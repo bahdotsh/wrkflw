@@ -16,7 +16,7 @@ use std::path::PathBuf;
     about = "GitHub Workflow validator and executor",
     version
 )]
-struct Cli {
+struct Wrkflw {
     #[command(subcommand)]
     command: Option<Commands>,
 
@@ -46,7 +46,7 @@ enum Commands {
 
 #[tokio::main]
 async fn main() {
-    let cli = Cli::parse();
+    let cli = Wrkflw::parse();
     let verbose = cli.verbose;
 
     match &cli.command {

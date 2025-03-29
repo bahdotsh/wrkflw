@@ -1,6 +1,5 @@
 use crate::runtime::container::{ContainerError, ContainerOutput, ContainerRuntime};
 use async_trait::async_trait;
-use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -19,7 +18,7 @@ impl EmulationRuntime {
         EmulationRuntime { workspace }
     }
 
-    fn prepare_workspace(&self, working_dir: &Path, volumes: &[(&Path, &Path)]) -> PathBuf {
+    fn prepare_workspace(&self, _working_dir: &Path, volumes: &[(&Path, &Path)]) -> PathBuf {
         // Get the container root - this is the emulation workspace directory
         let container_root = self.workspace.path().to_path_buf();
 
@@ -265,10 +264,7 @@ fn copy_directory_contents(source: &Path, dest: &Path) -> std::io::Result<()> {
 
     Ok(())
 }
-pub async fn handle_special_action(
-    action: &str,
-    with_params: &Option<HashMap<String, String>>,
-) -> Result<(), ContainerError> {
+pub async fn handle_special_action(action: &str) -> Result<(), ContainerError> {
     if action.starts_with("cachix/install-nix-action") {
         println!("🔄 Emulating cachix/install-nix-action");
 

@@ -39,28 +39,11 @@ pub struct Step {
 }
 
 impl WorkflowDefinition {
-    fn default() -> Self {
-        WorkflowDefinition {
-            name: String::new(),
-            on: Vec::new(),
-            on_raw: serde_yaml::Value::Null,
-            jobs: HashMap::new(),
-        }
-    }
-    pub fn get_default_shell(&self) -> String {
-        // GitHub defaults to bash on Linux/macOS and PowerShell on Windows
-        if cfg!(windows) {
-            "powershell".to_string()
-        } else {
-            "bash".to_string()
-        }
-    }
-
     pub fn resolve_action(&self, action_ref: &str) -> ActionInfo {
         // Parse GitHub action reference like "actions/checkout@v3"
         let parts: Vec<&str> = action_ref.split('@').collect();
 
-        let (repo, version) = if parts.len() > 1 {
+        let (repo, _) = if parts.len() > 1 {
             (parts[0], parts[1])
         } else {
             (parts[0], "main") // Default to main if no version specified
@@ -68,7 +51,6 @@ impl WorkflowDefinition {
 
         ActionInfo {
             repository: repo.to_string(),
-            version: version.to_string(),
             is_docker: repo.starts_with("docker://"),
             is_local: repo.starts_with("./"),
         }
@@ -78,7 +60,6 @@ impl WorkflowDefinition {
 #[derive(Debug, Clone)]
 pub struct ActionInfo {
     pub repository: String,
-    pub version: String,
     pub is_docker: bool,
     pub is_local: bool,
 }

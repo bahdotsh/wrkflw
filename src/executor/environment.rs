@@ -1,8 +1,6 @@
 use crate::parser::workflow::WorkflowDefinition;
 use chrono::Utc;
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::process::Command;
 
 pub fn create_github_context(workflow: &WorkflowDefinition) -> HashMap<String, String> {
     let mut env = HashMap::new();
@@ -25,40 +23,6 @@ pub fn create_github_context(workflow: &WorkflowDefinition) -> HashMap<String, S
     // Path-related variables
     env.insert("RUNNER_TEMP".to_string(), get_temp_dir());
     env.insert("RUNNER_TOOL_CACHE".to_string(), get_tool_cache_dir());
-
-    env
-}
-
-pub fn setup_git_context(workflow_dir: &Path) -> HashMap<String, String> {
-    let mut env = HashMap::new();
-
-    // Try to detect the git repository root
-    let repo_root = find_git_repo_root(workflow_dir);
-
-    if let Some(repo_root) = repo_root {
-        // Set GITHUB_WORKSPACE to the git repo root
-        env.insert(
-            "GITHUB_WORKSPACE".to_string(),
-            repo_root.to_string_lossy().to_string(),
-        );
-
-        // Try to get current branch
-        if let Some(branch) = get_current_branch(&repo_root) {
-            env.insert("GITHUB_REF".to_string(), format!("refs/heads/{}", branch));
-            env.insert("GITHUB_REF_NAME".to_string(), branch.clone());
-            env.insert("GITHUB_HEAD_REF".to_string(), branch);
-        }
-
-        // Try to get current commit SHA
-        if let Some(sha) = get_git_sha(&repo_root) {
-            env.insert("GITHUB_SHA".to_string(), sha);
-        }
-
-        // Try to get repository name from remote origin
-        if let Some(repo) = get_repo_name_from_git(&repo_root) {
-            env.insert("GITHUB_REPOSITORY".to_string(), repo);
-        }
-    }
 
     env
 }
@@ -171,65 +135,4 @@ fn get_tool_cache_dir() -> String {
         .join("tools")
         .to_string_lossy()
         .to_string()
-}
-
-fn find_git_repo_root(start_dir: &Path) -> Option<PathBuf> {
-    let mut current_dir = start_dir.to_path_buf();
-
-    loop {
-        let git_dir = current_dir.join(".git");
-        if git_dir.exists() && git_dir.is_dir() {
-            return Some(current_dir);
-        }
-
-        if !current_dir.pop() {
-            // Reached root directory without finding .git
-            return None;
-        }
-    }
-}
-
-fn get_current_branch(repo_root: &Path) -> Option<String> {
-    let output = Command::new("git")
-        .args(&["rev-parse", "--abbrev-ref", "HEAD"])
-        .current_dir(repo_root)
-        .output();
-
-    match output {
-        Ok(output) if output.status.success() => {
-            let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            Some(branch)
-        }
-        _ => None,
-    }
-}
-
-fn get_git_sha(repo_root: &Path) -> Option<String> {
-    let output = Command::new("git")
-        .args(&["rev-parse", "HEAD"])
-        .current_dir(repo_root)
-        .output();
-
-    match output {
-        Ok(output) if output.status.success() => {
-            let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            Some(sha)
-        }
-        _ => None,
-    }
-}
-
-fn get_repo_name_from_git(repo_root: &Path) -> Option<String> {
-    let output = Command::new("git")
-        .args(&["remote", "get-url", "origin"])
-        .current_dir(repo_root)
-        .output();
-
-    match output {
-        Ok(output) if output.status.success() => {
-            let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            extract_repo_from_url(&url)
-        }
-        _ => None,
-    }
 }

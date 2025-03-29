@@ -98,9 +98,6 @@ pub enum ExecutionError {
     #[error("Parse error: {0}")]
     ParseError(String),
 
-    #[error("Dependency error: {0}")]
-    DependencyError(String),
-
     #[error("Runtime error: {0}")]
     RuntimeError(String),
 
@@ -383,7 +380,7 @@ async fn execute_step(
                 }
             } else {
                 // For GitHub actions, check if we have special handling
-                if let Err(e) = handle_special_action(uses, &step.with).await {
+                if let Err(e) = handle_special_action(uses).await {
                     // Log error but continue
                     println!("   Warning: Special action handling failed: {}", e);
                 }
@@ -613,60 +610,4 @@ async fn prepare_runner_image(
     }
 
     Ok(())
-}
-
-async fn prepare_nix_container(
-    runtime: &Box<dyn ContainerRuntime>,
-    verbose: bool,
-) -> Result<String, ExecutionError> {
-    if verbose {
-        println!("🔧 Preparing specialized container for Nix workflow");
-    }
-
-    // Create a container that has Nix pre-installed
-    // We'll use a multi-step approach to create a Nix-enabled container
-
-    // Step 1: Create a temporary Dockerfile for a Nix-enabled container
-    let temp_dir = tempfile::tempdir()
-        .map_err(|e| ExecutionError::ExecutionError(format!("Failed to create temp dir: {}", e)))?;
-
-    let dockerfile_path = temp_dir.path().join("Dockerfile");
-    let dockerfile_content = r#"FROM ubuntu:latest
-RUN apt-get update && apt-get install -y curl xz-utils sudo
-RUN adduser --disabled-password --gecos '' nix && \
-    echo "nix ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/nix && \
-    mkdir -p /nix && chown nix:nix /nix
-
-USER nix
-RUN curl -L https://nixos.org/nix/install | sh
-ENV PATH="/nix/var/nix/profiles/default/bin:${PATH}"
-ENV NIX_PATH="nixpkgs=/nix/var/nix/profiles/per-user/nix/channels/nixpkgs"
-
-# Run nix once to verify it works
-RUN nix --version
-
-WORKDIR /github/workspace
-"#;
-
-    std::fs::write(&dockerfile_path, dockerfile_content).map_err(|e| {
-        ExecutionError::ExecutionError(format!("Failed to write Dockerfile: {}", e))
-    })?;
-
-    // Step 2: Build the custom image
-    let nix_image_tag = format!("wrkflw-nix-{}", uuid::Uuid::new_v4());
-
-    if verbose {
-        println!("🔧 Building custom Nix-enabled image: {}", nix_image_tag);
-    }
-
-    runtime
-        .build_image(&dockerfile_path, &nix_image_tag)
-        .await
-        .map_err(|e| ExecutionError::RuntimeError(format!("Failed to build Nix image: {}", e)))?;
-
-    if verbose {
-        println!("✅ Successfully built Nix-enabled container image");
-    }
-
-    Ok(nix_image_tag)
 }

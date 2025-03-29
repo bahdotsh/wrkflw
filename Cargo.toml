@@ -3,7 +3,11 @@ name = "wrkflw"
 version = "0.1.0"
 edition = "2021"
 description = "A GitHub Actions workflow validator and executor"
-authors = ["Your Name <your.email@example.com>"]
+documentation = "https://github.com/bahdotsh/wrkflw"
+homepage = "https://github.com/bahdotsh/wrkflw"
+repository = "https://github.com/bahdotsh/wrkflw"
+keywords = ["workflows", "github", "local"]
+categories = ["command-line-utilities", "github"]
 license = "MIT"
 
 [dependencies]

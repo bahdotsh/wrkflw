@@ -14,7 +14,7 @@ WRKFLW is a command-line tool for validating and executing GitHub Actions workfl
 
 ## Installation
 
-The recommended way to install `zp` is using Rust's package manager, Cargo. Here are several methods:
+The recommended way to install `wrkflw` is using Rust's package manager, Cargo. Here are several methods:
 
 ### Using Cargo Install (Recommended)
 ```bash

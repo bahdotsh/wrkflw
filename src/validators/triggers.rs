@@ -78,6 +78,4 @@ fn validate_cron_syntax(cron: &str, result: &mut ValidationResult) {
             cron
         ));
     }
-
-    // More detailed validation could be added here
 }

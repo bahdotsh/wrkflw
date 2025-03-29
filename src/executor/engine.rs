@@ -302,7 +302,7 @@ async fn execute_step(
     working_dir: &Path,
     runtime: &Box<dyn ContainerRuntime>,
     workflow: &WorkflowDefinition,
-    job_runs_on: &str, // Add this parameter to get the runner
+    job_runs_on: &str,
     verbose: bool,
 ) -> Result<StepResult, ExecutionError> {
     let step_name = step

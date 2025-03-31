@@ -28,3 +28,7 @@ dirs = "5.0"
 thiserror = "1.0"
 log = "0.4"
 which = "4.4"
+
+[profile.release]
+codegen-units = 1
+lto = true

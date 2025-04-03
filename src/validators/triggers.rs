@@ -14,7 +14,7 @@ pub fn validate_triggers(on: &Value, result: &mut ValidationResult) {
         "discussion_comment",
         "fork",
         "gollum",
-        "issue_comment",
+        "issue_comment", // Covers comments on PRs that are not part of a diff
         "issues",
         "label",
         "merge_group",
@@ -22,7 +22,6 @@ pub fn validate_triggers(on: &Value, result: &mut ValidationResult) {
         "page_build",
         "public",
         "pull_request",
-        "pull_request_comment (use issue_comment)",
         "pull_request_review",
         "pull_request_review_comment",
         "pull_request_target",

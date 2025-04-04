@@ -28,8 +28,8 @@ dirs = "5.0"
 thiserror = "1.0"
 log = "0.4"
 which = "4.4"
-crossterm = "0.25"
-tui = "0.19"
+crossterm = "0.26.1"
+ratatui = { version = "0.23.0", features = ["crossterm"] }
 once_cell = "1.19.0"
 
 [profile.release]

@@ -28,6 +28,9 @@ dirs = "5.0"
 thiserror = "1.0"
 log = "0.4"
 which = "4.4"
+crossterm = "0.25"
+tui = "0.19"
+once_cell = "1.19.0"
 
 [profile.release]
 codegen-units = 1

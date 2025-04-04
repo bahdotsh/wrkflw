@@ -5,6 +5,7 @@ use thiserror::Error;
 use crate::executor::dependency;
 use crate::executor::docker;
 use crate::executor::environment;
+use crate::logging;
 use crate::parser::workflow::{parse_workflow, ActionInfo, WorkflowDefinition};
 use crate::runtime::container::ContainerRuntime;
 use crate::runtime::emulation::handle_special_action;
@@ -15,6 +16,8 @@ pub async fn execute_workflow(
     runtime_type: RuntimeType,
     verbose: bool,
 ) -> Result<ExecutionResult, ExecutionError> {
+    logging::info(&format!("Executing workflow: {}", workflow_path.display()));
+    logging::info(&format!("Runtime: {:?}", runtime_type));
     // 1. Parse workflow file
     let workflow = parse_workflow(workflow_path)?;
 
@@ -48,7 +51,9 @@ fn initialize_runtime(
             if docker::is_available() {
                 Ok(Box::new(docker::DockerRuntime::new()))
             } else {
-                eprintln!("Docker not available, falling back to emulation mode");
+                logging::error(&format!(
+                    "Docker not available, falling back to emulation mode"
+                ));
                 Ok(Box::new(crate::runtime::emulation::EmulationRuntime::new()))
             }
         }
@@ -200,7 +205,7 @@ async fn execute_job(
     verbose: bool,
 ) -> Result<JobResult, ExecutionError> {
     if verbose {
-        println!("Executing job: {}", job_name);
+        logging::info(&format!("Executing job: {}", job_name));
     }
 
     let job = workflow.jobs.get(job_name).ok_or_else(|| {
@@ -311,7 +316,7 @@ async fn execute_step(
         .unwrap_or_else(|| format!("Step {}", step_idx + 1));
 
     if verbose {
-        println!("  Executing step: {}", step_name);
+        logging::info(&format!("  Executing step: {}", step_name));
     }
 
     // Prepare step environment
@@ -440,11 +445,9 @@ async fn execute_step(
         }
     } else if let Some(run) = &step.run {
         // Print the command we're trying to run
-        println!("📝 Executing command: {}", run);
 
         let shell_default = "bash".to_string();
         let shell = step_env.get("SHELL").unwrap_or(&shell_default);
-        println!("📝 Using shell: {}", shell);
 
         // Store command in a vector to ensure it stays alive
         let mut cmd_strings = Vec::new();

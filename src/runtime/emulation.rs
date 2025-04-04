@@ -1,3 +1,4 @@
+use crate::logging;
 use crate::runtime::container::{ContainerError, ContainerOutput, ContainerRuntime};
 use async_trait::async_trait;
 use std::fs;
@@ -99,8 +100,7 @@ impl ContainerRuntime for EmulationRuntime {
         volumes: &[(&Path, &Path)],
     ) -> Result<ContainerOutput, ContainerError> {
         // Print emulation info
-        println!("🔄 Emulating container: {}", image);
-
+        logging::info(&format!("Emulating container: {}", image));
         // Prepare the workspace
         let container_working_dir = self.prepare_workspace(working_dir, volumes);
 
@@ -108,8 +108,6 @@ impl ContainerRuntime for EmulationRuntime {
         let contains_nix_command = cmd.iter().any(|&arg| arg.contains("nix "));
 
         if contains_nix_command {
-            println!("🔄 Emulation: Detected Nix command, checking if Nix is installed");
-
             let nix_installed = Command::new("which")
                 .arg("nix")
                 .output()
@@ -117,10 +115,12 @@ impl ContainerRuntime for EmulationRuntime {
                 .unwrap_or(false);
 
             if !nix_installed {
-                println!("⚠️ Nix commands detected but Nix is not installed!");
-                println!(
+                logging::info(&format!(
+                    "⚠️ Nix commands detected but Nix is not installed!"
+                ));
+                logging::info(&format!(
                     "🔄 To use this workflow, please install Nix: https://nixos.org/download.html"
-                );
+                ));
 
                 return Ok(ContainerOutput {
                         stdout: String::new(),
@@ -128,7 +128,7 @@ impl ContainerRuntime for EmulationRuntime {
                         exit_code: 1,
                     });
             } else {
-                println!("✅ Nix is installed, proceeding with command");
+                logging::info(&format!("✅ Nix is installed, proceeding with command"));
             }
         }
 
@@ -213,16 +213,16 @@ impl ContainerRuntime for EmulationRuntime {
     }
 
     async fn pull_image(&self, image: &str) -> Result<(), ContainerError> {
-        println!("🔄 Emulation: Pretending to pull image {}", image);
+        logging::info(&format!("🔄 Emulation: Pretending to pull image {}", image));
         Ok(())
     }
 
     async fn build_image(&self, dockerfile: &Path, tag: &str) -> Result<(), ContainerError> {
-        println!(
+        logging::info(&format!(
             "🔄 Emulation: Pretending to build image {} from {}",
             tag,
             dockerfile.display()
-        );
+        ));
         Ok(())
     }
 }
@@ -266,7 +266,7 @@ fn copy_directory_contents(source: &Path, dest: &Path) -> std::io::Result<()> {
 }
 pub async fn handle_special_action(action: &str) -> Result<(), ContainerError> {
     if action.starts_with("cachix/install-nix-action") {
-        println!("🔄 Emulating cachix/install-nix-action");
+        logging::info(&format!("🔄 Emulating cachix/install-nix-action"));
 
         // In emulation mode, check if nix is installed
         let nix_installed = Command::new("which")
@@ -276,13 +276,15 @@ pub async fn handle_special_action(action: &str) -> Result<(), ContainerError> {
             .unwrap_or(false);
 
         if !nix_installed {
-            println!("🔄 Emulation: Nix is required but not installed.");
-            println!(
+            logging::info(&format!("🔄 Emulation: Nix is required but not installed."));
+            logging::info(&format!(
                 "🔄 To use this workflow, please install Nix: https://nixos.org/download.html"
-            );
-            println!("🔄 Continuing emulation, but nix commands will fail.");
+            ));
+            logging::info(&format!(
+                "🔄 Continuing emulation, but nix commands will fail."
+            ));
         } else {
-            println!("🔄 Emulation: Using system-installed Nix");
+            logging::info(&format!("🔄 Emulation: Using system-installed Nix"));
         }
         Ok(())
     } else {

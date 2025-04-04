@@ -1,3 +1,4 @@
+use crate::logging;
 use crate::runtime::container::{ContainerError, ContainerOutput, ContainerRuntime};
 use async_trait::async_trait;
 use bollard::{
@@ -25,12 +26,12 @@ pub fn is_available() -> bool {
         Ok(docker) => match futures::executor::block_on(async { docker.ping().await }) {
             Ok(_) => true,
             Err(e) => {
-                eprintln!("Docker ping failed: {}", e);
+                logging::error(&format!("Docker ping failed: {}", e));
                 false
             }
         },
         Err(e) => {
-            eprintln!("Docker connection failed: {}", e);
+            logging::error(&format!("Docker connection failed: {}", e));
             false
         }
     }
@@ -47,15 +48,12 @@ impl ContainerRuntime for DockerRuntime {
         volumes: &[(&Path, &Path)],
     ) -> Result<ContainerOutput, ContainerError> {
         // Print detailed debugging info
-        println!("🐳 Docker: Running container with image: {}", image);
-        println!("🐳 Command: {:?}", cmd);
-        println!("🐳 Working directory: {}", working_dir.display());
-        println!("🐳 Volumes: {:?}", volumes);
+        logging::info(&format!("Docker: Running container with image: {}", image));
 
         // Always try to pull the image first
         match self.pull_image(image).await {
-                Ok(_) => println!("🐳 Successfully pulled image: {}", image),
-                Err(e) => println!("🐳 Warning: Failed to pull image: {}. Continuing with existing image if available.", e),
+            Ok(_) => logging::info(&format!("🐳 Successfully pulled image: {}", image)),
+                Err(e) => logging::error(&format!("🐳 Warning: Failed to pull image: {}. Continuing with existing image if available.", e)),
             }
         // Map env vars to format Docker expects
         let env: Vec<String> = env_vars

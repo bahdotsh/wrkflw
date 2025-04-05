@@ -1,5 +1,6 @@
 use crate::evaluator::evaluate_workflow_file;
 use crate::executor::{self, ExecutionResult, JobStatus, RuntimeType, StepStatus};
+use crate::logging;
 use crate::utils::is_workflow_file;
 use chrono::Local;
 use crossterm::{
@@ -7,20 +8,24 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
+use ratatui::widgets::TableState;
+use ratatui::{
+    backend::CrosstermBackend,
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{
+        Block, BorderType, Borders, Cell, Gauge, List, ListItem, ListState, Paragraph, Row, Table,
+        Tabs, Wrap,
+    },
+    Frame, Terminal,
+};
 use std::io::{self, stdout};
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
-use tui::{
-    backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
-    text::{Span, Spans},
-    widgets::{Block, Borders, List, ListItem, Paragraph, Tabs, Wrap},
-    Terminal,
-};
+use std::time::{Duration, Instant};
 
 // Represents an individual workflow file
 struct Workflow {
@@ -42,14 +47,17 @@ enum WorkflowStatus {
 }
 
 // Detailed execution information
+#[allow(dead_code)]
 struct WorkflowExecution {
     jobs: Vec<JobExecution>,
     start_time: chrono::DateTime<Local>,
     end_time: Option<chrono::DateTime<Local>>,
     logs: Vec<String>,
+    progress: f64, // 0.0 - 1.0 for progress bar
 }
 
 // Job execution details
+#[allow(dead_code)]
 struct JobExecution {
     name: String,
     status: JobStatus,
@@ -67,23 +75,40 @@ struct StepExecution {
 // Application state
 struct App {
     workflows: Vec<Workflow>,
-    selected_workflow_index: usize,
+    workflow_list_state: ListState,
     selected_tab: usize,
     running: bool,
     show_help: bool,
     runtime_type: RuntimeType,
     execution_queue: Vec<usize>, // Indices of workflows to execute
     current_execution: Option<usize>,
-    logs: Vec<String>,         // Overall execution logs
-    selected_job_index: usize, // For viewing job details
-    detailed_view: bool,       // Whether we're in detailed view mode
+    logs: Vec<String>,            // Overall execution logs
+    log_scroll: usize,            // Scrolling position for logs
+    job_list_state: ListState,    // For viewing job details
+    detailed_view: bool,          // Whether we're in detailed view mode
+    step_list_state: ListState,   // For selecting steps in detailed view
+    step_table_state: TableState, // For the steps table in detailed view
+    last_tick: Instant,           // For UI animations and updates
+    tick_rate: Duration,          // How often to update the UI
 }
 
 impl App {
     fn new(runtime_type: RuntimeType) -> App {
+        let mut workflow_list_state = ListState::default();
+        workflow_list_state.select(Some(0));
+
+        let mut job_list_state = ListState::default();
+        job_list_state.select(Some(0));
+
+        let mut step_list_state = ListState::default();
+        step_list_state.select(Some(0));
+
+        let mut step_table_state = TableState::default();
+        step_table_state.select(Some(0));
+
         App {
             workflows: Vec::new(),
-            selected_workflow_index: 0,
+            workflow_list_state,
             selected_tab: 0,
             running: false,
             show_help: false,
@@ -91,31 +116,198 @@ impl App {
             execution_queue: Vec::new(),
             current_execution: None,
             logs: Vec::new(),
-            selected_job_index: 0,
+            log_scroll: 0,
+            job_list_state,
             detailed_view: false,
+            step_list_state,
+            step_table_state,
+            last_tick: Instant::now(),
+            tick_rate: Duration::from_millis(250), // Update 4 times per second
         }
     }
 
     // Toggle workflow selection
     fn toggle_selected(&mut self) {
-        if !self.workflows.is_empty() {
-            let idx = self.selected_workflow_index;
-            self.workflows[idx].selected = !self.workflows[idx].selected;
+        if let Some(idx) = self.workflow_list_state.selected() {
+            if idx < self.workflows.len() {
+                self.workflows[idx].selected = !self.workflows[idx].selected;
+            }
         }
     }
 
-    // Move cursor up in the list
-    fn previous(&mut self) {
-        if !self.workflows.is_empty() {
-            self.selected_workflow_index = self.selected_workflow_index.saturating_sub(1);
+    // Move cursor up in the workflow list
+    fn previous_workflow(&mut self) {
+        if self.workflows.is_empty() {
+            return;
+        }
+
+        let i = match self.workflow_list_state.selected() {
+            Some(i) => {
+                if i == 0 {
+                    self.workflows.len() - 1
+                } else {
+                    i - 1
+                }
+            }
+            None => 0,
+        };
+        self.workflow_list_state.select(Some(i));
+    }
+
+    // Move cursor down in the workflow list
+    fn next_workflow(&mut self) {
+        if self.workflows.is_empty() {
+            return;
+        }
+
+        let i = match self.workflow_list_state.selected() {
+            Some(i) => {
+                if i >= self.workflows.len() - 1 {
+                    0
+                } else {
+                    i + 1
+                }
+            }
+            None => 0,
+        };
+        self.workflow_list_state.select(Some(i));
+    }
+
+    // Move cursor up in the job list
+    fn previous_job(&mut self) {
+        let current_workflow_idx = self
+            .current_execution
+            .or_else(|| self.workflow_list_state.selected());
+
+        if let Some(workflow_idx) = current_workflow_idx {
+            if workflow_idx >= self.workflows.len() {
+                return;
+            }
+
+            if let Some(execution) = &self.workflows[workflow_idx].execution_details {
+                if execution.jobs.is_empty() {
+                    return;
+                }
+
+                let i = match self.job_list_state.selected() {
+                    Some(i) => {
+                        if i == 0 {
+                            execution.jobs.len() - 1
+                        } else {
+                            i - 1
+                        }
+                    }
+                    None => 0,
+                };
+                self.job_list_state.select(Some(i));
+
+                // Reset step selection when changing jobs
+                self.step_list_state.select(Some(0));
+            }
         }
     }
 
-    // Move cursor down in the list
-    fn next(&mut self) {
-        if !self.workflows.is_empty() {
-            let len = self.workflows.len();
-            self.selected_workflow_index = (self.selected_workflow_index + 1) % len;
+    // Move cursor down in the job list
+    fn next_job(&mut self) {
+        let current_workflow_idx = self
+            .current_execution
+            .or_else(|| self.workflow_list_state.selected());
+
+        if let Some(workflow_idx) = current_workflow_idx {
+            if workflow_idx >= self.workflows.len() {
+                return;
+            }
+
+            if let Some(execution) = &self.workflows[workflow_idx].execution_details {
+                if execution.jobs.is_empty() {
+                    return;
+                }
+
+                let i = match self.job_list_state.selected() {
+                    Some(i) => {
+                        if i >= execution.jobs.len() - 1 {
+                            0
+                        } else {
+                            i + 1
+                        }
+                    }
+                    None => 0,
+                };
+                self.job_list_state.select(Some(i));
+
+                // Reset step selection when changing jobs
+                self.step_list_state.select(Some(0));
+            }
+        }
+    }
+
+    // Move cursor up in step list
+    fn previous_step(&mut self) {
+        let current_workflow_idx = self
+            .current_execution
+            .or_else(|| self.workflow_list_state.selected());
+
+        if let Some(workflow_idx) = current_workflow_idx {
+            if let Some(execution) = &self.workflows[workflow_idx].execution_details {
+                if let Some(job_idx) = self.job_list_state.selected() {
+                    if job_idx < execution.jobs.len() {
+                        let steps = &execution.jobs[job_idx].steps;
+                        if steps.is_empty() {
+                            return;
+                        }
+
+                        let i = match self.step_list_state.selected() {
+                            Some(i) => {
+                                if i == 0 {
+                                    steps.len() - 1
+                                } else {
+                                    i - 1
+                                }
+                            }
+                            None => 0,
+                        };
+                        self.step_list_state.select(Some(i));
+                    }
+                }
+            }
+        }
+        if let Some(i) = self.step_list_state.selected() {
+            self.step_table_state.select(Some(i));
+        }
+    }
+
+    // Move cursor down in step list
+    fn next_step(&mut self) {
+        let current_workflow_idx = self
+            .current_execution
+            .or_else(|| self.workflow_list_state.selected());
+
+        if let Some(workflow_idx) = current_workflow_idx {
+            if let Some(execution) = &self.workflows[workflow_idx].execution_details {
+                if let Some(job_idx) = self.job_list_state.selected() {
+                    if job_idx < execution.jobs.len() {
+                        let steps = &execution.jobs[job_idx].steps;
+                        if steps.is_empty() {
+                            return;
+                        }
+
+                        let i = match self.step_list_state.selected() {
+                            Some(i) => {
+                                if i >= steps.len() - 1 {
+                                    0
+                                } else {
+                                    i + 1
+                                }
+                            }
+                            None => 0,
+                        };
+                        self.step_list_state.select(Some(i));
+                    }
+                }
+            }
+        }
+        if let Some(i) = self.step_list_state.selected() {
+            self.step_table_state.select(Some(i));
         }
     }
 
@@ -136,6 +328,10 @@ impl App {
             "Queued {} workflow(s) for execution",
             self.execution_queue.len()
         ));
+        logging::info(&format!(
+            "Queued {} workflow(s) for execution",
+            self.execution_queue.len()
+        ));
     }
 
     // Start workflow execution process
@@ -143,11 +339,13 @@ impl App {
         if self.execution_queue.is_empty() {
             self.logs
                 .push("No workflows selected for execution".to_string());
+            logging::warning("No workflows selected for execution");
             return;
         }
 
         self.running = true;
         self.logs.push("Starting workflow execution...".to_string());
+        logging::info("Starting workflow execution...");
 
         // Update all queued workflows to "Queued" state
         for &idx in &self.execution_queue {
@@ -187,20 +385,27 @@ impl App {
             .any(|j| j.status == JobStatus::Failure)
         {
             workflow.status = WorkflowStatus::Failed;
+            logging::error(&format!("Workflow '{}' failed", workflow.name));
         } else {
             workflow.status = WorkflowStatus::Success;
+            logging::success(&format!(
+                "Workflow '{}' completed successfully",
+                workflow.name
+            ));
         }
 
         // Update workflow execution details
         if let Some(exec) = &mut workflow.execution_details {
             exec.jobs = job_executions;
             exec.end_time = Some(end_time);
+            exec.progress = 1.0; // Completed
         } else {
             workflow.execution_details = Some(WorkflowExecution {
                 jobs: job_executions,
                 start_time: end_time - chrono::Duration::seconds(1), // Approximate
                 end_time: Some(end_time),
                 logs: vec!["Execution completed".to_string()],
+                progress: 1.0, // Completed
             });
         }
 
@@ -222,6 +427,10 @@ impl App {
         self.current_execution = Some(next);
         self.logs
             .push(format!("Executing workflow: {}", self.workflows[next].name));
+        logging::info(&format!(
+            "Executing workflow: {}",
+            self.workflows[next].name
+        ));
 
         // Initialize execution details
         self.workflows[next].execution_details = Some(WorkflowExecution {
@@ -229,6 +438,7 @@ impl App {
             start_time: Local::now(),
             end_time: None,
             logs: vec!["Execution started".to_string()],
+            progress: 0.0, // Just started
         });
 
         Some(next)
@@ -239,30 +449,38 @@ impl App {
         self.detailed_view = !self.detailed_view;
     }
 
-    // Select previous job in detailed view
-    fn previous_job(&mut self) {
-        if self.detailed_view {
-            if let Some(idx) = self.current_execution {
-                if let Some(exec) = &self.workflows[idx].execution_details {
-                    if !exec.jobs.is_empty() {
-                        self.selected_job_index = self.selected_job_index.saturating_sub(1);
-                    }
+    // Scroll logs up
+    fn scroll_logs_up(&mut self) {
+        self.log_scroll = self.log_scroll.saturating_sub(1);
+    }
+
+    // Scroll logs down
+    fn scroll_logs_down(&mut self) {
+        if !self.logs.is_empty() {
+            self.log_scroll = (self.log_scroll + 1).min(self.logs.len() - 1);
+        }
+    }
+
+    // Update progress for running workflows
+    fn update_running_workflow_progress(&mut self) {
+        if let Some(idx) = self.current_execution {
+            if let Some(execution) = &mut self.workflows[idx].execution_details {
+                if execution.end_time.is_none() {
+                    // Gradually increase progress for visual feedback
+                    execution.progress = (execution.progress + 0.01).min(0.95);
                 }
             }
         }
     }
 
-    // Select next job in detailed view
-    fn next_job(&mut self) {
-        if self.detailed_view {
-            if let Some(idx) = self.current_execution {
-                if let Some(exec) = &self.workflows[idx].execution_details {
-                    let len = exec.jobs.len();
-                    if len > 0 {
-                        self.selected_job_index = (self.selected_job_index + 1) % len;
-                    }
-                }
-            }
+    // Check if tick should happen
+    fn tick(&mut self) -> bool {
+        let now = Instant::now();
+        if now.duration_since(self.last_tick) >= self.tick_rate {
+            self.last_tick = now;
+            true
+        } else {
+            false
         }
     }
 }
@@ -360,64 +578,14 @@ pub fn run_tui(
 
     // Main event loop
     loop {
+        // Update UI on tick
+        if app.tick() {
+            app.update_running_workflow_progress();
+        }
+
         // Draw UI
         terminal.draw(|f| {
-            let size = f.size();
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .margin(1)
-                .constraints(
-                    [
-                        Constraint::Length(3), // Tabs
-                        Constraint::Min(10),   // Main content
-                        Constraint::Length(1), // Status line
-                    ]
-                    .as_ref(),
-                )
-                .split(size);
-
-            // Tab bar
-            let titles = vec!["Workflows", "Execution", "Logs", "Help"];
-            let tabs = Tabs::new(
-                titles
-                    .iter()
-                    .map(|t| Spans::from(Span::styled(*t, Style::default().fg(Color::White))))
-                    .collect(),
-            )
-            .block(Block::default().borders(Borders::ALL).title("wrkflw"))
-            .highlight_style(
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            )
-            .select(app.selected_tab);
-
-            f.render_widget(tabs, chunks[0]);
-
-            // Main content based on selected tab
-            match app.selected_tab {
-                0 => render_workflows_tab(f, &app, chunks[1]),
-                1 => render_execution_tab(f, &app, chunks[1]),
-                2 => render_logs_tab(f, &app, chunks[1]),
-                3 => render_help_tab(f, chunks[1]),
-                _ => {}
-            }
-
-            // Status line
-            let runtime_mode = match app.runtime_type {
-                RuntimeType::Docker => "Docker",
-                RuntimeType::Emulation => "Emulation",
-            };
-
-            let status = format!(
-                "Runtime: {} | Press q to quit | {} workflow(s) loaded",
-                runtime_mode,
-                app.workflows.len()
-            );
-
-            let status_widget = Paragraph::new(status).style(Style::default().fg(Color::White));
-
-            f.render_widget(status_widget, chunks[2]);
+            render_ui(f, &mut app);
         })?;
 
         // Handle incoming execution results
@@ -464,6 +632,7 @@ pub fn run_tui(
                 app.running = false;
                 app.logs
                     .push("All workflows completed execution".to_string());
+                logging::info("All workflows completed execution");
             }
         }
 
@@ -514,6 +683,8 @@ pub fn run_tui(
                     KeyCode::Esc => {
                         if app.detailed_view {
                             app.detailed_view = false;
+                        } else if app.show_help {
+                            app.show_help = false;
                         } else {
                             break;
                         }
@@ -529,21 +700,33 @@ pub fn run_tui(
                     KeyCode::Char('1') => app.switch_tab(0),
                     KeyCode::Char('2') => app.switch_tab(1),
                     KeyCode::Char('3') => app.switch_tab(2),
-                    KeyCode::Char('4') => app.switch_tab(3),
-                    KeyCode::Up | KeyCode::Char('k') => {
-                        if app.detailed_view {
-                            app.previous_job();
-                        } else {
-                            app.previous();
-                        }
+                    KeyCode::Char('4') | KeyCode::Char('?') | KeyCode::Char('h') => {
+                        app.switch_tab(3)
                     }
-                    KeyCode::Down | KeyCode::Char('j') => {
-                        if app.detailed_view {
-                            app.next_job();
-                        } else {
-                            app.next();
+                    KeyCode::Up | KeyCode::Char('k') => match app.selected_tab {
+                        0 => app.previous_workflow(),
+                        1 => {
+                            if app.detailed_view {
+                                app.previous_step();
+                            } else {
+                                app.previous_job();
+                            }
                         }
-                    }
+                        2 => app.scroll_logs_up(),
+                        _ => {}
+                    },
+                    KeyCode::Down | KeyCode::Char('j') => match app.selected_tab {
+                        0 => app.next_workflow(),
+                        1 => {
+                            if app.detailed_view {
+                                app.next_step();
+                            } else {
+                                app.next_job();
+                            }
+                        }
+                        2 => app.scroll_logs_down(),
+                        _ => {}
+                    },
                     KeyCode::Char(' ') => {
                         if app.selected_tab == 0 && !app.running {
                             app.toggle_selected();
@@ -554,9 +737,11 @@ pub fn run_tui(
                             0 => {
                                 // In workflows tab, Enter runs the selected workflow
                                 if !app.running {
-                                    app.toggle_selected();
-                                    app.queue_selected_for_execution();
-                                    app.start_execution();
+                                    if let Some(idx) = app.workflow_list_state.selected() {
+                                        app.workflows[idx].selected = true;
+                                        app.queue_selected_for_execution();
+                                        app.start_execution();
+                                    }
                                 }
                             }
                             1 => {
@@ -606,26 +791,104 @@ pub fn run_tui(
     Ok(())
 }
 
+// Main render function for the UI
+fn render_ui(f: &mut Frame<CrosstermBackend<io::Stdout>>, app: &mut App) {
+    // Check if help should be shown as an overlay
+    if app.show_help {
+        render_help_overlay(f);
+        return;
+    }
+
+    let size = f.size();
+
+    // Create main layout
+    let main_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(
+            [
+                Constraint::Length(3), // Title bar and tabs
+                Constraint::Min(5),    // Main content
+                Constraint::Length(2), // Status bar
+            ]
+            .as_ref(),
+        )
+        .split(size);
+
+    // Render title bar with tabs
+    render_title_bar(f, app, main_chunks[0]);
+
+    // Render main content based on selected tab
+    match app.selected_tab {
+        0 => render_workflows_tab(f, app, main_chunks[1]),
+        1 => render_execution_tab(f, app, main_chunks[1]),
+        2 => render_logs_tab(f, app, main_chunks[1]),
+        3 => render_help_tab(f, main_chunks[1]),
+        _ => {}
+    }
+
+    // Render status bar
+    render_status_bar(f, app, main_chunks[2]);
+}
+
+// Render the title bar with tabs
+fn render_title_bar(f: &mut Frame<CrosstermBackend<io::Stdout>>, app: &App, area: Rect) {
+    // Create tabs
+    let titles = vec!["Workflows", "Execution", "Logs", "Help"];
+    let tabs = Tabs::new(
+        titles
+            .iter()
+            .map(|t| {
+                let (first, rest) = t.split_at(1);
+                Line::from(vec![
+                    Span::styled(
+                        first,
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::UNDERLINED),
+                    ),
+                    Span::styled(rest, Style::default().fg(Color::White)),
+                ])
+            })
+            .collect(),
+    )
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .title(Span::styled(
+                " wrkflw ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ))
+            .title_alignment(Alignment::Center),
+    )
+    .highlight_style(
+        Style::default()
+            .bg(Color::DarkGray)
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    )
+    .select(app.selected_tab)
+    .divider(Span::raw("|"));
+
+    f.render_widget(tabs, area);
+}
+
 // Render the workflow list tab
-fn render_workflows_tab(f: &mut tui::Frame<CrosstermBackend<io::Stdout>>, app: &App, area: Rect) {
+fn render_workflows_tab(f: &mut Frame<CrosstermBackend<io::Stdout>>, app: &mut App, area: Rect) {
     let items: Vec<ListItem> = app
         .workflows
         .iter()
-        .enumerate()
-        .map(|(i, w)| {
-            let checked = if w.selected { "[✓] " } else { "[ ] " };
+        .map(|w| {
+            let checked = if w.selected { "✓ " } else { "  " };
             let status_indicator = match w.status {
                 WorkflowStatus::NotStarted => "  ",
                 WorkflowStatus::Running => "⟳ ",
-                WorkflowStatus::Success => "✓ ",
-                WorkflowStatus::Failed => "✗ ",
-                WorkflowStatus::Skipped => "- ",
+                WorkflowStatus::Success => "✅ ",
+                WorkflowStatus::Failed => "❌ ",
+                WorkflowStatus::Skipped => "⏭  ",
             };
-
-            let mut style = Style::default();
-            if i == app.selected_workflow_index {
-                style = style.fg(Color::Yellow).add_modifier(Modifier::BOLD);
-            }
 
             let status_style = match w.status {
                 WorkflowStatus::NotStarted => Style::default(),
@@ -635,10 +898,10 @@ fn render_workflows_tab(f: &mut tui::Frame<CrosstermBackend<io::Stdout>>, app: &
                 WorkflowStatus::Skipped => Style::default().fg(Color::Gray),
             };
 
-            ListItem::new(Spans::from(vec![
-                Span::styled(checked, style),
+            ListItem::new(Line::from(vec![
+                Span::styled(checked, Style::default().fg(Color::Green)),
                 Span::styled(status_indicator, status_style),
-                Span::styled(w.name.clone(), style),
+                Span::raw(&w.name),
             ]))
         })
         .collect();
@@ -647,29 +910,31 @@ fn render_workflows_tab(f: &mut tui::Frame<CrosstermBackend<io::Stdout>>, app: &
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title("Available Workflows"),
+                .border_type(BorderType::Rounded)
+                .title(Span::styled(
+                    " Available Workflows ",
+                    Style::default().fg(Color::Yellow),
+                )),
         )
         .highlight_style(
             Style::default()
-                .fg(Color::Yellow)
+                .bg(Color::DarkGray)
                 .add_modifier(Modifier::BOLD),
-        );
+        )
+        .highlight_symbol("» ");
 
-    f.render_widget(workflows_list, area);
+    f.render_stateful_widget(workflows_list, area, &mut app.workflow_list_state);
 }
-// Render the execution tab
-fn render_execution_tab(f: &mut tui::Frame<CrosstermBackend<io::Stdout>>, app: &App, area: Rect) {
+
+fn render_execution_tab(f: &mut Frame<CrosstermBackend<io::Stdout>>, app: &mut App, area: Rect) {
     if app.detailed_view {
         render_job_detail_view(f, app, area);
         return;
     }
-
-    // Determine which workflow to display - either the one currently running or the last one executed
-    let current_workflow_idx = app.current_execution.or_else(|| {
-        app.workflows
-            .iter()
-            .position(|w| matches!(w.status, WorkflowStatus::Success | WorkflowStatus::Failed))
-    });
+    let current_workflow_idx = app
+        .current_execution
+        .or_else(|| app.workflow_list_state.selected())
+        .filter(|&idx| idx < app.workflows.len());
 
     if let Some(idx) = current_workflow_idx {
         let workflow = &app.workflows[idx];
@@ -679,12 +944,13 @@ fn render_execution_tab(f: &mut tui::Frame<CrosstermBackend<io::Stdout>>, app: &
             .direction(Direction::Vertical)
             .constraints(
                 [
-                    Constraint::Length(3), // Workflow info
+                    Constraint::Length(5), // Workflow info with progress bar
                     Constraint::Min(5),    // Jobs list
-                    Constraint::Length(5), // Execution info
+                    Constraint::Length(6), // Execution info
                 ]
                 .as_ref(),
             )
+            .margin(1)
             .split(area);
 
         // Workflow info section
@@ -697,166 +963,340 @@ fn render_execution_tab(f: &mut tui::Frame<CrosstermBackend<io::Stdout>>, app: &
         };
 
         let status_style = match workflow.status {
-            WorkflowStatus::NotStarted => Style::default(),
+            WorkflowStatus::NotStarted => Style::default().fg(Color::Gray),
             WorkflowStatus::Running => Style::default().fg(Color::Cyan),
             WorkflowStatus::Success => Style::default().fg(Color::Green),
             WorkflowStatus::Failed => Style::default().fg(Color::Red),
-            WorkflowStatus::Skipped => Style::default().fg(Color::Gray),
+            WorkflowStatus::Skipped => Style::default().fg(Color::Yellow),
         };
 
-        let workflow_info = Paragraph::new(vec![
-            Spans::from(vec![
-                Span::raw("Workflow: "),
+        let mut workflow_info = vec![
+            Line::from(vec![
+                Span::styled("Workflow: ", Style::default().fg(Color::Blue)),
                 Span::styled(
                     workflow.name.clone(),
-                    Style::default().add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
                 ),
             ]),
-            Spans::from(vec![
-                Span::raw("Status: "),
+            Line::from(vec![
+                Span::styled("Status: ", Style::default().fg(Color::Blue)),
                 Span::styled(status_text, status_style),
             ]),
-        ])
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("Workflow Information"),
-        );
+        ];
 
-        f.render_widget(workflow_info, chunks[0]);
+        // Add progress bar for running workflows
+        if let Some(execution) = &workflow.execution_details {
+            // Calculate progress
+            let progress = execution.progress;
+
+            // Add progress bar
+            let gauge_color = match workflow.status {
+                WorkflowStatus::Running => Color::Cyan,
+                WorkflowStatus::Success => Color::Green,
+                WorkflowStatus::Failed => Color::Red,
+                _ => Color::Gray,
+            };
+
+            let progress_text = match workflow.status {
+                WorkflowStatus::Running => format!("{:.0}%", progress * 100.0),
+                WorkflowStatus::Success => "Completed".to_string(),
+                WorkflowStatus::Failed => "Failed".to_string(),
+                _ => "Not started".to_string(),
+            };
+
+            // Add empty line before progress bar
+            workflow_info.push(Line::from(""));
+
+            // Add the gauge widget to the paragraph data
+            workflow_info.push(Line::from(vec![Span::styled(
+                format!("Progress: {}", progress_text),
+                Style::default().fg(Color::Blue),
+            )]));
+
+            let gauge = Gauge::default()
+                .block(Block::default())
+                .gauge_style(Style::default().fg(gauge_color).bg(Color::Black))
+                .percent((progress * 100.0) as u16);
+
+            // Render gauge separately after the paragraph
+            let workflow_info_widget = Paragraph::new(workflow_info).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .title(Span::styled(
+                        " Workflow Information ",
+                        Style::default().fg(Color::Yellow),
+                    )),
+            );
+
+            let gauge_area = Rect {
+                x: chunks[0].x + 2,
+                y: chunks[0].y + 4,
+                width: chunks[0].width - 4,
+                height: 1,
+            };
+
+            f.render_widget(workflow_info_widget, chunks[0]);
+            f.render_widget(gauge, gauge_area);
+        } else {
+            // No execution details
+            let workflow_info_widget = Paragraph::new(workflow_info).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .title(Span::styled(
+                        " Workflow Information ",
+                        Style::default().fg(Color::Yellow),
+                    )),
+            );
+            f.render_widget(workflow_info_widget, chunks[0]);
+        }
 
         // Jobs list section
         if let Some(execution) = &workflow.execution_details {
-            let job_items: Vec<ListItem> = execution
-                .jobs
-                .iter()
-                .map(|job| {
-                    let status_indicator = match job.status {
-                        JobStatus::Success => "✓ ",
-                        JobStatus::Failure => "✗ ",
-                        JobStatus::Skipped => "- ",
-                    };
+            if execution.jobs.is_empty() {
+                let placeholder = Paragraph::new("No jobs have started execution yet...")
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_type(BorderType::Rounded)
+                            .title(Span::styled(" Jobs ", Style::default().fg(Color::Yellow))),
+                    )
+                    .alignment(Alignment::Center);
+                f.render_widget(placeholder, chunks[1]);
+            } else {
+                let job_items: Vec<ListItem> = execution
+                    .jobs
+                    .iter()
+                    .map(|job| {
+                        let status_symbol = match job.status {
+                            JobStatus::Success => "✅",
+                            JobStatus::Failure => "❌",
+                            JobStatus::Skipped => "⏭",
+                        };
 
-                    let status_style = match job.status {
-                        JobStatus::Success => Style::default().fg(Color::Green),
-                        JobStatus::Failure => Style::default().fg(Color::Red),
-                        JobStatus::Skipped => Style::default().fg(Color::Gray),
-                    };
+                        let status_style = match job.status {
+                            JobStatus::Success => Style::default().fg(Color::Green),
+                            JobStatus::Failure => Style::default().fg(Color::Red),
+                            JobStatus::Skipped => Style::default().fg(Color::Gray),
+                        };
 
-                    ListItem::new(Spans::from(vec![
-                        Span::styled(status_indicator, status_style),
-                        Span::raw(job.name.clone()),
-                    ]))
-                })
-                .collect();
+                        // Count completed and total steps
+                        let total_steps = job.steps.len();
+                        let completed_steps = job
+                            .steps
+                            .iter()
+                            .filter(|s| {
+                                s.status == StepStatus::Success || s.status == StepStatus::Failure
+                            })
+                            .count();
 
-            let jobs_list =
-                List::new(job_items).block(Block::default().borders(Borders::ALL).title("Jobs"));
+                        let steps_info = format!("[{}/{}]", completed_steps, total_steps);
 
-            f.render_widget(jobs_list, chunks[1]);
+                        ListItem::new(Line::from(vec![
+                            Span::styled(status_symbol, status_style),
+                            Span::raw(" "),
+                            Span::styled(&job.name, Style::default().fg(Color::White)),
+                            Span::raw(" "),
+                            Span::styled(steps_info, Style::default().fg(Color::DarkGray)),
+                        ]))
+                    })
+                    .collect();
+
+                let jobs_list = List::new(job_items)
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_type(BorderType::Rounded)
+                            .title(Span::styled(" Jobs ", Style::default().fg(Color::Yellow))),
+                    )
+                    .highlight_style(
+                        Style::default()
+                            .bg(Color::DarkGray)
+                            .add_modifier(Modifier::BOLD),
+                    )
+                    .highlight_symbol("» ");
+
+                f.render_stateful_widget(jobs_list, chunks[1], &mut app.job_list_state);
+            }
 
             // Execution info section
             let mut execution_info = Vec::new();
 
-            execution_info.push(Spans::from(vec![
-                Span::raw("Started: "),
+            execution_info.push(Line::from(vec![
+                Span::styled("Started: ", Style::default().fg(Color::Blue)),
                 Span::styled(
                     execution.start_time.format("%Y-%m-%d %H:%M:%S").to_string(),
-                    Style::default(),
+                    Style::default().fg(Color::White),
                 ),
             ]));
 
             if let Some(end_time) = execution.end_time {
-                execution_info.push(Spans::from(vec![
-                    Span::raw("Finished: "),
+                execution_info.push(Line::from(vec![
+                    Span::styled("Finished: ", Style::default().fg(Color::Blue)),
                     Span::styled(
                         end_time.format("%Y-%m-%d %H:%M:%S").to_string(),
-                        Style::default(),
+                        Style::default().fg(Color::White),
                     ),
                 ]));
 
                 // Calculate duration
                 let duration = end_time.signed_duration_since(execution.start_time);
-                execution_info.push(Spans::from(vec![
-                    Span::raw("Duration: "),
+                execution_info.push(Line::from(vec![
+                    Span::styled("Duration: ", Style::default().fg(Color::Blue)),
                     Span::styled(
                         format!(
                             "{}m {}s",
                             duration.num_minutes(),
                             duration.num_seconds() % 60
                         ),
-                        Style::default(),
+                        Style::default().fg(Color::White),
+                    ),
+                ]));
+            } else {
+                // Show running time for active workflows
+                let current_time = Local::now();
+                let running_time = current_time.signed_duration_since(execution.start_time);
+                execution_info.push(Line::from(vec![
+                    Span::styled("Running for: ", Style::default().fg(Color::Blue)),
+                    Span::styled(
+                        format!(
+                            "{}m {}s",
+                            running_time.num_minutes(),
+                            running_time.num_seconds() % 60
+                        ),
+                        Style::default().fg(Color::White),
                     ),
                 ]));
             }
 
+            // Add hint for Enter key to see details
+            execution_info.push(Line::from(""));
+            execution_info.push(Line::from(vec![
+                Span::styled("Press ", Style::default().fg(Color::DarkGray)),
+                Span::styled("Enter", Style::default().fg(Color::Yellow)),
+                Span::styled(" to view job details", Style::default().fg(Color::DarkGray)),
+            ]));
+
             let info_widget = Paragraph::new(execution_info).block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title("Execution Information"),
+                    .border_type(BorderType::Rounded)
+                    .title(Span::styled(
+                        " Execution Information ",
+                        Style::default().fg(Color::Yellow),
+                    )),
             );
 
             f.render_widget(info_widget, chunks[2]);
         } else {
             // No execution details yet
             let placeholder = Paragraph::new("Execution has not started yet...")
-                .block(Block::default().borders(Borders::ALL).title("Jobs"));
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Rounded)
+                        .title(Span::styled(" Jobs ", Style::default().fg(Color::Yellow))),
+                )
+                .alignment(Alignment::Center);
 
             f.render_widget(placeholder, chunks[1]);
 
-            let info_placeholder = Paragraph::new("Waiting for execution to start...").block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title("Execution Information"),
-            );
+            let info_placeholder = Paragraph::new("Waiting for execution to start...")
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Rounded)
+                        .title(Span::styled(
+                            " Execution Information ",
+                            Style::default().fg(Color::Yellow),
+                        )),
+                )
+                .alignment(Alignment::Center);
 
             f.render_widget(info_placeholder, chunks[2]);
         }
     } else {
         // No workflow execution to display
-        let placeholder = Paragraph::new("No workflow execution data available.\n\nSelect workflows in the Workflows tab and press 'r' to run them.")
-            .block(Block::default().borders(Borders::ALL).title("Execution"))
-            .wrap(Wrap { trim: true });
+        let placeholder = Paragraph::new(vec![
+            Line::from(""),
+            Line::from(vec![Span::styled(
+                "No workflow execution data available.",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )]),
+            Line::from(""),
+            Line::from("Select workflows in the Workflows tab and press 'r' to run them."),
+            Line::from(""),
+            Line::from("Or press Enter on a selected workflow to run it directly."),
+        ])
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .title(Span::styled(
+                    " Execution ",
+                    Style::default().fg(Color::Yellow),
+                )),
+        )
+        .alignment(Alignment::Center);
 
         f.render_widget(placeholder, area);
     }
 }
 
 // Render detailed job view
-fn render_job_detail_view(f: &mut tui::Frame<CrosstermBackend<io::Stdout>>, app: &App, area: Rect) {
+fn render_job_detail_view(f: &mut Frame<CrosstermBackend<io::Stdout>>, app: &mut App, area: Rect) {
     // Get the current workflow and job
-    if let Some(workflow_idx) = app.current_execution.or_else(|| {
-        app.workflows
-            .iter()
-            .position(|w| matches!(w.status, WorkflowStatus::Success | WorkflowStatus::Failed))
-    }) {
+    let current_workflow_idx = app
+        .current_execution
+        .or_else(|| app.workflow_list_state.selected())
+        .filter(|&idx| idx < app.workflows.len());
+
+    if let Some(workflow_idx) = current_workflow_idx {
         let workflow = &app.workflows[workflow_idx];
 
         if let Some(execution) = &workflow.execution_details {
             if execution.jobs.is_empty() {
                 let placeholder = Paragraph::new("This job has no steps or execution data.")
-                    .block(Block::default().borders(Borders::ALL).title("Job Details"))
-                    .wrap(Wrap { trim: true });
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_type(BorderType::Rounded)
+                            .title(Span::styled(
+                                " Job Details ",
+                                Style::default().fg(Color::Yellow),
+                            )),
+                    )
+                    .alignment(Alignment::Center);
 
                 f.render_widget(placeholder, area);
                 return;
             }
 
             // Ensure job index is valid
-            let job_idx = app.selected_job_index.min(execution.jobs.len() - 1);
+            let job_idx = app
+                .job_list_state
+                .selected()
+                .unwrap_or(0)
+                .min(execution.jobs.len() - 1);
             let job = &execution.jobs[job_idx];
 
-            // Split area
+            // Split area for job details
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints(
                     [
-                        Constraint::Length(3), // Job info
-                        Constraint::Min(10),   // Steps list
-                        Constraint::Length(8), // Step output
+                        Constraint::Length(4), // Job info
+                        Constraint::Length(7), // Steps list with border
+                        Constraint::Min(3),    // Step output
                     ]
                     .as_ref(),
                 )
+                .margin(1)
                 .split(area);
 
             // Job info
@@ -866,197 +1306,443 @@ fn render_job_detail_view(f: &mut tui::Frame<CrosstermBackend<io::Stdout>>, app:
                 JobStatus::Skipped => Style::default().fg(Color::Gray),
             };
 
+            let status_text = match job.status {
+                JobStatus::Success => "Success",
+                JobStatus::Failure => "Failed",
+                JobStatus::Skipped => "Skipped",
+            };
+
             let job_info = Paragraph::new(vec![
-                Spans::from(vec![
-                    Span::raw("Job: "),
+                Line::from(vec![
+                    Span::styled("Job: ", Style::default().fg(Color::Blue)),
                     Span::styled(
                         job.name.clone(),
-                        Style::default().add_modifier(Modifier::BOLD),
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD),
                     ),
                 ]),
-                Spans::from(vec![
-                    Span::raw("Status: "),
-                    Span::styled(format!("{:?}", job.status), status_style),
+                Line::from(vec![
+                    Span::styled("Status: ", Style::default().fg(Color::Blue)),
+                    Span::styled(status_text, status_style),
+                ]),
+                Line::from(vec![
+                    Span::styled("Steps: ", Style::default().fg(Color::Blue)),
+                    Span::styled(
+                        format!("{}", job.steps.len()),
+                        Style::default().fg(Color::White),
+                    ),
                 ]),
             ])
-            .block(Block::default().borders(Borders::ALL).title(format!(
-                "Job Details ({}/{})",
-                job_idx + 1,
-                execution.jobs.len()
-            )));
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .title(Span::styled(
+                        format!(" Job Details ({}/{}) ", job_idx + 1, execution.jobs.len()),
+                        Style::default().fg(Color::Yellow),
+                    )),
+            );
 
             f.render_widget(job_info, chunks[0]);
 
-            // Steps list
-            let step_items: Vec<ListItem> = job
-                .steps
+            // Steps list with more details
+            // Create a table for better aligned step information
+            let header_cells = ["Status", "Step Name", "Duration"]
                 .iter()
-                .map(|step| {
-                    let status_indicator = match step.status {
-                        StepStatus::Success => "✓ ",
-                        StepStatus::Failure => "✗ ",
-                        StepStatus::Skipped => "- ",
-                    };
+                .map(|h| Cell::from(*h).style(Style::default().fg(Color::Yellow)));
 
-                    let status_style = match step.status {
-                        StepStatus::Success => Style::default().fg(Color::Green),
-                        StepStatus::Failure => Style::default().fg(Color::Red),
-                        StepStatus::Skipped => Style::default().fg(Color::Gray),
-                    };
+            let header = Row::new(header_cells)
+                .style(Style::default().add_modifier(Modifier::BOLD))
+                .height(1);
 
-                    ListItem::new(Spans::from(vec![
-                        Span::styled(status_indicator, status_style),
-                        Span::raw(step.name.clone()),
-                    ]))
-                })
-                .collect();
+            let rows = job.steps.iter().map(|step| {
+                let status_symbol = match step.status {
+                    StepStatus::Success => "✅",
+                    StepStatus::Failure => "❌",
+                    StepStatus::Skipped => "⏭",
+                };
 
-            let steps_list =
-                List::new(step_items).block(Block::default().borders(Borders::ALL).title("Steps"));
+                let status_style = match step.status {
+                    StepStatus::Success => Style::default().fg(Color::Green),
+                    StepStatus::Failure => Style::default().fg(Color::Red),
+                    StepStatus::Skipped => Style::default().fg(Color::Gray),
+                };
 
-            f.render_widget(steps_list, chunks[1]);
+                // Calculate fake duration (would be real in a complete app)
+                let duration = "1s";
+
+                Row::new(vec![
+                    Cell::from(status_symbol).style(status_style),
+                    Cell::from(step.name.clone()),
+                    Cell::from(duration).style(Style::default().fg(Color::DarkGray)),
+                ])
+                .height(1)
+            });
+
+            let steps_table = Table::new(rows)
+                .header(header)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Rounded)
+                        .title(Span::styled(" Steps ", Style::default().fg(Color::Yellow))),
+                )
+                .highlight_style(Style::default().bg(Color::DarkGray))
+                .highlight_symbol("» ")
+                .widths(&[
+                    Constraint::Length(8),      // Status column
+                    Constraint::Percentage(70), // Name column (takes most space)
+                    Constraint::Length(10),     // Duration column
+                ]);
+
+            f.render_stateful_widget(steps_table, chunks[1], &mut app.step_table_state);
 
             // Step output - show output from the selected step
             let output_text = if !job.steps.is_empty() {
-                // For simplicity, we'll show output from the first failed step if any, or the first step otherwise
-                let step = job
-                    .steps
-                    .iter()
-                    .find(|s| s.status == StepStatus::Failure)
-                    .unwrap_or(&job.steps[0]);
+                let step_idx = app
+                    .step_list_state
+                    .selected()
+                    .unwrap_or(0)
+                    .min(job.steps.len() - 1);
+                let step = &job.steps[step_idx];
 
                 let mut output = step.output.clone();
                 if output.is_empty() {
                     output = "No output for this step.".to_string();
                 }
 
-                // Limit output to prevent performance issues
+                // Limit output to prevent performance issues with very long strings
                 if output.len() > 2000 {
-                    output.truncate(2000);
-                    output.push_str("\n... (output truncated) ...");
+                    let truncated = &output[..2000];
+                    format!("{}\n... (output truncated) ...", truncated)
+                } else {
+                    output
                 }
-
-                format!("Step output ({}): \n{}", step.name, output)
             } else {
                 "No steps to display output for.".to_string()
             };
 
             let output_widget = Paragraph::new(output_text)
-                .block(Block::default().borders(Borders::ALL).title("Output"))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Rounded)
+                        .title(Span::styled(" Output ", Style::default().fg(Color::Yellow))),
+                )
                 .wrap(Wrap { trim: true });
 
             f.render_widget(output_widget, chunks[2]);
         } else {
             // No execution details
             let placeholder = Paragraph::new("No job execution details available.")
-                .block(Block::default().borders(Borders::ALL).title("Job Details"))
-                .wrap(Wrap { trim: true });
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Rounded)
+                        .title(Span::styled(
+                            " Job Details ",
+                            Style::default().fg(Color::Yellow),
+                        )),
+                )
+                .alignment(Alignment::Center);
 
             f.render_widget(placeholder, area);
         }
     } else {
         // No workflow selected
         let placeholder = Paragraph::new("No workflow execution available to display details.")
-            .block(Block::default().borders(Borders::ALL).title("Job Details"))
-            .wrap(Wrap { trim: true });
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .title(Span::styled(
+                        " Job Details ",
+                        Style::default().fg(Color::Yellow),
+                    )),
+            )
+            .alignment(Alignment::Center);
 
         f.render_widget(placeholder, area);
     }
 }
 
 // Render the logs tab
-fn render_logs_tab(f: &mut tui::Frame<CrosstermBackend<io::Stdout>>, app: &App, area: Rect) {
+fn render_logs_tab(f: &mut Frame<CrosstermBackend<io::Stdout>>, app: &App, area: Rect) {
     // Combine application logs with system logs
     let mut all_logs = app.logs.clone();
     all_logs.extend(crate::logging::get_logs());
 
-    // Sort logs by timestamp (if we added timestamps to them)
-    // This might require additional parsing
+    // Create visible log lines, with timestamps and color coding
+    let log_items: Vec<ListItem> = all_logs
+        .iter()
+        .map(|log_line| {
+            // Try to parse log line to extract type (info, error, etc)
+            let style = if log_line.contains("Error")
+                || log_line.contains("error")
+                || log_line.contains("❌")
+            {
+                Style::default().fg(Color::Red)
+            } else if log_line.contains("Warning")
+                || log_line.contains("warning")
+                || log_line.contains("⚠️")
+            {
+                Style::default().fg(Color::Yellow)
+            } else if log_line.contains("Success")
+                || log_line.contains("success")
+                || log_line.contains("✅")
+            {
+                Style::default().fg(Color::Green)
+            } else if log_line.contains("Running")
+                || log_line.contains("running")
+                || log_line.contains("⟳")
+            {
+                Style::default().fg(Color::Cyan)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
 
-    let logs = all_logs.join("\n");
-    let logs_widget = Paragraph::new(logs)
+            ListItem::new(Line::from(Span::styled(log_line, style)))
+        })
+        .collect();
+
+    let logs_list = List::new(log_items)
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title("Execution Logs"),
+                .border_type(BorderType::Rounded)
+                .title(Span::styled(
+                    " Execution Logs ",
+                    Style::default().fg(Color::Yellow),
+                )),
         )
-        .wrap(Wrap { trim: true });
+        .start_corner(ratatui::layout::Corner::BottomLeft); // Show most recent logs at the bottom
 
-    f.render_widget(logs_widget, area);
+    f.render_widget(logs_list, area);
 }
 
 // Render the help tab
-fn render_help_tab(f: &mut tui::Frame<CrosstermBackend<io::Stdout>>, area: Rect) {
+fn render_help_tab(f: &mut Frame<CrosstermBackend<io::Stdout>>, area: Rect) {
     let help_text = vec![
-        Spans::from(Span::styled(
+        Line::from(Span::styled(
             "Keyboard Controls",
-            Style::default().add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         )),
-        Spans::from(""),
-        Spans::from(vec![
-            Span::styled("Tab", Style::default().add_modifier(Modifier::BOLD)),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(
+                "Tab",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw(" - Switch between tabs"),
         ]),
-        Spans::from(vec![
-            Span::styled("1-4", Style::default().add_modifier(Modifier::BOLD)),
+        Line::from(vec![
+            Span::styled(
+                "1-4",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw(" - Switch directly to tab"),
         ]),
-        Spans::from(vec![
+        Line::from(vec![
             Span::styled(
                 "Up/Down or j/k",
-                Style::default().add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::raw(" - Navigate lists"),
         ]),
-        Spans::from(vec![
-            Span::styled("Space", Style::default().add_modifier(Modifier::BOLD)),
+        Line::from(vec![
+            Span::styled(
+                "Space",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw(" - Toggle workflow selection"),
         ]),
-        Spans::from(vec![
-            Span::styled("Enter", Style::default().add_modifier(Modifier::BOLD)),
+        Line::from(vec![
+            Span::styled(
+                "Enter",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw(" - Run selected workflow / View job details"),
         ]),
-        Spans::from(vec![
-            Span::styled("r", Style::default().add_modifier(Modifier::BOLD)),
+        Line::from(vec![
+            Span::styled(
+                "r",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw(" - Run all selected workflows"),
         ]),
-        Spans::from(vec![
-            Span::styled("a", Style::default().add_modifier(Modifier::BOLD)),
+        Line::from(vec![
+            Span::styled(
+                "a",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw(" - Select all workflows"),
         ]),
-        Spans::from(vec![
-            Span::styled("n", Style::default().add_modifier(Modifier::BOLD)),
+        Line::from(vec![
+            Span::styled(
+                "n",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw(" - Deselect all workflows"),
         ]),
-        Spans::from(vec![
-            Span::styled("Esc", Style::default().add_modifier(Modifier::BOLD)),
+        Line::from(vec![
+            Span::styled(
+                "Esc",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw(" - Back / Exit detailed view"),
         ]),
-        Spans::from(vec![
-            Span::styled("q", Style::default().add_modifier(Modifier::BOLD)),
+        Line::from(vec![
+            Span::styled(
+                "q",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw(" - Quit application"),
         ]),
-        Spans::from(""),
-        Spans::from(Span::styled(
+        Line::from(""),
+        Line::from(Span::styled(
             "Runtime Modes",
-            Style::default().add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         )),
-        Spans::from(""),
-        Spans::from(vec![
-            Span::styled("Docker", Style::default().fg(Color::Cyan)),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(
+                "Docker",
+                Style::default()
+                    .fg(Color::Blue)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw(" - Uses Docker to run workflows (default)"),
         ]),
-        Spans::from(vec![
-            Span::styled("Emulation", Style::default().fg(Color::Yellow)),
+        Line::from(vec![
+            Span::styled(
+                "Emulation",
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw(" - Emulates GitHub Actions environment locally (no Docker required)"),
         ]),
     ];
 
     let help_widget = Paragraph::new(help_text)
-        .block(Block::default().borders(Borders::ALL).title("Help"))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .title(Span::styled(" Help ", Style::default().fg(Color::Yellow))),
+        )
         .wrap(Wrap { trim: true });
 
     f.render_widget(help_widget, area);
+}
+
+// Render a help overlay
+fn render_help_overlay(f: &mut Frame<CrosstermBackend<io::Stdout>>) {
+    let size = f.size();
+
+    // Create a slightly smaller centered modal
+    let width = size.width.min(60);
+    let height = size.height.min(20);
+    let x = (size.width - width) / 2;
+    let y = (size.height - height) / 2;
+
+    let help_area = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
+
+    // Create a clear background
+    let clear = Block::default().style(Style::default().bg(Color::Black));
+    f.render_widget(clear, size);
+
+    // Render the help content
+    render_help_tab(f, help_area);
+}
+
+// Render the status bar
+fn render_status_bar(f: &mut Frame<CrosstermBackend<io::Stdout>>, app: &App, area: Rect) {
+    let runtime_mode = match app.runtime_type {
+        RuntimeType::Docker => "Docker",
+        RuntimeType::Emulation => "Emulation",
+    };
+
+    let runtime_style = match app.runtime_type {
+        RuntimeType::Docker => Style::default()
+            .fg(Color::Blue)
+            .add_modifier(Modifier::BOLD),
+        RuntimeType::Emulation => Style::default()
+            .fg(Color::Magenta)
+            .add_modifier(Modifier::BOLD),
+    };
+
+    // Left side of status bar
+    let left_text = Line::from(vec![
+        Span::raw("Runtime: "),
+        Span::styled(runtime_mode, runtime_style),
+        Span::raw(" | "),
+        Span::styled(
+            format!("{} workflow(s) loaded", app.workflows.len()),
+            Style::default().fg(Color::White),
+        ),
+    ]);
+
+    // Right side of status bar
+    let right_text = Line::from(vec![
+        Span::styled(
+            "q",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(": Quit | "),
+        Span::styled(
+            "?",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(": Help"),
+    ]);
+
+    // Create a layout with two parts for left and right aligned text
+    let status_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(area);
+
+    let left_status = Paragraph::new(left_text).alignment(Alignment::Left);
+
+    let right_status = Paragraph::new(right_text).alignment(Alignment::Right);
+
+    f.render_widget(left_status, status_chunks[0]);
+    f.render_widget(right_status, status_chunks[1]);
 }
 
 // Validate a workflow or directory containing workflows
@@ -1117,7 +1803,6 @@ pub fn validate_workflow(path: &PathBuf, verbose: bool) -> io::Result<()> {
     Ok(())
 }
 
-// Execute a workflow in CLI mode (not TUI)
 pub async fn execute_workflow_cli(
     path: &PathBuf,
     runtime_type: RuntimeType,
@@ -1168,7 +1853,7 @@ pub async fn execute_workflow_cli(
                         println!("\n❌ Job failed: {}", job.name);
                     }
                     JobStatus::Skipped => {
-                        println!("\n⚠️ Job skipped: {}", job.name);
+                        println!("\n⏭️ Job skipped: {}", job.name);
                     }
                 }
 
@@ -1197,7 +1882,7 @@ pub async fn execute_workflow_cli(
                             println!("    {}", output.trim().replace('\n', "\n    "));
                         }
                         StepStatus::Skipped => {
-                            println!("  ⚠️ {} (skipped)", step.name);
+                            println!("  ⏭️ {} (skipped)", step.name);
                         }
                     }
                 }

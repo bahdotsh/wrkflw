@@ -49,6 +49,7 @@ pub fn get_logs() -> Vec<String> {
 }
 
 // Clear all logs
+#[allow(dead_code)]
 pub fn clear_logs() {
     if let Ok(mut logs) = LOGS.lock() {
         logs.clear();
@@ -56,6 +57,7 @@ pub fn clear_logs() {
 }
 
 // Convenience functions for different log levels
+#[allow(dead_code)]
 pub fn debug(message: &str) {
     log(LogLevel::Debug, message);
 }

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fs;
 use std::path::Path;
 use thiserror::Error;
 
@@ -79,6 +80,7 @@ pub struct JobResult {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
 pub enum JobStatus {
     Success,
     Failure,
@@ -355,9 +357,27 @@ async fn execute_step(
                 output,
             })
         } else {
-            // Other actions - original code for handling non-checkout actions
+            // Get action info
             let image = prepare_action(&action_info, runtime).await?;
 
+            // Special handling for composite actions
+            if image == "composite" && action_info.is_local {
+                // Handle composite action
+                let action_path = Path::new(&action_info.repository);
+                return execute_composite_action(
+                    step,
+                    action_path,
+                    &step_env,
+                    working_dir,
+                    runtime,
+                    job_runs_on,
+                    verbose,
+                )
+                .await;
+            }
+
+            // Regular Docker or JavaScript action processing
+            // ... (rest of the existing code for handling regular actions)
             // Build command for Docker action
             let mut cmd = Vec::new();
             let mut owned_strings = Vec::new(); // Keep strings alive until after we use cmd
@@ -613,4 +633,209 @@ async fn prepare_runner_image(
     }
 
     Ok(())
+}
+
+async fn execute_composite_action(
+    step: &crate::parser::workflow::Step,
+    action_path: &Path,
+    job_env: &HashMap<String, String>,
+    working_dir: &Path,
+    runtime: &Box<dyn ContainerRuntime>,
+    job_runs_on: &str,
+    verbose: bool,
+) -> Result<StepResult, ExecutionError> {
+    // Find the action definition file
+    let action_yaml = action_path.join("action.yml");
+    let action_yaml_alt = action_path.join("action.yaml");
+
+    let action_file = if action_yaml.exists() {
+        action_yaml
+    } else if action_yaml_alt.exists() {
+        action_yaml_alt
+    } else {
+        return Err(ExecutionError::ExecutionError(format!(
+            "No action.yml or action.yaml found in {}",
+            action_path.display()
+        )));
+    };
+
+    // Parse the composite action definition
+    let action_content = fs::read_to_string(&action_file).map_err(|e| {
+        ExecutionError::ExecutionError(format!("Failed to read action file: {}", e))
+    })?;
+
+    let action_def: serde_yaml::Value = serde_yaml::from_str(&action_content)
+        .map_err(|e| ExecutionError::ExecutionError(format!("Invalid action YAML: {}", e)))?;
+
+    // Check if it's a composite action
+    match action_def.get("runs").and_then(|v| v.get("using")) {
+        Some(serde_yaml::Value::String(using)) if using == "composite" => {
+            // Get the steps
+            let steps = match action_def.get("runs").and_then(|v| v.get("steps")) {
+                Some(serde_yaml::Value::Sequence(steps)) => steps,
+                _ => {
+                    return Err(ExecutionError::ExecutionError(
+                        "Composite action is missing steps".to_string(),
+                    ))
+                }
+            };
+
+            // Process inputs from the calling step's 'with' parameters
+            let mut action_env = job_env.clone();
+            if let Some(inputs_def) = action_def.get("inputs") {
+                if let Some(inputs_map) = inputs_def.as_mapping() {
+                    for (input_name, input_def) in inputs_map {
+                        if let Some(input_name_str) = input_name.as_str() {
+                            // Get default value if available
+                            let default_value = input_def
+                                .get("default")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+
+                            // Check if the input was provided in the 'with' section
+                            let input_value = step
+                                .with
+                                .as_ref()
+                                .and_then(|with| with.get(input_name_str))
+                                .unwrap_or(&default_value.to_string())
+                                .clone();
+
+                            // Add to environment as INPUT_X
+                            action_env.insert(
+                                format!("INPUT_{}", input_name_str.to_uppercase()),
+                                input_value,
+                            );
+                        }
+                    }
+                }
+            }
+
+            // Execute each step
+            let mut step_outputs = Vec::new();
+            for (idx, step_def) in steps.iter().enumerate() {
+                // Convert the YAML step to our Step struct
+                let composite_step = match convert_yaml_to_step(step_def) {
+                    Ok(step) => step,
+                    Err(e) => {
+                        return Err(ExecutionError::ExecutionError(format!(
+                            "Failed to process composite action step {}: {}",
+                            idx + 1,
+                            e
+                        )))
+                    }
+                };
+
+                // Execute the step - using Box::pin to handle async recursion
+                let step_result = Box::pin(execute_step(
+                    &composite_step,
+                    idx,
+                    &action_env,
+                    working_dir,
+                    runtime,
+                    &crate::parser::workflow::WorkflowDefinition {
+                        name: "Composite Action".to_string(),
+                        on: vec![],
+                        on_raw: serde_yaml::Value::Null,
+                        jobs: HashMap::new(),
+                    },
+                    job_runs_on,
+                    verbose,
+                ))
+                .await?;
+
+                // Add output to results
+                step_outputs.push(format!("Step {}: {}", idx + 1, step_result.output));
+
+                // Short-circuit on failure if needed
+                if step_result.status == StepStatus::Failure {
+                    return Ok(StepResult {
+                        name: step
+                            .name
+                            .clone()
+                            .unwrap_or_else(|| "Composite Action".to_string()),
+                        status: StepStatus::Failure,
+                        output: format!("Composite action failed:\n{}", step_outputs.join("\n")),
+                    });
+                }
+            }
+
+            // All steps completed successfully
+            Ok(StepResult {
+                name: step
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| "Composite Action".to_string()),
+                status: StepStatus::Success,
+                output: format!("Composite action completed:\n{}", step_outputs.join("\n")),
+            })
+        }
+        _ => Err(ExecutionError::ExecutionError(
+            "Action is not a composite action or has invalid format".to_string(),
+        )),
+    }
+}
+
+// Helper function to convert YAML step to our Step struct
+fn convert_yaml_to_step(
+    step_yaml: &serde_yaml::Value,
+) -> Result<crate::parser::workflow::Step, String> {
+    // Extract step properties
+    let name = step_yaml
+        .get("name")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let uses = step_yaml
+        .get("uses")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let run = step_yaml
+        .get("run")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let shell = step_yaml
+        .get("shell")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let with = step_yaml.get("with").and_then(|v| v.as_mapping()).map(|m| {
+        let mut with_map = HashMap::new();
+        for (k, v) in m {
+            if let (Some(key), Some(value)) = (k.as_str(), v.as_str()) {
+                with_map.insert(key.to_string(), value.to_string());
+            }
+        }
+        with_map
+    });
+
+    let env = step_yaml
+        .get("env")
+        .and_then(|v| v.as_mapping())
+        .map(|m| {
+            let mut env_map = HashMap::new();
+            for (k, v) in m {
+                if let (Some(key), Some(value)) = (k.as_str(), v.as_str()) {
+                    env_map.insert(key.to_string(), value.to_string());
+                }
+            }
+            env_map
+        })
+        .unwrap_or_default();
+
+    // For composite steps with shell, construct a run step
+    let final_run = if shell.is_some() && run.is_some() {
+        run
+    } else {
+        run
+    };
+
+    Ok(crate::parser::workflow::Step {
+        name,
+        uses,
+        run: final_run,
+        with: with,
+        env,
+    })
 }

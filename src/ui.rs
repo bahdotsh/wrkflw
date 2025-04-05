@@ -697,12 +697,10 @@ pub fn run_tui(
                         // Cycle through tabs backwards
                         app.switch_tab((app.selected_tab + 3) % 4);
                     }
-                    KeyCode::Char('1') => app.switch_tab(0),
-                    KeyCode::Char('2') => app.switch_tab(1),
-                    KeyCode::Char('3') => app.switch_tab(2),
-                    KeyCode::Char('4') | KeyCode::Char('?') | KeyCode::Char('h') => {
-                        app.switch_tab(3)
-                    }
+                    KeyCode::Char('1') | KeyCode::Char('w') => app.switch_tab(0),
+                    KeyCode::Char('2') | KeyCode::Char('e') => app.switch_tab(1),
+                    KeyCode::Char('3') | KeyCode::Char('l') => app.switch_tab(2),
+                    KeyCode::Char('4') | KeyCode::Char('h') => app.switch_tab(3),
                     KeyCode::Up | KeyCode::Char('k') => match app.selected_tab {
                         0 => app.previous_workflow(),
                         1 => {

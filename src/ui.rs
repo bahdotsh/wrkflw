@@ -80,6 +80,7 @@ struct App {
     running: bool,
     show_help: bool,
     runtime_type: RuntimeType,
+    validation_mode: bool,
     execution_queue: Vec<usize>, // Indices of workflows to execute
     current_execution: Option<usize>,
     logs: Vec<String>,            // Overall execution logs
@@ -113,6 +114,7 @@ impl App {
             running: false,
             show_help: false,
             runtime_type,
+            validation_mode: false,
             execution_queue: Vec::new(),
             current_execution: None,
             logs: Vec::new(),
@@ -132,6 +134,32 @@ impl App {
             if idx < self.workflows.len() {
                 self.workflows[idx].selected = !self.workflows[idx].selected;
             }
+        }
+    }
+
+    fn toggle_emulation_mode(&mut self) {
+        self.runtime_type = match self.runtime_type {
+            RuntimeType::Docker => RuntimeType::Emulation,
+            RuntimeType::Emulation => RuntimeType::Docker,
+        };
+        self.logs
+            .push(format!("Switched to {} mode", self.runtime_type_name()));
+    }
+
+    fn toggle_validation_mode(&mut self) {
+        self.validation_mode = !self.validation_mode;
+        let mode = if self.validation_mode {
+            "validation"
+        } else {
+            "execution"
+        };
+        self.logs.push(format!("Switched to {} mode", mode));
+    }
+
+    fn runtime_type_name(&self) -> &str {
+        match self.runtime_type {
+            RuntimeType::Docker => "Docker",
+            RuntimeType::Emulation => "Emulation",
         }
     }
 
@@ -346,6 +374,15 @@ impl App {
         self.running = true;
         self.logs.push("Starting workflow execution...".to_string());
         logging::info("Starting workflow execution...");
+
+        if self.validation_mode {
+            self.logs
+                .push("Starting workflow validation...".to_string());
+            logging::info("Starting workflow validation...");
+        } else {
+            self.logs.push("Starting workflow execution...".to_string());
+            logging::info("Starting workflow execution...");
+        }
 
         // Update all queued workflows to "Queued" state
         for &idx in &self.execution_queue {
@@ -646,25 +683,89 @@ pub fn run_tui(
                 thread::spawn(move || {
                     let runtime = tokio::runtime::Runtime::new().unwrap();
                     let result = runtime.block_on(async {
-                        match executor::execute_workflow(&workflow_path, runtime_type, verbose)
-                            .await
-                        {
-                            Ok(result) => result,
-                            Err(e) => {
-                                // Create a failed execution result with error message
-                                let failed_job = executor::JobResult {
-                                    name: "Error".to_string(),
-                                    status: JobStatus::Failure,
-                                    steps: vec![executor::StepResult {
-                                        name: "Execution Error".to_string(),
-                                        status: StepStatus::Failure,
-                                        output: format!("Error: {}", e),
-                                    }],
-                                    logs: format!("Error executing workflow: {}", e),
-                                };
+                        if app.validation_mode {
+                            // Perform validation instead of execution
+                            match evaluate_workflow_file(&workflow_path, verbose) {
+                                Ok(validation_result) => {
+                                    // Create execution result based on validation
+                                    let status = if validation_result.is_valid {
+                                        JobStatus::Success
+                                    } else {
+                                        JobStatus::Failure
+                                    };
 
-                                ExecutionResult {
-                                    jobs: vec![failed_job],
+                                    let steps = vec![executor::StepResult {
+                                        name: "Validation".to_string(),
+                                        status: if validation_result.is_valid {
+                                            StepStatus::Success
+                                        } else {
+                                            StepStatus::Failure
+                                        },
+                                        output: if validation_result.is_valid {
+                                            "Workflow is valid".to_string()
+                                        } else {
+                                            format!(
+                                                "Validation issues:\n{}",
+                                                validation_result.issues.join("\n")
+                                            )
+                                        },
+                                    }];
+
+                                    ExecutionResult {
+                                        jobs: vec![executor::JobResult {
+                                            name: "Validation".to_string(),
+                                            status,
+                                            steps,
+                                            logs: if validation_result.is_valid {
+                                                "Workflow validation succeeded".to_string()
+                                            } else {
+                                                format!(
+                                                    "Workflow validation failed:\n{}",
+                                                    validation_result.issues.join("\n")
+                                                )
+                                            },
+                                        }],
+                                    }
+                                }
+                                Err(e) => {
+                                    // Error during validation
+                                    let failed_job = executor::JobResult {
+                                        name: "Validation Error".to_string(),
+                                        status: JobStatus::Failure,
+                                        steps: vec![executor::StepResult {
+                                            name: "Validation Error".to_string(),
+                                            status: StepStatus::Failure,
+                                            output: format!("Error: {}", e),
+                                        }],
+                                        logs: format!("Error validating workflow: {}", e),
+                                    };
+
+                                    ExecutionResult {
+                                        jobs: vec![failed_job],
+                                    }
+                                }
+                            }
+                        } else {
+                            match executor::execute_workflow(&workflow_path, runtime_type, verbose)
+                                .await
+                            {
+                                Ok(result) => result,
+                                Err(e) => {
+                                    // Create a failed execution result with error message
+                                    let failed_job = executor::JobResult {
+                                        name: "Error".to_string(),
+                                        status: JobStatus::Failure,
+                                        steps: vec![executor::StepResult {
+                                            name: "Execution Error".to_string(),
+                                            status: StepStatus::Failure,
+                                            output: format!("Error: {}", e),
+                                        }],
+                                        logs: format!("Error executing workflow: {}", e),
+                                    };
+
+                                    ExecutionResult {
+                                        jobs: vec![failed_job],
+                                    }
                                 }
                             }
                         }
@@ -698,7 +799,7 @@ pub fn run_tui(
                         app.switch_tab((app.selected_tab + 3) % 4);
                     }
                     KeyCode::Char('1') | KeyCode::Char('w') => app.switch_tab(0),
-                    KeyCode::Char('2') | KeyCode::Char('e') => app.switch_tab(1),
+                    KeyCode::Char('2') | KeyCode::Char('x') => app.switch_tab(1),
                     KeyCode::Char('3') | KeyCode::Char('l') => app.switch_tab(2),
                     KeyCode::Char('4') | KeyCode::Char('h') => app.switch_tab(3),
                     KeyCode::Up | KeyCode::Char('k') => match app.selected_tab {
@@ -761,6 +862,16 @@ pub fn run_tui(
                             for workflow in &mut app.workflows {
                                 workflow.selected = true;
                             }
+                        }
+                    }
+                    KeyCode::Char('e') => {
+                        if !app.running {
+                            app.toggle_emulation_mode();
+                        }
+                    }
+                    KeyCode::Char('v') => {
+                        if !app.running {
+                            app.toggle_validation_mode();
                         }
                     }
                     KeyCode::Char('n') => {
@@ -835,17 +946,36 @@ fn render_title_bar(f: &mut Frame<CrosstermBackend<io::Stdout>>, app: &App, area
     let tabs = Tabs::new(
         titles
             .iter()
-            .map(|t| {
-                let (first, rest) = t.split_at(1);
-                Line::from(vec![
-                    Span::styled(
-                        first,
-                        Style::default()
-                            .fg(Color::Yellow)
-                            .add_modifier(Modifier::UNDERLINED),
-                    ),
-                    Span::styled(rest, Style::default().fg(Color::White)),
-                ])
+            .enumerate()
+            .map(|(i, t)| {
+                if i == 1 {
+                    // Special case for "Execution"
+                    let e_part = &t[0..1]; // "E"
+                    let x_part = &t[1..2]; // "x"
+                    let rest = &t[2..]; // "ecution"
+                    Line::from(vec![
+                        Span::styled(e_part, Style::default().fg(Color::White)),
+                        Span::styled(
+                            x_part,
+                            Style::default()
+                                .fg(Color::Yellow)
+                                .add_modifier(Modifier::UNDERLINED),
+                        ),
+                        Span::styled(rest, Style::default().fg(Color::White)),
+                    ])
+                } else {
+                    // Original styling for other tabs
+                    let (first, rest) = t.split_at(1);
+                    Line::from(vec![
+                        Span::styled(
+                            first,
+                            Style::default()
+                                .fg(Color::Yellow)
+                                .add_modifier(Modifier::UNDERLINED),
+                        ),
+                        Span::styled(rest, Style::default().fg(Color::White)),
+                    ])
+                }
             })
             .collect(),
     )
@@ -1594,6 +1724,24 @@ fn render_help_tab(f: &mut Frame<CrosstermBackend<io::Stdout>>, area: Rect) {
         ]),
         Line::from(vec![
             Span::styled(
+                "e",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" - Toggle between Docker and Emulation mode"),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "v",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" - Toggle between Execution and Validation mode"),
+        ]),
+        Line::from(vec![
+            Span::styled(
                 "n",
                 Style::default()
                     .fg(Color::Yellow)
@@ -1700,10 +1848,29 @@ fn render_status_bar(f: &mut Frame<CrosstermBackend<io::Stdout>>, app: &App, are
             .add_modifier(Modifier::BOLD),
     };
 
+    let mode_text = if app.validation_mode {
+        "VALIDATION"
+    } else {
+        "EXECUTION"
+    };
+
+    let mode_style = if app.validation_mode {
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD)
+    };
+
     // Left side of status bar
     let left_text = Line::from(vec![
         Span::raw("Runtime: "),
         Span::styled(runtime_mode, runtime_style),
+        Span::raw(" | "),
+        Span::raw("Mode: "),
+        Span::styled(mode_text, mode_style),
         Span::raw(" | "),
         Span::styled(
             format!("{} workflow(s) loaded", app.workflows.len()),
@@ -1714,19 +1881,26 @@ fn render_status_bar(f: &mut Frame<CrosstermBackend<io::Stdout>>, app: &App, are
     // Right side of status bar
     let right_text = Line::from(vec![
         Span::styled(
+            "e",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(": Toggle Emulation | "),
+        Span::styled(
+            "v",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(": Toggle Validation | "),
+        Span::styled(
             "q",
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::raw(": Quit | "),
-        Span::styled(
-            "?",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(": Help"),
+        Span::raw(": Quit"),
     ]);
 
     // Create a layout with two parts for left and right aligned text

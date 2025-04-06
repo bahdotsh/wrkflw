@@ -1,8 +1,31 @@
 use crate::parser::workflow::WorkflowDefinition;
 use chrono::Utc;
-use std::collections::HashMap;
+use std::{collections::HashMap, fs, io, path::Path};
 
-pub fn create_github_context(workflow: &WorkflowDefinition) -> HashMap<String, String> {
+pub fn setup_github_environment_files(workspace_dir: &Path) -> io::Result<()> {
+    // Create necessary directories
+    let github_dir = workspace_dir.join("github");
+    fs::create_dir_all(&github_dir)?;
+
+    // Create common GitHub environment files
+    let github_output = github_dir.join("output");
+    let github_env = github_dir.join("env");
+    let github_path = github_dir.join("path");
+    let github_step_summary = github_dir.join("step_summary");
+
+    // Initialize files with empty content
+    fs::write(&github_output, "")?;
+    fs::write(&github_env, "")?;
+    fs::write(&github_path, "")?;
+    fs::write(&github_step_summary, "")?;
+
+    Ok(())
+}
+
+pub fn create_github_context(
+    workflow: &WorkflowDefinition,
+    workspace_dir: &Path,
+) -> HashMap<String, String> {
     let mut env = HashMap::new();
 
     // Basic GitHub environment variables
@@ -14,6 +37,40 @@ pub fn create_github_context(workflow: &WorkflowDefinition) -> HashMap<String, S
     env.insert("GITHUB_WORKSPACE".to_string(), get_workspace_path());
     env.insert("GITHUB_SHA".to_string(), get_current_sha());
     env.insert("GITHUB_REF".to_string(), get_current_ref());
+
+    // File paths for GitHub Actions
+    env.insert(
+        "GITHUB_OUTPUT".to_string(),
+        workspace_dir
+            .join("github")
+            .join("output")
+            .to_string_lossy()
+            .to_string(),
+    );
+    env.insert(
+        "GITHUB_ENV".to_string(),
+        workspace_dir
+            .join("github")
+            .join("env")
+            .to_string_lossy()
+            .to_string(),
+    );
+    env.insert(
+        "GITHUB_PATH".to_string(),
+        workspace_dir
+            .join("github")
+            .join("path")
+            .to_string_lossy()
+            .to_string(),
+    );
+    env.insert(
+        "GITHUB_STEP_SUMMARY".to_string(),
+        workspace_dir
+            .join("github")
+            .join("step_summary")
+            .to_string_lossy()
+            .to_string(),
+    );
 
     // Time-related variables
     let now = Utc::now();

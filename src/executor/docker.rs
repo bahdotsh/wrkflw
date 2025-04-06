@@ -88,8 +88,35 @@ impl ContainerRuntime for DockerRuntime {
         // Check if command contains background processes
         let has_background = cmd.iter().any(|c| c.contains(" &"));
 
-        // If there's a background process, we need to handle it differently
-        let cmd_vec: Vec<String> = if has_background {
+        // Check if any command uses GITHUB_ variables and needs special handling
+        let uses_github_vars = cmd.iter().any(|c| c.contains("GITHUB_"));
+
+        // If there's a command using GitHub variables, we need to wrap it properly
+        let cmd_vec: Vec<String> = if uses_github_vars {
+            let mut shell_cmd = Vec::new();
+            shell_cmd.push("sh".to_string());
+            shell_cmd.push("-c".to_string());
+
+            // Join the original command and fix GitHub variables reference
+            let command_with_fixes =
+                if cmd.len() > 2 && (cmd[0] == "sh" || cmd[0] == "bash") && cmd[1] == "-c" {
+                    // For shell commands, we need to modify the command string to handle GitHub variables
+                    let fixed_cmd = cmd[2]
+                        .replace(">>$GITHUB_OUTPUT", ">>\"$GITHUB_OUTPUT\"")
+                        .replace(">>$GITHUB_ENV", ">>\"$GITHUB_ENV\"")
+                        .replace(">>$GITHUB_PATH", ">>\"$GITHUB_PATH\"")
+                        .replace(">>$GITHUB_STEP_SUMMARY", ">>\"$GITHUB_STEP_SUMMARY\"");
+
+                    format!("{} ; wait", fixed_cmd)
+                } else {
+                    // Otherwise join all parts and add wait
+                    let cmd_str: Vec<String> = cmd.iter().map(|s| s.to_string()).collect();
+                    format!("{} ; wait", cmd_str.join(" "))
+                };
+
+            shell_cmd.push(command_with_fixes);
+            shell_cmd
+        } else if has_background {
             // If the command contains a background process, wrap it in a shell script
             // that properly manages the background process and exits when the foreground completes
             let mut shell_cmd = Vec::new();

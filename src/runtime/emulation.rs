@@ -157,11 +157,18 @@ impl ContainerRuntime for EmulationRuntime {
                     // Get the actual command
                     let command_str = cmd[idx + 1];
 
+                    // Handle GitHub variables properly
+                    let fixed_cmd = command_str
+                        .replace(">>$GITHUB_OUTPUT", ">>\"$GITHUB_OUTPUT\"")
+                        .replace(">>$GITHUB_ENV", ">>\"$GITHUB_ENV\"")
+                        .replace(">>$GITHUB_PATH", ">>\"$GITHUB_PATH\"")
+                        .replace(">>$GITHUB_STEP_SUMMARY", ">>\"$GITHUB_STEP_SUMMARY\"");
+
                     // If we have background processes, add a wait command
-                    let final_cmd = if has_background && !command_str.contains(" wait") {
-                        format!("{{ {}; }} && wait", command_str)
+                    let final_cmd = if has_background && !fixed_cmd.contains(" wait") {
+                        format!("{{ {}; }} && wait", fixed_cmd)
                     } else {
-                        command_str.to_string()
+                        fixed_cmd
                     };
 
                     // Create command

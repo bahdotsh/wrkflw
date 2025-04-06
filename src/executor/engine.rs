@@ -19,6 +19,7 @@ pub async fn execute_workflow(
 ) -> Result<ExecutionResult, ExecutionError> {
     logging::info(&format!("Executing workflow: {}", workflow_path.display()));
     logging::info(&format!("Runtime: {:?}", runtime_type));
+
     // 1. Parse workflow file
     let workflow = parse_workflow(workflow_path)?;
 
@@ -28,8 +29,18 @@ pub async fn execute_workflow(
     // 3. Initialize appropriate runtime
     let runtime = initialize_runtime(runtime_type)?;
 
+    // Create a temporary workspace directory
+    let workspace_dir = tempfile::tempdir().map_err(|e| {
+        ExecutionError::ExecutionError(format!("Failed to create workspace: {}", e))
+    })?;
+
     // 4. Set up GitHub-like environment
-    let env_context = environment::create_github_context(&workflow);
+    let env_context = environment::create_github_context(&workflow, workspace_dir.path());
+
+    // Setup GitHub environment files
+    environment::setup_github_environment_files(workspace_dir.path()).map_err(|e| {
+        ExecutionError::ExecutionError(format!("Failed to setup GitHub env files: {}", e))
+    })?;
 
     // 5. Execute jobs according to the plan
     let mut results = Vec::new();

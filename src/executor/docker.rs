@@ -85,6 +85,35 @@ impl ContainerRuntime for DockerRuntime {
         // Print detailed debugging info
         logging::info(&format!("Docker: Running container with image: {}", image));
 
+        // Check if command contains background processes
+        let has_background = cmd.iter().any(|c| c.contains(" &"));
+
+        // If there's a background process, we need to handle it differently
+        let cmd_vec: Vec<String> = if has_background {
+            // If the command contains a background process, wrap it in a shell script
+            // that properly manages the background process and exits when the foreground completes
+            let mut shell_cmd = Vec::new();
+            shell_cmd.push("sh".to_string());
+            shell_cmd.push("-c".to_string());
+
+            // Join the original command and add a wait for any child processes
+            let command_with_wait =
+                if cmd.len() > 2 && (cmd[0] == "sh" || cmd[0] == "bash") && cmd[1] == "-c" {
+                    // For shell commands, we just need to modify the command string
+                    format!("{} ; wait", cmd[2])
+                } else {
+                    // Otherwise join all parts and add wait
+                    let cmd_str: Vec<String> = cmd.iter().map(|s| s.to_string()).collect();
+                    format!("{} ; wait", cmd_str.join(" "))
+                };
+
+            shell_cmd.push(command_with_wait);
+            shell_cmd
+        } else {
+            // No background processes, use original command
+            cmd.iter().map(|s| s.to_string()).collect()
+        };
+
         // Always try to pull the image first
         match self.pull_image(image).await {
             Ok(_) => logging::info(&format!("🐳 Successfully pulled image: {}", image)),
@@ -111,8 +140,6 @@ impl ContainerRuntime for DockerRuntime {
             name: format!("wrkflw-{}", uuid::Uuid::new_v4()),
             platform: None,
         });
-
-        let cmd_vec: Vec<String> = cmd.iter().map(|s| s.to_string()).collect();
 
         let host_config = HostConfig {
             binds: Some(binds),

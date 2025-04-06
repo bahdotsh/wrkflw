@@ -139,6 +139,8 @@ impl ContainerRuntime for EmulationRuntime {
             ));
         }
 
+        let has_background = cmd.iter().any(|c| c.contains(" &"));
+
         // For bash/sh with -c, handle specially
         if (cmd[0] == "bash" || cmd[0] == "sh")
             && cmd.len() >= 2
@@ -155,6 +157,13 @@ impl ContainerRuntime for EmulationRuntime {
                     // Get the actual command
                     let command_str = cmd[idx + 1];
 
+                    // If we have background processes, add a wait command
+                    let final_cmd = if has_background && !command_str.contains(" wait") {
+                        format!("{{ {}; }} && wait", command_str)
+                    } else {
+                        command_str.to_string()
+                    };
+
                     // Create command
                     let mut command = Command::new(shell);
                     command.current_dir(&container_working_dir);
@@ -165,7 +174,7 @@ impl ContainerRuntime for EmulationRuntime {
                     }
 
                     // Add the command
-                    command.arg(command_str);
+                    command.arg(final_cmd);
 
                     // Set environment variables
                     for (key, value) in env_vars {
@@ -184,6 +193,32 @@ impl ContainerRuntime for EmulationRuntime {
                     });
                 }
             }
+        }
+
+        if has_background {
+            // For commands with background processes, use shell wrapper
+            let mut shell_command = Command::new("sh");
+            shell_command.current_dir(&container_working_dir);
+            shell_command.arg("-c");
+
+            // Join the original command and add trap for cleanup
+            let command_str = format!("{{ {}; }} && wait", cmd.join(" "));
+            shell_command.arg(command_str);
+
+            // Set environment variables
+            for (key, value) in env_vars {
+                shell_command.env(key, value);
+            }
+
+            let output = shell_command
+                .output()
+                .map_err(|e| ContainerError::ContainerExecutionFailed(e.to_string()))?;
+
+            return Ok(ContainerOutput {
+                stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+                stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+                exit_code: output.status.code().unwrap_or(-1),
+            });
         }
 
         // For all other commands

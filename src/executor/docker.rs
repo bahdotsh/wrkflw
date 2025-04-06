@@ -7,7 +7,11 @@ use bollard::{
     Docker,
 };
 use futures_util::StreamExt;
+use once_cell::sync::Lazy;
 use std::path::Path;
+use std::sync::Mutex;
+
+static RUNNING_CONTAINERS: Lazy<Mutex<Vec<String>>> = Lazy::new(|| Mutex::new(Vec::new()));
 
 pub struct DockerRuntime {
     docker: Docker,
@@ -34,6 +38,37 @@ pub fn is_available() -> bool {
             logging::error(&format!("Docker connection failed: {}", e));
             false
         }
+    }
+}
+
+// Add container to tracking
+fn track_container(id: &str) {
+    if let Ok(mut containers) = RUNNING_CONTAINERS.lock() {
+        containers.push(id.to_string());
+    }
+}
+
+// Remove container from tracking
+fn untrack_container(id: &str) {
+    if let Ok(mut containers) = RUNNING_CONTAINERS.lock() {
+        containers.retain(|c| c != id);
+    }
+}
+
+// Clean up all tracked containers
+pub async fn cleanup_containers(docker: &Docker) {
+    let containers_to_cleanup = {
+        if let Ok(containers) = RUNNING_CONTAINERS.lock() {
+            containers.clone()
+        } else {
+            vec![]
+        }
+    };
+
+    for container_id in containers_to_cleanup {
+        let _ = docker.stop_container(&container_id, None).await;
+        let _ = docker.remove_container(&container_id, None).await;
+        untrack_container(&container_id);
     }
 }
 
@@ -105,6 +140,8 @@ impl ContainerRuntime for DockerRuntime {
             .await
             .map_err(|e| ContainerError::ContainerExecutionFailed(e.to_string()))?;
 
+        track_container(&container.id);
+
         // Wait for container to finish
         let wait_result = self
             .docker
@@ -143,6 +180,7 @@ impl ContainerRuntime for DockerRuntime {
 
         // Clean up container
         let _ = self.docker.remove_container(&container.id, None).await;
+        untrack_container(&container.id);
 
         Ok(ContainerOutput {
             stdout,

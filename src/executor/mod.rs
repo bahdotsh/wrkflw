@@ -7,3 +7,5 @@ mod environment;
 pub use engine::{
     execute_workflow, ExecutionResult, JobResult, JobStatus, RuntimeType, StepResult, StepStatus,
 };
+
+pub use docker::cleanup_containers;

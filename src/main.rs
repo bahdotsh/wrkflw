@@ -8,6 +8,7 @@ mod ui;
 mod utils;
 mod validators;
 
+use bollard::Docker;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -55,10 +56,33 @@ enum Commands {
     },
 }
 
+async fn cleanup_on_exit() {
+    match Docker::connect_with_local_defaults() {
+        Ok(docker) => {
+            executor::cleanup_containers(&docker).await;
+        }
+        Err(_) => {
+            // Docker not available, nothing to clean up
+        }
+    }
+}
+
+async fn handle_signals() {
+    // This creates a future that completes when CTRL+C is received
+    tokio::signal::ctrl_c()
+        .await
+        .expect("Failed to listen for ctrl+c event");
+
+    println!("Received Ctrl+C, shutting down...");
+    cleanup_on_exit().await;
+    std::process::exit(0);
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Wrkflw::parse();
     let verbose = cli.verbose;
+    tokio::spawn(handle_signals());
 
     match &cli.command {
         Some(Commands::Validate { path }) => {

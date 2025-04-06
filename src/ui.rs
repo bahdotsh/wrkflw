@@ -577,6 +577,11 @@ pub fn run_tui(
     // Initialize app state
     let mut app = App::new(runtime_type.clone());
 
+    if app.validation_mode {
+        app.logs.push("Starting in validation mode".to_string());
+        logging::info("Starting in validation mode");
+    }
+
     // Load workflows
     let dir_path = match workflow_path {
         Some(path) if path.is_dir() => path.clone(),
@@ -639,25 +644,89 @@ pub fn run_tui(
                 thread::spawn(move || {
                     let runtime = tokio::runtime::Runtime::new().unwrap();
                     let result = runtime.block_on(async {
-                        match executor::execute_workflow(&workflow_path, runtime_type, verbose)
-                            .await
-                        {
-                            Ok(result) => result,
-                            Err(e) => {
-                                // Create a failed execution result with error message
-                                let failed_job = executor::JobResult {
-                                    name: "Error".to_string(),
-                                    status: JobStatus::Failure,
-                                    steps: vec![executor::StepResult {
-                                        name: "Execution Error".to_string(),
-                                        status: StepStatus::Failure,
-                                        output: format!("Error: {}", e),
-                                    }],
-                                    logs: format!("Error executing workflow: {}", e),
-                                };
+                        if app.validation_mode {
+                            // Perform validation instead of execution
+                            match evaluate_workflow_file(&workflow_path, verbose) {
+                                Ok(validation_result) => {
+                                    // Create execution result based on validation
+                                    let status = if validation_result.is_valid {
+                                        JobStatus::Success
+                                    } else {
+                                        JobStatus::Failure
+                                    };
 
-                                ExecutionResult {
-                                    jobs: vec![failed_job],
+                                    let steps = vec![executor::StepResult {
+                                        name: "Validation".to_string(),
+                                        status: if validation_result.is_valid {
+                                            StepStatus::Success
+                                        } else {
+                                            StepStatus::Failure
+                                        },
+                                        output: if validation_result.is_valid {
+                                            "Workflow is valid".to_string()
+                                        } else {
+                                            format!(
+                                                "Validation issues:\n{}",
+                                                validation_result.issues.join("\n")
+                                            )
+                                        },
+                                    }];
+
+                                    ExecutionResult {
+                                        jobs: vec![executor::JobResult {
+                                            name: "Validation".to_string(),
+                                            status,
+                                            steps,
+                                            logs: if validation_result.is_valid {
+                                                "Workflow validation succeeded".to_string()
+                                            } else {
+                                                format!(
+                                                    "Workflow validation failed:\n{}",
+                                                    validation_result.issues.join("\n")
+                                                )
+                                            },
+                                        }],
+                                    }
+                                }
+                                Err(e) => {
+                                    // Error during validation
+                                    let failed_job = executor::JobResult {
+                                        name: "Validation Error".to_string(),
+                                        status: JobStatus::Failure,
+                                        steps: vec![executor::StepResult {
+                                            name: "Validation Error".to_string(),
+                                            status: StepStatus::Failure,
+                                            output: format!("Error: {}", e),
+                                        }],
+                                        logs: format!("Error validating workflow: {}", e),
+                                    };
+
+                                    ExecutionResult {
+                                        jobs: vec![failed_job],
+                                    }
+                                }
+                            }
+                        } else {
+                            match executor::execute_workflow(&workflow_path, runtime_type, verbose)
+                                .await
+                            {
+                                Ok(result) => result,
+                                Err(e) => {
+                                    // Create a failed execution result with error message
+                                    let failed_job = executor::JobResult {
+                                        name: "Error".to_string(),
+                                        status: JobStatus::Failure,
+                                        steps: vec![executor::StepResult {
+                                            name: "Execution Error".to_string(),
+                                            status: StepStatus::Failure,
+                                            output: format!("Error: {}", e),
+                                        }],
+                                        logs: format!("Error executing workflow: {}", e),
+                                    };
+
+                                    ExecutionResult {
+                                        jobs: vec![failed_job],
+                                    }
                                 }
                             }
                         }

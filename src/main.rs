@@ -68,13 +68,17 @@ async fn cleanup_on_exit() {
 }
 
 async fn handle_signals() {
-    // This creates a future that completes when CTRL+C is received
+    // Wait for Ctrl+C
     tokio::signal::ctrl_c()
         .await
         .expect("Failed to listen for ctrl+c event");
 
-    println!("Received Ctrl+C, shutting down...");
+    println!("Received Ctrl+C, shutting down and cleaning up...");
+
+    // Clean up containers
     cleanup_on_exit().await;
+
+    // Exit with success status
     std::process::exit(0);
 }
 
@@ -82,6 +86,8 @@ async fn handle_signals() {
 async fn main() {
     let cli = Wrkflw::parse();
     let verbose = cli.verbose;
+
+    // Setup a Ctrl+C handler that runs in the background
     tokio::spawn(handle_signals());
 
     match &cli.command {
@@ -107,7 +113,17 @@ async fn main() {
             };
 
             // Run in TUI mode with the specific workflow
-            ui::run_wrkflw_tui(Some(path), runtime_type, verbose).await;
+            match ui::run_wrkflw_tui(Some(path), runtime_type, verbose).await {
+                Ok(_) => {
+                    // Clean up on successful exit
+                    cleanup_on_exit().await;
+                }
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    cleanup_on_exit().await;
+                    std::process::exit(1);
+                }
+            }
         }
 
         Some(Commands::Tui { path, emulate }) => {
@@ -118,17 +134,41 @@ async fn main() {
                 executor::RuntimeType::Docker
             };
 
-            ui::run_wrkflw_tui(path.as_ref(), runtime_type, verbose).await;
+            match ui::run_wrkflw_tui(path.as_ref(), runtime_type, verbose).await {
+                Ok(_) => {
+                    // Clean up on successful exit
+                    cleanup_on_exit().await;
+                }
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    cleanup_on_exit().await;
+                    std::process::exit(1);
+                }
+            }
         }
 
         None => {
             // Default to TUI interface if no subcommand
-            ui::run_wrkflw_tui(
+            match ui::run_wrkflw_tui(
                 Some(&PathBuf::from(".github/workflows")),
                 executor::RuntimeType::Docker,
                 verbose,
             )
-            .await;
+            .await
+            {
+                Ok(_) => {
+                    // Clean up on successful exit
+                    cleanup_on_exit().await;
+                }
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    cleanup_on_exit().await;
+                    std::process::exit(1);
+                }
+            }
         }
     }
+
+    // Final cleanup before program exit
+    cleanup_on_exit().await;
 }

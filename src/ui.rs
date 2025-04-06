@@ -22,7 +22,6 @@ use ratatui::{
 };
 use std::io::{self, stdout};
 use std::path::{Path, PathBuf};
-use std::process;
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -619,7 +618,7 @@ pub fn run_tui(
     }
 
     // Main event loop
-    loop {
+    let result = loop {
         // Update UI on tick
         if app.tick() {
             app.update_running_workflow_progress();
@@ -849,14 +848,18 @@ pub fn run_tui(
         if event::poll(Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
                 match key.code {
-                    KeyCode::Char('q') => break,
+                    KeyCode::Char('q') => {
+                        // Exit and clean up
+                        break Ok(());
+                    }
                     KeyCode::Esc => {
                         if app.detailed_view {
                             app.detailed_view = false;
                         } else if app.show_help {
                             app.show_help = false;
                         } else {
-                            break;
+                            // Exit and clean up
+                            break Ok(());
                         }
                     }
                     KeyCode::Tab => {
@@ -955,7 +958,7 @@ pub fn run_tui(
                 }
             }
         }
-    }
+    };
 
     // Clean up terminal
     disable_raw_mode()?;
@@ -966,7 +969,7 @@ pub fn run_tui(
     )?;
     terminal.show_cursor()?;
 
-    Ok(())
+    result
 }
 
 // Main render function for the UI
@@ -2158,9 +2161,13 @@ pub async fn execute_workflow_cli(
 }
 
 // Main entry point for the TUI interface
-pub async fn run_wrkflw_tui(path: Option<&PathBuf>, runtime_type: RuntimeType, verbose: bool) {
+pub async fn run_wrkflw_tui(
+    path: Option<&PathBuf>,
+    runtime_type: RuntimeType,
+    verbose: bool,
+) -> io::Result<()> {
     match run_tui(path, &runtime_type, verbose) {
-        Ok(_) => {}
+        Ok(_) => Ok(()),
         Err(e) => {
             // If the TUI fails to initialize or crashes, fall back to CLI mode
             eprintln!("Failed to start UI: {}", e);
@@ -2168,16 +2175,12 @@ pub async fn run_wrkflw_tui(path: Option<&PathBuf>, runtime_type: RuntimeType, v
             if let Some(path) = path {
                 if path.is_file() {
                     println!("Falling back to CLI mode...");
-                    if let Err(e) = execute_workflow_cli(path, runtime_type, verbose).await {
-                        eprintln!("Error: {}", e);
-                        process::exit(1);
-                    }
+                    execute_workflow_cli(path, runtime_type, verbose).await
                 } else {
-                    validate_workflow(path, verbose).unwrap_or_else(|e| {
-                        eprintln!("Error: {}", e);
-                        process::exit(1);
-                    });
+                    validate_workflow(path, verbose)
                 }
+            } else {
+                Err(e)
             }
         }
     }

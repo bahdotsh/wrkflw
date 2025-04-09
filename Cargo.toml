@@ -1,6 +1,6 @@
 [package]
 name = "wrkflw"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "A GitHub Actions workflow validator and executor"
 documentation = "https://github.com/bahdotsh/wrkflw"

@@ -1930,7 +1930,7 @@ checksum = "1e9df38ee2d2c3c5948ea468a8406ff0db0b29ae1ffde1bcf20ef305bcc95c51"
 
 [[package]]
 name = "wrkflw"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "bollard",

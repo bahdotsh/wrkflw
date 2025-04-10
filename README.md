@@ -2,6 +2,8 @@
 
 WRKFLW is a powerful command-line tool for validating and executing GitHub Actions workflows locally, without requiring a full GitHub environment. It helps developers test their workflows directly on their machines before pushing changes to GitHub.
 
+![WRKFLW Demo](demo.gif)
+
 ## Features
 
 - **TUI Interface**: A full-featured terminal user interface for managing and monitoring workflow executions

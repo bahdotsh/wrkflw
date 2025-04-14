@@ -1,0 +1,58 @@
+name: Matrix Sample
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Test
+    runs-on: ${{ matrix.os }}
+    
+    # This matrix strategy matches the test code in matrix_test.rs
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        node: [14, 16]
+        # Exclude windows with node 14
+        exclude:
+          - os: windows-latest
+            node: 14
+        # Include an experimental configuration
+        include:
+          - os: ubuntu-latest
+            node: 18
+            experimental: true
+      # Set max parallel executions to 2
+      max-parallel: 2
+      # Enable fail-fast behavior
+      fail-fast: true
+
+    steps:
+      - uses: actions/checkout@v3
+        
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: ${{ matrix.node }}
+          
+      - name: Display configuration
+        run: |
+          echo "OS: ${{ matrix.os }}"
+          echo "Node version: ${{ matrix.node }}"
+          
+      - name: Display experimental info
+        if: ${{ matrix.experimental == true }}
+        run: echo "This is an experimental configuration"
+          
+      - name: Build
+        run: |
+          echo "Building with Node ${{ matrix.node }} on ${{ matrix.os }}"
+          
+      - name: Test
+        run: |
+          echo "Testing with Node ${{ matrix.node }} on ${{ matrix.os }}"
+          # Add your real test commands here 

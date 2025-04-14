@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
+use crate::matrix::MatrixConfig;
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct WorkflowDefinition {
@@ -22,6 +23,8 @@ pub struct Job {
     pub steps: Vec<Step>,
     #[serde(default)]
     pub env: HashMap<String, String>,
+    #[serde(default)]
+    pub matrix: Option<MatrixConfig>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]

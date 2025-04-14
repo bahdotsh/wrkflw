@@ -1,12 +1,14 @@
 mod evaluator;
 mod executor;
 mod logging;
+mod matrix;
 mod models;
 mod parser;
 mod runtime;
 mod ui;
 mod utils;
 mod validators;
+mod matrix_test;
 
 use bollard::Docker;
 use clap::{Parser, Subcommand};

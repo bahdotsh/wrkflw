@@ -1,6 +1,8 @@
 use crate::parser::workflow::WorkflowDefinition;
+use crate::matrix::MatrixCombination;
 use chrono::Utc;
 use std::{collections::HashMap, fs, io, path::Path};
+use serde_yaml::Value;
 
 pub fn setup_github_environment_files(workspace_dir: &Path) -> io::Result<()> {
     // Create necessary directories
@@ -82,6 +84,51 @@ pub fn create_github_context(
     env.insert("RUNNER_TOOL_CACHE".to_string(), get_tool_cache_dir());
 
     env
+}
+
+/// Add matrix context variables to the environment
+pub fn add_matrix_context(
+    env: &mut HashMap<String, String>,
+    matrix_combination: &MatrixCombination,
+) {
+    // Add each matrix parameter as an environment variable
+    for (key, value) in &matrix_combination.values {
+        let env_key = format!("MATRIX_{}", key.to_uppercase());
+        let env_value = value_to_string(value);
+        env.insert(env_key, env_value);
+    }
+    
+    // Also serialize the whole matrix as JSON for potential use
+    if let Ok(json_value) = serde_json::to_string(&matrix_combination.values) {
+        env.insert("MATRIX_CONTEXT".to_string(), json_value);
+    }
+}
+
+/// Convert a serde_yaml::Value to a string for environment variables
+fn value_to_string(value: &Value) -> String {
+    match value {
+        Value::String(s) => s.clone(),
+        Value::Number(n) => n.to_string(),
+        Value::Bool(b) => b.to_string(),
+        Value::Sequence(seq) => {
+            let items = seq
+                .iter()
+                .map(|v| value_to_string(v))
+                .collect::<Vec<_>>()
+                .join(",");
+            items
+        }
+        Value::Mapping(map) => {
+            let items = map
+                .iter()
+                .map(|(k, v)| format!("{}={}", value_to_string(k), value_to_string(v)))
+                .collect::<Vec<_>>()
+                .join(",");
+            items
+        }
+        Value::Null => "".to_string(),
+        _ => "".to_string(),
+    }
 }
 
 fn get_repo_name() -> String {

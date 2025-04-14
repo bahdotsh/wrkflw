@@ -2,14 +2,18 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use thiserror::Error;
+use futures::future;
+use serde_yaml::Value;
 
 use crate::executor::dependency;
 use crate::executor::docker;
 use crate::executor::environment;
 use crate::logging;
-use crate::parser::workflow::{parse_workflow, ActionInfo, WorkflowDefinition};
+use crate::matrix::{self, MatrixCombination};
+use crate::parser::workflow::{parse_workflow, ActionInfo, Job, WorkflowDefinition};
 use crate::runtime::container::ContainerRuntime;
 use crate::runtime::emulation::handle_special_action;
+use crate::executor::substitution;
 
 /// Execute a GitHub Actions workflow file locally
 pub async fn execute_workflow(
@@ -98,6 +102,7 @@ pub enum JobStatus {
     Skipped,
 }
 
+#[derive(Debug, Clone)]
 pub struct StepResult {
     pub name: String,
     pub status: StepStatus,
@@ -105,6 +110,7 @@ pub struct StepResult {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
 pub enum StepStatus {
     Success,
     Failure,
@@ -189,25 +195,263 @@ async fn execute_job_batch(
     env_context: &HashMap<String, String>,
     verbose: bool,
 ) -> Result<Vec<JobResult>, ExecutionError> {
-    use futures::future;
-
     // Execute jobs in parallel
-    let futures = jobs
-        .iter()
-        .map(|job_name| execute_job(job_name, workflow, runtime, env_context, verbose));
+    let futures = jobs.iter().map(|job_name| {
+        execute_job_with_matrix(job_name, workflow, runtime, env_context, verbose)
+    });
 
-    let results = future::join_all(futures).await;
-
-    // Collect and check for errors
-    let mut job_results = Vec::new();
-    for result in results {
-        match result {
-            Ok(job_result) => job_results.push(job_result),
+    let result_arrays = future::join_all(futures).await;
+    
+    // Flatten the results from all jobs and their matrix combinations
+    let mut results = Vec::new();
+    for result_array in result_arrays {
+        match result_array {
+            Ok(job_results) => results.extend(job_results),
             Err(e) => return Err(e),
         }
     }
 
-    Ok(job_results)
+    Ok(results)
+}
+
+/// Execute a job, expanding matrix if present
+async fn execute_job_with_matrix(
+    job_name: &str,
+    workflow: &WorkflowDefinition,
+    runtime: &Box<dyn ContainerRuntime>,
+    env_context: &HashMap<String, String>,
+    verbose: bool,
+) -> Result<Vec<JobResult>, ExecutionError> {
+    // Get the job definition
+    let job = workflow.jobs.get(job_name).ok_or_else(|| {
+        ExecutionError::ExecutionError(format!("Job '{}' not found in workflow", job_name))
+    })?;
+    
+    // Check if this is a matrix job
+    if let Some(matrix_config) = &job.matrix {
+        // Expand the matrix into combinations
+        let combinations = matrix::expand_matrix(matrix_config).map_err(|e| {
+            ExecutionError::ExecutionError(format!("Failed to expand matrix: {}", e))
+        })?;
+        
+        if combinations.is_empty() {
+            logging::info(&format!("Matrix job '{}' has no valid combinations", job_name));
+            // Return empty result for jobs with no valid combinations
+            return Ok(Vec::new());
+        }
+        
+        logging::info(&format!(
+            "Matrix job '{}' expanded to {} combinations",
+            job_name,
+            combinations.len()
+        ));
+        
+        // Set maximum parallel jobs
+        let max_parallel = matrix_config.max_parallel.unwrap_or_else(|| {
+            // If not specified, use a reasonable default based on CPU cores
+            std::cmp::max(1, num_cpus::get())
+        });
+        
+        // Execute matrix combinations
+        execute_matrix_combinations(
+            job_name,
+            job,
+            &combinations,
+            max_parallel,
+            matrix_config.fail_fast.unwrap_or(true),
+            workflow,
+            runtime,
+            env_context,
+            verbose,
+        )
+        .await
+    } else {
+        // Regular job, no matrix
+        let result = execute_job(job_name, workflow, runtime, env_context, verbose).await?;
+        Ok(vec![result])
+    }
+}
+
+/// Execute a set of matrix combinations
+async fn execute_matrix_combinations(
+    job_name: &str,
+    job_template: &Job,
+    combinations: &[MatrixCombination],
+    max_parallel: usize,
+    fail_fast: bool,
+    workflow: &WorkflowDefinition,
+    runtime: &Box<dyn ContainerRuntime>,
+    env_context: &HashMap<String, String>,
+    verbose: bool,
+) -> Result<Vec<JobResult>, ExecutionError> {
+    let mut results = Vec::new();
+    let mut any_failed = false;
+    
+    // Process combinations in chunks limited by max_parallel
+    for chunk in combinations.chunks(max_parallel) {
+        // Skip processing if fail-fast is enabled and a previous job failed
+        if fail_fast && any_failed {
+            // Add skipped results for remaining combinations
+            for combination in chunk {
+                let combination_name = matrix::format_combination_name(job_name, combination);
+                results.push(JobResult {
+                    name: combination_name,
+                    status: JobStatus::Skipped,
+                    steps: Vec::new(),
+                    logs: "Job skipped due to previous matrix job failure".to_string(),
+                });
+            }
+            continue;
+        }
+        
+        // Process this chunk of combinations in parallel
+        let chunk_futures = chunk.iter().map(|combination| {
+            execute_matrix_job(
+                job_name,
+                job_template,
+                combination,
+                workflow,
+                runtime,
+                env_context,
+                verbose,
+            )
+        });
+        
+        let chunk_results = future::join_all(chunk_futures).await;
+        
+        // Process results from this chunk
+        for result in chunk_results {
+            match result {
+                Ok(job_result) => {
+                    if job_result.status == JobStatus::Failure {
+                        any_failed = true;
+                    }
+                    results.push(job_result);
+                }
+                Err(e) => {
+                    // On error, mark as failed and continue if not fail-fast
+                    any_failed = true;
+                    logging::error(&format!("Matrix job failed: {}", e));
+                    
+                    if fail_fast {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+    }
+    
+    Ok(results)
+}
+
+/// Execute a single matrix job combination
+async fn execute_matrix_job(
+    job_name: &str,
+    job_template: &Job,
+    combination: &MatrixCombination,
+    workflow: &WorkflowDefinition,
+    runtime: &Box<dyn ContainerRuntime>,
+    base_env_context: &HashMap<String, String>,
+    verbose: bool,
+) -> Result<JobResult, ExecutionError> {
+    // Create the matrix-specific job name
+    let matrix_job_name = matrix::format_combination_name(job_name, combination);
+    
+    logging::info(&format!("Executing matrix job: {}", matrix_job_name));
+    
+    // Clone the environment and add matrix-specific values
+    let mut job_env = base_env_context.clone();
+    environment::add_matrix_context(&mut job_env, combination);
+    
+    // Add job-level environment variables
+    for (key, value) in &job_template.env {
+        // TODO: Substitute matrix variable references in env values
+        job_env.insert(key.clone(), value.clone());
+    }
+    
+    // Execute the job steps
+    let mut step_results = Vec::new();
+    let mut job_logs = String::new();
+    
+    // Create a temporary directory for this job execution
+    let job_dir = tempfile::tempdir().map_err(|e| {
+        ExecutionError::ExecutionError(format!("Failed to create job directory: {}", e))
+    })?;
+    
+    // Prepare the runner
+    let runner_image = get_runner_image(&job_template.runs_on);
+    prepare_runner_image(&runner_image, runtime, verbose).await?;
+    
+    // Copy project files to workspace
+    copy_directory_contents(
+        &std::env::current_dir().unwrap_or_default(),
+        job_dir.path(),
+    )?;
+    
+    let job_success = if job_template.steps.is_empty() {
+        logging::warning(&format!("Job '{}' has no steps", matrix_job_name));
+        true
+    } else {
+        // Execute each step
+        for (idx, step) in job_template.steps.iter().enumerate() {
+            match execute_step(
+                step,
+                idx,
+                &job_env,
+                job_dir.path(),
+                runtime,
+                workflow,
+                &job_template.runs_on, // Pass the job's runner
+                verbose,
+                &Some(combination.values.clone()),
+            )
+            .await
+            {
+                Ok(result) => {
+                    job_logs.push_str(&format!("Step: {}\n", result.name));
+                    job_logs.push_str(&format!("Status: {:?}\n", result.status));
+                    job_logs.push_str(&result.output);
+                    job_logs.push_str("\n\n");
+                    
+                    step_results.push(result.clone());
+                    
+                    if result.status != StepStatus::Success {
+                        // Step failed, abort job
+                        return Ok(JobResult {
+                            name: matrix_job_name,
+                            status: JobStatus::Failure,
+                            steps: step_results,
+                            logs: job_logs,
+                        });
+                    }
+                }
+                Err(e) => {
+                    // Log the error and abort the job
+                    job_logs.push_str(&format!("Step execution error: {}\n\n", e));
+                    return Ok(JobResult {
+                        name: matrix_job_name,
+                        status: JobStatus::Failure,
+                        steps: step_results,
+                        logs: job_logs,
+                    });
+                }
+            }
+        }
+        
+        true
+    };
+    
+    // Return job result
+    Ok(JobResult {
+        name: matrix_job_name,
+        status: if job_success {
+            JobStatus::Success
+        } else {
+            JobStatus::Failure
+        },
+        steps: step_results,
+        logs: job_logs,
+    })
 }
 
 async fn execute_job(
@@ -217,97 +461,98 @@ async fn execute_job(
     env_context: &HashMap<String, String>,
     verbose: bool,
 ) -> Result<JobResult, ExecutionError> {
-    if verbose {
-        logging::info(&format!("Executing job: {}", job_name));
-    }
-
+    // Get job definition
     let job = workflow.jobs.get(job_name).ok_or_else(|| {
         ExecutionError::ExecutionError(format!("Job '{}' not found in workflow", job_name))
     })?;
-
-    // Setup job environment
+    
+    // Clone context and add job-specific variables
     let mut job_env = env_context.clone();
-
+    
     // Add job-level environment variables
     for (key, value) in &job.env {
         job_env.insert(key.clone(), value.clone());
     }
-
-    // Create a temporary directory for job execution
-    let job_dir = tempfile::tempdir()
-        .map_err(|e| ExecutionError::ExecutionError(format!("Failed to create temp dir: {}", e)))?;
-
-    // Get the runner image
-    let runner_image = get_runner_image(&job.runs_on);
-
-    // Prepare the runner image (pull it)
-    prepare_runner_image(&runner_image, runtime, verbose).await?;
-
-    // Execute steps sequentially
+    
+    // Execute job steps
     let mut step_results = Vec::new();
-    let mut job_status = JobStatus::Success;
     let mut job_logs = String::new();
-
-    for (step_idx, step) in job.steps.iter().enumerate() {
-        if job_status == JobStatus::Failure {
-            // Skip remaining steps if job has failed
-            let step_name = step
-                .name
-                .clone()
-                .unwrap_or_else(|| format!("Step {}", step_idx + 1));
-            step_results.push(StepResult {
-                name: step_name,
-                status: StepStatus::Skipped,
-                output: "Skipped due to previous step failure".to_string(),
-            });
-            continue;
-        }
-
-        let step_result = execute_step(
-            step,
-            step_idx,
-            &job_env,
-            job_dir.path(),
-            runtime,
-            workflow,
-            &job.runs_on, // Pass the job's runner
-            verbose,
-        )
-        .await;
-
-        match step_result {
-            Ok(result) => {
-                job_logs.push_str(&format!("\n## Step: {}\n{}\n", result.name, result.output));
-
-                if result.status == StepStatus::Failure {
-                    job_status = JobStatus::Failure;
+    
+    // Create a temporary directory for this job execution
+    let job_dir = tempfile::tempdir().map_err(|e| {
+        ExecutionError::ExecutionError(format!("Failed to create job directory: {}", e))
+    })?;
+    
+    // Prepare the runner environment
+    let runner_image = get_runner_image(&job.runs_on);
+    prepare_runner_image(&runner_image, runtime, verbose).await?;
+    
+    // Copy project files to workspace
+    copy_directory_contents(&std::env::current_dir().unwrap_or_default(), job_dir.path())?;
+    
+    logging::info(&format!("Executing job: {}", job_name));
+    
+    let job_success = if job.steps.is_empty() {
+        logging::warning(&format!("Job '{}' has no steps", job_name));
+        true
+    } else {
+        // Execute each step
+        for (idx, step) in job.steps.iter().enumerate() {
+            match execute_step(
+                step,
+                idx,
+                &job_env,
+                job_dir.path(),
+                runtime,
+                workflow,
+                &job.runs_on, // Pass the job's runner
+                verbose,
+                &None, // No matrix combination for regular jobs
+            )
+            .await
+            {
+                Ok(result) => {
+                    job_logs.push_str(&format!("Step: {}\n", result.name));
+                    job_logs.push_str(&format!("Status: {:?}\n", result.status));
+                    job_logs.push_str(&result.output);
+                    job_logs.push_str("\n\n");
+                    
+                    step_results.push(result.clone());
+                    
+                    if result.status != StepStatus::Success {
+                        // Step failed, abort job
+                        return Ok(JobResult {
+                            name: job_name.to_string(),
+                            status: JobStatus::Failure,
+                            steps: step_results,
+                            logs: job_logs,
+                        });
+                    }
                 }
-
-                step_results.push(result);
-            }
-            Err(e) => {
-                let step_name = step
-                    .name
-                    .clone()
-                    .unwrap_or_else(|| format!("Step {}", step_idx + 1));
-                let error_msg = format!("Step execution error: {}", e);
-
-                job_logs.push_str(&format!("\n## Step: {}\nERROR: {}\n", step_name, error_msg));
-
-                step_results.push(StepResult {
-                    name: step_name,
-                    status: StepStatus::Failure,
-                    output: error_msg,
-                });
-
-                job_status = JobStatus::Failure;
+                Err(e) => {
+                    // Log the error and abort the job
+                    job_logs.push_str(&format!("Step execution error: {}\n\n", e));
+                    return Ok(JobResult {
+                        name: job_name.to_string(),
+                        status: JobStatus::Failure,
+                        steps: step_results,
+                        logs: job_logs,
+                    });
+                }
             }
         }
-    }
-
+        
+        true
+    };
+    
+    // Return job result
     Ok(JobResult {
         name: job_name.to_string(),
-        status: job_status,
+        status: if job_success {
+            JobStatus::Success
+        } else {
+            JobStatus::Failure
+        },
         steps: step_results,
         logs: job_logs,
     })
@@ -322,6 +567,7 @@ async fn execute_step(
     workflow: &WorkflowDefinition,
     job_runs_on: &str,
     verbose: bool,
+    matrix_combination: &Option<HashMap<String, Value>>,
 ) -> Result<StepResult, ExecutionError> {
     let step_name = step
         .name
@@ -475,8 +721,10 @@ async fn execute_step(
             }
         }
     } else if let Some(run) = &step.run {
+        // Apply GitHub-style matrix variable substitution to the command
+        let processed_run = substitution::process_step_run(run, matrix_combination);
+        
         // Print the command we're trying to run
-
         let shell_default = "bash".to_string();
         let shell = step_env.get("SHELL").unwrap_or(&shell_default);
 
@@ -490,21 +738,21 @@ async fn execute_step(
             cmd.push("-c");
 
             // Store the string and keep a reference to it
-            cmd_strings.push(run.clone());
+            cmd_strings.push(processed_run);
             cmd.push(&cmd_strings[0]);
         } else if shell == "powershell" {
             cmd.push("pwsh");
             cmd.push("-Command");
 
             // Store the string and keep a reference to it
-            cmd_strings.push(run.clone());
+            cmd_strings.push(processed_run);
             cmd.push(&cmd_strings[0]);
         } else {
             cmd.push("sh");
             cmd.push("-c");
 
             // Store the string and keep a reference to it
-            cmd_strings.push(run.clone());
+            cmd_strings.push(processed_run);
             cmd.push(&cmd_strings[0]);
         }
 
@@ -525,6 +773,7 @@ async fn execute_step(
             .pull_image(&image)
             .await
             .map_err(|e| ExecutionError::RuntimeError(format!("Failed to pull image: {}", e)))?;
+        
         // Map volumes
         let volumes: Vec<(&Path, &Path)> = vec![(working_dir, Path::new("/github/workspace"))];
 
@@ -751,6 +1000,7 @@ async fn execute_composite_action(
                     },
                     job_runs_on,
                     verbose,
+                    &None,
                 ))
                 .await?;
 

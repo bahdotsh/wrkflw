@@ -1,5 +1,5 @@
 use crate::models::ValidationResult;
-use crate::validators::validate_steps;
+use crate::validators::{validate_matrix, validate_steps};
 use serde_yaml::Value;
 
 pub fn validate_jobs(jobs: &Value, result: &mut ValidationResult) {
@@ -66,6 +66,11 @@ pub fn validate_jobs(jobs: &Value, result: &mut ValidationResult) {
                                 job_name, need
                             ));
                         }
+                    }
+                    
+                    // Validate matrix configuration if present
+                    if let Some(matrix) = job_config.get(&Value::String("matrix".to_string())) {
+                        validate_matrix(matrix, result);
                     }
                 } else {
                     result.add_issue(format!("Job '{}' configuration is not a mapping", job_name));

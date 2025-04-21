@@ -33,7 +33,7 @@ pub fn resolve_dependencies(workflow: &WorkflowDefinition) -> Result<Vec<Vec<Str
                         job_name
                     ));
                 }
-                
+
                 // Get mutable reference to the dependents set for the needed job, with error handling
                 if let Some(deps) = dependents.get_mut(needed_job) {
                     deps.insert(job_name.clone());
@@ -76,12 +76,12 @@ pub fn resolve_dependencies(workflow: &WorkflowDefinition) -> Result<Vec<Vec<Str
                     ));
                 }
             };
-            
+
             for dependent in dependent_jobs {
                 // Remove the current job from its dependencies
                 if let Some(deps) = dependencies.get_mut(&dependent) {
                     deps.remove(job);
-                    
+
                     // Check if it's empty now to determine if it should be in the next level
                     if deps.is_empty() {
                         next_no_dependencies.insert(dependent);

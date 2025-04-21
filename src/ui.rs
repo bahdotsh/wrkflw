@@ -1,8 +1,8 @@
 use crate::evaluator::evaluate_workflow_file;
 use crate::executor::{self, JobStatus, RuntimeType, StepStatus};
 use crate::logging;
-use crate::utils::is_workflow_file;
 use crate::utils;
+use crate::utils::is_workflow_file;
 use chrono::Local;
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers},
@@ -174,24 +174,26 @@ impl App {
         let runtime_type = match runtime_type {
             RuntimeType::Docker => {
                 // Use the safe FD redirection utility from utils
-                let is_docker_available = match utils::fd::with_stderr_to_null(|| {
-                    executor::docker::is_available()
-                }) {
-                    Ok(result) => result,
-                    Err(_) => {
-                        logging::debug("Failed to redirect stderr when checking Docker availability.");
-                        false
-                    }
-                };
-                
+                let is_docker_available =
+                    match utils::fd::with_stderr_to_null(|| executor::docker::is_available()) {
+                        Ok(result) => result,
+                        Err(_) => {
+                            logging::debug(
+                                "Failed to redirect stderr when checking Docker availability.",
+                            );
+                            false
+                        }
+                    };
+
                 if !is_docker_available {
-                    initial_logs.push("Docker is not available. Using emulation mode instead.".to_string());
+                    initial_logs
+                        .push("Docker is not available. Using emulation mode instead.".to_string());
                     logging::warning("Docker is not available. Using emulation mode instead.");
                     RuntimeType::Emulation
                 } else {
                     RuntimeType::Docker
                 }
-            },
+            }
             RuntimeType::Emulation => RuntimeType::Emulation,
         };
 
@@ -551,7 +553,7 @@ impl App {
                         .logs
                         .push(format!("[{}] Error: {}", timestamp, e));
                     execution_details.progress = 1.0;
-                    
+
                     // Create a dummy job with the error information so users can see details
                     execution_details.jobs = vec![JobExecution {
                         name: "Workflow Execution".to_string(),
@@ -892,7 +894,10 @@ impl App {
                         Err(e) => {
                             eprintln!("Failed to create Tokio runtime: {}", e);
                             // Return early from the current function with appropriate error handling
-                            let _ = tx_clone.send((selected_idx, Err("Failed to create runtime for execution".to_string())));
+                            let _ = tx_clone.send((
+                                selected_idx,
+                                Err("Failed to create runtime for execution".to_string()),
+                            ));
                             return;
                         }
                     };
@@ -1003,12 +1008,10 @@ fn load_workflows(dir_path: &Path) -> Vec<Workflow> {
             if let Ok(entry) = entry {
                 let path = entry.path();
                 if path.is_file() && (is_workflow_file(&path) || !is_default_dir) {
-                    let name = path
-                        .file_name()
-                        .map_or_else(
-                            || "[unknown]".to_string(),
-                            |fname| fname.to_string_lossy().into_owned()
-                        );
+                    let name = path.file_name().map_or_else(
+                        || "[unknown]".to_string(),
+                        |fname| fname.to_string_lossy().into_owned(),
+                    );
 
                     workflows.push(Workflow {
                         name,
@@ -2642,16 +2645,15 @@ fn render_status_bar(f: &mut Frame<CrosstermBackend<io::Stdout>>, app: &App, are
     // Add Docker status if relevant
     if app.runtime_type == RuntimeType::Docker {
         // Check Docker silently using safe FD redirection
-        let is_docker_available = match utils::fd::with_stderr_to_null(|| {
-            executor::docker::is_available()
-        }) {
-            Ok(result) => result,
-            Err(_) => {
-                logging::debug("Failed to redirect stderr when checking Docker availability.");
-                false
-            }
-        };
-        
+        let is_docker_available =
+            match utils::fd::with_stderr_to_null(|| executor::docker::is_available()) {
+                Ok(result) => result,
+                Err(_) => {
+                    logging::debug("Failed to redirect stderr when checking Docker availability.");
+                    false
+                }
+            };
+
         status_items.push(Span::raw(" "));
         status_items.push(Span::styled(
             if is_docker_available {
@@ -2862,7 +2864,7 @@ pub async fn execute_workflow_cli(
             } else {
                 RuntimeType::Docker
             }
-        },
+        }
         RuntimeType::Emulation => RuntimeType::Emulation,
     };
 
@@ -3475,32 +3477,34 @@ fn start_next_workflow_execution(
         app.current_execution = Some(next_idx);
         let tx_clone_inner = tx_clone.clone();
         let workflow_path = app.workflows[next_idx].path.clone();
-        
+
         // Check Docker availability again if Docker runtime is selected
         let runtime_type = match app.runtime_type {
             RuntimeType::Docker => {
                 // Use safe FD redirection to check Docker availability
-                let is_docker_available = match utils::fd::with_stderr_to_null(|| {
-                    executor::docker::is_available()
-                }) {
-                    Ok(result) => result,
-                    Err(_) => {
-                        logging::debug("Failed to redirect stderr when checking Docker availability.");
-                        false
-                    }
-                };
-                
+                let is_docker_available =
+                    match utils::fd::with_stderr_to_null(|| executor::docker::is_available()) {
+                        Ok(result) => result,
+                        Err(_) => {
+                            logging::debug(
+                                "Failed to redirect stderr when checking Docker availability.",
+                            );
+                            false
+                        }
+                    };
+
                 if !is_docker_available {
-                    app.logs.push("Docker is not available. Using emulation mode instead.".to_string());
+                    app.logs
+                        .push("Docker is not available. Using emulation mode instead.".to_string());
                     logging::warning("Docker is not available. Using emulation mode instead.");
                     RuntimeType::Emulation
                 } else {
                     RuntimeType::Docker
                 }
-            },
+            }
             RuntimeType::Emulation => RuntimeType::Emulation,
         };
-        
+
         let validation_mode = app.validation_mode;
 
         // Update workflow status and add execution details
@@ -3523,7 +3527,10 @@ fn start_next_workflow_execution(
                 Err(e) => {
                     eprintln!("Failed to create Tokio runtime: {}", e);
                     // Return early from the current function with appropriate error handling
-                    let _ = tx_clone_inner.send((next_idx, Err("Failed to create runtime for execution".to_string())));
+                    let _ = tx_clone_inner.send((
+                        next_idx,
+                        Err("Failed to create runtime for execution".to_string()),
+                    ));
                     return;
                 }
             };
@@ -3573,8 +3580,9 @@ fn start_next_workflow_execution(
                         futures::executor::block_on(async {
                             executor::execute_workflow(&workflow_path, runtime_type, verbose).await
                         })
-                    }).map_err(|e| format!("Failed to redirect stderr during execution: {}", e))?;
-                    
+                    })
+                    .map_err(|e| format!("Failed to redirect stderr during execution: {}", e))?;
+
                     match execution_result {
                         Ok(execution_result) => {
                             // Send back the job results in a wrapped result

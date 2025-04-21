@@ -1,3 +1,4 @@
+use lazy_static::lazy_static;
 use regex::Regex;
 use reqwest;
 use reqwest::header;
@@ -7,7 +8,6 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 use thiserror::Error;
-use lazy_static::lazy_static;
 
 #[derive(Error, Debug)]
 pub enum GithubError {
@@ -36,9 +36,9 @@ pub struct RepoInfo {
 }
 
 lazy_static! {
-    static ref GITHUB_REPO_REGEX: Regex = Regex::new(
-        r"(?:https://github\.com/|git@github\.com:)([^/]+)/([^/.]+)(?:\.git)?"
-    ).expect("Failed to compile GitHub repo regex - this is a critical error");
+    static ref GITHUB_REPO_REGEX: Regex =
+        Regex::new(r"(?:https://github\.com/|git@github\.com:)([^/]+)/([^/.]+)(?:\.git)?")
+            .expect("Failed to compile GitHub repo regex - this is a critical error");
 }
 
 /// Extract repository information from the current git repository
@@ -49,30 +49,44 @@ pub fn get_repo_info() -> Result<RepoInfo, GithubError> {
         .map_err(|e| GithubError::GitParseError(format!("Failed to execute git command: {}", e)))?;
 
     if !output.status.success() {
-        return Err(GithubError::GitParseError("Failed to get git origin URL. Are you in a git repository?".to_string()));
+        return Err(GithubError::GitParseError(
+            "Failed to get git origin URL. Are you in a git repository?".to_string(),
+        ));
     }
 
     let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    
+
     if let Some(captures) = GITHUB_REPO_REGEX.captures(&url) {
-        let owner = captures.get(1)
-            .ok_or_else(|| GithubError::GitParseError("Unable to extract owner from GitHub URL".to_string()))?
+        let owner = captures
+            .get(1)
+            .ok_or_else(|| {
+                GithubError::GitParseError("Unable to extract owner from GitHub URL".to_string())
+            })?
             .as_str()
             .to_string();
-            
-        let repo = captures.get(2)
-            .ok_or_else(|| GithubError::GitParseError("Unable to extract repo name from GitHub URL".to_string()))?
+
+        let repo = captures
+            .get(2)
+            .ok_or_else(|| {
+                GithubError::GitParseError(
+                    "Unable to extract repo name from GitHub URL".to_string(),
+                )
+            })?
             .as_str()
             .to_string();
-            
+
         // Get the default branch
         let branch_output = Command::new("git")
             .args(["rev-parse", "--abbrev-ref", "HEAD"])
             .output()
-            .map_err(|e| GithubError::GitParseError(format!("Failed to execute git command: {}", e)))?;
+            .map_err(|e| {
+                GithubError::GitParseError(format!("Failed to execute git command: {}", e))
+            })?;
 
         if !branch_output.status.success() {
-            return Err(GithubError::GitParseError("Failed to get current branch".to_string()));
+            return Err(GithubError::GitParseError(
+                "Failed to get current branch".to_string(),
+            ));
         }
 
         let default_branch = String::from_utf8_lossy(&branch_output.stdout)
@@ -85,7 +99,10 @@ pub fn get_repo_info() -> Result<RepoInfo, GithubError> {
             default_branch,
         })
     } else {
-        Err(GithubError::GitParseError(format!("URL '{}' is not a valid GitHub repository URL", url)))
+        Err(GithubError::GitParseError(format!(
+            "URL '{}' is not a valid GitHub repository URL",
+            url
+        )))
     }
 }
 

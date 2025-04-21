@@ -1098,9 +1098,10 @@ fn copy_directory_contents(from: &Path, to: &Path) -> Result<(), ExecutionError>
         let file_name = match path.file_name() {
             Some(name) => name.to_string_lossy(),
             None => {
-                return Err(ExecutionError::ExecutionError(
-                    format!("Failed to get file name from path: {:?}", path)
-                ));
+                return Err(ExecutionError::ExecutionError(format!(
+                    "Failed to get file name from path: {:?}",
+                    path
+                )));
             }
         };
         if file_name.starts_with(".") || file_name == "target" {
@@ -1110,9 +1111,10 @@ fn copy_directory_contents(from: &Path, to: &Path) -> Result<(), ExecutionError>
         let dest_path = match path.file_name() {
             Some(name) => to.join(name),
             None => {
-                return Err(ExecutionError::ExecutionError(
-                    format!("Failed to get file name from path: {:?}", path)
-                ));
+                return Err(ExecutionError::ExecutionError(format!(
+                    "Failed to get file name from path: {:?}",
+                    path
+                )));
             }
         };
 

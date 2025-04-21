@@ -1,16 +1,12 @@
 #[cfg(test)]
 mod cleanup_tests {
+    use crate::{
+        cleanup_on_exit,
+        executor::docker,
+        runtime::emulation::{self, EmulationRuntime},
+    };
     use bollard::Docker;
     use std::process::Command;
-    use crate::{
-        executor::{
-            docker,
-        },
-        runtime::{
-            emulation::{self, EmulationRuntime},
-        },
-        cleanup_on_exit,
-    };
 
     #[tokio::test]
     async fn test_docker_container_cleanup() {
@@ -46,7 +42,10 @@ mod cleanup_tests {
         let containers = docker::get_tracked_containers();
         let still_tracked = containers.contains(&container_id);
 
-        assert!(!still_tracked, "Container should be removed from tracking after cleanup");
+        assert!(
+            !still_tracked,
+            "Container should be removed from tracking after cleanup"
+        );
     }
 
     #[tokio::test]
@@ -88,7 +87,10 @@ mod cleanup_tests {
         let networks = docker::get_tracked_networks();
         let still_tracked = networks.contains(&network_id);
 
-        assert!(!still_tracked, "Network should be removed from tracking after cleanup");
+        assert!(
+            !still_tracked,
+            "Network should be removed from tracking after cleanup"
+        );
     }
 
     #[tokio::test]
@@ -106,7 +108,10 @@ mod cleanup_tests {
         let workspace_path = &workspaces[0];
 
         // Verify workspace exists
-        assert!(workspace_path.exists(), "Workspace should exist before cleanup");
+        assert!(
+            workspace_path.exists(),
+            "Workspace should exist before cleanup"
+        );
 
         // Run cleanup
         emulation::cleanup_resources().await;
@@ -115,10 +120,16 @@ mod cleanup_tests {
         let workspaces = emulation::get_tracked_workspaces();
         let still_tracked = workspaces.iter().any(|w| w == workspace_path);
 
-        assert!(!still_tracked, "Workspace should be removed from tracking after cleanup");
+        assert!(
+            !still_tracked,
+            "Workspace should be removed from tracking after cleanup"
+        );
 
         // Verify workspace directory is deleted
-        assert!(!workspace_path.exists(), "Workspace directory should be deleted after cleanup");
+        assert!(
+            !workspace_path.exists(),
+            "Workspace directory should be deleted after cleanup"
+        );
     }
 
     #[tokio::test]
@@ -188,7 +199,10 @@ mod cleanup_tests {
         let processes = emulation::get_tracked_processes();
         let still_tracked = processes.contains(&process_id);
 
-        assert!(!still_tracked, "Process should be removed from tracking after cleanup");
+        assert!(
+            !still_tracked,
+            "Process should be removed from tracking after cleanup"
+        );
     }
 
     #[tokio::test]
@@ -214,10 +228,7 @@ mod cleanup_tests {
 
         // Create a process to track in emulation mode
         if cfg!(unix) {
-            let child = Command::new("sh")
-                .arg("-c")
-                .arg("sleep 30 &")
-                .spawn();
+            let child = Command::new("sh").arg("-c").arg("sleep 30 &").spawn();
 
             if let Ok(child) = child {
                 emulation::track_process(child.id());
@@ -248,7 +259,7 @@ mod cleanup_tests {
 
         // Run the main cleanup function
         cleanup_on_exit().await;
-        
+
         // Add a small delay to ensure async cleanup operations complete
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -269,7 +280,13 @@ mod cleanup_tests {
         };
 
         // Verify all resources were cleaned up
-        assert_eq!(docker_resources_after, 0, "All Docker resources should be cleaned up");
-        assert_eq!(emulation_resources_after, 0, "All emulation resources should be cleaned up");
+        assert_eq!(
+            docker_resources_after, 0,
+            "All Docker resources should be cleaned up"
+        );
+        assert_eq!(
+            emulation_resources_after, 0,
+            "All emulation resources should be cleaned up"
+        );
     }
-} 
+}

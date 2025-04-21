@@ -81,7 +81,10 @@ impl EmulationRuntime {
                             let file_name = match source.file_name() {
                                 Some(name) => name,
                                 None => {
-                                    eprintln!("Warning: Could not get file name from path: {:?}", source);
+                                    eprintln!(
+                                        "Warning: Could not get file name from path: {:?}",
+                                        source
+                                    );
                                     continue; // Skip this file
                                 }
                             };
@@ -89,7 +92,10 @@ impl EmulationRuntime {
 
                             if source.is_file() {
                                 if let Err(e) = fs::copy(&source, &dest) {
-                                    eprintln!("Warning: Failed to copy file from {:?} to {:?}: {}", &source, &dest, e);
+                                    eprintln!(
+                                        "Warning: Failed to copy file from {:?} to {:?}: {}",
+                                        &source, &dest, e
+                                    );
                                 }
                             } else {
                                 // We could make this recursive if needed
@@ -103,13 +109,19 @@ impl EmulationRuntime {
                 let file_name = match host_path.file_name() {
                     Some(name) => name,
                     None => {
-                        eprintln!("Warning: Could not get file name from path: {:?}", host_path);
+                        eprintln!(
+                            "Warning: Could not get file name from path: {:?}",
+                            host_path
+                        );
                         continue; // Skip this file
                     }
                 };
                 let dest = target_path.join(file_name);
                 if let Err(e) = fs::copy(host_path, &dest) {
-                    eprintln!("Warning: Failed to copy file from {:?} to {:?}: {}", host_path, &dest, e);
+                    eprintln!(
+                        "Warning: Failed to copy file from {:?} to {:?}: {}",
+                        host_path, &dest, e
+                    );
                 }
             }
         }

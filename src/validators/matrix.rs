@@ -37,7 +37,7 @@ pub fn validate_matrix(matrix: &Value, result: &mut ValidationResult) {
 
     // Validate the main matrix parameters (excluding special keywords)
     let special_keys = ["include", "exclude", "max-parallel", "fail-fast"];
-    
+
     // Use if let to avoid unwrap
     if let Some(mapping) = matrix.as_mapping() {
         for (key, value) in mapping {

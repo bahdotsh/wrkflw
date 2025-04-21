@@ -1,3 +1,4 @@
+mod cleanup_test;
 mod evaluator;
 mod executor;
 mod github;
@@ -10,7 +11,6 @@ mod runtime;
 mod ui;
 mod utils;
 mod validators;
-mod cleanup_test;
 
 use bollard::Docker;
 use clap::{Parser, Subcommand};
@@ -111,7 +111,7 @@ async fn handle_signals() {
     match tokio::signal::ctrl_c().await {
         Ok(_) => {
             println!("Received Ctrl+C, shutting down and cleaning up...");
-        },
+        }
         Err(e) => {
             // Log the error but continue with cleanup
             eprintln!("Warning: Failed to properly listen for ctrl+c event: {}", e);

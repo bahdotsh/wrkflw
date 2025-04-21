@@ -49,27 +49,23 @@ pub mod fd {
                 Ok(fd) => fd,
                 Err(e) => return Err(io::Error::new(io::ErrorKind::Other, e)),
             };
-            
+
             // Open /dev/null
-            let null_fd = match open(
-                Path::new("/dev/null"),
-                OFlag::O_WRONLY,
-                Mode::empty(),
-            ) {
+            let null_fd = match open(Path::new("/dev/null"), OFlag::O_WRONLY, Mode::empty()) {
                 Ok(fd) => fd,
                 Err(e) => {
                     let _ = close(stderr_backup); // Clean up on error
                     return Err(io::Error::new(io::ErrorKind::Other, e));
                 }
             };
-            
+
             // Redirect stderr to /dev/null
             if let Err(e) = dup2(null_fd, STDERR_FILENO) {
                 let _ = close(stderr_backup); // Clean up on error
                 let _ = close(null_fd);
                 return Err(io::Error::new(io::ErrorKind::Other, e));
             }
-            
+
             Ok(RedirectedStderr {
                 original_fd: Some(stderr_backup),
                 null_fd: Some(null_fd),
@@ -85,7 +81,7 @@ pub mod fd {
                 let _ = dup2(orig_fd, STDERR_FILENO);
                 let _ = close(orig_fd);
             }
-            
+
             // Close the null fd
             if let Some(null_fd) = self.null_fd.take() {
                 let _ = close(null_fd);
@@ -94,7 +90,7 @@ pub mod fd {
     }
 
     /// Run a function with stderr redirected to /dev/null, then restore stderr
-    pub fn with_stderr_to_null<F, T>(f: F) -> Result<T> 
+    pub fn with_stderr_to_null<F, T>(f: F) -> Result<T>
     where
         F: FnOnce() -> T,
     {
@@ -106,7 +102,7 @@ pub mod fd {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_fd_redirection() {
         // This test will write to stderr, which should be redirected
@@ -116,7 +112,7 @@ mod tests {
             // Return a test value to verify the function passes through the result
             42
         });
-        
+
         // The function should succeed and return our test value
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), 42);

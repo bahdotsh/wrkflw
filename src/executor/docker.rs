@@ -21,10 +21,9 @@ pub struct DockerRuntime {
 
 impl DockerRuntime {
     pub fn new() -> Result<Self, ContainerError> {
-        let docker = Docker::connect_with_local_defaults()
-            .map_err(|e| ContainerError::ContainerStartFailed(
-                format!("Failed to connect to Docker: {}", e)
-            ))?;
+        let docker = Docker::connect_with_local_defaults().map_err(|e| {
+            ContainerError::ContainerStartFailed(format!("Failed to connect to Docker: {}", e))
+        })?;
 
         Ok(DockerRuntime { docker })
     }
@@ -353,12 +352,26 @@ impl ContainerRuntime for DockerRuntime {
             if let Ok(file) = std::fs::File::open(dockerfile) {
                 let mut header = tar::Header::new_gnu();
                 let metadata = file.metadata().map_err(|e| {
-                    ContainerError::ContainerExecutionFailed(format!("Failed to get file metadata: {}", e))
+                    ContainerError::ContainerExecutionFailed(format!(
+                        "Failed to get file metadata: {}",
+                        e
+                    ))
                 })?;
-                let modified_time = metadata.modified()
-                    .map_err(|e| ContainerError::ContainerExecutionFailed(format!("Failed to get file modification time: {}", e)))?
+                let modified_time = metadata
+                    .modified()
+                    .map_err(|e| {
+                        ContainerError::ContainerExecutionFailed(format!(
+                            "Failed to get file modification time: {}",
+                            e
+                        ))
+                    })?
                     .elapsed()
-                    .map_err(|e| ContainerError::ContainerExecutionFailed(format!("Failed to get elapsed time since modification: {}", e)))?
+                    .map_err(|e| {
+                        ContainerError::ContainerExecutionFailed(format!(
+                            "Failed to get elapsed time since modification: {}",
+                            e
+                        ))
+                    })?
                     .as_secs();
                 header.set_size(metadata.len());
                 header.set_mode(0o644);

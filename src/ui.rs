@@ -684,7 +684,7 @@ impl App {
                 
                 // Set a success status message
                 self.set_status_message(format!(
-                    "✅ Workflow '{}' has been reset and is ready to be triggered again",
+                    "✅ Workflow '{}' has been reset!",
                     workflow_name
                 ));
                 
@@ -2104,7 +2104,7 @@ fn render_status_bar(f: &mut Frame<CrosstermBackend<io::Stdout>>, app: &App, are
                 if idx < app.workflows.len() {
                     let workflow = &app.workflows[idx];
                     match workflow.status {
-                        WorkflowStatus::NotStarted => "[Space] Toggle selection   [Enter] Run selected   [r] Run all selected   [Shift+R] Reset workflow",
+                        WorkflowStatus::NotStarted => "[Space] Toggle selection   [Enter] Run selected   [r] Run all selected   [t] Trigger Workflow  [Shift+R] Reset workflow",
                         WorkflowStatus::Running => "[Space] Toggle selection   [Enter] Run selected   [r] Run all selected   (Workflow running...)",
                         WorkflowStatus::Success | WorkflowStatus::Failed | WorkflowStatus::Skipped => 
                             "[Space] Toggle selection   [Enter] Run selected   [r] Run all selected   [Shift+R] Reset workflow",
@@ -2702,6 +2702,12 @@ async fn execute_curl_trigger(workflow_name: &str, branch: Option<&str>) -> Resu
     let token = std::env::var("GITHUB_TOKEN")
         .map_err(|_| "GitHub token not found. Please set GITHUB_TOKEN environment variable".to_string())?;
     
+    // Debug log to check if GITHUB_TOKEN is set
+    match std::env::var("GITHUB_TOKEN") {
+        Ok(token) => logging::info(&format!("GITHUB_TOKEN is set: {}", &token[..5])), // Log first 5 characters for security
+        Err(_) => logging::error("GITHUB_TOKEN is not set"),
+    }
+    
     // Get repository information
     let repo_info = crate::github::get_repo_info()
         .map_err(|e| format!("Failed to get repository info: {}", e))?;
@@ -2714,9 +2720,12 @@ async fn execute_curl_trigger(workflow_name: &str, branch: Option<&str>) -> Resu
     
     // Construct API URL
     let url = format!(
-        "https://api.github.com/repos/{}/{}/actions/workflows/{}.yml/dispatches",
+        "https://api.github.com/repos/{}/{}/actions/workflows/{}/dispatches",
         repo_info.owner, repo_info.repo, workflow_name
     );
+    
+    // Log the constructed API URL and payload for debugging
+    logging::info(&format!("Triggering workflow with URL: {} and payload: {}", url, payload));
     
     // Use a Command to run curl - disable verbose flags for better performance
     let output = tokio::process::Command::new("curl")
@@ -2732,9 +2741,14 @@ async fn execute_curl_trigger(workflow_name: &str, branch: Option<&str>) -> Resu
         .await
         .map_err(|e| format!("Failed to execute curl: {}", e))?;
     
+    // Log the output of the curl command for debugging
     if !output.status.success() {
         let error = String::from_utf8_lossy(&output.stderr);
+        logging::error(&format!("Curl command failed: {}", error));
         return Err(format!("Curl command failed: {}", error));
+    } else {
+        let success_output = String::from_utf8_lossy(&output.stdout);
+        logging::info(&format!("Curl command succeeded: {}", success_output));
     }
     
     // Success message with URL to view the workflow

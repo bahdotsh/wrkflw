@@ -22,6 +22,7 @@ WRKFLW is a powerful command-line tool for validating and executing GitHub Actio
 - **Special Action Handling**: Native handling for commonly used actions like `actions/checkout`
 - **Output Capturing**: View logs, step outputs, and execution details
 - **Parallel Job Execution**: Runs independent jobs in parallel for faster workflow execution
+- **Trigger Workflows Remotely**: Manually trigger workflow runs on GitHub
 
 ## Installation
 
@@ -99,6 +100,13 @@ wrkflw tui path/to/workflow.yml
 
 # Open TUI in emulation mode
 wrkflw tui --emulate
+```
+
+### Triggering Workflows Remotely
+
+```bash
+# Trigger a workflow remotely on GitHub
+wrkflw trigger workflow-name --branch main --input key1=value1 --input key2=value2
 ```
 
 ## TUI Controls
@@ -216,3 +224,33 @@ WRKFLW automatically cleans up any Docker containers created during workflow exe
 ## License
 
 This project is licensed under the MIT License - see the LICENSE file for details.
+
+## Remote Workflow Triggering
+
+The new `trigger` command lets you manually trigger workflow runs on GitHub. Requirements:
+
+1. You need a GitHub token with appropriate permissions. Set it in the `GITHUB_TOKEN` environment variable:
+   ```bash
+   export GITHUB_TOKEN=ghp_your_token_here
+   ```
+
+2. The workflow must have the `workflow_dispatch` trigger defined:
+   ```yaml
+   on:
+     workflow_dispatch:
+       inputs:
+         # Optional inputs can be defined here
+   ```
+
+Examples:
+
+```bash
+# Trigger a workflow using the default branch
+wrkflw trigger build
+
+# Trigger on a specific branch
+wrkflw trigger deploy --branch production
+
+# Trigger with input parameters
+wrkflw trigger release --input version=1.0.0 --input draft=false
+```

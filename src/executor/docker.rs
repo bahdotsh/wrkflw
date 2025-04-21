@@ -33,17 +33,46 @@ pub fn is_available() -> bool {
     // Use the safe FD redirection utility from utils
     match crate::utils::fd::with_stderr_to_null(|| {
         match Docker::connect_with_local_defaults() {
-            Ok(docker) => match futures::executor::block_on(async { docker.ping().await }) {
-                Ok(_) => true,
-                Err(_) => {
-                    // Only log at debug level to avoid cluttering the console with technical errors
-                    logging::debug("Docker daemon is running but ping failed. Docker may not be properly configured.");
-                    false
+            Ok(docker) => {
+                // Add a timeout to the ping operation to prevent hanging
+                let ping_future = docker.ping();
+                match futures::executor::block_on(async {
+                    match tokio::time::timeout(std::time::Duration::from_secs(5), ping_future).await {
+                        Ok(result) => result,
+                        Err(_) => {
+                            logging::warning("Docker ping timed out after 5 seconds");
+                            Err(bollard::errors::Error::DockerResponseServerError {
+                                status_code: 500,
+                                message: "Timeout pinging Docker daemon".to_string(),
+                            })
+                        }
+                    }
+                }) {
+                    Ok(_) => true,
+                    Err(e) => {
+                        // Only log at debug level to avoid cluttering the console with technical errors
+                        logging::debug(&format!("Docker daemon is running but ping failed: {}", e));
+                        
+                        // Additional check for Linux CI environments
+                        if cfg!(target_os = "linux") && std::env::var("CI").is_ok() {
+                            logging::info("Running in Linux CI environment, performing additional Docker availability checks");
+                            
+                            // Try a simple docker command as a fallback check
+                            match std::process::Command::new("docker")
+                                .arg("version")
+                                .output() {
+                                Ok(output) => output.status.success(),
+                                Err(_) => false,
+                            }
+                        } else {
+                            false
+                        }
+                    }
                 }
-            },
-            Err(_) => {
+            }
+            Err(e) => {
                 // Only log at debug level to avoid confusing users
-                logging::debug("Docker daemon is not running or not properly configured.");
+                logging::debug(&format!("Docker daemon is not running or not properly configured: {}", e));
                 false
             }
         }

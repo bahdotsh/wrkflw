@@ -142,10 +142,10 @@ mod cleanup_tests {
 
         // Create a process for testing
         let process_id = if cfg!(unix) {
-            // Use sleep on Unix to create a long-running process
-            let child = Command::new("sh")
-                .arg("-c")
-                .arg("sleep 30 &") // Run sleep for 30 seconds in background
+            // Use sleep on Unix but DO NOT use & to background
+            // Instead run it directly and track the actual process
+            let child = Command::new("sleep")
+                .arg("10") // Shorter sleep time
                 .spawn();
 
             match child {
@@ -161,7 +161,7 @@ mod cleanup_tests {
             // Use timeout on Windows (equivalent to sleep)
             let child = Command::new("cmd")
                 .arg("/C")
-                .arg("start /b timeout /t 30") // Run timeout for 30 seconds
+                .arg("timeout /t 10") // Shorter timeout
                 .spawn();
 
             match child {

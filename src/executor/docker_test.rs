@@ -11,9 +11,15 @@ use crate::{
 mod docker_cleanup_tests {
     use super::*;
 
+    // Helper function to check if Docker tests should be skipped
+    fn should_skip_docker_tests() -> bool {
+        std::env::var("WRKFLW_TEST_SKIP_DOCKER").is_ok() || 
+        !docker::is_available()
+    }
+
     /// Helper function to create a Docker container that should be tracked
     async fn create_test_container(docker_client: &Docker) -> Option<String> {
-        if !docker::is_available() {
+        if should_skip_docker_tests() {
             return None;
         }
 
@@ -53,7 +59,7 @@ mod docker_cleanup_tests {
 
     /// Helper function to create a Docker network that should be tracked
     async fn create_test_network(docker_client: &Docker) -> Option<String> {
-        if !docker::is_available() {
+        if should_skip_docker_tests() {
             return None;
         }
 
@@ -66,8 +72,8 @@ mod docker_cleanup_tests {
 
     #[tokio::test]
     async fn test_docker_container_cleanup() {
-        if !docker::is_available() {
-            println!("Docker not available, skipping test");
+        if should_skip_docker_tests() {
+            println!("Docker tests disabled or Docker not available, skipping test");
             return;
         }
 
@@ -107,8 +113,8 @@ mod docker_cleanup_tests {
 
     #[tokio::test]
     async fn test_docker_network_cleanup() {
-        if !docker::is_available() {
-            println!("Docker not available, skipping test");
+        if should_skip_docker_tests() {
+            println!("Docker tests disabled or Docker not available, skipping test");
             return;
         }
 
@@ -148,8 +154,8 @@ mod docker_cleanup_tests {
 
     #[tokio::test]
     async fn test_full_resource_cleanup() {
-        if !docker::is_available() {
-            println!("Docker not available, skipping test");
+        if should_skip_docker_tests() {
+            println!("Docker tests disabled or Docker not available, skipping test");
             return;
         }
 

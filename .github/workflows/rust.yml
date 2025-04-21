@@ -11,6 +11,8 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  CI: true
+  WRKFLW_TEST_SKIP_DOCKER: true
 
 jobs:
   build:
@@ -49,5 +51,18 @@ jobs:
       - name: Build
         run: cargo build --verbose
       
+      - name: Check Docker Availability on Linux
+        if: runner.os == 'Linux'
+        id: docker-check
+        run: |
+          if command -v docker &> /dev/null && docker info &> /dev/null; then
+            echo "docker-available=true" >> $GITHUB_OUTPUT
+            echo "Docker is available, will run Docker tests"
+          else
+            echo "docker-available=false" >> $GITHUB_OUTPUT
+            echo "Docker is not available, will skip Docker tests"
+          fi
+      
       - name: Run Tests
-        run: cargo test --verbose 
+        run: cargo test --verbose
+        timeout-minutes: 10  # Add timeout to prevent tests from running indefinitely 

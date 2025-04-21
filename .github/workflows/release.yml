@@ -18,7 +18,9 @@ jobs:
           fetch-depth: 0
       
       - name: Install git-cliff
-        uses: kenji-miyake/setup-git-cliff@v1
+        run: |
+          curl -LSfs https://raw.githubusercontent.com/orhun/git-cliff/main/install.sh | sh -s -- --version latest
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
       
       - name: Generate Changelog
         run: git cliff --latest --output CHANGELOG.md
@@ -36,7 +38,7 @@ jobs:
 
   build-release:
     name: Build Release
-    needs: create-release
+    needs: [create-release]
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -79,18 +81,22 @@ jobs:
       - name: Compress Release Binary (Unix)
         if: runner.os != 'Windows'
         run: |
-          cd target/${{ matrix.target }}/release
+          mkdir -p compressed
+          cp target/${{ matrix.target }}/release/${{ matrix.artifact_name }} compressed/
+          cd compressed
           tar czvf ${{ matrix.asset_name }}.tar.gz ${{ matrix.artifact_name }}
           echo "ASSET=${{ matrix.asset_name }}.tar.gz" >> $GITHUB_ENV
-          echo "ASSET_PATH=target/${{ matrix.target }}/release/${{ matrix.asset_name }}.tar.gz" >> $GITHUB_ENV
+          echo "ASSET_PATH=compressed/${{ matrix.asset_name }}.tar.gz" >> $GITHUB_ENV
       
       - name: Compress Release Binary (Windows)
         if: runner.os == 'Windows'
         run: |
-          cd target/${{ matrix.target }}/release
+          mkdir -p compressed
+          copy target\${{ matrix.target }}\release\${{ matrix.artifact_name }} compressed\
+          cd compressed
           7z a ${{ matrix.asset_name }}.zip ${{ matrix.artifact_name }}
           echo "ASSET=${{ matrix.asset_name }}.zip" >> $env:GITHUB_ENV
-          echo "ASSET_PATH=target/${{ matrix.target }}/release/${{ matrix.asset_name }}.zip" >> $env:GITHUB_ENV
+          echo "ASSET_PATH=compressed\${{ matrix.asset_name }}.zip" >> $env:GITHUB_ENV
         shell: pwsh
       
       - name: Upload Release Asset

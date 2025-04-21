@@ -38,7 +38,7 @@ cargo install wrkflw
 Clone the repository and build using Cargo:
 
 ```bash
-git clone https://github.com/yourusername/wrkflw.git
+git clone https://github.com/bahdotsh/wrkflw.git
 cd wrkflw
 cargo build --release
 ```

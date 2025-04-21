@@ -48,6 +48,11 @@ commit_parsers = [
   { body = ".*security", group = "Security" },
 ]
 
+# Define the GitHub repository URL for commit links
+[git.link]
+# Format: https://github.com/USER/REPO/commit/{}
+github_link = "https://github.com/bahdotsh/wrkflw/commit/{}"
+
 # Format of the git commit link
 link_parsers = [
   { pattern = "#(\\d+)", href = "https://github.com/bahdotsh/wrkflw/issues/$1" },

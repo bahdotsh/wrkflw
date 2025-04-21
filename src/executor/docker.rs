@@ -37,7 +37,8 @@ pub fn is_available() -> bool {
                 // Add a timeout to the ping operation to prevent hanging
                 let ping_future = docker.ping();
                 match futures::executor::block_on(async {
-                    match tokio::time::timeout(std::time::Duration::from_secs(5), ping_future).await {
+                    match tokio::time::timeout(std::time::Duration::from_secs(5), ping_future).await
+                    {
                         Ok(result) => result,
                         Err(_) => {
                             logging::warning("Docker ping timed out after 5 seconds");
@@ -52,15 +53,13 @@ pub fn is_available() -> bool {
                     Err(e) => {
                         // Only log at debug level to avoid cluttering the console with technical errors
                         logging::debug(&format!("Docker daemon is running but ping failed: {}", e));
-                        
+
                         // Additional check for Linux CI environments
                         if cfg!(target_os = "linux") && std::env::var("CI").is_ok() {
                             logging::info("Running in Linux CI environment, performing additional Docker availability checks");
-                            
+
                             // Try a simple docker command as a fallback check
-                            match std::process::Command::new("docker")
-                                .arg("version")
-                                .output() {
+                            match std::process::Command::new("docker").arg("version").output() {
                                 Ok(output) => output.status.success(),
                                 Err(_) => false,
                             }
@@ -72,7 +71,10 @@ pub fn is_available() -> bool {
             }
             Err(e) => {
                 // Only log at debug level to avoid confusing users
-                logging::debug(&format!("Docker daemon is not running or not properly configured: {}", e));
+                logging::debug(&format!(
+                    "Docker daemon is not running or not properly configured: {}",
+                    e
+                ));
                 false
             }
         }

@@ -22,7 +22,7 @@ pub struct DockerRuntime {
 impl DockerRuntime {
     pub fn new() -> Result<Self, ContainerError> {
         let docker = Docker::connect_with_local_defaults().map_err(|e| {
-            ContainerError::ContainerStartFailed(format!("Failed to connect to Docker: {}", e))
+            ContainerError::ContainerStart(format!("Failed to connect to Docker: {}", e))
         })?;
 
         Ok(DockerRuntime { docker })
@@ -141,11 +141,11 @@ pub async fn create_job_network(docker: &Docker) -> Result<String, ContainerErro
     let network = docker
         .create_network(options)
         .await
-        .map_err(|e| ContainerError::NetworkCreationFailed(e.to_string()))?;
+        .map_err(|e| ContainerError::NetworkCreation(e.to_string()))?;
 
     // network.id is Option<String>, unwrap it safely
     let network_id = network.id.ok_or_else(|| {
-        ContainerError::NetworkOperationFailed("Network created but no ID returned".to_string())
+        ContainerError::NetworkOperation("Network created but no ID returned".to_string())
     })?;
 
     track_network(&network_id);
@@ -268,13 +268,13 @@ impl ContainerRuntime for DockerRuntime {
             .docker
             .create_container(options, config)
             .await
-            .map_err(|e| ContainerError::ContainerStartFailed(e.to_string()))?;
+            .map_err(|e| ContainerError::ContainerStart(e.to_string()))?;
 
         // Start container
         self.docker
             .start_container::<String>(&container.id, None)
             .await
-            .map_err(|e| ContainerError::ContainerExecutionFailed(e.to_string()))?;
+            .map_err(|e| ContainerError::ContainerExecution(e.to_string()))?;
 
         track_container(&container.id);
 
@@ -300,17 +300,15 @@ impl ContainerRuntime for DockerRuntime {
         let mut stdout = String::new();
         let mut stderr = String::new();
 
-        for log_result in logs {
-            if let Ok(log) = log_result {
-                match log {
-                    bollard::container::LogOutput::StdOut { message } => {
-                        stdout.push_str(&String::from_utf8_lossy(&message));
-                    }
-                    bollard::container::LogOutput::StdErr { message } => {
-                        stderr.push_str(&String::from_utf8_lossy(&message));
-                    }
-                    _ => {}
+        for log in logs.into_iter().flatten() {
+            match log {
+                bollard::container::LogOutput::StdOut { message } => {
+                    stdout.push_str(&String::from_utf8_lossy(&message));
                 }
+                bollard::container::LogOutput::StdErr { message } => {
+                    stderr.push_str(&String::from_utf8_lossy(&message));
+                }
+                _ => {}
             }
         }
 
@@ -335,7 +333,7 @@ impl ContainerRuntime for DockerRuntime {
 
         while let Some(result) = stream.next().await {
             if let Err(e) = result {
-                return Err(ContainerError::ImagePullFailed(e.to_string()));
+                return Err(ContainerError::ImagePull(e.to_string()));
             }
         }
 
@@ -352,7 +350,7 @@ impl ContainerRuntime for DockerRuntime {
             if let Ok(file) = std::fs::File::open(dockerfile) {
                 let mut header = tar::Header::new_gnu();
                 let metadata = file.metadata().map_err(|e| {
-                    ContainerError::ContainerExecutionFailed(format!(
+                    ContainerError::ContainerExecution(format!(
                         "Failed to get file metadata: {}",
                         e
                     ))
@@ -360,14 +358,14 @@ impl ContainerRuntime for DockerRuntime {
                 let modified_time = metadata
                     .modified()
                     .map_err(|e| {
-                        ContainerError::ContainerExecutionFailed(format!(
+                        ContainerError::ContainerExecution(format!(
                             "Failed to get file modification time: {}",
                             e
                         ))
                     })?
                     .elapsed()
                     .map_err(|e| {
-                        ContainerError::ContainerExecutionFailed(format!(
+                        ContainerError::ContainerExecution(format!(
                             "Failed to get elapsed time since modification: {}",
                             e
                         ))
@@ -380,9 +378,9 @@ impl ContainerRuntime for DockerRuntime {
 
                 tar_builder
                     .append_data(&mut header, "Dockerfile", file)
-                    .map_err(|e| ContainerError::ImageBuildFailed(e.to_string()))?;
+                    .map_err(|e| ContainerError::ImageBuild(e.to_string()))?;
             } else {
-                return Err(ContainerError::ImageBuildFailed(format!(
+                return Err(ContainerError::ImageBuild(format!(
                     "Cannot open Dockerfile at {}",
                     dockerfile.display()
                 )));
@@ -390,7 +388,7 @@ impl ContainerRuntime for DockerRuntime {
 
             tar_builder
                 .into_inner()
-                .map_err(|e| ContainerError::ImageBuildFailed(e.to_string()))?
+                .map_err(|e| ContainerError::ImageBuild(e.to_string()))?
         };
 
         let options = bollard::image::BuildImageOptions {
@@ -412,7 +410,7 @@ impl ContainerRuntime for DockerRuntime {
                     // For verbose output, we could log the build progress here
                 }
                 Err(e) => {
-                    return Err(ContainerError::ImageBuildFailed(e.to_string()));
+                    return Err(ContainerError::ImageBuild(e.to_string()));
                 }
             }
         }

@@ -63,12 +63,12 @@ pub fn validate_triggers(on: &Value, result: &mut ValidationResult) {
 
             // Check schedule syntax if present
             if let Some(Value::Sequence(schedules)) =
-                event_map.get(&Value::String("schedule".to_string()))
+                event_map.get(Value::String("schedule".to_string()))
             {
                 for schedule in schedules {
                     if let Some(schedule_map) = schedule.as_mapping() {
                         if let Some(Value::String(cron)) =
-                            schedule_map.get(&Value::String("cron".to_string()))
+                            schedule_map.get(Value::String("cron".to_string()))
                         {
                             validate_cron_syntax(cron, result);
                         } else {

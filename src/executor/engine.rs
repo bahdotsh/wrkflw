@@ -17,7 +17,6 @@ use crate::runtime::container::ContainerRuntime;
 use crate::runtime::emulation::handle_special_action;
 
 #[allow(unused_variables, unused_assignments)]
-
 /// Execute a GitHub Actions workflow file locally
 pub async fn execute_workflow(
     workflow_path: &Path,
@@ -37,24 +36,29 @@ pub async fn execute_workflow(
     let runtime = initialize_runtime(runtime_type)?;
 
     // Create a temporary workspace directory
-    let workspace_dir = tempfile::tempdir().map_err(|e| {
-        ExecutionError::ExecutionError(format!("Failed to create workspace: {}", e))
-    })?;
+    let workspace_dir = tempfile::tempdir()
+        .map_err(|e| ExecutionError::Execution(format!("Failed to create workspace: {}", e)))?;
 
     // 4. Set up GitHub-like environment
     let env_context = environment::create_github_context(&workflow, workspace_dir.path());
 
     // Setup GitHub environment files
     environment::setup_github_environment_files(workspace_dir.path()).map_err(|e| {
-        ExecutionError::ExecutionError(format!("Failed to setup GitHub env files: {}", e))
+        ExecutionError::Execution(format!("Failed to setup GitHub env files: {}", e))
     })?;
 
     // 5. Execute jobs according to the plan
     let mut results = Vec::new();
     for job_batch in execution_plan {
         // Execute jobs in parallel if they don't depend on each other
-        let job_results =
-            execute_job_batch(&job_batch, &workflow, &runtime, &env_context, verbose).await?;
+        let job_results = execute_job_batch(
+            &job_batch,
+            &workflow,
+            runtime.as_ref(),
+            &env_context,
+            verbose,
+        )
+        .await?;
         results.extend(job_results);
     }
 
@@ -80,9 +84,7 @@ fn initialize_runtime(
                     }
                 }
             } else {
-                logging::error(&format!(
-                    "Docker not available, falling back to emulation mode"
-                ));
+                logging::error("Docker not available, falling back to emulation mode");
                 Ok(Box::new(crate::runtime::emulation::EmulationRuntime::new()))
             }
         }
@@ -133,37 +135,38 @@ pub enum StepStatus {
 #[derive(Error, Debug)]
 pub enum ExecutionError {
     #[error("Parse error: {0}")]
-    ParseError(String),
+    Parse(String),
 
     #[error("Runtime error: {0}")]
-    RuntimeError(String),
+    Runtime(String),
 
     #[error("Execution error: {0}")]
-    ExecutionError(String),
+    Execution(String),
 
     #[error("IO error: {0}")]
-    IoError(#[from] std::io::Error),
+    Io(#[from] std::io::Error),
 }
 
 // Convert errors from other modules
 impl From<String> for ExecutionError {
     fn from(err: String) -> Self {
-        ExecutionError::ParseError(err)
+        ExecutionError::Parse(err)
     }
 }
 
 // Add Action preparation functions
 async fn prepare_action(
     action: &ActionInfo,
-    runtime: &Box<dyn ContainerRuntime>,
+    runtime: &dyn ContainerRuntime,
 ) -> Result<String, ExecutionError> {
     if action.is_docker {
         // Docker action: pull the image
         let image = action.repository.trim_start_matches("docker://");
 
-        runtime.pull_image(image).await.map_err(|e| {
-            ExecutionError::RuntimeError(format!("Failed to pull Docker image: {}", e))
-        })?;
+        runtime
+            .pull_image(image)
+            .await
+            .map_err(|e| ExecutionError::Runtime(format!("Failed to pull Docker image: {}", e)))?;
 
         return Ok(image.to_string());
     }
@@ -173,7 +176,7 @@ async fn prepare_action(
         let action_dir = Path::new(&action.repository);
 
         if !action_dir.exists() {
-            return Err(ExecutionError::ExecutionError(format!(
+            return Err(ExecutionError::Execution(format!(
                 "Local action directory not found: {}",
                 action_dir.display()
             )));
@@ -184,9 +187,10 @@ async fn prepare_action(
             // It's a Docker action, build it
             let tag = format!("wrkflw-local-action:{}", uuid::Uuid::new_v4());
 
-            runtime.build_image(&dockerfile, &tag).await.map_err(|e| {
-                ExecutionError::RuntimeError(format!("Failed to build image: {}", e))
-            })?;
+            runtime
+                .build_image(&dockerfile, &tag)
+                .await
+                .map_err(|e| ExecutionError::Runtime(format!("Failed to build image: {}", e)))?;
 
             return Ok(tag);
         } else {
@@ -204,7 +208,7 @@ async fn prepare_action(
 async fn execute_job_batch(
     jobs: &[String],
     workflow: &WorkflowDefinition,
-    runtime: &Box<dyn ContainerRuntime>,
+    runtime: &dyn ContainerRuntime,
     env_context: &HashMap<String, String>,
     verbose: bool,
 ) -> Result<Vec<JobResult>, ExecutionError> {
@@ -227,25 +231,33 @@ async fn execute_job_batch(
     Ok(results)
 }
 
+// Before execute_job_with_matrix implementation, add this struct
+struct JobExecutionContext<'a> {
+    job_name: &'a str,
+    workflow: &'a WorkflowDefinition,
+    runtime: &'a dyn ContainerRuntime,
+    env_context: &'a HashMap<String, String>,
+    verbose: bool,
+}
+
 /// Execute a job, expanding matrix if present
 async fn execute_job_with_matrix(
     job_name: &str,
     workflow: &WorkflowDefinition,
-    runtime: &Box<dyn ContainerRuntime>,
+    runtime: &dyn ContainerRuntime,
     env_context: &HashMap<String, String>,
     verbose: bool,
 ) -> Result<Vec<JobResult>, ExecutionError> {
     // Get the job definition
     let job = workflow.jobs.get(job_name).ok_or_else(|| {
-        ExecutionError::ExecutionError(format!("Job '{}' not found in workflow", job_name))
+        ExecutionError::Execution(format!("Job '{}' not found in workflow", job_name))
     })?;
 
     // Check if this is a matrix job
     if let Some(matrix_config) = &job.matrix {
         // Expand the matrix into combinations
-        let combinations = matrix::expand_matrix(matrix_config).map_err(|e| {
-            ExecutionError::ExecutionError(format!("Failed to expand matrix: {}", e))
-        })?;
+        let combinations = matrix::expand_matrix(matrix_config)
+            .map_err(|e| ExecutionError::Execution(format!("Failed to expand matrix: {}", e)))?;
 
         if combinations.is_empty() {
             logging::info(&format!(
@@ -269,222 +281,41 @@ async fn execute_job_with_matrix(
         });
 
         // Execute matrix combinations
-        execute_matrix_combinations(
+        execute_matrix_combinations(MatrixExecutionContext {
             job_name,
-            job,
-            &combinations,
+            job_template: job,
+            combinations: &combinations,
             max_parallel,
-            matrix_config.fail_fast.unwrap_or(true),
+            fail_fast: matrix_config.fail_fast.unwrap_or(true),
             workflow,
             runtime,
             env_context,
             verbose,
-        )
+        })
         .await
     } else {
         // Regular job, no matrix
-        let result = execute_job(job_name, workflow, runtime, env_context, verbose).await?;
+        let ctx = JobExecutionContext {
+            job_name,
+            workflow,
+            runtime,
+            env_context,
+            verbose,
+        };
+        let result = execute_job(ctx).await?;
         Ok(vec![result])
     }
 }
 
-/// Execute a set of matrix combinations
-async fn execute_matrix_combinations(
-    job_name: &str,
-    job_template: &Job,
-    combinations: &[MatrixCombination],
-    max_parallel: usize,
-    fail_fast: bool,
-    workflow: &WorkflowDefinition,
-    runtime: &Box<dyn ContainerRuntime>,
-    env_context: &HashMap<String, String>,
-    verbose: bool,
-) -> Result<Vec<JobResult>, ExecutionError> {
-    let mut results = Vec::new();
-    let mut any_failed = false;
-
-    // Process combinations in chunks limited by max_parallel
-    for chunk in combinations.chunks(max_parallel) {
-        // Skip processing if fail-fast is enabled and a previous job failed
-        if fail_fast && any_failed {
-            // Add skipped results for remaining combinations
-            for combination in chunk {
-                let combination_name = matrix::format_combination_name(job_name, combination);
-                results.push(JobResult {
-                    name: combination_name,
-                    status: JobStatus::Skipped,
-                    steps: Vec::new(),
-                    logs: "Job skipped due to previous matrix job failure".to_string(),
-                });
-            }
-            continue;
-        }
-
-        // Process this chunk of combinations in parallel
-        let chunk_futures = chunk.iter().map(|combination| {
-            execute_matrix_job(
-                job_name,
-                job_template,
-                combination,
-                workflow,
-                runtime,
-                env_context,
-                verbose,
-            )
-        });
-
-        let chunk_results = future::join_all(chunk_futures).await;
-
-        // Process results from this chunk
-        for result in chunk_results {
-            match result {
-                Ok(job_result) => {
-                    if job_result.status == JobStatus::Failure {
-                        any_failed = true;
-                    }
-                    results.push(job_result);
-                }
-                Err(e) => {
-                    // On error, mark as failed and continue if not fail-fast
-                    any_failed = true;
-                    logging::error(&format!("Matrix job failed: {}", e));
-
-                    if fail_fast {
-                        return Err(e);
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(results)
-}
-
-/// Execute a single matrix job combination
-async fn execute_matrix_job(
-    job_name: &str,
-    job_template: &Job,
-    combination: &MatrixCombination,
-    workflow: &WorkflowDefinition,
-    runtime: &Box<dyn ContainerRuntime>,
-    base_env_context: &HashMap<String, String>,
-    verbose: bool,
-) -> Result<JobResult, ExecutionError> {
-    // Create the matrix-specific job name
-    let matrix_job_name = matrix::format_combination_name(job_name, combination);
-
-    logging::info(&format!("Executing matrix job: {}", matrix_job_name));
-
-    // Clone the environment and add matrix-specific values
-    let mut job_env = base_env_context.clone();
-    environment::add_matrix_context(&mut job_env, combination);
-
-    // Add job-level environment variables
-    for (key, value) in &job_template.env {
-        // TODO: Substitute matrix variable references in env values
-        job_env.insert(key.clone(), value.clone());
-    }
-
-    // Execute the job steps
-    let mut step_results = Vec::new();
-    let mut job_logs = String::new();
-
-    // Create a temporary directory for this job execution
-    let job_dir = tempfile::tempdir().map_err(|e| {
-        ExecutionError::ExecutionError(format!("Failed to create job directory: {}", e))
-    })?;
-
-    // Prepare the runner
-    let runner_image = get_runner_image(&job_template.runs_on);
-    prepare_runner_image(&runner_image, runtime, verbose).await?;
-
-    // Copy project files to workspace
-    let current_dir = std::env::current_dir().map_err(|e| {
-        ExecutionError::ExecutionError(format!("Failed to get current directory: {}", e))
-    })?;
-    copy_directory_contents(&current_dir, job_dir.path())?;
-
-    let job_success = if job_template.steps.is_empty() {
-        logging::warning(&format!("Job '{}' has no steps", matrix_job_name));
-        true
-    } else {
-        // Execute each step
-        for (idx, step) in job_template.steps.iter().enumerate() {
-            match execute_step(
-                step,
-                idx,
-                &job_env,
-                job_dir.path(),
-                runtime,
-                workflow,
-                &job_template.runs_on, // Pass the job's runner
-                verbose,
-                &Some(combination.values.clone()),
-            )
-            .await
-            {
-                Ok(result) => {
-                    job_logs.push_str(&format!("Step: {}\n", result.name));
-                    job_logs.push_str(&format!("Status: {:?}\n", result.status));
-                    job_logs.push_str(&result.output);
-                    job_logs.push_str("\n\n");
-
-                    step_results.push(result.clone());
-
-                    if result.status != StepStatus::Success {
-                        // Step failed, abort job
-                        return Ok(JobResult {
-                            name: matrix_job_name,
-                            status: JobStatus::Failure,
-                            steps: step_results,
-                            logs: job_logs,
-                        });
-                    }
-                }
-                Err(e) => {
-                    // Log the error and abort the job
-                    job_logs.push_str(&format!("Step execution error: {}\n\n", e));
-                    return Ok(JobResult {
-                        name: matrix_job_name,
-                        status: JobStatus::Failure,
-                        steps: step_results,
-                        logs: job_logs,
-                    });
-                }
-            }
-        }
-
-        true
-    };
-
-    // Return job result
-    Ok(JobResult {
-        name: matrix_job_name,
-        status: if job_success {
-            JobStatus::Success
-        } else {
-            JobStatus::Failure
-        },
-        steps: step_results,
-        logs: job_logs,
-    })
-}
-
 #[allow(unused_variables, unused_assignments)]
-async fn execute_job(
-    job_name: &str,
-    workflow: &WorkflowDefinition,
-    runtime: &Box<dyn ContainerRuntime>,
-    env_context: &HashMap<String, String>,
-    verbose: bool,
-) -> Result<JobResult, ExecutionError> {
+async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, ExecutionError> {
     // Get job definition
-    let job = workflow.jobs.get(job_name).ok_or_else(|| {
-        ExecutionError::ExecutionError(format!("Job '{}' not found in workflow", job_name))
+    let job = ctx.workflow.jobs.get(ctx.job_name).ok_or_else(|| {
+        ExecutionError::Execution(format!("Job '{}' not found in workflow", ctx.job_name))
     })?;
 
     // Clone context and add job-specific variables
-    let mut job_env = env_context.clone();
+    let mut job_env = ctx.env_context.clone();
 
     // Add job-level environment variables
     for (key, value) in &job.env {
@@ -496,9 +327,8 @@ async fn execute_job(
     let mut job_logs = String::new();
 
     // Create a temporary directory for this job execution
-    let job_dir = tempfile::tempdir().map_err(|e| {
-        ExecutionError::ExecutionError(format!("Failed to create job directory: {}", e))
-    })?;
+    let job_dir = tempfile::tempdir()
+        .map_err(|e| ExecutionError::Execution(format!("Failed to create job directory: {}", e)))?;
 
     // Try to get a Docker client if using Docker and services exist
     let docker_client = if !job.services.is_empty() {
@@ -518,22 +348,25 @@ async fn execute_job(
         let docker = match docker_client.as_ref() {
             Some(client) => client,
             None => {
-                return Err(ExecutionError::RuntimeError(
+                return Err(ExecutionError::Runtime(
                     "Docker client is required but not available".to_string(),
                 ));
             }
         };
         match docker::create_job_network(docker).await {
             Ok(id) => {
-                logging::info(&format!("Created network {} for job '{}'", id, job_name));
+                logging::info(&format!(
+                    "Created network {} for job '{}'",
+                    id, ctx.job_name
+                ));
                 Some(id)
             }
             Err(e) => {
                 logging::error(&format!(
                     "Failed to create network for job '{}': {}",
-                    job_name, e
+                    ctx.job_name, e
                 ));
-                return Err(ExecutionError::RuntimeError(format!(
+                return Err(ExecutionError::Runtime(format!(
                     "Failed to create network: {}",
                     e
                 )));
@@ -549,7 +382,7 @@ async fn execute_job(
     if !job.services.is_empty() {
         if docker_client.is_none() {
             logging::error("Services are only supported with Docker runtime");
-            return Err(ExecutionError::RuntimeError(
+            return Err(ExecutionError::Runtime(
                 "Services require Docker runtime".to_string(),
             ));
         }
@@ -557,13 +390,13 @@ async fn execute_job(
         logging::info(&format!(
             "Starting {} service containers for job '{}'",
             job.services.len(),
-            job_name
+            ctx.job_name
         ));
 
         let docker = match docker_client.as_ref() {
             Some(client) => client,
             None => {
-                return Err(ExecutionError::RuntimeError(
+                return Err(ExecutionError::Runtime(
                     "Docker client is required but not available".to_string(),
                 ));
             }
@@ -577,7 +410,7 @@ async fn execute_job(
             ));
 
             // Prepare container configuration
-            let container_name = format!("wrkflw-service-{}-{}", job_name, service_name);
+            let container_name = format!("wrkflw-service-{}-{}", ctx.job_name, service_name);
 
             // Map ports if specified
             let mut port_bindings = HashMap::new();
@@ -676,7 +509,7 @@ async fn execute_job(
                                 docker::untrack_network(net_id);
                             }
 
-                            return Err(ExecutionError::RuntimeError(error_msg));
+                            return Err(ExecutionError::Runtime(error_msg));
                         }
                     }
                 }
@@ -693,7 +526,7 @@ async fn execute_job(
                         docker::untrack_network(net_id);
                     }
 
-                    return Err(ExecutionError::RuntimeError(error_msg));
+                    return Err(ExecutionError::Runtime(error_msg));
                 }
             }
         }
@@ -704,31 +537,31 @@ async fn execute_job(
 
     // Prepare the runner environment
     let runner_image = get_runner_image(&job.runs_on);
-    prepare_runner_image(&runner_image, runtime, verbose).await?;
+    prepare_runner_image(&runner_image, ctx.runtime, ctx.verbose).await?;
 
     // Copy project files to workspace
     let current_dir = std::env::current_dir().map_err(|e| {
-        ExecutionError::ExecutionError(format!("Failed to get current directory: {}", e))
+        ExecutionError::Execution(format!("Failed to get current directory: {}", e))
     })?;
     copy_directory_contents(&current_dir, job_dir.path())?;
 
-    logging::info(&format!("Executing job: {}", job_name));
+    logging::info(&format!("Executing job: {}", ctx.job_name));
 
     let mut job_success = true;
 
     // Execute job steps
     for (idx, step) in job.steps.iter().enumerate() {
-        let step_result = execute_step(
+        let step_result = execute_step(StepExecutionContext {
             step,
-            idx,
-            &job_env,
-            job_dir.path(),
-            runtime,
-            workflow,
-            &job.runs_on,
-            verbose,
-            &None,
-        )
+            step_idx: idx,
+            job_env: &job_env,
+            working_dir: job_dir.path(),
+            runtime: ctx.runtime,
+            workflow: ctx.workflow,
+            job_runs_on: &job.runs_on,
+            verbose: ctx.verbose,
+            matrix_combination: &None,
+        })
         .await;
 
         match step_result {
@@ -773,7 +606,7 @@ async fn execute_job(
         let docker = match docker_client.as_ref() {
             Some(client) => client,
             None => {
-                return Err(ExecutionError::RuntimeError(
+                return Err(ExecutionError::Runtime(
                     "Docker client is required but not available".to_string(),
                 ));
             }
@@ -796,7 +629,7 @@ async fn execute_job(
             let docker = match docker_client.as_ref() {
                 Some(client) => client,
                 None => {
-                    return Err(ExecutionError::RuntimeError(
+                    return Err(ExecutionError::Runtime(
                         "Docker client is required but not available".to_string(),
                     ));
                 }
@@ -813,7 +646,7 @@ async fn execute_job(
     }
 
     Ok(JobResult {
-        name: job_name.to_string(),
+        name: ctx.job_name.to_string(),
         status: if job_success {
             JobStatus::Success
         } else {
@@ -824,53 +657,243 @@ async fn execute_job(
     })
 }
 
-async fn execute_step(
-    step: &crate::parser::workflow::Step,
-    step_idx: usize,
-    job_env: &HashMap<String, String>,
-    working_dir: &Path,
-    runtime: &Box<dyn ContainerRuntime>,
-    workflow: &WorkflowDefinition,
-    job_runs_on: &str,
+// Before the execute_matrix_combinations function, add this struct
+struct MatrixExecutionContext<'a> {
+    job_name: &'a str,
+    job_template: &'a Job,
+    combinations: &'a [MatrixCombination],
+    max_parallel: usize,
+    fail_fast: bool,
+    workflow: &'a WorkflowDefinition,
+    runtime: &'a dyn ContainerRuntime,
+    env_context: &'a HashMap<String, String>,
     verbose: bool,
-    matrix_combination: &Option<HashMap<String, Value>>,
-) -> Result<StepResult, ExecutionError> {
-    let step_name = step
+}
+
+/// Execute a set of matrix combinations
+async fn execute_matrix_combinations(
+    ctx: MatrixExecutionContext<'_>,
+) -> Result<Vec<JobResult>, ExecutionError> {
+    let mut results = Vec::new();
+    let mut any_failed = false;
+
+    // Process combinations in chunks limited by max_parallel
+    for chunk in ctx.combinations.chunks(ctx.max_parallel) {
+        // Skip processing if fail-fast is enabled and a previous job failed
+        if ctx.fail_fast && any_failed {
+            // Add skipped results for remaining combinations
+            for combination in chunk {
+                let combination_name = matrix::format_combination_name(ctx.job_name, combination);
+                results.push(JobResult {
+                    name: combination_name,
+                    status: JobStatus::Skipped,
+                    steps: Vec::new(),
+                    logs: "Job skipped due to previous matrix job failure".to_string(),
+                });
+            }
+            continue;
+        }
+
+        // Process this chunk of combinations in parallel
+        let chunk_futures = chunk.iter().map(|combination| {
+            execute_matrix_job(
+                ctx.job_name,
+                ctx.job_template,
+                combination,
+                ctx.workflow,
+                ctx.runtime,
+                ctx.env_context,
+                ctx.verbose,
+            )
+        });
+
+        let chunk_results = future::join_all(chunk_futures).await;
+
+        // Process results from this chunk
+        for result in chunk_results {
+            match result {
+                Ok(job_result) => {
+                    if job_result.status == JobStatus::Failure {
+                        any_failed = true;
+                    }
+                    results.push(job_result);
+                }
+                Err(e) => {
+                    // On error, mark as failed and continue if not fail-fast
+                    any_failed = true;
+                    logging::error(&format!("Matrix job failed: {}", e));
+
+                    if ctx.fail_fast {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(results)
+}
+
+/// Execute a single matrix job combination
+async fn execute_matrix_job(
+    job_name: &str,
+    job_template: &Job,
+    combination: &MatrixCombination,
+    workflow: &WorkflowDefinition,
+    runtime: &dyn ContainerRuntime,
+    base_env_context: &HashMap<String, String>,
+    verbose: bool,
+) -> Result<JobResult, ExecutionError> {
+    // Create the matrix-specific job name
+    let matrix_job_name = matrix::format_combination_name(job_name, combination);
+
+    logging::info(&format!("Executing matrix job: {}", matrix_job_name));
+
+    // Clone the environment and add matrix-specific values
+    let mut job_env = base_env_context.clone();
+    environment::add_matrix_context(&mut job_env, combination);
+
+    // Add job-level environment variables
+    for (key, value) in &job_template.env {
+        // TODO: Substitute matrix variable references in env values
+        job_env.insert(key.clone(), value.clone());
+    }
+
+    // Execute the job steps
+    let mut step_results = Vec::new();
+    let mut job_logs = String::new();
+
+    // Create a temporary directory for this job execution
+    let job_dir = tempfile::tempdir()
+        .map_err(|e| ExecutionError::Execution(format!("Failed to create job directory: {}", e)))?;
+
+    // Prepare the runner
+    let runner_image = get_runner_image(&job_template.runs_on);
+    prepare_runner_image(&runner_image, runtime, verbose).await?;
+
+    // Copy project files to workspace
+    let current_dir = std::env::current_dir().map_err(|e| {
+        ExecutionError::Execution(format!("Failed to get current directory: {}", e))
+    })?;
+    copy_directory_contents(&current_dir, job_dir.path())?;
+
+    let job_success = if job_template.steps.is_empty() {
+        logging::warning(&format!("Job '{}' has no steps", matrix_job_name));
+        true
+    } else {
+        // Execute each step
+        for (idx, step) in job_template.steps.iter().enumerate() {
+            match execute_step(StepExecutionContext {
+                step,
+                step_idx: idx,
+                job_env: &job_env,
+                working_dir: job_dir.path(),
+                runtime,
+                workflow,
+                job_runs_on: &job_template.runs_on,
+                verbose,
+                matrix_combination: &Some(combination.values.clone()),
+            })
+            .await
+            {
+                Ok(result) => {
+                    job_logs.push_str(&format!("Step: {}\n", result.name));
+                    job_logs.push_str(&format!("Status: {:?}\n", result.status));
+                    job_logs.push_str(&result.output);
+                    job_logs.push_str("\n\n");
+
+                    step_results.push(result.clone());
+
+                    if result.status != StepStatus::Success {
+                        // Step failed, abort job
+                        return Ok(JobResult {
+                            name: matrix_job_name,
+                            status: JobStatus::Failure,
+                            steps: step_results,
+                            logs: job_logs,
+                        });
+                    }
+                }
+                Err(e) => {
+                    // Log the error and abort the job
+                    job_logs.push_str(&format!("Step execution error: {}\n\n", e));
+                    return Ok(JobResult {
+                        name: matrix_job_name,
+                        status: JobStatus::Failure,
+                        steps: step_results,
+                        logs: job_logs,
+                    });
+                }
+            }
+        }
+
+        true
+    };
+
+    // Return job result
+    Ok(JobResult {
+        name: matrix_job_name,
+        status: if job_success {
+            JobStatus::Success
+        } else {
+            JobStatus::Failure
+        },
+        steps: step_results,
+        logs: job_logs,
+    })
+}
+
+// Before the execute_step function, add this struct
+struct StepExecutionContext<'a> {
+    step: &'a crate::parser::workflow::Step,
+    step_idx: usize,
+    job_env: &'a HashMap<String, String>,
+    working_dir: &'a Path,
+    runtime: &'a dyn ContainerRuntime,
+    workflow: &'a WorkflowDefinition,
+    job_runs_on: &'a str,
+    verbose: bool,
+    matrix_combination: &'a Option<HashMap<String, Value>>,
+}
+
+async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, ExecutionError> {
+    let step_name = ctx
+        .step
         .name
         .clone()
-        .unwrap_or_else(|| format!("Step {}", step_idx + 1));
+        .unwrap_or_else(|| format!("Step {}", ctx.step_idx + 1));
 
-    if verbose {
+    if ctx.verbose {
         logging::info(&format!("  Executing step: {}", step_name));
     }
 
     // Prepare step environment
-    let mut step_env = job_env.clone();
+    let mut step_env = ctx.job_env.clone();
 
     // Add step-level environment variables
-    for (key, value) in &step.env {
+    for (key, value) in &ctx.step.env {
         step_env.insert(key.clone(), value.clone());
     }
 
     // Execute the step based on its type
-    if let Some(uses) = &step.uses {
+    if let Some(uses) = &ctx.step.uses {
         // Action step
-        let action_info = workflow.resolve_action(uses);
+        let action_info = ctx.workflow.resolve_action(uses);
 
         // Check if this is the checkout action
         if uses.starts_with("actions/checkout") {
             // Get the current directory (assumes this is where your project is)
             let current_dir = std::env::current_dir().map_err(|e| {
-                ExecutionError::ExecutionError(format!("Failed to get current dir: {}", e))
+                ExecutionError::Execution(format!("Failed to get current dir: {}", e))
             })?;
 
             // Copy the project files to the workspace
-            copy_directory_contents(&current_dir, working_dir)?;
+            copy_directory_contents(&current_dir, ctx.working_dir)?;
 
             // Add info for logs
-            let output = format!("Emulated checkout: Copied current directory to workspace");
+            let output = "Emulated checkout: Copied current directory to workspace".to_string();
 
-            if verbose {
+            if ctx.verbose {
                 println!("  Emulated actions/checkout: copied project files to workspace");
             }
 
@@ -881,20 +904,20 @@ async fn execute_step(
             })
         } else {
             // Get action info
-            let image = prepare_action(&action_info, runtime).await?;
+            let image = prepare_action(&action_info, ctx.runtime).await?;
 
             // Special handling for composite actions
             if image == "composite" && action_info.is_local {
                 // Handle composite action
                 let action_path = Path::new(&action_info.repository);
                 return execute_composite_action(
-                    step,
+                    ctx.step,
                     action_path,
                     &step_env,
-                    working_dir,
-                    runtime,
-                    job_runs_on,
-                    verbose,
+                    ctx.working_dir,
+                    ctx.runtime,
+                    ctx.job_runs_on,
+                    ctx.verbose,
                 )
                 .await;
             }
@@ -942,7 +965,7 @@ async fn execute_step(
                 cmd.push(match owned_strings.last() {
                     Some(s) => s,
                     None => {
-                        return Err(ExecutionError::ExecutionError(
+                        return Err(ExecutionError::Execution(
                             "Expected at least one string in action arguments".to_string(),
                         ));
                     }
@@ -950,7 +973,7 @@ async fn execute_step(
             }
 
             // Convert 'with' parameters to environment variables
-            if let Some(with_params) = &step.with {
+            if let Some(with_params) = &ctx.step.with {
                 for (key, value) in with_params {
                     step_env.insert(format!("INPUT_{}", key.to_uppercase()), value.clone());
                 }
@@ -963,18 +986,20 @@ async fn execute_step(
                 .collect();
 
             // Map volumes
-            let volumes: Vec<(&Path, &Path)> = vec![(working_dir, Path::new("/github/workspace"))];
+            let volumes: Vec<(&Path, &Path)> =
+                vec![(ctx.working_dir, Path::new("/github/workspace"))];
 
-            let output = runtime
+            let output = ctx
+                .runtime
                 .run_container(
                     &image,
-                    &cmd.iter().map(|s| *s).collect::<Vec<&str>>(),
+                    &cmd.to_vec(),
                     &env_vars,
                     Path::new("/github/workspace"),
                     &volumes,
                 )
                 .await
-                .map_err(|e| ExecutionError::RuntimeError(format!("{}", e)))?;
+                .map_err(|e| ExecutionError::Runtime(format!("{}", e)))?;
 
             if output.exit_code == 0 {
                 Ok(StepResult {
@@ -993,9 +1018,9 @@ async fn execute_step(
                 })
             }
         }
-    } else if let Some(run) = &step.run {
+    } else if let Some(run) = &ctx.step.run {
         // Apply GitHub-style matrix variable substitution to the command
-        let processed_run = substitution::process_step_run(run, matrix_combination);
+        let processed_run = substitution::process_step_run(run, ctx.matrix_combination);
 
         // Print the command we're trying to run
         let shell_default = "bash".to_string();
@@ -1035,22 +1060,23 @@ async fn execute_step(
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
 
-        let image = if job_runs_on.contains("ubuntu") {
+        let image = if ctx.job_runs_on.contains("ubuntu") {
             // Try with a simple Ubuntu image
             "ubuntu:latest".to_string()
         } else {
-            get_runner_image(job_runs_on)
+            get_runner_image(ctx.job_runs_on)
         };
 
-        runtime
+        ctx.runtime
             .pull_image(&image)
             .await
-            .map_err(|e| ExecutionError::RuntimeError(format!("Failed to pull image: {}", e)))?;
+            .map_err(|e| ExecutionError::Runtime(format!("Failed to pull image: {}", e)))?;
 
         // Map volumes
-        let volumes: Vec<(&Path, &Path)> = vec![(working_dir, Path::new("/github/workspace"))];
+        let volumes: Vec<(&Path, &Path)> = vec![(ctx.working_dir, Path::new("/github/workspace"))];
 
-        let output = runtime
+        let output = ctx
+            .runtime
             .run_container(
                 &image,
                 &cmd,
@@ -1059,7 +1085,7 @@ async fn execute_step(
                 &volumes,
             )
             .await
-            .map_err(|e| ExecutionError::RuntimeError(format!("{}", e)))?;
+            .map_err(|e| ExecutionError::Runtime(format!("{}", e)))?;
 
         if output.exit_code == 0 {
             Ok(StepResult {
@@ -1079,7 +1105,7 @@ async fn execute_step(
         }
     } else {
         // Neither 'uses' nor 'run' - this is an error
-        Err(ExecutionError::ExecutionError(format!(
+        Err(ExecutionError::Execution(format!(
             "Step '{}' has neither 'uses' nor 'run' directive",
             step_name
         )))
@@ -1088,17 +1114,17 @@ async fn execute_step(
 
 fn copy_directory_contents(from: &Path, to: &Path) -> Result<(), ExecutionError> {
     for entry in std::fs::read_dir(from)
-        .map_err(|e| ExecutionError::ExecutionError(format!("Failed to read directory: {}", e)))?
+        .map_err(|e| ExecutionError::Execution(format!("Failed to read directory: {}", e)))?
     {
-        let entry = entry
-            .map_err(|e| ExecutionError::ExecutionError(format!("Failed to read entry: {}", e)))?;
+        let entry =
+            entry.map_err(|e| ExecutionError::Execution(format!("Failed to read entry: {}", e)))?;
         let path = entry.path();
 
         // Skip hidden files/dirs and target directory for efficiency
         let file_name = match path.file_name() {
             Some(name) => name.to_string_lossy(),
             None => {
-                return Err(ExecutionError::ExecutionError(format!(
+                return Err(ExecutionError::Execution(format!(
                     "Failed to get file name from path: {:?}",
                     path
                 )));
@@ -1111,7 +1137,7 @@ fn copy_directory_contents(from: &Path, to: &Path) -> Result<(), ExecutionError>
         let dest_path = match path.file_name() {
             Some(name) => to.join(name),
             None => {
-                return Err(ExecutionError::ExecutionError(format!(
+                return Err(ExecutionError::Execution(format!(
                     "Failed to get file name from path: {:?}",
                     path
                 )));
@@ -1119,16 +1145,14 @@ fn copy_directory_contents(from: &Path, to: &Path) -> Result<(), ExecutionError>
         };
 
         if path.is_dir() {
-            std::fs::create_dir_all(&dest_path).map_err(|e| {
-                ExecutionError::ExecutionError(format!("Failed to create dir: {}", e))
-            })?;
+            std::fs::create_dir_all(&dest_path)
+                .map_err(|e| ExecutionError::Execution(format!("Failed to create dir: {}", e)))?;
 
             // Recursively copy subdirectories
             copy_directory_contents(&path, &dest_path)?;
         } else {
-            std::fs::copy(&path, &dest_path).map_err(|e| {
-                ExecutionError::ExecutionError(format!("Failed to copy file: {}", e))
-            })?;
+            std::fs::copy(&path, &dest_path)
+                .map_err(|e| ExecutionError::Execution(format!("Failed to copy file: {}", e)))?;
         }
     }
 
@@ -1164,7 +1188,7 @@ fn get_runner_image(runs_on: &str) -> String {
 
 async fn prepare_runner_image(
     image: &str,
-    runtime: &Box<dyn ContainerRuntime>,
+    runtime: &dyn ContainerRuntime,
     verbose: bool,
 ) -> Result<(), ExecutionError> {
     if verbose {
@@ -1175,7 +1199,7 @@ async fn prepare_runner_image(
     runtime
         .pull_image(image)
         .await
-        .map_err(|e| ExecutionError::RuntimeError(format!("Failed to pull runner image: {}", e)))?;
+        .map_err(|e| ExecutionError::Runtime(format!("Failed to pull runner image: {}", e)))?;
 
     if verbose {
         println!("  Image {} ready", image);
@@ -1189,7 +1213,7 @@ async fn execute_composite_action(
     action_path: &Path,
     job_env: &HashMap<String, String>,
     working_dir: &Path,
-    runtime: &Box<dyn ContainerRuntime>,
+    runtime: &dyn ContainerRuntime,
     job_runs_on: &str,
     verbose: bool,
 ) -> Result<StepResult, ExecutionError> {
@@ -1202,19 +1226,18 @@ async fn execute_composite_action(
     } else if action_yaml_alt.exists() {
         action_yaml_alt
     } else {
-        return Err(ExecutionError::ExecutionError(format!(
+        return Err(ExecutionError::Execution(format!(
             "No action.yml or action.yaml found in {}",
             action_path.display()
         )));
     };
 
     // Parse the composite action definition
-    let action_content = fs::read_to_string(&action_file).map_err(|e| {
-        ExecutionError::ExecutionError(format!("Failed to read action file: {}", e))
-    })?;
+    let action_content = fs::read_to_string(&action_file)
+        .map_err(|e| ExecutionError::Execution(format!("Failed to read action file: {}", e)))?;
 
     let action_def: serde_yaml::Value = serde_yaml::from_str(&action_content)
-        .map_err(|e| ExecutionError::ExecutionError(format!("Invalid action YAML: {}", e)))?;
+        .map_err(|e| ExecutionError::Execution(format!("Invalid action YAML: {}", e)))?;
 
     // Check if it's a composite action
     match action_def.get("runs").and_then(|v| v.get("using")) {
@@ -1223,7 +1246,7 @@ async fn execute_composite_action(
             let steps = match action_def.get("runs").and_then(|v| v.get("steps")) {
                 Some(serde_yaml::Value::Sequence(steps)) => steps,
                 _ => {
-                    return Err(ExecutionError::ExecutionError(
+                    return Err(ExecutionError::Execution(
                         "Composite action is missing steps".to_string(),
                     ))
                 }
@@ -1266,7 +1289,7 @@ async fn execute_composite_action(
                 let composite_step = match convert_yaml_to_step(step_def) {
                     Ok(step) => step,
                     Err(e) => {
-                        return Err(ExecutionError::ExecutionError(format!(
+                        return Err(ExecutionError::Execution(format!(
                             "Failed to process composite action step {}: {}",
                             idx + 1,
                             e
@@ -1275,13 +1298,13 @@ async fn execute_composite_action(
                 };
 
                 // Execute the step - using Box::pin to handle async recursion
-                let step_result = Box::pin(execute_step(
-                    &composite_step,
-                    idx,
-                    &action_env,
+                let step_result = Box::pin(execute_step(StepExecutionContext {
+                    step: &composite_step,
+                    step_idx: idx,
+                    job_env: &action_env,
                     working_dir,
                     runtime,
-                    &crate::parser::workflow::WorkflowDefinition {
+                    workflow: &crate::parser::workflow::WorkflowDefinition {
                         name: "Composite Action".to_string(),
                         on: vec![],
                         on_raw: serde_yaml::Value::Null,
@@ -1289,8 +1312,8 @@ async fn execute_composite_action(
                     },
                     job_runs_on,
                     verbose,
-                    &None,
-                ))
+                    matrix_combination: &None,
+                }))
                 .await?;
 
                 // Add output to results
@@ -1319,7 +1342,7 @@ async fn execute_composite_action(
                 output: format!("Composite action completed:\n{}", step_outputs.join("\n")),
             })
         }
-        _ => Err(ExecutionError::ExecutionError(
+        _ => Err(ExecutionError::Execution(
             "Action is not a composite action or has invalid format".to_string(),
         )),
     }
@@ -1375,17 +1398,13 @@ fn convert_yaml_to_step(
         .unwrap_or_default();
 
     // For composite steps with shell, construct a run step
-    let final_run = if shell.is_some() && run.is_some() {
-        run
-    } else {
-        run
-    };
+    let final_run = run;
 
     Ok(crate::parser::workflow::Step {
         name,
         uses,
         run: final_run,
-        with: with,
+        with,
         env,
     })
 }

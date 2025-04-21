@@ -113,7 +113,7 @@ fn value_to_string(value: &Value) -> String {
         Value::Sequence(seq) => {
             let items = seq
                 .iter()
-                .map(|v| value_to_string(v))
+                .map(value_to_string)
                 .collect::<Vec<_>>()
                 .join(",");
             items
@@ -134,7 +134,7 @@ fn value_to_string(value: &Value) -> String {
 fn get_repo_name() -> String {
     // Try to detect from git if available
     if let Ok(output) = std::process::Command::new("git")
-        .args(&["remote", "get-url", "origin"])
+        .args(["remote", "get-url", "origin"])
         .output()
     {
         if output.status.success() {
@@ -200,7 +200,7 @@ fn get_workspace_path() -> String {
 
 fn get_current_sha() -> String {
     if let Ok(output) = std::process::Command::new("git")
-        .args(&["rev-parse", "HEAD"])
+        .args(["rev-parse", "HEAD"])
         .output()
     {
         if output.status.success() {
@@ -213,7 +213,7 @@ fn get_current_sha() -> String {
 
 fn get_current_ref() -> String {
     if let Ok(output) = std::process::Command::new("git")
-        .args(&["symbolic-ref", "--short", "HEAD"])
+        .args(["symbolic-ref", "--short", "HEAD"])
         .output()
     {
         if output.status.success() {

@@ -75,32 +75,33 @@ impl EmulationRuntime {
                     fs::create_dir_all(&target_path).expect("Failed to create target directory");
 
                     // Copy files in this directory (not recursive for simplicity)
-                    for entry in fs::read_dir(host_path).expect("Failed to read source directory") {
-                        if let Ok(entry) = entry {
-                            let source = entry.path();
-                            let file_name = match source.file_name() {
-                                Some(name) => name,
-                                None => {
-                                    eprintln!(
-                                        "Warning: Could not get file name from path: {:?}",
-                                        source
-                                    );
-                                    continue; // Skip this file
-                                }
-                            };
-                            let dest = target_path.join(file_name);
-
-                            if source.is_file() {
-                                if let Err(e) = fs::copy(&source, &dest) {
-                                    eprintln!(
-                                        "Warning: Failed to copy file from {:?} to {:?}: {}",
-                                        &source, &dest, e
-                                    );
-                                }
-                            } else {
-                                // We could make this recursive if needed
-                                fs::create_dir_all(&dest).expect("Failed to create subdirectory");
+                    for entry in fs::read_dir(host_path)
+                        .expect("Failed to read source directory")
+                        .flatten()
+                    {
+                        let source = entry.path();
+                        let file_name = match source.file_name() {
+                            Some(name) => name,
+                            None => {
+                                eprintln!(
+                                    "Warning: Could not get file name from path: {:?}",
+                                    source
+                                );
+                                continue; // Skip this file
                             }
+                        };
+                        let dest = target_path.join(file_name);
+
+                        if source.is_file() {
+                            if let Err(e) = fs::copy(&source, &dest) {
+                                eprintln!(
+                                    "Warning: Failed to copy file from {:?} to {:?}: {}",
+                                    &source, &dest, e
+                                );
+                            }
+                        } else {
+                            // We could make this recursive if needed
+                            fs::create_dir_all(&dest).expect("Failed to create subdirectory");
                         }
                     }
                 }
@@ -157,7 +158,7 @@ impl ContainerRuntime for EmulationRuntime {
         });
 
         if is_long_running {
-            logging::info(&format!("Detected long-running command, will run detached"));
+            logging::info("Detected long-running command, will run detached");
 
             let mut command = Command::new(cmd[0]);
             command.current_dir(&container_working_dir);
@@ -186,7 +187,7 @@ impl ContainerRuntime for EmulationRuntime {
                     });
                 }
                 Err(e) => {
-                    return Err(ContainerError::ContainerExecutionFailed(format!(
+                    return Err(ContainerError::ContainerExecution(format!(
                         "Failed to start detached process: {}",
                         e
                     )));
@@ -205,12 +206,10 @@ impl ContainerRuntime for EmulationRuntime {
                 .unwrap_or(false);
 
             if !nix_installed {
-                logging::info(&format!(
-                    "⚠️ Nix commands detected but Nix is not installed!"
-                ));
-                logging::info(&format!(
-                    "🔄 To use this workflow, please install Nix: https://nixos.org/download.html"
-                ));
+                logging::info("⚠️ Nix commands detected but Nix is not installed!");
+                logging::info(
+                    "🔄 To use this workflow, please install Nix: https://nixos.org/download.html",
+                );
 
                 return Ok(ContainerOutput {
                         stdout: String::new(),
@@ -218,13 +217,13 @@ impl ContainerRuntime for EmulationRuntime {
                         exit_code: 1,
                     });
             } else {
-                logging::info(&format!("✅ Nix is installed, proceeding with command"));
+                logging::info("✅ Nix is installed, proceeding with command");
             }
         }
 
         // Ensure we have a command
         if cmd.is_empty() {
-            return Err(ContainerError::ContainerExecutionFailed(
+            return Err(ContainerError::ContainerExecution(
                 "No command specified".to_string(),
             ));
         }
@@ -266,8 +265,8 @@ impl ContainerRuntime for EmulationRuntime {
                     command.current_dir(&container_working_dir);
 
                     // Add flags
-                    for i in 1..idx + 1 {
-                        command.arg(cmd[i]);
+                    for arg in cmd.iter().skip(1).take(idx) {
+                        command.arg(arg);
                     }
 
                     // Add the command
@@ -281,7 +280,7 @@ impl ContainerRuntime for EmulationRuntime {
                     // Execute
                     let output = command
                         .output()
-                        .map_err(|e| ContainerError::ContainerExecutionFailed(e.to_string()))?;
+                        .map_err(|e| ContainerError::ContainerExecution(e.to_string()))?;
 
                     return Ok(ContainerOutput {
                         stdout: String::from_utf8_lossy(&output.stdout).to_string(),
@@ -308,16 +307,14 @@ impl ContainerRuntime for EmulationRuntime {
             }
 
             // Log that we're running a background process
-            logging::info(&format!(
-                "Emulation: Running command with background processes"
-            ));
+            logging::info("Emulation: Running command with background processes");
 
             // For commands with background processes, we could potentially track PIDs
             // However, since they're in a shell wrapper, we'd need to parse them from output
 
             let output = shell_command
                 .output()
-                .map_err(|e| ContainerError::ContainerExecutionFailed(e.to_string()))?;
+                .map_err(|e| ContainerError::ContainerExecution(e.to_string()))?;
 
             return Ok(ContainerOutput {
                 stdout: String::from_utf8_lossy(&output.stdout).to_string(),
@@ -343,7 +340,7 @@ impl ContainerRuntime for EmulationRuntime {
         // Execute
         let output = command
             .output()
-            .map_err(|e| ContainerError::ContainerExecutionFailed(e.to_string()))?;
+            .map_err(|e| ContainerError::ContainerExecution(e.to_string()))?;
 
         Ok(ContainerOutput {
             stdout: String::from_utf8_lossy(&output.stdout).to_string(),
@@ -413,7 +410,7 @@ fn copy_directory_contents(source: &Path, dest: &Path) -> std::io::Result<()> {
 
 pub async fn handle_special_action(action: &str) -> Result<(), ContainerError> {
     if action.starts_with("cachix/install-nix-action") {
-        logging::info(&format!("🔄 Emulating cachix/install-nix-action"));
+        logging::info("🔄 Emulating cachix/install-nix-action");
 
         // In emulation mode, check if nix is installed
         let nix_installed = Command::new("which")
@@ -423,15 +420,13 @@ pub async fn handle_special_action(action: &str) -> Result<(), ContainerError> {
             .unwrap_or(false);
 
         if !nix_installed {
-            logging::info(&format!("🔄 Emulation: Nix is required but not installed."));
-            logging::info(&format!(
-                "🔄 To use this workflow, please install Nix: https://nixos.org/download.html"
-            ));
-            logging::info(&format!(
-                "🔄 Continuing emulation, but nix commands will fail."
-            ));
+            logging::info("🔄 Emulation: Nix is required but not installed.");
+            logging::info(
+                "🔄 To use this workflow, please install Nix: https://nixos.org/download.html",
+            );
+            logging::info("🔄 Continuing emulation, but nix commands will fail.");
         } else {
-            logging::info(&format!("🔄 Emulation: Using system-installed Nix"));
+            logging::info("🔄 Emulation: Using system-installed Nix");
         }
         Ok(())
     } else {
@@ -464,7 +459,7 @@ async fn cleanup_processes() {
             // On Unix-like systems, use kill command
             let _ = Command::new("kill")
                 .arg("-TERM")
-                .arg(&pid.to_string())
+                .arg(pid.to_string())
                 .output();
         }
 
@@ -504,7 +499,7 @@ async fn cleanup_workspaces() {
         // Only attempt to remove if it exists
         if workspace_path.exists() {
             match fs::remove_dir_all(&workspace_path) {
-                Ok(_) => logging::info(&format!("Successfully removed workspace directory")),
+                Ok(_) => logging::info("Successfully removed workspace directory"),
                 Err(e) => logging::error(&format!("Error removing workspace: {}", e)),
             }
         }

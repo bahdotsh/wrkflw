@@ -1,8 +1,6 @@
 use lazy_static::lazy_static;
 use regex::Regex;
-use reqwest;
 use reqwest::header;
-use serde_json;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
@@ -126,7 +124,7 @@ pub async fn list_workflows(_repo_info: &RepoInfo) -> Result<Vec<String>, Github
         if path.is_file()
             && path
                 .extension()
-                .map_or(false, |ext| ext == "yml" || ext == "yaml")
+                .is_some_and(|ext| ext == "yml" || ext == "yaml")
         {
             if let Some(file_name) = path.file_stem() {
                 if let Some(name) = file_name.to_str() {
@@ -195,7 +193,7 @@ pub async fn trigger_workflow(
         .json(&payload)
         .send()
         .await
-        .map_err(|e| GithubError::RequestError(e))?;
+        .map_err(GithubError::RequestError)?;
 
     if !response.status().is_success() {
         let status = response.status().as_u16();

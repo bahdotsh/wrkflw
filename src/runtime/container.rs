@@ -27,29 +27,29 @@ use std::fmt;
 
 #[derive(Debug)]
 pub enum ContainerError {
-    ImagePullFailed(String),
-    ImageBuildFailed(String),
-    ContainerStartFailed(String),
-    ContainerExecutionFailed(String),
-    NetworkCreationFailed(String),
-    NetworkOperationFailed(String),
+    ImagePull(String),
+    ImageBuild(String),
+    ContainerStart(String),
+    ContainerExecution(String),
+    NetworkCreation(String),
+    NetworkOperation(String),
 }
 
 impl fmt::Display for ContainerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ContainerError::ImagePullFailed(msg) => write!(f, "Failed to pull image: {}", msg),
-            ContainerError::ImageBuildFailed(msg) => write!(f, "Failed to build image: {}", msg),
-            ContainerError::ContainerStartFailed(msg) => {
+            ContainerError::ImagePull(msg) => write!(f, "Failed to pull image: {}", msg),
+            ContainerError::ImageBuild(msg) => write!(f, "Failed to build image: {}", msg),
+            ContainerError::ContainerStart(msg) => {
                 write!(f, "Failed to start container: {}", msg)
             }
-            ContainerError::ContainerExecutionFailed(msg) => {
+            ContainerError::ContainerExecution(msg) => {
                 write!(f, "Container execution failed: {}", msg)
             }
-            ContainerError::NetworkCreationFailed(msg) => {
+            ContainerError::NetworkCreation(msg) => {
                 write!(f, "Failed to create Docker network: {}", msg)
             }
-            ContainerError::NetworkOperationFailed(msg) => {
+            ContainerError::NetworkOperation(msg) => {
                 write!(f, "Network operation failed: {}", msg)
             }
         }

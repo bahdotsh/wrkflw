@@ -22,7 +22,7 @@ pub fn evaluate_workflow_file(path: &Path, verbose: bool) -> Result<ValidationRe
     }
 
     // Check if name exists
-    if !workflow.get("name").is_some() {
+    if workflow.get("name").is_none() {
         result.add_issue("Workflow is missing a name".to_string());
     }
 

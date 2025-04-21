@@ -20,7 +20,6 @@ use ratatui::{
     },
     Frame, Terminal,
 };
-use regex;
 use std::io::{self, stdout};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -72,6 +71,9 @@ struct StepExecution {
     output: String,
 }
 
+// Type alias for the complex execution result type
+type ExecutionResultMsg = (usize, Result<(Vec<executor::JobResult>, ()), String>);
+
 // Application state
 struct App {
     workflows: Vec<Workflow>,
@@ -83,16 +85,16 @@ struct App {
     validation_mode: bool,
     execution_queue: Vec<usize>, // Indices of workflows to execute
     current_execution: Option<usize>,
-    logs: Vec<String>,            // Overall execution logs
-    log_scroll: usize,            // Scrolling position for logs
-    job_list_state: ListState,    // For viewing job details
-    detailed_view: bool,          // Whether we're in detailed view mode
-    step_list_state: ListState,   // For selecting steps in detailed view
-    step_table_state: TableState, // For the steps table in detailed view
-    last_tick: Instant,           // For UI animations and updates
-    tick_rate: Duration,          // How often to update the UI
-    tx: mpsc::Sender<(usize, Result<(Vec<executor::JobResult>, ()), String>)>, // Channel for async communication
-    status_message: Option<String>, // Temporary status message to display
+    logs: Vec<String>,                    // Overall execution logs
+    log_scroll: usize,                    // Scrolling position for logs
+    job_list_state: ListState,            // For viewing job details
+    detailed_view: bool,                  // Whether we're in detailed view mode
+    step_list_state: ListState,           // For selecting steps in detailed view
+    step_table_state: TableState,         // For the steps table in detailed view
+    last_tick: Instant,                   // For UI animations and updates
+    tick_rate: Duration,                  // How often to update the UI
+    tx: mpsc::Sender<ExecutionResultMsg>, // Channel for async communication
+    status_message: Option<String>,       // Temporary status message to display
     status_message_time: Option<Instant>, // When the message was set
 
     // Search and filter functionality
@@ -153,10 +155,7 @@ impl LogFilterLevel {
 }
 
 impl App {
-    fn new(
-        runtime_type: RuntimeType,
-        tx: mpsc::Sender<(usize, Result<(Vec<executor::JobResult>, ()), String>)>,
-    ) -> App {
+    fn new(runtime_type: RuntimeType, tx: mpsc::Sender<ExecutionResultMsg>) -> App {
         let mut workflow_list_state = ListState::default();
         workflow_list_state.select(Some(0));
 
@@ -175,7 +174,7 @@ impl App {
             RuntimeType::Docker => {
                 // Use the safe FD redirection utility from utils
                 let is_docker_available =
-                    match utils::fd::with_stderr_to_null(|| executor::docker::is_available()) {
+                    match utils::fd::with_stderr_to_null(executor::docker::is_available) {
                         Ok(result) => result,
                         Err(_) => {
                             logging::debug(
@@ -451,15 +450,13 @@ impl App {
     // Queue selected workflows for execution
     fn queue_selected_for_execution(&mut self) {
         if let Some(idx) = self.workflow_list_state.selected() {
-            if idx < self.workflows.len() {
-                if !self.execution_queue.contains(&idx) {
-                    self.execution_queue.push(idx);
-                    let timestamp = Local::now().format("%H:%M:%S").to_string();
-                    self.logs.push(format!(
-                        "[{}] Added '{}' to execution queue. Press 'Enter' to start.",
-                        timestamp, self.workflows[idx].name
-                    ));
-                }
+            if idx < self.workflows.len() && !self.execution_queue.contains(&idx) {
+                self.execution_queue.push(idx);
+                let timestamp = Local::now().format("%H:%M:%S").to_string();
+                self.logs.push(format!(
+                    "[{}] Added '{}' to execution queue. Press 'Enter' to start.",
+                    timestamp, self.workflows[idx].name
+                ));
             }
         }
     }
@@ -1001,26 +998,24 @@ fn load_workflows(dir_path: &Path) -> Vec<Workflow> {
 
     // Default path is .github/workflows
     let default_workflows_dir = Path::new(".github").join("workflows");
-    let is_default_dir = dir_path == &default_workflows_dir || dir_path.ends_with("workflows");
+    let is_default_dir = dir_path == default_workflows_dir || dir_path.ends_with("workflows");
 
     if let Ok(entries) = std::fs::read_dir(dir_path) {
-        for entry in entries {
-            if let Ok(entry) = entry {
-                let path = entry.path();
-                if path.is_file() && (is_workflow_file(&path) || !is_default_dir) {
-                    let name = path.file_name().map_or_else(
-                        || "[unknown]".to_string(),
-                        |fname| fname.to_string_lossy().into_owned(),
-                    );
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() && (is_workflow_file(&path) || !is_default_dir) {
+                let name = path.file_name().map_or_else(
+                    || "[unknown]".to_string(),
+                    |fname| fname.to_string_lossy().into_owned(),
+                );
 
-                    workflows.push(Workflow {
-                        name,
-                        path,
-                        selected: false,
-                        status: WorkflowStatus::NotStarted,
-                        execution_details: None,
-                    });
-                }
+                workflows.push(Workflow {
+                    name,
+                    path,
+                    selected: false,
+                    status: WorkflowStatus::NotStarted,
+                    execution_details: None,
+                });
             }
         }
     }
@@ -1071,8 +1066,7 @@ fn render_ui(f: &mut Frame<CrosstermBackend<io::Stdout>>, app: &mut App) {
 
 // Render the title bar with tabs
 fn render_title_bar(f: &mut Frame<CrosstermBackend<io::Stdout>>, app: &App, area: Rect) {
-    // Create tabs
-    let titles = vec!["Workflows", "Execution", "Logs", "Help"];
+    let titles = ["Workflows", "Execution", "Logs", "Help"];
     let tabs = Tabs::new(
         titles
             .iter()
@@ -1405,11 +1399,12 @@ fn render_execution_tab(f: &mut Frame<CrosstermBackend<io::Stdout>>, app: &mut A
                     let error_msg = execution
                         .logs
                         .iter()
-                        .filter(|log| log.contains("Error:") || log.contains("Failed"))
-                        .next()
-                        .map_or("Failed to trigger workflow on GitHub.", |s| s.as_str());
+                        .find(|log| log.contains("Error:") || log.contains("Failed"));
 
-                    (error_msg, None)
+                    (
+                        error_msg.map_or("Failed to trigger workflow on GitHub.", |s| s.as_str()),
+                        None,
+                    )
                 } else {
                     ("Triggering workflow on GitHub...", None)
                 };
@@ -2646,7 +2641,7 @@ fn render_status_bar(f: &mut Frame<CrosstermBackend<io::Stdout>>, app: &App, are
     if app.runtime_type == RuntimeType::Docker {
         // Check Docker silently using safe FD redirection
         let is_docker_available =
-            match utils::fd::with_stderr_to_null(|| executor::docker::is_available()) {
+            match utils::fd::with_stderr_to_null(executor::docker::is_available) {
                 Ok(result) => result,
                 Err(_) => {
                     logging::debug("Failed to redirect stderr when checking Docker availability.");
@@ -2763,6 +2758,7 @@ fn render_status_bar(f: &mut Frame<CrosstermBackend<io::Stdout>>, app: &App, are
 }
 
 // Validate a workflow or directory containing workflows
+#[allow(clippy::ptr_arg)]
 pub fn validate_workflow(path: &PathBuf, verbose: bool) -> io::Result<()> {
     let mut workflows = Vec::new();
 
@@ -2820,134 +2816,8 @@ pub fn validate_workflow(path: &PathBuf, verbose: bool) -> io::Result<()> {
     Ok(())
 }
 
-pub async fn execute_workflow_cli(
-    path: &PathBuf,
-    runtime_type: RuntimeType,
-    verbose: bool,
-) -> io::Result<()> {
-    if !path.exists() {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("Workflow file does not exist: {}", path.display()),
-        ));
-    }
-
-    println!("Validating workflow...");
-    match evaluate_workflow_file(path, false) {
-        Ok(result) => {
-            if !result.is_valid {
-                println!("❌ Cannot execute invalid workflow: {}", path.display());
-                for (i, issue) in result.issues.iter().enumerate() {
-                    println!("   {}. {}", i + 1, issue);
-                }
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "Workflow validation failed",
-                ));
-            }
-        }
-        Err(e) => {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("Error validating workflow: {}", e),
-            ));
-        }
-    }
-
-    // Check Docker availability if Docker runtime is selected
-    let runtime_type = match runtime_type {
-        RuntimeType::Docker => {
-            if !executor::docker::is_available() {
-                println!("⚠️ Docker is not available. Using emulation mode instead.");
-                logging::warning("Docker is not available. Using emulation mode instead.");
-                RuntimeType::Emulation
-            } else {
-                RuntimeType::Docker
-            }
-        }
-        RuntimeType::Emulation => RuntimeType::Emulation,
-    };
-
-    println!("Executing workflow: {}", path.display());
-    println!("Runtime mode: {:?}", runtime_type);
-
-    match executor::execute_workflow(path, runtime_type, verbose).await {
-        Ok(result) => {
-            println!("\nWorkflow execution results:");
-
-            for job in &result.jobs {
-                match job.status {
-                    JobStatus::Success => {
-                        println!("\n✅ Job succeeded: {}", job.name);
-                    }
-                    JobStatus::Failure => {
-                        println!("\n❌ Job failed: {}", job.name);
-                    }
-                    JobStatus::Skipped => {
-                        println!("\n⏭️ Job skipped: {}", job.name);
-                    }
-                }
-
-                println!("-------------------------");
-
-                for step in job.steps.iter() {
-                    match step.status {
-                        StepStatus::Success => {
-                            println!("  ✅ {}", step.name);
-
-                            if !step.output.trim().is_empty() && step.output.lines().count() <= 3 {
-                                // For short outputs, show directly
-                                println!("    {}", step.output.trim());
-                            }
-                        }
-                        StepStatus::Failure => {
-                            println!("  ❌ {}", step.name);
-
-                            // For failures, always show output (truncated)
-                            let output = if step.output.len() > 500 {
-                                format!("{}... (truncated)", &step.output[..500])
-                            } else {
-                                step.output.clone()
-                            };
-
-                            println!("    {}", output.trim().replace('\n', "\n    "));
-                        }
-                        StepStatus::Skipped => {
-                            println!("  ⏭️ {} (skipped)", step.name);
-                        }
-                    }
-                }
-            }
-
-            // Determine overall success
-            let failures = result
-                .jobs
-                .iter()
-                .filter(|job| job.status == JobStatus::Failure)
-                .count();
-
-            if failures > 0 {
-                println!("\n❌ Workflow completed with failures");
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "Workflow execution failed",
-                ));
-            } else {
-                println!("\n✅ Workflow completed successfully!");
-                Ok(())
-            }
-        }
-        Err(e) => {
-            println!("❌ Failed to execute workflow: {}", e);
-            Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("Workflow execution error: {}", e),
-            ))
-        }
-    }
-}
-
 // Main entry point for the TUI interface
+#[allow(clippy::ptr_arg)]
 pub async fn run_wrkflw_tui(
     path: Option<&PathBuf>,
     runtime_type: RuntimeType,
@@ -2964,8 +2834,8 @@ pub async fn run_wrkflw_tui(
 
         // Set up channel for async communication
         let (tx, rx): (
-            mpsc::Sender<(usize, Result<(Vec<executor::JobResult>, ()), String>)>,
-            mpsc::Receiver<(usize, Result<(Vec<executor::JobResult>, ()), String>)>,
+            mpsc::Sender<ExecutionResultMsg>,
+            mpsc::Receiver<ExecutionResultMsg>,
         ) = mpsc::channel();
 
         // Initialize app state
@@ -3058,8 +2928,8 @@ pub async fn run_wrkflw_tui(
 fn run_tui_event_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
-    tx_clone: &mpsc::Sender<(usize, Result<(Vec<executor::JobResult>, ()), String>)>,
-    rx: &mpsc::Receiver<(usize, Result<(Vec<executor::JobResult>, ()), String>)>,
+    tx_clone: &mpsc::Sender<ExecutionResultMsg>,
+    rx: &mpsc::Receiver<ExecutionResultMsg>,
     verbose: bool,
 ) -> io::Result<()> {
     loop {
@@ -3470,7 +3340,7 @@ async fn execute_curl_trigger(
 // Extract common workflow execution logic to avoid duplication
 fn start_next_workflow_execution(
     app: &mut App,
-    tx_clone: &mpsc::Sender<(usize, Result<(Vec<executor::JobResult>, ()), String>)>,
+    tx_clone: &mpsc::Sender<ExecutionResultMsg>,
     verbose: bool,
 ) {
     if let Some(next_idx) = app.get_next_workflow_to_execute() {
@@ -3483,7 +3353,7 @@ fn start_next_workflow_execution(
             RuntimeType::Docker => {
                 // Use safe FD redirection to check Docker availability
                 let is_docker_available =
-                    match utils::fd::with_stderr_to_null(|| executor::docker::is_available()) {
+                    match utils::fd::with_stderr_to_null(executor::docker::is_available) {
                         Ok(result) => result,
                         Err(_) => {
                             logging::debug(
@@ -3604,5 +3474,133 @@ fn start_next_workflow_execution(
         app.logs
             .push(format!("[{}] All workflows completed execution", timestamp));
         logging::info("All workflows completed execution");
+    }
+}
+
+#[allow(clippy::ptr_arg)]
+pub async fn execute_workflow_cli(
+    path: &PathBuf,
+    runtime_type: RuntimeType,
+    verbose: bool,
+) -> io::Result<()> {
+    if !path.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("Workflow file does not exist: {}", path.display()),
+        ));
+    }
+
+    println!("Validating workflow...");
+    match evaluate_workflow_file(path, false) {
+        Ok(result) => {
+            if !result.is_valid {
+                println!("❌ Cannot execute invalid workflow: {}", path.display());
+                for (i, issue) in result.issues.iter().enumerate() {
+                    println!("   {}. {}", i + 1, issue);
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Workflow validation failed",
+                ));
+            }
+        }
+        Err(e) => {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("Error validating workflow: {}", e),
+            ));
+        }
+    }
+
+    // Check Docker availability if Docker runtime is selected
+    let runtime_type = match runtime_type {
+        RuntimeType::Docker => {
+            if !executor::docker::is_available() {
+                println!("⚠️ Docker is not available. Using emulation mode instead.");
+                logging::warning("Docker is not available. Using emulation mode instead.");
+                RuntimeType::Emulation
+            } else {
+                RuntimeType::Docker
+            }
+        }
+        RuntimeType::Emulation => RuntimeType::Emulation,
+    };
+
+    println!("Executing workflow: {}", path.display());
+    println!("Runtime mode: {:?}", runtime_type);
+
+    match executor::execute_workflow(path, runtime_type, verbose).await {
+        Ok(result) => {
+            println!("\nWorkflow execution results:");
+
+            for job in &result.jobs {
+                match job.status {
+                    JobStatus::Success => {
+                        println!("\n✅ Job succeeded: {}", job.name);
+                    }
+                    JobStatus::Failure => {
+                        println!("\n❌ Job failed: {}", job.name);
+                    }
+                    JobStatus::Skipped => {
+                        println!("\n⏭️ Job skipped: {}", job.name);
+                    }
+                }
+
+                println!("-------------------------");
+
+                for step in job.steps.iter() {
+                    match step.status {
+                        StepStatus::Success => {
+                            println!("  ✅ {}", step.name);
+
+                            if !step.output.trim().is_empty() && step.output.lines().count() <= 3 {
+                                // For short outputs, show directly
+                                println!("    {}", step.output.trim());
+                            }
+                        }
+                        StepStatus::Failure => {
+                            println!("  ❌ {}", step.name);
+
+                            // For failures, always show output (truncated)
+                            let output = if step.output.len() > 500 {
+                                format!("{}... (truncated)", &step.output[..500])
+                            } else {
+                                step.output.clone()
+                            };
+
+                            println!("    {}", output.trim().replace('\n', "\n    "));
+                        }
+                        StepStatus::Skipped => {
+                            println!("  ⏭️ {} (skipped)", step.name);
+                        }
+                    }
+                }
+            }
+
+            // Determine overall success
+            let failures = result
+                .jobs
+                .iter()
+                .filter(|job| job.status == JobStatus::Failure)
+                .count();
+
+            if failures > 0 {
+                println!("\n❌ Workflow completed with failures");
+                Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "Workflow execution failed",
+                ))
+            } else {
+                println!("\n✅ Workflow completed successfully!");
+                Ok(())
+            }
+        }
+        Err(e) => {
+            println!("❌ Failed to execute workflow: {}", e);
+            Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("Workflow execution error: {}", e),
+            ))
+        }
     }
 }

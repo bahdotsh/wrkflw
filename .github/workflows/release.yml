@@ -1,0 +1,101 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  create-release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    outputs:
+      upload_url: ${{ steps.create_release.outputs.upload_url }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+      
+      - name: Install git-cliff
+        uses: kenji-miyake/setup-git-cliff@v1
+      
+      - name: Generate Changelog
+        run: git cliff --latest --output CHANGELOG.md
+      
+      - name: Create Release
+        id: create_release
+        uses: softprops/action-gh-release@v1
+        with:
+          name: "wrkflw ${{ github.ref_name }}"
+          body_path: CHANGELOG.md
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build-release:
+    name: Build Release
+    needs: create-release
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact_name: wrkflw
+            asset_name: wrkflw-${{ github.ref_name }}-linux-x86_64
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            artifact_name: wrkflw
+            asset_name: wrkflw-${{ github.ref_name }}-macos-x86_64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact_name: wrkflw
+            asset_name: wrkflw-${{ github.ref_name }}-macos-arm64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact_name: wrkflw.exe
+            asset_name: wrkflw-${{ github.ref_name }}-windows-x86_64
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Setup Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          target: ${{ matrix.target }}
+          override: true
+      
+      - name: Build Release Binary
+        uses: actions-rs/cargo@v1
+        with:
+          command: build
+          args: --release --target ${{ matrix.target }}
+      
+      - name: Compress Release Binary (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar czvf ${{ matrix.asset_name }}.tar.gz ${{ matrix.artifact_name }}
+          echo "ASSET=${{ matrix.asset_name }}.tar.gz" >> $GITHUB_ENV
+          echo "ASSET_PATH=target/${{ matrix.target }}/release/${{ matrix.asset_name }}.tar.gz" >> $GITHUB_ENV
+      
+      - name: Compress Release Binary (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          cd target/${{ matrix.target }}/release
+          7z a ${{ matrix.asset_name }}.zip ${{ matrix.artifact_name }}
+          echo "ASSET=${{ matrix.asset_name }}.zip" >> $env:GITHUB_ENV
+          echo "ASSET_PATH=target/${{ matrix.target }}/release/${{ matrix.asset_name }}.zip" >> $env:GITHUB_ENV
+        shell: pwsh
+      
+      - name: Upload Release Asset
+        uses: softprops/action-gh-release@v1
+        with:
+          files: ${{ env.ASSET_PATH }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} 

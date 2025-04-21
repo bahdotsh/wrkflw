@@ -540,10 +540,10 @@ impl App {
                                     },
                                     output: step_result.output.clone(),
                                 })
-                                .collect(),
+                                .collect::<Vec<StepExecution>>(),
                             logs: vec![job_result.logs.clone()],
                         })
-                        .collect();
+                        .collect::<Vec<JobExecution>>();
                 }
                 Err(e) => {
                     let timestamp = Local::now().format("%H:%M:%S").to_string();
@@ -551,6 +551,18 @@ impl App {
                         .logs
                         .push(format!("[{}] Error: {}", timestamp, e));
                     execution_details.progress = 1.0;
+                    
+                    // Create a dummy job with the error information so users can see details
+                    execution_details.jobs = vec![JobExecution {
+                        name: "Workflow Execution".to_string(),
+                        status: JobStatus::Failure,
+                        steps: vec![StepExecution {
+                            name: "Execution Error".to_string(),
+                            status: StepStatus::Failure,
+                            output: format!("Error: {}\n\nThis error prevented the workflow from executing properly.", e),
+                        }],
+                        logs: vec![format!("Workflow execution error: {}", e)],
+                    }];
                 }
             }
         }

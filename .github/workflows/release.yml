@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to use (e.g. v1.0.0)'
+        required: true
+        default: 'test-release'
 
 jobs:
   create-release:
@@ -35,10 +41,11 @@ jobs:
         id: create_release
         uses: softprops/action-gh-release@v1
         with:
-          name: "wrkflw ${{ github.ref_name }}"
+          name: "wrkflw ${{ github.event.inputs.version || github.ref_name }}"
           body_path: CHANGELOG.md
           draft: false
           prerelease: false
+          tag_name: ${{ github.event.inputs.version || github.ref_name }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -52,19 +59,19 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             artifact_name: wrkflw
-            asset_name: wrkflw-${{ github.ref_name }}-linux-x86_64
+            asset_name: wrkflw-${{ github.event.inputs.version || github.ref_name }}-linux-x86_64
           - os: macos-latest
             target: x86_64-apple-darwin
             artifact_name: wrkflw
-            asset_name: wrkflw-${{ github.ref_name }}-macos-x86_64
+            asset_name: wrkflw-${{ github.event.inputs.version || github.ref_name }}-macos-x86_64
           - os: macos-latest
             target: aarch64-apple-darwin
             artifact_name: wrkflw
-            asset_name: wrkflw-${{ github.ref_name }}-macos-arm64
+            asset_name: wrkflw-${{ github.event.inputs.version || github.ref_name }}-macos-arm64
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             artifact_name: wrkflw.exe
-            asset_name: wrkflw-${{ github.ref_name }}-windows-x86_64
+            asset_name: wrkflw-${{ github.event.inputs.version || github.ref_name }}-windows-x86_64
 
     steps:
       - name: Checkout code

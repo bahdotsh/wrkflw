@@ -3,6 +3,8 @@ name: Build & Test
 on:
   push:
     branches: [ main ]
+    paths-ignore:
+      - '.github/workflows/**'
   pull_request:
     branches: [ main ]
   workflow_dispatch:

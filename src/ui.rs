@@ -94,6 +94,58 @@ struct App {
     tx: mpsc::Sender<(usize, Result<(Vec<executor::JobResult>, ()), String>)>, // Channel for async communication
     status_message: Option<String>, // Temporary status message to display
     status_message_time: Option<Instant>, // When the message was set
+    
+    // Search and filter functionality
+    log_search_query: String,     // Current search query for logs
+    log_search_active: bool,      // Whether search input is active
+    log_filter_level: Option<LogFilterLevel>, // Current log level filter
+    log_search_matches: Vec<usize>, // Indices of logs that match the search
+    log_search_match_idx: usize,  // Current match index for navigation
+}
+
+// Log filter levels
+enum LogFilterLevel {
+    Info,
+    Warning,
+    Error,
+    Success,
+    Trigger,
+    All,
+}
+
+impl LogFilterLevel {
+    fn matches(&self, log: &str) -> bool {
+        match self {
+            LogFilterLevel::Info => log.contains("ℹ️") || (log.contains("INFO") && !log.contains("SUCCESS")),
+            LogFilterLevel::Warning => log.contains("⚠️") || log.contains("WARN"),
+            LogFilterLevel::Error => log.contains("❌") || log.contains("ERROR"),
+            LogFilterLevel::Success => log.contains("SUCCESS") || log.contains("success"),
+            LogFilterLevel::Trigger => log.contains("Triggering") || log.contains("triggered") || log.contains("TRIG"),
+            LogFilterLevel::All => true,
+        }
+    }
+    
+    fn next(&self) -> Self {
+        match self {
+            LogFilterLevel::All => LogFilterLevel::Info,
+            LogFilterLevel::Info => LogFilterLevel::Warning,
+            LogFilterLevel::Warning => LogFilterLevel::Error,
+            LogFilterLevel::Error => LogFilterLevel::Success,
+            LogFilterLevel::Success => LogFilterLevel::Trigger,
+            LogFilterLevel::Trigger => LogFilterLevel::All,
+        }
+    }
+    
+    fn to_string(&self) -> &str {
+        match self {
+            LogFilterLevel::All => "ALL",
+            LogFilterLevel::Info => "INFO",
+            LogFilterLevel::Warning => "WARNING",
+            LogFilterLevel::Error => "ERROR",
+            LogFilterLevel::Success => "SUCCESS",
+            LogFilterLevel::Trigger => "TRIGGER",
+        }
+    }
 }
 
 impl App {
@@ -131,6 +183,13 @@ impl App {
             tx,
             status_message: None,
             status_message_time: None,
+            
+            // Search and filter functionality
+            log_search_query: String::new(),
+            log_search_active: false,
+            log_filter_level: Some(LogFilterLevel::All),
+            log_search_matches: Vec::new(),
+            log_search_match_idx: 0,
         }
     }
 
@@ -517,6 +576,152 @@ impl App {
             // Also ensure job_list_state has a selection
             if self.job_list_state.selected().is_none() {
                 self.job_list_state.select(Some(0));
+            }
+        }
+    }
+
+    // Function to handle keyboard input for log search
+    fn handle_log_search_input(&mut self, key: KeyCode) {
+        match key {
+            KeyCode::Esc => {
+                self.log_search_active = false;
+                self.log_search_query.clear();
+                self.log_search_matches.clear();
+            },
+            KeyCode::Backspace => {
+                self.log_search_query.pop();
+                self.update_log_search_matches();
+            },
+            KeyCode::Enter => {
+                self.log_search_active = false;
+                // Keep the search query and matches
+            },
+            KeyCode::Char(c) => {
+                self.log_search_query.push(c);
+                self.update_log_search_matches();
+            },
+            _ => {}
+        }
+    }
+
+    // Toggle log search mode
+    fn toggle_log_search(&mut self) {
+        self.log_search_active = !self.log_search_active;
+        if !self.log_search_active {
+            // Don't clear the query, this allows toggling the search UI while keeping the filter
+        } else {
+            // When activating search, update matches
+            self.update_log_search_matches();
+        }
+    }
+
+    // Toggle log filter
+    fn toggle_log_filter(&mut self) {
+        self.log_filter_level = match &self.log_filter_level {
+            None => Some(LogFilterLevel::Info),
+            Some(level) => Some(level.next()),
+        };
+        
+        // Update search matches when filter changes
+        self.update_log_search_matches();
+    }
+
+    // Clear log search and filter
+    fn clear_log_search_and_filter(&mut self) {
+        self.log_search_query.clear();
+        self.log_filter_level = None;
+        self.log_search_matches.clear();
+        self.log_search_match_idx = 0;
+    }
+
+    // Update matches based on current search and filter
+    fn update_log_search_matches(&mut self) {
+        self.log_search_matches.clear();
+        self.log_search_match_idx = 0;
+        
+        // Get all logs (app logs + system logs)
+        let mut all_logs = Vec::new();
+        for log in &self.logs {
+            all_logs.push(log.clone());
+        }
+        for log in crate::logging::get_logs() {
+            all_logs.push(log.clone());
+        }
+        
+        // Apply filter and search
+        for (idx, log) in all_logs.iter().enumerate() {
+            let passes_filter = match &self.log_filter_level {
+                None => true,
+                Some(level) => level.matches(log),
+            };
+            
+            let matches_search = if self.log_search_query.is_empty() {
+                true
+            } else {
+                log.to_lowercase().contains(&self.log_search_query.to_lowercase())
+            };
+            
+            if passes_filter && matches_search {
+                self.log_search_matches.push(idx);
+            }
+        }
+        
+        // Jump to first match and provide feedback
+        if !self.log_search_matches.is_empty() {
+            // Jump to the first match
+            if let Some(&idx) = self.log_search_matches.first() {
+                self.log_scroll = idx;
+                
+                if !self.log_search_query.is_empty() {
+                    self.set_status_message(format!(
+                        "Found {} matches for '{}'", 
+                        self.log_search_matches.len(),
+                        self.log_search_query
+                    ));
+                }
+            }
+        } else if !self.log_search_query.is_empty() {
+            // No matches found
+            self.set_status_message(format!("No matches found for '{}'", self.log_search_query));
+        }
+    }
+
+    // Navigate to next search match
+    fn next_search_match(&mut self) {
+        if !self.log_search_matches.is_empty() {
+            self.log_search_match_idx = (self.log_search_match_idx + 1) % self.log_search_matches.len();
+            if let Some(&idx) = self.log_search_matches.get(self.log_search_match_idx) {
+                self.log_scroll = idx;
+                
+                // Set status message showing which match we're on
+                self.set_status_message(format!(
+                    "Search match {}/{} for '{}'", 
+                    self.log_search_match_idx + 1, 
+                    self.log_search_matches.len(),
+                    self.log_search_query
+                ));
+            }
+        }
+    }
+
+    // Navigate to previous search match
+    fn previous_search_match(&mut self) {
+        if !self.log_search_matches.is_empty() {
+            self.log_search_match_idx = if self.log_search_match_idx == 0 {
+                self.log_search_matches.len() - 1
+            } else {
+                self.log_search_match_idx - 1
+            };
+            if let Some(&idx) = self.log_search_matches.get(self.log_search_match_idx) {
+                self.log_scroll = idx;
+                
+                // Set status message showing which match we're on
+                self.set_status_message(format!(
+                    "Search match {}/{} for '{}'", 
+                    self.log_search_match_idx + 1, 
+                    self.log_search_matches.len(),
+                    self.log_search_query
+                ));
             }
         }
     }
@@ -1661,18 +1866,22 @@ fn render_job_detail_view(f: &mut Frame<CrosstermBackend<io::Stdout>>, app: &mut
 
 // Render the logs tab
 fn render_logs_tab(f: &mut Frame<CrosstermBackend<io::Stdout>>, app: &App, area: Rect) {
-    // Split the area into header and log content
+    // Split the area into header, search bar (optionally shown), and log content
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3), // Header with instructions
+            Constraint::Length(if app.log_search_active || !app.log_search_query.is_empty() || app.log_filter_level.is_some() { 3 } else { 0 }), // Search bar (optional)
             Constraint::Min(3),    // Logs content
         ].as_ref())
         .margin(1)
         .split(area);
     
+    // Determine if search/filter bar should be shown
+    let show_search_bar = app.log_search_active || !app.log_search_query.is_empty() || app.log_filter_level.is_some();
+    
     // Render header with instructions
-    let header_text = vec![
+    let mut header_text = vec![
         Line::from(vec![
             Span::styled("Execution and System Logs", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
         ]),
@@ -1680,11 +1889,26 @@ fn render_logs_tab(f: &mut Frame<CrosstermBackend<io::Stdout>>, app: &App, area:
             Span::styled("↑/↓", Style::default().fg(Color::Cyan)),
             Span::raw(" or "),
             Span::styled("j/k", Style::default().fg(Color::Cyan)),
-            Span::raw(": Scroll logs   "),
+            Span::raw(": Navigate logs/matches   "),
+            Span::styled("s", Style::default().fg(Color::Cyan)),
+            Span::raw(": Search   "),
+            Span::styled("f", Style::default().fg(Color::Cyan)),
+            Span::raw(": Filter   "),
             Span::styled("Tab", Style::default().fg(Color::Cyan)),
             Span::raw(": Switch tabs"),
         ]),
     ];
+    
+    if show_search_bar {
+        header_text.push(Line::from(vec![
+            Span::styled("Enter", Style::default().fg(Color::Cyan)),
+            Span::raw(": Apply search   "),
+            Span::styled("Esc", Style::default().fg(Color::Cyan)),
+            Span::raw(": Clear search   "),
+            Span::styled("c", Style::default().fg(Color::Cyan)),
+            Span::raw(": Clear all filters"),
+        ]));
+    }
 
     let header = Paragraph::new(header_text)
         .block(Block::default()
@@ -1693,6 +1917,56 @@ fn render_logs_tab(f: &mut Frame<CrosstermBackend<io::Stdout>>, app: &App, area:
         .alignment(Alignment::Center);
     
     f.render_widget(header, chunks[0]);
+    
+    // Render search bar if active or has content
+    if show_search_bar {
+        let search_text = if app.log_search_active {
+            format!("Search: {}█", app.log_search_query)
+        } else {
+            format!("Search: {}", app.log_search_query)
+        };
+        
+        let filter_text = match &app.log_filter_level {
+            Some(level) => format!("Filter: {}", level.to_string()),
+            None => "No filter".to_string(),
+        };
+        
+        let match_info = if !app.log_search_matches.is_empty() {
+            format!("Matches: {}/{}", 
+                app.log_search_match_idx + 1, 
+                app.log_search_matches.len())
+        } else if !app.log_search_query.is_empty() {
+            "No matches".to_string()
+        } else {
+            "".to_string()
+        };
+        
+        let search_info = Line::from(vec![
+            Span::raw(search_text),
+            Span::raw("   "),
+            Span::styled(filter_text, Style::default().fg(
+                match &app.log_filter_level {
+                    Some(LogFilterLevel::Error) => Color::Red,
+                    Some(LogFilterLevel::Warning) => Color::Yellow,
+                    Some(LogFilterLevel::Info) => Color::Cyan,
+                    Some(LogFilterLevel::Success) => Color::Green,
+                    Some(LogFilterLevel::Trigger) => Color::Magenta,
+                    Some(LogFilterLevel::All) | None => Color::Gray,
+                }
+            )),
+            Span::raw("   "),
+            Span::styled(match_info, Style::default().fg(Color::Magenta)),
+        ]);
+        
+        let search_block = Paragraph::new(search_info)
+            .block(Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .title(Span::styled(" Search & Filter ", Style::default().fg(Color::Yellow))))
+            .alignment(Alignment::Left);
+        
+        f.render_widget(search_block, chunks[1]);
+    }
     
     // Combine application logs with system logs
     let mut all_logs = Vec::new();
@@ -1715,6 +1989,29 @@ fn render_logs_tab(f: &mut Frame<CrosstermBackend<io::Stdout>>, app: &App, area:
     //     // For now we're keeping the order as they came in
     // });
 
+    // Filter logs based on search query and filter level
+    let filtered_logs = if !app.log_search_query.is_empty() || app.log_filter_level.is_some() {
+        all_logs.iter()
+            .filter(|log| {
+                let passes_filter = match &app.log_filter_level {
+                    None => true,
+                    Some(level) => level.matches(log),
+                };
+                
+                let matches_search = if app.log_search_query.is_empty() {
+                    true
+                } else {
+                    log.to_lowercase().contains(&app.log_search_query.to_lowercase())
+                };
+                
+                passes_filter && matches_search
+            })
+            .cloned()
+            .collect::<Vec<String>>()
+    } else {
+        all_logs.clone() // Clone to avoid moving all_logs
+    };
+
     // Create a table for logs for better organization
     let header_cells = ["Time", "Type", "Message"]
         .iter()
@@ -1724,7 +2021,7 @@ fn render_logs_tab(f: &mut Frame<CrosstermBackend<io::Stdout>>, app: &App, area:
         .style(Style::default().add_modifier(Modifier::BOLD))
         .height(1);
     
-    let rows = all_logs.iter().map(|log_line| {
+    let rows = filtered_logs.iter().map(|log_line| {
         // Parse log line to extract timestamp, type and message
         
         // Extract timestamp from log format [HH:MM:SS]
@@ -1760,6 +2057,7 @@ fn render_logs_tab(f: &mut Frame<CrosstermBackend<io::Stdout>>, app: &App, area:
         {
             ("INFO", Style::default().fg(Color::Cyan), log_line.as_str())
         } else if log_line.contains("Triggering")
+            || log_line.contains("triggered")
         {
             ("TRIG", Style::default().fg(Color::Magenta), log_line.as_str())
         } else {
@@ -1774,12 +2072,53 @@ fn render_logs_tab(f: &mut Frame<CrosstermBackend<io::Stdout>>, app: &App, area:
             log_line.as_str()
         };
         
+        // Highlight search matches in content if search is active
+        let mut content_spans = Vec::new();
+        if !app.log_search_query.is_empty() {
+            let lowercase_content = content.to_lowercase();
+            let lowercase_query = app.log_search_query.to_lowercase();
+            
+            if lowercase_content.contains(&lowercase_query) {
+                let mut last_idx = 0;
+                while let Some(idx) = lowercase_content[last_idx..].find(&lowercase_query) {
+                    let real_idx = last_idx + idx;
+                    
+                    // Add text before match
+                    if real_idx > last_idx {
+                        content_spans.push(Span::raw(content[last_idx..real_idx].to_string()));
+                    }
+                    
+                    // Add matched text with highlight
+                    let match_end = real_idx + app.log_search_query.len();
+                    content_spans.push(
+                        Span::styled(
+                            content[real_idx..match_end].to_string(),
+                            Style::default().bg(Color::Yellow).fg(Color::Black)
+                        )
+                    );
+                    
+                    last_idx = match_end;
+                }
+                
+                // Add remaining text after last match
+                if last_idx < content.len() {
+                    content_spans.push(Span::raw(content[last_idx..].to_string()));
+                }
+            } else {
+                content_spans.push(Span::raw(content));
+            }
+        } else {
+            content_spans.push(Span::raw(content));
+        }
+        
         Row::new(vec![
             Cell::from(timestamp),
             Cell::from(log_type).style(log_style),
-            Cell::from(content),
+            Cell::from(Line::from(content_spans)),
         ])
     });
+    
+    let content_idx = if show_search_bar { 2 } else { 1 };
     
     let log_table = Table::new(rows)
         .header(header)
@@ -1789,8 +2128,8 @@ fn render_logs_tab(f: &mut Frame<CrosstermBackend<io::Stdout>>, app: &App, area:
                 .border_type(BorderType::Rounded)
                 .title(Span::styled(
                     format!(" Logs ({}/{}) ", 
-                        if all_logs.is_empty() { 0 } else { app.log_scroll + 1 }, 
-                        all_logs.len()
+                        if filtered_logs.is_empty() { 0 } else { app.log_scroll + 1 }, 
+                        filtered_logs.len()
                     ),
                     Style::default().fg(Color::Yellow),
                 ))
@@ -1798,17 +2137,60 @@ fn render_logs_tab(f: &mut Frame<CrosstermBackend<io::Stdout>>, app: &App, area:
         .highlight_style(Style::default().bg(Color::DarkGray))
         .widths(&[
             Constraint::Length(10),  // Timestamp column
-            Constraint::Length(6),   // Log type column
+            Constraint::Length(7),   // Log type column
             Constraint::Percentage(80), // Message column
         ]);
     
     // We need to convert log_scroll index to a TableState
     let mut log_table_state = TableState::default();
-    if !all_logs.is_empty() {
-        log_table_state.select(Some(app.log_scroll.min(all_logs.len() - 1)));
+    
+    if !filtered_logs.is_empty() {
+        // If we have search matches, use the match index as the selected row
+        if !app.log_search_matches.is_empty() {
+            // Make sure we're within bounds
+            let match_index = app.log_search_match_idx.min(app.log_search_matches.len() - 1);
+            
+            // Get the filtered log index corresponding to the current search match
+            if let Some(&original_idx) = app.log_search_matches.get(match_index) {
+                // We need to map from the original all_logs index to filtered_logs index
+                let filtered_idx = filtered_logs.iter().position(|log| {
+                    // Find this log in all_logs
+                    let all_logs_idx = if original_idx < app.logs.len() {
+                        // This is an app log
+                        app.logs.get(original_idx).map(|l| all_logs.iter().position(|al| al == l))
+                    } else {
+                        // This is a system log
+                        let system_idx = original_idx - app.logs.len();
+                        crate::logging::get_logs().get(system_idx).map(|l| all_logs.iter().position(|al| al == l))
+                    };
+                    
+                    // If we found the log and it matches the current filtered log, select it
+                    if let Some(Some(idx)) = all_logs_idx {
+                        if idx < all_logs.len() && &all_logs[idx] == log {
+                            return true;
+                        }
+                    }
+                    false
+                });
+                
+                // If we found the correct index in filtered logs, select it
+                if let Some(idx) = filtered_idx {
+                    log_table_state.select(Some(idx));
+                } else {
+                    // Fall back to regular scroll if we can't find the match
+                    log_table_state.select(Some(app.log_scroll.min(filtered_logs.len() - 1)));
+                }
+            } else {
+                // Fall back to regular scroll if match index is out of bounds
+                log_table_state.select(Some(app.log_scroll.min(filtered_logs.len() - 1)));
+            }
+        } else {
+            // No search matches, use regular scroll position
+            log_table_state.select(Some(app.log_scroll.min(filtered_logs.len() - 1)));
+        }
     }
     
-    f.render_stateful_widget(log_table, chunks[1], &mut log_table_state);
+    f.render_stateful_widget(log_table, chunks[content_idx], &mut log_table_state);
 }
 
 // Render the help tab
@@ -1846,7 +2228,16 @@ fn render_help_tab(f: &mut Frame<CrosstermBackend<io::Stdout>>, area: Rect) {
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw(" - Navigate lists or scroll logs"),
+            Span::raw(" - Navigate logs or search matches"),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "Selected line",
+                Style::default()
+                    .fg(Color::White)
+                    .bg(Color::DarkGray),
+            ),
+            Span::raw(" - Current scroll position or search match"),
         ]),
         Line::from(vec![
             Span::styled(
@@ -2008,6 +2399,26 @@ fn render_help_tab(f: &mut Frame<CrosstermBackend<io::Stdout>>, area: Rect) {
             ),
             Span::raw(" - Current scroll position"),
         ]),
+        Line::from(vec![
+            Span::styled("Tab", Style::default().fg(Color::Yellow)),
+            Span::raw(" - Navigate between tabs"),
+        ]),
+        Line::from(vec![
+            Span::styled("s", Style::default().fg(Color::Yellow)),
+            Span::raw(" - Search logs (in Logs tab)"),
+        ]),
+        Line::from(vec![
+            Span::styled("f", Style::default().fg(Color::Yellow)),
+            Span::raw(" - Toggle log filter (in Logs tab)"),
+        ]),
+        Line::from(vec![
+            Span::styled("c", Style::default().fg(Color::Yellow)),
+            Span::raw(" - Clear log search/filter (in Logs tab)"),
+        ]),
+        Line::from(vec![
+            Span::styled("↑/↓", Style::default().fg(Color::Yellow)),
+            Span::raw(" - Navigate between logs or search matches (in Logs tab)"),
+        ]),
     ];
 
     let help_widget = Paragraph::new(help_text)
@@ -2128,7 +2539,7 @@ fn render_status_bar(f: &mut Frame<CrosstermBackend<io::Stdout>>, app: &App, are
             let log_count = app.logs.len() + crate::logging::get_logs().len();
             if log_count > 0 {
                 // Convert to a static string for consistent return type
-                let scroll_text = format!("[↑/↓] Scroll logs ({}/{})", app.log_scroll + 1, log_count);
+                let scroll_text = format!("[↑/↓] Scroll logs ({}/{}) [s] Search [f] Filter", app.log_scroll + 1, log_count);
                 Box::leak(scroll_text.into_boxed_str())
             } else {
                 "[No logs to display]"
@@ -2478,6 +2889,12 @@ fn run_tui_event_loop(
         // Handle key events - use shorter timeout to improve responsiveness
         if event::poll(Duration::from_millis(50))? {
             if let Event::Key(key) = event::read()? {           
+                // Handle search input first if we're in search mode and logs tab
+                if app.selected_tab == 2 && app.log_search_active {
+                    app.handle_log_search_input(key.code);
+                    continue;
+                }
+                
                 match key.code {
                     KeyCode::Char('q') => {
                         // Exit and clean up
@@ -2505,29 +2922,39 @@ fn run_tui_event_loop(
                     KeyCode::Char('2') | KeyCode::Char('x') => app.switch_tab(1),
                     KeyCode::Char('3') | KeyCode::Char('l') => app.switch_tab(2),
                     KeyCode::Char('4') | KeyCode::Char('h') => app.switch_tab(3),
-                    KeyCode::Up | KeyCode::Char('k') => match app.selected_tab {
-                        0 => app.previous_workflow(),
-                        1 => {
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        if app.selected_tab == 2 {
+                            if !app.log_search_matches.is_empty() {
+                                app.previous_search_match();
+                            } else {
+                                app.scroll_logs_up();
+                            }
+                        } else if app.selected_tab == 0 {
+                            app.previous_workflow();
+                        } else if app.selected_tab == 1 {
                             if app.detailed_view {
                                 app.previous_step();
                             } else {
                                 app.previous_job();
                             }
                         }
-                        2 => app.scroll_logs_up(),
-                        _ => {}
                     },
-                    KeyCode::Down | KeyCode::Char('j') => match app.selected_tab {
-                        0 => app.next_workflow(),
-                        1 => {
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        if app.selected_tab == 2 {
+                            if !app.log_search_matches.is_empty() {
+                                app.next_search_match();
+                            } else {
+                                app.scroll_logs_down();
+                            }
+                        } else if app.selected_tab == 0 {
+                            app.next_workflow();
+                        } else if app.selected_tab == 1 {
                             if app.detailed_view {
                                 app.next_step();
                             } else {
                                 app.next_job();
                             }
                         }
-                        2 => app.scroll_logs_down(),
-                        _ => {}
                     },
                     KeyCode::Char(' ') => {
                         if app.selected_tab == 0 && !app.running {
@@ -2594,7 +3021,9 @@ fn run_tui_event_loop(
                         }
                     }
                     KeyCode::Char('n') => {
-                        if !app.running {
+                        if app.selected_tab == 2 && !app.log_search_query.is_empty() {
+                            app.next_search_match();
+                        } else if app.selected_tab == 0 && !app.running {
                             // Deselect all workflows
                             for workflow in &mut app.workflows {
                                 workflow.selected = false;
@@ -2688,6 +3117,26 @@ fn run_tui_event_loop(
                             app.switch_tab(0);
                         }
                     }
+                    KeyCode::Char('s') => {
+                        if app.selected_tab == 2 {
+                            app.toggle_log_search();
+                        }
+                    },
+                    KeyCode::Char('f') => {
+                        if app.selected_tab == 2 {
+                            app.toggle_log_filter();
+                        }
+                    },
+                    KeyCode::Char('c') => {
+                        if app.selected_tab == 2 {
+                            app.clear_log_search_and_filter();
+                        }
+                    },
+                    KeyCode::Char(c) => {
+                        if app.selected_tab == 2 && app.log_search_active {
+                            app.handle_log_search_input(KeyCode::Char(c));
+                        }
+                    },
                     _ => {}
                 }
             }

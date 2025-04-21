@@ -1,5 +1,11 @@
 # WRKFLW
 
+[![Crates.io](https://img.shields.io/crates/v/wrkflw)](https://crates.io/crates/wrkflw)
+[![Rust Version](https://img.shields.io/badge/rust-1.67%2B-orange)](https://www.rust-lang.org/)
+[![License](https://img.shields.io/crates/l/wrkflw)](LICENSE)
+[![GitHub Workflow Status](https://img.shields.io/github/actions/workflow/status/bahdotsh/wrkflw/test.yml?branch=main)](https://github.com/bahdotsh/wrkflw/actions)
+[![Downloads](https://img.shields.io/crates/d/wrkflw)](https://crates.io/crates/wrkflw)
+
 WRKFLW is a powerful command-line tool for validating and executing GitHub Actions workflows locally, without requiring a full GitHub environment. It helps developers test their workflows directly on their machines before pushing changes to GitHub.
 
 ![WRKFLW Demo](demo.gif)

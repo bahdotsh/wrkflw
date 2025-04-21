@@ -43,7 +43,9 @@ mod cleanup_tests {
         assert!(is_tracked, "Container should be tracked for cleanup");
 
         // Run cleanup with timeout
-        match tokio::time::timeout(Duration::from_secs(10), docker::cleanup_containers(&docker)).await {
+        match tokio::time::timeout(Duration::from_secs(10), docker::cleanup_containers(&docker))
+            .await
+        {
             Ok(_) => {
                 // Cleanup completed within timeout
                 // Verify container is no longer tracked
@@ -54,7 +56,7 @@ mod cleanup_tests {
                     !still_tracked,
                     "Container should be removed from tracking after cleanup"
                 );
-            },
+            }
             Err(_) => {
                 // Cleanup timed out
                 println!("Container cleanup timed out after 10 seconds");
@@ -91,8 +93,10 @@ mod cleanup_tests {
         // Create a test network with timeout
         let network_id = match tokio::time::timeout(
             Duration::from_secs(10),
-            docker::create_job_network(&docker)
-        ).await {
+            docker::create_job_network(&docker),
+        )
+        .await
+        {
             Ok(result) => match result {
                 Ok(id) => id,
                 Err(_) => {
@@ -113,7 +117,8 @@ mod cleanup_tests {
         assert!(is_tracked, "Network should be tracked for cleanup");
 
         // Run cleanup with timeout
-        match tokio::time::timeout(Duration::from_secs(10), docker::cleanup_networks(&docker)).await {
+        match tokio::time::timeout(Duration::from_secs(10), docker::cleanup_networks(&docker)).await
+        {
             Ok(_) => {
                 // Cleanup completed within timeout
                 // Verify network is no longer tracked
@@ -124,7 +129,7 @@ mod cleanup_tests {
                     !still_tracked,
                     "Network should be removed from tracking after cleanup"
                 );
-            },
+            }
             Err(_) => {
                 // Cleanup timed out
                 println!("Network cleanup timed out after 10 seconds");
@@ -262,8 +267,10 @@ mod cleanup_tests {
                     // Create a network with timeout
                     match tokio::time::timeout(
                         Duration::from_secs(10),
-                        docker::create_job_network(&client)
-                    ).await {
+                        docker::create_job_network(&client),
+                    )
+                    .await
+                    {
                         Ok(_) => Some(client),
                         Err(_) => {
                             println!("Network creation timed out after 10 seconds, skipping Docker part of test");
@@ -318,13 +325,13 @@ mod cleanup_tests {
                 if docker_client.is_some() {
                     let remaining_containers = docker::get_tracked_containers().len();
                     let remaining_networks = docker::get_tracked_networks().len();
-                    
+
                     assert_eq!(
                         remaining_containers, 0,
                         "All Docker containers should be cleaned up"
                     );
                     assert_eq!(
-                        remaining_networks, 0, 
+                        remaining_networks, 0,
                         "All Docker networks should be cleaned up"
                     );
                 }
@@ -332,7 +339,7 @@ mod cleanup_tests {
                 // Verify emulation resources are cleaned up
                 let remaining_processes = emulation::get_tracked_processes().len();
                 let remaining_workspaces = emulation::get_tracked_workspaces().len();
-                
+
                 assert_eq!(
                     remaining_processes, 0,
                     "All emulation processes should be cleaned up"
@@ -341,7 +348,7 @@ mod cleanup_tests {
                     remaining_workspaces, 0,
                     "All emulation workspaces should be cleaned up"
                 );
-            },
+            }
             Err(_) => {
                 println!("Cleanup timed out after 15 seconds");
                 // Clean up any tracked resources to not affect other tests

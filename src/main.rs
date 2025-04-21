@@ -181,21 +181,7 @@ async fn main() {
             
             match github::trigger_workflow(workflow, branch.as_deref(), inputs.clone()).await {
                 Ok(_) => {
-                    println!("Successfully triggered workflow '{}' on GitHub", workflow);
-                    if let Some(branch_name) = branch {
-                        println!("Branch: {}", branch_name);
-                    } else {
-                        println!("Branch: default branch");
-                    }
-                    
-                    if let Some(workflow_inputs) = &inputs {
-                        if !workflow_inputs.is_empty() {
-                            println!("Inputs:");
-                            for (key, value) in workflow_inputs {
-                                println!("  {}: {}", key, value);
-                            }
-                        }
-                    }
+                    // Success is already reported in the github module with detailed info
                 }
                 Err(e) => {
                     eprintln!("Error triggering workflow: {}", e);

@@ -1,11 +1,12 @@
-use serde::Serialize;
 use std::path::Path;
 use thiserror::Error;
-use reqwest::{Client, header};
+use reqwest;
 use std::fs;
 use std::process::Command;
 use std::collections::HashMap;
 use regex::Regex;
+use serde_json;
+use reqwest::header;
 
 #[derive(Error, Debug)]
 pub enum GithubError {
@@ -18,24 +19,11 @@ pub enum GithubError {
     #[error("Failed to parse Git repository URL: {0}")]
     GitParseError(String),
     
-    #[error("Failed to extract repository info: {0}")]
-    RepoInfoError(String),
-    
     #[error("GitHub token not found. Please set GITHUB_TOKEN environment variable")]
     TokenNotFound,
     
-    #[error("Failed to parse workflow file: {0}")]
-    WorkflowParseError(String),
-    
     #[error("API error: {status} - {message}")]
     ApiError { status: u16, message: String },
-}
-
-#[derive(Debug, Serialize)]
-struct WorkflowDispatchPayload {
-    #[serde(rename = "ref")]
-    reference: String,
-    inputs: Option<HashMap<String, String>>,
 }
 
 /// Information about a GitHub repository
@@ -128,31 +116,31 @@ pub async fn trigger_workflow(
     let token = std::env::var("GITHUB_TOKEN")
         .map_err(|_| GithubError::TokenNotFound)?;
     
+    // Trim the token to remove any leading or trailing whitespace
+    let trimmed_token = token.trim();
+    
+    // Convert token to HeaderValue
+    let token_header = header::HeaderValue::from_str(&format!("Bearer {}", trimmed_token))
+        .map_err(|_| GithubError::GitParseError("Invalid token format".to_string()))?;
+    
     // Get repository information
     let repo_info = get_repo_info()?;
-    
-    // Create HTTP client with GitHub token
-    let mut headers = header::HeaderMap::new();
-    headers.insert(
-        header::ACCEPT,
-        header::HeaderValue::from_static("application/vnd.github.v3+json"),
-    );
-    headers.insert(
-        header::USER_AGENT,
-        header::HeaderValue::from_static("wrkflw-cli"),
-    );
-    
-    let client = Client::builder()
-        .default_headers(headers)
-        .build()?;
+    println!("Repository: {}/{}", repo_info.owner, repo_info.repo);
     
     // Prepare the request payload
     let branch_ref = branch.unwrap_or(&repo_info.default_branch);
+    println!("Using branch: {}", branch_ref);
     
-    let payload = WorkflowDispatchPayload {
-        reference: branch_ref.to_string(),
-        inputs,
-    };
+    // Create simplified payload
+    let mut payload = serde_json::json!({
+        "ref": branch_ref
+    });
+    
+    // Add inputs if provided
+    if let Some(input_map) = inputs {
+        payload["inputs"] = serde_json::json!(input_map);
+        println!("With inputs: {:?}", input_map);
+    }
     
     // Send the workflow_dispatch event
     let url = format!(
@@ -160,12 +148,22 @@ pub async fn trigger_workflow(
         repo_info.owner, repo_info.repo, workflow_name
     );
     
+    println!("Triggering workflow at URL: {}", url);
+    
+    // Create a reqwest client
+    let client = reqwest::Client::new();
+    
+    // Send the request using reqwest
     let response = client
         .post(&url)
-        .bearer_auth(token)
+        .header(header::AUTHORIZATION, token_header)
+        .header(header::ACCEPT, "application/vnd.github.v3+json")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::USER_AGENT, "wrkflw-cli")
         .json(&payload)
         .send()
-        .await?;
+        .await
+        .map_err(|e| GithubError::RequestError(e))?;
     
     if !response.status().is_success() {
         let status = response.status().as_u16();
@@ -179,5 +177,71 @@ pub async fn trigger_workflow(
         });
     }
     
+    println!("Workflow triggered successfully!");
+    println!("View runs at: https://github.com/{}/{}/actions/workflows/{}.yml", 
+             repo_info.owner, repo_info.repo, workflow_name);
+    
+    // Attempt to verify the workflow was actually triggered
+    match list_recent_workflow_runs(&repo_info, workflow_name, &token).await {
+        Ok(runs) => {
+            if !runs.is_empty() {
+                println!("\nRecent runs of this workflow:");
+                for run in runs.iter().take(3) {
+                    println!("- Run #{} ({}): {}", 
+                        run.get("id").and_then(|id| id.as_u64()).unwrap_or(0),
+                        run.get("status").and_then(|s| s.as_str()).unwrap_or("unknown"),
+                        run.get("html_url").and_then(|u| u.as_str()).unwrap_or("")
+                    );
+                }
+            } else {
+                println!("\nNo recent runs found. The workflow might still be initializing.");
+                println!("Check GitHub UI in a few moments: https://github.com/{}/{}/actions", 
+                         repo_info.owner, repo_info.repo);
+            }
+        },
+        Err(e) => {
+            println!("\nCould not fetch recent workflow runs: {}", e);
+            println!("This doesn't mean the trigger failed - check GitHub UI: https://github.com/{}/{}/actions", 
+                     repo_info.owner, repo_info.repo);
+        }
+    }
+    
     Ok(())
+}
+
+/// List recent workflow runs for a specific workflow
+async fn list_recent_workflow_runs(
+    repo_info: &RepoInfo, 
+    workflow_name: &str,
+    token: &str
+) -> Result<Vec<serde_json::Value>, GithubError> {
+    // Get recent workflow runs via GitHub API
+    let url = format!(
+        "https://api.github.com/repos/{}/{}/actions/workflows/{}.yml/runs?per_page=5",
+        repo_info.owner, repo_info.repo, workflow_name
+    );
+    
+    let curl_output = Command::new("curl")
+        .arg("-s")
+        .arg("-H").arg(format!("Authorization: Bearer {}", token))
+        .arg("-H").arg("Accept: application/vnd.github.v3+json")
+        .arg(&url)
+        .output()
+        .map_err(|e| GithubError::GitParseError(format!("Failed to execute curl: {}", e)))?;
+    
+    if !curl_output.status.success() {
+        let error_message = String::from_utf8_lossy(&curl_output.stderr).to_string();
+        return Err(GithubError::GitParseError(format!("Failed to list workflow runs: {}", error_message)));
+    }
+    
+    let response_body = String::from_utf8_lossy(&curl_output.stdout).to_string();
+    let parsed: serde_json::Value = serde_json::from_str(&response_body)
+        .map_err(|e| GithubError::GitParseError(format!("Failed to parse workflow runs: {}", e)))?;
+    
+    // Extract the workflow runs from the response
+    if let Some(workflow_runs) = parsed.get("workflow_runs").and_then(|wr| wr.as_array()) {
+        Ok(workflow_runs.clone())
+    } else {
+        Ok(Vec::new())
+    }
 } 

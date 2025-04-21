@@ -6,6 +6,6 @@ pub mod substitution;
 
 // Re-export public items
 pub use engine::{
-    execute_workflow, ExecutionResult, JobResult, JobStatus, RuntimeType, StepResult, StepStatus,
+    execute_workflow, JobResult, JobStatus, RuntimeType, StepResult, StepStatus,
 };
 pub use docker::cleanup_containers;

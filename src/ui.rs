@@ -1739,7 +1739,7 @@ fn render_logs_tab(f: &mut Frame<CrosstermBackend<io::Stdout>>, app: &App, area:
             "??:??:??".to_string() // Show placeholder for malformed logs
         };
         
-        let (log_type, log_style, message) = if log_line.contains("Error")
+        let (log_type, log_style, _) = if log_line.contains("Error")
             || log_line.contains("error")
             || log_line.contains("❌")
         {
@@ -2108,7 +2108,6 @@ fn render_status_bar(f: &mut Frame<CrosstermBackend<io::Stdout>>, app: &App, are
                         WorkflowStatus::Running => "[Space] Toggle selection   [Enter] Run selected   [r] Run all selected   (Workflow running...)",
                         WorkflowStatus::Success | WorkflowStatus::Failed | WorkflowStatus::Skipped => 
                             "[Space] Toggle selection   [Enter] Run selected   [r] Run all selected   [Shift+R] Reset workflow",
-                        _ => "[Space] Toggle selection   [Enter] Run selected   [r] Run all selected",
                     }
                 } else {
                     "[Space] Toggle selection   [Enter] Run selected   [r] Run all selected"

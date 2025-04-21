@@ -11,7 +11,7 @@ pub enum LogLevel {
     Info,
     Warning,
     Error,
-    Success,
+    
 }
 
 impl LogLevel {
@@ -21,17 +21,7 @@ impl LogLevel {
             LogLevel::Info => "ℹ️",
             LogLevel::Warning => "⚠️",
             LogLevel::Error => "❌",
-            LogLevel::Success => "✅",
-        }
-    }
-    
-    fn name(&self) -> &'static str {
-        match self {
-            LogLevel::Debug => "DEBUG",
-            LogLevel::Info => "INFO",
-            LogLevel::Warning => "WARN",
-            LogLevel::Error => "ERROR",
-            LogLevel::Success => "SUCCESS",
+            
         }
     }
 }
@@ -86,8 +76,4 @@ pub fn warning(message: &str) {
 
 pub fn error(message: &str) {
     log(LogLevel::Error, message);
-}
-
-pub fn success(message: &str) {
-    log(LogLevel::Success, message);
 }

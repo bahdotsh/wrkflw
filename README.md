@@ -227,30 +227,68 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 
 ## Remote Workflow Triggering
 
-The new `trigger` command lets you manually trigger workflow runs on GitHub. Requirements:
+WRKFLW allows you to manually trigger workflow runs on GitHub through both the command-line interface (CLI) and the terminal user interface (TUI).
 
-1. You need a GitHub token with appropriate permissions. Set it in the `GITHUB_TOKEN` environment variable:
+### Requirements:
+
+1. You need a GitHub token with workflow permissions. Set it in the `GITHUB_TOKEN` environment variable:
    ```bash
    export GITHUB_TOKEN=ghp_your_token_here
    ```
 
-2. The workflow must have the `workflow_dispatch` trigger defined:
+2. The workflow must have the `workflow_dispatch` trigger defined in your workflow YAML:
    ```yaml
    on:
      workflow_dispatch:
        inputs:
-         # Optional inputs can be defined here
+         name:
+           description: 'Person to greet'
+           default: 'World'
+           required: true
+         debug:
+           description: 'Enable debug mode'
+           required: false
+           type: boolean
+           default: false
    ```
 
-Examples:
+### Triggering from CLI:
 
 ```bash
 # Trigger a workflow using the default branch
-wrkflw trigger build
+wrkflw trigger workflow-name
 
-# Trigger on a specific branch
-wrkflw trigger deploy --branch production
+# Trigger a workflow on a specific branch
+wrkflw trigger workflow-name --branch feature-branch
 
 # Trigger with input parameters
-wrkflw trigger release --input version=1.0.0 --input draft=false
+wrkflw trigger workflow-name --branch main --input name=Alice --input debug=true
 ```
+
+After triggering, WRKFLW will provide feedback including the URL to view the triggered workflow on GitHub.
+
+### Triggering from TUI:
+
+1. Launch the TUI interface:
+   ```bash
+   wrkflw tui
+   ```
+
+2. Navigate to the "Workflows" tab (use `Tab` key or press `1`).
+
+3. Use the arrow keys (`↑`/`↓`) or `j`/`k` to select the desired workflow.
+
+4. Press `t` to trigger the selected workflow.
+
+5. If the workflow is successfully triggered, you'll see a notification in the UI.
+
+6. You can monitor the triggered workflow's execution on GitHub using the provided URL.
+
+### Verifying Triggered Workflows:
+
+To verify that your workflow was triggered:
+
+1. Visit your GitHub repository in a web browser.
+2. Navigate to the "Actions" tab.
+3. Look for your workflow in the list of workflow runs.
+4. Click on it to view the details of the run.

@@ -24,12 +24,24 @@ impl LogLevel {
             LogLevel::Success => "✅",
         }
     }
+    
+    fn name(&self) -> &'static str {
+        match self {
+            LogLevel::Debug => "DEBUG",
+            LogLevel::Info => "INFO",
+            LogLevel::Warning => "WARN",
+            LogLevel::Error => "ERROR",
+            LogLevel::Success => "SUCCESS",
+        }
+    }
 }
 
 // Log a message with timestamp and level
 pub fn log(level: LogLevel, message: &str) {
     let timestamp = Local::now().format("%H:%M:%S").to_string();
-    let formatted = format!("{} {} {}", timestamp, level.prefix(), message);
+    
+    // Always include timestamp in [HH:MM:SS] format to ensure consistency
+    let formatted = format!("[{}] {} {}", timestamp, level.prefix(), message);
 
     if let Ok(mut logs) = LOGS.lock() {
         logs.push(formatted);
@@ -44,7 +56,9 @@ pub fn get_logs() -> Vec<String> {
     if let Ok(logs) = LOGS.lock() {
         logs.clone()
     } else {
-        vec!["Error accessing logs".to_string()]
+        // If we can't access logs, return an error message with timestamp
+        let timestamp = Local::now().format("%H:%M:%S").to_string();
+        vec![format!("[{}] ❌ Error accessing logs", timestamp)]
     }
 }
 

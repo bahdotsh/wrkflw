@@ -1,10 +1,10 @@
 use crate::evaluator::evaluate_workflow_file;
-use crate::executor::{self, ExecutionResult, JobStatus, RuntimeType, StepStatus};
+use crate::executor::{self, JobStatus, RuntimeType, StepStatus};
 use crate::logging;
 use crate::utils::is_workflow_file;
 use chrono::Local;
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -25,6 +25,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
+use regex;
 
 // Represents an individual workflow file
 struct Workflow {
@@ -90,10 +91,13 @@ struct App {
     step_table_state: TableState, // For the steps table in detailed view
     last_tick: Instant,           // For UI animations and updates
     tick_rate: Duration,          // How often to update the UI
+    tx: mpsc::Sender<(usize, Result<(Vec<executor::JobResult>, ()), String>)>, // Channel for async communication
+    status_message: Option<String>, // Temporary status message to display
+    status_message_time: Option<Instant>, // When the message was set
 }
 
 impl App {
-    fn new(runtime_type: RuntimeType) -> App {
+    fn new(runtime_type: RuntimeType, tx: mpsc::Sender<(usize, Result<(Vec<executor::JobResult>, ()), String>)>,) -> App {
         let mut workflow_list_state = ListState::default();
         workflow_list_state.select(Some(0));
 
@@ -124,6 +128,9 @@ impl App {
             step_table_state,
             last_tick: Instant::now(),
             tick_rate: Duration::from_millis(250), // Update 4 times per second
+            tx,
+            status_message: None,
+            status_message_time: None,
         }
     }
 
@@ -150,9 +157,11 @@ impl App {
         let mode = if self.validation_mode {
             "validation"
         } else {
-            "execution"
+            "normal"
         };
-        self.logs.push(format!("Switched to {} mode", mode));
+        let timestamp = Local::now().format("%H:%M:%S").to_string();
+        self.logs.push(format!("[{}] Switched to {} mode", timestamp, mode));
+        logging::info(&format!("Switched to {} mode", mode));
     }
 
     fn runtime_type_name(&self) -> &str {
@@ -238,7 +247,8 @@ impl App {
     fn next_job(&mut self) {
         let current_workflow_idx = self
             .current_execution
-            .or_else(|| self.workflow_list_state.selected());
+            .or_else(|| self.workflow_list_state.selected())
+            .filter(|&idx| idx < self.workflows.len());
 
         if let Some(workflow_idx) = current_workflow_idx {
             if workflow_idx >= self.workflows.len() {
@@ -272,7 +282,8 @@ impl App {
     fn previous_step(&mut self) {
         let current_workflow_idx = self
             .current_execution
-            .or_else(|| self.workflow_list_state.selected());
+            .or_else(|| self.workflow_list_state.selected())
+            .filter(|&idx| idx < self.workflows.len());
 
         if let Some(workflow_idx) = current_workflow_idx {
             if let Some(execution) = &self.workflows[workflow_idx].execution_details {
@@ -294,12 +305,11 @@ impl App {
                             None => 0,
                         };
                         self.step_list_state.select(Some(i));
+                        // Update the table state to match
+                        self.step_table_state.select(Some(i));
                     }
                 }
             }
-        }
-        if let Some(i) = self.step_list_state.selected() {
-            self.step_table_state.select(Some(i));
         }
     }
 
@@ -307,7 +317,8 @@ impl App {
     fn next_step(&mut self) {
         let current_workflow_idx = self
             .current_execution
-            .or_else(|| self.workflow_list_state.selected());
+            .or_else(|| self.workflow_list_state.selected())
+            .filter(|&idx| idx < self.workflows.len());
 
         if let Some(workflow_idx) = current_workflow_idx {
             if let Some(execution) = &self.workflows[workflow_idx].execution_details {
@@ -329,12 +340,11 @@ impl App {
                             None => 0,
                         };
                         self.step_list_state.select(Some(i));
+                        // Update the table state to match
+                        self.step_table_state.select(Some(i));
                     }
                 }
             }
-        }
-        if let Some(i) = self.step_list_state.selected() {
-            self.step_table_state.select(Some(i));
         }
     }
 
@@ -345,111 +355,120 @@ impl App {
 
     // Queue selected workflows for execution
     fn queue_selected_for_execution(&mut self) {
-        self.execution_queue.clear();
-        for (i, workflow) in self.workflows.iter().enumerate() {
-            if workflow.selected {
-                self.execution_queue.push(i);
+        if let Some(idx) = self.workflow_list_state.selected() {
+            if idx < self.workflows.len() {
+                if !self.execution_queue.contains(&idx) {
+                    self.execution_queue.push(idx);
+                    let timestamp = Local::now().format("%H:%M:%S").to_string();
+                    self.logs.push(format!(
+                        "[{}] Added '{}' to execution queue. Press 'Enter' to start.",
+                        timestamp,
+                        self.workflows[idx].name
+                    ));
+                }
             }
         }
-        self.logs.push(format!(
-            "Queued {} workflow(s) for execution",
-            self.execution_queue.len()
-        ));
-        logging::info(&format!(
-            "Queued {} workflow(s) for execution",
-            self.execution_queue.len()
-        ));
     }
 
     // Start workflow execution process
     fn start_execution(&mut self) {
-        if self.execution_queue.is_empty() {
-            self.logs
-                .push("No workflows selected for execution".to_string());
-            logging::warning("No workflows selected for execution");
-            return;
-        }
-
-        self.running = true;
-        self.logs.push("Starting workflow execution...".to_string());
-        logging::info("Starting workflow execution...");
-
-        if self.validation_mode {
-            self.logs
-                .push("Starting workflow validation...".to_string());
-            logging::info("Starting workflow validation...");
-        } else {
-            self.logs.push("Starting workflow execution...".to_string());
+        // Only start if we have workflows in queue and nothing is currently running
+        if !self.execution_queue.is_empty() && self.current_execution.is_none() {
+            self.running = true;
+            
+            // Log only once at the beginning - don't initialize execution details here
+            // since that will happen in start_next_workflow_execution
+            let timestamp = Local::now().format("%H:%M:%S").to_string();
+            self.logs.push(format!("[{}] Starting workflow execution...", timestamp));
             logging::info("Starting workflow execution...");
-        }
-
-        // Update all queued workflows to "Queued" state
-        for &idx in &self.execution_queue {
-            self.workflows[idx].status = WorkflowStatus::Skipped;
         }
     }
 
     // Process execution results and update UI
-    fn process_execution_result(&mut self, workflow_idx: usize, result: ExecutionResult) {
+    fn process_execution_result(&mut self, workflow_idx: usize, result: Result<(Vec<executor::JobResult>, ()), String>) {
+        if workflow_idx >= self.workflows.len() {
+            let timestamp = Local::now().format("%H:%M:%S").to_string();
+            self.logs.push(format!("[{}] Error: Invalid workflow index received", timestamp));
+            logging::error("Invalid workflow index received in process_execution_result");
+            return;
+        }
+
         let workflow = &mut self.workflows[workflow_idx];
-
-        // Convert execution results to our internal format
-        let mut job_executions = Vec::new();
-        for job in result.jobs {
-            let mut step_executions = Vec::new();
-            for step in job.steps {
-                step_executions.push(StepExecution {
-                    name: step.name,
-                    status: step.status,
-                    output: step.output,
-                });
-            }
-
-            job_executions.push(JobExecution {
-                name: job.name,
-                status: job.status,
-                steps: step_executions,
-                logs: vec![job.logs],
-            });
-        }
-
-        let end_time = Local::now();
-
-        // Determine overall workflow status
-        if job_executions
-            .iter()
-            .any(|j| j.status == JobStatus::Failure)
-        {
-            workflow.status = WorkflowStatus::Failed;
-            logging::error(&format!("Workflow '{}' failed", workflow.name));
-        } else {
-            workflow.status = WorkflowStatus::Success;
-            logging::success(&format!(
-                "Workflow '{}' completed successfully",
-                workflow.name
-            ));
-        }
-
-        // Update workflow execution details
-        if let Some(exec) = &mut workflow.execution_details {
-            exec.jobs = job_executions;
-            exec.end_time = Some(end_time);
-            exec.progress = 1.0; // Completed
-        } else {
+        
+        // Ensure execution details exist
+        if workflow.execution_details.is_none() {
             workflow.execution_details = Some(WorkflowExecution {
-                jobs: job_executions,
-                start_time: end_time - chrono::Duration::seconds(1), // Approximate
-                end_time: Some(end_time),
-                logs: vec!["Execution completed".to_string()],
-                progress: 1.0, // Completed
+                jobs: Vec::new(),
+                start_time: Local::now(),
+                end_time: Some(Local::now()),
+                logs: Vec::new(),
+                progress: 1.0,
             });
         }
-
-        // Add workflow completion to logs
-        self.logs.push(format!(
-            "Workflow '{}' execution completed with status: {:?}",
-            workflow.name, workflow.status
-        ));
+        
+        // Update execution details with end time
+        if let Some(execution_details) = &mut workflow.execution_details {
+            execution_details.end_time = Some(Local::now());
+            
+            match &result {
+                Ok((jobs, _)) => {
+                    let timestamp = Local::now().format("%H:%M:%S").to_string();
+                    execution_details.logs.push(format!("[{}] Operation completed successfully.", timestamp));
+                    execution_details.progress = 1.0;
+                    
+                    // Convert executor::JobResult to our JobExecution struct
+                    execution_details.jobs = jobs.iter().map(|job_result| {
+                        JobExecution {
+                            name: job_result.name.clone(),
+                            status: match job_result.status {
+                                executor::JobStatus::Success => JobStatus::Success,
+                                executor::JobStatus::Failure => JobStatus::Failure,
+                                executor::JobStatus::Skipped => JobStatus::Skipped,
+                            },
+                            steps: job_result.steps.iter().map(|step_result| {
+                                StepExecution {
+                                    name: step_result.name.clone(),
+                                    status: match step_result.status {
+                                        executor::StepStatus::Success => StepStatus::Success,
+                                        executor::StepStatus::Failure => StepStatus::Failure,
+                                        executor::StepStatus::Skipped => StepStatus::Skipped,
+                                    },
+                                    output: step_result.output.clone(),
+                                }
+                            }).collect(),
+                            logs: vec![job_result.logs.clone()],
+                        }
+                    }).collect();
+                },
+                Err(e) => {
+                    let timestamp = Local::now().format("%H:%M:%S").to_string();
+                    execution_details.logs.push(format!("[{}] Error: {}", timestamp, e));
+                    execution_details.progress = 1.0;
+                }
+            }
+        }
+        
+        match result {
+            Ok(_) => {
+                workflow.status = WorkflowStatus::Success;
+                let timestamp = Local::now().format("%H:%M:%S").to_string();
+                self.logs.push(format!("[{}] Workflow '{}' completed successfully!", timestamp, workflow.name));
+                logging::info(&format!("[{}] Workflow '{}' completed successfully!", timestamp, workflow.name));
+            }
+            Err(e) => {
+                workflow.status = WorkflowStatus::Failed;
+                let timestamp = Local::now().format("%H:%M:%S").to_string();
+                self.logs.push(format!("[{}] Workflow '{}' failed: {}", timestamp, workflow.name, e));
+                logging::error(&format!("[{}] Workflow '{}' failed: {}", timestamp, workflow.name, e));
+            }
+        }
+        
+        // Only clear current_execution if it matches the processed workflow
+        if let Some(current_idx) = self.current_execution {
+            if current_idx == workflow_idx {
+                self.current_execution = None;
+            }
+        }
     }
 
     // Get next workflow for execution
@@ -483,6 +502,23 @@ impl App {
     // Toggle detailed view mode
     fn toggle_detailed_view(&mut self) {
         self.detailed_view = !self.detailed_view;
+        
+        // When entering detailed view, make sure step selection is initialized
+        if self.detailed_view {
+            // Ensure the step_table_state matches the step_list_state
+            if let Some(step_idx) = self.step_list_state.selected() {
+                self.step_table_state.select(Some(step_idx));
+            } else {
+                // Initialize both to the first item if nothing is selected
+                self.step_list_state.select(Some(0));
+                self.step_table_state.select(Some(0));
+            }
+            
+            // Also ensure job_list_state has a selection
+            if self.job_list_state.selected().is_none() {
+                self.job_list_state.select(Some(0));
+            }
+        }
     }
 
     // Scroll logs up
@@ -511,14 +547,160 @@ impl App {
         }
     }
 
+    // Set a temporary status message to be displayed in the UI
+    fn set_status_message(&mut self, message: String) {
+        self.status_message = Some(message);
+        self.status_message_time = Some(Instant::now());
+    }
+
     // Check if tick should happen
     fn tick(&mut self) -> bool {
         let now = Instant::now();
+        
+        // Check if we should clear a status message (after 3 seconds)
+        if let Some(message_time) = self.status_message_time {
+            if now.duration_since(message_time).as_secs() >= 3 {
+                self.status_message = None;
+                self.status_message_time = None;
+            }
+        }
+        
         if now.duration_since(self.last_tick) >= self.tick_rate {
             self.last_tick = now;
             true
         } else {
             false
+        }
+    }
+
+    // Trigger the selected workflow
+    fn trigger_selected_workflow(&mut self) {
+        if let Some(selected_idx) = self.workflow_list_state.selected() {
+            if selected_idx < self.workflows.len() {
+                let workflow = &self.workflows[selected_idx];
+                
+                if workflow.name.is_empty() {
+                    let timestamp = Local::now().format("%H:%M:%S").to_string();
+                    self.logs.push(format!("[{}] Error: Invalid workflow selection", timestamp));
+                    logging::error("Invalid workflow selection in trigger_selected_workflow");
+                    return;
+                }
+                
+                // Set up background task to execute the workflow via GitHub Actions REST API
+                let timestamp = Local::now().format("%H:%M:%S").to_string();
+                self.logs.push(format!("[{}] Triggering workflow: {}", timestamp, workflow.name));
+                logging::info(&format!("Triggering workflow: {}", workflow.name));
+                
+                // Clone necessary values for the async task
+                let workflow_name = workflow.name.clone();
+                let tx_clone = self.tx.clone();
+                
+                // Set this tab as the current execution to ensure it shows in the Execution tab
+                self.current_execution = Some(selected_idx);
+                
+                // Switch to execution tab for better user feedback
+                self.selected_tab = 1; // Switch to Execution tab manually to avoid the borrowing issue
+                
+                // Create a thread instead of using tokio runtime directly since send() is not async
+                std::thread::spawn(move || {
+                    // Create a runtime for the thread
+                    let rt = tokio::runtime::Runtime::new().unwrap();
+                    
+                    // Execute the GitHub Actions trigger API call
+                    let result = rt.block_on(async {
+                        execute_curl_trigger(&workflow_name, None).await
+                    });
+                    
+                    // Send the result back to the main thread
+                    if let Err(e) = tx_clone.send((selected_idx, result)) {
+                        eprintln!("Error sending trigger result: {}", e);
+                    }
+                });
+            } else {
+                let timestamp = Local::now().format("%H:%M:%S").to_string();
+                self.logs.push(format!("[{}] No workflow selected to trigger", timestamp));
+                logging::warning("No workflow selected to trigger");
+            }
+        } else {
+            self.logs.push("No workflow selected to trigger".to_string());
+            logging::warning("No workflow selected to trigger");
+        }
+    }
+
+    // Reset a workflow's status to NotStarted
+    fn reset_workflow_status(&mut self) {
+        // Log whether a selection exists
+        if self.workflow_list_state.selected().is_none() {
+            let timestamp = Local::now().format("%H:%M:%S").to_string();
+            self.logs.push(format!("[{}] Debug: No workflow selected for reset", timestamp));
+            logging::warning("No workflow selected for reset");
+            return;
+        }
+
+        if let Some(idx) = self.workflow_list_state.selected() {
+            if idx < self.workflows.len() {
+                let workflow = &mut self.workflows[idx];
+                // Log before status
+                let timestamp = Local::now().format("%H:%M:%S").to_string();
+                self.logs.push(format!(
+                    "[{}] Debug: Attempting to reset workflow '{}' from {:?} state",
+                    timestamp,
+                    workflow.name,
+                    workflow.status
+                ));
+                
+                // Debug: Reset unconditionally for testing
+                // if workflow.status != WorkflowStatus::Running {
+                let old_status = match workflow.status {
+                    WorkflowStatus::Success => "Success",
+                    WorkflowStatus::Failed => "Failed",
+                    WorkflowStatus::Skipped => "Skipped",
+                    WorkflowStatus::NotStarted => "NotStarted",
+                    WorkflowStatus::Running => "Running",
+                };
+                
+                // Store workflow name for the success message
+                let workflow_name = workflow.name.clone();
+                
+                // Reset regardless of current status (for debugging)
+                workflow.status = WorkflowStatus::NotStarted;
+                // Clear execution details to reset all state
+                workflow.execution_details = None;
+                
+                let timestamp = Local::now().format("%H:%M:%S").to_string();
+                self.logs.push(format!(
+                    "[{}] Reset workflow '{}' from {} state to NotStarted - status is now {:?}",
+                    timestamp,
+                    workflow.name,
+                    old_status,
+                    workflow.status
+                ));
+                logging::info(&format!(
+                    "Reset workflow '{}' from {} state to NotStarted - status is now {:?}",
+                    workflow.name,
+                    old_status,
+                    workflow.status
+                ));
+                
+                // Set a success status message
+                self.set_status_message(format!(
+                    "✅ Workflow '{}' has been reset and is ready to be triggered again",
+                    workflow_name
+                ));
+                
+                // } else {
+                //     let timestamp = Local::now().format("%H:%M:%S").to_string();
+                //     self.logs.push(format!(
+                //         "[{}] Cannot reset workflow '{}' while it is running",
+                //         timestamp,
+                //         workflow.name
+                //     ));
+                //     logging::warning(&format!(
+                //         "Cannot reset workflow '{}' while it is running",
+                //         workflow.name
+                //     ));
+                // }
+            }
         }
     }
 }
@@ -557,425 +739,6 @@ fn load_workflows(dir_path: &Path) -> Vec<Workflow> {
     // Sort workflows by name
     workflows.sort_by(|a, b| a.name.cmp(&b.name));
     workflows
-}
-
-// Main UI function to run the TUI application
-pub fn run_tui(
-    workflow_path: Option<&PathBuf>,
-    runtime_type: &RuntimeType,
-    verbose: bool,
-) -> io::Result<()> {
-    // Terminal setup
-    enable_raw_mode()?;
-    let mut stdout = stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
-
-    // Set up channel for async communication
-    let (tx, rx) = mpsc::channel();
-
-    // Initialize app state
-    let mut app = App::new(runtime_type.clone());
-
-    if app.validation_mode {
-        app.logs.push("Starting in validation mode".to_string());
-        logging::info("Starting in validation mode");
-    }
-
-    // Load workflows
-    let dir_path = match workflow_path {
-        Some(path) if path.is_dir() => path.clone(),
-        Some(path) if path.is_file() => {
-            // Single workflow file
-            let name = path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into_owned();
-
-            app.workflows = vec![Workflow {
-                name: name.clone(),
-                path: path.clone(),
-                selected: true,
-                status: WorkflowStatus::NotStarted,
-                execution_details: None,
-            }];
-
-            // Queue the single workflow for execution
-            app.execution_queue = vec![0];
-            app.start_execution();
-
-            // Return parent dir or current dir if no parent
-            path.parent()
-                .map(|p| p.to_path_buf())
-                .unwrap_or_else(|| PathBuf::from("."))
-        }
-        _ => PathBuf::from(".github/workflows"),
-    };
-
-    // Only load directory if we haven't already loaded a single file
-    if app.workflows.is_empty() {
-        app.workflows = load_workflows(&dir_path);
-    }
-
-    // Main event loop
-    let result = loop {
-        // Update UI on tick
-        if app.tick() {
-            app.update_running_workflow_progress();
-        }
-
-        // Draw UI
-        terminal.draw(|f| {
-            render_ui(f, &mut app);
-        })?;
-
-        // Handle incoming execution results
-        if let Ok((workflow_idx, result)) = rx.try_recv() {
-            app.process_execution_result(workflow_idx, result);
-            app.current_execution = None;
-
-            // Get next workflow to execute
-            if let Some(next_idx) = app.get_next_workflow_to_execute() {
-                let tx_clone = tx.clone();
-                let workflow_path = app.workflows[next_idx].path.clone();
-                let runtime_type = app.runtime_type.clone();
-
-                thread::spawn(move || {
-                    let runtime = tokio::runtime::Runtime::new().unwrap();
-                    let result = runtime.block_on(async {
-                        if app.validation_mode {
-                            // Perform validation instead of execution
-                            match evaluate_workflow_file(&workflow_path, verbose) {
-                                Ok(validation_result) => {
-                                    // Create execution result based on validation
-                                    let status = if validation_result.is_valid {
-                                        JobStatus::Success
-                                    } else {
-                                        JobStatus::Failure
-                                    };
-
-                                    let steps = vec![executor::StepResult {
-                                        name: "Validation".to_string(),
-                                        status: if validation_result.is_valid {
-                                            StepStatus::Success
-                                        } else {
-                                            StepStatus::Failure
-                                        },
-                                        output: if validation_result.is_valid {
-                                            "Workflow is valid".to_string()
-                                        } else {
-                                            format!(
-                                                "Validation issues:\n{}",
-                                                validation_result.issues.join("\n")
-                                            )
-                                        },
-                                    }];
-
-                                    ExecutionResult {
-                                        jobs: vec![executor::JobResult {
-                                            name: "Validation".to_string(),
-                                            status,
-                                            steps,
-                                            logs: if validation_result.is_valid {
-                                                "Workflow validation succeeded".to_string()
-                                            } else {
-                                                format!(
-                                                    "Workflow validation failed:\n{}",
-                                                    validation_result.issues.join("\n")
-                                                )
-                                            },
-                                        }],
-                                    }
-                                }
-                                Err(e) => {
-                                    // Error during validation
-                                    let failed_job = executor::JobResult {
-                                        name: "Validation Error".to_string(),
-                                        status: JobStatus::Failure,
-                                        steps: vec![executor::StepResult {
-                                            name: "Validation Error".to_string(),
-                                            status: StepStatus::Failure,
-                                            output: format!("Error: {}", e),
-                                        }],
-                                        logs: format!("Error validating workflow: {}", e),
-                                    };
-
-                                    ExecutionResult {
-                                        jobs: vec![failed_job],
-                                    }
-                                }
-                            }
-                        } else {
-                            match executor::execute_workflow(&workflow_path, runtime_type, verbose)
-                                .await
-                            {
-                                Ok(result) => result,
-                                Err(e) => {
-                                    // Create a failed execution result with error message
-                                    let failed_job = executor::JobResult {
-                                        name: "Error".to_string(),
-                                        status: JobStatus::Failure,
-                                        steps: vec![executor::StepResult {
-                                            name: "Execution Error".to_string(),
-                                            status: StepStatus::Failure,
-                                            output: format!("Error: {}", e),
-                                        }],
-                                        logs: format!("Error executing workflow: {}", e),
-                                    };
-
-                                    ExecutionResult {
-                                        jobs: vec![failed_job],
-                                    }
-                                }
-                            }
-                        }
-                    });
-
-                    tx_clone.send((next_idx, result)).unwrap();
-                });
-            } else {
-                app.running = false;
-                app.logs
-                    .push("All workflows completed execution".to_string());
-                logging::info("All workflows completed execution");
-            }
-        }
-
-        // Start execution if we have a queued workflow and nothing is currently running
-        if app.running && app.current_execution.is_none() && !app.execution_queue.is_empty() {
-            if let Some(next_idx) = app.get_next_workflow_to_execute() {
-                let tx_clone = tx.clone();
-                let workflow_path = app.workflows[next_idx].path.clone();
-                let runtime_type = app.runtime_type.clone();
-
-                thread::spawn(move || {
-                    let runtime = tokio::runtime::Runtime::new().unwrap();
-                    let result = runtime.block_on(async {
-                        if app.validation_mode {
-                            // Perform validation instead of execution
-                            match evaluate_workflow_file(&workflow_path, verbose) {
-                                Ok(validation_result) => {
-                                    // Create execution result based on validation
-                                    let status = if validation_result.is_valid {
-                                        JobStatus::Success
-                                    } else {
-                                        JobStatus::Failure
-                                    };
-
-                                    let steps = vec![executor::StepResult {
-                                        name: "Validation".to_string(),
-                                        status: if validation_result.is_valid {
-                                            StepStatus::Success
-                                        } else {
-                                            StepStatus::Failure
-                                        },
-                                        output: if validation_result.is_valid {
-                                            "Workflow is valid".to_string()
-                                        } else {
-                                            format!(
-                                                "Validation issues:\n{}",
-                                                validation_result.issues.join("\n")
-                                            )
-                                        },
-                                    }];
-
-                                    ExecutionResult {
-                                        jobs: vec![executor::JobResult {
-                                            name: "Validation".to_string(),
-                                            status,
-                                            steps,
-                                            logs: if validation_result.is_valid {
-                                                "Workflow validation succeeded".to_string()
-                                            } else {
-                                                format!(
-                                                    "Workflow validation failed:\n{}",
-                                                    validation_result.issues.join("\n")
-                                                )
-                                            },
-                                        }],
-                                    }
-                                }
-                                Err(e) => {
-                                    // Error during validation
-                                    let failed_job = executor::JobResult {
-                                        name: "Validation Error".to_string(),
-                                        status: JobStatus::Failure,
-                                        steps: vec![executor::StepResult {
-                                            name: "Validation Error".to_string(),
-                                            status: StepStatus::Failure,
-                                            output: format!("Error: {}", e),
-                                        }],
-                                        logs: format!("Error validating workflow: {}", e),
-                                    };
-
-                                    ExecutionResult {
-                                        jobs: vec![failed_job],
-                                    }
-                                }
-                            }
-                        } else {
-                            match executor::execute_workflow(&workflow_path, runtime_type, verbose)
-                                .await
-                            {
-                                Ok(result) => result,
-                                Err(e) => {
-                                    // Create a failed execution result with error message
-                                    let failed_job = executor::JobResult {
-                                        name: "Error".to_string(),
-                                        status: JobStatus::Failure,
-                                        steps: vec![executor::StepResult {
-                                            name: "Execution Error".to_string(),
-                                            status: StepStatus::Failure,
-                                            output: format!("Error: {}", e),
-                                        }],
-                                        logs: format!("Error executing workflow: {}", e),
-                                    };
-
-                                    ExecutionResult {
-                                        jobs: vec![failed_job],
-                                    }
-                                }
-                            }
-                        }
-                    });
-
-                    tx_clone.send((next_idx, result)).unwrap();
-                });
-            }
-        }
-
-        // Handle key events
-        if event::poll(Duration::from_millis(100))? {
-            if let Event::Key(key) = event::read()? {
-                match key.code {
-                    KeyCode::Char('q') => {
-                        // Exit and clean up
-                        break Ok(());
-                    }
-                    KeyCode::Esc => {
-                        if app.detailed_view {
-                            app.detailed_view = false;
-                        } else if app.show_help {
-                            app.show_help = false;
-                        } else {
-                            // Exit and clean up
-                            break Ok(());
-                        }
-                    }
-                    KeyCode::Tab => {
-                        // Cycle through tabs
-                        app.switch_tab((app.selected_tab + 1) % 4);
-                    }
-                    KeyCode::BackTab => {
-                        // Cycle through tabs backwards
-                        app.switch_tab((app.selected_tab + 3) % 4);
-                    }
-                    KeyCode::Char('1') | KeyCode::Char('w') => app.switch_tab(0),
-                    KeyCode::Char('2') | KeyCode::Char('x') => app.switch_tab(1),
-                    KeyCode::Char('3') | KeyCode::Char('l') => app.switch_tab(2),
-                    KeyCode::Char('4') | KeyCode::Char('h') => app.switch_tab(3),
-                    KeyCode::Up | KeyCode::Char('k') => match app.selected_tab {
-                        0 => app.previous_workflow(),
-                        1 => {
-                            if app.detailed_view {
-                                app.previous_step();
-                            } else {
-                                app.previous_job();
-                            }
-                        }
-                        2 => app.scroll_logs_up(),
-                        _ => {}
-                    },
-                    KeyCode::Down | KeyCode::Char('j') => match app.selected_tab {
-                        0 => app.next_workflow(),
-                        1 => {
-                            if app.detailed_view {
-                                app.next_step();
-                            } else {
-                                app.next_job();
-                            }
-                        }
-                        2 => app.scroll_logs_down(),
-                        _ => {}
-                    },
-                    KeyCode::Char(' ') => {
-                        if app.selected_tab == 0 && !app.running {
-                            app.toggle_selected();
-                        }
-                    }
-                    KeyCode::Enter => {
-                        match app.selected_tab {
-                            0 => {
-                                // In workflows tab, Enter runs the selected workflow
-                                if !app.running {
-                                    if let Some(idx) = app.workflow_list_state.selected() {
-                                        app.workflows[idx].selected = true;
-                                        app.queue_selected_for_execution();
-                                        app.start_execution();
-                                    }
-                                }
-                            }
-                            1 => {
-                                // In execution tab, Enter shows job details
-                                app.toggle_detailed_view();
-                            }
-                            _ => {}
-                        }
-                    }
-                    KeyCode::Char('r') => {
-                        if !app.running {
-                            app.queue_selected_for_execution();
-                            app.start_execution();
-                        }
-                    }
-                    KeyCode::Char('a') => {
-                        if !app.running {
-                            // Select all workflows
-                            for workflow in &mut app.workflows {
-                                workflow.selected = true;
-                            }
-                        }
-                    }
-                    KeyCode::Char('e') => {
-                        if !app.running {
-                            app.toggle_emulation_mode();
-                        }
-                    }
-                    KeyCode::Char('v') => {
-                        if !app.running {
-                            app.toggle_validation_mode();
-                        }
-                    }
-                    KeyCode::Char('n') => {
-                        if !app.running {
-                            // Deselect all workflows
-                            for workflow in &mut app.workflows {
-                                workflow.selected = false;
-                            }
-                        }
-                    }
-                    KeyCode::Char('?') => {
-                        // Toggle help overlay
-                        app.show_help = !app.show_help;
-                    }
-                    _ => {}
-                }
-            }
-        }
-    };
-
-    // Clean up terminal
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )?;
-    terminal.show_cursor()?;
-
-    result
 }
 
 // Main render function for the UI
@@ -1083,53 +846,112 @@ fn render_title_bar(f: &mut Frame<CrosstermBackend<io::Stdout>>, app: &App, area
 
 // Render the workflow list tab
 fn render_workflows_tab(f: &mut Frame<CrosstermBackend<io::Stdout>>, app: &mut App, area: Rect) {
-    let items: Vec<ListItem> = app
-        .workflows
+    // Create a more structured layout for the workflow tab
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3), // Header with instructions
+            Constraint::Min(5),    // Workflow list
+        ].as_ref())
+        .margin(1)
+        .split(area);
+    
+    // Render header with instructions
+    let header_text = vec![
+        Line::from(vec![
+            Span::styled(
+                "Available Workflows",
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Space", Style::default().fg(Color::Cyan)),
+            Span::raw(": Toggle selection   "),
+            Span::styled("Enter", Style::default().fg(Color::Cyan)),
+            Span::raw(": Run   "),
+            Span::styled("t", Style::default().fg(Color::Cyan)),
+            Span::raw(": Trigger remotely"),
+        ]),
+    ];
+
+    let header = Paragraph::new(header_text)
+        .block(Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded))
+        .alignment(Alignment::Center);
+    
+    f.render_widget(header, chunks[0]);
+    
+    // Create a table for workflows instead of a list for better organization
+    let selected_style = Style::default()
+        .bg(Color::DarkGray)
+        .add_modifier(Modifier::BOLD);
+    
+    // Normal style definition removed as it was unused
+    
+    let header_cells = ["", "Status", "Workflow Name", "Path"]
         .iter()
-        .map(|w| {
-            let checked = if w.selected { "✓ " } else { "  " };
-            let status_indicator = match w.status {
-                WorkflowStatus::NotStarted => "  ",
-                WorkflowStatus::Running => "⟳ ",
-                WorkflowStatus::Success => "✅ ",
-                WorkflowStatus::Failed => "❌ ",
-                WorkflowStatus::Skipped => "⏭  ",
-            };
+        .map(|h| Cell::from(*h).style(Style::default().fg(Color::Yellow)));
+    
+    let header = Row::new(header_cells)
+        .style(Style::default().add_modifier(Modifier::BOLD))
+        .height(1);
+    
+    let rows = app.workflows.iter().map(|workflow| {
+        // Create cells for each column
+        let checkbox = if workflow.selected { "✓" } else { " " };
+        
+        let (status_symbol, status_style) = match workflow.status {
+            WorkflowStatus::NotStarted => ("○", Style::default().fg(Color::Gray)),
+            WorkflowStatus::Running => ("⟳", Style::default().fg(Color::Cyan)),
+            WorkflowStatus::Success => ("✅", Style::default().fg(Color::Green)),
+            WorkflowStatus::Failed => ("❌", Style::default().fg(Color::Red)),
+            WorkflowStatus::Skipped => ("⏭", Style::default().fg(Color::Yellow)),
+        };
+        
+        let path_display = workflow.path.to_string_lossy();
+        let path_shortened = if path_display.len() > 30 {
+            format!("...{}", &path_display[path_display.len() - 30..])
+        } else {
+            path_display.to_string()
+        };
 
-            let status_style = match w.status {
-                WorkflowStatus::NotStarted => Style::default(),
-                WorkflowStatus::Running => Style::default().fg(Color::Cyan),
-                WorkflowStatus::Success => Style::default().fg(Color::Green),
-                WorkflowStatus::Failed => Style::default().fg(Color::Red),
-                WorkflowStatus::Skipped => Style::default().fg(Color::Gray),
-            };
-
-            ListItem::new(Line::from(vec![
-                Span::styled(checked, Style::default().fg(Color::Green)),
-                Span::styled(status_indicator, status_style),
-                Span::raw(&w.name),
-            ]))
-        })
-        .collect();
-
-    let workflows_list = List::new(items)
+        Row::new(vec![
+            Cell::from(checkbox).style(Style::default().fg(Color::Green)),
+            Cell::from(status_symbol).style(status_style),
+            Cell::from(workflow.name.clone()),
+            Cell::from(path_shortened).style(Style::default().fg(Color::DarkGray)),
+        ])
+    });
+    
+    let workflows_table = Table::new(rows)
+        .header(header)
         .block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
                 .title(Span::styled(
-                    " Available Workflows ",
+                    " Workflows ",
                     Style::default().fg(Color::Yellow),
-                )),
+                ))
         )
-        .highlight_style(
-            Style::default()
-                .bg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
-        )
-        .highlight_symbol("» ");
-
-    f.render_stateful_widget(workflows_list, area, &mut app.workflow_list_state);
+        .highlight_style(selected_style)
+        .highlight_symbol("» ")
+        .widths(&[
+            Constraint::Length(3),  // Checkbox column
+            Constraint::Length(4),  // Status icon column
+            Constraint::Percentage(45), // Name column
+            Constraint::Percentage(45), // Path column
+        ]);
+    
+    // We need to convert ListState to TableState
+    let mut table_state = TableState::default();
+    table_state.select(app.workflow_list_state.selected());
+    
+    f.render_stateful_widget(workflows_table, chunks[1], &mut table_state);
+    
+    // Update the app list state to match the table state
+    app.workflow_list_state.select(table_state.selected());
 }
 
 fn render_execution_tab(f: &mut Frame<CrosstermBackend<io::Stdout>>, app: &mut App, area: Rect) {
@@ -1137,6 +959,8 @@ fn render_execution_tab(f: &mut Frame<CrosstermBackend<io::Stdout>>, app: &mut A
         render_job_detail_view(f, app, area);
         return;
     }
+    
+    // Get the workflow index either from current_execution or selected workflow
     let current_workflow_idx = app
         .current_execution
         .or_else(|| app.workflow_list_state.selected())
@@ -1151,8 +975,8 @@ fn render_execution_tab(f: &mut Frame<CrosstermBackend<io::Stdout>>, app: &mut A
             .constraints(
                 [
                     Constraint::Length(5), // Workflow info with progress bar
-                    Constraint::Min(5),    // Jobs list
-                    Constraint::Length(6), // Execution info
+                    Constraint::Min(5),    // Jobs list or Remote execution info
+                    Constraint::Length(7), // Execution info
                 ]
                 .as_ref(),
             )
@@ -1192,7 +1016,7 @@ fn render_execution_tab(f: &mut Frame<CrosstermBackend<io::Stdout>>, app: &mut A
             ]),
         ];
 
-        // Add progress bar for running workflows
+        // Add progress bar for running workflows or workflows with execution details
         if let Some(execution) = &workflow.execution_details {
             // Calculate progress
             let progress = execution.progress;
@@ -1246,172 +1070,287 @@ fn render_execution_tab(f: &mut Frame<CrosstermBackend<io::Stdout>>, app: &mut A
 
             f.render_widget(workflow_info_widget, chunks[0]);
             f.render_widget(gauge, gauge_area);
-        } else {
-            // No execution details
-            let workflow_info_widget = Paragraph::new(workflow_info).block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
-                    .title(Span::styled(
-                        " Workflow Information ",
-                        Style::default().fg(Color::Yellow),
-                    )),
-            );
-            f.render_widget(workflow_info_widget, chunks[0]);
-        }
-
-        // Jobs list section
-        if let Some(execution) = &workflow.execution_details {
-            if execution.jobs.is_empty() {
-                let placeholder = Paragraph::new("No jobs have started execution yet...")
+            
+            // Jobs list section - show appropriate information based on operation type
+            let is_remote_trigger = execution.logs.iter().any(|log| log.contains("Triggering workflow remotely"));
+            
+            if is_remote_trigger {
+                // Handle remotely triggered workflows differently
+                let (message, url_opt) = if workflow.status == WorkflowStatus::Success {
+                    // Try to extract the URL from execution logs
+                    let url = execution.logs.iter()
+                        .filter_map(|log| {
+                            if log.contains("https://github.com") {
+                                log.lines()
+                                    .find(|line| line.contains("https://github.com"))
+                                    .map(|line| {
+                                        // Extract URL with regex
+                                        let re = regex::Regex::new(r"https://github\.com/[^/]+/[^/]+/actions[^\s]+").unwrap();
+                                        re.find(line).map_or_else(|| line.trim(), |m| m.as_str())
+                                    })
+                            } else {
+                                None
+                            }
+                        })
+                        .next();
+                    
+                    (
+                        "Workflow triggered successfully on GitHub.\nCheck the Actions tab on GitHub to view progress.",
+                        url
+                    )
+                } else if workflow.status == WorkflowStatus::Failed {
+                    // Extract error message from logs
+                    let error_msg = execution.logs.iter()
+                        .filter(|log| log.contains("Error:") || log.contains("Failed"))
+                        .next()
+                        .map_or("Failed to trigger workflow on GitHub.", |s| s.as_str());
+                    
+                    (error_msg, None)
+                } else {
+                    ("Triggering workflow on GitHub...", None)
+                };
+                
+                // Create a more structured remote execution display
+                let mut remote_trigger_info = vec![
+                    Line::from(vec![
+                        Span::styled(
+                            "GitHub Actions Remote Trigger",
+                            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                        ),
+                    ]),
+                    Line::from(""),
+                    Line::from(message),
+                    Line::from(""),
+                ];
+                
+                // Add URL if available
+                if let Some(url) = url_opt {
+                    remote_trigger_info.push(Line::from(vec![
+                        Span::styled("View on GitHub: ", Style::default().fg(Color::Blue)),
+                        Span::styled(url, Style::default().fg(Color::Cyan).add_modifier(Modifier::UNDERLINED)),
+                    ]));
+                }
+                
+                let remote_display = Paragraph::new(remote_trigger_info)
                     .block(
                         Block::default()
                             .borders(Borders::ALL)
                             .border_type(BorderType::Rounded)
-                            .title(Span::styled(" Jobs ", Style::default().fg(Color::Yellow))),
+                            .title(Span::styled(" Remote Execution ", Style::default().fg(Color::Yellow))),
                     )
-                    .alignment(Alignment::Center);
-                f.render_widget(placeholder, chunks[1]);
-            } else {
-                let job_items: Vec<ListItem> = execution
-                    .jobs
-                    .iter()
-                    .map(|job| {
-                        let status_symbol = match job.status {
-                            JobStatus::Success => "✅",
-                            JobStatus::Failure => "❌",
-                            JobStatus::Skipped => "⏭",
-                        };
-
-                        let status_style = match job.status {
-                            JobStatus::Success => Style::default().fg(Color::Green),
-                            JobStatus::Failure => Style::default().fg(Color::Red),
-                            JobStatus::Skipped => Style::default().fg(Color::Gray),
-                        };
-
-                        // Count completed and total steps
-                        let total_steps = job.steps.len();
-                        let completed_steps = job
-                            .steps
-                            .iter()
-                            .filter(|s| {
-                                s.status == StepStatus::Success || s.status == StepStatus::Failure
-                            })
-                            .count();
-
-                        let steps_info = format!("[{}/{}]", completed_steps, total_steps);
-
-                        ListItem::new(Line::from(vec![
-                            Span::styled(status_symbol, status_style),
-                            Span::raw(" "),
-                            Span::styled(&job.name, Style::default().fg(Color::White)),
-                            Span::raw(" "),
-                            Span::styled(steps_info, Style::default().fg(Color::DarkGray)),
-                        ]))
-                    })
-                    .collect();
-
-                let jobs_list = List::new(job_items)
-                    .block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .border_type(BorderType::Rounded)
-                            .title(Span::styled(" Jobs ", Style::default().fg(Color::Yellow))),
-                    )
-                    .highlight_style(
-                        Style::default()
-                            .bg(Color::DarkGray)
-                            .add_modifier(Modifier::BOLD),
-                    )
-                    .highlight_symbol("» ");
-
-                f.render_stateful_widget(jobs_list, chunks[1], &mut app.job_list_state);
-            }
-
-            // Execution info section
-            let mut execution_info = Vec::new();
-
-            execution_info.push(Line::from(vec![
-                Span::styled("Started: ", Style::default().fg(Color::Blue)),
-                Span::styled(
-                    execution.start_time.format("%Y-%m-%d %H:%M:%S").to_string(),
-                    Style::default().fg(Color::White),
-                ),
-            ]));
-
-            if let Some(end_time) = execution.end_time {
+                    .alignment(Alignment::Left)
+                    .wrap(Wrap { trim: true });
+                
+                f.render_widget(remote_display, chunks[1]);
+                
+                // Show a simpler execution info for remote triggers
+                let mut execution_info = Vec::new();
+                
                 execution_info.push(Line::from(vec![
-                    Span::styled("Finished: ", Style::default().fg(Color::Blue)),
+                    Span::styled("Started: ", Style::default().fg(Color::Blue)),
                     Span::styled(
-                        end_time.format("%Y-%m-%d %H:%M:%S").to_string(),
+                        execution.start_time.format("%Y-%m-%d %H:%M:%S").to_string(),
                         Style::default().fg(Color::White),
                     ),
                 ]));
-
-                // Calculate duration
-                let duration = end_time.signed_duration_since(execution.start_time);
-                execution_info.push(Line::from(vec![
-                    Span::styled("Duration: ", Style::default().fg(Color::Blue)),
-                    Span::styled(
-                        format!(
-                            "{}m {}s",
-                            duration.num_minutes(),
-                            duration.num_seconds() % 60
+                
+                if let Some(end_time) = execution.end_time {
+                    execution_info.push(Line::from(vec![
+                        Span::styled("Finished: ", Style::default().fg(Color::Blue)),
+                        Span::styled(
+                            end_time.format("%Y-%m-%d %H:%M:%S").to_string(),
+                            Style::default().fg(Color::White),
                         ),
-                        Style::default().fg(Color::White),
-                    ),
-                ]));
-            } else {
-                // Show running time for active workflows
-                let current_time = Local::now();
-                let running_time = current_time.signed_duration_since(execution.start_time);
-                execution_info.push(Line::from(vec![
-                    Span::styled("Running for: ", Style::default().fg(Color::Blue)),
-                    Span::styled(
-                        format!(
-                            "{}m {}s",
-                            running_time.num_minutes(),
-                            running_time.num_seconds() % 60
+                    ]));
+                    
+                    // Calculate duration
+                    let duration = end_time.signed_duration_since(execution.start_time);
+                    execution_info.push(Line::from(vec![
+                        Span::styled("Duration: ", Style::default().fg(Color::Blue)),
+                        Span::styled(
+                            format!(
+                                "{}m {}s",
+                                duration.num_minutes(),
+                                duration.num_seconds() % 60
+                            ),
+                            Style::default().fg(Color::White),
                         ),
-                        Style::default().fg(Color::White),
+                    ]));
+                } else {
+                    // Show running time for active workflows
+                    let current_time = Local::now();
+                    let running_time = current_time.signed_duration_since(execution.start_time);
+                    execution_info.push(Line::from(vec![
+                        Span::styled("Running for: ", Style::default().fg(Color::Blue)),
+                        Span::styled(
+                            format!(
+                                "{}m {}s",
+                                running_time.num_minutes(),
+                                running_time.num_seconds() % 60
+                            ),
+                            Style::default().fg(Color::White),
+                        ),
+                    ]));
+                }
+                
+                // Add hint for viewing execution on GitHub
+                execution_info.push(Line::from(""));
+                execution_info.push(Line::from(vec![
+                    Span::styled("Status: ", Style::default().fg(Color::Blue)),
+                    Span::styled(
+                        match workflow.status {
+                            WorkflowStatus::Success => "✅ Workflow triggered successfully",
+                            WorkflowStatus::Failed => "❌ Failed to trigger workflow",
+                            WorkflowStatus::Running => "⟳ Triggering workflow...",
+                            _ => "Waiting...",
+                        },
+                        match workflow.status {
+                            WorkflowStatus::Success => Style::default().fg(Color::Green),
+                            WorkflowStatus::Failed => Style::default().fg(Color::Red),
+                            WorkflowStatus::Running => Style::default().fg(Color::Cyan),
+                            _ => Style::default().fg(Color::Gray),
+                        }
                     ),
                 ]));
-            }
-
-            // Add hint for Enter key to see details
-            execution_info.push(Line::from(""));
-            execution_info.push(Line::from(vec![
-                Span::styled("Press ", Style::default().fg(Color::DarkGray)),
-                Span::styled("Enter", Style::default().fg(Color::Yellow)),
-                Span::styled(" to view job details", Style::default().fg(Color::DarkGray)),
-            ]));
-
-            let info_widget = Paragraph::new(execution_info).block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
-                    .title(Span::styled(
-                        " Execution Information ",
-                        Style::default().fg(Color::Yellow),
-                    )),
-            );
-
-            f.render_widget(info_widget, chunks[2]);
-        } else {
-            // No execution details yet
-            let placeholder = Paragraph::new("Execution has not started yet...")
-                .block(
+                
+                let info_widget = Paragraph::new(execution_info).block(
                     Block::default()
                         .borders(Borders::ALL)
                         .border_type(BorderType::Rounded)
-                        .title(Span::styled(" Jobs ", Style::default().fg(Color::Yellow))),
-                )
-                .alignment(Alignment::Center);
+                        .title(Span::styled(
+                            " Trigger Information ",
+                            Style::default().fg(Color::Yellow),
+                        )),
+                );
+                
+                f.render_widget(info_widget, chunks[2]);
+            } else {
+                // Standard local execution display
+                if execution.jobs.is_empty() {
+                    let placeholder = Paragraph::new("No jobs have started execution yet...")
+                        .block(
+                            Block::default()
+                                .borders(Borders::ALL)
+                                .border_type(BorderType::Rounded)
+                                .title(Span::styled(" Jobs ", Style::default().fg(Color::Yellow))),
+                        )
+                        .alignment(Alignment::Center);
+                    f.render_widget(placeholder, chunks[1]);
+                } else {
+                    let job_items: Vec<ListItem> = execution
+                        .jobs
+                        .iter()
+                        .map(|job| {
+                            let status_symbol = match job.status {
+                                JobStatus::Success => "✅",
+                                JobStatus::Failure => "❌",
+                                JobStatus::Skipped => "⏭",
+                            };
 
-            f.render_widget(placeholder, chunks[1]);
+                            let status_style = match job.status {
+                                JobStatus::Success => Style::default().fg(Color::Green),
+                                JobStatus::Failure => Style::default().fg(Color::Red),
+                                JobStatus::Skipped => Style::default().fg(Color::Gray),
+                            };
 
-            let info_placeholder = Paragraph::new("Waiting for execution to start...")
-                .block(
+                            // Count completed and total steps
+                            let total_steps = job.steps.len();
+                            let completed_steps = job
+                                .steps
+                                .iter()
+                                .filter(|s| {
+                                    s.status == StepStatus::Success || s.status == StepStatus::Failure
+                                })
+                                .count();
+
+                            let steps_info = format!("[{}/{}]", completed_steps, total_steps);
+
+                            ListItem::new(Line::from(vec![
+                                Span::styled(status_symbol, status_style),
+                                Span::raw(" "),
+                                Span::styled(&job.name, Style::default().fg(Color::White)),
+                                Span::raw(" "),
+                                Span::styled(steps_info, Style::default().fg(Color::DarkGray)),
+                            ]))
+                        })
+                        .collect();
+
+                    let jobs_list = List::new(job_items)
+                        .block(
+                            Block::default()
+                                .borders(Borders::ALL)
+                                .border_type(BorderType::Rounded)
+                                .title(Span::styled(" Jobs ", Style::default().fg(Color::Yellow))),
+                        )
+                        .highlight_style(
+                            Style::default()
+                                .bg(Color::DarkGray)
+                                .add_modifier(Modifier::BOLD),
+                        )
+                        .highlight_symbol("» ");
+
+                    f.render_stateful_widget(jobs_list, chunks[1], &mut app.job_list_state);
+                }
+
+                // Execution info section
+                let mut execution_info = Vec::new();
+
+                execution_info.push(Line::from(vec![
+                    Span::styled("Started: ", Style::default().fg(Color::Blue)),
+                    Span::styled(
+                        execution.start_time.format("%Y-%m-%d %H:%M:%S").to_string(),
+                        Style::default().fg(Color::White),
+                    ),
+                ]));
+
+                if let Some(end_time) = execution.end_time {
+                    execution_info.push(Line::from(vec![
+                        Span::styled("Finished: ", Style::default().fg(Color::Blue)),
+                        Span::styled(
+                            end_time.format("%Y-%m-%d %H:%M:%S").to_string(),
+                            Style::default().fg(Color::White),
+                        ),
+                    ]));
+
+                    // Calculate duration
+                    let duration = end_time.signed_duration_since(execution.start_time);
+                    execution_info.push(Line::from(vec![
+                        Span::styled("Duration: ", Style::default().fg(Color::Blue)),
+                        Span::styled(
+                            format!(
+                                "{}m {}s",
+                                duration.num_minutes(),
+                                duration.num_seconds() % 60
+                            ),
+                            Style::default().fg(Color::White),
+                        ),
+                    ]));
+                } else {
+                    // Show running time for active workflows
+                    let current_time = Local::now();
+                    let running_time = current_time.signed_duration_since(execution.start_time);
+                    execution_info.push(Line::from(vec![
+                        Span::styled("Running for: ", Style::default().fg(Color::Blue)),
+                        Span::styled(
+                            format!(
+                                "{}m {}s",
+                                running_time.num_minutes(),
+                                running_time.num_seconds() % 60
+                            ),
+                            Style::default().fg(Color::White),
+                        ),
+                    ]));
+                }
+
+                // Add hint for Enter key to see details
+                execution_info.push(Line::from(""));
+                execution_info.push(Line::from(vec![
+                    Span::styled("Press ", Style::default().fg(Color::DarkGray)),
+                    Span::styled("Enter", Style::default().fg(Color::Yellow)),
+                    Span::styled(" to view job details", Style::default().fg(Color::DarkGray)),
+                ]));
+
+                let info_widget = Paragraph::new(execution_info).block(
                     Block::default()
                         .borders(Borders::ALL)
                         .border_type(BorderType::Rounded)
@@ -1419,10 +1358,39 @@ fn render_execution_tab(f: &mut Frame<CrosstermBackend<io::Stdout>>, app: &mut A
                             " Execution Information ",
                             Style::default().fg(Color::Yellow),
                         )),
-                )
-                .alignment(Alignment::Center);
+                );
 
-            f.render_widget(info_placeholder, chunks[2]);
+                f.render_widget(info_widget, chunks[2]);
+            }
+        } else {
+            // No workflow execution to display
+            let placeholder = Paragraph::new(vec![
+                Line::from(""),
+                Line::from(vec![Span::styled(
+                    "No workflow execution data available.",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                )]),
+                Line::from(""),
+                Line::from("Select workflows in the Workflows tab and press 'r' to run them."),
+                Line::from(""),
+                Line::from("Or press Enter on a selected workflow to run it directly."),
+                Line::from(""),
+                Line::from("You can also press 't' to trigger a workflow on GitHub remotely."),
+            ])
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .title(Span::styled(
+                        " Execution ",
+                        Style::default().fg(Color::Yellow),
+                    )),
+            )
+            .alignment(Alignment::Center);
+
+            f.render_widget(placeholder, area);
         }
     } else {
         // No workflow execution to display
@@ -1438,6 +1406,8 @@ fn render_execution_tab(f: &mut Frame<CrosstermBackend<io::Stdout>>, app: &mut A
             Line::from("Select workflows in the Workflows tab and press 'r' to run them."),
             Line::from(""),
             Line::from("Or press Enter on a selected workflow to run it directly."),
+            Line::from(""),
+            Line::from("You can also press 't' to trigger a workflow on GitHub remotely."),
         ])
         .block(
             Block::default()
@@ -1489,6 +1459,10 @@ fn render_job_detail_view(f: &mut Frame<CrosstermBackend<io::Stdout>>, app: &mut
                 .selected()
                 .unwrap_or(0)
                 .min(execution.jobs.len() - 1);
+            
+            // Update the job_list_state in case we adjusted the selection
+            app.job_list_state.select(Some(job_idx));
+            
             let job = &execution.jobs[job_idx];
 
             // Split area for job details
@@ -1602,15 +1576,27 @@ fn render_job_detail_view(f: &mut Frame<CrosstermBackend<io::Stdout>>, app: &mut
                     Constraint::Length(10),     // Duration column
                 ]);
 
+            // Update step_list_state to match table state if needed
+            if let Some(table_selected) = app.step_table_state.selected() {
+                if app.step_list_state.selected() != Some(table_selected) {
+                    app.step_list_state.select(Some(table_selected));
+                }
+            }
+
             f.render_stateful_widget(steps_table, chunks[1], &mut app.step_table_state);
 
             // Step output - show output from the selected step
             let output_text = if !job.steps.is_empty() {
+                // Use the table_state for step selection to keep them in sync
                 let step_idx = app
-                    .step_list_state
+                    .step_table_state
                     .selected()
                     .unwrap_or(0)
                     .min(job.steps.len() - 1);
+
+                // Also update step_list_state to stay in sync
+                app.step_list_state.select(Some(step_idx));
+                
                 let step = &job.steps[step_idx];
 
                 let mut output = step.output.clone();
@@ -1675,72 +1661,154 @@ fn render_job_detail_view(f: &mut Frame<CrosstermBackend<io::Stdout>>, app: &mut
 
 // Render the logs tab
 fn render_logs_tab(f: &mut Frame<CrosstermBackend<io::Stdout>>, app: &App, area: Rect) {
+    // Split the area into header and log content
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3), // Header with instructions
+            Constraint::Min(3),    // Logs content
+        ].as_ref())
+        .margin(1)
+        .split(area);
+    
+    // Render header with instructions
+    let header_text = vec![
+        Line::from(vec![
+            Span::styled("Execution and System Logs", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        ]),
+        Line::from(vec![
+            Span::styled("↑/↓", Style::default().fg(Color::Cyan)),
+            Span::raw(" or "),
+            Span::styled("j/k", Style::default().fg(Color::Cyan)),
+            Span::raw(": Scroll logs   "),
+            Span::styled("Tab", Style::default().fg(Color::Cyan)),
+            Span::raw(": Switch tabs"),
+        ]),
+    ];
+
+    let header = Paragraph::new(header_text)
+        .block(Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded))
+        .alignment(Alignment::Center);
+    
+    f.render_widget(header, chunks[0]);
+    
     // Combine application logs with system logs
-    let mut all_logs = app.logs.clone();
-    all_logs.extend(crate::logging::get_logs());
-
-    // Create visible log lines, with timestamps and color coding
-    let log_items: Vec<ListItem> = all_logs
-        .iter()
-        .map(|log_line| {
-            // Try to parse log line to extract type (info, error, etc)
-            let style = if log_line.contains("Error")
-                || log_line.contains("error")
-                || log_line.contains("❌")
-            {
-                Style::default().fg(Color::Red)
-            } else if log_line.contains("Warning")
-                || log_line.contains("warning")
-                || log_line.contains("⚠️")
-            {
-                Style::default().fg(Color::Yellow)
-            } else if log_line.contains("Success")
-                || log_line.contains("success")
-                || log_line.contains("✅")
-            {
-                Style::default().fg(Color::Green)
-            } else if log_line.contains("Running")
-                || log_line.contains("running")
-                || log_line.contains("⟳")
-            {
-                Style::default().fg(Color::Cyan)
-            } else {
-                Style::default().fg(Color::Gray)
-            };
-
-            ListItem::new(Line::from(Span::styled(log_line, style)))
-        })
-        .collect();
-
-    // Create a block with a title showing scrolling info
-    let log_count = all_logs.len();
-    let scroll_info = if log_count > 0 {
-        format!(" Execution Logs ({}/{}) ", app.log_scroll + 1, log_count)
-    } else {
-        " Execution Logs ".to_string()
-    };
-
-    // Create a stateful list that supports scrolling
-    let mut log_list_state = ListState::default();
-    if !all_logs.is_empty() {
-        log_list_state.select(Some(app.log_scroll));
+    let mut all_logs = Vec::new();
+    
+    // Now all logs should have timestamps in the format [HH:MM:SS]
+    
+    // Process app logs
+    for log in &app.logs {
+        all_logs.push(log.clone());
     }
     
-    let logs_list = List::new(log_items)
+    // Process system logs
+    for log in crate::logging::get_logs() {
+        all_logs.push(log.clone());
+    }
+
+    // Sort logs by timestamp if needed
+    // all_logs.sort_by(|a, b| {
+    //     // Extract timestamps and compare
+    //     // For now we're keeping the order as they came in
+    // });
+
+    // Create a table for logs for better organization
+    let header_cells = ["Time", "Type", "Message"]
+        .iter()
+        .map(|h| Cell::from(*h).style(Style::default().fg(Color::Yellow)));
+    
+    let header = Row::new(header_cells)
+        .style(Style::default().add_modifier(Modifier::BOLD))
+        .height(1);
+    
+    let rows = all_logs.iter().map(|log_line| {
+        // Parse log line to extract timestamp, type and message
+        
+        // Extract timestamp from log format [HH:MM:SS]
+        let timestamp = if log_line.starts_with('[') && log_line.contains(']') {
+            let end = log_line.find(']').unwrap_or(0);
+            if end > 1 {
+                log_line[1..end].to_string()
+            } else {
+                "??:??:??".to_string() // Show placeholder for malformed logs
+            }
+        } else {
+            "??:??:??".to_string() // Show placeholder for malformed logs
+        };
+        
+        let (log_type, log_style, message) = if log_line.contains("Error")
+            || log_line.contains("error")
+            || log_line.contains("❌")
+        {
+            ("ERROR", Style::default().fg(Color::Red), log_line.as_str())
+        } else if log_line.contains("Warning")
+            || log_line.contains("warning")
+            || log_line.contains("⚠️")
+        {
+            ("WARN", Style::default().fg(Color::Yellow), log_line.as_str())
+        } else if log_line.contains("Success")
+            || log_line.contains("success")
+            || log_line.contains("✅")
+        {
+            ("SUCCESS", Style::default().fg(Color::Green), log_line.as_str())
+        } else if log_line.contains("Running")
+            || log_line.contains("running")
+            || log_line.contains("⟳")
+        {
+            ("INFO", Style::default().fg(Color::Cyan), log_line.as_str())
+        } else if log_line.contains("Triggering")
+        {
+            ("TRIG", Style::default().fg(Color::Magenta), log_line.as_str())
+        } else {
+            ("INFO", Style::default().fg(Color::Gray), log_line.as_str())
+        };
+        
+        // Extract content after timestamp
+        let content = if log_line.starts_with('[') && log_line.contains(']') {
+            let start = log_line.find(']').unwrap_or(0) + 1;
+            log_line[start..].trim()
+        } else {
+            log_line.as_str()
+        };
+        
+        Row::new(vec![
+            Cell::from(timestamp),
+            Cell::from(log_type).style(log_style),
+            Cell::from(content),
+        ])
+    });
+    
+    let log_table = Table::new(rows)
+        .header(header)
         .block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
                 .title(Span::styled(
-                    scroll_info,
+                    format!(" Logs ({}/{}) ", 
+                        if all_logs.is_empty() { 0 } else { app.log_scroll + 1 }, 
+                        all_logs.len()
+                    ),
                     Style::default().fg(Color::Yellow),
                 ))
-                .title_alignment(Alignment::Center),
         )
         .highlight_style(Style::default().bg(Color::DarkGray))
-        .start_corner(ratatui::layout::Corner::TopLeft); // Change to TopLeft to show in chronological order
+        .widths(&[
+            Constraint::Length(10),  // Timestamp column
+            Constraint::Length(6),   // Log type column
+            Constraint::Percentage(80), // Message column
+        ]);
     
-    f.render_stateful_widget(logs_list, area, &mut log_list_state);
+    // We need to convert log_scroll index to a TableState
+    let mut log_table_state = TableState::default();
+    if !all_logs.is_empty() {
+        log_table_state.select(Some(app.log_scroll.min(all_logs.len() - 1)));
+    }
+    
+    f.render_stateful_widget(log_table, chunks[1], &mut log_table_state);
 }
 
 // Render the help tab
@@ -1845,6 +1913,15 @@ fn render_help_tab(f: &mut Frame<CrosstermBackend<io::Stdout>>, area: Rect) {
         ]),
         Line::from(vec![
             Span::styled(
+                "Shift+R",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" - Reset workflow status to allow re-triggering"),
+        ]),
+        Line::from(vec![
+            Span::styled(
                 "Esc",
                 Style::default()
                     .fg(Color::Yellow)
@@ -1869,6 +1946,15 @@ fn render_help_tab(f: &mut Frame<CrosstermBackend<io::Stdout>>, area: Rect) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw(" - Quit application"),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "t",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" - Trigger selected workflow"),
         ]),
         Line::from(""),
         Line::from(Span::styled(
@@ -1963,6 +2049,27 @@ fn render_help_overlay(f: &mut Frame<CrosstermBackend<io::Stdout>>) {
 
 // Render the status bar
 fn render_status_bar(f: &mut Frame<CrosstermBackend<io::Stdout>>, app: &App, area: Rect) {
+    // If we have a status message, show it instead of the normal status bar
+    if let Some(message) = &app.status_message {
+        // Determine if this is a success message (starts with ✅)
+        let is_success = message.starts_with("✅");
+        
+        let status_message = Paragraph::new(Line::from(vec![
+            Span::styled(
+                format!(" {} ", message),
+                Style::default()
+                    .bg(if is_success { Color::Green } else { Color::Red })
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD)
+            ),
+        ]))
+        .alignment(Alignment::Center);
+        
+        f.render_widget(status_message, area);
+        return;
+    }
+    
+    // Normal status bar
     let mut status_items = vec![];
 
     // Add mode info
@@ -1992,14 +2099,31 @@ fn render_status_bar(f: &mut Frame<CrosstermBackend<io::Stdout>>, app: &App, are
     // Add context-specific help based on current tab
     status_items.push(Span::raw(" "));
     let help_text = match app.selected_tab {
-        0 => "[Space] Toggle selection   [Enter] Run selected   [r] Run all selected",
+        0 => {
+            if let Some(idx) = app.workflow_list_state.selected() {
+                if idx < app.workflows.len() {
+                    let workflow = &app.workflows[idx];
+                    match workflow.status {
+                        WorkflowStatus::NotStarted => "[Space] Toggle selection   [Enter] Run selected   [r] Run all selected   [Shift+R] Reset workflow",
+                        WorkflowStatus::Running => "[Space] Toggle selection   [Enter] Run selected   [r] Run all selected   (Workflow running...)",
+                        WorkflowStatus::Success | WorkflowStatus::Failed | WorkflowStatus::Skipped => 
+                            "[Space] Toggle selection   [Enter] Run selected   [r] Run all selected   [Shift+R] Reset workflow",
+                        _ => "[Space] Toggle selection   [Enter] Run selected   [r] Run all selected",
+                    }
+                } else {
+                    "[Space] Toggle selection   [Enter] Run selected   [r] Run all selected"
+                }
+            } else {
+                "[Space] Toggle selection   [Enter] Run selected   [r] Run all selected"
+            }
+        },
         1 => {
             if app.detailed_view {
                 "[Esc] Back to jobs   [↑/↓] Navigate steps"
             } else {
                 "[Enter] View details   [↑/↓] Navigate jobs"
             }
-        }
+        },
         2 => {
             // For logs tab, show scrolling instructions
             let log_count = app.logs.len() + crate::logging::get_logs().len();
@@ -2010,7 +2134,7 @@ fn render_status_bar(f: &mut Frame<CrosstermBackend<io::Stdout>>, app: &App, are
             } else {
                 "[No logs to display]"
             }
-        }
+        },
         3 => "[?] Toggle help overlay",
         _ => "",
     };
@@ -2218,7 +2342,84 @@ pub async fn run_wrkflw_tui(
     runtime_type: RuntimeType,
     verbose: bool,
 ) -> io::Result<()> {
-    match run_tui(path, &runtime_type, verbose) {
+    // Call the TUI function directly - this was previously incorrectly referring to run_tui
+    let result = {
+        // Terminal setup
+        enable_raw_mode()?;
+        let mut stdout = stdout();
+        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+        let backend = CrosstermBackend::new(stdout);
+        let mut terminal = Terminal::new(backend)?;
+
+        // Set up channel for async communication
+        let (tx, rx): (
+            mpsc::Sender<(usize, Result<(Vec<executor::JobResult>, ()), String>)>,
+            mpsc::Receiver<(usize, Result<(Vec<executor::JobResult>, ()), String>)>
+        ) = mpsc::channel();
+
+        // Initialize app state
+        let mut app = App::new(runtime_type.clone(), tx.clone());
+
+        if app.validation_mode {
+            app.logs.push("Starting in validation mode".to_string());
+            logging::info("Starting in validation mode");
+        }
+
+        // Load workflows
+        let dir_path = match path {
+            Some(path) if path.is_dir() => path.clone(),
+            Some(path) if path.is_file() => {
+                // Single workflow file
+                let name = path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned();
+
+                app.workflows = vec![Workflow {
+                    name: name.clone(),
+                    path: path.clone(),
+                    selected: true,
+                    status: WorkflowStatus::NotStarted,
+                    execution_details: None,
+                }];
+
+                // Queue the single workflow for execution
+                app.execution_queue = vec![0];
+                app.start_execution();
+
+                // Return parent dir or current dir if no parent
+                path.parent()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(|| PathBuf::from("."))
+            }
+            _ => PathBuf::from(".github/workflows"),
+        };
+
+        // Only load directory if we haven't already loaded a single file
+        if app.workflows.is_empty() {
+            app.workflows = load_workflows(&dir_path);
+        }
+
+        // Run the main event loop (simplified for this fix)
+        let tx_clone = tx.clone();
+        
+        // Run the event loop
+        let result = run_tui_event_loop(&mut terminal, &mut app, &tx_clone, &rx, verbose);
+        
+        // Clean up terminal
+        disable_raw_mode()?;
+        execute!(
+            terminal.backend_mut(),
+            LeaveAlternateScreen,
+            DisableMouseCapture
+        )?;
+        terminal.show_cursor()?;
+
+        result
+    };
+
+    match result {
         Ok(_) => Ok(()),
         Err(e) => {
             // If the TUI fails to initialize or crashes, fall back to CLI mode
@@ -2239,5 +2440,408 @@ pub async fn run_wrkflw_tui(
                 Err(e)
             }
         }
+    }
+}
+
+// Helper function to run the main event loop
+fn run_tui_event_loop(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    app: &mut App,
+    tx_clone: &mpsc::Sender<(usize, Result<(Vec<executor::JobResult>, ()), String>)>,
+    rx: &mpsc::Receiver<(usize, Result<(Vec<executor::JobResult>, ()), String>)>,
+    verbose: bool,
+) -> io::Result<()> {
+    loop {
+        // Update UI on tick
+        if app.tick() {
+            app.update_running_workflow_progress();
+        }
+
+        // Draw UI
+        terminal.draw(|f| {
+            render_ui(f, app);
+        })?;
+
+        // Handle incoming execution results
+        if let Ok((workflow_idx, result)) = rx.try_recv() {
+            app.process_execution_result(workflow_idx, result);
+            app.current_execution = None;
+
+            // Get next workflow to execute using our helper function
+            start_next_workflow_execution(app, tx_clone, verbose);
+        }
+
+        // Start execution if we have a queued workflow and nothing is currently running
+        if app.running && app.current_execution.is_none() && !app.execution_queue.is_empty() {
+            start_next_workflow_execution(app, tx_clone, verbose);
+        }
+
+        // Handle key events - use shorter timeout to improve responsiveness
+        if event::poll(Duration::from_millis(50))? {
+            if let Event::Key(key) = event::read()? {           
+                match key.code {
+                    KeyCode::Char('q') => {
+                        // Exit and clean up
+                        break Ok(());
+                    }
+                    KeyCode::Esc => {
+                        if app.detailed_view {
+                            app.detailed_view = false;
+                        } else if app.show_help {
+                            app.show_help = false;
+                        } else {
+                            // Exit and clean up
+                            break Ok(());
+                        }
+                    }
+                    KeyCode::Tab => {
+                        // Cycle through tabs
+                        app.switch_tab((app.selected_tab + 1) % 4);
+                    }
+                    KeyCode::BackTab => {
+                        // Cycle through tabs backwards
+                        app.switch_tab((app.selected_tab + 3) % 4);
+                    }
+                    KeyCode::Char('1') | KeyCode::Char('w') => app.switch_tab(0),
+                    KeyCode::Char('2') | KeyCode::Char('x') => app.switch_tab(1),
+                    KeyCode::Char('3') | KeyCode::Char('l') => app.switch_tab(2),
+                    KeyCode::Char('4') | KeyCode::Char('h') => app.switch_tab(3),
+                    KeyCode::Up | KeyCode::Char('k') => match app.selected_tab {
+                        0 => app.previous_workflow(),
+                        1 => {
+                            if app.detailed_view {
+                                app.previous_step();
+                            } else {
+                                app.previous_job();
+                            }
+                        }
+                        2 => app.scroll_logs_up(),
+                        _ => {}
+                    },
+                    KeyCode::Down | KeyCode::Char('j') => match app.selected_tab {
+                        0 => app.next_workflow(),
+                        1 => {
+                            if app.detailed_view {
+                                app.next_step();
+                            } else {
+                                app.next_job();
+                            }
+                        }
+                        2 => app.scroll_logs_down(),
+                        _ => {}
+                    },
+                    KeyCode::Char(' ') => {
+                        if app.selected_tab == 0 && !app.running {
+                            app.toggle_selected();
+                        }
+                    }
+                    KeyCode::Enter => {
+                        match app.selected_tab {
+                            0 => {
+                                // In workflows tab, Enter runs the selected workflow
+                                if !app.running {
+                                    if let Some(idx) = app.workflow_list_state.selected() {
+                                        app.workflows[idx].selected = true;
+                                        app.queue_selected_for_execution();
+                                        app.start_execution();
+                                    }
+                                }
+                            }
+                            1 => {
+                                // In execution tab, Enter shows job details
+                                app.toggle_detailed_view();
+                            }
+                            _ => {}
+                        }
+                    }
+                    KeyCode::Char('r') => {
+                        // Check if shift is pressed - this might be receiving the reset command
+                        if key.modifiers.contains(KeyModifiers::SHIFT) {
+                            let timestamp = Local::now().format("%H:%M:%S").to_string();
+                            app.logs.push(format!("[{}] DEBUG: Shift+r detected - this should be uppercase R", timestamp));
+                            logging::info("Shift+r detected as lowercase - this should be uppercase R");
+                            
+                            if !app.running {
+                                // Reset workflow status with Shift+r
+                                app.logs.push(format!("[{}] Attempting to reset workflow status via Shift+r...", timestamp));
+                                app.reset_workflow_status();
+                                
+                                // Force redraw to update UI immediately
+                                terminal.draw(|f| {
+                                    render_ui(f, app);
+                                })?;
+                            }
+                        } else if !app.running {
+                            app.queue_selected_for_execution();
+                            app.start_execution();
+                        }
+                    }
+                    KeyCode::Char('a') => {
+                        if !app.running {
+                            // Select all workflows
+                            for workflow in &mut app.workflows {
+                                workflow.selected = true;
+                            }
+                        }
+                    }
+                    KeyCode::Char('e') => {
+                        if !app.running {
+                            app.toggle_emulation_mode();
+                        }
+                    }
+                    KeyCode::Char('v') => {
+                        if !app.running {
+                            app.toggle_validation_mode();
+                        }
+                    }
+                    KeyCode::Char('n') => {
+                        if !app.running {
+                            // Deselect all workflows
+                            for workflow in &mut app.workflows {
+                                workflow.selected = false;
+                            }
+                        }
+                    }
+                    KeyCode::Char('R') => {
+                        let timestamp = Local::now().format("%H:%M:%S").to_string();
+                        app.logs.push(format!("[{}] DEBUG: Reset key 'Shift+R' pressed", timestamp));
+                        logging::info("Reset key 'Shift+R' pressed");
+                        
+                        if !app.running {
+                            // Reset workflow status
+                            app.logs.push(format!("[{}] Attempting to reset workflow status...", timestamp));
+                            app.reset_workflow_status();
+                            
+                            // Force redraw to update UI immediately
+                            terminal.draw(|f| {
+                                render_ui(f, app);
+                            })?;
+                        } else {
+                            app.logs.push(format!("[{}] Cannot reset workflow while another operation is running", timestamp));
+                        }
+                    }
+                    KeyCode::Char('?') => {
+                        // Toggle help overlay
+                        app.show_help = !app.show_help;
+                    }
+                    KeyCode::Char('t') => {
+                        // Only trigger workflow if not already running and we're in the workflows tab
+                        if !app.running && app.selected_tab == 0 {
+                            if let Some(selected_idx) = app.workflow_list_state.selected() {
+                                if selected_idx < app.workflows.len() {
+                                    let workflow = &app.workflows[selected_idx];
+                                    if workflow.status == WorkflowStatus::NotStarted {
+                                        app.trigger_selected_workflow();
+                                    } else if workflow.status == WorkflowStatus::Running {
+                                        app.logs.push(format!("Workflow '{}' is already running", workflow.name));
+                                        logging::warning(&format!("Workflow '{}' is already running", workflow.name));
+                                    } else {
+                                        // First, get all the data we need from the workflow
+                                        let workflow_name = workflow.name.clone();
+                                        let status_text = match workflow.status {
+                                            WorkflowStatus::Success => "Success",
+                                            WorkflowStatus::Failed => "Failed",
+                                            WorkflowStatus::Skipped => "Skipped",
+                                            _ => "current"
+                                        };
+                                        let needs_reset_hint = workflow.status == WorkflowStatus::Success || 
+                                                             workflow.status == WorkflowStatus::Failed || 
+                                                             workflow.status == WorkflowStatus::Skipped;
+                                        
+                                        // Now set the status message (mutable borrow)
+                                        app.set_status_message(format!(
+                                            "Cannot trigger workflow '{}' in {} state. Press Shift+R to reset.",
+                                            workflow_name,
+                                            status_text
+                                        ));
+                                        
+                                        // Add log entries
+                                        app.logs.push(format!("Cannot trigger workflow '{}' in {} state", 
+                                            workflow_name, 
+                                            status_text
+                                        ));
+                                        
+                                        // Add hint about using reset
+                                        if needs_reset_hint {
+                                            let timestamp = Local::now().format("%H:%M:%S").to_string();
+                                            app.logs.push(format!(
+                                                "[{}] Hint: Press 'Shift+R' to reset the workflow status and allow triggering",
+                                                timestamp
+                                            ));
+                                        }
+                                        
+                                        logging::warning(&format!("Cannot trigger workflow in {} state", 
+                                            status_text
+                                        ));
+                                    }
+                                }
+                            } else {
+                                app.logs.push("No workflow selected to trigger".to_string());
+                                logging::warning("No workflow selected to trigger");
+                            }
+                        } else if app.running {
+                            app.logs.push("Cannot trigger workflow while another operation is in progress".to_string());
+                            logging::warning("Cannot trigger workflow while another operation is in progress");
+                        } else if app.selected_tab != 0 {
+                            app.logs.push("Switch to Workflows tab to trigger a workflow".to_string());
+                            logging::warning("Switch to Workflows tab to trigger a workflow");
+                            // For better UX, we could also automatically switch to the Workflows tab here
+                            app.switch_tab(0);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+// Helper function to execute workflow trigger using curl
+async fn execute_curl_trigger(workflow_name: &str, branch: Option<&str>) -> Result<(Vec<executor::JobResult>, ()), String> {
+    // Get GitHub token
+    let token = std::env::var("GITHUB_TOKEN")
+        .map_err(|_| "GitHub token not found. Please set GITHUB_TOKEN environment variable".to_string())?;
+    
+    // Get repository information
+    let repo_info = crate::github::get_repo_info()
+        .map_err(|e| format!("Failed to get repository info: {}", e))?;
+    
+    // Determine branch to use
+    let branch_ref = branch.unwrap_or(&repo_info.default_branch);
+    
+    // Construct JSON payload
+    let payload = format!("{{\"ref\":\"{}\"}}", branch_ref);
+    
+    // Construct API URL
+    let url = format!(
+        "https://api.github.com/repos/{}/{}/actions/workflows/{}.yml/dispatches",
+        repo_info.owner, repo_info.repo, workflow_name
+    );
+    
+    // Use a Command to run curl - disable verbose flags for better performance
+    let output = tokio::process::Command::new("curl")
+        .arg("-s") // Silent mode
+        .arg("-X").arg("POST")
+        .arg("-H").arg(format!("Authorization: Bearer {}", token.trim()))
+        .arg("-H").arg("Accept: application/vnd.github.v3+json")
+        .arg("-H").arg("Content-Type: application/json")
+        .arg("-H").arg("User-Agent: wrkflw-cli")
+        .arg("-d").arg(payload)
+        .arg(url)
+        .output()
+        .await
+        .map_err(|e| format!("Failed to execute curl: {}", e))?;
+    
+    if !output.status.success() {
+        let error = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("Curl command failed: {}", error));
+    }
+    
+    // Success message with URL to view the workflow
+    let success_msg = format!(
+        "Workflow triggered successfully. View it at: https://github.com/{}/{}/actions/workflows/{}.yml",
+        repo_info.owner, repo_info.repo, workflow_name
+    );
+    
+    // Create a job result structure
+    let job_result = executor::JobResult {
+        name: "GitHub Trigger".to_string(),
+        status: executor::JobStatus::Success,
+        steps: vec![executor::StepResult {
+            name: "Remote Trigger".to_string(),
+            status: executor::StepStatus::Success,
+            output: success_msg,
+        }],
+        logs: "Workflow triggered remotely on GitHub".to_string(),
+    };
+
+    Ok((vec![job_result], ()))
+}
+
+// Add a new function before the run_tui_event_loop function
+// Extract common workflow execution logic to avoid duplication
+fn start_next_workflow_execution(
+    app: &mut App,
+    tx_clone: &mpsc::Sender<(usize, Result<(Vec<executor::JobResult>, ()), String>)>,
+    verbose: bool,
+) {
+    if let Some(next_idx) = app.get_next_workflow_to_execute() {
+        app.current_execution = Some(next_idx);
+        let tx_clone_inner = tx_clone.clone();
+        let workflow_path = app.workflows[next_idx].path.clone();
+        let runtime_type = app.runtime_type.clone();
+        let validation_mode = app.validation_mode;
+        
+        // Update workflow status and add execution details
+        app.workflows[next_idx].status = WorkflowStatus::Running;
+        
+        // Initialize execution details if not already done
+        if app.workflows[next_idx].execution_details.is_none() {
+            app.workflows[next_idx].execution_details = Some(WorkflowExecution {
+                jobs: Vec::new(),
+                start_time: Local::now(),
+                end_time: None,
+                logs: Vec::new(),
+                progress: 0.0,
+            });
+        }
+
+        thread::spawn(move || {
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            let result = runtime.block_on(async {
+                if validation_mode {
+                    // Perform validation instead of execution
+                    match evaluate_workflow_file(&workflow_path, verbose) {
+                        Ok(validation_result) => {
+                            // Create execution result based on validation
+                            let status = if validation_result.is_valid {
+                                executor::JobStatus::Success
+                            } else {
+                                executor::JobStatus::Failure
+                            };
+                            
+                            // Create a synthetic job result for validation
+                            let jobs = vec![executor::JobResult {
+                                name: "Validation".to_string(),
+                                status,
+                                steps: vec![executor::StepResult {
+                                    name: "Validator".to_string(),
+                                    status: if validation_result.is_valid {
+                                        executor::StepStatus::Success
+                                    } else {
+                                        executor::StepStatus::Failure
+                                    },
+                                    output: validation_result.issues.join("\n"),
+                                }],
+                                logs: format!("Validation result: {}", 
+                                    if validation_result.is_valid { "PASSED" } else { "FAILED" }
+                                ),
+                            }];
+                            
+                            Ok((jobs, ()))
+                        }
+                        Err(e) => Err(e.to_string()),
+                    }
+                } else {
+                    match executor::execute_workflow(&workflow_path, runtime_type, verbose).await {
+                        Ok(execution_result) => {
+                            // Send back the job results in a wrapped result
+                            Ok((execution_result.jobs, ()))
+                        }
+                        Err(e) => Err(e.to_string()),
+                    }
+                }
+            });
+
+            // Only send if we get a valid result
+            if let Err(e) = tx_clone_inner.send((next_idx, result)) {
+                eprintln!("Error sending execution result: {}", e);
+            }
+        });
+    } else {
+        app.running = false;
+        let timestamp = Local::now().format("%H:%M:%S").to_string();
+        app.logs.push(format!("[{}] All workflows completed execution", timestamp));
+        logging::info("All workflows completed execution");
     }
 }

@@ -17,13 +17,19 @@ jobs:
         with:
           fetch-depth: 0
       
+      - name: Setup Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          override: true
+      
       - name: Install git-cliff
         run: |
-          curl -LSfs https://raw.githubusercontent.com/orhun/git-cliff/main/install.sh | sh -s -- --version latest
-          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+          cargo install git-cliff --force
       
       - name: Generate Changelog
-        run: git cliff --latest --output CHANGELOG.md
+        run: git-cliff --latest --output CHANGELOG.md
       
       - name: Create Release
         id: create_release

@@ -114,8 +114,8 @@ async fn main() {
                 executor::RuntimeType::Docker
             };
 
-            // Run in TUI mode with the specific workflow
-            match ui::run_wrkflw_tui(Some(path), runtime_type, verbose).await {
+            // Run in CLI mode with the specific workflow
+            match ui::execute_workflow_cli(path, runtime_type, verbose).await {
                 Ok(_) => {
                     // Clean up on successful exit
                     cleanup_on_exit().await;

@@ -2224,12 +2224,16 @@ pub async fn run_wrkflw_tui(
             // If the TUI fails to initialize or crashes, fall back to CLI mode
             eprintln!("Failed to start UI: {}", e);
 
+            // Only for 'tui' command should we fall back to CLI mode for files
+            // For other commands, return the error
             if let Some(path) = path {
                 if path.is_file() {
-                    println!("Falling back to CLI mode...");
+                    eprintln!("Falling back to CLI mode...");
                     execute_workflow_cli(path, runtime_type, verbose).await
-                } else {
+                } else if path.is_dir() {
                     validate_workflow(path, verbose)
+                } else {
+                    Err(e)
                 }
             } else {
                 Err(e)

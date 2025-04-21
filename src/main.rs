@@ -1,5 +1,6 @@
 mod evaluator;
 mod executor;
+mod github;
 mod logging;
 mod matrix;
 mod models;
@@ -13,6 +14,7 @@ mod matrix_test;
 use bollard::Docker;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
+use std::collections::HashMap;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -56,6 +58,29 @@ enum Commands {
         #[arg(short, long)]
         emulate: bool,
     },
+
+    /// Trigger a GitHub workflow remotely
+    Trigger {
+        /// Name of the workflow file (without .yml extension)
+        workflow: String,
+
+        /// Branch to run the workflow on
+        #[arg(short, long)]
+        branch: Option<String>,
+
+        /// Key-value inputs for the workflow in format key=value
+        #[arg(short, long, value_parser = parse_key_val)]
+        input: Option<Vec<(String, String)>>,
+    },
+    
+    /// List available workflows
+    List,
+}
+
+// Parser function for key-value pairs
+fn parse_key_val(s: &str) -> Result<(String, String), String> {
+    let pos = s.find('=').ok_or_else(|| format!("Invalid key=value: {}", s))?;
+    Ok((s[..pos].to_string(), s[pos + 1..].to_string()))
 }
 
 async fn cleanup_on_exit() {
@@ -144,6 +169,64 @@ async fn main() {
                 Err(e) => {
                     eprintln!("Error: {}", e);
                     cleanup_on_exit().await;
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        Some(Commands::Trigger { workflow, branch, input }) => {
+            let inputs = input.as_ref().map(|kv_pairs| {
+                kv_pairs.iter().cloned().collect::<HashMap<String, String>>()
+            });
+            
+            match github::trigger_workflow(workflow, branch.as_deref(), inputs.clone()).await {
+                Ok(_) => {
+                    println!("Successfully triggered workflow '{}' on GitHub", workflow);
+                    if let Some(branch_name) = branch {
+                        println!("Branch: {}", branch_name);
+                    } else {
+                        println!("Branch: default branch");
+                    }
+                    
+                    if let Some(workflow_inputs) = &inputs {
+                        if !workflow_inputs.is_empty() {
+                            println!("Inputs:");
+                            for (key, value) in workflow_inputs {
+                                println!("  {}: {}", key, value);
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Error triggering workflow: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        
+        Some(Commands::List) => {
+            match github::get_repo_info() {
+                Ok(repo_info) => {
+                    match github::list_workflows(&repo_info).await {
+                        Ok(workflows) => {
+                            if workflows.is_empty() {
+                                println!("No workflows found in the .github/workflows directory");
+                            } else {
+                                println!("Available workflows:");
+                                for workflow in workflows {
+                                    println!("  {}", workflow);
+                                }
+                                println!("\nTrigger a workflow with: wrkflw trigger <workflow> [options]");
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Error listing workflows: {}", e);
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Error getting repository info: {}", e);
                     std::process::exit(1);
                 }
             }

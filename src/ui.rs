@@ -492,8 +492,10 @@ impl App {
 
     // Scroll logs down
     fn scroll_logs_down(&mut self) {
-        if !self.logs.is_empty() {
-            self.log_scroll = (self.log_scroll + 1).min(self.logs.len() - 1);
+        // Get total log count including system logs
+        let total_logs = self.logs.len() + crate::logging::get_logs().len();
+        if total_logs > 0 {
+            self.log_scroll = (self.log_scroll + 1).min(total_logs - 1);
         }
     }
 
@@ -953,6 +955,10 @@ pub fn run_tui(
                                 workflow.selected = false;
                             }
                         }
+                    }
+                    KeyCode::Char('?') => {
+                        // Toggle help overlay
+                        app.show_help = !app.show_help;
                     }
                     _ => {}
                 }
@@ -1706,19 +1712,35 @@ fn render_logs_tab(f: &mut Frame<CrosstermBackend<io::Stdout>>, app: &App, area:
         })
         .collect();
 
+    // Create a block with a title showing scrolling info
+    let log_count = all_logs.len();
+    let scroll_info = if log_count > 0 {
+        format!(" Execution Logs ({}/{}) ", app.log_scroll + 1, log_count)
+    } else {
+        " Execution Logs ".to_string()
+    };
+
+    // Create a stateful list that supports scrolling
+    let mut log_list_state = ListState::default();
+    if !all_logs.is_empty() {
+        log_list_state.select(Some(app.log_scroll));
+    }
+    
     let logs_list = List::new(log_items)
         .block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
                 .title(Span::styled(
-                    " Execution Logs ",
+                    scroll_info,
                     Style::default().fg(Color::Yellow),
-                )),
+                ))
+                .title_alignment(Alignment::Center),
         )
-        .start_corner(ratatui::layout::Corner::BottomLeft); // Show most recent logs at the bottom
-
-    f.render_widget(logs_list, area);
+        .highlight_style(Style::default().bg(Color::DarkGray))
+        .start_corner(ratatui::layout::Corner::TopLeft); // Change to TopLeft to show in chronological order
+    
+    f.render_stateful_widget(logs_list, area, &mut log_list_state);
 }
 
 // Render the help tab
@@ -1756,7 +1778,7 @@ fn render_help_tab(f: &mut Frame<CrosstermBackend<io::Stdout>>, area: Rect) {
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw(" - Navigate lists"),
+            Span::raw(" - Navigate lists or scroll logs"),
         ]),
         Line::from(vec![
             Span::styled(
@@ -1832,6 +1854,15 @@ fn render_help_tab(f: &mut Frame<CrosstermBackend<io::Stdout>>, area: Rect) {
         ]),
         Line::from(vec![
             Span::styled(
+                "?",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" - Toggle help overlay"),
+        ]),
+        Line::from(vec![
+            Span::styled(
                 "q",
                 Style::default()
                     .fg(Color::Yellow)
@@ -1864,6 +1895,32 @@ fn render_help_tab(f: &mut Frame<CrosstermBackend<io::Stdout>>, area: Rect) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw(" - Emulates GitHub Actions environment locally (no Docker required)"),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Logs Tab",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(
+                "Up/Down or j/k",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" - Scroll through logs"),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "Selected line",
+                Style::default()
+                    .fg(Color::White)
+                    .bg(Color::DarkGray),
+            ),
+            Span::raw(" - Current scroll position"),
         ]),
     ];
 
@@ -1906,87 +1963,82 @@ fn render_help_overlay(f: &mut Frame<CrosstermBackend<io::Stdout>>) {
 
 // Render the status bar
 fn render_status_bar(f: &mut Frame<CrosstermBackend<io::Stdout>>, app: &App, area: Rect) {
-    let runtime_mode = match app.runtime_type {
-        RuntimeType::Docker => "Docker",
-        RuntimeType::Emulation => "Emulation",
-    };
+    let mut status_items = vec![];
 
-    let runtime_style = match app.runtime_type {
-        RuntimeType::Docker => Style::default()
-            .fg(Color::Blue)
-            .add_modifier(Modifier::BOLD),
-        RuntimeType::Emulation => Style::default()
-            .fg(Color::Magenta)
-            .add_modifier(Modifier::BOLD),
-    };
-
-    let mode_text = if app.validation_mode {
-        "VALIDATION"
-    } else {
-        "EXECUTION"
-    };
-
-    let mode_style = if app.validation_mode {
+    // Add mode info
+    status_items.push(Span::styled(
+        format!(" {} ", app.runtime_type_name()),
         Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD)
-    } else {
+            .bg(match app.runtime_type {
+                RuntimeType::Docker => Color::Blue,
+                RuntimeType::Emulation => Color::Magenta,
+            })
+            .fg(Color::White),
+    ));
+
+    // Add validation/execution mode
+    status_items.push(Span::raw(" "));
+    status_items.push(Span::styled(
+        format!(" {} ", if app.validation_mode { "Validation" } else { "Execution" }),
         Style::default()
-            .fg(Color::Green)
-            .add_modifier(Modifier::BOLD)
+            .bg(if app.validation_mode {
+                Color::Yellow
+            } else {
+                Color::Green
+            })
+            .fg(Color::Black),
+    ));
+
+    // Add context-specific help based on current tab
+    status_items.push(Span::raw(" "));
+    let help_text = match app.selected_tab {
+        0 => "[Space] Toggle selection   [Enter] Run selected   [r] Run all selected",
+        1 => {
+            if app.detailed_view {
+                "[Esc] Back to jobs   [↑/↓] Navigate steps"
+            } else {
+                "[Enter] View details   [↑/↓] Navigate jobs"
+            }
+        }
+        2 => {
+            // For logs tab, show scrolling instructions
+            let log_count = app.logs.len() + crate::logging::get_logs().len();
+            if log_count > 0 {
+                // Convert to a static string for consistent return type
+                let scroll_text = format!("[↑/↓] Scroll logs ({}/{})", app.log_scroll + 1, log_count);
+                Box::leak(scroll_text.into_boxed_str())
+            } else {
+                "[No logs to display]"
+            }
+        }
+        3 => "[?] Toggle help overlay",
+        _ => "",
     };
+    status_items.push(Span::styled(
+        format!(" {} ", help_text),
+        Style::default().fg(Color::White),
+    ));
 
-    // Left side of status bar
-    let left_text = Line::from(vec![
-        Span::raw("Runtime: "),
-        Span::styled(runtime_mode, runtime_style),
-        Span::raw(" | "),
-        Span::raw("Mode: "),
-        Span::styled(mode_text, mode_style),
-        Span::raw(" | "),
-        Span::styled(
-            format!("{} workflow(s) loaded", app.workflows.len()),
-            Style::default().fg(Color::White),
-        ),
-    ]);
+    // Show keybindings for common actions
+    status_items.push(Span::raw(" "));
+    status_items.push(Span::styled(
+        " [Tab] Switch tabs ",
+        Style::default().fg(Color::White),
+    ));
+    status_items.push(Span::styled(
+        " [?] Help ",
+        Style::default().fg(Color::White),
+    ));
+    status_items.push(Span::styled(
+        " [q] Quit ",
+        Style::default().fg(Color::White),
+    ));
 
-    // Right side of status bar
-    let right_text = Line::from(vec![
-        Span::styled(
-            "e",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(": Toggle Emulation | "),
-        Span::styled(
-            "v",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(": Toggle Validation | "),
-        Span::styled(
-            "q",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(": Quit"),
-    ]);
+    let status_bar = Paragraph::new(Line::from(status_items))
+        .style(Style::default().bg(Color::DarkGray))
+        .alignment(Alignment::Left);
 
-    // Create a layout with two parts for left and right aligned text
-    let status_chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(area);
-
-    let left_status = Paragraph::new(left_text).alignment(Alignment::Left);
-
-    let right_status = Paragraph::new(right_text).alignment(Alignment::Right);
-
-    f.render_widget(left_status, status_chunks[0]);
-    f.render_widget(right_status, status_chunks[1]);
+    f.render_widget(status_bar, area);
 }
 
 // Validate a workflow or directory containing workflows

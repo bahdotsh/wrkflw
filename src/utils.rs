@@ -25,40 +25,54 @@ pub fn is_workflow_file(path: &Path) -> bool {
 
 /// Module for safely handling file descriptor redirection
 pub mod fd {
-    use std::fs::File;
+    use nix::fcntl::{open, OFlag};
+    use nix::sys::stat::Mode;
+    use nix::unistd::{close, dup, dup2};
     use std::io::{self, Result};
-    use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
-    use std::process::Command;
+    use std::os::unix::io::RawFd;
+    use std::path::Path;
+
+    /// Standard file descriptors
+    const STDERR_FILENO: RawFd = 2;
 
     /// Represents a redirected stderr that can be restored
     pub struct RedirectedStderr {
-        original_fd: Option<File>,
-        null_file: Option<File>,
+        original_fd: Option<RawFd>,
+        null_fd: Option<RawFd>,
     }
 
     impl RedirectedStderr {
         /// Creates a new RedirectedStderr that redirects stderr to /dev/null
         pub fn to_null() -> Result<Self> {
-            // Open original stderr as a File to keep a copy
-            let stderr_fd = 2; // STDERR_FILENO
-            let stderr_file = unsafe { 
-                // This is still unsafe but in a controlled, limited scope
-                File::from_raw_fd(libc::dup(stderr_fd))
+            // Duplicate the current stderr fd
+            let stderr_backup = match dup(STDERR_FILENO) {
+                Ok(fd) => fd,
+                Err(e) => return Err(io::Error::new(io::ErrorKind::Other, e)),
             };
             
             // Open /dev/null
-            let null_file = File::open("/dev/null")?;
+            let null_fd = match open(
+                Path::new("/dev/null"),
+                OFlag::O_WRONLY,
+                Mode::empty(),
+            ) {
+                Ok(fd) => fd,
+                Err(e) => {
+                    let _ = close(stderr_backup); // Clean up on error
+                    return Err(io::Error::new(io::ErrorKind::Other, e));
+                }
+            };
             
-            // Duplicate the /dev/null file descriptor to stderr
-            let null_fd = null_file.as_raw_fd();
-            unsafe {
-                // This is still unsafe but in a controlled, limited scope
-                libc::dup2(null_fd, stderr_fd);
+            // Redirect stderr to /dev/null
+            if let Err(e) = dup2(null_fd, STDERR_FILENO) {
+                let _ = close(stderr_backup); // Clean up on error
+                let _ = close(null_fd);
+                return Err(io::Error::new(io::ErrorKind::Other, e));
             }
             
             Ok(RedirectedStderr {
-                original_fd: Some(stderr_file),
-                null_file: Some(null_file),
+                original_fd: Some(stderr_backup),
+                null_fd: Some(null_fd),
             })
         }
     }
@@ -66,21 +80,16 @@ pub mod fd {
     impl Drop for RedirectedStderr {
         /// Automatically restores stderr when the RedirectedStderr is dropped
         fn drop(&mut self) {
-            if let Some(orig_file) = self.original_fd.take() {
-                let stderr_fd = 2; // STDERR_FILENO
-                let orig_fd = orig_file.as_raw_fd();
-                
+            if let Some(orig_fd) = self.original_fd.take() {
                 // Restore the original stderr
-                unsafe {
-                    libc::dup2(orig_fd, stderr_fd);
-                }
-                
-                // Let the File be closed automatically when it goes out of scope
-                // This prevents us from having to call libc::close directly
+                let _ = dup2(orig_fd, STDERR_FILENO);
+                let _ = close(orig_fd);
             }
             
-            // Let null_file be closed automatically when it's dropped
-            self.null_file.take();
+            // Close the null fd
+            if let Some(null_fd) = self.null_fd.take() {
+                let _ = close(null_fd);
+            }
         }
     }
 
@@ -92,17 +101,11 @@ pub mod fd {
         let _redirected = RedirectedStderr::to_null()?;
         Ok(f())
     }
-    
-    /// Run a command with stderr redirected to /dev/null
-    pub fn run_command_without_stderr(command: &mut Command) -> Result<std::process::Output> {
-        with_stderr_to_null(|| command.output())?.map_err(|e| io::Error::new(io::ErrorKind::Other, e))
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
     
     #[test]
     fn test_fd_redirection() {

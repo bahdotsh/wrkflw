@@ -10,6 +10,7 @@ mod runtime;
 mod ui;
 mod utils;
 mod validators;
+mod cleanup_test;
 
 use bollard::Docker;
 use clap::{Parser, Subcommand};
@@ -81,11 +82,13 @@ enum Commands {
 fn parse_key_val(s: &str) -> Result<(String, String), String> {
     let pos = s
         .find('=')
-        .ok_or_else(|| format!("Invalid key=value: {}", s))?;
+        .ok_or_else(|| format!("invalid KEY=value: no `=` found in `{}`", s))?;
+
     Ok((s[..pos].to_string(), s[pos + 1..].to_string()))
 }
 
-async fn cleanup_on_exit() {
+// Make this function public for testing
+pub async fn cleanup_on_exit() {
     // Clean up Docker resources if available
     match Docker::connect_with_local_defaults() {
         Ok(docker) => {

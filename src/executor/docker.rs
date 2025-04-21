@@ -407,3 +407,22 @@ impl ContainerRuntime for DockerRuntime {
         Ok(())
     }
 }
+
+// Public accessor functions for testing
+#[cfg(test)]
+pub fn get_tracked_containers() -> Vec<String> {
+    if let Ok(containers) = RUNNING_CONTAINERS.lock() {
+        containers.clone()
+    } else {
+        vec![]
+    }
+}
+
+#[cfg(test)]
+pub fn get_tracked_networks() -> Vec<String> {
+    if let Ok(networks) = CREATED_NETWORKS.lock() {
+        networks.clone()
+    } else {
+        vec![]
+    }
+}

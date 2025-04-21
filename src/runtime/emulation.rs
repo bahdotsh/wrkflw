@@ -534,3 +534,22 @@ pub fn untrack_workspace(path: &Path) {
         workspaces.retain(|w| *w != path);
     }
 }
+
+// Public accessor functions for testing
+#[cfg(test)]
+pub fn get_tracked_workspaces() -> Vec<PathBuf> {
+    if let Ok(workspaces) = EMULATION_WORKSPACES.lock() {
+        workspaces.clone()
+    } else {
+        vec![]
+    }
+}
+
+#[cfg(test)]
+pub fn get_tracked_processes() -> Vec<u32> {
+    if let Ok(processes) = EMULATION_PROCESSES.lock() {
+        processes.clone()
+    } else {
+        vec![]
+    }
+}

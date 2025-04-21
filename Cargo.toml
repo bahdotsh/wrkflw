@@ -40,6 +40,7 @@ regex = "1.9"
 lazy_static = "1.4"
 reqwest = { version = "0.11", features = ["json"] }
 libc = "0.2"
+nix = { version = "0.27.1", features = ["fs"] }
 
 [profile.release]
 codegen-units = 1

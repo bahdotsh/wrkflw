@@ -1,28 +1,12 @@
-name: Docker Setup Workflow
+name: Test
 
 on:
-  push:
-    branches:
-      - main
-  pull_request:
-    branches:
-      - main
+  workflow_dispatch:
 
 jobs:
-  setup:
-    runs-on: ubuntu-latest
-
+  test:
+    runs-on: 'ubuntu-latest'
     steps:
-      - name: Create Docker Network
-        run: docker network create app-network
-
-      - name: Start PostgreSQL Container
+      - name: Hey
         run: |
-          docker run -d \
-            --name postgres \
-            --network app-network \
-            -p 5432:5432 \
-            -e POSTGRES_USER=postgres \
-            -e POSTGRES_PASSWORD=password \
-            -e POSTGRES_DB=testdb \
-            postgres:17
+          echo hello && echo world

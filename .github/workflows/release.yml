@@ -126,5 +126,6 @@ jobs:
         uses: softprops/action-gh-release@v1
         with:
           files: ${{ env.ASSET_PATH }}
+          tag_name: ${{ github.event.inputs.version || github.ref_name }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} 

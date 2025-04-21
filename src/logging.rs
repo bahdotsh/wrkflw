@@ -11,7 +11,6 @@ pub enum LogLevel {
     Info,
     Warning,
     Error,
-    
 }
 
 impl LogLevel {
@@ -21,7 +20,6 @@ impl LogLevel {
             LogLevel::Info => "ℹ️",
             LogLevel::Warning => "⚠️",
             LogLevel::Error => "❌",
-            
         }
     }
 }
@@ -29,7 +27,7 @@ impl LogLevel {
 // Log a message with timestamp and level
 pub fn log(level: LogLevel, message: &str) {
     let timestamp = Local::now().format("%H:%M:%S").to_string();
-    
+
     // Always include timestamp in [HH:MM:SS] format to ensure consistency
     let formatted = format!("[{}] {} {}", timestamp, level.prefix(), message);
 

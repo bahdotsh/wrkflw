@@ -1,8 +1,8 @@
+use crate::matrix::MatrixConfig;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
-use crate::matrix::MatrixConfig;
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct WorkflowDefinition {
@@ -25,6 +25,21 @@ pub struct Job {
     pub env: HashMap<String, String>,
     #[serde(default)]
     pub matrix: Option<MatrixConfig>,
+    #[serde(default)]
+    pub services: HashMap<String, Service>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct Service {
+    pub image: String,
+    #[serde(default)]
+    pub ports: Option<Vec<String>>,
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    #[serde(default)]
+    pub volumes: Option<Vec<String>>,
+    #[serde(default)]
+    pub options: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]

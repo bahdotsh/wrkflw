@@ -39,6 +39,7 @@ num_cpus = "1.16.0"
 regex = "1.9"
 lazy_static = "1.4"
 reqwest = { version = "0.11", features = ["json"] }
+libc = "0.2"
 
 [profile.release]
 codegen-units = 1

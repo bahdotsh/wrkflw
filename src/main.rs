@@ -3,18 +3,18 @@ mod executor;
 mod github;
 mod logging;
 mod matrix;
+mod matrix_test;
 mod models;
 mod parser;
 mod runtime;
 mod ui;
 mod utils;
 mod validators;
-mod matrix_test;
 
 use bollard::Docker;
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -72,35 +72,49 @@ enum Commands {
         #[arg(short, long, value_parser = parse_key_val)]
         input: Option<Vec<(String, String)>>,
     },
-    
+
     /// List available workflows
     List,
 }
 
 // Parser function for key-value pairs
 fn parse_key_val(s: &str) -> Result<(String, String), String> {
-    let pos = s.find('=').ok_or_else(|| format!("Invalid key=value: {}", s))?;
+    let pos = s
+        .find('=')
+        .ok_or_else(|| format!("Invalid key=value: {}", s))?;
     Ok((s[..pos].to_string(), s[pos + 1..].to_string()))
 }
 
 async fn cleanup_on_exit() {
+    // Clean up Docker resources if available
     match Docker::connect_with_local_defaults() {
         Ok(docker) => {
-            executor::cleanup_containers(&docker).await;
+            executor::cleanup_resources(&docker).await;
         }
         Err(_) => {
-            // Docker not available, nothing to clean up
+            // Docker not available
+            logging::info("Docker not available, skipping Docker cleanup");
         }
     }
+
+    // Always clean up emulation resources
+    runtime::emulation::cleanup_resources().await;
+
+    logging::info("Resource cleanup completed");
 }
 
 async fn handle_signals() {
     // Wait for Ctrl+C
-    tokio::signal::ctrl_c()
-        .await
-        .expect("Failed to listen for ctrl+c event");
-
-    println!("Received Ctrl+C, shutting down and cleaning up...");
+    match tokio::signal::ctrl_c().await {
+        Ok(_) => {
+            println!("Received Ctrl+C, shutting down and cleaning up...");
+        },
+        Err(e) => {
+            // Log the error but continue with cleanup
+            eprintln!("Warning: Failed to properly listen for ctrl+c event: {}", e);
+            println!("Shutting down and cleaning up...");
+        }
+    }
 
     // Clean up containers
     cleanup_on_exit().await;
@@ -136,7 +150,14 @@ async fn main() {
             let runtime_type = if *emulate {
                 executor::RuntimeType::Emulation
             } else {
-                executor::RuntimeType::Docker
+                // Check if Docker is available, fall back to emulation if not
+                if !executor::docker::is_available() {
+                    println!("⚠️ Docker is not available. Using emulation mode instead.");
+                    logging::warning("Docker is not available. Using emulation mode instead.");
+                    executor::RuntimeType::Emulation
+                } else {
+                    executor::RuntimeType::Docker
+                }
             };
 
             // Run in CLI mode with the specific workflow
@@ -158,7 +179,14 @@ async fn main() {
             let runtime_type = if *emulate {
                 executor::RuntimeType::Emulation
             } else {
-                executor::RuntimeType::Docker
+                // Check if Docker is available, fall back to emulation if not
+                if !executor::docker::is_available() {
+                    println!("⚠️ Docker is not available. Using emulation mode instead.");
+                    logging::warning("Docker is not available. Using emulation mode instead.");
+                    executor::RuntimeType::Emulation
+                } else {
+                    executor::RuntimeType::Docker
+                }
             };
 
             match ui::run_wrkflw_tui(path.as_ref(), runtime_type, verbose).await {
@@ -174,11 +202,18 @@ async fn main() {
             }
         }
 
-        Some(Commands::Trigger { workflow, branch, input }) => {
+        Some(Commands::Trigger {
+            workflow,
+            branch,
+            input,
+        }) => {
             let inputs = input.as_ref().map(|kv_pairs| {
-                kv_pairs.iter().cloned().collect::<HashMap<String, String>>()
+                kv_pairs
+                    .iter()
+                    .cloned()
+                    .collect::<HashMap<String, String>>()
             });
-            
+
             match github::trigger_workflow(workflow, branch.as_deref(), inputs.clone()).await {
                 Ok(_) => {
                     // Success is already reported in the github module with detailed info
@@ -189,40 +224,45 @@ async fn main() {
                 }
             }
         }
-        
-        Some(Commands::List) => {
-            match github::get_repo_info() {
-                Ok(repo_info) => {
-                    match github::list_workflows(&repo_info).await {
-                        Ok(workflows) => {
-                            if workflows.is_empty() {
-                                println!("No workflows found in the .github/workflows directory");
-                            } else {
-                                println!("Available workflows:");
-                                for workflow in workflows {
-                                    println!("  {}", workflow);
-                                }
-                                println!("\nTrigger a workflow with: wrkflw trigger <workflow> [options]");
-                            }
+
+        Some(Commands::List) => match github::get_repo_info() {
+            Ok(repo_info) => match github::list_workflows(&repo_info).await {
+                Ok(workflows) => {
+                    if workflows.is_empty() {
+                        println!("No workflows found in the .github/workflows directory");
+                    } else {
+                        println!("Available workflows:");
+                        for workflow in workflows {
+                            println!("  {}", workflow);
                         }
-                        Err(e) => {
-                            eprintln!("Error listing workflows: {}", e);
-                            std::process::exit(1);
-                        }
+                        println!("\nTrigger a workflow with: wrkflw trigger <workflow> [options]");
                     }
                 }
                 Err(e) => {
-                    eprintln!("Error getting repository info: {}", e);
+                    eprintln!("Error listing workflows: {}", e);
                     std::process::exit(1);
                 }
+            },
+            Err(e) => {
+                eprintln!("Error getting repository info: {}", e);
+                std::process::exit(1);
             }
-        }
+        },
 
         None => {
             // Default to TUI interface if no subcommand
+            // Check if Docker is available, fall back to emulation if not
+            let runtime_type = if !executor::docker::is_available() {
+                println!("⚠️ Docker is not available. Using emulation mode instead.");
+                logging::warning("Docker is not available. Using emulation mode instead.");
+                executor::RuntimeType::Emulation
+            } else {
+                executor::RuntimeType::Docker
+            };
+
             match ui::run_wrkflw_tui(
                 Some(&PathBuf::from(".github/workflows")),
-                executor::RuntimeType::Docker,
+                runtime_type,
                 verbose,
             )
             .await

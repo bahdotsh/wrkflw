@@ -67,20 +67,22 @@ pub fn expand_matrix(matrix: &MatrixConfig) -> Result<Vec<MatrixCombination>, Ma
 
     // Step 1: Generate base combinations from parameter arrays
     let param_combinations = generate_base_combinations(matrix)?;
-    
+
     // Step 2: Filter out any combinations that match the exclude patterns
     let filtered_combinations = apply_exclude_filters(param_combinations, &matrix.exclude);
     combinations.extend(filtered_combinations);
-    
+
     // Step 3: Add any combinations from the include section
     for include_item in &matrix.include {
         combinations.push(MatrixCombination::from_include(include_item.clone()));
     }
-    
+
     if combinations.is_empty() {
-        return Err(MatrixError::ExpansionError("No valid combinations found after applying filters".to_string()));
+        return Err(MatrixError::ExpansionError(
+            "No valid combinations found after applying filters".to_string(),
+        ));
     }
-    
+
     Ok(combinations)
 }
 
@@ -90,7 +92,7 @@ fn generate_base_combinations(
 ) -> Result<Vec<MatrixCombination>, MatrixError> {
     // Extract parameter arrays and prepare for combination generation
     let mut param_arrays: IndexMap<String, Vec<Value>> = IndexMap::new();
-    
+
     for (param_name, param_value) in &matrix.parameters {
         match param_value {
             Value::Sequence(array) => {
@@ -103,22 +105,24 @@ fn generate_base_combinations(
             }
         }
     }
-    
+
     if param_arrays.is_empty() {
-        return Err(MatrixError::InvalidParameterFormat("Matrix has no valid parameters".to_string()));
+        return Err(MatrixError::InvalidParameterFormat(
+            "Matrix has no valid parameters".to_string(),
+        ));
     }
-    
+
     // Generate the Cartesian product of all parameter arrays
     let param_names: Vec<String> = param_arrays.keys().cloned().collect();
     let param_values: Vec<Vec<Value>> = param_arrays.values().cloned().collect();
-    
+
     // Generate all combinations using itertools
     let combinations = if !param_values.is_empty() {
         generate_combinations(&param_names, &param_values, 0, &mut HashMap::new())?
     } else {
         vec![]
     };
-    
+
     Ok(combinations)
 }
 
@@ -133,27 +137,27 @@ fn generate_combinations(
         // We've reached a complete combination
         return Ok(vec![MatrixCombination::new(current_combination.clone())]);
     }
-    
+
     let mut result = Vec::new();
     let param_name = &param_names[current_depth];
     let values = &param_values[current_depth];
-    
+
     for value in values {
         current_combination.insert(param_name.clone(), value.clone());
-        
+
         let mut new_combinations = generate_combinations(
             param_names,
             param_values,
             current_depth + 1,
             current_combination,
         )?;
-        
+
         result.append(&mut new_combinations);
     }
-    
+
     // Remove this level's parameter to backtrack
     current_combination.remove(param_name);
-    
+
     Ok(result)
 }
 
@@ -165,12 +169,10 @@ fn apply_exclude_filters(
     if exclude_patterns.is_empty() {
         return combinations;
     }
-    
+
     combinations
         .into_iter()
-        .filter(|combination| {
-            !is_excluded(combination, exclude_patterns)
-        })
+        .filter(|combination| !is_excluded(combination, exclude_patterns))
         .collect()
 }
 
@@ -181,7 +183,7 @@ fn is_excluded(
 ) -> bool {
     for exclude in exclude_patterns {
         let mut excluded = true;
-        
+
         for (key, value) in exclude {
             match combination.values.get(key) {
                 Some(combo_value) if combo_value == value => {
@@ -195,12 +197,12 @@ fn is_excluded(
                 }
             }
         }
-        
+
         if excluded {
             return true;
         }
     }
-    
+
     false
 }
 
@@ -212,7 +214,7 @@ pub fn format_combination_name(job_name: &str, combination: &MatrixCombination) 
         .map(|(k, v)| format!("{}: {}", k, value_to_string(v)))
         .collect::<Vec<_>>()
         .join(", ");
-    
+
     format!("{} ({})", job_name, params)
 }
 
@@ -241,4 +243,4 @@ fn value_to_string(value: &Value) -> String {
         Value::Null => "null".to_string(),
         _ => "unknown".to_string(),
     }
-} 
+}

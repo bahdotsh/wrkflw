@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use bollard::{
     container::{Config, CreateContainerOptions},
     models::HostConfig,
+    network::CreateNetworkOptions,
     Docker,
 };
 use futures_util::StreamExt;
@@ -12,47 +13,82 @@ use std::path::Path;
 use std::sync::Mutex;
 
 static RUNNING_CONTAINERS: Lazy<Mutex<Vec<String>>> = Lazy::new(|| Mutex::new(Vec::new()));
+static CREATED_NETWORKS: Lazy<Mutex<Vec<String>>> = Lazy::new(|| Mutex::new(Vec::new()));
 
 pub struct DockerRuntime {
     docker: Docker,
 }
 
 impl DockerRuntime {
-    pub fn new() -> Self {
-        let docker = Docker::connect_with_local_defaults().expect("Failed to connect to Docker");
+    pub fn new() -> Result<Self, ContainerError> {
+        let docker = Docker::connect_with_local_defaults()
+            .map_err(|e| ContainerError::ContainerStartFailed(
+                format!("Failed to connect to Docker: {}", e)
+            ))?;
 
-        DockerRuntime { docker }
+        Ok(DockerRuntime { docker })
     }
 }
 
 pub fn is_available() -> bool {
-    match Docker::connect_with_local_defaults() {
-        Ok(docker) => match futures::executor::block_on(async { docker.ping().await }) {
-            Ok(_) => true,
-            Err(e) => {
-                logging::error(&format!("Docker ping failed: {}", e));
+    // Use the safe FD redirection utility from utils
+    match crate::utils::fd::with_stderr_to_null(|| {
+        match Docker::connect_with_local_defaults() {
+            Ok(docker) => match futures::executor::block_on(async { docker.ping().await }) {
+                Ok(_) => true,
+                Err(_) => {
+                    // Only log at debug level to avoid cluttering the console with technical errors
+                    logging::debug("Docker daemon is running but ping failed. Docker may not be properly configured.");
+                    false
+                }
+            },
+            Err(_) => {
+                // Only log at debug level to avoid confusing users
+                logging::debug("Docker daemon is not running or not properly configured.");
                 false
             }
-        },
-        Err(e) => {
-            logging::error(&format!("Docker connection failed: {}", e));
+        }
+    }) {
+        Ok(result) => result,
+        Err(_) => {
+            logging::debug("Failed to redirect stderr when checking Docker availability.");
             false
         }
     }
 }
 
 // Add container to tracking
-fn track_container(id: &str) {
+pub fn track_container(id: &str) {
     if let Ok(mut containers) = RUNNING_CONTAINERS.lock() {
         containers.push(id.to_string());
     }
 }
 
 // Remove container from tracking
-fn untrack_container(id: &str) {
+pub fn untrack_container(id: &str) {
     if let Ok(mut containers) = RUNNING_CONTAINERS.lock() {
         containers.retain(|c| c != id);
     }
+}
+
+// Add network to tracking
+pub fn track_network(id: &str) {
+    if let Ok(mut networks) = CREATED_NETWORKS.lock() {
+        networks.push(id.to_string());
+    }
+}
+
+// Remove network from tracking
+pub fn untrack_network(id: &str) {
+    if let Ok(mut networks) = CREATED_NETWORKS.lock() {
+        networks.retain(|n| n != id);
+    }
+}
+
+// Clean up all tracked resources
+pub async fn cleanup_resources(docker: &Docker) {
+    cleanup_containers(docker).await;
+    cleanup_networks(docker).await;
 }
 
 // Clean up all tracked containers
@@ -66,10 +102,57 @@ pub async fn cleanup_containers(docker: &Docker) {
     };
 
     for container_id in containers_to_cleanup {
+        logging::info(&format!("Cleaning up container: {}", container_id));
         let _ = docker.stop_container(&container_id, None).await;
         let _ = docker.remove_container(&container_id, None).await;
         untrack_container(&container_id);
     }
+}
+
+// Clean up all tracked networks
+pub async fn cleanup_networks(docker: &Docker) {
+    let networks_to_cleanup = {
+        if let Ok(networks) = CREATED_NETWORKS.lock() {
+            networks.clone()
+        } else {
+            vec![]
+        }
+    };
+
+    for network_id in networks_to_cleanup {
+        logging::info(&format!("Cleaning up network: {}", network_id));
+        match docker.remove_network(&network_id).await {
+            Ok(_) => logging::info(&format!("Successfully removed network: {}", network_id)),
+            Err(e) => logging::error(&format!("Error removing network {}: {}", network_id, e)),
+        }
+        untrack_network(&network_id);
+    }
+}
+
+// Create a new Docker network for a job
+pub async fn create_job_network(docker: &Docker) -> Result<String, ContainerError> {
+    let network_name = format!("wrkflw-network-{}", uuid::Uuid::new_v4());
+
+    let options = CreateNetworkOptions {
+        name: network_name.clone(),
+        driver: "bridge".to_string(),
+        ..Default::default()
+    };
+
+    let network = docker
+        .create_network(options)
+        .await
+        .map_err(|e| ContainerError::NetworkCreationFailed(e.to_string()))?;
+
+    // network.id is Option<String>, unwrap it safely
+    let network_id = network.id.ok_or_else(|| {
+        ContainerError::NetworkOperationFailed("Network created but no ID returned".to_string())
+    })?;
+
+    track_network(&network_id);
+    logging::info(&format!("Created Docker network: {}", network_id));
+
+    Ok(network_id)
 }
 
 #[async_trait]
@@ -144,8 +227,8 @@ impl ContainerRuntime for DockerRuntime {
         // Always try to pull the image first
         match self.pull_image(image).await {
             Ok(_) => logging::info(&format!("🐳 Successfully pulled image: {}", image)),
-                Err(e) => logging::error(&format!("🐳 Warning: Failed to pull image: {}. Continuing with existing image if available.", e)),
-            }
+            Err(e) => logging::error(&format!("🐳 Warning: Failed to pull image: {}. Continuing with existing image if available.", e)),
+        }
         // Map env vars to format Docker expects
         let env: Vec<String> = env_vars
             .iter()
@@ -269,10 +352,17 @@ impl ContainerRuntime for DockerRuntime {
             // Add Dockerfile to tar
             if let Ok(file) = std::fs::File::open(dockerfile) {
                 let mut header = tar::Header::new_gnu();
-                let metadata = file.metadata().unwrap();
+                let metadata = file.metadata().map_err(|e| {
+                    ContainerError::ContainerExecutionFailed(format!("Failed to get file metadata: {}", e))
+                })?;
+                let modified_time = metadata.modified()
+                    .map_err(|e| ContainerError::ContainerExecutionFailed(format!("Failed to get file modification time: {}", e)))?
+                    .elapsed()
+                    .map_err(|e| ContainerError::ContainerExecutionFailed(format!("Failed to get elapsed time since modification: {}", e)))?
+                    .as_secs();
                 header.set_size(metadata.len());
                 header.set_mode(0o644);
-                header.set_mtime(metadata.modified().unwrap().elapsed().unwrap().as_secs());
+                header.set_mtime(modified_time);
                 header.set_cksum();
 
                 tar_builder

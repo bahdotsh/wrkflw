@@ -1,8 +1,8 @@
-use crate::parser::workflow::WorkflowDefinition;
 use crate::matrix::MatrixCombination;
+use crate::parser::workflow::WorkflowDefinition;
 use chrono::Utc;
-use std::{collections::HashMap, fs, io, path::Path};
 use serde_yaml::Value;
+use std::{collections::HashMap, fs, io, path::Path};
 
 pub fn setup_github_environment_files(workspace_dir: &Path) -> io::Result<()> {
     // Create necessary directories
@@ -97,7 +97,7 @@ pub fn add_matrix_context(
         let env_value = value_to_string(value);
         env.insert(env_key, env_value);
     }
-    
+
     // Also serialize the whole matrix as JSON for potential use
     if let Ok(json_value) = serde_json::to_string(&matrix_combination.values) {
         env.insert("MATRIX_CONTEXT".to_string(), json_value);

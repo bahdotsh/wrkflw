@@ -24,14 +24,25 @@ pub fn resolve_dependencies(workflow: &WorkflowDefinition) -> Result<Vec<Vec<Str
                         job_name, needed_job
                     ));
                 }
-                dependencies
-                    .get_mut(job_name)
-                    .unwrap()
-                    .insert(needed_job.clone());
-                dependents
-                    .get_mut(needed_job)
-                    .unwrap()
-                    .insert(job_name.clone());
+                // Get mutable reference to the dependency set for this job, with error handling
+                if let Some(deps) = dependencies.get_mut(job_name) {
+                    deps.insert(needed_job.clone());
+                } else {
+                    return Err(format!(
+                        "Internal error: Failed to update dependencies for job '{}'",
+                        job_name
+                    ));
+                }
+                
+                // Get mutable reference to the dependents set for the needed job, with error handling
+                if let Some(deps) = dependents.get_mut(needed_job) {
+                    deps.insert(job_name.clone());
+                } else {
+                    return Err(format!(
+                        "Internal error: Failed to update dependents for job '{}'",
+                        needed_job
+                    ));
+                }
             }
         }
     }
@@ -55,13 +66,31 @@ pub fn resolve_dependencies(workflow: &WorkflowDefinition) -> Result<Vec<Vec<Str
 
         for job in &no_dependencies {
             // For each dependent job of the current job
-            for dependent in dependents.get(job).unwrap().clone() {
+            // Get the set of dependents with error handling
+            let dependent_jobs = match dependents.get(job) {
+                Some(deps) => deps.clone(),
+                None => {
+                    return Err(format!(
+                        "Internal error: Failed to find dependents for job '{}'",
+                        job
+                    ));
+                }
+            };
+            
+            for dependent in dependent_jobs {
                 // Remove the current job from its dependencies
-                dependencies.get_mut(&dependent).unwrap().remove(job);
-
-                // If no more dependencies, add to next level
-                if dependencies.get(&dependent).unwrap().is_empty() {
-                    next_no_dependencies.insert(dependent);
+                if let Some(deps) = dependencies.get_mut(&dependent) {
+                    deps.remove(job);
+                    
+                    // Check if it's empty now to determine if it should be in the next level
+                    if deps.is_empty() {
+                        next_no_dependencies.insert(dependent);
+                    }
+                } else {
+                    return Err(format!(
+                        "Internal error: Failed to find dependencies for job '{}'",
+                        dependent
+                    ));
                 }
             }
         }

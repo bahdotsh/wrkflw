@@ -1,5 +1,5 @@
-use serde_yaml::Value;
 use crate::models::ValidationResult;
+use serde_yaml::Value;
 
 pub fn validate_matrix(matrix: &Value, result: &mut ValidationResult) {
     // Check if matrix is a mapping
@@ -37,11 +37,19 @@ pub fn validate_matrix(matrix: &Value, result: &mut ValidationResult) {
 
     // Validate the main matrix parameters (excluding special keywords)
     let special_keys = ["include", "exclude", "max-parallel", "fail-fast"];
-    for (key, value) in matrix.as_mapping().unwrap() {
-        let key_str = key.as_str().unwrap_or("");
-        if !special_keys.contains(&key_str) {
-            validate_matrix_parameter(key_str, value, result);
+    
+    // Use if let to avoid unwrap
+    if let Some(mapping) = matrix.as_mapping() {
+        for (key, value) in mapping {
+            // Safely get the key string, using an empty string as fallback
+            let key_str = key.as_str().unwrap_or("");
+            if !special_keys.contains(&key_str) {
+                validate_matrix_parameter(key_str, value, result);
+            }
         }
+    } else {
+        // This is a safeguard, though we already checked if it's a mapping above
+        result.add_issue("Failed to process matrix mapping".to_string());
     }
 }
 
@@ -52,13 +60,19 @@ fn validate_include_exclude(section: &Value, section_name: &str, result: &mut Va
     }
 
     // Check each item in the include/exclude array
-    for (index, item) in section.as_sequence().unwrap().iter().enumerate() {
-        if !item.is_mapping() {
-            result.add_issue(format!(
-                "{} item at index {} must be an object",
-                section_name, index
-            ));
+    // Use if let to avoid unwrap
+    if let Some(sequence) = section.as_sequence() {
+        for (index, item) in sequence.iter().enumerate() {
+            if !item.is_mapping() {
+                result.add_issue(format!(
+                    "{} item at index {} must be an object",
+                    section_name, index
+                ));
+            }
         }
+    } else {
+        // This is a safeguard, though we already checked if it's a sequence above
+        result.add_issue(format!("Failed to process {} sequence", section_name));
     }
 }
 
@@ -70,7 +84,7 @@ fn validate_matrix_parameter(name: &str, value: &Value, result: &mut ValidationR
             if let Some(seq) = value.as_sequence() {
                 if !seq.is_empty() {
                     let first_type = get_value_type(&seq[0]);
-                    
+
                     for (i, item) in seq.iter().enumerate().skip(1) {
                         let item_type = get_value_type(item);
                         if item_type != first_type {
@@ -102,4 +116,4 @@ fn get_value_type(value: &Value) -> &'static str {
         Value::Mapping(_) => "object",
         _ => "unknown",
     }
-} 
+}

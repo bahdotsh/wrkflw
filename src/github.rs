@@ -1,27 +1,28 @@
-use std::path::Path;
-use thiserror::Error;
-use reqwest;
-use std::fs;
-use std::process::Command;
-use std::collections::HashMap;
 use regex::Regex;
-use serde_json;
+use reqwest;
 use reqwest::header;
+use serde_json;
+use std::collections::HashMap;
+use std::fs;
+use std::path::Path;
+use std::process::Command;
+use thiserror::Error;
+use lazy_static::lazy_static;
 
 #[derive(Error, Debug)]
 pub enum GithubError {
     #[error("HTTP error: {0}")]
     RequestError(#[from] reqwest::Error),
-    
+
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),
-    
+
     #[error("Failed to parse Git repository URL: {0}")]
     GitParseError(String),
-    
+
     #[error("GitHub token not found. Please set GITHUB_TOKEN environment variable")]
     TokenNotFound,
-    
+
     #[error("API error: {status} - {message}")]
     ApiError { status: u16, message: String },
 }
@@ -34,67 +35,82 @@ pub struct RepoInfo {
     pub default_branch: String,
 }
 
+lazy_static! {
+    static ref GITHUB_REPO_REGEX: Regex = Regex::new(
+        r"(?:https://github\.com/|git@github\.com:)([^/]+)/([^/.]+)(?:\.git)?"
+    ).expect("Failed to compile GitHub repo regex - this is a critical error");
+}
+
 /// Extract repository information from the current git repository
 pub fn get_repo_info() -> Result<RepoInfo, GithubError> {
-    // Get the remote URL
     let output = Command::new("git")
         .args(["remote", "get-url", "origin"])
-        .output()?;
-    
+        .output()
+        .map_err(|e| GithubError::GitParseError(format!("Failed to execute git command: {}", e)))?;
+
     if !output.status.success() {
-        return Err(GithubError::GitParseError(
-            "Failed to get git remote URL".to_string(),
-        ));
+        return Err(GithubError::GitParseError("Failed to get git origin URL. Are you in a git repository?".to_string()));
     }
-    
+
     let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
     
-    // Extract owner and repo from the URL using regex
-    let re = Regex::new(r"(?:https://github\.com/|git@github\.com:)([^/]+)/([^/.]+)(?:\.git)?").unwrap();
-    let captures = re.captures(&url).ok_or_else(|| {
-        GithubError::GitParseError(format!("Could not parse GitHub URL: {}", url))
-    })?;
-    
-    let owner = captures.get(1).unwrap().as_str().to_string();
-    let repo = captures.get(2).unwrap().as_str().to_string();
-    
-    // Get the default branch
-    let branch_output = Command::new("git")
-        .args(["rev-parse", "--abbrev-ref", "HEAD"])
-        .output()?;
-    
-    if !branch_output.status.success() {
-        return Err(GithubError::GitParseError(
-            "Failed to get current branch".to_string(),
-        ));
+    if let Some(captures) = GITHUB_REPO_REGEX.captures(&url) {
+        let owner = captures.get(1)
+            .ok_or_else(|| GithubError::GitParseError("Unable to extract owner from GitHub URL".to_string()))?
+            .as_str()
+            .to_string();
+            
+        let repo = captures.get(2)
+            .ok_or_else(|| GithubError::GitParseError("Unable to extract repo name from GitHub URL".to_string()))?
+            .as_str()
+            .to_string();
+            
+        // Get the default branch
+        let branch_output = Command::new("git")
+            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .output()
+            .map_err(|e| GithubError::GitParseError(format!("Failed to execute git command: {}", e)))?;
+
+        if !branch_output.status.success() {
+            return Err(GithubError::GitParseError("Failed to get current branch".to_string()));
+        }
+
+        let default_branch = String::from_utf8_lossy(&branch_output.stdout)
+            .trim()
+            .to_string();
+
+        Ok(RepoInfo {
+            owner,
+            repo,
+            default_branch,
+        })
+    } else {
+        Err(GithubError::GitParseError(format!("URL '{}' is not a valid GitHub repository URL", url)))
     }
-    
-    let default_branch = String::from_utf8_lossy(&branch_output.stdout).trim().to_string();
-    
-    Ok(RepoInfo {
-        owner,
-        repo,
-        default_branch,
-    })
 }
 
 /// Get the list of available workflows in the repository
 pub async fn list_workflows(_repo_info: &RepoInfo) -> Result<Vec<String>, GithubError> {
     let workflows_dir = Path::new(".github/workflows");
-    
+
     if !workflows_dir.exists() {
-        return Err(GithubError::IoError(
-            std::io::Error::new(std::io::ErrorKind::NotFound, "Workflows directory not found")
-        ));
+        return Err(GithubError::IoError(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "Workflows directory not found",
+        )));
     }
-    
+
     let mut workflow_names = Vec::new();
-    
+
     for entry in fs::read_dir(workflows_dir)? {
         let entry = entry?;
         let path = entry.path();
-        
-        if path.is_file() && path.extension().map_or(false, |ext| ext == "yml" || ext == "yaml") {
+
+        if path.is_file()
+            && path
+                .extension()
+                .map_or(false, |ext| ext == "yml" || ext == "yaml")
+        {
             if let Some(file_name) = path.file_stem() {
                 if let Some(name) = file_name.to_str() {
                     workflow_names.push(name.to_string());
@@ -102,7 +118,7 @@ pub async fn list_workflows(_repo_info: &RepoInfo) -> Result<Vec<String>, Github
             }
         }
     }
-    
+
     Ok(workflow_names)
 }
 
@@ -113,46 +129,45 @@ pub async fn trigger_workflow(
     inputs: Option<HashMap<String, String>>,
 ) -> Result<(), GithubError> {
     // Get GitHub token from environment
-    let token = std::env::var("GITHUB_TOKEN")
-        .map_err(|_| GithubError::TokenNotFound)?;
-    
+    let token = std::env::var("GITHUB_TOKEN").map_err(|_| GithubError::TokenNotFound)?;
+
     // Trim the token to remove any leading or trailing whitespace
     let trimmed_token = token.trim();
-    
+
     // Convert token to HeaderValue
     let token_header = header::HeaderValue::from_str(&format!("Bearer {}", trimmed_token))
         .map_err(|_| GithubError::GitParseError("Invalid token format".to_string()))?;
-    
+
     // Get repository information
     let repo_info = get_repo_info()?;
     println!("Repository: {}/{}", repo_info.owner, repo_info.repo);
-    
+
     // Prepare the request payload
     let branch_ref = branch.unwrap_or(&repo_info.default_branch);
     println!("Using branch: {}", branch_ref);
-    
+
     // Create simplified payload
     let mut payload = serde_json::json!({
         "ref": branch_ref
     });
-    
+
     // Add inputs if provided
     if let Some(input_map) = inputs {
         payload["inputs"] = serde_json::json!(input_map);
         println!("With inputs: {:?}", input_map);
     }
-    
+
     // Send the workflow_dispatch event
     let url = format!(
         "https://api.github.com/repos/{}/{}/actions/workflows/{}.yml/dispatches",
         repo_info.owner, repo_info.repo, workflow_name
     );
-    
+
     println!("Triggering workflow at URL: {}", url);
-    
+
     // Create a reqwest client
     let client = reqwest::Client::new();
-    
+
     // Send the request using reqwest
     let response = client
         .post(&url)
@@ -164,84 +179,97 @@ pub async fn trigger_workflow(
         .send()
         .await
         .map_err(|e| GithubError::RequestError(e))?;
-    
+
     if !response.status().is_success() {
         let status = response.status().as_u16();
-        let error_message = response.text().await.unwrap_or_else(|_| {
-            format!("Unknown error (HTTP {})", status)
-        });
-        
+        let error_message = response
+            .text()
+            .await
+            .unwrap_or_else(|_| format!("Unknown error (HTTP {})", status));
+
         return Err(GithubError::ApiError {
             status,
             message: error_message,
         });
     }
-    
+
     println!("Workflow triggered successfully!");
-    println!("View runs at: https://github.com/{}/{}/actions/workflows/{}.yml", 
-             repo_info.owner, repo_info.repo, workflow_name);
-    
+    println!(
+        "View runs at: https://github.com/{}/{}/actions/workflows/{}.yml",
+        repo_info.owner, repo_info.repo, workflow_name
+    );
+
     // Attempt to verify the workflow was actually triggered
     match list_recent_workflow_runs(&repo_info, workflow_name, &token).await {
         Ok(runs) => {
             if !runs.is_empty() {
                 println!("\nRecent runs of this workflow:");
                 for run in runs.iter().take(3) {
-                    println!("- Run #{} ({}): {}", 
+                    println!(
+                        "- Run #{} ({}): {}",
                         run.get("id").and_then(|id| id.as_u64()).unwrap_or(0),
-                        run.get("status").and_then(|s| s.as_str()).unwrap_or("unknown"),
+                        run.get("status")
+                            .and_then(|s| s.as_str())
+                            .unwrap_or("unknown"),
                         run.get("html_url").and_then(|u| u.as_str()).unwrap_or("")
                     );
                 }
             } else {
                 println!("\nNo recent runs found. The workflow might still be initializing.");
-                println!("Check GitHub UI in a few moments: https://github.com/{}/{}/actions", 
-                         repo_info.owner, repo_info.repo);
+                println!(
+                    "Check GitHub UI in a few moments: https://github.com/{}/{}/actions",
+                    repo_info.owner, repo_info.repo
+                );
             }
-        },
+        }
         Err(e) => {
             println!("\nCould not fetch recent workflow runs: {}", e);
             println!("This doesn't mean the trigger failed - check GitHub UI: https://github.com/{}/{}/actions", 
                      repo_info.owner, repo_info.repo);
         }
     }
-    
+
     Ok(())
 }
 
 /// List recent workflow runs for a specific workflow
 async fn list_recent_workflow_runs(
-    repo_info: &RepoInfo, 
+    repo_info: &RepoInfo,
     workflow_name: &str,
-    token: &str
+    token: &str,
 ) -> Result<Vec<serde_json::Value>, GithubError> {
     // Get recent workflow runs via GitHub API
     let url = format!(
         "https://api.github.com/repos/{}/{}/actions/workflows/{}.yml/runs?per_page=5",
         repo_info.owner, repo_info.repo, workflow_name
     );
-    
+
     let curl_output = Command::new("curl")
         .arg("-s")
-        .arg("-H").arg(format!("Authorization: Bearer {}", token))
-        .arg("-H").arg("Accept: application/vnd.github.v3+json")
+        .arg("-H")
+        .arg(format!("Authorization: Bearer {}", token))
+        .arg("-H")
+        .arg("Accept: application/vnd.github.v3+json")
         .arg(&url)
         .output()
         .map_err(|e| GithubError::GitParseError(format!("Failed to execute curl: {}", e)))?;
-    
+
     if !curl_output.status.success() {
         let error_message = String::from_utf8_lossy(&curl_output.stderr).to_string();
-        return Err(GithubError::GitParseError(format!("Failed to list workflow runs: {}", error_message)));
+        return Err(GithubError::GitParseError(format!(
+            "Failed to list workflow runs: {}",
+            error_message
+        )));
     }
-    
+
     let response_body = String::from_utf8_lossy(&curl_output.stdout).to_string();
     let parsed: serde_json::Value = serde_json::from_str(&response_body)
         .map_err(|e| GithubError::GitParseError(format!("Failed to parse workflow runs: {}", e)))?;
-    
+
     // Extract the workflow runs from the response
     if let Some(workflow_runs) = parsed.get("workflow_runs").and_then(|wr| wr.as_array()) {
         Ok(workflow_runs.clone())
     } else {
         Ok(Vec::new())
     }
-} 
+}

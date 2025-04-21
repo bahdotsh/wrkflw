@@ -31,6 +31,8 @@ pub enum ContainerError {
     ImageBuildFailed(String),
     ContainerStartFailed(String),
     ContainerExecutionFailed(String),
+    NetworkCreationFailed(String),
+    NetworkOperationFailed(String),
 }
 
 impl fmt::Display for ContainerError {
@@ -43,6 +45,12 @@ impl fmt::Display for ContainerError {
             }
             ContainerError::ContainerExecutionFailed(msg) => {
                 write!(f, "Container execution failed: {}", msg)
+            }
+            ContainerError::NetworkCreationFailed(msg) => {
+                write!(f, "Failed to create Docker network: {}", msg)
+            }
+            ContainerError::NetworkOperationFailed(msg) => {
+                write!(f, "Network operation failed: {}", msg)
             }
         }
     }

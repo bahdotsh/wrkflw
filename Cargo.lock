@@ -2327,6 +2327,7 @@ dependencies = [
  "indexmap 2.8.0",
  "itertools",
  "lazy_static",
+ "libc",
  "log",
  "num_cpus",
  "once_cell",

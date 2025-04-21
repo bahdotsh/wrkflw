@@ -1,19 +1,22 @@
+use bollard::Docker;
+use futures::future;
+use serde_yaml::Value;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use thiserror::Error;
-use futures::future;
-use serde_yaml::Value;
 
 use crate::executor::dependency;
 use crate::executor::docker;
 use crate::executor::environment;
+use crate::executor::substitution;
 use crate::logging;
 use crate::matrix::{self, MatrixCombination};
 use crate::parser::workflow::{parse_workflow, ActionInfo, Job, WorkflowDefinition};
 use crate::runtime::container::ContainerRuntime;
 use crate::runtime::emulation::handle_special_action;
-use crate::executor::substitution;
+
+#[allow(unused_variables, unused_assignments)]
 
 /// Execute a GitHub Actions workflow file locally
 pub async fn execute_workflow(
@@ -65,7 +68,17 @@ fn initialize_runtime(
     match runtime_type {
         RuntimeType::Docker => {
             if docker::is_available() {
-                Ok(Box::new(docker::DockerRuntime::new()))
+                // Handle the Result returned by DockerRuntime::new()
+                match docker::DockerRuntime::new() {
+                    Ok(docker_runtime) => Ok(Box::new(docker_runtime)),
+                    Err(e) => {
+                        logging::error(&format!(
+                            "Failed to initialize Docker runtime: {}, falling back to emulation mode",
+                            e
+                        ));
+                        Ok(Box::new(crate::runtime::emulation::EmulationRuntime::new()))
+                    }
+                }
             } else {
                 logging::error(&format!(
                     "Docker not available, falling back to emulation mode"
@@ -196,12 +209,12 @@ async fn execute_job_batch(
     verbose: bool,
 ) -> Result<Vec<JobResult>, ExecutionError> {
     // Execute jobs in parallel
-    let futures = jobs.iter().map(|job_name| {
-        execute_job_with_matrix(job_name, workflow, runtime, env_context, verbose)
-    });
+    let futures = jobs
+        .iter()
+        .map(|job_name| execute_job_with_matrix(job_name, workflow, runtime, env_context, verbose));
 
     let result_arrays = future::join_all(futures).await;
-    
+
     // Flatten the results from all jobs and their matrix combinations
     let mut results = Vec::new();
     for result_array in result_arrays {
@@ -226,32 +239,35 @@ async fn execute_job_with_matrix(
     let job = workflow.jobs.get(job_name).ok_or_else(|| {
         ExecutionError::ExecutionError(format!("Job '{}' not found in workflow", job_name))
     })?;
-    
+
     // Check if this is a matrix job
     if let Some(matrix_config) = &job.matrix {
         // Expand the matrix into combinations
         let combinations = matrix::expand_matrix(matrix_config).map_err(|e| {
             ExecutionError::ExecutionError(format!("Failed to expand matrix: {}", e))
         })?;
-        
+
         if combinations.is_empty() {
-            logging::info(&format!("Matrix job '{}' has no valid combinations", job_name));
+            logging::info(&format!(
+                "Matrix job '{}' has no valid combinations",
+                job_name
+            ));
             // Return empty result for jobs with no valid combinations
             return Ok(Vec::new());
         }
-        
+
         logging::info(&format!(
             "Matrix job '{}' expanded to {} combinations",
             job_name,
             combinations.len()
         ));
-        
+
         // Set maximum parallel jobs
         let max_parallel = matrix_config.max_parallel.unwrap_or_else(|| {
             // If not specified, use a reasonable default based on CPU cores
             std::cmp::max(1, num_cpus::get())
         });
-        
+
         // Execute matrix combinations
         execute_matrix_combinations(
             job_name,
@@ -286,7 +302,7 @@ async fn execute_matrix_combinations(
 ) -> Result<Vec<JobResult>, ExecutionError> {
     let mut results = Vec::new();
     let mut any_failed = false;
-    
+
     // Process combinations in chunks limited by max_parallel
     for chunk in combinations.chunks(max_parallel) {
         // Skip processing if fail-fast is enabled and a previous job failed
@@ -303,7 +319,7 @@ async fn execute_matrix_combinations(
             }
             continue;
         }
-        
+
         // Process this chunk of combinations in parallel
         let chunk_futures = chunk.iter().map(|combination| {
             execute_matrix_job(
@@ -316,9 +332,9 @@ async fn execute_matrix_combinations(
                 verbose,
             )
         });
-        
+
         let chunk_results = future::join_all(chunk_futures).await;
-        
+
         // Process results from this chunk
         for result in chunk_results {
             match result {
@@ -332,7 +348,7 @@ async fn execute_matrix_combinations(
                     // On error, mark as failed and continue if not fail-fast
                     any_failed = true;
                     logging::error(&format!("Matrix job failed: {}", e));
-                    
+
                     if fail_fast {
                         return Err(e);
                     }
@@ -340,7 +356,7 @@ async fn execute_matrix_combinations(
             }
         }
     }
-    
+
     Ok(results)
 }
 
@@ -356,38 +372,38 @@ async fn execute_matrix_job(
 ) -> Result<JobResult, ExecutionError> {
     // Create the matrix-specific job name
     let matrix_job_name = matrix::format_combination_name(job_name, combination);
-    
+
     logging::info(&format!("Executing matrix job: {}", matrix_job_name));
-    
+
     // Clone the environment and add matrix-specific values
     let mut job_env = base_env_context.clone();
     environment::add_matrix_context(&mut job_env, combination);
-    
+
     // Add job-level environment variables
     for (key, value) in &job_template.env {
         // TODO: Substitute matrix variable references in env values
         job_env.insert(key.clone(), value.clone());
     }
-    
+
     // Execute the job steps
     let mut step_results = Vec::new();
     let mut job_logs = String::new();
-    
+
     // Create a temporary directory for this job execution
     let job_dir = tempfile::tempdir().map_err(|e| {
         ExecutionError::ExecutionError(format!("Failed to create job directory: {}", e))
     })?;
-    
+
     // Prepare the runner
     let runner_image = get_runner_image(&job_template.runs_on);
     prepare_runner_image(&runner_image, runtime, verbose).await?;
-    
+
     // Copy project files to workspace
-    copy_directory_contents(
-        &std::env::current_dir().unwrap_or_default(),
-        job_dir.path(),
-    )?;
-    
+    let current_dir = std::env::current_dir().map_err(|e| {
+        ExecutionError::ExecutionError(format!("Failed to get current directory: {}", e))
+    })?;
+    copy_directory_contents(&current_dir, job_dir.path())?;
+
     let job_success = if job_template.steps.is_empty() {
         logging::warning(&format!("Job '{}' has no steps", matrix_job_name));
         true
@@ -412,9 +428,9 @@ async fn execute_matrix_job(
                     job_logs.push_str(&format!("Status: {:?}\n", result.status));
                     job_logs.push_str(&result.output);
                     job_logs.push_str("\n\n");
-                    
+
                     step_results.push(result.clone());
-                    
+
                     if result.status != StepStatus::Success {
                         // Step failed, abort job
                         return Ok(JobResult {
@@ -437,10 +453,10 @@ async fn execute_matrix_job(
                 }
             }
         }
-        
+
         true
     };
-    
+
     // Return job result
     Ok(JobResult {
         name: matrix_job_name,
@@ -454,6 +470,7 @@ async fn execute_matrix_job(
     })
 }
 
+#[allow(unused_variables, unused_assignments)]
 async fn execute_job(
     job_name: &str,
     workflow: &WorkflowDefinition,
@@ -465,87 +482,336 @@ async fn execute_job(
     let job = workflow.jobs.get(job_name).ok_or_else(|| {
         ExecutionError::ExecutionError(format!("Job '{}' not found in workflow", job_name))
     })?;
-    
+
     // Clone context and add job-specific variables
     let mut job_env = env_context.clone();
-    
+
     // Add job-level environment variables
     for (key, value) in &job.env {
         job_env.insert(key.clone(), value.clone());
     }
-    
+
     // Execute job steps
     let mut step_results = Vec::new();
     let mut job_logs = String::new();
-    
+
     // Create a temporary directory for this job execution
     let job_dir = tempfile::tempdir().map_err(|e| {
         ExecutionError::ExecutionError(format!("Failed to create job directory: {}", e))
     })?;
-    
-    // Prepare the runner environment
-    let runner_image = get_runner_image(&job.runs_on);
-    prepare_runner_image(&runner_image, runtime, verbose).await?;
-    
-    // Copy project files to workspace
-    copy_directory_contents(&std::env::current_dir().unwrap_or_default(), job_dir.path())?;
-    
-    logging::info(&format!("Executing job: {}", job_name));
-    
-    let job_success = if job.steps.is_empty() {
-        logging::warning(&format!("Job '{}' has no steps", job_name));
-        true
+
+    // Try to get a Docker client if using Docker and services exist
+    let docker_client = if !job.services.is_empty() {
+        match Docker::connect_with_local_defaults() {
+            Ok(client) => Some(client),
+            Err(e) => {
+                logging::error(&format!("Failed to connect to Docker: {}", e));
+                None
+            }
+        }
     } else {
-        // Execute each step
-        for (idx, step) in job.steps.iter().enumerate() {
-            match execute_step(
-                step,
-                idx,
-                &job_env,
-                job_dir.path(),
-                runtime,
-                workflow,
-                &job.runs_on, // Pass the job's runner
-                verbose,
-                &None, // No matrix combination for regular jobs
-            )
-            .await
-            {
-                Ok(result) => {
-                    job_logs.push_str(&format!("Step: {}\n", result.name));
-                    job_logs.push_str(&format!("Status: {:?}\n", result.status));
-                    job_logs.push_str(&result.output);
-                    job_logs.push_str("\n\n");
-                    
-                    step_results.push(result.clone());
-                    
-                    if result.status != StepStatus::Success {
-                        // Step failed, abort job
-                        return Ok(JobResult {
-                            name: job_name.to_string(),
-                            status: JobStatus::Failure,
-                            steps: step_results,
-                            logs: job_logs,
-                        });
+        None
+    };
+
+    // Create a Docker network for this job if we have services
+    let network_id = if !job.services.is_empty() && docker_client.is_some() {
+        let docker = match docker_client.as_ref() {
+            Some(client) => client,
+            None => {
+                return Err(ExecutionError::RuntimeError(
+                    "Docker client is required but not available".to_string(),
+                ));
+            }
+        };
+        match docker::create_job_network(docker).await {
+            Ok(id) => {
+                logging::info(&format!("Created network {} for job '{}'", id, job_name));
+                Some(id)
+            }
+            Err(e) => {
+                logging::error(&format!(
+                    "Failed to create network for job '{}': {}",
+                    job_name, e
+                ));
+                return Err(ExecutionError::RuntimeError(format!(
+                    "Failed to create network: {}",
+                    e
+                )));
+            }
+        }
+    } else {
+        None
+    };
+
+    // Start service containers if any
+    let mut service_containers = Vec::new();
+
+    if !job.services.is_empty() {
+        if docker_client.is_none() {
+            logging::error("Services are only supported with Docker runtime");
+            return Err(ExecutionError::RuntimeError(
+                "Services require Docker runtime".to_string(),
+            ));
+        }
+
+        logging::info(&format!(
+            "Starting {} service containers for job '{}'",
+            job.services.len(),
+            job_name
+        ));
+
+        let docker = match docker_client.as_ref() {
+            Some(client) => client,
+            None => {
+                return Err(ExecutionError::RuntimeError(
+                    "Docker client is required but not available".to_string(),
+                ));
+            }
+        };
+
+        #[allow(unused_variables, unused_assignments)]
+        for (service_name, service_config) in &job.services {
+            logging::info(&format!(
+                "Starting service '{}' with image '{}'",
+                service_name, service_config.image
+            ));
+
+            // Prepare container configuration
+            let container_name = format!("wrkflw-service-{}-{}", job_name, service_name);
+
+            // Map ports if specified
+            let mut port_bindings = HashMap::new();
+            if let Some(ports) = &service_config.ports {
+                for port_spec in ports {
+                    // Parse port spec like "8080:80"
+                    let parts: Vec<&str> = port_spec.split(':').collect();
+                    if parts.len() == 2 {
+                        let host_port = parts[0];
+                        let container_port = parts[1];
+
+                        let port_binding = bollard::models::PortBinding {
+                            host_ip: Some("0.0.0.0".to_string()),
+                            host_port: Some(host_port.to_string()),
+                        };
+
+                        let key = format!("{}/tcp", container_port);
+                        port_bindings.insert(key, Some(vec![port_binding]));
+                    }
+                }
+            }
+
+            // Convert environment variables
+            let env_vars: Vec<String> = service_config
+                .env
+                .iter()
+                .map(|(k, v)| format!("{}={}", k, v))
+                .collect();
+
+            // Create container options
+            let create_opts = bollard::container::CreateContainerOptions {
+                name: container_name,
+                platform: None,
+            };
+
+            // Host configuration
+            let host_config = bollard::models::HostConfig {
+                port_bindings: Some(port_bindings),
+                network_mode: network_id.clone(),
+                ..Default::default()
+            };
+
+            // Container configuration
+            let config = bollard::container::Config {
+                image: Some(service_config.image.clone()),
+                env: Some(env_vars),
+                host_config: Some(host_config),
+                ..Default::default()
+            };
+
+            // Log the network connection
+            if network_id.is_some() {
+                logging::info(&format!(
+                    "Service '{}' connected to network via host_config",
+                    service_name
+                ));
+            }
+
+            match docker.create_container(Some(create_opts), config).await {
+                Ok(response) => {
+                    let container_id = response.id;
+
+                    // Track the container for cleanup
+                    docker::track_container(&container_id);
+                    service_containers.push(container_id.clone());
+
+                    // Start the container
+                    match docker.start_container::<String>(&container_id, None).await {
+                        Ok(_) => {
+                            logging::info(&format!("Started service container: {}", container_id));
+
+                            // Add service address to environment
+                            job_env.insert(
+                                format!("{}_HOST", service_name.to_uppercase()),
+                                service_name.clone(),
+                            );
+
+                            job_logs.push_str(&format!(
+                                "Started service '{}' with container ID: {}\n",
+                                service_name, container_id
+                            ));
+                        }
+                        Err(e) => {
+                            let error_msg = format!(
+                                "Failed to start service container '{}': {}",
+                                service_name, e
+                            );
+                            logging::error(&error_msg);
+
+                            // Clean up the created container
+                            let _ = docker.remove_container(&container_id, None).await;
+
+                            // Clean up network if created
+                            if let Some(net_id) = &network_id {
+                                let _ = docker.remove_network(net_id).await;
+                                docker::untrack_network(net_id);
+                            }
+
+                            return Err(ExecutionError::RuntimeError(error_msg));
+                        }
                     }
                 }
                 Err(e) => {
-                    // Log the error and abort the job
-                    job_logs.push_str(&format!("Step execution error: {}\n\n", e));
-                    return Ok(JobResult {
-                        name: job_name.to_string(),
-                        status: JobStatus::Failure,
-                        steps: step_results,
-                        logs: job_logs,
-                    });
+                    let error_msg = format!(
+                        "Failed to create service container '{}': {}",
+                        service_name, e
+                    );
+                    logging::error(&error_msg);
+
+                    // Clean up network if created
+                    if let Some(net_id) = &network_id {
+                        let _ = docker.remove_network(net_id).await;
+                        docker::untrack_network(net_id);
+                    }
+
+                    return Err(ExecutionError::RuntimeError(error_msg));
                 }
             }
         }
-        
-        true
-    };
-    
-    // Return job result
+
+        // Give services a moment to start up
+        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+    }
+
+    // Prepare the runner environment
+    let runner_image = get_runner_image(&job.runs_on);
+    prepare_runner_image(&runner_image, runtime, verbose).await?;
+
+    // Copy project files to workspace
+    let current_dir = std::env::current_dir().map_err(|e| {
+        ExecutionError::ExecutionError(format!("Failed to get current directory: {}", e))
+    })?;
+    copy_directory_contents(&current_dir, job_dir.path())?;
+
+    logging::info(&format!("Executing job: {}", job_name));
+
+    let mut job_success = true;
+
+    // Execute job steps
+    for (idx, step) in job.steps.iter().enumerate() {
+        let step_result = execute_step(
+            step,
+            idx,
+            &job_env,
+            job_dir.path(),
+            runtime,
+            workflow,
+            &job.runs_on,
+            verbose,
+            &None,
+        )
+        .await;
+
+        match step_result {
+            Ok(result) => {
+                // Check if step was successful
+                if result.status == StepStatus::Failure {
+                    job_success = false;
+                }
+
+                // Add step output to logs
+                if !result.output.is_empty() {
+                    job_logs.push_str(&format!(
+                        "\n=== Output from step '{}' ===\n{}\n=== End output ===\n\n",
+                        result.name, result.output
+                    ));
+                }
+
+                step_results.push(result);
+            }
+            Err(e) => {
+                job_success = false;
+                job_logs.push_str(&format!("\n=== ERROR in step {} ===\n{}\n", idx + 1, e));
+
+                // Record the error as a failed step
+                step_results.push(StepResult {
+                    name: step
+                        .name
+                        .clone()
+                        .unwrap_or_else(|| format!("Step {}", idx + 1)),
+                    status: StepStatus::Failure,
+                    output: format!("Error: {}", e),
+                });
+
+                // Stop executing further steps
+                break;
+            }
+        }
+    }
+
+    // Clean up service containers
+    if !service_containers.is_empty() && docker_client.is_some() {
+        let docker = match docker_client.as_ref() {
+            Some(client) => client,
+            None => {
+                return Err(ExecutionError::RuntimeError(
+                    "Docker client is required but not available".to_string(),
+                ));
+            }
+        };
+
+        for container_id in &service_containers {
+            logging::info(&format!("Stopping service container: {}", container_id));
+
+            let _ = docker.stop_container(container_id, None).await;
+            let _ = docker.remove_container(container_id, None).await;
+
+            // Untrack container since we've explicitly removed it
+            docker::untrack_container(container_id);
+        }
+    }
+
+    // Clean up network if created
+    if let Some(net_id) = &network_id {
+        if docker_client.is_some() {
+            let docker = match docker_client.as_ref() {
+                Some(client) => client,
+                None => {
+                    return Err(ExecutionError::RuntimeError(
+                        "Docker client is required but not available".to_string(),
+                    ));
+                }
+            };
+
+            logging::info(&format!("Removing network: {}", net_id));
+            if let Err(e) = docker.remove_network(net_id).await {
+                logging::error(&format!("Failed to remove network {}: {}", net_id, e));
+            }
+
+            // Untrack network since we've explicitly removed it
+            docker::untrack_network(net_id);
+        }
+    }
+
     Ok(JobResult {
         name: job_name.to_string(),
         status: if job_success {
@@ -673,7 +939,14 @@ async fn execute_step(
                 // Store the string and keep a reference to it
                 let echo_cmd = format!("echo 'Would execute GitHub action: {}'", uses);
                 owned_strings.push(echo_cmd);
-                cmd.push(owned_strings.last().unwrap());
+                cmd.push(match owned_strings.last() {
+                    Some(s) => s,
+                    None => {
+                        return Err(ExecutionError::ExecutionError(
+                            "Expected at least one string in action arguments".to_string(),
+                        ));
+                    }
+                });
             }
 
             // Convert 'with' parameters to environment variables
@@ -723,7 +996,7 @@ async fn execute_step(
     } else if let Some(run) = &step.run {
         // Apply GitHub-style matrix variable substitution to the command
         let processed_run = substitution::process_step_run(run, matrix_combination);
-        
+
         // Print the command we're trying to run
         let shell_default = "bash".to_string();
         let shell = step_env.get("SHELL").unwrap_or(&shell_default);
@@ -773,7 +1046,7 @@ async fn execute_step(
             .pull_image(&image)
             .await
             .map_err(|e| ExecutionError::RuntimeError(format!("Failed to pull image: {}", e)))?;
-        
+
         // Map volumes
         let volumes: Vec<(&Path, &Path)> = vec![(working_dir, Path::new("/github/workspace"))];
 
@@ -822,12 +1095,26 @@ fn copy_directory_contents(from: &Path, to: &Path) -> Result<(), ExecutionError>
         let path = entry.path();
 
         // Skip hidden files/dirs and target directory for efficiency
-        let file_name = path.file_name().unwrap().to_string_lossy();
+        let file_name = match path.file_name() {
+            Some(name) => name.to_string_lossy(),
+            None => {
+                return Err(ExecutionError::ExecutionError(
+                    format!("Failed to get file name from path: {:?}", path)
+                ));
+            }
+        };
         if file_name.starts_with(".") || file_name == "target" {
             continue;
         }
 
-        let dest_path = to.join(path.file_name().unwrap());
+        let dest_path = match path.file_name() {
+            Some(name) => to.join(name),
+            None => {
+                return Err(ExecutionError::ExecutionError(
+                    format!("Failed to get file name from path: {:?}", path)
+                ));
+            }
+        };
 
         if path.is_dir() {
             std::fs::create_dir_all(&dest_path).map_err(|e| {

@@ -67,7 +67,7 @@ pub fn validate_jobs(jobs: &Value, result: &mut ValidationResult) {
                             ));
                         }
                     }
-                    
+
                     // Validate matrix configuration if present
                     if let Some(matrix) = job_config.get(&Value::String("matrix".to_string())) {
                         validate_matrix(matrix, result);

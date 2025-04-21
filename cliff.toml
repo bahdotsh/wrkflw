@@ -17,7 +17,7 @@ body = """
 {% for group, commits in commits | group_by(attribute="group") %}
 ### {{ group | upper_first }}
 {% for commit in commits %}
-- {% if commit.breaking %}**BREAKING:** {% endif %}{{ commit.message | upper_first }} ([{{ commit.id | truncate(length=7, end="") }}]({{ commit.id | github_link }})){% if commit.links %} ({% for link in commit.links %}[{{ link.text }}]({{ link.href }}){% if not loop.last %}, {% endif %}{% endfor %}){% endif %}
+- {% if commit.breaking %}**BREAKING:** {% endif %}{{ commit.message | upper_first }} ([{{ commit.id | truncate(length=7, end="") }}](https://github.com/bahdotsh/wrkflw/commit/{{ commit.id }})){% if commit.links %} ({% for link in commit.links %}[{{ link.text }}]({{ link.href }}){% if not loop.last %}, {% endif %}{% endfor %}){% endif %}
 {% endfor %}
 {% endfor %}
 """
@@ -51,7 +51,7 @@ commit_parsers = [
 # Define the GitHub repository URL for commit links
 [git.link]
 # Format: https://github.com/USER/REPO/commit/{}
-github_link = "https://github.com/bahdotsh/wrkflw/commit/{}"
+commit_link = "https://github.com/bahdotsh/wrkflw/commit/{}"
 
 # Format of the git commit link
 link_parsers = [

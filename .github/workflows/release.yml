@@ -11,10 +11,17 @@ on:
         required: true
         default: 'test-release'
 
+# Add permissions at workflow level
+permissions:
+  contents: write
+
 jobs:
   create-release:
     name: Create Release
     runs-on: ubuntu-latest
+    # You can also set permissions at the job level if needed
+    # permissions:
+    #   contents: write
     outputs:
       upload_url: ${{ steps.create_release.outputs.upload_url }}
     steps:
@@ -53,6 +60,9 @@ jobs:
     name: Build Release
     needs: [create-release]
     runs-on: ${{ matrix.os }}
+    # You can also set permissions at the job level if needed
+    # permissions:
+    #   contents: write
     strategy:
       matrix:
         include:

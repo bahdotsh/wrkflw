@@ -32,56 +32,69 @@ impl DockerRuntime {
 pub fn is_available() -> bool {
     // Use the safe FD redirection utility from utils
     match crate::utils::fd::with_stderr_to_null(|| {
-        match Docker::connect_with_local_defaults() {
-            Ok(docker) => {
-                // Add a timeout to the ping operation to prevent hanging
-                let ping_future = docker.ping();
-                match futures::executor::block_on(async {
-                    match tokio::time::timeout(std::time::Duration::from_secs(5), ping_future).await
-                    {
-                        Ok(result) => result,
-                        Err(_) => {
-                            logging::warning("Docker ping timed out after 5 seconds");
-                            Err(bollard::errors::Error::DockerResponseServerError {
-                                status_code: 500,
-                                message: "Timeout pinging Docker daemon".to_string(),
-                            })
-                        }
-                    }
-                }) {
-                    Ok(_) => true,
-                    Err(e) => {
-                        // Only log at debug level to avoid cluttering the console with technical errors
-                        logging::debug(&format!("Docker daemon is running but ping failed: {}", e));
-
-                        // Additional check for Linux CI environments
-                        if cfg!(target_os = "linux") && std::env::var("CI").is_ok() {
-                            logging::info("Running in Linux CI environment, performing additional Docker availability checks");
-
-                            // Try a simple docker command as a fallback check
-                            match std::process::Command::new("docker").arg("version").output() {
-                                Ok(output) => output.status.success(),
-                                Err(_) => false,
-                            }
-                        } else {
-                            false
-                        }
-                    }
+        // First, check if docker CLI is available as a quick non-blocking test
+        if cfg!(target_os = "linux") || cfg!(target_os = "macos") {
+            // Try a simple command with a very short timeout
+            match std::process::Command::new("docker")
+                .arg("version")
+                .arg("--format")
+                .arg("{{.Server.Version}}")
+                .output() {
+                Ok(output) if output.status.success() => {
+                    // Docker CLI is available, but we still need to check the daemon
+                    logging::debug("Docker CLI is available, checking API access");
+                },
+                _ => {
+                    // Docker CLI not available, don't bother with API checks
+                    logging::debug("Docker CLI is not available");
+                    return false;
                 }
             }
-            Err(e) => {
-                // Only log at debug level to avoid confusing users
-                logging::debug(&format!(
-                    "Docker daemon is not running or not properly configured: {}",
-                    e
-                ));
-                false
-            }
         }
+
+        // Create a separate thread with a hard timeout for the Docker API check
+        // This ensures we don't block the main thread indefinitely
+        let thread_result = std::thread::scope(|s| {
+            let handle = s.spawn(|| {
+                match Docker::connect_with_local_defaults() {
+                    Ok(docker) => {
+                        // Use a very short timeout for the ping operation
+                        match futures::executor::block_on(async {
+                            tokio::time::timeout(std::time::Duration::from_secs(2), docker.ping()).await
+                        }) {
+                            Ok(Ok(_)) => true,
+                            Ok(Err(e)) => {
+                                logging::debug(&format!("Docker daemon ping failed: {}", e));
+                                false
+                            }
+                            Err(_) => {
+                                logging::debug("Docker daemon ping timed out after 2 seconds");
+                                false
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        logging::debug(&format!("Docker daemon connection failed: {}", e));
+                        false
+                    }
+                }
+            });
+
+            // Add a hard timeout for the thread itself
+            match handle.join() {
+                Ok(result) => result,
+                Err(_) => {
+                    logging::warning("Docker availability check thread panicked");
+                    false
+                }
+            }
+        });
+        
+        thread_result
     }) {
         Ok(result) => result,
         Err(_) => {
-            logging::debug("Failed to redirect stderr when checking Docker availability.");
+            logging::debug("Failed to redirect stderr when checking Docker availability");
             false
         }
     }

@@ -172,24 +172,45 @@ impl App {
         let mut initial_logs = Vec::new();
         let runtime_type = match runtime_type {
             RuntimeType::Docker => {
-                // Use the safe FD redirection utility from utils
-                let is_docker_available =
-                    match utils::fd::with_stderr_to_null(executor::docker::is_available) {
-                        Ok(result) => result,
-                        Err(_) => {
-                            logging::debug(
-                                "Failed to redirect stderr when checking Docker availability.",
-                            );
-                            false
+                // Use a timeout for the Docker availability check to prevent hanging
+                let is_docker_available = match std::panic::catch_unwind(|| {
+                    // Use a very short timeout to prevent blocking the UI
+                    let result = std::thread::scope(|s| {
+                        let handle = s.spawn(|| {
+                            utils::fd::with_stderr_to_null(executor::docker::is_available).unwrap_or(false)
+                        });
+                        
+                        // Set a short timeout for the thread
+                        let start = std::time::Instant::now();
+                        let timeout = std::time::Duration::from_secs(1);
+                        
+                        while start.elapsed() < timeout {
+                            if handle.is_finished() {
+                                return handle.join().unwrap_or(false);
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(10));
                         }
-                    };
+                        
+                        // If we reach here, the check took too long
+                        logging::warning("Docker availability check timed out, falling back to emulation mode");
+                        false
+                    });
+                    result
+                }) {
+                    Ok(result) => result,
+                    Err(_) => {
+                        logging::warning("Docker availability check failed with panic, falling back to emulation mode");
+                        false
+                    }
+                };
 
                 if !is_docker_available {
                     initial_logs
-                        .push("Docker is not available. Using emulation mode instead.".to_string());
-                    logging::warning("Docker is not available. Using emulation mode instead.");
+                        .push("Docker is not available or unresponsive. Using emulation mode instead.".to_string());
+                    logging::warning("Docker is not available or unresponsive. Using emulation mode instead.");
                     RuntimeType::Emulation
                 } else {
+                    logging::info("Docker is available, using Docker runtime");
                     RuntimeType::Docker
                 }
             }

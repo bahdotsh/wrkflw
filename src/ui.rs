@@ -2960,18 +2960,27 @@ fn run_tui_event_loop(
     rx: &mpsc::Receiver<ExecutionResultMsg>,
     verbose: bool,
 ) -> io::Result<()> {
-    loop {
-        // Update UI on tick
-        if app.tick() {
-            app.update_running_workflow_progress();
-        }
+    // Max time to wait for events - keep this short to ensure UI responsiveness
+    let event_poll_timeout = Duration::from_millis(50);
 
-        // Draw UI
+    // Set up a dedicated tick timer
+    let tick_rate = app.tick_rate;
+    let mut last_tick = Instant::now();
+
+    loop {
+        // Always redraw the UI on each loop iteration to keep it responsive
         terminal.draw(|f| {
             render_ui(f, app);
         })?;
 
-        // Handle incoming execution results
+        // Update the UI on every tick
+        if last_tick.elapsed() >= tick_rate {
+            app.tick();
+            app.update_running_workflow_progress();
+            last_tick = Instant::now();
+        }
+
+        // Non-blocking check for execution results
         if let Ok((workflow_idx, result)) = rx.try_recv() {
             app.process_execution_result(workflow_idx, result);
             app.current_execution = None;
@@ -2985,8 +2994,8 @@ fn run_tui_event_loop(
             start_next_workflow_execution(app, tx_clone, verbose);
         }
 
-        // Handle key events - use shorter timeout to improve responsiveness
-        if event::poll(Duration::from_millis(50))? {
+        // Handle key events with a short timeout
+        if event::poll(event_poll_timeout)? {
             if let Event::Key(key) = event::read()? {
                 // Handle search input first if we're in search mode and logs tab
                 if app.selected_tab == 2 && app.log_search_active {

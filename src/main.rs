@@ -124,6 +124,10 @@ pub async fn cleanup_on_exit() {
 }
 
 async fn handle_signals() {
+    // Set up a hard exit timer in case cleanup takes too long
+    // This ensures the app always exits even if Docker operations are stuck
+    let hard_exit_time = std::time::Duration::from_secs(10);
+
     // Wait for Ctrl+C
     match tokio::signal::ctrl_c().await {
         Ok(_) => {
@@ -136,10 +140,22 @@ async fn handle_signals() {
         }
     }
 
+    // Set up a watchdog thread that will force exit if cleanup takes too long
+    // This is important because Docker operations can sometimes hang indefinitely
+    let _ = std::thread::spawn(move || {
+        std::thread::sleep(hard_exit_time);
+        eprintln!(
+            "Cleanup taking too long (over {} seconds), forcing exit...",
+            hard_exit_time.as_secs()
+        );
+        logging::error("Forced exit due to cleanup timeout");
+        std::process::exit(1);
+    });
+
     // Clean up containers
     cleanup_on_exit().await;
 
-    // Exit with success status
+    // Exit with success status - the force exit thread will be terminated automatically
     std::process::exit(0);
 }
 

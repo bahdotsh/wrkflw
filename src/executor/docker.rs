@@ -51,7 +51,7 @@ pub fn is_available() -> bool {
                 match process {
                     Ok(mut child) => {
                         // Set a very short timeout for the process
-                        let status = match std::thread::scope(|_| {
+                        let status = std::thread::scope(|_| {
                             // Try to wait for a short time
                             for _ in 0..10 {
                                 match child.try_wait() {
@@ -65,16 +65,7 @@ pub fn is_available() -> bool {
                             // Kill it if it takes too long
                             let _ = child.kill();
                             false
-                        }) {
-                            true => {
-                                // logging::debug("Docker CLI is available");
-                                true
-                            }
-                            false => {
-                                // logging::debug("Docker CLI is not responding quickly");
-                                false
-                            }
-                        };
+                        });
 
                         if !status {
                             return false;

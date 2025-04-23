@@ -90,24 +90,23 @@ fn parse_key_val(s: &str) -> Result<(String, String), String> {
 // Make this function public for testing
 pub async fn cleanup_on_exit() {
     // Clean up Docker resources if available, but don't let it block indefinitely
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(3),
-        async {
-            match Docker::connect_with_local_defaults() {
-                Ok(docker) => {
-                    executor::cleanup_resources(&docker).await;
-                }
-                Err(_) => {
-                    // Docker not available
-                    logging::info("Docker not available, skipping Docker cleanup");
-                }
+    match tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        match Docker::connect_with_local_defaults() {
+            Ok(docker) => {
+                executor::cleanup_resources(&docker).await;
             }
-        },
-    )
+            Err(_) => {
+                // Docker not available
+                logging::info("Docker not available, skipping Docker cleanup");
+            }
+        }
+    })
     .await
     {
         Ok(_) => logging::debug("Docker cleanup completed successfully"),
-        Err(_) => logging::warning("Docker cleanup timed out after 3 seconds, continuing with shutdown"),
+        Err(_) => {
+            logging::warning("Docker cleanup timed out after 3 seconds, continuing with shutdown")
+        }
     }
 
     // Always clean up emulation resources

@@ -177,22 +177,25 @@ impl App {
                     // Use a very short timeout to prevent blocking the UI
                     let result = std::thread::scope(|s| {
                         let handle = s.spawn(|| {
-                            utils::fd::with_stderr_to_null(executor::docker::is_available).unwrap_or(false)
+                            utils::fd::with_stderr_to_null(executor::docker::is_available)
+                                .unwrap_or(false)
                         });
-                        
+
                         // Set a short timeout for the thread
                         let start = std::time::Instant::now();
                         let timeout = std::time::Duration::from_secs(1);
-                        
+
                         while start.elapsed() < timeout {
                             if handle.is_finished() {
                                 return handle.join().unwrap_or(false);
                             }
                             std::thread::sleep(std::time::Duration::from_millis(10));
                         }
-                        
+
                         // If we reach here, the check took too long
-                        logging::warning("Docker availability check timed out, falling back to emulation mode");
+                        logging::warning(
+                            "Docker availability check timed out, falling back to emulation mode",
+                        );
                         false
                     });
                     result
@@ -205,9 +208,13 @@ impl App {
                 };
 
                 if !is_docker_available {
-                    initial_logs
-                        .push("Docker is not available or unresponsive. Using emulation mode instead.".to_string());
-                    logging::warning("Docker is not available or unresponsive. Using emulation mode instead.");
+                    initial_logs.push(
+                        "Docker is not available or unresponsive. Using emulation mode instead."
+                            .to_string(),
+                    );
+                    logging::warning(
+                        "Docker is not available or unresponsive. Using emulation mode instead.",
+                    );
                     RuntimeType::Emulation
                 } else {
                     logging::info("Docker is available, using Docker runtime");

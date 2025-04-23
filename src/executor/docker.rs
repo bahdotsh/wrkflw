@@ -39,11 +39,12 @@ pub fn is_available() -> bool {
                 .arg("version")
                 .arg("--format")
                 .arg("{{.Server.Version}}")
-                .output() {
+                .output()
+            {
                 Ok(output) if output.status.success() => {
                     // Docker CLI is available, but we still need to check the daemon
                     logging::debug("Docker CLI is available, checking API access");
-                },
+                }
                 _ => {
                     // Docker CLI not available, don't bother with API checks
                     logging::debug("Docker CLI is not available");
@@ -60,7 +61,8 @@ pub fn is_available() -> bool {
                     Ok(docker) => {
                         // Use a very short timeout for the ping operation
                         match futures::executor::block_on(async {
-                            tokio::time::timeout(std::time::Duration::from_secs(2), docker.ping()).await
+                            tokio::time::timeout(std::time::Duration::from_secs(2), docker.ping())
+                                .await
                         }) {
                             Ok(Ok(_)) => true,
                             Ok(Err(e)) => {
@@ -89,7 +91,7 @@ pub fn is_available() -> bool {
                 }
             }
         });
-        
+
         thread_result
     }) {
         Ok(result) => result,

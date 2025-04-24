@@ -33,14 +33,30 @@ pub async fn execute_workflow(
     let execution_plan = dependency::resolve_dependencies(&workflow)?;
 
     // 3. Initialize appropriate runtime
-    let runtime = initialize_runtime(runtime_type)?;
+    let runtime = initialize_runtime(runtime_type.clone())?;
 
     // Create a temporary workspace directory
     let workspace_dir = tempfile::tempdir()
         .map_err(|e| ExecutionError::Execution(format!("Failed to create workspace: {}", e)))?;
 
     // 4. Set up GitHub-like environment
-    let env_context = environment::create_github_context(&workflow, workspace_dir.path());
+    let mut env_context = environment::create_github_context(&workflow, workspace_dir.path());
+
+    // Add runtime mode to environment
+    env_context.insert(
+        "WRKFLW_RUNTIME_MODE".to_string(),
+        if runtime_type == RuntimeType::Emulation {
+            "emulation".to_string()
+        } else {
+            "docker".to_string()
+        },
+    );
+
+    // Add flag to hide GitHub action messages when in emulation mode
+    env_context.insert(
+        "WRKFLW_HIDE_ACTION_MESSAGES".to_string(),
+        "true".to_string(),
+    );
 
     // Setup GitHub environment files
     environment::setup_github_environment_files(workspace_dir.path()).map_err(|e| {
@@ -955,12 +971,40 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                     // Log error but continue
                     println!("   Warning: Special action handling failed: {}", e);
                 }
+
+                // Check if we should hide GitHub action messages
+                let hide_action_value = ctx
+                    .job_env
+                    .get("WRKFLW_HIDE_ACTION_MESSAGES")
+                    .map(|v| v.clone())
+                    .unwrap_or_else(|| "not set".to_string());
+
+                logging::debug(&format!(
+                    "WRKFLW_HIDE_ACTION_MESSAGES value: {}",
+                    hide_action_value
+                ));
+
+                let hide_messages = hide_action_value == "true";
+                logging::debug(&format!("Should hide messages: {}", hide_messages));
+
+                // Only log a message to the console if we're showing action messages
+                if !hide_messages {
+                    // For Emulation mode, log a message about what action would be executed
+                    println!("   ⚙️ Would execute GitHub action: {}", uses);
+                }
+
                 // GitHub actions - would need to clone repo and setup action
                 cmd.push("sh");
                 cmd.push("-c");
 
                 // Store the string and keep a reference to it
-                let echo_cmd = format!("echo 'Would execute GitHub action: {}'", uses);
+                let echo_cmd = if hide_messages {
+                    // Empty string so there's no output
+                    "".to_string()
+                } else {
+                    format!("echo 'Would execute GitHub action: {}'", uses)
+                };
+
                 owned_strings.push(echo_cmd);
                 cmd.push(match owned_strings.last() {
                     Some(s) => s,
@@ -1001,6 +1045,7 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                 .await
                 .map_err(|e| ExecutionError::Runtime(format!("{}", e)))?;
 
+            // Check if this was called from 'run' branch - don't try to hide these outputs
             if output.exit_code == 0 {
                 Ok(StepResult {
                     name: step_name,
@@ -1022,36 +1067,106 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
         // Apply GitHub-style matrix variable substitution to the command
         let processed_run = substitution::process_step_run(run, ctx.matrix_combination);
 
-        // Print the command we're trying to run
-        let shell_default = "bash".to_string();
-        let shell = step_env.get("SHELL").unwrap_or(&shell_default);
-
-        // Store command in a vector to ensure it stays alive
+        // Determine the shell to use based on the runner platform
         let mut cmd_strings = Vec::new();
         let mut cmd: Vec<&str> = Vec::new();
 
-        if shell == "bash" {
-            cmd.push("bash");
-            cmd.push("-e");
-            cmd.push("-c");
-
-            // Store the string and keep a reference to it
-            cmd_strings.push(processed_run);
-            cmd.push(&cmd_strings[0]);
-        } else if shell == "powershell" {
-            cmd.push("pwsh");
-            cmd.push("-Command");
-
-            // Store the string and keep a reference to it
-            cmd_strings.push(processed_run);
-            cmd.push(&cmd_strings[0]);
+        // Detect platform from the runner string
+        let platform = if ctx.job_runs_on.to_lowercase().contains("windows") {
+            "windows"
+        } else if ctx.job_runs_on.to_lowercase().contains("macos") {
+            "macos"
         } else {
-            cmd.push("sh");
-            cmd.push("-c");
+            "linux"
+        };
 
-            // Store the string and keep a reference to it
-            cmd_strings.push(processed_run);
-            cmd.push(&cmd_strings[0]);
+        // Get the shell from environment or use platform-appropriate default
+        let shell_env = step_env.get("SHELL").map(|s| s.as_str());
+
+        // We'll use the runtime mode for this step - no reliable way to detect at runtime
+        // so we trust the environment variables
+        let runtime_mode = ctx
+            .job_env
+            .get("WRKFLW_RUNTIME_MODE")
+            .map(|s| s.as_str())
+            .unwrap_or("default");
+        let is_emulation = runtime_mode == "emulation";
+
+        match platform {
+            "windows" => {
+                // Use PowerShell for Windows runners
+                cmd.push("pwsh");
+                cmd.push("-Command");
+                cmd_strings.push(processed_run);
+                cmd.push(&cmd_strings[0]);
+
+                // Add Windows-specific environment variables if not present
+                if !step_env.contains_key("TEMP") {
+                    step_env.insert("TEMP".to_string(), "C:\\Windows\\Temp".to_string());
+                }
+                if !step_env.contains_key("TMP") {
+                    step_env.insert("TMP".to_string(), "C:\\Windows\\Temp".to_string());
+                }
+            }
+            "macos" => {
+                // Use bash for macOS runners
+                cmd.push("bash");
+                cmd.push("-e");
+                cmd.push("-c");
+                cmd_strings.push(processed_run);
+                cmd.push(&cmd_strings[0]);
+
+                // Add macOS-specific environment variables if not present
+                if !step_env.contains_key("TMPDIR") {
+                    step_env.insert("TMPDIR".to_string(), "/tmp".to_string());
+                }
+
+                // Set HOME directory differently based on runtime mode
+                if !step_env.contains_key("HOME") {
+                    if is_emulation {
+                        // In emulation mode, use the real user's home directory
+                        if let Ok(home) = std::env::var("HOME") {
+                            step_env.insert("HOME".to_string(), home);
+                        } else {
+                            // Fallback to something that should be writable
+                            step_env.insert("HOME".to_string(), ".".to_string());
+                        }
+                    } else {
+                        // In Docker mode, use /root
+                        step_env.insert("HOME".to_string(), "/root".to_string());
+                    }
+                }
+
+                // Add RUNNER_OS to help scripts identify the platform
+                if !step_env.contains_key("RUNNER_OS") {
+                    step_env.insert("RUNNER_OS".to_string(), "macOS".to_string());
+                }
+            }
+            _ => {
+                // linux and any other platform
+                match shell_env {
+                    Some("powershell") => {
+                        cmd.push("pwsh");
+                        cmd.push("-Command");
+                        cmd_strings.push(processed_run);
+                        cmd.push(&cmd_strings[0]);
+                    }
+                    Some(shell) if shell.ends_with("bash") => {
+                        cmd.push("bash");
+                        cmd.push("-e");
+                        cmd.push("-c");
+                        cmd_strings.push(processed_run);
+                        cmd.push(&cmd_strings[0]);
+                    }
+                    _ => {
+                        // Default to sh
+                        cmd.push("sh");
+                        cmd.push("-c");
+                        cmd_strings.push(processed_run);
+                        cmd.push(&cmd_strings[0]);
+                    }
+                }
+            }
         }
 
         // Convert environment HashMap to Vec<(&str, &str)> for container runtime
@@ -1060,33 +1175,26 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
 
-        let image = if ctx.job_runs_on.contains("ubuntu") {
-            // Try with a simple Ubuntu image
-            "ubuntu:latest".to_string()
-        } else {
-            get_runner_image(ctx.job_runs_on)
-        };
+        // Use the appropriate runner image based on platform
+        let image = get_runner_image(ctx.job_runs_on);
 
         ctx.runtime
             .pull_image(&image)
             .await
             .map_err(|e| ExecutionError::Runtime(format!("Failed to pull image: {}", e)))?;
 
-        // Map volumes
-        let volumes: Vec<(&Path, &Path)> = vec![(ctx.working_dir, Path::new("/github/workspace"))];
+        // Map volumes with platform-specific paths
+        let container_workspace_path = Path::new("/github/workspace"); // Use consistent path for all platforms
+
+        let volumes: Vec<(&Path, &Path)> = vec![(ctx.working_dir, container_workspace_path)];
 
         let output = ctx
             .runtime
-            .run_container(
-                &image,
-                &cmd,
-                &env_vars,
-                Path::new("/github/workspace"),
-                &volumes,
-            )
+            .run_container(&image, &cmd, &env_vars, container_workspace_path, &volumes)
             .await
             .map_err(|e| ExecutionError::Runtime(format!("{}", e)))?;
 
+        // Check if this was called from 'run' branch - don't try to hide these outputs
         if output.exit_code == 0 {
             Ok(StepResult {
                 name: step_name,
@@ -1180,8 +1288,29 @@ fn get_runner_image(runs_on: &str) -> String {
         "ubuntu-20.04-large" => "catthehacker/ubuntu:full-20.04",
         "ubuntu-18.04-large" => "catthehacker/ubuntu:full-18.04",
 
+        // macOS runners - use existing images for macOS compatibility layer
+        "macos-latest" => "catthehacker/ubuntu:act-latest", // Use Ubuntu with macOS compatibility
+        "macos-12" => "catthehacker/ubuntu:act-latest",     // Monterey equivalent
+        "macos-11" => "catthehacker/ubuntu:act-latest",     // Big Sur equivalent
+        "macos-10.15" => "catthehacker/ubuntu:act-latest",  // Catalina equivalent
+
+        // Windows runners - using servercore-based images
+        "windows-latest" => "mcr.microsoft.com/windows/servercore:ltsc2022",
+        "windows-2022" => "mcr.microsoft.com/windows/servercore:ltsc2022",
+        "windows-2019" => "mcr.microsoft.com/windows/servercore:ltsc2019",
+
         // Default case for other runners or custom strings
-        _ => "ubuntu:latest", // Default to Ubuntu for everything
+        _ => {
+            // Check for platform prefixes and provide appropriate images
+            let runs_on_lower = runs_on.trim().to_lowercase();
+            if runs_on_lower.starts_with("macos") {
+                "catthehacker/ubuntu:act-latest" // Use Ubuntu with macOS compatibility
+            } else if runs_on_lower.starts_with("windows") {
+                "mcr.microsoft.com/windows/servercore:ltsc2022" // Default Windows image
+            } else {
+                "ubuntu:latest" // Default to Ubuntu for everything else
+            }
+        }
     }
     .to_string()
 }
@@ -1195,17 +1324,47 @@ async fn prepare_runner_image(
         println!("  Preparing runner image: {}", image);
     }
 
-    // Pull the image
-    runtime
-        .pull_image(image)
-        .await
-        .map_err(|e| ExecutionError::Runtime(format!("Failed to pull runner image: {}", e)))?;
+    // Check if this is a platform-specific image
+    let is_windows_image =
+        image.contains("windows") || image.contains("servercore") || image.contains("nanoserver");
+    let is_macos_emu =
+        image.contains("act-") && (image.contains("catthehacker") || image.contains("nektos"));
 
-    if verbose {
-        println!("  Image {} ready", image);
+    // Display appropriate warnings for non-Linux runners
+    if is_windows_image {
+        logging::warning("Windows runners in Docker mode have limited compatibility");
+        logging::info("Some Windows-specific features may not work correctly");
+    } else if is_macos_emu {
+        logging::warning(
+            "macOS emulation active - running on Linux with macOS compatibility layer",
+        );
+        logging::info("Using an Ubuntu-based runner with macOS compatibility");
     }
 
-    Ok(())
+    // Pull the image
+    match runtime.pull_image(image).await {
+        Ok(_) => {
+            if verbose {
+                println!("  Image {} ready", image);
+            }
+            Ok(())
+        }
+        Err(e) => {
+            // For platform-specific images, provide more helpful error messages
+            if is_windows_image {
+                logging::error("Failed to pull Windows runner image. Docker may not support Windows containers on your system.");
+                logging::info("Try using emulation mode (-e) or switch to a Linux-based runner like 'ubuntu-latest'");
+            } else if is_macos_emu {
+                logging::error("Failed to pull macOS compatibility image.");
+                logging::info("Try using emulation mode (-e) or switch to a Linux-based runner like 'ubuntu-latest'");
+            }
+
+            Err(ExecutionError::Runtime(format!(
+                "Failed to pull runner image: {}",
+                e
+            )))
+        }
+    }
 }
 
 async fn execute_composite_action(

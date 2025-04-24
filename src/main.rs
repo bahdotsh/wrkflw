@@ -48,6 +48,10 @@ enum Commands {
         /// Use emulation mode instead of Docker
         #[arg(short, long)]
         emulate: bool,
+
+        /// Show 'Would execute GitHub action' messages in emulation mode
+        #[arg(long, default_value_t = false)]
+        show_action_messages: bool,
     },
 
     /// Open TUI interface to manage workflows
@@ -58,6 +62,10 @@ enum Commands {
         /// Use emulation mode instead of Docker
         #[arg(short, long)]
         emulate: bool,
+
+        /// Show 'Would execute GitHub action' messages in emulation mode
+        #[arg(long, default_value_t = false)]
+        show_action_messages: bool,
     },
 
     /// Trigger a GitHub workflow remotely
@@ -181,7 +189,11 @@ async fn main() {
             });
         }
 
-        Some(Commands::Run { path, emulate }) => {
+        Some(Commands::Run {
+            path,
+            emulate,
+            show_action_messages,
+        }) => {
             // Run the workflow execution
             let runtime_type = if *emulate {
                 executor::RuntimeType::Emulation
@@ -195,6 +207,13 @@ async fn main() {
                     executor::RuntimeType::Docker
                 }
             };
+
+            // Control hiding action messages based on the flag
+            if !show_action_messages {
+                std::env::set_var("WRKFLW_HIDE_ACTION_MESSAGES", "true");
+            } else {
+                std::env::set_var("WRKFLW_HIDE_ACTION_MESSAGES", "false");
+            }
 
             // Run in CLI mode with the specific workflow
             match ui::execute_workflow_cli(path, runtime_type, verbose).await {
@@ -210,7 +229,11 @@ async fn main() {
             }
         }
 
-        Some(Commands::Tui { path, emulate }) => {
+        Some(Commands::Tui {
+            path,
+            emulate,
+            show_action_messages,
+        }) => {
             // Open the TUI interface
             let runtime_type = if *emulate {
                 executor::RuntimeType::Emulation
@@ -224,6 +247,13 @@ async fn main() {
                     executor::RuntimeType::Docker
                 }
             };
+
+            // Control hiding action messages based on the flag
+            if !show_action_messages {
+                std::env::set_var("WRKFLW_HIDE_ACTION_MESSAGES", "true");
+            } else {
+                std::env::set_var("WRKFLW_HIDE_ACTION_MESSAGES", "false");
+            }
 
             match ui::run_wrkflw_tui(path.as_ref(), runtime_type, verbose).await {
                 Ok(_) => {
@@ -295,6 +325,9 @@ async fn main() {
             } else {
                 executor::RuntimeType::Docker
             };
+
+            // Set environment variable to hide action messages by default
+            std::env::set_var("WRKFLW_HIDE_ACTION_MESSAGES", "true");
 
             match ui::run_wrkflw_tui(
                 Some(&PathBuf::from(".github/workflows")),

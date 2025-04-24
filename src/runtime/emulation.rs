@@ -147,6 +147,38 @@ impl ContainerRuntime for EmulationRuntime {
         // Prepare the workspace
         let container_working_dir = self.prepare_workspace(working_dir, volumes);
 
+        // Check if this is likely a Rust job (cargo command)
+        let is_rust_job = cmd
+            .iter()
+            .any(|&c| c.contains("cargo") || c.contains("rustc") || c.contains("rustup"));
+
+        // Check if we need to ensure Rust toolchain paths are properly set up
+        if is_rust_job {
+            logging::info("Rust toolchain detected, ensuring proper setup...");
+
+            // Create a local .rustup directory if needed
+            let local_rustup = container_working_dir.join(".rustup");
+            if !local_rustup.exists() {
+                std::fs::create_dir_all(&local_rustup).map_err(|e| {
+                    ContainerError::ContainerExecution(format!(
+                        "Failed to create .rustup directory: {}",
+                        e
+                    ))
+                })?;
+            }
+
+            // Create a local .cargo directory if needed
+            let local_cargo = container_working_dir.join(".cargo");
+            if !local_cargo.exists() {
+                std::fs::create_dir_all(&local_cargo).map_err(|e| {
+                    ContainerError::ContainerExecution(format!(
+                        "Failed to create .cargo directory: {}",
+                        e
+                    ))
+                })?;
+            }
+        }
+
         // Detect if this is a long-running command that should be spawned as a detached process
         let is_long_running = cmd.iter().any(|&c| {
             c.contains("server")
@@ -221,6 +253,35 @@ impl ContainerRuntime for EmulationRuntime {
             }
         }
 
+        // Create a map of environment variables for easy manipulation
+        let mut env_map: std::collections::HashMap<String, String> = env_vars
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+
+        // For Rust jobs, set up RUSTUP_HOME and CARGO_HOME to point to local directories
+        if is_rust_job {
+            let rustup_home = container_working_dir
+                .join(".rustup")
+                .to_string_lossy()
+                .to_string();
+            let cargo_home = container_working_dir
+                .join(".cargo")
+                .to_string_lossy()
+                .to_string();
+
+            env_map.insert("RUSTUP_HOME".to_string(), rustup_home);
+            env_map.insert("CARGO_HOME".to_string(), cargo_home);
+            logging::info(&format!(
+                "Setting RUSTUP_HOME={}",
+                env_map.get("RUSTUP_HOME").unwrap()
+            ));
+            logging::info(&format!(
+                "Setting CARGO_HOME={}",
+                env_map.get("CARGO_HOME").unwrap()
+            ));
+        }
+
         // Ensure we have a command
         if cmd.is_empty() {
             return Err(ContainerError::ContainerExecution(
@@ -272,8 +333,8 @@ impl ContainerRuntime for EmulationRuntime {
                     // Add the command
                     command.arg(final_cmd);
 
-                    // Set environment variables
-                    for (key, value) in env_vars {
+                    // Set environment variables from the map
+                    for (key, value) in &env_map {
                         command.env(key, value);
                     }
 
@@ -301,8 +362,8 @@ impl ContainerRuntime for EmulationRuntime {
             let command_str = format!("{{ {}; }} && wait", cmd.join(" "));
             shell_command.arg(command_str);
 
-            // Set environment variables
-            for (key, value) in env_vars {
+            // Set environment variables from the map
+            for (key, value) in &env_map {
                 shell_command.env(key, value);
             }
 
@@ -332,8 +393,8 @@ impl ContainerRuntime for EmulationRuntime {
             command.arg(arg);
         }
 
-        // Set environment variables
-        for (key, value) in env_vars {
+        // Set environment variables from the map
+        for (key, value) in &env_map {
             command.env(key, value);
         }
 

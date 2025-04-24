@@ -3590,7 +3590,17 @@ pub async fn execute_workflow_cli(
                         StepStatus::Success => {
                             println!("  ✅ {}", step.name);
 
-                            if !step.output.trim().is_empty() && step.output.lines().count() <= 3 {
+                            // Check if this is a GitHub action output that should be hidden
+                            let should_hide = std::env::var("WRKFLW_HIDE_ACTION_MESSAGES")
+                                .map(|val| val == "true")
+                                .unwrap_or(false)
+                                && step.output.contains("Would execute GitHub action:");
+
+                            // Only show output if not hidden and it's short
+                            if !should_hide
+                                && !step.output.trim().is_empty()
+                                && step.output.lines().count() <= 3
+                            {
                                 // For short outputs, show directly
                                 println!("    {}", step.output.trim());
                             }

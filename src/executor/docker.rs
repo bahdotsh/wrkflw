@@ -9,6 +9,7 @@ use bollard::{
 };
 use futures_util::StreamExt;
 use once_cell::sync::Lazy;
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -438,102 +439,100 @@ impl DockerRuntime {
         working_dir: &Path,
         volumes: &[(&Path, &Path)],
     ) -> Result<ContainerOutput, ContainerError> {
-        // Check if command contains background processes
-        let has_background = cmd.iter().any(|c| c.contains(" &"));
-
-        // Check if any command uses GITHUB_ variables and needs special handling
-        let uses_github_vars = cmd.iter().any(|c| c.contains("GITHUB_"));
-
-        // If there's a command using GitHub variables, we need to wrap it properly
-        let cmd_vec: Vec<String> = if uses_github_vars {
-            let mut shell_cmd = Vec::new();
-            shell_cmd.push("sh".to_string());
-            shell_cmd.push("-c".to_string());
-
-            // Join the original command and fix GitHub variables reference
-            let command_with_fixes =
-                if cmd.len() > 2 && (cmd[0] == "sh" || cmd[0] == "bash") && cmd[1] == "-c" {
-                    // For shell commands, we need to modify the command string to handle GitHub variables
-                    let fixed_cmd = cmd[2]
-                        .replace(">>$GITHUB_OUTPUT", ">>\"$GITHUB_OUTPUT\"")
-                        .replace(">>$GITHUB_ENV", ">>\"$GITHUB_ENV\"")
-                        .replace(">>$GITHUB_PATH", ">>\"$GITHUB_PATH\"")
-                        .replace(">>$GITHUB_STEP_SUMMARY", ">>\"$GITHUB_STEP_SUMMARY\"");
-
-                    format!("{} ; wait", fixed_cmd)
-                } else {
-                    // Otherwise join all parts and add wait
-                    let cmd_str: Vec<String> = cmd.iter().map(|s| s.to_string()).collect();
-                    format!("{} ; wait", cmd_str.join(" "))
-                };
-
-            shell_cmd.push(command_with_fixes);
-            shell_cmd
-        } else if has_background {
-            // If the command contains a background process, wrap it in a shell script
-            // that properly manages the background process and exits when the foreground completes
-            let mut shell_cmd = Vec::new();
-            shell_cmd.push("sh".to_string());
-            shell_cmd.push("-c".to_string());
-
-            // Join the original command and add a wait for any child processes
-            let command_with_wait =
-                if cmd.len() > 2 && (cmd[0] == "sh" || cmd[0] == "bash") && cmd[1] == "-c" {
-                    // For shell commands, we just need to modify the command string
-                    format!("{} ; wait", cmd[2])
-                } else {
-                    // Otherwise join all parts and add wait
-                    let cmd_str: Vec<String> = cmd.iter().map(|s| s.to_string()).collect();
-                    format!("{} ; wait", cmd_str.join(" "))
-                };
-
-            shell_cmd.push(command_with_wait);
-            shell_cmd
-        } else {
-            // No background processes, use original command
-            cmd.iter().map(|s| s.to_string()).collect()
-        };
-
-        // Always try to pull the image first - with a timeout
-        match self.pull_image(image).await {
-            Ok(_) => logging::info(&format!("🐳 Successfully pulled image: {}", image)),
-            Err(e) => logging::error(&format!("🐳 Warning: Failed to pull image: {}. Continuing with existing image if available.", e)),
-        }
-        // Map env vars to format Docker expects
-        let env: Vec<String> = env_vars
+        // Collect environment variables
+        let mut env: Vec<String> = env_vars
             .iter()
             .map(|(k, v)| format!("{}={}", k, v))
             .collect();
 
-        // Setup volume bindings
         let mut binds = Vec::new();
-        for (host, container) in volumes {
+        for (host_path, container_path) in volumes {
             binds.push(format!(
                 "{}:{}",
-                host.to_string_lossy(),
-                container.to_string_lossy()
+                host_path.to_string_lossy(),
+                container_path.to_string_lossy()
             ));
         }
 
-        // Create container
+        // Convert command vector to Vec<String>
+        let cmd_vec: Vec<String> = cmd.iter().map(|&s| s.to_string()).collect();
+
+        logging::debug(&format!("Running command: {:?}", cmd_vec));
+        logging::debug(&format!("Environment: {:?}", env));
+        logging::debug(&format!("Working directory: {}", working_dir.display()));
+
+        // Determine platform-specific configurations
+        let is_windows_image = image.contains("windows")
+            || image.contains("servercore")
+            || image.contains("nanoserver");
+        let is_macos_emu =
+            image.contains("act-") && (image.contains("catthehacker") || image.contains("nektos"));
+
+        // Add platform-specific environment variables
+        if is_macos_emu {
+            // Add macOS-specific environment variables
+            env.push("RUNNER_OS=macOS".to_string());
+            env.push("RUNNER_ARCH=X64".to_string());
+            env.push("TMPDIR=/tmp".to_string());
+            env.push("HOME=/root".to_string());
+            env.push("GITHUB_WORKSPACE=/github/workspace".to_string());
+            env.push("PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin".to_string());
+        }
+
+        // Create appropriate container options based on platform
         let options = Some(CreateContainerOptions {
             name: format!("wrkflw-{}", uuid::Uuid::new_v4()),
-            platform: None,
+            platform: if is_windows_image {
+                Some("windows".to_string())
+            } else {
+                None
+            },
         });
 
-        let host_config = HostConfig {
-            binds: Some(binds),
-            ..Default::default()
+        // Configure host configuration based on platform
+        let host_config = if is_windows_image {
+            HostConfig {
+                binds: Some(binds),
+                isolation: Some(bollard::models::HostConfigIsolationEnum::PROCESS),
+                ..Default::default()
+            }
+        } else {
+            HostConfig {
+                binds: Some(binds),
+                ..Default::default()
+            }
         };
 
-        let config = Config {
+        // Create container config with platform-specific settings
+        let mut config = Config {
             image: Some(image.to_string()),
             cmd: Some(cmd_vec),
             env: Some(env),
             working_dir: Some(working_dir.to_string_lossy().to_string()),
             host_config: Some(host_config),
+            // Windows containers need specific configuration
+            user: if is_windows_image {
+                Some("ContainerAdministrator".to_string())
+            } else {
+                None // Don't specify user for macOS emulation - use default root user
+            },
+            // Map appropriate entrypoint for different platforms
+            entrypoint: if is_macos_emu {
+                // For macOS, ensure we use bash
+                Some(vec!["bash".to_string(), "-l".to_string(), "-c".to_string()])
+            } else {
+                None
+            },
             ..Default::default()
         };
+
+        // Run platform-specific container setup
+        if is_macos_emu {
+            // Add special labels for macOS
+            let mut labels = HashMap::new();
+            labels.insert("wrkflw.platform".to_string(), "macos".to_string());
+            config.labels = Some(labels);
+        }
 
         // Create container with a shorter timeout
         let create_result = tokio::time::timeout(

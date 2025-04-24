@@ -222,10 +222,43 @@ WRKFLW automatically cleans up any Docker containers created during workflow exe
 
 ## Limitations
 
-- Some GitHub-specific functionality might not work exactly as it does on GitHub
-- Complex matrix builds with very large matrices may have performance limitations
-- Actions that require specific GitHub environment features may need customization
-- Network-isolated actions might need internet connectivity configured differently
+### Supported Features
+- ✅ Basic workflow syntax and validation
+- ✅ Job dependency resolution and parallel execution
+- ✅ Matrix builds (with reasonable size limits)
+- ✅ Environment variables and GitHub context
+- ✅ Docker container actions
+- ✅ JavaScript actions
+- ✅ Composite actions
+- ✅ Local actions
+- ✅ Special handling for common actions (e.g., `actions/checkout`)
+- ✅ Workflow triggering via `workflow_dispatch`
+- ✅ Environment files (`GITHUB_OUTPUT`, `GITHUB_ENV`, `GITHUB_PATH`, `GITHUB_STEP_SUMMARY`)
+
+### Limited or Unsupported Features
+- ⚠️ GitHub-specific secrets and permissions (limited to basic environment variables)
+- ⚠️ GitHub API integrations (only basic workflow triggering is supported)
+- ⚠️ GitHub-specific environment variables (some may be emulated but not fully functional)
+- ⚠️ Complex matrix builds with very large matrices (performance limitations)
+- ⚠️ Network-isolated actions (may require additional configuration)
+- ⚠️ GitHub Actions cache functionality (not supported in emulation mode)
+- ⚠️ Some GitHub-specific event triggers (only `workflow_dispatch` is fully supported)
+- ⚠️ GitHub-specific runner features (some features may behave differently)
+
+### Runtime Mode Differences
+- **Docker Mode**: Closer to GitHub's environment but may have limitations with certain container configurations
+- **Emulation Mode**: Runs without Docker but has more limitations:
+  - Limited support for container-specific actions
+  - No caching support
+  - Some actions may need to be adapted to work in the local environment
+  - Special action handling is more limited
+
+### Best Practices
+- Test workflows in both Docker and emulation modes to ensure compatibility
+- Keep matrix builds reasonably sized for better performance
+- Use environment variables instead of GitHub secrets when possible
+- Consider using local actions for complex custom functionality
+- Test network-dependent actions carefully in both modes
 
 ## License
 

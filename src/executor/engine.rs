@@ -1617,6 +1617,33 @@ fn get_runner_image(runs_on: &str) -> String {
         "windows-2022" => "mcr.microsoft.com/windows/servercore:ltsc2022",
         "windows-2019" => "mcr.microsoft.com/windows/servercore:ltsc2019",
 
+        // Language-specific runners
+        "python-latest" => "python:3.11-slim",
+        "python-3.11" => "python:3.11-slim",
+        "python-3.10" => "python:3.10-slim",
+        "python-3.9" => "python:3.9-slim",
+        "python-3.8" => "python:3.8-slim",
+
+        "node-latest" => "node:20-slim",
+        "node-20" => "node:20-slim",
+        "node-18" => "node:18-slim",
+        "node-16" => "node:16-slim",
+
+        "java-latest" => "eclipse-temurin:17-jdk",
+        "java-17" => "eclipse-temurin:17-jdk",
+        "java-11" => "eclipse-temurin:11-jdk",
+        "java-8" => "eclipse-temurin:8-jdk",
+
+        "go-latest" => "golang:1.21-slim",
+        "go-1.21" => "golang:1.21-slim",
+        "go-1.20" => "golang:1.20-slim",
+        "go-1.19" => "golang:1.19-slim",
+
+        "dotnet-latest" => "mcr.microsoft.com/dotnet/sdk:7.0",
+        "dotnet-7.0" => "mcr.microsoft.com/dotnet/sdk:7.0",
+        "dotnet-6.0" => "mcr.microsoft.com/dotnet/sdk:6.0",
+        "dotnet-5.0" => "mcr.microsoft.com/dotnet/sdk:5.0",
+
         // Default case for other runners or custom strings
         _ => {
             // Check for platform prefixes and provide appropriate images
@@ -1625,6 +1652,16 @@ fn get_runner_image(runs_on: &str) -> String {
                 "catthehacker/ubuntu:act-latest" // Use Ubuntu with macOS compatibility
             } else if runs_on_lower.starts_with("windows") {
                 "mcr.microsoft.com/windows/servercore:ltsc2022" // Default Windows image
+            } else if runs_on_lower.starts_with("python") {
+                "python:3.11-slim" // Default Python image
+            } else if runs_on_lower.starts_with("node") {
+                "node:20-slim" // Default Node.js image
+            } else if runs_on_lower.starts_with("java") {
+                "eclipse-temurin:17-jdk" // Default Java image
+            } else if runs_on_lower.starts_with("go") {
+                "golang:1.21-slim" // Default Go image
+            } else if runs_on_lower.starts_with("dotnet") {
+                "mcr.microsoft.com/dotnet/sdk:7.0" // Default .NET image
             } else {
                 "ubuntu:latest" // Default to Ubuntu for everything else
             }
@@ -1638,50 +1675,49 @@ async fn prepare_runner_image(
     runtime: &dyn ContainerRuntime,
     verbose: bool,
 ) -> Result<(), ExecutionError> {
-    if verbose {
-        println!("  Preparing runner image: {}", image);
+    // Try to pull the image first
+    if let Err(e) = runtime.pull_image(image).await {
+        logging::warning(&format!("Failed to pull image {}: {}", image, e));
     }
 
-    // Check if this is a platform-specific image
-    let is_windows_image =
-        image.contains("windows") || image.contains("servercore") || image.contains("nanoserver");
-    let is_macos_emu =
-        image.contains("act-") && (image.contains("catthehacker") || image.contains("nektos"));
-
-    // Display appropriate warnings for non-Linux runners
-    if is_windows_image {
-        logging::warning("Windows runners in Docker mode have limited compatibility");
-        logging::info("Some Windows-specific features may not work correctly");
-    } else if is_macos_emu {
-        logging::warning(
-            "macOS emulation active - running on Linux with macOS compatibility layer",
-        );
-        logging::info("Using an Ubuntu-based runner with macOS compatibility");
-    }
-
-    // Pull the image
-    match runtime.pull_image(image).await {
-        Ok(_) => {
+    // Check if this is a language-specific runner
+    let language_info = extract_language_info(image);
+    if let Some((language, version)) = language_info {
+        // Try to prepare a language-specific environment
+        if let Ok(custom_image) = runtime
+            .prepare_language_environment(language, version, None)
+            .await
+            .map_err(|e| ExecutionError::Runtime(e.to_string()))
+        {
             if verbose {
-                println!("  Image {} ready", image);
+                logging::info(&format!("Using customized image: {}", custom_image));
             }
-            Ok(())
+            return Ok(());
         }
-        Err(e) => {
-            // For platform-specific images, provide more helpful error messages
-            if is_windows_image {
-                logging::error("Failed to pull Windows runner image. Docker may not support Windows containers on your system.");
-                logging::info("Try using emulation mode (-e) or switch to a Linux-based runner like 'ubuntu-latest'");
-            } else if is_macos_emu {
-                logging::error("Failed to pull macOS compatibility image.");
-                logging::info("Try using emulation mode (-e) or switch to a Linux-based runner like 'ubuntu-latest'");
-            }
+    }
 
-            Err(ExecutionError::Runtime(format!(
-                "Failed to pull runner image: {}",
-                e
-            )))
-        }
+    Ok(())
+}
+
+/// Extract language and version information from an image name
+fn extract_language_info(image: &str) -> Option<(&'static str, Option<&str>)> {
+    let image_lower = image.to_lowercase();
+
+    // Check for language-specific images
+    if image_lower.starts_with("python:") {
+        Some(("python", Some(&image[7..])))
+    } else if image_lower.starts_with("node:") {
+        Some(("node", Some(&image[5..])))
+    } else if image_lower.starts_with("eclipse-temurin:") {
+        Some(("java", Some(&image[15..])))
+    } else if image_lower.starts_with("golang:") {
+        Some(("go", Some(&image[6..])))
+    } else if image_lower.starts_with("mcr.microsoft.com/dotnet/sdk:") {
+        Some(("dotnet", Some(&image[29..])))
+    } else if image_lower.starts_with("rust:") {
+        Some(("rust", Some(&image[5..])))
+    } else {
+        None
     }
 }
 

@@ -62,6 +62,185 @@ impl DockerRuntime {
 
         None
     }
+
+    /// Get a customized image with language-specific dependencies
+    pub fn get_language_specific_image(
+        base_image: &str,
+        language: &str,
+        version: Option<&str>,
+    ) -> Option<String> {
+        let key = match (language, version) {
+            ("python", Some(ver)) => format!("python:{}", ver),
+            ("node", Some(ver)) => format!("node:{}", ver),
+            ("java", Some(ver)) => format!("eclipse-temurin:{}", ver),
+            ("go", Some(ver)) => format!("golang:{}", ver),
+            ("dotnet", Some(ver)) => format!("mcr.microsoft.com/dotnet/sdk:{}", ver),
+            ("rust", Some(ver)) => format!("rust:{}", ver),
+            (lang, Some(ver)) => format!("{}:{}", lang, ver),
+            (lang, None) => lang.to_string(),
+        };
+
+        let images = CUSTOMIZED_IMAGES.lock().unwrap();
+        images.get(&key).cloned()
+    }
+
+    /// Set a customized image with language-specific dependencies
+    pub fn set_language_specific_image(
+        base_image: &str,
+        language: &str,
+        version: Option<&str>,
+        new_image: &str,
+    ) {
+        let key = match (language, version) {
+            ("python", Some(ver)) => format!("python:{}", ver),
+            ("node", Some(ver)) => format!("node:{}", ver),
+            ("java", Some(ver)) => format!("eclipse-temurin:{}", ver),
+            ("go", Some(ver)) => format!("golang:{}", ver),
+            ("dotnet", Some(ver)) => format!("mcr.microsoft.com/dotnet/sdk:{}", ver),
+            ("rust", Some(ver)) => format!("rust:{}", ver),
+            (lang, Some(ver)) => format!("{}:{}", lang, ver),
+            (lang, None) => lang.to_string(),
+        };
+
+        let mut images = CUSTOMIZED_IMAGES.lock().unwrap();
+        images.insert(key, new_image.to_string());
+    }
+
+    /// Prepare a language-specific environment
+    #[allow(dead_code)]
+    pub async fn prepare_language_environment(
+        &self,
+        language: &str,
+        version: Option<&str>,
+        additional_packages: Option<Vec<String>>,
+    ) -> Result<String, ContainerError> {
+        // Check if we already have a customized image for this language and version
+        let key = format!("{}-{}", language, version.unwrap_or("latest"));
+        if let Some(customized_image) = Self::get_language_specific_image("", language, version) {
+            return Ok(customized_image);
+        }
+
+        // Create a temporary Dockerfile for customization
+        let temp_dir = tempfile::tempdir().map_err(|e| {
+            ContainerError::ContainerStart(format!("Failed to create temp directory: {}", e))
+        })?;
+
+        let dockerfile_path = temp_dir.path().join("Dockerfile");
+        let mut dockerfile_content = String::new();
+
+        // Add language-specific setup based on the language
+        match language {
+            "python" => {
+                let base_image =
+                    version.map_or("python:3.11-slim".to_string(), |v| format!("python:{}", v));
+                dockerfile_content.push_str(&format!("FROM {}\n\n", base_image));
+                dockerfile_content.push_str(
+                    "RUN apt-get update && apt-get install -y --no-install-recommends \\\n",
+                );
+                dockerfile_content.push_str("    build-essential \\\n");
+                dockerfile_content.push_str("    && rm -rf /var/lib/apt/lists/*\n");
+
+                if let Some(packages) = additional_packages {
+                    for package in packages {
+                        dockerfile_content.push_str(&format!("RUN pip install {}\n", package));
+                    }
+                }
+            }
+            "node" => {
+                let base_image =
+                    version.map_or("node:20-slim".to_string(), |v| format!("node:{}", v));
+                dockerfile_content.push_str(&format!("FROM {}\n\n", base_image));
+                dockerfile_content.push_str(
+                    "RUN apt-get update && apt-get install -y --no-install-recommends \\\n",
+                );
+                dockerfile_content.push_str("    build-essential \\\n");
+                dockerfile_content.push_str("    && rm -rf /var/lib/apt/lists/*\n");
+
+                if let Some(packages) = additional_packages {
+                    for package in packages {
+                        dockerfile_content.push_str(&format!("RUN npm install -g {}\n", package));
+                    }
+                }
+            }
+            "java" => {
+                let base_image = version.map_or("eclipse-temurin:17-jdk".to_string(), |v| {
+                    format!("eclipse-temurin:{}", v)
+                });
+                dockerfile_content.push_str(&format!("FROM {}\n\n", base_image));
+                dockerfile_content.push_str(
+                    "RUN apt-get update && apt-get install -y --no-install-recommends \\\n",
+                );
+                dockerfile_content.push_str("    maven \\\n");
+                dockerfile_content.push_str("    && rm -rf /var/lib/apt/lists/*\n");
+            }
+            "go" => {
+                let base_image =
+                    version.map_or("golang:1.21-slim".to_string(), |v| format!("golang:{}", v));
+                dockerfile_content.push_str(&format!("FROM {}\n\n", base_image));
+                dockerfile_content.push_str(
+                    "RUN apt-get update && apt-get install -y --no-install-recommends \\\n",
+                );
+                dockerfile_content.push_str("    git \\\n");
+                dockerfile_content.push_str("    && rm -rf /var/lib/apt/lists/*\n");
+
+                if let Some(packages) = additional_packages {
+                    for package in packages {
+                        dockerfile_content.push_str(&format!("RUN go install {}\n", package));
+                    }
+                }
+            }
+            "dotnet" => {
+                let base_image = version
+                    .map_or("mcr.microsoft.com/dotnet/sdk:7.0".to_string(), |v| {
+                        format!("mcr.microsoft.com/dotnet/sdk:{}", v)
+                    });
+                dockerfile_content.push_str(&format!("FROM {}\n\n", base_image));
+
+                if let Some(packages) = additional_packages {
+                    for package in packages {
+                        dockerfile_content
+                            .push_str(&format!("RUN dotnet tool install -g {}\n", package));
+                    }
+                }
+            }
+            "rust" => {
+                let base_image =
+                    version.map_or("rust:latest".to_string(), |v| format!("rust:{}", v));
+                dockerfile_content.push_str(&format!("FROM {}\n\n", base_image));
+                dockerfile_content.push_str(
+                    "RUN apt-get update && apt-get install -y --no-install-recommends \\\n",
+                );
+                dockerfile_content.push_str("    build-essential \\\n");
+                dockerfile_content.push_str("    && rm -rf /var/lib/apt/lists/*\n");
+
+                if let Some(packages) = additional_packages {
+                    for package in packages {
+                        dockerfile_content.push_str(&format!("RUN cargo install {}\n", package));
+                    }
+                }
+            }
+            _ => {
+                return Err(ContainerError::ContainerStart(format!(
+                    "Unsupported language: {}",
+                    language
+                )));
+            }
+        }
+
+        // Write the Dockerfile
+        std::fs::write(&dockerfile_path, dockerfile_content).map_err(|e| {
+            ContainerError::ContainerStart(format!("Failed to write Dockerfile: {}", e))
+        })?;
+
+        // Build the customized image
+        let image_tag = format!("wrkflw-{}-{}", language, version.unwrap_or("latest"));
+        self.build_image(&dockerfile_path, &image_tag).await?;
+
+        // Store the customized image
+        Self::set_language_specific_image("", language, version, &image_tag);
+
+        Ok(image_tag)
+    }
 }
 
 pub fn is_available() -> bool {
@@ -460,6 +639,140 @@ impl ContainerRuntime for DockerRuntime {
                 ))
             }
         }
+    }
+
+    async fn prepare_language_environment(
+        &self,
+        language: &str,
+        version: Option<&str>,
+        additional_packages: Option<Vec<String>>,
+    ) -> Result<String, ContainerError> {
+        // Check if we already have a customized image for this language and version
+        let key = format!("{}-{}", language, version.unwrap_or("latest"));
+        if let Some(customized_image) = Self::get_language_specific_image("", language, version) {
+            return Ok(customized_image);
+        }
+
+        // Create a temporary Dockerfile for customization
+        let temp_dir = tempfile::tempdir().map_err(|e| {
+            ContainerError::ContainerStart(format!("Failed to create temp directory: {}", e))
+        })?;
+
+        let dockerfile_path = temp_dir.path().join("Dockerfile");
+        let mut dockerfile_content = String::new();
+
+        // Add language-specific setup based on the language
+        match language {
+            "python" => {
+                let base_image =
+                    version.map_or("python:3.11-slim".to_string(), |v| format!("python:{}", v));
+                dockerfile_content.push_str(&format!("FROM {}\n\n", base_image));
+                dockerfile_content.push_str(
+                    "RUN apt-get update && apt-get install -y --no-install-recommends \\\n",
+                );
+                dockerfile_content.push_str("    build-essential \\\n");
+                dockerfile_content.push_str("    && rm -rf /var/lib/apt/lists/*\n");
+
+                if let Some(packages) = additional_packages {
+                    for package in packages {
+                        dockerfile_content.push_str(&format!("RUN pip install {}\n", package));
+                    }
+                }
+            }
+            "node" => {
+                let base_image =
+                    version.map_or("node:20-slim".to_string(), |v| format!("node:{}", v));
+                dockerfile_content.push_str(&format!("FROM {}\n\n", base_image));
+                dockerfile_content.push_str(
+                    "RUN apt-get update && apt-get install -y --no-install-recommends \\\n",
+                );
+                dockerfile_content.push_str("    build-essential \\\n");
+                dockerfile_content.push_str("    && rm -rf /var/lib/apt/lists/*\n");
+
+                if let Some(packages) = additional_packages {
+                    for package in packages {
+                        dockerfile_content.push_str(&format!("RUN npm install -g {}\n", package));
+                    }
+                }
+            }
+            "java" => {
+                let base_image = version.map_or("eclipse-temurin:17-jdk".to_string(), |v| {
+                    format!("eclipse-temurin:{}", v)
+                });
+                dockerfile_content.push_str(&format!("FROM {}\n\n", base_image));
+                dockerfile_content.push_str(
+                    "RUN apt-get update && apt-get install -y --no-install-recommends \\\n",
+                );
+                dockerfile_content.push_str("    maven \\\n");
+                dockerfile_content.push_str("    && rm -rf /var/lib/apt/lists/*\n");
+            }
+            "go" => {
+                let base_image =
+                    version.map_or("golang:1.21-slim".to_string(), |v| format!("golang:{}", v));
+                dockerfile_content.push_str(&format!("FROM {}\n\n", base_image));
+                dockerfile_content.push_str(
+                    "RUN apt-get update && apt-get install -y --no-install-recommends \\\n",
+                );
+                dockerfile_content.push_str("    git \\\n");
+                dockerfile_content.push_str("    && rm -rf /var/lib/apt/lists/*\n");
+
+                if let Some(packages) = additional_packages {
+                    for package in packages {
+                        dockerfile_content.push_str(&format!("RUN go install {}\n", package));
+                    }
+                }
+            }
+            "dotnet" => {
+                let base_image = version
+                    .map_or("mcr.microsoft.com/dotnet/sdk:7.0".to_string(), |v| {
+                        format!("mcr.microsoft.com/dotnet/sdk:{}", v)
+                    });
+                dockerfile_content.push_str(&format!("FROM {}\n\n", base_image));
+
+                if let Some(packages) = additional_packages {
+                    for package in packages {
+                        dockerfile_content
+                            .push_str(&format!("RUN dotnet tool install -g {}\n", package));
+                    }
+                }
+            }
+            "rust" => {
+                let base_image =
+                    version.map_or("rust:latest".to_string(), |v| format!("rust:{}", v));
+                dockerfile_content.push_str(&format!("FROM {}\n\n", base_image));
+                dockerfile_content.push_str(
+                    "RUN apt-get update && apt-get install -y --no-install-recommends \\\n",
+                );
+                dockerfile_content.push_str("    build-essential \\\n");
+                dockerfile_content.push_str("    && rm -rf /var/lib/apt/lists/*\n");
+
+                if let Some(packages) = additional_packages {
+                    for package in packages {
+                        dockerfile_content.push_str(&format!("RUN cargo install {}\n", package));
+                    }
+                }
+            }
+            _ => {
+                return Err(ContainerError::ContainerStart(format!(
+                    "Unsupported language: {}",
+                    language
+                )));
+            }
+        }
+
+        // Write the Dockerfile
+        std::fs::write(&dockerfile_path, dockerfile_content).map_err(|e| {
+            ContainerError::ContainerStart(format!("Failed to write Dockerfile: {}", e))
+        })?;
+
+        // Build the customized image
+        let image_tag = format!("wrkflw-{}-{}", language, version.unwrap_or("latest"));
+        self.build_image(&dockerfile_path, &image_tag).await?;
+
+        // Store the customized image
+        Self::set_language_specific_image("", language, version, &image_tag);
+
+        Ok(image_tag)
     }
 }
 

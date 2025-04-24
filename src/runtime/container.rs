@@ -15,6 +15,13 @@ pub trait ContainerRuntime {
     async fn pull_image(&self, image: &str) -> Result<(), ContainerError>;
 
     async fn build_image(&self, dockerfile: &Path, tag: &str) -> Result<(), ContainerError>;
+
+    async fn prepare_language_environment(
+        &self,
+        language: &str,
+        version: Option<&str>,
+        additional_packages: Option<Vec<String>>,
+    ) -> Result<String, ContainerError>;
 }
 
 pub struct ContainerOutput {

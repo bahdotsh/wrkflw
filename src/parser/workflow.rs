@@ -4,6 +4,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
+use super::schema::SchemaValidator;
+
 #[derive(Debug, Deserialize, Serialize)]
 pub struct WorkflowDefinition {
     pub name: String,
@@ -85,6 +87,11 @@ pub struct ActionInfo {
 }
 
 pub fn parse_workflow(path: &Path) -> Result<WorkflowDefinition, String> {
+    // First validate against schema
+    let validator = SchemaValidator::new()?;
+    validator.validate_workflow(path)?;
+
+    // If validation passes, parse the workflow
     let content =
         fs::read_to_string(path).map_err(|e| format!("Failed to read workflow file: {}", e))?;
 

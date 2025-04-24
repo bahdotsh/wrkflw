@@ -16,6 +16,7 @@ colored = "2.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_yaml = "0.9"
 serde_json = "1.0"
+jsonschema = "0.17"
 tokio = { version = "1.28", features = ["full"] }
 async-trait = "0.1"
 bollard = "0.14"

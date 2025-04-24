@@ -1,0 +1,26 @@
+name: Basic Workflow Example
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+env:
+  GLOBAL_VAR: "global value"
+
+jobs:
+  test-job:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Echo Hello
+        run: echo "Hello World"
+      
+      - name: Show Environment
+        run: echo "Using global var: $GLOBAL_VAR"
+      
+      - name: Run Multiple Commands
+        run: |
+          echo "This is a multi-line command"
+          echo "Current directory: $PWD"
+          ls -la 

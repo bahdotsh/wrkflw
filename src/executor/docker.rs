@@ -15,6 +15,8 @@ use std::sync::Mutex;
 
 static RUNNING_CONTAINERS: Lazy<Mutex<Vec<String>>> = Lazy::new(|| Mutex::new(Vec::new()));
 static CREATED_NETWORKS: Lazy<Mutex<Vec<String>>> = Lazy::new(|| Mutex::new(Vec::new()));
+// Map to track customized images for a job
+static CUSTOMIZED_IMAGES: Lazy<Mutex<HashMap<String, String>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 
 pub struct DockerRuntime {
     docker: Docker,
@@ -27,6 +29,33 @@ impl DockerRuntime {
         })?;
 
         Ok(DockerRuntime { docker })
+    }
+
+    // Add a method to store and retrieve customized images (e.g., with Python installed)
+    pub fn get_customized_image(base_image: &str, customization: &str) -> Option<String> {
+        let key = format!("{}:{}", base_image, customization);
+        let images = CUSTOMIZED_IMAGES.lock().unwrap();
+        images.get(&key).cloned()
+    }
+
+    pub fn set_customized_image(base_image: &str, customization: &str, new_image: &str) {
+        let key = format!("{}:{}", base_image, customization);
+        let mut images = CUSTOMIZED_IMAGES.lock().unwrap();
+        images.insert(key, new_image.to_string());
+    }
+
+    /// Find a customized image key by prefix
+    pub fn find_customized_image_key(image: &str, prefix: &str) -> Option<String> {
+        let image_keys = CUSTOMIZED_IMAGES.lock().unwrap();
+        
+        // Look for any key that starts with the prefix
+        for (key, _) in image_keys.iter() {
+            if key.starts_with(prefix) {
+                return Some(key.clone());
+            }
+        }
+        
+        None
     }
 }
 
@@ -457,7 +486,7 @@ impl DockerRuntime {
         // Convert command vector to Vec<String>
         let cmd_vec: Vec<String> = cmd.iter().map(|&s| s.to_string()).collect();
 
-        logging::debug(&format!("Running command: {:?}", cmd_vec));
+        logging::debug(&format!("Running command in Docker: {:?}", cmd_vec));
         logging::debug(&format!("Environment: {:?}", env));
         logging::debug(&format!("Working directory: {}", working_dir.display()));
 
@@ -634,6 +663,17 @@ impl DockerRuntime {
         )
         .await;
         untrack_container(&container.id);
+
+        // Log detailed information about the command execution for debugging
+        if exit_code != 0 {
+            logging::info(&format!(
+                "Docker command failed with exit code: {}",
+                exit_code
+            ));
+            logging::debug(&format!("Failed command: {:?}", cmd));
+            logging::debug(&format!("Working directory: {}", working_dir.display()));
+            logging::debug(&format!("STDERR: {}", stderr));
+        }
 
         Ok(ContainerOutput {
             stdout,

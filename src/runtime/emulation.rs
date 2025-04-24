@@ -2,6 +2,8 @@ use crate::logging;
 use crate::runtime::container::{ContainerError, ContainerOutput, ContainerRuntime};
 use async_trait::async_trait;
 use once_cell::sync::Lazy;
+use serde_json;
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -144,6 +146,8 @@ impl ContainerRuntime for EmulationRuntime {
     ) -> Result<ContainerOutput, ContainerError> {
         // Print emulation info
         logging::info(&format!("Emulating container: {}", image));
+        logging::debug(&format!("Command: {:?}", cmd));
+
         // Prepare the workspace
         let container_working_dir = self.prepare_workspace(working_dir, volumes);
 
@@ -259,6 +263,28 @@ impl ContainerRuntime for EmulationRuntime {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
 
+        // Check if any of the commands suggest a specific action
+        let mut detected_action = None;
+        let mut with_params = None;
+
+        // Extract possible action info from comments in environment variables
+        for (key, value) in &env_map {
+            if key == "__WRKFLW_ACTION" {
+                detected_action = Some(value.clone());
+            }
+            if key == "__WRKFLW_WITH_PARAMS" {
+                // This would be a JSON-encoded string of with parameters
+                if let Ok(params) = serde_json::from_str::<HashMap<String, String>>(value) {
+                    with_params = Some(params);
+                }
+            }
+        }
+
+        // Apply action-specific environment variables if detected
+        if let Some(action) = detected_action {
+            add_action_env_vars(&mut env_map, &action, &with_params);
+        }
+
         // For Rust jobs, set up RUSTUP_HOME and CARGO_HOME to point to local directories
         if is_rust_job {
             let rustup_home = container_working_dir
@@ -321,6 +347,9 @@ impl ContainerRuntime for EmulationRuntime {
                         fixed_cmd
                     };
 
+                    // Store a copy for logging
+                    let cmd_for_logs = final_cmd.clone();
+
                     // Create command
                     let mut command = Command::new(shell);
                     command.current_dir(&container_working_dir);
@@ -343,10 +372,25 @@ impl ContainerRuntime for EmulationRuntime {
                         .output()
                         .map_err(|e| ContainerError::ContainerExecution(e.to_string()))?;
 
+                    // Log detailed information about the command execution for debugging
+                    let exit_code = output.status.code().unwrap_or(-1);
+                    if exit_code != 0 {
+                        logging::info(&format!("Command failed with exit code: {}", exit_code));
+                        logging::debug(&format!("Failed command: {}", cmd_for_logs));
+                        logging::debug(&format!(
+                            "Working directory: {}",
+                            container_working_dir.display()
+                        ));
+                        logging::debug(&format!(
+                            "STDERR: {}",
+                            String::from_utf8_lossy(&output.stderr)
+                        ));
+                    }
+
                     return Ok(ContainerOutput {
                         stdout: String::from_utf8_lossy(&output.stdout).to_string(),
                         stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-                        exit_code: output.status.code().unwrap_or(-1),
+                        exit_code,
                     });
                 }
             }
@@ -360,6 +404,10 @@ impl ContainerRuntime for EmulationRuntime {
 
             // Join the original command and add trap for cleanup
             let command_str = format!("{{ {}; }} && wait", cmd.join(" "));
+
+            // Store a copy for logging
+            let cmd_for_logs = command_str.clone();
+
             shell_command.arg(command_str);
 
             // Set environment variables from the map
@@ -377,16 +425,41 @@ impl ContainerRuntime for EmulationRuntime {
                 .output()
                 .map_err(|e| ContainerError::ContainerExecution(e.to_string()))?;
 
+            // Log detailed information about the command execution for debugging
+            let exit_code = output.status.code().unwrap_or(-1);
+            if exit_code != 0 {
+                logging::info(&format!(
+                    "Background command failed with exit code: {}",
+                    exit_code
+                ));
+                logging::debug(&format!("Failed command: {}", cmd_for_logs));
+                logging::debug(&format!(
+                    "Working directory: {}",
+                    container_working_dir.display()
+                ));
+                logging::debug(&format!(
+                    "STDERR: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                ));
+            }
+
             return Ok(ContainerOutput {
                 stdout: String::from_utf8_lossy(&output.stdout).to_string(),
                 stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-                exit_code: output.status.code().unwrap_or(-1),
+                exit_code,
             });
         }
 
         // For all other commands
         let mut command = Command::new(cmd[0]);
         command.current_dir(&container_working_dir);
+
+        // Log the command we're about to run
+        logging::debug(&format!("Executing command: {}", cmd.join(" ")));
+        logging::debug(&format!(
+            "In directory: {}",
+            container_working_dir.display()
+        ));
 
         // Add all arguments
         for arg in &cmd[1..] {
@@ -403,10 +476,25 @@ impl ContainerRuntime for EmulationRuntime {
             .output()
             .map_err(|e| ContainerError::ContainerExecution(e.to_string()))?;
 
+        // Log detailed information about the command execution for debugging
+        let exit_code = output.status.code().unwrap_or(-1);
+        if exit_code != 0 {
+            logging::info(&format!("Command failed with exit code: {}", exit_code));
+            logging::debug(&format!("Failed command: {:?}", cmd));
+            logging::debug(&format!(
+                "Working directory: {}",
+                container_working_dir.display()
+            ));
+            logging::debug(&format!(
+                "STDERR: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+
         Ok(ContainerOutput {
             stdout: String::from_utf8_lossy(&output.stdout).to_string(),
             stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-            exit_code: output.status.code().unwrap_or(-1),
+            exit_code,
         })
     }
 
@@ -470,6 +558,21 @@ fn copy_directory_contents(source: &Path, dest: &Path) -> std::io::Result<()> {
 }
 
 pub async fn handle_special_action(action: &str) -> Result<(), ContainerError> {
+    // Extract owner, repo and version from the action
+    let action_parts: Vec<&str> = action.split('@').collect();
+    let action_name = action_parts[0];
+    let action_version = if action_parts.len() > 1 {
+        action_parts[1]
+    } else {
+        "latest"
+    };
+
+    logging::info(&format!(
+        "🔄 Processing action: {} @ {}",
+        action_name, action_version
+    ));
+
+    // Handle specific known actions with special requirements
     if action.starts_with("cachix/install-nix-action") {
         logging::info("🔄 Emulating cachix/install-nix-action");
 
@@ -489,10 +592,125 @@ pub async fn handle_special_action(action: &str) -> Result<(), ContainerError> {
         } else {
             logging::info("🔄 Emulation: Using system-installed Nix");
         }
-        Ok(())
+    } else if action.starts_with("actions-rs/cargo@") {
+        // For actions-rs/cargo action, ensure Rust is available
+        logging::info(&format!("🔄 Detected Rust cargo action: {}", action));
+
+        // Verify Rust/cargo is installed
+        check_command_available("cargo", "Rust/Cargo", "https://rustup.rs/");
+    } else if action.starts_with("actions-rs/toolchain@") {
+        // For actions-rs/toolchain action, check for Rust installation
+        logging::info(&format!("🔄 Detected Rust toolchain action: {}", action));
+
+        check_command_available("rustc", "Rust", "https://rustup.rs/");
+    } else if action.starts_with("actions-rs/fmt@") {
+        // For actions-rs/fmt action, check if rustfmt is available
+        logging::info(&format!("🔄 Detected Rust formatter action: {}", action));
+
+        check_command_available("rustfmt", "rustfmt", "rustup component add rustfmt");
+    } else if action.starts_with("actions/setup-node@") {
+        // Node.js setup action
+        logging::info(&format!("🔄 Detected Node.js setup action: {}", action));
+
+        check_command_available("node", "Node.js", "https://nodejs.org/");
+    } else if action.starts_with("actions/setup-python@") {
+        // Python setup action
+        logging::info(&format!("🔄 Detected Python setup action: {}", action));
+
+        check_command_available("python", "Python", "https://www.python.org/downloads/");
+    } else if action.starts_with("actions/setup-java@") {
+        // Java setup action
+        logging::info(&format!("🔄 Detected Java setup action: {}", action));
+
+        check_command_available("java", "Java", "https://adoptium.net/");
+    } else if action.starts_with("actions/checkout@") {
+        // Git checkout action - this is handled implicitly by our workspace setup
+        logging::info("🔄 Detected checkout action - workspace files are already prepared");
+    } else if action.starts_with("actions/cache@") {
+        // Cache action - can't really emulate caching effectively
+        logging::info(
+            "🔄 Detected cache action - caching is not fully supported in emulation mode",
+        );
     } else {
-        // Ignore other actions in emulation mode
-        Ok(())
+        // Generic action we don't have special handling for
+        logging::info(&format!(
+            "🔄 Action '{}' has no special handling in emulation mode",
+            action_name
+        ));
+    }
+
+    // Always return success - the actual command execution will happen in execute_step
+    Ok(())
+}
+
+// Helper function to check if a command is available on the system
+fn check_command_available(command: &str, name: &str, install_url: &str) {
+    let is_available = Command::new("which")
+        .arg(command)
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false);
+
+    if !is_available {
+        logging::warning(&format!("{} is required but not found on the system", name));
+        logging::info(&format!(
+            "To use this action, please install {}: {}",
+            name, install_url
+        ));
+        logging::info(&format!(
+            "Continuing emulation, but {} commands will fail",
+            name
+        ));
+    } else {
+        // Try to get version information
+        if let Ok(output) = Command::new(command).arg("--version").output() {
+            if output.status.success() {
+                let version = String::from_utf8_lossy(&output.stdout);
+                logging::info(&format!("🔄 Using system {}: {}", name, version.trim()));
+            }
+        }
+    }
+}
+
+// Add a function to help set up appropriate environment variables for different actions
+fn add_action_env_vars(
+    env_map: &mut HashMap<String, String>,
+    action: &str,
+    with_params: &Option<HashMap<String, String>>,
+) {
+    if let Some(params) = with_params {
+        if action.starts_with("actions/setup-node") {
+            // For Node.js actions, add NODE_VERSION
+            if let Some(version) = params.get("node-version") {
+                env_map.insert("NODE_VERSION".to_string(), version.clone());
+            }
+
+            // Set NPM/Yarn paths if needed
+            env_map.insert(
+                "NPM_CONFIG_PREFIX".to_string(),
+                "/tmp/.npm-global".to_string(),
+            );
+            env_map.insert("PATH".to_string(), "/tmp/.npm-global/bin:$PATH".to_string());
+        } else if action.starts_with("actions/setup-python") {
+            // For Python actions, add PYTHON_VERSION
+            if let Some(version) = params.get("python-version") {
+                env_map.insert("PYTHON_VERSION".to_string(), version.clone());
+            }
+
+            // Set pip cache directories
+            env_map.insert("PIP_CACHE_DIR".to_string(), "/tmp/.pip-cache".to_string());
+        } else if action.starts_with("actions/setup-java") {
+            // For Java actions, add JAVA_VERSION
+            if let Some(version) = params.get("java-version") {
+                env_map.insert("JAVA_VERSION".to_string(), version.clone());
+            }
+
+            // Set JAVA_HOME
+            env_map.insert(
+                "JAVA_HOME".to_string(),
+                "/usr/lib/jvm/default-java".to_string(),
+            );
+        }
     }
 }
 

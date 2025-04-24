@@ -587,12 +587,16 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
                     job_success = false;
                 }
 
-                // Add step output to logs
-                if !result.output.is_empty() {
+                // Add step output to logs only in verbose mode or if there's an error
+                if ctx.verbose || result.status == StepStatus::Failure {
                     job_logs.push_str(&format!(
                         "\n=== Output from step '{}' ===\n{}\n=== End output ===\n\n",
                         result.name, result.output
                     ));
+                } else {
+                    // In non-verbose mode, just record that the step ran but don't include output
+                    job_logs.push_str(&format!("Step '{}' completed with status: {:?}\n", 
+                        result.name, result.status));
                 }
 
                 step_results.push(result);
@@ -815,8 +819,14 @@ async fn execute_matrix_job(
                 Ok(result) => {
                     job_logs.push_str(&format!("Step: {}\n", result.name));
                     job_logs.push_str(&format!("Status: {:?}\n", result.status));
-                    job_logs.push_str(&result.output);
-                    job_logs.push_str("\n\n");
+                    
+                    // Only include step output in verbose mode or if there's an error
+                    if verbose || result.status == StepStatus::Failure {
+                        job_logs.push_str(&result.output);
+                        job_logs.push_str("\n\n");
+                    } else {
+                        job_logs.push('\n');
+                    }
 
                     step_results.push(result.clone());
 
@@ -1559,11 +1569,17 @@ fn convert_yaml_to_step(
     // For composite steps with shell, construct a run step
     let final_run = run;
 
+    // Extract continue_on_error
+    let continue_on_error = step_yaml
+        .get("continue-on-error")
+        .and_then(|v| v.as_bool());
+
     Ok(crate::parser::workflow::Step {
         name,
         uses,
         run: final_run,
         with,
         env,
+        continue_on_error,
     })
 }

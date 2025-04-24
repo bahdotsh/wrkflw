@@ -3385,6 +3385,15 @@ fn start_next_workflow_execution(
         let tx_clone_inner = tx_clone.clone();
         let workflow_path = app.workflows[next_idx].path.clone();
 
+        // Log whether verbose mode is enabled
+        if verbose {
+            app.logs.push("Verbose mode: Step outputs will be displayed in full".to_string());
+            logging::info("Verbose mode: Step outputs will be displayed in full");
+        } else {
+            app.logs.push("Standard mode: Only step status will be shown (use --verbose for full output)".to_string());
+            logging::info("Standard mode: Only step status will be shown (use --verbose for full output)");
+        }
+
         // Check Docker availability again if Docker runtime is selected
         let runtime_type = match app.runtime_type {
             RuntimeType::Docker => {
@@ -3566,9 +3575,20 @@ pub async fn execute_workflow_cli(
     println!("Executing workflow: {}", path.display());
     println!("Runtime mode: {:?}", runtime_type);
 
+    // Log the start of the execution in debug mode with more details
+    logging::debug(&format!(
+        "Starting workflow execution: path={}, runtime={:?}, verbose={}",
+        path.display(),
+        runtime_type,
+        verbose
+    ));
+
     match executor::execute_workflow(path, runtime_type, verbose).await {
         Ok(result) => {
             println!("\nWorkflow execution results:");
+
+            // Track if the workflow had any failures
+            let mut any_job_failed = false;
 
             for job in &result.jobs {
                 match job.status {
@@ -3577,6 +3597,7 @@ pub async fn execute_workflow_cli(
                     }
                     JobStatus::Failure => {
                         println!("\n❌ Job failed: {}", job.name);
+                        any_job_failed = true;
                     }
                     JobStatus::Skipped => {
                         println!("\n⏭️ Job skipped: {}", job.name);
@@ -3584,6 +3605,9 @@ pub async fn execute_workflow_cli(
                 }
 
                 println!("-------------------------");
+
+                // Log the job details for debug purposes
+                logging::debug(&format!("Job: {}, Status: {:?}", job.name, job.status));
 
                 for step in job.steps.iter() {
                     match step.status {
@@ -3608,46 +3632,93 @@ pub async fn execute_workflow_cli(
                         StepStatus::Failure => {
                             println!("  ❌ {}", step.name);
 
-                            // For failures, always show output (truncated)
-                            let output = if step.output.len() > 500 {
-                                format!("{}... (truncated)", &step.output[..500])
-                            } else {
-                                step.output.clone()
-                            };
+                            // Ensure we capture and show exit code
+                            if let Some(exit_code) = step
+                                .output
+                                .lines()
+                                .find(|line| line.trim().starts_with("Exit code:"))
+                                .map(|line| line.trim().to_string())
+                            {
+                                println!("    {}", exit_code);
+                            }
 
-                            println!("    {}", output.trim().replace('\n', "\n    "));
+                            // Show command/run details in debug mode
+                            if logging::get_log_level() <= logging::LogLevel::Debug {
+                                if let Some(cmd_output) = step
+                                    .output
+                                    .lines()
+                                    .skip_while(|l| !l.trim().starts_with("$"))
+                                    .take(1)
+                                    .next()
+                                {
+                                    println!("    Command: {}", cmd_output.trim());
+                                }
+                            }
+
+                            // Always show error output from failed steps, but keep it to a reasonable length
+                            let output_lines: Vec<&str> = step
+                                .output
+                                .lines()
+                                .filter(|line| !line.trim().starts_with("Exit code:"))
+                                .collect();
+
+                            if !output_lines.is_empty() {
+                                println!("    Error output:");
+                                for line in output_lines.iter().take(10) {
+                                    println!("    {}", line.trim().replace('\n', "\n    "));
+                                }
+
+                                if output_lines.len() > 10 {
+                                    println!(
+                                        "    ... (and {} more lines)",
+                                        output_lines.len() - 10
+                                    );
+                                    println!("    Use --debug to see full output");
+                                }
+                            }
                         }
                         StepStatus::Skipped => {
                             println!("  ⏭️ {} (skipped)", step.name);
                         }
                     }
+
+                    // Always log the step details for debug purposes
+                    logging::debug(&format!(
+                        "Step: {}, Status: {:?}, Output length: {} lines",
+                        step.name,
+                        step.status,
+                        step.output.lines().count()
+                    ));
+
+                    // In debug mode, log all step output
+                    if logging::get_log_level() == logging::LogLevel::Debug
+                        && !step.output.trim().is_empty()
+                    {
+                        logging::debug(&format!(
+                            "Step output for '{}': \n{}",
+                            step.name, step.output
+                        ));
+                    }
                 }
             }
 
-            // Determine overall success
-            let failures = result
-                .jobs
-                .iter()
-                .filter(|job| job.status == JobStatus::Failure)
-                .count();
-
-            if failures > 0 {
+            if any_job_failed {
                 println!("\n❌ Workflow completed with failures");
-                Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "Workflow execution failed",
-                ))
+                // In the case of failure, we'll also inform the user about the debug option
+                // if they're not already using it
+                if logging::get_log_level() > logging::LogLevel::Debug {
+                    println!("    Run with --debug for more detailed output");
+                }
             } else {
                 println!("\n✅ Workflow completed successfully!");
-                Ok(())
             }
+
+            Ok(())
         }
         Err(e) => {
             println!("❌ Failed to execute workflow: {}", e);
-            Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("Workflow execution error: {}", e),
-            ))
+            logging::error(&format!("Failed to execute workflow: {}", e));
+            Err(io::Error::new(io::ErrorKind::Other, e))
         }
     }
 }

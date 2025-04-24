@@ -21,7 +21,8 @@ use std::path::PathBuf;
 #[command(
     name = "wrkflw",
     about = "GitHub Workflow validator and executor",
-    version
+    version,
+    long_about = "A GitHub Workflow validator and executor that runs workflows locally.\n\nExamples:\n  wrkflw validate                             # Validate all workflows in .github/workflows\n  wrkflw run .github/workflows/build.yml      # Run a specific workflow\n  wrkflw --verbose run .github/workflows/build.yml  # Run with more output\n  wrkflw --debug run .github/workflows/build.yml    # Run with detailed debug information\n  wrkflw run --emulate .github/workflows/build.yml  # Use emulation mode instead of Docker"
 )]
 struct Wrkflw {
     #[command(subcommand)]
@@ -30,6 +31,10 @@ struct Wrkflw {
     /// Run in verbose mode with detailed output
     #[arg(short, long, global = true)]
     verbose: bool,
+
+    /// Run in debug mode with extensive execution details
+    #[arg(short, long, global = true)]
+    debug: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -171,6 +176,18 @@ async fn handle_signals() {
 async fn main() {
     let cli = Wrkflw::parse();
     let verbose = cli.verbose;
+    let debug = cli.debug;
+
+    // Set log level based on command line flags
+    if debug {
+        logging::set_log_level(logging::LogLevel::Debug);
+        logging::debug("Debug mode enabled - showing detailed logs");
+    } else if verbose {
+        logging::set_log_level(logging::LogLevel::Info);
+        logging::info("Verbose mode enabled");
+    } else {
+        logging::set_log_level(logging::LogLevel::Warning);
+    }
 
     // Setup a Ctrl+C handler that runs in the background
     tokio::spawn(handle_signals());
@@ -192,41 +209,103 @@ async fn main() {
         Some(Commands::Run {
             path,
             emulate,
-            show_action_messages,
+            show_action_messages: _,
         }) => {
-            // Run the workflow execution
+            // Set runner mode based on flags
             let runtime_type = if *emulate {
                 executor::RuntimeType::Emulation
             } else {
-                // Check if Docker is available, fall back to emulation if not
-                if !executor::docker::is_available() {
-                    println!("⚠️ Docker is not available. Using emulation mode instead.");
-                    logging::warning("Docker is not available. Using emulation mode instead.");
-                    executor::RuntimeType::Emulation
-                } else {
-                    executor::RuntimeType::Docker
-                }
+                executor::RuntimeType::Docker
             };
 
-            // Control hiding action messages based on the flag
-            if !show_action_messages {
-                std::env::set_var("WRKFLW_HIDE_ACTION_MESSAGES", "true");
-            } else {
-                std::env::set_var("WRKFLW_HIDE_ACTION_MESSAGES", "false");
-            }
-
-            // Run in CLI mode with the specific workflow
-            match ui::execute_workflow_cli(path, runtime_type, verbose).await {
-                Ok(_) => {
-                    // Clean up on successful exit
-                    cleanup_on_exit().await;
-                }
+            // First validate the workflow file
+            match parser::workflow::parse_workflow(path) {
+                Ok(_) => logging::info("Validating workflow..."),
                 Err(e) => {
-                    eprintln!("Error: {}", e);
-                    cleanup_on_exit().await;
+                    logging::error(&format!("Workflow validation failed: {}", e));
                     std::process::exit(1);
                 }
             }
+
+            // Execute the workflow
+            match executor::execute_workflow(path, runtime_type, verbose || debug).await {
+                Ok(result) => {
+                    // Display execution results
+                    println!();
+                    println!("Workflow execution results:");
+                    println!();
+
+                    // Check if we had any job failures
+                    let mut any_job_failed = false;
+
+                    // Summarize each job
+                    for job in result.jobs {
+                        match job.status {
+                            executor::JobStatus::Success => {
+                                println!("✅ Job succeeded: {}", job.name);
+                            }
+                            executor::JobStatus::Failure => {
+                                any_job_failed = true;
+                                println!("❌ Job failed: {}", job.name);
+                            }
+                            executor::JobStatus::Skipped => {
+                                println!("⏭️ Job skipped: {}", job.name);
+                            }
+                        }
+                        println!("-------------------------");
+
+                        // Show individual steps
+                        for step in job.steps {
+                            let status_symbol = match step.status {
+                                executor::StepStatus::Success => "✅",
+                                executor::StepStatus::Failure => "❌",
+                                executor::StepStatus::Skipped => "⏭️",
+                            };
+                            println!("  {} {}", status_symbol, step.name);
+
+                            // Show output for any step if in verbose/debug mode or for failed steps always
+                            if (verbose || debug) || step.status == executor::StepStatus::Failure {
+                                // Show output if not empty and in verbose mode
+                                if !step.output.trim().is_empty() {
+                                    // If the output is very long, trim it
+                                    let output_lines = step.output.lines().collect::<Vec<&str>>();
+                                    
+                                    // In verbose mode, show more output
+                                    let max_lines = if verbose || debug { 
+                                        std::cmp::min(15, output_lines.len()) 
+                                    } else { 
+                                        std::cmp::min(5, output_lines.len()) 
+                                    };
+                                    
+                                    println!("    Output:");
+                                    for line in output_lines.iter().take(max_lines) {
+                                        println!("    {}", line);
+                                    }
+                                    
+                                    if output_lines.len() > max_lines {
+                                        println!("    ... ({} more lines, use --debug to see full output)", 
+                                            output_lines.len() - max_lines);
+                                    }
+                                    println!();
+                                }
+                            }
+                        }
+                        println!();
+                    }
+
+                    if any_job_failed {
+                        println!("❌ Workflow completed with errors!");
+                        std::process::exit(1);
+                    } else {
+                        println!("✅ Workflow completed successfully!");
+                    }
+                }
+                Err(e) => {
+                    println!();
+                    println!("❌ Workflow execution failed: {}", e);
+                    std::process::exit(1);
+                }
+            };
         }
 
         Some(Commands::Tui {

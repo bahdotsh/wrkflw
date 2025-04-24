@@ -54,6 +54,8 @@ pub struct Step {
     pub with: Option<HashMap<String, String>>,
     #[serde(default)]
     pub env: HashMap<String, String>,
+    #[serde(default)]
+    pub continue_on_error: Option<bool>,
 }
 
 impl WorkflowDefinition {

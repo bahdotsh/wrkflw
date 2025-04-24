@@ -1,0 +1,38 @@
+name: C++ Test
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+jobs:
+  test:
+    name: Test C++
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup GCC
+        uses: egor-tensin/setup-gcc@v1
+        with:
+          version: 11
+
+      - name: Check GCC version
+        run: g++ --version
+
+      - name: Create simple program
+        run: |
+          echo '#include <iostream>' > hello.cpp
+          echo 'int main() {' >> hello.cpp
+          echo '    std::cout << "Hello from C++!" << std::endl;' >> hello.cpp
+          echo '    std::cout << "Running on GCC" << std::endl;' >> hello.cpp
+          echo '    return 0;' >> hello.cpp
+          echo '}' >> hello.cpp
+
+      - name: Build C++ program
+        run: g++ hello.cpp -o hello
+
+      - name: Run C++ program
+        run: ./hello 

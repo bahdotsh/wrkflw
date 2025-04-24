@@ -1,0 +1,44 @@
+name: Matrix Example
+
+triggers:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+env:
+  GLOBAL_VAR: "This applies to all jobs"
+
+jobs:
+  test:
+    name: "Test"
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        node-version: [14, 16, 18]
+        include:
+          - os: ubuntu-latest
+            node-version: 20
+            experimental: true
+        exclude:
+          - os: windows-latest
+            node-version: 14
+        fail-fast: false
+        max-parallel: 2
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: ${{ matrix.node-version }}
+      
+      - name: Show configuration
+        run: |
+          echo "Running on: ${{ matrix.os }}"
+          echo "Node version: ${{ matrix.node-version }}"
+          if [ "${{ matrix.experimental }}" = "true" ]; then
+            echo "This is an experimental configuration"
+          fi 

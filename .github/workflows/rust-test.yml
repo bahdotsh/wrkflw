@@ -1,0 +1,38 @@
+name: Rust Test
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+jobs:
+  test:
+    name: Test Rust
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          profile: minimal
+          override: true
+
+      - name: Check Rust version
+        run: rustc --version
+
+      - name: Create simple program
+        run: |
+          echo 'fn main() {' > hello.rs
+          echo '    println!("Hello from Rust!");' >> hello.rs
+          echo '    println!("Running on Rust");' >> hello.rs
+          echo '}' >> hello.rs
+
+      - name: Build Rust program
+        run: rustc hello.rs -o hello
+
+      - name: Run Rust program
+        run: ./hello 

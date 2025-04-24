@@ -975,7 +975,8 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                 // Check if we should hide GitHub action messages
                 let hide_action_value = ctx
                     .job_env
-                    .get("WRKFLW_HIDE_ACTION_MESSAGES").cloned()
+                    .get("WRKFLW_HIDE_ACTION_MESSAGES")
+                    .cloned()
                     .unwrap_or_else(|| "not set".to_string());
 
                 logging::debug(&format!(

@@ -230,82 +230,80 @@ async fn main() {
             // Execute the workflow
             match executor::execute_workflow(path, runtime_type, verbose || debug).await {
                 Ok(result) => {
-                    // Display execution results
-                    println!();
-                    println!("Workflow execution results:");
-                    println!();
-
-                    // Check if we had any job failures
-                    let mut any_job_failed = false;
-
-                    // Summarize each job
-                    for job in result.jobs {
-                        match job.status {
-                            executor::JobStatus::Success => {
-                                println!("✅ Job succeeded: {}", job.name);
+                    // Print job results
+                    for job in &result.jobs {
+                        println!(
+                            "\n{} Job {}: {}",
+                            if job.status == executor::JobStatus::Success {
+                                "✅"
+                            } else {
+                                "❌"
+                            },
+                            job.name,
+                            if job.status == executor::JobStatus::Success {
+                                "succeeded"
+                            } else {
+                                "failed"
                             }
-                            executor::JobStatus::Failure => {
-                                any_job_failed = true;
-                                println!("❌ Job failed: {}", job.name);
-                            }
-                            executor::JobStatus::Skipped => {
-                                println!("⏭️ Job skipped: {}", job.name);
-                            }
-                        }
-                        println!("-------------------------");
+                        );
 
-                        // Show individual steps
-                        for step in job.steps {
-                            let status_symbol = match step.status {
-                                executor::StepStatus::Success => "✅",
-                                executor::StepStatus::Failure => "❌",
-                                executor::StepStatus::Skipped => "⏭️",
-                            };
-                            println!("  {} {}", status_symbol, step.name);
+                        // Print step results
+                        for step in &job.steps {
+                            println!(
+                                "  {} {}",
+                                if step.status == executor::StepStatus::Success {
+                                    "✅"
+                                } else {
+                                    "❌"
+                                },
+                                step.name
+                            );
 
-                            // Show output for any step if in verbose/debug mode or for failed steps always
-                            if (verbose || debug) || step.status == executor::StepStatus::Failure {
-                                // Show output if not empty and in verbose mode
-                                if !step.output.trim().is_empty() {
-                                    // If the output is very long, trim it
-                                    let output_lines = step.output.lines().collect::<Vec<&str>>();
-                                    
-                                    // In verbose mode, show more output
-                                    let max_lines = if verbose || debug { 
-                                        std::cmp::min(15, output_lines.len()) 
-                                    } else { 
-                                        std::cmp::min(5, output_lines.len()) 
-                                    };
-                                    
-                                    println!("    Output:");
+                            if !step.output.trim().is_empty() {
+                                // If the output is very long, trim it
+                                let output_lines = step.output.lines().collect::<Vec<&str>>();
+
+                                println!("    Output:");
+
+                                // In verbose mode, show complete output
+                                if verbose || debug {
+                                    for line in &output_lines {
+                                        println!("    {}", line);
+                                    }
+                                } else {
+                                    // Show only the first few lines
+                                    let max_lines = 5;
                                     for line in output_lines.iter().take(max_lines) {
                                         println!("    {}", line);
                                     }
-                                    
+
                                     if output_lines.len() > max_lines {
-                                        println!("    ... ({} more lines, use --debug to see full output)", 
+                                        println!("    ... ({} more lines, use --verbose to see full output)",
                                             output_lines.len() - max_lines);
                                     }
-                                    println!();
                                 }
                             }
                         }
-                        println!();
                     }
 
-                    if any_job_failed {
-                        println!("❌ Workflow completed with errors!");
+                    // Print detailed failure information if available
+                    if let Some(failure_details) = &result.failure_details {
+                        println!("\n❌ Workflow execution failed!");
+                        println!("{}", failure_details);
+                        println!("\nTo fix these issues:");
+                        println!("1. Check the formatting issues with: cargo fmt");
+                        println!("2. Fix clippy warnings with: cargo clippy -- -D warnings");
+                        println!("3. Run tests to ensure everything passes: cargo test");
                         std::process::exit(1);
                     } else {
-                        println!("✅ Workflow completed successfully!");
+                        println!("\n✅ Workflow completed successfully!");
                     }
                 }
                 Err(e) => {
-                    println!();
-                    println!("❌ Workflow execution failed: {}", e);
+                    logging::error(&format!("Workflow execution failed: {}", e));
                     std::process::exit(1);
                 }
-            };
+            }
         }
 
         Some(Commands::Tui {

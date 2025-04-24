@@ -3387,11 +3387,17 @@ fn start_next_workflow_execution(
 
         // Log whether verbose mode is enabled
         if verbose {
-            app.logs.push("Verbose mode: Step outputs will be displayed in full".to_string());
+            app.logs
+                .push("Verbose mode: Step outputs will be displayed in full".to_string());
             logging::info("Verbose mode: Step outputs will be displayed in full");
         } else {
-            app.logs.push("Standard mode: Only step status will be shown (use --verbose for full output)".to_string());
-            logging::info("Standard mode: Only step status will be shown (use --verbose for full output)");
+            app.logs.push(
+                "Standard mode: Only step status will be shown (use --verbose for full output)"
+                    .to_string(),
+            );
+            logging::info(
+                "Standard mode: Only step status will be shown (use --verbose for full output)",
+            );
         }
 
         // Check Docker availability again if Docker runtime is selected

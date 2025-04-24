@@ -16,7 +16,9 @@ use std::sync::Mutex;
 static RUNNING_CONTAINERS: Lazy<Mutex<Vec<String>>> = Lazy::new(|| Mutex::new(Vec::new()));
 static CREATED_NETWORKS: Lazy<Mutex<Vec<String>>> = Lazy::new(|| Mutex::new(Vec::new()));
 // Map to track customized images for a job
-static CUSTOMIZED_IMAGES: Lazy<Mutex<HashMap<String, String>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+#[allow(dead_code)]
+static CUSTOMIZED_IMAGES: Lazy<Mutex<HashMap<String, String>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
 
 pub struct DockerRuntime {
     docker: Docker,
@@ -32,12 +34,14 @@ impl DockerRuntime {
     }
 
     // Add a method to store and retrieve customized images (e.g., with Python installed)
+    #[allow(dead_code)]
     pub fn get_customized_image(base_image: &str, customization: &str) -> Option<String> {
         let key = format!("{}:{}", base_image, customization);
         let images = CUSTOMIZED_IMAGES.lock().unwrap();
         images.get(&key).cloned()
     }
 
+    #[allow(dead_code)]
     pub fn set_customized_image(base_image: &str, customization: &str, new_image: &str) {
         let key = format!("{}:{}", base_image, customization);
         let mut images = CUSTOMIZED_IMAGES.lock().unwrap();
@@ -45,16 +49,17 @@ impl DockerRuntime {
     }
 
     /// Find a customized image key by prefix
+    #[allow(dead_code)]
     pub fn find_customized_image_key(image: &str, prefix: &str) -> Option<String> {
         let image_keys = CUSTOMIZED_IMAGES.lock().unwrap();
-        
+
         // Look for any key that starts with the prefix
         for (key, _) in image_keys.iter() {
             if key.starts_with(prefix) {
                 return Some(key.clone());
             }
         }
-        
+
         None
     }
 }

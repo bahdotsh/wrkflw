@@ -2,7 +2,6 @@ use crate::logging;
 use crate::runtime::container::{ContainerError, ContainerOutput, ContainerRuntime};
 use async_trait::async_trait;
 use once_cell::sync::Lazy;
-use serde_json;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -15,6 +14,7 @@ static EMULATION_WORKSPACES: Lazy<Mutex<Vec<PathBuf>>> = Lazy::new(|| Mutex::new
 static EMULATION_PROCESSES: Lazy<Mutex<Vec<u32>>> = Lazy::new(|| Mutex::new(Vec::new()));
 
 pub struct EmulationRuntime {
+    #[allow(dead_code)]
     workspace: TempDir,
 }
 
@@ -32,6 +32,7 @@ impl EmulationRuntime {
         EmulationRuntime { workspace }
     }
 
+    #[allow(dead_code)]
     fn prepare_workspace(&self, _working_dir: &Path, volumes: &[(&Path, &Path)]) -> PathBuf {
         // Get the container root - this is the emulation workspace directory
         let container_root = self.workspace.path().to_path_buf();
@@ -138,364 +139,136 @@ impl EmulationRuntime {
 impl ContainerRuntime for EmulationRuntime {
     async fn run_container(
         &self,
-        image: &str,
-        cmd: &[&str],
+        _image: &str,
+        command: &[&str],
         env_vars: &[(&str, &str)],
         working_dir: &Path,
-        volumes: &[(&Path, &Path)],
+        _volumes: &[(&Path, &Path)],
     ) -> Result<ContainerOutput, ContainerError> {
-        // Print emulation info
-        logging::info(&format!("Emulating container: {}", image));
-        logging::debug(&format!("Command: {:?}", cmd));
-
-        // Prepare the workspace
-        let container_working_dir = self.prepare_workspace(working_dir, volumes);
-
-        // Check if this is likely a Rust job (cargo command)
-        let is_rust_job = cmd
-            .iter()
-            .any(|&c| c.contains("cargo") || c.contains("rustc") || c.contains("rustup"));
-
-        // Check if we need to ensure Rust toolchain paths are properly set up
-        if is_rust_job {
-            logging::info("Rust toolchain detected, ensuring proper setup...");
-
-            // Create a local .rustup directory if needed
-            let local_rustup = container_working_dir.join(".rustup");
-            if !local_rustup.exists() {
-                std::fs::create_dir_all(&local_rustup).map_err(|e| {
-                    ContainerError::ContainerExecution(format!(
-                        "Failed to create .rustup directory: {}",
-                        e
-                    ))
-                })?;
+        // Build command string
+        let mut command_str = String::new();
+        for part in command {
+            if !command_str.is_empty() {
+                command_str.push(' ');
             }
-
-            // Create a local .cargo directory if needed
-            let local_cargo = container_working_dir.join(".cargo");
-            if !local_cargo.exists() {
-                std::fs::create_dir_all(&local_cargo).map_err(|e| {
-                    ContainerError::ContainerExecution(format!(
-                        "Failed to create .cargo directory: {}",
-                        e
-                    ))
-                })?;
-            }
+            command_str.push_str(part);
         }
 
-        // Detect if this is a long-running command that should be spawned as a detached process
-        let is_long_running = cmd.iter().any(|&c| {
-            c.contains("server")
-                || c.contains("daemon")
-                || c.contains("listen")
-                || c.contains("watch")
-                || c.contains("-d")
-                || c.contains("--detach")
-        });
+        // Log the command being executed
+        logging::info(&format!("Executing command in container: {}", command_str));
 
-        if is_long_running {
-            logging::info("Detected long-running command, will run detached");
+        // Special handling for Rust/Cargo actions
+        if command_str.contains("rust") || command_str.contains("cargo") {
+            logging::debug(&format!("Executing Rust command: {}", command_str));
 
-            let mut command = Command::new(cmd[0]);
-            command.current_dir(&container_working_dir);
+            let mut cmd = Command::new("cargo");
+            let parts = command_str.split_whitespace().collect::<Vec<&str>>();
 
-            // Add all arguments
-            for arg in &cmd[1..] {
-                command.arg(arg);
-            }
+            let current_dir = working_dir.to_str().unwrap_or(".");
+            cmd.current_dir(current_dir);
 
-            // Set environment variables
+            // Add environment variables
             for (key, value) in env_vars {
-                command.env(key, value);
+                cmd.env(key, value);
             }
 
-            // Run detached
-            match command.spawn() {
-                Ok(child) => {
-                    let pid = child.id();
-                    track_process(pid);
-                    logging::info(&format!("Started detached process with PID: {}", pid));
+            // Add command arguments
+            if parts.len() > 1 {
+                cmd.args(&parts[1..]);
+            }
+
+            match cmd.output() {
+                Ok(output_result) => {
+                    let exit_code = output_result.status.code().unwrap_or(-1);
+                    let output = String::from_utf8_lossy(&output_result.stdout).to_string();
+                    let error = String::from_utf8_lossy(&output_result.stderr).to_string();
+
+                    logging::debug(&format!("Command exit code: {}", exit_code));
+
+                    if exit_code != 0 {
+                        let mut error_details = format!(
+                            "Command failed with exit code: {}\nCommand: {}\n\nError output:\n{}",
+                            exit_code, command_str, error
+                        );
+
+                        // Add environment variables to error details
+                        error_details.push_str("\n\nEnvironment variables:\n");
+                        for (key, value) in env_vars {
+                            if key.starts_with("GITHUB_") || key.starts_with("RUST") {
+                                error_details.push_str(&format!("{}={}\n", key, value));
+                            }
+                        }
+
+                        return Err(ContainerError::ContainerExecution(error_details));
+                    }
 
                     return Ok(ContainerOutput {
-                        stdout: format!("Started long-running process with PID: {}", pid),
-                        stderr: String::new(),
-                        exit_code: 0,
+                        stdout: output,
+                        stderr: error,
+                        exit_code,
                     });
                 }
                 Err(e) => {
                     return Err(ContainerError::ContainerExecution(format!(
-                        "Failed to start detached process: {}",
+                        "Failed to execute Rust command: {}",
                         e
                     )));
                 }
             }
         }
 
-        // For Nix-specific commands, ensure Nix is installed
-        let contains_nix_command = cmd.iter().any(|&arg| arg.contains("nix "));
+        // For other commands, use a shell
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c");
+        cmd.arg(&command_str);
+        cmd.current_dir(working_dir.to_str().unwrap_or("."));
 
-        if contains_nix_command {
-            let nix_installed = Command::new("which")
-                .arg("nix")
-                .output()
-                .map(|output| output.status.success())
-                .unwrap_or(false);
-
-            if !nix_installed {
-                logging::info("⚠️ Nix commands detected but Nix is not installed!");
-                logging::info(
-                    "🔄 To use this workflow, please install Nix: https://nixos.org/download.html",
-                );
-
-                return Ok(ContainerOutput {
-                        stdout: String::new(),
-                        stderr: "Nix is required for this workflow but not installed on your system.\nPlease install Nix first: https://nixos.org/download.html".to_string(),
-                        exit_code: 1,
-                    });
-            } else {
-                logging::info("✅ Nix is installed, proceeding with command");
-            }
+        // Add environment variables
+        for (key, value) in env_vars {
+            cmd.env(key, value);
         }
 
-        // Create a map of environment variables for easy manipulation
-        let mut env_map: std::collections::HashMap<String, String> = env_vars
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect();
+        match cmd.output() {
+            Ok(output_result) => {
+                let exit_code = output_result.status.code().unwrap_or(-1);
+                let output = String::from_utf8_lossy(&output_result.stdout).to_string();
+                let error = String::from_utf8_lossy(&output_result.stderr).to_string();
 
-        // Check if any of the commands suggest a specific action
-        let mut detected_action = None;
-        let mut with_params = None;
+                logging::debug(&format!("Command completed with exit code: {}", exit_code));
 
-        // Extract possible action info from comments in environment variables
-        for (key, value) in &env_map {
-            if key == "__WRKFLW_ACTION" {
-                detected_action = Some(value.clone());
-            }
-            if key == "__WRKFLW_WITH_PARAMS" {
-                // This would be a JSON-encoded string of with parameters
-                if let Ok(params) = serde_json::from_str::<HashMap<String, String>>(value) {
-                    with_params = Some(params);
+                if exit_code != 0 {
+                    let mut error_details = format!(
+                        "Command failed with exit code: {}\nCommand: {}\n\nError output:\n{}",
+                        exit_code, command_str, error
+                    );
+
+                    // Add environment variables to error details
+                    error_details.push_str("\n\nEnvironment variables:\n");
+                    for (key, value) in env_vars {
+                        if key.starts_with("GITHUB_") {
+                            error_details.push_str(&format!("{}={}\n", key, value));
+                        }
+                    }
+
+                    return Err(ContainerError::ContainerExecution(error_details));
                 }
+
+                Ok(ContainerOutput {
+                    stdout: format!(
+                        "Emulated container execution with command: {}\n\nOutput:\n{}",
+                        command_str, output
+                    ),
+                    stderr: error,
+                    exit_code,
+                })
+            }
+            Err(e) => {
+                return Err(ContainerError::ContainerExecution(format!(
+                    "Failed to execute command: {}\nError: {}",
+                    command_str, e
+                )));
             }
         }
-
-        // Apply action-specific environment variables if detected
-        if let Some(action) = detected_action {
-            add_action_env_vars(&mut env_map, &action, &with_params);
-        }
-
-        // For Rust jobs, set up RUSTUP_HOME and CARGO_HOME to point to local directories
-        if is_rust_job {
-            let rustup_home = container_working_dir
-                .join(".rustup")
-                .to_string_lossy()
-                .to_string();
-            let cargo_home = container_working_dir
-                .join(".cargo")
-                .to_string_lossy()
-                .to_string();
-
-            env_map.insert("RUSTUP_HOME".to_string(), rustup_home);
-            env_map.insert("CARGO_HOME".to_string(), cargo_home);
-            logging::info(&format!(
-                "Setting RUSTUP_HOME={}",
-                env_map.get("RUSTUP_HOME").unwrap()
-            ));
-            logging::info(&format!(
-                "Setting CARGO_HOME={}",
-                env_map.get("CARGO_HOME").unwrap()
-            ));
-        }
-
-        // Ensure we have a command
-        if cmd.is_empty() {
-            return Err(ContainerError::ContainerExecution(
-                "No command specified".to_string(),
-            ));
-        }
-
-        let has_background = cmd.iter().any(|c| c.contains(" &"));
-
-        // For bash/sh with -c, handle specially
-        if (cmd[0] == "bash" || cmd[0] == "sh")
-            && cmd.len() >= 2
-            && (cmd[1] == "-c" || cmd[1] == "-e" || cmd[1] == "-ec")
-        {
-            let shell = cmd[0];
-
-            // Find the index of -c flag (could be -e -c or just -c)
-            let c_flag_index = cmd.iter().position(|&arg| arg == "-c");
-
-            if let Some(idx) = c_flag_index {
-                // Ensure there's an argument after -c
-                if idx + 1 < cmd.len() {
-                    // Get the actual command
-                    let command_str = cmd[idx + 1];
-
-                    // Handle GitHub variables properly
-                    let fixed_cmd = command_str
-                        .replace(">>$GITHUB_OUTPUT", ">>\"$GITHUB_OUTPUT\"")
-                        .replace(">>$GITHUB_ENV", ">>\"$GITHUB_ENV\"")
-                        .replace(">>$GITHUB_PATH", ">>\"$GITHUB_PATH\"")
-                        .replace(">>$GITHUB_STEP_SUMMARY", ">>\"$GITHUB_STEP_SUMMARY\"");
-
-                    // If we have background processes, add a wait command
-                    let final_cmd = if has_background && !fixed_cmd.contains(" wait") {
-                        format!("{{ {}; }} && wait", fixed_cmd)
-                    } else {
-                        fixed_cmd
-                    };
-
-                    // Store a copy for logging
-                    let cmd_for_logs = final_cmd.clone();
-
-                    // Create command
-                    let mut command = Command::new(shell);
-                    command.current_dir(&container_working_dir);
-
-                    // Add flags
-                    for arg in cmd.iter().skip(1).take(idx) {
-                        command.arg(arg);
-                    }
-
-                    // Add the command
-                    command.arg(final_cmd);
-
-                    // Set environment variables from the map
-                    for (key, value) in &env_map {
-                        command.env(key, value);
-                    }
-
-                    // Execute
-                    let output = command
-                        .output()
-                        .map_err(|e| ContainerError::ContainerExecution(e.to_string()))?;
-
-                    // Log detailed information about the command execution for debugging
-                    let exit_code = output.status.code().unwrap_or(-1);
-                    if exit_code != 0 {
-                        logging::info(&format!("Command failed with exit code: {}", exit_code));
-                        logging::debug(&format!("Failed command: {}", cmd_for_logs));
-                        logging::debug(&format!(
-                            "Working directory: {}",
-                            container_working_dir.display()
-                        ));
-                        logging::debug(&format!(
-                            "STDERR: {}",
-                            String::from_utf8_lossy(&output.stderr)
-                        ));
-                    }
-
-                    return Ok(ContainerOutput {
-                        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-                        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-                        exit_code,
-                    });
-                }
-            }
-        }
-
-        if has_background {
-            // For commands with background processes, use shell wrapper
-            let mut shell_command = Command::new("sh");
-            shell_command.current_dir(&container_working_dir);
-            shell_command.arg("-c");
-
-            // Join the original command and add trap for cleanup
-            let command_str = format!("{{ {}; }} && wait", cmd.join(" "));
-
-            // Store a copy for logging
-            let cmd_for_logs = command_str.clone();
-
-            shell_command.arg(command_str);
-
-            // Set environment variables from the map
-            for (key, value) in &env_map {
-                shell_command.env(key, value);
-            }
-
-            // Log that we're running a background process
-            logging::info("Emulation: Running command with background processes");
-
-            // For commands with background processes, we could potentially track PIDs
-            // However, since they're in a shell wrapper, we'd need to parse them from output
-
-            let output = shell_command
-                .output()
-                .map_err(|e| ContainerError::ContainerExecution(e.to_string()))?;
-
-            // Log detailed information about the command execution for debugging
-            let exit_code = output.status.code().unwrap_or(-1);
-            if exit_code != 0 {
-                logging::info(&format!(
-                    "Background command failed with exit code: {}",
-                    exit_code
-                ));
-                logging::debug(&format!("Failed command: {}", cmd_for_logs));
-                logging::debug(&format!(
-                    "Working directory: {}",
-                    container_working_dir.display()
-                ));
-                logging::debug(&format!(
-                    "STDERR: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                ));
-            }
-
-            return Ok(ContainerOutput {
-                stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-                stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-                exit_code,
-            });
-        }
-
-        // For all other commands
-        let mut command = Command::new(cmd[0]);
-        command.current_dir(&container_working_dir);
-
-        // Log the command we're about to run
-        logging::debug(&format!("Executing command: {}", cmd.join(" ")));
-        logging::debug(&format!(
-            "In directory: {}",
-            container_working_dir.display()
-        ));
-
-        // Add all arguments
-        for arg in &cmd[1..] {
-            command.arg(arg);
-        }
-
-        // Set environment variables from the map
-        for (key, value) in &env_map {
-            command.env(key, value);
-        }
-
-        // Execute
-        let output = command
-            .output()
-            .map_err(|e| ContainerError::ContainerExecution(e.to_string()))?;
-
-        // Log detailed information about the command execution for debugging
-        let exit_code = output.status.code().unwrap_or(-1);
-        if exit_code != 0 {
-            logging::info(&format!("Command failed with exit code: {}", exit_code));
-            logging::debug(&format!("Failed command: {:?}", cmd));
-            logging::debug(&format!(
-                "Working directory: {}",
-                container_working_dir.display()
-            ));
-            logging::debug(&format!(
-                "STDERR: {}",
-                String::from_utf8_lossy(&output.stderr)
-            ));
-        }
-
-        Ok(ContainerOutput {
-            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-            exit_code,
-        })
     }
 
     async fn pull_image(&self, image: &str) -> Result<(), ContainerError> {
@@ -513,7 +286,7 @@ impl ContainerRuntime for EmulationRuntime {
     }
 }
 
-// Helper function for recursive directory copying
+#[allow(dead_code)]
 fn copy_directory_contents(source: &Path, dest: &Path) -> std::io::Result<()> {
     // Create the destination directory if it doesn't exist
     fs::create_dir_all(dest)?;
@@ -673,6 +446,7 @@ fn check_command_available(command: &str, name: &str, install_url: &str) {
 }
 
 // Add a function to help set up appropriate environment variables for different actions
+#[allow(dead_code)]
 fn add_action_env_vars(
     env_map: &mut HashMap<String, String>,
     action: &str,
@@ -791,6 +565,7 @@ async fn cleanup_workspaces() {
 }
 
 // Add process to tracking
+#[allow(dead_code)]
 pub fn track_process(pid: u32) {
     if let Ok(mut processes) = EMULATION_PROCESSES.lock() {
         processes.push(pid);

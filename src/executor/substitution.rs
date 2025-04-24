@@ -10,6 +10,7 @@ lazy_static! {
 
 /// Preprocesses a command string to replace GitHub-style matrix variable references
 /// with their values from the environment
+#[allow(dead_code)]
 pub fn preprocess_command(command: &str, matrix_values: &HashMap<String, Value>) -> String {
     // Replace matrix references like ${{ matrix.os }} with their values
     let result = MATRIX_PATTERN.replace_all(command, |caps: &regex::Captures| {
@@ -34,6 +35,7 @@ pub fn preprocess_command(command: &str, matrix_values: &HashMap<String, Value>)
 }
 
 /// Apply variable substitution to step run commands
+#[allow(dead_code)]
 pub fn process_step_run(run: &str, matrix_combination: &Option<HashMap<String, Value>>) -> String {
     if let Some(matrix) = matrix_combination {
         preprocess_command(run, matrix)

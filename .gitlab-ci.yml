@@ -1,0 +1,107 @@
+# GitLab CI/CD Pipeline for wrkflw
+# This pipeline will build and test the Rust project
+
+stages:
+  - lint
+  - build
+  - test
+  - release
+
+variables:
+  CARGO_HOME: ${CI_PROJECT_DIR}/.cargo
+  RUST_VERSION: stable
+
+# Cache dependencies between jobs
+cache:
+  paths:
+    - .cargo/
+    - target/
+
+# Lint job - runs rustfmt and clippy
+lint:
+  stage: lint
+  image: rust:${RUST_VERSION}
+  script:
+    - rustup component add rustfmt clippy
+    - cargo fmt -- --check
+    - cargo clippy -- -D warnings
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "web"
+      when: always
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: always
+    - if: $CI_COMMIT_TAG
+      when: never
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: always
+
+# Build job - builds the application
+build:
+  stage: build
+  image: rust:${RUST_VERSION}
+  script:
+    - cargo build --verbose
+  artifacts:
+    paths:
+      - target/debug/wrkflw
+    expire_in: 1 week
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "web"
+      when: always
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: always
+    - if: $CI_COMMIT_TAG
+      when: always
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: always
+
+# Test job - runs unit and integration tests
+test:
+  stage: test
+  image: rust:${RUST_VERSION}
+  script:
+    - cargo test --verbose
+  needs:
+    - build
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "web"
+      when: always
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: always
+    - if: $CI_COMMIT_TAG
+      when: always
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: always
+
+# Release job - creates a release build
+release:
+  stage: release
+  image: rust:${RUST_VERSION}
+  script:
+    - cargo build --release --verbose
+  artifacts:
+    paths:
+      - target/release/wrkflw
+    expire_in: 1 month
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "web" && $BUILD_RELEASE == "true"
+      when: always
+    - if: $CI_COMMIT_TAG
+      when: always
+    - when: never
+
+# Custom job for documentation
+docs:
+  stage: release
+  image: rust:${RUST_VERSION}
+  script:
+    - cargo doc --no-deps
+  artifacts:
+    paths:
+      - target/doc/
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "web" && $BUILD_DOCS == "true"
+      when: always
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: always
+    - when: never 

@@ -161,6 +161,18 @@ pub async fn trigger_workflow(
     let branch_ref = branch.unwrap_or(&repo_info.default_branch);
     println!("Using branch: {}", branch_ref);
 
+    // Extract just the workflow name from the path if it's a full path
+    let workflow_name = if workflow_name.contains('/') {
+        Path::new(workflow_name)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| GithubError::GitParseError("Invalid workflow name".to_string()))?
+    } else {
+        workflow_name
+    };
+
+    println!("Using workflow name: {}", workflow_name);
+
     // Create simplified payload
     let mut payload = serde_json::json!({
         "ref": branch_ref
@@ -202,9 +214,23 @@ pub async fn trigger_workflow(
             .await
             .unwrap_or_else(|_| format!("Unknown error (HTTP {})", status));
 
+        // Add more detailed error information
+        let error_details = if status == 500 {
+            "Internal server error from GitHub. This could be due to:\n\
+             1. The workflow file doesn't exist in the repository\n\
+             2. The GitHub token doesn't have sufficient permissions\n\
+             3. There's an issue with the workflow file itself\n\
+             Please check:\n\
+             - The workflow file exists at .github/workflows/rust.yml\n\
+             - Your GitHub token has the 'workflow' scope\n\
+             - The workflow file is valid YAML"
+        } else {
+            &error_message
+        };
+
         return Err(GithubError::ApiError {
             status,
-            message: error_message,
+            message: error_details.to_string(),
         });
     }
 
@@ -253,6 +279,16 @@ async fn list_recent_workflow_runs(
     workflow_name: &str,
     token: &str,
 ) -> Result<Vec<serde_json::Value>, GithubError> {
+    // Extract just the workflow name from the path if it's a full path
+    let workflow_name = if workflow_name.contains('/') {
+        Path::new(workflow_name)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| GithubError::GitParseError("Invalid workflow name".to_string()))?
+    } else {
+        workflow_name
+    };
+
     // Get recent workflow runs via GitHub API
     let url = format!(
         "https://api.github.com/repos/{}/{}/actions/workflows/{}.yml/runs?per_page=5",

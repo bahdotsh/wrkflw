@@ -917,11 +917,9 @@ impl App {
                     let rt = match tokio::runtime::Runtime::new() {
                         Ok(runtime) => runtime,
                         Err(e) => {
-                            eprintln!("Failed to create Tokio runtime: {}", e);
-                            // Return early from the current function with appropriate error handling
                             let _ = tx_clone.send((
                                 selected_idx,
-                                Err("Failed to create runtime for execution".to_string()),
+                                Err(format!("Failed to create Tokio runtime: {}", e)),
                             ));
                             return;
                         }
@@ -933,7 +931,7 @@ impl App {
 
                     // Send the result back to the main thread
                     if let Err(e) = tx_clone.send((selected_idx, result)) {
-                        eprintln!("Error sending trigger result: {}", e);
+                        logging::error(&format!("Error sending trigger result: {}", e));
                     }
                 });
             } else {
@@ -1032,7 +1030,8 @@ fn load_workflows(dir_path: &Path) -> Vec<Workflow> {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_file() && (is_workflow_file(&path) || !is_default_dir) {
-                let name = path.file_name().map_or_else(
+                // Get just the base name without extension
+                let name = path.file_stem().map_or_else(
                     || "[unknown]".to_string(),
                     |fname| fname.to_string_lossy().into_owned(),
                 );
@@ -2932,13 +2931,13 @@ pub async fn run_wrkflw_tui(
         Ok(_) => Ok(()),
         Err(e) => {
             // If the TUI fails to initialize or crashes, fall back to CLI mode
-            eprintln!("Failed to start UI: {}", e);
+            logging::error(&format!("Failed to start UI: {}", e));
 
             // Only for 'tui' command should we fall back to CLI mode for files
             // For other commands, return the error
             if let Some(path) = path {
                 if path.is_file() {
-                    eprintln!("Falling back to CLI mode...");
+                    logging::error("Falling back to CLI mode...");
                     execute_workflow_cli(path, runtime_type, verbose).await
                 } else if path.is_dir() {
                     validate_workflow(path, verbose)
@@ -3307,49 +3306,54 @@ async fn execute_curl_trigger(
     // Determine branch to use
     let branch_ref = branch.unwrap_or(&repo_info.default_branch);
 
+    // Extract just the workflow name from the path if it's a full path
+    let workflow_name = if workflow_name.contains('/') {
+        Path::new(workflow_name)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| "Invalid workflow name".to_string())?
+    } else {
+        workflow_name
+    };
+
+    logging::info(&format!("Using workflow name: {}", workflow_name));
+
     // Construct JSON payload
-    let payload = format!("{{\"ref\":\"{}\"}}", branch_ref);
+    let payload = serde_json::json!({
+        "ref": branch_ref
+    });
 
     // Construct API URL
     let url = format!(
-        "https://api.github.com/repos/{}/{}/actions/workflows/{}/dispatches",
+        "https://api.github.com/repos/{}/{}/actions/workflows/{}.yml/dispatches",
         repo_info.owner, repo_info.repo, workflow_name
     );
 
-    // Log the constructed API URL and payload for debugging
-    logging::info(&format!(
-        "Triggering workflow with URL: {} and payload: {}",
-        url, payload
-    ));
+    logging::info(&format!("Triggering workflow at URL: {}", url));
 
-    // Use a Command to run curl - disable verbose flags for better performance
-    let output = tokio::process::Command::new("curl")
-        .arg("-s") // Silent mode
-        .arg("-X")
-        .arg("POST")
-        .arg("-H")
-        .arg(format!("Authorization: Bearer {}", token.trim()))
-        .arg("-H")
-        .arg("Accept: application/vnd.github.v3+json")
-        .arg("-H")
-        .arg("Content-Type: application/json")
-        .arg("-H")
-        .arg("User-Agent: wrkflw-cli")
-        .arg("-d")
-        .arg(payload)
-        .arg(url)
-        .output()
+    // Create a reqwest client
+    let client = reqwest::Client::new();
+
+    // Send the request using reqwest
+    let response = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", token.trim()))
+        .header("Accept", "application/vnd.github.v3+json")
+        .header("Content-Type", "application/json")
+        .header("User-Agent", "wrkflw-cli")
+        .json(&payload)
+        .send()
         .await
-        .map_err(|e| format!("Failed to execute curl: {}", e))?;
+        .map_err(|e| format!("Failed to send request: {}", e))?;
 
-    // Log the output of the curl command for debugging
-    if !output.status.success() {
-        let error = String::from_utf8_lossy(&output.stderr);
-        logging::error(&format!("Curl command failed: {}", error));
-        return Err(format!("Curl command failed: {}", error));
-    } else {
-        let success_output = String::from_utf8_lossy(&output.stdout);
-        logging::info(&format!("Curl command succeeded: {}", success_output));
+    if !response.status().is_success() {
+        let status = response.status().as_u16();
+        let error_message = response
+            .text()
+            .await
+            .unwrap_or_else(|_| format!("Unknown error (HTTP {})", status));
+
+        return Err(format!("API error: {} - {}", status, error_message));
     }
 
     // Success message with URL to view the workflow
@@ -3447,11 +3451,9 @@ fn start_next_workflow_execution(
             let rt = match tokio::runtime::Runtime::new() {
                 Ok(runtime) => runtime,
                 Err(e) => {
-                    eprintln!("Failed to create Tokio runtime: {}", e);
-                    // Return early from the current function with appropriate error handling
                     let _ = tx_clone_inner.send((
                         next_idx,
-                        Err("Failed to create runtime for execution".to_string()),
+                        Err(format!("Failed to create Tokio runtime: {}", e)),
                     ));
                     return;
                 }
@@ -3517,7 +3519,7 @@ fn start_next_workflow_execution(
 
             // Only send if we get a valid result
             if let Err(e) = tx_clone_inner.send((next_idx, result)) {
-                eprintln!("Error sending execution result: {}", e);
+                logging::error(&format!("Error sending execution result: {}", e));
             }
         });
     } else {

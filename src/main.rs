@@ -95,7 +95,7 @@ enum Commands {
         branch: Option<String>,
 
         /// Key-value variables for the pipeline in format key=value
-        #[arg(short, long, value_parser = parse_key_val)]
+        #[arg(short = 'V', long, value_parser = parse_key_val)]
         variable: Option<Vec<(String, String)>>,
     },
 

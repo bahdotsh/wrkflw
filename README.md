@@ -226,35 +226,46 @@ WRKFLW automatically cleans up any Docker containers created during workflow exe
 ## Limitations
 
 ### Supported Features
-- ✅ Basic workflow syntax and validation
-- ✅ Job dependency resolution and parallel execution
-- ✅ Matrix builds (with reasonable size limits)
-- ✅ Environment variables and GitHub context
-- ✅ Docker container actions
-- ✅ JavaScript actions
-- ✅ Composite actions
-- ✅ Local actions
-- ✅ Special handling for common actions (e.g., `actions/checkout`)
-- ✅ Workflow triggering via `workflow_dispatch`
-- ✅ GitLab pipeline triggering
-- ✅ Environment files (`GITHUB_OUTPUT`, `GITHUB_ENV`, `GITHUB_PATH`, `GITHUB_STEP_SUMMARY`)
+- ✅ Basic workflow syntax and validation (all YAML syntax checks, required fields, and structure)
+- ✅ Job dependency resolution and parallel execution (all jobs with correct 'needs' relationships are executed in the right order, and independent jobs run in parallel)
+- ✅ Matrix builds (supported for reasonable matrix sizes; very large matrices may be slow or resource-intensive)
+- ✅ Environment variables and GitHub context (all standard GitHub Actions environment variables and context objects are emulated)
+- ✅ Docker container actions (all actions that use Docker containers are supported in Docker mode)
+- ✅ JavaScript actions (all actions that use JavaScript are supported)
+- ✅ Composite actions (all composite actions, including nested and local composite actions, are supported)
+- ✅ Local actions (actions referenced with local paths are supported)
+- ✅ Special handling for common actions (e.g., `actions/checkout` is natively supported)
+- ✅ Workflow triggering via `workflow_dispatch` (manual triggering of workflows is supported)
+- ✅ GitLab pipeline triggering (manual triggering of GitLab pipelines is supported)
+- ✅ Environment files (`GITHUB_OUTPUT`, `GITHUB_ENV`, `GITHUB_PATH`, `GITHUB_STEP_SUMMARY` are fully supported)
+- ✅ TUI interface for workflow management and monitoring
+- ✅ CLI interface for validation, execution, and remote triggering
+- ✅ Output capturing (logs, step outputs, and execution details are available in both TUI and CLI)
+- ✅ Container cleanup (all containers created by wrkflw are automatically cleaned up, even on interruption)
 
-### Limited or Unsupported Features
-- ⚠️ GitHub-specific secrets and permissions (limited to basic environment variables)
-- ⚠️ GitHub API integrations (only basic workflow triggering is supported)
-- ⚠️ GitHub-specific environment variables (some may be emulated but not fully functional)
-- ⚠️ Complex matrix builds with very large matrices (performance limitations)
-- ⚠️ Network-isolated actions (may require additional configuration)
-- ⚠️ GitHub Actions cache functionality (not supported in emulation mode)
-- ⚠️ Some GitHub-specific event triggers (only `workflow_dispatch` is fully supported)
-- ⚠️ GitHub-specific runner features (some features may behave differently)
+### Limited or Unsupported Features (Explicit List)
+- ❌ GitHub secrets and permissions: Only basic environment variables are supported. GitHub's encrypted secrets and fine-grained permissions are NOT available.
+- ❌ GitHub Actions cache: Caching functionality (e.g., `actions/cache`) is NOT supported in emulation mode and only partially supported in Docker mode (no persistent cache between runs).
+- ❌ GitHub API integrations: Only basic workflow triggering is supported. Features like workflow status reporting, artifact upload/download, and API-based job control are NOT available.
+- ❌ GitHub-specific environment variables: Some advanced or dynamic environment variables (e.g., those set by GitHub runners or by the GitHub API) are emulated with static or best-effort values, but not all are fully functional.
+- ❌ Large/complex matrix builds: Very large matrices (hundreds or thousands of job combinations) may not be practical due to performance and resource limits.
+- ❌ Network-isolated actions: Actions that require strict network isolation or custom network configuration may not work out-of-the-box and may require manual Docker configuration.
+- ❌ Some event triggers: Only `workflow_dispatch` (manual trigger) is fully supported. Other triggers (e.g., `push`, `pull_request`, `schedule`, `release`, etc.) are NOT supported.
+- ❌ GitHub runner-specific features: Features that depend on the exact GitHub-hosted runner environment (e.g., pre-installed tools, runner labels, or hardware) are NOT guaranteed to match. Only a best-effort emulation is provided.
+- ❌ Windows and macOS runners: Only Linux-based runners are fully supported. Windows and macOS jobs are NOT supported.
+- ❌ Service containers: Service containers (e.g., databases defined in `services:`) are only supported in Docker mode. In emulation mode, they are NOT supported.
+- ❌ Artifacts: Uploading and downloading artifacts between jobs/steps is NOT supported.
+- ❌ Job/step timeouts: Custom timeouts for jobs and steps are NOT enforced.
+- ❌ Job/step concurrency and cancellation: Features like `concurrency` and job cancellation are NOT supported.
+- ❌ Expressions and advanced YAML features: Most common expressions are supported, but some advanced or edge-case expressions may not be fully implemented.
 
 ### Runtime Mode Differences
-- **Docker Mode**: Closer to GitHub's environment but may have limitations with certain container configurations
-- **Emulation Mode**: Runs without Docker but has more limitations:
-  - Limited support for container-specific actions
+- **Docker Mode**: Provides the closest match to GitHub's environment, including support for Docker container actions, service containers, and Linux-based jobs. Some advanced container configurations may still require manual setup.
+- **Emulation Mode**: Runs workflows using the local system tools. Limitations:
+  - Only supports local and JavaScript actions (no Docker container actions)
+  - No support for service containers
   - No caching support
-  - Some actions may need to be adapted to work in the local environment
+  - Some actions may require adaptation to work locally
   - Special action handling is more limited
 
 ### Best Practices
@@ -263,6 +274,78 @@ WRKFLW automatically cleans up any Docker containers created during workflow exe
 - Use environment variables instead of GitHub secrets when possible
 - Consider using local actions for complex custom functionality
 - Test network-dependent actions carefully in both modes
+
+## Roadmap
+
+The following roadmap outlines our planned approach to implementing currently unsupported or partially supported features in WRKFLW. Progress and priorities may change based on user feedback and community contributions.
+
+### 1. Secrets and Permissions
+- **Goal:** Support encrypted secrets and fine-grained permissions similar to GitHub Actions.
+- **Plan:** 
+  - Implement secure secret storage and injection for workflow steps.
+  - Add support for reading secrets from environment variables, files, or secret managers.
+  - Investigate permission scoping for jobs and steps.
+
+### 2. GitHub Actions Cache
+- **Goal:** Enable persistent caching between workflow runs, especially for dependencies.
+- **Plan:** 
+  - Implement a local cache directory for Docker mode.
+  - Add support for `actions/cache` in both Docker and emulation modes.
+  - Investigate cross-run cache persistence.
+
+### 3. GitHub API Integrations
+- **Goal:** Support artifact upload/download, workflow/job status reporting, and other API-based features.
+- **Plan:** 
+  - Add artifact upload/download endpoints.
+  - Implement status reporting to GitHub via the API.
+  - Add support for job/step annotations and logs upload.
+
+### 4. Advanced Environment Variables
+- **Goal:** Emulate all dynamic GitHub-provided environment variables.
+- **Plan:** 
+  - Audit missing variables and add dynamic computation where possible.
+  - Provide a compatibility table in the documentation.
+
+### 5. Large/Complex Matrix Builds
+- **Goal:** Improve performance and resource management for large matrices.
+- **Plan:** 
+  - Optimize matrix expansion and job scheduling.
+  - Add resource limits and warnings for very large matrices.
+
+### 6. Network-Isolated Actions
+- **Goal:** Support custom network configurations and strict isolation for actions.
+- **Plan:** 
+  - Add advanced Docker network configuration options.
+  - Document best practices for network isolation.
+
+### 7. Event Triggers
+- **Goal:** Support additional triggers (`push`, `pull_request`, `schedule`, etc.).
+- **Plan:** 
+  - Implement event simulation for common triggers.
+  - Allow users to specify event payloads for local runs.
+
+### 8. Windows and macOS Runners
+- **Goal:** Add support for non-Linux runners.
+- **Plan:** 
+  - Investigate cross-platform containerization and emulation.
+  - Add documentation for platform-specific limitations.
+
+### 9. Service Containers in Emulation Mode
+- **Goal:** Support service containers (e.g., databases) in emulation mode.
+- **Plan:** 
+  - Implement local service startup and teardown scripts.
+  - Provide configuration for common services.
+
+### 10. Artifacts, Timeouts, Concurrency, and Expressions
+- **Goal:** Support artifact handling, job/step timeouts, concurrency, and advanced YAML expressions.
+- **Plan:** 
+  - Add artifact storage and retrieval.
+  - Enforce timeouts and concurrency limits.
+  - Expand expression parser for advanced use cases.
+
+---
+
+**Want to help?** Contributions are welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for how to get started.
 
 ## License
 

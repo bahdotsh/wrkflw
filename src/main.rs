@@ -2,6 +2,7 @@ mod cleanup_test;
 mod evaluator;
 mod executor;
 mod github;
+mod gitlab;
 mod logging;
 mod matrix;
 mod matrix_test;
@@ -85,6 +86,17 @@ enum Commands {
         /// Key-value inputs for the workflow in format key=value
         #[arg(short, long, value_parser = parse_key_val)]
         input: Option<Vec<(String, String)>>,
+    },
+
+    /// Trigger a GitLab pipeline remotely
+    TriggerGitlab {
+        /// Branch to run the pipeline on
+        #[arg(short, long)]
+        branch: Option<String>,
+
+        /// Key-value variables for the pipeline in format key=value
+        #[arg(short, long, value_parser = parse_key_val)]
+        variable: Option<Vec<(String, String)>>,
     },
 
     /// List available workflows
@@ -350,17 +362,17 @@ async fn main() {
             branch,
             input,
         }) => {
-            let inputs = input.as_ref().map(|kv_pairs| {
-                kv_pairs
-                    .iter()
-                    .cloned()
+            logging::info(&format!("Triggering workflow {} on GitHub", workflow));
+
+            // Convert inputs to HashMap
+            let input_map = input.as_ref().map(|i| {
+                i.iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
                     .collect::<HashMap<String, String>>()
             });
 
-            match github::trigger_workflow(workflow, branch.as_deref(), inputs.clone()).await {
-                Ok(_) => {
-                    // Success is already reported in the github module with detailed info
-                }
+            match github::trigger_workflow(workflow, branch.as_deref(), input_map).await {
+                Ok(_) => logging::info("Workflow triggered successfully"),
                 Err(e) => {
                     eprintln!("Error triggering workflow: {}", e);
                     std::process::exit(1);
@@ -368,29 +380,70 @@ async fn main() {
             }
         }
 
-        Some(Commands::List) => match github::get_repo_info() {
-            Ok(repo_info) => match github::list_workflows(&repo_info).await {
-                Ok(workflows) => {
-                    if workflows.is_empty() {
-                        println!("No workflows found in the .github/workflows directory");
-                    } else {
-                        println!("Available workflows:");
-                        for workflow in workflows {
-                            println!("  {}", workflow);
-                        }
-                        println!("\nTrigger a workflow with: wrkflw trigger <workflow> [options]");
-                    }
-                }
+        Some(Commands::TriggerGitlab { branch, variable }) => {
+            logging::info("Triggering pipeline on GitLab");
+
+            // Convert variables to HashMap
+            let variable_map = variable.as_ref().map(|v| {
+                v.iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect::<HashMap<String, String>>()
+            });
+
+            match gitlab::trigger_pipeline(branch.as_deref(), variable_map).await {
+                Ok(_) => logging::info("GitLab pipeline triggered successfully"),
                 Err(e) => {
-                    eprintln!("Error listing workflows: {}", e);
+                    eprintln!("Error triggering GitLab pipeline: {}", e);
                     std::process::exit(1);
                 }
-            },
-            Err(e) => {
-                eprintln!("Error getting repository info: {}", e);
-                std::process::exit(1);
             }
-        },
+        }
+
+        Some(Commands::List) => {
+            logging::info("Listing available workflows");
+
+            // Attempt to get GitHub repo info
+            if let Ok(repo_info) = github::get_repo_info() {
+                match github::list_workflows(&repo_info).await {
+                    Ok(workflows) => {
+                        if workflows.is_empty() {
+                            println!("No GitHub workflows found in repository");
+                        } else {
+                            println!("GitHub workflows:");
+                            for workflow in workflows {
+                                println!("  {}", workflow);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Error listing GitHub workflows: {}", e);
+                    }
+                }
+            } else {
+                println!("Not a GitHub repository or unable to get repository information");
+            }
+
+            // Attempt to get GitLab repo info
+            if let Ok(repo_info) = gitlab::get_repo_info() {
+                match gitlab::list_pipelines(&repo_info).await {
+                    Ok(pipelines) => {
+                        if pipelines.is_empty() {
+                            println!("No GitLab pipelines found in repository");
+                        } else {
+                            println!("GitLab pipelines:");
+                            for pipeline in pipelines {
+                                println!("  {}", pipeline);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Error listing GitLab pipelines: {}", e);
+                    }
+                }
+            } else {
+                println!("Not a GitLab repository or unable to get repository information");
+            }
+        }
 
         None => {
             // Default to TUI interface if no subcommand

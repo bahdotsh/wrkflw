@@ -42,17 +42,17 @@ footer = """
 conventional_commits = true
 filter_unconventional = true
 commit_parsers = [
-  { message = "^feat", group = "Features", icon = "✨" },
-  { message = "^fix", group = "Bug Fixes", icon = "🐛" },
-  { message = "^docs", group = "Documentation", icon = "📚" },
-  { message = "^style", group = "Styling", icon = "💎" },
-  { message = "^refactor", group = "Refactor", icon = "🔨" },
-  { message = "^perf", group = "Performance", icon = "🚀" },
-  { message = "^test", group = "Testing", icon = "🧪" },
-  { message = "^chore\\(deps\\)", skip = true },
-  { message = "^chore\\(release\\)", skip = true },
-  { message = "^chore", group = "Miscellaneous Tasks", icon = "🧹" },
-  { body = ".*security", group = "Security", icon = "🔒" },
+  { message = '^feat', group = "Features", icon = "✨" },
+  { message = '^fix', group = "Bug Fixes", icon = "🐛" },
+  { message = '^docs', group = "Documentation", icon = "📚" },
+  { message = '^style', group = "Styling", icon = "💎" },
+  { message = '^refactor', group = "Refactor", icon = "🔨" },
+  { message = '^perf', group = "Performance", icon = "🚀" },
+  { message = '^test', group = "Testing", icon = "🧪" },
+  { message = '^chore\(deps\)', skip = true },
+  { message = '^chore\(release\)', skip = true },
+  { message = '^chore', group = "Miscellaneous Tasks", icon = "🧹" },
+  { body = '.*security', group = "Security", icon = "🔒" },
 ]
 
 # Define the GitHub repository URL for commit links

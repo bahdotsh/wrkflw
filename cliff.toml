@@ -1,7 +1,3 @@
-[remote.github]
-owner = "bahdotsh"
-repo = "wrkflw"
-
 [changelog]
 # The header of the changelog
 header = """

@@ -49,8 +49,8 @@ commit_parsers = [
   { message = "^refactor", group = "Refactor", icon = "🔨" },
   { message = "^perf", group = "Performance", icon = "🚀" },
   { message = "^test", group = "Testing", icon = "🧪" },
-  { message = "^chore\(deps\)", skip = true },
-  { message = "^chore\(release\)", skip = true },
+  { message = "^chore\\(deps\\)", skip = true },
+  { message = "^chore\\(release\\)", skip = true },
   { message = "^chore", group = "Miscellaneous Tasks", icon = "🧹" },
   { body = ".*security", group = "Security", icon = "🔒" },
 ]

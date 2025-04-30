@@ -1,18 +1,5 @@
-mod cleanup_test;
-mod evaluator;
-mod executor;
-mod github;
-mod gitlab;
-mod logging;
-mod matrix;
-mod matrix_test;
-mod models;
-mod parser;
-mod reusable_workflow_test;
-mod runtime;
-mod ui;
-mod utils;
-mod validators;
+// Import public modules from lib.rs
+use wrkflw::*;
 
 use bollard::Docker;
 use clap::{Parser, Subcommand};

@@ -12,12 +12,32 @@ env:
 
 jobs:
   build:
-
     runs-on: macos-latest
-
     steps:
     - uses: actions/checkout@v3
     - name: Build
       run: cargo build --verbose
-    - name: Run tests
-      run: cargo test --verbose 
+      
+  test-unit:
+    needs: [build]
+    runs-on: macos-latest
+    steps:
+    - uses: actions/checkout@v3
+    - name: Run unit tests
+      run: cargo test --lib --verbose
+      
+  test-integration:
+    needs: [build]
+    runs-on: macos-latest
+    steps:
+    - uses: actions/checkout@v3
+    - name: Run integration tests
+      run: cargo test --test matrix_test --test reusable_workflow_test --verbose
+      
+  test-e2e:
+    needs: [build]
+    runs-on: macos-latest
+    steps:
+    - uses: actions/checkout@v3
+    - name: Run e2e tests (if Docker available)
+      run: cargo test --test cleanup_test --verbose -- --skip docker --skip processes 

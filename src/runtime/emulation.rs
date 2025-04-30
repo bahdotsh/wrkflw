@@ -18,6 +18,12 @@ pub struct EmulationRuntime {
     workspace: TempDir,
 }
 
+impl Default for EmulationRuntime {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl EmulationRuntime {
     pub fn new() -> Self {
         // Create a temporary workspace to simulate container isolation

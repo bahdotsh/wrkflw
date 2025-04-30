@@ -1,0 +1,31 @@
+name: Cyclic Dependencies
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  job-a:
+    runs-on: ubuntu-latest
+    needs: [job-c]
+    steps:
+      - name: Job A
+        run: echo "Job A"
+  
+  job-b:
+    runs-on: ubuntu-latest
+    needs: [job-a]
+    steps:
+      - name: Job B
+        run: echo "Job B"
+  
+  job-c:
+    runs-on: ubuntu-latest
+    needs: [job-b]
+    steps:
+      - name: Job C
+        run: echo "Job C"
+  
+  reusable-job:
+    uses: octo-org/example-repo/.github/workflows/reusable.yml@main
+    needs: [job-a] 

@@ -1,0 +1,25 @@
+name: Mixed Regular and Reusable Jobs
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  regular-job:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Run regular task
+        run: echo "This is a regular job"
+  
+  reusable-job:
+    uses: octo-org/example-repo/.github/workflows/reusable.yml@main
+    with:
+      parameter: "value"
+  
+  dependent-job:
+    runs-on: ubuntu-latest
+    needs: [regular-job, reusable-job]
+    steps:
+      - name: Run dependent task
+        run: echo "This job depends on both a regular and reusable job" 

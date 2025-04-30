@@ -8,6 +8,7 @@ mod matrix;
 mod matrix_test;
 mod models;
 mod parser;
+mod reusable_workflow_test;
 mod runtime;
 mod ui;
 mod utils;

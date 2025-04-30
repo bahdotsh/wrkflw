@@ -1,0 +1,32 @@
+name: Reusable Workflow Definition
+
+on:
+  workflow_call:
+    inputs:
+      config-path:
+        required: true
+        type: string
+        description: "Path to the configuration file"
+      environment:
+        required: false
+        type: string
+        default: "production"
+        description: "Environment to run in"
+    secrets:
+      token:
+        required: true
+        description: "GitHub token for authentication"
+
+jobs:
+  reusable-job:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Load configuration
+        run: echo "Loading configuration from ${{ inputs.config-path }}"
+      - name: Run in environment
+        run: echo "Running in ${{ inputs.environment }} environment"
+      - name: Use secret
+        run: echo "Using secret with length ${#TOKEN}"
+        env:
+          TOKEN: ${{ secrets.token }} 

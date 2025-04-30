@@ -1,0 +1,12 @@
+on:
+  push:
+    branches: [main]
+
+jobs:
+  call-workflow-1:
+    uses: octo-org/example-repo/.github/workflows/workflow-A.yml@v1
+  
+  call-workflow-2:
+    uses: ./local-workflows/build.yml
+    with:
+      config-path: ./config/test.yml 

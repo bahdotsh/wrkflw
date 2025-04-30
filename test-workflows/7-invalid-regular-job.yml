@@ -1,0 +1,19 @@
+name: Invalid Regular Job
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  job-missing-runs-on:
+    # Missing runs-on field
+    steps:
+      - name: Test step
+        run: echo "This job is missing runs-on field"
+  
+  job-missing-steps:
+    runs-on: ubuntu-latest
+    # Missing steps section
+  
+  valid-reusable-job:
+    uses: octo-org/example-repo/.github/workflows/reusable.yml@main 

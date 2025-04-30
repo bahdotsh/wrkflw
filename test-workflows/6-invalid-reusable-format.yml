@@ -1,0 +1,17 @@
+name: Invalid Reusable Format
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  valid-job:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Test step
+        run: echo "This is a valid job"
+  
+  invalid-reusable-job:
+    uses: invalid-format
+    with:
+      param: "value" 

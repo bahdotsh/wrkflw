@@ -8,18 +8,54 @@ All notable changes to wrkflw will be documented in this file.
 
 # Template for the changelog body
 body = """
-{% if version %}
-## [{{ version | trim_start_matches(pat="v") }}] - {{ timestamp | date(format="%Y-%m-%d") }}
-{% else %}
-## [unreleased]
-{% endif %}
+{%- macro remote_url() -%}
+  https://github.com/{{ bahdotsh }}/{{ wrkflw }}
+{%- endmacro -%}
+
+{% macro print_commit(commit) -%}
+    - {% if commit.scope %}*({{ commit.scope }})* {% endif %}\
+        {% if commit.breaking %}[**breaking**] {% endif %}\
+        {{ commit.message | upper_first }} - \
+        ([{{ commit.id | truncate(length=7, end="") }}]({{ self::remote_url() }}/commit/{{ commit.id }}))\
+{% endmacro -%}
+
+{% if version %}\
+    {% if previous.version %}\
+        ## [{{ version | trim_start_matches(pat="v") }}]\
+          ({{ self::remote_url() }}/compare/{{ previous.version }}..{{ version }}) - {{ timestamp | date(format="%Y-%m-%d") }}
+    {% else %}\
+        ## [{{ version | trim_start_matches(pat="v") }}] - {{ timestamp | date(format="%Y-%m-%d") }}
+    {% endif %}\
+{% else %}\
+    ## [unreleased]
+{% endif %}\
 
 {% for group, commits in commits | group_by(attribute="group") %}
-### {{ group | upper_first }}
-{% for commit in commits %}
-- {% if commit.breaking %}**BREAKING:** {% endif %}{{ commit.message | upper_first }} ([{{ commit.id | truncate(length=7, end="") }}](https://github.com/bahdotsh/wrkflw/commit/{{ commit.id }})){% if commit.links %} ({% for link in commit.links %}[{{ link.text }}]({{ link.href }}){% if not loop.last %}, {% endif %}{% endfor %}){% endif %}
-{% endfor %}
-{% endfor %}
+    ### {{ group | striptags | trim | upper_first }}
+    {% for commit in commits
+    | filter(attribute="scope")
+    | sort(attribute="scope") %}
+        {{ self::print_commit(commit=commit) }}
+    {%- endfor %}
+    {% for commit in commits %}
+        {%- if not commit.scope -%}
+            {{ self::print_commit(commit=commit) }}
+        {% endif -%}
+    {% endfor -%}
+{% endfor -%}
+{%- if github -%}
+{% if github.contributors | filter(attribute="is_first_time", value=true) | length != 0 %}
+  ## New Contributors ❤️
+{% endif %}\
+{% for contributor in github.contributors | filter(attribute="is_first_time", value=true) %}
+  * @{{ contributor.username }} made their first contribution
+    {%- if contributor.pr_number %} in \
+      [#{{ contributor.pr_number }}]({{ self::remote_url() }}/pull/{{ contributor.pr_number }}) \
+    {%- endif %}
+{%- endfor -%}
+{%- endif %}
+
+
 """
 
 # Remove the leading and trailing whitespace from the template
@@ -35,17 +71,22 @@ footer = """
 conventional_commits = true
 filter_unconventional = true
 commit_parsers = [
-  { message = "^feat", group = "Features", icon = "✨" },
-  { message = "^fix", group = "Bug Fixes", icon = "🐛" },
-  { message = "^docs", group = "Documentation", icon = "📚" },
-  { message = "^style", group = "Styling", icon = "💎" },
-  { message = "^refactor", group = "Refactor", icon = "🔨" },
-  { message = "^perf", group = "Performance", icon = "🚀" },
-  { message = "^test", group = "Testing", icon = "🧪" },
-  { message = "^chore(deps)", skip = true },
-  { message = "^chore(release)", skip = true },
-  { message = "^chore", group = "Miscellaneous Tasks", icon = "🧹" },
-  { body = ".*security", group = "Security", icon = "🔒" },
+  { message = "^feat", group = "<!-- 0 -->⛰️  Features" },
+  { message = "^fix", group = "<!-- 1 -->🐛 Bug Fixes" },
+  { message = "^doc", group = "<!-- 3 -->📚 Documentation" },
+  { message = "^perf", group = "<!-- 4 -->⚡ Performance" },
+  { message = "^refactor\\(clippy\\)", skip = true },
+  { message = "^refactor", group = "<!-- 2 -->🚜 Refactor" },
+  { message = "^style", group = "<!-- 5 -->🎨 Styling" },
+  { message = "^test", group = "<!-- 6 -->🧪 Testing" },
+  { message = "^chore\\(release\\): prepare for", skip = true },
+  { message = "^chore\\(deps.*\\)", skip = true },
+  { message = "^chore\\(pr\\)", skip = true },
+  { message = "^chore\\(pull\\)", skip = true },
+  { message = "^chore\\(npm\\).*yarn\\.lock", skip = true },
+  { message = "^chore|^ci", group = "<!-- 7 -->⚙️ Miscellaneous Tasks" },
+  { body = ".*security", group = "<!-- 8 -->🛡️ Security" },
+  { message = "^revert", group = "<!-- 9 -->◀️ Revert" },
 ]
 
 # Define the GitHub repository URL for commit links

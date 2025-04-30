@@ -586,7 +586,7 @@ impl ContainerRuntime for DockerRuntime {
         logging::info(&format!("Docker: Running container with image: {}", image));
 
         // Add a global timeout for all Docker operations to prevent freezing
-        let timeout_duration = std::time::Duration::from_secs(60); // 1 minute timeout
+        let timeout_duration = std::time::Duration::from_secs(360); // Increased outer timeout to 6 minutes
 
         // Run the entire container operation with a timeout
         match tokio::time::timeout(
@@ -597,7 +597,7 @@ impl ContainerRuntime for DockerRuntime {
         {
             Ok(result) => result,
             Err(_) => {
-                logging::error("Docker operation timed out after 60 seconds");
+                logging::error("Docker operation timed out after 360 seconds");
                 Err(ContainerError::ContainerExecution(
                     "Operation timed out".to_string(),
                 ))
@@ -926,9 +926,9 @@ impl DockerRuntime {
             }
         }
 
-        // Wait for container to finish with a timeout (30 seconds)
+        // Wait for container to finish with a timeout (300 seconds)
         let wait_result = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
+            std::time::Duration::from_secs(300),
             self.docker
                 .wait_container::<String>(&container.id, None)
                 .collect::<Vec<_>>(),

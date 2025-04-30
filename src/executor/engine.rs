@@ -607,7 +607,7 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
             working_dir: job_dir.path(),
             runtime: ctx.runtime,
             workflow: ctx.workflow,
-            job_runs_on: &job.runs_on,
+            runner_image: &runner_image,
             verbose: ctx.verbose,
             matrix_combination: &None,
         })
@@ -845,7 +845,7 @@ async fn execute_matrix_job(
                 working_dir: job_dir.path(),
                 runtime,
                 workflow,
-                job_runs_on: &job_template.runs_on,
+                runner_image: &runner_image,
                 verbose,
                 matrix_combination: &Some(combination.values.clone()),
             })
@@ -913,7 +913,7 @@ struct StepExecutionContext<'a> {
     working_dir: &'a Path,
     runtime: &'a dyn ContainerRuntime,
     workflow: &'a WorkflowDefinition,
-    job_runs_on: &'a str,
+    runner_image: &'a str,
     verbose: bool,
     #[allow(dead_code)]
     matrix_combination: &'a Option<HashMap<String, Value>>,
@@ -1016,7 +1016,7 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                     &step_env,
                     ctx.working_dir,
                     ctx.runtime,
-                    ctx.job_runs_on,
+                    ctx.runner_image,
                     ctx.verbose,
                 )
                 .await?
@@ -1331,17 +1331,19 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                     .map(|(k, v)| (k.as_str(), v.as_str()))
                     .collect();
 
-                // Map volumes
-                let volumes: Vec<(&Path, &Path)> =
-                    vec![(ctx.working_dir, Path::new("/github/workspace"))];
+                // Define the standard workspace path inside the container
+                let container_workspace = Path::new("/github/workspace");
+
+                // Set up volume mapping from host working dir to container workspace
+                let volumes: Vec<(&Path, &Path)> = vec![(ctx.working_dir, container_workspace)];
 
                 let output = ctx
                     .runtime
                     .run_container(
-                        &image,
+                        ctx.runner_image,
                         &cmd.to_vec(),
                         &env_vars,
-                        Path::new("/github/workspace"),
+                        container_workspace,
                         &volumes,
                     )
                     .await
@@ -1455,15 +1457,21 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
 
+        // Define the standard workspace path inside the container
+        let container_workspace = Path::new("/github/workspace");
+
+        // Set up volume mapping from host working dir to container workspace
+        let volumes: Vec<(&Path, &Path)> = vec![(ctx.working_dir, container_workspace)];
+
         // Execute the command
         match ctx
             .runtime
             .run_container(
-                "ubuntu:latest", // or appropriate runner image
+                ctx.runner_image,
                 &cmd_parts,
                 &env_vars,
-                ctx.working_dir,
-                &[], // Empty volumes for now, add if needed
+                container_workspace,
+                &volumes,
             )
             .await
         {
@@ -1606,11 +1614,11 @@ fn get_runner_image(runs_on: &str) -> String {
         "ubuntu-20.04-large" => "catthehacker/ubuntu:full-20.04",
         "ubuntu-18.04-large" => "catthehacker/ubuntu:full-18.04",
 
-        // macOS runners - use existing images for macOS compatibility layer
-        "macos-latest" => "catthehacker/ubuntu:act-latest", // Use Ubuntu with macOS compatibility
-        "macos-12" => "catthehacker/ubuntu:act-latest",     // Monterey equivalent
-        "macos-11" => "catthehacker/ubuntu:act-latest",     // Big Sur equivalent
-        "macos-10.15" => "catthehacker/ubuntu:act-latest",  // Catalina equivalent
+        // macOS runners - use a standard Rust image for compatibility
+        "macos-latest" => "rust:latest",
+        "macos-12" => "rust:latest",    // Monterey equivalent
+        "macos-11" => "rust:latest",    // Big Sur equivalent
+        "macos-10.15" => "rust:latest", // Catalina equivalent
 
         // Windows runners - using servercore-based images
         "windows-latest" => "mcr.microsoft.com/windows/servercore:ltsc2022",
@@ -1649,7 +1657,7 @@ fn get_runner_image(runs_on: &str) -> String {
             // Check for platform prefixes and provide appropriate images
             let runs_on_lower = runs_on.trim().to_lowercase();
             if runs_on_lower.starts_with("macos") {
-                "catthehacker/ubuntu:act-latest" // Use Ubuntu with macOS compatibility
+                "rust:latest" // Use Rust image for macOS runners
             } else if runs_on_lower.starts_with("windows") {
                 "mcr.microsoft.com/windows/servercore:ltsc2022" // Default Windows image
             } else if runs_on_lower.starts_with("python") {
@@ -1727,7 +1735,7 @@ async fn execute_composite_action(
     job_env: &HashMap<String, String>,
     working_dir: &Path,
     runtime: &dyn ContainerRuntime,
-    job_runs_on: &str,
+    runner_image: &str,
     verbose: bool,
 ) -> Result<StepResult, ExecutionError> {
     // Find the action definition file
@@ -1823,7 +1831,7 @@ async fn execute_composite_action(
                         on_raw: serde_yaml::Value::Null,
                         jobs: HashMap::new(),
                     },
-                    job_runs_on,
+                    runner_image,
                     verbose,
                     matrix_combination: &None,
                 }))

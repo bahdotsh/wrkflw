@@ -9,7 +9,7 @@ All notable changes to wrkflw will be documented in this file.
 # Template for the changelog body
 body = """
 {%- macro remote_url() -%}
-  https://github.com/{{ bahdotsh }}/{{ wrkflw }}
+  https://github.com/bahdotsh/wrkflw
 {%- endmacro -%}
 
 {% macro print_commit(commit) -%}

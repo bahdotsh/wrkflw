@@ -55,6 +55,10 @@ once_cell.workspace = true
 crossterm.workspace = true
 ratatui.workspace = true
 
+[lib]
+name = "wrkflw_lib"
+path = "src/lib.rs"
+
 [[bin]]
 name = "wrkflw"
 path = "src/main.rs" 

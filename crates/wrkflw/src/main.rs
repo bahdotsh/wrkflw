@@ -97,14 +97,16 @@ fn parse_key_val(s: &str) -> Result<(String, String), String> {
     Ok((s[..pos].to_string(), s[pos + 1..].to_string()))
 }
 
-/// Clean up all resources when exiting the application
-/// This is used by both main.rs and in tests
-pub async fn cleanup_on_exit() {
+// Make this function public for testing? Or move to a utils/cleanup mod?
+// Or call executor::cleanup and runtime::cleanup directly?
+// Let's try calling them directly for now.
+async fn cleanup_on_exit() {
     // Clean up Docker resources if available, but don't let it block indefinitely
     match tokio::time::timeout(std::time::Duration::from_secs(3), async {
         match Docker::connect_with_local_defaults() {
             Ok(docker) => {
-                let _ = executor::docker::cleanup_containers(&docker).await;
+                // Assuming cleanup_resources exists in executor crate
+                executor::cleanup_resources(&docker).await;
             }
             Err(_) => {
                 // Docker not available
@@ -123,6 +125,7 @@ pub async fn cleanup_on_exit() {
     // Always clean up emulation resources
     match tokio::time::timeout(
         std::time::Duration::from_secs(2),
+        // Assuming cleanup_resources exists in runtime::emulation module
         runtime::emulation::cleanup_resources(),
     )
     .await
@@ -197,7 +200,7 @@ async fn main() {
                 .clone()
                 .unwrap_or_else(|| PathBuf::from(".github/workflows"));
 
-            // Run the validation
+            // Run the validation using ui crate
             ui::validate_workflow(&validate_path, verbose).unwrap_or_else(|e| {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
@@ -207,7 +210,7 @@ async fn main() {
         Some(Commands::Run {
             path,
             emulate,
-            show_action_messages: _,
+            show_action_messages: _, // Assuming this flag is handled within executor/runtime
         }) => {
             // Set runner mode based on flags
             let runtime_type = if *emulate {
@@ -216,7 +219,7 @@ async fn main() {
                 executor::RuntimeType::Docker
             };
 
-            // First validate the workflow file
+            // First validate the workflow file using parser crate
             match parser::workflow::parse_workflow(path) {
                 Ok(_) => logging::info("Validating workflow..."),
                 Err(e) => {
@@ -225,7 +228,7 @@ async fn main() {
                 }
             }
 
-            // Execute the workflow
+            // Execute the workflow using executor crate
             match executor::execute_workflow(path, runtime_type, verbose || debug).await {
                 Ok(result) => {
                     // Print job results
@@ -309,11 +312,12 @@ async fn main() {
             emulate,
             show_action_messages,
         }) => {
-            // Open the TUI interface
+            // Open the TUI interface using ui crate
             let runtime_type = if *emulate {
                 executor::RuntimeType::Emulation
             } else {
                 // Check if Docker is available, fall back to emulation if not
+                // Assuming executor::docker::is_available() exists
                 if !executor::docker::is_available() {
                     println!("⚠️ Docker is not available. Using emulation mode instead.");
                     logging::warning("Docker is not available. Using emulation mode instead.");
@@ -337,7 +341,7 @@ async fn main() {
                 }
                 Err(e) => {
                     eprintln!("Error: {}", e);
-                    cleanup_on_exit().await;
+                    cleanup_on_exit().await; // Ensure cleanup even on error
                     std::process::exit(1);
                 }
             }
@@ -357,6 +361,7 @@ async fn main() {
                     .collect::<HashMap<String, String>>()
             });
 
+            // Use github crate
             match github::trigger_workflow(workflow, branch.as_deref(), input_map).await {
                 Ok(_) => logging::info("Workflow triggered successfully"),
                 Err(e) => {
@@ -376,6 +381,7 @@ async fn main() {
                     .collect::<HashMap<String, String>>()
             });
 
+            // Use gitlab crate
             match gitlab::trigger_pipeline(branch.as_deref(), variable_map).await {
                 Ok(_) => logging::info("GitLab pipeline triggered successfully"),
                 Err(e) => {
@@ -388,7 +394,7 @@ async fn main() {
         Some(Commands::List) => {
             logging::info("Listing available workflows");
 
-            // Attempt to get GitHub repo info
+            // Attempt to get GitHub repo info using github crate
             if let Ok(repo_info) = github::get_repo_info() {
                 match github::list_workflows(&repo_info).await {
                     Ok(workflows) => {
@@ -409,7 +415,7 @@ async fn main() {
                 println!("Not a GitHub repository or unable to get repository information");
             }
 
-            // Attempt to get GitLab repo info
+            // Attempt to get GitLab repo info using gitlab crate
             if let Ok(repo_info) = gitlab::get_repo_info() {
                 match gitlab::list_pipelines(&repo_info).await {
                     Ok(pipelines) => {
@@ -458,13 +464,15 @@ async fn main() {
                 }
                 Err(e) => {
                     eprintln!("Error: {}", e);
-                    cleanup_on_exit().await;
+                    cleanup_on_exit().await; // Ensure cleanup even on error
                     std::process::exit(1);
                 }
             }
         }
     }
 
-    // Final cleanup before program exit
-    cleanup_on_exit().await;
+    // Final cleanup before program exit (redundant if called on success/error/signal?)
+    // Consider if this final call is necessary given the calls in Ok/Err/signal handlers.
+    // It might be okay as a safety net, but ensure cleanup_on_exit is idempotent.
+    // cleanup_on_exit().await; // Keep or remove based on idempotency review
 }

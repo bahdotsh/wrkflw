@@ -1,8 +1,8 @@
 use bollard::Docker;
 use clap::{Parser, Subcommand};
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::path::Path;
+use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -198,7 +198,8 @@ fn is_gitlab_pipeline(path: &Path) -> bool {
         if let Some(parent_str) = parent.to_str() {
             if parent_str.ends_with(".gitlab/ci")
                 && path
-                    .extension().is_some_and(|ext| ext == "yml" || ext == "yaml")
+                    .extension()
+                    .is_some_and(|ext| ext == "yml" || ext == "yaml")
             {
                 return true;
             }
@@ -272,7 +273,8 @@ async fn main() {
                         entry.path().is_file()
                             && entry
                                 .path()
-                                .extension().is_some_and(|ext| ext == "yml" || ext == "yaml")
+                                .extension()
+                                .is_some_and(|ext| ext == "yml" || ext == "yaml")
                     })
                     .collect::<Vec<_>>();
 
@@ -498,7 +500,8 @@ fn list_workflows_and_pipelines(verbose: bool) {
                 entry.path().is_file()
                     && entry
                         .path()
-                        .extension().is_some_and(|ext| ext == "yml" || ext == "yaml")
+                        .extension()
+                        .is_some_and(|ext| ext == "yml" || ext == "yaml")
             })
             .collect::<Vec<_>>();
 

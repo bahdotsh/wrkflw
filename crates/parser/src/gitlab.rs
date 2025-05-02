@@ -28,8 +28,7 @@ pub fn parse_pipeline(pipeline_path: &Path) -> Result<Pipeline, GitlabParserErro
     let pipeline_content = fs::read_to_string(pipeline_path)?;
 
     // Validate against schema
-    let validator =
-        SchemaValidator::new().map_err(GitlabParserError::SchemaValidationError)?;
+    let validator = SchemaValidator::new().map_err(GitlabParserError::SchemaValidationError)?;
 
     validator
         .validate_with_specific_schema(&pipeline_content, SchemaType::GitLab)

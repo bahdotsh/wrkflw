@@ -1,3 +1,4 @@
+#[allow(unused_imports)]
 use bollard::Docker;
 use futures::future;
 use regex;
@@ -266,6 +267,12 @@ fn create_gitlab_context(pipeline: &Pipeline, workspace_dir: &Path) -> HashMap<S
     // Add workspace directory
     env_context.insert(
         "CI_PROJECT_DIR".to_string(),
+        workspace_dir.to_string_lossy().to_string(),
+    );
+
+    // Also add the workspace as the GitHub workspace for compatibility with emulation runtime
+    env_context.insert(
+        "GITHUB_WORKSPACE".to_string(),
         workspace_dir.to_string_lossy().to_string(),
     );
 
@@ -612,219 +619,16 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
     let job_dir = tempfile::tempdir()
         .map_err(|e| ExecutionError::Execution(format!("Failed to create job directory: {}", e)))?;
 
-    // Try to get a Docker client if using Docker and services exist
-    let docker_client = if !job.services.is_empty() {
-        match Docker::connect_with_local_defaults() {
-            Ok(client) => Some(client),
-            Err(e) => {
-                logging::error(&format!("Failed to connect to Docker: {}", e));
-                None
-            }
-        }
-    } else {
-        None
-    };
-
-    // Create a Docker network for this job if we have services
-    let network_id = if !job.services.is_empty() && docker_client.is_some() {
-        let docker = match docker_client.as_ref() {
-            Some(client) => client,
-            None => {
-                return Err(ExecutionError::Runtime(
-                    "Docker client is required but not available".to_string(),
-                ));
-            }
-        };
-        match docker::create_job_network(docker).await {
-            Ok(id) => {
-                logging::info(&format!(
-                    "Created network {} for job '{}'",
-                    id, ctx.job_name
-                ));
-                Some(id)
-            }
-            Err(e) => {
-                logging::error(&format!(
-                    "Failed to create network for job '{}': {}",
-                    ctx.job_name, e
-                ));
-                return Err(ExecutionError::Runtime(format!(
-                    "Failed to create network: {}",
-                    e
-                )));
-            }
-        }
-    } else {
-        None
-    };
-
-    // Start service containers if any
-    let mut service_containers = Vec::new();
-
-    if !job.services.is_empty() {
-        if docker_client.is_none() {
-            logging::error("Services are only supported with Docker runtime");
-            return Err(ExecutionError::Runtime(
-                "Services require Docker runtime".to_string(),
-            ));
-        }
-
-        logging::info(&format!(
-            "Starting {} service containers for job '{}'",
-            job.services.len(),
-            ctx.job_name
-        ));
-
-        let docker = match docker_client.as_ref() {
-            Some(client) => client,
-            None => {
-                return Err(ExecutionError::Runtime(
-                    "Docker client is required but not available".to_string(),
-                ));
-            }
-        };
-
-        #[allow(unused_variables, unused_assignments)]
-        for (service_name, service_config) in &job.services {
-            logging::info(&format!(
-                "Starting service '{}' with image '{}'",
-                service_name, service_config.image
-            ));
-
-            // Prepare container configuration
-            let container_name = format!("wrkflw-service-{}-{}", ctx.job_name, service_name);
-
-            // Map ports if specified
-            let mut port_bindings = HashMap::new();
-            if let Some(ports) = &service_config.ports {
-                for port_spec in ports {
-                    // Parse port spec like "8080:80"
-                    let parts: Vec<&str> = port_spec.split(':').collect();
-                    if parts.len() == 2 {
-                        let host_port = parts[0];
-                        let container_port = parts[1];
-
-                        let port_binding = bollard::models::PortBinding {
-                            host_ip: Some("0.0.0.0".to_string()),
-                            host_port: Some(host_port.to_string()),
-                        };
-
-                        let key = format!("{}/tcp", container_port);
-                        port_bindings.insert(key, Some(vec![port_binding]));
-                    }
-                }
-            }
-
-            // Convert environment variables
-            let env_vars: Vec<String> = service_config
-                .env
-                .iter()
-                .map(|(k, v)| format!("{}={}", k, v))
-                .collect();
-
-            // Create container options
-            let create_opts = bollard::container::CreateContainerOptions {
-                name: container_name,
-                platform: None,
-            };
-
-            // Host configuration
-            let host_config = bollard::models::HostConfig {
-                port_bindings: Some(port_bindings),
-                network_mode: network_id.clone(),
-                ..Default::default()
-            };
-
-            // Container configuration
-            let config = bollard::container::Config {
-                image: Some(service_config.image.clone()),
-                env: Some(env_vars),
-                host_config: Some(host_config),
-                ..Default::default()
-            };
-
-            // Log the network connection
-            if network_id.is_some() {
-                logging::info(&format!(
-                    "Service '{}' connected to network via host_config",
-                    service_name
-                ));
-            }
-
-            match docker.create_container(Some(create_opts), config).await {
-                Ok(response) => {
-                    let container_id = response.id;
-
-                    // Track the container for cleanup
-                    docker::track_container(&container_id);
-                    service_containers.push(container_id.clone());
-
-                    // Start the container
-                    match docker.start_container::<String>(&container_id, None).await {
-                        Ok(_) => {
-                            logging::info(&format!("Started service container: {}", container_id));
-
-                            // Add service address to environment
-                            job_env.insert(
-                                format!("{}_HOST", service_name.to_uppercase()),
-                                service_name.clone(),
-                            );
-
-                            job_logs.push_str(&format!(
-                                "Started service '{}' with container ID: {}\n",
-                                service_name, container_id
-                            ));
-                        }
-                        Err(e) => {
-                            let error_msg = format!(
-                                "Failed to start service container '{}': {}",
-                                service_name, e
-                            );
-                            logging::error(&error_msg);
-
-                            // Clean up the created container
-                            let _ = docker.remove_container(&container_id, None).await;
-
-                            // Clean up network if created
-                            if let Some(net_id) = &network_id {
-                                let _ = docker.remove_network(net_id).await;
-                                docker::untrack_network(net_id);
-                            }
-
-                            return Err(ExecutionError::Runtime(error_msg));
-                        }
-                    }
-                }
-                Err(e) => {
-                    let error_msg = format!(
-                        "Failed to create service container '{}': {}",
-                        service_name, e
-                    );
-                    logging::error(&error_msg);
-
-                    // Clean up network if created
-                    if let Some(net_id) = &network_id {
-                        let _ = docker.remove_network(net_id).await;
-                        docker::untrack_network(net_id);
-                    }
-
-                    return Err(ExecutionError::Runtime(error_msg));
-                }
-            }
-        }
-
-        // Give services a moment to start up
-        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-    }
-
-    // Prepare the runner environment
-    let runner_image = get_runner_image(&job.runs_on);
-    prepare_runner_image(&runner_image, ctx.runtime, ctx.verbose).await?;
-
-    // Copy project files to workspace
+    // Get the current project directory
     let current_dir = std::env::current_dir().map_err(|e| {
         ExecutionError::Execution(format!("Failed to get current directory: {}", e))
     })?;
+
+    // Copy project files to the job workspace directory
+    logging::info(&format!(
+        "Copying project files to job workspace: {}",
+        job_dir.path().display()
+    ));
     copy_directory_contents(&current_dir, job_dir.path())?;
 
     logging::info(&format!("Executing job: {}", ctx.job_name));
@@ -840,7 +644,7 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
             working_dir: job_dir.path(),
             runtime: ctx.runtime,
             workflow: ctx.workflow,
-            runner_image: &runner_image,
+            runner_image: &get_runner_image(&job.runs_on),
             verbose: ctx.verbose,
             matrix_combination: &None,
         })
@@ -886,50 +690,6 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
                 // Stop executing further steps
                 break;
             }
-        }
-    }
-
-    // Clean up service containers
-    if !service_containers.is_empty() && docker_client.is_some() {
-        let docker = match docker_client.as_ref() {
-            Some(client) => client,
-            None => {
-                return Err(ExecutionError::Runtime(
-                    "Docker client is required but not available".to_string(),
-                ));
-            }
-        };
-
-        for container_id in &service_containers {
-            logging::info(&format!("Stopping service container: {}", container_id));
-
-            let _ = docker.stop_container(container_id, None).await;
-            let _ = docker.remove_container(container_id, None).await;
-
-            // Untrack container since we've explicitly removed it
-            docker::untrack_container(container_id);
-        }
-    }
-
-    // Clean up network if created
-    if let Some(net_id) = &network_id {
-        if docker_client.is_some() {
-            let docker = match docker_client.as_ref() {
-                Some(client) => client,
-                None => {
-                    return Err(ExecutionError::Runtime(
-                        "Docker client is required but not available".to_string(),
-                    ));
-                }
-            };
-
-            logging::info(&format!("Removing network: {}", net_id));
-            if let Err(e) = docker.remove_network(net_id).await {
-                logging::error(&format!("Failed to remove network {}: {}", net_id, e));
-            }
-
-            // Untrack network since we've explicitly removed it
-            docker::untrack_network(net_id);
         }
     }
 
@@ -1055,14 +815,16 @@ async fn execute_matrix_job(
     let job_dir = tempfile::tempdir()
         .map_err(|e| ExecutionError::Execution(format!("Failed to create job directory: {}", e)))?;
 
-    // Prepare the runner
-    let runner_image = get_runner_image(&job_template.runs_on);
-    prepare_runner_image(&runner_image, runtime, verbose).await?;
-
-    // Copy project files to workspace
+    // Get the current project directory
     let current_dir = std::env::current_dir().map_err(|e| {
         ExecutionError::Execution(format!("Failed to get current directory: {}", e))
     })?;
+
+    // Copy project files to the job workspace directory
+    logging::info(&format!(
+        "Copying project files to job workspace: {}",
+        job_dir.path().display()
+    ));
     copy_directory_contents(&current_dir, job_dir.path())?;
 
     let job_success = if job_template.steps.is_empty() {
@@ -1078,7 +840,7 @@ async fn execute_matrix_job(
                 working_dir: job_dir.path(),
                 runtime,
                 workflow,
-                runner_image: &runner_image,
+                runner_image: &get_runner_image(&job_template.runs_on),
                 verbose,
                 matrix_combination: &Some(combination.values.clone()),
             })
@@ -1918,6 +1680,7 @@ fn get_runner_image(runs_on: &str) -> String {
     .to_string()
 }
 
+#[allow(dead_code)]
 async fn prepare_runner_image(
     image: &str,
     runtime: &dyn ContainerRuntime,
@@ -1947,7 +1710,7 @@ async fn prepare_runner_image(
     Ok(())
 }
 
-/// Extract language and version information from an image name
+#[allow(dead_code)]
 fn extract_language_info(image: &str) -> Option<(&'static str, Option<&str>)> {
     let image_lower = image.to_lowercase();
 

@@ -336,14 +336,32 @@ async fn main() {
             if result.failure_details.is_some() {
                 eprintln!("❌ Workflow execution failed:");
                 if let Some(details) = result.failure_details {
-                    eprintln!("{}", details);
+                    if verbose {
+                        // Show full error details in verbose mode
+                        eprintln!("{}", details);
+                    } else {
+                        // Show simplified error info in non-verbose mode
+                        let simplified_error = details
+                            .lines()
+                            .filter(|line| line.contains("❌") || line.trim().starts_with("Error:"))
+                            .take(5) // Limit to the first 5 error lines
+                            .collect::<Vec<&str>>()
+                            .join("\n");
+
+                        eprintln!("{}", simplified_error);
+
+                        if details.lines().count() > 5 {
+                            eprintln!("\nUse --verbose flag to see full error details");
+                        }
+                    }
                 }
                 std::process::exit(1);
             } else {
                 println!("✅ Workflow execution completed successfully!");
 
                 // Print a summary of executed jobs
-                if verbose {
+                if true {
+                    // Always show job summary
                     println!("\nJob summary:");
                     for job in result.jobs {
                         println!(
@@ -361,18 +379,42 @@ async fn main() {
                             }
                         );
 
-                        if debug {
-                            println!("  Steps:");
-                            for step in job.steps {
-                                println!(
-                                    "    {} {}",
-                                    match step.status {
-                                        executor::StepStatus::Success => "✅",
-                                        executor::StepStatus::Failure => "❌",
-                                        executor::StepStatus::Skipped => "⏭️",
-                                    },
-                                    step.name
-                                );
+                        // Always show steps, not just in debug mode
+                        println!("  Steps:");
+                        for step in job.steps {
+                            let step_status = match step.status {
+                                executor::StepStatus::Success => "✅",
+                                executor::StepStatus::Failure => "❌",
+                                executor::StepStatus::Skipped => "⏭️",
+                            };
+
+                            println!("    {} {}", step_status, step.name);
+
+                            // If step failed and we're not in verbose mode, show condensed error info
+                            if step.status == executor::StepStatus::Failure && !verbose {
+                                // Extract error information from step output
+                                let error_lines = step
+                                    .output
+                                    .lines()
+                                    .filter(|line| {
+                                        line.contains("error:")
+                                            || line.contains("Error:")
+                                            || line.trim().starts_with("Exit code:")
+                                            || line.contains("failed")
+                                    })
+                                    .take(3) // Limit to 3 most relevant error lines
+                                    .collect::<Vec<&str>>();
+
+                                if !error_lines.is_empty() {
+                                    println!("      Error details:");
+                                    for line in error_lines {
+                                        println!("      {}", line.trim());
+                                    }
+
+                                    if step.output.lines().count() > 3 {
+                                        println!("      (Use --verbose for full output)");
+                                    }
+                                }
                             }
                         }
                     }

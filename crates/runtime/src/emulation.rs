@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
 use tempfile::TempDir;
+use which;
 
 // Global collection of resources to clean up
 static EMULATION_WORKSPACES: Lazy<Mutex<Vec<PathBuf>>> = Lazy::new(|| Mutex::new(Vec::new()));
@@ -160,28 +161,188 @@ impl ContainerRuntime for EmulationRuntime {
             command_str.push_str(part);
         }
 
-        // Log the command being executed
+        // Log more detailed debugging information
         logging::info(&format!("Executing command in container: {}", command_str));
+        logging::info(&format!("Working directory: {}", working_dir.display()));
+        logging::info(&format!("Command length: {}", command.len()));
 
-        // Special handling for Rust/Cargo actions
-        if command_str.contains("rust") || command_str.contains("cargo") {
-            logging::debug(&format!("Executing Rust command: {}", command_str));
+        if command.is_empty() {
+            return Err(ContainerError::ContainerExecution(
+                "Empty command array".to_string(),
+            ));
+        }
 
-            let mut cmd = Command::new("cargo");
-            let parts = command_str.split_whitespace().collect::<Vec<&str>>();
+        // Print each command part separately for debugging
+        for (i, part) in command.iter().enumerate() {
+            logging::info(&format!("Command part {}: '{}'", i, part));
+        }
 
-            let current_dir = working_dir.to_str().unwrap_or(".");
-            cmd.current_dir(current_dir);
+        // Log environment variables
+        logging::info("Environment variables:");
+        for (key, value) in env_vars {
+            logging::info(&format!("  {}={}", key, value));
+        }
+
+        // Find actual working directory - determine if we should use the current directory instead
+        let actual_working_dir: PathBuf = if !working_dir.exists() {
+            // Look for GITHUB_WORKSPACE or CI_PROJECT_DIR in env_vars
+            let mut workspace_path = None;
+            for (key, value) in env_vars {
+                if *key == "GITHUB_WORKSPACE" || *key == "CI_PROJECT_DIR" {
+                    workspace_path = Some(PathBuf::from(value));
+                    break;
+                }
+            }
+
+            // If found, use that as the working directory
+            if let Some(path) = workspace_path {
+                if path.exists() {
+                    logging::info(&format!(
+                        "Using environment-defined workspace: {}",
+                        path.display()
+                    ));
+                    path
+                } else {
+                    // Fallback to current directory
+                    let current_dir =
+                        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                    logging::info(&format!(
+                        "Using current directory: {}",
+                        current_dir.display()
+                    ));
+                    current_dir
+                }
+            } else {
+                // Fallback to current directory
+                let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                logging::info(&format!(
+                    "Using current directory: {}",
+                    current_dir.display()
+                ));
+                current_dir
+            }
+        } else {
+            working_dir.to_path_buf()
+        };
+
+        logging::info(&format!(
+            "Using actual working directory: {}",
+            actual_working_dir.display()
+        ));
+
+        // Check if path contains the command (for shell script execution)
+        let command_path = which::which(command[0]);
+        match &command_path {
+            Ok(path) => logging::info(&format!("Found command at: {}", path.display())),
+            Err(e) => logging::error(&format!(
+                "Command not found in PATH: {} - Error: {}",
+                command[0], e
+            )),
+        }
+
+        // First, check if this is a simple shell command (like echo)
+        if command_str.starts_with("echo ")
+            || command_str.starts_with("cp ")
+            || command_str.starts_with("mkdir ")
+            || command_str.starts_with("mv ")
+        {
+            logging::info("Executing as shell command");
+            // Execute as a shell command
+            let mut cmd = Command::new("sh");
+            cmd.arg("-c");
+            cmd.arg(&command_str);
+            cmd.current_dir(&actual_working_dir);
 
             // Add environment variables
             for (key, value) in env_vars {
                 cmd.env(key, value);
             }
 
+            match cmd.output() {
+                Ok(output_result) => {
+                    let exit_code = output_result.status.code().unwrap_or(-1);
+                    let output = String::from_utf8_lossy(&output_result.stdout).to_string();
+                    let error = String::from_utf8_lossy(&output_result.stderr).to_string();
+
+                    logging::debug(&format!(
+                        "Shell command completed with exit code: {}",
+                        exit_code
+                    ));
+
+                    if exit_code != 0 {
+                        let mut error_details = format!(
+                            "Command failed with exit code: {}\nCommand: {}\n\nError output:\n{}",
+                            exit_code, command_str, error
+                        );
+
+                        // Add environment variables to error details
+                        error_details.push_str("\n\nEnvironment variables:\n");
+                        for (key, value) in env_vars {
+                            if key.starts_with("GITHUB_") || key.starts_with("CI_") {
+                                error_details.push_str(&format!("{}={}\n", key, value));
+                            }
+                        }
+
+                        return Err(ContainerError::ContainerExecution(error_details));
+                    }
+
+                    return Ok(ContainerOutput {
+                        stdout: output,
+                        stderr: error,
+                        exit_code,
+                    });
+                }
+                Err(e) => {
+                    return Err(ContainerError::ContainerExecution(format!(
+                        "Failed to execute command: {}\nError: {}",
+                        command_str, e
+                    )));
+                }
+            }
+        }
+
+        // Special handling for Rust/Cargo commands
+        if command_str.starts_with("cargo ") || command_str.starts_with("rustup ") {
+            let parts: Vec<&str> = command_str.split_whitespace().collect();
+            if parts.is_empty() {
+                return Err(ContainerError::ContainerExecution(
+                    "Empty command".to_string(),
+                ));
+            }
+
+            let mut cmd = Command::new(parts[0]);
+
+            // Always use the current directory for cargo/rust commands rather than the temporary directory
+            let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            logging::info(&format!(
+                "Using project directory for Rust command: {}",
+                current_dir.display()
+            ));
+            cmd.current_dir(&current_dir);
+
+            // Add environment variables
+            for (key, value) in env_vars {
+                // Don't use the CI_PROJECT_DIR for CARGO_HOME, use the actual project directory
+                if *key == "CARGO_HOME" && value.contains("${CI_PROJECT_DIR}") {
+                    let cargo_home =
+                        value.replace("${CI_PROJECT_DIR}", &current_dir.to_string_lossy());
+                    logging::info(&format!("Setting CARGO_HOME to: {}", cargo_home));
+                    cmd.env(key, cargo_home);
+                } else {
+                    cmd.env(key, value);
+                }
+            }
+
             // Add command arguments
             if parts.len() > 1 {
                 cmd.args(&parts[1..]);
             }
+
+            logging::debug(&format!(
+                "Executing Rust command: {} in {}",
+                command_str,
+                current_dir.display()
+            ));
 
             match cmd.output() {
                 Ok(output_result) => {
@@ -200,7 +361,11 @@ impl ContainerRuntime for EmulationRuntime {
                         // Add environment variables to error details
                         error_details.push_str("\n\nEnvironment variables:\n");
                         for (key, value) in env_vars {
-                            if key.starts_with("GITHUB_") || key.starts_with("RUST") {
+                            if key.starts_with("GITHUB_")
+                                || key.starts_with("RUST")
+                                || key.starts_with("CARGO")
+                                || key.starts_with("CI_")
+                            {
                                 error_details.push_str(&format!("{}={}\n", key, value));
                             }
                         }
@@ -223,11 +388,11 @@ impl ContainerRuntime for EmulationRuntime {
             }
         }
 
-        // For other commands, use a shell
+        // For other commands, use a shell as fallback
         let mut cmd = Command::new("sh");
         cmd.arg("-c");
         cmd.arg(&command_str);
-        cmd.current_dir(working_dir.to_str().unwrap_or("."));
+        cmd.current_dir(&actual_working_dir);
 
         // Add environment variables
         for (key, value) in env_vars {
@@ -251,7 +416,7 @@ impl ContainerRuntime for EmulationRuntime {
                     // Add environment variables to error details
                     error_details.push_str("\n\nEnvironment variables:\n");
                     for (key, value) in env_vars {
-                        if key.starts_with("GITHUB_") {
+                        if key.starts_with("GITHUB_") || key.starts_with("CI_") {
                             error_details.push_str(&format!("{}={}\n", key, value));
                         }
                     }

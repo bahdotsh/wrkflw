@@ -3,6 +3,15 @@
 use std::path::Path;
 
 pub fn is_workflow_file(path: &Path) -> bool {
+    // First, check for GitLab CI files by name
+    if let Some(file_name) = path.file_name() {
+        let file_name_str = file_name.to_string_lossy().to_lowercase();
+        if file_name_str == ".gitlab-ci.yml" || file_name_str.ends_with("gitlab-ci.yml") {
+            return true;
+        }
+    }
+
+    // Then check for GitHub Actions workflows
     if let Some(ext) = path.extension() {
         if ext == "yml" || ext == "yaml" {
             // Check if the file is in a .github/workflows directory

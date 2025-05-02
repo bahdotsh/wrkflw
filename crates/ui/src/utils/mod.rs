@@ -1,6 +1,6 @@
 // UI utilities
 use crate::models::{Workflow, WorkflowStatus};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use utils::is_workflow_file;
 
 /// Find and load all workflow files in a directory
@@ -29,6 +29,21 @@ pub fn load_workflows(dir_path: &Path) -> Vec<Workflow> {
                     execution_details: None,
                 });
             }
+        }
+    }
+
+    // Check for GitLab CI pipeline file in the root directory if we're in the default GitHub workflows dir
+    if is_default_dir {
+        // Look for .gitlab-ci.yml in the repository root
+        let gitlab_ci_path = PathBuf::from(".gitlab-ci.yml");
+        if gitlab_ci_path.exists() && gitlab_ci_path.is_file() {
+            workflows.push(Workflow {
+                name: "gitlab-ci".to_string(),
+                path: gitlab_ci_path,
+                selected: false,
+                status: WorkflowStatus::NotStarted,
+                execution_details: None,
+            });
         }
     }
 

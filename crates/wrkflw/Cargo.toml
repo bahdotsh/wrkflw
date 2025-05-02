@@ -1,0 +1,60 @@
+[package]
+name = "wrkflw"
+version.workspace = true
+edition.workspace = true
+description.workspace = true
+documentation.workspace = true
+homepage.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+license.workspace = true
+
+[dependencies]
+# Workspace crates
+models = { path = "../models" }
+executor = { path = "../executor" }
+github = { path = "../github" }
+gitlab = { path = "../gitlab" }
+logging = { path = "../logging" }
+matrix = { path = "../matrix" }
+parser = { path = "../parser" }
+runtime = { path = "../runtime" }
+ui = { path = "../ui" }
+utils = { path = "../utils" }
+validators = { path = "../validators" }
+evaluator = { path = "../evaluator" }
+
+# External dependencies
+clap.workspace = true
+bollard.workspace = true
+tokio.workspace = true
+futures-util.workspace = true
+futures.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+tempfile.workspace = true
+dirs.workspace = true
+thiserror.workspace = true
+log.workspace = true
+regex.workspace = true
+lazy_static.workspace = true
+reqwest.workspace = true
+libc.workspace = true
+nix.workspace = true
+urlencoding.workspace = true
+serde.workspace = true
+serde_yaml.workspace = true
+serde_json.workspace = true
+colored.workspace = true
+indexmap.workspace = true
+rayon.workspace = true
+num_cpus.workspace = true
+itertools.workspace = true
+once_cell.workspace = true
+crossterm.workspace = true
+ratatui.workspace = true
+
+[[bin]]
+name = "wrkflw"
+path = "src/main.rs" 

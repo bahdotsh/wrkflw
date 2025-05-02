@@ -1,0 +1,27 @@
+[package]
+name = "ui"
+version.workspace = true
+edition.workspace = true
+description = "user interface functionality for wrkflw"
+license.workspace = true
+
+[dependencies]
+# Internal crates
+models = { path = "../models" }
+evaluator = { path = "../evaluator" }
+executor = { path = "../executor" }
+logging = { path = "../logging" }
+utils = { path = "../utils" }
+github = { path = "../github" }
+
+# External dependencies
+chrono.workspace = true
+crossterm.workspace = true
+ratatui.workspace = true
+serde.workspace = true
+serde_yaml.workspace = true
+tokio.workspace = true
+serde_json.workspace = true
+reqwest = { workspace = true, features = ["json"] }
+regex.workspace = true
+futures.workspace = true

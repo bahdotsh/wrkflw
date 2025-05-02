@@ -1,0 +1,35 @@
+[package]
+name = "executor"
+version.workspace = true
+edition.workspace = true
+description = "Workflow executor for wrkflw"
+license.workspace = true
+
+[dependencies]
+# Internal crates
+models = { path = "../models" }
+parser = { path = "../parser" }
+runtime = { path = "../runtime" }
+logging = { path = "../logging" }
+matrix = { path = "../matrix" }
+utils = { path = "../utils" }
+
+# External dependencies
+async-trait.workspace = true
+bollard.workspace = true
+chrono.workspace = true
+dirs.workspace = true
+futures.workspace = true
+futures-util.workspace = true
+lazy_static.workspace = true
+num_cpus.workspace = true
+once_cell.workspace = true
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+tar.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+uuid.workspace = true

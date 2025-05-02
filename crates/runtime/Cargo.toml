@@ -1,0 +1,19 @@
+[package]
+name = "runtime"
+version.workspace = true
+edition.workspace = true
+description = "Runtime environment for wrkflw"
+license.workspace = true
+
+[dependencies]
+# Internal crates
+models = { path = "../models" }
+logging = { path = "../logging" }
+
+# External dependencies
+async-trait.workspace = true
+once_cell.workspace = true
+serde.workspace = true
+serde_yaml.workspace = true
+tempfile.workspace = true
+tokio.workspace = true

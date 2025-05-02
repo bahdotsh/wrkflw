@@ -1,5 +1,10 @@
-[package]
-name = "wrkflw"
+[workspace]
+members = [
+    "crates/*"
+]
+resolver = "2"
+
+[workspace.package]
 version = "0.4.0"
 edition = "2021"
 description = "A GitHub Actions workflow validator and executor"
@@ -10,7 +15,7 @@ keywords = ["workflows", "github", "local"]
 categories = ["command-line-utilities"]
 license = "MIT"
 
-[dependencies]
+[workspace.dependencies]
 clap = { version = "4.3", features = ["derive"] }
 colored = "2.0"
 serde = { version = "1.0", features = ["derive"] }

@@ -1,0 +1,15 @@
+[package]
+name = "evaluator"
+version.workspace = true
+edition.workspace = true
+description = "Workflow evaluation for wrkflw"
+license.workspace = true
+
+[dependencies]
+# Internal crates
+models = { path = "../models" }
+validators = { path = "../validators" }
+
+# External dependencies
+colored.workspace = true
+serde_yaml.workspace = true 

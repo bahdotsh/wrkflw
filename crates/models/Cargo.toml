@@ -1,0 +1,12 @@
+[package]
+name = "models"
+version.workspace = true
+edition.workspace = true
+description = "Data models for wrkflw"
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_yaml.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true 

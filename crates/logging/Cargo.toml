@@ -1,0 +1,16 @@
+[package]
+name = "logging"
+version.workspace = true
+edition.workspace = true
+description = "logging functionality for wrkflw"
+license.workspace = true
+
+[dependencies]
+# Internal crates
+models = { path = "../models" }
+
+# External dependencies
+chrono.workspace = true
+once_cell.workspace = true
+serde.workspace = true
+serde_yaml.workspace = true

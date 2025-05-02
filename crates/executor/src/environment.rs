@@ -1,0 +1,242 @@
+use chrono::Utc;
+use matrix::MatrixCombination;
+use parser::workflow::WorkflowDefinition;
+use serde_yaml::Value;
+use std::{collections::HashMap, fs, io, path::Path};
+
+pub fn setup_github_environment_files(workspace_dir: &Path) -> io::Result<()> {
+    // Create necessary directories
+    let github_dir = workspace_dir.join("github");
+    fs::create_dir_all(&github_dir)?;
+
+    // Create common GitHub environment files
+    let github_output = github_dir.join("output");
+    let github_env = github_dir.join("env");
+    let github_path = github_dir.join("path");
+    let github_step_summary = github_dir.join("step_summary");
+
+    // Initialize files with empty content
+    fs::write(&github_output, "")?;
+    fs::write(&github_env, "")?;
+    fs::write(&github_path, "")?;
+    fs::write(&github_step_summary, "")?;
+
+    Ok(())
+}
+
+pub fn create_github_context(
+    workflow: &WorkflowDefinition,
+    workspace_dir: &Path,
+) -> HashMap<String, String> {
+    let mut env = HashMap::new();
+
+    // Basic GitHub environment variables
+    env.insert("GITHUB_WORKFLOW".to_string(), workflow.name.clone());
+    env.insert("GITHUB_ACTION".to_string(), "run".to_string());
+    env.insert("GITHUB_ACTOR".to_string(), "wrkflw".to_string());
+    env.insert("GITHUB_REPOSITORY".to_string(), get_repo_name());
+    env.insert("GITHUB_EVENT_NAME".to_string(), get_event_name(workflow));
+    env.insert("GITHUB_WORKSPACE".to_string(), get_workspace_path());
+    env.insert("GITHUB_SHA".to_string(), get_current_sha());
+    env.insert("GITHUB_REF".to_string(), get_current_ref());
+
+    // File paths for GitHub Actions
+    env.insert(
+        "GITHUB_OUTPUT".to_string(),
+        workspace_dir
+            .join("github")
+            .join("output")
+            .to_string_lossy()
+            .to_string(),
+    );
+    env.insert(
+        "GITHUB_ENV".to_string(),
+        workspace_dir
+            .join("github")
+            .join("env")
+            .to_string_lossy()
+            .to_string(),
+    );
+    env.insert(
+        "GITHUB_PATH".to_string(),
+        workspace_dir
+            .join("github")
+            .join("path")
+            .to_string_lossy()
+            .to_string(),
+    );
+    env.insert(
+        "GITHUB_STEP_SUMMARY".to_string(),
+        workspace_dir
+            .join("github")
+            .join("step_summary")
+            .to_string_lossy()
+            .to_string(),
+    );
+
+    // Time-related variables
+    let now = Utc::now();
+    env.insert("GITHUB_RUN_ID".to_string(), format!("{}", now.timestamp()));
+    env.insert("GITHUB_RUN_NUMBER".to_string(), "1".to_string());
+
+    // Path-related variables
+    env.insert("RUNNER_TEMP".to_string(), get_temp_dir());
+    env.insert("RUNNER_TOOL_CACHE".to_string(), get_tool_cache_dir());
+
+    env
+}
+
+/// Add matrix context variables to the environment
+pub fn add_matrix_context(
+    env: &mut HashMap<String, String>,
+    matrix_combination: &MatrixCombination,
+) {
+    // Add each matrix parameter as an environment variable
+    for (key, value) in &matrix_combination.values {
+        let env_key = format!("MATRIX_{}", key.to_uppercase());
+        let env_value = value_to_string(value);
+        env.insert(env_key, env_value);
+    }
+
+    // Also serialize the whole matrix as JSON for potential use
+    if let Ok(json_value) = serde_json::to_string(&matrix_combination.values) {
+        env.insert("MATRIX_CONTEXT".to_string(), json_value);
+    }
+}
+
+/// Convert a serde_yaml::Value to a string for environment variables
+fn value_to_string(value: &Value) -> String {
+    match value {
+        Value::String(s) => s.clone(),
+        Value::Number(n) => n.to_string(),
+        Value::Bool(b) => b.to_string(),
+        Value::Sequence(seq) => {
+            let items = seq
+                .iter()
+                .map(value_to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            items
+        }
+        Value::Mapping(map) => {
+            let items = map
+                .iter()
+                .map(|(k, v)| format!("{}={}", value_to_string(k), value_to_string(v)))
+                .collect::<Vec<_>>()
+                .join(",");
+            items
+        }
+        Value::Null => "".to_string(),
+        _ => "".to_string(),
+    }
+}
+
+fn get_repo_name() -> String {
+    // Try to detect from git if available
+    if let Ok(output) = std::process::Command::new("git")
+        .args(["remote", "get-url", "origin"])
+        .output()
+    {
+        if output.status.success() {
+            let url = String::from_utf8_lossy(&output.stdout);
+            if let Some(repo) = extract_repo_from_url(&url) {
+                return repo;
+            }
+        }
+    }
+
+    // Fallback to directory name
+    let current_dir = std::env::current_dir().unwrap_or_default();
+    format!(
+        "wrkflw/{}",
+        current_dir
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+    )
+}
+
+fn extract_repo_from_url(url: &str) -> Option<String> {
+    // Extract owner/repo from common git URLs
+    let url = url.trim();
+
+    // Handle SSH URLs: git@github.com:owner/repo.git
+    if url.starts_with("git@") {
+        let parts: Vec<&str> = url.split(':').collect();
+        if parts.len() == 2 {
+            let repo_part = parts[1].trim_end_matches(".git");
+            return Some(repo_part.to_string());
+        }
+    }
+
+    // Handle HTTPS URLs: https://github.com/owner/repo.git
+    if url.starts_with("http") {
+        let without_protocol = url.split("://").nth(1)?;
+        let parts: Vec<&str> = without_protocol.split('/').collect();
+        if parts.len() >= 3 {
+            let owner = parts[1];
+            let repo = parts[2].trim_end_matches(".git");
+            return Some(format!("{}/{}", owner, repo));
+        }
+    }
+
+    None
+}
+
+fn get_event_name(workflow: &WorkflowDefinition) -> String {
+    // Try to extract from the workflow trigger
+    if let Some(first_trigger) = workflow.on.first() {
+        return first_trigger.clone();
+    }
+    "workflow_dispatch".to_string()
+}
+
+fn get_workspace_path() -> String {
+    std::env::current_dir()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string()
+}
+
+fn get_current_sha() -> String {
+    if let Ok(output) = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .output()
+    {
+        if output.status.success() {
+            return String::from_utf8_lossy(&output.stdout).trim().to_string();
+        }
+    }
+
+    "0000000000000000000000000000000000000000".to_string()
+}
+
+fn get_current_ref() -> String {
+    if let Ok(output) = std::process::Command::new("git")
+        .args(["symbolic-ref", "--short", "HEAD"])
+        .output()
+    {
+        if output.status.success() {
+            return format!(
+                "refs/heads/{}",
+                String::from_utf8_lossy(&output.stdout).trim()
+            );
+        }
+    }
+
+    "refs/heads/main".to_string()
+}
+
+fn get_temp_dir() -> String {
+    let temp_dir = std::env::temp_dir();
+    temp_dir.join("wrkflw").to_string_lossy().to_string()
+}
+
+fn get_tool_cache_dir() -> String {
+    let home_dir = dirs::home_dir().unwrap_or_default();
+    home_dir
+        .join(".wrkflw")
+        .join("tools")
+        .to_string_lossy()
+        .to_string()
+}

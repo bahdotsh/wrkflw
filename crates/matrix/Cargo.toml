@@ -1,0 +1,16 @@
+[package]
+name = "matrix"
+version.workspace = true
+edition.workspace = true
+description = "matrix functionality for wrkflw"
+license.workspace = true
+
+[dependencies]
+# Internal crates
+models = { path = "../models" }
+
+# External dependencies
+indexmap.workspace = true
+serde.workspace = true
+serde_yaml.workspace = true
+thiserror.workspace = true

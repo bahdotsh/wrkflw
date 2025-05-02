@@ -1,0 +1,15 @@
+[package]
+name = "validators"
+version.workspace = true
+edition.workspace = true
+description = "validation functionality for wrkflw"
+license.workspace = true
+
+[dependencies]
+# Internal crates
+models = { path = "../models" }
+matrix = { path = "../matrix" }
+
+# External dependencies
+serde.workspace = true
+serde_yaml.workspace = true

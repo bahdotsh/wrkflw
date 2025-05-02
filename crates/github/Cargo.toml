@@ -1,0 +1,19 @@
+[package]
+name = "github"
+version.workspace = true
+edition.workspace = true
+description = "github functionality for wrkflw"
+license.workspace = true
+
+[dependencies]
+# Add other crate dependencies as needed
+models = { path = "../models" }
+
+# External dependencies from workspace
+serde.workspace = true
+serde_yaml.workspace = true
+serde_json.workspace = true
+reqwest.workspace = true
+thiserror.workspace = true
+lazy_static.workspace = true
+regex.workspace = true

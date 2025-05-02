@@ -1,0 +1,45 @@
+stages:
+  - build
+  - test
+  - deploy
+
+variables:
+  CARGO_HOME: "${CI_PROJECT_DIR}/.cargo"
+
+# Default image for all jobs
+image: rust:1.76
+
+build:
+  stage: build
+  script:
+    - cargo build --release
+  artifacts:
+    paths:
+      - target/release/
+    expire_in: 1 week
+
+test:
+  stage: test
+  script:
+    - cargo test
+  dependencies:
+    - build
+
+lint:
+  stage: test
+  script:
+    - rustup component add clippy
+    - cargo clippy -- -D warnings
+    - cargo fmt -- --check
+
+deploy:
+  stage: deploy
+  script:
+    - echo "Deploying application..."
+    - cp target/release/wrkflw /usr/local/bin/
+  only:
+    - main
+  environment:
+    name: production
+  dependencies:
+    - build 

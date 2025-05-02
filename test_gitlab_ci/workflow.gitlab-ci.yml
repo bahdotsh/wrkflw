@@ -1,0 +1,186 @@
+stages:
+  - prepare
+  - build
+  - test
+  - deploy
+
+# Global workflow rules to control when pipelines run
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      when: always
+    - if: $CI_COMMIT_BRANCH == "main"
+      when: always
+    - if: $CI_COMMIT_TAG
+      when: always
+    - if: $CI_COMMIT_BRANCH == "develop"
+      when: always
+    - if: $CI_COMMIT_BRANCH =~ /^release\/.*/
+      when: always
+    - if: $CI_COMMIT_BRANCH =~ /^hotfix\/.*/
+      when: always
+    - when: never  # Skip all other branches
+
+variables:
+  RUST_VERSION: "1.76"
+  CARGO_HOME: "${CI_PROJECT_DIR}/.cargo"
+
+# Default settings
+default:
+  image: "rust:${RUST_VERSION}"
+  interruptible: true
+
+# Cache definition to be used by other jobs
+.cargo-cache:
+  cache:
+    key:
+      files:
+        - Cargo.lock
+    paths:
+      - ${CARGO_HOME}
+      - target/
+
+# Prepare the dependencies (runs on all branches)
+prepare:
+  stage: prepare
+  extends: .cargo-cache
+  script:
+    - cargo fetch --locked
+  artifacts:
+    paths:
+      - Cargo.lock
+
+# Build only on main branch and MRs
+build:
+  stage: build
+  extends: .cargo-cache
+  needs:
+    - prepare
+  script:
+    - cargo build --release
+  artifacts:
+    paths:
+      - target/release/
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "main"
+    - if: $CI_COMMIT_TAG
+
+# Build with debug symbols on develop branch
+debug-build:
+  stage: build
+  extends: .cargo-cache
+  needs:
+    - prepare
+  script:
+    - cargo build
+  artifacts:
+    paths:
+      - target/debug/
+  rules:
+    - if: $CI_COMMIT_BRANCH == "develop"
+
+# Test job - run on all branches except release and hotfix
+test:
+  stage: test
+  extends: .cargo-cache
+  needs:
+    - job: build
+      optional: true
+    - job: debug-build
+      optional: true
+  script:
+    - |
+      if [ -d "target/release" ]; then
+        cargo test --release
+      else
+        cargo test
+      fi
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "main"
+    - if: $CI_COMMIT_BRANCH == "develop"
+    - if: $CI_COMMIT_TAG
+    - if: $CI_COMMIT_BRANCH =~ /^feature\/.*/
+
+# Only lint on MRs and develop
+lint:
+  stage: test
+  extends: .cargo-cache
+  script:
+    - rustup component add clippy
+    - cargo clippy -- -D warnings
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "develop"
+
+# Run benchmarks only on main branch
+benchmark:
+  stage: test
+  extends: .cargo-cache
+  needs:
+    - build
+  script:
+    - cargo bench
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+    - if: $CI_COMMIT_TAG
+
+# Deploy to staging on develop branch pushes
+deploy-staging:
+  stage: deploy
+  needs:
+    - test
+  environment:
+    name: staging
+    url: https://staging.example.com
+  script:
+    - echo "Deploying to staging..."
+    - cp target/release/wrkflw /tmp/wrkflw-staging
+  rules:
+    - if: $CI_COMMIT_BRANCH == "develop"
+      when: on_success
+    - if: $CI_COMMIT_BRANCH =~ /^release\/.*/
+      when: manual
+
+# Deploy to production on main branch and tags
+deploy-prod:
+  stage: deploy
+  needs:
+    - test
+    - benchmark
+  environment:
+    name: production
+    url: https://example.com
+  script:
+    - echo "Deploying to production..."
+    - cp target/release/wrkflw /tmp/wrkflw-prod
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+      when: manual
+    - if: $CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/
+      when: manual
+    - if: $CI_COMMIT_BRANCH =~ /^hotfix\/.*/
+      when: manual
+
+# Notify slack only when deploy succeeded or failed
+notify:
+  stage: .post
+  image: curlimages/curl:latest
+  needs:
+    - job: deploy-staging
+      optional: true
+    - job: deploy-prod
+      optional: true
+  script:
+    - |
+      if [ "$CI_JOB_STATUS" == "success" ]; then
+        curl -X POST -H 'Content-type: application/json' --data '{"text":"Deployment succeeded! :tada:"}' $SLACK_WEBHOOK_URL
+      else
+        curl -X POST -H 'Content-type: application/json' --data '{"text":"Deployment failed! :boom:"}' $SLACK_WEBHOOK_URL
+      fi
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main" && $CI_PIPELINE_SOURCE != "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "develop" && $CI_PIPELINE_SOURCE != "merge_request_event"
+    - if: $CI_COMMIT_TAG
+    - if: $CI_COMMIT_BRANCH =~ /^hotfix\/.*/ 

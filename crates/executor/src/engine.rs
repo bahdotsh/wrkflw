@@ -13,6 +13,8 @@ use crate::docker;
 use crate::environment;
 use logging;
 use matrix::MatrixCombination;
+use models::gitlab::Pipeline;
+use parser::gitlab::{self, parse_pipeline};
 use parser::workflow::{self, parse_workflow, ActionInfo, Job, WorkflowDefinition};
 use runtime::container::ContainerRuntime;
 use runtime::emulation;
@@ -27,6 +29,51 @@ pub async fn execute_workflow(
     logging::info(&format!("Executing workflow: {}", workflow_path.display()));
     logging::info(&format!("Runtime: {:?}", runtime_type));
 
+    // Determine if this is a GitLab CI/CD pipeline or GitHub Actions workflow
+    let is_gitlab = is_gitlab_pipeline(workflow_path);
+
+    if is_gitlab {
+        execute_gitlab_pipeline(workflow_path, runtime_type, verbose).await
+    } else {
+        execute_github_workflow(workflow_path, runtime_type, verbose).await
+    }
+}
+
+/// Determine if a file is a GitLab CI/CD pipeline
+fn is_gitlab_pipeline(path: &Path) -> bool {
+    // Check the file name
+    if let Some(file_name) = path.file_name() {
+        if let Some(file_name_str) = file_name.to_str() {
+            return file_name_str == ".gitlab-ci.yml" || file_name_str.ends_with("gitlab-ci.yml");
+        }
+    }
+
+    // If file name check fails, try to read and determine by content
+    if let Ok(content) = fs::read_to_string(path) {
+        // GitLab CI/CD pipelines typically have stages, before_script, after_script at the top level
+        if content.contains("stages:")
+            || content.contains("before_script:")
+            || content.contains("after_script:")
+        {
+            // Check for GitHub Actions specific keys that would indicate it's not GitLab
+            if !content.contains("on:")
+                && !content.contains("runs-on:")
+                && !content.contains("uses:")
+            {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+/// Execute a GitHub Actions workflow file locally
+async fn execute_github_workflow(
+    workflow_path: &Path,
+    runtime_type: RuntimeType,
+    verbose: bool,
+) -> Result<ExecutionResult, ExecutionError> {
     // 1. Parse workflow file
     let workflow = parse_workflow(workflow_path)?;
 
@@ -111,6 +158,192 @@ pub async fn execute_workflow(
             None
         },
     })
+}
+
+/// Execute a GitLab CI/CD pipeline locally
+async fn execute_gitlab_pipeline(
+    pipeline_path: &Path,
+    runtime_type: RuntimeType,
+    verbose: bool,
+) -> Result<ExecutionResult, ExecutionError> {
+    logging::info("Executing GitLab CI/CD pipeline");
+
+    // 1. Parse the GitLab pipeline file
+    let pipeline = parse_pipeline(pipeline_path)
+        .map_err(|e| ExecutionError::Parse(format!("Failed to parse GitLab pipeline: {}", e)))?;
+
+    // 2. Convert the GitLab pipeline to a format compatible with the workflow executor
+    let workflow = gitlab::convert_to_workflow_format(&pipeline);
+
+    // 3. Resolve job dependencies based on stages
+    let execution_plan = resolve_gitlab_dependencies(&pipeline, &workflow)?;
+
+    // 4. Initialize appropriate runtime
+    let runtime = initialize_runtime(runtime_type.clone())?;
+
+    // Create a temporary workspace directory
+    let workspace_dir = tempfile::tempdir()
+        .map_err(|e| ExecutionError::Execution(format!("Failed to create workspace: {}", e)))?;
+
+    // 5. Set up GitLab-like environment
+    let mut env_context = create_gitlab_context(&pipeline, workspace_dir.path());
+
+    // Add runtime mode to environment
+    env_context.insert(
+        "WRKFLW_RUNTIME_MODE".to_string(),
+        if runtime_type == RuntimeType::Emulation {
+            "emulation".to_string()
+        } else {
+            "docker".to_string()
+        },
+    );
+
+    // Setup environment files
+    environment::setup_github_environment_files(workspace_dir.path()).map_err(|e| {
+        ExecutionError::Execution(format!("Failed to setup environment files: {}", e))
+    })?;
+
+    // 6. Execute jobs according to the plan
+    let mut results = Vec::new();
+    let mut has_failures = false;
+    let mut failure_details = String::new();
+
+    for job_batch in execution_plan {
+        // Execute jobs in parallel if they don't depend on each other
+        let job_results = execute_job_batch(
+            &job_batch,
+            &workflow,
+            runtime.as_ref(),
+            &env_context,
+            verbose,
+        )
+        .await?;
+
+        // Check for job failures and collect details
+        for job_result in &job_results {
+            if job_result.status == JobStatus::Failure {
+                has_failures = true;
+                failure_details.push_str(&format!("\n❌ Job failed: {}\n", job_result.name));
+
+                // Add step details for failed jobs
+                for step in &job_result.steps {
+                    if step.status == StepStatus::Failure {
+                        failure_details.push_str(&format!("  ❌ {}: {}\n", step.name, step.output));
+                    }
+                }
+            }
+        }
+
+        results.extend(job_results);
+    }
+
+    // If there were failures, add detailed failure information to the result
+    if has_failures {
+        logging::error(&format!("Pipeline execution failed:{}", failure_details));
+    }
+
+    Ok(ExecutionResult {
+        jobs: results,
+        failure_details: if has_failures {
+            Some(failure_details)
+        } else {
+            None
+        },
+    })
+}
+
+/// Create an environment context for GitLab CI/CD pipeline execution
+fn create_gitlab_context(pipeline: &Pipeline, workspace_dir: &Path) -> HashMap<String, String> {
+    let mut env_context = HashMap::new();
+
+    // Add GitLab CI/CD environment variables
+    env_context.insert("CI".to_string(), "true".to_string());
+    env_context.insert("GITLAB_CI".to_string(), "true".to_string());
+
+    // Add custom environment variable to indicate use in wrkflw
+    env_context.insert("WRKFLW_CI".to_string(), "true".to_string());
+
+    // Add workspace directory
+    env_context.insert(
+        "CI_PROJECT_DIR".to_string(),
+        workspace_dir.to_string_lossy().to_string(),
+    );
+
+    // Add global variables from the pipeline
+    if let Some(variables) = &pipeline.variables {
+        for (key, value) in variables {
+            env_context.insert(key.clone(), value.clone());
+        }
+    }
+
+    env_context
+}
+
+/// Resolve GitLab CI/CD pipeline dependencies
+fn resolve_gitlab_dependencies(
+    pipeline: &Pipeline,
+    workflow: &WorkflowDefinition,
+) -> Result<Vec<Vec<String>>, ExecutionError> {
+    // For GitLab CI/CD pipelines, jobs within the same stage can run in parallel,
+    // but jobs in different stages run sequentially
+
+    // Get stages from the pipeline or create a default one
+    let stages = match &pipeline.stages {
+        Some(defined_stages) => defined_stages.clone(),
+        None => vec![
+            "build".to_string(),
+            "test".to_string(),
+            "deploy".to_string(),
+        ],
+    };
+
+    // Create an execution plan based on stages
+    let mut execution_plan = Vec::new();
+
+    // For each stage, collect the jobs that belong to it
+    for stage in stages {
+        let mut stage_jobs = Vec::new();
+
+        for (job_name, job) in &pipeline.jobs {
+            // Skip template jobs
+            if let Some(true) = job.template {
+                continue;
+            }
+
+            // Get the job's stage, or assume "test" if not specified
+            let default_stage = "test".to_string();
+            let job_stage = job.stage.as_ref().unwrap_or(&default_stage);
+
+            // If the job belongs to the current stage, add it to the batch
+            if job_stage == &stage {
+                stage_jobs.push(job_name.clone());
+            }
+        }
+
+        if !stage_jobs.is_empty() {
+            execution_plan.push(stage_jobs);
+        }
+    }
+
+    // Also create a batch for jobs without a stage
+    let mut stageless_jobs = Vec::new();
+
+    for (job_name, job) in &pipeline.jobs {
+        // Skip template jobs
+        if let Some(true) = job.template {
+            continue;
+        }
+
+        if job.stage.is_none() {
+            stageless_jobs.push(job_name.clone());
+        }
+    }
+
+    if !stageless_jobs.is_empty() {
+        execution_plan.push(stageless_jobs);
+    }
+
+    Ok(execution_plan)
 }
 
 // Determine if Docker is available or fall back to emulation
@@ -1425,7 +1658,12 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                         } else {
                             StepStatus::Failure
                         },
-                        output: output_text,
+                        output: format!(
+                            "Exit code: {}
+{}
+{}",
+                            output.exit_code, output.stdout, output.stderr
+                        ),
                     }
                 } else {
                     StepResult {

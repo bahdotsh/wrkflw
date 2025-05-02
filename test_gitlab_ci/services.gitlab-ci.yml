@@ -1,0 +1,167 @@
+stages:
+  - build
+  - test
+  - deploy
+
+variables:
+  POSTGRES_DB: test_db
+  POSTGRES_USER: postgres
+  POSTGRES_PASSWORD: postgres
+  POSTGRES_HOST: postgres
+  REDIS_HOST: redis
+  MONGO_HOST: mongo
+  RUST_BACKTRACE: 1
+
+# Default settings
+default:
+  image: rust:1.76
+
+# Build the application
+build:
+  stage: build
+  script:
+    - cargo build --release
+  artifacts:
+    paths:
+      - target/release/
+  cache:
+    key:
+      files:
+        - Cargo.lock
+    paths:
+      - ${CI_PROJECT_DIR}/.cargo
+      - target/
+
+# Run unit tests (no services needed)
+unit-tests:
+  stage: test
+  needs:
+    - build
+  script:
+    - cargo test --lib
+  cache:
+    key:
+      files:
+        - Cargo.lock
+    paths:
+      - ${CI_PROJECT_DIR}/.cargo
+      - target/
+    policy: pull
+
+# Run integration tests with a PostgreSQL service
+postgres-tests:
+  stage: test
+  needs:
+    - build
+  services:
+    - name: postgres:14-alpine
+      alias: postgres
+  variables:
+    # Service-specific variables
+    POSTGRES_DB: test_db
+    POSTGRES_USER: postgres
+    POSTGRES_PASSWORD: postgres
+    DATABASE_URL: postgres://postgres:postgres@postgres:5432/test_db
+  script:
+    - apt-get update && apt-get install -y postgresql-client
+    - cd target/release && ./wrkflw test-postgres
+    - psql -h postgres -U postgres -d test_db -c "SELECT 1;"
+  cache:
+    key:
+      files:
+        - Cargo.lock
+    paths:
+      - ${CI_PROJECT_DIR}/.cargo
+      - target/
+    policy: pull
+
+# Run integration tests with Redis service
+redis-tests:
+  stage: test
+  needs:
+    - build
+  services:
+    - name: redis:alpine
+      alias: redis
+  variables:
+    REDIS_URL: redis://redis:6379
+  script:
+    - apt-get update && apt-get install -y redis-tools
+    - cd target/release && ./wrkflw test-redis
+    - redis-cli -h redis PING
+  cache:
+    key:
+      files:
+        - Cargo.lock
+    paths:
+      - ${CI_PROJECT_DIR}/.cargo
+      - target/
+    policy: pull
+
+# Run integration tests with MongoDB service
+mongo-tests:
+  stage: test
+  needs:
+    - build
+  services:
+    - name: mongo:5
+      alias: mongo
+  variables:
+    MONGO_URL: mongodb://mongo:27017
+  script:
+    - apt-get update && apt-get install -y mongodb-clients
+    - cd target/release && ./wrkflw test-mongo
+    - mongosh --host mongo --eval "db.version()"
+  cache:
+    key:
+      files:
+        - Cargo.lock
+    paths:
+      - ${CI_PROJECT_DIR}/.cargo
+      - target/
+    policy: pull
+
+# Run multi-service integration tests
+all-services-test:
+  stage: test
+  needs:
+    - build
+  services:
+    - name: postgres:14-alpine
+      alias: postgres
+    - name: redis:alpine
+      alias: redis
+    - name: mongo:5
+      alias: mongo
+    - name: rabbitmq:3-management
+      alias: rabbitmq
+  variables:
+    DATABASE_URL: postgres://postgres:postgres@postgres:5432/test_db
+    REDIS_URL: redis://redis:6379
+    MONGO_URL: mongodb://mongo:27017
+    RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672
+  script:
+    - apt-get update && apt-get install -y postgresql-client redis-tools mongodb-clients
+    - cd target/release && ./wrkflw test-all-services
+  cache:
+    key:
+      files:
+        - Cargo.lock
+    paths:
+      - ${CI_PROJECT_DIR}/.cargo
+      - target/
+    policy: pull
+
+# Deploy to production
+deploy:
+  stage: deploy
+  needs:
+    - unit-tests
+    - postgres-tests
+    - redis-tests
+    - mongo-tests
+  script:
+    - echo "Deploying application..."
+    - cp target/release/wrkflw /tmp/
+  only:
+    - main 

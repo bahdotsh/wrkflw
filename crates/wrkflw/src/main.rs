@@ -2,13 +2,14 @@ use bollard::Docker;
 use clap::{Parser, Subcommand};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::path::Path;
 
 #[derive(Debug, Parser)]
 #[command(
     name = "wrkflw",
-    about = "GitHub Workflow validator and executor",
+    about = "GitHub & GitLab CI/CD validator and executor",
     version,
-    long_about = "A GitHub Workflow validator and executor that runs workflows locally.\n\nExamples:\n  wrkflw validate                             # Validate all workflows in .github/workflows\n  wrkflw run .github/workflows/build.yml      # Run a specific workflow\n  wrkflw --verbose run .github/workflows/build.yml  # Run with more output\n  wrkflw --debug run .github/workflows/build.yml    # Run with detailed debug information\n  wrkflw run --emulate .github/workflows/build.yml  # Use emulation mode instead of Docker"
+    long_about = "A CI/CD validator and executor that runs workflows locally.\n\nExamples:\n  wrkflw validate                             # Validate all workflows in .github/workflows\n  wrkflw run .github/workflows/build.yml      # Run a specific workflow\n  wrkflw run .gitlab-ci.yml                   # Run a GitLab CI pipeline\n  wrkflw --verbose run .github/workflows/build.yml  # Run with more output\n  wrkflw --debug run .github/workflows/build.yml    # Run with detailed debug information\n  wrkflw run --emulate .github/workflows/build.yml  # Use emulation mode instead of Docker"
 )]
 struct Wrkflw {
     #[command(subcommand)]
@@ -25,15 +26,19 @@ struct Wrkflw {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    /// Validate GitHub workflow files
+    /// Validate workflow or pipeline files
     Validate {
-        /// Path to workflow file or directory (defaults to .github/workflows)
+        /// Path to workflow/pipeline file or directory (defaults to .github/workflows)
         path: Option<PathBuf>,
+
+        /// Explicitly validate as GitLab CI/CD pipeline
+        #[arg(long)]
+        gitlab: bool,
     },
 
-    /// Execute GitHub workflow files locally
+    /// Execute workflow or pipeline files locally
     Run {
-        /// Path to workflow file to execute
+        /// Path to workflow/pipeline file to execute
         path: PathBuf,
 
         /// Use emulation mode instead of Docker
@@ -43,6 +48,10 @@ enum Commands {
         /// Show 'Would execute GitHub action' messages in emulation mode
         #[arg(long, default_value_t = false)]
         show_action_messages: bool,
+
+        /// Explicitly run as GitLab CI/CD pipeline
+        #[arg(long)]
+        gitlab: bool,
     },
 
     /// Open TUI interface to manage workflows
@@ -84,7 +93,7 @@ enum Commands {
         variable: Option<Vec<(String, String)>>,
     },
 
-    /// List available workflows
+    /// List available workflows and pipelines
     List,
 }
 
@@ -173,6 +182,51 @@ async fn handle_signals() {
     std::process::exit(0);
 }
 
+/// Determines if a file is a GitLab CI/CD pipeline based on its name and content
+fn is_gitlab_pipeline(path: &Path) -> bool {
+    // First check the file name
+    if let Some(file_name) = path.file_name() {
+        if let Some(file_name_str) = file_name.to_str() {
+            if file_name_str == ".gitlab-ci.yml" || file_name_str.ends_with("gitlab-ci.yml") {
+                return true;
+            }
+        }
+    }
+
+    // Check if file is in .gitlab/ci directory
+    if let Some(parent) = path.parent() {
+        if let Some(parent_str) = parent.to_str() {
+            if parent_str.ends_with(".gitlab/ci")
+                && path
+                    .extension().is_some_and(|ext| ext == "yml" || ext == "yaml")
+            {
+                return true;
+            }
+        }
+    }
+
+    // If file exists, check the content
+    if path.exists() {
+        if let Ok(content) = std::fs::read_to_string(path) {
+            // GitLab CI/CD pipelines typically have stages, before_script, after_script at the top level
+            if content.contains("stages:")
+                || content.contains("before_script:")
+                || content.contains("after_script:")
+            {
+                // Check for GitHub Actions specific keys that would indicate it's not GitLab
+                if !content.contains("on:")
+                    && !content.contains("runs-on:")
+                    && !content.contains("uses:")
+                {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Wrkflw::parse();
@@ -194,285 +248,303 @@ async fn main() {
     tokio::spawn(handle_signals());
 
     match &cli.command {
-        Some(Commands::Validate { path }) => {
+        Some(Commands::Validate { path, gitlab }) => {
             // Determine the path to validate
             let validate_path = path
                 .clone()
                 .unwrap_or_else(|| PathBuf::from(".github/workflows"));
 
-            // Run the validation using ui crate
-            ui::validate_workflow(&validate_path, verbose).unwrap_or_else(|e| {
-                eprintln!("Error: {}", e);
+            // Check if the path exists
+            if !validate_path.exists() {
+                eprintln!("Error: Path does not exist: {}", validate_path.display());
                 std::process::exit(1);
-            });
-        }
+            }
 
+            // Determine if we're validating a GitLab pipeline based on the --gitlab flag or file detection
+            let force_gitlab = *gitlab;
+
+            if validate_path.is_dir() {
+                // Validate all workflow files in the directory
+                let entries = std::fs::read_dir(&validate_path)
+                    .expect("Failed to read directory")
+                    .filter_map(|entry| entry.ok())
+                    .filter(|entry| {
+                        entry.path().is_file()
+                            && entry
+                                .path()
+                                .extension().is_some_and(|ext| ext == "yml" || ext == "yaml")
+                    })
+                    .collect::<Vec<_>>();
+
+                println!("Validating {} workflow file(s)...", entries.len());
+
+                for entry in entries {
+                    let path = entry.path();
+                    let is_gitlab = force_gitlab || is_gitlab_pipeline(&path);
+
+                    if is_gitlab {
+                        validate_gitlab_pipeline(&path, verbose);
+                    } else {
+                        validate_github_workflow(&path, verbose);
+                    }
+                }
+            } else {
+                // Validate a single workflow file
+                let is_gitlab = force_gitlab || is_gitlab_pipeline(&validate_path);
+
+                if is_gitlab {
+                    validate_gitlab_pipeline(&validate_path, verbose);
+                } else {
+                    validate_github_workflow(&validate_path, verbose);
+                }
+            }
+        }
         Some(Commands::Run {
             path,
             emulate,
-            show_action_messages: _, // Assuming this flag is handled within executor/runtime
+            show_action_messages: _,
+            gitlab,
         }) => {
-            // Set runner mode based on flags
+            // Determine the runtime type
             let runtime_type = if *emulate {
                 executor::RuntimeType::Emulation
             } else {
                 executor::RuntimeType::Docker
             };
 
-            // First validate the workflow file using parser crate
-            match parser::workflow::parse_workflow(path) {
-                Ok(_) => logging::info("Validating workflow..."),
-                Err(e) => {
-                    logging::error(&format!("Workflow validation failed: {}", e));
-                    std::process::exit(1);
-                }
-            }
+            // Check if we're explicitly or implicitly running a GitLab pipeline
+            let is_gitlab = *gitlab || is_gitlab_pipeline(path);
+            let workflow_type = if is_gitlab {
+                "GitLab CI pipeline"
+            } else {
+                "GitHub workflow"
+            };
 
-            // Execute the workflow using executor crate
-            match executor::execute_workflow(path, runtime_type, verbose || debug).await {
-                Ok(result) => {
-                    // Print job results
-                    for job in &result.jobs {
+            logging::info(&format!("Running {} at: {}", workflow_type, path.display()));
+
+            // Execute the workflow
+            let result = executor::execute_workflow(path, runtime_type, verbose)
+                .await
+                .unwrap_or_else(|e| {
+                    eprintln!("Error executing workflow: {}", e);
+                    std::process::exit(1);
+                });
+
+            // Print execution summary
+            if result.failure_details.is_some() {
+                eprintln!("❌ Workflow execution failed:");
+                if let Some(details) = result.failure_details {
+                    eprintln!("{}", details);
+                }
+                std::process::exit(1);
+            } else {
+                println!("✅ Workflow execution completed successfully!");
+
+                // Print a summary of executed jobs
+                if verbose {
+                    println!("\nJob summary:");
+                    for job in result.jobs {
                         println!(
-                            "\n{} Job {}: {}",
-                            if job.status == executor::JobStatus::Success {
-                                "✅"
-                            } else {
-                                "❌"
+                            "  {} {} ({})",
+                            match job.status {
+                                executor::JobStatus::Success => "✅",
+                                executor::JobStatus::Failure => "❌",
+                                executor::JobStatus::Skipped => "⏭️",
                             },
                             job.name,
-                            if job.status == executor::JobStatus::Success {
-                                "succeeded"
-                            } else {
-                                "failed"
+                            match job.status {
+                                executor::JobStatus::Success => "success",
+                                executor::JobStatus::Failure => "failure",
+                                executor::JobStatus::Skipped => "skipped",
                             }
                         );
 
-                        // Print step results
-                        for step in &job.steps {
-                            println!(
-                                "  {} {}",
-                                if step.status == executor::StepStatus::Success {
-                                    "✅"
-                                } else {
-                                    "❌"
-                                },
-                                step.name
-                            );
-
-                            if !step.output.trim().is_empty() {
-                                // If the output is very long, trim it
-                                let output_lines = step.output.lines().collect::<Vec<&str>>();
-
-                                println!("    Output:");
-
-                                // In verbose mode, show complete output
-                                if verbose || debug {
-                                    for line in &output_lines {
-                                        println!("    {}", line);
-                                    }
-                                } else {
-                                    // Show only the first few lines
-                                    let max_lines = 5;
-                                    for line in output_lines.iter().take(max_lines) {
-                                        println!("    {}", line);
-                                    }
-
-                                    if output_lines.len() > max_lines {
-                                        println!("    ... ({} more lines, use --verbose to see full output)",
-                                            output_lines.len() - max_lines);
-                                    }
-                                }
+                        if debug {
+                            println!("  Steps:");
+                            for step in job.steps {
+                                println!(
+                                    "    {} {}",
+                                    match step.status {
+                                        executor::StepStatus::Success => "✅",
+                                        executor::StepStatus::Failure => "❌",
+                                        executor::StepStatus::Skipped => "⏭️",
+                                    },
+                                    step.name
+                                );
                             }
                         }
                     }
-
-                    // Print detailed failure information if available
-                    if let Some(failure_details) = &result.failure_details {
-                        println!("\n❌ Workflow execution failed!");
-                        println!("{}", failure_details);
-                        println!("\nTo fix these issues:");
-                        println!("1. Check the formatting issues with: cargo fmt");
-                        println!("2. Fix clippy warnings with: cargo clippy -- -D warnings");
-                        println!("3. Run tests to ensure everything passes: cargo test");
-                        std::process::exit(1);
-                    } else {
-                        println!("\n✅ Workflow completed successfully!");
-                    }
-                }
-                Err(e) => {
-                    logging::error(&format!("Workflow execution failed: {}", e));
-                    std::process::exit(1);
                 }
             }
-        }
 
+            // Cleanup is handled automatically via the signal handler
+        }
+        Some(Commands::TriggerGitlab { branch, variable }) => {
+            // Convert optional Vec<(String, String)> to Option<HashMap<String, String>>
+            let variables = variable
+                .as_ref()
+                .map(|v| v.iter().cloned().collect::<HashMap<String, String>>());
+
+            // Trigger the pipeline
+            if let Err(e) = gitlab::trigger_pipeline(branch.as_deref(), variables).await {
+                eprintln!("Error triggering GitLab pipeline: {}", e);
+                std::process::exit(1);
+            }
+        }
         Some(Commands::Tui {
             path,
             emulate,
-            show_action_messages,
+            show_action_messages: _,
         }) => {
-            // Open the TUI interface using ui crate
+            // Set runtime type based on the emulate flag
             let runtime_type = if *emulate {
                 executor::RuntimeType::Emulation
             } else {
-                // Check if Docker is available, fall back to emulation if not
-                // Assuming executor::docker::is_available() exists
-                if !executor::docker::is_available() {
-                    println!("⚠️ Docker is not available. Using emulation mode instead.");
-                    logging::warning("Docker is not available. Using emulation mode instead.");
-                    executor::RuntimeType::Emulation
-                } else {
-                    executor::RuntimeType::Docker
-                }
+                executor::RuntimeType::Docker
             };
 
-            // Control hiding action messages based on the flag
-            if !show_action_messages {
-                std::env::set_var("WRKFLW_HIDE_ACTION_MESSAGES", "true");
-            } else {
-                std::env::set_var("WRKFLW_HIDE_ACTION_MESSAGES", "false");
-            }
-
-            match ui::run_wrkflw_tui(path.as_ref(), runtime_type, verbose).await {
-                Ok(_) => {
-                    // Clean up on successful exit
-                    cleanup_on_exit().await;
-                }
-                Err(e) => {
-                    eprintln!("Error: {}", e);
-                    cleanup_on_exit().await; // Ensure cleanup even on error
-                    std::process::exit(1);
-                }
+            // Call the TUI implementation from the ui crate
+            if let Err(e) = ui::run_wrkflw_tui(path.as_ref(), runtime_type, verbose).await {
+                eprintln!("Error running TUI: {}", e);
+                std::process::exit(1);
             }
         }
-
         Some(Commands::Trigger {
             workflow,
             branch,
             input,
         }) => {
-            logging::info(&format!("Triggering workflow {} on GitHub", workflow));
+            // Convert optional Vec<(String, String)> to Option<HashMap<String, String>>
+            let inputs = input
+                .as_ref()
+                .map(|i| i.iter().cloned().collect::<HashMap<String, String>>());
 
-            // Convert inputs to HashMap
-            let input_map = input.as_ref().map(|i| {
-                i.iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect::<HashMap<String, String>>()
-            });
-
-            // Use github crate
-            match github::trigger_workflow(workflow, branch.as_deref(), input_map).await {
-                Ok(_) => logging::info("Workflow triggered successfully"),
-                Err(e) => {
-                    eprintln!("Error triggering workflow: {}", e);
-                    std::process::exit(1);
-                }
+            // Trigger the workflow
+            if let Err(e) = github::trigger_workflow(workflow, branch.as_deref(), inputs).await {
+                eprintln!("Error triggering GitHub workflow: {}", e);
+                std::process::exit(1);
             }
         }
-
-        Some(Commands::TriggerGitlab { branch, variable }) => {
-            logging::info("Triggering pipeline on GitLab");
-
-            // Convert variables to HashMap
-            let variable_map = variable.as_ref().map(|v| {
-                v.iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect::<HashMap<String, String>>()
-            });
-
-            // Use gitlab crate
-            match gitlab::trigger_pipeline(branch.as_deref(), variable_map).await {
-                Ok(_) => logging::info("GitLab pipeline triggered successfully"),
-                Err(e) => {
-                    eprintln!("Error triggering GitLab pipeline: {}", e);
-                    std::process::exit(1);
-                }
-            }
-        }
-
         Some(Commands::List) => {
-            logging::info("Listing available workflows");
-
-            // Attempt to get GitHub repo info using github crate
-            if let Ok(repo_info) = github::get_repo_info() {
-                match github::list_workflows(&repo_info).await {
-                    Ok(workflows) => {
-                        if workflows.is_empty() {
-                            println!("No GitHub workflows found in repository");
-                        } else {
-                            println!("GitHub workflows:");
-                            for workflow in workflows {
-                                println!("  {}", workflow);
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("Error listing GitHub workflows: {}", e);
-                    }
-                }
-            } else {
-                println!("Not a GitHub repository or unable to get repository information");
-            }
-
-            // Attempt to get GitLab repo info using gitlab crate
-            if let Ok(repo_info) = gitlab::get_repo_info() {
-                match gitlab::list_pipelines(&repo_info).await {
-                    Ok(pipelines) => {
-                        if pipelines.is_empty() {
-                            println!("No GitLab pipelines found in repository");
-                        } else {
-                            println!("GitLab pipelines:");
-                            for pipeline in pipelines {
-                                println!("  {}", pipeline);
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("Error listing GitLab pipelines: {}", e);
-                    }
-                }
-            } else {
-                println!("Not a GitLab repository or unable to get repository information");
-            }
+            list_workflows_and_pipelines(verbose);
         }
-
         None => {
-            // Default to TUI interface if no subcommand
-            // Check if Docker is available, fall back to emulation if not
-            let runtime_type = if !executor::docker::is_available() {
-                println!("⚠️ Docker is not available. Using emulation mode instead.");
-                logging::warning("Docker is not available. Using emulation mode instead.");
-                executor::RuntimeType::Emulation
-            } else {
-                executor::RuntimeType::Docker
-            };
+            // Launch TUI by default when no command is provided
+            let runtime_type = executor::RuntimeType::Docker;
 
-            // Set environment variable to hide action messages by default
-            std::env::set_var("WRKFLW_HIDE_ACTION_MESSAGES", "true");
-
-            match ui::run_wrkflw_tui(
-                Some(&PathBuf::from(".github/workflows")),
-                runtime_type,
-                verbose,
-            )
-            .await
-            {
-                Ok(_) => {
-                    // Clean up on successful exit
-                    cleanup_on_exit().await;
-                }
-                Err(e) => {
-                    eprintln!("Error: {}", e);
-                    cleanup_on_exit().await; // Ensure cleanup even on error
-                    std::process::exit(1);
-                }
+            // Call the TUI implementation from the ui crate with default path
+            if let Err(e) = ui::run_wrkflw_tui(None, runtime_type, verbose).await {
+                eprintln!("Error running TUI: {}", e);
+                std::process::exit(1);
             }
         }
     }
+}
 
-    // Final cleanup before program exit (redundant if called on success/error/signal?)
-    // Consider if this final call is necessary given the calls in Ok/Err/signal handlers.
-    // It might be okay as a safety net, but ensure cleanup_on_exit is idempotent.
-    // cleanup_on_exit().await; // Keep or remove based on idempotency review
+/// Validate a GitHub workflow file
+fn validate_github_workflow(path: &Path, verbose: bool) {
+    print!("Validating GitHub workflow file: {}... ", path.display());
+
+    // Use the ui crate's validate_workflow function
+    match ui::validate_workflow(path, verbose) {
+        Ok(_) => {
+            // The detailed validation output is already printed by the function
+        }
+        Err(e) => {
+            eprintln!("Error validating workflow: {}", e);
+        }
+    }
+}
+
+/// Validate a GitLab CI/CD pipeline file
+fn validate_gitlab_pipeline(path: &Path, verbose: bool) {
+    print!("Validating GitLab CI pipeline file: {}... ", path.display());
+
+    // Parse and validate the pipeline file
+    match parser::gitlab::parse_pipeline(path) {
+        Ok(pipeline) => {
+            println!("✅ Valid syntax");
+
+            // Additional structural validation
+            let validation_result = validators::validate_gitlab_pipeline(&pipeline);
+
+            if !validation_result.is_valid {
+                println!("⚠️  Validation issues:");
+                for issue in validation_result.issues {
+                    println!("   - {}", issue);
+                }
+            } else if verbose {
+                println!("✅ All validation checks passed");
+            }
+        }
+        Err(e) => {
+            println!("❌ Invalid");
+            eprintln!("Validation failed: {}", e);
+        }
+    }
+}
+
+/// List available workflows and pipelines in the repository
+fn list_workflows_and_pipelines(verbose: bool) {
+    // Check for GitHub workflows
+    let github_path = PathBuf::from(".github/workflows");
+    if github_path.exists() && github_path.is_dir() {
+        println!("GitHub Workflows:");
+
+        let entries = std::fs::read_dir(&github_path)
+            .expect("Failed to read directory")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry.path().is_file()
+                    && entry
+                        .path()
+                        .extension().is_some_and(|ext| ext == "yml" || ext == "yaml")
+            })
+            .collect::<Vec<_>>();
+
+        if entries.is_empty() {
+            println!("  No workflow files found in .github/workflows");
+        } else {
+            for entry in entries {
+                println!("  - {}", entry.path().display());
+            }
+        }
+    } else {
+        println!("GitHub Workflows: No .github/workflows directory found");
+    }
+
+    // Check for GitLab CI pipeline
+    let gitlab_path = PathBuf::from(".gitlab-ci.yml");
+    if gitlab_path.exists() && gitlab_path.is_file() {
+        println!("GitLab CI Pipeline:");
+        println!("  - {}", gitlab_path.display());
+    } else {
+        println!("GitLab CI Pipeline: No .gitlab-ci.yml file found");
+    }
+
+    // Check for other GitLab CI pipeline files
+    if verbose {
+        println!("Searching for other GitLab CI pipeline files...");
+
+        let entries = walkdir::WalkDir::new(".")
+            .follow_links(true)
+            .into_iter()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry.path().is_file()
+                    && entry
+                        .file_name()
+                        .to_string_lossy()
+                        .ends_with("gitlab-ci.yml")
+                    && entry.path() != gitlab_path
+            })
+            .collect::<Vec<_>>();
+
+        if !entries.is_empty() {
+            println!("Additional GitLab CI Pipeline files:");
+            for entry in entries {
+                println!("  - {}", entry.path().display());
+            }
+        }
+    }
 }

@@ -10,8 +10,7 @@ use std::sync::mpsc;
 use std::thread;
 
 // Validate a workflow or directory containing workflows
-#[allow(clippy::ptr_arg)]
-pub fn validate_workflow(path: &PathBuf, verbose: bool) -> io::Result<()> {
+pub fn validate_workflow(path: &Path, verbose: bool) -> io::Result<()> {
     let mut workflows = Vec::new();
 
     if path.is_dir() {
@@ -26,7 +25,7 @@ pub fn validate_workflow(path: &PathBuf, verbose: bool) -> io::Result<()> {
             }
         }
     } else if path.is_file() {
-        workflows.push(path.clone());
+        workflows.push(PathBuf::from(path));
     } else {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
@@ -69,9 +68,8 @@ pub fn validate_workflow(path: &PathBuf, verbose: bool) -> io::Result<()> {
 }
 
 // Execute a workflow through the CLI
-#[allow(clippy::ptr_arg)]
 pub async fn execute_workflow_cli(
-    path: &PathBuf,
+    path: &Path,
     runtime_type: RuntimeType,
     verbose: bool,
 ) -> io::Result<()> {

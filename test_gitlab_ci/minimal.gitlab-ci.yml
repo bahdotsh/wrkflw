@@ -1,0 +1,11 @@
+# Minimal GitLab CI configuration
+
+image: rust:latest
+
+build:
+  script:
+    - cargo build
+
+test:
+  script:
+    - cargo test 

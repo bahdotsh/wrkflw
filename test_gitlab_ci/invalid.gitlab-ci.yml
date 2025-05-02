@@ -1,0 +1,57 @@
+# Invalid GitLab CI file with common mistakes
+
+# Missing stages definition
+# stages:
+#   - build
+#   - test
+
+variables:
+  CARGO_HOME: ${CI_PROJECT_DIR}/.cargo  # Missing quotes around value with variables
+
+# Invalid job definition (missing script)
+build:
+  stage: build  # Referring to undefined stage
+  # Missing required script section
+  artifacts:
+    paths:
+      - target/release/
+    expire_in: 1 week
+
+# Invalid job with incorrect when value
+test:
+  stage: test
+  script:
+    - cargo test
+  when: never  # Invalid value for when (should be always, manual, or delayed)
+  dependencies:
+    - non_existent_job  # Dependency on non-existent job
+
+# Improperly structured job with invalid keys
+deploy:
+  stagee: deploy  # Typo in stage key
+  scriptt:  # Typo in script key
+    - echo "Deploying..."
+  only:
+    - main
+  environment:
+    production  # Incorrect format for environment
+  retry: hello  # Incorrect type for retry (should be integer or object)
+
+# Invalid rules section
+lint:
+  stage: test
+  script:
+    - cargo clippy
+  rules:
+    - equals: $CI_COMMIT_BRANCH == "main"  # Invalid rule (should be if, changes, exists, etc.)
+    
+# Job with invalid cache configuration
+cache-test:
+  stage: test
+  script:
+    - echo "Testing cache"
+  cache:
+    paths:
+      - ${CARGO_HOME}
+    key: [invalid, key, type]  # Invalid type for key (should be string)
+    policy: invalid-policy  # Invalid policy value 

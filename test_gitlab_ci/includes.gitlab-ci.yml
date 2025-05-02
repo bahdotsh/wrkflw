@@ -1,0 +1,40 @@
+stages:
+  - build
+  - test
+  - deploy
+
+# Including external files
+include:
+  - local: '.gitlab/ci/build.yml'  # Will be created in a moment
+  - local: '.gitlab/ci/test.yml'   # Will be created in a moment
+  - template: 'Workflows/MergeRequest-Pipelines.gitlab-ci.yml'  # Built-in template
+
+variables:
+  RUST_VERSION: "1.76"
+  CARGO_HOME: "${CI_PROJECT_DIR}/.cargo"
+
+# Default settings for all jobs
+default:
+  image: rust:${RUST_VERSION}
+  before_script:
+    - rustc --version
+    - cargo --version
+
+# Main pipeline jobs that use the included templates
+production_deploy:
+  stage: deploy
+  extends: .deploy-template  # This template is defined in one of the included files
+  variables:
+    ENVIRONMENT: production
+  only:
+    - main
+  when: manual
+
+staging_deploy:
+  stage: deploy
+  extends: .deploy-template
+  variables:
+    ENVIRONMENT: staging
+  only:
+    - staging
+  when: manual 

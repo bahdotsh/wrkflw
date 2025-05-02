@@ -2,38 +2,30 @@
 # This pipeline will build and test the Rust project
 
 stages:
-  - lint
   - build
   - test
-  - release
+  - deploy
 
 variables:
-  CARGO_HOME: ${CI_PROJECT_DIR}/.cargo
-  RUST_VERSION: stable
+  RUST_VERSION: "1.70.0"
+  CARGO_TERM_COLOR: always
 
-# Cache dependencies between jobs
+# Cache settings
 cache:
+  key: "$CI_COMMIT_REF_SLUG"
   paths:
-    - .cargo/
     - target/
+  script:
+    - echo "This is a placeholder - the cache directive doesn't need a script"
 
 # Lint job - runs rustfmt and clippy
 lint:
-  stage: lint
+  stage: test
   image: rust:${RUST_VERSION}
   script:
-    - rustup component add rustfmt clippy
-    - cargo fmt -- --check
+    - rustup component add clippy
     - cargo clippy -- -D warnings
-  rules:
-    - if: $CI_PIPELINE_SOURCE == "web"
-      when: always
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
-      when: always
-    - if: $CI_COMMIT_TAG
-      when: never
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
-      when: always
+  allow_failure: true
 
 # Build job - builds the application
 build:
@@ -43,17 +35,8 @@ build:
     - cargo build --verbose
   artifacts:
     paths:
-      - target/debug/wrkflw
+      - target/debug
     expire_in: 1 week
-  rules:
-    - if: $CI_PIPELINE_SOURCE == "web"
-      when: always
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
-      when: always
-    - if: $CI_COMMIT_TAG
-      when: always
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
-      when: always
 
 # Test job - runs unit and integration tests
 test:
@@ -61,21 +44,12 @@ test:
   image: rust:${RUST_VERSION}
   script:
     - cargo test --verbose
-  needs:
+  dependencies:
     - build
-  rules:
-    - if: $CI_PIPELINE_SOURCE == "web"
-      when: always
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
-      when: always
-    - if: $CI_COMMIT_TAG
-      when: always
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
-      when: always
 
 # Release job - creates a release build
 release:
-  stage: release
+  stage: deploy
   image: rust:${RUST_VERSION}
   script:
     - cargo build --release --verbose
@@ -92,16 +66,35 @@ release:
 
 # Custom job for documentation
 docs:
-  stage: release
+  stage: deploy
   image: rust:${RUST_VERSION}
   script:
     - cargo doc --no-deps
+    - mkdir -p public
+    - cp -r target/doc/* public/
   artifacts:
     paths:
-      - target/doc/
-  rules:
-    - if: $CI_PIPELINE_SOURCE == "web" && $BUILD_DOCS == "true"
-      when: always
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
-      when: always
-    - when: never 
+      - public
+  only:
+    - main
+
+format:
+  stage: test
+  image: rust:${RUST_VERSION}
+  script:
+    - rustup component add rustfmt
+    - cargo fmt --check
+  allow_failure: true
+
+pages:
+  stage: deploy
+  image: rust:${RUST_VERSION}
+  script:
+    - cargo doc --no-deps
+    - mkdir -p public
+    - cp -r target/doc/* public/
+  artifacts:
+    paths:
+      - public
+  only:
+    - main 

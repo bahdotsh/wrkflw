@@ -54,6 +54,7 @@ itertools.workspace = true
 once_cell.workspace = true
 crossterm.workspace = true
 ratatui.workspace = true
+walkdir = "2.4"
 
 [lib]
 name = "wrkflw_lib"

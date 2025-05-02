@@ -1,0 +1,63 @@
+.test-template:
+  stage: test
+  dependencies:
+    - build
+  cache:
+    key:
+      files:
+        - Cargo.lock
+    paths:
+      - ${CARGO_HOME}
+      - target/
+
+# Unit tests
+unit-tests:
+  extends: .test-template
+  script:
+    - cargo test --lib
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "main"
+
+# Integration tests
+integration-tests:
+  extends: .test-template
+  script:
+    - cargo test --test '*'
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "main"
+
+# Lint with clippy
+lint:
+  extends: .test-template
+  dependencies: []  # No dependencies needed for linting
+  script:
+    - rustup component add clippy
+    - cargo clippy -- -D warnings
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "main"
+
+# Check formatting
+format:
+  extends: .test-template
+  dependencies: []  # No dependencies needed for formatting
+  script:
+    - rustup component add rustfmt
+    - cargo fmt -- --check
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "main"
+
+# Deployment template
+.deploy-template:
+  stage: deploy
+  script:
+    - echo "Deploying to ${ENVIRONMENT} environment"
+    - cp target/release/wrkflw /tmp/wrkflw-${ENVIRONMENT}
+  artifacts:
+    paths:
+      - /tmp/wrkflw-${ENVIRONMENT}
+  dependencies:
+    - build 

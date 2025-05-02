@@ -1,0 +1,33 @@
+.build-template:
+  stage: build
+  script:
+    - cargo build --release
+  artifacts:
+    paths:
+      - target/release/
+    expire_in: 1 week
+  cache:
+    key:
+      files:
+        - Cargo.lock
+    paths:
+      - ${CARGO_HOME}
+      - target/
+
+# Normal build job
+build:
+  extends: .build-template
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "main"
+
+# Debug build with additional flags
+debug-build:
+  extends: .build-template
+  script:
+    - cargo build --features debug
+  variables:
+    RUSTFLAGS: "-Z debug-info=2"
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $DEBUG_BUILD == "true"
+  when: manual 

@@ -1,0 +1,97 @@
+stages:
+  - build
+  - test
+  - deploy
+
+variables:
+  DOCKER_DRIVER: overlay2
+  DOCKER_TLS_CERTDIR: "/certs"
+  CONTAINER_IMAGE: ${CI_REGISTRY_IMAGE}:${CI_COMMIT_REF_SLUG}
+  CONTAINER_IMAGE_LATEST: ${CI_REGISTRY_IMAGE}:latest
+
+# Use Docker-in-Docker for building and testing
+.docker:
+  image: docker:20.10
+  services:
+    - docker:20.10-dind
+  variables:
+    DOCKER_HOST: tcp://docker:2376
+    DOCKER_TLS_VERIFY: 1
+    DOCKER_CERT_PATH: $DOCKER_TLS_CERTDIR/client
+  before_script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+
+# Build the Docker image
+build-docker:
+  extends: .docker
+  stage: build
+  script:
+    - docker build --pull -t $CONTAINER_IMAGE -t $CONTAINER_IMAGE_LATEST .
+    - docker push $CONTAINER_IMAGE
+    - docker push $CONTAINER_IMAGE_LATEST
+  only:
+    - main
+    - tags
+
+# Run tests inside Docker
+test-docker:
+  extends: .docker
+  stage: test
+  script:
+    - docker pull $CONTAINER_IMAGE
+    - docker run --rm $CONTAINER_IMAGE cargo test
+  dependencies:
+    - build-docker
+
+# Security scan the Docker image
+security-scan:
+  extends: .docker
+  stage: test
+  image: aquasec/trivy:latest
+  script:
+    - trivy image --no-progress --exit-code 1 --severity HIGH,CRITICAL $CONTAINER_IMAGE
+  allow_failure: true
+
+# Run a Docker container with our app in the staging environment
+deploy-staging:
+  extends: .docker
+  stage: deploy
+  environment:
+    name: staging
+    url: https://staging.example.com
+  script:
+    - docker pull $CONTAINER_IMAGE
+    - docker tag $CONTAINER_IMAGE wrkflw-staging
+    - |
+      cat > deploy.sh << 'EOF'
+      docker stop wrkflw-staging || true
+      docker rm wrkflw-staging || true
+      docker run -d --name wrkflw-staging -p 8080:8080 wrkflw-staging
+      EOF
+    - chmod +x deploy.sh
+    - ssh $STAGING_USER@$STAGING_HOST 'bash -s' < deploy.sh
+  only:
+    - main
+  when: manual
+
+# Run a Docker container with our app in the production environment
+deploy-production:
+  extends: .docker
+  stage: deploy
+  environment:
+    name: production
+    url: https://wrkflw.example.com
+  script:
+    - docker pull $CONTAINER_IMAGE
+    - docker tag $CONTAINER_IMAGE wrkflw-production
+    - |
+      cat > deploy.sh << 'EOF'
+      docker stop wrkflw-production || true
+      docker rm wrkflw-production || true
+      docker run -d --name wrkflw-production -p 80:8080 wrkflw-production
+      EOF
+    - chmod +x deploy.sh
+    - ssh $PRODUCTION_USER@$PRODUCTION_HOST 'bash -s' < deploy.sh
+  only:
+    - tags
+  when: manual 

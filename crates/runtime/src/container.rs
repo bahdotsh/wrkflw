@@ -8,6 +8,9 @@ pub trait ContainerRuntime {
     /// If `cmd` is empty (`&[]`), the container runs with the image's built-in
     /// ENTRYPOINT/CMD. This is used for Docker-type GitHub Actions whose
     /// entrypoint is baked into the image.
+    ///
+    /// `entrypoint` optionally overrides the image's ENTRYPOINT (used when an
+    /// action.yml declares `runs.entrypoint`).
     async fn run_container(
         &self,
         image: &str,
@@ -15,6 +18,7 @@ pub trait ContainerRuntime {
         env_vars: &[(&str, &str)],
         working_dir: &Path,
         volumes: &[(&Path, &Path)],
+        entrypoint: Option<&str>,
     ) -> Result<ContainerOutput, ContainerError>;
 
     async fn pull_image(&self, image: &str) -> Result<(), ContainerError>;

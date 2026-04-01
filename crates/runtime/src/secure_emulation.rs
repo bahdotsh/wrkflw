@@ -47,6 +47,7 @@ impl ContainerRuntime for SecureEmulationRuntime {
         env_vars: &[(&str, &str)],
         working_dir: &Path,
         _volumes: &[(&Path, &Path)],
+        _entrypoint: Option<&str>,
     ) -> Result<ContainerOutput, ContainerError> {
         wrkflw_logging::info(&format!(
             "🔒 Executing sandboxed command: {} (image: {})",
@@ -308,6 +309,7 @@ mod tests {
                 &[],
                 &PathBuf::from("."),
                 &[],
+                None,
             )
             .await;
 
@@ -328,6 +330,7 @@ mod tests {
                 &[],
                 &PathBuf::from("."),
                 &[],
+                None,
             )
             .await;
 

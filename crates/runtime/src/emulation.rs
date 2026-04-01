@@ -153,6 +153,7 @@ impl ContainerRuntime for EmulationRuntime {
         env_vars: &[(&str, &str)],
         working_dir: &Path,
         _volumes: &[(&Path, &Path)],
+        _entrypoint: Option<&str>,
     ) -> Result<ContainerOutput, ContainerError> {
         // Build command string
         let mut command_str = String::new();
@@ -853,6 +854,7 @@ mod tests {
                 &[],
                 Path::new("."),
                 &[(Path::new("."), Path::new("/github/workspace"))],
+                None,
             )
             .await;
 
@@ -870,6 +872,7 @@ mod tests {
                 &[],
                 Path::new("."),
                 &[(Path::new("."), Path::new("/github/workspace"))],
+                None,
             )
             .await;
 

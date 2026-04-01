@@ -470,6 +470,7 @@ impl ContainerRuntime for PodmanRuntime {
         env_vars: &[(&str, &str)],
         working_dir: &Path,
         volumes: &[(&Path, &Path)],
+        entrypoint: Option<&str>,
     ) -> Result<ContainerOutput, ContainerError> {
         // Print detailed debugging info
         wrkflw_logging::info(&format!("Podman: Running container with image: {}", image));
@@ -479,7 +480,7 @@ impl ContainerRuntime for PodmanRuntime {
         // Run the entire container operation with a timeout
         match tokio::time::timeout(
             timeout_duration,
-            self.run_container_inner(image, cmd, env_vars, working_dir, volumes),
+            self.run_container_inner(image, cmd, env_vars, working_dir, volumes, entrypoint),
         )
         .await
         {
@@ -673,6 +674,7 @@ impl PodmanRuntime {
         env_vars: &[(&str, &str)],
         working_dir: &Path,
         volumes: &[(&Path, &Path)],
+        entrypoint: Option<&str>,
     ) -> Result<ContainerOutput, ContainerError> {
         wrkflw_logging::debug(&format!("Running command in Podman: {:?}", cmd));
         wrkflw_logging::debug(&format!("Environment: {:?}", env_vars));
@@ -718,6 +720,14 @@ impl PodmanRuntime {
         for volume_string in &volume_strings {
             args.push("-v");
             args.push(volume_string);
+        }
+
+        // Override entrypoint if specified by action.yml
+        let ep_string;
+        if let Some(ep) = entrypoint {
+            ep_string = ep.to_string();
+            args.push("--entrypoint");
+            args.push(&ep_string);
         }
 
         // Add the image

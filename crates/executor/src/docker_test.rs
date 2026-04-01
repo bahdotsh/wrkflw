@@ -37,6 +37,7 @@ mod docker_cleanup_tests {
                 &[],
                 Path::new("/"),
                 &[],
+                None,
             )
             .await;
         

@@ -635,6 +635,7 @@ impl ContainerRuntime for DockerRuntime {
         env_vars: &[(&str, &str)],
         working_dir: &Path,
         volumes: &[(&Path, &Path)],
+        entrypoint: Option<&str>,
     ) -> Result<ContainerOutput, ContainerError> {
         // Print detailed debugging info
         wrkflw_logging::info(&format!("Docker: Running container with image: {}", image));
@@ -645,7 +646,7 @@ impl ContainerRuntime for DockerRuntime {
         // Run the entire container operation with a timeout
         match tokio::time::timeout(
             timeout_duration,
-            self.run_container_inner(image, cmd, env_vars, working_dir, volumes),
+            self.run_container_inner(image, cmd, env_vars, working_dir, volumes, entrypoint),
         )
         .await
         {
@@ -839,6 +840,7 @@ impl DockerRuntime {
         env_vars: &[(&str, &str)],
         working_dir: &Path,
         volumes: &[(&Path, &Path)],
+        entrypoint: Option<&str>,
     ) -> Result<ContainerOutput, ContainerError> {
         // First, try to pull the image if it's not available locally
         if let Err(e) = self.pull_image_inner(image).await {
@@ -928,10 +930,13 @@ impl DockerRuntime {
                 None // Don't specify user for macOS emulation - use default root user
             },
             // Map appropriate entrypoint for different platforms.
-            // Only override when there is an explicit command to wrap;
+            // Priority: explicit entrypoint from action.yml > macOS bash wrapper > image default.
+            // Only apply the macOS bash wrapper when there is an explicit command to wrap;
             // an empty cmd means "use the image's native ENTRYPOINT/CMD"
             // and overriding it with bash would hang or discard the real entrypoint.
-            entrypoint: if is_macos_emu && has_cmd {
+            entrypoint: if let Some(ep) = entrypoint {
+                Some(vec![ep.to_string()])
+            } else if is_macos_emu && has_cmd {
                 // For macOS, ensure we use bash
                 Some(vec!["bash".to_string(), "-l".to_string(), "-c".to_string()])
             } else {
@@ -1099,6 +1104,14 @@ impl DockerRuntime {
         Ok(())
     }
 
+    /// Build a Docker image from a Dockerfile.
+    ///
+    /// The build context is the **parent directory** of `dockerfile`, and the
+    /// Dockerfile is referenced by its filename (the last path component).
+    /// Callers must ensure the Dockerfile lives at the top level of the intended
+    /// build context; if the Dockerfile is in a subdirectory, the context will
+    /// be scoped to that subdirectory and COPY instructions referencing files
+    /// outside it will fail.
     async fn build_image_inner(&self, dockerfile: &Path, tag: &str) -> Result<(), ContainerError> {
         let context_dir = dockerfile.parent().unwrap_or(Path::new("."));
 

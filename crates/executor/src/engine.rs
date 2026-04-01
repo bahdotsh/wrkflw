@@ -538,9 +538,14 @@ impl From<String> for ExecutionError {
 
 /// The result of preparing an action — either a Docker image to run or a composite action.
 enum PreparedAction {
-    /// Docker action: run with image's native entrypoint (empty cmd).
+    /// Docker action: run with the image's native entrypoint/CMD, optionally
+    /// overridden by `runs.entrypoint` and `runs.args` from action.yml.
     /// Used for DockerBuild and Docker registry actions.
-    NativeDocker { image: String },
+    NativeDocker {
+        image: String,
+        entrypoint: Option<String>,
+        args: Vec<String>,
+    },
     /// A Docker image name to run a command in (legacy path for special-cased actions).
     Image(String),
     /// A composite action that needs special step-based execution.
@@ -563,6 +568,8 @@ async fn prepare_action(
 
         return Ok(PreparedAction::NativeDocker {
             image: image.to_string(),
+            entrypoint: None,
+            args: vec![],
         });
     }
 
@@ -587,7 +594,19 @@ async fn prepare_action(
                 .await
                 .map_err(|e| ExecutionError::Runtime(format!("Failed to build image: {}", e)))?;
 
-            return Ok(PreparedAction::Image(tag));
+            // Parse action.yml if present for entrypoint/args
+            let definition: Option<serde_yaml::Value> =
+                std::fs::read_to_string(action_dir.join("action.yml"))
+                    .or_else(|_| std::fs::read_to_string(action_dir.join("action.yaml")))
+                    .ok()
+                    .and_then(|s| serde_yaml::from_str(&s).ok());
+            let (entrypoint, args) = extract_docker_runs_config(&definition);
+
+            return Ok(PreparedAction::NativeDocker {
+                image: tag,
+                entrypoint,
+                args,
+            });
         } else {
             // It's a JavaScript or composite action
             // For simplicity, we'll use node to run it (this would need more work for full support)
@@ -618,8 +637,11 @@ async fn prepare_action(
                         "Resolved action '{}' -> Docker image '{}'",
                         action.repository, image
                     ));
+                    let (entrypoint, args) = extract_docker_runs_config(&resolved.definition);
                     return Ok(PreparedAction::NativeDocker {
                         image: image.clone(),
+                        entrypoint,
+                        args,
                     });
                 }
                 action_resolver::ActionType::Composite => {
@@ -650,30 +672,48 @@ async fn prepare_action(
                     };
 
                     // Get the Dockerfile path from action.yml's runs.image field.
-                    // Sanitize: strip docker:// prefix, leading slashes, and
-                    // reject path traversal to prevent escaping the action dir.
-                    let dockerfile_rel = resolved
+                    let dockerfile_raw = resolved
                         .definition
                         .as_ref()
                         .and_then(|d| d.get("runs"))
                         .and_then(|r| r.get("image"))
                         .and_then(|i| i.as_str())
-                        .unwrap_or("Dockerfile")
-                        .trim_start_matches("docker://")
-                        .trim_start_matches('/');
+                        .unwrap_or("Dockerfile");
 
-                    if dockerfile_rel.split('/').any(|c| c == "..") {
-                        return Err(ExecutionError::Execution(format!(
-                            "Invalid Dockerfile path '{}' for action '{}': path traversal not allowed",
-                            dockerfile_rel, action.repository
-                        )));
-                    }
+                    let dockerfile_rel = sanitize_dockerfile_rel(dockerfile_raw).map_err(|e| {
+                        ExecutionError::Execution(format!(
+                            "Invalid Dockerfile path for action '{}': {}",
+                            action.repository, e
+                        ))
+                    })?;
 
                     let dockerfile = action_dir.join(dockerfile_rel);
 
                     if !dockerfile.exists() {
                         return Err(ExecutionError::Execution(format!(
                             "Dockerfile not found at {} for action '{}'",
+                            dockerfile.display(),
+                            action.repository
+                        )));
+                    }
+
+                    // Defense-in-depth: verify the resolved Dockerfile is
+                    // still inside the action directory after symlink resolution.
+                    let canon_dockerfile = dockerfile.canonicalize().map_err(|e| {
+                        ExecutionError::Execution(format!(
+                            "Failed to canonicalize Dockerfile path: {}",
+                            e
+                        ))
+                    })?;
+                    let canon_action_dir = action_dir.canonicalize().map_err(|e| {
+                        ExecutionError::Execution(format!(
+                            "Failed to canonicalize action directory: {}",
+                            e
+                        ))
+                    })?;
+                    if !canon_dockerfile.starts_with(&canon_action_dir) {
+                        return Err(ExecutionError::Execution(format!(
+                            "Dockerfile path '{}' escapes action directory for action '{}'",
                             dockerfile.display(),
                             action.repository
                         )));
@@ -688,7 +728,12 @@ async fn prepare_action(
                         ))
                     })?;
 
-                    return Ok(PreparedAction::NativeDocker { image: tag });
+                    let (entrypoint, args) = extract_docker_runs_config(&resolved.definition);
+                    return Ok(PreparedAction::NativeDocker {
+                        image: tag,
+                        entrypoint,
+                        args,
+                    });
                 }
             },
             Err(e) => {
@@ -703,6 +748,45 @@ async fn prepare_action(
     // Fallback: determine appropriate image based on hardcoded action type mapping
     let image = determine_action_image(&action.repository);
     Ok(PreparedAction::Image(image))
+}
+
+/// Sanitize a Dockerfile path from an action.yml `runs.image` field.
+///
+/// Strips the `docker://` prefix and leading slashes, then rejects any
+/// path component that is exactly `..` to prevent directory traversal.
+fn sanitize_dockerfile_rel(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim_start_matches("docker://").trim_start_matches('/');
+    if trimmed.split('/').any(|c| c == "..") {
+        return Err(format!("path traversal not allowed: {}", trimmed));
+    }
+    Ok(trimmed.to_string())
+}
+
+/// Extract `runs.entrypoint` and `runs.args` from a parsed action.yml definition.
+///
+/// These fields allow Docker actions to override the image's default ENTRYPOINT
+/// and provide arguments that are passed as CMD.
+fn extract_docker_runs_config(
+    definition: &Option<serde_yaml::Value>,
+) -> (Option<String>, Vec<String>) {
+    let runs = definition.as_ref().and_then(|d| d.get("runs"));
+
+    let entrypoint = runs
+        .and_then(|r| r.get("entrypoint"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let args = runs
+        .and_then(|r| r.get("args"))
+        .and_then(|v| v.as_sequence())
+        .map(|seq| {
+            seq.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    (entrypoint, args)
 }
 
 /// Shallow-clone a GitHub repository at a specific ref (branch, tag, or SHA).
@@ -1558,12 +1642,27 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                         .await?
                     }
                 }
-                PreparedAction::NativeDocker { image } => {
-                    // Docker action: run with the image's built-in entrypoint.
-                    // Convert 'with' parameters to INPUT_* environment variables
+                PreparedAction::NativeDocker {
+                    image,
+                    entrypoint,
+                    args,
+                } => {
+                    // Docker action: run with the image's built-in entrypoint,
+                    // optionally overridden by runs.entrypoint / runs.args from action.yml.
+
+                    // Convert 'with' parameters to INPUT_* environment variables.
+                    // Also extract 'with.args' — if provided by the workflow step, it
+                    // overrides the action.yml's runs.args as the container CMD
+                    // (this matches GitHub Actions behavior).
+                    let mut with_args_override: Option<String> = None;
                     if let Some(with_params) = &ctx.step.with {
                         for (key, value) in with_params {
                             step_env.insert(format!("INPUT_{}", key.to_uppercase()), value.clone());
+                        }
+                        if let Some(a) = with_params.get("args") {
+                            if !a.is_empty() {
+                                with_args_override = Some(a.clone());
+                            }
                         }
                     }
 
@@ -1595,10 +1694,25 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                         uses, image
                     ));
 
-                    // Run with empty cmd to use the image's native ENTRYPOINT/CMD
+                    // Determine container CMD: workflow `with.args` overrides action.yml `runs.args`.
+                    // If neither is specified, the image's built-in CMD takes effect.
+                    let effective_args: Vec<String> = if let Some(ref wa) = with_args_override {
+                        wa.split_whitespace().map(|s| s.to_string()).collect()
+                    } else {
+                        args
+                    };
+                    let args_refs: Vec<&str> = effective_args.iter().map(|s| s.as_str()).collect();
+
                     let output = ctx
                         .runtime
-                        .run_container(&image, &[], &env_vars, container_workspace, &volumes)
+                        .run_container(
+                            &image,
+                            &args_refs,
+                            &env_vars,
+                            container_workspace,
+                            &volumes,
+                            entrypoint.as_deref(),
+                        )
                         .await
                         .map_err(|e| ExecutionError::Runtime(format!("{}", e)))?;
 
@@ -1916,6 +2030,7 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                             &env_vars,
                             container_workspace,
                             &volumes,
+                            None,
                         )
                         .await
                         .map_err(|e| ExecutionError::Runtime(format!("{}", e)))?;
@@ -2059,6 +2174,7 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                 &env_vars,
                 container_workspace,
                 &volumes,
+                None,
             )
             .await
         {
@@ -3646,27 +3762,121 @@ mod tests {
     // --- PreparedAction / NativeDocker tests ---
 
     #[test]
-    fn prepared_action_native_docker_stores_image() {
+    fn prepared_action_native_docker_stores_fields() {
         let pa = PreparedAction::NativeDocker {
             image: "ghcr.io/super-linter:latest".to_string(),
+            entrypoint: Some("/entrypoint.sh".to_string()),
+            args: vec!["--flag".to_string(), "value".to_string()],
         };
         match pa {
-            PreparedAction::NativeDocker { image } => {
+            PreparedAction::NativeDocker {
+                image,
+                entrypoint,
+                args,
+            } => {
                 assert_eq!(image, "ghcr.io/super-linter:latest");
+                assert_eq!(entrypoint.as_deref(), Some("/entrypoint.sh"));
+                assert_eq!(args, vec!["--flag", "value"]);
             }
             _ => panic!("expected NativeDocker variant"),
         }
     }
 
-    // --- Dockerfile path sanitization tests ---
-
-    fn sanitize_dockerfile_rel(raw: &str) -> Result<String, String> {
-        let trimmed = raw.trim_start_matches("docker://").trim_start_matches('/');
-        if trimmed.split('/').any(|c| c == "..") {
-            return Err(format!("path traversal not allowed: {}", trimmed));
+    #[test]
+    fn prepared_action_native_docker_defaults() {
+        let pa = PreparedAction::NativeDocker {
+            image: "alpine:latest".to_string(),
+            entrypoint: None,
+            args: vec![],
+        };
+        match pa {
+            PreparedAction::NativeDocker {
+                entrypoint, args, ..
+            } => {
+                assert!(entrypoint.is_none());
+                assert!(args.is_empty());
+            }
+            _ => panic!("expected NativeDocker variant"),
         }
-        Ok(trimmed.to_string())
     }
+
+    // --- extract_docker_runs_config tests ---
+
+    #[test]
+    fn extract_runs_config_with_entrypoint_and_args() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+runs:
+  using: docker
+  image: Dockerfile
+  entrypoint: /entrypoint.sh
+  args:
+    - --flag
+    - value
+"#,
+        )
+        .unwrap();
+        let (ep, args) = extract_docker_runs_config(&Some(yaml));
+        assert_eq!(ep.as_deref(), Some("/entrypoint.sh"));
+        assert_eq!(args, vec!["--flag", "value"]);
+    }
+
+    #[test]
+    fn extract_runs_config_missing_both() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+runs:
+  using: docker
+  image: Dockerfile
+"#,
+        )
+        .unwrap();
+        let (ep, args) = extract_docker_runs_config(&Some(yaml));
+        assert!(ep.is_none());
+        assert!(args.is_empty());
+    }
+
+    #[test]
+    fn extract_runs_config_none_definition() {
+        let (ep, args) = extract_docker_runs_config(&None);
+        assert!(ep.is_none());
+        assert!(args.is_empty());
+    }
+
+    #[test]
+    fn extract_runs_config_entrypoint_only() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+runs:
+  using: docker
+  image: Dockerfile
+  entrypoint: /custom.sh
+"#,
+        )
+        .unwrap();
+        let (ep, args) = extract_docker_runs_config(&Some(yaml));
+        assert_eq!(ep.as_deref(), Some("/custom.sh"));
+        assert!(args.is_empty());
+    }
+
+    #[test]
+    fn extract_runs_config_args_only() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+runs:
+  using: docker
+  image: Dockerfile
+  args:
+    - hello
+"#,
+        )
+        .unwrap();
+        let (ep, args) = extract_docker_runs_config(&Some(yaml));
+        assert!(ep.is_none());
+        assert_eq!(args, vec!["hello"]);
+    }
+
+    // --- Dockerfile path sanitization tests ---
 
     #[test]
     fn dockerfile_rel_strips_docker_prefix() {

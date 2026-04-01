@@ -172,6 +172,7 @@ mod emulation_cleanup_tests {
                 &[],
                 Path::new("/"),
                 &[(Path::new("."), Path::new("/github/workspace"))],
+                None,
             )
             .await;
             

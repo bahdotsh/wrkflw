@@ -915,7 +915,8 @@ impl DockerRuntime {
         // Create container config with platform-specific settings
         let mut config = Config {
             image: Some(image.to_string()),
-            cmd: Some(cmd_vec),
+            // Empty cmd means "use the image's built-in ENTRYPOINT/CMD"
+            cmd: if cmd_vec.is_empty() { None } else { Some(cmd_vec) },
             env: Some(env),
             working_dir: Some(working_dir.to_string_lossy().to_string()),
             host_config: Some(host_config),
@@ -1095,50 +1096,30 @@ impl DockerRuntime {
     }
 
     async fn build_image_inner(&self, dockerfile: &Path, tag: &str) -> Result<(), ContainerError> {
-        let _context_dir = dockerfile.parent().unwrap_or(Path::new("."));
+        let context_dir = dockerfile.parent().unwrap_or(Path::new("."));
+
+        if !dockerfile.exists() {
+            return Err(ContainerError::ImageBuild(format!(
+                "Cannot open Dockerfile at {}",
+                dockerfile.display()
+            )));
+        }
+
+        // Determine the Dockerfile's filename relative to the context directory.
+        let dockerfile_name = dockerfile
+            .file_name()
+            .map(|f| f.to_string_lossy().to_string())
+            .unwrap_or_else(|| "Dockerfile".to_string());
 
         let tar_buffer = {
             let mut tar_builder = tar::Builder::new(Vec::new());
 
-            // Add Dockerfile to tar
-            if let Ok(file) = std::fs::File::open(dockerfile) {
-                let mut header = tar::Header::new_gnu();
-                let metadata = file.metadata().map_err(|e| {
-                    ContainerError::ContainerExecution(format!(
-                        "Failed to get file metadata: {}",
-                        e
-                    ))
-                })?;
-                let modified_time = metadata
-                    .modified()
-                    .map_err(|e| {
-                        ContainerError::ContainerExecution(format!(
-                            "Failed to get file modification time: {}",
-                            e
-                        ))
-                    })?
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_err(|e| {
-                        ContainerError::ContainerExecution(format!(
-                            "Failed to convert modification time to Unix timestamp: {}",
-                            e
-                        ))
-                    })?
-                    .as_secs();
-                header.set_size(metadata.len());
-                header.set_mode(0o644);
-                header.set_mtime(modified_time);
-                header.set_cksum();
-
-                tar_builder
-                    .append_data(&mut header, "Dockerfile", file)
-                    .map_err(|e| ContainerError::ImageBuild(e.to_string()))?;
-            } else {
-                return Err(ContainerError::ImageBuild(format!(
-                    "Cannot open Dockerfile at {}",
-                    dockerfile.display()
-                )));
-            }
+            // Include the full context directory so COPY instructions work.
+            tar_builder
+                .append_dir_all(".", context_dir)
+                .map_err(|e| ContainerError::ImageBuild(format!(
+                    "Failed to create build context tar: {}", e
+                )))?;
 
             tar_builder
                 .into_inner()
@@ -1146,7 +1127,7 @@ impl DockerRuntime {
         };
 
         let options = bollard::image::BuildImageOptions {
-            dockerfile: "Dockerfile",
+            dockerfile: dockerfile_name.as_str(),
             t: tag,
             q: false,
             nocache: false,

@@ -3,6 +3,11 @@ use std::path::Path;
 
 #[async_trait]
 pub trait ContainerRuntime {
+    /// Run a command inside a container.
+    ///
+    /// If `cmd` is empty (`&[]`), the container runs with the image's built-in
+    /// ENTRYPOINT/CMD. This is used for Docker-type GitHub Actions whose
+    /// entrypoint is baked into the image.
     async fn run_container(
         &self,
         image: &str,

@@ -169,9 +169,19 @@ impl ContainerRuntime for EmulationRuntime {
         wrkflw_logging::info(&format!("Command length: {}", command.len()));
 
         if command.is_empty() {
-            return Err(ContainerError::ContainerExecution(
-                "Empty command array".to_string(),
-            ));
+            // Empty cmd means "use the image's built-in ENTRYPOINT/CMD".
+            // Emulation mode cannot run Docker images natively, so return
+            // a descriptive message instead of erroring.
+            wrkflw_logging::warning(
+                "Emulation mode cannot run Docker actions with native entrypoints. \
+                 Use --runtime docker for full Docker action support.",
+            );
+            return Ok(ContainerOutput {
+                stdout: "Emulation mode: Docker action would run with image's native entrypoint"
+                    .to_string(),
+                stderr: String::new(),
+                exit_code: 0,
+            });
         }
 
         // Print each command part separately for debugging

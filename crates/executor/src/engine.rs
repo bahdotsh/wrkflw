@@ -538,7 +538,10 @@ impl From<String> for ExecutionError {
 
 /// The result of preparing an action — either a Docker image to run or a composite action.
 enum PreparedAction {
-    /// A Docker image name to pull and run the action in.
+    /// Docker action: run with image's native entrypoint (empty cmd).
+    /// Used for DockerBuild and Docker registry actions.
+    NativeDocker { image: String },
+    /// A Docker image name to run a command in (legacy path for special-cased actions).
     Image(String),
     /// A composite action that needs special step-based execution.
     Composite,
@@ -610,10 +613,12 @@ async fn prepare_action(
                 }
                 action_resolver::ActionType::Docker { image } => {
                     wrkflw_logging::info(&format!(
-                        "Resolved action '{}' -> image '{}'",
+                        "Resolved action '{}' -> Docker image '{}'",
                         action.repository, image
                     ));
-                    return Ok(PreparedAction::Image(image.clone()));
+                    return Ok(PreparedAction::NativeDocker {
+                        image: image.clone(),
+                    });
                 }
                 action_resolver::ActionType::Composite => {
                     wrkflw_logging::info(&format!(
@@ -623,11 +628,55 @@ async fn prepare_action(
                     return Ok(PreparedAction::Composite);
                 }
                 action_resolver::ActionType::DockerBuild => {
-                    return Err(ExecutionError::Execution(format!(
-                        "Action '{}' bundles its own Dockerfile (runs.image = Dockerfile). \
-                             Building remote Dockerfiles is not yet supported.",
+                    wrkflw_logging::info(&format!(
+                        "Resolved action '{}' as DockerBuild — cloning and building",
                         action.repository
-                    )));
+                    ));
+
+                    // Clone the repository
+                    let tempdir = tempfile::tempdir().map_err(|e| {
+                        ExecutionError::Execution(format!("Failed to create temp dir: {}", e))
+                    })?;
+                    let repo_url =
+                        format!("https://github.com/{}.git", action.repository);
+                    let repo_dir = tempdir.path().join("action");
+                    shallow_clone(&repo_url, &action.version, &repo_dir).await?;
+
+                    // Resolve the action directory (respecting sub_path)
+                    let action_dir = match &action.sub_path {
+                        Some(p) => repo_dir.join(p),
+                        None => repo_dir.clone(),
+                    };
+
+                    // Get the Dockerfile path from action.yml's runs.image field
+                    let dockerfile_rel = resolved
+                        .definition
+                        .as_ref()
+                        .and_then(|d| d.get("runs"))
+                        .and_then(|r| r.get("image"))
+                        .and_then(|i| i.as_str())
+                        .unwrap_or("Dockerfile")
+                        .trim_start_matches("docker://");
+                    let dockerfile = action_dir.join(dockerfile_rel);
+
+                    if !dockerfile.exists() {
+                        return Err(ExecutionError::Execution(format!(
+                            "Dockerfile not found at {} for action '{}'",
+                            dockerfile.display(),
+                            action.repository
+                        )));
+                    }
+
+                    // Build the image
+                    let tag = format!("wrkflw-action:{}", uuid::Uuid::new_v4());
+                    runtime.build_image(&dockerfile, &tag).await.map_err(|e| {
+                        ExecutionError::Runtime(format!(
+                            "Failed to build Dockerfile for action '{}': {}",
+                            action.repository, e
+                        ))
+                    })?;
+
+                    return Ok(PreparedAction::NativeDocker { image: tag });
                 }
             },
             Err(e) => {
@@ -1495,6 +1544,63 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                             ctx.verbose,
                         )
                         .await?
+                    }
+                }
+                PreparedAction::NativeDocker { image } => {
+                    // Docker action: run with the image's built-in entrypoint.
+                    // Convert 'with' parameters to INPUT_* environment variables
+                    if let Some(with_params) = &ctx.step.with {
+                        for (key, value) in with_params {
+                            step_env.insert(format!("INPUT_{}", key.to_uppercase()), value.clone());
+                        }
+                    }
+
+                    // Define the standard workspace path inside the container
+                    let container_workspace = Path::new("/github/workspace");
+
+                    // Set up volume mapping from host working dir to container workspace
+                    let mut volumes: Vec<(&Path, &Path)> =
+                        vec![(ctx.working_dir, container_workspace)];
+
+                    // Prepare container mounts and remap GitHub env paths
+                    let (owned_volume_paths, github_mount) =
+                        prepare_container_mounts(&mut step_env, ctx.job_env, ctx.container_config);
+                    if let Some((ref host, ref container)) = github_mount {
+                        volumes.push((host.as_path(), container.as_path()));
+                    }
+                    for (host, container) in &owned_volume_paths {
+                        volumes.push((host.as_path(), container.as_path()));
+                    }
+
+                    // Convert environment HashMap to Vec<(&str, &str)> for container runtime
+                    let env_vars: Vec<(&str, &str)> = step_env
+                        .iter()
+                        .map(|(k, v)| (k.as_str(), v.as_str()))
+                        .collect();
+
+                    wrkflw_logging::info(&format!(
+                        "Running Docker action '{}' with image '{}'",
+                        uses, image
+                    ));
+
+                    // Run with empty cmd to use the image's native ENTRYPOINT/CMD
+                    let output = ctx
+                        .runtime
+                        .run_container(&image, &[], &env_vars, container_workspace, &volumes)
+                        .await
+                        .map_err(|e| ExecutionError::Runtime(format!("{}", e)))?;
+
+                    StepResult {
+                        name: step_name,
+                        status: if output.exit_code == 0 {
+                            StepStatus::Success
+                        } else {
+                            StepStatus::Failure
+                        },
+                        output: format!(
+                            "Exit code: {}\n{}\n{}",
+                            output.exit_code, output.stdout, output.stderr
+                        ),
                     }
                 }
                 PreparedAction::Image(image) => {

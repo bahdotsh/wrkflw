@@ -723,7 +723,8 @@ impl PodmanRuntime {
         // Add the image
         args.push(image);
 
-        // Add the command
+        // Add the command. If cmd is empty, nothing is appended and the
+        // image's built-in ENTRYPOINT/CMD is used.
         args.extend(cmd);
 
         // Track the container (even though we use --rm, track it for consistency)

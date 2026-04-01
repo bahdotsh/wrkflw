@@ -756,6 +756,9 @@ async fn prepare_action(
 /// path component that is exactly `..` to prevent directory traversal.
 fn sanitize_dockerfile_rel(raw: &str) -> Result<String, String> {
     let trimmed = raw.trim_start_matches("docker://").trim_start_matches('/');
+    if trimmed.is_empty() {
+        return Err("empty Dockerfile path".to_string());
+    }
     if trimmed.split('/').any(|c| c == "..") {
         return Err(format!("path traversal not allowed: {}", trimmed));
     }
@@ -1697,7 +1700,9 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                     // Determine container CMD: workflow `with.args` overrides action.yml `runs.args`.
                     // If neither is specified, the image's built-in CMD takes effect.
                     let effective_args: Vec<String> = if let Some(ref wa) = with_args_override {
-                        wa.split_whitespace().map(|s| s.to_string()).collect()
+                        shlex::split(wa).unwrap_or_else(|| {
+                            wa.split_whitespace().map(|s| s.to_string()).collect()
+                        })
                     } else {
                         args
                     };
@@ -3924,5 +3929,15 @@ runs:
             sanitize_dockerfile_rel("foo..bar/Dockerfile").unwrap(),
             "foo..bar/Dockerfile"
         );
+    }
+
+    #[test]
+    fn dockerfile_rel_rejects_empty_string() {
+        assert!(sanitize_dockerfile_rel("").is_err());
+    }
+
+    #[test]
+    fn dockerfile_rel_rejects_docker_prefix_only() {
+        assert!(sanitize_dockerfile_rel("docker://").is_err());
     }
 }

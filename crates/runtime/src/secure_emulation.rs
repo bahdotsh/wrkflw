@@ -47,8 +47,16 @@ impl ContainerRuntime for SecureEmulationRuntime {
         env_vars: &[(&str, &str)],
         working_dir: &Path,
         _volumes: &[(&Path, &Path)],
-        _entrypoint: Option<&str>,
+        entrypoint: Option<&str>,
     ) -> Result<ContainerOutput, ContainerError> {
+        if let Some(ep) = entrypoint {
+            wrkflw_logging::warning(&format!(
+                "Secure emulation mode ignoring entrypoint override '{}' for image '{}'. \
+                 Use --runtime docker for full Docker action support.",
+                ep, image
+            ));
+        }
+
         wrkflw_logging::info(&format!(
             "🔒 Executing sandboxed command: {} (image: {})",
             command.join(" "),

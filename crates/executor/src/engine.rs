@@ -2317,7 +2317,10 @@ fn prepare_container_mounts(
             let parts: Vec<&str> = vol_spec.splitn(3, ':').collect();
             // Check host path for path traversal (only the host component, not the full spec)
             let host_path = parts[0];
-            if host_path.contains("..") {
+            if std::path::Path::new(host_path)
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+            {
                 wrkflw_logging::warning(&format!(
                     "Skipping volume with path traversal in host path: {}",
                     vol_spec
@@ -2928,7 +2931,8 @@ fn convert_yaml_to_step(step_yaml: &serde_yaml::Value) -> Result<workflow::Step,
 /// This is a simplified implementation that handles basic GitHub Actions expressions.
 /// Note: step-level expressions like `steps.<id>.outcome`, `success()`, `failure()`,
 /// `always()`, and `cancelled()` are not yet fully supported — a warning is emitted
-/// and the condition defaults to true.
+/// and the condition defaults to its most likely state (`always()`/`success()` → true,
+/// `failure()`/`cancelled()` → false).
 fn evaluate_job_condition(
     condition: &str,
     env_context: &HashMap<String, String>,
@@ -2936,22 +2940,44 @@ fn evaluate_job_condition(
 ) -> bool {
     wrkflw_logging::debug(&format!("Evaluating condition: {}", condition));
 
-    // Warn about step-level expressions we can't properly evaluate yet
-    let unsupported_patterns = [
-        "steps.",
-        "success()",
-        "failure()",
-        "always()",
-        "cancelled()",
-    ];
-    for pattern in &unsupported_patterns {
-        if condition.contains(pattern) {
-            wrkflw_logging::warning(&format!(
-                "Condition '{}' uses '{}' which is not fully supported in local execution — defaulting to true",
-                condition, pattern
-            ));
-            return true;
-        }
+    // Handle step-level status functions with appropriate defaults
+    // always() → true (run regardless), success() → true (optimistic default),
+    // failure()/cancelled() → false (these states are uncommon),
+    // steps.<id>.outcome → true (optimistic, can't track step state yet)
+    if condition.contains("always()") {
+        wrkflw_logging::warning(&format!(
+            "Condition '{}' uses 'always()' which is not fully supported in local execution — defaulting to true",
+            condition
+        ));
+        return true;
+    }
+    if condition.contains("success()") {
+        wrkflw_logging::warning(&format!(
+            "Condition '{}' uses 'success()' which is not fully supported in local execution — defaulting to true",
+            condition
+        ));
+        return true;
+    }
+    if condition.contains("failure()") {
+        wrkflw_logging::warning(&format!(
+            "Condition '{}' uses 'failure()' which is not fully supported in local execution — defaulting to false",
+            condition
+        ));
+        return false;
+    }
+    if condition.contains("cancelled()") {
+        wrkflw_logging::warning(&format!(
+            "Condition '{}' uses 'cancelled()' which is not fully supported in local execution — defaulting to false",
+            condition
+        ));
+        return false;
+    }
+    if condition.contains("steps.") {
+        wrkflw_logging::warning(&format!(
+            "Condition '{}' uses step references which are not fully supported in local execution — defaulting to true",
+            condition
+        ));
+        return true;
     }
 
     // For now, implement basic pattern matching for common conditions
@@ -3374,10 +3400,10 @@ mod tests {
     }
 
     #[test]
-    fn condition_failure_function_defaults_true() {
+    fn condition_failure_function_defaults_false() {
         let env = HashMap::new();
         let wf = empty_workflow();
-        assert!(evaluate_job_condition("failure()", &env, &wf));
+        assert!(!evaluate_job_condition("failure()", &env, &wf));
     }
 
     #[test]
@@ -3388,24 +3414,24 @@ mod tests {
     }
 
     #[test]
-    fn condition_cancelled_function_defaults_true() {
+    fn condition_cancelled_function_defaults_false() {
         let env = HashMap::new();
         let wf = empty_workflow();
-        assert!(evaluate_job_condition("cancelled()", &env, &wf));
+        assert!(!evaluate_job_condition("cancelled()", &env, &wf));
     }
 
     // --- volume path traversal tests ---
 
+    fn has_path_traversal(host_path: &str) -> bool {
+        std::path::Path::new(host_path)
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    }
+
     #[test]
     fn volume_traversal_check_rejects_host_traversal() {
-        // Simulate the check: only host path component (parts[0]) is checked
-        let vol_spec = "../../../etc/passwd:/data";
-        let parts: Vec<&str> = vol_spec.splitn(3, ':').collect();
-        let host_path = parts[0];
-        assert!(
-            host_path.contains(".."),
-            "host path traversal should be detected"
-        );
+        assert!(has_path_traversal("../../../etc/passwd"));
+        assert!(has_path_traversal("/safe/../etc/passwd"));
     }
 
     #[test]
@@ -3413,10 +3439,12 @@ mod tests {
         // Container path with ".." in it should NOT trigger the host check
         let vol_spec = "/safe/host:/container/..weird";
         let parts: Vec<&str> = vol_spec.splitn(3, ':').collect();
-        let host_path = parts[0];
-        assert!(
-            !host_path.contains(".."),
-            "container path dots should not affect host check"
-        );
+        assert!(!has_path_traversal(parts[0]));
+    }
+
+    #[test]
+    fn volume_traversal_allows_double_dot_prefix_dir() {
+        // A directory literally named "..hidden" is not path traversal
+        assert!(!has_path_traversal("/data/..hidden/files"));
     }
 }

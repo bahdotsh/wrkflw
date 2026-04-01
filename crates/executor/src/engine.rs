@@ -637,8 +637,7 @@ async fn prepare_action(
                     let tempdir = tempfile::tempdir().map_err(|e| {
                         ExecutionError::Execution(format!("Failed to create temp dir: {}", e))
                     })?;
-                    let repo_url =
-                        format!("https://github.com/{}.git", action.repository);
+                    let repo_url = format!("https://github.com/{}.git", action.repository);
                     let repo_dir = tempdir.path().join("action");
                     shallow_clone(&repo_url, &action.version, &repo_dir).await?;
 
@@ -648,7 +647,9 @@ async fn prepare_action(
                         None => repo_dir.clone(),
                     };
 
-                    // Get the Dockerfile path from action.yml's runs.image field
+                    // Get the Dockerfile path from action.yml's runs.image field.
+                    // Sanitize: strip docker:// prefix, leading slashes, and
+                    // reject path traversal to prevent escaping the action dir.
                     let dockerfile_rel = resolved
                         .definition
                         .as_ref()
@@ -656,7 +657,16 @@ async fn prepare_action(
                         .and_then(|r| r.get("image"))
                         .and_then(|i| i.as_str())
                         .unwrap_or("Dockerfile")
-                        .trim_start_matches("docker://");
+                        .trim_start_matches("docker://")
+                        .trim_start_matches('/');
+
+                    if dockerfile_rel.contains("..") {
+                        return Err(ExecutionError::Execution(format!(
+                            "Invalid Dockerfile path '{}' for action '{}': path traversal not allowed",
+                            dockerfile_rel, action.repository
+                        )));
+                    }
+
                     let dockerfile = action_dir.join(dockerfile_rel);
 
                     if !dockerfile.exists() {
@@ -3629,5 +3639,69 @@ mod tests {
     fn volume_traversal_allows_double_dot_prefix_dir() {
         // A directory literally named "..hidden" is not path traversal
         assert!(!has_path_traversal("/data/..hidden/files"));
+    }
+
+    // --- PreparedAction / NativeDocker tests ---
+
+    #[test]
+    fn prepared_action_native_docker_stores_image() {
+        let pa = PreparedAction::NativeDocker {
+            image: "ghcr.io/super-linter:latest".to_string(),
+        };
+        match pa {
+            PreparedAction::NativeDocker { image } => {
+                assert_eq!(image, "ghcr.io/super-linter:latest");
+            }
+            _ => panic!("expected NativeDocker variant"),
+        }
+    }
+
+    // --- Dockerfile path sanitization tests ---
+
+    fn sanitize_dockerfile_rel(raw: &str) -> Result<String, String> {
+        let trimmed = raw.trim_start_matches("docker://").trim_start_matches('/');
+        if trimmed.contains("..") {
+            return Err(format!("path traversal not allowed: {}", trimmed));
+        }
+        Ok(trimmed.to_string())
+    }
+
+    #[test]
+    fn dockerfile_rel_strips_docker_prefix() {
+        assert_eq!(
+            sanitize_dockerfile_rel("docker://Dockerfile").unwrap(),
+            "Dockerfile"
+        );
+    }
+
+    #[test]
+    fn dockerfile_rel_strips_leading_slash() {
+        assert_eq!(
+            sanitize_dockerfile_rel("docker:///etc/Dockerfile").unwrap(),
+            "etc/Dockerfile"
+        );
+    }
+
+    #[test]
+    fn dockerfile_rel_rejects_dotdot_traversal() {
+        assert!(sanitize_dockerfile_rel("docker://../../etc/passwd").is_err());
+    }
+
+    #[test]
+    fn dockerfile_rel_rejects_dotdot_in_middle() {
+        assert!(sanitize_dockerfile_rel("subdir/../../../etc/shadow").is_err());
+    }
+
+    #[test]
+    fn dockerfile_rel_plain_dockerfile() {
+        assert_eq!(sanitize_dockerfile_rel("Dockerfile").unwrap(), "Dockerfile");
+    }
+
+    #[test]
+    fn dockerfile_rel_relative_path() {
+        assert_eq!(
+            sanitize_dockerfile_rel("./build/Dockerfile").unwrap(),
+            "./build/Dockerfile"
+        );
     }
 }

@@ -865,6 +865,7 @@ impl DockerRuntime {
 
         // Convert command vector to Vec<String>
         let cmd_vec: Vec<String> = cmd.iter().map(|&s| s.to_string()).collect();
+        let has_cmd = !cmd_vec.is_empty();
 
         wrkflw_logging::debug(&format!("Running command in Docker: {:?}", cmd_vec));
         wrkflw_logging::debug(&format!("Environment: {:?}", env));
@@ -916,7 +917,7 @@ impl DockerRuntime {
         let mut config = Config {
             image: Some(image.to_string()),
             // Empty cmd means "use the image's built-in ENTRYPOINT/CMD"
-            cmd: if cmd_vec.is_empty() { None } else { Some(cmd_vec) },
+            cmd: if has_cmd { Some(cmd_vec) } else { None },
             env: Some(env),
             working_dir: Some(working_dir.to_string_lossy().to_string()),
             host_config: Some(host_config),
@@ -926,8 +927,11 @@ impl DockerRuntime {
             } else {
                 None // Don't specify user for macOS emulation - use default root user
             },
-            // Map appropriate entrypoint for different platforms
-            entrypoint: if is_macos_emu {
+            // Map appropriate entrypoint for different platforms.
+            // Only override when there is an explicit command to wrap;
+            // an empty cmd means "use the image's native ENTRYPOINT/CMD"
+            // and overriding it with bash would hang or discard the real entrypoint.
+            entrypoint: if is_macos_emu && has_cmd {
                 // For macOS, ensure we use bash
                 Some(vec!["bash".to_string(), "-l".to_string(), "-c".to_string()])
             } else {
@@ -1115,11 +1119,9 @@ impl DockerRuntime {
             let mut tar_builder = tar::Builder::new(Vec::new());
 
             // Include the full context directory so COPY instructions work.
-            tar_builder
-                .append_dir_all(".", context_dir)
-                .map_err(|e| ContainerError::ImageBuild(format!(
-                    "Failed to create build context tar: {}", e
-                )))?;
+            tar_builder.append_dir_all(".", context_dir).map_err(|e| {
+                ContainerError::ImageBuild(format!("Failed to create build context tar: {}", e))
+            })?;
 
             tar_builder
                 .into_inner()

@@ -177,10 +177,11 @@ impl ContainerRuntime for EmulationRuntime {
                  Use --runtime docker for full Docker action support.",
             );
             return Ok(ContainerOutput {
-                stdout: "Emulation mode: Docker action would run with image's native entrypoint"
+                stdout: String::new(),
+                stderr: "Emulation mode: skipped Docker action (requires --runtime docker). \
+                         The action was NOT executed."
                     .to_string(),
-                stderr: String::new(),
-                exit_code: 0,
+                exit_code: 1,
             });
         }
 
@@ -857,5 +858,27 @@ mod tests {
 
         let output = result.expect("non-zero exit should return Ok, not Err");
         assert_eq!(output.exit_code, 42);
+    }
+
+    #[tokio::test]
+    async fn test_empty_cmd_returns_failure_in_emulation() {
+        let runtime = EmulationRuntime::new();
+        let result = runtime
+            .run_container(
+                "some-action:latest",
+                &[],
+                &[],
+                Path::new("."),
+                &[(Path::new("."), Path::new("/github/workspace"))],
+            )
+            .await;
+
+        let output = result.expect("empty cmd should return Ok with exit_code 1, not Err");
+        assert_eq!(output.exit_code, 1, "empty cmd should signal failure");
+        assert!(
+            output.stderr.contains("skipped Docker action"),
+            "stderr should explain the action was not executed"
+        );
+        assert!(output.stdout.is_empty(), "stdout should be empty");
     }
 }

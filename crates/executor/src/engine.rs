@@ -787,20 +787,27 @@ fn extract_docker_runs_config(
 
     let args = runs
         .and_then(|r| r.get("args"))
-        .and_then(|v| v.as_sequence())
-        .map(|seq| {
-            seq.iter()
-                .map(|v| {
-                    v.as_str().map(|s| s.to_string()).unwrap_or_else(|| {
-                        // Coerce non-string values (int, bool, etc.) to strings,
-                        // matching GitHub Actions behavior.
-                        serde_yaml::to_string(v)
-                            .unwrap_or_default()
-                            .trim()
-                            .to_string()
+        .map(|v| {
+            if let Some(seq) = v.as_sequence() {
+                // args as a YAML sequence: ["--flag", "value"]
+                seq.iter()
+                    .map(|v| {
+                        v.as_str().map(|s| s.to_string()).unwrap_or_else(|| {
+                            // Coerce non-string values (int, bool, etc.) to strings,
+                            // matching GitHub Actions behavior.
+                            serde_yaml::to_string(v)
+                                .unwrap_or_default()
+                                .trim()
+                                .to_string()
+                        })
                     })
-                })
-                .collect()
+                    .collect()
+            } else if let Some(s) = v.as_str() {
+                // args as a single string: "hello world" → shell-tokenize
+                shlex::split(s).unwrap_or_else(|| vec![s.to_string()])
+            } else {
+                vec![]
+            }
         })
         .unwrap_or_default();
 
@@ -1715,14 +1722,13 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                     // Determine container CMD: workflow `with.args` overrides action.yml `runs.args`.
                     // If neither is specified, the image's built-in CMD takes effect.
                     let effective_args: Vec<String> = if let Some(ref wa) = with_args_override {
-                        shlex::split(wa).unwrap_or_else(|| {
-                            wrkflw_logging::warning(&format!(
-                                "Failed to parse 'with.args' as shell tokens (unmatched quote?), \
-                                 falling back to whitespace splitting: {:?}",
-                                wa
-                            ));
-                            wa.split_whitespace().map(|s| s.to_string()).collect()
-                        })
+                        shlex::split(wa).ok_or_else(|| {
+                            ExecutionError::Execution(format!(
+                                "Failed to parse 'with.args' for action '{}': \
+                                 unmatched quote in {:?}",
+                                uses, wa
+                            ))
+                        })?
                     } else {
                         args
                     };
@@ -3899,6 +3905,55 @@ runs:
         let (ep, args) = extract_docker_runs_config(&Some(yaml));
         assert!(ep.is_none());
         assert_eq!(args, vec!["hello"]);
+    }
+
+    #[test]
+    fn extract_runs_config_args_as_string() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+runs:
+  using: docker
+  image: Dockerfile
+  args: "--flag value 'quoted arg'"
+"#,
+        )
+        .unwrap();
+        let (ep, args) = extract_docker_runs_config(&Some(yaml));
+        assert!(ep.is_none());
+        assert_eq!(args, vec!["--flag", "value", "quoted arg"]);
+    }
+
+    #[test]
+    fn extract_runs_config_args_as_plain_string() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+runs:
+  using: docker
+  image: Dockerfile
+  args: hello
+"#,
+        )
+        .unwrap();
+        let (ep, args) = extract_docker_runs_config(&Some(yaml));
+        assert!(ep.is_none());
+        assert_eq!(args, vec!["hello"]);
+    }
+
+    #[test]
+    fn extract_runs_config_args_string_bad_quoting_fallback() {
+        // Unmatched quote — shlex returns None, fallback to raw string
+        let yaml: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+runs:
+  using: docker
+  image: Dockerfile
+  args: "hello 'world"
+"#,
+        )
+        .unwrap();
+        let (ep, args) = extract_docker_runs_config(&Some(yaml));
+        assert!(ep.is_none());
+        assert_eq!(args, vec!["hello 'world"]);
     }
 
     // --- Dockerfile path sanitization tests ---

@@ -600,12 +600,13 @@ async fn prepare_action(
                     .or_else(|_| std::fs::read_to_string(action_dir.join("action.yaml")))
                     .ok()
                     .and_then(|s| serde_yaml::from_str(&s).ok());
-            let (entrypoint, args) = extract_docker_runs_config(&definition).map_err(|e| {
-                ExecutionError::Execution(format!(
-                    "Invalid runs config in local action '{}': {}",
-                    action.repository, e
-                ))
-            })?;
+            let (entrypoint, args) =
+                extract_docker_runs_config(definition.as_ref()).map_err(|e| {
+                    ExecutionError::Execution(format!(
+                        "Invalid runs config in local action '{}': {}",
+                        action.repository, e
+                    ))
+                })?;
 
             return Ok(PreparedAction::NativeDocker {
                 image: tag,
@@ -642,8 +643,8 @@ async fn prepare_action(
                         "Resolved action '{}' -> Docker image '{}'",
                         action.repository, image
                     ));
-                    let (entrypoint, args) = extract_docker_runs_config(&resolved.definition)
-                        .map_err(|e| {
+                    let (entrypoint, args) =
+                        extract_docker_runs_config(resolved.definition.as_ref()).map_err(|e| {
                             ExecutionError::Execution(format!(
                                 "Invalid runs config for action '{}': {}",
                                 action.repository, e
@@ -668,7 +669,10 @@ async fn prepare_action(
                         action.repository
                     ));
 
-                    // Clone the repository
+                    // Clone the repository.
+                    // `tempdir` is only needed through `build_image` — after the
+                    // image is built all files are baked into the Docker image
+                    // and the temp directory can be dropped safely.
                     let tempdir = tempfile::tempdir().map_err(|e| {
                         ExecutionError::Execution(format!("Failed to create temp dir: {}", e))
                     })?;
@@ -766,8 +770,8 @@ async fn prepare_action(
                             ))
                         })?;
 
-                    let (entrypoint, args) = extract_docker_runs_config(&resolved.definition)
-                        .map_err(|e| {
+                    let (entrypoint, args) =
+                        extract_docker_runs_config(resolved.definition.as_ref()).map_err(|e| {
                             ExecutionError::Execution(format!(
                                 "Invalid runs config for action '{}': {}",
                                 action.repository, e
@@ -799,6 +803,9 @@ async fn prepare_action(
 /// Rejects any path component that is exactly `..` to prevent directory
 /// traversal out of the cloned repository.
 fn sanitize_sub_path(raw: &str) -> Result<(), String> {
+    if raw.contains('\0') {
+        return Err("null byte not allowed in sub_path".to_string());
+    }
     if raw.split('/').any(|c| c == "..") {
         return Err(format!("path traversal not allowed in sub_path: {}", raw));
     }
@@ -810,6 +817,9 @@ fn sanitize_sub_path(raw: &str) -> Result<(), String> {
 /// Strips the `docker://` prefix and leading slashes, then rejects any
 /// path component that is exactly `..` to prevent directory traversal.
 fn sanitize_dockerfile_rel(raw: &str) -> Result<String, String> {
+    if raw.contains('\0') {
+        return Err("null byte not allowed in Dockerfile path".to_string());
+    }
     let trimmed = raw
         .trim_start_matches("docker://")
         .trim_start_matches('/')
@@ -831,9 +841,9 @@ fn sanitize_dockerfile_rel(raw: &str) -> Result<String, String> {
 /// Returns an error if `runs.args` is a string with unmatched quotes, keeping
 /// error handling consistent with how `with.args` is parsed at execution time.
 fn extract_docker_runs_config(
-    definition: &Option<serde_yaml::Value>,
+    definition: Option<&serde_yaml::Value>,
 ) -> Result<(Option<String>, Vec<String>), String> {
-    let runs = definition.as_ref().and_then(|d| d.get("runs"));
+    let runs = definition.and_then(|d| d.get("runs"));
 
     let entrypoint = runs
         .and_then(|r| r.get("entrypoint"))
@@ -1747,31 +1757,20 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                         for (key, value) in with_params {
                             step_env.insert(format!("INPUT_{}", key.to_uppercase()), value.clone());
                         }
+                        // Presence of the key is the override signal — even an empty
+                        // string means "pass zero args", matching GitHub Actions behavior.
                         if let Some(a) = with_params.get("args") {
-                            if !a.is_empty() {
-                                with_args_override = Some(a.clone());
-                            }
+                            with_args_override = Some(a.clone());
                         }
                     }
 
-                    // Define the standard workspace path inside the container
                     let container_workspace = Path::new("/github/workspace");
-
-                    // Set up volume mapping from host working dir to container workspace
-                    let mut volumes: Vec<(&Path, &Path)> =
-                        vec![(ctx.working_dir, container_workspace)];
-
-                    // Prepare container mounts and remap GitHub env paths
-                    let (owned_volume_paths, github_mount) =
-                        prepare_container_mounts(&mut step_env, ctx.job_env, ctx.container_config);
-                    if let Some((ref host, ref container)) = github_mount {
-                        volumes.push((host.as_path(), container.as_path()));
-                    }
-                    for (host, container) in &owned_volume_paths {
-                        volumes.push((host.as_path(), container.as_path()));
-                    }
-
-                    // Convert environment HashMap to Vec<(&str, &str)> for container runtime
+                    let mount_ctx = prepare_step_container_context(
+                        &mut step_env,
+                        ctx.job_env,
+                        ctx.container_config,
+                    );
+                    let volumes = mount_ctx.build_volumes(ctx.working_dir, container_workspace);
                     let env_vars: Vec<(&str, &str)> = step_env
                         .iter()
                         .map(|(k, v)| (k.as_str(), v.as_str()))
@@ -2093,24 +2092,13 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                         }
                     }
 
-                    // Define the standard workspace path inside the container
                     let container_workspace = Path::new("/github/workspace");
-
-                    // Set up volume mapping from host working dir to container workspace
-                    let mut volumes: Vec<(&Path, &Path)> =
-                        vec![(ctx.working_dir, container_workspace)];
-
-                    // Prepare container mounts and remap GitHub env paths
-                    let (owned_volume_paths, github_mount) =
-                        prepare_container_mounts(&mut step_env, ctx.job_env, ctx.container_config);
-                    if let Some((ref host, ref container)) = github_mount {
-                        volumes.push((host.as_path(), container.as_path()));
-                    }
-                    for (host, container) in &owned_volume_paths {
-                        volumes.push((host.as_path(), container.as_path()));
-                    }
-
-                    // Convert environment HashMap to Vec<(&str, &str)> for container runtime
+                    let mount_ctx = prepare_step_container_context(
+                        &mut step_env,
+                        ctx.job_env,
+                        ctx.container_config,
+                    );
+                    let volumes = mount_ctx.build_volumes(ctx.working_dir, container_workspace);
                     let env_vars: Vec<(&str, &str)> = step_env
                         .iter()
                         .map(|(k, v)| (k.as_str(), v.as_str()))
@@ -2240,20 +2228,9 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
         // Define the standard workspace path inside the container
         let container_workspace = Path::new("/github/workspace");
 
-        // Set up volume mapping from host working dir to container workspace
-        let mut volumes: Vec<(&Path, &Path)> = vec![(ctx.working_dir, container_workspace)];
-
-        // Prepare container mounts and remap GitHub env paths
-        let (owned_volume_paths, github_mount) =
-            prepare_container_mounts(&mut step_env, ctx.job_env, ctx.container_config);
-        if let Some((ref host, ref container)) = github_mount {
-            volumes.push((host.as_path(), container.as_path()));
-        }
-        for (host, container) in &owned_volume_paths {
-            volumes.push((host.as_path(), container.as_path()));
-        }
-
-        // Convert environment variables to the required format (after path remapping)
+        let mount_ctx =
+            prepare_step_container_context(&mut step_env, ctx.job_env, ctx.container_config);
+        let volumes = mount_ctx.build_volumes(ctx.working_dir, container_workspace);
         let env_vars: Vec<(&str, &str)> = step_env
             .iter()
             .map(|(k, v)| (k.as_str(), v.as_str()))
@@ -2577,6 +2554,52 @@ fn get_effective_runner_image(job: &Job) -> String {
         }
     } else {
         get_runner_image_from_opt(&job.runs_on)
+    }
+}
+
+/// Owned data returned by [`prepare_step_container_context`].
+///
+/// The caller should derive `&[(&Path, &Path)]` and `&[(&str, &str)]` references
+/// from this struct's fields before passing them to `run_container`.
+struct StepContainerContext {
+    owned_volume_paths: Vec<VolumePathPair>,
+    github_mount: Option<VolumePathPair>,
+}
+
+impl StepContainerContext {
+    /// Build the final volumes slice by appending all owned mounts after the
+    /// initial `(working_dir, container_workspace)` pair.
+    fn build_volumes<'a>(
+        &'a self,
+        working_dir: &'a Path,
+        container_workspace: &'a Path,
+    ) -> Vec<(&'a Path, &'a Path)> {
+        let mut volumes: Vec<(&Path, &Path)> = vec![(working_dir, container_workspace)];
+        if let Some((ref host, ref container)) = self.github_mount {
+            volumes.push((host.as_path(), container.as_path()));
+        }
+        for (host, container) in &self.owned_volume_paths {
+            volumes.push((host.as_path(), container.as_path()));
+        }
+        volumes
+    }
+}
+
+/// Set up container volumes and remap GitHub env paths for a step execution.
+///
+/// This is the common setup shared by `NativeDocker`, `Image`, and `run` step
+/// execution paths.  Returns owned mount data; the caller uses
+/// [`StepContainerContext::build_volumes`] to borrow into it.
+fn prepare_step_container_context(
+    step_env: &mut HashMap<String, String>,
+    job_env: &HashMap<String, String>,
+    container_config: Option<&JobContainer>,
+) -> StepContainerContext {
+    let (owned_volume_paths, github_mount) =
+        prepare_container_mounts(step_env, job_env, container_config);
+    StepContainerContext {
+        owned_volume_paths,
+        github_mount,
     }
 }
 
@@ -3910,7 +3933,7 @@ runs:
 "#,
         )
         .unwrap();
-        let (ep, args) = extract_docker_runs_config(&Some(yaml)).unwrap();
+        let (ep, args) = extract_docker_runs_config(Some(&yaml)).unwrap();
         assert_eq!(ep.as_deref(), Some("/entrypoint.sh"));
         assert_eq!(args, vec!["--flag", "value"]);
     }
@@ -3925,14 +3948,14 @@ runs:
 "#,
         )
         .unwrap();
-        let (ep, args) = extract_docker_runs_config(&Some(yaml)).unwrap();
+        let (ep, args) = extract_docker_runs_config(Some(&yaml)).unwrap();
         assert!(ep.is_none());
         assert!(args.is_empty());
     }
 
     #[test]
     fn extract_runs_config_none_definition() {
-        let (ep, args) = extract_docker_runs_config(&None).unwrap();
+        let (ep, args) = extract_docker_runs_config(None).unwrap();
         assert!(ep.is_none());
         assert!(args.is_empty());
     }
@@ -3948,7 +3971,7 @@ runs:
 "#,
         )
         .unwrap();
-        let (ep, args) = extract_docker_runs_config(&Some(yaml)).unwrap();
+        let (ep, args) = extract_docker_runs_config(Some(&yaml)).unwrap();
         assert_eq!(ep.as_deref(), Some("/custom.sh"));
         assert!(args.is_empty());
     }
@@ -3965,7 +3988,7 @@ runs:
 "#,
         )
         .unwrap();
-        let (ep, args) = extract_docker_runs_config(&Some(yaml)).unwrap();
+        let (ep, args) = extract_docker_runs_config(Some(&yaml)).unwrap();
         assert!(ep.is_none());
         assert_eq!(args, vec!["hello"]);
     }
@@ -3981,7 +4004,7 @@ runs:
 "#,
         )
         .unwrap();
-        let (ep, args) = extract_docker_runs_config(&Some(yaml)).unwrap();
+        let (ep, args) = extract_docker_runs_config(Some(&yaml)).unwrap();
         assert!(ep.is_none());
         assert_eq!(args, vec!["--flag", "value", "quoted arg"]);
     }
@@ -3997,7 +4020,7 @@ runs:
 "#,
         )
         .unwrap();
-        let (ep, args) = extract_docker_runs_config(&Some(yaml)).unwrap();
+        let (ep, args) = extract_docker_runs_config(Some(&yaml)).unwrap();
         assert!(ep.is_none());
         assert_eq!(args, vec!["hello"]);
     }
@@ -4014,7 +4037,7 @@ runs:
 "#,
         )
         .unwrap();
-        let result = extract_docker_runs_config(&Some(yaml));
+        let result = extract_docker_runs_config(Some(&yaml));
         assert!(result.is_err(), "unmatched quote should return Err");
         assert!(result.unwrap_err().contains("unmatched quote"));
     }
@@ -4110,5 +4133,40 @@ runs:
     fn sub_path_allows_dotdot_in_name() {
         // ".." as a substring in a directory name is not traversal
         assert!(sanitize_sub_path("foo..bar").is_ok());
+    }
+
+    // --- null byte rejection tests ---
+
+    #[test]
+    fn sub_path_rejects_null_byte() {
+        assert!(sanitize_sub_path("foo\0bar").is_err());
+    }
+
+    #[test]
+    fn dockerfile_rel_rejects_null_byte() {
+        assert!(sanitize_dockerfile_rel("Dockerfile\0.txt").is_err());
+    }
+
+    // --- extract_docker_runs_config with numeric/bool args ---
+
+    #[test]
+    fn extract_runs_config_args_coerces_non_string_values() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+runs:
+  using: docker
+  image: Dockerfile
+  args:
+    - 42
+    - true
+    - --flag
+"#,
+        )
+        .unwrap();
+        let (_, args) = extract_docker_runs_config(Some(&yaml)).unwrap();
+        assert_eq!(args.len(), 3);
+        assert_eq!(args[0], "42");
+        assert_eq!(args[1], "true");
+        assert_eq!(args[2], "--flag");
     }
 }

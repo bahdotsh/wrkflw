@@ -1117,9 +1117,18 @@ impl DockerRuntime {
 
     /// Build a Docker image from a Dockerfile.
     ///
-    /// `context_dir` is the Docker build context directory. All files in this
+    /// `context_dir` is the Docker build context directory. Files in this
     /// directory are sent to the Docker daemon so that COPY instructions work.
     /// The Dockerfile path is made relative to this context for the build API.
+    ///
+    /// If a `.dockerignore` file exists in the context directory, its patterns
+    /// are honoured to exclude files from the build context — reducing the
+    /// amount of data sent to the daemon for large action repositories.
+    ///
+    /// **Note:** `follow_symlinks(false)` protects against symlink-based
+    /// exfiltration but does not prevent hard-links to files outside the
+    /// context.  This is acceptable because the context is always a freshly
+    /// cloned repo or tempdir that we control.
     async fn build_image_inner(
         &self,
         dockerfile: &Path,
@@ -1152,10 +1161,56 @@ impl DockerRuntime {
             // to leak host filesystem contents into the Docker build context.
             tar_builder.follow_symlinks(false);
 
-            // Include the full context directory so COPY instructions work.
-            tar_builder.append_dir_all(".", context_dir).map_err(|e| {
-                ContainerError::ImageBuild(format!("Failed to create build context tar: {}", e))
-            })?;
+            // Build a .dockerignore-aware walker when the file exists.
+            let dockerignore_path = context_dir.join(".dockerignore");
+            if dockerignore_path.exists() {
+                // Use the `ignore` crate to walk the context directory while
+                // respecting .dockerignore patterns (same glob semantics).
+                use ignore::WalkBuilder;
+
+                let walker = WalkBuilder::new(context_dir)
+                    // Disable default .gitignore / .ignore handling — we only
+                    // want .dockerignore semantics.
+                    .standard_filters(false)
+                    .add_custom_ignore_filename(".dockerignore")
+                    .follow_links(false)
+                    .build();
+
+                for entry in walker {
+                    let entry = entry.map_err(|e| {
+                        ContainerError::ImageBuild(format!("Failed to walk build context: {}", e))
+                    })?;
+                    let path = entry.path();
+                    let rel = match path.strip_prefix(context_dir) {
+                        Ok(r) => r,
+                        Err(_) => continue,
+                    };
+                    // Skip the root directory itself — tar implicitly contains it.
+                    if rel.as_os_str().is_empty() {
+                        continue;
+                    }
+                    if path.is_dir() {
+                        tar_builder.append_dir(rel, path).map_err(|e| {
+                            ContainerError::ImageBuild(format!(
+                                "Failed to add directory to build context tar: {}",
+                                e
+                            ))
+                        })?;
+                    } else {
+                        tar_builder.append_path_with_name(path, rel).map_err(|e| {
+                            ContainerError::ImageBuild(format!(
+                                "Failed to add file to build context tar: {}",
+                                e
+                            ))
+                        })?;
+                    }
+                }
+            } else {
+                // No .dockerignore — include the full context directory.
+                tar_builder.append_dir_all(".", context_dir).map_err(|e| {
+                    ContainerError::ImageBuild(format!("Failed to create build context tar: {}", e))
+                })?;
+            }
 
             tar_builder
                 .into_inner()

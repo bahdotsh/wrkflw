@@ -1308,20 +1308,19 @@ async fn run_step_with_guards(
 
     match execute_step(step_exec_ctx).await {
         Ok(result) => {
-            let abort_job =
-                if result.status == StepStatus::Failure || result.status == StepStatus::Skipped {
-                    if step.continue_on_error == Some(true) {
-                        wrkflw_logging::info(&format!(
-                            "  Step '{}' failed but continue-on-error is set, continuing",
-                            result.name
-                        ));
-                        false
-                    } else {
-                        result.status == StepStatus::Failure
-                    }
-                } else {
+            let abort_job = if result.status == StepStatus::Failure {
+                if step.continue_on_error == Some(true) {
+                    wrkflw_logging::info(&format!(
+                        "  Step '{}' failed but continue-on-error is set, continuing",
+                        result.name
+                    ));
                     false
-                };
+                } else {
+                    true
+                }
+            } else {
+                false
+            };
             Ok(StepOutcome::Completed { result, abort_job })
         }
         Err(e) => {

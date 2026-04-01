@@ -139,8 +139,22 @@ impl EncryptedSecretStore {
             .map_err(|e| SecretError::internal(format!("Serialization failed: {}", e)))
     }
 
-    /// Deserialize from JSON
+    /// Deserialize from JSON.
+    /// Detects the old serialization format (which had a top-level `nonce` field)
+    /// and returns a clear error directing users to re-create their secret store.
     pub fn from_json(json: &str) -> SecretResult<Self> {
+        // Detect old format: if the JSON contains a top-level "nonce" field, it's
+        // the pre-per-secret-nonce format that is no longer compatible.
+        if let Ok(raw) = serde_json::from_str::<serde_json::Value>(json) {
+            if raw.get("nonce").is_some() {
+                return Err(SecretError::InvalidFormat(
+                    "This secret store uses the old serialization format (shared nonce). \
+                     It is incompatible with the current version which uses per-secret nonces. \
+                     Please re-create your secret store. See BREAKING_CHANGES.md for details."
+                        .to_string(),
+                ));
+            }
+        }
         serde_json::from_str(json)
             .map_err(|e| SecretError::internal(format!("Deserialization failed: {}", e)))
     }
@@ -324,6 +338,25 @@ mod tests {
         // Both should decrypt to the same value
         assert_eq!(store.get_secret(&key, "secret_a").unwrap(), "same_value");
         assert_eq!(store.get_secret(&key, "secret_b").unwrap(), "same_value");
+    }
+
+    #[test]
+    fn test_old_format_with_nonce_field_rejected() {
+        // Simulate the old serialization format that had a top-level "nonce" field
+        let old_format_json = r#"{
+            "secrets": {},
+            "salt": "dGVzdHNhbHQ=",
+            "nonce": "dGVzdG5vbmNl"
+        }"#;
+
+        let result = EncryptedSecretStore::from_json(old_format_json);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("old serialization format"),
+            "Expected old-format error, got: {}",
+            err_msg
+        );
     }
 
     #[test]

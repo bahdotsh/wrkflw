@@ -600,7 +600,12 @@ async fn prepare_action(
                     .or_else(|_| std::fs::read_to_string(action_dir.join("action.yaml")))
                     .ok()
                     .and_then(|s| serde_yaml::from_str(&s).ok());
-            let (entrypoint, args) = extract_docker_runs_config(&definition);
+            let (entrypoint, args) = extract_docker_runs_config(&definition).map_err(|e| {
+                ExecutionError::Execution(format!(
+                    "Invalid runs config in local action '{}': {}",
+                    action.repository, e
+                ))
+            })?;
 
             return Ok(PreparedAction::NativeDocker {
                 image: tag,
@@ -637,7 +642,13 @@ async fn prepare_action(
                         "Resolved action '{}' -> Docker image '{}'",
                         action.repository, image
                     ));
-                    let (entrypoint, args) = extract_docker_runs_config(&resolved.definition);
+                    let (entrypoint, args) = extract_docker_runs_config(&resolved.definition)
+                        .map_err(|e| {
+                            ExecutionError::Execution(format!(
+                                "Invalid runs config for action '{}': {}",
+                                action.repository, e
+                            ))
+                        })?;
                     return Ok(PreparedAction::NativeDocker {
                         image: image.clone(),
                         entrypoint,
@@ -667,9 +678,38 @@ async fn prepare_action(
 
                     // Resolve the action directory (respecting sub_path)
                     let action_dir = match &action.sub_path {
-                        Some(p) => repo_dir.join(p),
+                        Some(p) => {
+                            sanitize_sub_path(p).map_err(|e| {
+                                ExecutionError::Execution(format!(
+                                    "Invalid sub_path for action '{}': {}",
+                                    action.repository, e
+                                ))
+                            })?;
+                            repo_dir.join(p)
+                        }
                         None => repo_dir.clone(),
                     };
+
+                    // Defense-in-depth: verify the action directory is still
+                    // inside the cloned repo after symlink resolution.
+                    let canon_action_dir = action_dir.canonicalize().map_err(|e| {
+                        ExecutionError::Execution(format!(
+                            "Failed to canonicalize action directory: {}",
+                            e
+                        ))
+                    })?;
+                    let canon_repo_dir = repo_dir.canonicalize().map_err(|e| {
+                        ExecutionError::Execution(format!(
+                            "Failed to canonicalize repo directory: {}",
+                            e
+                        ))
+                    })?;
+                    if !canon_action_dir.starts_with(&canon_repo_dir) {
+                        return Err(ExecutionError::Execution(format!(
+                            "Action sub_path escapes repository directory for action '{}'",
+                            action.repository
+                        )));
+                    }
 
                     // Get the Dockerfile path from action.yml's runs.image field.
                     let dockerfile_raw = resolved
@@ -699,15 +739,10 @@ async fn prepare_action(
 
                     // Defense-in-depth: verify the resolved Dockerfile is
                     // still inside the action directory after symlink resolution.
+                    // (canon_action_dir was already computed above for the sub_path check.)
                     let canon_dockerfile = dockerfile.canonicalize().map_err(|e| {
                         ExecutionError::Execution(format!(
                             "Failed to canonicalize Dockerfile path: {}",
-                            e
-                        ))
-                    })?;
-                    let canon_action_dir = action_dir.canonicalize().map_err(|e| {
-                        ExecutionError::Execution(format!(
-                            "Failed to canonicalize action directory: {}",
                             e
                         ))
                     })?;
@@ -731,7 +766,13 @@ async fn prepare_action(
                             ))
                         })?;
 
-                    let (entrypoint, args) = extract_docker_runs_config(&resolved.definition);
+                    let (entrypoint, args) = extract_docker_runs_config(&resolved.definition)
+                        .map_err(|e| {
+                            ExecutionError::Execution(format!(
+                                "Invalid runs config for action '{}': {}",
+                                action.repository, e
+                            ))
+                        })?;
                     return Ok(PreparedAction::NativeDocker {
                         image: tag,
                         entrypoint,
@@ -751,6 +792,17 @@ async fn prepare_action(
     // Fallback: determine appropriate image based on hardcoded action type mapping
     let image = determine_action_image(&action.repository);
     Ok(PreparedAction::Image(image))
+}
+
+/// Sanitize a sub-path component from an action reference (e.g. `owner/repo/sub/path`).
+///
+/// Rejects any path component that is exactly `..` to prevent directory
+/// traversal out of the cloned repository.
+fn sanitize_sub_path(raw: &str) -> Result<(), String> {
+    if raw.split('/').any(|c| c == "..") {
+        return Err(format!("path traversal not allowed in sub_path: {}", raw));
+    }
+    Ok(())
 }
 
 /// Sanitize a Dockerfile path from an action.yml `runs.image` field.
@@ -775,9 +827,12 @@ fn sanitize_dockerfile_rel(raw: &str) -> Result<String, String> {
 ///
 /// These fields allow Docker actions to override the image's default ENTRYPOINT
 /// and provide arguments that are passed as CMD.
+///
+/// Returns an error if `runs.args` is a string with unmatched quotes, keeping
+/// error handling consistent with how `with.args` is parsed at execution time.
 fn extract_docker_runs_config(
     definition: &Option<serde_yaml::Value>,
-) -> (Option<String>, Vec<String>) {
+) -> Result<(Option<String>, Vec<String>), String> {
     let runs = definition.as_ref().and_then(|d| d.get("runs"));
 
     let entrypoint = runs
@@ -785,9 +840,8 @@ fn extract_docker_runs_config(
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
-    let args = runs
-        .and_then(|r| r.get("args"))
-        .map(|v| {
+    let args = match runs.and_then(|r| r.get("args")) {
+        Some(v) => {
             if let Some(seq) = v.as_sequence() {
                 // args as a YAML sequence: ["--flag", "value"]
                 seq.iter()
@@ -804,14 +858,15 @@ fn extract_docker_runs_config(
                     .collect()
             } else if let Some(s) = v.as_str() {
                 // args as a single string: "hello world" → shell-tokenize
-                shlex::split(s).unwrap_or_else(|| vec![s.to_string()])
+                shlex::split(s).ok_or_else(|| format!("unmatched quote in runs.args: {:?}", s))?
             } else {
                 vec![]
             }
-        })
-        .unwrap_or_default();
+        }
+        None => vec![],
+    };
 
-    (entrypoint, args)
+    Ok((entrypoint, args))
 }
 
 /// Shallow-clone a GitHub repository at a specific ref (branch, tag, or SHA).
@@ -1651,7 +1706,15 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                         shallow_clone(&repo_url, &action_info.version, &repo_dir).await?;
                         // If the action has a sub-path, the action.yml is inside that directory
                         let action_dir = match &action_info.sub_path {
-                            Some(p) => repo_dir.join(p),
+                            Some(p) => {
+                                sanitize_sub_path(p).map_err(|e| {
+                                    ExecutionError::Execution(format!(
+                                        "Invalid sub_path for action '{}': {}",
+                                        action_info.repository, e
+                                    ))
+                                })?;
+                                repo_dir.join(p)
+                            }
                             None => repo_dir,
                         };
                         // tempdir must stay alive until execute_composite_action completes
@@ -3847,7 +3910,7 @@ runs:
 "#,
         )
         .unwrap();
-        let (ep, args) = extract_docker_runs_config(&Some(yaml));
+        let (ep, args) = extract_docker_runs_config(&Some(yaml)).unwrap();
         assert_eq!(ep.as_deref(), Some("/entrypoint.sh"));
         assert_eq!(args, vec!["--flag", "value"]);
     }
@@ -3862,14 +3925,14 @@ runs:
 "#,
         )
         .unwrap();
-        let (ep, args) = extract_docker_runs_config(&Some(yaml));
+        let (ep, args) = extract_docker_runs_config(&Some(yaml)).unwrap();
         assert!(ep.is_none());
         assert!(args.is_empty());
     }
 
     #[test]
     fn extract_runs_config_none_definition() {
-        let (ep, args) = extract_docker_runs_config(&None);
+        let (ep, args) = extract_docker_runs_config(&None).unwrap();
         assert!(ep.is_none());
         assert!(args.is_empty());
     }
@@ -3885,7 +3948,7 @@ runs:
 "#,
         )
         .unwrap();
-        let (ep, args) = extract_docker_runs_config(&Some(yaml));
+        let (ep, args) = extract_docker_runs_config(&Some(yaml)).unwrap();
         assert_eq!(ep.as_deref(), Some("/custom.sh"));
         assert!(args.is_empty());
     }
@@ -3902,7 +3965,7 @@ runs:
 "#,
         )
         .unwrap();
-        let (ep, args) = extract_docker_runs_config(&Some(yaml));
+        let (ep, args) = extract_docker_runs_config(&Some(yaml)).unwrap();
         assert!(ep.is_none());
         assert_eq!(args, vec!["hello"]);
     }
@@ -3918,7 +3981,7 @@ runs:
 "#,
         )
         .unwrap();
-        let (ep, args) = extract_docker_runs_config(&Some(yaml));
+        let (ep, args) = extract_docker_runs_config(&Some(yaml)).unwrap();
         assert!(ep.is_none());
         assert_eq!(args, vec!["--flag", "value", "quoted arg"]);
     }
@@ -3934,14 +3997,14 @@ runs:
 "#,
         )
         .unwrap();
-        let (ep, args) = extract_docker_runs_config(&Some(yaml));
+        let (ep, args) = extract_docker_runs_config(&Some(yaml)).unwrap();
         assert!(ep.is_none());
         assert_eq!(args, vec!["hello"]);
     }
 
     #[test]
-    fn extract_runs_config_args_string_bad_quoting_fallback() {
-        // Unmatched quote — shlex returns None, fallback to raw string
+    fn extract_runs_config_args_string_bad_quoting_is_error() {
+        // Unmatched quote — should return an error (consistent with with.args parsing)
         let yaml: serde_yaml::Value = serde_yaml::from_str(
             r#"
 runs:
@@ -3951,9 +4014,9 @@ runs:
 "#,
         )
         .unwrap();
-        let (ep, args) = extract_docker_runs_config(&Some(yaml));
-        assert!(ep.is_none());
-        assert_eq!(args, vec!["hello 'world"]);
+        let result = extract_docker_runs_config(&Some(yaml));
+        assert!(result.is_err(), "unmatched quote should return Err");
+        assert!(result.unwrap_err().contains("unmatched quote"));
     }
 
     // --- Dockerfile path sanitization tests ---
@@ -4014,5 +4077,38 @@ runs:
     #[test]
     fn dockerfile_rel_rejects_docker_prefix_only() {
         assert!(sanitize_dockerfile_rel("docker://").is_err());
+    }
+
+    // --- sub_path sanitization tests ---
+
+    #[test]
+    fn sub_path_allows_simple_path() {
+        assert!(sanitize_sub_path("subdir").is_ok());
+    }
+
+    #[test]
+    fn sub_path_allows_nested_path() {
+        assert!(sanitize_sub_path("a/b/c").is_ok());
+    }
+
+    #[test]
+    fn sub_path_rejects_dotdot() {
+        assert!(sanitize_sub_path("..").is_err());
+    }
+
+    #[test]
+    fn sub_path_rejects_dotdot_prefix() {
+        assert!(sanitize_sub_path("../../etc").is_err());
+    }
+
+    #[test]
+    fn sub_path_rejects_dotdot_in_middle() {
+        assert!(sanitize_sub_path("a/../../../etc").is_err());
+    }
+
+    #[test]
+    fn sub_path_allows_dotdot_in_name() {
+        // ".." as a substring in a directory name is not traversal
+        assert!(sanitize_sub_path("foo..bar").is_ok());
     }
 }

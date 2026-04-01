@@ -236,6 +236,25 @@ pub struct Step {
     pub timeout_minutes: Option<f64>,
 }
 
+impl Step {
+    /// Create a step that runs a shell command with default optional fields.
+    pub fn with_run(name: impl Into<String>, run: impl Into<String>) -> Self {
+        Self {
+            name: Some(name.into()),
+            uses: None,
+            run: Some(run.into()),
+            with: None,
+            env: HashMap::new(),
+            continue_on_error: None,
+            if_condition: None,
+            id: None,
+            working_directory: None,
+            shell: None,
+            timeout_minutes: None,
+        }
+    }
+}
+
 impl WorkflowDefinition {
     pub fn resolve_action(&self, action_ref: &str) -> ActionInfo {
         // Parse GitHub action reference like "actions/checkout@v3"

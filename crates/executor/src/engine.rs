@@ -2967,7 +2967,12 @@ fn evaluate_job_condition(
     let has_success = condition.contains("success()");
     let has_failure = condition.contains("failure()");
     let has_cancelled = condition.contains("cancelled()");
-    let has_steps_ref = condition.contains("steps.");
+    // Match "steps." only at word boundaries to avoid false positives on env var
+    // names like "env.MY_STEPS_COUNT". We check for start-of-string or a non-alphanumeric
+    // character immediately before "steps.".
+    let has_steps_ref = condition
+        .match_indices("steps.")
+        .any(|(pos, _)| pos == 0 || !condition.as_bytes()[pos - 1].is_ascii_alphanumeric());
     let has_unsupported =
         has_always || has_success || has_failure || has_cancelled || has_steps_ref;
 
@@ -3451,6 +3456,26 @@ mod tests {
         let wf = empty_workflow();
         // always() present → true regardless of other functions
         assert!(evaluate_job_condition("always() && failure()", &env, &wf));
+    }
+
+    #[test]
+    fn condition_env_var_containing_steps_not_treated_as_step_ref() {
+        let env = HashMap::new();
+        let wf = empty_workflow();
+        // "env.MY_STEPS_COUNT" contains "steps." as a substring but should NOT
+        // trigger the step-reference heuristic (which returns false). Instead it
+        // falls through to the unknown-condition default (true).
+        // A bare "steps.build.outcome" at the start SHOULD be caught.
+        assert!(evaluate_job_condition(
+            "env.MY_STEPS_COUNT == '5'",
+            &env,
+            &wf
+        ));
+        assert!(!evaluate_job_condition(
+            "steps.build.outcome == 'success'",
+            &env,
+            &wf
+        ));
     }
 
     // --- volume path traversal tests ---

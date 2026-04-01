@@ -99,7 +99,7 @@ fn validate_cron_syntax(cron: &str, result: &mut ValidationResult) {
         ("hour", 0, 23),
         ("day of month", 1, 31),
         ("month", 1, 12),
-        ("day of week", 0, 6),
+        ("day of week", 0, 7), // 7 is accepted as Sunday alias (GitHub Actions, POSIX)
     ];
 
     for (part, (name, min, max)) in parts.iter().zip(field_specs.iter()) {
@@ -146,7 +146,7 @@ fn is_valid_cron_atom(atom: &str, min: u32, max: u32) -> bool {
     let month_names = [
         "JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC",
     ];
-    // Named day-of-week values (min=0, max=6)
+    // Named day-of-week values (min=0, max=7; 7 is Sunday alias)
     let dow_names = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"];
 
     let resolve_named = |s: &str| -> Option<u32> {
@@ -156,7 +156,7 @@ fn is_valid_cron_atom(atom: &str, min: u32, max: u32) -> bool {
                 .iter()
                 .position(|&n| n == upper)
                 .map(|i| i as u32 + 1)
-        } else if min == 0 && max == 6 {
+        } else if min == 0 && max >= 6 {
             dow_names.iter().position(|&n| n == upper).map(|i| i as u32)
         } else {
             None
@@ -216,7 +216,8 @@ mod tests {
         assert!(!cron_issues("* 24 * * *").is_empty());
         assert!(!cron_issues("* * 32 * *").is_empty());
         assert!(!cron_issues("* * * 13 *").is_empty());
-        assert!(!cron_issues("* * * * 7").is_empty());
+        assert!(cron_issues("* * * * 7").is_empty()); // 7 is valid (Sunday alias)
+        assert!(!cron_issues("* * * * 8").is_empty());
     }
 
     #[test]

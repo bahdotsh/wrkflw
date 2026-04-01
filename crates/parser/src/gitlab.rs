@@ -161,59 +161,29 @@ pub fn convert_to_workflow_format(pipeline: &Pipeline) -> workflow::WorkflowDefi
         // Convert before_script to steps if it exists
         if let Some(before_script) = &gitlab_job.before_script {
             for (i, cmd) in before_script.iter().enumerate() {
-                let step = workflow::Step {
-                    name: Some(format!("Before script {}", i + 1)),
-                    uses: None,
-                    run: Some(cmd.clone()),
-                    with: None,
-                    env: HashMap::new(),
-                    continue_on_error: None,
-                    if_condition: None,
-                    id: None,
-                    working_directory: None,
-                    shell: None,
-                    timeout_minutes: None,
-                };
-                job.steps.push(step);
+                job.steps.push(workflow::Step::with_run(
+                    format!("Before script {}", i + 1),
+                    cmd.clone(),
+                ));
             }
         }
 
         // Convert main script to steps
         if let Some(script) = &gitlab_job.script {
             for (i, cmd) in script.iter().enumerate() {
-                let step = workflow::Step {
-                    name: Some(format!("Run script line {}", i + 1)),
-                    uses: None,
-                    run: Some(cmd.clone()),
-                    with: None,
-                    env: HashMap::new(),
-                    continue_on_error: None,
-                    if_condition: None,
-                    id: None,
-                    working_directory: None,
-                    shell: None,
-                    timeout_minutes: None,
-                };
-                job.steps.push(step);
+                job.steps.push(workflow::Step::with_run(
+                    format!("Run script line {}", i + 1),
+                    cmd.clone(),
+                ));
             }
         }
 
         // Convert after_script to steps if it exists
         if let Some(after_script) = &gitlab_job.after_script {
             for (i, cmd) in after_script.iter().enumerate() {
-                let step = workflow::Step {
-                    name: Some(format!("After script {}", i + 1)),
-                    uses: None,
-                    run: Some(cmd.clone()),
-                    with: None,
-                    env: HashMap::new(),
-                    continue_on_error: Some(true), // After script should continue even if previous steps fail
-                    if_condition: None,
-                    id: None,
-                    working_directory: None,
-                    shell: None,
-                    timeout_minutes: None,
-                };
+                let mut step =
+                    workflow::Step::with_run(format!("After script {}", i + 1), cmd.clone());
+                step.continue_on_error = Some(true); // After script should continue even if previous steps fail
                 job.steps.push(step);
             }
         }

@@ -91,7 +91,9 @@ pub fn expand_matrix(matrix: &MatrixConfig) -> Result<Vec<MatrixCombination>, Ma
                 .keys()
                 .any(|key| combo.values.contains_key(key));
             if all_shared_keys_match && has_matching_key {
-                // Merge extra keys into the existing combination
+                // Merge extra keys into the existing combination.
+                // or_insert_with is intentional: per GitHub Actions semantics, include
+                // entries add new keys but do NOT override existing matrix values.
                 for (key, value) in include_item {
                     combo
                         .values

@@ -154,7 +154,7 @@ pub struct Job {
     pub steps: Vec<Step>,
     #[serde(default)]
     pub env: HashMap<String, String>,
-    #[serde(default)]
+    #[serde(default, alias = "matrix")]
     pub strategy: Option<Strategy>,
     #[serde(default)]
     pub services: HashMap<String, Service>,

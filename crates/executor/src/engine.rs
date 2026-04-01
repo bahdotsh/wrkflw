@@ -20,7 +20,7 @@ use wrkflw_matrix::MatrixCombination;
 use wrkflw_models::gitlab::Pipeline;
 use wrkflw_parser::gitlab::{self, parse_pipeline};
 use wrkflw_parser::workflow::{
-    self, parse_workflow, ActionInfo, Job, JobContainer, WorkflowDefinition,
+    self, parse_workflow, ActionInfo, Job, JobContainer, Step, WorkflowDefinition,
 };
 use wrkflw_runtime::container::ContainerRuntime;
 use wrkflw_runtime::emulation;
@@ -1004,58 +1004,33 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
     let runner_image_value = get_effective_runner_image(job);
 
     for (idx, step) in job.steps.iter().enumerate() {
-        let step_name = step
-            .name
-            .clone()
-            .unwrap_or_else(|| format!("Step {}", idx + 1));
-
-        // Check step-level if condition
-        if let Some(if_cond) = &step.if_condition {
-            let should_run = evaluate_job_condition(if_cond, &job_env, ctx.workflow);
-            if !should_run {
-                wrkflw_logging::info(&format!(
-                    "  ⏭️ Skipping step '{}' due to condition: {}",
-                    step_name, if_cond
-                ));
-                step_results.push(StepResult {
-                    name: step_name,
-                    status: StepStatus::Skipped,
-                    output: format!("Skipped due to condition: {}", if_cond),
-                });
-                continue;
-            }
-        }
-
-        let step_result = execute_step(StepExecutionContext {
+        let outcome = run_step_with_guards(
             step,
-            step_idx: idx,
-            job_env: &job_env,
-            working_dir: job_dir.path(),
-            runtime: ctx.runtime,
-            workflow: ctx.workflow,
-            runner_image: &runner_image_value,
-            verbose: ctx.verbose,
-            matrix_combination: &None,
-            secret_manager: ctx.secret_manager,
-            secret_masker: ctx.secret_masker,
-            container_config: job.container.as_ref(),
-        })
-        .await;
+            idx,
+            &job_env,
+            ctx.workflow,
+            StepExecutionContext {
+                step,
+                step_idx: idx,
+                job_env: &job_env,
+                working_dir: job_dir.path(),
+                runtime: ctx.runtime,
+                workflow: ctx.workflow,
+                runner_image: &runner_image_value,
+                verbose: ctx.verbose,
+                matrix_combination: &None,
+                secret_manager: ctx.secret_manager,
+                secret_masker: ctx.secret_masker,
+                container_config: job.container.as_ref(),
+            },
+        )
+        .await?;
 
-        match step_result {
-            Ok(result) => {
-                // Check if step was successful
-                if result.status == StepStatus::Failure {
-                    if step.continue_on_error == Some(true) {
-                        wrkflw_logging::info(&format!(
-                            "  Step '{}' failed but continue-on-error is set, continuing",
-                            result.name
-                        ));
-                    } else {
-                        job_success = false;
-                    }
-                }
-
+        match outcome {
+            StepOutcome::Skipped(result) => {
+                step_results.push(result);
+            }
+            StepOutcome::Completed { result, abort_job } => {
                 // Add step output to logs only in verbose mode or if there's an error
                 if ctx.verbose || result.status == StepStatus::Failure {
                     job_logs.push_str(&format!(
@@ -1063,7 +1038,6 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
                         result.name, result.output
                     ));
                 } else {
-                    // In non-verbose mode, just record that the step ran but don't include output
                     job_logs.push_str(&format!(
                         "Step '{}' completed with status: {:?}\n",
                         result.name, result.status
@@ -1071,30 +1045,9 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
                 }
 
                 step_results.push(result);
-            }
-            Err(e) => {
-                if step.continue_on_error == Some(true) {
-                    wrkflw_logging::info(&format!(
-                        "  Step '{}' errored but continue-on-error is set, continuing",
-                        step_name
-                    ));
-                    step_results.push(StepResult {
-                        name: step_name,
-                        status: StepStatus::Failure,
-                        output: format!("Error: {}", e),
-                    });
-                } else {
+
+                if abort_job {
                     job_success = false;
-                    job_logs.push_str(&format!("\n=== ERROR in step {} ===\n{}\n", idx + 1, e));
-
-                    // Record the error as a failed step
-                    step_results.push(StepResult {
-                        name: step_name,
-                        status: StepStatus::Failure,
-                        output: format!("Error: {}", e),
-                    });
-
-                    // Stop executing further steps
                     break;
                 }
             }
@@ -1249,50 +1202,38 @@ async fn execute_matrix_job(
         // Determine runner image: prefer job container image, fall back to runs-on mapping
         let runner_image_value = get_effective_runner_image(job_template);
 
+        let mut all_steps_ok = true;
         for (idx, step) in job_template.steps.iter().enumerate() {
-            let step_name = step
-                .name
-                .clone()
-                .unwrap_or_else(|| format!("Step {}", idx + 1));
-
-            // Check step-level if condition
-            if let Some(if_cond) = &step.if_condition {
-                let should_run = evaluate_job_condition(if_cond, &job_env, workflow);
-                if !should_run {
-                    wrkflw_logging::info(&format!(
-                        "  ⏭️ Skipping step '{}' due to condition: {}",
-                        step_name, if_cond
-                    ));
-                    step_results.push(StepResult {
-                        name: step_name,
-                        status: StepStatus::Skipped,
-                        output: format!("Skipped due to condition: {}", if_cond),
-                    });
-                    continue;
-                }
-            }
-
-            match execute_step(StepExecutionContext {
+            let outcome = run_step_with_guards(
                 step,
-                step_idx: idx,
-                job_env: &job_env,
-                working_dir: job_dir.path(),
-                runtime,
+                idx,
+                &job_env,
                 workflow,
-                runner_image: &runner_image_value,
-                verbose,
-                matrix_combination: &Some(combination.values.clone()),
-                secret_manager: None, // Matrix execution context doesn't have secrets yet
-                secret_masker: None,
-                container_config: job_template.container.as_ref(),
-            })
-            .await
-            {
-                Ok(result) => {
+                StepExecutionContext {
+                    step,
+                    step_idx: idx,
+                    job_env: &job_env,
+                    working_dir: job_dir.path(),
+                    runtime,
+                    workflow,
+                    runner_image: &runner_image_value,
+                    verbose,
+                    matrix_combination: &Some(combination.values.clone()),
+                    secret_manager: None,
+                    secret_masker: None,
+                    container_config: job_template.container.as_ref(),
+                },
+            )
+            .await?;
+
+            match outcome {
+                StepOutcome::Skipped(result) => {
+                    step_results.push(result);
+                }
+                StepOutcome::Completed { result, abort_job } => {
                     job_logs.push_str(&format!("Step: {}\n", result.name));
                     job_logs.push_str(&format!("Status: {:?}\n", result.status));
 
-                    // Only include step output in verbose mode or if there's an error
                     if verbose || result.status == StepStatus::Failure {
                         job_logs.push_str(&result.output);
                         job_logs.push_str("\n\n");
@@ -1301,52 +1242,17 @@ async fn execute_matrix_job(
                         job_logs.push('\n');
                     }
 
-                    step_results.push(result.clone());
+                    step_results.push(result);
 
-                    if result.status != StepStatus::Success {
-                        if step.continue_on_error == Some(true) {
-                            wrkflw_logging::info(&format!(
-                                "  Step '{}' failed but continue-on-error is set",
-                                step_name
-                            ));
-                            // Don't abort, continue to next step
-                        } else {
-                            // Step failed, abort job
-                            return Ok(JobResult {
-                                name: matrix_job_name,
-                                status: JobStatus::Failure,
-                                steps: step_results,
-                                logs: job_logs,
-                            });
-                        }
-                    }
-                }
-                Err(e) => {
-                    if step.continue_on_error == Some(true) {
-                        wrkflw_logging::info(&format!(
-                            "  Step '{}' errored but continue-on-error is set, continuing",
-                            step_name
-                        ));
-                        step_results.push(StepResult {
-                            name: step_name,
-                            status: StepStatus::Failure,
-                            output: format!("Error: {}", e),
-                        });
-                    } else {
-                        // Log the error and abort the job
-                        job_logs.push_str(&format!("Step execution error: {}\n\n", e));
-                        return Ok(JobResult {
-                            name: matrix_job_name,
-                            status: JobStatus::Failure,
-                            steps: step_results,
-                            logs: job_logs,
-                        });
+                    if abort_job {
+                        all_steps_ok = false;
+                        break;
                     }
                 }
             }
         }
 
-        true
+        all_steps_ok
     };
 
     // Return job result
@@ -1360,6 +1266,90 @@ async fn execute_matrix_job(
         steps: step_results,
         logs: job_logs,
     })
+}
+
+/// Outcome of a single step after guards (if-condition, continue-on-error) are applied.
+enum StepOutcome {
+    /// Step ran (or was skipped). Contains the result and whether the job should abort.
+    Completed { result: StepResult, abort_job: bool },
+    /// Step was skipped due to an if-condition.
+    Skipped(StepResult),
+}
+
+/// Run a step with if-condition and continue-on-error guards.
+/// Returns the step result and whether the job should be aborted.
+async fn run_step_with_guards(
+    step: &Step,
+    step_idx: usize,
+    job_env: &HashMap<String, String>,
+    workflow: &WorkflowDefinition,
+    step_exec_ctx: StepExecutionContext<'_>,
+) -> Result<StepOutcome, ExecutionError> {
+    let step_name = step
+        .name
+        .clone()
+        .unwrap_or_else(|| format!("Step {}", step_idx + 1));
+
+    // Check step-level if condition
+    if let Some(if_cond) = &step.if_condition {
+        let should_run = evaluate_job_condition(if_cond, job_env, workflow);
+        if !should_run {
+            wrkflw_logging::info(&format!(
+                "  ⏭️ Skipping step '{}' due to condition: {}",
+                step_name, if_cond
+            ));
+            return Ok(StepOutcome::Skipped(StepResult {
+                name: step_name,
+                status: StepStatus::Skipped,
+                output: format!("Skipped due to condition: {}", if_cond),
+            }));
+        }
+    }
+
+    match execute_step(step_exec_ctx).await {
+        Ok(result) => {
+            let abort_job =
+                if result.status == StepStatus::Failure || result.status == StepStatus::Skipped {
+                    if step.continue_on_error == Some(true) {
+                        wrkflw_logging::info(&format!(
+                            "  Step '{}' failed but continue-on-error is set, continuing",
+                            result.name
+                        ));
+                        false
+                    } else {
+                        result.status == StepStatus::Failure
+                    }
+                } else {
+                    false
+                };
+            Ok(StepOutcome::Completed { result, abort_job })
+        }
+        Err(e) => {
+            if step.continue_on_error == Some(true) {
+                wrkflw_logging::info(&format!(
+                    "  Step '{}' errored but continue-on-error is set, continuing",
+                    step_name
+                ));
+                Ok(StepOutcome::Completed {
+                    result: StepResult {
+                        name: step_name,
+                        status: StepStatus::Failure,
+                        output: format!("Error: {}", e),
+                    },
+                    abort_job: false,
+                })
+            } else {
+                Ok(StepOutcome::Completed {
+                    result: StepResult {
+                        name: step_name,
+                        status: StepStatus::Failure,
+                        output: format!("Error: {}", e),
+                    },
+                    abort_job: true,
+                })
+            }
+        }
+    }
 }
 
 // Before the execute_step function, add this struct
@@ -2970,11 +2960,10 @@ fn evaluate_job_condition(
     wrkflw_logging::debug(&format!("Evaluating condition: {}", condition));
 
     // Handle status functions and step references that we can't fully evaluate.
-    // For compound expressions (e.g. "failure() || success()"), we check for the
-    // presence of any unsupported function/reference and choose the most permissive
-    // default: if any "run-always" function (always(), success()) appears, default
-    // to true; only default to false if the expression exclusively uses "run-rarely"
-    // functions (failure(), cancelled()) with no positive counterpart.
+    // We default conservatively: only `always()` and `success()` resolve to true,
+    // since those represent the common "run this step" intent. Bare `steps.*`
+    // references (e.g. `steps.X.outcome == 'failure'`) default to false to avoid
+    // running steps that depend on prior failure/output we can't evaluate.
     let has_always = condition.contains("always()");
     let has_success = condition.contains("success()");
     let has_failure = condition.contains("failure()");
@@ -2989,11 +2978,11 @@ fn evaluate_job_condition(
             condition
         ));
 
-        // always() or success() or step refs → optimistic default (true)
-        if has_always || has_success || has_steps_ref {
+        // always() or success() → true (common "run this step" intent)
+        if has_always || has_success {
             return true;
         }
-        // Only failure()/cancelled() with no positive counterpart → false
+        // Bare steps.* refs, failure(), cancelled() without positive counterpart → false
         return false;
     }
 
@@ -3398,11 +3387,11 @@ mod tests {
     }
 
     #[test]
-    fn condition_steps_reference_defaults_true() {
+    fn condition_steps_reference_defaults_false() {
         let env = HashMap::new();
         let wf = empty_workflow();
-        // step-level expressions should warn and default to true
-        assert!(evaluate_job_condition(
+        // Bare step-level expressions default to false (conservative — we can't evaluate them)
+        assert!(!evaluate_job_condition(
             "steps.build.outcome == 'success'",
             &env,
             &wf

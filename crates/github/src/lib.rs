@@ -76,23 +76,29 @@ pub fn get_repo_info() -> Result<RepoInfo, GithubError> {
             .as_str()
             .to_string();
 
-        // Get the default branch
-        let branch_output = Command::new("git")
-            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        // Get the default branch (try remote HEAD first, fall back to current branch)
+        let default_branch = Command::new("git")
+            .args(["symbolic-ref", "refs/remotes/origin/HEAD"])
             .output()
-            .map_err(|e| {
-                GithubError::GitParseError(format!("Failed to execute git command: {}", e))
-            })?;
-
-        if !branch_output.status.success() {
-            return Err(GithubError::GitParseError(
-                "Failed to get current branch".to_string(),
-            ));
-        }
-
-        let default_branch = String::from_utf8_lossy(&branch_output.stdout)
-            .trim()
-            .to_string();
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| {
+                let full_ref = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                full_ref
+                    .strip_prefix("refs/remotes/origin/")
+                    .unwrap_or(&full_ref)
+                    .to_string()
+            })
+            .unwrap_or_else(|| {
+                // Fall back to current branch
+                Command::new("git")
+                    .args(["rev-parse", "--abbrev-ref", "HEAD"])
+                    .output()
+                    .ok()
+                    .filter(|o| o.status.success())
+                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                    .unwrap_or_else(|| "main".to_string())
+            });
 
         Ok(RepoInfo {
             owner,
@@ -298,26 +304,31 @@ async fn list_recent_workflow_runs(
         repo_info.owner, repo_info.repo, workflow_name
     );
 
-    let curl_output = Command::new("curl")
-        .arg("-s")
-        .arg("-H")
-        .arg(format!("Authorization: Bearer {}", token))
-        .arg("-H")
-        .arg("Accept: application/vnd.github.v3+json")
-        .arg(&url)
-        .output()
-        .map_err(|e| GithubError::GitParseError(format!("Failed to execute curl: {}", e)))?;
+    let client = reqwest::Client::new();
+    let response = client
+        .get(&url)
+        .header(header::AUTHORIZATION, format!("Bearer {}", token))
+        .header(header::ACCEPT, "application/vnd.github.v3+json")
+        .header(header::USER_AGENT, "wrkflw-cli")
+        .send()
+        .await
+        .map_err(GithubError::RequestError)?;
 
-    if !curl_output.status.success() {
-        let error_message = String::from_utf8_lossy(&curl_output.stderr).to_string();
-        return Err(GithubError::GitParseError(format!(
-            "Failed to list workflow runs: {}",
-            error_message
-        )));
+    if !response.status().is_success() {
+        let status = response.status().as_u16();
+        let error_message = response
+            .text()
+            .await
+            .unwrap_or_else(|_| format!("Unknown error (HTTP {})", status));
+        return Err(GithubError::ApiError {
+            status,
+            message: error_message,
+        });
     }
 
-    let response_body = String::from_utf8_lossy(&curl_output.stdout).to_string();
-    let parsed: serde_json::Value = serde_json::from_str(&response_body)
+    let parsed: serde_json::Value = response
+        .json()
+        .await
         .map_err(|e| GithubError::GitParseError(format!("Failed to parse workflow runs: {}", e)))?;
 
     // Extract the workflow runs from the response

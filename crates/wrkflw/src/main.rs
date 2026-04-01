@@ -464,60 +464,57 @@ async fn main() {
                 println!("✅ Workflow execution completed successfully!");
 
                 // Print a summary of executed jobs
-                if true {
-                    // Always show job summary
-                    println!("\nJob summary:");
-                    for job in result.jobs {
-                        println!(
-                            "  {} {} ({})",
-                            match job.status {
-                                wrkflw_executor::JobStatus::Success => "✅",
-                                wrkflw_executor::JobStatus::Failure => "❌",
-                                wrkflw_executor::JobStatus::Skipped => "⏭️",
-                            },
-                            job.name,
-                            match job.status {
-                                wrkflw_executor::JobStatus::Success => "success",
-                                wrkflw_executor::JobStatus::Failure => "failure",
-                                wrkflw_executor::JobStatus::Skipped => "skipped",
-                            }
-                        );
+                println!("\nJob summary:");
+                for job in result.jobs {
+                    println!(
+                        "  {} {} ({})",
+                        match job.status {
+                            wrkflw_executor::JobStatus::Success => "✅",
+                            wrkflw_executor::JobStatus::Failure => "❌",
+                            wrkflw_executor::JobStatus::Skipped => "⏭️",
+                        },
+                        job.name,
+                        match job.status {
+                            wrkflw_executor::JobStatus::Success => "success",
+                            wrkflw_executor::JobStatus::Failure => "failure",
+                            wrkflw_executor::JobStatus::Skipped => "skipped",
+                        }
+                    );
 
-                        // Always show steps, not just in debug mode
-                        println!("  Steps:");
-                        for step in job.steps {
-                            let step_status = match step.status {
-                                wrkflw_executor::StepStatus::Success => "✅",
-                                wrkflw_executor::StepStatus::Failure => "❌",
-                                wrkflw_executor::StepStatus::Skipped => "⏭️",
-                            };
+                    // Always show steps, not just in debug mode
+                    println!("  Steps:");
+                    for step in job.steps {
+                        let step_status = match step.status {
+                            wrkflw_executor::StepStatus::Success => "✅",
+                            wrkflw_executor::StepStatus::Failure => "❌",
+                            wrkflw_executor::StepStatus::Skipped => "⏭️",
+                        };
 
-                            println!("    {} {}", step_status, step.name);
+                        println!("    {} {}", step_status, step.name);
 
-                            // If step failed and we're not in verbose mode, show condensed error info
-                            if step.status == wrkflw_executor::StepStatus::Failure && !verbose {
-                                // Extract error information from step output
-                                let error_lines = step
-                                    .output
-                                    .lines()
-                                    .filter(|line| {
-                                        line.contains("error:")
-                                            || line.contains("Error:")
-                                            || line.trim().starts_with("Exit code:")
-                                            || line.contains("failed")
-                                    })
-                                    .take(3) // Limit to 3 most relevant error lines
-                                    .collect::<Vec<&str>>();
+                        // If step failed and we're not in verbose mode, show condensed error info
+                        if step.status == wrkflw_executor::StepStatus::Failure && !verbose {
+                            // Extract error information from step output
+                            let error_lines = step
+                                .output
+                                .lines()
+                                .filter(|line| {
+                                    line.contains("error:")
+                                        || line.contains("Error:")
+                                        || line.trim().starts_with("Exit code:")
+                                        || line.contains("failed")
+                                })
+                                .take(3) // Limit to 3 most relevant error lines
+                                .collect::<Vec<&str>>();
 
-                                if !error_lines.is_empty() {
-                                    println!("      Error details:");
-                                    for line in error_lines {
-                                        println!("      {}", line.trim());
-                                    }
+                            if !error_lines.is_empty() {
+                                println!("      Error details:");
+                                for line in error_lines {
+                                    println!("      {}", line.trim());
+                                }
 
-                                    if step.output.lines().count() > 3 {
-                                        println!("      (Use --verbose for full output)");
-                                    }
+                                if step.output.lines().count() > 3 {
+                                    println!("      (Use --verbose for full output)");
                                 }
                             }
                         }
@@ -542,7 +539,7 @@ async fn main() {
         Some(Commands::Tui {
             path,
             runtime,
-            show_action_messages: _,
+            show_action_messages,
             preserve_containers_on_failure,
         }) => {
             // Set runtime type based on the runtime choice
@@ -554,6 +551,7 @@ async fn main() {
                 runtime_type,
                 verbose,
                 *preserve_containers_on_failure,
+                *show_action_messages,
             )
             .await
             {
@@ -587,7 +585,9 @@ async fn main() {
             let runtime_type = wrkflw_executor::RuntimeType::Docker;
 
             // Call the TUI implementation from the ui crate with default path
-            if let Err(e) = wrkflw_ui::run_wrkflw_tui(None, runtime_type, verbose, false).await {
+            if let Err(e) =
+                wrkflw_ui::run_wrkflw_tui(None, runtime_type, verbose, false, false).await
+            {
                 eprintln!("Error running TUI: {}", e);
                 std::process::exit(1);
             }

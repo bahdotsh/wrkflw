@@ -74,9 +74,37 @@ pub fn expand_matrix(matrix: &MatrixConfig) -> Result<Vec<MatrixCombination>, Ma
     let filtered_combinations = apply_exclude_filters(param_combinations, &matrix.exclude);
     combinations.extend(filtered_combinations);
 
-    // Step 3: Add any combinations from the include section
+    // Step 3: Process include entries per GitHub Actions semantics:
+    // If an include entry matches all shared keys of an existing combination,
+    // merge extra keys into it. Otherwise, add as a new standalone combination.
     for include_item in &matrix.include {
-        combinations.push(MatrixCombination::from_include(include_item.clone()));
+        let mut merged = false;
+        for combo in &mut combinations {
+            let all_shared_keys_match = include_item.iter().all(|(key, value)| {
+                match combo.values.get(key) {
+                    Some(existing_value) => existing_value == value,
+                    None => true, // Key not in base combo = no conflict, it's a new key to add
+                }
+            });
+            // Only merge if there's at least one matching key (not purely new keys)
+            let has_matching_key = include_item
+                .keys()
+                .any(|key| combo.values.contains_key(key));
+            if all_shared_keys_match && has_matching_key {
+                // Merge extra keys into the existing combination
+                for (key, value) in include_item {
+                    combo
+                        .values
+                        .entry(key.clone())
+                        .or_insert_with(|| value.clone());
+                }
+                merged = true;
+                // Don't break — merge into ALL matching combinations per GitHub Actions semantics
+            }
+        }
+        if !merged {
+            combinations.push(MatrixCombination::from_include(include_item.clone()));
+        }
     }
 
     if combinations.is_empty() {

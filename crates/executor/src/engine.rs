@@ -1,7 +1,6 @@
 #[allow(unused_imports)]
 use bollard::Docker;
 use futures::future;
-use regex;
 use serde_yaml::Value;
 use std::collections::HashMap;
 use std::fs;
@@ -897,7 +896,7 @@ async fn execute_job_with_matrix(
     }
 
     // Check if this is a matrix job
-    if let Some(matrix_config) = &job.matrix {
+    if let Some(matrix_config) = job.matrix_config() {
         // Expand the matrix into combinations
         let combinations = wrkflw_matrix::expand_matrix(matrix_config)
             .map_err(|e| ExecutionError::Execution(format!("Failed to expand matrix: {}", e)))?;
@@ -918,7 +917,7 @@ async fn execute_job_with_matrix(
         ));
 
         // Set maximum parallel jobs
-        let max_parallel = matrix_config.max_parallel.unwrap_or_else(|| {
+        let max_parallel = job.max_parallel().unwrap_or_else(|| {
             // If not specified, use a reasonable default based on CPU cores
             std::cmp::max(1, num_cpus::get())
         });
@@ -929,7 +928,7 @@ async fn execute_job_with_matrix(
             job_template: job,
             combinations: &combinations,
             max_parallel,
-            fail_fast: matrix_config.fail_fast.unwrap_or(true),
+            fail_fast: job.fail_fast(),
             workflow,
             runtime,
             env_context,
@@ -1005,6 +1004,28 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
     let runner_image_value = get_effective_runner_image(job);
 
     for (idx, step) in job.steps.iter().enumerate() {
+        let step_name = step
+            .name
+            .clone()
+            .unwrap_or_else(|| format!("Step {}", idx + 1));
+
+        // Check step-level if condition
+        if let Some(if_cond) = &step.if_condition {
+            let should_run = evaluate_job_condition(if_cond, &job_env, ctx.workflow);
+            if !should_run {
+                wrkflw_logging::info(&format!(
+                    "  ⏭️ Skipping step '{}' due to condition: {}",
+                    step_name, if_cond
+                ));
+                step_results.push(StepResult {
+                    name: step_name,
+                    status: StepStatus::Skipped,
+                    output: format!("Skipped due to condition: {}", if_cond),
+                });
+                continue;
+            }
+        }
+
         let step_result = execute_step(StepExecutionContext {
             step,
             step_idx: idx,
@@ -1025,7 +1046,14 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
             Ok(result) => {
                 // Check if step was successful
                 if result.status == StepStatus::Failure {
-                    job_success = false;
+                    if step.continue_on_error == Some(true) {
+                        wrkflw_logging::info(&format!(
+                            "  Step '{}' failed but continue-on-error is set, continuing",
+                            result.name
+                        ));
+                    } else {
+                        job_success = false;
+                    }
                 }
 
                 // Add step output to logs only in verbose mode or if there's an error
@@ -1045,21 +1073,30 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
                 step_results.push(result);
             }
             Err(e) => {
-                job_success = false;
-                job_logs.push_str(&format!("\n=== ERROR in step {} ===\n{}\n", idx + 1, e));
+                if step.continue_on_error == Some(true) {
+                    wrkflw_logging::info(&format!(
+                        "  Step '{}' errored but continue-on-error is set, continuing",
+                        step_name
+                    ));
+                    step_results.push(StepResult {
+                        name: step_name,
+                        status: StepStatus::Failure,
+                        output: format!("Error: {}", e),
+                    });
+                } else {
+                    job_success = false;
+                    job_logs.push_str(&format!("\n=== ERROR in step {} ===\n{}\n", idx + 1, e));
 
-                // Record the error as a failed step
-                step_results.push(StepResult {
-                    name: step
-                        .name
-                        .clone()
-                        .unwrap_or_else(|| format!("Step {}", idx + 1)),
-                    status: StepStatus::Failure,
-                    output: format!("Error: {}", e),
-                });
+                    // Record the error as a failed step
+                    step_results.push(StepResult {
+                        name: step_name,
+                        status: StepStatus::Failure,
+                        output: format!("Error: {}", e),
+                    });
 
-                // Stop executing further steps
-                break;
+                    // Stop executing further steps
+                    break;
+                }
             }
         }
     }
@@ -1213,6 +1250,28 @@ async fn execute_matrix_job(
         let runner_image_value = get_effective_runner_image(job_template);
 
         for (idx, step) in job_template.steps.iter().enumerate() {
+            let step_name_for_skip = step
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("Step {}", idx + 1));
+
+            // Check step-level if condition
+            if let Some(if_cond) = &step.if_condition {
+                let should_run = evaluate_job_condition(if_cond, &job_env, workflow);
+                if !should_run {
+                    wrkflw_logging::info(&format!(
+                        "  ⏭️ Skipping step '{}' due to condition: {}",
+                        step_name_for_skip, if_cond
+                    ));
+                    step_results.push(StepResult {
+                        name: step_name_for_skip,
+                        status: StepStatus::Skipped,
+                        output: format!("Skipped due to condition: {}", if_cond),
+                    });
+                    continue;
+                }
+            }
+
             match execute_step(StepExecutionContext {
                 step,
                 step_idx: idx,
@@ -1245,13 +1304,21 @@ async fn execute_matrix_job(
                     step_results.push(result.clone());
 
                     if result.status != StepStatus::Success {
-                        // Step failed, abort job
-                        return Ok(JobResult {
-                            name: matrix_job_name,
-                            status: JobStatus::Failure,
-                            steps: step_results,
-                            logs: job_logs,
-                        });
+                        if step.continue_on_error == Some(true) {
+                            wrkflw_logging::info(&format!(
+                                "  Step '{}' failed but continue-on-error is set",
+                                step_name_for_skip
+                            ));
+                            // Don't abort, continue to next step
+                        } else {
+                            // Step failed, abort job
+                            return Ok(JobResult {
+                                name: matrix_job_name,
+                                status: JobStatus::Failure,
+                                steps: step_results,
+                                logs: job_logs,
+                            });
+                        }
                     }
                 }
                 Err(e) => {
@@ -1491,41 +1558,14 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                                     // Add any arguments if specified
                                     if let Some(args) = with_params.get("args") {
                                         if !args.is_empty() {
-                                            // Resolve GitHub-style variables in args
-                                            let resolved_args = if args.contains("${{") {
-                                                wrkflw_logging::info(&format!(
-                                                    "🔄 Resolving workflow variables in: {}",
-                                                    args
-                                                ));
-
-                                                // Handle common matrix variables
-                                                let mut resolved =
-                                                    args.replace("${{ matrix.target }}", "");
-                                                resolved = resolved.replace("${{ matrix.os }}", "");
-
-                                                // Handle any remaining ${{ variables }} by removing them
-                                                let re_pattern =
-                                                    regex::Regex::new(r"\$\{\{\s*([^}]+)\s*\}\}")
-                                                        .unwrap_or_else(|_| {
-                                                            wrkflw_logging::error(
-                                                                "Failed to create regex pattern",
-                                                            );
-                                                            regex::Regex::new(r"\$\{\{.*?\}\}")
-                                                                .unwrap()
-                                                        });
-
-                                                let resolved = re_pattern
-                                                    .replace_all(&resolved, "")
-                                                    .to_string();
-                                                wrkflw_logging::info(&format!(
-                                                    "🔄 Resolved to: {}",
-                                                    resolved
-                                                ));
-
-                                                resolved.trim().to_string()
-                                            } else {
-                                                args.clone()
-                                            };
+                                            // Resolve GitHub-style matrix variables in args
+                                            let resolved_args =
+                                                crate::substitution::process_step_run(
+                                                    args,
+                                                    ctx.matrix_combination,
+                                                )
+                                                .trim()
+                                                .to_string();
 
                                             // Only add if we have something left after resolving variables
                                             // and it's not just "--target" without a value
@@ -1674,39 +1714,13 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                                 // Add any arguments if specified
                                 if let Some(args) = with_params.get("args") {
                                     if !args.is_empty() {
-                                        // Resolve GitHub-style variables in args
-                                        let resolved_args = if args.contains("${{") {
-                                            wrkflw_logging::info(&format!(
-                                                "🔄 Resolving workflow variables in: {}",
-                                                args
-                                            ));
-
-                                            // Handle common matrix variables
-                                            let mut resolved =
-                                                args.replace("${{ matrix.target }}", "");
-                                            resolved = resolved.replace("${{ matrix.os }}", "");
-
-                                            // Handle any remaining ${{ variables }} by removing them
-                                            let re_pattern =
-                                                regex::Regex::new(r"\$\{\{\s*([^}]+)\s*\}\}")
-                                                    .unwrap_or_else(|_| {
-                                                        wrkflw_logging::error(
-                                                            "Failed to create regex pattern",
-                                                        );
-                                                        regex::Regex::new(r"\$\{\{.*?\}\}").unwrap()
-                                                    });
-
-                                            let resolved =
-                                                re_pattern.replace_all(&resolved, "").to_string();
-                                            wrkflw_logging::info(&format!(
-                                                "🔄 Resolved to: {}",
-                                                resolved
-                                            ));
-
-                                            resolved.trim().to_string()
-                                        } else {
-                                            args.clone()
-                                        };
+                                        // Resolve GitHub-style matrix variables in args
+                                        let resolved_args = crate::substitution::process_step_run(
+                                            args,
+                                            ctx.matrix_combination,
+                                        )
+                                        .trim()
+                                        .to_string();
 
                                         // Only add if we have something left after resolving variables
                                         if !resolved_args.is_empty() {
@@ -2063,6 +2077,11 @@ fn copy_directory_contents_with_gitignore(
             entry.map_err(|e| ExecutionError::Execution(format!("Failed to read entry: {}", e)))?;
         let path = entry.path();
 
+        if path.is_symlink() {
+            wrkflw_logging::debug(&format!("Skipping symlink: {:?}", path));
+            continue;
+        }
+
         // Check if the file should be ignored according to .gitignore
         if let Some(gitignore) = gitignore {
             let relative_path = path.strip_prefix(from).unwrap_or(&path);
@@ -2292,6 +2311,10 @@ fn prepare_container_mounts(
         for vol_spec in container_volumes {
             if vol_spec.is_empty() {
                 wrkflw_logging::warning("skipping empty volume spec");
+                continue;
+            }
+            if vol_spec.contains("..") {
+                wrkflw_logging::warning(&format!("Skipping suspicious volume path: {}", vol_spec));
                 continue;
             }
             // NOTE: splitn(3, ':') won't correctly handle Windows-style host paths (e.g. C:\data:/container)
@@ -2888,6 +2911,11 @@ fn convert_yaml_to_step(step_yaml: &serde_yaml::Value) -> Result<workflow::Step,
         with,
         env,
         continue_on_error,
+        if_condition: None,
+        id: None,
+        working_directory: None,
+        shell: None,
+        timeout_minutes: None,
     })
 }
 
@@ -2988,7 +3016,7 @@ mod tests {
             container,
             steps: Vec::new(),
             env: HashMap::new(),
-            matrix: None,
+            strategy: None,
             services: HashMap::new(),
             if_condition: None,
             outputs: None,

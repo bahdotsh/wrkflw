@@ -135,7 +135,7 @@ pub fn convert_to_workflow_format(pipeline: &Pipeline) -> workflow::WorkflowDefi
             container: None,
             steps: Vec::new(),
             env: HashMap::new(),
-            matrix: None,
+            strategy: None,
             services: HashMap::new(),
             if_condition: None,
             outputs: None,
@@ -168,6 +168,11 @@ pub fn convert_to_workflow_format(pipeline: &Pipeline) -> workflow::WorkflowDefi
                     with: None,
                     env: HashMap::new(),
                     continue_on_error: None,
+                    if_condition: None,
+                    id: None,
+                    working_directory: None,
+                    shell: None,
+                    timeout_minutes: None,
                 };
                 job.steps.push(step);
             }
@@ -183,6 +188,11 @@ pub fn convert_to_workflow_format(pipeline: &Pipeline) -> workflow::WorkflowDefi
                     with: None,
                     env: HashMap::new(),
                     continue_on_error: None,
+                    if_condition: None,
+                    id: None,
+                    working_directory: None,
+                    shell: None,
+                    timeout_minutes: None,
                 };
                 job.steps.push(step);
             }
@@ -198,6 +208,11 @@ pub fn convert_to_workflow_format(pipeline: &Pipeline) -> workflow::WorkflowDefi
                     with: None,
                     env: HashMap::new(),
                     continue_on_error: Some(true), // After script should continue even if previous steps fail
+                    if_condition: None,
+                    id: None,
+                    working_directory: None,
+                    shell: None,
+                    timeout_minutes: None,
                 };
                 job.steps.push(step);
             }

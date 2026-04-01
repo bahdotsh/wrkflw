@@ -76,23 +76,29 @@ pub fn get_repo_info() -> Result<RepoInfo, GitlabError> {
             .as_str()
             .to_string();
 
-        // Get the default branch
-        let branch_output = Command::new("git")
-            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        // Get the default branch (try remote HEAD first, fall back to current branch)
+        let default_branch = Command::new("git")
+            .args(["symbolic-ref", "refs/remotes/origin/HEAD"])
             .output()
-            .map_err(|e| {
-                GitlabError::GitParseError(format!("Failed to execute git command: {}", e))
-            })?;
-
-        if !branch_output.status.success() {
-            return Err(GitlabError::GitParseError(
-                "Failed to get current branch".to_string(),
-            ));
-        }
-
-        let default_branch = String::from_utf8_lossy(&branch_output.stdout)
-            .trim()
-            .to_string();
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| {
+                let full_ref = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                full_ref
+                    .strip_prefix("refs/remotes/origin/")
+                    .unwrap_or(&full_ref)
+                    .to_string()
+            })
+            .unwrap_or_else(|| {
+                // Fall back to current branch
+                Command::new("git")
+                    .args(["rev-parse", "--abbrev-ref", "HEAD"])
+                    .output()
+                    .ok()
+                    .filter(|o| o.status.success())
+                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                    .unwrap_or_else(|| "main".to_string())
+            });
 
         Ok(RepoInfo {
             namespace,

@@ -25,8 +25,48 @@ impl ValidationResult {
 
 // GitLab pipeline models
 pub mod gitlab {
-    use serde::{Deserialize, Serialize};
+    use serde::{Deserialize, Deserializer, Serialize};
     use std::collections::HashMap;
+
+    fn deserialize_string_or_vec<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum StringOrVec {
+            String(String),
+            Vec(Vec<String>),
+        }
+        let value = Option::<StringOrVec>::deserialize(deserializer)?;
+        match value {
+            Some(StringOrVec::String(s)) => Ok(Some(vec![s])),
+            Some(StringOrVec::Vec(v)) => Ok(Some(v)),
+            None => Ok(None),
+        }
+    }
+
+    fn deserialize_variables<'de, D>(
+        deserializer: D,
+    ) -> Result<Option<HashMap<String, String>>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let opt: Option<HashMap<String, serde_yaml::Value>> = Option::deserialize(deserializer)?;
+        Ok(opt.map(|m| {
+            m.into_iter()
+                .map(|(k, v)| {
+                    let s = match v {
+                        serde_yaml::Value::String(s) => s,
+                        serde_yaml::Value::Number(n) => n.to_string(),
+                        serde_yaml::Value::Bool(b) => b.to_string(),
+                        other => serde_yaml::to_string(&other).unwrap_or_default(),
+                    };
+                    (k, s)
+                })
+                .collect()
+        }))
+    }
 
     /// Represents a GitLab CI/CD pipeline configuration
     #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -36,7 +76,11 @@ pub mod gitlab {
         pub image: Option<Image>,
 
         /// Global variables available to all jobs
-        #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "deserialize_variables"
+        )]
         pub variables: Option<HashMap<String, String>>,
 
         /// Pipeline stages in execution order
@@ -44,12 +88,24 @@ pub mod gitlab {
         pub stages: Option<Vec<String>>,
 
         /// Default before_script for all jobs
-        #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "deserialize_string_or_vec"
+        )]
         pub before_script: Option<Vec<String>>,
 
         /// Default after_script for all jobs
-        #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "deserialize_string_or_vec"
+        )]
         pub after_script: Option<Vec<String>>,
+
+        /// Default settings for all jobs
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub default: Option<serde_yaml::Value>,
 
         /// Job definitions (name => job)
         #[serde(flatten)]
@@ -76,15 +132,27 @@ pub mod gitlab {
         pub image: Option<Image>,
 
         /// Script commands to run
-        #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "deserialize_string_or_vec"
+        )]
         pub script: Option<Vec<String>>,
 
         /// Commands to run before the main script
-        #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "deserialize_string_or_vec"
+        )]
         pub before_script: Option<Vec<String>>,
 
         /// Commands to run after the main script
-        #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "deserialize_string_or_vec"
+        )]
         pub after_script: Option<Vec<String>>,
 
         /// When to run the job (on_success, on_failure, always, manual)
@@ -104,7 +172,11 @@ pub mod gitlab {
         pub tags: Option<Vec<String>>,
 
         /// Job-specific variables
-        #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "deserialize_variables"
+        )]
         pub variables: Option<HashMap<String, String>>,
 
         /// Job dependencies
@@ -148,8 +220,20 @@ pub mod gitlab {
         pub template: Option<bool>,
 
         /// List of jobs this job extends from
-        #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "deserialize_string_or_vec"
+        )]
         pub extends: Option<Vec<String>>,
+
+        /// Job needs (dependencies with more granular control)
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub needs: Option<serde_yaml::Value>,
+
+        /// Whether the job can be interrupted by a newer pipeline
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub interruptible: Option<bool>,
     }
 
     /// Docker image configuration
@@ -199,6 +283,25 @@ pub mod gitlab {
         /// When to upload artifacts (on_success, on_failure, always)
         #[serde(skip_serializing_if = "Option::is_none")]
         pub when: Option<String>,
+        /// Reports configuration (e.g., junit, coverage_report)
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub reports: Option<serde_yaml::Value>,
+    }
+
+    /// Cache key configuration
+    #[derive(Debug, Serialize, Deserialize, Clone)]
+    #[serde(untagged)]
+    pub enum CacheKey {
+        /// Simple string key
+        Simple(String),
+        /// Structured key with files and optional prefix
+        Structured {
+            /// Files to use for cache key generation
+            files: Vec<String>,
+            /// Optional prefix for the cache key
+            #[serde(skip_serializing_if = "Option::is_none")]
+            prefix: Option<String>,
+        },
     }
 
     /// Cache configuration
@@ -206,7 +309,7 @@ pub mod gitlab {
     pub struct Cache {
         /// Cache key
         #[serde(skip_serializing_if = "Option::is_none")]
-        pub key: Option<String>,
+        pub key: Option<CacheKey>,
         /// Paths to cache
         #[serde(skip_serializing_if = "Option::is_none")]
         pub paths: Option<Vec<String>>,

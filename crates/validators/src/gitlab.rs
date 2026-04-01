@@ -200,15 +200,16 @@ fn check_circular_extends(
 fn validate_artifacts(jobs: &HashMap<String, Job>, result: &mut ValidationResult) {
     for (job_name, job) in jobs {
         if let Some(artifacts) = &job.artifacts {
-            // Check that paths are specified
+            // Check that paths or reports are specified
+            let has_reports = artifacts.reports.is_some();
             if let Some(paths) = &artifacts.paths {
-                if paths.is_empty() {
+                if paths.is_empty() && !has_reports {
                     result.add_issue(format!(
                         "Job '{}' has artifacts section with empty paths",
                         job_name
                     ));
                 }
-            } else {
+            } else if !has_reports {
                 result.add_issue(format!(
                     "Job '{}' has artifacts section without specifying paths",
                     job_name

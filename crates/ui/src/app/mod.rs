@@ -27,6 +27,7 @@ pub async fn run_wrkflw_tui(
     runtime_type: RuntimeType,
     verbose: bool,
     preserve_containers_on_failure: bool,
+    show_action_messages: bool,
 ) -> io::Result<()> {
     // Terminal setup
     enable_raw_mode()?;
@@ -46,6 +47,7 @@ pub async fn run_wrkflw_tui(
         runtime_type.clone(),
         tx.clone(),
         preserve_containers_on_failure,
+        show_action_messages,
     );
 
     if app.validation_mode {

@@ -116,11 +116,8 @@ impl SecretMasker {
             self.mask_char.to_string().repeat(3)
         } else if len <= 8 {
             // Short secrets - show first character
-            format!(
-                "{}{}",
-                secret.chars().next().unwrap(),
-                self.mask_char.to_string().repeat(len - 1)
-            )
+            let first = secret.chars().next().unwrap_or(self.mask_char);
+            format!("{}{}", first, self.mask_char.to_string().repeat(len - 1))
         } else {
             // Longer secrets - show first 2 and last 2 characters
             let chars: Vec<char> = secret.chars().collect();

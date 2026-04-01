@@ -132,6 +132,16 @@ pub struct WorkflowDefinition {
     pub jobs: HashMap<String, Job>,
 }
 
+#[derive(Debug, Deserialize, Serialize, Default)]
+pub struct Strategy {
+    #[serde(default)]
+    pub matrix: Option<MatrixConfig>,
+    #[serde(default, rename = "fail-fast")]
+    pub fail_fast: Option<bool>,
+    #[serde(default, rename = "max-parallel")]
+    pub max_parallel: Option<usize>,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Job {
     #[serde(rename = "runs-on", default, deserialize_with = "deserialize_runs_on")]
@@ -145,7 +155,7 @@ pub struct Job {
     #[serde(default)]
     pub env: HashMap<String, String>,
     #[serde(default)]
-    pub matrix: Option<MatrixConfig>,
+    pub strategy: Option<Strategy>,
     #[serde(default)]
     pub services: HashMap<String, Service>,
     #[serde(default, rename = "if")]
@@ -161,6 +171,30 @@ pub struct Job {
     pub with: Option<HashMap<String, String>>,
     #[serde(default)]
     pub secrets: Option<serde_yaml::Value>,
+}
+
+impl Job {
+    /// Get the matrix config from strategy, if present
+    pub fn matrix_config(&self) -> Option<&MatrixConfig> {
+        self.strategy.as_ref().and_then(|s| s.matrix.as_ref())
+    }
+
+    /// Get fail-fast setting: strategy-level takes precedence, then matrix-level, default true
+    pub fn fail_fast(&self) -> bool {
+        self.strategy
+            .as_ref()
+            .and_then(|s| s.fail_fast)
+            .or_else(|| self.matrix_config().and_then(|m| m.fail_fast))
+            .unwrap_or(true)
+    }
+
+    /// Get max-parallel setting: strategy-level takes precedence, then matrix-level
+    pub fn max_parallel(&self) -> Option<usize> {
+        self.strategy
+            .as_ref()
+            .and_then(|s| s.max_parallel)
+            .or_else(|| self.matrix_config().and_then(|m| m.max_parallel))
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -188,8 +222,18 @@ pub struct Step {
     pub with: Option<HashMap<String, String>>,
     #[serde(default)]
     pub env: HashMap<String, String>,
-    #[serde(default)]
+    #[serde(default, rename = "continue-on-error")]
     pub continue_on_error: Option<bool>,
+    #[serde(default, rename = "if")]
+    pub if_condition: Option<String>,
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default, rename = "working-directory")]
+    pub working_directory: Option<String>,
+    #[serde(default)]
+    pub shell: Option<String>,
+    #[serde(default, rename = "timeout-minutes")]
+    pub timeout_minutes: Option<f64>,
 }
 
 impl WorkflowDefinition {
@@ -614,5 +658,74 @@ jobs:
         let json = serde_json::to_string(&creds).unwrap();
         assert!(json.contains("user"));
         assert!(!json.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn parse_step_with_all_new_fields() {
+        let temp_dir = tempdir().unwrap();
+        let workflow_path = temp_dir.path().join("workflow.yml");
+
+        let content = r#"
+name: step-fields-test
+on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - id: build-step
+        name: Build
+        if: github.ref == 'refs/heads/main'
+        run: cargo build
+        shell: bash
+        working-directory: ./src
+        timeout-minutes: 10.5
+        continue-on-error: true
+"#;
+        fs::write(&workflow_path, content).unwrap();
+
+        let parsed = parse_workflow(&workflow_path).unwrap();
+        let job = parsed.jobs.get("test").unwrap();
+        let step = &job.steps[0];
+        assert_eq!(step.id.as_deref(), Some("build-step"));
+        assert_eq!(
+            step.if_condition.as_deref(),
+            Some("github.ref == 'refs/heads/main'")
+        );
+        assert_eq!(step.shell.as_deref(), Some("bash"));
+        assert_eq!(step.working_directory.as_deref(), Some("./src"));
+        assert_eq!(step.timeout_minutes, Some(10.5));
+        assert_eq!(step.continue_on_error, Some(true));
+    }
+
+    #[test]
+    fn parse_strategy_matrix() {
+        let temp_dir = tempdir().unwrap();
+        let workflow_path = temp_dir.path().join("workflow.yml");
+
+        let content = r#"
+name: matrix-test
+on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        node: [16, 18]
+    steps:
+      - run: echo hi
+"#;
+        fs::write(&workflow_path, content).unwrap();
+
+        let parsed = parse_workflow(&workflow_path).unwrap();
+        let job = parsed.jobs.get("test").unwrap();
+        assert!(job.matrix_config().is_some());
+        let matrix = job.matrix_config().unwrap();
+        assert!(matrix.parameters.contains_key("os"));
+        assert!(matrix.parameters.contains_key("node"));
+        assert!(!job.fail_fast());
+        assert_eq!(job.max_parallel(), Some(2));
     }
 }

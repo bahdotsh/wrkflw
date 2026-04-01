@@ -222,7 +222,7 @@ pub mod gitlab {
     #[derive(Debug, Serialize, Deserialize, Clone)]
     pub struct Rule {
         /// If condition expression
-        #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(rename = "if", skip_serializing_if = "Option::is_none")]
         pub if_: Option<String>,
         /// When to run if condition is true
         #[serde(skip_serializing_if = "Option::is_none")]

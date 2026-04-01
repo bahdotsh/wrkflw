@@ -110,10 +110,15 @@ async fn execute_github_workflow(
         },
     );
 
-    // Add flag to hide GitHub action messages when in emulation mode
+    // Add flag to control GitHub action message visibility
     env_context.insert(
         "WRKFLW_HIDE_ACTION_MESSAGES".to_string(),
-        "true".to_string(),
+        if config.show_action_messages {
+            "false"
+        } else {
+            "true"
+        }
+        .to_string(),
     );
 
     // Setup GitHub environment files
@@ -472,6 +477,7 @@ pub struct ExecutionConfig {
     pub verbose: bool,
     pub preserve_containers_on_failure: bool,
     pub secrets_config: Option<SecretConfig>,
+    pub show_action_messages: bool,
 }
 
 pub struct ExecutionResult {

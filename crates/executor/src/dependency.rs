@@ -105,7 +105,18 @@ pub fn resolve_dependencies(workflow: &WorkflowDefinition) -> Result<Vec<Vec<Str
         .collect();
 
     if processed_jobs.len() < jobs.len() {
-        return Err("Circular dependency detected in workflow jobs".to_string());
+        let unprocessed: Vec<&String> = jobs
+            .keys()
+            .filter(|j| !processed_jobs.contains(*j))
+            .collect();
+        return Err(format!(
+            "Circular dependency detected in workflow jobs: {}",
+            unprocessed
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
     }
 
     Ok(result)

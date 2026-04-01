@@ -142,47 +142,46 @@ pub fn render_status_bar(f: &mut Frame<CrosstermBackend<io::Stdout>>, app: &App,
 
     // Add context-specific help based on current tab
     status_items.push(Span::raw(" "));
-    let help_text = match app.selected_tab {
+    let help_text: String = match app.selected_tab {
         0 => {
             if let Some(idx) = app.workflow_list_state.selected() {
                 if idx < app.workflows.len() {
                     let workflow = &app.workflows[idx];
                     match workflow.status {
-                        crate::models::WorkflowStatus::NotStarted => "[Space] Toggle selection   [Enter] Run selected   [r] Run all selected   [t] Trigger Workflow  [Shift+R] Reset workflow",
-                        crate::models::WorkflowStatus::Running => "[Space] Toggle selection   [Enter] Run selected   [r] Run all selected   (Workflow running...)",
-                        crate::models::WorkflowStatus::Success | crate::models::WorkflowStatus::Failed | crate::models::WorkflowStatus::Skipped => "[Space] Toggle selection   [Enter] Run selected   [r] Run all selected   [Shift+R] Reset workflow",
+                        crate::models::WorkflowStatus::NotStarted => "[Space] Toggle selection   [Enter] Run selected   [r] Run all selected   [t] Trigger Workflow  [Shift+R] Reset workflow".to_string(),
+                        crate::models::WorkflowStatus::Running => "[Space] Toggle selection   [Enter] Run selected   [r] Run all selected   (Workflow running...)".to_string(),
+                        crate::models::WorkflowStatus::Success | crate::models::WorkflowStatus::Failed | crate::models::WorkflowStatus::Skipped => "[Space] Toggle selection   [Enter] Run selected   [r] Run all selected   [Shift+R] Reset workflow".to_string(),
                     }
                 } else {
                     "[Space] Toggle selection   [Enter] Run selected   [r] Run all selected"
+                        .to_string()
                 }
             } else {
-                "[Space] Toggle selection   [Enter] Run selected   [r] Run all selected"
+                "[Space] Toggle selection   [Enter] Run selected   [r] Run all selected".to_string()
             }
         }
         1 => {
             if app.detailed_view {
-                "[Esc] Back to jobs   [↑/↓] Navigate steps"
+                "[Esc] Back to jobs   [↑/↓] Navigate steps".to_string()
             } else {
-                "[Enter] View details   [↑/↓] Navigate jobs"
+                "[Enter] View details   [↑/↓] Navigate jobs".to_string()
             }
         }
         2 => {
             // For logs tab, show scrolling instructions
             let log_count = app.logs.len() + wrkflw_logging::get_logs().len();
             if log_count > 0 {
-                // Convert to a static string for consistent return type
-                let scroll_text = format!(
+                format!(
                     "[↑/↓] Scroll logs ({}/{}) [s] Search [f] Filter",
                     app.log_scroll + 1,
                     log_count
-                );
-                Box::leak(scroll_text.into_boxed_str())
+                )
             } else {
-                "[No logs to display]"
+                "[No logs to display]".to_string()
             }
         }
-        3 => "[↑/↓] Scroll help   [?] Toggle help overlay",
-        _ => "",
+        3 => "[↑/↓] Scroll help   [?] Toggle help overlay".to_string(),
+        _ => String::new(),
     };
     status_items.push(Span::styled(
         format!(" {} ", help_text),

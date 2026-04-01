@@ -10,12 +10,10 @@ use std::collections::HashMap;
 /// Encrypted secret storage for sensitive data at rest
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EncryptedSecretStore {
-    /// Encrypted secrets map (base64 encoded)
+    /// Encrypted secrets map (base64 encoded, nonce prepended to ciphertext)
     secrets: HashMap<String, String>,
     /// Salt for key derivation (base64 encoded)
     salt: String,
-    /// Nonce for encryption (base64 encoded)
-    nonce: String,
 }
 
 impl EncryptedSecretStore {
@@ -23,29 +21,23 @@ impl EncryptedSecretStore {
     pub fn new() -> SecretResult<(Self, [u8; 32])> {
         let key = Aes256Gcm::generate_key(&mut OsRng);
         let salt = Self::generate_salt();
-        let nonce = Self::generate_nonce();
 
         let store = Self {
             secrets: HashMap::new(),
             salt: general_purpose::STANDARD.encode(salt),
-            nonce: general_purpose::STANDARD.encode(nonce),
         };
 
         Ok((store, key.into()))
     }
 
     /// Create an encrypted secret store from existing data
-    pub fn from_data(secrets: HashMap<String, String>, salt: String, nonce: String) -> Self {
-        Self {
-            secrets,
-            salt,
-            nonce,
-        }
+    pub fn from_data(secrets: HashMap<String, String>, salt: String, _nonce: String) -> Self {
+        Self { secrets, salt }
     }
 
     /// Add an encrypted secret
     pub fn add_secret(&mut self, key: &[u8; 32], name: &str, value: &str) -> SecretResult<()> {
-        let encrypted = self.encrypt_value(key, value)?;
+        let encrypted = Self::encrypt_value(key, value)?;
         self.secrets.insert(name.to_string(), encrypted);
         Ok(())
     }
@@ -57,7 +49,7 @@ impl EncryptedSecretStore {
             .get(name)
             .ok_or_else(|| SecretError::not_found(name))?;
 
-        self.decrypt_value(key, encrypted)
+        Self::decrypt_value(key, encrypted)
     }
 
     /// Remove a secret
@@ -85,47 +77,42 @@ impl EncryptedSecretStore {
         self.secrets.clear();
     }
 
-    /// Encrypt a value
-    fn encrypt_value(&self, key: &[u8; 32], value: &str) -> SecretResult<String> {
+    /// Encrypt a value with a fresh nonce prepended to the ciphertext
+    fn encrypt_value(key: &[u8; 32], value: &str) -> SecretResult<String> {
         let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
-        let nonce_bytes = general_purpose::STANDARD
-            .decode(&self.nonce)
-            .map_err(|e| SecretError::EncryptionError(format!("Invalid nonce: {}", e)))?;
-
-        if nonce_bytes.len() != 12 {
-            return Err(SecretError::EncryptionError(
-                "Invalid nonce length".to_string(),
-            ));
-        }
-
+        let nonce_bytes = Self::generate_nonce();
         let nonce = Nonce::from_slice(&nonce_bytes);
+
         let ciphertext = cipher
             .encrypt(nonce, value.as_bytes())
             .map_err(|e| SecretError::EncryptionError(format!("Encryption failed: {}", e)))?;
 
-        Ok(general_purpose::STANDARD.encode(&ciphertext))
+        // Prepend nonce to ciphertext so each secret carries its own nonce
+        let mut combined = Vec::with_capacity(nonce_bytes.len() + ciphertext.len());
+        combined.extend_from_slice(&nonce_bytes);
+        combined.extend_from_slice(&ciphertext);
+
+        Ok(general_purpose::STANDARD.encode(&combined))
     }
 
-    /// Decrypt a value
-    fn decrypt_value(&self, key: &[u8; 32], encrypted: &str) -> SecretResult<String> {
+    /// Decrypt a value (nonce is extracted from the ciphertext prefix)
+    fn decrypt_value(key: &[u8; 32], encrypted: &str) -> SecretResult<String> {
         let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
-        let nonce_bytes = general_purpose::STANDARD
-            .decode(&self.nonce)
-            .map_err(|e| SecretError::EncryptionError(format!("Invalid nonce: {}", e)))?;
-
-        if nonce_bytes.len() != 12 {
-            return Err(SecretError::EncryptionError(
-                "Invalid nonce length".to_string(),
-            ));
-        }
-
-        let nonce = Nonce::from_slice(&nonce_bytes);
-        let ciphertext = general_purpose::STANDARD
+        let combined = general_purpose::STANDARD
             .decode(encrypted)
             .map_err(|e| SecretError::EncryptionError(format!("Invalid ciphertext: {}", e)))?;
 
+        if combined.len() < 12 {
+            return Err(SecretError::EncryptionError(
+                "Ciphertext too short to contain nonce".to_string(),
+            ));
+        }
+
+        let (nonce_bytes, ciphertext) = combined.split_at(12);
+        let nonce = Nonce::from_slice(nonce_bytes);
+
         let plaintext = cipher
-            .decrypt(nonce, ciphertext.as_ref())
+            .decrypt(nonce, ciphertext)
             .map_err(|e| SecretError::EncryptionError(format!("Decryption failed: {}", e)))?;
 
         String::from_utf8(plaintext)
@@ -177,8 +164,10 @@ impl EncryptedSecretStore {
 
 impl Default for EncryptedSecretStore {
     fn default() -> Self {
-        let (store, _) = Self::new().expect("Failed to create default encrypted store");
-        store
+        Self {
+            secrets: HashMap::new(),
+            salt: general_purpose::STANDARD.encode(Self::generate_salt()),
+        }
     }
 }
 
@@ -316,6 +305,25 @@ mod tests {
             restored_store.get_secret(&key, "secret2").unwrap(),
             "value2"
         );
+    }
+
+    #[tokio::test]
+    async fn test_each_secret_gets_unique_nonce() {
+        let (mut store, key) = EncryptedSecretStore::new().unwrap();
+
+        // Encrypt the same value twice - should produce different ciphertexts
+        store.add_secret(&key, "secret_a", "same_value").unwrap();
+        store.add_secret(&key, "secret_b", "same_value").unwrap();
+
+        let encrypted_a = store.secrets.get("secret_a").unwrap();
+        let encrypted_b = store.secrets.get("secret_b").unwrap();
+
+        // Different nonces means different ciphertexts even for the same plaintext
+        assert_ne!(encrypted_a, encrypted_b);
+
+        // Both should decrypt to the same value
+        assert_eq!(store.get_secret(&key, "secret_a").unwrap(), "same_value");
+        assert_eq!(store.get_secret(&key, "secret_b").unwrap(), "same_value");
     }
 
     #[test]

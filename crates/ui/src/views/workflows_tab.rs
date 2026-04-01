@@ -87,7 +87,13 @@ pub fn render_workflows_tab(
 
         let path_display = workflow.path.to_string_lossy();
         let path_shortened = if path_display.len() > 30 {
-            format!("...{}", &path_display[path_display.len() - 30..])
+            let start = path_display
+                .char_indices()
+                .rev()
+                .nth(29)
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            format!("...{}", &path_display[start..])
         } else {
             path_display.to_string()
         };

@@ -85,12 +85,74 @@ pub fn validate_triggers(on: &Value, result: &mut ValidationResult) {
 }
 
 fn validate_cron_syntax(cron: &str, result: &mut ValidationResult) {
-    // Basic validation of cron syntax
     let parts: Vec<&str> = cron.split_whitespace().collect();
     if parts.len() != 5 {
         result.add_issue(format!(
-            "Invalid cron syntax '{}': should have 5 components",
+            "Invalid cron syntax '{}': should have 5 components (minute hour day month day-of-week)",
             cron
         ));
+        return;
+    }
+
+    let field_specs: [(&str, u32, u32); 5] = [
+        ("minute", 0, 59),
+        ("hour", 0, 23),
+        ("day of month", 1, 31),
+        ("month", 1, 12),
+        ("day of week", 0, 6),
+    ];
+
+    for (part, (name, min, max)) in parts.iter().zip(field_specs.iter()) {
+        if !is_valid_cron_field(part, *min, *max) {
+            result.add_issue(format!(
+                "Invalid cron {} value '{}' in '{}': expected {}-{}, *, or a valid expression",
+                name, part, cron, min, max
+            ));
+        }
+    }
+}
+
+fn is_valid_cron_field(field: &str, min: u32, max: u32) -> bool {
+    if field == "*" {
+        return true;
+    }
+
+    // Handle comma-separated values: "1,15,30"
+    for item in field.split(',') {
+        if !is_valid_cron_atom(item, min, max) {
+            return false;
+        }
+    }
+    true
+}
+
+fn is_valid_cron_atom(atom: &str, min: u32, max: u32) -> bool {
+    // Handle step values: "*/5" or "1-10/2"
+    let (base, step) = if let Some((b, s)) = atom.split_once('/') {
+        match s.parse::<u32>() {
+            Ok(v) if v >= 1 => (b, Some(v)),
+            _ => return false,
+        }
+    } else {
+        (atom, None)
+    };
+
+    // Handle wildcard with step: "*/5"
+    if base == "*" {
+        return step.is_some();
+    }
+
+    // Handle ranges: "1-5"
+    if let Some((start_s, end_s)) = base.split_once('-') {
+        return match (start_s.parse::<u32>(), end_s.parse::<u32>()) {
+            (Ok(start), Ok(end)) => start >= min && end <= max && start <= end,
+            _ => false,
+        };
+    }
+
+    // Single numeric value
+    match base.parse::<u32>() {
+        Ok(v) => v >= min && v <= max && step.is_none(),
+        Err(_) => false,
     }
 }

@@ -274,3 +274,147 @@ fn value_to_string(value: &Value) -> String {
         _ => "unknown".to_string(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn val(s: &str) -> Value {
+        Value::String(s.to_string())
+    }
+
+    fn make_matrix(params: Vec<(&str, Vec<&str>)>) -> MatrixConfig {
+        let mut parameters = IndexMap::new();
+        for (name, values) in params {
+            parameters.insert(
+                name.to_string(),
+                Value::Sequence(values.into_iter().map(val).collect()),
+            );
+        }
+        MatrixConfig {
+            parameters,
+            include: Vec::new(),
+            exclude: Vec::new(),
+            max_parallel: None,
+            fail_fast: Some(true),
+        }
+    }
+
+    #[test]
+    fn include_merges_into_matching_combination() {
+        let mut matrix = make_matrix(vec![("os", vec!["ubuntu", "windows"])]);
+        // Include entry that matches os=ubuntu and adds a new key
+        let mut include_entry = HashMap::new();
+        include_entry.insert("os".to_string(), val("ubuntu"));
+        include_entry.insert("compiler".to_string(), val("gcc"));
+        matrix.include.push(include_entry);
+
+        let combos = expand_matrix(&matrix).unwrap();
+
+        // Should have 2 combos: ubuntu (with compiler=gcc merged) and windows
+        assert_eq!(combos.len(), 2);
+
+        let ubuntu = combos
+            .iter()
+            .find(|c| c.values.get("os") == Some(&val("ubuntu")))
+            .unwrap();
+        assert_eq!(ubuntu.values.get("compiler"), Some(&val("gcc")));
+
+        let windows = combos
+            .iter()
+            .find(|c| c.values.get("os") == Some(&val("windows")))
+            .unwrap();
+        assert_eq!(windows.values.get("compiler"), None);
+    }
+
+    #[test]
+    fn include_adds_standalone_when_no_match() {
+        let mut matrix = make_matrix(vec![("os", vec!["ubuntu", "windows"])]);
+        // Include entry with a value that doesn't match any existing combo
+        let mut include_entry = HashMap::new();
+        include_entry.insert("os".to_string(), val("macos"));
+        include_entry.insert("special".to_string(), val("true"));
+        matrix.include.push(include_entry);
+
+        let combos = expand_matrix(&matrix).unwrap();
+
+        // Should have 3 combos: ubuntu, windows, macos (standalone)
+        assert_eq!(combos.len(), 3);
+
+        let macos = combos
+            .iter()
+            .find(|c| c.values.get("os") == Some(&val("macos")))
+            .unwrap();
+        assert_eq!(macos.values.get("special"), Some(&val("true")));
+        assert!(macos.is_included);
+    }
+
+    #[test]
+    fn include_merges_into_all_matching_combinations() {
+        let mut matrix = make_matrix(vec![
+            ("os", vec!["ubuntu", "windows"]),
+            ("node", vec!["16", "18"]),
+        ]);
+        // Include entry matching os=ubuntu — should merge into both (ubuntu, 16) and (ubuntu, 18)
+        let mut include_entry = HashMap::new();
+        include_entry.insert("os".to_string(), val("ubuntu"));
+        include_entry.insert("extra".to_string(), val("yes"));
+        matrix.include.push(include_entry);
+
+        let combos = expand_matrix(&matrix).unwrap();
+
+        // 4 base combos, no new standalone (merged into 2 existing)
+        assert_eq!(combos.len(), 4);
+
+        let ubuntu_combos: Vec<_> = combos
+            .iter()
+            .filter(|c| c.values.get("os") == Some(&val("ubuntu")))
+            .collect();
+        assert_eq!(ubuntu_combos.len(), 2);
+        for combo in &ubuntu_combos {
+            assert_eq!(combo.values.get("extra"), Some(&val("yes")));
+        }
+
+        let windows_combos: Vec<_> = combos
+            .iter()
+            .filter(|c| c.values.get("os") == Some(&val("windows")))
+            .collect();
+        for combo in &windows_combos {
+            assert_eq!(combo.values.get("extra"), None);
+        }
+    }
+
+    #[test]
+    fn include_with_only_new_keys_adds_standalone() {
+        let mut matrix = make_matrix(vec![("os", vec!["ubuntu"])]);
+        // Include entry with only keys that don't exist in base combos
+        let mut include_entry = HashMap::new();
+        include_entry.insert("arch".to_string(), val("arm64"));
+        matrix.include.push(include_entry);
+
+        let combos = expand_matrix(&matrix).unwrap();
+
+        // Should have 2: the base ubuntu + standalone arm64
+        assert_eq!(combos.len(), 2);
+    }
+
+    #[test]
+    fn exclude_removes_matching_combinations() {
+        let mut matrix = make_matrix(vec![
+            ("os", vec!["ubuntu", "windows"]),
+            ("node", vec!["16", "18"]),
+        ]);
+        let mut exclude_entry = HashMap::new();
+        exclude_entry.insert("os".to_string(), val("windows"));
+        exclude_entry.insert("node".to_string(), val("16"));
+        matrix.exclude.push(exclude_entry);
+
+        let combos = expand_matrix(&matrix).unwrap();
+
+        // 4 - 1 excluded = 3
+        assert_eq!(combos.len(), 3);
+        assert!(!combos.iter().any(|c| {
+            c.values.get("os") == Some(&val("windows")) && c.values.get("node") == Some(&val("16"))
+        }));
+    }
+}

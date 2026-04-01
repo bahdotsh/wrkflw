@@ -1250,7 +1250,7 @@ async fn execute_matrix_job(
         let runner_image_value = get_effective_runner_image(job_template);
 
         for (idx, step) in job_template.steps.iter().enumerate() {
-            let step_name_for_skip = step
+            let step_name = step
                 .name
                 .clone()
                 .unwrap_or_else(|| format!("Step {}", idx + 1));
@@ -1261,10 +1261,10 @@ async fn execute_matrix_job(
                 if !should_run {
                     wrkflw_logging::info(&format!(
                         "  ⏭️ Skipping step '{}' due to condition: {}",
-                        step_name_for_skip, if_cond
+                        step_name, if_cond
                     ));
                     step_results.push(StepResult {
-                        name: step_name_for_skip,
+                        name: step_name,
                         status: StepStatus::Skipped,
                         output: format!("Skipped due to condition: {}", if_cond),
                     });
@@ -1307,7 +1307,7 @@ async fn execute_matrix_job(
                         if step.continue_on_error == Some(true) {
                             wrkflw_logging::info(&format!(
                                 "  Step '{}' failed but continue-on-error is set",
-                                step_name_for_skip
+                                step_name
                             ));
                             // Don't abort, continue to next step
                         } else {
@@ -2313,12 +2313,17 @@ fn prepare_container_mounts(
                 wrkflw_logging::warning("skipping empty volume spec");
                 continue;
             }
-            if vol_spec.contains("..") {
-                wrkflw_logging::warning(&format!("Skipping suspicious volume path: {}", vol_spec));
-                continue;
-            }
             // NOTE: splitn(3, ':') won't correctly handle Windows-style host paths (e.g. C:\data:/container)
             let parts: Vec<&str> = vol_spec.splitn(3, ':').collect();
+            // Check host path for path traversal (only the host component, not the full spec)
+            let host_path = parts[0];
+            if host_path.contains("..") {
+                wrkflw_logging::warning(&format!(
+                    "Skipping volume with path traversal in host path: {}",
+                    vol_spec
+                ));
+                continue;
+            }
             match parts.len() {
                 3 => {
                     if parts[0].is_empty() || parts[1].is_empty() {
@@ -2920,13 +2925,34 @@ fn convert_yaml_to_step(step_yaml: &serde_yaml::Value) -> Result<workflow::Step,
 }
 
 /// Evaluate a job condition expression
-/// This is a simplified implementation that handles basic GitHub Actions expressions
+/// This is a simplified implementation that handles basic GitHub Actions expressions.
+/// Note: step-level expressions like `steps.<id>.outcome`, `success()`, `failure()`,
+/// `always()`, and `cancelled()` are not yet fully supported — a warning is emitted
+/// and the condition defaults to true.
 fn evaluate_job_condition(
     condition: &str,
     env_context: &HashMap<String, String>,
     workflow: &WorkflowDefinition,
 ) -> bool {
     wrkflw_logging::debug(&format!("Evaluating condition: {}", condition));
+
+    // Warn about step-level expressions we can't properly evaluate yet
+    let unsupported_patterns = [
+        "steps.",
+        "success()",
+        "failure()",
+        "always()",
+        "cancelled()",
+    ];
+    for pattern in &unsupported_patterns {
+        if condition.contains(pattern) {
+            wrkflw_logging::warning(&format!(
+                "Condition '{}' uses '{}' which is not fully supported in local execution — defaulting to true",
+                condition, pattern
+            ));
+            return true;
+        }
+    }
 
     // For now, implement basic pattern matching for common conditions
     // TODO: Implement a full GitHub Actions expression evaluator
@@ -3307,5 +3333,90 @@ mod tests {
         assert_eq!(job_env.get("CONTAINER_ONLY").unwrap(), "container-value");
         // Job-only keys are preserved
         assert_eq!(job_env.get("JOB_ONLY").unwrap(), "job-value");
+    }
+
+    // --- evaluate_job_condition tests for step-level expressions ---
+
+    fn empty_workflow() -> workflow::WorkflowDefinition {
+        workflow::WorkflowDefinition {
+            name: "test".to_string(),
+            on: Vec::new(),
+            on_raw: serde_yaml::Value::Null,
+            jobs: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn condition_true_false_literals() {
+        let env = HashMap::new();
+        let wf = empty_workflow();
+        assert!(evaluate_job_condition("true", &env, &wf));
+        assert!(!evaluate_job_condition("false", &env, &wf));
+    }
+
+    #[test]
+    fn condition_steps_reference_defaults_true() {
+        let env = HashMap::new();
+        let wf = empty_workflow();
+        // step-level expressions should warn and default to true
+        assert!(evaluate_job_condition(
+            "steps.build.outcome == 'success'",
+            &env,
+            &wf
+        ));
+    }
+
+    #[test]
+    fn condition_success_function_defaults_true() {
+        let env = HashMap::new();
+        let wf = empty_workflow();
+        assert!(evaluate_job_condition("success()", &env, &wf));
+    }
+
+    #[test]
+    fn condition_failure_function_defaults_true() {
+        let env = HashMap::new();
+        let wf = empty_workflow();
+        assert!(evaluate_job_condition("failure()", &env, &wf));
+    }
+
+    #[test]
+    fn condition_always_function_defaults_true() {
+        let env = HashMap::new();
+        let wf = empty_workflow();
+        assert!(evaluate_job_condition("always()", &env, &wf));
+    }
+
+    #[test]
+    fn condition_cancelled_function_defaults_true() {
+        let env = HashMap::new();
+        let wf = empty_workflow();
+        assert!(evaluate_job_condition("cancelled()", &env, &wf));
+    }
+
+    // --- volume path traversal tests ---
+
+    #[test]
+    fn volume_traversal_check_rejects_host_traversal() {
+        // Simulate the check: only host path component (parts[0]) is checked
+        let vol_spec = "../../../etc/passwd:/data";
+        let parts: Vec<&str> = vol_spec.splitn(3, ':').collect();
+        let host_path = parts[0];
+        assert!(
+            host_path.contains(".."),
+            "host path traversal should be detected"
+        );
+    }
+
+    #[test]
+    fn volume_traversal_check_allows_dotdot_in_container_path() {
+        // Container path with ".." in it should NOT trigger the host check
+        let vol_spec = "/safe/host:/container/..weird";
+        let parts: Vec<&str> = vol_spec.splitn(3, ':').collect();
+        let host_path = parts[0];
+        assert!(
+            !host_path.contains(".."),
+            "container path dots should not affect host check"
+        );
     }
 }

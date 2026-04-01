@@ -728,4 +728,50 @@ jobs:
         assert!(!job.fail_fast());
         assert_eq!(job.max_parallel(), Some(2));
     }
+
+    #[test]
+    fn parse_continue_on_error_workflow() {
+        let temp_dir = tempdir().unwrap();
+        let workflow_path = temp_dir.path().join("workflow.yml");
+
+        let content = r#"
+name: Continue On Error Test
+on: [push]
+jobs:
+  test-continue:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Failing step with continue
+        run: exit 1
+        continue-on-error: true
+      - name: Should still run
+        run: echo "I ran after failure"
+  test-if-skip:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Always runs
+        run: echo "hello"
+      - name: Skipped step
+        if: "false"
+        run: echo "should not run"
+      - name: Runs after skip
+        run: echo "after skip"
+"#;
+        fs::write(&workflow_path, content).unwrap();
+
+        let parsed = parse_workflow(&workflow_path).unwrap();
+
+        // Verify continue-on-error parsing
+        let job = parsed.jobs.get("test-continue").unwrap();
+        assert_eq!(job.steps.len(), 2);
+        assert_eq!(job.steps[0].continue_on_error, Some(true));
+        assert_eq!(job.steps[1].continue_on_error, None);
+
+        // Verify step-level if condition parsing
+        let job2 = parsed.jobs.get("test-if-skip").unwrap();
+        assert_eq!(job2.steps.len(), 3);
+        assert_eq!(job2.steps[0].if_condition, None);
+        assert_eq!(job2.steps[1].if_condition.as_deref(), Some("false"));
+        assert_eq!(job2.steps[2].if_condition, None);
+    }
 }

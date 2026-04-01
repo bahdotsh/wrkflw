@@ -2968,11 +2968,14 @@ fn evaluate_job_condition(
     let has_failure = condition.contains("failure()");
     let has_cancelled = condition.contains("cancelled()");
     // Match "steps." only at word boundaries to avoid false positives on env var
-    // names like "env.MY_STEPS_COUNT". We check for start-of-string or a non-alphanumeric
-    // character immediately before "steps.".
-    let has_steps_ref = condition
-        .match_indices("steps.")
-        .any(|(pos, _)| pos == 0 || !condition.as_bytes()[pos - 1].is_ascii_alphanumeric());
+    // names like "env.MY_STEPS_COUNT" or "env._STEPS_CHECK". We check for
+    // start-of-string or a character that isn't alphanumeric/underscore before "steps.".
+    let has_steps_ref = condition.match_indices("steps.").any(|(pos, _)| {
+        pos == 0 || {
+            let b = condition.as_bytes()[pos - 1];
+            !b.is_ascii_alphanumeric() && b != b'_'
+        }
+    });
     let has_unsupported =
         has_always || has_success || has_failure || has_cancelled || has_steps_ref;
 
@@ -2982,7 +2985,17 @@ fn evaluate_job_condition(
             condition
         ));
 
-        // always() or success() → true (common "run this step" intent)
+        // In GitHub Actions, `always()` means "run this step regardless of job
+        // status" — it is a *scheduling* directive, not a boolean `true` literal.
+        // Similarly, `success()` means "run when all previous steps succeeded".
+        // Since we can't evaluate actual job/step status locally, we treat
+        // `always()` and `success()` as "likely to run" → true, and `failure()`
+        // / `cancelled()` as "unlikely" → false.
+        //
+        // Known limitation: compound expressions like `always() && failure()` will
+        // return true (because `always()` is present) even though a real evaluator
+        // would AND the two. This is acceptable because we lack step-status context
+        // and would rather over-run than silently skip steps.
         if has_always || has_success {
             return true;
         }
@@ -3468,6 +3481,12 @@ mod tests {
         // A bare "steps.build.outcome" at the start SHOULD be caught.
         assert!(evaluate_job_condition(
             "env.MY_STEPS_COUNT == '5'",
+            &env,
+            &wf
+        ));
+        // Underscore-prefixed names should also NOT be treated as step refs
+        assert!(evaluate_job_condition(
+            "env._STEPS_CHECK == 'ok'",
             &env,
             &wf
         ));

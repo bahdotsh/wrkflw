@@ -149,6 +149,7 @@ fn detect_cyclic_needs(jobs_map: &serde_yaml::Mapping, result: &mut ValidationRe
     let mut visited = HashSet::new();
     let mut in_stack = HashSet::new();
     let mut rec_stack = Vec::new();
+    let mut reported_cycles: HashSet<Vec<String>> = HashSet::new();
 
     for job_name in graph.keys() {
         if !visited.contains(job_name.as_str()) {
@@ -158,6 +159,7 @@ fn detect_cyclic_needs(jobs_map: &serde_yaml::Mapping, result: &mut ValidationRe
                 &mut visited,
                 &mut in_stack,
                 &mut rec_stack,
+                &mut reported_cycles,
                 result,
             );
         }
@@ -170,6 +172,7 @@ fn dfs_detect_cycle(
     visited: &mut HashSet<String>,
     in_stack: &mut HashSet<String>,
     rec_stack: &mut Vec<String>,
+    reported_cycles: &mut HashSet<Vec<String>>,
     result: &mut ValidationResult,
 ) {
     visited.insert(node.to_string());
@@ -181,19 +184,41 @@ fn dfs_detect_cycle(
             if in_stack.contains(neighbor.as_str()) {
                 // Found a cycle — build the cycle path from the stack
                 if let Some(pos) = rec_stack.iter().position(|x| x == neighbor) {
-                    let cycle = rec_stack[pos..]
+                    // Normalize the cycle: rotate so the lexicographically smallest
+                    // node is first, ensuring the same cycle isn't reported twice
+                    // from different entry points.
+                    let mut cycle_nodes: Vec<String> = rec_stack[pos..].iter().cloned().collect();
+                    if let Some(min_pos) = cycle_nodes
                         .iter()
-                        .chain(std::iter::once(neighbor))
-                        .cloned()
-                        .collect::<Vec<_>>()
-                        .join(" -> ");
-                    result.add_issue(format!(
-                        "Circular dependency detected in 'needs': {}",
-                        cycle
-                    ));
+                        .enumerate()
+                        .min_by_key(|(_, n)| n.clone())
+                        .map(|(i, _)| i)
+                    {
+                        cycle_nodes.rotate_left(min_pos);
+                    }
+                    if reported_cycles.insert(cycle_nodes.clone()) {
+                        let display = cycle_nodes
+                            .iter()
+                            .chain(std::iter::once(&cycle_nodes[0]))
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(" -> ");
+                        result.add_issue(format!(
+                            "Circular dependency detected in 'needs': {}",
+                            display
+                        ));
+                    }
                 }
             } else if !visited.contains(neighbor.as_str()) {
-                dfs_detect_cycle(neighbor, graph, visited, in_stack, rec_stack, result);
+                dfs_detect_cycle(
+                    neighbor,
+                    graph,
+                    visited,
+                    in_stack,
+                    rec_stack,
+                    reported_cycles,
+                    result,
+                );
             }
         }
     }

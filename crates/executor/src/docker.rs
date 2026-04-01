@@ -1118,6 +1118,10 @@ impl DockerRuntime {
         let tar_buffer = {
             let mut tar_builder = tar::Builder::new(Vec::new());
 
+            // Do not follow symlinks — untrusted action repos could use symlinks
+            // to leak host filesystem contents into the Docker build context.
+            tar_builder.follow_symlinks(false);
+
             // Include the full context directory so COPY instructions work.
             tar_builder.append_dir_all(".", context_dir).map_err(|e| {
                 ContainerError::ImageBuild(format!("Failed to create build context tar: {}", e))

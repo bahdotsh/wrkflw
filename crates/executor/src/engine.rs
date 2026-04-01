@@ -553,7 +553,7 @@ async fn prepare_action(
     runtime: &dyn ContainerRuntime,
 ) -> Result<PreparedAction, ExecutionError> {
     if action.is_docker {
-        // Docker action: pull the image
+        // Docker action: pull the image and run with its native entrypoint
         let image = action.repository.trim_start_matches("docker://");
 
         runtime
@@ -561,7 +561,9 @@ async fn prepare_action(
             .await
             .map_err(|e| ExecutionError::Runtime(format!("Failed to pull Docker image: {}", e)))?;
 
-        return Ok(PreparedAction::Image(image.to_string()));
+        return Ok(PreparedAction::NativeDocker {
+            image: image.to_string(),
+        });
     }
 
     if action.is_local {
@@ -660,7 +662,7 @@ async fn prepare_action(
                         .trim_start_matches("docker://")
                         .trim_start_matches('/');
 
-                    if dockerfile_rel.contains("..") {
+                    if dockerfile_rel.split('/').any(|c| c == "..") {
                         return Err(ExecutionError::Execution(format!(
                             "Invalid Dockerfile path '{}' for action '{}': path traversal not allowed",
                             dockerfile_rel, action.repository
@@ -3660,7 +3662,7 @@ mod tests {
 
     fn sanitize_dockerfile_rel(raw: &str) -> Result<String, String> {
         let trimmed = raw.trim_start_matches("docker://").trim_start_matches('/');
-        if trimmed.contains("..") {
+        if trimmed.split('/').any(|c| c == "..") {
             return Err(format!("path traversal not allowed: {}", trimmed));
         }
         Ok(trimmed.to_string())
@@ -3702,6 +3704,15 @@ mod tests {
         assert_eq!(
             sanitize_dockerfile_rel("./build/Dockerfile").unwrap(),
             "./build/Dockerfile"
+        );
+    }
+
+    #[test]
+    fn dockerfile_rel_allows_dotdot_in_filename() {
+        // ".." as a substring in a filename is not path traversal
+        assert_eq!(
+            sanitize_dockerfile_rel("foo..bar/Dockerfile").unwrap(),
+            "foo..bar/Dockerfile"
         );
     }
 }

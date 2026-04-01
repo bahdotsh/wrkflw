@@ -1322,14 +1322,26 @@ async fn execute_matrix_job(
                     }
                 }
                 Err(e) => {
-                    // Log the error and abort the job
-                    job_logs.push_str(&format!("Step execution error: {}\n\n", e));
-                    return Ok(JobResult {
-                        name: matrix_job_name,
-                        status: JobStatus::Failure,
-                        steps: step_results,
-                        logs: job_logs,
-                    });
+                    if step.continue_on_error == Some(true) {
+                        wrkflw_logging::info(&format!(
+                            "  Step '{}' errored but continue-on-error is set, continuing",
+                            step_name
+                        ));
+                        step_results.push(StepResult {
+                            name: step_name,
+                            status: StepStatus::Failure,
+                            output: format!("Error: {}", e),
+                        });
+                    } else {
+                        // Log the error and abort the job
+                        job_logs.push_str(&format!("Step execution error: {}\n\n", e));
+                        return Ok(JobResult {
+                            name: matrix_job_name,
+                            status: JobStatus::Failure,
+                            steps: step_results,
+                            logs: job_logs,
+                        });
+                    }
                 }
             }
         }
@@ -2912,6 +2924,23 @@ fn convert_yaml_to_step(step_yaml: &serde_yaml::Value) -> Result<workflow::Step,
     // Extract continue_on_error
     let continue_on_error = step_yaml.get("continue-on-error").and_then(|v| v.as_bool());
 
+    let if_condition = step_yaml
+        .get("if")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let id = step_yaml
+        .get("id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let working_directory = step_yaml
+        .get("working-directory")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let timeout_minutes = step_yaml.get("timeout-minutes").and_then(|v| v.as_f64());
+
     Ok(workflow::Step {
         name,
         uses,
@@ -2919,11 +2948,11 @@ fn convert_yaml_to_step(step_yaml: &serde_yaml::Value) -> Result<workflow::Step,
         with,
         env,
         continue_on_error,
-        if_condition: None,
-        id: None,
-        working_directory: None,
-        shell: None,
-        timeout_minutes: None,
+        if_condition,
+        id,
+        working_directory,
+        shell,
+        timeout_minutes,
     })
 }
 
@@ -2940,44 +2969,32 @@ fn evaluate_job_condition(
 ) -> bool {
     wrkflw_logging::debug(&format!("Evaluating condition: {}", condition));
 
-    // Handle step-level status functions with appropriate defaults
-    // always() → true (run regardless), success() → true (optimistic default),
-    // failure()/cancelled() → false (these states are uncommon),
-    // steps.<id>.outcome → true (optimistic, can't track step state yet)
-    if condition.contains("always()") {
+    // Handle status functions and step references that we can't fully evaluate.
+    // For compound expressions (e.g. "failure() || success()"), we check for the
+    // presence of any unsupported function/reference and choose the most permissive
+    // default: if any "run-always" function (always(), success()) appears, default
+    // to true; only default to false if the expression exclusively uses "run-rarely"
+    // functions (failure(), cancelled()) with no positive counterpart.
+    let has_always = condition.contains("always()");
+    let has_success = condition.contains("success()");
+    let has_failure = condition.contains("failure()");
+    let has_cancelled = condition.contains("cancelled()");
+    let has_steps_ref = condition.contains("steps.");
+    let has_unsupported =
+        has_always || has_success || has_failure || has_cancelled || has_steps_ref;
+
+    if has_unsupported {
         wrkflw_logging::warning(&format!(
-            "Condition '{}' uses 'always()' which is not fully supported in local execution — defaulting to true",
+            "Condition '{}' uses status functions/step references not fully supported in local execution",
             condition
         ));
-        return true;
-    }
-    if condition.contains("success()") {
-        wrkflw_logging::warning(&format!(
-            "Condition '{}' uses 'success()' which is not fully supported in local execution — defaulting to true",
-            condition
-        ));
-        return true;
-    }
-    if condition.contains("failure()") {
-        wrkflw_logging::warning(&format!(
-            "Condition '{}' uses 'failure()' which is not fully supported in local execution — defaulting to false",
-            condition
-        ));
+
+        // always() or success() or step refs → optimistic default (true)
+        if has_always || has_success || has_steps_ref {
+            return true;
+        }
+        // Only failure()/cancelled() with no positive counterpart → false
         return false;
-    }
-    if condition.contains("cancelled()") {
-        wrkflw_logging::warning(&format!(
-            "Condition '{}' uses 'cancelled()' which is not fully supported in local execution — defaulting to false",
-            condition
-        ));
-        return false;
-    }
-    if condition.contains("steps.") {
-        wrkflw_logging::warning(&format!(
-            "Condition '{}' uses step references which are not fully supported in local execution — defaulting to true",
-            condition
-        ));
-        return true;
     }
 
     // For now, implement basic pattern matching for common conditions
@@ -3418,6 +3435,34 @@ mod tests {
         let env = HashMap::new();
         let wf = empty_workflow();
         assert!(!evaluate_job_condition("cancelled()", &env, &wf));
+    }
+
+    #[test]
+    fn condition_compound_failure_or_success_defaults_true() {
+        let env = HashMap::new();
+        let wf = empty_workflow();
+        // success() is present, so compound expression should default to true
+        assert!(evaluate_job_condition("failure() || success()", &env, &wf));
+    }
+
+    #[test]
+    fn condition_compound_failure_and_cancelled_defaults_false() {
+        let env = HashMap::new();
+        let wf = empty_workflow();
+        // Only negative functions, no positive counterpart → false
+        assert!(!evaluate_job_condition(
+            "failure() || cancelled()",
+            &env,
+            &wf
+        ));
+    }
+
+    #[test]
+    fn condition_always_with_failure_defaults_true() {
+        let env = HashMap::new();
+        let wf = empty_workflow();
+        // always() present → true regardless of other functions
+        assert!(evaluate_job_condition("always() && failure()", &env, &wf));
     }
 
     // --- volume path traversal tests ---

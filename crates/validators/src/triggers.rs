@@ -181,9 +181,9 @@ fn is_valid_cron_atom(atom: &str, min: u32, max: u32) -> bool {
         return v >= min && v <= max && step.is_none();
     }
 
-    // Single numeric value
+    // Single numeric value (with optional step, e.g. "5/2" means starting at 5, every 2)
     match base.parse::<u32>() {
-        Ok(v) => v >= min && v <= max && step.is_none(),
+        Ok(v) => v >= min && v <= max,
         Err(_) => false,
     }
 }
@@ -251,5 +251,12 @@ mod tests {
         assert!(cron_issues("0 0 * JAN MON").is_empty());
         assert!(cron_issues("0 0 * * MON-FRI").is_empty());
         assert!(cron_issues("0 0 * JAN-MAR *").is_empty());
+    }
+
+    #[test]
+    fn valid_numeric_with_step() {
+        // "5/2" means starting at 5, every 2 — valid POSIX cron
+        assert!(cron_issues("5/2 * * * *").is_empty());
+        assert!(cron_issues("0 3/4 * * *").is_empty());
     }
 }

@@ -147,11 +147,19 @@ fn detect_cyclic_needs(jobs_map: &serde_yaml::Mapping, result: &mut ValidationRe
 
     // DFS cycle detection
     let mut visited = HashSet::new();
+    let mut in_stack = HashSet::new();
     let mut rec_stack = Vec::new();
 
     for job_name in graph.keys() {
         if !visited.contains(job_name.as_str()) {
-            dfs_detect_cycle(job_name, &graph, &mut visited, &mut rec_stack, result);
+            dfs_detect_cycle(
+                job_name,
+                &graph,
+                &mut visited,
+                &mut in_stack,
+                &mut rec_stack,
+                result,
+            );
         }
     }
 }
@@ -160,35 +168,37 @@ fn dfs_detect_cycle(
     node: &str,
     graph: &HashMap<String, Vec<String>>,
     visited: &mut HashSet<String>,
+    in_stack: &mut HashSet<String>,
     rec_stack: &mut Vec<String>,
     result: &mut ValidationResult,
 ) {
     visited.insert(node.to_string());
+    in_stack.insert(node.to_string());
     rec_stack.push(node.to_string());
 
     if let Some(neighbors) = graph.get(node) {
         for neighbor in neighbors {
-            if let Some(pos) = rec_stack.iter().position(|x| x == neighbor) {
-                // Found a cycle — build the cycle path
-                let cycle = rec_stack[pos..]
-                    .iter()
-                    .chain(std::iter::once(neighbor))
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join(" -> ");
-                result.add_issue(format!(
-                    "Circular dependency detected in 'needs': {}",
-                    cycle
-                ));
-                return;
-            }
-
-            if !visited.contains(neighbor.as_str()) {
-                dfs_detect_cycle(neighbor, graph, visited, rec_stack, result);
+            if in_stack.contains(neighbor.as_str()) {
+                // Found a cycle — build the cycle path from the stack
+                if let Some(pos) = rec_stack.iter().position(|x| x == neighbor) {
+                    let cycle = rec_stack[pos..]
+                        .iter()
+                        .chain(std::iter::once(neighbor))
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(" -> ");
+                    result.add_issue(format!(
+                        "Circular dependency detected in 'needs': {}",
+                        cycle
+                    ));
+                }
+            } else if !visited.contains(neighbor.as_str()) {
+                dfs_detect_cycle(neighbor, graph, visited, in_stack, rec_stack, result);
             }
         }
     }
 
+    in_stack.remove(node);
     rec_stack.pop();
 }
 
@@ -227,6 +237,92 @@ job-c:
                 .iter()
                 .any(|i| i.contains("Circular dependency detected in 'needs'")),
             "Expected a cyclic needs error, got: {:?}",
+            result.issues
+        );
+    }
+
+    #[test]
+    fn test_no_false_positive_cycle_with_cross_edge() {
+        // A→B is a cycle, D→E→A is a cross-edge (NOT a cycle).
+        // Previously, the DFS would leave stale entries in rec_stack after
+        // detecting the A↔B cycle, causing a false positive for D→E→A.
+        let yaml = r#"
+job-a:
+  runs-on: ubuntu-latest
+  needs: job-b
+  steps:
+    - run: echo a
+job-b:
+  runs-on: ubuntu-latest
+  needs: job-a
+  steps:
+    - run: echo b
+job-d:
+  runs-on: ubuntu-latest
+  steps:
+    - run: echo d
+job-e:
+  runs-on: ubuntu-latest
+  needs:
+    - job-d
+    - job-a
+  steps:
+    - run: echo e
+"#;
+        let jobs: Value = serde_yaml::from_str(yaml).unwrap();
+        let mut result = ValidationResult::new();
+        validate_jobs(&jobs, &mut result);
+
+        let cycle_issues: Vec<_> = result
+            .issues
+            .iter()
+            .filter(|i| i.contains("Circular dependency detected in 'needs'"))
+            .collect();
+
+        // Should have exactly one cycle (A↔B), NOT a false positive involving D or E
+        assert_eq!(
+            cycle_issues.len(),
+            1,
+            "Expected exactly 1 cycle issue (A↔B), got: {:?}",
+            cycle_issues
+        );
+        assert!(
+            cycle_issues[0].contains("job-a") && cycle_issues[0].contains("job-b"),
+            "Cycle should involve job-a and job-b, got: {}",
+            cycle_issues[0]
+        );
+    }
+
+    #[test]
+    fn test_no_cycle_in_valid_dag() {
+        let yaml = r#"
+build:
+  runs-on: ubuntu-latest
+  steps:
+    - run: echo build
+test:
+  runs-on: ubuntu-latest
+  needs: build
+  steps:
+    - run: echo test
+deploy:
+  runs-on: ubuntu-latest
+  needs:
+    - build
+    - test
+  steps:
+    - run: echo deploy
+"#;
+        let jobs: Value = serde_yaml::from_str(yaml).unwrap();
+        let mut result = ValidationResult::new();
+        validate_jobs(&jobs, &mut result);
+
+        assert!(
+            !result
+                .issues
+                .iter()
+                .any(|i| i.contains("Circular dependency")),
+            "Valid DAG should not have cycle issues, got: {:?}",
             result.issues
         );
     }

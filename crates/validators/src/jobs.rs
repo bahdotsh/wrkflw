@@ -187,11 +187,11 @@ fn dfs_detect_cycle(
                     // Normalize the cycle: rotate so the lexicographically smallest
                     // node is first, ensuring the same cycle isn't reported twice
                     // from different entry points.
-                    let mut cycle_nodes: Vec<String> = rec_stack[pos..].iter().cloned().collect();
+                    let mut cycle_nodes: Vec<String> = rec_stack[pos..].to_vec();
                     if let Some(min_pos) = cycle_nodes
                         .iter()
                         .enumerate()
-                        .min_by_key(|(_, n)| n.clone())
+                        .min_by(|(_, a), (_, b)| a.cmp(b))
                         .map(|(i, _)| i)
                     {
                         cycle_nodes.rotate_left(min_pos);

@@ -72,6 +72,7 @@ pub async fn execute_workflow_cli(
     path: &Path,
     runtime_type: RuntimeType,
     verbose: bool,
+    show_action_messages: bool,
 ) -> io::Result<()> {
     if !path.exists() {
         return Err(io::Error::new(
@@ -142,7 +143,7 @@ pub async fn execute_workflow_cli(
         verbose,
         preserve_containers_on_failure: false, // Default for this path
         secrets_config: None,                  // Use default secrets configuration
-        show_action_messages: false,           // Default for CLI execution path
+        show_action_messages,
     };
 
     match wrkflw_executor::execute_workflow(path, config).await {

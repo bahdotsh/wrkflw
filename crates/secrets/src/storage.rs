@@ -31,7 +31,7 @@ impl EncryptedSecretStore {
     }
 
     /// Create an encrypted secret store from existing data
-    pub fn from_data(secrets: HashMap<String, String>, salt: String, _nonce: String) -> Self {
+    pub fn from_data(secrets: HashMap<String, String>, salt: String) -> Self {
         Self { secrets, salt }
     }
 

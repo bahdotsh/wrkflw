@@ -156,3 +156,62 @@ fn is_valid_cron_atom(atom: &str, min: u32, max: u32) -> bool {
         Err(_) => false,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cron_issues(cron: &str) -> Vec<String> {
+        let mut result = ValidationResult::default();
+        validate_cron_syntax(cron, &mut result);
+        result.issues
+    }
+
+    #[test]
+    fn valid_standard_crons() {
+        assert!(cron_issues("0 0 * * *").is_empty());
+        assert!(cron_issues("30 2 * * 1-5").is_empty());
+        assert!(cron_issues("*/15 * * * *").is_empty());
+        assert!(cron_issues("0 0 1 1 *").is_empty());
+        assert!(cron_issues("0,30 * * * *").is_empty());
+        assert!(cron_issues("1,15,30 0 1-7 * 1-5").is_empty());
+        assert!(cron_issues("0-59/2 * * * *").is_empty());
+    }
+
+    #[test]
+    fn rejects_out_of_range_values() {
+        assert!(!cron_issues("99 99 99 99 99").is_empty());
+        assert!(!cron_issues("60 * * * *").is_empty());
+        assert!(!cron_issues("* 24 * * *").is_empty());
+        assert!(!cron_issues("* * 32 * *").is_empty());
+        assert!(!cron_issues("* * * 13 *").is_empty());
+        assert!(!cron_issues("* * * * 7").is_empty());
+    }
+
+    #[test]
+    fn rejects_wrong_part_count() {
+        assert!(!cron_issues("* * *").is_empty());
+        assert!(!cron_issues("* * * * * *").is_empty());
+        assert!(!cron_issues("*").is_empty());
+    }
+
+    #[test]
+    fn rejects_invalid_step() {
+        assert!(!cron_issues("*/0 * * * *").is_empty());
+        assert!(!cron_issues("*/abc * * * *").is_empty());
+    }
+
+    #[test]
+    fn rejects_invalid_ranges_and_atoms() {
+        assert!(!cron_issues("5-2 * * * *").is_empty()); // inverted range
+        assert!(!cron_issues("1- * * * *").is_empty()); // partial range
+        assert!(!cron_issues("1,,3 * * * *").is_empty()); // empty comma item
+        assert!(!cron_issues("abc * * * *").is_empty()); // non-numeric
+    }
+
+    #[test]
+    fn valid_ranges_with_steps() {
+        assert!(cron_issues("1-30/5 * * * *").is_empty());
+        assert!(cron_issues("0-23/2 0-23/2 * * *").is_empty());
+    }
+}

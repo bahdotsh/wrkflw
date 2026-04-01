@@ -110,7 +110,7 @@ async fn execute_github_workflow(
         },
     );
 
-    // Add flag to control GitHub action message visibility
+    // show=true means hide=false (inverted for the env var)
     env_context.insert(
         "WRKFLW_HIDE_ACTION_MESSAGES".to_string(),
         if config.show_action_messages {

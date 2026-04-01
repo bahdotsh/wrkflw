@@ -1137,13 +1137,13 @@ impl DockerRuntime {
         let dockerfile_name = dockerfile
             .strip_prefix(context_dir)
             .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|_| {
-                // Fallback: use just the filename if stripping fails
-                dockerfile
-                    .file_name()
-                    .map(|f| f.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "Dockerfile".to_string())
-            });
+            .map_err(|_| {
+                ContainerError::ImageBuild(format!(
+                    "Dockerfile {} is not within context directory {}",
+                    dockerfile.display(),
+                    context_dir.display()
+                ))
+            })?;
 
         let tar_buffer = {
             let mut tar_builder = tar::Builder::new(Vec::new());

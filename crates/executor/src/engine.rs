@@ -758,7 +758,10 @@ async fn prepare_action(
 /// Strips the `docker://` prefix and leading slashes, then rejects any
 /// path component that is exactly `..` to prevent directory traversal.
 fn sanitize_dockerfile_rel(raw: &str) -> Result<String, String> {
-    let trimmed = raw.trim_start_matches("docker://").trim_start_matches('/');
+    let trimmed = raw
+        .trim_start_matches("docker://")
+        .trim_start_matches('/')
+        .trim_start_matches("./");
     if trimmed.is_empty() {
         return Err("empty Dockerfile path".to_string());
     }
@@ -787,7 +790,16 @@ fn extract_docker_runs_config(
         .and_then(|v| v.as_sequence())
         .map(|seq| {
             seq.iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .map(|v| {
+                    v.as_str().map(|s| s.to_string()).unwrap_or_else(|| {
+                        // Coerce non-string values (int, bool, etc.) to strings,
+                        // matching GitHub Actions behavior.
+                        serde_yaml::to_string(v)
+                            .unwrap_or_default()
+                            .trim()
+                            .to_string()
+                    })
+                })
                 .collect()
         })
         .unwrap_or_default();
@@ -3926,7 +3938,7 @@ runs:
     fn dockerfile_rel_relative_path() {
         assert_eq!(
             sanitize_dockerfile_rel("./build/Dockerfile").unwrap(),
-            "./build/Dockerfile"
+            "build/Dockerfile"
         );
     }
 

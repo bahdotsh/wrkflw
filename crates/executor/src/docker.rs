@@ -266,7 +266,8 @@ impl DockerRuntime {
 
         // Build the customized image
         let image_tag = format!("wrkflw-{}-{}", language, version.unwrap_or("latest"));
-        self.build_image(&dockerfile_path, &image_tag).await?;
+        self.build_image(&dockerfile_path, &image_tag, temp_dir.path())
+            .await?;
 
         // Store the customized image
         Self::set_language_specific_image("", language, version, &image_tag);
@@ -677,11 +678,20 @@ impl ContainerRuntime for DockerRuntime {
         }
     }
 
-    async fn build_image(&self, dockerfile: &Path, tag: &str) -> Result<(), ContainerError> {
+    async fn build_image(
+        &self,
+        dockerfile: &Path,
+        tag: &str,
+        context_dir: &Path,
+    ) -> Result<(), ContainerError> {
         // Add a timeout for build operations
         let timeout_duration = std::time::Duration::from_secs(120); // 2 minutes timeout for builds
 
-        match tokio::time::timeout(timeout_duration, self.build_image_inner(dockerfile, tag)).await
+        match tokio::time::timeout(
+            timeout_duration,
+            self.build_image_inner(dockerfile, tag, context_dir),
+        )
+        .await
         {
             Ok(result) => result,
             Err(_) => {
@@ -822,7 +832,8 @@ impl ContainerRuntime for DockerRuntime {
 
         // Build the customized image
         let image_tag = format!("wrkflw-{}-{}", language, version.unwrap_or("latest"));
-        self.build_image(&dockerfile_path, &image_tag).await?;
+        self.build_image(&dockerfile_path, &image_tag, temp_dir.path())
+            .await?;
 
         // Store the customized image
         Self::set_language_specific_image("", language, version, &image_tag);
@@ -1106,15 +1117,15 @@ impl DockerRuntime {
 
     /// Build a Docker image from a Dockerfile.
     ///
-    /// The build context is the **parent directory** of `dockerfile`, and the
-    /// Dockerfile is referenced by its filename (the last path component).
-    /// Callers must ensure the Dockerfile lives at the top level of the intended
-    /// build context; if the Dockerfile is in a subdirectory, the context will
-    /// be scoped to that subdirectory and COPY instructions referencing files
-    /// outside it will fail.
-    async fn build_image_inner(&self, dockerfile: &Path, tag: &str) -> Result<(), ContainerError> {
-        let context_dir = dockerfile.parent().unwrap_or(Path::new("."));
-
+    /// `context_dir` is the Docker build context directory. All files in this
+    /// directory are sent to the Docker daemon so that COPY instructions work.
+    /// The Dockerfile path is made relative to this context for the build API.
+    async fn build_image_inner(
+        &self,
+        dockerfile: &Path,
+        tag: &str,
+        context_dir: &Path,
+    ) -> Result<(), ContainerError> {
         if !dockerfile.exists() {
             return Err(ContainerError::ImageBuild(format!(
                 "Cannot open Dockerfile at {}",
@@ -1122,11 +1133,17 @@ impl DockerRuntime {
             )));
         }
 
-        // Determine the Dockerfile's filename relative to the context directory.
+        // Determine the Dockerfile path relative to the context directory.
         let dockerfile_name = dockerfile
-            .file_name()
-            .map(|f| f.to_string_lossy().to_string())
-            .unwrap_or_else(|| "Dockerfile".to_string());
+            .strip_prefix(context_dir)
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| {
+                // Fallback: use just the filename if stripping fails
+                dockerfile
+                    .file_name()
+                    .map(|f| f.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "Dockerfile".to_string())
+            });
 
         let tar_buffer = {
             let mut tar_builder = tar::Builder::new(Vec::new());

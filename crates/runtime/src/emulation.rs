@@ -403,7 +403,12 @@ impl ContainerRuntime for EmulationRuntime {
         Ok(())
     }
 
-    async fn build_image(&self, dockerfile: &Path, tag: &str) -> Result<(), ContainerError> {
+    async fn build_image(
+        &self,
+        dockerfile: &Path,
+        tag: &str,
+        _context_dir: &Path,
+    ) -> Result<(), ContainerError> {
         wrkflw_logging::info(&format!(
             "🔄 Emulation: Pretending to build image {} from {}",
             tag,

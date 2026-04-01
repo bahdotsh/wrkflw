@@ -590,7 +590,7 @@ async fn prepare_action(
             let tag = format!("wrkflw-local-action:{}", uuid::Uuid::new_v4());
 
             runtime
-                .build_image(&dockerfile, &tag)
+                .build_image(&dockerfile, &tag, action_dir)
                 .await
                 .map_err(|e| ExecutionError::Runtime(format!("Failed to build image: {}", e)))?;
 
@@ -721,12 +721,15 @@ async fn prepare_action(
 
                     // Build the image
                     let tag = format!("wrkflw-action:{}", uuid::Uuid::new_v4());
-                    runtime.build_image(&dockerfile, &tag).await.map_err(|e| {
-                        ExecutionError::Runtime(format!(
-                            "Failed to build Dockerfile for action '{}': {}",
-                            action.repository, e
-                        ))
-                    })?;
+                    runtime
+                        .build_image(&dockerfile, &tag, &action_dir)
+                        .await
+                        .map_err(|e| {
+                            ExecutionError::Runtime(format!(
+                                "Failed to build Dockerfile for action '{}': {}",
+                                action.repository, e
+                            ))
+                        })?;
 
                     let (entrypoint, args) = extract_docker_runs_config(&resolved.definition);
                     return Ok(PreparedAction::NativeDocker {
@@ -1701,6 +1704,11 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                     // If neither is specified, the image's built-in CMD takes effect.
                     let effective_args: Vec<String> = if let Some(ref wa) = with_args_override {
                         shlex::split(wa).unwrap_or_else(|| {
+                            wrkflw_logging::warning(&format!(
+                                "Failed to parse 'with.args' as shell tokens (unmatched quote?), \
+                                 falling back to whitespace splitting: {:?}",
+                                wa
+                            ));
                             wa.split_whitespace().map(|s| s.to_string()).collect()
                         })
                     } else {

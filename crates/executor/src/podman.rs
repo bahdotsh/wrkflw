@@ -511,11 +511,20 @@ impl ContainerRuntime for PodmanRuntime {
         }
     }
 
-    async fn build_image(&self, dockerfile: &Path, tag: &str) -> Result<(), ContainerError> {
+    async fn build_image(
+        &self,
+        dockerfile: &Path,
+        tag: &str,
+        context_dir: &Path,
+    ) -> Result<(), ContainerError> {
         // Add a timeout for build operations
         let timeout_duration = std::time::Duration::from_secs(120); // 2 minutes timeout for builds
 
-        match tokio::time::timeout(timeout_duration, self.build_image_inner(dockerfile, tag)).await
+        match tokio::time::timeout(
+            timeout_duration,
+            self.build_image_inner(dockerfile, tag, context_dir),
+        )
+        .await
         {
             Ok(result) => result,
             Err(_) => {
@@ -656,7 +665,8 @@ impl ContainerRuntime for PodmanRuntime {
 
         // Build the customized image
         let image_tag = format!("wrkflw-{}-{}", language, version.unwrap_or("latest"));
-        self.build_image(&dockerfile_path, &image_tag).await?;
+        self.build_image(&dockerfile_path, &image_tag, temp_dir.path())
+            .await?;
 
         // Store the customized image
         Self::set_language_specific_image("", language, version, &image_tag);
@@ -858,8 +868,12 @@ impl PodmanRuntime {
         Ok(())
     }
 
-    async fn build_image_inner(&self, dockerfile: &Path, tag: &str) -> Result<(), ContainerError> {
-        let context_dir = dockerfile.parent().unwrap_or(Path::new("."));
+    async fn build_image_inner(
+        &self,
+        dockerfile: &Path,
+        tag: &str,
+        context_dir: &Path,
+    ) -> Result<(), ContainerError> {
         let dockerfile_str = dockerfile.to_string_lossy().to_string();
         let context_dir_str = context_dir.to_string_lossy().to_string();
         let args = vec!["build", "-f", &dockerfile_str, "-t", tag, &context_dir_str];

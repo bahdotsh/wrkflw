@@ -858,6 +858,7 @@ fn extract_docker_runs_config(
     let entrypoint = runs
         .and_then(|r| r.get("entrypoint"))
         .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
 
     let args = match runs.and_then(|r| r.get("args")) {
@@ -1741,7 +1742,28 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                                         action_info.repository, e
                                     ))
                                 })?;
-                                repo_dir.join(p)
+                                let candidate = repo_dir.join(p);
+                                // Defense-in-depth: verify the resolved path is
+                                // still inside the cloned repo after symlink resolution.
+                                let canon_candidate = candidate.canonicalize().map_err(|e| {
+                                    ExecutionError::Execution(format!(
+                                        "Failed to canonicalize action sub_path: {}",
+                                        e
+                                    ))
+                                })?;
+                                let canon_repo = repo_dir.canonicalize().map_err(|e| {
+                                    ExecutionError::Execution(format!(
+                                        "Failed to canonicalize repo directory: {}",
+                                        e
+                                    ))
+                                })?;
+                                if !canon_candidate.starts_with(&canon_repo) {
+                                    return Err(ExecutionError::Execution(format!(
+                                        "Action sub_path escapes repository directory for action '{}'",
+                                        action_info.repository
+                                    )));
+                                }
+                                candidate
                             }
                             None => repo_dir,
                         };
@@ -4569,6 +4591,68 @@ runs:
         assert_eq!(calls.len(), 1);
         // with.args takes precedence over any runs.args the action may have
         assert_eq!(calls[0].cmd, vec!["override-arg"]);
+    }
+
+    #[tokio::test]
+    async fn native_docker_with_entrypoint_override() {
+        let runtime = MockContainerRuntime::default();
+        let workflow = minimal_workflow();
+        let job_env = HashMap::new();
+        let working_dir = std::env::current_dir().unwrap();
+
+        let mut with = HashMap::new();
+        with.insert("entrypoint".to_string(), "/custom.sh".to_string());
+        with.insert("args".to_string(), "hello".to_string());
+
+        let step = make_step(
+            "docker-ep-override",
+            "docker://alpine:3.18",
+            Some(with),
+            HashMap::new(),
+        );
+
+        let ctx = StepExecutionContext {
+            step: &step,
+            step_idx: 0,
+            job_env: &job_env,
+            working_dir: &working_dir,
+            runtime: &runtime,
+            workflow: &workflow,
+            runner_image: "ubuntu:latest",
+            verbose: false,
+            matrix_combination: &None,
+            secret_manager: None,
+            secret_masker: None,
+            container_config: None,
+        };
+
+        let result = execute_step(ctx).await.unwrap();
+        assert_eq!(result.status, StepStatus::Success);
+
+        let calls = runtime.run_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        let call = &calls[0];
+        // with.entrypoint should override the image default
+        assert_eq!(call.entrypoint.as_deref(), Some("/custom.sh"));
+        assert_eq!(call.cmd, vec!["hello"]);
+    }
+
+    #[test]
+    fn extract_runs_config_empty_entrypoint_treated_as_none() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+runs:
+  using: docker
+  image: Dockerfile
+  entrypoint: ""
+"#,
+        )
+        .unwrap();
+        let (ep, _) = extract_docker_runs_config(Some(&yaml)).unwrap();
+        assert!(
+            ep.is_none(),
+            "empty entrypoint string should be treated as None"
+        );
     }
 
     // --- sub_path backslash traversal tests ---

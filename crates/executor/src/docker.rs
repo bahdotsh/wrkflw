@@ -945,7 +945,7 @@ impl DockerRuntime {
             // Only apply the macOS bash wrapper when there is an explicit command to wrap;
             // an empty cmd means "use the image's native ENTRYPOINT/CMD"
             // and overriding it with bash would hang or discard the real entrypoint.
-            entrypoint: if let Some(ep) = entrypoint {
+            entrypoint: if let Some(ep) = entrypoint.filter(|s| !s.is_empty()) {
                 Some(vec![ep.to_string()])
             } else if is_macos_emu && has_cmd {
                 // For macOS, ensure we use bash

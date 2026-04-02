@@ -10,6 +10,10 @@ keywords.workspace = true
 categories.workspace = true
 license.workspace = true
 
+[features]
+default = ["tui"]
+tui = ["wrkflw-ui/tui"]
+
 [dependencies]
 # Workspace crates
 wrkflw-models.workspace = true
@@ -52,8 +56,6 @@ rayon.workspace = true
 num_cpus.workspace = true
 itertools.workspace = true
 once_cell.workspace = true
-crossterm.workspace = true
-ratatui.workspace = true
 walkdir = "2.4"
 
 [lib]

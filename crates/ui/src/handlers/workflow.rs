@@ -1,10 +1,15 @@
 // Workflow handlers
+#[cfg(feature = "tui")]
 use crate::app::App;
+#[cfg(feature = "tui")]
 use crate::models::{ExecutionResultMsg, WorkflowExecution, WorkflowStatus};
+#[cfg(feature = "tui")]
 use chrono::Local;
 use std::io;
 use std::path::{Path, PathBuf};
+#[cfg(feature = "tui")]
 use std::sync::mpsc;
+#[cfg(feature = "tui")]
 use std::thread;
 use wrkflw_evaluator::evaluate_workflow_file;
 use wrkflw_executor::{self, JobStatus, RuntimeType, StepStatus};
@@ -382,6 +387,7 @@ pub async fn execute_curl_trigger(
 }
 
 // Extract common workflow execution logic to avoid duplication
+#[cfg(feature = "tui")]
 pub fn start_next_workflow_execution(
     app: &mut App,
     tx_clone: &mpsc::Sender<ExecutionResultMsg>,

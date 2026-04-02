@@ -9,15 +9,22 @@
 // - views: Contains UI rendering code
 
 // Re-export public modules
-pub mod app;
-pub mod components;
 pub mod handlers;
-pub mod log_processor;
 pub mod models;
 pub mod utils;
+
+// TUI-specific modules (require ratatui/crossterm)
+#[cfg(feature = "tui")]
+pub mod app;
+#[cfg(feature = "tui")]
+pub mod components;
+#[cfg(feature = "tui")]
+pub mod log_processor;
+#[cfg(feature = "tui")]
 pub mod views;
 
 // Re-export main entry points
+#[cfg(feature = "tui")]
 pub use app::run_wrkflw_tui;
 pub use handlers::workflow::execute_workflow_cli;
 pub use handlers::workflow::validate_workflow;

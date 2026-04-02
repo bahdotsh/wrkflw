@@ -95,6 +95,7 @@ enum Commands {
     },
 
     /// Open TUI interface to manage workflows
+    #[cfg(feature = "tui")]
     Tui {
         /// Path to workflow file or directory (defaults to .github/workflows)
         path: Option<PathBuf>,
@@ -546,6 +547,7 @@ async fn main() {
                 std::process::exit(1);
             }
         }
+        #[cfg(feature = "tui")]
         Some(Commands::Tui {
             path,
             runtime,
@@ -591,15 +593,24 @@ async fn main() {
             list_workflows_and_pipelines(verbose, *jobs);
         }
         None => {
-            // Launch TUI by default when no command is provided
-            let runtime_type = wrkflw_executor::RuntimeType::Docker;
-
-            // Call the TUI implementation from the ui crate with default path
-            if let Err(e) =
-                wrkflw_ui::run_wrkflw_tui(None, runtime_type, verbose, false, false).await
+            #[cfg(feature = "tui")]
             {
-                eprintln!("Error running TUI: {}", e);
-                std::process::exit(1);
+                // Launch TUI by default when no command is provided
+                let runtime_type = wrkflw_executor::RuntimeType::Docker;
+
+                // Call the TUI implementation from the ui crate with default path
+                if let Err(e) =
+                    wrkflw_ui::run_wrkflw_tui(None, runtime_type, verbose, false, false).await
+                {
+                    eprintln!("Error running TUI: {}", e);
+                    std::process::exit(1);
+                }
+            }
+            #[cfg(not(feature = "tui"))]
+            {
+                use clap::CommandFactory;
+                Wrkflw::command().print_help().unwrap();
+                println!();
             }
         }
     }

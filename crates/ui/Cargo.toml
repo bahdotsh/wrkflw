@@ -10,6 +10,10 @@ repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+[features]
+default = ["tui"]
+tui = ["dep:crossterm", "dep:ratatui"]
+
 [dependencies]
 # Internal crates
 wrkflw-models.workspace = true
@@ -21,8 +25,8 @@ wrkflw-github.workspace = true
 
 # External dependencies
 chrono.workspace = true
-crossterm.workspace = true
-ratatui.workspace = true
+crossterm = { workspace = true, optional = true }
+ratatui = { workspace = true, optional = true }
 serde.workspace = true
 serde_yaml.workspace = true
 tokio.workspace = true

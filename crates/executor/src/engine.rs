@@ -1719,9 +1719,14 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
     // Determine runner image: prefer job container, then detect setup actions, fall back to runs-on
     let runner_image_value = resolve_runner_image(job, ctx.runtime).await?;
 
-    // GHA default job timeout is 360 minutes
-    let job_timeout =
-        std::time::Duration::from_secs_f64(job.timeout_minutes.unwrap_or(360.0) * 60.0);
+    // GHA default job timeout is 360 minutes; sanitize to avoid panic on negative/NaN
+    let timeout_mins = job.timeout_minutes.unwrap_or(360.0);
+    let timeout_mins = if timeout_mins.is_finite() && timeout_mins > 0.0 {
+        timeout_mins.min(360.0 * 24.0)
+    } else {
+        360.0
+    };
+    let job_timeout = std::time::Duration::from_secs_f64(timeout_mins * 60.0);
 
     let step_loop = async {
         for (idx, step) in job.steps.iter().enumerate() {
@@ -2052,9 +2057,14 @@ async fn run_step_with_guards(
         }
     }
 
-    // Wrap step execution with optional timeout
+    // Wrap step execution with optional timeout; sanitize to avoid panic on negative/NaN
     let step_result = if let Some(minutes) = step.timeout_minutes {
-        let dur = std::time::Duration::from_secs_f64(minutes * 60.0);
+        let safe_mins = if minutes.is_finite() && minutes > 0.0 {
+            minutes.min(360.0 * 24.0)
+        } else {
+            360.0
+        };
+        let dur = std::time::Duration::from_secs_f64(safe_mins * 60.0);
         match tokio::time::timeout(dur, execute_step(step_exec_ctx)).await {
             Ok(result) => result,
             Err(_) => {
@@ -2755,7 +2765,13 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
             "sh" => vec!["sh", "-e", "-c", &resolved_run],
             "python" => vec!["python", "-c", &resolved_run],
             "pwsh" | "powershell" => vec!["pwsh", "-command", &resolved_run],
-            other => vec![other, "-c", &resolved_run],
+            other => {
+                wrkflw_logging::warning(&format!(
+                    "  Unrecognized shell '{}', falling back to '{} -c'",
+                    other, other
+                ));
+                vec![other, "-c", &resolved_run]
+            }
         };
 
         // Resolve effective working directory: step > job defaults > workflow defaults

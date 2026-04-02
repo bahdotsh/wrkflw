@@ -100,6 +100,16 @@ fn compute_hash_files(args_raw: &str, workspace: &Path) -> Result<String, String
         return Ok(String::new());
     }
 
+    // Reject patterns containing path traversal components
+    for pattern in &patterns {
+        if pattern.split('/').any(|seg| seg == "..") {
+            return Err(format!(
+                "hashFiles: pattern '{}' contains '..' path traversal",
+                pattern
+            ));
+        }
+    }
+
     // Collect all matching files
     let mut matched_files = Vec::new();
     for pattern in &patterns {
@@ -122,12 +132,13 @@ fn compute_hash_files(args_raw: &str, workspace: &Path) -> Result<String, String
     matched_files.sort();
     matched_files.dedup();
 
-    // Hash all file contents
+    // Hash all file contents (stream to avoid loading large files into memory)
     let mut hasher = Sha256::new();
     for path in &matched_files {
-        let contents = std::fs::read(path)
+        let mut file = std::fs::File::open(path)
             .map_err(|e| format!("hashFiles: could not read '{}': {}", path.display(), e))?;
-        hasher.update(&contents);
+        std::io::copy(&mut file, &mut hasher)
+            .map_err(|e| format!("hashFiles: could not read '{}': {}", path.display(), e))?;
     }
 
     Ok(format!("{:x}", hasher.finalize()))
@@ -310,23 +321,22 @@ mod tests {
     }
 
     #[test]
-    fn hash_files_read_error_returns_err() {
+    fn hash_files_rejects_path_traversal() {
         let dir = tempdir().unwrap();
-        let file_path = dir.path().join("unreadable.txt");
-        fs::write(&file_path, "content").unwrap();
-        // Remove the file after glob can find it — simulate a race / permission error
-        // Instead, test with a pattern that matches a directory (directories can't be "read" as files)
-        // Actually, the simplest reliable approach: test compute_hash_files directly
-        // with a path that doesn't exist by the time we read it
-        let result = compute_hash_files("'unreadable.txt'", &Path::new("/nonexistent/path"));
-        // glob won't match anything in a nonexistent dir, so it returns empty hash
-        assert!(result.is_ok());
+        fs::write(dir.path().join("legit.txt"), "content").unwrap();
 
-        // Test that the error propagation works through preprocess_hash_files
-        // by verifying the function returns Ok for valid inputs
-        let text = "${{ hashFiles('*.txt') }}";
+        let text = "${{ hashFiles('../../etc/passwd') }}";
         let result = preprocess_hash_files(text, dir.path());
-        // No .txt files remain, so this should return the empty hash
-        assert!(result.is_ok());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("path traversal"));
+    }
+
+    #[test]
+    fn hash_files_rejects_mid_path_traversal() {
+        let dir = tempdir().unwrap();
+
+        let result = compute_hash_files("'subdir/../../etc/passwd'", dir.path());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("path traversal"));
     }
 }

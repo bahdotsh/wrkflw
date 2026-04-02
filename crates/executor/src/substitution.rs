@@ -96,7 +96,8 @@ fn compute_hash_files(args_raw: &str, workspace: &Path) -> String {
     }
 
     if matched_files.is_empty() {
-        return String::new();
+        // GHA returns the SHA-256 of empty input when no files match
+        return format!("{:x}", Sha256::new().finalize());
     }
 
     // Sort for deterministic output (GHA sorts lexicographically)
@@ -106,8 +107,15 @@ fn compute_hash_files(args_raw: &str, workspace: &Path) -> String {
     // Hash all file contents
     let mut hasher = Sha256::new();
     for path in &matched_files {
-        if let Ok(contents) = std::fs::read(path) {
-            hasher.update(&contents);
+        match std::fs::read(path) {
+            Ok(contents) => hasher.update(&contents),
+            Err(e) => {
+                eprintln!(
+                    "warning: hashFiles: could not read '{}': {}",
+                    path.display(),
+                    e
+                );
+            }
         }
     }
 
@@ -221,13 +229,16 @@ mod tests {
     }
 
     #[test]
-    fn hash_files_no_matches_returns_empty() {
+    fn hash_files_no_matches_returns_hash_of_empty() {
         let dir = tempdir().unwrap();
 
         let text = "${{ hashFiles('nonexistent-*.xyz') }}";
         let result = preprocess_hash_files(text, dir.path());
 
-        assert_eq!(result, "");
+        // GHA returns SHA-256 of empty input when no files match
+        let expected = format!("{:x}", Sha256::new().finalize());
+        assert_eq!(result, expected);
+        assert_eq!(result.len(), 64);
     }
 
     #[test]

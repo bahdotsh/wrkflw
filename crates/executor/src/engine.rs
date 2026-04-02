@@ -2757,7 +2757,28 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
         // Define the standard workspace path inside the container
         let container_workspace = Path::new("/github/workspace");
         let final_workspace = if let Some(wd) = effective_wd {
-            container_workspace.join(wd)
+            let joined = container_workspace.join(wd);
+            // Canonicalize logically to catch ".." traversal and absolute path replacement
+            let mut normalized = std::path::PathBuf::new();
+            for component in joined.components() {
+                match component {
+                    std::path::Component::ParentDir => {
+                        normalized.pop();
+                    }
+                    c => normalized.push(c.as_os_str()),
+                }
+            }
+            if !normalized.starts_with(container_workspace) {
+                return Ok(StepResult {
+                    name: step_name,
+                    status: StepStatus::Failure,
+                    output: format!(
+                        "Invalid working-directory '{}': must be within workspace",
+                        wd
+                    ),
+                });
+            }
+            normalized
         } else {
             container_workspace.to_path_buf()
         };

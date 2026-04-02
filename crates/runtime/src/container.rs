@@ -1,6 +1,12 @@
 use async_trait::async_trait;
 use std::path::Path;
 
+/// Prefix for all locally-built images. Used to skip registry pulls.
+pub const LOCAL_IMAGE_PREFIX: &str = "wrkflw-";
+
+/// Prefix for combined runtime images built by `resolve_runner_image`.
+pub const COMBINED_IMAGE_PREFIX: &str = "wrkflw-combined:";
+
 #[async_trait]
 pub trait ContainerRuntime {
     /// Run a command inside a container.
@@ -36,6 +42,9 @@ pub trait ContainerRuntime {
         version: Option<&str>,
         additional_packages: Option<Vec<String>>,
     ) -> Result<String, ContainerError>;
+
+    /// Check whether a Docker/OCI image exists locally.
+    async fn image_exists(&self, tag: &str) -> Result<bool, ContainerError>;
 }
 
 #[derive(Debug)]

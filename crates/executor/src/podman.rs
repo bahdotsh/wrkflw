@@ -7,7 +7,9 @@ use std::sync::Mutex;
 use tempfile;
 use tokio::process::Command;
 use wrkflw_logging;
-use wrkflw_runtime::container::{ContainerError, ContainerOutput, ContainerRuntime};
+use wrkflw_runtime::container::{
+    ContainerError, ContainerOutput, ContainerRuntime, LOCAL_IMAGE_PREFIX,
+};
 use wrkflw_utils;
 use wrkflw_utils::fd;
 
@@ -673,6 +675,19 @@ impl ContainerRuntime for PodmanRuntime {
 
         Ok(image_tag)
     }
+
+    async fn image_exists(&self, tag: &str) -> Result<bool, ContainerError> {
+        let output = Command::new("podman")
+            .args(["image", "exists", tag])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await
+            .map_err(|e| {
+                ContainerError::ImageBuild(format!("Failed to check image {}: {}", tag, e))
+            })?;
+        Ok(output.success())
+    }
 }
 
 // Implementation of internal methods
@@ -714,8 +729,8 @@ impl PodmanRuntime {
 
         let mut args = vec!["run", "--name", &container_name, "-w", &working_dir_str];
 
-        // Skip registry pull for locally-built images (e.g., wrkflw-combined:*).
-        if image.starts_with("wrkflw-") {
+        // Skip registry pull for locally-built images (e.g., combined runtime images).
+        if image.starts_with(LOCAL_IMAGE_PREFIX) {
             args.push("--pull=never");
         }
 

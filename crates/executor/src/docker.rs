@@ -11,7 +11,9 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
 use wrkflw_logging;
-use wrkflw_runtime::container::{ContainerError, ContainerOutput, ContainerRuntime};
+use wrkflw_runtime::container::{
+    ContainerError, ContainerOutput, ContainerRuntime, COMBINED_IMAGE_PREFIX, LOCAL_IMAGE_PREFIX,
+};
 use wrkflw_utils;
 use wrkflw_utils::fd;
 
@@ -685,10 +687,10 @@ impl ContainerRuntime for DockerRuntime {
         context_dir: &Path,
     ) -> Result<(), ContainerError> {
         // Add a timeout for build operations.
-        // Combined runtime images (wrkflw-combined:*) may need to install
-        // packages from PPAs and external sources, so allow up to 10 minutes.
+        // Combined runtime images may need to install packages from PPAs
+        // and external sources, so allow up to 10 minutes.
         // Other builds use a 2 minute timeout.
-        let timeout_secs = if tag.starts_with("wrkflw-combined:") {
+        let timeout_secs = if tag.starts_with(COMBINED_IMAGE_PREFIX) {
             600
         } else {
             120
@@ -849,6 +851,19 @@ impl ContainerRuntime for DockerRuntime {
 
         Ok(image_tag)
     }
+
+    async fn image_exists(&self, tag: &str) -> Result<bool, ContainerError> {
+        match self.docker.inspect_image(tag).await {
+            Ok(_) => Ok(true),
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => Ok(false),
+            Err(e) => Err(ContainerError::ImageBuild(format!(
+                "Failed to inspect image {}: {}",
+                tag, e
+            ))),
+        }
+    }
 }
 
 // Move the actual implementation to internal methods
@@ -863,8 +878,8 @@ impl DockerRuntime {
         entrypoint: Option<&str>,
     ) -> Result<ContainerOutput, ContainerError> {
         // Try to pull the image if it's not available locally.
-        // Skip pull for locally-built images (e.g., wrkflw-combined:*).
-        if !image.starts_with("wrkflw-") {
+        // Skip pull for locally-built images (e.g., combined runtime images).
+        if !image.starts_with(LOCAL_IMAGE_PREFIX) {
             if let Err(e) = self.pull_image_inner(image).await {
                 wrkflw_logging::warning(&format!(
                     "Failed to pull image {}: {}. Attempting to continue with existing image.",

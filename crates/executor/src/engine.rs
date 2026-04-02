@@ -22,7 +22,7 @@ use wrkflw_parser::gitlab::{self, parse_pipeline};
 use wrkflw_parser::workflow::{
     self, parse_workflow, ActionInfo, Job, JobContainer, Step, WorkflowDefinition,
 };
-use wrkflw_runtime::container::ContainerRuntime;
+use wrkflw_runtime::container::{ContainerRuntime, COMBINED_IMAGE_PREFIX};
 use wrkflw_runtime::emulation;
 use wrkflw_secrets::{SecretConfig, SecretManager, SecretMasker, SecretSubstitution};
 
@@ -1362,63 +1362,90 @@ fn get_install_script(language: &str, version: &str) -> String {
 /// Extracted as a pure function so the output can be unit-tested without Docker.
 fn generate_combined_dockerfile(runtimes: &[SetupRuntime], base_image: &str) -> String {
     let mut dockerfile = format!("FROM {}\n", base_image);
-    dockerfile.push_str("RUN apt-get update && apt-get install -y --no-install-recommends curl bash git ca-certificates gnupg && rm -rf /var/lib/apt/lists/*\n");
 
-    // Combine all install scripts into a single RUN directive to avoid
-    // N separate `apt-get update` calls and reduce Docker layers.
+    // Combine base packages and all runtime install scripts into a single
+    // RUN directive so there is only one `apt-get update` call and the Docker
+    // layer cache works as a single unit.
     let scripts: Vec<&str> = runtimes
         .iter()
         .filter(|rt| !rt.install_script.is_empty())
         .map(|rt| rt.install_script.as_str())
         .collect();
 
-    if !scripts.is_empty() {
-        dockerfile.push_str("RUN apt-get update && \\\n");
-        for (i, script) in scripts.iter().enumerate() {
-            dockerfile.push_str(&format!("    {}", script));
-            if i + 1 < scripts.len() {
-                dockerfile.push_str(" && \\\n");
-            }
-        }
-        dockerfile.push_str(" && \\\n    rm -rf /var/lib/apt/lists/*\n");
+    dockerfile.push_str("RUN apt-get update && \\\n");
+    dockerfile.push_str(
+        "    apt-get install -y --no-install-recommends curl bash git ca-certificates gnupg",
+    );
+
+    for script in &scripts {
+        dockerfile.push_str(" && \\\n");
+        dockerfile.push_str(&format!("    {}", script));
     }
 
+    dockerfile.push_str(" && \\\n    rm -rf /var/lib/apt/lists/*\n");
+
     dockerfile
+}
+
+/// FNV-1a hash — deterministic across Rust toolchain versions, unlike `DefaultHasher`.
+fn fnv1a_hash(data: &[u8]) -> u64 {
+    const FNV_OFFSET_BASIS: u64 = 14695981039346656037;
+    const FNV_PRIME: u64 = 1099511628211;
+    let mut hash = FNV_OFFSET_BASIS;
+    for &byte in data {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
 }
 
 /// Build a deterministic image tag from the Dockerfile content.
 ///
 /// Includes a hash of the full Dockerfile so that changes to install scripts
 /// (e.g., updated URLs) invalidate the cache even when language/version pairs
-/// are unchanged.
+/// are unchanged.  Uses FNV-1a rather than `DefaultHasher` so the tag is
+/// stable across Rust toolchain upgrades.
 fn combined_image_tag(runtimes: &[SetupRuntime], dockerfile: &str) -> String {
-    use std::hash::{Hash, Hasher};
-
     let mut tag_parts: Vec<String> = runtimes
         .iter()
         .map(|r| format!("{}{}", r.language, r.version))
         .collect();
     tag_parts.sort();
 
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    dockerfile.hash(&mut hasher);
-    let hash = hasher.finish();
+    let hash = fnv1a_hash(dockerfile.as_bytes());
 
-    format!("wrkflw-combined:{}-{:x}", tag_parts.join("-"), hash)
+    format!(
+        "{}{}-{:x}",
+        COMBINED_IMAGE_PREFIX,
+        tag_parts.join("-"),
+        hash
+    )
 }
 
 /// Build a Docker image that combines multiple language runtimes on an Ubuntu base.
+///
+/// Skips the build when an image with the same tag already exists locally,
+/// avoiding redundant work on repeated runs.
 async fn build_combined_runtime_image(
     runtimes: &[SetupRuntime],
     base_image: &str,
     runtime: &dyn ContainerRuntime,
 ) -> Result<String, ExecutionError> {
+    let dockerfile = generate_combined_dockerfile(runtimes, base_image);
+    let tag = combined_image_tag(runtimes, &dockerfile);
+
+    // Skip the build if the image already exists locally.
+    let exists = runtime.image_exists(&tag).await.map_err(|e| {
+        ExecutionError::Runtime(format!("Failed to check for existing image: {}", e))
+    })?;
+    if exists {
+        wrkflw_logging::info(&format!("Reusing existing combined runtime image: {}", tag));
+        return Ok(tag);
+    }
+
     let temp_dir = tempfile::tempdir().map_err(|e| {
         ExecutionError::Execution(format!("Failed to create temp directory: {}", e))
     })?;
-
-    let dockerfile = generate_combined_dockerfile(runtimes, base_image);
-    let tag = combined_image_tag(runtimes, &dockerfile);
 
     let dockerfile_path = temp_dir.path().join("Dockerfile");
     std::fs::write(&dockerfile_path, &dockerfile)
@@ -4621,6 +4648,10 @@ runs:
         ) -> Result<String, ContainerError> {
             Ok("mock-image:latest".to_string())
         }
+
+        async fn image_exists(&self, _tag: &str) -> Result<bool, ContainerError> {
+            Ok(false)
+        }
     }
 
     /// Helper to build a minimal `WorkflowDefinition`.
@@ -5319,8 +5350,8 @@ runs:
         let df = generate_combined_dockerfile(&runtimes, "ubuntu:latest");
         assert!(df.starts_with("FROM ubuntu:latest\n"));
         assert!(df.contains("nodesource"));
-        // Single combined RUN layer (base + install)
-        assert_eq!(df.matches("RUN ").count(), 2);
+        // Everything in a single RUN layer
+        assert_eq!(df.matches("RUN ").count(), 1);
     }
 
     #[test]
@@ -5338,8 +5369,8 @@ runs:
             },
         ];
         let df = generate_combined_dockerfile(&runtimes, "ubuntu:latest");
-        // Base apt-get RUN + one combined install RUN = 2 total
-        assert_eq!(df.matches("RUN ").count(), 2);
+        // Everything in a single RUN layer
+        assert_eq!(df.matches("RUN ").count(), 1);
         assert!(df.contains("nodesource"));
         assert!(df.contains("deadsnakes"));
     }
@@ -5352,7 +5383,7 @@ runs:
             install_script: String::new(),
         }];
         let df = generate_combined_dockerfile(&runtimes, "ubuntu:latest");
-        // Only the base RUN, no install RUN
+        // Single RUN layer with just the base packages
         assert_eq!(df.matches("RUN ").count(), 1);
     }
 
@@ -5374,7 +5405,7 @@ runs:
         let tag1 = combined_image_tag(&runtimes, df);
         let tag2 = combined_image_tag(&runtimes, df);
         assert_eq!(tag1, tag2);
-        assert!(tag1.starts_with("wrkflw-combined:"));
+        assert!(tag1.starts_with(COMBINED_IMAGE_PREFIX));
     }
 
     #[test]

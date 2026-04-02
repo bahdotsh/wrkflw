@@ -417,6 +417,10 @@ impl ContainerRuntime for EmulationRuntime {
         Ok(())
     }
 
+    async fn image_exists(&self, _tag: &str) -> Result<bool, ContainerError> {
+        Ok(false)
+    }
+
     async fn prepare_language_environment(
         &self,
         language: &str,

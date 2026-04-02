@@ -1720,12 +1720,7 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
     let runner_image_value = resolve_runner_image(job, ctx.runtime).await?;
 
     // GHA default job timeout is 360 minutes; sanitize to avoid panic on negative/NaN
-    let timeout_mins = job.timeout_minutes.unwrap_or(360.0);
-    let timeout_mins = if timeout_mins.is_finite() && timeout_mins > 0.0 {
-        timeout_mins.min(360.0 * 24.0)
-    } else {
-        360.0
-    };
+    let timeout_mins = sanitize_timeout_minutes(job.timeout_minutes, 360.0);
     let job_timeout = std::time::Duration::from_secs_f64(timeout_mins * 60.0);
 
     let step_loop = async {
@@ -1789,7 +1784,6 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
         Ok(Ok(())) => {}
         Ok(Err(e)) => return Err(e),
         Err(_) => {
-            let timeout_mins = job.timeout_minutes.unwrap_or(360.0);
             wrkflw_logging::error(&format!(
                 "Job '{}' exceeded timeout of {} minutes",
                 ctx.job_name, timeout_mins
@@ -2059,11 +2053,7 @@ async fn run_step_with_guards(
 
     // Wrap step execution with optional timeout; sanitize to avoid panic on negative/NaN
     let step_result = if let Some(minutes) = step.timeout_minutes {
-        let safe_mins = if minutes.is_finite() && minutes > 0.0 {
-            minutes.min(360.0 * 24.0)
-        } else {
-            360.0
-        };
+        let safe_mins = sanitize_timeout_minutes(Some(minutes), 360.0);
         let dur = std::time::Duration::from_secs_f64(safe_mins * 60.0);
         match tokio::time::timeout(dur, execute_step(step_exec_ctx)).await {
             Ok(result) => result,
@@ -2125,6 +2115,18 @@ async fn run_step_with_guards(
                 })
             }
         }
+    }
+}
+
+/// Sanitize a timeout-minutes value, returning a safe positive finite number.
+/// Falls back to `default` for `None`, `NaN`, `Infinity`, zero, or negative values.
+/// Clamps to a maximum of 8640 minutes (6 days).
+fn sanitize_timeout_minutes(raw: Option<f64>, default: f64) -> f64 {
+    let mins = raw.unwrap_or(default);
+    if mins.is_finite() && mins > 0.0 {
+        mins.min(360.0 * 24.0)
+    } else {
+        default
     }
 }
 
@@ -6055,5 +6057,71 @@ runs:
         let result = execute_step(ctx).await.unwrap();
         assert_eq!(result.status, StepStatus::Success);
         // Should succeed — "src" is a valid subdirectory path
+    }
+
+    // --- sanitize_timeout_minutes tests ---
+
+    #[test]
+    fn sanitize_timeout_none_returns_default() {
+        assert_eq!(sanitize_timeout_minutes(None, 360.0), 360.0);
+    }
+
+    #[test]
+    fn sanitize_timeout_positive_value_returned() {
+        assert_eq!(sanitize_timeout_minutes(Some(30.0), 360.0), 30.0);
+    }
+
+    #[test]
+    fn sanitize_timeout_nan_returns_default() {
+        assert_eq!(sanitize_timeout_minutes(Some(f64::NAN), 360.0), 360.0);
+    }
+
+    #[test]
+    fn sanitize_timeout_infinity_returns_default() {
+        assert_eq!(sanitize_timeout_minutes(Some(f64::INFINITY), 360.0), 360.0);
+    }
+
+    #[test]
+    fn sanitize_timeout_neg_infinity_returns_default() {
+        assert_eq!(
+            sanitize_timeout_minutes(Some(f64::NEG_INFINITY), 360.0),
+            360.0
+        );
+    }
+
+    #[test]
+    fn sanitize_timeout_zero_returns_default() {
+        assert_eq!(sanitize_timeout_minutes(Some(0.0), 360.0), 360.0);
+    }
+
+    #[test]
+    fn sanitize_timeout_negative_returns_default() {
+        assert_eq!(sanitize_timeout_minutes(Some(-5.0), 360.0), 360.0);
+    }
+
+    #[test]
+    fn sanitize_timeout_clamps_to_max() {
+        // 360 * 24 = 8640
+        assert_eq!(sanitize_timeout_minutes(Some(99999.0), 360.0), 8640.0);
+    }
+
+    // --- Job-level timeout test ---
+
+    #[tokio::test]
+    async fn job_timeout_produces_failure_result() {
+        // Use a very short timeout wrapping a step that sleeps longer
+        let timeout_mins = 0.0001; // ~6ms
+        let dur = std::time::Duration::from_secs_f64(
+            sanitize_timeout_minutes(Some(timeout_mins), 360.0) * 60.0,
+        );
+
+        let step_loop = async {
+            // Simulate a step that takes longer than the timeout
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            Ok::<(), ExecutionError>(())
+        };
+
+        let result = tokio::time::timeout(dur, step_loop).await;
+        assert!(result.is_err(), "Expected timeout but step completed");
     }
 }

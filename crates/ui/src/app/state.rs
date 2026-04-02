@@ -10,6 +10,7 @@ use ratatui::widgets::{ListState, TableState};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use wrkflw_executor::{JobStatus, RuntimeType, StepStatus};
+use wrkflw_parser::workflow::parse_workflow;
 
 /// Application state
 pub struct App {
@@ -51,6 +52,12 @@ pub struct App {
     pub processed_logs: Vec<ProcessedLogEntry>,
     pub logs_need_update: bool,        // Flag to trigger log processing
     pub last_system_logs_count: usize, // Track system log changes
+
+    // Job selection mode
+    pub job_selection_mode: bool, // Are we viewing jobs of a workflow?
+    pub available_jobs: Vec<String>, // Job names parsed from selected workflow
+    pub selected_job_index: usize, // Cursor in job selection list
+    pub target_job: Option<String>, // Job to execute (None = all)
 }
 
 impl App {
@@ -220,6 +227,12 @@ impl App {
             processed_logs: Vec::new(),
             logs_need_update: true,
             last_system_logs_count: 0,
+
+            // Job selection mode
+            job_selection_mode: false,
+            available_jobs: Vec::new(),
+            selected_job_index: 0,
+            target_job: None,
         }
     }
 
@@ -591,6 +604,9 @@ impl App {
                 self.current_execution = None;
             }
         }
+
+        // Reset target_job after execution completes
+        self.target_job = None;
     }
 
     // Get next workflow for execution
@@ -619,6 +635,110 @@ impl App {
         });
 
         Some(next)
+    }
+
+    // Enter job selection mode for the currently selected workflow
+    pub fn enter_job_selection_mode(&mut self) {
+        if let Some(idx) = self.workflow_list_state.selected() {
+            if idx < self.workflows.len() {
+                let workflow_path = &self.workflows[idx].path;
+                match parse_workflow(workflow_path) {
+                    Ok(workflow_def) => {
+                        let mut job_names: Vec<String> =
+                            workflow_def.jobs.keys().cloned().collect();
+                        job_names.sort();
+
+                        if job_names.is_empty() {
+                            self.add_timestamped_log(&format!(
+                                "No jobs found in workflow '{}'",
+                                self.workflows[idx].name
+                            ));
+                            return;
+                        }
+
+                        self.available_jobs = job_names;
+                        self.selected_job_index = 0;
+                        self.job_selection_mode = true;
+                    }
+                    Err(e) => {
+                        self.add_timestamped_log(&format!(
+                            "Failed to parse workflow '{}': {}",
+                            self.workflows[idx].name, e
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    // Exit job selection mode back to workflow list
+    pub fn exit_job_selection_mode(&mut self) {
+        self.job_selection_mode = false;
+        self.available_jobs.clear();
+        self.selected_job_index = 0;
+        self.target_job = None;
+    }
+
+    // Navigate to next job in selection list
+    pub fn next_available_job(&mut self) {
+        if !self.available_jobs.is_empty() {
+            self.selected_job_index = (self.selected_job_index + 1) % self.available_jobs.len();
+        }
+    }
+
+    // Navigate to previous job in selection list
+    pub fn previous_available_job(&mut self) {
+        if !self.available_jobs.is_empty() {
+            if self.selected_job_index == 0 {
+                self.selected_job_index = self.available_jobs.len() - 1;
+            } else {
+                self.selected_job_index -= 1;
+            }
+        }
+    }
+
+    // Select a specific job and run it
+    pub fn select_job_and_run(&mut self) {
+        if self.selected_job_index < self.available_jobs.len() {
+            let job_name = self.available_jobs[self.selected_job_index].clone();
+            self.target_job = Some(job_name.clone());
+            self.add_timestamped_log(&format!("Running job '{}'", job_name));
+
+            // Queue the workflow that was selected before entering job selection mode
+            if let Some(idx) = self.workflow_list_state.selected() {
+                if idx < self.workflows.len() {
+                    self.workflows[idx].selected = true;
+                    if !self.execution_queue.contains(&idx) {
+                        self.execution_queue.push(idx);
+                    }
+                }
+            }
+
+            self.job_selection_mode = false;
+            self.available_jobs.clear();
+            self.selected_job_index = 0;
+            self.start_execution();
+        }
+    }
+
+    // Run all jobs in the workflow (from job selection mode)
+    pub fn run_all_jobs(&mut self) {
+        self.target_job = None;
+        self.add_timestamped_log("Running all jobs");
+
+        if let Some(idx) = self.workflow_list_state.selected() {
+            if idx < self.workflows.len() {
+                self.workflows[idx].selected = true;
+                if !self.execution_queue.contains(&idx) {
+                    self.execution_queue.push(idx);
+                }
+            }
+        }
+
+        self.job_selection_mode = false;
+        self.available_jobs.clear();
+        self.selected_job_index = 0;
+        self.start_execution();
     }
 
     // Toggle detailed view mode

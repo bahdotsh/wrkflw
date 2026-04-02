@@ -144,20 +144,22 @@ pub fn render_status_bar(f: &mut Frame<CrosstermBackend<io::Stdout>>, app: &App,
     status_items.push(Span::raw(" "));
     let help_text: String = match app.selected_tab {
         0 => {
-            if let Some(idx) = app.workflow_list_state.selected() {
+            if app.job_selection_mode {
+                "[Enter] Run job   [a] Run all jobs   [Esc] Back to workflows".to_string()
+            } else if let Some(idx) = app.workflow_list_state.selected() {
                 if idx < app.workflows.len() {
                     let workflow = &app.workflows[idx];
                     match workflow.status {
-                        crate::models::WorkflowStatus::NotStarted => "[Space] Toggle selection   [Enter] Run selected   [r] Run all selected   [t] Trigger Workflow  [Shift+R] Reset workflow".to_string(),
-                        crate::models::WorkflowStatus::Running => "[Space] Toggle selection   [Enter] Run selected   [r] Run all selected   (Workflow running...)".to_string(),
-                        crate::models::WorkflowStatus::Success | crate::models::WorkflowStatus::Failed | crate::models::WorkflowStatus::Skipped => "[Space] Toggle selection   [Enter] Run selected   [r] Run all selected   [Shift+R] Reset workflow".to_string(),
+                        crate::models::WorkflowStatus::NotStarted => "[Space] Toggle selection   [Enter] Select jobs   [r] Run all selected   [t] Trigger Workflow  [Shift+R] Reset workflow".to_string(),
+                        crate::models::WorkflowStatus::Running => "[Space] Toggle selection   [Enter] Select jobs   [r] Run all selected   (Workflow running...)".to_string(),
+                        crate::models::WorkflowStatus::Success | crate::models::WorkflowStatus::Failed | crate::models::WorkflowStatus::Skipped => "[Space] Toggle selection   [Enter] Select jobs   [r] Run all selected   [Shift+R] Reset workflow".to_string(),
                     }
                 } else {
-                    "[Space] Toggle selection   [Enter] Run selected   [r] Run all selected"
+                    "[Space] Toggle selection   [Enter] Select jobs   [r] Run all selected"
                         .to_string()
                 }
             } else {
-                "[Space] Toggle selection   [Enter] Run selected   [r] Run all selected".to_string()
+                "[Space] Toggle selection   [Enter] Select jobs   [r] Run all selected".to_string()
             }
         }
         1 => {

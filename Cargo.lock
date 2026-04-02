@@ -3542,6 +3542,7 @@ dependencies = [
  "wrkflw-github",
  "wrkflw-logging",
  "wrkflw-models",
+ "wrkflw-parser",
  "wrkflw-utils",
 ]
 

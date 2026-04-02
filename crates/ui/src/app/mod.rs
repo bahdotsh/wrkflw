@@ -221,7 +221,9 @@ fn run_tui_event_loop(
                         break Ok(());
                     }
                     KeyCode::Esc => {
-                        if app.detailed_view {
+                        if app.job_selection_mode {
+                            app.exit_job_selection_mode();
+                        } else if app.detailed_view {
                             app.detailed_view = false;
                         } else if app.show_help {
                             app.show_help = false;
@@ -252,7 +254,11 @@ fn run_tui_event_loop(
                         } else if app.selected_tab == 3 {
                             app.scroll_help_up();
                         } else if app.selected_tab == 0 {
-                            app.previous_workflow();
+                            if app.job_selection_mode {
+                                app.previous_available_job();
+                            } else {
+                                app.previous_workflow();
+                            }
                         } else if app.selected_tab == 1 {
                             if app.detailed_view {
                                 app.previous_step();
@@ -271,7 +277,11 @@ fn run_tui_event_loop(
                         } else if app.selected_tab == 3 {
                             app.scroll_help_down();
                         } else if app.selected_tab == 0 {
-                            app.next_workflow();
+                            if app.job_selection_mode {
+                                app.next_available_job();
+                            } else {
+                                app.next_workflow();
+                            }
                         } else if app.selected_tab == 1 {
                             if app.detailed_view {
                                 app.next_step();
@@ -281,19 +291,20 @@ fn run_tui_event_loop(
                         }
                     }
                     KeyCode::Char(' ') => {
-                        if app.selected_tab == 0 && !app.running {
+                        if app.selected_tab == 0 && !app.running && !app.job_selection_mode {
                             app.toggle_selected();
                         }
                     }
                     KeyCode::Enter => {
                         match app.selected_tab {
                             0 => {
-                                // In workflows tab, Enter runs the selected workflow
                                 if !app.running {
-                                    if let Some(idx) = app.workflow_list_state.selected() {
-                                        app.workflows[idx].selected = true;
-                                        app.queue_selected_for_execution();
-                                        app.start_execution();
+                                    if app.job_selection_mode {
+                                        // In job selection mode, run the selected job
+                                        app.select_job_and_run();
+                                    } else {
+                                        // Enter job selection mode for the selected workflow
+                                        app.enter_job_selection_mode();
                                     }
                                 }
                             }
@@ -336,9 +347,14 @@ fn run_tui_event_loop(
                     }
                     KeyCode::Char('a') => {
                         if !app.running {
-                            // Select all workflows
-                            for workflow in &mut app.workflows {
-                                workflow.selected = true;
+                            if app.job_selection_mode {
+                                // In job selection mode, run all jobs
+                                app.run_all_jobs();
+                            } else {
+                                // Select all workflows
+                                for workflow in &mut app.workflows {
+                                    workflow.selected = true;
+                                }
                             }
                         }
                     }

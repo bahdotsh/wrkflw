@@ -17,6 +17,14 @@ pub fn render_workflows_tab(
     app: &mut App,
     area: Rect,
 ) {
+    if app.job_selection_mode {
+        render_job_selection(f, app, area);
+    } else {
+        render_workflow_list(f, app, area);
+    }
+}
+
+fn render_workflow_list(f: &mut Frame<CrosstermBackend<io::Stdout>>, app: &mut App, area: Rect) {
     // Create a more structured layout for the workflow tab
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -42,7 +50,7 @@ pub fn render_workflows_tab(
             Span::styled("Space", Style::default().fg(Color::Cyan)),
             Span::raw(": Toggle selection   "),
             Span::styled("Enter", Style::default().fg(Color::Cyan)),
-            Span::raw(": Run   "),
+            Span::raw(": Select jobs   "),
             Span::styled("t", Style::default().fg(Color::Cyan)),
             Span::raw(": Trigger remotely"),
         ]),
@@ -62,8 +70,6 @@ pub fn render_workflows_tab(
     let selected_style = Style::default()
         .bg(Color::DarkGray)
         .add_modifier(Modifier::BOLD);
-
-    // Normal style definition removed as it was unused
 
     let header_cells = ["", "Status", "Workflow Name", "Path"]
         .iter()
@@ -134,4 +140,92 @@ pub fn render_workflows_tab(
 
     // Update the app list state to match the table state
     app.workflow_list_state.select(table_state.selected());
+}
+
+fn render_job_selection(f: &mut Frame<CrosstermBackend<io::Stdout>>, app: &mut App, area: Rect) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(
+            [
+                Constraint::Length(3), // Header with instructions
+                Constraint::Min(5),    // Job list
+            ]
+            .as_ref(),
+        )
+        .margin(1)
+        .split(area);
+
+    // Get workflow name for the header
+    let workflow_name = app
+        .workflow_list_state
+        .selected()
+        .and_then(|idx| app.workflows.get(idx))
+        .map(|w| w.name.as_str())
+        .unwrap_or("Unknown");
+
+    let header_text = vec![
+        Line::from(vec![Span::styled(
+            format!("Jobs in '{}'", workflow_name),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )]),
+        Line::from(vec![
+            Span::styled("Enter", Style::default().fg(Color::Cyan)),
+            Span::raw(": Run job   "),
+            Span::styled("a", Style::default().fg(Color::Cyan)),
+            Span::raw(": Run all   "),
+            Span::styled("Esc", Style::default().fg(Color::Cyan)),
+            Span::raw(": Back"),
+        ]),
+    ];
+
+    let header = Paragraph::new(header_text)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded),
+        )
+        .alignment(Alignment::Center);
+
+    f.render_widget(header, chunks[0]);
+
+    let selected_style = Style::default()
+        .bg(Color::DarkGray)
+        .add_modifier(Modifier::BOLD);
+
+    let header_cells = ["#", "Job Name"]
+        .iter()
+        .map(|h| Cell::from(*h).style(Style::default().fg(Color::Yellow)));
+
+    let header = Row::new(header_cells)
+        .style(Style::default().add_modifier(Modifier::BOLD))
+        .height(1);
+
+    let rows = app.available_jobs.iter().enumerate().map(|(i, job_name)| {
+        Row::new(vec![
+            Cell::from(format!("{}", i + 1)).style(Style::default().fg(Color::DarkGray)),
+            Cell::from(job_name.clone()),
+        ])
+    });
+
+    let jobs_table = Table::new(rows)
+        .header(header)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .title(Span::styled(" Jobs ", Style::default().fg(Color::Yellow))),
+        )
+        .highlight_style(selected_style)
+        .highlight_symbol("» ")
+        .widths(&[
+            Constraint::Length(4),      // Number column
+            Constraint::Percentage(90), // Job name column
+        ]);
+
+    let mut table_state = TableState::default();
+    table_state.select(Some(app.selected_job_index));
+
+    f.render_stateful_widget(jobs_table, chunks[1], &mut table_state);
 }

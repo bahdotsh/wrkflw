@@ -470,6 +470,7 @@ pub fn start_next_workflow_execution(
         let validation_mode = app.validation_mode;
         let preserve_containers_on_failure = app.preserve_containers_on_failure;
         let show_action_messages = app.show_action_messages;
+        let target_job = app.target_job.clone();
 
         // Update workflow status and add execution details
         app.workflows[next_idx].status = WorkflowStatus::Running;
@@ -544,7 +545,7 @@ pub fn start_next_workflow_execution(
                         preserve_containers_on_failure,
                         secrets_config: None, // Use default secrets configuration
                         show_action_messages,
-                        target_job: None,
+                        target_job,
                     };
 
                     let execution_result = wrkflw_utils::fd::with_stderr_to_null(|| {

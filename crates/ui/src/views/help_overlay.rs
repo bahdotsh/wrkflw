@@ -139,6 +139,50 @@ pub fn render_help_content(
         ]),
         Line::from(""),
         Line::from(Span::styled(
+            "🎯 JOB SELECTION",
+            Style::default()
+                .fg(Color::Blue)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(
+                "Enter",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" - View jobs in workflow"),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "Enter (in jobs)",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" - Run selected job"),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "a (in jobs)",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" - Run all jobs"),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "Esc (in jobs)",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" - Back to workflow list"),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
             "🔧 EXECUTION MODES",
             Style::default()
                 .fg(Color::Magenta)

@@ -837,7 +837,7 @@ fn sanitize_dockerfile_rel(raw: &str) -> Result<String, String> {
     if trimmed.is_empty() {
         return Err("empty Dockerfile path".to_string());
     }
-    if trimmed.split('/').any(|c| c == "..") {
+    if trimmed.split(&['/', '\\'][..]).any(|c| c == "..") {
         return Err(format!("path traversal not allowed: {}", trimmed));
     }
     Ok(trimmed.to_string())
@@ -1771,6 +1771,9 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                     // overrides the action.yml's runs.args as the container CMD
                     // (this matches GitHub Actions behavior).
                     let mut with_args_override: Option<String> = None;
+                    // Allow workflow step to override entrypoint via `with.entrypoint`,
+                    // matching GitHub Actions behavior.
+                    let mut entrypoint = entrypoint;
                     if let Some(with_params) = &ctx.step.with {
                         for (key, value) in with_params {
                             step_env.insert(format!("INPUT_{}", key.to_uppercase()), value.clone());
@@ -1779,6 +1782,9 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                         // string means "pass zero args", matching GitHub Actions behavior.
                         if let Some(a) = with_params.get("args") {
                             with_args_override = Some(a.clone());
+                        }
+                        if let Some(ep) = with_params.get("entrypoint") {
+                            entrypoint = Some(ep.clone());
                         }
                     }
 
@@ -4086,6 +4092,16 @@ runs:
     #[test]
     fn dockerfile_rel_rejects_dotdot_in_middle() {
         assert!(sanitize_dockerfile_rel("subdir/../../../etc/shadow").is_err());
+    }
+
+    #[test]
+    fn dockerfile_rel_rejects_backslash_traversal() {
+        assert!(sanitize_dockerfile_rel("..\\..\\etc\\shadow").is_err());
+    }
+
+    #[test]
+    fn dockerfile_rel_rejects_mixed_separator_traversal() {
+        assert!(sanitize_dockerfile_rel("subdir\\..\\..\\etc/shadow").is_err());
     }
 
     #[test]

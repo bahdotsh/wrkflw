@@ -546,7 +546,14 @@ enum PreparedAction {
         entrypoint: Option<String>,
         args: Vec<String>,
     },
-    /// A Docker image name to run a command in (legacy path for special-cased actions).
+    /// A Docker image name to run a shell command in.
+    ///
+    /// Used by Node.js actions (resolved to `node:XX-slim`), the
+    /// `determine_action_image` fallback, and `run:` steps. These paths
+    /// build an explicit shell command that is passed as CMD, so the
+    /// image's built-in ENTRYPOINT is intentionally overridden with a
+    /// bash wrapper. If you need the image's native ENTRYPOINT/CMD,
+    /// use `NativeDocker` instead.
     Image(String),
     /// A composite action that needs special step-based execution.
     Composite,
@@ -801,12 +808,15 @@ async fn prepare_action(
 /// Sanitize a sub-path component from an action reference (e.g. `owner/repo/sub/path`).
 ///
 /// Rejects any path component that is exactly `..` to prevent directory
-/// traversal out of the cloned repository.
+/// traversal out of the cloned repository. Both `/` and `\` are treated
+/// as separators for defense-in-depth (backslash paths are unlikely in
+/// practice but could bypass a `/`-only check on Windows hosts).
 fn sanitize_sub_path(raw: &str) -> Result<(), String> {
     if raw.contains('\0') {
         return Err("null byte not allowed in sub_path".to_string());
     }
-    if raw.split('/').any(|c| c == "..") {
+    // Split on both forward and back slashes to catch Windows-style traversal.
+    if raw.split(&['/', '\\'][..]).any(|c| c == "..") {
         return Err(format!("path traversal not allowed in sub_path: {}", raw));
     }
     Ok(())
@@ -4458,5 +4468,102 @@ runs:
             .collect();
         assert_eq!(env_map.get("JOB_VAR"), Some(&"from-job"));
         assert_eq!(env_map.get("STEP_VAR"), Some(&"from-step"));
+    }
+
+    #[tokio::test]
+    async fn native_docker_with_args_unmatched_quote_is_error() {
+        let runtime = MockContainerRuntime::default();
+        let workflow = minimal_workflow();
+        let job_env = HashMap::new();
+        let working_dir = std::env::current_dir().unwrap();
+
+        let mut with = HashMap::new();
+        with.insert("args".to_string(), "hello 'world".to_string());
+
+        let step = make_step(
+            "docker-bad-args",
+            "docker://alpine:3.18",
+            Some(with),
+            HashMap::new(),
+        );
+
+        let ctx = StepExecutionContext {
+            step: &step,
+            step_idx: 0,
+            job_env: &job_env,
+            working_dir: &working_dir,
+            runtime: &runtime,
+            workflow: &workflow,
+            runner_image: "ubuntu:latest",
+            verbose: false,
+            matrix_combination: &None,
+            secret_manager: None,
+            secret_masker: None,
+            container_config: None,
+        };
+
+        let result = execute_step(ctx).await;
+        assert!(result.is_err(), "unmatched quote in with.args should error");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("unmatched quote"),
+            "error should mention unmatched quote, got: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn native_docker_runs_args_overridden_by_with_args() {
+        // When both runs.args (from action.yml) and with.args (from workflow)
+        // are present, with.args should win — matching GitHub Actions behavior.
+        let runtime = MockContainerRuntime::default();
+        let workflow = minimal_workflow();
+        let job_env = HashMap::new();
+        let working_dir = std::env::current_dir().unwrap();
+
+        let mut with = HashMap::new();
+        with.insert("args".to_string(), "override-arg".to_string());
+
+        let step = make_step(
+            "docker-override-step",
+            "docker://alpine:3.18",
+            Some(with),
+            HashMap::new(),
+        );
+
+        let ctx = StepExecutionContext {
+            step: &step,
+            step_idx: 0,
+            job_env: &job_env,
+            working_dir: &working_dir,
+            runtime: &runtime,
+            workflow: &workflow,
+            runner_image: "ubuntu:latest",
+            verbose: false,
+            matrix_combination: &None,
+            secret_manager: None,
+            secret_masker: None,
+            container_config: None,
+        };
+
+        let result = execute_step(ctx).await.unwrap();
+        assert_eq!(result.status, StepStatus::Success);
+
+        let calls = runtime.run_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        // with.args takes precedence over any runs.args the action may have
+        assert_eq!(calls[0].cmd, vec!["override-arg"]);
+    }
+
+    // --- sub_path backslash traversal tests ---
+
+    #[test]
+    fn sub_path_rejects_backslash_dotdot() {
+        assert!(sanitize_sub_path("a\\..\\..\\etc").is_err());
+    }
+
+    #[test]
+    fn sub_path_rejects_mixed_separator_dotdot() {
+        assert!(sanitize_sub_path("a/..\\..\\etc").is_err());
     }
 }

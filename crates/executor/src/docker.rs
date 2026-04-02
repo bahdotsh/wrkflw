@@ -1168,106 +1168,56 @@ impl DockerRuntime {
             // Track cumulative size so we can enforce MAX_CONTEXT_BYTES.
             let mut total_bytes: u64 = 0;
 
-            // Build a .dockerignore-aware walker when the file exists.
+            // Build a context walker. When a .dockerignore exists, its patterns
+            // are used to exclude files (same glob semantics as Docker).
+            use ignore::WalkBuilder;
+
             let dockerignore_path = context_dir.join(".dockerignore");
+            let mut walker_builder = WalkBuilder::new(context_dir);
+            // Disable default .gitignore / .ignore handling — we only want
+            // .dockerignore semantics when the file is present.
+            walker_builder.standard_filters(false).follow_links(false);
             if dockerignore_path.exists() {
-                // Use the `ignore` crate to walk the context directory while
-                // respecting .dockerignore patterns (same glob semantics).
-                use ignore::WalkBuilder;
+                walker_builder.add_custom_ignore_filename(".dockerignore");
+            }
 
-                let walker = WalkBuilder::new(context_dir)
-                    // Disable default .gitignore / .ignore handling — we only
-                    // want .dockerignore semantics.
-                    .standard_filters(false)
-                    .add_custom_ignore_filename(".dockerignore")
-                    .follow_links(false)
-                    .build();
-
-                for entry in walker {
-                    let entry = entry.map_err(|e| {
-                        ContainerError::ImageBuild(format!("Failed to walk build context: {}", e))
-                    })?;
-                    let path = entry.path();
-                    let rel = match path.strip_prefix(context_dir) {
-                        Ok(r) => r,
-                        Err(_) => continue,
-                    };
-                    // Skip the root directory itself — tar implicitly contains it.
-                    if rel.as_os_str().is_empty() {
-                        continue;
-                    }
-                    if path.is_dir() {
-                        tar_builder.append_dir(rel, path).map_err(|e| {
-                            ContainerError::ImageBuild(format!(
-                                "Failed to add directory to build context tar: {}",
-                                e
-                            ))
-                        })?;
-                    } else {
-                        if let Ok(meta) = path.metadata() {
-                            total_bytes += meta.len();
-                            if total_bytes > MAX_CONTEXT_BYTES {
-                                return Err(ContainerError::ImageBuild(format!(
-                                    "Docker build context exceeds {} MB limit. \
-                                     Add a .dockerignore file to exclude unnecessary files.",
-                                    MAX_CONTEXT_BYTES / (1024 * 1024)
-                                )));
-                            }
-                        }
-                        tar_builder.append_path_with_name(path, rel).map_err(|e| {
-                            ContainerError::ImageBuild(format!(
-                                "Failed to add file to build context tar: {}",
-                                e
-                            ))
-                        })?;
-                    }
+            for entry in walker_builder.build() {
+                let entry = entry.map_err(|e| {
+                    ContainerError::ImageBuild(format!("Failed to walk build context: {}", e))
+                })?;
+                let path = entry.path();
+                let rel = match path.strip_prefix(context_dir) {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
+                // Skip the root directory itself — tar implicitly contains it.
+                if rel.as_os_str().is_empty() {
+                    continue;
                 }
-            } else {
-                // No .dockerignore — walk manually so we can enforce the size limit.
-                use ignore::WalkBuilder;
-
-                let walker = WalkBuilder::new(context_dir)
-                    .standard_filters(false)
-                    .follow_links(false)
-                    .build();
-
-                for entry in walker {
-                    let entry = entry.map_err(|e| {
-                        ContainerError::ImageBuild(format!("Failed to walk build context: {}", e))
+                if path.is_dir() {
+                    tar_builder.append_dir(rel, path).map_err(|e| {
+                        ContainerError::ImageBuild(format!(
+                            "Failed to add directory to build context tar: {}",
+                            e
+                        ))
                     })?;
-                    let path = entry.path();
-                    let rel = match path.strip_prefix(context_dir) {
-                        Ok(r) => r,
-                        Err(_) => continue,
-                    };
-                    if rel.as_os_str().is_empty() {
-                        continue;
-                    }
-                    if path.is_dir() {
-                        tar_builder.append_dir(rel, path).map_err(|e| {
-                            ContainerError::ImageBuild(format!(
-                                "Failed to add directory to build context tar: {}",
-                                e
-                            ))
-                        })?;
-                    } else {
-                        if let Ok(meta) = path.metadata() {
-                            total_bytes += meta.len();
-                            if total_bytes > MAX_CONTEXT_BYTES {
-                                return Err(ContainerError::ImageBuild(format!(
-                                    "Docker build context exceeds {} MB limit. \
-                                     Add a .dockerignore file to exclude unnecessary files.",
-                                    MAX_CONTEXT_BYTES / (1024 * 1024)
-                                )));
-                            }
+                } else {
+                    if let Ok(meta) = path.metadata() {
+                        total_bytes += meta.len();
+                        if total_bytes > MAX_CONTEXT_BYTES {
+                            return Err(ContainerError::ImageBuild(format!(
+                                "Docker build context exceeds {} MB limit. \
+                                 Add a .dockerignore file to exclude unnecessary files.",
+                                MAX_CONTEXT_BYTES / (1024 * 1024)
+                            )));
                         }
-                        tar_builder.append_path_with_name(path, rel).map_err(|e| {
-                            ContainerError::ImageBuild(format!(
-                                "Failed to add file to build context tar: {}",
-                                e
-                            ))
-                        })?;
                     }
+                    tar_builder.append_path_with_name(path, rel).map_err(|e| {
+                        ContainerError::ImageBuild(format!(
+                            "Failed to add file to build context tar: {}",
+                            e
+                        ))
+                    })?;
                 }
             }
 

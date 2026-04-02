@@ -1,41 +1,37 @@
 // Job detail view rendering
 use crate::app::App;
+use crate::theme::{self, COLORS};
 use ratatui::{
-    backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Paragraph, Row, Table},
+    widgets::{Paragraph, Row, Table, Wrap},
     Frame,
 };
-use std::io;
 
 // Render the job detail view
 pub fn render_job_detail_view(
-    f: &mut Frame<CrosstermBackend<io::Stdout>>,
+    f: &mut Frame<'_>,
     app: &mut App,
     area: Rect,
 ) {
-    // Get the workflow index either from current_execution or selected workflow
     let current_workflow_idx = app
         .current_execution
         .or_else(|| app.workflow_list_state.selected())
         .filter(|&idx| idx < app.workflows.len());
 
     if let Some(workflow_idx) = current_workflow_idx {
-        // Only proceed if we have execution details
         if let Some(execution) = &app.workflows[workflow_idx].execution_details {
-            // Only proceed if we have a valid job selection
             if let Some(job_idx) = app.job_list_state.selected() {
                 if job_idx < execution.jobs.len() {
                     let job = &execution.jobs[job_idx];
+                    let workflow_name = &app.workflows[workflow_idx].name;
 
-                    // Split the area into sections
                     let chunks = Layout::default()
                         .direction(Direction::Vertical)
                         .constraints(
                             [
-                                Constraint::Length(3), // Job title
+                                Constraint::Length(4), // Job title + breadcrumb
                                 Constraint::Min(5),    // Steps table
                                 Constraint::Length(8), // Step details
                             ]
@@ -44,104 +40,70 @@ pub fn render_job_detail_view(
                         .margin(1)
                         .split(area);
 
-                    // Job title section
+                    // Job title with breadcrumb
+                    let (status_symbol, status_style) = theme::job_status(&job.status);
                     let status_text = match job.status {
                         wrkflw_executor::JobStatus::Success => "Success",
                         wrkflw_executor::JobStatus::Failure => "Failed",
                         wrkflw_executor::JobStatus::Skipped => "Skipped",
                     };
 
-                    let status_style = match job.status {
-                        wrkflw_executor::JobStatus::Success => Style::default().fg(Color::Green),
-                        wrkflw_executor::JobStatus::Failure => Style::default().fg(Color::Red),
-                        wrkflw_executor::JobStatus::Skipped => Style::default().fg(Color::Yellow),
-                    };
-
                     let job_title = Paragraph::new(vec![
+                        // Breadcrumb
                         Line::from(vec![
-                            Span::styled("Job: ", Style::default().fg(Color::Blue)),
+                            Span::styled(workflow_name, theme::muted_style()),
                             Span::styled(
-                                job.name.clone(),
+                                format!(" {} ", theme::symbols::ARROW),
+                                theme::muted_style(),
+                            ),
+                            Span::styled(
+                                &job.name,
                                 Style::default()
-                                    .fg(Color::White)
+                                    .fg(COLORS.text)
                                     .add_modifier(Modifier::BOLD),
                             ),
-                            Span::raw(" ("),
-                            Span::styled(status_text, status_style),
-                            Span::raw(")"),
                         ]),
                         Line::from(vec![
-                            Span::styled("Steps: ", Style::default().fg(Color::Blue)),
+                            Span::styled(status_symbol, status_style),
+                            Span::raw(" "),
+                            Span::styled(status_text, status_style),
                             Span::styled(
-                                format!("{}", job.steps.len()),
-                                Style::default().fg(Color::White),
+                                format!("  {} steps", job.steps.len()),
+                                theme::muted_style(),
                             ),
                         ]),
                     ])
-                    .block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .border_type(BorderType::Rounded)
-                            .title(Span::styled(
-                                " Job Details ",
-                                Style::default().fg(Color::Yellow),
-                            )),
-                    );
+                    .block(theme::block("Job Details"));
 
                     f.render_widget(job_title, chunks[0]);
 
                     // Steps section
                     let header_cells = ["Status", "Step Name"].iter().map(|h| {
-                        ratatui::widgets::Cell::from(*h).style(Style::default().fg(Color::Yellow))
+                        ratatui::widgets::Cell::from(*h).style(theme::header_style())
                     });
 
-                    let header = Row::new(header_cells)
-                        .style(Style::default().add_modifier(Modifier::BOLD))
-                        .height(1);
+                    let header = Row::new(header_cells).height(1);
 
                     let rows = job.steps.iter().map(|step| {
-                        let status_symbol = match step.status {
-                            wrkflw_executor::StepStatus::Success => "✅",
-                            wrkflw_executor::StepStatus::Failure => "❌",
-                            wrkflw_executor::StepStatus::Skipped => "⏭",
-                        };
-
-                        let status_style = match step.status {
-                            wrkflw_executor::StepStatus::Success => {
-                                Style::default().fg(Color::Green)
-                            }
-                            wrkflw_executor::StepStatus::Failure => Style::default().fg(Color::Red),
-                            wrkflw_executor::StepStatus::Skipped => {
-                                Style::default().fg(Color::Gray)
-                            }
-                        };
+                        let (status_symbol, status_style) = theme::step_status(&step.status);
 
                         Row::new(vec![
                             ratatui::widgets::Cell::from(status_symbol).style(status_style),
-                            ratatui::widgets::Cell::from(step.name.clone()),
+                            ratatui::widgets::Cell::from(step.name.clone())
+                                .style(Style::default().fg(COLORS.text)),
                         ])
                     });
 
-                    let steps_table = Table::new(rows)
+                    let widths = [
+                        Constraint::Length(4),      // Status icon column
+                        Constraint::Percentage(92), // Name column
+                    ];
+                    let steps_table = Table::new(rows, widths)
                         .header(header)
-                        .block(
-                            Block::default()
-                                .borders(Borders::ALL)
-                                .border_type(BorderType::Rounded)
-                                .title(Span::styled(" Steps ", Style::default().fg(Color::Yellow))),
-                        )
-                        .highlight_style(
-                            Style::default()
-                                .bg(Color::DarkGray)
-                                .add_modifier(Modifier::BOLD),
-                        )
-                        .highlight_symbol("» ")
-                        .widths(&[
-                            Constraint::Length(8),      // Status icon column
-                            Constraint::Percentage(92), // Name column
-                        ]);
+                        .block(theme::block("Steps"))
+                        .highlight_style(theme::selected_style())
+                        .highlight_symbol(theme::symbols::SELECTED);
 
-                    // We need to use the table state from the app
                     f.render_stateful_widget(steps_table, chunks[1], &mut app.step_table_state);
 
                     // Step detail section
@@ -149,57 +111,42 @@ pub fn render_job_detail_view(
                         if step_idx < job.steps.len() {
                             let step = &job.steps[step_idx];
 
-                            // Show step output with proper styling
+                            let (step_symbol, step_style) = theme::step_status(&step.status);
                             let status_text = match step.status {
                                 wrkflw_executor::StepStatus::Success => "Success",
                                 wrkflw_executor::StepStatus::Failure => "Failed",
                                 wrkflw_executor::StepStatus::Skipped => "Skipped",
                             };
 
-                            let status_style = match step.status {
-                                wrkflw_executor::StepStatus::Success => {
-                                    Style::default().fg(Color::Green)
-                                }
-                                wrkflw_executor::StepStatus::Failure => {
-                                    Style::default().fg(Color::Red)
-                                }
-                                wrkflw_executor::StepStatus::Skipped => {
-                                    Style::default().fg(Color::Yellow)
-                                }
-                            };
-
                             let mut output_text = step.output.clone();
-                            // Truncate if too long
-                            if output_text.len() > 1000 {
-                                output_text = format!("{}... [truncated]", &output_text[..1000]);
+                            if output_text.len() > 5000 {
+                                output_text =
+                                    format!("{}\u{2026} [truncated]", &output_text[..5000]);
                             }
 
                             let step_detail = Paragraph::new(vec![
                                 Line::from(vec![
-                                    Span::styled("Step: ", Style::default().fg(Color::Blue)),
+                                    Span::styled(step_symbol, step_style),
+                                    Span::raw(" "),
                                     Span::styled(
                                         step.name.clone(),
                                         Style::default()
-                                            .fg(Color::White)
+                                            .fg(COLORS.text)
                                             .add_modifier(Modifier::BOLD),
                                     ),
-                                    Span::raw(" ("),
-                                    Span::styled(status_text, status_style),
-                                    Span::raw(")"),
+                                    Span::styled(
+                                        format!(" ({})", status_text),
+                                        step_style,
+                                    ),
                                 ]),
                                 Line::from(""),
-                                Line::from(output_text),
+                                Line::from(Span::styled(
+                                    output_text,
+                                    Style::default().fg(COLORS.text_dim),
+                                )),
                             ])
-                            .block(
-                                Block::default()
-                                    .borders(Borders::ALL)
-                                    .border_type(BorderType::Rounded)
-                                    .title(Span::styled(
-                                        " Step Output ",
-                                        Style::default().fg(Color::Yellow),
-                                    )),
-                            )
-                            .wrap(ratatui::widgets::Wrap { trim: false });
+                            .block(theme::block("Step Output"))
+                            .wrap(Wrap { trim: false });
 
                             f.render_widget(step_detail, chunks[2]);
                         }

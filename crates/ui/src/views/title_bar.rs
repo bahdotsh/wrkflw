@@ -1,74 +1,51 @@
 // Title bar rendering
 use crate::app::App;
+use crate::theme::{self, COLORS};
 use ratatui::{
-    backend::CrosstermBackend,
     layout::{Alignment, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Tabs},
     Frame,
 };
-use std::io;
 
 // Render the title bar with tabs
-pub fn render_title_bar(f: &mut Frame<CrosstermBackend<io::Stdout>>, app: &App, area: Rect) {
-    let titles = ["Workflows", "Execution", "Logs", "Help"];
-    let tabs = Tabs::new(
-        titles
-            .iter()
-            .enumerate()
-            .map(|(i, t)| {
-                if i == 1 {
-                    // Special case for "Execution"
-                    let e_part = &t[0..1]; // "E"
-                    let x_part = &t[1..2]; // "x"
-                    let rest = &t[2..]; // "ecution"
-                    Line::from(vec![
-                        Span::styled(e_part, Style::default().fg(Color::White)),
-                        Span::styled(
-                            x_part,
-                            Style::default()
-                                .fg(Color::Yellow)
-                                .add_modifier(Modifier::UNDERLINED),
-                        ),
-                        Span::styled(rest, Style::default().fg(Color::White)),
-                    ])
-                } else {
-                    // Original styling for other tabs
-                    let (first, rest) = t.split_at(1);
-                    Line::from(vec![
-                        Span::styled(
-                            first,
-                            Style::default()
-                                .fg(Color::Yellow)
-                                .add_modifier(Modifier::UNDERLINED),
-                        ),
-                        Span::styled(rest, Style::default().fg(Color::White)),
-                    ])
-                }
-            })
-            .collect(),
-    )
+pub fn render_title_bar(f: &mut Frame<'_>, app: &App, area: Rect) {
+    let tab_labels = ["1\u{00B7}Workflows", "2\u{00B7}Execution", "3\u{00B7}Logs", "4\u{00B7}Help"];
+    let tab_lines: Vec<Line> = tab_labels
+        .iter()
+        .enumerate()
+        .map(|(i, t)| {
+            let style = if i == app.selected_tab {
+                Style::default()
+                    .fg(COLORS.highlight)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(COLORS.text_dim)
+            };
+            Line::from(Span::styled(*t, style))
+        })
+        .collect();
+    let tabs = Tabs::new(tab_lines)
     .block(
         Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .title(Span::styled(
-                " wrkflw ",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ))
+            .border_style(Style::default().fg(COLORS.border))
+            .title(Span::styled(" wrkflw ", theme::brand_style()))
             .title_alignment(Alignment::Center),
     )
     .highlight_style(
         Style::default()
-            .bg(Color::DarkGray)
-            .fg(Color::Yellow)
+            .bg(COLORS.bg_selected)
+            .fg(COLORS.highlight)
             .add_modifier(Modifier::BOLD),
     )
     .select(app.selected_tab)
-    .divider(Span::raw("|"));
+    .divider(Span::styled(
+        theme::symbols::TAB_DIVIDER,
+        Style::default().fg(COLORS.text_muted),
+    ));
 
     f.render_widget(tabs, area);
 }

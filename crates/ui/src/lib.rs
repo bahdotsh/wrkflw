@@ -9,6 +9,7 @@
 // - views: Contains UI rendering code
 
 // Always-available modules (CLI validation/execution)
+pub mod cli_style;
 pub mod handlers;
 
 // TUI-specific modules (require ratatui/crossterm)
@@ -20,6 +21,8 @@ pub mod components;
 pub mod log_processor;
 #[cfg(feature = "tui")]
 pub mod models;
+#[cfg(feature = "tui")]
+pub mod theme;
 #[cfg(feature = "tui")]
 pub mod utils;
 #[cfg(feature = "tui")]

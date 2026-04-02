@@ -1,6 +1,7 @@
 // Checkbox component
+use crate::theme::{self, COLORS};
 use ratatui::{
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::Paragraph,
 };
@@ -41,14 +42,18 @@ impl Checkbox {
 
     /// Render the checkbox
     pub fn render(&self) -> Paragraph<'_> {
-        let checkbox = if self.is_checked { "[✓]" } else { "[ ]" };
+        let checkbox = if self.is_checked {
+            theme::symbols::CHECKBOX_ON
+        } else {
+            theme::symbols::CHECKBOX_OFF
+        };
 
         let style = if self.is_selected {
             Style::default()
-                .fg(Color::Yellow)
+                .fg(COLORS.highlight)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::White)
+            Style::default().fg(COLORS.text)
         };
 
         Paragraph::new(Line::from(vec![

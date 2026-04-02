@@ -32,6 +32,7 @@ pub struct App {
     pub step_table_state: TableState,         // For the steps table in detailed view
     pub last_tick: Instant,                   // For UI animations and updates
     pub tick_rate: Duration,                  // How often to update the UI
+    pub spinner_frame: usize,                 // Current spinner animation frame
     pub tx: mpsc::Sender<ExecutionResultMsg>, // Channel for async communication
     pub status_message: Option<String>,       // Temporary status message to display
     pub status_message_time: Option<Instant>, // When the message was set
@@ -208,6 +209,7 @@ impl App {
             step_table_state,
             last_tick: Instant::now(),
             tick_rate: Duration::from_millis(250), // Update 4 times per second
+            spinner_frame: 0,
             tx,
             status_message: None,
             status_message_time: None,
@@ -937,6 +939,7 @@ impl App {
 
         if now.duration_since(self.last_tick) >= self.tick_rate {
             self.last_tick = now;
+            self.spinner_frame = (self.spinner_frame + 1) % crate::theme::symbols::SPINNER.len();
             true
         } else {
             false

@@ -1,6 +1,7 @@
 // Button component
+use crate::theme::COLORS;
 use ratatui::{
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::Paragraph,
 };
@@ -37,10 +38,10 @@ impl Button {
     /// Render the button
     pub fn render(&self) -> Paragraph<'_> {
         let (fg, bg) = match (self.is_selected, self.is_active) {
-            (true, true) => (Color::Black, Color::Yellow),
-            (true, false) => (Color::Black, Color::DarkGray),
-            (false, true) => (Color::White, Color::Blue),
-            (false, false) => (Color::DarkGray, Color::Black),
+            (true, true) => (COLORS.bg_dark, COLORS.highlight),
+            (true, false) => (COLORS.bg_dark, COLORS.bg_bar),
+            (false, true) => (COLORS.text, COLORS.runtime_docker),
+            (false, false) => (COLORS.text_muted, COLORS.bg_dark),
         };
 
         let style = Style::default().fg(fg).bg(bg).add_modifier(Modifier::BOLD);

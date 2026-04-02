@@ -1,7 +1,8 @@
 // Background log processor for asynchronous log filtering and formatting
 use crate::models::LogFilterLevel;
+use crate::theme;
 use ratatui::{
-    style::{Color, Style},
+    style::Style,
     text::{Line, Span},
     widgets::{Cell, Row},
 };
@@ -22,8 +23,8 @@ impl ProcessedLogEntry {
     /// Convert to a table row for rendering
     pub fn to_row(&self) -> Row<'static> {
         Row::new(vec![
-            Cell::from(self.timestamp.clone()),
-            Cell::from(self.log_type.clone()).style(self.log_style),
+            Cell::from(self.timestamp.clone()).style(theme::muted_style()),
+            Cell::from(format!(" {} ", self.log_type)).style(self.log_style),
             Cell::from(Line::from(self.content_spans.clone())),
         ])
     }
@@ -97,19 +98,16 @@ impl LogProcessor {
         let mut cached_system_logs_count = 0;
 
         loop {
-            // Check for new requests with a timeout to allow periodic processing
             let request = match request_rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(req) => Some(req),
                 Err(mpsc::RecvTimeoutError::Timeout) => None,
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             };
 
-            // Update request if we received one
             if let Some(req) = request {
                 last_request = Some(req);
             }
 
-            // Process if we have a request and enough time has passed since last processing
             if let Some(ref req) = last_request {
                 let should_process = last_processed_time.elapsed() > Duration::from_millis(50)
                     && (cached_app_logs_count != req.app_logs_count
@@ -117,7 +115,6 @@ impl LogProcessor {
                         || cached_logs.is_empty());
 
                 if should_process {
-                    // Refresh log cache if log counts changed
                     if cached_app_logs_count != req.app_logs_count
                         || cached_system_logs_count != req.system_logs_count
                         || cached_logs.is_empty()
@@ -130,7 +127,7 @@ impl LogProcessor {
                     let response = Self::process_logs(&cached_logs, req);
 
                     if response_tx.send(response).is_err() {
-                        break; // Receiver disconnected
+                        break;
                     }
 
                     last_processed_time = Instant::now();
@@ -143,12 +140,10 @@ impl LogProcessor {
     fn get_combined_logs(app_logs: &[String]) -> Vec<String> {
         let mut all_logs = Vec::new();
 
-        // Add app logs
         for log in app_logs {
             all_logs.push(log.clone());
         }
 
-        // Add system logs
         for log in wrkflw_logging::get_logs() {
             all_logs.push(log.clone());
         }
@@ -158,7 +153,6 @@ impl LogProcessor {
 
     /// Process logs according to search and filter criteria
     fn process_logs(all_logs: &[String], request: &LogProcessingRequest) -> LogProcessingResponse {
-        // Filter logs based on search query and filter level
         let mut filtered_logs = Vec::new();
         let mut search_matches = Vec::new();
 
@@ -183,7 +177,6 @@ impl LogProcessor {
             }
         }
 
-        // Process filtered logs into display format
         let processed_logs: Vec<ProcessedLogEntry> = filtered_logs
             .iter()
             .map(|(_, log_line)| Self::process_log_entry(log_line, &request.search_query))
@@ -211,30 +204,30 @@ impl LogProcessor {
             "??:??:??".to_string()
         };
 
-        // Determine log type and style
+        // Determine log type and style using theme badge styles
         let (log_type, log_style) =
             if log_line.contains("Error") || log_line.contains("error") || log_line.contains("❌")
             {
-                ("ERROR", Style::default().fg(Color::Red))
+                ("ERROR", theme::log_badge("ERROR"))
             } else if log_line.contains("Warning")
                 || log_line.contains("warning")
                 || log_line.contains("⚠️")
             {
-                ("WARN", Style::default().fg(Color::Yellow))
+                ("WARN", theme::log_badge("WARN"))
             } else if log_line.contains("Success")
                 || log_line.contains("success")
                 || log_line.contains("✅")
             {
-                ("SUCCESS", Style::default().fg(Color::Green))
+                ("SUCCESS", theme::log_badge("SUCCESS"))
             } else if log_line.contains("Running")
                 || log_line.contains("running")
                 || log_line.contains("⟳")
             {
-                ("INFO", Style::default().fg(Color::Cyan))
+                ("INFO", theme::log_badge("INFO"))
             } else if log_line.contains("Triggering") || log_line.contains("triggered") {
-                ("TRIG", Style::default().fg(Color::Magenta))
+                ("TRIG", theme::log_badge("TRIG"))
             } else {
-                ("INFO", Style::default().fg(Color::Gray))
+                ("INFO", theme::log_badge(""))
             };
 
         // Extract content after timestamp
@@ -275,22 +268,19 @@ impl LogProcessor {
             while let Some(idx) = lowercase_content[last_idx..].find(&lowercase_query) {
                 let real_idx = last_idx + idx;
 
-                // Add text before match
                 if real_idx > last_idx {
                     spans.push(Span::raw(content[last_idx..real_idx].to_string()));
                 }
 
-                // Add matched text with highlight
                 let match_end = real_idx + search_query.len();
                 spans.push(Span::styled(
                     content[real_idx..match_end].to_string(),
-                    Style::default().bg(Color::Yellow).fg(Color::Black),
+                    theme::search_highlight(),
                 ));
 
                 last_idx = match_end;
             }
 
-            // Add remaining text after last match
             if last_idx < content.len() {
                 spans.push(Span::raw(content[last_idx..].to_string()));
             }

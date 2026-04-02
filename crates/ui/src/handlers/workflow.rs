@@ -1,4 +1,5 @@
 // Workflow handlers
+use crate::cli_style;
 use std::io;
 use std::path::{Path, PathBuf};
 use wrkflw_evaluator::evaluate_workflow_file;
@@ -39,32 +40,62 @@ pub fn validate_workflow(path: &Path, verbose: bool) -> io::Result<()> {
     let mut valid_count = 0;
     let mut invalid_count = 0;
 
-    println!("Validating {} workflow file(s)...", workflows.len());
+    println!(
+        "{}",
+        cli_style::info(&format!(
+            "Validating {} workflow file(s)...",
+            workflows.len()
+        ))
+    );
 
     for workflow_path in workflows {
         match evaluate_workflow_file(&workflow_path, verbose) {
             Ok(result) => {
                 if result.is_valid {
-                    println!("✅ Valid: {}", workflow_path.display());
+                    println!(
+                        "{}",
+                        cli_style::success(&format!(
+                            "Valid: {}",
+                            cli_style::dim(&workflow_path.display().to_string())
+                        ))
+                    );
                     valid_count += 1;
                 } else {
-                    println!("❌ Invalid: {}", workflow_path.display());
+                    println!(
+                        "{}",
+                        cli_style::error(&format!(
+                            "Invalid: {}",
+                            workflow_path.display()
+                        ))
+                    );
                     for (i, issue) in result.issues.iter().enumerate() {
-                        println!("   {}. {}", i + 1, issue);
+                        println!("{}", cli_style::indent(&format!("{}. {}", i + 1, issue)));
                     }
                     invalid_count += 1;
                 }
             }
             Err(e) => {
-                println!("❌ Error processing {}: {}", workflow_path.display(), e);
+                println!(
+                    "{}",
+                    cli_style::error(&format!(
+                        "Error processing {}: {}",
+                        workflow_path.display(),
+                        e
+                    ))
+                );
                 invalid_count += 1;
             }
         }
     }
 
+    use colored::Colorize;
     println!(
-        "\nSummary: {} valid, {} invalid",
-        valid_count, invalid_count
+        "\n{}",
+        format!(
+            "Summary: {} valid, {} invalid",
+            valid_count, invalid_count
+        )
+        .bold()
     );
 
     Ok(())
@@ -84,13 +115,19 @@ pub async fn execute_workflow_cli(
         ));
     }
 
-    println!("Validating workflow...");
+    println!("{}", cli_style::info("Validating workflow..."));
     match evaluate_workflow_file(path, false) {
         Ok(result) => {
             if !result.is_valid {
-                println!("❌ Cannot execute invalid workflow: {}", path.display());
+                println!(
+                    "{}",
+                    cli_style::error(&format!(
+                        "Cannot execute invalid workflow: {}",
+                        path.display()
+                    ))
+                );
                 for (i, issue) in result.issues.iter().enumerate() {
-                    println!("   {}. {}", i + 1, issue);
+                    println!("{}", cli_style::indent(&format!("{}. {}", i + 1, issue)));
                 }
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -110,7 +147,10 @@ pub async fn execute_workflow_cli(
     let runtime_type = match runtime_type {
         RuntimeType::Docker => {
             if !wrkflw_executor::docker::is_available() {
-                println!("⚠️ Docker is not available. Using emulation mode instead.");
+                println!(
+                    "{}",
+                    cli_style::warning("Docker is not available. Using emulation mode instead.")
+                );
                 wrkflw_logging::warning("Docker is not available. Using emulation mode instead.");
                 RuntimeType::Emulation
             } else {
@@ -119,7 +159,10 @@ pub async fn execute_workflow_cli(
         }
         RuntimeType::Podman => {
             if !wrkflw_executor::podman::is_available() {
-                println!("⚠️ Podman is not available. Using emulation mode instead.");
+                println!(
+                    "{}",
+                    cli_style::warning("Podman is not available. Using emulation mode instead.")
+                );
                 wrkflw_logging::warning("Podman is not available. Using emulation mode instead.");
                 RuntimeType::Emulation
             } else {
@@ -130,8 +173,8 @@ pub async fn execute_workflow_cli(
         RuntimeType::Emulation => RuntimeType::Emulation,
     };
 
-    println!("Executing workflow: {}", path.display());
-    println!("Runtime mode: {:?}", runtime_type);
+    println!("{}", cli_style::key_value("Workflow", &path.display().to_string()));
+    println!("{}", cli_style::key_value("Runtime", &format!("{:?}", runtime_type)));
 
     // Log the start of the execution in debug mode with more details
     wrkflw_logging::debug(&format!(
@@ -152,64 +195,53 @@ pub async fn execute_workflow_cli(
 
     match wrkflw_executor::execute_workflow(path, config).await {
         Ok(result) => {
-            println!("\nWorkflow execution results:");
+            println!("{}", cli_style::section("Workflow execution results"));
 
-            // Track if the workflow had any failures
             let mut any_job_failed = false;
 
             for job in &result.jobs {
                 match job.status {
-                    JobStatus::Success => {
-                        println!("\n✅ Job succeeded: {}", job.name);
-                    }
+                    JobStatus::Success => println!("\n{}", cli_style::job_success(&job.name)),
                     JobStatus::Failure => {
-                        println!("\n❌ Job failed: {}", job.name);
+                        println!("\n{}", cli_style::job_failure(&job.name));
                         any_job_failed = true;
                     }
-                    JobStatus::Skipped => {
-                        println!("\n⏭️ Job skipped: {}", job.name);
-                    }
+                    JobStatus::Skipped => println!("\n{}", cli_style::job_skipped(&job.name)),
                 }
 
-                println!("-------------------------");
+                println!("{}", cli_style::separator());
 
-                // Log the job details for debug purposes
                 wrkflw_logging::debug(&format!("Job: {}, Status: {:?}", job.name, job.status));
 
                 for step in job.steps.iter() {
                     match step.status {
                         StepStatus::Success => {
-                            println!("  ✅ {}", step.name);
+                            println!("{}", cli_style::step_success(&step.name));
 
-                            // Check if this is a GitHub action output that should be hidden
                             let should_hide = std::env::var("WRKFLW_HIDE_ACTION_MESSAGES")
                                 .map(|val| val == "true")
                                 .unwrap_or(false)
                                 && step.output.contains("Would execute GitHub action:");
 
-                            // Only show output if not hidden and it's short
                             if !should_hide
                                 && !step.output.trim().is_empty()
                                 && step.output.lines().count() <= 3
                             {
-                                // For short outputs, show directly
-                                println!("    {}", step.output.trim());
+                                println!("{}", cli_style::indent(step.output.trim()));
                             }
                         }
                         StepStatus::Failure => {
-                            println!("  ❌ {}", step.name);
+                            println!("{}", cli_style::step_failure(&step.name));
 
-                            // Ensure we capture and show exit code
                             if let Some(exit_code) = step
                                 .output
                                 .lines()
                                 .find(|line| line.trim().starts_with("Exit code:"))
                                 .map(|line| line.trim().to_string())
                             {
-                                println!("    {}", exit_code);
+                                println!("{}", cli_style::indent(&exit_code));
                             }
 
-                            // Show command/run details in debug mode
                             if wrkflw_logging::get_log_level() <= wrkflw_logging::LogLevel::Debug {
                                 if let Some(cmd_output) = step
                                     .output
@@ -218,11 +250,13 @@ pub async fn execute_workflow_cli(
                                     .take(1)
                                     .next()
                                 {
-                                    println!("    Command: {}", cmd_output.trim());
+                                    println!(
+                                        "{}",
+                                        cli_style::indent(&format!("Command: {}", cmd_output.trim()))
+                                    );
                                 }
                             }
 
-                            // Always show error output from failed steps, but keep it to a reasonable length
                             let output_lines: Vec<&str> = step
                                 .output
                                 .lines()
@@ -230,26 +264,34 @@ pub async fn execute_workflow_cli(
                                 .collect();
 
                             if !output_lines.is_empty() {
-                                println!("    Error output:");
+                                println!("{}", cli_style::indent("Error output:"));
                                 for line in output_lines.iter().take(10) {
-                                    println!("    {}", line.trim().replace('\n', "\n    "));
+                                    println!(
+                                        "{}",
+                                        cli_style::indent(line.trim())
+                                    );
                                 }
 
                                 if output_lines.len() > 10 {
                                     println!(
-                                        "    ... (and {} more lines)",
-                                        output_lines.len() - 10
+                                        "{}",
+                                        cli_style::indent(&format!(
+                                            "... (and {} more lines)",
+                                            output_lines.len() - 10
+                                        ))
                                     );
-                                    println!("    Use --debug to see full output");
+                                    println!(
+                                        "{}",
+                                        cli_style::indent("Use --debug to see full output")
+                                    );
                                 }
                             }
                         }
                         StepStatus::Skipped => {
-                            println!("  ⏭️ {} (skipped)", step.name);
+                            println!("{}", cli_style::step_skipped(&step.name));
                         }
                     }
 
-                    // Always log the step details for debug purposes
                     wrkflw_logging::debug(&format!(
                         "Step: {}, Status: {:?}, Output length: {} lines",
                         step.name,
@@ -257,7 +299,6 @@ pub async fn execute_workflow_cli(
                         step.output.lines().count()
                     ));
 
-                    // In debug mode, log all step output
                     if wrkflw_logging::get_log_level() == wrkflw_logging::LogLevel::Debug
                         && !step.output.trim().is_empty()
                     {
@@ -270,20 +311,21 @@ pub async fn execute_workflow_cli(
             }
 
             if any_job_failed {
-                println!("\n❌ Workflow completed with failures");
-                // In the case of failure, we'll also inform the user about the debug option
-                // if they're not already using it
+                println!("\n{}", cli_style::error("Workflow completed with failures"));
                 if wrkflw_logging::get_log_level() > wrkflw_logging::LogLevel::Debug {
-                    println!("    Run with --debug for more detailed output");
+                    println!("{}", cli_style::indent("Run with --debug for more detailed output"));
                 }
             } else {
-                println!("\n✅ Workflow completed successfully!");
+                println!("\n{}", cli_style::success("Workflow completed successfully!"));
             }
 
             Ok(())
         }
         Err(e) => {
-            println!("❌ Failed to execute workflow: {}", e);
+            println!(
+                "{}",
+                cli_style::error(&format!("Failed to execute workflow: {}", e))
+            );
             wrkflw_logging::error(&format!("Failed to execute workflow: {}", e));
             Err(io::Error::other(e))
         }

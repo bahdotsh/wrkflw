@@ -8,18 +8,17 @@ mod title_bar;
 mod workflows_tab;
 
 use crate::app::App;
-use ratatui::{backend::CrosstermBackend, Frame};
-use std::io;
+use ratatui::Frame;
 
 // Main render function for the UI
-pub fn render_ui(f: &mut Frame<CrosstermBackend<io::Stdout>>, app: &mut App) {
+pub fn render_ui(f: &mut Frame<'_>, app: &mut App) {
     // Check if help should be shown as an overlay
     if app.show_help {
         help_overlay::render_help_overlay(f, app.help_scroll);
         return;
     }
 
-    let size = f.size();
+    let size = f.area();
 
     // Create main layout
     let main_chunks = ratatui::layout::Layout::default()

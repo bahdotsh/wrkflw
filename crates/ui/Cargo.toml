@@ -26,6 +26,7 @@ wrkflw-github.workspace = true
 
 # External dependencies
 chrono.workspace = true
+colored.workspace = true
 crossterm = { workspace = true, optional = true }
 ratatui = { workspace = true, optional = true }
 serde.workspace = true

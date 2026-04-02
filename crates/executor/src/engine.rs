@@ -1955,31 +1955,53 @@ async fn execute_matrix_job(
 
         let mut all_steps_ok = true;
         let mut step_outputs_map: HashMap<String, HashMap<String, String>> = HashMap::new();
+        let timeout_mins = sanitize_timeout_minutes(job_template.timeout_minutes, 360.0);
+        let job_timeout = std::time::Duration::from_secs_f64(timeout_mins * 60.0);
+        let job_deadline = tokio::time::Instant::now() + job_timeout;
+
         for (idx, step) in job_template.steps.iter().enumerate() {
-            let outcome = run_step_with_guards(
-                step,
-                idx,
-                &job_env,
-                workflow,
-                StepExecutionContext {
+            let remaining = job_deadline.saturating_duration_since(tokio::time::Instant::now());
+
+            let outcome = match tokio::time::timeout(
+                remaining,
+                run_step_with_guards(
                     step,
-                    step_idx: idx,
-                    job_env: &job_env,
-                    working_dir: job_dir.path(),
-                    runtime,
+                    idx,
+                    &job_env,
                     workflow,
-                    runner_image: &runner_image_value,
-                    verbose,
-                    matrix_combination: &Some(combination.values.clone()),
-                    secret_manager: None,
-                    secret_masker: None,
-                    container_config: job_template.container.as_ref(),
-                    workflow_defaults: workflow.defaults.as_ref(),
-                    job_defaults: job_template.defaults.as_ref(),
-                    step_outputs: &step_outputs_map,
-                },
+                    StepExecutionContext {
+                        step,
+                        step_idx: idx,
+                        job_env: &job_env,
+                        working_dir: job_dir.path(),
+                        runtime,
+                        workflow,
+                        runner_image: &runner_image_value,
+                        verbose,
+                        matrix_combination: &Some(combination.values.clone()),
+                        secret_manager: None,
+                        secret_masker: None,
+                        container_config: job_template.container.as_ref(),
+                        workflow_defaults: workflow.defaults.as_ref(),
+                        job_defaults: job_template.defaults.as_ref(),
+                        step_outputs: &step_outputs_map,
+                    },
+                ),
             )
-            .await?;
+            .await
+            {
+                Ok(result) => result?,
+                Err(_) => {
+                    let msg = format!(
+                        "Job '{}' exceeded timeout of {} minutes",
+                        matrix_job_name, timeout_mins
+                    );
+                    wrkflw_logging::error(&msg);
+                    job_logs.push_str(&format!("\n{}\n", msg));
+                    all_steps_ok = false;
+                    break;
+                }
+            };
 
             match outcome {
                 StepOutcome::Skipped(result) => {

@@ -15,7 +15,10 @@ pub struct StepEnvironmentUpdates {
     pub step_summary: String,
 }
 
-/// Check whether `s` looks like a valid GHA identifier: `[a-zA-Z_][a-zA-Z0-9_]*`.
+/// Check whether `s` looks like a valid GHA environment file key: `[a-zA-Z_][a-zA-Z0-9_]*`.
+///
+/// This validates keys used in GITHUB_OUTPUT and GITHUB_ENV files (e.g. `MY_VAR=value`),
+/// NOT step IDs — step IDs additionally allow hyphens (see `STEPS_OUTPUT_PATTERN`).
 fn is_valid_identifier(s: &str) -> bool {
     let mut chars = s.chars();
     match chars.next() {

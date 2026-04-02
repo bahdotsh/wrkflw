@@ -282,21 +282,22 @@ impl ContainerRuntime for EmulationRuntime {
             cmd.arg(&command_str);
         }
 
+        // Resolve the project directory once for cargo/rustup cwd and CI_PROJECT_DIR substitution.
+        let project_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+
         // Cargo/rustup commands always run in the project directory
         if matches!(cmd_basename, "cargo" | "rustup") {
-            let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
             wrkflw_logging::info(&format!(
                 "Using project directory for Rust command: {}",
-                current_dir.display()
+                project_dir.display()
             ));
-            cmd.current_dir(&current_dir);
+            cmd.current_dir(&project_dir);
         } else {
             cmd.current_dir(&actual_working_dir);
         }
 
         // Add environment variables, interpolating ${CI_PROJECT_DIR} in values
         // (e.g. CARGO_HOME="${CI_PROJECT_DIR}/.cargo" in GitLab CI configs).
-        let project_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let project_dir_str = project_dir.to_string_lossy();
         for (key, value) in env_vars {
             if value.contains("${CI_PROJECT_DIR}") {

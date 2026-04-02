@@ -37,7 +37,7 @@ jobs:
         id: changelog
         run: |
           # Get the previous tag
-          prev_tag=$(git tag --sort=-v:refname | grep -v "^${RELEASE_TAG}$" | head -1)
+          prev_tag=$(git tag --sort=-v:refname | grep "^v" | grep -v "^${RELEASE_TAG}$" | head -1)
           if [ -z "$prev_tag" ]; then
             # First release: use all commits
             changelog=$(git log --pretty=format:"- %s (%h)" --no-merges)
@@ -93,7 +93,7 @@ jobs:
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
           mkdir -p .cargo
-          echo '[target.aarch64-unknown-linux-gnu]' >> .cargo/config.toml
+          echo '[target.aarch64-unknown-linux-gnu]' > .cargo/config.toml
           echo 'linker = "aarch64-linux-gnu-gcc"' >> .cargo/config.toml
 
       - name: Build
@@ -127,7 +127,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Install cargo-workspaces
-        run: cargo install cargo-workspaces
+        run: cargo install cargo-workspaces@0.4.2
       - name: Publish all crates
         run: cargo workspaces publish --from-git --yes
         env:

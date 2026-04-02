@@ -26,6 +26,14 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      - name: Validate tag exists
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          if ! git rev-parse "${RELEASE_TAG}" >/dev/null 2>&1; then
+            echo "::error::Tag ${RELEASE_TAG} does not exist in the repository"
+            exit 1
+          fi
       - name: Generate changelog
         id: changelog
         env:

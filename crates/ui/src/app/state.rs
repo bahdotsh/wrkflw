@@ -684,7 +684,8 @@ impl App {
         }
     }
 
-    // Run from job selection mode with an optional target job
+    // Run from job selection mode with an optional target job.
+    // Callers must ensure `!self.running` before calling.
     pub fn run_from_job_selection(&mut self, target_job: Option<String>) {
         if let Some(ref name) = target_job {
             self.add_timestamped_log(&format!("Running job '{}'", name));
@@ -702,9 +703,7 @@ impl App {
             }
         }
 
-        self.job_selection_mode = false;
-        self.available_jobs.clear();
-        self.selected_job_index = 0;
+        self.exit_job_selection_mode();
         self.start_execution();
     }
 
@@ -1323,5 +1322,30 @@ mod tests {
         assert_eq!(app.selected_job_index, 0);
         app.previous_available_job(); // 0 -> 0
         assert_eq!(app.selected_job_index, 0);
+    }
+
+    #[test]
+    fn run_from_job_selection_noop_when_no_workflow_selected() {
+        let mut app = make_app();
+        app.workflow_list_state.select(None);
+        app.job_selection_mode = true;
+        app.available_jobs = vec!["build".to_string()];
+
+        app.run_from_job_selection(Some("build".to_string()));
+
+        assert!(app.execution_queue.is_empty());
+        assert!(!app.job_selection_mode);
+        assert!(app.available_jobs.is_empty());
+    }
+
+    #[test]
+    fn enter_job_selection_mode_noop_when_index_out_of_bounds() {
+        let mut app = make_app();
+        app.workflow_list_state.select(Some(99)); // out of bounds
+
+        app.enter_job_selection_mode();
+
+        assert!(!app.job_selection_mode);
+        assert!(app.available_jobs.is_empty());
     }
 }

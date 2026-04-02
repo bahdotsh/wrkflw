@@ -714,6 +714,11 @@ impl PodmanRuntime {
 
         let mut args = vec!["run", "--name", &container_name, "-w", &working_dir_str];
 
+        // Skip registry pull for locally-built images (e.g., wrkflw-combined:*).
+        if image.starts_with("wrkflw-") {
+            args.push("--pull=never");
+        }
+
         // Only use --rm if we don't want to preserve containers on failure
         // When preserve_containers_on_failure is true, we skip --rm so failed containers remain
         if !self.preserve_containers_on_failure {

@@ -1165,8 +1165,6 @@ struct SetupRuntime {
     language: String,
     /// Sanitized version string (e.g., "20", "8.2")
     version: String,
-    /// Docker image that provides this runtime (e.g., "node:20-slim")
-    image: String,
     /// Shell commands to install this runtime on an Ubuntu base image
     install_script: String,
 }
@@ -1207,12 +1205,9 @@ fn detect_setup_runtimes(steps: &[Step]) -> Vec<SetupRuntime> {
                 ));
                 continue;
             }
-            // Strip trailing .x suffix for image tag
-            let image_ver = ver.trim_end_matches(".x");
             Some(SetupRuntime {
                 language: "node".to_string(),
                 version: ver.clone(),
-                image: format!("node:{}-slim", image_ver),
                 install_script: get_install_script("node", &ver),
             })
         } else if repo == "shivammathur/setup-php" {
@@ -1227,7 +1222,6 @@ fn detect_setup_runtimes(steps: &[Step]) -> Vec<SetupRuntime> {
             Some(SetupRuntime {
                 language: "php".to_string(),
                 version: ver.clone(),
-                image: "composer:latest".to_string(),
                 install_script: get_install_script("php", &ver),
             })
         } else if repo == "actions/setup-python" {
@@ -1242,7 +1236,6 @@ fn detect_setup_runtimes(steps: &[Step]) -> Vec<SetupRuntime> {
             Some(SetupRuntime {
                 language: "python".to_string(),
                 version: ver.clone(),
-                image: format!("python:{}-slim", ver),
                 install_script: get_install_script("python", &ver),
             })
         } else if repo == "actions/setup-go" {
@@ -1257,7 +1250,6 @@ fn detect_setup_runtimes(steps: &[Step]) -> Vec<SetupRuntime> {
             Some(SetupRuntime {
                 language: "go".to_string(),
                 version: ver.clone(),
-                image: format!("golang:{}-slim", ver),
                 install_script: get_install_script("go", &ver),
             })
         } else if repo == "actions/setup-java" {
@@ -1272,7 +1264,6 @@ fn detect_setup_runtimes(steps: &[Step]) -> Vec<SetupRuntime> {
             Some(SetupRuntime {
                 language: "java".to_string(),
                 version: ver.clone(),
-                image: format!("eclipse-temurin:{}-jdk", ver),
                 install_script: get_install_script("java", &ver),
             })
         } else if repo == "actions/setup-dotnet" {
@@ -1287,7 +1278,6 @@ fn detect_setup_runtimes(steps: &[Step]) -> Vec<SetupRuntime> {
             Some(SetupRuntime {
                 language: "dotnet".to_string(),
                 version: ver.clone(),
-                image: format!("mcr.microsoft.com/dotnet/sdk:{}", ver),
                 install_script: get_install_script("dotnet", &ver),
             })
         } else if repo == "actions-rs/toolchain" || repo == "dtolnay/rust-toolchain" {
@@ -1299,11 +1289,9 @@ fn detect_setup_runtimes(steps: &[Step]) -> Vec<SetupRuntime> {
                 ));
                 continue;
             }
-            let image_ver = if ver == "stable" { "latest" } else { &ver };
             Some(SetupRuntime {
                 language: "rust".to_string(),
                 version: ver.clone(),
-                image: format!("rust:{}", image_ver),
                 install_script: get_install_script("rust", &ver),
             })
         } else {
@@ -1344,9 +1332,17 @@ fn get_install_script(language: &str, version: &str) -> String {
                 ver = version
             )
         }
-        "python" => "apt-get install -y python3 python3-pip python3-venv && \
-             ln -sf /usr/bin/python3 /usr/bin/python"
-            .to_string(),
+        "python" => {
+            format!(
+                "apt-get install -y software-properties-common && \
+                 add-apt-repository -y ppa:deadsnakes/ppa && apt-get update && \
+                 apt-get install -y python{ver} python{ver}-venv && \
+                 ln -sf /usr/bin/python{ver} /usr/bin/python && \
+                 ln -sf /usr/bin/python{ver} /usr/bin/python3 && \
+                 curl -sS https://bootstrap.pypa.io/get-pip.py | python{ver}",
+                ver = version
+            )
+        }
         "go" => {
             format!(
                 "ARCH=$(dpkg --print-architecture || echo amd64) && \
@@ -1444,8 +1440,9 @@ async fn build_combined_runtime_image(
 /// Determine the effective runner image for a job, taking setup actions into account.
 ///
 /// If the job has an explicit `container:` config, that takes precedence.
-/// Otherwise, scans steps for setup actions and either uses the single runtime's
-/// image or builds a combined image for multi-language jobs.
+/// Otherwise, scans steps for setup actions and builds a combined image that
+/// installs the detected runtimes on top of the runner base image (which
+/// includes git and other tools needed by actions like `actions/checkout`).
 async fn resolve_runner_image(
     job: &Job,
     runtime: &dyn ContainerRuntime,
@@ -1459,13 +1456,9 @@ async fn resolve_runner_image(
     let setup_runtimes = detect_setup_runtimes(&job.steps);
     if setup_runtimes.is_empty() {
         Ok(base_image)
-    } else if setup_runtimes.len() == 1 {
-        wrkflw_logging::info(&format!(
-            "Detected {} setup action, using image: {}",
-            setup_runtimes[0].language, setup_runtimes[0].image
-        ));
-        Ok(setup_runtimes[0].image.clone())
     } else {
+        // Always build a combined image on the runner base so that essential
+        // tools (git, curl, etc.) remain available for actions like checkout.
         build_combined_runtime_image(&setup_runtimes, &base_image, runtime).await
     }
 }
@@ -5057,7 +5050,8 @@ runs:
         let runtimes = detect_setup_runtimes(&steps);
         assert_eq!(runtimes.len(), 1);
         assert_eq!(runtimes[0].language, "node");
-        assert_eq!(runtimes[0].image, "node:20-slim");
+        assert_eq!(runtimes[0].version, "20");
+        assert!(!runtimes[0].install_script.is_empty());
     }
 
     #[test]
@@ -5067,7 +5061,7 @@ runs:
         let runtimes = detect_setup_runtimes(&steps);
         assert_eq!(runtimes.len(), 1);
         assert_eq!(runtimes[0].language, "node");
-        assert_eq!(runtimes[0].image, "node:16-slim");
+        assert_eq!(runtimes[0].version, "16.x");
     }
 
     #[test]
@@ -5077,7 +5071,7 @@ runs:
         let runtimes = detect_setup_runtimes(&steps);
         assert_eq!(runtimes.len(), 1);
         assert_eq!(runtimes[0].language, "php");
-        assert_eq!(runtimes[0].image, "composer:latest");
+        assert_eq!(runtimes[0].version, "8.1");
     }
 
     #[test]
@@ -5102,7 +5096,7 @@ runs:
         let runtimes = detect_setup_runtimes(&steps);
         assert_eq!(runtimes.len(), 1);
         assert_eq!(runtimes[0].language, "python");
-        assert_eq!(runtimes[0].image, "python:3.12-slim");
+        assert_eq!(runtimes[0].version, "3.12");
     }
 
     #[test]
@@ -5112,7 +5106,7 @@ runs:
         let runtimes = detect_setup_runtimes(&steps);
         assert_eq!(runtimes.len(), 1);
         assert_eq!(runtimes[0].language, "go");
-        assert_eq!(runtimes[0].image, "golang:1.22-slim");
+        assert_eq!(runtimes[0].version, "1.22");
     }
 
     #[test]
@@ -5121,7 +5115,7 @@ runs:
         let runtimes = detect_setup_runtimes(&steps);
         assert_eq!(runtimes.len(), 1);
         assert_eq!(runtimes[0].language, "rust");
-        assert_eq!(runtimes[0].image, "rust:latest");
+        assert_eq!(runtimes[0].version, "stable");
     }
 
     #[test]
@@ -5131,7 +5125,7 @@ runs:
         let runtimes = detect_setup_runtimes(&steps);
         assert_eq!(runtimes.len(), 1);
         assert_eq!(runtimes[0].language, "java");
-        assert_eq!(runtimes[0].image, "eclipse-temurin:21-jdk");
+        assert_eq!(runtimes[0].version, "21");
     }
 
     #[test]
@@ -5141,7 +5135,7 @@ runs:
         let runtimes = detect_setup_runtimes(&steps);
         assert_eq!(runtimes.len(), 1);
         assert_eq!(runtimes[0].language, "dotnet");
-        assert_eq!(runtimes[0].image, "mcr.microsoft.com/dotnet/sdk:8.0");
+        assert_eq!(runtimes[0].version, "8.0");
     }
 
     #[test]
@@ -5207,7 +5201,7 @@ runs:
         let runtimes = detect_setup_runtimes(&steps);
         assert_eq!(runtimes.len(), 1);
         // Last one wins
-        assert_eq!(runtimes[0].image, "node:20-slim");
+        assert_eq!(runtimes[0].version, "20");
     }
 
     // --- exact match tests ---

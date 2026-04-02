@@ -3,148 +3,156 @@ name: Release
 on:
   push:
     tags:
-      - 'v*'
-  workflow_dispatch:
-    inputs:
-      version:
-        description: 'Version to use (e.g. v1.0.0)'
-        required: true
-        default: 'test-release'
+      - "v*"
 
-# Add permissions at workflow level
 permissions:
   contents: write
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
-  create-release:
-    name: Create Release
+  changelog:
+    name: Generate Changelog
     runs-on: ubuntu-latest
-    # You can also set permissions at the job level if needed
-    # permissions:
-    #   contents: write
     outputs:
-      upload_url: ${{ steps.create_release.outputs.upload_url }}
+      changelog: ${{ steps.changelog.outputs.changelog }}
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      
-      - name: Setup Rust
-        uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: stable
-          override: true
-      
-      - name: Install git-cliff
+      - name: Generate changelog
+        id: changelog
         run: |
-          cargo install git-cliff --force
-      
-      - name: Generate Changelog
-        run: |
-          # Debug: Show current state
-          echo "Current ref: ${{ github.ref_name }}"
-          echo "Input version: ${{ github.event.inputs.version }}"
-          echo "All tags:"
-          git tag --sort=-version:refname | head -10
-          
-          # Generate changelog from the current tag to the previous version tag
-          CURRENT_TAG="${{ github.event.inputs.version || github.ref_name }}"
-          PREVIOUS_TAG=$(git tag --sort=-version:refname | grep "^v" | head -2 | tail -1)
-          
-          echo "Current tag: $CURRENT_TAG"
-          echo "Previous tag: $PREVIOUS_TAG"
-          
-          if [ -n "$PREVIOUS_TAG" ] && [ "$PREVIOUS_TAG" != "$CURRENT_TAG" ]; then
-            echo "Generating changelog for range: $PREVIOUS_TAG..$CURRENT_TAG"
-            git-cliff --tag "$CURRENT_TAG" "$PREVIOUS_TAG..$CURRENT_TAG" --output CHANGELOG.md
+          # Get the previous tag
+          prev_tag=$(git tag --sort=-v:refname | sed -n '2p')
+          if [ -z "$prev_tag" ]; then
+            # First release: use all commits
+            range="HEAD"
           else
-            echo "Generating latest changelog for tag: $CURRENT_TAG"
-            git-cliff --tag "$CURRENT_TAG" --latest --output CHANGELOG.md
+            range="${prev_tag}..HEAD"
           fi
-          
-          echo "Generated changelog:"
-          cat CHANGELOG.md
-      
-      - name: Create Release
-        id: create_release
-        uses: softprops/action-gh-release@v1
-        with:
-          name: "wrkflw ${{ github.event.inputs.version || github.ref_name }}"
-          body_path: CHANGELOG.md
-          draft: false
-          prerelease: false
-          tag_name: ${{ github.event.inputs.version || github.ref_name }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  build-release:
-    name: Build Release
-    needs: [create-release]
+          changelog=$(git log "$range" --pretty=format:"- %s (%h)" --no-merges)
+          # Escape for GitHub Actions output
+          {
+            echo "changelog<<CHANGELOG_EOF"
+            echo "$changelog"
+            echo "CHANGELOG_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
-    # You can also set permissions at the job level if needed
-    # permissions:
-    #   contents: write
     strategy:
+      fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            artifact_name: wrkflw
-            asset_name: wrkflw-${{ github.event.inputs.version || github.ref_name }}-linux-x86_64
-          - os: macos-latest
-            target: x86_64-apple-darwin
-            artifact_name: wrkflw
-            asset_name: wrkflw-${{ github.event.inputs.version || github.ref_name }}-macos-x86_64
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            artifact_name: wrkflw
-            asset_name: wrkflw-${{ github.event.inputs.version || github.ref_name }}-macos-arm64
-
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+          - target: aarch64-pc-windows-msvc
+            os: windows-latest
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
-      
-      - name: Setup Rust
-        uses: actions-rs/toolchain@v1
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          profile: minimal
-          toolchain: stable
-          target: ${{ matrix.target }}
-          override: true
-      
-      - name: Build Release Binary
-        uses: actions-rs/cargo@v1
-        with:
-          command: build
-          args: --release --target ${{ matrix.target }}
-      
-      - name: Compress Release Binary (Unix)
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cross-compilation tools
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Install musl tools
+        if: contains(matrix.target, 'musl')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          if [[ "${{ matrix.target }}" == "aarch64-unknown-linux-musl" ]]; then
+            sudo apt-get install -y gcc-aarch64-linux-gnu
+          fi
+
+      - name: Configure linker for aarch64-linux-gnu
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          mkdir -p .cargo
+          echo '[target.aarch64-unknown-linux-gnu]' >> .cargo/config.toml
+          echo 'linker = "aarch64-linux-gnu-gcc"' >> .cargo/config.toml
+
+      - name: Configure linker for aarch64-linux-musl
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: |
+          mkdir -p .cargo
+          echo '[target.aarch64-unknown-linux-musl]' >> .cargo/config.toml
+          echo 'linker = "aarch64-linux-gnu-gcc"' >> .cargo/config.toml
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package (Unix)
         if: runner.os != 'Windows'
         run: |
-          mkdir -p compressed
-          cp target/${{ matrix.target }}/release/${{ matrix.artifact_name }} compressed/
-          cd compressed
-          tar czvf ${{ matrix.asset_name }}.tar.gz ${{ matrix.artifact_name }}
-          echo "ASSET=${{ matrix.asset_name }}.tar.gz" >> $GITHUB_ENV
-          echo "ASSET_PATH=compressed/${{ matrix.asset_name }}.tar.gz" >> $GITHUB_ENV
-      
-      - name: Compress Release Binary (Windows)
+          cd target/${{ matrix.target }}/release
+          tar czf ../../../wrkflw-${{ matrix.target }}.tar.gz wrkflw
+          cd ../../..
+
+      - name: Package (Windows)
         if: runner.os == 'Windows'
-        run: |
-          mkdir -p compressed
-          copy target\${{ matrix.target }}\release\${{ matrix.artifact_name }} compressed\
-          cd compressed
-          7z a ${{ matrix.asset_name }}.zip ${{ matrix.artifact_name }}
-          echo "ASSET=${{ matrix.asset_name }}.zip" >> $env:GITHUB_ENV
-          echo "ASSET_PATH=compressed\${{ matrix.asset_name }}.zip" >> $env:GITHUB_ENV
         shell: pwsh
-      
-      - name: Upload Release Asset
-        uses: softprops/action-gh-release@v1
+        run: |
+          Compress-Archive -Path "target/${{ matrix.target }}/release/wrkflw.exe" -DestinationPath "wrkflw-${{ matrix.target }}.zip"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
         with:
-          files: ${{ env.ASSET_PATH }}
-          tag_name: ${{ github.event.inputs.version || github.ref_name }}
+          name: wrkflw-${{ matrix.target }}
+          path: wrkflw-${{ matrix.target }}.*
+
+  publish:
+    name: Publish to crates.io
+    runs-on: ubuntu-latest
+    needs: [build, changelog]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Publish
+        run: cargo publish
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} 
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: [build, changelog]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          body: |
+            ## What's Changed
+            ${{ needs.changelog.outputs.changelog }}
+          files: artifacts/*
+          generate_release_notes: false

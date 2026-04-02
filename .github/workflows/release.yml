@@ -37,10 +37,10 @@ jobs:
         id: changelog
         run: |
           # Get the previous tag
-          prev_tag=$(git tag --sort=-v:refname | grep "^v" | grep -v "^${RELEASE_TAG}$" | head -1)
+          prev_tag=$(git tag --sort=-v:refname | grep "^v" | sed -n "/^${RELEASE_TAG}\$/,\$p" | sed '1d' | head -1)
           if [ -z "$prev_tag" ]; then
             # First release: use all commits
-            changelog=$(git log --pretty=format:"- %s (%h)" --no-merges)
+            changelog=$(git log --pretty=format:"- %s (%h)" --no-merges --max-count=100)
           else
             changelog=$(git log "${prev_tag}..${RELEASE_TAG}" --pretty=format:"- %s (%h)" --no-merges)
           fi
@@ -53,6 +53,7 @@ jobs:
 
   build:
     name: Build (${{ matrix.target }})
+    needs: [changelog]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false

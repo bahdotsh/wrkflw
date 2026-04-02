@@ -260,8 +260,13 @@ impl ContainerRuntime for EmulationRuntime {
         // remain a single argument rather than being re-split by an outer shell.
         // For all other commands, fall back to `sh -c` to handle shell builtins,
         // pipelines, and other shell syntax.
+        // Use the basename so absolute paths like /usr/bin/bash are matched too.
+        let cmd_basename = Path::new(command[0])
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(command[0]);
         let use_direct_exec = matches!(
-            command[0],
+            cmd_basename,
             "bash" | "sh" | "python" | "python3" | "pwsh" | "powershell" | "cargo" | "rustup"
         );
 
@@ -278,7 +283,7 @@ impl ContainerRuntime for EmulationRuntime {
         }
 
         // Cargo/rustup commands always run in the project directory
-        if command[0] == "cargo" || command[0] == "rustup" {
+        if matches!(cmd_basename, "cargo" | "rustup") {
             let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
             wrkflw_logging::info(&format!(
                 "Using project directory for Rust command: {}",
@@ -289,9 +294,16 @@ impl ContainerRuntime for EmulationRuntime {
             cmd.current_dir(&actual_working_dir);
         }
 
-        // Add environment variables
+        // Add environment variables, interpolating ${CI_PROJECT_DIR} in values
+        // (e.g. CARGO_HOME="${CI_PROJECT_DIR}/.cargo" in GitLab CI configs).
+        let project_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let project_dir_str = project_dir.to_string_lossy();
         for (key, value) in env_vars {
-            cmd.env(key, value);
+            if value.contains("${CI_PROJECT_DIR}") {
+                cmd.env(key, value.replace("${CI_PROJECT_DIR}", &project_dir_str));
+            } else {
+                cmd.env(key, value);
+            }
         }
 
         match cmd.output() {

@@ -3753,6 +3753,9 @@ async fn execute_composite_action(
                     container_config: None, // Composite actions don't use job containers
                     workflow_defaults: None,
                     job_defaults: None,
+                    // Composite action steps don't have access to the parent job's step
+                    // outputs — this matches GitHub Actions behavior where ${{ steps.* }}
+                    // only resolves within the same job scope, not across action boundaries.
                     step_outputs: &HashMap::new(),
                 }))
                 .await?;

@@ -2708,11 +2708,20 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
         };
 
         // Resolve expression substitutions (hashFiles, matrix vars)
-        let resolved_run = crate::substitution::preprocess_expressions(
+        let resolved_run = match crate::substitution::preprocess_expressions(
             &resolved_run,
             ctx.working_dir,
             ctx.matrix_combination,
-        );
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                return Ok(StepResult {
+                    name: step_name,
+                    status: StepStatus::Failure,
+                    output: format!("Expression substitution failed: {}", e),
+                });
+            }
+        };
 
         // Check if this is a cargo command
         let is_cargo_cmd = resolved_run.trim().starts_with("cargo");
@@ -2733,7 +2742,16 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
             .unwrap_or("bash");
 
         let cmd_parts = match effective_shell {
-            "bash" => vec!["bash", "-e", "-c", &resolved_run],
+            "bash" => vec![
+                "bash",
+                "--noprofile",
+                "--norc",
+                "-e",
+                "-o",
+                "pipefail",
+                "-c",
+                &resolved_run,
+            ],
             "sh" => vec!["sh", "-e", "-c", &resolved_run],
             "python" => vec!["python", "-c", &resolved_run],
             "pwsh" | "powershell" => vec!["pwsh", "-command", &resolved_run],
@@ -5650,5 +5668,376 @@ runs:
         let tag_ba = combined_image_tag(&runtimes_ba, df);
         // Both should produce the same sorted prefix (a1-b2)
         assert_eq!(tag_ab, tag_ba);
+    }
+
+    // --- Shell invocation tests ---
+
+    fn make_run_step(run: &str) -> Step {
+        Step {
+            name: Some("run-step".to_string()),
+            uses: None,
+            run: Some(run.to_string()),
+            with: None,
+            env: HashMap::new(),
+            continue_on_error: None,
+            if_condition: None,
+            id: None,
+            working_directory: None,
+            shell: None,
+            timeout_minutes: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn bash_shell_uses_errexit_and_pipefail() {
+        let runtime = MockContainerRuntime::default();
+        let workflow = minimal_workflow();
+        let job_env = HashMap::new();
+        let working_dir = std::env::current_dir().unwrap();
+
+        let step = make_run_step("echo hello");
+
+        let ctx = StepExecutionContext {
+            step: &step,
+            step_idx: 0,
+            job_env: &job_env,
+            working_dir: &working_dir,
+            runtime: &runtime,
+            workflow: &workflow,
+            runner_image: "ubuntu:latest",
+            verbose: false,
+            matrix_combination: &None,
+            secret_manager: None,
+            secret_masker: None,
+            container_config: None,
+            workflow_defaults: None,
+            job_defaults: None,
+        };
+
+        let result = execute_step(ctx).await.unwrap();
+        assert_eq!(result.status, StepStatus::Success);
+
+        let calls = runtime.run_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        let cmd = &calls[0].cmd;
+        // Should be: bash --noprofile --norc -e -o pipefail -c <script>
+        assert_eq!(cmd[0], "bash");
+        assert_eq!(cmd[1], "--noprofile");
+        assert_eq!(cmd[2], "--norc");
+        assert_eq!(cmd[3], "-e");
+        assert_eq!(cmd[4], "-o");
+        assert_eq!(cmd[5], "pipefail");
+        assert_eq!(cmd[6], "-c");
+        assert_eq!(cmd[7], "echo hello");
+    }
+
+    #[tokio::test]
+    async fn sh_shell_uses_errexit() {
+        let runtime = MockContainerRuntime::default();
+        let workflow = minimal_workflow();
+        let job_env = HashMap::new();
+        let working_dir = std::env::current_dir().unwrap();
+
+        let mut step = make_run_step("echo hello");
+        step.shell = Some("sh".to_string());
+
+        let ctx = StepExecutionContext {
+            step: &step,
+            step_idx: 0,
+            job_env: &job_env,
+            working_dir: &working_dir,
+            runtime: &runtime,
+            workflow: &workflow,
+            runner_image: "ubuntu:latest",
+            verbose: false,
+            matrix_combination: &None,
+            secret_manager: None,
+            secret_masker: None,
+            container_config: None,
+            workflow_defaults: None,
+            job_defaults: None,
+        };
+
+        let result = execute_step(ctx).await.unwrap();
+        assert_eq!(result.status, StepStatus::Success);
+
+        let calls = runtime.run_calls.lock().unwrap();
+        let cmd = &calls[0].cmd;
+        assert_eq!(cmd[0], "sh");
+        assert_eq!(cmd[1], "-e");
+        assert_eq!(cmd[2], "-c");
+        assert_eq!(cmd[3], "echo hello");
+    }
+
+    // --- Working-directory path traversal tests ---
+
+    #[tokio::test]
+    async fn working_directory_rejects_parent_traversal() {
+        let runtime = MockContainerRuntime::default();
+        let workflow = minimal_workflow();
+        let job_env = HashMap::new();
+        let working_dir = std::env::current_dir().unwrap();
+
+        let mut step = make_run_step("echo pwned");
+        step.working_directory = Some("../../etc".to_string());
+
+        let ctx = StepExecutionContext {
+            step: &step,
+            step_idx: 0,
+            job_env: &job_env,
+            working_dir: &working_dir,
+            runtime: &runtime,
+            workflow: &workflow,
+            runner_image: "ubuntu:latest",
+            verbose: false,
+            matrix_combination: &None,
+            secret_manager: None,
+            secret_masker: None,
+            container_config: None,
+            workflow_defaults: None,
+            job_defaults: None,
+        };
+
+        let result = execute_step(ctx).await.unwrap();
+        assert_eq!(result.status, StepStatus::Failure);
+        assert!(result.output.contains("Invalid working-directory"));
+    }
+
+    #[tokio::test]
+    async fn working_directory_allows_subdirectory() {
+        let runtime = MockContainerRuntime::default();
+        let workflow = minimal_workflow();
+        let job_env = HashMap::new();
+        let working_dir = std::env::current_dir().unwrap();
+
+        let mut step = make_run_step("echo ok");
+        step.working_directory = Some("src/app".to_string());
+
+        let ctx = StepExecutionContext {
+            step: &step,
+            step_idx: 0,
+            job_env: &job_env,
+            working_dir: &working_dir,
+            runtime: &runtime,
+            workflow: &workflow,
+            runner_image: "ubuntu:latest",
+            verbose: false,
+            matrix_combination: &None,
+            secret_manager: None,
+            secret_masker: None,
+            container_config: None,
+            workflow_defaults: None,
+            job_defaults: None,
+        };
+
+        let result = execute_step(ctx).await.unwrap();
+        assert_eq!(result.status, StepStatus::Success);
+        // No container calls should have failed
+        let calls = runtime.run_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn working_directory_rejects_absolute_path() {
+        let runtime = MockContainerRuntime::default();
+        let workflow = minimal_workflow();
+        let job_env = HashMap::new();
+        let working_dir = std::env::current_dir().unwrap();
+
+        let mut step = make_run_step("echo pwned");
+        step.working_directory = Some("/tmp/evil".to_string());
+
+        let ctx = StepExecutionContext {
+            step: &step,
+            step_idx: 0,
+            job_env: &job_env,
+            working_dir: &working_dir,
+            runtime: &runtime,
+            workflow: &workflow,
+            runner_image: "ubuntu:latest",
+            verbose: false,
+            matrix_combination: &None,
+            secret_manager: None,
+            secret_masker: None,
+            container_config: None,
+            workflow_defaults: None,
+            job_defaults: None,
+        };
+
+        let result = execute_step(ctx).await.unwrap();
+        assert_eq!(result.status, StepStatus::Failure);
+        assert!(result.output.contains("Invalid working-directory"));
+    }
+
+    // --- Defaults cascade tests ---
+
+    #[tokio::test]
+    async fn defaults_cascade_job_overrides_workflow() {
+        let runtime = MockContainerRuntime::default();
+        let workflow_defaults = workflow::Defaults {
+            run: Some(workflow::DefaultsRun {
+                shell: Some("sh".to_string()),
+                working_directory: None,
+            }),
+        };
+        let job_defaults = workflow::Defaults {
+            run: Some(workflow::DefaultsRun {
+                shell: Some("python".to_string()),
+                working_directory: None,
+            }),
+        };
+        let workflow = minimal_workflow();
+        let job_env = HashMap::new();
+        let working_dir = std::env::current_dir().unwrap();
+
+        let step = make_run_step("print('hello')");
+
+        let ctx = StepExecutionContext {
+            step: &step,
+            step_idx: 0,
+            job_env: &job_env,
+            working_dir: &working_dir,
+            runtime: &runtime,
+            workflow: &workflow,
+            runner_image: "ubuntu:latest",
+            verbose: false,
+            matrix_combination: &None,
+            secret_manager: None,
+            secret_masker: None,
+            container_config: None,
+            workflow_defaults: Some(&workflow_defaults),
+            job_defaults: Some(&job_defaults),
+        };
+
+        let result = execute_step(ctx).await.unwrap();
+        assert_eq!(result.status, StepStatus::Success);
+
+        let calls = runtime.run_calls.lock().unwrap();
+        let cmd = &calls[0].cmd;
+        // Job defaults (python) should override workflow defaults (sh)
+        assert_eq!(cmd[0], "python");
+        assert_eq!(cmd[1], "-c");
+    }
+
+    #[tokio::test]
+    async fn defaults_cascade_step_overrides_job() {
+        let runtime = MockContainerRuntime::default();
+        let job_defaults = workflow::Defaults {
+            run: Some(workflow::DefaultsRun {
+                shell: Some("python".to_string()),
+                working_directory: None,
+            }),
+        };
+        let workflow = minimal_workflow();
+        let job_env = HashMap::new();
+        let working_dir = std::env::current_dir().unwrap();
+
+        let mut step = make_run_step("echo hello");
+        step.shell = Some("sh".to_string());
+
+        let ctx = StepExecutionContext {
+            step: &step,
+            step_idx: 0,
+            job_env: &job_env,
+            working_dir: &working_dir,
+            runtime: &runtime,
+            workflow: &workflow,
+            runner_image: "ubuntu:latest",
+            verbose: false,
+            matrix_combination: &None,
+            secret_manager: None,
+            secret_masker: None,
+            container_config: None,
+            workflow_defaults: None,
+            job_defaults: Some(&job_defaults),
+        };
+
+        let result = execute_step(ctx).await.unwrap();
+        assert_eq!(result.status, StepStatus::Success);
+
+        let calls = runtime.run_calls.lock().unwrap();
+        let cmd = &calls[0].cmd;
+        // Step shell (sh) should override job defaults (python)
+        assert_eq!(cmd[0], "sh");
+        assert_eq!(cmd[1], "-e");
+        assert_eq!(cmd[2], "-c");
+    }
+
+    #[tokio::test]
+    async fn defaults_cascade_workflow_used_when_no_job_or_step() {
+        let runtime = MockContainerRuntime::default();
+        let workflow_defaults = workflow::Defaults {
+            run: Some(workflow::DefaultsRun {
+                shell: Some("sh".to_string()),
+                working_directory: None,
+            }),
+        };
+        let workflow = minimal_workflow();
+        let job_env = HashMap::new();
+        let working_dir = std::env::current_dir().unwrap();
+
+        let step = make_run_step("echo hello");
+
+        let ctx = StepExecutionContext {
+            step: &step,
+            step_idx: 0,
+            job_env: &job_env,
+            working_dir: &working_dir,
+            runtime: &runtime,
+            workflow: &workflow,
+            runner_image: "ubuntu:latest",
+            verbose: false,
+            matrix_combination: &None,
+            secret_manager: None,
+            secret_masker: None,
+            container_config: None,
+            workflow_defaults: Some(&workflow_defaults),
+            job_defaults: None,
+        };
+
+        let result = execute_step(ctx).await.unwrap();
+        assert_eq!(result.status, StepStatus::Success);
+
+        let calls = runtime.run_calls.lock().unwrap();
+        let cmd = &calls[0].cmd;
+        // Workflow defaults (sh) should be used
+        assert_eq!(cmd[0], "sh");
+    }
+
+    #[tokio::test]
+    async fn defaults_cascade_working_directory_from_job() {
+        let runtime = MockContainerRuntime::default();
+        let job_defaults = workflow::Defaults {
+            run: Some(workflow::DefaultsRun {
+                shell: None,
+                working_directory: Some("src".to_string()),
+            }),
+        };
+        let workflow = minimal_workflow();
+        let job_env = HashMap::new();
+        let working_dir = std::env::current_dir().unwrap();
+
+        let step = make_run_step("echo ok");
+
+        let ctx = StepExecutionContext {
+            step: &step,
+            step_idx: 0,
+            job_env: &job_env,
+            working_dir: &working_dir,
+            runtime: &runtime,
+            workflow: &workflow,
+            runner_image: "ubuntu:latest",
+            verbose: false,
+            matrix_combination: &None,
+            secret_manager: None,
+            secret_masker: None,
+            container_config: None,
+            workflow_defaults: None,
+            job_defaults: Some(&job_defaults),
+        };
+
+        let result = execute_step(ctx).await.unwrap();
+        assert_eq!(result.status, StepStatus::Success);
+        // Should succeed — "src" is a valid subdirectory path
     }
 }

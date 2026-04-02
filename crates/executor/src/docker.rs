@@ -1154,12 +1154,19 @@ impl DockerRuntime {
                 ))
             })?;
 
+        // Maximum build context size (500 MB). Prevents OOM when an action
+        // repo is unexpectedly large and has no .dockerignore.
+        const MAX_CONTEXT_BYTES: u64 = 500 * 1024 * 1024;
+
         let tar_buffer = {
             let mut tar_builder = tar::Builder::new(Vec::new());
 
             // Do not follow symlinks — untrusted action repos could use symlinks
             // to leak host filesystem contents into the Docker build context.
             tar_builder.follow_symlinks(false);
+
+            // Track cumulative size so we can enforce MAX_CONTEXT_BYTES.
+            let mut total_bytes: u64 = 0;
 
             // Build a .dockerignore-aware walker when the file exists.
             let dockerignore_path = context_dir.join(".dockerignore");
@@ -1197,6 +1204,16 @@ impl DockerRuntime {
                             ))
                         })?;
                     } else {
+                        if let Ok(meta) = path.metadata() {
+                            total_bytes += meta.len();
+                            if total_bytes > MAX_CONTEXT_BYTES {
+                                return Err(ContainerError::ImageBuild(format!(
+                                    "Docker build context exceeds {} MB limit. \
+                                     Add a .dockerignore file to exclude unnecessary files.",
+                                    MAX_CONTEXT_BYTES / (1024 * 1024)
+                                )));
+                            }
+                        }
                         tar_builder.append_path_with_name(path, rel).map_err(|e| {
                             ContainerError::ImageBuild(format!(
                                 "Failed to add file to build context tar: {}",
@@ -1206,10 +1223,52 @@ impl DockerRuntime {
                     }
                 }
             } else {
-                // No .dockerignore — include the full context directory.
-                tar_builder.append_dir_all(".", context_dir).map_err(|e| {
-                    ContainerError::ImageBuild(format!("Failed to create build context tar: {}", e))
-                })?;
+                // No .dockerignore — walk manually so we can enforce the size limit.
+                use ignore::WalkBuilder;
+
+                let walker = WalkBuilder::new(context_dir)
+                    .standard_filters(false)
+                    .follow_links(false)
+                    .build();
+
+                for entry in walker {
+                    let entry = entry.map_err(|e| {
+                        ContainerError::ImageBuild(format!("Failed to walk build context: {}", e))
+                    })?;
+                    let path = entry.path();
+                    let rel = match path.strip_prefix(context_dir) {
+                        Ok(r) => r,
+                        Err(_) => continue,
+                    };
+                    if rel.as_os_str().is_empty() {
+                        continue;
+                    }
+                    if path.is_dir() {
+                        tar_builder.append_dir(rel, path).map_err(|e| {
+                            ContainerError::ImageBuild(format!(
+                                "Failed to add directory to build context tar: {}",
+                                e
+                            ))
+                        })?;
+                    } else {
+                        if let Ok(meta) = path.metadata() {
+                            total_bytes += meta.len();
+                            if total_bytes > MAX_CONTEXT_BYTES {
+                                return Err(ContainerError::ImageBuild(format!(
+                                    "Docker build context exceeds {} MB limit. \
+                                     Add a .dockerignore file to exclude unnecessary files.",
+                                    MAX_CONTEXT_BYTES / (1024 * 1024)
+                                )));
+                            }
+                        }
+                        tar_builder.append_path_with_name(path, rel).map_err(|e| {
+                            ContainerError::ImageBuild(format!(
+                                "Failed to add file to build context tar: {}",
+                                e
+                            ))
+                        })?;
+                    }
+                }
             }
 
             tar_builder

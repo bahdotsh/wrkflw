@@ -892,9 +892,14 @@ async fn shallow_clone(
 ) -> Result<(), ExecutionError> {
     let is_sha = is_git_sha(git_ref);
 
+    // Disable git hooks for all operations — cloned repos are untrusted and
+    // could contain malicious post-checkout / post-merge hooks.
+    let no_hooks = ["-c", "core.hooksPath=/dev/null"];
+
     if is_sha {
         // SHA refs can't use --branch; use init + fetch + checkout instead
         let init = tokio::process::Command::new("git")
+            .args(no_hooks)
             .arg("init")
             .arg(target_dir)
             .stdout(std::process::Stdio::null())
@@ -910,6 +915,7 @@ async fn shallow_clone(
         }
 
         let fetch = tokio::process::Command::new("git")
+            .args(no_hooks)
             .arg("-C")
             .arg(target_dir)
             .arg("fetch")
@@ -936,6 +942,7 @@ async fn shallow_clone(
         }
 
         let checkout = tokio::process::Command::new("git")
+            .args(no_hooks)
             .arg("-C")
             .arg(target_dir)
             .arg("checkout")
@@ -959,6 +966,7 @@ async fn shallow_clone(
     } else {
         // Branch/tag refs: standard shallow clone
         let output = tokio::process::Command::new("git")
+            .args(no_hooks)
             .arg("clone")
             .arg("--depth")
             .arg("1")
@@ -4168,5 +4176,287 @@ runs:
         assert_eq!(args[0], "42");
         assert_eq!(args[1], "true");
         assert_eq!(args[2], "--flag");
+    }
+
+    // --- Mock ContainerRuntime for NativeDocker integration tests ---
+
+    use std::sync::{Arc, Mutex};
+    use wrkflw_runtime::container::{ContainerError, ContainerOutput};
+
+    /// Records all `run_container` calls for later assertion.
+    #[derive(Clone, Default)]
+    struct MockContainerRuntime {
+        run_calls: Arc<Mutex<Vec<RunContainerCall>>>,
+    }
+
+    #[derive(Debug, Clone)]
+    struct RunContainerCall {
+        image: String,
+        cmd: Vec<String>,
+        env_vars: Vec<(String, String)>,
+        entrypoint: Option<String>,
+    }
+
+    #[async_trait::async_trait]
+    impl ContainerRuntime for MockContainerRuntime {
+        async fn run_container(
+            &self,
+            image: &str,
+            cmd: &[&str],
+            env_vars: &[(&str, &str)],
+            _working_dir: &Path,
+            _volumes: &[(&Path, &Path)],
+            entrypoint: Option<&str>,
+        ) -> Result<ContainerOutput, ContainerError> {
+            self.run_calls.lock().unwrap().push(RunContainerCall {
+                image: image.to_string(),
+                cmd: cmd.iter().map(|s| s.to_string()).collect(),
+                env_vars: env_vars
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+                entrypoint: entrypoint.map(|s| s.to_string()),
+            });
+            Ok(ContainerOutput {
+                stdout: "mock ok".to_string(),
+                stderr: String::new(),
+                exit_code: 0,
+            })
+        }
+
+        async fn pull_image(&self, _image: &str) -> Result<(), ContainerError> {
+            Ok(())
+        }
+
+        async fn build_image(
+            &self,
+            _dockerfile: &Path,
+            _tag: &str,
+            _context_dir: &Path,
+        ) -> Result<(), ContainerError> {
+            Ok(())
+        }
+
+        async fn prepare_language_environment(
+            &self,
+            _language: &str,
+            _version: Option<&str>,
+            _additional_packages: Option<Vec<String>>,
+        ) -> Result<String, ContainerError> {
+            Ok("mock-image:latest".to_string())
+        }
+    }
+
+    /// Helper to build a minimal `WorkflowDefinition`.
+    fn minimal_workflow() -> WorkflowDefinition {
+        WorkflowDefinition {
+            name: "test".to_string(),
+            on: vec![],
+            on_raw: serde_yaml::Value::Null,
+            jobs: Default::default(),
+        }
+    }
+
+    /// Helper to build a `Step` with sensible defaults (Step doesn't derive Default).
+    fn make_step(
+        name: &str,
+        uses: &str,
+        with: Option<HashMap<String, String>>,
+        env: HashMap<String, String>,
+    ) -> Step {
+        Step {
+            name: Some(name.to_string()),
+            uses: Some(uses.to_string()),
+            run: None,
+            with,
+            env,
+            continue_on_error: None,
+            if_condition: None,
+            id: None,
+            working_directory: None,
+            shell: None,
+            timeout_minutes: None,
+        }
+    }
+
+    // --- NativeDocker execute_step integration tests ---
+
+    #[tokio::test]
+    async fn native_docker_passes_entrypoint_and_args() {
+        let runtime = MockContainerRuntime::default();
+        let workflow = minimal_workflow();
+        let job_env = HashMap::new();
+        let working_dir = std::env::current_dir().unwrap();
+
+        // Step uses a docker:// image — triggers NativeDocker path via prepare_action
+        let step = make_step("docker-step", "docker://alpine:3.18", None, HashMap::new());
+
+        let ctx = StepExecutionContext {
+            step: &step,
+            step_idx: 0,
+            job_env: &job_env,
+            working_dir: &working_dir,
+            runtime: &runtime,
+            workflow: &workflow,
+            runner_image: "ubuntu:latest",
+            verbose: false,
+            matrix_combination: &None,
+            secret_manager: None,
+            secret_masker: None,
+            container_config: None,
+        };
+
+        let result = execute_step(ctx).await.unwrap();
+        assert_eq!(result.status, StepStatus::Success);
+
+        let calls = runtime.run_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        let call = &calls[0];
+        assert_eq!(call.image, "alpine:3.18");
+        // docker:// actions have no runs.entrypoint — uses image default
+        assert!(call.entrypoint.is_none());
+        // No args either — uses image CMD
+        assert!(call.cmd.is_empty());
+    }
+
+    #[tokio::test]
+    async fn native_docker_with_args_override() {
+        let runtime = MockContainerRuntime::default();
+        let workflow = minimal_workflow();
+        let job_env = HashMap::new();
+        let working_dir = std::env::current_dir().unwrap();
+
+        let mut with = HashMap::new();
+        with.insert("args".to_string(), "hello world".to_string());
+        with.insert("myinput".to_string(), "myvalue".to_string());
+
+        let step = make_step(
+            "docker-args-step",
+            "docker://alpine:3.18",
+            Some(with),
+            HashMap::new(),
+        );
+
+        let ctx = StepExecutionContext {
+            step: &step,
+            step_idx: 0,
+            job_env: &job_env,
+            working_dir: &working_dir,
+            runtime: &runtime,
+            workflow: &workflow,
+            runner_image: "ubuntu:latest",
+            verbose: false,
+            matrix_combination: &None,
+            secret_manager: None,
+            secret_masker: None,
+            container_config: None,
+        };
+
+        let result = execute_step(ctx).await.unwrap();
+        assert_eq!(result.status, StepStatus::Success);
+
+        let calls = runtime.run_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        let call = &calls[0];
+        // with.args should be shell-tokenized into the CMD
+        assert_eq!(call.cmd, vec!["hello", "world"]);
+        // INPUT_* env vars should be set
+        let env_map: HashMap<&str, &str> = call
+            .env_vars
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        assert_eq!(env_map.get("INPUT_ARGS"), Some(&"hello world"));
+        assert_eq!(env_map.get("INPUT_MYINPUT"), Some(&"myvalue"));
+    }
+
+    #[tokio::test]
+    async fn native_docker_empty_with_args_passes_zero_args() {
+        let runtime = MockContainerRuntime::default();
+        let workflow = minimal_workflow();
+        let job_env = HashMap::new();
+        let working_dir = std::env::current_dir().unwrap();
+
+        let mut with = HashMap::new();
+        // Empty string means "pass zero args" — overrides any runs.args
+        with.insert("args".to_string(), String::new());
+
+        let step = make_step(
+            "docker-empty-args",
+            "docker://alpine:3.18",
+            Some(with),
+            HashMap::new(),
+        );
+
+        let ctx = StepExecutionContext {
+            step: &step,
+            step_idx: 0,
+            job_env: &job_env,
+            working_dir: &working_dir,
+            runtime: &runtime,
+            workflow: &workflow,
+            runner_image: "ubuntu:latest",
+            verbose: false,
+            matrix_combination: &None,
+            secret_manager: None,
+            secret_masker: None,
+            container_config: None,
+        };
+
+        let result = execute_step(ctx).await.unwrap();
+        assert_eq!(result.status, StepStatus::Success);
+
+        let calls = runtime.run_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert!(
+            calls[0].cmd.is_empty(),
+            "empty with.args should yield zero CMD args"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_docker_step_env_injected() {
+        let runtime = MockContainerRuntime::default();
+        let workflow = minimal_workflow();
+        let mut job_env = HashMap::new();
+        job_env.insert("JOB_VAR".to_string(), "from-job".to_string());
+        let working_dir = std::env::current_dir().unwrap();
+
+        let mut step_env_map = HashMap::new();
+        step_env_map.insert("STEP_VAR".to_string(), "from-step".to_string());
+
+        let step = make_step(
+            "docker-env-step",
+            "docker://alpine:3.18",
+            None,
+            step_env_map,
+        );
+
+        let ctx = StepExecutionContext {
+            step: &step,
+            step_idx: 0,
+            job_env: &job_env,
+            working_dir: &working_dir,
+            runtime: &runtime,
+            workflow: &workflow,
+            runner_image: "ubuntu:latest",
+            verbose: false,
+            matrix_combination: &None,
+            secret_manager: None,
+            secret_masker: None,
+            container_config: None,
+        };
+
+        let result = execute_step(ctx).await.unwrap();
+        assert_eq!(result.status, StepStatus::Success);
+
+        let calls = runtime.run_calls.lock().unwrap();
+        let env_map: HashMap<&str, &str> = calls[0]
+            .env_vars
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        assert_eq!(env_map.get("JOB_VAR"), Some(&"from-job"));
+        assert_eq!(env_map.get("STEP_VAR"), Some(&"from-step"));
     }
 }

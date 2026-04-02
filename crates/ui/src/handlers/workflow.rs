@@ -144,6 +144,7 @@ pub async fn execute_workflow_cli(
         preserve_containers_on_failure: false, // Default for this path
         secrets_config: None,                  // Use default secrets configuration
         show_action_messages,
+        target_job: None,
     };
 
     match wrkflw_executor::execute_workflow(path, config).await {
@@ -539,6 +540,7 @@ pub fn start_next_workflow_execution(
                         preserve_containers_on_failure,
                         secrets_config: None, // Use default secrets configuration
                         show_action_messages,
+                        target_job: None,
                     };
 
                     let execution_result = wrkflw_utils::fd::with_stderr_to_null(|| {

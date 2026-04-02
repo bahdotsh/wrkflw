@@ -84,6 +84,7 @@ let cfg = ExecutionConfig {
     runtime_type: RuntimeType::Docker,
     verbose: true,
     preserve_containers_on_failure: false,
+    target_job: None,
 };
 let result = execute_workflow(Path::new(".github/workflows/ci.yml"), cfg).await?;
 println!("status: {:?}", result.summary_status);

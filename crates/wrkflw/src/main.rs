@@ -88,6 +88,10 @@ enum Commands {
         /// Explicitly run as GitLab CI/CD pipeline
         #[arg(long)]
         gitlab: bool,
+
+        /// Run only a specific job by name
+        #[arg(long)]
+        job: Option<String>,
     },
 
     /// Open TUI interface to manage workflows
@@ -134,7 +138,11 @@ enum Commands {
     },
 
     /// List available workflows and pipelines
-    List,
+    List {
+        /// Show jobs within each workflow/pipeline
+        #[arg(long)]
+        jobs: bool,
+    },
 }
 
 // Parser function for key-value pairs
@@ -408,6 +416,7 @@ async fn main() {
             show_action_messages,
             preserve_containers_on_failure,
             gitlab,
+            job,
         }) => {
             // Create execution configuration
             let config = wrkflw_executor::ExecutionConfig {
@@ -416,6 +425,7 @@ async fn main() {
                 preserve_containers_on_failure: *preserve_containers_on_failure,
                 secrets_config: None, // Use default secrets configuration
                 show_action_messages: *show_action_messages,
+                target_job: job.clone(),
             };
 
             // Check if we're explicitly or implicitly running a GitLab pipeline
@@ -577,8 +587,8 @@ async fn main() {
                 std::process::exit(1);
             }
         }
-        Some(Commands::List) => {
-            list_workflows_and_pipelines(verbose);
+        Some(Commands::List { jobs }) => {
+            list_workflows_and_pipelines(verbose, *jobs);
         }
         None => {
             // Launch TUI by default when no command is provided
@@ -658,7 +668,7 @@ fn validate_gitlab_pipeline(path: &Path, verbose: bool) -> bool {
 }
 
 /// List available workflows and pipelines in the repository
-fn list_workflows_and_pipelines(verbose: bool) {
+fn list_workflows_and_pipelines(verbose: bool, show_jobs: bool) {
     // Check for GitHub workflows
     let github_path = PathBuf::from(".github/workflows");
     if github_path.exists() && github_path.is_dir() {
@@ -682,6 +692,29 @@ fn list_workflows_and_pipelines(verbose: bool) {
                 } else {
                     for entry in entries {
                         println!("  - {}", entry.path().display());
+                        if show_jobs {
+                            match wrkflw_parser::workflow::parse_workflow(&entry.path()) {
+                                Ok(workflow) => {
+                                    let mut job_names: Vec<&String> =
+                                        workflow.jobs.keys().collect();
+                                    job_names.sort();
+                                    println!(
+                                        "      Jobs: {}",
+                                        job_names
+                                            .iter()
+                                            .map(|s| s.as_str())
+                                            .collect::<Vec<_>>()
+                                            .join(", ")
+                                    );
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "      Could not parse workflow: {}",
+                                        e
+                                    );
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -702,6 +735,25 @@ fn list_workflows_and_pipelines(verbose: bool) {
     if gitlab_path.exists() && gitlab_path.is_file() {
         println!("GitLab CI Pipeline:");
         println!("  - {}", gitlab_path.display());
+        if show_jobs {
+            match wrkflw_parser::gitlab::parse_pipeline(Path::new(".gitlab-ci.yml")) {
+                Ok(pipeline) => {
+                    let mut job_names: Vec<&String> = pipeline.jobs.keys().collect();
+                    job_names.sort();
+                    println!(
+                        "      Jobs: {}",
+                        job_names
+                            .iter()
+                            .map(|s| s.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                }
+                Err(e) => {
+                    eprintln!("      Could not parse pipeline: {}", e);
+                }
+            }
+        }
     } else {
         println!("GitLab CI Pipeline: No .gitlab-ci.yml file found");
     }

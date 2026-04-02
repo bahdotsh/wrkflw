@@ -47,6 +47,7 @@ jobs:
         runtime_type: RuntimeType::Emulation,
         verbose: false,
         preserve_containers_on_failure: false,
+        target_job: None,
     };
 
     let result = execute_workflow(&caller_path, cfg)
@@ -104,6 +105,7 @@ jobs:
         runtime_type: RuntimeType::Emulation,
         verbose: false,
         preserve_containers_on_failure: false,
+        target_job: None,
     };
 
     let result = execute_workflow(&caller_path, cfg)

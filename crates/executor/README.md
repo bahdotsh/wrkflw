@@ -17,6 +17,7 @@ let cfg = ExecutionConfig {
     runtime: RuntimeType::Docker,
     verbose: true,
     preserve_containers_on_failure: false,
+    target_job: None,
 };
 
 // Path to a workflow YAML

@@ -1252,14 +1252,23 @@ fn detect_setup_runtimes(steps: &[Step]) -> Vec<SetupRuntime> {
             .and_then(|w| w.get(def.with_key))
             .cloned()
             .or_else(|| {
-                // Some actions encode the version in the @ref (e.g., dtolnay/rust-toolchain@nightly)
+                // Some actions encode the version in the @ref (e.g., dtolnay/rust-toolchain@nightly).
+                // Skip bare git SHAs — they pin the action version, not the toolchain.
                 if def.version_from_ref {
-                    git_ref.map(|r| r.to_string())
+                    git_ref.filter(|r| !is_git_sha(r)).map(|r| r.to_string())
                 } else {
                     None
                 }
             })
             .unwrap_or_else(|| def.default_version.to_string());
+
+        // Normalize trailing ".x" suffix (e.g., "16.x" -> "16") so it doesn't
+        // leak into install scripts for languages that don't expect it.
+        let ver = if ver.ends_with(".x") {
+            ver[..ver.len() - 2].to_string()
+        } else {
+            ver
+        };
 
         if !is_safe_version(&ver) {
             wrkflw_logging::warning(&format!(
@@ -5098,7 +5107,8 @@ runs:
         let runtimes = detect_setup_runtimes(&steps);
         assert_eq!(runtimes.len(), 1);
         assert_eq!(runtimes[0].language, "node");
-        assert_eq!(runtimes[0].version, "16.x");
+        // ".x" suffix is normalized away
+        assert_eq!(runtimes[0].version, "16");
     }
 
     #[test]
@@ -5173,6 +5183,29 @@ runs:
         let runtimes = detect_setup_runtimes(&steps);
         assert_eq!(runtimes.len(), 1);
         assert_eq!(runtimes[0].version, "beta");
+    }
+
+    #[test]
+    fn detect_setup_runtimes_rust_sha_ref_falls_back_to_default() {
+        // A pinned SHA ref should NOT be treated as a toolchain version
+        let steps = vec![make_step_uses(
+            "dtolnay/rust-toolchain@d4ff7a3c5bbbc35c47ee72003c3e0a88e24a9919",
+            None,
+        )];
+        let runtimes = detect_setup_runtimes(&steps);
+        assert_eq!(runtimes.len(), 1);
+        assert_eq!(runtimes[0].language, "rust");
+        assert_eq!(runtimes[0].version, "stable");
+    }
+
+    #[test]
+    fn detect_setup_runtimes_normalizes_dot_x_suffix() {
+        // "16.x" should be normalized to "16"
+        let with = HashMap::from([("node-version".to_string(), "16.x".to_string())]);
+        let steps = vec![make_step_uses("actions/setup-node@v3", Some(with))];
+        let runtimes = detect_setup_runtimes(&steps);
+        assert_eq!(runtimes.len(), 1);
+        assert_eq!(runtimes[0].version, "16");
     }
 
     #[test]

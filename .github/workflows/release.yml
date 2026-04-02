@@ -54,15 +54,11 @@ jobs:
             os: ubuntu-latest
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
-          - target: aarch64-unknown-linux-musl
-            os: ubuntu-latest
           - target: x86_64-apple-darwin
             os: macos-latest
           - target: aarch64-apple-darwin
             os: macos-latest
           - target: x86_64-pc-windows-msvc
-            os: windows-latest
-          - target: aarch64-pc-windows-msvc
             os: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -78,26 +74,16 @@ jobs:
           sudo apt-get install -y gcc-aarch64-linux-gnu
 
       - name: Install musl tools
-        if: contains(matrix.target, 'musl')
+        if: matrix.target == 'x86_64-unknown-linux-musl'
         run: |
           sudo apt-get update
           sudo apt-get install -y musl-tools
-          if [[ "${{ matrix.target }}" == "aarch64-unknown-linux-musl" ]]; then
-            sudo apt-get install -y gcc-aarch64-linux-gnu
-          fi
 
       - name: Configure linker for aarch64-linux-gnu
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
           mkdir -p .cargo
           echo '[target.aarch64-unknown-linux-gnu]' >> .cargo/config.toml
-          echo 'linker = "aarch64-linux-gnu-gcc"' >> .cargo/config.toml
-
-      - name: Configure linker for aarch64-linux-musl
-        if: matrix.target == 'aarch64-unknown-linux-musl'
-        run: |
-          mkdir -p .cargo
-          echo '[target.aarch64-unknown-linux-musl]' >> .cargo/config.toml
           echo 'linker = "aarch64-linux-gnu-gcc"' >> .cargo/config.toml
 
       - name: Build
@@ -130,8 +116,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Publish
-        run: cargo publish
+      - name: Install cargo-workspaces
+        run: cargo install cargo-workspaces
+      - name: Publish all crates
+        run: cargo workspaces publish --from-git --allow-dirty --yes
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 

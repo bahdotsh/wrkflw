@@ -43,7 +43,11 @@ jobs:
         id: changelog
         run: |
           # Get the previous tag
-          prev_tag=$(git tag --sort=-v:refname | grep "^v" | grep -F -x -A1 "${RELEASE_TAG}" | tail -1)
+          all_tags=$(git tag --sort=-v:refname | grep "^v")
+          if ! echo "$all_tags" | grep -F -x -q "${RELEASE_TAG}"; then
+            echo "::warning::Tag ${RELEASE_TAG} not found in tag list; generating changelog from all commits"
+          fi
+          prev_tag=$(echo "$all_tags" | grep -F -x -A1 "${RELEASE_TAG}" | tail -1)
           [ "$prev_tag" = "${RELEASE_TAG}" ] && prev_tag=""  # No previous tag found
           if [ -z "$prev_tag" ]; then
             # First release: use all commits
@@ -104,7 +108,7 @@ jobs:
           echo 'linker = "aarch64-linux-gnu-gcc"' >> .cargo/config.toml
 
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Package (Unix)
         if: runner.os != 'Windows'

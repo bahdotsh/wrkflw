@@ -1800,33 +1800,12 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
 
                 step_results.push(result);
 
-                // Post-step: read back environment files written by the step
-                let updates = crate::github_env_files::read_step_environment_updates(&job_env);
-
-                // Store step outputs keyed by step ID for ${{ steps.<id>.outputs.<key> }}
-                if let Some(ref step_id) = step.id {
-                    step_outputs_map.insert(step_id.clone(), updates.outputs);
-                }
-
-                // Merge GITHUB_ENV entries into job_env for subsequent steps
-                for (k, v) in updates.env_vars {
-                    job_env.insert(k, v);
-                }
-
-                // Prepend GITHUB_PATH entries to PATH for subsequent steps
-                if !updates.path_entries.is_empty() {
-                    let current_path = job_env.get("PATH").cloned().unwrap_or_default();
-                    let new_entries = updates.path_entries.join(":");
-                    let new_path = if current_path.is_empty() {
-                        new_entries
-                    } else {
-                        format!("{}:{}", new_entries, current_path)
-                    };
-                    job_env.insert("PATH".to_string(), new_path);
-                }
-
-                // Clear GITHUB_OUTPUT for next step (per-step, not cumulative)
-                crate::github_env_files::clear_github_output(&job_env);
+                // Read back environment files and apply to job state
+                crate::github_env_files::apply_step_environment_updates(
+                    &mut job_env,
+                    &mut step_outputs_map,
+                    step.id.as_deref(),
+                );
 
                 if abort_job {
                     job_success = false;
@@ -2030,29 +2009,12 @@ async fn execute_matrix_job(
 
                     step_results.push(result);
 
-                    // Post-step: read back environment files written by the step
-                    let updates = crate::github_env_files::read_step_environment_updates(&job_env);
-
-                    if let Some(ref step_id) = step.id {
-                        step_outputs_map.insert(step_id.clone(), updates.outputs);
-                    }
-
-                    for (k, v) in updates.env_vars {
-                        job_env.insert(k, v);
-                    }
-
-                    if !updates.path_entries.is_empty() {
-                        let current_path = job_env.get("PATH").cloned().unwrap_or_default();
-                        let new_entries = updates.path_entries.join(":");
-                        let new_path = if current_path.is_empty() {
-                            new_entries
-                        } else {
-                            format!("{}:{}", new_entries, current_path)
-                        };
-                        job_env.insert("PATH".to_string(), new_path);
-                    }
-
-                    crate::github_env_files::clear_github_output(&job_env);
+                    // Read back environment files and apply to job state
+                    crate::github_env_files::apply_step_environment_updates(
+                        &mut job_env,
+                        &mut step_outputs_map,
+                        step.id.as_deref(),
+                    );
 
                     if abort_job {
                         all_steps_ok = false;

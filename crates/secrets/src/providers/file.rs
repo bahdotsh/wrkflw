@@ -82,9 +82,10 @@ impl FileProvider {
                 let key = key.trim().to_string();
                 let value = value.trim();
 
-                // Handle quoted values
-                let value = if (value.starts_with('"') && value.ends_with('"'))
-                    || (value.starts_with('\'') && value.ends_with('\''))
+                // Handle quoted values (length check prevents panic on single-char values like `"`)
+                let value = if value.len() >= 2
+                    && ((value.starts_with('"') && value.ends_with('"'))
+                        || (value.starts_with('\'') && value.ends_with('\'')))
                 {
                     &value[1..value.len() - 1]
                 } else {

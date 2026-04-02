@@ -35,31 +35,16 @@ jobs:
           components: clippy, rustfmt
 
       - name: Check formatting
-        uses: actions-rs/cargo@v1
-        with:
-          command: fmt
-          args: -- --check
+        run: cargo fmt -- --check
 
       - name: Run clippy
-        uses: actions-rs/cargo@v1
-        with:
-          command: clippy
-          args: -- -D warnings
+        run: cargo clippy -- -D warnings
 
       - name: Build
-        uses: actions-rs/cargo@v1
-        with:
-          command: build
-          args: --target ${{ matrix.target }}
+        run: cargo build --target ${{ matrix.target }}
 
       - name: Check no-default-features
-        uses: actions-rs/cargo@v1
-        with:
-          command: check
-          args: --no-default-features --target ${{ matrix.target }}
+        run: cargo check --no-default-features --workspace --target ${{ matrix.target }}
 
       - name: Run tests
-        uses: actions-rs/cargo@v1
-        with:
-          command: test
-          args: --target ${{ matrix.target }}
+        run: cargo test --target ${{ matrix.target }}

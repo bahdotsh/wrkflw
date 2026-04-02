@@ -10,6 +10,12 @@ lazy_static! {
         Regex::new(r"\$\{\{\s*matrix\.([a-zA-Z0-9_]+)\s*\}\}").unwrap();
     static ref HASH_FILES_PATTERN: Regex =
         Regex::new(r"\$\{\{\s*hashFiles\(([^)]+)\)\s*\}\}").unwrap();
+    static ref STEPS_OUTPUT_PATTERN: Regex = Regex::new(
+        r"\$\{\{\s*steps\.([a-zA-Z_][a-zA-Z0-9_-]*)\.outputs\.([a-zA-Z_][a-zA-Z0-9_-]*)\s*\}\}"
+    )
+    .unwrap();
+    static ref ENV_CONTEXT_PATTERN: Regex =
+        Regex::new(r"\$\{\{\s*env\.([a-zA-Z_][a-zA-Z0-9_]*)\s*\}\}").unwrap();
 }
 
 /// Preprocesses a command string to replace GitHub-style matrix variable references
@@ -50,6 +56,38 @@ pub fn process_step_run(run: &str, matrix_combination: &Option<HashMap<String, V
             })
             .to_string()
     }
+}
+
+/// Replace `${{ steps.<id>.outputs.<key> }}` with the corresponding step output value.
+///
+/// Missing step IDs or output keys resolve to an empty string, matching GitHub Actions behavior.
+pub fn preprocess_step_outputs(
+    text: &str,
+    step_outputs: &HashMap<String, HashMap<String, String>>,
+) -> String {
+    STEPS_OUTPUT_PATTERN
+        .replace_all(text, |caps: &regex::Captures| {
+            let step_id = &caps[1];
+            let output_key = &caps[2];
+            step_outputs
+                .get(step_id)
+                .and_then(|m| m.get(output_key))
+                .cloned()
+                .unwrap_or_default()
+        })
+        .into_owned()
+}
+
+/// Replace `${{ env.<name> }}` with the value of the environment variable.
+///
+/// Missing variables resolve to an empty string, matching GitHub Actions behavior.
+pub fn preprocess_env_context(text: &str, env: &HashMap<String, String>) -> String {
+    ENV_CONTEXT_PATTERN
+        .replace_all(text, |caps: &regex::Captures| {
+            let var_name = &caps[1];
+            env.get(var_name).cloned().unwrap_or_default()
+        })
+        .into_owned()
 }
 
 /// Replace `${{ hashFiles(...) }}` expressions with the SHA-256 hash of matched files.
@@ -144,17 +182,22 @@ fn compute_hash_files(args_raw: &str, workspace: &Path) -> Result<String, String
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-/// Apply all expression substitutions: hashFiles, matrix variables.
+/// Apply all expression substitutions: hashFiles, step outputs, env context, matrix variables.
 ///
 /// Returns `Err` if a `hashFiles()` expression fails (e.g. unreadable file).
 pub fn preprocess_expressions(
     text: &str,
     workspace: &Path,
     matrix_combination: &Option<HashMap<String, Value>>,
+    step_outputs: &HashMap<String, HashMap<String, String>>,
+    env_context: &HashMap<String, String>,
 ) -> Result<String, String> {
-    // First resolve hashFiles
+    // Resolve hashFiles first (needs filesystem access)
     let result = preprocess_hash_files(text, workspace)?;
-    // Then resolve matrix variables
+    // Then resolve step outputs and env context
+    let result = preprocess_step_outputs(&result, step_outputs);
+    let result = preprocess_env_context(&result, env_context);
+    // Finally resolve matrix variables
     Ok(if let Some(matrix) = matrix_combination {
         preprocess_command(&result, matrix)
     } else {
@@ -313,7 +356,14 @@ mod tests {
         matrix.insert("os".to_string(), Value::String("ubuntu".to_string()));
 
         let text = "${{ matrix.os }}-${{ hashFiles('Cargo.lock') }}";
-        let result = preprocess_expressions(text, dir.path(), &Some(matrix)).unwrap();
+        let result = preprocess_expressions(
+            text,
+            dir.path(),
+            &Some(matrix),
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .unwrap();
 
         assert!(result.starts_with("ubuntu-"));
         assert!(!result.contains("hashFiles"));
@@ -338,5 +388,77 @@ mod tests {
         let result = compute_hash_files("'subdir/../../etc/passwd'", dir.path());
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("path traversal"));
+    }
+
+    #[test]
+    fn step_output_substitution() {
+        let mut step_outputs = HashMap::new();
+        let mut build_outputs = HashMap::new();
+        build_outputs.insert("version".to_string(), "1.2.3".to_string());
+        step_outputs.insert("build".to_string(), build_outputs);
+
+        let text = "Version is ${{ steps.build.outputs.version }}";
+        let result = preprocess_step_outputs(text, &step_outputs);
+        assert_eq!(result, "Version is 1.2.3");
+    }
+
+    #[test]
+    fn step_output_missing_returns_empty() {
+        let step_outputs = HashMap::new();
+
+        let text = "Value: ${{ steps.unknown.outputs.key }}";
+        let result = preprocess_step_outputs(text, &step_outputs);
+        assert_eq!(result, "Value: ");
+    }
+
+    #[test]
+    fn step_output_missing_key_returns_empty() {
+        let mut step_outputs = HashMap::new();
+        step_outputs.insert("build".to_string(), HashMap::new());
+
+        let text = "${{ steps.build.outputs.missing }}";
+        let result = preprocess_step_outputs(text, &step_outputs);
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn env_context_substitution() {
+        let mut env = HashMap::new();
+        env.insert("MY_VAR".to_string(), "hello".to_string());
+
+        let text = "Value: ${{ env.MY_VAR }}";
+        let result = preprocess_env_context(text, &env);
+        assert_eq!(result, "Value: hello");
+    }
+
+    #[test]
+    fn env_context_missing_returns_empty() {
+        let env = HashMap::new();
+
+        let text = "${{ env.MISSING }}";
+        let result = preprocess_env_context(text, &env);
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn combined_substitutions() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("lock"), "content").unwrap();
+
+        let mut matrix = HashMap::new();
+        matrix.insert("os".to_string(), Value::String("ubuntu".to_string()));
+
+        let mut step_outputs = HashMap::new();
+        let mut build_out = HashMap::new();
+        build_out.insert("tag".to_string(), "v1".to_string());
+        step_outputs.insert("build".to_string(), build_out);
+
+        let mut env = HashMap::new();
+        env.insert("CI".to_string(), "true".to_string());
+
+        let text = "${{ matrix.os }}-${{ steps.build.outputs.tag }}-${{ env.CI }}";
+        let result =
+            preprocess_expressions(text, dir.path(), &Some(matrix), &step_outputs, &env).unwrap();
+        assert_eq!(result, "ubuntu-v1-true");
     }
 }

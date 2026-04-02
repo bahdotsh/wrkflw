@@ -527,6 +527,8 @@ pub struct StepResult {
     pub name: String,
     pub status: StepStatus,
     pub output: String,
+    /// Parsed key-value outputs from GITHUB_OUTPUT file.
+    pub outputs: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -915,6 +917,7 @@ async fn execute_native_docker_step(
             "Exit code: {}\n{}\n{}",
             output.exit_code, output.stdout, output.stderr
         ),
+        outputs: HashMap::new(),
     })
 }
 
@@ -1723,9 +1726,24 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
     let timeout_mins = sanitize_timeout_minutes(job.timeout_minutes, 360.0);
     let job_timeout = std::time::Duration::from_secs_f64(timeout_mins * 60.0);
 
-    let step_loop = async {
-        for (idx, step) in job.steps.iter().enumerate() {
-            let outcome = run_step_with_guards(
+    let mut step_outputs_map: HashMap<String, HashMap<String, String>> = HashMap::new();
+    let job_deadline = tokio::time::Instant::now() + job_timeout;
+
+    for (idx, step) in job.steps.iter().enumerate() {
+        // Check job-level timeout before each step
+        let remaining = job_deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            wrkflw_logging::error(&format!(
+                "Job '{}' exceeded timeout of {} minutes",
+                ctx.job_name, timeout_mins
+            ));
+            job_success = false;
+            break;
+        }
+
+        let outcome = match tokio::time::timeout(
+            remaining,
+            run_step_with_guards(
                 step,
                 idx,
                 &job_env,
@@ -1745,55 +1763,76 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
                     container_config: job.container.as_ref(),
                     workflow_defaults: ctx.workflow.defaults.as_ref(),
                     job_defaults: job.defaults.as_ref(),
+                    step_outputs: &step_outputs_map,
                 },
-            )
-            .await?;
+            ),
+        )
+        .await
+        {
+            Ok(result) => result?,
+            Err(_) => {
+                wrkflw_logging::error(&format!(
+                    "Job '{}' exceeded timeout of {} minutes",
+                    ctx.job_name, timeout_mins
+                ));
+                job_success = false;
+                break;
+            }
+        };
 
-            match outcome {
-                StepOutcome::Skipped(result) => {
-                    step_results.push(result);
+        match outcome {
+            StepOutcome::Skipped(result) => {
+                step_results.push(result);
+            }
+            StepOutcome::Completed { result, abort_job } => {
+                // Add step output to logs only in verbose mode or if there's an error
+                if ctx.verbose || result.status == StepStatus::Failure {
+                    job_logs.push_str(&format!(
+                        "\n=== Output from step '{}' ===\n{}\n=== End output ===\n\n",
+                        result.name, result.output
+                    ));
+                } else {
+                    job_logs.push_str(&format!(
+                        "Step '{}' completed with status: {:?}\n",
+                        result.name, result.status
+                    ));
                 }
-                StepOutcome::Completed { result, abort_job } => {
-                    // Add step output to logs only in verbose mode or if there's an error
-                    if ctx.verbose || result.status == StepStatus::Failure {
-                        job_logs.push_str(&format!(
-                            "\n=== Output from step '{}' ===\n{}\n=== End output ===\n\n",
-                            result.name, result.output
-                        ));
+
+                step_results.push(result);
+
+                // Post-step: read back environment files written by the step
+                let updates = crate::github_env_files::read_step_environment_updates(&job_env);
+
+                // Store step outputs keyed by step ID for ${{ steps.<id>.outputs.<key> }}
+                if let Some(ref step_id) = step.id {
+                    step_outputs_map.insert(step_id.clone(), updates.outputs);
+                }
+
+                // Merge GITHUB_ENV entries into job_env for subsequent steps
+                for (k, v) in updates.env_vars {
+                    job_env.insert(k, v);
+                }
+
+                // Prepend GITHUB_PATH entries to PATH for subsequent steps
+                if !updates.path_entries.is_empty() {
+                    let current_path = job_env.get("PATH").cloned().unwrap_or_default();
+                    let new_entries = updates.path_entries.join(":");
+                    let new_path = if current_path.is_empty() {
+                        new_entries
                     } else {
-                        job_logs.push_str(&format!(
-                            "Step '{}' completed with status: {:?}\n",
-                            result.name, result.status
-                        ));
-                    }
+                        format!("{}:{}", new_entries, current_path)
+                    };
+                    job_env.insert("PATH".to_string(), new_path);
+                }
 
-                    step_results.push(result);
+                // Clear GITHUB_OUTPUT for next step (per-step, not cumulative)
+                crate::github_env_files::clear_github_output(&job_env);
 
-                    if abort_job {
-                        job_success = false;
-                        break;
-                    }
+                if abort_job {
+                    job_success = false;
+                    break;
                 }
             }
-        }
-
-        Ok::<(), ExecutionError>(())
-    };
-
-    match tokio::time::timeout(job_timeout, step_loop).await {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => return Err(e),
-        Err(_) => {
-            wrkflw_logging::error(&format!(
-                "Job '{}' exceeded timeout of {} minutes",
-                ctx.job_name, timeout_mins
-            ));
-            return Ok(JobResult {
-                name: ctx.job_name.to_string(),
-                status: JobStatus::Failure,
-                steps: step_results,
-                logs: format!("{}\nJob timed out after {} minutes", job_logs, timeout_mins),
-            });
         }
     }
 
@@ -1946,6 +1985,7 @@ async fn execute_matrix_job(
         let runner_image_value = resolve_runner_image(job_template, runtime).await?;
 
         let mut all_steps_ok = true;
+        let mut step_outputs_map: HashMap<String, HashMap<String, String>> = HashMap::new();
         for (idx, step) in job_template.steps.iter().enumerate() {
             let outcome = run_step_with_guards(
                 step,
@@ -1967,6 +2007,7 @@ async fn execute_matrix_job(
                     container_config: job_template.container.as_ref(),
                     workflow_defaults: workflow.defaults.as_ref(),
                     job_defaults: job_template.defaults.as_ref(),
+                    step_outputs: &step_outputs_map,
                 },
             )
             .await?;
@@ -1988,6 +2029,30 @@ async fn execute_matrix_job(
                     }
 
                     step_results.push(result);
+
+                    // Post-step: read back environment files written by the step
+                    let updates = crate::github_env_files::read_step_environment_updates(&job_env);
+
+                    if let Some(ref step_id) = step.id {
+                        step_outputs_map.insert(step_id.clone(), updates.outputs);
+                    }
+
+                    for (k, v) in updates.env_vars {
+                        job_env.insert(k, v);
+                    }
+
+                    if !updates.path_entries.is_empty() {
+                        let current_path = job_env.get("PATH").cloned().unwrap_or_default();
+                        let new_entries = updates.path_entries.join(":");
+                        let new_path = if current_path.is_empty() {
+                            new_entries
+                        } else {
+                            format!("{}:{}", new_entries, current_path)
+                        };
+                        job_env.insert("PATH".to_string(), new_path);
+                    }
+
+                    crate::github_env_files::clear_github_output(&job_env);
 
                     if abort_job {
                         all_steps_ok = false;
@@ -2047,6 +2112,7 @@ async fn run_step_with_guards(
                 name: step_name,
                 status: StepStatus::Skipped,
                 output: format!("Skipped due to condition: {}", if_cond),
+                outputs: HashMap::new(),
             }));
         }
     }
@@ -2066,6 +2132,7 @@ async fn run_step_with_guards(
                     name: step_name.clone(),
                     status: StepStatus::Failure,
                     output: format!("Step timed out after {} minutes", minutes),
+                    outputs: HashMap::new(),
                 })
             }
         }
@@ -2101,6 +2168,7 @@ async fn run_step_with_guards(
                         name: step_name,
                         status: StepStatus::Failure,
                         output: format!("Error: {}", e),
+                        outputs: HashMap::new(),
                     },
                     abort_job: false,
                 })
@@ -2110,6 +2178,7 @@ async fn run_step_with_guards(
                         name: step_name,
                         status: StepStatus::Failure,
                         output: format!("Error: {}", e),
+                        outputs: HashMap::new(),
                     },
                     abort_job: true,
                 })
@@ -2148,6 +2217,7 @@ struct StepExecutionContext<'a> {
     container_config: Option<&'a JobContainer>,
     workflow_defaults: Option<&'a workflow::Defaults>,
     job_defaults: Option<&'a workflow::Defaults>,
+    step_outputs: &'a HashMap<String, HashMap<String, String>>,
 }
 
 async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, ExecutionError> {
@@ -2232,6 +2302,7 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                 name: step_name,
                 status: StepStatus::Success,
                 output,
+                outputs: HashMap::new(),
             }
         } else {
             // Get action info
@@ -2355,6 +2426,7 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                                 name: step_name,
                                 status: StepStatus::Success,
                                 output: format!("Using system Rust: {}", rustc_version.trim()),
+                                outputs: HashMap::new(),
                             });
                         }
 
@@ -2437,6 +2509,7 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                                                     StepStatus::Failure
                                                 },
                                                 output: format!("{}\n{}", stdout, stderr),
+                                                outputs: HashMap::new(),
                                             });
                                         }
                                         Err(e) => {
@@ -2444,6 +2517,7 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                                                 name: step_name,
                                                 status: StepStatus::Failure,
                                                 output: format!("Failed to execute command: {}", e),
+                                                outputs: HashMap::new(),
                                             });
                                         }
                                     }
@@ -2678,6 +2752,7 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                             name: step_name,
                             status: StepStatus::Failure,
                             output: format!("{}\n{}", output_text, error_details),
+                            outputs: HashMap::new(),
                         });
                     }
 
@@ -2692,6 +2767,7 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                             "Exit code: {}\n{}\n{}",
                             output.exit_code, output.stdout, output.stderr
                         ),
+                        outputs: HashMap::new(),
                     }
                 }
             }
@@ -2712,6 +2788,7 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                         name: step_name,
                         status: StepStatus::Failure,
                         output: format!("Secret substitution failed: {}", e),
+                        outputs: HashMap::new(),
                     });
                 }
             }
@@ -2719,11 +2796,13 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
             run.clone()
         };
 
-        // Resolve expression substitutions (hashFiles, matrix vars)
+        // Resolve expression substitutions (hashFiles, step outputs, env, matrix vars)
         let resolved_run = match crate::substitution::preprocess_expressions(
             &resolved_run,
             ctx.working_dir,
             ctx.matrix_combination,
+            ctx.step_outputs,
+            ctx.job_env,
         ) {
             Ok(r) => r,
             Err(e) => {
@@ -2731,6 +2810,7 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                     name: step_name,
                     status: StepStatus::Failure,
                     output: format!("Expression substitution failed: {}", e),
+                    outputs: HashMap::new(),
                 });
             }
         };
@@ -2812,6 +2892,7 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                         "Invalid working-directory '{}': must be within workspace",
                         wd
                     ),
+                    outputs: HashMap::new(),
                 });
             }
             normalized
@@ -2901,12 +2982,14 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
             name: step_name,
             status,
             output,
+            outputs: HashMap::new(),
         }
     } else {
         return Ok(StepResult {
             name: step_name,
             status: StepStatus::Skipped,
             output: "Step has neither 'uses' nor 'run'".to_string(),
+            outputs: HashMap::new(),
         });
     };
 
@@ -3482,6 +3565,7 @@ async fn execute_reusable_workflow_job(
                     StepStatus::Success
                 },
                 output: logs.clone(),
+                outputs: HashMap::new(),
             };
 
             return Ok(JobResult {
@@ -3556,6 +3640,7 @@ async fn execute_reusable_workflow_job(
             StepStatus::Success
         },
         output: logs.clone(),
+        outputs: HashMap::new(),
     };
 
     Ok(JobResult {
@@ -3733,6 +3818,7 @@ async fn execute_composite_action(
                     container_config: None, // Composite actions don't use job containers
                     workflow_defaults: None,
                     job_defaults: None,
+                    step_outputs: &HashMap::new(),
                 }))
                 .await?;
 
@@ -3748,6 +3834,7 @@ async fn execute_composite_action(
                             .unwrap_or_else(|| "Composite Action".to_string()),
                         status: StepStatus::Failure,
                         output: step_outputs.join("\n"),
+                        outputs: HashMap::new(),
                     });
                 }
             }
@@ -3797,6 +3884,7 @@ async fn execute_composite_action(
                     .unwrap_or_else(|| "Composite Action".to_string()),
                 status: StepStatus::Success,
                 output,
+                outputs: HashMap::new(),
             })
         }
         _ => Err(ExecutionError::Execution(
@@ -4910,6 +4998,7 @@ runs:
             container_config: None,
             workflow_defaults: None,
             job_defaults: None,
+            step_outputs: &HashMap::new(),
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -4958,6 +5047,7 @@ runs:
             container_config: None,
             workflow_defaults: None,
             job_defaults: None,
+            step_outputs: &HashMap::new(),
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -5011,6 +5101,7 @@ runs:
             container_config: None,
             workflow_defaults: None,
             job_defaults: None,
+            step_outputs: &HashMap::new(),
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -5057,6 +5148,7 @@ runs:
             container_config: None,
             workflow_defaults: None,
             job_defaults: None,
+            step_outputs: &HashMap::new(),
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -5104,6 +5196,7 @@ runs:
             container_config: None,
             workflow_defaults: None,
             job_defaults: None,
+            step_outputs: &HashMap::new(),
         };
 
         let result = execute_step(ctx).await;
@@ -5150,6 +5243,7 @@ runs:
             container_config: None,
             workflow_defaults: None,
             job_defaults: None,
+            step_outputs: &HashMap::new(),
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -5194,6 +5288,7 @@ runs:
             container_config: None,
             workflow_defaults: None,
             job_defaults: None,
+            step_outputs: &HashMap::new(),
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -5730,6 +5825,7 @@ runs:
             container_config: None,
             workflow_defaults: None,
             job_defaults: None,
+            step_outputs: &HashMap::new(),
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -5774,6 +5870,7 @@ runs:
             container_config: None,
             workflow_defaults: None,
             job_defaults: None,
+            step_outputs: &HashMap::new(),
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -5814,6 +5911,7 @@ runs:
             container_config: None,
             workflow_defaults: None,
             job_defaults: None,
+            step_outputs: &HashMap::new(),
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -5846,6 +5944,7 @@ runs:
             container_config: None,
             workflow_defaults: None,
             job_defaults: None,
+            step_outputs: &HashMap::new(),
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -5880,6 +5979,7 @@ runs:
             container_config: None,
             workflow_defaults: None,
             job_defaults: None,
+            step_outputs: &HashMap::new(),
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -5925,6 +6025,7 @@ runs:
             container_config: None,
             workflow_defaults: Some(&workflow_defaults),
             job_defaults: Some(&job_defaults),
+            step_outputs: &HashMap::new(),
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -5968,6 +6069,7 @@ runs:
             container_config: None,
             workflow_defaults: None,
             job_defaults: Some(&job_defaults),
+            step_outputs: &HashMap::new(),
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -6011,6 +6113,7 @@ runs:
             container_config: None,
             workflow_defaults: Some(&workflow_defaults),
             job_defaults: None,
+            step_outputs: &HashMap::new(),
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -6052,6 +6155,7 @@ runs:
             container_config: None,
             workflow_defaults: None,
             job_defaults: Some(&job_defaults),
+            step_outputs: &HashMap::new(),
         };
 
         let result = execute_step(ctx).await.unwrap();

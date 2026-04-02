@@ -1,0 +1,27 @@
+name: Multi-runtime Test
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  laravel-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: shivammathur/setup-php@v2
+        with:
+          php: "8.2"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Validate composer.json
+        run: composer validate
+      - name: Install PHP dependencies
+        run: composer install --no-interaction --no-scripts --no-progress --prefer-dist
+      - name: Install Node dependencies
+        run: npm install
+      - name: Check PHP version
+        run: php --version
+      - name: Check Node version
+        run: node --version

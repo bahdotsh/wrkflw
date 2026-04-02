@@ -684,8 +684,10 @@ impl ContainerRuntime for DockerRuntime {
         tag: &str,
         context_dir: &Path,
     ) -> Result<(), ContainerError> {
-        // Add a timeout for build operations
-        let timeout_duration = std::time::Duration::from_secs(120); // 2 minutes timeout for builds
+        // Add a timeout for build operations.
+        // Combined runtime images (e.g., PHP + Node.js) may need to install
+        // packages from PPAs and external sources, so allow up to 10 minutes.
+        let timeout_duration = std::time::Duration::from_secs(600);
 
         match tokio::time::timeout(
             timeout_duration,
@@ -696,8 +698,9 @@ impl ContainerRuntime for DockerRuntime {
             Ok(result) => result,
             Err(_) => {
                 wrkflw_logging::error(&format!(
-                    "Building image {} timed out after 120 seconds",
-                    tag
+                    "Building image {} timed out after {} seconds",
+                    tag,
+                    timeout_duration.as_secs()
                 ));
                 Err(ContainerError::ImageBuild(
                     "Operation timed out".to_string(),
@@ -853,12 +856,15 @@ impl DockerRuntime {
         volumes: &[(&Path, &Path)],
         entrypoint: Option<&str>,
     ) -> Result<ContainerOutput, ContainerError> {
-        // First, try to pull the image if it's not available locally
-        if let Err(e) = self.pull_image_inner(image).await {
-            wrkflw_logging::warning(&format!(
-                "Failed to pull image {}: {}. Attempting to continue with existing image.",
-                image, e
-            ));
+        // Try to pull the image if it's not available locally.
+        // Skip pull for locally-built images (e.g., wrkflw-combined:*).
+        if !image.starts_with("wrkflw-") {
+            if let Err(e) = self.pull_image_inner(image).await {
+                wrkflw_logging::warning(&format!(
+                    "Failed to pull image {}: {}. Attempting to continue with existing image.",
+                    image, e
+                ));
+            }
         }
 
         // Collect environment variables

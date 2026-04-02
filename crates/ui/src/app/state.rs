@@ -695,12 +695,10 @@ impl App {
         if let Some(idx) = self.workflow_list_state.selected() {
             if idx < self.workflows.len() {
                 self.workflows[idx].selected = true;
-                if !self.execution_queue.iter().any(|e| e.workflow_idx == idx) {
-                    self.execution_queue.push(QueuedExecution {
-                        workflow_idx: idx,
-                        target_job,
-                    });
-                }
+                self.execution_queue.push(QueuedExecution {
+                    workflow_idx: idx,
+                    target_job,
+                });
             }
         }
 
@@ -1150,5 +1148,180 @@ impl App {
         let timestamp = Local::now().format("%H:%M:%S").to_string();
         let formatted_message = format!("[{}] {}", timestamp, message);
         self.add_log(formatted_message);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn make_app() -> App {
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(RuntimeType::Emulation, tx, false, false);
+        app.workflows = vec![
+            Workflow {
+                name: "ci".to_string(),
+                path: PathBuf::from("ci.yml"),
+                selected: false,
+                status: WorkflowStatus::NotStarted,
+                execution_details: None,
+                job_names: vec!["build".to_string(), "lint".to_string(), "test".to_string()],
+            },
+            Workflow {
+                name: "deploy".to_string(),
+                path: PathBuf::from("deploy.yml"),
+                selected: false,
+                status: WorkflowStatus::NotStarted,
+                execution_details: None,
+                job_names: vec![],
+            },
+        ];
+        app.workflow_list_state.select(Some(0));
+        app
+    }
+
+    #[test]
+    fn enter_job_selection_mode_populates_jobs() {
+        let mut app = make_app();
+        app.enter_job_selection_mode();
+
+        assert!(app.job_selection_mode);
+        assert_eq!(app.available_jobs, vec!["build", "lint", "test"]);
+        assert_eq!(app.selected_job_index, 0);
+    }
+
+    #[test]
+    fn enter_job_selection_mode_no_jobs_stays_in_normal_mode() {
+        let mut app = make_app();
+        app.workflow_list_state.select(Some(1)); // deploy has no jobs
+        app.enter_job_selection_mode();
+
+        assert!(!app.job_selection_mode);
+        assert!(app.available_jobs.is_empty());
+    }
+
+    #[test]
+    fn exit_job_selection_mode_clears_state() {
+        let mut app = make_app();
+        app.enter_job_selection_mode();
+        app.selected_job_index = 2;
+        app.exit_job_selection_mode();
+
+        assert!(!app.job_selection_mode);
+        assert!(app.available_jobs.is_empty());
+        assert_eq!(app.selected_job_index, 0);
+    }
+
+    #[test]
+    fn next_available_job_wraps_around() {
+        let mut app = make_app();
+        app.enter_job_selection_mode();
+
+        app.next_available_job(); // 0 -> 1
+        assert_eq!(app.selected_job_index, 1);
+        app.next_available_job(); // 1 -> 2
+        assert_eq!(app.selected_job_index, 2);
+        app.next_available_job(); // 2 -> 0 (wrap)
+        assert_eq!(app.selected_job_index, 0);
+    }
+
+    #[test]
+    fn previous_available_job_wraps_around() {
+        let mut app = make_app();
+        app.enter_job_selection_mode();
+
+        app.previous_available_job(); // 0 -> 2 (wrap)
+        assert_eq!(app.selected_job_index, 2);
+        app.previous_available_job(); // 2 -> 1
+        assert_eq!(app.selected_job_index, 1);
+        app.previous_available_job(); // 1 -> 0
+        assert_eq!(app.selected_job_index, 0);
+    }
+
+    #[test]
+    fn navigate_jobs_noop_when_empty() {
+        let mut app = make_app();
+        // Don't enter job selection mode — available_jobs is empty
+        app.next_available_job();
+        assert_eq!(app.selected_job_index, 0);
+        app.previous_available_job();
+        assert_eq!(app.selected_job_index, 0);
+    }
+
+    #[test]
+    fn run_from_job_selection_queues_with_target_job() {
+        let mut app = make_app();
+        app.enter_job_selection_mode();
+        app.run_from_job_selection(Some("build".to_string()));
+
+        assert!(!app.job_selection_mode);
+        assert!(app.available_jobs.is_empty());
+        assert_eq!(app.execution_queue.len(), 1);
+        assert_eq!(app.execution_queue[0].workflow_idx, 0);
+        assert_eq!(app.execution_queue[0].target_job, Some("build".to_string()));
+    }
+
+    #[test]
+    fn run_from_job_selection_none_queues_all_jobs() {
+        let mut app = make_app();
+        app.enter_job_selection_mode();
+        app.run_from_job_selection(None);
+
+        assert_eq!(app.execution_queue.len(), 1);
+        assert_eq!(app.execution_queue[0].target_job, None);
+    }
+
+    #[test]
+    fn run_from_job_selection_allows_same_workflow_different_jobs() {
+        let mut app = make_app();
+
+        app.enter_job_selection_mode();
+        app.run_from_job_selection(Some("build".to_string()));
+
+        // Drain the queue to simulate the executor consuming it
+        app.execution_queue.clear();
+        app.current_execution = None;
+        app.running = false;
+
+        app.enter_job_selection_mode();
+        app.run_from_job_selection(Some("test".to_string()));
+
+        assert_eq!(app.execution_queue.len(), 1);
+        assert_eq!(app.execution_queue[0].target_job, Some("test".to_string()));
+    }
+
+    #[test]
+    fn get_next_workflow_to_execute_threads_target_job() {
+        let mut app = make_app();
+        app.execution_queue.push(QueuedExecution {
+            workflow_idx: 0,
+            target_job: Some("lint".to_string()),
+        });
+
+        let result = app.get_next_workflow_to_execute();
+        assert!(result.is_some());
+        let (idx, target) = result.unwrap();
+        assert_eq!(idx, 0);
+        assert_eq!(target, Some("lint".to_string()));
+        assert!(app.execution_queue.is_empty());
+    }
+
+    #[test]
+    fn get_next_workflow_to_execute_returns_none_when_empty() {
+        let mut app = make_app();
+        assert!(app.get_next_workflow_to_execute().is_none());
+    }
+
+    #[test]
+    fn single_job_navigation_wraps_correctly() {
+        let mut app = make_app();
+        app.available_jobs = vec!["only-job".to_string()];
+        app.selected_job_index = 0;
+
+        app.next_available_job(); // 0 -> 0 (only one item)
+        assert_eq!(app.selected_job_index, 0);
+        app.previous_available_job(); // 0 -> 0
+        assert_eq!(app.selected_job_index, 0);
     }
 }

@@ -66,13 +66,15 @@ pub async fn run_wrkflw_tui(
                 .to_string_lossy()
                 .into_owned();
 
+            let job_names = crate::utils::extract_job_names(path);
+
             app.workflows = vec![Workflow {
                 name: name.clone(),
                 path: path.clone(),
                 selected: true,
                 status: WorkflowStatus::NotStarted,
                 execution_details: None,
-                job_names: Vec::new(),
+                job_names,
             }];
 
             // Queue the single workflow for execution

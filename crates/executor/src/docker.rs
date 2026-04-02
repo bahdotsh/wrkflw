@@ -685,9 +685,15 @@ impl ContainerRuntime for DockerRuntime {
         context_dir: &Path,
     ) -> Result<(), ContainerError> {
         // Add a timeout for build operations.
-        // Combined runtime images (e.g., PHP + Node.js) may need to install
+        // Combined runtime images (wrkflw-combined:*) may need to install
         // packages from PPAs and external sources, so allow up to 10 minutes.
-        let timeout_duration = std::time::Duration::from_secs(600);
+        // Other builds use a 2 minute timeout.
+        let timeout_secs = if tag.starts_with("wrkflw-combined:") {
+            600
+        } else {
+            120
+        };
+        let timeout_duration = std::time::Duration::from_secs(timeout_secs);
 
         match tokio::time::timeout(
             timeout_duration,

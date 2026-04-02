@@ -1158,6 +1158,8 @@ impl DockerRuntime {
         // repo is unexpectedly large and has no .dockerignore.
         const MAX_CONTEXT_BYTES: u64 = 500 * 1024 * 1024;
 
+        // TODO: For large build contexts (approaching MAX_CONTEXT_BYTES), consider
+        // streaming the tar to a temporary file instead of holding it all in memory.
         let tar_buffer = {
             let mut tar_builder = tar::Builder::new(Vec::new());
 

@@ -805,6 +805,96 @@ async fn prepare_action(
     Ok(PreparedAction::Image(image))
 }
 
+/// Execute a `NativeDocker` action step.
+///
+/// Handles `with.args` / `with.entrypoint` overrides, INPUT_* env injection,
+/// volume setup, and container invocation.
+async fn execute_native_docker_step(
+    ctx: &StepExecutionContext<'_>,
+    step_env: &mut HashMap<String, String>,
+    step_name: String,
+    uses: &str,
+    image: String,
+    entrypoint: Option<String>,
+    args: Vec<String>,
+) -> Result<StepResult, ExecutionError> {
+    // Convert 'with' parameters to INPUT_* environment variables.
+    // Also extract 'with.args' — if provided by the workflow step, it
+    // overrides the action.yml's runs.args as the container CMD
+    // (this matches GitHub Actions behavior).
+    let mut with_args_override: Option<String> = None;
+    // Allow workflow step to override entrypoint via `with.entrypoint`,
+    // matching GitHub Actions behavior.
+    let mut entrypoint = entrypoint;
+    if let Some(with_params) = &ctx.step.with {
+        for (key, value) in with_params {
+            step_env.insert(format!("INPUT_{}", key.to_uppercase()), value.clone());
+        }
+        // Presence of the key is the override signal — even an empty
+        // string means "pass zero args", matching GitHub Actions behavior.
+        if let Some(a) = with_params.get("args") {
+            with_args_override = Some(a.clone());
+        }
+        if let Some(ep) = with_params.get("entrypoint") {
+            entrypoint = Some(ep.clone());
+        }
+    }
+
+    let container_workspace = Path::new("/github/workspace");
+    let mount_ctx = prepare_step_container_context(step_env, ctx.job_env, ctx.container_config);
+    let volumes = mount_ctx.build_volumes(ctx.working_dir, container_workspace);
+    let env_vars: Vec<(&str, &str)> = step_env
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+
+    wrkflw_logging::info(&format!(
+        "Running Docker action '{}' with image '{}'",
+        uses, image
+    ));
+
+    // Determine container CMD: workflow `with.args` overrides action.yml `runs.args`.
+    // If neither is specified, the image's built-in CMD takes effect.
+    let effective_args: Vec<String> = if let Some(ref wa) = with_args_override {
+        shlex::split(wa).ok_or_else(|| {
+            ExecutionError::Execution(format!(
+                "Failed to parse 'with.args' for action '{}': \
+                 unmatched quote in {:?}",
+                uses, wa
+            ))
+        })?
+    } else {
+        args
+    };
+    let args_refs: Vec<&str> = effective_args.iter().map(|s| s.as_str()).collect();
+
+    let output = ctx
+        .runtime
+        .run_container(
+            &image,
+            &args_refs,
+            &env_vars,
+            container_workspace,
+            &volumes,
+            entrypoint.as_deref(),
+        )
+        .await
+        .map_err(|e| ExecutionError::Runtime(format!("{}", e)))?;
+
+    Ok(StepResult {
+        name: step_name,
+        status: if output.exit_code == 0 {
+            StepStatus::Success
+        } else {
+            StepStatus::Failure
+        },
+        output: format!(
+            "Exit code: {}\n{}\n{}",
+            output.exit_code, output.stdout, output.stderr
+        ),
+    })
+}
+
 /// Sanitize a sub-path component from an action reference (e.g. `owner/repo/sub/path`).
 ///
 /// Rejects any path component that is exactly `..` to prevent directory
@@ -1785,88 +1875,16 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                     entrypoint,
                     args,
                 } => {
-                    // Docker action: run with the image's built-in entrypoint,
-                    // optionally overridden by runs.entrypoint / runs.args from action.yml.
-
-                    // Convert 'with' parameters to INPUT_* environment variables.
-                    // Also extract 'with.args' — if provided by the workflow step, it
-                    // overrides the action.yml's runs.args as the container CMD
-                    // (this matches GitHub Actions behavior).
-                    let mut with_args_override: Option<String> = None;
-                    // Allow workflow step to override entrypoint via `with.entrypoint`,
-                    // matching GitHub Actions behavior.
-                    let mut entrypoint = entrypoint;
-                    if let Some(with_params) = &ctx.step.with {
-                        for (key, value) in with_params {
-                            step_env.insert(format!("INPUT_{}", key.to_uppercase()), value.clone());
-                        }
-                        // Presence of the key is the override signal — even an empty
-                        // string means "pass zero args", matching GitHub Actions behavior.
-                        if let Some(a) = with_params.get("args") {
-                            with_args_override = Some(a.clone());
-                        }
-                        if let Some(ep) = with_params.get("entrypoint") {
-                            entrypoint = Some(ep.clone());
-                        }
-                    }
-
-                    let container_workspace = Path::new("/github/workspace");
-                    let mount_ctx = prepare_step_container_context(
+                    execute_native_docker_step(
+                        &ctx,
                         &mut step_env,
-                        ctx.job_env,
-                        ctx.container_config,
-                    );
-                    let volumes = mount_ctx.build_volumes(ctx.working_dir, container_workspace);
-                    let env_vars: Vec<(&str, &str)> = step_env
-                        .iter()
-                        .map(|(k, v)| (k.as_str(), v.as_str()))
-                        .collect();
-
-                    wrkflw_logging::info(&format!(
-                        "Running Docker action '{}' with image '{}'",
-                        uses, image
-                    ));
-
-                    // Determine container CMD: workflow `with.args` overrides action.yml `runs.args`.
-                    // If neither is specified, the image's built-in CMD takes effect.
-                    let effective_args: Vec<String> = if let Some(ref wa) = with_args_override {
-                        shlex::split(wa).ok_or_else(|| {
-                            ExecutionError::Execution(format!(
-                                "Failed to parse 'with.args' for action '{}': \
-                                 unmatched quote in {:?}",
-                                uses, wa
-                            ))
-                        })?
-                    } else {
-                        args
-                    };
-                    let args_refs: Vec<&str> = effective_args.iter().map(|s| s.as_str()).collect();
-
-                    let output = ctx
-                        .runtime
-                        .run_container(
-                            &image,
-                            &args_refs,
-                            &env_vars,
-                            container_workspace,
-                            &volumes,
-                            entrypoint.as_deref(),
-                        )
-                        .await
-                        .map_err(|e| ExecutionError::Runtime(format!("{}", e)))?;
-
-                    StepResult {
-                        name: step_name,
-                        status: if output.exit_code == 0 {
-                            StepStatus::Success
-                        } else {
-                            StepStatus::Failure
-                        },
-                        output: format!(
-                            "Exit code: {}\n{}\n{}",
-                            output.exit_code, output.stdout, output.stderr
-                        ),
-                    }
+                        step_name,
+                        uses,
+                        image,
+                        entrypoint,
+                        args,
+                    )
+                    .await?
                 }
                 PreparedAction::Image(image) => {
                     // Build command for Docker action

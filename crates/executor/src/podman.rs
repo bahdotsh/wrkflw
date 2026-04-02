@@ -734,7 +734,7 @@ impl PodmanRuntime {
 
         // Override entrypoint if specified by action.yml
         let ep_string;
-        if let Some(ep) = entrypoint {
+        if let Some(ep) = entrypoint.filter(|s| !s.is_empty()) {
             ep_string = ep.to_string();
             args.push("--entrypoint");
             args.push(&ep_string);

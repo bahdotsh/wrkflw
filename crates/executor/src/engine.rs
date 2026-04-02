@@ -221,10 +221,16 @@ async fn execute_gitlab_pipeline(
     // 3. Resolve job dependencies based on stages
     let execution_plan = resolve_gitlab_dependencies(&pipeline, &workflow)?;
 
-    // Filter to target job and its transitive dependencies if specified
+    // Filter to target job and its stage-based dependencies if specified.
+    // GitLab uses stages for implicit ordering, so we keep all earlier stages.
     let execution_plan = if let Some(ref target_job) = config.target_job {
-        dependency::filter_plan_to_job(execution_plan, target_job, &workflow.jobs, "pipeline")
-            .map_err(ExecutionError::Execution)?
+        dependency::filter_plan_to_job_by_stage(
+            execution_plan,
+            target_job,
+            &workflow.jobs,
+            "pipeline",
+        )
+        .map_err(ExecutionError::Execution)?
     } else {
         execution_plan
     };

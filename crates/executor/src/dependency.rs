@@ -154,18 +154,7 @@ pub fn filter_plan_to_job(
     kind: &str,
 ) -> Result<Vec<Vec<String>>, String> {
     if !jobs.contains_key(target_job) {
-        let mut available: Vec<&String> = jobs.keys().collect();
-        available.sort();
-        return Err(format!(
-            "Job '{}' not found in {}. Available jobs: {}",
-            target_job,
-            kind,
-            available
-                .iter()
-                .map(|s| s.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
+        return Err(job_not_found_error(target_job, jobs, kind));
     }
 
     let needed = collect_transitive_deps(target_job, jobs);
@@ -180,6 +169,52 @@ pub fn filter_plan_to_job(
         })
         .filter(|batch| !batch.is_empty())
         .collect())
+}
+
+/// Filter a stage-ordered execution plan to only include the target job and all
+/// jobs in preceding stages (implicit dependencies). This is appropriate for
+/// GitLab CI/CD where stage ordering defines implicit dependencies — all jobs in
+/// earlier stages must complete before later stages run.
+///
+/// In the target job's own stage batch, only the target job is kept; all earlier
+/// stage batches are preserved in full.
+pub fn filter_plan_to_job_by_stage(
+    plan: Vec<Vec<String>>,
+    target_job: &str,
+    jobs: &HashMap<String, Job>,
+    kind: &str,
+) -> Result<Vec<Vec<String>>, String> {
+    if !jobs.contains_key(target_job) {
+        return Err(job_not_found_error(target_job, jobs, kind));
+    }
+
+    let mut result = Vec::new();
+    for batch in plan {
+        if batch.contains(&target_job.to_string()) {
+            // Target's stage: only keep the target job itself
+            result.push(vec![target_job.to_string()]);
+            break;
+        }
+        // Earlier stage: keep all jobs (implicit dependencies)
+        result.push(batch);
+    }
+
+    Ok(result)
+}
+
+fn job_not_found_error(target_job: &str, jobs: &HashMap<String, Job>, kind: &str) -> String {
+    let mut available: Vec<&String> = jobs.keys().collect();
+    available.sort();
+    format!(
+        "Job '{}' not found in {}. Available jobs: {}",
+        target_job,
+        kind,
+        available
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
 }
 
 #[cfg(test)]
@@ -345,5 +380,128 @@ mod tests {
 
         let filtered = filter_plan_to_job(plan, "a", &jobs, "workflow").unwrap();
         assert_eq!(filtered, vec![vec!["a".to_string()]]);
+    }
+
+    // --- filter_plan_to_job_by_stage tests (GitLab stage-based filtering) ---
+
+    #[test]
+    fn test_filter_by_stage_not_found() {
+        let jobs = HashMap::new();
+        let plan = vec![vec!["a".to_string()]];
+
+        let result = filter_plan_to_job_by_stage(plan, "missing", &jobs, "pipeline");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("missing"));
+        assert!(err.contains("pipeline"));
+    }
+
+    #[test]
+    fn test_filter_by_stage_target_in_first_stage() {
+        let mut jobs = HashMap::new();
+        jobs.insert("build".to_string(), job_with_needs(None));
+        jobs.insert("lint".to_string(), job_with_needs(None));
+        jobs.insert("test".to_string(), job_with_needs(None));
+        jobs.insert("deploy".to_string(), job_with_needs(None));
+
+        // Stages: [build, lint] -> [test] -> [deploy]
+        let plan = vec![
+            vec!["build".to_string(), "lint".to_string()],
+            vec!["test".to_string()],
+            vec!["deploy".to_string()],
+        ];
+
+        let filtered = filter_plan_to_job_by_stage(plan, "build", &jobs, "pipeline").unwrap();
+        // Only the first stage, filtered to just "build"
+        assert_eq!(filtered, vec![vec!["build".to_string()]]);
+    }
+
+    #[test]
+    fn test_filter_by_stage_target_in_middle_stage() {
+        let mut jobs = HashMap::new();
+        jobs.insert("build".to_string(), job_with_needs(None));
+        jobs.insert("lint".to_string(), job_with_needs(None));
+        jobs.insert("test".to_string(), job_with_needs(None));
+        jobs.insert("deploy".to_string(), job_with_needs(None));
+
+        // Stages: [build, lint] -> [test] -> [deploy]
+        let plan = vec![
+            vec!["build".to_string(), "lint".to_string()],
+            vec!["test".to_string()],
+            vec!["deploy".to_string()],
+        ];
+
+        let filtered = filter_plan_to_job_by_stage(plan, "test", &jobs, "pipeline").unwrap();
+        // Keep all of stage 1, then just "test" from stage 2, drop stage 3
+        assert_eq!(
+            filtered,
+            vec![
+                vec!["build".to_string(), "lint".to_string()],
+                vec!["test".to_string()],
+            ]
+        );
+    }
+
+    #[test]
+    fn test_filter_by_stage_target_in_last_stage() {
+        let mut jobs = HashMap::new();
+        jobs.insert("build".to_string(), job_with_needs(None));
+        jobs.insert("test".to_string(), job_with_needs(None));
+        jobs.insert("deploy".to_string(), job_with_needs(None));
+
+        // Stages: [build] -> [test] -> [deploy]
+        let plan = vec![
+            vec!["build".to_string()],
+            vec!["test".to_string()],
+            vec!["deploy".to_string()],
+        ];
+
+        let filtered = filter_plan_to_job_by_stage(plan, "deploy", &jobs, "pipeline").unwrap();
+        assert_eq!(
+            filtered,
+            vec![
+                vec!["build".to_string()],
+                vec!["test".to_string()],
+                vec!["deploy".to_string()],
+            ]
+        );
+    }
+
+    #[test]
+    fn test_filter_by_stage_filters_peers_in_target_stage() {
+        let mut jobs = HashMap::new();
+        jobs.insert("a".to_string(), job_with_needs(None));
+        jobs.insert("b".to_string(), job_with_needs(None));
+        jobs.insert("c".to_string(), job_with_needs(None));
+
+        // All in same stage: [a, b, c]
+        let plan = vec![vec!["a".to_string(), "b".to_string(), "c".to_string()]];
+
+        let filtered = filter_plan_to_job_by_stage(plan, "b", &jobs, "pipeline").unwrap();
+        // Only the target job from its stage
+        assert_eq!(filtered, vec![vec!["b".to_string()]]);
+    }
+
+    #[test]
+    fn test_filter_by_stage_drops_later_stages() {
+        let mut jobs = HashMap::new();
+        jobs.insert("compile".to_string(), job_with_needs(None));
+        jobs.insert("unit_test".to_string(), job_with_needs(None));
+        jobs.insert("integration_test".to_string(), job_with_needs(None));
+        jobs.insert("deploy_staging".to_string(), job_with_needs(None));
+        jobs.insert("deploy_prod".to_string(), job_with_needs(None));
+
+        // Stages: [compile] -> [unit_test, integration_test] -> [deploy_staging, deploy_prod]
+        let plan = vec![
+            vec!["compile".to_string()],
+            vec!["unit_test".to_string(), "integration_test".to_string()],
+            vec!["deploy_staging".to_string(), "deploy_prod".to_string()],
+        ];
+
+        let filtered = filter_plan_to_job_by_stage(plan, "unit_test", &jobs, "pipeline").unwrap();
+        assert_eq!(
+            filtered,
+            vec![vec!["compile".to_string()], vec!["unit_test".to_string()],]
+        );
     }
 }

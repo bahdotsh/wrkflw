@@ -2,7 +2,7 @@
 mod state;
 
 use crate::handlers::workflow::start_next_workflow_execution;
-use crate::models::{ExecutionResultMsg, Workflow, WorkflowStatus};
+use crate::models::{ExecutionResultMsg, QueuedExecution, Workflow, WorkflowStatus};
 use crate::utils::load_workflows;
 use crate::views::render_ui;
 use chrono::Local;
@@ -72,10 +72,14 @@ pub async fn run_wrkflw_tui(
                 selected: true,
                 status: WorkflowStatus::NotStarted,
                 execution_details: None,
+                job_names: Vec::new(),
             }];
 
             // Queue the single workflow for execution
-            app.execution_queue = vec![0];
+            app.execution_queue = vec![QueuedExecution {
+                workflow_idx: 0,
+                target_job: None,
+            }];
             app.start_execution();
 
             // Return parent dir or current dir if no parent
@@ -301,10 +305,20 @@ fn run_tui_event_loop(
                                 if !app.running {
                                     if app.job_selection_mode {
                                         // In job selection mode, run the selected job
-                                        app.select_job_and_run();
+                                        if app.selected_job_index < app.available_jobs.len() {
+                                            let job_name =
+                                                app.available_jobs[app.selected_job_index].clone();
+                                            app.run_from_job_selection(Some(job_name));
+                                        }
                                     } else {
-                                        // Enter job selection mode for the selected workflow
-                                        app.enter_job_selection_mode();
+                                        // Run the selected workflow directly
+                                        if let Some(idx) = app.workflow_list_state.selected() {
+                                            if idx < app.workflows.len() {
+                                                app.workflows[idx].selected = true;
+                                                app.queue_selected_for_execution();
+                                                app.start_execution();
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -340,7 +354,7 @@ fn run_tui_event_loop(
                                     render_ui(f, app);
                                 })?;
                             }
-                        } else if !app.running {
+                        } else if !app.running && !app.job_selection_mode {
                             app.queue_selected_for_execution();
                             app.start_execution();
                         }
@@ -349,13 +363,19 @@ fn run_tui_event_loop(
                         if !app.running {
                             if app.job_selection_mode {
                                 // In job selection mode, run all jobs
-                                app.run_all_jobs();
+                                app.run_from_job_selection(None);
                             } else {
                                 // Select all workflows
                                 for workflow in &mut app.workflows {
                                     workflow.selected = true;
                                 }
                             }
+                        }
+                    }
+                    KeyCode::Char('J') => {
+                        // Enter job selection mode for selected workflow
+                        if !app.running && app.selected_tab == 0 && !app.job_selection_mode {
+                            app.enter_job_selection_mode();
                         }
                     }
                     KeyCode::Char('e') => {

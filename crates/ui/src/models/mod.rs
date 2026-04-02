@@ -13,6 +13,13 @@ pub struct Workflow {
     pub selected: bool,
     pub status: WorkflowStatus,
     pub execution_details: Option<WorkflowExecution>,
+    pub job_names: Vec<String>,
+}
+
+/// A workflow queued for execution, with its own target job
+pub struct QueuedExecution {
+    pub workflow_idx: usize,
+    pub target_job: Option<String>,
 }
 
 /// Status of a workflow

@@ -391,7 +391,7 @@ pub fn start_next_workflow_execution(
     tx_clone: &mpsc::Sender<ExecutionResultMsg>,
     verbose: bool,
 ) {
-    if let Some(next_idx) = app.get_next_workflow_to_execute() {
+    if let Some((next_idx, target_job)) = app.get_next_workflow_to_execute() {
         app.current_execution = Some(next_idx);
         let tx_clone_inner = tx_clone.clone();
         let workflow_path = app.workflows[next_idx].path.clone();
@@ -470,7 +470,6 @@ pub fn start_next_workflow_execution(
         let validation_mode = app.validation_mode;
         let preserve_containers_on_failure = app.preserve_containers_on_failure;
         let show_action_messages = app.show_action_messages;
-        let target_job = app.target_job.clone();
 
         // Update workflow status and add execution details
         app.workflows[next_idx].status = WorkflowStatus::Running;

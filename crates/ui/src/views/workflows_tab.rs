@@ -48,8 +48,10 @@ fn render_workflow_list(f: &mut Frame<CrosstermBackend<io::Stdout>>, app: &mut A
         )]),
         Line::from(vec![
             Span::styled("Space", Style::default().fg(Color::Cyan)),
-            Span::raw(": Toggle selection   "),
+            Span::raw(": Toggle   "),
             Span::styled("Enter", Style::default().fg(Color::Cyan)),
+            Span::raw(": Run   "),
+            Span::styled("J", Style::default().fg(Color::Cyan)),
             Span::raw(": Select jobs   "),
             Span::styled("t", Style::default().fg(Color::Cyan)),
             Span::raw(": Trigger remotely"),

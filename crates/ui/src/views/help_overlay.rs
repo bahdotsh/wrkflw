@@ -147,7 +147,7 @@ pub fn render_help_content(
         Line::from(""),
         Line::from(vec![
             Span::styled(
-                "Enter",
+                "Shift+J",
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),

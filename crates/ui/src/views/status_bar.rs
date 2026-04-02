@@ -150,16 +150,15 @@ pub fn render_status_bar(f: &mut Frame<CrosstermBackend<io::Stdout>>, app: &App,
                 if idx < app.workflows.len() {
                     let workflow = &app.workflows[idx];
                     match workflow.status {
-                        crate::models::WorkflowStatus::NotStarted => "[Space] Toggle selection   [Enter] Select jobs   [r] Run all selected   [t] Trigger Workflow  [Shift+R] Reset workflow".to_string(),
-                        crate::models::WorkflowStatus::Running => "[Space] Toggle selection   [Enter] Select jobs   [r] Run all selected   (Workflow running...)".to_string(),
-                        crate::models::WorkflowStatus::Success | crate::models::WorkflowStatus::Failed | crate::models::WorkflowStatus::Skipped => "[Space] Toggle selection   [Enter] Select jobs   [r] Run all selected   [Shift+R] Reset workflow".to_string(),
+                        crate::models::WorkflowStatus::NotStarted => "[Space] Toggle   [Enter] Run   [J] Select jobs   [r] Run selected   [t] Trigger   [Shift+R] Reset".to_string(),
+                        crate::models::WorkflowStatus::Running => "[Space] Toggle   [Enter] Run   [J] Select jobs   [r] Run selected   (Running...)".to_string(),
+                        crate::models::WorkflowStatus::Success | crate::models::WorkflowStatus::Failed | crate::models::WorkflowStatus::Skipped => "[Space] Toggle   [Enter] Run   [J] Select jobs   [r] Run selected   [Shift+R] Reset".to_string(),
                     }
                 } else {
-                    "[Space] Toggle selection   [Enter] Select jobs   [r] Run all selected"
-                        .to_string()
+                    "[Space] Toggle   [Enter] Run   [J] Select jobs   [r] Run selected".to_string()
                 }
             } else {
-                "[Space] Toggle selection   [Enter] Select jobs   [r] Run all selected".to_string()
+                "[Space] Toggle   [Enter] Run   [J] Select jobs   [r] Run selected".to_string()
             }
         }
         1 => {

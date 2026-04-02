@@ -377,7 +377,6 @@ pub async fn execute_curl_trigger(
             name: "Remote Trigger".to_string(),
             status: wrkflw_executor::StepStatus::Success,
             output: success_msg,
-            outputs: std::collections::HashMap::new(),
         }],
         logs: "Workflow triggered remotely on GitHub".to_string(),
     };
@@ -522,7 +521,6 @@ pub fn start_next_workflow_execution(
                                         wrkflw_executor::StepStatus::Failure
                                     },
                                     output: validation_result.issues.join("\n"),
-                                    outputs: std::collections::HashMap::new(),
                                 }],
                                 logs: format!(
                                     "Validation result: {}",

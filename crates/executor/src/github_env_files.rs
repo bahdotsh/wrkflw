@@ -178,6 +178,8 @@ pub fn apply_step_environment_updates(
 /// GITHUB_ENV and GITHUB_PATH are cumulative *on disk* in real GHA, but we read back
 /// and merge their contents into `job_env` after each step. To avoid re-processing
 /// the same entries on the next step, we truncate them here as well.
+/// GITHUB_STEP_SUMMARY is intentionally not cleared — in real GHA, step summaries are
+/// cumulative (each step appends to the same file).
 pub fn clear_step_files(job_env: &HashMap<String, String>) {
     for key in &["GITHUB_OUTPUT", "GITHUB_ENV", "GITHUB_PATH"] {
         if let Some(path) = job_env.get(*key) {

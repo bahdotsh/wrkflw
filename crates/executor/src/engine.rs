@@ -527,8 +527,6 @@ pub struct StepResult {
     pub name: String,
     pub status: StepStatus,
     pub output: String,
-    /// Parsed key-value outputs from GITHUB_OUTPUT file.
-    pub outputs: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -917,7 +915,6 @@ async fn execute_native_docker_step(
             "Exit code: {}\n{}\n{}",
             output.exit_code, output.stdout, output.stderr
         ),
-        outputs: HashMap::new(),
     })
 }
 
@@ -1730,16 +1727,7 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
     let job_deadline = tokio::time::Instant::now() + job_timeout;
 
     for (idx, step) in job.steps.iter().enumerate() {
-        // Check job-level timeout before each step
         let remaining = job_deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            wrkflw_logging::error(&format!(
-                "Job '{}' exceeded timeout of {} minutes",
-                ctx.job_name, timeout_mins
-            ));
-            job_success = false;
-            break;
-        }
 
         let outcome = match tokio::time::timeout(
             remaining,
@@ -1771,10 +1759,12 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
         {
             Ok(result) => result?,
             Err(_) => {
-                wrkflw_logging::error(&format!(
+                let msg = format!(
                     "Job '{}' exceeded timeout of {} minutes",
                     ctx.job_name, timeout_mins
-                ));
+                );
+                wrkflw_logging::error(&msg);
+                job_logs.push_str(&format!("\n{}\n", msg));
                 job_success = false;
                 break;
             }
@@ -2074,7 +2064,6 @@ async fn run_step_with_guards(
                 name: step_name,
                 status: StepStatus::Skipped,
                 output: format!("Skipped due to condition: {}", if_cond),
-                outputs: HashMap::new(),
             }));
         }
     }
@@ -2094,7 +2083,6 @@ async fn run_step_with_guards(
                     name: step_name.clone(),
                     status: StepStatus::Failure,
                     output: format!("Step timed out after {} minutes", minutes),
-                    outputs: HashMap::new(),
                 })
             }
         }
@@ -2130,7 +2118,6 @@ async fn run_step_with_guards(
                         name: step_name,
                         status: StepStatus::Failure,
                         output: format!("Error: {}", e),
-                        outputs: HashMap::new(),
                     },
                     abort_job: false,
                 })
@@ -2140,7 +2127,6 @@ async fn run_step_with_guards(
                         name: step_name,
                         status: StepStatus::Failure,
                         output: format!("Error: {}", e),
-                        outputs: HashMap::new(),
                     },
                     abort_job: true,
                 })
@@ -2264,7 +2250,6 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                 name: step_name,
                 status: StepStatus::Success,
                 output,
-                outputs: HashMap::new(),
             }
         } else {
             // Get action info
@@ -2388,7 +2373,6 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                                 name: step_name,
                                 status: StepStatus::Success,
                                 output: format!("Using system Rust: {}", rustc_version.trim()),
-                                outputs: HashMap::new(),
                             });
                         }
 
@@ -2471,7 +2455,6 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                                                     StepStatus::Failure
                                                 },
                                                 output: format!("{}\n{}", stdout, stderr),
-                                                outputs: HashMap::new(),
                                             });
                                         }
                                         Err(e) => {
@@ -2479,7 +2462,6 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                                                 name: step_name,
                                                 status: StepStatus::Failure,
                                                 output: format!("Failed to execute command: {}", e),
-                                                outputs: HashMap::new(),
                                             });
                                         }
                                     }
@@ -2714,7 +2696,6 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                             name: step_name,
                             status: StepStatus::Failure,
                             output: format!("{}\n{}", output_text, error_details),
-                            outputs: HashMap::new(),
                         });
                     }
 
@@ -2729,7 +2710,6 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                             "Exit code: {}\n{}\n{}",
                             output.exit_code, output.stdout, output.stderr
                         ),
-                        outputs: HashMap::new(),
                     }
                 }
             }
@@ -2750,7 +2730,6 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                         name: step_name,
                         status: StepStatus::Failure,
                         output: format!("Secret substitution failed: {}", e),
-                        outputs: HashMap::new(),
                     });
                 }
             }
@@ -2772,7 +2751,6 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                     name: step_name,
                     status: StepStatus::Failure,
                     output: format!("Expression substitution failed: {}", e),
-                    outputs: HashMap::new(),
                 });
             }
         };
@@ -2854,7 +2832,6 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                         "Invalid working-directory '{}': must be within workspace",
                         wd
                     ),
-                    outputs: HashMap::new(),
                 });
             }
             normalized
@@ -2944,14 +2921,12 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
             name: step_name,
             status,
             output,
-            outputs: HashMap::new(),
         }
     } else {
         return Ok(StepResult {
             name: step_name,
             status: StepStatus::Skipped,
             output: "Step has neither 'uses' nor 'run'".to_string(),
-            outputs: HashMap::new(),
         });
     };
 
@@ -3527,7 +3502,6 @@ async fn execute_reusable_workflow_job(
                     StepStatus::Success
                 },
                 output: logs.clone(),
-                outputs: HashMap::new(),
             };
 
             return Ok(JobResult {
@@ -3602,7 +3576,6 @@ async fn execute_reusable_workflow_job(
             StepStatus::Success
         },
         output: logs.clone(),
-        outputs: HashMap::new(),
     };
 
     Ok(JobResult {
@@ -3796,7 +3769,6 @@ async fn execute_composite_action(
                             .unwrap_or_else(|| "Composite Action".to_string()),
                         status: StepStatus::Failure,
                         output: step_outputs.join("\n"),
-                        outputs: HashMap::new(),
                     });
                 }
             }
@@ -3846,7 +3818,6 @@ async fn execute_composite_action(
                     .unwrap_or_else(|| "Composite Action".to_string()),
                 status: StepStatus::Success,
                 output,
-                outputs: HashMap::new(),
             })
         }
         _ => Err(ExecutionError::Execution(

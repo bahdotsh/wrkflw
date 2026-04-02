@@ -1104,58 +1104,33 @@ fn is_git_sha(git_ref: &str) -> bool {
     git_ref.len() == 40 && git_ref.chars().all(|c| c.is_ascii_hexdigit())
 }
 
-/// Determine the appropriate Docker image for a GitHub action
+/// Determine the appropriate Docker image for a GitHub action.
+///
+/// Setup actions (from the `SETUP_ACTIONS` table) use the act runner base image
+/// so that runtimes installed by the combined image build remain available.
+/// Other well-known actions use exact-match or namespace-prefix matching.
 fn determine_action_image(repository: &str) -> String {
-    // Handle specific well-known actions
+    // Known setup actions run on the base runner image; their runtimes are
+    // installed via resolve_runner_image's combined image build.
+    if SETUP_ACTIONS.iter().any(|d| d.repos.contains(&repository)) {
+        return "catthehacker/ubuntu:act-latest".to_string();
+    }
+
     match repository {
-        // PHP setup actions
-        repo if repo.starts_with("shivammathur/setup-php") => {
-            "composer:latest".to_string() // Use composer image which includes PHP and composer
-        }
-
-        // Python setup actions
-        repo if repo.starts_with("actions/setup-python") => "python:3.11-slim".to_string(),
-
-        // Node.js setup actions
-        repo if repo.starts_with("actions/setup-node") => "node:20-slim".to_string(),
-
-        // Java setup actions
-        repo if repo.starts_with("actions/setup-java") => "eclipse-temurin:17-jdk".to_string(),
-
-        // Go setup actions
-        repo if repo.starts_with("actions/setup-go") => "golang:1.21-slim".to_string(),
-
-        // .NET setup actions
-        repo if repo.starts_with("actions/setup-dotnet") => {
-            "mcr.microsoft.com/dotnet/sdk:7.0".to_string()
-        }
-
-        // Rust setup actions
-        repo if repo.starts_with("actions-rs/toolchain")
-            || repo.starts_with("dtolnay/rust-toolchain") =>
-        {
-            "rust:latest".to_string()
-        }
-
-        // Docker/container actions
+        // Docker/container actions (namespace prefix)
         repo if repo.starts_with("docker/") => "docker:latest".to_string(),
 
-        // AWS actions
+        // AWS actions (namespace prefix)
         repo if repo.starts_with("aws-actions/") => "amazon/aws-cli:latest".to_string(),
 
-        // Default to Node.js for most GitHub actions (checkout, upload-artifact, etc.)
-        _ => {
-            // Check if it's a common core GitHub action that should use a more complete environment
-            if repository.starts_with("actions/checkout")
-                || repository.starts_with("actions/upload-artifact")
-                || repository.starts_with("actions/download-artifact")
-                || repository.starts_with("actions/cache")
-            {
-                "catthehacker/ubuntu:act-latest".to_string() // Use act runner image for core actions
-            } else {
-                "node:20-slim".to_string() // Default for other actions
-            }
-        }
+        // Core GitHub actions that need a full environment
+        "actions/checkout"
+        | "actions/upload-artifact"
+        | "actions/download-artifact"
+        | "actions/cache" => "catthehacker/ubuntu:act-latest".to_string(),
+
+        // Default to Node.js for other actions
+        _ => "node:20-slim".to_string(),
     }
 }
 
@@ -1168,6 +1143,77 @@ struct SetupRuntime {
     /// Shell commands to install this runtime on an Ubuntu base image
     install_script: String,
 }
+
+/// Definition of a known setup action for runtime detection.
+///
+/// Used by both `detect_setup_runtimes` (to build combined images) and
+/// `determine_action_image` (to select per-step images), keeping the two
+/// in sync automatically.
+struct SetupActionDef {
+    /// Repository names that map to this runtime (exact match, no @version suffix).
+    repos: &'static [&'static str],
+    /// The `with:` key that specifies the version.
+    with_key: &'static str,
+    /// Default version when no `with:` key is provided.
+    default_version: &'static str,
+    /// Language identifier used in install scripts and image tags.
+    language: &'static str,
+    /// If true, fall back to the @ref from the `uses:` field when no `with:` key is set.
+    /// Used by `dtolnay/rust-toolchain` which encodes the toolchain in the ref.
+    version_from_ref: bool,
+}
+
+const SETUP_ACTIONS: &[SetupActionDef] = &[
+    SetupActionDef {
+        repos: &["actions/setup-node"],
+        with_key: "node-version",
+        default_version: "20",
+        language: "node",
+        version_from_ref: false,
+    },
+    SetupActionDef {
+        repos: &["shivammathur/setup-php"],
+        with_key: "php",
+        default_version: "8.2",
+        language: "php",
+        version_from_ref: false,
+    },
+    SetupActionDef {
+        repos: &["actions/setup-python"],
+        with_key: "python-version",
+        default_version: "3.11",
+        language: "python",
+        version_from_ref: false,
+    },
+    SetupActionDef {
+        repos: &["actions/setup-go"],
+        with_key: "go-version",
+        default_version: "1.21",
+        language: "go",
+        version_from_ref: false,
+    },
+    SetupActionDef {
+        repos: &["actions/setup-java"],
+        with_key: "java-version",
+        default_version: "17",
+        language: "java",
+        version_from_ref: false,
+    },
+    SetupActionDef {
+        repos: &["actions/setup-dotnet"],
+        with_key: "dotnet-version",
+        default_version: "7.0",
+        language: "dotnet",
+        version_from_ref: false,
+    },
+    SetupActionDef {
+        repos: &["actions-rs/toolchain", "dtolnay/rust-toolchain"],
+        with_key: "toolchain",
+        default_version: "stable",
+        language: "rust",
+        version_from_ref: true,
+    },
+];
 
 /// Check that a version string contains only safe characters (alphanumeric, dots, hyphens, underscores).
 fn is_safe_version(version: &str) -> bool {
@@ -1190,122 +1236,51 @@ fn detect_setup_runtimes(steps: &[Step]) -> Vec<SetupRuntime> {
             None => continue,
         };
 
-        // Strip version suffix (e.g., "actions/setup-node@v3" -> "actions/setup-node")
-        let repo = uses.split('@').next().unwrap_or(uses);
-
-        let with = step.with.as_ref();
-        let get_with = |key: &str| -> Option<String> { with.and_then(|w| w.get(key)).cloned() };
-
-        let runtime = if repo == "actions/setup-node" {
-            let ver = get_with("node-version").unwrap_or_else(|| "20".to_string());
-            if !is_safe_version(&ver) {
-                wrkflw_logging::warning(&format!(
-                    "Ignoring setup-node with invalid version: {:?}",
-                    ver
-                ));
-                continue;
-            }
-            Some(SetupRuntime {
-                language: "node".to_string(),
-                version: ver.clone(),
-                install_script: get_install_script("node", &ver),
-            })
-        } else if repo == "shivammathur/setup-php" {
-            let ver = get_with("php").unwrap_or_else(|| "8.2".to_string());
-            if !is_safe_version(&ver) {
-                wrkflw_logging::warning(&format!(
-                    "Ignoring setup-php with invalid version: {:?}",
-                    ver
-                ));
-                continue;
-            }
-            Some(SetupRuntime {
-                language: "php".to_string(),
-                version: ver.clone(),
-                install_script: get_install_script("php", &ver),
-            })
-        } else if repo == "actions/setup-python" {
-            let ver = get_with("python-version").unwrap_or_else(|| "3.11".to_string());
-            if !is_safe_version(&ver) {
-                wrkflw_logging::warning(&format!(
-                    "Ignoring setup-python with invalid version: {:?}",
-                    ver
-                ));
-                continue;
-            }
-            Some(SetupRuntime {
-                language: "python".to_string(),
-                version: ver.clone(),
-                install_script: get_install_script("python", &ver),
-            })
-        } else if repo == "actions/setup-go" {
-            let ver = get_with("go-version").unwrap_or_else(|| "1.21".to_string());
-            if !is_safe_version(&ver) {
-                wrkflw_logging::warning(&format!(
-                    "Ignoring setup-go with invalid version: {:?}",
-                    ver
-                ));
-                continue;
-            }
-            Some(SetupRuntime {
-                language: "go".to_string(),
-                version: ver.clone(),
-                install_script: get_install_script("go", &ver),
-            })
-        } else if repo == "actions/setup-java" {
-            let ver = get_with("java-version").unwrap_or_else(|| "17".to_string());
-            if !is_safe_version(&ver) {
-                wrkflw_logging::warning(&format!(
-                    "Ignoring setup-java with invalid version: {:?}",
-                    ver
-                ));
-                continue;
-            }
-            Some(SetupRuntime {
-                language: "java".to_string(),
-                version: ver.clone(),
-                install_script: get_install_script("java", &ver),
-            })
-        } else if repo == "actions/setup-dotnet" {
-            let ver = get_with("dotnet-version").unwrap_or_else(|| "7.0".to_string());
-            if !is_safe_version(&ver) {
-                wrkflw_logging::warning(&format!(
-                    "Ignoring setup-dotnet with invalid version: {:?}",
-                    ver
-                ));
-                continue;
-            }
-            Some(SetupRuntime {
-                language: "dotnet".to_string(),
-                version: ver.clone(),
-                install_script: get_install_script("dotnet", &ver),
-            })
-        } else if repo == "actions-rs/toolchain" || repo == "dtolnay/rust-toolchain" {
-            let ver = get_with("toolchain").unwrap_or_else(|| "stable".to_string());
-            if !is_safe_version(&ver) {
-                wrkflw_logging::warning(&format!(
-                    "Ignoring rust-toolchain with invalid version: {:?}",
-                    ver
-                ));
-                continue;
-            }
-            Some(SetupRuntime {
-                language: "rust".to_string(),
-                version: ver.clone(),
-                install_script: get_install_script("rust", &ver),
-            })
-        } else {
-            None
+        // Split "actions/setup-node@v3" into ("actions/setup-node", Some("v3"))
+        let (repo, git_ref) = match uses.split_once('@') {
+            Some((r, v)) => (r, Some(v)),
+            None => (uses.as_str(), None),
         };
 
-        if let Some(rt) = runtime {
-            // Deduplicate: later setup steps override earlier ones for the same language
-            let existing_idx = runtimes.iter().position(|r| r.language == rt.language);
-            if let Some(idx) = existing_idx {
-                runtimes[idx] = rt;
-            } else {
-                runtimes.push(rt);
-            }
+        let def = match SETUP_ACTIONS.iter().find(|d| d.repos.contains(&repo)) {
+            Some(d) => d,
+            None => continue,
+        };
+
+        let with = step.with.as_ref();
+        let ver = with
+            .and_then(|w| w.get(def.with_key))
+            .cloned()
+            .or_else(|| {
+                // Some actions encode the version in the @ref (e.g., dtolnay/rust-toolchain@nightly)
+                if def.version_from_ref {
+                    git_ref.map(|r| r.to_string())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| def.default_version.to_string());
+
+        if !is_safe_version(&ver) {
+            wrkflw_logging::warning(&format!(
+                "Ignoring {} with invalid version: {:?}",
+                def.language, ver
+            ));
+            continue;
+        }
+
+        let rt = SetupRuntime {
+            language: def.language.to_string(),
+            version: ver.clone(),
+            install_script: get_install_script(def.language, &ver),
+        };
+
+        // Deduplicate: later setup steps override earlier ones for the same language
+        let existing_idx = runtimes.iter().position(|r| r.language == rt.language);
+        if let Some(idx) = existing_idx {
+            runtimes[idx] = rt;
+        } else {
+            runtimes.push(rt);
         }
     }
 
@@ -1382,6 +1357,56 @@ fn get_install_script(language: &str, version: &str) -> String {
     }
 }
 
+/// Generate a Dockerfile that installs multiple language runtimes on an Ubuntu base.
+///
+/// Extracted as a pure function so the output can be unit-tested without Docker.
+fn generate_combined_dockerfile(runtimes: &[SetupRuntime], base_image: &str) -> String {
+    let mut dockerfile = format!("FROM {}\n", base_image);
+    dockerfile.push_str("RUN apt-get update && apt-get install -y --no-install-recommends curl bash git ca-certificates gnupg && rm -rf /var/lib/apt/lists/*\n");
+
+    // Combine all install scripts into a single RUN directive to avoid
+    // N separate `apt-get update` calls and reduce Docker layers.
+    let scripts: Vec<&str> = runtimes
+        .iter()
+        .filter(|rt| !rt.install_script.is_empty())
+        .map(|rt| rt.install_script.as_str())
+        .collect();
+
+    if !scripts.is_empty() {
+        dockerfile.push_str("RUN apt-get update && \\\n");
+        for (i, script) in scripts.iter().enumerate() {
+            dockerfile.push_str(&format!("    {}", script));
+            if i + 1 < scripts.len() {
+                dockerfile.push_str(" && \\\n");
+            }
+        }
+        dockerfile.push_str(" && \\\n    rm -rf /var/lib/apt/lists/*\n");
+    }
+
+    dockerfile
+}
+
+/// Build a deterministic image tag from the Dockerfile content.
+///
+/// Includes a hash of the full Dockerfile so that changes to install scripts
+/// (e.g., updated URLs) invalidate the cache even when language/version pairs
+/// are unchanged.
+fn combined_image_tag(runtimes: &[SetupRuntime], dockerfile: &str) -> String {
+    use std::hash::{Hash, Hasher};
+
+    let mut tag_parts: Vec<String> = runtimes
+        .iter()
+        .map(|r| format!("{}{}", r.language, r.version))
+        .collect();
+    tag_parts.sort();
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    dockerfile.hash(&mut hasher);
+    let hash = hasher.finish();
+
+    format!("wrkflw-combined:{}-{:x}", tag_parts.join("-"), hash)
+}
+
 /// Build a Docker image that combines multiple language runtimes on an Ubuntu base.
 async fn build_combined_runtime_image(
     runtimes: &[SetupRuntime],
@@ -1392,31 +1417,12 @@ async fn build_combined_runtime_image(
         ExecutionError::Execution(format!("Failed to create temp directory: {}", e))
     })?;
 
-    let mut dockerfile = format!("FROM {}\n", base_image);
-    dockerfile.push_str("RUN apt-get update && apt-get install -y --no-install-recommends curl bash git ca-certificates gnupg && rm -rf /var/lib/apt/lists/*\n");
-
-    for rt in runtimes {
-        if rt.install_script.is_empty() {
-            continue;
-        }
-        dockerfile.push_str(&format!(
-            "# Install {}\nRUN apt-get update && {} && rm -rf /var/lib/apt/lists/*\n",
-            rt.language, rt.install_script
-        ));
-    }
+    let dockerfile = generate_combined_dockerfile(runtimes, base_image);
+    let tag = combined_image_tag(runtimes, &dockerfile);
 
     let dockerfile_path = temp_dir.path().join("Dockerfile");
     std::fs::write(&dockerfile_path, &dockerfile)
         .map_err(|e| ExecutionError::Execution(format!("Failed to write Dockerfile: {}", e)))?;
-
-    // Build a deterministic tag from sorted language-version pairs so identical
-    // runtime combinations reuse the cached image instead of rebuilding.
-    let mut tag_parts: Vec<String> = runtimes
-        .iter()
-        .map(|r| format!("{}{}", r.language, r.version))
-        .collect();
-    tag_parts.sort();
-    let tag = format!("wrkflw-combined:{}", tag_parts.join("-"));
 
     wrkflw_logging::info(&format!(
         "Building combined runtime image with: {}",
@@ -5119,6 +5125,26 @@ runs:
     }
 
     #[test]
+    fn detect_setup_runtimes_rust_version_from_ref() {
+        // dtolnay/rust-toolchain encodes the toolchain in the @ref
+        let steps = vec![make_step_uses("dtolnay/rust-toolchain@nightly", None)];
+        let runtimes = detect_setup_runtimes(&steps);
+        assert_eq!(runtimes.len(), 1);
+        assert_eq!(runtimes[0].language, "rust");
+        assert_eq!(runtimes[0].version, "nightly");
+    }
+
+    #[test]
+    fn detect_setup_runtimes_rust_with_overrides_ref() {
+        // Explicit with.toolchain takes precedence over @ref
+        let with = HashMap::from([("toolchain".to_string(), "beta".to_string())]);
+        let steps = vec![make_step_uses("dtolnay/rust-toolchain@nightly", Some(with))];
+        let runtimes = detect_setup_runtimes(&steps);
+        assert_eq!(runtimes.len(), 1);
+        assert_eq!(runtimes[0].version, "beta");
+    }
+
+    #[test]
     fn detect_setup_runtimes_java() {
         let with = HashMap::from([("java-version".to_string(), "21".to_string())]);
         let steps = vec![make_step_uses("actions/setup-java@v4", Some(with))];
@@ -5214,5 +5240,185 @@ runs:
         ];
         let runtimes = detect_setup_runtimes(&steps);
         assert!(runtimes.is_empty());
+    }
+
+    // --- determine_action_image exact-match tests ---
+
+    #[test]
+    fn determine_action_image_exact_match_setup_actions() {
+        // Known setup actions should return the runner base
+        assert_eq!(
+            determine_action_image("actions/setup-node"),
+            "catthehacker/ubuntu:act-latest"
+        );
+        assert_eq!(
+            determine_action_image("actions/setup-python"),
+            "catthehacker/ubuntu:act-latest"
+        );
+        assert_eq!(
+            determine_action_image("shivammathur/setup-php"),
+            "catthehacker/ubuntu:act-latest"
+        );
+        assert_eq!(
+            determine_action_image("dtolnay/rust-toolchain"),
+            "catthehacker/ubuntu:act-latest"
+        );
+    }
+
+    #[test]
+    fn determine_action_image_rejects_similar_names() {
+        // Similar-but-different action names must NOT match setup actions
+        assert_eq!(
+            determine_action_image("actions/setup-node-legacy"),
+            "node:20-slim"
+        );
+        assert_eq!(
+            determine_action_image("actions/setup-nodejs"),
+            "node:20-slim"
+        );
+    }
+
+    #[test]
+    fn determine_action_image_core_actions() {
+        assert_eq!(
+            determine_action_image("actions/checkout"),
+            "catthehacker/ubuntu:act-latest"
+        );
+        assert_eq!(
+            determine_action_image("actions/cache"),
+            "catthehacker/ubuntu:act-latest"
+        );
+    }
+
+    #[test]
+    fn determine_action_image_namespace_prefix() {
+        // docker/* and aws-actions/* use namespace prefix matching
+        assert_eq!(
+            determine_action_image("docker/build-push-action"),
+            "docker:latest"
+        );
+        assert_eq!(
+            determine_action_image("docker/login-action"),
+            "docker:latest"
+        );
+        assert_eq!(
+            determine_action_image("aws-actions/configure-aws-credentials"),
+            "amazon/aws-cli:latest"
+        );
+    }
+
+    // --- Dockerfile generation tests ---
+
+    #[test]
+    fn generate_combined_dockerfile_single_runtime() {
+        let runtimes = vec![SetupRuntime {
+            language: "node".to_string(),
+            version: "20".to_string(),
+            install_script: get_install_script("node", "20"),
+        }];
+        let df = generate_combined_dockerfile(&runtimes, "ubuntu:latest");
+        assert!(df.starts_with("FROM ubuntu:latest\n"));
+        assert!(df.contains("nodesource"));
+        // Single combined RUN layer (base + install)
+        assert_eq!(df.matches("RUN ").count(), 2);
+    }
+
+    #[test]
+    fn generate_combined_dockerfile_multi_runtime_single_run() {
+        let runtimes = vec![
+            SetupRuntime {
+                language: "node".to_string(),
+                version: "20".to_string(),
+                install_script: get_install_script("node", "20"),
+            },
+            SetupRuntime {
+                language: "python".to_string(),
+                version: "3.12".to_string(),
+                install_script: get_install_script("python", "3.12"),
+            },
+        ];
+        let df = generate_combined_dockerfile(&runtimes, "ubuntu:latest");
+        // Base apt-get RUN + one combined install RUN = 2 total
+        assert_eq!(df.matches("RUN ").count(), 2);
+        assert!(df.contains("nodesource"));
+        assert!(df.contains("deadsnakes"));
+    }
+
+    #[test]
+    fn generate_combined_dockerfile_skips_empty_scripts() {
+        let runtimes = vec![SetupRuntime {
+            language: "unknown".to_string(),
+            version: "1.0".to_string(),
+            install_script: String::new(),
+        }];
+        let df = generate_combined_dockerfile(&runtimes, "ubuntu:latest");
+        // Only the base RUN, no install RUN
+        assert_eq!(df.matches("RUN ").count(), 1);
+    }
+
+    #[test]
+    fn combined_image_tag_is_deterministic() {
+        let runtimes = vec![
+            SetupRuntime {
+                language: "node".to_string(),
+                version: "20".to_string(),
+                install_script: "install node".to_string(),
+            },
+            SetupRuntime {
+                language: "python".to_string(),
+                version: "3.12".to_string(),
+                install_script: "install python".to_string(),
+            },
+        ];
+        let df = "FROM base\nRUN install stuff\n";
+        let tag1 = combined_image_tag(&runtimes, df);
+        let tag2 = combined_image_tag(&runtimes, df);
+        assert_eq!(tag1, tag2);
+        assert!(tag1.starts_with("wrkflw-combined:"));
+    }
+
+    #[test]
+    fn combined_image_tag_changes_when_dockerfile_changes() {
+        let runtimes = vec![SetupRuntime {
+            language: "node".to_string(),
+            version: "20".to_string(),
+            install_script: "install node v1".to_string(),
+        }];
+        let tag1 = combined_image_tag(&runtimes, "FROM base\nRUN v1\n");
+        let tag2 = combined_image_tag(&runtimes, "FROM base\nRUN v2\n");
+        assert_ne!(tag1, tag2);
+    }
+
+    #[test]
+    fn combined_image_tag_sorts_languages() {
+        let runtimes_ab = vec![
+            SetupRuntime {
+                language: "a".to_string(),
+                version: "1".to_string(),
+                install_script: String::new(),
+            },
+            SetupRuntime {
+                language: "b".to_string(),
+                version: "2".to_string(),
+                install_script: String::new(),
+            },
+        ];
+        let runtimes_ba = vec![
+            SetupRuntime {
+                language: "b".to_string(),
+                version: "2".to_string(),
+                install_script: String::new(),
+            },
+            SetupRuntime {
+                language: "a".to_string(),
+                version: "1".to_string(),
+                install_script: String::new(),
+            },
+        ];
+        let df = "same";
+        let tag_ab = combined_image_tag(&runtimes_ab, df);
+        let tag_ba = combined_image_tag(&runtimes_ba, df);
+        // Both should produce the same sorted prefix (a1-b2)
+        assert_eq!(tag_ab, tag_ba);
     }
 }

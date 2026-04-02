@@ -708,10 +708,7 @@ fn list_workflows_and_pipelines(verbose: bool, show_jobs: bool) {
                                     );
                                 }
                                 Err(e) => {
-                                    eprintln!(
-                                        "      Could not parse workflow: {}",
-                                        e
-                                    );
+                                    eprintln!("      Could not parse workflow: {}", e);
                                 }
                             }
                         }

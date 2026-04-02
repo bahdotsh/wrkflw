@@ -85,18 +85,10 @@ async fn execute_github_workflow(
     // 2. Resolve job dependencies and create execution plan
     let execution_plan = dependency::resolve_dependencies(&workflow)?;
 
-    // Filter to a single job if target_job is specified
+    // Filter to target job and its transitive dependencies if specified
     let execution_plan = if let Some(ref target_job) = config.target_job {
-        if !workflow.jobs.contains_key(target_job) {
-            let mut available: Vec<&String> = workflow.jobs.keys().collect();
-            available.sort();
-            return Err(ExecutionError::Execution(format!(
-                "Job '{}' not found in workflow. Available jobs: {}",
-                target_job,
-                available.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
-            )));
-        }
-        vec![vec![target_job.clone()]]
+        dependency::filter_plan_to_job(execution_plan, target_job, &workflow.jobs, "workflow")
+            .map_err(ExecutionError::Execution)?
     } else {
         execution_plan
     };
@@ -229,18 +221,10 @@ async fn execute_gitlab_pipeline(
     // 3. Resolve job dependencies based on stages
     let execution_plan = resolve_gitlab_dependencies(&pipeline, &workflow)?;
 
-    // Filter to a single job if target_job is specified
+    // Filter to target job and its transitive dependencies if specified
     let execution_plan = if let Some(ref target_job) = config.target_job {
-        if !workflow.jobs.contains_key(target_job) {
-            let mut available: Vec<&String> = workflow.jobs.keys().collect();
-            available.sort();
-            return Err(ExecutionError::Execution(format!(
-                "Job '{}' not found in pipeline. Available jobs: {}",
-                target_job,
-                available.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
-            )));
-        }
-        vec![vec![target_job.clone()]]
+        dependency::filter_plan_to_job(execution_plan, target_job, &workflow.jobs, "pipeline")
+            .map_err(ExecutionError::Execution)?
     } else {
         execution_plan
     };

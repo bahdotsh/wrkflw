@@ -1,5 +1,5 @@
-use std::collections::{HashMap, HashSet};
-use wrkflw_parser::workflow::WorkflowDefinition;
+use std::collections::{HashMap, HashSet, VecDeque};
+use wrkflw_parser::workflow::{Job, WorkflowDefinition};
 
 pub fn resolve_dependencies(workflow: &WorkflowDefinition) -> Result<Vec<Vec<String>>, String> {
     let jobs = &workflow.jobs;
@@ -120,4 +120,230 @@ pub fn resolve_dependencies(workflow: &WorkflowDefinition) -> Result<Vec<Vec<Str
     }
 
     Ok(result)
+}
+
+/// Collect a job and all its transitive dependencies via `needs` edges.
+pub fn collect_transitive_deps(target_job: &str, jobs: &HashMap<String, Job>) -> HashSet<String> {
+    let mut deps = HashSet::new();
+    let mut queue = VecDeque::new();
+
+    deps.insert(target_job.to_string());
+    queue.push_back(target_job.to_string());
+
+    while let Some(job_name) = queue.pop_front() {
+        if let Some(job) = jobs.get(&job_name) {
+            if let Some(needs) = &job.needs {
+                for needed in needs {
+                    if deps.insert(needed.clone()) {
+                        queue.push_back(needed.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    deps
+}
+
+/// Filter an execution plan to only include a target job and its transitive
+/// dependencies. Returns an error if the target job doesn't exist.
+pub fn filter_plan_to_job(
+    plan: Vec<Vec<String>>,
+    target_job: &str,
+    jobs: &HashMap<String, Job>,
+    kind: &str,
+) -> Result<Vec<Vec<String>>, String> {
+    if !jobs.contains_key(target_job) {
+        let mut available: Vec<&String> = jobs.keys().collect();
+        available.sort();
+        return Err(format!(
+            "Job '{}' not found in {}. Available jobs: {}",
+            target_job,
+            kind,
+            available
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+
+    let needed = collect_transitive_deps(target_job, jobs);
+
+    Ok(plan
+        .into_iter()
+        .map(|batch| {
+            batch
+                .into_iter()
+                .filter(|j| needed.contains(j))
+                .collect::<Vec<_>>()
+        })
+        .filter(|batch| !batch.is_empty())
+        .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn job_with_needs(needs: Option<Vec<&str>>) -> Job {
+        Job {
+            runs_on: None,
+            needs: needs.map(|v| v.into_iter().map(String::from).collect()),
+            container: None,
+            steps: vec![],
+            env: HashMap::new(),
+            strategy: None,
+            services: HashMap::new(),
+            if_condition: None,
+            outputs: None,
+            permissions: None,
+            uses: None,
+            with: None,
+            secrets: None,
+        }
+    }
+
+    #[test]
+    fn test_collect_transitive_deps_no_deps() {
+        let mut jobs = HashMap::new();
+        jobs.insert("build".to_string(), job_with_needs(None));
+        jobs.insert("test".to_string(), job_with_needs(None));
+
+        let deps = collect_transitive_deps("build", &jobs);
+        assert_eq!(deps, HashSet::from(["build".to_string()]));
+    }
+
+    #[test]
+    fn test_collect_transitive_deps_linear_chain() {
+        let mut jobs = HashMap::new();
+        jobs.insert("setup".to_string(), job_with_needs(None));
+        jobs.insert("build".to_string(), job_with_needs(Some(vec!["setup"])));
+        jobs.insert("deploy".to_string(), job_with_needs(Some(vec!["build"])));
+
+        let deps = collect_transitive_deps("deploy", &jobs);
+        assert_eq!(
+            deps,
+            HashSet::from([
+                "setup".to_string(),
+                "build".to_string(),
+                "deploy".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_collect_transitive_deps_diamond() {
+        let mut jobs = HashMap::new();
+        jobs.insert("a".to_string(), job_with_needs(None));
+        jobs.insert("b".to_string(), job_with_needs(Some(vec!["a"])));
+        jobs.insert("c".to_string(), job_with_needs(Some(vec!["a"])));
+        jobs.insert("d".to_string(), job_with_needs(Some(vec!["b", "c"])));
+
+        let deps = collect_transitive_deps("d", &jobs);
+        assert_eq!(
+            deps,
+            HashSet::from([
+                "a".to_string(),
+                "b".to_string(),
+                "c".to_string(),
+                "d".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_collect_transitive_deps_partial_graph() {
+        let mut jobs = HashMap::new();
+        jobs.insert("a".to_string(), job_with_needs(None));
+        jobs.insert("b".to_string(), job_with_needs(Some(vec!["a"])));
+        jobs.insert("unrelated".to_string(), job_with_needs(None));
+
+        let deps = collect_transitive_deps("b", &jobs);
+        assert_eq!(deps, HashSet::from(["a".to_string(), "b".to_string()]));
+        assert!(!deps.contains("unrelated"));
+    }
+
+    #[test]
+    fn test_filter_plan_to_job_not_found() {
+        let jobs = HashMap::new();
+        let plan = vec![vec!["a".to_string()]];
+
+        let result = filter_plan_to_job(plan, "missing", &jobs, "workflow");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("missing"));
+        assert!(err.contains("workflow"));
+    }
+
+    #[test]
+    fn test_filter_plan_to_job_not_found_lists_available() {
+        let mut jobs = HashMap::new();
+        jobs.insert("build".to_string(), job_with_needs(None));
+        jobs.insert("test".to_string(), job_with_needs(None));
+        let plan = vec![vec!["build".to_string(), "test".to_string()]];
+
+        let err = filter_plan_to_job(plan, "deploy", &jobs, "pipeline").unwrap_err();
+        assert!(err.contains("build"));
+        assert!(err.contains("test"));
+        assert!(err.contains("pipeline"));
+    }
+
+    #[test]
+    fn test_filter_plan_to_job_with_deps() {
+        let mut jobs = HashMap::new();
+        jobs.insert("a".to_string(), job_with_needs(None));
+        jobs.insert("x".to_string(), job_with_needs(None));
+        jobs.insert("b".to_string(), job_with_needs(Some(vec!["a"])));
+        jobs.insert("y".to_string(), job_with_needs(Some(vec!["x"])));
+        jobs.insert("c".to_string(), job_with_needs(Some(vec!["b"])));
+
+        // Plan: [a, x] -> [b, y] -> [c]
+        let plan = vec![
+            vec!["a".to_string(), "x".to_string()],
+            vec!["b".to_string(), "y".to_string()],
+            vec!["c".to_string()],
+        ];
+
+        let filtered = filter_plan_to_job(plan, "c", &jobs, "workflow").unwrap();
+        // Should keep a, b, c but drop x and y
+        assert_eq!(
+            filtered,
+            vec![
+                vec!["a".to_string()],
+                vec!["b".to_string()],
+                vec!["c".to_string()],
+            ]
+        );
+    }
+
+    #[test]
+    fn test_filter_plan_to_job_no_deps() {
+        let mut jobs = HashMap::new();
+        jobs.insert("a".to_string(), job_with_needs(None));
+        jobs.insert("b".to_string(), job_with_needs(None));
+
+        let plan = vec![vec!["a".to_string(), "b".to_string()]];
+
+        let filtered = filter_plan_to_job(plan, "a", &jobs, "workflow").unwrap();
+        assert_eq!(filtered, vec![vec!["a".to_string()]]);
+    }
+
+    #[test]
+    fn test_filter_plan_to_job_removes_empty_batches() {
+        let mut jobs = HashMap::new();
+        jobs.insert("a".to_string(), job_with_needs(None));
+        jobs.insert("x".to_string(), job_with_needs(None));
+        jobs.insert("y".to_string(), job_with_needs(Some(vec!["x"])));
+
+        // Plan: [a, x] -> [y]
+        // Targeting "a" should produce [[a]] — batch [y] is entirely removed
+        let plan = vec![
+            vec!["a".to_string(), "x".to_string()],
+            vec!["y".to_string()],
+        ];
+
+        let filtered = filter_plan_to_job(plan, "a", &jobs, "workflow").unwrap();
+        assert_eq!(filtered, vec![vec!["a".to_string()]]);
+    }
 }

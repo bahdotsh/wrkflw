@@ -1,18 +1,16 @@
 // Workflow handlers
-#[cfg(feature = "tui")]
-use crate::app::App;
-#[cfg(feature = "tui")]
-use crate::models::{ExecutionResultMsg, WorkflowExecution, WorkflowStatus};
-#[cfg(feature = "tui")]
-use chrono::Local;
 use std::io;
 use std::path::{Path, PathBuf};
-#[cfg(feature = "tui")]
-use std::sync::mpsc;
-#[cfg(feature = "tui")]
-use std::thread;
 use wrkflw_evaluator::evaluate_workflow_file;
 use wrkflw_executor::{self, JobStatus, RuntimeType, StepStatus};
+#[cfg(feature = "tui")]
+use {
+    crate::app::App,
+    crate::models::{ExecutionResultMsg, WorkflowExecution, WorkflowStatus},
+    chrono::Local,
+    std::sync::mpsc,
+    std::thread,
+};
 
 // Validate a workflow or directory containing workflows
 pub fn validate_workflow(path: &Path, verbose: bool) -> io::Result<()> {

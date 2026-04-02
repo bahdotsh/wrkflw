@@ -52,6 +52,12 @@ jobs:
           command: build
           args: --target ${{ matrix.target }}
 
+      - name: Check no-default-features
+        uses: actions-rs/cargo@v1
+        with:
+          command: check
+          args: --no-default-features --target ${{ matrix.target }}
+
       - name: Run tests
         uses: actions-rs/cargo@v1
         with:

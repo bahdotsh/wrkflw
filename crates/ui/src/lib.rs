@@ -8,10 +8,8 @@
 // - utils: Contains utility functions
 // - views: Contains UI rendering code
 
-// Re-export public modules
+// Always-available modules (CLI validation/execution)
 pub mod handlers;
-pub mod models;
-pub mod utils;
 
 // TUI-specific modules (require ratatui/crossterm)
 #[cfg(feature = "tui")]
@@ -20,6 +18,10 @@ pub mod app;
 pub mod components;
 #[cfg(feature = "tui")]
 pub mod log_processor;
+#[cfg(feature = "tui")]
+pub mod models;
+#[cfg(feature = "tui")]
+pub mod utils;
 #[cfg(feature = "tui")]
 pub mod views;
 

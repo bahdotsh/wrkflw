@@ -2,7 +2,7 @@
 
 Small, focused helper for statically evaluating GitHub Actions workflow files.
 
-- **Purpose**: Fast structural checks (e.g., `name`, `on`, `jobs`) before deeper validation/execution
+- **Purpose**: Fast structural checks (e.g., `name`, `on`, `jobs`) and composite action input cross-checking before deeper validation/execution
 - **Used by**: `wrkflw` CLI and TUI during validation flows
 
 ### Example

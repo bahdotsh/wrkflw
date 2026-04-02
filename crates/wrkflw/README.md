@@ -52,7 +52,7 @@ wrkflw tui --runtime podman
 
 - **run**: Execute a workflow or pipeline locally
   - Runtimes: `docker` (default), `podman`, `emulation`
-  - Flags: `--runtime`, `--preserve-containers-on-failure`, `--gitlab`, `--verbose`
+  - Flags: `--runtime`, `--job` (run a single job), `--jobs` (list jobs), `--preserve-containers-on-failure`, `--gitlab`, `--verbose`
 
 - **tui**: Interactive terminal interface
   - Browse workflows, execute, and inspect logs and job details

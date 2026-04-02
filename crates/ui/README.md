@@ -3,7 +3,9 @@
 Terminal user interface for browsing workflows, running them, and viewing logs.
 
 - Tabs: Workflows, Execution, Logs, Help
+- Job selection mode: pick and run individual jobs within a workflow
 - Hotkeys: `1-4`, `Tab`, `Enter`, `r`, `R`, `t`, `v`, `e`, `q`, etc.
+- Optional: enabled via the `tui` cargo feature flag
 - Integrates with `wrkflw-executor` and `wrkflw-logging`
 
 ### Example

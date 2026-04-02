@@ -254,121 +254,40 @@ impl ContainerRuntime for EmulationRuntime {
             )),
         }
 
-        // First, check if this is a simple shell command (like echo)
-        if command_str.starts_with("echo ")
-            || command_str.starts_with("cp ")
-            || command_str.starts_with("mkdir ")
-            || command_str.starts_with("mv ")
-        {
-            wrkflw_logging::info("Executing as shell command");
-            // Execute as a shell command
-            let mut cmd = Command::new("sh");
+        // When the command starts with a known interpreter (bash, sh, python, pwsh)
+        // or cargo/rustup, execute the command array directly to preserve argument
+        // boundaries. This is critical for `bash -c <script>` where the script must
+        // remain a single argument rather than being re-split by an outer shell.
+        // For all other commands, fall back to `sh -c` to handle shell builtins,
+        // pipelines, and other shell syntax.
+        let use_direct_exec = matches!(
+            command[0],
+            "bash" | "sh" | "python" | "python3" | "pwsh" | "powershell" | "cargo" | "rustup"
+        );
+
+        let mut cmd;
+        if use_direct_exec {
+            cmd = Command::new(command[0]);
+            if command.len() > 1 {
+                cmd.args(&command[1..]);
+            }
+        } else {
+            cmd = Command::new("sh");
             cmd.arg("-c");
             cmd.arg(&command_str);
-            cmd.current_dir(&actual_working_dir);
-
-            // Add environment variables
-            for (key, value) in env_vars {
-                cmd.env(key, value);
-            }
-
-            match cmd.output() {
-                Ok(output_result) => {
-                    let exit_code = output_result.status.code().unwrap_or(-1);
-                    let output = String::from_utf8_lossy(&output_result.stdout).to_string();
-                    let error = String::from_utf8_lossy(&output_result.stderr).to_string();
-
-                    wrkflw_logging::debug(&format!(
-                        "Shell command completed with exit code: {}",
-                        exit_code
-                    ));
-
-                    return Ok(ContainerOutput {
-                        stdout: output,
-                        stderr: error,
-                        exit_code,
-                    });
-                }
-                Err(e) => {
-                    return Err(ContainerError::ContainerExecution(format!(
-                        "Failed to execute command: {}\nError: {}",
-                        command_str, e
-                    )));
-                }
-            }
         }
 
-        // Special handling for Rust/Cargo commands
-        if command_str.starts_with("cargo ") || command_str.starts_with("rustup ") {
-            let parts: Vec<&str> = command_str.split_whitespace().collect();
-            if parts.is_empty() {
-                return Err(ContainerError::ContainerExecution(
-                    "Empty command".to_string(),
-                ));
-            }
-
-            let mut cmd = Command::new(parts[0]);
-
-            // Always use the current directory for cargo/rust commands rather than the temporary directory
+        // Cargo/rustup commands always run in the project directory
+        if command[0] == "cargo" || command[0] == "rustup" {
             let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
             wrkflw_logging::info(&format!(
                 "Using project directory for Rust command: {}",
                 current_dir.display()
             ));
             cmd.current_dir(&current_dir);
-
-            // Add environment variables
-            for (key, value) in env_vars {
-                // Don't use the CI_PROJECT_DIR for CARGO_HOME, use the actual project directory
-                if *key == "CARGO_HOME" && value.contains("${CI_PROJECT_DIR}") {
-                    let cargo_home =
-                        value.replace("${CI_PROJECT_DIR}", &current_dir.to_string_lossy());
-                    wrkflw_logging::info(&format!("Setting CARGO_HOME to: {}", cargo_home));
-                    cmd.env(key, cargo_home);
-                } else {
-                    cmd.env(key, value);
-                }
-            }
-
-            // Add command arguments
-            if parts.len() > 1 {
-                cmd.args(&parts[1..]);
-            }
-
-            wrkflw_logging::debug(&format!(
-                "Executing Rust command: {} in {}",
-                command_str,
-                current_dir.display()
-            ));
-
-            match cmd.output() {
-                Ok(output_result) => {
-                    let exit_code = output_result.status.code().unwrap_or(-1);
-                    let output = String::from_utf8_lossy(&output_result.stdout).to_string();
-                    let error = String::from_utf8_lossy(&output_result.stderr).to_string();
-
-                    wrkflw_logging::debug(&format!("Command exit code: {}", exit_code));
-
-                    return Ok(ContainerOutput {
-                        stdout: output,
-                        stderr: error,
-                        exit_code,
-                    });
-                }
-                Err(e) => {
-                    return Err(ContainerError::ContainerExecution(format!(
-                        "Failed to execute Rust command: {}",
-                        e
-                    )));
-                }
-            }
+        } else {
+            cmd.current_dir(&actual_working_dir);
         }
-
-        // For other commands, use a shell as fallback
-        let mut cmd = Command::new("sh");
-        cmd.arg("-c");
-        cmd.arg(&command_str);
-        cmd.current_dir(&actual_working_dir);
 
         // Add environment variables
         for (key, value) in env_vars {

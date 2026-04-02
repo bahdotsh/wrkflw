@@ -158,7 +158,11 @@ pub fn apply_step_environment_updates(
 
     // Prepend GITHUB_PATH entries to PATH for subsequent steps
     if !updates.path_entries.is_empty() {
-        let current_path = job_env.get("PATH").cloned().unwrap_or_default();
+        let current_path = job_env
+            .get("PATH")
+            .cloned()
+            .or_else(|| std::env::var("PATH").ok())
+            .unwrap_or_default();
         let new_entries = updates.path_entries.join(":");
         let new_path = if current_path.is_empty() {
             new_entries

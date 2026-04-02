@@ -1,10 +1,11 @@
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 
 use crate::{validate_matrix, validate_steps};
 use serde_yaml::Value;
 use wrkflw_models::ValidationResult;
 
-pub fn validate_jobs(jobs: &Value, result: &mut ValidationResult) {
+pub fn validate_jobs(jobs: &Value, repo_root: Option<&Path>, result: &mut ValidationResult) {
     if let Value::Mapping(jobs_map) = jobs {
         if jobs_map.is_empty() {
             result.add_issue("'jobs' section is empty".to_string());
@@ -35,7 +36,7 @@ pub fn validate_jobs(jobs: &Value, result: &mut ValidationResult) {
                                         job_name
                                     ));
                                 } else {
-                                    validate_steps(steps, job_name, result);
+                                    validate_steps(steps, job_name, repo_root, result);
                                 }
                             }
                             Some(_) => {
@@ -254,7 +255,7 @@ job-c:
 "#;
         let jobs: Value = serde_yaml::from_str(yaml).unwrap();
         let mut result = ValidationResult::new();
-        validate_jobs(&jobs, &mut result);
+        validate_jobs(&jobs, None, &mut result);
 
         assert!(
             result
@@ -296,7 +297,7 @@ job-e:
 "#;
         let jobs: Value = serde_yaml::from_str(yaml).unwrap();
         let mut result = ValidationResult::new();
-        validate_jobs(&jobs, &mut result);
+        validate_jobs(&jobs, None, &mut result);
 
         let cycle_issues: Vec<_> = result
             .issues
@@ -340,7 +341,7 @@ deploy:
 "#;
         let jobs: Value = serde_yaml::from_str(yaml).unwrap();
         let mut result = ValidationResult::new();
-        validate_jobs(&jobs, &mut result);
+        validate_jobs(&jobs, None, &mut result);
 
         assert!(
             !result

@@ -3563,6 +3563,7 @@ version = "0.7.3"
 dependencies = [
  "serde",
  "serde_yaml",
+ "tempfile",
  "wrkflw-matrix",
  "wrkflw-models",
 ]

@@ -1,9 +1,15 @@
 use crate::validate_action_reference;
 use serde_yaml::Value;
 use std::collections::HashSet;
+use std::path::Path;
 use wrkflw_models::ValidationResult;
 
-pub fn validate_steps(steps: &[Value], job_name: &str, result: &mut ValidationResult) {
+pub fn validate_steps(
+    steps: &[Value],
+    job_name: &str,
+    repo_root: Option<&Path>,
+    result: &mut ValidationResult,
+) {
     let mut step_ids: HashSet<String> = HashSet::new();
 
     for (i, step) in steps.iter().enumerate() {
@@ -44,7 +50,10 @@ pub fn validate_steps(steps: &[Value], job_name: &str, result: &mut ValidationRe
 
             // Validate action reference if 'uses' is present
             if let Some(Value::String(uses)) = step_map.get(Value::String("uses".to_string())) {
-                validate_action_reference(uses, job_name, i, result);
+                let with_params = step_map
+                    .get(Value::String("with".to_string()))
+                    .and_then(|v| v.as_mapping());
+                validate_action_reference(uses, with_params, job_name, i, repo_root, result);
             }
         } else {
             result.add_issue(format!(
@@ -68,7 +77,7 @@ mod tests {
 "#;
         let steps: Vec<Value> = serde_yaml::from_str(yaml).unwrap();
         let mut result = ValidationResult::new();
-        validate_steps(&steps, "test-job", &mut result);
+        validate_steps(&steps, "test-job", None, &mut result);
 
         assert!(!result.is_valid);
         assert!(result
@@ -85,7 +94,7 @@ mod tests {
 "#;
         let steps: Vec<Value> = serde_yaml::from_str(yaml).unwrap();
         let mut result = ValidationResult::new();
-        validate_steps(&steps, "test-job", &mut result);
+        validate_steps(&steps, "test-job", None, &mut result);
 
         assert!(result.is_valid);
         assert!(result.issues.is_empty());
@@ -99,7 +108,7 @@ mod tests {
 "#;
         let steps: Vec<Value> = serde_yaml::from_str(yaml).unwrap();
         let mut result = ValidationResult::new();
-        validate_steps(&steps, "test-job", &mut result);
+        validate_steps(&steps, "test-job", None, &mut result);
 
         assert!(result.is_valid);
         assert!(result.issues.is_empty());

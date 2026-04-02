@@ -1,7 +1,7 @@
 use colored::*;
 use serde_yaml::{self, Value};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use wrkflw_models::ValidationResult;
 use wrkflw_validators::{validate_jobs, validate_triggers};
@@ -14,6 +14,7 @@ pub fn evaluate_workflow_file(path: &Path, verbose: bool) -> Result<ValidationRe
         serde_yaml::from_str(&content).map_err(|e| format!("Invalid YAML: {}", e))?;
 
     let mut result = ValidationResult::new();
+    let repo_root = find_repo_root(path);
 
     // Check for required structure
     if !workflow.is_mapping() {
@@ -28,7 +29,7 @@ pub fn evaluate_workflow_file(path: &Path, verbose: bool) -> Result<ValidationRe
     // Check if jobs section exists
     match workflow.get("jobs") {
         Some(jobs) if jobs.is_mapping() => {
-            validate_jobs(jobs, &mut result);
+            validate_jobs(jobs, repo_root.as_deref(), &mut result);
         }
         Some(_) => {
             result.add_issue("'jobs' section is not a mapping".to_string());
@@ -57,4 +58,18 @@ pub fn evaluate_workflow_file(path: &Path, verbose: bool) -> Result<ValidationRe
     }
 
     Ok(result)
+}
+
+/// Walk up from the workflow file's directory to find the repository root (.git directory).
+/// Falls back to the current working directory if no .git is found.
+fn find_repo_root(workflow_path: &Path) -> Option<PathBuf> {
+    let canonical = fs::canonicalize(workflow_path).ok()?;
+    let mut dir = canonical.parent();
+    while let Some(d) = dir {
+        if d.join(".git").exists() {
+            return Some(d.to_path_buf());
+        }
+        dir = d.parent();
+    }
+    std::env::current_dir().ok()
 }

@@ -1,16 +1,18 @@
 # Codebase Index: wrkflw
 
-> Generated: 2026-03-28 05:02:20 UTC | Files: 150 | Lines: 35146
-> Languages: JSON (4), Markdown (24), Rust (72), Shell (5), TOML (16), YAML (29)
+> Generated: 2026-04-02 07:55:32 UTC | Files: 158 | Lines: 44819
+> Languages: C++ (1), JSON (4), Markdown (26), Python (1), Rust (75), Shell (5), TOML (16), YAML (30)
 
 ## Directory Structure
 
 ```
 wrkflw/
   AGENTS.md
+  BREAKING_CHANGES.md
   CLAUDE.md
   Cargo.toml
   GITLAB_USAGE.md
+  INDEX.md
   README.md
   VERSION_MANAGEMENT.md
   cliff.toml
@@ -25,6 +27,7 @@ wrkflw/
       Cargo.toml
       README.md
       src/
+        action_resolver.rs
         dependency.rs
         docker.rs
         docker_test.rs
@@ -152,16 +155,21 @@ wrkflw/
       src/
         lib.rs
         main.rs
+      tests/
+        target_job_test.rs
   examples/
     secrets-demo/
       README.md
       secrets-workflow.yml
+  hello.cpp
+  hello.rs
   publish_crates.sh
   schemas/
     github-workflow.json
     gitlab-ci.json
   scripts/
     bump-crate.sh
+  test.py
   tests/
     README.md
     TESTING_PODMAN.md
@@ -197,6 +205,7 @@ wrkflw/
       cpp-test.yml
       example.yml
       matrix-example.yml
+      multi-runtime-test.yml
       node-test.yml
       python-test.yml
       runs-on-array-test.yml
@@ -213,6 +222,9 @@ wrkflw/
 **AGENTS.md**
 - `# Codebase Navigation — Use indxr MCP tools`
 
+**BREAKING_CHANGES.md**
+- `# Breaking Changes`
+
 **CLAUDE.md**
 - `# wrkflw`
 
@@ -227,6 +239,9 @@ wrkflw/
 - `# Trigger using the default branch`
 - `# Trigger on a specific branch`
 - `# Trigger with custom variables`
+
+**INDEX.md**
+- `# Codebase Index: wrkflw`
 
 **README.md**
 - `# WRKFLW`
@@ -329,12 +344,21 @@ wrkflw/
 **crates/executor/Cargo.toml**
 - `[package]`
 - `[dependencies]`
+- `[dev-dependencies]`
 
 **crates/executor/README.md**
 - `## wrkflw-executor`
 
+**crates/executor/src/action_resolver.rs**
+- `pub enum ActionType`
+- `pub struct ResolvedAction`
+- `pub async fn resolve_remote_action( repo: &str, version: &str, sub_path: Option<&str>, ) -> Result<ResolvedAction, String>`
+
 **crates/executor/src/dependency.rs**
 - `pub fn resolve_dependencies(workflow: &WorkflowDefinition) -> Result<Vec<Vec<String>>, String>`
+- `pub fn collect_transitive_deps(target_job: &str, jobs: &HashMap<String, Job>) -> HashSet<String>`
+- `pub fn filter_plan_to_job( plan: Vec<Vec<String>>, target_job: &str, jobs: &HashMap<String, Job>, kind: &str, ) -> Result<Vec<Vec<String>>, String>`
+- `pub fn filter_plan_to_job_by_stage( plan: Vec<Vec<String>>, target_job: &str, jobs: &HashMap<String, Job>, kind: &str, ) -> Result<Vec<Vec<String>>, String>`
 
 **crates/executor/src/docker.rs**
 - `pub struct DockerRuntime`
@@ -367,6 +391,7 @@ wrkflw/
 - `pub fn add_matrix_context( env: &mut HashMap<String, String>, matrix_combination: &MatrixCombination, )`
 
 **crates/executor/src/lib.rs**
+- `pub mod action_resolver`
 - `pub mod dependency`
 - `pub mod docker`
 - `pub mod engine`
@@ -509,7 +534,10 @@ wrkflw/
 - `pub struct SchemaValidator`
 
 **crates/parser/src/workflow.rs**
+- `pub struct ContainerCredentials`
+- `pub struct JobContainer`
 - `pub struct WorkflowDefinition`
+- `pub struct Strategy`
 - `pub struct Job`
 - `pub struct Service`
 - `pub struct Step`
@@ -532,6 +560,8 @@ wrkflw/
 - `# This workflow will run successfully in secure emulation mode`
 
 **crates/runtime/src/container.rs**
+- `pub const LOCAL_IMAGE_PREFIX: &str = "wrkflw-"`
+- `pub const COMBINED_IMAGE_PREFIX: &str = "wrkflw-combined:"`
 - `pub trait ContainerRuntime`
 - `pub struct ContainerOutput`
 - `pub enum ContainerError`
@@ -647,7 +677,7 @@ wrkflw/
 - `# })?;`
 
 **crates/ui/src/app/mod.rs**
-- `pub async fn run_wrkflw_tui( path: Option<&PathBuf>, runtime_type: RuntimeType, verbose: bool, preserve_containers_on_failure: bool, ) -> io::Result<()>`
+- `pub async fn run_wrkflw_tui( path: Option<&PathBuf>, runtime_type: RuntimeType, verbose: bool, preserve_containers_on_failure: bool, show_action_messages: bool, ) -> io::Result<()>`
 
 **crates/ui/src/app/state.rs**
 - `pub struct App`
@@ -666,7 +696,7 @@ wrkflw/
 
 **crates/ui/src/handlers/workflow.rs**
 - `pub fn validate_workflow(path: &Path, verbose: bool) -> io::Result<()>`
-- `pub async fn execute_workflow_cli( path: &Path, runtime_type: RuntimeType, verbose: bool, ) -> io::Result<()>`
+- `pub async fn execute_workflow_cli( path: &Path, runtime_type: RuntimeType, verbose: bool, show_action_messages: bool, ) -> io::Result<()>`
 - `pub async fn execute_curl_trigger( workflow_name: &str, branch: Option<&str>, ) -> Result<(Vec<wrkflw_executor::JobResult>, ()), String>`
 - `pub fn start_next_workflow_execution( app: &mut App, tx_clone: &mpsc::Sender<ExecutionResultMsg>, verbose: bool, )`
 
@@ -810,6 +840,9 @@ wrkflw/
 - `name:`
 - `on:`
 - `jobs:`
+
+**hello.cpp**
+- `int main()`
 
 **publish_crates.sh**
 - `show_help()`
@@ -1042,6 +1075,11 @@ wrkflw/
 - `env:`
 - `jobs:`
 
+**tests/workflows/multi-runtime-test.yml**
+- `name:`
+- `on:`
+- `jobs:`
+
 **tests/workflows/node-test.yml**
 - `name:`
 - `on:`
@@ -1085,6 +1123,14 @@ wrkflw/
 
 ---
 
+## BREAKING_CHANGES.md
+
+**Language:** Markdown | **Size:** 1.3 KB | **Lines:** 30
+
+**Declarations:**
+
+---
+
 ## CLAUDE.md
 
 **Language:** Markdown | **Size:** 4.4 KB | **Lines:** 66
@@ -1095,7 +1141,7 @@ wrkflw/
 
 ## Cargo.toml
 
-**Language:** TOML | **Size:** 2.2 KB | **Lines:** 71
+**Language:** TOML | **Size:** 2.2 KB | **Lines:** 73
 
 **Declarations:**
 
@@ -1104,6 +1150,14 @@ wrkflw/
 ## GITLAB_USAGE.md
 
 **Language:** Markdown | **Size:** 2.2 KB | **Lines:** 83
+
+**Declarations:**
+
+---
+
+## INDEX.md
+
+**Language:** Markdown | **Size:** 85.9 KB | **Lines:** 3732
 
 **Declarations:**
 
@@ -1175,7 +1229,7 @@ wrkflw/
 
 ## crates/executor/Cargo.toml
 
-**Language:** TOML | **Size:** 1.0 KB | **Lines:** 42
+**Language:** TOML | **Size:** 1.1 KB | **Lines:** 47
 
 **Imports:**
 - `ignore`
@@ -1186,27 +1240,73 @@ wrkflw/
 
 ## crates/executor/README.md
 
-**Language:** Markdown | **Size:** 880 B | **Lines:** 29
+**Language:** Markdown | **Size:** 902 B | **Lines:** 30
 
 **Declarations:**
+
+---
+
+## crates/executor/src/action_resolver.rs
+
+**Language:** Rust | **Size:** 23.4 KB | **Lines:** 736
+
+**Imports:**
+- `once_cell::sync::Lazy`
+- `std::collections::{HashMap, VecDeque}`
+- `tokio::sync::RwLock`
+
+**Declarations:**
+
+`const MAX_CACHE_ENTRIES: usize = 256`
+
+`struct BoundedCache`
+> Fields: `map: HashMap<String, ResolvedAction>`, `order: VecDeque<String>`
+
+**`impl BoundedCache`**
+  `fn new() -> Self`
+
+  `fn get(&self, key: &str) -> Option<&ResolvedAction>`
+
+  `fn insert(&mut self, key: String, value: ResolvedAction)`
+
+
+`static ACTION_CACHE: Lazy<RwLock<BoundedCache>> = Lazy::new(|| RwLock::new(BoundedCache::new()))`
+
+`static HTTP_CLIENT: Lazy<reqwest::Client> = Lazy::new(||`
+
+`static NO_REDIRECT_CLIENT: Lazy<reqwest::Client> = Lazy::new(||`
+
+`const GITHUB_RAW_BASE_URL: &str = "https://raw.githubusercontent.com"`
+
+`async fn fetch_and_parse( base_url: &str, repo: &str, version: &str, sub_path: Option<&str>, filename: &str, token: Option<&str>, ) -> Result<ResolvedAction, String>`
+
+`fn parse_action_definition(content: &str) -> Result<ResolvedAction, String>`
+
+`fn parse_using(using: &str, runs: &serde_yaml::Value) -> Result<ActionType, String>`
+
+`mod tests`
 
 ---
 
 ## crates/executor/src/dependency.rs
 
-**Language:** Rust | **Size:** 4.0 KB | **Lines:** 112
+**Language:** Rust | **Size:** 17.4 KB | **Lines:** 507
 
 **Imports:**
-- `std::collections::{HashMap, HashSet}`
-- `wrkflw_parser::workflow::WorkflowDefinition`
+- `std::collections::{HashMap, HashSet, VecDeque}`
+- `wrkflw_parser::workflow::{Job, WorkflowDefinition}`
 
 **Declarations:**
+
+`fn job_not_found_error(target_job: &str, jobs: &HashMap<String, Job>, kind: &str) -> String`
+
+`mod tests`
 
 ---
 
 ## crates/executor/src/docker.rs
 
-**Language:** Rust | **Size:** 44.0 KB | **Lines:** 1188
+**Language:** Rust | **Size:** 49.0 KB | **Lines:** 1303
 
 **Imports:**
 - `async_trait::async_trait`
@@ -1222,7 +1322,9 @@ wrkflw/
 - `std::path::Path`
 - `std::sync::Mutex`
 - `wrkflw_logging`
-- `wrkflw_runtime::container::{ContainerError, ContainerOutput, ContainerRuntime}`
+- `wrkflw_runtime::container::{
+    ContainerError, ContainerOutput, ContainerRuntime, COMBINED_IMAGE_PREFIX, LOCAL_IMAGE_PREFIX,
+}`
 - `wrkflw_utils`
 - *... and 1 more imports*
 
@@ -1253,28 +1355,30 @@ wrkflw/
 
 
 **`impl ContainerRuntime for DockerRuntime`**
-  `async fn run_container( &self, image: &str, cmd: &[&str], env_vars: &[(&str, &str)], working_dir: &Path, volumes: &[(&Path, &Path)], ) -> Result<ContainerOutput, ContainerError>`
+  `async fn run_container( &self, image: &str, cmd: &[&str], env_vars: &[(&str, &str)], working_dir: &Path, volumes: &[(&Path, &Path)], entrypoint: Option<&str>, ) -> Result<ContainerOutput, ContainerError>`
 
   `async fn pull_image(&self, image: &str) -> Result<(), ContainerError>`
 
-  `async fn build_image(&self, dockerfile: &Path, tag: &str) -> Result<(), ContainerError>`
+  `async fn build_image( &self, dockerfile: &Path, tag: &str, context_dir: &Path, ) -> Result<(), ContainerError>`
 
   `async fn prepare_language_environment( &self, language: &str, version: Option<&str>, additional_packages: Option<Vec<String>>, ) -> Result<String, ContainerError>`
 
+  `async fn image_exists(&self, tag: &str) -> Result<bool, ContainerError>`
+
 
 **`impl DockerRuntime`**
-  `async fn run_container_inner( &self, image: &str, cmd: &[&str], env_vars: &[(&str, &str)], working_dir: &Path, volumes: &[(&Path, &Path)], ) -> Result<ContainerOutput, ContainerError>`
+  `async fn run_container_inner( &self, image: &str, cmd: &[&str], env_vars: &[(&str, &str)], working_dir: &Path, volumes: &[(&Path, &Path)], entrypoint: Option<&str>, ) -> Result<ContainerOutput, ContainerError>`
 
   `async fn pull_image_inner(&self, image: &str) -> Result<(), ContainerError>`
 
-  `async fn build_image_inner(&self, dockerfile: &Path, tag: &str) -> Result<(), ContainerError>`
+  `async fn build_image_inner( &self, dockerfile: &Path, tag: &str, context_dir: &Path, ) -> Result<(), ContainerError>`
 
 
 ---
 
 ## crates/executor/src/docker_test.rs
 
-**Language:** Rust | **Size:** 6.4 KB | **Lines:** 197
+**Language:** Rust | **Size:** 6.4 KB | **Lines:** 198
 
 **Imports:**
 - `bollard::Docker`
@@ -1293,19 +1397,19 @@ wrkflw/
 
 ## crates/executor/src/engine.rs
 
-**Language:** Rust | **Size:** 96.4 KB | **Lines:** 2608
+**Language:** Rust | **Size:** 196.9 KB | **Lines:** 5511
 
 **Imports:**
 - `bollard::Docker`
 - `futures::future`
-- `regex`
 - `serde_yaml::Value`
 - `std::collections::HashMap`
 - `std::fs`
-- `std::path::Path`
+- `std::path::{Path, PathBuf}`
 - `std::process::Command`
 - `thiserror::Error`
 - `ignore::{gitignore::GitignoreBuilder, Match}`
+- `crate::action_resolver`
 - *... and 12 more imports*
 
 **Declarations:**
@@ -1326,9 +1430,48 @@ wrkflw/
   `fn from(err: String) -> Self`
 
 
-`async fn prepare_action( action: &ActionInfo, runtime: &dyn ContainerRuntime, ) -> Result<String, ExecutionError>`
+`enum PreparedAction`
+> Variants: `NativeDocker`, `Image`, `Composite`
+
+`async fn prepare_action( action: &ActionInfo, runtime: &dyn ContainerRuntime, ) -> Result<PreparedAction, ExecutionError>`
+
+`async fn execute_native_docker_step( ctx: &StepExecutionContext<'_>, step_env: &mut HashMap<String, String>, step_name: String, uses: &str, image: String, entrypoint: Option<String>, args: Vec<String>, ) -> Result<StepResult, ExecutionError>`
+
+`fn sanitize_sub_path(raw: &str) -> Result<(), String>`
+
+`fn sanitize_dockerfile_rel(raw: &str) -> Result<String, String>`
+
+`fn extract_docker_runs_config( definition: Option<&serde_yaml::Value>, ) -> Result<(Option<String>, Vec<String>), String>`
+
+`async fn shallow_clone( repo_url: &str, git_ref: &str, target_dir: &Path, ) -> Result<(), ExecutionError>`
+
+`fn is_git_sha(git_ref: &str) -> bool`
 
 `fn determine_action_image(repository: &str) -> String`
+
+`struct SetupRuntime`
+> Fields: `language: String`, `version: String`, `install_script: String`
+
+`struct SetupActionDef`
+> Fields: `repos: &'static [&'static str]`, `with_key: &'static str`, `default_version: &'static str`, `language: &'static str`, `version_from_ref: bool`
+
+`const SETUP_ACTIONS: &[SetupActionDef] = &[ SetupActionDef`
+
+`fn is_safe_version(version: &str) -> bool`
+
+`fn detect_setup_runtimes(steps: &[Step]) -> Vec<SetupRuntime>`
+
+`fn get_install_script(language: &str, version: &str) -> String`
+
+`fn generate_combined_dockerfile(runtimes: &[SetupRuntime], base_image: &str) -> String`
+
+`fn fnv1a_hash(data: &[u8]) -> u64`
+
+`fn combined_image_tag(runtimes: &[SetupRuntime], dockerfile: &str) -> String`
+
+`async fn build_combined_runtime_image( runtimes: &[SetupRuntime], base_image: &str, runtime: &dyn ContainerRuntime, ) -> Result<String, ExecutionError>`
+
+`async fn resolve_runner_image( job: &Job, runtime: &dyn ContainerRuntime, ) -> Result<String, ExecutionError>`
 
 `async fn execute_job_batch( jobs: &[String], workflow: &WorkflowDefinition, runtime: &dyn ContainerRuntime, env_context: &HashMap<String, String>, verbose: bool, secret_manager: Option<&SecretManager>, secret_masker: Option<&SecretMasker>, ) -> Result<Vec<JobResult>, ExecutionError>`
 
@@ -1346,8 +1489,13 @@ wrkflw/
 
 `async fn execute_matrix_job( job_name: &str, job_template: &Job, combination: &MatrixCombination, workflow: &WorkflowDefinition, runtime: &dyn ContainerRuntime, base_env_context: &HashMap<String, String>, verbose: bool, ) -> Result<JobResult, ExecutionError>`
 
+`enum StepOutcome`
+> Variants: `Completed`, `Skipped`
+
+`async fn run_step_with_guards( step: &Step, step_idx: usize, job_env: &HashMap<String, String>, workflow: &WorkflowDefinition, step_exec_ctx: StepExecutionContext<'_>, ) -> Result<StepOutcome, ExecutionError>`
+
 `struct StepExecutionContext<'a>`
-> Fields: `step: &'a workflow::Step`, `step_idx: usize`, `job_env: &'a HashMap<String, String>`, `working_dir: &'a Path`, `runtime: &'a dyn ContainerRuntime`, `workflow: &'a WorkflowDefinition`, `runner_image: &'a str`, `verbose: bool`, `matrix_combination: &'a Option<HashMap<String, Value>>`, `secret_manager: Option<&'a SecretManager>`, `secret_masker: Option<&'a SecretMasker>`
+> Fields: `step: &'a workflow::Step`, `step_idx: usize`, `job_env: &'a HashMap<String, String>`, `working_dir: &'a Path`, `runtime: &'a dyn ContainerRuntime`, `workflow: &'a WorkflowDefinition`, `runner_image: &'a str`, `verbose: bool`, `matrix_combination: &'a Option<HashMap<String, Value>>`, `secret_manager: Option<&'a SecretManager>`, `secret_masker: Option<&'a SecretMasker>`, `container_config: Option<&'a JobContainer>`
 
 `async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, ExecutionError>`
 
@@ -1361,6 +1509,23 @@ wrkflw/
 
 `fn get_runner_image_from_opt(runs_on: &Option<Vec<String>>) -> String`
 
+`fn get_effective_runner_image(job: &Job) -> String`
+
+`struct StepContainerContext`
+> Fields: `owned_volume_paths: Vec<VolumePathPair>`, `github_mount: Option<VolumePathPair>`
+
+**`impl StepContainerContext`**
+  `fn build_volumes<'a>( &'a self, working_dir: &'a Path, container_workspace: &'a Path, ) -> Vec<(&'a Path, &'a Path)>`
+
+
+`fn prepare_step_container_context( step_env: &mut HashMap<String, String>, job_env: &HashMap<String, String>, container_config: Option<&JobContainer>, ) -> StepContainerContext`
+
+`type VolumePathPair = (PathBuf, PathBuf)`
+
+`fn prepare_container_mounts( step_env: &mut HashMap<String, String>, job_env: &HashMap<String, String>, container_config: Option<&JobContainer>, ) -> (Vec<VolumePathPair>, Option<VolumePathPair>)`
+
+`fn warn_unsupported_container_fields(container: &JobContainer)`
+
 `async fn execute_reusable_workflow_job( ctx: &JobExecutionContext<'_>, uses: &str, with: Option<&HashMap<String, String>>, secrets: Option<&serde_yaml::Value>, ) -> Result<JobResult, ExecutionError>`
 
 `async fn prepare_runner_image( image: &str, runtime: &dyn ContainerRuntime, verbose: bool, ) -> Result<(), ExecutionError>`
@@ -1372,6 +1537,8 @@ wrkflw/
 `fn convert_yaml_to_step(step_yaml: &serde_yaml::Value) -> Result<workflow::Step, String>`
 
 `fn evaluate_job_condition( condition: &str, env_context: &HashMap<String, String>, workflow: &WorkflowDefinition, ) -> bool`
+
+`mod tests`
 
 ---
 
@@ -1410,7 +1577,7 @@ wrkflw/
 
 ## crates/executor/src/lib.rs
 
-**Language:** Rust | **Size:** 360 B | **Lines:** 16
+**Language:** Rust | **Size:** 385 B | **Lines:** 17
 
 **Imports:**
 - `pub use docker::cleanup_resources`
@@ -1424,7 +1591,7 @@ wrkflw/
 
 ## crates/executor/src/podman.rs
 
-**Language:** Rust | **Size:** 33.0 KB | **Lines:** 877
+**Language:** Rust | **Size:** 34.2 KB | **Lines:** 922
 
 **Imports:**
 - `async_trait::async_trait`
@@ -1436,7 +1603,9 @@ wrkflw/
 - `tempfile`
 - `tokio::process::Command`
 - `wrkflw_logging`
-- `wrkflw_runtime::container::{ContainerError, ContainerOutput, ContainerRuntime}`
+- `wrkflw_runtime::container::{
+    ContainerError, ContainerOutput, ContainerRuntime, LOCAL_IMAGE_PREFIX,
+}`
 - *... and 2 more imports*
 
 **Declarations:**
@@ -1464,28 +1633,30 @@ wrkflw/
 
 
 **`impl ContainerRuntime for PodmanRuntime`**
-  `async fn run_container( &self, image: &str, cmd: &[&str], env_vars: &[(&str, &str)], working_dir: &Path, volumes: &[(&Path, &Path)], ) -> Result<ContainerOutput, ContainerError>`
+  `async fn run_container( &self, image: &str, cmd: &[&str], env_vars: &[(&str, &str)], working_dir: &Path, volumes: &[(&Path, &Path)], entrypoint: Option<&str>, ) -> Result<ContainerOutput, ContainerError>`
 
   `async fn pull_image(&self, image: &str) -> Result<(), ContainerError>`
 
-  `async fn build_image(&self, dockerfile: &Path, tag: &str) -> Result<(), ContainerError>`
+  `async fn build_image( &self, dockerfile: &Path, tag: &str, context_dir: &Path, ) -> Result<(), ContainerError>`
 
   `async fn prepare_language_environment( &self, language: &str, version: Option<&str>, additional_packages: Option<Vec<String>>, ) -> Result<String, ContainerError>`
 
+  `async fn image_exists(&self, tag: &str) -> Result<bool, ContainerError>`
+
 
 **`impl PodmanRuntime`**
-  `async fn run_container_inner( &self, image: &str, cmd: &[&str], env_vars: &[(&str, &str)], working_dir: &Path, volumes: &[(&Path, &Path)], ) -> Result<ContainerOutput, ContainerError>`
+  `async fn run_container_inner( &self, image: &str, cmd: &[&str], env_vars: &[(&str, &str)], working_dir: &Path, volumes: &[(&Path, &Path)], entrypoint: Option<&str>, ) -> Result<ContainerOutput, ContainerError>`
 
   `async fn pull_image_inner(&self, image: &str) -> Result<(), ContainerError>`
 
-  `async fn build_image_inner(&self, dockerfile: &Path, tag: &str) -> Result<(), ContainerError>`
+  `async fn build_image_inner( &self, dockerfile: &Path, tag: &str, context_dir: &Path, ) -> Result<(), ContainerError>`
 
 
 ---
 
 ## crates/executor/src/substitution.rs
 
-**Language:** Rust | **Size:** 3.6 KB | **Lines:** 108
+**Language:** Rust | **Size:** 3.6 KB | **Lines:** 106
 
 **Imports:**
 - `lazy_static::lazy_static`
@@ -1517,7 +1688,7 @@ wrkflw/
 
 ## crates/github/src/lib.rs
 
-**Language:** Rust | **Size:** 10.7 KB | **Lines:** 329
+**Language:** Rust | **Size:** 11.1 KB | **Lines:** 340
 
 **Imports:**
 - `lazy_static::lazy_static`
@@ -1554,7 +1725,7 @@ wrkflw/
 
 ## crates/gitlab/src/lib.rs
 
-**Language:** Rust | **Size:** 8.7 KB | **Lines:** 278
+**Language:** Rust | **Size:** 9.1 KB | **Lines:** 284
 
 **Imports:**
 - `lazy_static::lazy_static`
@@ -1626,7 +1797,7 @@ wrkflw/
 
 ## crates/matrix/src/lib.rs
 
-**Language:** Rust | **Size:** 7.2 KB | **Lines:** 248
+**Language:** Rust | **Size:** 13.6 KB | **Lines:** 422
 
 **Imports:**
 - `indexmap::IndexMap`
@@ -1657,6 +1828,8 @@ wrkflw/
 
 `fn value_to_string(value: &Value) -> String`
 
+`mod tests`
+
 ---
 
 ## crates/models/Cargo.toml
@@ -1677,7 +1850,7 @@ wrkflw/
 
 ## crates/models/src/lib.rs
 
-**Language:** Rust | **Size:** 11.3 KB | **Lines:** 338
+**Language:** Rust | **Size:** 14.8 KB | **Lines:** 444
 
 **Declarations:**
 
@@ -1730,7 +1903,7 @@ wrkflw/
 
 ## crates/parser/src/gitlab.rs
 
-**Language:** Rust | **Size:** 8.8 KB | **Lines:** 278
+**Language:** Rust | **Size:** 8.3 KB | **Lines:** 264
 
 **Imports:**
 - `crate::schema::{SchemaType, SchemaValidator}`
@@ -1784,7 +1957,7 @@ wrkflw/
 
 ## crates/parser/src/workflow.rs
 
-**Language:** Rust | **Size:** 6.4 KB | **Lines:** 231
+**Language:** Rust | **Size:** 24.3 KB | **Lines:** 796
 
 **Imports:**
 - `serde::{Deserialize, Deserializer, Serialize}`
@@ -1799,6 +1972,28 @@ wrkflw/
 `fn deserialize_needs<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error> where D: Deserializer<'de>,`
 
 `fn deserialize_runs_on<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error> where D: Deserializer<'de>,`
+
+`fn deserialize_container<'de, D>(deserializer: D) -> Result<Option<JobContainer>, D::Error> where D: Deserializer<'de>,`
+
+**`impl serde::Serialize for ContainerCredentials`**
+  `fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error> where S: serde::Serializer,`
+
+
+**`impl std::fmt::Debug for ContainerCredentials`**
+  `fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result`
+
+
+**`impl Job`**
+  `pub fn matrix_config(&self) -> Option<&MatrixConfig>`
+
+  `pub fn fail_fast(&self) -> bool`
+
+  `pub fn max_parallel(&self) -> Option<usize>`
+
+
+**`impl Step`**
+  `pub fn with_run(name: impl Into<String>, run: impl Into<String>) -> Self`
+
 
 **`impl WorkflowDefinition`**
   `pub fn resolve_action(&self, action_ref: &str) -> ActionInfo`
@@ -1839,7 +2034,7 @@ wrkflw/
 
 ## crates/runtime/src/container.rs
 
-**Language:** Rust | **Size:** 1.9 KB | **Lines:** 65
+**Language:** Rust | **Size:** 2.7 KB | **Lines:** 89
 
 **Imports:**
 - `async_trait::async_trait`
@@ -1856,7 +2051,7 @@ wrkflw/
 
 ## crates/runtime/src/emulation.rs
 
-**Language:** Rust | **Size:** 33.0 KB | **Lines:** 887
+**Language:** Rust | **Size:** 32.5 KB | **Lines:** 896
 
 **Imports:**
 - `crate::container::{ContainerError, ContainerOutput, ContainerRuntime}`
@@ -1888,11 +2083,13 @@ wrkflw/
 
 
 **`impl ContainerRuntime for EmulationRuntime`**
-  `async fn run_container( &self, _image: &str, command: &[&str], env_vars: &[(&str, &str)], working_dir: &Path, _volumes: &[(&Path, &Path)], ) -> Result<ContainerOutput, ContainerError>`
+  `async fn run_container( &self, _image: &str, command: &[&str], env_vars: &[(&str, &str)], working_dir: &Path, _volumes: &[(&Path, &Path)], _entrypoint: Option<&str>, ) -> Result<ContainerOutput, ContainerError>`
 
   `async fn pull_image(&self, image: &str) -> Result<(), ContainerError>`
 
-  `async fn build_image(&self, dockerfile: &Path, tag: &str) -> Result<(), ContainerError>`
+  `async fn build_image( &self, dockerfile: &Path, tag: &str, _context_dir: &Path, ) -> Result<(), ContainerError>`
+
+  `async fn image_exists(&self, _tag: &str) -> Result<bool, ContainerError>`
 
   `async fn prepare_language_environment( &self, language: &str, version: Option<&str>, _additional_packages: Option<Vec<String>>, ) -> Result<String, ContainerError>`
 
@@ -1911,11 +2108,13 @@ wrkflw/
 
 `async fn cleanup_workspaces()`
 
+`mod tests`
+
 ---
 
 ## crates/runtime/src/emulation_test.rs
 
-**Language:** Rust | **Size:** 8.6 KB | **Lines:** 240
+**Language:** Rust | **Size:** 8.7 KB | **Lines:** 241
 
 **Imports:**
 - `std::path::{Path, PathBuf}`
@@ -1996,7 +2195,7 @@ wrkflw/
 
 ## crates/runtime/src/secure_emulation.rs
 
-**Language:** Rust | **Size:** 12.7 KB | **Lines:** 339
+**Language:** Rust | **Size:** 13.3 KB | **Lines:** 359
 
 **Imports:**
 - `crate::container::{ContainerError, ContainerOutput, ContainerRuntime}`
@@ -2018,11 +2217,13 @@ wrkflw/
 
 
 **`impl ContainerRuntime for SecureEmulationRuntime`**
-  `async fn run_container( &self, image: &str, command: &[&str], env_vars: &[(&str, &str)], working_dir: &Path, _volumes: &[(&Path, &Path)], ) -> Result<ContainerOutput, ContainerError>`
+  `async fn run_container( &self, image: &str, command: &[&str], env_vars: &[(&str, &str)], working_dir: &Path, _volumes: &[(&Path, &Path)], entrypoint: Option<&str>, ) -> Result<ContainerOutput, ContainerError>`
 
   `async fn pull_image(&self, image: &str) -> Result<(), ContainerError>`
 
-  `async fn build_image(&self, dockerfile: &Path, tag: &str) -> Result<(), ContainerError>`
+  `async fn build_image( &self, dockerfile: &Path, tag: &str, _context_dir: &Path, ) -> Result<(), ContainerError>`
+
+  `async fn image_exists(&self, _tag: &str) -> Result<bool, ContainerError>`
 
   `async fn prepare_language_environment( &self, language: &str, version: Option<&str>, _additional_packages: Option<Vec<String>>, ) -> Result<String, ContainerError>`
 
@@ -2199,7 +2400,7 @@ wrkflw/
 
 ## crates/secrets/src/masking.rs
 
-**Language:** Rust | **Size:** 10.4 KB | **Lines:** 348
+**Language:** Rust | **Size:** 10.4 KB | **Lines:** 345
 
 **Imports:**
 - `regex::Regex`
@@ -2409,7 +2610,7 @@ wrkflw/
 
 ## crates/secrets/src/storage.rs
 
-**Language:** Rust | **Size:** 10.9 KB | **Lines:** 351
+**Language:** Rust | **Size:** 13.0 KB | **Lines:** 394
 
 **Imports:**
 - `crate::{SecretError, SecretResult}`
@@ -2426,7 +2627,7 @@ wrkflw/
 **`impl EncryptedSecretStore`**
   `pub fn new() -> SecretResult<(Self, [u8; 32])>`
 
-  `pub fn from_data(secrets: HashMap<String, String>, salt: String, nonce: String) -> Self`
+  `pub fn from_data(secrets: HashMap<String, String>, salt: String) -> Self`
 
   `pub fn add_secret(&mut self, key: &[u8; 32], name: &str, value: &str) -> SecretResult<()>`
 
@@ -2442,9 +2643,9 @@ wrkflw/
 
   `pub fn clear(&mut self)`
 
-  `fn encrypt_value(&self, key: &[u8; 32], value: &str) -> SecretResult<String>`
+  `fn encrypt_value(key: &[u8; 32], value: &str) -> SecretResult<String>`
 
-  `fn decrypt_value(&self, key: &[u8; 32], encrypted: &str) -> SecretResult<String>`
+  `fn decrypt_value(key: &[u8; 32], encrypted: &str) -> SecretResult<String>`
 
   `fn generate_salt() -> [u8; 32]`
 
@@ -2572,7 +2773,7 @@ wrkflw/
 
 ## crates/ui/src/app/mod.rs
 
-**Language:** Rust | **Size:** 21.1 KB | **Lines:** 496
+**Language:** Rust | **Size:** 21.3 KB | **Lines:** 503
 
 **Imports:**
 - `crate::handlers::workflow::start_next_workflow_execution`
@@ -2601,7 +2802,7 @@ wrkflw/
 
 ## crates/ui/src/app/state.rs
 
-**Language:** Rust | **Size:** 40.9 KB | **Lines:** 1069
+**Language:** Rust | **Size:** 40.9 KB | **Lines:** 1065
 
 **Imports:**
 - `crate::log_processor::{LogProcessingRequest, LogProcessor, ProcessedLogEntry}`
@@ -2619,7 +2820,7 @@ wrkflw/
 **Declarations:**
 
 **`impl App`**
-  `pub fn new( runtime_type: RuntimeType, tx: mpsc::Sender<ExecutionResultMsg>, preserve_containers_on_failure: bool, ) -> App`
+  `pub fn new( runtime_type: RuntimeType, tx: mpsc::Sender<ExecutionResultMsg>, preserve_containers_on_failure: bool, show_action_messages: bool, ) -> App`
 
   `pub fn toggle_selected(&mut self)`
 
@@ -2807,7 +3008,7 @@ wrkflw/
 
 ## crates/ui/src/handlers/workflow.rs
 
-**Language:** Rust | **Size:** 22.1 KB | **Lines:** 569
+**Language:** Rust | **Size:** 22.3 KB | **Lines:** 575
 
 **Imports:**
 - `crate::app::App`
@@ -2839,7 +3040,7 @@ wrkflw/
 
 ## crates/ui/src/log_processor.rs
 
-**Language:** Rust | **Size:** 10.4 KB | **Lines:** 305
+**Language:** Rust | **Size:** 11.2 KB | **Lines:** 330
 
 **Imports:**
 - `crate::models::LogFilterLevel`
@@ -2879,6 +3080,8 @@ wrkflw/
 **`impl Default for LogProcessor`**
   `fn default() -> Self`
 
+
+`mod tests`
 
 ---
 
@@ -3025,7 +3228,7 @@ wrkflw/
 
 ## crates/ui/src/views/status_bar.rs
 
-**Language:** Rust | **Size:** 7.3 KB | **Lines:** 212
+**Language:** Rust | **Size:** 7.3 KB | **Lines:** 211
 
 **Imports:**
 - `crate::app::App`
@@ -3066,7 +3269,7 @@ wrkflw/
 
 ## crates/ui/src/views/workflows_tab.rs
 
-**Language:** Rust | **Size:** 4.5 KB | **Lines:** 131
+**Language:** Rust | **Size:** 4.7 KB | **Lines:** 137
 
 **Imports:**
 - `crate::app::App`
@@ -3143,7 +3346,7 @@ wrkflw/
 
 ## crates/validators/src/gitlab.rs
 
-**Language:** Rust | **Size:** 7.7 KB | **Lines:** 234
+**Language:** Rust | **Size:** 7.8 KB | **Lines:** 235
 
 **Imports:**
 - `std::collections::HashMap`
@@ -3168,14 +3371,21 @@ wrkflw/
 
 ## crates/validators/src/jobs.rs
 
-**Language:** Rust | **Size:** 4.7 KB | **Lines:** 102
+**Language:** Rust | **Size:** 12.0 KB | **Lines:** 354
 
 **Imports:**
+- `std::collections::{HashMap, HashSet}`
 - `crate::{validate_matrix, validate_steps}`
 - `serde_yaml::Value`
 - `wrkflw_models::ValidationResult`
 
 **Declarations:**
+
+`fn detect_cyclic_needs(jobs_map: &serde_yaml::Mapping, result: &mut ValidationResult)`
+
+`fn dfs_detect_cycle( node: &str, graph: &HashMap<String, Vec<String>>, visited: &mut HashSet<String>, in_stack: &mut HashSet<String>, rec_stack: &mut Vec<String>, reported_cycles: &mut HashSet<Vec<String>>, result: &mut ValidationResult, )`
+
+`mod tests`
 
 ---
 
@@ -3227,7 +3437,7 @@ wrkflw/
 
 ## crates/validators/src/steps.rs
 
-**Language:** Rust | **Size:** 2.2 KB | **Lines:** 57
+**Language:** Rust | **Size:** 3.5 KB | **Lines:** 107
 
 **Imports:**
 - `crate::validate_action_reference`
@@ -3237,11 +3447,13 @@ wrkflw/
 
 **Declarations:**
 
+`mod tests`
+
 ---
 
 ## crates/validators/src/triggers.rs
 
-**Language:** Rust | **Size:** 3.0 KB | **Lines:** 96
+**Language:** Rust | **Size:** 8.3 KB | **Lines:** 263
 
 **Imports:**
 - `serde_yaml::Value`
@@ -3250,6 +3462,12 @@ wrkflw/
 **Declarations:**
 
 `fn validate_cron_syntax(cron: &str, result: &mut ValidationResult)`
+
+`fn is_valid_cron_field(field: &str, min: u32, max: u32) -> bool`
+
+`fn is_valid_cron_atom(atom: &str, min: u32, max: u32) -> bool`
+
+`mod tests`
 
 ---
 
@@ -3266,7 +3484,7 @@ wrkflw/
 
 ## crates/wrkflw/README.md
 
-**Language:** Markdown | **Size:** 3.6 KB | **Lines:** 112
+**Language:** Markdown | **Size:** 3.6 KB | **Lines:** 113
 
 **Declarations:**
 
@@ -3293,7 +3511,7 @@ wrkflw/
 
 ## crates/wrkflw/src/main.rs
 
-**Language:** Rust | **Size:** 26.7 KB | **Lines:** 708
+**Language:** Rust | **Size:** 29.2 KB | **Lines:** 783
 
 **Imports:**
 - `bollard::Docker`
@@ -3331,7 +3549,28 @@ wrkflw/
 
 `fn validate_gitlab_pipeline(path: &Path, verbose: bool) -> bool`
 
-`fn list_workflows_and_pipelines(verbose: bool)`
+`fn list_workflows_and_pipelines(verbose: bool, show_jobs: bool)`
+
+---
+
+## crates/wrkflw/tests/target_job_test.rs
+
+**Language:** Rust | **Size:** 3.6 KB | **Lines:** 141
+
+**Imports:**
+- `std::fs`
+- `tempfile::tempdir`
+- `wrkflw_lib::executor::engine::{execute_workflow, ExecutionConfig, RuntimeType}`
+
+**Declarations:**
+
+`fn write_file(path: &std::path::Path, content: &str)`
+
+`async fn test_target_job_runs_only_specified_job()`
+
+`async fn test_target_job_not_found_returns_error()`
+
+`async fn test_target_job_with_no_deps_runs_alone()`
 
 ---
 
@@ -3348,6 +3587,20 @@ wrkflw/
 **Language:** YAML | **Size:** 6.9 KB | **Lines:** 213
 
 **Declarations:**
+
+---
+
+## hello.cpp
+
+**Language:** C++ | **Size:** 127 B | **Lines:** 6
+
+**Declarations:**
+
+---
+
+## hello.rs
+
+**Language:** Rust | **Size:** 70 B | **Lines:** 4
 
 ---
 
@@ -3378,6 +3631,15 @@ wrkflw/
 ## scripts/bump-crate.sh
 
 **Language:** Shell | **Size:** 3.1 KB | **Lines:** 97
+
+---
+
+## test.py
+
+**Language:** Python | **Size:** 53 B | **Lines:** 2
+
+**Imports:**
+- `import sys`
 
 ---
 
@@ -3516,7 +3778,7 @@ wrkflw/
 
 ## tests/reusable_workflow_execution_test.rs
 
-**Language:** Rust | **Size:** 3.0 KB | **Lines:** 120
+**Language:** Rust | **Size:** 3.1 KB | **Lines:** 122
 
 **Imports:**
 - `std::fs`
@@ -3671,6 +3933,14 @@ wrkflw/
 ## tests/workflows/matrix-example.yml
 
 **Language:** YAML | **Size:** 1.0 KB | **Lines:** 44
+
+**Declarations:**
+
+---
+
+## tests/workflows/multi-runtime-test.yml
+
+**Language:** YAML | **Size:** 688 B | **Lines:** 27
 
 **Declarations:**
 

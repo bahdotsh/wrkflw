@@ -236,6 +236,8 @@ mod tests {
             uses: None,
             with: None,
             secrets: None,
+            timeout_minutes: None,
+            defaults: None,
         }
     }
 

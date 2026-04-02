@@ -122,6 +122,20 @@ pub struct JobContainer {
     pub options: Option<String>,
 }
 
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct DefaultsRun {
+    #[serde(default)]
+    pub shell: Option<String>,
+    #[serde(default, rename = "working-directory")]
+    pub working_directory: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct Defaults {
+    #[serde(default)]
+    pub run: Option<DefaultsRun>,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 pub struct WorkflowDefinition {
     pub name: String,
@@ -130,6 +144,8 @@ pub struct WorkflowDefinition {
     #[serde(rename = "on")] // Raw access to the 'on' field for custom handling
     pub on_raw: serde_yaml::Value,
     pub jobs: HashMap<String, Job>,
+    #[serde(default)]
+    pub defaults: Option<Defaults>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Default)]
@@ -171,6 +187,10 @@ pub struct Job {
     pub with: Option<HashMap<String, String>>,
     #[serde(default)]
     pub secrets: Option<serde_yaml::Value>,
+    #[serde(default, rename = "timeout-minutes")]
+    pub timeout_minutes: Option<f64>,
+    #[serde(default)]
+    pub defaults: Option<Defaults>,
 }
 
 impl Job {
@@ -391,6 +411,7 @@ mod tests {
             on: vec![],
             on_raw: serde_yaml::Value::Null,
             jobs: Default::default(),
+            defaults: None,
         };
         let info = wd.resolve_action("actions/checkout@v4");
         assert_eq!(info.repository, "actions/checkout");
@@ -407,6 +428,7 @@ mod tests {
             on: vec![],
             on_raw: serde_yaml::Value::Null,
             jobs: Default::default(),
+            defaults: None,
         };
         let info = wd.resolve_action("owner/repo");
         assert_eq!(info.repository, "owner/repo");
@@ -421,6 +443,7 @@ mod tests {
             on: vec![],
             on_raw: serde_yaml::Value::Null,
             jobs: Default::default(),
+            defaults: None,
         };
         let info = wd.resolve_action("docker://alpine:3.18");
         assert_eq!(info.repository, "docker://alpine:3.18");
@@ -436,6 +459,7 @@ mod tests {
             on: vec![],
             on_raw: serde_yaml::Value::Null,
             jobs: Default::default(),
+            defaults: None,
         };
         let info = wd.resolve_action("./my-action");
         assert_eq!(info.repository, "./my-action");
@@ -451,6 +475,7 @@ mod tests {
             on: vec![],
             on_raw: serde_yaml::Value::Null,
             jobs: Default::default(),
+            defaults: None,
         };
         // Docker image references can use @sha256:digest — the full string is the image ref
         let info = wd.resolve_action("docker://alpine@sha256:abcdef1234567890");
@@ -467,6 +492,7 @@ mod tests {
             on: vec![],
             on_raw: serde_yaml::Value::Null,
             jobs: Default::default(),
+            defaults: None,
         };
         let info = wd.resolve_action("actions/checkout@a81bbbf8298c0fa03ea29cdc473d45769f953675");
         assert_eq!(info.repository, "actions/checkout");
@@ -481,6 +507,7 @@ mod tests {
             on: vec![],
             on_raw: serde_yaml::Value::Null,
             jobs: Default::default(),
+            defaults: None,
         };
         let info = wd.resolve_action("owner/repo/path/to/action@v2");
         assert_eq!(info.repository, "owner/repo");
@@ -497,6 +524,7 @@ mod tests {
             on: vec![],
             on_raw: serde_yaml::Value::Null,
             jobs: Default::default(),
+            defaults: None,
         };
         let info = wd.resolve_action("github/codeql-action/init@v3");
         assert_eq!(info.repository, "github/codeql-action");
@@ -714,6 +742,83 @@ jobs:
         assert_eq!(step.working_directory.as_deref(), Some("./src"));
         assert_eq!(step.timeout_minutes, Some(10.5));
         assert_eq!(step.continue_on_error, Some(true));
+    }
+
+    #[test]
+    fn parse_job_timeout_minutes() {
+        let temp_dir = tempdir().unwrap();
+        let workflow_path = temp_dir.path().join("workflow.yml");
+
+        let content = r#"
+name: timeout-test
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - run: echo hello
+  no-timeout:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo world
+"#;
+        fs::write(&workflow_path, content).unwrap();
+
+        let parsed = parse_workflow(&workflow_path).unwrap();
+        let build_job = parsed.jobs.get("build").unwrap();
+        assert_eq!(build_job.timeout_minutes, Some(30.0));
+
+        let no_timeout_job = parsed.jobs.get("no-timeout").unwrap();
+        assert_eq!(no_timeout_job.timeout_minutes, None);
+    }
+
+    #[test]
+    fn parse_workflow_defaults() {
+        let temp_dir = tempdir().unwrap();
+        let workflow_path = temp_dir.path().join("workflow.yml");
+
+        let content = r#"
+name: defaults-test
+on: push
+defaults:
+  run:
+    shell: bash
+    working-directory: ./src
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: sh
+        working-directory: ./app
+    steps:
+      - run: echo hello
+  no-defaults:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo world
+"#;
+        fs::write(&workflow_path, content).unwrap();
+
+        let parsed = parse_workflow(&workflow_path).unwrap();
+
+        // Workflow-level defaults
+        let wf_defaults = parsed.defaults.as_ref().unwrap();
+        let wf_run = wf_defaults.run.as_ref().unwrap();
+        assert_eq!(wf_run.shell.as_deref(), Some("bash"));
+        assert_eq!(wf_run.working_directory.as_deref(), Some("./src"));
+
+        // Job-level defaults override workflow defaults
+        let build_job = parsed.jobs.get("build").unwrap();
+        let job_defaults = build_job.defaults.as_ref().unwrap();
+        let job_run = job_defaults.run.as_ref().unwrap();
+        assert_eq!(job_run.shell.as_deref(), Some("sh"));
+        assert_eq!(job_run.working_directory.as_deref(), Some("./app"));
+
+        // Job without defaults
+        let no_defaults_job = parsed.jobs.get("no-defaults").unwrap();
+        assert!(no_defaults_job.defaults.is_none());
     }
 
     #[test]

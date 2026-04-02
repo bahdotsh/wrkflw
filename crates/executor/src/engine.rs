@@ -1695,6 +1695,9 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
         job_env.insert(key.clone(), value.clone());
     }
 
+    // Add job-specific context
+    environment::add_job_context(&mut job_env, ctx.job_name);
+
     // Execute job steps
     let mut step_results = Vec::new();
     let mut job_logs = String::new();
@@ -1716,54 +1719,82 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
     // Determine runner image: prefer job container, then detect setup actions, fall back to runs-on
     let runner_image_value = resolve_runner_image(job, ctx.runtime).await?;
 
-    for (idx, step) in job.steps.iter().enumerate() {
-        let outcome = run_step_with_guards(
-            step,
-            idx,
-            &job_env,
-            ctx.workflow,
-            StepExecutionContext {
+    // GHA default job timeout is 360 minutes
+    let job_timeout =
+        std::time::Duration::from_secs_f64(job.timeout_minutes.unwrap_or(360.0) * 60.0);
+
+    let step_loop = async {
+        for (idx, step) in job.steps.iter().enumerate() {
+            let outcome = run_step_with_guards(
                 step,
-                step_idx: idx,
-                job_env: &job_env,
-                working_dir: job_dir.path(),
-                runtime: ctx.runtime,
-                workflow: ctx.workflow,
-                runner_image: &runner_image_value,
-                verbose: ctx.verbose,
-                matrix_combination: &None,
-                secret_manager: ctx.secret_manager,
-                secret_masker: ctx.secret_masker,
-                container_config: job.container.as_ref(),
-            },
-        )
-        .await?;
+                idx,
+                &job_env,
+                ctx.workflow,
+                StepExecutionContext {
+                    step,
+                    step_idx: idx,
+                    job_env: &job_env,
+                    working_dir: job_dir.path(),
+                    runtime: ctx.runtime,
+                    workflow: ctx.workflow,
+                    runner_image: &runner_image_value,
+                    verbose: ctx.verbose,
+                    matrix_combination: &None,
+                    secret_manager: ctx.secret_manager,
+                    secret_masker: ctx.secret_masker,
+                    container_config: job.container.as_ref(),
+                    workflow_defaults: ctx.workflow.defaults.as_ref(),
+                    job_defaults: job.defaults.as_ref(),
+                },
+            )
+            .await?;
 
-        match outcome {
-            StepOutcome::Skipped(result) => {
-                step_results.push(result);
-            }
-            StepOutcome::Completed { result, abort_job } => {
-                // Add step output to logs only in verbose mode or if there's an error
-                if ctx.verbose || result.status == StepStatus::Failure {
-                    job_logs.push_str(&format!(
-                        "\n=== Output from step '{}' ===\n{}\n=== End output ===\n\n",
-                        result.name, result.output
-                    ));
-                } else {
-                    job_logs.push_str(&format!(
-                        "Step '{}' completed with status: {:?}\n",
-                        result.name, result.status
-                    ));
+            match outcome {
+                StepOutcome::Skipped(result) => {
+                    step_results.push(result);
                 }
+                StepOutcome::Completed { result, abort_job } => {
+                    // Add step output to logs only in verbose mode or if there's an error
+                    if ctx.verbose || result.status == StepStatus::Failure {
+                        job_logs.push_str(&format!(
+                            "\n=== Output from step '{}' ===\n{}\n=== End output ===\n\n",
+                            result.name, result.output
+                        ));
+                    } else {
+                        job_logs.push_str(&format!(
+                            "Step '{}' completed with status: {:?}\n",
+                            result.name, result.status
+                        ));
+                    }
 
-                step_results.push(result);
+                    step_results.push(result);
 
-                if abort_job {
-                    job_success = false;
-                    break;
+                    if abort_job {
+                        job_success = false;
+                        break;
+                    }
                 }
             }
+        }
+
+        Ok::<(), ExecutionError>(())
+    };
+
+    match tokio::time::timeout(job_timeout, step_loop).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return Err(e),
+        Err(_) => {
+            let timeout_mins = job.timeout_minutes.unwrap_or(360.0);
+            wrkflw_logging::error(&format!(
+                "Job '{}' exceeded timeout of {} minutes",
+                ctx.job_name, timeout_mins
+            ));
+            return Ok(JobResult {
+                name: ctx.job_name.to_string(),
+                status: JobStatus::Failure,
+                steps: step_results,
+                logs: format!("{}\nJob timed out after {} minutes", job_logs, timeout_mins),
+            });
         }
     }
 
@@ -1935,6 +1966,8 @@ async fn execute_matrix_job(
                     secret_manager: None,
                     secret_masker: None,
                     container_config: job_template.container.as_ref(),
+                    workflow_defaults: workflow.defaults.as_ref(),
+                    job_defaults: job_template.defaults.as_ref(),
                 },
             )
             .await?;
@@ -2019,7 +2052,28 @@ async fn run_step_with_guards(
         }
     }
 
-    match execute_step(step_exec_ctx).await {
+    // Wrap step execution with optional timeout
+    let step_result = if let Some(minutes) = step.timeout_minutes {
+        let dur = std::time::Duration::from_secs_f64(minutes * 60.0);
+        match tokio::time::timeout(dur, execute_step(step_exec_ctx)).await {
+            Ok(result) => result,
+            Err(_) => {
+                wrkflw_logging::error(&format!(
+                    "  Step '{}' exceeded timeout of {} minutes",
+                    step_name, minutes
+                ));
+                Ok(StepResult {
+                    name: step_name.clone(),
+                    status: StepStatus::Failure,
+                    output: format!("Step timed out after {} minutes", minutes),
+                })
+            }
+        }
+    } else {
+        execute_step(step_exec_ctx).await
+    };
+
+    match step_result {
         Ok(result) => {
             let abort_job = if result.status == StepStatus::Failure {
                 if step.continue_on_error == Some(true) {
@@ -2080,6 +2134,8 @@ struct StepExecutionContext<'a> {
     #[allow(dead_code)] // Planned for future implementation
     secret_masker: Option<&'a SecretMasker>,
     container_config: Option<&'a JobContainer>,
+    workflow_defaults: Option<&'a workflow::Defaults>,
+    job_defaults: Option<&'a workflow::Defaults>,
 }
 
 async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, ExecutionError> {
@@ -2651,15 +2707,60 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
             run.clone()
         };
 
+        // Resolve expression substitutions (hashFiles, matrix vars)
+        let resolved_run = crate::substitution::preprocess_expressions(
+            &resolved_run,
+            ctx.working_dir,
+            ctx.matrix_combination,
+        );
+
         // Check if this is a cargo command
         let is_cargo_cmd = resolved_run.trim().starts_with("cargo");
 
-        // For complex shell commands, use bash to execute them properly
-        // This handles quotes, pipes, redirections, and command substitutions correctly
-        let cmd_parts = vec!["bash", "-c", &resolved_run];
+        // Resolve effective shell: step > job defaults > workflow defaults > "bash"
+        let effective_shell = ctx
+            .step
+            .shell
+            .as_deref()
+            .or_else(|| {
+                ctx.job_defaults
+                    .and_then(|d| d.run.as_ref()?.shell.as_deref())
+            })
+            .or_else(|| {
+                ctx.workflow_defaults
+                    .and_then(|d| d.run.as_ref()?.shell.as_deref())
+            })
+            .unwrap_or("bash");
+
+        let cmd_parts = match effective_shell {
+            "bash" => vec!["bash", "-e", "-c", &resolved_run],
+            "sh" => vec!["sh", "-e", "-c", &resolved_run],
+            "python" => vec!["python", "-c", &resolved_run],
+            "pwsh" | "powershell" => vec!["pwsh", "-command", &resolved_run],
+            other => vec![other, "-c", &resolved_run],
+        };
+
+        // Resolve effective working directory: step > job defaults > workflow defaults
+        let effective_wd = ctx
+            .step
+            .working_directory
+            .as_deref()
+            .or_else(|| {
+                ctx.job_defaults
+                    .and_then(|d| d.run.as_ref()?.working_directory.as_deref())
+            })
+            .or_else(|| {
+                ctx.workflow_defaults
+                    .and_then(|d| d.run.as_ref()?.working_directory.as_deref())
+            });
 
         // Define the standard workspace path inside the container
         let container_workspace = Path::new("/github/workspace");
+        let final_workspace = if let Some(wd) = effective_wd {
+            container_workspace.join(wd)
+        } else {
+            container_workspace.to_path_buf()
+        };
 
         let mount_ctx =
             prepare_step_container_context(&mut step_env, ctx.job_env, ctx.container_config);
@@ -2676,7 +2777,7 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                 ctx.runner_image,
                 &cmd_parts,
                 &env_vars,
-                container_workspace,
+                &final_workspace,
                 &volumes,
                 None,
             )
@@ -3565,6 +3666,7 @@ async fn execute_composite_action(
                         on: vec![],
                         on_raw: serde_yaml::Value::Null,
                         jobs: HashMap::new(),
+                        defaults: None,
                     },
                     runner_image,
                     verbose,
@@ -3572,6 +3674,8 @@ async fn execute_composite_action(
                     secret_manager: None, // Composite actions don't have secrets yet
                     secret_masker: None,
                     container_config: None, // Composite actions don't use job containers
+                    workflow_defaults: None,
+                    job_defaults: None,
                 }))
                 .await?;
 
@@ -3883,6 +3987,8 @@ mod tests {
             uses: None,
             with: None,
             secrets: None,
+            timeout_minutes: None,
+            defaults: None,
         }
     }
 
@@ -4176,6 +4282,7 @@ mod tests {
             on: Vec::new(),
             on_raw: serde_yaml::Value::Null,
             jobs: HashMap::new(),
+            defaults: None,
         }
     }
 
@@ -4693,6 +4800,7 @@ runs:
             on: vec![],
             on_raw: serde_yaml::Value::Null,
             jobs: Default::default(),
+            defaults: None,
         }
     }
 
@@ -4743,6 +4851,8 @@ runs:
             secret_manager: None,
             secret_masker: None,
             container_config: None,
+            workflow_defaults: None,
+            job_defaults: None,
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -4789,6 +4899,8 @@ runs:
             secret_manager: None,
             secret_masker: None,
             container_config: None,
+            workflow_defaults: None,
+            job_defaults: None,
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -4840,6 +4952,8 @@ runs:
             secret_manager: None,
             secret_masker: None,
             container_config: None,
+            workflow_defaults: None,
+            job_defaults: None,
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -4884,6 +4998,8 @@ runs:
             secret_manager: None,
             secret_masker: None,
             container_config: None,
+            workflow_defaults: None,
+            job_defaults: None,
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -4929,6 +5045,8 @@ runs:
             secret_manager: None,
             secret_masker: None,
             container_config: None,
+            workflow_defaults: None,
+            job_defaults: None,
         };
 
         let result = execute_step(ctx).await;
@@ -4973,6 +5091,8 @@ runs:
             secret_manager: None,
             secret_masker: None,
             container_config: None,
+            workflow_defaults: None,
+            job_defaults: None,
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -5015,6 +5135,8 @@ runs:
             secret_manager: None,
             secret_masker: None,
             container_config: None,
+            workflow_defaults: None,
+            job_defaults: None,
         };
 
         let result = execute_step(ctx).await.unwrap();

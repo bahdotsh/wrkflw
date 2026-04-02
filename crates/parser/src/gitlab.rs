@@ -119,6 +119,7 @@ pub fn convert_to_workflow_format(pipeline: &Pipeline) -> workflow::WorkflowDefi
         on: vec!["push".to_string()], // Default trigger
         on_raw: serde_yaml::Value::String("push".to_string()),
         jobs: HashMap::new(),
+        defaults: None,
     };
 
     // Convert each GitLab job to a GitHub Actions job
@@ -143,6 +144,8 @@ pub fn convert_to_workflow_format(pipeline: &Pipeline) -> workflow::WorkflowDefi
             uses: None,
             with: None,
             secrets: None,
+            timeout_minutes: None,
+            defaults: None,
         };
 
         // Add job-specific environment variables

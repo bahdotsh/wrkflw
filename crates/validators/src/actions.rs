@@ -145,7 +145,11 @@ fn validate_local_action_inputs(
 
         let is_required = input_def
             .get("required")
-            .and_then(|v| v.as_bool())
+            .map(|v| match v {
+                serde_yaml::Value::Bool(b) => *b,
+                serde_yaml::Value::String(s) => s.eq_ignore_ascii_case("true"),
+                _ => false,
+            })
             .unwrap_or(false);
 
         let has_default = input_def.get("default").is_some();
@@ -439,6 +443,44 @@ runs:
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn test_required_as_string_true() {
+        let dir = tempdir().unwrap();
+        let action_dir = dir.path().join("my-action");
+        fs::create_dir(&action_dir).unwrap();
+        fs::write(
+            action_dir.join("action.yml"),
+            r#"
+name: 'Test Action'
+inputs:
+  token:
+    description: 'Required as string'
+    required: 'true'
+runs:
+  using: 'composite'
+  steps:
+    - run: echo hello
+"#,
+        )
+        .unwrap();
+
+        let mut result = ValidationResult::new();
+        validate_action_reference(
+            "./my-action",
+            None,
+            "build",
+            0,
+            Some(dir.path()),
+            &mut result,
+        );
+
+        assert!(!result.is_valid);
+        assert!(result
+            .issues
+            .iter()
+            .any(|i| i.contains("requires input 'token'")));
     }
 
     #[test]

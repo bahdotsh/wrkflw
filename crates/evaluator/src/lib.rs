@@ -61,7 +61,7 @@ pub fn evaluate_workflow_file(path: &Path, verbose: bool) -> Result<ValidationRe
 }
 
 /// Walk up from the workflow file's directory to find the repository root (.git directory).
-/// Falls back to the current working directory if no .git is found.
+/// Returns `None` if no `.git` directory is found.
 fn find_repo_root(workflow_path: &Path) -> Option<PathBuf> {
     let canonical = fs::canonicalize(workflow_path).ok()?;
     let mut dir = canonical.parent();
@@ -71,5 +71,5 @@ fn find_repo_root(workflow_path: &Path) -> Option<PathBuf> {
         }
         dir = d.parent();
     }
-    std::env::current_dir().ok()
+    None
 }

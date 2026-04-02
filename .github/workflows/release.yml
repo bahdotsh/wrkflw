@@ -29,7 +29,7 @@ jobs:
           fetch-depth: 0
       - name: Validate tag format
         run: |
-          if [[ ! "${RELEASE_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+          if [[ ! "${RELEASE_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$ ]]; then
             echo "::error::Tag '${RELEASE_TAG}' does not match expected format vX.Y.Z"
             exit 1
           fi
@@ -43,7 +43,8 @@ jobs:
         id: changelog
         run: |
           # Get the previous tag
-          prev_tag=$(git tag --sort=-v:refname | grep "^v" | sed -n "/^${RELEASE_TAG}\$/,\$p" | sed '1d' | head -1)
+          prev_tag=$(git tag --sort=-v:refname | grep "^v" | grep -F -x -A1 "${RELEASE_TAG}" | tail -1)
+          [ "$prev_tag" = "${RELEASE_TAG}" ] && prev_tag=""  # No previous tag found
           if [ -z "$prev_tag" ]; then
             # First release: use all commits
             changelog=$(git log --pretty=format:"- %s (%h)" --no-merges --max-count=100)

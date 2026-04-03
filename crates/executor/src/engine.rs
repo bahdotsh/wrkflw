@@ -632,6 +632,13 @@ async fn prepare_action(
             )));
         }
 
+        // Parse action.yml/action.yaml once — used for both Docker and composite detection
+        let definition: Option<serde_yaml::Value> =
+            std::fs::read_to_string(action_dir.join("action.yml"))
+                .or_else(|_| std::fs::read_to_string(action_dir.join("action.yaml")))
+                .ok()
+                .and_then(|s| serde_yaml::from_str(&s).ok());
+
         let dockerfile = action_dir.join("Dockerfile");
         if dockerfile.exists() {
             // It's a Docker action, build it
@@ -642,12 +649,6 @@ async fn prepare_action(
                 .await
                 .map_err(|e| ExecutionError::Runtime(format!("Failed to build image: {}", e)))?;
 
-            // Parse action.yml if present for entrypoint/args
-            let definition: Option<serde_yaml::Value> =
-                std::fs::read_to_string(action_dir.join("action.yml"))
-                    .or_else(|_| std::fs::read_to_string(action_dir.join("action.yaml")))
-                    .ok()
-                    .and_then(|s| serde_yaml::from_str(&s).ok());
             let (entrypoint, args) =
                 extract_docker_runs_config(definition.as_ref()).map_err(|e| {
                     ExecutionError::Execution(format!(
@@ -662,13 +663,7 @@ async fn prepare_action(
                 args,
             });
         } else {
-            // Check action.yml to determine if it's a composite or JS action
-            let definition: Option<serde_yaml::Value> =
-                std::fs::read_to_string(action_dir.join("action.yml"))
-                    .or_else(|_| std::fs::read_to_string(action_dir.join("action.yaml")))
-                    .ok()
-                    .and_then(|s| serde_yaml::from_str(&s).ok());
-
+            // Check if it's a composite action
             if let Some(def) = &definition {
                 if let Some(using) = def
                     .get("runs")

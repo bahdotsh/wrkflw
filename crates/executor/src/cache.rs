@@ -13,10 +13,19 @@ pub struct CacheStore {
 
 impl CacheStore {
     /// Create a new cache store. Uses `~/.wrkflw/cache/` by default.
-    pub fn new() -> Option<Self> {
-        let root = dirs::home_dir()?.join(".wrkflw").join("cache");
-        std::fs::create_dir_all(&root).ok()?;
-        Some(Self { root })
+    pub fn new() -> Result<Self, String> {
+        let root = dirs::home_dir()
+            .ok_or_else(|| "Could not determine home directory".to_string())?
+            .join(".wrkflw")
+            .join("cache");
+        std::fs::create_dir_all(&root).map_err(|e| {
+            format!(
+                "Failed to create cache directory '{}': {}",
+                root.display(),
+                e
+            )
+        })?;
+        Ok(Self { root })
     }
 
     /// Create a cache store at a custom root (for testing).

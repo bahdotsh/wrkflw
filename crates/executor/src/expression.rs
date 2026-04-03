@@ -781,56 +781,46 @@ pub fn evaluate_as_bool(expr: &str, ctx: &ExpressionContext) -> Result<bool, Str
 mod tests {
     use super::*;
 
+    lazy_static::lazy_static! {
+        static ref EMPTY_ENV: HashMap<String, String> = HashMap::new();
+        static ref EMPTY_STEPS: HashMap<String, HashMap<String, String>> = HashMap::new();
+        static ref EMPTY_MATRIX: Option<HashMap<String, Value>> = None;
+        static ref EMPTY_STATUSES: HashMap<String, (String, String)> = HashMap::new();
+        static ref EMPTY_SECRETS: HashMap<String, String> = HashMap::new();
+        static ref EMPTY_NEEDS: HashMap<String, HashMap<String, String>> = HashMap::new();
+        static ref EMPTY_NEEDS_RESULTS: HashMap<String, String> = HashMap::new();
+    }
+
     fn empty_ctx() -> ExpressionContext<'static> {
-        // Leak to get 'static — fine for tests
-        let env: &'static HashMap<String, String> = Box::leak(Box::new(HashMap::new()));
-        let steps: &'static HashMap<String, HashMap<String, String>> =
-            Box::leak(Box::new(HashMap::new()));
-        let matrix: &'static Option<HashMap<String, Value>> = Box::leak(Box::new(None));
-        let statuses: &'static HashMap<String, (String, String)> =
-            Box::leak(Box::new(HashMap::new()));
-        let secrets: &'static HashMap<String, String> = Box::leak(Box::new(HashMap::new()));
-        let needs: &'static HashMap<String, HashMap<String, String>> =
-            Box::leak(Box::new(HashMap::new()));
-        let needs_r: &'static HashMap<String, String> = Box::leak(Box::new(HashMap::new()));
+        ExpressionContext {
+            env_context: &EMPTY_ENV,
+            step_outputs: &EMPTY_STEPS,
+            matrix_combination: &EMPTY_MATRIX,
+            step_statuses: &EMPTY_STATUSES,
+            job_status: "success",
+            secrets_context: &EMPTY_SECRETS,
+            needs_context: &EMPTY_NEEDS,
+            needs_results: &EMPTY_NEEDS_RESULTS,
+        }
+    }
+
+    /// Build an `ExpressionContext` from the fields that vary across tests;
+    /// all other fields default to empty/success.
+    fn make_ctx<'a>(
+        env: &'a HashMap<String, String>,
+        steps: &'a HashMap<String, HashMap<String, String>>,
+        matrix: &'a Option<HashMap<String, Value>>,
+    ) -> ExpressionContext<'a> {
         ExpressionContext {
             env_context: env,
             step_outputs: steps,
             matrix_combination: matrix,
-            step_statuses: statuses,
+            step_statuses: &EMPTY_STATUSES,
             job_status: "success",
-            secrets_context: secrets,
-            needs_context: needs,
-            needs_results: needs_r,
+            secrets_context: &EMPTY_SECRETS,
+            needs_context: &EMPTY_NEEDS,
+            needs_results: &EMPTY_NEEDS_RESULTS,
         }
-    }
-
-    fn ctx_with(
-        env: HashMap<String, String>,
-        steps: HashMap<String, HashMap<String, String>>,
-        matrix: Option<HashMap<String, Value>>,
-    ) -> (
-        ExpressionContext<'static>,
-        // Drop guards to prevent leaks in tests — not strictly needed since
-        // we're leaking anyway, but makes the pattern explicit
-    ) {
-        let env: &'static _ = Box::leak(Box::new(env));
-        let steps: &'static _ = Box::leak(Box::new(steps));
-        let matrix: &'static _ = Box::leak(Box::new(matrix));
-        let statuses: &'static _ = Box::leak(Box::new(HashMap::new()));
-        let secrets: &'static _ = Box::leak(Box::new(HashMap::new()));
-        let needs: &'static _ = Box::leak(Box::new(HashMap::new()));
-        let needs_r: &'static _ = Box::leak(Box::new(HashMap::new()));
-        (ExpressionContext {
-            env_context: env,
-            step_outputs: steps,
-            matrix_combination: matrix,
-            step_statuses: statuses,
-            job_status: "success",
-            secrets_context: secrets,
-            needs_context: needs,
-            needs_results: needs_r,
-        },)
     }
 
     // -- Literals --
@@ -1007,7 +997,8 @@ mod tests {
     fn eval_inputs_context() {
         let mut env = HashMap::new();
         env.insert("INPUT_TOOLCHAIN".to_string(), "nightly".to_string());
-        let (ctx,) = ctx_with(env, HashMap::new(), None);
+        let empty_steps = HashMap::new();
+        let ctx = make_ctx(&env, &empty_steps, &None);
 
         assert_eq!(
             evaluate("inputs.toolchain", &ctx).unwrap(),
@@ -1019,7 +1010,8 @@ mod tests {
     fn eval_env_context() {
         let mut env = HashMap::new();
         env.insert("MY_VAR".to_string(), "hello".to_string());
-        let (ctx,) = ctx_with(env, HashMap::new(), None);
+        let empty_steps = HashMap::new();
+        let ctx = make_ctx(&env, &empty_steps, &None);
 
         assert_eq!(
             evaluate("env.MY_VAR", &ctx).unwrap(),
@@ -1031,7 +1023,8 @@ mod tests {
     fn eval_github_context() {
         let mut env = HashMap::new();
         env.insert("GITHUB_REPOSITORY".to_string(), "owner/repo".to_string());
-        let (ctx,) = ctx_with(env, HashMap::new(), None);
+        let empty_steps = HashMap::new();
+        let ctx = make_ctx(&env, &empty_steps, &None);
 
         assert_eq!(
             evaluate("github.repository", &ctx).unwrap(),
@@ -1045,7 +1038,8 @@ mod tests {
         let mut build_out = HashMap::new();
         build_out.insert("version".to_string(), "1.2.3".to_string());
         steps.insert("build".to_string(), build_out);
-        let (ctx,) = ctx_with(HashMap::new(), steps, None);
+        let empty_env = HashMap::new();
+        let ctx = make_ctx(&empty_env, &steps, &None);
 
         assert_eq!(
             evaluate("steps.build.outputs.version", &ctx).unwrap(),
@@ -1057,7 +1051,10 @@ mod tests {
     fn eval_matrix_context() {
         let mut matrix = HashMap::new();
         matrix.insert("os".to_string(), Value::String("ubuntu".to_string()));
-        let (ctx,) = ctx_with(HashMap::new(), HashMap::new(), Some(matrix));
+        let empty_env = HashMap::new();
+        let empty_steps = HashMap::new();
+        let matrix = Some(matrix);
+        let ctx = make_ctx(&empty_env, &empty_steps, &matrix);
 
         assert_eq!(
             evaluate("matrix.os", &ctx).unwrap(),
@@ -1087,7 +1084,7 @@ mod tests {
         parse_out.insert("toolchain".to_string(), "nightly".to_string());
         steps.insert("parse".to_string(), parse_out);
 
-        let (ctx,) = ctx_with(env, steps, None);
+        let ctx = make_ctx(&env, &steps, &None);
 
         let result = evaluate(
             "steps.parse.outputs.toolchain == 'nightly' && inputs.components && ' --allow-downgrade' || ''",
@@ -1107,7 +1104,7 @@ mod tests {
         parse_out.insert("toolchain".to_string(), "stable".to_string());
         steps.insert("parse".to_string(), parse_out);
 
-        let (ctx,) = ctx_with(env, steps, None);
+        let ctx = make_ctx(&env, &steps, &None);
 
         let result = evaluate(
             "steps.parse.outputs.toolchain == 'nightly' && inputs.components && ' --allow-downgrade' || ''",
@@ -1127,7 +1124,7 @@ mod tests {
         parse_out.insert("toolchain".to_string(), "nightly".to_string());
         steps.insert("parse".to_string(), parse_out);
 
-        let (ctx,) = ctx_with(env, steps, None);
+        let ctx = make_ctx(&env, &steps, &None);
 
         let result = evaluate(
             "steps.parse.outputs.toolchain == 'nightly' && inputs.components && ' --allow-downgrade' || ''",
@@ -1216,7 +1213,8 @@ mod tests {
     fn eval_as_bool_condition_with_context() {
         let mut env = HashMap::new();
         env.insert("GITHUB_REF".to_string(), "refs/tags/v1.0.0".to_string());
-        let (ctx,) = ctx_with(env, HashMap::new(), None);
+        let empty_steps = HashMap::new();
+        let ctx = make_ctx(&env, &empty_steps, &None);
 
         assert!(evaluate_as_bool("startsWith(github.ref, 'refs/tags/')", &ctx).unwrap());
     }

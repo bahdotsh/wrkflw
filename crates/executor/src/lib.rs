@@ -3,8 +3,8 @@
 #![allow(unused_variables, unused_assignments)]
 
 pub mod action_resolver;
-pub mod artifacts; // Implemented but not yet wired into engine execution
-pub mod cache; // Implemented but not yet wired into engine execution
+pub(crate) mod artifacts;
+pub(crate) mod cache;
 pub mod dependency;
 pub mod docker;
 pub mod engine;

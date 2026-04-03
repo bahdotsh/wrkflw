@@ -573,8 +573,8 @@ pub fn start_next_workflow_execution(
                                     };
                                     wrkflw_executor::StepResult {
                                         name: "Validator".to_string(),
-                                        outcome: step_status.clone(),
-                                        conclusion: step_status.clone(),
+                                        outcome: step_status,
+                                        conclusion: step_status,
                                         status: step_status,
                                         output: validation_result.issues.join("\n"),
                                     }

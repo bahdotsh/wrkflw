@@ -583,20 +583,30 @@ impl StepResult {
     fn new(name: String, status: StepStatus, output: String) -> Self {
         Self {
             name,
-            outcome: status.clone(),
-            conclusion: status.clone(),
+            outcome: status,
+            conclusion: status,
             status,
             output,
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 #[allow(dead_code)]
 pub enum StepStatus {
     Success,
     Failure,
     Skipped,
+}
+
+impl std::fmt::Display for StepStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StepStatus::Success => f.write_str("success"),
+            StepStatus::Failure => f.write_str("failure"),
+            StepStatus::Skipped => f.write_str("skipped"),
+        }
+    }
 }
 
 #[derive(Error, Debug)]
@@ -1892,36 +1902,21 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
 
         match outcome {
             StepOutcome::Skipped(ref result) => {
-                // Record step status for expression context
-                if let Some(id) = &step.id {
-                    step_status_map
-                        .insert(id.clone(), ("skipped".to_string(), "skipped".to_string()));
-                }
+                record_step_status(
+                    step.id.as_deref(),
+                    result,
+                    &mut step_status_map,
+                    &mut job_status_str,
+                );
                 step_results.push(result.clone());
             }
             StepOutcome::Completed { result, abort_job } => {
-                // Record step outcome/conclusion for expression context
-                if let Some(id) = &step.id {
-                    let outcome_str = match &result.outcome {
-                        StepStatus::Success => "success",
-                        StepStatus::Failure => "failure",
-                        StepStatus::Skipped => "skipped",
-                    };
-                    let conclusion_str = match &result.conclusion {
-                        StepStatus::Success => "success",
-                        StepStatus::Failure => "failure",
-                        StepStatus::Skipped => "skipped",
-                    };
-                    step_status_map.insert(
-                        id.clone(),
-                        (outcome_str.to_string(), conclusion_str.to_string()),
-                    );
-                }
-
-                // Update job status for success()/failure() builtins
-                if result.conclusion == StepStatus::Failure {
-                    job_status_str = "failure".to_string();
-                }
+                record_step_status(
+                    step.id.as_deref(),
+                    &result,
+                    &mut step_status_map,
+                    &mut job_status_str,
+                );
 
                 // Add step output to logs only in verbose mode or if there's an error
                 if ctx.verbose || result.status == StepStatus::Failure {
@@ -1954,7 +1949,7 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
     }
 
     // Resolve job outputs from step outputs (GHA jobs.*.outputs map expressions to step outputs)
-    let job_outputs = resolve_job_outputs(job, &step_outputs_map, &job_env);
+    let job_outputs = resolve_job_outputs(job, &step_outputs_map, &job_env, &job_status_str);
 
     Ok(JobResult {
         name: ctx.job_name.to_string(),
@@ -2114,6 +2109,7 @@ async fn execute_matrix_job(
     })?;
 
     let mut step_outputs_map: HashMap<String, HashMap<String, String>> = HashMap::new();
+    let mut job_status_str = "success".to_string();
     let job_success = if job_template.steps.is_empty() {
         wrkflw_logging::warning(&format!("Job '{}' has no steps", matrix_job_name));
         true
@@ -2124,7 +2120,6 @@ async fn execute_matrix_job(
 
         let mut all_steps_ok = true;
         let mut step_status_map: HashMap<String, (String, String)> = HashMap::new();
-        let mut job_status_str = "success".to_string();
         let timeout_mins = sanitize_timeout_minutes(job_template.timeout_minutes, 360.0);
         let job_timeout = std::time::Duration::from_secs_f64(timeout_mins * 60.0);
         let job_deadline = tokio::time::Instant::now() + job_timeout;
@@ -2180,35 +2175,21 @@ async fn execute_matrix_job(
 
             match outcome {
                 StepOutcome::Skipped(ref result) => {
-                    if let Some(id) = &step.id {
-                        step_status_map
-                            .insert(id.clone(), ("skipped".to_string(), "skipped".to_string()));
-                    }
+                    record_step_status(
+                        step.id.as_deref(),
+                        result,
+                        &mut step_status_map,
+                        &mut job_status_str,
+                    );
                     step_results.push(result.clone());
                 }
                 StepOutcome::Completed { result, abort_job } => {
-                    // Record step outcome/conclusion for expression context
-                    if let Some(id) = &step.id {
-                        let outcome_str = match &result.outcome {
-                            StepStatus::Success => "success",
-                            StepStatus::Failure => "failure",
-                            StepStatus::Skipped => "skipped",
-                        };
-                        let conclusion_str = match &result.conclusion {
-                            StepStatus::Success => "success",
-                            StepStatus::Failure => "failure",
-                            StepStatus::Skipped => "skipped",
-                        };
-                        step_status_map.insert(
-                            id.clone(),
-                            (outcome_str.to_string(), conclusion_str.to_string()),
-                        );
-                    }
-
-                    // Update job status for success()/failure() builtins
-                    if result.conclusion == StepStatus::Failure {
-                        job_status_str = "failure".to_string();
-                    }
+                    record_step_status(
+                        step.id.as_deref(),
+                        &result,
+                        &mut step_status_map,
+                        &mut job_status_str,
+                    );
 
                     job_logs.push_str(&format!("Step: {}\n", result.name));
                     job_logs.push_str(&format!("Status: {:?}\n", result.status));
@@ -2242,7 +2223,8 @@ async fn execute_matrix_job(
     };
 
     // Resolve job outputs from step outputs
-    let job_outputs = resolve_job_outputs(job_template, &step_outputs_map, &job_env);
+    let job_outputs =
+        resolve_job_outputs(job_template, &step_outputs_map, &job_env, &job_status_str);
 
     // Return job result
     Ok(JobResult {
@@ -2265,6 +2247,25 @@ enum StepOutcome {
     Completed { result: StepResult, abort_job: bool },
     /// Step was skipped due to an if-condition.
     Skipped(StepResult),
+}
+
+/// Record a step's outcome/conclusion in the status tracking map and update job status.
+/// Shared between `execute_job` and `execute_matrix_job` to avoid duplicating this logic.
+fn record_step_status(
+    step_id: Option<&str>,
+    result: &StepResult,
+    step_status_map: &mut HashMap<String, (String, String)>,
+    job_status_str: &mut String,
+) {
+    if let Some(id) = step_id {
+        step_status_map.insert(
+            id.to_string(),
+            (result.outcome.to_string(), result.conclusion.to_string()),
+        );
+    }
+    if result.conclusion == StepStatus::Failure {
+        *job_status_str = "failure".to_string();
+    }
 }
 
 /// Run a step with if-condition and continue-on-error guards.
@@ -2349,9 +2350,9 @@ async fn run_step_with_guards(
                     (true, StepStatus::Failure)
                 }
             } else {
-                (false, result.status.clone())
+                (false, result.status)
             };
-            result.outcome = result.status.clone();
+            result.outcome = result.status;
             result.conclusion = conclusion;
             Ok(StepOutcome::Completed { result, abort_job })
         }
@@ -4014,10 +4015,12 @@ async fn execute_composite_action(
                 }
             }
 
-            // Execute each step, tracking outputs and env changes between steps
+            // Execute each step, tracking outputs, statuses, and env changes between steps
             let mut step_outputs = Vec::new();
             let mut composite_step_outputs: HashMap<String, HashMap<String, String>> =
                 HashMap::new();
+            let mut composite_step_statuses: HashMap<String, (String, String)> = HashMap::new();
+            let mut composite_job_status = "success".to_string();
             for (idx, step_def) in steps.iter().enumerate() {
                 // Convert the YAML step to our Step struct
                 let composite_step = match convert_yaml_to_step(step_def) {
@@ -4054,13 +4057,21 @@ async fn execute_composite_action(
                     workflow_defaults: None,
                     job_defaults: None,
                     step_outputs: &composite_step_outputs,
-                    step_statuses: &HashMap::new(),
-                    job_status: "success",
+                    step_statuses: &composite_step_statuses,
+                    job_status: &composite_job_status,
                     secrets_context,
                     needs_context,
                     needs_results,
                 }))
                 .await?;
+
+                // Track step status within composite scope
+                record_step_status(
+                    composite_step.id.as_deref(),
+                    &step_result,
+                    &mut composite_step_statuses,
+                    &mut composite_job_status,
+                );
 
                 // Add output to results
                 step_outputs.push(format!("Step {}: {}", idx + 1, step_result.output));
@@ -4308,6 +4319,7 @@ fn resolve_job_outputs(
     job: &Job,
     step_outputs_map: &HashMap<String, HashMap<String, String>>,
     env_context: &HashMap<String, String>,
+    job_status: &str,
 ) -> HashMap<String, String> {
     let mut resolved = HashMap::new();
     if let Some(outputs) = &job.outputs {
@@ -4316,7 +4328,7 @@ fn resolve_job_outputs(
             step_outputs: step_outputs_map,
             matrix_combination: &None,
             step_statuses: &HashMap::new(),
-            job_status: "success",
+            job_status,
             secrets_context: &HashMap::new(),
             needs_context: &HashMap::new(),
             needs_results: &HashMap::new(),

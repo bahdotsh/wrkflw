@@ -28,7 +28,7 @@ impl ExprValue {
     pub fn is_truthy(&self) -> bool {
         match self {
             ExprValue::Bool(b) => *b,
-            ExprValue::Number(n) => *n != 0.0,
+            ExprValue::Number(n) => *n != 0.0 && !n.is_nan(),
             ExprValue::String(s) => !s.is_empty(),
             ExprValue::Null => false,
         }
@@ -39,7 +39,7 @@ impl ExprValue {
         match self {
             ExprValue::String(s) => s.clone(),
             ExprValue::Number(n) => {
-                if *n == (*n as i64) as f64 {
+                if n.is_finite() && *n == (*n as i64) as f64 {
                     format!("{}", *n as i64)
                 } else {
                     format!("{}", n)

@@ -23,10 +23,10 @@ lazy_static! {
     static ref RUNNER_PATTERN: Regex =
         Regex::new(r"\$\{\{\s*runner\.([a-zA-Z_][a-zA-Z0-9_]*)\s*\}\}").unwrap();
     /// Catch-all for any remaining `${{ ... }}` expressions that weren't handled
-    /// by specific patterns. Replaces with empty string to match GitHub Actions
-    /// behavior and prevent bash "bad substitution" errors.
+    /// by specific patterns. Matches `${{` then any content (including single `}`
+    /// inside format placeholders like `{0}`) up to the closing `}}`.
     static ref EXPRESSION_FALLBACK: Regex =
-        Regex::new(r"\$\{\{[^}]*\}\}").unwrap();
+        Regex::new(r"\$\{\{(?:[^}]|\}[^}])*\}\}").unwrap();
 }
 
 /// Preprocesses a command string to replace GitHub-style matrix variable references
@@ -140,15 +140,6 @@ pub fn preprocess_runner_context(text: &str, env: &HashMap<String, String>) -> S
             env.get(&env_key).cloned().unwrap_or_default()
         })
         .into_owned()
-}
-
-/// Replace any remaining `${{ ... }}` expressions with empty string.
-///
-/// This is a safety net that runs after all specific substitutions. It prevents
-/// unresolved expressions from reaching bash (which interprets `${{` as brace
-/// expansion and fails with "bad substitution").
-pub fn preprocess_fallback(text: &str) -> String {
-    EXPRESSION_FALLBACK.replace_all(text, "").into_owned()
 }
 
 /// Replace `${{ hashFiles(...) }}` expressions with the SHA-256 hash of matched files.
@@ -642,28 +633,6 @@ mod tests {
         let text = "${{ runner.arch }}";
         let result = preprocess_runner_context(text, &env);
         assert_eq!(result, "");
-    }
-
-    #[test]
-    fn fallback_removes_unresolved_expressions() {
-        let text = "before ${{ some.unknown.expression }} after";
-        let result = preprocess_fallback(text);
-        assert_eq!(result, "before  after");
-    }
-
-    #[test]
-    fn fallback_removes_complex_expressions() {
-        let text =
-            "cmd${{ steps.parse.outputs.toolchain == 'nightly' && ' --allow-downgrade' || '' }}end";
-        let result = preprocess_fallback(text);
-        assert_eq!(result, "cmdend");
-    }
-
-    #[test]
-    fn fallback_preserves_resolved_text() {
-        let text = "no expressions here, just ${SHELL_VAR}";
-        let result = preprocess_fallback(text);
-        assert_eq!(result, "no expressions here, just ${SHELL_VAR}");
     }
 
     #[test]

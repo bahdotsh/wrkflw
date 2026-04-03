@@ -36,6 +36,9 @@ pub async fn run_wrkflw_tui(
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
+    // Suppress logging to stdout/stderr while TUI owns the terminal
+    wrkflw_logging::set_quiet_mode(true);
+
     // Set up channel for async communication
     let (tx, rx): (
         mpsc::Sender<ExecutionResultMsg>,
@@ -104,6 +107,7 @@ pub async fn run_wrkflw_tui(
     let result = run_tui_event_loop(&mut terminal, &mut app, &tx_clone, &rx, verbose);
 
     // Clean up terminal
+    wrkflw_logging::set_quiet_mode(false);
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),

@@ -58,6 +58,10 @@ pub struct App {
     pub job_selection_mode: bool, // Are we viewing jobs of a workflow?
     pub available_jobs: Vec<String>, // Job names from selected workflow
     pub selected_job_index: usize, // Cursor in job selection list
+
+    // Cached container runtime availability (avoids re-checking every render frame)
+    pub runtime_available: bool,
+    pub last_availability_check: Instant,
 }
 
 impl App {
@@ -190,6 +194,9 @@ impl App {
             RuntimeType::SecureEmulation => RuntimeType::SecureEmulation,
         };
 
+        // If we're still Docker/Podman after the availability check above, it was available
+        let runtime_available = matches!(runtime_type, RuntimeType::Docker | RuntimeType::Podman);
+
         App {
             workflows: Vec::new(),
             workflow_list_state,
@@ -234,6 +241,9 @@ impl App {
             job_selection_mode: false,
             available_jobs: Vec::new(),
             selected_job_index: 0,
+
+            runtime_available,
+            last_availability_check: Instant::now(),
         }
     }
 
@@ -253,6 +263,13 @@ impl App {
             RuntimeType::SecureEmulation => RuntimeType::Emulation,
             RuntimeType::Emulation => RuntimeType::Docker,
         };
+        // Re-check availability for the new runtime immediately
+        self.runtime_available = match self.runtime_type {
+            RuntimeType::Docker => wrkflw_executor::docker::is_available(),
+            RuntimeType::Podman => wrkflw_executor::podman::is_available(),
+            _ => false,
+        };
+        self.last_availability_check = Instant::now();
         self.logs
             .push(format!("Switched to {} mode", self.runtime_type_name()));
     }
@@ -964,6 +981,17 @@ impl App {
         if now.duration_since(self.last_tick) >= self.tick_rate {
             self.last_tick = now;
             self.spinner_frame = (self.spinner_frame + 1) % crate::theme::symbols::SPINNER.len();
+
+            // Refresh container runtime availability every 30 seconds
+            if now.duration_since(self.last_availability_check) >= Duration::from_secs(30) {
+                self.last_availability_check = now;
+                self.runtime_available = match self.runtime_type {
+                    RuntimeType::Docker => wrkflw_executor::docker::is_available(),
+                    RuntimeType::Podman => wrkflw_executor::podman::is_available(),
+                    _ => false,
+                };
+            }
+
             true
         } else {
             false

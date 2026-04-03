@@ -50,29 +50,17 @@ pub fn render_status_bar(f: &mut Frame<'_>, app: &App, area: Rect) {
         COLORS.text,
     ));
 
-    // Container runtime status
+    // Container runtime status (uses cached availability from App state)
     match app.runtime_type {
         RuntimeType::Docker => {
-            let is_docker_available = match wrkflw_utils::fd::with_stderr_to_null(
-                wrkflw_executor::docker::is_available,
-            ) {
-                Ok(result) => result,
-                Err(_) => {
-                    wrkflw_logging::debug(
-                        "Failed to redirect stderr when checking Docker availability.",
-                    );
-                    false
-                }
-            };
-
             status_items.push(Span::raw(" "));
             status_items.push(theme::badge(
-                if is_docker_available {
+                if app.runtime_available {
                     "Docker: Connected"
                 } else {
                     "Docker: Unavailable"
                 },
-                if is_docker_available {
+                if app.runtime_available {
                     COLORS.success
                 } else {
                     COLORS.error
@@ -81,26 +69,14 @@ pub fn render_status_bar(f: &mut Frame<'_>, app: &App, area: Rect) {
             ));
         }
         RuntimeType::Podman => {
-            let is_podman_available = match wrkflw_utils::fd::with_stderr_to_null(
-                wrkflw_executor::podman::is_available,
-            ) {
-                Ok(result) => result,
-                Err(_) => {
-                    wrkflw_logging::debug(
-                        "Failed to redirect stderr when checking Podman availability.",
-                    );
-                    false
-                }
-            };
-
             status_items.push(Span::raw(" "));
             status_items.push(theme::badge(
-                if is_podman_available {
+                if app.runtime_available {
                     "Podman: Connected"
                 } else {
                     "Podman: Unavailable"
                 },
-                if is_podman_available {
+                if app.runtime_available {
                     COLORS.success
                 } else {
                     COLORS.error

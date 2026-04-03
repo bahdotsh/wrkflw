@@ -17,6 +17,8 @@ pub fn render_status_bar(f: &mut Frame<'_>, app: &App, area: Rect) {
     if let Some(message) = &app.status_message {
         let bg = match app.status_message_severity {
             StatusSeverity::Success => COLORS.success,
+            StatusSeverity::Info => COLORS.info,
+            StatusSeverity::Warning => COLORS.warning,
             StatusSeverity::Error => COLORS.error,
         };
 

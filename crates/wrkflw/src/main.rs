@@ -458,8 +458,7 @@ async fn main() {
                         let simplified_error = details
                             .lines()
                             .filter(|line| {
-                                line.contains('\u{2716}')
-                                    || line.contains("❌")
+                                line.contains(wrkflw_logging::symbols::FAILURE)
                                     || line.trim().starts_with("Error:")
                             })
                             .take(5)

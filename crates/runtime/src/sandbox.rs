@@ -237,7 +237,8 @@ impl Sandbox {
         for pattern in &self.dangerous_patterns {
             if pattern.is_match(command_str) {
                 wrkflw_logging::warning(&format!(
-                    "🚫 Blocked dangerous command pattern: {}",
+                    "{} Blocked dangerous command pattern: {}",
+                    wrkflw_logging::symbols::BLOCKED,
                     command_str
                 ));
                 return Err(SandboxError::DangerousPattern {
@@ -269,7 +270,11 @@ impl Sandbox {
 
             // Check blocked commands
             if self.config.blocked_commands.contains(command_name) {
-                wrkflw_logging::warning(&format!("🚫 Blocked command: {}", command_name));
+                wrkflw_logging::warning(&format!(
+                    "{} Blocked command: {}",
+                    wrkflw_logging::symbols::BLOCKED,
+                    command_name
+                ));
                 return Err(SandboxError::BlockedCommand {
                     command: command_name.to_string(),
                 });
@@ -278,7 +283,8 @@ impl Sandbox {
             // In strict mode, only allow whitelisted commands
             if self.config.strict_mode && !self.config.allowed_commands.contains(command_name) {
                 wrkflw_logging::warning(&format!(
-                    "🚫 Command not in whitelist (strict mode): {}",
+                    "{} Command not in whitelist (strict mode): {}",
+                    wrkflw_logging::symbols::BLOCKED,
                     command_name
                 ));
                 return Err(SandboxError::BlockedCommand {
@@ -287,7 +293,11 @@ impl Sandbox {
             }
         }
 
-        wrkflw_logging::info(&format!("✅ Command validation passed: {}", command_str));
+        wrkflw_logging::info(&format!(
+            "{} Command validation passed: {}",
+            wrkflw_logging::symbols::SUCCESS,
+            command_str
+        ));
         Ok(())
     }
 
@@ -437,14 +447,16 @@ impl Sandbox {
         match result {
             Ok(output_result) => {
                 wrkflw_logging::info(&format!(
-                    "✅ Sandboxed command completed in {:.2}s",
+                    "{} Sandboxed command completed in {:.2}s",
+                    wrkflw_logging::symbols::SUCCESS,
                     execution_time.as_secs_f64()
                 ));
                 output_result
             }
             Err(_) => {
                 wrkflw_logging::warning(&format!(
-                    "⏰ Sandboxed command timed out after {:.2}s",
+                    "{} Sandboxed command timed out after {:.2}s",
+                    wrkflw_logging::symbols::WARNING,
                     timeout_duration.as_secs_f64()
                 ));
                 Err(SandboxError::ExecutionTimeout {

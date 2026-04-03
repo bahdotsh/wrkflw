@@ -212,7 +212,7 @@ impl LogProcessor {
             ("ERROR", theme::log_badge("ERROR"))
         } else if log_line.contains("Warning")
             || log_line.contains("warning")
-            || log_line.contains("\u{26A0}")
+            || log_line.contains(theme::symbols::WARNING)
         {
             ("WARN", theme::log_badge("WARN"))
         } else if log_line.contains("Success")

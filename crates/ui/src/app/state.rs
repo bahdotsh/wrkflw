@@ -838,7 +838,7 @@ impl App {
             }
         } else if !self.log_search_query.is_empty() {
             // No matches found
-            self.set_error_message(format!("No matches found for '{}'", self.log_search_query));
+            self.set_warning_message(format!("No matches found for '{}'", self.log_search_query));
         }
     }
 
@@ -925,6 +925,20 @@ impl App {
     pub fn set_error_message(&mut self, message: String) {
         self.status_message = Some(message);
         self.status_message_severity = StatusSeverity::Error;
+        self.status_message_time = Some(Instant::now());
+    }
+
+    // Set a temporary warning status message
+    pub fn set_warning_message(&mut self, message: String) {
+        self.status_message = Some(message);
+        self.status_message_severity = StatusSeverity::Warning;
+        self.status_message_time = Some(Instant::now());
+    }
+
+    // Set a temporary info status message
+    pub fn set_info_message(&mut self, message: String) {
+        self.status_message = Some(message);
+        self.status_message_severity = StatusSeverity::Info;
         self.status_message_time = Some(Instant::now());
     }
 

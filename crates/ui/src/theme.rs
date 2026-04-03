@@ -73,32 +73,9 @@ pub const COLORS: Colors = Colors {
 
 // ── Symbols ────────────────────────────────────────────────────────
 
-/// Consistent single-cell-width Unicode symbols.
-/// These replace the mixed emoji (✅❌⏭) that render at double width in many terminals.
-pub mod symbols {
-    pub const SUCCESS: &str = "\u{2714}"; // ✔
-    pub const FAILURE: &str = "\u{2716}"; // ✖
-    pub const RUNNING: &str = "\u{25C9}"; // ◉
-    pub const SKIPPED: &str = "\u{2298}"; // ⊘
-    pub const NOT_STARTED: &str = "\u{25CB}"; // ○
-
-    pub const SELECTED: &str = "\u{25B8} "; // ▸ (with trailing space for highlight_symbol)
-    pub const CHECKBOX_ON: &str = "[\u{2714}]"; // [✔]
-    pub const CHECKBOX_OFF: &str = "[ ]";
-
-    pub const TAB_DIVIDER: &str = " \u{2502} "; // │
-    pub const SEPARATOR: &str = "\u{2502}"; // │
-    pub const ARROW: &str = "\u{2192}"; // →
-    pub const HRULE: &str = "\u{2500}"; // ─
-
-    pub const LOCK: &str = "\u{26BF}"; // ⚿
-
-    // Braille spinner frames for running animation
-    pub const SPINNER: &[&str] = &[
-        "\u{280B}", "\u{2819}", "\u{2839}", "\u{2838}", "\u{283C}", "\u{2834}", "\u{2826}",
-        "\u{2827}", "\u{2807}", "\u{280F}",
-    ];
-}
+/// Re-export the shared symbol constants from `wrkflw_logging::symbols`.
+/// All crates use a single source of truth for Unicode symbols.
+pub use wrkflw_logging::symbols;
 
 // ── Style Helpers ──────────────────────────────────────────────────
 

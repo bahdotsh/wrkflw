@@ -2,25 +2,26 @@
 // Used for non-TUI terminal output (validate, execute, list commands)
 
 use colored::Colorize;
+use wrkflw_logging::symbols;
 
 pub fn success(text: &str) -> String {
-    format!("{} {}", "\u{2714}".green(), text)
+    format!("{} {}", symbols::SUCCESS.green(), text)
 }
 
 pub fn error(text: &str) -> String {
-    format!("{} {}", "\u{2716}".red(), text)
+    format!("{} {}", symbols::FAILURE.red(), text)
 }
 
 pub fn warning(text: &str) -> String {
-    format!("{} {}", "\u{26A0}".yellow(), text)
+    format!("{} {}", symbols::WARNING.yellow(), text)
 }
 
 pub fn info(text: &str) -> String {
-    format!("{} {}", "\u{25CF}".cyan(), text)
+    format!("{} {}", symbols::INFO.cyan(), text)
 }
 
 pub fn skipped(text: &str) -> String {
-    format!("{} {}", "\u{2298}".dimmed(), text)
+    format!("{} {}", symbols::SKIPPED.dimmed(), text)
 }
 
 pub fn section(text: &str) -> String {
@@ -28,7 +29,7 @@ pub fn section(text: &str) -> String {
 }
 
 pub fn separator() -> String {
-    format!("{}", "\u{2500}".repeat(40).dimmed())
+    format!("{}", symbols::HRULE.repeat(40).dimmed())
 }
 
 pub fn dim(text: &str) -> String {
@@ -36,29 +37,33 @@ pub fn dim(text: &str) -> String {
 }
 
 pub fn job_success(name: &str) -> String {
-    format!("{} Job succeeded: {}", "\u{2714}".green(), name.bold())
+    format!(
+        "{} Job succeeded: {}",
+        symbols::SUCCESS.green(),
+        name.bold()
+    )
 }
 
 pub fn job_failure(name: &str) -> String {
-    format!("{} Job failed: {}", "\u{2716}".red(), name.bold())
+    format!("{} Job failed: {}", symbols::FAILURE.red(), name.bold())
 }
 
 pub fn job_skipped(name: &str) -> String {
-    format!("{} Job skipped: {}", "\u{2298}".dimmed(), name.bold())
+    format!("{} Job skipped: {}", symbols::SKIPPED.dimmed(), name.bold())
 }
 
 pub fn step_success(name: &str) -> String {
-    format!("  {} {}", "\u{2714}".green(), name)
+    format!("  {} {}", symbols::SUCCESS.green(), name)
 }
 
 pub fn step_failure(name: &str) -> String {
-    format!("  {} {}", "\u{2716}".red(), name)
+    format!("  {} {}", symbols::FAILURE.red(), name)
 }
 
 pub fn step_skipped(name: &str) -> String {
     format!(
         "  {} {} {}",
-        "\u{2298}".dimmed(),
+        symbols::SKIPPED.dimmed(),
         name,
         "(skipped)".dimmed()
     )

@@ -1,3 +1,5 @@
+pub mod symbols;
+
 use chrono::Local;
 use once_cell::sync::Lazy;
 use std::sync::{Arc, Mutex};
@@ -20,10 +22,10 @@ pub enum LogLevel {
 impl LogLevel {
     fn prefix(&self) -> &'static str {
         match self {
-            LogLevel::Debug => "🔍",
-            LogLevel::Info => "ℹ️",
-            LogLevel::Warning => "⚠️",
-            LogLevel::Error => "❌",
+            LogLevel::Debug => symbols::DEBUG,
+            LogLevel::Info => symbols::INFO,
+            LogLevel::Warning => symbols::WARNING,
+            LogLevel::Error => symbols::FAILURE,
         }
     }
 }
@@ -76,7 +78,11 @@ pub fn get_logs() -> Vec<String> {
     } else {
         // If we can't access logs, return an error message with timestamp
         let timestamp = Local::now().format("%H:%M:%S").to_string();
-        vec![format!("[{}] ❌ Error accessing logs", timestamp)]
+        vec![format!(
+            "[{}] {} Error accessing logs",
+            timestamp,
+            symbols::FAILURE
+        )]
     }
 }
 

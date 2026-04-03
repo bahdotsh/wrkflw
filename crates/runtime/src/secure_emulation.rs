@@ -21,7 +21,10 @@ impl SecureEmulationRuntime {
         let config = create_workflow_sandbox_config();
         let sandbox = Sandbox::new(config).expect("Failed to create sandbox");
 
-        wrkflw_logging::info("🔒 Initialized secure emulation runtime with sandboxing");
+        wrkflw_logging::info(&format!(
+            "{} Initialized secure emulation runtime with sandboxing",
+            wrkflw_logging::symbols::LOCK
+        ));
 
         Self { sandbox }
     }
@@ -32,7 +35,10 @@ impl SecureEmulationRuntime {
             ContainerError::ContainerStart(format!("Failed to create sandbox: {}", e))
         })?;
 
-        wrkflw_logging::info("🔒 Initialized secure emulation runtime with custom config");
+        wrkflw_logging::info(&format!(
+            "{} Initialized secure emulation runtime with custom config",
+            wrkflw_logging::symbols::LOCK
+        ));
 
         Ok(Self { sandbox })
     }
@@ -58,7 +64,8 @@ impl ContainerRuntime for SecureEmulationRuntime {
         }
 
         wrkflw_logging::info(&format!(
-            "🔒 Executing sandboxed command: {} (image: {})",
+            "{} Executing sandboxed command: {} (image: {})",
+            wrkflw_logging::symbols::LOCK,
             command.join(" "),
             image
         ));
@@ -71,14 +78,18 @@ impl ContainerRuntime for SecureEmulationRuntime {
 
         match result {
             Ok(output) => {
-                wrkflw_logging::info("✅ Sandboxed command completed successfully");
+                wrkflw_logging::info(&format!(
+                    "{} Sandboxed command completed successfully",
+                    wrkflw_logging::symbols::SUCCESS
+                ));
                 Ok(output)
             }
             Err(SandboxError::BlockedCommand { command }) => {
                 let error_msg = format!(
-                    "🚫 SECURITY BLOCK: Command '{}' is not allowed in secure emulation mode. \
+                    "{} SECURITY BLOCK: Command '{}' is not allowed in secure emulation mode. \
                      This command was blocked for security reasons. \
                      If you need to run this command, please use Docker or Podman mode instead.",
+                    wrkflw_logging::symbols::BLOCKED,
                     command
                 );
                 wrkflw_logging::warning(&error_msg);
@@ -86,9 +97,10 @@ impl ContainerRuntime for SecureEmulationRuntime {
             }
             Err(SandboxError::DangerousPattern { pattern }) => {
                 let error_msg = format!(
-                    "🚫 SECURITY BLOCK: Dangerous command pattern detected: '{}'. \
+                    "{} SECURITY BLOCK: Dangerous command pattern detected: '{}'. \
                      This command was blocked because it matches a known dangerous pattern. \
                      Please review your workflow for potentially harmful commands.",
+                    wrkflw_logging::symbols::BLOCKED,
                     pattern
                 );
                 wrkflw_logging::warning(&error_msg);
@@ -96,8 +108,9 @@ impl ContainerRuntime for SecureEmulationRuntime {
             }
             Err(SandboxError::ExecutionTimeout { seconds }) => {
                 let error_msg = format!(
-                    "⏰ Command execution timed out after {} seconds. \
+                    "{} Command execution timed out after {} seconds. \
                      Consider optimizing your command or increasing timeout limits.",
+                    wrkflw_logging::symbols::WARNING,
                     seconds
                 );
                 wrkflw_logging::warning(&error_msg);
@@ -105,8 +118,9 @@ impl ContainerRuntime for SecureEmulationRuntime {
             }
             Err(SandboxError::PathAccessDenied { path }) => {
                 let error_msg = format!(
-                    "🚫 Path access denied: '{}'. \
+                    "{} Path access denied: '{}'. \
                      The sandbox restricts file system access for security.",
+                    wrkflw_logging::symbols::BLOCKED,
                     path
                 );
                 wrkflw_logging::warning(&error_msg);
@@ -114,8 +128,9 @@ impl ContainerRuntime for SecureEmulationRuntime {
             }
             Err(SandboxError::ResourceLimitExceeded { resource }) => {
                 let error_msg = format!(
-                    "📊 Resource limit exceeded: {}. \
+                    "{} Resource limit exceeded: {}. \
                      Your command used too many system resources.",
+                    wrkflw_logging::symbols::WARNING,
                     resource
                 );
                 wrkflw_logging::warning(&error_msg);
@@ -131,7 +146,8 @@ impl ContainerRuntime for SecureEmulationRuntime {
 
     async fn pull_image(&self, image: &str) -> Result<(), ContainerError> {
         wrkflw_logging::info(&format!(
-            "🔒 Secure emulation: Pretending to pull image {}",
+            "{} Secure emulation: Pretending to pull image {}",
+            wrkflw_logging::symbols::LOCK,
             image
         ));
         Ok(())
@@ -144,7 +160,8 @@ impl ContainerRuntime for SecureEmulationRuntime {
         _context_dir: &Path,
     ) -> Result<(), ContainerError> {
         wrkflw_logging::info(&format!(
-            "🔒 Secure emulation: Pretending to build image {} from {}",
+            "{} Secure emulation: Pretending to build image {} from {}",
+            wrkflw_logging::symbols::LOCK,
             tag,
             dockerfile.display()
         ));
@@ -200,58 +217,86 @@ pub async fn handle_special_action_secure(action: &str) -> Result<(), ContainerE
     };
 
     wrkflw_logging::info(&format!(
-        "🔒 Processing action in secure mode: {} @ {}",
-        action_name, action_version
+        "{} Processing action in secure mode: {} @ {}",
+        wrkflw_logging::symbols::LOCK,
+        action_name,
+        action_version
     ));
 
     // In secure mode, we're more restrictive about what actions we allow
     match action_name {
         // Core GitHub actions that are generally safe
         name if name.starts_with("actions/checkout") => {
-            wrkflw_logging::info("✅ Checkout action - workspace files are prepared securely");
+            wrkflw_logging::info(&format!(
+                "{} Checkout action - workspace files are prepared securely",
+                wrkflw_logging::symbols::SUCCESS
+            ));
         }
         name if name.starts_with("actions/setup-node") => {
-            wrkflw_logging::info("🟡 Node.js setup - using system Node.js in secure mode");
+            wrkflw_logging::info(&format!(
+                "{} Node.js setup - using system Node.js in secure mode",
+                wrkflw_logging::symbols::WARNING
+            ));
             check_command_available_secure("node", "Node.js", "https://nodejs.org/");
         }
         name if name.starts_with("actions/setup-python") => {
-            wrkflw_logging::info("🟡 Python setup - using system Python in secure mode");
+            wrkflw_logging::info(&format!(
+                "{} Python setup - using system Python in secure mode",
+                wrkflw_logging::symbols::WARNING
+            ));
             check_command_available_secure("python", "Python", "https://www.python.org/downloads/");
         }
         name if name.starts_with("actions/setup-java") => {
-            wrkflw_logging::info("🟡 Java setup - using system Java in secure mode");
+            wrkflw_logging::info(&format!(
+                "{} Java setup - using system Java in secure mode",
+                wrkflw_logging::symbols::WARNING
+            ));
             check_command_available_secure("java", "Java", "https://adoptium.net/");
         }
         name if name.starts_with("actions/cache") => {
-            wrkflw_logging::info("🟡 Cache action - caching disabled in secure emulation mode");
+            wrkflw_logging::info(&format!(
+                "{} Cache action - caching disabled in secure emulation mode",
+                wrkflw_logging::symbols::WARNING
+            ));
         }
 
         // Rust-specific actions
         name if name.starts_with("actions-rs/cargo") => {
-            wrkflw_logging::info("🟡 Rust cargo action - using system Rust in secure mode");
+            wrkflw_logging::info(&format!(
+                "{} Rust cargo action - using system Rust in secure mode",
+                wrkflw_logging::symbols::WARNING
+            ));
             check_command_available_secure("cargo", "Rust/Cargo", "https://rustup.rs/");
         }
         name if name.starts_with("actions-rs/toolchain") => {
-            wrkflw_logging::info("🟡 Rust toolchain action - using system Rust in secure mode");
+            wrkflw_logging::info(&format!(
+                "{} Rust toolchain action - using system Rust in secure mode",
+                wrkflw_logging::symbols::WARNING
+            ));
             check_command_available_secure("rustc", "Rust", "https://rustup.rs/");
         }
         name if name.starts_with("actions-rs/fmt") => {
-            wrkflw_logging::info("🟡 Rust formatter action - using system rustfmt in secure mode");
+            wrkflw_logging::info(&format!(
+                "{} Rust formatter action - using system rustfmt in secure mode",
+                wrkflw_logging::symbols::WARNING
+            ));
             check_command_available_secure("rustfmt", "rustfmt", "rustup component add rustfmt");
         }
 
         // Potentially dangerous actions that we warn about
         name if name.contains("docker") || name.contains("container") => {
             wrkflw_logging::warning(&format!(
-                "🚫 Docker/container action '{}' is not supported in secure emulation mode. \
+                "{} Docker/container action '{}' is not supported in secure emulation mode. \
                  Use Docker or Podman mode for container actions.",
+                wrkflw_logging::symbols::BLOCKED,
                 action_name
             ));
         }
         name if name.contains("ssh") || name.contains("deploy") => {
             wrkflw_logging::warning(&format!(
-                "🚫 SSH/deployment action '{}' is restricted in secure emulation mode. \
+                "{} SSH/deployment action '{}' is restricted in secure emulation mode. \
                  Use Docker or Podman mode for deployment actions.",
+                wrkflw_logging::symbols::BLOCKED,
                 action_name
             ));
         }
@@ -259,8 +304,9 @@ pub async fn handle_special_action_secure(action: &str) -> Result<(), ContainerE
         // Unknown actions
         _ => {
             wrkflw_logging::warning(&format!(
-                "🟡 Unknown action '{}' in secure emulation mode. \
+                "{} Unknown action '{}' in secure emulation mode. \
                  Some functionality may be limited or unavailable.",
+                wrkflw_logging::symbols::WARNING,
                 action_name
             ));
         }
@@ -298,7 +344,8 @@ fn check_command_available_secure(command: &str, name: &str, install_url: &str) 
             if output.status.success() {
                 let version = String::from_utf8_lossy(&output.stdout);
                 wrkflw_logging::info(&format!(
-                    "✅ Using system {} in secure mode: {}",
+                    "{} Using system {} in secure mode: {}",
+                    wrkflw_logging::symbols::SUCCESS,
                     name,
                     version.trim()
                 ));

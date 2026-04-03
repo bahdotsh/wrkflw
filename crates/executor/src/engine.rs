@@ -175,12 +175,21 @@ async fn execute_github_workflow(
         for job_result in &job_results {
             if job_result.status == JobStatus::Failure {
                 has_failures = true;
-                failure_details.push_str(&format!("\n❌ Job failed: {}\n", job_result.name));
+                failure_details.push_str(&format!(
+                    "\n{} Job failed: {}\n",
+                    wrkflw_logging::symbols::FAILURE,
+                    job_result.name
+                ));
 
                 // Add step details for failed jobs
                 for step in &job_result.steps {
                     if step.status == StepStatus::Failure {
-                        failure_details.push_str(&format!("  ❌ {}: {}\n", step.name, step.output));
+                        failure_details.push_str(&format!(
+                            "  {} {}: {}\n",
+                            wrkflw_logging::symbols::FAILURE,
+                            step.name,
+                            step.output
+                        ));
                     }
                 }
             }
@@ -306,12 +315,21 @@ async fn execute_gitlab_pipeline(
         for job_result in &job_results {
             if job_result.status == JobStatus::Failure {
                 has_failures = true;
-                failure_details.push_str(&format!("\n❌ Job failed: {}\n", job_result.name));
+                failure_details.push_str(&format!(
+                    "\n{} Job failed: {}\n",
+                    wrkflw_logging::symbols::FAILURE,
+                    job_result.name
+                ));
 
                 // Add step details for failed jobs
                 for step in &job_result.steps {
                     if step.status == StepStatus::Failure {
-                        failure_details.push_str(&format!("  ❌ {}: {}\n", step.name, step.output));
+                        failure_details.push_str(&format!(
+                            "  {} {}: {}\n",
+                            wrkflw_logging::symbols::FAILURE,
+                            step.name,
+                            step.output
+                        ));
                     }
                 }
             }
@@ -1595,8 +1613,10 @@ async fn execute_job_with_matrix(
         let should_run = evaluate_job_condition(if_condition, env_context, workflow);
         if !should_run {
             wrkflw_logging::info(&format!(
-                "⏭️ Skipping job '{}' due to condition: {}",
-                job_name, if_condition
+                "{} Skipping job '{}' due to condition: {}",
+                wrkflw_logging::symbols::SKIPPED,
+                job_name,
+                if_condition
             ));
             // Return a skipped job result
             return Ok(vec![JobResult {
@@ -2079,8 +2099,10 @@ async fn run_step_with_guards(
         let should_run = evaluate_job_condition(if_cond, job_env, workflow);
         if !should_run {
             wrkflw_logging::info(&format!(
-                "  ⏭️ Skipping step '{}' due to condition: {}",
-                step_name, if_cond
+                "  {} Skipping step '{}' due to condition: {}",
+                wrkflw_logging::symbols::SKIPPED,
+                step_name,
+                if_cond
             ));
             return Ok(StepOutcome::Skipped(StepResult {
                 name: step_name,
@@ -2528,7 +2550,11 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                         // Only log a message to the console if we're showing action messages
                         if !hide_messages {
                             // For Emulation mode, log a message about what action would be executed
-                            println!("   ⚙️ Would execute GitHub action: {}", uses);
+                            println!(
+                                "   {} Would execute GitHub action: {}",
+                                wrkflw_logging::symbols::GEAR,
+                                uses
+                            );
                         }
 
                         // Extract the actual command from the GitHub action if applicable
@@ -2694,7 +2720,8 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                     // Add detailed error information for failed cargo/rust commands
                     if output.exit_code != 0 && (uses.contains("cargo") || uses.contains("rust")) {
                         let mut error_details = format!(
-                            "\n\n❌ Command failed with exit code: {}\n",
+                            "\n\n{} Command failed with exit code: {}\n",
+                            wrkflw_logging::symbols::FAILURE,
                             output.exit_code
                         );
 

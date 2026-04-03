@@ -662,8 +662,26 @@ async fn prepare_action(
                 args,
             });
         } else {
-            // It's a JavaScript or composite action
-            // For simplicity, we'll use node to run it (this would need more work for full support)
+            // Check action.yml to determine if it's a composite or JS action
+            let definition: Option<serde_yaml::Value> =
+                std::fs::read_to_string(action_dir.join("action.yml"))
+                    .or_else(|_| std::fs::read_to_string(action_dir.join("action.yaml")))
+                    .ok()
+                    .and_then(|s| serde_yaml::from_str(&s).ok());
+
+            if let Some(def) = &definition {
+                if let Some(using) = def
+                    .get("runs")
+                    .and_then(|r| r.get("using"))
+                    .and_then(|u| u.as_str())
+                {
+                    if using == "composite" {
+                        return Ok(PreparedAction::Composite);
+                    }
+                }
+            }
+
+            // Fall back to node for JS actions
             return Ok(PreparedAction::Image("node:20-slim".to_string()));
         }
     }

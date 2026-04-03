@@ -1,5 +1,6 @@
 // Status bar rendering
 use crate::app::App;
+use crate::models::StatusSeverity;
 use crate::theme::{self, COLORS};
 use ratatui::{
     layout::{Alignment, Rect},
@@ -14,19 +15,15 @@ use wrkflw_executor::RuntimeType;
 pub fn render_status_bar(f: &mut Frame<'_>, app: &App, area: Rect) {
     // If we have a status message, show it as a toast
     if let Some(message) = &app.status_message {
-        let is_success = message.contains("success")
-            || message.contains("Success")
-            || message.contains(theme::symbols::SUCCESS)
-            || message.contains('\u{2705}'); // ✅ legacy
+        let bg = match app.status_message_severity {
+            StatusSeverity::Success => COLORS.success,
+            StatusSeverity::Error => COLORS.error,
+        };
 
         let status_message = Paragraph::new(Line::from(vec![Span::styled(
             format!(" {} ", message),
             Style::default()
-                .bg(if is_success {
-                    COLORS.success
-                } else {
-                    COLORS.error
-                })
+                .bg(bg)
                 .fg(COLORS.text)
                 .add_modifier(Modifier::BOLD),
         )]))
@@ -111,10 +108,9 @@ pub fn render_status_bar(f: &mut Frame<'_>, app: &App, area: Rect) {
         }
         RuntimeType::SecureEmulation => {
             status_items.push(Span::raw(" "));
-            status_items.push(theme::badge(
-                "\u{1F512}SECURE",
-                COLORS.runtime_secure,
-                COLORS.text,
+            status_items.push(Span::styled(
+                format!(" {}SECURE ", theme::symbols::LOCK),
+                Style::default().bg(COLORS.runtime_secure).fg(COLORS.text),
             ));
         }
         RuntimeType::Emulation => {}
@@ -123,9 +119,17 @@ pub fn render_status_bar(f: &mut Frame<'_>, app: &App, area: Rect) {
     // Validation/execution mode badge
     status_items.push(Span::raw(" "));
     if app.validation_mode {
-        status_items.push(theme::badge("Validation", COLORS.warning, ratatui::style::Color::Black));
+        status_items.push(theme::badge(
+            "Validation",
+            COLORS.warning,
+            ratatui::style::Color::Black,
+        ));
     } else {
-        status_items.push(theme::badge("Execution", COLORS.success, ratatui::style::Color::Black));
+        status_items.push(theme::badge(
+            "Execution",
+            COLORS.success,
+            ratatui::style::Color::Black,
+        ));
     }
 
     // Separator
@@ -156,9 +160,11 @@ fn build_context_help(app: &App) -> String {
         }
         1 => {
             if app.detailed_view {
-                "Esc back \u{2502} \u{2191}\u{2193} steps \u{2502} ? help \u{2502} q quit".to_string()
+                "Esc back \u{2502} \u{2191}\u{2193} steps \u{2502} ? help \u{2502} q quit"
+                    .to_string()
             } else {
-                "Enter details \u{2502} \u{2191}\u{2193} jobs \u{2502} ? help \u{2502} q quit".to_string()
+                "Enter details \u{2502} \u{2191}\u{2193} jobs \u{2502} ? help \u{2502} q quit"
+                    .to_string()
             }
         }
         2 => {

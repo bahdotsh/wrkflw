@@ -56,6 +56,14 @@ pub struct StepExecution {
     pub output: String,
 }
 
+/// Severity level for status bar toast messages
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum StatusSeverity {
+    Success,
+    #[default]
+    Error,
+}
+
 /// Log filter levels
 #[derive(Debug, Clone, PartialEq)]
 pub enum LogFilterLevel {

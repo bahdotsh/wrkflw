@@ -91,7 +91,7 @@ pub mod symbols {
     pub const ARROW: &str = "\u{2192}"; // →
     pub const HRULE: &str = "\u{2500}"; // ─
 
-    pub const LOCK: &str = "\u{1F512}"; // 🔒
+    pub const LOCK: &str = "\u{26BF}"; // ⚿
 
     // Braille spinner frames for running animation
     pub const SPINNER: &[&str] = &[
@@ -185,7 +185,10 @@ pub fn spinner(frame: usize) -> &'static str {
 }
 
 /// Get symbol and style for a WorkflowStatus with spinner animation
-pub fn workflow_status_animated(status: &WorkflowStatus, spinner_frame: usize) -> (&'static str, Style) {
+pub fn workflow_status_animated(
+    status: &WorkflowStatus,
+    spinner_frame: usize,
+) -> (&'static str, Style) {
     match status {
         WorkflowStatus::Running => (spinner(spinner_frame), Style::default().fg(COLORS.info)),
         other => workflow_status(other),
@@ -234,10 +237,7 @@ pub fn block_focused<'a>(title: &'a str) -> Block<'a> {
 
 /// Create a styled badge span (text with colored background)
 pub fn badge<'a>(text: &'a str, bg: Color, fg: Color) -> Span<'a> {
-    Span::styled(
-        format!(" {} ", text),
-        Style::default().bg(bg).fg(fg),
-    )
+    Span::styled(format!(" {} ", text), Style::default().bg(bg).fg(fg))
 }
 
 /// Log level badge styles

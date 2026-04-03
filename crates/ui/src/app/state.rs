@@ -1,8 +1,8 @@
 // App state for the UI
 use crate::log_processor::{LogProcessingRequest, LogProcessor, ProcessedLogEntry};
 use crate::models::{
-    ExecutionResultMsg, JobExecution, LogFilterLevel, QueuedExecution, StepExecution, Workflow,
-    WorkflowExecution, WorkflowStatus,
+    ExecutionResultMsg, JobExecution, LogFilterLevel, QueuedExecution, StatusSeverity,
+    StepExecution, Workflow, WorkflowExecution, WorkflowStatus,
 };
 use chrono::Local;
 use crossterm::event::KeyCode;
@@ -24,18 +24,19 @@ pub struct App {
     pub show_action_messages: bool,
     pub execution_queue: Vec<QueuedExecution>, // Workflows queued for execution
     pub current_execution: Option<usize>,
-    pub logs: Vec<String>,                    // Overall execution logs
-    pub log_scroll: usize,                    // Scrolling position for logs
-    pub job_list_state: ListState,            // For viewing job details
-    pub detailed_view: bool,                  // Whether we're in detailed view mode
-    pub step_list_state: ListState,           // For selecting steps in detailed view
-    pub step_table_state: TableState,         // For the steps table in detailed view
-    pub last_tick: Instant,                   // For UI animations and updates
-    pub tick_rate: Duration,                  // How often to update the UI
-    pub spinner_frame: usize,                 // Current spinner animation frame
-    pub tx: mpsc::Sender<ExecutionResultMsg>, // Channel for async communication
-    pub status_message: Option<String>,       // Temporary status message to display
-    pub status_message_time: Option<Instant>, // When the message was set
+    pub logs: Vec<String>,                       // Overall execution logs
+    pub log_scroll: usize,                       // Scrolling position for logs
+    pub job_list_state: ListState,               // For viewing job details
+    pub detailed_view: bool,                     // Whether we're in detailed view mode
+    pub step_list_state: ListState,              // For selecting steps in detailed view
+    pub step_table_state: TableState,            // For the steps table in detailed view
+    pub last_tick: Instant,                      // For UI animations and updates
+    pub tick_rate: Duration,                     // How often to update the UI
+    pub spinner_frame: usize,                    // Current spinner animation frame
+    pub tx: mpsc::Sender<ExecutionResultMsg>,    // Channel for async communication
+    pub status_message: Option<String>,          // Temporary status message to display
+    pub status_message_severity: StatusSeverity, // Severity of the current status message
+    pub status_message_time: Option<Instant>,    // When the message was set
 
     // Search and filter functionality
     pub log_search_query: String, // Current search query for logs
@@ -212,6 +213,7 @@ impl App {
             spinner_frame: 0,
             tx,
             status_message: None,
+            status_message_severity: StatusSeverity::default(),
             status_message_time: None,
 
             // Search and filter functionality
@@ -827,7 +829,7 @@ impl App {
                 self.log_scroll = idx;
 
                 if !self.log_search_query.is_empty() {
-                    self.set_status_message(format!(
+                    self.set_success_message(format!(
                         "Found {} matches for '{}'",
                         self.log_search_matches.len(),
                         self.log_search_query
@@ -849,7 +851,7 @@ impl App {
                 self.log_scroll = idx;
 
                 // Set status message showing which match we're on
-                self.set_status_message(format!(
+                self.set_success_message(format!(
                     "Search match {}/{} for '{}'",
                     self.log_search_match_idx + 1,
                     self.log_search_matches.len(),
@@ -871,7 +873,7 @@ impl App {
                 self.log_scroll = idx;
 
                 // Set status message showing which match we're on
-                self.set_status_message(format!(
+                self.set_success_message(format!(
                     "Search match {}/{} for '{}'",
                     self.log_search_match_idx + 1,
                     self.log_search_matches.len(),
@@ -922,6 +924,14 @@ impl App {
     // Set a temporary status message to be displayed in the UI
     pub fn set_status_message(&mut self, message: String) {
         self.status_message = Some(message);
+        self.status_message_severity = StatusSeverity::Error;
+        self.status_message_time = Some(Instant::now());
+    }
+
+    // Set a temporary success status message
+    pub fn set_success_message(&mut self, message: String) {
+        self.status_message = Some(message);
+        self.status_message_severity = StatusSeverity::Success;
         self.status_message_time = Some(Instant::now());
     }
 
@@ -1069,7 +1079,7 @@ impl App {
                 ));
 
                 // Set a success status message
-                self.set_status_message(format!("✅ Workflow '{}' has been reset!", workflow_name));
+                self.set_success_message(format!("Workflow '{}' has been reset!", workflow_name));
             }
         }
     }

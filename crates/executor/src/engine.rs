@@ -183,8 +183,11 @@ async fn execute_github_workflow(
                 JobStatus::Failure => "failure",
                 JobStatus::Skipped => "skipped",
             };
-            all_job_results.insert(job_result.name.clone(), result_str.to_string());
-            all_job_outputs.insert(job_result.name.clone(), job_result.outputs.clone());
+            all_job_results.insert(job_result.canonical_name.clone(), result_str.to_string());
+            all_job_outputs.insert(
+                job_result.canonical_name.clone(),
+                job_result.outputs.clone(),
+            );
         }
 
         // Check for job failures and collect details
@@ -545,6 +548,10 @@ pub struct ExecutionResult {
 
 pub struct JobResult {
     pub name: String,
+    /// The canonical job key from the workflow definition (e.g., "build").
+    /// For matrix jobs, `name` is the display name (e.g., "build (os: ubuntu)")
+    /// while this remains the canonical key used for `needs.*` lookups.
+    pub canonical_name: String,
     pub status: JobStatus,
     pub steps: Vec<StepResult>,
     pub logs: String,
@@ -1681,6 +1688,7 @@ async fn execute_job_with_matrix(
             // Return a skipped job result
             return Ok(vec![JobResult {
                 name: job_name.to_string(),
+                canonical_name: job_name.to_string(),
                 status: JobStatus::Skipped,
                 steps: Vec::new(),
                 logs: String::new(),
@@ -1719,6 +1727,13 @@ async fn execute_job_with_matrix(
             std::cmp::max(1, num_cpus::get())
         });
 
+        // Pre-resolve secrets once for all matrix combinations
+        let secrets_context: HashMap<String, String> = if let Some(secret_mgr) = secret_manager {
+            resolve_secrets_for_context(secret_mgr, job, workflow).await
+        } else {
+            HashMap::new()
+        };
+
         // Execute matrix combinations
         execute_matrix_combinations(MatrixExecutionContext {
             job_name,
@@ -1732,6 +1747,9 @@ async fn execute_job_with_matrix(
             verbose,
             secret_manager,
             secret_masker,
+            secrets_context: &secrets_context,
+            needs_context: &needs_ctx,
+            needs_results: &needs_res,
         })
         .await
     } else {
@@ -1940,6 +1958,7 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
 
     Ok(JobResult {
         name: ctx.job_name.to_string(),
+        canonical_name: ctx.job_name.to_string(),
         status: if job_success {
             JobStatus::Success
         } else {
@@ -1962,10 +1981,12 @@ struct MatrixExecutionContext<'a> {
     runtime: &'a dyn ContainerRuntime,
     env_context: &'a HashMap<String, String>,
     verbose: bool,
-    #[allow(dead_code)] // Planned for future implementation
     secret_manager: Option<&'a SecretManager>,
-    #[allow(dead_code)] // Planned for future implementation
     secret_masker: Option<&'a SecretMasker>,
+    /// Pre-resolved secrets for expression context (resolved once, shared across combinations).
+    secrets_context: &'a HashMap<String, String>,
+    needs_context: &'a HashMap<String, HashMap<String, String>>,
+    needs_results: &'a HashMap<String, String>,
 }
 
 /// Execute a set of matrix combinations
@@ -1985,6 +2006,7 @@ async fn execute_matrix_combinations(
                     wrkflw_matrix::format_combination_name(ctx.job_name, combination);
                 results.push(JobResult {
                     name: combination_name,
+                    canonical_name: ctx.job_name.to_string(),
                     status: JobStatus::Skipped,
                     steps: Vec::new(),
                     logs: "Job skipped due to previous matrix job failure".to_string(),
@@ -2004,6 +2026,11 @@ async fn execute_matrix_combinations(
                 ctx.runtime,
                 ctx.env_context,
                 ctx.verbose,
+                ctx.secret_manager,
+                ctx.secret_masker,
+                ctx.secrets_context,
+                ctx.needs_context,
+                ctx.needs_results,
             )
         });
 
@@ -2035,6 +2062,7 @@ async fn execute_matrix_combinations(
 }
 
 /// Execute a single matrix job combination
+#[allow(clippy::too_many_arguments)]
 async fn execute_matrix_job(
     job_name: &str,
     job_template: &Job,
@@ -2043,6 +2071,11 @@ async fn execute_matrix_job(
     runtime: &dyn ContainerRuntime,
     base_env_context: &HashMap<String, String>,
     verbose: bool,
+    secret_manager: Option<&SecretManager>,
+    secret_masker: Option<&SecretMasker>,
+    secrets_context: &HashMap<String, String>,
+    needs_context: &HashMap<String, HashMap<String, String>>,
+    needs_results: &HashMap<String, String>,
 ) -> Result<JobResult, ExecutionError> {
     // Create the matrix-specific job name
     let matrix_job_name = wrkflw_matrix::format_combination_name(job_name, combination);
@@ -2080,6 +2113,7 @@ async fn execute_matrix_job(
         ExecutionError::Execution(format!("Failed to get current directory: {}", e))
     })?;
 
+    let mut step_outputs_map: HashMap<String, HashMap<String, String>> = HashMap::new();
     let job_success = if job_template.steps.is_empty() {
         wrkflw_logging::warning(&format!("Job '{}' has no steps", matrix_job_name));
         true
@@ -2089,7 +2123,8 @@ async fn execute_matrix_job(
         let runner_image_value = resolve_runner_image(job_template, runtime).await?;
 
         let mut all_steps_ok = true;
-        let mut step_outputs_map: HashMap<String, HashMap<String, String>> = HashMap::new();
+        let mut step_status_map: HashMap<String, (String, String)> = HashMap::new();
+        let mut job_status_str = "success".to_string();
         let timeout_mins = sanitize_timeout_minutes(job_template.timeout_minutes, 360.0);
         let job_timeout = std::time::Duration::from_secs_f64(timeout_mins * 60.0);
         let job_deadline = tokio::time::Instant::now() + job_timeout;
@@ -2114,17 +2149,17 @@ async fn execute_matrix_job(
                         runner_image: &runner_image_value,
                         verbose,
                         matrix_combination: &Some(combination.values.clone()),
-                        secret_manager: None,
-                        secret_masker: None,
+                        secret_manager,
+                        secret_masker,
                         container_config: job_template.container.as_ref(),
                         workflow_defaults: workflow.defaults.as_ref(),
                         job_defaults: job_template.defaults.as_ref(),
                         step_outputs: &step_outputs_map,
-                        step_statuses: &HashMap::new(),
-                        job_status: "success",
-                        secrets_context: &HashMap::new(),
-                        needs_context: &HashMap::new(),
-                        needs_results: &HashMap::new(),
+                        step_statuses: &step_status_map,
+                        job_status: &job_status_str,
+                        secrets_context,
+                        needs_context,
+                        needs_results,
                     },
                 ),
             )
@@ -2144,10 +2179,37 @@ async fn execute_matrix_job(
             };
 
             match outcome {
-                StepOutcome::Skipped(result) => {
-                    step_results.push(result);
+                StepOutcome::Skipped(ref result) => {
+                    if let Some(id) = &step.id {
+                        step_status_map
+                            .insert(id.clone(), ("skipped".to_string(), "skipped".to_string()));
+                    }
+                    step_results.push(result.clone());
                 }
                 StepOutcome::Completed { result, abort_job } => {
+                    // Record step outcome/conclusion for expression context
+                    if let Some(id) = &step.id {
+                        let outcome_str = match &result.outcome {
+                            StepStatus::Success => "success",
+                            StepStatus::Failure => "failure",
+                            StepStatus::Skipped => "skipped",
+                        };
+                        let conclusion_str = match &result.conclusion {
+                            StepStatus::Success => "success",
+                            StepStatus::Failure => "failure",
+                            StepStatus::Skipped => "skipped",
+                        };
+                        step_status_map.insert(
+                            id.clone(),
+                            (outcome_str.to_string(), conclusion_str.to_string()),
+                        );
+                    }
+
+                    // Update job status for success()/failure() builtins
+                    if result.conclusion == StepStatus::Failure {
+                        job_status_str = "failure".to_string();
+                    }
+
                     job_logs.push_str(&format!("Step: {}\n", result.name));
                     job_logs.push_str(&format!("Status: {:?}\n", result.status));
 
@@ -2179,9 +2241,13 @@ async fn execute_matrix_job(
         all_steps_ok
     };
 
+    // Resolve job outputs from step outputs
+    let job_outputs = resolve_job_outputs(job_template, &step_outputs_map, &job_env);
+
     // Return job result
     Ok(JobResult {
         name: matrix_job_name,
+        canonical_name: job_name.to_string(),
         status: if job_success {
             JobStatus::Success
         } else {
@@ -2189,7 +2255,7 @@ async fn execute_matrix_job(
         },
         steps: step_results,
         logs: job_logs,
-        outputs: HashMap::new(),
+        outputs: job_outputs,
     })
 }
 
@@ -2217,17 +2283,17 @@ async fn run_step_with_guards(
 
     // Check step-level if condition
     if let Some(if_cond) = &step.if_condition {
-        let should_run = evaluate_condition_with_context(
-            if_cond,
-            job_env,
-            step_exec_ctx.step_outputs,
-            step_exec_ctx.matrix_combination,
-            step_exec_ctx.step_statuses,
-            step_exec_ctx.job_status,
-            step_exec_ctx.secrets_context,
-            step_exec_ctx.needs_context,
-            step_exec_ctx.needs_results,
-        );
+        let cond_ctx = crate::expression::ExpressionContext {
+            env_context: job_env,
+            step_outputs: step_exec_ctx.step_outputs,
+            matrix_combination: step_exec_ctx.matrix_combination,
+            step_statuses: step_exec_ctx.step_statuses,
+            job_status: step_exec_ctx.job_status,
+            secrets_context: step_exec_ctx.secrets_context,
+            needs_context: step_exec_ctx.needs_context,
+            needs_results: step_exec_ctx.needs_results,
+        };
+        let should_run = evaluate_condition_with_context(if_cond, &cond_ctx);
         if !should_run {
             wrkflw_logging::info(&format!(
                 "  {} Skipping step '{}' due to condition: {}",
@@ -2383,17 +2449,20 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
             value.clone()
         };
         // Resolve ${{ }} expressions in env values (e.g. ${{inputs.toolchain}})
+        let env_expr_ctx = crate::expression::ExpressionContext {
+            env_context: &step_env,
+            step_outputs: ctx.step_outputs,
+            matrix_combination: ctx.matrix_combination,
+            step_statuses: ctx.step_statuses,
+            job_status: ctx.job_status,
+            secrets_context: ctx.secrets_context,
+            needs_context: ctx.needs_context,
+            needs_results: ctx.needs_results,
+        };
         let resolved_value = match crate::substitution::preprocess_expressions(
             &resolved_value,
             ctx.working_dir,
-            ctx.matrix_combination,
-            ctx.step_outputs,
-            &step_env,
-            ctx.step_statuses,
-            ctx.job_status,
-            ctx.secrets_context,
-            ctx.needs_context,
-            ctx.needs_results,
+            &env_expr_ctx,
         ) {
             Ok(r) => r,
             Err(_) => resolved_value,
@@ -2463,6 +2532,11 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                             ctx.runtime,
                             ctx.runner_image,
                             ctx.verbose,
+                            ctx.secret_manager,
+                            ctx.secret_masker,
+                            ctx.secrets_context,
+                            ctx.needs_context,
+                            ctx.needs_results,
                         )
                         .await?
                     } else {
@@ -2516,6 +2590,11 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                             ctx.runtime,
                             ctx.runner_image,
                             ctx.verbose,
+                            ctx.secret_manager,
+                            ctx.secret_masker,
+                            ctx.secrets_context,
+                            ctx.needs_context,
+                            ctx.needs_results,
                         )
                         .await?
                     }
@@ -2938,17 +3017,20 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
         };
 
         // Resolve expression substitutions (hashFiles, step outputs, env, matrix vars)
+        let run_expr_ctx = crate::expression::ExpressionContext {
+            env_context: ctx.job_env,
+            step_outputs: ctx.step_outputs,
+            matrix_combination: ctx.matrix_combination,
+            step_statuses: ctx.step_statuses,
+            job_status: ctx.job_status,
+            secrets_context: ctx.secrets_context,
+            needs_context: ctx.needs_context,
+            needs_results: ctx.needs_results,
+        };
         let resolved_run = match crate::substitution::preprocess_expressions(
             &resolved_run,
             ctx.working_dir,
-            ctx.matrix_combination,
-            ctx.step_outputs,
-            ctx.job_env,
-            ctx.step_statuses,
-            ctx.job_status,
-            ctx.secrets_context,
-            ctx.needs_context,
-            ctx.needs_results,
+            &run_expr_ctx,
         ) {
             Ok(r) => r,
             Err(e) => {
@@ -3710,6 +3792,7 @@ async fn execute_reusable_workflow_job(
 
             return Ok(JobResult {
                 name: ctx.job_name.to_string(),
+                canonical_name: ctx.job_name.to_string(),
                 status: if any_failed {
                     JobStatus::Failure
                 } else {
@@ -3787,6 +3870,7 @@ async fn execute_reusable_workflow_job(
 
     Ok(JobResult {
         name: ctx.job_name.to_string(),
+        canonical_name: ctx.job_name.to_string(),
         status: if any_failed {
             JobStatus::Failure
         } else {
@@ -3850,6 +3934,7 @@ fn extract_language_info(image: &str) -> Option<(&'static str, Option<&str>)> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_composite_action(
     step: &workflow::Step,
     action_path: &Path,
@@ -3858,6 +3943,11 @@ async fn execute_composite_action(
     runtime: &dyn ContainerRuntime,
     runner_image: &str,
     verbose: bool,
+    secret_manager: Option<&SecretManager>,
+    secret_masker: Option<&SecretMasker>,
+    secrets_context: &HashMap<String, String>,
+    needs_context: &HashMap<String, HashMap<String, String>>,
+    needs_results: &HashMap<String, String>,
 ) -> Result<StepResult, ExecutionError> {
     // Find the action definition file
     let action_yaml = action_path.join("action.yml");
@@ -3958,17 +4048,17 @@ async fn execute_composite_action(
                     runner_image,
                     verbose,
                     matrix_combination: &None,
-                    secret_manager: None, // Composite actions don't have secrets yet
-                    secret_masker: None,
+                    secret_manager,
+                    secret_masker,
                     container_config: None, // Composite actions don't use job containers
                     workflow_defaults: None,
                     job_defaults: None,
                     step_outputs: &composite_step_outputs,
                     step_statuses: &HashMap::new(),
                     job_status: "success",
-                    secrets_context: &HashMap::new(),
-                    needs_context: &HashMap::new(),
-                    needs_results: &HashMap::new(),
+                    secrets_context,
+                    needs_context,
+                    needs_results,
                 }))
                 .await?;
 
@@ -4139,57 +4229,37 @@ fn convert_yaml_to_step(step_yaml: &serde_yaml::Value) -> Result<workflow::Step,
 /// `always()`, and `cancelled()` are not yet fully supported — a warning is emitted
 /// and the condition defaults to its most likely state (`always()`/`success()` → true,
 /// `failure()`/`cancelled()` → false).
-#[allow(clippy::too_many_arguments)]
 fn evaluate_job_condition(
     condition: &str,
     env_context: &HashMap<String, String>,
     _workflow: &WorkflowDefinition,
 ) -> bool {
-    evaluate_condition_with_context(
-        condition,
+    let ctx = crate::expression::ExpressionContext {
         env_context,
-        &HashMap::new(),
-        &None,
-        &HashMap::new(),
-        "success",
-        &HashMap::new(),
-        &HashMap::new(),
-        &HashMap::new(),
-    )
+        step_outputs: &HashMap::new(),
+        matrix_combination: &None,
+        step_statuses: &HashMap::new(),
+        job_status: "success",
+        secrets_context: &HashMap::new(),
+        needs_context: &HashMap::new(),
+        needs_results: &HashMap::new(),
+    };
+    evaluate_condition_with_context(condition, &ctx)
 }
 
 /// Evaluate a job/step `if:` condition using the expression evaluator.
 ///
 /// Accepts the full expression context (env, step outputs, matrix) for accurate
 /// resolution of context references and operators.
-#[allow(clippy::too_many_arguments)]
 fn evaluate_condition_with_context(
     condition: &str,
-    env_context: &HashMap<String, String>,
-    step_outputs: &HashMap<String, HashMap<String, String>>,
-    matrix_combination: &Option<HashMap<String, Value>>,
-    step_statuses: &HashMap<String, (String, String)>,
-    job_status: &str,
-    secrets_context: &HashMap<String, String>,
-    needs_context: &HashMap<String, HashMap<String, String>>,
-    needs_results: &HashMap<String, String>,
+    ctx: &crate::expression::ExpressionContext<'_>,
 ) -> bool {
-    use crate::expression::{evaluate_as_bool, ExpressionContext};
+    use crate::expression::evaluate_as_bool;
 
     wrkflw_logging::debug(&format!("Evaluating condition: {}", condition));
 
-    let ctx = ExpressionContext {
-        env_context,
-        step_outputs,
-        matrix_combination,
-        step_statuses,
-        job_status,
-        secrets_context,
-        needs_context,
-        needs_results,
-    };
-
-    match evaluate_as_bool(condition, &ctx) {
+    match evaluate_as_bool(condition, ctx) {
         Ok(result) => {
             wrkflw_logging::debug(&format!(
                 "Condition '{}' evaluated to {}",
@@ -4234,7 +4304,6 @@ fn build_needs_context(
 
 /// Resolve a job's declared outputs by evaluating the output expressions
 /// (which typically reference `steps.<id>.outputs.<key>`) against the job's step outputs.
-#[allow(clippy::too_many_arguments)]
 fn resolve_job_outputs(
     job: &Job,
     step_outputs_map: &HashMap<String, HashMap<String, String>>,
@@ -4242,19 +4311,18 @@ fn resolve_job_outputs(
 ) -> HashMap<String, String> {
     let mut resolved = HashMap::new();
     if let Some(outputs) = &job.outputs {
+        let ctx = crate::expression::ExpressionContext {
+            env_context,
+            step_outputs: step_outputs_map,
+            matrix_combination: &None,
+            step_statuses: &HashMap::new(),
+            job_status: "success",
+            secrets_context: &HashMap::new(),
+            needs_context: &HashMap::new(),
+            needs_results: &HashMap::new(),
+        };
         for (key, expr) in outputs {
-            match crate::substitution::preprocess_expressions(
-                expr,
-                Path::new("."),
-                &None,
-                step_outputs_map,
-                env_context,
-                &HashMap::new(),
-                "success",
-                &HashMap::new(),
-                &HashMap::new(),
-                &HashMap::new(),
-            ) {
+            match crate::substitution::preprocess_expressions(expr, Path::new("."), &ctx) {
                 Ok(val) => {
                     resolved.insert(key.clone(), val);
                 }
@@ -4713,17 +4781,16 @@ mod tests {
     }
 
     #[test]
-    fn condition_steps_reference_evaluates_with_default_outcome() {
+    fn condition_steps_reference_evaluates_null_for_unknown_step() {
         let env = HashMap::new();
         let wf = empty_workflow();
-        // steps.build.outcome defaults to "success" in local execution since
-        // we don't track actual step status — so == 'success' is true.
-        assert!(evaluate_job_condition(
+        // Unknown step IDs resolve to null (matching GitHub Actions behavior),
+        // so comparisons to any string are false.
+        assert!(!evaluate_job_condition(
             "steps.build.outcome == 'success'",
             &env,
             &wf
         ));
-        // Checking for failure should be false
         assert!(!evaluate_job_condition(
             "steps.build.outcome == 'failure'",
             &env,

@@ -344,9 +344,10 @@ impl<'a> ExpressionContext<'a> {
                 .get(&parts[1])
                 .map(|v| ExprValue::String(v.clone()))
                 .unwrap_or(ExprValue::Null),
-            // jobs.* context — same structure as needs.* but typically used in
-            // workflow_call output contexts. Uses needs data (which already contains
-            // all completed upstream jobs).
+            // jobs.* context — In real GitHub Actions, this is only available in
+            // workflow_call output mapping contexts, not in step expressions. We alias
+            // it to needs.* data here as a pragmatic approximation that covers the most
+            // common use case (reusable workflow outputs).
             "jobs" if parts.len() == 4 && parts[2] == "outputs" => self
                 .needs_context
                 .get(&parts[1])
@@ -367,12 +368,12 @@ impl<'a> ExpressionContext<'a> {
                 .step_statuses
                 .get(&parts[1])
                 .map(|(outcome, _)| ExprValue::String(outcome.clone()))
-                .unwrap_or(ExprValue::String("success".to_string())),
+                .unwrap_or(ExprValue::Null),
             "steps" if parts.len() == 3 && parts[2] == "conclusion" => self
                 .step_statuses
                 .get(&parts[1])
                 .map(|(_, conclusion)| ExprValue::String(conclusion.clone()))
-                .unwrap_or(ExprValue::String("success".to_string())),
+                .unwrap_or(ExprValue::Null),
             _ => ExprValue::Null,
         }
     }
@@ -1249,5 +1250,18 @@ mod tests {
     fn eval_empty_expression() {
         let ctx = empty_ctx();
         assert_eq!(evaluate("", &ctx).unwrap(), ExprValue::Null);
+    }
+
+    #[test]
+    fn unknown_step_id_returns_null() {
+        let ctx = empty_ctx();
+        assert_eq!(
+            evaluate("steps.nonexistent.outcome", &ctx).unwrap(),
+            ExprValue::Null
+        );
+        assert_eq!(
+            evaluate("steps.nonexistent.conclusion", &ctx).unwrap(),
+            ExprValue::Null
+        );
     }
 }

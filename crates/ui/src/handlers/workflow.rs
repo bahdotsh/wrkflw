@@ -419,6 +419,7 @@ pub async fn execute_curl_trigger(
     // Create a job result structure
     let job_result = wrkflw_executor::JobResult {
         name: "GitHub Trigger".to_string(),
+        canonical_name: "GitHub Trigger".to_string(),
         status: wrkflw_executor::JobStatus::Success,
         steps: vec![wrkflw_executor::StepResult {
             name: "Remote Trigger".to_string(),
@@ -562,6 +563,7 @@ pub fn start_next_workflow_execution(
                             // Create a synthetic job result for validation
                             let jobs = vec![wrkflw_executor::JobResult {
                                 name: "Validation".to_string(),
+                                canonical_name: "Validation".to_string(),
                                 status,
                                 steps: vec![{
                                     let step_status = if validation_result.is_valid {

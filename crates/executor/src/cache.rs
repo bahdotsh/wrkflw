@@ -97,6 +97,7 @@ impl CacheStore {
     }
 
     /// Find a cached key that starts with the given prefix.
+    // TODO: consider an in-memory index for large cache directories (currently O(n) scan)
     fn find_by_prefix(&self, prefix: &str) -> Option<String> {
         let entries = std::fs::read_dir(&self.root).ok()?;
         for entry in entries.flatten() {

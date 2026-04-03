@@ -564,6 +564,9 @@ fn expr_eq(a: &ExprValue, b: &ExprValue) -> bool {
             (bv - n).abs() < f64::EPSILON
         }
         (ExprValue::Bool(b), ExprValue::String(s)) | (ExprValue::String(s), ExprValue::Bool(b)) => {
+            // GitHub Actions coerces strings to booleans for comparison:
+            // "true" (case-insensitive) → true, everything else → false.
+            // This means `false == "random"` is true (both coerce to false).
             let sv = s.eq_ignore_ascii_case("true");
             *b == sv
         }
@@ -828,6 +831,33 @@ mod tests {
         );
         assert_eq!(
             evaluate("'nightly' != 'stable'", &ctx).unwrap(),
+            ExprValue::Bool(true)
+        );
+    }
+
+    #[test]
+    fn eval_bool_string_coercion() {
+        let ctx = empty_ctx();
+        // GitHub Actions coerces strings to booleans: "true" → true, everything else → false.
+        // So false == "random" is true because "random" coerces to false.
+        assert_eq!(
+            evaluate("false == 'random'", &ctx).unwrap(),
+            ExprValue::Bool(true)
+        );
+        assert_eq!(
+            evaluate("true == 'true'", &ctx).unwrap(),
+            ExprValue::Bool(true)
+        );
+        assert_eq!(
+            evaluate("true == 'TRUE'", &ctx).unwrap(),
+            ExprValue::Bool(true)
+        );
+        assert_eq!(
+            evaluate("true == 'false'", &ctx).unwrap(),
+            ExprValue::Bool(false)
+        );
+        assert_eq!(
+            evaluate("false == 'false'", &ctx).unwrap(),
             ExprValue::Bool(true)
         );
     }

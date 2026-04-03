@@ -36,11 +36,7 @@ fn key_line<'a>(key: &'a str, desc: &'a str) -> Line<'a> {
 }
 
 // Render the help tab with scroll support
-pub fn render_help_content(
-    f: &mut Frame<'_>,
-    area: Rect,
-    scroll_offset: usize,
-) {
+pub fn render_help_content(f: &mut Frame<'_>, area: Rect, scroll_offset: usize) {
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)].as_ref())
@@ -90,7 +86,10 @@ pub fn render_help_content(
     left_lines.push(Line::from(vec![
         Span::raw("  \u{2022} "),
         Span::styled("Docker", Style::default().fg(COLORS.runtime_docker)),
-        Span::styled(" \u{2500} Container isolation (default)", theme::dim_style()),
+        Span::styled(
+            " \u{2500} Container isolation (default)",
+            theme::dim_style(),
+        ),
     ]));
     left_lines.push(Line::from(vec![
         Span::raw("  \u{2022} "),
@@ -104,7 +103,10 @@ pub fn render_help_content(
     ]));
     left_lines.push(Line::from(vec![
         Span::raw("  \u{2022} "),
-        Span::styled("Secure Emulation", Style::default().fg(COLORS.runtime_secure)),
+        Span::styled(
+            "Secure Emulation",
+            Style::default().fg(COLORS.runtime_secure),
+        ),
         Span::styled(" \u{2500} Sandboxed processes", theme::dim_style()),
     ]));
 
@@ -185,13 +187,22 @@ pub fn render_help_content(
     right_lines.push(Line::from(""));
     right_lines.push(Line::from(vec![
         Span::raw("\u{2022} Use "),
-        Span::styled("emulation mode", Style::default().fg(COLORS.runtime_emulation)),
+        Span::styled(
+            "emulation mode",
+            Style::default().fg(COLORS.runtime_emulation),
+        ),
         Span::styled(" when containers are unavailable", theme::dim_style()),
     ]));
     right_lines.push(Line::from(vec![
         Span::raw("\u{2022} "),
-        Span::styled("Secure emulation", Style::default().fg(COLORS.runtime_secure)),
-        Span::styled(" provides sandboxing for untrusted workflows", theme::dim_style()),
+        Span::styled(
+            "Secure emulation",
+            Style::default().fg(COLORS.runtime_secure),
+        ),
+        Span::styled(
+            " provides sandboxing for untrusted workflows",
+            theme::dim_style(),
+        ),
     ]));
     right_lines.push(Line::from(vec![
         Span::raw("\u{2022} Use "),

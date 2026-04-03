@@ -56,7 +56,12 @@ pub fn step_failure(name: &str) -> String {
 }
 
 pub fn step_skipped(name: &str) -> String {
-    format!("  {} {} {}", "\u{2298}".dimmed(), name, "(skipped)".dimmed())
+    format!(
+        "  {} {} {}",
+        "\u{2298}".dimmed(),
+        name,
+        "(skipped)".dimmed()
+    )
 }
 
 pub fn indent(text: &str) -> String {

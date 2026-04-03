@@ -11,11 +11,7 @@ use ratatui::{
 };
 
 // Render the execution tab
-pub fn render_execution_tab(
-    f: &mut Frame<'_>,
-    app: &mut App,
-    area: Rect,
-) {
+pub fn render_execution_tab(f: &mut Frame<'_>, app: &mut App, area: Rect) {
     let current_workflow_idx = app
         .current_execution
         .or_else(|| app.workflow_list_state.selected())

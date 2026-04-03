@@ -63,10 +63,7 @@ pub fn validate_workflow(path: &Path, verbose: bool) -> io::Result<()> {
                 } else {
                     println!(
                         "{}",
-                        cli_style::error(&format!(
-                            "Invalid: {}",
-                            workflow_path.display()
-                        ))
+                        cli_style::error(&format!("Invalid: {}", workflow_path.display()))
                     );
                     for (i, issue) in result.issues.iter().enumerate() {
                         println!("{}", cli_style::indent(&format!("{}. {}", i + 1, issue)));
@@ -91,11 +88,7 @@ pub fn validate_workflow(path: &Path, verbose: bool) -> io::Result<()> {
     use colored::Colorize;
     println!(
         "\n{}",
-        format!(
-            "Summary: {} valid, {} invalid",
-            valid_count, invalid_count
-        )
-        .bold()
+        format!("Summary: {} valid, {} invalid", valid_count, invalid_count).bold()
     );
 
     Ok(())
@@ -173,8 +166,14 @@ pub async fn execute_workflow_cli(
         RuntimeType::Emulation => RuntimeType::Emulation,
     };
 
-    println!("{}", cli_style::key_value("Workflow", &path.display().to_string()));
-    println!("{}", cli_style::key_value("Runtime", &format!("{:?}", runtime_type)));
+    println!(
+        "{}",
+        cli_style::key_value("Workflow", &path.display().to_string())
+    );
+    println!(
+        "{}",
+        cli_style::key_value("Runtime", &format!("{:?}", runtime_type))
+    );
 
     // Log the start of the execution in debug mode with more details
     wrkflw_logging::debug(&format!(
@@ -252,7 +251,10 @@ pub async fn execute_workflow_cli(
                                 {
                                     println!(
                                         "{}",
-                                        cli_style::indent(&format!("Command: {}", cmd_output.trim()))
+                                        cli_style::indent(&format!(
+                                            "Command: {}",
+                                            cmd_output.trim()
+                                        ))
                                     );
                                 }
                             }
@@ -266,10 +268,7 @@ pub async fn execute_workflow_cli(
                             if !output_lines.is_empty() {
                                 println!("{}", cli_style::indent("Error output:"));
                                 for line in output_lines.iter().take(10) {
-                                    println!(
-                                        "{}",
-                                        cli_style::indent(line.trim())
-                                    );
+                                    println!("{}", cli_style::indent(line.trim()));
                                 }
 
                                 if output_lines.len() > 10 {
@@ -313,10 +312,16 @@ pub async fn execute_workflow_cli(
             if any_job_failed {
                 println!("\n{}", cli_style::error("Workflow completed with failures"));
                 if wrkflw_logging::get_log_level() > wrkflw_logging::LogLevel::Debug {
-                    println!("{}", cli_style::indent("Run with --debug for more detailed output"));
+                    println!(
+                        "{}",
+                        cli_style::indent("Run with --debug for more detailed output")
+                    );
                 }
             } else {
-                println!("\n{}", cli_style::success("Workflow completed successfully!"));
+                println!(
+                    "\n{}",
+                    cli_style::success("Workflow completed successfully!")
+                );
             }
 
             Ok(())

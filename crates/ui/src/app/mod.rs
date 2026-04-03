@@ -463,7 +463,7 @@ fn run_tui_event_loop(
                                             || workflow.status == WorkflowStatus::Skipped;
 
                                         // Now set the status message (mutable borrow)
-                                        app.set_status_message(format!(
+                                        app.set_error_message(format!(
                                             "Cannot trigger workflow '{}' in {} state. Press Shift+R to reset.",
                                             workflow_name,
                                             status_text

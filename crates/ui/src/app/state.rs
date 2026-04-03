@@ -838,7 +838,7 @@ impl App {
             }
         } else if !self.log_search_query.is_empty() {
             // No matches found
-            self.set_status_message(format!("No matches found for '{}'", self.log_search_query));
+            self.set_error_message(format!("No matches found for '{}'", self.log_search_query));
         }
     }
 
@@ -921,8 +921,8 @@ impl App {
         }
     }
 
-    // Set a temporary status message to be displayed in the UI
-    pub fn set_status_message(&mut self, message: String) {
+    // Set a temporary error status message to be displayed in the UI
+    pub fn set_error_message(&mut self, message: String) {
         self.status_message = Some(message);
         self.status_message_severity = StatusSeverity::Error;
         self.status_message_time = Some(Instant::now());

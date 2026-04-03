@@ -205,30 +205,31 @@ impl LogProcessor {
         };
 
         // Determine log type and style using theme badge styles
-        let (log_type, log_style) =
-            if log_line.contains("Error") || log_line.contains("error") || log_line.contains("❌")
-            {
-                ("ERROR", theme::log_badge("ERROR"))
-            } else if log_line.contains("Warning")
-                || log_line.contains("warning")
-                || log_line.contains("⚠️")
-            {
-                ("WARN", theme::log_badge("WARN"))
-            } else if log_line.contains("Success")
-                || log_line.contains("success")
-                || log_line.contains("✅")
-            {
-                ("SUCCESS", theme::log_badge("SUCCESS"))
-            } else if log_line.contains("Running")
-                || log_line.contains("running")
-                || log_line.contains("⟳")
-            {
-                ("INFO", theme::log_badge("INFO"))
-            } else if log_line.contains("Triggering") || log_line.contains("triggered") {
-                ("TRIG", theme::log_badge("TRIG"))
-            } else {
-                ("INFO", theme::log_badge(""))
-            };
+        let (log_type, log_style) = if log_line.contains("Error")
+            || log_line.contains("error")
+            || log_line.contains(theme::symbols::FAILURE)
+        {
+            ("ERROR", theme::log_badge("ERROR"))
+        } else if log_line.contains("Warning")
+            || log_line.contains("warning")
+            || log_line.contains("\u{26A0}")
+        {
+            ("WARN", theme::log_badge("WARN"))
+        } else if log_line.contains("Success")
+            || log_line.contains("success")
+            || log_line.contains(theme::symbols::SUCCESS)
+        {
+            ("SUCCESS", theme::log_badge("SUCCESS"))
+        } else if log_line.contains("Running")
+            || log_line.contains("running")
+            || log_line.contains(theme::symbols::RUNNING)
+        {
+            ("INFO", theme::log_badge("INFO"))
+        } else if log_line.contains("Triggering") || log_line.contains("triggered") {
+            ("TRIG", theme::log_badge("TRIG"))
+        } else {
+            ("INFO", theme::log_badge(""))
+        };
 
         // Extract content after timestamp
         let content = if log_line.starts_with('[') && log_line.contains(']') {

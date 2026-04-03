@@ -457,7 +457,11 @@ async fn main() {
                     } else {
                         let simplified_error = details
                             .lines()
-                            .filter(|line| line.contains('\u{2716}') || line.contains("❌") || line.trim().starts_with("Error:"))
+                            .filter(|line| {
+                                line.contains('\u{2716}')
+                                    || line.contains("❌")
+                                    || line.trim().starts_with("Error:")
+                            })
                             .take(5)
                             .collect::<Vec<&str>>()
                             .join("\n");
@@ -465,25 +469,39 @@ async fn main() {
                         eprintln!("{}", simplified_error);
 
                         if details.lines().count() > 5 {
-                            eprintln!("\n{}", cli_style::dim("Use --verbose flag to see full error details"));
+                            eprintln!(
+                                "\n{}",
+                                cli_style::dim("Use --verbose flag to see full error details")
+                            );
                         }
                     }
                 }
                 std::process::exit(1);
             } else {
-                println!("{}", cli_style::success("Workflow execution completed successfully!"));
+                println!(
+                    "{}",
+                    cli_style::success("Workflow execution completed successfully!")
+                );
 
                 println!("{}", cli_style::section("Job summary"));
                 for job in result.jobs {
                     match job.status {
-                        wrkflw_executor::JobStatus::Success => println!("  {}", cli_style::job_success(&job.name)),
-                        wrkflw_executor::JobStatus::Failure => println!("  {}", cli_style::job_failure(&job.name)),
-                        wrkflw_executor::JobStatus::Skipped => println!("  {}", cli_style::job_skipped(&job.name)),
+                        wrkflw_executor::JobStatus::Success => {
+                            println!("  {}", cli_style::job_success(&job.name))
+                        }
+                        wrkflw_executor::JobStatus::Failure => {
+                            println!("  {}", cli_style::job_failure(&job.name))
+                        }
+                        wrkflw_executor::JobStatus::Skipped => {
+                            println!("  {}", cli_style::job_skipped(&job.name))
+                        }
                     }
 
                     for step in job.steps {
                         match step.status {
-                            wrkflw_executor::StepStatus::Success => println!("{}", cli_style::step_success(&step.name)),
+                            wrkflw_executor::StepStatus::Success => {
+                                println!("{}", cli_style::step_success(&step.name))
+                            }
                             wrkflw_executor::StepStatus::Failure => {
                                 println!("{}", cli_style::step_failure(&step.name));
 
@@ -506,12 +524,19 @@ async fn main() {
                                         }
 
                                         if step.output.lines().count() > 3 {
-                                            println!("{}", cli_style::indent("(Use --verbose for full output)"));
+                                            println!(
+                                                "{}",
+                                                cli_style::indent(
+                                                    "(Use --verbose for full output)"
+                                                )
+                                            );
                                         }
                                     }
                                 }
                             }
-                            wrkflw_executor::StepStatus::Skipped => println!("{}", cli_style::step_skipped(&step.name)),
+                            wrkflw_executor::StepStatus::Skipped => {
+                                println!("{}", cli_style::step_skipped(&step.name))
+                            }
                         }
                     }
                 }
@@ -686,16 +711,19 @@ fn list_workflows_and_pipelines(verbose: bool, show_jobs: bool) {
                     .collect();
 
                 if entries.is_empty() {
-                    println!("{}", cli_style::dim("  No workflow files found in .github/workflows"));
+                    println!(
+                        "{}",
+                        cli_style::dim("  No workflow files found in .github/workflows")
+                    );
                 } else {
                     for (i, entry) in entries.iter().enumerate() {
                         let is_last = i == entries.len() - 1;
-                        let connector = if is_last { "\u{2514}\u{2500}\u{2500}" } else { "\u{251C}\u{2500}\u{2500}" };
-                        println!(
-                            "{} {}",
-                            connector.dimmed(),
-                            entry.path().display()
-                        );
+                        let connector = if is_last {
+                            "\u{2514}\u{2500}\u{2500}"
+                        } else {
+                            "\u{251C}\u{2500}\u{2500}"
+                        };
+                        println!("{} {}", connector.dimmed(), entry.path().display());
                         if show_jobs {
                             let prefix = if is_last { "    " } else { "\u{2502}   " };
                             match wrkflw_parser::workflow::parse_workflow(&entry.path()) {
@@ -737,7 +765,10 @@ fn list_workflows_and_pipelines(verbose: bool, show_jobs: bool) {
             }
         }
     } else {
-        println!("{}", cli_style::dim("GitHub Workflows: No .github/workflows directory found"));
+        println!(
+            "{}",
+            cli_style::dim("GitHub Workflows: No .github/workflows directory found")
+        );
     }
 
     // Check for GitLab CI pipeline
@@ -773,12 +804,18 @@ fn list_workflows_and_pipelines(verbose: bool, show_jobs: bool) {
             }
         }
     } else {
-        println!("{}", cli_style::dim("GitLab CI Pipeline: No .gitlab-ci.yml file found"));
+        println!(
+            "{}",
+            cli_style::dim("GitLab CI Pipeline: No .gitlab-ci.yml file found")
+        );
     }
 
     // Check for other GitLab CI pipeline files
     if verbose {
-        println!("\n{}", cli_style::info("Searching for other GitLab CI pipeline files..."));
+        println!(
+            "\n{}",
+            cli_style::info("Searching for other GitLab CI pipeline files...")
+        );
 
         let entries = walkdir::WalkDir::new(".")
             .follow_links(true)

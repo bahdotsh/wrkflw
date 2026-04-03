@@ -10,11 +10,7 @@ use ratatui::{
 };
 
 // Render the job detail view
-pub fn render_job_detail_view(
-    f: &mut Frame<'_>,
-    app: &mut App,
-    area: Rect,
-) {
+pub fn render_job_detail_view(f: &mut Frame<'_>, app: &mut App, area: Rect) {
     let current_workflow_idx = app
         .current_execution
         .or_else(|| app.workflow_list_state.selected())
@@ -78,9 +74,9 @@ pub fn render_job_detail_view(
                     f.render_widget(job_title, chunks[0]);
 
                     // Steps section
-                    let header_cells = ["Status", "Step Name"].iter().map(|h| {
-                        ratatui::widgets::Cell::from(*h).style(theme::header_style())
-                    });
+                    let header_cells = ["Status", "Step Name"]
+                        .iter()
+                        .map(|h| ratatui::widgets::Cell::from(*h).style(theme::header_style()));
 
                     let header = Row::new(header_cells).height(1);
 
@@ -134,10 +130,7 @@ pub fn render_job_detail_view(
                                             .fg(COLORS.text)
                                             .add_modifier(Modifier::BOLD),
                                     ),
-                                    Span::styled(
-                                        format!(" ({})", status_text),
-                                        step_style,
-                                    ),
+                                    Span::styled(format!(" ({})", status_text), step_style),
                                 ]),
                                 Line::from(""),
                                 Line::from(Span::styled(

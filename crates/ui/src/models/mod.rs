@@ -79,11 +79,13 @@ impl LogFilterLevel {
     pub fn matches(&self, log: &str) -> bool {
         match self {
             LogFilterLevel::Info => {
-                log.contains("ℹ️") || (log.contains("INFO") && !log.contains("SUCCESS"))
+                log.contains("\u{25CF}") || (log.contains("INFO") && !log.contains("SUCCESS"))
             }
-            LogFilterLevel::Warning => log.contains("⚠️") || log.contains("WARN"),
-            LogFilterLevel::Error => log.contains("❌") || log.contains("ERROR"),
-            LogFilterLevel::Success => log.contains("SUCCESS") || log.contains("success"),
+            LogFilterLevel::Warning => log.contains("\u{26A0}") || log.contains("WARN"),
+            LogFilterLevel::Error => log.contains("\u{2716}") || log.contains("ERROR"),
+            LogFilterLevel::Success => {
+                log.contains("\u{2714}") || log.contains("SUCCESS") || log.contains("success")
+            }
             LogFilterLevel::Trigger => {
                 log.contains("Triggering") || log.contains("triggered") || log.contains("TRIG")
             }

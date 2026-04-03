@@ -9,11 +9,7 @@ use ratatui::{
 };
 
 // Render the workflow list tab
-pub fn render_workflows_tab(
-    f: &mut Frame<'_>,
-    app: &mut App,
-    area: Rect,
-) {
+pub fn render_workflows_tab(f: &mut Frame<'_>, app: &mut App, area: Rect) {
     if app.job_selection_mode {
         render_job_selection(f, app, area);
     } else {
@@ -38,7 +34,8 @@ fn render_workflow_list(f: &mut Frame<'_>, app: &mut App, area: Rect) {
             theme::symbols::CHECKBOX_OFF
         };
 
-        let (status_symbol, status_style) = theme::workflow_status_animated(&workflow.status, app.spinner_frame);
+        let (status_symbol, status_style) =
+            theme::workflow_status_animated(&workflow.status, app.spinner_frame);
 
         let path_display = workflow.path.to_string_lossy();
         let path_shortened = if path_display.len() > 30 {
@@ -56,8 +53,11 @@ fn render_workflow_list(f: &mut Frame<'_>, app: &mut App, area: Rect) {
         Row::new(vec![
             Cell::from(checkbox).style(Style::default().fg(COLORS.success)),
             Cell::from(status_symbol).style(status_style),
-            Cell::from(workflow.name.clone())
-                .style(Style::default().fg(COLORS.text).add_modifier(Modifier::BOLD)),
+            Cell::from(workflow.name.clone()).style(
+                Style::default()
+                    .fg(COLORS.text)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Cell::from(path_shortened).style(theme::muted_style()),
         ])
     });

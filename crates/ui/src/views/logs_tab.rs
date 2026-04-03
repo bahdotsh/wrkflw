@@ -19,7 +19,7 @@ pub fn render_logs_tab(f: &mut Frame<'_>, app: &App, area: Rect) {
         .constraints(
             [
                 Constraint::Length(if show_search_bar { 3 } else { 0 }), // Search bar (optional)
-                Constraint::Min(3), // Logs content
+                Constraint::Min(3),                                      // Logs content
             ]
             .as_ref(),
         )

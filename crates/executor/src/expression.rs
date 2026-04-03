@@ -1158,7 +1158,7 @@ mod tests {
     fn output_string_formatting() {
         assert_eq!(ExprValue::String("hi".to_string()).to_output_string(), "hi");
         assert_eq!(ExprValue::Number(42.0).to_output_string(), "42");
-        assert_eq!(ExprValue::Number(3.14).to_output_string(), "3.14");
+        assert_eq!(ExprValue::Number(3.15).to_output_string(), "3.15");
         assert_eq!(ExprValue::Bool(true).to_output_string(), "true");
         assert_eq!(ExprValue::Null.to_output_string(), "");
     }

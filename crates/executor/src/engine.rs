@@ -157,6 +157,9 @@ async fn execute_github_workflow(
     let mut results = Vec::new();
     let mut has_failures = false;
     let mut failure_details = String::new();
+    // Accumulate job outputs and results across batches for `needs.*` context
+    let mut all_job_outputs: HashMap<String, HashMap<String, String>> = HashMap::new();
+    let mut all_job_results: HashMap<String, String> = HashMap::new();
 
     for job_batch in execution_plan {
         // Execute jobs in parallel if they don't depend on each other
@@ -168,8 +171,21 @@ async fn execute_github_workflow(
             config.verbose,
             secret_manager.as_ref(),
             Some(&secret_masker),
+            &all_job_outputs,
+            &all_job_results,
         )
         .await?;
+
+        // Collect job outputs and results for downstream jobs' `needs.*` context
+        for job_result in &job_results {
+            let result_str = match job_result.status {
+                JobStatus::Success => "success",
+                JobStatus::Failure => "failure",
+                JobStatus::Skipped => "skipped",
+            };
+            all_job_results.insert(job_result.name.clone(), result_str.to_string());
+            all_job_outputs.insert(job_result.name.clone(), job_result.outputs.clone());
+        }
 
         // Check for job failures and collect details
         for job_result in &job_results {
@@ -308,6 +324,8 @@ async fn execute_gitlab_pipeline(
             config.verbose,
             secret_manager.as_ref(),
             Some(&secret_masker),
+            &HashMap::new(),
+            &HashMap::new(),
         )
         .await?;
 
@@ -530,6 +548,8 @@ pub struct JobResult {
     pub status: JobStatus,
     pub steps: Vec<StepResult>,
     pub logs: String,
+    /// Resolved job outputs (from the job's `outputs:` mapping).
+    pub outputs: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -545,6 +565,23 @@ pub struct StepResult {
     pub name: String,
     pub status: StepStatus,
     pub output: String,
+    /// Raw result before `continue-on-error` is applied.
+    pub outcome: StepStatus,
+    /// Effective result after `continue-on-error` is applied.
+    pub conclusion: StepStatus,
+}
+
+impl StepResult {
+    /// Create a StepResult where outcome and conclusion equal status (the common case).
+    fn new(name: String, status: StepStatus, output: String) -> Self {
+        Self {
+            name,
+            outcome: status.clone(),
+            conclusion: status.clone(),
+            status,
+            output,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -935,18 +972,18 @@ async fn execute_native_docker_step(
         .await
         .map_err(|e| ExecutionError::Runtime(format!("{}", e)))?;
 
-    Ok(StepResult {
-        name: step_name,
-        status: if output.exit_code == 0 {
+    Ok(StepResult::new(
+        step_name,
+        if output.exit_code == 0 {
             StepStatus::Success
         } else {
             StepStatus::Failure
         },
-        output: format!(
+        format!(
             "Exit code: {}\n{}\n{}",
             output.exit_code, output.stdout, output.stderr
         ),
-    })
+    ))
 }
 
 /// Sanitize a sub-path component from an action reference (e.g. `owner/repo/sub/path`).
@@ -1559,6 +1596,7 @@ async fn resolve_runner_image(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_job_batch(
     jobs: &[String],
     workflow: &WorkflowDefinition,
@@ -1567,6 +1605,8 @@ async fn execute_job_batch(
     verbose: bool,
     secret_manager: Option<&SecretManager>,
     secret_masker: Option<&SecretMasker>,
+    all_job_outputs: &HashMap<String, HashMap<String, String>>,
+    all_job_results: &HashMap<String, String>,
 ) -> Result<Vec<JobResult>, ExecutionError> {
     // Execute jobs in parallel
     let futures = jobs.iter().map(|job_name| {
@@ -1578,6 +1618,8 @@ async fn execute_job_batch(
             verbose,
             secret_manager,
             secret_masker,
+            all_job_outputs,
+            all_job_results,
         )
     });
 
@@ -1604,9 +1646,12 @@ struct JobExecutionContext<'a> {
     verbose: bool,
     secret_manager: Option<&'a SecretManager>,
     secret_masker: Option<&'a SecretMasker>,
+    needs_context: &'a HashMap<String, HashMap<String, String>>,
+    needs_results: &'a HashMap<String, String>,
 }
 
 /// Execute a job, expanding matrix if present
+#[allow(clippy::too_many_arguments)]
 async fn execute_job_with_matrix(
     job_name: &str,
     workflow: &WorkflowDefinition,
@@ -1615,6 +1660,8 @@ async fn execute_job_with_matrix(
     verbose: bool,
     secret_manager: Option<&SecretManager>,
     secret_masker: Option<&SecretMasker>,
+    all_job_outputs: &HashMap<String, HashMap<String, String>>,
+    all_job_results: &HashMap<String, String>,
 ) -> Result<Vec<JobResult>, ExecutionError> {
     // Get the job definition
     let job = workflow.jobs.get(job_name).ok_or_else(|| {
@@ -1637,9 +1684,13 @@ async fn execute_job_with_matrix(
                 status: JobStatus::Skipped,
                 steps: Vec::new(),
                 logs: String::new(),
+                outputs: HashMap::new(),
             }]);
         }
     }
+
+    // Build filtered needs context for this job (only jobs declared in `needs:`)
+    let (needs_ctx, needs_res) = build_needs_context(job, all_job_outputs, all_job_results);
 
     // Check if this is a matrix job
     if let Some(matrix_config) = job.matrix_config() {
@@ -1693,6 +1744,8 @@ async fn execute_job_with_matrix(
             verbose,
             secret_manager,
             secret_masker,
+            needs_context: &needs_ctx,
+            needs_results: &needs_res,
         };
         let result = execute_job(ctx).await?;
         Ok(vec![result])
@@ -1757,6 +1810,17 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
     let job_timeout = std::time::Duration::from_secs_f64(timeout_mins * 60.0);
 
     let mut step_outputs_map: HashMap<String, HashMap<String, String>> = HashMap::new();
+    let mut step_status_map: HashMap<String, (String, String)> = HashMap::new();
+    let mut job_status_str = "success".to_string();
+
+    // Pre-resolve secrets for expression context (secrets.* references)
+    let secrets_context: HashMap<String, String> = if let Some(secret_manager) = ctx.secret_manager
+    {
+        resolve_secrets_for_context(secret_manager, job, ctx.workflow).await
+    } else {
+        HashMap::new()
+    };
+
     let job_deadline = tokio::time::Instant::now() + job_timeout;
 
     for (idx, step) in job.steps.iter().enumerate() {
@@ -1785,6 +1849,11 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
                     workflow_defaults: ctx.workflow.defaults.as_ref(),
                     job_defaults: job.defaults.as_ref(),
                     step_outputs: &step_outputs_map,
+                    step_statuses: &step_status_map,
+                    job_status: &job_status_str,
+                    secrets_context: &secrets_context,
+                    needs_context: ctx.needs_context,
+                    needs_results: ctx.needs_results,
                 },
             ),
         )
@@ -1804,10 +1873,38 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
         };
 
         match outcome {
-            StepOutcome::Skipped(result) => {
-                step_results.push(result);
+            StepOutcome::Skipped(ref result) => {
+                // Record step status for expression context
+                if let Some(id) = &step.id {
+                    step_status_map
+                        .insert(id.clone(), ("skipped".to_string(), "skipped".to_string()));
+                }
+                step_results.push(result.clone());
             }
             StepOutcome::Completed { result, abort_job } => {
+                // Record step outcome/conclusion for expression context
+                if let Some(id) = &step.id {
+                    let outcome_str = match &result.outcome {
+                        StepStatus::Success => "success",
+                        StepStatus::Failure => "failure",
+                        StepStatus::Skipped => "skipped",
+                    };
+                    let conclusion_str = match &result.conclusion {
+                        StepStatus::Success => "success",
+                        StepStatus::Failure => "failure",
+                        StepStatus::Skipped => "skipped",
+                    };
+                    step_status_map.insert(
+                        id.clone(),
+                        (outcome_str.to_string(), conclusion_str.to_string()),
+                    );
+                }
+
+                // Update job status for success()/failure() builtins
+                if result.conclusion == StepStatus::Failure {
+                    job_status_str = "failure".to_string();
+                }
+
                 // Add step output to logs only in verbose mode or if there's an error
                 if ctx.verbose || result.status == StepStatus::Failure {
                     job_logs.push_str(&format!(
@@ -1838,6 +1935,9 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
         }
     }
 
+    // Resolve job outputs from step outputs (GHA jobs.*.outputs map expressions to step outputs)
+    let job_outputs = resolve_job_outputs(job, &step_outputs_map, &job_env);
+
     Ok(JobResult {
         name: ctx.job_name.to_string(),
         status: if job_success {
@@ -1847,6 +1947,7 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
         },
         steps: step_results,
         logs: job_logs,
+        outputs: job_outputs,
     })
 }
 
@@ -1887,6 +1988,7 @@ async fn execute_matrix_combinations(
                     status: JobStatus::Skipped,
                     steps: Vec::new(),
                     logs: "Job skipped due to previous matrix job failure".to_string(),
+                    outputs: HashMap::new(),
                 });
             }
             continue;
@@ -2018,6 +2120,11 @@ async fn execute_matrix_job(
                         workflow_defaults: workflow.defaults.as_ref(),
                         job_defaults: job_template.defaults.as_ref(),
                         step_outputs: &step_outputs_map,
+                        step_statuses: &HashMap::new(),
+                        job_status: "success",
+                        secrets_context: &HashMap::new(),
+                        needs_context: &HashMap::new(),
+                        needs_results: &HashMap::new(),
                     },
                 ),
             )
@@ -2082,6 +2189,7 @@ async fn execute_matrix_job(
         },
         steps: step_results,
         logs: job_logs,
+        outputs: HashMap::new(),
     })
 }
 
@@ -2114,6 +2222,11 @@ async fn run_step_with_guards(
             job_env,
             step_exec_ctx.step_outputs,
             step_exec_ctx.matrix_combination,
+            step_exec_ctx.step_statuses,
+            step_exec_ctx.job_status,
+            step_exec_ctx.secrets_context,
+            step_exec_ctx.needs_context,
+            step_exec_ctx.needs_results,
         );
         if !should_run {
             wrkflw_logging::info(&format!(
@@ -2122,15 +2235,17 @@ async fn run_step_with_guards(
                 step_name,
                 if_cond
             ));
-            return Ok(StepOutcome::Skipped(StepResult {
-                name: step_name,
-                status: StepStatus::Skipped,
-                output: format!("Skipped due to condition: {}", if_cond),
-            }));
+            return Ok(StepOutcome::Skipped(StepResult::new(
+                step_name,
+                StepStatus::Skipped,
+                format!("Skipped due to condition: {}", if_cond),
+            )));
         }
     }
 
-    // Wrap step execution with optional timeout; sanitize to avoid panic on negative/NaN
+    // Wrap step execution with optional step-level timeout; sanitize to avoid panic on negative/NaN.
+    // Note: the job-level timeout already wraps the entire step execution, so the step
+    // timeout only fires when it is shorter than the remaining job time.
     let step_result = if let Some(minutes) = step.timeout_minutes {
         let safe_mins = sanitize_timeout_minutes(Some(minutes), 360.0);
         let dur = std::time::Duration::from_secs_f64(safe_mins * 60.0);
@@ -2141,58 +2256,59 @@ async fn run_step_with_guards(
                     "  Step '{}' exceeded timeout of {} minutes",
                     step_name, minutes
                 ));
-                Ok(StepResult {
-                    name: step_name.clone(),
-                    status: StepStatus::Failure,
-                    output: format!("Step timed out after {} minutes", minutes),
-                })
+                Ok(StepResult::new(
+                    step_name.clone(),
+                    StepStatus::Failure,
+                    format!("Step timed out after {} minutes", minutes),
+                ))
             }
         }
     } else {
         execute_step(step_exec_ctx).await
     };
 
+    // Apply continue-on-error semantics and set outcome/conclusion:
+    //   outcome  = raw result (before continue-on-error)
+    //   conclusion = effective result (after continue-on-error)
     match step_result {
-        Ok(result) => {
-            let abort_job = if result.status == StepStatus::Failure {
+        Ok(mut result) => {
+            let (abort_job, conclusion) = if result.status == StepStatus::Failure {
                 if step.continue_on_error == Some(true) {
                     wrkflw_logging::info(&format!(
                         "  Step '{}' failed but continue-on-error is set, continuing",
                         result.name
                     ));
-                    false
+                    (false, StepStatus::Success)
                 } else {
-                    true
+                    (true, StepStatus::Failure)
                 }
             } else {
-                false
+                (false, result.status.clone())
             };
+            result.outcome = result.status.clone();
+            result.conclusion = conclusion;
             Ok(StepOutcome::Completed { result, abort_job })
         }
         Err(e) => {
-            if step.continue_on_error == Some(true) {
+            let (abort_job, conclusion) = if step.continue_on_error == Some(true) {
                 wrkflw_logging::info(&format!(
                     "  Step '{}' errored but continue-on-error is set, continuing",
                     step_name
                 ));
-                Ok(StepOutcome::Completed {
-                    result: StepResult {
-                        name: step_name,
-                        status: StepStatus::Failure,
-                        output: format!("Error: {}", e),
-                    },
-                    abort_job: false,
-                })
+                (false, StepStatus::Success)
             } else {
-                Ok(StepOutcome::Completed {
-                    result: StepResult {
-                        name: step_name,
-                        status: StepStatus::Failure,
-                        output: format!("Error: {}", e),
-                    },
-                    abort_job: true,
-                })
-            }
+                (true, StepStatus::Failure)
+            };
+            Ok(StepOutcome::Completed {
+                result: StepResult {
+                    name: step_name,
+                    status: StepStatus::Failure,
+                    output: format!("Error: {}", e),
+                    outcome: StepStatus::Failure,
+                    conclusion,
+                },
+                abort_job,
+            })
         }
     }
 }
@@ -2228,6 +2344,11 @@ struct StepExecutionContext<'a> {
     workflow_defaults: Option<&'a workflow::Defaults>,
     job_defaults: Option<&'a workflow::Defaults>,
     step_outputs: &'a HashMap<String, HashMap<String, String>>,
+    step_statuses: &'a HashMap<String, (String, String)>,
+    job_status: &'a str,
+    secrets_context: &'a HashMap<String, String>,
+    needs_context: &'a HashMap<String, HashMap<String, String>>,
+    needs_results: &'a HashMap<String, String>,
 }
 
 async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, ExecutionError> {
@@ -2268,6 +2389,11 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
             ctx.matrix_combination,
             ctx.step_outputs,
             &step_env,
+            ctx.step_statuses,
+            ctx.job_status,
+            ctx.secrets_context,
+            ctx.needs_context,
+            ctx.needs_results,
         ) {
             Ok(r) => r,
             Err(_) => resolved_value,
@@ -2319,11 +2445,7 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                 println!("  Emulated actions/checkout: copied project files to workspace");
             }
 
-            StepResult {
-                name: step_name,
-                status: StepStatus::Success,
-                output,
-            }
+            StepResult::new(step_name, StepStatus::Success, output)
         } else {
             // Get action info
             let prepared = prepare_action(&action_info, ctx.runtime).await?;
@@ -2442,11 +2564,11 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                             ));
 
                             // Return success since we're using system Rust
-                            return Ok(StepResult {
-                                name: step_name,
-                                status: StepStatus::Success,
-                                output: format!("Using system Rust: {}", rustc_version.trim()),
-                            });
+                            return Ok(StepResult::new(
+                                step_name,
+                                StepStatus::Success,
+                                format!("Using system Rust: {}", rustc_version.trim()),
+                            ));
                         }
 
                         // For cargo action, execute cargo commands directly
@@ -2520,22 +2642,22 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                                             let stderr =
                                                 String::from_utf8_lossy(&output.stderr).to_string();
 
-                                            return Ok(StepResult {
-                                                name: step_name,
-                                                status: if exit_code == 0 {
+                                            return Ok(StepResult::new(
+                                                step_name,
+                                                if exit_code == 0 {
                                                     StepStatus::Success
                                                 } else {
                                                     StepStatus::Failure
                                                 },
-                                                output: format!("{}\n{}", stdout, stderr),
-                                            });
+                                                format!("{}\n{}", stdout, stderr),
+                                            ));
                                         }
                                         Err(e) => {
-                                            return Ok(StepResult {
-                                                name: step_name,
-                                                status: StepStatus::Failure,
-                                                output: format!("Failed to execute command: {}", e),
-                                            });
+                                            return Ok(StepResult::new(
+                                                step_name,
+                                                StepStatus::Failure,
+                                                format!("Failed to execute command: {}", e),
+                                            ));
                                         }
                                     }
                                 }
@@ -2770,25 +2892,25 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                         error_details.push_str(&output.stdout);
                         error_details.push_str(&output.stderr);
 
-                        return Ok(StepResult {
-                            name: step_name,
-                            status: StepStatus::Failure,
-                            output: format!("{}\n{}", output_text, error_details),
-                        });
+                        return Ok(StepResult::new(
+                            step_name,
+                            StepStatus::Failure,
+                            format!("{}\n{}", output_text, error_details),
+                        ));
                     }
 
-                    StepResult {
-                        name: step_name,
-                        status: if output.exit_code == 0 {
+                    StepResult::new(
+                        step_name,
+                        if output.exit_code == 0 {
                             StepStatus::Success
                         } else {
                             StepStatus::Failure
                         },
-                        output: format!(
+                        format!(
                             "Exit code: {}\n{}\n{}",
                             output.exit_code, output.stdout, output.stderr
                         ),
-                    }
+                    )
                 }
             }
         }
@@ -2804,11 +2926,11 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
             match substitution.substitute(run).await {
                 Ok(resolved) => resolved,
                 Err(e) => {
-                    return Ok(StepResult {
-                        name: step_name,
-                        status: StepStatus::Failure,
-                        output: format!("Secret substitution failed: {}", e),
-                    });
+                    return Ok(StepResult::new(
+                        step_name,
+                        StepStatus::Failure,
+                        format!("Secret substitution failed: {}", e),
+                    ));
                 }
             }
         } else {
@@ -2822,14 +2944,19 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
             ctx.matrix_combination,
             ctx.step_outputs,
             ctx.job_env,
+            ctx.step_statuses,
+            ctx.job_status,
+            ctx.secrets_context,
+            ctx.needs_context,
+            ctx.needs_results,
         ) {
             Ok(r) => r,
             Err(e) => {
-                return Ok(StepResult {
-                    name: step_name,
-                    status: StepStatus::Failure,
-                    output: format!("Expression substitution failed: {}", e),
-                });
+                return Ok(StepResult::new(
+                    step_name,
+                    StepStatus::Failure,
+                    format!("Expression substitution failed: {}", e),
+                ));
             }
         };
 
@@ -2903,14 +3030,14 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                 }
             }
             if !normalized.starts_with(container_workspace) {
-                return Ok(StepResult {
-                    name: step_name,
-                    status: StepStatus::Failure,
-                    output: format!(
+                return Ok(StepResult::new(
+                    step_name,
+                    StepStatus::Failure,
+                    format!(
                         "Invalid working-directory '{}': must be within workspace",
                         wd
                     ),
-                });
+                ));
             }
             normalized
         } else {
@@ -2996,17 +3123,13 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
             output.push_str(&details);
         }
 
-        StepResult {
-            name: step_name,
-            status,
-            output,
-        }
+        StepResult::new(step_name, status, output)
     } else {
-        return Ok(StepResult {
-            name: step_name,
-            status: StepStatus::Skipped,
-            output: "Step has neither 'uses' nor 'run'".to_string(),
-        });
+        return Ok(StepResult::new(
+            step_name,
+            StepStatus::Skipped,
+            "Step has neither 'uses' nor 'run'".to_string(),
+        ));
     };
 
     Ok(step_result)
@@ -3555,6 +3678,8 @@ async fn execute_reusable_workflow_job(
                     ctx.verbose,
                     None,
                     None,
+                    &HashMap::new(),
+                    &HashMap::new(),
                 )
                 .await?;
                 for r in &results {
@@ -3573,15 +3698,15 @@ async fn execute_reusable_workflow_job(
             }
 
             // Represent as one summary step for UI
-            let summary_step = StepResult {
-                name: format!("Run reusable workflow: {}", uses),
-                status: if any_failed {
+            let summary_step = StepResult::new(
+                format!("Run reusable workflow: {}", uses),
+                if any_failed {
                     StepStatus::Failure
                 } else {
                     StepStatus::Success
                 },
-                output: logs.clone(),
-            };
+                logs.clone(),
+            );
 
             return Ok(JobResult {
                 name: ctx.job_name.to_string(),
@@ -3592,6 +3717,7 @@ async fn execute_reusable_workflow_job(
                 },
                 steps: vec![summary_step],
                 logs,
+                outputs: HashMap::new(),
             });
         }
     };
@@ -3629,6 +3755,8 @@ async fn execute_reusable_workflow_job(
             ctx.verbose,
             None,
             None,
+            &HashMap::new(),
+            &HashMap::new(),
         )
         .await?;
         for r in &results {
@@ -3647,15 +3775,15 @@ async fn execute_reusable_workflow_job(
     }
 
     // Represent as one summary step for UI
-    let summary_step = StepResult {
-        name: format!("Run reusable workflow: {}", uses),
-        status: if any_failed {
+    let summary_step = StepResult::new(
+        format!("Run reusable workflow: {}", uses),
+        if any_failed {
             StepStatus::Failure
         } else {
             StepStatus::Success
         },
-        output: logs.clone(),
-    };
+        logs.clone(),
+    );
 
     Ok(JobResult {
         name: ctx.job_name.to_string(),
@@ -3666,6 +3794,7 @@ async fn execute_reusable_workflow_job(
         },
         steps: vec![summary_step],
         logs,
+        outputs: HashMap::new(),
     })
 }
 
@@ -3835,6 +3964,11 @@ async fn execute_composite_action(
                     workflow_defaults: None,
                     job_defaults: None,
                     step_outputs: &composite_step_outputs,
+                    step_statuses: &HashMap::new(),
+                    job_status: "success",
+                    secrets_context: &HashMap::new(),
+                    needs_context: &HashMap::new(),
+                    needs_results: &HashMap::new(),
                 }))
                 .await?;
 
@@ -3852,14 +3986,13 @@ async fn execute_composite_action(
 
                 // Short-circuit on failure if needed
                 if step_result.status == StepStatus::Failure {
-                    return Ok(StepResult {
-                        name: step
-                            .name
+                    return Ok(StepResult::new(
+                        step.name
                             .clone()
                             .unwrap_or_else(|| "Composite Action".to_string()),
-                        status: StepStatus::Failure,
-                        output: step_outputs.join("\n"),
-                    });
+                        StepStatus::Failure,
+                        step_outputs.join("\n"),
+                    ));
                 }
             }
 
@@ -3901,14 +4034,13 @@ async fn execute_composite_action(
                 )
             };
 
-            Ok(StepResult {
-                name: step
-                    .name
+            Ok(StepResult::new(
+                step.name
                     .clone()
                     .unwrap_or_else(|| "Composite Action".to_string()),
-                status: StepStatus::Success,
+                StepStatus::Success,
                 output,
-            })
+            ))
         }
         _ => Err(ExecutionError::Execution(
             "Action is not a composite action or has invalid format".to_string(),
@@ -4007,23 +4139,40 @@ fn convert_yaml_to_step(step_yaml: &serde_yaml::Value) -> Result<workflow::Step,
 /// `always()`, and `cancelled()` are not yet fully supported — a warning is emitted
 /// and the condition defaults to its most likely state (`always()`/`success()` → true,
 /// `failure()`/`cancelled()` → false).
+#[allow(clippy::too_many_arguments)]
 fn evaluate_job_condition(
     condition: &str,
     env_context: &HashMap<String, String>,
     _workflow: &WorkflowDefinition,
 ) -> bool {
-    evaluate_condition_with_context(condition, env_context, &HashMap::new(), &None)
+    evaluate_condition_with_context(
+        condition,
+        env_context,
+        &HashMap::new(),
+        &None,
+        &HashMap::new(),
+        "success",
+        &HashMap::new(),
+        &HashMap::new(),
+        &HashMap::new(),
+    )
 }
 
 /// Evaluate a job/step `if:` condition using the expression evaluator.
 ///
 /// Accepts the full expression context (env, step outputs, matrix) for accurate
 /// resolution of context references and operators.
+#[allow(clippy::too_many_arguments)]
 fn evaluate_condition_with_context(
     condition: &str,
     env_context: &HashMap<String, String>,
     step_outputs: &HashMap<String, HashMap<String, String>>,
     matrix_combination: &Option<HashMap<String, Value>>,
+    step_statuses: &HashMap<String, (String, String)>,
+    job_status: &str,
+    secrets_context: &HashMap<String, String>,
+    needs_context: &HashMap<String, HashMap<String, String>>,
+    needs_results: &HashMap<String, String>,
 ) -> bool {
     use crate::expression::{evaluate_as_bool, ExpressionContext};
 
@@ -4033,6 +4182,11 @@ fn evaluate_condition_with_context(
         env_context,
         step_outputs,
         matrix_combination,
+        step_statuses,
+        job_status,
+        secrets_context,
+        needs_context,
+        needs_results,
     };
 
     match evaluate_as_bool(condition, &ctx) {
@@ -4052,6 +4206,142 @@ fn evaluate_condition_with_context(
             true
         }
     }
+}
+
+/// Filter accumulated job outputs/results to only include jobs declared in this job's `needs:`.
+fn build_needs_context(
+    job: &Job,
+    all_outputs: &HashMap<String, HashMap<String, String>>,
+    all_results: &HashMap<String, String>,
+) -> (
+    HashMap<String, HashMap<String, String>>,
+    HashMap<String, String>,
+) {
+    let mut needs_outputs = HashMap::new();
+    let mut needs_results = HashMap::new();
+    if let Some(needs) = &job.needs {
+        for needed_job in needs {
+            if let Some(outputs) = all_outputs.get(needed_job) {
+                needs_outputs.insert(needed_job.clone(), outputs.clone());
+            }
+            if let Some(result) = all_results.get(needed_job) {
+                needs_results.insert(needed_job.clone(), result.clone());
+            }
+        }
+    }
+    (needs_outputs, needs_results)
+}
+
+/// Resolve a job's declared outputs by evaluating the output expressions
+/// (which typically reference `steps.<id>.outputs.<key>`) against the job's step outputs.
+#[allow(clippy::too_many_arguments)]
+fn resolve_job_outputs(
+    job: &Job,
+    step_outputs_map: &HashMap<String, HashMap<String, String>>,
+    env_context: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    let mut resolved = HashMap::new();
+    if let Some(outputs) = &job.outputs {
+        for (key, expr) in outputs {
+            match crate::substitution::preprocess_expressions(
+                expr,
+                Path::new("."),
+                &None,
+                step_outputs_map,
+                env_context,
+                &HashMap::new(),
+                "success",
+                &HashMap::new(),
+                &HashMap::new(),
+                &HashMap::new(),
+            ) {
+                Ok(val) => {
+                    resolved.insert(key.clone(), val);
+                }
+                Err(_) => {
+                    resolved.insert(key.clone(), String::new());
+                }
+            }
+        }
+    }
+    resolved
+}
+
+/// Pre-resolve secrets referenced in the workflow into a HashMap for expression evaluation.
+/// Scans job steps for `${{ secrets.NAME }}` patterns and resolves each unique name.
+async fn resolve_secrets_for_context(
+    secret_manager: &SecretManager,
+    job: &Job,
+    workflow: &WorkflowDefinition,
+) -> HashMap<String, String> {
+    use wrkflw_secrets::SecretSubstitution;
+
+    let mut secrets = HashMap::new();
+    let mut all_text = String::new();
+
+    // Collect all text that might contain secrets references
+    for step in &job.steps {
+        if let Some(run) = &step.run {
+            all_text.push_str(run);
+            all_text.push('\n');
+        }
+        if let Some(cond) = &step.if_condition {
+            all_text.push_str(cond);
+            all_text.push('\n');
+        }
+        for value in step.env.values() {
+            all_text.push_str(value);
+            all_text.push('\n');
+        }
+        if let Some(with) = &step.with {
+            for value in with.values() {
+                all_text.push_str(value);
+                all_text.push('\n');
+            }
+        }
+    }
+    // Also check job-level if condition and env
+    if let Some(cond) = &job.if_condition {
+        all_text.push_str(cond);
+        all_text.push('\n');
+    }
+    for value in job.env.values() {
+        all_text.push_str(value);
+        all_text.push('\n');
+    }
+    // Check job outputs expressions
+    if let Some(outputs) = &job.outputs {
+        for value in outputs.values() {
+            all_text.push_str(value);
+            all_text.push('\n');
+        }
+    }
+
+    // Extract secret names and resolve them
+    let refs = SecretSubstitution::extract_secret_refs(&all_text);
+    for secret_ref in refs {
+        let name = &secret_ref.name;
+        if secrets.contains_key(name) {
+            continue;
+        }
+        let result = if let Some(provider) = &secret_ref.provider {
+            secret_manager
+                .get_secret_from_provider(provider, name)
+                .await
+        } else {
+            secret_manager.get_secret(name).await
+        };
+        match result {
+            Ok(value) => {
+                secrets.insert(name.clone(), value.value().to_string());
+            }
+            Err(_) => {
+                // Secret not found — leave it out so expression resolves to Null
+            }
+        }
+    }
+
+    secrets
 }
 
 #[cfg(test)]
@@ -4989,6 +5279,11 @@ runs:
             workflow_defaults: None,
             job_defaults: None,
             step_outputs: &HashMap::new(),
+            step_statuses: &HashMap::new(),
+            job_status: "success",
+            secrets_context: &HashMap::new(),
+            needs_context: &HashMap::new(),
+            needs_results: &HashMap::new(),
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -5038,6 +5333,11 @@ runs:
             workflow_defaults: None,
             job_defaults: None,
             step_outputs: &HashMap::new(),
+            step_statuses: &HashMap::new(),
+            job_status: "success",
+            secrets_context: &HashMap::new(),
+            needs_context: &HashMap::new(),
+            needs_results: &HashMap::new(),
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -5092,6 +5392,11 @@ runs:
             workflow_defaults: None,
             job_defaults: None,
             step_outputs: &HashMap::new(),
+            step_statuses: &HashMap::new(),
+            job_status: "success",
+            secrets_context: &HashMap::new(),
+            needs_context: &HashMap::new(),
+            needs_results: &HashMap::new(),
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -5139,6 +5444,11 @@ runs:
             workflow_defaults: None,
             job_defaults: None,
             step_outputs: &HashMap::new(),
+            step_statuses: &HashMap::new(),
+            job_status: "success",
+            secrets_context: &HashMap::new(),
+            needs_context: &HashMap::new(),
+            needs_results: &HashMap::new(),
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -5187,6 +5497,11 @@ runs:
             workflow_defaults: None,
             job_defaults: None,
             step_outputs: &HashMap::new(),
+            step_statuses: &HashMap::new(),
+            job_status: "success",
+            secrets_context: &HashMap::new(),
+            needs_context: &HashMap::new(),
+            needs_results: &HashMap::new(),
         };
 
         let result = execute_step(ctx).await;
@@ -5234,6 +5549,11 @@ runs:
             workflow_defaults: None,
             job_defaults: None,
             step_outputs: &HashMap::new(),
+            step_statuses: &HashMap::new(),
+            job_status: "success",
+            secrets_context: &HashMap::new(),
+            needs_context: &HashMap::new(),
+            needs_results: &HashMap::new(),
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -5279,6 +5599,11 @@ runs:
             workflow_defaults: None,
             job_defaults: None,
             step_outputs: &HashMap::new(),
+            step_statuses: &HashMap::new(),
+            job_status: "success",
+            secrets_context: &HashMap::new(),
+            needs_context: &HashMap::new(),
+            needs_results: &HashMap::new(),
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -5816,6 +6141,11 @@ runs:
             workflow_defaults: None,
             job_defaults: None,
             step_outputs: &HashMap::new(),
+            step_statuses: &HashMap::new(),
+            job_status: "success",
+            secrets_context: &HashMap::new(),
+            needs_context: &HashMap::new(),
+            needs_results: &HashMap::new(),
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -5861,6 +6191,11 @@ runs:
             workflow_defaults: None,
             job_defaults: None,
             step_outputs: &HashMap::new(),
+            step_statuses: &HashMap::new(),
+            job_status: "success",
+            secrets_context: &HashMap::new(),
+            needs_context: &HashMap::new(),
+            needs_results: &HashMap::new(),
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -5902,6 +6237,11 @@ runs:
             workflow_defaults: None,
             job_defaults: None,
             step_outputs: &HashMap::new(),
+            step_statuses: &HashMap::new(),
+            job_status: "success",
+            secrets_context: &HashMap::new(),
+            needs_context: &HashMap::new(),
+            needs_results: &HashMap::new(),
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -5935,6 +6275,11 @@ runs:
             workflow_defaults: None,
             job_defaults: None,
             step_outputs: &HashMap::new(),
+            step_statuses: &HashMap::new(),
+            job_status: "success",
+            secrets_context: &HashMap::new(),
+            needs_context: &HashMap::new(),
+            needs_results: &HashMap::new(),
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -5970,6 +6315,11 @@ runs:
             workflow_defaults: None,
             job_defaults: None,
             step_outputs: &HashMap::new(),
+            step_statuses: &HashMap::new(),
+            job_status: "success",
+            secrets_context: &HashMap::new(),
+            needs_context: &HashMap::new(),
+            needs_results: &HashMap::new(),
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -6016,6 +6366,11 @@ runs:
             workflow_defaults: Some(&workflow_defaults),
             job_defaults: Some(&job_defaults),
             step_outputs: &HashMap::new(),
+            step_statuses: &HashMap::new(),
+            job_status: "success",
+            secrets_context: &HashMap::new(),
+            needs_context: &HashMap::new(),
+            needs_results: &HashMap::new(),
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -6060,6 +6415,11 @@ runs:
             workflow_defaults: None,
             job_defaults: Some(&job_defaults),
             step_outputs: &HashMap::new(),
+            step_statuses: &HashMap::new(),
+            job_status: "success",
+            secrets_context: &HashMap::new(),
+            needs_context: &HashMap::new(),
+            needs_results: &HashMap::new(),
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -6104,6 +6464,11 @@ runs:
             workflow_defaults: Some(&workflow_defaults),
             job_defaults: None,
             step_outputs: &HashMap::new(),
+            step_statuses: &HashMap::new(),
+            job_status: "success",
+            secrets_context: &HashMap::new(),
+            needs_context: &HashMap::new(),
+            needs_results: &HashMap::new(),
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -6146,6 +6511,11 @@ runs:
             workflow_defaults: None,
             job_defaults: Some(&job_defaults),
             step_outputs: &HashMap::new(),
+            step_statuses: &HashMap::new(),
+            job_status: "success",
+            secrets_context: &HashMap::new(),
+            needs_context: &HashMap::new(),
+            needs_results: &HashMap::new(),
         };
 
         let result = execute_step(ctx).await.unwrap();

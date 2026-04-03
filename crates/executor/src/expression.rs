@@ -268,6 +268,17 @@ pub struct ExpressionContext<'a> {
     pub env_context: &'a HashMap<String, String>,
     pub step_outputs: &'a HashMap<String, HashMap<String, String>>,
     pub matrix_combination: &'a Option<HashMap<String, Value>>,
+    /// Step ID → (outcome, conclusion) where values are "success", "failure", or "skipped".
+    /// `outcome` is the raw result before `continue-on-error`; `conclusion` is the effective result.
+    pub step_statuses: &'a HashMap<String, (String, String)>,
+    /// Current job status for `success()`/`failure()` builtins: "success" or "failure".
+    pub job_status: &'a str,
+    /// Pre-resolved secrets for `secrets.*` context.
+    pub secrets_context: &'a HashMap<String, String>,
+    /// Job outputs from upstream jobs: `job_name -> { output_key -> output_value }`.
+    pub needs_context: &'a HashMap<String, HashMap<String, String>>,
+    /// Job results from upstream jobs: `job_name -> "success" | "failure" | "skipped"`.
+    pub needs_results: &'a HashMap<String, String>,
 }
 
 impl<'a> ExpressionContext<'a> {
@@ -322,13 +333,46 @@ impl<'a> ExpressionContext<'a> {
                 .and_then(|m| m.get(&parts[3]))
                 .map(|v| ExprValue::String(v.clone()))
                 .unwrap_or(ExprValue::Null),
-            "steps" if parts.len() == 3 && parts[2] == "outcome" => {
-                // We don't track step outcome; default to "success"
-                ExprValue::String("success".to_string())
-            }
-            "steps" if parts.len() == 3 && parts[2] == "conclusion" => {
-                ExprValue::String("success".to_string())
-            }
+            "needs" if parts.len() == 4 && parts[2] == "outputs" => self
+                .needs_context
+                .get(&parts[1])
+                .and_then(|m| m.get(&parts[3]))
+                .map(|v| ExprValue::String(v.clone()))
+                .unwrap_or(ExprValue::Null),
+            "needs" if parts.len() == 3 && parts[2] == "result" => self
+                .needs_results
+                .get(&parts[1])
+                .map(|v| ExprValue::String(v.clone()))
+                .unwrap_or(ExprValue::Null),
+            // jobs.* context — same structure as needs.* but typically used in
+            // workflow_call output contexts. Uses needs data (which already contains
+            // all completed upstream jobs).
+            "jobs" if parts.len() == 4 && parts[2] == "outputs" => self
+                .needs_context
+                .get(&parts[1])
+                .and_then(|m| m.get(&parts[3]))
+                .map(|v| ExprValue::String(v.clone()))
+                .unwrap_or(ExprValue::Null),
+            "jobs" if parts.len() == 3 && parts[2] == "result" => self
+                .needs_results
+                .get(&parts[1])
+                .map(|v| ExprValue::String(v.clone()))
+                .unwrap_or(ExprValue::Null),
+            "secrets" if parts.len() == 2 => self
+                .secrets_context
+                .get(&parts[1])
+                .map(|v| ExprValue::String(v.clone()))
+                .unwrap_or(ExprValue::Null),
+            "steps" if parts.len() == 3 && parts[2] == "outcome" => self
+                .step_statuses
+                .get(&parts[1])
+                .map(|(outcome, _)| ExprValue::String(outcome.clone()))
+                .unwrap_or(ExprValue::String("success".to_string())),
+            "steps" if parts.len() == 3 && parts[2] == "conclusion" => self
+                .step_statuses
+                .get(&parts[1])
+                .map(|(_, conclusion)| ExprValue::String(conclusion.clone()))
+                .unwrap_or(ExprValue::String("success".to_string())),
             _ => ExprValue::Null,
         }
     }
@@ -520,7 +564,7 @@ impl Parser {
                 }
             }
             self.expect(&Token::RParen)?;
-            return call_builtin(&name, &args);
+            return call_builtin(&name, &args, ctx);
         }
 
         // Context reference: ident.ident.ident...
@@ -587,7 +631,11 @@ fn expr_cmp(a: &ExprValue, b: &ExprValue) -> Option<std::cmp::Ordering> {
 // Built-in functions
 // ---------------------------------------------------------------------------
 
-fn call_builtin(name: &str, args: &[ExprValue]) -> Result<ExprValue, String> {
+fn call_builtin(
+    name: &str,
+    args: &[ExprValue],
+    ctx: &ExpressionContext,
+) -> Result<ExprValue, String> {
     match name {
         "contains" => {
             if args.len() != 2 {
@@ -670,11 +718,11 @@ fn call_builtin(name: &str, args: &[ExprValue]) -> Result<ExprValue, String> {
                 }
             }
         }
-        // Status functions — in local execution we assume success
-        "success" => Ok(ExprValue::Bool(true)),
-        "failure" => Ok(ExprValue::Bool(false)),
+        // Status functions — consult job_status from context
+        "success" => Ok(ExprValue::Bool(ctx.job_status != "failure")),
+        "failure" => Ok(ExprValue::Bool(ctx.job_status == "failure")),
         "always" => Ok(ExprValue::Bool(true)),
-        "cancelled" => Ok(ExprValue::Bool(false)),
+        "cancelled" => Ok(ExprValue::Bool(ctx.job_status == "cancelled")),
         _ => {
             // Unknown function — return null rather than erroring
             Ok(ExprValue::Null)
@@ -738,10 +786,21 @@ mod tests {
         let steps: &'static HashMap<String, HashMap<String, String>> =
             Box::leak(Box::new(HashMap::new()));
         let matrix: &'static Option<HashMap<String, Value>> = Box::leak(Box::new(None));
+        let statuses: &'static HashMap<String, (String, String)> =
+            Box::leak(Box::new(HashMap::new()));
+        let secrets: &'static HashMap<String, String> = Box::leak(Box::new(HashMap::new()));
+        let needs: &'static HashMap<String, HashMap<String, String>> =
+            Box::leak(Box::new(HashMap::new()));
+        let needs_r: &'static HashMap<String, String> = Box::leak(Box::new(HashMap::new()));
         ExpressionContext {
             env_context: env,
             step_outputs: steps,
             matrix_combination: matrix,
+            step_statuses: statuses,
+            job_status: "success",
+            secrets_context: secrets,
+            needs_context: needs,
+            needs_results: needs_r,
         }
     }
 
@@ -757,10 +816,19 @@ mod tests {
         let env: &'static _ = Box::leak(Box::new(env));
         let steps: &'static _ = Box::leak(Box::new(steps));
         let matrix: &'static _ = Box::leak(Box::new(matrix));
+        let statuses: &'static _ = Box::leak(Box::new(HashMap::new()));
+        let secrets: &'static _ = Box::leak(Box::new(HashMap::new()));
+        let needs: &'static _ = Box::leak(Box::new(HashMap::new()));
+        let needs_r: &'static _ = Box::leak(Box::new(HashMap::new()));
         (ExpressionContext {
             env_context: env,
             step_outputs: steps,
             matrix_combination: matrix,
+            step_statuses: statuses,
+            job_status: "success",
+            secrets_context: secrets,
+            needs_context: needs,
+            needs_results: needs_r,
         },)
     }
 

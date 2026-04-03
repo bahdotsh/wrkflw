@@ -424,8 +424,11 @@ pub async fn execute_curl_trigger(
             name: "Remote Trigger".to_string(),
             status: wrkflw_executor::StepStatus::Success,
             output: success_msg,
+            outcome: wrkflw_executor::StepStatus::Success,
+            conclusion: wrkflw_executor::StepStatus::Success,
         }],
         logs: "Workflow triggered remotely on GitHub".to_string(),
+        outputs: std::collections::HashMap::new(),
     };
 
     Ok((vec![job_result], ()))
@@ -560,14 +563,19 @@ pub fn start_next_workflow_execution(
                             let jobs = vec![wrkflw_executor::JobResult {
                                 name: "Validation".to_string(),
                                 status,
-                                steps: vec![wrkflw_executor::StepResult {
-                                    name: "Validator".to_string(),
-                                    status: if validation_result.is_valid {
+                                steps: vec![{
+                                    let step_status = if validation_result.is_valid {
                                         wrkflw_executor::StepStatus::Success
                                     } else {
                                         wrkflw_executor::StepStatus::Failure
-                                    },
-                                    output: validation_result.issues.join("\n"),
+                                    };
+                                    wrkflw_executor::StepResult {
+                                        name: "Validator".to_string(),
+                                        outcome: step_status.clone(),
+                                        conclusion: step_status.clone(),
+                                        status: step_status,
+                                        output: validation_result.issues.join("\n"),
+                                    }
                                 }],
                                 logs: format!(
                                     "Validation result: {}",
@@ -577,6 +585,7 @@ pub fn start_next_workflow_execution(
                                         "FAILED"
                                     }
                                 ),
+                                outputs: std::collections::HashMap::new(),
                             }];
 
                             Ok((jobs, ()))

@@ -159,12 +159,18 @@ fn compute_hash_files(args_raw: &str, workspace: &Path) -> Result<String, String
 /// fallback, matching GitHub Actions behavior.
 ///
 /// Returns `Err` if a `hashFiles()` expression fails (e.g. unreadable file).
+#[allow(clippy::too_many_arguments)]
 pub fn preprocess_expressions(
     text: &str,
     workspace: &Path,
     matrix_combination: &Option<HashMap<String, Value>>,
     step_outputs: &HashMap<String, HashMap<String, String>>,
     env_context: &HashMap<String, String>,
+    step_statuses: &HashMap<String, (String, String)>,
+    job_status: &str,
+    secrets_context: &HashMap<String, String>,
+    needs_context: &HashMap<String, HashMap<String, String>>,
+    needs_results: &HashMap<String, String>,
 ) -> Result<String, String> {
     use crate::expression::{evaluate, ExpressionContext};
 
@@ -176,6 +182,11 @@ pub fn preprocess_expressions(
         env_context,
         step_outputs,
         matrix_combination,
+        step_statuses,
+        job_status,
+        secrets_context,
+        needs_context,
+        needs_results,
     };
 
     // Evaluate all remaining ${{ ... }} expressions through the expression evaluator
@@ -353,6 +364,11 @@ mod tests {
             &Some(matrix),
             &HashMap::new(),
             &HashMap::new(),
+            &HashMap::new(),
+            "success",
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
         )
         .unwrap();
 
@@ -392,9 +408,19 @@ mod tests {
         step_outputs.insert("build".to_string(), build_outputs);
 
         let text = "Version is ${{ steps.build.outputs.version }}";
-        let result =
-            preprocess_expressions(text, dir.path(), &None, &step_outputs, &HashMap::new())
-                .unwrap();
+        let result = preprocess_expressions(
+            text,
+            dir.path(),
+            &None,
+            &step_outputs,
+            &HashMap::new(),
+            &HashMap::new(),
+            "success",
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .unwrap();
         assert_eq!(result, "Version is 1.2.3");
     }
 
@@ -403,9 +429,19 @@ mod tests {
         let dir = tempdir().unwrap();
 
         let text = "Value: ${{ steps.unknown.outputs.key }}";
-        let result =
-            preprocess_expressions(text, dir.path(), &None, &HashMap::new(), &HashMap::new())
-                .unwrap();
+        let result = preprocess_expressions(
+            text,
+            dir.path(),
+            &None,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            "success",
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .unwrap();
         assert_eq!(result, "Value: ");
     }
 
@@ -416,9 +452,19 @@ mod tests {
         step_outputs.insert("build".to_string(), HashMap::new());
 
         let text = "${{ steps.build.outputs.missing }}";
-        let result =
-            preprocess_expressions(text, dir.path(), &None, &step_outputs, &HashMap::new())
-                .unwrap();
+        let result = preprocess_expressions(
+            text,
+            dir.path(),
+            &None,
+            &step_outputs,
+            &HashMap::new(),
+            &HashMap::new(),
+            "success",
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .unwrap();
         assert_eq!(result, "");
     }
 
@@ -431,8 +477,19 @@ mod tests {
         env.insert("MY_VAR".to_string(), "hello".to_string());
 
         let text = "Value: ${{ env.MY_VAR }}";
-        let result =
-            preprocess_expressions(text, dir.path(), &None, &HashMap::new(), &env).unwrap();
+        let result = preprocess_expressions(
+            text,
+            dir.path(),
+            &None,
+            &HashMap::new(),
+            &env,
+            &HashMap::new(),
+            "success",
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .unwrap();
         assert_eq!(result, "Value: hello");
     }
 
@@ -441,9 +498,19 @@ mod tests {
         let dir = tempdir().unwrap();
 
         let text = "${{ env.MISSING }}";
-        let result =
-            preprocess_expressions(text, dir.path(), &None, &HashMap::new(), &HashMap::new())
-                .unwrap();
+        let result = preprocess_expressions(
+            text,
+            dir.path(),
+            &None,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            "success",
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .unwrap();
         assert_eq!(result, "");
     }
 
@@ -466,8 +533,19 @@ mod tests {
         env.insert("CI".to_string(), "true".to_string());
 
         let text = "${{ matrix.os }}-${{ steps.build.outputs.tag }}-${{ env.CI }}";
-        let result =
-            preprocess_expressions(text, dir.path(), &Some(matrix), &step_outputs, &env).unwrap();
+        let result = preprocess_expressions(
+            text,
+            dir.path(),
+            &Some(matrix),
+            &step_outputs,
+            &env,
+            &HashMap::new(),
+            "success",
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .unwrap();
         assert_eq!(result, "ubuntu-v1-true");
     }
 
@@ -482,8 +560,19 @@ mod tests {
 
         let text =
             "rustup toolchain install ${{ inputs.toolchain }} --component ${{ inputs.components }}";
-        let result =
-            preprocess_expressions(text, dir.path(), &None, &HashMap::new(), &env).unwrap();
+        let result = preprocess_expressions(
+            text,
+            dir.path(),
+            &None,
+            &HashMap::new(),
+            &env,
+            &HashMap::new(),
+            "success",
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .unwrap();
         assert_eq!(
             result,
             "rustup toolchain install stable --component rustfmt"
@@ -497,8 +586,19 @@ mod tests {
         env.insert("INPUT_NODE_VERSION".to_string(), "18".to_string());
 
         let text = "${{ inputs.node-version }}";
-        let result =
-            preprocess_expressions(text, dir.path(), &None, &HashMap::new(), &env).unwrap();
+        let result = preprocess_expressions(
+            text,
+            dir.path(),
+            &None,
+            &HashMap::new(),
+            &env,
+            &HashMap::new(),
+            "success",
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .unwrap();
         assert_eq!(result, "18");
     }
 
@@ -507,9 +607,19 @@ mod tests {
         let dir = tempdir().unwrap();
 
         let text = "${{ inputs.missing }}";
-        let result =
-            preprocess_expressions(text, dir.path(), &None, &HashMap::new(), &HashMap::new())
-                .unwrap();
+        let result = preprocess_expressions(
+            text,
+            dir.path(),
+            &None,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            "success",
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .unwrap();
         assert_eq!(result, "");
     }
 
@@ -523,8 +633,19 @@ mod tests {
         env.insert("GITHUB_REF_NAME".to_string(), "main".to_string());
 
         let text = "${{ github.repository }}/${{ github.ref_name }}";
-        let result =
-            preprocess_expressions(text, dir.path(), &None, &HashMap::new(), &env).unwrap();
+        let result = preprocess_expressions(
+            text,
+            dir.path(),
+            &None,
+            &HashMap::new(),
+            &env,
+            &HashMap::new(),
+            "success",
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .unwrap();
         assert_eq!(result, "owner/repo/main");
     }
 
@@ -533,9 +654,19 @@ mod tests {
         let dir = tempdir().unwrap();
 
         let text = "${{ github.token }}";
-        let result =
-            preprocess_expressions(text, dir.path(), &None, &HashMap::new(), &HashMap::new())
-                .unwrap();
+        let result = preprocess_expressions(
+            text,
+            dir.path(),
+            &None,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            "success",
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .unwrap();
         assert_eq!(result, "");
     }
 
@@ -549,8 +680,19 @@ mod tests {
         env.insert("RUNNER_TEMP".to_string(), "/tmp/runner".to_string());
 
         let text = "${{ runner.os }} ${{ runner.temp }}";
-        let result =
-            preprocess_expressions(text, dir.path(), &None, &HashMap::new(), &env).unwrap();
+        let result = preprocess_expressions(
+            text,
+            dir.path(),
+            &None,
+            &HashMap::new(),
+            &env,
+            &HashMap::new(),
+            "success",
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .unwrap();
         assert_eq!(result, "Linux /tmp/runner");
     }
 
@@ -559,9 +701,19 @@ mod tests {
         let dir = tempdir().unwrap();
 
         let text = "${{ runner.arch }}";
-        let result =
-            preprocess_expressions(text, dir.path(), &None, &HashMap::new(), &HashMap::new())
-                .unwrap();
+        let result = preprocess_expressions(
+            text,
+            dir.path(),
+            &None,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            "success",
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .unwrap();
         assert_eq!(result, "");
     }
 
@@ -577,8 +729,19 @@ mod tests {
         env.insert("RUNNER_OS".to_string(), "Linux".to_string());
 
         let text = "${{ inputs.toolchain }}-${{ github.repository }}-${{ runner.os }}";
-        let result =
-            preprocess_expressions(text, dir.path(), &None, &HashMap::new(), &env).unwrap();
+        let result = preprocess_expressions(
+            text,
+            dir.path(),
+            &None,
+            &HashMap::new(),
+            &env,
+            &HashMap::new(),
+            "success",
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .unwrap();
         assert_eq!(result, "nightly-foo/bar-Linux");
     }
 
@@ -587,9 +750,19 @@ mod tests {
         let dir = tempdir().unwrap();
 
         let text = "echo ${{ unknown_context.value }}";
-        let result =
-            preprocess_expressions(text, dir.path(), &None, &HashMap::new(), &HashMap::new())
-                .unwrap();
+        let result = preprocess_expressions(
+            text,
+            dir.path(),
+            &None,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            "success",
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .unwrap();
         assert_eq!(result, "echo ");
     }
 
@@ -608,7 +781,19 @@ mod tests {
 
         // This is the dtolnay/rust-toolchain pattern that triggered the original bug
         let text = "rustup toolchain install nightly${{ steps.parse.outputs.toolchain == 'nightly' && inputs.components && ' --allow-downgrade' || '' }}";
-        let result = preprocess_expressions(text, dir.path(), &None, &step_outputs, &env).unwrap();
+        let result = preprocess_expressions(
+            text,
+            dir.path(),
+            &None,
+            &step_outputs,
+            &env,
+            &HashMap::new(),
+            "success",
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .unwrap();
         assert_eq!(result, "rustup toolchain install nightly --allow-downgrade");
     }
 
@@ -624,7 +809,19 @@ mod tests {
         step_outputs.insert("parse".to_string(), parse_out);
 
         let text = "rustup toolchain install stable${{ steps.parse.outputs.toolchain == 'nightly' && inputs.components && ' --allow-downgrade' || '' }}";
-        let result = preprocess_expressions(text, dir.path(), &None, &step_outputs, &env).unwrap();
+        let result = preprocess_expressions(
+            text,
+            dir.path(),
+            &None,
+            &step_outputs,
+            &env,
+            &HashMap::new(),
+            "success",
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .unwrap();
         // stable != nightly, so the expression evaluates to ''
         assert_eq!(result, "rustup toolchain install stable");
     }
@@ -637,8 +834,19 @@ mod tests {
 
         // dtolnay/rust-toolchain uses ${{runner.os}} without spaces
         let text = "if [[ ${{runner.os}} == macOS ]]; then echo mac; fi";
-        let result =
-            preprocess_expressions(text, dir.path(), &None, &HashMap::new(), &env).unwrap();
+        let result = preprocess_expressions(
+            text,
+            dir.path(),
+            &None,
+            &HashMap::new(),
+            &env,
+            &HashMap::new(),
+            "success",
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .unwrap();
         assert_eq!(result, "if [[ Linux == macOS ]]; then echo mac; fi");
     }
 }

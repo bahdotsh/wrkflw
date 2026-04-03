@@ -2231,7 +2231,7 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
     // Prepare step environment
     let mut step_env = ctx.job_env.clone();
 
-    // Add step-level environment variables (with secret substitution)
+    // Add step-level environment variables (with secret + expression substitution)
     for (key, value) in &ctx.step.env {
         let resolved_value = if let Some(secret_manager) = ctx.secret_manager {
             let mut substitution = SecretSubstitution::new(secret_manager);
@@ -2247,6 +2247,17 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
             }
         } else {
             value.clone()
+        };
+        // Resolve ${{ }} expressions in env values (e.g. ${{inputs.toolchain}})
+        let resolved_value = match crate::substitution::preprocess_expressions(
+            &resolved_value,
+            ctx.working_dir,
+            ctx.matrix_combination,
+            ctx.step_outputs,
+            &step_env,
+        ) {
+            Ok(r) => r,
+            Err(_) => resolved_value,
         };
         step_env.insert(key.clone(), resolved_value);
     }
@@ -3771,8 +3782,10 @@ async fn execute_composite_action(
                 }
             }
 
-            // Execute each step
+            // Execute each step, tracking outputs and env changes between steps
             let mut step_outputs = Vec::new();
+            let mut composite_step_outputs: HashMap<String, HashMap<String, String>> =
+                HashMap::new();
             for (idx, step_def) in steps.iter().enumerate() {
                 // Convert the YAML step to our Step struct
                 let composite_step = match convert_yaml_to_step(step_def) {
@@ -3808,15 +3821,21 @@ async fn execute_composite_action(
                     container_config: None, // Composite actions don't use job containers
                     workflow_defaults: None,
                     job_defaults: None,
-                    // Composite action steps don't have access to the parent job's step
-                    // outputs — this matches GitHub Actions behavior where ${{ steps.* }}
-                    // only resolves within the same job scope, not across action boundaries.
-                    step_outputs: &HashMap::new(),
+                    step_outputs: &composite_step_outputs,
                 }))
                 .await?;
 
                 // Add output to results
                 step_outputs.push(format!("Step {}: {}", idx + 1, step_result.output));
+
+                // Read back GITHUB_OUTPUT/GITHUB_ENV/GITHUB_PATH so subsequent
+                // composite steps can reference ${{ steps.<id>.outputs.<key> }}
+                // and see environment changes from prior steps.
+                crate::github_env_files::apply_step_environment_updates(
+                    &mut action_env,
+                    &mut composite_step_outputs,
+                    composite_step.id.as_deref(),
+                );
 
                 // Short-circuit on failure if needed
                 if step_result.status == StepStatus::Failure {

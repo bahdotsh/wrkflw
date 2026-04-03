@@ -122,7 +122,11 @@ pub fn create_github_context(
     // Miscellaneous
     env.insert("GITHUB_RETENTION_DAYS".to_string(), "90".to_string());
 
-    // Path-related variables
+    // Runner variables
+    env.insert("RUNNER_OS".to_string(), get_runner_os());
+    env.insert("RUNNER_ARCH".to_string(), get_runner_arch());
+    env.insert("RUNNER_NAME".to_string(), "wrkflw-local".to_string());
+    env.insert("RUNNER_ENVIRONMENT".to_string(), "local".to_string());
     env.insert("RUNNER_TEMP".to_string(), get_temp_dir());
     env.insert("RUNNER_TOOL_CACHE".to_string(), get_tool_cache_dir());
 
@@ -273,6 +277,23 @@ fn get_current_ref() -> String {
     }
 
     "refs/heads/main".to_string()
+}
+
+fn get_runner_os() -> String {
+    match std::env::consts::OS {
+        "macos" => "macOS".to_string(),
+        "linux" => "Linux".to_string(),
+        "windows" => "Windows".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn get_runner_arch() -> String {
+    match std::env::consts::ARCH {
+        "x86_64" | "x86" => "X64".to_string(),
+        "aarch64" => "ARM64".to_string(),
+        other => other.to_string(),
+    }
 }
 
 fn get_temp_dir() -> String {

@@ -7,6 +7,7 @@ pub mod dependency;
 pub mod docker;
 pub mod engine;
 pub mod environment;
+pub mod expression;
 pub mod github_env_files;
 pub mod podman;
 pub mod substitution;

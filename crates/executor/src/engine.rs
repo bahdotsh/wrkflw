@@ -2096,7 +2096,12 @@ async fn run_step_with_guards(
 
     // Check step-level if condition
     if let Some(if_cond) = &step.if_condition {
-        let should_run = evaluate_job_condition(if_cond, job_env, workflow);
+        let should_run = evaluate_condition_with_context(
+            if_cond,
+            job_env,
+            step_exec_ctx.step_outputs,
+            step_exec_ctx.matrix_combination,
+        );
         if !should_run {
             wrkflw_logging::info(&format!(
                 "  {} Skipping step '{}' due to condition: {}",
@@ -2910,8 +2915,9 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
             .await
         {
             Ok(container_output) => {
-                // Add command details to output
-                output.push_str(&format!("Command: {}\n\n", run));
+                // Add command details to output (show resolved version so
+                // users can see expression substitutions were applied)
+                output.push_str(&format!("Command: {}\n\n", resolved_run));
 
                 if !container_output.stdout.is_empty() {
                     output.push_str("Standard Output:\n");
@@ -3972,88 +3978,48 @@ fn convert_yaml_to_step(step_yaml: &serde_yaml::Value) -> Result<workflow::Step,
 fn evaluate_job_condition(
     condition: &str,
     env_context: &HashMap<String, String>,
-    workflow: &WorkflowDefinition,
+    _workflow: &WorkflowDefinition,
 ) -> bool {
+    evaluate_condition_with_context(condition, env_context, &HashMap::new(), &None)
+}
+
+/// Evaluate a job/step `if:` condition using the expression evaluator.
+///
+/// Accepts the full expression context (env, step outputs, matrix) for accurate
+/// resolution of context references and operators.
+fn evaluate_condition_with_context(
+    condition: &str,
+    env_context: &HashMap<String, String>,
+    step_outputs: &HashMap<String, HashMap<String, String>>,
+    matrix_combination: &Option<HashMap<String, Value>>,
+) -> bool {
+    use crate::expression::{evaluate_as_bool, ExpressionContext};
+
     wrkflw_logging::debug(&format!("Evaluating condition: {}", condition));
 
-    // Handle status functions and step references that we can't fully evaluate.
-    // We default conservatively: only `always()` and `success()` resolve to true,
-    // since those represent the common "run this step" intent. Bare `steps.*`
-    // references (e.g. `steps.X.outcome == 'failure'`) default to false to avoid
-    // running steps that depend on prior failure/output we can't evaluate.
-    let has_always = condition.contains("always()");
-    let has_success = condition.contains("success()");
-    let has_failure = condition.contains("failure()");
-    let has_cancelled = condition.contains("cancelled()");
-    // Match "steps." only at word boundaries to avoid false positives on env var
-    // names like "env.MY_STEPS_COUNT" or "env._STEPS_CHECK". We check for
-    // start-of-string or a character that isn't alphanumeric/underscore before "steps.".
-    let has_steps_ref = condition.match_indices("steps.").any(|(pos, _)| {
-        pos == 0 || {
-            let b = condition.as_bytes()[pos - 1];
-            !b.is_ascii_alphanumeric() && b != b'_'
+    let ctx = ExpressionContext {
+        env_context,
+        step_outputs,
+        matrix_combination,
+    };
+
+    match evaluate_as_bool(condition, &ctx) {
+        Ok(result) => {
+            wrkflw_logging::debug(&format!(
+                "Condition '{}' evaluated to {}",
+                condition, result
+            ));
+            result
         }
-    });
-    let has_unsupported =
-        has_always || has_success || has_failure || has_cancelled || has_steps_ref;
-
-    if has_unsupported {
-        wrkflw_logging::warning(&format!(
-            "Condition '{}' uses status functions/step references not fully supported in local execution",
-            condition
-        ));
-
-        // In GitHub Actions, `always()` means "run this step regardless of job
-        // status" — it is a *scheduling* directive, not a boolean `true` literal.
-        // Similarly, `success()` means "run when all previous steps succeeded".
-        // Since we can't evaluate actual job/step status locally, we treat
-        // `always()` and `success()` as "likely to run" → true, and `failure()`
-        // / `cancelled()` as "unlikely" → false.
-        //
-        // Known limitation: compound expressions like `always() && failure()` will
-        // return true (because `always()` is present) even though a real evaluator
-        // would AND the two. This is acceptable because we lack step-status context
-        // and would rather over-run than silently skip steps.
-        if has_always || has_success {
-            return true;
+        Err(e) => {
+            wrkflw_logging::warning(&format!(
+                "Failed to evaluate condition '{}': {} — defaulting to true",
+                condition, e
+            ));
+            // Default to true to avoid breaking workflows
+            true
         }
-        // Bare steps.* refs, failure(), cancelled() without positive counterpart → false
-        return false;
     }
-
-    // For now, implement basic pattern matching for common conditions
-    // TODO: Implement a full GitHub Actions expression evaluator
-
-    // Handle simple boolean conditions
-    if condition == "true" {
-        return true;
-    }
-    if condition == "false" {
-        return false;
-    }
-
-    // Handle github.event.pull_request.draft == false
-    if condition.contains("github.event.pull_request.draft == false") {
-        // For local execution, assume this is always true (not a draft)
-        return true;
-    }
-
-    // Handle needs.jobname.outputs.outputname == 'value' patterns
-    if condition.contains("needs.") && condition.contains(".outputs.") {
-        // For now, simulate that outputs are available but empty
-        // This means conditions like needs.changes.outputs.source-code == 'true' will be false
-        wrkflw_logging::debug(
-            "Evaluating needs.outputs condition - defaulting to false for local execution",
-        );
-        return false;
-    }
-
-    // Default to true for unknown conditions to avoid breaking workflows
-    wrkflw_logging::warning(&format!(
-        "Unknown condition pattern: '{}' - defaulting to true",
-        condition
-    ));
-    true
 }
 
 #[cfg(test)]
@@ -4425,12 +4391,19 @@ mod tests {
     }
 
     #[test]
-    fn condition_steps_reference_defaults_false() {
+    fn condition_steps_reference_evaluates_with_default_outcome() {
         let env = HashMap::new();
         let wf = empty_workflow();
-        // Bare step-level expressions default to false (conservative — we can't evaluate them)
-        assert!(!evaluate_job_condition(
+        // steps.build.outcome defaults to "success" in local execution since
+        // we don't track actual step status — so == 'success' is true.
+        assert!(evaluate_job_condition(
             "steps.build.outcome == 'success'",
+            &env,
+            &wf
+        ));
+        // Checking for failure should be false
+        assert!(!evaluate_job_condition(
+            "steps.build.outcome == 'failure'",
             &env,
             &wf
         ));
@@ -4485,37 +4458,37 @@ mod tests {
     }
 
     #[test]
-    fn condition_always_with_failure_defaults_true() {
+    fn condition_always_and_failure_evaluates_correctly() {
         let env = HashMap::new();
         let wf = empty_workflow();
-        // always() present → true regardless of other functions
-        assert!(evaluate_job_condition("always() && failure()", &env, &wf));
+        // always() → true, failure() → false, true && false → false
+        // The expression evaluator correctly evaluates the compound expression
+        assert!(!evaluate_job_condition("always() && failure()", &env, &wf));
+        // always() alone → true
+        assert!(evaluate_job_condition("always()", &env, &wf));
+        // always() || failure() → true (|| returns first truthy)
+        assert!(evaluate_job_condition("always() || failure()", &env, &wf));
     }
 
     #[test]
-    fn condition_env_var_containing_steps_not_treated_as_step_ref() {
-        let env = HashMap::new();
+    fn condition_env_context_evaluates_correctly() {
+        let mut env = HashMap::new();
+        env.insert("MY_STEPS_COUNT".to_string(), "5".to_string());
+        env.insert("_STEPS_CHECK".to_string(), "ok".to_string());
         let wf = empty_workflow();
-        // "env.MY_STEPS_COUNT" contains "steps." as a substring but should NOT
-        // trigger the step-reference heuristic (which returns false). Instead it
-        // falls through to the unknown-condition default (true).
-        // A bare "steps.build.outcome" at the start SHOULD be caught.
+        // env.MY_STEPS_COUNT resolves via the env context, not as a steps ref
         assert!(evaluate_job_condition(
             "env.MY_STEPS_COUNT == '5'",
             &env,
             &wf
         ));
-        // Underscore-prefixed names should also NOT be treated as step refs
         assert!(evaluate_job_condition(
             "env._STEPS_CHECK == 'ok'",
             &env,
             &wf
         ));
-        assert!(!evaluate_job_condition(
-            "steps.build.outcome == 'success'",
-            &env,
-            &wf
-        ));
+        // Missing env var → null, null != '5' → false
+        assert!(!evaluate_job_condition("env.MISSING_VAR == '5'", &env, &wf));
     }
 
     // --- volume path traversal tests ---

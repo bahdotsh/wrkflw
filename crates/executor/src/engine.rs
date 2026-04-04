@@ -159,6 +159,10 @@ async fn execute_github_workflow(
             ExecutionError::Execution(format!("Failed to create artifact store: {}", e))
         })?;
 
+    // Create cache store for this workflow run (persistent across runs)
+    let cache_store = crate::cache::CacheStore::new()
+        .map_err(|e| ExecutionError::Execution(format!("Failed to create cache store: {}", e)))?;
+
     // 6. Execute jobs according to the plan
     let mut results = Vec::new();
     let mut has_failures = false;
@@ -180,6 +184,7 @@ async fn execute_github_workflow(
             &all_job_outputs,
             &all_job_results,
             &artifact_store,
+            &cache_store,
         )
         .await?;
 
@@ -325,6 +330,10 @@ async fn execute_gitlab_pipeline(
             ExecutionError::Execution(format!("Failed to create artifact store: {}", e))
         })?;
 
+    // Create cache store for this pipeline run (persistent across runs)
+    let cache_store = crate::cache::CacheStore::new()
+        .map_err(|e| ExecutionError::Execution(format!("Failed to create cache store: {}", e)))?;
+
     // 7. Execute jobs according to the plan
     let mut results = Vec::new();
     let mut has_failures = false;
@@ -343,6 +352,7 @@ async fn execute_gitlab_pipeline(
             &HashMap::new(),
             &HashMap::new(),
             &artifact_store,
+            &cache_store,
         )
         .await?;
 
@@ -1639,6 +1649,7 @@ async fn execute_job_batch(
     all_job_outputs: &HashMap<String, HashMap<String, String>>,
     all_job_results: &HashMap<String, String>,
     artifact_store: &crate::artifacts::ArtifactStore,
+    cache_store: &crate::cache::CacheStore,
 ) -> Result<Vec<JobResult>, ExecutionError> {
     // Execute jobs in parallel
     let futures = jobs.iter().map(|job_name| {
@@ -1653,6 +1664,7 @@ async fn execute_job_batch(
             all_job_outputs,
             all_job_results,
             artifact_store,
+            cache_store,
         )
     });
 
@@ -1679,9 +1691,12 @@ struct JobExecutionContext<'a> {
     verbose: bool,
     secret_manager: Option<&'a SecretManager>,
     secret_masker: Option<&'a SecretMasker>,
+    /// Pre-resolved secrets for expression context (resolved once per job).
+    secrets_context: &'a HashMap<String, String>,
     needs_context: &'a HashMap<String, HashMap<String, String>>,
     needs_results: &'a HashMap<String, String>,
     artifact_store: &'a crate::artifacts::ArtifactStore,
+    cache_store: &'a crate::cache::CacheStore,
 }
 
 /// Execute a job, expanding matrix if present
@@ -1697,6 +1712,7 @@ async fn execute_job_with_matrix(
     all_job_outputs: &HashMap<String, HashMap<String, String>>,
     all_job_results: &HashMap<String, String>,
     artifact_store: &crate::artifacts::ArtifactStore,
+    cache_store: &crate::cache::CacheStore,
 ) -> Result<Vec<JobResult>, ExecutionError> {
     // Get the job definition
     let job = workflow.jobs.get(job_name).ok_or_else(|| {
@@ -1728,6 +1744,13 @@ async fn execute_job_with_matrix(
     // Build filtered needs context for this job (only jobs declared in `needs:`)
     let (needs_ctx, needs_res) = build_needs_context(job, all_job_outputs, all_job_results);
 
+    // Pre-resolve secrets once for this job (shared across matrix combinations and non-matrix path)
+    let secrets_context: HashMap<String, String> = if let Some(secret_mgr) = secret_manager {
+        resolve_secrets_for_context(secret_mgr, job, workflow).await
+    } else {
+        HashMap::new()
+    };
+
     // Check if this is a matrix job
     if let Some(matrix_config) = job.matrix_config() {
         // Expand the matrix into combinations
@@ -1755,13 +1778,6 @@ async fn execute_job_with_matrix(
             std::cmp::max(1, num_cpus::get())
         });
 
-        // Pre-resolve secrets once for all matrix combinations
-        let secrets_context: HashMap<String, String> = if let Some(secret_mgr) = secret_manager {
-            resolve_secrets_for_context(secret_mgr, job, workflow).await
-        } else {
-            HashMap::new()
-        };
-
         // Execute matrix combinations
         execute_matrix_combinations(MatrixExecutionContext {
             job_name,
@@ -1779,6 +1795,7 @@ async fn execute_job_with_matrix(
             needs_context: &needs_ctx,
             needs_results: &needs_res,
             artifact_store,
+            cache_store,
         })
         .await
     } else {
@@ -1791,9 +1808,11 @@ async fn execute_job_with_matrix(
             verbose,
             secret_manager,
             secret_masker,
+            secrets_context: &secrets_context,
             needs_context: &needs_ctx,
             needs_results: &needs_res,
             artifact_store,
+            cache_store,
         };
         let result = execute_job(ctx).await?;
         Ok(vec![result])
@@ -1861,14 +1880,6 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
     let mut step_status_map: HashMap<String, (String, String)> = HashMap::new();
     let mut job_status_str = "success".to_string();
 
-    // Pre-resolve secrets for expression context (secrets.* references)
-    let secrets_context: HashMap<String, String> = if let Some(secret_manager) = ctx.secret_manager
-    {
-        resolve_secrets_for_context(secret_manager, job, ctx.workflow).await
-    } else {
-        HashMap::new()
-    };
-
     let job_deadline = tokio::time::Instant::now() + job_timeout;
 
     for (idx, step) in job.steps.iter().enumerate() {
@@ -1899,10 +1910,11 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
                     step_outputs: &step_outputs_map,
                     step_statuses: &step_status_map,
                     job_status: &job_status_str,
-                    secrets_context: &secrets_context,
+                    secrets_context: ctx.secrets_context,
                     needs_context: ctx.needs_context,
                     needs_results: ctx.needs_results,
                     artifact_store: ctx.artifact_store,
+                    cache_store: ctx.cache_store,
                 },
             ),
         )
@@ -2012,6 +2024,7 @@ struct MatrixExecutionContext<'a> {
     needs_context: &'a HashMap<String, HashMap<String, String>>,
     needs_results: &'a HashMap<String, String>,
     artifact_store: &'a crate::artifacts::ArtifactStore,
+    cache_store: &'a crate::cache::CacheStore,
 }
 
 /// Execute a set of matrix combinations
@@ -2057,6 +2070,7 @@ async fn execute_matrix_combinations(
                 ctx.needs_context,
                 ctx.needs_results,
                 ctx.artifact_store,
+                ctx.cache_store,
             )
         });
 
@@ -2103,6 +2117,7 @@ async fn execute_matrix_job(
     needs_context: &HashMap<String, HashMap<String, String>>,
     needs_results: &HashMap<String, String>,
     artifact_store: &crate::artifacts::ArtifactStore,
+    cache_store: &crate::cache::CacheStore,
 ) -> Result<JobResult, ExecutionError> {
     // Create the matrix-specific job name
     let matrix_job_name = wrkflw_matrix::format_combination_name(job_name, combination);
@@ -2188,6 +2203,7 @@ async fn execute_matrix_job(
                         needs_context,
                         needs_results,
                         artifact_store,
+                        cache_store,
                     },
                 ),
             )
@@ -2394,16 +2410,7 @@ async fn run_step_with_guards(
 
     // Check step-level if condition
     if let Some(if_cond) = &step.if_condition {
-        let cond_ctx = crate::expression::ExpressionContext {
-            env_context: job_env,
-            step_outputs: step_exec_ctx.step_outputs,
-            matrix_combination: step_exec_ctx.matrix_combination,
-            step_statuses: step_exec_ctx.step_statuses,
-            job_status: step_exec_ctx.job_status,
-            secrets_context: step_exec_ctx.secrets_context,
-            needs_context: step_exec_ctx.needs_context,
-            needs_results: step_exec_ctx.needs_results,
-        };
+        let cond_ctx = step_exec_ctx.expr_context();
         let should_run = evaluate_condition_with_context(if_cond, &cond_ctx);
         if !should_run {
             wrkflw_logging::info(&format!(
@@ -2526,20 +2533,48 @@ struct StepExecutionContext<'a> {
     needs_context: &'a HashMap<String, HashMap<String, String>>,
     needs_results: &'a HashMap<String, String>,
     artifact_store: &'a crate::artifacts::ArtifactStore,
+    cache_store: &'a crate::cache::CacheStore,
+}
+
+impl<'a> StepExecutionContext<'a> {
+    /// Build an `ExpressionContext` from this step context.
+    fn expr_context(&self) -> crate::expression::ExpressionContext<'_> {
+        crate::expression::ExpressionContext {
+            env_context: self.job_env,
+            step_outputs: self.step_outputs,
+            matrix_combination: self.matrix_combination,
+            step_statuses: self.step_statuses,
+            job_status: self.job_status,
+            secrets_context: self.secrets_context,
+            needs_context: self.needs_context,
+            needs_results: self.needs_results,
+        }
+    }
+
+    /// Build an `ExpressionContext` using a custom env (e.g. partially-built step env).
+    fn expr_context_with_env<'e>(
+        &self,
+        env: &'e HashMap<String, String>,
+    ) -> crate::expression::ExpressionContext<'e>
+    where
+        'a: 'e,
+    {
+        crate::expression::ExpressionContext {
+            env_context: env,
+            step_outputs: self.step_outputs,
+            matrix_combination: self.matrix_combination,
+            step_statuses: self.step_statuses,
+            job_status: self.job_status,
+            secrets_context: self.secrets_context,
+            needs_context: self.needs_context,
+            needs_results: self.needs_results,
+        }
+    }
 }
 
 /// Resolve `${{ }}` expressions in an action `with` parameter value.
 fn preprocess_with_value(value: &str, ctx: &StepExecutionContext<'_>) -> String {
-    let expr_ctx = crate::expression::ExpressionContext {
-        env_context: ctx.job_env,
-        step_outputs: ctx.step_outputs,
-        matrix_combination: ctx.matrix_combination,
-        step_statuses: ctx.step_statuses,
-        job_status: ctx.job_status,
-        secrets_context: ctx.secrets_context,
-        needs_context: ctx.needs_context,
-        needs_results: ctx.needs_results,
-    };
+    let expr_ctx = ctx.expr_context();
     crate::substitution::preprocess_expressions(value, ctx.working_dir, &expr_ctx)
         .unwrap_or_else(|_| value.to_string())
 }
@@ -2576,16 +2611,7 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
             value.clone()
         };
         // Resolve ${{ }} expressions in env values (e.g. ${{inputs.toolchain}})
-        let env_expr_ctx = crate::expression::ExpressionContext {
-            env_context: &step_env,
-            step_outputs: ctx.step_outputs,
-            matrix_combination: ctx.matrix_combination,
-            step_statuses: ctx.step_statuses,
-            job_status: ctx.job_status,
-            secrets_context: ctx.secrets_context,
-            needs_context: ctx.needs_context,
-            needs_results: ctx.needs_results,
-        };
+        let env_expr_ctx = ctx.expr_context_with_env(&step_env);
         let resolved_value = match crate::substitution::preprocess_expressions(
             &resolved_value,
             ctx.working_dir,
@@ -2777,61 +2803,52 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                 ));
             }
 
-            match crate::cache::CacheStore::new() {
-                Ok(store) => {
-                    let cache_hit =
-                        store.restore(&key, &restore_keys, &cache_path, ctx.working_dir);
+            {
+                let cache_hit =
+                    ctx.cache_store
+                        .restore(&key, &restore_keys, &cache_path, ctx.working_dir);
 
-                    // Write cache-hit output to GITHUB_OUTPUT file
-                    if let Some(output_path) = ctx.job_env.get("GITHUB_OUTPUT") {
-                        let hit_val = if cache_hit.is_some() { "true" } else { "false" };
-                        let _ = std::fs::OpenOptions::new()
-                            .append(true)
-                            .open(output_path)
-                            .and_then(|mut f| {
-                                use std::io::Write;
-                                writeln!(f, "cache-hit={}", hit_val)
-                            });
+                // Write cache-hit output to GITHUB_OUTPUT file
+                if let Some(output_path) = ctx.job_env.get("GITHUB_OUTPUT") {
+                    let hit_val = if cache_hit.is_some() { "true" } else { "false" };
+                    let _ = std::fs::OpenOptions::new()
+                        .append(true)
+                        .open(output_path)
+                        .and_then(|mut f| {
+                            use std::io::Write;
+                            writeln!(f, "cache-hit={}", hit_val)
+                        });
+                }
+
+                match &cache_hit {
+                    Some(matched_key) => {
+                        wrkflw_logging::info(&format!("  Cache restored (key: {})", matched_key));
+                        StepResult::new(
+                            step_name,
+                            StepStatus::Success,
+                            format!("Cache restored (key: {})", matched_key),
+                        )
                     }
-
-                    match &cache_hit {
-                        Some(matched_key) => {
-                            wrkflw_logging::info(&format!(
-                                "  Cache restored (key: {})",
-                                matched_key
-                            ));
-                            StepResult::new(
-                                step_name,
-                                StepStatus::Success,
-                                format!("Cache restored (key: {})", matched_key),
-                            )
-                        }
-                        None => {
-                            // No cache hit — try to save current path for future runs
-                            let msg = match store.save(&key, &cache_path, ctx.working_dir) {
-                                Ok(()) => {
-                                    format!(
-                                        "Cache miss. Saved path '{}' with key '{}'",
-                                        cache_path, key
-                                    )
-                                }
-                                Err(_) => {
-                                    format!(
-                                        "Cache miss. Path '{}' does not exist yet (will be available on next run)",
-                                        cache_path
-                                    )
-                                }
-                            };
-                            wrkflw_logging::info(&format!("  {}", msg));
-                            StepResult::new(step_name, StepStatus::Success, msg)
-                        }
+                    None => {
+                        // No cache hit — try to save current path for future runs
+                        let msg = match ctx.cache_store.save(&key, &cache_path, ctx.working_dir) {
+                            Ok(()) => {
+                                format!(
+                                    "Cache miss. Saved path '{}' with key '{}'",
+                                    cache_path, key
+                                )
+                            }
+                            Err(_) => {
+                                format!(
+                                    "Cache miss. Path '{}' does not exist yet (will be available on next run)",
+                                    cache_path
+                                )
+                            }
+                        };
+                        wrkflw_logging::info(&format!("  {}", msg));
+                        StepResult::new(step_name, StepStatus::Success, msg)
                     }
                 }
-                Err(e) => StepResult::new(
-                    step_name,
-                    StepStatus::Failure,
-                    format!("Failed to initialize cache: {}", e),
-                ),
             }
         } else {
             // Get action info
@@ -2856,6 +2873,7 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                             ctx.needs_context,
                             ctx.needs_results,
                             ctx.artifact_store,
+                            ctx.cache_store,
                         )
                         .await?
                     } else {
@@ -2915,6 +2933,7 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                             ctx.needs_context,
                             ctx.needs_results,
                             ctx.artifact_store,
+                            ctx.cache_store,
                         )
                         .await?
                     }
@@ -3337,16 +3356,7 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
         };
 
         // Resolve expression substitutions (hashFiles, step outputs, env, matrix vars)
-        let run_expr_ctx = crate::expression::ExpressionContext {
-            env_context: ctx.job_env,
-            step_outputs: ctx.step_outputs,
-            matrix_combination: ctx.matrix_combination,
-            step_statuses: ctx.step_statuses,
-            job_status: ctx.job_status,
-            secrets_context: ctx.secrets_context,
-            needs_context: ctx.needs_context,
-            needs_results: ctx.needs_results,
-        };
+        let run_expr_ctx = ctx.expr_context();
         let resolved_run = match crate::substitution::preprocess_expressions(
             &resolved_run,
             ctx.working_dir,
@@ -4075,6 +4085,9 @@ async fn execute_reusable_workflow_job(
                 .map_err(|e| {
                     ExecutionError::Execution(format!("Failed to create artifact store: {}", e))
                 })?;
+            let reusable_cache_store = crate::cache::CacheStore::new().map_err(|e| {
+                ExecutionError::Execution(format!("Failed to create cache store: {}", e))
+            })?;
             for batch in plan {
                 let results = execute_job_batch(
                     &batch,
@@ -4087,6 +4100,7 @@ async fn execute_reusable_workflow_job(
                     &HashMap::new(),
                     &HashMap::new(),
                     &reusable_artifact_store,
+                    &reusable_cache_store,
                 )
                 .await?;
                 for r in &results {
@@ -4158,6 +4172,8 @@ async fn execute_reusable_workflow_job(
         crate::artifacts::ArtifactStore::new(Path::new(".")).map_err(|e| {
             ExecutionError::Execution(format!("Failed to create artifact store: {}", e))
         })?;
+    let reusable_cache_store = crate::cache::CacheStore::new()
+        .map_err(|e| ExecutionError::Execution(format!("Failed to create cache store: {}", e)))?;
     for batch in plan {
         let results = execute_job_batch(
             &batch,
@@ -4170,6 +4186,7 @@ async fn execute_reusable_workflow_job(
             &HashMap::new(),
             &HashMap::new(),
             &reusable_artifact_store,
+            &reusable_cache_store,
         )
         .await?;
         for r in &results {
@@ -4279,6 +4296,7 @@ async fn execute_composite_action(
     needs_context: &HashMap<String, HashMap<String, String>>,
     needs_results: &HashMap<String, String>,
     artifact_store: &crate::artifacts::ArtifactStore,
+    cache_store: &crate::cache::CacheStore,
 ) -> Result<StepResult, ExecutionError> {
     // Find the action definition file
     let action_yaml = action_path.join("action.yml");
@@ -4393,6 +4411,7 @@ async fn execute_composite_action(
                     needs_context,
                     needs_results,
                     artifact_store,
+                    cache_store,
                 }))
                 .await?;
 
@@ -4770,6 +4789,9 @@ mod tests {
         static ref TEST_ARTIFACT_DIR: tempfile::TempDir = tempfile::tempdir().unwrap();
         static ref TEST_ARTIFACT_STORE: crate::artifacts::ArtifactStore =
             crate::artifacts::ArtifactStore::new(TEST_ARTIFACT_DIR.path()).unwrap();
+        static ref TEST_CACHE_DIR: tempfile::TempDir = tempfile::tempdir().unwrap();
+        static ref TEST_CACHE_STORE: crate::cache::CacheStore =
+            crate::cache::CacheStore::with_root(TEST_CACHE_DIR.path().to_path_buf()).unwrap();
     }
 
     #[test]
@@ -5708,6 +5730,7 @@ runs:
             needs_context: &HashMap::new(),
             needs_results: &HashMap::new(),
             artifact_store: &TEST_ARTIFACT_STORE,
+            cache_store: &TEST_CACHE_STORE,
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -5763,6 +5786,7 @@ runs:
             needs_context: &HashMap::new(),
             needs_results: &HashMap::new(),
             artifact_store: &TEST_ARTIFACT_STORE,
+            cache_store: &TEST_CACHE_STORE,
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -5823,6 +5847,7 @@ runs:
             needs_context: &HashMap::new(),
             needs_results: &HashMap::new(),
             artifact_store: &TEST_ARTIFACT_STORE,
+            cache_store: &TEST_CACHE_STORE,
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -5876,6 +5901,7 @@ runs:
             needs_context: &HashMap::new(),
             needs_results: &HashMap::new(),
             artifact_store: &TEST_ARTIFACT_STORE,
+            cache_store: &TEST_CACHE_STORE,
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -5930,6 +5956,7 @@ runs:
             needs_context: &HashMap::new(),
             needs_results: &HashMap::new(),
             artifact_store: &TEST_ARTIFACT_STORE,
+            cache_store: &TEST_CACHE_STORE,
         };
 
         let result = execute_step(ctx).await;
@@ -5983,6 +6010,7 @@ runs:
             needs_context: &HashMap::new(),
             needs_results: &HashMap::new(),
             artifact_store: &TEST_ARTIFACT_STORE,
+            cache_store: &TEST_CACHE_STORE,
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -6034,6 +6062,7 @@ runs:
             needs_context: &HashMap::new(),
             needs_results: &HashMap::new(),
             artifact_store: &TEST_ARTIFACT_STORE,
+            cache_store: &TEST_CACHE_STORE,
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -6577,6 +6606,7 @@ runs:
             needs_context: &HashMap::new(),
             needs_results: &HashMap::new(),
             artifact_store: &TEST_ARTIFACT_STORE,
+            cache_store: &TEST_CACHE_STORE,
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -6628,6 +6658,7 @@ runs:
             needs_context: &HashMap::new(),
             needs_results: &HashMap::new(),
             artifact_store: &TEST_ARTIFACT_STORE,
+            cache_store: &TEST_CACHE_STORE,
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -6675,6 +6706,7 @@ runs:
             needs_context: &HashMap::new(),
             needs_results: &HashMap::new(),
             artifact_store: &TEST_ARTIFACT_STORE,
+            cache_store: &TEST_CACHE_STORE,
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -6714,6 +6746,7 @@ runs:
             needs_context: &HashMap::new(),
             needs_results: &HashMap::new(),
             artifact_store: &TEST_ARTIFACT_STORE,
+            cache_store: &TEST_CACHE_STORE,
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -6755,6 +6788,7 @@ runs:
             needs_context: &HashMap::new(),
             needs_results: &HashMap::new(),
             artifact_store: &TEST_ARTIFACT_STORE,
+            cache_store: &TEST_CACHE_STORE,
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -6807,6 +6841,7 @@ runs:
             needs_context: &HashMap::new(),
             needs_results: &HashMap::new(),
             artifact_store: &TEST_ARTIFACT_STORE,
+            cache_store: &TEST_CACHE_STORE,
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -6857,6 +6892,7 @@ runs:
             needs_context: &HashMap::new(),
             needs_results: &HashMap::new(),
             artifact_store: &TEST_ARTIFACT_STORE,
+            cache_store: &TEST_CACHE_STORE,
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -6907,6 +6943,7 @@ runs:
             needs_context: &HashMap::new(),
             needs_results: &HashMap::new(),
             artifact_store: &TEST_ARTIFACT_STORE,
+            cache_store: &TEST_CACHE_STORE,
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -6955,6 +6992,7 @@ runs:
             needs_context: &HashMap::new(),
             needs_results: &HashMap::new(),
             artifact_store: &TEST_ARTIFACT_STORE,
+            cache_store: &TEST_CACHE_STORE,
         };
 
         let result = execute_step(ctx).await.unwrap();

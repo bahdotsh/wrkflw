@@ -9,12 +9,16 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-/// Recursively collect all files under `dir`.
+/// Recursively collect all regular files under `dir`, skipping symlinks.
 fn walk_files(dir: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             let path = entry.path();
+            // Skip symlinks to prevent following links outside the artifact tree
+            if path.is_symlink() {
+                continue;
+            }
             if path.is_dir() {
                 files.extend(walk_files(&path));
             } else {
@@ -62,11 +66,20 @@ impl ArtifactStore {
         std::fs::create_dir_all(&artifact_dir)
             .map_err(|e| format!("Failed to create artifact directory: {}", e))?;
 
+        let canonical_workspace = workspace
+            .canonicalize()
+            .map_err(|e| format!("Failed to canonicalize workspace: {}", e))?;
         let full_pattern = workspace.join(path_pattern).to_string_lossy().to_string();
         let entries: Vec<PathBuf> = glob::glob(&full_pattern)
             .map_err(|e| format!("Invalid glob pattern '{}': {}", path_pattern, e))?
             .filter_map(|e| e.ok())
-            .filter(|p| p.is_file())
+            .filter(|p| p.is_file() && !p.is_symlink())
+            // Ensure matched files are within the workspace (prevent path traversal)
+            .filter(|p| {
+                p.canonicalize()
+                    .map(|c| c.starts_with(&canonical_workspace))
+                    .unwrap_or(false)
+            })
             .collect();
 
         if entries.is_empty() {

@@ -28,8 +28,8 @@ impl CacheStore {
         Ok(Self { root })
     }
 
-    /// Create a cache store at a custom root (for testing).
-    #[cfg(test)]
+    /// Create a cache store at a custom root (useful for testing or custom locations).
+    #[allow(dead_code)]
     pub fn with_root(root: PathBuf) -> std::io::Result<Self> {
         std::fs::create_dir_all(&root)?;
         Ok(Self { root })
@@ -47,6 +47,11 @@ impl CacheStore {
         path: &str,
         workspace: &Path,
     ) -> Option<String> {
+        // Validate that the resolved target stays within the workspace
+        if !validate_cache_path(path, workspace) {
+            return None;
+        }
+
         // Try exact match first
         let cache_dir = self.cache_path(key);
         if cache_dir.exists() {
@@ -72,6 +77,11 @@ impl CacheStore {
 
     /// Save the contents of `path` (relative to `workspace`) under `key`.
     pub fn save(&self, key: &str, path: &str, workspace: &Path) -> Result<(), String> {
+        // Validate that the resolved source stays within the workspace
+        if !validate_cache_path(path, workspace) {
+            return Err(format!("Cache path '{}' escapes workspace directory", path));
+        }
+
         let source = workspace.join(path);
         if !source.exists() {
             return Err(format!("Cache path '{}' does not exist", source.display()));
@@ -122,7 +132,31 @@ impl CacheStore {
     }
 }
 
-/// Recursively copy directory contents from `src` to `dst`.
+/// Validate that `path` (relative to `workspace`) does not escape the workspace via `..` etc.
+fn validate_cache_path(path: &str, workspace: &Path) -> bool {
+    let joined = workspace.join(path);
+    // Use lexical normalization: canonicalize the workspace (which must exist) and
+    // check that the joined path, once cleaned, starts with it.
+    if let Ok(canonical_ws) = workspace.canonicalize() {
+        // If the target exists, canonicalize it directly; otherwise check the parent.
+        if let Ok(canonical_target) = joined.canonicalize() {
+            canonical_target.starts_with(&canonical_ws)
+        } else if let Some(parent) = joined.parent() {
+            // Target doesn't exist yet — validate its parent
+            parent
+                .canonicalize()
+                .map(|p| p.starts_with(&canonical_ws))
+                .unwrap_or_else(|_| !path.contains(".."))
+        } else {
+            !path.contains("..")
+        }
+    } else {
+        // Workspace itself can't be canonicalized — fall back to simple check
+        !path.contains("..")
+    }
+}
+
+/// Recursively copy directory contents from `src` to `dst`, skipping symlinks.
 fn copy_dir_contents(src: &Path, dst: &Path) -> Result<(), String> {
     std::fs::create_dir_all(dst).map_err(|e| format!("Failed to create dir: {}", e))?;
 
@@ -135,6 +169,10 @@ fn copy_dir_contents(src: &Path, dst: &Path) -> Result<(), String> {
         .flatten()
     {
         let src_path = entry.path();
+        // Skip symlinks to prevent following links outside the cache tree
+        if src_path.is_symlink() {
+            continue;
+        }
         let file_name = entry.file_name();
         let dst_path = dst.join(&file_name);
 

@@ -193,11 +193,6 @@ async fn execute_github_workflow(
         // combination to complete wins.  This matches GitHub Actions' behavior where matrix
         // job outputs are non-deterministic when multiple combinations set the same key.
         for job_result in &job_results {
-            let result_str = match job_result.status {
-                JobStatus::Success => "success",
-                JobStatus::Failure => "failure",
-                JobStatus::Skipped => "skipped",
-            };
             if all_job_outputs.contains_key(&job_result.canonical_name)
                 && job_result.name != job_result.canonical_name
             {
@@ -207,7 +202,10 @@ async fn execute_github_workflow(
                     job_result.name, job_result.canonical_name, job_result.canonical_name,
                 ));
             }
-            all_job_results.insert(job_result.canonical_name.clone(), result_str.to_string());
+            all_job_results.insert(
+                job_result.canonical_name.clone(),
+                job_result.status.to_string(),
+            );
             all_job_outputs.insert(
                 job_result.canonical_name.clone(),
                 job_result.outputs.clone(),
@@ -352,7 +350,9 @@ async fn execute_gitlab_pipeline(
     let mut failure_details = String::new();
 
     for job_batch in execution_plan {
-        // Execute jobs in parallel if they don't depend on each other
+        // Execute jobs in parallel if they don't depend on each other.
+        // GitLab CI uses artifacts/variables for inter-job communication, not `needs.*`
+        // context, so we pass empty maps here.
         let job_results = execute_job_batch(
             &job_batch,
             &workflow,
@@ -601,6 +601,16 @@ pub enum JobStatus {
     Success,
     Failure,
     Skipped,
+}
+
+impl std::fmt::Display for JobStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            JobStatus::Success => f.write_str("success"),
+            JobStatus::Failure => f.write_str("failure"),
+            JobStatus::Skipped => f.write_str("skipped"),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2745,6 +2755,35 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                 .map(|s| ctx.working_dir.join(preprocess_with_value(s, &ctx)))
                 .unwrap_or_else(|| ctx.working_dir.to_path_buf());
 
+            // Validate download path stays within workspace (prevent path traversal)
+            {
+                let canonical_ws = ctx
+                    .working_dir
+                    .canonicalize()
+                    .unwrap_or_else(|_| ctx.working_dir.to_path_buf());
+                // Check the path itself if it exists, otherwise check its parent
+                let is_safe = if let Ok(canonical_dl) = download_path.canonicalize() {
+                    canonical_dl.starts_with(&canonical_ws)
+                } else if let Some(parent) = download_path.parent() {
+                    parent
+                        .canonicalize()
+                        .map(|p| p.starts_with(&canonical_ws))
+                        .unwrap_or(false)
+                } else {
+                    false
+                };
+                if !is_safe {
+                    return Ok(StepResult::new(
+                        step_name,
+                        StepStatus::Failure,
+                        format!(
+                            "download-artifact path '{}' escapes workspace directory",
+                            download_path.display()
+                        ),
+                    ));
+                }
+            }
+
             if name.is_empty() {
                 // Download all artifacts into named subdirectories
                 let names = ctx.artifact_store.list().await;
@@ -4100,7 +4139,9 @@ async fn execute_reusable_workflow_job(
                 }
             }
 
-            // Execute called workflow, reusing parent's artifact/cache stores
+            // Execute called workflow, reusing parent's artifact/cache stores.
+            // TODO: propagate parent secret_manager/secret_masker when `secrets: inherit`
+            // is specified (currently reusable workflow jobs cannot access parent secrets).
             let plan = dependency::resolve_dependencies(&called)?;
             let mut all_results = Vec::new();
             let mut any_failed = false;
@@ -4125,12 +4166,7 @@ async fn execute_reusable_workflow_job(
                     if r.status == JobStatus::Failure {
                         any_failed = true;
                     }
-                    let result_str = match r.status {
-                        JobStatus::Success => "success",
-                        JobStatus::Failure => "failure",
-                        JobStatus::Skipped => "skipped",
-                    };
-                    reusable_job_results.insert(r.canonical_name.clone(), result_str.to_string());
+                    reusable_job_results.insert(r.canonical_name.clone(), r.status.to_string());
                     reusable_job_outputs.insert(r.canonical_name.clone(), r.outputs.clone());
                 }
                 all_results.extend(results);
@@ -4189,7 +4225,9 @@ async fn execute_reusable_workflow_job(
         }
     }
 
-    // Execute called workflow, reusing parent's artifact/cache stores
+    // Execute called workflow, reusing parent's artifact/cache stores.
+    // TODO: propagate parent secret_manager/secret_masker when `secrets: inherit`
+    // is specified (currently reusable workflow jobs cannot access parent secrets).
     let plan = dependency::resolve_dependencies(&called)?;
     let mut all_results = Vec::new();
     let mut any_failed = false;
@@ -4214,12 +4252,7 @@ async fn execute_reusable_workflow_job(
             if r.status == JobStatus::Failure {
                 any_failed = true;
             }
-            let result_str = match r.status {
-                JobStatus::Success => "success",
-                JobStatus::Failure => "failure",
-                JobStatus::Skipped => "skipped",
-            };
-            reusable_job_results.insert(r.canonical_name.clone(), result_str.to_string());
+            reusable_job_results.insert(r.canonical_name.clone(), r.status.to_string());
             reusable_job_outputs.insert(r.canonical_name.clone(), r.outputs.clone());
         }
         all_results.extend(results);

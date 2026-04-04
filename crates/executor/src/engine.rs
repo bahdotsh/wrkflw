@@ -153,6 +153,12 @@ async fn execute_github_workflow(
 
     let secret_masker = SecretMasker::new();
 
+    // Create artifact store for this workflow run
+    let artifact_store =
+        crate::artifacts::ArtifactStore::new(workspace_dir.path()).map_err(|e| {
+            ExecutionError::Execution(format!("Failed to create artifact store: {}", e))
+        })?;
+
     // 6. Execute jobs according to the plan
     let mut results = Vec::new();
     let mut has_failures = false;
@@ -173,6 +179,7 @@ async fn execute_github_workflow(
             Some(&secret_masker),
             &all_job_outputs,
             &all_job_results,
+            &artifact_store,
         )
         .await?;
 
@@ -312,6 +319,12 @@ async fn execute_gitlab_pipeline(
 
     let secret_masker = SecretMasker::new();
 
+    // Create artifact store for this pipeline run
+    let artifact_store =
+        crate::artifacts::ArtifactStore::new(workspace_dir.path()).map_err(|e| {
+            ExecutionError::Execution(format!("Failed to create artifact store: {}", e))
+        })?;
+
     // 7. Execute jobs according to the plan
     let mut results = Vec::new();
     let mut has_failures = false;
@@ -329,6 +342,7 @@ async fn execute_gitlab_pipeline(
             Some(&secret_masker),
             &HashMap::new(),
             &HashMap::new(),
+            &artifact_store,
         )
         .await?;
 
@@ -1624,6 +1638,7 @@ async fn execute_job_batch(
     secret_masker: Option<&SecretMasker>,
     all_job_outputs: &HashMap<String, HashMap<String, String>>,
     all_job_results: &HashMap<String, String>,
+    artifact_store: &crate::artifacts::ArtifactStore,
 ) -> Result<Vec<JobResult>, ExecutionError> {
     // Execute jobs in parallel
     let futures = jobs.iter().map(|job_name| {
@@ -1637,6 +1652,7 @@ async fn execute_job_batch(
             secret_masker,
             all_job_outputs,
             all_job_results,
+            artifact_store,
         )
     });
 
@@ -1665,6 +1681,7 @@ struct JobExecutionContext<'a> {
     secret_masker: Option<&'a SecretMasker>,
     needs_context: &'a HashMap<String, HashMap<String, String>>,
     needs_results: &'a HashMap<String, String>,
+    artifact_store: &'a crate::artifacts::ArtifactStore,
 }
 
 /// Execute a job, expanding matrix if present
@@ -1679,6 +1696,7 @@ async fn execute_job_with_matrix(
     secret_masker: Option<&SecretMasker>,
     all_job_outputs: &HashMap<String, HashMap<String, String>>,
     all_job_results: &HashMap<String, String>,
+    artifact_store: &crate::artifacts::ArtifactStore,
 ) -> Result<Vec<JobResult>, ExecutionError> {
     // Get the job definition
     let job = workflow.jobs.get(job_name).ok_or_else(|| {
@@ -1760,6 +1778,7 @@ async fn execute_job_with_matrix(
             secrets_context: &secrets_context,
             needs_context: &needs_ctx,
             needs_results: &needs_res,
+            artifact_store,
         })
         .await
     } else {
@@ -1774,6 +1793,7 @@ async fn execute_job_with_matrix(
             secret_masker,
             needs_context: &needs_ctx,
             needs_results: &needs_res,
+            artifact_store,
         };
         let result = execute_job(ctx).await?;
         Ok(vec![result])
@@ -1882,6 +1902,7 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
                     secrets_context: &secrets_context,
                     needs_context: ctx.needs_context,
                     needs_results: ctx.needs_results,
+                    artifact_store: ctx.artifact_store,
                 },
             ),
         )
@@ -1931,9 +1952,17 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
                     ));
                 }
 
+                // Parse deprecated ::set-output:: and other workflow commands from stdout
+                process_workflow_commands(
+                    &result.output,
+                    step.id.as_deref(),
+                    &mut step_outputs_map,
+                );
+
                 step_results.push(result);
 
                 // Read back environment files and apply to job state
+                // (GITHUB_OUTPUT file values override deprecated ::set-output:: commands)
                 crate::github_env_files::apply_step_environment_updates(
                     &mut job_env,
                     &mut step_outputs_map,
@@ -1982,6 +2011,7 @@ struct MatrixExecutionContext<'a> {
     secrets_context: &'a HashMap<String, String>,
     needs_context: &'a HashMap<String, HashMap<String, String>>,
     needs_results: &'a HashMap<String, String>,
+    artifact_store: &'a crate::artifacts::ArtifactStore,
 }
 
 /// Execute a set of matrix combinations
@@ -2026,6 +2056,7 @@ async fn execute_matrix_combinations(
                 ctx.secrets_context,
                 ctx.needs_context,
                 ctx.needs_results,
+                ctx.artifact_store,
             )
         });
 
@@ -2071,6 +2102,7 @@ async fn execute_matrix_job(
     secrets_context: &HashMap<String, String>,
     needs_context: &HashMap<String, HashMap<String, String>>,
     needs_results: &HashMap<String, String>,
+    artifact_store: &crate::artifacts::ArtifactStore,
 ) -> Result<JobResult, ExecutionError> {
     // Create the matrix-specific job name
     let matrix_job_name = wrkflw_matrix::format_combination_name(job_name, combination);
@@ -2155,6 +2187,7 @@ async fn execute_matrix_job(
                         secrets_context,
                         needs_context,
                         needs_results,
+                        artifact_store,
                     },
                 ),
             )
@@ -2201,6 +2234,13 @@ async fn execute_matrix_job(
                         job_logs.push('\n');
                         job_logs.push('\n');
                     }
+
+                    // Parse deprecated ::set-output:: and other workflow commands from stdout
+                    process_workflow_commands(
+                        &result.output,
+                        step.id.as_deref(),
+                        &mut step_outputs_map,
+                    );
 
                     step_results.push(result);
 
@@ -2265,6 +2305,76 @@ fn record_step_status(
     }
     if result.conclusion == StepStatus::Failure {
         *job_status_str = "failure".to_string();
+    }
+}
+
+/// Parse workflow commands from step output and apply their effects.
+///
+/// Handles the deprecated `::set-output::` command (populates `step_outputs_map`),
+/// annotation commands (`::error::`, `::warning::`, `::notice::`, `::debug::`),
+/// and `::add-mask::` (logged for now; full masker integration deferred).
+fn process_workflow_commands(
+    output: &str,
+    step_id: Option<&str>,
+    step_outputs_map: &mut HashMap<String, HashMap<String, String>>,
+) {
+    let commands = crate::workflow_commands::parse_workflow_commands(output);
+    for cmd in commands {
+        match cmd {
+            crate::workflow_commands::WorkflowCommand::SetOutput { name, value } => {
+                if let Some(id) = step_id {
+                    step_outputs_map
+                        .entry(id.to_string())
+                        .or_default()
+                        .insert(name, value);
+                }
+            }
+            crate::workflow_commands::WorkflowCommand::Error {
+                message,
+                file,
+                line,
+                col,
+            } => {
+                let loc = format_annotation_location(file.as_deref(), line, col);
+                wrkflw_logging::error(&format!("{}{}", loc, message));
+            }
+            crate::workflow_commands::WorkflowCommand::Warning {
+                message,
+                file,
+                line,
+                col,
+            } => {
+                let loc = format_annotation_location(file.as_deref(), line, col);
+                wrkflw_logging::warning(&format!("{}{}", loc, message));
+            }
+            crate::workflow_commands::WorkflowCommand::Notice {
+                message,
+                file,
+                line,
+                col,
+            } => {
+                let loc = format_annotation_location(file.as_deref(), line, col);
+                wrkflw_logging::info(&format!("{}{}", loc, message));
+            }
+            crate::workflow_commands::WorkflowCommand::Debug { message } => {
+                wrkflw_logging::debug(&format!("[debug] {}", message));
+            }
+            crate::workflow_commands::WorkflowCommand::AddMask { .. } => {
+                // Full SecretMasker integration deferred (requires Arc<Mutex<>> wrapping)
+                wrkflw_logging::debug("::add-mask:: requested (value redacted)");
+            }
+            // Group, EndGroup, SaveState — no-ops for now
+            _ => {}
+        }
+    }
+}
+
+fn format_annotation_location(file: Option<&str>, line: Option<u32>, col: Option<u32>) -> String {
+    match (file, line, col) {
+        (Some(f), Some(l), Some(c)) => format!("{}:{}:{}: ", f, l, c),
+        (Some(f), Some(l), None) => format!("{}:{}: ", f, l),
+        (Some(f), None, None) => format!("{}: ", f),
+        _ => String::new(),
     }
 }
 
@@ -2405,7 +2515,6 @@ struct StepExecutionContext<'a> {
     #[allow(dead_code)]
     matrix_combination: &'a Option<HashMap<String, Value>>,
     secret_manager: Option<&'a SecretManager>,
-    #[allow(dead_code)] // Planned for future implementation
     secret_masker: Option<&'a SecretMasker>,
     container_config: Option<&'a JobContainer>,
     workflow_defaults: Option<&'a workflow::Defaults>,
@@ -2416,6 +2525,23 @@ struct StepExecutionContext<'a> {
     secrets_context: &'a HashMap<String, String>,
     needs_context: &'a HashMap<String, HashMap<String, String>>,
     needs_results: &'a HashMap<String, String>,
+    artifact_store: &'a crate::artifacts::ArtifactStore,
+}
+
+/// Resolve `${{ }}` expressions in an action `with` parameter value.
+fn preprocess_with_value(value: &str, ctx: &StepExecutionContext<'_>) -> String {
+    let expr_ctx = crate::expression::ExpressionContext {
+        env_context: ctx.job_env,
+        step_outputs: ctx.step_outputs,
+        matrix_combination: ctx.matrix_combination,
+        step_statuses: ctx.step_statuses,
+        job_status: ctx.job_status,
+        secrets_context: ctx.secrets_context,
+        needs_context: ctx.needs_context,
+        needs_results: ctx.needs_results,
+    };
+    crate::substitution::preprocess_expressions(value, ctx.working_dir, &expr_ctx)
+        .unwrap_or_else(|_| value.to_string())
 }
 
 async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, ExecutionError> {
@@ -2516,6 +2642,197 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
             }
 
             StepResult::new(step_name, StepStatus::Success, output)
+        } else if uses.starts_with("actions/upload-artifact") {
+            // Emulate actions/upload-artifact locally
+            let with = ctx.step.with.as_ref();
+            let name = with
+                .and_then(|w| w.get("name"))
+                .map(|s| preprocess_with_value(s, &ctx))
+                .unwrap_or_else(|| "artifact".to_string());
+            let path_pattern = with
+                .and_then(|w| w.get("path"))
+                .map(|s| preprocess_with_value(s, &ctx))
+                .unwrap_or_default();
+
+            if path_pattern.is_empty() {
+                return Ok(StepResult::new(
+                    step_name,
+                    StepStatus::Failure,
+                    "Required input 'path' not provided for upload-artifact".to_string(),
+                ));
+            }
+
+            match ctx
+                .artifact_store
+                .upload(&name, &path_pattern, ctx.working_dir)
+                .await
+            {
+                Ok(count) => {
+                    wrkflw_logging::info(&format!(
+                        "  Uploaded artifact '{}': {} file(s)",
+                        name, count
+                    ));
+                    StepResult::new(
+                        step_name,
+                        StepStatus::Success,
+                        format!("Uploaded artifact '{}': {} file(s)", name, count),
+                    )
+                }
+                Err(e) => StepResult::new(
+                    step_name,
+                    StepStatus::Failure,
+                    format!("Failed to upload artifact '{}': {}", name, e),
+                ),
+            }
+        } else if uses.starts_with("actions/download-artifact") {
+            // Emulate actions/download-artifact locally
+            let with = ctx.step.with.as_ref();
+            let name = with
+                .and_then(|w| w.get("name"))
+                .map(|s| preprocess_with_value(s, &ctx))
+                .unwrap_or_default();
+            let download_path = with
+                .and_then(|w| w.get("path"))
+                .map(|s| ctx.working_dir.join(preprocess_with_value(s, &ctx)))
+                .unwrap_or_else(|| ctx.working_dir.to_path_buf());
+
+            if name.is_empty() {
+                // Download all artifacts into named subdirectories
+                let names = ctx.artifact_store.list().await;
+                let mut total = 0;
+                for artifact_name in &names {
+                    let target = download_path.join(artifact_name);
+                    match ctx.artifact_store.download(artifact_name, &target).await {
+                        Ok(c) => total += c,
+                        Err(e) => {
+                            return Ok(StepResult::new(
+                                step_name,
+                                StepStatus::Failure,
+                                format!("Failed to download artifact '{}': {}", artifact_name, e),
+                            ));
+                        }
+                    }
+                }
+                wrkflw_logging::info(&format!(
+                    "  Downloaded {} artifact(s), {} file(s) total",
+                    names.len(),
+                    total
+                ));
+                StepResult::new(
+                    step_name,
+                    StepStatus::Success,
+                    format!(
+                        "Downloaded {} artifact(s), {} file(s) total",
+                        names.len(),
+                        total
+                    ),
+                )
+            } else {
+                match ctx.artifact_store.download(&name, &download_path).await {
+                    Ok(count) => {
+                        wrkflw_logging::info(&format!(
+                            "  Downloaded artifact '{}': {} file(s)",
+                            name, count
+                        ));
+                        StepResult::new(
+                            step_name,
+                            StepStatus::Success,
+                            format!("Downloaded artifact '{}': {} file(s)", name, count),
+                        )
+                    }
+                    Err(e) => StepResult::new(
+                        step_name,
+                        StepStatus::Failure,
+                        format!("Failed to download artifact '{}': {}", name, e),
+                    ),
+                }
+            }
+        } else if uses.starts_with("actions/cache") {
+            // Emulate actions/cache locally
+            let with = ctx.step.with.as_ref();
+            let key = with
+                .and_then(|w| w.get("key"))
+                .map(|s| preprocess_with_value(s, &ctx))
+                .unwrap_or_default();
+            let cache_path = with
+                .and_then(|w| w.get("path"))
+                .map(|s| preprocess_with_value(s, &ctx))
+                .unwrap_or_default();
+            let restore_keys: Vec<String> = with
+                .and_then(|w| w.get("restore-keys"))
+                .map(|s| preprocess_with_value(s, &ctx))
+                .map(|s| {
+                    s.lines()
+                        .map(|l| l.trim().to_string())
+                        .filter(|l| !l.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            if key.is_empty() || cache_path.is_empty() {
+                return Ok(StepResult::new(
+                    step_name,
+                    StepStatus::Failure,
+                    "Required inputs 'key' and 'path' not provided for actions/cache".to_string(),
+                ));
+            }
+
+            match crate::cache::CacheStore::new() {
+                Ok(store) => {
+                    let cache_hit =
+                        store.restore(&key, &restore_keys, &cache_path, ctx.working_dir);
+
+                    // Write cache-hit output to GITHUB_OUTPUT file
+                    if let Some(output_path) = ctx.job_env.get("GITHUB_OUTPUT") {
+                        let hit_val = if cache_hit.is_some() { "true" } else { "false" };
+                        let _ = std::fs::OpenOptions::new()
+                            .append(true)
+                            .open(output_path)
+                            .and_then(|mut f| {
+                                use std::io::Write;
+                                writeln!(f, "cache-hit={}", hit_val)
+                            });
+                    }
+
+                    match &cache_hit {
+                        Some(matched_key) => {
+                            wrkflw_logging::info(&format!(
+                                "  Cache restored (key: {})",
+                                matched_key
+                            ));
+                            StepResult::new(
+                                step_name,
+                                StepStatus::Success,
+                                format!("Cache restored (key: {})", matched_key),
+                            )
+                        }
+                        None => {
+                            // No cache hit — try to save current path for future runs
+                            let msg = match store.save(&key, &cache_path, ctx.working_dir) {
+                                Ok(()) => {
+                                    format!(
+                                        "Cache miss. Saved path '{}' with key '{}'",
+                                        cache_path, key
+                                    )
+                                }
+                                Err(_) => {
+                                    format!(
+                                        "Cache miss. Path '{}' does not exist yet (will be available on next run)",
+                                        cache_path
+                                    )
+                                }
+                            };
+                            wrkflw_logging::info(&format!("  {}", msg));
+                            StepResult::new(step_name, StepStatus::Success, msg)
+                        }
+                    }
+                }
+                Err(e) => StepResult::new(
+                    step_name,
+                    StepStatus::Failure,
+                    format!("Failed to initialize cache: {}", e),
+                ),
+            }
         } else {
             // Get action info
             let prepared = prepare_action(&action_info, ctx.runtime).await?;
@@ -2538,6 +2855,7 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                             ctx.secrets_context,
                             ctx.needs_context,
                             ctx.needs_results,
+                            ctx.artifact_store,
                         )
                         .await?
                     } else {
@@ -2596,6 +2914,7 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                             ctx.secrets_context,
                             ctx.needs_context,
                             ctx.needs_results,
+                            ctx.artifact_store,
                         )
                         .await?
                     }
@@ -3752,6 +4071,10 @@ async fn execute_reusable_workflow_job(
             let plan = dependency::resolve_dependencies(&called)?;
             let mut all_results = Vec::new();
             let mut any_failed = false;
+            let reusable_artifact_store = crate::artifacts::ArtifactStore::new(Path::new("."))
+                .map_err(|e| {
+                    ExecutionError::Execution(format!("Failed to create artifact store: {}", e))
+                })?;
             for batch in plan {
                 let results = execute_job_batch(
                     &batch,
@@ -3763,6 +4086,7 @@ async fn execute_reusable_workflow_job(
                     None,
                     &HashMap::new(),
                     &HashMap::new(),
+                    &reusable_artifact_store,
                 )
                 .await?;
                 for r in &results {
@@ -3830,6 +4154,10 @@ async fn execute_reusable_workflow_job(
     let plan = dependency::resolve_dependencies(&called)?;
     let mut all_results = Vec::new();
     let mut any_failed = false;
+    let reusable_artifact_store =
+        crate::artifacts::ArtifactStore::new(Path::new(".")).map_err(|e| {
+            ExecutionError::Execution(format!("Failed to create artifact store: {}", e))
+        })?;
     for batch in plan {
         let results = execute_job_batch(
             &batch,
@@ -3841,6 +4169,7 @@ async fn execute_reusable_workflow_job(
             None,
             &HashMap::new(),
             &HashMap::new(),
+            &reusable_artifact_store,
         )
         .await?;
         for r in &results {
@@ -3949,6 +4278,7 @@ async fn execute_composite_action(
     secrets_context: &HashMap<String, String>,
     needs_context: &HashMap<String, HashMap<String, String>>,
     needs_results: &HashMap<String, String>,
+    artifact_store: &crate::artifacts::ArtifactStore,
 ) -> Result<StepResult, ExecutionError> {
     // Find the action definition file
     let action_yaml = action_path.join("action.yml");
@@ -4062,6 +4392,7 @@ async fn execute_composite_action(
                     secrets_context,
                     needs_context,
                     needs_results,
+                    artifact_store,
                 }))
                 .await?;
 
@@ -4071,6 +4402,13 @@ async fn execute_composite_action(
                     &step_result,
                     &mut composite_step_statuses,
                     &mut composite_job_status,
+                );
+
+                // Parse deprecated ::set-output:: and other workflow commands from stdout
+                process_workflow_commands(
+                    &step_result.output,
+                    composite_step.id.as_deref(),
+                    &mut composite_step_outputs,
                 );
 
                 // Add output to results
@@ -4427,6 +4765,12 @@ async fn resolve_secrets_for_context(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    lazy_static::lazy_static! {
+        static ref TEST_ARTIFACT_DIR: tempfile::TempDir = tempfile::tempdir().unwrap();
+        static ref TEST_ARTIFACT_STORE: crate::artifacts::ArtifactStore =
+            crate::artifacts::ArtifactStore::new(TEST_ARTIFACT_DIR.path()).unwrap();
+    }
 
     #[test]
     fn is_git_sha_recognizes_valid_sha1() {
@@ -5363,6 +5707,7 @@ runs:
             secrets_context: &HashMap::new(),
             needs_context: &HashMap::new(),
             needs_results: &HashMap::new(),
+            artifact_store: &TEST_ARTIFACT_STORE,
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -5417,6 +5762,7 @@ runs:
             secrets_context: &HashMap::new(),
             needs_context: &HashMap::new(),
             needs_results: &HashMap::new(),
+            artifact_store: &TEST_ARTIFACT_STORE,
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -5476,6 +5822,7 @@ runs:
             secrets_context: &HashMap::new(),
             needs_context: &HashMap::new(),
             needs_results: &HashMap::new(),
+            artifact_store: &TEST_ARTIFACT_STORE,
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -5528,6 +5875,7 @@ runs:
             secrets_context: &HashMap::new(),
             needs_context: &HashMap::new(),
             needs_results: &HashMap::new(),
+            artifact_store: &TEST_ARTIFACT_STORE,
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -5581,6 +5929,7 @@ runs:
             secrets_context: &HashMap::new(),
             needs_context: &HashMap::new(),
             needs_results: &HashMap::new(),
+            artifact_store: &TEST_ARTIFACT_STORE,
         };
 
         let result = execute_step(ctx).await;
@@ -5633,6 +5982,7 @@ runs:
             secrets_context: &HashMap::new(),
             needs_context: &HashMap::new(),
             needs_results: &HashMap::new(),
+            artifact_store: &TEST_ARTIFACT_STORE,
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -5683,6 +6033,7 @@ runs:
             secrets_context: &HashMap::new(),
             needs_context: &HashMap::new(),
             needs_results: &HashMap::new(),
+            artifact_store: &TEST_ARTIFACT_STORE,
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -6225,6 +6576,7 @@ runs:
             secrets_context: &HashMap::new(),
             needs_context: &HashMap::new(),
             needs_results: &HashMap::new(),
+            artifact_store: &TEST_ARTIFACT_STORE,
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -6275,6 +6627,7 @@ runs:
             secrets_context: &HashMap::new(),
             needs_context: &HashMap::new(),
             needs_results: &HashMap::new(),
+            artifact_store: &TEST_ARTIFACT_STORE,
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -6321,6 +6674,7 @@ runs:
             secrets_context: &HashMap::new(),
             needs_context: &HashMap::new(),
             needs_results: &HashMap::new(),
+            artifact_store: &TEST_ARTIFACT_STORE,
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -6359,6 +6713,7 @@ runs:
             secrets_context: &HashMap::new(),
             needs_context: &HashMap::new(),
             needs_results: &HashMap::new(),
+            artifact_store: &TEST_ARTIFACT_STORE,
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -6399,6 +6754,7 @@ runs:
             secrets_context: &HashMap::new(),
             needs_context: &HashMap::new(),
             needs_results: &HashMap::new(),
+            artifact_store: &TEST_ARTIFACT_STORE,
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -6450,6 +6806,7 @@ runs:
             secrets_context: &HashMap::new(),
             needs_context: &HashMap::new(),
             needs_results: &HashMap::new(),
+            artifact_store: &TEST_ARTIFACT_STORE,
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -6499,6 +6856,7 @@ runs:
             secrets_context: &HashMap::new(),
             needs_context: &HashMap::new(),
             needs_results: &HashMap::new(),
+            artifact_store: &TEST_ARTIFACT_STORE,
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -6548,6 +6906,7 @@ runs:
             secrets_context: &HashMap::new(),
             needs_context: &HashMap::new(),
             needs_results: &HashMap::new(),
+            artifact_store: &TEST_ARTIFACT_STORE,
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -6595,6 +6954,7 @@ runs:
             secrets_context: &HashMap::new(),
             needs_context: &HashMap::new(),
             needs_results: &HashMap::new(),
+            artifact_store: &TEST_ARTIFACT_STORE,
         };
 
         let result = execute_step(ctx).await.unwrap();

@@ -29,6 +29,7 @@ impl CacheStore {
     }
 
     /// Create a cache store at a custom root (for testing).
+    #[cfg(test)]
     pub fn with_root(root: PathBuf) -> std::io::Result<Self> {
         std::fs::create_dir_all(&root)?;
         Ok(Self { root })

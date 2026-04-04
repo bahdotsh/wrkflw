@@ -31,6 +31,7 @@ struct ArtifactMetadata {
 }
 
 /// Manages artifact storage for a single workflow run.
+#[derive(Clone)]
 pub struct ArtifactStore {
     root: PathBuf,
     index: Arc<RwLock<HashMap<String, ArtifactMetadata>>>,

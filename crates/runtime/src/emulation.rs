@@ -566,10 +566,8 @@ pub async fn handle_special_action(action: &str) -> Result<(), ContainerError> {
         // Git checkout action - this is handled implicitly by our workspace setup
         wrkflw_logging::info("🔄 Detected checkout action - workspace files are already prepared");
     } else if action.starts_with("actions/cache@") {
-        // Cache action - can't really emulate caching effectively
-        wrkflw_logging::info(
-            "🔄 Detected cache action - caching is not fully supported in emulation mode",
-        );
+        // Cache action — local cache emulation is handled by the executor
+        wrkflw_logging::info("🔄 Detected cache action - local cache emulation active");
     } else {
         // Generic action we don't have special handling for
         wrkflw_logging::info(&format!(

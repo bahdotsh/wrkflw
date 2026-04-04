@@ -132,6 +132,13 @@ impl CacheStore {
     }
 }
 
+/// Check whether any path component is literally `..`.
+fn has_dotdot_component(path: &str) -> bool {
+    Path::new(path)
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+}
+
 /// Validate that `path` (relative to `workspace`) does not escape the workspace via `..` etc.
 fn validate_cache_path(path: &str, workspace: &Path) -> bool {
     let joined = workspace.join(path);
@@ -146,13 +153,13 @@ fn validate_cache_path(path: &str, workspace: &Path) -> bool {
             parent
                 .canonicalize()
                 .map(|p| p.starts_with(&canonical_ws))
-                .unwrap_or_else(|_| !path.contains(".."))
+                .unwrap_or_else(|_| !has_dotdot_component(path))
         } else {
-            !path.contains("..")
+            !has_dotdot_component(path)
         }
     } else {
-        // Workspace itself can't be canonicalized — fall back to simple check
-        !path.contains("..")
+        // Workspace itself can't be canonicalized — fall back to component check
+        !has_dotdot_component(path)
     }
 }
 
@@ -285,5 +292,35 @@ mod tests {
             std::fs::read_to_string(workspace2.path().join("data/v1.txt")).unwrap(),
             "version2"
         );
+    }
+
+    #[test]
+    fn has_dotdot_rejects_traversal() {
+        assert!(has_dotdot_component("../etc/passwd"));
+        assert!(has_dotdot_component("foo/../../bar"));
+        assert!(has_dotdot_component(".."));
+    }
+
+    #[test]
+    fn has_dotdot_allows_similar_names() {
+        // "..bar" is a valid directory name, not a traversal component
+        assert!(!has_dotdot_component("foo/..bar/baz"));
+        assert!(!has_dotdot_component("..."));
+        assert!(!has_dotdot_component("node_modules"));
+    }
+
+    #[test]
+    fn validate_rejects_path_traversal() {
+        let workspace = tempdir().unwrap();
+        assert!(!validate_cache_path("../escape", workspace.path()));
+        assert!(!validate_cache_path("foo/../../escape", workspace.path()));
+    }
+
+    #[test]
+    fn validate_allows_normal_paths() {
+        let workspace = tempdir().unwrap();
+        assert!(validate_cache_path("node_modules", workspace.path()));
+        assert!(validate_cache_path("target/debug", workspace.path()));
+        assert!(validate_cache_path("..bar/baz", workspace.path()));
     }
 }

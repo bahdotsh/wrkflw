@@ -188,13 +188,25 @@ async fn execute_github_workflow(
         )
         .await?;
 
-        // Collect job outputs and results for downstream jobs' `needs.*` context
+        // Collect job outputs and results for downstream jobs' `needs.*` context.
+        // For matrix jobs, multiple combinations share the same canonical_name — the last
+        // combination to complete wins.  This matches GitHub Actions' behavior where matrix
+        // job outputs are non-deterministic when multiple combinations set the same key.
         for job_result in &job_results {
             let result_str = match job_result.status {
                 JobStatus::Success => "success",
                 JobStatus::Failure => "failure",
                 JobStatus::Skipped => "skipped",
             };
+            if all_job_outputs.contains_key(&job_result.canonical_name)
+                && job_result.name != job_result.canonical_name
+            {
+                wrkflw_logging::warning(&format!(
+                    "Matrix job '{}' overwrites outputs for '{}' — \
+                     needs.{}.outputs will reflect the last combination only",
+                    job_result.name, job_result.canonical_name, job_result.canonical_name,
+                ));
+            }
             all_job_results.insert(job_result.canonical_name.clone(), result_str.to_string());
             all_job_outputs.insert(
                 job_result.canonical_name.clone(),
@@ -1990,7 +2002,13 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
     }
 
     // Resolve job outputs from step outputs (GHA jobs.*.outputs map expressions to step outputs)
-    let job_outputs = resolve_job_outputs(job, &step_outputs_map, &job_env, &job_status_str);
+    let job_outputs = resolve_job_outputs(
+        job,
+        &step_outputs_map,
+        &step_status_map,
+        &job_env,
+        &job_status_str,
+    );
 
     Ok(JobResult {
         name: ctx.job_name.to_string(),
@@ -2156,6 +2174,7 @@ async fn execute_matrix_job(
     })?;
 
     let mut step_outputs_map: HashMap<String, HashMap<String, String>> = HashMap::new();
+    let mut step_status_map: HashMap<String, (String, String)> = HashMap::new();
     let mut job_status_str = "success".to_string();
     let job_success = if job_template.steps.is_empty() {
         wrkflw_logging::warning(&format!("Job '{}' has no steps", matrix_job_name));
@@ -2166,7 +2185,6 @@ async fn execute_matrix_job(
         let runner_image_value = resolve_runner_image(job_template, runtime).await?;
 
         let mut all_steps_ok = true;
-        let mut step_status_map: HashMap<String, (String, String)> = HashMap::new();
         let timeout_mins = sanitize_timeout_minutes(job_template.timeout_minutes, 360.0);
         let job_timeout = std::time::Duration::from_secs_f64(timeout_mins * 60.0);
         let job_deadline = tokio::time::Instant::now() + job_timeout;
@@ -2279,8 +2297,13 @@ async fn execute_matrix_job(
     };
 
     // Resolve job outputs from step outputs
-    let job_outputs =
-        resolve_job_outputs(job_template, &step_outputs_map, &job_env, &job_status_str);
+    let job_outputs = resolve_job_outputs(
+        job_template,
+        &step_outputs_map,
+        &step_status_map,
+        &job_env,
+        &job_status_str,
+    );
 
     // Return job result
     Ok(JobResult {
@@ -4077,17 +4100,12 @@ async fn execute_reusable_workflow_job(
                 }
             }
 
-            // Execute called workflow
+            // Execute called workflow, reusing parent's artifact/cache stores
             let plan = dependency::resolve_dependencies(&called)?;
             let mut all_results = Vec::new();
             let mut any_failed = false;
-            let reusable_artifact_store = crate::artifacts::ArtifactStore::new(Path::new("."))
-                .map_err(|e| {
-                    ExecutionError::Execution(format!("Failed to create artifact store: {}", e))
-                })?;
-            let reusable_cache_store = crate::cache::CacheStore::new().map_err(|e| {
-                ExecutionError::Execution(format!("Failed to create cache store: {}", e))
-            })?;
+            let mut reusable_job_outputs: HashMap<String, HashMap<String, String>> = HashMap::new();
+            let mut reusable_job_results: HashMap<String, String> = HashMap::new();
             for batch in plan {
                 let results = execute_job_batch(
                     &batch,
@@ -4097,16 +4115,23 @@ async fn execute_reusable_workflow_job(
                     ctx.verbose,
                     None,
                     None,
-                    &HashMap::new(),
-                    &HashMap::new(),
-                    &reusable_artifact_store,
-                    &reusable_cache_store,
+                    &reusable_job_outputs,
+                    &reusable_job_results,
+                    ctx.artifact_store,
+                    ctx.cache_store,
                 )
                 .await?;
                 for r in &results {
                     if r.status == JobStatus::Failure {
                         any_failed = true;
                     }
+                    let result_str = match r.status {
+                        JobStatus::Success => "success",
+                        JobStatus::Failure => "failure",
+                        JobStatus::Skipped => "skipped",
+                    };
+                    reusable_job_results.insert(r.canonical_name.clone(), result_str.to_string());
+                    reusable_job_outputs.insert(r.canonical_name.clone(), r.outputs.clone());
                 }
                 all_results.extend(results);
             }
@@ -4164,16 +4189,12 @@ async fn execute_reusable_workflow_job(
         }
     }
 
-    // Execute called workflow
+    // Execute called workflow, reusing parent's artifact/cache stores
     let plan = dependency::resolve_dependencies(&called)?;
     let mut all_results = Vec::new();
     let mut any_failed = false;
-    let reusable_artifact_store =
-        crate::artifacts::ArtifactStore::new(Path::new(".")).map_err(|e| {
-            ExecutionError::Execution(format!("Failed to create artifact store: {}", e))
-        })?;
-    let reusable_cache_store = crate::cache::CacheStore::new()
-        .map_err(|e| ExecutionError::Execution(format!("Failed to create cache store: {}", e)))?;
+    let mut reusable_job_outputs: HashMap<String, HashMap<String, String>> = HashMap::new();
+    let mut reusable_job_results: HashMap<String, String> = HashMap::new();
     for batch in plan {
         let results = execute_job_batch(
             &batch,
@@ -4183,16 +4204,23 @@ async fn execute_reusable_workflow_job(
             ctx.verbose,
             None,
             None,
-            &HashMap::new(),
-            &HashMap::new(),
-            &reusable_artifact_store,
-            &reusable_cache_store,
+            &reusable_job_outputs,
+            &reusable_job_results,
+            ctx.artifact_store,
+            ctx.cache_store,
         )
         .await?;
         for r in &results {
             if r.status == JobStatus::Failure {
                 any_failed = true;
             }
+            let result_str = match r.status {
+                JobStatus::Success => "success",
+                JobStatus::Failure => "failure",
+                JobStatus::Skipped => "skipped",
+            };
+            reusable_job_results.insert(r.canonical_name.clone(), result_str.to_string());
+            reusable_job_outputs.insert(r.canonical_name.clone(), r.outputs.clone());
         }
         all_results.extend(results);
     }
@@ -4675,6 +4703,7 @@ fn build_needs_context(
 fn resolve_job_outputs(
     job: &Job,
     step_outputs_map: &HashMap<String, HashMap<String, String>>,
+    step_status_map: &HashMap<String, (String, String)>,
     env_context: &HashMap<String, String>,
     job_status: &str,
 ) -> HashMap<String, String> {
@@ -4684,7 +4713,7 @@ fn resolve_job_outputs(
             env_context,
             step_outputs: step_outputs_map,
             matrix_combination: &None,
-            step_statuses: &HashMap::new(),
+            step_statuses: step_status_map,
             job_status,
             secrets_context: &HashMap::new(),
             needs_context: &HashMap::new(),

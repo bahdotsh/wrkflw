@@ -180,7 +180,6 @@ pub mod prelude {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use uuid;
 
     #[tokio::test]
     async fn test_basic_secret_management() {

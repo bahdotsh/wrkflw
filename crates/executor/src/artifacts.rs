@@ -9,6 +9,28 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+/// Sanitize an artifact name to prevent path traversal.
+///
+/// Rejects names containing path separators or `..` components and strips
+/// null bytes. Returns an error if the name is invalid.
+fn sanitize_artifact_name(name: &str) -> Result<String, String> {
+    if name.is_empty() {
+        return Err("Artifact name cannot be empty".to_string());
+    }
+    let sanitized = name.replace('\0', "");
+    if sanitized.contains('/')
+        || sanitized.contains('\\')
+        || sanitized.contains("..")
+        || sanitized.starts_with('.')
+    {
+        return Err(format!(
+            "Invalid artifact name '{}': must not contain path separators, '..', or start with '.'",
+            name
+        ));
+    }
+    Ok(sanitized)
+}
+
 /// Recursively collect all regular files under `dir`, skipping symlinks.
 fn walk_files(dir: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
@@ -62,55 +84,69 @@ impl ArtifactStore {
         path_pattern: &str,
         workspace: &Path,
     ) -> Result<usize, String> {
-        let artifact_dir = self.root.join(name);
-        std::fs::create_dir_all(&artifact_dir)
-            .map_err(|e| format!("Failed to create artifact directory: {}", e))?;
+        let safe_name = sanitize_artifact_name(name)?;
+        let artifact_dir = self.root.join(&safe_name);
+        let workspace = workspace.to_path_buf();
+        let pattern = path_pattern.to_string();
 
-        let canonical_workspace = workspace
-            .canonicalize()
-            .map_err(|e| format!("Failed to canonicalize workspace: {}", e))?;
-        let full_pattern = workspace.join(path_pattern).to_string_lossy().to_string();
-        let entries: Vec<PathBuf> = glob::glob(&full_pattern)
-            .map_err(|e| format!("Invalid glob pattern '{}': {}", path_pattern, e))?
-            .filter_map(|e| e.ok())
-            .filter(|p| p.is_file() && !p.is_symlink())
-            // Ensure matched files are within the workspace (prevent path traversal)
-            .filter(|p| {
-                p.canonicalize()
-                    .map(|c| c.starts_with(&canonical_workspace))
-                    .unwrap_or(false)
-            })
-            .collect();
+        let ad = artifact_dir.clone();
+        let ws = workspace.clone();
+        let count = tokio::task::spawn_blocking(move || -> Result<usize, String> {
+            std::fs::create_dir_all(&ad)
+                .map_err(|e| format!("Failed to create artifact directory: {}", e))?;
 
-        if entries.is_empty() {
-            return Err(format!(
-                "No files found matching pattern '{}' in {}",
-                path_pattern,
-                workspace.display()
-            ));
-        }
+            let canonical_workspace = ws
+                .canonicalize()
+                .map_err(|e| format!("Failed to canonicalize workspace: {}", e))?;
+            let full_pattern = ws.join(&pattern).to_string_lossy().to_string();
+            let entries: Vec<PathBuf> = glob::glob(&full_pattern)
+                .map_err(|e| format!("Invalid glob pattern '{}': {}", pattern, e))?
+                .filter_map(|e| e.ok())
+                .filter(|p| p.is_file() && !p.is_symlink())
+                // Ensure matched files are within the workspace (prevent path traversal)
+                .filter(|p| {
+                    p.canonicalize()
+                        .map(|c| c.starts_with(&canonical_workspace))
+                        .unwrap_or(false)
+                })
+                .collect();
 
-        let mut count = 0;
-        for entry in &entries {
-            let rel = entry.strip_prefix(workspace).map_err(|_| {
-                format!(
-                    "File '{}' is not within workspace '{}'",
-                    entry.display(),
-                    workspace.display()
-                )
-            })?;
-            let dest = artifact_dir.join(rel);
-            if let Some(parent) = dest.parent() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|e| format!("Failed to create directory: {}", e))?;
+            if entries.is_empty() {
+                return Err(format!(
+                    "No files found matching pattern '{}' in {}",
+                    pattern,
+                    ws.display()
+                ));
             }
-            std::fs::copy(entry, &dest)
-                .map_err(|e| format!("Failed to copy '{}': {}", entry.display(), e))?;
-            count += 1;
-        }
+
+            let mut count = 0;
+            for entry in &entries {
+                let rel = entry.strip_prefix(&ws).map_err(|_| {
+                    format!(
+                        "File '{}' is not within workspace '{}'",
+                        entry.display(),
+                        ws.display()
+                    )
+                })?;
+                let dest = ad.join(rel);
+                if let Some(parent) = dest.parent() {
+                    std::fs::create_dir_all(parent)
+                        .map_err(|e| format!("Failed to create directory: {}", e))?;
+                }
+                std::fs::copy(entry, &dest)
+                    .map_err(|e| format!("Failed to copy '{}': {}", entry.display(), e))?;
+                count += 1;
+            }
+            Ok(count)
+        })
+        .await
+        .map_err(|e| format!("Upload task panicked: {}", e))??;
 
         let mut idx = self.index.write().await;
-        idx.insert(name.to_string(), ArtifactMetadata { path: artifact_dir });
+        idx.insert(
+            safe_name.to_string(),
+            ArtifactMetadata { path: artifact_dir },
+        );
 
         Ok(count)
     }
@@ -119,27 +155,33 @@ impl ArtifactStore {
     ///
     /// Returns the number of files downloaded.
     pub async fn download(&self, name: &str, target_dir: &Path) -> Result<usize, String> {
+        let safe_name = sanitize_artifact_name(name)?;
         let idx = self.index.read().await;
         let meta = idx
-            .get(name)
+            .get(&safe_name)
             .ok_or_else(|| format!("Artifact '{}' not found", name))?;
 
-        let artifact_dir = &meta.path;
-        let mut count = 0;
+        let artifact_dir = meta.path.clone();
+        let target = target_dir.to_path_buf();
+        drop(idx);
 
-        for file_path in walk_files(artifact_dir) {
-            let rel = file_path.strip_prefix(artifact_dir).unwrap_or(&file_path);
-            let dest = target_dir.join(rel);
-            if let Some(parent) = dest.parent() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|e| format!("Failed to create directory: {}", e))?;
+        tokio::task::spawn_blocking(move || -> Result<usize, String> {
+            let mut count = 0;
+            for file_path in walk_files(&artifact_dir) {
+                let rel = file_path.strip_prefix(&artifact_dir).unwrap_or(&file_path);
+                let dest = target.join(rel);
+                if let Some(parent) = dest.parent() {
+                    std::fs::create_dir_all(parent)
+                        .map_err(|e| format!("Failed to create directory: {}", e))?;
+                }
+                std::fs::copy(&file_path, &dest)
+                    .map_err(|e| format!("Failed to copy '{}': {}", file_path.display(), e))?;
+                count += 1;
             }
-            std::fs::copy(&file_path, &dest)
-                .map_err(|e| format!("Failed to copy '{}': {}", file_path.display(), e))?;
-            count += 1;
-        }
-
-        Ok(count)
+            Ok(count)
+        })
+        .await
+        .map_err(|e| format!("Download task panicked: {}", e))?
     }
 
     /// List all available artifact names.
@@ -214,5 +256,27 @@ mod tests {
             .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("No files found"));
+    }
+
+    #[tokio::test]
+    async fn rejects_path_traversal_in_artifact_name() {
+        let run_dir = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        std::fs::write(workspace.path().join("f.txt"), "data").unwrap();
+        let store = ArtifactStore::new(run_dir.path()).unwrap();
+
+        let result = store
+            .upload("../../escape", "*.txt", workspace.path())
+            .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Invalid artifact name"));
+
+        let result = store.upload("foo/bar", "*.txt", workspace.path()).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Invalid artifact name"));
+
+        let result = store.download("../escape", workspace.path()).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Invalid artifact name"));
     }
 }

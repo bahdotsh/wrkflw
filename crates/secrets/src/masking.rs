@@ -73,9 +73,12 @@ impl SecretMasker {
             let masked = self.create_mask(&secret);
             self.secret_cache
                 .write()
-                .unwrap()
+                .unwrap_or_else(|e| e.into_inner())
                 .insert(secret.clone(), masked);
-            self.secrets.write().unwrap().insert(secret);
+            self.secrets
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(secret);
         }
     }
 
@@ -88,22 +91,34 @@ impl SecretMasker {
 
     /// Remove a secret from masking
     pub fn remove_secret(&self, secret: &str) {
-        self.secrets.write().unwrap().remove(secret);
-        self.secret_cache.write().unwrap().remove(secret);
+        self.secrets
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(secret);
+        self.secret_cache
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(secret);
     }
 
     /// Clear all secrets
     pub fn clear(&self) {
-        self.secrets.write().unwrap().clear();
-        self.secret_cache.write().unwrap().clear();
+        self.secrets
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.secret_cache
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 
     /// Mask secrets in the given text
     pub fn mask(&self, text: &str) -> String {
         let mut result = text.to_string();
 
-        let secrets = self.secrets.read().unwrap();
-        let cache = self.secret_cache.read().unwrap();
+        let secrets = self.secrets.read().unwrap_or_else(|e| e.into_inner());
+        let cache = self.secret_cache.read().unwrap_or_else(|e| e.into_inner());
 
         // Use cached masked versions for better performance
         for secret in secrets.iter() {
@@ -196,7 +211,7 @@ impl SecretMasker {
 
     /// Check if text contains any secrets
     pub fn contains_secrets(&self, text: &str) -> bool {
-        let secrets = self.secrets.read().unwrap();
+        let secrets = self.secrets.read().unwrap_or_else(|e| e.into_inner());
         for secret in secrets.iter() {
             if text.contains(secret) {
                 return true;
@@ -221,12 +236,15 @@ impl SecretMasker {
 
     /// Get the number of secrets being tracked
     pub fn secret_count(&self) -> usize {
-        self.secrets.read().unwrap().len()
+        self.secrets.read().unwrap_or_else(|e| e.into_inner()).len()
     }
 
     /// Check if a specific secret is being tracked
     pub fn has_secret(&self, secret: &str) -> bool {
-        self.secrets.read().unwrap().contains(secret)
+        self.secrets
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(secret)
     }
 }
 

@@ -2264,14 +2264,14 @@ impl StepLoopState {
         secret_masker: Option<&SecretMasker>,
     ) -> bool {
         match outcome {
-            StepOutcome::Skipped(ref result) => {
+            StepOutcome::Skipped(result) => {
                 record_step_status(
                     step.id.as_deref(),
-                    result,
+                    &result,
                     &mut self.step_status_map,
                     &mut self.job_status_str,
                 );
-                self.step_results.push(result.clone());
+                self.step_results.push(result);
                 false
             }
             StepOutcome::Completed { result, abort_job } => {

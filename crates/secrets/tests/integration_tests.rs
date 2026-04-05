@@ -6,7 +6,6 @@
 use std::collections::HashMap;
 use std::process;
 use tempfile::TempDir;
-use tokio;
 use wrkflw_secrets::{
     SecretConfig, SecretManager, SecretMasker, SecretProviderConfig, SecretSubstitution,
 };
@@ -174,11 +173,13 @@ async fn test_rate_limiting() {
     use wrkflw_secrets::rate_limit::RateLimitConfig;
 
     // Create config with very low rate limit
-    let mut config = SecretConfig::default();
-    config.rate_limit = RateLimitConfig {
-        max_requests: 2,
-        window_duration: Duration::from_secs(10),
-        enabled: true,
+    let config = SecretConfig {
+        rate_limit: RateLimitConfig {
+            max_requests: 2,
+            window_duration: Duration::from_secs(10),
+            enabled: true,
+        },
+        ..SecretConfig::default()
     };
 
     let manager = SecretManager::new(config).await.unwrap();
@@ -233,9 +234,9 @@ async fn test_concurrent_access() {
     let mut successful_requests = 0;
     for handle in handles {
         let (_, result) = handle.await.unwrap();
-        if result.is_ok() {
+        if let Ok(secret) = result {
             successful_requests += 1;
-            assert_eq!(result.unwrap().value(), "concurrent_test_value");
+            assert_eq!(secret.value(), "concurrent_test_value");
         }
     }
 
@@ -269,7 +270,7 @@ async fn test_substitution_edge_cases() {
 
     // Test 2: Nested-like patterns (should not be substituted)
     let input = "This is not a secret: ${ secrets.FAKE }";
-    let output = substitution.substitute(&input).await.unwrap();
+    let output = substitution.substitute(input).await.unwrap();
     assert_eq!(input, output); // Should remain unchanged
 
     // Test 3: Mixed valid and invalid references

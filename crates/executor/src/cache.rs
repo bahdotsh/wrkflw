@@ -127,18 +127,29 @@ impl CacheStore {
         self.root.join(hash)
     }
 
-    /// Find a cached key that starts with the given prefix.
+    /// Find the most recently modified cached key that starts with the given prefix.
+    ///
+    /// When multiple entries match, the one with the newest modification time wins,
+    /// matching GitHub Actions' behavior of preferring the most recently created key.
     fn find_by_prefix(&self, prefix: &str) -> Option<String> {
         let entries = std::fs::read_dir(&self.root).ok()?;
+        let mut best: Option<(String, std::time::SystemTime)> = None;
         for entry in entries.flatten() {
-            let meta_path = entry.path().join(".cache_key");
+            let path = entry.path();
+            let meta_path = path.join(".cache_key");
             if let Ok(stored_key) = std::fs::read_to_string(&meta_path) {
                 if stored_key.starts_with(prefix) {
-                    return Some(stored_key);
+                    let mtime = entry
+                        .metadata()
+                        .and_then(|m| m.modified())
+                        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                    if best.as_ref().is_none_or(|(_, t)| mtime > *t) {
+                        best = Some((stored_key, mtime));
+                    }
                 }
             }
         }
-        None
+        best.map(|(key, _)| key)
     }
 
     /// Evict oldest cache entries until the total size is under `MAX_CACHE_SIZE_BYTES`.

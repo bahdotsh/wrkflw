@@ -40,7 +40,7 @@
 //!     println!("Resolved: {}", resolved);
 //!     
 //!     // Set up secret masking
-//!     let mut masker = SecretMasker::new();
+//!     let masker = SecretMasker::new();
 //!     masker.add_secret("secret_api_token_123");
 //!     
 //!     let log_message = "Failed to authenticate with token: secret_api_token_123";
@@ -233,7 +233,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_secret_masking() {
-        let mut masker = SecretMasker::new();
+        let masker = SecretMasker::new();
         masker.add_secret("secret123");
         masker.add_secret("password456");
 

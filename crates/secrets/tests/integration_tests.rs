@@ -99,7 +99,7 @@ async fn test_end_to_end_secret_workflow() {
     assert!(output.contains("ghp_1234567890abcdefghijklmnopqrstuvwxyz"));
 
     // Test 5: Secret masking
-    let mut masker = SecretMasker::new();
+    let masker = SecretMasker::new();
     masker.add_secret("super_secret_db_pass_123");
     masker.add_secret("ghp_1234567890abcdefghijklmnopqrstuvwxyz");
 
@@ -297,7 +297,7 @@ async fn test_substitution_edge_cases() {
 /// Test masking comprehensive patterns
 #[tokio::test]
 async fn test_comprehensive_masking() {
-    let mut masker = SecretMasker::new();
+    let masker = SecretMasker::new();
 
     // Add various types of secrets
     masker.add_secret("password123");

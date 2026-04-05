@@ -7,7 +7,7 @@ use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use wrkflw_secrets::SecretMasker;
 
 fn bench_basic_masking(c: &mut Criterion) {
-    let mut masker = SecretMasker::new();
+    let masker = SecretMasker::new();
     masker.add_secret("password123");
     masker.add_secret("api_key_abcdef123456");
     masker.add_secret("super_secret_value_that_should_be_masked");
@@ -28,7 +28,7 @@ fn bench_pattern_masking(c: &mut Criterion) {
 }
 
 fn bench_large_text_masking(c: &mut Criterion) {
-    let mut masker = SecretMasker::new();
+    let masker = SecretMasker::new();
     masker.add_secret("secret123");
     masker.add_secret("password456");
 
@@ -47,7 +47,7 @@ fn bench_large_text_masking(c: &mut Criterion) {
 }
 
 fn bench_many_secrets(c: &mut Criterion) {
-    let mut masker = SecretMasker::new();
+    let masker = SecretMasker::new();
 
     // Add many secrets
     for i in 0..100 {
@@ -60,7 +60,7 @@ fn bench_many_secrets(c: &mut Criterion) {
 }
 
 fn bench_contains_secrets(c: &mut Criterion) {
-    let mut masker = SecretMasker::new();
+    let masker = SecretMasker::new();
     masker.add_secret("password123");
     masker.add_secret("api_key_abcdef123456");
 

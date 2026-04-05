@@ -92,7 +92,13 @@ impl ArtifactStore {
 
         let mut count = 0;
         for entry in &entries {
-            let rel = entry.strip_prefix(workspace).unwrap_or(entry.as_path());
+            let rel = entry.strip_prefix(workspace).map_err(|_| {
+                format!(
+                    "File '{}' is not within workspace '{}'",
+                    entry.display(),
+                    workspace.display()
+                )
+            })?;
             let dest = artifact_dir.join(rel);
             if let Some(parent) = dest.parent() {
                 std::fs::create_dir_all(parent)

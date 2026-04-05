@@ -1873,10 +1873,6 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
     // Add job-specific context
     environment::add_job_context(&mut job_env, ctx.job_name);
 
-    // Execute job steps
-    let mut step_results = Vec::new();
-    let mut job_logs = String::new();
-
     // Create a temporary directory for this job execution
     let job_dir = tempfile::tempdir()
         .map_err(|e| ExecutionError::Execution(format!("Failed to create job directory: {}", e)))?;
@@ -1898,9 +1894,7 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
     let timeout_mins = sanitize_timeout_minutes(job.timeout_minutes, 360.0);
     let job_timeout = std::time::Duration::from_secs_f64(timeout_mins * 60.0);
 
-    let mut step_outputs_map: HashMap<String, HashMap<String, String>> = HashMap::new();
-    let mut step_status_map: HashMap<String, (String, String)> = HashMap::new();
-    let mut job_status_str = "success".to_string();
+    let mut loop_state = StepLoopState::new();
 
     let job_deadline = tokio::time::Instant::now() + job_timeout;
 
@@ -1929,9 +1923,9 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
                     container_config: job.container.as_ref(),
                     workflow_defaults: ctx.workflow.defaults.as_ref(),
                     job_defaults: job.defaults.as_ref(),
-                    step_outputs: &step_outputs_map,
-                    step_statuses: &step_status_map,
-                    job_status: &job_status_str,
+                    step_outputs: &loop_state.step_outputs_map,
+                    step_statuses: &loop_state.step_status_map,
+                    job_status: &loop_state.job_status_str,
                     secrets_context: ctx.secrets_context,
                     needs_context: ctx.needs_context,
                     needs_results: ctx.needs_results,
@@ -1949,75 +1943,25 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
                     ctx.job_name, timeout_mins
                 );
                 wrkflw_logging::error(&msg);
-                job_logs.push_str(&format!("\n{}\n", msg));
+                loop_state.job_logs.push_str(&format!("\n{}\n", msg));
                 job_success = false;
                 break;
             }
         };
 
-        match outcome {
-            StepOutcome::Skipped(ref result) => {
-                record_step_status(
-                    step.id.as_deref(),
-                    result,
-                    &mut step_status_map,
-                    &mut job_status_str,
-                );
-                step_results.push(result.clone());
-            }
-            StepOutcome::Completed { result, abort_job } => {
-                record_step_status(
-                    step.id.as_deref(),
-                    &result,
-                    &mut step_status_map,
-                    &mut job_status_str,
-                );
-
-                // Add step output to logs only in verbose mode or if there's an error
-                if ctx.verbose || result.status == StepStatus::Failure {
-                    job_logs.push_str(&format!(
-                        "\n=== Output from step '{}' ===\n{}\n=== End output ===\n\n",
-                        result.name, result.output
-                    ));
-                } else {
-                    job_logs.push_str(&format!(
-                        "Step '{}' completed with status: {:?}\n",
-                        result.name, result.status
-                    ));
-                }
-
-                // Parse deprecated ::set-output:: and other workflow commands from stdout
-                process_workflow_commands(
-                    &result.output,
-                    step.id.as_deref(),
-                    &mut step_outputs_map,
-                );
-
-                step_results.push(result);
-
-                // Read back environment files and apply to job state
-                // (GITHUB_OUTPUT file values override deprecated ::set-output:: commands)
-                crate::github_env_files::apply_step_environment_updates(
-                    &mut job_env,
-                    &mut step_outputs_map,
-                    step.id.as_deref(),
-                );
-
-                if abort_job {
-                    job_success = false;
-                    break;
-                }
-            }
+        if loop_state.process_outcome(outcome, step, ctx.verbose, &mut job_env, ctx.secret_masker) {
+            job_success = false;
+            break;
         }
     }
 
     // Resolve job outputs from step outputs (GHA jobs.*.outputs map expressions to step outputs)
     let job_outputs = resolve_job_outputs(
         job,
-        &step_outputs_map,
-        &step_status_map,
+        &loop_state.step_outputs_map,
+        &loop_state.step_status_map,
         &job_env,
-        &job_status_str,
+        &loop_state.job_status_str,
     );
 
     Ok(JobResult {
@@ -2028,8 +1972,8 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
         } else {
             JobStatus::Failure
         },
-        steps: step_results,
-        logs: job_logs,
+        steps: loop_state.step_results,
+        logs: loop_state.job_logs,
         outputs: job_outputs,
     })
 }
@@ -2170,10 +2114,6 @@ async fn execute_matrix_job(
         job_env.insert(key.clone(), value.clone());
     }
 
-    // Execute the job steps
-    let mut step_results = Vec::new();
-    let mut job_logs = String::new();
-
     // Create a temporary directory for this job execution
     let job_dir = tempfile::tempdir()
         .map_err(|e| ExecutionError::Execution(format!("Failed to create job directory: {}", e)))?;
@@ -2183,9 +2123,7 @@ async fn execute_matrix_job(
         ExecutionError::Execution(format!("Failed to get current directory: {}", e))
     })?;
 
-    let mut step_outputs_map: HashMap<String, HashMap<String, String>> = HashMap::new();
-    let mut step_status_map: HashMap<String, (String, String)> = HashMap::new();
-    let mut job_status_str = "success".to_string();
+    let mut loop_state = StepLoopState::new();
     let job_success = if job_template.steps.is_empty() {
         wrkflw_logging::warning(&format!("Job '{}' has no steps", matrix_job_name));
         true
@@ -2224,9 +2162,9 @@ async fn execute_matrix_job(
                         container_config: job_template.container.as_ref(),
                         workflow_defaults: workflow.defaults.as_ref(),
                         job_defaults: job_template.defaults.as_ref(),
-                        step_outputs: &step_outputs_map,
-                        step_statuses: &step_status_map,
-                        job_status: &job_status_str,
+                        step_outputs: &loop_state.step_outputs_map,
+                        step_statuses: &loop_state.step_status_map,
+                        job_status: &loop_state.job_status_str,
                         secrets_context,
                         needs_context,
                         needs_results,
@@ -2244,62 +2182,15 @@ async fn execute_matrix_job(
                         matrix_job_name, timeout_mins
                     );
                     wrkflw_logging::error(&msg);
-                    job_logs.push_str(&format!("\n{}\n", msg));
+                    loop_state.job_logs.push_str(&format!("\n{}\n", msg));
                     all_steps_ok = false;
                     break;
                 }
             };
 
-            match outcome {
-                StepOutcome::Skipped(ref result) => {
-                    record_step_status(
-                        step.id.as_deref(),
-                        result,
-                        &mut step_status_map,
-                        &mut job_status_str,
-                    );
-                    step_results.push(result.clone());
-                }
-                StepOutcome::Completed { result, abort_job } => {
-                    record_step_status(
-                        step.id.as_deref(),
-                        &result,
-                        &mut step_status_map,
-                        &mut job_status_str,
-                    );
-
-                    job_logs.push_str(&format!("Step: {}\n", result.name));
-                    job_logs.push_str(&format!("Status: {:?}\n", result.status));
-
-                    if verbose || result.status == StepStatus::Failure {
-                        job_logs.push_str(&result.output);
-                        job_logs.push_str("\n\n");
-                    } else {
-                        job_logs.push('\n');
-                        job_logs.push('\n');
-                    }
-
-                    // Parse deprecated ::set-output:: and other workflow commands from stdout
-                    process_workflow_commands(
-                        &result.output,
-                        step.id.as_deref(),
-                        &mut step_outputs_map,
-                    );
-
-                    step_results.push(result);
-
-                    // Read back environment files and apply to job state
-                    crate::github_env_files::apply_step_environment_updates(
-                        &mut job_env,
-                        &mut step_outputs_map,
-                        step.id.as_deref(),
-                    );
-
-                    if abort_job {
-                        all_steps_ok = false;
-                        break;
-                    }
-                }
+            if loop_state.process_outcome(outcome, step, verbose, &mut job_env, secret_masker) {
+                all_steps_ok = false;
+                break;
             }
         }
 
@@ -2309,10 +2200,10 @@ async fn execute_matrix_job(
     // Resolve job outputs from step outputs
     let job_outputs = resolve_job_outputs(
         job_template,
-        &step_outputs_map,
-        &step_status_map,
+        &loop_state.step_outputs_map,
+        &loop_state.step_status_map,
         &job_env,
-        &job_status_str,
+        &loop_state.job_status_str,
     );
 
     // Return job result
@@ -2324,8 +2215,8 @@ async fn execute_matrix_job(
         } else {
             JobStatus::Failure
         },
-        steps: step_results,
-        logs: job_logs,
+        steps: loop_state.step_results,
+        logs: loop_state.job_logs,
         outputs: job_outputs,
     })
 }
@@ -2338,8 +2229,93 @@ enum StepOutcome {
     Skipped(StepResult),
 }
 
+/// Mutable state accumulated during a step loop.
+///
+/// Shared between `execute_job` and `execute_matrix_job` to avoid duplicating
+/// the post-outcome processing logic (status tracking, workflow commands, env
+/// file application, logging).
+struct StepLoopState {
+    step_results: Vec<StepResult>,
+    job_logs: String,
+    step_outputs_map: HashMap<String, HashMap<String, String>>,
+    step_status_map: HashMap<String, (String, String)>,
+    job_status_str: String,
+}
+
+impl StepLoopState {
+    fn new() -> Self {
+        Self {
+            step_results: Vec::new(),
+            job_logs: String::new(),
+            step_outputs_map: HashMap::new(),
+            step_status_map: HashMap::new(),
+            job_status_str: "success".to_string(),
+        }
+    }
+
+    /// Process one step outcome: record status, log, parse workflow commands,
+    /// apply environment file updates. Returns `true` if the job should abort.
+    fn process_outcome(
+        &mut self,
+        outcome: StepOutcome,
+        step: &workflow::Step,
+        verbose: bool,
+        job_env: &mut HashMap<String, String>,
+        secret_masker: Option<&SecretMasker>,
+    ) -> bool {
+        match outcome {
+            StepOutcome::Skipped(ref result) => {
+                record_step_status(
+                    step.id.as_deref(),
+                    result,
+                    &mut self.step_status_map,
+                    &mut self.job_status_str,
+                );
+                self.step_results.push(result.clone());
+                false
+            }
+            StepOutcome::Completed { result, abort_job } => {
+                record_step_status(
+                    step.id.as_deref(),
+                    &result,
+                    &mut self.step_status_map,
+                    &mut self.job_status_str,
+                );
+
+                if verbose || result.status == StepStatus::Failure {
+                    self.job_logs.push_str(&format!(
+                        "\n=== Output from step '{}' ===\n{}\n=== End output ===\n\n",
+                        result.name, result.output
+                    ));
+                } else {
+                    self.job_logs.push_str(&format!(
+                        "Step '{}' completed with status: {:?}\n",
+                        result.name, result.status
+                    ));
+                }
+
+                process_workflow_commands(
+                    &result.output,
+                    step.id.as_deref(),
+                    &mut self.step_outputs_map,
+                    secret_masker,
+                );
+
+                self.step_results.push(result);
+
+                crate::github_env_files::apply_step_environment_updates(
+                    job_env,
+                    &mut self.step_outputs_map,
+                    step.id.as_deref(),
+                );
+
+                abort_job
+            }
+        }
+    }
+}
+
 /// Record a step's outcome/conclusion in the status tracking map and update job status.
-/// Shared between `execute_job` and `execute_matrix_job` to avoid duplicating this logic.
 fn record_step_status(
     step_id: Option<&str>,
     result: &StepResult,
@@ -2361,11 +2337,12 @@ fn record_step_status(
 ///
 /// Handles the deprecated `::set-output::` command (populates `step_outputs_map`),
 /// annotation commands (`::error::`, `::warning::`, `::notice::`, `::debug::`),
-/// and `::add-mask::` (logged for now; full masker integration deferred).
+/// and `::add-mask::` (adds value to the `SecretMasker` for future output masking).
 fn process_workflow_commands(
     output: &str,
     step_id: Option<&str>,
     step_outputs_map: &mut HashMap<String, HashMap<String, String>>,
+    secret_masker: Option<&SecretMasker>,
 ) {
     let commands = crate::workflow_commands::parse_workflow_commands(output);
     for cmd in commands {
@@ -2408,9 +2385,11 @@ fn process_workflow_commands(
             crate::workflow_commands::WorkflowCommand::Debug { message } => {
                 wrkflw_logging::debug(&format!("[debug] {}", message));
             }
-            crate::workflow_commands::WorkflowCommand::AddMask { .. } => {
-                // Full SecretMasker integration deferred (requires Arc<Mutex<>> wrapping)
-                wrkflw_logging::debug("::add-mask:: requested (value redacted)");
+            crate::workflow_commands::WorkflowCommand::AddMask { value } => {
+                if let Some(masker) = secret_masker {
+                    masker.add_secret(value);
+                }
+                wrkflw_logging::debug("::add-mask:: applied (value redacted)");
             }
             // Group, EndGroup, SaveState — no-ops for now
             _ => {}
@@ -4190,6 +4169,9 @@ async fn execute_reusable_workflow_job(
                 logs.clone(),
             );
 
+            // Aggregate outputs from all jobs in the called workflow
+            let outputs = aggregate_reusable_workflow_outputs(&reusable_job_outputs);
+
             return Ok(JobResult {
                 name: ctx.job_name.to_string(),
                 canonical_name: ctx.job_name.to_string(),
@@ -4200,7 +4182,7 @@ async fn execute_reusable_workflow_job(
                 },
                 steps: vec![summary_step],
                 logs,
-                outputs: HashMap::new(),
+                outputs,
             });
         }
     };
@@ -4276,6 +4258,9 @@ async fn execute_reusable_workflow_job(
         logs.clone(),
     );
 
+    // Aggregate outputs from all jobs in the called workflow
+    let outputs = aggregate_reusable_workflow_outputs(&reusable_job_outputs);
+
     Ok(JobResult {
         name: ctx.job_name.to_string(),
         canonical_name: ctx.job_name.to_string(),
@@ -4286,8 +4271,29 @@ async fn execute_reusable_workflow_job(
         },
         steps: vec![summary_step],
         logs,
-        outputs: HashMap::new(),
+        outputs,
     })
+}
+
+/// Merge per-job outputs from a reusable workflow into a flat map.
+///
+/// In GitHub Actions, reusable workflow outputs are declared via
+/// `on.workflow_call.outputs` which maps output names to job output
+/// expressions. Since we don't parse that declaration yet, we use a
+/// pragmatic approximation: flatten all job outputs into a single map.
+/// Later jobs overwrite earlier jobs if keys collide.
+fn aggregate_reusable_workflow_outputs(
+    job_outputs: &HashMap<String, HashMap<String, String>>,
+) -> HashMap<String, String> {
+    let mut merged = HashMap::new();
+    for outputs in job_outputs.values() {
+        for (key, value) in outputs {
+            if !value.is_empty() {
+                merged.insert(key.clone(), value.clone());
+            }
+        }
+    }
+    merged
 }
 
 #[allow(dead_code)]
@@ -4489,6 +4495,7 @@ async fn execute_composite_action(
                     &step_result.output,
                     composite_step.id.as_deref(),
                     &mut composite_step_outputs,
+                    secret_masker,
                 );
 
                 // Add output to results
@@ -7126,5 +7133,200 @@ runs:
 
         let result = tokio::time::timeout(dur, step_loop).await;
         assert!(result.is_err(), "Expected timeout but step completed");
+    }
+
+    // ---- Tests for review findings ----
+
+    #[test]
+    fn record_step_status_tracks_outcome_and_conclusion() {
+        let mut map = HashMap::new();
+        let mut status = "success".to_string();
+
+        let result = StepResult {
+            name: "build".to_string(),
+            status: StepStatus::Failure,
+            output: String::new(),
+            outcome: StepStatus::Failure,
+            conclusion: StepStatus::Success, // continue-on-error
+        };
+        record_step_status(Some("build"), &result, &mut map, &mut status);
+
+        let (outcome, conclusion) = map.get("build").unwrap();
+        assert_eq!(outcome, "failure");
+        assert_eq!(conclusion, "success");
+        // conclusion is Success (continue-on-error), so job status stays "success"
+        assert_eq!(status, "success");
+    }
+
+    #[test]
+    fn record_step_status_sets_job_failure_on_failed_conclusion() {
+        let mut map = HashMap::new();
+        let mut status = "success".to_string();
+
+        let result = StepResult::new("test".to_string(), StepStatus::Failure, String::new());
+        record_step_status(Some("test"), &result, &mut map, &mut status);
+
+        assert_eq!(status, "failure");
+    }
+
+    #[test]
+    fn record_step_status_ignores_steps_without_id() {
+        let mut map = HashMap::new();
+        let mut status = "success".to_string();
+
+        let result = StepResult::new("anon".to_string(), StepStatus::Success, String::new());
+        record_step_status(None, &result, &mut map, &mut status);
+
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn process_workflow_commands_sets_output() {
+        let mut outputs: HashMap<String, HashMap<String, String>> = HashMap::new();
+        let masker = SecretMasker::new();
+
+        process_workflow_commands(
+            "::set-output name=version::1.2.3\nsome normal output\n",
+            Some("build"),
+            &mut outputs,
+            Some(&masker),
+        );
+
+        assert_eq!(
+            outputs.get("build").unwrap().get("version").unwrap(),
+            "1.2.3"
+        );
+    }
+
+    #[test]
+    fn process_workflow_commands_wires_add_mask() {
+        let mut outputs: HashMap<String, HashMap<String, String>> = HashMap::new();
+        let masker = SecretMasker::new();
+
+        process_workflow_commands(
+            "::add-mask::my-secret-value\n",
+            None,
+            &mut outputs,
+            Some(&masker),
+        );
+
+        assert!(masker.has_secret("my-secret-value"));
+        let masked = masker.mask("my-secret-value is here");
+        assert!(!masked.contains("my-secret-value"));
+    }
+
+    #[test]
+    fn process_workflow_commands_without_masker_does_not_panic() {
+        let mut outputs: HashMap<String, HashMap<String, String>> = HashMap::new();
+        // Passing None for secret_masker should not panic
+        process_workflow_commands("::add-mask::secret\n", None, &mut outputs, None);
+    }
+
+    #[test]
+    fn build_needs_context_filters_to_declared_deps() {
+        let mut job = empty_workflow()
+            .jobs
+            .into_values()
+            .next()
+            .unwrap_or_else(|| serde_yaml::from_str::<Job>("steps: []").unwrap());
+        job.needs = Some(vec!["build".to_string()]);
+
+        let mut all_outputs = HashMap::new();
+        let mut build_out = HashMap::new();
+        build_out.insert("artifact".to_string(), "foo.tar.gz".to_string());
+        all_outputs.insert("build".to_string(), build_out);
+        // "deploy" outputs should NOT be included
+        let mut deploy_out = HashMap::new();
+        deploy_out.insert("url".to_string(), "https://example.com".to_string());
+        all_outputs.insert("deploy".to_string(), deploy_out);
+
+        let mut all_results = HashMap::new();
+        all_results.insert("build".to_string(), "success".to_string());
+        all_results.insert("deploy".to_string(), "failure".to_string());
+
+        let (needs_out, needs_res) = build_needs_context(&job, &all_outputs, &all_results);
+
+        assert!(needs_out.contains_key("build"));
+        assert!(!needs_out.contains_key("deploy"));
+        assert_eq!(needs_res.get("build").unwrap(), "success");
+        assert!(!needs_res.contains_key("deploy"));
+    }
+
+    #[test]
+    fn resolve_job_outputs_evaluates_step_reference() {
+        let job: Job = serde_yaml::from_str(
+            r#"
+            steps: []
+            outputs:
+              version: "${{ steps.build.outputs.ver }}"
+            "#,
+        )
+        .unwrap();
+
+        let mut step_outputs = HashMap::new();
+        let mut build_out = HashMap::new();
+        build_out.insert("ver".to_string(), "2.0.0".to_string());
+        step_outputs.insert("build".to_string(), build_out);
+
+        let result = resolve_job_outputs(
+            &job,
+            &step_outputs,
+            &HashMap::new(),
+            &HashMap::new(),
+            "success",
+        );
+
+        assert_eq!(result.get("version").unwrap(), "2.0.0");
+    }
+
+    #[test]
+    fn resolve_job_outputs_returns_empty_for_missing_step() {
+        let job: Job = serde_yaml::from_str(
+            r#"
+            steps: []
+            outputs:
+              missing: "${{ steps.nonexistent.outputs.key }}"
+            "#,
+        )
+        .unwrap();
+
+        let result = resolve_job_outputs(
+            &job,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            "success",
+        );
+
+        assert_eq!(result.get("missing").unwrap(), "");
+    }
+
+    #[test]
+    fn aggregate_reusable_workflow_outputs_merges_all_jobs() {
+        let mut job_outputs = HashMap::new();
+        let mut build_out = HashMap::new();
+        build_out.insert("artifact".to_string(), "build.tar".to_string());
+        job_outputs.insert("build".to_string(), build_out);
+
+        let mut test_out = HashMap::new();
+        test_out.insert("coverage".to_string(), "92%".to_string());
+        job_outputs.insert("test".to_string(), test_out);
+
+        let merged = aggregate_reusable_workflow_outputs(&job_outputs);
+        assert_eq!(merged.get("artifact").unwrap(), "build.tar");
+        assert_eq!(merged.get("coverage").unwrap(), "92%");
+    }
+
+    #[test]
+    fn aggregate_reusable_workflow_outputs_skips_empty_values() {
+        let mut job_outputs = HashMap::new();
+        let mut out = HashMap::new();
+        out.insert("key".to_string(), String::new());
+        out.insert("real".to_string(), "value".to_string());
+        job_outputs.insert("job".to_string(), out);
+
+        let merged = aggregate_reusable_workflow_outputs(&job_outputs);
+        assert!(!merged.contains_key("key"));
+        assert_eq!(merged.get("real").unwrap(), "value");
     }
 }

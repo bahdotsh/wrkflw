@@ -1,6 +1,6 @@
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
-use std::sync::OnceLock;
+use std::sync::{OnceLock, RwLock};
 
 /// Compiled regex patterns for common secret formats
 struct CompiledPatterns {
@@ -30,10 +30,14 @@ impl CompiledPatterns {
 /// Global compiled patterns (initialized once)
 static PATTERNS: OnceLock<CompiledPatterns> = OnceLock::new();
 
-/// Secret masking utility to prevent secrets from appearing in logs
+/// Secret masking utility to prevent secrets from appearing in logs.
+///
+/// Uses interior mutability (`RwLock`) so secrets can be added through shared
+/// references — e.g. when processing `::add-mask::` workflow commands during
+/// step execution while the masker is shared across the job.
 pub struct SecretMasker {
-    secrets: HashSet<String>,
-    secret_cache: HashMap<String, String>, // Cache masked versions
+    secrets: RwLock<HashSet<String>>,
+    secret_cache: RwLock<HashMap<String, String>>,
     mask_char: char,
     min_length: usize,
 }
@@ -42,8 +46,8 @@ impl SecretMasker {
     /// Create a new secret masker
     pub fn new() -> Self {
         Self {
-            secrets: HashSet::new(),
-            secret_cache: HashMap::new(),
+            secrets: RwLock::new(HashSet::new()),
+            secret_cache: RwLock::new(HashMap::new()),
             mask_char: '*',
             min_length: 3, // Don't mask very short strings
         }
@@ -52,54 +56,66 @@ impl SecretMasker {
     /// Create a new secret masker with custom mask character
     pub fn with_mask_char(mask_char: char) -> Self {
         Self {
-            secrets: HashSet::new(),
-            secret_cache: HashMap::new(),
+            secrets: RwLock::new(HashSet::new()),
+            secret_cache: RwLock::new(HashMap::new()),
             mask_char,
             min_length: 3,
         }
     }
 
-    /// Add a secret to be masked
-    pub fn add_secret(&mut self, secret: impl Into<String>) {
+    /// Add a secret to be masked.
+    ///
+    /// Takes `&self` (not `&mut self`) thanks to interior mutability, so this
+    /// can be called through a shared reference during workflow execution.
+    pub fn add_secret(&self, secret: impl Into<String>) {
         let secret = secret.into();
         if secret.len() >= self.min_length {
             let masked = self.create_mask(&secret);
-            self.secret_cache.insert(secret.clone(), masked);
-            self.secrets.insert(secret);
+            self.secret_cache
+                .write()
+                .unwrap()
+                .insert(secret.clone(), masked);
+            self.secrets.write().unwrap().insert(secret);
         }
     }
 
     /// Add multiple secrets to be masked
-    pub fn add_secrets(&mut self, secrets: impl IntoIterator<Item = String>) {
+    pub fn add_secrets(&self, secrets: impl IntoIterator<Item = String>) {
         for secret in secrets {
             self.add_secret(secret);
         }
     }
 
     /// Remove a secret from masking
-    pub fn remove_secret(&mut self, secret: &str) {
-        self.secrets.remove(secret);
-        self.secret_cache.remove(secret);
+    pub fn remove_secret(&self, secret: &str) {
+        self.secrets.write().unwrap().remove(secret);
+        self.secret_cache.write().unwrap().remove(secret);
     }
 
     /// Clear all secrets
-    pub fn clear(&mut self) {
-        self.secrets.clear();
-        self.secret_cache.clear();
+    pub fn clear(&self) {
+        self.secrets.write().unwrap().clear();
+        self.secret_cache.write().unwrap().clear();
     }
 
     /// Mask secrets in the given text
     pub fn mask(&self, text: &str) -> String {
         let mut result = text.to_string();
 
+        let secrets = self.secrets.read().unwrap();
+        let cache = self.secret_cache.read().unwrap();
+
         // Use cached masked versions for better performance
-        for secret in &self.secrets {
+        for secret in secrets.iter() {
             if !secret.is_empty() {
-                if let Some(masked) = self.secret_cache.get(secret) {
+                if let Some(masked) = cache.get(secret) {
                     result = result.replace(secret, masked);
                 }
             }
         }
+
+        drop(cache);
+        drop(secrets);
 
         // Also mask potential tokens and keys with regex patterns
         result = self.mask_patterns(&result);
@@ -180,11 +196,13 @@ impl SecretMasker {
 
     /// Check if text contains any secrets
     pub fn contains_secrets(&self, text: &str) -> bool {
-        for secret in &self.secrets {
+        let secrets = self.secrets.read().unwrap();
+        for secret in secrets.iter() {
             if text.contains(secret) {
                 return true;
             }
         }
+        drop(secrets);
 
         // Also check for common patterns
         self.has_secret_patterns(text)
@@ -203,12 +221,12 @@ impl SecretMasker {
 
     /// Get the number of secrets being tracked
     pub fn secret_count(&self) -> usize {
-        self.secrets.len()
+        self.secrets.read().unwrap().len()
     }
 
     /// Check if a specific secret is being tracked
     pub fn has_secret(&self, secret: &str) -> bool {
-        self.secrets.contains(secret)
+        self.secrets.read().unwrap().contains(secret)
     }
 }
 
@@ -224,7 +242,7 @@ mod tests {
 
     #[test]
     fn test_basic_masking() {
-        let mut masker = SecretMasker::new();
+        let masker = SecretMasker::new();
         masker.add_secret("secret123");
         masker.add_secret("password456");
 
@@ -238,7 +256,7 @@ mod tests {
 
     #[test]
     fn test_preserve_structure() {
-        let mut masker = SecretMasker::new();
+        let masker = SecretMasker::new();
         masker.add_secret("verylongsecretkey123");
 
         let input = "Key: verylongsecretkey123";
@@ -286,7 +304,7 @@ mod tests {
 
     #[test]
     fn test_contains_secrets() {
-        let mut masker = SecretMasker::new();
+        let masker = SecretMasker::new();
         masker.add_secret("secret123");
 
         assert!(masker.contains_secrets("The secret is secret123"));
@@ -296,7 +314,7 @@ mod tests {
 
     #[test]
     fn test_short_secrets() {
-        let mut masker = SecretMasker::new();
+        let masker = SecretMasker::new();
         masker.add_secret("ab"); // Too short, should not be added
         masker.add_secret("abc"); // Minimum length
 
@@ -307,7 +325,7 @@ mod tests {
 
     #[test]
     fn test_custom_mask_char() {
-        let mut masker = SecretMasker::with_mask_char('X');
+        let masker = SecretMasker::with_mask_char('X');
         masker.add_secret("secret123");
 
         let input = "The secret is secret123";
@@ -319,7 +337,7 @@ mod tests {
 
     #[test]
     fn test_remove_secret() {
-        let mut masker = SecretMasker::new();
+        let masker = SecretMasker::new();
         masker.add_secret("secret123");
         masker.add_secret("password456");
 
@@ -333,7 +351,7 @@ mod tests {
 
     #[test]
     fn test_clear_secrets() {
-        let mut masker = SecretMasker::new();
+        let masker = SecretMasker::new();
         masker.add_secret("secret123");
         masker.add_secret("password456");
 

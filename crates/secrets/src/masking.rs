@@ -30,6 +30,14 @@ impl CompiledPatterns {
 /// Global compiled patterns (initialized once)
 static PATTERNS: OnceLock<CompiledPatterns> = OnceLock::new();
 
+/// Interior data protected by a single `RwLock` so that mutations
+/// (add/remove/clear) are atomic — no window where `secrets` and
+/// `secret_cache` can be out of sync.
+struct SecretData {
+    secrets: HashSet<String>,
+    secret_cache: HashMap<String, String>,
+}
+
 /// Secret masking utility to prevent secrets from appearing in logs.
 ///
 /// Uses interior mutability (`RwLock`) so secrets can be added through shared
@@ -40,13 +48,9 @@ static PATTERNS: OnceLock<CompiledPatterns> = OnceLock::new();
 ///
 /// All `RwLock` acquisitions use `.unwrap_or_else(|e| e.into_inner())` to
 /// recover from poisoned locks rather than panicking. If a thread panics
-/// while holding the lock, the data may be in a partially-updated state
-/// (e.g. a secret added to `secret_cache` but not yet in `secrets`), but
-/// this is acceptable: the masker is a best-effort safety net and a missed
-/// or extra mask is far less harmful than crashing the executor.
+/// while holding the lock the masker continues with the data as-is.
 pub struct SecretMasker {
-    secrets: RwLock<HashSet<String>>,
-    secret_cache: RwLock<HashMap<String, String>>,
+    data: RwLock<SecretData>,
     mask_char: char,
     min_length: usize,
 }
@@ -55,8 +59,10 @@ impl SecretMasker {
     /// Create a new secret masker
     pub fn new() -> Self {
         Self {
-            secrets: RwLock::new(HashSet::new()),
-            secret_cache: RwLock::new(HashMap::new()),
+            data: RwLock::new(SecretData {
+                secrets: HashSet::new(),
+                secret_cache: HashMap::new(),
+            }),
             mask_char: '*',
             min_length: 3, // Don't mask very short strings
         }
@@ -65,8 +71,10 @@ impl SecretMasker {
     /// Create a new secret masker with custom mask character
     pub fn with_mask_char(mask_char: char) -> Self {
         Self {
-            secrets: RwLock::new(HashSet::new()),
-            secret_cache: RwLock::new(HashMap::new()),
+            data: RwLock::new(SecretData {
+                secrets: HashSet::new(),
+                secret_cache: HashMap::new(),
+            }),
             mask_char,
             min_length: 3,
         }
@@ -80,14 +88,9 @@ impl SecretMasker {
         let secret = secret.into();
         if secret.len() >= self.min_length {
             let masked = self.create_mask(&secret);
-            self.secret_cache
-                .write()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(secret.clone(), masked);
-            self.secrets
-                .write()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(secret);
+            let mut data = self.data.write().unwrap_or_else(|e| e.into_inner());
+            data.secret_cache.insert(secret.clone(), masked);
+            data.secrets.insert(secret);
         }
     }
 
@@ -100,46 +103,34 @@ impl SecretMasker {
 
     /// Remove a secret from masking
     pub fn remove_secret(&self, secret: &str) {
-        self.secrets
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(secret);
-        self.secret_cache
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(secret);
+        let mut data = self.data.write().unwrap_or_else(|e| e.into_inner());
+        data.secrets.remove(secret);
+        data.secret_cache.remove(secret);
     }
 
     /// Clear all secrets
     pub fn clear(&self) {
-        self.secrets
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
-        self.secret_cache
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
+        let mut data = self.data.write().unwrap_or_else(|e| e.into_inner());
+        data.secrets.clear();
+        data.secret_cache.clear();
     }
 
     /// Mask secrets in the given text
     pub fn mask(&self, text: &str) -> String {
         let mut result = text.to_string();
 
-        let secrets = self.secrets.read().unwrap_or_else(|e| e.into_inner());
-        let cache = self.secret_cache.read().unwrap_or_else(|e| e.into_inner());
+        let data = self.data.read().unwrap_or_else(|e| e.into_inner());
 
         // Use cached masked versions for better performance
-        for secret in secrets.iter() {
+        for secret in data.secrets.iter() {
             if !secret.is_empty() {
-                if let Some(masked) = cache.get(secret) {
+                if let Some(masked) = data.secret_cache.get(secret) {
                     result = result.replace(secret, masked);
                 }
             }
         }
 
-        drop(cache);
-        drop(secrets);
+        drop(data);
 
         // Also mask potential tokens and keys with regex patterns
         result = self.mask_patterns(&result);
@@ -220,13 +211,13 @@ impl SecretMasker {
 
     /// Check if text contains any secrets
     pub fn contains_secrets(&self, text: &str) -> bool {
-        let secrets = self.secrets.read().unwrap_or_else(|e| e.into_inner());
-        for secret in secrets.iter() {
+        let data = self.data.read().unwrap_or_else(|e| e.into_inner());
+        for secret in data.secrets.iter() {
             if text.contains(secret) {
                 return true;
             }
         }
-        drop(secrets);
+        drop(data);
 
         // Also check for common patterns
         self.has_secret_patterns(text)
@@ -245,14 +236,15 @@ impl SecretMasker {
 
     /// Get the number of secrets being tracked
     pub fn secret_count(&self) -> usize {
-        self.secrets.read().unwrap_or_else(|e| e.into_inner()).len()
+        self.data.read().unwrap_or_else(|e| e.into_inner()).secrets.len()
     }
 
     /// Check if a specific secret is being tracked
     pub fn has_secret(&self, secret: &str) -> bool {
-        self.secrets
+        self.data
             .read()
             .unwrap_or_else(|e| e.into_inner())
+            .secrets
             .contains(secret)
     }
 }

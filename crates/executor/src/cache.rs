@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 /// Default maximum cache size: 1 GiB. When the cache exceeds this limit,
 /// the oldest entries (by last modification time) are evicted until the
 /// total size is back under the limit.
-const MAX_CACHE_SIZE_BYTES: u64 = 1024 * 1024 * 1024;
+const DEFAULT_MAX_CACHE_SIZE_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// Manages a persistent local cache for workflow runs.
 ///
@@ -19,6 +19,7 @@ const MAX_CACHE_SIZE_BYTES: u64 = 1024 * 1024 * 1024;
 #[derive(Clone)]
 pub struct CacheStore {
     root: PathBuf,
+    max_size: u64,
 }
 
 impl CacheStore {
@@ -35,14 +36,27 @@ impl CacheStore {
                 e
             )
         })?;
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            max_size: DEFAULT_MAX_CACHE_SIZE_BYTES,
+        })
     }
 
     /// Create a cache store at a custom root (useful for testing or custom locations).
     #[allow(dead_code)]
     pub fn with_root(root: PathBuf) -> std::io::Result<Self> {
         std::fs::create_dir_all(&root)?;
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            max_size: DEFAULT_MAX_CACHE_SIZE_BYTES,
+        })
+    }
+
+    /// Set the maximum cache size in bytes. When exceeded, the oldest entries
+    /// are evicted after each `save`.
+    #[allow(dead_code)]
+    pub fn set_max_size(&mut self, max_size: u64) {
+        self.max_size = max_size;
     }
 
     /// Attempt to restore a cache. Tries `key` first, then each of `restore_keys`
@@ -198,7 +212,7 @@ impl CacheStore {
         best.map(|(key, _)| key)
     }
 
-    /// Evict oldest cache entries until the total size is under `MAX_CACHE_SIZE_BYTES`.
+    /// Evict oldest cache entries until the total size is under `self.max_size`.
     ///
     /// Entries are sorted by last modification time (oldest first) and removed
     /// until the cache fits within the budget. Called automatically after `save`.
@@ -226,7 +240,7 @@ impl CacheStore {
             cache_entries.push((path, size, mtime));
         }
 
-        if total_size <= MAX_CACHE_SIZE_BYTES {
+        if total_size <= self.max_size {
             return;
         }
 
@@ -234,7 +248,7 @@ impl CacheStore {
         cache_entries.sort_by_key(|&(_, _, mtime)| mtime);
 
         for (path, size, _) in &cache_entries {
-            if total_size <= MAX_CACHE_SIZE_BYTES {
+            if total_size <= self.max_size {
                 break;
             }
             if std::fs::remove_dir_all(path).is_ok() {
@@ -487,29 +501,40 @@ mod tests {
     async fn evict_removes_oldest_entries() {
         let cache_root = tempdir().unwrap();
         let workspace = tempdir().unwrap();
-        let store = CacheStore::with_root(cache_root.path().to_path_buf()).unwrap();
+        let mut store = CacheStore::with_root(cache_root.path().to_path_buf()).unwrap();
+        // Set a tiny max size so that two entries exceed it and the oldest is evicted.
+        // Each entry has a data file + a .cache_key metadata file, totalling ~20-30 bytes.
+        // A limit of 30 bytes ensures that the second save triggers eviction of the first.
+        store.set_max_size(30);
 
         // Create two cache entries with known order (sleep to separate mtimes)
         std::fs::create_dir_all(workspace.path().join("d1")).unwrap();
-        std::fs::write(workspace.path().join("d1/f.txt"), "old").unwrap();
+        std::fs::write(workspace.path().join("d1/f.txt"), "old-data-here").unwrap();
         store.save("key-old", "d1", workspace.path()).await.unwrap();
 
         // Touch the second entry slightly later
         std::thread::sleep(std::time::Duration::from_millis(50));
         std::fs::create_dir_all(workspace.path().join("d2")).unwrap();
-        std::fs::write(workspace.path().join("d2/f.txt"), "new").unwrap();
+        std::fs::write(workspace.path().join("d2/f.txt"), "new-data-here").unwrap();
         store.save("key-new", "d2", workspace.path()).await.unwrap();
 
-        // Both entries should exist
+        // The oldest entry should have been evicted
         let workspace2 = tempdir().unwrap();
-        assert!(store
-            .restore("key-old", &[], "d1", workspace2.path())
-            .await
-            .is_some());
-        assert!(store
-            .restore("key-new", &[], "d2", workspace2.path())
-            .await
-            .is_some());
+        assert!(
+            store
+                .restore("key-old", &[], "d1", workspace2.path())
+                .await
+                .is_none(),
+            "key-old should have been evicted"
+        );
+        // The newest entry should still exist
+        assert!(
+            store
+                .restore("key-new", &[], "d2", workspace2.path())
+                .await
+                .is_some(),
+            "key-new should survive eviction"
+        );
     }
 
     #[tokio::test]

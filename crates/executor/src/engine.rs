@@ -1895,6 +1895,7 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
     let job_timeout = std::time::Duration::from_secs_f64(timeout_mins * 60.0);
 
     let mut loop_state = StepLoopState::new();
+    let pending_cache_saves = std::sync::Mutex::new(Vec::<PendingCacheSave>::new());
 
     let job_deadline = tokio::time::Instant::now() + job_timeout;
 
@@ -1931,6 +1932,7 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
                     needs_results: ctx.needs_results,
                     artifact_store: ctx.artifact_store,
                     cache_store: ctx.cache_store,
+                    pending_cache_saves: &pending_cache_saves,
                 },
             ),
         )
@@ -1953,6 +1955,11 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
             job_success = false;
             break;
         }
+    }
+
+    // Flush deferred cache saves only on success (matches GHA post-step semantics)
+    if job_success {
+        flush_pending_cache_saves(&pending_cache_saves, ctx.cache_store).await;
     }
 
     // Resolve job outputs from step outputs (GHA jobs.*.outputs map expressions to step outputs)
@@ -2124,6 +2131,7 @@ async fn execute_matrix_job(
     })?;
 
     let mut loop_state = StepLoopState::new();
+    let pending_cache_saves = std::sync::Mutex::new(Vec::<PendingCacheSave>::new());
     let job_success = if job_template.steps.is_empty() {
         wrkflw_logging::warning(&format!("Job '{}' has no steps", matrix_job_name));
         true
@@ -2170,6 +2178,7 @@ async fn execute_matrix_job(
                         needs_results,
                         artifact_store,
                         cache_store,
+                        pending_cache_saves: &pending_cache_saves,
                     },
                 ),
             )
@@ -2196,6 +2205,11 @@ async fn execute_matrix_job(
 
         all_steps_ok
     };
+
+    // Flush deferred cache saves only on success (matches GHA post-step semantics)
+    if job_success {
+        flush_pending_cache_saves(&pending_cache_saves, cache_store).await;
+    }
 
     // Resolve job outputs from step outputs
     let job_outputs = resolve_job_outputs(
@@ -2227,6 +2241,41 @@ enum StepOutcome {
     Completed { result: StepResult, abort_job: bool },
     /// Step was skipped due to an if-condition.
     Skipped(StepResult),
+}
+
+/// A deferred cache save: key + relative path + workspace.
+/// Recorded during `actions/cache` on a miss and flushed at end-of-job,
+/// matching GitHub Actions' post-step save semantics.
+struct PendingCacheSave {
+    key: String,
+    path: String,
+    workspace: std::path::PathBuf,
+}
+
+/// Flush pending cache saves. Called at end-of-job only when the job succeeded,
+/// matching GitHub Actions' behavior where `actions/cache` saves in a post-step
+/// hook that only runs after all steps complete and the job succeeds.
+async fn flush_pending_cache_saves(
+    pending: &std::sync::Mutex<Vec<PendingCacheSave>>,
+    cache_store: &crate::cache::CacheStore,
+) {
+    let saves = pending.lock().map(|mut v| std::mem::take(&mut *v)).unwrap_or_default();
+    for save in saves {
+        match cache_store.save(&save.key, &save.path, &save.workspace).await {
+            Ok(()) => {
+                wrkflw_logging::info(&format!(
+                    "  Cache saved path '{}' with key '{}'",
+                    save.path, save.key
+                ));
+            }
+            Err(e) => {
+                wrkflw_logging::warning(&format!(
+                    "  Failed to save cache key '{}': {}",
+                    save.key, e
+                ));
+            }
+        }
+    }
 }
 
 /// Mutable state accumulated during a step loop.
@@ -2546,6 +2595,8 @@ struct StepExecutionContext<'a> {
     needs_results: &'a HashMap<String, String>,
     artifact_store: &'a crate::artifacts::ArtifactStore,
     cache_store: &'a crate::cache::CacheStore,
+    /// Collects deferred `actions/cache` saves, flushed at end-of-job on success.
+    pending_cache_saves: &'a std::sync::Mutex<Vec<PendingCacheSave>>,
 }
 
 impl<'a> StepExecutionContext<'a> {
@@ -2878,32 +2929,20 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                         )
                     }
                     None => {
-                        // Divergence from GitHub Actions: in real GHA, `actions/cache`
-                        // saves in a post-step hook that runs *after* all steps complete
-                        // (and only if the job succeeds). We save eagerly here because
-                        // we don't have a post-step hook mechanism. This is safe because
-                        // each workflow run uses a fresh tempdir workspace, so the path
-                        // typically doesn't exist yet at this point (the save fails with
-                        // a benign message). If the path *does* exist (e.g. from
-                        // actions/checkout), the content is current, not stale.
-                        let msg = match ctx
-                            .cache_store
-                            .save(&key, &cache_path, ctx.working_dir)
-                            .await
-                        {
-                            Ok(()) => {
-                                format!(
-                                    "Cache miss. Saved path '{}' with key '{}'",
-                                    cache_path, key
-                                )
-                            }
-                            Err(_) => {
-                                format!(
-                                    "Cache miss. Path '{}' does not exist yet (will be available on next run)",
-                                    cache_path
-                                )
-                            }
-                        };
+                        // Defer the save to end-of-job, matching GitHub Actions'
+                        // behavior where `actions/cache` saves in a post-step hook
+                        // that only runs after all steps complete and the job succeeds.
+                        if let Ok(mut pending) = ctx.pending_cache_saves.lock() {
+                            pending.push(PendingCacheSave {
+                                key: key.clone(),
+                                path: cache_path.clone(),
+                                workspace: ctx.working_dir.to_path_buf(),
+                            });
+                        }
+                        let msg = format!(
+                            "Cache miss for key '{}'. Save deferred to end of job.",
+                            key
+                        );
                         wrkflw_logging::info(&format!("  {}", msg));
                         StepResult::new(step_name, StepStatus::Success, msg)
                     }
@@ -2933,6 +2972,7 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                             ctx.needs_results,
                             ctx.artifact_store,
                             ctx.cache_store,
+                            ctx.pending_cache_saves,
                         )
                         .await?
                     } else {
@@ -2993,6 +3033,7 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                             ctx.needs_results,
                             ctx.artifact_store,
                             ctx.cache_store,
+                            ctx.pending_cache_saves,
                         )
                         .await?
                     }
@@ -4388,6 +4429,7 @@ async fn execute_composite_action(
     needs_results: &HashMap<String, String>,
     artifact_store: &crate::artifacts::ArtifactStore,
     cache_store: &crate::cache::CacheStore,
+    pending_cache_saves: &std::sync::Mutex<Vec<PendingCacheSave>>,
 ) -> Result<StepResult, ExecutionError> {
     // Find the action definition file
     let action_yaml = action_path.join("action.yml");
@@ -4503,6 +4545,7 @@ async fn execute_composite_action(
                     needs_results,
                     artifact_store,
                     cache_store,
+                    pending_cache_saves,
                 }))
                 .await?;
 
@@ -4885,6 +4928,8 @@ mod tests {
         static ref TEST_CACHE_DIR: tempfile::TempDir = tempfile::tempdir().unwrap();
         static ref TEST_CACHE_STORE: crate::cache::CacheStore =
             crate::cache::CacheStore::with_root(TEST_CACHE_DIR.path().to_path_buf()).unwrap();
+        static ref TEST_PENDING_CACHE_SAVES: std::sync::Mutex<Vec<PendingCacheSave>> =
+            std::sync::Mutex::new(Vec::new());
     }
 
     #[test]
@@ -5824,6 +5869,7 @@ runs:
             needs_results: &HashMap::new(),
             artifact_store: &TEST_ARTIFACT_STORE,
             cache_store: &TEST_CACHE_STORE,
+            pending_cache_saves: &TEST_PENDING_CACHE_SAVES,
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -5880,6 +5926,7 @@ runs:
             needs_results: &HashMap::new(),
             artifact_store: &TEST_ARTIFACT_STORE,
             cache_store: &TEST_CACHE_STORE,
+            pending_cache_saves: &TEST_PENDING_CACHE_SAVES,
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -5941,6 +5988,7 @@ runs:
             needs_results: &HashMap::new(),
             artifact_store: &TEST_ARTIFACT_STORE,
             cache_store: &TEST_CACHE_STORE,
+            pending_cache_saves: &TEST_PENDING_CACHE_SAVES,
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -5995,6 +6043,7 @@ runs:
             needs_results: &HashMap::new(),
             artifact_store: &TEST_ARTIFACT_STORE,
             cache_store: &TEST_CACHE_STORE,
+            pending_cache_saves: &TEST_PENDING_CACHE_SAVES,
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -6050,6 +6099,7 @@ runs:
             needs_results: &HashMap::new(),
             artifact_store: &TEST_ARTIFACT_STORE,
             cache_store: &TEST_CACHE_STORE,
+            pending_cache_saves: &TEST_PENDING_CACHE_SAVES,
         };
 
         let result = execute_step(ctx).await;
@@ -6104,6 +6154,7 @@ runs:
             needs_results: &HashMap::new(),
             artifact_store: &TEST_ARTIFACT_STORE,
             cache_store: &TEST_CACHE_STORE,
+            pending_cache_saves: &TEST_PENDING_CACHE_SAVES,
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -6156,6 +6207,7 @@ runs:
             needs_results: &HashMap::new(),
             artifact_store: &TEST_ARTIFACT_STORE,
             cache_store: &TEST_CACHE_STORE,
+            pending_cache_saves: &TEST_PENDING_CACHE_SAVES,
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -6700,6 +6752,7 @@ runs:
             needs_results: &HashMap::new(),
             artifact_store: &TEST_ARTIFACT_STORE,
             cache_store: &TEST_CACHE_STORE,
+            pending_cache_saves: &TEST_PENDING_CACHE_SAVES,
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -6752,6 +6805,7 @@ runs:
             needs_results: &HashMap::new(),
             artifact_store: &TEST_ARTIFACT_STORE,
             cache_store: &TEST_CACHE_STORE,
+            pending_cache_saves: &TEST_PENDING_CACHE_SAVES,
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -6800,6 +6854,7 @@ runs:
             needs_results: &HashMap::new(),
             artifact_store: &TEST_ARTIFACT_STORE,
             cache_store: &TEST_CACHE_STORE,
+            pending_cache_saves: &TEST_PENDING_CACHE_SAVES,
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -6840,6 +6895,7 @@ runs:
             needs_results: &HashMap::new(),
             artifact_store: &TEST_ARTIFACT_STORE,
             cache_store: &TEST_CACHE_STORE,
+            pending_cache_saves: &TEST_PENDING_CACHE_SAVES,
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -6882,6 +6938,7 @@ runs:
             needs_results: &HashMap::new(),
             artifact_store: &TEST_ARTIFACT_STORE,
             cache_store: &TEST_CACHE_STORE,
+            pending_cache_saves: &TEST_PENDING_CACHE_SAVES,
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -6935,6 +6992,7 @@ runs:
             needs_results: &HashMap::new(),
             artifact_store: &TEST_ARTIFACT_STORE,
             cache_store: &TEST_CACHE_STORE,
+            pending_cache_saves: &TEST_PENDING_CACHE_SAVES,
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -6986,6 +7044,7 @@ runs:
             needs_results: &HashMap::new(),
             artifact_store: &TEST_ARTIFACT_STORE,
             cache_store: &TEST_CACHE_STORE,
+            pending_cache_saves: &TEST_PENDING_CACHE_SAVES,
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -7037,6 +7096,7 @@ runs:
             needs_results: &HashMap::new(),
             artifact_store: &TEST_ARTIFACT_STORE,
             cache_store: &TEST_CACHE_STORE,
+            pending_cache_saves: &TEST_PENDING_CACHE_SAVES,
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -7086,6 +7146,7 @@ runs:
             needs_results: &HashMap::new(),
             artifact_store: &TEST_ARTIFACT_STORE,
             cache_store: &TEST_CACHE_STORE,
+            pending_cache_saves: &TEST_PENDING_CACHE_SAVES,
         };
 
         let result = execute_step(ctx).await.unwrap();

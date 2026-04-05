@@ -2853,13 +2853,19 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                 // Write cache-hit output to GITHUB_OUTPUT file
                 if let Some(output_path) = ctx.job_env.get("GITHUB_OUTPUT") {
                     let hit_val = if cache_hit.is_some() { "true" } else { "false" };
-                    let _ = std::fs::OpenOptions::new()
+                    if let Err(e) = std::fs::OpenOptions::new()
                         .append(true)
                         .open(output_path)
                         .and_then(|mut f| {
                             use std::io::Write;
                             writeln!(f, "cache-hit={}", hit_val)
-                        });
+                        })
+                    {
+                        wrkflw_logging::warning(&format!(
+                            "Failed to write cache-hit to GITHUB_OUTPUT: {}",
+                            e
+                        ));
+                    }
                 }
 
                 match &cache_hit {
@@ -4118,7 +4124,12 @@ async fn execute_reusable_workflow_job(
                 }
             }
             if let Some(secrets_val) = secrets {
-                if let Some(map) = secrets_val.as_mapping() {
+                if secrets_val.as_str() == Some("inherit") {
+                    wrkflw_logging::warning(
+                        "`secrets: inherit` is not yet supported for reusable workflows; \
+                         parent secrets will not be available in the called workflow",
+                    );
+                } else if let Some(map) = secrets_val.as_mapping() {
                     for (k, v) in map {
                         if let (Some(key), Some(value)) = (k.as_str(), v.as_str()) {
                             child_env.insert(
@@ -4131,8 +4142,6 @@ async fn execute_reusable_workflow_job(
             }
 
             // Execute called workflow, reusing parent's artifact/cache stores.
-            // TODO: propagate parent secret_manager/secret_masker when `secrets: inherit`
-            // is specified (currently reusable workflow jobs cannot access parent secrets).
             let plan = dependency::resolve_dependencies(&called)?;
             let mut all_results = Vec::new();
             let mut any_failed = false;
@@ -4210,7 +4219,12 @@ async fn execute_reusable_workflow_job(
         }
     }
     if let Some(secrets_val) = secrets {
-        if let Some(map) = secrets_val.as_mapping() {
+        if secrets_val.as_str() == Some("inherit") {
+            wrkflw_logging::warning(
+                "`secrets: inherit` is not yet supported for reusable workflows; \
+                 parent secrets will not be available in the called workflow",
+            );
+        } else if let Some(map) = secrets_val.as_mapping() {
             for (k, v) in map {
                 if let (Some(key), Some(value)) = (k.as_str(), v.as_str()) {
                     child_env.insert(format!("SECRET_{}", key.to_uppercase()), value.to_string());
@@ -4220,8 +4234,6 @@ async fn execute_reusable_workflow_job(
     }
 
     // Execute called workflow, reusing parent's artifact/cache stores.
-    // TODO: propagate parent secret_manager/secret_masker when `secrets: inherit`
-    // is specified (currently reusable workflow jobs cannot access parent secrets).
     let plan = dependency::resolve_dependencies(&called)?;
     let mut all_results = Vec::new();
     let mut any_failed = false;

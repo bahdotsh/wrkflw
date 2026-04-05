@@ -90,7 +90,7 @@ pub fn parse_workflow_commands(output: &str) -> Vec<WorkflowCommand> {
 fn parse_command_line(line: &str) -> Option<WorkflowCommand> {
     // Format: ::command param1=val1,param2=val2::message
     // The line starts with "::" — strip it.
-    let rest = &line[2..];
+    let rest = line.strip_prefix("::").unwrap_or(line);
 
     // Find the second "::" that separates command+params from the message
     let (cmd_part, message) = if let Some(idx) = rest.find("::") {

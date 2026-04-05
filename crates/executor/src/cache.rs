@@ -65,11 +65,17 @@ impl CacheStore {
         let path = path.to_string();
         let workspace = workspace.to_path_buf();
 
-        tokio::task::spawn_blocking(move || {
+        match tokio::task::spawn_blocking(move || {
             this.restore_inner(&key, &restore_keys, &path, &workspace)
         })
         .await
-        .ok()?
+        {
+            Ok(result) => result,
+            Err(e) => {
+                wrkflw_logging::warning(&format!("Cache restore task panicked: {}", e));
+                None
+            }
+        }
     }
 
     /// Save the contents of `path` (relative to `workspace`) under `key`.

@@ -35,6 +35,15 @@ static PATTERNS: OnceLock<CompiledPatterns> = OnceLock::new();
 /// Uses interior mutability (`RwLock`) so secrets can be added through shared
 /// references — e.g. when processing `::add-mask::` workflow commands during
 /// step execution while the masker is shared across the job.
+///
+/// ## Poison recovery
+///
+/// All `RwLock` acquisitions use `.unwrap_or_else(|e| e.into_inner())` to
+/// recover from poisoned locks rather than panicking. If a thread panics
+/// while holding the lock, the data may be in a partially-updated state
+/// (e.g. a secret added to `secret_cache` but not yet in `secrets`), but
+/// this is acceptable: the masker is a best-effort safety net and a missed
+/// or extra mask is far less harmful than crashing the executor.
 pub struct SecretMasker {
     secrets: RwLock<HashSet<String>>,
     secret_cache: RwLock<HashMap<String, String>>,

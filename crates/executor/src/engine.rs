@@ -2845,9 +2845,10 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
             }
 
             {
-                let cache_hit =
-                    ctx.cache_store
-                        .restore(&key, &restore_keys, &cache_path, ctx.working_dir);
+                let cache_hit = ctx
+                    .cache_store
+                    .restore(&key, &restore_keys, &cache_path, ctx.working_dir)
+                    .await;
 
                 // Write cache-hit output to GITHUB_OUTPUT file
                 if let Some(output_path) = ctx.job_env.get("GITHUB_OUTPUT") {
@@ -2871,8 +2872,19 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                         )
                     }
                     None => {
-                        // No cache hit — try to save current path for future runs
-                        let msg = match ctx.cache_store.save(&key, &cache_path, ctx.working_dir) {
+                        // Divergence from GitHub Actions: in real GHA, `actions/cache`
+                        // saves in a post-step hook that runs *after* all steps complete
+                        // (and only if the job succeeds). We save eagerly here because
+                        // we don't have a post-step hook mechanism. This is safe because
+                        // each workflow run uses a fresh tempdir workspace, so the path
+                        // typically doesn't exist yet at this point (the save fails with
+                        // a benign message). If the path *does* exist (e.g. from
+                        // actions/checkout), the content is current, not stale.
+                        let msg = match ctx
+                            .cache_store
+                            .save(&key, &cache_path, ctx.working_dir)
+                            .await
+                        {
                             Ok(()) => {
                                 format!(
                                     "Cache miss. Saved path '{}' with key '{}'",
@@ -7328,5 +7340,76 @@ runs:
         let merged = aggregate_reusable_workflow_outputs(&job_outputs);
         assert!(!merged.contains_key("key"));
         assert_eq!(merged.get("real").unwrap(), "value");
+    }
+
+    #[test]
+    fn build_needs_context_empty_when_no_needs_declared() {
+        let job = make_job(None, None);
+
+        let mut all_outputs = HashMap::new();
+        all_outputs.insert("build".to_string(), HashMap::new());
+        let mut all_results = HashMap::new();
+        all_results.insert("build".to_string(), "success".to_string());
+
+        let (needs_outputs, needs_results) = build_needs_context(&job, &all_outputs, &all_results);
+
+        assert!(needs_outputs.is_empty());
+        assert!(needs_results.is_empty());
+    }
+
+    #[test]
+    fn build_needs_context_ignores_missing_upstream_jobs() {
+        let mut job = make_job(None, None);
+        job.needs = Some(vec!["nonexistent".to_string()]);
+
+        let (needs_outputs, needs_results) =
+            build_needs_context(&job, &HashMap::new(), &HashMap::new());
+
+        assert!(needs_outputs.is_empty());
+        assert!(needs_results.is_empty());
+    }
+
+    #[test]
+    fn resolve_job_outputs_handles_static_and_dynamic_values() {
+        let job: Job = serde_yaml::from_str(
+            r#"
+            steps: []
+            outputs:
+              version: "${{ steps.build.outputs.ver }}"
+              label: "release"
+            "#,
+        )
+        .unwrap();
+
+        let mut step_outputs = HashMap::new();
+        let mut build_out = HashMap::new();
+        build_out.insert("ver".to_string(), "3.0.0".to_string());
+        step_outputs.insert("build".to_string(), build_out);
+
+        let result = resolve_job_outputs(
+            &job,
+            &step_outputs,
+            &HashMap::new(),
+            &HashMap::new(),
+            "success",
+        );
+
+        assert_eq!(result.get("version").unwrap(), "3.0.0");
+        assert_eq!(result.get("label").unwrap(), "release");
+    }
+
+    #[test]
+    fn resolve_job_outputs_empty_when_no_outputs_section() {
+        let job = make_job(None, None);
+
+        let resolved = resolve_job_outputs(
+            &job,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            "success",
+        );
+
+        assert!(resolved.is_empty());
     }
 }

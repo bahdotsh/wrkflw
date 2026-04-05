@@ -12,6 +12,11 @@ use std::path::{Path, PathBuf};
 const MAX_CACHE_SIZE_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// Manages a persistent local cache for workflow runs.
+///
+/// All public I/O methods (`restore`, `save`) run filesystem work on a
+/// blocking thread via `tokio::task::spawn_blocking` to avoid stalling the
+/// async executor — matching the pattern used by `ArtifactStore`.
+#[derive(Clone)]
 pub struct CacheStore {
     root: PathBuf,
 }
@@ -45,7 +50,43 @@ impl CacheStore {
     ///
     /// `path` is the directory to restore into (relative to `workspace`).
     /// Returns the matched key on hit, or `None` on miss.
-    pub fn restore(
+    ///
+    /// Filesystem I/O is offloaded to a blocking thread.
+    pub async fn restore(
+        &self,
+        key: &str,
+        restore_keys: &[String],
+        path: &str,
+        workspace: &Path,
+    ) -> Option<String> {
+        let this = self.clone();
+        let key = key.to_string();
+        let restore_keys = restore_keys.to_vec();
+        let path = path.to_string();
+        let workspace = workspace.to_path_buf();
+
+        tokio::task::spawn_blocking(move || {
+            this.restore_inner(&key, &restore_keys, &path, &workspace)
+        })
+        .await
+        .ok()?
+    }
+
+    /// Save the contents of `path` (relative to `workspace`) under `key`.
+    ///
+    /// Filesystem I/O is offloaded to a blocking thread.
+    pub async fn save(&self, key: &str, path: &str, workspace: &Path) -> Result<(), String> {
+        let this = self.clone();
+        let key = key.to_string();
+        let path = path.to_string();
+        let workspace = workspace.to_path_buf();
+
+        tokio::task::spawn_blocking(move || this.save_inner(&key, &path, &workspace))
+            .await
+            .map_err(|e| format!("Cache task panicked: {}", e))?
+    }
+
+    fn restore_inner(
         &self,
         key: &str,
         restore_keys: &[String],
@@ -80,8 +121,7 @@ impl CacheStore {
         None
     }
 
-    /// Save the contents of `path` (relative to `workspace`) under `key`.
-    pub fn save(&self, key: &str, path: &str, workspace: &Path) -> Result<(), String> {
+    fn save_inner(&self, key: &str, path: &str, workspace: &Path) -> Result<(), String> {
         // Validate that the resolved source stays within the workspace
         if !validate_cache_path(path, workspace) {
             return Err(format!("Cache path '{}' escapes workspace directory", path));
@@ -286,8 +326,8 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
-    #[test]
-    fn save_and_restore_directory() {
+    #[tokio::test]
+    async fn save_and_restore_directory() {
         let cache_root = tempdir().unwrap();
         let workspace = tempdir().unwrap();
 
@@ -302,11 +342,14 @@ mod tests {
         // Save
         store
             .save("node-deps-abc123", "node_modules", workspace.path())
+            .await
             .unwrap();
 
         // Restore to a different workspace
         let workspace2 = tempdir().unwrap();
-        let matched = store.restore("node-deps-abc123", &[], "node_modules", workspace2.path());
+        let matched = store
+            .restore("node-deps-abc123", &[], "node_modules", workspace2.path())
+            .await;
         assert_eq!(matched, Some("node-deps-abc123".to_string()));
         assert_eq!(
             std::fs::read_to_string(workspace2.path().join("node_modules/README")).unwrap(),
@@ -318,18 +361,20 @@ mod tests {
         );
     }
 
-    #[test]
-    fn restore_miss() {
+    #[tokio::test]
+    async fn restore_miss() {
         let cache_root = tempdir().unwrap();
         let workspace = tempdir().unwrap();
         let store = CacheStore::with_root(cache_root.path().to_path_buf()).unwrap();
 
-        let result = store.restore("missing-key", &[], "some_dir", workspace.path());
+        let result = store
+            .restore("missing-key", &[], "some_dir", workspace.path())
+            .await;
         assert!(result.is_none());
     }
 
-    #[test]
-    fn restore_by_prefix() {
+    #[tokio::test]
+    async fn restore_by_prefix() {
         let cache_root = tempdir().unwrap();
         let workspace = tempdir().unwrap();
 
@@ -340,16 +385,19 @@ mod tests {
         let store = CacheStore::with_root(cache_root.path().to_path_buf()).unwrap();
         store
             .save("rust-cargo-abc123", "cache_dir", workspace.path())
+            .await
             .unwrap();
 
         // Restore with prefix
         let workspace2 = tempdir().unwrap();
-        let matched = store.restore(
-            "rust-cargo-xyz789",
-            &["rust-cargo-".to_string()],
-            "cache_dir",
-            workspace2.path(),
-        );
+        let matched = store
+            .restore(
+                "rust-cargo-xyz789",
+                &["rust-cargo-".to_string()],
+                "cache_dir",
+                workspace2.path(),
+            )
+            .await;
         assert_eq!(matched, Some("rust-cargo-abc123".to_string()));
         assert_eq!(
             std::fs::read_to_string(workspace2.path().join("cache_dir/data.bin")).unwrap(),
@@ -357,8 +405,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn save_overwrites_existing() {
+    #[tokio::test]
+    async fn save_overwrites_existing() {
         let cache_root = tempdir().unwrap();
         let workspace = tempdir().unwrap();
 
@@ -366,15 +414,23 @@ mod tests {
         std::fs::write(workspace.path().join("data/v1.txt"), "version1").unwrap();
 
         let store = CacheStore::with_root(cache_root.path().to_path_buf()).unwrap();
-        store.save("my-key", "data", workspace.path()).unwrap();
+        store
+            .save("my-key", "data", workspace.path())
+            .await
+            .unwrap();
 
         // Overwrite
         std::fs::write(workspace.path().join("data/v1.txt"), "version2").unwrap();
-        store.save("my-key", "data", workspace.path()).unwrap();
+        store
+            .save("my-key", "data", workspace.path())
+            .await
+            .unwrap();
 
         // Restore should get v2
         let workspace2 = tempdir().unwrap();
-        store.restore("my-key", &[], "data", workspace2.path());
+        store
+            .restore("my-key", &[], "data", workspace2.path())
+            .await;
         assert_eq!(
             std::fs::read_to_string(workspace2.path().join("data/v1.txt")).unwrap(),
             "version2"
@@ -421,8 +477,8 @@ mod tests {
         assert_eq!(dir_size(d.path()), 8);
     }
 
-    #[test]
-    fn evict_removes_oldest_entries() {
+    #[tokio::test]
+    async fn evict_removes_oldest_entries() {
         let cache_root = tempdir().unwrap();
         let workspace = tempdir().unwrap();
         let store = CacheStore::with_root(cache_root.path().to_path_buf()).unwrap();
@@ -430,26 +486,28 @@ mod tests {
         // Create two cache entries with known order (sleep to separate mtimes)
         std::fs::create_dir_all(workspace.path().join("d1")).unwrap();
         std::fs::write(workspace.path().join("d1/f.txt"), "old").unwrap();
-        store.save("key-old", "d1", workspace.path()).unwrap();
+        store.save("key-old", "d1", workspace.path()).await.unwrap();
 
         // Touch the second entry slightly later
         std::thread::sleep(std::time::Duration::from_millis(50));
         std::fs::create_dir_all(workspace.path().join("d2")).unwrap();
         std::fs::write(workspace.path().join("d2/f.txt"), "new").unwrap();
-        store.save("key-new", "d2", workspace.path()).unwrap();
+        store.save("key-new", "d2", workspace.path()).await.unwrap();
 
         // Both entries should exist
         let workspace2 = tempdir().unwrap();
         assert!(store
             .restore("key-old", &[], "d1", workspace2.path())
+            .await
             .is_some());
         assert!(store
             .restore("key-new", &[], "d2", workspace2.path())
+            .await
             .is_some());
     }
 
-    #[test]
-    fn save_single_file_without_filename_returns_error() {
+    #[tokio::test]
+    async fn save_single_file_without_filename_returns_error() {
         // The file_name() fix should error on paths with no file component.
         // In practice, validate_cache_path would catch ".." paths first,
         // but we test the save path for completeness.
@@ -459,6 +517,9 @@ mod tests {
 
         // A normal file save should work
         std::fs::write(workspace.path().join("file.txt"), "content").unwrap();
-        assert!(store.save("file-key", "file.txt", workspace.path()).is_ok());
+        assert!(store
+            .save("file-key", "file.txt", workspace.path())
+            .await
+            .is_ok());
     }
 }

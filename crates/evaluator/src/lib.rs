@@ -4,7 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use wrkflw_models::ValidationResult;
-use wrkflw_validators::{validate_jobs, validate_triggers};
+use wrkflw_validators::{validate_env, validate_jobs, validate_triggers};
 
 pub fn evaluate_workflow_file(path: &Path, verbose: bool) -> Result<ValidationResult, String> {
     let content = fs::read_to_string(path).map_err(|e| format!("Failed to read file: {}", e))?;
@@ -37,6 +37,11 @@ pub fn evaluate_workflow_file(path: &Path, verbose: bool) -> Result<ValidationRe
         None => {
             result.add_issue("Workflow is missing 'jobs' section".to_string());
         }
+    }
+
+    // Validate top-level env is a mapping
+    if let Some(env) = workflow.get("env") {
+        validate_env(env, "Top-level", &mut result);
     }
 
     // Check for valid triggers

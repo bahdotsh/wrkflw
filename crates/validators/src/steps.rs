@@ -1,4 +1,4 @@
-use crate::validate_action_reference;
+use crate::{validate_action_reference, validate_env};
 use serde_yaml::Value;
 use std::collections::HashSet;
 use std::path::Path;
@@ -48,6 +48,15 @@ pub fn validate_steps(
                 }
             }
 
+            // Validate env is a mapping, not a bare string
+            if let Some(env_val) = step_map.get(Value::String("env".to_string())) {
+                validate_env(
+                    env_val,
+                    &format!("Job '{}', step {}", job_name, i + 1),
+                    result,
+                );
+            }
+
             // Validate action reference if 'uses' is present
             if let Some(Value::String(uses)) = step_map.get(Value::String("uses".to_string())) {
                 let with_params = step_map
@@ -91,6 +100,55 @@ mod tests {
         let yaml = r#"
 - name: "build"
   run: "cargo build"
+"#;
+        let steps: Vec<Value> = serde_yaml::from_str(yaml).unwrap();
+        let mut result = ValidationResult::new();
+        validate_steps(&steps, "test-job", None, &mut result);
+
+        assert!(result.is_valid);
+        assert!(result.issues.is_empty());
+    }
+
+    #[test]
+    fn test_step_env_string_is_invalid() {
+        let yaml = r#"
+- name: "build"
+  run: "cargo build"
+  env: VAR=value
+"#;
+        let steps: Vec<Value> = serde_yaml::from_str(yaml).unwrap();
+        let mut result = ValidationResult::new();
+        validate_steps(&steps, "test-job", None, &mut result);
+
+        assert!(!result.is_valid);
+        assert!(result
+            .issues
+            .iter()
+            .any(|i| i.contains("'env' must be a mapping")));
+    }
+
+    #[test]
+    fn test_step_env_mapping_is_valid() {
+        let yaml = r#"
+- name: "build"
+  run: "cargo build"
+  env:
+    MY_VAR: my_value
+"#;
+        let steps: Vec<Value> = serde_yaml::from_str(yaml).unwrap();
+        let mut result = ValidationResult::new();
+        validate_steps(&steps, "test-job", None, &mut result);
+
+        assert!(result.is_valid);
+        assert!(result.issues.is_empty());
+    }
+
+    #[test]
+    fn test_step_env_expression_is_valid() {
+        let yaml = r#"
+- name: "build"
+  run: "cargo build"
+  env: ${{ fromJSON(needs.setup.outputs.env) }}
 "#;
         let steps: Vec<Value> = serde_yaml::from_str(yaml).unwrap();
         let mut result = ValidationResult::new();

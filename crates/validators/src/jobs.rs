@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use crate::{validate_matrix, validate_steps};
+use crate::{validate_env, validate_matrix, validate_steps};
 use serde_yaml::Value;
 use wrkflw_models::ValidationResult;
 
@@ -90,6 +90,11 @@ pub fn validate_jobs(jobs: &Value, repo_root: Option<&Path>, result: &mut Valida
                                 job_name, need
                             ));
                         }
+                    }
+
+                    // Validate env is a mapping, not a bare string
+                    if let Some(env_val) = job_config.get(Value::String("env".to_string())) {
+                        validate_env(env_val, &format!("Job '{}'", job_name), result);
                     }
 
                     // Validate matrix configuration if present
@@ -349,6 +354,51 @@ deploy:
                 .iter()
                 .any(|i| i.contains("Circular dependency")),
             "Valid DAG should not have cycle issues, got: {:?}",
+            result.issues
+        );
+    }
+
+    #[test]
+    fn test_job_env_string_is_invalid() {
+        let yaml = r#"
+build:
+  runs-on: ubuntu-latest
+  env: VAR=value
+  steps:
+    - run: echo build
+"#;
+        let jobs: Value = serde_yaml::from_str(yaml).unwrap();
+        let mut result = ValidationResult::new();
+        validate_jobs(&jobs, None, &mut result);
+
+        assert!(!result.is_valid);
+        assert!(
+            result
+                .issues
+                .iter()
+                .any(|i| i.contains("'env' must be a mapping")),
+            "Expected env mapping error, got: {:?}",
+            result.issues
+        );
+    }
+
+    #[test]
+    fn test_job_env_mapping_is_valid() {
+        let yaml = r#"
+build:
+  runs-on: ubuntu-latest
+  env:
+    MY_VAR: my_value
+  steps:
+    - run: echo build
+"#;
+        let jobs: Value = serde_yaml::from_str(yaml).unwrap();
+        let mut result = ValidationResult::new();
+        validate_jobs(&jobs, None, &mut result);
+
+        assert!(
+            !result.issues.iter().any(|i| i.contains("env")),
+            "Valid env mapping should not produce env issues, got: {:?}",
             result.issues
         );
     }

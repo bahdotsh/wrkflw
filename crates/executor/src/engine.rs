@@ -4424,7 +4424,7 @@ fn aggregate_reusable_workflow_outputs(
     let mut merged = HashMap::new();
     // Sort by job name for deterministic output when keys collide
     let mut sorted_jobs: Vec<_> = job_outputs.iter().collect();
-    sorted_jobs.sort_by_key(|(name, _)| (*name).clone());
+    sorted_jobs.sort_by(|a, b| a.0.cmp(b.0));
     for (_, outputs) in sorted_jobs {
         for (key, value) in outputs {
             if !value.is_empty() {

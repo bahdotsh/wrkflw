@@ -80,20 +80,18 @@ enum Token {
 }
 
 struct Tokenizer<'a> {
-    input: &'a [u8],
-    pos: usize,
+    input: &'a str,
+    pos: usize, // byte offset into `input`
 }
 
 impl<'a> Tokenizer<'a> {
     fn new(input: &'a str) -> Self {
-        Self {
-            input: input.as_bytes(),
-            pos: 0,
-        }
+        Self { input, pos: 0 }
     }
 
     fn skip_whitespace(&mut self) {
-        while self.pos < self.input.len() && self.input[self.pos].is_ascii_whitespace() {
+        let bytes = self.input.as_bytes();
+        while self.pos < bytes.len() && bytes[self.pos].is_ascii_whitespace() {
             self.pos += 1;
         }
     }
@@ -106,7 +104,8 @@ impl<'a> Tokenizer<'a> {
                 tokens.push(Token::Eof);
                 return Ok(tokens);
             }
-            let ch = self.input[self.pos] as char;
+            let bytes = self.input.as_bytes();
+            let ch = bytes[self.pos] as char;
             match ch {
                 '.' => {
                     tokens.push(Token::Dot);
@@ -125,7 +124,7 @@ impl<'a> Tokenizer<'a> {
                     self.pos += 1;
                 }
                 '=' => {
-                    if self.peek_next() == Some('=') {
+                    if self.peek_next_byte() == Some(b'=') {
                         tokens.push(Token::Eq);
                         self.pos += 2;
                     } else {
@@ -133,7 +132,7 @@ impl<'a> Tokenizer<'a> {
                     }
                 }
                 '!' => {
-                    if self.peek_next() == Some('=') {
+                    if self.peek_next_byte() == Some(b'=') {
                         tokens.push(Token::Ne);
                         self.pos += 2;
                     } else {
@@ -142,7 +141,7 @@ impl<'a> Tokenizer<'a> {
                     }
                 }
                 '<' => {
-                    if self.peek_next() == Some('=') {
+                    if self.peek_next_byte() == Some(b'=') {
                         tokens.push(Token::Le);
                         self.pos += 2;
                     } else {
@@ -151,7 +150,7 @@ impl<'a> Tokenizer<'a> {
                     }
                 }
                 '>' => {
-                    if self.peek_next() == Some('=') {
+                    if self.peek_next_byte() == Some(b'=') {
                         tokens.push(Token::Ge);
                         self.pos += 2;
                     } else {
@@ -160,7 +159,7 @@ impl<'a> Tokenizer<'a> {
                     }
                 }
                 '&' => {
-                    if self.peek_next() == Some('&') {
+                    if self.peek_next_byte() == Some(b'&') {
                         tokens.push(Token::And);
                         self.pos += 2;
                     } else {
@@ -168,7 +167,7 @@ impl<'a> Tokenizer<'a> {
                     }
                 }
                 '|' => {
-                    if self.peek_next() == Some('|') {
+                    if self.peek_next_byte() == Some(b'|') {
                         tokens.push(Token::Or);
                         self.pos += 2;
                     } else {
@@ -191,31 +190,38 @@ impl<'a> Tokenizer<'a> {
                     });
                 }
                 _ => {
+                    // Decode the actual char at this position for the error message
+                    let actual_ch = self.input[self.pos..].chars().next().unwrap_or(ch);
                     return Err(format!(
                         "unexpected character '{}' at position {}",
-                        ch, self.pos
-                    ))
+                        actual_ch, self.pos
+                    ));
                 }
             }
         }
     }
 
-    fn peek_next(&self) -> Option<char> {
-        if self.pos + 1 < self.input.len() {
-            Some(self.input[self.pos + 1] as char)
+    /// Peek at the next byte (used only for ASCII operator lookahead).
+    fn peek_next_byte(&self) -> Option<u8> {
+        let bytes = self.input.as_bytes();
+        if self.pos + 1 < bytes.len() {
+            Some(bytes[self.pos + 1])
         } else {
             None
         }
     }
 
+    /// Read a single-quoted string literal, handling multi-byte UTF-8 correctly.
     fn read_string(&mut self) -> Result<Token, String> {
         self.pos += 1; // skip opening quote
         let mut s = String::new();
         while self.pos < self.input.len() {
-            let ch = self.input[self.pos] as char;
+            // Iterate chars from current position to handle multi-byte correctly
+            let ch = self.input[self.pos..].chars().next().unwrap();
             if ch == '\'' {
                 // Check for escaped quote ('')
-                if self.peek_next() == Some('\'') {
+                let next_pos = self.pos + 1;
+                if next_pos < self.input.len() && self.input.as_bytes()[next_pos] == b'\'' {
                     s.push('\'');
                     self.pos += 2;
                 } else {
@@ -224,7 +230,7 @@ impl<'a> Tokenizer<'a> {
                 }
             } else {
                 s.push(ch);
-                self.pos += 1;
+                self.pos += ch.len_utf8();
             }
         }
         Err("unterminated string literal".to_string())
@@ -232,13 +238,13 @@ impl<'a> Tokenizer<'a> {
 
     fn read_number(&mut self) -> Result<Token, String> {
         let start = self.pos;
-        while self.pos < self.input.len()
-            && (self.input[self.pos].is_ascii_digit() || self.input[self.pos] == b'.')
+        let bytes = self.input.as_bytes();
+        while self.pos < bytes.len()
+            && (bytes[self.pos].is_ascii_digit() || bytes[self.pos] == b'.')
         {
             self.pos += 1;
         }
-        let s = std::str::from_utf8(&self.input[start..self.pos])
-            .map_err(|e| format!("invalid number: {}", e))?;
+        let s = &self.input[start..self.pos];
         let n: f64 = s
             .parse()
             .map_err(|e| format!("invalid number '{}': {}", s, e))?;
@@ -247,15 +253,16 @@ impl<'a> Tokenizer<'a> {
 
     fn read_ident(&mut self) -> String {
         let start = self.pos;
-        while self.pos < self.input.len() {
-            let ch = self.input[self.pos];
+        let bytes = self.input.as_bytes();
+        while self.pos < bytes.len() {
+            let ch = bytes[self.pos];
             if ch.is_ascii_alphanumeric() || ch == b'_' || ch == b'-' {
                 self.pos += 1;
             } else {
                 break;
             }
         }
-        String::from_utf8_lossy(&self.input[start..self.pos]).to_string()
+        self.input[start..self.pos].to_string()
     }
 }
 
@@ -676,24 +683,27 @@ fn call_builtin(
             // by later placeholder substitutions (e.g. format('{0} {1}', '{1}', 'x')
             // should produce '{1} x', not 'x x').
             let mut result = String::with_capacity(fmt.len());
-            let fmt_bytes = fmt.as_bytes();
-            let mut i = 0;
-            while i < fmt_bytes.len() {
-                if fmt_bytes[i] == b'{' {
+            let mut chars = fmt.char_indices().peekable();
+            while let Some((i, ch)) = chars.next() {
+                if ch == '{' {
                     // Look for {N} pattern
-                    if let Some(close) = fmt[i + 1..].find('}') {
-                        let inner = &fmt[i + 1..i + 1 + close];
+                    let rest = &fmt[i + 1..];
+                    if let Some(close) = rest.find('}') {
+                        let inner = &rest[..close];
                         if let Ok(idx) = inner.parse::<usize>() {
                             if idx + 1 < args.len() {
                                 result.push_str(&args[idx + 1].to_output_string());
-                                i += close + 2; // skip past '}'
+                                // Skip past the closing '}'
+                                let skip_to = i + 1 + close + 1;
+                                while chars.peek().is_some_and(|(ci, _)| *ci < skip_to) {
+                                    chars.next();
+                                }
                                 continue;
                             }
                         }
                     }
                 }
-                result.push(fmt_bytes[i] as char);
-                i += 1;
+                result.push(ch);
             }
             Ok(ExprValue::String(result))
         }
@@ -1214,6 +1224,15 @@ mod tests {
         assert_eq!(
             evaluate("format('Hello {0}, you are {1}', 'world', 'great')", &ctx).unwrap(),
             ExprValue::String("Hello world, you are great".to_string())
+        );
+    }
+
+    #[test]
+    fn eval_format_non_ascii() {
+        let ctx = empty_ctx();
+        assert_eq!(
+            evaluate("format('{0} → {1}', 'a', 'b')", &ctx).unwrap(),
+            ExprValue::String("a → b".to_string())
         );
     }
 

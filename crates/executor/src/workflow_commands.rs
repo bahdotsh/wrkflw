@@ -62,7 +62,8 @@ pub enum WorkflowCommand {
 
 /// Decode GitHub Actions percent-encoded values.
 ///
-/// GitHub Actions encodes: `%25` → `%`, `%0A` → `\n`, `%0D` → `\r`, `%3A` → `:`.
+/// GitHub Actions encodes: `%25` → `%`, `%0A` → `\n`, `%0D` → `\r`,
+/// `%3A` → `:`, `%2C` → `,`, `%3B` → `;`.
 fn decode_value(s: &str) -> String {
     // Decode %25 (percent) LAST to avoid double-decode: if input contains
     // `%250A`, decoding %25 first would turn it into `%0A`, which the next
@@ -73,6 +74,10 @@ fn decode_value(s: &str) -> String {
         .replace("%0d", "\r")
         .replace("%3A", ":")
         .replace("%3a", ":")
+        .replace("%2C", ",")
+        .replace("%2c", ",")
+        .replace("%3B", ";")
+        .replace("%3b", ";")
         .replace("%25", "%")
 }
 
@@ -480,6 +485,32 @@ mod tests {
                 assert_eq!(message, "before%0Aafter");
             }
             _ => panic!("expected Error"),
+        }
+    }
+
+    #[test]
+    fn url_decoding_comma_and_semicolon() {
+        let output = "::error::item1%2Citem2%3Bitem3";
+        let cmds = parse_workflow_commands(output);
+        assert_eq!(cmds.len(), 1);
+        match &cmds[0] {
+            WorkflowCommand::Error { message, .. } => {
+                assert_eq!(message, "item1,item2;item3");
+            }
+            _ => panic!("expected Error"),
+        }
+    }
+
+    #[test]
+    fn url_decoding_comma_and_semicolon_lowercase() {
+        let output = "::warning::a%2cb%3bc";
+        let cmds = parse_workflow_commands(output);
+        assert_eq!(cmds.len(), 1);
+        match &cmds[0] {
+            WorkflowCommand::Warning { message, .. } => {
+                assert_eq!(message, "a,b;c");
+            }
+            _ => panic!("expected Warning"),
         }
     }
 }

@@ -2703,6 +2703,277 @@ fn preprocess_with_value(value: &str, ctx: &StepExecutionContext<'_>) -> String 
         .unwrap_or_default()
 }
 
+/// Handle `actions/upload-artifact` emulation.
+async fn handle_upload_artifact(
+    step_name: &str,
+    ctx: &StepExecutionContext<'_>,
+) -> Result<StepResult, ExecutionError> {
+    let with = ctx.step.with.as_ref();
+    let name = with
+        .and_then(|w| w.get("name"))
+        .map(|s| preprocess_with_value(s, ctx))
+        .unwrap_or_else(|| "artifact".to_string());
+    let path_pattern = with
+        .and_then(|w| w.get("path"))
+        .map(|s| preprocess_with_value(s, ctx))
+        .unwrap_or_default();
+
+    if path_pattern.is_empty() {
+        return Ok(StepResult::new(
+            step_name.to_string(),
+            StepStatus::Failure,
+            "Required input 'path' not provided for upload-artifact".to_string(),
+        ));
+    }
+
+    match ctx
+        .services
+        .artifact_store
+        .upload(&name, &path_pattern, ctx.working_dir)
+        .await
+    {
+        Ok(count) => {
+            wrkflw_logging::info(&format!(
+                "  Uploaded artifact '{}': {} file(s)",
+                name, count
+            ));
+            Ok(StepResult::new(
+                step_name.to_string(),
+                StepStatus::Success,
+                format!("Uploaded artifact '{}': {} file(s)", name, count),
+            ))
+        }
+        Err(e) => Ok(StepResult::new(
+            step_name.to_string(),
+            StepStatus::Failure,
+            format!("Failed to upload artifact '{}': {}", name, e),
+        )),
+    }
+}
+
+/// Handle `actions/download-artifact` emulation.
+async fn handle_download_artifact(
+    step_name: &str,
+    ctx: &StepExecutionContext<'_>,
+) -> Result<StepResult, ExecutionError> {
+    let with = ctx.step.with.as_ref();
+    let name = with
+        .and_then(|w| w.get("name"))
+        .map(|s| preprocess_with_value(s, ctx))
+        .unwrap_or_default();
+    let download_path = with
+        .and_then(|w| w.get("path"))
+        .map(|s| ctx.working_dir.join(preprocess_with_value(s, ctx)))
+        .unwrap_or_else(|| ctx.working_dir.to_path_buf());
+
+    // Validate download path stays within workspace (prevent path traversal).
+    // If we cannot canonicalize the workspace itself, reject — a non-absolute
+    // or non-existent workspace makes the safety check meaningless.
+    let canonical_ws = match ctx.working_dir.canonicalize() {
+        Ok(p) => p,
+        Err(_) => {
+            return Ok(StepResult::new(
+                step_name.to_string(),
+                StepStatus::Failure,
+                format!(
+                    "download-artifact: cannot verify path safety — \
+                     workspace '{}' could not be canonicalized",
+                    ctx.working_dir.display()
+                ),
+            ));
+        }
+    };
+    let is_safe = if let Ok(canonical_dl) = download_path.canonicalize() {
+        canonical_dl.starts_with(&canonical_ws)
+    } else if let Some(parent) = download_path.parent() {
+        parent
+            .canonicalize()
+            .map(|p| p.starts_with(&canonical_ws))
+            .unwrap_or(false)
+    } else {
+        false
+    };
+    if !is_safe {
+        return Ok(StepResult::new(
+            step_name.to_string(),
+            StepStatus::Failure,
+            format!(
+                "download-artifact path '{}' escapes workspace directory",
+                download_path.display()
+            ),
+        ));
+    }
+
+    if name.is_empty() {
+        // Download all artifacts into named subdirectories
+        let names = ctx.services.artifact_store.list().await;
+        let mut total = 0;
+        for artifact_name in &names {
+            let target = download_path.join(artifact_name);
+            match ctx
+                .services
+                .artifact_store
+                .download(artifact_name, &target)
+                .await
+            {
+                Ok(c) => total += c,
+                Err(e) => {
+                    return Ok(StepResult::new(
+                        step_name.to_string(),
+                        StepStatus::Failure,
+                        format!("Failed to download artifact '{}': {}", artifact_name, e),
+                    ));
+                }
+            }
+        }
+        wrkflw_logging::info(&format!(
+            "  Downloaded {} artifact(s), {} file(s) total",
+            names.len(),
+            total
+        ));
+        Ok(StepResult::new(
+            step_name.to_string(),
+            StepStatus::Success,
+            format!(
+                "Downloaded {} artifact(s), {} file(s) total",
+                names.len(),
+                total
+            ),
+        ))
+    } else {
+        match ctx
+            .services
+            .artifact_store
+            .download(&name, &download_path)
+            .await
+        {
+            Ok(count) => {
+                wrkflw_logging::info(&format!(
+                    "  Downloaded artifact '{}': {} file(s)",
+                    name, count
+                ));
+                Ok(StepResult::new(
+                    step_name.to_string(),
+                    StepStatus::Success,
+                    format!("Downloaded artifact '{}': {} file(s)", name, count),
+                ))
+            }
+            Err(e) => Ok(StepResult::new(
+                step_name.to_string(),
+                StepStatus::Failure,
+                format!("Failed to download artifact '{}': {}", name, e),
+            )),
+        }
+    }
+}
+
+/// Handle `actions/cache` emulation.
+async fn handle_cache_action(
+    step_name: &str,
+    ctx: &StepExecutionContext<'_>,
+) -> Result<StepResult, ExecutionError> {
+    let with = ctx.step.with.as_ref();
+    let key = with
+        .and_then(|w| w.get("key"))
+        .map(|s| preprocess_with_value(s, ctx))
+        .unwrap_or_default();
+    let cache_path_raw = with
+        .and_then(|w| w.get("path"))
+        .map(|s| preprocess_with_value(s, ctx))
+        .unwrap_or_default();
+    // actions/cache supports multi-line `path` input (one path per line)
+    let cache_paths: Vec<String> = cache_path_raw
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    let restore_keys: Vec<String> = with
+        .and_then(|w| w.get("restore-keys"))
+        .map(|s| preprocess_with_value(s, ctx))
+        .map(|s| {
+            s.lines()
+                .map(|l| l.trim().to_string())
+                .filter(|l| !l.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if key.is_empty() || cache_paths.is_empty() {
+        return Ok(StepResult::new(
+            step_name.to_string(),
+            StepStatus::Failure,
+            "Required inputs 'key' and 'path' not provided for actions/cache".to_string(),
+        ));
+    }
+
+    // Try to restore each path. A hit on any path counts as a cache hit.
+    let mut cache_hit: Option<String> = None;
+    for cache_path in &cache_paths {
+        let hit = ctx
+            .services
+            .cache_store
+            .restore(&key, &restore_keys, cache_path, ctx.working_dir)
+            .await;
+        if cache_hit.is_none() {
+            cache_hit = hit;
+        }
+    }
+
+    // Write cache-hit output to GITHUB_OUTPUT file
+    if let Some(output_path) = ctx.job_env.get("GITHUB_OUTPUT") {
+        let hit_val = if cache_hit.is_some() { "true" } else { "false" };
+        if let Err(e) = std::fs::OpenOptions::new()
+            .append(true)
+            .open(output_path)
+            .and_then(|mut f| {
+                use std::io::Write;
+                writeln!(f, "cache-hit={}", hit_val)
+            })
+        {
+            wrkflw_logging::warning(&format!(
+                "Failed to write cache-hit to GITHUB_OUTPUT: {}",
+                e
+            ));
+        }
+    }
+
+    match &cache_hit {
+        Some(matched_key) => {
+            wrkflw_logging::info(&format!("  Cache restored (key: {})", matched_key));
+            Ok(StepResult::new(
+                step_name.to_string(),
+                StepStatus::Success,
+                format!("Cache restored (key: {})", matched_key),
+            ))
+        }
+        None => {
+            // Defer the save to end-of-job, matching GitHub Actions' behavior where
+            // `actions/cache` saves in a post-step hook that only runs after all
+            // steps complete and the job succeeds.
+            {
+                let mut pending = ctx
+                    .pending_cache_saves
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                for cache_path in &cache_paths {
+                    pending.push(PendingCacheSave {
+                        key: key.clone(),
+                        path: cache_path.clone(),
+                        workspace: ctx.working_dir.to_path_buf(),
+                    });
+                }
+            }
+            let msg = format!("Cache miss for key '{}'. Save deferred to end of job.", key);
+            wrkflw_logging::info(&format!("  {}", msg));
+            Ok(StepResult::new(
+                step_name.to_string(),
+                StepStatus::Success,
+                msg,
+            ))
+        }
+    }
+}
+
 async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, ExecutionError> {
     let step_name = ctx
         .step
@@ -2795,251 +3066,11 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
 
             StepResult::new(step_name, StepStatus::Success, output)
         } else if uses.starts_with("actions/upload-artifact") {
-            // Emulate actions/upload-artifact locally
-            let with = ctx.step.with.as_ref();
-            let name = with
-                .and_then(|w| w.get("name"))
-                .map(|s| preprocess_with_value(s, &ctx))
-                .unwrap_or_else(|| "artifact".to_string());
-            let path_pattern = with
-                .and_then(|w| w.get("path"))
-                .map(|s| preprocess_with_value(s, &ctx))
-                .unwrap_or_default();
-
-            if path_pattern.is_empty() {
-                return Ok(StepResult::new(
-                    step_name,
-                    StepStatus::Failure,
-                    "Required input 'path' not provided for upload-artifact".to_string(),
-                ));
-            }
-
-            match ctx
-                .services
-                .artifact_store
-                .upload(&name, &path_pattern, ctx.working_dir)
-                .await
-            {
-                Ok(count) => {
-                    wrkflw_logging::info(&format!(
-                        "  Uploaded artifact '{}': {} file(s)",
-                        name, count
-                    ));
-                    StepResult::new(
-                        step_name,
-                        StepStatus::Success,
-                        format!("Uploaded artifact '{}': {} file(s)", name, count),
-                    )
-                }
-                Err(e) => StepResult::new(
-                    step_name,
-                    StepStatus::Failure,
-                    format!("Failed to upload artifact '{}': {}", name, e),
-                ),
-            }
+            handle_upload_artifact(&step_name, &ctx).await?
         } else if uses.starts_with("actions/download-artifact") {
-            // Emulate actions/download-artifact locally
-            let with = ctx.step.with.as_ref();
-            let name = with
-                .and_then(|w| w.get("name"))
-                .map(|s| preprocess_with_value(s, &ctx))
-                .unwrap_or_default();
-            let download_path = with
-                .and_then(|w| w.get("path"))
-                .map(|s| ctx.working_dir.join(preprocess_with_value(s, &ctx)))
-                .unwrap_or_else(|| ctx.working_dir.to_path_buf());
-
-            // Validate download path stays within workspace (prevent path traversal)
-            {
-                let canonical_ws = ctx
-                    .working_dir
-                    .canonicalize()
-                    .unwrap_or_else(|_| ctx.working_dir.to_path_buf());
-                // Check the path itself if it exists, otherwise check its parent
-                let is_safe = if let Ok(canonical_dl) = download_path.canonicalize() {
-                    canonical_dl.starts_with(&canonical_ws)
-                } else if let Some(parent) = download_path.parent() {
-                    parent
-                        .canonicalize()
-                        .map(|p| p.starts_with(&canonical_ws))
-                        .unwrap_or(false)
-                } else {
-                    false
-                };
-                if !is_safe {
-                    return Ok(StepResult::new(
-                        step_name,
-                        StepStatus::Failure,
-                        format!(
-                            "download-artifact path '{}' escapes workspace directory",
-                            download_path.display()
-                        ),
-                    ));
-                }
-            }
-
-            if name.is_empty() {
-                // Download all artifacts into named subdirectories
-                let names = ctx.services.artifact_store.list().await;
-                let mut total = 0;
-                for artifact_name in &names {
-                    let target = download_path.join(artifact_name);
-                    match ctx
-                        .services
-                        .artifact_store
-                        .download(artifact_name, &target)
-                        .await
-                    {
-                        Ok(c) => total += c,
-                        Err(e) => {
-                            return Ok(StepResult::new(
-                                step_name,
-                                StepStatus::Failure,
-                                format!("Failed to download artifact '{}': {}", artifact_name, e),
-                            ));
-                        }
-                    }
-                }
-                wrkflw_logging::info(&format!(
-                    "  Downloaded {} artifact(s), {} file(s) total",
-                    names.len(),
-                    total
-                ));
-                StepResult::new(
-                    step_name,
-                    StepStatus::Success,
-                    format!(
-                        "Downloaded {} artifact(s), {} file(s) total",
-                        names.len(),
-                        total
-                    ),
-                )
-            } else {
-                match ctx
-                    .services
-                    .artifact_store
-                    .download(&name, &download_path)
-                    .await
-                {
-                    Ok(count) => {
-                        wrkflw_logging::info(&format!(
-                            "  Downloaded artifact '{}': {} file(s)",
-                            name, count
-                        ));
-                        StepResult::new(
-                            step_name,
-                            StepStatus::Success,
-                            format!("Downloaded artifact '{}': {} file(s)", name, count),
-                        )
-                    }
-                    Err(e) => StepResult::new(
-                        step_name,
-                        StepStatus::Failure,
-                        format!("Failed to download artifact '{}': {}", name, e),
-                    ),
-                }
-            }
+            handle_download_artifact(&step_name, &ctx).await?
         } else if uses.starts_with("actions/cache") {
-            // Emulate actions/cache locally
-            let with = ctx.step.with.as_ref();
-            let key = with
-                .and_then(|w| w.get("key"))
-                .map(|s| preprocess_with_value(s, &ctx))
-                .unwrap_or_default();
-            let cache_path_raw = with
-                .and_then(|w| w.get("path"))
-                .map(|s| preprocess_with_value(s, &ctx))
-                .unwrap_or_default();
-            // actions/cache supports multi-line `path` input (one path per line)
-            let cache_paths: Vec<String> = cache_path_raw
-                .lines()
-                .map(|l| l.trim().to_string())
-                .filter(|l| !l.is_empty())
-                .collect();
-            let restore_keys: Vec<String> = with
-                .and_then(|w| w.get("restore-keys"))
-                .map(|s| preprocess_with_value(s, &ctx))
-                .map(|s| {
-                    s.lines()
-                        .map(|l| l.trim().to_string())
-                        .filter(|l| !l.is_empty())
-                        .collect()
-                })
-                .unwrap_or_default();
-
-            if key.is_empty() || cache_paths.is_empty() {
-                return Ok(StepResult::new(
-                    step_name,
-                    StepStatus::Failure,
-                    "Required inputs 'key' and 'path' not provided for actions/cache".to_string(),
-                ));
-            }
-
-            {
-                // Try to restore each path. A hit on any path counts as a cache hit.
-                let mut cache_hit: Option<String> = None;
-                for cache_path in &cache_paths {
-                    let hit = ctx
-                        .services
-                        .cache_store
-                        .restore(&key, &restore_keys, cache_path, ctx.working_dir)
-                        .await;
-                    if cache_hit.is_none() {
-                        cache_hit = hit;
-                    }
-                }
-
-                // Write cache-hit output to GITHUB_OUTPUT file
-                if let Some(output_path) = ctx.job_env.get("GITHUB_OUTPUT") {
-                    let hit_val = if cache_hit.is_some() { "true" } else { "false" };
-                    if let Err(e) = std::fs::OpenOptions::new()
-                        .append(true)
-                        .open(output_path)
-                        .and_then(|mut f| {
-                            use std::io::Write;
-                            writeln!(f, "cache-hit={}", hit_val)
-                        })
-                    {
-                        wrkflw_logging::warning(&format!(
-                            "Failed to write cache-hit to GITHUB_OUTPUT: {}",
-                            e
-                        ));
-                    }
-                }
-
-                match &cache_hit {
-                    Some(matched_key) => {
-                        wrkflw_logging::info(&format!("  Cache restored (key: {})", matched_key));
-                        StepResult::new(
-                            step_name,
-                            StepStatus::Success,
-                            format!("Cache restored (key: {})", matched_key),
-                        )
-                    }
-                    None => {
-                        // Defer the save to end-of-job, matching GitHub Actions'
-                        // behavior where `actions/cache` saves in a post-step hook
-                        // that only runs after all steps complete and the job succeeds.
-                        {
-                            let mut pending = ctx
-                                .pending_cache_saves
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner());
-                            for cache_path in &cache_paths {
-                                pending.push(PendingCacheSave {
-                                    key: key.clone(),
-                                    path: cache_path.clone(),
-                                    workspace: ctx.working_dir.to_path_buf(),
-                                });
-                            }
-                        }
-                        let msg =
-                            format!("Cache miss for key '{}'. Save deferred to end of job.", key);
-                        wrkflw_logging::info(&format!("  {}", msg));
-                        StepResult::new(step_name, StepStatus::Success, msg)
-                    }
-                }
-            }
+            handle_cache_action(&step_name, &ctx).await?
         } else {
             // Get action info
             let prepared = prepare_action(&action_info, ctx.runtime).await?;
@@ -5422,6 +5453,17 @@ mod tests {
         assert!(evaluate_job_condition("always()", &env, &wf));
         // always() || failure() → true (|| returns first truthy)
         assert!(evaluate_job_condition("always() || failure()", &env, &wf));
+    }
+
+    #[test]
+    fn condition_parse_error_returns_false() {
+        let env = HashMap::new();
+        let wf = empty_workflow();
+        // Malformed conditions should evaluate to false (not true) — matching
+        // GitHub Actions behavior where unparseable expressions error out.
+        assert!(!evaluate_job_condition("&&& invalid syntax", &env, &wf));
+        assert!(!evaluate_job_condition("== broken", &env, &wf));
+        assert!(!evaluate_job_condition("((( unmatched", &env, &wf));
     }
 
     #[test]
@@ -8156,5 +8198,86 @@ runs:
     fn aggregate_reusable_workflow_outputs_empty_input() {
         let merged = aggregate_reusable_workflow_outputs(&HashMap::new());
         assert!(merged.is_empty());
+    }
+
+    #[tokio::test]
+    async fn download_artifact_all_with_empty_store() {
+        let runtime = MockContainerRuntime::default();
+        let workflow = minimal_workflow();
+        let working_dir = tempfile::tempdir().unwrap();
+
+        let artifact_dir = tempfile::tempdir().unwrap();
+        let artifact_store = crate::artifacts::ArtifactStore::new(artifact_dir.path()).unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache_store =
+            crate::cache::CacheStore::with_root(cache_dir.path().to_path_buf()).unwrap();
+        let pending = std::sync::Mutex::new(Vec::<PendingCacheSave>::new());
+
+        // Download all with no artifacts uploaded — should succeed with 0 files
+        let dl_with = HashMap::new();
+        let step = make_step(
+            "download-all",
+            "actions/download-artifact@v4",
+            Some(dl_with),
+            HashMap::new(),
+        );
+        let job_env = HashMap::new();
+
+        let ctx = StepExecutionContext {
+            step: &step,
+            step_idx: 0,
+            job_env: &job_env,
+            working_dir: working_dir.path(),
+            runtime: &runtime,
+            workflow: &workflow,
+            runner_image: "ubuntu:latest",
+            verbose: false,
+            matrix_combination: &None,
+            container_config: None,
+            workflow_defaults: None,
+            job_defaults: None,
+            step_outputs: &HashMap::new(),
+            step_statuses: &HashMap::new(),
+            job_status: "success",
+            services: JobServices {
+                secret_manager: None,
+                secret_masker: None,
+                secrets_context: &HashMap::new(),
+                needs_context: &HashMap::new(),
+                needs_results: &HashMap::new(),
+                artifact_store: &artifact_store,
+                cache_store: &cache_store,
+            },
+            pending_cache_saves: &pending,
+        };
+
+        let result = execute_step(ctx).await.unwrap();
+        assert_eq!(result.status, StepStatus::Success);
+        assert!(result.output.contains("0 artifact(s)"));
+    }
+
+    #[test]
+    fn process_workflow_commands_multiple_set_outputs() {
+        let mut outputs: HashMap<String, HashMap<String, String>> = HashMap::new();
+        let masker = SecretMasker::new();
+
+        process_workflow_commands(
+            "::set-output name=a::1\n::set-output name=b::2\nnormal line\n::set-output name=a::overwritten\n",
+            Some("step1"),
+            &mut outputs,
+            Some(&masker),
+        );
+
+        let step_out = outputs.get("step1").unwrap();
+        assert_eq!(step_out.get("a").unwrap(), "overwritten");
+        assert_eq!(step_out.get("b").unwrap(), "2");
+    }
+
+    #[test]
+    fn process_workflow_commands_no_step_id_ignores_set_output() {
+        let mut outputs: HashMap<String, HashMap<String, String>> = HashMap::new();
+        // Without a step_id, ::set-output:: commands should be silently ignored
+        process_workflow_commands("::set-output name=x::val\n", None, &mut outputs, None);
+        assert!(outputs.is_empty());
     }
 }

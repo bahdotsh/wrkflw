@@ -1243,6 +1243,26 @@ mod tests {
     }
 
     #[test]
+    fn eval_format_out_of_bounds_placeholder_preserved() {
+        let ctx = empty_ctx();
+        // {5} references a non-existent arg — should be left as literal "{5}"
+        assert_eq!(
+            evaluate("format('{0} {5}', 'hi')", &ctx).unwrap(),
+            ExprValue::String("hi {5}".to_string())
+        );
+    }
+
+    #[test]
+    fn eval_format_arg_containing_placeholder_not_reinterpreted() {
+        let ctx = empty_ctx();
+        // format('{0} {1}', '{1}', 'x') should produce '{1} x', not 'x x'
+        assert_eq!(
+            evaluate("format('{0} {1}', '{1}', 'x')", &ctx).unwrap(),
+            ExprValue::String("{1} x".to_string())
+        );
+    }
+
+    #[test]
     fn eval_status_functions() {
         let ctx = empty_ctx();
         assert_eq!(evaluate("success()", &ctx).unwrap(), ExprValue::Bool(true));

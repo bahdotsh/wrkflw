@@ -93,7 +93,7 @@ impl SecretMasker {
     /// can be called through a shared reference during workflow execution.
     pub fn add_secret(&self, secret: impl Into<String>) {
         let secret = secret.into();
-        if secret.chars().count() >= self.min_length {
+        if secret.len() >= self.min_length {
             let masked = self.create_mask(&secret);
             let mut data = self.data.write().unwrap_or_else(|e| e.into_inner());
             data.secret_cache.insert(secret.clone(), masked);
@@ -108,7 +108,7 @@ impl SecretMasker {
     pub fn add_secrets(&self, secrets: impl IntoIterator<Item = String>) {
         let pairs: Vec<(String, String)> = secrets
             .into_iter()
-            .filter(|s| s.chars().count() >= self.min_length)
+            .filter(|s| s.len() >= self.min_length)
             .map(|s| {
                 let masked = self.create_mask(&s);
                 (s, masked)

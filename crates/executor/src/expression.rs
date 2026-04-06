@@ -315,6 +315,13 @@ impl<'a> ExpressionContext<'a> {
                 // Support nested github context like github.event.action,
                 // github.event.pull_request.number, etc.
                 // Map dotted path to GITHUB_ env var with underscores.
+                //
+                // LIMITATION: In real GitHub Actions, `github.event.*` is a deep
+                // JSON object parsed from the webhook payload (`$GITHUB_EVENT_PATH`).
+                // Here we approximate it via flat GITHUB_* environment variables,
+                // which works for simple top-level properties (e.g. `github.event.action`,
+                // `github.ref_name`) but will return Null for deeply-nested event
+                // properties that don't have a corresponding env var.
                 let env_key = format!("GITHUB_{}", parts[1..].join("_").to_uppercase());
                 self.env_context
                     .get(&env_key)

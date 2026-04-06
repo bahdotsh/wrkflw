@@ -31,10 +31,14 @@ pub struct CacheStore {
 impl CacheStore {
     /// Create a new cache store. Uses `~/.wrkflw/cache/` by default.
     pub fn new() -> Result<Self, String> {
-        let root = dirs::home_dir()
-            .ok_or_else(|| "Could not determine home directory".to_string())?
-            .join(".wrkflw")
-            .join("cache");
+        let home = dirs::home_dir()
+            .or_else(|| std::env::var("HOME").ok().map(std::path::PathBuf::from))
+            .ok_or_else(|| {
+                "Could not determine home directory (HOME is not set). \
+                 Set HOME or use CacheStore::with_root() to specify a custom cache path."
+                    .to_string()
+            })?;
+        let root = home.join(".wrkflw").join("cache");
         std::fs::create_dir_all(&root).map_err(|e| {
             format!(
                 "Failed to create cache directory '{}': {}",

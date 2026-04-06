@@ -1713,12 +1713,7 @@ struct JobExecutionContext<'a> {
     verbose: bool,
     secret_manager: Option<&'a SecretManager>,
     secret_masker: Option<&'a SecretMasker>,
-    /// Pre-resolved secrets for expression context (resolved once per job).
-    secrets_context: &'a HashMap<String, String>,
-    needs_context: &'a HashMap<String, HashMap<String, String>>,
-    needs_results: &'a HashMap<String, String>,
-    artifact_store: &'a crate::artifacts::ArtifactStore,
-    cache_store: &'a crate::cache::CacheStore,
+    services: JobServices<'a>,
 }
 
 /// Execute a job, expanding matrix if present
@@ -1736,6 +1731,9 @@ async fn execute_job_with_matrix(
     artifact_store: &crate::artifacts::ArtifactStore,
     cache_store: &crate::cache::CacheStore,
 ) -> Result<Vec<JobResult>, ExecutionError> {
+    // NOTE: This function still has many arguments because it sits at the boundary
+    // between per-run state (artifact_store, cache_store) and per-job state (needs
+    // context, secrets). It constructs JobServices internally after resolving secrets.
     // Get the job definition
     let job = workflow.jobs.get(job_name).ok_or_else(|| {
         ExecutionError::Execution(format!("Job '{}' not found in workflow", job_name))
@@ -1800,6 +1798,14 @@ async fn execute_job_with_matrix(
             std::cmp::max(1, num_cpus::get())
         });
 
+        let services = JobServices {
+            secrets_context: &secrets_context,
+            needs_context: &needs_ctx,
+            needs_results: &needs_res,
+            artifact_store,
+            cache_store,
+        };
+
         // Execute matrix combinations
         execute_matrix_combinations(MatrixExecutionContext {
             job_name,
@@ -1813,15 +1819,18 @@ async fn execute_job_with_matrix(
             verbose,
             secret_manager,
             secret_masker,
+            services,
+        })
+        .await
+    } else {
+        // Regular job, no matrix
+        let services = JobServices {
             secrets_context: &secrets_context,
             needs_context: &needs_ctx,
             needs_results: &needs_res,
             artifact_store,
             cache_store,
-        })
-        .await
-    } else {
-        // Regular job, no matrix
+        };
         let ctx = JobExecutionContext {
             job_name,
             workflow,
@@ -1830,11 +1839,7 @@ async fn execute_job_with_matrix(
             verbose,
             secret_manager,
             secret_masker,
-            secrets_context: &secrets_context,
-            needs_context: &needs_ctx,
-            needs_results: &needs_res,
-            artifact_store,
-            cache_store,
+            services,
         };
         let result = execute_job(ctx).await?;
         Ok(vec![result])
@@ -1895,7 +1900,7 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
     let job_timeout = std::time::Duration::from_secs_f64(timeout_mins * 60.0);
 
     let mut loop_state = StepLoopState::new();
-    let pending_cache_saves = std::sync::Mutex::new(Vec::<PendingCacheSave>::new());
+    let pending_cache_saves = tokio::sync::Mutex::new(Vec::<PendingCacheSave>::new());
 
     let job_deadline = tokio::time::Instant::now() + job_timeout;
 
@@ -1927,11 +1932,13 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
                     step_outputs: &loop_state.step_outputs_map,
                     step_statuses: &loop_state.step_status_map,
                     job_status: &loop_state.job_status_str,
-                    secrets_context: ctx.secrets_context,
-                    needs_context: ctx.needs_context,
-                    needs_results: ctx.needs_results,
-                    artifact_store: ctx.artifact_store,
-                    cache_store: ctx.cache_store,
+                    services: JobServices {
+                        secrets_context: ctx.services.secrets_context,
+                        needs_context: ctx.services.needs_context,
+                        needs_results: ctx.services.needs_results,
+                        artifact_store: ctx.services.artifact_store,
+                        cache_store: ctx.services.cache_store,
+                    },
                     pending_cache_saves: &pending_cache_saves,
                 },
             ),
@@ -1959,7 +1966,7 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
 
     // Flush deferred cache saves only on success (matches GHA post-step semantics)
     if job_success {
-        flush_pending_cache_saves(&pending_cache_saves, ctx.cache_store).await;
+        flush_pending_cache_saves(&pending_cache_saves, ctx.services.cache_store).await;
     }
 
     // Resolve job outputs from step outputs (GHA jobs.*.outputs map expressions to step outputs)
@@ -1999,12 +2006,7 @@ struct MatrixExecutionContext<'a> {
     verbose: bool,
     secret_manager: Option<&'a SecretManager>,
     secret_masker: Option<&'a SecretMasker>,
-    /// Pre-resolved secrets for expression context (resolved once, shared across combinations).
-    secrets_context: &'a HashMap<String, String>,
-    needs_context: &'a HashMap<String, HashMap<String, String>>,
-    needs_results: &'a HashMap<String, String>,
-    artifact_store: &'a crate::artifacts::ArtifactStore,
-    cache_store: &'a crate::cache::CacheStore,
+    services: JobServices<'a>,
 }
 
 /// Execute a set of matrix combinations
@@ -2046,11 +2048,7 @@ async fn execute_matrix_combinations(
                 ctx.verbose,
                 ctx.secret_manager,
                 ctx.secret_masker,
-                ctx.secrets_context,
-                ctx.needs_context,
-                ctx.needs_results,
-                ctx.artifact_store,
-                ctx.cache_store,
+                &ctx.services,
             )
         });
 
@@ -2093,11 +2091,7 @@ async fn execute_matrix_job(
     verbose: bool,
     secret_manager: Option<&SecretManager>,
     secret_masker: Option<&SecretMasker>,
-    secrets_context: &HashMap<String, String>,
-    needs_context: &HashMap<String, HashMap<String, String>>,
-    needs_results: &HashMap<String, String>,
-    artifact_store: &crate::artifacts::ArtifactStore,
-    cache_store: &crate::cache::CacheStore,
+    services: &JobServices<'_>,
 ) -> Result<JobResult, ExecutionError> {
     // Create the matrix-specific job name
     let matrix_job_name = wrkflw_matrix::format_combination_name(job_name, combination);
@@ -2128,9 +2122,9 @@ async fn execute_matrix_job(
             matrix_combination: &matrix_opt,
             step_statuses: &HashMap::new(),
             job_status: "success",
-            secrets_context,
-            needs_context,
-            needs_results,
+            secrets_context: services.secrets_context,
+            needs_context: services.needs_context,
+            needs_results: services.needs_results,
         };
         let cwd = std::env::current_dir().unwrap_or_default();
         let resolved_env: Vec<(String, String)> = job_template
@@ -2158,7 +2152,7 @@ async fn execute_matrix_job(
     })?;
 
     let mut loop_state = StepLoopState::new();
-    let pending_cache_saves = std::sync::Mutex::new(Vec::<PendingCacheSave>::new());
+    let pending_cache_saves = tokio::sync::Mutex::new(Vec::<PendingCacheSave>::new());
     let job_success = if job_template.steps.is_empty() {
         wrkflw_logging::warning(&format!("Job '{}' has no steps", matrix_job_name));
         true
@@ -2200,11 +2194,13 @@ async fn execute_matrix_job(
                         step_outputs: &loop_state.step_outputs_map,
                         step_statuses: &loop_state.step_status_map,
                         job_status: &loop_state.job_status_str,
-                        secrets_context,
-                        needs_context,
-                        needs_results,
-                        artifact_store,
-                        cache_store,
+                        services: JobServices {
+                            secrets_context: services.secrets_context,
+                            needs_context: services.needs_context,
+                            needs_results: services.needs_results,
+                            artifact_store: services.artifact_store,
+                            cache_store: services.cache_store,
+                        },
                         pending_cache_saves: &pending_cache_saves,
                     },
                 ),
@@ -2235,7 +2231,7 @@ async fn execute_matrix_job(
 
     // Flush deferred cache saves only on success (matches GHA post-step semantics)
     if job_success {
-        flush_pending_cache_saves(&pending_cache_saves, cache_store).await;
+        flush_pending_cache_saves(&pending_cache_saves, services.cache_store).await;
     }
 
     // Resolve job outputs from step outputs
@@ -2280,17 +2276,35 @@ struct PendingCacheSave {
     workspace: std::path::PathBuf,
 }
 
+/// Shared services and resolved context passed through the job/step execution hierarchy.
+///
+/// Groups artifact/cache stores, pre-resolved secrets, and upstream job context
+/// into a single struct to avoid threading 5+ extra parameters through every
+/// function in the call chain.
+pub(crate) struct JobServices<'a> {
+    /// Pre-resolved secrets for expression context (resolved once per job).
+    pub secrets_context: &'a HashMap<String, String>,
+    /// Job outputs from upstream jobs: `job_name -> { output_key -> output_value }`.
+    pub needs_context: &'a HashMap<String, HashMap<String, String>>,
+    /// Job results from upstream jobs: `job_name -> "success" | "failure" | "skipped"`.
+    pub needs_results: &'a HashMap<String, String>,
+    /// Artifact store shared across the workflow run.
+    pub artifact_store: &'a crate::artifacts::ArtifactStore,
+    /// Cache store shared across the workflow run (persistent across runs).
+    pub cache_store: &'a crate::cache::CacheStore,
+}
+
 /// Flush pending cache saves. Called at end-of-job only when the job succeeded,
 /// matching GitHub Actions' behavior where `actions/cache` saves in a post-step
 /// hook that only runs after all steps complete and the job succeeds.
 async fn flush_pending_cache_saves(
-    pending: &std::sync::Mutex<Vec<PendingCacheSave>>,
+    pending: &tokio::sync::Mutex<Vec<PendingCacheSave>>,
     cache_store: &crate::cache::CacheStore,
 ) {
-    let saves = pending
-        .lock()
-        .map(|mut v| std::mem::take(&mut *v))
-        .unwrap_or_default();
+    let saves = {
+        let mut guard = pending.lock().await;
+        std::mem::take(&mut *guard)
+    };
     for save in saves {
         match cache_store
             .save(&save.key, &save.path, &save.workspace)
@@ -2627,13 +2641,9 @@ struct StepExecutionContext<'a> {
     step_outputs: &'a HashMap<String, HashMap<String, String>>,
     step_statuses: &'a HashMap<String, (String, String)>,
     job_status: &'a str,
-    secrets_context: &'a HashMap<String, String>,
-    needs_context: &'a HashMap<String, HashMap<String, String>>,
-    needs_results: &'a HashMap<String, String>,
-    artifact_store: &'a crate::artifacts::ArtifactStore,
-    cache_store: &'a crate::cache::CacheStore,
+    services: JobServices<'a>,
     /// Collects deferred `actions/cache` saves, flushed at end-of-job on success.
-    pending_cache_saves: &'a std::sync::Mutex<Vec<PendingCacheSave>>,
+    pending_cache_saves: &'a tokio::sync::Mutex<Vec<PendingCacheSave>>,
 }
 
 impl<'a> StepExecutionContext<'a> {
@@ -2645,9 +2655,9 @@ impl<'a> StepExecutionContext<'a> {
             matrix_combination: self.matrix_combination,
             step_statuses: self.step_statuses,
             job_status: self.job_status,
-            secrets_context: self.secrets_context,
-            needs_context: self.needs_context,
-            needs_results: self.needs_results,
+            secrets_context: self.services.secrets_context,
+            needs_context: self.services.needs_context,
+            needs_results: self.services.needs_results,
         }
     }
 
@@ -2665,9 +2675,9 @@ impl<'a> StepExecutionContext<'a> {
             matrix_combination: self.matrix_combination,
             step_statuses: self.step_statuses,
             job_status: self.job_status,
-            secrets_context: self.secrets_context,
-            needs_context: self.needs_context,
-            needs_results: self.needs_results,
+            secrets_context: self.services.secrets_context,
+            needs_context: self.services.needs_context,
+            needs_results: self.services.needs_results,
         }
     }
 }
@@ -2794,6 +2804,7 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
             }
 
             match ctx
+                .services
                 .artifact_store
                 .upload(&name, &path_pattern, ctx.working_dir)
                 .await
@@ -2858,11 +2869,16 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
 
             if name.is_empty() {
                 // Download all artifacts into named subdirectories
-                let names = ctx.artifact_store.list().await;
+                let names = ctx.services.artifact_store.list().await;
                 let mut total = 0;
                 for artifact_name in &names {
                     let target = download_path.join(artifact_name);
-                    match ctx.artifact_store.download(artifact_name, &target).await {
+                    match ctx
+                        .services
+                        .artifact_store
+                        .download(artifact_name, &target)
+                        .await
+                    {
                         Ok(c) => total += c,
                         Err(e) => {
                             return Ok(StepResult::new(
@@ -2888,7 +2904,12 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                     ),
                 )
             } else {
-                match ctx.artifact_store.download(&name, &download_path).await {
+                match ctx
+                    .services
+                    .artifact_store
+                    .download(&name, &download_path)
+                    .await
+                {
                     Ok(count) => {
                         wrkflw_logging::info(&format!(
                             "  Downloaded artifact '{}': {} file(s)",
@@ -2948,6 +2969,7 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                 let mut cache_hit: Option<String> = None;
                 for cache_path in &cache_paths {
                     let hit = ctx
+                        .services
                         .cache_store
                         .restore(&key, &restore_keys, cache_path, ctx.working_dir)
                         .await;
@@ -2987,7 +3009,8 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                         // Defer the save to end-of-job, matching GitHub Actions'
                         // behavior where `actions/cache` saves in a post-step hook
                         // that only runs after all steps complete and the job succeeds.
-                        if let Ok(mut pending) = ctx.pending_cache_saves.lock() {
+                        {
+                            let mut pending = ctx.pending_cache_saves.lock().await;
                             for cache_path in &cache_paths {
                                 pending.push(PendingCacheSave {
                                     key: key.clone(),
@@ -3022,11 +3045,7 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                             ctx.verbose,
                             ctx.secret_manager,
                             ctx.secret_masker,
-                            ctx.secrets_context,
-                            ctx.needs_context,
-                            ctx.needs_results,
-                            ctx.artifact_store,
-                            ctx.cache_store,
+                            &ctx.services,
                             ctx.pending_cache_saves,
                         )
                         .await?
@@ -3083,11 +3102,7 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                             ctx.verbose,
                             ctx.secret_manager,
                             ctx.secret_masker,
-                            ctx.secrets_context,
-                            ctx.needs_context,
-                            ctx.needs_results,
-                            ctx.artifact_store,
-                            ctx.cache_store,
+                            &ctx.services,
                             ctx.pending_cache_saves,
                         )
                         .await?
@@ -4235,7 +4250,7 @@ async fn execute_reusable_workflow_job(
             if let Some(secrets_val) = secrets {
                 if secrets_val.as_str() == Some("inherit") {
                     // Propagate all parent secrets to the child workflow
-                    for (name, value) in ctx.secrets_context {
+                    for (name, value) in ctx.services.secrets_context {
                         child_env.insert(format!("SECRET_{}", name.to_uppercase()), value.clone());
                     }
                 } else if let Some(map) = secrets_val.as_mapping() {
@@ -4267,8 +4282,8 @@ async fn execute_reusable_workflow_job(
                     ctx.secret_masker,
                     &reusable_job_outputs,
                     &reusable_job_results,
-                    ctx.artifact_store,
-                    ctx.cache_store,
+                    ctx.services.artifact_store,
+                    ctx.services.cache_store,
                 )
                 .await?;
                 for r in &results {
@@ -4330,7 +4345,7 @@ async fn execute_reusable_workflow_job(
     if let Some(secrets_val) = secrets {
         if secrets_val.as_str() == Some("inherit") {
             // Propagate all parent secrets to the child workflow
-            for (name, value) in ctx.secrets_context {
+            for (name, value) in ctx.services.secrets_context {
                 child_env.insert(format!("SECRET_{}", name.to_uppercase()), value.clone());
             }
         } else if let Some(map) = secrets_val.as_mapping() {
@@ -4361,8 +4376,8 @@ async fn execute_reusable_workflow_job(
             ctx.secret_masker,
             &reusable_job_outputs,
             &reusable_job_results,
-            ctx.artifact_store,
-            ctx.cache_store,
+            ctx.services.artifact_store,
+            ctx.services.cache_store,
         )
         .await?;
         for r in &results {
@@ -4498,12 +4513,8 @@ async fn execute_composite_action(
     verbose: bool,
     secret_manager: Option<&SecretManager>,
     secret_masker: Option<&SecretMasker>,
-    secrets_context: &HashMap<String, String>,
-    needs_context: &HashMap<String, HashMap<String, String>>,
-    needs_results: &HashMap<String, String>,
-    artifact_store: &crate::artifacts::ArtifactStore,
-    cache_store: &crate::cache::CacheStore,
-    pending_cache_saves: &std::sync::Mutex<Vec<PendingCacheSave>>,
+    services: &JobServices<'_>,
+    pending_cache_saves: &tokio::sync::Mutex<Vec<PendingCacheSave>>,
 ) -> Result<StepResult, ExecutionError> {
     // Find the action definition file
     let action_yaml = action_path.join("action.yml");
@@ -4614,11 +4625,13 @@ async fn execute_composite_action(
                     step_outputs: &composite_step_outputs,
                     step_statuses: &composite_step_statuses,
                     job_status: &composite_job_status,
-                    secrets_context,
-                    needs_context,
-                    needs_results,
-                    artifact_store,
-                    cache_store,
+                    services: JobServices {
+                        secrets_context: services.secrets_context,
+                        needs_context: services.needs_context,
+                        needs_results: services.needs_results,
+                        artifact_store: services.artifact_store,
+                        cache_store: services.cache_store,
+                    },
                     pending_cache_saves,
                 }))
                 .await?;
@@ -5004,8 +5017,21 @@ mod tests {
         static ref TEST_CACHE_DIR: tempfile::TempDir = tempfile::tempdir().unwrap();
         static ref TEST_CACHE_STORE: crate::cache::CacheStore =
             crate::cache::CacheStore::with_root(TEST_CACHE_DIR.path().to_path_buf()).unwrap();
-        static ref TEST_PENDING_CACHE_SAVES: std::sync::Mutex<Vec<PendingCacheSave>> =
-            std::sync::Mutex::new(Vec::new());
+        static ref TEST_PENDING_CACHE_SAVES: tokio::sync::Mutex<Vec<PendingCacheSave>> =
+            tokio::sync::Mutex::new(Vec::new());
+        static ref EMPTY_SECRETS: HashMap<String, String> = HashMap::new();
+        static ref EMPTY_NEEDS: HashMap<String, HashMap<String, String>> = HashMap::new();
+        static ref EMPTY_NEEDS_RESULTS: HashMap<String, String> = HashMap::new();
+    }
+
+    fn test_services() -> JobServices<'static> {
+        JobServices {
+            secrets_context: &EMPTY_SECRETS,
+            needs_context: &EMPTY_NEEDS,
+            needs_results: &EMPTY_NEEDS_RESULTS,
+            artifact_store: &TEST_ARTIFACT_STORE,
+            cache_store: &TEST_CACHE_STORE,
+        }
     }
 
     #[test]
@@ -5940,11 +5966,7 @@ runs:
             step_outputs: &HashMap::new(),
             step_statuses: &HashMap::new(),
             job_status: "success",
-            secrets_context: &HashMap::new(),
-            needs_context: &HashMap::new(),
-            needs_results: &HashMap::new(),
-            artifact_store: &TEST_ARTIFACT_STORE,
-            cache_store: &TEST_CACHE_STORE,
+            services: test_services(),
             pending_cache_saves: &TEST_PENDING_CACHE_SAVES,
         };
 
@@ -5997,11 +6019,7 @@ runs:
             step_outputs: &HashMap::new(),
             step_statuses: &HashMap::new(),
             job_status: "success",
-            secrets_context: &HashMap::new(),
-            needs_context: &HashMap::new(),
-            needs_results: &HashMap::new(),
-            artifact_store: &TEST_ARTIFACT_STORE,
-            cache_store: &TEST_CACHE_STORE,
+            services: test_services(),
             pending_cache_saves: &TEST_PENDING_CACHE_SAVES,
         };
 
@@ -6059,11 +6077,7 @@ runs:
             step_outputs: &HashMap::new(),
             step_statuses: &HashMap::new(),
             job_status: "success",
-            secrets_context: &HashMap::new(),
-            needs_context: &HashMap::new(),
-            needs_results: &HashMap::new(),
-            artifact_store: &TEST_ARTIFACT_STORE,
-            cache_store: &TEST_CACHE_STORE,
+            services: test_services(),
             pending_cache_saves: &TEST_PENDING_CACHE_SAVES,
         };
 
@@ -6114,11 +6128,7 @@ runs:
             step_outputs: &HashMap::new(),
             step_statuses: &HashMap::new(),
             job_status: "success",
-            secrets_context: &HashMap::new(),
-            needs_context: &HashMap::new(),
-            needs_results: &HashMap::new(),
-            artifact_store: &TEST_ARTIFACT_STORE,
-            cache_store: &TEST_CACHE_STORE,
+            services: test_services(),
             pending_cache_saves: &TEST_PENDING_CACHE_SAVES,
         };
 
@@ -6170,11 +6180,7 @@ runs:
             step_outputs: &HashMap::new(),
             step_statuses: &HashMap::new(),
             job_status: "success",
-            secrets_context: &HashMap::new(),
-            needs_context: &HashMap::new(),
-            needs_results: &HashMap::new(),
-            artifact_store: &TEST_ARTIFACT_STORE,
-            cache_store: &TEST_CACHE_STORE,
+            services: test_services(),
             pending_cache_saves: &TEST_PENDING_CACHE_SAVES,
         };
 
@@ -6225,11 +6231,7 @@ runs:
             step_outputs: &HashMap::new(),
             step_statuses: &HashMap::new(),
             job_status: "success",
-            secrets_context: &HashMap::new(),
-            needs_context: &HashMap::new(),
-            needs_results: &HashMap::new(),
-            artifact_store: &TEST_ARTIFACT_STORE,
-            cache_store: &TEST_CACHE_STORE,
+            services: test_services(),
             pending_cache_saves: &TEST_PENDING_CACHE_SAVES,
         };
 
@@ -6278,11 +6280,7 @@ runs:
             step_outputs: &HashMap::new(),
             step_statuses: &HashMap::new(),
             job_status: "success",
-            secrets_context: &HashMap::new(),
-            needs_context: &HashMap::new(),
-            needs_results: &HashMap::new(),
-            artifact_store: &TEST_ARTIFACT_STORE,
-            cache_store: &TEST_CACHE_STORE,
+            services: test_services(),
             pending_cache_saves: &TEST_PENDING_CACHE_SAVES,
         };
 
@@ -6823,11 +6821,7 @@ runs:
             step_outputs: &HashMap::new(),
             step_statuses: &HashMap::new(),
             job_status: "success",
-            secrets_context: &HashMap::new(),
-            needs_context: &HashMap::new(),
-            needs_results: &HashMap::new(),
-            artifact_store: &TEST_ARTIFACT_STORE,
-            cache_store: &TEST_CACHE_STORE,
+            services: test_services(),
             pending_cache_saves: &TEST_PENDING_CACHE_SAVES,
         };
 
@@ -6876,11 +6870,7 @@ runs:
             step_outputs: &HashMap::new(),
             step_statuses: &HashMap::new(),
             job_status: "success",
-            secrets_context: &HashMap::new(),
-            needs_context: &HashMap::new(),
-            needs_results: &HashMap::new(),
-            artifact_store: &TEST_ARTIFACT_STORE,
-            cache_store: &TEST_CACHE_STORE,
+            services: test_services(),
             pending_cache_saves: &TEST_PENDING_CACHE_SAVES,
         };
 
@@ -6925,11 +6915,7 @@ runs:
             step_outputs: &HashMap::new(),
             step_statuses: &HashMap::new(),
             job_status: "success",
-            secrets_context: &HashMap::new(),
-            needs_context: &HashMap::new(),
-            needs_results: &HashMap::new(),
-            artifact_store: &TEST_ARTIFACT_STORE,
-            cache_store: &TEST_CACHE_STORE,
+            services: test_services(),
             pending_cache_saves: &TEST_PENDING_CACHE_SAVES,
         };
 
@@ -6966,11 +6952,7 @@ runs:
             step_outputs: &HashMap::new(),
             step_statuses: &HashMap::new(),
             job_status: "success",
-            secrets_context: &HashMap::new(),
-            needs_context: &HashMap::new(),
-            needs_results: &HashMap::new(),
-            artifact_store: &TEST_ARTIFACT_STORE,
-            cache_store: &TEST_CACHE_STORE,
+            services: test_services(),
             pending_cache_saves: &TEST_PENDING_CACHE_SAVES,
         };
 
@@ -7009,11 +6991,7 @@ runs:
             step_outputs: &HashMap::new(),
             step_statuses: &HashMap::new(),
             job_status: "success",
-            secrets_context: &HashMap::new(),
-            needs_context: &HashMap::new(),
-            needs_results: &HashMap::new(),
-            artifact_store: &TEST_ARTIFACT_STORE,
-            cache_store: &TEST_CACHE_STORE,
+            services: test_services(),
             pending_cache_saves: &TEST_PENDING_CACHE_SAVES,
         };
 
@@ -7063,11 +7041,7 @@ runs:
             step_outputs: &HashMap::new(),
             step_statuses: &HashMap::new(),
             job_status: "success",
-            secrets_context: &HashMap::new(),
-            needs_context: &HashMap::new(),
-            needs_results: &HashMap::new(),
-            artifact_store: &TEST_ARTIFACT_STORE,
-            cache_store: &TEST_CACHE_STORE,
+            services: test_services(),
             pending_cache_saves: &TEST_PENDING_CACHE_SAVES,
         };
 
@@ -7115,11 +7089,7 @@ runs:
             step_outputs: &HashMap::new(),
             step_statuses: &HashMap::new(),
             job_status: "success",
-            secrets_context: &HashMap::new(),
-            needs_context: &HashMap::new(),
-            needs_results: &HashMap::new(),
-            artifact_store: &TEST_ARTIFACT_STORE,
-            cache_store: &TEST_CACHE_STORE,
+            services: test_services(),
             pending_cache_saves: &TEST_PENDING_CACHE_SAVES,
         };
 
@@ -7167,11 +7137,7 @@ runs:
             step_outputs: &HashMap::new(),
             step_statuses: &HashMap::new(),
             job_status: "success",
-            secrets_context: &HashMap::new(),
-            needs_context: &HashMap::new(),
-            needs_results: &HashMap::new(),
-            artifact_store: &TEST_ARTIFACT_STORE,
-            cache_store: &TEST_CACHE_STORE,
+            services: test_services(),
             pending_cache_saves: &TEST_PENDING_CACHE_SAVES,
         };
 
@@ -7217,11 +7183,7 @@ runs:
             step_outputs: &HashMap::new(),
             step_statuses: &HashMap::new(),
             job_status: "success",
-            secrets_context: &HashMap::new(),
-            needs_context: &HashMap::new(),
-            needs_results: &HashMap::new(),
-            artifact_store: &TEST_ARTIFACT_STORE,
-            cache_store: &TEST_CACHE_STORE,
+            services: test_services(),
             pending_cache_saves: &TEST_PENDING_CACHE_SAVES,
         };
 
@@ -7582,7 +7544,7 @@ runs:
         let cache_dir = tempfile::tempdir().unwrap();
         let cache_store =
             crate::cache::CacheStore::with_root(cache_dir.path().to_path_buf()).unwrap();
-        let pending = std::sync::Mutex::new(Vec::<PendingCacheSave>::new());
+        let pending = tokio::sync::Mutex::new(Vec::<PendingCacheSave>::new());
 
         let mut with = HashMap::new();
         with.insert("name".to_string(), "my-build".to_string());
@@ -7613,11 +7575,13 @@ runs:
             step_outputs: &HashMap::new(),
             step_statuses: &HashMap::new(),
             job_status: "success",
-            secrets_context: &HashMap::new(),
-            needs_context: &HashMap::new(),
-            needs_results: &HashMap::new(),
-            artifact_store: &artifact_store,
-            cache_store: &cache_store,
+            services: JobServices {
+                secrets_context: &HashMap::new(),
+                needs_context: &HashMap::new(),
+                needs_results: &HashMap::new(),
+                artifact_store: &artifact_store,
+                cache_store: &cache_store,
+            },
             pending_cache_saves: &pending,
         };
 
@@ -7657,11 +7621,13 @@ runs:
             step_outputs: &HashMap::new(),
             step_statuses: &HashMap::new(),
             job_status: "success",
-            secrets_context: &HashMap::new(),
-            needs_context: &HashMap::new(),
-            needs_results: &HashMap::new(),
-            artifact_store: &artifact_store,
-            cache_store: &cache_store,
+            services: JobServices {
+                secrets_context: &HashMap::new(),
+                needs_context: &HashMap::new(),
+                needs_results: &HashMap::new(),
+                artifact_store: &artifact_store,
+                cache_store: &cache_store,
+            },
             pending_cache_saves: &pending,
         };
 
@@ -7685,7 +7651,7 @@ runs:
             crate::cache::CacheStore::with_root(cache_dir.path().to_path_buf()).unwrap();
         let artifact_dir = tempfile::tempdir().unwrap();
         let artifact_store = crate::artifacts::ArtifactStore::new(artifact_dir.path()).unwrap();
-        let pending = std::sync::Mutex::new(Vec::<PendingCacheSave>::new());
+        let pending = tokio::sync::Mutex::new(Vec::<PendingCacheSave>::new());
 
         let mut with = HashMap::new();
         with.insert("key".to_string(), "deps-abc123".to_string());
@@ -7711,11 +7677,13 @@ runs:
             step_outputs: &HashMap::new(),
             step_statuses: &HashMap::new(),
             job_status: "success",
-            secrets_context: &HashMap::new(),
-            needs_context: &HashMap::new(),
-            needs_results: &HashMap::new(),
-            artifact_store: &artifact_store,
-            cache_store: &cache_store,
+            services: JobServices {
+                secrets_context: &HashMap::new(),
+                needs_context: &HashMap::new(),
+                needs_results: &HashMap::new(),
+                artifact_store: &artifact_store,
+                cache_store: &cache_store,
+            },
             pending_cache_saves: &pending,
         };
 
@@ -7724,7 +7692,7 @@ runs:
         assert!(result.output.contains("Cache miss"));
 
         // The save should be deferred
-        assert_eq!(pending.lock().unwrap().len(), 1);
+        assert_eq!(pending.lock().await.len(), 1);
 
         // Flush pending saves
         flush_pending_cache_saves(&pending, &cache_store).await;
@@ -7881,7 +7849,7 @@ runs:
         let cache_dir = tempfile::tempdir().unwrap();
         let cache_store =
             crate::cache::CacheStore::with_root(cache_dir.path().to_path_buf()).unwrap();
-        let pending = std::sync::Mutex::new(Vec::<PendingCacheSave>::new());
+        let pending = tokio::sync::Mutex::new(Vec::<PendingCacheSave>::new());
 
         let mut dl_with = HashMap::new();
         dl_with.insert("name".to_string(), "my-artifact".to_string());
@@ -7912,11 +7880,13 @@ runs:
             step_outputs: &HashMap::new(),
             step_statuses: &HashMap::new(),
             job_status: "success",
-            secrets_context: &HashMap::new(),
-            needs_context: &HashMap::new(),
-            needs_results: &HashMap::new(),
-            artifact_store: &artifact_store,
-            cache_store: &cache_store,
+            services: JobServices {
+                secrets_context: &HashMap::new(),
+                needs_context: &HashMap::new(),
+                needs_results: &HashMap::new(),
+                artifact_store: &artifact_store,
+                cache_store: &cache_store,
+            },
             pending_cache_saves: &pending,
         };
 
@@ -7949,7 +7919,7 @@ runs:
         let cache_dir = tempfile::tempdir().unwrap();
         let cache_store =
             crate::cache::CacheStore::with_root(cache_dir.path().to_path_buf()).unwrap();
-        let pending = std::sync::Mutex::new(Vec::<PendingCacheSave>::new());
+        let pending = tokio::sync::Mutex::new(Vec::<PendingCacheSave>::new());
 
         // Download all (no name specified)
         let dl_with = HashMap::new();
@@ -7980,11 +7950,13 @@ runs:
             step_outputs: &HashMap::new(),
             step_statuses: &HashMap::new(),
             job_status: "success",
-            secrets_context: &HashMap::new(),
-            needs_context: &HashMap::new(),
-            needs_results: &HashMap::new(),
-            artifact_store: &artifact_store,
-            cache_store: &cache_store,
+            services: JobServices {
+                secrets_context: &HashMap::new(),
+                needs_context: &HashMap::new(),
+                needs_results: &HashMap::new(),
+                artifact_store: &artifact_store,
+                cache_store: &cache_store,
+            },
             pending_cache_saves: &pending,
         };
 
@@ -8007,7 +7979,7 @@ runs:
             crate::cache::CacheStore::with_root(cache_dir.path().to_path_buf()).unwrap();
         let artifact_dir = tempfile::tempdir().unwrap();
         let artifact_store = crate::artifacts::ArtifactStore::new(artifact_dir.path()).unwrap();
-        let pending = std::sync::Mutex::new(Vec::<PendingCacheSave>::new());
+        let pending = tokio::sync::Mutex::new(Vec::<PendingCacheSave>::new());
 
         let mut with = HashMap::new();
         with.insert("key".to_string(), String::new());
@@ -8033,11 +8005,13 @@ runs:
             step_outputs: &HashMap::new(),
             step_statuses: &HashMap::new(),
             job_status: "success",
-            secrets_context: &HashMap::new(),
-            needs_context: &HashMap::new(),
-            needs_results: &HashMap::new(),
-            artifact_store: &artifact_store,
-            cache_store: &cache_store,
+            services: JobServices {
+                secrets_context: &HashMap::new(),
+                needs_context: &HashMap::new(),
+                needs_results: &HashMap::new(),
+                artifact_store: &artifact_store,
+                cache_store: &cache_store,
+            },
             pending_cache_saves: &pending,
         };
 
@@ -8057,7 +8031,7 @@ runs:
             crate::cache::CacheStore::with_root(cache_dir.path().to_path_buf()).unwrap();
         let artifact_dir = tempfile::tempdir().unwrap();
         let artifact_store = crate::artifacts::ArtifactStore::new(artifact_dir.path()).unwrap();
-        let pending = std::sync::Mutex::new(Vec::<PendingCacheSave>::new());
+        let pending = tokio::sync::Mutex::new(Vec::<PendingCacheSave>::new());
 
         let mut with = HashMap::new();
         with.insert("key".to_string(), "deps-key".to_string());
@@ -8083,11 +8057,13 @@ runs:
             step_outputs: &HashMap::new(),
             step_statuses: &HashMap::new(),
             job_status: "success",
-            secrets_context: &HashMap::new(),
-            needs_context: &HashMap::new(),
-            needs_results: &HashMap::new(),
-            artifact_store: &artifact_store,
-            cache_store: &cache_store,
+            services: JobServices {
+                secrets_context: &HashMap::new(),
+                needs_context: &HashMap::new(),
+                needs_results: &HashMap::new(),
+                artifact_store: &artifact_store,
+                cache_store: &cache_store,
+            },
             pending_cache_saves: &pending,
         };
 
@@ -8113,7 +8089,7 @@ runs:
             crate::cache::CacheStore::with_root(cache_dir.path().to_path_buf()).unwrap();
         let artifact_dir = tempfile::tempdir().unwrap();
         let artifact_store = crate::artifacts::ArtifactStore::new(artifact_dir.path()).unwrap();
-        let pending = std::sync::Mutex::new(Vec::<PendingCacheSave>::new());
+        let pending = tokio::sync::Mutex::new(Vec::<PendingCacheSave>::new());
 
         let mut with = HashMap::new();
         with.insert("key".to_string(), "deps-multi".to_string());
@@ -8139,11 +8115,13 @@ runs:
             step_outputs: &HashMap::new(),
             step_statuses: &HashMap::new(),
             job_status: "success",
-            secrets_context: &HashMap::new(),
-            needs_context: &HashMap::new(),
-            needs_results: &HashMap::new(),
-            artifact_store: &artifact_store,
-            cache_store: &cache_store,
+            services: JobServices {
+                secrets_context: &HashMap::new(),
+                needs_context: &HashMap::new(),
+                needs_results: &HashMap::new(),
+                artifact_store: &artifact_store,
+                cache_store: &cache_store,
+            },
             pending_cache_saves: &pending,
         };
 
@@ -8152,7 +8130,7 @@ runs:
         assert!(result.output.contains("Cache miss"));
 
         // Both paths should be deferred
-        assert_eq!(pending.lock().unwrap().len(), 2);
+        assert_eq!(pending.lock().await.len(), 2);
 
         // Flush and verify both paths are saved
         flush_pending_cache_saves(&pending, &cache_store).await;

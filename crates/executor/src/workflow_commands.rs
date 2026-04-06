@@ -64,13 +64,16 @@ pub enum WorkflowCommand {
 ///
 /// GitHub Actions encodes: `%25` → `%`, `%0A` → `\n`, `%0D` → `\r`, `%3A` → `:`.
 fn decode_value(s: &str) -> String {
-    s.replace("%25", "%")
-        .replace("%0A", "\n")
+    // Decode %25 (percent) LAST to avoid double-decode: if input contains
+    // `%250A`, decoding %25 first would turn it into `%0A`, which the next
+    // step would incorrectly decode to `\n`. GitHub Actions decodes %25 last.
+    s.replace("%0A", "\n")
         .replace("%0a", "\n")
         .replace("%0D", "\r")
         .replace("%0d", "\r")
         .replace("%3A", ":")
         .replace("%3a", ":")
+        .replace("%25", "%")
 }
 
 /// Parse all workflow commands from step output text.
@@ -440,6 +443,21 @@ mod tests {
         match &cmds[0] {
             WorkflowCommand::Error { file, .. } => {
                 assert_eq!(file.as_deref(), Some("src:main.rs"));
+            }
+            _ => panic!("expected Error"),
+        }
+    }
+
+    #[test]
+    fn url_decoding_no_double_decode() {
+        // %250A is a literal percent-encoded "%0A" — it should decode to "%0A",
+        // NOT to a newline. This verifies that %25 is decoded last.
+        let output = "::error::before%250Aafter";
+        let cmds = parse_workflow_commands(output);
+        assert_eq!(cmds.len(), 1);
+        match &cmds[0] {
+            WorkflowCommand::Error { message, .. } => {
+                assert_eq!(message, "before%0Aafter");
             }
             _ => panic!("expected Error"),
         }

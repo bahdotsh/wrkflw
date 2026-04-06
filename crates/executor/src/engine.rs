@@ -2912,10 +2912,16 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                 .and_then(|w| w.get("key"))
                 .map(|s| preprocess_with_value(s, &ctx))
                 .unwrap_or_default();
-            let cache_path = with
+            let cache_path_raw = with
                 .and_then(|w| w.get("path"))
                 .map(|s| preprocess_with_value(s, &ctx))
                 .unwrap_or_default();
+            // actions/cache supports multi-line `path` input (one path per line)
+            let cache_paths: Vec<String> = cache_path_raw
+                .lines()
+                .map(|l| l.trim().to_string())
+                .filter(|l| !l.is_empty())
+                .collect();
             let restore_keys: Vec<String> = with
                 .and_then(|w| w.get("restore-keys"))
                 .map(|s| preprocess_with_value(s, &ctx))
@@ -2927,7 +2933,7 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                 })
                 .unwrap_or_default();
 
-            if key.is_empty() || cache_path.is_empty() {
+            if key.is_empty() || cache_paths.is_empty() {
                 return Ok(StepResult::new(
                     step_name,
                     StepStatus::Failure,
@@ -2936,10 +2942,17 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
             }
 
             {
-                let cache_hit = ctx
-                    .cache_store
-                    .restore(&key, &restore_keys, &cache_path, ctx.working_dir)
-                    .await;
+                // Try to restore each path. A hit on any path counts as a cache hit.
+                let mut cache_hit: Option<String> = None;
+                for cache_path in &cache_paths {
+                    let hit = ctx
+                        .cache_store
+                        .restore(&key, &restore_keys, cache_path, ctx.working_dir)
+                        .await;
+                    if cache_hit.is_none() {
+                        cache_hit = hit;
+                    }
+                }
 
                 // Write cache-hit output to GITHUB_OUTPUT file
                 if let Some(output_path) = ctx.job_env.get("GITHUB_OUTPUT") {
@@ -2973,11 +2986,13 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                         // behavior where `actions/cache` saves in a post-step hook
                         // that only runs after all steps complete and the job succeeds.
                         if let Ok(mut pending) = ctx.pending_cache_saves.lock() {
-                            pending.push(PendingCacheSave {
-                                key: key.clone(),
-                                path: cache_path.clone(),
-                                workspace: ctx.working_dir.to_path_buf(),
-                            });
+                            for cache_path in &cache_paths {
+                                pending.push(PendingCacheSave {
+                                    key: key.clone(),
+                                    path: cache_path.clone(),
+                                    workspace: ctx.working_dir.to_path_buf(),
+                                });
+                            }
                         }
                         let msg =
                             format!("Cache miss for key '{}'. Save deferred to end of job.", key);
@@ -7838,5 +7853,306 @@ runs:
         // Unknown secret returns null
         let result = crate::expression::evaluate("secrets.UNKNOWN", &ctx).unwrap();
         assert_eq!(result, crate::expression::ExprValue::Null);
+    }
+
+    #[tokio::test]
+    async fn download_artifact_rejects_path_traversal() {
+        let runtime = MockContainerRuntime::default();
+        let workflow = minimal_workflow();
+        let working_dir = tempfile::tempdir().unwrap();
+
+        let artifact_dir = tempfile::tempdir().unwrap();
+        let artifact_store = crate::artifacts::ArtifactStore::new(artifact_dir.path()).unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache_store =
+            crate::cache::CacheStore::with_root(cache_dir.path().to_path_buf()).unwrap();
+        let pending = std::sync::Mutex::new(Vec::<PendingCacheSave>::new());
+
+        let mut dl_with = HashMap::new();
+        dl_with.insert("name".to_string(), "my-artifact".to_string());
+        dl_with.insert("path".to_string(), "../../escape".to_string());
+        let step = make_step(
+            "download",
+            "actions/download-artifact@v4",
+            Some(dl_with),
+            HashMap::new(),
+        );
+        let job_env = HashMap::new();
+
+        let ctx = StepExecutionContext {
+            step: &step,
+            step_idx: 0,
+            job_env: &job_env,
+            working_dir: working_dir.path(),
+            runtime: &runtime,
+            workflow: &workflow,
+            runner_image: "ubuntu:latest",
+            verbose: false,
+            matrix_combination: &None,
+            secret_manager: None,
+            secret_masker: None,
+            container_config: None,
+            workflow_defaults: None,
+            job_defaults: None,
+            step_outputs: &HashMap::new(),
+            step_statuses: &HashMap::new(),
+            job_status: "success",
+            secrets_context: &HashMap::new(),
+            needs_context: &HashMap::new(),
+            needs_results: &HashMap::new(),
+            artifact_store: &artifact_store,
+            cache_store: &cache_store,
+            pending_cache_saves: &pending,
+        };
+
+        let result = execute_step(ctx).await.unwrap();
+        assert_eq!(result.status, StepStatus::Failure);
+        assert!(result.output.contains("escapes workspace"));
+    }
+
+    #[tokio::test]
+    async fn download_artifact_all_when_name_empty() {
+        let runtime = MockContainerRuntime::default();
+        let workflow = minimal_workflow();
+        let working_dir = tempfile::tempdir().unwrap();
+
+        // Create and upload two artifacts
+        std::fs::write(working_dir.path().join("a.txt"), "aaa").unwrap();
+        std::fs::write(working_dir.path().join("b.txt"), "bbb").unwrap();
+
+        let artifact_dir = tempfile::tempdir().unwrap();
+        let artifact_store = crate::artifacts::ArtifactStore::new(artifact_dir.path()).unwrap();
+        artifact_store
+            .upload("art-a", "a.txt", working_dir.path())
+            .await
+            .unwrap();
+        artifact_store
+            .upload("art-b", "b.txt", working_dir.path())
+            .await
+            .unwrap();
+
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache_store =
+            crate::cache::CacheStore::with_root(cache_dir.path().to_path_buf()).unwrap();
+        let pending = std::sync::Mutex::new(Vec::<PendingCacheSave>::new());
+
+        // Download all (no name specified)
+        let dl_with = HashMap::new();
+        let step = make_step(
+            "download-all",
+            "actions/download-artifact@v4",
+            Some(dl_with),
+            HashMap::new(),
+        );
+        let dl_workspace = tempfile::tempdir().unwrap();
+        let job_env = HashMap::new();
+
+        let ctx = StepExecutionContext {
+            step: &step,
+            step_idx: 0,
+            job_env: &job_env,
+            working_dir: dl_workspace.path(),
+            runtime: &runtime,
+            workflow: &workflow,
+            runner_image: "ubuntu:latest",
+            verbose: false,
+            matrix_combination: &None,
+            secret_manager: None,
+            secret_masker: None,
+            container_config: None,
+            workflow_defaults: None,
+            job_defaults: None,
+            step_outputs: &HashMap::new(),
+            step_statuses: &HashMap::new(),
+            job_status: "success",
+            secrets_context: &HashMap::new(),
+            needs_context: &HashMap::new(),
+            needs_results: &HashMap::new(),
+            artifact_store: &artifact_store,
+            cache_store: &cache_store,
+            pending_cache_saves: &pending,
+        };
+
+        let result = execute_step(ctx).await.unwrap();
+        assert_eq!(result.status, StepStatus::Success);
+        assert!(result.output.contains("2 artifact(s)"));
+        // Each artifact should be in its own subdirectory
+        assert!(dl_workspace.path().join("art-a/a.txt").exists());
+        assert!(dl_workspace.path().join("art-b/b.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn cache_step_rejects_empty_key() {
+        let runtime = MockContainerRuntime::default();
+        let workflow = minimal_workflow();
+        let working_dir = tempfile::tempdir().unwrap();
+
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache_store =
+            crate::cache::CacheStore::with_root(cache_dir.path().to_path_buf()).unwrap();
+        let artifact_dir = tempfile::tempdir().unwrap();
+        let artifact_store = crate::artifacts::ArtifactStore::new(artifact_dir.path()).unwrap();
+        let pending = std::sync::Mutex::new(Vec::<PendingCacheSave>::new());
+
+        let mut with = HashMap::new();
+        with.insert("key".to_string(), String::new());
+        with.insert("path".to_string(), "node_modules".to_string());
+        let step = make_step("cache", "actions/cache@v4", Some(with), HashMap::new());
+        let job_env = HashMap::new();
+
+        let ctx = StepExecutionContext {
+            step: &step,
+            step_idx: 0,
+            job_env: &job_env,
+            working_dir: working_dir.path(),
+            runtime: &runtime,
+            workflow: &workflow,
+            runner_image: "ubuntu:latest",
+            verbose: false,
+            matrix_combination: &None,
+            secret_manager: None,
+            secret_masker: None,
+            container_config: None,
+            workflow_defaults: None,
+            job_defaults: None,
+            step_outputs: &HashMap::new(),
+            step_statuses: &HashMap::new(),
+            job_status: "success",
+            secrets_context: &HashMap::new(),
+            needs_context: &HashMap::new(),
+            needs_results: &HashMap::new(),
+            artifact_store: &artifact_store,
+            cache_store: &cache_store,
+            pending_cache_saves: &pending,
+        };
+
+        let result = execute_step(ctx).await.unwrap();
+        assert_eq!(result.status, StepStatus::Failure);
+        assert!(result.output.contains("not provided"));
+    }
+
+    #[tokio::test]
+    async fn cache_step_rejects_empty_path() {
+        let runtime = MockContainerRuntime::default();
+        let workflow = minimal_workflow();
+        let working_dir = tempfile::tempdir().unwrap();
+
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache_store =
+            crate::cache::CacheStore::with_root(cache_dir.path().to_path_buf()).unwrap();
+        let artifact_dir = tempfile::tempdir().unwrap();
+        let artifact_store = crate::artifacts::ArtifactStore::new(artifact_dir.path()).unwrap();
+        let pending = std::sync::Mutex::new(Vec::<PendingCacheSave>::new());
+
+        let mut with = HashMap::new();
+        with.insert("key".to_string(), "deps-key".to_string());
+        // path is missing entirely
+        let step = make_step("cache", "actions/cache@v4", Some(with), HashMap::new());
+        let job_env = HashMap::new();
+
+        let ctx = StepExecutionContext {
+            step: &step,
+            step_idx: 0,
+            job_env: &job_env,
+            working_dir: working_dir.path(),
+            runtime: &runtime,
+            workflow: &workflow,
+            runner_image: "ubuntu:latest",
+            verbose: false,
+            matrix_combination: &None,
+            secret_manager: None,
+            secret_masker: None,
+            container_config: None,
+            workflow_defaults: None,
+            job_defaults: None,
+            step_outputs: &HashMap::new(),
+            step_statuses: &HashMap::new(),
+            job_status: "success",
+            secrets_context: &HashMap::new(),
+            needs_context: &HashMap::new(),
+            needs_results: &HashMap::new(),
+            artifact_store: &artifact_store,
+            cache_store: &cache_store,
+            pending_cache_saves: &pending,
+        };
+
+        let result = execute_step(ctx).await.unwrap();
+        assert_eq!(result.status, StepStatus::Failure);
+        assert!(result.output.contains("not provided"));
+    }
+
+    #[tokio::test]
+    async fn cache_step_multi_path_defers_all_paths() {
+        let runtime = MockContainerRuntime::default();
+        let workflow = minimal_workflow();
+        let working_dir = tempfile::tempdir().unwrap();
+
+        // Create two directories to cache
+        std::fs::create_dir_all(working_dir.path().join("node_modules")).unwrap();
+        std::fs::write(working_dir.path().join("node_modules/pkg.json"), "{}").unwrap();
+        std::fs::create_dir_all(working_dir.path().join(".npm")).unwrap();
+        std::fs::write(working_dir.path().join(".npm/cache.bin"), "data").unwrap();
+
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache_store =
+            crate::cache::CacheStore::with_root(cache_dir.path().to_path_buf()).unwrap();
+        let artifact_dir = tempfile::tempdir().unwrap();
+        let artifact_store = crate::artifacts::ArtifactStore::new(artifact_dir.path()).unwrap();
+        let pending = std::sync::Mutex::new(Vec::<PendingCacheSave>::new());
+
+        let mut with = HashMap::new();
+        with.insert("key".to_string(), "deps-multi".to_string());
+        with.insert("path".to_string(), "node_modules\n.npm".to_string());
+        let step = make_step("cache", "actions/cache@v4", Some(with), HashMap::new());
+        let job_env = HashMap::new();
+
+        let ctx = StepExecutionContext {
+            step: &step,
+            step_idx: 0,
+            job_env: &job_env,
+            working_dir: working_dir.path(),
+            runtime: &runtime,
+            workflow: &workflow,
+            runner_image: "ubuntu:latest",
+            verbose: false,
+            matrix_combination: &None,
+            secret_manager: None,
+            secret_masker: None,
+            container_config: None,
+            workflow_defaults: None,
+            job_defaults: None,
+            step_outputs: &HashMap::new(),
+            step_statuses: &HashMap::new(),
+            job_status: "success",
+            secrets_context: &HashMap::new(),
+            needs_context: &HashMap::new(),
+            needs_results: &HashMap::new(),
+            artifact_store: &artifact_store,
+            cache_store: &cache_store,
+            pending_cache_saves: &pending,
+        };
+
+        let result = execute_step(ctx).await.unwrap();
+        assert_eq!(result.status, StepStatus::Success);
+        assert!(result.output.contains("Cache miss"));
+
+        // Both paths should be deferred
+        assert_eq!(pending.lock().unwrap().len(), 2);
+
+        // Flush and verify both paths are saved
+        flush_pending_cache_saves(&pending, &cache_store).await;
+
+        let ws2 = tempfile::tempdir().unwrap();
+        let hit = cache_store
+            .restore("deps-multi", &[], "node_modules", ws2.path())
+            .await;
+        assert!(hit.is_some());
+        assert!(ws2.path().join("node_modules/pkg.json").exists());
+
+        let hit2 = cache_store
+            .restore("deps-multi", &[], ".npm", ws2.path())
+            .await;
+        assert!(hit2.is_some());
+        assert!(ws2.path().join(".npm/cache.bin").exists());
     }
 }

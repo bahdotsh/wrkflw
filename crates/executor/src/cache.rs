@@ -118,22 +118,31 @@ impl CacheStore {
             return None;
         }
 
-        // Try exact match first
-        let cache_dir = self.cache_path(key);
-        if cache_dir.exists() {
-            let target = workspace.join(path);
-            if copy_dir_contents(&cache_dir, &target).is_ok() {
-                return Some(key.to_string());
+        // Try exact match first (composite key+path hash, then legacy key-only hash)
+        for cache_dir in [self.cache_path_for(key, path), self.cache_path(key)] {
+            if cache_dir.exists() {
+                let target = workspace.join(path);
+                if copy_dir_contents(&cache_dir, &target).is_ok() {
+                    return Some(key.to_string());
+                }
             }
         }
 
         // Try restore-keys as prefix matches
         for prefix in restore_keys {
-            if let Some(matched) = self.find_by_prefix(prefix) {
-                let cache_dir = self.cache_path(&matched);
+            if let Some(matched) = self.find_by_prefix(prefix, path) {
+                let cache_dir = self.cache_path_for(&matched, path);
                 let target = workspace.join(path);
                 if copy_dir_contents(&cache_dir, &target).is_ok() {
                     return Some(matched);
+                }
+                // Also try the legacy key-only hash for backwards compat
+                let legacy_dir = self.cache_path(&matched);
+                if legacy_dir.exists() {
+                    let target = workspace.join(path);
+                    if copy_dir_contents(&legacy_dir, &target).is_ok() {
+                        return Some(matched);
+                    }
                 }
             }
         }
@@ -152,7 +161,7 @@ impl CacheStore {
             return Err(format!("Cache path '{}' does not exist", source.display()));
         }
 
-        let cache_dir = self.cache_path(key);
+        let cache_dir = self.cache_path_for(key, path);
         // Remove old cache entry if it exists
         if cache_dir.exists() {
             std::fs::remove_dir_all(&cache_dir)
@@ -182,6 +191,18 @@ impl CacheStore {
         Ok(())
     }
 
+    /// Compute the on-disk directory for a `(key, path)` pair.
+    ///
+    /// When `path` is provided, the hash incorporates both key and path so that
+    /// multiple paths under the same cache key get separate storage directories
+    /// (matching `actions/cache`'s multi-path `path:` input).
+    fn cache_path_for(&self, key: &str, path: &str) -> PathBuf {
+        let input = format!("{}\0{}", key, path);
+        let hash = format!("{:x}", Sha256::digest(input.as_bytes()));
+        self.root.join(hash)
+    }
+
+    /// Compute the on-disk directory for a key (single-path legacy form).
     fn cache_path(&self, key: &str) -> PathBuf {
         let hash = format!("{:x}", Sha256::digest(key.as_bytes()));
         self.root.join(hash)
@@ -189,14 +210,21 @@ impl CacheStore {
 
     /// Find the most recently modified cached key that starts with the given prefix.
     ///
+    /// When `cache_path` is provided, the fast-path exact check also tries the
+    /// composite `(prefix, cache_path)` hash, supporting multi-path cache entries.
+    ///
     /// When multiple entries match, the one with the newest modification time wins,
     /// matching GitHub Actions' behavior of preferring the most recently created key.
-    fn find_by_prefix(&self, prefix: &str) -> Option<String> {
-        // Fast path: if the prefix is an exact key, skip the full directory scan
-        let exact_path = self.cache_path(prefix);
-        if let Ok(stored) = std::fs::read_to_string(exact_path.join(".cache_key")) {
-            if stored == prefix {
-                return Some(stored);
+    fn find_by_prefix(&self, prefix: &str, cache_path: &str) -> Option<String> {
+        // Fast path: try composite (prefix, path) hash first, then legacy key-only hash
+        for exact_path in [
+            self.cache_path_for(prefix, cache_path),
+            self.cache_path(prefix),
+        ] {
+            if let Ok(stored) = std::fs::read_to_string(exact_path.join(".cache_key")) {
+                if stored == prefix {
+                    return Some(stored);
+                }
             }
         }
 

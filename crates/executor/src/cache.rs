@@ -11,6 +11,12 @@ use std::path::{Path, PathBuf};
 /// total size is back under the limit.
 const DEFAULT_MAX_CACHE_SIZE_BYTES: u64 = 1024 * 1024 * 1024;
 
+/// Internal metadata file name used by `CacheStore` to store the cache key.
+///
+/// Used in `save_inner` (to write) and `find_by_prefix` / `copy_dir_contents`
+/// (to read / skip). Keep all references consistent via this constant.
+const CACHE_KEY_METADATA_FILE: &str = ".cache_key";
+
 /// Manages a persistent local cache for workflow runs.
 ///
 /// All public I/O methods (`restore`, `save`) run filesystem work on a
@@ -162,28 +168,38 @@ impl CacheStore {
         }
 
         let cache_dir = self.cache_path_for(key, path);
-        // Remove old cache entry if it exists
-        if cache_dir.exists() {
-            std::fs::remove_dir_all(&cache_dir)
-                .map_err(|e| format!("Failed to remove old cache: {}", e))?;
+        // Write to a temporary directory first, then atomically rename over the
+        // old entry. This prevents data loss if the process is killed mid-copy.
+        let tmp_dir = cache_dir.with_extension(".tmp");
+        if tmp_dir.exists() {
+            std::fs::remove_dir_all(&tmp_dir)
+                .map_err(|e| format!("Failed to clean tmp cache dir: {}", e))?;
         }
 
         if source.is_dir() {
-            copy_dir_contents(&source, &cache_dir)?;
+            copy_dir_contents(&source, &tmp_dir)?;
         } else {
             let file_name = source
                 .file_name()
                 .ok_or_else(|| format!("Cache path '{}' has no file name component", path))?;
-            std::fs::create_dir_all(&cache_dir)
+            std::fs::create_dir_all(&tmp_dir)
                 .map_err(|e| format!("Failed to create cache dir: {}", e))?;
-            let dest = cache_dir.join(file_name);
+            let dest = tmp_dir.join(file_name);
             std::fs::copy(&source, &dest).map_err(|e| format!("Failed to copy file: {}", e))?;
         }
 
         // Write key metadata for prefix matching
-        let meta_path = cache_dir.join(".cache_key");
+        let meta_path = tmp_dir.join(CACHE_KEY_METADATA_FILE);
         std::fs::write(&meta_path, key)
             .map_err(|e| format!("Failed to write cache metadata: {}", e))?;
+
+        // Atomic swap: remove old, rename tmp into place
+        if cache_dir.exists() {
+            std::fs::remove_dir_all(&cache_dir)
+                .map_err(|e| format!("Failed to remove old cache: {}", e))?;
+        }
+        std::fs::rename(&tmp_dir, &cache_dir)
+            .map_err(|e| format!("Failed to finalize cache entry: {}", e))?;
 
         // Evict oldest entries if cache exceeds size limit
         self.evict_if_needed();
@@ -221,7 +237,7 @@ impl CacheStore {
             self.cache_path_for(prefix, cache_path),
             self.cache_path(prefix),
         ] {
-            if let Ok(stored) = std::fs::read_to_string(exact_path.join(".cache_key")) {
+            if let Ok(stored) = std::fs::read_to_string(exact_path.join(CACHE_KEY_METADATA_FILE)) {
                 if stored == prefix {
                     return Some(stored);
                 }
@@ -232,7 +248,7 @@ impl CacheStore {
         let mut best: Option<(String, std::time::SystemTime)> = None;
         for entry in entries.flatten() {
             let path = entry.path();
-            let meta_path = path.join(".cache_key");
+            let meta_path = path.join(CACHE_KEY_METADATA_FILE);
             if let Ok(stored_key) = std::fs::read_to_string(&meta_path) {
                 if stored_key.starts_with(prefix) {
                     let mtime = entry
@@ -345,9 +361,6 @@ fn validate_cache_path(path: &str, workspace: &Path) -> bool {
         !has_dotdot_component(path)
     }
 }
-
-/// Internal metadata file name used by `CacheStore` to store the cache key.
-const CACHE_KEY_METADATA_FILE: &str = ".cache_key";
 
 /// Recursively copy directory contents from `src` to `dst`, skipping symlinks
 /// and internal cache metadata files.

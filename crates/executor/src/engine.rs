@@ -5,7 +5,7 @@ use serde_yaml::Value;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+// std::process::Command replaced by tokio::process::Command for async safety
 use thiserror::Error;
 
 use ignore::{gitignore::GitignoreBuilder, Match};
@@ -2767,7 +2767,9 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
             };
 
             if ctx.verbose {
-                println!("  Emulated actions/checkout: copied project files to workspace");
+                wrkflw_logging::info(
+                    "Emulated actions/checkout: copied project files to workspace",
+                );
             }
 
             StepResult::new(step_name, StepStatus::Success, output)
@@ -3123,9 +3125,10 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                         if uses.starts_with("actions-rs/toolchain@")
                             || uses.starts_with("dtolnay/rust-toolchain@")
                         {
-                            let rustc_version = Command::new("rustc")
+                            let rustc_version = tokio::process::Command::new("rustc")
                                 .arg("--version")
                                 .output()
+                                .await
                                 .map(|output| String::from_utf8_lossy(&output.stdout).to_string())
                                 .unwrap_or_else(|_| "not found".to_string());
 
@@ -3144,9 +3147,10 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
 
                         // For cargo action, execute cargo commands directly
                         if uses.starts_with("actions-rs/cargo@") {
-                            let cargo_version = Command::new("cargo")
+                            let cargo_version = tokio::process::Command::new("cargo")
                                 .arg("--version")
                                 .output()
+                                .await
                                 .map(|output| String::from_utf8_lossy(&output.stdout).to_string())
                                 .unwrap_or_else(|_| "not found".to_string());
 
@@ -3195,17 +3199,17 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                                     ));
 
                                     // Execute the command
-                                    let mut cmd = Command::new("sh");
+                                    let mut cmd = tokio::process::Command::new("sh");
                                     cmd.arg("-c");
                                     cmd.arg(&real_command);
                                     cmd.current_dir(ctx.working_dir);
 
                                     // Add environment variables
-                                    for (key, value) in step_env {
+                                    for (key, value) in &step_env {
                                         cmd.env(key, value);
                                     }
 
-                                    match cmd.output() {
+                                    match cmd.output().await {
                                         Ok(output) => {
                                             let exit_code = output.status.code().unwrap_or(-1);
                                             let stdout =
@@ -3250,8 +3254,10 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                     } else {
                         // For GitHub actions, check if we have special handling
                         if let Err(e) = emulation::handle_special_action(uses).await {
-                            // Log error but continue
-                            println!("   Warning: Special action handling failed: {}", e);
+                            wrkflw_logging::warning(&format!(
+                                "Special action handling failed: {}",
+                                e
+                            ));
                         }
 
                         // Check if we should hide GitHub action messages
@@ -3271,12 +3277,7 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
 
                         // Only log a message to the console if we're showing action messages
                         if !hide_messages {
-                            // For Emulation mode, log a message about what action would be executed
-                            println!(
-                                "   {} Would execute GitHub action: {}",
-                                wrkflw_logging::symbols::GEAR,
-                                uses
-                            );
+                            wrkflw_logging::info(&format!("Would execute GitHub action: {}", uses));
                         }
 
                         // Extract the actual command from the GitHub action if applicable
@@ -3424,10 +3425,13 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                         }
 
                         // Add standard GitHub action environment variables
+                        // (mask INPUT_* values since they may contain secrets)
                         detailed_output.push_str("\nEnvironment variables:\n");
                         for (key, value) in step_env.iter() {
-                            if key.starts_with("GITHUB_") || key.starts_with("INPUT_") {
+                            if key.starts_with("GITHUB_") {
                                 detailed_output.push_str(&format!("  {}: {}\n", key, value));
+                            } else if key.starts_with("INPUT_") {
+                                detailed_output.push_str(&format!("  {}: ***\n", key));
                             }
                         }
 
@@ -3451,11 +3455,10 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
 
                         error_details.push_str("\nEnvironment:\n");
                         for (key, value) in step_env.iter() {
-                            if key.starts_with("GITHUB_")
-                                || key.starts_with("INPUT_")
-                                || key.starts_with("RUST")
-                            {
+                            if key.starts_with("GITHUB_") || key.starts_with("RUST") {
                                 error_details.push_str(&format!("  {}: {}\n", key, value));
+                            } else if key.starts_with("INPUT_") {
+                                error_details.push_str(&format!("  {}: ***\n", key));
                             }
                         }
 
@@ -4179,6 +4182,18 @@ async fn execute_reusable_workflow_job(
                     "Reusable workflow not found at path: {}",
                     path.display()
                 )));
+            }
+            // Validate the resolved path stays within the repository root
+            // to prevent path traversal via `uses: /etc/some-file` or `uses: ../../escape`.
+            if let Ok(canonical) = path.canonicalize() {
+                if let Ok(canonical_cwd) = current_dir.canonicalize() {
+                    if !canonical.starts_with(&canonical_cwd) {
+                        return Err(ExecutionError::Execution(format!(
+                            "Reusable workflow path '{}' escapes the repository root",
+                            p
+                        )));
+                    }
+                }
             }
             path
         }

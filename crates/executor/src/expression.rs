@@ -304,8 +304,11 @@ impl<'a> ExpressionContext<'a> {
                 .get(&parts[1])
                 .map(|v| ExprValue::String(v.clone()))
                 .unwrap_or(ExprValue::Null),
-            "github" if parts.len() == 2 => {
-                let env_key = format!("GITHUB_{}", parts[1].to_uppercase());
+            "github" if parts.len() >= 2 => {
+                // Support nested github context like github.event.action,
+                // github.event.pull_request.number, etc.
+                // Map dotted path to GITHUB_ env var with underscores.
+                let env_key = format!("GITHUB_{}", parts[1..].join("_").to_uppercase());
                 self.env_context
                     .get(&env_key)
                     .map(|v| ExprValue::String(v.clone()))
@@ -382,7 +385,12 @@ fn yaml_value_to_expr(v: &Value) -> ExprValue {
         Value::Number(n) => ExprValue::Number(n.as_f64().unwrap_or(0.0)),
         Value::Bool(b) => ExprValue::Bool(*b),
         Value::Null => ExprValue::Null,
-        _ => ExprValue::String(format!("{:?}", v)),
+        _ => ExprValue::String(
+            serde_yaml::to_string(v)
+                .unwrap_or_else(|_| format!("{:?}", v))
+                .trim()
+                .to_string(),
+        ),
     }
 }
 
@@ -664,9 +672,28 @@ fn call_builtin(
                 return Err("format() requires at least 1 argument".to_string());
             }
             let fmt = args[0].to_output_string();
-            let mut result = fmt;
-            for (i, arg) in args.iter().skip(1).enumerate() {
-                result = result.replace(&format!("{{{}}}", i), &arg.to_output_string());
+            // Single-pass replacement to prevent arg content from being consumed
+            // by later placeholder substitutions (e.g. format('{0} {1}', '{1}', 'x')
+            // should produce '{1} x', not 'x x').
+            let mut result = String::with_capacity(fmt.len());
+            let fmt_bytes = fmt.as_bytes();
+            let mut i = 0;
+            while i < fmt_bytes.len() {
+                if fmt_bytes[i] == b'{' {
+                    // Look for {N} pattern
+                    if let Some(close) = fmt[i + 1..].find('}') {
+                        let inner = &fmt[i + 1..i + 1 + close];
+                        if let Ok(idx) = inner.parse::<usize>() {
+                            if idx + 1 < args.len() {
+                                result.push_str(&args[idx + 1].to_output_string());
+                                i += close + 2; // skip past '}'
+                                continue;
+                            }
+                        }
+                    }
+                }
+                result.push(fmt_bytes[i] as char);
+                i += 1;
             }
             Ok(ExprValue::String(result))
         }
@@ -689,7 +716,16 @@ fn call_builtin(
                 return Err("toJSON() requires 1 argument".to_string());
             }
             match &args[0] {
-                ExprValue::String(s) => Ok(ExprValue::String(format!("\"{}\"", s))),
+                ExprValue::String(s) => {
+                    // Properly escape the string for valid JSON output
+                    let escaped = s
+                        .replace('\\', "\\\\")
+                        .replace('"', "\\\"")
+                        .replace('\n', "\\n")
+                        .replace('\r', "\\r")
+                        .replace('\t', "\\t");
+                    Ok(ExprValue::String(format!("\"{}\"", escaped)))
+                }
                 ExprValue::Number(n) => Ok(ExprValue::String(format!("{}", n))),
                 ExprValue::Bool(b) => Ok(ExprValue::String(format!("{}", b))),
                 ExprValue::Null => Ok(ExprValue::String("null".to_string())),
@@ -709,8 +745,11 @@ fn call_builtin(
                     if let Ok(n) = s.parse::<f64>() {
                         Ok(ExprValue::Number(n))
                     } else {
-                        // Strip quotes if present
-                        let stripped = s.trim_matches('"');
+                        // Strip one layer of quotes if present
+                        let stripped = s
+                            .strip_prefix('"')
+                            .and_then(|s| s.strip_suffix('"'))
+                            .unwrap_or(&s);
                         Ok(ExprValue::String(stripped.to_string()))
                     }
                 }

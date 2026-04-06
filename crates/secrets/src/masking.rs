@@ -86,7 +86,7 @@ impl SecretMasker {
     /// can be called through a shared reference during workflow execution.
     pub fn add_secret(&self, secret: impl Into<String>) {
         let secret = secret.into();
-        if secret.len() >= self.min_length {
+        if secret.chars().count() >= self.min_length {
             let masked = self.create_mask(&secret);
             let mut data = self.data.write().unwrap_or_else(|e| e.into_inner());
             data.secret_cache.insert(secret.clone(), masked);
@@ -94,10 +94,24 @@ impl SecretMasker {
         }
     }
 
-    /// Add multiple secrets to be masked
+    /// Add multiple secrets to be masked.
+    ///
+    /// Acquires the write lock once for the entire batch instead of per-secret.
     pub fn add_secrets(&self, secrets: impl IntoIterator<Item = String>) {
-        for secret in secrets {
-            self.add_secret(secret);
+        let pairs: Vec<(String, String)> = secrets
+            .into_iter()
+            .filter(|s| s.chars().count() >= self.min_length)
+            .map(|s| {
+                let masked = self.create_mask(&s);
+                (s, masked)
+            })
+            .collect();
+        if !pairs.is_empty() {
+            let mut data = self.data.write().unwrap_or_else(|e| e.into_inner());
+            for (secret, masked) in pairs {
+                data.secret_cache.insert(secret.clone(), masked);
+                data.secrets.insert(secret);
+            }
         }
     }
 
@@ -119,18 +133,22 @@ impl SecretMasker {
     pub fn mask(&self, text: &str) -> String {
         let mut result = text.to_string();
 
+        // Clone the secret/mask pairs so we can release the lock quickly,
+        // then sort longest-first so overlapping secrets are handled correctly
+        // (e.g. "secret123" is replaced before "secret").
         let data = self.data.read().unwrap_or_else(|e| e.into_inner());
-
-        // Use cached masked versions for better performance
-        for secret in data.secrets.iter() {
-            if !secret.is_empty() {
-                if let Some(masked) = data.secret_cache.get(secret) {
-                    result = result.replace(secret, masked);
-                }
-            }
-        }
-
+        let mut pairs: Vec<(String, String)> = data
+            .secret_cache
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
         drop(data);
+
+        pairs.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+
+        for (secret, masked) in &pairs {
+            result = result.replace(secret.as_str(), masked);
+        }
 
         // Also mask potential tokens and keys with regex patterns
         result = self.mask_patterns(&result);
@@ -138,25 +156,12 @@ impl SecretMasker {
         result
     }
 
-    /// Create a mask for a secret, preserving some structure for debugging
-    fn create_mask(&self, secret: &str) -> String {
-        let len = secret.len();
-
-        if len <= 3 {
-            // Very short secrets - mask completely
-            self.mask_char.to_string().repeat(3)
-        } else if len <= 8 {
-            // Short secrets - show first character
-            let first = secret.chars().next().unwrap_or(self.mask_char);
-            format!("{}{}", first, self.mask_char.to_string().repeat(len - 1))
-        } else {
-            // Longer secrets - show first 2 and last 2 characters
-            let chars: Vec<char> = secret.chars().collect();
-            let first_two = chars.iter().take(2).collect::<String>();
-            let last_two = chars.iter().skip(len - 2).collect::<String>();
-            let middle_mask = self.mask_char.to_string().repeat(len - 4);
-            format!("{}{}{}", first_two, middle_mask, last_two)
-        }
+    /// Create a fixed mask for a secret.
+    ///
+    /// Uses a fixed `***` replacement matching GitHub Actions behavior.
+    /// Never leaks any characters of the original secret.
+    fn create_mask(&self, _secret: &str) -> String {
+        format!("{}{}{}", self.mask_char, self.mask_char, self.mask_char)
     }
 
     /// Mask common patterns that look like secrets
@@ -190,7 +195,8 @@ impl SecretMasker {
 
         // AWS Secret Access Keys (basic pattern)
         // Only mask if it's clearly in a secret context (basic heuristic)
-        if text.to_lowercase().contains("secret") || text.to_lowercase().contains("key") {
+        let lower = text.to_lowercase();
+        if lower.contains("secret") || lower.contains("key") {
             result = patterns.aws_secret.replace_all(&result, "***").to_string();
         }
 
@@ -200,11 +206,8 @@ impl SecretMasker {
             .replace_all(&result, "eyJ***.eyJ***.***")
             .to_string();
 
-        // API keys with common prefixes
-        result = patterns
-            .api_key
-            .replace_all(&result, "${1}=***")
-            .to_string();
+        // API keys with common prefixes — replace full match with ***
+        result = patterns.api_key.replace_all(&result, "***").to_string();
 
         result
     }
@@ -232,6 +235,12 @@ impl SecretMasker {
             || patterns.github_oauth.is_match(text)
             || patterns.aws_access_key.is_match(text)
             || patterns.jwt.is_match(text)
+            || patterns.api_key.is_match(text)
+            || {
+                let lower = text.to_lowercase();
+                (lower.contains("secret") || lower.contains("key"))
+                    && patterns.aws_secret.is_match(text)
+            }
     }
 
     /// Get the number of secrets being tracked
@@ -278,17 +287,15 @@ mod tests {
     }
 
     #[test]
-    fn test_preserve_structure() {
+    fn test_fixed_mask_replacement() {
         let masker = SecretMasker::new();
         masker.add_secret("verylongsecretkey123");
 
         let input = "Key: verylongsecretkey123";
         let masked = masker.mask(input);
 
-        // Should preserve first 2 and last 2 characters
-        assert!(masked.contains("ve"));
-        assert!(masked.contains("23"));
-        assert!(masked.contains("***"));
+        // Should use fixed *** mask with no character leakage
+        assert_eq!(masked, "Key: ***");
         assert!(!masked.contains("verylongsecretkey123"));
     }
 
@@ -354,7 +361,7 @@ mod tests {
         let input = "The secret is secret123";
         let masked = masker.mask(input);
 
-        assert!(masked.contains("XX"));
+        assert_eq!(masked, "The secret is XXX");
         assert!(!masked.contains("**"));
     }
 

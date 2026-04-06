@@ -17,21 +17,21 @@ fn sanitize_artifact_name(name: &str) -> Result<String, String> {
     if name.is_empty() {
         return Err("Artifact name cannot be empty".to_string());
     }
-    let sanitized = name.replace('\0', "");
-    if sanitized.is_empty() {
-        return Err("Artifact name cannot be empty after sanitization".to_string());
+    // Reject names containing null bytes outright rather than silently stripping
+    // (stripping could create collisions, e.g. "foo\0bar" → "foobar").
+    if name.contains('\0') {
+        return Err(format!(
+            "Invalid artifact name '{}': contains null bytes",
+            name
+        ));
     }
-    if sanitized.contains('/')
-        || sanitized.contains('\\')
-        || sanitized.contains("..")
-        || sanitized.starts_with('.')
-    {
+    if name.contains('/') || name.contains('\\') || name.contains("..") || name.starts_with('.') {
         return Err(format!(
             "Invalid artifact name '{}': must not contain path separators, '..', or start with '.'",
             name
         ));
     }
-    Ok(sanitized)
+    Ok(name.to_string())
 }
 
 /// Recursively collect all regular files under `dir`, skipping symlinks.
@@ -102,15 +102,17 @@ impl ArtifactStore {
                 .canonicalize()
                 .map_err(|e| format!("Failed to canonicalize workspace: {}", e))?;
             let full_pattern = ws.join(&pattern).to_string_lossy().to_string();
-            let entries: Vec<PathBuf> = glob::glob(&full_pattern)
+            // Collect (original, canonical) pairs in one pass to avoid
+            // double-canonicalize per file.
+            let entries: Vec<(PathBuf, PathBuf)> = glob::glob(&full_pattern)
                 .map_err(|e| format!("Invalid glob pattern '{}': {}", pattern, e))?
                 .filter_map(|e| e.ok())
                 .filter(|p| p.is_file() && !p.is_symlink())
-                // Ensure matched files are within the workspace (prevent path traversal)
-                .filter(|p| {
+                .filter_map(|p| {
                     p.canonicalize()
-                        .map(|c| c.starts_with(&canonical_workspace))
-                        .unwrap_or(false)
+                        .ok()
+                        .filter(|c| c.starts_with(&canonical_workspace))
+                        .map(|c| (p, c))
                 })
                 .collect();
 
@@ -123,12 +125,7 @@ impl ArtifactStore {
             }
 
             let mut count = 0;
-            for entry in &entries {
-                // Use canonical paths for strip_prefix to be consistent
-                // with the canonical workspace security filter above.
-                let canonical_entry = entry
-                    .canonicalize()
-                    .map_err(|e| format!("Failed to canonicalize '{}': {}", entry.display(), e))?;
+            for (entry, canonical_entry) in &entries {
                 let rel = canonical_entry
                     .strip_prefix(&canonical_workspace)
                     .map_err(|_| {

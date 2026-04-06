@@ -13,7 +13,7 @@ pub mod expression;
 pub mod github_env_files;
 pub mod podman;
 pub mod substitution;
-pub mod workflow_commands;
+pub(crate) mod workflow_commands;
 
 // Re-export public items
 pub use docker::cleanup_resources;

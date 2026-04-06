@@ -82,17 +82,17 @@ fn decode_value(s: &str) -> String {
 /// workflow commands are silently skipped.
 pub fn parse_workflow_commands(output: &str) -> Vec<WorkflowCommand> {
     let mut commands = Vec::new();
-    let mut stop_token: Option<String> = None;
     // Pre-computed resume sentinel to avoid allocation per line
     let mut resume_sentinel: Option<String> = None;
 
     for line in output.lines() {
-        let trimmed = line.trim();
+        // GitHub Actions only recognizes commands starting at column 0 —
+        // indented lines must not be treated as commands.
+        let trimmed = line.trim_end();
 
         // If commands are stopped, look for the resume token
         if let Some(ref sentinel) = resume_sentinel {
             if trimmed == sentinel.as_str() {
-                stop_token = None;
                 resume_sentinel = None;
             }
             continue;
@@ -109,15 +109,11 @@ pub fn parse_workflow_commands(output: &str) -> Vec<WorkflowCommand> {
                     continue;
                 }
                 resume_sentinel = Some(format!("::{}::", token));
-                stop_token = Some(token.clone());
             } else {
                 commands.push(cmd);
             }
         }
     }
-
-    // Suppress unused variable warning — stop_token tracks state for potential future use
-    let _ = stop_token;
 
     commands
 }
@@ -147,40 +143,61 @@ fn parse_command_line(line: &str) -> Option<WorkflowCommand> {
 
     let params = parse_params(params_str);
 
+    // Helper to extract common annotation parameters
+    let build_annotation = |kind: &str,
+                            message: String,
+                            params: &std::collections::HashMap<String, String>|
+     -> Option<WorkflowCommand> {
+        let file = params.get("file").map(|v| decode_value(v));
+        let line = params.get("line").and_then(|v| v.parse().ok());
+        let end_line = params.get("endLine").and_then(|v| v.parse().ok());
+        let col = params.get("col").and_then(|v| v.parse().ok());
+        let end_column = params.get("endColumn").and_then(|v| v.parse().ok());
+        let title = params.get("title").map(|v| decode_value(v));
+        Some(match kind {
+            "error" => WorkflowCommand::Error {
+                message,
+                file,
+                line,
+                end_line,
+                col,
+                end_column,
+                title,
+            },
+            "warning" => WorkflowCommand::Warning {
+                message,
+                file,
+                line,
+                end_line,
+                col,
+                end_column,
+                title,
+            },
+            _ => WorkflowCommand::Notice {
+                message,
+                file,
+                line,
+                end_line,
+                col,
+                end_column,
+                title,
+            },
+        })
+    };
+
     match cmd_name {
-        "error" => Some(WorkflowCommand::Error {
-            message,
-            file: params.get("file").map(|v| decode_value(v)),
-            line: params.get("line").and_then(|v| v.parse().ok()),
-            end_line: params.get("endLine").and_then(|v| v.parse().ok()),
-            col: params.get("col").and_then(|v| v.parse().ok()),
-            end_column: params.get("endColumn").and_then(|v| v.parse().ok()),
-            title: params.get("title").map(|v| decode_value(v)),
-        }),
-        "warning" => Some(WorkflowCommand::Warning {
-            message,
-            file: params.get("file").map(|v| decode_value(v)),
-            line: params.get("line").and_then(|v| v.parse().ok()),
-            end_line: params.get("endLine").and_then(|v| v.parse().ok()),
-            col: params.get("col").and_then(|v| v.parse().ok()),
-            end_column: params.get("endColumn").and_then(|v| v.parse().ok()),
-            title: params.get("title").map(|v| decode_value(v)),
-        }),
-        "notice" => Some(WorkflowCommand::Notice {
-            message,
-            file: params.get("file").map(|v| decode_value(v)),
-            line: params.get("line").and_then(|v| v.parse().ok()),
-            end_line: params.get("endLine").and_then(|v| v.parse().ok()),
-            col: params.get("col").and_then(|v| v.parse().ok()),
-            end_column: params.get("endColumn").and_then(|v| v.parse().ok()),
-            title: params.get("title").map(|v| decode_value(v)),
-        }),
+        "error" => build_annotation("error", message, &params),
+        "warning" => build_annotation("warning", message, &params),
+        "notice" => build_annotation("notice", message, &params),
         "debug" => Some(WorkflowCommand::Debug { message }),
         "group" => Some(WorkflowCommand::Group { name: message }),
         "endgroup" => Some(WorkflowCommand::EndGroup),
         "add-mask" => Some(WorkflowCommand::AddMask { value: message }),
         "set-output" => {
-            let name = params.get("name").cloned().unwrap_or_default();
+            let name = params
+                .get("name")
+                .map(|v| decode_value(v))
+                .unwrap_or_default();
             if name.is_empty() {
                 return None;
             }
@@ -190,7 +207,10 @@ fn parse_command_line(line: &str) -> Option<WorkflowCommand> {
             })
         }
         "save-state" => {
-            let name = params.get("name").cloned().unwrap_or_default();
+            let name = params
+                .get("name")
+                .map(|v| decode_value(v))
+                .unwrap_or_default();
             if name.is_empty() {
                 return None;
             }

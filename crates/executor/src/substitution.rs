@@ -114,14 +114,23 @@ fn compute_hash_files(args_raw: &str, workspace: &Path) -> Result<String, String
         }
     }
 
-    // Collect all matching files
+    // Collect all matching files, validating they stay within the workspace
+    let canonical_workspace = workspace
+        .canonicalize()
+        .map_err(|e| format!("hashFiles: cannot canonicalize workspace: {}", e))?;
     let mut matched_files = Vec::new();
     for pattern in &patterns {
         let full_pattern = workspace.join(pattern).to_string_lossy().to_string();
         if let Ok(entries) = glob::glob(&full_pattern) {
             for entry in entries.flatten() {
-                if entry.is_file() {
-                    matched_files.push(entry);
+                if entry.is_file() && !entry.is_symlink() {
+                    // Verify the resolved file stays within the workspace
+                    // (prevents symlink traversal outside the repo).
+                    if let Ok(canonical) = entry.canonicalize() {
+                        if canonical.starts_with(&canonical_workspace) {
+                            matched_files.push(entry);
+                        }
+                    }
                 }
             }
         }

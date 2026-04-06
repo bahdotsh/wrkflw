@@ -12,19 +12,28 @@ pub enum WorkflowCommand {
         message: String,
         file: Option<String>,
         line: Option<u32>,
+        end_line: Option<u32>,
         col: Option<u32>,
+        end_column: Option<u32>,
+        title: Option<String>,
     },
     Warning {
         message: String,
         file: Option<String>,
         line: Option<u32>,
+        end_line: Option<u32>,
         col: Option<u32>,
+        end_column: Option<u32>,
+        title: Option<String>,
     },
     Notice {
         message: String,
         file: Option<String>,
         line: Option<u32>,
+        end_line: Option<u32>,
         col: Option<u32>,
+        end_column: Option<u32>,
+        title: Option<String>,
     },
     Debug {
         message: String,
@@ -51,6 +60,19 @@ pub enum WorkflowCommand {
     },
 }
 
+/// Decode GitHub Actions percent-encoded values.
+///
+/// GitHub Actions encodes: `%25` → `%`, `%0A` → `\n`, `%0D` → `\r`, `%3A` → `:`.
+fn decode_value(s: &str) -> String {
+    s.replace("%25", "%")
+        .replace("%0A", "\n")
+        .replace("%0a", "\n")
+        .replace("%0D", "\r")
+        .replace("%0d", "\r")
+        .replace("%3A", ":")
+        .replace("%3a", ":")
+}
+
 /// Parse all workflow commands from step output text.
 ///
 /// Returns the commands in the order they appear. Lines that are not
@@ -58,14 +80,17 @@ pub enum WorkflowCommand {
 pub fn parse_workflow_commands(output: &str) -> Vec<WorkflowCommand> {
     let mut commands = Vec::new();
     let mut stop_token: Option<String> = None;
+    // Pre-computed resume sentinel to avoid allocation per line
+    let mut resume_sentinel: Option<String> = None;
 
     for line in output.lines() {
         let trimmed = line.trim();
 
         // If commands are stopped, look for the resume token
-        if let Some(ref token) = stop_token {
-            if trimmed == format!("::{token}::") {
+        if let Some(ref sentinel) = resume_sentinel {
+            if trimmed == sentinel.as_str() {
                 stop_token = None;
+                resume_sentinel = None;
             }
             continue;
         }
@@ -76,12 +101,20 @@ pub fn parse_workflow_commands(output: &str) -> Vec<WorkflowCommand> {
 
         if let Some(cmd) = parse_command_line(trimmed) {
             if let WorkflowCommand::StopCommands { ref token } = cmd {
+                if token.is_empty() {
+                    // Empty token creates an unmatchable sentinel — skip
+                    continue;
+                }
+                resume_sentinel = Some(format!("::{}::", token));
                 stop_token = Some(token.clone());
             } else {
                 commands.push(cmd);
             }
         }
     }
+
+    // Suppress unused variable warning — stop_token tracks state for potential future use
+    let _ = stop_token;
 
     commands
 }
@@ -93,11 +126,14 @@ fn parse_command_line(line: &str) -> Option<WorkflowCommand> {
     let rest = line.strip_prefix("::").unwrap_or(line);
 
     // Find the second "::" that separates command+params from the message
-    let (cmd_part, message) = if let Some(idx) = rest.find("::") {
+    let (cmd_part, raw_message) = if let Some(idx) = rest.find("::") {
         (&rest[..idx], rest[idx + 2..].to_string())
     } else {
         return None;
     };
+
+    // Decode percent-encoded values in the message
+    let message = decode_value(&raw_message);
 
     // Split command name from params (space-separated)
     let (cmd_name, params_str) = if let Some(idx) = cmd_part.find(' ') {
@@ -111,21 +147,30 @@ fn parse_command_line(line: &str) -> Option<WorkflowCommand> {
     match cmd_name {
         "error" => Some(WorkflowCommand::Error {
             message,
-            file: params.get("file").cloned(),
+            file: params.get("file").map(|v| decode_value(v)),
             line: params.get("line").and_then(|v| v.parse().ok()),
+            end_line: params.get("endLine").and_then(|v| v.parse().ok()),
             col: params.get("col").and_then(|v| v.parse().ok()),
+            end_column: params.get("endColumn").and_then(|v| v.parse().ok()),
+            title: params.get("title").map(|v| decode_value(v)),
         }),
         "warning" => Some(WorkflowCommand::Warning {
             message,
-            file: params.get("file").cloned(),
+            file: params.get("file").map(|v| decode_value(v)),
             line: params.get("line").and_then(|v| v.parse().ok()),
+            end_line: params.get("endLine").and_then(|v| v.parse().ok()),
             col: params.get("col").and_then(|v| v.parse().ok()),
+            end_column: params.get("endColumn").and_then(|v| v.parse().ok()),
+            title: params.get("title").map(|v| decode_value(v)),
         }),
         "notice" => Some(WorkflowCommand::Notice {
             message,
-            file: params.get("file").cloned(),
+            file: params.get("file").map(|v| decode_value(v)),
             line: params.get("line").and_then(|v| v.parse().ok()),
+            end_line: params.get("endLine").and_then(|v| v.parse().ok()),
             col: params.get("col").and_then(|v| v.parse().ok()),
+            end_column: params.get("endColumn").and_then(|v| v.parse().ok()),
+            title: params.get("title").map(|v| decode_value(v)),
         }),
         "debug" => Some(WorkflowCommand::Debug { message }),
         "group" => Some(WorkflowCommand::Group { name: message }),
@@ -133,6 +178,9 @@ fn parse_command_line(line: &str) -> Option<WorkflowCommand> {
         "add-mask" => Some(WorkflowCommand::AddMask { value: message }),
         "set-output" => {
             let name = params.get("name").cloned().unwrap_or_default();
+            if name.is_empty() {
+                return None;
+            }
             Some(WorkflowCommand::SetOutput {
                 name,
                 value: message,
@@ -140,6 +188,9 @@ fn parse_command_line(line: &str) -> Option<WorkflowCommand> {
         }
         "save-state" => {
             let name = params.get("name").cloned().unwrap_or_default();
+            if name.is_empty() {
+                return None;
+            }
             Some(WorkflowCommand::SaveState {
                 name,
                 value: message,
@@ -181,11 +232,40 @@ mod tests {
                 file,
                 line,
                 col,
+                ..
             } => {
                 assert_eq!(message, "Something went wrong");
                 assert_eq!(file.as_deref(), Some("app.js"));
                 assert_eq!(*line, Some(10));
                 assert_eq!(*col, Some(5));
+            }
+            _ => panic!("expected Error command"),
+        }
+    }
+
+    #[test]
+    fn parse_error_with_end_line_and_title() {
+        let output =
+            "::error file=app.js,line=5,endLine=10,col=1,endColumn=20,title=Syntax Error::bad code";
+        let cmds = parse_workflow_commands(output);
+        assert_eq!(cmds.len(), 1);
+        match &cmds[0] {
+            WorkflowCommand::Error {
+                message,
+                file,
+                line,
+                end_line,
+                col,
+                end_column,
+                title,
+            } => {
+                assert_eq!(message, "bad code");
+                assert_eq!(file.as_deref(), Some("app.js"));
+                assert_eq!(*line, Some(5));
+                assert_eq!(*end_line, Some(10));
+                assert_eq!(*col, Some(1));
+                assert_eq!(*end_column, Some(20));
+                assert_eq!(title.as_deref(), Some("Syntax Error"));
             }
             _ => panic!("expected Error command"),
         }
@@ -217,6 +297,20 @@ mod tests {
             }
             _ => panic!("expected SetOutput"),
         }
+    }
+
+    #[test]
+    fn parse_set_output_rejects_empty_name() {
+        let output = "::set-output::some value";
+        let cmds = parse_workflow_commands(output);
+        assert_eq!(cmds.len(), 0);
+    }
+
+    #[test]
+    fn parse_save_state_rejects_empty_name() {
+        let output = "::save-state::some value";
+        let cmds = parse_workflow_commands(output);
+        assert_eq!(cmds.len(), 0);
     }
 
     #[test]
@@ -281,6 +375,17 @@ mod tests {
     }
 
     #[test]
+    fn stop_commands_empty_token_ignored() {
+        // An empty stop-commands token should be ignored (not permanently stop parsing)
+        let output = "::stop-commands::\n::warning::still visible";
+        let cmds = parse_workflow_commands(output);
+        assert_eq!(cmds.len(), 1);
+        assert!(
+            matches!(&cmds[0], WorkflowCommand::Warning { message, .. } if message == "still visible")
+        );
+    }
+
+    #[test]
     fn save_state() {
         let output = "::save-state name=isPost::true";
         let cmds = parse_workflow_commands(output);
@@ -299,5 +404,44 @@ mod tests {
         let output = "::group::Build\nbuilding...\n::endgroup::\n::set-output name=result::ok\n::warning::slow build";
         let cmds = parse_workflow_commands(output);
         assert_eq!(cmds.len(), 4);
+    }
+
+    #[test]
+    fn url_decoding_in_message() {
+        let output = "::error::Line1%0ALine2%0ALine3";
+        let cmds = parse_workflow_commands(output);
+        assert_eq!(cmds.len(), 1);
+        match &cmds[0] {
+            WorkflowCommand::Error { message, .. } => {
+                assert_eq!(message, "Line1\nLine2\nLine3");
+            }
+            _ => panic!("expected Error"),
+        }
+    }
+
+    #[test]
+    fn url_decoding_percent_and_colon() {
+        let output = "::add-mask::secret%3Avalue%25encoded";
+        let cmds = parse_workflow_commands(output);
+        assert_eq!(cmds.len(), 1);
+        match &cmds[0] {
+            WorkflowCommand::AddMask { value } => {
+                assert_eq!(value, "secret:value%encoded");
+            }
+            _ => panic!("expected AddMask"),
+        }
+    }
+
+    #[test]
+    fn url_decoding_in_file_param() {
+        let output = "::error file=src%3Amain.rs,line=10::oops";
+        let cmds = parse_workflow_commands(output);
+        assert_eq!(cmds.len(), 1);
+        match &cmds[0] {
+            WorkflowCommand::Error { file, .. } => {
+                assert_eq!(file.as_deref(), Some("src:main.rs"));
+            }
+            _ => panic!("expected Error"),
+        }
     }
 }

@@ -271,7 +271,8 @@ pub struct ExpressionContext<'a> {
     /// Step ID → (outcome, conclusion) where values are "success", "failure", or "skipped".
     /// `outcome` is the raw result before `continue-on-error`; `conclusion` is the effective result.
     pub step_statuses: &'a HashMap<String, (String, String)>,
-    /// Current job status for `success()`/`failure()` builtins: "success" or "failure".
+    /// Current job status for `success()`/`failure()`/`cancelled()` builtins:
+    /// "success", "failure", or "cancelled".
     pub job_status: &'a str,
     /// Pre-resolved secrets for `secrets.*` context.
     pub secrets_context: &'a HashMap<String, String>,
@@ -347,16 +348,12 @@ impl<'a> ExpressionContext<'a> {
             // jobs.* context — In real GitHub Actions, this is only available in
             // workflow_call output mapping contexts, not in step expressions. We alias
             // it to needs.* data here as a pragmatic approximation that covers the most
-            // common use case (reusable workflow outputs).
+            // common use case (reusable workflow outputs). Note: jobs.*.result does not
+            // exist in real GHA (only needs.*.result does), so we only support outputs.
             "jobs" if parts.len() == 4 && parts[2] == "outputs" => self
                 .needs_context
                 .get(&parts[1])
                 .and_then(|m| m.get(&parts[3]))
-                .map(|v| ExprValue::String(v.clone()))
-                .unwrap_or(ExprValue::Null),
-            "jobs" if parts.len() == 3 && parts[2] == "result" => self
-                .needs_results
-                .get(&parts[1])
                 .map(|v| ExprValue::String(v.clone()))
                 .unwrap_or(ExprValue::Null),
             "secrets" if parts.len() == 2 => self
@@ -720,7 +717,7 @@ fn call_builtin(
             }
         }
         // Status functions — consult job_status from context
-        "success" => Ok(ExprValue::Bool(ctx.job_status != "failure")),
+        "success" => Ok(ExprValue::Bool(ctx.job_status == "success")),
         "failure" => Ok(ExprValue::Bool(ctx.job_status == "failure")),
         "always" => Ok(ExprValue::Bool(true)),
         "cancelled" => Ok(ExprValue::Bool(ctx.job_status == "cancelled")),

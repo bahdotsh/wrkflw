@@ -1768,7 +1768,7 @@ async fn execute_job_with_matrix(
 
     // Pre-resolve secrets once for this job (shared across matrix combinations and non-matrix path)
     let secrets_context: HashMap<String, String> = if let Some(secret_mgr) = secret_manager {
-        resolve_secrets_for_context(secret_mgr, job, workflow).await
+        resolve_secrets_for_context(secret_mgr, job).await
     } else {
         HashMap::new()
     };
@@ -1969,6 +1969,7 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
         &loop_state.step_status_map,
         &job_env,
         &loop_state.job_status_str,
+        &current_dir,
     );
 
     Ok(JobResult {
@@ -2244,6 +2245,7 @@ async fn execute_matrix_job(
         &loop_state.step_status_map,
         &job_env,
         &loop_state.job_status_str,
+        &current_dir,
     );
 
     // Return job result
@@ -2441,6 +2443,7 @@ fn process_workflow_commands(
                 file,
                 line,
                 col,
+                ..
             } => {
                 let loc = format_annotation_location(file.as_deref(), line, col);
                 wrkflw_logging::error(&format!("{}{}", loc, message));
@@ -2450,6 +2453,7 @@ fn process_workflow_commands(
                 file,
                 line,
                 col,
+                ..
             } => {
                 let loc = format_annotation_location(file.as_deref(), line, col);
                 wrkflw_logging::warning(&format!("{}{}", loc, message));
@@ -2459,6 +2463,7 @@ fn process_workflow_commands(
                 file,
                 line,
                 col,
+                ..
             } => {
                 let loc = format_annotation_location(file.as_deref(), line, col);
                 wrkflw_logging::info(&format!("{}{}", loc, message));
@@ -2668,10 +2673,13 @@ impl<'a> StepExecutionContext<'a> {
 }
 
 /// Resolve `${{ }}` expressions in an action `with` parameter value.
+///
+/// On expression error, returns empty string (matching GitHub Actions behavior
+/// where unresolvable expressions resolve to empty).
 fn preprocess_with_value(value: &str, ctx: &StepExecutionContext<'_>) -> String {
     let expr_ctx = ctx.expr_context();
     crate::substitution::preprocess_expressions(value, ctx.working_dir, &expr_ctx)
-        .unwrap_or_else(|_| value.to_string())
+        .unwrap_or_default()
 }
 
 async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, ExecutionError> {
@@ -4196,10 +4204,10 @@ async fn execute_reusable_workflow_job(
             }
             if let Some(secrets_val) = secrets {
                 if secrets_val.as_str() == Some("inherit") {
-                    wrkflw_logging::warning(
-                        "`secrets: inherit` is not yet supported for reusable workflows; \
-                         parent secrets will not be available in the called workflow",
-                    );
+                    // Propagate all parent secrets to the child workflow
+                    for (name, value) in ctx.secrets_context {
+                        child_env.insert(format!("SECRET_{}", name.to_uppercase()), value.clone());
+                    }
                 } else if let Some(map) = secrets_val.as_mapping() {
                     for (k, v) in map {
                         if let (Some(key), Some(value)) = (k.as_str(), v.as_str()) {
@@ -4291,10 +4299,10 @@ async fn execute_reusable_workflow_job(
     }
     if let Some(secrets_val) = secrets {
         if secrets_val.as_str() == Some("inherit") {
-            wrkflw_logging::warning(
-                "`secrets: inherit` is not yet supported for reusable workflows; \
-                 parent secrets will not be available in the called workflow",
-            );
+            // Propagate all parent secrets to the child workflow
+            for (name, value) in ctx.secrets_context {
+                child_env.insert(format!("SECRET_{}", name.to_uppercase()), value.clone());
+            }
         } else if let Some(map) = secrets_val.as_mapping() {
             for (k, v) in map {
                 if let (Some(key), Some(value)) = (k.as_str(), v.as_str()) {
@@ -4378,12 +4386,16 @@ async fn execute_reusable_workflow_job(
 /// `on.workflow_call.outputs` which maps output names to job output
 /// expressions. Since we don't parse that declaration yet, we use a
 /// pragmatic approximation: flatten all job outputs into a single map.
-/// Later jobs overwrite earlier jobs if keys collide.
+/// Jobs are iterated in sorted order by name for deterministic merging;
+/// later jobs (alphabetically) overwrite earlier jobs if keys collide.
 fn aggregate_reusable_workflow_outputs(
     job_outputs: &HashMap<String, HashMap<String, String>>,
 ) -> HashMap<String, String> {
     let mut merged = HashMap::new();
-    for outputs in job_outputs.values() {
+    // Sort by job name for deterministic output when keys collide
+    let mut sorted_jobs: Vec<_> = job_outputs.iter().collect();
+    sorted_jobs.sort_by_key(|(name, _)| (*name).clone());
+    for (_, outputs) in sorted_jobs {
         for (key, value) in outputs {
             if !value.is_empty() {
                 merged.insert(key.clone(), value.clone());
@@ -4804,11 +4816,12 @@ fn evaluate_condition_with_context(
         }
         Err(e) => {
             wrkflw_logging::warning(&format!(
-                "Failed to evaluate condition '{}': {} — defaulting to true",
+                "Failed to evaluate condition '{}': {} — defaulting to false",
                 condition, e
             ));
-            // Default to true to avoid breaking workflows
-            true
+            // Default to false — in real GitHub Actions, unparseable conditions
+            // cause an error. Defaulting to false is safer than silently running.
+            false
         }
     }
 }
@@ -4845,6 +4858,7 @@ fn resolve_job_outputs(
     step_status_map: &HashMap<String, (String, String)>,
     env_context: &HashMap<String, String>,
     job_status: &str,
+    working_dir: &Path,
 ) -> HashMap<String, String> {
     let mut resolved = HashMap::new();
     if let Some(outputs) = &job.outputs {
@@ -4859,7 +4873,7 @@ fn resolve_job_outputs(
             needs_results: &HashMap::new(),
         };
         for (key, expr) in outputs {
-            match crate::substitution::preprocess_expressions(expr, Path::new("."), &ctx) {
+            match crate::substitution::preprocess_expressions(expr, working_dir, &ctx) {
                 Ok(val) => {
                     resolved.insert(key.clone(), val);
                 }
@@ -4872,12 +4886,12 @@ fn resolve_job_outputs(
     resolved
 }
 
-/// Pre-resolve secrets referenced in the workflow into a HashMap for expression evaluation.
-/// Scans job steps for `${{ secrets.NAME }}` patterns and resolves each unique name.
+/// Pre-resolve secrets referenced in the job into a HashMap for expression evaluation.
+/// Scans job steps, conditions, env, and outputs for `${{ secrets.NAME }}` patterns
+/// and resolves each unique name.
 async fn resolve_secrets_for_context(
     secret_manager: &SecretManager,
     job: &Job,
-    workflow: &WorkflowDefinition,
 ) -> HashMap<String, String> {
     use wrkflw_secrets::SecretSubstitution;
 
@@ -7391,6 +7405,7 @@ runs:
             &HashMap::new(),
             &HashMap::new(),
             "success",
+            Path::new("."),
         );
 
         assert_eq!(result.get("version").unwrap(), "2.0.0");
@@ -7413,6 +7428,7 @@ runs:
             &HashMap::new(),
             &HashMap::new(),
             "success",
+            Path::new("."),
         );
 
         assert_eq!(result.get("missing").unwrap(), "");
@@ -7497,6 +7513,7 @@ runs:
             &HashMap::new(),
             &HashMap::new(),
             "success",
+            Path::new("."),
         );
 
         assert_eq!(result.get("version").unwrap(), "3.0.0");
@@ -7513,6 +7530,7 @@ runs:
             &HashMap::new(),
             &HashMap::new(),
             "success",
+            Path::new("."),
         );
 
         assert!(resolved.is_empty());

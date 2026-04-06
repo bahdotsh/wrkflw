@@ -18,6 +18,9 @@ fn sanitize_artifact_name(name: &str) -> Result<String, String> {
         return Err("Artifact name cannot be empty".to_string());
     }
     let sanitized = name.replace('\0', "");
+    if sanitized.is_empty() {
+        return Err("Artifact name cannot be empty after sanitization".to_string());
+    }
     if sanitized.contains('/')
         || sanitized.contains('\\')
         || sanitized.contains("..")
@@ -32,23 +35,23 @@ fn sanitize_artifact_name(name: &str) -> Result<String, String> {
 }
 
 /// Recursively collect all regular files under `dir`, skipping symlinks.
-fn walk_files(dir: &Path) -> Vec<PathBuf> {
+fn walk_files(dir: &Path) -> Result<Vec<PathBuf>, String> {
     let mut files = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            // Skip symlinks to prevent following links outside the artifact tree
-            if path.is_symlink() {
-                continue;
-            }
-            if path.is_dir() {
-                files.extend(walk_files(&path));
-            } else {
-                files.push(path);
-            }
+    let entries = std::fs::read_dir(dir)
+        .map_err(|e| format!("Failed to read directory '{}': {}", dir.display(), e))?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        // Skip symlinks to prevent following links outside the artifact tree
+        if path.is_symlink() {
+            continue;
+        }
+        if path.is_dir() {
+            files.extend(walk_files(&path)?);
+        } else {
+            files.push(path);
         }
     }
-    files
+    Ok(files)
 }
 
 struct ArtifactMetadata {
@@ -121,13 +124,20 @@ impl ArtifactStore {
 
             let mut count = 0;
             for entry in &entries {
-                let rel = entry.strip_prefix(&ws).map_err(|_| {
-                    format!(
-                        "File '{}' is not within workspace '{}'",
-                        entry.display(),
-                        ws.display()
-                    )
-                })?;
+                // Use canonical paths for strip_prefix to be consistent
+                // with the canonical workspace security filter above.
+                let canonical_entry = entry
+                    .canonicalize()
+                    .map_err(|e| format!("Failed to canonicalize '{}': {}", entry.display(), e))?;
+                let rel = canonical_entry
+                    .strip_prefix(&canonical_workspace)
+                    .map_err(|_| {
+                        format!(
+                            "File '{}' is not within workspace '{}'",
+                            entry.display(),
+                            ws.display()
+                        )
+                    })?;
                 let dest = ad.join(rel);
                 if let Some(parent) = dest.parent() {
                     std::fs::create_dir_all(parent)
@@ -167,8 +177,14 @@ impl ArtifactStore {
 
         tokio::task::spawn_blocking(move || -> Result<usize, String> {
             let mut count = 0;
-            for file_path in walk_files(&artifact_dir) {
-                let rel = file_path.strip_prefix(&artifact_dir).unwrap_or(&file_path);
+            for file_path in walk_files(&artifact_dir)? {
+                let rel = file_path.strip_prefix(&artifact_dir).map_err(|_| {
+                    format!(
+                        "Artifact file '{}' is outside artifact directory '{}'",
+                        file_path.display(),
+                        artifact_dir.display()
+                    )
+                })?;
                 let dest = target.join(rel);
                 if let Some(parent) = dest.parent() {
                     std::fs::create_dir_all(parent)

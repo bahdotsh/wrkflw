@@ -318,7 +318,11 @@ fn validate_cache_path(path: &str, workspace: &Path) -> bool {
     }
 }
 
-/// Recursively copy directory contents from `src` to `dst`, skipping symlinks.
+/// Internal metadata file name used by `CacheStore` to store the cache key.
+const CACHE_KEY_METADATA_FILE: &str = ".cache_key";
+
+/// Recursively copy directory contents from `src` to `dst`, skipping symlinks
+/// and internal cache metadata files.
 fn copy_dir_contents(src: &Path, dst: &Path) -> Result<(), String> {
     std::fs::create_dir_all(dst).map_err(|e| format!("Failed to create dir: {}", e))?;
 
@@ -336,6 +340,10 @@ fn copy_dir_contents(src: &Path, dst: &Path) -> Result<(), String> {
             continue;
         }
         let file_name = entry.file_name();
+        // Skip internal cache metadata files to avoid polluting the workspace
+        if file_name == CACHE_KEY_METADATA_FILE {
+            continue;
+        }
         let dst_path = dst.join(&file_name);
 
         if src_path.is_dir() {
@@ -386,6 +394,11 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(workspace2.path().join("node_modules/pkg/index.js")).unwrap(),
             "module.exports = {}"
+        );
+        // .cache_key metadata file should NOT leak into the restored workspace
+        assert!(
+            !workspace2.path().join("node_modules/.cache_key").exists(),
+            ".cache_key metadata should not be restored into workspace"
         );
     }
 

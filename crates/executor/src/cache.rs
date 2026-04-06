@@ -33,11 +33,7 @@ impl CacheStore {
     pub fn new() -> Result<Self, String> {
         let home = dirs::home_dir()
             .or_else(|| std::env::var("HOME").ok().map(std::path::PathBuf::from))
-            .ok_or_else(|| {
-                "Could not determine home directory (HOME is not set). \
-                 Set HOME or use CacheStore::with_root() to specify a custom cache path."
-                    .to_string()
-            })?;
+            .ok_or_else(|| "Could not determine home directory (HOME is not set).".to_string())?;
         let root = home.join(".wrkflw").join("cache");
         std::fs::create_dir_all(&root).map_err(|e| {
             format!(
@@ -197,13 +193,24 @@ impl CacheStore {
         std::fs::write(&meta_path, key)
             .map_err(|e| format!("Failed to write cache metadata: {}", e))?;
 
-        // Atomic swap: remove old, rename tmp into place
+        // Replace old entry: rename old to `.old`, rename `.tmp` into place,
+        // then remove `.old`. This is not fully atomic (no single-syscall
+        // directory swap on POSIX), but minimises the window where the entry
+        // is missing if the process is killed mid-operation.
+        let old_dir = cache_dir.with_extension(".old");
+        if old_dir.exists() {
+            let _ = std::fs::remove_dir_all(&old_dir);
+        }
         if cache_dir.exists() {
-            std::fs::remove_dir_all(&cache_dir)
-                .map_err(|e| format!("Failed to remove old cache: {}", e))?;
+            std::fs::rename(&cache_dir, &old_dir)
+                .map_err(|e| format!("Failed to move old cache aside: {}", e))?;
         }
         std::fs::rename(&tmp_dir, &cache_dir)
             .map_err(|e| format!("Failed to finalize cache entry: {}", e))?;
+        // Best-effort cleanup of old entry
+        if old_dir.exists() {
+            let _ = std::fs::remove_dir_all(&old_dir);
+        }
 
         // Evict oldest entries if cache exceeds size limit
         self.evict_if_needed();

@@ -36,6 +36,8 @@ static PATTERNS: OnceLock<CompiledPatterns> = OnceLock::new();
 struct SecretData {
     secrets: HashSet<String>,
     secret_cache: HashMap<String, String>,
+    /// Pre-sorted (longest-first) pairs for `mask()`. Invalidated on mutation.
+    sorted_pairs: Option<Vec<(String, String)>>,
 }
 
 /// Secret masking utility to prevent secrets from appearing in logs.
@@ -62,6 +64,7 @@ impl SecretMasker {
             data: RwLock::new(SecretData {
                 secrets: HashSet::new(),
                 secret_cache: HashMap::new(),
+                sorted_pairs: None,
             }),
             mask_char: '*',
             min_length: 3, // Don't mask very short strings
@@ -74,6 +77,7 @@ impl SecretMasker {
             data: RwLock::new(SecretData {
                 secrets: HashSet::new(),
                 secret_cache: HashMap::new(),
+                sorted_pairs: None,
             }),
             mask_char,
             min_length: 3,
@@ -91,6 +95,7 @@ impl SecretMasker {
             let mut data = self.data.write().unwrap_or_else(|e| e.into_inner());
             data.secret_cache.insert(secret.clone(), masked);
             data.secrets.insert(secret);
+            data.sorted_pairs = None; // invalidate cache
         }
     }
 
@@ -112,6 +117,7 @@ impl SecretMasker {
                 data.secret_cache.insert(secret.clone(), masked);
                 data.secrets.insert(secret);
             }
+            data.sorted_pairs = None; // invalidate cache
         }
     }
 
@@ -120,6 +126,7 @@ impl SecretMasker {
         let mut data = self.data.write().unwrap_or_else(|e| e.into_inner());
         data.secrets.remove(secret);
         data.secret_cache.remove(secret);
+        data.sorted_pairs = None; // invalidate cache
     }
 
     /// Clear all secrets
@@ -127,24 +134,38 @@ impl SecretMasker {
         let mut data = self.data.write().unwrap_or_else(|e| e.into_inner());
         data.secrets.clear();
         data.secret_cache.clear();
+        data.sorted_pairs = None; // invalidate cache
     }
 
     /// Mask secrets in the given text
     pub fn mask(&self, text: &str) -> String {
         let mut result = text.to_string();
 
-        // Clone the secret/mask pairs so we can release the lock quickly,
-        // then sort longest-first so overlapping secrets are handled correctly
-        // (e.g. "secret123" is replaced before "secret").
-        let data = self.data.read().unwrap_or_else(|e| e.into_inner());
-        let mut pairs: Vec<(String, String)> = data
-            .secret_cache
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        drop(data);
-
-        pairs.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+        // Use cached sorted pairs (longest-first) so overlapping secrets are
+        // handled correctly (e.g. "secret123" is replaced before "secret").
+        // The cache is rebuilt lazily on the first read after a mutation.
+        let pairs = {
+            // Try the read lock first (fast path: cached pairs available)
+            let data = self.data.read().unwrap_or_else(|e| e.into_inner());
+            if let Some(ref cached) = data.sorted_pairs {
+                cached.clone()
+            } else {
+                drop(data);
+                // Upgrade to write lock to rebuild the cache
+                let mut data = self.data.write().unwrap_or_else(|e| e.into_inner());
+                // Double-check after acquiring write lock
+                if data.sorted_pairs.is_none() {
+                    let mut p: Vec<(String, String)> = data
+                        .secret_cache
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect();
+                    p.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+                    data.sorted_pairs = Some(p);
+                }
+                data.sorted_pairs.clone().unwrap_or_default()
+            }
+        };
 
         for (secret, masked) in &pairs {
             result = result.replace(secret.as_str(), masked);

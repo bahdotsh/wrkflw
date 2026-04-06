@@ -4440,10 +4440,18 @@ fn aggregate_reusable_workflow_outputs(
     // Sort by job name for deterministic output when keys collide
     let mut sorted_jobs: Vec<_> = job_outputs.iter().collect();
     sorted_jobs.sort_by(|a, b| a.0.cmp(b.0));
-    for (_, outputs) in sorted_jobs {
+    for (job_name, outputs) in sorted_jobs {
         for (key, value) in outputs {
             if !value.is_empty() {
-                merged.insert(key.clone(), value.clone());
+                if let Some(prev) = merged.insert(key.clone(), value.clone()) {
+                    if prev != *value {
+                        wrkflw_logging::warning(&format!(
+                            "Reusable workflow output key '{}' from job '{}' overwrites \
+                             a different value set by an earlier job",
+                            key, job_name
+                        ));
+                    }
+                }
             }
         }
     }
@@ -4859,7 +4867,7 @@ fn evaluate_condition_with_context(
         }
         Err(e) => {
             wrkflw_logging::warning(&format!(
-                "Failed to evaluate condition '{}': {} — defaulting to false",
+                "Condition '{}' failed to parse: {} — treating as false (step/job will be skipped)",
                 condition, e
             ));
             // Default to false — in real GitHub Actions, unparseable conditions
@@ -8147,5 +8155,74 @@ runs:
             .await;
         assert!(hit2.is_some());
         assert!(ws2.path().join(".npm/cache.bin").exists());
+    }
+
+    // --- additional build_needs_context tests ---
+
+    #[test]
+    fn build_needs_context_filters_to_declared_needs() {
+        let mut all_outputs = HashMap::new();
+        all_outputs.insert("build".to_string(), {
+            let mut m = HashMap::new();
+            m.insert("version".to_string(), "1.2.3".to_string());
+            m
+        });
+        all_outputs.insert("lint".to_string(), {
+            let mut m = HashMap::new();
+            m.insert("status".to_string(), "ok".to_string());
+            m
+        });
+        all_outputs.insert("deploy".to_string(), {
+            let mut m = HashMap::new();
+            m.insert("url".to_string(), "https://example.com".to_string());
+            m
+        });
+
+        let mut all_results = HashMap::new();
+        all_results.insert("build".to_string(), "success".to_string());
+        all_results.insert("lint".to_string(), "success".to_string());
+        all_results.insert("deploy".to_string(), "failure".to_string());
+
+        // Job only declares needs: [build, lint]
+        let job = Job {
+            needs: Some(vec!["build".to_string(), "lint".to_string()]),
+            ..make_job(None, None)
+        };
+
+        let (needs_out, needs_res) = build_needs_context(&job, &all_outputs, &all_results);
+        assert_eq!(needs_out.len(), 2);
+        assert!(needs_out.contains_key("build"));
+        assert!(needs_out.contains_key("lint"));
+        assert!(!needs_out.contains_key("deploy"));
+        assert_eq!(needs_res.get("build").unwrap(), "success");
+        assert_eq!(needs_res.get("lint").unwrap(), "success");
+        assert!(!needs_res.contains_key("deploy"));
+    }
+
+    // --- additional aggregate_reusable_workflow_outputs tests ---
+
+    #[test]
+    fn aggregate_reusable_workflow_outputs_last_job_wins_on_collision() {
+        let mut job_outputs = HashMap::new();
+        job_outputs.insert("alpha".to_string(), {
+            let mut m = HashMap::new();
+            m.insert("result".to_string(), "from-alpha".to_string());
+            m
+        });
+        job_outputs.insert("beta".to_string(), {
+            let mut m = HashMap::new();
+            m.insert("result".to_string(), "from-beta".to_string());
+            m
+        });
+
+        let merged = aggregate_reusable_workflow_outputs(&job_outputs);
+        // "beta" > "alpha" alphabetically, so beta's value wins
+        assert_eq!(merged.get("result").unwrap(), "from-beta");
+    }
+
+    #[test]
+    fn aggregate_reusable_workflow_outputs_empty_input() {
+        let merged = aggregate_reusable_workflow_outputs(&HashMap::new());
+        assert!(merged.is_empty());
     }
 }

@@ -192,6 +192,14 @@ impl CacheStore {
     /// When multiple entries match, the one with the newest modification time wins,
     /// matching GitHub Actions' behavior of preferring the most recently created key.
     fn find_by_prefix(&self, prefix: &str) -> Option<String> {
+        // Fast path: if the prefix is an exact key, skip the full directory scan
+        let exact_path = self.cache_path(prefix);
+        if let Ok(stored) = std::fs::read_to_string(exact_path.join(".cache_key")) {
+            if stored == prefix {
+                return Some(stored);
+            }
+        }
+
         let entries = std::fs::read_dir(&self.root).ok()?;
         let mut best: Option<(String, std::time::SystemTime)> = None;
         for entry in entries.flatten() {

@@ -2115,10 +2115,36 @@ async fn execute_matrix_job(
         }
     }
 
-    // Add job-level environment variables (overrides container env)
-    for (key, value) in &job_template.env {
-        // TODO: Substitute matrix variable references in env values
-        job_env.insert(key.clone(), value.clone());
+    // Add job-level environment variables (overrides container env).
+    // Substitute ${{ matrix.* }} and other expression references in env values
+    // so that e.g. `MY_VAR: ${{ matrix.os }}` resolves correctly.
+    // We collect resolved values first to avoid borrowing job_env while mutating it.
+    {
+        let matrix_opt = Some(combination.values.clone());
+        let env_expr_ctx = crate::expression::ExpressionContext {
+            env_context: &job_env,
+            step_outputs: &HashMap::new(),
+            matrix_combination: &matrix_opt,
+            step_statuses: &HashMap::new(),
+            job_status: "success",
+            secrets_context,
+            needs_context,
+            needs_results,
+        };
+        let cwd = std::env::current_dir().unwrap_or_default();
+        let resolved_env: Vec<(String, String)> = job_template
+            .env
+            .iter()
+            .map(|(key, value)| {
+                let resolved =
+                    crate::substitution::preprocess_expressions(value, &cwd, &env_expr_ctx)
+                        .unwrap_or_else(|_| value.clone());
+                (key.clone(), resolved)
+            })
+            .collect();
+        for (key, value) in resolved_env {
+            job_env.insert(key, value);
+        }
     }
 
     // Create a temporary directory for this job execution
@@ -2259,9 +2285,15 @@ async fn flush_pending_cache_saves(
     pending: &std::sync::Mutex<Vec<PendingCacheSave>>,
     cache_store: &crate::cache::CacheStore,
 ) {
-    let saves = pending.lock().map(|mut v| std::mem::take(&mut *v)).unwrap_or_default();
+    let saves = pending
+        .lock()
+        .map(|mut v| std::mem::take(&mut *v))
+        .unwrap_or_default();
     for save in saves {
-        match cache_store.save(&save.key, &save.path, &save.workspace).await {
+        match cache_store
+            .save(&save.key, &save.path, &save.workspace)
+            .await
+        {
             Ok(()) => {
                 wrkflw_logging::info(&format!(
                     "  Cache saved path '{}' with key '{}'",
@@ -2939,10 +2971,8 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                                 workspace: ctx.working_dir.to_path_buf(),
                             });
                         }
-                        let msg = format!(
-                            "Cache miss for key '{}'. Save deferred to end of job.",
-                            key
-                        );
+                        let msg =
+                            format!("Cache miss for key '{}'. Save deferred to end of job.", key);
                         wrkflw_logging::info(&format!("  {}", msg));
                         StepResult::new(step_name, StepStatus::Success, msg)
                     }
@@ -4195,8 +4225,8 @@ async fn execute_reusable_workflow_job(
                     ctx.runtime,
                     &child_env,
                     ctx.verbose,
-                    None,
-                    None,
+                    ctx.secret_manager,
+                    ctx.secret_masker,
                     &reusable_job_outputs,
                     &reusable_job_results,
                     ctx.artifact_store,
@@ -4274,7 +4304,9 @@ async fn execute_reusable_workflow_job(
         }
     }
 
-    // Execute called workflow, reusing parent's artifact/cache stores.
+    // Execute called workflow, reusing parent's secret manager, masker,
+    // artifact/cache stores so that `secrets.*` expressions and shared
+    // stores work inside the called workflow.
     let plan = dependency::resolve_dependencies(&called)?;
     let mut all_results = Vec::new();
     let mut any_failed = false;
@@ -4287,8 +4319,8 @@ async fn execute_reusable_workflow_job(
             ctx.runtime,
             &child_env,
             ctx.verbose,
-            None,
-            None,
+            ctx.secret_manager,
+            ctx.secret_masker,
             &reusable_job_outputs,
             &reusable_job_results,
             ctx.artifact_store,
@@ -7484,5 +7516,309 @@ runs:
         );
 
         assert!(resolved.is_empty());
+    }
+
+    // ---- Integration tests for artifact, cache, and needs.* wiring ----
+
+    #[tokio::test]
+    async fn upload_artifact_step_wiring() {
+        let runtime = MockContainerRuntime::default();
+        let workflow = minimal_workflow();
+        let working_dir = tempfile::tempdir().unwrap();
+
+        // Create a file in the workspace to upload
+        std::fs::write(working_dir.path().join("build.tar"), "artifact-content").unwrap();
+
+        let artifact_dir = tempfile::tempdir().unwrap();
+        let artifact_store = crate::artifacts::ArtifactStore::new(artifact_dir.path()).unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache_store =
+            crate::cache::CacheStore::with_root(cache_dir.path().to_path_buf()).unwrap();
+        let pending = std::sync::Mutex::new(Vec::<PendingCacheSave>::new());
+
+        let mut with = HashMap::new();
+        with.insert("name".to_string(), "my-build".to_string());
+        with.insert("path".to_string(), "build.tar".to_string());
+        let step = make_step(
+            "upload",
+            "actions/upload-artifact@v4",
+            Some(with),
+            HashMap::new(),
+        );
+        let job_env = HashMap::new();
+
+        let ctx = StepExecutionContext {
+            step: &step,
+            step_idx: 0,
+            job_env: &job_env,
+            working_dir: working_dir.path(),
+            runtime: &runtime,
+            workflow: &workflow,
+            runner_image: "ubuntu:latest",
+            verbose: false,
+            matrix_combination: &None,
+            secret_manager: None,
+            secret_masker: None,
+            container_config: None,
+            workflow_defaults: None,
+            job_defaults: None,
+            step_outputs: &HashMap::new(),
+            step_statuses: &HashMap::new(),
+            job_status: "success",
+            secrets_context: &HashMap::new(),
+            needs_context: &HashMap::new(),
+            needs_results: &HashMap::new(),
+            artifact_store: &artifact_store,
+            cache_store: &cache_store,
+            pending_cache_saves: &pending,
+        };
+
+        let result = execute_step(ctx).await.unwrap();
+        assert_eq!(result.status, StepStatus::Success);
+        assert!(result.output.contains("Uploaded artifact 'my-build'"));
+
+        // Now download via a second step
+        let download_dir = tempfile::tempdir().unwrap();
+        let mut dl_with = HashMap::new();
+        dl_with.insert("name".to_string(), "my-build".to_string());
+        dl_with.insert("path".to_string(), "dl".to_string());
+        let dl_step = make_step(
+            "download",
+            "actions/download-artifact@v4",
+            Some(dl_with),
+            HashMap::new(),
+        );
+
+        // Create the download target inside the workspace
+        let dl_workspace = tempfile::tempdir().unwrap();
+        let dl_ctx = StepExecutionContext {
+            step: &dl_step,
+            step_idx: 1,
+            job_env: &job_env,
+            working_dir: dl_workspace.path(),
+            runtime: &runtime,
+            workflow: &workflow,
+            runner_image: "ubuntu:latest",
+            verbose: false,
+            matrix_combination: &None,
+            secret_manager: None,
+            secret_masker: None,
+            container_config: None,
+            workflow_defaults: None,
+            job_defaults: None,
+            step_outputs: &HashMap::new(),
+            step_statuses: &HashMap::new(),
+            job_status: "success",
+            secrets_context: &HashMap::new(),
+            needs_context: &HashMap::new(),
+            needs_results: &HashMap::new(),
+            artifact_store: &artifact_store,
+            cache_store: &cache_store,
+            pending_cache_saves: &pending,
+        };
+
+        let dl_result = execute_step(dl_ctx).await.unwrap();
+        assert_eq!(dl_result.status, StepStatus::Success);
+        assert!(dl_result.output.contains("Downloaded artifact 'my-build'"));
+    }
+
+    #[tokio::test]
+    async fn cache_step_miss_defers_save_and_flush_works() {
+        let runtime = MockContainerRuntime::default();
+        let workflow = minimal_workflow();
+        let working_dir = tempfile::tempdir().unwrap();
+
+        // Create a directory to cache
+        std::fs::create_dir_all(working_dir.path().join("node_modules")).unwrap();
+        std::fs::write(working_dir.path().join("node_modules/pkg.json"), "{}").unwrap();
+
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache_store =
+            crate::cache::CacheStore::with_root(cache_dir.path().to_path_buf()).unwrap();
+        let artifact_dir = tempfile::tempdir().unwrap();
+        let artifact_store = crate::artifacts::ArtifactStore::new(artifact_dir.path()).unwrap();
+        let pending = std::sync::Mutex::new(Vec::<PendingCacheSave>::new());
+
+        let mut with = HashMap::new();
+        with.insert("key".to_string(), "deps-abc123".to_string());
+        with.insert("path".to_string(), "node_modules".to_string());
+        let step = make_step("cache", "actions/cache@v4", Some(with), HashMap::new());
+        let job_env = HashMap::new();
+
+        let ctx = StepExecutionContext {
+            step: &step,
+            step_idx: 0,
+            job_env: &job_env,
+            working_dir: working_dir.path(),
+            runtime: &runtime,
+            workflow: &workflow,
+            runner_image: "ubuntu:latest",
+            verbose: false,
+            matrix_combination: &None,
+            secret_manager: None,
+            secret_masker: None,
+            container_config: None,
+            workflow_defaults: None,
+            job_defaults: None,
+            step_outputs: &HashMap::new(),
+            step_statuses: &HashMap::new(),
+            job_status: "success",
+            secrets_context: &HashMap::new(),
+            needs_context: &HashMap::new(),
+            needs_results: &HashMap::new(),
+            artifact_store: &artifact_store,
+            cache_store: &cache_store,
+            pending_cache_saves: &pending,
+        };
+
+        let result = execute_step(ctx).await.unwrap();
+        assert_eq!(result.status, StepStatus::Success);
+        assert!(result.output.contains("Cache miss"));
+
+        // The save should be deferred
+        assert_eq!(pending.lock().unwrap().len(), 1);
+
+        // Flush pending saves
+        flush_pending_cache_saves(&pending, &cache_store).await;
+
+        // Now a second restore should hit
+        let workspace2 = tempfile::tempdir().unwrap();
+        let restored = cache_store
+            .restore("deps-abc123", &[], "node_modules", workspace2.path())
+            .await;
+        assert_eq!(restored, Some("deps-abc123".to_string()));
+        assert!(workspace2.path().join("node_modules/pkg.json").exists());
+    }
+
+    #[test]
+    fn needs_context_flows_through_expression_evaluation() {
+        let mut needs_ctx = HashMap::new();
+        let mut build_outputs = HashMap::new();
+        build_outputs.insert("artifact".to_string(), "dist.tar.gz".to_string());
+        needs_ctx.insert("build".to_string(), build_outputs);
+
+        let mut needs_res = HashMap::new();
+        needs_res.insert("build".to_string(), "success".to_string());
+
+        let empty_env = HashMap::new();
+        let empty_steps = HashMap::new();
+        let empty_statuses = HashMap::new();
+        let empty_secrets = HashMap::new();
+
+        let ctx = crate::expression::ExpressionContext {
+            env_context: &empty_env,
+            step_outputs: &empty_steps,
+            matrix_combination: &None,
+            step_statuses: &empty_statuses,
+            job_status: "success",
+            secrets_context: &empty_secrets,
+            needs_context: &needs_ctx,
+            needs_results: &needs_res,
+        };
+
+        // Test needs.build.outputs.artifact
+        let result = crate::expression::evaluate("needs.build.outputs.artifact", &ctx).unwrap();
+        assert_eq!(
+            result,
+            crate::expression::ExprValue::String("dist.tar.gz".to_string())
+        );
+
+        // Test needs.build.result
+        let result = crate::expression::evaluate("needs.build.result", &ctx).unwrap();
+        assert_eq!(
+            result,
+            crate::expression::ExprValue::String("success".to_string())
+        );
+
+        // Test unknown needs job returns null
+        let result = crate::expression::evaluate("needs.deploy.result", &ctx).unwrap();
+        assert_eq!(result, crate::expression::ExprValue::Null);
+    }
+
+    #[test]
+    fn step_outcome_conclusion_with_continue_on_error() {
+        let mut step_statuses = HashMap::new();
+        let mut job_status = "success".to_string();
+
+        // Simulate a step that failed but had continue-on-error
+        let result = StepResult {
+            name: "lint".to_string(),
+            status: StepStatus::Failure,
+            output: String::new(),
+            outcome: StepStatus::Failure,
+            conclusion: StepStatus::Success,
+        };
+        record_step_status(Some("lint"), &result, &mut step_statuses, &mut job_status);
+
+        // Job status should remain "success" because conclusion is Success
+        assert_eq!(job_status, "success");
+
+        let empty_env = HashMap::new();
+        let empty_steps = HashMap::new();
+        let empty_secrets = HashMap::new();
+        let empty_needs = HashMap::new();
+        let empty_needs_results = HashMap::new();
+
+        let ctx = crate::expression::ExpressionContext {
+            env_context: &empty_env,
+            step_outputs: &empty_steps,
+            matrix_combination: &None,
+            step_statuses: &step_statuses,
+            job_status: &job_status,
+            secrets_context: &empty_secrets,
+            needs_context: &empty_needs,
+            needs_results: &empty_needs_results,
+        };
+
+        // outcome should be "failure" (raw result)
+        let outcome = crate::expression::evaluate("steps.lint.outcome", &ctx).unwrap();
+        assert_eq!(
+            outcome,
+            crate::expression::ExprValue::String("failure".to_string())
+        );
+
+        // conclusion should be "success" (after continue-on-error)
+        let conclusion = crate::expression::evaluate("steps.lint.conclusion", &ctx).unwrap();
+        assert_eq!(
+            conclusion,
+            crate::expression::ExprValue::String("success".to_string())
+        );
+
+        // success() should return true (job hasn't failed)
+        let is_success = crate::expression::evaluate("success()", &ctx).unwrap();
+        assert_eq!(is_success, crate::expression::ExprValue::Bool(true));
+    }
+
+    #[test]
+    fn secrets_context_resolves_in_expressions() {
+        let mut secrets = HashMap::new();
+        secrets.insert("API_KEY".to_string(), "sk-12345".to_string());
+
+        let empty_env = HashMap::new();
+        let empty_steps = HashMap::new();
+        let empty_statuses = HashMap::new();
+        let empty_needs = HashMap::new();
+        let empty_needs_results = HashMap::new();
+
+        let ctx = crate::expression::ExpressionContext {
+            env_context: &empty_env,
+            step_outputs: &empty_steps,
+            matrix_combination: &None,
+            step_statuses: &empty_statuses,
+            job_status: "success",
+            secrets_context: &secrets,
+            needs_context: &empty_needs,
+            needs_results: &empty_needs_results,
+        };
+
+        let result = crate::expression::evaluate("secrets.API_KEY", &ctx).unwrap();
+        assert_eq!(
+            result,
+            crate::expression::ExprValue::String("sk-12345".to_string())
+        );
+
+        // Unknown secret returns null
+        let result = crate::expression::evaluate("secrets.UNKNOWN", &ctx).unwrap();
+        assert_eq!(result, crate::expression::ExprValue::Null);
     }
 }

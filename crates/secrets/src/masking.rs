@@ -236,7 +236,11 @@ impl SecretMasker {
 
     /// Get the number of secrets being tracked
     pub fn secret_count(&self) -> usize {
-        self.data.read().unwrap_or_else(|e| e.into_inner()).secrets.len()
+        self.data
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .secrets
+            .len()
     }
 
     /// Check if a specific secret is being tracked

@@ -1,6 +1,6 @@
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
-use std::sync::{OnceLock, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 /// Compiled regex patterns for common secret formats
 struct CompiledPatterns {
@@ -37,7 +37,9 @@ struct SecretData {
     secrets: HashSet<String>,
     secret_cache: HashMap<String, String>,
     /// Pre-sorted (longest-first) pairs for `mask()`. Invalidated on mutation.
-    sorted_pairs: Option<Vec<(String, String)>>,
+    /// Wrapped in `Arc` so `mask()` can cheaply clone a reference instead of
+    /// deep-copying every secret string on every call.
+    sorted_pairs: Option<Arc<Vec<(String, String)>>>,
 }
 
 /// Secret masking utility to prevent secrets from appearing in logs.
@@ -71,7 +73,8 @@ impl SecretMasker {
         }
     }
 
-    /// Create a new secret masker with custom mask character
+    /// Create a new secret masker with custom mask character (test-only).
+    #[cfg(test)]
     pub fn with_mask_char(mask_char: char) -> Self {
         Self {
             data: RwLock::new(SecretData {
@@ -145,10 +148,10 @@ impl SecretMasker {
         // handled correctly (e.g. "secret123" is replaced before "secret").
         // The cache is rebuilt lazily on the first read after a mutation.
         let pairs = {
-            // Try the read lock first (fast path: cached pairs available)
+            // Try the read lock first (fast path: cached Arc available)
             let data = self.data.read().unwrap_or_else(|e| e.into_inner());
             if let Some(ref cached) = data.sorted_pairs {
-                cached.clone()
+                Arc::clone(cached)
             } else {
                 drop(data);
                 // Upgrade to write lock to rebuild the cache
@@ -161,14 +164,14 @@ impl SecretMasker {
                         .map(|(k, v)| (k.clone(), v.clone()))
                         .collect();
                     p.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
-                    data.sorted_pairs = Some(p);
+                    data.sorted_pairs = Some(Arc::new(p));
                 }
-                data.sorted_pairs.clone().unwrap_or_default()
+                Arc::clone(data.sorted_pairs.as_ref().unwrap())
             }
         };
 
-        for (secret, masked) in &pairs {
-            result = result.replace(secret.as_str(), masked);
+        for (secret, masked) in pairs.iter() {
+            result = result.replace(secret.as_str(), masked.as_str());
         }
 
         // Also mask potential tokens and keys with regex patterns

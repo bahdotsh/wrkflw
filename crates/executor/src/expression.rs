@@ -10,6 +10,9 @@
 use serde_yaml::Value;
 use std::collections::HashMap;
 
+// serde_json is used by toJSON() for robust string escaping.
+use serde_json;
+
 // ---------------------------------------------------------------------------
 // Value type
 // ---------------------------------------------------------------------------
@@ -734,14 +737,10 @@ fn call_builtin(
             }
             match &args[0] {
                 ExprValue::String(s) => {
-                    // Properly escape the string for valid JSON output
-                    let escaped = s
-                        .replace('\\', "\\\\")
-                        .replace('"', "\\\"")
-                        .replace('\n', "\\n")
-                        .replace('\r', "\\r")
-                        .replace('\t', "\\t");
-                    Ok(ExprValue::String(format!("\"{}\"", escaped)))
+                    // Use serde_json for robust escaping (handles control chars, null bytes, etc.)
+                    Ok(ExprValue::String(
+                        serde_json::to_string(s).unwrap_or_else(|_| format!("\"{}\"", s)),
+                    ))
                 }
                 ExprValue::Number(n) => Ok(ExprValue::String(format!("{}", n))),
                 ExprValue::Bool(b) => Ok(ExprValue::String(format!("{}", b))),
@@ -1323,5 +1322,34 @@ mod tests {
             evaluate("steps.nonexistent.conclusion", &ctx).unwrap(),
             ExprValue::Null
         );
+    }
+
+    #[test]
+    fn tojson_escapes_control_characters() {
+        let ctx = empty_ctx();
+        // Tab, newline, carriage return
+        let result = evaluate("toJSON('line1\tindented\nline2\rend')", &ctx).unwrap();
+        let s = result.to_output_string();
+        assert!(s.contains("\\t"), "should escape tab: {}", s);
+        assert!(s.contains("\\n"), "should escape newline: {}", s);
+        assert!(s.contains("\\r"), "should escape carriage return: {}", s);
+    }
+
+    #[test]
+    fn tojson_escapes_quotes_and_backslash() {
+        let ctx = empty_ctx();
+        let result = evaluate(r#"toJSON('say "hello\world"')"#, &ctx).unwrap();
+        let s = result.to_output_string();
+        assert!(s.contains(r#"\""#), "should escape quotes: {}", s);
+        assert!(s.contains(r"\\"), "should escape backslash: {}", s);
+    }
+
+    #[test]
+    fn tojson_handles_null_bytes() {
+        let ctx = empty_ctx();
+        // Null byte in string — serde_json encodes as \u0000
+        let result = evaluate("toJSON('before\x00after')", &ctx).unwrap();
+        let s = result.to_output_string();
+        assert!(!s.contains('\0'), "should not contain raw null: {}", s);
     }
 }

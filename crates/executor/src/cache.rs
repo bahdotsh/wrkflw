@@ -626,4 +626,43 @@ mod tests {
             .await
             .is_ok());
     }
+
+    #[tokio::test]
+    async fn multi_path_save_and_restore() {
+        // Saving multiple paths under the same key should produce separate
+        // on-disk entries (keyed by hash of key+path), and each can be restored.
+        let cache_root = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+
+        std::fs::create_dir_all(workspace.path().join("path_a")).unwrap();
+        std::fs::write(workspace.path().join("path_a/a.txt"), "aaa").unwrap();
+        std::fs::create_dir_all(workspace.path().join("path_b")).unwrap();
+        std::fs::write(workspace.path().join("path_b/b.txt"), "bbb").unwrap();
+
+        let store = CacheStore::with_root(cache_root.path().to_path_buf()).unwrap();
+        store
+            .save("same-key", "path_a", workspace.path())
+            .await
+            .unwrap();
+        store
+            .save("same-key", "path_b", workspace.path())
+            .await
+            .unwrap();
+
+        // Restore each path into a clean workspace
+        let ws2 = tempdir().unwrap();
+        let hit_a = store.restore("same-key", &[], "path_a", ws2.path()).await;
+        assert!(hit_a.is_some(), "path_a should restore");
+        assert_eq!(
+            std::fs::read_to_string(ws2.path().join("path_a/a.txt")).unwrap(),
+            "aaa"
+        );
+
+        let hit_b = store.restore("same-key", &[], "path_b", ws2.path()).await;
+        assert!(hit_b.is_some(), "path_b should restore");
+        assert_eq!(
+            std::fs::read_to_string(ws2.path().join("path_b/b.txt")).unwrap(),
+            "bbb"
+        );
+    }
 }

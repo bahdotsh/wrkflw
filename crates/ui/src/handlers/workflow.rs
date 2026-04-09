@@ -190,6 +190,7 @@ pub async fn execute_workflow_cli(
         secrets_config: None,                  // Use default secrets configuration
         show_action_messages,
         target_job: None,
+        event_filter: None,
     };
 
     match wrkflw_executor::execute_workflow(path, config).await {
@@ -603,6 +604,7 @@ pub fn start_next_workflow_execution(
                         secrets_config: None, // Use default secrets configuration
                         show_action_messages,
                         target_job,
+                        event_filter: None,
                     };
 
                     let execution_result = wrkflw_utils::fd::with_stderr_to_null(|| {

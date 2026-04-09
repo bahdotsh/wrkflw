@@ -1,9 +1,10 @@
 // Workflows tab rendering
 use crate::app::App;
+use crate::models::TriggerMatchStatus;
 use crate::theme::{self, COLORS};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     widgets::{Cell, Row, Table, TableState},
     Frame,
 };
@@ -19,14 +20,27 @@ pub fn render_workflows_tab(f: &mut Frame<'_>, app: &mut App, area: Rect) {
 
 fn render_workflow_list(f: &mut Frame<'_>, app: &mut App, area: Rect) {
     let selected_count = app.workflows.iter().filter(|w| w.selected).count();
-    let block_title = format!("Workflows ({} selected)", selected_count);
+    let diff_indicator = if app.diff_filter_active {
+        " [DIFF]"
+    } else {
+        ""
+    };
+    let block_title = format!("Workflows ({} selected){}", selected_count, diff_indicator);
 
-    let header_cells = ["", "Status", "Workflow Name", "Path"]
-        .iter()
-        .map(|h| Cell::from(*h).style(theme::header_style()));
+    let header_cells = if app.diff_filter_active {
+        vec!["", "Status", "Trigger", "Workflow Name", "Path"]
+    } else {
+        vec!["", "Status", "Workflow Name", "Path"]
+    };
+    let header = Row::new(
+        header_cells
+            .iter()
+            .map(|h| Cell::from(*h).style(theme::header_style())),
+    )
+    .height(1);
 
-    let header = Row::new(header_cells).height(1);
-
+    let diff_active = app.diff_filter_active;
+    let spinner_frame = app.spinner_frame;
     let rows = app.workflows.iter().map(|workflow| {
         let checkbox = if workflow.selected {
             theme::symbols::CHECKBOX_ON
@@ -35,7 +49,7 @@ fn render_workflow_list(f: &mut Frame<'_>, app: &mut App, area: Rect) {
         };
 
         let (status_symbol, status_style) =
-            theme::workflow_status_animated(&workflow.status, app.spinner_frame);
+            theme::workflow_status_animated(&workflow.status, spinner_frame);
 
         let path_display = workflow.path.to_string_lossy();
         let path_shortened = if path_display.len() > 30 {
@@ -50,24 +64,53 @@ fn render_workflow_list(f: &mut Frame<'_>, app: &mut App, area: Rect) {
             path_display.to_string()
         };
 
-        Row::new(vec![
+        let mut cells = vec![
             Cell::from(checkbox).style(Style::default().fg(COLORS.success)),
             Cell::from(status_symbol).style(status_style),
+        ];
+
+        if diff_active {
+            let (trigger_symbol, trigger_style) = match &workflow.trigger_match {
+                Some(TriggerMatchStatus::Matched(_)) => {
+                    ("\u{25cf}", Style::default().fg(Color::Green)) // filled circle
+                }
+                Some(TriggerMatchStatus::Skipped(_)) => {
+                    ("\u{25cb}", Style::default().fg(Color::DarkGray)) // empty circle
+                }
+                None => ("-", Style::default().fg(Color::DarkGray)),
+            };
+            cells.push(Cell::from(trigger_symbol).style(trigger_style));
+        }
+
+        cells.push(
             Cell::from(workflow.name.clone()).style(
                 Style::default()
                     .fg(COLORS.text)
                     .add_modifier(Modifier::BOLD),
             ),
-            Cell::from(path_shortened).style(theme::muted_style()),
-        ])
+        );
+        cells.push(Cell::from(path_shortened).style(theme::muted_style()));
+
+        Row::new(cells)
     });
 
-    let widths = [
-        Constraint::Length(5),      // Checkbox column
-        Constraint::Length(3),      // Status icon column
-        Constraint::Percentage(45), // Name column
-        Constraint::Percentage(45), // Path column
-    ];
+    let widths: Vec<Constraint> = if app.diff_filter_active {
+        vec![
+            Constraint::Length(5),      // Checkbox
+            Constraint::Length(3),      // Status
+            Constraint::Length(3),      // Trigger
+            Constraint::Percentage(42), // Name
+            Constraint::Percentage(42), // Path
+        ]
+    } else {
+        vec![
+            Constraint::Length(5),      // Checkbox
+            Constraint::Length(3),      // Status
+            Constraint::Percentage(45), // Name
+            Constraint::Percentage(45), // Path
+        ]
+    };
+
     let workflows_table = Table::new(rows, widths)
         .header(header)
         .block(theme::block(&block_title))

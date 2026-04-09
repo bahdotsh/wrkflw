@@ -62,6 +62,9 @@ pub struct App {
     // Cached container runtime availability (avoids re-checking every render frame)
     pub runtime_available: bool,
     pub last_availability_check: Instant,
+
+    // Diff-aware trigger filtering
+    pub diff_filter_active: bool,
 }
 
 impl App {
@@ -244,6 +247,8 @@ impl App {
 
             runtime_available,
             last_availability_check: Instant::now(),
+
+            diff_filter_active: false,
         }
     }
 
@@ -272,6 +277,86 @@ impl App {
         self.last_availability_check = Instant::now();
         self.logs
             .push(format!("Switched to {} mode", self.runtime_type_name()));
+    }
+
+    /// Toggle diff-aware trigger filtering and evaluate all workflows.
+    pub fn toggle_diff_filter(&mut self) {
+        use crate::models::TriggerMatchStatus;
+        self.diff_filter_active = !self.diff_filter_active;
+
+        if self.diff_filter_active {
+            // Synchronously get git state for trigger evaluation
+            let branch = std::process::Command::new("git")
+                .args(["rev-parse", "--abbrev-ref", "HEAD"])
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+
+            let changed_files: Vec<String> = std::process::Command::new("git")
+                .args(["diff", "--name-only", "HEAD"])
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| {
+                    String::from_utf8_lossy(&o.stdout)
+                        .lines()
+                        .map(|l| l.trim().to_string())
+                        .filter(|l| !l.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            let context = wrkflw_trigger_filter::EventContext {
+                event_name: "push".to_string(),
+                branch,
+                tag: None,
+                changed_files,
+            };
+
+            for workflow in &mut self.workflows {
+                match wrkflw_parser::workflow::parse_workflow(&workflow.path) {
+                    Ok(wf) => {
+                        match wrkflw_trigger_filter::parse_trigger_config(
+                            &wf,
+                            workflow.path.clone(),
+                        ) {
+                            Ok(config) => {
+                                let result =
+                                    wrkflw_trigger_filter::evaluate_trigger(&config, &context);
+                                workflow.trigger_match = Some(if result.matches {
+                                    TriggerMatchStatus::Matched(result.reason)
+                                } else {
+                                    TriggerMatchStatus::Skipped(result.reason)
+                                });
+                            }
+                            Err(_) => {
+                                workflow.trigger_match = None;
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        workflow.trigger_match = None;
+                    }
+                }
+            }
+
+            let matched = self
+                .workflows
+                .iter()
+                .filter(|w| matches!(&w.trigger_match, Some(TriggerMatchStatus::Matched(_))))
+                .count();
+            self.logs.push(format!(
+                "Diff filter ON: {}/{} workflows would trigger",
+                matched,
+                self.workflows.len()
+            ));
+        } else {
+            for workflow in &mut self.workflows {
+                workflow.trigger_match = None;
+            }
+            self.logs.push("Diff filter OFF".to_string());
+        }
     }
 
     pub fn toggle_validation_mode(&mut self) {
@@ -1221,6 +1306,7 @@ mod tests {
                 status: WorkflowStatus::NotStarted,
                 execution_details: None,
                 job_names: vec!["build".to_string(), "lint".to_string(), "test".to_string()],
+                trigger_match: None,
             },
             Workflow {
                 name: "deploy".to_string(),
@@ -1229,6 +1315,7 @@ mod tests {
                 status: WorkflowStatus::NotStarted,
                 execution_details: None,
                 job_names: vec![],
+                trigger_match: None,
             },
         ];
         app.workflow_list_state.select(Some(0));

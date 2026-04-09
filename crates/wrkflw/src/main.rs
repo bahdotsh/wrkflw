@@ -92,6 +92,52 @@ enum Commands {
         /// Run only a specific job by name
         #[arg(long)]
         job: Option<String>,
+
+        /// Simulate a specific event type for trigger filtering (e.g., push, pull_request)
+        #[arg(long)]
+        event: Option<String>,
+
+        /// Use git diff to determine changed files for trigger filtering
+        #[arg(long)]
+        diff: bool,
+
+        /// Manually specify changed files (comma-separated) for trigger filtering
+        #[arg(long, value_delimiter = ',')]
+        changed_files: Option<Vec<String>>,
+
+        /// Base ref for diff comparison (default: HEAD)
+        #[arg(long, default_value = "HEAD")]
+        diff_base: String,
+
+        /// Head ref for diff comparison (default: working tree)
+        #[arg(long)]
+        diff_head: Option<String>,
+    },
+
+    /// Watch for file changes and re-run affected workflows
+    Watch {
+        /// Path to workflow file or directory (defaults to .github/workflows)
+        path: Option<PathBuf>,
+
+        /// Container runtime to use (docker, podman, emulation, secure-emulation)
+        #[arg(short, long, value_enum, default_value = "docker")]
+        runtime: RuntimeChoice,
+
+        /// Debounce interval in milliseconds
+        #[arg(long, default_value = "500")]
+        debounce: u64,
+
+        /// Event type to simulate (default: push)
+        #[arg(long, default_value = "push")]
+        event: String,
+
+        /// Show 'Would execute GitHub action' messages in emulation mode
+        #[arg(long, default_value_t = false)]
+        show_action_messages: bool,
+
+        /// Preserve Docker containers on failure for debugging (Docker mode only)
+        #[arg(long)]
+        preserve_containers_on_failure: bool,
     },
 
     /// Open TUI interface to manage workflows
@@ -418,7 +464,59 @@ async fn main() {
             preserve_containers_on_failure,
             gitlab,
             job,
+            event,
+            diff,
+            changed_files,
+            diff_base,
+            diff_head,
         }) => {
+            // Build event filter context if any diff/event flags are set
+            let event_filter = if *diff || event.is_some() || changed_files.is_some() {
+                let event_name = event.clone().unwrap_or_else(|| "push".to_string());
+                let files = if let Some(files) = changed_files {
+                    files.clone()
+                } else if *diff {
+                    if let Some(head) = diff_head {
+                        wrkflw_trigger_filter::git::get_changed_files_between(diff_base, head)
+                            .await
+                            .unwrap_or_else(|e| {
+                                eprintln!("Warning: Failed to get git diff: {}", e);
+                                vec![]
+                            })
+                    } else {
+                        wrkflw_trigger_filter::git::get_changed_files(diff_base)
+                            .await
+                            .unwrap_or_else(|e| {
+                                eprintln!("Warning: Failed to get git diff: {}", e);
+                                vec![]
+                            })
+                    }
+                } else {
+                    vec![]
+                };
+                let branch = wrkflw_trigger_filter::git::get_current_branch().await.ok();
+                let tag = wrkflw_trigger_filter::git::get_current_tag()
+                    .await
+                    .ok()
+                    .flatten();
+
+                if verbose {
+                    wrkflw_logging::info(&format!(
+                        "Trigger filter: event={}, branch={:?}, changed_files={:?}",
+                        event_name, branch, files
+                    ));
+                }
+
+                Some(wrkflw_trigger_filter::EventContext {
+                    event_name,
+                    branch,
+                    tag,
+                    changed_files: files,
+                })
+            } else {
+                None
+            };
+
             // Create execution configuration
             let config = wrkflw_executor::ExecutionConfig {
                 runtime_type: runtime.clone().into(),
@@ -427,6 +525,7 @@ async fn main() {
                 secrets_config: None, // Use default secrets configuration
                 show_action_messages: *show_action_messages,
                 target_job: job.clone(),
+                event_filter,
             };
 
             // Check if we're explicitly or implicitly running a GitLab pipeline
@@ -542,6 +641,90 @@ async fn main() {
             }
 
             // Cleanup is handled automatically via the signal handler
+        }
+        Some(Commands::Watch {
+            path,
+            runtime,
+            debounce,
+            event,
+            show_action_messages,
+            preserve_containers_on_failure,
+        }) => {
+            let workflow_dir = path
+                .clone()
+                .unwrap_or_else(|| PathBuf::from(".github/workflows"));
+            if !workflow_dir.exists() {
+                eprintln!(
+                    "Error: workflow directory not found: {}",
+                    workflow_dir.display()
+                );
+                std::process::exit(1);
+            }
+
+            let repo_root = wrkflw_watcher::find_repo_root().unwrap_or_else(|| {
+                eprintln!("Error: not inside a git repository");
+                std::process::exit(1);
+            });
+
+            let debounce_duration = std::time::Duration::from_millis(*debounce);
+
+            let config = wrkflw_executor::ExecutionConfig {
+                runtime_type: runtime.clone().into(),
+                verbose,
+                preserve_containers_on_failure: *preserve_containers_on_failure,
+                secrets_config: None,
+                show_action_messages: *show_action_messages,
+                target_job: None,
+                event_filter: None,
+            };
+
+            use wrkflw_ui::cli_style;
+            println!(
+                "{}",
+                cli_style::success(&format!(
+                    "Watching for changes (event={}, debounce={}ms)... Press Ctrl+C to stop.",
+                    event, debounce
+                ))
+            );
+
+            let watcher = wrkflw_watcher::WorkflowWatcher::new(
+                workflow_dir,
+                repo_root,
+                event.clone(),
+                debounce_duration,
+                config,
+                verbose,
+            );
+
+            // Validate workflow files exist before starting
+            if let Err(e) = watcher.collect_workflow_files() {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+
+            watcher
+                .run(|watch_event| {
+                    println!(
+                        "\n{}",
+                        cli_style::section(&format!(
+                            "Change detected ({} file(s) changed, {} triggered, {} skipped)",
+                            watch_event.changed_files.len(),
+                            watch_event.triggered_workflows.len(),
+                            watch_event.skipped_workflows.len(),
+                        ))
+                    );
+                    for wf in &watch_event.triggered_workflows {
+                        println!("  {} {}", cli_style::success("TRIGGERED"), wf);
+                    }
+                    for wf in &watch_event.skipped_workflows {
+                        println!("  {} {}", cli_style::dim("SKIPPED"), wf);
+                    }
+                })
+                .await
+                .unwrap_or_else(|e| {
+                    eprintln!("Watch error: {}", e);
+                    std::process::exit(1);
+                });
         }
         Some(Commands::TriggerGitlab { branch, variable }) => {
             // Convert optional Vec<(String, String)> to Option<HashMap<String, String>>

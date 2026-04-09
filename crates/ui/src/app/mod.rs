@@ -78,6 +78,7 @@ pub async fn run_wrkflw_tui(
                 status: WorkflowStatus::NotStarted,
                 execution_details: None,
                 job_names,
+                trigger_match: None,
             }];
 
             // Queue the single workflow for execution
@@ -392,6 +393,11 @@ fn run_tui_event_loop(
                     KeyCode::Char('v') => {
                         if !app.running {
                             app.toggle_validation_mode();
+                        }
+                    }
+                    KeyCode::Char('d') => {
+                        if !app.running && app.selected_tab == 0 {
+                            app.toggle_diff_filter();
                         }
                     }
                     KeyCode::Char('n') => {

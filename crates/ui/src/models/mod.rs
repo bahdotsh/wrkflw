@@ -7,6 +7,15 @@ use wrkflw_logging::symbols;
 /// Type alias for the complex execution result type
 pub type ExecutionResultMsg = (usize, Result<(Vec<wrkflw_executor::JobResult>, ()), String>);
 
+/// Result of trigger evaluation for TUI display
+#[derive(Debug, Clone)]
+pub enum TriggerMatchStatus {
+    /// Workflow would trigger based on current diff
+    Matched(String),
+    /// Workflow would NOT trigger
+    Skipped(String),
+}
+
 /// Represents an individual workflow file
 pub struct Workflow {
     pub name: String,
@@ -15,6 +24,7 @@ pub struct Workflow {
     pub status: WorkflowStatus,
     pub execution_details: Option<WorkflowExecution>,
     pub job_names: Vec<String>,
+    pub trigger_match: Option<TriggerMatchStatus>,
 }
 
 /// A workflow queued for execution, with its own target job

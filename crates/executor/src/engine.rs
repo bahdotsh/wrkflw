@@ -82,6 +82,22 @@ async fn execute_github_workflow(
     // 1. Parse workflow file
     let workflow = parse_workflow(workflow_path)?;
 
+    // 1b. Apply trigger/event filtering if configured
+    if let Some(ref event_context) = config.event_filter {
+        let trigger_config =
+            wrkflw_trigger_filter::parse_trigger_config(&workflow, workflow_path.to_path_buf())
+                .map_err(|e| ExecutionError::Execution(format!("Trigger filter error: {}", e)))?;
+        let match_result = wrkflw_trigger_filter::evaluate_trigger(&trigger_config, event_context);
+        if !match_result.matches {
+            wrkflw_logging::info(&format!("Workflow skipped: {}", match_result.reason));
+            return Ok(ExecutionResult {
+                jobs: vec![],
+                failure_details: None,
+            });
+        }
+        wrkflw_logging::info(&format!("Trigger matched: {}", match_result.reason));
+    }
+
     // 2. Resolve job dependencies and create execution plan
     let execution_plan = dependency::resolve_dependencies(&workflow)?;
 
@@ -575,6 +591,7 @@ pub struct ExecutionConfig {
     pub secrets_config: Option<SecretConfig>,
     pub show_action_messages: bool,
     pub target_job: Option<String>,
+    pub event_filter: Option<wrkflw_trigger_filter::EventContext>,
 }
 
 pub struct ExecutionResult {

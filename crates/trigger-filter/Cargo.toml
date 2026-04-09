@@ -1,0 +1,18 @@
+[package]
+name = "wrkflw-trigger-filter"
+version.workspace = true
+edition.workspace = true
+description = "Trigger filter and diff-aware execution logic for wrkflw"
+license.workspace = true
+documentation.workspace = true
+homepage.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+wrkflw-parser.workspace = true
+serde_yaml.workspace = true
+glob.workspace = true
+tokio.workspace = true
+thiserror.workspace = true

@@ -42,6 +42,7 @@ pub fn load_workflows(dir_path: &Path) -> Vec<Workflow> {
                     status: WorkflowStatus::NotStarted,
                     execution_details: None,
                     job_names,
+                    trigger_match: None,
                 });
             }
         }
@@ -61,6 +62,7 @@ pub fn load_workflows(dir_path: &Path) -> Vec<Workflow> {
                 status: WorkflowStatus::NotStarted,
                 execution_details: None,
                 job_names,
+                trigger_match: None,
             });
         }
     }

@@ -1,0 +1,20 @@
+[package]
+name = "wrkflw-watcher"
+version.workspace = true
+edition.workspace = true
+description = "File watcher with trigger-aware workflow execution for wrkflw"
+license.workspace = true
+documentation.workspace = true
+homepage.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+wrkflw-trigger-filter.workspace = true
+wrkflw-executor.workspace = true
+wrkflw-parser.workspace = true
+wrkflw-logging.workspace = true
+notify.workspace = true
+tokio.workspace = true
+thiserror.workspace = true

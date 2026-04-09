@@ -21,6 +21,7 @@ wrkflw-evaluator.workspace = true
 wrkflw-executor.workspace = true
 wrkflw-parser.workspace = true
 wrkflw-logging.workspace = true
+wrkflw-trigger-filter.workspace = true
 wrkflw-utils.workspace = true
 wrkflw-github.workspace = true
 

@@ -92,22 +92,43 @@ pub fn evaluate_trigger(
         };
     }
 
-    // No filter combination matched
+    // No filter combination matched — build a diagnostic reason
     let reasons: Vec<String> = matching_filters
         .iter()
         .map(|f| {
             let mut parts = Vec::new();
-            if !f.branches.is_empty() {
-                parts.push(format!("branches: {:?}", f.branches));
+            if !f.branches.is_empty() || !f.branches_ignore.is_empty() {
+                match &context.branch {
+                    Some(branch) => parts.push(format!(
+                        "branch '{}' did not match {:?}",
+                        branch, f.branches
+                    )),
+                    None => parts.push("no branch in context (branch filter requires one)".to_string()),
+                }
+            }
+            if !f.tags.is_empty() || !f.tags_ignore.is_empty() {
+                match &context.tag {
+                    Some(tag) => parts.push(format!(
+                        "tag '{}' did not match {:?}",
+                        tag, f.tags
+                    )),
+                    None => parts.push("no tag in context (tag filter requires one)".to_string()),
+                }
+            }
+            if !f.types.is_empty() {
+                match &context.activity_type {
+                    Some(activity) => parts.push(format!(
+                        "activity '{}' not in {:?}",
+                        activity, f.types
+                    )),
+                    None => parts.push("no activity type in context (types filter requires one)".to_string()),
+                }
             }
             if !f.paths.is_empty() {
                 parts.push(format!("paths: {:?}", f.paths));
             }
             if !f.paths_ignore.is_empty() {
                 parts.push(format!("paths-ignore: {:?}", f.paths_ignore));
-            }
-            if !f.tags.is_empty() {
-                parts.push(format!("tags: {:?}", f.tags));
             }
             if parts.is_empty() {
                 "no specific filters".to_string()

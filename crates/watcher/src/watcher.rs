@@ -160,6 +160,7 @@ impl WorkflowWatcher {
 
             let mut triggered = Vec::new();
             let mut skipped = Vec::new();
+            let mut exec_futures = Vec::new();
 
             for wf_path in &workflow_files {
                 let workflow = match wrkflw_parser::workflow::parse_workflow(wf_path) {
@@ -197,33 +198,37 @@ impl WorkflowWatcher {
                     triggered.push(wf_path.display().to_string());
 
                     let config = self.config_template.clone();
-
-                    match wrkflw_executor::execute_workflow(wf_path, config).await {
-                        Ok(exec_result) => {
-                            if exec_result.failure_details.is_some() {
+                    exec_futures.push(async move {
+                        match wrkflw_executor::execute_workflow(wf_path, config).await {
+                            Ok(exec_result) => {
+                                if exec_result.failure_details.is_some() {
+                                    wrkflw_logging::error(&format!(
+                                        "Workflow {} failed",
+                                        wf_path.display()
+                                    ));
+                                } else {
+                                    wrkflw_logging::info(&format!(
+                                        "Workflow {} succeeded",
+                                        wf_path.display()
+                                    ));
+                                }
+                            }
+                            Err(e) => {
                                 wrkflw_logging::error(&format!(
-                                    "Workflow {} failed",
-                                    wf_path.display()
-                                ));
-                            } else {
-                                wrkflw_logging::info(&format!(
-                                    "Workflow {} succeeded",
-                                    wf_path.display()
+                                    "Workflow {} error: {}",
+                                    wf_path.display(),
+                                    e
                                 ));
                             }
                         }
-                        Err(e) => {
-                            wrkflw_logging::error(&format!(
-                                "Workflow {} error: {}",
-                                wf_path.display(),
-                                e
-                            ));
-                        }
-                    }
+                    });
                 } else {
                     skipped.push(wf_path.display().to_string());
                 }
             }
+
+            // Execute all triggered workflows concurrently
+            futures::future::join_all(exec_futures).await;
 
             on_event(WatchEvent {
                 changed_files,

@@ -34,12 +34,31 @@ impl Debouncer {
         self.notify.notify_one();
     }
 
-    /// Wait for the debounce duration, then drain all pending paths.
-    /// Returns empty vec if nothing was collected.
+    /// Wait for the debounce window to settle, then drain all pending paths.
+    ///
+    /// Sleeps for the debounce duration, but only continues waiting while new
+    /// events keep arriving. Returns as soon as a full debounce interval passes
+    /// with no new events (or immediately if nothing is pending).
     pub async fn drain(&self) -> Vec<PathBuf> {
-        tokio::time::sleep(self.duration).await;
-        let mut pending = self.lock_or_recover();
-        pending.drain().collect()
+        loop {
+            let count_before = {
+                let pending = self.lock_or_recover();
+                pending.len()
+            };
+
+            if count_before == 0 {
+                return Vec::new();
+            }
+
+            tokio::time::sleep(self.duration).await;
+
+            let mut pending = self.lock_or_recover();
+            // If no new events arrived during the sleep, drain and return.
+            // Otherwise loop to wait for the burst to settle.
+            if pending.len() == count_before {
+                return pending.drain().collect();
+            }
+        }
     }
 
     /// Check if there are any pending events without draining.

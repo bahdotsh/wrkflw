@@ -1276,32 +1276,19 @@ impl App {
 }
 
 /// Run git + trigger evaluation synchronously (intended for background threads).
+/// Uses the sync wrappers from trigger-filter::git so logic stays in one place.
 fn evaluate_diff_filter(workflow_paths: Vec<PathBuf>) -> Vec<Option<TriggerMatchStatus>> {
-    let branch = std::process::Command::new("git")
-        .args(["rev-parse", "--abbrev-ref", "HEAD"])
-        .output()
+    let branch = wrkflw_trigger_filter::git::get_current_branch_sync().ok();
+    let tag = wrkflw_trigger_filter::git::get_current_tag_sync()
         .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
-
-    let changed_files: Vec<String> = std::process::Command::new("git")
-        .args(["diff", "--name-only", "HEAD"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .map(|l| l.trim().to_string())
-                .filter(|l| !l.is_empty())
-                .collect()
-        })
+        .flatten();
+    let changed_files = wrkflw_trigger_filter::git::get_changed_files_sync("HEAD")
         .unwrap_or_default();
 
     let context = wrkflw_trigger_filter::EventContext {
         event_name: "push".to_string(),
         branch,
-        tag: None,
+        tag,
         changed_files,
         activity_type: None,
     };

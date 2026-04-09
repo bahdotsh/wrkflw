@@ -15,6 +15,7 @@ wrkflw-trigger-filter.workspace = true
 wrkflw-executor.workspace = true
 wrkflw-parser.workspace = true
 wrkflw-logging.workspace = true
+futures.workspace = true
 notify.workspace = true
 tokio.workspace = true
 thiserror.workspace = true

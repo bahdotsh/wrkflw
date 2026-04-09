@@ -40,10 +40,11 @@ pub async fn get_changed_files(base: &str) -> Result<Vec<String>, TriggerFilterE
         .map_err(|e| TriggerFilterError::GitError(format!("Failed to run git ls-files: {}", e)))?;
 
     if untracked_output.status.success() {
+        let seen: std::collections::HashSet<String> = files.iter().cloned().collect();
         let untracked_str = String::from_utf8_lossy(&untracked_output.stdout);
         for line in untracked_str.lines() {
             let trimmed = line.trim();
-            if !trimmed.is_empty() && !files.contains(&trimmed.to_string()) {
+            if !trimmed.is_empty() && !seen.contains(trimmed) {
                 files.push(trimmed.to_string());
             }
         }

@@ -280,65 +280,76 @@ impl App {
     }
 
     /// Toggle diff-aware trigger filtering and evaluate all workflows.
+    /// Git commands and workflow parsing run on a background thread to avoid blocking the TUI.
     pub fn toggle_diff_filter(&mut self) {
         use crate::models::TriggerMatchStatus;
         self.diff_filter_active = !self.diff_filter_active;
 
         if self.diff_filter_active {
-            // Synchronously get git state for trigger evaluation
-            let branch = std::process::Command::new("git")
-                .args(["rev-parse", "--abbrev-ref", "HEAD"])
-                .output()
-                .ok()
-                .filter(|o| o.status.success())
-                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+            self.logs
+                .push("Diff filter: evaluating triggers...".to_string());
 
-            let changed_files: Vec<String> = std::process::Command::new("git")
-                .args(["diff", "--name-only", "HEAD"])
-                .output()
-                .ok()
-                .filter(|o| o.status.success())
-                .map(|o| {
-                    String::from_utf8_lossy(&o.stdout)
-                        .lines()
-                        .map(|l| l.trim().to_string())
-                        .filter(|l| !l.is_empty())
-                        .collect()
-                })
-                .unwrap_or_default();
+            // Collect workflow paths for the background thread
+            let workflow_paths: Vec<_> = self.workflows.iter().map(|w| w.path.clone()).collect();
 
-            let context = wrkflw_trigger_filter::EventContext {
-                event_name: "push".to_string(),
-                branch,
-                tag: None,
-                changed_files,
-            };
+            // Run git + trigger evaluation on a background thread
+            let results: Vec<Option<TriggerMatchStatus>> = std::thread::spawn(move || {
+                let branch = std::process::Command::new("git")
+                    .args(["rev-parse", "--abbrev-ref", "HEAD"])
+                    .output()
+                    .ok()
+                    .filter(|o| o.status.success())
+                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
 
-            for workflow in &mut self.workflows {
-                match wrkflw_parser::workflow::parse_workflow(&workflow.path) {
-                    Ok(wf) => {
-                        match wrkflw_trigger_filter::parse_trigger_config(
-                            &wf,
-                            workflow.path.clone(),
-                        ) {
-                            Ok(config) => {
-                                let result =
-                                    wrkflw_trigger_filter::evaluate_trigger(&config, &context);
-                                workflow.trigger_match = Some(if result.matches {
-                                    TriggerMatchStatus::Matched(result.reason)
-                                } else {
-                                    TriggerMatchStatus::Skipped(result.reason)
-                                });
-                            }
-                            Err(_) => {
-                                workflow.trigger_match = None;
-                            }
-                        }
-                    }
-                    Err(_) => {
-                        workflow.trigger_match = None;
-                    }
-                }
+                let changed_files: Vec<String> = std::process::Command::new("git")
+                    .args(["diff", "--name-only", "HEAD"])
+                    .output()
+                    .ok()
+                    .filter(|o| o.status.success())
+                    .map(|o| {
+                        String::from_utf8_lossy(&o.stdout)
+                            .lines()
+                            .map(|l| l.trim().to_string())
+                            .filter(|l| !l.is_empty())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                let context = wrkflw_trigger_filter::EventContext {
+                    event_name: "push".to_string(),
+                    branch,
+                    tag: None,
+                    changed_files,
+                    activity_type: None,
+                };
+
+                workflow_paths
+                    .iter()
+                    .map(|path| {
+                        let wf = match wrkflw_parser::workflow::parse_workflow(path) {
+                            Ok(wf) => wf,
+                            Err(_) => return None,
+                        };
+                        let config =
+                            match wrkflw_trigger_filter::parse_trigger_config(&wf, path.clone()) {
+                                Ok(c) => c,
+                                Err(_) => return None,
+                            };
+                        let result = wrkflw_trigger_filter::evaluate_trigger(&config, &context);
+                        Some(if result.matches {
+                            TriggerMatchStatus::Matched(result.reason)
+                        } else {
+                            TriggerMatchStatus::Skipped(result.reason)
+                        })
+                    })
+                    .collect()
+            })
+            .join()
+            .unwrap_or_default();
+
+            // Apply results back to workflows
+            for (workflow, result) in self.workflows.iter_mut().zip(results.into_iter()) {
+                workflow.trigger_match = result;
             }
 
             let matched = self

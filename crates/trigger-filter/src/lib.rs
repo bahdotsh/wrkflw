@@ -47,5 +47,6 @@ pub async fn auto_detect_context(
         branch,
         tag,
         changed_files,
+        activity_type: None,
     })
 }

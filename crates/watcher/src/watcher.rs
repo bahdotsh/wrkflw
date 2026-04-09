@@ -152,6 +152,7 @@ impl WorkflowWatcher {
                 branch,
                 tag,
                 changed_files: changed_files.clone(),
+                activity_type: None,
             };
 
             let mut triggered = Vec::new();

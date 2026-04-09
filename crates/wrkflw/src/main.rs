@@ -512,6 +512,7 @@ async fn main() {
                     branch,
                     tag,
                     changed_files: files,
+                    activity_type: None,
                 })
             } else {
                 None

@@ -35,20 +35,39 @@ pub fn evaluate_trigger(
 
     for filter in &matching_filters {
         // Check branch filters (applies to push, pull_request, etc.)
-        if let Some(ref branch) = context.branch {
-            if (!filter.branches.is_empty() || !filter.branches_ignore.is_empty())
-                && !ref_matcher::matches_ref(branch, &filter.branches, &filter.branches_ignore)
-            {
-                continue;
+        if !filter.branches.is_empty() || !filter.branches_ignore.is_empty() {
+            match context.branch {
+                Some(ref branch) => {
+                    if !ref_matcher::matches_ref(branch, &filter.branches, &filter.branches_ignore)
+                    {
+                        continue;
+                    }
+                }
+                None => continue, // No branch in context, branch filter cannot match
             }
         }
 
         // Check tag filters (applies to push with tags)
-        if let Some(ref tag) = context.tag {
-            if (!filter.tags.is_empty() || !filter.tags_ignore.is_empty())
-                && !ref_matcher::matches_ref(tag, &filter.tags, &filter.tags_ignore)
-            {
-                continue;
+        if !filter.tags.is_empty() || !filter.tags_ignore.is_empty() {
+            match context.tag {
+                Some(ref tag) => {
+                    if !ref_matcher::matches_ref(tag, &filter.tags, &filter.tags_ignore) {
+                        continue;
+                    }
+                }
+                None => continue, // No tag in context, tag filter cannot match
+            }
+        }
+
+        // Check activity type filters (applies to pull_request, issues, etc.)
+        if !filter.types.is_empty() {
+            match context.activity_type {
+                Some(ref activity) => {
+                    if !filter.types.iter().any(|t| t == activity) {
+                        continue;
+                    }
+                }
+                None => continue, // No activity type in context, type filter cannot match
             }
         }
 
@@ -136,6 +155,7 @@ mod tests {
             branch: Some("main".into()),
             tag: None,
             changed_files: vec!["src/main.rs".into()],
+            activity_type: None,
         };
         let result = evaluate_trigger(&config, &ctx);
         assert!(!result.matches);
@@ -152,6 +172,7 @@ mod tests {
             branch: Some("main".into()),
             tag: None,
             changed_files: vec![],
+            activity_type: None,
         };
         let result = evaluate_trigger(&config, &ctx);
         assert!(result.matches);
@@ -169,6 +190,7 @@ mod tests {
             branch: Some("main".into()),
             tag: None,
             changed_files: vec![],
+            activity_type: None,
         };
         assert!(evaluate_trigger(&config, &ctx).matches);
     }
@@ -185,6 +207,7 @@ mod tests {
             branch: Some("feature/foo".into()),
             tag: None,
             changed_files: vec![],
+            activity_type: None,
         };
         assert!(!evaluate_trigger(&config, &ctx).matches);
     }
@@ -201,6 +224,7 @@ mod tests {
             branch: Some("main".into()),
             tag: None,
             changed_files: vec!["src/main.rs".into()],
+            activity_type: None,
         };
         assert!(evaluate_trigger(&config, &ctx).matches);
     }
@@ -217,6 +241,7 @@ mod tests {
             branch: Some("main".into()),
             tag: None,
             changed_files: vec!["docs/readme.md".into()],
+            activity_type: None,
         };
         assert!(!evaluate_trigger(&config, &ctx).matches);
     }
@@ -234,6 +259,7 @@ mod tests {
             branch: Some("main".into()),
             tag: None,
             changed_files: vec!["docs/guide.md".into()],
+            activity_type: None,
         };
         assert!(!evaluate_trigger(&config, &ctx).matches);
 
@@ -243,6 +269,7 @@ mod tests {
             branch: Some("main".into()),
             tag: None,
             changed_files: vec!["docs/guide.md".into(), "src/lib.rs".into()],
+            activity_type: None,
         };
         assert!(evaluate_trigger(&config, &ctx2).matches);
     }
@@ -262,6 +289,7 @@ mod tests {
             branch: Some("main".into()),
             tag: None,
             changed_files: vec!["src/main.rs".into()],
+            activity_type: None,
         };
         assert!(evaluate_trigger(&config, &ctx).matches);
 
@@ -271,6 +299,7 @@ mod tests {
             branch: Some("develop".into()),
             tag: None,
             changed_files: vec!["src/main.rs".into()],
+            activity_type: None,
         };
         assert!(!evaluate_trigger(&config, &ctx2).matches);
 
@@ -280,6 +309,7 @@ mod tests {
             branch: Some("main".into()),
             tag: None,
             changed_files: vec!["docs/readme.md".into()],
+            activity_type: None,
         };
         assert!(!evaluate_trigger(&config, &ctx3).matches);
     }
@@ -298,6 +328,7 @@ mod tests {
             branch: None,
             tag: Some("v1.0.0".into()),
             changed_files: vec![],
+            activity_type: None,
         };
         assert!(evaluate_trigger(&config, &ctx).matches);
 
@@ -306,6 +337,7 @@ mod tests {
             branch: None,
             tag: Some("v1.0.0-rc1".into()),
             changed_files: vec![],
+            activity_type: None,
         };
         assert!(!evaluate_trigger(&config, &ctx2).matches);
     }
@@ -321,7 +353,93 @@ mod tests {
             branch: None,
             tag: None,
             changed_files: vec![],
+            activity_type: None,
         };
         assert!(evaluate_trigger(&config, &ctx).matches);
+    }
+
+    #[test]
+    fn branch_filter_fails_when_no_branch_in_context() {
+        let config = make_config(vec![EventFilter {
+            event_name: "push".into(),
+            branches: vec!["main".into()],
+            ..Default::default()
+        }]);
+        let ctx = EventContext {
+            event_name: "push".into(),
+            branch: None,
+            tag: None,
+            changed_files: vec![],
+            activity_type: None,
+        };
+        assert!(!evaluate_trigger(&config, &ctx).matches);
+    }
+
+    #[test]
+    fn tag_filter_fails_when_no_tag_in_context() {
+        let config = make_config(vec![EventFilter {
+            event_name: "push".into(),
+            tags: vec!["v*".into()],
+            ..Default::default()
+        }]);
+        let ctx = EventContext {
+            event_name: "push".into(),
+            branch: Some("main".into()),
+            tag: None,
+            changed_files: vec![],
+            activity_type: None,
+        };
+        assert!(!evaluate_trigger(&config, &ctx).matches);
+    }
+
+    #[test]
+    fn types_filter_matches() {
+        let config = make_config(vec![EventFilter {
+            event_name: "pull_request".into(),
+            types: vec!["opened".into(), "synchronize".into()],
+            ..Default::default()
+        }]);
+        let ctx = EventContext {
+            event_name: "pull_request".into(),
+            branch: None,
+            tag: None,
+            changed_files: vec![],
+            activity_type: Some("opened".into()),
+        };
+        assert!(evaluate_trigger(&config, &ctx).matches);
+    }
+
+    #[test]
+    fn types_filter_no_match() {
+        let config = make_config(vec![EventFilter {
+            event_name: "pull_request".into(),
+            types: vec!["opened".into()],
+            ..Default::default()
+        }]);
+        let ctx = EventContext {
+            event_name: "pull_request".into(),
+            branch: None,
+            tag: None,
+            changed_files: vec![],
+            activity_type: Some("closed".into()),
+        };
+        assert!(!evaluate_trigger(&config, &ctx).matches);
+    }
+
+    #[test]
+    fn types_filter_fails_when_no_activity_type_in_context() {
+        let config = make_config(vec![EventFilter {
+            event_name: "pull_request".into(),
+            types: vec!["opened".into()],
+            ..Default::default()
+        }]);
+        let ctx = EventContext {
+            event_name: "pull_request".into(),
+            branch: None,
+            tag: None,
+            changed_files: vec![],
+            activity_type: None,
+        };
+        assert!(!evaluate_trigger(&config, &ctx).matches);
     }
 }

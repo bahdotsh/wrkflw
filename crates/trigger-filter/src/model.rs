@@ -28,6 +28,8 @@ pub struct EventContext {
     pub branch: Option<String>,
     pub tag: Option<String>,
     pub changed_files: Vec<String>,
+    /// Activity type for events that support it (e.g., "opened", "synchronize" for pull_request)
+    pub activity_type: Option<String>,
 }
 
 /// Result of trigger evaluation for a single workflow.

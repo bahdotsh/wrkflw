@@ -177,4 +177,18 @@ mod tests {
         let files = vec!["README.md".into(), "CHANGELOG.md".into()];
         assert!(!matches_paths(&files, &[], &["*.md".into()]));
     }
+
+    #[test]
+    fn invalid_glob_pattern_is_silently_skipped() {
+        // An unclosed bracket is an invalid glob — it should not panic or match
+        let files = vec!["src/main.rs".into()];
+        assert!(!matches_paths(&files, &["[unclosed".into()], &[]));
+    }
+
+    #[test]
+    fn invalid_exclude_pattern_is_silently_skipped() {
+        // Invalid exclude pattern should not filter anything out
+        let files = vec!["src/main.rs".into()];
+        assert!(matches_paths(&files, &[], &["[bad".into()]));
+    }
 }

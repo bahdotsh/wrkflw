@@ -473,47 +473,45 @@ async fn main() {
             // Evaluate trigger filter at the call site before executing
             if *diff || event.is_some() || changed_files.is_some() {
                 let event_name = event.clone().unwrap_or_else(|| "push".to_string());
-                let files = if let Some(files) = changed_files {
-                    files.clone()
+
+                let event_context = if let Some(files) = changed_files {
+                    wrkflw_trigger_filter::context_from_changed_files(&event_name, files.clone())
+                        .await
+                        .unwrap_or_else(|e| {
+                            eprintln!("Warning: Failed to build event context: {}", e);
+                            std::process::exit(1);
+                        })
                 } else if *diff {
                     if let Some(head) = diff_head {
-                        wrkflw_trigger_filter::git::get_changed_files_between(diff_base, head)
+                        wrkflw_trigger_filter::context_from_diff_range(&event_name, diff_base, head)
                             .await
                             .unwrap_or_else(|e| {
                                 eprintln!("Warning: Failed to get git diff: {}", e);
-                                vec![]
+                                std::process::exit(1);
                             })
                     } else {
-                        wrkflw_trigger_filter::git::get_changed_files(diff_base)
+                        wrkflw_trigger_filter::auto_detect_context(&event_name, diff_base)
                             .await
                             .unwrap_or_else(|e| {
                                 eprintln!("Warning: Failed to get git diff: {}", e);
-                                vec![]
+                                std::process::exit(1);
                             })
                     }
                 } else {
-                    vec![]
+                    wrkflw_trigger_filter::context_from_changed_files(&event_name, vec![])
+                        .await
+                        .unwrap_or_else(|e| {
+                            eprintln!("Warning: Failed to build event context: {}", e);
+                            std::process::exit(1);
+                        })
                 };
-                let branch = wrkflw_trigger_filter::git::get_current_branch().await.ok();
-                let tag = wrkflw_trigger_filter::git::get_current_tag()
-                    .await
-                    .ok()
-                    .flatten();
 
                 if verbose {
                     wrkflw_logging::info(&format!(
                         "Trigger filter: event={}, branch={:?}, changed_files={:?}",
-                        event_name, branch, files
+                        event_context.event_name, event_context.branch, event_context.changed_files
                     ));
                 }
-
-                let event_context = wrkflw_trigger_filter::EventContext {
-                    event_name,
-                    branch,
-                    tag,
-                    changed_files: files,
-                    activity_type: None,
-                };
 
                 // Parse workflow and evaluate trigger before executing
                 let workflow = wrkflw_parser::workflow::parse_workflow(path).unwrap_or_else(|e| {

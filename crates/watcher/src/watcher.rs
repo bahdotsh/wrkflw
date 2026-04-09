@@ -93,14 +93,19 @@ impl WorkflowWatcher {
     /// Start the watch loop. Calls `on_cycle_complete` after each
     /// debounced change set has been evaluated and executed.
     /// This blocks until an error occurs or the process is interrupted.
+    ///
+    /// **Important:** `on_cycle_complete` is invoked via `spawn_blocking` so it
+    /// will not stall the async watch loop, but it should still return promptly
+    /// to avoid exhausting the blocking thread pool under sustained churn.
     pub async fn run<F>(&self, on_cycle_complete: F) -> Result<(), WatchError>
     where
-        F: Fn(WatchEvent) + Send + 'static,
+        F: Fn(WatchEvent) + Send + Sync + 'static,
     {
         let workflow_files = self.collect_workflow_files()?;
 
         let (tx, mut rx) = mpsc::channel::<PathBuf>(256);
         let debouncer = Arc::new(Debouncer::new(self.debounce_duration));
+        let callback = Arc::new(on_cycle_complete);
 
         // Set up the notify watcher
         let tx_clone = tx.clone();
@@ -142,6 +147,7 @@ impl WorkflowWatcher {
         });
 
         // Main loop: wait for notification, debounce, evaluate triggers, execute
+        let mut workflow_files = workflow_files;
         loop {
             // Only block on notification if no events are already pending.
             // This prevents losing events that accumulated during workflow execution.
@@ -152,6 +158,11 @@ impl WorkflowWatcher {
             let changed_paths = debouncer.drain().await;
             if changed_paths.is_empty() {
                 continue;
+            }
+
+            // Re-collect workflow files so newly added .yml files are picked up
+            if let Ok(refreshed) = self.collect_workflow_files() {
+                workflow_files = refreshed;
             }
 
             // Convert to relative paths
@@ -172,7 +183,8 @@ impl WorkflowWatcher {
                 .evaluate_and_execute(&workflow_files, changed_files)
                 .await;
 
-            on_cycle_complete(event);
+            let cb = callback.clone();
+            let _ = tokio::task::spawn_blocking(move || cb(event)).await;
         }
     }
 
@@ -183,19 +195,21 @@ impl WorkflowWatcher {
         workflow_files: &[PathBuf],
         changed_files: Vec<String>,
     ) -> WatchEvent {
-        let branch = wrkflw_trigger_filter::git::get_current_branch().await.ok();
-        let tag = wrkflw_trigger_filter::git::get_current_tag()
-            .await
-            .ok()
-            .flatten();
-
-        let context = wrkflw_trigger_filter::EventContext {
-            event_name: self.event_name.clone(),
-            branch,
-            tag,
-            changed_files: changed_files.clone(),
-            activity_type: None,
-        };
+        let context = wrkflw_trigger_filter::context_from_changed_files(
+            &self.event_name,
+            changed_files.clone(),
+        )
+        .await
+        .unwrap_or_else(|e| {
+            wrkflw_logging::warning(&format!("Failed to build event context: {}", e));
+            wrkflw_trigger_filter::EventContext {
+                event_name: self.event_name.clone(),
+                branch: None,
+                tag: None,
+                changed_files: changed_files.clone(),
+                activity_type: None,
+            }
+        });
 
         // Parse all workflow files, logging failures
         let workflows: Vec<_> = workflow_files
@@ -298,5 +312,52 @@ pub fn find_repo_root() -> Option<PathBuf> {
         Some(PathBuf::from(path))
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ignores_git_directory() {
+        assert!(should_ignore_path(std::path::Path::new(
+            "/repo/.git/objects/pack/abc"
+        )));
+    }
+
+    #[test]
+    fn ignores_target_directory() {
+        assert!(should_ignore_path(std::path::Path::new(
+            "/repo/target/debug/deps/foo"
+        )));
+    }
+
+    #[test]
+    fn ignores_node_modules() {
+        assert!(should_ignore_path(std::path::Path::new(
+            "/repo/node_modules/pkg/index.js"
+        )));
+    }
+
+    #[test]
+    fn does_not_ignore_src() {
+        assert!(!should_ignore_path(std::path::Path::new(
+            "/repo/src/main.rs"
+        )));
+    }
+
+    #[test]
+    fn does_not_ignore_workflow_files() {
+        assert!(!should_ignore_path(std::path::Path::new(
+            "/repo/.github/workflows/ci.yml"
+        )));
+    }
+
+    #[test]
+    fn ignores_pycache() {
+        assert!(should_ignore_path(std::path::Path::new(
+            "/repo/__pycache__/module.cpython-311.pyc"
+        )));
     }
 }

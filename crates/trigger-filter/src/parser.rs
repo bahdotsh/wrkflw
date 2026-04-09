@@ -200,4 +200,33 @@ push:
         assert_eq!(events[0].tags, vec!["v*"]);
         assert_eq!(events[0].tags_ignore, vec!["v*-rc*"]);
     }
+
+    #[test]
+    fn parse_mapping_with_types() {
+        let raw = make_on_raw(
+            r#"
+pull_request:
+  types:
+    - opened
+    - synchronize
+    - reopened
+"#,
+        );
+        let events = parse_events(&raw).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_name, "pull_request");
+        assert_eq!(events[0].types, vec!["opened", "synchronize", "reopened"]);
+    }
+
+    #[test]
+    fn parse_single_string_type() {
+        let raw = make_on_raw(
+            r#"
+issues:
+  types: opened
+"#,
+        );
+        let events = parse_events(&raw).unwrap();
+        assert_eq!(events[0].types, vec!["opened"]);
+    }
 }

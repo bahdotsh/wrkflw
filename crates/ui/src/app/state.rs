@@ -285,10 +285,16 @@ impl App {
     /// Toggle diff-aware trigger filtering and evaluate all workflows.
     /// Git commands and workflow parsing run on a background thread to avoid blocking the TUI.
     /// Results are received via `check_diff_filter_results()` on the next tick.
+    ///
+    /// If an evaluation is already in flight (rapid toggle), the pending result is
+    /// discarded and a new evaluation is started.
     pub fn toggle_diff_filter(&mut self) {
         self.diff_filter_active = !self.diff_filter_active;
 
         if self.diff_filter_active {
+            // Drop any in-flight receiver so the orphaned thread's send() harmlessly fails
+            self.diff_filter_rx = None;
+
             self.logs
                 .push("Diff filter: evaluating triggers...".to_string());
 

@@ -206,7 +206,20 @@ pub async fn get_default_diff_base() -> String {
         }
     }
 
-    "HEAD~1".to_string()
+    // Try HEAD~1, but it fails on repos with only one commit (no parent)
+    if let Ok(output) = Command::new("git")
+        .args(["rev-parse", "--verify", "HEAD~1"])
+        .output()
+        .await
+    {
+        if output.status.success() {
+            return "HEAD~1".to_string();
+        }
+    }
+
+    // Ultimate fallback: the git empty tree SHA.
+    // This compares against a completely empty tree, so all files appear as "changed".
+    "4b825dc642cb6eb9a060e54bf899d69f82e4f2d1".to_string()
 }
 
 /// Get the current tag if HEAD is tagged, or None.

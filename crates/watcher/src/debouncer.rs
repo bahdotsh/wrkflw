@@ -127,4 +127,30 @@ mod tests {
         let got_notified = handle.await.unwrap();
         assert!(got_notified);
     }
+
+    #[tokio::test]
+    async fn max_settle_rounds_prevents_livelock() {
+        // Use a very short debounce window so the test completes quickly
+        let debouncer = Arc::new(Debouncer::new(Duration::from_millis(5)));
+        let debouncer_clone = debouncer.clone();
+
+        // Continuously add events during drain to simulate sustained churn
+        let feeder = tokio::spawn(async move {
+            for i in 0..50 {
+                debouncer_clone.add_event(PathBuf::from(format!("file_{}.rs", i)));
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        });
+
+        // Seed at least one event so drain doesn't return empty immediately
+        debouncer.add_event(PathBuf::from("seed.rs"));
+
+        // drain() must return within a bounded time despite continuous events
+        let result = tokio::time::timeout(Duration::from_secs(2), debouncer.drain()).await;
+        assert!(result.is_ok(), "drain() should not livelock");
+        let paths = result.unwrap();
+        assert!(!paths.is_empty());
+
+        feeder.abort();
+    }
 }

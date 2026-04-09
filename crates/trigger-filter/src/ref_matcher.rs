@@ -20,7 +20,7 @@ pub fn matches_ref(
 
     let opts = glob::MatchOptions {
         case_sensitive: true,
-        require_literal_separator: false,
+        require_literal_separator: true, // * must not match /
         require_literal_leading_dot: false,
     };
 
@@ -71,6 +71,12 @@ mod tests {
     fn wildcard_match() {
         assert!(matches_ref("release/v1.0", &["release/*".into()], &[]));
         assert!(matches_ref("release/v2.0", &["release/*".into()], &[]));
+        // * must not cross /
+        assert!(!matches_ref(
+            "release/v1.0/hotfix",
+            &["release/*".into()],
+            &[]
+        ));
     }
 
     #[test]

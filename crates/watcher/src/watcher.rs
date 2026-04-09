@@ -108,6 +108,7 @@ impl WorkflowWatcher {
         ));
 
         let debouncer_clone = debouncer.clone();
+        let notify = debouncer.notifier();
 
         // Spawn a task to receive filesystem events and feed the debouncer
         tokio::spawn(async move {
@@ -116,13 +117,10 @@ impl WorkflowWatcher {
             }
         });
 
-        // Main loop: wait for debounced events, evaluate triggers, execute
+        // Main loop: wait for notification, debounce, evaluate triggers, execute
         loop {
-            if !debouncer.has_pending() {
-                // Sleep briefly before checking again
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                continue;
-            }
+            // Block until the debouncer signals that an event arrived
+            notify.notified().await;
 
             let changed_paths = debouncer.drain().await;
             if changed_paths.is_empty() {

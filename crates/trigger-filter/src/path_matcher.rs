@@ -64,7 +64,7 @@ fn match_github_glob(file: &str, pattern: &str) -> bool {
     // in addition to the full path.
     let opts = glob::MatchOptions {
         case_sensitive: true,
-        require_literal_separator: false,
+        require_literal_separator: true, // * must not match /
         require_literal_leading_dot: false,
     };
 
@@ -165,11 +165,11 @@ mod tests {
     #[test]
     fn star_does_not_match_slash() {
         let files = vec!["src/sub/file.rs".into()];
-        // Single * should not cross directory boundaries in `require_literal_separator` mode
-        // but GitHub Actions default allows it via **, so src/* won't match src/sub/file.rs
-        // Actually with require_literal_separator: false, * does match /
-        // GitHub Actions: * matches anything except /, so let's verify the pattern
+        // * must not cross directory boundaries (GitHub Actions semantics)
+        assert!(!matches_paths(&files, &["src/*".into()], &[]));
+        // ** should cross directory boundaries
         assert!(matches_paths(&files, &["src/**/*.rs".into()], &[]));
+        assert!(matches_paths(&files, &["src/**".into()], &[]));
     }
 
     #[test]

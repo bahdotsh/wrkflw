@@ -2,12 +2,14 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::sync::Notify;
 
 /// Collects filesystem events over a configurable window,
 /// deduplicates paths, and fires a single coalesced event.
 pub struct Debouncer {
     duration: Duration,
     pending: Arc<Mutex<HashSet<PathBuf>>>,
+    notify: Arc<Notify>,
 }
 
 impl Debouncer {
@@ -15,28 +17,43 @@ impl Debouncer {
         Self {
             duration,
             pending: Arc::new(Mutex::new(HashSet::new())),
+            notify: Arc::new(Notify::new()),
         }
+    }
+
+    /// Return a clone of the Notify handle so the watcher loop can await it.
+    pub fn notifier(&self) -> Arc<Notify> {
+        self.notify.clone()
     }
 
     /// Add a path from a filesystem event.
     pub fn add_event(&self, path: PathBuf) {
-        if let Ok(mut pending) = self.pending.lock() {
-            pending.insert(path);
-        }
+        let mut pending = self.lock_or_recover();
+        pending.insert(path);
+        drop(pending);
+        self.notify.notify_one();
     }
 
     /// Wait for the debounce duration, then drain all pending paths.
     /// Returns empty vec if nothing was collected.
     pub async fn drain(&self) -> Vec<PathBuf> {
         tokio::time::sleep(self.duration).await;
-        let mut pending = self.pending.lock().unwrap();
-        let paths: Vec<PathBuf> = pending.drain().collect();
-        paths
+        let mut pending = self.lock_or_recover();
+        pending.drain().collect()
     }
 
     /// Check if there are any pending events without draining.
     pub fn has_pending(&self) -> bool {
-        self.pending.lock().map(|p| !p.is_empty()).unwrap_or(false)
+        let pending = self.lock_or_recover();
+        !pending.is_empty()
+    }
+
+    /// Lock the mutex, recovering from poison if necessary.
+    fn lock_or_recover(&self) -> std::sync::MutexGuard<'_, HashSet<PathBuf>> {
+        match self.pending.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
     }
 }
 
@@ -67,5 +84,21 @@ mod tests {
 
         let paths2 = debouncer.drain().await;
         assert!(paths2.is_empty());
+    }
+
+    #[tokio::test]
+    async fn add_event_sends_notification() {
+        let debouncer = Arc::new(Debouncer::new(Duration::from_millis(10)));
+        let notifier = debouncer.notifier();
+
+        // Spawn a task that waits for notification
+        let handle = tokio::spawn(async move {
+            notifier.notified().await;
+            true
+        });
+
+        debouncer.add_event(PathBuf::from("test.rs"));
+        let got_notified = handle.await.unwrap();
+        assert!(got_notified);
     }
 }

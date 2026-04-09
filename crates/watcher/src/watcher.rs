@@ -119,8 +119,11 @@ impl WorkflowWatcher {
 
         // Main loop: wait for notification, debounce, evaluate triggers, execute
         loop {
-            // Block until the debouncer signals that an event arrived
-            notify.notified().await;
+            // Only block on notification if no events are already pending.
+            // This prevents losing events that accumulated during workflow execution.
+            if !debouncer.has_pending() {
+                notify.notified().await;
+            }
 
             let changed_paths = debouncer.drain().await;
             if changed_paths.is_empty() {
@@ -193,10 +196,7 @@ impl WorkflowWatcher {
                 if result.matches {
                     triggered.push(wf_path.display().to_string());
 
-                    let config = ExecutionConfig {
-                        event_filter: None, // Already filtered
-                        ..self.config_template.clone()
-                    };
+                    let config = self.config_template.clone();
 
                     match wrkflw_executor::execute_workflow(wf_path, config).await {
                         Ok(exec_result) => {

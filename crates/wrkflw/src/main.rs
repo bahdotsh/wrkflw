@@ -470,8 +470,8 @@ async fn main() {
             diff_base,
             diff_head,
         }) => {
-            // Build event filter context if any diff/event flags are set
-            let event_filter = if *diff || event.is_some() || changed_files.is_some() {
+            // Evaluate trigger filter at the call site before executing
+            if *diff || event.is_some() || changed_files.is_some() {
                 let event_name = event.clone().unwrap_or_else(|| "push".to_string());
                 let files = if let Some(files) = changed_files {
                     files.clone()
@@ -507,16 +507,38 @@ async fn main() {
                     ));
                 }
 
-                Some(wrkflw_trigger_filter::EventContext {
+                let event_context = wrkflw_trigger_filter::EventContext {
                     event_name,
                     branch,
                     tag,
                     changed_files: files,
                     activity_type: None,
-                })
-            } else {
-                None
-            };
+                };
+
+                // Parse workflow and evaluate trigger before executing
+                let workflow = wrkflw_parser::workflow::parse_workflow(path).unwrap_or_else(|e| {
+                    eprintln!("Error parsing workflow: {}", e);
+                    std::process::exit(1);
+                });
+                let trigger_config =
+                    wrkflw_trigger_filter::parse_trigger_config(&workflow, path.to_path_buf())
+                        .unwrap_or_else(|e| {
+                            eprintln!("Error parsing trigger config: {}", e);
+                            std::process::exit(1);
+                        });
+                let match_result =
+                    wrkflw_trigger_filter::evaluate_trigger(&trigger_config, &event_context);
+
+                if !match_result.matches {
+                    use wrkflw_ui::cli_style;
+                    println!(
+                        "{}",
+                        cli_style::dim(&format!("Workflow skipped: {}", match_result.reason))
+                    );
+                    std::process::exit(0);
+                }
+                wrkflw_logging::info(&format!("Trigger matched: {}", match_result.reason));
+            }
 
             // Create execution configuration
             let config = wrkflw_executor::ExecutionConfig {
@@ -526,7 +548,6 @@ async fn main() {
                 secrets_config: None, // Use default secrets configuration
                 show_action_messages: *show_action_messages,
                 target_job: job.clone(),
-                event_filter,
             };
 
             // Check if we're explicitly or implicitly running a GitLab pipeline
@@ -676,7 +697,6 @@ async fn main() {
                 secrets_config: None,
                 show_action_messages: *show_action_messages,
                 target_job: None,
-                event_filter: None,
             };
 
             use wrkflw_ui::cli_style;

@@ -48,7 +48,6 @@ jobs:
         verbose: false,
         preserve_containers_on_failure: false,
         target_job: None,
-        event_filter: None,
     };
 
     let result = execute_workflow(&caller_path, cfg)
@@ -107,7 +106,6 @@ jobs:
         verbose: false,
         preserve_containers_on_failure: false,
         target_job: None,
-        event_filter: None,
     };
 
     let result = execute_workflow(&caller_path, cfg)

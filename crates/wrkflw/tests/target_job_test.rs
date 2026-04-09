@@ -41,7 +41,6 @@ jobs:
         secrets_config: None,
         show_action_messages: false,
         target_job: Some("test".to_string()),
-        event_filter: None,
     };
 
     let result = execute_workflow(&workflow_path, cfg)
@@ -83,7 +82,6 @@ jobs:
         secrets_config: None,
         show_action_messages: false,
         target_job: Some("nonexistent".to_string()),
-        event_filter: None,
     };
 
     let result = execute_workflow(&workflow_path, cfg).await;
@@ -132,7 +130,6 @@ jobs:
         secrets_config: None,
         show_action_messages: false,
         target_job: Some("lint".to_string()),
-        event_filter: None,
     };
 
     let result = execute_workflow(&workflow_path, cfg)

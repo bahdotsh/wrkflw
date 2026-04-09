@@ -3582,7 +3582,6 @@ dependencies = [
  "wrkflw-parser",
  "wrkflw-runtime",
  "wrkflw-secrets",
- "wrkflw-trigger-filter",
  "wrkflw-utils",
 ]
 

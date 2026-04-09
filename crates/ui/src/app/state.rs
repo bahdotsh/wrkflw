@@ -2,11 +2,12 @@
 use crate::log_processor::{LogProcessingRequest, LogProcessor, ProcessedLogEntry};
 use crate::models::{
     ExecutionResultMsg, JobExecution, LogFilterLevel, QueuedExecution, StatusSeverity,
-    StepExecution, Workflow, WorkflowExecution, WorkflowStatus,
+    StepExecution, TriggerMatchStatus, Workflow, WorkflowExecution, WorkflowStatus,
 };
 use chrono::Local;
 use crossterm::event::KeyCode;
 use ratatui::widgets::{ListState, TableState};
+use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use wrkflw_executor::{JobStatus, RuntimeType, StepStatus};
@@ -65,6 +66,7 @@ pub struct App {
 
     // Diff-aware trigger filtering
     pub diff_filter_active: bool,
+    pub diff_filter_rx: Option<mpsc::Receiver<Vec<Option<TriggerMatchStatus>>>>,
 }
 
 impl App {
@@ -249,6 +251,7 @@ impl App {
             last_availability_check: Instant::now(),
 
             diff_filter_active: false,
+            diff_filter_rx: None,
         }
     }
 
@@ -281,93 +284,64 @@ impl App {
 
     /// Toggle diff-aware trigger filtering and evaluate all workflows.
     /// Git commands and workflow parsing run on a background thread to avoid blocking the TUI.
+    /// Results are received via `check_diff_filter_results()` on the next tick.
     pub fn toggle_diff_filter(&mut self) {
-        use crate::models::TriggerMatchStatus;
         self.diff_filter_active = !self.diff_filter_active;
 
         if self.diff_filter_active {
             self.logs
                 .push("Diff filter: evaluating triggers...".to_string());
 
-            // Collect workflow paths for the background thread
-            let workflow_paths: Vec<_> = self.workflows.iter().map(|w| w.path.clone()).collect();
+            let workflow_paths: Vec<PathBuf> =
+                self.workflows.iter().map(|w| w.path.clone()).collect();
 
-            // Run git + trigger evaluation on a background thread
-            let results: Vec<Option<TriggerMatchStatus>> = std::thread::spawn(move || {
-                let branch = std::process::Command::new("git")
-                    .args(["rev-parse", "--abbrev-ref", "HEAD"])
-                    .output()
-                    .ok()
-                    .filter(|o| o.status.success())
-                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+            let (tx, rx) = mpsc::channel();
+            self.diff_filter_rx = Some(rx);
 
-                let changed_files: Vec<String> = std::process::Command::new("git")
-                    .args(["diff", "--name-only", "HEAD"])
-                    .output()
-                    .ok()
-                    .filter(|o| o.status.success())
-                    .map(|o| {
-                        String::from_utf8_lossy(&o.stdout)
-                            .lines()
-                            .map(|l| l.trim().to_string())
-                            .filter(|l| !l.is_empty())
-                            .collect()
-                    })
-                    .unwrap_or_default();
-
-                let context = wrkflw_trigger_filter::EventContext {
-                    event_name: "push".to_string(),
-                    branch,
-                    tag: None,
-                    changed_files,
-                    activity_type: None,
-                };
-
-                workflow_paths
-                    .iter()
-                    .map(|path| {
-                        let wf = match wrkflw_parser::workflow::parse_workflow(path) {
-                            Ok(wf) => wf,
-                            Err(_) => return None,
-                        };
-                        let config =
-                            match wrkflw_trigger_filter::parse_trigger_config(&wf, path.clone()) {
-                                Ok(c) => c,
-                                Err(_) => return None,
-                            };
-                        let result = wrkflw_trigger_filter::evaluate_trigger(&config, &context);
-                        Some(if result.matches {
-                            TriggerMatchStatus::Matched(result.reason)
-                        } else {
-                            TriggerMatchStatus::Skipped(result.reason)
-                        })
-                    })
-                    .collect()
-            })
-            .join()
-            .unwrap_or_default();
-
-            // Apply results back to workflows
-            for (workflow, result) in self.workflows.iter_mut().zip(results.into_iter()) {
-                workflow.trigger_match = result;
-            }
-
-            let matched = self
-                .workflows
-                .iter()
-                .filter(|w| matches!(&w.trigger_match, Some(TriggerMatchStatus::Matched(_))))
-                .count();
-            self.logs.push(format!(
-                "Diff filter ON: {}/{} workflows would trigger",
-                matched,
-                self.workflows.len()
-            ));
+            std::thread::spawn(move || {
+                let results = evaluate_diff_filter(workflow_paths);
+                let _ = tx.send(results);
+            });
         } else {
+            self.diff_filter_rx = None;
             for workflow in &mut self.workflows {
                 workflow.trigger_match = None;
             }
             self.logs.push("Diff filter OFF".to_string());
         }
+    }
+
+    /// Check for completed diff filter results from the background thread.
+    /// Called on each TUI tick to apply results without blocking.
+    pub fn check_diff_filter_results(&mut self) {
+        let results = match self.diff_filter_rx.as_ref() {
+            Some(rx) => match rx.try_recv() {
+                Ok(results) => results,
+                Err(mpsc::TryRecvError::Empty) => return,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.diff_filter_rx = None;
+                    self.logs.push("Diff filter: evaluation failed".to_string());
+                    return;
+                }
+            },
+            None => return,
+        };
+        self.diff_filter_rx = None;
+
+        for (workflow, result) in self.workflows.iter_mut().zip(results.into_iter()) {
+            workflow.trigger_match = result;
+        }
+
+        let matched = self
+            .workflows
+            .iter()
+            .filter(|w| matches!(&w.trigger_match, Some(TriggerMatchStatus::Matched(_))))
+            .count();
+        self.logs.push(format!(
+            "Diff filter ON: {}/{} workflows would trigger",
+            matched,
+            self.workflows.len()
+        ));
     }
 
     pub fn toggle_validation_mode(&mut self) {
@@ -1299,6 +1273,58 @@ impl App {
         let formatted_message = format!("[{}] {}", timestamp, message);
         self.add_log(formatted_message);
     }
+}
+
+/// Run git + trigger evaluation synchronously (intended for background threads).
+fn evaluate_diff_filter(workflow_paths: Vec<PathBuf>) -> Vec<Option<TriggerMatchStatus>> {
+    let branch = std::process::Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+
+    let changed_files: Vec<String> = std::process::Command::new("git")
+        .args(["diff", "--name-only", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .map(|l| l.trim().to_string())
+                .filter(|l| !l.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let context = wrkflw_trigger_filter::EventContext {
+        event_name: "push".to_string(),
+        branch,
+        tag: None,
+        changed_files,
+        activity_type: None,
+    };
+
+    workflow_paths
+        .iter()
+        .map(|path| {
+            let wf = match wrkflw_parser::workflow::parse_workflow(path) {
+                Ok(wf) => wf,
+                Err(_) => return None,
+            };
+            let config = match wrkflw_trigger_filter::parse_trigger_config(&wf, path.clone()) {
+                Ok(c) => c,
+                Err(_) => return None,
+            };
+            let result = wrkflw_trigger_filter::evaluate_trigger(&config, &context);
+            Some(if result.matches {
+                TriggerMatchStatus::Matched(result.reason)
+            } else {
+                TriggerMatchStatus::Skipped(result.reason)
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]

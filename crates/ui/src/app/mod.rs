@@ -181,6 +181,9 @@ fn run_tui_event_loop(
                 app.request_log_processing_update();
             }
 
+            // Check for completed diff filter results
+            app.check_diff_filter_results();
+
             last_tick = Instant::now();
         }
 

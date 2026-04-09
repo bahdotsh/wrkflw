@@ -14,10 +14,10 @@ fn parse_lines(output: &[u8]) -> Vec<String> {
 }
 
 fn collect_changed_files_from_outputs(
-    diff_stdout: &[u8],
+    diff_files: &[String],
     untracked_stdout: Option<&[u8]>,
 ) -> Vec<String> {
-    let mut files = parse_lines(diff_stdout);
+    let mut files = diff_files.to_vec();
 
     if let Some(untracked) = untracked_stdout {
         let seen: std::collections::HashSet<String> = files.iter().cloned().collect();
@@ -39,18 +39,24 @@ fn collect_changed_files_from_outputs(
 /// Get changed files between the working tree and a base ref.
 ///
 /// Combines (in parallel):
-/// - `git diff --name-only <base>` (staged + unstaged changes vs base)
+/// - `git diff --name-only <base>` (unstaged changes vs base)
+/// - `git diff --cached --name-only <base>` (staged changes vs base)
 /// - `git ls-files --others --exclude-standard` (untracked files)
 pub async fn get_changed_files(base: &str) -> Result<Vec<String>, TriggerFilterError> {
     let diff_fut = Command::new("git")
         .args(["diff", "--name-only", base])
         .output();
 
+    let cached_fut = Command::new("git")
+        .args(["diff", "--cached", "--name-only", base])
+        .output();
+
     let untracked_fut = Command::new("git")
         .args(["ls-files", "--others", "--exclude-standard"])
         .output();
 
-    let (diff_result, untracked_result) = tokio::join!(diff_fut, untracked_fut);
+    let (diff_result, cached_result, untracked_result) =
+        tokio::join!(diff_fut, cached_fut, untracked_fut);
 
     let diff_output = diff_result
         .map_err(|e| TriggerFilterError::GitError(format!("Failed to run git diff: {}", e)))?;
@@ -63,6 +69,21 @@ pub async fn get_changed_files(base: &str) -> Result<Vec<String>, TriggerFilterE
         )));
     }
 
+    let cached_output = cached_result.map_err(|e| {
+        TriggerFilterError::GitError(format!("Failed to run git diff --cached: {}", e))
+    })?;
+
+    // Merge unstaged and staged diffs
+    let mut files = parse_lines(&diff_output.stdout);
+    if cached_output.status.success() {
+        let seen: std::collections::HashSet<String> = files.iter().cloned().collect();
+        for line in parse_lines(&cached_output.stdout) {
+            if !seen.contains(&line) {
+                files.push(line);
+            }
+        }
+    }
+
     let untracked_output = untracked_result
         .map_err(|e| TriggerFilterError::GitError(format!("Failed to run git ls-files: {}", e)))?;
 
@@ -72,10 +93,7 @@ pub async fn get_changed_files(base: &str) -> Result<Vec<String>, TriggerFilterE
         None
     };
 
-    Ok(collect_changed_files_from_outputs(
-        &diff_output.stdout,
-        untracked,
-    ))
+    Ok(collect_changed_files_from_outputs(&files, untracked))
 }
 
 /// Get changed files between two refs.
@@ -126,8 +144,9 @@ pub async fn get_current_branch() -> Result<String, TriggerFilterError> {
 ///
 /// Strategy:
 /// 1. If there are uncommitted changes (vs HEAD), use "HEAD".
-/// 2. Otherwise try the merge-base with `main`, then `master`.
-/// 3. Falls back to "HEAD~1" if no merge-base is found.
+/// 2. Detect the remote default branch via `git symbolic-ref refs/remotes/origin/HEAD`.
+/// 3. Fall back to trying `main`, then `master`.
+/// 4. Falls back to "HEAD~1" if no merge-base is found.
 pub async fn get_default_diff_base() -> String {
     // Check for uncommitted changes first
     if let Ok(output) = Command::new("git")
@@ -141,8 +160,38 @@ pub async fn get_default_diff_base() -> String {
         }
     }
 
-    // No uncommitted changes — try merge-base with main/master
-    for base_branch in &["main", "master"] {
+    // Build candidate list: detected default branch first, then common fallbacks
+    let mut candidates: Vec<String> = Vec::new();
+
+    // Try to detect the remote default branch
+    if let Ok(output) = Command::new("git")
+        .args(["symbolic-ref", "refs/remotes/origin/HEAD", "--short"])
+        .output()
+        .await
+    {
+        if output.status.success() {
+            let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            // symbolic-ref returns e.g. "origin/main" — strip the remote prefix
+            let short = branch
+                .strip_prefix("origin/")
+                .unwrap_or(&branch)
+                .to_string();
+            if !short.is_empty() {
+                candidates.push(short);
+            }
+        }
+    }
+
+    // Common fallbacks in case symbolic-ref is unavailable
+    for fallback in &["main", "master"] {
+        let s = fallback.to_string();
+        if !candidates.contains(&s) {
+            candidates.push(s);
+        }
+    }
+
+    // Try merge-base with each candidate
+    for base_branch in &candidates {
         if let Ok(output) = Command::new("git")
             .args(["merge-base", "HEAD", base_branch])
             .output()

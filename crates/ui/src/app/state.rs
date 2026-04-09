@@ -1275,15 +1275,29 @@ impl App {
     }
 }
 
-/// Run git + trigger evaluation synchronously (intended for background threads).
-/// Uses the sync wrappers from trigger-filter::git so logic stays in one place.
+/// Run git + trigger evaluation on a background thread.
+/// Spins up a short-lived tokio runtime so we can reuse the async git helpers
+/// without maintaining duplicate sync wrappers.
 fn evaluate_diff_filter(workflow_paths: Vec<PathBuf>) -> Vec<Option<TriggerMatchStatus>> {
-    let branch = wrkflw_trigger_filter::git::get_current_branch_sync().ok();
-    let tag = wrkflw_trigger_filter::git::get_current_tag_sync()
-        .ok()
-        .flatten();
-    let changed_files = wrkflw_trigger_filter::git::get_changed_files_sync("HEAD")
-        .unwrap_or_default();
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(_) => return vec![None; workflow_paths.len()],
+    };
+
+    let (branch, tag, changed_files) = rt.block_on(async {
+        let branch = wrkflw_trigger_filter::git::get_current_branch().await.ok();
+        let tag = wrkflw_trigger_filter::git::get_current_tag()
+            .await
+            .ok()
+            .flatten();
+        let changed_files = wrkflw_trigger_filter::git::get_changed_files("HEAD")
+            .await
+            .unwrap_or_default();
+        (branch, tag, changed_files)
+    });
 
     let context = wrkflw_trigger_filter::EventContext {
         event_name: "push".to_string(),

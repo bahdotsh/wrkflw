@@ -1,5 +1,4 @@
 use crate::error::TriggerFilterError;
-use std::process::Command as StdCommand;
 use tokio::process::Command;
 
 // ---------------------------------------------------------------------------
@@ -39,14 +38,21 @@ fn collect_changed_files_from_outputs(
 
 /// Get changed files between the working tree and a base ref.
 ///
-/// Combines:
+/// Combines (in parallel):
 /// - `git diff --name-only <base>` (staged + unstaged changes vs base)
 /// - `git ls-files --others --exclude-standard` (untracked files)
 pub async fn get_changed_files(base: &str) -> Result<Vec<String>, TriggerFilterError> {
-    let diff_output = Command::new("git")
+    let diff_fut = Command::new("git")
         .args(["diff", "--name-only", base])
-        .output()
-        .await
+        .output();
+
+    let untracked_fut = Command::new("git")
+        .args(["ls-files", "--others", "--exclude-standard"])
+        .output();
+
+    let (diff_result, untracked_result) = tokio::join!(diff_fut, untracked_fut);
+
+    let diff_output = diff_result
         .map_err(|e| TriggerFilterError::GitError(format!("Failed to run git diff: {}", e)))?;
 
     if !diff_output.status.success() {
@@ -57,10 +63,7 @@ pub async fn get_changed_files(base: &str) -> Result<Vec<String>, TriggerFilterE
         )));
     }
 
-    let untracked_output = Command::new("git")
-        .args(["ls-files", "--others", "--exclude-standard"])
-        .output()
-        .await
+    let untracked_output = untracked_result
         .map_err(|e| TriggerFilterError::GitError(format!("Failed to run git ls-files: {}", e)))?;
 
     let untracked = if untracked_output.status.success() {
@@ -140,77 +143,3 @@ pub async fn get_current_tag() -> Result<Option<String>, TriggerFilterError> {
     }
 }
 
-// ===========================================================================
-// Synchronous API — for use in blocking contexts (e.g. background threads)
-// ===========================================================================
-
-/// Synchronous version of [`get_changed_files`].
-pub fn get_changed_files_sync(base: &str) -> Result<Vec<String>, TriggerFilterError> {
-    let diff_output = StdCommand::new("git")
-        .args(["diff", "--name-only", base])
-        .output()
-        .map_err(|e| TriggerFilterError::GitError(format!("Failed to run git diff: {}", e)))?;
-
-    if !diff_output.status.success() {
-        let stderr = String::from_utf8_lossy(&diff_output.stderr);
-        return Err(TriggerFilterError::GitError(format!(
-            "git diff failed: {}",
-            stderr.trim()
-        )));
-    }
-
-    let untracked_output = StdCommand::new("git")
-        .args(["ls-files", "--others", "--exclude-standard"])
-        .output()
-        .map_err(|e| TriggerFilterError::GitError(format!("Failed to run git ls-files: {}", e)))?;
-
-    let untracked = if untracked_output.status.success() {
-        Some(untracked_output.stdout.as_slice())
-    } else {
-        None
-    };
-
-    Ok(collect_changed_files_from_outputs(
-        &diff_output.stdout,
-        untracked,
-    ))
-}
-
-/// Synchronous version of [`get_current_branch`].
-pub fn get_current_branch_sync() -> Result<String, TriggerFilterError> {
-    let output = StdCommand::new("git")
-        .args(["rev-parse", "--abbrev-ref", "HEAD"])
-        .output()
-        .map_err(|e| {
-            TriggerFilterError::GitError(format!("Failed to get current branch: {}", e))
-        })?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(TriggerFilterError::GitError(format!(
-            "git rev-parse failed: {}",
-            stderr.trim()
-        )));
-    }
-
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-}
-
-/// Synchronous version of [`get_current_tag`].
-pub fn get_current_tag_sync() -> Result<Option<String>, TriggerFilterError> {
-    let output = StdCommand::new("git")
-        .args(["describe", "--tags", "--exact-match", "HEAD"])
-        .output()
-        .map_err(|e| TriggerFilterError::GitError(format!("Failed to check tags: {}", e)))?;
-
-    if output.status.success() {
-        let tag = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if tag.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(tag))
-        }
-    } else {
-        Ok(None)
-    }
-}

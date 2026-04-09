@@ -117,7 +117,7 @@ impl LogFilterLevel {
         }
     }
 
-    pub fn to_string(&self) -> &str {
+    pub fn as_str(&self) -> &str {
         match self {
             LogFilterLevel::All => "ALL",
             LogFilterLevel::Info => "INFO",

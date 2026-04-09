@@ -35,7 +35,7 @@ pub fn render_logs_tab(f: &mut Frame<'_>, app: &App, area: Rect) {
         };
 
         let filter_text = match &app.log_filter_level {
-            Some(level) => format!("Filter: {}", level.to_string()),
+            Some(level) => format!("Filter: {}", level.as_str()),
             None => "No filter".to_string(),
         };
 

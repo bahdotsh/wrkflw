@@ -1,11 +1,15 @@
 use crate::debouncer::Debouncer;
 use crate::error::WatchError;
+use futures::stream::{self, StreamExt};
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use wrkflw_executor::ExecutionConfig;
+
+/// Maximum number of workflows that execute concurrently in watch mode.
+const MAX_CONCURRENT_EXECUTIONS: usize = 4;
 
 /// A watch event containing the changed files and trigger evaluation results.
 #[derive(Debug, Clone)]
@@ -14,6 +18,24 @@ pub struct WatchEvent {
     pub triggered_workflows: Vec<String>,
     pub skipped_workflows: Vec<String>,
 }
+
+/// Directories ignored by the filesystem watcher by default.
+/// These are high-churn directories that almost never contain workflow-relevant
+/// source files and would otherwise flood the event channel.
+const DEFAULT_IGNORE_DIRS: &[&str] = &[
+    ".git",
+    "target",
+    "node_modules",
+    ".build",
+    "build",
+    "dist",
+    "__pycache__",
+    ".tox",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".venv",
+    "venv",
+];
 
 /// Watches for filesystem changes and triggers workflow execution.
 pub struct WorkflowWatcher {
@@ -68,9 +90,10 @@ impl WorkflowWatcher {
         Ok(files)
     }
 
-    /// Start the watch loop. Calls `on_event` for each coalesced change set.
+    /// Start the watch loop. Calls `on_cycle_complete` after each
+    /// debounced change set has been evaluated and executed.
     /// This blocks until an error occurs or the process is interrupted.
-    pub async fn run<F>(&self, on_event: F) -> Result<(), WatchError>
+    pub async fn run<F>(&self, on_cycle_complete: F) -> Result<(), WatchError>
     where
         F: Fn(WatchEvent) + Send + 'static,
     {
@@ -85,12 +108,13 @@ impl WorkflowWatcher {
             move |res: Result<Event, notify::Error>| {
                 if let Ok(event) = res {
                     for path in event.paths {
-                        // Skip .git directory
-                        let path_str = path.to_string_lossy();
-                        if path_str.contains("/.git/") || path_str.contains("\\.git\\") {
+                        if should_ignore_path(&path) {
                             continue;
                         }
-                        let _ = tx_clone.blocking_send(path);
+                        // Use try_send to avoid blocking the OS filesystem event
+                        // thread when the channel is full.  Dropping an event is
+                        // acceptable because the debouncer coalesces anyway.
+                        let _ = tx_clone.try_send(path);
                     }
                 }
             },
@@ -144,31 +168,61 @@ impl WorkflowWatcher {
                 continue;
             }
 
-            let branch = wrkflw_trigger_filter::git::get_current_branch().await.ok();
-            let tag = wrkflw_trigger_filter::git::get_current_tag()
-                .await
-                .ok()
-                .flatten();
+            let event = self
+                .evaluate_and_execute(&workflow_files, changed_files)
+                .await;
 
-            let context = wrkflw_trigger_filter::EventContext {
-                event_name: self.event_name.clone(),
-                branch,
-                tag,
-                changed_files: changed_files.clone(),
-                activity_type: None,
+            on_cycle_complete(event);
+        }
+    }
+
+    /// Evaluate triggers for all workflow files against the current git state,
+    /// then execute the matching workflows with bounded concurrency.
+    async fn evaluate_and_execute(
+        &self,
+        workflow_files: &[PathBuf],
+        changed_files: Vec<String>,
+    ) -> WatchEvent {
+        let branch = wrkflw_trigger_filter::git::get_current_branch().await.ok();
+        let tag = wrkflw_trigger_filter::git::get_current_tag()
+            .await
+            .ok()
+            .flatten();
+
+        let context = wrkflw_trigger_filter::EventContext {
+            event_name: self.event_name.clone(),
+            branch,
+            tag,
+            changed_files: changed_files.clone(),
+            activity_type: None,
+        };
+
+        let mut triggered = Vec::new();
+        let mut skipped = Vec::new();
+        let mut exec_futures = Vec::new();
+
+        for wf_path in workflow_files {
+            let workflow = match wrkflw_parser::workflow::parse_workflow(wf_path) {
+                Ok(w) => w,
+                Err(e) => {
+                    if self.verbose {
+                        wrkflw_logging::warning(&format!(
+                            "Failed to parse {}: {}",
+                            wf_path.display(),
+                            e
+                        ));
+                    }
+                    continue;
+                }
             };
 
-            let mut triggered = Vec::new();
-            let mut skipped = Vec::new();
-            let mut exec_futures = Vec::new();
-
-            for wf_path in &workflow_files {
-                let workflow = match wrkflw_parser::workflow::parse_workflow(wf_path) {
-                    Ok(w) => w,
+            let trigger_config =
+                match wrkflw_trigger_filter::parse_trigger_config(&workflow, wf_path.clone()) {
+                    Ok(c) => c,
                     Err(e) => {
                         if self.verbose {
                             wrkflw_logging::warning(&format!(
-                                "Failed to parse {}: {}",
+                                "Failed to parse triggers for {}: {}",
                                 wf_path.display(),
                                 e
                             ));
@@ -177,66 +231,67 @@ impl WorkflowWatcher {
                     }
                 };
 
-                let trigger_config =
-                    match wrkflw_trigger_filter::parse_trigger_config(&workflow, wf_path.clone()) {
-                        Ok(c) => c,
-                        Err(e) => {
-                            if self.verbose {
-                                wrkflw_logging::warning(&format!(
-                                    "Failed to parse triggers for {}: {}",
-                                    wf_path.display(),
-                                    e
-                                ));
-                            }
-                            continue;
-                        }
-                    };
+            let result = wrkflw_trigger_filter::evaluate_trigger(&trigger_config, &context);
 
-                let result = wrkflw_trigger_filter::evaluate_trigger(&trigger_config, &context);
+            if result.matches {
+                triggered.push(wf_path.display().to_string());
 
-                if result.matches {
-                    triggered.push(wf_path.display().to_string());
-
-                    let config = self.config_template.clone();
-                    exec_futures.push(async move {
-                        match wrkflw_executor::execute_workflow(wf_path, config).await {
-                            Ok(exec_result) => {
-                                if exec_result.failure_details.is_some() {
-                                    wrkflw_logging::error(&format!(
-                                        "Workflow {} failed",
-                                        wf_path.display()
-                                    ));
-                                } else {
-                                    wrkflw_logging::info(&format!(
-                                        "Workflow {} succeeded",
-                                        wf_path.display()
-                                    ));
-                                }
-                            }
-                            Err(e) => {
+                let config = self.config_template.clone();
+                exec_futures.push(async move {
+                    match wrkflw_executor::execute_workflow(wf_path, config).await {
+                        Ok(exec_result) => {
+                            if exec_result.failure_details.is_some() {
                                 wrkflw_logging::error(&format!(
-                                    "Workflow {} error: {}",
-                                    wf_path.display(),
-                                    e
+                                    "Workflow {} failed",
+                                    wf_path.display()
+                                ));
+                            } else {
+                                wrkflw_logging::info(&format!(
+                                    "Workflow {} succeeded",
+                                    wf_path.display()
                                 ));
                             }
                         }
-                    });
-                } else {
-                    skipped.push(wf_path.display().to_string());
-                }
+                        Err(e) => {
+                            wrkflw_logging::error(&format!(
+                                "Workflow {} error: {}",
+                                wf_path.display(),
+                                e
+                            ));
+                        }
+                    }
+                });
+            } else {
+                skipped.push(wf_path.display().to_string());
             }
+        }
 
-            // Execute all triggered workflows concurrently
-            futures::future::join_all(exec_futures).await;
+        // Execute triggered workflows with bounded concurrency
+        stream::iter(exec_futures)
+            .buffer_unordered(MAX_CONCURRENT_EXECUTIONS)
+            .collect::<Vec<()>>()
+            .await;
 
-            on_event(WatchEvent {
-                changed_files,
-                triggered_workflows: triggered,
-                skipped_workflows: skipped,
-            });
+        WatchEvent {
+            changed_files,
+            triggered_workflows: triggered,
+            skipped_workflows: skipped,
         }
     }
+}
+
+/// Returns `true` if a path falls inside any of the default ignore directories.
+fn should_ignore_path(path: &std::path::Path) -> bool {
+    for component in path.components() {
+        if let std::path::Component::Normal(os) = component {
+            if let Some(s) = os.to_str() {
+                if DEFAULT_IGNORE_DIRS.contains(&s) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Find the git repository root from the current working directory.

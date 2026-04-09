@@ -103,25 +103,25 @@ pub fn evaluate_trigger(
                         "branch '{}' did not match {:?}",
                         branch, f.branches
                     )),
-                    None => parts.push("no branch in context (branch filter requires one)".to_string()),
+                    None => {
+                        parts.push("no branch in context (branch filter requires one)".to_string())
+                    }
                 }
             }
             if !f.tags.is_empty() || !f.tags_ignore.is_empty() {
                 match &context.tag {
-                    Some(tag) => parts.push(format!(
-                        "tag '{}' did not match {:?}",
-                        tag, f.tags
-                    )),
+                    Some(tag) => parts.push(format!("tag '{}' did not match {:?}", tag, f.tags)),
                     None => parts.push("no tag in context (tag filter requires one)".to_string()),
                 }
             }
             if !f.types.is_empty() {
                 match &context.activity_type {
-                    Some(activity) => parts.push(format!(
-                        "activity '{}' not in {:?}",
-                        activity, f.types
-                    )),
-                    None => parts.push("no activity type in context (types filter requires one)".to_string()),
+                    Some(activity) => {
+                        parts.push(format!("activity '{}' not in {:?}", activity, f.types))
+                    }
+                    None => parts.push(
+                        "no activity type in context (types filter requires one)".to_string(),
+                    ),
                 }
             }
             if !f.paths.is_empty() {

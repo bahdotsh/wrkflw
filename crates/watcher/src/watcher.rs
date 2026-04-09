@@ -197,48 +197,40 @@ impl WorkflowWatcher {
             activity_type: None,
         };
 
-        let mut triggered = Vec::new();
-        let mut skipped = Vec::new();
-        let mut exec_futures = Vec::new();
-
-        for wf_path in workflow_files {
-            let workflow = match wrkflw_parser::workflow::parse_workflow(wf_path) {
-                Ok(w) => w,
-                Err(e) => {
-                    if self.verbose {
-                        wrkflw_logging::warning(&format!(
-                            "Failed to parse {}: {}",
-                            wf_path.display(),
-                            e
-                        ));
-                    }
-                    continue;
-                }
-            };
-
-            let trigger_config =
-                match wrkflw_trigger_filter::parse_trigger_config(&workflow, wf_path.clone()) {
-                    Ok(c) => c,
+        // Parse all workflow files, logging failures
+        let workflows: Vec<_> = workflow_files
+            .iter()
+            .filter_map(
+                |wf_path| match wrkflw_parser::workflow::parse_workflow(wf_path) {
+                    Ok(wf) => Some((wf_path.clone(), wf)),
                     Err(e) => {
                         if self.verbose {
                             wrkflw_logging::warning(&format!(
-                                "Failed to parse triggers for {}: {}",
+                                "Failed to parse {}: {}",
                                 wf_path.display(),
                                 e
                             ));
                         }
-                        continue;
+                        None
                     }
-                };
+                },
+            )
+            .collect();
 
-            let result = wrkflw_trigger_filter::evaluate_trigger(&trigger_config, &context);
+        let results = wrkflw_trigger_filter::filter_workflows(&workflows, &context);
 
+        let mut triggered = Vec::new();
+        let mut skipped = Vec::new();
+        let mut exec_futures = Vec::new();
+
+        for result in &results {
             if result.matches {
-                triggered.push(wf_path.display().to_string());
+                triggered.push(result.workflow_path.display().to_string());
 
                 let config = self.config_template.clone();
+                let wf_path = result.workflow_path.clone();
                 exec_futures.push(async move {
-                    match wrkflw_executor::execute_workflow(wf_path, config).await {
+                    match wrkflw_executor::execute_workflow(&wf_path, config).await {
                         Ok(exec_result) => {
                             if exec_result.failure_details.is_some() {
                                 wrkflw_logging::error(&format!(
@@ -262,7 +254,7 @@ impl WorkflowWatcher {
                     }
                 });
             } else {
-                skipped.push(wf_path.display().to_string());
+                skipped.push(result.workflow_path.display().to_string());
             }
         }
 

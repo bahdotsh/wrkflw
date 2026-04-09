@@ -122,6 +122,44 @@ pub async fn get_current_branch() -> Result<String, TriggerFilterError> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// Determine a sensible diff base for trigger evaluation.
+///
+/// Strategy:
+/// 1. If there are uncommitted changes (vs HEAD), use "HEAD".
+/// 2. Otherwise try the merge-base with `main`, then `master`.
+/// 3. Falls back to "HEAD~1" if no merge-base is found.
+pub async fn get_default_diff_base() -> String {
+    // Check for uncommitted changes first
+    if let Ok(output) = Command::new("git")
+        .args(["status", "--porcelain"])
+        .output()
+        .await
+    {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if !stdout.trim().is_empty() {
+            return "HEAD".to_string();
+        }
+    }
+
+    // No uncommitted changes — try merge-base with main/master
+    for base_branch in &["main", "master"] {
+        if let Ok(output) = Command::new("git")
+            .args(["merge-base", "HEAD", base_branch])
+            .output()
+            .await
+        {
+            if output.status.success() {
+                let mb = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if !mb.is_empty() {
+                    return mb;
+                }
+            }
+        }
+    }
+
+    "HEAD~1".to_string()
+}
+
 /// Get the current tag if HEAD is tagged, or None.
 pub async fn get_current_tag() -> Result<Option<String>, TriggerFilterError> {
     let output = Command::new("git")
@@ -142,4 +180,3 @@ pub async fn get_current_tag() -> Result<Option<String>, TriggerFilterError> {
         Ok(None)
     }
 }
-

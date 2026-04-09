@@ -1287,43 +1287,40 @@ fn evaluate_diff_filter(workflow_paths: Vec<PathBuf>) -> Vec<Option<TriggerMatch
         Err(_) => return vec![None; workflow_paths.len()],
     };
 
-    let (branch, tag, changed_files) = rt.block_on(async {
-        let branch = wrkflw_trigger_filter::git::get_current_branch().await.ok();
-        let tag = wrkflw_trigger_filter::git::get_current_tag()
-            .await
-            .ok()
-            .flatten();
-        let changed_files = wrkflw_trigger_filter::git::get_changed_files("HEAD")
-            .await
-            .unwrap_or_default();
-        (branch, tag, changed_files)
-    });
-
-    let context = wrkflw_trigger_filter::EventContext {
-        event_name: "push".to_string(),
-        branch,
-        tag,
-        changed_files,
-        activity_type: None,
+    let context = match rt.block_on(async {
+        let diff_base = wrkflw_trigger_filter::git::get_default_diff_base().await;
+        wrkflw_trigger_filter::auto_detect_context("push", &diff_base).await
+    }) {
+        Ok(ctx) => ctx,
+        Err(_) => return vec![None; workflow_paths.len()],
     };
 
+    // Parse workflows and use filter_workflows to evaluate
+    let workflows: Vec<_> = workflow_paths
+        .iter()
+        .filter_map(|path| {
+            wrkflw_parser::workflow::parse_workflow(path)
+                .ok()
+                .map(|wf| (path.clone(), wf))
+        })
+        .collect();
+
+    let results = wrkflw_trigger_filter::filter_workflows(&workflows, &context);
+
+    // Map back to original workflow_paths order (unparseable workflows get None)
     workflow_paths
         .iter()
         .map(|path| {
-            let wf = match wrkflw_parser::workflow::parse_workflow(path) {
-                Ok(wf) => wf,
-                Err(_) => return None,
-            };
-            let config = match wrkflw_trigger_filter::parse_trigger_config(&wf, path.clone()) {
-                Ok(c) => c,
-                Err(_) => return None,
-            };
-            let result = wrkflw_trigger_filter::evaluate_trigger(&config, &context);
-            Some(if result.matches {
-                TriggerMatchStatus::Matched(result.reason)
-            } else {
-                TriggerMatchStatus::Skipped(result.reason)
-            })
+            results
+                .iter()
+                .find(|r| r.workflow_path == *path)
+                .map(|result| {
+                    if result.matches {
+                        TriggerMatchStatus::Matched(result.reason.clone())
+                    } else {
+                        TriggerMatchStatus::Skipped(result.reason.clone())
+                    }
+                })
         })
         .collect()
 }

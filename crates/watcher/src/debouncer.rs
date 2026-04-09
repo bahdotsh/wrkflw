@@ -38,8 +38,14 @@ impl Debouncer {
     ///
     /// Sleeps for the debounce duration, but only continues waiting while new
     /// events keep arriving. Returns as soon as a full debounce interval passes
-    /// with no new events (or immediately if nothing is pending).
+    /// with no new events. A maximum of `MAX_SETTLE_ROUNDS` iterations prevents
+    /// livelock under sustained filesystem churn (e.g. large builds).
     pub async fn drain(&self) -> Vec<PathBuf> {
+        // Cap the number of settle rounds to prevent livelock when events
+        // arrive faster than the debounce window.
+        const MAX_SETTLE_ROUNDS: usize = 10;
+
+        let mut rounds = 0;
         loop {
             let count_before = {
                 let pending = self.lock_or_recover();
@@ -51,11 +57,12 @@ impl Debouncer {
             }
 
             tokio::time::sleep(self.duration).await;
+            rounds += 1;
 
             let mut pending = self.lock_or_recover();
-            // If no new events arrived during the sleep, drain and return.
-            // Otherwise loop to wait for the burst to settle.
-            if pending.len() == count_before {
+            // Drain if no new events arrived during the sleep, or if we've
+            // waited long enough to avoid starving the consumer.
+            if pending.len() == count_before || rounds >= MAX_SETTLE_ROUNDS {
                 return pending.drain().collect();
             }
         }

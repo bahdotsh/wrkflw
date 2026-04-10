@@ -1,11 +1,13 @@
 use crate::error::TriggerFilterError;
 use std::path::Path;
+use std::time::Duration;
 use tokio::process::Command;
 
-/// Git's empty-tree object SHA. Diffing against it shows every tracked file
-/// as added — used as a last-resort fallback for repositories where no other
-/// reasonable diff base can be detected (e.g. a fresh repo with one commit).
-const GIT_EMPTY_TREE_SHA: &str = "4b825dc642cb6eb9a060e54bf899d69f82e4f2d1";
+/// Hard upper bound on every git subprocess call. A git invocation that hasn't
+/// completed within this window is almost certainly stuck on a network
+/// filesystem, a hung credential prompt, or a corrupt repository — we'd rather
+/// surface a clear error than wedge the watch loop forever.
+const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Build a `git` command optionally rooted at a working directory via `-C`.
 fn git_cmd(cwd: Option<&Path>) -> Command {
@@ -52,6 +54,29 @@ pub fn validate_ref_name(name: &str) -> Result<(), TriggerFilterError> {
     Ok(())
 }
 
+/// Run a prepared `git` command with a hard timeout. Maps timeout and spawn
+/// failures into `TriggerFilterError::GitError` with a consistent message
+/// shape so callers don't have to.
+async fn run_git(
+    mut cmd: Command,
+    cmd_label: &str,
+) -> Result<std::process::Output, TriggerFilterError> {
+    let fut = cmd.output();
+    match tokio::time::timeout(GIT_COMMAND_TIMEOUT, fut).await {
+        Ok(Ok(output)) => Ok(output),
+        Ok(Err(e)) => Err(TriggerFilterError::GitError(format!(
+            "Failed to run {}: {}",
+            cmd_label, e
+        ))),
+        Err(_) => Err(TriggerFilterError::GitError(format!(
+            "{} timed out after {}s (git subprocess hung — check for network \
+             filesystems, credential prompts, or corrupt repository state)",
+            cmd_label,
+            GIT_COMMAND_TIMEOUT.as_secs()
+        ))),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Helpers operating on raw command output
 // ---------------------------------------------------------------------------
@@ -76,10 +101,10 @@ fn merge_unique(mut into: Vec<String>, more: Vec<String>) -> Vec<String> {
 
 /// Get changed files between the working tree and a base ref.
 ///
-/// When `base == "HEAD"`, we run two diffs (unstaged and staged) plus an
-/// untracked-files probe. For any other base, `git diff <base>` already
-/// covers staged + unstaged + committed-on-branch changes, so the `--cached`
-/// pass is redundant and we omit it.
+/// `git diff <base>` already covers staged + unstaged + committed-on-branch
+/// changes (the index is compared transitively through the working tree), so
+/// one `git diff` plus an untracked-files probe is enough — no separate
+/// `--cached` pass is needed.
 ///
 /// `cwd` selects the git working directory; pass `None` to use the
 /// process CWD. The watcher should always pass its repo root.
@@ -89,58 +114,34 @@ pub async fn get_changed_files(
 ) -> Result<Vec<String>, TriggerFilterError> {
     validate_ref_name(base)?;
 
-    let untracked_fut = git_cmd(cwd)
-        .args(["ls-files", "--others", "--exclude-standard"])
-        .output();
+    let mut diff_cmd = git_cmd(cwd);
+    diff_cmd.args(["diff", "--name-only", base]);
+    let mut untracked_cmd = git_cmd(cwd);
+    untracked_cmd.args(["ls-files", "--others", "--exclude-standard"]);
 
-    if base == "HEAD" {
-        let diff_fut = git_cmd(cwd).args(["diff", "--name-only", base]).output();
-        let cached_fut = git_cmd(cwd)
-            .args(["diff", "--cached", "--name-only", base])
-            .output();
+    let (diff_res, untracked_res) = tokio::join!(
+        run_git(diff_cmd, "git diff"),
+        run_git(untracked_cmd, "git ls-files"),
+    );
 
-        let (diff_result, cached_result, untracked_result) =
-            tokio::join!(diff_fut, cached_fut, untracked_fut);
+    let diff_output = check_status(diff_res?, "git diff")?;
+    let mut files = parse_lines(&diff_output.stdout);
 
-        let diff_output = check_status(diff_result, "git diff")?;
-        let mut files = parse_lines(&diff_output.stdout);
-
-        if let Ok(cached_output) = cached_result {
-            if cached_output.status.success() {
-                files = merge_unique(files, parse_lines(&cached_output.stdout));
-            }
+    // Untracked files are a best-effort enrichment; don't fail the whole
+    // call if `ls-files` errors (e.g. outside a repo).
+    if let Ok(untracked_output) = untracked_res {
+        if untracked_output.status.success() {
+            files = merge_unique(files, parse_lines(&untracked_output.stdout));
         }
-
-        if let Ok(untracked_output) = untracked_result {
-            if untracked_output.status.success() {
-                files = merge_unique(files, parse_lines(&untracked_output.stdout));
-            }
-        }
-
-        Ok(files)
-    } else {
-        let diff_fut = git_cmd(cwd).args(["diff", "--name-only", base]).output();
-        let (diff_result, untracked_result) = tokio::join!(diff_fut, untracked_fut);
-
-        let diff_output = check_status(diff_result, "git diff")?;
-        let mut files = parse_lines(&diff_output.stdout);
-
-        if let Ok(untracked_output) = untracked_result {
-            if untracked_output.status.success() {
-                files = merge_unique(files, parse_lines(&untracked_output.stdout));
-            }
-        }
-
-        Ok(files)
     }
+
+    Ok(files)
 }
 
 fn check_status(
-    result: Result<std::process::Output, std::io::Error>,
+    output: std::process::Output,
     cmd_label: &str,
 ) -> Result<std::process::Output, TriggerFilterError> {
-    let output = result
-        .map_err(|e| TriggerFilterError::GitError(format!("Failed to run {}: {}", cmd_label, e)))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(TriggerFilterError::GitError(format!(
@@ -162,21 +163,17 @@ pub async fn get_changed_files_between(
     validate_ref_name(head_ref)?;
 
     let range = format!("{}..{}", base_ref, head_ref);
-    let result = git_cmd(cwd)
-        .args(["diff", "--name-only", &range])
-        .output()
-        .await;
-    let output = check_status(result, "git diff")?;
+    let mut cmd = git_cmd(cwd);
+    cmd.args(["diff", "--name-only", &range]);
+    let output = check_status(run_git(cmd, "git diff").await?, "git diff")?;
     Ok(parse_lines(&output.stdout))
 }
 
 /// Get the current branch name.
 pub async fn get_current_branch(cwd: Option<&Path>) -> Result<String, TriggerFilterError> {
-    let result = git_cmd(cwd)
-        .args(["rev-parse", "--abbrev-ref", "HEAD"])
-        .output()
-        .await;
-    let output = check_status(result, "git rev-parse")?;
+    let mut cmd = git_cmd(cwd);
+    cmd.args(["rev-parse", "--abbrev-ref", "HEAD"]);
+    let output = check_status(run_git(cmd, "git rev-parse").await?, "git rev-parse")?;
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
@@ -187,14 +184,19 @@ pub async fn get_current_branch(cwd: Option<&Path>) -> Result<String, TriggerFil
 /// 2. Detect the remote default branch via `git symbolic-ref refs/remotes/origin/HEAD`.
 /// 3. Fall back to trying `main`, then `master`.
 /// 4. Otherwise try `HEAD~1`.
-/// 5. Last resort: the empty-tree SHA, which makes every tracked file appear
-///    as changed. A warning is logged because this is rarely what the user wants.
-pub async fn get_default_diff_base(cwd: Option<&Path>) -> String {
+///
+/// Returns an error if none of these succeed — previously this fell back to
+/// the empty-tree SHA, which silently made every tracked file appear as
+/// changed and defeated the purpose of the filter. Callers should surface
+/// the error so the user knows to pass `--diff-base` explicitly.
+pub async fn get_default_diff_base(cwd: Option<&Path>) -> Result<String, TriggerFilterError> {
     // Check for uncommitted changes first
-    if let Ok(output) = git_cmd(cwd).args(["status", "--porcelain"]).output().await {
+    let mut status_cmd = git_cmd(cwd);
+    status_cmd.args(["status", "--porcelain"]);
+    if let Ok(output) = run_git(status_cmd, "git status").await {
         let stdout = String::from_utf8_lossy(&output.stdout);
         if !stdout.trim().is_empty() {
-            return "HEAD".to_string();
+            return Ok("HEAD".to_string());
         }
     }
 
@@ -202,11 +204,9 @@ pub async fn get_default_diff_base(cwd: Option<&Path>) -> String {
     let mut candidates: Vec<String> = Vec::new();
 
     // Try to detect the remote default branch
-    if let Ok(output) = git_cmd(cwd)
-        .args(["symbolic-ref", "refs/remotes/origin/HEAD", "--short"])
-        .output()
-        .await
-    {
+    let mut sym_cmd = git_cmd(cwd);
+    sym_cmd.args(["symbolic-ref", "refs/remotes/origin/HEAD", "--short"]);
+    if let Ok(output) = run_git(sym_cmd, "git symbolic-ref").await {
         if output.status.success() {
             let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
             // symbolic-ref returns e.g. "origin/main" — strip the remote prefix
@@ -230,49 +230,40 @@ pub async fn get_default_diff_base(cwd: Option<&Path>) -> String {
 
     // Try merge-base with each candidate
     for base_branch in &candidates {
-        if let Ok(output) = git_cmd(cwd)
-            .args(["merge-base", "HEAD", base_branch])
-            .output()
-            .await
-        {
+        let mut mb_cmd = git_cmd(cwd);
+        mb_cmd.args(["merge-base", "HEAD", base_branch]);
+        if let Ok(output) = run_git(mb_cmd, "git merge-base").await {
             if output.status.success() {
                 let mb = String::from_utf8_lossy(&output.stdout).trim().to_string();
                 if !mb.is_empty() {
-                    return mb;
+                    return Ok(mb);
                 }
             }
         }
     }
 
     // Try HEAD~1, which works on any repo with at least two commits
-    if let Ok(output) = git_cmd(cwd)
-        .args(["rev-parse", "--verify", "HEAD~1"])
-        .output()
-        .await
-    {
+    let mut parent_cmd = git_cmd(cwd);
+    parent_cmd.args(["rev-parse", "--verify", "HEAD~1"]);
+    if let Ok(output) = run_git(parent_cmd, "git rev-parse").await {
         if output.status.success() {
-            return "HEAD~1".to_string();
+            return Ok("HEAD~1".to_string());
         }
     }
 
-    // Ultimate fallback: empty-tree SHA. This compares against an empty tree,
-    // so every tracked file appears as added. Warn loudly because that's
-    // almost certainly not what the user wants.
-    wrkflw_logging::warning(
-        "Could not detect a sensible diff base (no remote default, no HEAD~1). \
-         Falling back to the empty tree, which treats every file as changed. \
-         Pass --diff-base explicitly to override.",
-    );
-    GIT_EMPTY_TREE_SHA.to_string()
+    Err(TriggerFilterError::GitError(
+        "could not detect a diff base (no uncommitted changes, no remote default branch, \
+         no main/master branch, and HEAD has no parent). Pass --diff-base explicitly \
+         to tell wrkflw what to compare against."
+            .to_string(),
+    ))
 }
 
 /// Get the current tag if HEAD is tagged, or None.
 pub async fn get_current_tag(cwd: Option<&Path>) -> Result<Option<String>, TriggerFilterError> {
-    let result = git_cmd(cwd)
-        .args(["describe", "--tags", "--exact-match", "HEAD"])
-        .output()
-        .await;
-    match result {
+    let mut cmd = git_cmd(cwd);
+    cmd.args(["describe", "--tags", "--exact-match", "HEAD"]);
+    match run_git(cmd, "git describe").await {
         Ok(output) if output.status.success() => {
             let tag = String::from_utf8_lossy(&output.stdout).trim().to_string();
             if tag.is_empty() {
@@ -282,10 +273,7 @@ pub async fn get_current_tag(cwd: Option<&Path>) -> Result<Option<String>, Trigg
             }
         }
         Ok(_) => Ok(None), // not on a tag is normal
-        Err(e) => Err(TriggerFilterError::GitError(format!(
-            "Failed to check tags: {}",
-            e
-        ))),
+        Err(e) => Err(e),
     }
 }
 

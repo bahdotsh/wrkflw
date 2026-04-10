@@ -20,10 +20,13 @@ pub fn render_workflows_tab(f: &mut Frame<'_>, app: &mut App, area: Rect) {
 
 fn render_workflow_list(f: &mut Frame<'_>, app: &mut App, area: Rect) {
     let selected_count = app.workflows.iter().filter(|w| w.selected).count();
+    // Surface the simulated event so users aren't confused when a
+    // pull_request-only workflow shows up as SKIPPED under the push-only
+    // diff filter.
     let diff_indicator = if app.diff_filter_active {
-        " [DIFF]"
+        format!(" [DIFF: {}]", App::DIFF_FILTER_EVENT)
     } else {
-        ""
+        String::new()
     };
     let block_title = format!("Workflows ({} selected){}", selected_count, diff_indicator);
 

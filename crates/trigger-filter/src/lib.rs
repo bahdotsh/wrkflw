@@ -96,11 +96,15 @@ pub async fn auto_detect_context(
 
 /// Like [`auto_detect_context`] but also resolves the diff base via
 /// [`git::get_default_diff_base`] when the caller has no preference.
+///
+/// Fails with a `GitError` if no reasonable diff base can be detected — the
+/// caller should surface that so the user can pass `--diff-base` explicitly
+/// instead of silently getting a filter that matches every workflow.
 pub async fn auto_detect_context_default_base(
     event_name: &str,
     cwd: Option<&Path>,
 ) -> Result<EventContext, TriggerFilterError> {
-    let diff_base = git::get_default_diff_base(cwd).await;
+    let diff_base = git::get_default_diff_base(cwd).await?;
     auto_detect_context(event_name, &diff_base, cwd).await
 }
 

@@ -87,14 +87,62 @@ fn parse_event_config(
         }
     };
 
+    // GitHub Actions supports inline `!`-prefixed exclusion patterns in
+    // `branches`, `tags`, and `paths`. We split them into the include /
+    // exclude lists at parse time so the evaluator sees them the same way
+    // as the explicit `*-ignore` forms. Mixing `!`-patterns with the
+    // dedicated `*-ignore` key is rejected by GitHub Actions, so we enforce
+    // the same rule to keep semantics predictable.
+    let (branches, branches_inline_ignore) = extract_glob_list(map, "branches", event_name)?;
+    let branches_ignore_explicit = extract_glob_list(map, "branches-ignore", event_name)?.0;
+    if !branches_inline_ignore.is_empty() && !branches_ignore_explicit.is_empty() {
+        return Err(TriggerFilterError::ParseError(format!(
+            "{}: cannot mix inline `!`-patterns in `branches:` with a separate `branches-ignore:` key",
+            event_name
+        )));
+    }
+    let branches_ignore = if branches_ignore_explicit.is_empty() {
+        branches_inline_ignore
+    } else {
+        branches_ignore_explicit
+    };
+
+    let (tags, tags_inline_ignore) = extract_glob_list(map, "tags", event_name)?;
+    let tags_ignore_explicit = extract_glob_list(map, "tags-ignore", event_name)?.0;
+    if !tags_inline_ignore.is_empty() && !tags_ignore_explicit.is_empty() {
+        return Err(TriggerFilterError::ParseError(format!(
+            "{}: cannot mix inline `!`-patterns in `tags:` with a separate `tags-ignore:` key",
+            event_name
+        )));
+    }
+    let tags_ignore = if tags_ignore_explicit.is_empty() {
+        tags_inline_ignore
+    } else {
+        tags_ignore_explicit
+    };
+
+    let (paths, paths_inline_ignore) = extract_glob_list(map, "paths", event_name)?;
+    let paths_ignore_explicit = extract_glob_list(map, "paths-ignore", event_name)?.0;
+    if !paths_inline_ignore.is_empty() && !paths_ignore_explicit.is_empty() {
+        return Err(TriggerFilterError::ParseError(format!(
+            "{}: cannot mix inline `!`-patterns in `paths:` with a separate `paths-ignore:` key",
+            event_name
+        )));
+    }
+    let paths_ignore = if paths_ignore_explicit.is_empty() {
+        paths_inline_ignore
+    } else {
+        paths_ignore_explicit
+    };
+
     Ok(EventFilter {
         event_name: event_name.to_string(),
-        branches: extract_glob_list(map, "branches", event_name)?,
-        branches_ignore: extract_glob_list(map, "branches-ignore", event_name)?,
-        tags: extract_glob_list(map, "tags", event_name)?,
-        tags_ignore: extract_glob_list(map, "tags-ignore", event_name)?,
-        paths: extract_glob_list(map, "paths", event_name)?,
-        paths_ignore: extract_glob_list(map, "paths-ignore", event_name)?,
+        branches,
+        branches_ignore,
+        tags,
+        tags_ignore,
+        paths,
+        paths_ignore,
         types: extract_string_list(map, "types"),
     })
 }
@@ -117,6 +165,11 @@ fn extract_string_list(map: &serde_yaml::Mapping, key: &str) -> Vec<String> {
 
 /// Extract a list of strings from a YAML mapping and compile each as a glob pattern.
 ///
+/// Returns `(includes, inline_excludes)` — entries prefixed with `!` are treated
+/// as inline negations (GitHub Actions semantics) and routed into the second
+/// tuple field with the `!` stripped. Callers are responsible for merging the
+/// inline excludes into the corresponding `*-ignore` list.
+///
 /// Compilation failures are surfaced as `TriggerFilterError::ParseError` so that
 /// a typo like `paths: [src/**.rs]` is reported to the user instead of silently
 /// causing the workflow to never trigger.
@@ -124,18 +177,41 @@ fn extract_glob_list(
     map: &serde_yaml::Mapping,
     key: &str,
     event_name: &str,
-) -> Result<Vec<GlobPattern>, TriggerFilterError> {
+) -> Result<(Vec<GlobPattern>, Vec<GlobPattern>), TriggerFilterError> {
     let raw = extract_string_list(map, key);
-    raw.into_iter()
-        .map(|source| {
-            GlobPattern::new(&source).map_err(|e| {
-                TriggerFilterError::ParseError(format!(
-                    "Invalid glob pattern '{}' under '{}.{}': {}",
-                    source, event_name, key, e
-                ))
-            })
-        })
-        .collect()
+    let mut includes = Vec::new();
+    let mut excludes = Vec::new();
+    for source in raw {
+        // `!!literal` is GHA's escape for a literal leading `!`. Two `!`
+        // prefixes collapse into one, and the result is an include pattern
+        // matching a ref/path that literally starts with `!`.
+        let (is_exclude, pattern_src, display_src) = if let Some(rest) = source.strip_prefix("!!") {
+            let literal = format!("!{}", rest);
+            (false, literal.clone(), literal)
+        } else if let Some(rest) = source.strip_prefix('!') {
+            (true, rest.to_string(), rest.to_string())
+        } else {
+            (false, source.clone(), source.clone())
+        };
+
+        let mut compiled = GlobPattern::new(&pattern_src).map_err(|e| {
+            TriggerFilterError::ParseError(format!(
+                "Invalid glob pattern '{}' under '{}.{}': {}",
+                source, event_name, key, e
+            ))
+        })?;
+        // Preserve the human-visible source for diagnostics. For the `!!`
+        // escape this is `!rest`; `GlobPattern::new` was handed the same
+        // string above so the compiled pattern matches the literal `!`.
+        compiled.source = display_src;
+
+        if is_exclude {
+            excludes.push(compiled);
+        } else {
+            includes.push(compiled);
+        }
+    }
+    Ok((includes, excludes))
 }
 
 #[cfg(test)]
@@ -275,6 +351,112 @@ push:
         assert!(msg.contains("Invalid glob"), "got: {}", msg);
         assert!(msg.contains("[unclosed"), "got: {}", msg);
         assert!(msg.contains("push.paths"), "got: {}", msg);
+    }
+
+    #[test]
+    fn inline_negation_routes_into_ignore_list() {
+        // GitHub Actions semantics: `!pattern` inside `branches:` is an
+        // inline exclusion equivalent to adding to `branches-ignore:`.
+        let raw = make_on_raw(
+            r#"
+push:
+  branches:
+    - 'release/*'
+    - '!release/old'
+    - '!release/abandoned'
+"#,
+        );
+        let events = parse_events(&raw).unwrap();
+        let push = &events[0];
+        let inc: Vec<&str> = push.branches.iter().map(|g| g.source.as_str()).collect();
+        let exc: Vec<&str> = push
+            .branches_ignore
+            .iter()
+            .map(|g| g.source.as_str())
+            .collect();
+        assert_eq!(inc, vec!["release/*"]);
+        assert_eq!(exc, vec!["release/old", "release/abandoned"]);
+    }
+
+    #[test]
+    fn inline_negation_on_paths_and_tags() {
+        let raw = make_on_raw(
+            r#"
+push:
+  paths:
+    - 'src/**'
+    - '!src/generated/**'
+  tags:
+    - 'v*'
+    - '!v*-rc*'
+"#,
+        );
+        let events = parse_events(&raw).unwrap();
+        let push = &events[0];
+        assert_eq!(
+            push.paths
+                .iter()
+                .map(|g| g.source.as_str())
+                .collect::<Vec<_>>(),
+            vec!["src/**"]
+        );
+        assert_eq!(
+            push.paths_ignore
+                .iter()
+                .map(|g| g.source.as_str())
+                .collect::<Vec<_>>(),
+            vec!["src/generated/**"]
+        );
+        assert_eq!(
+            push.tags
+                .iter()
+                .map(|g| g.source.as_str())
+                .collect::<Vec<_>>(),
+            vec!["v*"]
+        );
+        assert_eq!(
+            push.tags_ignore
+                .iter()
+                .map(|g| g.source.as_str())
+                .collect::<Vec<_>>(),
+            vec!["v*-rc*"]
+        );
+    }
+
+    #[test]
+    fn double_bang_escapes_literal_leading_bang() {
+        // `!!foo` means a pattern whose literal first character is `!`.
+        let raw = make_on_raw(
+            r#"
+push:
+  branches:
+    - '!!weird-branch'
+"#,
+        );
+        let events = parse_events(&raw).unwrap();
+        let push = &events[0];
+        assert_eq!(push.branches.len(), 1);
+        assert_eq!(push.branches[0].source, "!weird-branch");
+        assert!(push.branches_ignore.is_empty());
+    }
+
+    #[test]
+    fn inline_negation_rejected_when_mixed_with_ignore_key() {
+        // GHA disallows mixing inline `!` with the dedicated ignore key.
+        let raw = make_on_raw(
+            r#"
+push:
+  branches:
+    - 'main'
+    - '!release/old'
+  branches-ignore:
+    - 'legacy/*'
+"#,
+        );
+        let err = parse_events(&raw).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("cannot mix"), "got: {}", msg);
+        assert!(msg.contains("branches"), "got: {}", msg);
     }
 
     #[test]

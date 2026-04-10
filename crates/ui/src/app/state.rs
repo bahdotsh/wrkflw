@@ -290,35 +290,40 @@ impl App {
             .push(format!("Switched to {} mode", self.runtime_type_name()));
     }
 
+    /// The event the TUI simulates for diff-filter evaluation. Surfaced in
+    /// the `[DIFF: push]` title so the user knows which event kind is being
+    /// tested — the TUI currently has no event selector.
+    pub const DIFF_FILTER_EVENT: &'static str = "push";
+
     /// Toggle diff-aware trigger filtering and evaluate all workflows.
-    /// Git commands and workflow parsing run on a background thread to avoid blocking the TUI.
+    ///
+    /// The git + parsing work is dispatched onto the ambient tokio runtime
+    /// via `tokio::task::spawn`, not a raw OS thread with a nested runtime.
     /// Results are received via `check_diff_filter_results()` on the next tick.
     ///
-    /// If an evaluation is already in flight (rapid toggle), the pending result is
-    /// discarded and a new evaluation is started.
+    /// If an evaluation is already in flight (rapid toggle), the pending
+    /// result is discarded and a new evaluation is started — the previous
+    /// task's `send()` will harmlessly fail on a closed channel.
     pub fn toggle_diff_filter(&mut self) {
         self.diff_filter_active = !self.diff_filter_active;
 
         if self.diff_filter_active {
-            // Drop any in-flight receiver so the orphaned thread's send() harmlessly fails
             self.diff_filter_rx = None;
 
-            self.logs
-                .push("Diff filter: evaluating triggers...".to_string());
+            self.logs.push(format!(
+                "Diff filter: evaluating triggers (simulating '{}' event)...",
+                Self::DIFF_FILTER_EVENT
+            ));
 
             let workflow_paths: Vec<PathBuf> =
                 self.workflows.iter().map(|w| w.path.clone()).collect();
-
-            // The TUI currently has no event/branch selector, so we
-            // simulate a `push` event. Users who need other events should
-            // reach for `wrkflw run --event ... --diff`.
-            let event_name = "push".to_string();
+            let event_name = Self::DIFF_FILTER_EVENT.to_string();
 
             let (tx, rx) = mpsc::channel();
             self.diff_filter_rx = Some(rx);
 
-            std::thread::spawn(move || {
-                let results = evaluate_diff_filter(workflow_paths, event_name);
+            tokio::task::spawn(async move {
+                let results = evaluate_diff_filter(workflow_paths, event_name).await;
                 let _ = tx.send(results);
             });
         } else {
@@ -1301,7 +1306,7 @@ impl App {
     }
 }
 
-/// Run git + trigger evaluation on a background thread.
+/// Run git + trigger evaluation as an async task on the ambient runtime.
 ///
 /// Returns `(workflow_path, status)` pairs so the caller can apply results
 /// keyed by path — this guarantees correctness even if the workflow list is
@@ -1310,38 +1315,38 @@ impl App {
 /// The event name is passed through from the caller rather than hardcoded,
 /// so a future TUI change that adds event selection is a plumbing-only
 /// change here.
-fn evaluate_diff_filter(
+async fn evaluate_diff_filter(
     workflow_paths: Vec<PathBuf>,
     event_name: String,
 ) -> Vec<(PathBuf, Option<TriggerMatchStatus>)> {
-    let rt = match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(rt) => rt,
-        Err(_) => {
-            return workflow_paths.into_iter().map(|p| (p, None)).collect();
-        }
-    };
+    let context =
+        match wrkflw_trigger_filter::auto_detect_context_default_base(&event_name, None).await {
+            Ok(ctx) => ctx,
+            Err(_) => {
+                return workflow_paths.into_iter().map(|p| (p, None)).collect();
+            }
+        };
 
-    let context = match rt.block_on(async {
-        wrkflw_trigger_filter::auto_detect_context_default_base(&event_name, None).await
-    }) {
-        Ok(ctx) => ctx,
-        Err(_) => {
-            return workflow_paths.into_iter().map(|p| (p, None)).collect();
-        }
-    };
-
-    // Parse workflows and use filter_workflows to evaluate
-    let parsed: Vec<(PathBuf, wrkflw_parser::workflow::WorkflowDefinition)> = workflow_paths
-        .iter()
-        .filter_map(|path| {
-            wrkflw_parser::workflow::parse_workflow(path)
-                .ok()
-                .map(|wf| (path.clone(), wf))
+    // Workflow parsing is synchronous file I/O; run it on a blocking thread
+    // so we don't hold the reactor while reading every .yml in the repo.
+    let paths_for_parse = workflow_paths.clone();
+    let parsed: Vec<(PathBuf, wrkflw_parser::workflow::WorkflowDefinition)> =
+        match tokio::task::spawn_blocking(move || {
+            paths_for_parse
+                .iter()
+                .filter_map(|path| {
+                    wrkflw_parser::workflow::parse_workflow(path)
+                        .ok()
+                        .map(|wf| (path.clone(), wf))
+                })
+                .collect()
         })
-        .collect();
+        .await
+        {
+            Ok(v) => v,
+            Err(_) => return workflow_paths.into_iter().map(|p| (p, None)).collect(),
+        };
+
     let borrowed: Vec<(PathBuf, &wrkflw_parser::workflow::WorkflowDefinition)> =
         parsed.iter().map(|(p, w)| (p.clone(), w)).collect();
 

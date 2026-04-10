@@ -695,7 +695,7 @@ async fn main() {
             );
 
             // Validate workflow files exist before starting
-            if let Err(e) = watcher.collect_workflow_files() {
+            if let Err(e) = watcher.collect_workflow_files().await {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
@@ -846,7 +846,7 @@ async fn run_trigger_prefilter_or_exit(
         wrkflw_trigger_filter::context_from_changed_files(&event_name, files.clone(), None)
             .await
             .unwrap_or_else(|e| {
-                eprintln!("Warning: Failed to build event context: {}", e);
+                eprintln!("Error: failed to build event context: {}", e);
                 std::process::exit(1);
             })
     } else if diff {
@@ -854,14 +854,14 @@ async fn run_trigger_prefilter_or_exit(
             wrkflw_trigger_filter::context_from_diff_range(&event_name, diff_base, head, None)
                 .await
                 .unwrap_or_else(|e| {
-                    eprintln!("Warning: Failed to get git diff: {}", e);
+                    eprintln!("Error: failed to get git diff: {}", e);
                     std::process::exit(1);
                 })
         } else {
             wrkflw_trigger_filter::auto_detect_context(&event_name, diff_base, None)
                 .await
                 .unwrap_or_else(|e| {
-                    eprintln!("Warning: Failed to get git diff: {}", e);
+                    eprintln!("Error: failed to get git diff: {}", e);
                     std::process::exit(1);
                 })
         }
@@ -878,7 +878,7 @@ async fn run_trigger_prefilter_or_exit(
         wrkflw_trigger_filter::context_from_changed_files(&event_name, vec![], None)
             .await
             .unwrap_or_else(|e| {
-                eprintln!("Warning: Failed to build event context: {}", e);
+                eprintln!("Error: failed to build event context: {}", e);
                 std::process::exit(1);
             })
     };

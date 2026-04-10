@@ -78,41 +78,32 @@ impl WorkflowWatcher {
     }
 
     /// Collect workflow files from the configured directory.
-    pub fn collect_workflow_files(&self) -> Result<Vec<PathBuf>, WatchError> {
-        let dir = &self.workflow_dir;
-        if dir.is_file() {
-            return Ok(vec![dir.clone()]);
-        }
-
-        let mut files = Vec::new();
-        for entry in std::fs::read_dir(dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                if ext == "yml" || ext == "yaml" {
-                    files.push(path);
-                }
-            }
-        }
-
-        if files.is_empty() {
-            return Err(WatchError::NoWorkflows(dir.display().to_string()));
-        }
-        Ok(files)
+    ///
+    /// Runs the blocking `read_dir` syscall on a blocking thread so it
+    /// doesn't stall the tokio reactor — the watcher calls this on every
+    /// cycle, and a slow filesystem (e.g. a network mount or a huge
+    /// workflows directory) would otherwise block incoming notify events.
+    pub async fn collect_workflow_files(&self) -> Result<Vec<PathBuf>, WatchError> {
+        let dir = self.workflow_dir.clone();
+        tokio::task::spawn_blocking(move || collect_workflow_files_blocking(&dir))
+            .await
+            .map_err(|e| WatchError::Io(std::io::Error::other(e.to_string())))?
     }
 
     /// Start the watch loop. Calls `on_cycle_complete` after each
     /// debounced change set has been evaluated and executed.
     /// This blocks until an error occurs or the process is interrupted.
     ///
-    /// **Important:** `on_cycle_complete` is invoked via `spawn_blocking` so it
-    /// will not stall the async watch loop, but it should still return promptly
-    /// to avoid exhausting the blocking thread pool under sustained churn.
+    /// **Important:** `on_cycle_complete` runs on a blocking thread (via
+    /// `spawn_blocking`) so it doesn't block the tokio reactor, but the main
+    /// watch loop awaits its completion before starting the next cycle —
+    /// events that arrive during the callback accumulate in the debouncer
+    /// and are processed on the following cycle. Keep the callback fast.
     pub async fn run<F>(&self, on_cycle_complete: F) -> Result<(), WatchError>
     where
         F: Fn(WatchEvent) + Send + Sync + 'static,
     {
-        let initial_workflow_files = self.collect_workflow_files()?;
+        let initial_workflow_files = self.collect_workflow_files().await?;
 
         // Canonicalize the repo root once so incoming notify paths (which the
         // OS may deliver as canonicalized — e.g. macOS `/private/var` vs
@@ -183,7 +174,7 @@ impl WorkflowWatcher {
             }
 
             // Re-collect workflow files so newly added .yml files are picked up
-            if let Ok(refreshed) = self.collect_workflow_files() {
+            if let Ok(refreshed) = self.collect_workflow_files().await {
                 workflow_files = refreshed;
             }
 
@@ -257,16 +248,26 @@ impl WorkflowWatcher {
             // that events delivered via symlinked paths or on macOS
             // (`/private/var` → `/var`) still line up with the canonical
             // repo root and don't drop out of the set.
-            let changed_files: Vec<String> = changed_paths
-                .iter()
-                .filter_map(|p| {
-                    let canonical = std::fs::canonicalize(p).unwrap_or_else(|_| p.clone());
-                    canonical
-                        .strip_prefix(&repo_root_canonical)
-                        .ok()
-                        .map(|rel| rel.to_string_lossy().to_string())
-                })
-                .collect();
+            //
+            // `canonicalize` is a blocking syscall (one `lstat` per component)
+            // and `changed_paths` can be large during a burst — hop onto a
+            // blocking thread so the reactor isn't stalled.
+            let paths_for_canon = changed_paths.clone();
+            let root_for_canon = repo_root_canonical.clone();
+            let changed_files: Vec<String> = tokio::task::spawn_blocking(move || {
+                paths_for_canon
+                    .iter()
+                    .filter_map(|p| {
+                        let canonical = std::fs::canonicalize(p).unwrap_or_else(|_| p.clone());
+                        canonical
+                            .strip_prefix(&root_for_canon)
+                            .ok()
+                            .map(|rel| rel.to_string_lossy().to_string())
+                    })
+                    .collect()
+            })
+            .await
+            .unwrap_or_default();
 
             if changed_files.is_empty() {
                 if self.verbose {
@@ -373,6 +374,30 @@ impl WorkflowWatcher {
     }
 }
 
+/// Synchronous implementation of `collect_workflow_files`. Extracted so it can
+/// be invoked from `spawn_blocking` without closure capture juggling.
+fn collect_workflow_files_blocking(dir: &Path) -> Result<Vec<PathBuf>, WatchError> {
+    if dir.is_file() {
+        return Ok(vec![dir.to_path_buf()]);
+    }
+
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+            if ext == "yml" || ext == "yaml" {
+                files.push(path);
+            }
+        }
+    }
+
+    if files.is_empty() {
+        return Err(WatchError::NoWorkflows(dir.display().to_string()));
+    }
+    Ok(files)
+}
+
 /// Returns `true` if a path falls inside any of the default ignore directories,
 /// where "inside" means: a directory component (NOT the leaf filename) of the
 /// path's `repo_root`-relative form matches one of the ignore names.
@@ -385,17 +410,15 @@ fn should_ignore_path(path: &Path, repo_root: &Path) -> bool {
     // repo_root we still apply the ignore set positionally rather than
     // returning false, so events from inside symlinks etc. still get filtered.
     let rel = path.strip_prefix(repo_root).unwrap_or(path);
-    let components: Vec<_> = rel.components().collect();
-    if components.is_empty() {
-        return false;
-    }
-    // Iterate every component except the last (the leaf, which is presumed
-    // to be a filename and shouldn't be matched against directory names).
-    let last_idx = components.len() - 1;
-    for (i, component) in components.iter().enumerate() {
-        if i == last_idx {
-            break;
-        }
+    // Compare against every component except the last (the leaf, which is
+    // presumed to be a filename). Using `parent()` + component iteration
+    // avoids collecting into a `Vec` — this function runs on every notify
+    // event, so the hot path is worth keeping allocation-free.
+    let parent = match rel.parent() {
+        Some(p) => p,
+        None => return false,
+    };
+    for component in parent.components() {
         if let std::path::Component::Normal(os) = component {
             if let Some(s) = os.to_str() {
                 if DEFAULT_IGNORE_DIRS.contains(&s) {

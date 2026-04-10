@@ -64,6 +64,12 @@ pub struct WatcherConfig {
     pub repo_root: PathBuf,
     pub event_name: String,
     pub base_branch: Option<String>,
+    /// Activity type to stamp on the synthesized event context — needed
+    /// so workflows that filter on `pull_request: { types: [...] }` can
+    /// match in watch mode without being silently rejected for "no
+    /// activity type in context". `None` is fine for `push` and any
+    /// event that has no `types:` filter.
+    pub activity_type: Option<String>,
     pub debounce_duration: Duration,
     pub execution: ExecutionConfig,
     pub verbose: bool,
@@ -77,6 +83,7 @@ impl WatcherConfig {
             repo_root,
             event_name: "push".to_string(),
             base_branch: None,
+            activity_type: None,
             debounce_duration: Duration::from_millis(500),
             execution,
             verbose: false,
@@ -91,6 +98,11 @@ impl WatcherConfig {
 
     pub fn with_base_branch(mut self, base: Option<String>) -> Self {
         self.base_branch = base;
+        self
+    }
+
+    pub fn with_activity_type(mut self, activity: Option<String>) -> Self {
+        self.activity_type = activity;
         self
     }
 
@@ -168,8 +180,26 @@ impl WorkflowWatcher {
         // OS may deliver as canonicalized — e.g. macOS `/private/var` vs
         // `/var`, or a symlinked working copy) can be made root-relative
         // without silently failing every `strip_prefix`.
-        let repo_root_canonical = std::fs::canonicalize(&self.cfg.repo_root)
-            .unwrap_or_else(|_| self.cfg.repo_root.clone());
+        //
+        // Failing this is FATAL. The previous fallback (use the raw,
+        // non-canonical path) produces a totally degraded watcher on
+        // macOS: every notify event arrives canonicalized as
+        // `/private/var/...` and `strip_prefix("/var/...")` rejects all
+        // of them, so the user sees "watching..." forever and zero
+        // workflows ever fire. A watcher that *looks* alive but never
+        // matches a single event is the worst possible failure mode for
+        // this PR — refuse to start in that state and let the operator
+        // see the underlying error directly.
+        let repo_root_canonical = std::fs::canonicalize(&self.cfg.repo_root).map_err(|e| {
+            WatchError::Io(std::io::Error::other(format!(
+                "could not canonicalize repo root {}: {} — refusing to start the \
+                 watcher in a degraded state where event paths could not be made \
+                 repo-relative (this notably affects macOS /private/var and \
+                 symlinked working trees). Verify the path exists and is accessible.",
+                self.cfg.repo_root.display(),
+                e,
+            )))
+        })?;
 
         let debouncer = Arc::new(Debouncer::new(self.cfg.debounce_duration));
         let callback = Arc::new(on_cycle_complete);
@@ -456,6 +486,13 @@ impl WorkflowWatcher {
         {
             Ok(mut ctx) => {
                 ctx.base_branch = self.cfg.base_branch.clone();
+                // Stamp the activity type so workflows that gate on
+                // `pull_request: { types: [opened, synchronize] }` can
+                // actually match in watch mode. Without this, every
+                // typed `pull_request` workflow is silently rejected
+                // for "no activity type in context" — exactly the
+                // silent-skip failure mode this PR is built to prevent.
+                ctx.activity_type = self.cfg.activity_type.clone();
                 ctx
             }
             Err(e) => {
@@ -521,9 +558,22 @@ impl WorkflowWatcher {
                             // give a consistent message than format a
                             // type name. The user can dig into executor
                             // logs for the actual panic message.
+                            //
+                            // Resource leak warning: a panic mid-execution
+                            // bypasses the executor's normal cleanup path,
+                            // so containers, tempdirs, named volumes, or
+                            // child processes the workflow had spun up may
+                            // still be alive. Surface that in the user log
+                            // so a long-running watch session does not
+                            // accumulate orphaned resources without anyone
+                            // noticing.
                             wrkflw_logging::error(&format!(
                                 "Workflow {} panicked during execution — \
-                                 watch loop continues; investigate the executor logs",
+                                 watch loop continues. Note: a panicking executor may have \
+                                 left containers, tempdirs, or child processes uncleaned; \
+                                 check `docker ps -a` (or your runtime's equivalent) if you \
+                                 see resource buildup, and investigate the executor logs for \
+                                 the actual panic.",
                                 log_path.display()
                             ));
                         }
@@ -553,17 +603,29 @@ impl WorkflowWatcher {
 
 /// Return `true` if a notify event kind is relevant for trigger
 /// re-evaluation. We care about creates, writes, removes, and rename
-/// endpoints; we drop access/metadata updates (atime/chmod/owner) and
-/// "Any"/"Other" kinds that notify emits for bookkeeping.
+/// endpoints; we drop access/metadata updates (atime/chmod/owner).
+///
+/// `Modify(Any)` is treated as relevant. The Linux inotify and macOS
+/// FSEvents backends emit specific subkinds (`Modify(Data(...))`,
+/// `Modify(Name(...))`), but the kqueue backend (FreeBSD, some macOS
+/// configurations) and notify's `PollWatcher` fallback emit
+/// `Modify(Any)` for content changes when the underlying API can't
+/// distinguish data from metadata. Dropping `Modify(Any)` would leave
+/// the watcher silently dead on those platforms — over-firing is
+/// bounded by the debouncer; under-firing isn't recoverable.
+///
+/// The match is exhaustive on `ModifyKind` (no catch-all `Modify(_)`
+/// arm) so future additions to the notify enum surface as a compile
+/// error instead of silently being routed to "drop".
 fn is_relevant_event_kind(kind: &EventKind) -> bool {
     match kind {
         EventKind::Create(_) => true,
         EventKind::Remove(_) => true,
         EventKind::Modify(ModifyKind::Data(_)) => true,
         EventKind::Modify(ModifyKind::Name(_)) => true,
-        // Data and Name modifications are the ones users care about.
-        // Metadata (chmod, chown) and Access events are dropped.
-        EventKind::Modify(_) => false,
+        EventKind::Modify(ModifyKind::Any) => true,
+        EventKind::Modify(ModifyKind::Metadata(_)) => false,
+        EventKind::Modify(ModifyKind::Other) => false,
         EventKind::Access(_) => false,
         EventKind::Any | EventKind::Other => false,
     }
@@ -677,9 +739,15 @@ fn refresh_trigger_cache_blocking(
                 );
             }
             Err(e) => {
-                trigger_cache.remove(wf_path);
+                // `remove` returns `Some` iff this workflow was
+                // previously parseable — i.e. the user just broke a
+                // working file. Surface that loudly even at non-verbose
+                // level so the regression isn't hidden behind a generic
+                // "N workflows failed to parse" summary that the user
+                // has no way to act on.
+                let was_previously_parseable = trigger_cache.remove(wf_path).is_some();
                 parse_failures += 1;
-                if verbose {
+                if verbose || was_previously_parseable {
                     wrkflw_logging::warning(&format!(
                         "Failed to parse {}: {}",
                         wf_path.display(),
@@ -810,6 +878,18 @@ mod tests {
         )));
         assert!(!is_relevant_event_kind(&EventKind::Any));
         assert!(!is_relevant_event_kind(&EventKind::Other));
+    }
+
+    #[test]
+    fn is_relevant_event_kind_accepts_modify_any() {
+        // Regression: `Modify(Any)` is what kqueue (FreeBSD) and
+        // PollWatcher emit for content changes when the underlying API
+        // can't distinguish data from metadata. The previous catch-all
+        // `Modify(_) => false` arm dropped these silently, leaving the
+        // watcher in a "no events ever fire" state on those backends
+        // even though Linux/macOS users saw it work fine. Treating
+        // `Modify(Any)` as relevant fixes the platform parity.
+        assert!(is_relevant_event_kind(&EventKind::Modify(ModifyKind::Any)));
     }
 
     #[test]
@@ -1013,6 +1093,49 @@ mod tests {
             Path::new("/repo/crates/foo/target/debug/build/foo"),
             root()
         ));
+    }
+
+    /// Regression: when a workflow file that *was* successfully parsed
+    /// breaks (e.g. user introduces an invalid glob), the cache must
+    /// drop the stale entry AND the failure should not require
+    /// `--verbose` to be visible. Previously, the only signal at
+    /// non-verbose level was a generic "N workflow file(s) failed to
+    /// parse" summary, leaving the user with no way to identify which
+    /// file regressed. After the fix, a previously-parseable workflow
+    /// going broken must propagate to the cache (entry removed) so the
+    /// surrounding warning logic can fire.
+    #[test]
+    fn refresh_trigger_cache_drops_previously_parseable_on_break() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let repo = tmp.path().to_path_buf();
+        let _watcher = make_watcher_for(&repo);
+
+        let wf_abs = repo.join(".github/workflows/ci.yml");
+        let good = "name: t\non:\n  push:\n    paths:\n      - 'src/**'\njobs:\n  b:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n";
+        std::fs::write(&wf_abs, good).expect("write good ci.yml");
+
+        let workflow_files = vec![wf_abs.clone()];
+        let mut cache: HashMap<PathBuf, TriggerCacheEntry> = HashMap::new();
+
+        // Prime: file parses fine, cache populated.
+        refresh_trigger_cache_blocking(&mut cache, &workflow_files, &[], false);
+        assert!(
+            cache.contains_key(&wf_abs),
+            "good workflow must be cached after first refresh"
+        );
+
+        // Break the file with an invalid glob and re-refresh, simulating
+        // a notify event for the broken workflow.
+        let bad = "name: t\non:\n  push:\n    paths:\n      - '[unclosed'\njobs:\n  b:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n";
+        std::fs::write(&wf_abs, bad).expect("write bad ci.yml");
+        let changed = std::fs::canonicalize(&wf_abs).expect("canonicalize wf");
+        refresh_trigger_cache_blocking(&mut cache, &workflow_files, &[changed], false);
+
+        assert!(
+            !cache.contains_key(&wf_abs),
+            "broken workflow must be evicted from cache so the surrounding \
+             warning logic can surface the regression"
+        );
     }
 
     /// Refreshing the cache twice for an unchanged workflow file must

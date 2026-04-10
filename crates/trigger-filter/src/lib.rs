@@ -14,7 +14,7 @@ pub use model::{
 };
 pub use parser::parse_trigger_config;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Read a workflow file from disk and parse its trigger configuration in
 /// one step. Centralizes the "read + parse + compile globs" pipeline so
@@ -30,6 +30,30 @@ pub fn load_trigger_config(
     let workflow = wrkflw_parser::workflow::parse_workflow(workflow_path)
         .map_err(|e| TriggerFilterError::ParseError(e.to_string()))?;
     parse_trigger_config(&workflow, workflow_path.to_path_buf())
+}
+
+/// Bulk-load trigger configs for many workflow files, partitioning the
+/// result into successes and per-file failure pairs.
+///
+/// This is the shape both the watcher and the TUI need: parse failures
+/// must be surfaced to the user (rather than `filter_map(... .ok())`d
+/// into invisibility), so any caller that wants to render "N failed to
+/// parse" diagnostics gets the offending paths and reasons in one call.
+///
+/// Same blocking-I/O caveat as [`load_trigger_config`] — wrap in
+/// `spawn_blocking` from async contexts.
+pub fn load_trigger_configs(
+    paths: &[PathBuf],
+) -> (Vec<WorkflowTriggerConfig>, Vec<(PathBuf, String)>) {
+    let mut configs = Vec::with_capacity(paths.len());
+    let mut failures: Vec<(PathBuf, String)> = Vec::new();
+    for path in paths {
+        match load_trigger_config(path) {
+            Ok(cfg) => configs.push(cfg),
+            Err(e) => failures.push((path.clone(), e.to_string())),
+        }
+    }
+    (configs, failures)
 }
 
 /// Evaluate multiple pre-parsed trigger configs against an event context.
@@ -157,3 +181,50 @@ pub async fn context_from_changed_files(
 // "broken glob surfaces a parse error" contract). The cached path
 // `filter_trigger_configs` is exercised by every consumer in the
 // workspace.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn load_trigger_configs_partitions_successes_and_failures() {
+        // Mixed batch: one valid workflow, one with broken YAML, one
+        // with a malformed glob. The bulk loader must return the
+        // successful config and a per-file failure entry for each
+        // broken file — the silent-drop pattern that
+        // `.filter_map(... .ok())` produced was exactly the failure
+        // mode that drove the original "lying about which workflows
+        // would run" incident.
+        let tmp = TempDir::new().expect("tempdir");
+        let root = tmp.path();
+
+        let good = root.join("good.yml");
+        std::fs::write(
+            &good,
+            "name: good\non: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+        )
+        .unwrap();
+
+        let bad_yaml = root.join("bad_yaml.yml");
+        std::fs::write(&bad_yaml, "name: bad\non: [unterminated\n").unwrap();
+
+        let bad_glob = root.join("bad_glob.yml");
+        std::fs::write(
+            &bad_glob,
+            "name: bad_glob\non:\n  push:\n    paths:\n      - '[unclosed'\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+        )
+        .unwrap();
+
+        let paths = vec![good.clone(), bad_yaml.clone(), bad_glob.clone()];
+        let (configs, failures) = load_trigger_configs(&paths);
+
+        assert_eq!(configs.len(), 1, "exactly one workflow should parse");
+        assert_eq!(configs[0].workflow_path, good);
+
+        assert_eq!(failures.len(), 2, "both broken files must surface");
+        let failed_paths: Vec<&PathBuf> = failures.iter().map(|(p, _)| p).collect();
+        assert!(failed_paths.contains(&&bad_yaml));
+        assert!(failed_paths.contains(&&bad_glob));
+    }
+}

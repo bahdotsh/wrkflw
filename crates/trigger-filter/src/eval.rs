@@ -163,7 +163,7 @@ fn explain_filter_failure(filter: &EventFilter, context: &EventContext) -> Strin
                 parts.push(format!("activity '{}' not in {:?}", activity, filter.types))
             }
             None => {
-                parts.push("no activity type in context (types filter requires one)".to_string())
+                parts.push("no activity type in context — pass --activity-type <name>".to_string())
             }
         }
     }
@@ -529,6 +529,31 @@ mod tests {
         let result = evaluate_trigger(&config, &ctx);
         assert!(!result.matches);
         assert!(result.reason.contains("base_branch"));
+    }
+
+    #[test]
+    fn types_filter_failure_message_mentions_activity_type_flag() {
+        // Regression: the diagnostic for "this workflow has a `types:`
+        // filter and the context has no activity type" used to say
+        // "no activity type in context (types filter requires one)" —
+        // factually correct but no clue how to fix it. Surface the
+        // exact CLI flag the user needs, mirroring the `paths:` branch.
+        let config = make_config(vec![EventFilter {
+            event_name: "pull_request".into(),
+            types: vec!["opened".into()],
+            ..Default::default()
+        }]);
+        let ctx = EventContext {
+            event_name: "pull_request".into(),
+            ..Default::default()
+        };
+        let result = evaluate_trigger(&config, &ctx);
+        assert!(!result.matches);
+        assert!(
+            result.reason.contains("--activity-type"),
+            "diagnostic must point users at the fix flag, got: {}",
+            result.reason
+        );
     }
 
     #[test]

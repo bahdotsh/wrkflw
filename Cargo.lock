@@ -3718,6 +3718,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "wrkflw-logging",
  "wrkflw-parser",
 ]
 

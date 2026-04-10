@@ -71,6 +71,14 @@ pub struct App {
     /// `App` rather than as a hardcoded constant so a future event selector
     /// UI is a data-flow change only.
     pub diff_filter_event: String,
+    /// Activity type to stamp on the synthesized event context — same
+    /// purpose as `WatcherConfig::activity_type` and the CLI's
+    /// `--activity-type` flag. The TUI has no UI to set this yet, so it
+    /// defaults to `None`; the field exists so a future activity-type
+    /// selector is a plumbing-only change here, and so workflows that
+    /// gate on `pull_request: { types: [...] }` aren't silently rejected
+    /// the moment such a UI ships.
+    pub diff_filter_activity_type: Option<String>,
     /// Channel receiving (workflow_path, trigger_status) pairs from the background
     /// evaluation task. We send pairs (rather than a positional Vec) so that
     /// reloading `self.workflows` between toggle and result delivery cannot
@@ -309,6 +317,7 @@ impl App {
 
             diff_filter_active: false,
             diff_filter_event: "push".to_string(),
+            diff_filter_activity_type: None,
             diff_filter_rx: None,
             diff_filter_task: None,
             diff_filter_aborted: false,
@@ -374,7 +383,18 @@ impl App {
         self.diff_filter_rx = None;
 
         if self.diff_filter_active {
+            // A new evaluation begins with a fresh receiver. Any
+            // `diff_filter_aborted` flag still set at this point belongs
+            // to a *prior* abort cycle whose receiver was dropped without
+            // ever being observed (e.g. user toggled OFF, no tick ran,
+            // user toggled back ON). Leaving it armed here would silently
+            // swallow a genuine failure on the new task — exactly the
+            // silent-skip mode this PR is built to prevent. Clear it
+            // before spawning so the next `Disconnected` is treated as
+            // a real failure and surfaced to the user.
+            self.diff_filter_aborted = false;
             let event_name = self.diff_filter_event.clone();
+            let activity_type = self.diff_filter_activity_type.clone();
             self.logs.push(format!(
                 "Diff filter: evaluating triggers (simulating '{}' event)...",
                 event_name
@@ -403,7 +423,9 @@ impl App {
                     .await
                     .ok()
                     .flatten();
-                let results = evaluate_diff_filter(workflow_paths, event_name, repo_root).await;
+                let results =
+                    evaluate_diff_filter(workflow_paths, event_name, activity_type, repo_root)
+                        .await;
                 let _ = tx.send(results);
             });
             self.diff_filter_task = Some(handle);
@@ -1456,6 +1478,7 @@ impl App {
 async fn evaluate_diff_filter(
     workflow_paths: Vec<PathBuf>,
     event_name: String,
+    activity_type: Option<String>,
     repo_root: Option<PathBuf>,
 ) -> DiffFilterOutcome {
     // Pass the discovered repo root through to every git helper so the
@@ -1464,24 +1487,25 @@ async fn evaluate_diff_filter(
     // (e.g. user launched the TUI outside any repo) — the helpers will
     // surface a `GitError` and the TUI will log it.
     let cwd: Option<&Path> = repo_root.as_deref();
-    let context =
+    let mut context =
         match wrkflw_trigger_filter::auto_detect_context_default_base(&event_name, cwd).await {
             Ok(ctx) => ctx,
             Err(e) => {
                 return DiffFilterOutcome::Failure(format!("{}", e));
             }
         };
+    // Stamp the activity type so workflows that filter on
+    // `pull_request: { types: [...] }` can match. Mirrors the
+    // CLI prefilter and the watcher; without it the TUI silently
+    // rejects every typed pull_request workflow.
+    context.activity_type = activity_type;
 
     // Trigger config parsing is synchronous file I/O; run it on a
     // blocking thread so we don't hold the reactor while reading every
-    // .yml in the repo. `load_trigger_config` consolidates read + parse
-    // so the TUI and the watcher fail identically on the same broken file.
-    //
-    // We capture parse failures alongside the successes so the UI can
-    // surface a real error in the log pane. Previously the failure
-    // branch was silently dropped via `.filter_map(... .ok())`, which
-    // collapsed "broken YAML" and "matching trigger" into the same
-    // `trigger_match = None` rendering.
+    // .yml in the repo. `load_trigger_configs` consolidates read + parse
+    // and partitions the result into successes + per-file failures, so
+    // the TUI and the watcher fail identically on the same broken file
+    // and the failure branch is never silently dropped.
     let paths_for_parse = workflow_paths.clone();
     let parse_outcome: Result<
         (
@@ -1490,15 +1514,7 @@ async fn evaluate_diff_filter(
         ),
         _,
     > = tokio::task::spawn_blocking(move || {
-        let mut configs = Vec::with_capacity(paths_for_parse.len());
-        let mut failures: DiffFilterParseFailures = Vec::new();
-        for path in &paths_for_parse {
-            match wrkflw_trigger_filter::load_trigger_config(path) {
-                Ok(cfg) => configs.push(cfg),
-                Err(e) => failures.push((path.clone(), e.to_string())),
-            }
-        }
-        (configs, failures)
+        wrkflw_trigger_filter::load_trigger_configs(&paths_for_parse)
     })
     .await;
 
@@ -1869,6 +1885,67 @@ mod tests {
         if let Some(handle) = app.diff_filter_task.take() {
             handle.abort();
         }
+    }
+
+    #[tokio::test]
+    async fn aborted_flag_does_not_silence_failures_across_toggle_cycles() {
+        // Regression for the stale-abort-flag bug: when the user toggles
+        // OFF (which arms the flag and drops the receiver) and the next
+        // tick observes `rx is None` and returns early, the flag is left
+        // armed. The *next* toggle ON spawns a fresh task with a fresh
+        // receiver, and a real failure on that fresh task used to be
+        // silenced because the leftover flag was treated as a self-
+        // inflicted abort. After the fix, starting a new evaluation
+        // must clear any stale flag so a genuine failure is loud.
+        let mut app = make_app();
+
+        // Step 1: Toggle ON — spawns task A.
+        app.toggle_diff_filter();
+        assert!(app.diff_filter_task.is_some(), "task A should be in flight");
+        assert!(!app.diff_filter_aborted);
+
+        // Step 2: Toggle OFF — aborts A, arms flag, drops rx.
+        app.toggle_diff_filter();
+        assert!(app.diff_filter_aborted, "OFF with in-flight task arms flag");
+        assert!(app.diff_filter_rx.is_none());
+
+        // Step 3: A tick fires while OFF. With rx=None it returns early
+        // and never observes/clears the flag — this is the gap that the
+        // old code left behind.
+        app.check_diff_filter_results();
+        assert!(
+            app.diff_filter_aborted,
+            "early-return tick must not touch the flag"
+        );
+
+        // Step 4: Toggle ON again. The fix is here: starting a new
+        // evaluation must clear the stale flag so the next failure is
+        // not mistaken for a self-inflicted abort.
+        app.toggle_diff_filter();
+        assert!(
+            !app.diff_filter_aborted,
+            "stale abort flag from a prior cycle must be cleared on new evaluation"
+        );
+
+        // Step 5: Cancel the real spawned task and inject a fresh
+        // already-disconnected channel to simulate task B failing
+        // (panic, send-side dropped). The flag is currently false, so
+        // the disconnect must be reported as a genuine failure.
+        if let Some(handle) = app.diff_filter_task.take() {
+            handle.abort();
+        }
+        let (tx, rx) = mpsc::channel::<DiffFilterOutcome>();
+        drop(tx);
+        app.diff_filter_rx = Some(rx);
+
+        let log_count_before = app.logs.len();
+        app.check_diff_filter_results();
+        let new_logs: Vec<&String> = app.logs.iter().skip(log_count_before).collect();
+        assert!(
+            new_logs.iter().any(|l| l.contains("evaluation failed")),
+            "real failure on a fresh evaluation must surface, got {:?}",
+            new_logs
+        );
     }
 
     #[test]

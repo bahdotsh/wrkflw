@@ -105,9 +105,13 @@ enum Commands {
         #[arg(long, value_delimiter = ',')]
         changed_files: Option<Vec<String>>,
 
-        /// Base ref for diff comparison (default: HEAD)
-        #[arg(long, default_value = "HEAD")]
-        diff_base: String,
+        /// Base ref for diff comparison.
+        ///
+        /// Omit to auto-detect: tries `origin/HEAD`, then `main`/`master`,
+        /// then `HEAD~1`. Pass `HEAD` to compare working tree against the
+        /// last commit (uncommitted changes only).
+        #[arg(long)]
+        diff_base: Option<String>,
 
         /// Head ref for diff comparison (default: working tree)
         #[arg(long)]
@@ -118,6 +122,13 @@ enum Commands {
         /// against the base branch — set this to simulate a PR locally.
         #[arg(long)]
         base_branch: Option<String>,
+
+        /// Activity type for events that support it (e.g. `opened`,
+        /// `synchronize` for pull_request). Required when simulating an
+        /// event whose workflows use `types:` filters — without it, every
+        /// such workflow is reported as skipped for "no activity type".
+        #[arg(long)]
+        activity_type: Option<String>,
     },
 
     /// Watch for file changes and re-run affected workflows
@@ -154,6 +165,13 @@ enum Commands {
         /// uses `branches:` to constrain the target branch.
         #[arg(long)]
         base_branch: Option<String>,
+
+        /// Activity type for events that support it (e.g. `opened`,
+        /// `synchronize` for pull_request). Required when watching an
+        /// event whose workflows use `types:` filters — without it, every
+        /// such workflow is silently rejected for "no activity type".
+        #[arg(long)]
+        activity_type: Option<String>,
     },
 
     /// Open TUI interface to manage workflows
@@ -486,6 +504,7 @@ async fn main() {
             diff_base,
             diff_head,
             base_branch,
+            activity_type,
         }) => {
             // Evaluate trigger filter at the call site before executing
             if *diff || event.is_some() || changed_files.is_some() {
@@ -494,9 +513,10 @@ async fn main() {
                     event: event.as_ref(),
                     diff: *diff,
                     changed_files: changed_files.as_ref(),
-                    diff_base,
+                    diff_base: diff_base.as_deref(),
                     diff_head: diff_head.as_ref(),
                     base_branch: base_branch.as_ref(),
+                    activity_type: activity_type.as_ref(),
                     verbose,
                 })
                 .await;
@@ -635,6 +655,7 @@ async fn main() {
             preserve_containers_on_failure,
             max_concurrency,
             base_branch,
+            activity_type,
         }) => {
             let workflow_dir = path
                 .clone()
@@ -686,6 +707,7 @@ async fn main() {
             let watcher_cfg = wrkflw_watcher::WatcherConfig::new(workflow_dir, repo_root, config)
                 .with_event(event.clone())
                 .with_base_branch(base_branch.clone())
+                .with_activity_type(activity_type.clone())
                 .with_debounce(debounce_duration)
                 .with_verbose(verbose)
                 .with_max_concurrency(*max_concurrency);
@@ -821,9 +843,15 @@ struct PrefilterRequest<'a> {
     event: Option<&'a String>,
     diff: bool,
     changed_files: Option<&'a Vec<String>>,
-    diff_base: &'a str,
+    /// `None` means the user did not pass `--diff-base` and we should fall
+    /// back to `auto_detect_context_default_base` (origin/HEAD → main →
+    /// master → HEAD~1). Previously this was a `&str` defaulting to
+    /// `"HEAD"`, which made the smart detection unreachable from the CLI
+    /// and silently restricted `--diff` to uncommitted-only changes.
+    diff_base: Option<&'a str>,
     diff_head: Option<&'a String>,
     base_branch: Option<&'a String>,
+    activity_type: Option<&'a String>,
     verbose: bool,
 }
 
@@ -862,13 +890,15 @@ async fn run_trigger_prefilter_or_exit(req: PrefilterRequest<'_>) {
 
     let mut event_context = build_event_context(&req, &event_name, cwd_for_git).await;
     apply_base_branch(&mut event_context, &event_name, req.base_branch);
+    apply_activity_type(&mut event_context, req.activity_type);
 
     if req.verbose {
         wrkflw_logging::info(&format!(
-            "Trigger filter: event={}, branch={:?}, base_branch={:?}, changed_files={:?}",
+            "Trigger filter: event={}, branch={:?}, base_branch={:?}, activity_type={:?}, changed_files={:?}",
             event_context.event_name,
             event_context.branch,
             event_context.base_branch,
+            event_context.activity_type,
             event_context.changed_files
         ));
     }
@@ -932,16 +962,24 @@ async fn build_event_context(
     }
 
     if req.diff {
+        // Three branches:
+        //   1. `--diff-head` set: explicit two-ref range. Honour
+        //      `--diff-base` if given, default the base end of the range
+        //      to `HEAD` so the range is well-formed.
+        //   2. `--diff-base` set, no `--diff-head`: auto-detect against
+        //      that base ref (working tree vs <base>).
+        //   3. Neither: smart-detect via origin/HEAD → main → master →
+        //      HEAD~1. This is the path the user gets from `--diff` alone,
+        //      which previously was wired to "HEAD" and silently restricted
+        //      the diff to uncommitted changes only.
         return if let Some(head) = req.diff_head {
-            wrkflw_trigger_filter::context_from_diff_range(
-                event_name,
-                req.diff_base,
-                head,
-                cwd_for_git,
-            )
-            .await
+            let base = req.diff_base.unwrap_or("HEAD");
+            wrkflw_trigger_filter::context_from_diff_range(event_name, base, head, cwd_for_git)
+                .await
+        } else if let Some(base) = req.diff_base {
+            wrkflw_trigger_filter::auto_detect_context(event_name, base, cwd_for_git).await
         } else {
-            wrkflw_trigger_filter::auto_detect_context(event_name, req.diff_base, cwd_for_git).await
+            wrkflw_trigger_filter::auto_detect_context_default_base(event_name, cwd_for_git).await
         }
         .unwrap_or_else(|e| {
             eprintln!("Error: failed to get git diff: {}", e);
@@ -986,6 +1024,23 @@ fn apply_base_branch(
              `branches:` to constrain the PR target branch will be reported as not triggering. \
              Pass --base-branch <name> to match against a target branch.",
         );
+    }
+}
+
+/// Stamp `--activity-type` onto the event context.
+///
+/// `EventContext::activity_type` is the field GitHub Actions matches its
+/// `types:` filter against. If a user simulates a `pull_request` whose
+/// workflow has `types: [opened, synchronize]` but doesn't pass
+/// `--activity-type`, every such workflow is silently rejected with
+/// "no activity type in context" — exactly the silent-skip failure mode
+/// the rest of this PR is built to prevent.
+fn apply_activity_type(
+    ctx: &mut wrkflw_trigger_filter::EventContext,
+    activity_type: Option<&String>,
+) {
+    if let Some(activity) = activity_type {
+        ctx.activity_type = Some(activity.clone());
     }
 }
 

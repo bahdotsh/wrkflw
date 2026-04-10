@@ -12,6 +12,7 @@ categories.workspace = true
 
 [dependencies]
 wrkflw-parser.workspace = true
+wrkflw-logging.workspace = true
 serde_yaml.workspace = true
 glob.workspace = true
 tokio.workspace = true

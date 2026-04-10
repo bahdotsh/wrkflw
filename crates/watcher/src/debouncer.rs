@@ -43,7 +43,14 @@ impl Debouncer {
     pub async fn drain(&self) -> Vec<PathBuf> {
         // Cap the number of settle rounds to prevent livelock when events
         // arrive faster than the debounce window.
-        const MAX_SETTLE_ROUNDS: usize = 10;
+        //
+        // Tuning rationale: with the default 500ms debounce, the previous
+        // value of 10 rounds meant a sustained `cargo build` could delay
+        // a drain by 5s — long enough for the user to wonder if the
+        // watcher is hung. 3 rounds caps the worst case at ~1.5s while
+        // still absorbing the brief flurries that follow most editor
+        // saves (write → fsync → editor swap-rename).
+        const MAX_SETTLE_ROUNDS: usize = 3;
 
         let mut rounds = 0;
         loop {

@@ -141,6 +141,14 @@ fn merge_unique(mut into: Vec<String>, more: Vec<String>) -> Vec<String> {
 /// version. We accept that — the trigger filter is a "what would run on
 /// this checkout?" approximation, not a full index audit.
 ///
+/// The same gap applies to staged deletions: if the user `git rm`-ed a
+/// file but has not committed yet, the file is gone from the working
+/// tree, present in the index, and present in `<base>`. `git diff <base>`
+/// against the working tree reports it as deleted (the working tree no
+/// longer has it), so this case IS covered. But a file that was deleted
+/// in the index AND restored in the working tree is invisible — same
+/// shape as the modified-then-reverted case above.
+///
 /// `cwd` selects the git working directory; pass `None` to use the
 /// process CWD. The watcher should always pass its repo root.
 pub async fn get_changed_files(
@@ -243,6 +251,19 @@ pub async fn get_default_diff_base(cwd: Option<&Path>) -> Result<String, Trigger
     if let Ok(output) = run_git(status_cmd, "git status").await {
         let stdout = String::from_utf8_lossy(&output.stdout);
         if !stdout.trim().is_empty() {
+            // Surface the heuristic so users aren't surprised when
+            // `--diff` against a dirty tree only considers uncommitted
+            // changes. The typical confusion: "I have WIP edits and a
+            // workflow with `paths: ['src/**']` is reported as not
+            // triggering even though my committed branch obviously
+            // changed src/". Pointing them at `--diff-base` lets them
+            // override without having to read the source.
+            wrkflw_logging::info(
+                "diff base = HEAD: working tree has uncommitted changes, so \
+                 --diff is comparing the working tree against the last commit. \
+                 Pass --diff-base <ref> (e.g. main, origin/main) to compare \
+                 against a branch instead.",
+            );
             return Ok("HEAD".to_string());
         }
     }

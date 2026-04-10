@@ -1,9 +1,13 @@
 use crate::error::TriggerFilterError;
-use crate::model::{EventFilter, WorkflowTriggerConfig};
+use crate::model::{EventFilter, GlobPattern, WorkflowTriggerConfig};
 use std::path::PathBuf;
 use wrkflw_parser::workflow::WorkflowDefinition;
 
 /// Parse the `on_raw` YAML value from a WorkflowDefinition into structured trigger config.
+///
+/// Glob patterns in `branches`, `tags`, `paths`, and their `*-ignore` counterparts
+/// are compiled here so that invalid patterns surface as a `ParseError` instead of
+/// silently never matching at evaluation time.
 pub fn parse_trigger_config(
     workflow: &WorkflowDefinition,
     workflow_path: PathBuf,
@@ -85,12 +89,12 @@ fn parse_event_config(
 
     Ok(EventFilter {
         event_name: event_name.to_string(),
-        branches: extract_string_list(map, "branches"),
-        branches_ignore: extract_string_list(map, "branches-ignore"),
-        tags: extract_string_list(map, "tags"),
-        tags_ignore: extract_string_list(map, "tags-ignore"),
-        paths: extract_string_list(map, "paths"),
-        paths_ignore: extract_string_list(map, "paths-ignore"),
+        branches: extract_glob_list(map, "branches", event_name)?,
+        branches_ignore: extract_glob_list(map, "branches-ignore", event_name)?,
+        tags: extract_glob_list(map, "tags", event_name)?,
+        tags_ignore: extract_glob_list(map, "tags-ignore", event_name)?,
+        paths: extract_glob_list(map, "paths", event_name)?,
+        paths_ignore: extract_glob_list(map, "paths-ignore", event_name)?,
         types: extract_string_list(map, "types"),
     })
 }
@@ -109,6 +113,29 @@ fn extract_string_list(map: &serde_yaml::Mapping, key: &str) -> Vec<String> {
             .collect(),
         _ => Vec::new(),
     }
+}
+
+/// Extract a list of strings from a YAML mapping and compile each as a glob pattern.
+///
+/// Compilation failures are surfaced as `TriggerFilterError::ParseError` so that
+/// a typo like `paths: [src/**.rs]` is reported to the user instead of silently
+/// causing the workflow to never trigger.
+fn extract_glob_list(
+    map: &serde_yaml::Mapping,
+    key: &str,
+    event_name: &str,
+) -> Result<Vec<GlobPattern>, TriggerFilterError> {
+    let raw = extract_string_list(map, key);
+    raw.into_iter()
+        .map(|source| {
+            GlobPattern::new(&source).map_err(|e| {
+                TriggerFilterError::ParseError(format!(
+                    "Invalid glob pattern '{}' under '{}.{}': {}",
+                    source, event_name, key, e
+                ))
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -156,14 +183,17 @@ pull_request:
         assert_eq!(events.len(), 2);
 
         let push = events.iter().find(|e| e.event_name == "push").unwrap();
-        assert_eq!(push.branches, vec!["main", "release/**"]);
-        assert_eq!(push.paths, vec!["src/**", "Cargo.toml"]);
+        let branch_sources: Vec<&str> = push.branches.iter().map(|g| g.source.as_str()).collect();
+        assert_eq!(branch_sources, vec!["main", "release/**"]);
+        let path_sources: Vec<&str> = push.paths.iter().map(|g| g.source.as_str()).collect();
+        assert_eq!(path_sources, vec!["src/**", "Cargo.toml"]);
 
         let pr = events
             .iter()
             .find(|e| e.event_name == "pull_request")
             .unwrap();
-        assert_eq!(pr.paths_ignore, vec!["docs/**", "*.md"]);
+        let pi: Vec<&str> = pr.paths_ignore.iter().map(|g| g.source.as_str()).collect();
+        assert_eq!(pi, vec!["docs/**", "*.md"]);
     }
 
     #[test]
@@ -197,8 +227,8 @@ push:
 "#,
         );
         let events = parse_events(&raw).unwrap();
-        assert_eq!(events[0].tags, vec!["v*"]);
-        assert_eq!(events[0].tags_ignore, vec!["v*-rc*"]);
+        assert_eq!(events[0].tags[0].source, "v*");
+        assert_eq!(events[0].tags_ignore[0].source, "v*-rc*");
     }
 
     #[test]
@@ -228,5 +258,35 @@ issues:
         );
         let events = parse_events(&raw).unwrap();
         assert_eq!(events[0].types, vec!["opened"]);
+    }
+
+    #[test]
+    fn invalid_glob_pattern_surfaces_as_parse_error() {
+        // Unclosed bracket is an invalid glob — should fail at parse time, not silently
+        let raw = make_on_raw(
+            r#"
+push:
+  paths:
+    - '[unclosed'
+"#,
+        );
+        let err = parse_events(&raw).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Invalid glob"), "got: {}", msg);
+        assert!(msg.contains("[unclosed"), "got: {}", msg);
+        assert!(msg.contains("push.paths"), "got: {}", msg);
+    }
+
+    #[test]
+    fn invalid_branches_glob_surfaces_as_parse_error() {
+        let raw = make_on_raw(
+            r#"
+push:
+  branches:
+    - 'main'
+    - '[bad'
+"#,
+        );
+        assert!(parse_events(&raw).is_err());
     }
 }

@@ -7,7 +7,4 @@ pub enum TriggerFilterError {
 
     #[error("Git error: {0}")]
     GitError(String),
-
-    #[error("IO error: {0}")]
-    IoError(#[from] std::io::Error),
 }

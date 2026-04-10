@@ -66,8 +66,16 @@ pub struct App {
 
     // Diff-aware trigger filtering
     pub diff_filter_active: bool,
-    pub diff_filter_rx: Option<mpsc::Receiver<Vec<Option<TriggerMatchStatus>>>>,
+    /// Channel receiving (workflow_path, trigger_status) pairs from the background
+    /// evaluation thread. We send pairs (rather than a positional Vec) so that
+    /// reloading `self.workflows` between toggle and result delivery cannot
+    /// mis-assign trigger statuses.
+    pub diff_filter_rx: Option<DiffFilterReceiver>,
 }
+
+/// Result rows shipped from the background diff-filter thread to the UI loop.
+pub type DiffFilterResults = Vec<(PathBuf, Option<TriggerMatchStatus>)>;
+pub type DiffFilterReceiver = mpsc::Receiver<DiffFilterResults>;
 
 impl App {
     pub fn new(
@@ -319,6 +327,11 @@ impl App {
 
     /// Check for completed diff filter results from the background thread.
     /// Called on each TUI tick to apply results without blocking.
+    ///
+    /// Results are looked up by workflow path so that reloading
+    /// `self.workflows` between toggle and result delivery (e.g. a new file
+    /// shows up on disk) does not cause statuses to be assigned to the wrong
+    /// workflow.
     pub fn check_diff_filter_results(&mut self) {
         let results = match self.diff_filter_rx.as_ref() {
             Some(rx) => match rx.try_recv() {
@@ -334,8 +347,10 @@ impl App {
         };
         self.diff_filter_rx = None;
 
-        for (workflow, result) in self.workflows.iter_mut().zip(results.into_iter()) {
-            workflow.trigger_match = result;
+        let by_path: std::collections::HashMap<PathBuf, Option<TriggerMatchStatus>> =
+            results.into_iter().collect();
+        for workflow in self.workflows.iter_mut() {
+            workflow.trigger_match = by_path.get(&workflow.path).cloned().flatten();
         }
 
         let matched = self
@@ -1282,27 +1297,38 @@ impl App {
 }
 
 /// Run git + trigger evaluation on a background thread.
-/// Spins up a short-lived tokio runtime so we can reuse the async git helpers
-/// without maintaining duplicate sync wrappers.
-fn evaluate_diff_filter(workflow_paths: Vec<PathBuf>) -> Vec<Option<TriggerMatchStatus>> {
+///
+/// Returns `(workflow_path, status)` pairs so the caller can apply results
+/// keyed by path — this guarantees correctness even if the workflow list is
+/// reloaded between toggle and result delivery.
+///
+/// Note: this hardcodes `event_name = "push"`. The TUI does not currently
+/// expose event/branch selection; users who need that should use
+/// `wrkflw run --event ... --diff` from the CLI.
+fn evaluate_diff_filter(
+    workflow_paths: Vec<PathBuf>,
+) -> Vec<(PathBuf, Option<TriggerMatchStatus>)> {
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
     {
         Ok(rt) => rt,
-        Err(_) => return vec![None; workflow_paths.len()],
+        Err(_) => {
+            return workflow_paths.into_iter().map(|p| (p, None)).collect();
+        }
     };
 
-    let context = match rt.block_on(async {
-        let diff_base = wrkflw_trigger_filter::git::get_default_diff_base().await;
-        wrkflw_trigger_filter::auto_detect_context("push", &diff_base).await
-    }) {
+    let context = match rt
+        .block_on(async { wrkflw_trigger_filter::auto_detect_context_default_base("push", None).await })
+    {
         Ok(ctx) => ctx,
-        Err(_) => return vec![None; workflow_paths.len()],
+        Err(_) => {
+            return workflow_paths.into_iter().map(|p| (p, None)).collect();
+        }
     };
 
     // Parse workflows and use filter_workflows to evaluate
-    let workflows: Vec<_> = workflow_paths
+    let parsed: Vec<(PathBuf, wrkflw_parser::workflow::WorkflowDefinition)> = workflow_paths
         .iter()
         .filter_map(|path| {
             wrkflw_parser::workflow::parse_workflow(path)
@@ -1310,23 +1336,24 @@ fn evaluate_diff_filter(workflow_paths: Vec<PathBuf>) -> Vec<Option<TriggerMatch
                 .map(|wf| (path.clone(), wf))
         })
         .collect();
+    let borrowed: Vec<(PathBuf, &wrkflw_parser::workflow::WorkflowDefinition)> =
+        parsed.iter().map(|(p, w)| (p.clone(), w)).collect();
 
-    let results = wrkflw_trigger_filter::filter_workflows(&workflows, &context);
+    let results = wrkflw_trigger_filter::filter_workflows(&borrowed, &context);
+    let results_by_path: std::collections::HashMap<PathBuf, &wrkflw_trigger_filter::TriggerMatchResult> =
+        results.iter().map(|r| (r.workflow_path.clone(), r)).collect();
 
-    // Map back to original workflow_paths order (unparseable workflows get None)
     workflow_paths
-        .iter()
+        .into_iter()
         .map(|path| {
-            results
-                .iter()
-                .find(|r| r.workflow_path == *path)
-                .map(|result| {
-                    if result.matches {
-                        TriggerMatchStatus::Matched(result.reason.clone())
-                    } else {
-                        TriggerMatchStatus::Skipped(result.reason.clone())
-                    }
-                })
+            let status = results_by_path.get(&path).map(|result| {
+                if result.matches {
+                    TriggerMatchStatus::Matched(result.reason.clone())
+                } else {
+                    TriggerMatchStatus::Skipped(result.reason.clone())
+                }
+            });
+            (path, status)
         })
         .collect()
 }
@@ -1429,6 +1456,69 @@ mod tests {
         assert_eq!(app.selected_job_index, 0);
         app.previous_available_job();
         assert_eq!(app.selected_job_index, 0);
+    }
+
+    #[test]
+    fn check_diff_filter_results_keys_by_path_not_position() {
+        // Regression: previously the result was zipped positionally with
+        // self.workflows. If the workflow list reloaded between toggle and
+        // result delivery, statuses would land on the wrong workflow.
+        let mut app = make_app();
+        // Simulate a reload that reorders workflows AFTER we captured paths
+        app.workflows = vec![
+            Workflow {
+                name: "deploy".into(),
+                path: PathBuf::from("deploy.yml"),
+                selected: false,
+                status: WorkflowStatus::NotStarted,
+                execution_details: None,
+                job_names: vec![],
+                trigger_match: None,
+            },
+            Workflow {
+                name: "ci".into(),
+                path: PathBuf::from("ci.yml"),
+                selected: false,
+                status: WorkflowStatus::NotStarted,
+                execution_details: None,
+                job_names: vec![],
+                trigger_match: None,
+            },
+        ];
+
+        // Background thread reports results keyed to the OLD order
+        let (tx, rx) = mpsc::channel();
+        app.diff_filter_rx = Some(rx);
+        app.diff_filter_active = true;
+        tx.send(vec![
+            (
+                PathBuf::from("ci.yml"),
+                Some(TriggerMatchStatus::Matched("matched ci".into())),
+            ),
+            (
+                PathBuf::from("deploy.yml"),
+                Some(TriggerMatchStatus::Skipped("skipped deploy".into())),
+            ),
+        ])
+        .unwrap();
+
+        app.check_diff_filter_results();
+
+        // After applying, ci.yml must be Matched and deploy.yml Skipped
+        // regardless of their position in self.workflows.
+        let by_name: std::collections::HashMap<&str, &Option<TriggerMatchStatus>> = app
+            .workflows
+            .iter()
+            .map(|w| (w.name.as_str(), &w.trigger_match))
+            .collect();
+        assert!(matches!(
+            by_name.get("ci").unwrap(),
+            Some(TriggerMatchStatus::Matched(_))
+        ));
+        assert!(matches!(
+            by_name.get("deploy").unwrap(),
+            Some(TriggerMatchStatus::Skipped(_))
+        ));
     }
 
     #[test]

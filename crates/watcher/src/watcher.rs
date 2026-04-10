@@ -2,11 +2,13 @@ use crate::debouncer::Debouncer;
 use crate::error::WatchError;
 use futures::stream::{self, StreamExt};
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use wrkflw_executor::ExecutionConfig;
+use wrkflw_parser::workflow::WorkflowDefinition;
 
 /// Default cap on workflows executing concurrently in watch mode when the
 /// caller does not supply an explicit limit.
@@ -43,6 +45,7 @@ pub struct WorkflowWatcher {
     workflow_dir: PathBuf,
     repo_root: PathBuf,
     event_name: String,
+    base_branch: Option<String>,
     debounce_duration: Duration,
     config_template: ExecutionConfig,
     verbose: bool,
@@ -50,10 +53,12 @@ pub struct WorkflowWatcher {
 }
 
 impl WorkflowWatcher {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         workflow_dir: PathBuf,
         repo_root: PathBuf,
         event_name: String,
+        base_branch: Option<String>,
         debounce_duration: Duration,
         config: ExecutionConfig,
         verbose: bool,
@@ -65,6 +70,7 @@ impl WorkflowWatcher {
             workflow_dir,
             repo_root,
             event_name,
+            base_branch,
             debounce_duration,
             config_template: config,
             verbose,
@@ -107,7 +113,7 @@ impl WorkflowWatcher {
     where
         F: Fn(WatchEvent) + Send + Sync + 'static,
     {
-        let workflow_files = self.collect_workflow_files()?;
+        let initial_workflow_files = self.collect_workflow_files()?;
 
         let (tx, mut rx) = mpsc::channel::<PathBuf>(256);
         let debouncer = Arc::new(Debouncer::new(self.debounce_duration));
@@ -120,11 +126,12 @@ impl WorkflowWatcher {
         // the entire duration of the watch loop below. Do not narrow this
         // scope or rebind it without preserving its lifetime.
         let tx_clone = tx.clone();
+        let repo_root_clone = self.repo_root.clone();
         let mut watcher = RecommendedWatcher::new(
             move |res: Result<Event, notify::Error>| {
                 if let Ok(event) = res {
                     for path in event.paths {
-                        if should_ignore_path(&path) {
+                        if should_ignore_path(&path, &repo_root_clone) {
                             continue;
                         }
                         // Use try_send to avoid blocking the OS filesystem event
@@ -157,8 +164,11 @@ impl WorkflowWatcher {
             }
         });
 
-        // Main loop: wait for notification, debounce, evaluate triggers, execute
-        let mut workflow_files = workflow_files;
+        // Cache of parsed workflow definitions, keyed by file path.
+        // Reparsed only when a file is new or shows up in changed_paths.
+        let mut parsed_cache: HashMap<PathBuf, WorkflowDefinition> = HashMap::new();
+        let mut workflow_files = initial_workflow_files;
+
         loop {
             // Only block on notification if no events are already pending.
             // This prevents losing events that accumulated during workflow execution.
@@ -176,6 +186,55 @@ impl WorkflowWatcher {
                 workflow_files = refreshed;
             }
 
+            // Refresh the parse cache: drop entries no longer in the workflow
+            // list, reparse new ones and any whose backing file just changed.
+            let active_set: HashSet<&PathBuf> = workflow_files.iter().collect();
+            parsed_cache.retain(|k, _| active_set.contains(k));
+
+            let changed_set: HashSet<&PathBuf> = changed_paths.iter().collect();
+            let mut parse_failures = 0usize;
+            for wf_path in &workflow_files {
+                let needs_reparse =
+                    !parsed_cache.contains_key(wf_path) || changed_set.contains(wf_path);
+                if needs_reparse {
+                    match wrkflw_parser::workflow::parse_workflow(wf_path) {
+                        Ok(wf) => {
+                            parsed_cache.insert(wf_path.clone(), wf);
+                        }
+                        Err(e) => {
+                            parsed_cache.remove(wf_path);
+                            parse_failures += 1;
+                            if self.verbose {
+                                wrkflw_logging::warning(&format!(
+                                    "Failed to parse {}: {}",
+                                    wf_path.display(),
+                                    e
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+            // Build the borrowed view used by filter_workflows. We must
+            // hold the cache borrow for the entire eval call.
+            let workflows_for_eval: Vec<(PathBuf, &WorkflowDefinition)> = workflow_files
+                .iter()
+                .filter_map(|p| parsed_cache.get(p).map(|wf| (p.clone(), wf)))
+                .collect();
+
+            if workflows_for_eval.is_empty() && !workflow_files.is_empty() {
+                wrkflw_logging::warning(&format!(
+                    "No workflows are usable: all {} workflow file(s) failed to parse. \
+                     Run with --verbose for details.",
+                    workflow_files.len()
+                ));
+            } else if parse_failures > 0 && !self.verbose {
+                wrkflw_logging::warning(&format!(
+                    "{} workflow file(s) failed to parse and were skipped (use --verbose for details)",
+                    parse_failures
+                ));
+            }
+
             // Convert to relative paths
             let changed_files: Vec<String> = changed_paths
                 .iter()
@@ -191,7 +250,7 @@ impl WorkflowWatcher {
             }
 
             let event = self
-                .evaluate_and_execute(&workflow_files, changed_files)
+                .evaluate_and_execute(&workflows_for_eval, changed_files)
                 .await;
 
             let cb = callback.clone();
@@ -199,50 +258,37 @@ impl WorkflowWatcher {
         }
     }
 
-    /// Evaluate triggers for all workflow files against the current git state,
-    /// then execute the matching workflows with bounded concurrency.
+    /// Evaluate triggers for the given (already parsed) workflows against the
+    /// current git state, then execute the matching workflows with bounded
+    /// concurrency.
     async fn evaluate_and_execute(
         &self,
-        workflow_files: &[PathBuf],
+        workflows: &[(PathBuf, &WorkflowDefinition)],
         changed_files: Vec<String>,
     ) -> WatchEvent {
         let context = wrkflw_trigger_filter::context_from_changed_files(
             &self.event_name,
             changed_files.clone(),
+            Some(&self.repo_root),
         )
         .await
+        .map(|mut ctx| {
+            ctx.base_branch = self.base_branch.clone();
+            ctx
+        })
         .unwrap_or_else(|e| {
             wrkflw_logging::warning(&format!("Failed to build event context: {}", e));
             wrkflw_trigger_filter::EventContext {
                 event_name: self.event_name.clone(),
                 branch: None,
+                base_branch: self.base_branch.clone(),
                 tag: None,
                 changed_files: changed_files.clone(),
                 activity_type: None,
             }
         });
 
-        // Parse all workflow files, logging failures
-        let workflows: Vec<_> = workflow_files
-            .iter()
-            .filter_map(
-                |wf_path| match wrkflw_parser::workflow::parse_workflow(wf_path) {
-                    Ok(wf) => Some((wf_path.clone(), wf)),
-                    Err(e) => {
-                        if self.verbose {
-                            wrkflw_logging::warning(&format!(
-                                "Failed to parse {}: {}",
-                                wf_path.display(),
-                                e
-                            ));
-                        }
-                        None
-                    }
-                },
-            )
-            .collect();
-
-        let results = wrkflw_trigger_filter::filter_workflows(&workflows, &context);
+        let results = wrkflw_trigger_filter::filter_workflows(workflows, &context);
 
         let mut triggered = Vec::new();
         let mut skipped = Vec::new();
@@ -297,9 +343,29 @@ impl WorkflowWatcher {
     }
 }
 
-/// Returns `true` if a path falls inside any of the default ignore directories.
-fn should_ignore_path(path: &std::path::Path) -> bool {
-    for component in path.components() {
+/// Returns `true` if a path falls inside any of the default ignore directories,
+/// where "inside" means: a directory component (NOT the leaf filename) of the
+/// path's `repo_root`-relative form matches one of the ignore names.
+///
+/// We deliberately skip the leaf component so a user file literally named
+/// `target` (e.g. `scripts/target`) is not silently dropped — only paths that
+/// have a `target/` (etc.) parent directory are filtered.
+fn should_ignore_path(path: &Path, repo_root: &Path) -> bool {
+    // Make the path repo-root-relative if possible. If it isn't under
+    // repo_root we still apply the ignore set positionally rather than
+    // returning false, so events from inside symlinks etc. still get filtered.
+    let rel = path.strip_prefix(repo_root).unwrap_or(path);
+    let components: Vec<_> = rel.components().collect();
+    if components.is_empty() {
+        return false;
+    }
+    // Iterate every component except the last (the leaf, which is presumed
+    // to be a filename and shouldn't be matched against directory names).
+    let last_idx = components.len() - 1;
+    for (i, component) in components.iter().enumerate() {
+        if i == last_idx {
+            break;
+        }
         if let std::path::Component::Normal(os) = component {
             if let Some(s) = os.to_str() {
                 if DEFAULT_IGNORE_DIRS.contains(&s) {
@@ -330,45 +396,75 @@ pub fn find_repo_root() -> Option<PathBuf> {
 mod tests {
     use super::*;
 
+    fn root() -> &'static Path {
+        Path::new("/repo")
+    }
+
     #[test]
     fn ignores_git_directory() {
-        assert!(should_ignore_path(std::path::Path::new(
-            "/repo/.git/objects/pack/abc"
-        )));
+        assert!(should_ignore_path(
+            Path::new("/repo/.git/objects/pack/abc"),
+            root()
+        ));
     }
 
     #[test]
     fn ignores_target_directory() {
-        assert!(should_ignore_path(std::path::Path::new(
-            "/repo/target/debug/deps/foo"
-        )));
+        assert!(should_ignore_path(
+            Path::new("/repo/target/debug/deps/foo"),
+            root()
+        ));
     }
 
     #[test]
     fn ignores_node_modules() {
-        assert!(should_ignore_path(std::path::Path::new(
-            "/repo/node_modules/pkg/index.js"
-        )));
+        assert!(should_ignore_path(
+            Path::new("/repo/node_modules/pkg/index.js"),
+            root()
+        ));
     }
 
     #[test]
     fn does_not_ignore_src() {
-        assert!(!should_ignore_path(std::path::Path::new(
-            "/repo/src/main.rs"
-        )));
+        assert!(!should_ignore_path(Path::new("/repo/src/main.rs"), root()));
     }
 
     #[test]
     fn does_not_ignore_workflow_files() {
-        assert!(!should_ignore_path(std::path::Path::new(
-            "/repo/.github/workflows/ci.yml"
-        )));
+        assert!(!should_ignore_path(
+            Path::new("/repo/.github/workflows/ci.yml"),
+            root()
+        ));
     }
 
     #[test]
     fn ignores_pycache() {
-        assert!(should_ignore_path(std::path::Path::new(
-            "/repo/__pycache__/module.cpython-311.pyc"
-        )));
+        assert!(should_ignore_path(
+            Path::new("/repo/__pycache__/module.cpython-311.pyc"),
+            root()
+        ));
+    }
+
+    #[test]
+    fn does_not_ignore_file_named_target() {
+        // A file literally named `target` should not be filtered out;
+        // only directories named `target/` count.
+        assert!(!should_ignore_path(
+            Path::new("/repo/scripts/target"),
+            root()
+        ));
+    }
+
+    #[test]
+    fn does_not_ignore_file_named_build() {
+        assert!(!should_ignore_path(Path::new("/repo/docs/build"), root()));
+    }
+
+    #[test]
+    fn ignores_nested_target_subdirectory() {
+        assert!(should_ignore_path(
+            Path::new("/repo/crates/foo/target/debug/build/foo"),
+            root()
+        ));
     }
 }

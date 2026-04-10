@@ -3717,6 +3717,7 @@ dependencies = [
  "serde_yaml",
  "thiserror",
  "tokio",
+ "wrkflw-logging",
  "wrkflw-parser",
 ]
 

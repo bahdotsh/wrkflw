@@ -1,4 +1,4 @@
-use crate::model::{EventContext, TriggerMatchResult, WorkflowTriggerConfig};
+use crate::model::{EventContext, EventFilter, TriggerMatchResult, WorkflowTriggerConfig};
 use crate::path_matcher;
 use crate::ref_matcher;
 
@@ -36,8 +36,13 @@ pub fn evaluate_trigger(
     for filter in &matching_filters {
         // Check branch filters (applies to push, pull_request, etc.)
         if !filter.branches.is_empty() || !filter.branches_ignore.is_empty() {
-            match context.branch {
-                Some(ref branch) => {
+            // GitHub Actions semantics: for `pull_request` and
+            // `pull_request_target`, the `branches:` filter matches the BASE
+            // (target) branch, not the source/head branch. For all other
+            // events (push, etc.) it matches the current branch.
+            let target_branch = branch_for_filter(context);
+            match target_branch {
+                Some(branch) => {
                     if !ref_matcher::matches_ref(branch, &filter.branches, &filter.branches_ignore)
                     {
                         continue;
@@ -95,47 +100,7 @@ pub fn evaluate_trigger(
     // No filter combination matched — build a diagnostic reason
     let reasons: Vec<String> = matching_filters
         .iter()
-        .map(|f| {
-            let mut parts = Vec::new();
-            if !f.branches.is_empty() || !f.branches_ignore.is_empty() {
-                match &context.branch {
-                    Some(branch) => parts.push(format!(
-                        "branch '{}' did not match {:?}",
-                        branch, f.branches
-                    )),
-                    None => {
-                        parts.push("no branch in context (branch filter requires one)".to_string())
-                    }
-                }
-            }
-            if !f.tags.is_empty() || !f.tags_ignore.is_empty() {
-                match &context.tag {
-                    Some(tag) => parts.push(format!("tag '{}' did not match {:?}", tag, f.tags)),
-                    None => parts.push("no tag in context (tag filter requires one)".to_string()),
-                }
-            }
-            if !f.types.is_empty() {
-                match &context.activity_type {
-                    Some(activity) => {
-                        parts.push(format!("activity '{}' not in {:?}", activity, f.types))
-                    }
-                    None => parts.push(
-                        "no activity type in context (types filter requires one)".to_string(),
-                    ),
-                }
-            }
-            if !f.paths.is_empty() {
-                parts.push(format!("paths: {:?}", f.paths));
-            }
-            if !f.paths_ignore.is_empty() {
-                parts.push(format!("paths-ignore: {:?}", f.paths_ignore));
-            }
-            if parts.is_empty() {
-                "no specific filters".to_string()
-            } else {
-                parts.join(", ")
-            }
-        })
+        .map(|f| explain_filter_failure(f, context))
         .collect();
 
     TriggerMatchResult {
@@ -151,11 +116,81 @@ pub fn evaluate_trigger(
     }
 }
 
+/// Pick the branch that GH Actions uses to evaluate `branches:` filters.
+fn branch_for_filter(context: &EventContext) -> Option<&String> {
+    match context.event_name.as_str() {
+        "pull_request" | "pull_request_target" => context.base_branch.as_ref(),
+        _ => context.branch.as_ref(),
+    }
+}
+
+/// Build a human-readable diagnostic explaining which sub-filter caused
+/// `filter` to reject `context`.
+fn explain_filter_failure(filter: &EventFilter, context: &EventContext) -> String {
+    let mut parts = Vec::new();
+
+    if !filter.branches.is_empty() || !filter.branches_ignore.is_empty() {
+        let pattern_sources: Vec<&str> = filter.branches.iter().map(|p| p.source.as_str()).collect();
+        match branch_for_filter(context) {
+            Some(branch) => parts.push(format!(
+                "branch '{}' did not match {:?}",
+                branch, pattern_sources
+            )),
+            None => {
+                let what = if matches!(
+                    context.event_name.as_str(),
+                    "pull_request" | "pull_request_target"
+                ) {
+                    "no base_branch in context (pull_request branches: filter requires the target branch — pass --base-branch)"
+                } else {
+                    "no branch in context (branch filter requires one)"
+                };
+                parts.push(what.to_string());
+            }
+        }
+    }
+    if !filter.tags.is_empty() || !filter.tags_ignore.is_empty() {
+        let pattern_sources: Vec<&str> = filter.tags.iter().map(|p| p.source.as_str()).collect();
+        match &context.tag {
+            Some(tag) => parts.push(format!("tag '{}' did not match {:?}", tag, pattern_sources)),
+            None => parts.push("no tag in context (tag filter requires one)".to_string()),
+        }
+    }
+    if !filter.types.is_empty() {
+        match &context.activity_type {
+            Some(activity) => parts.push(format!("activity '{}' not in {:?}", activity, filter.types)),
+            None => parts
+                .push("no activity type in context (types filter requires one)".to_string()),
+        }
+    }
+    if !filter.paths.is_empty() {
+        let sources: Vec<&str> = filter.paths.iter().map(|p| p.source.as_str()).collect();
+        parts.push(format!("paths: {:?}", sources));
+    }
+    if !filter.paths_ignore.is_empty() {
+        let sources: Vec<&str> = filter
+            .paths_ignore
+            .iter()
+            .map(|p| p.source.as_str())
+            .collect();
+        parts.push(format!("paths-ignore: {:?}", sources));
+    }
+    if parts.is_empty() {
+        "no specific filters".to_string()
+    } else {
+        parts.join(", ")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::EventFilter;
+    use crate::model::{EventFilter, GlobPattern};
     use std::path::PathBuf;
+
+    fn gp(s: &str) -> GlobPattern {
+        GlobPattern::new(s).unwrap()
+    }
 
     fn make_config(events: Vec<EventFilter>) -> WorkflowTriggerConfig {
         WorkflowTriggerConfig {
@@ -174,9 +209,8 @@ mod tests {
         let ctx = EventContext {
             event_name: "pull_request".into(),
             branch: Some("main".into()),
-            tag: None,
             changed_files: vec!["src/main.rs".into()],
-            activity_type: None,
+            ..Default::default()
         };
         let result = evaluate_trigger(&config, &ctx);
         assert!(!result.matches);
@@ -191,27 +225,22 @@ mod tests {
         let ctx = EventContext {
             event_name: "push".into(),
             branch: Some("main".into()),
-            tag: None,
-            changed_files: vec![],
-            activity_type: None,
+            ..Default::default()
         };
-        let result = evaluate_trigger(&config, &ctx);
-        assert!(result.matches);
+        assert!(evaluate_trigger(&config, &ctx).matches);
     }
 
     #[test]
     fn branch_filter_matches() {
         let config = make_config(vec![EventFilter {
             event_name: "push".into(),
-            branches: vec!["main".into(), "release/**".into()],
+            branches: vec![gp("main"), gp("release/**")],
             ..Default::default()
         }]);
         let ctx = EventContext {
             event_name: "push".into(),
             branch: Some("main".into()),
-            tag: None,
-            changed_files: vec![],
-            activity_type: None,
+            ..Default::default()
         };
         assert!(evaluate_trigger(&config, &ctx).matches);
     }
@@ -220,15 +249,13 @@ mod tests {
     fn branch_filter_no_match() {
         let config = make_config(vec![EventFilter {
             event_name: "push".into(),
-            branches: vec!["main".into()],
+            branches: vec![gp("main")],
             ..Default::default()
         }]);
         let ctx = EventContext {
             event_name: "push".into(),
             branch: Some("feature/foo".into()),
-            tag: None,
-            changed_files: vec![],
-            activity_type: None,
+            ..Default::default()
         };
         assert!(!evaluate_trigger(&config, &ctx).matches);
     }
@@ -237,15 +264,14 @@ mod tests {
     fn path_filter_matches() {
         let config = make_config(vec![EventFilter {
             event_name: "push".into(),
-            paths: vec!["src/**".into()],
+            paths: vec![gp("src/**")],
             ..Default::default()
         }]);
         let ctx = EventContext {
             event_name: "push".into(),
             branch: Some("main".into()),
-            tag: None,
             changed_files: vec!["src/main.rs".into()],
-            activity_type: None,
+            ..Default::default()
         };
         assert!(evaluate_trigger(&config, &ctx).matches);
     }
@@ -254,15 +280,14 @@ mod tests {
     fn path_filter_no_match() {
         let config = make_config(vec![EventFilter {
             event_name: "push".into(),
-            paths: vec!["src/**".into()],
+            paths: vec![gp("src/**")],
             ..Default::default()
         }]);
         let ctx = EventContext {
             event_name: "push".into(),
             branch: Some("main".into()),
-            tag: None,
             changed_files: vec!["docs/readme.md".into()],
-            activity_type: None,
+            ..Default::default()
         };
         assert!(!evaluate_trigger(&config, &ctx).matches);
     }
@@ -271,16 +296,15 @@ mod tests {
     fn paths_ignore_match() {
         let config = make_config(vec![EventFilter {
             event_name: "push".into(),
-            paths_ignore: vec!["docs/**".into(), "*.md".into()],
+            paths_ignore: vec![gp("docs/**"), gp("*.md")],
             ..Default::default()
         }]);
         // Only doc changes — should NOT trigger
         let ctx = EventContext {
             event_name: "push".into(),
             branch: Some("main".into()),
-            tag: None,
             changed_files: vec!["docs/guide.md".into()],
-            activity_type: None,
+            ..Default::default()
         };
         assert!(!evaluate_trigger(&config, &ctx).matches);
 
@@ -288,9 +312,8 @@ mod tests {
         let ctx2 = EventContext {
             event_name: "push".into(),
             branch: Some("main".into()),
-            tag: None,
             changed_files: vec!["docs/guide.md".into(), "src/lib.rs".into()],
-            activity_type: None,
+            ..Default::default()
         };
         assert!(evaluate_trigger(&config, &ctx2).matches);
     }
@@ -299,38 +322,32 @@ mod tests {
     fn combined_branch_and_path_filter() {
         let config = make_config(vec![EventFilter {
             event_name: "push".into(),
-            branches: vec!["main".into()],
-            paths: vec!["src/**".into()],
+            branches: vec![gp("main")],
+            paths: vec![gp("src/**")],
             ..Default::default()
         }]);
 
-        // Right branch, right path
         let ctx = EventContext {
             event_name: "push".into(),
             branch: Some("main".into()),
-            tag: None,
             changed_files: vec!["src/main.rs".into()],
-            activity_type: None,
+            ..Default::default()
         };
         assert!(evaluate_trigger(&config, &ctx).matches);
 
-        // Wrong branch, right path
         let ctx2 = EventContext {
             event_name: "push".into(),
             branch: Some("develop".into()),
-            tag: None,
             changed_files: vec!["src/main.rs".into()],
-            activity_type: None,
+            ..Default::default()
         };
         assert!(!evaluate_trigger(&config, &ctx2).matches);
 
-        // Right branch, wrong path
         let ctx3 = EventContext {
             event_name: "push".into(),
             branch: Some("main".into()),
-            tag: None,
             changed_files: vec!["docs/readme.md".into()],
-            activity_type: None,
+            ..Default::default()
         };
         assert!(!evaluate_trigger(&config, &ctx3).matches);
     }
@@ -339,26 +356,22 @@ mod tests {
     fn tag_filter() {
         let config = make_config(vec![EventFilter {
             event_name: "push".into(),
-            tags: vec!["v*".into()],
-            tags_ignore: vec!["v*-rc*".into()],
+            tags: vec![gp("v*")],
+            tags_ignore: vec![gp("v*-rc*")],
             ..Default::default()
         }]);
 
         let ctx = EventContext {
             event_name: "push".into(),
-            branch: None,
             tag: Some("v1.0.0".into()),
-            changed_files: vec![],
-            activity_type: None,
+            ..Default::default()
         };
         assert!(evaluate_trigger(&config, &ctx).matches);
 
         let ctx2 = EventContext {
             event_name: "push".into(),
-            branch: None,
             tag: Some("v1.0.0-rc1".into()),
-            changed_files: vec![],
-            activity_type: None,
+            ..Default::default()
         };
         assert!(!evaluate_trigger(&config, &ctx2).matches);
     }
@@ -371,10 +384,7 @@ mod tests {
         }]);
         let ctx = EventContext {
             event_name: "workflow_dispatch".into(),
-            branch: None,
-            tag: None,
-            changed_files: vec![],
-            activity_type: None,
+            ..Default::default()
         };
         assert!(evaluate_trigger(&config, &ctx).matches);
     }
@@ -383,15 +393,12 @@ mod tests {
     fn branch_filter_fails_when_no_branch_in_context() {
         let config = make_config(vec![EventFilter {
             event_name: "push".into(),
-            branches: vec!["main".into()],
+            branches: vec![gp("main")],
             ..Default::default()
         }]);
         let ctx = EventContext {
             event_name: "push".into(),
-            branch: None,
-            tag: None,
-            changed_files: vec![],
-            activity_type: None,
+            ..Default::default()
         };
         assert!(!evaluate_trigger(&config, &ctx).matches);
     }
@@ -400,15 +407,13 @@ mod tests {
     fn tag_filter_fails_when_no_tag_in_context() {
         let config = make_config(vec![EventFilter {
             event_name: "push".into(),
-            tags: vec!["v*".into()],
+            tags: vec![gp("v*")],
             ..Default::default()
         }]);
         let ctx = EventContext {
             event_name: "push".into(),
             branch: Some("main".into()),
-            tag: None,
-            changed_files: vec![],
-            activity_type: None,
+            ..Default::default()
         };
         assert!(!evaluate_trigger(&config, &ctx).matches);
     }
@@ -422,10 +427,8 @@ mod tests {
         }]);
         let ctx = EventContext {
             event_name: "pull_request".into(),
-            branch: None,
-            tag: None,
-            changed_files: vec![],
             activity_type: Some("opened".into()),
+            ..Default::default()
         };
         assert!(evaluate_trigger(&config, &ctx).matches);
     }
@@ -439,10 +442,8 @@ mod tests {
         }]);
         let ctx = EventContext {
             event_name: "pull_request".into(),
-            branch: None,
-            tag: None,
-            changed_files: vec![],
             activity_type: Some("closed".into()),
+            ..Default::default()
         };
         assert!(!evaluate_trigger(&config, &ctx).matches);
     }
@@ -451,16 +452,82 @@ mod tests {
     fn types_filter_fails_when_no_activity_type_in_context() {
         let config = make_config(vec![EventFilter {
             event_name: "pull_request".into(),
-            types: vec!["opened".into()],
+            types: vec![gp("opened").source.clone()],
             ..Default::default()
         }]);
         let ctx = EventContext {
             event_name: "pull_request".into(),
-            branch: None,
-            tag: None,
-            changed_files: vec![],
-            activity_type: None,
+            ..Default::default()
         };
         assert!(!evaluate_trigger(&config, &ctx).matches);
+    }
+
+    #[test]
+    fn pull_request_branches_filter_matches_base_not_head() {
+        // pull_request workflow listening only to PRs targeting `main`
+        let config = make_config(vec![EventFilter {
+            event_name: "pull_request".into(),
+            branches: vec![gp("main")],
+            ..Default::default()
+        }]);
+
+        // Source branch is feature/foo, base branch is main → should match
+        let ctx = EventContext {
+            event_name: "pull_request".into(),
+            branch: Some("feature/foo".into()),
+            base_branch: Some("main".into()),
+            ..Default::default()
+        };
+        assert!(
+            evaluate_trigger(&config, &ctx).matches,
+            "PR feature/foo→main should match pull_request branches:[main]"
+        );
+
+        // Source branch is main, base branch is develop → should NOT match
+        let ctx2 = EventContext {
+            event_name: "pull_request".into(),
+            branch: Some("main".into()),
+            base_branch: Some("develop".into()),
+            ..Default::default()
+        };
+        assert!(
+            !evaluate_trigger(&config, &ctx2).matches,
+            "PR main→develop should not match pull_request branches:[main]"
+        );
+    }
+
+    #[test]
+    fn pull_request_branches_filter_fails_without_base_branch() {
+        let config = make_config(vec![EventFilter {
+            event_name: "pull_request".into(),
+            branches: vec![gp("main")],
+            ..Default::default()
+        }]);
+        // No base_branch supplied → branch filter cannot succeed
+        let ctx = EventContext {
+            event_name: "pull_request".into(),
+            branch: Some("main".into()),
+            base_branch: None,
+            ..Default::default()
+        };
+        let result = evaluate_trigger(&config, &ctx);
+        assert!(!result.matches);
+        assert!(result.reason.contains("base_branch"));
+    }
+
+    #[test]
+    fn pull_request_target_uses_base_branch_too() {
+        let config = make_config(vec![EventFilter {
+            event_name: "pull_request_target".into(),
+            branches: vec![gp("main")],
+            ..Default::default()
+        }]);
+        let ctx = EventContext {
+            event_name: "pull_request_target".into(),
+            branch: Some("feature/x".into()),
+            base_branch: Some("main".into()),
+            ..Default::default()
+        };
+        assert!(evaluate_trigger(&config, &ctx).matches);
     }
 }

@@ -1,8 +1,54 @@
 use crate::error::TriggerFilterError;
+use std::path::Path;
 use tokio::process::Command;
 
+/// Git's empty-tree object SHA. Diffing against it shows every tracked file
+/// as added — used as a last-resort fallback for repositories where no other
+/// reasonable diff base can be detected (e.g. a fresh repo with one commit).
+const GIT_EMPTY_TREE_SHA: &str = "4b825dc642cb6eb9a060e54bf899d69f82e4f2d1";
+
+/// Build a `git` command optionally rooted at a working directory via `-C`.
+fn git_cmd(cwd: Option<&Path>) -> Command {
+    let mut cmd = Command::new("git");
+    if let Some(dir) = cwd {
+        cmd.arg("-C").arg(dir.as_os_str());
+    }
+    cmd
+}
+
+/// Validate a git ref name to prevent argv injection.
+///
+/// We can't trust user-supplied refs to be safe to splat into a `git` argv —
+/// a value like `--upload-pack=foo` would be parsed as an option. Reject any
+/// ref starting with `-` or containing characters git itself disallows.
+pub fn validate_ref_name(name: &str) -> Result<(), TriggerFilterError> {
+    if name.is_empty() {
+        return Err(TriggerFilterError::GitError(
+            "git ref name must not be empty".to_string(),
+        ));
+    }
+    if name.starts_with('-') {
+        return Err(TriggerFilterError::GitError(format!(
+            "git ref name '{}' must not start with '-' (refused as possible flag injection)",
+            name
+        )));
+    }
+    // Allowlist: a safe subset that covers branch names, tags, sha1s,
+    // and revision suffixes like `HEAD~1` / `HEAD^`.
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '/' | '.' | '~' | '^'))
+    {
+        return Err(TriggerFilterError::GitError(format!(
+            "git ref name '{}' contains characters outside the allowed set",
+            name
+        )));
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
-// Shared helpers (operate on already-captured output)
+// Helpers operating on raw command output
 // ---------------------------------------------------------------------------
 
 fn parse_lines(output: &[u8]) -> Vec<String> {
@@ -13,130 +59,120 @@ fn parse_lines(output: &[u8]) -> Vec<String> {
         .collect()
 }
 
-fn collect_changed_files_from_outputs(
-    diff_files: &[String],
-    untracked_stdout: Option<&[u8]>,
-) -> Vec<String> {
-    let mut files = diff_files.to_vec();
-
-    if let Some(untracked) = untracked_stdout {
-        let seen: std::collections::HashSet<String> = files.iter().cloned().collect();
-        for line in String::from_utf8_lossy(untracked).lines() {
-            let trimmed = line.trim();
-            if !trimmed.is_empty() && !seen.contains(trimmed) {
-                files.push(trimmed.to_string());
-            }
+fn merge_unique(mut into: Vec<String>, more: Vec<String>) -> Vec<String> {
+    let seen: std::collections::HashSet<String> = into.iter().cloned().collect();
+    for line in more {
+        if !seen.contains(&line) {
+            into.push(line);
         }
     }
-
-    files
+    into
 }
-
-// ===========================================================================
-// Async API
-// ===========================================================================
 
 /// Get changed files between the working tree and a base ref.
 ///
-/// Combines (in parallel):
-/// - `git diff --name-only <base>` (unstaged changes vs base)
-/// - `git diff --cached --name-only <base>` (staged changes vs base)
-/// - `git ls-files --others --exclude-standard` (untracked files)
-pub async fn get_changed_files(base: &str) -> Result<Vec<String>, TriggerFilterError> {
-    let diff_fut = Command::new("git")
-        .args(["diff", "--name-only", base])
-        .output();
+/// When `base == "HEAD"`, we run two diffs (unstaged and staged) plus an
+/// untracked-files probe. For any other base, `git diff <base>` already
+/// covers staged + unstaged + committed-on-branch changes, so the `--cached`
+/// pass is redundant and we omit it.
+///
+/// `cwd` selects the git working directory; pass `None` to use the
+/// process CWD. The watcher should always pass its repo root.
+pub async fn get_changed_files(
+    base: &str,
+    cwd: Option<&Path>,
+) -> Result<Vec<String>, TriggerFilterError> {
+    validate_ref_name(base)?;
 
-    let cached_fut = Command::new("git")
-        .args(["diff", "--cached", "--name-only", base])
-        .output();
-
-    let untracked_fut = Command::new("git")
+    let untracked_fut = git_cmd(cwd)
         .args(["ls-files", "--others", "--exclude-standard"])
         .output();
 
-    let (diff_result, cached_result, untracked_result) =
-        tokio::join!(diff_fut, cached_fut, untracked_fut);
+    if base == "HEAD" {
+        let diff_fut = git_cmd(cwd).args(["diff", "--name-only", base]).output();
+        let cached_fut = git_cmd(cwd)
+            .args(["diff", "--cached", "--name-only", base])
+            .output();
 
-    let diff_output = diff_result
-        .map_err(|e| TriggerFilterError::GitError(format!("Failed to run git diff: {}", e)))?;
+        let (diff_result, cached_result, untracked_result) =
+            tokio::join!(diff_fut, cached_fut, untracked_fut);
 
-    if !diff_output.status.success() {
-        let stderr = String::from_utf8_lossy(&diff_output.stderr);
+        let diff_output = check_status(diff_result, "git diff")?;
+        let mut files = parse_lines(&diff_output.stdout);
+
+        if let Ok(cached_output) = cached_result {
+            if cached_output.status.success() {
+                files = merge_unique(files, parse_lines(&cached_output.stdout));
+            }
+        }
+
+        if let Ok(untracked_output) = untracked_result {
+            if untracked_output.status.success() {
+                files = merge_unique(files, parse_lines(&untracked_output.stdout));
+            }
+        }
+
+        Ok(files)
+    } else {
+        let diff_fut = git_cmd(cwd).args(["diff", "--name-only", base]).output();
+        let (diff_result, untracked_result) = tokio::join!(diff_fut, untracked_fut);
+
+        let diff_output = check_status(diff_result, "git diff")?;
+        let mut files = parse_lines(&diff_output.stdout);
+
+        if let Ok(untracked_output) = untracked_result {
+            if untracked_output.status.success() {
+                files = merge_unique(files, parse_lines(&untracked_output.stdout));
+            }
+        }
+
+        Ok(files)
+    }
+}
+
+fn check_status(
+    result: Result<std::process::Output, std::io::Error>,
+    cmd_label: &str,
+) -> Result<std::process::Output, TriggerFilterError> {
+    let output = result.map_err(|e| {
+        TriggerFilterError::GitError(format!("Failed to run {}: {}", cmd_label, e))
+    })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(TriggerFilterError::GitError(format!(
-            "git diff failed: {}",
+            "{} failed: {}",
+            cmd_label,
             stderr.trim()
         )));
     }
-
-    let cached_output = cached_result.map_err(|e| {
-        TriggerFilterError::GitError(format!("Failed to run git diff --cached: {}", e))
-    })?;
-
-    // Merge unstaged and staged diffs
-    let mut files = parse_lines(&diff_output.stdout);
-    if cached_output.status.success() {
-        let seen: std::collections::HashSet<String> = files.iter().cloned().collect();
-        for line in parse_lines(&cached_output.stdout) {
-            if !seen.contains(&line) {
-                files.push(line);
-            }
-        }
-    }
-
-    let untracked_output = untracked_result
-        .map_err(|e| TriggerFilterError::GitError(format!("Failed to run git ls-files: {}", e)))?;
-
-    let untracked = if untracked_output.status.success() {
-        Some(untracked_output.stdout.as_slice())
-    } else {
-        None
-    };
-
-    Ok(collect_changed_files_from_outputs(&files, untracked))
+    Ok(output)
 }
 
 /// Get changed files between two refs.
 pub async fn get_changed_files_between(
     base_ref: &str,
     head_ref: &str,
+    cwd: Option<&Path>,
 ) -> Result<Vec<String>, TriggerFilterError> {
+    validate_ref_name(base_ref)?;
+    validate_ref_name(head_ref)?;
+
     let range = format!("{}..{}", base_ref, head_ref);
-    let output = Command::new("git")
+    let result = git_cmd(cwd)
         .args(["diff", "--name-only", &range])
         .output()
-        .await
-        .map_err(|e| TriggerFilterError::GitError(format!("Failed to run git diff: {}", e)))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(TriggerFilterError::GitError(format!(
-            "git diff failed: {}",
-            stderr.trim()
-        )));
-    }
-
+        .await;
+    let output = check_status(result, "git diff")?;
     Ok(parse_lines(&output.stdout))
 }
 
 /// Get the current branch name.
-pub async fn get_current_branch() -> Result<String, TriggerFilterError> {
-    let output = Command::new("git")
+pub async fn get_current_branch(cwd: Option<&Path>) -> Result<String, TriggerFilterError> {
+    let result = git_cmd(cwd)
         .args(["rev-parse", "--abbrev-ref", "HEAD"])
         .output()
-        .await
-        .map_err(|e| {
-            TriggerFilterError::GitError(format!("Failed to get current branch: {}", e))
-        })?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(TriggerFilterError::GitError(format!(
-            "git rev-parse failed: {}",
-            stderr.trim()
-        )));
-    }
-
+        .await;
+    let output = check_status(result, "git rev-parse")?;
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
@@ -146,14 +182,12 @@ pub async fn get_current_branch() -> Result<String, TriggerFilterError> {
 /// 1. If there are uncommitted changes (vs HEAD), use "HEAD".
 /// 2. Detect the remote default branch via `git symbolic-ref refs/remotes/origin/HEAD`.
 /// 3. Fall back to trying `main`, then `master`.
-/// 4. Falls back to "HEAD~1" if no merge-base is found.
-pub async fn get_default_diff_base() -> String {
+/// 4. Otherwise try `HEAD~1`.
+/// 5. Last resort: the empty-tree SHA, which makes every tracked file appear
+///    as changed. A warning is logged because this is rarely what the user wants.
+pub async fn get_default_diff_base(cwd: Option<&Path>) -> String {
     // Check for uncommitted changes first
-    if let Ok(output) = Command::new("git")
-        .args(["status", "--porcelain"])
-        .output()
-        .await
-    {
+    if let Ok(output) = git_cmd(cwd).args(["status", "--porcelain"]).output().await {
         let stdout = String::from_utf8_lossy(&output.stdout);
         if !stdout.trim().is_empty() {
             return "HEAD".to_string();
@@ -164,7 +198,7 @@ pub async fn get_default_diff_base() -> String {
     let mut candidates: Vec<String> = Vec::new();
 
     // Try to detect the remote default branch
-    if let Ok(output) = Command::new("git")
+    if let Ok(output) = git_cmd(cwd)
         .args(["symbolic-ref", "refs/remotes/origin/HEAD", "--short"])
         .output()
         .await
@@ -192,7 +226,7 @@ pub async fn get_default_diff_base() -> String {
 
     // Try merge-base with each candidate
     for base_branch in &candidates {
-        if let Ok(output) = Command::new("git")
+        if let Ok(output) = git_cmd(cwd)
             .args(["merge-base", "HEAD", base_branch])
             .output()
             .await
@@ -206,8 +240,8 @@ pub async fn get_default_diff_base() -> String {
         }
     }
 
-    // Try HEAD~1, but it fails on repos with only one commit (no parent)
-    if let Ok(output) = Command::new("git")
+    // Try HEAD~1, which works on any repo with at least two commits
+    if let Ok(output) = git_cmd(cwd)
         .args(["rev-parse", "--verify", "HEAD~1"])
         .output()
         .await
@@ -217,28 +251,69 @@ pub async fn get_default_diff_base() -> String {
         }
     }
 
-    // Ultimate fallback: the git empty tree SHA.
-    // This compares against a completely empty tree, so all files appear as "changed".
-    "4b825dc642cb6eb9a060e54bf899d69f82e4f2d1".to_string()
+    // Ultimate fallback: empty-tree SHA. This compares against an empty tree,
+    // so every tracked file appears as added. Warn loudly because that's
+    // almost certainly not what the user wants.
+    wrkflw_logging::warning(
+        "Could not detect a sensible diff base (no remote default, no HEAD~1). \
+         Falling back to the empty tree, which treats every file as changed. \
+         Pass --diff-base explicitly to override.",
+    );
+    GIT_EMPTY_TREE_SHA.to_string()
 }
 
 /// Get the current tag if HEAD is tagged, or None.
-pub async fn get_current_tag() -> Result<Option<String>, TriggerFilterError> {
-    let output = Command::new("git")
+pub async fn get_current_tag(cwd: Option<&Path>) -> Result<Option<String>, TriggerFilterError> {
+    let result = git_cmd(cwd)
         .args(["describe", "--tags", "--exact-match", "HEAD"])
         .output()
-        .await
-        .map_err(|e| TriggerFilterError::GitError(format!("Failed to check tags: {}", e)))?;
-
-    if output.status.success() {
-        let tag = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if tag.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(tag))
+        .await;
+    match result {
+        Ok(output) if output.status.success() => {
+            let tag = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if tag.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(tag))
+            }
         }
-    } else {
-        // Not on a tag — this is normal, not an error
-        Ok(None)
+        Ok(_) => Ok(None), // not on a tag is normal
+        Err(e) => Err(TriggerFilterError::GitError(format!(
+            "Failed to check tags: {}",
+            e
+        ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_ref_accepts_normal_branches() {
+        assert!(validate_ref_name("main").is_ok());
+        assert!(validate_ref_name("feature/foo").is_ok());
+        assert!(validate_ref_name("release-1.2.3").is_ok());
+        assert!(validate_ref_name("HEAD").is_ok());
+        assert!(validate_ref_name("HEAD~1").is_ok());
+        assert!(validate_ref_name("HEAD^").is_ok());
+    }
+
+    #[test]
+    fn validate_ref_rejects_flag_injection() {
+        assert!(validate_ref_name("--upload-pack=foo").is_err());
+        assert!(validate_ref_name("-fbad").is_err());
+    }
+
+    #[test]
+    fn validate_ref_rejects_empty() {
+        assert!(validate_ref_name("").is_err());
+    }
+
+    #[test]
+    fn validate_ref_rejects_shell_metachars() {
+        assert!(validate_ref_name("main; rm -rf /").is_err());
+        assert!(validate_ref_name("main`whoami`").is_err());
+        assert!(validate_ref_name("main$(id)").is_err());
     }
 }

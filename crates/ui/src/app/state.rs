@@ -7,7 +7,7 @@ use crate::models::{
 use chrono::Local;
 use crossterm::event::KeyCode;
 use ratatui::widgets::{ListState, TableState};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
@@ -85,6 +85,25 @@ pub struct App {
 /// Result rows shipped from the background diff-filter task to the UI loop.
 pub type DiffFilterResults = Vec<(PathBuf, Option<TriggerMatchStatus>)>;
 
+/// Workflow files that failed to parse during a diff-filter evaluation,
+/// paired with the reason. Surfaced to the TUI log so the user is not
+/// left wondering why N workflows are missing from the result table.
+pub type DiffFilterParseFailures = Vec<(PathBuf, String)>;
+
+/// Successful diff-filter evaluation payload.
+///
+/// Carrying `parse_failures` alongside `rows` lets the UI distinguish
+/// "this workflow has triggers that did not match" from "this workflow
+/// has broken YAML and was silently dropped from the result map" — the
+/// previous `filter_map(... .ok())` collapsed both cases into the same
+/// `trigger_match = None` rendering, leaving users with no debugging
+/// signal when their `on:` block had a typo.
+#[derive(Debug, Clone)]
+pub struct DiffFilterReport {
+    pub rows: DiffFilterResults,
+    pub parse_failures: DiffFilterParseFailures,
+}
+
 /// Outcome of a background diff-filter evaluation.
 ///
 /// Wrapping the row list in an enum lets us distinguish "we ran the
@@ -94,7 +113,7 @@ pub type DiffFilterResults = Vec<(PathBuf, Option<TriggerMatchStatus>)>;
 /// zero matches.
 #[derive(Debug, Clone)]
 pub enum DiffFilterOutcome {
-    Success(DiffFilterResults),
+    Success(DiffFilterReport),
     Failure(String),
 }
 
@@ -344,11 +363,20 @@ impl App {
             let workflow_paths: Vec<PathBuf> =
                 self.workflows.iter().map(|w| w.path.clone()).collect();
 
+            // Anchor git operations at the discovered repo root rather
+            // than the process CWD. The TUI may be launched from a
+            // sibling repo or a subdirectory; without this, every git
+            // helper inside `auto_detect_context_default_base` would
+            // run wherever the user happened to be when they started
+            // `wrkflw tui`. The watcher and CLI prefilter both pass
+            // `find_repo_root()` for the same reason.
+            let repo_root = wrkflw_trigger_filter::find_repo_root();
+
             let (tx, rx) = mpsc::channel();
             self.diff_filter_rx = Some(rx);
 
             let handle = tokio::task::spawn(async move {
-                let results = evaluate_diff_filter(workflow_paths, event_name).await;
+                let results = evaluate_diff_filter(workflow_paths, event_name, repo_root).await;
                 let _ = tx.send(results);
             });
             self.diff_filter_task = Some(handle);
@@ -390,7 +418,10 @@ impl App {
         self.diff_filter_task = None;
 
         match results {
-            DiffFilterOutcome::Success(rows) => {
+            DiffFilterOutcome::Success(DiffFilterReport {
+                rows,
+                parse_failures,
+            }) => {
                 let by_path: std::collections::HashMap<PathBuf, Option<TriggerMatchStatus>> =
                     rows.into_iter().collect();
                 for workflow in self.workflows.iter_mut() {
@@ -407,6 +438,22 @@ impl App {
                     matched,
                     self.workflows.len()
                 ));
+
+                // Parse failures used to be silently dropped via
+                // `filter_map(... .ok())`, leaving the user with N
+                // workflows showing as `-` (untriggered) and no clue why.
+                // Surface each failure individually so the YAML/glob
+                // typo is the first thing they see in the log pane.
+                if !parse_failures.is_empty() {
+                    self.logs.push(format!(
+                        "Diff filter: {} workflow file(s) failed to parse and were skipped",
+                        parse_failures.len()
+                    ));
+                    for (path, reason) in &parse_failures {
+                        self.logs
+                            .push(format!("  parse error: {}: {}", path.display(), reason));
+                    }
+                }
             }
             DiffFilterOutcome::Failure(reason) => {
                 for workflow in &mut self.workflows {
@@ -1362,9 +1409,16 @@ impl App {
 async fn evaluate_diff_filter(
     workflow_paths: Vec<PathBuf>,
     event_name: String,
+    repo_root: Option<PathBuf>,
 ) -> DiffFilterOutcome {
+    // Pass the discovered repo root through to every git helper so the
+    // diff/branch/tag queries run against the user's actual repo, not
+    // whatever the process CWD happens to be. `None` is still tolerated
+    // (e.g. user launched the TUI outside any repo) — the helpers will
+    // surface a `GitError` and the TUI will log it.
+    let cwd: Option<&Path> = repo_root.as_deref();
     let context =
-        match wrkflw_trigger_filter::auto_detect_context_default_base(&event_name, None).await {
+        match wrkflw_trigger_filter::auto_detect_context_default_base(&event_name, cwd).await {
             Ok(ctx) => ctx,
             Err(e) => {
                 return DiffFilterOutcome::Failure(format!("{}", e));
@@ -1375,21 +1429,38 @@ async fn evaluate_diff_filter(
     // blocking thread so we don't hold the reactor while reading every
     // .yml in the repo. `load_trigger_config` consolidates read + parse
     // so the TUI and the watcher fail identically on the same broken file.
+    //
+    // We capture parse failures alongside the successes so the UI can
+    // surface a real error in the log pane. Previously the failure
+    // branch was silently dropped via `.filter_map(... .ok())`, which
+    // collapsed "broken YAML" and "matching trigger" into the same
+    // `trigger_match = None` rendering.
     let paths_for_parse = workflow_paths.clone();
-    let configs: Vec<wrkflw_trigger_filter::WorkflowTriggerConfig> =
-        match tokio::task::spawn_blocking(move || {
-            paths_for_parse
-                .iter()
-                .filter_map(|path| wrkflw_trigger_filter::load_trigger_config(path).ok())
-                .collect::<Vec<_>>()
-        })
-        .await
-        {
-            Ok(v) => v,
-            Err(e) => {
-                return DiffFilterOutcome::Failure(format!("background task failed: {}", e));
+    let parse_outcome: Result<
+        (
+            Vec<wrkflw_trigger_filter::WorkflowTriggerConfig>,
+            DiffFilterParseFailures,
+        ),
+        _,
+    > = tokio::task::spawn_blocking(move || {
+        let mut configs = Vec::with_capacity(paths_for_parse.len());
+        let mut failures: DiffFilterParseFailures = Vec::new();
+        for path in &paths_for_parse {
+            match wrkflw_trigger_filter::load_trigger_config(path) {
+                Ok(cfg) => configs.push(cfg),
+                Err(e) => failures.push((path.clone(), e.to_string())),
             }
-        };
+        }
+        (configs, failures)
+    })
+    .await;
+
+    let (configs, parse_failures) = match parse_outcome {
+        Ok(pair) => pair,
+        Err(e) => {
+            return DiffFilterOutcome::Failure(format!("background task failed: {}", e));
+        }
+    };
 
     let borrowed: Vec<&wrkflw_trigger_filter::WorkflowTriggerConfig> = configs.iter().collect();
     let results = wrkflw_trigger_filter::filter_trigger_configs(&borrowed, &context);
@@ -1415,7 +1486,10 @@ async fn evaluate_diff_filter(
         })
         .collect();
 
-    DiffFilterOutcome::Success(rows)
+    DiffFilterOutcome::Success(DiffFilterReport {
+        rows,
+        parse_failures,
+    })
 }
 
 #[cfg(test)]
@@ -1550,16 +1624,19 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         app.diff_filter_rx = Some(rx);
         app.diff_filter_active = true;
-        tx.send(DiffFilterOutcome::Success(vec![
-            (
-                PathBuf::from("ci.yml"),
-                Some(TriggerMatchStatus::Matched("matched ci".into())),
-            ),
-            (
-                PathBuf::from("deploy.yml"),
-                Some(TriggerMatchStatus::Skipped("skipped deploy".into())),
-            ),
-        ]))
+        tx.send(DiffFilterOutcome::Success(DiffFilterReport {
+            rows: vec![
+                (
+                    PathBuf::from("ci.yml"),
+                    Some(TriggerMatchStatus::Matched("matched ci".into())),
+                ),
+                (
+                    PathBuf::from("deploy.yml"),
+                    Some(TriggerMatchStatus::Skipped("skipped deploy".into())),
+                ),
+            ],
+            parse_failures: Vec::new(),
+        }))
         .unwrap();
 
         app.check_diff_filter_results();
@@ -1579,6 +1656,49 @@ mod tests {
             by_name.get("deploy").unwrap(),
             Some(TriggerMatchStatus::Skipped(_))
         ));
+    }
+
+    #[test]
+    fn check_diff_filter_results_surfaces_parse_failures_to_logs() {
+        // Regression: previously, workflows whose YAML failed to parse
+        // were silently dropped via `.filter_map(... .ok())`. The user
+        // saw `0/N would trigger`, the workflow row stayed at `-`, and
+        // there was no signal that the YAML was broken. After the fix,
+        // each parse failure must appear in the log pane with its
+        // path + error reason.
+        let mut app = make_app();
+        let log_count_before = app.logs.len();
+
+        let (tx, rx) = mpsc::channel();
+        app.diff_filter_rx = Some(rx);
+        app.diff_filter_active = true;
+        tx.send(DiffFilterOutcome::Success(DiffFilterReport {
+            rows: vec![(
+                PathBuf::from("ci.yml"),
+                Some(TriggerMatchStatus::Matched("matched ci".into())),
+            )],
+            parse_failures: vec![(
+                PathBuf::from("broken.yml"),
+                "Invalid glob pattern '[unclosed' under 'push.paths'".to_string(),
+            )],
+        }))
+        .unwrap();
+
+        app.check_diff_filter_results();
+
+        let new_logs: Vec<&String> = app.logs.iter().skip(log_count_before).collect();
+        assert!(
+            new_logs.iter().any(|l| l.contains("failed to parse")),
+            "expected parse-failure summary line in logs, got {:?}",
+            new_logs
+        );
+        assert!(
+            new_logs
+                .iter()
+                .any(|l| l.contains("broken.yml") && l.contains("[unclosed")),
+            "expected per-file parse error line in logs, got {:?}",
+            new_logs
+        );
     }
 
     #[test]

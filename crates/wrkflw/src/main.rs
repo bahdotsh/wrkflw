@@ -683,16 +683,13 @@ async fn main() {
                 );
             }
 
-            let watcher = wrkflw_watcher::WorkflowWatcher::new(
-                workflow_dir,
-                repo_root,
-                event.clone(),
-                base_branch.clone(),
-                debounce_duration,
-                config,
-                verbose,
-                *max_concurrency,
-            );
+            let watcher_cfg = wrkflw_watcher::WatcherConfig::new(workflow_dir, repo_root, config)
+                .with_event(event.clone())
+                .with_base_branch(base_branch.clone())
+                .with_debounce(debounce_duration)
+                .with_verbose(verbose)
+                .with_max_concurrency(*max_concurrency);
+            let watcher = wrkflw_watcher::WorkflowWatcher::from_config(watcher_cfg);
 
             // Validate workflow files exist before starting
             if let Err(e) = watcher.collect_workflow_files().await {

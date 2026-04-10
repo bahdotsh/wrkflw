@@ -8,12 +8,13 @@ pub mod ref_matcher;
 
 pub use error::TriggerFilterError;
 pub use eval::evaluate_trigger;
+pub use git::find_repo_root;
 pub use model::{
     EventContext, EventFilter, GlobPattern, TriggerMatchResult, WorkflowTriggerConfig,
 };
 pub use parser::parse_trigger_config;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// Read a workflow file from disk and parse its trigger configuration in
 /// one step. Centralizes the "read + parse + compile globs" pipeline so
@@ -29,35 +30,6 @@ pub fn load_trigger_config(
     let workflow = wrkflw_parser::workflow::parse_workflow(workflow_path)
         .map_err(|e| TriggerFilterError::ParseError(e.to_string()))?;
     parse_trigger_config(&workflow, workflow_path.to_path_buf())
-}
-
-/// Evaluate multiple workflows against an event context, returning match results for each.
-///
-/// `WorkflowDefinition` is borrowed (not cloned) because it isn't `Clone`.
-/// The watcher hits this hot loop on every cycle, so it caches parsed
-/// workflows and passes references in.
-///
-/// This parses and compiles trigger globs on every call. For hot loops
-/// (e.g. the filesystem watcher), prefer [`filter_trigger_configs`], which
-/// takes pre-parsed [`WorkflowTriggerConfig`]s so that glob compilation can
-/// be cached across cycles.
-pub fn filter_workflows(
-    workflows: &[(PathBuf, &wrkflw_parser::workflow::WorkflowDefinition)],
-    context: &EventContext,
-) -> Vec<TriggerMatchResult> {
-    workflows
-        .iter()
-        .map(|(path, wf)| match parse_trigger_config(wf, path.clone()) {
-            Ok(config) => evaluate_trigger(&config, context),
-            Err(e) => TriggerMatchResult {
-                workflow_path: path.clone(),
-                workflow_name: wf.name.clone(),
-                matches: false,
-                matched_event: None,
-                reason: format!("Failed to parse trigger config: {}", e),
-            },
-        })
-        .collect()
 }
 
 /// Evaluate multiple pre-parsed trigger configs against an event context.
@@ -171,131 +143,11 @@ pub async fn context_from_changed_files(
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::collections::HashMap;
-
-    fn make_workflow(on_yaml: &str) -> wrkflw_parser::workflow::WorkflowDefinition {
-        wrkflw_parser::workflow::WorkflowDefinition {
-            name: "test-workflow".to_string(),
-            on: vec![],
-            on_raw: serde_yaml::from_str(on_yaml).unwrap(),
-            jobs: HashMap::new(),
-            defaults: None,
-        }
-    }
-
-    fn borrow(
-        v: &[(PathBuf, wrkflw_parser::workflow::WorkflowDefinition)],
-    ) -> Vec<(PathBuf, &wrkflw_parser::workflow::WorkflowDefinition)> {
-        v.iter().map(|(p, w)| (p.clone(), w)).collect()
-    }
-
-    #[test]
-    fn filter_workflows_matches_push_event() {
-        let wf = make_workflow("push");
-        let owned = vec![(PathBuf::from("ci.yml"), wf)];
-        let context = EventContext {
-            event_name: "push".into(),
-            branch: Some("main".into()),
-            ..Default::default()
-        };
-
-        let results = filter_workflows(&borrow(&owned), &context);
-        assert_eq!(results.len(), 1);
-        assert!(results[0].matches);
-    }
-
-    #[test]
-    fn filter_workflows_skips_non_matching_event() {
-        let wf = make_workflow("push");
-        let owned = vec![(PathBuf::from("ci.yml"), wf)];
-        let context = EventContext {
-            event_name: "pull_request".into(),
-            branch: Some("main".into()),
-            ..Default::default()
-        };
-
-        let results = filter_workflows(&borrow(&owned), &context);
-        assert_eq!(results.len(), 1);
-        assert!(!results[0].matches);
-    }
-
-    #[test]
-    fn filter_workflows_multiple_workflows() {
-        let wf_push = make_workflow("push");
-        let wf_pr = make_workflow("pull_request");
-        let owned = vec![
-            (PathBuf::from("ci.yml"), wf_push),
-            (PathBuf::from("pr.yml"), wf_pr),
-        ];
-        let context = EventContext {
-            event_name: "push".into(),
-            branch: Some("main".into()),
-            ..Default::default()
-        };
-
-        let results = filter_workflows(&borrow(&owned), &context);
-        assert_eq!(results.len(), 2);
-        assert!(results[0].matches); // ci.yml matches push
-        assert!(!results[1].matches); // pr.yml doesn't match push
-    }
-
-    #[test]
-    fn filter_workflows_with_path_filter() {
-        let wf = make_workflow(
-            r#"
-push:
-  paths:
-    - 'src/**'
-"#,
-        );
-        let owned = vec![(PathBuf::from("ci.yml"), wf)];
-
-        // Changed file matches path filter
-        let context = EventContext {
-            event_name: "push".into(),
-            branch: Some("main".into()),
-            changed_files: vec!["src/main.rs".into()],
-            ..Default::default()
-        };
-        let results = filter_workflows(&borrow(&owned), &context);
-        assert!(results[0].matches);
-
-        // Changed file does NOT match path filter
-        let context2 = EventContext {
-            event_name: "push".into(),
-            branch: Some("main".into()),
-            changed_files: vec!["docs/readme.md".into()],
-            ..Default::default()
-        };
-        let results2 = filter_workflows(&borrow(&owned), &context2);
-        assert!(!results2[0].matches);
-    }
-
-    #[test]
-    fn filter_workflows_surfaces_invalid_glob_as_failure_reason() {
-        // A workflow with an invalid glob should be reported as not-matching
-        // with a clear "Failed to parse" reason — not silently dropped.
-        let wf = make_workflow(
-            r#"
-push:
-  paths:
-    - '[unclosed'
-"#,
-        );
-        let owned = vec![(PathBuf::from("bad.yml"), wf)];
-        let ctx = EventContext {
-            event_name: "push".into(),
-            branch: Some("main".into()),
-            changed_files: vec!["src/main.rs".into()],
-            ..Default::default()
-        };
-        let results = filter_workflows(&borrow(&owned), &ctx);
-        assert_eq!(results.len(), 1);
-        assert!(!results[0].matches);
-        assert!(results[0].reason.contains("Failed to parse trigger config"));
-        assert!(results[0].reason.contains("[unclosed"));
-    }
-}
+// Note: the tests for the deleted `filter_workflows` (which parsed +
+// evaluated in one shot) used to live here. They have been removed
+// alongside the function — equivalent coverage already exists in
+// `eval.rs` (match/no-match across event types and filter combos) and
+// `parser.rs::invalid_glob_pattern_surfaces_as_parse_error` (the
+// "broken glob surfaces a parse error" contract). The cached path
+// `filter_trigger_configs` is exercised by every consumer in the
+// workspace.

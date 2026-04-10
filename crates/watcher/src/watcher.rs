@@ -113,29 +113,6 @@ impl WorkflowWatcher {
         Self { cfg }
     }
 
-    /// Legacy positional constructor. Prefer [`WorkflowWatcher::from_config`]
-    /// + [`WatcherConfig`] for new call sites; kept for the existing CLI.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        workflow_dir: PathBuf,
-        repo_root: PathBuf,
-        event_name: String,
-        base_branch: Option<String>,
-        debounce_duration: Duration,
-        config: ExecutionConfig,
-        verbose: bool,
-        max_concurrent_executions: usize,
-    ) -> Self {
-        Self::from_config(
-            WatcherConfig::new(workflow_dir, repo_root, config)
-                .with_event(event_name)
-                .with_base_branch(base_branch)
-                .with_debounce(debounce_duration)
-                .with_verbose(verbose)
-                .with_max_concurrency(max_concurrent_executions),
-        )
-    }
-
     // Accessors kept for source-compat with any in-tree callers.
     fn workflow_dir(&self) -> &Path {
         &self.cfg.workflow_dir
@@ -265,7 +242,9 @@ impl WorkflowWatcher {
                 workflow_files = refreshed;
             }
 
-            self.refresh_trigger_cache(&mut trigger_cache, &workflow_files, &changed_paths);
+            trigger_cache = self
+                .refresh_trigger_cache_async(trigger_cache, &workflow_files, &changed_paths)
+                .await;
 
             // Build the borrowed view for evaluation.
             let configs_for_eval: Vec<&WorkflowTriggerConfig> = workflow_files
@@ -301,6 +280,46 @@ impl WorkflowWatcher {
         }
     }
 
+    /// Async wrapper around [`refresh_trigger_cache`] that moves the
+    /// blocking file I/O onto a `spawn_blocking` thread. The watcher's
+    /// main loop must call this rather than the sync helper directly —
+    /// `load_trigger_config` reads + YAML-parses every workflow file
+    /// serially, and on a network mount that latency multiplies into a
+    /// reactor stall between debouncer drain and execution.
+    ///
+    /// Takes the cache by value and returns the updated cache so the
+    /// closure owns its mutable state. The caller reassigns the result.
+    async fn refresh_trigger_cache_async(
+        &self,
+        mut trigger_cache: HashMap<PathBuf, WorkflowTriggerConfig>,
+        workflow_files: &[PathBuf],
+        changed_paths: &[PathBuf],
+    ) -> HashMap<PathBuf, WorkflowTriggerConfig> {
+        let workflow_files = workflow_files.to_vec();
+        let changed_paths = changed_paths.to_vec();
+        let verbose = self.verbose();
+        let result = tokio::task::spawn_blocking(move || {
+            refresh_trigger_cache_blocking(
+                &mut trigger_cache,
+                &workflow_files,
+                &changed_paths,
+                verbose,
+            );
+            trigger_cache
+        })
+        .await;
+        // A panic inside the blocking closure should not abort the watch
+        // loop — fall back to an empty cache, which will be repopulated
+        // on the next cycle from `workflow_files`.
+        result.unwrap_or_else(|e| {
+            wrkflw_logging::error(&format!(
+                "Trigger cache refresh task panicked: {} — starting next cycle with an empty cache",
+                e
+            ));
+            HashMap::new()
+        })
+    }
+
     /// Refresh `trigger_cache` in place: drop entries no longer in
     /// `workflow_files`, reparse anything new or whose backing file appeared
     /// in the current cycle's change set. Centralized so it can be unit
@@ -309,53 +328,23 @@ impl WorkflowWatcher {
     /// Uses [`wrkflw_trigger_filter::load_trigger_config`] as the single
     /// source of truth for "read + parse + compile" — the TUI and CLI
     /// prefilter use the same helper so errors are reported identically.
+    ///
+    /// **Path-form normalization is load-bearing here.** `workflow_files`
+    /// arrives in whatever form `read_dir(workflow_dir)` produced (typically
+    /// relative — `.github/workflows/ci.yml`), while `changed_paths` arrives
+    /// from notify (typically absolute and OS-canonicalized — on macOS that
+    /// means `/private/var/...` instead of `/var/...`). A naive
+    /// `HashSet::contains` between the two never matches, so the
+    /// "this workflow file was edited, reparse it" branch silently rots and
+    /// the watcher serves stale parsed configs forever. We canonicalize both
+    /// sides to the same form before set membership.
     pub fn refresh_trigger_cache(
         &self,
         trigger_cache: &mut HashMap<PathBuf, WorkflowTriggerConfig>,
         workflow_files: &[PathBuf],
         changed_paths: &[PathBuf],
     ) {
-        let active_set: HashSet<&PathBuf> = workflow_files.iter().collect();
-        trigger_cache.retain(|k, _| active_set.contains(k));
-
-        let changed_set: HashSet<&PathBuf> = changed_paths.iter().collect();
-        let mut parse_failures = 0usize;
-        for wf_path in workflow_files {
-            let needs_reparse =
-                !trigger_cache.contains_key(wf_path) || changed_set.contains(wf_path);
-            if !needs_reparse {
-                continue;
-            }
-            match wrkflw_trigger_filter::load_trigger_config(wf_path) {
-                Ok(cfg) => {
-                    trigger_cache.insert(wf_path.clone(), cfg);
-                }
-                Err(e) => {
-                    trigger_cache.remove(wf_path);
-                    parse_failures += 1;
-                    if self.verbose() {
-                        wrkflw_logging::warning(&format!(
-                            "Failed to parse {}: {}",
-                            wf_path.display(),
-                            e
-                        ));
-                    }
-                }
-            }
-        }
-
-        if trigger_cache.is_empty() && !workflow_files.is_empty() {
-            wrkflw_logging::warning(&format!(
-                "No workflows are usable: all {} workflow file(s) failed to parse. \
-                 Run with --verbose for details.",
-                workflow_files.len()
-            ));
-        } else if parse_failures > 0 && !self.verbose() {
-            wrkflw_logging::warning(&format!(
-                "{} workflow file(s) failed to parse and were skipped (use --verbose for details)",
-                parse_failures
-            ));
-        }
+        refresh_trigger_cache_blocking(trigger_cache, workflow_files, changed_paths, self.verbose());
     }
 
     /// Convert absolute change paths to repo-relative strings. Runs on a
@@ -522,6 +511,71 @@ pub(crate) fn canonicalize_allowing_missing(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
+/// Synchronous implementation of trigger cache refresh. Extracted so the
+/// async wrapper can move it onto a `spawn_blocking` thread without
+/// dragging `&self` along, and so unit tests can drive it without an
+/// ambient tokio runtime.
+///
+/// See [`WorkflowWatcher::refresh_trigger_cache`] for the path-form
+/// normalization rationale and the parse-failure logging contract.
+fn refresh_trigger_cache_blocking(
+    trigger_cache: &mut HashMap<PathBuf, WorkflowTriggerConfig>,
+    workflow_files: &[PathBuf],
+    changed_paths: &[PathBuf],
+    verbose: bool,
+) {
+    let active_set: HashSet<&PathBuf> = workflow_files.iter().collect();
+    trigger_cache.retain(|k, _| active_set.contains(k));
+
+    // Canonicalize the change set into the same shape as the workflow
+    // file paths so equality comparisons actually work. We use the
+    // missing-tolerant canonicalize so a workflow file that was just
+    // deleted still hashes consistently with whatever notify reports.
+    let changed_canon: HashSet<PathBuf> = changed_paths
+        .iter()
+        .map(|p| canonicalize_allowing_missing(p))
+        .collect();
+
+    let mut parse_failures = 0usize;
+    for wf_path in workflow_files {
+        let wf_canon = canonicalize_allowing_missing(wf_path);
+        let needs_reparse =
+            !trigger_cache.contains_key(wf_path) || changed_canon.contains(&wf_canon);
+        if !needs_reparse {
+            continue;
+        }
+        match wrkflw_trigger_filter::load_trigger_config(wf_path) {
+            Ok(cfg) => {
+                trigger_cache.insert(wf_path.clone(), cfg);
+            }
+            Err(e) => {
+                trigger_cache.remove(wf_path);
+                parse_failures += 1;
+                if verbose {
+                    wrkflw_logging::warning(&format!(
+                        "Failed to parse {}: {}",
+                        wf_path.display(),
+                        e
+                    ));
+                }
+            }
+        }
+    }
+
+    if trigger_cache.is_empty() && !workflow_files.is_empty() {
+        wrkflw_logging::warning(&format!(
+            "No workflows are usable: all {} workflow file(s) failed to parse. \
+             Run with --verbose for details.",
+            workflow_files.len()
+        ));
+    } else if parse_failures > 0 && !verbose {
+        wrkflw_logging::warning(&format!(
+            "{} workflow file(s) failed to parse and were skipped (use --verbose for details)",
+            parse_failures
+        ));
+    }
+}
+
 /// Synchronous implementation of `collect_workflow_files`. Extracted so it can
 /// be invoked from `spawn_blocking` without closure capture juggling.
 fn collect_workflow_files_blocking(dir: &Path) -> Result<Vec<PathBuf>, WatchError> {
@@ -588,19 +642,13 @@ fn should_ignore_path(path: &Path, repo_root: &Path) -> bool {
 }
 
 /// Find the git repository root from the current working directory.
-pub fn find_repo_root() -> Option<PathBuf> {
-    let output = std::process::Command::new("git")
-        .args(["rev-parse", "--show-toplevel"])
-        .output()
-        .ok()?;
-
-    if output.status.success() {
-        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        Some(PathBuf::from(path))
-    } else {
-        None
-    }
-}
+///
+/// Re-exported from `wrkflw-trigger-filter` so the watcher's existing
+/// `wrkflw_watcher::find_repo_root` call sites keep compiling without
+/// the watcher owning the implementation. The single source of truth
+/// lives in the trigger-filter crate, which is the right home for
+/// every git shell-out we do.
+pub use wrkflw_trigger_filter::find_repo_root;
 
 #[cfg(test)]
 mod tests {
@@ -747,6 +795,77 @@ mod tests {
     #[test]
     fn does_not_ignore_file_named_build() {
         assert!(!should_ignore_path(Path::new("/repo/docs/build"), root()));
+    }
+
+    /// Build a minimal `WorkflowWatcher` over a tempdir for cache tests.
+    fn make_watcher_for(repo: &Path) -> WorkflowWatcher {
+        let workflow_dir = repo.join(".github").join("workflows");
+        std::fs::create_dir_all(&workflow_dir).expect("create workflow dir");
+        let cfg = WatcherConfig::new(
+            workflow_dir,
+            repo.to_path_buf(),
+            wrkflw_executor::ExecutionConfig {
+                runtime_type: wrkflw_executor::RuntimeType::Emulation,
+                verbose: false,
+                preserve_containers_on_failure: false,
+                secrets_config: None,
+                show_action_messages: false,
+                target_job: None,
+            },
+        );
+        WorkflowWatcher::from_config(cfg)
+    }
+
+    /// Regression for the dead-code cache invalidation branch:
+    /// `workflow_files` arrives in relative form (`.github/workflows/ci.yml`)
+    /// while `changed_paths` from notify is absolute + OS-canonicalized
+    /// (`/private/var/folders/...` on macOS). The naive `HashSet::contains`
+    /// against raw `PathBuf`s never matched, so editing a workflow file
+    /// mid-watch left the cache stale forever. After the fix, an absolute
+    /// canonicalized changed path must invalidate the cached entry for the
+    /// matching relative workflow file.
+    #[test]
+    fn refresh_trigger_cache_reparses_edited_workflow_across_path_forms() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let repo = tmp.path().to_path_buf();
+        let watcher = make_watcher_for(&repo);
+
+        // Write the workflow with `paths: ['src/foo.rs']`. The schema
+        // validator that `parse_workflow` runs requires at least one
+        // step, so we give the job a trivial echo.
+        let wf_rel = PathBuf::from(".github/workflows/ci.yml");
+        let wf_abs = repo.join(&wf_rel);
+        let v1_yaml = "name: test\non:\n  push:\n    paths:\n      - 'src/foo.rs'\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo v1\n";
+        std::fs::write(&wf_abs, v1_yaml).expect("write ci.yml v1");
+
+        // Reach the workflow via the same relative form `read_dir` would
+        // produce when `workflow_dir` was passed in relative.
+        let workflow_files = vec![wf_abs.clone()];
+        let mut cache: HashMap<PathBuf, WorkflowTriggerConfig> = HashMap::new();
+
+        // Prime the cache with the v1 config.
+        watcher.refresh_trigger_cache(&mut cache, &workflow_files, &[]);
+        let v1 = cache.get(&wf_abs).expect("v1 cached");
+        let v1_paths: Vec<&str> = v1.events[0].paths.iter().map(|p| p.source.as_str()).collect();
+        assert_eq!(v1_paths, vec!["src/foo.rs"], "v1 should have foo paths");
+
+        // Rewrite the file with `paths: ['src/bar.rs']`.
+        let v2_yaml = "name: test\non:\n  push:\n    paths:\n      - 'src/bar.rs'\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo v2\n";
+        std::fs::write(&wf_abs, v2_yaml).expect("write ci.yml v2");
+
+        // Simulate a notify event with the OS-canonicalized absolute form.
+        // (On macOS this prepends `/private`.)
+        let changed = std::fs::canonicalize(&wf_abs).expect("canonicalize wf");
+        watcher.refresh_trigger_cache(&mut cache, &workflow_files, &[changed]);
+
+        let v2 = cache.get(&wf_abs).expect("v2 cached");
+        let v2_paths: Vec<&str> = v2.events[0].paths.iter().map(|p| p.source.as_str()).collect();
+        assert_eq!(
+            v2_paths,
+            vec!["src/bar.rs"],
+            "edit must invalidate the cached parse — got stale {:?}",
+            v2_paths
+        );
     }
 
     #[test]

@@ -24,6 +24,10 @@ fn git_cmd(cwd: Option<&Path>) -> Command {
 /// a value like `--upload-pack=foo` would be parsed as an option. Reject any
 /// ref starting with `-` or containing characters that aren't part of git's
 /// documented revision syntax.
+///
+/// This validates a *single* ref. Range expressions (`a..b`, `a...b`) are
+/// rejected — callers that need to take a range must take two refs and
+/// validate each independently.
 pub fn validate_ref_name(name: &str) -> Result<(), TriggerFilterError> {
     if name.is_empty() {
         return Err(TriggerFilterError::GitError(
@@ -33,6 +37,17 @@ pub fn validate_ref_name(name: &str) -> Result<(), TriggerFilterError> {
     if name.starts_with('-') {
         return Err(TriggerFilterError::GitError(format!(
             "git ref name '{}' must not start with '-' (refused as possible flag injection)",
+            name
+        )));
+    }
+    // `..` is git's range syntax. Accepting it here would let a caller
+    // smuggle a range through an API that promises a single ref — and
+    // when interpolated into another `format!("{}..{}", ...)` it
+    // produces a malformed three-dot expression that surfaces as a
+    // confusing `git diff` error. Reject it up front instead.
+    if name.contains("..") {
+        return Err(TriggerFilterError::GitError(format!(
+            "git ref name '{}' must not contain '..' (range syntax is not a valid single ref)",
             name
         )));
     }
@@ -269,6 +284,37 @@ pub async fn get_default_diff_base(cwd: Option<&Path>) -> Result<String, Trigger
          to tell wrkflw what to compare against."
             .to_string(),
     ))
+}
+
+/// Find the git repository root from the current working directory by
+/// shelling out to `git rev-parse --show-toplevel`.
+///
+/// Returns `None` if `git` is unavailable, the call fails, or the
+/// process is not inside a git working tree. This is the right anchor
+/// for any consumer that wants to run subsequent git operations against
+/// "the repo the user is in" — passing it as `cwd` to the other helpers
+/// in this module makes their behavior independent of the process CWD.
+///
+/// Synchronous on purpose: callers tend to invoke this once at startup,
+/// and the dependency on tokio for a single subprocess call would force
+/// every consumer (including the synchronous TUI bootstrap) to create a
+/// runtime just to discover a path.
+pub fn find_repo_root() -> Option<std::path::PathBuf> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .ok()?;
+
+    if output.status.success() {
+        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if path.is_empty() {
+            None
+        } else {
+            Some(std::path::PathBuf::from(path))
+        }
+    } else {
+        None
+    }
 }
 
 /// Get the current tag if HEAD is tagged, or None.
@@ -512,6 +558,18 @@ mod tests {
     #[test]
     fn validate_ref_rejects_empty() {
         assert!(validate_ref_name("").is_err());
+    }
+
+    #[test]
+    fn validate_ref_rejects_range_syntax() {
+        // `..` is git's range expression — not a valid single ref, and
+        // smuggling it through here turns `{base}..{head}` interpolation
+        // into a malformed three-dot mess.
+        assert!(validate_ref_name("HEAD..foo").is_err());
+        assert!(validate_ref_name("..").is_err());
+        assert!(validate_ref_name("main..feature").is_err());
+        // A single dot remains valid (e.g. `release-1.2.3`).
+        assert!(validate_ref_name("release-1.2.3").is_ok());
     }
 
     #[test]

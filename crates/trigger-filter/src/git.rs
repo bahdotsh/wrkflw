@@ -10,8 +10,17 @@ use tokio::process::Command;
 const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Build a `git` command optionally rooted at a working directory via `-C`.
+///
+/// `kill_on_drop(true)` is load-bearing: [`run_git`] enforces a hard timeout
+/// via `tokio::time::timeout`, but a timeout only drops the future — without
+/// `kill_on_drop`, the underlying child process keeps running until it exits
+/// on its own. The whole point of the timeout is to handle hung-process
+/// failure modes (network filesystem stalls, credential prompts, corrupt
+/// repos), so we MUST reap the child when we give up on it. Otherwise the
+/// long-running watch loop accumulates one zombie per timed-out call.
 fn git_cmd(cwd: Option<&Path>) -> Command {
     let mut cmd = Command::new("git");
+    cmd.kill_on_drop(true);
     if let Some(dir) = cwd {
         cmd.arg("-C").arg(dir.as_os_str());
     }

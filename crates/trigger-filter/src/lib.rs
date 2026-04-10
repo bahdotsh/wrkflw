@@ -56,6 +56,12 @@ pub fn filter_trigger_configs(
 /// process CWD. Long-running consumers (e.g. the watcher) should always pass
 /// their explicit repo root so they don't accidentally query the wrong repo.
 ///
+/// **Branch handling:** detached HEAD returns `Ok` with `branch: None` (the
+/// underlying [`git::get_current_branch`] surfaces detached HEAD as `Ok(None)`,
+/// not an error). A *real* git error — e.g. permission denied on `.git/HEAD`,
+/// corrupt repo — propagates as `Err`. Previously this code collapsed both
+/// cases to `branch: None`, which masked real failures.
+///
 /// **Note:** for `pull_request`/`pull_request_target` events, this does NOT
 /// populate `base_branch` — there's no way to infer the PR target from a
 /// local checkout. Callers should pass it explicitly via the higher-level
@@ -74,7 +80,7 @@ pub async fn auto_detect_context(
 
     Ok(EventContext {
         event_name: event_name.to_string(),
-        branch: branch_res.ok().flatten(),
+        branch: branch_res?,
         base_branch: None,
         tag: tag_res?,
         changed_files: changed_res?,
@@ -113,7 +119,7 @@ pub async fn context_from_diff_range(
 
     Ok(EventContext {
         event_name: event_name.to_string(),
-        branch: branch_res.ok().flatten(),
+        branch: branch_res?,
         base_branch: None,
         tag: tag_res?,
         changed_files: changed_res?,
@@ -135,7 +141,7 @@ pub async fn context_from_changed_files(
 
     Ok(EventContext {
         event_name: event_name.to_string(),
-        branch: branch_res.ok().flatten(),
+        branch: branch_res?,
         base_branch: None,
         tag: tag_res?,
         changed_files,

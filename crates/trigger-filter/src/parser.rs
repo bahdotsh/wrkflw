@@ -93,6 +93,9 @@ fn parse_event_config(
     // sees them the same way as the explicit `*-ignore` forms. Mixing
     // `!`-patterns with the dedicated `*-ignore` key is rejected by GitHub
     // Actions, so we enforce the same rule to keep semantics predictable.
+    // GitHub Actions also rejects combining a populated `branches:` (or
+    // `tags:`/`paths:`) with the matching `*-ignore` key — that
+    // mutual-exclusion check lives in `resolve_include_and_ignore` too.
     let (branches, branches_ignore) =
         resolve_include_and_ignore(map, "branches", "branches-ignore", event_name)?;
     let (tags, tags_ignore) = resolve_include_and_ignore(map, "tags", "tags-ignore", event_name)?;
@@ -107,7 +110,7 @@ fn parse_event_config(
         tags_ignore,
         paths,
         paths_ignore,
-        types: extract_string_list(map, "types"),
+        types: extract_string_list(map, "types", event_name)?,
     })
 }
 
@@ -117,8 +120,14 @@ fn parse_event_config(
 ///
 /// Handles GitHub Actions' inline `!`-negation semantics (which
 /// `extract_glob_list` splits into `(includes, inline_excludes)`), and
-/// rejects mixing inline negation with a dedicated `*-ignore` key since
-/// GitHub Actions rejects that combination.
+/// enforces both of GHA's mutual-exclusion rules:
+///
+/// 1. Inline `!`-patterns inside `<include>:` cannot be combined with a
+///    separate `<include>-ignore:` key.
+/// 2. A populated `<include>:` cannot be combined with a populated
+///    `<include>-ignore:` key — GHA rejects this at upload time, so
+///    accepting it locally would let users iterate against semantics that
+///    will fail in production.
 fn resolve_include_and_ignore(
     map: &serde_yaml::Mapping,
     include_key: &str,
@@ -133,6 +142,13 @@ fn resolve_include_and_ignore(
             event_name, include_key, ignore_key
         )));
     }
+    if !includes.is_empty() && !explicit_ignore.is_empty() {
+        return Err(TriggerFilterError::ParseError(format!(
+            "{}: cannot use both `{}:` and `{}:` on the same event \
+             (GitHub Actions rejects this combination — pick one)",
+            event_name, include_key, ignore_key
+        )));
+    }
     let ignore = if explicit_ignore.is_empty() {
         inline_ignore
     } else {
@@ -141,19 +157,69 @@ fn resolve_include_and_ignore(
     Ok((includes, ignore))
 }
 
-fn extract_string_list(map: &serde_yaml::Mapping, key: &str) -> Vec<String> {
+/// Extract a `String` or `Vec<String>` from a YAML mapping, surfacing
+/// any non-string entries as a `ParseError`.
+///
+/// We deliberately do NOT silently drop non-string entries the way
+/// `filter_map(... .as_str())` would. A typo like
+/// `paths: [{src: foo}]` (a forgotten quoted glob containing `:`) used
+/// to yield an empty list, which then matched everything — exactly the
+/// "silently lying about which workflows would run" failure mode the
+/// rest of this crate is built to prevent. Surface the typo with a
+/// location that names the event and key so the user can find it fast.
+fn extract_string_list(
+    map: &serde_yaml::Mapping,
+    key: &str,
+    event_name: &str,
+) -> Result<Vec<String>, TriggerFilterError> {
     let value = match map.get(serde_yaml::Value::String(key.to_string())) {
         Some(v) => v,
-        None => return Vec::new(),
+        None => return Ok(Vec::new()),
     };
 
     match value {
-        serde_yaml::Value::String(s) => vec![s.clone()],
-        serde_yaml::Value::Sequence(seq) => seq
-            .iter()
-            .filter_map(|v| v.as_str().map(|s| s.to_string()))
-            .collect(),
-        _ => Vec::new(),
+        serde_yaml::Value::String(s) => Ok(vec![s.clone()]),
+        serde_yaml::Value::Sequence(seq) => {
+            let mut out = Vec::with_capacity(seq.len());
+            for (idx, item) in seq.iter().enumerate() {
+                match item.as_str() {
+                    Some(s) => out.push(s.to_string()),
+                    None => {
+                        return Err(TriggerFilterError::ParseError(format!(
+                            "{}.{}[{}]: expected a string, got {}",
+                            event_name,
+                            key,
+                            idx,
+                            yaml_kind(item),
+                        )));
+                    }
+                }
+            }
+            Ok(out)
+        }
+        // null is treated as "absent" — GHA accepts e.g. `branches:` with
+        // no value and the user clearly intended an empty list.
+        serde_yaml::Value::Null => Ok(Vec::new()),
+        other => Err(TriggerFilterError::ParseError(format!(
+            "{}.{}: expected a string or list of strings, got {}",
+            event_name,
+            key,
+            yaml_kind(other),
+        ))),
+    }
+}
+
+/// Human-readable name for a YAML node, used in `ParseError` messages so
+/// the diagnostic doesn't dump a `Debug`-formatted blob at the user.
+fn yaml_kind(v: &serde_yaml::Value) -> &'static str {
+    match v {
+        serde_yaml::Value::Null => "null",
+        serde_yaml::Value::Bool(_) => "bool",
+        serde_yaml::Value::Number(_) => "number",
+        serde_yaml::Value::String(_) => "string",
+        serde_yaml::Value::Sequence(_) => "sequence",
+        serde_yaml::Value::Mapping(_) => "mapping",
+        serde_yaml::Value::Tagged(_) => "tagged value",
     }
 }
 
@@ -172,7 +238,7 @@ fn extract_glob_list(
     key: &str,
     event_name: &str,
 ) -> Result<(Vec<GlobPattern>, Vec<GlobPattern>), TriggerFilterError> {
-    let raw = extract_string_list(map, key);
+    let raw = extract_string_list(map, key, event_name)?;
     let mut includes = Vec::new();
     let mut excludes = Vec::new();
     for source in raw {
@@ -287,13 +353,19 @@ push:
 
     #[test]
     fn parse_mapping_with_tags() {
+        // Note: this test originally combined `tags:` + `tags-ignore:` on
+        // the same event, which GitHub Actions rejects at upload time.
+        // The parser now enforces the same rule, so we use the inline
+        // `!`-negation form (which IS valid GHA syntax) to exercise the
+        // include-and-exclude code path. Inline negation is split into
+        // `tags_ignore` by `extract_glob_list`, so the assertion shape
+        // matches the original.
         let raw = make_on_raw(
             r#"
 push:
   tags:
     - 'v*'
-  tags-ignore:
-    - 'v*-rc*'
+    - '!v*-rc*'
 "#,
         );
         let events = parse_events(&raw).unwrap();
@@ -464,5 +536,115 @@ push:
 "#,
         );
         assert!(parse_events(&raw).is_err());
+    }
+
+    #[test]
+    fn paths_and_paths_ignore_combo_is_rejected() {
+        // Regression: GHA rejects `paths:` + `paths-ignore:` on the same
+        // event at upload time. Previously this parser silently accepted
+        // both and ran them sequentially, so users could iterate locally
+        // against semantics that would later fail in production.
+        let raw = make_on_raw(
+            r#"
+push:
+  paths:
+    - 'src/**'
+  paths-ignore:
+    - 'docs/**'
+"#,
+        );
+        let err = parse_events(&raw).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("cannot use both"), "got: {}", msg);
+        assert!(
+            msg.contains("paths") && msg.contains("paths-ignore"),
+            "got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn branches_and_branches_ignore_combo_is_rejected() {
+        let raw = make_on_raw(
+            r#"
+push:
+  branches:
+    - 'main'
+  branches-ignore:
+    - 'release/*'
+"#,
+        );
+        let err = parse_events(&raw).unwrap_err();
+        assert!(err.to_string().contains("cannot use both"), "got: {}", err);
+    }
+
+    #[test]
+    fn tags_and_tags_ignore_combo_is_rejected() {
+        let raw = make_on_raw(
+            r#"
+push:
+  tags:
+    - 'v*'
+  tags-ignore:
+    - 'v*-rc*'
+"#,
+        );
+        let err = parse_events(&raw).unwrap_err();
+        assert!(err.to_string().contains("cannot use both"), "got: {}", err);
+    }
+
+    #[test]
+    fn non_string_list_entry_surfaces_as_parse_error() {
+        // Regression: a typo like `paths: [{src: foo}]` (forgotten quotes
+        // around a glob containing `:`) used to silently yield an empty
+        // list, which then matched everything — the worst possible
+        // failure mode for a "would this trigger?" filter. Surface the
+        // typo as a `ParseError` with the offending location instead.
+        let raw = make_on_raw(
+            r#"
+push:
+  paths:
+    - 'src/**'
+    - { not: a-string }
+"#,
+        );
+        let err = parse_events(&raw).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("expected a string"), "got: {}", msg);
+        assert!(msg.contains("push.paths"), "got: {}", msg);
+        assert!(msg.contains("[1]"), "got: {}", msg);
+    }
+
+    #[test]
+    fn non_string_types_entry_surfaces_as_parse_error() {
+        // The same surfacing must work for `types:` (which goes through
+        // the same `extract_string_list` helper).
+        let raw = make_on_raw(
+            r#"
+pull_request:
+  types:
+    - opened
+    - 42
+"#,
+        );
+        let err = parse_events(&raw).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("expected a string"), "got: {}", msg);
+        assert!(msg.contains("pull_request.types"), "got: {}", msg);
+    }
+
+    #[test]
+    fn null_value_for_list_key_is_treated_as_empty() {
+        // `branches:` with no value (null) should be accepted and treated
+        // as an empty list, matching GHA's behavior. This is the negative
+        // case for the "non-string entry" rejection above.
+        let raw = make_on_raw(
+            r#"
+push:
+  branches:
+"#,
+        );
+        let events = parse_events(&raw).unwrap();
+        assert!(events[0].branches.is_empty());
     }
 }

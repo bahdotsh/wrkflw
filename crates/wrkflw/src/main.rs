@@ -489,16 +489,16 @@ async fn main() {
         }) => {
             // Evaluate trigger filter at the call site before executing
             if *diff || event.is_some() || changed_files.is_some() {
-                run_trigger_prefilter_or_exit(
-                    path,
-                    event,
-                    *diff,
-                    changed_files.as_ref(),
+                run_trigger_prefilter_or_exit(PrefilterRequest {
+                    workflow_path: path,
+                    event: event.as_ref(),
+                    diff: *diff,
+                    changed_files: changed_files.as_ref(),
                     diff_base,
-                    diff_head.as_ref(),
-                    base_branch.as_ref(),
+                    diff_head: diff_head.as_ref(),
+                    base_branch: base_branch.as_ref(),
                     verbose,
-                )
+                })
                 .await;
             }
 
@@ -708,6 +708,13 @@ async fn main() {
                             watch_event.skipped_workflows.len(),
                         ))
                     );
+                    // Surface degraded cycles loudly: if the watcher
+                    // could not build a git event context, the trigger
+                    // results are not authoritative and the user needs
+                    // to know why before they assume "0 triggered".
+                    if let Some(reason) = &watch_event.error {
+                        eprintln!("  {} {}", cli_style::error("ERROR"), reason);
+                    }
                     for wf in &watch_event.triggered_workflows {
                         println!("  {} {}", cli_style::success("TRIGGERED"), wf);
                     }
@@ -802,42 +809,50 @@ async fn main() {
     }
 }
 
+/// Bundled inputs for the `wrkflw run` trigger prefilter.
+///
+/// Grouping these into a single struct collapses the previous 8-argument
+/// `run_trigger_prefilter_or_exit` into a more reviewable shape, and lets
+/// the orchestrator pass the request through to its private helpers
+/// (`build_event_context`, `apply_base_branch`) without dragging an
+/// ever-growing positional list.
+struct PrefilterRequest<'a> {
+    workflow_path: &'a Path,
+    event: Option<&'a String>,
+    diff: bool,
+    changed_files: Option<&'a Vec<String>>,
+    diff_base: &'a str,
+    diff_head: Option<&'a String>,
+    base_branch: Option<&'a String>,
+    verbose: bool,
+}
+
 /// Build an event context from the user's CLI flags and short-circuit
 /// the run if the workflow's triggers do not match.
 ///
 /// Exits the process on failure or skip; returns normally only when the
 /// workflow should run.
-#[allow(clippy::too_many_arguments)]
-async fn run_trigger_prefilter_or_exit(
-    workflow_path: &Path,
-    event: &Option<String>,
-    diff: bool,
-    changed_files: Option<&Vec<String>>,
-    diff_base: &str,
-    diff_head: Option<&String>,
-    base_branch: Option<&String>,
-    verbose: bool,
-) {
+async fn run_trigger_prefilter_or_exit(req: PrefilterRequest<'_>) {
     // `wrkflw run` expects a single workflow file. Catch directory paths up
     // front with a clear error; otherwise the user sees a confusing
     // "Error parsing workflow" from the YAML parser further down.
-    if !workflow_path.is_file() {
-        if workflow_path.is_dir() {
+    if !req.workflow_path.is_file() {
+        if req.workflow_path.is_dir() {
             eprintln!(
                 "Error: --diff/--event/--changed-files require a single workflow file, not a directory.\n\
                  Hint: point at a specific .yml file, or use `wrkflw watch {}` for directory-wide watching.",
-                workflow_path.display()
+                req.workflow_path.display()
             );
         } else {
             eprintln!(
                 "Error: workflow file not found: {}",
-                workflow_path.display()
+                req.workflow_path.display()
             );
         }
         std::process::exit(1);
     }
 
-    let event_name = event.clone().unwrap_or_else(|| "push".to_string());
+    let event_name = req.event.cloned().unwrap_or_else(|| "push".to_string());
 
     // Root git operations at the git repo root when possible, so behavior
     // is consistent regardless of the directory the user ran `wrkflw`
@@ -845,64 +860,10 @@ async fn run_trigger_prefilter_or_exit(
     let repo_root: Option<PathBuf> = wrkflw_watcher::find_repo_root();
     let cwd_for_git: Option<&Path> = repo_root.as_deref();
 
-    let mut event_context = if let Some(files) = changed_files {
-        wrkflw_trigger_filter::context_from_changed_files(&event_name, files.clone(), cwd_for_git)
-            .await
-            .unwrap_or_else(|e| {
-                eprintln!("Error: failed to build event context: {}", e);
-                std::process::exit(1);
-            })
-    } else if diff {
-        if let Some(head) = diff_head {
-            wrkflw_trigger_filter::context_from_diff_range(
-                &event_name,
-                diff_base,
-                head,
-                cwd_for_git,
-            )
-            .await
-            .unwrap_or_else(|e| {
-                eprintln!("Error: failed to get git diff: {}", e);
-                std::process::exit(1);
-            })
-        } else {
-            wrkflw_trigger_filter::auto_detect_context(&event_name, diff_base, cwd_for_git)
-                .await
-                .unwrap_or_else(|e| {
-                    eprintln!("Error: failed to get git diff: {}", e);
-                    std::process::exit(1);
-                })
-        }
-    } else {
-        // --event was passed alone (no --diff, no --changed-files).
-        // The context will have an empty changed-files set, which means
-        // any workflow with a `paths:` filter will be silently skipped.
-        // Warn so users do not get surprised by "nothing triggered".
-        wrkflw_logging::warning(
-            "--event was supplied without --diff or --changed-files; \
-             path filters will not match because no changed files are known. \
-             Use --diff to auto-detect from git, or --changed-files to specify them.",
-        );
-        wrkflw_trigger_filter::context_from_changed_files(&event_name, vec![], cwd_for_git)
-            .await
-            .unwrap_or_else(|e| {
-                eprintln!("Error: failed to build event context: {}", e);
-                std::process::exit(1);
-            })
-    };
+    let mut event_context = build_event_context(&req, &event_name, cwd_for_git).await;
+    apply_base_branch(&mut event_context, &event_name, req.base_branch);
 
-    // Apply --base-branch if supplied; warn if it's needed but missing.
-    if let Some(base) = base_branch {
-        event_context.base_branch = Some(base.clone());
-    } else if matches!(event_name.as_str(), "pull_request" | "pull_request_target") {
-        wrkflw_logging::warning(
-            "Simulating pull_request without --base-branch: workflows that use \
-             `branches:` to constrain the PR target branch will be reported as not triggering. \
-             Pass --base-branch <name> to match against a target branch.",
-        );
-    }
-
-    if verbose {
+    if req.verbose {
         wrkflw_logging::info(&format!(
             "Trigger filter: event={}, branch={:?}, base_branch={:?}, changed_files={:?}",
             event_context.event_name,
@@ -913,8 +874,8 @@ async fn run_trigger_prefilter_or_exit(
     }
 
     // Parse workflow and evaluate trigger before executing
-    let trigger_config =
-        wrkflw_trigger_filter::load_trigger_config(workflow_path).unwrap_or_else(|e| {
+    let trigger_config = wrkflw_trigger_filter::load_trigger_config(req.workflow_path)
+        .unwrap_or_else(|e| {
             eprintln!("Error parsing workflow: {}", e);
             std::process::exit(1);
         });
@@ -929,6 +890,88 @@ async fn run_trigger_prefilter_or_exit(
         std::process::exit(0);
     }
     wrkflw_logging::info(&format!("Trigger matched: {}", match_result.reason));
+}
+
+/// Pick the right context-builder based on which flags the user supplied.
+///
+/// Exits the process on failure — the previous inline implementation also
+/// exited from each branch, but extracting this makes the
+/// `run_trigger_prefilter_or_exit` orchestrator easier to read and lets
+/// each branch own its own error message without nesting.
+async fn build_event_context(
+    req: &PrefilterRequest<'_>,
+    event_name: &str,
+    cwd_for_git: Option<&Path>,
+) -> wrkflw_trigger_filter::EventContext {
+    if let Some(files) = req.changed_files {
+        return wrkflw_trigger_filter::context_from_changed_files(
+            event_name,
+            files.clone(),
+            cwd_for_git,
+        )
+        .await
+        .unwrap_or_else(|e| {
+            eprintln!("Error: failed to build event context: {}", e);
+            std::process::exit(1);
+        });
+    }
+
+    if req.diff {
+        return if let Some(head) = req.diff_head {
+            wrkflw_trigger_filter::context_from_diff_range(
+                event_name,
+                req.diff_base,
+                head,
+                cwd_for_git,
+            )
+            .await
+        } else {
+            wrkflw_trigger_filter::auto_detect_context(event_name, req.diff_base, cwd_for_git).await
+        }
+        .unwrap_or_else(|e| {
+            eprintln!("Error: failed to get git diff: {}", e);
+            std::process::exit(1);
+        });
+    }
+
+    // --event was passed alone (no --diff, no --changed-files).
+    // The context will have an empty changed-files set, which means
+    // any workflow with a `paths:` filter will be silently skipped.
+    // Warn so users do not get surprised by "nothing triggered".
+    wrkflw_logging::warning(
+        "--event was supplied without --diff or --changed-files; \
+         path filters will not match because no changed files are known. \
+         Use --diff to auto-detect from git, or --changed-files to specify them.",
+    );
+    wrkflw_trigger_filter::context_from_changed_files(event_name, vec![], cwd_for_git)
+        .await
+        .unwrap_or_else(|e| {
+            eprintln!("Error: failed to build event context: {}", e);
+            std::process::exit(1);
+        })
+}
+
+/// Stamp the user-supplied `--base-branch` onto the event context, or
+/// warn if the event needs one but the user did not pass it.
+///
+/// Extracted out of the prefilter orchestrator so the warning behavior is
+/// in one place — both the `pull_request` and `pull_request_target`
+/// events evaluate `branches:` filters against the base branch, and the
+/// failure mode is identical.
+fn apply_base_branch(
+    ctx: &mut wrkflw_trigger_filter::EventContext,
+    event_name: &str,
+    base_branch: Option<&String>,
+) {
+    if let Some(base) = base_branch {
+        ctx.base_branch = Some(base.clone());
+    } else if matches!(event_name, "pull_request" | "pull_request_target") {
+        wrkflw_logging::warning(
+            "Simulating pull_request without --base-branch: workflows that use \
+             `branches:` to constrain the PR target branch will be reported as not triggering. \
+             Pass --base-branch <name> to match against a target branch.",
+        );
+    }
 }
 
 /// Validate a GitHub workflow file

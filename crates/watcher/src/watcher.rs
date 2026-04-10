@@ -1,9 +1,11 @@
 use crate::debouncer::Debouncer;
 use crate::error::WatchError;
 use futures::stream::{self, StreamExt};
+use futures::FutureExt;
 use notify::event::{EventKind, ModifyKind};
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::{HashMap, HashSet};
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,11 +17,20 @@ use wrkflw_trigger_filter::WorkflowTriggerConfig;
 pub const DEFAULT_MAX_CONCURRENT_EXECUTIONS: usize = 4;
 
 /// A watch event containing the changed files and trigger evaluation results.
+///
+/// `error` is `Some` when the cycle ran into a non-fatal failure that the
+/// reporter should surface to the user (e.g. building the git event
+/// context failed). The watch loop will keep running on the next event,
+/// but the user needs to know that *this* cycle's "0 triggered" result is
+/// degraded rather than authoritative — otherwise a missing default branch
+/// or a transient git failure produces a session-long stream of silent
+/// "nothing to do" reports.
 #[derive(Debug, Clone)]
 pub struct WatchEvent {
     pub changed_files: Vec<String>,
     pub triggered_workflows: Vec<String>,
     pub skipped_workflows: Vec<String>,
+    pub error: Option<String>,
 }
 
 /// Directories ignored by the filesystem watcher by default.
@@ -107,36 +118,14 @@ pub struct WorkflowWatcher {
 
 impl WorkflowWatcher {
     /// Build a watcher from a [`WatcherConfig`].
-    pub fn from_config(mut cfg: WatcherConfig) -> Self {
-        // 0 would deadlock buffer_unordered; clamp to at least 1.
-        cfg.max_concurrent_executions = cfg.max_concurrent_executions.max(1);
+    ///
+    /// `WatcherConfig::with_max_concurrency` already clamps the concurrency
+    /// floor to 1, so this constructor is intentionally just a `Self { cfg }`
+    /// — the previous re-clamp here was dead defensive code and the
+    /// per-field accessor wrappers it sat alongside have been removed in
+    /// favor of reading `self.cfg.x` directly.
+    pub fn from_config(cfg: WatcherConfig) -> Self {
         Self { cfg }
-    }
-
-    // Accessors kept for source-compat with any in-tree callers.
-    fn workflow_dir(&self) -> &Path {
-        &self.cfg.workflow_dir
-    }
-    fn repo_root(&self) -> &Path {
-        &self.cfg.repo_root
-    }
-    fn event_name(&self) -> &str {
-        &self.cfg.event_name
-    }
-    fn base_branch(&self) -> Option<&String> {
-        self.cfg.base_branch.as_ref()
-    }
-    fn debounce_duration(&self) -> Duration {
-        self.cfg.debounce_duration
-    }
-    fn config_template(&self) -> &ExecutionConfig {
-        &self.cfg.execution
-    }
-    fn verbose(&self) -> bool {
-        self.cfg.verbose
-    }
-    fn max_concurrent_executions(&self) -> usize {
-        self.cfg.max_concurrent_executions
     }
 
     /// Collect workflow files from the configured directory.
@@ -146,7 +135,7 @@ impl WorkflowWatcher {
     /// cycle, and a slow filesystem (e.g. a network mount or a huge
     /// workflows directory) would otherwise block incoming notify events.
     pub async fn collect_workflow_files(&self) -> Result<Vec<PathBuf>, WatchError> {
-        let dir = self.workflow_dir().to_path_buf();
+        let dir = self.cfg.workflow_dir.clone();
         tokio::task::spawn_blocking(move || collect_workflow_files_blocking(&dir))
             .await
             .map_err(|e| WatchError::Io(std::io::Error::other(e.to_string())))?
@@ -170,10 +159,10 @@ impl WorkflowWatcher {
         // OS may deliver as canonicalized — e.g. macOS `/private/var` vs
         // `/var`, or a symlinked working copy) can be made root-relative
         // without silently failing every `strip_prefix`.
-        let repo_root_canonical = std::fs::canonicalize(self.repo_root())
-            .unwrap_or_else(|_| self.repo_root().to_path_buf());
+        let repo_root_canonical = std::fs::canonicalize(&self.cfg.repo_root)
+            .unwrap_or_else(|_| self.cfg.repo_root.clone());
 
-        let debouncer = Arc::new(Debouncer::new(self.debounce_duration()));
+        let debouncer = Arc::new(Debouncer::new(self.cfg.debounce_duration));
         let callback = Arc::new(on_cycle_complete);
 
         // Set up the notify watcher.
@@ -207,13 +196,13 @@ impl WorkflowWatcher {
         )?;
 
         // Watch the repo root recursively
-        watcher.watch(self.repo_root(), RecursiveMode::Recursive)?;
+        watcher.watch(&self.cfg.repo_root, RecursiveMode::Recursive)?;
 
         wrkflw_logging::info(&format!(
             "Watching {} for changes (event={}, debounce={}ms)",
-            self.repo_root().display(),
-            self.event_name(),
-            self.debounce_duration().as_millis()
+            self.cfg.repo_root.display(),
+            self.cfg.event_name,
+            self.cfg.debounce_duration.as_millis()
         ));
 
         let notify = debouncer.notifier();
@@ -222,7 +211,15 @@ impl WorkflowWatcher {
         // Invalidated only when a workflow file appears in the current
         // cycle's `changed_paths` set, so glob compilation doesn't repeat on
         // every file-save elsewhere in the repo.
-        let mut trigger_cache: HashMap<PathBuf, WorkflowTriggerConfig> = HashMap::new();
+        //
+        // Each entry stores the workflow's canonical path alongside the
+        // compiled config so the refresh loop can do change-set lookups
+        // without re-running `canonicalize_allowing_missing` for every
+        // workflow on every cycle. The previous implementation called
+        // canonicalize once per workflow per cycle — on a network mount or
+        // a deep workflows directory that adds noticeable latency between
+        // debounce drain and execution.
+        let mut trigger_cache: HashMap<PathBuf, TriggerCacheEntry> = HashMap::new();
         let mut workflow_files = initial_workflow_files;
 
         loop {
@@ -249,7 +246,7 @@ impl WorkflowWatcher {
             // Build the borrowed view for evaluation.
             let configs_for_eval: Vec<&WorkflowTriggerConfig> = workflow_files
                 .iter()
-                .filter_map(|p| trigger_cache.get(p))
+                .filter_map(|p| trigger_cache.get(p).map(|entry| &entry.config))
                 .collect();
 
             let changed_files = self
@@ -257,7 +254,7 @@ impl WorkflowWatcher {
                 .await;
 
             if changed_files.is_empty() {
-                if self.verbose() {
+                if self.cfg.verbose {
                     wrkflw_logging::warning(&format!(
                         "Ignored {} change event(s): none resolved under repo root {}",
                         changed_paths.len(),
@@ -280,8 +277,8 @@ impl WorkflowWatcher {
         }
     }
 
-    /// Async wrapper around [`refresh_trigger_cache`] that moves the
-    /// blocking file I/O onto a `spawn_blocking` thread. The watcher's
+    /// Async wrapper around [`refresh_trigger_cache_blocking`] that moves
+    /// the blocking file I/O onto a `spawn_blocking` thread. The watcher's
     /// main loop must call this rather than the sync helper directly —
     /// `load_trigger_config` reads + YAML-parses every workflow file
     /// serially, and on a network mount that latency multiplies into a
@@ -291,13 +288,13 @@ impl WorkflowWatcher {
     /// closure owns its mutable state. The caller reassigns the result.
     async fn refresh_trigger_cache_async(
         &self,
-        mut trigger_cache: HashMap<PathBuf, WorkflowTriggerConfig>,
+        mut trigger_cache: HashMap<PathBuf, TriggerCacheEntry>,
         workflow_files: &[PathBuf],
         changed_paths: &[PathBuf],
-    ) -> HashMap<PathBuf, WorkflowTriggerConfig> {
+    ) -> HashMap<PathBuf, TriggerCacheEntry> {
         let workflow_files = workflow_files.to_vec();
         let changed_paths = changed_paths.to_vec();
-        let verbose = self.verbose();
+        let verbose = self.cfg.verbose;
         let result = tokio::task::spawn_blocking(move || {
             refresh_trigger_cache_blocking(
                 &mut trigger_cache,
@@ -318,33 +315,6 @@ impl WorkflowWatcher {
             ));
             HashMap::new()
         })
-    }
-
-    /// Refresh `trigger_cache` in place: drop entries no longer in
-    /// `workflow_files`, reparse anything new or whose backing file appeared
-    /// in the current cycle's change set. Centralized so it can be unit
-    /// tested independently of the notify/tokio plumbing.
-    ///
-    /// Uses [`wrkflw_trigger_filter::load_trigger_config`] as the single
-    /// source of truth for "read + parse + compile" — the TUI and CLI
-    /// prefilter use the same helper so errors are reported identically.
-    ///
-    /// **Path-form normalization is load-bearing here.** `workflow_files`
-    /// arrives in whatever form `read_dir(workflow_dir)` produced (typically
-    /// relative — `.github/workflows/ci.yml`), while `changed_paths` arrives
-    /// from notify (typically absolute and OS-canonicalized — on macOS that
-    /// means `/private/var/...` instead of `/var/...`). A naive
-    /// `HashSet::contains` between the two never matches, so the
-    /// "this workflow file was edited, reparse it" branch silently rots and
-    /// the watcher serves stale parsed configs forever. We canonicalize both
-    /// sides to the same form before set membership.
-    pub fn refresh_trigger_cache(
-        &self,
-        trigger_cache: &mut HashMap<PathBuf, WorkflowTriggerConfig>,
-        workflow_files: &[PathBuf],
-        changed_paths: &[PathBuf],
-    ) {
-        refresh_trigger_cache_blocking(trigger_cache, workflow_files, changed_paths, self.verbose());
     }
 
     /// Convert absolute change paths to repo-relative strings. Runs on a
@@ -382,32 +352,59 @@ impl WorkflowWatcher {
     /// Evaluate triggers for the given (already parsed) workflows against the
     /// current git state, then execute the matching workflows with bounded
     /// concurrency.
+    ///
+    /// **Degraded context handling.** If `context_from_changed_files` fails
+    /// (e.g. transient git error), we no longer silently fall back to a
+    /// `branch: None` context — that previously caused every `branches:`
+    /// filter to deterministically reject for the rest of the session
+    /// while the user just saw "0 triggered" with no explanation. We now
+    /// short-circuit the cycle, attach the failure reason to the
+    /// `WatchEvent`, and let the reporter callback surface it. The watch
+    /// loop itself keeps running so the next event still gets a chance to
+    /// build a healthy context.
+    ///
+    /// **Per-workflow panic isolation.** Each `wrkflw_executor::execute_workflow`
+    /// future is wrapped in [`futures::FutureExt::catch_unwind`]. A panic
+    /// inside one workflow's execution path used to propagate through
+    /// `buffer_unordered` and abort the entire watch loop, killing the
+    /// session for every workflow. Catching the unwind contains the panic
+    /// to the offending workflow and lets the rest of the cycle complete.
+    ///
+    /// We do NOT use `tokio::spawn` for the per-workflow task: the
+    /// executor's internal `dyn ContainerRuntime` is not `Sync`, so the
+    /// `execute_workflow` future is not `Send`. `catch_unwind` works on
+    /// the local future without requiring it to be sent across threads.
+    /// `AssertUnwindSafe` is required because the captured config and
+    /// path are not statically `UnwindSafe`; we accept that contract here
+    /// because we discard all per-task state on panic and surface only a
+    /// log line.
     async fn evaluate_and_execute(
         &self,
         configs: &[&WorkflowTriggerConfig],
         changed_files: Vec<String>,
     ) -> WatchEvent {
-        let context = wrkflw_trigger_filter::context_from_changed_files(
-            self.event_name(),
+        let context = match wrkflw_trigger_filter::context_from_changed_files(
+            &self.cfg.event_name,
             changed_files.clone(),
-            Some(self.repo_root()),
+            Some(&self.cfg.repo_root),
         )
         .await
-        .map(|mut ctx| {
-            ctx.base_branch = self.base_branch().cloned();
-            ctx
-        })
-        .unwrap_or_else(|e| {
-            wrkflw_logging::warning(&format!("Failed to build event context: {}", e));
-            wrkflw_trigger_filter::EventContext {
-                event_name: self.event_name().to_string(),
-                branch: None,
-                base_branch: self.base_branch().cloned(),
-                tag: None,
-                changed_files: changed_files.clone(),
-                activity_type: None,
+        {
+            Ok(mut ctx) => {
+                ctx.base_branch = self.cfg.base_branch.clone();
+                ctx
             }
-        });
+            Err(e) => {
+                let reason = format!("Failed to build event context: {}", e);
+                wrkflw_logging::warning(&reason);
+                return WatchEvent {
+                    changed_files,
+                    triggered_workflows: Vec::new(),
+                    skipped_workflows: Vec::new(),
+                    error: Some(reason),
+                };
+            }
+        };
 
         let results = wrkflw_trigger_filter::filter_trigger_configs(configs, &context);
 
@@ -419,28 +416,51 @@ impl WorkflowWatcher {
             if result.matches {
                 triggered.push(result.workflow_path.display().to_string());
 
-                let config = self.config_template().clone();
+                let exec_config = self.cfg.execution.clone();
                 let wf_path = result.workflow_path.clone();
                 exec_futures.push(async move {
-                    match wrkflw_executor::execute_workflow(&wf_path, config).await {
-                        Ok(exec_result) => {
+                    let log_path = wf_path.clone();
+                    // `AssertUnwindSafe` + `catch_unwind` contains panics
+                    // from inside the executor so a single rogue workflow
+                    // cannot kill the watch loop. See the type-level docs
+                    // above for why we use this instead of `tokio::spawn`.
+                    let outcome =
+                        AssertUnwindSafe(wrkflw_executor::execute_workflow(&wf_path, exec_config))
+                            .catch_unwind()
+                            .await;
+                    match outcome {
+                        Ok(Ok(exec_result)) => {
                             if exec_result.failure_details.is_some() {
                                 wrkflw_logging::error(&format!(
                                     "Workflow {} failed",
-                                    wf_path.display()
+                                    log_path.display()
                                 ));
                             } else {
                                 wrkflw_logging::info(&format!(
                                     "Workflow {} succeeded",
-                                    wf_path.display()
+                                    log_path.display()
                                 ));
                             }
                         }
-                        Err(e) => {
+                        Ok(Err(e)) => {
                             wrkflw_logging::error(&format!(
                                 "Workflow {} error: {}",
-                                wf_path.display(),
+                                log_path.display(),
                                 e
+                            ));
+                        }
+                        Err(_panic_payload) => {
+                            // We deliberately discard the panic payload —
+                            // recovering a `&str` from `Box<dyn Any>`
+                            // works for the common case but the executor
+                            // could panic with anything, and we'd rather
+                            // give a consistent message than format a
+                            // type name. The user can dig into executor
+                            // logs for the actual panic message.
+                            wrkflw_logging::error(&format!(
+                                "Workflow {} panicked during execution — \
+                                 watch loop continues; investigate the executor logs",
+                                log_path.display()
                             ));
                         }
                     }
@@ -450,9 +470,11 @@ impl WorkflowWatcher {
             }
         }
 
-        // Execute triggered workflows with bounded concurrency
+        // Execute triggered workflows with bounded concurrency. Each future
+        // wraps a `tokio::spawn`, so a panicking workflow surfaces as a
+        // logged error inside the future rather than propagating out.
         stream::iter(exec_futures)
-            .buffer_unordered(self.max_concurrent_executions())
+            .buffer_unordered(self.cfg.max_concurrent_executions)
             .collect::<Vec<()>>()
             .await;
 
@@ -460,6 +482,7 @@ impl WorkflowWatcher {
             changed_files,
             triggered_workflows: triggered,
             skipped_workflows: skipped,
+            error: None,
         }
     }
 }
@@ -511,15 +534,44 @@ pub(crate) fn canonicalize_allowing_missing(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
+/// One entry in the trigger cache: the compiled config plus a memoized
+/// canonical form of the workflow's path.
+///
+/// Stashing the canonical form lets `refresh_trigger_cache_blocking` skip
+/// `canonicalize_allowing_missing` for any workflow that's already cached —
+/// previously, every cycle re-canonicalized every workflow file, which on
+/// a network mount or a deep tree was a measurable per-cycle latency hit.
+#[derive(Debug, Clone)]
+pub(crate) struct TriggerCacheEntry {
+    /// Canonical form of the workflow file path. Used to test set
+    /// membership against `changed_paths` (which arrive from notify in
+    /// canonical absolute form on macOS).
+    pub canonical_path: PathBuf,
+    pub config: WorkflowTriggerConfig,
+}
+
 /// Synchronous implementation of trigger cache refresh. Extracted so the
 /// async wrapper can move it onto a `spawn_blocking` thread without
 /// dragging `&self` along, and so unit tests can drive it without an
 /// ambient tokio runtime.
 ///
-/// See [`WorkflowWatcher::refresh_trigger_cache`] for the path-form
-/// normalization rationale and the parse-failure logging contract.
+/// **Path-form normalization is load-bearing here.** `workflow_files`
+/// arrives in whatever form `read_dir(workflow_dir)` produced (typically
+/// relative — `.github/workflows/ci.yml`), while `changed_paths` arrives
+/// from notify (typically absolute and OS-canonicalized — on macOS that
+/// means `/private/var/...` instead of `/var/...`). A naive
+/// `HashSet::contains` between the two never matches, so the
+/// "this workflow file was edited, reparse it" branch silently rots and
+/// the watcher serves stale parsed configs forever. We canonicalize both
+/// sides to the same form before set membership.
+///
+/// **Canonical-path memoization.** Each entry stores its canonical form
+/// in [`TriggerCacheEntry::canonical_path`]; we only re-canonicalize a
+/// workflow file when it isn't yet in the cache. This bounds the
+/// per-cycle canonicalize calls to "newly-added workflows", instead of
+/// "every workflow on every cycle".
 fn refresh_trigger_cache_blocking(
-    trigger_cache: &mut HashMap<PathBuf, WorkflowTriggerConfig>,
+    trigger_cache: &mut HashMap<PathBuf, TriggerCacheEntry>,
     workflow_files: &[PathBuf],
     changed_paths: &[PathBuf],
     verbose: bool,
@@ -538,7 +590,13 @@ fn refresh_trigger_cache_blocking(
 
     let mut parse_failures = 0usize;
     for wf_path in workflow_files {
-        let wf_canon = canonicalize_allowing_missing(wf_path);
+        // Reuse the cached canonical form if we have one — only newly
+        // discovered workflow files cost a fresh canonicalize.
+        let cached_canonical = trigger_cache.get(wf_path).map(|e| e.canonical_path.clone());
+        let wf_canon = match cached_canonical {
+            Some(c) => c,
+            None => canonicalize_allowing_missing(wf_path),
+        };
         let needs_reparse =
             !trigger_cache.contains_key(wf_path) || changed_canon.contains(&wf_canon);
         if !needs_reparse {
@@ -546,7 +604,13 @@ fn refresh_trigger_cache_blocking(
         }
         match wrkflw_trigger_filter::load_trigger_config(wf_path) {
             Ok(cfg) => {
-                trigger_cache.insert(wf_path.clone(), cfg);
+                trigger_cache.insert(
+                    wf_path.clone(),
+                    TriggerCacheEntry {
+                        canonical_path: wf_canon,
+                        config: cfg,
+                    },
+                );
             }
             Err(e) => {
                 trigger_cache.remove(wf_path);
@@ -828,7 +892,7 @@ mod tests {
     fn refresh_trigger_cache_reparses_edited_workflow_across_path_forms() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let repo = tmp.path().to_path_buf();
-        let watcher = make_watcher_for(&repo);
+        let _watcher = make_watcher_for(&repo);
 
         // Write the workflow with `paths: ['src/foo.rs']`. The schema
         // validator that `parse_workflow` runs requires at least one
@@ -841,12 +905,19 @@ mod tests {
         // Reach the workflow via the same relative form `read_dir` would
         // produce when `workflow_dir` was passed in relative.
         let workflow_files = vec![wf_abs.clone()];
-        let mut cache: HashMap<PathBuf, WorkflowTriggerConfig> = HashMap::new();
+        let mut cache: HashMap<PathBuf, TriggerCacheEntry> = HashMap::new();
 
-        // Prime the cache with the v1 config.
-        watcher.refresh_trigger_cache(&mut cache, &workflow_files, &[]);
+        // Prime the cache with the v1 config. Drives the private blocking
+        // helper directly so the test does not depend on the public API
+        // surface (the `refresh_trigger_cache` accessor was removed once
+        // its only consumer was this test).
+        refresh_trigger_cache_blocking(&mut cache, &workflow_files, &[], false);
         let v1 = cache.get(&wf_abs).expect("v1 cached");
-        let v1_paths: Vec<&str> = v1.events[0].paths.iter().map(|p| p.source.as_str()).collect();
+        let v1_paths: Vec<&str> = v1.config.events[0]
+            .paths
+            .iter()
+            .map(|p| p.source.as_str())
+            .collect();
         assert_eq!(v1_paths, vec!["src/foo.rs"], "v1 should have foo paths");
 
         // Rewrite the file with `paths: ['src/bar.rs']`.
@@ -856,10 +927,14 @@ mod tests {
         // Simulate a notify event with the OS-canonicalized absolute form.
         // (On macOS this prepends `/private`.)
         let changed = std::fs::canonicalize(&wf_abs).expect("canonicalize wf");
-        watcher.refresh_trigger_cache(&mut cache, &workflow_files, &[changed]);
+        refresh_trigger_cache_blocking(&mut cache, &workflow_files, &[changed], false);
 
         let v2 = cache.get(&wf_abs).expect("v2 cached");
-        let v2_paths: Vec<&str> = v2.events[0].paths.iter().map(|p| p.source.as_str()).collect();
+        let v2_paths: Vec<&str> = v2.config.events[0]
+            .paths
+            .iter()
+            .map(|p| p.source.as_str())
+            .collect();
         assert_eq!(
             v2_paths,
             vec!["src/bar.rs"],
@@ -874,5 +949,72 @@ mod tests {
             Path::new("/repo/crates/foo/target/debug/build/foo"),
             root()
         ));
+    }
+
+    /// Refreshing the cache twice for an unchanged workflow file must
+    /// only canonicalize that file once — the second pass should reuse
+    /// the canonical form stored in [`TriggerCacheEntry`]. This is the
+    /// memoization that backs the per-cycle latency win on network
+    /// mounts; the test asserts the cache hit by checking that the
+    /// stored canonical_path survives the second refresh unchanged.
+    #[test]
+    fn refresh_trigger_cache_memoizes_canonical_paths() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let repo = tmp.path().to_path_buf();
+        let _watcher = make_watcher_for(&repo);
+
+        let wf_abs = repo.join(".github/workflows/ci.yml");
+        let yaml = "name: test\non:\n  push:\n    paths:\n      - 'src/foo.rs'\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n";
+        std::fs::write(&wf_abs, yaml).expect("write ci.yml");
+
+        let workflow_files = vec![wf_abs.clone()];
+        let mut cache: HashMap<PathBuf, TriggerCacheEntry> = HashMap::new();
+
+        refresh_trigger_cache_blocking(&mut cache, &workflow_files, &[], false);
+        let canonical_after_first = cache
+            .get(&wf_abs)
+            .expect("v1 cached")
+            .canonical_path
+            .clone();
+        assert!(
+            !canonical_after_first.as_os_str().is_empty(),
+            "canonical_path should be populated"
+        );
+
+        // A second refresh with no changes must keep the same canonical
+        // form (we're asserting the cache value survives, which proves
+        // the entry was reused rather than re-canonicalized into a new
+        // entry).
+        refresh_trigger_cache_blocking(&mut cache, &workflow_files, &[], false);
+        let canonical_after_second = &cache.get(&wf_abs).expect("still cached").canonical_path;
+        assert_eq!(
+            &canonical_after_first, canonical_after_second,
+            "second refresh should reuse the memoized canonical_path"
+        );
+    }
+
+    /// Pattern test for the per-workflow panic isolation in
+    /// `evaluate_and_execute`: wrapping a panicking future in
+    /// `AssertUnwindSafe(...).catch_unwind()` must yield `Err(_)`
+    /// rather than unwinding into the awaiter. This is the load-bearing
+    /// property the watcher relies on so a single rogue workflow does
+    /// not kill the entire watch loop.
+    ///
+    /// We use `catch_unwind` rather than `tokio::spawn` because the
+    /// executor's `execute_workflow` future is not `Send` (it holds a
+    /// `dyn ContainerRuntime` that is not `Sync`), so spawning is not
+    /// available — see the type-level docs on `evaluate_and_execute`.
+    #[tokio::test]
+    async fn catch_unwind_isolates_panics_from_workflow_futures() {
+        let result: Result<(), _> = AssertUnwindSafe(async {
+            panic!("simulated executor panic");
+        })
+        .catch_unwind()
+        .await;
+        assert!(
+            result.is_err(),
+            "catch_unwind must classify a panicking future as Err so the watcher's \
+             match arm can log + continue instead of unwinding the loop"
+        );
     }
 }

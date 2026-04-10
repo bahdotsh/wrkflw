@@ -138,6 +138,10 @@ enum Commands {
         /// Preserve Docker containers on failure for debugging (Docker mode only)
         #[arg(long)]
         preserve_containers_on_failure: bool,
+
+        /// Maximum number of workflows that may execute concurrently per cycle
+        #[arg(long, default_value_t = wrkflw_watcher::DEFAULT_MAX_CONCURRENT_EXECUTIONS)]
+        max_concurrency: usize,
     },
 
     /// Open TUI interface to manage workflows
@@ -498,6 +502,15 @@ async fn main() {
                             })
                     }
                 } else {
+                    // --event was passed alone (no --diff, no --changed-files).
+                    // The context will have an empty changed-files set, which means
+                    // any workflow with a `paths:` filter will be silently skipped.
+                    // Warn so users do not get surprised by "nothing triggered".
+                    wrkflw_logging::warning(
+                        "--event was supplied without --diff or --changed-files; \
+                         path filters will not match because no changed files are known. \
+                         Use --diff to auto-detect from git, or --changed-files to specify them.",
+                    );
                     wrkflw_trigger_filter::context_from_changed_files(&event_name, vec![])
                         .await
                         .unwrap_or_else(|e| {
@@ -669,6 +682,7 @@ async fn main() {
             event,
             show_action_messages,
             preserve_containers_on_failure,
+            max_concurrency,
         }) => {
             let workflow_dir = path
                 .clone()
@@ -713,6 +727,7 @@ async fn main() {
                 debounce_duration,
                 config,
                 verbose,
+                *max_concurrency,
             );
 
             // Validate workflow files exist before starting

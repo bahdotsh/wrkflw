@@ -132,12 +132,10 @@ fn build_context_help(app: &App) -> String {
         0 => {
             if app.job_selection_mode {
                 "Enter run \u{2502} a all \u{2502} Esc back".to_string()
+            } else if app.diff_filter_active {
+                "Space toggle \u{2502} Enter run \u{2502} J jobs \u{2502} r queue \u{2502} d diff:ON \u{2502} ? help \u{2502} q quit".to_string()
             } else {
-                if app.diff_filter_active {
-                    "Space toggle \u{2502} Enter run \u{2502} J jobs \u{2502} r queue \u{2502} d diff:ON \u{2502} ? help \u{2502} q quit".to_string()
-                } else {
-                    "Space toggle \u{2502} Enter run \u{2502} J jobs \u{2502} r queue \u{2502} d diff \u{2502} ? help \u{2502} q quit".to_string()
-                }
+                "Space toggle \u{2502} Enter run \u{2502} J jobs \u{2502} r queue \u{2502} d diff \u{2502} ? help \u{2502} q quit".to_string()
             }
         }
         1 => {

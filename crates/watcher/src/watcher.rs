@@ -8,8 +8,9 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use wrkflw_executor::ExecutionConfig;
 
-/// Maximum number of workflows that execute concurrently in watch mode.
-const MAX_CONCURRENT_EXECUTIONS: usize = 4;
+/// Default cap on workflows executing concurrently in watch mode when the
+/// caller does not supply an explicit limit.
+pub const DEFAULT_MAX_CONCURRENT_EXECUTIONS: usize = 4;
 
 /// A watch event containing the changed files and trigger evaluation results.
 #[derive(Debug, Clone)]
@@ -45,6 +46,7 @@ pub struct WorkflowWatcher {
     debounce_duration: Duration,
     config_template: ExecutionConfig,
     verbose: bool,
+    max_concurrent_executions: usize,
 }
 
 impl WorkflowWatcher {
@@ -55,7 +57,10 @@ impl WorkflowWatcher {
         debounce_duration: Duration,
         config: ExecutionConfig,
         verbose: bool,
+        max_concurrent_executions: usize,
     ) -> Self {
+        // 0 would deadlock buffer_unordered; clamp to at least 1.
+        let max_concurrent_executions = max_concurrent_executions.max(1);
         Self {
             workflow_dir,
             repo_root,
@@ -63,6 +68,7 @@ impl WorkflowWatcher {
             debounce_duration,
             config_template: config,
             verbose,
+            max_concurrent_executions,
         }
     }
 
@@ -107,7 +113,12 @@ impl WorkflowWatcher {
         let debouncer = Arc::new(Debouncer::new(self.debounce_duration));
         let callback = Arc::new(on_cycle_complete);
 
-        // Set up the notify watcher
+        // Set up the notify watcher.
+        //
+        // The `watcher` binding is load-bearing: `RecommendedWatcher` stops
+        // emitting events the moment it is dropped, so it MUST stay alive for
+        // the entire duration of the watch loop below. Do not narrow this
+        // scope or rebind it without preserving its lifetime.
         let tx_clone = tx.clone();
         let mut watcher = RecommendedWatcher::new(
             move |res: Result<Event, notify::Error>| {
@@ -274,7 +285,7 @@ impl WorkflowWatcher {
 
         // Execute triggered workflows with bounded concurrency
         stream::iter(exec_futures)
-            .buffer_unordered(MAX_CONCURRENT_EXECUTIONS)
+            .buffer_unordered(self.max_concurrent_executions)
             .collect::<Vec<()>>()
             .await;
 

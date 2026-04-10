@@ -20,7 +20,8 @@ fn git_cmd(cwd: Option<&Path>) -> Command {
 ///
 /// We can't trust user-supplied refs to be safe to splat into a `git` argv —
 /// a value like `--upload-pack=foo` would be parsed as an option. Reject any
-/// ref starting with `-` or containing characters git itself disallows.
+/// ref starting with `-` or containing characters that aren't part of git's
+/// documented revision syntax.
 pub fn validate_ref_name(name: &str) -> Result<(), TriggerFilterError> {
     if name.is_empty() {
         return Err(TriggerFilterError::GitError(
@@ -33,12 +34,16 @@ pub fn validate_ref_name(name: &str) -> Result<(), TriggerFilterError> {
             name
         )));
     }
-    // Allowlist: a safe subset that covers branch names, tags, sha1s,
-    // and revision suffixes like `HEAD~1` / `HEAD^`.
-    if !name
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '/' | '.' | '~' | '^'))
-    {
+    // Allowlist covers:
+    // - branch/tag names and sha1s
+    // - path separators in refs: `/`, `.`
+    // - revision suffixes: `~`, `^`
+    // - reflog / upstream syntax: `@`, `{`, `}`
+    //   (e.g. `HEAD@{1}`, `origin/main@{upstream}`, `@` as a synonym for HEAD)
+    if !name.chars().all(|c| {
+        c.is_ascii_alphanumeric()
+            || matches!(c, '_' | '-' | '/' | '.' | '~' | '^' | '@' | '{' | '}')
+    }) {
         return Err(TriggerFilterError::GitError(format!(
             "git ref name '{}' contains characters outside the allowed set",
             name
@@ -134,9 +139,8 @@ fn check_status(
     result: Result<std::process::Output, std::io::Error>,
     cmd_label: &str,
 ) -> Result<std::process::Output, TriggerFilterError> {
-    let output = result.map_err(|e| {
-        TriggerFilterError::GitError(format!("Failed to run {}: {}", cmd_label, e))
-    })?;
+    let output = result
+        .map_err(|e| TriggerFilterError::GitError(format!("Failed to run {}: {}", cmd_label, e)))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(TriggerFilterError::GitError(format!(
@@ -315,5 +319,13 @@ mod tests {
         assert!(validate_ref_name("main; rm -rf /").is_err());
         assert!(validate_ref_name("main`whoami`").is_err());
         assert!(validate_ref_name("main$(id)").is_err());
+    }
+
+    #[test]
+    fn validate_ref_accepts_reflog_and_upstream_syntax() {
+        assert!(validate_ref_name("HEAD@{1}").is_ok());
+        assert!(validate_ref_name("origin/main@{upstream}").is_ok());
+        assert!(validate_ref_name("@").is_ok());
+        assert!(validate_ref_name("@~1").is_ok());
     }
 }

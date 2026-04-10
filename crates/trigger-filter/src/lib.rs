@@ -20,6 +20,11 @@ use std::path::{Path, PathBuf};
 /// `WorkflowDefinition` is borrowed (not cloned) because it isn't `Clone`.
 /// The watcher hits this hot loop on every cycle, so it caches parsed
 /// workflows and passes references in.
+///
+/// This parses and compiles trigger globs on every call. For hot loops
+/// (e.g. the filesystem watcher), prefer [`filter_trigger_configs`], which
+/// takes pre-parsed [`WorkflowTriggerConfig`]s so that glob compilation can
+/// be cached across cycles.
 pub fn filter_workflows(
     workflows: &[(PathBuf, &wrkflw_parser::workflow::WorkflowDefinition)],
     context: &EventContext,
@@ -36,6 +41,22 @@ pub fn filter_workflows(
                 reason: format!("Failed to parse trigger config: {}", e),
             },
         })
+        .collect()
+}
+
+/// Evaluate multiple pre-parsed trigger configs against an event context.
+///
+/// Callers are expected to cache the [`WorkflowTriggerConfig`] values and
+/// invalidate them only when the underlying workflow file changes. This
+/// avoids re-running `parse_trigger_config` — and thus re-compiling every
+/// glob pattern — on every cycle.
+pub fn filter_trigger_configs(
+    configs: &[&WorkflowTriggerConfig],
+    context: &EventContext,
+) -> Vec<TriggerMatchResult> {
+    configs
+        .iter()
+        .map(|config| evaluate_trigger(config, context))
         .collect()
 }
 
@@ -56,16 +77,19 @@ pub async fn auto_detect_context(
     diff_base: &str,
     cwd: Option<&Path>,
 ) -> Result<EventContext, TriggerFilterError> {
-    let branch = git::get_current_branch(cwd).await.ok();
-    let tag = git::get_current_tag(cwd).await?;
-    let changed_files = git::get_changed_files(diff_base, cwd).await?;
+    // Run the three independent git queries concurrently.
+    let (branch_res, tag_res, changed_res) = tokio::join!(
+        git::get_current_branch(cwd),
+        git::get_current_tag(cwd),
+        git::get_changed_files(diff_base, cwd),
+    );
 
     Ok(EventContext {
         event_name: event_name.to_string(),
-        branch,
+        branch: branch_res.ok(),
         base_branch: None,
-        tag,
-        changed_files,
+        tag: tag_res?,
+        changed_files: changed_res?,
         activity_type: None,
     })
 }
@@ -89,16 +113,18 @@ pub async fn context_from_diff_range(
     head_ref: &str,
     cwd: Option<&Path>,
 ) -> Result<EventContext, TriggerFilterError> {
-    let branch = git::get_current_branch(cwd).await.ok();
-    let tag = git::get_current_tag(cwd).await?;
-    let changed_files = git::get_changed_files_between(base_ref, head_ref, cwd).await?;
+    let (branch_res, tag_res, changed_res) = tokio::join!(
+        git::get_current_branch(cwd),
+        git::get_current_tag(cwd),
+        git::get_changed_files_between(base_ref, head_ref, cwd),
+    );
 
     Ok(EventContext {
         event_name: event_name.to_string(),
-        branch,
+        branch: branch_res.ok(),
         base_branch: None,
-        tag,
-        changed_files,
+        tag: tag_res?,
+        changed_files: changed_res?,
         activity_type: None,
     })
 }
@@ -112,14 +138,14 @@ pub async fn context_from_changed_files(
     changed_files: Vec<String>,
     cwd: Option<&Path>,
 ) -> Result<EventContext, TriggerFilterError> {
-    let branch = git::get_current_branch(cwd).await.ok();
-    let tag = git::get_current_tag(cwd).await?;
+    let (branch_res, tag_res) =
+        tokio::join!(git::get_current_branch(cwd), git::get_current_tag(cwd),);
 
     Ok(EventContext {
         event_name: event_name.to_string(),
-        branch,
+        branch: branch_res.ok(),
         base_branch: None,
-        tag,
+        tag: tag_res?,
         changed_files,
         activity_type: None,
     })
@@ -140,9 +166,9 @@ mod tests {
         }
     }
 
-    fn borrow<'a>(
-        v: &'a [(PathBuf, wrkflw_parser::workflow::WorkflowDefinition)],
-    ) -> Vec<(PathBuf, &'a wrkflw_parser::workflow::WorkflowDefinition)> {
+    fn borrow(
+        v: &[(PathBuf, wrkflw_parser::workflow::WorkflowDefinition)],
+    ) -> Vec<(PathBuf, &wrkflw_parser::workflow::WorkflowDefinition)> {
         v.iter().map(|(p, w)| (p.clone(), w)).collect()
     }
 

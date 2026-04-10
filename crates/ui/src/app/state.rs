@@ -309,11 +309,16 @@ impl App {
             let workflow_paths: Vec<PathBuf> =
                 self.workflows.iter().map(|w| w.path.clone()).collect();
 
+            // The TUI currently has no event/branch selector, so we
+            // simulate a `push` event. Users who need other events should
+            // reach for `wrkflw run --event ... --diff`.
+            let event_name = "push".to_string();
+
             let (tx, rx) = mpsc::channel();
             self.diff_filter_rx = Some(rx);
 
             std::thread::spawn(move || {
-                let results = evaluate_diff_filter(workflow_paths);
+                let results = evaluate_diff_filter(workflow_paths, event_name);
                 let _ = tx.send(results);
             });
         } else {
@@ -1302,11 +1307,12 @@ impl App {
 /// keyed by path — this guarantees correctness even if the workflow list is
 /// reloaded between toggle and result delivery.
 ///
-/// Note: this hardcodes `event_name = "push"`. The TUI does not currently
-/// expose event/branch selection; users who need that should use
-/// `wrkflw run --event ... --diff` from the CLI.
+/// The event name is passed through from the caller rather than hardcoded,
+/// so a future TUI change that adds event selection is a plumbing-only
+/// change here.
 fn evaluate_diff_filter(
     workflow_paths: Vec<PathBuf>,
+    event_name: String,
 ) -> Vec<(PathBuf, Option<TriggerMatchStatus>)> {
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -1318,9 +1324,9 @@ fn evaluate_diff_filter(
         }
     };
 
-    let context = match rt
-        .block_on(async { wrkflw_trigger_filter::auto_detect_context_default_base("push", None).await })
-    {
+    let context = match rt.block_on(async {
+        wrkflw_trigger_filter::auto_detect_context_default_base(&event_name, None).await
+    }) {
         Ok(ctx) => ctx,
         Err(_) => {
             return workflow_paths.into_iter().map(|p| (p, None)).collect();
@@ -1340,8 +1346,13 @@ fn evaluate_diff_filter(
         parsed.iter().map(|(p, w)| (p.clone(), w)).collect();
 
     let results = wrkflw_trigger_filter::filter_workflows(&borrowed, &context);
-    let results_by_path: std::collections::HashMap<PathBuf, &wrkflw_trigger_filter::TriggerMatchResult> =
-        results.iter().map(|r| (r.workflow_path.clone(), r)).collect();
+    let results_by_path: std::collections::HashMap<
+        PathBuf,
+        &wrkflw_trigger_filter::TriggerMatchResult,
+    > = results
+        .iter()
+        .map(|r| (r.workflow_path.clone(), r))
+        .collect();
 
     workflow_paths
         .into_iter()

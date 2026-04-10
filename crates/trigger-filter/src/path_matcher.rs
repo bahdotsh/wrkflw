@@ -135,11 +135,7 @@ mod tests {
         assert!(matches_paths(&files, &[gp("src/**")], &[gp("**/test_*")]));
         // Only test file — included by src/** but excluded by test_*
         let files2 = vec!["src/test_helpers.rs".into()];
-        assert!(!matches_paths(
-            &files2,
-            &[gp("src/**")],
-            &[gp("**/test_*")]
-        ));
+        assert!(!matches_paths(&files2, &[gp("src/**")], &[gp("**/test_*")]));
     }
 
     #[test]

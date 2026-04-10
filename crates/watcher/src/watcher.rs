@@ -6,9 +6,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc;
 use wrkflw_executor::ExecutionConfig;
-use wrkflw_parser::workflow::WorkflowDefinition;
+use wrkflw_trigger_filter::WorkflowTriggerConfig;
 
 /// Default cap on workflows executing concurrently in watch mode when the
 /// caller does not supply an explicit limit.
@@ -115,7 +114,13 @@ impl WorkflowWatcher {
     {
         let initial_workflow_files = self.collect_workflow_files()?;
 
-        let (tx, mut rx) = mpsc::channel::<PathBuf>(256);
+        // Canonicalize the repo root once so incoming notify paths (which the
+        // OS may deliver as canonicalized — e.g. macOS `/private/var` vs
+        // `/var`, or a symlinked working copy) can be made root-relative
+        // without silently failing every `strip_prefix`.
+        let repo_root_canonical =
+            std::fs::canonicalize(&self.repo_root).unwrap_or_else(|_| self.repo_root.clone());
+
         let debouncer = Arc::new(Debouncer::new(self.debounce_duration));
         let callback = Arc::new(on_cycle_complete);
 
@@ -125,19 +130,21 @@ impl WorkflowWatcher {
         // emitting events the moment it is dropped, so it MUST stay alive for
         // the entire duration of the watch loop below. Do not narrow this
         // scope or rebind it without preserving its lifetime.
-        let tx_clone = tx.clone();
-        let repo_root_clone = self.repo_root.clone();
+        //
+        // The callback pushes events directly into the shared debouncer set
+        // (no intermediate bounded MPSC). This avoids silent drops under
+        // burst load: a `HashSet::insert` on the debouncer's mutex is bounded
+        // in cost, and the debouncer naturally deduplicates paths.
+        let debouncer_for_callback = debouncer.clone();
+        let repo_root_for_callback = repo_root_canonical.clone();
         let mut watcher = RecommendedWatcher::new(
             move |res: Result<Event, notify::Error>| {
                 if let Ok(event) = res {
                     for path in event.paths {
-                        if should_ignore_path(&path, &repo_root_clone) {
+                        if should_ignore_path(&path, &repo_root_for_callback) {
                             continue;
                         }
-                        // Use try_send to avoid blocking the OS filesystem event
-                        // thread when the channel is full.  Dropping an event is
-                        // acceptable because the debouncer coalesces anyway.
-                        let _ = tx_clone.try_send(path);
+                        debouncer_for_callback.add_event(path);
                     }
                 }
             },
@@ -154,19 +161,13 @@ impl WorkflowWatcher {
             self.debounce_duration.as_millis()
         ));
 
-        let debouncer_clone = debouncer.clone();
         let notify = debouncer.notifier();
 
-        // Spawn a task to receive filesystem events and feed the debouncer
-        tokio::spawn(async move {
-            while let Some(path) = rx.recv().await {
-                debouncer_clone.add_event(path);
-            }
-        });
-
-        // Cache of parsed workflow definitions, keyed by file path.
-        // Reparsed only when a file is new or shows up in changed_paths.
-        let mut parsed_cache: HashMap<PathBuf, WorkflowDefinition> = HashMap::new();
+        // Cache of compiled trigger configs keyed by workflow file path.
+        // Invalidated only when a workflow file appears in the current
+        // cycle's `changed_paths` set, so glob compilation doesn't repeat on
+        // every file-save elsewhere in the repo.
+        let mut trigger_cache: HashMap<PathBuf, WorkflowTriggerConfig> = HashMap::new();
         let mut workflow_files = initial_workflow_files;
 
         loop {
@@ -186,43 +187,60 @@ impl WorkflowWatcher {
                 workflow_files = refreshed;
             }
 
-            // Refresh the parse cache: drop entries no longer in the workflow
-            // list, reparse new ones and any whose backing file just changed.
+            // Refresh the trigger cache: drop entries no longer in the
+            // workflow list, and reparse new ones or any whose backing file
+            // just changed.
             let active_set: HashSet<&PathBuf> = workflow_files.iter().collect();
-            parsed_cache.retain(|k, _| active_set.contains(k));
+            trigger_cache.retain(|k, _| active_set.contains(k));
 
             let changed_set: HashSet<&PathBuf> = changed_paths.iter().collect();
             let mut parse_failures = 0usize;
             for wf_path in &workflow_files {
                 let needs_reparse =
-                    !parsed_cache.contains_key(wf_path) || changed_set.contains(wf_path);
-                if needs_reparse {
-                    match wrkflw_parser::workflow::parse_workflow(wf_path) {
-                        Ok(wf) => {
-                            parsed_cache.insert(wf_path.clone(), wf);
-                        }
-                        Err(e) => {
-                            parsed_cache.remove(wf_path);
-                            parse_failures += 1;
-                            if self.verbose {
-                                wrkflw_logging::warning(&format!(
-                                    "Failed to parse {}: {}",
-                                    wf_path.display(),
-                                    e
-                                ));
+                    !trigger_cache.contains_key(wf_path) || changed_set.contains(wf_path);
+                if !needs_reparse {
+                    continue;
+                }
+                match wrkflw_parser::workflow::parse_workflow(wf_path) {
+                    Ok(wf) => {
+                        match wrkflw_trigger_filter::parse_trigger_config(&wf, wf_path.clone()) {
+                            Ok(cfg) => {
+                                trigger_cache.insert(wf_path.clone(), cfg);
                             }
+                            Err(e) => {
+                                trigger_cache.remove(wf_path);
+                                parse_failures += 1;
+                                if self.verbose {
+                                    wrkflw_logging::warning(&format!(
+                                        "Failed to parse trigger config for {}: {}",
+                                        wf_path.display(),
+                                        e
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        trigger_cache.remove(wf_path);
+                        parse_failures += 1;
+                        if self.verbose {
+                            wrkflw_logging::warning(&format!(
+                                "Failed to parse {}: {}",
+                                wf_path.display(),
+                                e
+                            ));
                         }
                     }
                 }
             }
-            // Build the borrowed view used by filter_workflows. We must
-            // hold the cache borrow for the entire eval call.
-            let workflows_for_eval: Vec<(PathBuf, &WorkflowDefinition)> = workflow_files
+
+            // Build the borrowed view for evaluation.
+            let configs_for_eval: Vec<&WorkflowTriggerConfig> = workflow_files
                 .iter()
-                .filter_map(|p| parsed_cache.get(p).map(|wf| (p.clone(), wf)))
+                .filter_map(|p| trigger_cache.get(p))
                 .collect();
 
-            if workflows_for_eval.is_empty() && !workflow_files.is_empty() {
+            if configs_for_eval.is_empty() && !workflow_files.is_empty() {
                 wrkflw_logging::warning(&format!(
                     "No workflows are usable: all {} workflow file(s) failed to parse. \
                      Run with --verbose for details.",
@@ -235,22 +253,34 @@ impl WorkflowWatcher {
                 ));
             }
 
-            // Convert to relative paths
+            // Convert paths to repo-relative, canonicalizing along the way so
+            // that events delivered via symlinked paths or on macOS
+            // (`/private/var` → `/var`) still line up with the canonical
+            // repo root and don't drop out of the set.
             let changed_files: Vec<String> = changed_paths
                 .iter()
                 .filter_map(|p| {
-                    p.strip_prefix(&self.repo_root)
+                    let canonical = std::fs::canonicalize(p).unwrap_or_else(|_| p.clone());
+                    canonical
+                        .strip_prefix(&repo_root_canonical)
                         .ok()
                         .map(|rel| rel.to_string_lossy().to_string())
                 })
                 .collect();
 
             if changed_files.is_empty() {
+                if self.verbose {
+                    wrkflw_logging::warning(&format!(
+                        "Ignored {} change event(s): none resolved under repo root {}",
+                        changed_paths.len(),
+                        repo_root_canonical.display()
+                    ));
+                }
                 continue;
             }
 
             let event = self
-                .evaluate_and_execute(&workflows_for_eval, changed_files)
+                .evaluate_and_execute(&configs_for_eval, changed_files)
                 .await;
 
             let cb = callback.clone();
@@ -263,7 +293,7 @@ impl WorkflowWatcher {
     /// concurrency.
     async fn evaluate_and_execute(
         &self,
-        workflows: &[(PathBuf, &WorkflowDefinition)],
+        configs: &[&WorkflowTriggerConfig],
         changed_files: Vec<String>,
     ) -> WatchEvent {
         let context = wrkflw_trigger_filter::context_from_changed_files(
@@ -288,7 +318,7 @@ impl WorkflowWatcher {
             }
         });
 
-        let results = wrkflw_trigger_filter::filter_workflows(workflows, &context);
+        let results = wrkflw_trigger_filter::filter_trigger_configs(configs, &context);
 
         let mut triggered = Vec::new();
         let mut skipped = Vec::new();

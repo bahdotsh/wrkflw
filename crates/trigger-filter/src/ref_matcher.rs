@@ -73,11 +73,7 @@ mod tests {
 
     #[test]
     fn double_star_matches_nested() {
-        assert!(matches_ref(
-            "release/v1.0/hotfix",
-            &[gp("release/**")],
-            &[]
-        ));
+        assert!(matches_ref("release/v1.0/hotfix", &[gp("release/**")], &[]));
     }
 
     #[test]

@@ -674,8 +674,7 @@ async fn main() {
 
             // Warn loudly if the user is watching pull_request without a
             // base branch — branches: filters will reject every workflow.
-            if (event == "pull_request" || event == "pull_request_target")
-                && base_branch.is_none()
+            if (event == "pull_request" || event == "pull_request_target") && base_branch.is_none()
             {
                 wrkflw_logging::warning(
                     "Watching pull_request without --base-branch: any workflow with a \
@@ -822,6 +821,25 @@ async fn run_trigger_prefilter_or_exit(
     base_branch: Option<&String>,
     verbose: bool,
 ) {
+    // `wrkflw run` expects a single workflow file. Catch directory paths up
+    // front with a clear error; otherwise the user sees a confusing
+    // "Error parsing workflow" from the YAML parser further down.
+    if !workflow_path.is_file() {
+        if workflow_path.is_dir() {
+            eprintln!(
+                "Error: --diff/--event/--changed-files require a single workflow file, not a directory.\n\
+                 Hint: point at a specific .yml file, or use `wrkflw watch {}` for directory-wide watching.",
+                workflow_path.display()
+            );
+        } else {
+            eprintln!(
+                "Error: workflow file not found: {}",
+                workflow_path.display()
+            );
+        }
+        std::process::exit(1);
+    }
+
     let event_name = event.clone().unwrap_or_else(|| "push".to_string());
 
     let mut event_context = if let Some(files) = changed_files {

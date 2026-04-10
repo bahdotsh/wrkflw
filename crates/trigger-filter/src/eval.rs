@@ -130,7 +130,8 @@ fn explain_filter_failure(filter: &EventFilter, context: &EventContext) -> Strin
     let mut parts = Vec::new();
 
     if !filter.branches.is_empty() || !filter.branches_ignore.is_empty() {
-        let pattern_sources: Vec<&str> = filter.branches.iter().map(|p| p.source.as_str()).collect();
+        let pattern_sources: Vec<&str> =
+            filter.branches.iter().map(|p| p.source.as_str()).collect();
         match branch_for_filter(context) {
             Some(branch) => parts.push(format!(
                 "branch '{}' did not match {:?}",
@@ -158,9 +159,12 @@ fn explain_filter_failure(filter: &EventFilter, context: &EventContext) -> Strin
     }
     if !filter.types.is_empty() {
         match &context.activity_type {
-            Some(activity) => parts.push(format!("activity '{}' not in {:?}", activity, filter.types)),
-            None => parts
-                .push("no activity type in context (types filter requires one)".to_string()),
+            Some(activity) => {
+                parts.push(format!("activity '{}' not in {:?}", activity, filter.types))
+            }
+            None => {
+                parts.push("no activity type in context (types filter requires one)".to_string())
+            }
         }
     }
     if !filter.paths.is_empty() {

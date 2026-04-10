@@ -169,7 +169,19 @@ fn explain_filter_failure(filter: &EventFilter, context: &EventContext) -> Strin
     }
     if !filter.paths.is_empty() {
         let sources: Vec<&str> = filter.paths.iter().map(|p| p.source.as_str()).collect();
-        parts.push(format!("paths: {:?}", sources));
+        // When the change set is empty the path filter cannot possibly
+        // match — call that out directly so a user who passed
+        // `--event` without `--diff` / `--changed-files` doesn't have
+        // to guess why every workflow is "skipped".
+        let detail = if context.changed_files.is_empty() {
+            format!(
+                "paths: {:?} (no changed files in context — pass --diff or --changed-files)",
+                sources
+            )
+        } else {
+            format!("paths: {:?}", sources)
+        };
+        parts.push(detail);
     }
     if !filter.paths_ignore.is_empty() {
         let sources: Vec<&str> = filter

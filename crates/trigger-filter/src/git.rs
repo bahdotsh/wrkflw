@@ -125,10 +125,17 @@ fn merge_unique(mut into: Vec<String>, more: Vec<String>) -> Vec<String> {
 
 /// Get changed files between the working tree and a base ref.
 ///
-/// `git diff <base>` already covers staged + unstaged + committed-on-branch
-/// changes (the index is compared transitively through the working tree), so
-/// one `git diff` plus an untracked-files probe is enough — no separate
-/// `--cached` pass is needed.
+/// `git diff <base>` compares the working tree against `<base>`, which
+/// covers committed-on-branch changes plus any unstaged edits the user
+/// has on top. We additionally probe `git ls-files --others
+/// --exclude-standard` to surface untracked files, which `git diff`
+/// alone misses.
+///
+/// Edge case worth knowing: a file that was modified, `git add`-ed, then
+/// reverted in the working tree to match `<base>` will not show up here
+/// (working tree == base), even though the index still has a divergent
+/// version. We accept that — the trigger filter is a "what would run on
+/// this checkout?" approximation, not a full index audit.
 ///
 /// `cwd` selects the git working directory; pass `None` to use the
 /// process CWD. The watcher should always pass its repo root.
@@ -245,9 +252,14 @@ pub async fn get_default_diff_base(cwd: Option<&Path>) -> Result<String, Trigger
     if let Ok(output) = run_git(sym_cmd, "git symbolic-ref").await {
         if output.status.success() {
             let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            // symbolic-ref returns e.g. "origin/main" — strip the remote prefix
+            // symbolic-ref with `--short` returns e.g. "origin/main".
+            // Without `--short` (older git, or if a different
+            // implementation slips through) it returns
+            // "refs/remotes/origin/main". Strip whichever form is
+            // present so the candidate name is a bare branch.
             let short = branch
-                .strip_prefix("origin/")
+                .strip_prefix("refs/remotes/origin/")
+                .or_else(|| branch.strip_prefix("origin/"))
                 .unwrap_or(&branch)
                 .to_string();
             if !short.is_empty() {

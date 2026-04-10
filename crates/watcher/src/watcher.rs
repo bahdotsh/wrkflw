@@ -149,6 +149,15 @@ impl WorkflowWatcher {
     /// thread so a slow reporter (file sink, network webhook) cannot stall
     /// the main loop. Callers MUST NOT rely on serialization between
     /// cycles in the callback.
+    ///
+    /// **No graceful shutdown.** This function is an unbounded `loop {}`
+    /// — it has no cancellation path and will only return on a fatal
+    /// error from notify or workflow collection. Callers that need to
+    /// stop the watcher must do so by terminating the surrounding task
+    /// (e.g. `process::exit` from a Ctrl+C handler, which is what the
+    /// `wrkflw watch` CLI does). Embedding `WorkflowWatcher` in a
+    /// long-running daemon, the TUI, or a test harness will require
+    /// adding a cancellation parameter; this is a known follow-up.
     pub async fn run<F>(&self, on_cycle_complete: F) -> Result<(), WatchError>
     where
         F: Fn(WatchEvent) + Send + Sync + 'static,
@@ -333,17 +342,31 @@ impl WorkflowWatcher {
     ) -> Vec<String> {
         let paths_for_canon = changed_paths.to_vec();
         let root_for_canon = repo_root_canonical.to_path_buf();
+        let verbose = self.cfg.verbose;
         tokio::task::spawn_blocking(move || {
-            paths_for_canon
-                .iter()
-                .filter_map(|p| {
-                    let canonical = canonicalize_allowing_missing(p);
-                    canonical
-                        .strip_prefix(&root_for_canon)
-                        .ok()
-                        .map(|rel| rel.to_string_lossy().to_string())
-                })
-                .collect()
+            let mut out = Vec::with_capacity(paths_for_canon.len());
+            for p in &paths_for_canon {
+                let canonical = canonicalize_allowing_missing(p);
+                match canonical.strip_prefix(&root_for_canon) {
+                    Ok(rel) => out.push(rel.to_string_lossy().to_string()),
+                    Err(_) => {
+                        // Notify is scoped to the repo root so this is
+                        // unusual — symlinked target outside the tree,
+                        // NFS oddity, or a notify backend bug. Surface
+                        // the dropped path under verbose so the user
+                        // doesn't have to guess why their `paths:`
+                        // filter never fires.
+                        if verbose {
+                            wrkflw_logging::warning(&format!(
+                                "Dropped change event {}: not under repo root {}",
+                                p.display(),
+                                root_for_canon.display()
+                            ));
+                        }
+                    }
+                }
+            }
+            out
         })
         .await
         .unwrap_or_default()
@@ -383,6 +406,19 @@ impl WorkflowWatcher {
         configs: &[&WorkflowTriggerConfig],
         changed_files: Vec<String>,
     ) -> WatchEvent {
+        // Skip the git context build entirely when there are no parseable
+        // workflows. Otherwise every cycle pays for two `git` subprocess
+        // calls (`get_current_branch`, `get_current_tag`) for nothing —
+        // visible on a network mount, and entirely avoidable.
+        if configs.is_empty() {
+            return WatchEvent {
+                changed_files,
+                triggered_workflows: Vec::new(),
+                skipped_workflows: Vec::new(),
+                error: None,
+            };
+        }
+
         let context = match wrkflw_trigger_filter::context_from_changed_files(
             &self.cfg.event_name,
             changed_files.clone(),

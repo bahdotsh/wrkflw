@@ -341,13 +341,16 @@ impl App {
     /// `check_diff_filter_results()` on the next tick.
     ///
     /// If an evaluation is already in flight (rapid toggle), the previous
-    /// task is **aborted** rather than left running — otherwise a burst of
-    /// toggles would fan out a series of wasted git + parse tasks that
-    /// each walk every workflow in the repo.
+    /// task's [`JoinHandle`] is aborted and its `mpsc::Sender` is dropped.
+    /// `JoinHandle::abort` only signals at the next await point — git
+    /// futures already in flight may keep running until they complete —
+    /// but the receiver is gone, so any results they produce are
+    /// discarded. From the user's perspective the previous evaluation is
+    /// dead; in reality it's "no longer observed."
     pub fn toggle_diff_filter(&mut self) {
         self.diff_filter_active = !self.diff_filter_active;
 
-        // Always cancel any in-flight evaluation before we change state.
+        // Always drop any in-flight evaluation before we change state.
         if let Some(handle) = self.diff_filter_task.take() {
             handle.abort();
         }
@@ -363,6 +366,9 @@ impl App {
             let workflow_paths: Vec<PathBuf> =
                 self.workflows.iter().map(|w| w.path.clone()).collect();
 
+            let (tx, rx) = mpsc::channel();
+            self.diff_filter_rx = Some(rx);
+
             // Anchor git operations at the discovered repo root rather
             // than the process CWD. The TUI may be launched from a
             // sibling repo or a subdirectory; without this, every git
@@ -370,12 +376,16 @@ impl App {
             // run wherever the user happened to be when they started
             // `wrkflw tui`. The watcher and CLI prefilter both pass
             // `find_repo_root()` for the same reason.
-            let repo_root = wrkflw_trigger_filter::find_repo_root();
-
-            let (tx, rx) = mpsc::channel();
-            self.diff_filter_rx = Some(rx);
-
+            //
+            // `find_repo_root` shells out to `git rev-parse --show-toplevel`
+            // synchronously. Calling it on the UI thread would hitch the
+            // TUI on every toggle on a network mount, so we move it onto
+            // the blocking pool inside the spawned task.
             let handle = tokio::task::spawn(async move {
+                let repo_root = tokio::task::spawn_blocking(wrkflw_trigger_filter::find_repo_root)
+                    .await
+                    .ok()
+                    .flatten();
                 let results = evaluate_diff_filter(workflow_paths, event_name, repo_root).await;
                 let _ = tx.send(results);
             });

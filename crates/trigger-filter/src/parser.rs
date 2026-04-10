@@ -242,28 +242,28 @@ fn extract_glob_list(
     let mut includes = Vec::new();
     let mut excludes = Vec::new();
     for source in raw {
-        // `!!literal` is GHA's escape for a literal leading `!`. Two `!`
-        // prefixes collapse into one, and the result is an include pattern
-        // matching a ref/path that literally starts with `!`.
-        let (is_exclude, pattern_src, display_src) = if let Some(rest) = source.strip_prefix("!!") {
-            let literal = format!("!{}", rest);
-            (false, literal.clone(), literal)
+        // `!!literal` is GHA's escape for a literal leading `!`: two `!`
+        // prefixes collapse into one and the result is an include pattern
+        // matching a ref/path that literally starts with `!`. Three or
+        // more bangs are undocumented in GHA; we treat `!!!foo` as a
+        // literal include of `!!foo` (the `!!` escape consumes only the
+        // first two bangs). The behavior is pinned by
+        // `triple_bang_treated_as_literal_double_bang` so a future
+        // refactor cannot silently flip it.
+        let (is_exclude, pattern_str) = if let Some(rest) = source.strip_prefix("!!") {
+            (false, format!("!{}", rest))
         } else if let Some(rest) = source.strip_prefix('!') {
-            (true, rest.to_string(), rest.to_string())
+            (true, rest.to_string())
         } else {
-            (false, source.clone(), source.clone())
+            (false, source.clone())
         };
 
-        let mut compiled = GlobPattern::new(&pattern_src).map_err(|e| {
+        let compiled = GlobPattern::new(&pattern_str).map_err(|e| {
             TriggerFilterError::ParseError(format!(
                 "Invalid glob pattern '{}' under '{}.{}': {}",
                 source, event_name, key, e
             ))
         })?;
-        // Preserve the human-visible source for diagnostics. For the `!!`
-        // escape this is `!rest`; `GlobPattern::new` was handed the same
-        // string above so the compiled pattern matches the literal `!`.
-        compiled.source = display_src;
 
         if is_exclude {
             excludes.push(compiled);
@@ -487,6 +487,29 @@ push:
                 .collect::<Vec<_>>(),
             vec!["v*-rc*"]
         );
+    }
+
+    #[test]
+    fn triple_bang_treated_as_literal_double_bang() {
+        // GHA's spec only documents `!!foo` (literal `!foo`); `!!!foo`
+        // is undocumented. Our parser greedily consumes the first two
+        // bangs as the escape, so `!!!foo` becomes a literal include
+        // matching `!!foo`. This test pins that behavior — flipping it
+        // (e.g. to "exclude `!foo`") would be a semantic change that
+        // must be done deliberately, not as a side effect of refactoring
+        // `extract_glob_list`.
+        let raw = make_on_raw(
+            r#"
+push:
+  branches:
+    - '!!!triple'
+"#,
+        );
+        let events = parse_events(&raw).unwrap();
+        let push = &events[0];
+        assert_eq!(push.branches.len(), 1);
+        assert_eq!(push.branches[0].source, "!!triple");
+        assert!(push.branches_ignore.is_empty());
     }
 
     #[test]

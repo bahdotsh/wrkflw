@@ -80,6 +80,13 @@ pub struct App {
     /// rapid toggles can cancel the previous in-flight evaluation instead
     /// of leaking wasted git + parse work.
     pub diff_filter_task: Option<JoinHandle<()>>,
+    /// Set to `true` immediately before we drop the previous evaluation's
+    /// receiver in [`App::toggle_diff_filter`]. The next
+    /// [`App::check_diff_filter_results`] tick uses it to distinguish a
+    /// self-inflicted disconnect (rapid toggle) from a genuine background
+    /// task failure, so we don't tell the user "evaluation failed" for an
+    /// action they took deliberately. Cleared once observed.
+    pub diff_filter_aborted: bool,
 }
 
 /// Result rows shipped from the background diff-filter task to the UI loop.
@@ -304,6 +311,7 @@ impl App {
             diff_filter_event: "push".to_string(),
             diff_filter_rx: None,
             diff_filter_task: None,
+            diff_filter_aborted: false,
         }
     }
 
@@ -351,6 +359,15 @@ impl App {
         self.diff_filter_active = !self.diff_filter_active;
 
         // Always drop any in-flight evaluation before we change state.
+        // Mark the disconnect as self-inflicted BEFORE dropping the
+        // receiver so the next tick's `check_diff_filter_results`
+        // distinguishes "we cancelled" from "the task crashed". Only
+        // arm the flag when there was actually something to abort,
+        // otherwise a fresh toggle from a clean state would silently
+        // suppress a real failure on the *next* evaluation.
+        if self.diff_filter_task.is_some() || self.diff_filter_rx.is_some() {
+            self.diff_filter_aborted = true;
+        }
         if let Some(handle) = self.diff_filter_task.take() {
             handle.abort();
         }
@@ -418,7 +435,22 @@ impl App {
                 Err(mpsc::TryRecvError::Disconnected) => {
                     self.diff_filter_rx = None;
                     self.diff_filter_task = None;
-                    self.logs.push("Diff filter: evaluation failed".to_string());
+                    // A `Disconnected` here can mean two things:
+                    //   1. The background task panicked or returned without
+                    //      sending — a real failure the user should see.
+                    //   2. We deliberately aborted the previous evaluation
+                    //      because the user toggled rapidly. The receiver
+                    //      we are draining is the *abandoned* one and the
+                    //      next tick will see a fresh channel.
+                    // Use the `diff_filter_aborted` flag (set in
+                    // `toggle_diff_filter`) to distinguish them. Self-
+                    // inflicted aborts are silent; everything else is a
+                    // real failure and stays loud.
+                    if self.diff_filter_aborted {
+                        self.diff_filter_aborted = false;
+                    } else {
+                        self.logs.push("Diff filter: evaluation failed".to_string());
+                    }
                     return;
                 }
             },
@@ -426,6 +458,11 @@ impl App {
         };
         self.diff_filter_rx = None;
         self.diff_filter_task = None;
+        // We received a real payload, so any pending "we aborted" flag
+        // belonged to a previous cycle whose disconnect we never observed
+        // (because the new task beat it to the channel). Clear it so the
+        // next genuine failure isn't silently swallowed.
+        self.diff_filter_aborted = false;
 
         match results {
             DiffFilterOutcome::Success(DiffFilterReport {
@@ -1740,6 +1777,97 @@ mod tests {
         // All workflows must have trigger_match cleared on failure.
         for wf in &app.workflows {
             assert!(wf.trigger_match.is_none());
+        }
+    }
+
+    #[test]
+    fn check_diff_filter_results_silences_self_inflicted_disconnect() {
+        // Regression: previously, dropping the receiver (e.g. via a rapid
+        // toggle that aborted the in-flight task) reached the
+        // `Disconnected` arm and logged "evaluation failed" — misleading,
+        // because the user took the action themselves. After the fix, a
+        // disconnect that follows an `aborted` flag must be silent, and
+        // the flag must be cleared so the *next* genuine failure is still
+        // surfaced loudly.
+        let mut app = make_app();
+        let log_count_before = app.logs.len();
+
+        // Build a channel and immediately drop the sender to simulate an
+        // aborted background task: the next try_recv will see Disconnected.
+        let (tx, rx) = mpsc::channel::<DiffFilterOutcome>();
+        drop(tx);
+        app.diff_filter_rx = Some(rx);
+        app.diff_filter_aborted = true;
+
+        app.check_diff_filter_results();
+
+        // No "evaluation failed" line should have been added.
+        let new_logs: Vec<&String> = app.logs.iter().skip(log_count_before).collect();
+        assert!(
+            !new_logs.iter().any(|l| l.contains("evaluation failed")),
+            "self-inflicted abort must not log a failure, got {:?}",
+            new_logs
+        );
+        // Flag must be consumed so the next disconnect is loud again.
+        assert!(
+            !app.diff_filter_aborted,
+            "abort flag must be cleared after being observed"
+        );
+
+        // Now simulate a real failure (no abort flag set) on a fresh
+        // disconnect — it should produce a log line.
+        let log_count_after_silent = app.logs.len();
+        let (tx2, rx2) = mpsc::channel::<DiffFilterOutcome>();
+        drop(tx2);
+        app.diff_filter_rx = Some(rx2);
+        // Note: aborted flag is intentionally NOT set this time.
+
+        app.check_diff_filter_results();
+
+        let final_logs: Vec<&String> = app.logs.iter().skip(log_count_after_silent).collect();
+        assert!(
+            final_logs.iter().any(|l| l.contains("evaluation failed")),
+            "genuine disconnect must still be reported, got {:?}",
+            final_logs
+        );
+    }
+
+    #[tokio::test]
+    async fn toggle_diff_filter_arms_abort_flag_only_when_task_in_flight() {
+        // Toggling from a clean state (no in-flight task) must NOT arm
+        // the abort flag — otherwise the *next* evaluation's genuine
+        // failure would be silently swallowed.
+        //
+        // This test runs under `#[tokio::test]` because the active branch
+        // of `toggle_diff_filter` calls `tokio::task::spawn`, which panics
+        // without an ambient runtime. We don't await the spawned task
+        // (the git/parse work would actually try to shell out); we only
+        // assert the synchronous flag-arming behavior that runs before
+        // the spawn returns.
+        let mut app = make_app();
+        assert!(app.diff_filter_task.is_none());
+        assert!(app.diff_filter_rx.is_none());
+
+        app.toggle_diff_filter();
+        // After a fresh toggle ON, the abort flag must remain false:
+        // there was nothing to abort, so the next disconnect is real.
+        assert!(
+            !app.diff_filter_aborted,
+            "fresh toggle must not arm the abort flag"
+        );
+
+        // Toggling again — this time there IS an in-flight task and
+        // receiver — must arm the flag so the resulting Disconnected
+        // tick is treated as self-inflicted.
+        app.toggle_diff_filter();
+        assert!(
+            app.diff_filter_aborted,
+            "toggle with task in flight must arm the abort flag"
+        );
+
+        // Cancel the spawned task so the test doesn't leak it.
+        if let Some(handle) = app.diff_filter_task.take() {
+            handle.abort();
         }
     }
 

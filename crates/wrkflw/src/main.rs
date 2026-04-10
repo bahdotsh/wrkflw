@@ -873,12 +873,27 @@ async fn run_trigger_prefilter_or_exit(req: PrefilterRequest<'_>) {
         ));
     }
 
-    // Parse workflow and evaluate trigger before executing
-    let trigger_config = wrkflw_trigger_filter::load_trigger_config(req.workflow_path)
-        .unwrap_or_else(|e| {
-            eprintln!("Error parsing workflow: {}", e);
-            std::process::exit(1);
-        });
+    // Parse workflow and evaluate trigger before executing.
+    //
+    // `load_trigger_config` performs blocking file I/O + YAML parsing
+    // (documented in `wrkflw_trigger_filter::lib.rs`). Move it onto a
+    // blocking thread so we don't stall the tokio reactor. The latency
+    // hit for a single file is small, but the contract should match
+    // the watcher and TUI, both of which already do this — drifting
+    // here is exactly how the silent-failure holes accumulated.
+    let workflow_path_owned = req.workflow_path.to_path_buf();
+    let trigger_config = tokio::task::spawn_blocking(move || {
+        wrkflw_trigger_filter::load_trigger_config(&workflow_path_owned)
+    })
+    .await
+    .unwrap_or_else(|e| {
+        eprintln!("Error: workflow parse task panicked: {}", e);
+        std::process::exit(1);
+    })
+    .unwrap_or_else(|e| {
+        eprintln!("Error parsing workflow: {}", e);
+        std::process::exit(1);
+    });
     let match_result = wrkflw_trigger_filter::evaluate_trigger(&trigger_config, &event_context);
 
     if !match_result.matches {

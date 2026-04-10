@@ -114,9 +114,13 @@ fn parse_lines(output: &[u8]) -> Vec<String> {
 }
 
 fn merge_unique(mut into: Vec<String>, more: Vec<String>) -> Vec<String> {
-    let seen: std::collections::HashSet<String> = into.iter().cloned().collect();
+    // `seen` MUST be updated as we go: otherwise duplicates within `more`
+    // itself slip through and the function silently breaks its own
+    // uniqueness contract. Use `HashSet::insert`'s "was new?" return so
+    // each insertion is one lookup, not two.
+    let mut seen: std::collections::HashSet<String> = into.iter().cloned().collect();
     for line in more {
-        if !seen.contains(&line) {
+        if seen.insert(line.clone()) {
             into.push(line);
         }
     }
@@ -598,6 +602,32 @@ mod tests {
         assert!(validate_ref_name("main; rm -rf /").is_err());
         assert!(validate_ref_name("main`whoami`").is_err());
         assert!(validate_ref_name("main$(id)").is_err());
+    }
+
+    #[test]
+    fn merge_unique_dedupes_within_more() {
+        // Regression: previously `seen` was built once from `into` and
+        // never updated, so duplicates within `more` itself were both
+        // appended. The function name promises uniqueness — exercise the
+        // case where `into` is empty and `more` carries duplicates.
+        let merged = merge_unique(Vec::new(), vec!["a".into(), "b".into(), "a".into()]);
+        assert_eq!(
+            merged,
+            vec!["a".to_string(), "b".to_string()],
+            "merge_unique must deduplicate `more` against itself"
+        );
+    }
+
+    #[test]
+    fn merge_unique_skips_entries_already_in_into() {
+        let merged = merge_unique(
+            vec!["a".into(), "b".into()],
+            vec!["b".into(), "c".into(), "a".into()],
+        );
+        assert_eq!(
+            merged,
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
     }
 
     #[test]

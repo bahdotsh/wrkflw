@@ -189,16 +189,32 @@ impl WorkflowWatcher {
         let repo_root_for_callback = repo_root_canonical.clone();
         let mut watcher = RecommendedWatcher::new(
             move |res: Result<Event, notify::Error>| {
-                if let Ok(event) = res {
-                    if !is_relevant_event_kind(&event.kind) {
+                // Notify can deliver `Err` for queue overflow, kernel-side
+                // disconnects (Linux inotify watch budget), permission
+                // failures on a newly created subdirectory, or symlink
+                // resolution errors. Previously this branch dropped them
+                // silently, which left the user staring at a "watching..."
+                // banner while the loop was effectively dead. Surface them
+                // as warnings so the failure mode matches every other
+                // silent-failure hole this PR has been plugging.
+                let event = match res {
+                    Ok(e) => e,
+                    Err(e) => {
+                        wrkflw_logging::warning(&format!(
+                            "filesystem watcher error: {} — some change events may be missed",
+                            e
+                        ));
                         return;
                     }
-                    for path in event.paths {
-                        if should_ignore_path(&path, &repo_root_for_callback) {
-                            continue;
-                        }
-                        debouncer_for_callback.add_event(path);
+                };
+                if !is_relevant_event_kind(&event.kind) {
+                    return;
+                }
+                for path in event.paths {
+                    if should_ignore_path(&path, &repo_root_for_callback) {
+                        continue;
                     }
+                    debouncer_for_callback.add_event(path);
                 }
             },
             notify::Config::default(),
@@ -369,7 +385,19 @@ impl WorkflowWatcher {
             out
         })
         .await
-        .unwrap_or_default()
+        .unwrap_or_else(|e| {
+            // Mirror `refresh_trigger_cache_async`'s panic logging — a
+            // silent `unwrap_or_default` here would mean a panicking
+            // canonicalize task drops the entire change set for the
+            // current cycle and the user sees "0 triggered" with no
+            // explanation.
+            wrkflw_logging::error(&format!(
+                "Path canonicalization task panicked: {} — current cycle's change \
+                 set is being dropped, watch loop continues",
+                e
+            ));
+            Vec::new()
+        })
     }
 
     /// Evaluate triggers for the given (already parsed) workflows against the

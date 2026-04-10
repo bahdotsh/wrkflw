@@ -24,7 +24,7 @@ fn render_workflow_list(f: &mut Frame<'_>, app: &mut App, area: Rect) {
     // pull_request-only workflow shows up as SKIPPED under the push-only
     // diff filter.
     let diff_indicator = if app.diff_filter_active {
-        format!(" [DIFF: {}]", App::DIFF_FILTER_EVENT)
+        format!(" [DIFF: {}]", app.diff_filter_event)
     } else {
         String::new()
     };

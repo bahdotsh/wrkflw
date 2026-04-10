@@ -15,6 +15,22 @@ pub use parser::parse_trigger_config;
 
 use std::path::{Path, PathBuf};
 
+/// Read a workflow file from disk and parse its trigger configuration in
+/// one step. Centralizes the "read + parse + compile globs" pipeline so
+/// that `watcher`, the TUI, and the CLI all fail identically on the same
+/// broken file.
+///
+/// This performs blocking file I/O via [`wrkflw_parser::workflow::parse_workflow`].
+/// Call from a blocking context (or wrap in `spawn_blocking`) if invoked
+/// from an async task that must not stall the reactor.
+pub fn load_trigger_config(
+    workflow_path: &Path,
+) -> Result<WorkflowTriggerConfig, TriggerFilterError> {
+    let workflow = wrkflw_parser::workflow::parse_workflow(workflow_path)
+        .map_err(|e| TriggerFilterError::ParseError(e.to_string()))?;
+    parse_trigger_config(&workflow, workflow_path.to_path_buf())
+}
+
 /// Evaluate multiple workflows against an event context, returning match results for each.
 ///
 /// `WorkflowDefinition` is borrowed (not cloned) because it isn't `Clone`.
@@ -86,7 +102,7 @@ pub async fn auto_detect_context(
 
     Ok(EventContext {
         event_name: event_name.to_string(),
-        branch: branch_res.ok(),
+        branch: branch_res.ok().flatten(),
         base_branch: None,
         tag: tag_res?,
         changed_files: changed_res?,
@@ -125,7 +141,7 @@ pub async fn context_from_diff_range(
 
     Ok(EventContext {
         event_name: event_name.to_string(),
-        branch: branch_res.ok(),
+        branch: branch_res.ok().flatten(),
         base_branch: None,
         tag: tag_res?,
         changed_files: changed_res?,
@@ -147,7 +163,7 @@ pub async fn context_from_changed_files(
 
     Ok(EventContext {
         event_name: event_name.to_string(),
-        branch: branch_res.ok(),
+        branch: branch_res.ok().flatten(),
         base_branch: None,
         tag: tag_res?,
         changed_files,

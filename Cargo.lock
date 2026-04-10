@@ -3715,6 +3715,7 @@ version = "0.7.3"
 dependencies = [
  "glob",
  "serde_yaml",
+ "tempfile",
  "thiserror",
  "tokio",
  "wrkflw-parser",
@@ -3772,6 +3773,7 @@ version = "0.7.3"
 dependencies = [
  "futures",
  "notify",
+ "tempfile",
  "thiserror",
  "tokio",
  "wrkflw-executor",

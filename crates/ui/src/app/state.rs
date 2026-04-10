@@ -10,6 +10,7 @@ use ratatui::widgets::{ListState, TableState};
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
+use tokio::task::JoinHandle;
 use wrkflw_executor::{JobStatus, RuntimeType, StepStatus};
 
 /// Application state
@@ -66,16 +67,38 @@ pub struct App {
 
     // Diff-aware trigger filtering
     pub diff_filter_active: bool,
+    /// The event the TUI simulates for diff-filter evaluation. Stored on
+    /// `App` rather than as a hardcoded constant so a future event selector
+    /// UI is a data-flow change only.
+    pub diff_filter_event: String,
     /// Channel receiving (workflow_path, trigger_status) pairs from the background
-    /// evaluation thread. We send pairs (rather than a positional Vec) so that
+    /// evaluation task. We send pairs (rather than a positional Vec) so that
     /// reloading `self.workflows` between toggle and result delivery cannot
     /// mis-assign trigger statuses.
     pub diff_filter_rx: Option<DiffFilterReceiver>,
+    /// Handle for the most-recently-spawned evaluation task, held so
+    /// rapid toggles can cancel the previous in-flight evaluation instead
+    /// of leaking wasted git + parse work.
+    pub diff_filter_task: Option<JoinHandle<()>>,
 }
 
-/// Result rows shipped from the background diff-filter thread to the UI loop.
+/// Result rows shipped from the background diff-filter task to the UI loop.
 pub type DiffFilterResults = Vec<(PathBuf, Option<TriggerMatchStatus>)>;
-pub type DiffFilterReceiver = mpsc::Receiver<DiffFilterResults>;
+
+/// Outcome of a background diff-filter evaluation.
+///
+/// Wrapping the row list in an enum lets us distinguish "we ran the
+/// evaluation and some workflows matched" from "we could not even build
+/// an event context" (e.g. git could not find a diff base), so the TUI
+/// can show the user a real error reason instead of silently reporting
+/// zero matches.
+#[derive(Debug, Clone)]
+pub enum DiffFilterOutcome {
+    Success(DiffFilterResults),
+    Failure(String),
+}
+
+pub type DiffFilterReceiver = mpsc::Receiver<DiffFilterOutcome>;
 
 impl App {
     pub fn new(
@@ -259,7 +282,9 @@ impl App {
             last_availability_check: Instant::now(),
 
             diff_filter_active: false,
+            diff_filter_event: "push".to_string(),
             diff_filter_rx: None,
+            diff_filter_task: None,
         }
     }
 
@@ -290,44 +315,44 @@ impl App {
             .push(format!("Switched to {} mode", self.runtime_type_name()));
     }
 
-    /// The event the TUI simulates for diff-filter evaluation. Surfaced in
-    /// the `[DIFF: push]` title so the user knows which event kind is being
-    /// tested — the TUI currently has no event selector.
-    pub const DIFF_FILTER_EVENT: &'static str = "push";
-
     /// Toggle diff-aware trigger filtering and evaluate all workflows.
     ///
     /// The git + parsing work is dispatched onto the ambient tokio runtime
-    /// via `tokio::task::spawn`, not a raw OS thread with a nested runtime.
-    /// Results are received via `check_diff_filter_results()` on the next tick.
+    /// via `tokio::task::spawn`. Results are received via
+    /// `check_diff_filter_results()` on the next tick.
     ///
-    /// If an evaluation is already in flight (rapid toggle), the pending
-    /// result is discarded and a new evaluation is started — the previous
-    /// task's `send()` will harmlessly fail on a closed channel.
+    /// If an evaluation is already in flight (rapid toggle), the previous
+    /// task is **aborted** rather than left running — otherwise a burst of
+    /// toggles would fan out a series of wasted git + parse tasks that
+    /// each walk every workflow in the repo.
     pub fn toggle_diff_filter(&mut self) {
         self.diff_filter_active = !self.diff_filter_active;
 
-        if self.diff_filter_active {
-            self.diff_filter_rx = None;
+        // Always cancel any in-flight evaluation before we change state.
+        if let Some(handle) = self.diff_filter_task.take() {
+            handle.abort();
+        }
+        self.diff_filter_rx = None;
 
+        if self.diff_filter_active {
+            let event_name = self.diff_filter_event.clone();
             self.logs.push(format!(
                 "Diff filter: evaluating triggers (simulating '{}' event)...",
-                Self::DIFF_FILTER_EVENT
+                event_name
             ));
 
             let workflow_paths: Vec<PathBuf> =
                 self.workflows.iter().map(|w| w.path.clone()).collect();
-            let event_name = Self::DIFF_FILTER_EVENT.to_string();
 
             let (tx, rx) = mpsc::channel();
             self.diff_filter_rx = Some(rx);
 
-            tokio::task::spawn(async move {
+            let handle = tokio::task::spawn(async move {
                 let results = evaluate_diff_filter(workflow_paths, event_name).await;
                 let _ = tx.send(results);
             });
+            self.diff_filter_task = Some(handle);
         } else {
-            self.diff_filter_rx = None;
             for workflow in &mut self.workflows {
                 workflow.trigger_match = None;
             }
@@ -335,13 +360,18 @@ impl App {
         }
     }
 
-    /// Check for completed diff filter results from the background thread.
+    /// Check for completed diff filter results from the background task.
     /// Called on each TUI tick to apply results without blocking.
     ///
     /// Results are looked up by workflow path so that reloading
     /// `self.workflows` between toggle and result delivery (e.g. a new file
     /// shows up on disk) does not cause statuses to be assigned to the wrong
     /// workflow.
+    ///
+    /// A channel payload of [`DiffFilterOutcome::Failure`] surfaces the
+    /// underlying error reason to the TUI log instead of silently leaving
+    /// every workflow as `None` — previously the user would see
+    /// "0/N workflows would trigger" with no explanation.
     pub fn check_diff_filter_results(&mut self) {
         let results = match self.diff_filter_rx.as_ref() {
             Some(rx) => match rx.try_recv() {
@@ -349,6 +379,7 @@ impl App {
                 Err(mpsc::TryRecvError::Empty) => return,
                 Err(mpsc::TryRecvError::Disconnected) => {
                     self.diff_filter_rx = None;
+                    self.diff_filter_task = None;
                     self.logs.push("Diff filter: evaluation failed".to_string());
                     return;
                 }
@@ -356,23 +387,35 @@ impl App {
             None => return,
         };
         self.diff_filter_rx = None;
+        self.diff_filter_task = None;
 
-        let by_path: std::collections::HashMap<PathBuf, Option<TriggerMatchStatus>> =
-            results.into_iter().collect();
-        for workflow in self.workflows.iter_mut() {
-            workflow.trigger_match = by_path.get(&workflow.path).cloned().flatten();
+        match results {
+            DiffFilterOutcome::Success(rows) => {
+                let by_path: std::collections::HashMap<PathBuf, Option<TriggerMatchStatus>> =
+                    rows.into_iter().collect();
+                for workflow in self.workflows.iter_mut() {
+                    workflow.trigger_match = by_path.get(&workflow.path).cloned().flatten();
+                }
+
+                let matched = self
+                    .workflows
+                    .iter()
+                    .filter(|w| matches!(&w.trigger_match, Some(TriggerMatchStatus::Matched(_))))
+                    .count();
+                self.logs.push(format!(
+                    "Diff filter ON: {}/{} workflows would trigger",
+                    matched,
+                    self.workflows.len()
+                ));
+            }
+            DiffFilterOutcome::Failure(reason) => {
+                for workflow in &mut self.workflows {
+                    workflow.trigger_match = None;
+                }
+                self.logs
+                    .push(format!("Diff filter: evaluation failed — {}", reason));
+            }
         }
-
-        let matched = self
-            .workflows
-            .iter()
-            .filter(|w| matches!(&w.trigger_match, Some(TriggerMatchStatus::Matched(_))))
-            .count();
-        self.logs.push(format!(
-            "Diff filter ON: {}/{} workflows would trigger",
-            matched,
-            self.workflows.len()
-        ));
     }
 
     pub fn toggle_validation_mode(&mut self) {
@@ -1308,9 +1351,10 @@ impl App {
 
 /// Run git + trigger evaluation as an async task on the ambient runtime.
 ///
-/// Returns `(workflow_path, status)` pairs so the caller can apply results
-/// keyed by path — this guarantees correctness even if the workflow list is
-/// reloaded between toggle and result delivery.
+/// Returns a [`DiffFilterOutcome`] so the UI can distinguish "evaluation
+/// ran and produced rows" from "no event context could be built" — the
+/// latter is typically a missing-default-branch or missing-commits error
+/// that the user needs a real explanation for.
 ///
 /// The event name is passed through from the caller rather than hardcoded,
 /// so a future TUI change that adds event selection is a plumbing-only
@@ -1318,39 +1362,37 @@ impl App {
 async fn evaluate_diff_filter(
     workflow_paths: Vec<PathBuf>,
     event_name: String,
-) -> Vec<(PathBuf, Option<TriggerMatchStatus>)> {
+) -> DiffFilterOutcome {
     let context =
         match wrkflw_trigger_filter::auto_detect_context_default_base(&event_name, None).await {
             Ok(ctx) => ctx,
-            Err(_) => {
-                return workflow_paths.into_iter().map(|p| (p, None)).collect();
+            Err(e) => {
+                return DiffFilterOutcome::Failure(format!("{}", e));
             }
         };
 
-    // Workflow parsing is synchronous file I/O; run it on a blocking thread
-    // so we don't hold the reactor while reading every .yml in the repo.
+    // Trigger config parsing is synchronous file I/O; run it on a
+    // blocking thread so we don't hold the reactor while reading every
+    // .yml in the repo. `load_trigger_config` consolidates read + parse
+    // so the TUI and the watcher fail identically on the same broken file.
     let paths_for_parse = workflow_paths.clone();
-    let parsed: Vec<(PathBuf, wrkflw_parser::workflow::WorkflowDefinition)> =
+    let configs: Vec<wrkflw_trigger_filter::WorkflowTriggerConfig> =
         match tokio::task::spawn_blocking(move || {
             paths_for_parse
                 .iter()
-                .filter_map(|path| {
-                    wrkflw_parser::workflow::parse_workflow(path)
-                        .ok()
-                        .map(|wf| (path.clone(), wf))
-                })
-                .collect()
+                .filter_map(|path| wrkflw_trigger_filter::load_trigger_config(path).ok())
+                .collect::<Vec<_>>()
         })
         .await
         {
             Ok(v) => v,
-            Err(_) => return workflow_paths.into_iter().map(|p| (p, None)).collect(),
+            Err(e) => {
+                return DiffFilterOutcome::Failure(format!("background task failed: {}", e));
+            }
         };
 
-    let borrowed: Vec<(PathBuf, &wrkflw_parser::workflow::WorkflowDefinition)> =
-        parsed.iter().map(|(p, w)| (p.clone(), w)).collect();
-
-    let results = wrkflw_trigger_filter::filter_workflows(&borrowed, &context);
+    let borrowed: Vec<&wrkflw_trigger_filter::WorkflowTriggerConfig> = configs.iter().collect();
+    let results = wrkflw_trigger_filter::filter_trigger_configs(&borrowed, &context);
     let results_by_path: std::collections::HashMap<
         PathBuf,
         &wrkflw_trigger_filter::TriggerMatchResult,
@@ -1359,7 +1401,7 @@ async fn evaluate_diff_filter(
         .map(|r| (r.workflow_path.clone(), r))
         .collect();
 
-    workflow_paths
+    let rows = workflow_paths
         .into_iter()
         .map(|path| {
             let status = results_by_path.get(&path).map(|result| {
@@ -1371,7 +1413,9 @@ async fn evaluate_diff_filter(
             });
             (path, status)
         })
-        .collect()
+        .collect();
+
+    DiffFilterOutcome::Success(rows)
 }
 
 #[cfg(test)]
@@ -1506,7 +1550,7 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         app.diff_filter_rx = Some(rx);
         app.diff_filter_active = true;
-        tx.send(vec![
+        tx.send(DiffFilterOutcome::Success(vec![
             (
                 PathBuf::from("ci.yml"),
                 Some(TriggerMatchStatus::Matched("matched ci".into())),
@@ -1515,7 +1559,7 @@ mod tests {
                 PathBuf::from("deploy.yml"),
                 Some(TriggerMatchStatus::Skipped("skipped deploy".into())),
             ),
-        ])
+        ]))
         .unwrap();
 
         app.check_diff_filter_results();
@@ -1535,6 +1579,38 @@ mod tests {
             by_name.get("deploy").unwrap(),
             Some(TriggerMatchStatus::Skipped(_))
         ));
+    }
+
+    #[test]
+    fn check_diff_filter_results_surfaces_failure_reason_to_logs() {
+        // Regression: previously, if auto_detect_context_default_base
+        // errored (e.g. fresh repo with no remote default branch), the
+        // TUI silently showed every workflow as None and the summary
+        // line said "0/N workflows would trigger" with no explanation.
+        let mut app = make_app();
+        let log_count_before = app.logs.len();
+
+        let (tx, rx) = mpsc::channel();
+        app.diff_filter_rx = Some(rx);
+        app.diff_filter_active = true;
+        tx.send(DiffFilterOutcome::Failure(
+            "could not detect a diff base".into(),
+        ))
+        .unwrap();
+
+        app.check_diff_filter_results();
+
+        // The failure reason should be visible in the log, not silently dropped.
+        let new_logs: Vec<&String> = app.logs.iter().skip(log_count_before).collect();
+        assert!(
+            new_logs.iter().any(|l| l.contains("could not detect")),
+            "expected failure reason in logs, got {:?}",
+            new_logs
+        );
+        // All workflows must have trigger_match cleared on failure.
+        for wf in &app.workflows {
+            assert!(wf.trigger_match.is_none());
+        }
     }
 
     #[test]

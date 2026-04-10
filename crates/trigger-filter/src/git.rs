@@ -169,12 +169,24 @@ pub async fn get_changed_files_between(
     Ok(parse_lines(&output.stdout))
 }
 
-/// Get the current branch name.
-pub async fn get_current_branch(cwd: Option<&Path>) -> Result<String, TriggerFilterError> {
+/// Get the current branch name, or `None` if HEAD is detached.
+///
+/// `git rev-parse --abbrev-ref HEAD` returns the literal string `"HEAD"`
+/// when the repository is in detached-HEAD state (e.g. after checking out
+/// a tag or commit SHA). Treating that as a branch name would cause
+/// `branches:` filters to match the pseudo-ref `HEAD`, which is almost
+/// never what the user intended. Surface detached HEAD as "no branch"
+/// instead so callers can fall back to explicit `--base-branch`.
+pub async fn get_current_branch(cwd: Option<&Path>) -> Result<Option<String>, TriggerFilterError> {
     let mut cmd = git_cmd(cwd);
     cmd.args(["rev-parse", "--abbrev-ref", "HEAD"]);
     let output = check_status(run_git(cmd, "git rev-parse").await?, "git rev-parse")?;
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    let name = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if name.is_empty() || name == "HEAD" {
+        Ok(None)
+    } else {
+        Ok(Some(name))
+    }
 }
 
 /// Determine a sensible diff base for trigger evaluation.
@@ -280,6 +292,206 @@ pub async fn get_current_tag(cwd: Option<&Path>) -> Result<Option<String>, Trigg
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+    use std::process::Command as StdCommand;
+    use tempfile::TempDir;
+
+    /// Initialize a bare-bones git repo in `dir` with a single committed
+    /// file and one branch `main`. Returns the path so the caller can
+    /// operate on it.
+    fn init_repo(dir: &Path) {
+        // Git >= 2.28 supports --initial-branch; older needs fallback.
+        let status = StdCommand::new("git")
+            .args(["-C", dir.to_str().unwrap(), "init", "--initial-branch=main"])
+            .status();
+        if !status.map(|s| s.success()).unwrap_or(false) {
+            StdCommand::new("git")
+                .args(["-C", dir.to_str().unwrap(), "init"])
+                .status()
+                .expect("git init");
+            StdCommand::new("git")
+                .args(["-C", dir.to_str().unwrap(), "checkout", "-b", "main"])
+                .status()
+                .expect("git checkout -b main");
+        }
+        // Configure identity to allow commits (sandboxed CI may have no global config)
+        for (k, v) in [("user.email", "t@t.t"), ("user.name", "t")] {
+            StdCommand::new("git")
+                .args(["-C", dir.to_str().unwrap(), "config", k, v])
+                .status()
+                .expect("git config");
+        }
+    }
+
+    fn commit_file(dir: &Path, name: &str, content: &str) {
+        let path = dir.join(name);
+        std::fs::write(&path, content).expect("write");
+        StdCommand::new("git")
+            .args(["-C", dir.to_str().unwrap(), "add", name])
+            .status()
+            .expect("git add");
+        StdCommand::new("git")
+            .args([
+                "-C",
+                dir.to_str().unwrap(),
+                "commit",
+                "-m",
+                "msg",
+                "--no-gpg-sign",
+            ])
+            .status()
+            .expect("git commit");
+    }
+
+    fn git_available() -> bool {
+        StdCommand::new("git")
+            .arg("--version")
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    #[tokio::test]
+    async fn get_changed_files_reports_modified_and_untracked() {
+        if !git_available() {
+            return;
+        }
+        let tmp = TempDir::new().expect("tempdir");
+        let repo: PathBuf = tmp.path().to_path_buf();
+        init_repo(&repo);
+        commit_file(&repo, "tracked.txt", "a");
+
+        // Modify tracked file, add an untracked file
+        std::fs::write(repo.join("tracked.txt"), "b").unwrap();
+        std::fs::write(repo.join("new.txt"), "x").unwrap();
+
+        let files = get_changed_files("HEAD", Some(&repo))
+            .await
+            .expect("get_changed_files");
+        assert!(files.iter().any(|f| f == "tracked.txt"));
+        assert!(files.iter().any(|f| f == "new.txt"));
+    }
+
+    #[tokio::test]
+    async fn get_changed_files_reports_deleted_file() {
+        if !git_available() {
+            return;
+        }
+        let tmp = TempDir::new().expect("tempdir");
+        let repo: PathBuf = tmp.path().to_path_buf();
+        init_repo(&repo);
+        commit_file(&repo, "doomed.txt", "a");
+
+        std::fs::remove_file(repo.join("doomed.txt")).unwrap();
+
+        let files = get_changed_files("HEAD", Some(&repo))
+            .await
+            .expect("get_changed_files");
+        assert!(
+            files.iter().any(|f| f == "doomed.txt"),
+            "deleted files must appear in changed set, got {:?}",
+            files
+        );
+    }
+
+    #[tokio::test]
+    async fn get_default_diff_base_returns_head_on_dirty_tree() {
+        if !git_available() {
+            return;
+        }
+        let tmp = TempDir::new().expect("tempdir");
+        let repo: PathBuf = tmp.path().to_path_buf();
+        init_repo(&repo);
+        commit_file(&repo, "a.txt", "1");
+        // Make tree dirty
+        std::fs::write(repo.join("a.txt"), "2").unwrap();
+
+        let base = get_default_diff_base(Some(&repo)).await.expect("diff base");
+        assert_eq!(base, "HEAD");
+    }
+
+    #[tokio::test]
+    async fn get_default_diff_base_errors_when_no_base_available() {
+        // A repo whose only branch is neither `main` nor `master`, with no
+        // remote and a single root commit, has no valid diff base:
+        //   - no uncommitted changes
+        //   - no remote default branch (no origin)
+        //   - no main/master fallback
+        //   - no HEAD~1 (root commit)
+        // The function must error rather than silently fall back to an
+        // empty-tree SHA as it used to.
+        if !git_available() {
+            return;
+        }
+        let tmp = TempDir::new().expect("tempdir");
+        let repo: PathBuf = tmp.path().to_path_buf();
+        // Initialize with a custom branch so there's no main/master.
+        let status = StdCommand::new("git")
+            .args([
+                "-C",
+                repo.to_str().unwrap(),
+                "init",
+                "--initial-branch=weirdname",
+            ])
+            .status();
+        if !status.map(|s| s.success()).unwrap_or(false) {
+            // Older git fallback — skip the test if we can't force a
+            // non-main initial branch.
+            return;
+        }
+        for (k, v) in [("user.email", "t@t.t"), ("user.name", "t")] {
+            StdCommand::new("git")
+                .args(["-C", repo.to_str().unwrap(), "config", k, v])
+                .status()
+                .expect("git config");
+        }
+        commit_file(&repo, "a.txt", "1");
+
+        let err = get_default_diff_base(Some(&repo)).await;
+        assert!(
+            err.is_err(),
+            "expected error when no diff base is available, got {:?}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn get_current_branch_returns_none_on_detached_head() {
+        if !git_available() {
+            return;
+        }
+        let tmp = TempDir::new().expect("tempdir");
+        let repo: PathBuf = tmp.path().to_path_buf();
+        init_repo(&repo);
+        commit_file(&repo, "a.txt", "1");
+        commit_file(&repo, "b.txt", "2");
+        // Detach HEAD
+        StdCommand::new("git")
+            .args(["-C", repo.to_str().unwrap(), "checkout", "HEAD~1"])
+            .status()
+            .expect("checkout");
+
+        let result = get_current_branch(Some(&repo)).await.expect("branch");
+        assert_eq!(
+            result, None,
+            "detached HEAD must be reported as None, got {:?}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn get_current_branch_returns_name_on_normal_checkout() {
+        if !git_available() {
+            return;
+        }
+        let tmp = TempDir::new().expect("tempdir");
+        let repo: PathBuf = tmp.path().to_path_buf();
+        init_repo(&repo);
+        commit_file(&repo, "a.txt", "1");
+
+        let result = get_current_branch(Some(&repo)).await.expect("branch");
+        assert_eq!(result, Some("main".to_string()));
+    }
 
     #[test]
     fn validate_ref_accepts_normal_branches() {

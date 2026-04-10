@@ -1,6 +1,7 @@
 use crate::debouncer::Debouncer;
 use crate::error::WatchError;
 use futures::stream::{self, StreamExt};
+use notify::event::{EventKind, ModifyKind};
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -39,19 +40,81 @@ const DEFAULT_IGNORE_DIRS: &[&str] = &[
     "venv",
 ];
 
+/// Configuration for [`WorkflowWatcher`]. Use the builder-style `with_*`
+/// methods to set optional fields; `workflow_dir`, `repo_root`, and
+/// `config` are required.
+///
+/// Introduced to bound the growth of `WorkflowWatcher::new`'s argument
+/// list — future knobs (idle timeout, custom ignore list, event sink)
+/// should be added here instead of as additional positional arguments.
+#[derive(Debug, Clone)]
+pub struct WatcherConfig {
+    pub workflow_dir: PathBuf,
+    pub repo_root: PathBuf,
+    pub event_name: String,
+    pub base_branch: Option<String>,
+    pub debounce_duration: Duration,
+    pub execution: ExecutionConfig,
+    pub verbose: bool,
+    pub max_concurrent_executions: usize,
+}
+
+impl WatcherConfig {
+    pub fn new(workflow_dir: PathBuf, repo_root: PathBuf, execution: ExecutionConfig) -> Self {
+        Self {
+            workflow_dir,
+            repo_root,
+            event_name: "push".to_string(),
+            base_branch: None,
+            debounce_duration: Duration::from_millis(500),
+            execution,
+            verbose: false,
+            max_concurrent_executions: DEFAULT_MAX_CONCURRENT_EXECUTIONS,
+        }
+    }
+
+    pub fn with_event(mut self, event: impl Into<String>) -> Self {
+        self.event_name = event.into();
+        self
+    }
+
+    pub fn with_base_branch(mut self, base: Option<String>) -> Self {
+        self.base_branch = base;
+        self
+    }
+
+    pub fn with_debounce(mut self, d: Duration) -> Self {
+        self.debounce_duration = d;
+        self
+    }
+
+    pub fn with_verbose(mut self, v: bool) -> Self {
+        self.verbose = v;
+        self
+    }
+
+    pub fn with_max_concurrency(mut self, n: usize) -> Self {
+        // 0 would deadlock buffer_unordered; clamp to at least 1.
+        self.max_concurrent_executions = n.max(1);
+        self
+    }
+}
+
 /// Watches for filesystem changes and triggers workflow execution.
 pub struct WorkflowWatcher {
-    workflow_dir: PathBuf,
-    repo_root: PathBuf,
-    event_name: String,
-    base_branch: Option<String>,
-    debounce_duration: Duration,
-    config_template: ExecutionConfig,
-    verbose: bool,
-    max_concurrent_executions: usize,
+    cfg: WatcherConfig,
 }
 
 impl WorkflowWatcher {
+    /// Build a watcher from a [`WatcherConfig`].
+    pub fn from_config(mut cfg: WatcherConfig) -> Self {
+        // 0 would deadlock buffer_unordered; clamp to at least 1.
+        cfg.max_concurrent_executions = cfg.max_concurrent_executions.max(1);
+        Self { cfg }
+    }
+
+    /// Legacy positional constructor. Prefer [`WorkflowWatcher::from_config`]
+    /// + [`WatcherConfig`] for new call sites; kept for the existing CLI.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         workflow_dir: PathBuf,
@@ -63,18 +126,40 @@ impl WorkflowWatcher {
         verbose: bool,
         max_concurrent_executions: usize,
     ) -> Self {
-        // 0 would deadlock buffer_unordered; clamp to at least 1.
-        let max_concurrent_executions = max_concurrent_executions.max(1);
-        Self {
-            workflow_dir,
-            repo_root,
-            event_name,
-            base_branch,
-            debounce_duration,
-            config_template: config,
-            verbose,
-            max_concurrent_executions,
-        }
+        Self::from_config(
+            WatcherConfig::new(workflow_dir, repo_root, config)
+                .with_event(event_name)
+                .with_base_branch(base_branch)
+                .with_debounce(debounce_duration)
+                .with_verbose(verbose)
+                .with_max_concurrency(max_concurrent_executions),
+        )
+    }
+
+    // Accessors kept for source-compat with any in-tree callers.
+    fn workflow_dir(&self) -> &Path {
+        &self.cfg.workflow_dir
+    }
+    fn repo_root(&self) -> &Path {
+        &self.cfg.repo_root
+    }
+    fn event_name(&self) -> &str {
+        &self.cfg.event_name
+    }
+    fn base_branch(&self) -> Option<&String> {
+        self.cfg.base_branch.as_ref()
+    }
+    fn debounce_duration(&self) -> Duration {
+        self.cfg.debounce_duration
+    }
+    fn config_template(&self) -> &ExecutionConfig {
+        &self.cfg.execution
+    }
+    fn verbose(&self) -> bool {
+        self.cfg.verbose
+    }
+    fn max_concurrent_executions(&self) -> usize {
+        self.cfg.max_concurrent_executions
     }
 
     /// Collect workflow files from the configured directory.
@@ -84,7 +169,7 @@ impl WorkflowWatcher {
     /// cycle, and a slow filesystem (e.g. a network mount or a huge
     /// workflows directory) would otherwise block incoming notify events.
     pub async fn collect_workflow_files(&self) -> Result<Vec<PathBuf>, WatchError> {
-        let dir = self.workflow_dir.clone();
+        let dir = self.workflow_dir().to_path_buf();
         tokio::task::spawn_blocking(move || collect_workflow_files_blocking(&dir))
             .await
             .map_err(|e| WatchError::Io(std::io::Error::other(e.to_string())))?
@@ -94,11 +179,10 @@ impl WorkflowWatcher {
     /// debounced change set has been evaluated and executed.
     /// This blocks until an error occurs or the process is interrupted.
     ///
-    /// **Important:** `on_cycle_complete` runs on a blocking thread (via
-    /// `spawn_blocking`) so it doesn't block the tokio reactor, but the main
-    /// watch loop awaits its completion before starting the next cycle —
-    /// events that arrive during the callback accumulate in the debouncer
-    /// and are processed on the following cycle. Keep the callback fast.
+    /// `on_cycle_complete` is dispatched fire-and-forget on a blocking
+    /// thread so a slow reporter (file sink, network webhook) cannot stall
+    /// the main loop. Callers MUST NOT rely on serialization between
+    /// cycles in the callback.
     pub async fn run<F>(&self, on_cycle_complete: F) -> Result<(), WatchError>
     where
         F: Fn(WatchEvent) + Send + Sync + 'static,
@@ -109,10 +193,10 @@ impl WorkflowWatcher {
         // OS may deliver as canonicalized — e.g. macOS `/private/var` vs
         // `/var`, or a symlinked working copy) can be made root-relative
         // without silently failing every `strip_prefix`.
-        let repo_root_canonical =
-            std::fs::canonicalize(&self.repo_root).unwrap_or_else(|_| self.repo_root.clone());
+        let repo_root_canonical = std::fs::canonicalize(self.repo_root())
+            .unwrap_or_else(|_| self.repo_root().to_path_buf());
 
-        let debouncer = Arc::new(Debouncer::new(self.debounce_duration));
+        let debouncer = Arc::new(Debouncer::new(self.debounce_duration()));
         let callback = Arc::new(on_cycle_complete);
 
         // Set up the notify watcher.
@@ -131,6 +215,9 @@ impl WorkflowWatcher {
         let mut watcher = RecommendedWatcher::new(
             move |res: Result<Event, notify::Error>| {
                 if let Ok(event) = res {
+                    if !is_relevant_event_kind(&event.kind) {
+                        return;
+                    }
                     for path in event.paths {
                         if should_ignore_path(&path, &repo_root_for_callback) {
                             continue;
@@ -143,13 +230,13 @@ impl WorkflowWatcher {
         )?;
 
         // Watch the repo root recursively
-        watcher.watch(&self.repo_root, RecursiveMode::Recursive)?;
+        watcher.watch(self.repo_root(), RecursiveMode::Recursive)?;
 
         wrkflw_logging::info(&format!(
             "Watching {} for changes (event={}, debounce={}ms)",
-            self.repo_root.display(),
-            self.event_name,
-            self.debounce_duration.as_millis()
+            self.repo_root().display(),
+            self.event_name(),
+            self.debounce_duration().as_millis()
         ));
 
         let notify = debouncer.notifier();
@@ -178,52 +265,7 @@ impl WorkflowWatcher {
                 workflow_files = refreshed;
             }
 
-            // Refresh the trigger cache: drop entries no longer in the
-            // workflow list, and reparse new ones or any whose backing file
-            // just changed.
-            let active_set: HashSet<&PathBuf> = workflow_files.iter().collect();
-            trigger_cache.retain(|k, _| active_set.contains(k));
-
-            let changed_set: HashSet<&PathBuf> = changed_paths.iter().collect();
-            let mut parse_failures = 0usize;
-            for wf_path in &workflow_files {
-                let needs_reparse =
-                    !trigger_cache.contains_key(wf_path) || changed_set.contains(wf_path);
-                if !needs_reparse {
-                    continue;
-                }
-                match wrkflw_parser::workflow::parse_workflow(wf_path) {
-                    Ok(wf) => {
-                        match wrkflw_trigger_filter::parse_trigger_config(&wf, wf_path.clone()) {
-                            Ok(cfg) => {
-                                trigger_cache.insert(wf_path.clone(), cfg);
-                            }
-                            Err(e) => {
-                                trigger_cache.remove(wf_path);
-                                parse_failures += 1;
-                                if self.verbose {
-                                    wrkflw_logging::warning(&format!(
-                                        "Failed to parse trigger config for {}: {}",
-                                        wf_path.display(),
-                                        e
-                                    ));
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        trigger_cache.remove(wf_path);
-                        parse_failures += 1;
-                        if self.verbose {
-                            wrkflw_logging::warning(&format!(
-                                "Failed to parse {}: {}",
-                                wf_path.display(),
-                                e
-                            ));
-                        }
-                    }
-                }
-            }
+            self.refresh_trigger_cache(&mut trigger_cache, &workflow_files, &changed_paths);
 
             // Build the borrowed view for evaluation.
             let configs_for_eval: Vec<&WorkflowTriggerConfig> = workflow_files
@@ -231,46 +273,12 @@ impl WorkflowWatcher {
                 .filter_map(|p| trigger_cache.get(p))
                 .collect();
 
-            if configs_for_eval.is_empty() && !workflow_files.is_empty() {
-                wrkflw_logging::warning(&format!(
-                    "No workflows are usable: all {} workflow file(s) failed to parse. \
-                     Run with --verbose for details.",
-                    workflow_files.len()
-                ));
-            } else if parse_failures > 0 && !self.verbose {
-                wrkflw_logging::warning(&format!(
-                    "{} workflow file(s) failed to parse and were skipped (use --verbose for details)",
-                    parse_failures
-                ));
-            }
-
-            // Convert paths to repo-relative, canonicalizing along the way so
-            // that events delivered via symlinked paths or on macOS
-            // (`/private/var` → `/var`) still line up with the canonical
-            // repo root and don't drop out of the set.
-            //
-            // `canonicalize` is a blocking syscall (one `lstat` per component)
-            // and `changed_paths` can be large during a burst — hop onto a
-            // blocking thread so the reactor isn't stalled.
-            let paths_for_canon = changed_paths.clone();
-            let root_for_canon = repo_root_canonical.clone();
-            let changed_files: Vec<String> = tokio::task::spawn_blocking(move || {
-                paths_for_canon
-                    .iter()
-                    .filter_map(|p| {
-                        let canonical = std::fs::canonicalize(p).unwrap_or_else(|_| p.clone());
-                        canonical
-                            .strip_prefix(&root_for_canon)
-                            .ok()
-                            .map(|rel| rel.to_string_lossy().to_string())
-                    })
-                    .collect()
-            })
-            .await
-            .unwrap_or_default();
+            let changed_files = self
+                .canonicalize_changed_paths(&changed_paths, &repo_root_canonical)
+                .await;
 
             if changed_files.is_empty() {
-                if self.verbose {
+                if self.verbose() {
                     wrkflw_logging::warning(&format!(
                         "Ignored {} change event(s): none resolved under repo root {}",
                         changed_paths.len(),
@@ -284,9 +292,102 @@ impl WorkflowWatcher {
                 .evaluate_and_execute(&configs_for_eval, changed_files)
                 .await;
 
+            // Fire-and-forget the callback so a slow reporter can't stall
+            // the next cycle. Events that arrive during the callback still
+            // accumulate in the debouncer and are processed on the next
+            // round.
             let cb = callback.clone();
-            let _ = tokio::task::spawn_blocking(move || cb(event)).await;
+            tokio::task::spawn_blocking(move || cb(event));
         }
+    }
+
+    /// Refresh `trigger_cache` in place: drop entries no longer in
+    /// `workflow_files`, reparse anything new or whose backing file appeared
+    /// in the current cycle's change set. Centralized so it can be unit
+    /// tested independently of the notify/tokio plumbing.
+    ///
+    /// Uses [`wrkflw_trigger_filter::load_trigger_config`] as the single
+    /// source of truth for "read + parse + compile" — the TUI and CLI
+    /// prefilter use the same helper so errors are reported identically.
+    pub fn refresh_trigger_cache(
+        &self,
+        trigger_cache: &mut HashMap<PathBuf, WorkflowTriggerConfig>,
+        workflow_files: &[PathBuf],
+        changed_paths: &[PathBuf],
+    ) {
+        let active_set: HashSet<&PathBuf> = workflow_files.iter().collect();
+        trigger_cache.retain(|k, _| active_set.contains(k));
+
+        let changed_set: HashSet<&PathBuf> = changed_paths.iter().collect();
+        let mut parse_failures = 0usize;
+        for wf_path in workflow_files {
+            let needs_reparse =
+                !trigger_cache.contains_key(wf_path) || changed_set.contains(wf_path);
+            if !needs_reparse {
+                continue;
+            }
+            match wrkflw_trigger_filter::load_trigger_config(wf_path) {
+                Ok(cfg) => {
+                    trigger_cache.insert(wf_path.clone(), cfg);
+                }
+                Err(e) => {
+                    trigger_cache.remove(wf_path);
+                    parse_failures += 1;
+                    if self.verbose() {
+                        wrkflw_logging::warning(&format!(
+                            "Failed to parse {}: {}",
+                            wf_path.display(),
+                            e
+                        ));
+                    }
+                }
+            }
+        }
+
+        if trigger_cache.is_empty() && !workflow_files.is_empty() {
+            wrkflw_logging::warning(&format!(
+                "No workflows are usable: all {} workflow file(s) failed to parse. \
+                 Run with --verbose for details.",
+                workflow_files.len()
+            ));
+        } else if parse_failures > 0 && !self.verbose() {
+            wrkflw_logging::warning(&format!(
+                "{} workflow file(s) failed to parse and were skipped (use --verbose for details)",
+                parse_failures
+            ));
+        }
+    }
+
+    /// Convert absolute change paths to repo-relative strings. Runs on a
+    /// blocking thread because `canonicalize` is one `lstat` per component.
+    ///
+    /// **Deleted-file handling:** `canonicalize` fails for paths whose
+    /// target no longer exists. Previously the fallback was the raw path,
+    /// which could fail `strip_prefix` on macOS (`/private/var` vs `/var`)
+    /// or symlinked trees, silently dropping deletions. We now walk back
+    /// to the nearest canonicalizable ancestor and re-join the trailing
+    /// components so deletions under `paths:` filters still propagate.
+    async fn canonicalize_changed_paths(
+        &self,
+        changed_paths: &[PathBuf],
+        repo_root_canonical: &Path,
+    ) -> Vec<String> {
+        let paths_for_canon = changed_paths.to_vec();
+        let root_for_canon = repo_root_canonical.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            paths_for_canon
+                .iter()
+                .filter_map(|p| {
+                    let canonical = canonicalize_allowing_missing(p);
+                    canonical
+                        .strip_prefix(&root_for_canon)
+                        .ok()
+                        .map(|rel| rel.to_string_lossy().to_string())
+                })
+                .collect()
+        })
+        .await
+        .unwrap_or_default()
     }
 
     /// Evaluate triggers for the given (already parsed) workflows against the
@@ -298,21 +399,21 @@ impl WorkflowWatcher {
         changed_files: Vec<String>,
     ) -> WatchEvent {
         let context = wrkflw_trigger_filter::context_from_changed_files(
-            &self.event_name,
+            self.event_name(),
             changed_files.clone(),
-            Some(&self.repo_root),
+            Some(self.repo_root()),
         )
         .await
         .map(|mut ctx| {
-            ctx.base_branch = self.base_branch.clone();
+            ctx.base_branch = self.base_branch().cloned();
             ctx
         })
         .unwrap_or_else(|e| {
             wrkflw_logging::warning(&format!("Failed to build event context: {}", e));
             wrkflw_trigger_filter::EventContext {
-                event_name: self.event_name.clone(),
+                event_name: self.event_name().to_string(),
                 branch: None,
-                base_branch: self.base_branch.clone(),
+                base_branch: self.base_branch().cloned(),
                 tag: None,
                 changed_files: changed_files.clone(),
                 activity_type: None,
@@ -329,7 +430,7 @@ impl WorkflowWatcher {
             if result.matches {
                 triggered.push(result.workflow_path.display().to_string());
 
-                let config = self.config_template.clone();
+                let config = self.config_template().clone();
                 let wf_path = result.workflow_path.clone();
                 exec_futures.push(async move {
                     match wrkflw_executor::execute_workflow(&wf_path, config).await {
@@ -362,7 +463,7 @@ impl WorkflowWatcher {
 
         // Execute triggered workflows with bounded concurrency
         stream::iter(exec_futures)
-            .buffer_unordered(self.max_concurrent_executions)
+            .buffer_unordered(self.max_concurrent_executions())
             .collect::<Vec<()>>()
             .await;
 
@@ -372,6 +473,53 @@ impl WorkflowWatcher {
             skipped_workflows: skipped,
         }
     }
+}
+
+/// Return `true` if a notify event kind is relevant for trigger
+/// re-evaluation. We care about creates, writes, removes, and rename
+/// endpoints; we drop access/metadata updates (atime/chmod/owner) and
+/// "Any"/"Other" kinds that notify emits for bookkeeping.
+fn is_relevant_event_kind(kind: &EventKind) -> bool {
+    match kind {
+        EventKind::Create(_) => true,
+        EventKind::Remove(_) => true,
+        EventKind::Modify(ModifyKind::Data(_)) => true,
+        EventKind::Modify(ModifyKind::Name(_)) => true,
+        // Data and Name modifications are the ones users care about.
+        // Metadata (chmod, chown) and Access events are dropped.
+        EventKind::Modify(_) => false,
+        EventKind::Access(_) => false,
+        EventKind::Any | EventKind::Other => false,
+    }
+}
+
+/// Canonicalize `path`, tolerating the case where the target was deleted.
+/// Walks back to the nearest canonicalizable ancestor, then re-appends the
+/// missing components. This keeps deleted files root-relative on platforms
+/// where the raw path would fail `strip_prefix` (macOS `/private/var` vs
+/// `/var`, symlinked working trees).
+pub(crate) fn canonicalize_allowing_missing(path: &Path) -> PathBuf {
+    if let Ok(canonical) = std::fs::canonicalize(path) {
+        return canonical;
+    }
+    // Walk up until we find an ancestor we can canonicalize; collect the
+    // missing tail so we can re-join it.
+    let mut tail: Vec<&std::ffi::OsStr> = Vec::new();
+    let mut cursor: &Path = path;
+    while let Some(parent) = cursor.parent() {
+        if let Some(leaf) = cursor.file_name() {
+            tail.push(leaf);
+        }
+        if let Ok(canonical_parent) = std::fs::canonicalize(parent) {
+            let mut result = canonical_parent;
+            for seg in tail.into_iter().rev() {
+                result.push(seg);
+            }
+            return result;
+        }
+        cursor = parent;
+    }
+    path.to_path_buf()
 }
 
 /// Synchronous implementation of `collect_workflow_files`. Extracted so it can
@@ -405,11 +553,20 @@ fn collect_workflow_files_blocking(dir: &Path) -> Result<Vec<PathBuf>, WatchErro
 /// We deliberately skip the leaf component so a user file literally named
 /// `target` (e.g. `scripts/target`) is not silently dropped — only paths that
 /// have a `target/` (etc.) parent directory are filtered.
+///
+/// Paths that are NOT under `repo_root` are left untouched (the previous
+/// implementation iterated their absolute components, which would
+/// incorrectly drop a valid `/home/alice/target-acquisition/...` just
+/// because an absolute component happened to equal `target`).
 fn should_ignore_path(path: &Path, repo_root: &Path) -> bool {
-    // Make the path repo-root-relative if possible. If it isn't under
-    // repo_root we still apply the ignore set positionally rather than
-    // returning false, so events from inside symlinks etc. still get filtered.
-    let rel = path.strip_prefix(repo_root).unwrap_or(path);
+    // Only apply the ignore set if we can express the path as repo-relative.
+    // A path outside the repo root shouldn't exist in practice (notify
+    // scoped to the root), but if it does, we do not want to match against
+    // spurious absolute-path components like `/target-foo/...`.
+    let rel = match path.strip_prefix(repo_root) {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
     // Compare against every component except the last (the leaf, which is
     // presumed to be a filename). Using `parent()` + component iteration
     // avoids collecting into a `Vec` — this function runs on every notify
@@ -448,9 +605,74 @@ pub fn find_repo_root() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use notify::event::{AccessKind, CreateKind, DataChange, MetadataKind, ModifyKind, RemoveKind};
 
     fn root() -> &'static Path {
         Path::new("/repo")
+    }
+
+    #[test]
+    fn is_relevant_event_kind_accepts_creates_and_writes() {
+        assert!(is_relevant_event_kind(&EventKind::Create(CreateKind::File)));
+        assert!(is_relevant_event_kind(&EventKind::Modify(
+            ModifyKind::Data(DataChange::Content)
+        )));
+        assert!(is_relevant_event_kind(&EventKind::Remove(RemoveKind::File)));
+        // Renames must propagate — a `git checkout` fires them in pairs.
+        assert!(is_relevant_event_kind(&EventKind::Modify(
+            ModifyKind::Name(notify::event::RenameMode::Any)
+        )));
+    }
+
+    #[test]
+    fn is_relevant_event_kind_drops_access_and_metadata() {
+        assert!(!is_relevant_event_kind(&EventKind::Access(
+            AccessKind::Read
+        )));
+        assert!(!is_relevant_event_kind(&EventKind::Modify(
+            ModifyKind::Metadata(MetadataKind::Permissions)
+        )));
+        assert!(!is_relevant_event_kind(&EventKind::Any));
+        assert!(!is_relevant_event_kind(&EventKind::Other));
+    }
+
+    #[test]
+    fn canonicalize_allowing_missing_handles_deleted_leaf() {
+        // The leaf does not exist, but its parent is a real canonicalizable
+        // directory — the fallback must walk up and re-join the missing leaf.
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let root = tmp.path();
+        let deleted = root.join("missing.txt");
+        assert!(!deleted.exists());
+
+        let canonical = canonicalize_allowing_missing(&deleted);
+        // The result should start with the canonical parent and end with the
+        // missing leaf name.
+        assert!(
+            canonical.ends_with("missing.txt"),
+            "canonical should retain the leaf, got {}",
+            canonical.display()
+        );
+        // The parent component should equal the canonical form of root.
+        let expected_parent = std::fs::canonicalize(root).unwrap();
+        assert_eq!(canonical.parent(), Some(expected_parent.as_path()));
+    }
+
+    #[test]
+    fn canonicalize_allowing_missing_handles_deleted_subdir_leaf() {
+        // Parent directory also missing, grandparent exists — must walk up
+        // one more level and re-join both segments.
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let root = tmp.path();
+        let deeper = root.join("gone").join("missing.txt");
+
+        let canonical = canonicalize_allowing_missing(&deeper);
+        assert!(canonical.ends_with("gone/missing.txt"));
+        let expected_root = std::fs::canonicalize(root).unwrap();
+        assert_eq!(
+            canonical.strip_prefix(&expected_root).ok(),
+            Some(Path::new("gone/missing.txt"))
+        );
     }
 
     #[test]
@@ -459,6 +681,20 @@ mod tests {
             Path::new("/repo/.git/objects/pack/abc"),
             root()
         ));
+    }
+
+    #[test]
+    fn does_not_ignore_path_outside_repo_root() {
+        // Regression: previously, paths outside repo_root were iterated as
+        // absolute components, so `/home/alice/target-acquisition/file.rs`
+        // would match the `target` ignore entry.
+        assert!(!should_ignore_path(
+            Path::new("/home/alice/target-acquisition/file.rs"),
+            root()
+        ));
+        // Similarly for a directory literally named `target` outside the
+        // watched root.
+        assert!(!should_ignore_path(Path::new("/target/build.rs"), root()));
     }
 
     #[test]

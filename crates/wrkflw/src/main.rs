@@ -842,8 +842,14 @@ async fn run_trigger_prefilter_or_exit(
 
     let event_name = event.clone().unwrap_or_else(|| "push".to_string());
 
+    // Root git operations at the git repo root when possible, so behavior
+    // is consistent regardless of the directory the user ran `wrkflw`
+    // from. Falls back to process CWD if we're not inside a repo.
+    let repo_root: Option<PathBuf> = wrkflw_watcher::find_repo_root();
+    let cwd_for_git: Option<&Path> = repo_root.as_deref();
+
     let mut event_context = if let Some(files) = changed_files {
-        wrkflw_trigger_filter::context_from_changed_files(&event_name, files.clone(), None)
+        wrkflw_trigger_filter::context_from_changed_files(&event_name, files.clone(), cwd_for_git)
             .await
             .unwrap_or_else(|e| {
                 eprintln!("Error: failed to build event context: {}", e);
@@ -851,14 +857,19 @@ async fn run_trigger_prefilter_or_exit(
             })
     } else if diff {
         if let Some(head) = diff_head {
-            wrkflw_trigger_filter::context_from_diff_range(&event_name, diff_base, head, None)
-                .await
-                .unwrap_or_else(|e| {
-                    eprintln!("Error: failed to get git diff: {}", e);
-                    std::process::exit(1);
-                })
+            wrkflw_trigger_filter::context_from_diff_range(
+                &event_name,
+                diff_base,
+                head,
+                cwd_for_git,
+            )
+            .await
+            .unwrap_or_else(|e| {
+                eprintln!("Error: failed to get git diff: {}", e);
+                std::process::exit(1);
+            })
         } else {
-            wrkflw_trigger_filter::auto_detect_context(&event_name, diff_base, None)
+            wrkflw_trigger_filter::auto_detect_context(&event_name, diff_base, cwd_for_git)
                 .await
                 .unwrap_or_else(|e| {
                     eprintln!("Error: failed to get git diff: {}", e);
@@ -875,7 +886,7 @@ async fn run_trigger_prefilter_or_exit(
              path filters will not match because no changed files are known. \
              Use --diff to auto-detect from git, or --changed-files to specify them.",
         );
-        wrkflw_trigger_filter::context_from_changed_files(&event_name, vec![], None)
+        wrkflw_trigger_filter::context_from_changed_files(&event_name, vec![], cwd_for_git)
             .await
             .unwrap_or_else(|e| {
                 eprintln!("Error: failed to build event context: {}", e);
@@ -905,16 +916,11 @@ async fn run_trigger_prefilter_or_exit(
     }
 
     // Parse workflow and evaluate trigger before executing
-    let workflow = wrkflw_parser::workflow::parse_workflow(workflow_path).unwrap_or_else(|e| {
-        eprintln!("Error parsing workflow: {}", e);
-        std::process::exit(1);
-    });
     let trigger_config =
-        wrkflw_trigger_filter::parse_trigger_config(&workflow, workflow_path.to_path_buf())
-            .unwrap_or_else(|e| {
-                eprintln!("Error parsing trigger config: {}", e);
-                std::process::exit(1);
-            });
+        wrkflw_trigger_filter::load_trigger_config(workflow_path).unwrap_or_else(|e| {
+            eprintln!("Error parsing workflow: {}", e);
+            std::process::exit(1);
+        });
     let match_result = wrkflw_trigger_filter::evaluate_trigger(&trigger_config, &event_context);
 
     if !match_result.matches {

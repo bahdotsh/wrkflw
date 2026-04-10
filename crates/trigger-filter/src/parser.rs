@@ -88,52 +88,16 @@ fn parse_event_config(
     };
 
     // GitHub Actions supports inline `!`-prefixed exclusion patterns in
-    // `branches`, `tags`, and `paths`. We split them into the include /
-    // exclude lists at parse time so the evaluator sees them the same way
-    // as the explicit `*-ignore` forms. Mixing `!`-patterns with the
-    // dedicated `*-ignore` key is rejected by GitHub Actions, so we enforce
-    // the same rule to keep semantics predictable.
-    let (branches, branches_inline_ignore) = extract_glob_list(map, "branches", event_name)?;
-    let branches_ignore_explicit = extract_glob_list(map, "branches-ignore", event_name)?.0;
-    if !branches_inline_ignore.is_empty() && !branches_ignore_explicit.is_empty() {
-        return Err(TriggerFilterError::ParseError(format!(
-            "{}: cannot mix inline `!`-patterns in `branches:` with a separate `branches-ignore:` key",
-            event_name
-        )));
-    }
-    let branches_ignore = if branches_ignore_explicit.is_empty() {
-        branches_inline_ignore
-    } else {
-        branches_ignore_explicit
-    };
-
-    let (tags, tags_inline_ignore) = extract_glob_list(map, "tags", event_name)?;
-    let tags_ignore_explicit = extract_glob_list(map, "tags-ignore", event_name)?.0;
-    if !tags_inline_ignore.is_empty() && !tags_ignore_explicit.is_empty() {
-        return Err(TriggerFilterError::ParseError(format!(
-            "{}: cannot mix inline `!`-patterns in `tags:` with a separate `tags-ignore:` key",
-            event_name
-        )));
-    }
-    let tags_ignore = if tags_ignore_explicit.is_empty() {
-        tags_inline_ignore
-    } else {
-        tags_ignore_explicit
-    };
-
-    let (paths, paths_inline_ignore) = extract_glob_list(map, "paths", event_name)?;
-    let paths_ignore_explicit = extract_glob_list(map, "paths-ignore", event_name)?.0;
-    if !paths_inline_ignore.is_empty() && !paths_ignore_explicit.is_empty() {
-        return Err(TriggerFilterError::ParseError(format!(
-            "{}: cannot mix inline `!`-patterns in `paths:` with a separate `paths-ignore:` key",
-            event_name
-        )));
-    }
-    let paths_ignore = if paths_ignore_explicit.is_empty() {
-        paths_inline_ignore
-    } else {
-        paths_ignore_explicit
-    };
+    // `branches`, `tags`, and `paths`. `resolve_include_and_ignore` splits
+    // them into the include / exclude lists at parse time so the evaluator
+    // sees them the same way as the explicit `*-ignore` forms. Mixing
+    // `!`-patterns with the dedicated `*-ignore` key is rejected by GitHub
+    // Actions, so we enforce the same rule to keep semantics predictable.
+    let (branches, branches_ignore) =
+        resolve_include_and_ignore(map, "branches", "branches-ignore", event_name)?;
+    let (tags, tags_ignore) = resolve_include_and_ignore(map, "tags", "tags-ignore", event_name)?;
+    let (paths, paths_ignore) =
+        resolve_include_and_ignore(map, "paths", "paths-ignore", event_name)?;
 
     Ok(EventFilter {
         event_name: event_name.to_string(),
@@ -145,6 +109,36 @@ fn parse_event_config(
         paths_ignore,
         types: extract_string_list(map, "types"),
     })
+}
+
+/// Resolve an `(include, ignore)` list pair for one of the three filter
+/// axes — `branches`/`branches-ignore`, `tags`/`tags-ignore`,
+/// `paths`/`paths-ignore`.
+///
+/// Handles GitHub Actions' inline `!`-negation semantics (which
+/// `extract_glob_list` splits into `(includes, inline_excludes)`), and
+/// rejects mixing inline negation with a dedicated `*-ignore` key since
+/// GitHub Actions rejects that combination.
+fn resolve_include_and_ignore(
+    map: &serde_yaml::Mapping,
+    include_key: &str,
+    ignore_key: &str,
+    event_name: &str,
+) -> Result<(Vec<GlobPattern>, Vec<GlobPattern>), TriggerFilterError> {
+    let (includes, inline_ignore) = extract_glob_list(map, include_key, event_name)?;
+    let explicit_ignore = extract_glob_list(map, ignore_key, event_name)?.0;
+    if !inline_ignore.is_empty() && !explicit_ignore.is_empty() {
+        return Err(TriggerFilterError::ParseError(format!(
+            "{}: cannot mix inline `!`-patterns in `{}:` with a separate `{}:` key",
+            event_name, include_key, ignore_key
+        )));
+    }
+    let ignore = if explicit_ignore.is_empty() {
+        inline_ignore
+    } else {
+        explicit_ignore
+    };
+    Ok((includes, ignore))
 }
 
 fn extract_string_list(map: &serde_yaml::Mapping, key: &str) -> Vec<String> {

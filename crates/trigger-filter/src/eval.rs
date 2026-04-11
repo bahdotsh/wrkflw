@@ -298,6 +298,7 @@ mod tests {
             workflow_path: PathBuf::from("test.yml"),
             workflow_name: "test".to_string(),
             events,
+            warnings: Vec::new(),
         }
     }
 

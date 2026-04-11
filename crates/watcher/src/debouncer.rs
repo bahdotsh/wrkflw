@@ -91,23 +91,37 @@ impl Debouncer {
         self.notify.notify_one();
     }
 
+    /// Wall-clock ceiling on the cumulative settle window. Sustained
+    /// filesystem churn will not delay a drain past this budget
+    /// regardless of how long `duration` is — a user passing
+    /// `--debounce 5000` would otherwise see a 5s × 3-round = 15s
+    /// worst-case drain under a churn burst. 1.5s preserves the
+    /// behavior the old hardcoded 3-round cap produced for the stock
+    /// 500ms debounce (3 × 500 = 1500) while scaling correctly when
+    /// the user picks a different debounce window. Tests that rely
+    /// on the livelock prevention (see
+    /// `max_settle_rounds_prevents_livelock` below) continue to
+    /// pass because the cumulative budget resolves the same way for
+    /// short windows (many rounds fit in 1.5s).
+    const MAX_SETTLE_BUDGET: Duration = Duration::from_millis(1500);
+
     /// Wait for the debounce window to settle, then drain all pending paths.
     ///
     /// Sleeps for the debounce duration, but only continues waiting while new
     /// events keep arriving. Returns as soon as a full debounce interval passes
-    /// with no new events. A maximum of `MAX_SETTLE_ROUNDS` iterations prevents
-    /// livelock under sustained filesystem churn (e.g. large builds).
+    /// with no new events. A cumulative wall-clock budget of
+    /// [`Self::MAX_SETTLE_BUDGET`] prevents livelock under sustained
+    /// filesystem churn (e.g. large builds) regardless of debounce window.
     pub async fn drain(&self) -> Vec<PathBuf> {
-        // Cap the number of settle rounds to prevent livelock when events
-        // arrive faster than the debounce window.
-        //
-        // Tuning rationale: with the default 500ms debounce, the previous
-        // value of 10 rounds meant a sustained `cargo build` could delay
-        // a drain by 5s — long enough for the user to wonder if the
-        // watcher is hung. 3 rounds caps the worst case at ~1.5s while
-        // still absorbing the brief flurries that follow most editor
-        // saves (write → fsync → editor swap-rename).
-        const MAX_SETTLE_ROUNDS: usize = 3;
+        // Derive the round cap from the debounce window so long
+        // user-picked windows still terminate within ~1.5s even
+        // under sustained churn. At least 1 round so a zero-ish
+        // debounce still drains once.
+        let max_rounds: usize = {
+            let budget_ms = Self::MAX_SETTLE_BUDGET.as_millis();
+            let window_ms = self.duration.as_millis().max(1);
+            (budget_ms / window_ms).max(1) as usize
+        };
 
         let mut rounds = 0;
         loop {
@@ -126,7 +140,7 @@ impl Debouncer {
             let mut pending = self.lock_or_recover();
             // Drain if no new events arrived during the sleep, or if we've
             // waited long enough to avoid starving the consumer.
-            if pending.len() == count_before || rounds >= MAX_SETTLE_ROUNDS {
+            if pending.len() == count_before || rounds >= max_rounds {
                 return pending.drain().collect();
             }
         }
@@ -232,6 +246,32 @@ mod tests {
         assert_eq!(debouncer.dropped_count(), 1);
         let drained = debouncer.drain().await;
         assert_eq!(drained.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn long_debounce_window_still_terminates_within_budget() {
+        // Regression pin: the old hardcoded `MAX_SETTLE_ROUNDS = 3`
+        // meant a user passing `--debounce 5000` would see up to a
+        // 15-second worst-case drain delay under sustained churn —
+        // long enough for the watcher to look hung. The dynamic cap
+        // derived from `MAX_SETTLE_BUDGET` (1.5s) must terminate the
+        // drain within that wall-clock budget regardless of how long
+        // the debounce window is. We use a 2-second debounce so the
+        // max_rounds math is 1 (1500 / 2000 = 0, .max(1) = 1), which
+        // means the drain terminates after exactly one settle round.
+        let debouncer = Debouncer::new(Duration::from_millis(2000));
+        debouncer.add_event(PathBuf::from("a.rs"));
+
+        // The drain sleeps for `duration` (2s) once, checks, and
+        // returns because max_rounds was 1. Give it a 3-second
+        // timeout so a flake is obvious rather than wedged.
+        let result = tokio::time::timeout(Duration::from_secs(3), debouncer.drain()).await;
+        assert!(
+            result.is_ok(),
+            "drain() must terminate within 3s even with a 2s debounce window"
+        );
+        let paths = result.unwrap();
+        assert_eq!(paths.len(), 1);
     }
 
     #[tokio::test]

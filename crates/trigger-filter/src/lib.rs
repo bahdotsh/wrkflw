@@ -10,7 +10,7 @@ pub mod ref_matcher;
 pub use config::TriggerFilterConfig;
 pub use error::TriggerFilterError;
 pub use eval::evaluate_trigger;
-pub use git::{find_repo_root_detailed, FindRepoRootError};
+pub use git::{find_repo_root_detailed, head_mtime, FindRepoRootError};
 pub use model::{
     EventContext, EventFilter, GlobPattern, TriggerMatchResult, WorkflowTriggerConfig,
 };
@@ -123,35 +123,6 @@ impl PatternCache {
         }
     }
 
-    fn get_or_load(
-        &mut self,
-        path: &Path,
-        mtime: SystemTime,
-    ) -> Result<WorkflowTriggerConfig, TriggerFilterError> {
-        self.tick = self.tick.wrapping_add(1);
-        if let Some(entry) = self.entries.get_mut(path) {
-            if entry.mtime == mtime {
-                entry.last_used = self.tick;
-                return Ok(entry.config.clone());
-            }
-        }
-        // Miss or stale — re-parse.
-        let config = load_trigger_config(path)?;
-        let tick = self.tick;
-        self.entries.insert(
-            path.to_path_buf(),
-            CachedTriggerConfig {
-                mtime,
-                config: config.clone(),
-                last_used: tick,
-            },
-        );
-        if self.entries.len() > self.capacity {
-            self.evict_lru();
-        }
-        Ok(config)
-    }
-
     fn evict_lru(&mut self) {
         // Linear LRU — correct and cheap for the ~128-entry default.
         // If the capacity ever needs to scale, swap in `lru` crate.
@@ -172,6 +143,15 @@ impl PatternCache {
 /// zero (the test-mode opt-out) or when the file's mtime cannot be
 /// read. Callers that want a guaranteed fresh parse should call
 /// [`load_trigger_config`] directly.
+///
+/// **Locking discipline.** The cache mutex is released BEFORE the
+/// blocking YAML parse on a miss, so concurrent callers hitting
+/// different files never serialize behind a single slow parse. A
+/// previous shape held the lock across `load_trigger_config`, which
+/// defeated the point of the cache on any multi-thread host: one
+/// slow file made every other parse wait for it. Racing duplicate
+/// parses on the *same* file are safe — both writers produce the
+/// same value, and late-writer-wins is the simpler invariant.
 pub fn load_trigger_config_cached(
     workflow_path: &Path,
     config: &TriggerFilterConfig,
@@ -183,20 +163,59 @@ pub fn load_trigger_config_cached(
         Ok(t) => t,
         Err(_) => return load_trigger_config(workflow_path),
     };
+
+    // Fast path: cache hit under lock. Release the lock before the
+    // blocking parse on a miss — see the doc comment above.
+    {
+        let mut guard = match PATTERN_CACHE.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let cache = guard.get_or_insert_with(|| PatternCache::new(config.pattern_cache_size));
+        // Honour capacity changes across calls — a test that flips the
+        // cache size off/on should see the new ceiling immediately.
+        if cache.capacity != config.pattern_cache_size {
+            cache.capacity = config.pattern_cache_size;
+            while cache.entries.len() > cache.capacity {
+                cache.evict_lru();
+            }
+        }
+        cache.tick = cache.tick.wrapping_add(1);
+        if let Some(entry) = cache.entries.get_mut(workflow_path) {
+            if entry.mtime == mtime {
+                entry.last_used = cache.tick;
+                return Ok(entry.config.clone());
+            }
+        }
+    }
+
+    // Cache miss — parse WITHOUT holding the lock. This is the load-
+    // bearing change: `load_trigger_config` does blocking file I/O +
+    // YAML parse + glob compile. Holding `PATTERN_CACHE` across that
+    // would serialize every other caller in the process.
+    let parsed = load_trigger_config(workflow_path)?;
+
+    // Re-acquire and insert. A concurrent caller may have populated
+    // the entry while we were parsing; overwrite it with our fresh
+    // value — same content, so late-writer-wins is safe.
     let mut guard = match PATTERN_CACHE.lock() {
         Ok(g) => g,
         Err(p) => p.into_inner(),
     };
     let cache = guard.get_or_insert_with(|| PatternCache::new(config.pattern_cache_size));
-    // Honour capacity changes across calls — a test that flips the
-    // cache size off/on should see the new ceiling immediately.
-    if cache.capacity != config.pattern_cache_size {
-        cache.capacity = config.pattern_cache_size;
-        while cache.entries.len() > cache.capacity {
-            cache.evict_lru();
-        }
+    let tick = cache.tick;
+    cache.entries.insert(
+        workflow_path.to_path_buf(),
+        CachedTriggerConfig {
+            mtime,
+            config: parsed.clone(),
+            last_used: tick,
+        },
+    );
+    if cache.entries.len() > cache.capacity {
+        cache.evict_lru();
     }
-    cache.get_or_load(workflow_path, mtime)
+    Ok(parsed)
 }
 
 /// Bulk cached variant of [`load_trigger_configs`] that pushes every
@@ -368,6 +387,19 @@ pub fn normalize_user_changed_file(raw: &str) -> Result<String, TriggerFilterErr
         return Err(TriggerFilterError::ParseError(
             "--changed-files entries must be non-empty repo-relative paths".to_string(),
         ));
+    }
+    // Reject embedded NUL bytes up front. NUL is not a valid filename
+    // byte on any supported platform (Unix forbids it in pathnames;
+    // Windows uses NUL-terminated APIs), and letting one through would
+    // only produce downstream confusion in glob matching or subprocess
+    // argv handling. Consistent with the rest of the boundary-input
+    // validation in this function.
+    if trimmed.contains('\0') {
+        return Err(TriggerFilterError::ParseError(format!(
+            "--changed-files entry contains a NUL byte, which is not a valid \
+             path component on any supported platform (raw: {:?})",
+            raw
+        )));
     }
     // Cheap textual checks cover the whole set of invalid shapes we
     // care about without pulling in a full path-canonicalization
@@ -553,5 +585,17 @@ mod tests {
             normalize_user_changed_file("src\\main.rs").unwrap(),
             "src/main.rs"
         );
+    }
+
+    #[test]
+    fn normalize_user_changed_file_rejects_nul_bytes() {
+        // NUL is not a valid filename byte on any supported platform;
+        // a user passing one through `--changed-files` is almost
+        // certainly a bug in whatever generated the list. Fail fast
+        // with a pointer at the input instead of letting glob matching
+        // silently misbehave.
+        let err = normalize_user_changed_file("src/main\0.rs").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("NUL"), "got: {}", msg);
     }
 }

@@ -4,7 +4,6 @@
 //! `git.rs`, `watcher.rs`, and the TUI. A single struct lets callers
 //! override the knobs in one place instead of forking the crate:
 //!
-//! - `git_timeout` — hard cap on every `git` subprocess invocation.
 //! - `git_state_ttl` — how long the watcher may reuse a cached
 //!   `(branch, tag)` pair between `git checkout`s.
 //! - `pattern_cache_size` — upper bound on the LRU of compiled
@@ -12,24 +11,31 @@
 //! - `default_event` — event name to synthesize when the caller does
 //!   not pass one (CLI `--event` default, TUI diff-filter default, and
 //!   the watcher's `WatcherConfig` fall-through).
-//! - `strict_missing_context` — when true, building an `EventContext`
-//!   with known-incomplete inputs (e.g. `--event` without a changed
-//!   file set, or `pull_request` without a base branch) is a hard
-//!   error instead of a warning-and-proceed.
 //!
 //! Construction is via `TriggerFilterConfig::default()` plus builder
 //! setters, the same shape `WatcherConfig` already uses — this keeps
 //! the CLI / TUI / watcher wiring uniform.
+//!
+//! **On missing knobs.** This struct deliberately does NOT carry a
+//! `git_timeout` or `strict_missing_context` field. Both existed as
+//! builder-only plumbing in an earlier draft with no library-side
+//! consumers — `git.rs` read a file-local const for the timeout, and
+//! strict-mode was implemented entirely in the CLI. Shipping
+//! non-functional config knobs is precisely the kind of drift the
+//! rest of this crate is built to prevent, so they were removed
+//! rather than half-wired. If a future caller needs to override the
+//! git timeout, thread `Duration` through `run_git` first and add
+//! the field at the same commit.
 
 use std::time::Duration;
 
-/// Hard upper bound on every git subprocess call, unless overridden.
+/// Hard upper bound on every git subprocess call.
 ///
-/// Moved from `git.rs` so the knob is visible from every caller that
-/// threads a `TriggerFilterConfig` through. The 10s default matches the
-/// value the crate has shipped with, and exists to catch hung-process
-/// failure modes (network filesystems, credential prompts, corrupt
-/// repos) without letting them wedge the watch loop forever.
+/// The 10s default matches the value the crate has shipped with and
+/// exists to catch hung-process failure modes (network filesystems,
+/// credential prompts, corrupt repos) without letting them wedge the
+/// watch loop forever. Currently hard-coded — see the module-level
+/// docstring for the rationale on why there is no config knob yet.
 pub const DEFAULT_GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Default TTL for the watcher's cached `(branch, tag)` pair.
@@ -68,37 +74,27 @@ pub const DEFAULT_EVENT_NAME: &str = "push";
 /// use std::time::Duration;
 ///
 /// let cfg = TriggerFilterConfig::default()
-///     .with_git_timeout(Duration::from_secs(30))
-///     .with_default_event("pull_request")
-///     .with_strict_missing_context(true);
+///     .with_git_state_ttl(Duration::from_secs(1))
+///     .with_default_event("pull_request");
 /// ```
 #[derive(Debug, Clone)]
 pub struct TriggerFilterConfig {
-    pub git_timeout: Duration,
     pub git_state_ttl: Duration,
     pub pattern_cache_size: usize,
     pub default_event: String,
-    pub strict_missing_context: bool,
 }
 
 impl Default for TriggerFilterConfig {
     fn default() -> Self {
         Self {
-            git_timeout: DEFAULT_GIT_COMMAND_TIMEOUT,
             git_state_ttl: DEFAULT_GIT_STATE_TTL,
             pattern_cache_size: DEFAULT_PATTERN_CACHE_SIZE,
             default_event: DEFAULT_EVENT_NAME.to_string(),
-            strict_missing_context: false,
         }
     }
 }
 
 impl TriggerFilterConfig {
-    pub fn with_git_timeout(mut self, d: Duration) -> Self {
-        self.git_timeout = d;
-        self
-    }
-
     pub fn with_git_state_ttl(mut self, d: Duration) -> Self {
         self.git_state_ttl = d;
         self
@@ -113,11 +109,6 @@ impl TriggerFilterConfig {
         self.default_event = event.into();
         self
     }
-
-    pub fn with_strict_missing_context(mut self, strict: bool) -> Self {
-        self.strict_missing_context = strict;
-        self
-    }
 }
 
 #[cfg(test)]
@@ -127,25 +118,19 @@ mod tests {
     #[test]
     fn default_matches_documented_constants() {
         let cfg = TriggerFilterConfig::default();
-        assert_eq!(cfg.git_timeout, DEFAULT_GIT_COMMAND_TIMEOUT);
         assert_eq!(cfg.git_state_ttl, DEFAULT_GIT_STATE_TTL);
         assert_eq!(cfg.pattern_cache_size, DEFAULT_PATTERN_CACHE_SIZE);
         assert_eq!(cfg.default_event, DEFAULT_EVENT_NAME);
-        assert!(!cfg.strict_missing_context);
     }
 
     #[test]
     fn builder_setters_override_defaults() {
         let cfg = TriggerFilterConfig::default()
-            .with_git_timeout(Duration::from_secs(30))
             .with_git_state_ttl(Duration::from_secs(1))
             .with_pattern_cache_size(0)
-            .with_default_event("pull_request")
-            .with_strict_missing_context(true);
-        assert_eq!(cfg.git_timeout, Duration::from_secs(30));
+            .with_default_event("pull_request");
         assert_eq!(cfg.git_state_ttl, Duration::from_secs(1));
         assert_eq!(cfg.pattern_cache_size, 0);
         assert_eq!(cfg.default_event, "pull_request");
-        assert!(cfg.strict_missing_context);
     }
 }

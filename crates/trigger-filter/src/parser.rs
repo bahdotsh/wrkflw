@@ -35,7 +35,6 @@ const KNOWN_GHA_EVENTS: &[&str] = &[
     "project_column",
     "public",
     "pull_request",
-    "pull_request_comment",
     "pull_request_review",
     "pull_request_review_comment",
     "pull_request_target",
@@ -51,7 +50,8 @@ const KNOWN_GHA_EVENTS: &[&str] = &[
     "workflow_run",
 ];
 
-/// Log a warning for every event name that is not in [`KNOWN_GHA_EVENTS`].
+/// Collect a warning for every event name that is not in
+/// [`KNOWN_GHA_EVENTS`].
 ///
 /// Called from [`parse_trigger_config`] as a side channel — unknown
 /// events are NOT a hard error because GitHub Actions may add new ones
@@ -59,23 +59,27 @@ const KNOWN_GHA_EVENTS: &[&str] = &[
 /// a typo like `pul_request` would otherwise produce "no matching
 /// event" diagnostics forever, with no hint at the root cause.
 ///
-/// Returns the list of warnings produced so callers (like the TUI)
-/// can also stash them in an in-app diagnostics panel instead of
-/// relying on the global logger.
-fn warn_on_unknown_events(events: &[EventFilter], workflow_path: &std::path::Path) -> Vec<String> {
+/// This function only *collects* warnings; it does not log them. The
+/// returned list is stored on [`WorkflowTriggerConfig::warnings`] so
+/// hosts (CLI, TUI, watcher) own the rendering policy. Removing the
+/// direct `wrkflw_logging::warning` call here is the fix for the
+/// library-level logging coupling — the log sink is now a host
+/// concern, not a library side effect.
+fn collect_unknown_event_warnings(
+    events: &[EventFilter],
+    workflow_path: &std::path::Path,
+) -> Vec<String> {
     let mut warnings = Vec::new();
     for ev in events {
         if !KNOWN_GHA_EVENTS.contains(&ev.event_name.as_str()) {
-            let msg = format!(
+            warnings.push(format!(
                 "workflow {} uses unknown event '{}' — if this is a typo, the \
                  evaluator will silently report 'no matching event' for every run. \
                  GitHub Actions' documented event list: \
                  https://docs.github.com/actions/using-workflows/events-that-trigger-workflows",
                 workflow_path.display(),
                 ev.event_name
-            );
-            wrkflw_logging::warning(&msg);
-            warnings.push(msg);
+            ));
         }
     }
     warnings
@@ -92,12 +96,14 @@ pub fn parse_trigger_config(
 ) -> Result<WorkflowTriggerConfig, TriggerFilterError> {
     let events = parse_events(&workflow.on_raw)?;
     // Side-channel warning for typos / unknown events — not a parse
-    // error because GHA's event list keeps growing.
-    warn_on_unknown_events(&events, &workflow_path);
+    // error because GHA's event list keeps growing. Stashed on the
+    // returned config so hosts can render them via their own log sink.
+    let warnings = collect_unknown_event_warnings(&events, &workflow_path);
     Ok(WorkflowTriggerConfig {
         workflow_path,
         workflow_name: workflow.name.clone(),
         events,
+        warnings,
     })
 }
 
@@ -862,9 +868,48 @@ pul_request:
         let events = parse_events(&raw).unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_name, "pul_request");
-        let warnings = warn_on_unknown_events(&events, std::path::Path::new("test.yml"));
+        let warnings = collect_unknown_event_warnings(&events, std::path::Path::new("test.yml"));
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("pul_request"), "got: {}", warnings[0]);
+    }
+
+    #[test]
+    fn parse_trigger_config_surfaces_warnings_on_the_returned_config() {
+        // End-to-end: `parse_trigger_config` must route the
+        // unknown-event diagnostics through `WorkflowTriggerConfig::warnings`
+        // rather than the global logger. Hosts assert on this field
+        // to render their own diagnostics; changing it back to log
+        // directly would silently break the TUI/CLI warning surface.
+        use wrkflw_parser::workflow::WorkflowDefinition;
+        let wf = WorkflowDefinition {
+            name: "t".to_string(),
+            on: Vec::new(),
+            on_raw: make_on_raw("pul_request"),
+            jobs: std::collections::HashMap::new(),
+            defaults: None,
+        };
+        let cfg = parse_trigger_config(&wf, PathBuf::from("test.yml")).unwrap();
+        assert_eq!(cfg.warnings.len(), 1);
+        assert!(
+            cfg.warnings[0].contains("pul_request"),
+            "got: {}",
+            cfg.warnings[0]
+        );
+    }
+
+    #[test]
+    fn known_events_allowlist_does_not_contain_nonexistent_pull_request_comment() {
+        // Regression pin: `pull_request_comment` is NOT a real GitHub
+        // Actions event. Comments on PRs arrive as `issue_comment`
+        // (PRs are issues). Keeping `pull_request_comment` in the
+        // allowlist silently masks the typo-detection warning for a
+        // user who writes `on: pull_request_comment` — exactly the
+        // silent-skip mode this function is meant to prevent.
+        assert!(
+            !KNOWN_GHA_EVENTS.contains(&"pull_request_comment"),
+            "pull_request_comment is not a real GHA event; \
+             use issue_comment for PR comments"
+        );
     }
 
     #[test]

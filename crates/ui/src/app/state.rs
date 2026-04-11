@@ -389,13 +389,27 @@ impl App {
         self.diff_filter_event = next;
         // If the filter is currently active, re-run evaluation so
         // the result column reflects the new event immediately.
-        // `toggle_diff_filter` flips the flag, so call it twice to
-        // tear down the in-flight task and re-spawn against the
-        // fresh `diff_filter_event`.
-        if self.diff_filter_active {
-            self.toggle_diff_filter();
-            self.toggle_diff_filter();
+        self.rerun_diff_filter_if_active();
+    }
+
+    /// Re-run an active diff-filter evaluation against the current
+    /// event/activity fields by tearing down the in-flight task and
+    /// spawning a fresh one.
+    ///
+    /// No-op when the filter is inactive. Extracted out of
+    /// [`Self::cycle_diff_filter_event`] so the double-`toggle_diff_filter`
+    /// idiom is named for what it does instead of living as a
+    /// cryptic two-call sequence at the end of the cycle helper.
+    fn rerun_diff_filter_if_active(&mut self) {
+        if !self.diff_filter_active {
+            return;
         }
+        // `toggle_diff_filter` flips the flag: call once to turn it
+        // off (which cancels the in-flight task) and once more to
+        // turn it back on and spawn a fresh evaluation against the
+        // updated `diff_filter_event` / `diff_filter_activity_type`.
+        self.toggle_diff_filter();
+        self.toggle_diff_filter();
     }
 
     /// Toggle diff-aware trigger filtering and evaluate all workflows.

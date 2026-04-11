@@ -251,9 +251,15 @@ pub async fn get_changed_files_with_warnings(
     // transient permission glitch). Previously the failure was
     // swallowed in an `if let Ok(_) = ...` block with no trace; the
     // user saw an incomplete changed set and a `paths: ['new/**']`
-    // filter that mysteriously refused to fire. Log a warning AND
-    // return it to the caller so `EventContext::warnings` can carry
-    // it to the UI layer.
+    // filter that mysteriously refused to fire.
+    //
+    // We return the diagnostic as data rather than logging it here.
+    // Hosts (watcher / CLI / TUI) receive the warnings through
+    // `EventContext::warnings` and own the rendering policy — the
+    // library used to double-emit via `wrkflw_logging::warning` AND
+    // the return value, which coupled the crate to a global log
+    // sink and forced every test that observed warnings to assert
+    // against stdout.
     let mut warnings = Vec::new();
     match untracked_res {
         Ok(out) if out.status.success() => {
@@ -261,7 +267,7 @@ pub async fn get_changed_files_with_warnings(
         }
         Ok(out) => {
             let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-            let msg = format!(
+            warnings.push(format!(
                 "git ls-files --others failed (exit {}): {} — untracked files will \
                  be missing from the changed set, so workflows gated on `paths:` for \
                  brand-new files may be incorrectly reported as not triggering",
@@ -274,18 +280,14 @@ pub async fn get_changed_files_with_warnings(
                 } else {
                     &stderr
                 }
-            );
-            wrkflw_logging::warning(&msg);
-            warnings.push(msg);
+            ));
         }
         Err(e) => {
-            let msg = format!(
+            warnings.push(format!(
                 "git ls-files --others errored: {} — untracked files will be missing \
-                 from the changed set (see above warning for the consequences)",
+                 from the changed set",
                 e
-            );
-            wrkflw_logging::warning(&msg);
-            warnings.push(msg);
+            ));
         }
     }
 

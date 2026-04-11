@@ -59,12 +59,22 @@ pub struct EventFilter {
 /// construction is still permitted — the attribute only blocks
 /// external crates, which today only read the fields and never build
 /// this type themselves.
+///
+/// `warnings` carries non-fatal parse diagnostics (unknown event
+/// names, typo detection) that the library surfaces as data rather
+/// than via the global logger. Hosts that want to render them to the
+/// user should iterate this field after a successful
+/// [`crate::parse_trigger_config`]. Routing them through the struct
+/// instead of `wrkflw_logging::warning` keeps the library decoupled
+/// from the log sink — an embedder using a different logger (or
+/// running silently in tests) never sees spurious output.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct WorkflowTriggerConfig {
     pub workflow_path: PathBuf,
     pub workflow_name: String,
     pub events: Vec<EventFilter>,
+    pub warnings: Vec<String>,
 }
 
 /// Simulated event context for matching.

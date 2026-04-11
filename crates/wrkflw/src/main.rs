@@ -210,6 +210,18 @@ enum Commands {
         #[arg(long, default_value_t = 0)]
         max_pending_events: usize,
 
+        /// Extra directory names to ignore in addition to the built-in
+        /// list (`.git`, `target`, `node_modules`, `.build`, `build`,
+        /// `dist`, `__pycache__`, `.tox`, `.mypy_cache`, `.pytest_cache`,
+        /// `.venv`, `venv`). Matched by directory-component name, not
+        /// glob or path — a user file literally named `.terraform` is
+        /// never silenced; only events whose parent path contains a
+        /// `.terraform/` component are dropped. Pass multiple times
+        /// or as a comma-separated list: `--ignore-dir .terraform
+        /// --ignore-dir coverage` or `--ignore-dir .terraform,coverage`.
+        #[arg(long = "ignore-dir", value_delimiter = ',')]
+        ignore_dirs: Vec<String>,
+
         /// Reject degraded filter contexts (missing base branch on
         /// `pull_request`, unknown events, etc.) with a hard error
         /// instead of a log warning. Defaults to `true` so watch
@@ -731,6 +743,7 @@ async fn main() {
             base_branch,
             activity_type,
             max_pending_events,
+            ignore_dirs,
             strict_filter,
             no_strict_filter,
         }) => {
@@ -827,7 +840,8 @@ async fn main() {
                 .with_debounce(debounce_duration)
                 .with_verbose(verbose)
                 .with_max_concurrency(*max_concurrency)
-                .with_max_pending_events(*max_pending_events);
+                .with_max_pending_events(*max_pending_events)
+                .with_extra_ignore_dirs(ignore_dirs.clone());
             let watcher = wrkflw_watcher::WorkflowWatcher::from_config(watcher_cfg);
 
             // Validate workflow files exist before starting
@@ -1097,15 +1111,26 @@ async fn run_trigger_prefilter_or_exit(req: PrefilterRequest<'_>) {
         eprintln!("Error: {}", e);
         std::process::exit(1);
     }
-    apply_activity_type(&mut event_context, req.activity_type);
+    // Stamp `--activity-type` onto the context. `EventContext::activity_type`
+    // is the field GitHub Actions matches its `types:` filter against —
+    // without it, every workflow with `types: [opened, ...]` is silently
+    // rejected for "no activity type in context", which is exactly the
+    // silent-skip failure mode this PR is built to prevent.
+    if let Some(activity) = req.activity_type {
+        event_context.activity_type = Some(activity.clone());
+    }
 
     // Surface any non-fatal warnings collected while building the
     // context (e.g. `git ls-files --others` failed, so untracked
-    // files were dropped). These are already logged at warning
-    // level by the trigger-filter crate; re-emitting them here
-    // would double the noise. We leave them in `event_context.warnings`
-    // so tests can assert on them — the visibility already exists
-    // via the log path for users.
+    // files were dropped). The trigger-filter crate no longer logs
+    // these itself — it collects them as data and hands them to
+    // hosts via `EventContext::warnings`, so we own the rendering
+    // policy here and can stay consistent with the rest of the CLI's
+    // colorization. See the parser.rs note on why library logging
+    // was removed.
+    for w in &event_context.warnings {
+        wrkflw_logging::warning(w);
+    }
 
     if req.verbose {
         wrkflw_logging::info(&format!(
@@ -1145,6 +1170,13 @@ async fn run_trigger_prefilter_or_exit(req: PrefilterRequest<'_>) {
         eprintln!("Error parsing workflow: {}", e);
         std::process::exit(1);
     });
+    // Surface any parser-collected diagnostics (unknown event names,
+    // etc.) now that the trigger-filter crate no longer logs them
+    // itself. Hosts own the rendering policy — see model.rs::
+    // `WorkflowTriggerConfig::warnings` for rationale.
+    for w in &trigger_config.warnings {
+        wrkflw_logging::warning(w);
+    }
     let match_result = wrkflw_trigger_filter::evaluate_trigger(&trigger_config, &event_context);
 
     if !match_result.matches {
@@ -1275,23 +1307,6 @@ fn apply_base_branch(
         );
     }
     Ok(())
-}
-
-/// Stamp `--activity-type` onto the event context.
-///
-/// `EventContext::activity_type` is the field GitHub Actions matches its
-/// `types:` filter against. If a user simulates a `pull_request` whose
-/// workflow has `types: [opened, synchronize]` but doesn't pass
-/// `--activity-type`, every such workflow is silently rejected with
-/// "no activity type in context" — exactly the silent-skip failure mode
-/// the rest of this PR is built to prevent.
-fn apply_activity_type(
-    ctx: &mut wrkflw_trigger_filter::EventContext,
-    activity_type: Option<&String>,
-) {
-    if let Some(activity) = activity_type {
-        ctx.activity_type = Some(activity.clone());
-    }
 }
 
 /// Validate a GitHub workflow file

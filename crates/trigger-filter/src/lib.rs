@@ -8,7 +8,7 @@ pub mod ref_matcher;
 
 pub use error::TriggerFilterError;
 pub use eval::evaluate_trigger;
-pub use git::find_repo_root;
+pub use git::{find_repo_root, find_repo_root_detailed, FindRepoRootError};
 pub use model::{
     EventContext, EventFilter, GlobPattern, TriggerMatchResult, WorkflowTriggerConfig,
 };

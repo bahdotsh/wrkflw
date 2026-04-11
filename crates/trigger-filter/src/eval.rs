@@ -422,6 +422,34 @@ mod tests {
     }
 
     #[test]
+    fn manual_events_match_without_branch_tag_or_changed_files() {
+        // Regression pin: `workflow_dispatch`, `schedule`, and
+        // `repository_dispatch` have no `branches:`/`paths:`/`tags:`
+        // filters in practice, so an empty EventContext (no branch, no
+        // tag, no changed files) MUST match. A refactor that starts
+        // defaulting `branches:` to `[default_branch]` or similar would
+        // silently break this contract and the watcher would start
+        // rejecting manual triggers with no diagnostic — the exact
+        // silent-skip mode this crate is built to prevent.
+        for event in ["workflow_dispatch", "schedule", "repository_dispatch"] {
+            let config = make_config(vec![EventFilter {
+                event_name: event.into(),
+                ..Default::default()
+            }]);
+            let ctx = EventContext {
+                event_name: event.into(),
+                ..Default::default()
+            };
+            let result = evaluate_trigger(&config, &ctx);
+            assert!(
+                result.matches,
+                "{} with empty context must match (no filters configured), got skip: {}",
+                event, result.reason
+            );
+        }
+    }
+
+    #[test]
     fn branch_filter_fails_when_no_branch_in_context() {
         let config = make_config(vec![EventFilter {
             event_name: "push".into(),

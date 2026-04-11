@@ -683,19 +683,33 @@ async fn main() {
                 std::process::exit(1);
             }
 
-            // `find_repo_root` shells out to `git rev-parse` synchronously
-            // and is NOT wrapped in the trigger-filter's GIT_COMMAND_TIMEOUT,
-            // so a hung git (credential prompt, stuck network mount) would
-            // block the reactor if we called it directly. Move it onto the
-            // blocking pool to keep the tokio runtime responsive.
-            let repo_root = tokio::task::spawn_blocking(wrkflw_watcher::find_repo_root)
-                .await
-                .ok()
-                .flatten()
-                .unwrap_or_else(|| {
-                    eprintln!("Error: not inside a git repository");
-                    std::process::exit(1);
-                });
+            // `find_repo_root_detailed` shells out to `git rev-parse`
+            // synchronously and is NOT wrapped in the trigger-filter's
+            // GIT_COMMAND_TIMEOUT, so a hung git (credential prompt,
+            // stuck network mount) would block the reactor if we called
+            // it directly. Move it onto the blocking pool to keep the
+            // tokio runtime responsive.
+            //
+            // We use the `_detailed` variant so each failure mode
+            // (missing binary / timeout / not-in-repo / other) renders
+            // its own diagnostic. The legacy `Option`-returning wrapper
+            // collapsed all four into "not inside a git repository",
+            // which is actively wrong for the first three and sent
+            // users down the wrong fix path.
+            let repo_root =
+                match tokio::task::spawn_blocking(wrkflw_trigger_filter::find_repo_root_detailed)
+                    .await
+                {
+                    Ok(Ok(p)) => p,
+                    Ok(Err(e)) => {
+                        eprintln!("Error: {}", e);
+                        std::process::exit(1);
+                    }
+                    Err(join_err) => {
+                        eprintln!("Error: find_repo_root task panicked: {}", join_err);
+                        std::process::exit(1);
+                    }
+                };
 
             let debounce_duration = std::time::Duration::from_millis(*debounce);
 

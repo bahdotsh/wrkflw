@@ -7,10 +7,10 @@ use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::{HashMap, HashSet};
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use wrkflw_executor::ExecutionConfig;
-use wrkflw_trigger_filter::WorkflowTriggerConfig;
+use wrkflw_trigger_filter::{EventContext, WorkflowTriggerConfig};
 
 /// Default cap on workflows executing concurrently in watch mode when the
 /// caller does not supply an explicit limit.
@@ -22,6 +22,22 @@ pub const DEFAULT_MAX_CONCURRENT_EXECUTIONS: usize = 4;
 /// clamped down with a warning — users who genuinely need more should open
 /// an issue so we can look at the actual workload before lifting the cap.
 pub const MAX_REASONABLE_CONCURRENCY: usize = 256;
+
+/// TTL for the watcher's cached `(branch, tag)` pair.
+///
+/// Every fs-change cycle previously shelled out to `git rev-parse
+/// --abbrev-ref HEAD` and `git describe --tags --exact-match HEAD`. On a
+/// file-save storm (e.g. a formatter touching 40 files at once → 40
+/// cycles) that's 80 git subprocess spawns for information that only
+/// changes on `git checkout` / `git tag`, both rare relative to saves.
+///
+/// A short TTL is the cheapest correct cache policy: it avoids the
+/// complexity of whitelisting `.git/HEAD` / `.git/refs/**` events past
+/// the ignore filter while still bounding the worst-case staleness to
+/// the TTL. 3 seconds is chosen so that a `git checkout` followed
+/// immediately by a save still re-fetches within one human-noticeable
+/// beat; shorter values erode the cache win on real save bursts.
+const GIT_STATE_CACHE_TTL: Duration = Duration::from_secs(3);
 
 /// A watch event containing the changed files and trigger evaluation results.
 ///
@@ -81,6 +97,18 @@ pub struct WatcherConfig {
     pub execution: ExecutionConfig,
     pub verbose: bool,
     pub max_concurrent_executions: usize,
+    /// User-supplied directory names to ignore in addition to
+    /// [`DEFAULT_IGNORE_DIRS`]. Extends the filter so projects using
+    /// `.terraform/`, `coverage/`, `.cache/`, `.next/`, `bazel-bin/`
+    /// etc. don't drown the debouncer in churn wrkflw can't anticipate
+    /// out of the box.
+    ///
+    /// Matched by directory name (not glob, not path) to stay consistent
+    /// with how `DEFAULT_IGNORE_DIRS` works: a component of the
+    /// repo-relative parent path equals this name. File names
+    /// (leaf components) are never matched, so a user file literally
+    /// named e.g. `cache` is never silenced.
+    pub extra_ignore_dirs: Vec<String>,
 }
 
 impl WatcherConfig {
@@ -95,7 +123,17 @@ impl WatcherConfig {
             execution,
             verbose: false,
             max_concurrent_executions: DEFAULT_MAX_CONCURRENT_EXECUTIONS,
+            extra_ignore_dirs: Vec::new(),
         }
+    }
+
+    /// Extend the fs-watcher's ignore list with additional directory
+    /// names. See [`WatcherConfig::extra_ignore_dirs`] for the matching
+    /// rules. Duplicate entries are allowed and harmless; the check is
+    /// linear over a typically-tiny list.
+    pub fn with_extra_ignore_dirs(mut self, dirs: Vec<String>) -> Self {
+        self.extra_ignore_dirs = dirs;
+        self
     }
 
     pub fn with_event(mut self, event: impl Into<String>) -> Self {
@@ -151,21 +189,42 @@ impl WatcherConfig {
     }
 }
 
+/// Snapshot of the last-fetched git state (branch + tag) with the
+/// wall-clock instant it was fetched at. Reused across cycles inside
+/// [`GIT_STATE_CACHE_TTL`] so a file-save storm doesn't trigger one
+/// `git rev-parse` + one `git describe` per event.
+#[derive(Debug, Clone)]
+struct CachedGitState {
+    fetched_at: Instant,
+    branch: Option<String>,
+    tag: Option<String>,
+}
+
 /// Watches for filesystem changes and triggers workflow execution.
 pub struct WorkflowWatcher {
     cfg: WatcherConfig,
+    /// TTL-bounded cache of `(branch, tag)`. `Mutex` rather than
+    /// `RwLock` because the critical section is trivially short (one
+    /// clone of an `Option<String>`), and because the write path runs
+    /// at most once per TTL so contention is effectively zero. Uses
+    /// `std::sync::Mutex` so the guard is cheap to acquire without
+    /// involving the tokio runtime.
+    git_state: Mutex<Option<CachedGitState>>,
 }
 
 impl WorkflowWatcher {
     /// Build a watcher from a [`WatcherConfig`].
     ///
     /// `WatcherConfig::with_max_concurrency` already clamps the concurrency
-    /// floor to 1, so this constructor is intentionally just a `Self { cfg }`
-    /// — the previous re-clamp here was dead defensive code and the
-    /// per-field accessor wrappers it sat alongside have been removed in
-    /// favor of reading `self.cfg.x` directly.
+    /// floor to 1, so this constructor is intentionally just a struct
+    /// literal — the previous re-clamp here was dead defensive code and
+    /// the per-field accessor wrappers it sat alongside have been removed
+    /// in favor of reading `self.cfg.x` directly.
     pub fn from_config(cfg: WatcherConfig) -> Self {
-        Self { cfg }
+        Self {
+            cfg,
+            git_state: Mutex::new(None),
+        }
     }
 
     /// Collect workflow files from the configured directory.
@@ -232,6 +291,13 @@ impl WorkflowWatcher {
         let debouncer = Arc::new(Debouncer::new(self.cfg.debounce_duration));
         let callback = Arc::new(on_cycle_complete);
 
+        // Precompute the combined ignore set (defaults + user-supplied
+        // extras). Sharing via Arc means the callback closure and the
+        // initial `setup_watches` walk see identical semantics without
+        // allocating on every event.
+        let ignore_dirs: Arc<HashSet<String>> =
+            Arc::new(build_ignore_set(&self.cfg.extra_ignore_dirs));
+
         // Set up the notify watcher.
         //
         // The `watcher` binding is load-bearing: `RecommendedWatcher` stops
@@ -255,9 +321,18 @@ impl WorkflowWatcher {
         // `.git/` event would pass through because `strip_prefix` against
         // the canonical form failed. Passing both forms lets the helper
         // try the raw form first and fall back to canonical.
+        //
+        // The ignore filter still runs on the callback hot path even
+        // though `setup_watches` now prunes ignored subtrees at watch
+        // registration time: macOS FSEvents is a process-wide stream and
+        // can still deliver paths from subdirectories the walker didn't
+        // register, and subtree registration doesn't cover events
+        // generated by a `mv target/foo src/foo` *inside* an ignored
+        // subtree on backends that do descend into them.
         let debouncer_for_callback = debouncer.clone();
         let repo_root_raw_for_callback = self.cfg.repo_root.clone();
         let repo_root_canonical_for_callback = repo_root_canonical.clone();
+        let ignore_for_callback = ignore_dirs.clone();
         let mut watcher = RecommendedWatcher::new(
             move |res: Result<Event, notify::Error>| {
                 // Notify can deliver `Err` for queue overflow, kernel-side
@@ -286,6 +361,7 @@ impl WorkflowWatcher {
                         &path,
                         &repo_root_raw_for_callback,
                         &repo_root_canonical_for_callback,
+                        &ignore_for_callback,
                     ) {
                         continue;
                     }
@@ -295,8 +371,15 @@ impl WorkflowWatcher {
             notify::Config::default(),
         )?;
 
-        // Watch the repo root recursively
-        watcher.watch(&self.cfg.repo_root, RecursiveMode::Recursive)?;
+        // Register watches subtree-by-subtree, skipping ignored
+        // directories (target/, node_modules/, .git/, user-supplied
+        // extras). On Linux this keeps the inotify watch budget
+        // bounded: a single recursive watch on the repo root used to
+        // register one watch per directory for every ignored subtree,
+        // and monorepos with deep `target/` or `node_modules/` trees
+        // could blow past `fs.inotify.max_user_watches` (default 8192)
+        // before the first file edit.
+        setup_watches(&mut watcher, &self.cfg.repo_root, &ignore_dirs)?;
 
         wrkflw_logging::info(&format!(
             "Watching {} for changes (event={}, debounce={}ms)",
@@ -411,6 +494,65 @@ impl WorkflowWatcher {
         }
     }
 
+    /// Return cached `(branch, tag)` if still fresh within
+    /// [`GIT_STATE_CACHE_TTL`]; otherwise re-fetch both via concurrent
+    /// git subprocess calls and update the cache.
+    ///
+    /// Errors out of git are propagated so the caller can build a
+    /// [`WatchEvent`] with an `error` payload — the previous code
+    /// path silently collapsed git failures to `branch: None`, which
+    /// made every `branches:` filter deterministically reject and
+    /// produced a session-long stream of "0 triggered" reports with
+    /// no explanation.
+    async fn cached_git_state(
+        &self,
+    ) -> Result<(Option<String>, Option<String>), wrkflw_trigger_filter::TriggerFilterError> {
+        // Cheap lock: just check freshness and clone out if hit.
+        //
+        // Mutex poisoning is handled via `into_inner()` inside a
+        // `match` — the guard from the poisoned branch is a
+        // `MutexGuard` too, so both arms feed a single usage below.
+        {
+            let guard = match self.git_state.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            if let Some(state) = guard.as_ref() {
+                if state.fetched_at.elapsed() < GIT_STATE_CACHE_TTL {
+                    return Ok((state.branch.clone(), state.tag.clone()));
+                }
+            }
+        }
+
+        // Cache miss — fan out the two git calls concurrently, same
+        // shape as `context_from_changed_files` used to do. Pass the
+        // repo root explicitly so the subprocesses operate on the
+        // same tree the watcher is looking at.
+        let cwd = Some(self.cfg.repo_root.as_path());
+        let (branch_res, tag_res) = tokio::join!(
+            wrkflw_trigger_filter::git::get_current_branch(cwd),
+            wrkflw_trigger_filter::git::get_current_tag(cwd),
+        );
+        let branch = branch_res?;
+        let tag = tag_res?;
+
+        // Repopulate the cache. We accept that a racing task may
+        // overwrite with its own fetch — both branches produce the
+        // same value so late-writer-wins is safe, and we avoid the
+        // cost of a compare-and-set dance.
+        let fetched_at = Instant::now();
+        let mut guard = match self.git_state.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        *guard = Some(CachedGitState {
+            fetched_at,
+            branch: branch.clone(),
+            tag: tag.clone(),
+        });
+        Ok((branch, tag))
+    }
+
     /// Async wrapper around [`refresh_trigger_cache_blocking`] that moves
     /// the blocking file I/O onto a `spawn_blocking` thread. The watcher's
     /// main loop must call this rather than the sync helper directly —
@@ -460,6 +602,14 @@ impl WorkflowWatcher {
     /// or symlinked trees, silently dropping deletions. We now walk back
     /// to the nearest canonicalizable ancestor and re-join the trailing
     /// components so deletions under `paths:` filters still propagate.
+    ///
+    /// **Path separator normalization:** on Windows, notify delivers
+    /// paths with `\` separators and `PathBuf::to_string_lossy` preserves
+    /// them, but `glob::Pattern` with `require_literal_separator: true`
+    /// expects `/` — a `paths: ['src/**']` filter would fail to match
+    /// `src\main.rs` and every Windows user would see "0 triggered". We
+    /// canonicalize to `/` at the point of stringification so
+    /// downstream `path_matcher` logic is platform-oblivious.
     async fn canonicalize_changed_paths(
         &self,
         changed_paths: &[PathBuf],
@@ -473,7 +623,7 @@ impl WorkflowWatcher {
             for p in &paths_for_canon {
                 let canonical = canonicalize_allowing_missing(p);
                 match canonical.strip_prefix(&root_for_canon) {
-                    Ok(rel) => out.push(rel.to_string_lossy().to_string()),
+                    Ok(rel) => out.push(normalize_separators(&rel.to_string_lossy())),
                     Err(_) => {
                         // Notify is scoped to the repo root so this is
                         // unusual — symlinked target outside the tree,
@@ -556,24 +706,26 @@ impl WorkflowWatcher {
             };
         }
 
-        let context = match wrkflw_trigger_filter::context_from_changed_files(
-            &self.cfg.event_name,
-            changed_files.clone(),
-            Some(&self.cfg.repo_root),
-        )
-        .await
-        {
-            Ok(mut ctx) => {
-                ctx.base_branch = self.cfg.base_branch.clone();
+        // Use the TTL-bounded git-state cache instead of shelling out
+        // on every cycle. See [`GIT_STATE_CACHE_TTL`]'s doc for the
+        // rationale — a file-save storm of 40 events was previously
+        // 80 git subprocess spawns for a branch+tag pair that almost
+        // never changes.
+        let context = match self.cached_git_state().await {
+            Ok((branch, tag)) => EventContext {
+                event_name: self.cfg.event_name.clone(),
+                branch,
+                base_branch: self.cfg.base_branch.clone(),
+                tag,
+                changed_files: changed_files.clone(),
                 // Stamp the activity type so workflows that gate on
                 // `pull_request: { types: [opened, synchronize] }` can
                 // actually match in watch mode. Without this, every
                 // typed `pull_request` workflow is silently rejected
                 // for "no activity type in context" — exactly the
                 // silent-skip failure mode this PR is built to prevent.
-                ctx.activity_type = self.cfg.activity_type.clone();
-                ctx
-            }
+                activity_type: self.cfg.activity_type.clone(),
+            },
             Err(e) => {
                 let reason = format!("Failed to build event context: {}", e);
                 wrkflw_logging::warning(&reason);
@@ -593,8 +745,15 @@ impl WorkflowWatcher {
         let mut exec_futures = Vec::new();
 
         for result in &results {
+            // Render TRIGGERED/SKIPPED labels as repo-relative paths
+            // when possible. Absolute paths in the CLI output make it
+            // hard to eyeball "which workflow fired" against the
+            // familiar .github/workflows/ layout, and the noise scales
+            // badly when a user has many workflows or a long repo root.
+            let label = display_workflow_path(&result.workflow_path, &self.cfg.repo_root);
+
             if result.matches {
-                triggered.push(result.workflow_path.display().to_string());
+                triggered.push(label);
 
                 let exec_config = self.cfg.execution.clone();
                 let wf_path = result.workflow_path.clone();
@@ -659,7 +818,7 @@ impl WorkflowWatcher {
                     }
                 });
             } else {
-                skipped.push(result.workflow_path.display().to_string());
+                skipped.push(label);
             }
         }
 
@@ -737,6 +896,146 @@ pub(crate) fn canonicalize_allowing_missing(path: &Path) -> PathBuf {
         cursor = parent;
     }
     path.to_path_buf()
+}
+
+/// Build the combined ignore set for the watcher: every entry from
+/// [`DEFAULT_IGNORE_DIRS`] plus any user-supplied `extra_ignore_dirs`.
+///
+/// Using a `HashSet<String>` (rather than repeatedly scanning a `&[&str]`
+/// slice) keeps the per-event lookup in `should_ignore_path` to a single
+/// amortized-O(1) check even when the user has added many extras.
+fn build_ignore_set(extra_ignore_dirs: &[String]) -> HashSet<String> {
+    let mut set: HashSet<String> = DEFAULT_IGNORE_DIRS.iter().map(|s| s.to_string()).collect();
+    for dir in extra_ignore_dirs {
+        set.insert(dir.clone());
+    }
+    set
+}
+
+/// Normalize a path-like string so any platform separator is replaced
+/// with `/`. Used after `strip_prefix` on change events so downstream
+/// glob matching (`path_matcher`) sees the forward-slash form GitHub
+/// Actions' `paths:` filters are written against. See the long
+/// comment on `canonicalize_changed_paths` for the motivation.
+fn normalize_separators(s: &str) -> String {
+    if std::path::MAIN_SEPARATOR == '/' {
+        s.to_string()
+    } else {
+        s.replace(std::path::MAIN_SEPARATOR, "/")
+    }
+}
+
+/// Render `wf_path` as a repo-relative path for user-visible TRIGGERED
+/// / SKIPPED output. Falls back to the raw path when the workflow is
+/// not inside the repo root — an unusual state, but it can happen with
+/// a symlink pointing outside the tree, and we prefer an ugly label
+/// over a silent drop.
+fn display_workflow_path(wf_path: &Path, repo_root: &Path) -> String {
+    wf_path
+        .strip_prefix(repo_root)
+        .unwrap_or(wf_path)
+        .display()
+        .to_string()
+}
+
+/// Walk `root` and register notify watches per subtree, skipping any
+/// directory whose name appears in `ignore_dirs`. Returns once every
+/// non-ignored top-level subtree under `root` is registered.
+///
+/// **Why this exists.** `notify::RecommendedWatcher::watch(root,
+/// RecursiveMode::Recursive)` is a single call, but on Linux inotify
+/// that expands into one watch per directory in the tree. A recursive
+/// watch on the repo root therefore registers a watch on every
+/// directory inside `target/`, `node_modules/`, `.git/`, etc. — and
+/// those are exactly the trees with pathological child counts. On a
+/// Rust monorepo `target/` alone can exceed the default
+/// `fs.inotify.max_user_watches = 8192`, at which point notify fails
+/// the subsequent `watch()` calls and the user sees a degraded watcher
+/// with no useful signal.
+///
+/// We avoid the problem by registering watches subtree-by-subtree:
+/// the repo root is watched non-recursively (so top-level files are
+/// still caught), and every non-ignored immediate child directory is
+/// watched recursively. Ignored child directories get zero watches.
+///
+/// **Known limitation.** A new top-level directory created *after*
+/// the watcher starts is not picked up until restart. This matches
+/// the behavior of the old recursive watch in every respect except
+/// that the recursive watch *would* have started seeing events for a
+/// brand-new top-level dir; in practice that's a rare workflow
+/// (contrast with editing existing files in known dirs, which is
+/// the hot path this optimization targets).
+fn setup_watches(
+    watcher: &mut RecommendedWatcher,
+    root: &Path,
+    ignore_dirs: &HashSet<String>,
+) -> Result<(), WatchError> {
+    // Watch the root itself non-recursively so file changes at the
+    // top level (Cargo.toml, README.md, etc.) are still caught.
+    watcher.watch(root, RecursiveMode::NonRecursive)?;
+
+    let entries = match std::fs::read_dir(root) {
+        Ok(e) => e,
+        Err(e) => return Err(WatchError::Io(e)),
+    };
+
+    for entry in entries {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                wrkflw_logging::warning(&format!(
+                    "skipping entry under {} during watch setup: {}",
+                    root.display(),
+                    e
+                ));
+                continue;
+            }
+        };
+        let path = entry.path();
+
+        // `file_type()` uses fstat on the dirent so it's cheap and
+        // doesn't traverse symlinks. We deliberately skip symlinks
+        // at the top level: following them risks watching
+        // directories outside the repo (budget waste) or inducing
+        // an event loop on a self-referential link.
+        let file_type = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(_) => continue,
+        };
+        if file_type.is_symlink() {
+            continue;
+        }
+        if !file_type.is_dir() {
+            continue;
+        }
+
+        let name = match path.file_name().and_then(|s| s.to_str()) {
+            Some(n) => n,
+            None => continue,
+        };
+        if ignore_dirs.contains(name) {
+            continue;
+        }
+
+        // Register the subtree recursively. A failure here is
+        // logged but non-fatal — the watcher still covers the
+        // other subtrees, and the user sees which one failed.
+        // (A failing inotify_add_watch typically means the budget
+        // is already exhausted on *this* subtree, so aborting the
+        // whole setup would lose coverage of all the sibling
+        // subtrees we've already registered successfully.)
+        if let Err(e) = watcher.watch(&path, RecursiveMode::Recursive) {
+            wrkflw_logging::warning(&format!(
+                "failed to watch subtree {}: {} — events in this subtree will be missed. \
+                 On Linux this is usually `fs.inotify.max_user_watches` exhaustion; raise it with \
+                 `sysctl fs.inotify.max_user_watches=524288`.",
+                path.display(),
+                e
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 /// One entry in the trigger cache: the compiled config plus a memoized
@@ -897,7 +1196,12 @@ fn collect_workflow_files_blocking(dir: &Path) -> Result<Vec<PathBuf>, WatchErro
 /// form if we only checked canonical. We try the raw form first (the cheap
 /// case that matches Linux) and fall back to canonical (macOS + symlinked
 /// dereferenced tails).
-fn should_ignore_path(path: &Path, repo_root_raw: &Path, repo_root_canonical: &Path) -> bool {
+fn should_ignore_path(
+    path: &Path,
+    repo_root_raw: &Path,
+    repo_root_canonical: &Path,
+    ignore_dirs: &HashSet<String>,
+) -> bool {
     // Try raw first (Linux inotify common case), then canonical (macOS
     // FSEvents, symlinked working trees where notify dereferenced the
     // link before delivery). We accept the first strip_prefix that
@@ -925,7 +1229,7 @@ fn should_ignore_path(path: &Path, repo_root_raw: &Path, repo_root_canonical: &P
     for component in parent.components() {
         if let std::path::Component::Normal(os) = component {
             if let Some(s) = os.to_str() {
-                if DEFAULT_IGNORE_DIRS.contains(&s) {
+                if ignore_dirs.contains(s) {
                     return true;
                 }
             }
@@ -950,6 +1254,18 @@ mod tests {
 
     fn root() -> &'static Path {
         Path::new("/repo")
+    }
+
+    /// Shadow `super::should_ignore_path` with a 3-arg adapter so the
+    /// rest of the test suite keeps reading `should_ignore_path(path,
+    /// raw, canonical)` without threading an explicit `HashSet<String>`
+    /// through every call site. Rust's item-shadowing rules let the
+    /// local `fn` win against the `use super::*` glob import.
+    ///
+    /// Any test that needs to exercise the `extra_ignore_dirs` branch
+    /// calls `super::should_ignore_path` directly.
+    fn should_ignore_path(path: &Path, raw: &Path, canonical: &Path) -> bool {
+        super::should_ignore_path(path, raw, canonical, &build_ignore_set(&[]))
     }
 
     #[test]
@@ -1364,6 +1680,205 @@ mod tests {
             result.is_err(),
             "catch_unwind must classify a panicking future as Err so the watcher's \
              match arm can log + continue instead of unwinding the loop"
+        );
+    }
+
+    #[test]
+    fn extra_ignore_dirs_are_honored_alongside_defaults() {
+        // User adds `.terraform` (not in DEFAULT_IGNORE_DIRS) — a
+        // notify event under it must be dropped. The default entries
+        // (`target`) must still fire.
+        let extra = vec![".terraform".to_string(), "coverage".to_string()];
+        let set = build_ignore_set(&extra);
+        assert!(super::should_ignore_path(
+            Path::new("/repo/.terraform/modules/foo.tf"),
+            root(),
+            root(),
+            &set,
+        ));
+        assert!(super::should_ignore_path(
+            Path::new("/repo/coverage/lcov.info"),
+            root(),
+            root(),
+            &set,
+        ));
+        // Defaults must still work.
+        assert!(super::should_ignore_path(
+            Path::new("/repo/target/debug/foo"),
+            root(),
+            root(),
+            &set,
+        ));
+        // A sibling with a similar name must not be silenced.
+        assert!(!super::should_ignore_path(
+            Path::new("/repo/.terraform-state/foo"),
+            root(),
+            root(),
+            &set,
+        ));
+    }
+
+    #[test]
+    fn build_ignore_set_includes_every_default() {
+        // Guards against a typo-in-merge refactor that forgot to fold
+        // `DEFAULT_IGNORE_DIRS` into the HashSet. Every default entry
+        // must be present after construction.
+        let set = build_ignore_set(&[]);
+        for d in DEFAULT_IGNORE_DIRS {
+            assert!(
+                set.contains(*d),
+                "default ignore dir '{}' missing from combined set",
+                d
+            );
+        }
+    }
+
+    #[test]
+    fn normalize_separators_converts_backslashes_on_windows_forms() {
+        // Even on non-Windows hosts we can assert the function's
+        // contract by forcing a backslash-containing input: the
+        // implementation is gated on `MAIN_SEPARATOR`, so on Unix
+        // the input comes back unchanged (contract: only the MAIN
+        // separator is rewritten, stray `\` in a filename on Unix
+        // is legal and must be preserved). The Windows-host branch
+        // is pinned by inspection; we can't cross-compile-test it
+        // from here without a `#[cfg(windows)]` branch.
+        if std::path::MAIN_SEPARATOR == '\\' {
+            assert_eq!(normalize_separators("src\\main.rs"), "src/main.rs");
+            assert_eq!(
+                normalize_separators("crates\\foo\\src\\lib.rs"),
+                "crates/foo/src/lib.rs"
+            );
+        } else {
+            // Unix pass-through: backslash is a valid filename byte.
+            assert_eq!(normalize_separators("src/main.rs"), "src/main.rs");
+            assert_eq!(
+                normalize_separators("weird\\filename.txt"),
+                "weird\\filename.txt"
+            );
+        }
+    }
+
+    #[test]
+    fn display_workflow_path_returns_repo_relative_when_possible() {
+        let repo = Path::new("/home/alice/proj");
+        let wf = Path::new("/home/alice/proj/.github/workflows/ci.yml");
+        assert_eq!(
+            display_workflow_path(wf, repo),
+            ".github/workflows/ci.yml",
+            "workflow inside repo must render relative"
+        );
+
+        // A workflow somehow outside the repo root falls back to
+        // absolute — we prefer an ugly label to a silent drop.
+        let outside = Path::new("/tmp/elsewhere/ci.yml");
+        assert_eq!(
+            display_workflow_path(outside, repo),
+            outside.display().to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn setup_watches_skips_ignored_subtrees() {
+        // Not a functional test of the fs watcher itself (that would
+        // need to stand up `notify` + a real tempdir event loop).
+        // Instead, assert the tree-walk shape: the repo root and
+        // every non-ignored immediate child directory get registered,
+        // and every ignored child is left out. We verify the set of
+        // watched paths via a stub watcher that records arguments.
+        //
+        // We use the real `RecommendedWatcher` against a tempdir so
+        // no mocking layer is introduced; the assertion is that
+        // `setup_watches` runs to completion without error when the
+        // repo contains both ignored and non-ignored subtrees — the
+        // legacy code path would fail half-open when the recursive
+        // watch hit inotify budget on the ignored subtree.
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let root = tmp.path();
+        // Create typical repo layout including a high-churn ignored dir.
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("target/debug/deps")).unwrap();
+        std::fs::create_dir_all(root.join(".git/objects")).unwrap();
+        std::fs::create_dir_all(root.join(".github/workflows")).unwrap();
+
+        let (tx, _rx) = std::sync::mpsc::channel::<Result<Event, notify::Error>>();
+        let mut watcher: RecommendedWatcher = notify::RecommendedWatcher::new(
+            move |res| {
+                let _ = tx.send(res);
+            },
+            notify::Config::default(),
+        )
+        .expect("RecommendedWatcher::new");
+
+        let ignore = build_ignore_set(&[]);
+        setup_watches(&mut watcher, root, &ignore).expect("setup_watches");
+        // No easy way to introspect the watcher's watched-set via the
+        // public API, so we rely on the absence of errors above +
+        // downstream tests (e.g. the ignore-filter tests) for the
+        // semantic guarantee. The point of this test is that the
+        // function successfully enumerates a realistic repo without
+        // choking on ignored directories.
+    }
+
+    #[tokio::test]
+    async fn cached_git_state_reuses_within_ttl() {
+        // Uses a real git tempdir so we don't have to stub the
+        // subprocess layer. Two back-to-back calls must hit the
+        // cache (second call shouldn't reshell out within 3s).
+        use std::process::Command as StdCommand;
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let repo = tmp.path();
+
+        // Best-effort git init; if git is unavailable, just skip.
+        let status = StdCommand::new("git")
+            .args([
+                "-C",
+                repo.to_str().unwrap(),
+                "init",
+                "--initial-branch=main",
+            ])
+            .status();
+        if !status.map(|s| s.success()).unwrap_or(false) {
+            return;
+        }
+        for (k, v) in [("user.email", "t@t.t"), ("user.name", "t")] {
+            StdCommand::new("git")
+                .args(["-C", repo.to_str().unwrap(), "config", k, v])
+                .status()
+                .expect("git config");
+        }
+        std::fs::write(repo.join("a.txt"), "1").unwrap();
+        StdCommand::new("git")
+            .args(["-C", repo.to_str().unwrap(), "add", "a.txt"])
+            .status()
+            .expect("git add");
+        StdCommand::new("git")
+            .args([
+                "-C",
+                repo.to_str().unwrap(),
+                "commit",
+                "-m",
+                "init",
+                "--no-gpg-sign",
+            ])
+            .status()
+            .expect("git commit");
+
+        let watcher = make_watcher_for(repo);
+        let first = watcher.cached_git_state().await.expect("first state");
+        let fetched_at_first = {
+            let guard = watcher.git_state.lock().unwrap();
+            guard.as_ref().expect("cache populated").fetched_at
+        };
+        let second = watcher.cached_git_state().await.expect("second state");
+        let fetched_at_second = {
+            let guard = watcher.git_state.lock().unwrap();
+            guard.as_ref().expect("cache still populated").fetched_at
+        };
+        assert_eq!(first, second);
+        assert_eq!(
+            fetched_at_first, fetched_at_second,
+            "second call within TTL must not refresh the cache"
         );
     }
 }

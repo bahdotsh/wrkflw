@@ -167,6 +167,17 @@ fn merge_unique(mut into: Vec<String>, more: Vec<String>) -> Vec<String> {
 /// in the index AND restored in the working tree is invisible — same
 /// shape as the modified-then-reverted case above.
 ///
+/// **Rename handling:** without `-M`/`--find-renames`, `--name-only`
+/// reports a rename as a deletion of the old path plus an addition of
+/// the new path, so both entries appear in the changed set. This
+/// matches GitHub Actions' behavior on a PR or push diff, where
+/// renames are also represented as a delete plus an add in the event
+/// payload — `paths:` filters on either the old or the new location
+/// correctly fire. Side effect: a `paths-ignore: ['docs/**']` filter
+/// will NOT silence a rename from `docs/foo.md` to `src/foo.md`,
+/// because `src/foo.md` is still in the changed set after the docs
+/// entry is filtered out. This mirrors the hosted runner's semantics.
+///
 /// `cwd` selects the git working directory; pass `None` to use the
 /// process CWD. The watcher should always pass its repo root.
 pub async fn get_changed_files(
@@ -360,28 +371,72 @@ pub async fn get_default_diff_base(cwd: Option<&Path>) -> Result<String, Trigger
 /// delays the very first user interaction.
 const FIND_REPO_ROOT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Classified failure from [`find_repo_root_detailed`].
+///
+/// Separating the failure modes lets the CLI (and anything else that
+/// surfaces the error to a human) produce a specific diagnostic instead
+/// of the generic `"not inside a git repository"` message the old
+/// `Option`-returning API forced everyone into. That message was a
+/// misdiagnosis for three of the four failure branches: missing
+/// binary, hung subprocess, and I/O error on `stdout` all rendered as
+/// "not a git repo", leading users to run `git init` at the wrong level
+/// and then wonder why the error persisted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FindRepoRootError {
+    /// `git` could not be spawned at all — typically "command not found"
+    /// or permission denied on the PATH entry.
+    GitNotInstalled(String),
+    /// The subprocess ran for longer than [`FIND_REPO_ROOT_TIMEOUT`].
+    /// Usually a hung credential helper, a stuck network mount, or a
+    /// corrupted `.git/` directory.
+    Timeout,
+    /// `git rev-parse` exited non-zero — the process is not inside any
+    /// git working tree.
+    NotInRepository,
+    /// Catch-all for wait/read failures that don't fit the classifications
+    /// above (e.g. the child process crashed, stdout pipe broke).
+    Other(String),
+}
+
+impl std::fmt::Display for FindRepoRootError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::GitNotInstalled(e) => write!(
+                f,
+                "`git` could not be executed: {}. Install git and ensure it is on PATH.",
+                e
+            ),
+            Self::Timeout => write!(
+                f,
+                "`git rev-parse --show-toplevel` timed out after {}s. \
+                 This usually means a hung credential prompt, a stuck network \
+                 filesystem, or a corrupted .git/ directory — investigate with \
+                 `GIT_TRACE=1 git rev-parse --show-toplevel`.",
+                FIND_REPO_ROOT_TIMEOUT.as_secs()
+            ),
+            Self::NotInRepository => {
+                write!(f, "not inside a git repository (run `git init` first)")
+            }
+            Self::Other(e) => write!(f, "git subprocess failed: {}", e),
+        }
+    }
+}
+
+impl std::error::Error for FindRepoRootError {}
+
 /// Find the git repository root from the current working directory by
-/// shelling out to `git rev-parse --show-toplevel`.
+/// shelling out to `git rev-parse --show-toplevel`. Returns a classified
+/// error on failure so callers can render the diagnostic the user needs.
 ///
-/// Returns `None` if `git` is unavailable, the call fails, the process is
-/// not inside a git working tree, or the call exceeds
-/// [`FIND_REPO_ROOT_TIMEOUT`]. The timeout matters: previously this used
-/// `Command::output()` with no bound, so a hung git (credential prompt,
-/// stuck network mount, corrupted `.git`) would wedge the caller's
-/// blocking-pool thread forever. Callers wrap us in `spawn_blocking` so
-/// the reactor stays responsive, but without a kill-timer the blocking
-/// thread leaks for the rest of the process's lifetime.
-///
-/// Synchronous on purpose: callers tend to invoke this once at startup,
-/// and the dependency on tokio for a single subprocess call would force
-/// every consumer (including the synchronous TUI bootstrap) to create a
-/// runtime just to discover a path. `std::process` plus a hand-rolled
-/// `try_wait` poll loop gives us the timeout without pulling in tokio.
+/// Same synchronous + timeout-protected mechanics as [`find_repo_root`]
+/// below — this is the implementation, and `find_repo_root` is a thin
+/// `Option` adapter for legacy call sites that don't distinguish failure
+/// modes.
 ///
 /// `stdin(Stdio::null())` + `GIT_TERMINAL_PROMPT=0` mirror `git_cmd` above —
 /// see its rationale for why the parent's TTY must never leak into a git
 /// subprocess.
-pub fn find_repo_root() -> Option<std::path::PathBuf> {
+pub fn find_repo_root_detailed() -> Result<std::path::PathBuf, FindRepoRootError> {
     use std::io::Read;
     use std::process::{Command as StdCommand, Stdio};
     use std::time::Instant;
@@ -390,10 +445,10 @@ pub fn find_repo_root() -> Option<std::path::PathBuf> {
         .args(["rev-parse", "--show-toplevel"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .env("GIT_TERMINAL_PROMPT", "0")
         .spawn()
-        .ok()?;
+        .map_err(|e| FindRepoRootError::GitNotInstalled(e.to_string()))?;
 
     let deadline = Instant::now() + FIND_REPO_ROOT_TIMEOUT;
     let exit_status = loop {
@@ -402,38 +457,53 @@ pub fn find_repo_root() -> Option<std::path::PathBuf> {
             Ok(None) => {
                 if Instant::now() >= deadline {
                     // Kill + reap the child so we don't leave a zombie.
-                    // We intentionally ignore errors on `kill`/`wait`:
-                    // there's nothing useful we can do, and the caller
-                    // is already in the "`None` means give up" branch.
+                    // Errors on kill/wait are intentionally swallowed —
+                    // we're already in the failure branch and there's
+                    // nothing more useful we can do.
                     let _ = child.kill();
                     let _ = child.wait();
-                    return None;
+                    return Err(FindRepoRootError::Timeout);
                 }
                 std::thread::sleep(Duration::from_millis(25));
             }
-            Err(_) => {
+            Err(e) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return None;
+                return Err(FindRepoRootError::Other(format!("wait failed: {}", e)));
             }
         }
     };
 
     if !exit_status.success() {
-        return None;
+        return Err(FindRepoRootError::NotInRepository);
     }
 
     // Child has exited; drain stdout. `wait_with_output` is not
     // available here because we've already waited — read from the
     // piped handle directly instead.
     let mut buf = String::new();
-    child.stdout.take()?.read_to_string(&mut buf).ok()?;
+    child
+        .stdout
+        .take()
+        .ok_or_else(|| FindRepoRootError::Other("stdout pipe closed".to_string()))?
+        .read_to_string(&mut buf)
+        .map_err(|e| FindRepoRootError::Other(format!("read stdout: {}", e)))?;
     let path = buf.trim().to_string();
     if path.is_empty() {
-        None
+        Err(FindRepoRootError::NotInRepository)
     } else {
-        Some(std::path::PathBuf::from(path))
+        Ok(std::path::PathBuf::from(path))
     }
+}
+
+/// `Option`-returning adapter around [`find_repo_root_detailed`] for
+/// callers that don't distinguish failure modes.
+///
+/// New call sites should prefer `find_repo_root_detailed` so the user
+/// gets a specific error; this wrapper exists so the TUI's existing
+/// `.ok().flatten()` chain doesn't have to be reshaped.
+pub fn find_repo_root() -> Option<std::path::PathBuf> {
+    find_repo_root_detailed().ok()
 }
 
 /// Get the current tag if HEAD is tagged, or None.

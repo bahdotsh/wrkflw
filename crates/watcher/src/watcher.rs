@@ -874,6 +874,14 @@ impl WorkflowWatcher {
                 base_branch: self.cfg.base_branch.clone(),
                 tag,
                 changed_files: changed_files.clone(),
+                // We observed the change set via notify events — even
+                // an empty list (e.g. all events were filtered out as
+                // irrelevant) is authoritative for this cycle, not a
+                // "user forgot to pass --diff" situation. The
+                // diagnostic layer uses this to avoid telling watch-
+                // mode users to pass a CLI flag that does not exist
+                // in their context.
+                changed_files_explicit: true,
                 // Stamp the activity type so workflows that gate on
                 // `pull_request: { types: [opened, synchronize] }` can
                 // actually match in watch mode. Without this, every
@@ -981,9 +989,18 @@ impl WorkflowWatcher {
             }
         }
 
-        // Execute triggered workflows with bounded concurrency. Each future
-        // wraps a `tokio::spawn`, so a panicking workflow surfaces as a
-        // logged error inside the future rather than propagating out.
+        // Execute triggered workflows with bounded concurrency. The
+        // futures above are polled in place by `buffer_unordered` —
+        // they are NOT wrapped in `tokio::spawn`. This is
+        // load-bearing: spawning would detach them from the stream
+        // and let the executor start an unbounded number of
+        // workflows (each of which carries container / tempdir /
+        // child-process state), defeating `max_concurrent_executions`.
+        // Panics inside a workflow are contained by the
+        // `AssertUnwindSafe + catch_unwind` wrapper around the
+        // executor call, so a crashing workflow is logged and the
+        // watch loop continues — without us ever needing `spawn` for
+        // panic isolation.
         stream::iter(exec_futures)
             .buffer_unordered(self.cfg.max_concurrent_executions)
             .collect::<Vec<()>>()

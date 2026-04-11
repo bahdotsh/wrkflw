@@ -132,6 +132,19 @@ fn parse_events(on_raw: &serde_yaml::Value) -> Result<Vec<EventFilter>, TriggerF
                     ..Default::default()
                 });
             }
+            // Empty sequence form (`on: []`) is not valid GitHub Actions
+            // syntax — GHA rejects it at upload time. Reject it here too
+            // so the failure surfaces at parse time with the file path,
+            // instead of surviving into evaluation as a silent
+            // "Workflow does not listen to any events" — the exact
+            // silent-skip class this crate exists to prevent.
+            if filters.is_empty() {
+                return Err(TriggerFilterError::ParseError(
+                    "'on' sequence is empty; must list at least one event \
+                     (e.g. 'on: [push]')"
+                        .to_string(),
+                ));
+            }
             Ok(filters)
         }
 
@@ -148,6 +161,19 @@ fn parse_events(on_raw: &serde_yaml::Value) -> Result<Vec<EventFilter>, TriggerF
 
                 let filter = parse_event_config(&event_name, value)?;
                 filters.push(filter);
+            }
+            // Empty mapping form (`on: {}`) is not valid GitHub Actions
+            // syntax. Same rationale as the empty-sequence branch above:
+            // the runtime diagnostic "Workflow does not listen to any
+            // events" is too late and too generic. Fail the parse with a
+            // pointer at the offending workflow so the user learns at
+            // load time.
+            if filters.is_empty() {
+                return Err(TriggerFilterError::ParseError(
+                    "'on' mapping is empty; must specify at least one event \
+                     (e.g. 'on: { push: null }' or 'on: push')"
+                        .to_string(),
+                ));
             }
             Ok(filters)
         }
@@ -854,5 +880,31 @@ push:
         );
         let events = parse_events(&raw).unwrap();
         assert!(events[0].branches.is_empty());
+    }
+
+    #[test]
+    fn empty_on_mapping_is_rejected() {
+        // Regression: `on: {}` used to produce a trigger config with an
+        // empty events list, which the evaluator then surfaced as
+        // "Workflow does not listen to any events" at runtime. GitHub
+        // Actions rejects the empty mapping at upload time — we must
+        // match that behaviour at parse time so the diagnostic carries
+        // the workflow path and blocks the cache from serving a
+        // silently-unfireable config.
+        let raw: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
+        let err = parse_events(&raw).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("'on' mapping is empty"), "got: {}", msg);
+    }
+
+    #[test]
+    fn empty_on_sequence_is_rejected() {
+        // Same rationale as the empty-mapping case above: `on: []` is
+        // invalid GHA and must error at parse time instead of silently
+        // surviving into evaluation as "no events listened for".
+        let raw: serde_yaml::Value = serde_yaml::from_str("[]").unwrap();
+        let err = parse_events(&raw).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("'on' sequence is empty"), "got: {}", msg);
     }
 }

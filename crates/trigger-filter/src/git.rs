@@ -124,11 +124,27 @@ async fn run_git(
 // Helpers operating on raw command output
 // ---------------------------------------------------------------------------
 
-fn parse_lines(output: &[u8]) -> Vec<String> {
-    String::from_utf8_lossy(output)
-        .lines()
-        .map(|l| l.trim().to_string())
-        .filter(|l| !l.is_empty())
+/// Parse NUL-terminated output from `git ... -z`.
+///
+/// `git diff --name-only -z` and `git ls-files --others -z` emit each
+/// path as a NUL-terminated record (optionally with a trailing NUL on
+/// the last record). We deliberately do NOT use a newline-splitting
+/// parser here — paths containing newlines would otherwise be silently
+/// split into two entries, and git's default output *without* `-z`
+/// additionally octal-escapes non-ASCII bytes, which would fail to
+/// match any `paths:` glob written against the repo's true on-disk
+/// form. Previously a `parse_lines` helper did exactly that and lost
+/// both classes of path.
+///
+/// Each record is still lossily converted to a `String` at the end
+/// because the rest of the crate operates on `String` glob arguments.
+/// The difference matters for correctness of record SPLITTING, not
+/// for the Unicode content inside a record.
+fn parse_nul_separated(output: &[u8]) -> Vec<String> {
+    output
+        .split(|b| *b == 0)
+        .filter(|bytes| !bytes.is_empty())
+        .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
         .collect()
 }
 
@@ -209,10 +225,18 @@ pub async fn get_changed_files_with_warnings(
 ) -> Result<(Vec<String>, Vec<String>), TriggerFilterError> {
     validate_ref_name(base)?;
 
+    // `-z` makes both commands emit NUL-terminated records, which is
+    // mandatory for correct splitting of paths that contain newlines,
+    // and also suppresses git's default octal-escaping of non-ASCII
+    // bytes (equivalent to `core.quotepath=false`). Without `-z`, a
+    // file like `some\nfile.rs` splits into two bogus entries and a
+    // Unicode filename round-trips through `\302\244`-style escapes
+    // that no `paths:` glob can match. Pair with `parse_nul_separated`
+    // below — never `parse_lines` on `-z` output.
     let mut diff_cmd = git_cmd(cwd);
-    diff_cmd.args(["diff", "--name-only", base]);
+    diff_cmd.args(["diff", "--name-only", "-z", base]);
     let mut untracked_cmd = git_cmd(cwd);
-    untracked_cmd.args(["ls-files", "--others", "--exclude-standard"]);
+    untracked_cmd.args(["ls-files", "--others", "--exclude-standard", "-z"]);
 
     let (diff_res, untracked_res) = tokio::join!(
         run_git(diff_cmd, "git diff"),
@@ -220,7 +244,7 @@ pub async fn get_changed_files_with_warnings(
     );
 
     let diff_output = check_status(diff_res?, "git diff")?;
-    let mut files = parse_lines(&diff_output.stdout);
+    let mut files = parse_nul_separated(&diff_output.stdout);
 
     // Untracked files are a best-effort enrichment — don't fail the
     // whole call if `ls-files` errors (e.g. a safe-directory rejection,
@@ -233,7 +257,7 @@ pub async fn get_changed_files_with_warnings(
     let mut warnings = Vec::new();
     match untracked_res {
         Ok(out) if out.status.success() => {
-            files = merge_unique(files, parse_lines(&out.stdout));
+            files = merge_unique(files, parse_nul_separated(&out.stdout));
         }
         Ok(out) => {
             let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
@@ -294,9 +318,11 @@ pub async fn get_changed_files_between(
 
     let range = format!("{}..{}", base_ref, head_ref);
     let mut cmd = git_cmd(cwd);
-    cmd.args(["diff", "--name-only", &range]);
+    // `-z`: NUL-terminate records. See `get_changed_files_with_warnings`
+    // for the full rationale — same issue applies to this two-ref form.
+    cmd.args(["diff", "--name-only", "-z", &range]);
     let output = check_status(run_git(cmd, "git diff").await?, "git diff")?;
-    Ok(parse_lines(&output.stdout))
+    Ok(parse_nul_separated(&output.stdout))
 }
 
 /// Get the current branch name, or `None` if HEAD is detached.
@@ -579,24 +605,57 @@ pub fn find_repo_root_detailed() -> Result<std::path::PathBuf, FindRepoRootError
 /// where a stale cache is re-served forever because every call
 /// observed `None`.
 pub fn head_mtime(cwd: Option<&Path>) -> Option<std::time::SystemTime> {
-    // We have to resolve `.git/HEAD` ourselves because linked
-    // worktrees put HEAD under `.git/worktrees/<name>/HEAD` and the
-    // top-level `.git` is a plain file containing `gitdir: ...`. The
-    // cheap path (`<cwd>/.git/HEAD`) handles the 99% case; the slow
-    // path falls back to `git rev-parse --git-path HEAD` when the
-    // quick guess fails. Keep this synchronous: the watcher calls it
-    // from a tight loop and cannot afford to fan out to
+    // Resolve the real HEAD file location before stat-ing it. Layout
+    // cases we have to handle:
+    //
+    //   1. Plain repo: `<cwd>/.git` is a directory and HEAD lives at
+    //      `<cwd>/.git/HEAD`. Cheap metadata read, 99% case.
+    //   2. Linked worktree: `<cwd>/.git` is a regular FILE whose
+    //      contents are `gitdir: /abs/path/to/.git/worktrees/<name>`.
+    //      The real HEAD lives at that `gitdir` + `/HEAD`. Stat-ing
+    //      `<cwd>/.git/HEAD` would return `NotFound` and the watcher
+    //      would serve its cached `(branch, tag)` forever on any
+    //      worktree-based workflow.
+    //   3. Submodule / custom gitdir: same shape as (2) but gitdir
+    //      may be a relative path, which we resolve relative to the
+    //      `.git` file's parent.
+    //
+    // Keep this synchronous: the watcher calls it from a tight
+    // cache-check loop and cannot afford to fan out to
     // `spawn_blocking` every cycle.
     let base = cwd.map(Path::to_path_buf).unwrap_or_else(|| {
         std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
     });
-    let direct = base.join(".git").join("HEAD");
-    if let Ok(meta) = std::fs::metadata(&direct) {
-        if let Ok(mtime) = meta.modified() {
-            return Some(mtime);
+    let dotgit = base.join(".git");
+
+    // Resolve the effective gitdir. When `.git` is a directory, the
+    // gitdir IS `.git`; when it's a file, parse the `gitdir: ...`
+    // pointer and resolve it (relative paths are resolved against the
+    // parent of the `.git` file, matching git's own rules).
+    let gitdir = match std::fs::metadata(&dotgit) {
+        Ok(meta) if meta.is_dir() => dotgit.clone(),
+        Ok(meta) if meta.is_file() => {
+            let contents = std::fs::read_to_string(&dotgit).ok()?;
+            let target = contents
+                .lines()
+                .find_map(|l| l.strip_prefix("gitdir:"))
+                .map(str::trim)?;
+            let target_path = std::path::Path::new(target);
+            if target_path.is_absolute() {
+                target_path.to_path_buf()
+            } else {
+                // Resolve against the parent of the `.git` file — the
+                // same anchor git itself uses for relative gitdir
+                // pointers.
+                base.join(target_path)
+            }
         }
-    }
-    None
+        _ => return None,
+    };
+
+    let head_path = gitdir.join("HEAD");
+    let meta = std::fs::metadata(&head_path).ok()?;
+    meta.modified().ok()
 }
 
 /// Get the current tag if HEAD is tagged, or None.
@@ -895,5 +954,156 @@ mod tests {
         assert!(validate_ref_name("origin/main@{upstream}").is_ok());
         assert!(validate_ref_name("@").is_ok());
         assert!(validate_ref_name("@~1").is_ok());
+    }
+
+    #[test]
+    fn parse_nul_separated_splits_on_nul_and_preserves_newlines() {
+        // Regression pin: `git diff --name-only -z` emits records
+        // separated by NUL bytes precisely because path names can
+        // legitimately contain newlines. The old newline-splitting
+        // parser would turn `foo\nbar.txt` into two fake entries and
+        // silently lose the real file from the changed set.
+        let raw: Vec<u8> = b"a.txt\0foo\nbar.txt\0c.txt\0".to_vec();
+        let parsed = parse_nul_separated(&raw);
+        assert_eq!(
+            parsed,
+            vec![
+                "a.txt".to_string(),
+                "foo\nbar.txt".to_string(),
+                "c.txt".to_string()
+            ],
+            "NUL splitter must preserve newlines inside a record"
+        );
+    }
+
+    #[test]
+    fn parse_nul_separated_drops_empty_trailing_record() {
+        // `git diff -z` usually (but not always) emits a trailing NUL
+        // after the last record. The parser must not treat that
+        // trailing NUL as an empty filename — otherwise `.contains`
+        // or set membership against a path of `""` produces silent
+        // false negatives.
+        let raw = b"a.txt\0b.txt\0".to_vec();
+        assert_eq!(
+            parse_nul_separated(&raw),
+            vec!["a.txt".to_string(), "b.txt".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_nul_separated_handles_empty_output() {
+        assert!(parse_nul_separated(&[]).is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_changed_files_handles_filename_with_newline() {
+        // End-to-end coverage for the `-z` switch: create a real file
+        // whose name contains a newline, commit to a baseline, modify
+        // it, and assert the changed set contains the file as a
+        // single entry. Without `-z`, this test would either fail to
+        // locate the file at all (newline splits the record) or see
+        // two bogus half-entries.
+        if !git_available() {
+            return;
+        }
+        // Skip on Windows where `\n` is not a legal filename byte —
+        // the feature is Unix-only anyway.
+        if cfg!(windows) {
+            return;
+        }
+        let tmp = TempDir::new().expect("tempdir");
+        let repo: PathBuf = tmp.path().to_path_buf();
+        init_repo(&repo);
+        // Commit a placeholder so HEAD exists.
+        commit_file(&repo, "seed.txt", "seed");
+
+        let weird_name = "weird\nfile.txt";
+        std::fs::write(repo.join(weird_name), "a").expect("write");
+        StdCommand::new("git")
+            .args(["-C", repo.to_str().unwrap(), "add", "--", weird_name])
+            .status()
+            .expect("git add");
+        StdCommand::new("git")
+            .args([
+                "-C",
+                repo.to_str().unwrap(),
+                "commit",
+                "-m",
+                "add weird",
+                "--no-gpg-sign",
+            ])
+            .status()
+            .expect("git commit");
+
+        // Modify the tracked weird-named file; diff vs HEAD~1 must
+        // report it as exactly one changed entry.
+        std::fs::write(repo.join(weird_name), "b").expect("write");
+
+        let files = get_changed_files("HEAD~1", Some(&repo))
+            .await
+            .expect("get_changed_files");
+        assert!(
+            files.iter().any(|f| f == weird_name),
+            "file with newline in name must appear as a single entry, got {:?}",
+            files
+        );
+        // And it must NOT appear split into the two pseudo-entries
+        // the old newline-splitting parser would have produced.
+        assert!(
+            !files.iter().any(|f| f == "weird"),
+            "newline in name must not cause a bogus split, got {:?}",
+            files
+        );
+    }
+
+    #[test]
+    fn head_mtime_follows_linked_worktree_gitdir_pointer() {
+        // Regression pin: linked worktrees have `.git` as a regular
+        // file whose contents are `gitdir: /abs/path/to/real/HEAD`.
+        // The old implementation stat'd `.git/HEAD` directly and
+        // returned None on worktrees, which meant the watcher's
+        // git-state cache served stale `(branch, tag)` pairs until
+        // the bare TTL expired. We simulate the layout by creating a
+        // fake worktree root whose `.git` is a file pointing at a
+        // real gitdir in a sibling temp dir. `head_mtime` must
+        // resolve the pointer and return the mtime of the real HEAD.
+        let tmp = TempDir::new().expect("tempdir");
+        let worktree = tmp.path().join("worktree");
+        let real_gitdir = tmp.path().join("realgitdir");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::create_dir_all(&real_gitdir).unwrap();
+        // Create a HEAD file inside the real gitdir.
+        let real_head = real_gitdir.join("HEAD");
+        std::fs::write(&real_head, "ref: refs/heads/main\n").unwrap();
+        // Create the worktree's `.git` pointer file. Use an absolute
+        // gitdir path so the resolution doesn't depend on CWD.
+        let pointer = format!("gitdir: {}\n", real_gitdir.display());
+        std::fs::write(worktree.join(".git"), pointer).unwrap();
+
+        let mtime = head_mtime(Some(&worktree));
+        assert!(
+            mtime.is_some(),
+            "head_mtime must follow the worktree .git gitdir pointer"
+        );
+        // Rewrite real HEAD to bump its mtime, then verify the
+        // function sees the change (proves it's really reading the
+        // pointed-at file and not some stale path).
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&real_head, "ref: refs/heads/other\n").unwrap();
+        let mtime_after = head_mtime(Some(&worktree));
+        assert!(mtime_after.is_some());
+        assert!(
+            mtime_after.unwrap() >= mtime.unwrap(),
+            "rewriting the real HEAD must be visible through the worktree pointer"
+        );
+    }
+
+    #[test]
+    fn head_mtime_returns_none_when_no_dotgit() {
+        let tmp = TempDir::new().expect("tempdir");
+        assert!(
+            head_mtime(Some(tmp.path())).is_none(),
+            "a directory with no .git entry at all must return None, not a spurious mtime"
+        );
     }
 }

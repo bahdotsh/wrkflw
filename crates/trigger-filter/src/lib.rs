@@ -264,6 +264,11 @@ pub async fn auto_detect_context(
         base_branch: None,
         tag: tag_res?,
         changed_files,
+        // We actually ran `git diff` against `diff_base`, so even an
+        // empty result is an *authoritative* "nothing changed". The
+        // diagnostic layer uses this to stop suggesting `--diff` when
+        // the user already passed one.
+        changed_files_explicit: true,
         activity_type: None,
         warnings,
     })
@@ -311,6 +316,9 @@ pub async fn context_from_diff_range(
         base_branch: None,
         tag: tag_res?,
         changed_files: changed_res?,
+        // Explicit two-ref diff range — the caller asked for a diff,
+        // so an empty result is authoritative.
+        changed_files_explicit: true,
         activity_type: None,
         warnings: Vec::new(),
     })
@@ -334,6 +342,12 @@ pub async fn context_from_changed_files(
         base_branch: None,
         tag: tag_res?,
         changed_files,
+        // Caller supplied the list explicitly — even `vec![]` is a
+        // deliberate "nothing changed", not "I didn't bother to
+        // check". The watcher uses this path with the set of files
+        // that fired a notify event, so every call site here means
+        // "authoritative".
+        changed_files_explicit: true,
         activity_type: None,
         warnings: Vec::new(),
     })

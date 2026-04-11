@@ -238,14 +238,31 @@ fn explain_filter_failure(filter: &EventFilter, context: &EventContext) -> Strin
     if !filter.paths.is_empty() {
         let sources: Vec<&str> = filter.paths.iter().map(|p| p.source.as_str()).collect();
         // When the change set is empty the path filter cannot possibly
-        // match — call that out directly so a user who passed
-        // `--event` without `--diff` / `--changed-files` doesn't have
-        // to guess why every workflow is "skipped".
+        // match. Distinguish two cases so the user is not blamed for a
+        // flag they have already passed:
+        //   - `changed_files_explicit == false`: the caller never ran a
+        //     diff, so "pass --diff / --changed-files" is the correct
+        //     fix.
+        //   - `changed_files_explicit == true`: the diff WAS run and
+        //     returned zero files. Telling the user to pass `--diff`
+        //     here is actively wrong — the filter is working and
+        //     there's simply nothing to match.
+        // The old single-message form conflated these and sent users
+        // on wild-goose chases after a flag they had already set.
         let detail = if context.changed_files.is_empty() {
-            format!(
-                "paths: {:?} (no changed files in context — pass --diff or --changed-files)",
-                sources
-            )
+            if context.changed_files_explicit {
+                format!(
+                    "paths: {:?} (diff produced no changed files — nothing to match \
+                     against; this is not an error, just a no-op cycle)",
+                    sources
+                )
+            } else {
+                format!(
+                    "paths: {:?} (no changed files in context — pass --diff or \
+                     --changed-files)",
+                    sources
+                )
+            }
         } else {
             format!("paths: {:?}", sources)
         };

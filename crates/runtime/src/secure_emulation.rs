@@ -1,7 +1,10 @@
-use crate::container::{ContainerError, ContainerOutput, ContainerRuntime};
+use crate::container::{
+    resolve_host_working_dir, ContainerError, ContainerOutput, ContainerRuntime,
+};
 use crate::sandbox::{create_workflow_sandbox_config, Sandbox, SandboxConfig, SandboxError};
 use async_trait::async_trait;
-use std::path::Path;
+use std::fs;
+use std::path::{Path, PathBuf};
 use wrkflw_logging;
 
 /// Secure emulation runtime that uses sandboxing for safety
@@ -52,7 +55,7 @@ impl ContainerRuntime for SecureEmulationRuntime {
         command: &[&str],
         env_vars: &[(&str, &str)],
         working_dir: &Path,
-        _volumes: &[(&Path, &Path)],
+        volumes: &[(&Path, &Path)],
         entrypoint: Option<&str>,
     ) -> Result<ContainerOutput, ContainerError> {
         if let Some(ep) = entrypoint {
@@ -70,10 +73,45 @@ impl ContainerRuntime for SecureEmulationRuntime {
             image
         ));
 
+        // Rebase the container-visible working_dir onto its host-side volume
+        // source, matching EmulationRuntime and docker/podman (#88). Without
+        // this, `run:` steps and artifact/cache handlers observe different
+        // host directories.
+        let host_working_dir: PathBuf = if working_dir.exists() {
+            working_dir.to_path_buf()
+        } else {
+            match resolve_host_working_dir(working_dir, volumes) {
+                Some(host) => {
+                    if !host.exists() {
+                        fs::create_dir_all(&host).map_err(|e| {
+                            ContainerError::ContainerExecution(format!(
+                                "secure_emulation: failed to create host working directory '{}': {}",
+                                host.display(),
+                                e
+                            ))
+                        })?;
+                    }
+                    wrkflw_logging::info(&format!(
+                        "Rebased container path '{}' to host path '{}' via volume mount",
+                        working_dir.display(),
+                        host.display()
+                    ));
+                    host
+                }
+                None => {
+                    return Err(ContainerError::ContainerExecution(format!(
+                        "secure_emulation: container working dir '{}' is not covered by any \
+                         volume mount; caller must pass volumes",
+                        working_dir.display()
+                    )));
+                }
+            }
+        };
+
         // Use sandbox to execute the command safely
         let result = self
             .sandbox
-            .execute_command(command, env_vars, working_dir)
+            .execute_command(command, env_vars, &host_working_dir)
             .await;
 
         match result {
@@ -402,5 +440,62 @@ mod tests {
         let output = result.unwrap();
         assert!(output.stdout.contains("hello world"));
         assert_eq!(output.exit_code, 0);
+    }
+
+    /// Regression for #88: a container-visible working dir must be rebased
+    /// through the `volumes` mapping onto its host counterpart, so commands
+    /// run in the caller's workspace rather than a hidden sandbox copy.
+    #[tokio::test]
+    async fn secure_emulation_rebases_container_working_dir_via_volumes() {
+        let runtime = SecureEmulationRuntime::new();
+        let host_tempdir = tempfile::tempdir().unwrap();
+
+        let host = host_tempdir.path();
+        let container = Path::new("/github/workspace");
+
+        // Run `pwd` in the container workspace; with the rebase it should
+        // print the host tempdir.
+        let result = runtime
+            .run_container(
+                "alpine:latest",
+                &["pwd"],
+                &[],
+                container,
+                &[(host, container)],
+                None,
+            )
+            .await
+            .expect("secure_emulation run failed");
+        assert_eq!(result.exit_code, 0, "stderr: {}", result.stderr);
+        // `pwd` may canonicalize /var → /private/var on macOS, so compare
+        // canonical forms.
+        let canon_host = host.canonicalize().unwrap();
+        let canon_pwd = PathBuf::from(result.stdout.trim()).canonicalize().unwrap();
+        assert_eq!(canon_pwd, canon_host);
+    }
+
+    #[tokio::test]
+    async fn secure_emulation_errors_when_volumes_dont_cover_working_dir() {
+        let runtime = SecureEmulationRuntime::new();
+
+        // /github/workspace doesn't exist on host and no volume covers it.
+        let result = runtime
+            .run_container(
+                "alpine:latest",
+                &["echo", "nope"],
+                &[],
+                Path::new("/github/workspace"),
+                &[],
+                None,
+            )
+            .await;
+
+        let err = result.expect_err("should error when no volume covers working_dir");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not covered by any volume mount"),
+            "unexpected error: {}",
+            msg
+        );
     }
 }

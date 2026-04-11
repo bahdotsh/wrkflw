@@ -1,4 +1,6 @@
-use crate::model::{EventContext, EventFilter, TriggerMatchResult, WorkflowTriggerConfig};
+use crate::model::{
+    EventContext, EventFilter, GlobPattern, TriggerMatchResult, WorkflowTriggerConfig,
+};
 use crate::path_matcher;
 use crate::ref_matcher;
 
@@ -124,26 +126,27 @@ fn branch_for_filter(context: &EventContext) -> Option<&String> {
     }
 }
 
+/// Combine include + ignore pattern sources into a single list, with
+/// ignore entries prefixed by `!` so the diagnostic round-trips to the
+/// surface YAML syntax the user wrote. Extracted so the branches and
+/// tags paths in [`explain_filter_failure`] cannot drift apart.
+fn combined_pattern_sources(includes: &[GlobPattern], ignores: &[GlobPattern]) -> Vec<String> {
+    let mut out: Vec<String> = includes.iter().map(|p| p.source.clone()).collect();
+    out.extend(ignores.iter().map(|p| format!("!{}", p.source)));
+    out
+}
+
 /// Build a human-readable diagnostic explaining which sub-filter caused
 /// `filter` to reject `context`.
 fn explain_filter_failure(filter: &EventFilter, context: &EventContext) -> String {
     let mut parts = Vec::new();
 
     if !filter.branches.is_empty() || !filter.branches_ignore.is_empty() {
-        // Build a combined pattern list so a rejection driven by
-        // `branches-ignore:` alone (or inline `!`-negations routed into
-        // `branches_ignore`) is legible instead of rendering as
-        // `branch 'main' did not match []`. Ignore entries are prefixed
-        // with `!` so the diagnostic round-trips to the same surface
-        // syntax the user wrote in the workflow YAML.
-        let mut pattern_sources: Vec<String> =
-            filter.branches.iter().map(|p| p.source.clone()).collect();
-        pattern_sources.extend(
-            filter
-                .branches_ignore
-                .iter()
-                .map(|p| format!("!{}", p.source)),
-        );
+        // Combined pattern list: a rejection driven by `branches-ignore:`
+        // alone (or inline `!`-negations routed into `branches_ignore`)
+        // must render the offending rule instead of
+        // `branch 'main' did not match []`.
+        let pattern_sources = combined_pattern_sources(&filter.branches, &filter.branches_ignore);
         match branch_for_filter(context) {
             Some(branch) => parts.push(format!(
                 "branch '{}' did not match {:?}",
@@ -163,11 +166,8 @@ fn explain_filter_failure(filter: &EventFilter, context: &EventContext) -> Strin
         }
     }
     if !filter.tags.is_empty() || !filter.tags_ignore.is_empty() {
-        // Same treatment as branches: combine include + `!`-prefixed ignore
-        // sources so a rejection driven by `tags-ignore:` alone is legible.
-        let mut pattern_sources: Vec<String> =
-            filter.tags.iter().map(|p| p.source.clone()).collect();
-        pattern_sources.extend(filter.tags_ignore.iter().map(|p| format!("!{}", p.source)));
+        // Same treatment as branches — see `combined_pattern_sources`.
+        let pattern_sources = combined_pattern_sources(&filter.tags, &filter.tags_ignore);
         match &context.tag {
             Some(tag) => parts.push(format!("tag '{}' did not match {:?}", tag, pattern_sources)),
             None => parts.push("no tag in context (tag filter requires one)".to_string()),

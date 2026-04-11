@@ -45,25 +45,20 @@ pub fn matches_paths(
 /// Match a file path against a list of GlobPatterns using GitHub Actions semantics:
 /// - `*` matches any character except `/`
 /// - `**` matches zero or more directories
-/// - Patterns without `/` also match against the bare filename
-///   (e.g., `*.rs` matches `src/main.rs`)
+///
+/// **No bare-filename fallback.** An earlier version of this matcher tried
+/// the leaf filename as a second pass for patterns without `/`, so `*.rs`
+/// would match `src/main.rs`. That diverged from GitHub Actions, where `*`
+/// does not cross `/` — `*.rs` matches only top-level `.rs` files; to match
+/// `.rs` files anywhere, write `**/*.rs`. Silently matching under different
+/// rules than the production runner defeats the point of a trigger filter,
+/// so the fallback was removed. The regression is pinned by
+/// `star_pattern_does_not_match_nested_file_gha_semantics`.
 fn matches_any_pattern(file: &str, patterns: &[GlobPattern]) -> bool {
     let opts = GlobPattern::match_options();
-    for gp in patterns {
-        if gp.pattern.matches_with(file, opts) {
-            return true;
-        }
-
-        // If pattern has no `/`, also try matching just the filename
-        if !gp.source.contains('/') {
-            if let Some(filename) = file.rsplit('/').next() {
-                if gp.pattern.matches_with(filename, opts) {
-                    return true;
-                }
-            }
-        }
-    }
-    false
+    patterns
+        .iter()
+        .any(|gp| gp.pattern.matches_with(file, opts))
 }
 
 #[cfg(test)]
@@ -117,9 +112,29 @@ mod tests {
     }
 
     #[test]
-    fn pattern_without_slash_matches_filename() {
-        let files = vec!["src/main.rs".into()];
-        assert!(matches_paths(&files, &[gp("*.rs")], &[]));
+    fn star_pattern_does_not_match_nested_file_gha_semantics() {
+        // GitHub Actions semantics: `*.rs` only matches top-level files
+        // because `*` does not cross `/`. To match `.rs` files anywhere
+        // in the tree, write `**/*.rs` (the standard GHA idiom).
+        //
+        // wrkflw previously had a bare-filename fallback that made
+        // `*.rs` match `src/main.rs` — more permissive than GHA, which
+        // meant workflows behaved differently locally vs on GitHub.
+        // This test pins the corrected behavior so a future refactor
+        // cannot silently reintroduce the divergence.
+        let nested = vec!["src/main.rs".into()];
+        assert!(
+            !matches_paths(&nested, &[gp("*.rs")], &[]),
+            "'*.rs' must NOT match 'src/main.rs' under GHA semantics — \
+             `*` does not cross `/`"
+        );
+
+        // Top-level files DO match (no directory traversal needed).
+        let top_level = vec!["main.rs".into()];
+        assert!(matches_paths(&top_level, &[gp("*.rs")], &[]));
+
+        // `**/*.rs` is the correct GHA idiom for matching at any depth.
+        assert!(matches_paths(&nested, &[gp("**/*.rs")], &[]));
     }
 
     #[test]

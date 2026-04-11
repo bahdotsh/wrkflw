@@ -16,6 +16,13 @@ use wrkflw_trigger_filter::WorkflowTriggerConfig;
 /// caller does not supply an explicit limit.
 pub const DEFAULT_MAX_CONCURRENT_EXECUTIONS: usize = 4;
 
+/// Absolute upper bound on per-cycle concurrency. Each concurrent workflow
+/// carries executor state (containers, tempdirs, child processes), so an
+/// unbounded value can trivially OOM the host. Anything above this is
+/// clamped down with a warning — users who genuinely need more should open
+/// an issue so we can look at the actual workload before lifting the cap.
+pub const MAX_REASONABLE_CONCURRENCY: usize = 256;
+
 /// A watch event containing the changed files and trigger evaluation results.
 ///
 /// `error` is `Some` when the cycle ran into a non-fatal failure that the
@@ -118,7 +125,18 @@ impl WatcherConfig {
 
     pub fn with_max_concurrency(mut self, n: usize) -> Self {
         // 0 would deadlock buffer_unordered; clamp to at least 1.
-        self.max_concurrent_executions = n.max(1);
+        // Upper bound (see `MAX_REASONABLE_CONCURRENCY`) prevents OOM
+        // from silly values — each concurrent workflow carries
+        // executor state, so unbounded values can exhaust host
+        // resources without any helpful error message.
+        if n > MAX_REASONABLE_CONCURRENCY {
+            wrkflw_logging::warning(&format!(
+                "max_concurrency={} clamped to {} (higher values risk \
+                 exhausting container/tempdir/process resources)",
+                n, MAX_REASONABLE_CONCURRENCY
+            ));
+        }
+        self.max_concurrent_executions = n.clamp(1, MAX_REASONABLE_CONCURRENCY);
         self
     }
 }
@@ -341,8 +359,28 @@ impl WorkflowWatcher {
             // the next cycle. Events that arrive during the callback still
             // accumulate in the debouncer and are processed on the next
             // round.
+            //
+            // Panic handling: a panicking callback used to vanish into
+            // tokio's default panic reporter with no watch-loop signal —
+            // exactly the silent-failure mode this PR is built to
+            // prevent. We now await the blocking handle from a
+            // supervisor task and surface the panic via
+            // `wrkflw_logging::error` so the operator learns the
+            // reporter is broken instead of wondering why "nothing
+            // printed for the last N changes".
             let cb = callback.clone();
-            tokio::task::spawn_blocking(move || cb(event));
+            let cb_handle = tokio::task::spawn_blocking(move || cb(event));
+            tokio::spawn(async move {
+                if let Err(join_err) = cb_handle.await {
+                    if join_err.is_panic() {
+                        wrkflw_logging::error(&format!(
+                            "watch callback panicked: {} — watch loop continues, \
+                             but the reporter may now be dropping events",
+                            join_err
+                        ));
+                    }
+                }
+            });
         }
     }
 

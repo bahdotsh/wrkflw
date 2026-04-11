@@ -1481,6 +1481,18 @@ async fn evaluate_diff_filter(
     activity_type: Option<String>,
     repo_root: Option<PathBuf>,
 ) -> DiffFilterOutcome {
+    // Nothing to evaluate — bail out before paying for the git subprocess
+    // calls. Without this, toggling the diff filter on an empty workflow
+    // list would still shell out to `git rev-parse`/`git diff`/`git
+    // describe` and just throw the result away. Mirrors the watcher's
+    // `configs.is_empty()` short-circuit in `evaluate_and_execute`.
+    if workflow_paths.is_empty() {
+        return DiffFilterOutcome::Success(DiffFilterReport {
+            rows: Vec::new(),
+            parse_failures: Vec::new(),
+        });
+    }
+
     // Pass the discovered repo root through to every git helper so the
     // diff/branch/tag queries run against the user's actual repo, not
     // whatever the process CWD happens to be. `None` is still tolerated

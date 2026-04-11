@@ -506,8 +506,26 @@ async fn main() {
             base_branch,
             activity_type,
         }) => {
+            // Determine workflow type up front so the trigger prefilter
+            // can short-circuit for GitLab pipelines with a clear error.
+            // Previously the prefilter ran first and tried to parse the
+            // file as a GitHub workflow, which surfaced a confusing
+            // `Error parsing workflow: ...` from deep in the YAML parser.
+            let is_gitlab = *gitlab || is_gitlab_pipeline(path);
+
             // Evaluate trigger filter at the call site before executing
             if *diff || event.is_some() || changed_files.is_some() {
+                if is_gitlab {
+                    eprintln!(
+                        "Error: --diff, --event, and --changed-files are only \
+                         supported for GitHub Actions workflows.\n\
+                         {} appears to be a GitLab CI pipeline — trigger \
+                         filtering is GitHub Actions-specific and cannot be \
+                         evaluated against GitLab `rules:`/`only:`/`except:`.",
+                        path.display()
+                    );
+                    std::process::exit(1);
+                }
                 run_trigger_prefilter_or_exit(PrefilterRequest {
                     workflow_path: path,
                     event: event.as_ref(),
@@ -531,9 +549,6 @@ async fn main() {
                 show_action_messages: *show_action_messages,
                 target_job: job.clone(),
             };
-
-            // Check if we're explicitly or implicitly running a GitLab pipeline
-            let is_gitlab = *gitlab || is_gitlab_pipeline(path);
             let workflow_type = if is_gitlab {
                 "GitLab CI pipeline"
             } else {
@@ -668,10 +683,19 @@ async fn main() {
                 std::process::exit(1);
             }
 
-            let repo_root = wrkflw_watcher::find_repo_root().unwrap_or_else(|| {
-                eprintln!("Error: not inside a git repository");
-                std::process::exit(1);
-            });
+            // `find_repo_root` shells out to `git rev-parse` synchronously
+            // and is NOT wrapped in the trigger-filter's GIT_COMMAND_TIMEOUT,
+            // so a hung git (credential prompt, stuck network mount) would
+            // block the reactor if we called it directly. Move it onto the
+            // blocking pool to keep the tokio runtime responsive.
+            let repo_root = tokio::task::spawn_blocking(wrkflw_watcher::find_repo_root)
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| {
+                    eprintln!("Error: not inside a git repository");
+                    std::process::exit(1);
+                });
 
             let debounce_duration = std::time::Duration::from_millis(*debounce);
 
@@ -885,7 +909,14 @@ async fn run_trigger_prefilter_or_exit(req: PrefilterRequest<'_>) {
     // Root git operations at the git repo root when possible, so behavior
     // is consistent regardless of the directory the user ran `wrkflw`
     // from. Falls back to process CWD if we're not inside a repo.
-    let repo_root: Option<PathBuf> = wrkflw_watcher::find_repo_root();
+    //
+    // `find_repo_root` is a sync shell-out not covered by
+    // `GIT_COMMAND_TIMEOUT`; wrap in `spawn_blocking` so a hung git
+    // (credential prompt, stuck network mount) cannot freeze the reactor.
+    let repo_root: Option<PathBuf> = tokio::task::spawn_blocking(wrkflw_watcher::find_repo_root)
+        .await
+        .ok()
+        .flatten();
     let cwd_for_git: Option<&Path> = repo_root.as_deref();
 
     let mut event_context = build_event_context(&req, &event_name, cwd_for_git).await;

@@ -152,7 +152,7 @@ impl ContainerRuntime for EmulationRuntime {
         command: &[&str],
         env_vars: &[(&str, &str)],
         working_dir: &Path,
-        _volumes: &[(&Path, &Path)],
+        volumes: &[(&Path, &Path)],
         _entrypoint: Option<&str>,
     ) -> Result<ContainerOutput, ContainerError> {
         // Build command string
@@ -197,46 +197,53 @@ impl ContainerRuntime for EmulationRuntime {
             wrkflw_logging::info(&format!("  {}={}", key, value));
         }
 
-        // Find actual working directory - determine if we should use the current directory instead
-        let actual_working_dir: PathBuf = if !working_dir.exists() {
-            // Look for GITHUB_WORKSPACE or CI_PROJECT_DIR in env_vars
-            let mut workspace_path = None;
-            for (key, value) in env_vars {
-                if *key == "GITHUB_WORKSPACE" || *key == "CI_PROJECT_DIR" {
-                    workspace_path = Some(PathBuf::from(value));
-                    break;
-                }
-            }
-
-            // If found, use that as the working directory
-            if let Some(path) = workspace_path {
-                if path.exists() {
-                    wrkflw_logging::info(&format!(
-                        "Using environment-defined workspace: {}",
-                        path.display()
-                    ));
-                    path
-                } else {
-                    // Fallback to current directory
-                    let current_dir =
-                        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-                    wrkflw_logging::info(&format!(
-                        "Using current directory: {}",
-                        current_dir.display()
-                    ));
-                    current_dir
-                }
-            } else {
-                // Fallback to current directory
-                let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-                wrkflw_logging::info(&format!(
-                    "Using current directory: {}",
-                    current_dir.display()
-                ));
-                current_dir
-            }
-        } else {
+        // Resolve the host working directory.
+        //
+        // If `working_dir` already exists on the host, it's a host path — use
+        // it directly. Otherwise it's a container-visible path (typically
+        // `/github/workspace` or a subdir) and we must rebase it onto the
+        // host-side source of its volume mount so that `run:` steps and
+        // artifact/cache handlers observe the same workspace.
+        //
+        // Prior versions silently rerouted to `GITHUB_WORKSPACE` (i.e. the
+        // real project directory) when the container path didn't exist on the
+        // host, which caused run steps to write files where upload-artifact
+        // would never look (#88). That fallback is gone: callers must pass
+        // volumes that cover the working directory.
+        let actual_working_dir: PathBuf = if working_dir.exists() {
             working_dir.to_path_buf()
+        } else {
+            match crate::container::resolve_host_working_dir(working_dir, volumes) {
+                Some(host) => {
+                    // Create the host path if it doesn't exist yet (covers
+                    // `working-directory: sub` pointing at a subdir that
+                    // hasn't been created). Matches docker's behavior, where
+                    // the equivalent subdir would be created inside the bind
+                    // mount on first access.
+                    if !host.exists() {
+                        fs::create_dir_all(&host).map_err(|e| {
+                            ContainerError::ContainerExecution(format!(
+                                "emulation: failed to create host working directory '{}': {}",
+                                host.display(),
+                                e
+                            ))
+                        })?;
+                    }
+                    wrkflw_logging::info(&format!(
+                        "Rebased container path '{}' to host path '{}' via volume mount",
+                        working_dir.display(),
+                        host.display()
+                    ));
+                    host
+                }
+                None => {
+                    return Err(ContainerError::ContainerExecution(format!(
+                        "emulation: container working dir '{}' is not covered by any \
+                         volume mount; caller must pass volumes",
+                        working_dir.display()
+                    )));
+                }
+            }
         };
 
         wrkflw_logging::info(&format!(

@@ -7697,7 +7697,7 @@ runs:
         // --- Step 2: upload-artifact reads the file the run step just wrote ---
         let mut up_with = HashMap::new();
         up_with.insert("name".to_string(), "payload".to_string());
-        up_with.insert("path".to_string(), "artifact-dir/**".to_string());
+        up_with.insert("path".to_string(), "artifact-dir/payload.txt".to_string());
         let up_step = make_step(
             "upload",
             "actions/upload-artifact@v4",

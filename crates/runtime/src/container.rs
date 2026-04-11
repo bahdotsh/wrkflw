@@ -1,5 +1,7 @@
 use async_trait::async_trait;
+use std::fs;
 use std::path::{Path, PathBuf};
+use wrkflw_logging;
 
 /// Prefix for all locally-built images. Used to skip registry pulls.
 pub const LOCAL_IMAGE_PREFIX: &str = "wrkflw-";
@@ -94,12 +96,73 @@ pub(crate) fn resolve_host_working_dir(
             let depth = container.components().count();
             let candidate = host.join(suffix);
             match &best {
+                // Equal-depth ties can only occur when two volume entries
+                // share the same `container` prefix (two distinct container
+                // paths that are both strict component-boundary prefixes of
+                // the same `container_dir` must have different component
+                // counts, because one has to contain the other). In that
+                // duplicate-entry case, first-seen wins — the `>=` is the
+                // intentional conflict resolution, not a typo for `>`.
                 Some((best_depth, _)) if *best_depth >= depth => {}
                 _ => best = Some((depth, candidate)),
             }
         }
     }
     best.map(|(_, path)| path)
+}
+
+/// Resolve the host working directory for a non-container runtime call, or
+/// return a `ContainerError` describing why it couldn't.
+///
+/// This is the shared wiring used by `EmulationRuntime::run_container` and
+/// `SecureEmulationRuntime::run_container`. It enforces one invariant: when
+/// `volumes` covers `working_dir`, the volume mapping **always wins** over
+/// any accidentally-existing host path — so a dev-environment quirk like
+/// `/github/workspace` happening to exist on the host cannot silently skip
+/// the rebase and reintroduce #88.
+///
+/// - If a volume covers `working_dir`, rebase it, `create_dir_all` the host
+///   side if it doesn't exist yet (matching docker's bind-mount behavior of
+///   creating the mount target on first access), and return the host path.
+/// - If no volume covers `working_dir` but `working_dir` itself exists on
+///   the host, accept it as a caller-provided host path.
+/// - Otherwise, return a loud, descriptive error. No silent fallback.
+///
+/// `runtime_label` is used as a prefix in log and error messages so the
+/// reader can tell which runtime produced a given line.
+pub(crate) fn rebase_working_dir_or_error(
+    working_dir: &Path,
+    volumes: &[(&Path, &Path)],
+    runtime_label: &str,
+) -> Result<PathBuf, ContainerError> {
+    match resolve_host_working_dir(working_dir, volumes) {
+        Some(host) => {
+            if !host.exists() {
+                fs::create_dir_all(&host).map_err(|e| {
+                    ContainerError::ContainerExecution(format!(
+                        "{}: failed to create host working directory '{}': {}",
+                        runtime_label,
+                        host.display(),
+                        e
+                    ))
+                })?;
+            }
+            wrkflw_logging::info(&format!(
+                "{}: rebased container path '{}' to host path '{}' via volume mount",
+                runtime_label,
+                working_dir.display(),
+                host.display()
+            ));
+            Ok(host)
+        }
+        None if working_dir.exists() => Ok(working_dir.to_path_buf()),
+        None => Err(ContainerError::ContainerExecution(format!(
+            "{}: container working dir '{}' is not covered by any volume mount; \
+             caller must pass volumes",
+            runtime_label,
+            working_dir.display()
+        ))),
+    }
 }
 
 impl fmt::Display for ContainerError {
@@ -200,5 +263,64 @@ mod tests {
             resolve_host_working_dir(Path::new("/github/workspace-foo"), &volumes),
             None
         );
+    }
+
+    /// Core invariant of `rebase_working_dir_or_error`: when a volume
+    /// covers `working_dir`, the rebase wins even if `working_dir` also
+    /// happens to exist on the host. Without this, a dev environment with
+    /// a real `/github/workspace` directory would silently skip the rebase
+    /// and reintroduce the #88 class of bug.
+    #[test]
+    fn rebase_prefers_volume_mapping_over_accidentally_existing_host_path() {
+        // `container_dir` points at a real host tempdir (so `.exists()`
+        // returns true), but we also supply a volume mapping that claims
+        // that same path for a different host location. The volume must win.
+        let existing = tempfile::tempdir().unwrap();
+        let mapped = tempfile::tempdir().unwrap();
+        let volumes = [(mapped.path(), existing.path())];
+
+        let resolved = rebase_working_dir_or_error(existing.path(), &volumes, "test").unwrap();
+        assert_eq!(resolved, mapped.path().to_path_buf());
+    }
+
+    #[test]
+    fn rebase_accepts_existing_host_path_when_no_volume_covers_it() {
+        let host_dir = tempfile::tempdir().unwrap();
+        let resolved = rebase_working_dir_or_error(host_dir.path(), &[], "test").unwrap();
+        assert_eq!(resolved, host_dir.path().to_path_buf());
+    }
+
+    #[test]
+    fn rebase_errors_loudly_when_no_volume_and_path_does_not_exist() {
+        let err = rebase_working_dir_or_error(
+            Path::new("/definitely/does/not/exist/wrkflw-test"),
+            &[],
+            "test",
+        )
+        .expect_err("should error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not covered by any volume mount"),
+            "unexpected error: {}",
+            msg
+        );
+        assert!(msg.contains("test:"), "error should carry runtime label");
+    }
+
+    #[test]
+    fn rebase_creates_host_side_of_mount_if_missing() {
+        // Simulate `working-directory: sub` pointing at a container subdir
+        // that hasn't been created yet. The helper must `create_dir_all`
+        // the host side so the subsequent `Command` can `current_dir` into
+        // it. This matches docker's bind-mount behavior.
+        let host_root = tempfile::tempdir().unwrap();
+        let container_root = Path::new("/github/workspace");
+        let volumes = [(host_root.path(), container_root)];
+        let container_sub = Path::new("/github/workspace/sub/nested");
+
+        let resolved = rebase_working_dir_or_error(container_sub, &volumes, "test").unwrap();
+        let expected = host_root.path().join("sub/nested");
+        assert_eq!(resolved, expected);
+        assert!(expected.exists(), "helper should have created the subdir");
     }
 }

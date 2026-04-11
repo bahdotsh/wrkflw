@@ -7791,7 +7791,10 @@ runs:
         );
 
         let downloaded = std::fs::read_to_string(
-            dl_workspace.path().join("dl").join("artifact-dir/payload.txt"),
+            dl_workspace
+                .path()
+                .join("dl")
+                .join("artifact-dir/payload.txt"),
         )
         .expect("downloaded payload.txt should exist");
         assert_eq!(downloaded, "hello\n");

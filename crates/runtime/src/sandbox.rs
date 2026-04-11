@@ -1,11 +1,18 @@
 use regex::Regex;
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 use wrkflw_logging;
 
-/// Configuration for sandbox execution
+/// Configuration for sandbox execution.
+///
+/// Note: this sandbox provides **command-level** validation (whitelist,
+/// blocklist, dangerous-pattern regexes) and **environment-variable**
+/// filtering. It does NOT provide filesystem isolation — the command runs
+/// in the caller's working directory as a plain subprocess, so absolute
+/// paths and `..` sequences can reach anything the host user can reach.
+/// If filesystem isolation is needed, use the Docker or Podman runtime.
 #[derive(Debug, Clone)]
 pub struct SandboxConfig {
     /// Maximum execution time for commands
@@ -18,10 +25,6 @@ pub struct SandboxConfig {
     pub allowed_commands: HashSet<String>,
     /// Blocked commands (blacklist)
     pub blocked_commands: HashSet<String>,
-    /// Allowed file system paths (read-only)
-    pub allowed_read_paths: HashSet<PathBuf>,
-    /// Allowed file system paths (read-write)
-    pub allowed_write_paths: HashSet<PathBuf>,
     /// Whether to enable network access
     pub allow_network: bool,
     /// Maximum number of processes
@@ -141,8 +144,6 @@ impl Default for SandboxConfig {
             max_cpu_percent: 80,
             allowed_commands,
             blocked_commands,
-            allowed_read_paths: HashSet::new(),
-            allowed_write_paths: HashSet::new(),
             allow_network: false,
             max_processes: 10,
             strict_mode: true,
@@ -466,32 +467,18 @@ impl Sandbox {
 
 /// Create a default sandbox configuration for CI/CD workflows
 pub fn create_workflow_sandbox_config() -> SandboxConfig {
-    let mut allowed_read_paths = HashSet::new();
-    allowed_read_paths.insert(PathBuf::from("."));
-
-    let mut allowed_write_paths = HashSet::new();
-    allowed_write_paths.insert(PathBuf::from("."));
-
     SandboxConfig {
         max_execution_time: Duration::from_secs(1800), // 30 minutes
         max_memory_mb: 2048,                           // 2GB
         max_processes: 50,
         allow_network: true,
         strict_mode: false,
-        allowed_read_paths,
-        allowed_write_paths,
         ..Default::default()
     }
 }
 
 /// Create a strict sandbox configuration for untrusted code
 pub fn create_strict_sandbox_config() -> SandboxConfig {
-    let mut allowed_read_paths = HashSet::new();
-    allowed_read_paths.insert(PathBuf::from("."));
-
-    let mut allowed_write_paths = HashSet::new();
-    allowed_write_paths.insert(PathBuf::from("."));
-
     // Very limited command set
     let allowed_commands = ["echo", "cat", "ls", "pwd", "date"]
         .iter()
@@ -504,8 +491,6 @@ pub fn create_strict_sandbox_config() -> SandboxConfig {
         max_processes: 5,
         allow_network: false,
         strict_mode: true,
-        allowed_read_paths,
-        allowed_write_paths,
         allowed_commands,
         ..Default::default()
     }
@@ -546,5 +531,4 @@ mod tests {
         assert!(sandbox.validate_command("git clone").is_err());
         assert!(sandbox.validate_command("cargo build").is_err());
     }
-
 }

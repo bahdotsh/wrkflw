@@ -1,10 +1,9 @@
 use crate::container::{
-    resolve_host_working_dir, ContainerError, ContainerOutput, ContainerRuntime,
+    rebase_working_dir_or_error, ContainerError, ContainerOutput, ContainerRuntime,
 };
 use crate::sandbox::{create_workflow_sandbox_config, Sandbox, SandboxConfig, SandboxError};
 use async_trait::async_trait;
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use wrkflw_logging;
 
 /// Secure emulation runtime that uses sandboxing for safety
@@ -77,36 +76,8 @@ impl ContainerRuntime for SecureEmulationRuntime {
         // source, matching EmulationRuntime and docker/podman (#88). Without
         // this, `run:` steps and artifact/cache handlers observe different
         // host directories.
-        let host_working_dir: PathBuf = if working_dir.exists() {
-            working_dir.to_path_buf()
-        } else {
-            match resolve_host_working_dir(working_dir, volumes) {
-                Some(host) => {
-                    if !host.exists() {
-                        fs::create_dir_all(&host).map_err(|e| {
-                            ContainerError::ContainerExecution(format!(
-                                "secure_emulation: failed to create host working directory '{}': {}",
-                                host.display(),
-                                e
-                            ))
-                        })?;
-                    }
-                    wrkflw_logging::info(&format!(
-                        "Rebased container path '{}' to host path '{}' via volume mount",
-                        working_dir.display(),
-                        host.display()
-                    ));
-                    host
-                }
-                None => {
-                    return Err(ContainerError::ContainerExecution(format!(
-                        "secure_emulation: container working dir '{}' is not covered by any \
-                         volume mount; caller must pass volumes",
-                        working_dir.display()
-                    )));
-                }
-            }
-        };
+        let host_working_dir =
+            rebase_working_dir_or_error(working_dir, volumes, "secure_emulation")?;
 
         // Use sandbox to execute the command safely
         let result = self

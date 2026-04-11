@@ -1,4 +1,6 @@
-use crate::container::{ContainerError, ContainerOutput, ContainerRuntime};
+use crate::container::{
+    rebase_working_dir_or_error, ContainerError, ContainerOutput, ContainerRuntime,
+};
 use async_trait::async_trait;
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
@@ -197,54 +199,13 @@ impl ContainerRuntime for EmulationRuntime {
             wrkflw_logging::info(&format!("  {}={}", key, value));
         }
 
-        // Resolve the host working directory.
-        //
-        // If `working_dir` already exists on the host, it's a host path — use
-        // it directly. Otherwise it's a container-visible path (typically
-        // `/github/workspace` or a subdir) and we must rebase it onto the
-        // host-side source of its volume mount so that `run:` steps and
-        // artifact/cache handlers observe the same workspace.
-        //
-        // Prior versions silently rerouted to `GITHUB_WORKSPACE` (i.e. the
-        // real project directory) when the container path didn't exist on the
-        // host, which caused run steps to write files where upload-artifact
-        // would never look (#88). That fallback is gone: callers must pass
-        // volumes that cover the working directory.
-        let actual_working_dir: PathBuf = if working_dir.exists() {
-            working_dir.to_path_buf()
-        } else {
-            match crate::container::resolve_host_working_dir(working_dir, volumes) {
-                Some(host) => {
-                    // Create the host path if it doesn't exist yet (covers
-                    // `working-directory: sub` pointing at a subdir that
-                    // hasn't been created). Matches docker's behavior, where
-                    // the equivalent subdir would be created inside the bind
-                    // mount on first access.
-                    if !host.exists() {
-                        fs::create_dir_all(&host).map_err(|e| {
-                            ContainerError::ContainerExecution(format!(
-                                "emulation: failed to create host working directory '{}': {}",
-                                host.display(),
-                                e
-                            ))
-                        })?;
-                    }
-                    wrkflw_logging::info(&format!(
-                        "Rebased container path '{}' to host path '{}' via volume mount",
-                        working_dir.display(),
-                        host.display()
-                    ));
-                    host
-                }
-                None => {
-                    return Err(ContainerError::ContainerExecution(format!(
-                        "emulation: container working dir '{}' is not covered by any \
-                         volume mount; caller must pass volumes",
-                        working_dir.display()
-                    )));
-                }
-            }
-        };
+        // Resolve the host working directory via the shared mount-semantics
+        // helper. When `volumes` covers `working_dir` (the normal case for
+        // container-visible paths like `/github/workspace`), the rebase
+        // always wins over an accidentally-existing host path — so a dev
+        // environment with a real `/github/workspace` directory cannot
+        // silently reintroduce #88.
+        let actual_working_dir = rebase_working_dir_or_error(working_dir, volumes, "emulation")?;
 
         wrkflw_logging::info(&format!(
             "Using actual working directory: {}",
@@ -829,5 +790,39 @@ mod tests {
             "stderr should explain the action was not executed"
         );
         assert!(output.stdout.is_empty(), "stdout should be empty");
+    }
+
+    /// Regression for #88: if the caller passes a container-visible working
+    /// directory that no volume covers, emulation must hard-error instead of
+    /// silently rerouting to `GITHUB_WORKSPACE`. Symmetry test with the
+    /// matching `secure_emulation_errors_when_volumes_dont_cover_working_dir`.
+    #[tokio::test]
+    async fn emulation_errors_when_volumes_dont_cover_working_dir() {
+        let runtime = EmulationRuntime::new();
+
+        // /github/workspace doesn't exist on host and no volume covers it.
+        let result = runtime
+            .run_container(
+                "alpine:latest",
+                &["echo", "nope"],
+                &[],
+                Path::new("/github/workspace"),
+                &[],
+                None,
+            )
+            .await;
+
+        let err = result.expect_err("should error when no volume covers working_dir");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not covered by any volume mount"),
+            "unexpected error: {}",
+            msg
+        );
+        assert!(
+            msg.contains("emulation:"),
+            "error should carry runtime label, got: {}",
+            msg
+        );
     }
 }

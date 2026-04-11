@@ -319,6 +319,18 @@ impl WorkflowWatcher {
         F: Fn(WatchEvent) + Send + Sync + 'static,
     {
         let initial_workflow_files = self.collect_workflow_files().await?;
+        // An empty workflow directory is a legitimate starting state:
+        // the user may be about to create their first workflow file
+        // and want the watcher to pick it up as soon as it's written.
+        // Surface an info line so the banner isn't misleading, but do
+        // not abort — the mid-session rescan will populate the set
+        // once a `.yml` appears.
+        if initial_workflow_files.is_empty() {
+            wrkflw_logging::info(&format!(
+                "No workflow files yet in {} — watcher will pick them up as they appear.",
+                self.cfg.workflow_dir.display()
+            ));
+        }
 
         // Canonicalize the repo root once so incoming notify paths (which the
         // OS may deliver as canonicalized — e.g. macOS `/private/var` vs
@@ -656,10 +668,30 @@ impl WorkflowWatcher {
             }
         }
 
-        // Cache miss — fan out the two git calls concurrently, same
-        // shape as `context_from_changed_files` used to do. Pass the
-        // repo root explicitly so the subprocesses operate on the
-        // same tree the watcher is looking at.
+        // Cache miss — capture HEAD mtime BEFORE the git calls. This is
+        // load-bearing for the cache's staleness contract: if a `git
+        // checkout` lands between `get_current_branch` and the final
+        // store, we want the stored mtime to reflect the *pre-checkout*
+        // state that produced the branch/tag values we just read. The
+        // next `cached_git_state` call will then stat the (newer)
+        // post-checkout mtime, observe a mismatch against the stored
+        // value, and force a refresh.
+        //
+        // An earlier draft captured `head_mtime` after the git calls so
+        // the stored value reflected the post-checkout state. That
+        // "looked right" but produced the opposite bug: the cache would
+        // happily serve the pre-checkout branch/tag for the full TTL
+        // window because the stored mtime already matched whatever the
+        // next call would observe. The regression is pinned by
+        // `cached_git_state_invalidates_when_checkout_races_git_reads`.
+        //
+        // Racing writers: we accept that a concurrent refresher may
+        // overwrite with its own fetch. Both branches produce the same
+        // value on the steady-state, so late-writer-wins is safe; this
+        // avoids a compare-and-set dance on the hot path.
+        let fetched_at = Instant::now();
+        let head_mtime = wrkflw_trigger_filter::git::head_mtime(cwd);
+
         let (branch_res, tag_res) = tokio::join!(
             wrkflw_trigger_filter::git::get_current_branch(cwd),
             wrkflw_trigger_filter::git::get_current_tag(cwd),
@@ -667,18 +699,6 @@ impl WorkflowWatcher {
         let branch = branch_res?;
         let tag = tag_res?;
 
-        // Repopulate the cache. We accept that a racing task may
-        // overwrite with its own fetch — both branches produce the
-        // same value so late-writer-wins is safe, and we avoid the
-        // cost of a compare-and-set dance.
-        //
-        // Capture HEAD mtime AFTER the git calls so the "mtime at
-        // fetch time" we store is the one that was consistent with
-        // the branch/tag values we just read. A checkout that
-        // happens between the read and the store will show up as
-        // an mtime mismatch on the very next call.
-        let fetched_at = Instant::now();
-        let head_mtime = wrkflw_trigger_filter::git::head_mtime(cwd);
         let mut guard = match self.git_state.lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
@@ -867,7 +887,7 @@ impl WorkflowWatcher {
         // rationale — a file-save storm of 40 events was previously
         // 80 git subprocess spawns for a branch+tag pair that almost
         // never changes.
-        let context = match self.cached_git_state().await {
+        let mut context = match self.cached_git_state().await {
             Ok((branch, tag)) => EventContext {
                 event_name: self.cfg.event_name.clone(),
                 branch,
@@ -889,7 +909,7 @@ impl WorkflowWatcher {
                 // for "no activity type in context" — exactly the
                 // silent-skip failure mode this PR is built to prevent.
                 activity_type: self.cfg.activity_type.clone(),
-                warnings: Vec::new(),
+                warnings: wrkflw_trigger_filter::MustDrainWarnings::new(),
             },
             Err(e) => {
                 let reason = format!("Failed to build event context: {}", e);
@@ -904,6 +924,16 @@ impl WorkflowWatcher {
                 };
             }
         };
+
+        // Drain context-level warnings into the `WatchEvent` so the
+        // reporter surfaces them to the user. The watcher synthesises
+        // an empty warning buffer above (`cached_git_state` returns
+        // only branch/tag), so the drain is a no-op today — but the
+        // contract lives here so a future cached_git_state that
+        // surfaces diagnostics via `EventContext::warnings` does not
+        // silently drop them, and the `MustDrainWarnings` Drop check
+        // is guaranteed satisfied before `context` falls out of scope.
+        let mut cycle_warnings: Vec<String> = context.warnings.take();
 
         let results = wrkflw_trigger_filter::filter_trigger_configs(configs, &context);
 
@@ -1011,7 +1041,7 @@ impl WorkflowWatcher {
             triggered_workflows: triggered,
             skipped_workflows: skipped,
             error: None,
-            warnings: Vec::new(),
+            warnings: std::mem::take(&mut cycle_warnings),
             dropped_events: 0,
         }
     }
@@ -1129,6 +1159,85 @@ mod tests {
         assert_eq!(
             fetched_at_first, fetched_at_second,
             "second call within TTL must not refresh the cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn cached_git_state_invalidates_when_head_mtime_moves() {
+        // Regression: the cache must detect a `git checkout` that
+        // happens *between* the two `cached_git_state` calls, even if
+        // the wall-clock TTL has not expired. The staleness check
+        // compares the freshly-stat'd HEAD mtime against the one
+        // captured at fetch time; when they differ, we must refresh.
+        //
+        // Pairs with the fix that moved the mtime capture to BEFORE
+        // the git calls: with the old "capture after" logic, a
+        // checkout that landed between the branch/tag reads and the
+        // mtime stat was silently persisted as "cache consistent"
+        // and the watcher served the pre-checkout branch until TTL.
+        use std::process::Command as StdCommand;
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let repo = tmp.path();
+
+        let status = StdCommand::new("git")
+            .args([
+                "-C",
+                repo.to_str().unwrap(),
+                "init",
+                "--initial-branch=main",
+            ])
+            .status();
+        if !status.map(|s| s.success()).unwrap_or(false) {
+            return;
+        }
+        for (k, v) in [("user.email", "t@t.t"), ("user.name", "t")] {
+            StdCommand::new("git")
+                .args(["-C", repo.to_str().unwrap(), "config", k, v])
+                .status()
+                .expect("git config");
+        }
+        std::fs::write(repo.join("a.txt"), "1").unwrap();
+        StdCommand::new("git")
+            .args(["-C", repo.to_str().unwrap(), "add", "a.txt"])
+            .status()
+            .expect("git add");
+        StdCommand::new("git")
+            .args([
+                "-C",
+                repo.to_str().unwrap(),
+                "commit",
+                "-m",
+                "init",
+                "--no-gpg-sign",
+            ])
+            .status()
+            .expect("git commit");
+        // Create a second branch we can check out to force a HEAD move.
+        StdCommand::new("git")
+            .args(["-C", repo.to_str().unwrap(), "branch", "other"])
+            .status()
+            .expect("git branch");
+
+        let watcher = make_watcher_for(repo);
+        let (branch_a, _) = watcher.cached_git_state().await.expect("first state");
+        assert_eq!(branch_a, Some("main".to_string()));
+
+        // Sleep so the mtime tick is reliably distinct from the one
+        // captured at the first fetch. Filesystem mtime granularity
+        // is platform-dependent; 20ms is comfortably above any
+        // supported platform's resolution.
+        std::thread::sleep(Duration::from_millis(20));
+        StdCommand::new("git")
+            .args(["-C", repo.to_str().unwrap(), "checkout", "other"])
+            .status()
+            .expect("git checkout other");
+
+        let (branch_b, _) = watcher.cached_git_state().await.expect("second state");
+        assert_eq!(
+            branch_b,
+            Some("other".to_string()),
+            "HEAD mtime mismatch must force a cache refresh — got stale {:?}",
+            branch_b
         );
     }
 

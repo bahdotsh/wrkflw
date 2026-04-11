@@ -93,7 +93,22 @@ pub(crate) fn refresh_trigger_cache_blocking(
         // is a single HashMap lookup instead of a full YAML parse
         // plus glob compile.
         match wrkflw_trigger_filter::load_trigger_config_cached(wf_path, tf_config) {
-            Ok(cfg) => {
+            Ok(mut cfg) => {
+                // Drain any parser-level diagnostics (unknown event
+                // name, typo detection) into the log sink BEFORE
+                // stashing the config in the watcher-side cache.
+                // Leaving the warnings on `cfg.warnings` would either
+                // silently lose them here (the old bug) or trip the
+                // `MustDrainWarnings` Drop check every time the
+                // cache evicts an entry. Log-on-drain parity with
+                // the CLI prefilter and the TUI diff-filter path is
+                // load-bearing: all three hosts must surface the
+                // same diagnostics from the same library call, or
+                // the "why did my workflow silently not fire"
+                // failure mode reappears for whichever host skipped.
+                for w in cfg.warnings.take() {
+                    wrkflw_logging::warning(&w);
+                }
                 trigger_cache.insert(
                     wf_path.clone(),
                     TriggerCacheEntry {
@@ -262,6 +277,58 @@ mod tests {
             !cache.contains_key(&wf_abs),
             "broken workflow must be evicted from cache so the surrounding \
              warning logic can surface the regression"
+        );
+    }
+
+    /// Regression: deleting every workflow file mid-session must
+    /// evict the previously-cached entries. The old behavior had
+    /// `collect_workflow_files_blocking` returning `Err` for an
+    /// empty dir, the watcher's rescan branch fell back to the
+    /// stale snapshot, and `active_set` then retained the deleted
+    /// files forever. With the empty-dir fix the rescan hands us
+    /// an empty `workflow_files`, and `retain` must drop every
+    /// cached entry.
+    #[test]
+    fn refresh_trigger_cache_drops_entries_when_workflow_files_becomes_empty() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let repo = tmp.path().to_path_buf();
+        std::fs::create_dir_all(repo.join(".github").join("workflows"))
+            .expect("create workflow dir");
+
+        let wf_abs = repo.join(".github/workflows/ci.yml");
+        std::fs::write(
+            &wf_abs,
+            "name: t\non:\n  push:\n    paths:\n      - 'src/**'\njobs:\n  b:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+        )
+        .expect("write ci.yml");
+
+        let workflow_files = vec![wf_abs.clone()];
+        let mut cache: HashMap<PathBuf, TriggerCacheEntry> = HashMap::new();
+        refresh_trigger_cache_blocking(
+            &mut cache,
+            &workflow_files,
+            &[],
+            false,
+            &TriggerFilterConfig::default(),
+        );
+        assert!(cache.contains_key(&wf_abs));
+
+        // Simulate the user deleting the last workflow file — the
+        // next rescan returns an empty list, and `refresh_trigger_cache_blocking`
+        // must drop the stale entry so the evaluator does not run
+        // against a file that no longer exists.
+        std::fs::remove_file(&wf_abs).expect("delete ci.yml");
+        refresh_trigger_cache_blocking(
+            &mut cache,
+            &[], // empty active set
+            &[],
+            false,
+            &TriggerFilterConfig::default(),
+        );
+        assert!(
+            cache.is_empty(),
+            "stale cache entries must be evicted when workflow_files is empty, got {:?}",
+            cache.keys().collect::<Vec<_>>()
         );
     }
 

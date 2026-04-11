@@ -1743,10 +1743,14 @@ async fn evaluate_diff_filter(
     // this PR is built to plug. The CLI prefilter does this at
     // `crates/wrkflw/src/main.rs`; parity is load-bearing.
     //
-    // `std::mem::take` leaves an empty Vec in its place so the
-    // downstream `filter_trigger_configs` call still sees a
-    // well-formed context without any of the cost of a clone.
-    let mut warnings: Vec<String> = std::mem::take(&mut context.warnings);
+    // `MustDrainWarnings::take()` leaves an empty buffer in its
+    // place so the downstream `filter_trigger_configs` call still
+    // sees a well-formed context without any of the cost of a
+    // clone. `take` (not read-only iteration) is also what
+    // satisfies the `MustDrainWarnings` Drop-check contract — if we
+    // borrowed instead, the context's Drop would fire the
+    // "dropped without being drained" eprintln in debug builds.
+    let mut warnings: Vec<String> = context.warnings.take();
 
     // Trigger config parsing is synchronous file I/O; run it on a
     // blocking thread so we don't hold the reactor while reading every
@@ -1772,7 +1776,7 @@ async fn evaluate_diff_filter(
     })
     .await;
 
-    let (configs, parse_failures) = match parse_outcome {
+    let (mut configs, parse_failures) = match parse_outcome {
         Ok(pair) => pair,
         Err(e) => {
             return DiffFilterOutcome::Failure(format!("background task failed: {}", e));
@@ -1786,9 +1790,18 @@ async fn evaluate_diff_filter(
     // so each successfully-parsed config may still carry a warning.
     // Prefixing with the workflow path lets the log pane point the
     // user at exactly which file has the problem.
-    for cfg in &configs {
-        for w in &cfg.warnings {
-            warnings.push(format!("{}: {}", cfg.workflow_path.display(), w));
+    //
+    // `.take()` (not read-only iteration) is load-bearing: it is
+    // what satisfies the `MustDrainWarnings` Drop-check contract.
+    // A borrow-only `for w in &cfg.warnings` would leave the
+    // buffer non-empty on `cfg` drop, and the debug-build Drop
+    // impl would fire the "dropped without being drained"
+    // eprintln. Keeping this draining form also prevents the
+    // silent-skip regression the Drop check was designed to catch.
+    for cfg in configs.iter_mut() {
+        let path_display = cfg.workflow_path.display().to_string();
+        for w in cfg.warnings.take() {
+            warnings.push(format!("{}: {}", path_display, w));
         }
     }
 

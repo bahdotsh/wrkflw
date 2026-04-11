@@ -1,6 +1,168 @@
 use glob::{MatchOptions, Pattern, PatternError};
 use std::path::PathBuf;
 
+/// A warning buffer that insists on being drained before drop.
+///
+/// The trigger-filter crate deliberately routes non-fatal diagnostics
+/// (unknown event names, `git ls-files --others` failures, etc.)
+/// through struct fields instead of calling `wrkflw_logging::warning`
+/// directly — hosts own the rendering policy. That decoupling is only
+/// as strong as every host's willingness to drain the field; a single
+/// forgetful `filter_map(... .ok())` anywhere in the pipeline
+/// reintroduces the silent-skip failure mode this crate exists to
+/// plug.
+///
+/// `MustDrainWarnings` makes the contract self-enforcing in debug
+/// builds: if a non-empty instance is dropped without its contents
+/// being observed via [`MustDrainWarnings::take`], the Drop impl
+/// prints an `eprintln!` naming the unobserved warnings. Tests and
+/// CI catch the regression immediately; release builds carry no
+/// overhead. The Drop check is a `debug_assertions` guard, not a
+/// `panic!`, because panicking from Drop on a production code path
+/// (e.g. a watcher evicting a cache entry at shutdown under
+/// memory pressure) would be strictly worse than the silent skip
+/// it is trying to prevent.
+///
+/// **Clone semantics.** Clones carry an independent copy of the
+/// warnings — cloning does not count as observation. A cloned
+/// instance must be drained separately or its own Drop check will
+/// fire. This is the right behavior for the library's primary
+/// clone sites (the process-wide LRU cache and `filter_trigger_configs`
+/// iteration), because a clone whose warnings are silently dropped
+/// is exactly the same failure mode as the original — we want both
+/// paths to trip the check.
+#[derive(Debug, Default)]
+pub struct MustDrainWarnings {
+    inner: Vec<String>,
+}
+
+impl MustDrainWarnings {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn push(&mut self, warning: String) {
+        self.inner.push(warning);
+    }
+
+    pub fn extend<I: IntoIterator<Item = String>>(&mut self, iter: I) {
+        self.inner.extend(iter);
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    /// Iterate without draining. Callers that use this form MUST
+    /// follow it with a drain before the instance is dropped —
+    /// otherwise the debug-mode Drop check fires. Prefer
+    /// [`MustDrainWarnings::take`] whenever ownership semantics allow.
+    pub fn iter(&self) -> std::slice::Iter<'_, String> {
+        self.inner.iter()
+    }
+
+    /// Drain the buffer and return its contents. Satisfies the
+    /// Drop-time observation contract — after this, the instance
+    /// can be dropped cleanly even if the returned `Vec` is never
+    /// used again.
+    pub fn take(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.inner)
+    }
+}
+
+impl Clone for MustDrainWarnings {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+impl From<Vec<String>> for MustDrainWarnings {
+    fn from(inner: Vec<String>) -> Self {
+        Self { inner }
+    }
+}
+
+impl Drop for MustDrainWarnings {
+    fn drop(&mut self) {
+        // Silent in release builds — no production overhead, no
+        // stderr spam for users on platforms where the library is
+        // embedded without a host that drains. The loud behaviour
+        // is strictly a development/test guardrail.
+        //
+        // Also silent if we're already unwinding a panic:
+        // eprintln-ing during panic drop would stomp on the real
+        // failure message and confuse the test output.
+        if cfg!(debug_assertions) && !self.inner.is_empty() && !std::thread::panicking() {
+            eprintln!(
+                "wrkflw-trigger-filter: {} warning(s) were dropped without being drained by the host: {:?}",
+                self.inner.len(),
+                self.inner,
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn take_empties_the_buffer_and_returns_contents() {
+        let mut w = MustDrainWarnings::new();
+        w.push("alpha".to_string());
+        w.push("beta".to_string());
+        assert_eq!(w.len(), 2);
+        let drained = w.take();
+        assert_eq!(drained, vec!["alpha".to_string(), "beta".to_string()]);
+        assert!(w.is_empty(), "take must leave the buffer empty");
+        // Dropping the now-empty `w` at end of scope must NOT fire
+        // the debug-mode Drop check.
+    }
+
+    #[test]
+    fn dropping_after_take_is_silent() {
+        // Regression pin: if a future refactor flips the Drop check
+        // to fire on `len == 0 && drained == false` (a "did you
+        // remember to call take?" guard), this test catches it.
+        // The contract is: empty buffer at Drop = clean, regardless
+        // of whether anything was ever pushed.
+        let w = MustDrainWarnings::new();
+        drop(w);
+    }
+
+    #[test]
+    fn from_vec_roundtrip() {
+        let mut w = MustDrainWarnings::from(vec!["x".to_string()]);
+        let drained = w.take();
+        assert_eq!(drained, vec!["x".to_string()]);
+    }
+
+    #[test]
+    fn clone_produces_independent_buffers() {
+        // Clone semantics are load-bearing for the library's LRU
+        // cache: the cached clone must NOT count as observation of
+        // the original. This test pins that cloning yields two
+        // independent buffers, each of which must be drained
+        // separately.
+        let mut a = MustDrainWarnings::from(vec!["only-on-a".to_string()]);
+        let mut b = a.clone();
+        assert_eq!(a.len(), 1);
+        assert_eq!(b.len(), 1);
+        let _drain_a = a.take();
+        assert!(a.is_empty());
+        // b is still populated — drain it too so the Drop check
+        // doesn't fire at end of scope.
+        let _drain_b = b.take();
+        assert!(b.is_empty());
+    }
+}
+
 /// A glob pattern paired with its source string.
 ///
 /// The source is retained so diagnostic messages can refer back to what the
@@ -74,10 +236,20 @@ pub struct WorkflowTriggerConfig {
     pub workflow_path: PathBuf,
     pub workflow_name: String,
     pub events: Vec<EventFilter>,
-    pub warnings: Vec<String>,
+    /// Parser-level diagnostics (unknown event names, typo
+    /// detection). Hosts MUST drain via `warnings.take()` to satisfy
+    /// the `MustDrainWarnings` contract — see the type docs for
+    /// rationale.
+    pub warnings: MustDrainWarnings,
 }
 
 /// Simulated event context for matching.
+///
+/// **Not `#[non_exhaustive]` on purpose.** The watcher crate
+/// constructs this via struct literal from its own `cached_git_state`
+/// path, so adding `non_exhaustive` here would break the cross-crate
+/// build. If a future field is added, update the watcher's call site
+/// in the same commit.
 #[derive(Debug, Clone, Default)]
 pub struct EventContext {
     pub event_name: String,
@@ -112,11 +284,12 @@ pub struct EventContext {
     /// failed (the canonical example is `git ls-files --others` being
     /// rejected by a restrictive safe-directory config, which silently
     /// dropped untracked files from the changed set for the entire
-    /// cycle). Hosts should surface these to the user so "0 triggered"
-    /// on a buggy context does not look identical to "0 triggered"
-    /// because nothing matches — exactly the failure mode this crate
-    /// has been iteratively patched to prevent.
-    pub warnings: Vec<String>,
+    /// cycle). Hosts MUST drain this via `warnings.take()` so the
+    /// `MustDrainWarnings` Drop check stays satisfied — failing to
+    /// drain is exactly the silent-skip failure mode this crate has
+    /// been iteratively patched to prevent, and the Drop check
+    /// catches the regression in debug builds.
+    pub warnings: MustDrainWarnings,
 }
 
 /// Result of trigger evaluation for a single workflow.

@@ -12,7 +12,8 @@ pub use error::TriggerFilterError;
 pub use eval::evaluate_trigger;
 pub use git::{find_repo_root_detailed, head_mtime, FindRepoRootError};
 pub use model::{
-    EventContext, EventFilter, GlobPattern, TriggerMatchResult, WorkflowTriggerConfig,
+    EventContext, EventFilter, GlobPattern, MustDrainWarnings, TriggerMatchResult,
+    WorkflowTriggerConfig,
 };
 pub use parser::parse_trigger_config;
 
@@ -81,14 +82,37 @@ pub fn filter_trigger_configs(
 // Process-wide compiled-pattern cache
 // ---------------------------------------------------------------------------
 
-/// Entry in the global compiled-pattern cache. The mtime is the
-/// invalidation key: any caller asking for the same path after a write
-/// will observe a different mtime and re-parse. `u64` is the LRU
-/// "last used" counter — we avoid dragging in a full LRU crate for a
-/// hot-path cache whose typical hit ratio is >95%.
+/// Entry in the global compiled-pattern cache.
+///
+/// The invalidation key is the tuple `(mtime, len)`. Using mtime
+/// alone is unsafe on filesystems with coarse mtime granularity —
+/// FAT32 has a 2-second resolution, SMB and some NFS configurations
+/// report 1-second granularity, older ext4 without `dir_index` can
+/// return the same timestamp for two edits a few milliseconds apart.
+/// A user who edits a workflow file twice within the granularity
+/// window would otherwise hit the cache on the second parse and see
+/// a stale compiled config.
+///
+/// Pairing mtime with `file.len()` closes the common case: most
+/// edits change the file size (add a line, rename a field, fix a
+/// typo). Edits that leave the size unchanged AND land within the
+/// mtime resolution window are still a gap, but they are vanishingly
+/// rare in practice — the realistic failure mode was two saves in
+/// quick succession during iterative editing, which almost always
+/// change the byte count.
+///
+/// A content hash would close the remaining gap at the cost of one
+/// full file read on every cache lookup, which is precisely the
+/// work the cache exists to avoid. The `(mtime, len)` tuple is the
+/// pragmatic middle ground.
+///
+/// `u64` is the LRU "last used" counter — we avoid dragging in a
+/// full LRU crate for a hot-path cache whose typical hit ratio is
+/// >95%.
 #[derive(Debug, Clone)]
 struct CachedTriggerConfig {
     mtime: SystemTime,
+    len: u64,
     config: WorkflowTriggerConfig,
     last_used: u64,
 }
@@ -159,8 +183,15 @@ pub fn load_trigger_config_cached(
     if config.pattern_cache_size == 0 {
         return load_trigger_config(workflow_path);
     }
-    let mtime = match std::fs::metadata(workflow_path).and_then(|m| m.modified()) {
-        Ok(t) => t,
+    // Read both fields from a single `metadata()` call — `len()` is
+    // free on top of the stat we were already doing, and combining
+    // it with `modified()` makes the cache key resilient to
+    // coarse-granularity filesystems (see `CachedTriggerConfig` docs).
+    let (mtime, len) = match std::fs::metadata(workflow_path) {
+        Ok(meta) => match meta.modified() {
+            Ok(t) => (t, meta.len()),
+            Err(_) => return load_trigger_config(workflow_path),
+        },
         Err(_) => return load_trigger_config(workflow_path),
     };
 
@@ -182,7 +213,7 @@ pub fn load_trigger_config_cached(
         }
         cache.tick = cache.tick.wrapping_add(1);
         if let Some(entry) = cache.entries.get_mut(workflow_path) {
-            if entry.mtime == mtime {
+            if entry.mtime == mtime && entry.len == len {
                 entry.last_used = cache.tick;
                 return Ok(entry.config.clone());
             }
@@ -194,6 +225,28 @@ pub fn load_trigger_config_cached(
     // YAML parse + glob compile. Holding `PATTERN_CACHE` across that
     // would serialize every other caller in the process.
     let parsed = load_trigger_config(workflow_path)?;
+
+    // Build the cached copy BEFORE re-acquiring the lock, and drain
+    // its warnings on the way in. Rationale:
+    //
+    //   - The returned `parsed` carries the warnings for the
+    //     first-observer caller to render (CLI `eprintln!`, TUI log
+    //     pane, watcher warning drain).
+    //   - The cached clone is a private copy the caller never sees;
+    //     its warnings would otherwise fire the `MustDrainWarnings`
+    //     Drop check on cache eviction, because no one is around to
+    //     observe a clone nested inside an LRU.
+    //   - Suppressing warnings on subsequent cache-HIT calls is the
+    //     correct UX: a workflow-file typo is a one-time diagnostic,
+    //     and re-logging it every cache hit (e.g. every TUI
+    //     diff-filter toggle) would spam the log pane with
+    //     information the user already saw.
+    //
+    // If a future caller wants to see the warnings again, edit the
+    // workflow file — the mtime bump invalidates the cache entry,
+    // re-parses, and re-delivers them.
+    let mut cached_config = parsed.clone();
+    let _discard_cached_warnings = cached_config.warnings.take();
 
     // Re-acquire and insert. A concurrent caller may have populated
     // the entry while we were parsing; overwrite it with our fresh
@@ -208,7 +261,8 @@ pub fn load_trigger_config_cached(
         workflow_path.to_path_buf(),
         CachedTriggerConfig {
             mtime,
-            config: parsed.clone(),
+            len,
+            config: cached_config,
             last_used: tick,
         },
     );
@@ -289,7 +343,7 @@ pub async fn auto_detect_context(
         // the user already passed one.
         changed_files_explicit: true,
         activity_type: None,
-        warnings,
+        warnings: MustDrainWarnings::from(warnings),
     })
 }
 
@@ -339,7 +393,7 @@ pub async fn context_from_diff_range(
         // so an empty result is authoritative.
         changed_files_explicit: true,
         activity_type: None,
-        warnings: Vec::new(),
+        warnings: MustDrainWarnings::new(),
     })
 }
 
@@ -368,7 +422,7 @@ pub async fn context_from_changed_files(
         // "authoritative".
         changed_files_explicit: true,
         activity_type: None,
-        warnings: Vec::new(),
+        warnings: MustDrainWarnings::new(),
     })
 }
 
@@ -431,6 +485,26 @@ pub fn normalize_user_changed_file(raw: &str) -> Result<String, TriggerFilterErr
             return Err(TriggerFilterError::ParseError(format!(
                 "--changed-files entry '{}' contains `..`; only in-tree repo-relative \
                  paths are allowed",
+                raw
+            )));
+        }
+        // Reject empty segments (`src//foo.rs`) and whitespace-only
+        // segments (`src/   /foo.rs`). Both are structurally invalid
+        // — glob matching against the forward-slash-normalized form
+        // would silently fail on both shapes, which is the same
+        // silent-skip failure mode this validator exists to prevent.
+        // Catching them here produces an up-front "your flag was
+        // wrong" message instead of a mystery non-match.
+        //
+        // A trailing slash (`src/foo/`) produces one trailing empty
+        // component; that's also rejected, because GitHub Actions'
+        // `paths:` globs don't match directory references and a
+        // trailing slash is almost certainly a user mistake.
+        if component.trim().is_empty() {
+            return Err(TriggerFilterError::ParseError(format!(
+                "--changed-files entry '{}' contains an empty or whitespace-only \
+                 path component; use forward-slash-separated repo-relative paths \
+                 like `src/main.rs`",
                 raw
             )));
         }
@@ -551,6 +625,66 @@ mod tests {
     }
 
     #[test]
+    fn load_trigger_config_cached_invalidates_on_size_change_with_same_mtime() {
+        // Regression: the cache key used to be just mtime. On
+        // filesystems with coarse granularity (FAT32, SMB, older
+        // NFS) two edits within the resolution window hash to the
+        // same key and the second edit is served a stale compiled
+        // config. Simulate that collision by back-dating the file's
+        // mtime after a rewrite — mtime matches the first entry,
+        // len differs, and the cache must re-parse.
+        //
+        // Uses stdlib `FileTimes`/`File::set_times` (stable since
+        // Rust 1.75) so we don't pull in a dev-dep just to poke at
+        // mtimes from a test.
+        clear_pattern_cache();
+        let tmp = TempDir::new().expect("tempdir");
+        let wf = tmp.path().join("ci.yml");
+        std::fs::write(
+            &wf,
+            "name: first\non: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+        )
+        .unwrap();
+        let cfg = TriggerFilterConfig::default();
+        let first = load_trigger_config_cached(&wf, &cfg).unwrap();
+        assert_eq!(first.workflow_name, "first");
+
+        // Snapshot the exact mtime the first parse observed so we
+        // can force a collision.
+        let frozen_mtime = std::fs::metadata(&wf).unwrap().modified().unwrap();
+
+        // Rewrite with a DIFFERENT length. If we left mtime to the
+        // OS it would naturally advance and the test would pass
+        // for the wrong reason (the old mtime-only path would also
+        // invalidate). Force-reset mtime to its pre-rewrite value
+        // so the only surviving signal is `len`.
+        std::fs::write(
+            &wf,
+            "name: second-and-longer\non: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+        )
+        .unwrap();
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&wf)
+            .expect("open for mtime reset");
+        let times = std::fs::FileTimes::new().set_modified(frozen_mtime);
+        // Some CI filesystems / platforms may reject set_times; if
+        // so, skip the assertion below rather than flake, because
+        // the forced collision is the whole point of the test.
+        if f.set_times(times).is_err() {
+            return;
+        }
+        drop(f);
+
+        let second = load_trigger_config_cached(&wf, &cfg).unwrap();
+        assert_eq!(
+            second.workflow_name, "second-and-longer",
+            "cache must re-parse when the file SIZE changes even if mtime collides — \
+             coarse-granularity filesystem protection"
+        );
+    }
+
+    #[test]
     fn pattern_cache_size_zero_disables_caching() {
         clear_pattern_cache();
         let tmp = TempDir::new().expect("tempdir");
@@ -585,6 +719,29 @@ mod tests {
             normalize_user_changed_file("src\\main.rs").unwrap(),
             "src/main.rs"
         );
+    }
+
+    #[test]
+    fn normalize_user_changed_file_rejects_empty_and_whitespace_components() {
+        // Regression: previously a path like `src/   /foo.rs` (a
+        // whitespace-only middle component) would pass validation
+        // and then silently fail every `paths:` glob at evaluation
+        // time — the glob matcher treats `   ` as a literal three-
+        // space directory name, which never matches in practice.
+        // Surface the typo up front so the user sees a "your flag
+        // was wrong" message instead of a mystery non-match.
+        //
+        // The trailing-slash case (`src/foo/`) becomes an empty
+        // component after split and must also reject, because
+        // GitHub Actions' `paths:` filters don't match directories.
+        assert!(normalize_user_changed_file("src/   /foo.rs").is_err());
+        assert!(normalize_user_changed_file("src//foo.rs").is_err());
+        assert!(normalize_user_changed_file("src/foo/").is_err());
+        assert!(normalize_user_changed_file("/").is_err()); // already caught as absolute
+                                                            // Single-segment whitespace-only input is caught earlier
+                                                            // by the `trimmed.is_empty()` guard, but document that
+                                                            // path here for completeness.
+        assert!(normalize_user_changed_file("  ").is_err());
     }
 
     #[test]

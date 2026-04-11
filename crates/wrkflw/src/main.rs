@@ -570,12 +570,7 @@ async fn main() {
             strict_filter,
             no_strict_filter,
         }) => {
-            // `--no-strict-filter` wins over the default-true
-            // `--strict-filter` via clap's `conflicts_with`, so the
-            // effective value is (strict AND NOT no-strict). This
-            // mirrors the classic bool-toggle pattern clap uses for
-            // every other `--foo` / `--no-foo` pair in the CLI.
-            let strict_filter = *strict_filter && !*no_strict_filter;
+            let strict_filter = effective_strict_filter(*strict_filter, *no_strict_filter);
             // Determine workflow type up front so the trigger prefilter
             // can short-circuit for GitLab pipelines with a clear error.
             // Previously the prefilter ran first and tried to parse the
@@ -596,7 +591,7 @@ async fn main() {
                     );
                     std::process::exit(1);
                 }
-                run_trigger_prefilter_or_exit(PrefilterRequest {
+                let decision = run_trigger_prefilter(PrefilterRequest {
                     workflow_path: path,
                     event: event.as_ref(),
                     diff: *diff,
@@ -609,6 +604,23 @@ async fn main() {
                     strict_filter,
                 })
                 .await;
+                match decision {
+                    Ok(PrefilterDecision::Proceed) => {
+                        // Match — fall through to the executor below.
+                    }
+                    Ok(PrefilterDecision::Skip { reason }) => {
+                        use wrkflw_ui::cli_style;
+                        println!(
+                            "{}",
+                            cli_style::dim(&format!("Workflow skipped: {}", reason))
+                        );
+                        std::process::exit(0);
+                    }
+                    Err(msg) => {
+                        eprintln!("Error: {}", msg);
+                        std::process::exit(1);
+                    }
+                }
             }
 
             // Create execution configuration
@@ -747,7 +759,7 @@ async fn main() {
             strict_filter,
             no_strict_filter,
         }) => {
-            let strict_filter = *strict_filter && !*no_strict_filter;
+            let strict_filter = effective_strict_filter(*strict_filter, *no_strict_filter);
             let workflow_dir = path
                 .clone()
                 .unwrap_or_else(|| PathBuf::from(".github/workflows"));
@@ -844,7 +856,14 @@ async fn main() {
                 .with_extra_ignore_dirs(ignore_dirs.clone());
             let watcher = wrkflw_watcher::WorkflowWatcher::from_config(watcher_cfg);
 
-            // Validate workflow files exist before starting
+            // Pre-flight: surface any real I/O error (missing dir,
+            // permission denied) before the user sees a "watching..."
+            // banner. An empty directory is NOT an error — the
+            // watcher's internal rescan picks up `.yml` files the
+            // moment they are created, which is the whole point of
+            // watch mode. `collect_workflow_files_blocking` now
+            // returns `Ok(Vec::new())` for an empty dir, so only
+            // genuine failures propagate past this match.
             if let Err(e) = watcher.collect_workflow_files().await {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
@@ -1007,6 +1026,37 @@ async fn main() {
     }
 }
 
+/// Decision returned by [`run_trigger_prefilter`].
+///
+/// Previously the prefilter called `std::process::exit` from half a
+/// dozen sites deep inside its body, which made the flag-matrix
+/// untestable — a unit test would have to spawn a subprocess just to
+/// observe the exit code. Returning a plain enum lets the orchestrator
+/// own the decision and hand `main()` the responsibility of calling
+/// `process::exit`. The side-effects that need to happen before the
+/// decision (warning drains, verbose logging) still live in the
+/// orchestrator body; only the exit is deferred.
+#[derive(Debug)]
+enum PrefilterDecision {
+    /// The workflow's triggers matched the event context — main
+    /// should proceed to execute the workflow.
+    Proceed,
+    /// The workflow's triggers did NOT match — main should print the
+    /// reason (already formatted for the user) and exit 0.
+    Skip { reason: String },
+}
+
+/// Resolve the effective `--strict-filter` / `--no-strict-filter`
+/// bool toggle. `--no-strict-filter` wins over the default-true
+/// `--strict-filter` via clap's `conflicts_with`, so the effective
+/// value is `strict AND NOT no_strict`. Extracted so the two call
+/// sites (`wrkflw run` and `wrkflw watch`) cannot drift apart — if
+/// a third host grows the same flag pair, it gets the same
+/// coalescing for free.
+fn effective_strict_filter(strict: bool, no_strict: bool) -> bool {
+    strict && !no_strict
+}
+
 /// Bundled inputs for the `wrkflw run` trigger prefilter.
 ///
 /// Grouping these into a single struct collapses the previous 8-argument
@@ -1038,29 +1088,40 @@ struct PrefilterRequest<'a> {
     strict_filter: bool,
 }
 
-/// Build an event context from the user's CLI flags and short-circuit
-/// the run if the workflow's triggers do not match.
+/// Build an event context from the user's CLI flags and decide
+/// whether the workflow should run.
 ///
-/// Exits the process on failure or skip; returns normally only when the
-/// workflow should run.
-async fn run_trigger_prefilter_or_exit(req: PrefilterRequest<'_>) {
+/// Returns:
+/// - `Ok(PrefilterDecision::Proceed)` — triggers matched, main should
+///   continue into the executor path.
+/// - `Ok(PrefilterDecision::Skip { reason })` — triggers did not match,
+///   main should print the reason and exit 0.
+/// - `Err(msg)` — something went wrong building the context or parsing
+///   the workflow, main should print the message and exit 1.
+///
+/// All `std::process::exit` calls have been lifted out of this
+/// function so the decision logic is testable without spawning a
+/// subprocess — the flag matrix (`--diff` vs `--diff-base` vs
+/// `--changed-files`, strict vs non-strict, pull_request vs push) is
+/// the sort of thing that benefits most from unit tests, and the old
+/// shape made that impossible.
+async fn run_trigger_prefilter(req: PrefilterRequest<'_>) -> Result<PrefilterDecision, String> {
     // `wrkflw run` expects a single workflow file. Catch directory paths up
     // front with a clear error; otherwise the user sees a confusing
     // "Error parsing workflow" from the YAML parser further down.
     if !req.workflow_path.is_file() {
         if req.workflow_path.is_dir() {
-            eprintln!(
-                "Error: --diff/--event/--changed-files require a single workflow file, not a directory.\n\
+            return Err(format!(
+                "--diff/--event/--changed-files require a single workflow file, not a directory.\n\
                  Hint: point at a specific .yml file, or use `wrkflw watch {}` for directory-wide watching.",
                 req.workflow_path.display()
-            );
+            ));
         } else {
-            eprintln!(
-                "Error: workflow file not found: {}",
+            return Err(format!(
+                "workflow file not found: {}",
                 req.workflow_path.display()
-            );
+            ));
         }
-        std::process::exit(1);
     }
 
     let event_name = req.event.cloned().unwrap_or_else(|| "push".to_string());
@@ -1084,33 +1145,18 @@ async fn run_trigger_prefilter_or_exit(req: PrefilterRequest<'_>) {
         match tokio::task::spawn_blocking(wrkflw_trigger_filter::find_repo_root_detailed).await {
             Ok(Ok(p)) => Some(p),
             Ok(Err(wrkflw_trigger_filter::FindRepoRootError::NotInRepository)) => None,
-            Ok(Err(e)) => {
-                eprintln!("Error: {}", e);
-                std::process::exit(1);
-            }
-            Err(join_err) => {
-                eprintln!("Error: find_repo_root task panicked: {}", join_err);
-                std::process::exit(1);
-            }
+            Ok(Err(e)) => return Err(e.to_string()),
+            Err(join_err) => return Err(format!("find_repo_root task panicked: {}", join_err)),
         };
     let cwd_for_git: Option<&Path> = repo_root.as_deref();
 
-    let mut event_context = match build_event_context(&req, &event_name, cwd_for_git).await {
-        Ok(ctx) => ctx,
-        Err(e) => {
-            eprintln!("Error: {}", e);
-            std::process::exit(1);
-        }
-    };
-    if let Err(e) = apply_base_branch(
+    let mut event_context = build_event_context(&req, &event_name, cwd_for_git).await?;
+    apply_base_branch(
         &mut event_context,
         &event_name,
         req.base_branch,
         req.strict_filter,
-    ) {
-        eprintln!("Error: {}", e);
-        std::process::exit(1);
-    }
+    )?;
     // Stamp `--activity-type` onto the context. `EventContext::activity_type`
     // is the field GitHub Actions matches its `types:` filter against —
     // without it, every workflow with `types: [opened, ...]` is silently
@@ -1126,10 +1172,17 @@ async fn run_trigger_prefilter_or_exit(req: PrefilterRequest<'_>) {
     // these itself — it collects them as data and hands them to
     // hosts via `EventContext::warnings`, so we own the rendering
     // policy here and can stay consistent with the rest of the CLI's
-    // colorization. See the parser.rs note on why library logging
-    // was removed.
-    for w in &event_context.warnings {
-        wrkflw_logging::warning(w);
+    // colorization.
+    //
+    // `take()` (rather than read-only iteration) is load-bearing:
+    // `EventContext::warnings` is a `MustDrainWarnings` whose Drop
+    // check fires in debug builds if a non-empty buffer is dropped
+    // without being observed. Draining satisfies the contract and
+    // guarantees the CLI path cannot silently reintroduce the
+    // warning-loss failure mode the rest of this PR has been
+    // plugging.
+    for w in event_context.warnings.take() {
+        wrkflw_logging::warning(&w);
     }
 
     if req.verbose {
@@ -1153,7 +1206,7 @@ async fn run_trigger_prefilter_or_exit(req: PrefilterRequest<'_>) {
     // here is exactly how the silent-failure holes accumulated.
     let workflow_path_owned = req.workflow_path.to_path_buf();
     let tf_config = wrkflw_trigger_filter::TriggerFilterConfig::default();
-    let trigger_config = tokio::task::spawn_blocking(move || {
+    let mut trigger_config = tokio::task::spawn_blocking(move || {
         // Route through the shared LRU cache so every wrkflw entry
         // point (CLI prefilter, TUI diff-filter, watcher hot loop)
         // contends over the same compiled-pattern store. Unifying
@@ -1162,32 +1215,26 @@ async fn run_trigger_prefilter_or_exit(req: PrefilterRequest<'_>) {
         wrkflw_trigger_filter::load_trigger_config_cached(&workflow_path_owned, &tf_config)
     })
     .await
-    .unwrap_or_else(|e| {
-        eprintln!("Error: workflow parse task panicked: {}", e);
-        std::process::exit(1);
-    })
-    .unwrap_or_else(|e| {
-        eprintln!("Error parsing workflow: {}", e);
-        std::process::exit(1);
-    });
-    // Surface any parser-collected diagnostics (unknown event names,
-    // etc.) now that the trigger-filter crate no longer logs them
-    // itself. Hosts own the rendering policy — see model.rs::
-    // `WorkflowTriggerConfig::warnings` for rationale.
-    for w in &trigger_config.warnings {
-        wrkflw_logging::warning(w);
+    .map_err(|e| format!("workflow parse task panicked: {}", e))?
+    .map_err(|e| format!("parsing workflow: {}", e))?;
+    // Drain parser-collected diagnostics (unknown event names, etc.)
+    // — the library decouples from the log sink by design, so every
+    // host must drain this field or reintroduce the silent-skip
+    // failure mode. `take()` also satisfies the `MustDrainWarnings`
+    // Drop-check contract that catches the regression in debug
+    // builds.
+    for w in trigger_config.warnings.take() {
+        wrkflw_logging::warning(&w);
     }
     let match_result = wrkflw_trigger_filter::evaluate_trigger(&trigger_config, &event_context);
 
     if !match_result.matches {
-        use wrkflw_ui::cli_style;
-        println!(
-            "{}",
-            cli_style::dim(&format!("Workflow skipped: {}", match_result.reason))
-        );
-        std::process::exit(0);
+        return Ok(PrefilterDecision::Skip {
+            reason: match_result.reason,
+        });
     }
     wrkflw_logging::info(&format!("Trigger matched: {}", match_result.reason));
+    Ok(PrefilterDecision::Proceed)
 }
 
 /// Pick the right context-builder based on which flags the user supplied.
@@ -1523,6 +1570,129 @@ fn list_workflows_and_pipelines(verbose: bool, show_jobs: bool) {
                     "\u{2514}\u{2500}\u{2500}".dimmed(),
                     entry.path().display()
                 );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod prefilter_tests {
+    //! Unit coverage for the `run_trigger_prefilter` decision logic.
+    //!
+    //! These tests exist specifically because the previous
+    //! `run_trigger_prefilter_or_exit` shape called `std::process::exit`
+    //! from inside every failure branch, making the flag matrix
+    //! impossible to exercise without spawning a subprocess. The
+    //! refactor that returns `Result<PrefilterDecision, String>`
+    //! lets us pin the "path is a directory", "path does not
+    //! exist", and "workflow parses but does not match" branches
+    //! here in-process.
+    use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn directory_path_returns_err_with_watch_hint() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let dir = tmp.path().to_path_buf();
+        let empty_files: Option<Vec<String>> = None;
+        let event = "push".to_string();
+        let req = PrefilterRequest {
+            workflow_path: &dir,
+            event: Some(&event),
+            diff: false,
+            changed_files: empty_files.as_ref(),
+            diff_base: None,
+            diff_head: None,
+            base_branch: None,
+            activity_type: None,
+            verbose: false,
+            strict_filter: false,
+        };
+        let err = run_trigger_prefilter(req)
+            .await
+            .expect_err("directory path must produce an Err");
+        assert!(
+            err.contains("single workflow file"),
+            "err must explain the single-file constraint, got: {}",
+            err
+        );
+        assert!(
+            err.contains("wrkflw watch"),
+            "err must suggest `wrkflw watch` for directory-wide watching, got: {}",
+            err
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn missing_path_returns_err_with_not_found() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let missing = tmp.path().join("does-not-exist.yml");
+        let event = "push".to_string();
+        let req = PrefilterRequest {
+            workflow_path: &missing,
+            event: Some(&event),
+            diff: false,
+            changed_files: None,
+            diff_base: None,
+            diff_head: None,
+            base_branch: None,
+            activity_type: None,
+            verbose: false,
+            strict_filter: false,
+        };
+        let err = run_trigger_prefilter(req)
+            .await
+            .expect_err("missing path must produce an Err");
+        assert!(
+            err.contains("not found"),
+            "err must name the not-found case, got: {}",
+            err
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn skip_decision_returned_when_trigger_does_not_match() {
+        // A push workflow gated on `paths: ['irrelevant/**']` with an
+        // explicit empty --changed-files list must resolve to
+        // `Skip`, not an error. This is the load-bearing "user got
+        // a clean exit 0 because their edit did not touch the
+        // filter's paths" scenario the executor path depends on.
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let wf = tmp.path().join("ci.yml");
+        std::fs::write(
+            &wf,
+            "name: ci\n\
+             on:\n  push:\n    paths:\n      - 'irrelevant/**'\n\
+             jobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+        )
+        .expect("write workflow");
+
+        let event = "push".to_string();
+        let changed: Vec<String> = vec!["src/main.rs".to_string()];
+        let req = PrefilterRequest {
+            workflow_path: &wf,
+            event: Some(&event),
+            diff: false,
+            changed_files: Some(&changed),
+            diff_base: None,
+            diff_head: None,
+            base_branch: None,
+            activity_type: None,
+            verbose: false,
+            strict_filter: false,
+        };
+        let decision = run_trigger_prefilter(req)
+            .await
+            .expect("should not error on a valid workflow");
+        match decision {
+            PrefilterDecision::Skip { reason } => {
+                assert!(
+                    reason.contains("paths"),
+                    "skip reason must mention the paths filter, got: {}",
+                    reason
+                );
+            }
+            PrefilterDecision::Proceed => {
+                panic!("expected Skip for non-matching paths, got Proceed");
             }
         }
     }

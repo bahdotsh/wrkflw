@@ -112,6 +112,27 @@ pub(crate) fn setup_watches(
 
 /// Synchronous implementation of `collect_workflow_files`. Extracted so it can
 /// be invoked from `spawn_blocking` without closure capture juggling.
+///
+/// An empty directory returns `Ok(Vec::new())`, NOT an error. Two
+/// reasons:
+///
+///   1. Watch mode's entire value proposition is "react to files that
+///      don't exist yet" — refusing to start on an empty
+///      `.github/workflows` produces a UX dead end where the user
+///      has to pre-populate the directory just to start the watcher.
+///
+///   2. The mid-session rescan feeds this function's result into
+///      `refresh_trigger_cache_blocking`'s `active_set`, which drives
+///      `retain` over the compiled-pattern cache. If deleting every
+///      workflow file produced an `Err` here, the rescan branch
+///      fell back to the *stale* prior snapshot, `active_set`
+///      retained the deleted entries, and the evaluator kept
+///      running against configs for files that no longer existed.
+///      Returning an empty `Ok` lets the retain step evict correctly.
+///
+/// Real I/O errors (directory not found, permission denied) still
+/// propagate via the `?` on `read_dir` / `entry` — those are the
+/// cases the caller *does* want to handle explicitly.
 pub(crate) fn collect_workflow_files_blocking(dir: &Path) -> Result<Vec<PathBuf>, WatchError> {
     if dir.is_file() {
         return Ok(vec![dir.to_path_buf()]);
@@ -128,9 +149,6 @@ pub(crate) fn collect_workflow_files_blocking(dir: &Path) -> Result<Vec<PathBuf>
         }
     }
 
-    if files.is_empty() {
-        return Err(WatchError::NoWorkflows(dir.display().to_string()));
-    }
     Ok(files)
 }
 
@@ -139,6 +157,39 @@ mod tests {
     use super::*;
     use crate::ignore::build_ignore_set;
     use notify::Event;
+
+    #[test]
+    fn collect_workflow_files_returns_ok_for_empty_directory() {
+        // Regression: refusing to start on an empty workflow dir
+        // defeats the "pick up files as they appear" property that
+        // is the whole point of watch mode. An empty dir must
+        // return Ok(Vec::new()) so the watcher can start and the
+        // mid-session rescan can evict stale entries when the last
+        // workflow file is deleted.
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let files = collect_workflow_files_blocking(tmp.path()).expect("empty dir must be Ok");
+        assert!(
+            files.is_empty(),
+            "empty dir must return an empty Vec, got {:?}",
+            files
+        );
+    }
+
+    #[test]
+    fn collect_workflow_files_still_errors_on_missing_dir() {
+        // The guardrail for the "empty = Ok" change: a directory
+        // that does not exist at all must STILL produce an error
+        // via `read_dir`'s underlying I/O failure. Otherwise the
+        // CLI's pre-flight check would silently accept a typo'd
+        // `--path` and the user would see "watching..." against
+        // nothing.
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let missing = tmp.path().join("nope-does-not-exist");
+        assert!(
+            collect_workflow_files_blocking(&missing).is_err(),
+            "nonexistent dir must surface an I/O error"
+        );
+    }
 
     #[tokio::test]
     async fn setup_watches_skips_ignored_subtrees() {

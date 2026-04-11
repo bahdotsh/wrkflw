@@ -10,7 +10,4 @@ pub enum WatchError {
 
     #[error("Execution error: {0}")]
     Execution(String),
-
-    #[error("No workflow files found in {0}")]
-    NoWorkflows(String),
 }

@@ -1,5 +1,5 @@
 use crate::error::TriggerFilterError;
-use crate::model::{EventFilter, GlobPattern, WorkflowTriggerConfig};
+use crate::model::{EventFilter, GlobPattern, MustDrainWarnings, WorkflowTriggerConfig};
 use std::path::PathBuf;
 use wrkflw_parser::workflow::WorkflowDefinition;
 
@@ -98,7 +98,7 @@ pub fn parse_trigger_config(
     // Side-channel warning for typos / unknown events — not a parse
     // error because GHA's event list keeps growing. Stashed on the
     // returned config so hosts can render them via their own log sink.
-    let warnings = collect_unknown_event_warnings(&events, &workflow_path);
+    let warnings = MustDrainWarnings::from(collect_unknown_event_warnings(&events, &workflow_path));
     Ok(WorkflowTriggerConfig {
         workflow_path,
         workflow_name: workflow.name.clone(),
@@ -888,13 +888,12 @@ pul_request:
             jobs: std::collections::HashMap::new(),
             defaults: None,
         };
-        let cfg = parse_trigger_config(&wf, PathBuf::from("test.yml")).unwrap();
-        assert_eq!(cfg.warnings.len(), 1);
-        assert!(
-            cfg.warnings[0].contains("pul_request"),
-            "got: {}",
-            cfg.warnings[0]
-        );
+        let mut cfg = parse_trigger_config(&wf, PathBuf::from("test.yml")).unwrap();
+        // Drain explicitly so the MustDrainWarnings Drop check stays
+        // satisfied — this test also pins the host-side contract.
+        let drained = cfg.warnings.take();
+        assert_eq!(drained.len(), 1);
+        assert!(drained[0].contains("pul_request"), "got: {}", drained[0]);
     }
 
     #[test]

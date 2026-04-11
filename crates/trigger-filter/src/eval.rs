@@ -286,7 +286,7 @@ fn explain_filter_failure(filter: &EventFilter, context: &EventContext) -> Strin
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{EventFilter, GlobPattern};
+    use crate::model::{EventFilter, GlobPattern, MustDrainWarnings};
     use std::path::PathBuf;
 
     fn gp(s: &str) -> GlobPattern {
@@ -298,7 +298,7 @@ mod tests {
             workflow_path: PathBuf::from("test.yml"),
             workflow_name: "test".to_string(),
             events,
-            warnings: Vec::new(),
+            warnings: MustDrainWarnings::new(),
         }
     }
 

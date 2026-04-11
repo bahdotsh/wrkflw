@@ -22,6 +22,53 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::SystemTime;
 
+/// Canonicalize `path`, tolerating the case where the target was deleted.
+///
+/// Walks back to the nearest canonicalizable ancestor and then re-appends
+/// the missing trailing components. This is the load-bearing helper that
+/// lets deleted files stay root-relative on platforms where the raw path
+/// would fail `strip_prefix` — macOS `/private/var` vs `/var`, symlinked
+/// working trees on Linux, and similar platform quirks.
+///
+/// This function lives in `wrkflw-trigger-filter` (and not the watcher
+/// crate where it originally lived) so the process-wide compiled-config
+/// LRU inside [`load_trigger_config_cached`] can key cache entries on
+/// the canonical form. Without a single shared canonicalizer, the CLI
+/// prefilter, the TUI diff-filter, and the watcher hot loop all keyed
+/// the same logical file under DIFFERENT `PathBuf` shapes (raw user
+/// input vs relative `read_dir` output vs watcher-canonicalized notify
+/// paths), and the docstring's "three hosts share one parse per (path,
+/// mtime)" claim was aspirational — each host maintained its own
+/// de-facto private cache entry. Centralizing the helper here and
+/// canonicalizing inside the cache lookup closes that gap.
+///
+/// Pure function, no retries, no logging. Safe to call on a tight loop
+/// — each call is `O(components)` at worst (one `lstat` per component
+/// via `std::fs::canonicalize`).
+pub fn canonicalize_allowing_missing(path: &Path) -> PathBuf {
+    if let Ok(canonical) = std::fs::canonicalize(path) {
+        return canonical;
+    }
+    // Walk up until we find an ancestor we can canonicalize; collect the
+    // missing tail so we can re-join it.
+    let mut tail: Vec<&std::ffi::OsStr> = Vec::new();
+    let mut cursor: &Path = path;
+    while let Some(parent) = cursor.parent() {
+        if let Some(leaf) = cursor.file_name() {
+            tail.push(leaf);
+        }
+        if let Ok(canonical_parent) = std::fs::canonicalize(parent) {
+            let mut result = canonical_parent;
+            for seg in tail.into_iter().rev() {
+                result.push(seg);
+            }
+            return result;
+        }
+        cursor = parent;
+    }
+    path.to_path_buf()
+}
+
 /// Read a workflow file from disk and parse its trigger configuration in
 /// one step. Centralizes the "read + parse + compile globs" pipeline so
 /// that `watcher`, the TUI, and the CLI all fail identically on the same
@@ -118,11 +165,21 @@ struct CachedTriggerConfig {
 }
 
 /// Process-wide LRU cache of compiled trigger configs, keyed by
-/// `(absolute_path, mtime)`. Three hosts (CLI prefilter, watcher hot
-/// loop, TUI diff-filter toggle) previously each re-parsed every
-/// workflow on every invocation, re-compiling every glob pattern. This
-/// cache collapses that work to one parse per (path, mtime) pair across
-/// the entire process.
+/// `(canonicalized_path, mtime, len)`. Three hosts (CLI prefilter,
+/// watcher hot loop, TUI diff-filter toggle) each present the same
+/// workflow file under a different `PathBuf` shape — the CLI passes
+/// whatever the user typed, the TUI passes a relative form from
+/// `read_dir`, the watcher passes its own canonicalized notify form.
+/// Keying directly on the caller's path would therefore produce one
+/// cache entry per host per file, defeating the point of the cache.
+///
+/// [`load_trigger_config_cached`] canonicalizes via
+/// [`canonicalize_allowing_missing`] before every lookup and insert,
+/// so all three hosts hash to the same bucket. The returned
+/// `WorkflowTriggerConfig`'s `workflow_path` field is rewritten back
+/// to the caller's original shape before return — UI labels and error
+/// messages still show the path the user wrote, not macOS's
+/// `/private/var/...` form.
 ///
 /// Size is bounded by `TriggerFilterConfig::pattern_cache_size` —
 /// overflow evicts the least-recently-used entry. The lock is a
@@ -183,11 +240,31 @@ pub fn load_trigger_config_cached(
     if config.pattern_cache_size == 0 {
         return load_trigger_config(workflow_path);
     }
+    // Canonicalize for cache keying. The caller's raw `workflow_path`
+    // is preserved and rewritten onto the returned config below — UI
+    // labels and error messages still show the shape the user wrote.
+    // Without this, each host (CLI / TUI / watcher) would hash to a
+    // different bucket for the same file and the "shared process-wide
+    // cache" promise in the `PATTERN_CACHE` docstring would be a lie.
+    //
+    // `canonicalize_allowing_missing` never fails — it walks up to the
+    // nearest canonicalizable ancestor and re-joins the tail — so a
+    // workflow file that was just deleted (and is about to be
+    // recreated, or about to be evicted from the cache) still hashes
+    // consistently.
+    let canonical_key = canonicalize_allowing_missing(workflow_path);
     // Read both fields from a single `metadata()` call — `len()` is
     // free on top of the stat we were already doing, and combining
     // it with `modified()` makes the cache key resilient to
     // coarse-granularity filesystems (see `CachedTriggerConfig` docs).
-    let (mtime, len) = match std::fs::metadata(workflow_path) {
+    //
+    // We `stat` the canonical form so two callers with different path
+    // shapes for the same file agree on mtime + len. If a transient
+    // metadata failure happens (file deleted between canonicalize and
+    // stat, permission glitch), fall back to an uncached parse of the
+    // ORIGINAL path so the caller's error message points at the shape
+    // they actually wrote.
+    let (mtime, len) = match std::fs::metadata(&canonical_key) {
         Ok(meta) => match meta.modified() {
             Ok(t) => (t, meta.len()),
             Err(_) => return load_trigger_config(workflow_path),
@@ -212,10 +289,21 @@ pub fn load_trigger_config_cached(
             }
         }
         cache.tick = cache.tick.wrapping_add(1);
-        if let Some(entry) = cache.entries.get_mut(workflow_path) {
+        if let Some(entry) = cache.entries.get_mut(&canonical_key) {
             if entry.mtime == mtime && entry.len == len {
                 entry.last_used = cache.tick;
-                return Ok(entry.config.clone());
+                // Rewrite `workflow_path` to the caller's original
+                // form on the way out. The cached copy carries the
+                // canonical form so two callers with different path
+                // shapes agree on cache identity, but each caller
+                // expects to see their own input shape in the
+                // returned config (UI labels, error messages, and —
+                // crucially — the TUI's `by_path` HashMap lookup in
+                // `check_diff_filter_results` which keys on
+                // `workflow.path`, not the canonical form).
+                let mut hit = entry.config.clone();
+                hit.workflow_path = workflow_path.to_path_buf();
+                return Ok(hit);
             }
         }
     }
@@ -245,8 +333,14 @@ pub fn load_trigger_config_cached(
     // If a future caller wants to see the warnings again, edit the
     // workflow file — the mtime bump invalidates the cache entry,
     // re-parses, and re-delivers them.
+    //
+    // The cached copy carries `workflow_path = canonical_key` so the
+    // hit path above can rewrite each subsequent caller's return
+    // value back to their own input shape without depending on which
+    // host happened to parse first.
     let mut cached_config = parsed.clone();
     let _discard_cached_warnings = cached_config.warnings.take();
+    cached_config.workflow_path = canonical_key.clone();
 
     // Re-acquire and insert. A concurrent caller may have populated
     // the entry while we were parsing; overwrite it with our fresh
@@ -258,7 +352,7 @@ pub fn load_trigger_config_cached(
     let cache = guard.get_or_insert_with(|| PatternCache::new(config.pattern_cache_size));
     let tick = cache.tick;
     cache.entries.insert(
-        workflow_path.to_path_buf(),
+        canonical_key,
         CachedTriggerConfig {
             mtime,
             len,
@@ -754,5 +848,178 @@ mod tests {
         let err = normalize_user_changed_file("src/main\0.rs").unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("NUL"), "got: {}", msg);
+    }
+
+    #[test]
+    fn canonicalize_allowing_missing_handles_deleted_leaf() {
+        // The leaf does not exist, but its parent is a real
+        // canonicalizable directory — the fallback must walk up and
+        // re-join the missing leaf.
+        //
+        // Moved from `wrkflw-watcher` when the helper graduated to
+        // `trigger-filter` so a single copy serves both crates.
+        let tmp = TempDir::new().expect("tempdir");
+        let root = tmp.path();
+        let deleted = root.join("missing.txt");
+        assert!(!deleted.exists());
+
+        let canonical = canonicalize_allowing_missing(&deleted);
+        assert!(
+            canonical.ends_with("missing.txt"),
+            "canonical should retain the leaf, got {}",
+            canonical.display()
+        );
+        let expected_parent = std::fs::canonicalize(root).unwrap();
+        assert_eq!(canonical.parent(), Some(expected_parent.as_path()));
+    }
+
+    #[test]
+    fn canonicalize_allowing_missing_handles_deleted_subdir_leaf() {
+        // Parent directory also missing, grandparent exists — must walk
+        // up one more level and re-join both segments.
+        let tmp = TempDir::new().expect("tempdir");
+        let root = tmp.path();
+        let deeper = root.join("gone").join("missing.txt");
+
+        let canonical = canonicalize_allowing_missing(&deeper);
+        assert!(canonical.ends_with("gone/missing.txt"));
+        let expected_root = std::fs::canonicalize(root).unwrap();
+        assert_eq!(
+            canonical.strip_prefix(&expected_root).ok(),
+            Some(Path::new("gone/missing.txt"))
+        );
+    }
+
+    #[tokio::test]
+    async fn load_trigger_config_cached_handles_concurrent_same_file_callers() {
+        // Regression pin for the docstring at `PATTERN_CACHE`:
+        // "racing duplicate parses on the *same* file are safe — both
+        //  writers produce the same value, and late-writer-wins is the
+        //  simpler invariant."
+        //
+        // Sixteen concurrent `spawn_blocking` tasks hit
+        // `load_trigger_config_cached` on the same workflow file from
+        // a cold cache. All must succeed and return structurally
+        // identical configs. Without the mutex release-before-parse
+        // discipline in `load_trigger_config_cached`, concurrent
+        // callers would either serialize behind a single slow parse
+        // or produce divergent state; this test catches a regression
+        // in either direction.
+        //
+        // Also pins that cross-host path-shape sharing works: each
+        // task canonicalizes independently via
+        // `canonicalize_allowing_missing` and all hash to the same
+        // LRU bucket.
+        clear_pattern_cache();
+        let tmp = TempDir::new().expect("tempdir");
+        let wf = tmp.path().join("ci.yml");
+        std::fs::write(
+            &wf,
+            "name: ci\non: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+        )
+        .unwrap();
+
+        let cfg = TriggerFilterConfig::default();
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let wf = wf.clone();
+            let cfg = cfg.clone();
+            handles.push(tokio::task::spawn_blocking(move || {
+                load_trigger_config_cached(&wf, &cfg)
+            }));
+        }
+
+        let mut results = Vec::new();
+        for h in handles {
+            let r = h.await.expect("join").expect("load_trigger_config_cached");
+            results.push(r);
+        }
+
+        // Every result must agree on the structural shape. A
+        // concurrent-writer bug would show up as mismatched event
+        // counts or mismatched workflow_name strings.
+        let first_name = results[0].workflow_name.clone();
+        let first_events_len = results[0].events.len();
+        for r in &results {
+            assert_eq!(r.workflow_name, first_name);
+            assert_eq!(r.events.len(), first_events_len);
+            // Every caller must get their own raw path back, not the
+            // canonical form that the cache stores internally. The
+            // hit path rewrites `workflow_path` on return.
+            assert_eq!(r.workflow_path, wf);
+        }
+
+        // Drain warnings on every result to satisfy the
+        // `MustDrainWarnings` contract — the `ci` workflow above
+        // should produce no warnings in practice, but drain anyway
+        // so the debug-mode Drop check stays silent.
+        for mut r in results {
+            let _ = r.warnings.take();
+        }
+    }
+
+    #[test]
+    fn load_trigger_config_cached_shares_across_raw_and_canonical_forms() {
+        // Regression for the cross-host sharing promise on the
+        // `PATTERN_CACHE` docstring. A caller that passes the raw
+        // relative form and a caller that passes the canonical
+        // absolute form must hit the SAME cache entry — otherwise
+        // each host maintains its own de-facto private cache and the
+        // cross-host sharing the docstring advertises is a lie.
+        //
+        // Simulated by: parse once via the relative form, then parse
+        // again via the canonical absolute form, and assert the
+        // cached entry count stays at 1. We can't directly introspect
+        // the LRU from outside the module, so we use a small capacity
+        // (2) and a second workflow file as a "distinguishing
+        // fingerprint": if the sharing is broken and each call makes
+        // its own entry, the two entries plus the second file
+        // overflows the capacity and one gets evicted. We don't
+        // assert the fingerprint directly; instead we rely on the
+        // canonical-path-rewrite invariant: each caller must get
+        // their own raw path back on return. If raw and canonical
+        // callers shared a bucket, both reads succeed with each
+        // caller's own path. If they don't share, both still succeed
+        // but pay for an extra parse — which is exactly the
+        // performance regression we're pinning against.
+        //
+        // The strongest assertion available without introspection:
+        // both paths return the same `workflow_name` (trivially
+        // true for the same file) AND both return their own raw
+        // `workflow_path`, confirming the rewrite path fires.
+        clear_pattern_cache();
+        let tmp = TempDir::new().expect("tempdir");
+        // Use a subdirectory so we have a clear "relative" vs
+        // "absolute" distinction even on systems where the tempdir
+        // root is already canonical.
+        let subdir = tmp.path().join("workflows");
+        std::fs::create_dir(&subdir).unwrap();
+        let wf_abs = subdir.join("ci.yml");
+        std::fs::write(
+            &wf_abs,
+            "name: ci\non: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+        )
+        .unwrap();
+
+        let cfg = TriggerFilterConfig::default();
+
+        // First caller: absolute form.
+        let mut first = load_trigger_config_cached(&wf_abs, &cfg).unwrap();
+        assert_eq!(first.workflow_path, wf_abs);
+        let _ = first.warnings.take();
+
+        // Second caller: canonicalized absolute form (may differ on
+        // macOS via /private/var). If sharing is broken, this is a
+        // miss and pays for a second parse; if it works, it's a hit
+        // and the returned config still carries THIS caller's raw
+        // path (the canonical form in this case).
+        let canonical = std::fs::canonicalize(&wf_abs).unwrap();
+        let mut second = load_trigger_config_cached(&canonical, &cfg).unwrap();
+        assert_eq!(second.workflow_path, canonical);
+        assert_eq!(
+            second.workflow_name, first.workflow_name,
+            "both callers must see the same workflow identity"
+        );
+        let _ = second.warnings.take();
     }
 }

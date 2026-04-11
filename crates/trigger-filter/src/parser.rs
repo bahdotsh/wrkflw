@@ -156,6 +156,19 @@ fn parse_events(on_raw: &serde_yaml::Value) -> Result<Vec<EventFilter>, TriggerF
 
         // on: { push: { branches: [main], paths: [src/**] } }
         serde_yaml::Value::Mapping(map) => {
+            // Note on duplicate event keys: `serde_yaml >= 0.9.4`
+            // errors on duplicate mapping keys when deserializing into
+            // `Value`/`Mapping` (dtolnay/serde-yaml#301, merged
+            // 2022-08-03). `parse_workflow` deserializes through that
+            // path, so a workflow like `on: { push: ..., push: ... }`
+            // is rejected upstream by `wrkflw-parser` before reaching
+            // this function — the mapping walk here is therefore
+            // guaranteed to see each event name at most once. If
+            // `parse_workflow` ever swaps in a permissive YAML loader
+            // that preserves duplicates, add a `HashSet`-based
+            // duplicate-detection pass here and surface the collision
+            // via `MustDrainWarnings` so the user sees the typo
+            // instead of a silent last-writer-wins collapse.
             let mut filters = Vec::new();
             for (key, value) in map {
                 let event_name = key

@@ -13,9 +13,9 @@
 //! the "previously parseable but now broken" cache-eviction regression
 //! live with their own tests.
 
-use crate::paths::canonicalize_allowing_missing;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use wrkflw_trigger_filter::canonicalize_allowing_missing;
 use wrkflw_trigger_filter::{TriggerFilterConfig, WorkflowTriggerConfig};
 
 /// One entry in the trigger cache: the compiled config plus a memoized

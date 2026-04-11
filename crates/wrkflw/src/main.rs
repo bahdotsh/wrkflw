@@ -205,10 +205,18 @@ enum Commands {
         /// Upper bound on the debouncer's pending-event set. Events
         /// past this count during a churn burst are dropped and
         /// surfaced as a per-cycle warning so the user sees that
-        /// something was missed. Defaults to the debouncer's built-in
-        /// cap, which is sized for typical workloads.
-        #[arg(long, default_value_t = 0)]
-        max_pending_events: usize,
+        /// something was missed. Omit the flag to use the debouncer's
+        /// built-in default, which is sized for typical workloads.
+        ///
+        /// The flag is `Option<usize>` rather than `usize` with a
+        /// sentinel `0 = default` value because `--max-pending-events 0`
+        /// reads as "unbounded" to most users — the convention
+        /// violation was flagged in review. `0` is now explicitly
+        /// rejected at startup (warning + fall through to default)
+        /// since a zero cap would drop every event and render the
+        /// watcher useless.
+        #[arg(long)]
+        max_pending_events: Option<usize>,
 
         /// Extra directory names to ignore in addition to the built-in
         /// list (`.git`, `target`, `node_modules`, `.build`, `build`,
@@ -845,6 +853,32 @@ async fn main() {
                 );
             }
 
+            // Resolve `--max-pending-events`. The library's
+            // `WatcherConfig::max_pending_events` field keeps its
+            // existing `0 = use-library-default` convention (matches
+            // how `TriggerFilterConfig::pattern_cache_size == 0`
+            // disables caching — library-wide sentinel style). The
+            // CLI, however, exposes an honest `Option<usize>` so
+            // `--help` doesn't advertise a misleading `[default: 0]`.
+            //
+            // `Some(0)` is almost certainly an error on the user's
+            // part (cap-everything-to-zero would drop every event
+            // and make the watcher useless). Mirror the
+            // `max_concurrency=0 → 1` clamp pattern in the library:
+            // warn loudly and fall through to the library default.
+            let max_pending_for_cfg: usize = match max_pending_events {
+                Some(0) => {
+                    wrkflw_logging::warning(
+                        "--max-pending-events 0 is invalid (would cap the pending \
+                         set at zero and drop every event); falling back to the \
+                         library default.",
+                    );
+                    0 // 0 inside the library means "use DEFAULT_MAX_PENDING_EVENTS"
+                }
+                Some(n) => *n,
+                None => 0,
+            };
+
             let watcher_cfg = wrkflw_watcher::WatcherConfig::new(workflow_dir, repo_root, config)
                 .with_event(event.clone())
                 .with_base_branch(base_branch.clone())
@@ -852,7 +886,7 @@ async fn main() {
                 .with_debounce(debounce_duration)
                 .with_verbose(verbose)
                 .with_max_concurrency(*max_concurrency)
-                .with_max_pending_events(*max_pending_events)
+                .with_max_pending_events(max_pending_for_cfg)
                 .with_extra_ignore_dirs(ignore_dirs.clone());
             let watcher = wrkflw_watcher::WorkflowWatcher::from_config(watcher_cfg);
 
@@ -1647,6 +1681,150 @@ mod prefilter_tests {
             "err must name the not-found case, got: {}",
             err
         );
+    }
+
+    /// Build a bare-bones git repo in `dir` with one committed file
+    /// on branch `main`. Mirrors the `init_repo` helper in
+    /// `crates/trigger-filter/src/git.rs` tests — duplicated here
+    /// rather than lifted because this crate has no test-helpers
+    /// module and a single-use helper doesn't justify one.
+    fn init_repo_for_test(dir: &Path) -> bool {
+        use std::process::Command as StdCommand;
+        let status = StdCommand::new("git")
+            .args(["-C", dir.to_str().unwrap(), "init", "--initial-branch=main"])
+            .status();
+        if !status.map(|s| s.success()).unwrap_or(false) {
+            return false;
+        }
+        for (k, v) in [("user.email", "t@t.t"), ("user.name", "t")] {
+            if StdCommand::new("git")
+                .args(["-C", dir.to_str().unwrap(), "config", k, v])
+                .status()
+                .map(|s| !s.success())
+                .unwrap_or(true)
+            {
+                return false;
+            }
+        }
+        let path = dir.join("a.txt");
+        if std::fs::write(&path, "1").is_err() {
+            return false;
+        }
+        if StdCommand::new("git")
+            .args(["-C", dir.to_str().unwrap(), "add", "a.txt"])
+            .status()
+            .map(|s| !s.success())
+            .unwrap_or(true)
+        {
+            return false;
+        }
+        if StdCommand::new("git")
+            .args([
+                "-C",
+                dir.to_str().unwrap(),
+                "commit",
+                "-m",
+                "init",
+                "--no-gpg-sign",
+            ])
+            .status()
+            .map(|s| !s.success())
+            .unwrap_or(true)
+        {
+            return false;
+        }
+        true
+    }
+
+    fn git_available() -> bool {
+        use std::process::Command as StdCommand;
+        StdCommand::new("git")
+            .arg("--version")
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn build_event_context_defaults_diff_base_to_head_when_only_diff_head_set() {
+        // Regression pin for the `--diff-head` without `--diff-base`
+        // branch at `build_event_context`'s `if let Some(head) =
+        // req.diff_head` arm: the base end of the two-ref range
+        // defaults to `"HEAD"` so the constructed range is
+        // well-formed. Without a test this branch was reachable
+        // from the CLI but never exercised in-process, and a
+        // refactor that flipped the default to `"origin/HEAD"`
+        // (or anything else) would silently break the flag matrix.
+        //
+        // We call `build_event_context` directly instead of
+        // `run_trigger_prefilter` because the latter shells out to
+        // `find_repo_root_detailed` against the process CWD — global
+        // state that's not safe under cargo's parallel test runner.
+        // The direct call takes a `cwd_for_git: Option<&Path>` which
+        // we point at the tempdir repo, giving the test full
+        // isolation.
+        if !git_available() {
+            return;
+        }
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let repo = tmp.path().to_path_buf();
+        if !init_repo_for_test(&repo) {
+            return;
+        }
+
+        // Write a minimal workflow so the prefilter has something to
+        // point at if the test ever extends to parsing. Not strictly
+        // needed for `build_event_context`, which never reads the
+        // file, but keeps the setup close to a real CLI invocation.
+        let wf = repo.join("ci.yml");
+        std::fs::write(
+            &wf,
+            "name: ci\non: push\njobs:\n  b:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+        )
+        .expect("write ci.yml");
+
+        let event = "push".to_string();
+        let head = "HEAD".to_string();
+        let req = PrefilterRequest {
+            workflow_path: &wf,
+            event: Some(&event),
+            diff: true,
+            changed_files: None,
+            diff_base: None,
+            diff_head: Some(&head),
+            base_branch: None,
+            activity_type: None,
+            verbose: false,
+            strict_filter: false,
+        };
+
+        let ctx = build_event_context(&req, "push", Some(&repo)).await.expect(
+            "build_event_context must succeed when --diff-head=HEAD and --diff-base is absent",
+        );
+
+        // The branch under test constructs a range `base..head` and
+        // runs `git diff --name-only` on it. Base defaults to HEAD,
+        // so the range is `HEAD..HEAD` — an empty diff against a
+        // fresh repo. The key invariants:
+        //   1. No error (the branch was reached and git ran cleanly).
+        //   2. `changed_files_explicit == true` (caller asked for a
+        //      two-ref diff, so an empty result is authoritative —
+        //      the diagnostic layer must NOT suggest passing --diff).
+        //   3. `changed_files.is_empty()` (HEAD..HEAD trivially empty).
+        assert!(
+            ctx.changed_files_explicit,
+            "two-ref diff must mark changed_files as explicit"
+        );
+        assert!(
+            ctx.changed_files.is_empty(),
+            "HEAD..HEAD diff must be empty, got {:?}",
+            ctx.changed_files
+        );
+
+        // Drain warnings to satisfy MustDrainWarnings (none expected,
+        // but the contract is the same as every other host).
+        let mut ctx = ctx;
+        let _ = ctx.warnings.take();
     }
 
     #[tokio::test(flavor = "current_thread")]

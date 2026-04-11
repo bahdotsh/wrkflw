@@ -2,7 +2,7 @@ use crate::debouncer::Debouncer;
 use crate::error::WatchError;
 use crate::event_kind::is_relevant_event_kind;
 use crate::ignore::{build_ignore_set, should_ignore_path};
-use crate::paths::{canonicalize_allowing_missing, display_workflow_path, normalize_separators};
+use crate::paths::{display_workflow_path, normalize_separators};
 use crate::setup::{collect_workflow_files_blocking, setup_watches};
 use crate::shutdown::ShutdownSignal;
 use crate::trigger_cache::{refresh_trigger_cache_blocking, TriggerCacheEntry};
@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use wrkflw_executor::ExecutionConfig;
+use wrkflw_trigger_filter::canonicalize_allowing_missing;
 use wrkflw_trigger_filter::{EventContext, TriggerFilterConfig, WorkflowTriggerConfig};
 
 /// Default cap on workflows executing concurrently in watch mode when the
@@ -370,6 +371,26 @@ impl WorkflowWatcher {
         let mut last_dropped_snapshot: usize = 0;
         let callback = Arc::new(on_cycle_complete);
 
+        // Bounded pool for callback supervisors. Previously each cycle
+        // spawned a detached `tokio::spawn` that `.await`ed the
+        // `spawn_blocking` handle — correct on the happy path, but a
+        // stuck reporter callback would accumulate one supervisor per
+        // cycle forever because the runtime's own reaper is the ONLY
+        // thing polling the detached handle. Holding them in a JoinSet
+        // lets us reap completed supervisors at the top of each loop
+        // iteration via `try_join_next` (non-blocking, constant-time
+        // when empty) and surface a threshold warning so a reporter
+        // that's falling behind doesn't silently balloon memory.
+        //
+        // Threshold = 8: small enough that a legitimately slow reporter
+        // trips it (actionable), large enough that normal cycle-to-
+        // cycle overlap doesn't (no false positives). `warned` is a
+        // one-shot latch per threshold crossing — without it a
+        // session-long backlog would produce one warning per iteration.
+        let mut supervisor_tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+        let mut supervisor_warned_at_threshold = false;
+        const SUPERVISOR_WARN_THRESHOLD: usize = 8;
+
         // Precompute the combined ignore set (defaults + user-supplied
         // extras). Sharing via Arc means the callback closure and the
         // initial `setup_watches` walk see identical semantics without
@@ -493,6 +514,36 @@ impl WorkflowWatcher {
                 return Ok(());
             }
 
+            // Reap completed callback supervisors. `try_join_next` is
+            // non-blocking: returns `None` when the set is empty or no
+            // task is ready, so this is a constant-time poll on the
+            // happy path. We ignore the per-task `Result` — a panic
+            // *inside the callback itself* is already logged by the
+            // supervisor body before it returns, so the reaper's job
+            // is purely memory reclamation. A panic in the supervisor
+            // body (e.g. the logger is wedged) would surface here as
+            // `Err(join_err)` but is strictly out of scope for
+            // this fix.
+            while supervisor_tasks.try_join_next().is_some() {}
+            // One-shot warning on threshold crossing. Reset when the
+            // backlog drains back below so a long session with an
+            // intermittently-slow reporter still warns on each NEW
+            // spike, not just the first one. A persistent backlog
+            // produces exactly one warning per climb-past-8 event,
+            // never a warning-per-cycle flood.
+            let backlog = supervisor_tasks.len();
+            if backlog > SUPERVISOR_WARN_THRESHOLD && !supervisor_warned_at_threshold {
+                wrkflw_logging::warning(&format!(
+                    "{} callback supervisor task(s) are pending — your reporter \
+                     callback may be slow or stuck. The watch loop will continue \
+                     but memory usage will grow until the backlog drains.",
+                    backlog
+                ));
+                supervisor_warned_at_threshold = true;
+            } else if backlog <= SUPERVISOR_WARN_THRESHOLD {
+                supervisor_warned_at_threshold = false;
+            }
+
             // Only block on notification if no events are already pending.
             // This prevents losing events that accumulated during workflow execution.
             //
@@ -511,7 +562,27 @@ impl WorkflowWatcher {
                 }
             }
 
-            let changed_paths = debouncer.drain().await;
+            // Observe shutdown during the drain wait. `drain()` sleeps
+            // for up to `max(debounce_duration, MAX_SETTLE_BUDGET)`
+            // before returning — without this select, Ctrl+C during an
+            // active drain has to wait the whole window before the loop
+            // observes cancellation. Every other await in this loop is
+            // cancellation-aware; this was the last outlier.
+            //
+            // Losing the pending events on shutdown is strictly weaker
+            // than the already-accepted "cycle in flight completes
+            // before run() returns" contract documented on `run()` —
+            // we're exiting; dropping queued-but-not-yet-executing
+            // events is acceptable and expected.
+            let changed_paths = tokio::select! {
+                paths = debouncer.drain() => paths,
+                _ = shutdown.wait() => {
+                    wrkflw_logging::info(
+                        "Watch loop received shutdown signal during drain; exiting.",
+                    );
+                    return Ok(());
+                }
+            };
             if changed_paths.is_empty() {
                 continue;
             }
@@ -597,13 +668,19 @@ impl WorkflowWatcher {
             // tokio's default panic reporter with no watch-loop signal —
             // exactly the silent-failure mode this PR is built to
             // prevent. We now await the blocking handle from a
-            // supervisor task and surface the panic via
-            // `wrkflw_logging::error` so the operator learns the
-            // reporter is broken instead of wondering why "nothing
-            // printed for the last N changes".
+            // supervisor task held in `supervisor_tasks`, which gets
+            // reaped at the top of each loop iteration. A panicking
+            // callback surfaces as `JoinError::is_panic()` from that
+            // reaper, logged via `wrkflw_logging::error`.
+            //
+            // Holding the supervisor in a `JoinSet` (instead of the
+            // previous detached `tokio::spawn`) is what makes the
+            // accumulation bounded: a stuck reporter now trips the
+            // `SUPERVISOR_WARN_THRESHOLD` log at the top of the loop
+            // instead of silently leaking one task per cycle forever.
             let cb = callback.clone();
             let cb_handle = tokio::task::spawn_blocking(move || cb(event));
-            tokio::spawn(async move {
+            supervisor_tasks.spawn(async move {
                 if let Err(join_err) = cb_handle.await {
                     if join_err.is_panic() {
                         wrkflw_logging::error(&format!(
@@ -1523,6 +1600,150 @@ mod tests {
                     Ok(Ok(Err(e))) => panic!("watcher errored instead of returning Ok: {}", e),
                     Ok(Err(join_err)) => panic!("watch task join failed: {}", join_err),
                     Err(_) => panic!("shutdown did not interrupt the idle watch loop within 2s"),
+                }
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_returns_promptly_when_shutdown_triggers_during_drain() {
+        // Regression: the `debouncer.drain().await` call inside `run()`
+        // used to live outside any `tokio::select!` against
+        // `shutdown.wait()`. A drain in progress sleeps for up to
+        // `max(debounce_duration, MAX_SETTLE_BUDGET)` — on a long
+        // user-specified debounce window this could stretch Ctrl+C
+        // latency to multiple seconds. The fix wraps `drain()` in a
+        // select; this test pins that property by using a deliberately
+        // long 5-second debounce and asserting shutdown resolves
+        // `run()` well inside that window.
+        //
+        // Pairs with `run_returns_when_shutdown_signal_is_triggered_before_any_event`
+        // (which pins the idle-wait path). Together they assert both
+        // wait points in the main loop observe shutdown promptly.
+        use std::process::Command as StdCommand;
+        use std::sync::{Arc, Mutex as StdMutex};
+
+        if StdCommand::new("git")
+            .arg("--version")
+            .status()
+            .map(|s| !s.success())
+            .unwrap_or(true)
+        {
+            return;
+        }
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let repo = tmp.path().to_path_buf();
+        let init_status = StdCommand::new("git")
+            .args([
+                "-C",
+                repo.to_str().unwrap(),
+                "init",
+                "--initial-branch=main",
+            ])
+            .status();
+        if !init_status.map(|s| s.success()).unwrap_or(false) {
+            return;
+        }
+        for (k, v) in [("user.email", "t@t.t"), ("user.name", "t")] {
+            StdCommand::new("git")
+                .args(["-C", repo.to_str().unwrap(), "config", k, v])
+                .status()
+                .expect("git config");
+        }
+
+        let workflow_dir = repo.join(".github").join("workflows");
+        std::fs::create_dir_all(&workflow_dir).expect("mkdir workflows");
+        std::fs::write(
+            workflow_dir.join("ci.yml"),
+            "name: ci\non: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+        )
+        .expect("write ci.yml");
+        std::fs::create_dir_all(repo.join("src")).expect("mkdir src");
+
+        StdCommand::new("git")
+            .args(["-C", repo.to_str().unwrap(), "add", "."])
+            .status()
+            .expect("git add");
+        StdCommand::new("git")
+            .args([
+                "-C",
+                repo.to_str().unwrap(),
+                "commit",
+                "-m",
+                "init",
+                "--no-gpg-sign",
+            ])
+            .status()
+            .expect("git commit");
+
+        let repo_canonical = std::fs::canonicalize(&repo).expect("canonicalize repo");
+
+        // Deliberately long debounce window. The regression is that
+        // Ctrl+C during an active drain has to wait up to this long;
+        // the fix observes shutdown inside the drain wait.
+        let cfg = WatcherConfig::new(
+            workflow_dir,
+            repo_canonical.clone(),
+            wrkflw_executor::ExecutionConfig {
+                runtime_type: wrkflw_executor::RuntimeType::Emulation,
+                verbose: false,
+                preserve_containers_on_failure: false,
+                secrets_config: None,
+                show_action_messages: false,
+                target_job: None,
+            },
+        )
+        .with_debounce(Duration::from_secs(5));
+        let watcher = WorkflowWatcher::from_config(cfg);
+
+        let events: Arc<StdMutex<Vec<WatchEvent>>> = Arc::new(StdMutex::new(Vec::new()));
+        let events_for_cb = events.clone();
+        let shutdown = ShutdownSignal::new();
+        let shutdown_for_run = shutdown.clone();
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async move {
+                let handle = tokio::task::spawn_local(async move {
+                    watcher
+                        .run(shutdown_for_run, move |ev| {
+                            let mut guard = events_for_cb.lock().expect("events mutex");
+                            guard.push(ev);
+                        })
+                        .await
+                });
+
+                // Let the watcher register its notify watches.
+                tokio::time::sleep(Duration::from_millis(200)).await;
+
+                // Fire a change so the loop transitions out of its idle
+                // wait into `debouncer.drain()`. The drain then sleeps
+                // for the full 5-second window.
+                std::fs::write(repo_canonical.join("src").join("main.rs"), "fn main() {}\n")
+                    .expect("write src/main.rs");
+
+                // Give the drain enough time to enter its sleep but
+                // not enough to finish — we want shutdown to interrupt
+                // it mid-wait. 500 ms is comfortably below 5 s and
+                // above the notify delivery window.
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                shutdown.trigger();
+
+                // Shutdown must resolve `run()` well inside the
+                // 5-second debounce window. A 2-second budget is
+                // plenty; if the fix regresses, the task is still
+                // parked in `sleep()` and the timeout fires.
+                let result = tokio::time::timeout(Duration::from_secs(2), handle).await;
+                match result {
+                    Ok(Ok(Ok(()))) => {}
+                    Ok(Ok(Err(e))) => panic!("watcher errored: {}", e),
+                    Ok(Err(join_err)) => panic!("watch task join failed: {}", join_err),
+                    Err(_) => panic!(
+                        "shutdown did not interrupt an active drain within 2s \
+                         (the drain window was 5s — regression on the \
+                         `tokio::select!` around debouncer.drain())"
+                    ),
                 }
             })
             .await;

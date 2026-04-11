@@ -3,37 +3,13 @@
 //! Extracted from `watcher.rs` so the platform quirks (macOS
 //! `/private/var` prefix, symlinked working trees, Windows path
 //! separators) are documented and tested in one place.
+//!
+//! `canonicalize_allowing_missing` used to live here too, but it was
+//! promoted to `wrkflw-trigger-filter` so the process-wide compiled-
+//! config LRU could canonicalize its own cache keys. All watcher call
+//! sites now reach it via `wrkflw_trigger_filter::canonicalize_allowing_missing`.
 
-use std::path::{Path, PathBuf};
-
-/// Canonicalize `path`, tolerating the case where the target was deleted.
-/// Walks back to the nearest canonicalizable ancestor, then re-appends the
-/// missing components. This keeps deleted files root-relative on platforms
-/// where the raw path would fail `strip_prefix` (macOS `/private/var` vs
-/// `/var`, symlinked working trees).
-pub(crate) fn canonicalize_allowing_missing(path: &Path) -> PathBuf {
-    if let Ok(canonical) = std::fs::canonicalize(path) {
-        return canonical;
-    }
-    // Walk up until we find an ancestor we can canonicalize; collect the
-    // missing tail so we can re-join it.
-    let mut tail: Vec<&std::ffi::OsStr> = Vec::new();
-    let mut cursor: &Path = path;
-    while let Some(parent) = cursor.parent() {
-        if let Some(leaf) = cursor.file_name() {
-            tail.push(leaf);
-        }
-        if let Ok(canonical_parent) = std::fs::canonicalize(parent) {
-            let mut result = canonical_parent;
-            for seg in tail.into_iter().rev() {
-                result.push(seg);
-            }
-            return result;
-        }
-        cursor = parent;
-    }
-    path.to_path_buf()
-}
+use std::path::Path;
 
 /// Normalize a path-like string so any platform separator is replaced
 /// with `/`. Used after `strip_prefix` on change events so downstream
@@ -71,41 +47,9 @@ pub(crate) fn display_workflow_path(wf_path: &Path, repo_root: &Path) -> String 
 mod tests {
     use super::*;
 
-    #[test]
-    fn canonicalize_allowing_missing_handles_deleted_leaf() {
-        // The leaf does not exist, but its parent is a real canonicalizable
-        // directory — the fallback must walk up and re-join the missing leaf.
-        let tmp = tempfile::TempDir::new().expect("tempdir");
-        let root = tmp.path();
-        let deleted = root.join("missing.txt");
-        assert!(!deleted.exists());
-
-        let canonical = canonicalize_allowing_missing(&deleted);
-        assert!(
-            canonical.ends_with("missing.txt"),
-            "canonical should retain the leaf, got {}",
-            canonical.display()
-        );
-        let expected_parent = std::fs::canonicalize(root).unwrap();
-        assert_eq!(canonical.parent(), Some(expected_parent.as_path()));
-    }
-
-    #[test]
-    fn canonicalize_allowing_missing_handles_deleted_subdir_leaf() {
-        // Parent directory also missing, grandparent exists — must walk up
-        // one more level and re-join both segments.
-        let tmp = tempfile::TempDir::new().expect("tempdir");
-        let root = tmp.path();
-        let deeper = root.join("gone").join("missing.txt");
-
-        let canonical = canonicalize_allowing_missing(&deeper);
-        assert!(canonical.ends_with("gone/missing.txt"));
-        let expected_root = std::fs::canonicalize(root).unwrap();
-        assert_eq!(
-            canonical.strip_prefix(&expected_root).ok(),
-            Some(Path::new("gone/missing.txt"))
-        );
-    }
+    // The two `canonicalize_allowing_missing_*` tests that lived here
+    // were moved to `wrkflw-trigger-filter`'s test module alongside
+    // the function itself. See `crates/trigger-filter/src/lib.rs`.
 
     #[test]
     fn normalize_separators_converts_backslashes_on_windows_forms() {

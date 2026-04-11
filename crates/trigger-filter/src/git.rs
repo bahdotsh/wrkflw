@@ -273,7 +273,17 @@ pub async fn get_current_branch(cwd: Option<&Path>) -> Result<Option<String>, Tr
 /// the empty-tree SHA, which silently made every tracked file appear as
 /// changed and defeated the purpose of the filter. Callers should surface
 /// the error so the user knows to pass `--diff-base` explicitly.
-pub async fn get_default_diff_base(cwd: Option<&Path>) -> Result<String, TriggerFilterError> {
+///
+/// `verbose` gates the "diff base = HEAD" explanatory log. The CLI
+/// passes its `--verbose` flag through so the message lands in the
+/// user's terminal; long-lived hosts (TUI toggle, any future daemon)
+/// pass `false` to avoid flooding the log pane on every hot-path call.
+/// Previously this log was unconditional and the TUI user saw it on
+/// every diff-filter toggle against a dirty tree.
+pub async fn get_default_diff_base(
+    cwd: Option<&Path>,
+    verbose: bool,
+) -> Result<String, TriggerFilterError> {
     // Check for uncommitted changes first. `run_git` returns `Ok` even
     // for non-zero exit (e.g. "not a git repository"), so we must check
     // `output.status.success()` before trusting stdout — otherwise a
@@ -283,19 +293,21 @@ pub async fn get_default_diff_base(cwd: Option<&Path>) -> Result<String, Trigger
     status_cmd.args(["status", "--porcelain"]);
     if let Ok(output) = run_git(status_cmd, "git status").await {
         if output.status.success() && !String::from_utf8_lossy(&output.stdout).trim().is_empty() {
-            // Surface the heuristic so users aren't surprised when
-            // `--diff` against a dirty tree only considers uncommitted
-            // changes. The typical confusion: "I have WIP edits and a
-            // workflow with `paths: ['src/**']` is reported as not
-            // triggering even though my committed branch obviously
-            // changed src/". Pointing them at `--diff-base` lets them
-            // override without having to read the source.
-            wrkflw_logging::info(
-                "diff base = HEAD: working tree has uncommitted changes, so \
-                 --diff is comparing the working tree against the last commit. \
-                 Pass --diff-base <ref> (e.g. main, origin/main) to compare \
-                 against a branch instead.",
-            );
+            if verbose {
+                // Surface the heuristic so users aren't surprised when
+                // `--diff` against a dirty tree only considers uncommitted
+                // changes. The typical confusion: "I have WIP edits and a
+                // workflow with `paths: ['src/**']` is reported as not
+                // triggering even though my committed branch obviously
+                // changed src/". Pointing them at `--diff-base` lets them
+                // override without having to read the source.
+                wrkflw_logging::info(
+                    "diff base = HEAD: working tree has uncommitted changes, so \
+                     --diff is comparing the working tree against the last commit. \
+                     Pass --diff-base <ref> (e.g. main, origin/main) to compare \
+                     against a branch instead.",
+                );
+            }
             return Ok("HEAD".to_string());
         }
     }
@@ -496,16 +508,6 @@ pub fn find_repo_root_detailed() -> Result<std::path::PathBuf, FindRepoRootError
     }
 }
 
-/// `Option`-returning adapter around [`find_repo_root_detailed`] for
-/// callers that don't distinguish failure modes.
-///
-/// New call sites should prefer `find_repo_root_detailed` so the user
-/// gets a specific error; this wrapper exists so the TUI's existing
-/// `.ok().flatten()` chain doesn't have to be reshaped.
-pub fn find_repo_root() -> Option<std::path::PathBuf> {
-    find_repo_root_detailed().ok()
-}
-
 /// Get the current tag if HEAD is tagged, or None.
 pub async fn get_current_tag(cwd: Option<&Path>) -> Result<Option<String>, TriggerFilterError> {
     let mut cmd = git_cmd(cwd);
@@ -641,7 +643,9 @@ mod tests {
         // Make tree dirty
         std::fs::write(repo.join("a.txt"), "2").unwrap();
 
-        let base = get_default_diff_base(Some(&repo)).await.expect("diff base");
+        let base = get_default_diff_base(Some(&repo), false)
+            .await
+            .expect("diff base");
         assert_eq!(base, "HEAD");
     }
 
@@ -682,7 +686,7 @@ mod tests {
         }
         commit_file(&repo, "a.txt", "1");
 
-        let err = get_default_diff_base(Some(&repo)).await;
+        let err = get_default_diff_base(Some(&repo), false).await;
         assert!(
             err.is_err(),
             "expected error when no diff base is available, got {:?}",

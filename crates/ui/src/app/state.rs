@@ -411,18 +411,43 @@ impl App {
             // sibling repo or a subdirectory; without this, every git
             // helper inside `auto_detect_context_default_base` would
             // run wherever the user happened to be when they started
-            // `wrkflw tui`. The watcher and CLI prefilter both pass
-            // `find_repo_root()` for the same reason.
+            // `wrkflw tui`. The watcher and CLI prefilter both anchor
+            // at the repo root for the same reason.
             //
-            // `find_repo_root` shells out to `git rev-parse --show-toplevel`
-            // synchronously. Calling it on the UI thread would hitch the
-            // TUI on every toggle on a network mount, so we move it onto
-            // the blocking pool inside the spawned task.
+            // `find_repo_root_detailed` shells out to `git rev-parse
+            // --show-toplevel` synchronously. Calling it on the UI
+            // thread would hitch the TUI on every toggle on a network
+            // mount, so we move it onto the blocking pool inside the
+            // spawned task. Using the classified `_detailed` form
+            // (instead of the old `Option` wrapper) lets us surface a
+            // "not in a git repository" / "git not installed" /
+            // "timed out" reason to the user instead of silently
+            // collapsing every failure into "0/N would trigger".
             let handle = tokio::task::spawn(async move {
-                let repo_root = tokio::task::spawn_blocking(wrkflw_trigger_filter::find_repo_root)
-                    .await
-                    .ok()
-                    .flatten();
+                let repo_root_result =
+                    tokio::task::spawn_blocking(wrkflw_trigger_filter::find_repo_root_detailed)
+                        .await;
+                let repo_root = match repo_root_result {
+                    Ok(Ok(p)) => Some(p),
+                    // `NotInRepository` is a legitimate soft state —
+                    // the user may have launched `wrkflw tui` from
+                    // /tmp or a non-repo sandbox, and the downstream
+                    // git helpers will surface a clearer message
+                    // (e.g. "not a git repository" from `git diff`)
+                    // which lands in the Failure outcome below.
+                    Ok(Err(wrkflw_trigger_filter::FindRepoRootError::NotInRepository)) => None,
+                    Ok(Err(e)) => {
+                        let _ = tx.send(DiffFilterOutcome::Failure(e.to_string()));
+                        return;
+                    }
+                    Err(join_err) => {
+                        let _ = tx.send(DiffFilterOutcome::Failure(format!(
+                            "find_repo_root task panicked: {}",
+                            join_err
+                        )));
+                        return;
+                    }
+                };
                 let results =
                     evaluate_diff_filter(workflow_paths, event_name, activity_type, repo_root)
                         .await;
@@ -1499,13 +1524,24 @@ async fn evaluate_diff_filter(
     // (e.g. user launched the TUI outside any repo) — the helpers will
     // surface a `GitError` and the TUI will log it.
     let cwd: Option<&Path> = repo_root.as_deref();
-    let mut context =
-        match wrkflw_trigger_filter::auto_detect_context_default_base(&event_name, cwd).await {
-            Ok(ctx) => ctx,
-            Err(e) => {
-                return DiffFilterOutcome::Failure(format!("{}", e));
-            }
-        };
+    // The TUI is a hot-path host: the user may toggle the diff filter
+    // many times during a session, and the dirty-tree info message
+    // that `get_default_diff_base` emits would flood the log pane
+    // every toggle. Pass `verbose = false` so the CLI's loud message
+    // stays quiet here; users who need the explanation run `wrkflw
+    // run --diff --verbose` on the command line.
+    let mut context = match wrkflw_trigger_filter::auto_detect_context_default_base(
+        &event_name,
+        cwd,
+        false,
+    )
+    .await
+    {
+        Ok(ctx) => ctx,
+        Err(e) => {
+            return DiffFilterOutcome::Failure(format!("{}", e));
+        }
+    };
     // Stamp the activity type so workflows that filter on
     // `pull_request: { types: [...] }` can match. Mirrors the
     // CLI prefilter and the watcher; without it the TUI silently

@@ -131,7 +131,14 @@ enum Commands {
         activity_type: Option<String>,
     },
 
-    /// Watch for file changes and re-run affected workflows
+    /// Watch for file changes and re-run affected workflows.
+    ///
+    /// Ctrl+C exits immediately via `process::exit`; a cycle in flight
+    /// (Docker containers, tempdirs, child processes) will be killed
+    /// by the OS without running the executor's normal cleanup path.
+    /// If you see resource buildup after interrupted watch sessions,
+    /// check `docker ps -a` (or your runtime's equivalent) for
+    /// orphaned containers.
     Watch {
         /// Path to workflow file or directory (defaults to .github/workflows)
         path: Option<PathBuf>,
@@ -757,8 +764,25 @@ async fn main() {
                 std::process::exit(1);
             }
 
+            // The CLI relies on `process::exit` from the Ctrl+C handler
+            // for termination, so the watcher receives a never-firing
+            // `ShutdownSignal`. A long-lived host (the TUI, a future
+            // daemon) would construct a real signal and `.trigger()`
+            // it from its own cancellation path; see the type-level
+            // docs on `WorkflowWatcher::run`.
+            //
+            // Note on resource cleanup: a Ctrl+C interrupt while a
+            // workflow is executing under Docker will bypass the
+            // normal executor teardown path, leaving containers,
+            // tempdirs, or child processes alive until the next
+            // `docker ps -a` reaper run. This is a known limitation
+            // that also affects `wrkflw run`; a future signal handler
+            // that triggers the shutdown instead of `exit`-ing would
+            // let the current cycle drain. Flagged in the `watch`
+            // help text so operators who see resource buildup have a
+            // breadcrumb.
             watcher
-                .run(|watch_event| {
+                .run(wrkflw_watcher::ShutdownSignal::never(), |watch_event| {
                     println!(
                         "\n{}",
                         cli_style::section(&format!(
@@ -924,16 +948,39 @@ async fn run_trigger_prefilter_or_exit(req: PrefilterRequest<'_>) {
     // is consistent regardless of the directory the user ran `wrkflw`
     // from. Falls back to process CWD if we're not inside a repo.
     //
-    // `find_repo_root` is a sync shell-out not covered by
+    // `find_repo_root_detailed` is a sync shell-out not covered by
     // `GIT_COMMAND_TIMEOUT`; wrap in `spawn_blocking` so a hung git
     // (credential prompt, stuck network mount) cannot freeze the reactor.
-    let repo_root: Option<PathBuf> = tokio::task::spawn_blocking(wrkflw_watcher::find_repo_root)
-        .await
-        .ok()
-        .flatten();
+    //
+    // We use the classified `_detailed` form so each failure mode
+    // surfaces its own diagnostic. `NotInRepository` is a legitimate
+    // soft failure (the user may have passed `--changed-files` without
+    // needing any git helper) — fall back to `None` and let the
+    // downstream git calls decide whether they need a repo. Every
+    // other failure (git-not-installed, timeout, other) is loud and
+    // fatal because the user has something actionable to fix.
+    let repo_root: Option<PathBuf> =
+        match tokio::task::spawn_blocking(wrkflw_trigger_filter::find_repo_root_detailed).await {
+            Ok(Ok(p)) => Some(p),
+            Ok(Err(wrkflw_trigger_filter::FindRepoRootError::NotInRepository)) => None,
+            Ok(Err(e)) => {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+            Err(join_err) => {
+                eprintln!("Error: find_repo_root task panicked: {}", join_err);
+                std::process::exit(1);
+            }
+        };
     let cwd_for_git: Option<&Path> = repo_root.as_deref();
 
-    let mut event_context = build_event_context(&req, &event_name, cwd_for_git).await;
+    let mut event_context = match build_event_context(&req, &event_name, cwd_for_git).await {
+        Ok(ctx) => ctx,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
     apply_base_branch(&mut event_context, &event_name, req.base_branch);
     apply_activity_type(&mut event_context, req.activity_type);
 
@@ -984,15 +1031,16 @@ async fn run_trigger_prefilter_or_exit(req: PrefilterRequest<'_>) {
 
 /// Pick the right context-builder based on which flags the user supplied.
 ///
-/// Exits the process on failure — the previous inline implementation also
-/// exited from each branch, but extracting this makes the
-/// `run_trigger_prefilter_or_exit` orchestrator easier to read and lets
-/// each branch own its own error message without nesting.
+/// Returns a `Result<EventContext, String>` so the orchestrator owns the
+/// `process::exit` policy — previously each branch called `exit` from
+/// deep in the helper, which made the flag-matrix logic impossible to
+/// unit-test without spawning a subprocess. The error string is ready
+/// to be printed verbatim with an `Error:` prefix.
 async fn build_event_context(
     req: &PrefilterRequest<'_>,
     event_name: &str,
     cwd_for_git: Option<&Path>,
-) -> wrkflw_trigger_filter::EventContext {
+) -> Result<wrkflw_trigger_filter::EventContext, String> {
     if let Some(files) = req.changed_files {
         return wrkflw_trigger_filter::context_from_changed_files(
             event_name,
@@ -1000,10 +1048,7 @@ async fn build_event_context(
             cwd_for_git,
         )
         .await
-        .unwrap_or_else(|e| {
-            eprintln!("Error: failed to build event context: {}", e);
-            std::process::exit(1);
-        });
+        .map_err(|e| format!("failed to build event context: {}", e));
     }
 
     if req.diff {
@@ -1024,12 +1069,14 @@ async fn build_event_context(
         } else if let Some(base) = req.diff_base {
             wrkflw_trigger_filter::auto_detect_context(event_name, base, cwd_for_git).await
         } else {
-            wrkflw_trigger_filter::auto_detect_context_default_base(event_name, cwd_for_git).await
+            wrkflw_trigger_filter::auto_detect_context_default_base(
+                event_name,
+                cwd_for_git,
+                req.verbose,
+            )
+            .await
         }
-        .unwrap_or_else(|e| {
-            eprintln!("Error: failed to get git diff: {}", e);
-            std::process::exit(1);
-        });
+        .map_err(|e| format!("failed to get git diff: {}", e));
     }
 
     // --event was passed alone (no --diff, no --changed-files).
@@ -1043,10 +1090,7 @@ async fn build_event_context(
     );
     wrkflw_trigger_filter::context_from_changed_files(event_name, vec![], cwd_for_git)
         .await
-        .unwrap_or_else(|e| {
-            eprintln!("Error: failed to build event context: {}", e);
-            std::process::exit(1);
-        })
+        .map_err(|e| format!("failed to build event context: {}", e))
 }
 
 /// Stamp the user-supplied `--base-branch` onto the event context, or

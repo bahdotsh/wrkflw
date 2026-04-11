@@ -36,34 +36,17 @@ pub fn evaluate_trigger(
     }
 
     for filter in &matching_filters {
-        // Check branch filters (applies to push, pull_request, etc.)
-        if !filter.branches.is_empty() || !filter.branches_ignore.is_empty() {
-            // GitHub Actions semantics: for `pull_request` and
-            // `pull_request_target`, the `branches:` filter matches the BASE
-            // (target) branch, not the source/head branch. For all other
-            // events (push, etc.) it matches the current branch.
-            let target_branch = branch_for_filter(context);
-            match target_branch {
-                Some(branch) => {
-                    if !ref_matcher::matches_ref(branch, &filter.branches, &filter.branches_ignore)
-                    {
-                        continue;
-                    }
-                }
-                None => continue, // No branch in context, branch filter cannot match
-            }
-        }
-
-        // Check tag filters (applies to push with tags)
-        if !filter.tags.is_empty() || !filter.tags_ignore.is_empty() {
-            match context.tag {
-                Some(ref tag) => {
-                    if !ref_matcher::matches_ref(tag, &filter.tags, &filter.tags_ignore) {
-                        continue;
-                    }
-                }
-                None => continue, // No tag in context, tag filter cannot match
-            }
+        // Check ref-axis filters (branches + tags) with GHA OR semantics
+        // when both are configured. See [`ref_filters_pass`] for the full
+        // rule — the short version is: a push event with BOTH `branches:`
+        // and `tags:` set fires if *either* side matches the actual ref,
+        // not both. The previous sequential-AND check rejected both
+        // branch pushes (tag was None) and tag pushes (branch was None)
+        // for such workflows — exactly the silent-skip mode the rest of
+        // this crate exists to prevent. Pinned by
+        // `push_with_branches_and_tags_is_or_not_and`.
+        if !ref_filters_pass(filter, context) {
+            continue;
         }
 
         // Check activity type filters (applies to pull_request, issues, etc.)
@@ -126,6 +109,52 @@ fn branch_for_filter(context: &EventContext) -> Option<&String> {
     }
 }
 
+/// Evaluate the combined branches + tags filter axis against the context.
+///
+/// GitHub Actions semantics for `push`:
+/// - Neither filter set → any ref matches.
+/// - Only `branches:` set → branch pushes matching the pattern fire; tag
+///   pushes are rejected.
+/// - Only `tags:` set → tag pushes matching the pattern fire; branch
+///   pushes are rejected.
+/// - **Both `branches:` and `tags:` set → the workflow fires if the
+///   branch push matches `branches:` OR the tag push matches `tags:`.**
+///   This is the case the previous sequential-AND evaluator got wrong —
+///   a push can't be on both a branch and a tag simultaneously, so
+///   requiring both to match is uniformly unsatisfiable.
+///
+/// For `pull_request` / `pull_request_target` there is no `tags:` axis
+/// in GHA; we still evaluate branches: (against the base branch, per
+/// [`branch_for_filter`]) and anything in `tags:` will be checked
+/// against the always-None PR tag — rejecting the filter, which matches
+/// GHA's behavior (writing `tags:` under `pull_request:` is a user error
+/// that never fires).
+fn ref_filters_pass(filter: &EventFilter, context: &EventContext) -> bool {
+    let has_branches = !filter.branches.is_empty() || !filter.branches_ignore.is_empty();
+    let has_tags = !filter.tags.is_empty() || !filter.tags_ignore.is_empty();
+
+    if !has_branches && !has_tags {
+        return true;
+    }
+
+    let branch_ok = has_branches
+        && branch_for_filter(context)
+            .map(|b| ref_matcher::matches_ref(b, &filter.branches, &filter.branches_ignore))
+            .unwrap_or(false);
+
+    let tag_ok = has_tags
+        && context
+            .tag
+            .as_ref()
+            .map(|t| ref_matcher::matches_ref(t, &filter.tags, &filter.tags_ignore))
+            .unwrap_or(false);
+
+    // When only one axis is set, exactly one of the booleans can be
+    // true; when both are set, GHA's rule is OR. Either way the right
+    // aggregation is `branch_ok || tag_ok`.
+    branch_ok || tag_ok
+}
+
 /// Combine include + ignore pattern sources into a single list, with
 /// ignore entries prefixed by `!` so the diagnostic round-trips to the
 /// surface YAML syntax the user wrote. Extracted so the branches and
@@ -141,7 +170,31 @@ fn combined_pattern_sources(includes: &[GlobPattern], ignores: &[GlobPattern]) -
 fn explain_filter_failure(filter: &EventFilter, context: &EventContext) -> String {
     let mut parts = Vec::new();
 
-    if !filter.branches.is_empty() || !filter.branches_ignore.is_empty() {
+    let has_branches = !filter.branches.is_empty() || !filter.branches_ignore.is_empty();
+    let has_tags = !filter.tags.is_empty() || !filter.tags_ignore.is_empty();
+
+    // When BOTH axes are set, GHA treats them as OR (see
+    // [`ref_filters_pass`]). The diagnostic must reflect that — saying
+    // "branch X did not match [...]" in isolation is technically true
+    // but misleads the user into thinking the tags axis was not
+    // considered. Render the combined failure as a single "neither
+    // branch nor tag matched" line so the OR semantics are obvious.
+    if has_branches && has_tags {
+        let branch_sources = combined_pattern_sources(&filter.branches, &filter.branches_ignore);
+        let tag_sources = combined_pattern_sources(&filter.tags, &filter.tags_ignore);
+        let branch_part = match branch_for_filter(context) {
+            Some(b) => format!("branch '{}' did not match {:?}", b, branch_sources),
+            None => "no branch in context".to_string(),
+        };
+        let tag_part = match &context.tag {
+            Some(t) => format!("tag '{}' did not match {:?}", t, tag_sources),
+            None => "no tag in context".to_string(),
+        };
+        parts.push(format!(
+            "neither ref axis matched ({}; {}) — GHA fires on either branches: OR tags:",
+            branch_part, tag_part
+        ));
+    } else if has_branches {
         // Combined pattern list: a rejection driven by `branches-ignore:`
         // alone (or inline `!`-negations routed into `branches_ignore`)
         // must render the offending rule instead of
@@ -164,8 +217,7 @@ fn explain_filter_failure(filter: &EventFilter, context: &EventContext) -> Strin
                 parts.push(what.to_string());
             }
         }
-    }
-    if !filter.tags.is_empty() || !filter.tags_ignore.is_empty() {
+    } else if has_tags {
         // Same treatment as branches — see `combined_pattern_sources`.
         let pattern_sources = combined_pattern_sources(&filter.tags, &filter.tags_ignore);
         match &context.tag {
@@ -650,6 +702,161 @@ mod tests {
             result.reason.contains("!v*-rc*"),
             "tag diagnostic must include the ignore pattern, got: {}",
             result.reason
+        );
+    }
+
+    #[test]
+    fn push_with_branches_and_tags_is_or_not_and() {
+        // CRITICAL regression: GitHub Actions treats a push workflow
+        // with BOTH `branches:` and `tags:` filters as OR, not AND.
+        // Per the docs: "If a workflow includes both a branches filter
+        // and a tags filter, the workflow will run when a push event
+        // matches either the branches filter or the tags filter."
+        //
+        // The previous sequential check (branches first, continue on
+        // miss; tags second, continue on miss) collapsed both sides:
+        // a branch push had context.tag = None so the tags check
+        // rejected it; a tag push had context.branch = None so the
+        // branches check rejected it. A workflow like the one below
+        // never fired on any real push. This test pins the OR
+        // semantics so a future refactor cannot silently regress it.
+        let config = make_config(vec![EventFilter {
+            event_name: "push".into(),
+            branches: vec![gp("main")],
+            tags: vec![gp("v*")],
+            ..Default::default()
+        }]);
+
+        // Branch push to main (no tag on HEAD): must fire.
+        let branch_push = EventContext {
+            event_name: "push".into(),
+            branch: Some("main".into()),
+            tag: None,
+            ..Default::default()
+        };
+        assert!(
+            evaluate_trigger(&config, &branch_push).matches,
+            "push to main must fire under branches:[main] + tags:[v*]"
+        );
+
+        // Tag push to v1.0.0 (branch None because git reports detached
+        // HEAD on a tag checkout): must also fire.
+        let tag_push = EventContext {
+            event_name: "push".into(),
+            branch: None,
+            tag: Some("v1.0.0".into()),
+            ..Default::default()
+        };
+        assert!(
+            evaluate_trigger(&config, &tag_push).matches,
+            "push to tag v1.0.0 must fire under branches:[main] + tags:[v*]"
+        );
+
+        // Branch push to develop (not in branches, no tag): must NOT fire.
+        let branch_miss = EventContext {
+            event_name: "push".into(),
+            branch: Some("develop".into()),
+            tag: None,
+            ..Default::default()
+        };
+        assert!(
+            !evaluate_trigger(&config, &branch_miss).matches,
+            "push to develop must not fire (neither ref axis matches)"
+        );
+
+        // Tag push to v1-rc1 explicitly excluded by tags-ignore via
+        // inline `!`-negation: must NOT fire.
+        let config_excluded = make_config(vec![EventFilter {
+            event_name: "push".into(),
+            branches: vec![gp("main")],
+            tags: vec![gp("v*")],
+            tags_ignore: vec![gp("v*-rc*")],
+            ..Default::default()
+        }]);
+        let rc_push = EventContext {
+            event_name: "push".into(),
+            branch: None,
+            tag: Some("v1.0.0-rc1".into()),
+            ..Default::default()
+        };
+        assert!(
+            !evaluate_trigger(&config_excluded, &rc_push).matches,
+            "rc tag push must be excluded by tags-ignore even when branches: also set"
+        );
+    }
+
+    #[test]
+    fn push_with_branches_and_tags_failure_diagnostic_mentions_or() {
+        // Pair with `push_with_branches_and_tags_is_or_not_and`: when
+        // neither side matches, the diagnostic must reflect the OR
+        // aggregation so the user understands both axes were checked.
+        // Previously the failure line only mentioned the branches
+        // rejection and the user had no idea tags were even considered.
+        let config = make_config(vec![EventFilter {
+            event_name: "push".into(),
+            branches: vec![gp("main")],
+            tags: vec![gp("v*")],
+            ..Default::default()
+        }]);
+        let ctx = EventContext {
+            event_name: "push".into(),
+            branch: Some("develop".into()),
+            tag: None,
+            ..Default::default()
+        };
+        let result = evaluate_trigger(&config, &ctx);
+        assert!(!result.matches);
+        assert!(
+            result.reason.contains("neither ref axis"),
+            "diagnostic must acknowledge OR semantics, got: {}",
+            result.reason
+        );
+        assert!(
+            result.reason.contains("branches:") && result.reason.contains("tags:"),
+            "diagnostic must mention both axes, got: {}",
+            result.reason
+        );
+    }
+
+    #[test]
+    fn branches_only_rejects_tag_push() {
+        // Regression guard: a workflow with `branches:` only (no tags)
+        // must NOT fire on a tag push. The OR fix for the combo case
+        // must not accidentally loosen the single-axis case.
+        let config = make_config(vec![EventFilter {
+            event_name: "push".into(),
+            branches: vec![gp("main")],
+            ..Default::default()
+        }]);
+        let tag_push = EventContext {
+            event_name: "push".into(),
+            branch: None,
+            tag: Some("v1.0.0".into()),
+            ..Default::default()
+        };
+        assert!(
+            !evaluate_trigger(&config, &tag_push).matches,
+            "branches-only workflow must not fire on tag push"
+        );
+    }
+
+    #[test]
+    fn tags_only_rejects_branch_push() {
+        // Mirror of `branches_only_rejects_tag_push`.
+        let config = make_config(vec![EventFilter {
+            event_name: "push".into(),
+            tags: vec![gp("v*")],
+            ..Default::default()
+        }]);
+        let branch_push = EventContext {
+            event_name: "push".into(),
+            branch: Some("main".into()),
+            tag: None,
+            ..Default::default()
+        };
+        assert!(
+            !evaluate_trigger(&config, &branch_push).matches,
+            "tags-only workflow must not fire on branch push"
         );
     }
 

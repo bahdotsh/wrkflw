@@ -8,7 +8,7 @@ pub mod ref_matcher;
 
 pub use error::TriggerFilterError;
 pub use eval::evaluate_trigger;
-pub use git::{find_repo_root, find_repo_root_detailed, FindRepoRootError};
+pub use git::{find_repo_root_detailed, FindRepoRootError};
 pub use model::{
     EventContext, EventFilter, GlobPattern, TriggerMatchResult, WorkflowTriggerConfig,
 };
@@ -118,11 +118,18 @@ pub async fn auto_detect_context(
 /// Fails with a `GitError` if no reasonable diff base can be detected — the
 /// caller should surface that so the user can pass `--diff-base` explicitly
 /// instead of silently getting a filter that matches every workflow.
+///
+/// `verbose` is forwarded to [`git::get_default_diff_base`] so the
+/// "diff base = HEAD on dirty tree" explanatory log only fires when the
+/// caller wants it. The CLI opts in via its `--verbose` flag; the TUI
+/// and any long-lived host pass `false` so a hot-path toggle doesn't
+/// flood the log pane.
 pub async fn auto_detect_context_default_base(
     event_name: &str,
     cwd: Option<&Path>,
+    verbose: bool,
 ) -> Result<EventContext, TriggerFilterError> {
-    let diff_base = git::get_default_diff_base(cwd).await?;
+    let diff_base = git::get_default_diff_base(cwd, verbose).await?;
     auto_detect_context(event_name, &diff_base, cwd).await
 }
 

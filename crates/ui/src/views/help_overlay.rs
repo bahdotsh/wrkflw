@@ -77,6 +77,7 @@ pub fn render_help_content(f: &mut Frame<'_>, area: Rect, scroll_offset: usize) 
     left_lines.push(key_line("e", "Toggle emulation mode"));
     left_lines.push(key_line("v", "Toggle validation mode"));
     left_lines.push(key_line("d", "Toggle diff-aware trigger filter"));
+    left_lines.push(key_line("D", "Cycle diff filter event (push/PR/...)"));
     left_lines.push(Line::from(""));
     left_lines.push(Line::from(Span::styled(
         "Runtime Modes:",

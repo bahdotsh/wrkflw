@@ -113,10 +113,24 @@ pub type DiffFilterParseFailures = Vec<(PathBuf, String)>;
 /// previous `filter_map(... .ok())` collapsed both cases into the same
 /// `trigger_match = None` rendering, leaving users with no debugging
 /// signal when their `on:` block had a typo.
+///
+/// `warnings` carries the non-fatal diagnostics the trigger-filter
+/// collected while building the event context AND while parsing each
+/// workflow's `on:` block (e.g. `git ls-files --others` failed, so
+/// untracked files are missing from the change set; unknown event name
+/// typo in `on: pul_request`). The library routes these through struct
+/// fields on purpose — hosts own the rendering policy — so every host
+/// MUST drain them or reproduce the silent-skip failure mode the rest
+/// of this PR is built to plug. The CLI prefilter at
+/// `crates/wrkflw/src/main.rs` does this via `event_context.warnings`
+/// and `trigger_config.warnings`; the TUI plumbs both through this
+/// field so `check_diff_filter_results` can render them the same way
+/// `parse_failures` is rendered.
 #[derive(Debug, Clone)]
 pub struct DiffFilterReport {
     pub rows: DiffFilterResults,
     pub parse_failures: DiffFilterParseFailures,
+    pub warnings: Vec<String>,
 }
 
 /// Outcome of a background diff-filter evaluation.
@@ -396,44 +410,45 @@ impl App {
     /// event/activity fields by tearing down the in-flight task and
     /// spawning a fresh one.
     ///
-    /// No-op when the filter is inactive. Extracted out of
-    /// [`Self::cycle_diff_filter_event`] so the double-`toggle_diff_filter`
-    /// idiom is named for what it does instead of living as a
-    /// cryptic two-call sequence at the end of the cycle helper.
+    /// No-op when the filter is inactive. This is the path
+    /// [`Self::cycle_diff_filter_event`] takes after mutating
+    /// `diff_filter_event` so the result column reflects the new
+    /// event immediately.
+    ///
+    /// Previously this was a double `toggle_diff_filter` call, which
+    /// worked only as long as `toggle_diff_filter` stayed purely
+    /// idempotent in opposing directions — any future side effect
+    /// added to the toggle helper (metrics, tracing, throttle) would
+    /// have silently broken the rerun behaviour. Routing directly
+    /// through [`Self::spawn_evaluation`] makes the intent explicit
+    /// and removes the two-call fragility.
     fn rerun_diff_filter_if_active(&mut self) {
         if !self.diff_filter_active {
             return;
         }
-        // `toggle_diff_filter` flips the flag: call once to turn it
-        // off (which cancels the in-flight task) and once more to
-        // turn it back on and spawn a fresh evaluation against the
-        // updated `diff_filter_event` / `diff_filter_activity_type`.
-        self.toggle_diff_filter();
-        self.toggle_diff_filter();
+        self.spawn_evaluation();
     }
 
-    /// Toggle diff-aware trigger filtering and evaluate all workflows.
+    /// Tear down any in-flight diff-filter evaluation.
     ///
-    /// The git + parsing work is dispatched onto the ambient tokio runtime
-    /// via `tokio::task::spawn`. Results are received via
-    /// `check_diff_filter_results()` on the next tick.
+    /// Aborts the background task handle (best-effort: `JoinHandle::abort`
+    /// only signals at the next await point, so a git future already in
+    /// flight may keep running until it completes) and drops the receiver
+    /// so any result the task eventually produces is discarded. Arms
+    /// [`App::diff_filter_aborted`] when there was actually something to
+    /// abort so the next [`App::check_diff_filter_results`] tick treats
+    /// the resulting `Disconnected` as self-inflicted instead of logging
+    /// "evaluation failed" for an action the user took deliberately.
     ///
-    /// If an evaluation is already in flight (rapid toggle), the previous
-    /// task's [`JoinHandle`] is aborted and its `mpsc::Sender` is dropped.
-    /// `JoinHandle::abort` only signals at the next await point — git
-    /// futures already in flight may keep running until they complete —
-    /// but the receiver is gone, so any results they produce are
-    /// discarded. From the user's perspective the previous evaluation is
-    /// dead; in reality it's "no longer observed."
-    pub fn toggle_diff_filter(&mut self) {
-        self.diff_filter_active = !self.diff_filter_active;
-
-        // Always drop any in-flight evaluation before we change state.
+    /// Intentionally does NOT touch `diff_filter_active` — callers own
+    /// the active-flag flip so the semantics of "toggle off" and
+    /// "restart evaluation" stay separable.
+    fn abort_in_flight_evaluation(&mut self) {
         // Mark the disconnect as self-inflicted BEFORE dropping the
         // receiver so the next tick's `check_diff_filter_results`
         // distinguishes "we cancelled" from "the task crashed". Only
         // arm the flag when there was actually something to abort,
-        // otherwise a fresh toggle from a clean state would silently
+        // otherwise a fresh call from a clean state would silently
         // suppress a real failure on the *next* evaluation.
         if self.diff_filter_task.is_some() || self.diff_filter_rx.is_some() {
             self.diff_filter_aborted = true;
@@ -442,80 +457,121 @@ impl App {
             handle.abort();
         }
         self.diff_filter_rx = None;
+    }
+
+    /// Spawn a fresh diff-filter evaluation for the current workflow
+    /// list against the currently-selected `diff_filter_event` +
+    /// `diff_filter_activity_type`.
+    ///
+    /// Aborts any in-flight evaluation first so rapid toggles or
+    /// event-cycle key presses never leak wasted git + parse work.
+    /// Clears the stale `diff_filter_aborted` flag before spawning so
+    /// a genuine failure on the new task is surfaced to the user
+    /// instead of being mistaken for a self-inflicted abort.
+    ///
+    /// Git + parsing work is dispatched onto the ambient tokio runtime
+    /// via `tokio::task::spawn`. Results are received via
+    /// [`Self::check_diff_filter_results`] on the next tick.
+    fn spawn_evaluation(&mut self) {
+        self.abort_in_flight_evaluation();
+
+        // A new evaluation begins with a fresh receiver. Any
+        // `diff_filter_aborted` flag still set at this point belongs
+        // to a *prior* abort cycle whose receiver was dropped without
+        // ever being observed (e.g. user toggled OFF, no tick ran,
+        // user toggled back ON). Leaving it armed here would silently
+        // swallow a genuine failure on the new task — exactly the
+        // silent-skip mode this PR is built to prevent. Clear it
+        // before spawning so the next `Disconnected` is treated as
+        // a real failure and surfaced to the user.
+        self.diff_filter_aborted = false;
+
+        let event_name = self.diff_filter_event.clone();
+        let activity_type = self.diff_filter_activity_type.clone();
+        self.add_log(format!(
+            "Diff filter: evaluating triggers (simulating '{}' event)...",
+            event_name
+        ));
+
+        let workflow_paths: Vec<PathBuf> = self.workflows.iter().map(|w| w.path.clone()).collect();
+
+        let (tx, rx) = mpsc::channel();
+        self.diff_filter_rx = Some(rx);
+
+        // Anchor git operations at the discovered repo root rather
+        // than the process CWD. The TUI may be launched from a
+        // sibling repo or a subdirectory; without this, every git
+        // helper inside `auto_detect_context_default_base` would
+        // run wherever the user happened to be when they started
+        // `wrkflw tui`. The watcher and CLI prefilter both anchor
+        // at the repo root for the same reason.
+        //
+        // `find_repo_root_detailed` shells out to `git rev-parse
+        // --show-toplevel` synchronously. Calling it on the UI
+        // thread would hitch the TUI on every toggle on a network
+        // mount, so we move it onto the blocking pool inside the
+        // spawned task. Using the classified `_detailed` form
+        // (instead of the old `Option` wrapper) lets us surface a
+        // "not in a git repository" / "git not installed" /
+        // "timed out" reason to the user instead of silently
+        // collapsing every failure into "0/N would trigger".
+        let handle = tokio::task::spawn(async move {
+            let repo_root_result =
+                tokio::task::spawn_blocking(wrkflw_trigger_filter::find_repo_root_detailed).await;
+            let repo_root = match repo_root_result {
+                Ok(Ok(p)) => Some(p),
+                // `NotInRepository` is a legitimate soft state —
+                // the user may have launched `wrkflw tui` from
+                // /tmp or a non-repo sandbox, and the downstream
+                // git helpers will surface a clearer message
+                // (e.g. "not a git repository" from `git diff`)
+                // which lands in the Failure outcome below.
+                Ok(Err(wrkflw_trigger_filter::FindRepoRootError::NotInRepository)) => None,
+                Ok(Err(e)) => {
+                    let _ = tx.send(DiffFilterOutcome::Failure(e.to_string()));
+                    return;
+                }
+                Err(join_err) => {
+                    let _ = tx.send(DiffFilterOutcome::Failure(format!(
+                        "find_repo_root task panicked: {}",
+                        join_err
+                    )));
+                    return;
+                }
+            };
+            let results =
+                evaluate_diff_filter(workflow_paths, event_name, activity_type, repo_root).await;
+            let _ = tx.send(results);
+        });
+        self.diff_filter_task = Some(handle);
+    }
+
+    /// Toggle diff-aware trigger filtering and evaluate all workflows.
+    ///
+    /// On ON→OFF: aborts any in-flight task, drops the receiver,
+    /// clears the per-workflow trigger match state, and logs
+    /// "Diff filter OFF".
+    ///
+    /// On OFF→ON: delegates to [`Self::spawn_evaluation`], which
+    /// dispatches git + parsing onto the ambient tokio runtime.
+    /// Results are received via [`Self::check_diff_filter_results`]
+    /// on the next tick.
+    ///
+    /// If an evaluation is already in flight (rapid toggle), the
+    /// previous task's [`JoinHandle`] is aborted and its `mpsc::Sender`
+    /// is dropped. `JoinHandle::abort` only signals at the next await
+    /// point — git futures already in flight may keep running until
+    /// they complete — but the receiver is gone, so any results they
+    /// produce are discarded. From the user's perspective the
+    /// previous evaluation is dead; in reality it's "no longer
+    /// observed."
+    pub fn toggle_diff_filter(&mut self) {
+        self.diff_filter_active = !self.diff_filter_active;
 
         if self.diff_filter_active {
-            // A new evaluation begins with a fresh receiver. Any
-            // `diff_filter_aborted` flag still set at this point belongs
-            // to a *prior* abort cycle whose receiver was dropped without
-            // ever being observed (e.g. user toggled OFF, no tick ran,
-            // user toggled back ON). Leaving it armed here would silently
-            // swallow a genuine failure on the new task — exactly the
-            // silent-skip mode this PR is built to prevent. Clear it
-            // before spawning so the next `Disconnected` is treated as
-            // a real failure and surfaced to the user.
-            self.diff_filter_aborted = false;
-            let event_name = self.diff_filter_event.clone();
-            let activity_type = self.diff_filter_activity_type.clone();
-            self.add_log(format!(
-                "Diff filter: evaluating triggers (simulating '{}' event)...",
-                event_name
-            ));
-
-            let workflow_paths: Vec<PathBuf> =
-                self.workflows.iter().map(|w| w.path.clone()).collect();
-
-            let (tx, rx) = mpsc::channel();
-            self.diff_filter_rx = Some(rx);
-
-            // Anchor git operations at the discovered repo root rather
-            // than the process CWD. The TUI may be launched from a
-            // sibling repo or a subdirectory; without this, every git
-            // helper inside `auto_detect_context_default_base` would
-            // run wherever the user happened to be when they started
-            // `wrkflw tui`. The watcher and CLI prefilter both anchor
-            // at the repo root for the same reason.
-            //
-            // `find_repo_root_detailed` shells out to `git rev-parse
-            // --show-toplevel` synchronously. Calling it on the UI
-            // thread would hitch the TUI on every toggle on a network
-            // mount, so we move it onto the blocking pool inside the
-            // spawned task. Using the classified `_detailed` form
-            // (instead of the old `Option` wrapper) lets us surface a
-            // "not in a git repository" / "git not installed" /
-            // "timed out" reason to the user instead of silently
-            // collapsing every failure into "0/N would trigger".
-            let handle = tokio::task::spawn(async move {
-                let repo_root_result =
-                    tokio::task::spawn_blocking(wrkflw_trigger_filter::find_repo_root_detailed)
-                        .await;
-                let repo_root = match repo_root_result {
-                    Ok(Ok(p)) => Some(p),
-                    // `NotInRepository` is a legitimate soft state —
-                    // the user may have launched `wrkflw tui` from
-                    // /tmp or a non-repo sandbox, and the downstream
-                    // git helpers will surface a clearer message
-                    // (e.g. "not a git repository" from `git diff`)
-                    // which lands in the Failure outcome below.
-                    Ok(Err(wrkflw_trigger_filter::FindRepoRootError::NotInRepository)) => None,
-                    Ok(Err(e)) => {
-                        let _ = tx.send(DiffFilterOutcome::Failure(e.to_string()));
-                        return;
-                    }
-                    Err(join_err) => {
-                        let _ = tx.send(DiffFilterOutcome::Failure(format!(
-                            "find_repo_root task panicked: {}",
-                            join_err
-                        )));
-                        return;
-                    }
-                };
-                let results =
-                    evaluate_diff_filter(workflow_paths, event_name, activity_type, repo_root)
-                        .await;
-                let _ = tx.send(results);
-            });
-            self.diff_filter_task = Some(handle);
+            self.spawn_evaluation();
         } else {
+            self.abort_in_flight_evaluation();
             for workflow in &mut self.workflows {
                 workflow.trigger_match = None;
             }
@@ -576,6 +632,7 @@ impl App {
             DiffFilterOutcome::Success(DiffFilterReport {
                 rows,
                 parse_failures,
+                warnings,
             }) => {
                 let by_path: std::collections::HashMap<PathBuf, Option<TriggerMatchStatus>> =
                     rows.into_iter().collect();
@@ -594,6 +651,28 @@ impl App {
                     self.workflows.len()
                 ));
 
+                // Surface non-fatal warnings from the library BEFORE
+                // the parse-failure block so the most actionable
+                // diagnostics land closest to the "N/M triggered"
+                // summary line. `warnings` carries both context-level
+                // (e.g. `git ls-files --others` failed — untracked
+                // files missing from the change set) and parser-level
+                // (e.g. unknown event name typo) diagnostics. Previously
+                // the TUI dropped all of these on the floor even
+                // though the library deliberately routed them through
+                // `EventContext::warnings` / `WorkflowTriggerConfig::warnings`
+                // for hosts to render — the CLI prefilter logs them
+                // at `crates/wrkflw/src/main.rs`; parity is
+                // load-bearing to avoid the silent-skip mode this PR
+                // is built to plug.
+                if !warnings.is_empty() {
+                    self.logs
+                        .push(format!("Diff filter: {} warning(s)", warnings.len()));
+                    for w in &warnings {
+                        self.logs.push(format!("  warning: {}", w));
+                    }
+                }
+
                 // Parse failures used to be silently dropped via
                 // `filter_map(... .ok())`, leaving the user with N
                 // workflows showing as `-` (untriggered) and no clue why.
@@ -609,6 +688,17 @@ impl App {
                             .push(format!("  parse error: {}: {}", path.display(), reason));
                     }
                 }
+
+                // Ad-hoc `self.logs.push(...)` skips the cap that
+                // `add_log` / `mark_logs_for_update` normally enforce.
+                // A single large evaluation could push dozens of
+                // rows + warnings + parse failures all at once, and
+                // without this trim the buffer can temporarily exceed
+                // `LOG_BUFFER_CAP` until the next render pass happens
+                // to route through `mark_logs_for_update`. Mirror the
+                // `add_log` discipline here so the cap invariant is
+                // reasserted immediately.
+                self.trim_logs_to_cap();
             }
             DiffFilterOutcome::Failure(reason) => {
                 for workflow in &mut self.workflows {
@@ -616,6 +706,7 @@ impl App {
                 }
                 self.logs
                     .push(format!("Diff filter: evaluation failed — {}", reason));
+                self.trim_logs_to_cap();
             }
         }
     }
@@ -1609,6 +1700,7 @@ async fn evaluate_diff_filter(
         return DiffFilterOutcome::Success(DiffFilterReport {
             rows: Vec::new(),
             parse_failures: Vec::new(),
+            warnings: Vec::new(),
         });
     }
 
@@ -1642,6 +1734,20 @@ async fn evaluate_diff_filter(
     // rejects every typed pull_request workflow.
     context.activity_type = activity_type;
 
+    // Drain the context-level warnings into our own accumulator
+    // BEFORE we hand the context to `filter_trigger_configs`. The
+    // library routes these through `EventContext::warnings` instead
+    // of calling `wrkflw_logging::warning` directly on purpose —
+    // hosts own the rendering policy — so every host MUST consume
+    // them or reproduce the silent-skip failure mode the rest of
+    // this PR is built to plug. The CLI prefilter does this at
+    // `crates/wrkflw/src/main.rs`; parity is load-bearing.
+    //
+    // `std::mem::take` leaves an empty Vec in its place so the
+    // downstream `filter_trigger_configs` call still sees a
+    // well-formed context without any of the cost of a clone.
+    let mut warnings: Vec<String> = std::mem::take(&mut context.warnings);
+
     // Trigger config parsing is synchronous file I/O; run it on a
     // blocking thread so we don't hold the reactor while reading every
     // .yml in the repo. `load_trigger_configs` consolidates read + parse
@@ -1673,6 +1779,19 @@ async fn evaluate_diff_filter(
         }
     };
 
+    // Harvest per-workflow parser warnings (unknown event names, etc.)
+    // the same way the CLI prefilter at `crates/wrkflw/src/main.rs`
+    // does. `parse_trigger_config` stores typo-detection diagnostics
+    // on `WorkflowTriggerConfig::warnings` instead of logging them,
+    // so each successfully-parsed config may still carry a warning.
+    // Prefixing with the workflow path lets the log pane point the
+    // user at exactly which file has the problem.
+    for cfg in &configs {
+        for w in &cfg.warnings {
+            warnings.push(format!("{}: {}", cfg.workflow_path.display(), w));
+        }
+    }
+
     let borrowed: Vec<&wrkflw_trigger_filter::WorkflowTriggerConfig> = configs.iter().collect();
     let results = wrkflw_trigger_filter::filter_trigger_configs(&borrowed, &context);
     let results_by_path: std::collections::HashMap<
@@ -1700,6 +1819,7 @@ async fn evaluate_diff_filter(
     DiffFilterOutcome::Success(DiffFilterReport {
         rows,
         parse_failures,
+        warnings,
     })
 }
 
@@ -1897,6 +2017,7 @@ mod tests {
                 ),
             ],
             parse_failures: Vec::new(),
+            warnings: Vec::new(),
         }))
         .unwrap();
 
@@ -1942,6 +2063,7 @@ mod tests {
                 PathBuf::from("broken.yml"),
                 "Invalid glob pattern '[unclosed' under 'push.paths'".to_string(),
             )],
+            warnings: Vec::new(),
         }))
         .unwrap();
 
@@ -1958,6 +2080,72 @@ mod tests {
                 .iter()
                 .any(|l| l.contains("broken.yml") && l.contains("[unclosed")),
             "expected per-file parse error line in logs, got {:?}",
+            new_logs
+        );
+    }
+
+    #[test]
+    fn check_diff_filter_results_surfaces_context_and_parser_warnings_to_logs() {
+        // Regression: previously the TUI dropped every
+        // `EventContext::warnings` and every `WorkflowTriggerConfig::warnings`
+        // on the floor, even though the library deliberately routes
+        // those through struct fields so hosts own the rendering
+        // policy. The CLI prefilter at `crates/wrkflw/src/main.rs`
+        // logs both sources via `wrkflw_logging::warning`; the TUI must
+        // produce matching output in its log pane or reproduce the
+        // silent-skip failure mode the rest of this PR was built to
+        // plug (e.g. a `git ls-files --others` failure silently drops
+        // untracked files from the change set; an `on: pul_request`
+        // typo never surfaces; every workflow shows `-` with no clue).
+        //
+        // This test covers TWO warning sources in one payload:
+        //   1. A context-level warning (think: `git ls-files --others`
+        //      safe-directory rejection).
+        //   2. A parser-level warning already prefixed with the
+        //      workflow path, the same shape `evaluate_diff_filter`
+        //      produces when it harvests `WorkflowTriggerConfig::warnings`.
+        // Both must show up in the log burst, and the summary count
+        // line must match the number of warnings delivered.
+        let mut app = make_app();
+        let log_count_before = app.logs.len();
+
+        let (tx, rx) = mpsc::channel();
+        app.diff_filter_rx = Some(rx);
+        app.diff_filter_active = true;
+        tx.send(DiffFilterOutcome::Success(DiffFilterReport {
+            rows: vec![(
+                PathBuf::from("ci.yml"),
+                Some(TriggerMatchStatus::Matched("matched ci".into())),
+            )],
+            parse_failures: Vec::new(),
+            warnings: vec![
+                "git ls-files --others failed (exit 128): fatal: unsafe repository".to_string(),
+                ".github/workflows/ci.yml: workflow test.yml uses unknown event 'pul_request'"
+                    .to_string(),
+            ],
+        }))
+        .unwrap();
+
+        app.check_diff_filter_results();
+
+        let new_logs: Vec<&String> = app.logs.iter().skip(log_count_before).collect();
+        assert!(
+            new_logs
+                .iter()
+                .any(|l| l.contains("Diff filter: 2 warning(s)")),
+            "expected warning-count summary line in logs, got {:?}",
+            new_logs
+        );
+        assert!(
+            new_logs
+                .iter()
+                .any(|l| l.contains("git ls-files --others failed")),
+            "context warning must surface in logs, got {:?}",
+            new_logs
+        );
+        assert!(
+            new_logs.iter().any(|l| l.contains("pul_request")),
+            "parser warning (unknown event typo) must surface in logs, got {:?}",
             new_logs
         );
     }

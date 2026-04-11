@@ -91,18 +91,32 @@ impl Debouncer {
         self.notify.notify_one();
     }
 
-    /// Wall-clock ceiling on the cumulative settle window. Sustained
-    /// filesystem churn will not delay a drain past this budget
-    /// regardless of how long `duration` is — a user passing
-    /// `--debounce 5000` would otherwise see a 5s × 3-round = 15s
-    /// worst-case drain under a churn burst. 1.5s preserves the
-    /// behavior the old hardcoded 3-round cap produced for the stock
-    /// 500ms debounce (3 × 500 = 1500) while scaling correctly when
-    /// the user picks a different debounce window. Tests that rely
-    /// on the livelock prevention (see
-    /// `max_settle_rounds_prevents_livelock` below) continue to
-    /// pass because the cumulative budget resolves the same way for
-    /// short windows (many rounds fit in 1.5s).
+    /// Soft budget that bounds the cumulative settle window for
+    /// *normal-sized* debounce durations. The number of settle
+    /// rounds is computed as `max(1, budget / duration)`, so a
+    /// user passing `--debounce 5000` no longer produces a 5s × 3-round
+    /// = 15s worst-case drain like the old hardcoded `MAX_SETTLE_ROUNDS = 3`
+    /// did — the derived round count collapses to 1 for any window
+    /// that already meets or exceeds the budget.
+    ///
+    /// **This is NOT a hard wall-clock cap.** A single settle round
+    /// sleeps the full `duration`, and `tokio::time::sleep` is not
+    /// preempted mid-sleep. With `duration > MAX_SETTLE_BUDGET`
+    /// (e.g. `--debounce 2000`) the derived round count is 1 and
+    /// `drain()` still sleeps the entire 2s window before returning,
+    /// exceeding the nominal 1.5s budget. The worst-case drain
+    /// latency is therefore `max(MAX_SETTLE_BUDGET, duration)` plus
+    /// one extra `duration` for the final settle check. That's
+    /// acceptable because: (a) a user who explicitly picked a 2s
+    /// debounce is already opting into multi-second latency, and
+    /// (b) shortening the inner sleep would starve the legitimate
+    /// coalescing cases the debouncer exists to serve.
+    ///
+    /// For the stock 500ms debounce this degenerates to the old
+    /// hardcoded behavior (3 × 500 = 1500), so the existing
+    /// `max_settle_rounds_prevents_livelock` test continues to pin
+    /// the short-window path, and `long_debounce_window_still_terminates_within_budget`
+    /// pins the long-window single-round path.
     const MAX_SETTLE_BUDGET: Duration = Duration::from_millis(1500);
 
     /// Wait for the debounce window to settle, then drain all pending paths.

@@ -89,15 +89,20 @@ fn parse_event_config(
         });
     }
 
-    let map = match value.as_mapping() {
-        Some(m) => m,
-        None => {
-            return Ok(EventFilter {
-                event_name: event_name.to_string(),
-                ..Default::default()
-            })
-        }
-    };
+    // A non-null value for an event MUST be a mapping of filter keys
+    // (branches/tags/paths/types/...). Previously this path silently
+    // returned a default (unfiltered) EventFilter for anything else, so
+    // a typo like `on: { push: "main" }` collapsed to "push with no
+    // filters" — exactly the silent-drop mode the rest of this parser
+    // guards against via `extract_string_list`. Surface the typo with
+    // the offending yaml kind so the user can fix it.
+    let map = value.as_mapping().ok_or_else(|| {
+        TriggerFilterError::ParseError(format!(
+            "{}: event config must be a mapping of filter keys (branches, tags, paths, types, ...) or null, got {}",
+            event_name,
+            yaml_kind(value),
+        ))
+    })?;
 
     // GitHub Actions supports inline `!`-prefixed exclusion patterns in
     // `branches`, `tags`, and `paths`. `resolve_include_and_ignore` splits
@@ -688,6 +693,26 @@ pull_request:
         assert!(msg.contains("expected a string"), "got: {}", msg);
         assert!(msg.contains("on[1]"), "got: {}", msg);
         assert!(msg.contains("mapping"), "got: {}", msg);
+    }
+
+    #[test]
+    fn non_mapping_event_value_surfaces_as_parse_error() {
+        // Regression: `on: { push: "main" }` (value is a string instead
+        // of a `{ branches: [main] }` mapping) used to be silently
+        // accepted as "push with default filters", which matched every
+        // push regardless of the user's intent. Now it must be a
+        // ParseError naming the event and the offending yaml kind so
+        // the user can locate the typo.
+        let raw = make_on_raw(
+            r#"
+push: "main"
+"#,
+        );
+        let err = parse_events(&raw).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("must be a mapping"), "got: {}", msg);
+        assert!(msg.contains("push"), "got: {}", msg);
+        assert!(msg.contains("string"), "got: {}", msg);
     }
 
     #[test]

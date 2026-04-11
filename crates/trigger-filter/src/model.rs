@@ -4,8 +4,8 @@ use std::path::PathBuf;
 /// A glob pattern paired with its source string.
 ///
 /// The source is retained so diagnostic messages can refer back to what the
-/// user wrote in the workflow YAML, and so [`path_matcher`] can apply
-/// GitHub Actions' "no-slash patterns also match the bare filename" rule.
+/// user wrote in the workflow YAML (e.g. `branch 'main' did not match
+/// ["release/*"]` instead of the compiled `Pattern`'s `Debug` output).
 #[derive(Debug, Clone)]
 pub struct GlobPattern {
     pub source: String,

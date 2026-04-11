@@ -129,7 +129,17 @@ impl WatcherConfig {
         // from silly values — each concurrent workflow carries
         // executor state, so unbounded values can exhaust host
         // resources without any helpful error message.
-        if n > MAX_REASONABLE_CONCURRENCY {
+        //
+        // Both clamps must warn loudly. The previous version only
+        // warned on the upper-bound clamp, so `--max-concurrency 0`
+        // silently ran with concurrency=1 and the user's flag was
+        // effectively ignored — the same silent-skip mode the rest of
+        // this PR is built to prevent.
+        if n == 0 {
+            wrkflw_logging::warning(
+                "max_concurrency=0 is invalid (would deadlock buffer_unordered); clamping to 1",
+            );
+        } else if n > MAX_REASONABLE_CONCURRENCY {
             wrkflw_logging::warning(&format!(
                 "max_concurrency={} clamped to {} (higher values risk \
                  exhausting container/tempdir/process resources)",
@@ -233,8 +243,21 @@ impl WorkflowWatcher {
         // (no intermediate bounded MPSC). This avoids silent drops under
         // burst load: a `HashSet::insert` on the debouncer's mutex is bounded
         // in cost, and the debouncer naturally deduplicates paths.
+        //
+        // We capture BOTH the raw and the canonicalized repo root and hand
+        // both to `should_ignore_path`. Notify's path form is
+        // backend-dependent: macOS FSEvents emits canonicalized paths
+        // (`/private/var/...`), while Linux inotify emits paths rooted at
+        // whatever path we passed to `.watch()` — which is the raw
+        // (possibly symlinked) `self.cfg.repo_root`. Using only the
+        // canonical form here silently broke the ignore filter for
+        // symlinked working trees on Linux: every `target/`, `node_modules/`,
+        // `.git/` event would pass through because `strip_prefix` against
+        // the canonical form failed. Passing both forms lets the helper
+        // try the raw form first and fall back to canonical.
         let debouncer_for_callback = debouncer.clone();
-        let repo_root_for_callback = repo_root_canonical.clone();
+        let repo_root_raw_for_callback = self.cfg.repo_root.clone();
+        let repo_root_canonical_for_callback = repo_root_canonical.clone();
         let mut watcher = RecommendedWatcher::new(
             move |res: Result<Event, notify::Error>| {
                 // Notify can deliver `Err` for queue overflow, kernel-side
@@ -259,7 +282,11 @@ impl WorkflowWatcher {
                     return;
                 }
                 for path in event.paths {
-                    if should_ignore_path(&path, &repo_root_for_callback) {
+                    if should_ignore_path(
+                        &path,
+                        &repo_root_raw_for_callback,
+                        &repo_root_canonical_for_callback,
+                    ) {
                         continue;
                     }
                     debouncer_for_callback.add_event(path);
@@ -850,24 +877,42 @@ fn collect_workflow_files_blocking(dir: &Path) -> Result<Vec<PathBuf>, WatchErro
 
 /// Returns `true` if a path falls inside any of the default ignore directories,
 /// where "inside" means: a directory component (NOT the leaf filename) of the
-/// path's `repo_root`-relative form matches one of the ignore names.
+/// path's repo-relative form matches one of the ignore names.
 ///
 /// We deliberately skip the leaf component so a user file literally named
 /// `target` (e.g. `scripts/target`) is not silently dropped — only paths that
 /// have a `target/` (etc.) parent directory are filtered.
 ///
-/// Paths that are NOT under `repo_root` are left untouched (the previous
-/// implementation iterated their absolute components, which would
+/// Paths that are NOT under either repo root form are left untouched (the
+/// previous implementation iterated their absolute components, which would
 /// incorrectly drop a valid `/home/alice/target-acquisition/...` just
 /// because an absolute component happened to equal `target`).
-fn should_ignore_path(path: &Path, repo_root: &Path) -> bool {
-    // Only apply the ignore set if we can express the path as repo-relative.
-    // A path outside the repo root shouldn't exist in practice (notify
-    // scoped to the root), but if it does, we do not want to match against
-    // spurious absolute-path components like `/target-foo/...`.
-    let rel = match path.strip_prefix(repo_root) {
+///
+/// Both `repo_root_raw` and `repo_root_canonical` are taken because notify's
+/// path form is backend-dependent: Linux inotify delivers paths rooted at the
+/// raw `.watch()` argument, while macOS FSEvents delivers canonicalized
+/// paths. A symlinked working tree on Linux (e.g. `/home/alice/proj`
+/// pointing into `/mnt/…/proj`) would otherwise silently defeat the ignore
+/// filter — every `target/` event would pass `strip_prefix` against neither
+/// form if we only checked canonical. We try the raw form first (the cheap
+/// case that matches Linux) and fall back to canonical (macOS + symlinked
+/// dereferenced tails).
+fn should_ignore_path(path: &Path, repo_root_raw: &Path, repo_root_canonical: &Path) -> bool {
+    // Try raw first (Linux inotify common case), then canonical (macOS
+    // FSEvents, symlinked working trees where notify dereferenced the
+    // link before delivery). We accept the first strip_prefix that
+    // succeeds — both forms describe the same repo, so the ignore
+    // semantics are identical against either.
+    let rel = match path.strip_prefix(repo_root_raw) {
         Ok(r) => r,
-        Err(_) => return false,
+        Err(_) => match path.strip_prefix(repo_root_canonical) {
+            Ok(r) => r,
+            // Path outside both forms of the repo root shouldn't exist in
+            // practice (notify scoped to the root), but if it does, leave
+            // it alone rather than iterating absolute components that
+            // might spuriously match (`/target-foo/...`).
+            Err(_) => return false,
+        },
     };
     // Compare against every component except the last (the leaf, which is
     // presumed to be a filename). Using `parent()` + component iteration
@@ -987,6 +1032,7 @@ mod tests {
     fn ignores_git_directory() {
         assert!(should_ignore_path(
             Path::new("/repo/.git/objects/pack/abc"),
+            root(),
             root()
         ));
     }
@@ -998,17 +1044,23 @@ mod tests {
         // would match the `target` ignore entry.
         assert!(!should_ignore_path(
             Path::new("/home/alice/target-acquisition/file.rs"),
+            root(),
             root()
         ));
         // Similarly for a directory literally named `target` outside the
         // watched root.
-        assert!(!should_ignore_path(Path::new("/target/build.rs"), root()));
+        assert!(!should_ignore_path(
+            Path::new("/target/build.rs"),
+            root(),
+            root()
+        ));
     }
 
     #[test]
     fn ignores_target_directory() {
         assert!(should_ignore_path(
             Path::new("/repo/target/debug/deps/foo"),
+            root(),
             root()
         ));
     }
@@ -1017,19 +1069,25 @@ mod tests {
     fn ignores_node_modules() {
         assert!(should_ignore_path(
             Path::new("/repo/node_modules/pkg/index.js"),
+            root(),
             root()
         ));
     }
 
     #[test]
     fn does_not_ignore_src() {
-        assert!(!should_ignore_path(Path::new("/repo/src/main.rs"), root()));
+        assert!(!should_ignore_path(
+            Path::new("/repo/src/main.rs"),
+            root(),
+            root()
+        ));
     }
 
     #[test]
     fn does_not_ignore_workflow_files() {
         assert!(!should_ignore_path(
             Path::new("/repo/.github/workflows/ci.yml"),
+            root(),
             root()
         ));
     }
@@ -1038,6 +1096,7 @@ mod tests {
     fn ignores_pycache() {
         assert!(should_ignore_path(
             Path::new("/repo/__pycache__/module.cpython-311.pyc"),
+            root(),
             root()
         ));
     }
@@ -1048,13 +1107,63 @@ mod tests {
         // only directories named `target/` count.
         assert!(!should_ignore_path(
             Path::new("/repo/scripts/target"),
+            root(),
             root()
         ));
     }
 
     #[test]
+    fn ignores_target_via_raw_root_when_canonical_differs() {
+        // Regression: symlinked working tree on Linux. `repo_root_raw`
+        // is the symlink (`/home/alice/proj`), `repo_root_canonical`
+        // is the dereferenced target (`/mnt/work/proj`). Linux inotify
+        // delivers events rooted at the watched path (the raw symlink),
+        // so the raw form MUST match first — if we only checked the
+        // canonical form, every `target/`, `node_modules/`, `.git/`
+        // event would bypass the ignore filter and flood the debouncer.
+        let raw = Path::new("/home/alice/proj");
+        let canonical = Path::new("/mnt/work/proj");
+        assert!(should_ignore_path(
+            Path::new("/home/alice/proj/target/debug/foo"),
+            raw,
+            canonical,
+        ));
+        // And a non-ignored path under the raw form must still pass.
+        assert!(!should_ignore_path(
+            Path::new("/home/alice/proj/src/main.rs"),
+            raw,
+            canonical,
+        ));
+    }
+
+    #[test]
+    fn ignores_target_via_canonical_root_when_raw_differs() {
+        // Regression: macOS FSEvents. `repo_root_raw` is whatever the
+        // user passed (`/var/folders/.../proj`), `repo_root_canonical`
+        // is FSEvents' canonicalized form (`/private/var/folders/.../proj`).
+        // Notify delivers canonicalized paths on macOS, so the raw form
+        // WON'T match but the canonical fallback must catch the event.
+        let raw = Path::new("/var/folders/xyz/proj");
+        let canonical = Path::new("/private/var/folders/xyz/proj");
+        assert!(should_ignore_path(
+            Path::new("/private/var/folders/xyz/proj/target/debug/foo"),
+            raw,
+            canonical,
+        ));
+        assert!(!should_ignore_path(
+            Path::new("/private/var/folders/xyz/proj/src/main.rs"),
+            raw,
+            canonical,
+        ));
+    }
+
+    #[test]
     fn does_not_ignore_file_named_build() {
-        assert!(!should_ignore_path(Path::new("/repo/docs/build"), root()));
+        assert!(!should_ignore_path(
+            Path::new("/repo/docs/build"),
+            root(),
+            root()
+        ));
     }
 
     /// Build a minimal `WorkflowWatcher` over a tempdir for cache tests.
@@ -1143,6 +1252,7 @@ mod tests {
     fn ignores_nested_target_subdirectory() {
         assert!(should_ignore_path(
             Path::new("/repo/crates/foo/target/debug/build/foo"),
+            root(),
             root()
         ));
     }

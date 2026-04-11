@@ -18,9 +18,27 @@ const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 /// failure modes (network filesystem stalls, credential prompts, corrupt
 /// repos), so we MUST reap the child when we give up on it. Otherwise the
 /// long-running watch loop accumulates one zombie per timed-out call.
+///
+/// `stdin(Stdio::null())` + `GIT_TERMINAL_PROMPT=0` are also load-bearing and
+/// must never be removed. Without them:
+///
+/// 1. In raw-terminal TUI mode a backgrounded git subprocess inherits the
+///    same TTY stdin as ratatui and can consume the user's keystrokes for
+///    the full `GIT_COMMAND_TIMEOUT` window (up to 10 s) before the reaper
+///    kicks in. This is visible on any repo whose remote requires auth.
+/// 2. Git's askpass / credential helper can block indefinitely on a
+///    `terminal.prompt`, which the timeout only partially mitigates —
+///    during those 10 s git is actively reading from stdin, racing the UI
+///    for every keystroke. Forcing `GIT_TERMINAL_PROMPT=0` turns the
+///    prompt into an immediate auth-failure error instead.
+///
+/// The combination means every git subprocess is fully insulated from the
+/// parent process's terminal state, regardless of caller (CLI, watcher, TUI).
 fn git_cmd(cwd: Option<&Path>) -> Command {
     let mut cmd = Command::new("git");
-    cmd.kill_on_drop(true);
+    cmd.kill_on_drop(true)
+        .stdin(std::process::Stdio::null())
+        .env("GIT_TERMINAL_PROMPT", "0");
     if let Some(dir) = cwd {
         cmd.arg("-C").arg(dir.as_os_str());
     }
@@ -245,12 +263,15 @@ pub async fn get_current_branch(cwd: Option<&Path>) -> Result<Option<String>, Tr
 /// changed and defeated the purpose of the filter. Callers should surface
 /// the error so the user knows to pass `--diff-base` explicitly.
 pub async fn get_default_diff_base(cwd: Option<&Path>) -> Result<String, TriggerFilterError> {
-    // Check for uncommitted changes first
+    // Check for uncommitted changes first. `run_git` returns `Ok` even
+    // for non-zero exit (e.g. "not a git repository"), so we must check
+    // `output.status.success()` before trusting stdout — otherwise a
+    // corrupted repo silently claims a clean tree and we fall through
+    // to remote-default-branch probing under a confusing pretext.
     let mut status_cmd = git_cmd(cwd);
     status_cmd.args(["status", "--porcelain"]);
     if let Ok(output) = run_git(status_cmd, "git status").await {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        if !stdout.trim().is_empty() {
+        if output.status.success() && !String::from_utf8_lossy(&output.stdout).trim().is_empty() {
             // Surface the heuristic so users aren't surprised when
             // `--diff` against a dirty tree only considers uncommitted
             // changes. The typical confusion: "I have WIP edits and a
@@ -332,34 +353,86 @@ pub async fn get_default_diff_base(cwd: Option<&Path>) -> Result<String, Trigger
     ))
 }
 
+/// Hard upper bound on how long `find_repo_root` will wait for `git
+/// rev-parse --show-toplevel` before giving up and killing the child.
+/// Shorter than [`GIT_COMMAND_TIMEOUT`] because this call is on the
+/// startup / toggle-hot-path for every consumer, and a hung git here
+/// delays the very first user interaction.
+const FIND_REPO_ROOT_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Find the git repository root from the current working directory by
 /// shelling out to `git rev-parse --show-toplevel`.
 ///
-/// Returns `None` if `git` is unavailable, the call fails, or the
-/// process is not inside a git working tree. This is the right anchor
-/// for any consumer that wants to run subsequent git operations against
-/// "the repo the user is in" — passing it as `cwd` to the other helpers
-/// in this module makes their behavior independent of the process CWD.
+/// Returns `None` if `git` is unavailable, the call fails, the process is
+/// not inside a git working tree, or the call exceeds
+/// [`FIND_REPO_ROOT_TIMEOUT`]. The timeout matters: previously this used
+/// `Command::output()` with no bound, so a hung git (credential prompt,
+/// stuck network mount, corrupted `.git`) would wedge the caller's
+/// blocking-pool thread forever. Callers wrap us in `spawn_blocking` so
+/// the reactor stays responsive, but without a kill-timer the blocking
+/// thread leaks for the rest of the process's lifetime.
 ///
 /// Synchronous on purpose: callers tend to invoke this once at startup,
 /// and the dependency on tokio for a single subprocess call would force
 /// every consumer (including the synchronous TUI bootstrap) to create a
-/// runtime just to discover a path.
+/// runtime just to discover a path. `std::process` plus a hand-rolled
+/// `try_wait` poll loop gives us the timeout without pulling in tokio.
+///
+/// `stdin(Stdio::null())` + `GIT_TERMINAL_PROMPT=0` mirror `git_cmd` above —
+/// see its rationale for why the parent's TTY must never leak into a git
+/// subprocess.
 pub fn find_repo_root() -> Option<std::path::PathBuf> {
-    let output = std::process::Command::new("git")
+    use std::io::Read;
+    use std::process::{Command as StdCommand, Stdio};
+    use std::time::Instant;
+
+    let mut child = StdCommand::new("git")
         .args(["rev-parse", "--show-toplevel"])
-        .output()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .spawn()
         .ok()?;
 
-    if output.status.success() {
-        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if path.is_empty() {
-            None
-        } else {
-            Some(std::path::PathBuf::from(path))
+    let deadline = Instant::now() + FIND_REPO_ROOT_TIMEOUT;
+    let exit_status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    // Kill + reap the child so we don't leave a zombie.
+                    // We intentionally ignore errors on `kill`/`wait`:
+                    // there's nothing useful we can do, and the caller
+                    // is already in the "`None` means give up" branch.
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
         }
-    } else {
+    };
+
+    if !exit_status.success() {
+        return None;
+    }
+
+    // Child has exited; drain stdout. `wait_with_output` is not
+    // available here because we've already waited — read from the
+    // piped handle directly instead.
+    let mut buf = String::new();
+    child.stdout.take()?.read_to_string(&mut buf).ok()?;
+    let path = buf.trim().to_string();
+    if path.is_empty() {
         None
+    } else {
+        Some(std::path::PathBuf::from(path))
     }
 }
 

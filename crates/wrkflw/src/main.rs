@@ -1874,4 +1874,166 @@ mod prefilter_tests {
             }
         }
     }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn strict_filter_rejects_event_alone_without_diff_or_changed_files() {
+        // Regression pin for the strict-filter default-on gate in
+        // `build_event_context`: passing `--event push` with neither
+        // `--diff` nor `--changed-files` means the caller could not
+        // supply a change set, so every `paths:`-gated workflow would
+        // be silently rejected at evaluation time. Under strict mode
+        // (the default) this must be a hard error up front instead,
+        // pointing the user at the three escape hatches.
+        //
+        // This is the load-bearing CLI behavior change the
+        // BREAKING_CHANGES.md entry documents — keeping the rejection
+        // behavior pinned here prevents a future refactor from
+        // silently flipping it back to warn-and-proceed.
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let wf = tmp.path().join("ci.yml");
+        // Any parseable workflow works; `build_event_context` fails
+        // before parsing.
+        std::fs::write(
+            &wf,
+            "name: ci\n\
+             on:\n  push:\n    paths:\n      - 'src/**'\n\
+             jobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+        )
+        .expect("write workflow");
+
+        let event = "push".to_string();
+        let req = PrefilterRequest {
+            workflow_path: &wf,
+            event: Some(&event),
+            diff: false,
+            changed_files: None,
+            diff_base: None,
+            diff_head: None,
+            base_branch: None,
+            activity_type: None,
+            verbose: false,
+            strict_filter: true,
+        };
+        let err = run_trigger_prefilter(req)
+            .await
+            .expect_err("strict mode must reject --event without --diff/--changed-files");
+        assert!(
+            err.contains("--diff") && err.contains("--changed-files"),
+            "error must point the user at the three escape hatches, got: {}",
+            err
+        );
+        assert!(
+            err.contains("--no-strict-filter"),
+            "error must name the legacy opt-out, got: {}",
+            err
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn non_strict_filter_allows_event_alone_with_warning_and_empty_change_set() {
+        // Mirror of the strict-mode test: with `--no-strict-filter`
+        // the caller opts back into the legacy warn-and-proceed
+        // behavior, and the prefilter must build a context with an
+        // empty change set rather than erroring. We don't assert on
+        // the log output (wrkflw_logging::warning goes to a global
+        // sink), just that the path does not error and that a
+        // workflow gated on paths: will resolve to Skip cleanly.
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let wf = tmp.path().join("ci.yml");
+        std::fs::write(
+            &wf,
+            "name: ci\n\
+             on:\n  push:\n    paths:\n      - 'src/**'\n\
+             jobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+        )
+        .expect("write workflow");
+
+        let event = "push".to_string();
+        let req = PrefilterRequest {
+            workflow_path: &wf,
+            event: Some(&event),
+            diff: false,
+            changed_files: None,
+            diff_base: None,
+            diff_head: None,
+            base_branch: None,
+            activity_type: None,
+            verbose: false,
+            strict_filter: false,
+        };
+        let decision = run_trigger_prefilter(req)
+            .await
+            .expect("non-strict mode must not error on --event alone");
+        match decision {
+            PrefilterDecision::Skip { reason } => {
+                // Empty change set against `paths: ['src/**']` must
+                // surface as a Skip whose reason mentions the paths
+                // filter — not a Proceed (which would run the
+                // workflow against a phantom empty change set).
+                assert!(
+                    reason.contains("paths"),
+                    "non-strict empty change set must Skip on a paths-gated \
+                     workflow, got reason: {}",
+                    reason
+                );
+            }
+            PrefilterDecision::Proceed => {
+                panic!(
+                    "non-strict mode with empty change set must Skip a \
+                     paths-gated workflow, got Proceed"
+                );
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn strict_filter_rejects_pull_request_without_base_branch() {
+        // Regression pin for `apply_base_branch` under strict mode:
+        // simulating pull_request or pull_request_target without
+        // --base-branch is the same silent-skip shape as --event
+        // alone — every `branches:` filter on the event is
+        // deterministically rejected because GHA evaluates those
+        // against the PR target. Strict mode must refuse to proceed
+        // instead of warn-and-continue.
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let wf = tmp.path().join("ci.yml");
+        std::fs::write(
+            &wf,
+            "name: ci\n\
+             on:\n  pull_request:\n    branches:\n      - main\n\
+             jobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+        )
+        .expect("write workflow");
+
+        // Pass `--changed-files` so `build_event_context` doesn't
+        // reject on the "no change set" path — we want the error to
+        // come from `apply_base_branch` specifically.
+        let event = "pull_request".to_string();
+        let changed: Vec<String> = vec!["src/main.rs".to_string()];
+        let req = PrefilterRequest {
+            workflow_path: &wf,
+            event: Some(&event),
+            diff: false,
+            changed_files: Some(&changed),
+            diff_base: None,
+            diff_head: None,
+            base_branch: None,
+            activity_type: None,
+            verbose: false,
+            strict_filter: true,
+        };
+        let err = run_trigger_prefilter(req)
+            .await
+            .expect_err("strict mode must reject pull_request without --base-branch");
+        assert!(
+            err.contains("--base-branch"),
+            "error must point the user at --base-branch, got: {}",
+            err
+        );
+        assert!(
+            err.contains("pull_request"),
+            "error must name the offending event, got: {}",
+            err
+        );
+    }
 }

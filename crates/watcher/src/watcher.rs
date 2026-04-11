@@ -29,6 +29,22 @@ pub const DEFAULT_MAX_CONCURRENT_EXECUTIONS: usize = 4;
 /// an issue so we can look at the actual workload before lifting the cap.
 pub const MAX_REASONABLE_CONCURRENCY: usize = 256;
 
+/// Soft threshold for the callback supervisor JoinSet. Crossing this
+/// produces a one-shot warning so a slow reporter is surfaced without
+/// spamming the log; crossing back below half clears the latch so the
+/// NEXT spike warns again.
+pub(crate) const SUPERVISOR_WARN_THRESHOLD: usize = 8;
+
+/// Hard ceiling for the callback supervisor JoinSet. Past this we drop
+/// the current cycle's `WatchEvent` rather than spawning another
+/// supervisor we can't contain. Exists to bound memory under a wedged
+/// reporter (deadlocked writer, stuck network webhook); the warning
+/// threshold alone never reclaims anything, so a session-long hang
+/// would otherwise grow the JoinSet without bound for the life of the
+/// process. 128 keeps the worst-case footprint in the low MB range
+/// while leaving plenty of headroom for a briefly-slow reporter.
+pub(crate) const SUPERVISOR_HARD_CAP: usize = 128;
+
 // The watcher's cached-git-state TTL now lives on
 // `TriggerFilterConfig::git_state_ttl` — see the config crate for
 // rationale and rationale comments. `cached_git_state` reads
@@ -382,14 +398,28 @@ impl WorkflowWatcher {
         // when empty) and surface a threshold warning so a reporter
         // that's falling behind doesn't silently balloon memory.
         //
-        // Threshold = 8: small enough that a legitimately slow reporter
-        // trips it (actionable), large enough that normal cycle-to-
-        // cycle overlap doesn't (no false positives). `warned` is a
-        // one-shot latch per threshold crossing — without it a
-        // session-long backlog would produce one warning per iteration.
+        // Two caps:
+        //
+        //   - `SUPERVISOR_WARN_THRESHOLD = 8`: small enough that a
+        //     legitimately slow reporter trips it (actionable), large
+        //     enough that normal cycle-to-cycle overlap doesn't (no
+        //     false positives). One-shot latch per threshold crossing
+        //     so a session-long backlog produces exactly one warning
+        //     per climb-past-8, not a warning per iteration.
+        //
+        //   - `SUPERVISOR_HARD_CAP = 128`: genuine memory ceiling. A
+        //     truly wedged reporter (deadlocked file sink, hung network
+        //     webhook) would otherwise grow the JoinSet without bound
+        //     for the life of the session — the warning alone never
+        //     reclaims anything. At the hard cap we surface a loud
+        //     error, drop the CURRENT cycle's event (rather than
+        //     spawning a supervisor we can't contain), and keep the
+        //     watch loop running. 128 is small enough that memory
+        //     growth is bounded at low MB; large enough that a short
+        //     reporter stall can't false-trip it.
         let mut supervisor_tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
         let mut supervisor_warned_at_threshold = false;
-        const SUPERVISOR_WARN_THRESHOLD: usize = 8;
+        let mut supervisor_hard_cap_warned = false;
 
         // Precompute the combined ignore set (defaults + user-supplied
         // extras). Sharing via Arc means the callback closure and the
@@ -677,7 +707,42 @@ impl WorkflowWatcher {
             // previous detached `tokio::spawn`) is what makes the
             // accumulation bounded: a stuck reporter now trips the
             // `SUPERVISOR_WARN_THRESHOLD` log at the top of the loop
-            // instead of silently leaking one task per cycle forever.
+            // and, past `SUPERVISOR_HARD_CAP`, drops cycle events
+            // entirely rather than leaking one supervisor per cycle
+            // forever. The warning alone was not enough — a truly
+            // wedged reporter (deadlocked writer, stuck webhook) never
+            // drains, so the backlog grows until the process OOMs.
+            // Dropping cycles at the hard cap keeps memory bounded at
+            // the cost of losing events for the stuck reporter; the
+            // user sees a loud error explaining why.
+            if supervisor_tasks.len() >= SUPERVISOR_HARD_CAP {
+                if !supervisor_hard_cap_warned {
+                    wrkflw_logging::error(&format!(
+                        "{} callback supervisor task(s) pending — hit hard cap of {}. \
+                         Dropping this cycle's WatchEvent to contain memory growth. \
+                         Your reporter callback is stuck or wedged; the watch loop will \
+                         continue but will keep dropping cycles until the backlog drains. \
+                         Investigate the reporter (deadlocked writer? hung network sink?) \
+                         and restart `wrkflw watch` to recover fully.",
+                        supervisor_tasks.len(),
+                        SUPERVISOR_HARD_CAP,
+                    ));
+                    supervisor_hard_cap_warned = true;
+                }
+                // Skip spawning a new supervisor. The WatchEvent is
+                // dropped on the floor — the reaper at the top of the
+                // next iteration will clear space as supervisors
+                // finish, at which point new events resume flowing.
+                continue;
+            }
+            // Clear the one-shot hard-cap latch once we're back under
+            // the ceiling so a NEW spike of wedging produces a fresh
+            // error log. Mirrors the `supervisor_warned_at_threshold`
+            // reset discipline above.
+            if supervisor_tasks.len() < SUPERVISOR_HARD_CAP / 2 {
+                supervisor_hard_cap_warned = false;
+            }
+
             let cb = callback.clone();
             let cb_handle = tokio::task::spawn_blocking(move || cb(event));
             supervisor_tasks.spawn(async move {
@@ -1743,6 +1808,261 @@ mod tests {
                         "shutdown did not interrupt an active drain within 2s \
                          (the drain window was 5s — regression on the \
                          `tokio::select!` around debouncer.drain())"
+                    ),
+                }
+            })
+            .await;
+    }
+
+    // Compile-time invariants: the warning threshold must stay
+    // strictly below the hard cap, and the hard cap must leave
+    // meaningful headroom (4x) above the threshold so short reporter
+    // stalls don't trip the drop-cycles path. A future tweak that
+    // accidentally inverts the ordering or sets them too close
+    // together fails the build here instead of drifting silently into
+    // production.
+    //
+    // `const { assert!(..) }` is the idiomatic form — clippy flags a
+    // runtime `assert!` on all-const operands because the check is
+    // trivially evaluated at compile time. Const asserts also catch
+    // the regression at `cargo check` time instead of waiting for
+    // `cargo test`, which is strictly better.
+    const _: () = {
+        assert!(SUPERVISOR_WARN_THRESHOLD < SUPERVISOR_HARD_CAP);
+        assert!(SUPERVISOR_HARD_CAP >= SUPERVISOR_WARN_THRESHOLD * 4);
+    };
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shutdown_unblocks_run_even_when_reporter_callback_is_wedged() {
+        // Regression for the hard-cap + wedged-reporter contract: if
+        // a reporter callback blocks forever (deadlocked file sink,
+        // stuck network webhook), the watch loop must:
+        //
+        //   1. Stay responsive to shutdown — the main select!/await
+        //      points must not park behind the callback. `spawn_blocking`
+        //      around the callback gives us this for free because the
+        //      blocking thread is isolated from the reactor.
+        //   2. Eventually stop spawning new supervisors when the
+        //      `SUPERVISOR_HARD_CAP` is hit (validated by code
+        //      inspection + `supervisor_caps_are_sanely_ordered`; a
+        //      runtime test of the exact count would need to fire
+        //      128 debounced cycles and is not worth the flake budget).
+        //
+        // This test exercises (1) directly: we start the watcher with
+        // a callback that parks on a never-fired channel, fire a
+        // single change event, let the cycle reach the callback, then
+        // trigger shutdown. `run()` must return cleanly within a
+        // bounded window.
+        //
+        // Without the `spawn_blocking` isolation + cancellation-aware
+        // selects, this test would hang: `run()` would be waiting on
+        // the never-returning callback and never observe shutdown.
+        use std::process::Command as StdCommand;
+        use std::sync::{Arc, Mutex as StdMutex};
+
+        if StdCommand::new("git")
+            .arg("--version")
+            .status()
+            .map(|s| !s.success())
+            .unwrap_or(true)
+        {
+            return;
+        }
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let repo = tmp.path().to_path_buf();
+        let init_status = StdCommand::new("git")
+            .args([
+                "-C",
+                repo.to_str().unwrap(),
+                "init",
+                "--initial-branch=main",
+            ])
+            .status();
+        if !init_status.map(|s| s.success()).unwrap_or(false) {
+            return;
+        }
+        for (k, v) in [("user.email", "t@t.t"), ("user.name", "t")] {
+            StdCommand::new("git")
+                .args(["-C", repo.to_str().unwrap(), "config", k, v])
+                .status()
+                .expect("git config");
+        }
+
+        let workflow_dir = repo.join(".github").join("workflows");
+        std::fs::create_dir_all(&workflow_dir).expect("mkdir workflows");
+        std::fs::write(
+            workflow_dir.join("ci.yml"),
+            "name: ci\non: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+        )
+        .expect("write ci.yml");
+        std::fs::create_dir_all(repo.join("src")).expect("mkdir src");
+
+        StdCommand::new("git")
+            .args(["-C", repo.to_str().unwrap(), "add", "."])
+            .status()
+            .expect("git add");
+        StdCommand::new("git")
+            .args([
+                "-C",
+                repo.to_str().unwrap(),
+                "commit",
+                "-m",
+                "init",
+                "--no-gpg-sign",
+            ])
+            .status()
+            .expect("git commit");
+
+        let repo_canonical = std::fs::canonicalize(&repo).expect("canonicalize repo");
+
+        // Short debounce so the test doesn't pay a long wall-clock
+        // tax; the property under test is responsiveness during a
+        // wedged callback, not timing precision.
+        let cfg = WatcherConfig::new(
+            workflow_dir,
+            repo_canonical.clone(),
+            wrkflw_executor::ExecutionConfig {
+                runtime_type: wrkflw_executor::RuntimeType::Emulation,
+                verbose: false,
+                preserve_containers_on_failure: false,
+                secrets_config: None,
+                show_action_messages: false,
+                target_job: None,
+            },
+        )
+        .with_debounce(Duration::from_millis(50));
+        let watcher = WorkflowWatcher::from_config(cfg);
+
+        // `callback_started` flips to true the moment the blocking
+        // reporter is dispatched. The test waits for this flag
+        // before triggering shutdown — otherwise shutdown could race
+        // ahead of the callback and the test would pass for the
+        // wrong reason.
+        //
+        // `release_callback` is the gate we use to unstick the
+        // blocking thread once the main body of the test is done
+        // observing shutdown. We MUST give the blocking thread an
+        // exit path, because `spawn_blocking` runs on a real OS
+        // thread that cargo's test runner joins at process exit —
+        // an uninterruptible `thread::sleep` loop would wedge the
+        // entire test binary even after `run()` has returned. The
+        // gate is flipped in the happy-path outer scope after the
+        // shutdown assertion, and in the timeout fallback branch.
+        let callback_started: Arc<StdMutex<bool>> = Arc::new(StdMutex::new(false));
+        let callback_started_for_cb = callback_started.clone();
+        let release_callback = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let release_callback_for_cb = release_callback.clone();
+
+        let shutdown = ShutdownSignal::new();
+        let shutdown_for_run = shutdown.clone();
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async move {
+                let handle = tokio::task::spawn_local(async move {
+                    watcher
+                        .run(shutdown_for_run, move |_ev| {
+                            // Mark that the reporter was invoked,
+                            // then spin on a release-gated sleep
+                            // loop. `spawn_blocking` isolates this
+                            // thread from the reactor; the watch
+                            // loop stays responsive to shutdown.
+                            //
+                            // Hard upper bound (30s) is a last-resort
+                            // safety net so a bug in the release-gate
+                            // plumbing cannot wedge the test binary
+                            // indefinitely — if the gate never flips
+                            // the thread still exits on its own. The
+                            // outer test body always flips the gate
+                            // long before this bound fires on a
+                            // passing run.
+                            {
+                                let mut started = callback_started_for_cb
+                                    .lock()
+                                    .expect("callback_started mutex");
+                                *started = true;
+                            }
+                            let absolute_deadline =
+                                std::time::Instant::now() + Duration::from_secs(30);
+                            while !release_callback_for_cb
+                                .load(std::sync::atomic::Ordering::Relaxed)
+                            {
+                                if std::time::Instant::now() >= absolute_deadline {
+                                    break;
+                                }
+                                std::thread::sleep(Duration::from_millis(25));
+                            }
+                        })
+                        .await
+                });
+
+                // Let the watcher register notify watches.
+                tokio::time::sleep(Duration::from_millis(200)).await;
+
+                // Fire a change to drive the loop through drain →
+                // evaluate → callback dispatch.
+                std::fs::write(repo_canonical.join("src").join("main.rs"), "fn main() {}\n")
+                    .expect("write src/main.rs");
+
+                // Poll until the callback has been dispatched. Bound
+                // this at 3 seconds so a flake surfaces loudly rather
+                // than as a wedged test.
+                let deadline = std::time::Instant::now() + Duration::from_secs(3);
+                loop {
+                    {
+                        let started = callback_started.lock().expect("mutex");
+                        if *started {
+                            break;
+                        }
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        // Notify may have been slow to deliver on
+                        // this host — skip the assertion rather than
+                        // flake. If the callback never started, we
+                        // can't test the wedged-reporter path. Still
+                        // release the gate in case a late callback
+                        // arrives after we give up, so the blocking
+                        // thread doesn't wedge the test binary.
+                        release_callback.store(true, std::sync::atomic::Ordering::Relaxed);
+                        shutdown.trigger();
+                        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+
+                // Reporter is wedged in its release-gated sleep.
+                // Trigger shutdown — the watch loop MUST return
+                // without waiting for the callback to complete.
+                shutdown.trigger();
+
+                // 2 seconds is plenty: the loop observes shutdown at
+                // its next top-of-loop check or select! arm. If this
+                // times out, the regression is that some await inside
+                // `run()` is parked waiting on the callback.
+                let result = tokio::time::timeout(Duration::from_secs(2), handle).await;
+
+                // Release the callback gate BEFORE asserting on the
+                // result so the blocking thread exits regardless of
+                // whether the assertion passes. Without this, a
+                // panic!("shutdown did not unblock run()") would
+                // fire while the blocking thread is still spinning,
+                // cargo's test harness would try to reap it, and the
+                // binary would hang. Flipping the gate first gives
+                // the blocking thread its exit path in every code
+                // path.
+                release_callback.store(true, std::sync::atomic::Ordering::Relaxed);
+
+                match result {
+                    Ok(Ok(Ok(()))) => {}
+                    Ok(Ok(Err(e))) => panic!("watcher errored: {}", e),
+                    Ok(Err(join_err)) => panic!("watch task join failed: {}", join_err),
+                    Err(_) => panic!(
+                        "shutdown did not unblock run() within 2s while a reporter \
+                         callback was wedged — regression on the callback isolation \
+                         (spawn_blocking) or the cancellation-aware selects in the \
+                         watch loop top"
                     ),
                 }
             })

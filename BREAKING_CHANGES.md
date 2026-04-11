@@ -1,5 +1,104 @@
 # Breaking Changes
 
+## `wrkflw run --event` requires change-set input by default (v0.7.3)
+
+`wrkflw run` now supports trigger-aware filtering via `--event`, `--diff`,
+and `--changed-files`. When any of those flags is passed, the CLI runs a
+prefilter that evaluates the workflow's `on:` block against the simulated
+event context before execution — if the triggers don't match, the
+workflow is skipped with a clean `exit 0`.
+
+Under the new **`--strict-filter` default (on)**, running with `--event`
+alone — without any way for wrkflw to know the change set — is rejected
+with `exit 1`. Previously the CLI proceeded silently with an empty
+change set, which meant every workflow gated on `paths:` was reported as
+"not triggering" for reasons the user could not see.
+
+Strict mode also rejects simulating `pull_request` / `pull_request_target`
+without `--base-branch`, because GitHub Actions evaluates `branches:`
+filters on PR events against the target branch, and the same silent-skip
+mode applies there.
+
+### Why
+
+`wrkflw run --event push` used to proceed with `changed_files = []`,
+causing every `paths:`-gated workflow to be silently rejected at
+evaluation time. Users would then file "why didn't my workflow fire?"
+issues for the non-obvious reason that no change set had been supplied.
+Strict mode turns that silent failure into a loud, actionable error up
+front — it is the default countermeasure for the same class of silent
+skip the rest of v0.7.3 patched iteratively.
+
+### Impact
+
+Scripts that invoked `wrkflw run --event <name> <workflow>` without
+also passing `--diff` or `--changed-files` will now fail with:
+
+```
+Error: --event was supplied without --diff or --changed-files, so no
+changed files are known and any workflow with a `paths:` filter would
+be silently skipped. Pass --diff to auto-detect from git, --changed-files
+to supply them explicitly, or --no-strict-filter to proceed anyway.
+```
+
+Scripts that invoked `wrkflw run --event pull_request <workflow>` without
+`--base-branch` will similarly fail with a pointer at the missing flag.
+
+`wrkflw watch --event pull_request` behaves the same way: missing
+`--base-branch` is rejected under strict mode.
+
+### Migration
+
+Pick the option that matches your intent:
+
+- **CI script that wants to run only workflows the diff would trigger:**
+  add `--diff` (auto-detect base branch via `origin/HEAD` → `main` →
+  `master` → `HEAD~1`) or pin with `--diff-base <ref>`.
+
+  ```bash
+  wrkflw run --diff --event push .github/workflows/ci.yml
+  ```
+
+- **CI script that has its own change set (e.g. from `git diff` in a
+  wrapper):** pass it explicitly.
+
+  ```bash
+  wrkflw run --event push --changed-files src/main.rs,Cargo.toml \
+      .github/workflows/ci.yml
+  ```
+
+- **Simulating a pull request locally:** add `--base-branch`.
+
+  ```bash
+  wrkflw run --event pull_request --base-branch main --diff \
+      .github/workflows/ci.yml
+  ```
+
+- **Legacy warn-and-proceed behavior (not recommended):** opt out with
+  `--no-strict-filter`. This restores the pre-v0.7.3 behavior of logging
+  a warning and running every workflow anyway. Use this only if your
+  scripts have already adapted to the old silent-skip semantics and you
+  cannot change them right now.
+
+### Prefilter exit codes
+
+- `0` — triggers matched, workflow ran to completion (or was skipped
+  because its triggers did not match the event). A skipped workflow
+  prints `Workflow skipped: <reason>` and exits 0 to match GitHub
+  Actions' own "nothing to do" semantics.
+- `1` — something went wrong: flag validation, git error, strict-filter
+  rejection, or workflow execution failure.
+
+### Affected CLI
+
+- `wrkflw run` — new flags: `--event`, `--diff`, `--changed-files`,
+  `--diff-base`, `--diff-head`, `--base-branch`, `--activity-type`,
+  `--strict-filter` (default on), `--no-strict-filter`.
+- `wrkflw watch` — new subcommand. Same strict-filter gate for
+  `--event pull_request` + missing `--base-branch`.
+
+---
+
 ## Shell now matches GitHub Actions invocation (v0.7.3)
 
 The `bash` shell now executes with `bash --noprofile --norc -e -o pipefail -c`, matching GitHub Actions behavior. The `sh` shell uses `sh -e -c`. This means:

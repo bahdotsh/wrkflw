@@ -1654,8 +1654,30 @@ impl App {
     /// Upper bound on the TUI's in-memory log buffer. A long-lived TUI
     /// session (especially with rapid diff-filter toggles, each of
     /// which appends 2+ entries) previously grew unbounded — the
-    /// review flagged this as a slow-leak hazard. 5000 lines of log
-    /// is plenty for visual scrollback without bloating the process.
+    /// review flagged this as a slow-leak hazard.
+    ///
+    /// **Why 5000?** Sized against the two dominant log sources:
+    ///
+    ///   - The executor emits roughly 1-3 lines per workflow step
+    ///     (status + stdout/stderr header). A typical session running
+    ///     a handful of workflows with ~10 steps each stays well below
+    ///     1000 lines per run.
+    ///   - Diff-filter toggles and watch-style re-evaluations emit
+    ///     2-5 lines per cycle (summary + matched/skipped breakdown +
+    ///     optional warnings). Even at a frenzied toggle-per-second
+    ///     pace this produces ~300 lines/minute.
+    ///
+    /// 5000 lines therefore holds ~15 minutes of aggressive toggling
+    /// or several full multi-workflow runs of scrollback — enough for
+    /// a user to debug the most recent failure without bloating RSS
+    /// by the multi-megabyte String heap that an unbounded buffer
+    /// eventually produces in a day-long session. Below ~1000 the
+    /// cap starts losing context mid-run; above ~20000 the heap
+    /// footprint becomes visible on slow machines. If a future TUI
+    /// gains a "save full transcript" feature, route it to a file
+    /// sink rather than holding the transcript in this in-memory
+    /// buffer — the cap should stay in the 5000 neighbourhood
+    /// regardless of scrollback-export needs.
     const LOG_BUFFER_CAP: usize = 5000;
 
     /// Enforce [`LOG_BUFFER_CAP`] by dropping the oldest entries

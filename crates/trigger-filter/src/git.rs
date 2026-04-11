@@ -136,16 +136,55 @@ async fn run_git(
 /// form. Previously a `parse_lines` helper did exactly that and lost
 /// both classes of path.
 ///
-/// Each record is still lossily converted to a `String` at the end
-/// because the rest of the crate operates on `String` glob arguments.
-/// The difference matters for correctness of record SPLITTING, not
-/// for the Unicode content inside a record.
-fn parse_nul_separated(output: &[u8]) -> Vec<String> {
-    output
-        .split(|b| *b == 0)
-        .filter(|bytes| !bytes.is_empty())
-        .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
-        .collect()
+/// **Non-UTF-8 filenames.** On Unix, filesystem paths are not required
+/// to be valid UTF-8, but the rest of the crate operates on `String`
+/// glob arguments. Records that fail UTF-8 validation are collected in
+/// the returned `lossy` list (with `String::from_utf8_lossy` applied so
+/// they still round-trip visibly) AND counted in the `lossy_count`
+/// return so callers can surface a diagnostic. Silently replacing
+/// invalid bytes with U+FFFD — which the old implementation did — is
+/// the same "silently drop a file from the change set" failure mode
+/// the newline-split fix was put here to prevent: a workflow gated on
+/// `paths:` would mysteriously not fire for a non-UTF-8 filename, and
+/// no diagnostic would point at the cause. Callers should hoist the
+/// warning into `EventContext::warnings` so the user sees the root
+/// cause instead of a mystery non-match.
+fn parse_nul_separated(output: &[u8]) -> NulParseResult {
+    let mut files: Vec<String> = Vec::new();
+    let mut lossy_names: Vec<String> = Vec::new();
+    for bytes in output.split(|b| *b == 0).filter(|b| !b.is_empty()) {
+        match std::str::from_utf8(bytes) {
+            Ok(s) => files.push(s.to_string()),
+            Err(_) => {
+                // Retain a best-effort form so the user sees *which*
+                // file was dropped; `from_utf8_lossy` replaces invalid
+                // sequences with U+FFFD which is still visible and
+                // grep-able, just not matchable by any real glob.
+                let lossy = String::from_utf8_lossy(bytes).into_owned();
+                lossy_names.push(lossy.clone());
+                // Still push the lossy form into `files` so the rest
+                // of the pipeline doesn't see a mysteriously shorter
+                // list — the evaluator will simply fail to match it,
+                // and the accompanying warning explains why.
+                files.push(lossy);
+            }
+        }
+    }
+    NulParseResult { files, lossy_names }
+}
+
+/// Result of [`parse_nul_separated`].
+///
+/// `files` is the full list of paths in the order git emitted them.
+/// `lossy_names` is the subset whose bytes failed UTF-8 validation and
+/// were coerced via `from_utf8_lossy`. Callers MUST surface a warning
+/// when `lossy_names` is non-empty — the lossy form will not match any
+/// real glob pattern, and the silent drop is the same class of failure
+/// the rest of this crate exists to plug.
+#[derive(Debug, Default)]
+struct NulParseResult {
+    files: Vec<String>,
+    lossy_names: Vec<String>,
 }
 
 fn merge_unique(mut into: Vec<String>, more: Vec<String>) -> Vec<String> {
@@ -244,7 +283,8 @@ pub async fn get_changed_files_with_warnings(
     );
 
     let diff_output = check_status(diff_res?, "git diff")?;
-    let mut files = parse_nul_separated(&diff_output.stdout);
+    let diff_parsed = parse_nul_separated(&diff_output.stdout);
+    let mut files = diff_parsed.files;
 
     // Untracked files are a best-effort enrichment — don't fail the
     // whole call if `ls-files` errors (e.g. a safe-directory rejection,
@@ -261,9 +301,38 @@ pub async fn get_changed_files_with_warnings(
     // sink and forced every test that observed warnings to assert
     // against stdout.
     let mut warnings = Vec::new();
+
+    // Surface any non-UTF-8 filenames from the diff output. These
+    // are retained in `files` in lossy U+FFFD form so the rest of
+    // the pipeline doesn't short the list, but they will not match
+    // any real glob — tell the user so they don't chase a mystery
+    // non-match.
+    if !diff_parsed.lossy_names.is_empty() {
+        warnings.push(format!(
+            "{} changed file(s) have non-UTF-8 names and will not match any \
+             `paths:` glob — the evaluator operates on String globs, and the \
+             lossy U+FFFD form retained in the change set is not the on-disk \
+             form git emitted. Affected (lossy-decoded): {:?}. To trigger \
+             workflows on these files, rename them to UTF-8-clean paths.",
+            diff_parsed.lossy_names.len(),
+            diff_parsed.lossy_names,
+        ));
+    }
+
     match untracked_res {
         Ok(out) if out.status.success() => {
-            files = merge_unique(files, parse_nul_separated(&out.stdout));
+            let untracked_parsed = parse_nul_separated(&out.stdout);
+            if !untracked_parsed.lossy_names.is_empty() {
+                warnings.push(format!(
+                    "{} untracked file(s) have non-UTF-8 names and will not \
+                     match any `paths:` glob. Affected (lossy-decoded): {:?}. \
+                     To trigger workflows on these files, rename them to \
+                     UTF-8-clean paths.",
+                    untracked_parsed.lossy_names.len(),
+                    untracked_parsed.lossy_names,
+                ));
+            }
+            files = merge_unique(files, untracked_parsed.files);
         }
         Ok(out) => {
             let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
@@ -310,6 +379,13 @@ fn check_status(
 }
 
 /// Get changed files between two refs.
+///
+/// Non-UTF-8 filenames are surfaced as a log warning from inside this
+/// helper rather than returned as data. The two-ref form is lower-level
+/// than [`get_changed_files_with_warnings`] and its consumers (the CLI
+/// `--diff-head` path) do not carry a warning buffer through — logging
+/// directly is the pragmatic choice for a single call site, and it
+/// matches the policy the CLI uses for every other diagnostic.
 pub async fn get_changed_files_between(
     base_ref: &str,
     head_ref: &str,
@@ -324,7 +400,18 @@ pub async fn get_changed_files_between(
     // for the full rationale — same issue applies to this two-ref form.
     cmd.args(["diff", "--name-only", "-z", &range]);
     let output = check_status(run_git(cmd, "git diff").await?, "git diff")?;
-    Ok(parse_nul_separated(&output.stdout))
+    let parsed = parse_nul_separated(&output.stdout);
+    if !parsed.lossy_names.is_empty() {
+        wrkflw_logging::warning(&format!(
+            "{} changed file(s) in the {}..{} range have non-UTF-8 names and \
+             will not match any `paths:` glob (lossy-decoded: {:?}).",
+            parsed.lossy_names.len(),
+            base_ref,
+            head_ref,
+            parsed.lossy_names,
+        ));
+    }
+    Ok(parsed.files)
 }
 
 /// Get the current branch name, or `None` if HEAD is detached.
@@ -968,13 +1055,17 @@ mod tests {
         let raw: Vec<u8> = b"a.txt\0foo\nbar.txt\0c.txt\0".to_vec();
         let parsed = parse_nul_separated(&raw);
         assert_eq!(
-            parsed,
+            parsed.files,
             vec![
                 "a.txt".to_string(),
                 "foo\nbar.txt".to_string(),
                 "c.txt".to_string()
             ],
             "NUL splitter must preserve newlines inside a record"
+        );
+        assert!(
+            parsed.lossy_names.is_empty(),
+            "clean UTF-8 must not produce lossy_names entries"
         );
     }
 
@@ -986,15 +1077,54 @@ mod tests {
         // or set membership against a path of `""` produces silent
         // false negatives.
         let raw = b"a.txt\0b.txt\0".to_vec();
-        assert_eq!(
-            parse_nul_separated(&raw),
-            vec!["a.txt".to_string(), "b.txt".to_string()]
-        );
+        let parsed = parse_nul_separated(&raw);
+        assert_eq!(parsed.files, vec!["a.txt".to_string(), "b.txt".to_string()]);
+        assert!(parsed.lossy_names.is_empty());
     }
 
     #[test]
     fn parse_nul_separated_handles_empty_output() {
-        assert!(parse_nul_separated(&[]).is_empty());
+        let parsed = parse_nul_separated(&[]);
+        assert!(parsed.files.is_empty());
+        assert!(parsed.lossy_names.is_empty());
+    }
+
+    #[test]
+    fn parse_nul_separated_records_non_utf8_filenames() {
+        // Regression pin: the old implementation called
+        // `from_utf8_lossy(...).into_owned()` unconditionally, which
+        // replaced invalid bytes with U+FFFD and silently made the
+        // file unmatchable by any real glob — the same silent-skip
+        // mode the rest of this module fights. The parser must now
+        // collect invalid records in `lossy_names` so callers can
+        // surface a warning and the user sees *which* file was
+        // dropped from the change set.
+        //
+        // 0xC3 0x28 is a two-byte sequence with a valid lead byte
+        // (0xC3 starts a 2-byte sequence) followed by an invalid
+        // continuation byte (0x28 is ASCII, not 10xxxxxx), so it
+        // fails `str::from_utf8` but is a shape git can legitimately
+        // emit on Unix.
+        let raw: Vec<u8> = b"clean.txt\0bad\xC3\x28name.rs\0also_clean.rs\0".to_vec();
+        let parsed = parse_nul_separated(&raw);
+        // All three records must still appear in `files` so the
+        // change-set cardinality is honest — we don't drop the bad
+        // one, we just flag it so the host can explain the non-match.
+        assert_eq!(parsed.files.len(), 3);
+        assert_eq!(parsed.files[0], "clean.txt");
+        assert_eq!(parsed.files[2], "also_clean.rs");
+        // Exactly one record must be flagged as lossy, and it must
+        // be the invalid one (not the clean ones).
+        assert_eq!(parsed.lossy_names.len(), 1);
+        assert!(
+            parsed.lossy_names[0].contains("name.rs"),
+            "lossy form should retain the tail bytes, got {:?}",
+            parsed.lossy_names
+        );
+        assert!(
+            !parsed.lossy_names.iter().any(|s| s == "clean.txt"),
+            "clean records must not appear in lossy_names"
+        );
     }
 
     #[tokio::test]

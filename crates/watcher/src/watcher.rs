@@ -19,21 +19,10 @@ pub const DEFAULT_MAX_CONCURRENT_EXECUTIONS: usize = 4;
 /// an issue so we can look at the actual workload before lifting the cap.
 pub const MAX_REASONABLE_CONCURRENCY: usize = 256;
 
-/// Soft threshold for the callback supervisor JoinSet. Crossing this
-/// produces a one-shot warning so a slow reporter is surfaced without
-/// spamming the log; crossing back below half clears the latch so the
-/// NEXT spike warns again.
-pub(crate) const SUPERVISOR_WARN_THRESHOLD: usize = 8;
-
-/// Hard ceiling for the callback supervisor JoinSet. Past this we drop
-/// the current cycle's `WatchEvent` rather than spawning another
-/// supervisor we can't contain. Exists to bound memory under a wedged
-/// reporter (deadlocked writer, stuck network webhook); the warning
-/// threshold alone never reclaims anything, so a session-long hang
-/// would otherwise grow the JoinSet without bound for the life of the
-/// process. 128 keeps the worst-case footprint in the low MB range
-/// while leaving plenty of headroom for a briefly-slow reporter.
-pub(crate) const SUPERVISOR_HARD_CAP: usize = 128;
+// The supervisor JoinSet warn threshold and hard cap used to live
+// here as `pub(crate) const`s, but the reactor loop is the only
+// reader. They now live as private `const`s on `crate::reactor` so
+// the constant + the loop that enforces it stay co-located.
 
 // The watcher's cached-git-state TTL now lives on
 // `TriggerFilterConfig::git_state_ttl` — see the config crate for
@@ -960,24 +949,6 @@ mod tests {
             })
             .await;
     }
-
-    // Compile-time invariants: the warning threshold must stay
-    // strictly below the hard cap, and the hard cap must leave
-    // meaningful headroom (4x) above the threshold so short reporter
-    // stalls don't trip the drop-cycles path. A future tweak that
-    // accidentally inverts the ordering or sets them too close
-    // together fails the build here instead of drifting silently into
-    // production.
-    //
-    // `const { assert!(..) }` is the idiomatic form — clippy flags a
-    // runtime `assert!` on all-const operands because the check is
-    // trivially evaluated at compile time. Const asserts also catch
-    // the regression at `cargo check` time instead of waiting for
-    // `cargo test`, which is strictly better.
-    const _: () = {
-        assert!(SUPERVISOR_WARN_THRESHOLD < SUPERVISOR_HARD_CAP);
-        assert!(SUPERVISOR_HARD_CAP >= SUPERVISOR_WARN_THRESHOLD * 4);
-    };
 
     #[tokio::test(flavor = "current_thread")]
     async fn shutdown_unblocks_run_even_when_reporter_callback_is_wedged() {

@@ -28,7 +28,7 @@ use crate::paths::{display_workflow_path, normalize_separators};
 use crate::setup::setup_watches;
 use crate::shutdown::ShutdownSignal;
 use crate::trigger_cache::{refresh_trigger_cache_blocking, TriggerCacheEntry};
-use crate::watcher::{WatchEvent, WorkflowWatcher, SUPERVISOR_HARD_CAP, SUPERVISOR_WARN_THRESHOLD};
+use crate::watcher::{WatchEvent, WorkflowWatcher};
 use futures::stream::{self, StreamExt};
 use futures::FutureExt;
 use notify::{Event, RecommendedWatcher, Watcher};
@@ -38,6 +38,42 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use wrkflw_trigger_filter::canonicalize_allowing_missing;
 use wrkflw_trigger_filter::{EventContext, WorkflowTriggerConfig};
+
+/// Soft threshold for the callback supervisor JoinSet. Crossing this
+/// produces a one-shot warning so a slow reporter is surfaced without
+/// spamming the log; crossing back below half clears the latch so the
+/// NEXT spike warns again. Lives here rather than on `watcher.rs`
+/// because the reactor loop is its only reader.
+const SUPERVISOR_WARN_THRESHOLD: usize = 8;
+
+/// Hard ceiling for the callback supervisor JoinSet. Past this we drop
+/// the current cycle's `WatchEvent` rather than spawning another
+/// supervisor we can't contain. Exists to bound memory under a wedged
+/// reporter (deadlocked writer, stuck network webhook); the warning
+/// threshold alone never reclaims anything, so a session-long hang
+/// would otherwise grow the JoinSet without bound for the life of the
+/// process. 128 keeps the worst-case footprint in the low MB range
+/// while leaving plenty of headroom for a briefly-slow reporter.
+const SUPERVISOR_HARD_CAP: usize = 128;
+
+// Compile-time invariants: the warning threshold must stay strictly
+// below the hard cap, and the hard cap must leave meaningful headroom
+// (4x) above the threshold so short reporter stalls don't trip the
+// drop-cycles path. A future tweak that accidentally inverts the
+// ordering or sets them too close together fails the build here
+// instead of drifting silently into production.
+//
+// `const { assert!(..) }` is the idiomatic form — clippy flags a
+// runtime `assert!` on all-const operands because the check is
+// trivially evaluated at compile time. Const asserts also catch the
+// regression at `cargo check` time instead of waiting for `cargo test`,
+// which is strictly better. Moved here alongside the constants
+// themselves so a future reshuffle of the thresholds only has to touch
+// this one file.
+const _: () = {
+    assert!(SUPERVISOR_WARN_THRESHOLD < SUPERVISOR_HARD_CAP);
+    assert!(SUPERVISOR_HARD_CAP >= SUPERVISOR_WARN_THRESHOLD * 4);
+};
 
 /// The watcher's main loop. See [`WorkflowWatcher::run`] for the
 /// public contract — graceful shutdown, callback dispatch semantics,
@@ -139,6 +175,16 @@ where
     let mut supervisor_tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
     let mut supervisor_warned_at_threshold = false;
     let mut supervisor_hard_cap_warned = false;
+
+    // One-shot latch for the per-cycle workflow-rescan warning.
+    // Mirrors `supervisor_warned_at_threshold` discipline: a
+    // persistently-failing rescan (`chmod 000 .github/workflows`,
+    // stuck NFS mount, missing parent) would otherwise emit one
+    // warning per debounced cycle for the entire session — the
+    // diagnostic-flood failure mode on the other side of the
+    // silent-skip hole. Latched so the NEXT transition from
+    // healthy-to-failing produces a fresh warning without spamming.
+    let mut rescan_warned = false;
 
     // Precompute the combined ignore set (defaults + user-supplied
     // extras). Sharing via Arc means the callback closure and the
@@ -348,17 +394,37 @@ where
         // zero hint that a new workflow has been missed for the entire
         // session. Warning keeps the loop running AND tells the operator
         // something is wrong.
+        //
+        // One-shot latch: a chmod-000 + file-save storm would otherwise
+        // emit one warning per debounced cycle for the rest of the
+        // session (diagnostic flood). Warn once per failing spell and
+        // reset the latch the moment a rescan succeeds so a later
+        // failure still surfaces. Mirrors `supervisor_warned_at_threshold`.
         match watcher.collect_workflow_files().await {
-            Ok(refreshed) => workflow_files = refreshed,
+            Ok(refreshed) => {
+                workflow_files = refreshed;
+                if rescan_warned {
+                    wrkflw_logging::info(
+                        "workflow rescan recovered — new or deleted workflow files will \
+                         now be picked up again.",
+                    );
+                    rescan_warned = false;
+                }
+            }
             Err(e) => {
-                wrkflw_logging::warning(&format!(
-                    "workflow rescan failed, reusing {} cached path(s): {} — \
-                     new or deleted workflow files will NOT be picked up this \
-                     cycle. Investigate the workflow directory (permissions, \
-                     network mount, missing parent) if this repeats.",
-                    workflow_files.len(),
-                    e
-                ));
+                if !rescan_warned {
+                    wrkflw_logging::warning(&format!(
+                        "workflow rescan failed, reusing {} cached path(s): {} — \
+                         new or deleted workflow files will NOT be picked up until \
+                         the rescan recovers. Further rescan failures will be \
+                         suppressed until the next success. Investigate the workflow \
+                         directory (permissions, network mount, missing parent) if \
+                         this repeats.",
+                        workflow_files.len(),
+                        e
+                    ));
+                    rescan_warned = true;
+                }
             }
         }
 

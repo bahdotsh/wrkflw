@@ -68,6 +68,14 @@ pub(crate) fn effective_strict_filter(strict: bool, no_strict: bool) -> bool {
 /// independent copies of the same string, which was exactly the
 /// kind of drift the prefilter pattern was introduced to prevent.
 ///
+/// The wording is intentionally host-neutral — it names the event
+/// rather than the verb ("simulating" / "watching") so the same
+/// text reads correctly from both `wrkflw run` and `wrkflw watch`.
+/// An earlier revision hard-coded "simulating", which was wrong for
+/// the watch command and regressed watch-mode diagnostics; see the
+/// helper's `non_pr_event` / `pull_request_target` test pair for
+/// the pin.
+///
 /// Returns `Ok(())` for non-PR events regardless of flag state.
 /// Returns `Err(String)` under `strict_filter = true` with the
 /// caller-ready error text (no `Error:` prefix — the orchestrator
@@ -83,18 +91,19 @@ pub(crate) fn validate_event_requires_base_branch(
     }
     if strict_filter {
         return Err(format!(
-            "simulating `{}` without --base-branch is rejected under --strict-filter: \
+            "event `{}` without --base-branch is rejected under --strict-filter: \
              `branches:` filters on pull_request events evaluate against the PR target \
              branch, and without one every such workflow is silently reported as not \
              triggering. Pass --base-branch <name>, or use --no-strict-filter to proceed.",
             event_name
         ));
     }
-    wrkflw_logging::warning(
-        "Simulating pull_request without --base-branch: workflows that use \
-         `branches:` to constrain the PR target branch will be reported as not triggering. \
+    wrkflw_logging::warning(&format!(
+        "event `{}` without --base-branch: workflows that use `branches:` to constrain \
+         the PR target branch will be reported as not triggering. \
          --no-strict-filter allowed this to proceed.",
-    );
+        event_name,
+    ));
     Ok(())
 }
 
@@ -810,5 +819,80 @@ mod prefilter_tests {
             "error must name the offending event, got: {}",
             err
         );
+    }
+
+    #[test]
+    fn validate_event_requires_base_branch_is_noop_for_non_pr_events() {
+        // `push`, `workflow_dispatch`, `schedule`, etc. never
+        // evaluate `branches:` against a PR target, so
+        // `--base-branch` is irrelevant and the helper must
+        // return `Ok(())` regardless of flag state. This is the
+        // host-agnostic passthrough both `wrkflw run` and
+        // `wrkflw watch` depend on.
+        for event in ["push", "workflow_dispatch", "schedule", "release"] {
+            assert!(
+                validate_event_requires_base_branch(event, true).is_ok(),
+                "strict mode must not reject non-PR event `{}`",
+                event
+            );
+            assert!(
+                validate_event_requires_base_branch(event, false).is_ok(),
+                "non-strict mode must not reject non-PR event `{}`",
+                event
+            );
+        }
+    }
+
+    #[test]
+    fn validate_event_requires_base_branch_rejects_pull_request_target_under_strict() {
+        // `pull_request_target` carries the same `branches:`
+        // semantics as `pull_request`; the helper must cover
+        // both so watch-mode users who pass
+        // `--event pull_request_target` get the same diagnostic
+        // as the run command.
+        let err = validate_event_requires_base_branch("pull_request_target", true)
+            .expect_err("strict mode must reject pull_request_target without --base-branch");
+        assert!(
+            err.contains("pull_request_target"),
+            "error must name the pull_request_target event explicitly, got: {}",
+            err
+        );
+        assert!(
+            err.contains("--base-branch"),
+            "error must point the user at --base-branch, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn validate_event_requires_base_branch_wording_is_host_neutral() {
+        // Regression pin: the helper used to hard-code
+        // "simulating" in both the strict error and the
+        // non-strict warning. That reads correctly from
+        // `wrkflw run` but was semantically wrong for
+        // `wrkflw watch`, which is not simulating anything.
+        // The wording is now host-neutral; this test enforces
+        // it so a future reword can't silently reintroduce a
+        // host-specific verb.
+        let err = validate_event_requires_base_branch("pull_request", true)
+            .expect_err("strict mode must reject pull_request without --base-branch");
+        assert!(
+            !err.to_lowercase().contains("simulating"),
+            "error text must not use the host-specific verb `simulating`, got: {}",
+            err
+        );
+        assert!(
+            !err.to_lowercase().contains("watching"),
+            "error text must not use the host-specific verb `watching`, got: {}",
+            err
+        );
+        // Non-strict warn path: no `Result` to inspect, so we
+        // can only assert the call returns `Ok(())` and trust
+        // the body's compile-time string for the wording. The
+        // regression that motivated this test was specifically
+        // a hard-coded "simulating" literal, so pinning the
+        // error branch is enough to catch any reword that
+        // forgets to update both.
+        assert!(validate_event_requires_base_branch("pull_request", false).is_ok());
     }
 }

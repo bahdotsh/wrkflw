@@ -30,14 +30,26 @@ fn parse_events(on_raw: &serde_yaml::Value) -> Result<Vec<EventFilter>, TriggerF
 
         // on: [push, pull_request]
         serde_yaml::Value::Sequence(events) => {
-            let mut filters = Vec::new();
-            for event in events {
-                if let Some(name) = event.as_str() {
-                    filters.push(EventFilter {
-                        event_name: name.to_string(),
-                        ..Default::default()
-                    });
-                }
+            // Reject non-string entries the same way `extract_string_list`
+            // does for `paths`/`branches`/etc. Previously this path silently
+            // dropped anything that wasn't a string, so a typo like
+            // `on: [push, {pull_request: {branches: [main]}}]` collapsed to
+            // `on: [push]` and the pull_request filter was never applied —
+            // exactly the "silently lying about which workflows would run"
+            // mode the rest of this crate is built to prevent.
+            let mut filters = Vec::with_capacity(events.len());
+            for (idx, event) in events.iter().enumerate() {
+                let name = event.as_str().ok_or_else(|| {
+                    TriggerFilterError::ParseError(format!(
+                        "on[{}]: expected a string event name, got {}",
+                        idx,
+                        yaml_kind(event),
+                    ))
+                })?;
+                filters.push(EventFilter {
+                    event_name: name.to_string(),
+                    ..Default::default()
+                });
             }
             Ok(filters)
         }
@@ -654,6 +666,28 @@ pull_request:
         let msg = err.to_string();
         assert!(msg.contains("expected a string"), "got: {}", msg);
         assert!(msg.contains("pull_request.types"), "got: {}", msg);
+    }
+
+    #[test]
+    fn non_string_entry_in_sequence_form_surfaces_as_parse_error() {
+        // Regression: the `on: [push, pull_request]` sequence path used to
+        // silently drop non-string entries via `if let Some(name) = event.as_str()`.
+        // A typo like `on: [push, {pull_request: ...}]` would collapse to
+        // `on: [push]` and the misplaced pull_request filter would never
+        // apply — the same failure mode the rest of the parser guards against
+        // via `extract_string_list`. Now it must be a `ParseError` that names
+        // the offending index and kind.
+        let raw = make_on_raw(
+            r#"
+- push
+- pull_request: { branches: [main] }
+"#,
+        );
+        let err = parse_events(&raw).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("expected a string"), "got: {}", msg);
+        assert!(msg.contains("on[1]"), "got: {}", msg);
+        assert!(msg.contains("mapping"), "got: {}", msg);
     }
 
     #[test]

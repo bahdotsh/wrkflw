@@ -130,8 +130,20 @@ fn explain_filter_failure(filter: &EventFilter, context: &EventContext) -> Strin
     let mut parts = Vec::new();
 
     if !filter.branches.is_empty() || !filter.branches_ignore.is_empty() {
-        let pattern_sources: Vec<&str> =
-            filter.branches.iter().map(|p| p.source.as_str()).collect();
+        // Build a combined pattern list so a rejection driven by
+        // `branches-ignore:` alone (or inline `!`-negations routed into
+        // `branches_ignore`) is legible instead of rendering as
+        // `branch 'main' did not match []`. Ignore entries are prefixed
+        // with `!` so the diagnostic round-trips to the same surface
+        // syntax the user wrote in the workflow YAML.
+        let mut pattern_sources: Vec<String> =
+            filter.branches.iter().map(|p| p.source.clone()).collect();
+        pattern_sources.extend(
+            filter
+                .branches_ignore
+                .iter()
+                .map(|p| format!("!{}", p.source)),
+        );
         match branch_for_filter(context) {
             Some(branch) => parts.push(format!(
                 "branch '{}' did not match {:?}",
@@ -151,7 +163,11 @@ fn explain_filter_failure(filter: &EventFilter, context: &EventContext) -> Strin
         }
     }
     if !filter.tags.is_empty() || !filter.tags_ignore.is_empty() {
-        let pattern_sources: Vec<&str> = filter.tags.iter().map(|p| p.source.as_str()).collect();
+        // Same treatment as branches: combine include + `!`-prefixed ignore
+        // sources so a rejection driven by `tags-ignore:` alone is legible.
+        let mut pattern_sources: Vec<String> =
+            filter.tags.iter().map(|p| p.source.clone()).collect();
+        pattern_sources.extend(filter.tags_ignore.iter().map(|p| format!("!{}", p.source)));
         match &context.tag {
             Some(tag) => parts.push(format!("tag '{}' did not match {:?}", tag, pattern_sources)),
             None => parts.push("no tag in context (tag filter requires one)".to_string()),
@@ -552,6 +568,59 @@ mod tests {
         assert!(
             result.reason.contains("--activity-type"),
             "diagnostic must point users at the fix flag, got: {}",
+            result.reason
+        );
+    }
+
+    #[test]
+    fn branches_ignore_only_rejection_includes_ignore_patterns_in_diagnostic() {
+        // Regression: previously the branch-mismatch diagnostic only
+        // iterated `filter.branches`, so a workflow with ONLY a
+        // `branches-ignore: [main]` filter running on `main` rendered as
+        // `branch 'main' did not match []` — factually correct but
+        // totally opaque about which rule caused the rejection. The
+        // fix combines include + `!`-prefixed ignore sources so the
+        // user sees the actual rule that fired.
+        let config = make_config(vec![EventFilter {
+            event_name: "push".into(),
+            branches_ignore: vec![gp("main")],
+            ..Default::default()
+        }]);
+        let ctx = EventContext {
+            event_name: "push".into(),
+            branch: Some("main".into()),
+            ..Default::default()
+        };
+        let result = evaluate_trigger(&config, &ctx);
+        assert!(
+            !result.matches,
+            "main should be excluded by branches_ignore"
+        );
+        assert!(
+            result.reason.contains("!main"),
+            "diagnostic must include the ignore pattern that caused rejection, got: {}",
+            result.reason
+        );
+    }
+
+    #[test]
+    fn tags_ignore_only_rejection_includes_ignore_patterns_in_diagnostic() {
+        // Parallel regression for the tags branch of `explain_filter_failure`.
+        let config = make_config(vec![EventFilter {
+            event_name: "push".into(),
+            tags_ignore: vec![gp("v*-rc*")],
+            ..Default::default()
+        }]);
+        let ctx = EventContext {
+            event_name: "push".into(),
+            tag: Some("v1.0.0-rc1".into()),
+            ..Default::default()
+        };
+        let result = evaluate_trigger(&config, &ctx);
+        assert!(!result.matches);
+        assert!(
+            result.reason.contains("!v*-rc*"),
+            "tag diagnostic must include the ignore pattern, got: {}",
             result.reason
         );
     }

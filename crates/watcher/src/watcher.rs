@@ -289,9 +289,23 @@ impl WorkflowWatcher {
                 continue;
             }
 
-            // Re-collect workflow files so newly added .yml files are picked up
-            if let Ok(refreshed) = self.collect_workflow_files().await {
-                workflow_files = refreshed;
+            // Re-collect workflow files so newly added .yml files are picked up.
+            // Surface per-cycle rescan errors at debug level: the watch loop
+            // *must* continue on transient failures (e.g. a temporary empty
+            // directory, a fleeting I/O glitch), but silently falling back to
+            // a stale `workflow_files` snapshot with no diagnostic is the
+            // exact silent-skip pattern the rest of this PR has been plugging.
+            // Debug keeps non-verbose runs quiet while still leaving a trail
+            // for `--verbose` / debug-level operators.
+            match self.collect_workflow_files().await {
+                Ok(refreshed) => workflow_files = refreshed,
+                Err(e) => {
+                    wrkflw_logging::debug(&format!(
+                        "workflow rescan failed, reusing {} cached path(s): {}",
+                        workflow_files.len(),
+                        e
+                    ));
+                }
             }
 
             trigger_cache = self

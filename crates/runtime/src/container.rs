@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Prefix for all locally-built images. Used to skip registry pulls.
 pub const LOCAL_IMAGE_PREFIX: &str = "wrkflw-";
@@ -67,6 +67,41 @@ pub enum ContainerError {
     NetworkOperation(String),
 }
 
+/// Rebase a container-visible working directory onto its host-side volume
+/// source.
+///
+/// Given a `container_dir` like `/github/workspace/sub` and a `volumes` list
+/// that maps `(host, container)` pairs (e.g. `(/tmp/job-xxxx, /github/workspace)`),
+/// return the corresponding host path (`/tmp/job-xxxx/sub`) by locating the
+/// longest `container` path that is a component-boundary prefix of
+/// `container_dir` and grafting the remainder onto its `host` counterpart.
+///
+/// Returns `None` if no volume covers `container_dir`.
+///
+/// This is the mount-semantics bridge used by non-container runtimes
+/// (emulation, secure_emulation) so that a `run:` step and an
+/// artifact/cache handler observe the same host workspace. It is the fix
+/// for #88.
+pub(crate) fn resolve_host_working_dir(
+    container_dir: &Path,
+    volumes: &[(&Path, &Path)],
+) -> Option<PathBuf> {
+    let mut best: Option<(usize, PathBuf)> = None;
+    for (host, container) in volumes {
+        if let Ok(suffix) = container_dir.strip_prefix(container) {
+            // `Path::strip_prefix` respects component boundaries, so
+            // `/github/workspace-foo` is NOT matched by `/github/workspace`.
+            let depth = container.components().count();
+            let candidate = host.join(suffix);
+            match &best {
+                Some((best_depth, _)) if *best_depth >= depth => {}
+                _ => best = Some((depth, candidate)),
+            }
+        }
+    }
+    best.map(|(_, path)| path)
+}
+
 impl fmt::Display for ContainerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -85,5 +120,85 @@ impl fmt::Display for ContainerError {
                 write!(f, "Network operation failed: {}", msg)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_host_working_dir_exact_match() {
+        let host = Path::new("/host/tmp/job");
+        let container = Path::new("/github/workspace");
+        let volumes = [(host, container)];
+        assert_eq!(
+            resolve_host_working_dir(Path::new("/github/workspace"), &volumes),
+            Some(PathBuf::from("/host/tmp/job"))
+        );
+    }
+
+    #[test]
+    fn resolve_host_working_dir_sub_path() {
+        let host = Path::new("/host/tmp/job");
+        let container = Path::new("/github/workspace");
+        let volumes = [(host, container)];
+        assert_eq!(
+            resolve_host_working_dir(Path::new("/github/workspace/src/lib"), &volumes),
+            Some(PathBuf::from("/host/tmp/job/src/lib"))
+        );
+    }
+
+    #[test]
+    fn resolve_host_working_dir_longest_prefix_wins() {
+        let outer_host = Path::new("/host/outer");
+        let outer_container = Path::new("/a");
+        let inner_host = Path::new("/host/inner");
+        let inner_container = Path::new("/a/b");
+        // Order shouldn't matter — longest prefix always wins.
+        let volumes = [(outer_host, outer_container), (inner_host, inner_container)];
+        assert_eq!(
+            resolve_host_working_dir(Path::new("/a/b/c"), &volumes),
+            Some(PathBuf::from("/host/inner/c"))
+        );
+        let reversed = [(inner_host, inner_container), (outer_host, outer_container)];
+        assert_eq!(
+            resolve_host_working_dir(Path::new("/a/b/c"), &reversed),
+            Some(PathBuf::from("/host/inner/c"))
+        );
+    }
+
+    #[test]
+    fn resolve_host_working_dir_no_match() {
+        let host = Path::new("/host/tmp/job");
+        let container = Path::new("/different");
+        let volumes = [(host, container)];
+        assert_eq!(
+            resolve_host_working_dir(Path::new("/github/workspace"), &volumes),
+            None
+        );
+    }
+
+    #[test]
+    fn resolve_host_working_dir_empty_volumes() {
+        assert_eq!(
+            resolve_host_working_dir(Path::new("/github/workspace"), &[]),
+            None
+        );
+    }
+
+    /// Critical: a string-prefix match would incorrectly rebase
+    /// `/github/workspace-foo` onto the mount for `/github/workspace`.
+    /// `Path::strip_prefix` respects component boundaries, so this must
+    /// return `None`.
+    #[test]
+    fn resolve_host_working_dir_component_boundary_is_respected() {
+        let host = Path::new("/host/tmp/job");
+        let container = Path::new("/github/workspace");
+        let volumes = [(host, container)];
+        assert_eq!(
+            resolve_host_working_dir(Path::new("/github/workspace-foo"), &volumes),
+            None
+        );
     }
 }

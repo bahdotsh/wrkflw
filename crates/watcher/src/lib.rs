@@ -9,8 +9,10 @@ pub mod watcher;
 // embedders don't accidentally depend on helpers that are meant to
 // stay refactor-friendly.
 pub(crate) mod event_kind;
+pub(crate) mod git_state;
 pub(crate) mod ignore;
 pub(crate) mod paths;
+pub(crate) mod reactor;
 pub(crate) mod setup;
 pub(crate) mod trigger_cache;
 

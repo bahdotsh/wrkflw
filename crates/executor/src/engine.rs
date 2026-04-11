@@ -7618,6 +7618,185 @@ runs:
         assert!(dl_result.output.contains("Downloaded artifact 'my-build'"));
     }
 
+    /// Regression test for #88.
+    ///
+    /// A `run:` step that writes a file must land in the same workspace that
+    /// `actions/upload-artifact` subsequently reads from. Under the buggy
+    /// emulation runtime, run steps were rerouted to `GITHUB_WORKSPACE` (i.e.
+    /// the real project directory) while artifact handlers kept using the
+    /// per-job tempdir — so uploads could never find files the run step had
+    /// just written.
+    ///
+    /// This test drives a real `EmulationRuntime` end-to-end through
+    /// run → upload-artifact → download-artifact and asserts the payload
+    /// round-trips byte-for-byte.
+    #[tokio::test]
+    async fn run_step_upload_download_artifact_roundtrip_emulation() {
+        let runtime = emulation::EmulationRuntime::new();
+        let workflow = minimal_workflow();
+        let working_dir = tempfile::tempdir().unwrap();
+
+        // Point GITHUB_WORKSPACE at an isolated tempdir. On buggy main this is
+        // where the rerouted run step writes, so upload (which reads
+        // `ctx.working_dir`) finds nothing and the test fails. After the fix,
+        // emulation honors the volume mount and the run step writes directly
+        // into `ctx.working_dir`, so this path is irrelevant — but we still
+        // isolate it to keep the test from touching the real project tree.
+        let fake_github_ws = tempfile::tempdir().unwrap();
+
+        let artifact_dir = tempfile::tempdir().unwrap();
+        let artifact_store = crate::artifacts::ArtifactStore::new(artifact_dir.path()).unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache_store =
+            crate::cache::CacheStore::with_root(cache_dir.path().to_path_buf()).unwrap();
+        let pending = std::sync::Mutex::new(Vec::<PendingCacheSave>::new());
+
+        let mut job_env = HashMap::new();
+        job_env.insert(
+            "GITHUB_WORKSPACE".to_string(),
+            fake_github_ws.path().to_string_lossy().to_string(),
+        );
+
+        // --- Step 1: run step that writes a file into the workspace ---
+        let run_step = make_step_run("mkdir artifact-dir && echo hello > artifact-dir/payload.txt");
+        let run_ctx = StepExecutionContext {
+            step: &run_step,
+            step_idx: 0,
+            job_env: &job_env,
+            working_dir: working_dir.path(),
+            runtime: &runtime,
+            workflow: &workflow,
+            runner_image: "ubuntu:latest",
+            verbose: false,
+            matrix_combination: &None,
+            container_config: None,
+            workflow_defaults: None,
+            job_defaults: None,
+            step_outputs: &HashMap::new(),
+            step_statuses: &HashMap::new(),
+            job_status: "success",
+            services: JobServices {
+                secret_manager: None,
+                secret_masker: None,
+                secrets_context: &HashMap::new(),
+                needs_context: &HashMap::new(),
+                needs_results: &HashMap::new(),
+                artifact_store: &artifact_store,
+                cache_store: &cache_store,
+            },
+            pending_cache_saves: &pending,
+        };
+        let run_result = execute_step(run_ctx).await.unwrap();
+        assert_eq!(
+            run_result.status,
+            StepStatus::Success,
+            "run step failed: {}",
+            run_result.output
+        );
+
+        // --- Step 2: upload-artifact reads the file the run step just wrote ---
+        let mut up_with = HashMap::new();
+        up_with.insert("name".to_string(), "payload".to_string());
+        up_with.insert("path".to_string(), "artifact-dir/**".to_string());
+        let up_step = make_step(
+            "upload",
+            "actions/upload-artifact@v4",
+            Some(up_with),
+            HashMap::new(),
+        );
+        let up_ctx = StepExecutionContext {
+            step: &up_step,
+            step_idx: 1,
+            job_env: &job_env,
+            working_dir: working_dir.path(),
+            runtime: &runtime,
+            workflow: &workflow,
+            runner_image: "ubuntu:latest",
+            verbose: false,
+            matrix_combination: &None,
+            container_config: None,
+            workflow_defaults: None,
+            job_defaults: None,
+            step_outputs: &HashMap::new(),
+            step_statuses: &HashMap::new(),
+            job_status: "success",
+            services: JobServices {
+                secret_manager: None,
+                secret_masker: None,
+                secrets_context: &HashMap::new(),
+                needs_context: &HashMap::new(),
+                needs_results: &HashMap::new(),
+                artifact_store: &artifact_store,
+                cache_store: &cache_store,
+            },
+            pending_cache_saves: &pending,
+        };
+        let up_result = execute_step(up_ctx).await.unwrap();
+        assert_eq!(
+            up_result.status,
+            StepStatus::Success,
+            "upload step failed (this is the #88 regression): {}",
+            up_result.output
+        );
+        assert!(
+            up_result.output.contains("Uploaded artifact 'payload'"),
+            "unexpected upload output: {}",
+            up_result.output
+        );
+
+        // --- Step 3: download-artifact into a fresh dir and verify byte equality ---
+        let dl_workspace = tempfile::tempdir().unwrap();
+        let mut dl_with = HashMap::new();
+        dl_with.insert("name".to_string(), "payload".to_string());
+        dl_with.insert("path".to_string(), "dl".to_string());
+        let dl_step = make_step(
+            "download",
+            "actions/download-artifact@v4",
+            Some(dl_with),
+            HashMap::new(),
+        );
+        let dl_ctx = StepExecutionContext {
+            step: &dl_step,
+            step_idx: 2,
+            job_env: &job_env,
+            working_dir: dl_workspace.path(),
+            runtime: &runtime,
+            workflow: &workflow,
+            runner_image: "ubuntu:latest",
+            verbose: false,
+            matrix_combination: &None,
+            container_config: None,
+            workflow_defaults: None,
+            job_defaults: None,
+            step_outputs: &HashMap::new(),
+            step_statuses: &HashMap::new(),
+            job_status: "success",
+            services: JobServices {
+                secret_manager: None,
+                secret_masker: None,
+                secrets_context: &HashMap::new(),
+                needs_context: &HashMap::new(),
+                needs_results: &HashMap::new(),
+                artifact_store: &artifact_store,
+                cache_store: &cache_store,
+            },
+            pending_cache_saves: &pending,
+        };
+        let dl_result = execute_step(dl_ctx).await.unwrap();
+        assert_eq!(
+            dl_result.status,
+            StepStatus::Success,
+            "download step failed: {}",
+            dl_result.output
+        );
+
+        let downloaded = std::fs::read_to_string(
+            dl_workspace.path().join("dl").join("artifact-dir/payload.txt"),
+        )
+        .expect("downloaded payload.txt should exist");
+        assert_eq!(downloaded, "hello\n");
+    }
+
     #[tokio::test]
     async fn cache_step_miss_defers_save_and_flush_works() {
         let runtime = MockContainerRuntime::default();

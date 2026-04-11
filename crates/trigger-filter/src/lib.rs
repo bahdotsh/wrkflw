@@ -1,3 +1,4 @@
+pub mod config;
 pub mod error;
 pub mod eval;
 pub mod git;
@@ -6,6 +7,7 @@ pub mod parser;
 pub mod path_matcher;
 pub mod ref_matcher;
 
+pub use config::TriggerFilterConfig;
 pub use error::TriggerFilterError;
 pub use eval::evaluate_trigger;
 pub use git::{find_repo_root_detailed, FindRepoRootError};
@@ -14,7 +16,10 @@ pub use model::{
 };
 pub use parser::parse_trigger_config;
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::SystemTime;
 
 /// Read a workflow file from disk and parse its trigger configuration in
 /// one step. Centralizes the "read + parse + compile globs" pipeline so
@@ -72,6 +77,156 @@ pub fn filter_trigger_configs(
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// Process-wide compiled-pattern cache
+// ---------------------------------------------------------------------------
+
+/// Entry in the global compiled-pattern cache. The mtime is the
+/// invalidation key: any caller asking for the same path after a write
+/// will observe a different mtime and re-parse. `u64` is the LRU
+/// "last used" counter — we avoid dragging in a full LRU crate for a
+/// hot-path cache whose typical hit ratio is >95%.
+#[derive(Debug, Clone)]
+struct CachedTriggerConfig {
+    mtime: SystemTime,
+    config: WorkflowTriggerConfig,
+    last_used: u64,
+}
+
+/// Process-wide LRU cache of compiled trigger configs, keyed by
+/// `(absolute_path, mtime)`. Three hosts (CLI prefilter, watcher hot
+/// loop, TUI diff-filter toggle) previously each re-parsed every
+/// workflow on every invocation, re-compiling every glob pattern. This
+/// cache collapses that work to one parse per (path, mtime) pair across
+/// the entire process.
+///
+/// Size is bounded by `TriggerFilterConfig::pattern_cache_size` —
+/// overflow evicts the least-recently-used entry. The lock is a
+/// `std::sync::Mutex` because the critical section is bounded at
+/// `O(cache_size)` in the worst case (linear LRU scan on eviction),
+/// and the hit path is a single HashMap lookup.
+static PATTERN_CACHE: Mutex<Option<PatternCache>> = Mutex::new(None);
+
+#[derive(Debug)]
+struct PatternCache {
+    capacity: usize,
+    tick: u64,
+    entries: HashMap<PathBuf, CachedTriggerConfig>,
+}
+
+impl PatternCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            tick: 0,
+            entries: HashMap::new(),
+        }
+    }
+
+    fn get_or_load(
+        &mut self,
+        path: &Path,
+        mtime: SystemTime,
+    ) -> Result<WorkflowTriggerConfig, TriggerFilterError> {
+        self.tick = self.tick.wrapping_add(1);
+        if let Some(entry) = self.entries.get_mut(path) {
+            if entry.mtime == mtime {
+                entry.last_used = self.tick;
+                return Ok(entry.config.clone());
+            }
+        }
+        // Miss or stale — re-parse.
+        let config = load_trigger_config(path)?;
+        let tick = self.tick;
+        self.entries.insert(
+            path.to_path_buf(),
+            CachedTriggerConfig {
+                mtime,
+                config: config.clone(),
+                last_used: tick,
+            },
+        );
+        if self.entries.len() > self.capacity {
+            self.evict_lru();
+        }
+        Ok(config)
+    }
+
+    fn evict_lru(&mut self) {
+        // Linear LRU — correct and cheap for the ~128-entry default.
+        // If the capacity ever needs to scale, swap in `lru` crate.
+        if let Some(victim) = self
+            .entries
+            .iter()
+            .min_by_key(|(_, v)| v.last_used)
+            .map(|(k, _)| k.clone())
+        {
+            self.entries.remove(&victim);
+        }
+    }
+}
+
+/// Load a trigger config via the process-wide LRU cache.
+///
+/// Falls back to an uncached parse when the configured capacity is
+/// zero (the test-mode opt-out) or when the file's mtime cannot be
+/// read. Callers that want a guaranteed fresh parse should call
+/// [`load_trigger_config`] directly.
+pub fn load_trigger_config_cached(
+    workflow_path: &Path,
+    config: &TriggerFilterConfig,
+) -> Result<WorkflowTriggerConfig, TriggerFilterError> {
+    if config.pattern_cache_size == 0 {
+        return load_trigger_config(workflow_path);
+    }
+    let mtime = match std::fs::metadata(workflow_path).and_then(|m| m.modified()) {
+        Ok(t) => t,
+        Err(_) => return load_trigger_config(workflow_path),
+    };
+    let mut guard = match PATTERN_CACHE.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    let cache = guard.get_or_insert_with(|| PatternCache::new(config.pattern_cache_size));
+    // Honour capacity changes across calls — a test that flips the
+    // cache size off/on should see the new ceiling immediately.
+    if cache.capacity != config.pattern_cache_size {
+        cache.capacity = config.pattern_cache_size;
+        while cache.entries.len() > cache.capacity {
+            cache.evict_lru();
+        }
+    }
+    cache.get_or_load(workflow_path, mtime)
+}
+
+/// Bulk cached variant of [`load_trigger_configs`] that pushes every
+/// entry through the LRU. Same error-partitioning shape as the
+/// uncached version so callers drop-in-replace without touching their
+/// diagnostic rendering.
+pub fn load_trigger_configs_cached(
+    paths: &[PathBuf],
+    config: &TriggerFilterConfig,
+) -> (Vec<WorkflowTriggerConfig>, Vec<(PathBuf, String)>) {
+    let mut configs = Vec::with_capacity(paths.len());
+    let mut failures: Vec<(PathBuf, String)> = Vec::new();
+    for path in paths {
+        match load_trigger_config_cached(path, config) {
+            Ok(cfg) => configs.push(cfg),
+            Err(e) => failures.push((path.clone(), e.to_string())),
+        }
+    }
+    (configs, failures)
+}
+
+/// Drop every entry from the process-wide pattern cache. Used by
+/// tests and by long-lived hosts that need to react to an out-of-band
+/// signal that every workflow may have changed (e.g. a `git pull`).
+pub fn clear_pattern_cache() {
+    if let Ok(mut guard) = PATTERN_CACHE.lock() {
+        *guard = None;
+    }
+}
+
 /// Auto-detect event context from the current git state.
 ///
 /// Fetches the current branch, tag, and changed files (vs `diff_base`) from git.
@@ -99,16 +254,18 @@ pub async fn auto_detect_context(
     let (branch_res, tag_res, changed_res) = tokio::join!(
         git::get_current_branch(cwd),
         git::get_current_tag(cwd),
-        git::get_changed_files(diff_base, cwd),
+        git::get_changed_files_with_warnings(diff_base, cwd),
     );
 
+    let (changed_files, warnings) = changed_res?;
     Ok(EventContext {
         event_name: event_name.to_string(),
         branch: branch_res?,
         base_branch: None,
         tag: tag_res?,
-        changed_files: changed_res?,
+        changed_files,
         activity_type: None,
+        warnings,
     })
 }
 
@@ -155,6 +312,7 @@ pub async fn context_from_diff_range(
         tag: tag_res?,
         changed_files: changed_res?,
         activity_type: None,
+        warnings: Vec::new(),
     })
 }
 
@@ -177,7 +335,68 @@ pub async fn context_from_changed_files(
         tag: tag_res?,
         changed_files,
         activity_type: None,
+        warnings: Vec::new(),
     })
+}
+
+/// Validate a user-supplied changed-file path (from `--changed-files`
+/// or a similar host). Rejects absolute paths and any entry containing
+/// `..` components, since both violate the "repo-relative POSIX path"
+/// contract the evaluator assumes — a non-relative entry would silently
+/// fail every `paths:` glob.
+///
+/// The returned normalized string uses `/` separators on every
+/// platform so a user on Windows passing `src\foo.rs` gets the same
+/// matching behavior as a user on Linux.
+pub fn normalize_user_changed_file(raw: &str) -> Result<String, TriggerFilterError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(TriggerFilterError::ParseError(
+            "--changed-files entries must be non-empty repo-relative paths".to_string(),
+        ));
+    }
+    // Cheap textual checks cover the whole set of invalid shapes we
+    // care about without pulling in a full path-canonicalization
+    // helper (which would touch the filesystem — defeating the point
+    // of validating user input up front).
+    if trimmed.starts_with('/') || trimmed.starts_with('\\') {
+        return Err(TriggerFilterError::ParseError(format!(
+            "--changed-files entry '{}' is absolute; use repo-relative paths so `paths:` \
+             globs can match against the same form GitHub Actions would see",
+            trimmed
+        )));
+    }
+    // Windows drive letter detection — `C:\foo` or `C:/foo` are both
+    // absolute even though they don't start with `/`. Catch the
+    // common drive-letter-plus-colon shape up front.
+    if trimmed.len() >= 2 {
+        let bytes = trimmed.as_bytes();
+        if bytes[1] == b':' && bytes[0].is_ascii_alphabetic() {
+            return Err(TriggerFilterError::ParseError(format!(
+                "--changed-files entry '{}' looks like a drive-letter absolute path; \
+                 pass repo-relative paths instead",
+                trimmed
+            )));
+        }
+    }
+    let normalized = trimmed.replace('\\', "/");
+    for component in normalized.split('/') {
+        if component == ".." {
+            return Err(TriggerFilterError::ParseError(format!(
+                "--changed-files entry '{}' contains `..`; only in-tree repo-relative \
+                 paths are allowed",
+                raw
+            )));
+        }
+    }
+    Ok(normalized)
+}
+
+/// Bulk validate user-supplied changed-file entries. Returns the
+/// normalized list on success, or the first error with enough context
+/// for the CLI to print it verbatim.
+pub fn normalize_user_changed_files(raw: &[String]) -> Result<Vec<String>, TriggerFilterError> {
+    raw.iter().map(|s| normalize_user_changed_file(s)).collect()
 }
 
 // Note: the tests for the deleted `filter_workflows` (which parsed +
@@ -233,5 +452,92 @@ mod tests {
         let failed_paths: Vec<&PathBuf> = failures.iter().map(|(p, _)| p).collect();
         assert!(failed_paths.contains(&&bad_yaml));
         assert!(failed_paths.contains(&&bad_glob));
+    }
+
+    #[test]
+    fn load_trigger_config_cached_reuses_parse_across_calls() {
+        // Clean slate so prior tests in the same process do not
+        // contaminate the LRU's tick/last_used counters.
+        clear_pattern_cache();
+        let tmp = TempDir::new().expect("tempdir");
+        let wf = tmp.path().join("ci.yml");
+        std::fs::write(
+            &wf,
+            "name: ci\non: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+        )
+        .unwrap();
+        let cfg = TriggerFilterConfig::default();
+        let a = load_trigger_config_cached(&wf, &cfg).unwrap();
+        let b = load_trigger_config_cached(&wf, &cfg).unwrap();
+        assert_eq!(a.workflow_name, b.workflow_name);
+        assert_eq!(a.workflow_path, b.workflow_path);
+    }
+
+    #[test]
+    fn load_trigger_config_cached_invalidates_on_mtime_change() {
+        clear_pattern_cache();
+        let tmp = TempDir::new().expect("tempdir");
+        let wf = tmp.path().join("ci.yml");
+        std::fs::write(
+            &wf,
+            "name: first\non: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+        )
+        .unwrap();
+        let cfg = TriggerFilterConfig::default();
+        let first = load_trigger_config_cached(&wf, &cfg).unwrap();
+        assert_eq!(first.workflow_name, "first");
+
+        // Bump mtime by rewriting — on fast filesystems the mtime
+        // resolution is coarser than the test runtime, so sleep just
+        // long enough to guarantee a distinct mtime value. 20ms is
+        // well under any realistic filesystem granularity.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(
+            &wf,
+            "name: second\non: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+        )
+        .unwrap();
+        let second = load_trigger_config_cached(&wf, &cfg).unwrap();
+        assert_eq!(
+            second.workflow_name, "second",
+            "cache must re-parse when the file mtime changes"
+        );
+    }
+
+    #[test]
+    fn pattern_cache_size_zero_disables_caching() {
+        clear_pattern_cache();
+        let tmp = TempDir::new().expect("tempdir");
+        let wf = tmp.path().join("ci.yml");
+        std::fs::write(
+            &wf,
+            "name: ci\non: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+        )
+        .unwrap();
+        let cfg = TriggerFilterConfig::default().with_pattern_cache_size(0);
+        // Both calls must succeed; we can't directly observe that
+        // caching is disabled, but the code path (early-return
+        // without touching the static cache) is exercised here.
+        let _ = load_trigger_config_cached(&wf, &cfg).unwrap();
+        let _ = load_trigger_config_cached(&wf, &cfg).unwrap();
+    }
+
+    #[test]
+    fn normalize_user_changed_file_rejects_absolute_and_parent_refs() {
+        assert!(normalize_user_changed_file("/etc/passwd").is_err());
+        assert!(normalize_user_changed_file("../outside").is_err());
+        assert!(normalize_user_changed_file("src/../etc/passwd").is_err());
+        assert!(normalize_user_changed_file("C:\\Windows\\system32").is_err());
+        assert!(normalize_user_changed_file("").is_err());
+        assert!(normalize_user_changed_file("   ").is_err());
+        // Legit cases survive, with backslashes flipped to forward.
+        assert_eq!(
+            normalize_user_changed_file("src/main.rs").unwrap(),
+            "src/main.rs"
+        );
+        assert_eq!(
+            normalize_user_changed_file("src\\main.rs").unwrap(),
+            "src/main.rs"
+        );
     }
 }

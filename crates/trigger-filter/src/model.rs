@@ -66,6 +66,17 @@ pub struct EventContext {
     pub changed_files: Vec<String>,
     /// Activity type for events that support it (e.g., "opened", "synchronize" for pull_request)
     pub activity_type: Option<String>,
+    /// Non-fatal diagnostics collected while building this context.
+    ///
+    /// Populated by the git helpers when a best-effort enrichment
+    /// failed (the canonical example is `git ls-files --others` being
+    /// rejected by a restrictive safe-directory config, which silently
+    /// dropped untracked files from the changed set for the entire
+    /// cycle). Hosts should surface these to the user so "0 triggered"
+    /// on a buggy context does not look identical to "0 triggered"
+    /// because nothing matches — exactly the failure mode this crate
+    /// has been iteratively patched to prevent.
+    pub warnings: Vec<String>,
 }
 
 /// Result of trigger evaluation for a single workflow.

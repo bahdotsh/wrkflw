@@ -351,6 +351,53 @@ impl App {
             .push(format!("Switched to {} mode", self.runtime_type_name()));
     }
 
+    /// Cycle through the event names the diff filter simulates.
+    ///
+    /// Previously `diff_filter_event` was dead-plumbing: it existed on
+    /// the struct, defaulted to "push", and was never mutated. The
+    /// review flagged this as a "TUI silently lies about which
+    /// workflows would run" hazard, because a user debugging a
+    /// `pull_request` workflow would see it reported as skipped even
+    /// when the filter would have matched on the right event.
+    ///
+    /// The rotation covers the event names that usually appear with
+    /// `branches:` / `paths:` filters. `workflow_dispatch` is included
+    /// because watch-mode users frequently want to model manual runs.
+    /// If an evaluation is already active we re-run it against the
+    /// new event so the result table updates immediately; if it is
+    /// inactive we just update the pending event name so the next
+    /// toggle uses it.
+    pub fn cycle_diff_filter_event(&mut self) {
+        const ROTATION: &[&str] = &[
+            "push",
+            "pull_request",
+            "pull_request_target",
+            "workflow_dispatch",
+            "schedule",
+            "release",
+        ];
+        let current_idx = ROTATION
+            .iter()
+            .position(|name| *name == self.diff_filter_event)
+            .unwrap_or(0);
+        let next_idx = (current_idx + 1) % ROTATION.len();
+        let next = ROTATION[next_idx].to_string();
+        self.logs.push(format!(
+            "Diff filter event: {} -> {}",
+            self.diff_filter_event, next
+        ));
+        self.diff_filter_event = next;
+        // If the filter is currently active, re-run evaluation so
+        // the result column reflects the new event immediately.
+        // `toggle_diff_filter` flips the flag, so call it twice to
+        // tear down the in-flight task and re-spawn against the
+        // fresh `diff_filter_event`.
+        if self.diff_filter_active {
+            self.toggle_diff_filter();
+            self.toggle_diff_filter();
+        }
+    }
+
     /// Toggle diff-aware trigger filtering and evaluate all workflows.
     ///
     /// The git + parsing work is dispatched onto the ambient tokio runtime
@@ -395,7 +442,7 @@ impl App {
             self.diff_filter_aborted = false;
             let event_name = self.diff_filter_event.clone();
             let activity_type = self.diff_filter_activity_type.clone();
-            self.logs.push(format!(
+            self.add_log(format!(
                 "Diff filter: evaluating triggers (simulating '{}' event)...",
                 event_name
             ));
@@ -1453,8 +1500,17 @@ impl App {
         }
     }
 
-    /// Trigger log processing when search/filter changes
+    /// Trigger log processing when search/filter changes.
+    ///
+    /// Also enforces the log buffer cap so ad-hoc `self.logs.push(...)`
+    /// sites — which are sprinkled throughout the codebase for
+    /// historical reasons — don't need to each remember to call
+    /// [`trim_logs_to_cap`]. Every log mutation eventually routes
+    /// through `mark_logs_for_update` (that's what makes the logs
+    /// actually render), so trimming here is the single
+    /// unavoidable choke point.
     pub fn mark_logs_for_update(&mut self) {
+        self.trim_logs_to_cap();
         self.logs_need_update = true;
         self.request_log_processing_update();
     }
@@ -1479,6 +1535,7 @@ impl App {
     /// Add a log entry and trigger log processing update
     pub fn add_log(&mut self, message: String) {
         self.logs.push(message);
+        self.trim_logs_to_cap();
         self.mark_logs_for_update();
     }
 
@@ -1487,6 +1544,29 @@ impl App {
         let timestamp = Local::now().format("%H:%M:%S").to_string();
         let formatted_message = format!("[{}] {}", timestamp, message);
         self.add_log(formatted_message);
+    }
+
+    /// Upper bound on the TUI's in-memory log buffer. A long-lived TUI
+    /// session (especially with rapid diff-filter toggles, each of
+    /// which appends 2+ entries) previously grew unbounded — the
+    /// review flagged this as a slow-leak hazard. 5000 lines of log
+    /// is plenty for visual scrollback without bloating the process.
+    const LOG_BUFFER_CAP: usize = 5000;
+
+    /// Enforce [`LOG_BUFFER_CAP`] by dropping the oldest entries
+    /// until the buffer is within bounds. Called from every
+    /// [`add_log`] path AND from [`trim_logs_to_cap`] so ad-hoc
+    /// `self.logs.push(...)` sites can opt into the cap by calling
+    /// this once after pushing.
+    ///
+    /// Uses `drain(0..N)` instead of rebuilding the vec so the tail
+    /// entries don't get re-cloned; the operation is O(n) in the
+    /// number of *dropped* entries, which is zero on the fast path.
+    pub fn trim_logs_to_cap(&mut self) {
+        if self.logs.len() > Self::LOG_BUFFER_CAP {
+            let excess = self.logs.len() - Self::LOG_BUFFER_CAP;
+            self.logs.drain(0..excess);
+        }
     }
 }
 
@@ -1555,6 +1635,12 @@ async fn evaluate_diff_filter(
     // the TUI and the watcher fail identically on the same broken file
     // and the failure branch is never silently dropped.
     let paths_for_parse = workflow_paths.clone();
+    // Route through the shared LRU so toggling the TUI diff filter
+    // repeatedly on the same workflows pays the parse cost exactly
+    // once per (path, mtime). The CLI prefilter and the watcher hit
+    // the same cache — unifying the three entry points was a review
+    // ask specifically to prevent future drift.
+    let tf_config = wrkflw_trigger_filter::TriggerFilterConfig::default();
     let parse_outcome: Result<
         (
             Vec<wrkflw_trigger_filter::WorkflowTriggerConfig>,
@@ -1562,7 +1648,7 @@ async fn evaluate_diff_filter(
         ),
         _,
     > = tokio::task::spawn_blocking(move || {
-        wrkflw_trigger_filter::load_trigger_configs(&paths_for_parse)
+        wrkflw_trigger_filter::load_trigger_configs_cached(&paths_for_parse, &tf_config)
     })
     .await;
 
@@ -1633,6 +1719,56 @@ mod tests {
         ];
         app.workflow_list_state.select(Some(0));
         app
+    }
+
+    #[test]
+    fn log_buffer_caps_at_configured_size() {
+        // Long-running TUI sessions (especially with rapid diff-filter
+        // toggles) previously grew `logs` unbounded. The cap has to
+        // hold even when callers push directly to `self.logs` without
+        // going through `add_log`, because every render path eventually
+        // routes through `mark_logs_for_update`. Verify the cap kicks
+        // in on both shapes.
+        let mut app = make_app();
+        // Start from a clean slate so the setup-time log lines do not
+        // pollute the size assertion.
+        app.logs.clear();
+        for i in 0..(App::LOG_BUFFER_CAP + 200) {
+            app.logs.push(format!("line {}", i));
+        }
+        app.mark_logs_for_update();
+        assert_eq!(
+            app.logs.len(),
+            App::LOG_BUFFER_CAP,
+            "log buffer must be capped even for direct pushes routed through mark_logs_for_update"
+        );
+        // The tail must be the most recent entries, not the oldest.
+        assert!(
+            app.logs
+                .last()
+                .unwrap()
+                .contains(&format!("{}", App::LOG_BUFFER_CAP + 199)),
+            "newest entry must survive the drain, got {:?}",
+            app.logs.last()
+        );
+    }
+
+    #[test]
+    fn cycle_diff_filter_event_rotates_through_known_events() {
+        let mut app = make_app();
+        assert_eq!(app.diff_filter_event, "push");
+        app.cycle_diff_filter_event();
+        assert_eq!(app.diff_filter_event, "pull_request");
+        app.cycle_diff_filter_event();
+        assert_eq!(app.diff_filter_event, "pull_request_target");
+        // Six-step rotation wraps back to push.
+        for _ in 0..4 {
+            app.cycle_diff_filter_event();
+        }
+        assert_eq!(
+            app.diff_filter_event, "push",
+            "rotation must wrap after exhausting the known-event list"
+        );
     }
 
     #[test]

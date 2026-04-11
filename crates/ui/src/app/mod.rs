@@ -403,6 +403,19 @@ fn run_tui_event_loop(
                             app.toggle_diff_filter();
                         }
                     }
+                    KeyCode::Char('D') => {
+                        // Shift+D cycles through the diff-filter event
+                        // name (push → pull_request → workflow_dispatch →
+                        // schedule → release → push). Previously the
+                        // event name was a hardcoded "push" and the TUI
+                        // silently reported "0 triggered" for any
+                        // workflow gated on a non-push event — exactly
+                        // the "stop lying about which workflows would
+                        // run" failure mode the commit history fought.
+                        if !app.running && app.selected_tab == 0 {
+                            app.cycle_diff_filter_event();
+                        }
+                    }
                     KeyCode::Char('n') => {
                         if app.selected_tab == 2 && !app.log_search_query.is_empty() {
                             app.next_search_match();

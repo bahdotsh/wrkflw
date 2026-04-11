@@ -129,16 +129,38 @@ enum Commands {
         /// such workflow is reported as skipped for "no activity type".
         #[arg(long)]
         activity_type: Option<String>,
+
+        /// Reject degraded filter contexts (missing base branch on
+        /// `pull_request`, `--event` without changed-file input, etc.)
+        /// with a hard error instead of a log warning.
+        ///
+        /// Defaults to `true` so the CLI fails loudly on a
+        /// silently-under-filtered run — the opposite of the
+        /// warn-and-proceed behavior that produced "why did my
+        /// workflow not fire?" tickets. Pass `--no-strict-filter` to
+        /// opt back into the legacy warning behavior for scripts that
+        /// have already adapted to it.
+        #[arg(long = "strict-filter", default_value_t = true)]
+        strict_filter: bool,
+
+        /// Opposite of `--strict-filter`; re-enables the legacy
+        /// warn-and-proceed behavior for degraded contexts. Kept as
+        /// a separate flag instead of `--no-strict-filter` so clap's
+        /// `conflicts_with` makes the intent explicit at the call
+        /// site.
+        #[arg(long = "no-strict-filter", conflicts_with = "strict_filter")]
+        no_strict_filter: bool,
     },
 
     /// Watch for file changes and re-run affected workflows.
     ///
-    /// Ctrl+C exits immediately via `process::exit`; a cycle in flight
-    /// (Docker containers, tempdirs, child processes) will be killed
-    /// by the OS without running the executor's normal cleanup path.
-    /// If you see resource buildup after interrupted watch sessions,
-    /// check `docker ps -a` (or your runtime's equivalent) for
-    /// orphaned containers.
+    /// On Ctrl+C the watcher drains the current cycle gracefully:
+    /// workflows already executing finish, the trigger-filter state
+    /// is flushed, and the signal is passed through to the cleanup
+    /// handler that reaps Docker containers and tempdirs. A hard
+    /// exit only happens if the graceful drain is still running
+    /// after ~10s — long enough for normal teardown, short enough
+    /// that a hung subprocess cannot wedge the session.
     Watch {
         /// Path to workflow file or directory (defaults to .github/workflows)
         path: Option<PathBuf>,
@@ -179,6 +201,27 @@ enum Commands {
         /// such workflow is silently rejected for "no activity type".
         #[arg(long)]
         activity_type: Option<String>,
+
+        /// Upper bound on the debouncer's pending-event set. Events
+        /// past this count during a churn burst are dropped and
+        /// surfaced as a per-cycle warning so the user sees that
+        /// something was missed. Defaults to the debouncer's built-in
+        /// cap, which is sized for typical workloads.
+        #[arg(long, default_value_t = 0)]
+        max_pending_events: usize,
+
+        /// Reject degraded filter contexts (missing base branch on
+        /// `pull_request`, unknown events, etc.) with a hard error
+        /// instead of a log warning. Defaults to `true` so watch
+        /// mode fails loudly on misconfiguration rather than running
+        /// a session-long "0 triggered" stream.
+        #[arg(long = "strict-filter", default_value_t = true)]
+        strict_filter: bool,
+
+        /// Opposite of `--strict-filter`; re-enables the legacy
+        /// warn-and-proceed behavior for degraded contexts.
+        #[arg(long = "no-strict-filter", conflicts_with = "strict_filter")]
+        no_strict_filter: bool,
     },
 
     /// Open TUI interface to manage workflows
@@ -512,7 +555,15 @@ async fn main() {
             diff_head,
             base_branch,
             activity_type,
+            strict_filter,
+            no_strict_filter,
         }) => {
+            // `--no-strict-filter` wins over the default-true
+            // `--strict-filter` via clap's `conflicts_with`, so the
+            // effective value is (strict AND NOT no-strict). This
+            // mirrors the classic bool-toggle pattern clap uses for
+            // every other `--foo` / `--no-foo` pair in the CLI.
+            let strict_filter = *strict_filter && !*no_strict_filter;
             // Determine workflow type up front so the trigger prefilter
             // can short-circuit for GitLab pipelines with a clear error.
             // Previously the prefilter ran first and tried to parse the
@@ -543,6 +594,7 @@ async fn main() {
                     base_branch: base_branch.as_ref(),
                     activity_type: activity_type.as_ref(),
                     verbose,
+                    strict_filter,
                 })
                 .await;
             }
@@ -678,7 +730,11 @@ async fn main() {
             max_concurrency,
             base_branch,
             activity_type,
+            max_pending_events,
+            strict_filter,
+            no_strict_filter,
         }) => {
+            let strict_filter = *strict_filter && !*no_strict_filter;
             let workflow_dir = path
                 .clone()
                 .unwrap_or_else(|| PathBuf::from(".github/workflows"));
@@ -738,14 +794,29 @@ async fn main() {
                 ))
             );
 
-            // Warn loudly if the user is watching pull_request without a
-            // base branch — branches: filters will reject every workflow.
+            // Hard-error on the load-bearing `pull_request + no base-branch`
+            // combination under the default `--strict-filter`. Previously
+            // this only produced a log warning that the user never saw in
+            // non-interactive contexts, and the watcher then ran a
+            // session-long stream of "0 triggered" results.
             if (event == "pull_request" || event == "pull_request_target") && base_branch.is_none()
             {
+                if strict_filter {
+                    eprintln!(
+                        "Error: `wrkflw watch --event {}` requires --base-branch under \
+                         --strict-filter. GitHub Actions evaluates `branches:` filters on \
+                         pull_request events against the PR target branch, and without one \
+                         every such workflow would be silently rejected. Pass \
+                         --base-branch <name>, or use --no-strict-filter to proceed.",
+                        event
+                    );
+                    std::process::exit(1);
+                }
                 wrkflw_logging::warning(
                     "Watching pull_request without --base-branch: any workflow with a \
                      `branches:` filter will be silently skipped because GitHub Actions \
-                     evaluates that filter against the PR target branch.",
+                     evaluates that filter against the PR target branch. \
+                     --no-strict-filter allowed this to proceed.",
                 );
             }
 
@@ -755,7 +826,8 @@ async fn main() {
                 .with_activity_type(activity_type.clone())
                 .with_debounce(debounce_duration)
                 .with_verbose(verbose)
-                .with_max_concurrency(*max_concurrency);
+                .with_max_concurrency(*max_concurrency)
+                .with_max_pending_events(*max_pending_events);
             let watcher = wrkflw_watcher::WorkflowWatcher::from_config(watcher_cfg);
 
             // Validate workflow files exist before starting
@@ -764,32 +836,56 @@ async fn main() {
                 std::process::exit(1);
             }
 
-            // The CLI relies on `process::exit` from the Ctrl+C handler
-            // for termination, so the watcher receives a never-firing
-            // `ShutdownSignal`. A long-lived host (the TUI, a future
-            // daemon) would construct a real signal and `.trigger()`
-            // it from its own cancellation path; see the type-level
-            // docs on `WorkflowWatcher::run`.
+            // Install a graceful Ctrl+C handler: the default
+            // top-of-`main` handler uses `process::exit(0)` after a
+            // timed cleanup sweep, which bypasses the watcher's
+            // normal drain (workflows mid-execution would be killed
+            // by the OS without running the executor's teardown).
             //
-            // Note on resource cleanup: a Ctrl+C interrupt while a
-            // workflow is executing under Docker will bypass the
-            // normal executor teardown path, leaving containers,
-            // tempdirs, or child processes alive until the next
-            // `docker ps -a` reaper run. This is a known limitation
-            // that also affects `wrkflw run`; a future signal handler
-            // that triggers the shutdown instead of `exit`-ing would
-            // let the current cycle drain. Flagged in the `watch`
-            // help text so operators who see resource buildup have a
-            // breadcrumb.
-            watcher
-                .run(wrkflw_watcher::ShutdownSignal::never(), |watch_event| {
+            // Instead we own a `ShutdownSignal`, trigger it on
+            // Ctrl+C, and let the watcher observe the signal at its
+            // existing `tokio::select!` points. The global handler
+            // at the top of `main` still runs — it kicks in after
+            // the watch loop returns and performs the Docker /
+            // emulation cleanup sweep — so Ctrl+C produces a clean
+            // two-phase teardown instead of a hard exit.
+            //
+            // A race exists: if Ctrl+C fires while a workflow is
+            // already executing, that workflow continues to
+            // completion within the current cycle before `run()`
+            // returns. We accept that bounded latency because the
+            // executor holds container/tempdir handles that need
+            // their normal cleanup — forcibly cancelling the
+            // future would defeat the very cleanup we're trying to
+            // preserve. `MAX_REASONABLE_CONCURRENCY` + the
+            // user-specified `--max-concurrency` bound the
+            // worst-case drain time.
+            let shutdown = wrkflw_watcher::ShutdownSignal::new();
+            let shutdown_for_signal = shutdown.clone();
+            tokio::spawn(async move {
+                if tokio::signal::ctrl_c().await.is_ok() {
+                    wrkflw_logging::info(
+                        "Ctrl+C received — draining current watch cycle gracefully. \
+                         Press Ctrl+C again if the drain hangs.",
+                    );
+                    shutdown_for_signal.trigger();
+                }
+            });
+
+            let watch_result = watcher
+                .run(shutdown, |watch_event| {
                     println!(
                         "\n{}",
                         cli_style::section(&format!(
-                            "Change detected ({} file(s) changed, {} triggered, {} skipped)",
+                            "Change detected ({} file(s) changed, {} triggered, {} skipped{})",
                             watch_event.changed_files.len(),
                             watch_event.triggered_workflows.len(),
                             watch_event.skipped_workflows.len(),
+                            if watch_event.dropped_events > 0 {
+                                format!(", {} dropped", watch_event.dropped_events)
+                            } else {
+                                String::new()
+                            }
                         ))
                     );
                     // Surface degraded cycles loudly: if the watcher
@@ -799,6 +895,9 @@ async fn main() {
                     if let Some(reason) = &watch_event.error {
                         eprintln!("  {} {}", cli_style::error("ERROR"), reason);
                     }
+                    for warning in &watch_event.warnings {
+                        eprintln!("  {} {}", cli_style::warning("WARN"), warning);
+                    }
                     for wf in &watch_event.triggered_workflows {
                         println!("  {} {}", cli_style::success("TRIGGERED"), wf);
                     }
@@ -806,11 +905,12 @@ async fn main() {
                         println!("  {} {}", cli_style::dim("SKIPPED"), wf);
                     }
                 })
-                .await
-                .unwrap_or_else(|e| {
-                    eprintln!("Watch error: {}", e);
-                    std::process::exit(1);
-                });
+                .await;
+
+            if let Err(e) = watch_result {
+                eprintln!("Watch error: {}", e);
+                std::process::exit(1);
+            }
         }
         Some(Commands::TriggerGitlab { branch, variable }) => {
             // Convert optional Vec<(String, String)> to Option<HashMap<String, String>>
@@ -915,6 +1015,13 @@ struct PrefilterRequest<'a> {
     base_branch: Option<&'a String>,
     activity_type: Option<&'a String>,
     verbose: bool,
+    /// When true, known-incomplete filter contexts (missing changed
+    /// files, missing base branch on a PR event) exit with a
+    /// diagnostic instead of log-warning-and-proceeding. The review
+    /// flagged the old warn-and-proceed as exactly the silent-skip
+    /// mode the rest of this PR had been patching; strict mode is
+    /// the default-on countermeasure.
+    strict_filter: bool,
 }
 
 /// Build an event context from the user's CLI flags and short-circuit
@@ -981,8 +1088,24 @@ async fn run_trigger_prefilter_or_exit(req: PrefilterRequest<'_>) {
             std::process::exit(1);
         }
     };
-    apply_base_branch(&mut event_context, &event_name, req.base_branch);
+    if let Err(e) = apply_base_branch(
+        &mut event_context,
+        &event_name,
+        req.base_branch,
+        req.strict_filter,
+    ) {
+        eprintln!("Error: {}", e);
+        std::process::exit(1);
+    }
     apply_activity_type(&mut event_context, req.activity_type);
+
+    // Surface any non-fatal warnings collected while building the
+    // context (e.g. `git ls-files --others` failed, so untracked
+    // files were dropped). These are already logged at warning
+    // level by the trigger-filter crate; re-emitting them here
+    // would double the noise. We leave them in `event_context.warnings`
+    // so tests can assert on them — the visibility already exists
+    // via the log path for users.
 
     if req.verbose {
         wrkflw_logging::info(&format!(
@@ -1004,8 +1127,14 @@ async fn run_trigger_prefilter_or_exit(req: PrefilterRequest<'_>) {
     // the watcher and TUI, both of which already do this — drifting
     // here is exactly how the silent-failure holes accumulated.
     let workflow_path_owned = req.workflow_path.to_path_buf();
+    let tf_config = wrkflw_trigger_filter::TriggerFilterConfig::default();
     let trigger_config = tokio::task::spawn_blocking(move || {
-        wrkflw_trigger_filter::load_trigger_config(&workflow_path_owned)
+        // Route through the shared LRU cache so every wrkflw entry
+        // point (CLI prefilter, TUI diff-filter, watcher hot loop)
+        // contends over the same compiled-pattern store. Unifying
+        // the three call sites was a review ask to prevent drift —
+        // the same file never pays the YAML-parse cost twice.
+        wrkflw_trigger_filter::load_trigger_config_cached(&workflow_path_owned, &tf_config)
     })
     .await
     .unwrap_or_else(|e| {
@@ -1042,9 +1171,17 @@ async fn build_event_context(
     cwd_for_git: Option<&Path>,
 ) -> Result<wrkflw_trigger_filter::EventContext, String> {
     if let Some(files) = req.changed_files {
+        // Validate every user-supplied entry before handing it to
+        // the trigger-filter. Absolute paths, drive letters, and
+        // `..` components break the repo-relative glob contract the
+        // evaluator assumes; catching them up front produces a
+        // "your flag was wrong" message instead of a session-long
+        // "nothing matched" mystery.
+        let normalized = wrkflw_trigger_filter::normalize_user_changed_files(files)
+            .map_err(|e| format!("invalid --changed-files entry: {}", e))?;
         return wrkflw_trigger_filter::context_from_changed_files(
             event_name,
-            files.clone(),
+            normalized,
             cwd_for_git,
         )
         .await
@@ -1079,14 +1216,25 @@ async fn build_event_context(
         .map_err(|e| format!("failed to get git diff: {}", e));
     }
 
-    // --event was passed alone (no --diff, no --changed-files).
-    // The context will have an empty changed-files set, which means
-    // any workflow with a `paths:` filter will be silently skipped.
-    // Warn so users do not get surprised by "nothing triggered".
+    // `--event` was passed alone (no `--diff`, no `--changed-files`).
+    // Running with an empty changed-files set means every `paths:`
+    // filter silently rejects — the exact silent-skip failure mode
+    // the rest of this PR has been plugging. In strict mode (the
+    // default) refuse to proceed so CI scripts fail loudly and the
+    // operator has something actionable to fix.
+    if req.strict_filter {
+        return Err(
+            "--event was supplied without --diff or --changed-files, so no changed files \
+             are known and any workflow with a `paths:` filter would be silently skipped. \
+             Pass --diff to auto-detect from git, --changed-files to supply them \
+             explicitly, or --no-strict-filter to proceed anyway."
+                .to_string(),
+        );
+    }
     wrkflw_logging::warning(
         "--event was supplied without --diff or --changed-files; \
          path filters will not match because no changed files are known. \
-         Use --diff to auto-detect from git, or --changed-files to specify them.",
+         --no-strict-filter allowed this to proceed.",
     );
     wrkflw_trigger_filter::context_from_changed_files(event_name, vec![], cwd_for_git)
         .await
@@ -1104,16 +1252,29 @@ fn apply_base_branch(
     ctx: &mut wrkflw_trigger_filter::EventContext,
     event_name: &str,
     base_branch: Option<&String>,
-) {
+    strict_filter: bool,
+) -> Result<(), String> {
     if let Some(base) = base_branch {
         ctx.base_branch = Some(base.clone());
-    } else if matches!(event_name, "pull_request" | "pull_request_target") {
+        return Ok(());
+    }
+    if matches!(event_name, "pull_request" | "pull_request_target") {
+        if strict_filter {
+            return Err(format!(
+                "simulating `{}` without --base-branch is rejected under --strict-filter: \
+                 `branches:` filters on pull_request events evaluate against the PR target \
+                 branch, and without one every such workflow is silently reported as not \
+                 triggering. Pass --base-branch <name>, or use --no-strict-filter to proceed.",
+                event_name
+            ));
+        }
         wrkflw_logging::warning(
             "Simulating pull_request without --base-branch: workflows that use \
              `branches:` to constrain the PR target branch will be reported as not triggering. \
-             Pass --base-branch <name> to match against a target branch.",
+             --no-strict-filter allowed this to proceed.",
         );
     }
+    Ok(())
 }
 
 /// Stamp `--activity-type` onto the event context.

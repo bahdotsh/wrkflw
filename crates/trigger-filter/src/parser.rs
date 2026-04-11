@@ -3,6 +3,84 @@ use crate::model::{EventFilter, GlobPattern, WorkflowTriggerConfig};
 use std::path::PathBuf;
 use wrkflw_parser::workflow::WorkflowDefinition;
 
+/// Allowlist of event names GitHub Actions documents as valid workflow
+/// triggers, as of the 2024 schema. Any name not in this set is likely
+/// a user typo (`pul_request` instead of `pull_request`) and should be
+/// surfaced via [`warn_on_unknown_events`] so the user notices before
+/// the evaluator silently reports "event does not match".
+///
+/// Kept as a sorted slice rather than a HashSet — the list is small,
+/// the lookup happens once per workflow parse, and a slice is
+/// trivially debuggable in test failures.
+const KNOWN_GHA_EVENTS: &[&str] = &[
+    "branch_protection_rule",
+    "check_run",
+    "check_suite",
+    "create",
+    "delete",
+    "deployment",
+    "deployment_status",
+    "discussion",
+    "discussion_comment",
+    "fork",
+    "gollum",
+    "issue_comment",
+    "issues",
+    "label",
+    "merge_group",
+    "milestone",
+    "page_build",
+    "project",
+    "project_card",
+    "project_column",
+    "public",
+    "pull_request",
+    "pull_request_comment",
+    "pull_request_review",
+    "pull_request_review_comment",
+    "pull_request_target",
+    "push",
+    "registry_package",
+    "release",
+    "repository_dispatch",
+    "schedule",
+    "status",
+    "watch",
+    "workflow_call",
+    "workflow_dispatch",
+    "workflow_run",
+];
+
+/// Log a warning for every event name that is not in [`KNOWN_GHA_EVENTS`].
+///
+/// Called from [`parse_trigger_config`] as a side channel — unknown
+/// events are NOT a hard error because GitHub Actions may add new ones
+/// faster than we update the allowlist, but they ARE worth surfacing:
+/// a typo like `pul_request` would otherwise produce "no matching
+/// event" diagnostics forever, with no hint at the root cause.
+///
+/// Returns the list of warnings produced so callers (like the TUI)
+/// can also stash them in an in-app diagnostics panel instead of
+/// relying on the global logger.
+fn warn_on_unknown_events(events: &[EventFilter], workflow_path: &std::path::Path) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for ev in events {
+        if !KNOWN_GHA_EVENTS.contains(&ev.event_name.as_str()) {
+            let msg = format!(
+                "workflow {} uses unknown event '{}' — if this is a typo, the \
+                 evaluator will silently report 'no matching event' for every run. \
+                 GitHub Actions' documented event list: \
+                 https://docs.github.com/actions/using-workflows/events-that-trigger-workflows",
+                workflow_path.display(),
+                ev.event_name
+            );
+            wrkflw_logging::warning(&msg);
+            warnings.push(msg);
+        }
+    }
+    warnings
+}
+
 /// Parse the `on_raw` YAML value from a WorkflowDefinition into structured trigger config.
 ///
 /// Glob patterns in `branches`, `tags`, `paths`, and their `*-ignore` counterparts
@@ -13,6 +91,9 @@ pub fn parse_trigger_config(
     workflow_path: PathBuf,
 ) -> Result<WorkflowTriggerConfig, TriggerFilterError> {
     let events = parse_events(&workflow.on_raw)?;
+    // Side-channel warning for typos / unknown events — not a parse
+    // error because GHA's event list keeps growing.
+    warn_on_unknown_events(&events, &workflow_path);
     Ok(WorkflowTriggerConfig {
         workflow_path,
         workflow_name: workflow.name.clone(),
@@ -713,6 +794,51 @@ push: "main"
         assert!(msg.contains("must be a mapping"), "got: {}", msg);
         assert!(msg.contains("push"), "got: {}", msg);
         assert!(msg.contains("string"), "got: {}", msg);
+    }
+
+    #[test]
+    fn known_events_allowlist_contains_core_triggers() {
+        // Regression pin: if a refactor ever reorders or truncates
+        // KNOWN_GHA_EVENTS, the typo-detection side channel would
+        // silently start flagging `push`/`pull_request`/etc. as
+        // unknown and spam the log on every workflow. Keep the core
+        // triggers pinned here so the list can only drift upward.
+        for expected in [
+            "push",
+            "pull_request",
+            "pull_request_target",
+            "workflow_dispatch",
+            "workflow_call",
+            "schedule",
+            "release",
+            "issues",
+        ] {
+            assert!(
+                KNOWN_GHA_EVENTS.contains(&expected),
+                "{} must remain in KNOWN_GHA_EVENTS",
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_event_produces_warning_without_blocking_parse() {
+        // Typo'd event names must parse successfully (GHA adds events
+        // faster than we update the allowlist, so a hard error would
+        // be false-positive-prone) but MUST produce a warning so the
+        // user sees the typo instead of a silent "nothing triggers".
+        let raw = make_on_raw(
+            r#"
+pul_request:
+  branches: [main]
+"#,
+        );
+        let events = parse_events(&raw).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_name, "pul_request");
+        let warnings = warn_on_unknown_events(&events, std::path::Path::new("test.yml"));
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("pul_request"), "got: {}", warnings[0]);
     }
 
     #[test]

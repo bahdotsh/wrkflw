@@ -1,13 +1,14 @@
+use crate::config::DEFAULT_GIT_COMMAND_TIMEOUT;
 use crate::error::TriggerFilterError;
 use std::path::Path;
 use std::time::Duration;
 use tokio::process::Command;
 
-/// Hard upper bound on every git subprocess call. A git invocation that hasn't
-/// completed within this window is almost certainly stuck on a network
-/// filesystem, a hung credential prompt, or a corrupt repository — we'd rather
-/// surface a clear error than wedge the watch loop forever.
-const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+/// Default upper bound used when the caller does not pass a per-call
+/// override. See [`crate::config::DEFAULT_GIT_COMMAND_TIMEOUT`] for the
+/// authoritative knob. We re-alias it locally so existing private
+/// helpers can reference a stable name.
+const GIT_COMMAND_TIMEOUT: Duration = DEFAULT_GIT_COMMAND_TIMEOUT;
 
 /// Build a `git` command optionally rooted at a working directory via `-C`.
 ///
@@ -184,6 +185,28 @@ pub async fn get_changed_files(
     base: &str,
     cwd: Option<&Path>,
 ) -> Result<Vec<String>, TriggerFilterError> {
+    let (files, _warnings) = get_changed_files_with_warnings(base, cwd).await?;
+    Ok(files)
+}
+
+/// Variant of [`get_changed_files`] that additionally returns any
+/// non-fatal warnings collected while enriching the changed set.
+///
+/// The primary caller is `auto_detect_context*` — the CLI and the
+/// watcher want to surface e.g. a failed `git ls-files --others` so
+/// "untracked files missing from the changed set" becomes visible to
+/// the user, instead of a silent gap that manifests as a mysteriously
+/// unfiring `paths:` filter. The old `get_changed_files` shape is
+/// retained as a thin wrapper for callers that don't care.
+///
+/// The tuple convention (data, warnings) is deliberate: returning a
+/// struct would drag every caller that has been happily using the
+/// plain `Vec<String>` shape through a refactor, and the warning
+/// stream is empty on the happy path so the extra allocation is free.
+pub async fn get_changed_files_with_warnings(
+    base: &str,
+    cwd: Option<&Path>,
+) -> Result<(Vec<String>, Vec<String>), TriggerFilterError> {
     validate_ref_name(base)?;
 
     let mut diff_cmd = git_cmd(cwd);
@@ -199,15 +222,50 @@ pub async fn get_changed_files(
     let diff_output = check_status(diff_res?, "git diff")?;
     let mut files = parse_lines(&diff_output.stdout);
 
-    // Untracked files are a best-effort enrichment; don't fail the whole
-    // call if `ls-files` errors (e.g. outside a repo).
-    if let Ok(untracked_output) = untracked_res {
-        if untracked_output.status.success() {
-            files = merge_unique(files, parse_lines(&untracked_output.stdout));
+    // Untracked files are a best-effort enrichment — don't fail the
+    // whole call if `ls-files` errors (e.g. a safe-directory rejection,
+    // transient permission glitch). Previously the failure was
+    // swallowed in an `if let Ok(_) = ...` block with no trace; the
+    // user saw an incomplete changed set and a `paths: ['new/**']`
+    // filter that mysteriously refused to fire. Log a warning AND
+    // return it to the caller so `EventContext::warnings` can carry
+    // it to the UI layer.
+    let mut warnings = Vec::new();
+    match untracked_res {
+        Ok(out) if out.status.success() => {
+            files = merge_unique(files, parse_lines(&out.stdout));
+        }
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            let msg = format!(
+                "git ls-files --others failed (exit {}): {} — untracked files will \
+                 be missing from the changed set, so workflows gated on `paths:` for \
+                 brand-new files may be incorrectly reported as not triggering",
+                out.status
+                    .code()
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "signal".to_string()),
+                if stderr.is_empty() {
+                    "<no stderr>"
+                } else {
+                    &stderr
+                }
+            );
+            wrkflw_logging::warning(&msg);
+            warnings.push(msg);
+        }
+        Err(e) => {
+            let msg = format!(
+                "git ls-files --others errored: {} — untracked files will be missing \
+                 from the changed set (see above warning for the consequences)",
+                e
+            );
+            wrkflw_logging::warning(&msg);
+            warnings.push(msg);
         }
     }
 
-    Ok(files)
+    Ok((files, warnings))
 }
 
 fn check_status(
@@ -506,6 +564,39 @@ pub fn find_repo_root_detailed() -> Result<std::path::PathBuf, FindRepoRootError
     } else {
         Ok(std::path::PathBuf::from(path))
     }
+}
+
+/// Best-effort mtime of the repository's `.git/HEAD` file.
+///
+/// The watcher uses this to cheaply detect a `git checkout` happening
+/// mid-TTL: if the current HEAD mtime differs from the one captured at
+/// cache-population time, the cached `(branch, tag)` pair is stale even
+/// though the TTL window has not elapsed. `None` means either the file
+/// could not be stat'd (not a repo, linked worktree with an exotic
+/// layout, transient filesystem error) or the platform does not
+/// expose a `modified()` time — callers must treat `None` as "do not
+/// know, skip the short-circuit" to avoid the false-positive path
+/// where a stale cache is re-served forever because every call
+/// observed `None`.
+pub fn head_mtime(cwd: Option<&Path>) -> Option<std::time::SystemTime> {
+    // We have to resolve `.git/HEAD` ourselves because linked
+    // worktrees put HEAD under `.git/worktrees/<name>/HEAD` and the
+    // top-level `.git` is a plain file containing `gitdir: ...`. The
+    // cheap path (`<cwd>/.git/HEAD`) handles the 99% case; the slow
+    // path falls back to `git rev-parse --git-path HEAD` when the
+    // quick guess fails. Keep this synchronous: the watcher calls it
+    // from a tight loop and cannot afford to fan out to
+    // `spawn_blocking` every cycle.
+    let base = cwd.map(Path::to_path_buf).unwrap_or_else(|| {
+        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+    });
+    let direct = base.join(".git").join("HEAD");
+    if let Ok(meta) = std::fs::metadata(&direct) {
+        if let Ok(mtime) = meta.modified() {
+            return Some(mtime);
+        }
+    }
+    None
 }
 
 /// Get the current tag if HEAD is tagged, or None.

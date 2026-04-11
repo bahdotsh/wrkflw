@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use wrkflw_executor::ExecutionConfig;
-use wrkflw_trigger_filter::{EventContext, WorkflowTriggerConfig};
+use wrkflw_trigger_filter::{EventContext, TriggerFilterConfig, WorkflowTriggerConfig};
 
 /// Default cap on workflows executing concurrently in watch mode when the
 /// caller does not supply an explicit limit.
@@ -28,21 +28,13 @@ pub const DEFAULT_MAX_CONCURRENT_EXECUTIONS: usize = 4;
 /// an issue so we can look at the actual workload before lifting the cap.
 pub const MAX_REASONABLE_CONCURRENCY: usize = 256;
 
-/// TTL for the watcher's cached `(branch, tag)` pair.
-///
-/// Every fs-change cycle previously shelled out to `git rev-parse
-/// --abbrev-ref HEAD` and `git describe --tags --exact-match HEAD`. On a
-/// file-save storm (e.g. a formatter touching 40 files at once → 40
-/// cycles) that's 80 git subprocess spawns for information that only
-/// changes on `git checkout` / `git tag`, both rare relative to saves.
-///
-/// A short TTL is the cheapest correct cache policy: it avoids the
-/// complexity of whitelisting `.git/HEAD` / `.git/refs/**` events past
-/// the ignore filter while still bounding the worst-case staleness to
-/// the TTL. 3 seconds is chosen so that a `git checkout` followed
-/// immediately by a save still re-fetches within one human-noticeable
-/// beat; shorter values erode the cache win on real save bursts.
-const GIT_STATE_CACHE_TTL: Duration = Duration::from_secs(3);
+// The watcher's cached-git-state TTL now lives on
+// `TriggerFilterConfig::git_state_ttl` — see the config crate for
+// rationale and rationale comments. `cached_git_state` reads
+// `self.cfg.trigger_filter.git_state_ttl` directly. Previously a
+// file-local `GIT_STATE_CACHE_TTL` const existed as a placeholder for
+// the then-missing Config struct; it has been retired to avoid the
+// dead-plumbing drift the review flagged.
 
 /// A watch event containing the changed files and trigger evaluation results.
 ///
@@ -53,12 +45,26 @@ const GIT_STATE_CACHE_TTL: Duration = Duration::from_secs(3);
 /// degraded rather than authoritative — otherwise a missing default branch
 /// or a transient git failure produces a session-long stream of silent
 /// "nothing to do" reports.
+///
+/// `warnings` carries per-cycle non-fatal diagnostics that are NOT
+/// fatal to evaluation (e.g. `git ls-files --others` failed, so
+/// untracked files are missing from the change set — the rest of the
+/// cycle still runs). Reporters should render these at a lower
+/// severity than `error` but still above the "silent" line.
+///
+/// `dropped_events` is the number of filesystem events the debouncer
+/// refused this cycle because its pending set was saturated. Greater
+/// than zero means the reporter should tell the user something like
+/// "12 change events were dropped this cycle; reduce churn or raise
+/// the debouncer cap". Under normal use this is always zero.
 #[derive(Debug, Clone)]
 pub struct WatchEvent {
     pub changed_files: Vec<String>,
     pub triggered_workflows: Vec<String>,
     pub skipped_workflows: Vec<String>,
     pub error: Option<String>,
+    pub warnings: Vec<String>,
+    pub dropped_events: usize,
 }
 
 /// Configuration for [`WorkflowWatcher`]. Use the builder-style `with_*`
@@ -96,14 +102,27 @@ pub struct WatcherConfig {
     /// (leaf components) are never matched, so a user file literally
     /// named e.g. `cache` is never silenced.
     pub extra_ignore_dirs: Vec<String>,
+    /// Shared trigger-filter config. Owns the per-call git timeout,
+    /// the git-state TTL, and the compiled-pattern cache size. Passed
+    /// through from the CLI / TUI so a single config struct governs
+    /// the entire trigger-filter pipeline instead of each layer
+    /// re-declaring its own defaults.
+    pub trigger_filter: TriggerFilterConfig,
+    /// Upper bound on the debouncer's pending-event set. Zero means
+    /// "use the debouncer's built-in default" ([`crate::debouncer::DEFAULT_MAX_PENDING_EVENTS`]).
+    /// Tune upward for repos with heavy-churn workloads (large
+    /// `cargo build` / `make` / `git checkout` bursts); tune downward
+    /// in memory-constrained environments.
+    pub max_pending_events: usize,
 }
 
 impl WatcherConfig {
     pub fn new(workflow_dir: PathBuf, repo_root: PathBuf, execution: ExecutionConfig) -> Self {
+        let trigger_filter = TriggerFilterConfig::default();
         Self {
             workflow_dir,
             repo_root,
-            event_name: "push".to_string(),
+            event_name: trigger_filter.default_event.clone(),
             base_branch: None,
             activity_type: None,
             debounce_duration: Duration::from_millis(500),
@@ -111,7 +130,25 @@ impl WatcherConfig {
             verbose: false,
             max_concurrent_executions: DEFAULT_MAX_CONCURRENT_EXECUTIONS,
             extra_ignore_dirs: Vec::new(),
+            trigger_filter,
+            max_pending_events: 0, // 0 = use debouncer default
         }
+    }
+
+    pub fn with_trigger_filter_config(mut self, cfg: TriggerFilterConfig) -> Self {
+        // Keep `event_name` in sync if the caller hasn't overridden it
+        // yet — otherwise the new config's `default_event` would be
+        // silently shadowed by the previous default.
+        if self.event_name == TriggerFilterConfig::default().default_event {
+            self.event_name = cfg.default_event.clone();
+        }
+        self.trigger_filter = cfg;
+        self
+    }
+
+    pub fn with_max_pending_events(mut self, n: usize) -> Self {
+        self.max_pending_events = n;
+        self
     }
 
     /// Extend the fs-watcher's ignore list with additional directory
@@ -180,9 +217,19 @@ impl WatcherConfig {
 /// wall-clock instant it was fetched at. Reused across cycles inside
 /// [`GIT_STATE_CACHE_TTL`] so a file-save storm doesn't trigger one
 /// `git rev-parse` + one `git describe` per event.
+///
+/// `head_mtime` is the mtime of `.git/HEAD` at fetch time. We
+/// re-`stat` it on every lookup and treat the cache as stale if the
+/// value changed — a `git checkout` inside the TTL window bumps
+/// `.git/HEAD`'s mtime, so the next cycle's branch/tag fetch is
+/// guaranteed to run instead of handing back a value from the
+/// pre-checkout working tree. Without this key, a fast `checkout +
+/// save` sequence silently evaluated branch filters against the
+/// previous branch for up to one TTL.
 #[derive(Debug, Clone)]
 struct CachedGitState {
     fetched_at: Instant,
+    head_mtime: Option<std::time::SystemTime>,
     branch: Option<String>,
     tag: Option<String>,
 }
@@ -298,7 +345,17 @@ impl WorkflowWatcher {
             )))
         })?;
 
-        let debouncer = Arc::new(Debouncer::new(self.cfg.debounce_duration));
+        // Honour `WatcherConfig::max_pending_events` when set;
+        // otherwise fall through to the debouncer's baked-in default.
+        let debouncer = Arc::new(if self.cfg.max_pending_events > 0 {
+            Debouncer::with_capacity(self.cfg.debounce_duration, self.cfg.max_pending_events)
+        } else {
+            Debouncer::new(self.cfg.debounce_duration)
+        });
+        // Track dropped events across cycles so each cycle's summary
+        // reports only the drops that happened *since* the last
+        // drain, not the cumulative count.
+        let mut last_dropped_snapshot: usize = 0;
         let callback = Arc::new(on_cycle_complete);
 
         // Precompute the combined ignore set (defaults + user-supplied
@@ -491,9 +548,33 @@ impl WorkflowWatcher {
                 continue;
             }
 
-            let event = self
+            // Snapshot the dropped-event counter and compute the
+            // per-cycle delta before spawning the eval task. Reading
+            // the counter AFTER drain catches any drops recorded
+            // while the callback from the previous cycle was still
+            // executing — we attribute those to the current cycle
+            // so the user sees them at the first opportunity, not
+            // the one after that.
+            let dropped_now = debouncer.dropped_count();
+            let dropped_this_cycle = dropped_now.saturating_sub(last_dropped_snapshot);
+            last_dropped_snapshot = dropped_now;
+
+            let mut event = self
                 .evaluate_and_execute(&configs_for_eval, changed_files)
                 .await;
+            event.dropped_events = dropped_this_cycle;
+            if dropped_this_cycle > 0 {
+                let msg = format!(
+                    "{} filesystem event(s) were dropped this cycle because the \
+                     debouncer's pending set was saturated. This usually means a \
+                     filesystem churn burst (cargo build, git checkout, formatter \
+                     sweep) exceeded the configured cap. Raise --max-pending-events \
+                     or reduce the source of churn if this keeps happening.",
+                    dropped_this_cycle
+                );
+                wrkflw_logging::warning(&msg);
+                event.warnings.push(msg);
+            }
 
             // Fire-and-forget the callback so a slow reporter can't stall
             // the next cycle. Events that arrive during the callback still
@@ -537,18 +618,39 @@ impl WorkflowWatcher {
     async fn cached_git_state(
         &self,
     ) -> Result<(Option<String>, Option<String>), wrkflw_trigger_filter::TriggerFilterError> {
+        let ttl = self.cfg.trigger_filter.git_state_ttl;
+        let cwd = Some(self.cfg.repo_root.as_path());
+        let current_head_mtime = wrkflw_trigger_filter::git::head_mtime(cwd);
+
         // Cheap lock: just check freshness and clone out if hit.
         //
         // Mutex poisoning is handled via `into_inner()` inside a
         // `match` — the guard from the poisoned branch is a
         // `MutexGuard` too, so both arms feed a single usage below.
+        //
+        // Two independent staleness tests:
+        //   1. Wall-clock TTL (bounds worst-case staleness even if
+        //      `.git/HEAD` didn't move — e.g. a fresh clone with no
+        //      committed HEAD yet, or a platform where mtime is
+        //      coarser than the test expects).
+        //   2. HEAD mtime divergence — catches `git checkout` within
+        //      the TTL. Only compared when BOTH the cached and the
+        //      freshly-stat'd mtime are `Some`; one-sided `None` is
+        //      treated as "don't know, fall back to the TTL alone"
+        //      so the happy path still short-circuits on platforms
+        //      that don't expose a usable modified() time.
         {
             let guard = match self.git_state.lock() {
                 Ok(g) => g,
                 Err(p) => p.into_inner(),
             };
             if let Some(state) = guard.as_ref() {
-                if state.fetched_at.elapsed() < GIT_STATE_CACHE_TTL {
+                let ttl_ok = state.fetched_at.elapsed() < ttl;
+                let head_ok = match (state.head_mtime, current_head_mtime) {
+                    (Some(cached), Some(current)) => cached == current,
+                    _ => true,
+                };
+                if ttl_ok && head_ok {
                     return Ok((state.branch.clone(), state.tag.clone()));
                 }
             }
@@ -558,7 +660,6 @@ impl WorkflowWatcher {
         // shape as `context_from_changed_files` used to do. Pass the
         // repo root explicitly so the subprocesses operate on the
         // same tree the watcher is looking at.
-        let cwd = Some(self.cfg.repo_root.as_path());
         let (branch_res, tag_res) = tokio::join!(
             wrkflw_trigger_filter::git::get_current_branch(cwd),
             wrkflw_trigger_filter::git::get_current_tag(cwd),
@@ -570,13 +671,21 @@ impl WorkflowWatcher {
         // overwrite with its own fetch — both branches produce the
         // same value so late-writer-wins is safe, and we avoid the
         // cost of a compare-and-set dance.
+        //
+        // Capture HEAD mtime AFTER the git calls so the "mtime at
+        // fetch time" we store is the one that was consistent with
+        // the branch/tag values we just read. A checkout that
+        // happens between the read and the store will show up as
+        // an mtime mismatch on the very next call.
         let fetched_at = Instant::now();
+        let head_mtime = wrkflw_trigger_filter::git::head_mtime(cwd);
         let mut guard = match self.git_state.lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
         *guard = Some(CachedGitState {
             fetched_at,
+            head_mtime,
             branch: branch.clone(),
             tag: tag.clone(),
         });
@@ -594,32 +703,47 @@ impl WorkflowWatcher {
     /// closure owns its mutable state. The caller reassigns the result.
     async fn refresh_trigger_cache_async(
         &self,
-        mut trigger_cache: HashMap<PathBuf, TriggerCacheEntry>,
+        trigger_cache: HashMap<PathBuf, TriggerCacheEntry>,
         workflow_files: &[PathBuf],
         changed_paths: &[PathBuf],
     ) -> HashMap<PathBuf, TriggerCacheEntry> {
+        // Clone the cache into the blocking task so that if the
+        // closure panics, we can still hand the *previous* cache
+        // back to the loop. Previously a panic returned `HashMap::new()`,
+        // which forced the next cycle to re-parse every workflow —
+        // an O(n) cache cliff visible on any monorepo the moment a
+        // single workflow misbehaved. The cost of the extra clone is
+        // bounded by the workflow count, which is small relative to
+        // the parse work we're saving.
+        let original = trigger_cache.clone();
+        let mut working_copy = trigger_cache;
         let workflow_files = workflow_files.to_vec();
         let changed_paths = changed_paths.to_vec();
         let verbose = self.cfg.verbose;
+        let tf_config = self.cfg.trigger_filter.clone();
         let result = tokio::task::spawn_blocking(move || {
             refresh_trigger_cache_blocking(
-                &mut trigger_cache,
+                &mut working_copy,
                 &workflow_files,
                 &changed_paths,
                 verbose,
+                &tf_config,
             );
-            trigger_cache
+            working_copy
         })
         .await;
-        // A panic inside the blocking closure should not abort the watch
-        // loop — fall back to an empty cache, which will be repopulated
-        // on the next cycle from `workflow_files`.
+        // A panic inside the blocking closure should not abort the
+        // watch loop, nor should it force the next cycle to rebuild
+        // from scratch. Fall back to the untouched prior cache so
+        // the cycle continues against the last-known-good state.
         result.unwrap_or_else(|e| {
             wrkflw_logging::error(&format!(
-                "Trigger cache refresh task panicked: {} — starting next cycle with an empty cache",
-                e
+                "Trigger cache refresh task panicked: {} — reusing {} previously-cached \
+                 entries for the next cycle so the loop does not pay a full re-parse cliff",
+                e,
+                original.len()
             ));
-            HashMap::new()
+            original
         })
     }
 
@@ -733,6 +857,8 @@ impl WorkflowWatcher {
                 triggered_workflows: Vec::new(),
                 skipped_workflows: Vec::new(),
                 error: None,
+                warnings: Vec::new(),
+                dropped_events: 0,
             };
         }
 
@@ -755,6 +881,7 @@ impl WorkflowWatcher {
                 // for "no activity type in context" — exactly the
                 // silent-skip failure mode this PR is built to prevent.
                 activity_type: self.cfg.activity_type.clone(),
+                warnings: Vec::new(),
             },
             Err(e) => {
                 let reason = format!("Failed to build event context: {}", e);
@@ -764,6 +891,8 @@ impl WorkflowWatcher {
                     triggered_workflows: Vec::new(),
                     skipped_workflows: Vec::new(),
                     error: Some(reason),
+                    warnings: Vec::new(),
+                    dropped_events: 0,
                 };
             }
         };
@@ -865,6 +994,8 @@ impl WorkflowWatcher {
             triggered_workflows: triggered,
             skipped_workflows: skipped,
             error: None,
+            warnings: Vec::new(),
+            dropped_events: 0,
         }
     }
 }

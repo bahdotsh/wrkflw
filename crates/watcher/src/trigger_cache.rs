@@ -16,7 +16,7 @@
 use crate::paths::canonicalize_allowing_missing;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use wrkflw_trigger_filter::WorkflowTriggerConfig;
+use wrkflw_trigger_filter::{TriggerFilterConfig, WorkflowTriggerConfig};
 
 /// One entry in the trigger cache: the compiled config plus a memoized
 /// canonical form of the workflow's path.
@@ -59,6 +59,7 @@ pub(crate) fn refresh_trigger_cache_blocking(
     workflow_files: &[PathBuf],
     changed_paths: &[PathBuf],
     verbose: bool,
+    tf_config: &TriggerFilterConfig,
 ) {
     let active_set: HashSet<&PathBuf> = workflow_files.iter().collect();
     trigger_cache.retain(|k, _| active_set.contains(k));
@@ -86,7 +87,12 @@ pub(crate) fn refresh_trigger_cache_blocking(
         if !needs_reparse {
             continue;
         }
-        match wrkflw_trigger_filter::load_trigger_config(wf_path) {
+        // Route through the process-wide LRU cache so CLI prefilter,
+        // watcher, and TUI all share the same compiled-glob cache.
+        // With the default cache size, the unchanged-file path here
+        // is a single HashMap lookup instead of a full YAML parse
+        // plus glob compile.
+        match wrkflw_trigger_filter::load_trigger_config_cached(wf_path, tf_config) {
             Ok(cfg) => {
                 trigger_cache.insert(
                     wf_path.clone(),
@@ -159,7 +165,13 @@ mod tests {
         let workflow_files = vec![wf_abs.clone()];
         let mut cache: HashMap<PathBuf, TriggerCacheEntry> = HashMap::new();
 
-        refresh_trigger_cache_blocking(&mut cache, &workflow_files, &[], false);
+        refresh_trigger_cache_blocking(
+            &mut cache,
+            &workflow_files,
+            &[],
+            false,
+            &TriggerFilterConfig::default(),
+        );
         let v1 = cache.get(&wf_abs).expect("v1 cached");
         let v1_paths: Vec<&str> = v1.config.events[0]
             .paths
@@ -175,7 +187,13 @@ mod tests {
         // Simulate a notify event with the OS-canonicalized absolute form.
         // (On macOS this prepends `/private`.)
         let changed = std::fs::canonicalize(&wf_abs).expect("canonicalize wf");
-        refresh_trigger_cache_blocking(&mut cache, &workflow_files, &[changed], false);
+        refresh_trigger_cache_blocking(
+            &mut cache,
+            &workflow_files,
+            &[changed],
+            false,
+            &TriggerFilterConfig::default(),
+        );
 
         let v2 = cache.get(&wf_abs).expect("v2 cached");
         let v2_paths: Vec<&str> = v2.config.events[0]
@@ -215,7 +233,13 @@ mod tests {
         let mut cache: HashMap<PathBuf, TriggerCacheEntry> = HashMap::new();
 
         // Prime: file parses fine, cache populated.
-        refresh_trigger_cache_blocking(&mut cache, &workflow_files, &[], false);
+        refresh_trigger_cache_blocking(
+            &mut cache,
+            &workflow_files,
+            &[],
+            false,
+            &TriggerFilterConfig::default(),
+        );
         assert!(
             cache.contains_key(&wf_abs),
             "good workflow must be cached after first refresh"
@@ -226,7 +250,13 @@ mod tests {
         let bad = "name: t\non:\n  push:\n    paths:\n      - '[unclosed'\njobs:\n  b:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n";
         std::fs::write(&wf_abs, bad).expect("write bad ci.yml");
         let changed = std::fs::canonicalize(&wf_abs).expect("canonicalize wf");
-        refresh_trigger_cache_blocking(&mut cache, &workflow_files, &[changed], false);
+        refresh_trigger_cache_blocking(
+            &mut cache,
+            &workflow_files,
+            &[changed],
+            false,
+            &TriggerFilterConfig::default(),
+        );
 
         assert!(
             !cache.contains_key(&wf_abs),
@@ -255,7 +285,13 @@ mod tests {
         let workflow_files = vec![wf_abs.clone()];
         let mut cache: HashMap<PathBuf, TriggerCacheEntry> = HashMap::new();
 
-        refresh_trigger_cache_blocking(&mut cache, &workflow_files, &[], false);
+        refresh_trigger_cache_blocking(
+            &mut cache,
+            &workflow_files,
+            &[],
+            false,
+            &TriggerFilterConfig::default(),
+        );
         let canonical_after_first = cache
             .get(&wf_abs)
             .expect("v1 cached")
@@ -270,7 +306,13 @@ mod tests {
         // form (we're asserting the cache value survives, which proves
         // the entry was reused rather than re-canonicalized into a new
         // entry).
-        refresh_trigger_cache_blocking(&mut cache, &workflow_files, &[], false);
+        refresh_trigger_cache_blocking(
+            &mut cache,
+            &workflow_files,
+            &[],
+            false,
+            &TriggerFilterConfig::default(),
+        );
         let canonical_after_second = &cache.get(&wf_abs).expect("still cached").canonical_path;
         assert_eq!(
             &canonical_after_first, canonical_after_second,

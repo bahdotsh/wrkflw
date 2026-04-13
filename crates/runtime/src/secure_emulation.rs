@@ -416,6 +416,7 @@ mod tests {
     /// Regression for #88: a container-visible working dir must be rebased
     /// through the `volumes` mapping onto its host counterpart, so commands
     /// run in the caller's workspace rather than a hidden sandbox copy.
+    #[cfg(not(target_os = "windows"))]
     #[tokio::test]
     async fn secure_emulation_rebases_container_working_dir_via_volumes() {
         let runtime = SecureEmulationRuntime::new();

@@ -4780,13 +4780,30 @@ fn propagate_composite_outputs(
     // Append to the caller's GITHUB_OUTPUT file
     if let Some(output_path) = caller_job_env.get("GITHUB_OUTPUT") {
         use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new()
+        match std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(output_path)
         {
-            for (key, value) in &resolved {
-                let _ = writeln!(f, "{}={}", key, value);
+            Ok(mut f) => {
+                for (key, value) in &resolved {
+                    if value.contains('\n') {
+                        let _ = writeln!(f, "{}<<EOF", key);
+                        let _ = write!(f, "{}", value);
+                        if !value.ends_with('\n') {
+                            let _ = writeln!(f);
+                        }
+                        let _ = writeln!(f, "EOF");
+                    } else {
+                        let _ = writeln!(f, "{}={}", key, value);
+                    }
+                }
+            }
+            Err(e) => {
+                wrkflw_logging::debug(&format!(
+                    "Failed to open GITHUB_OUTPUT for composite output propagation: {}",
+                    e
+                ));
             }
         }
     }
@@ -8741,6 +8758,80 @@ runs:
             content.contains("phantom="),
             "Expected 'phantom=' in GITHUB_OUTPUT, got: {:?}",
             content
+        );
+    }
+
+    #[test]
+    fn propagate_composite_outputs_multiline_value_uses_heredoc() {
+        // When an output value contains newlines, it must be written using
+        // the heredoc format (key<<EOF\nvalue\nEOF) so that
+        // parse_github_kv_file can read it back correctly.
+        let action_yaml = r#"
+name: MultiLine
+outputs:
+  body:
+    description: A multiline value
+    value: ${{ steps.gen.outputs.text }}
+  single:
+    description: A single-line value
+    value: ${{ steps.gen.outputs.title }}
+runs:
+  using: composite
+  steps: []
+"#;
+        let action_def: serde_yaml::Value = serde_yaml::from_str(action_yaml).unwrap();
+
+        let mut composite_step_outputs: HashMap<String, HashMap<String, String>> = HashMap::new();
+        let mut gen_outputs = HashMap::new();
+        gen_outputs.insert("text".to_string(), "line1\nline2\nline3".to_string());
+        gen_outputs.insert("title".to_string(), "hello".to_string());
+        composite_step_outputs.insert("gen".to_string(), gen_outputs);
+
+        let action_env = HashMap::new();
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tmp_path = tmp.path().to_string_lossy().to_string();
+        let mut caller_env = HashMap::new();
+        caller_env.insert("GITHUB_OUTPUT".to_string(), tmp_path.clone());
+
+        let working_dir = std::env::temp_dir();
+
+        propagate_composite_outputs(
+            &action_def,
+            &composite_step_outputs,
+            &action_env,
+            &caller_env,
+            &working_dir,
+            "success",
+        );
+
+        let content = std::fs::read_to_string(&tmp_path).unwrap();
+
+        // Multiline value should use heredoc format
+        assert!(
+            content.contains("body<<EOF\nline1\nline2\nline3\nEOF\n"),
+            "Expected heredoc format for multiline value in GITHUB_OUTPUT, got: {:?}",
+            content
+        );
+
+        // Single-line value should use simple key=value format
+        assert!(
+            content.contains("single=hello"),
+            "Expected 'single=hello' in GITHUB_OUTPUT, got: {:?}",
+            content
+        );
+
+        // Verify parse_github_kv_file can round-trip the multiline value
+        let parsed = crate::github_env_files::parse_github_kv_file(&content);
+        assert_eq!(
+            parsed.get("body").map(|s| s.as_str()),
+            Some("line1\nline2\nline3"),
+            "parse_github_kv_file should round-trip the multiline value"
+        );
+        assert_eq!(
+            parsed.get("single").map(|s| s.as_str()),
+            Some("hello"),
+            "parse_github_kv_file should round-trip the single-line value"
         );
     }
 }

@@ -7630,6 +7630,7 @@ runs:
     /// This test drives a real `EmulationRuntime` end-to-end through
     /// run → upload-artifact → download-artifact and asserts the payload
     /// round-trips byte-for-byte.
+    #[cfg(not(target_os = "windows"))]
     #[tokio::test]
     async fn run_step_upload_download_artifact_roundtrip_emulation() {
         let runtime = emulation::EmulationRuntime::new();

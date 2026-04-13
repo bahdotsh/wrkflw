@@ -4638,6 +4638,14 @@ async fn execute_composite_action(
 
                 // Short-circuit on failure if needed
                 if step_result.status == StepStatus::Failure {
+                    // Still propagate whatever outputs were collected before the failure
+                    propagate_composite_outputs(
+                        &action_def,
+                        &composite_step_outputs,
+                        &action_env,
+                        job_env,
+                        working_dir,
+                    );
                     return Ok(StepResult::new(
                         step.name
                             .clone()
@@ -4647,6 +4655,15 @@ async fn execute_composite_action(
                     ));
                 }
             }
+
+            // Propagate composite action outputs to the caller's GITHUB_OUTPUT
+            propagate_composite_outputs(
+                &action_def,
+                &composite_step_outputs,
+                &action_env,
+                job_env,
+                working_dir,
+            );
 
             // All steps completed successfully
             let output = if verbose {
@@ -4697,6 +4714,78 @@ async fn execute_composite_action(
         _ => Err(ExecutionError::Execution(
             "Action is not a composite action or has invalid format".to_string(),
         )),
+    }
+}
+
+/// Evaluate a composite action's `outputs:` section and write the resolved values
+/// to the caller's GITHUB_OUTPUT file so `${{ steps.<id>.outputs.<key> }}` works.
+fn propagate_composite_outputs(
+    action_def: &serde_yaml::Value,
+    composite_step_outputs: &HashMap<String, HashMap<String, String>>,
+    action_env: &HashMap<String, String>,
+    caller_job_env: &HashMap<String, String>,
+    working_dir: &Path,
+) {
+    let outputs = match action_def.get("outputs").and_then(|v| v.as_mapping()) {
+        Some(m) => m,
+        None => return, // No outputs declared
+    };
+
+    // Build an expression context scoped to the composite's internal steps
+    let empty_matrix = None;
+    let empty_statuses = HashMap::new();
+    let empty_secrets = HashMap::new();
+    let empty_needs = HashMap::new();
+    let empty_results = HashMap::new();
+    let expr_ctx = crate::expression::ExpressionContext {
+        env_context: action_env,
+        step_outputs: composite_step_outputs,
+        matrix_combination: &empty_matrix,
+        step_statuses: &empty_statuses,
+        job_status: "success",
+        secrets_context: &empty_secrets,
+        needs_context: &empty_needs,
+        needs_results: &empty_results,
+    };
+
+    // Collect evaluated outputs
+    let mut resolved: Vec<(String, String)> = Vec::new();
+    for (key, def) in outputs {
+        let key_str = match key.as_str() {
+            Some(k) => k,
+            None => continue,
+        };
+        let value_expr = match def.get("value").and_then(|v| v.as_str()) {
+            Some(v) => v,
+            None => continue,
+        };
+        match crate::substitution::preprocess_expressions(value_expr, working_dir, &expr_ctx) {
+            Ok(val) => resolved.push((key_str.to_string(), val)),
+            Err(e) => {
+                wrkflw_logging::debug(&format!(
+                    "Failed to evaluate composite output '{}': {}",
+                    key_str, e
+                ));
+            }
+        }
+    }
+
+    if resolved.is_empty() {
+        return;
+    }
+
+    // Append to the caller's GITHUB_OUTPUT file
+    if let Some(output_path) = caller_job_env.get("GITHUB_OUTPUT") {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(output_path)
+        {
+            for (key, value) in &resolved {
+                let _ = writeln!(f, "{}={}", key, value);
+            }
+        }
     }
 }
 
@@ -8462,5 +8551,88 @@ runs:
         // Without a step_id, ::set-output:: commands should be silently ignored
         process_workflow_commands("::set-output name=x::val\n", None, &mut outputs, None);
         assert!(outputs.is_empty());
+    }
+
+    #[test]
+    fn propagate_composite_outputs_writes_to_github_output_file() {
+        // Simulate a composite action with an outputs section that references
+        // an internal step output via ${{ steps.build-msg.outputs.msg }}
+        let action_yaml = r#"
+name: Greet
+outputs:
+  message:
+    description: The greeting
+    value: ${{ steps.build-msg.outputs.msg }}
+  static_val:
+    description: A literal
+    value: hello-literal
+runs:
+  using: composite
+  steps: []
+"#;
+        let action_def: serde_yaml::Value = serde_yaml::from_str(action_yaml).unwrap();
+
+        // Populate the composite's internal step outputs
+        let mut composite_step_outputs: HashMap<String, HashMap<String, String>> = HashMap::new();
+        let mut build_msg_outputs = HashMap::new();
+        build_msg_outputs.insert("msg".to_string(), "Hi, World!".to_string());
+        composite_step_outputs.insert("build-msg".to_string(), build_msg_outputs);
+
+        let action_env = HashMap::new();
+
+        // Create a temp file to act as the caller's GITHUB_OUTPUT
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tmp_path = tmp.path().to_string_lossy().to_string();
+        let mut caller_env = HashMap::new();
+        caller_env.insert("GITHUB_OUTPUT".to_string(), tmp_path.clone());
+
+        let working_dir = std::env::temp_dir();
+
+        propagate_composite_outputs(
+            &action_def,
+            &composite_step_outputs,
+            &action_env,
+            &caller_env,
+            &working_dir,
+        );
+
+        // Read the GITHUB_OUTPUT file — it should contain the evaluated outputs
+        let content = std::fs::read_to_string(&tmp_path).unwrap();
+        assert!(
+            content.contains("message=Hi, World!"),
+            "Expected 'message=Hi, World!' in GITHUB_OUTPUT, got: {:?}",
+            content
+        );
+        assert!(
+            content.contains("static_val=hello-literal"),
+            "Expected 'static_val=hello-literal' in GITHUB_OUTPUT, got: {:?}",
+            content
+        );
+    }
+
+    #[test]
+    fn propagate_composite_outputs_no_outputs_section_is_noop() {
+        let action_yaml = r#"
+name: NoOutputs
+runs:
+  using: composite
+  steps: []
+"#;
+        let action_def: serde_yaml::Value = serde_yaml::from_str(action_yaml).unwrap();
+        let composite_step_outputs = HashMap::new();
+        let action_env = HashMap::new();
+
+        // No GITHUB_OUTPUT in env — should not panic
+        let caller_env = HashMap::new();
+        let working_dir = std::env::temp_dir();
+
+        propagate_composite_outputs(
+            &action_def,
+            &composite_step_outputs,
+            &action_env,
+            &caller_env,
+            &working_dir,
+        );
+        // No assertion needed — just verifying it doesn't panic
     }
 }

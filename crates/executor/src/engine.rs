@@ -4787,15 +4787,28 @@ fn propagate_composite_outputs(
         {
             Ok(mut f) => {
                 for (key, value) in &resolved {
-                    if value.contains('\n') {
-                        let _ = writeln!(f, "{}<<EOF", key);
-                        let _ = write!(f, "{}", value);
-                        if !value.ends_with('\n') {
-                            let _ = writeln!(f);
-                        }
-                        let _ = writeln!(f, "EOF");
+                    let res = if value.contains('\n') {
+                        // Use a unique delimiter to avoid collisions with value content
+                        let delim = generate_heredoc_delimiter(value);
+                        writeln!(f, "{}<<{}", key, delim)
+                            .and_then(|_| write!(f, "{}", value))
+                            .and_then(|_| {
+                                if !value.ends_with('\n') {
+                                    writeln!(f)
+                                } else {
+                                    Ok(())
+                                }
+                            })
+                            .and_then(|_| writeln!(f, "{}", delim))
                     } else {
-                        let _ = writeln!(f, "{}={}", key, value);
+                        writeln!(f, "{}={}", key, value)
+                    };
+                    if let Err(e) = res {
+                        wrkflw_logging::debug(&format!(
+                            "Failed to write composite output '{}' to GITHUB_OUTPUT: {}",
+                            key, e
+                        ));
+                        break;
                     }
                 }
             }
@@ -4807,6 +4820,20 @@ fn propagate_composite_outputs(
             }
         }
     }
+}
+
+/// Generate a heredoc delimiter that does not appear as a standalone line in `value`.
+/// Starts with `ghadelimiter_` and appends a numeric suffix until unique.
+fn generate_heredoc_delimiter(value: &str) -> String {
+    let base = "ghadelimiter";
+    let mut candidate = base.to_string();
+    let mut counter: u64 = 0;
+    // Check if the candidate appears as a complete line in the value
+    while value.lines().any(|line| line == candidate) {
+        counter += 1;
+        candidate = format!("{}_{}", base, counter);
+    }
+    candidate
 }
 
 // Helper function to convert YAML step to our Step struct
@@ -8764,7 +8791,7 @@ runs:
     #[test]
     fn propagate_composite_outputs_multiline_value_uses_heredoc() {
         // When an output value contains newlines, it must be written using
-        // the heredoc format (key<<EOF\nvalue\nEOF) so that
+        // the heredoc format (key<<DELIM\nvalue\nDELIM) so that
         // parse_github_kv_file can read it back correctly.
         let action_yaml = r#"
 name: MultiLine
@@ -8807,10 +8834,10 @@ runs:
 
         let content = std::fs::read_to_string(&tmp_path).unwrap();
 
-        // Multiline value should use heredoc format
+        // Multiline value should use heredoc format with ghadelimiter prefix
         assert!(
-            content.contains("body<<EOF\nline1\nline2\nline3\nEOF\n"),
-            "Expected heredoc format for multiline value in GITHUB_OUTPUT, got: {:?}",
+            content.contains("body<<ghadelimiter"),
+            "Expected heredoc format with ghadelimiter for multiline value in GITHUB_OUTPUT, got: {:?}",
             content
         );
 
@@ -8833,5 +8860,82 @@ runs:
             Some("hello"),
             "parse_github_kv_file should round-trip the single-line value"
         );
+    }
+
+    #[test]
+    fn propagate_composite_outputs_value_containing_eof_uses_unique_delimiter() {
+        // When a multiline output value contains a line that is literally "ghadelimiter",
+        // the function must pick a different delimiter to avoid premature termination.
+        let action_yaml = r#"
+name: EOFInValue
+outputs:
+  data:
+    description: Value with EOF-like content
+    value: ${{ steps.gen.outputs.blob }}
+runs:
+  using: composite
+  steps: []
+"#;
+        let action_def: serde_yaml::Value = serde_yaml::from_str(action_yaml).unwrap();
+
+        let mut composite_step_outputs: HashMap<String, HashMap<String, String>> = HashMap::new();
+        let mut gen_outputs = HashMap::new();
+        // Value that contains "ghadelimiter" as a standalone line
+        gen_outputs.insert(
+            "blob".to_string(),
+            "before\nghadelimiter\nafter".to_string(),
+        );
+        composite_step_outputs.insert("gen".to_string(), gen_outputs);
+
+        let action_env = HashMap::new();
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tmp_path = tmp.path().to_string_lossy().to_string();
+        let mut caller_env = HashMap::new();
+        caller_env.insert("GITHUB_OUTPUT".to_string(), tmp_path.clone());
+
+        let working_dir = std::env::temp_dir();
+
+        propagate_composite_outputs(
+            &action_def,
+            &composite_step_outputs,
+            &action_env,
+            &caller_env,
+            &working_dir,
+            "success",
+        );
+
+        let content = std::fs::read_to_string(&tmp_path).unwrap();
+
+        // The delimiter must NOT be "ghadelimiter" since the value contains it
+        assert!(
+            !content.starts_with("data<<ghadelimiter\n")
+                || content.starts_with("data<<ghadelimiter_"),
+            "Delimiter should have been suffixed to avoid collision, got: {:?}",
+            content
+        );
+
+        // Verify parse_github_kv_file can round-trip the value correctly
+        let parsed = crate::github_env_files::parse_github_kv_file(&content);
+        assert_eq!(
+            parsed.get("data").map(|s| s.as_str()),
+            Some("before\nghadelimiter\nafter"),
+            "parse_github_kv_file should round-trip value containing the base delimiter"
+        );
+    }
+
+    #[test]
+    fn generate_heredoc_delimiter_avoids_collisions() {
+        // Base case: no collision
+        let delim = generate_heredoc_delimiter("hello\nworld");
+        assert_eq!(delim, "ghadelimiter");
+
+        // Value contains the base delimiter as a line
+        let delim = generate_heredoc_delimiter("line1\nghadelimiter\nline2");
+        assert_eq!(delim, "ghadelimiter_1");
+
+        // Value contains both base and _1
+        let delim = generate_heredoc_delimiter("ghadelimiter\nghadelimiter_1\nother");
+        assert_eq!(delim, "ghadelimiter_2");
     }
 }

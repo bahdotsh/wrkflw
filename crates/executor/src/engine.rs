@@ -4645,6 +4645,7 @@ async fn execute_composite_action(
                         &action_env,
                         job_env,
                         working_dir,
+                        &composite_job_status,
                     );
                     return Ok(StepResult::new(
                         step.name
@@ -4663,6 +4664,7 @@ async fn execute_composite_action(
                 &action_env,
                 job_env,
                 working_dir,
+                &composite_job_status,
             );
 
             // All steps completed successfully
@@ -4725,6 +4727,7 @@ fn propagate_composite_outputs(
     action_env: &HashMap<String, String>,
     caller_job_env: &HashMap<String, String>,
     working_dir: &Path,
+    job_status: &str,
 ) {
     let outputs = match action_def.get("outputs").and_then(|v| v.as_mapping()) {
         Some(m) => m,
@@ -4742,7 +4745,7 @@ fn propagate_composite_outputs(
         step_outputs: composite_step_outputs,
         matrix_combination: &empty_matrix,
         step_statuses: &empty_statuses,
-        job_status: "success",
+        job_status,
         secrets_context: &empty_secrets,
         needs_context: &empty_needs,
         needs_results: &empty_results,
@@ -8594,6 +8597,7 @@ runs:
             &action_env,
             &caller_env,
             &working_dir,
+            "success",
         );
 
         // Read the GITHUB_OUTPUT file — it should contain the evaluated outputs
@@ -8632,7 +8636,111 @@ runs:
             &action_env,
             &caller_env,
             &working_dir,
+            "success",
         );
         // No assertion needed — just verifying it doesn't panic
+    }
+
+    #[test]
+    fn propagate_composite_outputs_on_failure_writes_partial_outputs() {
+        // Simulate a composite action where one step succeeded before a later step failed.
+        // The output referencing the successful step should still be propagated.
+        let action_yaml = r#"
+name: PartialOutputs
+outputs:
+  greeting:
+    description: From step that succeeded
+    value: ${{ steps.ok-step.outputs.val }}
+  missing:
+    description: From step that never ran
+    value: ${{ steps.never-ran.outputs.val }}
+runs:
+  using: composite
+  steps: []
+"#;
+        let action_def: serde_yaml::Value = serde_yaml::from_str(action_yaml).unwrap();
+
+        // Only the first step produced outputs
+        let mut composite_step_outputs: HashMap<String, HashMap<String, String>> = HashMap::new();
+        let mut ok_outputs = HashMap::new();
+        ok_outputs.insert("val".to_string(), "partial-result".to_string());
+        composite_step_outputs.insert("ok-step".to_string(), ok_outputs);
+        // "never-ran" is intentionally absent
+
+        let action_env = HashMap::new();
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tmp_path = tmp.path().to_string_lossy().to_string();
+        let mut caller_env = HashMap::new();
+        caller_env.insert("GITHUB_OUTPUT".to_string(), tmp_path.clone());
+
+        let working_dir = std::env::temp_dir();
+
+        propagate_composite_outputs(
+            &action_def,
+            &composite_step_outputs,
+            &action_env,
+            &caller_env,
+            &working_dir,
+            "failure",
+        );
+
+        let content = std::fs::read_to_string(&tmp_path).unwrap();
+        assert!(
+            content.contains("greeting=partial-result"),
+            "Expected 'greeting=partial-result' in GITHUB_OUTPUT, got: {:?}",
+            content
+        );
+        // The missing step output should resolve to empty string, not panic
+        assert!(
+            content.contains("missing="),
+            "Expected 'missing=' in GITHUB_OUTPUT, got: {:?}",
+            content
+        );
+    }
+
+    #[test]
+    fn propagate_composite_outputs_nonexistent_step_resolves_empty() {
+        // When an output value references a step that doesn't exist in the
+        // composite_step_outputs map, it should resolve to an empty string
+        // rather than panicking or erroring.
+        let action_yaml = r#"
+name: GhostStep
+outputs:
+  phantom:
+    description: References a step that was never executed
+    value: ${{ steps.ghost.outputs.result }}
+runs:
+  using: composite
+  steps: []
+"#;
+        let action_def: serde_yaml::Value = serde_yaml::from_str(action_yaml).unwrap();
+
+        let composite_step_outputs: HashMap<String, HashMap<String, String>> = HashMap::new();
+        let action_env = HashMap::new();
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tmp_path = tmp.path().to_string_lossy().to_string();
+        let mut caller_env = HashMap::new();
+        caller_env.insert("GITHUB_OUTPUT".to_string(), tmp_path.clone());
+
+        let working_dir = std::env::temp_dir();
+
+        propagate_composite_outputs(
+            &action_def,
+            &composite_step_outputs,
+            &action_env,
+            &caller_env,
+            &working_dir,
+            "success",
+        );
+
+        let content = std::fs::read_to_string(&tmp_path).unwrap();
+        // Should write the key with an empty value, not skip or panic
+        assert!(
+            content.contains("phantom="),
+            "Expected 'phantom=' in GITHUB_OUTPUT, got: {:?}",
+            content
+        );
     }
 }

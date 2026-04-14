@@ -429,4 +429,31 @@ mod tests {
     fn extract_repo_from_invalid_url() {
         assert_eq!(extract_repo_from_url("not-a-url"), None);
     }
+
+    #[test]
+    fn is_user_env_var_filters_all_github_context_keys() {
+        use crate::expression::is_user_env_var;
+
+        let workflow_yaml = r#"
+name: test
+on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo hi
+"#;
+        let workflow: wrkflw_parser::workflow::WorkflowDefinition =
+            serde_yaml::from_str(workflow_yaml).expect("valid workflow yaml");
+        let tmp = std::env::temp_dir().join("wrkflw_env_test");
+        let _ = std::fs::create_dir_all(&tmp);
+        let ctx = create_github_context(&workflow, &tmp);
+        for key in ctx.keys() {
+            assert!(
+                !is_user_env_var(key),
+                "internal key '{}' should be filtered by is_user_env_var but was not",
+                key
+            );
+        }
+    }
 }

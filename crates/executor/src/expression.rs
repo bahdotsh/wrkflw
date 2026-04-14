@@ -279,12 +279,13 @@ impl<'a> Tokenizer<'a> {
 /// KNOWN LIMITATION: Because `env_context` is a single flat HashMap that mixes
 /// user-declared env vars with runner-injected ones, we use a heuristic prefix
 /// filter. This means a user-defined var like `env: { GITHUB_CUSTOM: "val" }`
+/// or the commonly used `env: { GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} }`
 /// will be incorrectly excluded from `toJSON(env)` output. The proper fix is to
 /// separate user env from runner env upstream in ExpressionContext, but that is
 /// a larger refactor tracked separately.
 ///
 /// Update this function when new internal prefixes are introduced.
-fn is_user_env_var(key: &str) -> bool {
+pub(crate) fn is_user_env_var(key: &str) -> bool {
     !key.starts_with("GITHUB_")
         && !key.starts_with("RUNNER_")
         && !key.starts_with("INPUT_")
@@ -684,6 +685,9 @@ fn expr_cmp(a: &ExprValue, b: &ExprValue) -> Option<std::cmp::Ordering> {
         (ExprValue::String(a), ExprValue::String(b)) => {
             Some(a.to_lowercase().cmp(&b.to_lowercase()))
         }
+        // Objects are not orderable — comparisons like `env < env` yield None
+        // (meaning the comparison expression will evaluate to false).
+        (ExprValue::Object(_), _) | (_, ExprValue::Object(_)) => None,
         _ => None,
     }
 }
@@ -1553,5 +1557,59 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&s).expect("should be valid JSON");
         let obj = parsed.as_object().expect("should be a JSON object");
         assert!(obj.is_empty(), "should be empty with no env vars: {}", s);
+    }
+
+    #[test]
+    fn fromjson_tojson_env_roundtrip() {
+        let mut env = HashMap::new();
+        env.insert("MY_VAR".to_string(), "hello".to_string());
+        env.insert("OTHER".to_string(), "world".to_string());
+        let ctx = make_ctx(&env, &EMPTY_STEPS, &EMPTY_MATRIX);
+        // fromJSON(toJSON(env)) should produce an object that we can index into
+        let result = evaluate("fromJSON(toJSON(env))", &ctx).unwrap();
+        let s = result.to_output_string();
+        // The result of fromJSON on an object string is a string containing
+        // the JSON, verify it round-trips to valid JSON with expected keys
+        let parsed: serde_json::Value = serde_json::from_str(&s).expect("should be valid JSON");
+        let obj = parsed.as_object().expect("should be a JSON object");
+        assert_eq!(obj.get("MY_VAR").unwrap(), "hello");
+        assert_eq!(obj.get("OTHER").unwrap(), "world");
+    }
+
+    #[test]
+    fn tojson_env_special_characters_in_values() {
+        let mut env = HashMap::new();
+        env.insert("QUOTED".to_string(), "he said \"hi\"".to_string());
+        env.insert("NEWLINE".to_string(), "line1\nline2".to_string());
+        env.insert("UNICODE".to_string(), "\u{1F600}".to_string());
+        env.insert("BACKSLASH".to_string(), "path\\to\\file".to_string());
+        let ctx = make_ctx(&env, &EMPTY_STEPS, &EMPTY_MATRIX);
+        let result = evaluate("toJSON(env)", &ctx).unwrap();
+        let s = result.to_output_string();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&s).expect("should be valid JSON despite special chars");
+        let obj = parsed.as_object().expect("should be a JSON object");
+        assert_eq!(obj.get("QUOTED").unwrap(), "he said \"hi\"");
+        assert_eq!(obj.get("NEWLINE").unwrap(), "line1\nline2");
+        assert_eq!(obj.get("UNICODE").unwrap(), "\u{1F600}");
+        assert_eq!(obj.get("BACKSLASH").unwrap(), "path\\to\\file");
+    }
+
+    #[test]
+    fn object_cmp_returns_none() {
+        // Object comparisons via <, >, <=, >= should all evaluate to false
+        // because expr_cmp returns None for Object values.
+        let mut env = HashMap::new();
+        env.insert("FOO".to_string(), "bar".to_string());
+        let ctx = make_ctx(&env, &EMPTY_STEPS, &EMPTY_MATRIX);
+        // These should all evaluate to false (Object is not orderable)
+        let result = evaluate("env < env", &ctx).unwrap();
+        assert!(!result.is_truthy(), "env < env should be false");
+        let result = evaluate("env > env", &ctx).unwrap();
+        assert!(!result.is_truthy(), "env > env should be false");
+        let result = evaluate("env <= env", &ctx).unwrap();
+        assert!(!result.is_truthy(), "env <= env should be false");
+        let result = evaluate("env >= env", &ctx).unwrap();
+        assert!(!result.is_truthy(), "env >= env should be false");
     }
 }

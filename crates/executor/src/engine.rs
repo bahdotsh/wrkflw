@@ -106,9 +106,36 @@ async fn execute_github_workflow(
     // 4. Set up GitHub-like environment
     let mut env_context = environment::create_github_context(&workflow, workspace_dir.path());
 
-    // Add workflow-level environment variables (lowest precedence — job and step env override)
-    for (key, value) in &workflow.env {
-        env_context.insert(key.clone(), value.clone());
+    // Add workflow-level environment variables (lowest precedence — does not override
+    // built-in GITHUB_*/RUNNER_* vars; job and step env override these later).
+    // Resolve ${{ }} expressions (e.g. ${{ github.repository }}) in values.
+    {
+        let wf_expr_ctx = crate::expression::ExpressionContext {
+            env_context: &env_context,
+            step_outputs: &HashMap::new(),
+            matrix_combination: &None,
+            step_statuses: &HashMap::new(),
+            job_status: "success",
+            secrets_context: &HashMap::new(),
+            needs_context: &HashMap::new(),
+            needs_results: &HashMap::new(),
+        };
+        let cwd = std::env::current_dir().map_err(|e| {
+            ExecutionError::Execution(format!("Failed to get current directory: {}", e))
+        })?;
+        let resolved_env: Vec<(String, String)> = workflow
+            .env
+            .iter()
+            .map(|(key, value)| {
+                let resolved =
+                    crate::substitution::preprocess_expressions(value, &cwd, &wf_expr_ctx)
+                        .unwrap_or_else(|_| value.clone());
+                (key.clone(), resolved)
+            })
+            .collect();
+        for (key, value) in resolved_env {
+            env_context.entry(key).or_insert(value);
+        }
     }
 
     // Add runtime mode to environment
@@ -5496,6 +5523,94 @@ mod tests {
         assert_eq!(job_env.get("CONTAINER_ONLY").unwrap(), "container-value");
         // Job-only keys are preserved
         assert_eq!(job_env.get("JOB_ONLY").unwrap(), "job-value");
+    }
+
+    // --- workflow-level env tests ---
+
+    #[test]
+    fn workflow_env_does_not_override_builtin_github_vars() {
+        // Workflow-level env uses entry().or_insert(), so it must NOT override
+        // built-in GITHUB_* variables set by create_github_context().
+        let mut env_context: HashMap<String, String> = HashMap::from([
+            ("GITHUB_SHA".into(), "abc123".into()),
+            ("CI".into(), "true".into()),
+        ]);
+
+        // Simulate workflow env with keys that collide with builtins
+        let workflow_env: HashMap<String, String> = HashMap::from([
+            ("GITHUB_SHA".into(), "should-not-win".into()),
+            ("CI".into(), "false".into()),
+            ("MY_CUSTOM_VAR".into(), "custom-value".into()),
+        ]);
+        for (key, value) in &workflow_env {
+            env_context
+                .entry(key.clone())
+                .or_insert_with(|| value.clone());
+        }
+
+        // Built-in values must be preserved
+        assert_eq!(env_context.get("GITHUB_SHA").unwrap(), "abc123");
+        assert_eq!(env_context.get("CI").unwrap(), "true");
+        // Custom workflow env is added
+        assert_eq!(env_context.get("MY_CUSTOM_VAR").unwrap(), "custom-value");
+    }
+
+    #[test]
+    fn workflow_env_overridden_by_job_env() {
+        // Precedence: workflow env (lowest) < job env < step env (highest)
+        let mut env_context: HashMap<String, String> = HashMap::new();
+
+        // Step 1: workflow env (lowest precedence)
+        let workflow_env: HashMap<String, String> = HashMap::from([
+            ("SHARED".into(), "from-workflow".into()),
+            ("WF_ONLY".into(), "workflow-value".into()),
+        ]);
+        for (key, value) in &workflow_env {
+            env_context
+                .entry(key.clone())
+                .or_insert_with(|| value.clone());
+        }
+
+        // Step 2: job env (overrides workflow env)
+        let job_env: HashMap<String, String> = HashMap::from([
+            ("SHARED".into(), "from-job".into()),
+            ("JOB_ONLY".into(), "job-value".into()),
+        ]);
+        for (key, value) in &job_env {
+            env_context.insert(key.clone(), value.clone());
+        }
+
+        // Job env wins for shared keys
+        assert_eq!(env_context.get("SHARED").unwrap(), "from-job");
+        // Workflow-only keys are preserved
+        assert_eq!(env_context.get("WF_ONLY").unwrap(), "workflow-value");
+        // Job-only keys are preserved
+        assert_eq!(env_context.get("JOB_ONLY").unwrap(), "job-value");
+    }
+
+    #[test]
+    fn workflow_env_expression_substitution() {
+        // Workflow-level env values containing ${{ }} expressions should be resolved
+        let env_context: HashMap<String, String> =
+            HashMap::from([("GITHUB_REPOSITORY".into(), "owner/repo".into())]);
+        let expr_ctx = crate::expression::ExpressionContext {
+            env_context: &env_context,
+            step_outputs: &HashMap::new(),
+            matrix_combination: &None,
+            step_statuses: &HashMap::new(),
+            job_status: "success",
+            secrets_context: &HashMap::new(),
+            needs_context: &HashMap::new(),
+            needs_results: &HashMap::new(),
+        };
+        let cwd = std::env::current_dir().unwrap();
+
+        // Simulate a workflow env value with an expression
+        let raw_value = "repo=${{ github.repository }}";
+        let resolved = crate::substitution::preprocess_expressions(raw_value, &cwd, &expr_ctx)
+            .unwrap_or_else(|_| raw_value.to_string());
+
+        assert_eq!(resolved, "repo=owner/repo");
     }
 
     // --- evaluate_job_condition tests for step-level expressions ---

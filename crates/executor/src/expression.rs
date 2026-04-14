@@ -273,6 +273,19 @@ impl<'a> Tokenizer<'a> {
     }
 }
 
+/// Returns `true` if this env-var key belongs to the user-defined `env:` context
+/// rather than an internal variable injected by the executor/runner.
+///
+/// Update this function when new internal prefixes are introduced.
+fn is_user_env_var(key: &str) -> bool {
+    !key.starts_with("GITHUB_")
+        && !key.starts_with("RUNNER_")
+        && !key.starts_with("INPUT_")
+        && !key.starts_with("WRKFLW_")
+        && key != "CI"
+        && key != "MATRIX_CONTEXT"
+}
+
 // ---------------------------------------------------------------------------
 // Expression context
 // ---------------------------------------------------------------------------
@@ -398,21 +411,13 @@ impl<'a> ExpressionContext<'a> {
             // Bare context names — return the whole context as an Object so that
             // `toJSON(env)` (and similar) can serialise it.
             "env" if parts.len() == 1 => {
-                let mut entries: Vec<(String, ExprValue)> = self
+                let map = self
                     .env_context
                     .iter()
-                    .filter(|(k, _)| {
-                        !k.starts_with("GITHUB_")
-                            && !k.starts_with("RUNNER_")
-                            && !k.starts_with("INPUT_")
-                            && !k.starts_with("WRKFLW_")
-                            && k.as_str() != "CI"
-                            && k.as_str() != "MATRIX_CONTEXT"
-                    })
+                    .filter(|(k, _)| is_user_env_var(k))
                     .map(|(k, v)| (k.clone(), ExprValue::String(v.clone())))
                     .collect();
-                entries.sort_by(|(a, _), (b, _)| a.cmp(b));
-                ExprValue::Object(entries.into_iter().collect())
+                ExprValue::Object(map)
             }
             _ => ExprValue::Null,
         }
@@ -772,13 +777,10 @@ fn call_builtin(
                 ExprValue::Null => Ok(ExprValue::String("null".to_string())),
                 ExprValue::Object(map) => {
                     // Serialize as sorted, pretty-printed JSON (matches GHA behaviour).
-                    let sorted: std::collections::BTreeMap<&String, String> = map
-                        .iter()
-                        .map(|(k, v)| (k, v.to_output_string()))
-                        .collect();
+                    let sorted: std::collections::BTreeMap<&String, String> =
+                        map.iter().map(|(k, v)| (k, v.to_output_string())).collect();
                     Ok(ExprValue::String(
-                        serde_json::to_string_pretty(&sorted)
-                            .unwrap_or_else(|_| "{}".to_string()),
+                        serde_json::to_string_pretty(&sorted).unwrap_or_else(|_| "{}".to_string()),
                     ))
                 }
             }
@@ -1426,9 +1428,18 @@ mod tests {
         let obj = parsed.as_object().expect("should be a JSON object");
         assert_eq!(obj.get("MY_VAR").unwrap(), "hello");
         assert_eq!(obj.get("OTHER").unwrap(), "world");
-        assert!(obj.get("GITHUB_SHA").is_none(), "should exclude GITHUB_ vars");
-        assert!(obj.get("RUNNER_OS").is_none(), "should exclude RUNNER_ vars");
-        assert!(obj.get("INPUT_NAME").is_none(), "should exclude INPUT_ vars");
+        assert!(
+            obj.get("GITHUB_SHA").is_none(),
+            "should exclude GITHUB_ vars"
+        );
+        assert!(
+            obj.get("RUNNER_OS").is_none(),
+            "should exclude RUNNER_ vars"
+        );
+        assert!(
+            obj.get("INPUT_NAME").is_none(),
+            "should exclude INPUT_ vars"
+        );
         assert!(obj.get("CI").is_none(), "should exclude CI");
     }
 
@@ -1466,5 +1477,23 @@ mod tests {
         let ctx = make_ctx(&env, &EMPTY_STEPS, &EMPTY_MATRIX);
         let result = evaluate("env", &ctx).unwrap();
         assert_eq!(result.to_output_string(), "[object Object]");
+    }
+
+    #[test]
+    fn tojson_env_empty_when_only_internal_vars() {
+        let mut env = HashMap::new();
+        env.insert("GITHUB_SHA".to_string(), "abc123".to_string());
+        env.insert("RUNNER_OS".to_string(), "Linux".to_string());
+        env.insert("CI".to_string(), "true".to_string());
+        let ctx = make_ctx(&env, &EMPTY_STEPS, &EMPTY_MATRIX);
+        let result = evaluate("toJSON(env)", &ctx).unwrap();
+        let s = result.to_output_string();
+        let parsed: serde_json::Value = serde_json::from_str(&s).expect("should be valid JSON");
+        let obj = parsed.as_object().expect("should be a JSON object");
+        assert!(
+            obj.is_empty(),
+            "should be empty when all vars are internal: {}",
+            s
+        );
     }
 }

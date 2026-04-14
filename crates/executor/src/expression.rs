@@ -53,7 +53,12 @@ impl ExprValue {
             }
             ExprValue::Bool(b) => if *b { "true" } else { "false" }.to_string(),
             ExprValue::Null => String::new(),
-            ExprValue::Object(_) => "[object Object]".to_string(),
+            ExprValue::Object(map) => {
+                // GHA coerces objects to their JSON representation in string contexts.
+                let sorted: std::collections::BTreeMap<&String, serde_json::Value> =
+                    map.iter().map(|(k, v)| (k, expr_to_json(v))).collect();
+                serde_json::to_string_pretty(&sorted).unwrap_or_else(|_| "{}".to_string())
+            }
         }
     }
 }
@@ -291,7 +296,7 @@ pub(crate) fn is_user_env_var(key: &str) -> bool {
         && !key.starts_with("INPUT_")
         && !key.starts_with("WRKFLW_")
         && key != "CI"
-        && key != "MATRIX_CONTEXT"
+        && key != "MATRIX_CONTEXT" // inserted by add_matrix_context() in environment.rs
 }
 
 // ---------------------------------------------------------------------------
@@ -1506,7 +1511,11 @@ mod tests {
         env.insert("FOO".to_string(), "bar".to_string());
         let ctx = make_ctx(&env, &EMPTY_STEPS, &EMPTY_MATRIX);
         let result = evaluate("env", &ctx).unwrap();
-        assert_eq!(result.to_output_string(), "[object Object]");
+        // GHA coerces objects to their JSON representation in string contexts.
+        let s = result.to_output_string();
+        let parsed: serde_json::Value = serde_json::from_str(&s).expect("should be valid JSON");
+        let obj = parsed.as_object().expect("should be a JSON object");
+        assert_eq!(obj.get("FOO").unwrap(), "bar");
     }
 
     #[test]
@@ -1560,16 +1569,16 @@ mod tests {
     }
 
     #[test]
-    fn fromjson_tojson_env_roundtrip() {
+    fn fromjson_tojson_env_produces_parseable_json() {
+        // Note: fromJSON currently returns an ExprValue::String containing
+        // the raw JSON text, not an ExprValue::Object. This test verifies
+        // that the string output is valid, parseable JSON with expected keys.
         let mut env = HashMap::new();
         env.insert("MY_VAR".to_string(), "hello".to_string());
         env.insert("OTHER".to_string(), "world".to_string());
         let ctx = make_ctx(&env, &EMPTY_STEPS, &EMPTY_MATRIX);
-        // fromJSON(toJSON(env)) should produce an object that we can index into
         let result = evaluate("fromJSON(toJSON(env))", &ctx).unwrap();
         let s = result.to_output_string();
-        // The result of fromJSON on an object string is a string containing
-        // the JSON, verify it round-trips to valid JSON with expected keys
         let parsed: serde_json::Value = serde_json::from_str(&s).expect("should be valid JSON");
         let obj = parsed.as_object().expect("should be a JSON object");
         assert_eq!(obj.get("MY_VAR").unwrap(), "hello");

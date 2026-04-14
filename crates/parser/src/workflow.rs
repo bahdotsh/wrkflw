@@ -146,6 +146,8 @@ pub struct WorkflowDefinition {
     pub jobs: HashMap<String, Job>,
     #[serde(default)]
     pub defaults: Option<Defaults>,
+    #[serde(default)]
+    pub env: HashMap<String, String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Default)]
@@ -412,6 +414,7 @@ mod tests {
             on_raw: serde_yaml::Value::Null,
             jobs: Default::default(),
             defaults: None,
+            env: HashMap::new(),
         };
         let info = wd.resolve_action("actions/checkout@v4");
         assert_eq!(info.repository, "actions/checkout");
@@ -429,6 +432,7 @@ mod tests {
             on_raw: serde_yaml::Value::Null,
             jobs: Default::default(),
             defaults: None,
+            env: HashMap::new(),
         };
         let info = wd.resolve_action("owner/repo");
         assert_eq!(info.repository, "owner/repo");
@@ -444,6 +448,7 @@ mod tests {
             on_raw: serde_yaml::Value::Null,
             jobs: Default::default(),
             defaults: None,
+            env: HashMap::new(),
         };
         let info = wd.resolve_action("docker://alpine:3.18");
         assert_eq!(info.repository, "docker://alpine:3.18");
@@ -460,6 +465,7 @@ mod tests {
             on_raw: serde_yaml::Value::Null,
             jobs: Default::default(),
             defaults: None,
+            env: HashMap::new(),
         };
         let info = wd.resolve_action("./my-action");
         assert_eq!(info.repository, "./my-action");
@@ -476,6 +482,7 @@ mod tests {
             on_raw: serde_yaml::Value::Null,
             jobs: Default::default(),
             defaults: None,
+            env: HashMap::new(),
         };
         // Docker image references can use @sha256:digest — the full string is the image ref
         let info = wd.resolve_action("docker://alpine@sha256:abcdef1234567890");
@@ -493,6 +500,7 @@ mod tests {
             on_raw: serde_yaml::Value::Null,
             jobs: Default::default(),
             defaults: None,
+            env: HashMap::new(),
         };
         let info = wd.resolve_action("actions/checkout@a81bbbf8298c0fa03ea29cdc473d45769f953675");
         assert_eq!(info.repository, "actions/checkout");
@@ -508,6 +516,7 @@ mod tests {
             on_raw: serde_yaml::Value::Null,
             jobs: Default::default(),
             defaults: None,
+            env: HashMap::new(),
         };
         let info = wd.resolve_action("owner/repo/path/to/action@v2");
         assert_eq!(info.repository, "owner/repo");
@@ -525,6 +534,7 @@ mod tests {
             on_raw: serde_yaml::Value::Null,
             jobs: Default::default(),
             defaults: None,
+            env: HashMap::new(),
         };
         let info = wd.resolve_action("github/codeql-action/init@v3");
         assert_eq!(info.repository, "github/codeql-action");

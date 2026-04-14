@@ -900,6 +900,7 @@ pul_request:
             on_raw: make_on_raw("pul_request"),
             jobs: std::collections::HashMap::new(),
             defaults: None,
+            env: std::collections::HashMap::new(),
         };
         let mut cfg = parse_trigger_config(&wf, PathBuf::from("test.yml")).unwrap();
         // Drain explicitly so the MustDrainWarnings Drop check stays

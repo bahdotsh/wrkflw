@@ -106,6 +106,11 @@ async fn execute_github_workflow(
     // 4. Set up GitHub-like environment
     let mut env_context = environment::create_github_context(&workflow, workspace_dir.path());
 
+    // Add workflow-level environment variables (lowest precedence — job and step env override)
+    for (key, value) in &workflow.env {
+        env_context.insert(key.clone(), value.clone());
+    }
+
     // Add runtime mode to environment
     env_context.insert(
         "WRKFLW_RUNTIME_MODE".to_string(),
@@ -4585,6 +4590,7 @@ async fn execute_composite_action(
                         on_raw: serde_yaml::Value::Null,
                         jobs: HashMap::new(),
                         defaults: None,
+                        env: HashMap::new(),
                     },
                     runner_image,
                     verbose,
@@ -5501,6 +5507,7 @@ mod tests {
             on_raw: serde_yaml::Value::Null,
             jobs: HashMap::new(),
             defaults: None,
+            env: HashMap::new(),
         }
     }
 
@@ -6036,6 +6043,7 @@ runs:
             on_raw: serde_yaml::Value::Null,
             jobs: Default::default(),
             defaults: None,
+            env: HashMap::new(),
         }
     }
 

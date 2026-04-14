@@ -120,6 +120,7 @@ pub fn convert_to_workflow_format(pipeline: &Pipeline) -> workflow::WorkflowDefi
         on_raw: serde_yaml::Value::String("push".to_string()),
         jobs: HashMap::new(),
         defaults: None,
+        env: HashMap::new(),
     };
 
     // Convert each GitLab job to a GitHub Actions job

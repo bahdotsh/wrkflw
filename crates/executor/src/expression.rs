@@ -276,6 +276,13 @@ impl<'a> Tokenizer<'a> {
 /// Returns `true` if this env-var key belongs to the user-defined `env:` context
 /// rather than an internal variable injected by the executor/runner.
 ///
+/// KNOWN LIMITATION: Because `env_context` is a single flat HashMap that mixes
+/// user-declared env vars with runner-injected ones, we use a heuristic prefix
+/// filter. This means a user-defined var like `env: { GITHUB_CUSTOM: "val" }`
+/// will be incorrectly excluded from `toJSON(env)` output. The proper fix is to
+/// separate user env from runner env upstream in ExpressionContext, but that is
+/// a larger refactor tracked separately.
+///
 /// Update this function when new internal prefixes are introduced.
 fn is_user_env_var(key: &str) -> bool {
     !key.starts_with("GITHUB_")
@@ -410,6 +417,7 @@ impl<'a> ExpressionContext<'a> {
                 .unwrap_or(ExprValue::Null),
             // Bare context names — return the whole context as an Object so that
             // `toJSON(env)` (and similar) can serialise it.
+            // TODO: support other bare contexts: github, secrets, matrix, steps, needs
             "env" if parts.len() == 1 => {
                 let map = self
                     .env_context
@@ -1512,6 +1520,27 @@ mod tests {
             obj.is_empty(),
             "should be empty when all vars are internal: {}",
             s
+        );
+    }
+
+    #[test]
+    fn tojson_env_excludes_user_var_with_internal_prefix() {
+        // KNOWN LIMITATION: user-defined vars that happen to match internal
+        // prefixes (GITHUB_*, RUNNER_*, etc.) are incorrectly filtered out.
+        let mut env = HashMap::new();
+        env.insert("GITHUB_CUSTOM".to_string(), "user-val".to_string());
+        env.insert("MY_VAR".to_string(), "hello".to_string());
+        let ctx = make_ctx(&env, &EMPTY_STEPS, &EMPTY_MATRIX);
+        let result = evaluate("toJSON(env)", &ctx).unwrap();
+        let s = result.to_output_string();
+        let parsed: serde_json::Value = serde_json::from_str(&s).expect("should be valid JSON");
+        let obj = parsed.as_object().expect("should be a JSON object");
+        assert_eq!(obj.get("MY_VAR").unwrap(), "hello");
+        // GITHUB_CUSTOM is excluded despite being user-defined — this is the
+        // known limitation of the heuristic prefix filter.
+        assert!(
+            obj.get("GITHUB_CUSTOM").is_none(),
+            "user var with GITHUB_ prefix is incorrectly excluded (known limitation)"
         );
     }
 

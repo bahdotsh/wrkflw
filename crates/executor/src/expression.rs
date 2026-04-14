@@ -25,7 +25,7 @@ pub enum ExprValue {
     Bool(bool),
     Null,
     /// A key-value map, used for context objects like `env`, `github`, etc.
-    Object(std::collections::HashMap<String, ExprValue>),
+    Object(HashMap<String, ExprValue>),
 }
 
 impl ExprValue {
@@ -684,6 +684,23 @@ fn expr_cmp(a: &ExprValue, b: &ExprValue) -> Option<std::cmp::Ordering> {
 // Built-in functions
 // ---------------------------------------------------------------------------
 
+/// Convert an `ExprValue` to a `serde_json::Value` for JSON serialisation.
+fn expr_to_json(v: &ExprValue) -> serde_json::Value {
+    match v {
+        ExprValue::String(s) => serde_json::Value::String(s.clone()),
+        ExprValue::Number(n) => serde_json::json!(n),
+        ExprValue::Bool(b) => serde_json::Value::Bool(*b),
+        ExprValue::Null => serde_json::Value::Null,
+        ExprValue::Object(map) => {
+            let obj: serde_json::Map<String, serde_json::Value> = map
+                .iter()
+                .map(|(k, v)| (k.clone(), expr_to_json(v)))
+                .collect();
+            serde_json::Value::Object(obj)
+        }
+    }
+}
+
 fn call_builtin(
     name: &str,
     args: &[ExprValue],
@@ -777,8 +794,9 @@ fn call_builtin(
                 ExprValue::Null => Ok(ExprValue::String("null".to_string())),
                 ExprValue::Object(map) => {
                     // Serialize as sorted, pretty-printed JSON (matches GHA behaviour).
-                    let sorted: std::collections::BTreeMap<&String, String> =
-                        map.iter().map(|(k, v)| (k, v.to_output_string())).collect();
+                    // Use serde_json::Value so nested objects serialize correctly.
+                    let sorted: std::collections::BTreeMap<&String, serde_json::Value> =
+                        map.iter().map(|(k, v)| (k, expr_to_json(v))).collect();
                     Ok(ExprValue::String(
                         serde_json::to_string_pretty(&sorted).unwrap_or_else(|_| "{}".to_string()),
                     ))
@@ -1495,5 +1513,16 @@ mod tests {
             "should be empty when all vars are internal: {}",
             s
         );
+    }
+
+    #[test]
+    fn tojson_env_empty_context() {
+        let env = HashMap::new();
+        let ctx = make_ctx(&env, &EMPTY_STEPS, &EMPTY_MATRIX);
+        let result = evaluate("toJSON(env)", &ctx).unwrap();
+        let s = result.to_output_string();
+        let parsed: serde_json::Value = serde_json::from_str(&s).expect("should be valid JSON");
+        let obj = parsed.as_object().expect("should be a JSON object");
+        assert!(obj.is_empty(), "should be empty with no env vars: {}", s);
     }
 }

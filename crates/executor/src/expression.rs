@@ -24,6 +24,8 @@ pub enum ExprValue {
     Number(f64),
     Bool(bool),
     Null,
+    /// A key-value map, used for context objects like `env`, `github`, etc.
+    Object(std::collections::HashMap<String, ExprValue>),
 }
 
 impl ExprValue {
@@ -34,6 +36,7 @@ impl ExprValue {
             ExprValue::Number(n) => *n != 0.0 && !n.is_nan(),
             ExprValue::String(s) => !s.is_empty(),
             ExprValue::Null => false,
+            ExprValue::Object(_) => true,
         }
     }
 
@@ -50,6 +53,7 @@ impl ExprValue {
             }
             ExprValue::Bool(b) => if *b { "true" } else { "false" }.to_string(),
             ExprValue::Null => String::new(),
+            ExprValue::Object(_) => "[object Object]".to_string(),
         }
     }
 }
@@ -391,6 +395,25 @@ impl<'a> ExpressionContext<'a> {
                 .get(&parts[1])
                 .map(|(_, conclusion)| ExprValue::String(conclusion.clone()))
                 .unwrap_or(ExprValue::Null),
+            // Bare context names — return the whole context as an Object so that
+            // `toJSON(env)` (and similar) can serialise it.
+            "env" if parts.len() == 1 => {
+                let mut entries: Vec<(String, ExprValue)> = self
+                    .env_context
+                    .iter()
+                    .filter(|(k, _)| {
+                        !k.starts_with("GITHUB_")
+                            && !k.starts_with("RUNNER_")
+                            && !k.starts_with("INPUT_")
+                            && !k.starts_with("WRKFLW_")
+                            && k.as_str() != "CI"
+                            && k.as_str() != "MATRIX_CONTEXT"
+                    })
+                    .map(|(k, v)| (k.clone(), ExprValue::String(v.clone())))
+                    .collect();
+                entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+                ExprValue::Object(entries.into_iter().collect())
+            }
             _ => ExprValue::Null,
         }
     }
@@ -637,6 +660,8 @@ fn expr_eq(a: &ExprValue, b: &ExprValue) -> bool {
             let sv = s.eq_ignore_ascii_case("true");
             *b == sv
         }
+        // Objects are not comparable via ==
+        (ExprValue::Object(_), _) | (_, ExprValue::Object(_)) => false,
     }
 }
 
@@ -745,6 +770,17 @@ fn call_builtin(
                 ExprValue::Number(n) => Ok(ExprValue::String(format!("{}", n))),
                 ExprValue::Bool(b) => Ok(ExprValue::String(format!("{}", b))),
                 ExprValue::Null => Ok(ExprValue::String("null".to_string())),
+                ExprValue::Object(map) => {
+                    // Serialize as sorted, pretty-printed JSON (matches GHA behaviour).
+                    let sorted: std::collections::BTreeMap<&String, String> = map
+                        .iter()
+                        .map(|(k, v)| (k, v.to_output_string()))
+                        .collect();
+                    Ok(ExprValue::String(
+                        serde_json::to_string_pretty(&sorted)
+                            .unwrap_or_else(|_| "{}".to_string()),
+                    ))
+                }
             }
         }
         "fromJSON" | "fromjson" => {
@@ -1371,5 +1407,64 @@ mod tests {
         let result = evaluate("toJSON('before\x00after')", &ctx).unwrap();
         let s = result.to_output_string();
         assert!(!s.contains('\0'), "should not contain raw null: {}", s);
+    }
+
+    #[test]
+    fn tojson_env_returns_object() {
+        let mut env = HashMap::new();
+        env.insert("MY_VAR".to_string(), "hello".to_string());
+        env.insert("OTHER".to_string(), "world".to_string());
+        // System vars should be excluded from the env object
+        env.insert("GITHUB_SHA".to_string(), "abc123".to_string());
+        env.insert("RUNNER_OS".to_string(), "Linux".to_string());
+        env.insert("INPUT_NAME".to_string(), "test".to_string());
+        env.insert("CI".to_string(), "true".to_string());
+        let ctx = make_ctx(&env, &EMPTY_STEPS, &EMPTY_MATRIX);
+        let result = evaluate("toJSON(env)", &ctx).unwrap();
+        let s = result.to_output_string();
+        let parsed: serde_json::Value = serde_json::from_str(&s).expect("should be valid JSON");
+        let obj = parsed.as_object().expect("should be a JSON object");
+        assert_eq!(obj.get("MY_VAR").unwrap(), "hello");
+        assert_eq!(obj.get("OTHER").unwrap(), "world");
+        assert!(obj.get("GITHUB_SHA").is_none(), "should exclude GITHUB_ vars");
+        assert!(obj.get("RUNNER_OS").is_none(), "should exclude RUNNER_ vars");
+        assert!(obj.get("INPUT_NAME").is_none(), "should exclude INPUT_ vars");
+        assert!(obj.get("CI").is_none(), "should exclude CI");
+    }
+
+    #[test]
+    fn tojson_env_sorted_keys() {
+        let mut env = HashMap::new();
+        env.insert("ZEBRA".to_string(), "z".to_string());
+        env.insert("APPLE".to_string(), "a".to_string());
+        env.insert("MANGO".to_string(), "m".to_string());
+        let ctx = make_ctx(&env, &EMPTY_STEPS, &EMPTY_MATRIX);
+        let result = evaluate("toJSON(env)", &ctx).unwrap();
+        let s = result.to_output_string();
+        // Keys should appear in alphabetical order
+        let apple_pos = s.find("APPLE").unwrap();
+        let mango_pos = s.find("MANGO").unwrap();
+        let zebra_pos = s.find("ZEBRA").unwrap();
+        assert!(apple_pos < mango_pos, "APPLE should come before MANGO");
+        assert!(mango_pos < zebra_pos, "MANGO should come before ZEBRA");
+    }
+
+    #[test]
+    fn bare_env_is_truthy() {
+        let mut env = HashMap::new();
+        env.insert("FOO".to_string(), "bar".to_string());
+        let ctx = make_ctx(&env, &EMPTY_STEPS, &EMPTY_MATRIX);
+        // `env` alone should be truthy (it's an object)
+        let result = evaluate("env", &ctx).unwrap();
+        assert!(result.is_truthy());
+    }
+
+    #[test]
+    fn bare_env_to_output_string() {
+        let mut env = HashMap::new();
+        env.insert("FOO".to_string(), "bar".to_string());
+        let ctx = make_ctx(&env, &EMPTY_STEPS, &EMPTY_MATRIX);
+        let result = evaluate("env", &ctx).unwrap();
+        assert_eq!(result.to_output_string(), "[object Object]");
     }
 }

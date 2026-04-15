@@ -423,7 +423,45 @@ impl<'a> ExpressionContext<'a> {
                 .unwrap_or(ExprValue::Null),
             // Bare context names — return the whole context as an Object so that
             // `toJSON(env)` (and similar) can serialise it.
-            // TODO: support other bare contexts: github, secrets, matrix, steps, needs
+            // TODO: support other bare contexts: github, secrets, matrix, needs
+            "steps" if parts.len() == 1 => {
+                // Collect all step IDs from both outputs and statuses maps.
+                let mut all_ids: std::collections::HashSet<&String> =
+                    self.step_outputs.keys().collect();
+                all_ids.extend(self.step_statuses.keys());
+
+                let mut map = HashMap::new();
+                for step_id in all_ids {
+                    let mut step_obj = HashMap::new();
+
+                    // outputs sub-object (empty if no outputs recorded)
+                    let outputs_map: HashMap<String, ExprValue> = self
+                        .step_outputs
+                        .get(step_id)
+                        .map(|m| {
+                            m.iter()
+                                .map(|(k, v)| (k.clone(), ExprValue::String(v.clone())))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    step_obj.insert("outputs".to_string(), ExprValue::Object(outputs_map));
+
+                    // outcome + conclusion (only present if the step has a status)
+                    if let Some((outcome, conclusion)) = self.step_statuses.get(step_id) {
+                        step_obj.insert(
+                            "outcome".to_string(),
+                            ExprValue::String(outcome.clone()),
+                        );
+                        step_obj.insert(
+                            "conclusion".to_string(),
+                            ExprValue::String(conclusion.clone()),
+                        );
+                    }
+
+                    map.insert(step_id.clone(), ExprValue::Object(step_obj));
+                }
+                ExprValue::Object(map)
+            }
             "env" if parts.len() == 1 => {
                 let map = self
                     .env_context
@@ -1602,6 +1640,162 @@ mod tests {
         assert_eq!(obj.get("NEWLINE").unwrap(), "line1\nline2");
         assert_eq!(obj.get("UNICODE").unwrap(), "\u{1F600}");
         assert_eq!(obj.get("BACKSLASH").unwrap(), "path\\to\\file");
+    }
+
+    // -- toJSON(steps) tests --
+
+    /// Helper to build an ExpressionContext with step data.
+    fn make_steps_ctx<'a>(
+        step_outputs: &'a HashMap<String, HashMap<String, String>>,
+        step_statuses: &'a HashMap<String, (String, String)>,
+    ) -> ExpressionContext<'a> {
+        ExpressionContext {
+            env_context: &EMPTY_ENV,
+            step_outputs,
+            matrix_combination: &EMPTY_MATRIX,
+            step_statuses,
+            job_status: "success",
+            secrets_context: &EMPTY_SECRETS,
+            needs_context: &EMPTY_NEEDS,
+            needs_results: &EMPTY_NEEDS_RESULTS,
+        }
+    }
+
+    #[test]
+    fn tojson_steps_returns_nested_object() {
+        let mut outputs = HashMap::new();
+        let mut build_out = HashMap::new();
+        build_out.insert("artifact".to_string(), "app.zip".to_string());
+        build_out.insert("version".to_string(), "1.2.3".to_string());
+        outputs.insert("build".to_string(), build_out);
+
+        let mut test_out = HashMap::new();
+        test_out.insert("passed".to_string(), "true".to_string());
+        outputs.insert("test".to_string(), test_out);
+
+        let mut statuses = HashMap::new();
+        statuses.insert("build".to_string(), ("success".to_string(), "success".to_string()));
+        statuses.insert("test".to_string(), ("failure".to_string(), "failure".to_string()));
+
+        let ctx = make_steps_ctx(&outputs, &statuses);
+        let result = evaluate("toJSON(steps)", &ctx).unwrap();
+        let s = result.to_output_string();
+        let parsed: serde_json::Value = serde_json::from_str(&s).expect("should be valid JSON");
+        let obj = parsed.as_object().expect("should be a JSON object");
+
+        // Check build step
+        let build = obj.get("build").unwrap().as_object().unwrap();
+        assert_eq!(build.get("outcome").unwrap(), "success");
+        assert_eq!(build.get("conclusion").unwrap(), "success");
+        let build_outputs = build.get("outputs").unwrap().as_object().unwrap();
+        assert_eq!(build_outputs.get("artifact").unwrap(), "app.zip");
+        assert_eq!(build_outputs.get("version").unwrap(), "1.2.3");
+
+        // Check test step
+        let test = obj.get("test").unwrap().as_object().unwrap();
+        assert_eq!(test.get("outcome").unwrap(), "failure");
+        assert_eq!(test.get("conclusion").unwrap(), "failure");
+        let test_outputs = test.get("outputs").unwrap().as_object().unwrap();
+        assert_eq!(test_outputs.get("passed").unwrap(), "true");
+    }
+
+    #[test]
+    fn tojson_steps_empty_context() {
+        let outputs = HashMap::new();
+        let statuses = HashMap::new();
+        let ctx = make_steps_ctx(&outputs, &statuses);
+        let result = evaluate("toJSON(steps)", &ctx).unwrap();
+        let s = result.to_output_string();
+        let parsed: serde_json::Value = serde_json::from_str(&s).expect("should be valid JSON");
+        let obj = parsed.as_object().expect("should be a JSON object");
+        assert!(obj.is_empty(), "should be empty with no steps: {}", s);
+    }
+
+    #[test]
+    fn tojson_steps_sorted_keys() {
+        let mut statuses = HashMap::new();
+        statuses.insert("zebra".to_string(), ("success".to_string(), "success".to_string()));
+        statuses.insert("alpha".to_string(), ("success".to_string(), "success".to_string()));
+        statuses.insert("middle".to_string(), ("success".to_string(), "success".to_string()));
+        let ctx = make_steps_ctx(&EMPTY_STEPS, &statuses);
+        let result = evaluate("toJSON(steps)", &ctx).unwrap();
+        let s = result.to_output_string();
+        let alpha_pos = s.find("alpha").unwrap();
+        let middle_pos = s.find("middle").unwrap();
+        let zebra_pos = s.find("zebra").unwrap();
+        assert!(alpha_pos < middle_pos, "alpha should come before middle");
+        assert!(middle_pos < zebra_pos, "middle should come before zebra");
+    }
+
+    #[test]
+    fn tojson_steps_status_without_outputs() {
+        let mut statuses = HashMap::new();
+        statuses.insert("checkout".to_string(), ("success".to_string(), "success".to_string()));
+        let ctx = make_steps_ctx(&EMPTY_STEPS, &statuses);
+        let result = evaluate("toJSON(steps)", &ctx).unwrap();
+        let s = result.to_output_string();
+        let parsed: serde_json::Value = serde_json::from_str(&s).expect("should be valid JSON");
+        let checkout = parsed.get("checkout").unwrap().as_object().unwrap();
+        assert_eq!(checkout.get("outcome").unwrap(), "success");
+        assert_eq!(checkout.get("conclusion").unwrap(), "success");
+        let outputs = checkout.get("outputs").unwrap().as_object().unwrap();
+        assert!(outputs.is_empty(), "outputs should be empty: {:?}", outputs);
+    }
+
+    #[test]
+    fn tojson_steps_outputs_without_status() {
+        // Edge case: step has outputs but no recorded status yet.
+        let mut outputs = HashMap::new();
+        let mut step_out = HashMap::new();
+        step_out.insert("result".to_string(), "42".to_string());
+        outputs.insert("compute".to_string(), step_out);
+        let statuses = HashMap::new();
+        let ctx = make_steps_ctx(&outputs, &statuses);
+        let result = evaluate("toJSON(steps)", &ctx).unwrap();
+        let s = result.to_output_string();
+        let parsed: serde_json::Value = serde_json::from_str(&s).expect("should be valid JSON");
+        let compute = parsed.get("compute").unwrap().as_object().unwrap();
+        // No outcome/conclusion fields when status is absent
+        assert!(compute.get("outcome").is_none(), "should have no outcome");
+        assert!(compute.get("conclusion").is_none(), "should have no conclusion");
+        let out = compute.get("outputs").unwrap().as_object().unwrap();
+        assert_eq!(out.get("result").unwrap(), "42");
+    }
+
+    #[test]
+    fn bare_steps_is_truthy() {
+        let mut statuses = HashMap::new();
+        statuses.insert("build".to_string(), ("success".to_string(), "success".to_string()));
+        let ctx = make_steps_ctx(&EMPTY_STEPS, &statuses);
+        let result = evaluate("steps", &ctx).unwrap();
+        assert!(result.is_truthy());
+    }
+
+    #[test]
+    fn tojson_steps_special_characters_in_outputs() {
+        let mut outputs = HashMap::new();
+        let mut step_out = HashMap::new();
+        step_out.insert("msg".to_string(), "he said \"hi\"".to_string());
+        step_out.insert("path".to_string(), "C:\\Users\\dev".to_string());
+        step_out.insert("emoji".to_string(), "\u{1F680}".to_string());
+        outputs.insert("deploy".to_string(), step_out);
+        let mut statuses = HashMap::new();
+        statuses.insert("deploy".to_string(), ("success".to_string(), "success".to_string()));
+        let ctx = make_steps_ctx(&outputs, &statuses);
+        let result = evaluate("toJSON(steps)", &ctx).unwrap();
+        let s = result.to_output_string();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&s).expect("should be valid JSON despite special chars");
+        let deploy_outputs = parsed
+            .get("deploy")
+            .unwrap()
+            .get("outputs")
+            .unwrap()
+            .as_object()
+            .unwrap();
+        assert_eq!(deploy_outputs.get("msg").unwrap(), "he said \"hi\"");
+        assert_eq!(deploy_outputs.get("path").unwrap(), "C:\\Users\\dev");
+        assert_eq!(deploy_outputs.get("emoji").unwrap(), "\u{1F680}");
     }
 
     #[test]

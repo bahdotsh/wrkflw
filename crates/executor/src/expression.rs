@@ -8,7 +8,7 @@
 //! `success`, `failure`, `always`, `cancelled`).
 
 use serde_yaml::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 // serde_json is used by toJSON() for robust string escaping.
 use serde_json;
@@ -426,8 +426,7 @@ impl<'a> ExpressionContext<'a> {
             // TODO: support other bare contexts: github, secrets, matrix, needs
             "steps" if parts.len() == 1 => {
                 // Collect all step IDs from both outputs and statuses maps.
-                let mut all_ids: std::collections::HashSet<&String> =
-                    self.step_outputs.keys().collect();
+                let mut all_ids: HashSet<&String> = self.step_outputs.keys().collect();
                 all_ids.extend(self.step_statuses.keys());
 
                 let mut map = HashMap::new();
@@ -448,10 +447,7 @@ impl<'a> ExpressionContext<'a> {
 
                     // outcome + conclusion (only present if the step has a status)
                     if let Some((outcome, conclusion)) = self.step_statuses.get(step_id) {
-                        step_obj.insert(
-                            "outcome".to_string(),
-                            ExprValue::String(outcome.clone()),
-                        );
+                        step_obj.insert("outcome".to_string(), ExprValue::String(outcome.clone()));
                         step_obj.insert(
                             "conclusion".to_string(),
                             ExprValue::String(conclusion.clone()),
@@ -1674,8 +1670,14 @@ mod tests {
         outputs.insert("test".to_string(), test_out);
 
         let mut statuses = HashMap::new();
-        statuses.insert("build".to_string(), ("success".to_string(), "success".to_string()));
-        statuses.insert("test".to_string(), ("failure".to_string(), "failure".to_string()));
+        statuses.insert(
+            "build".to_string(),
+            ("success".to_string(), "success".to_string()),
+        );
+        statuses.insert(
+            "test".to_string(),
+            ("failure".to_string(), "failure".to_string()),
+        );
 
         let ctx = make_steps_ctx(&outputs, &statuses);
         let result = evaluate("toJSON(steps)", &ctx).unwrap();
@@ -1714,9 +1716,18 @@ mod tests {
     #[test]
     fn tojson_steps_sorted_keys() {
         let mut statuses = HashMap::new();
-        statuses.insert("zebra".to_string(), ("success".to_string(), "success".to_string()));
-        statuses.insert("alpha".to_string(), ("success".to_string(), "success".to_string()));
-        statuses.insert("middle".to_string(), ("success".to_string(), "success".to_string()));
+        statuses.insert(
+            "zebra".to_string(),
+            ("success".to_string(), "success".to_string()),
+        );
+        statuses.insert(
+            "alpha".to_string(),
+            ("success".to_string(), "success".to_string()),
+        );
+        statuses.insert(
+            "middle".to_string(),
+            ("success".to_string(), "success".to_string()),
+        );
         let ctx = make_steps_ctx(&EMPTY_STEPS, &statuses);
         let result = evaluate("toJSON(steps)", &ctx).unwrap();
         let s = result.to_output_string();
@@ -1730,7 +1741,10 @@ mod tests {
     #[test]
     fn tojson_steps_status_without_outputs() {
         let mut statuses = HashMap::new();
-        statuses.insert("checkout".to_string(), ("success".to_string(), "success".to_string()));
+        statuses.insert(
+            "checkout".to_string(),
+            ("success".to_string(), "success".to_string()),
+        );
         let ctx = make_steps_ctx(&EMPTY_STEPS, &statuses);
         let result = evaluate("toJSON(steps)", &ctx).unwrap();
         let s = result.to_output_string();
@@ -1757,7 +1771,10 @@ mod tests {
         let compute = parsed.get("compute").unwrap().as_object().unwrap();
         // No outcome/conclusion fields when status is absent
         assert!(compute.get("outcome").is_none(), "should have no outcome");
-        assert!(compute.get("conclusion").is_none(), "should have no conclusion");
+        assert!(
+            compute.get("conclusion").is_none(),
+            "should have no conclusion"
+        );
         let out = compute.get("outputs").unwrap().as_object().unwrap();
         assert_eq!(out.get("result").unwrap(), "42");
     }
@@ -1765,7 +1782,10 @@ mod tests {
     #[test]
     fn bare_steps_is_truthy() {
         let mut statuses = HashMap::new();
-        statuses.insert("build".to_string(), ("success".to_string(), "success".to_string()));
+        statuses.insert(
+            "build".to_string(),
+            ("success".to_string(), "success".to_string()),
+        );
         let ctx = make_steps_ctx(&EMPTY_STEPS, &statuses);
         let result = evaluate("steps", &ctx).unwrap();
         assert!(result.is_truthy());
@@ -1780,7 +1800,10 @@ mod tests {
         step_out.insert("emoji".to_string(), "\u{1F680}".to_string());
         outputs.insert("deploy".to_string(), step_out);
         let mut statuses = HashMap::new();
-        statuses.insert("deploy".to_string(), ("success".to_string(), "success".to_string()));
+        statuses.insert(
+            "deploy".to_string(),
+            ("success".to_string(), "success".to_string()),
+        );
         let ctx = make_steps_ctx(&outputs, &statuses);
         let result = evaluate("toJSON(steps)", &ctx).unwrap();
         let s = result.to_output_string();

@@ -163,7 +163,7 @@ impl SecretMasker {
                         .iter()
                         .map(|(k, v)| (k.clone(), v.clone()))
                         .collect();
-                    p.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+                    p.sort_by_key(|pair| std::cmp::Reverse(pair.0.len()));
                     data.sorted_pairs = Some(Arc::new(p));
                 }
                 Arc::clone(data.sorted_pairs.as_ref().unwrap())

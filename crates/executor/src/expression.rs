@@ -516,8 +516,7 @@ impl<'a> ExpressionContext<'a> {
                     .env_context
                     .iter()
                     .filter_map(|(k, v)| {
-                        github_context_suffix(k)
-                            .map(|key| (key, ExprValue::String(v.clone())))
+                        github_context_suffix(k).map(|key| (key, ExprValue::String(v.clone())))
                     })
                     .collect();
                 ExprValue::Object(map)

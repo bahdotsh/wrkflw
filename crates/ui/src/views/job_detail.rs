@@ -97,7 +97,7 @@ pub fn render_job_detail_view(f: &mut Frame<'_>, app: &mut App, area: Rect) {
                     let steps_table = Table::new(rows, widths)
                         .header(header)
                         .block(theme::block("Steps"))
-                        .highlight_style(theme::selected_style())
+                        .row_highlight_style(theme::selected_style())
                         .highlight_symbol(theme::symbols::SELECTED);
 
                     f.render_stateful_widget(steps_table, chunks[1], &mut app.step_table_state);

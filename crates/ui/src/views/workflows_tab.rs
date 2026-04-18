@@ -117,7 +117,7 @@ fn render_workflow_list(f: &mut Frame<'_>, app: &mut App, area: Rect) {
     let workflows_table = Table::new(rows, widths)
         .header(header)
         .block(theme::block(&block_title))
-        .highlight_style(theme::selected_style())
+        .row_highlight_style(theme::selected_style())
         .highlight_symbol(theme::symbols::SELECTED);
 
     let mut table_state = TableState::default();
@@ -167,7 +167,7 @@ fn render_job_selection(f: &mut Frame<'_>, app: &mut App, area: Rect) {
     let jobs_table = Table::new(rows, widths)
         .header(header)
         .block(theme::block(&block_title))
-        .highlight_style(theme::selected_style())
+        .row_highlight_style(theme::selected_style())
         .highlight_symbol(theme::symbols::SELECTED);
 
     let mut table_state = TableState::default();

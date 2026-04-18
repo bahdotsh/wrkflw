@@ -114,7 +114,7 @@ pub fn render_logs_tab(f: &mut Frame<'_>, app: &App, area: Rect) {
     let log_table = Table::new(rows, widths)
         .header(header)
         .block(theme::block(&log_title))
-        .highlight_style(theme::selected_style());
+        .row_highlight_style(theme::selected_style());
 
     let mut log_table_state = TableState::default();
 

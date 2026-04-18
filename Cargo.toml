@@ -52,7 +52,7 @@ thiserror = "1.0"
 log = "0.4"
 which = "4.4"
 crossterm = "0.28"
-ratatui = { version = "0.28", features = ["crossterm"] }
+ratatui = { version = "0.30", features = ["crossterm", "layout-cache"] }
 once_cell = "1.19.0"
 itertools = "0.11.0"
 indexmap = { version = "2.0.0", features = ["serde"] }

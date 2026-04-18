@@ -423,7 +423,7 @@ impl<'a> ExpressionContext<'a> {
                 .unwrap_or(ExprValue::Null),
             // Bare context names — return the whole context as an Object so that
             // `toJSON(env)` (and similar) can serialise it.
-            // TODO: support other bare contexts: github, secrets, matrix, needs
+            // TODO: support other bare contexts: github, secrets, matrix
             "steps" if parts.len() == 1 => {
                 // Collect all step IDs from both outputs and statuses maps.
                 let mut all_ids: HashSet<&String> = self.step_outputs.keys().collect();
@@ -465,6 +465,36 @@ impl<'a> ExpressionContext<'a> {
                     .filter(|(k, _)| is_user_env_var(k))
                     .map(|(k, v)| (k.clone(), ExprValue::String(v.clone())))
                     .collect();
+                ExprValue::Object(map)
+            }
+            "needs" if parts.len() == 1 => {
+                // Collect all job IDs from both outputs and results maps.
+                let mut all_ids: HashSet<&String> = self.needs_context.keys().collect();
+                all_ids.extend(self.needs_results.keys());
+
+                let mut map = HashMap::new();
+                for job_id in all_ids {
+                    let mut job_obj = HashMap::new();
+
+                    // outputs sub-object (empty if no outputs recorded)
+                    let outputs_map: HashMap<String, ExprValue> = self
+                        .needs_context
+                        .get(job_id)
+                        .map(|m| {
+                            m.iter()
+                                .map(|(k, v)| (k.clone(), ExprValue::String(v.clone())))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    job_obj.insert("outputs".to_string(), ExprValue::Object(outputs_map));
+
+                    // result (only present if the job has a recorded result)
+                    if let Some(result) = self.needs_results.get(job_id) {
+                        job_obj.insert("result".to_string(), ExprValue::String(result.clone()));
+                    }
+
+                    map.insert(job_id.clone(), ExprValue::Object(job_obj));
+                }
                 ExprValue::Object(map)
             }
             _ => ExprValue::Null,
@@ -1806,6 +1836,157 @@ mod tests {
         );
         let ctx = make_steps_ctx(&outputs, &statuses);
         let result = evaluate("toJSON(steps)", &ctx).unwrap();
+        let s = result.to_output_string();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&s).expect("should be valid JSON despite special chars");
+        let deploy_outputs = parsed
+            .get("deploy")
+            .unwrap()
+            .get("outputs")
+            .unwrap()
+            .as_object()
+            .unwrap();
+        assert_eq!(deploy_outputs.get("msg").unwrap(), "he said \"hi\"");
+        assert_eq!(deploy_outputs.get("path").unwrap(), "C:\\Users\\dev");
+        assert_eq!(deploy_outputs.get("emoji").unwrap(), "\u{1F680}");
+    }
+
+    // -- toJSON(needs) tests --
+
+    /// Helper to build an ExpressionContext with needs data.
+    fn make_needs_ctx<'a>(
+        needs_context: &'a HashMap<String, HashMap<String, String>>,
+        needs_results: &'a HashMap<String, String>,
+    ) -> ExpressionContext<'a> {
+        ExpressionContext {
+            env_context: &EMPTY_ENV,
+            step_outputs: &EMPTY_STEPS,
+            matrix_combination: &EMPTY_MATRIX,
+            step_statuses: &EMPTY_STATUSES,
+            job_status: "success",
+            secrets_context: &EMPTY_SECRETS,
+            needs_context,
+            needs_results,
+        }
+    }
+
+    #[test]
+    fn tojson_needs_returns_nested_object() {
+        let mut needs_ctx = HashMap::new();
+        let mut build_out = HashMap::new();
+        build_out.insert("artifact".to_string(), "app.zip".to_string());
+        build_out.insert("version".to_string(), "1.2.3".to_string());
+        needs_ctx.insert("build".to_string(), build_out);
+
+        let mut test_out = HashMap::new();
+        test_out.insert("passed".to_string(), "true".to_string());
+        needs_ctx.insert("test".to_string(), test_out);
+
+        let mut needs_res = HashMap::new();
+        needs_res.insert("build".to_string(), "success".to_string());
+        needs_res.insert("test".to_string(), "failure".to_string());
+
+        let ctx = make_needs_ctx(&needs_ctx, &needs_res);
+        let result = evaluate("toJSON(needs)", &ctx).unwrap();
+        let s = result.to_output_string();
+        let parsed: serde_json::Value = serde_json::from_str(&s).expect("should be valid JSON");
+        let obj = parsed.as_object().expect("should be a JSON object");
+
+        // Check build job
+        let build = obj.get("build").unwrap().as_object().unwrap();
+        assert_eq!(build.get("result").unwrap(), "success");
+        let build_outputs = build.get("outputs").unwrap().as_object().unwrap();
+        assert_eq!(build_outputs.get("artifact").unwrap(), "app.zip");
+        assert_eq!(build_outputs.get("version").unwrap(), "1.2.3");
+
+        // Check test job
+        let test = obj.get("test").unwrap().as_object().unwrap();
+        assert_eq!(test.get("result").unwrap(), "failure");
+        let test_outputs = test.get("outputs").unwrap().as_object().unwrap();
+        assert_eq!(test_outputs.get("passed").unwrap(), "true");
+    }
+
+    #[test]
+    fn tojson_needs_empty_context() {
+        let needs_ctx = HashMap::new();
+        let needs_res = HashMap::new();
+        let ctx = make_needs_ctx(&needs_ctx, &needs_res);
+        let result = evaluate("toJSON(needs)", &ctx).unwrap();
+        let s = result.to_output_string();
+        let parsed: serde_json::Value = serde_json::from_str(&s).expect("should be valid JSON");
+        let obj = parsed.as_object().expect("should be a JSON object");
+        assert!(obj.is_empty(), "should be empty with no needs: {}", s);
+    }
+
+    #[test]
+    fn tojson_needs_sorted_keys() {
+        let mut needs_res = HashMap::new();
+        needs_res.insert("zebra".to_string(), "success".to_string());
+        needs_res.insert("alpha".to_string(), "success".to_string());
+        needs_res.insert("middle".to_string(), "success".to_string());
+        let ctx = make_needs_ctx(&EMPTY_NEEDS, &needs_res);
+        let result = evaluate("toJSON(needs)", &ctx).unwrap();
+        let s = result.to_output_string();
+        let alpha_pos = s.find("alpha").unwrap();
+        let middle_pos = s.find("middle").unwrap();
+        let zebra_pos = s.find("zebra").unwrap();
+        assert!(alpha_pos < middle_pos, "alpha should come before middle");
+        assert!(middle_pos < zebra_pos, "middle should come before zebra");
+    }
+
+    #[test]
+    fn tojson_needs_result_without_outputs() {
+        let mut needs_res = HashMap::new();
+        needs_res.insert("lint".to_string(), "success".to_string());
+        let ctx = make_needs_ctx(&EMPTY_NEEDS, &needs_res);
+        let result = evaluate("toJSON(needs)", &ctx).unwrap();
+        let s = result.to_output_string();
+        let parsed: serde_json::Value = serde_json::from_str(&s).expect("should be valid JSON");
+        let lint = parsed.get("lint").unwrap().as_object().unwrap();
+        assert_eq!(lint.get("result").unwrap(), "success");
+        let outputs = lint.get("outputs").unwrap().as_object().unwrap();
+        assert!(outputs.is_empty(), "outputs should be empty: {:?}", outputs);
+    }
+
+    #[test]
+    fn tojson_needs_outputs_without_result() {
+        // Edge case: needs entry has outputs but no recorded result yet.
+        let mut needs_ctx = HashMap::new();
+        let mut job_out = HashMap::new();
+        job_out.insert("value".to_string(), "42".to_string());
+        needs_ctx.insert("compute".to_string(), job_out);
+        let needs_res = HashMap::new();
+        let ctx = make_needs_ctx(&needs_ctx, &needs_res);
+        let result = evaluate("toJSON(needs)", &ctx).unwrap();
+        let s = result.to_output_string();
+        let parsed: serde_json::Value = serde_json::from_str(&s).expect("should be valid JSON");
+        let compute = parsed.get("compute").unwrap().as_object().unwrap();
+        assert!(compute.get("result").is_none(), "should have no result");
+        let out = compute.get("outputs").unwrap().as_object().unwrap();
+        assert_eq!(out.get("value").unwrap(), "42");
+    }
+
+    #[test]
+    fn bare_needs_is_truthy() {
+        let mut needs_res = HashMap::new();
+        needs_res.insert("build".to_string(), "success".to_string());
+        let ctx = make_needs_ctx(&EMPTY_NEEDS, &needs_res);
+        let result = evaluate("needs", &ctx).unwrap();
+        assert!(result.is_truthy());
+    }
+
+    #[test]
+    fn tojson_needs_special_characters_in_outputs() {
+        let mut needs_ctx = HashMap::new();
+        let mut job_out = HashMap::new();
+        job_out.insert("msg".to_string(), "he said \"hi\"".to_string());
+        job_out.insert("path".to_string(), "C:\\Users\\dev".to_string());
+        job_out.insert("emoji".to_string(), "\u{1F680}".to_string());
+        needs_ctx.insert("deploy".to_string(), job_out);
+        let mut needs_res = HashMap::new();
+        needs_res.insert("deploy".to_string(), "success".to_string());
+        let ctx = make_needs_ctx(&needs_ctx, &needs_res);
+        let result = evaluate("toJSON(needs)", &ctx).unwrap();
         let s = result.to_output_string();
         let parsed: serde_json::Value =
             serde_json::from_str(&s).expect("should be valid JSON despite special chars");

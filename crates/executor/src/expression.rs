@@ -423,7 +423,7 @@ impl<'a> ExpressionContext<'a> {
                 .unwrap_or(ExprValue::Null),
             // Bare context names — return the whole context as an Object so that
             // `toJSON(env)` (and similar) can serialise it.
-            // TODO: support other bare contexts: github, secrets, matrix
+            // TODO: support other bare contexts: secrets, matrix
             "steps" if parts.len() == 1 => {
                 // Collect all step IDs from both outputs and statuses maps.
                 let mut all_ids: HashSet<&String> = self.step_outputs.keys().collect();
@@ -464,6 +464,23 @@ impl<'a> ExpressionContext<'a> {
                     .iter()
                     .filter(|(k, _)| is_user_env_var(k))
                     .map(|(k, v)| (k.clone(), ExprValue::String(v.clone())))
+                    .collect();
+                ExprValue::Object(map)
+            }
+            "github" if parts.len() == 1 => {
+                // Build a flat object from GITHUB_* env vars by stripping the
+                // prefix and lowercasing the remainder, inverting the dotted-access
+                // mapping (`github.sha` → `GITHUB_SHA`). Does not include a nested
+                // `event` sub-object — that's the same documented limitation as the
+                // dotted-access arm above.
+                let map = self
+                    .env_context
+                    .iter()
+                    .filter(|(k, _)| k.starts_with("GITHUB_"))
+                    .map(|(k, v)| {
+                        let key = k.strip_prefix("GITHUB_").unwrap_or(k).to_lowercase();
+                        (key, ExprValue::String(v.clone()))
+                    })
                     .collect();
                 ExprValue::Object(map)
             }
@@ -1666,6 +1683,152 @@ mod tests {
         assert_eq!(obj.get("NEWLINE").unwrap(), "line1\nline2");
         assert_eq!(obj.get("UNICODE").unwrap(), "\u{1F600}");
         assert_eq!(obj.get("BACKSLASH").unwrap(), "path\\to\\file");
+    }
+
+    // -- toJSON(github) tests --
+
+    #[test]
+    fn tojson_github_returns_object() {
+        let mut env = HashMap::new();
+        env.insert("GITHUB_SHA".to_string(), "abc123".to_string());
+        env.insert("GITHUB_REF".to_string(), "refs/heads/main".to_string());
+        env.insert("GITHUB_REPOSITORY".to_string(), "owner/repo".to_string());
+        // Unrelated vars should NOT appear in github object
+        env.insert("MY_VAR".to_string(), "hello".to_string());
+        env.insert("RUNNER_OS".to_string(), "Linux".to_string());
+        env.insert("INPUT_NAME".to_string(), "test".to_string());
+        let ctx = make_ctx(&env, &EMPTY_STEPS, &EMPTY_MATRIX);
+        let result = evaluate("toJSON(github)", &ctx).unwrap();
+        let s = result.to_output_string();
+        let parsed: serde_json::Value = serde_json::from_str(&s).expect("should be valid JSON");
+        let obj = parsed.as_object().expect("should be a JSON object");
+        assert_eq!(obj.get("sha").unwrap(), "abc123");
+        assert_eq!(obj.get("ref").unwrap(), "refs/heads/main");
+        assert_eq!(obj.get("repository").unwrap(), "owner/repo");
+        assert!(
+            obj.get("MY_VAR").is_none(),
+            "should exclude non-GITHUB vars"
+        );
+        assert!(
+            obj.get("RUNNER_OS").is_none(),
+            "should exclude RUNNER_ vars"
+        );
+        assert!(
+            obj.get("INPUT_NAME").is_none(),
+            "should exclude INPUT_ vars"
+        );
+    }
+
+    #[test]
+    fn tojson_github_empty_context() {
+        let env = HashMap::new();
+        let ctx = make_ctx(&env, &EMPTY_STEPS, &EMPTY_MATRIX);
+        let result = evaluate("toJSON(github)", &ctx).unwrap();
+        let s = result.to_output_string();
+        let parsed: serde_json::Value = serde_json::from_str(&s).expect("should be valid JSON");
+        let obj = parsed.as_object().expect("should be a JSON object");
+        assert!(obj.is_empty(), "should be empty with no env vars: {}", s);
+    }
+
+    #[test]
+    fn tojson_github_no_github_prefix() {
+        let mut env = HashMap::new();
+        env.insert("MY_VAR".to_string(), "hello".to_string());
+        env.insert("CI".to_string(), "true".to_string());
+        env.insert("RUNNER_OS".to_string(), "Linux".to_string());
+        let ctx = make_ctx(&env, &EMPTY_STEPS, &EMPTY_MATRIX);
+        let result = evaluate("toJSON(github)", &ctx).unwrap();
+        let s = result.to_output_string();
+        let parsed: serde_json::Value = serde_json::from_str(&s).expect("should be valid JSON");
+        let obj = parsed.as_object().expect("should be a JSON object");
+        assert!(
+            obj.is_empty(),
+            "should be empty when no GITHUB_* vars exist: {}",
+            s
+        );
+    }
+
+    #[test]
+    fn tojson_github_sorted_keys() {
+        let mut env = HashMap::new();
+        env.insert("GITHUB_ZEBRA".to_string(), "z".to_string());
+        env.insert("GITHUB_APPLE".to_string(), "a".to_string());
+        env.insert("GITHUB_MANGO".to_string(), "m".to_string());
+        let ctx = make_ctx(&env, &EMPTY_STEPS, &EMPTY_MATRIX);
+        let result = evaluate("toJSON(github)", &ctx).unwrap();
+        let s = result.to_output_string();
+        // Keys appear stripped + lowercased, in alphabetical order
+        let apple_pos = s.find("apple").unwrap();
+        let mango_pos = s.find("mango").unwrap();
+        let zebra_pos = s.find("zebra").unwrap();
+        assert!(apple_pos < mango_pos, "apple should come before mango");
+        assert!(mango_pos < zebra_pos, "mango should come before zebra");
+    }
+
+    #[test]
+    fn bare_github_is_truthy() {
+        let mut env = HashMap::new();
+        env.insert("GITHUB_SHA".to_string(), "abc123".to_string());
+        let ctx = make_ctx(&env, &EMPTY_STEPS, &EMPTY_MATRIX);
+        // `github` alone should be truthy (it's an object)
+        let result = evaluate("github", &ctx).unwrap();
+        assert!(result.is_truthy());
+    }
+
+    #[test]
+    fn tojson_github_preserves_dotted_access() {
+        // Regression guard: adding the bare-github arm must not shadow the
+        // existing dotted-access arm (`github.sha` → GITHUB_SHA).
+        let mut env = HashMap::new();
+        env.insert("GITHUB_SHA".to_string(), "abc123".to_string());
+        let ctx = make_ctx(&env, &EMPTY_STEPS, &EMPTY_MATRIX);
+
+        // Dotted access still works.
+        let dotted = evaluate("github.sha", &ctx).unwrap();
+        assert_eq!(dotted.to_output_string(), "abc123");
+
+        // Bare access returns the full object.
+        let bare = evaluate("toJSON(github)", &ctx).unwrap();
+        let s = bare.to_output_string();
+        let parsed: serde_json::Value = serde_json::from_str(&s).expect("should be valid JSON");
+        assert_eq!(parsed.get("sha").unwrap(), "abc123");
+    }
+
+    #[test]
+    fn tojson_github_special_characters_in_values() {
+        let mut env = HashMap::new();
+        env.insert(
+            "GITHUB_EVENT_HEAD_COMMIT_MESSAGE".to_string(),
+            "he said \"hi\"\nnew line".to_string(),
+        );
+        env.insert("GITHUB_WORKSPACE".to_string(), "C:\\Users\\dev".to_string());
+        env.insert("GITHUB_ACTOR".to_string(), "\u{1F600}".to_string());
+        let ctx = make_ctx(&env, &EMPTY_STEPS, &EMPTY_MATRIX);
+        let result = evaluate("toJSON(github)", &ctx).unwrap();
+        let s = result.to_output_string();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&s).expect("should be valid JSON despite special chars");
+        let obj = parsed.as_object().expect("should be a JSON object");
+        assert_eq!(
+            obj.get("event_head_commit_message").unwrap(),
+            "he said \"hi\"\nnew line"
+        );
+        assert_eq!(obj.get("workspace").unwrap(), "C:\\Users\\dev");
+        assert_eq!(obj.get("actor").unwrap(), "\u{1F600}");
+    }
+
+    #[test]
+    fn fromjson_tojson_github_produces_parseable_json() {
+        let mut env = HashMap::new();
+        env.insert("GITHUB_SHA".to_string(), "abc123".to_string());
+        env.insert("GITHUB_REF".to_string(), "refs/heads/main".to_string());
+        let ctx = make_ctx(&env, &EMPTY_STEPS, &EMPTY_MATRIX);
+        let result = evaluate("fromJSON(toJSON(github))", &ctx).unwrap();
+        let s = result.to_output_string();
+        let parsed: serde_json::Value = serde_json::from_str(&s).expect("should be valid JSON");
+        let obj = parsed.as_object().expect("should be a JSON object");
+        assert_eq!(obj.get("sha").unwrap(), "abc123");
+        assert_eq!(obj.get("ref").unwrap(), "refs/heads/main");
     }
 
     // -- toJSON(steps) tests --

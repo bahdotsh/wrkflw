@@ -144,6 +144,7 @@ pub fn read_step_environment_updates(job_env: &HashMap<String, String>) -> StepE
 /// - Clears per-step files so the next step starts fresh
 pub fn apply_step_environment_updates(
     job_env: &mut HashMap<String, String>,
+    job_user_env: &mut HashMap<String, String>,
     step_outputs_map: &mut HashMap<String, HashMap<String, String>>,
     step_id: Option<&str>,
 ) {
@@ -154,8 +155,13 @@ pub fn apply_step_environment_updates(
         step_outputs_map.insert(id.to_string(), updates.outputs);
     }
 
-    // Merge GITHUB_ENV entries into job_env for subsequent steps
+    // Merge GITHUB_ENV entries into job_env for subsequent steps.
+    // These are user-declared by definition (the step wrote them via
+    // `echo KEY=VAL >> $GITHUB_ENV`), so mirror into job_user_env too.
+    // GITHUB_PATH updates below modify PATH in job_env only — PATH is not
+    // a user-declared env var and must not leak into toJSON(env).
     for (k, v) in updates.env_vars {
+        job_user_env.insert(k.clone(), v.clone());
         job_env.insert(k, v);
     }
 
@@ -414,8 +420,14 @@ mod tests {
         job_env.insert("PATH".to_string(), "/usr/bin".to_string());
 
         let mut step_outputs_map = HashMap::new();
+        let mut job_user_env = HashMap::new();
 
-        apply_step_environment_updates(&mut job_env, &mut step_outputs_map, Some("build"));
+        apply_step_environment_updates(
+            &mut job_env,
+            &mut job_user_env,
+            &mut step_outputs_map,
+            Some("build"),
+        );
 
         // Step outputs stored under step ID
         assert_eq!(
@@ -428,8 +440,15 @@ mod tests {
         );
         // Env merged
         assert_eq!(job_env.get("CC").unwrap(), "gcc");
+        // $GITHUB_ENV writes must mirror into user_env
+        assert_eq!(job_user_env.get("CC").unwrap(), "gcc");
         // Path prepended
         assert_eq!(job_env.get("PATH").unwrap(), "/opt/gcc/bin:/usr/bin");
+        // PATH updates from $GITHUB_PATH must NOT appear in user_env
+        assert!(
+            !job_user_env.contains_key("PATH"),
+            "PATH should not leak into user_env"
+        );
         // Files cleared for next step
         assert!(fs::read_to_string(github_dir.join("output"))
             .unwrap()
@@ -468,19 +487,30 @@ mod tests {
         job_env.insert("PATH".to_string(), "/usr/bin".to_string());
 
         let mut step_outputs_map = HashMap::new();
+        let mut job_user_env = HashMap::new();
 
         // Step 1 writes /opt/tool to GITHUB_PATH
         fs::write(&output_path, "").unwrap();
         fs::write(&env_path, "").unwrap();
         fs::write(&path_path, "/opt/tool\n").unwrap();
-        apply_step_environment_updates(&mut job_env, &mut step_outputs_map, None);
+        apply_step_environment_updates(
+            &mut job_env,
+            &mut job_user_env,
+            &mut step_outputs_map,
+            None,
+        );
         assert_eq!(job_env.get("PATH").unwrap(), "/opt/tool:/usr/bin");
 
         // Step 2 writes /opt/other to GITHUB_PATH
         fs::write(&output_path, "").unwrap();
         fs::write(&env_path, "").unwrap();
         fs::write(&path_path, "/opt/other\n").unwrap();
-        apply_step_environment_updates(&mut job_env, &mut step_outputs_map, None);
+        apply_step_environment_updates(
+            &mut job_env,
+            &mut job_user_env,
+            &mut step_outputs_map,
+            None,
+        );
 
         // /opt/tool should appear exactly once (not duplicated)
         let path = job_env.get("PATH").unwrap();

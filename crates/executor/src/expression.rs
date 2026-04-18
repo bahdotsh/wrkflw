@@ -278,27 +278,6 @@ impl<'a> Tokenizer<'a> {
     }
 }
 
-/// Returns `true` if this env-var key belongs to the user-defined `env:` context
-/// rather than an internal variable injected by the executor/runner.
-///
-/// KNOWN LIMITATION: Because `env_context` is a single flat HashMap that mixes
-/// user-declared env vars with runner-injected ones, we use a heuristic prefix
-/// filter. This means a user-defined var like `env: { GITHUB_CUSTOM: "val" }`
-/// or the commonly used `env: { GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} }`
-/// will be incorrectly excluded from `toJSON(env)` output. The proper fix is to
-/// separate user env from runner env upstream in ExpressionContext, but that is
-/// a larger refactor tracked separately.
-///
-/// Update this function when new internal prefixes are introduced.
-pub(crate) fn is_user_env_var(key: &str) -> bool {
-    !key.starts_with("GITHUB_")
-        && !key.starts_with("RUNNER_")
-        && !key.starts_with("INPUT_")
-        && !key.starts_with("WRKFLW_")
-        && key != "CI"
-        && key != "MATRIX_CONTEXT" // inserted by add_matrix_context() in environment.rs
-}
-
 /// If `key` is a `GITHUB_*` env var that belongs on GHA's `github.*` expression
 /// context, returns the stripped + lowercased suffix used as the object key
 /// (`GITHUB_SHA` → `"sha"`). Returns `None` for non-`GITHUB_*` keys, the bare

@@ -1,6 +1,7 @@
 // App module for UI state and main TUI entry point
 mod state;
 
+use crate::config;
 use crate::handlers::workflow::start_next_workflow_execution;
 use crate::models::{ExecutionResultMsg, QueuedExecution, Workflow, WorkflowStatus};
 use crate::utils::load_workflows;
@@ -21,13 +22,14 @@ use wrkflw_executor::RuntimeType;
 pub use state::App;
 
 // Main entry point for the TUI interface
-#[allow(clippy::ptr_arg)]
+#[allow(clippy::ptr_arg, clippy::too_many_arguments)]
 pub async fn run_wrkflw_tui(
     path: Option<&PathBuf>,
     runtime_type: RuntimeType,
     verbose: bool,
     preserve_containers_on_failure: bool,
     show_action_messages: bool,
+    theme_override: Option<&str>,
 ) -> io::Result<()> {
     // Terminal setup
     enable_raw_mode()?;
@@ -52,6 +54,10 @@ pub async fn run_wrkflw_tui(
         preserve_containers_on_failure,
         show_action_messages,
     );
+
+    // Resolve theme: CLI --theme > config.toml > default (dark).
+    let cfg = config::Config::load();
+    app.theme = config::resolve_theme(&cfg, theme_override);
 
     if app.validation_mode {
         app.logs.push("Starting in validation mode".to_string());

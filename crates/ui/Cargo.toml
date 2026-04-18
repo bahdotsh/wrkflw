@@ -38,3 +38,5 @@ reqwest = { workspace = true, features = ["json"] }
 regex.workspace = true
 futures.workspace = true
 unicode-width = "0.2"
+toml = "0.8"
+dirs = { workspace = true }

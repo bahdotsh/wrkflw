@@ -265,6 +265,10 @@ enum Commands {
         /// Preserve Docker containers on failure for debugging (Docker mode only)
         #[arg(long)]
         preserve_containers_on_failure: bool,
+
+        /// Theme name: `dark` (default) or `light`. Overrides the config file.
+        #[arg(long)]
+        theme: Option<String>,
     },
 
     /// Trigger a GitHub workflow remotely
@@ -653,6 +657,7 @@ async fn main() {
             runtime,
             show_action_messages,
             preserve_containers_on_failure,
+            theme,
         }) => {
             // Set runtime type based on the runtime choice
             let runtime_type = runtime.clone().into();
@@ -664,6 +669,7 @@ async fn main() {
                 verbose,
                 *preserve_containers_on_failure,
                 *show_action_messages,
+                theme.as_deref(),
             )
             .await
             {
@@ -700,7 +706,7 @@ async fn main() {
 
                 // Call the TUI implementation from the ui crate with default path
                 if let Err(e) =
-                    wrkflw_ui::run_wrkflw_tui(None, runtime_type, verbose, false, false).await
+                    wrkflw_ui::run_wrkflw_tui(None, runtime_type, verbose, false, false, None).await
                 {
                     eprintln!("Error running TUI: {}", e);
                     std::process::exit(1);

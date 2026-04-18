@@ -350,6 +350,14 @@ pub struct ExpressionContext<'a> {
     pub needs_context: &'a HashMap<String, HashMap<String, String>>,
     /// Job results from upstream jobs: `job_name -> "success" | "failure" | "skipped"`.
     pub needs_results: &'a HashMap<String, String>,
+    /// User-declared env vars only (merged workflow/job/step `env:` plus step-authored
+    /// `$GITHUB_ENV` writes). `env_context` holds the union of these and runner-seeded
+    /// vars; `user_env` is the user's slice, consumed by `toJSON(env)` / bare `env`.
+    ///
+    /// Invariant: every key inserted here must have been declared by the user (YAML
+    /// `env:` at any scope, or written to `$GITHUB_ENV` by a step). Runner-seeded
+    /// vars (GITHUB_*, RUNNER_*, INPUT_*, WRKFLW_*, CI, MATRIX_*) must NOT be inserted.
+    pub user_env: &'a HashMap<String, String>,
 }
 
 impl<'a> ExpressionContext<'a> {
@@ -488,10 +496,13 @@ impl<'a> ExpressionContext<'a> {
                 ExprValue::Object(map)
             }
             "env" if parts.len() == 1 => {
+                // Dump only user-declared env vars. `env_context` holds the union
+                // (user + runner-seeded); `user_env` is the user's slice tracked
+                // separately from the construction site downward. See the
+                // `user_env` field doc on `ExpressionContext`.
                 let map = self
-                    .env_context
+                    .user_env
                     .iter()
-                    .filter(|(k, _)| is_user_env_var(k))
                     .map(|(k, v)| (k.clone(), ExprValue::String(v.clone())))
                     .collect();
                 ExprValue::Object(map)
@@ -1065,6 +1076,7 @@ mod tests {
 
     lazy_static::lazy_static! {
         static ref EMPTY_ENV: HashMap<String, String> = HashMap::new();
+        static ref EMPTY_USER_ENV: HashMap<String, String> = HashMap::new();
         static ref EMPTY_STEPS: HashMap<String, HashMap<String, String>> = HashMap::new();
         static ref EMPTY_MATRIX: Option<HashMap<String, Value>> = None;
         static ref EMPTY_STATUSES: HashMap<String, (String, String)> = HashMap::new();
@@ -1083,11 +1095,17 @@ mod tests {
             secrets_context: &EMPTY_SECRETS,
             needs_context: &EMPTY_NEEDS,
             needs_results: &EMPTY_NEEDS_RESULTS,
+            user_env: &EMPTY_USER_ENV,
         }
     }
 
     /// Build an `ExpressionContext` from the fields that vary across tests;
-    /// all other fields default to empty/success.
+    /// all other fields default to empty/success. The `env` map is wired into
+    /// both `env_context` (for dotted `env.X` lookups) AND `user_env` (for
+    /// `toJSON(env)` / bare `env`), so tests that don't distinguish the two
+    /// populations continue to work with a single input map. Tests that need
+    /// to distinguish user-declared from runner-seeded env should construct
+    /// `ExpressionContext` directly.
     fn make_ctx<'a>(
         env: &'a HashMap<String, String>,
         steps: &'a HashMap<String, HashMap<String, String>>,
@@ -1102,6 +1120,7 @@ mod tests {
             secrets_context: &EMPTY_SECRETS,
             needs_context: &EMPTY_NEEDS,
             needs_results: &EMPTY_NEEDS_RESULTS,
+            user_env: env,
         }
     }
 
@@ -1605,15 +1624,27 @@ mod tests {
 
     #[test]
     fn tojson_env_returns_object() {
-        let mut env = HashMap::new();
-        env.insert("MY_VAR".to_string(), "hello".to_string());
-        env.insert("OTHER".to_string(), "world".to_string());
-        // System vars should be excluded from the env object
-        env.insert("GITHUB_SHA".to_string(), "abc123".to_string());
-        env.insert("RUNNER_OS".to_string(), "Linux".to_string());
-        env.insert("INPUT_NAME".to_string(), "test".to_string());
-        env.insert("CI".to_string(), "true".to_string());
-        let ctx = make_ctx(&env, &EMPTY_STEPS, &EMPTY_MATRIX);
+        // env_context holds the union of user + runner env; user_env holds only
+        // what the user declared. toJSON(env) dumps user_env.
+        let mut user_env = HashMap::new();
+        user_env.insert("MY_VAR".to_string(), "hello".to_string());
+        user_env.insert("OTHER".to_string(), "world".to_string());
+        let mut env_context = user_env.clone();
+        env_context.insert("GITHUB_SHA".to_string(), "abc123".to_string());
+        env_context.insert("RUNNER_OS".to_string(), "Linux".to_string());
+        env_context.insert("INPUT_NAME".to_string(), "test".to_string());
+        env_context.insert("CI".to_string(), "true".to_string());
+        let ctx = ExpressionContext {
+            env_context: &env_context,
+            user_env: &user_env,
+            step_outputs: &EMPTY_STEPS,
+            matrix_combination: &EMPTY_MATRIX,
+            step_statuses: &EMPTY_STATUSES,
+            job_status: "success",
+            secrets_context: &EMPTY_SECRETS,
+            needs_context: &EMPTY_NEEDS,
+            needs_results: &EMPTY_NEEDS_RESULTS,
+        };
         let result = evaluate("toJSON(env)", &ctx).unwrap();
         let s = result.to_output_string();
         let parsed: serde_json::Value = serde_json::from_str(&s).expect("should be valid JSON");
@@ -1622,17 +1653,20 @@ mod tests {
         assert_eq!(obj.get("OTHER").unwrap(), "world");
         assert!(
             obj.get("GITHUB_SHA").is_none(),
-            "should exclude GITHUB_ vars"
+            "runner-seeded GITHUB_SHA should not leak into toJSON(env)"
         );
         assert!(
             obj.get("RUNNER_OS").is_none(),
-            "should exclude RUNNER_ vars"
+            "runner-seeded RUNNER_OS should not leak into toJSON(env)"
         );
         assert!(
             obj.get("INPUT_NAME").is_none(),
-            "should exclude INPUT_ vars"
+            "runner-seeded INPUT_NAME should not leak into toJSON(env)"
         );
-        assert!(obj.get("CI").is_none(), "should exclude CI");
+        assert!(
+            obj.get("CI").is_none(),
+            "runner-seeded CI should not leak into toJSON(env)"
+        );
     }
 
     #[test]
@@ -1677,40 +1711,94 @@ mod tests {
 
     #[test]
     fn tojson_env_empty_when_only_internal_vars() {
-        let mut env = HashMap::new();
-        env.insert("GITHUB_SHA".to_string(), "abc123".to_string());
-        env.insert("RUNNER_OS".to_string(), "Linux".to_string());
-        env.insert("CI".to_string(), "true".to_string());
-        let ctx = make_ctx(&env, &EMPTY_STEPS, &EMPTY_MATRIX);
+        // env_context has runner-seeded vars; user_env is empty (user declared nothing).
+        let mut env_context = HashMap::new();
+        env_context.insert("GITHUB_SHA".to_string(), "abc123".to_string());
+        env_context.insert("RUNNER_OS".to_string(), "Linux".to_string());
+        env_context.insert("CI".to_string(), "true".to_string());
+        let ctx = ExpressionContext {
+            env_context: &env_context,
+            user_env: &EMPTY_USER_ENV,
+            step_outputs: &EMPTY_STEPS,
+            matrix_combination: &EMPTY_MATRIX,
+            step_statuses: &EMPTY_STATUSES,
+            job_status: "success",
+            secrets_context: &EMPTY_SECRETS,
+            needs_context: &EMPTY_NEEDS,
+            needs_results: &EMPTY_NEEDS_RESULTS,
+        };
         let result = evaluate("toJSON(env)", &ctx).unwrap();
         let s = result.to_output_string();
         let parsed: serde_json::Value = serde_json::from_str(&s).expect("should be valid JSON");
         let obj = parsed.as_object().expect("should be a JSON object");
         assert!(
             obj.is_empty(),
-            "should be empty when all vars are internal: {}",
+            "should be empty when no user env is declared: {}",
             s
         );
     }
 
     #[test]
-    fn tojson_env_excludes_user_var_with_internal_prefix() {
-        // KNOWN LIMITATION: user-defined vars that happen to match internal
-        // prefixes (GITHUB_*, RUNNER_*, etc.) are incorrectly filtered out.
-        let mut env = HashMap::new();
-        env.insert("GITHUB_CUSTOM".to_string(), "user-val".to_string());
-        env.insert("MY_VAR".to_string(), "hello".to_string());
-        let ctx = make_ctx(&env, &EMPTY_STEPS, &EMPTY_MATRIX);
+    fn tojson_env_includes_user_var_with_internal_prefix() {
+        // A user-declared `GITHUB_CUSTOM` (e.g. from `env: { GITHUB_CUSTOM: ... }`
+        // in YAML) must appear in toJSON(env) — it's in user_env regardless of
+        // what prefix the key happens to have. This is the bug the refactor fixes.
+        let mut user_env = HashMap::new();
+        user_env.insert("GITHUB_CUSTOM".to_string(), "user-val".to_string());
+        user_env.insert("MY_VAR".to_string(), "hello".to_string());
+        // env_context mirrors user_env for lookup coherence.
+        let env_context = user_env.clone();
+        let ctx = ExpressionContext {
+            env_context: &env_context,
+            user_env: &user_env,
+            step_outputs: &EMPTY_STEPS,
+            matrix_combination: &EMPTY_MATRIX,
+            step_statuses: &EMPTY_STATUSES,
+            job_status: "success",
+            secrets_context: &EMPTY_SECRETS,
+            needs_context: &EMPTY_NEEDS,
+            needs_results: &EMPTY_NEEDS_RESULTS,
+        };
         let result = evaluate("toJSON(env)", &ctx).unwrap();
         let s = result.to_output_string();
         let parsed: serde_json::Value = serde_json::from_str(&s).expect("should be valid JSON");
         let obj = parsed.as_object().expect("should be a JSON object");
         assert_eq!(obj.get("MY_VAR").unwrap(), "hello");
-        // GITHUB_CUSTOM is excluded despite being user-defined — this is the
-        // known limitation of the heuristic prefix filter.
+        assert_eq!(
+            obj.get("GITHUB_CUSTOM").unwrap(),
+            "user-val",
+            "user-declared var with GITHUB_ prefix must appear in toJSON(env)"
+        );
+    }
+
+    #[test]
+    fn tojson_env_includes_user_declared_github_token() {
+        // The canonical real-world case: `env: { GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} }`.
+        // The token is user-declared and must appear in toJSON(env).
+        let mut user_env = HashMap::new();
+        user_env.insert("GITHUB_TOKEN".to_string(), "ghp_user_supplied".to_string());
+        let mut env_context = user_env.clone();
+        // Runner-seeded vars coexist in env_context but must not leak into toJSON(env).
+        env_context.insert("GITHUB_SHA".to_string(), "abc123".to_string());
+        let ctx = ExpressionContext {
+            env_context: &env_context,
+            user_env: &user_env,
+            step_outputs: &EMPTY_STEPS,
+            matrix_combination: &EMPTY_MATRIX,
+            step_statuses: &EMPTY_STATUSES,
+            job_status: "success",
+            secrets_context: &EMPTY_SECRETS,
+            needs_context: &EMPTY_NEEDS,
+            needs_results: &EMPTY_NEEDS_RESULTS,
+        };
+        let result = evaluate("toJSON(env)", &ctx).unwrap();
+        let s = result.to_output_string();
+        let parsed: serde_json::Value = serde_json::from_str(&s).expect("should be valid JSON");
+        let obj = parsed.as_object().expect("should be a JSON object");
+        assert_eq!(obj.get("GITHUB_TOKEN").unwrap(), "ghp_user_supplied");
         assert!(
-            obj.get("GITHUB_CUSTOM").is_none(),
-            "user var with GITHUB_ prefix is incorrectly excluded (known limitation)"
+            obj.get("GITHUB_SHA").is_none(),
+            "process-inherited GITHUB_SHA must not appear in toJSON(env)"
         );
     }
 
@@ -2008,6 +2096,7 @@ mod tests {
     ) -> ExpressionContext<'a> {
         ExpressionContext {
             env_context: &EMPTY_ENV,
+            user_env: &EMPTY_USER_ENV,
             step_outputs,
             matrix_combination: &EMPTY_MATRIX,
             step_statuses,
@@ -2191,6 +2280,7 @@ mod tests {
     ) -> ExpressionContext<'a> {
         ExpressionContext {
             env_context: &EMPTY_ENV,
+            user_env: &EMPTY_USER_ENV,
             step_outputs: &EMPTY_STEPS,
             matrix_combination: &EMPTY_MATRIX,
             step_statuses: &EMPTY_STATUSES,
@@ -2339,6 +2429,7 @@ mod tests {
     fn make_secrets_ctx(secrets: &HashMap<String, String>) -> ExpressionContext<'_> {
         ExpressionContext {
             env_context: &EMPTY_ENV,
+            user_env: &EMPTY_USER_ENV,
             step_outputs: &EMPTY_STEPS,
             matrix_combination: &EMPTY_MATRIX,
             step_statuses: &EMPTY_STATUSES,

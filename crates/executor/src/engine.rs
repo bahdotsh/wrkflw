@@ -110,6 +110,15 @@ async fn execute_github_workflow(
     // built-in GITHUB_*/RUNNER_* vars; job and step env override these later).
     // Resolve ${{ }} expressions (e.g. ${{ github.repository }}) in values.
     {
+        // Bridge: user_env is derived from env_context via the legacy heuristic filter.
+        // Commit 2 replaces this with an authoritatively-tracked user_env built from
+        // workflow/job/step env merges. Workflow.env hasn't been merged yet here, so
+        // in practice this map is empty.
+        let user_env: HashMap<String, String> = env_context
+            .iter()
+            .filter(|(k, _)| crate::expression::is_user_env_var(k))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
         let wf_expr_ctx = crate::expression::ExpressionContext {
             env_context: &env_context,
             step_outputs: &HashMap::new(),
@@ -119,6 +128,7 @@ async fn execute_github_workflow(
             secrets_context: &HashMap::new(),
             needs_context: &HashMap::new(),
             needs_results: &HashMap::new(),
+            user_env: &user_env,
         };
         let cwd = std::env::current_dir().map_err(|e| {
             ExecutionError::Execution(format!("Failed to get current directory: {}", e))
@@ -2150,6 +2160,13 @@ async fn execute_matrix_job(
     // We collect resolved values first to avoid borrowing job_env while mutating it.
     {
         let matrix_opt = Some(combination.values.clone());
+        // Bridge: derive user_env from the current job_env via the legacy heuristic.
+        // Commit 2 replaces this with an authoritatively-tracked job_user_env.
+        let user_env: HashMap<String, String> = job_env
+            .iter()
+            .filter(|(k, _)| crate::expression::is_user_env_var(k))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
         let env_expr_ctx = crate::expression::ExpressionContext {
             env_context: &job_env,
             step_outputs: &HashMap::new(),
@@ -2159,6 +2176,7 @@ async fn execute_matrix_job(
             secrets_context: services.secrets_context,
             needs_context: services.needs_context,
             needs_results: services.needs_results,
+            user_env: &user_env,
         };
         let cwd = std::env::current_dir().map_err(|e| {
             ExecutionError::Execution(format!("Failed to get current directory: {}", e))
@@ -2567,7 +2585,8 @@ async fn run_step_with_guards(
 
     // Check step-level if condition
     if let Some(if_cond) = &step.if_condition {
-        let cond_ctx = step_exec_ctx.expr_context();
+        let mut user_env_buf = HashMap::new();
+        let cond_ctx = step_exec_ctx.expr_context(&mut user_env_buf);
         let should_run = evaluate_condition_with_context(if_cond, &cond_ctx);
         if !should_run {
             wrkflw_logging::info(&format!(
@@ -2690,8 +2709,25 @@ struct StepExecutionContext<'a> {
 }
 
 impl<'a> StepExecutionContext<'a> {
-    /// Build an `ExpressionContext` from this step context.
-    fn expr_context(&self) -> crate::expression::ExpressionContext<'_> {
+    /// Build an `ExpressionContext` from this step context. The returned context
+    /// borrows from `user_env_buf`, which the caller owns — this indirection lets
+    /// us return a `ExpressionContext<'b>` whose lifetime is tied to a caller-
+    /// provided buffer rather than `self` (which already borrows `job_env`).
+    ///
+    /// Bridge behavior (Commit 1): `user_env_buf` is populated by filtering
+    /// `job_env` through the legacy `is_user_env_var` heuristic. Commit 2
+    /// replaces this with an authoritatively-tracked `job_user_env` field on
+    /// `StepExecutionContext`.
+    fn expr_context<'b>(
+        &'b self,
+        user_env_buf: &'b mut HashMap<String, String>,
+    ) -> crate::expression::ExpressionContext<'b> {
+        *user_env_buf = self
+            .job_env
+            .iter()
+            .filter(|(k, _)| crate::expression::is_user_env_var(k))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
         crate::expression::ExpressionContext {
             env_context: self.job_env,
             step_outputs: self.step_outputs,
@@ -2701,17 +2737,26 @@ impl<'a> StepExecutionContext<'a> {
             secrets_context: self.services.secrets_context,
             needs_context: self.services.needs_context,
             needs_results: self.services.needs_results,
+            user_env: user_env_buf,
         }
     }
 
     /// Build an `ExpressionContext` using a custom env (e.g. partially-built step env).
+    /// `user_env_buf` is filled with the user-declared slice of `env` and borrowed
+    /// by the returned context; callers must keep it alive alongside the context.
     fn expr_context_with_env<'e>(
         &self,
         env: &'e HashMap<String, String>,
+        user_env_buf: &'e mut HashMap<String, String>,
     ) -> crate::expression::ExpressionContext<'e>
     where
         'a: 'e,
     {
+        *user_env_buf = env
+            .iter()
+            .filter(|(k, _)| crate::expression::is_user_env_var(k))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
         crate::expression::ExpressionContext {
             env_context: env,
             step_outputs: self.step_outputs,
@@ -2721,6 +2766,7 @@ impl<'a> StepExecutionContext<'a> {
             secrets_context: self.services.secrets_context,
             needs_context: self.services.needs_context,
             needs_results: self.services.needs_results,
+            user_env: user_env_buf,
         }
     }
 }
@@ -2730,7 +2776,8 @@ impl<'a> StepExecutionContext<'a> {
 /// On expression error, returns empty string (matching GitHub Actions behavior
 /// where unresolvable expressions resolve to empty).
 fn preprocess_with_value(value: &str, ctx: &StepExecutionContext<'_>) -> String {
-    let expr_ctx = ctx.expr_context();
+    let mut user_env_buf = HashMap::new();
+    let expr_ctx = ctx.expr_context(&mut user_env_buf);
     crate::substitution::preprocess_expressions(value, ctx.working_dir, &expr_ctx)
         .unwrap_or_default()
 }
@@ -3038,7 +3085,8 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
             value.clone()
         };
         // Resolve ${{ }} expressions in env values (e.g. ${{inputs.toolchain}})
-        let env_expr_ctx = ctx.expr_context_with_env(&step_env);
+        let mut user_env_buf = HashMap::new();
+        let env_expr_ctx = ctx.expr_context_with_env(&step_env, &mut user_env_buf);
         let resolved_value = match crate::substitution::preprocess_expressions(
             &resolved_value,
             ctx.working_dir,
@@ -3600,7 +3648,8 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
         };
 
         // Resolve expression substitutions (hashFiles, step outputs, env, matrix vars)
-        let run_expr_ctx = ctx.expr_context();
+        let mut user_env_buf = HashMap::new();
+        let run_expr_ctx = ctx.expr_context(&mut user_env_buf);
         let resolved_run = match crate::substitution::preprocess_expressions(
             &resolved_run,
             ctx.working_dir,
@@ -4773,6 +4822,12 @@ fn propagate_composite_outputs(
     let empty_secrets = HashMap::new();
     let empty_needs = HashMap::new();
     let empty_results = HashMap::new();
+    // Bridge: derive user_env from action_env via the legacy heuristic.
+    let user_env: HashMap<String, String> = action_env
+        .iter()
+        .filter(|(k, _)| crate::expression::is_user_env_var(k))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
     let expr_ctx = crate::expression::ExpressionContext {
         env_context: action_env,
         step_outputs: composite_step_outputs,
@@ -4782,6 +4837,7 @@ fn propagate_composite_outputs(
         secrets_context: &empty_secrets,
         needs_context: &empty_needs,
         needs_results: &empty_results,
+        user_env: &user_env,
     };
 
     // Collect evaluated outputs
@@ -4965,6 +5021,12 @@ fn evaluate_job_condition(
     env_context: &HashMap<String, String>,
     _workflow: &WorkflowDefinition,
 ) -> bool {
+    // Bridge: derive user_env from env_context via the legacy heuristic.
+    let user_env: HashMap<String, String> = env_context
+        .iter()
+        .filter(|(k, _)| crate::expression::is_user_env_var(k))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
     let ctx = crate::expression::ExpressionContext {
         env_context,
         step_outputs: &HashMap::new(),
@@ -4974,6 +5036,7 @@ fn evaluate_job_condition(
         secrets_context: &HashMap::new(),
         needs_context: &HashMap::new(),
         needs_results: &HashMap::new(),
+        user_env: &user_env,
     };
     evaluate_condition_with_context(condition, &ctx)
 }
@@ -5046,6 +5109,12 @@ fn resolve_job_outputs(
 ) -> HashMap<String, String> {
     let mut resolved = HashMap::new();
     if let Some(outputs) = &job.outputs {
+        // Bridge: derive user_env from env_context via the legacy heuristic.
+        let user_env: HashMap<String, String> = env_context
+            .iter()
+            .filter(|(k, _)| crate::expression::is_user_env_var(k))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
         let ctx = crate::expression::ExpressionContext {
             env_context,
             step_outputs: step_outputs_map,
@@ -5055,6 +5124,7 @@ fn resolve_job_outputs(
             secrets_context: &HashMap::new(),
             needs_context: &HashMap::new(),
             needs_results: &HashMap::new(),
+            user_env: &user_env,
         };
         for (key, expr) in outputs {
             match crate::substitution::preprocess_expressions(expr, working_dir, &ctx) {
@@ -5593,6 +5663,7 @@ mod tests {
         // Workflow-level env values containing ${{ }} expressions should be resolved
         let env_context: HashMap<String, String> =
             HashMap::from([("GITHUB_REPOSITORY".into(), "owner/repo".into())]);
+        let empty_user_env = HashMap::new();
         let expr_ctx = crate::expression::ExpressionContext {
             env_context: &env_context,
             step_outputs: &HashMap::new(),
@@ -5602,6 +5673,7 @@ mod tests {
             secrets_context: &HashMap::new(),
             needs_context: &HashMap::new(),
             needs_results: &HashMap::new(),
+            user_env: &empty_user_env,
         };
         let cwd = std::env::current_dir().unwrap();
 
@@ -8154,6 +8226,7 @@ runs:
             secrets_context: &empty_secrets,
             needs_context: &needs_ctx,
             needs_results: &needs_res,
+            user_env: &empty_env,
         };
 
         // Test needs.build.outputs.artifact
@@ -8208,6 +8281,7 @@ runs:
             secrets_context: &empty_secrets,
             needs_context: &empty_needs,
             needs_results: &empty_needs_results,
+            user_env: &empty_env,
         };
 
         // outcome should be "failure" (raw result)
@@ -8249,6 +8323,7 @@ runs:
             secrets_context: &secrets,
             needs_context: &empty_needs,
             needs_results: &empty_needs_results,
+            user_env: &empty_env,
         };
 
         let result = crate::expression::evaluate("secrets.API_KEY", &ctx).unwrap();

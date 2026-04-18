@@ -218,6 +218,7 @@ mod tests {
     ) -> ExpressionContext<'a> {
         ExpressionContext {
             env_context: env,
+            user_env: env,
             step_outputs,
             matrix_combination: matrix,
             step_statuses: &EMPTY_STATUSES,

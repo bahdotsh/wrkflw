@@ -1,6 +1,6 @@
 // Logs tab rendering
 use crate::app::App;
-use crate::theme::{self, COLORS};
+use crate::theme;
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::Style,
@@ -11,6 +11,7 @@ use ratatui::{
 
 // Render the logs tab
 pub fn render_logs_tab(f: &mut Frame<'_>, app: &App, area: Rect) {
+    let t = &app.theme;
     let show_search_bar =
         app.log_search_active || !app.log_search_query.is_empty() || app.log_filter_level.is_some();
 
@@ -52,26 +53,26 @@ pub fn render_logs_tab(f: &mut Frame<'_>, app: &App, area: Rect) {
         };
 
         let filter_style = match &app.log_filter_level {
-            Some(crate::models::LogFilterLevel::Error) => Style::default().fg(COLORS.error),
-            Some(crate::models::LogFilterLevel::Warning) => Style::default().fg(COLORS.warning),
-            Some(crate::models::LogFilterLevel::Info) => Style::default().fg(COLORS.info),
-            Some(crate::models::LogFilterLevel::Success) => Style::default().fg(COLORS.success),
-            Some(crate::models::LogFilterLevel::Trigger) => Style::default().fg(COLORS.trigger),
-            Some(crate::models::LogFilterLevel::All) | None => theme::dim_style(),
+            Some(crate::models::LogFilterLevel::Error) => Style::default().fg(t.error),
+            Some(crate::models::LogFilterLevel::Warning) => Style::default().fg(t.warning),
+            Some(crate::models::LogFilterLevel::Info) => Style::default().fg(t.info),
+            Some(crate::models::LogFilterLevel::Success) => Style::default().fg(t.success),
+            Some(crate::models::LogFilterLevel::Trigger) => Style::default().fg(t.trigger),
+            Some(crate::models::LogFilterLevel::All) | None => theme::dim_style(t),
         };
 
         let search_info = Line::from(vec![
-            Span::styled(&search_text, Style::default().fg(COLORS.text)),
+            Span::styled(&search_text, Style::default().fg(t.fg_bright)),
             Span::raw("   "),
             Span::styled(filter_text, filter_style),
             Span::raw("   "),
-            Span::styled(match_info, Style::default().fg(COLORS.trigger)),
+            Span::styled(match_info, Style::default().fg(t.trigger)),
         ]);
 
         let search_block = if app.log_search_active {
-            theme::block_focused("Search & Filter")
+            theme::block_focused(t, "Search & Filter")
         } else {
-            theme::block("Search & Filter")
+            theme::block(t, "Search & Filter")
         };
 
         let search_widget = Paragraph::new(search_info)
@@ -86,13 +87,13 @@ pub fn render_logs_tab(f: &mut Frame<'_>, app: &App, area: Rect) {
 
     let header_cells = ["Time", "Type", "Message"]
         .iter()
-        .map(|h| Cell::from(*h).style(theme::header_style()));
+        .map(|h| Cell::from(*h).style(theme::header_style(t)));
 
     let header = Row::new(header_cells).height(1);
 
     let rows = filtered_logs
         .iter()
-        .map(|processed_log| processed_log.to_row());
+        .map(|processed_log| processed_log.to_row(t));
 
     let content_idx = if show_search_bar { 1 } else { 0 };
 
@@ -113,8 +114,8 @@ pub fn render_logs_tab(f: &mut Frame<'_>, app: &App, area: Rect) {
     ];
     let log_table = Table::new(rows, widths)
         .header(header)
-        .block(theme::block(&log_title))
-        .row_highlight_style(theme::selected_style());
+        .block(theme::block(t, &log_title))
+        .row_highlight_style(theme::selected_style(t));
 
     let mut log_table_state = TableState::default();
 

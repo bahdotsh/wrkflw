@@ -1,6 +1,6 @@
 // Job detail view rendering
 use crate::app::App;
-use crate::theme::{self, COLORS};
+use crate::theme;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
@@ -11,6 +11,7 @@ use ratatui::{
 
 // Render the job detail view
 pub fn render_job_detail_view(f: &mut Frame<'_>, app: &mut App, area: Rect) {
+    let t = &app.theme;
     let current_workflow_idx = app
         .current_execution
         .or_else(|| app.workflow_list_state.selected())
@@ -37,7 +38,7 @@ pub fn render_job_detail_view(f: &mut Frame<'_>, app: &mut App, area: Rect) {
                         .split(area);
 
                     // Job title with breadcrumb
-                    let (status_symbol, status_style) = theme::job_status(&job.status);
+                    let (status_symbol, status_style) = theme::job_status(t, &job.status);
                     let status_text = match job.status {
                         wrkflw_executor::JobStatus::Success => "Success",
                         wrkflw_executor::JobStatus::Failure => "Failed",
@@ -47,15 +48,15 @@ pub fn render_job_detail_view(f: &mut Frame<'_>, app: &mut App, area: Rect) {
                     let job_title = Paragraph::new(vec![
                         // Breadcrumb
                         Line::from(vec![
-                            Span::styled(workflow_name, theme::muted_style()),
+                            Span::styled(workflow_name, theme::muted_style(t)),
                             Span::styled(
                                 format!(" {} ", theme::symbols::ARROW),
-                                theme::muted_style(),
+                                theme::muted_style(t),
                             ),
                             Span::styled(
                                 &job.name,
                                 Style::default()
-                                    .fg(COLORS.text)
+                                    .fg(t.fg_bright)
                                     .add_modifier(Modifier::BOLD),
                             ),
                         ]),
@@ -65,28 +66,28 @@ pub fn render_job_detail_view(f: &mut Frame<'_>, app: &mut App, area: Rect) {
                             Span::styled(status_text, status_style),
                             Span::styled(
                                 format!("  {} steps", job.steps.len()),
-                                theme::muted_style(),
+                                theme::muted_style(t),
                             ),
                         ]),
                     ])
-                    .block(theme::block("Job Details"));
+                    .block(theme::block(t, "Job Details"));
 
                     f.render_widget(job_title, chunks[0]);
 
                     // Steps section
                     let header_cells = ["Status", "Step Name"]
                         .iter()
-                        .map(|h| ratatui::widgets::Cell::from(*h).style(theme::header_style()));
+                        .map(|h| ratatui::widgets::Cell::from(*h).style(theme::header_style(t)));
 
                     let header = Row::new(header_cells).height(1);
 
                     let rows = job.steps.iter().map(|step| {
-                        let (status_symbol, status_style) = theme::step_status(&step.status);
+                        let (status_symbol, status_style) = theme::step_status(t, &step.status);
 
                         Row::new(vec![
                             ratatui::widgets::Cell::from(status_symbol).style(status_style),
                             ratatui::widgets::Cell::from(step.name.clone())
-                                .style(Style::default().fg(COLORS.text)),
+                                .style(Style::default().fg(t.fg_bright)),
                         ])
                     });
 
@@ -96,8 +97,8 @@ pub fn render_job_detail_view(f: &mut Frame<'_>, app: &mut App, area: Rect) {
                     ];
                     let steps_table = Table::new(rows, widths)
                         .header(header)
-                        .block(theme::block("Steps"))
-                        .row_highlight_style(theme::selected_style())
+                        .block(theme::block(t, "Steps"))
+                        .row_highlight_style(theme::selected_style(t))
                         .highlight_symbol(theme::symbols::SELECTED);
 
                     f.render_stateful_widget(steps_table, chunks[1], &mut app.step_table_state);
@@ -107,7 +108,7 @@ pub fn render_job_detail_view(f: &mut Frame<'_>, app: &mut App, area: Rect) {
                         if step_idx < job.steps.len() {
                             let step = &job.steps[step_idx];
 
-                            let (step_symbol, step_style) = theme::step_status(&step.status);
+                            let (step_symbol, step_style) = theme::step_status(t, &step.status);
                             let status_text = match step.status {
                                 wrkflw_executor::StepStatus::Success => "Success",
                                 wrkflw_executor::StepStatus::Failure => "Failed",
@@ -127,7 +128,7 @@ pub fn render_job_detail_view(f: &mut Frame<'_>, app: &mut App, area: Rect) {
                                     Span::styled(
                                         step.name.clone(),
                                         Style::default()
-                                            .fg(COLORS.text)
+                                            .fg(t.fg_bright)
                                             .add_modifier(Modifier::BOLD),
                                     ),
                                     Span::styled(format!(" ({})", status_text), step_style),
@@ -135,10 +136,10 @@ pub fn render_job_detail_view(f: &mut Frame<'_>, app: &mut App, area: Rect) {
                                 Line::from(""),
                                 Line::from(Span::styled(
                                     output_text,
-                                    Style::default().fg(COLORS.text_dim),
+                                    Style::default().fg(t.fg_dim),
                                 )),
                             ])
-                            .block(theme::block("Step Output"))
+                            .block(theme::block(t, "Step Output"))
                             .wrap(Wrap { trim: false });
 
                             f.render_widget(step_detail, chunks[2]);

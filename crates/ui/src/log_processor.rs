@@ -1,6 +1,6 @@
 // Background log processor for asynchronous log filtering and formatting
 use crate::models::LogFilterLevel;
-use crate::theme;
+use crate::theme::{self, Theme};
 use ratatui::{
     style::Style,
     text::{Line, Span},
@@ -20,10 +20,13 @@ pub struct ProcessedLogEntry {
 }
 
 impl ProcessedLogEntry {
-    /// Convert to a table row for rendering
-    pub fn to_row(&self) -> Row<'static> {
+    /// Convert to a table row for rendering. Takes the current theme so the
+    /// timestamp column restyles if the user toggles themes between frames
+    /// (the content/badge styles are baked in at processing time — a future
+    /// improvement is to defer those too).
+    pub fn to_row(&self, theme: &Theme) -> Row<'static> {
         Row::new(vec![
-            Cell::from(self.timestamp.clone()).style(theme::muted_style()),
+            Cell::from(self.timestamp.clone()).style(theme::muted_style(theme)),
             Cell::from(format!(" {} ", self.log_type)).style(self.log_style),
             Cell::from(Line::from(self.content_spans.clone())),
         ])
@@ -38,6 +41,10 @@ pub struct LogProcessingRequest {
     pub app_logs: Vec<String>,    // Complete app logs
     pub app_logs_count: usize,    // To detect changes in app logs
     pub system_logs_count: usize, // To detect changes in system logs
+    /// Snapshot of the active theme when the request was queued. Background
+    /// processing bakes colors into `ProcessedLogEntry.log_style` and
+    /// `content_spans`, so the worker needs the theme to match.
+    pub theme: Theme,
 }
 
 /// Response with processed logs
@@ -74,6 +81,7 @@ impl LogProcessor {
     }
 
     /// Send a processing request (non-blocking)
+    #[allow(clippy::result_large_err)] // SendError carries the request back; callers only `.is_err()` it.
     pub fn request_update(
         &self,
         request: LogProcessingRequest,
@@ -179,7 +187,9 @@ impl LogProcessor {
 
         let processed_logs: Vec<ProcessedLogEntry> = filtered_logs
             .iter()
-            .map(|(_, log_line)| Self::process_log_entry(log_line, &request.search_query))
+            .map(|(_, log_line)| {
+                Self::process_log_entry(log_line, &request.search_query, &request.theme)
+            })
             .collect();
 
         LogProcessingResponse {
@@ -191,7 +201,7 @@ impl LogProcessor {
     }
 
     /// Process a single log entry into display format
-    fn process_log_entry(log_line: &str, search_query: &str) -> ProcessedLogEntry {
+    fn process_log_entry(log_line: &str, search_query: &str, theme: &Theme) -> ProcessedLogEntry {
         // Extract timestamp from log format [HH:MM:SS]
         let timestamp = if log_line.starts_with('[') && log_line.contains(']') {
             let end = log_line.find(']').unwrap_or(0);
@@ -209,26 +219,26 @@ impl LogProcessor {
             || log_line.contains("error")
             || log_line.contains(theme::symbols::FAILURE)
         {
-            ("ERROR", theme::log_badge("ERROR"))
+            ("ERROR", theme::log_badge(theme, "ERROR"))
         } else if log_line.contains("Warning")
             || log_line.contains("warning")
             || log_line.contains(theme::symbols::WARNING)
         {
-            ("WARN", theme::log_badge("WARN"))
+            ("WARN", theme::log_badge(theme, "WARN"))
         } else if log_line.contains("Success")
             || log_line.contains("success")
             || log_line.contains(theme::symbols::SUCCESS)
         {
-            ("SUCCESS", theme::log_badge("SUCCESS"))
+            ("SUCCESS", theme::log_badge(theme, "SUCCESS"))
         } else if log_line.contains("Running")
             || log_line.contains("running")
             || log_line.contains(theme::symbols::RUNNING)
         {
-            ("INFO", theme::log_badge("INFO"))
+            ("INFO", theme::log_badge(theme, "INFO"))
         } else if log_line.contains("Triggering") || log_line.contains("triggered") {
-            ("TRIG", theme::log_badge("TRIG"))
+            ("TRIG", theme::log_badge(theme, "TRIG"))
         } else {
-            ("INFO", theme::log_badge(""))
+            ("INFO", theme::log_badge(theme, ""))
         };
 
         // Extract content after timestamp
@@ -245,7 +255,7 @@ impl LogProcessor {
 
         // Create content spans with search highlighting
         let content_spans = if !search_query.is_empty() {
-            Self::highlight_search_matches(content, search_query)
+            Self::highlight_search_matches(content, search_query, theme)
         } else {
             vec![Span::raw(content.to_string())]
         };
@@ -259,7 +269,11 @@ impl LogProcessor {
     }
 
     /// Highlight search matches in content
-    fn highlight_search_matches(content: &str, search_query: &str) -> Vec<Span<'static>> {
+    fn highlight_search_matches(
+        content: &str,
+        search_query: &str,
+        theme: &Theme,
+    ) -> Vec<Span<'static>> {
         let mut spans = Vec::new();
         let lowercase_content = content.to_lowercase();
         let lowercase_query = search_query.to_lowercase();
@@ -276,7 +290,7 @@ impl LogProcessor {
                 let match_end = real_idx + search_query.len();
                 spans.push(Span::styled(
                     content[real_idx..match_end].to_string(),
-                    theme::search_highlight(),
+                    theme::search_highlight(theme),
                 ));
 
                 last_idx = match_end;
@@ -305,17 +319,19 @@ mod tests {
 
     #[test]
     fn test_multibyte_log_line_does_not_panic() {
+        let theme = Theme::dark();
         // Emoji and multi-byte characters near bracket boundaries
-        let entry = LogProcessor::process_log_entry("[🚀] deployed service", "");
+        let entry = LogProcessor::process_log_entry("[🚀] deployed service", "", &theme);
         assert_eq!(entry.log_type, "INFO");
 
-        let entry2 = LogProcessor::process_log_entry("[ñ] latin char", "");
+        let entry2 = LogProcessor::process_log_entry("[ñ] latin char", "", &theme);
         assert!(!entry2.timestamp.is_empty());
     }
 
     #[test]
     fn test_normal_timestamp_extraction() {
-        let entry = LogProcessor::process_log_entry("[12:34:56] some log", "");
+        let theme = Theme::dark();
+        let entry = LogProcessor::process_log_entry("[12:34:56] some log", "", &theme);
         assert_eq!(entry.timestamp, "12:34:56");
     }
 }

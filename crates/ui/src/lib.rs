@@ -16,8 +16,6 @@ pub mod handlers;
 #[cfg(feature = "tui")]
 pub mod app;
 #[cfg(feature = "tui")]
-pub mod components;
-#[cfg(feature = "tui")]
 pub mod log_processor;
 #[cfg(feature = "tui")]
 pub mod models;

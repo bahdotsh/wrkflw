@@ -4,6 +4,7 @@ use crate::models::{
     ExecutionResultMsg, JobExecution, LogFilterLevel, QueuedExecution, StatusSeverity,
     StepExecution, TriggerMatchStatus, Workflow, WorkflowExecution, WorkflowStatus,
 };
+use crate::theme::Theme;
 use chrono::Local;
 use crossterm::event::KeyCode;
 use ratatui::widgets::{ListState, TableState};
@@ -95,6 +96,10 @@ pub struct App {
     /// task failure, so we don't tell the user "evaluation failed" for an
     /// action they took deliberately. Cleared once observed.
     pub diff_filter_aborted: bool,
+
+    /// Active color theme. Thread through render calls via `&app.theme`;
+    /// swap via `Theme::toggle()` (commit 5 wires the keybind).
+    pub theme: Theme,
 }
 
 /// Result rows shipped from the background diff-filter task to the UI loop.
@@ -335,6 +340,8 @@ impl App {
             diff_filter_rx: None,
             diff_filter_task: None,
             diff_filter_aborted: false,
+
+            theme: Theme::default(),
         }
     }
 
@@ -1571,6 +1578,7 @@ impl App {
             app_logs: self.logs.clone(),
             app_logs_count: self.logs.len(),
             system_logs_count: wrkflw_logging::get_logs().len(),
+            theme: self.theme.clone(),
         };
 
         if self.log_processor.request_update(request).is_err() {

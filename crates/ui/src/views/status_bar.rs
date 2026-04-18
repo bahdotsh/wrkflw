@@ -1,7 +1,7 @@
 // Status bar rendering
 use crate::app::App;
 use crate::models::StatusSeverity;
-use crate::theme::{self, COLORS};
+use crate::theme;
 use ratatui::{
     layout::{Alignment, Rect},
     style::{Modifier, Style},
@@ -13,20 +13,22 @@ use wrkflw_executor::RuntimeType;
 
 // Render the status bar
 pub fn render_status_bar(f: &mut Frame<'_>, app: &App, area: Rect) {
+    let t = &app.theme;
+
     // If we have a status message, show it as a toast
     if let Some(message) = &app.status_message {
         let bg = match app.status_message_severity {
-            StatusSeverity::Success => COLORS.success,
-            StatusSeverity::Info => COLORS.info,
-            StatusSeverity::Warning => COLORS.warning,
-            StatusSeverity::Error => COLORS.error,
+            StatusSeverity::Success => t.success,
+            StatusSeverity::Info => t.info,
+            StatusSeverity::Warning => t.warning,
+            StatusSeverity::Error => t.error,
         };
 
         let status_message = Paragraph::new(Line::from(vec![Span::styled(
             format!(" {} ", message),
             Style::default()
                 .bg(bg)
-                .fg(COLORS.text)
+                .fg(t.fg_badge)
                 .add_modifier(Modifier::BOLD),
         )]))
         .alignment(Alignment::Center);
@@ -42,12 +44,12 @@ pub fn render_status_bar(f: &mut Frame<'_>, app: &App, area: Rect) {
     status_items.push(theme::badge(
         app.runtime_type_name(),
         match app.runtime_type {
-            RuntimeType::Docker => COLORS.runtime_docker,
-            RuntimeType::Podman => COLORS.runtime_podman,
-            RuntimeType::SecureEmulation => COLORS.runtime_secure,
-            RuntimeType::Emulation => COLORS.runtime_emulation,
+            RuntimeType::Docker => t.runtime_docker,
+            RuntimeType::Podman => t.runtime_podman,
+            RuntimeType::SecureEmulation => t.runtime_secure,
+            RuntimeType::Emulation => t.runtime_emulation,
         },
-        COLORS.text,
+        t.fg_badge,
     ));
 
     // Container runtime status (uses cached availability from App state)
@@ -61,11 +63,11 @@ pub fn render_status_bar(f: &mut Frame<'_>, app: &App, area: Rect) {
                     "Docker: Unavailable"
                 },
                 if app.runtime_available {
-                    COLORS.success
+                    t.success
                 } else {
-                    COLORS.error
+                    t.error
                 },
-                COLORS.text,
+                t.fg_badge,
             ));
         }
         RuntimeType::Podman => {
@@ -77,18 +79,18 @@ pub fn render_status_bar(f: &mut Frame<'_>, app: &App, area: Rect) {
                     "Podman: Unavailable"
                 },
                 if app.runtime_available {
-                    COLORS.success
+                    t.success
                 } else {
-                    COLORS.error
+                    t.error
                 },
-                COLORS.text,
+                t.fg_badge,
             ));
         }
         RuntimeType::SecureEmulation => {
             status_items.push(Span::raw(" "));
             status_items.push(Span::styled(
                 format!(" {}SECURE ", theme::symbols::LOCK),
-                Style::default().bg(COLORS.runtime_secure).fg(COLORS.text),
+                Style::default().bg(t.runtime_secure).fg(t.fg_badge),
             ));
         }
         RuntimeType::Emulation => {}
@@ -97,31 +99,23 @@ pub fn render_status_bar(f: &mut Frame<'_>, app: &App, area: Rect) {
     // Validation/execution mode badge
     status_items.push(Span::raw(" "));
     if app.validation_mode {
-        status_items.push(theme::badge(
-            "Validation",
-            COLORS.warning,
-            ratatui::style::Color::Black,
-        ));
+        status_items.push(theme::badge("Validation", t.warning, t.fg_badge));
     } else {
-        status_items.push(theme::badge(
-            "Execution",
-            COLORS.success,
-            ratatui::style::Color::Black,
-        ));
+        status_items.push(theme::badge("Execution", t.success, t.fg_badge));
     }
 
     // Separator
     status_items.push(Span::styled(
         format!(" {} ", theme::symbols::SEPARATOR),
-        Style::default().fg(COLORS.text_muted),
+        Style::default().fg(t.fg_muted),
     ));
 
     // Context-specific help
     let help_text = build_context_help(app);
-    status_items.push(Span::styled(help_text, theme::hint_style()));
+    status_items.push(Span::styled(help_text, theme::hint_style(t)));
 
     let status_bar = Paragraph::new(Line::from(status_items))
-        .style(Style::default().bg(COLORS.bg_bar))
+        .style(Style::default().bg(t.bg_bar))
         .alignment(Alignment::Left);
 
     f.render_widget(status_bar, area);

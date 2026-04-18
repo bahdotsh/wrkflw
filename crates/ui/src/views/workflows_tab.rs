@@ -1,10 +1,10 @@
 // Workflows tab rendering
 use crate::app::App;
 use crate::models::TriggerMatchStatus;
-use crate::theme::{self, COLORS};
+use crate::theme;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     widgets::{Cell, Row, Table, TableState},
     Frame,
 };
@@ -19,6 +19,7 @@ pub fn render_workflows_tab(f: &mut Frame<'_>, app: &mut App, area: Rect) {
 }
 
 fn render_workflow_list(f: &mut Frame<'_>, app: &mut App, area: Rect) {
+    let t = &app.theme;
     let selected_count = app.workflows.iter().filter(|w| w.selected).count();
     // Surface the simulated event so users aren't confused when a
     // pull_request-only workflow shows up as SKIPPED under the push-only
@@ -38,7 +39,7 @@ fn render_workflow_list(f: &mut Frame<'_>, app: &mut App, area: Rect) {
     let header = Row::new(
         header_cells
             .iter()
-            .map(|h| Cell::from(*h).style(theme::header_style())),
+            .map(|h| Cell::from(*h).style(theme::header_style(t))),
     )
     .height(1);
 
@@ -52,7 +53,7 @@ fn render_workflow_list(f: &mut Frame<'_>, app: &mut App, area: Rect) {
         };
 
         let (status_symbol, status_style) =
-            theme::workflow_status_animated(&workflow.status, spinner_frame);
+            theme::workflow_status_animated(t, &workflow.status, spinner_frame);
 
         let path_display = workflow.path.to_string_lossy();
         let path_shortened = if path_display.len() > 30 {
@@ -68,19 +69,19 @@ fn render_workflow_list(f: &mut Frame<'_>, app: &mut App, area: Rect) {
         };
 
         let mut cells = vec![
-            Cell::from(checkbox).style(Style::default().fg(COLORS.success)),
+            Cell::from(checkbox).style(Style::default().fg(t.success)),
             Cell::from(status_symbol).style(status_style),
         ];
 
         if diff_active {
             let (trigger_symbol, trigger_style) = match &workflow.trigger_match {
                 Some(TriggerMatchStatus::Matched(_)) => {
-                    ("\u{25cf}", Style::default().fg(Color::Green)) // filled circle
+                    ("\u{25cf}", Style::default().fg(t.success)) // filled circle
                 }
                 Some(TriggerMatchStatus::Skipped(_)) => {
-                    ("\u{25cb}", Style::default().fg(Color::DarkGray)) // empty circle
+                    ("\u{25cb}", Style::default().fg(t.fg_muted)) // empty circle
                 }
-                None => ("-", Style::default().fg(Color::DarkGray)),
+                None => ("-", Style::default().fg(t.fg_muted)),
             };
             cells.push(Cell::from(trigger_symbol).style(trigger_style));
         }
@@ -88,11 +89,11 @@ fn render_workflow_list(f: &mut Frame<'_>, app: &mut App, area: Rect) {
         cells.push(
             Cell::from(workflow.name.clone()).style(
                 Style::default()
-                    .fg(COLORS.text)
+                    .fg(t.fg_bright)
                     .add_modifier(Modifier::BOLD),
             ),
         );
-        cells.push(Cell::from(path_shortened).style(theme::muted_style()));
+        cells.push(Cell::from(path_shortened).style(theme::muted_style(t)));
 
         Row::new(cells)
     });
@@ -116,8 +117,8 @@ fn render_workflow_list(f: &mut Frame<'_>, app: &mut App, area: Rect) {
 
     let workflows_table = Table::new(rows, widths)
         .header(header)
-        .block(theme::block(&block_title))
-        .row_highlight_style(theme::selected_style())
+        .block(theme::block(t, &block_title))
+        .row_highlight_style(theme::selected_style(t))
         .highlight_symbol(theme::symbols::SELECTED);
 
     let mut table_state = TableState::default();
@@ -137,6 +138,7 @@ fn render_workflow_list(f: &mut Frame<'_>, app: &mut App, area: Rect) {
 }
 
 fn render_job_selection(f: &mut Frame<'_>, app: &mut App, area: Rect) {
+    let t = &app.theme;
     // Get workflow name for the header
     let workflow_name = app
         .workflow_list_state
@@ -149,14 +151,14 @@ fn render_job_selection(f: &mut Frame<'_>, app: &mut App, area: Rect) {
 
     let header_cells = ["#", "Job Name"]
         .iter()
-        .map(|h| Cell::from(*h).style(theme::header_style()));
+        .map(|h| Cell::from(*h).style(theme::header_style(t)));
 
     let header = Row::new(header_cells).height(1);
 
     let rows = app.available_jobs.iter().enumerate().map(|(i, job_name)| {
         Row::new(vec![
-            Cell::from(format!("{}", i + 1)).style(theme::muted_style()),
-            Cell::from(job_name.clone()).style(Style::default().fg(COLORS.text)),
+            Cell::from(format!("{}", i + 1)).style(theme::muted_style(t)),
+            Cell::from(job_name.clone()).style(Style::default().fg(t.fg_bright)),
         ])
     });
 
@@ -166,8 +168,8 @@ fn render_job_selection(f: &mut Frame<'_>, app: &mut App, area: Rect) {
     ];
     let jobs_table = Table::new(rows, widths)
         .header(header)
-        .block(theme::block(&block_title))
-        .row_highlight_style(theme::selected_style())
+        .block(theme::block(t, &block_title))
+        .row_highlight_style(theme::selected_style(t))
         .highlight_symbol(theme::symbols::SELECTED);
 
     let mut table_state = TableState::default();

@@ -453,7 +453,7 @@ impl<'a> ExpressionContext<'a> {
                 .unwrap_or(ExprValue::Null),
             // Bare context names — return the whole context as an Object so that
             // `toJSON(env)` (and similar) can serialise it.
-            // TODO: support other bare contexts: secrets, matrix
+            // TODO: support other bare contexts: matrix
             "steps" if parts.len() == 1 => {
                 // Collect all step IDs from both outputs and statuses maps.
                 let mut all_ids: HashSet<&String> = self.step_outputs.keys().collect();
@@ -549,6 +549,23 @@ impl<'a> ExpressionContext<'a> {
 
                     map.insert(job_id.clone(), ExprValue::Object(job_obj));
                 }
+                ExprValue::Object(map)
+            }
+            "secrets" if parts.len() == 1 => {
+                // Wrap `secrets_context` as an Object so `toJSON(secrets)` can
+                // serialise it. Mirrors real GHA's `secrets` context shape
+                // (flat `{ name: value }` map).
+                //
+                // Values are returned in plaintext by design — same policy as
+                // `toJSON(github)` for `GITHUB_TOKEN`. Masking is a log-boundary
+                // concern handled by `wrkflw_secrets::SecretMasker` when wired in
+                // via `engine.rs`. Do not dump this object to untrusted sinks
+                // without routing through the masker.
+                let map = self
+                    .secrets_context
+                    .iter()
+                    .map(|(k, v)| (k.clone(), ExprValue::String(v.clone())))
+                    .collect();
                 ExprValue::Object(map)
             }
             _ => ExprValue::Null,
@@ -2292,6 +2309,143 @@ mod tests {
         assert_eq!(deploy_outputs.get("msg").unwrap(), "he said \"hi\"");
         assert_eq!(deploy_outputs.get("path").unwrap(), "C:\\Users\\dev");
         assert_eq!(deploy_outputs.get("emoji").unwrap(), "\u{1F680}");
+    }
+
+    // -- toJSON(secrets) tests --
+
+    /// Helper to build an ExpressionContext with secrets data.
+    fn make_secrets_ctx(secrets: &HashMap<String, String>) -> ExpressionContext<'_> {
+        ExpressionContext {
+            env_context: &EMPTY_ENV,
+            step_outputs: &EMPTY_STEPS,
+            matrix_combination: &EMPTY_MATRIX,
+            step_statuses: &EMPTY_STATUSES,
+            job_status: "success",
+            secrets_context: secrets,
+            needs_context: &EMPTY_NEEDS,
+            needs_results: &EMPTY_NEEDS_RESULTS,
+        }
+    }
+
+    #[test]
+    fn tojson_secrets_returns_object() {
+        let mut secrets = HashMap::new();
+        secrets.insert("NPM_TOKEN".to_string(), "abc".to_string());
+        secrets.insert("DEPLOY_KEY".to_string(), "xyz".to_string());
+        let ctx = make_secrets_ctx(&secrets);
+        let result = evaluate("toJSON(secrets)", &ctx).unwrap();
+        let s = result.to_output_string();
+        let parsed: serde_json::Value = serde_json::from_str(&s).expect("should be valid JSON");
+        let obj = parsed.as_object().expect("should be a JSON object");
+        assert_eq!(obj.get("NPM_TOKEN").unwrap(), "abc");
+        assert_eq!(obj.get("DEPLOY_KEY").unwrap(), "xyz");
+        assert_eq!(obj.len(), 2);
+    }
+
+    #[test]
+    fn tojson_secrets_empty_context() {
+        let secrets = HashMap::new();
+        let ctx = make_secrets_ctx(&secrets);
+        let result = evaluate("toJSON(secrets)", &ctx).unwrap();
+        let s = result.to_output_string();
+        let parsed: serde_json::Value = serde_json::from_str(&s).expect("should be valid JSON");
+        let obj = parsed.as_object().expect("should be a JSON object");
+        assert!(obj.is_empty(), "should be empty with no secrets: {}", s);
+    }
+
+    #[test]
+    fn tojson_secrets_sorted_keys() {
+        let mut secrets = HashMap::new();
+        secrets.insert("ZEBRA".to_string(), "z".to_string());
+        secrets.insert("APPLE".to_string(), "a".to_string());
+        secrets.insert("MANGO".to_string(), "m".to_string());
+        let ctx = make_secrets_ctx(&secrets);
+        let result = evaluate("toJSON(secrets)", &ctx).unwrap();
+        let s = result.to_output_string();
+        let apple_pos = s.find("APPLE").unwrap();
+        let mango_pos = s.find("MANGO").unwrap();
+        let zebra_pos = s.find("ZEBRA").unwrap();
+        assert!(apple_pos < mango_pos, "APPLE should come before MANGO");
+        assert!(mango_pos < zebra_pos, "MANGO should come before ZEBRA");
+    }
+
+    #[test]
+    fn tojson_secrets_preserves_special_characters() {
+        let mut secrets = HashMap::new();
+        secrets.insert("QUOTE".to_string(), "he said \"hi\"".to_string());
+        secrets.insert("BACKSLASH".to_string(), "path\\to\\key".to_string());
+        secrets.insert(
+            "NEWLINE".to_string(),
+            "-----BEGIN-----\nBODY\n-----END-----".to_string(),
+        );
+        let ctx = make_secrets_ctx(&secrets);
+        let result = evaluate("toJSON(secrets)", &ctx).unwrap();
+        let s = result.to_output_string();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&s).expect("should be valid JSON despite special chars");
+        let obj = parsed.as_object().unwrap();
+        assert_eq!(obj.get("QUOTE").unwrap(), "he said \"hi\"");
+        assert_eq!(obj.get("BACKSLASH").unwrap(), "path\\to\\key");
+        assert_eq!(
+            obj.get("NEWLINE").unwrap(),
+            "-----BEGIN-----\nBODY\n-----END-----"
+        );
+    }
+
+    #[test]
+    fn fromjson_tojson_secrets_produces_parseable_json() {
+        // `fromJSON` currently returns the raw JSON text as `ExprValue::String`
+        // (same pattern as `fromjson_tojson_env_produces_parseable_json`). The
+        // round-trip must preserve exact values so pipe-through-an-action use
+        // cases work and so any future switch to value-masking here is a
+        // deliberate decision.
+        let mut secrets = HashMap::new();
+        secrets.insert("NPM_TOKEN".to_string(), "npm_ABC123".to_string());
+        secrets.insert("DEPLOY_KEY".to_string(), "deploy_XYZ".to_string());
+        let ctx = make_secrets_ctx(&secrets);
+        let result = evaluate("fromJSON(toJSON(secrets))", &ctx).unwrap();
+        let s = result.to_output_string();
+        let parsed: serde_json::Value = serde_json::from_str(&s).expect("should be valid JSON");
+        let obj = parsed.as_object().expect("should be a JSON object");
+        assert_eq!(obj.get("NPM_TOKEN").unwrap(), "npm_ABC123");
+        assert_eq!(obj.get("DEPLOY_KEY").unwrap(), "deploy_XYZ");
+    }
+
+    #[test]
+    fn bare_secrets_is_truthy() {
+        let mut secrets = HashMap::new();
+        secrets.insert("NPM_TOKEN".to_string(), "abc".to_string());
+        let ctx = make_secrets_ctx(&secrets);
+        let result = evaluate("secrets", &ctx).unwrap();
+        assert!(result.is_truthy());
+    }
+
+    #[test]
+    fn bare_secrets_does_not_shadow_dotted_access() {
+        // Regression guard: the bare-`secrets` arm must not shadow the existing
+        // `secrets.NAME` dotted-access arm.
+        let mut secrets = HashMap::new();
+        secrets.insert("NPM_TOKEN".to_string(), "abc".to_string());
+        let ctx = make_secrets_ctx(&secrets);
+        let result = evaluate("secrets.NPM_TOKEN", &ctx).unwrap();
+        assert_eq!(result, ExprValue::String("abc".to_string()));
+    }
+
+    #[test]
+    fn tojson_secrets_returns_values_in_plaintext() {
+        // Documents current behavior: secret values surface in plaintext inside
+        // `toJSON(secrets)`. This matches real GHA; masking lives at the log
+        // boundary via `wrkflw_secrets::SecretMasker`, not in the evaluator.
+        // Pin the behavior so any future change (exclude, redact, route through
+        // a masker at this layer) is a deliberate decision.
+        let mut secrets = HashMap::new();
+        secrets.insert("GITHUB_TOKEN".to_string(), "ghs_supersecret".to_string());
+        let ctx = make_secrets_ctx(&secrets);
+        let result = evaluate("toJSON(secrets)", &ctx).unwrap();
+        let s = result.to_output_string();
+        let parsed: serde_json::Value = serde_json::from_str(&s).expect("should be valid JSON");
+        let obj = parsed.as_object().unwrap();
+        assert_eq!(obj.get("GITHUB_TOKEN").unwrap(), "ghs_supersecret");
     }
 
     #[test]

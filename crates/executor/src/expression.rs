@@ -473,12 +473,20 @@ impl<'a> ExpressionContext<'a> {
                 // mapping (`github.sha` → `GITHUB_SHA`). Does not include a nested
                 // `event` sub-object — that's the same documented limitation as the
                 // dotted-access arm above.
+                //
+                // KNOWN LIMITATION: The inverse of `toJSON(env)`'s prefix heuristic
+                // applies here — any user-defined env var starting with `GITHUB_`
+                // (e.g. the common `env: { GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} }`)
+                // will appear in this object. In particular `GITHUB_TOKEN`, if set,
+                // surfaces as `github.token` in plaintext; do not dump this object
+                // to untrusted sinks without a masking layer.
+                const PREFIX: &str = "GITHUB_";
                 let map = self
                     .env_context
                     .iter()
-                    .filter(|(k, _)| k.starts_with("GITHUB_"))
+                    .filter(|(k, _)| k.len() > PREFIX.len() && k.starts_with(PREFIX))
                     .map(|(k, v)| {
-                        let key = k.strip_prefix("GITHUB_").unwrap_or(k).to_lowercase();
+                        let key = k[PREFIX.len()..].to_ascii_lowercase();
                         (key, ExprValue::String(v.clone()))
                     })
                     .collect();
@@ -1829,6 +1837,41 @@ mod tests {
         let obj = parsed.as_object().expect("should be a JSON object");
         assert_eq!(obj.get("sha").unwrap(), "abc123");
         assert_eq!(obj.get("ref").unwrap(), "refs/heads/main");
+    }
+
+    #[test]
+    fn tojson_github_includes_token_in_plaintext() {
+        // Documents current behavior: GITHUB_TOKEN (when present) surfaces as
+        // `github.token`. No masking layer exists yet — callers must not dump
+        // this object to untrusted sinks. Pin the behavior so any future change
+        // (exclude, redact, route through a masker) is a deliberate decision.
+        let mut env = HashMap::new();
+        env.insert("GITHUB_TOKEN".to_string(), "ghs_secret".to_string());
+        env.insert("GITHUB_SHA".to_string(), "abc123".to_string());
+        let ctx = make_ctx(&env, &EMPTY_STEPS, &EMPTY_MATRIX);
+        let result = evaluate("toJSON(github)", &ctx).unwrap();
+        let s = result.to_output_string();
+        let parsed: serde_json::Value = serde_json::from_str(&s).expect("should be valid JSON");
+        let obj = parsed.as_object().expect("should be a JSON object");
+        assert_eq!(obj.get("token").unwrap(), "ghs_secret");
+        assert_eq!(obj.get("sha").unwrap(), "abc123");
+    }
+
+    #[test]
+    fn tojson_github_ignores_prefix_only_key() {
+        // The bare prefix `GITHUB_` (no suffix) would strip to an empty string
+        // and emit `{"": "..."}` — nonsense output. It should be filtered out.
+        let mut env = HashMap::new();
+        env.insert("GITHUB_".to_string(), "weird".to_string());
+        env.insert("GITHUB_SHA".to_string(), "abc123".to_string());
+        let ctx = make_ctx(&env, &EMPTY_STEPS, &EMPTY_MATRIX);
+        let result = evaluate("toJSON(github)", &ctx).unwrap();
+        let s = result.to_output_string();
+        let parsed: serde_json::Value = serde_json::from_str(&s).expect("should be valid JSON");
+        let obj = parsed.as_object().expect("should be a JSON object");
+        assert!(obj.get("").is_none(), "empty-key entry must not appear");
+        assert_eq!(obj.get("sha").unwrap(), "abc123");
+        assert_eq!(obj.len(), 1);
     }
 
     // -- toJSON(steps) tests --

@@ -453,7 +453,6 @@ impl<'a> ExpressionContext<'a> {
                 .unwrap_or(ExprValue::Null),
             // Bare context names — return the whole context as an Object so that
             // `toJSON(env)` (and similar) can serialise it.
-            // TODO: support other bare contexts: matrix
             "steps" if parts.len() == 1 => {
                 // Collect all step IDs from both outputs and statuses maps.
                 let mut all_ids: HashSet<&String> = self.step_outputs.keys().collect();
@@ -567,6 +566,29 @@ impl<'a> ExpressionContext<'a> {
                     .map(|(k, v)| (k.clone(), ExprValue::String(v.clone())))
                     .collect();
                 ExprValue::Object(map)
+            }
+            "matrix" if parts.len() == 1 => {
+                // Wrap the current matrix combination as an Object so
+                // `toJSON(matrix)` can serialise it. Values are converted via
+                // `yaml_value_to_expr`, identical to the dotted-access arm
+                // above, so bare and dotted forms agree on per-value shape.
+                //
+                // Asymmetric with the other bare-context arms on purpose: when
+                // `matrix_combination` is `None` (non-matrix job), return `Null`
+                // rather than an empty `Object`. `None` encodes "no matrix
+                // context exists" — which is what real GHA exposes for jobs
+                // without a matrix strategy. `Some(empty)` would still render
+                // as `{}`, preserving the Some/None distinction carried by the
+                // field's `Option<...>` type.
+                if let Some(matrix) = self.matrix_combination {
+                    let map = matrix
+                        .iter()
+                        .map(|(k, v)| (k.clone(), yaml_value_to_expr(v)))
+                        .collect();
+                    ExprValue::Object(map)
+                } else {
+                    ExprValue::Null
+                }
             }
             _ => ExprValue::Null,
         }
@@ -2446,6 +2468,157 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&s).expect("should be valid JSON");
         let obj = parsed.as_object().unwrap();
         assert_eq!(obj.get("GITHUB_TOKEN").unwrap(), "ghs_supersecret");
+    }
+
+    // -- toJSON(matrix) tests --
+
+    #[test]
+    fn tojson_matrix_returns_object() {
+        let mut matrix = HashMap::new();
+        matrix.insert("os".to_string(), Value::String("ubuntu-latest".to_string()));
+        matrix.insert("node".to_string(), Value::String("20".to_string()));
+        let matrix = Some(matrix);
+        let ctx = make_ctx(&EMPTY_ENV, &EMPTY_STEPS, &matrix);
+        let result = evaluate("toJSON(matrix)", &ctx).unwrap();
+        let s = result.to_output_string();
+        let parsed: serde_json::Value = serde_json::from_str(&s).expect("should be valid JSON");
+        let obj = parsed.as_object().expect("should be a JSON object");
+        assert_eq!(obj.get("os").unwrap(), "ubuntu-latest");
+        assert_eq!(obj.get("node").unwrap(), "20");
+        assert_eq!(obj.len(), 2);
+    }
+
+    #[test]
+    fn tojson_matrix_no_matrix_returns_null() {
+        // Non-matrix job: `matrix_combination = None`. Pins the Null-on-None
+        // behaviour that's asymmetric with the other bare-context arms.
+        let ctx = make_ctx(&EMPTY_ENV, &EMPTY_STEPS, &EMPTY_MATRIX);
+        let result = evaluate("toJSON(matrix)", &ctx).unwrap();
+        assert_eq!(result, ExprValue::String("null".to_string()));
+    }
+
+    #[test]
+    fn tojson_matrix_empty_combination() {
+        // `Some(empty)` encodes "a matrix combination exists with zero keys".
+        // Distinct from `None` (non-matrix job) and must render as `{}`.
+        let matrix: Option<HashMap<String, Value>> = Some(HashMap::new());
+        let ctx = make_ctx(&EMPTY_ENV, &EMPTY_STEPS, &matrix);
+        let result = evaluate("toJSON(matrix)", &ctx).unwrap();
+        let s = result.to_output_string();
+        let parsed: serde_json::Value = serde_json::from_str(&s).expect("should be valid JSON");
+        let obj = parsed.as_object().expect("should be a JSON object");
+        assert!(obj.is_empty(), "should be empty with zero keys: {}", s);
+    }
+
+    #[test]
+    fn tojson_matrix_mixed_value_types() {
+        // `yaml_value_to_expr` preserves native types for String/Number/Bool,
+        // and `expr_to_json` serialises them as native JSON types — not
+        // stringified. This must match the dotted-access arm's per-value shape.
+        let mut matrix = HashMap::new();
+        matrix.insert("os".to_string(), Value::String("ubuntu".to_string()));
+        matrix.insert("node".to_string(), Value::Number(20.into()));
+        matrix.insert("experimental".to_string(), Value::Bool(true));
+        let matrix = Some(matrix);
+        let ctx = make_ctx(&EMPTY_ENV, &EMPTY_STEPS, &matrix);
+        let result = evaluate("toJSON(matrix)", &ctx).unwrap();
+        let s = result.to_output_string();
+        let parsed: serde_json::Value = serde_json::from_str(&s).expect("should be valid JSON");
+        let obj = parsed.as_object().unwrap();
+        assert_eq!(obj.get("os").unwrap(), "ubuntu");
+        assert_eq!(obj.get("node").unwrap().as_f64().unwrap(), 20.0);
+        assert!(obj.get("experimental").unwrap().as_bool().unwrap());
+    }
+
+    #[test]
+    fn tojson_matrix_sorted_keys() {
+        let mut matrix = HashMap::new();
+        matrix.insert("zebra".to_string(), Value::String("z".to_string()));
+        matrix.insert("apple".to_string(), Value::String("a".to_string()));
+        matrix.insert("mango".to_string(), Value::String("m".to_string()));
+        let matrix = Some(matrix);
+        let ctx = make_ctx(&EMPTY_ENV, &EMPTY_STEPS, &matrix);
+        let result = evaluate("toJSON(matrix)", &ctx).unwrap();
+        let s = result.to_output_string();
+        let apple_pos = s.find("apple").unwrap();
+        let mango_pos = s.find("mango").unwrap();
+        let zebra_pos = s.find("zebra").unwrap();
+        assert!(apple_pos < mango_pos, "apple should come before mango");
+        assert!(mango_pos < zebra_pos, "mango should come before zebra");
+    }
+
+    #[test]
+    fn fromjson_tojson_matrix_produces_parseable_json() {
+        let mut matrix = HashMap::new();
+        matrix.insert("os".to_string(), Value::String("ubuntu-latest".to_string()));
+        matrix.insert("node".to_string(), Value::String("20".to_string()));
+        let matrix = Some(matrix);
+        let ctx = make_ctx(&EMPTY_ENV, &EMPTY_STEPS, &matrix);
+        let result = evaluate("fromJSON(toJSON(matrix))", &ctx).unwrap();
+        let s = result.to_output_string();
+        let parsed: serde_json::Value = serde_json::from_str(&s).expect("should be valid JSON");
+        let obj = parsed.as_object().expect("should be a JSON object");
+        assert_eq!(obj.get("os").unwrap(), "ubuntu-latest");
+        assert_eq!(obj.get("node").unwrap(), "20");
+    }
+
+    #[test]
+    fn bare_matrix_is_truthy() {
+        let mut matrix = HashMap::new();
+        matrix.insert("os".to_string(), Value::String("ubuntu".to_string()));
+        let matrix = Some(matrix);
+        let ctx = make_ctx(&EMPTY_ENV, &EMPTY_STEPS, &matrix);
+        let result = evaluate("matrix", &ctx).unwrap();
+        assert!(result.is_truthy());
+    }
+
+    #[test]
+    fn bare_matrix_when_none_is_null() {
+        let ctx = make_ctx(&EMPTY_ENV, &EMPTY_STEPS, &EMPTY_MATRIX);
+        let result = evaluate("matrix", &ctx).unwrap();
+        assert_eq!(result, ExprValue::Null);
+        assert!(!result.is_truthy());
+    }
+
+    #[test]
+    fn bare_matrix_does_not_shadow_dotted_access() {
+        // Regression guard: the bare-`matrix` arm must not shadow the existing
+        // `matrix.<key>` dotted-access arm.
+        let mut matrix = HashMap::new();
+        matrix.insert("os".to_string(), Value::String("ubuntu-latest".to_string()));
+        let matrix = Some(matrix);
+        let ctx = make_ctx(&EMPTY_ENV, &EMPTY_STEPS, &matrix);
+        let result = evaluate("matrix.os", &ctx).unwrap();
+        assert_eq!(result, ExprValue::String("ubuntu-latest".to_string()));
+    }
+
+    #[test]
+    fn tojson_matrix_yaml_sequence_falls_through_to_string() {
+        // Matrix values that aren't scalar (sequences, mappings) currently
+        // render via `yaml_value_to_expr`'s fallback branch as a YAML-string.
+        // Pins the current behaviour; a future switch to a nested structure
+        // would be a deliberate decision.
+        let mut matrix = HashMap::new();
+        matrix.insert(
+            "versions".to_string(),
+            Value::Sequence(vec![
+                Value::String("a".to_string()),
+                Value::String("b".to_string()),
+            ]),
+        );
+        let matrix = Some(matrix);
+        let ctx = make_ctx(&EMPTY_ENV, &EMPTY_STEPS, &matrix);
+        let result = evaluate("toJSON(matrix)", &ctx).unwrap();
+        let s = result.to_output_string();
+        let parsed: serde_json::Value = serde_json::from_str(&s).expect("should be valid JSON");
+        let obj = parsed.as_object().expect("should be a JSON object");
+        let versions = obj.get("versions").expect("versions key present");
+        let rendered = versions.as_str().expect("rendered as JSON string");
+        assert!(
+            rendered.contains("- a") && rendered.contains("- b"),
+            "expected YAML sequence rendering, got: {}",
+            rendered
+        );
     }
 
     #[test]

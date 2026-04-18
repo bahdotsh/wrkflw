@@ -481,13 +481,19 @@ impl<'a> ExpressionContext<'a> {
                 // surfaces as `github.token` in plaintext; do not dump this object
                 // to untrusted sinks without a masking layer.
                 const PREFIX: &str = "GITHUB_";
+                // Runner-internal file-path env vars that aren't part of GHA's
+                // `github` context. Excluded so `toJSON(github)` matches real GHA
+                // shape (and to avoid leaking local tempfile paths).
+                const INTERNAL_KEYS: &[&str] = &["output", "env", "path", "step_summary"];
                 let map = self
                     .env_context
                     .iter()
-                    .filter(|(k, _)| k.len() > PREFIX.len() && k.starts_with(PREFIX))
-                    .map(|(k, v)| {
-                        let key = k[PREFIX.len()..].to_ascii_lowercase();
-                        (key, ExprValue::String(v.clone()))
+                    .filter_map(|(k, v)| {
+                        k.strip_prefix(PREFIX)
+                            .filter(|rest| !rest.is_empty())
+                            .map(|rest| rest.to_ascii_lowercase())
+                            .filter(|key| !INTERNAL_KEYS.contains(&key.as_str()))
+                            .map(|key| (key, ExprValue::String(v.clone())))
                     })
                     .collect();
                 ExprValue::Object(map)
@@ -1872,6 +1878,54 @@ mod tests {
         assert!(obj.get("").is_none(), "empty-key entry must not appear");
         assert_eq!(obj.get("sha").unwrap(), "abc123");
         assert_eq!(obj.len(), 1);
+    }
+
+    #[test]
+    fn tojson_github_excludes_runner_internal_keys() {
+        // environment.rs seeds GITHUB_OUTPUT / GITHUB_ENV / GITHUB_PATH /
+        // GITHUB_STEP_SUMMARY with local tempfile paths for the runner's
+        // file-based workflow-command protocol. Real GHA doesn't expose these
+        // on the `github` context, so `toJSON(github)` must drop them.
+        let mut env = HashMap::new();
+        env.insert("GITHUB_OUTPUT".to_string(), "/tmp/out".to_string());
+        env.insert("GITHUB_ENV".to_string(), "/tmp/env".to_string());
+        env.insert("GITHUB_PATH".to_string(), "/tmp/path".to_string());
+        env.insert(
+            "GITHUB_STEP_SUMMARY".to_string(),
+            "/tmp/summary".to_string(),
+        );
+        env.insert("GITHUB_SHA".to_string(), "abc123".to_string());
+        let ctx = make_ctx(&env, &EMPTY_STEPS, &EMPTY_MATRIX);
+        let result = evaluate("toJSON(github)", &ctx).unwrap();
+        let s = result.to_output_string();
+        let parsed: serde_json::Value = serde_json::from_str(&s).expect("should be valid JSON");
+        let obj = parsed.as_object().expect("should be a JSON object");
+        assert!(obj.get("output").is_none(), "should exclude GITHUB_OUTPUT");
+        assert!(obj.get("env").is_none(), "should exclude GITHUB_ENV");
+        assert!(obj.get("path").is_none(), "should exclude GITHUB_PATH");
+        assert!(
+            obj.get("step_summary").is_none(),
+            "should exclude GITHUB_STEP_SUMMARY"
+        );
+        assert_eq!(obj.get("sha").unwrap(), "abc123");
+    }
+
+    #[test]
+    fn tojson_github_includes_user_defined_github_prefixed_vars() {
+        // Documents the prefix-heuristic's inverse limitation: a user-defined
+        // `env: { GITHUB_FOO: bar }` contaminates the github object as
+        // `github.foo`. Pin this so any future switch to a curated allowlist
+        // is a deliberate change, not a silent behaviour flip.
+        let mut env = HashMap::new();
+        env.insert("GITHUB_SHA".to_string(), "abc123".to_string());
+        env.insert("GITHUB_FOO".to_string(), "bar".to_string());
+        let ctx = make_ctx(&env, &EMPTY_STEPS, &EMPTY_MATRIX);
+        let result = evaluate("toJSON(github)", &ctx).unwrap();
+        let s = result.to_output_string();
+        let parsed: serde_json::Value = serde_json::from_str(&s).expect("should be valid JSON");
+        let obj = parsed.as_object().expect("should be a JSON object");
+        assert_eq!(obj.get("foo").unwrap(), "bar");
+        assert_eq!(obj.get("sha").unwrap(), "abc123");
     }
 
     // -- toJSON(steps) tests --

@@ -1,158 +1,168 @@
-// Status bar rendering
+// Bottom-chrome helpers.
+//
+// The bottom border of the outer frame carries context-sensitive key hints
+// on the left and a position indicator on the right. When `App` has a
+// status_message set, `toast_title` replaces the normal bottom chrome with
+// a single colored banner line.
+
 use crate::app::App;
 use crate::models::StatusSeverity;
-use crate::theme;
 use ratatui::{
-    layout::{Alignment, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::Paragraph,
-    Frame,
 };
-use wrkflw_executor::RuntimeType;
 
-// Render the status bar
-pub fn render_status_bar(f: &mut Frame<'_>, app: &App, area: Rect) {
+/// When a toast is set, render the whole bottom chrome as a colored banner.
+pub fn toast_title(app: &App) -> Option<Line<'static>> {
+    let message = app.status_message.as_deref()?;
     let t = &app.theme;
 
-    // If we have a status message, show it as a toast
-    if let Some(message) = &app.status_message {
-        let bg = match app.status_message_severity {
-            StatusSeverity::Success => t.success,
-            StatusSeverity::Info => t.info,
-            StatusSeverity::Warning => t.warning,
-            StatusSeverity::Error => t.error,
-        };
+    let (bg, marker) = match app.status_message_severity {
+        StatusSeverity::Success => (t.success, "✓"),
+        StatusSeverity::Info => (t.info, "ℹ"),
+        StatusSeverity::Warning => (t.warning, "!"),
+        StatusSeverity::Error => (t.error, "✖"),
+    };
 
-        let status_message = Paragraph::new(Line::from(vec![Span::styled(
-            format!(" {} ", message),
+    Some(Line::from(vec![
+        Span::styled(
+            format!(" {} ", marker),
             Style::default()
                 .bg(bg)
                 .fg(t.fg_badge)
                 .add_modifier(Modifier::BOLD),
-        )]))
-        .alignment(Alignment::Center);
-
-        f.render_widget(status_message, area);
-        return;
-    }
-
-    // Normal status bar
-    let mut status_items = vec![];
-
-    // Runtime mode badge
-    status_items.push(theme::badge(
-        app.runtime_type_name(),
-        match app.runtime_type {
-            RuntimeType::Docker => t.runtime_docker,
-            RuntimeType::Podman => t.runtime_podman,
-            RuntimeType::SecureEmulation => t.runtime_secure,
-            RuntimeType::Emulation => t.runtime_emulation,
-        },
-        t.fg_badge,
-    ));
-
-    // Container runtime status (uses cached availability from App state)
-    match app.runtime_type {
-        RuntimeType::Docker => {
-            status_items.push(Span::raw(" "));
-            status_items.push(theme::badge(
-                if app.runtime_available {
-                    "Docker: Connected"
-                } else {
-                    "Docker: Unavailable"
-                },
-                if app.runtime_available {
-                    t.success
-                } else {
-                    t.error
-                },
-                t.fg_badge,
-            ));
-        }
-        RuntimeType::Podman => {
-            status_items.push(Span::raw(" "));
-            status_items.push(theme::badge(
-                if app.runtime_available {
-                    "Podman: Connected"
-                } else {
-                    "Podman: Unavailable"
-                },
-                if app.runtime_available {
-                    t.success
-                } else {
-                    t.error
-                },
-                t.fg_badge,
-            ));
-        }
-        RuntimeType::SecureEmulation => {
-            status_items.push(Span::raw(" "));
-            status_items.push(Span::styled(
-                format!(" {}SECURE ", theme::symbols::LOCK),
-                Style::default().bg(t.runtime_secure).fg(t.fg_badge),
-            ));
-        }
-        RuntimeType::Emulation => {}
-    }
-
-    // Validation/execution mode badge
-    status_items.push(Span::raw(" "));
-    if app.validation_mode {
-        status_items.push(theme::badge("Validation", t.warning, t.fg_badge));
-    } else {
-        status_items.push(theme::badge("Execution", t.success, t.fg_badge));
-    }
-
-    // Separator
-    status_items.push(Span::styled(
-        format!(" {} ", theme::symbols::SEPARATOR),
-        Style::default().fg(t.fg_muted),
-    ));
-
-    // Context-specific help
-    let help_text = build_context_help(app);
-    status_items.push(Span::styled(help_text, theme::hint_style(t)));
-
-    let status_bar = Paragraph::new(Line::from(status_items))
-        .style(Style::default().bg(t.bg_bar))
-        .alignment(Alignment::Left);
-
-    f.render_widget(status_bar, area);
+        ),
+        Span::styled(
+            format!(" {} ", message),
+            Style::default().bg(bg).fg(t.fg_badge),
+        ),
+    ]))
 }
 
-fn build_context_help(app: &App) -> String {
+/// Left-aligned bottom-border title: a sequence of `[key] desc` pairs
+/// appropriate to the current tab / mode.
+pub fn bottom_left_title(app: &App) -> Line<'static> {
+    let t = &app.theme;
+    let pairs = current_pairs(app);
+
+    let key_style = Style::default()
+        .bg(t.bg_key_badge)
+        .fg(t.highlight)
+        .add_modifier(Modifier::BOLD);
+    let desc_style = Style::default().fg(t.help_hint);
+
+    let mut spans: Vec<Span<'static>> = vec![Span::raw(" ")];
+    for (key, desc) in pairs {
+        spans.push(Span::styled(format!(" {} ", key), key_style));
+        spans.push(Span::styled(format!(" {}", desc), desc_style));
+        spans.push(Span::raw(" "));
+    }
+    Line::from(spans)
+}
+
+/// Right-aligned bottom-border title: `ws 3/5`, `job 2/7`, etc.
+pub fn bottom_right_title(app: &App) -> Line<'static> {
+    let t = &app.theme;
+    let text = position_text(app);
+    Line::from(vec![Span::styled(
+        format!(" {} ", text),
+        Style::default().fg(t.fg_dim),
+    )])
+}
+
+fn position_text(app: &App) -> String {
     match app.selected_tab {
         0 => {
-            if app.job_selection_mode {
-                "Enter run \u{2502} a all \u{2502} Esc back".to_string()
-            } else if app.diff_filter_active {
-                "Space toggle \u{2502} Enter run \u{2502} r queue \u{2502} t trig \u{2502} d diff:ON \u{2502} ? help \u{2502} q quit".to_string()
+            let total = app.workflows.len();
+            let idx = app.workflow_list_state.selected().unwrap_or(0);
+            if total == 0 {
+                "no workflows".to_string()
+            } else if app.job_selection_mode {
+                let jobs = app.available_jobs.len().max(1);
+                format!("job {}/{}", app.selected_job_index + 1, jobs)
             } else {
-                "Space toggle \u{2502} Enter run \u{2502} r queue \u{2502} t trig \u{2502} d diff \u{2502} ? help \u{2502} q quit".to_string()
+                format!("ws {}/{}", idx + 1, total)
             }
         }
         1 => {
             if app.detailed_view {
-                "Esc back \u{2502} \u{2191}\u{2193} steps \u{2502} ? help \u{2502} q quit"
-                    .to_string()
+                let step = app.step_table_state.selected().unwrap_or(0) + 1;
+                format!("step {}", step)
             } else {
-                "Enter details \u{2502} \u{2191}\u{2193} jobs \u{2502} ? help \u{2502} q quit"
-                    .to_string()
+                let job = app.job_list_state.selected().unwrap_or(0) + 1;
+                format!("job {}", job)
             }
         }
         2 => {
-            let log_count = app.logs.len() + wrkflw_logging::get_logs().len();
-            if log_count > 0 {
-                format!(
-                    "{} logs \u{2502} \u{2191}\u{2193} scroll \u{2502} s search \u{2502} f filter \u{2502} ? help \u{2502} q quit",
-                    log_count
-                )
+            let n = app.processed_logs.len();
+            if n == 0 {
+                "no logs".to_string()
             } else {
-                "No logs \u{2502} ? help \u{2502} q quit".to_string()
+                format!("log {}/{}", (app.log_scroll + 1).min(n), n)
             }
         }
-        3 => "\u{2191}\u{2193} scroll \u{2502} ? close \u{2502} q quit".to_string(),
         _ => String::new(),
+    }
+}
+
+fn current_pairs(app: &App) -> &'static [(&'static str, &'static str)] {
+    match app.selected_tab {
+        0 => {
+            if app.job_selection_mode {
+                &[
+                    ("↵", "run"),
+                    ("a", "all"),
+                    ("Esc", "back"),
+                    ("?", "help"),
+                    ("q", "quit"),
+                ]
+            } else if app.diff_filter_active {
+                &[
+                    ("Space", "toggle"),
+                    ("↵", "run"),
+                    ("r", "queue"),
+                    ("t", "trig"),
+                    ("d", "diff:on"),
+                    ("?", "help"),
+                    ("q", "quit"),
+                ]
+            } else {
+                &[
+                    ("Space", "toggle"),
+                    ("↵", "run"),
+                    ("r", "queue"),
+                    ("t", "trig"),
+                    ("d", "diff"),
+                    ("?", "help"),
+                    ("q", "quit"),
+                ]
+            }
+        }
+        1 => {
+            if app.detailed_view {
+                &[
+                    ("Esc", "back"),
+                    ("↑↓", "steps"),
+                    ("?", "help"),
+                    ("q", "quit"),
+                ]
+            } else {
+                &[
+                    ("↵", "details"),
+                    ("↑↓", "jobs"),
+                    ("?", "help"),
+                    ("q", "quit"),
+                ]
+            }
+        }
+        2 => &[
+            ("↑↓", "scroll"),
+            ("s", "search"),
+            ("f", "filter"),
+            ("c", "clear"),
+            ("?", "help"),
+            ("q", "quit"),
+        ],
+        _ => &[("?", "help"), ("q", "quit")],
     }
 }

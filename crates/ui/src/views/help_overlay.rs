@@ -1,282 +1,199 @@
-// Help overlay rendering
+// Help modal.
+//
+// Single centered overlay; `?` / `Esc` dismisses. Sections have a bullet
+// header and an underline; each row is `[ key ] description` with the key
+// rendered as an inverse-video badge (mdterm/giff pattern).
+
+use crate::app::App;
 use crate::theme::{self, Theme};
 use ratatui::{
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
-    text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Paragraph, Wrap},
+    text::{Line, Span, Text},
+    widgets::{Block, BorderType, Borders, Clear, Paragraph},
     Frame,
 };
 
-fn section_header<'a>(t: &Theme, title: &'a str) -> Vec<Line<'a>> {
-    vec![
-        Line::from(Span::styled(
-            title,
+const MAX_MODAL_WIDTH: u16 = 68;
+const MAX_MODAL_HEIGHT: u16 = 34;
+
+/// Render the help modal centered over the current frame.
+pub fn render_help_modal(f: &mut Frame<'_>, app: &App) {
+    let t = &app.theme;
+    let area = f.area();
+
+    // Dim the rest of the frame so the modal reads as foreground.
+    let dim = Block::default().style(Style::default().bg(t.bg_modal_dim));
+    f.render_widget(dim, area);
+
+    let modal = centered_rect(MAX_MODAL_WIDTH, MAX_MODAL_HEIGHT, area);
+    f.render_widget(Clear, modal);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(t.border_focused))
+        .style(Style::default().bg(t.bg_modal))
+        .title(Span::styled(
+            " Keybindings ",
             Style::default()
                 .fg(t.accent)
-                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
-        )),
-        Line::from(Span::styled(
-            theme::symbols::HRULE.repeat(title.len()),
-            Style::default().fg(t.fg_muted),
-        )),
+                .add_modifier(Modifier::BOLD),
+        ))
+        .title_bottom(
+            Line::from(vec![
+                Span::styled(" ? ", key_badge_style(t)),
+                Span::raw(" "),
+                Span::styled(" Esc ", key_badge_style(t)),
+                Span::styled(" to close ", Style::default().fg(t.help_hint)),
+            ])
+            .alignment(Alignment::Center),
+        );
+
+    let inner = block.inner(modal);
+    f.render_widget(block, modal);
+
+    let inner_width = inner.width as usize;
+    let lines = build_lines(t, inner_width, app);
+    let visible = inner.height as usize;
+    let scroll = app.help_scroll.min(lines.len().saturating_sub(visible));
+    let visible_lines: Vec<Line> = lines.into_iter().skip(scroll).take(visible).collect();
+
+    let paragraph =
+        Paragraph::new(Text::from(visible_lines)).style(Style::default().bg(t.bg_modal));
+    f.render_widget(paragraph, inner);
+}
+
+fn build_lines(t: &Theme, width: usize, app: &App) -> Vec<Line<'static>> {
+    let mut out = Vec::new();
+
+    out.push(Line::from(""));
+    out.extend(section(t, "Navigation"));
+    out.push(row(t, "Tab / S-Tab", "Cycle tabs"));
+    out.push(row(t, "1 · 2 · 3", "Jump to tab"));
+    out.push(row(t, "↑↓ / k j", "Navigate lists"));
+    out.push(row(t, "Enter", "Select / view details"));
+    out.push(row(t, "Esc", "Back / exit"));
+    out.push(separator(t, width));
+
+    out.extend(section(t, "Workflows"));
+    out.push(row(t, "Space", "Toggle selection"));
+    out.push(row(t, "r", "Run selected"));
+    out.push(row(t, "a", "Select all"));
+    out.push(row(t, "n", "Deselect all"));
+    out.push(row(t, "S-R", "Reset status"));
+    out.push(row(t, "t", "Trigger remote"));
+    out.push(row(t, "S-J", "View jobs"));
+    out.push(separator(t, width));
+
+    out.extend(section(t, "Modes"));
+    out.push(row(t, "e", "Toggle emulation"));
+    out.push(row(t, "v", "Toggle validation"));
+    out.push(row(t, "d", "Toggle diff filter"));
+    out.push(row(t, "D", "Cycle diff event"));
+    out.push(row(t, "T", "Toggle light / dark"));
+    out.push(separator(t, width));
+
+    out.extend(section(t, "Logs"));
+    out.push(row(t, "s", "Search"));
+    out.push(row(t, "f", "Filter"));
+    out.push(row(t, "c", "Clear search & filter"));
+    out.push(row(t, "n", "Next match"));
+    out.push(separator(t, width));
+
+    out.extend(section(t, "Runtimes"));
+    out.push(runtime_row(t, "Docker", t.runtime_docker, "container isolation"));
+    out.push(runtime_row(t, "Podman", t.runtime_podman, "rootless containers"));
+    out.push(runtime_row(t, "Secure", t.runtime_secure, "sandboxed processes"));
+    out.push(runtime_row(t, "Emul.", t.runtime_emulation, "process mode (unsafe)"));
+    out.push(separator(t, width));
+
+    out.extend(section(t, "General"));
+    out.push(row(t, "?", "Toggle this help"));
+    out.push(row(t, "q", "Quit"));
+
+    // Include selected-tab for the help_scroll accounting.
+    let _ = app.selected_tab;
+    out
+}
+
+fn section(t: &Theme, title: &str) -> Vec<Line<'static>> {
+    vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  ● ", Style::default().fg(t.accent)),
+            Span::styled(
+                title.to_string(),
+                Style::default()
+                    .fg(t.accent)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(""),
     ]
 }
 
-fn key_line<'a>(t: &Theme, key: &'a str, desc: &'a str) -> Line<'a> {
+fn row(t: &Theme, key: &str, desc: &str) -> Line<'static> {
     Line::from(vec![
-        Span::styled(
-            format!(" {:16}", key),
-            Style::default()
-                .fg(t.highlight)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(desc, Style::default().fg(t.fg_dim)),
+        Span::raw("    "),
+        Span::styled(format!(" {:^10} ", key), key_badge_style(t)),
+        Span::raw("  "),
+        Span::styled(desc.to_string(), Style::default().fg(t.fg_normal)),
     ])
 }
 
-// Render the help tab with scroll support
-pub fn render_help_content(f: &mut Frame<'_>, t: &Theme, area: Rect, scroll_offset: usize) {
-    let chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)].as_ref())
-        .split(area);
-
-    // Left column
-    let mut left_lines: Vec<Line> = Vec::new();
-
-    left_lines.extend(section_header(t, "NAVIGATION"));
-    left_lines.push(Line::from(""));
-    left_lines.push(key_line(t, "Tab / Shift+Tab", "Switch between tabs"));
-    left_lines.push(key_line(t, "1-4 / w,x,l,h", "Jump to specific tab"));
-    left_lines.push(key_line(t, "\u{2191}/\u{2193} or k/j", "Navigate lists"));
-    left_lines.push(key_line(t, "Enter", "Select / View details"));
-    left_lines.push(key_line(t, "Esc", "Back / Exit help"));
-    left_lines.push(Line::from(""));
-
-    left_lines.extend(section_header(t, "WORKFLOW MANAGEMENT"));
-    left_lines.push(Line::from(""));
-    left_lines.push(key_line(t, "Space", "Toggle workflow selection"));
-    left_lines.push(key_line(t, "r", "Run selected workflows"));
-    left_lines.push(key_line(t, "a", "Select all workflows"));
-    left_lines.push(key_line(t, "n", "Deselect all workflows"));
-    left_lines.push(key_line(t, "Shift+R", "Reset workflow status"));
-    left_lines.push(key_line(t, "t", "Trigger remote workflow"));
-    left_lines.push(Line::from(""));
-
-    left_lines.extend(section_header(t, "JOB SELECTION"));
-    left_lines.push(Line::from(""));
-    left_lines.push(key_line(t, "Shift+J", "View jobs in workflow"));
-    left_lines.push(key_line(t, "Enter (in jobs)", "Run selected job"));
-    left_lines.push(key_line(t, "a (in jobs)", "Run all jobs"));
-    left_lines.push(key_line(t, "Esc (in jobs)", "Back to workflow list"));
-    left_lines.push(Line::from(""));
-
-    left_lines.extend(section_header(t, "EXECUTION MODES"));
-    left_lines.push(Line::from(""));
-    left_lines.push(key_line(t, "e", "Toggle emulation mode"));
-    left_lines.push(key_line(t, "v", "Toggle validation mode"));
-    left_lines.push(key_line(t, "d", "Toggle diff-aware trigger filter"));
-    left_lines.push(key_line(t, "D", "Cycle diff filter event (push/PR/...)"));
-    left_lines.push(Line::from(""));
-    left_lines.push(Line::from(Span::styled(
-        "Runtime Modes:",
-        Style::default()
-            .fg(t.fg_bright)
-            .add_modifier(Modifier::BOLD),
-    )));
-    left_lines.push(Line::from(vec![
-        Span::raw("  \u{2022} "),
-        Span::styled("Docker", Style::default().fg(t.runtime_docker)),
+fn runtime_row(t: &Theme, name: &str, color: ratatui::style::Color, desc: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::raw("    "),
         Span::styled(
-            " \u{2500} Container isolation (default)",
-            theme::dim_style(t),
+            format!(" {:^10} ", name),
+            Style::default().bg(color).fg(t.fg_badge).add_modifier(Modifier::BOLD),
         ),
-    ]));
-    left_lines.push(Line::from(vec![
-        Span::raw("  \u{2022} "),
-        Span::styled("Podman", Style::default().fg(t.runtime_podman)),
-        Span::styled(" \u{2500} Rootless containers", theme::dim_style(t)),
-    ]));
-    left_lines.push(Line::from(vec![
-        Span::raw("  \u{2022} "),
-        Span::styled("Emulation", Style::default().fg(t.runtime_emulation)),
-        Span::styled(" \u{2500} Process mode (UNSAFE)", theme::dim_style(t)),
-    ]));
-    left_lines.push(Line::from(vec![
-        Span::raw("  \u{2022} "),
-        Span::styled("Secure Emulation", Style::default().fg(t.runtime_secure)),
-        Span::styled(" \u{2500} Sandboxed processes", theme::dim_style(t)),
-    ]));
-
-    // Right column
-    let mut right_lines: Vec<Line> = Vec::new();
-
-    right_lines.extend(section_header(t, "LOGS & SEARCH"));
-    right_lines.push(Line::from(""));
-    right_lines.push(key_line(t, "s", "Toggle log search"));
-    right_lines.push(key_line(t, "f", "Toggle log filter"));
-    right_lines.push(key_line(t, "c", "Clear search & filter"));
-    right_lines.push(key_line(t, "n", "Next search match"));
-    right_lines.push(key_line(t, "\u{2191}/\u{2193}", "Scroll logs / Navigate"));
-    right_lines.push(Line::from(""));
-
-    right_lines.extend(section_header(t, "TAB OVERVIEW"));
-    right_lines.push(Line::from(""));
-    right_lines.push(Line::from(vec![
-        Span::styled(
-            "1. Workflows",
-            Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" \u{2500} Browse & select workflows", theme::dim_style(t)),
-    ]));
-    right_lines.push(Line::from(Span::styled(
-        "   View, select, and run workflows",
-        theme::muted_style(t),
-    )));
-    right_lines.push(Line::from(""));
-    right_lines.push(Line::from(vec![
-        Span::styled(
-            "2. Execution",
-            Style::default().fg(t.success).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" \u{2500} Monitor job progress", theme::dim_style(t)),
-    ]));
-    right_lines.push(Line::from(Span::styled(
-        "   Track jobs, steps, and output",
-        theme::muted_style(t),
-    )));
-    right_lines.push(Line::from(""));
-    right_lines.push(Line::from(vec![
-        Span::styled(
-            "3. Logs",
-            Style::default().fg(t.info).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" \u{2500} View execution logs", theme::dim_style(t)),
-    ]));
-    right_lines.push(Line::from(Span::styled(
-        "   Search, filter, real-time streaming",
-        theme::muted_style(t),
-    )));
-    right_lines.push(Line::from(""));
-    right_lines.push(Line::from(vec![
-        Span::styled(
-            "4. Help",
-            Style::default()
-                .fg(t.highlight)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" \u{2500} This guide", theme::dim_style(t)),
-    ]));
-    right_lines.push(Line::from(""));
-
-    right_lines.extend(section_header(t, "QUICK ACTIONS"));
-    right_lines.push(Line::from(""));
-    right_lines.push(key_line(t, "?", "Toggle help overlay"));
-    right_lines.push(key_line(t, "q", "Quit application"));
-    right_lines.push(Line::from(""));
-
-    right_lines.extend(section_header(t, "TIPS"));
-    right_lines.push(Line::from(""));
-    right_lines.push(Line::from(vec![
-        Span::raw("\u{2022} Use "),
-        Span::styled("emulation mode", Style::default().fg(t.runtime_emulation)),
-        Span::styled(" when containers are unavailable", theme::dim_style(t)),
-    ]));
-    right_lines.push(Line::from(vec![
-        Span::raw("\u{2022} "),
-        Span::styled("Secure emulation", Style::default().fg(t.runtime_secure)),
-        Span::styled(
-            " provides sandboxing for untrusted workflows",
-            theme::dim_style(t),
-        ),
-    ]));
-    right_lines.push(Line::from(vec![
-        Span::raw("\u{2022} Use "),
-        Span::styled("validation mode", Style::default().fg(t.success)),
-        Span::styled(" to check workflows without execution", theme::dim_style(t)),
-    ]));
-    right_lines.push(Line::from(""));
-    right_lines.push(Line::from(Span::styled(
-        "\u{2191}\u{2193} scroll \u{2502} ? close",
-        theme::muted_style(t),
-    )));
-
-    // Apply scroll offset
-    let left_lines: Vec<Line> = if scroll_offset < left_lines.len() {
-        left_lines.into_iter().skip(scroll_offset).collect()
-    } else {
-        vec![Line::from("")]
-    };
-
-    let right_lines: Vec<Line> = if scroll_offset < right_lines.len() {
-        right_lines.into_iter().skip(scroll_offset).collect()
-    } else {
-        vec![Line::from("")]
-    };
-
-    let left_widget = Paragraph::new(left_lines)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(t.border))
-                .title(Span::styled(" Controls & Features ", theme::title_style(t))),
-        )
-        .wrap(Wrap { trim: true });
-
-    let right_widget = Paragraph::new(right_lines)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(t.border))
-                .title(Span::styled(" Interface Guide ", theme::title_style(t))),
-        )
-        .wrap(Wrap { trim: true });
-
-    f.render_widget(left_widget, chunks[0]);
-    f.render_widget(right_widget, chunks[1]);
+        Span::raw("  "),
+        Span::styled(desc.to_string(), Style::default().fg(t.fg_normal)),
+    ])
 }
 
-// Render a help overlay
-pub fn render_help_overlay(f: &mut Frame<'_>, t: &Theme, scroll_offset: usize) {
-    let size = f.area();
+fn separator(t: &Theme, width: usize) -> Line<'static> {
+    let inner = width.saturating_sub(2);
+    Line::from(Span::styled(
+        format!(" {} ", theme::symbols::HRULE.repeat(inner)),
+        Style::default().fg(t.fg_separator),
+    ))
+}
 
-    let width = (size.width * 9 / 10).min(120);
-    let height = (size.height * 9 / 10).min(40);
-    let x = (size.width - width) / 2;
-    let y = (size.height - height) / 2;
+fn key_badge_style(t: &Theme) -> Style {
+    Style::default()
+        .bg(t.bg_key_badge)
+        .fg(t.highlight)
+        .add_modifier(Modifier::BOLD)
+}
 
-    let help_area = Rect {
-        x,
-        y,
-        width,
-        height,
-    };
+fn centered_rect(width: u16, height: u16, r: Rect) -> Rect {
+    if r.width == 0 || r.height == 0 {
+        return r;
+    }
+    let height = height.min(r.height);
+    let width = width.min(r.width);
 
-    // Dim the rest of the screen behind the overlay
-    let dim = Block::default().style(Style::default().bg(t.bg_modal_dim));
-    f.render_widget(dim, size);
+    let vert_margin = 100u16.saturating_sub(height * 100 / r.height) / 2;
+    let horiz_margin = 100u16.saturating_sub(width * 100 / r.width) / 2;
 
-    // Overlay border
-    let overlay_block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Double)
-        .style(Style::default().bg(t.bg_modal).fg(t.border_focused))
-        .title(Span::styled(
-            " Press ? or Esc to close ",
-            theme::muted_style(t),
-        ));
+    let vlayout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage(vert_margin),
+            Constraint::Length(height),
+            Constraint::Percentage(vert_margin),
+        ])
+        .split(r);
 
-    f.render_widget(overlay_block, help_area);
-
-    let inner_area = Rect {
-        x: help_area.x + 1,
-        y: help_area.y + 1,
-        width: help_area.width.saturating_sub(2),
-        height: help_area.height.saturating_sub(2),
-    };
-
-    render_help_content(f, t, inner_area, scroll_offset);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(horiz_margin),
+            Constraint::Length(width),
+            Constraint::Percentage(horiz_margin),
+        ])
+        .split(vlayout[1])[1]
 }

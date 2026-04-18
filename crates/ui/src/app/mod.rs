@@ -248,17 +248,26 @@ fn run_tui_event_loop(
                         }
                     }
                     KeyCode::Tab => {
-                        // Cycle through tabs
-                        app.switch_tab((app.selected_tab + 1) % 4);
+                        // Cycle through tabs (three tabs now — Help is a modal).
+                        app.switch_tab((app.selected_tab + 1) % 3);
                     }
                     KeyCode::BackTab => {
-                        // Cycle through tabs backwards
-                        app.switch_tab((app.selected_tab + 3) % 4);
+                        app.switch_tab((app.selected_tab + 2) % 3);
                     }
                     KeyCode::Char('1') | KeyCode::Char('w') => app.switch_tab(0),
                     KeyCode::Char('2') | KeyCode::Char('x') => app.switch_tab(1),
                     KeyCode::Char('3') | KeyCode::Char('l') => app.switch_tab(2),
-                    KeyCode::Char('4') | KeyCode::Char('h') => app.switch_tab(3),
+                    // `4` / `h` used to select the Help tab; preserve muscle memory by
+                    // transparently opening the help modal instead.
+                    KeyCode::Char('4') | KeyCode::Char('h') => {
+                        app.show_help = true;
+                    }
+                    // Uppercase `T` toggles dark / light theme. Lowercase `t` is
+                    // already bound to trigger-remote-workflow below.
+                    KeyCode::Char('T') => {
+                        app.theme = app.theme.toggle();
+                        app.logs_need_update = true;
+                    }
                     KeyCode::Up | KeyCode::Char('k') => {
                         if app.selected_tab == 2 {
                             if !app.log_search_matches.is_empty() {
@@ -266,8 +275,6 @@ fn run_tui_event_loop(
                             } else {
                                 app.scroll_logs_up();
                             }
-                        } else if app.selected_tab == 3 {
-                            app.scroll_help_up();
                         } else if app.selected_tab == 0 {
                             if app.job_selection_mode {
                                 app.previous_available_job();
@@ -289,8 +296,6 @@ fn run_tui_event_loop(
                             } else {
                                 app.scroll_logs_down();
                             }
-                        } else if app.selected_tab == 3 {
-                            app.scroll_help_down();
                         } else if app.selected_tab == 0 {
                             if app.job_selection_mode {
                                 app.next_available_job();

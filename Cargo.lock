@@ -4348,6 +4348,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "tokio",
+ "unicode-width",
  "wrkflw-evaluator",
  "wrkflw-executor",
  "wrkflw-github",

@@ -5,8 +5,9 @@ use crate::theme;
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
+    symbols,
     text::{Line, Span},
-    widgets::{Block, Gauge, List, ListItem, Paragraph},
+    widgets::{Block, LineGauge, List, ListItem, Paragraph},
     Frame,
 };
 
@@ -82,10 +83,13 @@ pub fn render_execution_tab(f: &mut Frame<'_>, app: &mut App, area: Rect) {
                 Span::styled(progress_text, Style::default().fg(t.fg_dim)),
             ]));
 
-            let gauge = Gauge::default()
+            let gauge = LineGauge::default()
                 .block(Block::default())
-                .gauge_style(Style::default().fg(gauge_color).bg(t.bg_dark))
-                .percent((progress * 100.0) as u16);
+                .filled_style(Style::default().fg(gauge_color))
+                .unfilled_style(Style::default().fg(t.scrollbar_track))
+                .filled_symbol(symbols::line::THICK_HORIZONTAL)
+                .unfilled_symbol(symbols::line::THICK_HORIZONTAL)
+                .ratio(progress.clamp(0.0, 1.0));
 
             let workflow_info_widget =
                 Paragraph::new(workflow_info).block(theme::block(t, "Workflow Information"));
@@ -143,7 +147,7 @@ pub fn render_execution_tab(f: &mut Frame<'_>, app: &mut App, area: Rect) {
                 let jobs_list = List::new(job_items)
                     .block(theme::block(t, "Jobs"))
                     .highlight_style(theme::selected_style(t))
-                    .highlight_symbol(theme::symbols::SELECTED);
+                    .highlight_symbol("\u{258c} ");
 
                 f.render_stateful_widget(jobs_list, chunks[1], &mut app.job_list_state);
             }

@@ -2,8 +2,9 @@
 use crate::app::App;
 use crate::models::TriggerMatchStatus;
 use crate::theme;
+use crate::utils::truncate_path;
 use ratatui::{
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Constraint, Rect},
     style::{Modifier, Style},
     widgets::{Cell, Row, Table, TableState},
     Frame,
@@ -20,16 +21,6 @@ pub fn render_workflows_tab(f: &mut Frame<'_>, app: &mut App, area: Rect) {
 
 fn render_workflow_list(f: &mut Frame<'_>, app: &mut App, area: Rect) {
     let t = &app.theme;
-    let selected_count = app.workflows.iter().filter(|w| w.selected).count();
-    // Surface the simulated event so users aren't confused when a
-    // pull_request-only workflow shows up as SKIPPED under the push-only
-    // diff filter.
-    let diff_indicator = if app.diff_filter_active {
-        format!(" [DIFF: {}]", app.diff_filter_event)
-    } else {
-        String::new()
-    };
-    let block_title = format!("Workflows ({} selected){}", selected_count, diff_indicator);
 
     let header_cells = if app.diff_filter_active {
         vec!["", "Status", "Trigger", "Workflow Name", "Path"]
@@ -43,60 +34,60 @@ fn render_workflow_list(f: &mut Frame<'_>, app: &mut App, area: Rect) {
     )
     .height(1);
 
+    // Reserve space for the highlight_symbol ("▌ " = 2 cols) plus the four
+    // leading fixed columns when sizing the path column's usable width.
+    let path_budget = (area.width as usize)
+        .saturating_sub(2 + 5 + 3 + if app.diff_filter_active { 3 } else { 0 })
+        / 2;
+
     let diff_active = app.diff_filter_active;
     let spinner_frame = app.spinner_frame;
-    let rows = app.workflows.iter().map(|workflow| {
-        let checkbox = if workflow.selected {
-            theme::symbols::CHECKBOX_ON
-        } else {
-            theme::symbols::CHECKBOX_OFF
-        };
-
-        let (status_symbol, status_style) =
-            theme::workflow_status_animated(t, &workflow.status, spinner_frame);
-
-        let path_display = workflow.path.to_string_lossy();
-        let path_shortened = if path_display.len() > 30 {
-            let start = path_display
-                .char_indices()
-                .rev()
-                .nth(29)
-                .map(|(i, _)| i)
-                .unwrap_or(0);
-            format!("\u{2026}{}", &path_display[start..])
-        } else {
-            path_display.to_string()
-        };
-
-        let mut cells = vec![
-            Cell::from(checkbox).style(Style::default().fg(t.success)),
-            Cell::from(status_symbol).style(status_style),
-        ];
-
-        if diff_active {
-            let (trigger_symbol, trigger_style) = match &workflow.trigger_match {
-                Some(TriggerMatchStatus::Matched(_)) => {
-                    ("\u{25cf}", Style::default().fg(t.success)) // filled circle
-                }
-                Some(TriggerMatchStatus::Skipped(_)) => {
-                    ("\u{25cb}", Style::default().fg(t.fg_muted)) // empty circle
-                }
-                None => ("-", Style::default().fg(t.fg_muted)),
+    let rows: Vec<Row> = app
+        .workflows
+        .iter()
+        .map(|workflow| {
+            let checkbox = if workflow.selected {
+                theme::symbols::CHECKBOX_ON
+            } else {
+                theme::symbols::CHECKBOX_OFF
             };
-            cells.push(Cell::from(trigger_symbol).style(trigger_style));
-        }
 
-        cells.push(
-            Cell::from(workflow.name.clone()).style(
-                Style::default()
-                    .fg(t.fg_bright)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        );
-        cells.push(Cell::from(path_shortened).style(theme::muted_style(t)));
+            let (status_symbol, status_style) =
+                theme::workflow_status_animated(t, &workflow.status, spinner_frame);
 
-        Row::new(cells)
-    });
+            let path_display = workflow.path.to_string_lossy();
+            let path_shortened = truncate_path(&path_display, path_budget.max(10));
+
+            let mut cells = vec![
+                Cell::from(checkbox).style(Style::default().fg(t.success)),
+                Cell::from(status_symbol).style(status_style),
+            ];
+
+            if diff_active {
+                let (trigger_symbol, trigger_style) = match &workflow.trigger_match {
+                    Some(TriggerMatchStatus::Matched(_)) => {
+                        ("\u{25cf}", Style::default().fg(t.success))
+                    }
+                    Some(TriggerMatchStatus::Skipped(_)) => {
+                        ("\u{25cb}", Style::default().fg(t.fg_muted))
+                    }
+                    None => ("-", Style::default().fg(t.fg_muted)),
+                };
+                cells.push(Cell::from(trigger_symbol).style(trigger_style));
+            }
+
+            cells.push(
+                Cell::from(workflow.name.clone()).style(
+                    Style::default()
+                        .fg(t.fg_bright)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            );
+            cells.push(Cell::from(path_shortened).style(theme::muted_style(t)));
+
+            Row::new(cells)
+        })
+        .collect();
 
     let widths: Vec<Constraint> = if app.diff_filter_active {
         vec![
@@ -117,29 +108,21 @@ fn render_workflow_list(f: &mut Frame<'_>, app: &mut App, area: Rect) {
 
     let workflows_table = Table::new(rows, widths)
         .header(header)
-        .block(theme::block(t, &block_title))
         .row_highlight_style(theme::selected_style(t))
-        .highlight_symbol(theme::symbols::SELECTED);
+        .highlight_symbol("\u{258c} "); // ▌
 
     let mut table_state = TableState::default();
     table_state.select(app.workflow_list_state.selected());
 
-    // Use inner area with margin for consistent spacing
-    let inner = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(0)].as_ref())
-        .margin(1)
-        .split(area);
+    // One-row margin on each side so rows don't crowd the outer frame border.
+    let inset = inset(area, 1, 0);
+    f.render_stateful_widget(workflows_table, inset, &mut table_state);
 
-    f.render_stateful_widget(workflows_table, inner[0], &mut table_state);
-
-    // Update the app list state to match the table state
     app.workflow_list_state.select(table_state.selected());
 }
 
 fn render_job_selection(f: &mut Frame<'_>, app: &mut App, area: Rect) {
     let t = &app.theme;
-    // Get workflow name for the header
     let workflow_name = app
         .workflow_list_state
         .selected()
@@ -147,39 +130,73 @@ fn render_job_selection(f: &mut Frame<'_>, app: &mut App, area: Rect) {
         .map(|w| w.name.as_str())
         .unwrap_or("Unknown");
 
-    let block_title = format!("Jobs in '{}'", workflow_name);
-
     let header_cells = ["#", "Job Name"]
         .iter()
         .map(|h| Cell::from(*h).style(theme::header_style(t)));
-
     let header = Row::new(header_cells).height(1);
 
-    let rows = app.available_jobs.iter().enumerate().map(|(i, job_name)| {
-        Row::new(vec![
-            Cell::from(format!("{}", i + 1)).style(theme::muted_style(t)),
-            Cell::from(job_name.clone()).style(Style::default().fg(t.fg_bright)),
-        ])
-    });
+    let rows: Vec<Row> = app
+        .available_jobs
+        .iter()
+        .enumerate()
+        .map(|(i, job_name)| {
+            Row::new(vec![
+                Cell::from(format!("{}", i + 1)).style(theme::muted_style(t)),
+                Cell::from(job_name.clone()).style(Style::default().fg(t.fg_bright)),
+            ])
+        })
+        .collect();
 
-    let widths = [
-        Constraint::Length(4),      // Number column
-        Constraint::Percentage(90), // Job name column
-    ];
+    let widths = [Constraint::Length(4), Constraint::Percentage(90)];
     let jobs_table = Table::new(rows, widths)
         .header(header)
-        .block(theme::block(t, &block_title))
         .row_highlight_style(theme::selected_style(t))
-        .highlight_symbol(theme::symbols::SELECTED);
+        .highlight_symbol("\u{258c} ");
 
     let mut table_state = TableState::default();
     table_state.select(Some(app.selected_job_index));
 
-    let inner = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(0)].as_ref())
-        .margin(1)
-        .split(area);
+    // Render a small "Jobs in '<workflow>'" header line above the table,
+    // then the table in the remaining area.
+    use ratatui::text::{Line, Span};
+    use ratatui::widgets::Paragraph;
+    let heading = Paragraph::new(Line::from(vec![
+        Span::styled("  Jobs in ", theme::muted_style(t)),
+        Span::styled(
+            format!("'{}'", workflow_name),
+            Style::default()
+                .fg(t.fg_bright)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]));
+    let (heading_rect, body_rect) = split_top(area, 1);
+    f.render_widget(heading, heading_rect);
+    f.render_stateful_widget(jobs_table, inset(body_rect, 1, 0), &mut table_state);
+}
 
-    f.render_stateful_widget(jobs_table, inner[0], &mut table_state);
+/// Inset `r` by `dx` columns horizontally and `dy` rows vertically.
+fn inset(r: Rect, dx: u16, dy: u16) -> Rect {
+    Rect {
+        x: r.x + dx,
+        y: r.y + dy,
+        width: r.width.saturating_sub(dx * 2),
+        height: r.height.saturating_sub(dy * 2),
+    }
+}
+
+/// Split `r` into a top strip of `top_h` rows and the remainder below it.
+fn split_top(r: Rect, top_h: u16) -> (Rect, Rect) {
+    let top = Rect {
+        x: r.x,
+        y: r.y,
+        width: r.width,
+        height: top_h.min(r.height),
+    };
+    let rest = Rect {
+        x: r.x,
+        y: r.y + top.height,
+        width: r.width,
+        height: r.height.saturating_sub(top.height),
+    };
+    (top, rest)
 }

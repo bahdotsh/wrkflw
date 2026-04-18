@@ -1,8 +1,35 @@
 // UI utilities
 use crate::models::{Workflow, WorkflowStatus};
 use std::path::{Path, PathBuf};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use wrkflw_parser::workflow::parse_workflow;
 use wrkflw_utils::is_workflow_file;
+
+/// Truncate a display string from the left so it fits within `max_width`
+/// terminal columns, preserving the tail (filename) and inserting `…` at
+/// the head. Uses Unicode display widths so East Asian wide characters
+/// are measured correctly.
+pub fn truncate_path(path: &str, max_width: usize) -> String {
+    let display_width = UnicodeWidthStr::width(path);
+    if display_width <= max_width {
+        return path.to_string();
+    }
+    if max_width <= 1 {
+        return "\u{2026}".to_string();
+    }
+    let target = max_width - 1; // one column for the "…" prefix
+    let mut width = 0;
+    let mut start_byte = path.len();
+    for (idx, ch) in path.char_indices().rev() {
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if width + ch_width > target {
+            break;
+        }
+        width += ch_width;
+        start_byte = idx;
+    }
+    format!("\u{2026}{}", &path[start_byte..])
+}
 
 /// Parse a workflow file and return sorted job names, or an empty vec on failure.
 pub fn extract_job_names(path: &Path) -> Vec<String> {
@@ -70,4 +97,32 @@ pub fn load_workflows(dir_path: &Path) -> Vec<Workflow> {
     // Sort workflows by name
     workflows.sort_by(|a, b| a.name.cmp(&b.name));
     workflows
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_path_no_change_when_fits() {
+        assert_eq!(truncate_path("src/main.rs", 20), "src/main.rs");
+    }
+
+    #[test]
+    fn truncate_path_left_prefix_with_ellipsis() {
+        // 10 chars, max 6 → "…" + last 5 chars
+        assert_eq!(truncate_path("abcdefghij", 6), "\u{2026}fghij");
+    }
+
+    #[test]
+    fn truncate_path_very_narrow_returns_ellipsis() {
+        assert_eq!(truncate_path("abcdefghij", 1), "\u{2026}");
+        assert_eq!(truncate_path("abcdefghij", 0), "\u{2026}");
+    }
+
+    #[test]
+    fn truncate_path_respects_cjk_width() {
+        // Each CJK char is 2 columns wide; "日本語" = 6 cols, max 5 → "…本語" (5 cols).
+        assert_eq!(truncate_path("日本語", 5), "\u{2026}本語");
+    }
 }

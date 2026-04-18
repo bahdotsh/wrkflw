@@ -299,6 +299,36 @@ pub(crate) fn is_user_env_var(key: &str) -> bool {
         && key != "MATRIX_CONTEXT" // inserted by add_matrix_context() in environment.rs
 }
 
+/// If `key` is a `GITHUB_*` env var that belongs on GHA's `github.*` expression
+/// context, returns the stripped + lowercased suffix used as the object key
+/// (`GITHUB_SHA` → `"sha"`). Returns `None` for non-`GITHUB_*` keys, the bare
+/// `GITHUB_` prefix, and runner-internal env vars that real GHA does not expose
+/// on the `github` context.
+///
+/// The excluded suffixes fall into two groups, both seeded by
+/// `environment.rs::create_github_context`:
+///   - File-path vars for the workflow-command protocol (`GITHUB_OUTPUT`,
+///     `GITHUB_ENV`, `GITHUB_PATH`, `GITHUB_STEP_SUMMARY`) — these point at
+///     local tempfiles; leaking them diverges from real GHA and leaks paths.
+///   - CI-detection vars (`GITHUB_ACTIONS`) — documented as default runner
+///     env, not as a `github.*` context property.
+///
+/// Update this function when new runner-internal `GITHUB_*` vars are seeded.
+pub(crate) fn github_context_suffix(key: &str) -> Option<String> {
+    let rest = key.strip_prefix("GITHUB_")?;
+    if rest.is_empty() {
+        return None;
+    }
+    let suffix = rest.to_ascii_lowercase();
+    if matches!(
+        suffix.as_str(),
+        "output" | "env" | "path" | "step_summary" | "actions"
+    ) {
+        return None;
+    }
+    Some(suffix)
+}
+
 // ---------------------------------------------------------------------------
 // Expression context
 // ---------------------------------------------------------------------------
@@ -470,29 +500,23 @@ impl<'a> ExpressionContext<'a> {
             "github" if parts.len() == 1 => {
                 // Build a flat object from GITHUB_* env vars by stripping the
                 // prefix and lowercasing the remainder, inverting the dotted-access
-                // mapping (`github.sha` → `GITHUB_SHA`). Does not include a nested
-                // `event` sub-object — that's the same documented limitation as the
-                // dotted-access arm above.
+                // mapping (`github.sha` → `GITHUB_SHA`). Runner-internal keys that
+                // aren't part of GHA's `github` context are filtered out inside
+                // `github_context_suffix`. Does not include a nested `event`
+                // sub-object — same documented limitation as the dotted-access arm
+                // above.
                 //
-                // KNOWN LIMITATION: The inverse of `toJSON(env)`'s prefix heuristic
+                // KNOWN LIMITATION: the inverse of `toJSON(env)`'s prefix heuristic
                 // applies here — any user-defined env var starting with `GITHUB_`
                 // (e.g. the common `env: { GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} }`)
                 // will appear in this object. In particular `GITHUB_TOKEN`, if set,
                 // surfaces as `github.token` in plaintext; do not dump this object
                 // to untrusted sinks without a masking layer.
-                const PREFIX: &str = "GITHUB_";
-                // Runner-internal file-path env vars that aren't part of GHA's
-                // `github` context. Excluded so `toJSON(github)` matches real GHA
-                // shape (and to avoid leaking local tempfile paths).
-                const INTERNAL_KEYS: &[&str] = &["output", "env", "path", "step_summary"];
                 let map = self
                     .env_context
                     .iter()
                     .filter_map(|(k, v)| {
-                        k.strip_prefix(PREFIX)
-                            .filter(|rest| !rest.is_empty())
-                            .map(|rest| rest.to_ascii_lowercase())
-                            .filter(|key| !INTERNAL_KEYS.contains(&key.as_str()))
+                        github_context_suffix(k)
                             .map(|key| (key, ExprValue::String(v.clone())))
                     })
                     .collect();
@@ -1882,10 +1906,14 @@ mod tests {
 
     #[test]
     fn tojson_github_excludes_runner_internal_keys() {
-        // environment.rs seeds GITHUB_OUTPUT / GITHUB_ENV / GITHUB_PATH /
-        // GITHUB_STEP_SUMMARY with local tempfile paths for the runner's
-        // file-based workflow-command protocol. Real GHA doesn't expose these
-        // on the `github` context, so `toJSON(github)` must drop them.
+        // environment.rs seeds two classes of runner-internal GITHUB_* vars that
+        // aren't part of real GHA's `github` context:
+        //   - workflow-command-protocol tempfile paths (GITHUB_OUTPUT / GITHUB_ENV
+        //     / GITHUB_PATH / GITHUB_STEP_SUMMARY) — dropping these also avoids
+        //     leaking local tempfile paths.
+        //   - CI-detection (GITHUB_ACTIONS) — documented as default runner env,
+        //     not as a `github.*` context property.
+        // `toJSON(github)` must drop all of them.
         let mut env = HashMap::new();
         env.insert("GITHUB_OUTPUT".to_string(), "/tmp/out".to_string());
         env.insert("GITHUB_ENV".to_string(), "/tmp/env".to_string());
@@ -1894,6 +1922,7 @@ mod tests {
             "GITHUB_STEP_SUMMARY".to_string(),
             "/tmp/summary".to_string(),
         );
+        env.insert("GITHUB_ACTIONS".to_string(), "true".to_string());
         env.insert("GITHUB_SHA".to_string(), "abc123".to_string());
         let ctx = make_ctx(&env, &EMPTY_STEPS, &EMPTY_MATRIX);
         let result = evaluate("toJSON(github)", &ctx).unwrap();
@@ -1906,6 +1935,10 @@ mod tests {
         assert!(
             obj.get("step_summary").is_none(),
             "should exclude GITHUB_STEP_SUMMARY"
+        );
+        assert!(
+            obj.get("actions").is_none(),
+            "should exclude GITHUB_ACTIONS (not a github-context property)"
         );
         assert_eq!(obj.get("sha").unwrap(), "abc123");
     }

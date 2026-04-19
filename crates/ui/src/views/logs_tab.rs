@@ -98,7 +98,9 @@ fn render_log_table(f: &mut Frame<'_>, app: &App, area: Rect) {
         .map(|h| Cell::from(*h).style(theme::header_style(t)));
     let header = Row::new(header_cells).height(1);
 
-    let rows = filtered_logs.iter().map(|processed_log| processed_log.to_row(t));
+    let rows = filtered_logs
+        .iter()
+        .map(|processed_log| processed_log.to_row(t));
 
     let widths = [
         Constraint::Length(10),

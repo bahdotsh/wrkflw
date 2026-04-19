@@ -1,5 +1,5 @@
 use crate::container::{
-    rebase_working_dir_or_error, ContainerError, ContainerOutput, ContainerRuntime,
+    rebase_working_dir_or_error, ContainerError, ContainerOutput, ContainerRuntime, LogSink,
 };
 use crate::sandbox::{create_workflow_sandbox_config, Sandbox, SandboxConfig, SandboxError};
 use async_trait::async_trait;
@@ -56,6 +56,7 @@ impl ContainerRuntime for SecureEmulationRuntime {
         working_dir: &Path,
         volumes: &[(&Path, &Path)],
         entrypoint: Option<&str>,
+        log_sink: Option<&LogSink>,
     ) -> Result<ContainerOutput, ContainerError> {
         if let Some(ep) = entrypoint {
             wrkflw_logging::warning(&format!(
@@ -82,7 +83,7 @@ impl ContainerRuntime for SecureEmulationRuntime {
         // Use sandbox to execute the command safely
         let result = self
             .sandbox
-            .execute_command(command, env_vars, &host_working_dir)
+            .execute_command(command, env_vars, &host_working_dir, log_sink)
             .await;
 
         match result {
@@ -383,6 +384,7 @@ mod tests {
                 &PathBuf::from("."),
                 &[],
                 None,
+                None,
             )
             .await;
 
@@ -403,6 +405,7 @@ mod tests {
                 &[],
                 &PathBuf::from("."),
                 &[],
+                None,
                 None,
             )
             .await;
@@ -435,6 +438,7 @@ mod tests {
                 container,
                 &[(host, container)],
                 None,
+                None,
             )
             .await
             .expect("secure_emulation run failed");
@@ -458,6 +462,7 @@ mod tests {
                 &[],
                 Path::new("/github/workspace"),
                 &[],
+                None,
                 None,
             )
             .await;

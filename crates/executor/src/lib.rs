@@ -9,6 +9,7 @@ pub mod dependency;
 pub mod docker;
 pub mod engine;
 pub mod environment;
+pub mod events;
 pub mod expression;
 pub mod github_env_files;
 pub mod podman;
@@ -20,3 +21,4 @@ pub use docker::cleanup_resources;
 pub use engine::{
     execute_workflow, ExecutionConfig, JobResult, JobStatus, RuntimeType, StepResult, StepStatus,
 };
+pub use events::{EventSink, ExecutionEvent, JobId, LogStream};

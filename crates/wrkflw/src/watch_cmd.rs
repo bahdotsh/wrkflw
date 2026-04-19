@@ -91,6 +91,7 @@ pub(crate) async fn run(ctx: WatchCtx) {
         secrets_config: None,
         show_action_messages: ctx.show_action_messages,
         target_job: None,
+        event_sink: None,
     };
 
     use wrkflw_ui::cli_style;

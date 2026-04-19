@@ -1,8 +1,11 @@
+use crate::container::{LogSink, LogStream};
 use regex::Regex;
 use std::collections::HashSet;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::process::Command;
 use wrkflw_logging;
 
 /// Configuration for sandbox execution.
@@ -213,6 +216,7 @@ impl Sandbox {
         command: &[&str],
         env_vars: &[(&str, &str)],
         working_dir: &Path,
+        log_sink: Option<&LogSink>,
     ) -> Result<crate::container::ContainerOutput, SandboxError> {
         if command.is_empty() {
             return Err(SandboxError::ExecutionError {
@@ -226,7 +230,7 @@ impl Sandbox {
         self.validate_command(&command_str)?;
 
         // Step 2: Execute in-place with limits
-        self.execute_with_limits(command, env_vars, working_dir)
+        self.execute_with_limits(command, env_vars, working_dir, log_sink)
             .await
     }
 
@@ -338,6 +342,7 @@ impl Sandbox {
         command: &[&str],
         env_vars: &[(&str, &str)],
         working_dir: &Path,
+        log_sink: Option<&LogSink>,
     ) -> Result<crate::container::ContainerOutput, SandboxError> {
         // Join command parts and execute via shell for proper handling of operators
         let command_str = command.join(" ");
@@ -371,15 +376,60 @@ impl Sandbox {
 
         let start_time = std::time::Instant::now();
 
-        let result = tokio::time::timeout(timeout_duration, async {
-            let output = cmd.output().map_err(|e| SandboxError::ExecutionError {
-                reason: format!("Command execution failed: {}", e),
+        let stdout_sink = log_sink.cloned();
+        let stderr_sink = log_sink.cloned();
+
+        let result = tokio::time::timeout(timeout_duration, async move {
+            let mut child = cmd.spawn().map_err(|e| SandboxError::ExecutionError {
+                reason: format!("Command spawn failed: {}", e),
             })?;
 
+            let stdout_handle = child.stdout.take();
+            let stderr_handle = child.stderr.take();
+
+            let stdout_task = tokio::spawn(async move {
+                let mut acc = String::new();
+                if let Some(stdout) = stdout_handle {
+                    let mut reader = BufReader::new(stdout).lines();
+                    while let Ok(Some(line)) = reader.next_line().await {
+                        if let Some(ref s) = stdout_sink {
+                            let _ = s.send((LogStream::Stdout, format!("{}\n", line)));
+                        }
+                        acc.push_str(&line);
+                        acc.push('\n');
+                    }
+                }
+                acc
+            });
+
+            let stderr_task = tokio::spawn(async move {
+                let mut acc = String::new();
+                if let Some(stderr) = stderr_handle {
+                    let mut reader = BufReader::new(stderr).lines();
+                    while let Ok(Some(line)) = reader.next_line().await {
+                        if let Some(ref s) = stderr_sink {
+                            let _ = s.send((LogStream::Stderr, format!("{}\n", line)));
+                        }
+                        acc.push_str(&line);
+                        acc.push('\n');
+                    }
+                }
+                acc
+            });
+
+            let status = child
+                .wait()
+                .await
+                .map_err(|e| SandboxError::ExecutionError {
+                    reason: format!("Command wait failed: {}", e),
+                })?;
+            let stdout_str = stdout_task.await.unwrap_or_default();
+            let stderr_str = stderr_task.await.unwrap_or_default();
+
             Ok(crate::container::ContainerOutput {
-                stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-                stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-                exit_code: output.status.code().unwrap_or(-1),
+                stdout: stdout_str,
+                stderr: stderr_str,
+                exit_code: status.code().unwrap_or(-1),
             })
         })
         .await;

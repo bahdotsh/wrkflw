@@ -122,8 +122,12 @@ pub fn render_execution_tab(f: &mut Frame<'_>, app: &mut App, area: Rect) {
                             .steps
                             .iter()
                             .filter(|s| {
-                                s.status == wrkflw_executor::StepStatus::Success
-                                    || s.status == wrkflw_executor::StepStatus::Failure
+                                matches!(
+                                    s.status,
+                                    wrkflw_executor::StepStatus::Success
+                                        | wrkflw_executor::StepStatus::Failure
+                                        | wrkflw_executor::StepStatus::Skipped
+                                )
                             })
                             .count();
 

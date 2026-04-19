@@ -117,7 +117,10 @@ pub fn top_right_title(app: &App) -> Line<'static> {
             Style::default().fg(t.fg_dim)
         };
         spans.push(Span::styled(n, Style::default().fg(t.fg_muted)));
-        spans.push(Span::styled("·".to_string(), Style::default().fg(t.fg_muted)));
+        spans.push(Span::styled(
+            "·".to_string(),
+            Style::default().fg(t.fg_muted),
+        ));
         spans.push(Span::styled((*label).to_string(), style));
     }
     spans.push(Span::raw(" "));

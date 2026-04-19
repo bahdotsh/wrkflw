@@ -36,9 +36,7 @@ pub fn render_help_modal(f: &mut Frame<'_>, app: &App) {
         .style(Style::default().bg(t.bg_modal))
         .title(Span::styled(
             " Keybindings ",
-            Style::default()
-                .fg(t.accent)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
         ))
         .title_bottom(
             Line::from(vec![
@@ -102,10 +100,30 @@ fn build_lines(t: &Theme, width: usize, app: &App) -> Vec<Line<'static>> {
     out.push(separator(t, width));
 
     out.extend(section(t, "Runtimes"));
-    out.push(runtime_row(t, "Docker", t.runtime_docker, "container isolation"));
-    out.push(runtime_row(t, "Podman", t.runtime_podman, "rootless containers"));
-    out.push(runtime_row(t, "Secure", t.runtime_secure, "sandboxed processes"));
-    out.push(runtime_row(t, "Emul.", t.runtime_emulation, "process mode (unsafe)"));
+    out.push(runtime_row(
+        t,
+        "Docker",
+        t.runtime_docker,
+        "container isolation",
+    ));
+    out.push(runtime_row(
+        t,
+        "Podman",
+        t.runtime_podman,
+        "rootless containers",
+    ));
+    out.push(runtime_row(
+        t,
+        "Secure",
+        t.runtime_secure,
+        "sandboxed processes",
+    ));
+    out.push(runtime_row(
+        t,
+        "Emul.",
+        t.runtime_emulation,
+        "process mode (unsafe)",
+    ));
     out.push(separator(t, width));
 
     out.extend(section(t, "General"));
@@ -124,9 +142,7 @@ fn section(t: &Theme, title: &str) -> Vec<Line<'static>> {
             Span::styled("  ● ", Style::default().fg(t.accent)),
             Span::styled(
                 title.to_string(),
-                Style::default()
-                    .fg(t.accent)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
             ),
         ]),
         Line::from(""),
@@ -147,7 +163,10 @@ fn runtime_row(t: &Theme, name: &str, color: ratatui::style::Color, desc: &str) 
         Span::raw("    "),
         Span::styled(
             format!(" {:^10} ", name),
-            Style::default().bg(color).fg(t.fg_badge).add_modifier(Modifier::BOLD),
+            Style::default()
+                .bg(color)
+                .fg(t.fg_badge)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::raw("  "),
         Span::styled(desc.to_string(), Style::default().fg(t.fg_normal)),

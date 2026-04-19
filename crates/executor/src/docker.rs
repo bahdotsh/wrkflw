@@ -12,7 +12,8 @@ use std::path::Path;
 use std::sync::Mutex;
 use wrkflw_logging;
 use wrkflw_runtime::container::{
-    ContainerError, ContainerOutput, ContainerRuntime, COMBINED_IMAGE_PREFIX, LOCAL_IMAGE_PREFIX,
+    ContainerError, ContainerOutput, ContainerRuntime, LogSink, LogStream, COMBINED_IMAGE_PREFIX,
+    LOCAL_IMAGE_PREFIX,
 };
 use wrkflw_utils;
 use wrkflw_utils::fd;
@@ -639,6 +640,7 @@ impl ContainerRuntime for DockerRuntime {
         working_dir: &Path,
         volumes: &[(&Path, &Path)],
         entrypoint: Option<&str>,
+        log_sink: Option<&LogSink>,
     ) -> Result<ContainerOutput, ContainerError> {
         // Print detailed debugging info
         wrkflw_logging::info(&format!("Docker: Running container with image: {}", image));
@@ -649,7 +651,15 @@ impl ContainerRuntime for DockerRuntime {
         // Run the entire container operation with a timeout
         match tokio::time::timeout(
             timeout_duration,
-            self.run_container_inner(image, cmd, env_vars, working_dir, volumes, entrypoint),
+            self.run_container_inner(
+                image,
+                cmd,
+                env_vars,
+                working_dir,
+                volumes,
+                entrypoint,
+                log_sink,
+            ),
         )
         .await
         {
@@ -868,6 +878,7 @@ impl ContainerRuntime for DockerRuntime {
 
 // Move the actual implementation to internal methods
 impl DockerRuntime {
+    #[allow(clippy::too_many_arguments)]
     async fn run_container_inner(
         &self,
         image: &str,
@@ -876,6 +887,7 @@ impl DockerRuntime {
         working_dir: &Path,
         volumes: &[(&Path, &Path)],
         entrypoint: Option<&str>,
+        log_sink: Option<&LogSink>,
     ) -> Result<ContainerOutput, ContainerError> {
         // Try to pull the image if it's not available locally.
         // Skip pull for locally-built images (e.g., combined runtime images).
@@ -1036,58 +1048,73 @@ impl DockerRuntime {
             }
         }
 
-        // Wait for container to finish with a timeout (300 seconds)
-        let wait_result = tokio::time::timeout(
-            std::time::Duration::from_secs(300),
-            self.docker
-                .wait_container::<String>(&container.id, None)
-                .collect::<Vec<_>>(),
-        )
-        .await;
-
-        let exit_code = match wait_result {
-            Ok(results) => match results.first() {
-                Some(Ok(exit)) => exit.status_code as i32,
-                _ => -1,
-            },
-            Err(_) => {
-                wrkflw_logging::warning("Container wait operation timed out, treating as failure");
-                -1
-            }
-        };
-
-        // Get logs with a timeout
+        // Drive container wait and log streaming concurrently. With
+        // `follow: true`, the logs stream stays open until the container
+        // exits; bollard closes it at that point, so `join` naturally ends
+        // as soon as both the wait and the drain complete. This is what
+        // lets the UI see stdout/stderr as it's produced instead of in one
+        // chunk at the end.
         let log_options = Some(bollard::container::LogsOptions::<String> {
             stdout: true,
             stderr: true,
+            follow: true,
             ..Default::default()
         });
-        let logs_result = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            self.docker
-                .logs(&container.id, log_options)
-                .collect::<Vec<_>>(),
-        )
-        .await;
+        let stdout_sink = log_sink.cloned();
+        let stderr_sink = log_sink.cloned();
+        let mut log_stream = self.docker.logs(&container.id, log_options);
 
-        let mut stdout = String::new();
-        let mut stderr = String::new();
-
-        if let Ok(logs) = logs_result {
-            for log in logs.into_iter().flatten() {
-                match log {
-                    bollard::container::LogOutput::StdOut { message } => {
-                        stdout.push_str(&String::from_utf8_lossy(&message));
+        let drain_logs = async move {
+            let mut stdout = String::new();
+            let mut stderr = String::new();
+            while let Some(result) = log_stream.next().await {
+                match result {
+                    Ok(bollard::container::LogOutput::StdOut { message }) => {
+                        let chunk = String::from_utf8_lossy(&message).to_string();
+                        if let Some(ref s) = stdout_sink {
+                            let _ = s.send((LogStream::Stdout, chunk.clone()));
+                        }
+                        stdout.push_str(&chunk);
                     }
-                    bollard::container::LogOutput::StdErr { message } => {
-                        stderr.push_str(&String::from_utf8_lossy(&message));
+                    Ok(bollard::container::LogOutput::StdErr { message }) => {
+                        let chunk = String::from_utf8_lossy(&message).to_string();
+                        if let Some(ref s) = stderr_sink {
+                            let _ = s.send((LogStream::Stderr, chunk.clone()));
+                        }
+                        stderr.push_str(&chunk);
                     }
                     _ => {}
                 }
             }
-        } else {
-            wrkflw_logging::warning("Retrieving container logs timed out");
-        }
+            (stdout, stderr)
+        };
+
+        let wait_future = self
+            .docker
+            .wait_container::<String>(&container.id, None)
+            .collect::<Vec<_>>();
+
+        let combined = tokio::time::timeout(
+            std::time::Duration::from_secs(310),
+            futures::future::join(wait_future, drain_logs),
+        )
+        .await;
+
+        let (exit_code, stdout, stderr) = match combined {
+            Ok((wait_results, (stdout, stderr))) => {
+                let code = match wait_results.first() {
+                    Some(Ok(exit)) => exit.status_code as i32,
+                    _ => -1,
+                };
+                (code, stdout, stderr)
+            }
+            Err(_) => {
+                wrkflw_logging::warning(
+                    "Container wait/log streaming timed out, treating as failure",
+                );
+                (-1, String::new(), String::new())
+            }
+        };
 
         // Clean up container with a timeout, but preserve on failure if configured
         if exit_code == 0 || !self.preserve_containers_on_failure {

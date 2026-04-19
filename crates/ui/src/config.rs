@@ -27,11 +27,7 @@ impl Config {
         match toml::from_str(&contents) {
             Ok(config) => config,
             Err(e) => {
-                eprintln!(
-                    "Warning: failed to parse {}: {}",
-                    path.display(),
-                    e
-                );
+                eprintln!("Warning: failed to parse {}: {}", path.display(), e);
                 Config::default()
             }
         }

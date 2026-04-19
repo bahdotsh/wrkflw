@@ -1,5 +1,6 @@
 use crate::container::{
-    rebase_working_dir_or_error, ContainerError, ContainerOutput, ContainerRuntime,
+    rebase_working_dir_or_error, ContainerError, ContainerOutput, ContainerRuntime, LogSink,
+    LogStream,
 };
 use async_trait::async_trait;
 use once_cell::sync::Lazy;
@@ -9,6 +10,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
 use tempfile::TempDir;
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::process::Command as TokioCommand;
 use which;
 use wrkflw_logging;
 
@@ -156,6 +159,7 @@ impl ContainerRuntime for EmulationRuntime {
         working_dir: &Path,
         volumes: &[(&Path, &Path)],
         _entrypoint: Option<&str>,
+        log_sink: Option<&LogSink>,
     ) -> Result<ContainerOutput, ContainerError> {
         // Build command string
         let mut command_str = String::new();
@@ -240,12 +244,12 @@ impl ContainerRuntime for EmulationRuntime {
 
         let mut cmd;
         if use_direct_exec {
-            cmd = Command::new(command[0]);
+            cmd = TokioCommand::new(command[0]);
             if command.len() > 1 {
                 cmd.args(&command[1..]);
             }
         } else {
-            cmd = Command::new("sh");
+            cmd = TokioCommand::new("sh");
             cmd.arg("-c");
             cmd.arg(&command_str);
         }
@@ -275,26 +279,76 @@ impl ContainerRuntime for EmulationRuntime {
             }
         }
 
-        match cmd.output() {
-            Ok(output_result) => {
-                let exit_code = output_result.status.code().unwrap_or(-1);
-                let output = String::from_utf8_lossy(&output_result.stdout).to_string();
-                let error = String::from_utf8_lossy(&output_result.stderr).to_string();
+        // Pipe both streams so we can (a) stream them line-by-line to the
+        // optional log_sink and (b) accumulate the complete output for the
+        // final `ContainerOutput`. Keeping both in one place preserves the
+        // pre-streaming behavior from the caller's point of view.
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
 
+        let mut child = cmd.spawn().map_err(|e| {
+            ContainerError::ContainerExecution(format!(
+                "Failed to spawn command: {}\nError: {}",
+                command_str, e
+            ))
+        })?;
+
+        let stdout_handle = child.stdout.take();
+        let stderr_handle = child.stderr.take();
+
+        let stdout_sink = log_sink.cloned();
+        let stderr_sink = log_sink.cloned();
+
+        // Each pump task reads its stream to EOF, forwards every line to the
+        // sink (if any), and accumulates into a String returned at join time.
+        let stdout_task = tokio::spawn(async move {
+            let mut acc = String::new();
+            if let Some(stdout) = stdout_handle {
+                let mut reader = BufReader::new(stdout).lines();
+                while let Ok(Some(line)) = reader.next_line().await {
+                    if let Some(ref s) = stdout_sink {
+                        let _ = s.send((LogStream::Stdout, format!("{}\n", line)));
+                    }
+                    acc.push_str(&line);
+                    acc.push('\n');
+                }
+            }
+            acc
+        });
+
+        let stderr_task = tokio::spawn(async move {
+            let mut acc = String::new();
+            if let Some(stderr) = stderr_handle {
+                let mut reader = BufReader::new(stderr).lines();
+                while let Ok(Some(line)) = reader.next_line().await {
+                    if let Some(ref s) = stderr_sink {
+                        let _ = s.send((LogStream::Stderr, format!("{}\n", line)));
+                    }
+                    acc.push_str(&line);
+                    acc.push('\n');
+                }
+            }
+            acc
+        });
+
+        let wait_result = child.wait().await;
+        let stdout_str = stdout_task.await.unwrap_or_default();
+        let stderr_str = stderr_task.await.unwrap_or_default();
+
+        match wait_result {
+            Ok(status) => {
+                let exit_code = status.code().unwrap_or(-1);
                 wrkflw_logging::debug(&format!("Command completed with exit code: {}", exit_code));
-
                 Ok(ContainerOutput {
-                    stdout: output,
-                    stderr: error,
+                    stdout: stdout_str,
+                    stderr: stderr_str,
                     exit_code,
                 })
             }
-            Err(e) => {
-                return Err(ContainerError::ContainerExecution(format!(
-                    "Failed to execute command: {}\nError: {}",
-                    command_str, e
-                )));
-            }
+            Err(e) => Err(ContainerError::ContainerExecution(format!(
+                "Failed to wait on command: {}\nError: {}",
+                command_str, e
+            ))),
         }
     }
 
@@ -762,6 +816,7 @@ mod tests {
                 Path::new("."),
                 &[(Path::new("."), Path::new("/github/workspace"))],
                 None,
+                None,
             )
             .await;
 
@@ -779,6 +834,7 @@ mod tests {
                 &[],
                 Path::new("."),
                 &[(Path::new("."), Path::new("/github/workspace"))],
+                None,
                 None,
             )
             .await;
@@ -808,6 +864,7 @@ mod tests {
                 &[],
                 Path::new("/github/workspace"),
                 &[],
+                None,
                 None,
             )
             .await;

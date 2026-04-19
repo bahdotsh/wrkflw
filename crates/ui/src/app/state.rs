@@ -100,6 +100,17 @@ pub struct App {
     /// Active color theme. Thread through render calls via `&app.theme`;
     /// swap via `Theme::toggle()` (commit 5 wires the keybind).
     pub theme: Theme,
+
+    /// Live execution-event receiver. Populated by
+    /// `start_next_workflow_execution` each time a workflow is dispatched
+    /// with an attached `EventSink`. The event loop drains it on every tick.
+    pub event_rx:
+        Option<tokio::sync::mpsc::UnboundedReceiver<wrkflw_executor::events::ExecutionEvent>>,
+
+    /// When `true`, selection in the steps table jumps to the newest
+    /// `Running` step as events arrive. Any manual up/down navigation flips
+    /// this to `false`; pressing `f` re-engages it.
+    pub auto_follow_step: bool,
 }
 
 /// Result rows shipped from the background diff-filter task to the UI loop.
@@ -342,6 +353,225 @@ impl App {
             diff_filter_aborted: false,
 
             theme: Theme::default(),
+            event_rx: None,
+            auto_follow_step: true,
+        }
+    }
+
+    /// Apply a single `ExecutionEvent` from the executor's live event stream
+    /// to the corresponding workflow's execution details.
+    ///
+    /// Jobs are matched by their `event_job_id`. Steps are matched by
+    /// `step_idx`. YAML-seeded `Pending` jobs get their `event_job_id`
+    /// bound on first `JobStarted`.
+    pub fn apply_execution_event(&mut self, ev: wrkflw_executor::events::ExecutionEvent) {
+        let Some(workflow_idx) = self.current_execution else {
+            return;
+        };
+        let Some(workflow) = self.workflows.get_mut(workflow_idx) else {
+            return;
+        };
+        let Some(execution) = workflow.execution_details.as_mut() else {
+            return;
+        };
+
+        use wrkflw_executor::events::ExecutionEvent as E;
+        match ev {
+            E::ExecutionStarted { .. } => {
+                // No-op at the app level; state.running is already true.
+            }
+            E::JobStarted {
+                job_id,
+                name,
+                canonical_name,
+                started_at,
+            } => {
+                // Prefer to bind an existing Pending/YAML-seeded slot by name;
+                // otherwise append a new JobExecution.
+                if let Some(existing) = execution.jobs.iter_mut().find(|j| {
+                    j.event_job_id.is_none() && (j.name == name || j.name == canonical_name)
+                }) {
+                    existing.name = name;
+                    existing.event_job_id = Some(job_id);
+                    existing.start_time = Some(started_at);
+                    existing.status = JobStatus::Success; // will be overwritten on completion
+                } else {
+                    execution.jobs.push(JobExecution {
+                        name,
+                        status: JobStatus::Success,
+                        steps: Vec::new(),
+                        logs: Vec::new(),
+                        start_time: Some(started_at),
+                        end_time: None,
+                        event_job_id: Some(job_id),
+                    });
+                }
+                // First JobStarted of the run: flip into the live detailed view
+                // and make sure selection points somewhere sane.
+                self.detailed_view = true;
+                if self.job_list_state.selected().is_none() {
+                    self.job_list_state.select(Some(0));
+                }
+            }
+            E::JobCompleted {
+                job_id,
+                status,
+                ended_at,
+            } => {
+                if let Some(job) = execution
+                    .jobs
+                    .iter_mut()
+                    .find(|j| j.event_job_id == Some(job_id))
+                {
+                    job.status = match status {
+                        wrkflw_executor::JobStatus::Success => JobStatus::Success,
+                        wrkflw_executor::JobStatus::Failure => JobStatus::Failure,
+                        wrkflw_executor::JobStatus::Skipped => JobStatus::Skipped,
+                    };
+                    job.end_time = Some(ended_at);
+                }
+            }
+            E::StepStarted {
+                job_id,
+                step_idx,
+                name,
+                started_at,
+            } => {
+                // Locate the owning job for auto-follow first, then mutate its
+                // steps. We keep the auto-follow pointers (selected job + step)
+                // in sync so the user lands on the actually-running step
+                // without having to press anything.
+                let mut job_idx_for_follow: Option<usize> = None;
+                for (idx, j) in execution.jobs.iter_mut().enumerate() {
+                    if j.event_job_id == Some(job_id) {
+                        while j.steps.len() <= step_idx {
+                            j.steps.push(StepExecution {
+                                name: String::new(),
+                                status: StepStatus::Pending,
+                                output: String::new(),
+                                log_buffer: Vec::new(),
+                                start_time: None,
+                                end_time: None,
+                            });
+                        }
+                        let step = &mut j.steps[step_idx];
+                        step.name = name;
+                        step.status = StepStatus::Running;
+                        step.start_time = Some(started_at);
+                        job_idx_for_follow = Some(idx);
+                        break;
+                    }
+                }
+                if self.auto_follow_step {
+                    if let Some(job_idx) = job_idx_for_follow {
+                        self.job_list_state.select(Some(job_idx));
+                    }
+                    self.step_table_state.select(Some(step_idx));
+                    self.step_list_state.select(Some(step_idx));
+                }
+            }
+            E::StepLogChunk {
+                job_id,
+                step_idx,
+                stream,
+                data,
+            } => {
+                if let Some(job) = execution
+                    .jobs
+                    .iter_mut()
+                    .find(|j| j.event_job_id == Some(job_id))
+                {
+                    if let Some(step) = job.steps.get_mut(step_idx) {
+                        step.log_buffer.push(crate::models::LogLine {
+                            stream,
+                            text: data,
+                            at: Local::now(),
+                        });
+                    }
+                }
+            }
+            E::StepCompleted {
+                job_id,
+                step_idx,
+                status,
+                ended_at,
+                ..
+            } => {
+                if let Some(job) = execution
+                    .jobs
+                    .iter_mut()
+                    .find(|j| j.event_job_id == Some(job_id))
+                {
+                    if let Some(step) = job.steps.get_mut(step_idx) {
+                        step.status = match status {
+                            wrkflw_executor::StepStatus::Pending => StepStatus::Pending,
+                            wrkflw_executor::StepStatus::Running => StepStatus::Running,
+                            wrkflw_executor::StepStatus::Success => StepStatus::Success,
+                            wrkflw_executor::StepStatus::Failure => StepStatus::Failure,
+                            wrkflw_executor::StepStatus::Skipped => StepStatus::Skipped,
+                            _ => StepStatus::Skipped,
+                        };
+                        step.end_time = Some(ended_at);
+                    }
+                }
+            }
+            E::ExecutionCompleted { ended_at } => {
+                execution.end_time = Some(ended_at);
+            }
+            _ => {}
+        }
+    }
+
+    /// Find the currently-running step (across all jobs) and move selection
+    /// onto it. Falls back to the most recently-completed step, then to the
+    /// first step. Called from the `f` keybinding to re-engage auto-follow.
+    pub fn snap_to_running_step(&mut self) {
+        let Some(workflow_idx) = self.current_execution else {
+            return;
+        };
+        let Some(workflow) = self.workflows.get(workflow_idx) else {
+            return;
+        };
+        let Some(execution) = workflow.execution_details.as_ref() else {
+            return;
+        };
+        // Look for a Running step first. If none, pick the last job/step we
+        // have any record of.
+        for (ji, job) in execution.jobs.iter().enumerate() {
+            for (si, step) in job.steps.iter().enumerate() {
+                if step.status == StepStatus::Running {
+                    self.job_list_state.select(Some(ji));
+                    self.step_table_state.select(Some(si));
+                    self.step_list_state.select(Some(si));
+                    return;
+                }
+            }
+        }
+        if let Some((ji, job)) = execution
+            .jobs
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, j)| !j.steps.is_empty())
+        {
+            self.job_list_state.select(Some(ji));
+            let si = job.steps.len() - 1;
+            self.step_table_state.select(Some(si));
+            self.step_list_state.select(Some(si));
+        }
+    }
+
+    /// Drain every pending event from the live event receiver and apply
+    /// them in order. Called once per tick of the TUI event loop.
+    pub fn drain_execution_events(&mut self) {
+        let mut batch = Vec::new();
+        if let Some(rx) = self.event_rx.as_mut() {
+            while let Ok(ev) = rx.try_recv() {
+                batch.push(ev);
+            }
+        }
+        for ev in batch {
+            self.apply_execution_event(ev);
         }
     }
 
@@ -842,6 +1072,9 @@ impl App {
 
     // Move cursor up in step list
     pub fn previous_step(&mut self) {
+        // Manual navigation disengages auto-follow; the user wants to pin
+        // their inspection somewhere regardless of where the executor is.
+        self.auto_follow_step = false;
         let current_workflow_idx = self
             .current_execution
             .or_else(|| self.workflow_list_state.selected())
@@ -877,6 +1110,7 @@ impl App {
 
     // Move cursor down in step list
     pub fn next_step(&mut self) {
+        self.auto_follow_step = false;
         let current_workflow_idx = self
             .current_execution
             .or_else(|| self.workflow_list_state.selected())
@@ -989,32 +1223,101 @@ impl App {
                         .push(format!("[{}] Operation completed successfully.", timestamp));
                     execution_details.progress = 1.0;
 
-                    // Convert wrkflw_executor::JobResult to our JobExecution struct
-                    execution_details.jobs = jobs
-                        .iter()
-                        .map(|job_result| JobExecution {
-                            name: job_result.name.clone(),
-                            status: match job_result.status {
-                                wrkflw_executor::JobStatus::Success => JobStatus::Success,
-                                wrkflw_executor::JobStatus::Failure => JobStatus::Failure,
-                                wrkflw_executor::JobStatus::Skipped => JobStatus::Skipped,
-                            },
-                            steps: job_result
-                                .steps
-                                .iter()
-                                .map(|step_result| StepExecution {
-                                    name: step_result.name.clone(),
-                                    status: match step_result.status {
-                                        wrkflw_executor::StepStatus::Success => StepStatus::Success,
-                                        wrkflw_executor::StepStatus::Failure => StepStatus::Failure,
-                                        wrkflw_executor::StepStatus::Skipped => StepStatus::Skipped,
-                                    },
-                                    output: step_result.output.clone(),
-                                })
-                                .collect::<Vec<StepExecution>>(),
-                            logs: vec![job_result.logs.clone()],
-                        })
-                        .collect::<Vec<JobExecution>>();
+                    // Reconcile final JobResults into execution_details.
+                    //
+                    // If live events have already populated jobs/steps (event_sink
+                    // was attached on this run), we keep those pre-seeded
+                    // structures and only merge in fields that the event stream
+                    // does not carry — specifically the full `output` string for
+                    // archival. Otherwise, we fall back to the legacy full-rebuild
+                    // (CLI-style callers).
+                    let live_streamed = !execution_details.jobs.is_empty();
+                    if live_streamed {
+                        // Match by display name: execute_matrix_job and execute_job
+                        // both include the display-name form that JobStarted emits.
+                        for job_result in jobs.iter() {
+                            if let Some(existing) = execution_details
+                                .jobs
+                                .iter_mut()
+                                .find(|j| j.name == job_result.name)
+                            {
+                                existing.status = match job_result.status {
+                                    wrkflw_executor::JobStatus::Success => JobStatus::Success,
+                                    wrkflw_executor::JobStatus::Failure => JobStatus::Failure,
+                                    wrkflw_executor::JobStatus::Skipped => JobStatus::Skipped,
+                                };
+                                existing.logs = vec![job_result.logs.clone()];
+                                for (idx, step_result) in job_result.steps.iter().enumerate() {
+                                    if idx < existing.steps.len() {
+                                        existing.steps[idx].output = step_result.output.clone();
+                                        existing.steps[idx].status = match step_result.status {
+                                            wrkflw_executor::StepStatus::Pending => {
+                                                StepStatus::Pending
+                                            }
+                                            wrkflw_executor::StepStatus::Running => {
+                                                StepStatus::Running
+                                            }
+                                            wrkflw_executor::StepStatus::Success => {
+                                                StepStatus::Success
+                                            }
+                                            wrkflw_executor::StepStatus::Failure => {
+                                                StepStatus::Failure
+                                            }
+                                            wrkflw_executor::StepStatus::Skipped => {
+                                                StepStatus::Skipped
+                                            }
+                                            _ => StepStatus::Skipped,
+                                        };
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        execution_details.jobs = jobs
+                            .iter()
+                            .map(|job_result| JobExecution {
+                                name: job_result.name.clone(),
+                                status: match job_result.status {
+                                    wrkflw_executor::JobStatus::Success => JobStatus::Success,
+                                    wrkflw_executor::JobStatus::Failure => JobStatus::Failure,
+                                    wrkflw_executor::JobStatus::Skipped => JobStatus::Skipped,
+                                },
+                                steps: job_result
+                                    .steps
+                                    .iter()
+                                    .map(|step_result| StepExecution {
+                                        name: step_result.name.clone(),
+                                        status: match step_result.status {
+                                            wrkflw_executor::StepStatus::Pending => {
+                                                StepStatus::Pending
+                                            }
+                                            wrkflw_executor::StepStatus::Running => {
+                                                StepStatus::Running
+                                            }
+                                            wrkflw_executor::StepStatus::Success => {
+                                                StepStatus::Success
+                                            }
+                                            wrkflw_executor::StepStatus::Failure => {
+                                                StepStatus::Failure
+                                            }
+                                            wrkflw_executor::StepStatus::Skipped => {
+                                                StepStatus::Skipped
+                                            }
+                                            _ => StepStatus::Skipped,
+                                        },
+                                        output: step_result.output.clone(),
+                                        log_buffer: Vec::new(),
+                                        start_time: None,
+                                        end_time: None,
+                                    })
+                                    .collect::<Vec<StepExecution>>(),
+                                logs: vec![job_result.logs.clone()],
+                                start_time: None,
+                                end_time: None,
+                                event_job_id: None,
+                            })
+                            .collect::<Vec<JobExecution>>();
+                    }
                 }
                 Err(e) => {
                     let timestamp = Local::now().format("%H:%M:%S").to_string();
@@ -1031,8 +1334,14 @@ impl App {
                             name: "Execution Error".to_string(),
                             status: StepStatus::Failure,
                             output: format!("Error: {}\n\nThis error prevented the workflow from executing properly.", e),
+                            log_buffer: Vec::new(),
+                            start_time: None,
+                            end_time: None,
                         }],
                         logs: vec![format!("Workflow execution error: {}", e)],
+                        start_time: None,
+                        end_time: None,
+                        event_job_id: None,
                     }];
                 }
             }

@@ -190,6 +190,7 @@ pub async fn execute_workflow_cli(
         secrets_config: None,                  // Use default secrets configuration
         show_action_messages,
         target_job: None,
+        event_sink: None,
     };
 
     match wrkflw_executor::execute_workflow(path, config).await {
@@ -287,6 +288,11 @@ pub async fn execute_workflow_cli(
                             }
                         }
                         StepStatus::Skipped => {
+                            println!("{}", cli_style::step_skipped(&step.name));
+                        }
+                        // Pending/Running should not appear in a completed
+                        // JobResult — render defensively rather than panicking.
+                        _ => {
                             println!("{}", cli_style::step_skipped(&step.name));
                         }
                     }
@@ -536,6 +542,19 @@ pub fn start_next_workflow_execution(
             });
         }
 
+        // Live event channel for this execution. The sender is passed to the
+        // executor via `ExecutionConfig.event_sink`; the receiver is parked
+        // on App so the main event loop can drain it each tick. Skip for
+        // validation-mode (synthetic results, nothing to stream).
+        let event_sink = if !validation_mode {
+            let (tx_ev, rx_ev) =
+                tokio::sync::mpsc::unbounded_channel::<wrkflw_executor::events::ExecutionEvent>();
+            app.event_rx = Some(rx_ev);
+            Some(wrkflw_executor::events::EventSink::new(tx_ev))
+        } else {
+            None
+        };
+
         thread::spawn(move || {
             let rt = match tokio::runtime::Runtime::new() {
                 Ok(runtime) => runtime,
@@ -603,6 +622,7 @@ pub fn start_next_workflow_execution(
                         secrets_config: None, // Use default secrets configuration
                         show_action_messages,
                         target_job,
+                        event_sink: event_sink.clone(),
                     };
 
                     let execution_result = wrkflw_utils::fd::with_stderr_to_null(|| {

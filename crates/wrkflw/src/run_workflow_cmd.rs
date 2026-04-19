@@ -104,6 +104,7 @@ pub(crate) async fn run(ctx: RunCtx) {
         secrets_config: None, // Use default secrets configuration
         show_action_messages: ctx.show_action_messages,
         target_job: ctx.job.clone(),
+        event_sink: None,
     };
     let workflow_type = if is_gitlab {
         "GitLab CI pipeline"
@@ -212,6 +213,9 @@ pub(crate) async fn run(ctx: RunCtx) {
                     wrkflw_executor::StepStatus::Skipped => {
                         println!("{}", cli_style::step_skipped(&step.name))
                     }
+                    // Pending/Running cannot appear in a completed JobResult
+                    // returned from execute_workflow; render defensively.
+                    _ => println!("{}", cli_style::step_skipped(&step.name)),
                 }
             }
         }

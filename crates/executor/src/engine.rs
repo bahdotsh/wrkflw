@@ -217,6 +217,17 @@ async fn execute_github_workflow(
     let mut all_job_outputs: HashMap<String, HashMap<String, String>> = HashMap::new();
     let mut all_job_results: HashMap<String, String> = HashMap::new();
 
+    // Emit a single `ExecutionStarted` before dispatching any job batches.
+    // Consumers (TUI) seed their `Pending` state from the workflow YAML they
+    // already parsed, so we don't need to enumerate the plan here.
+    crate::events::emit(
+        config.event_sink.as_ref(),
+        crate::events::ExecutionEvent::ExecutionStarted {
+            workflow_name: workflow.name.clone(),
+            started_at: chrono::Local::now(),
+        },
+    );
+
     for job_batch in execution_plan {
         // Execute jobs in parallel if they don't depend on each other
         let job_results = execute_job_batch(
@@ -232,6 +243,7 @@ async fn execute_github_workflow(
             &all_job_results,
             &artifact_store,
             &cache_store,
+            config.event_sink.as_ref(),
         )
         .await?;
 
@@ -290,6 +302,13 @@ async fn execute_github_workflow(
     if has_failures {
         wrkflw_logging::error(&format!("Workflow execution failed:{}", failure_details));
     }
+
+    crate::events::emit(
+        config.event_sink.as_ref(),
+        crate::events::ExecutionEvent::ExecutionCompleted {
+            ended_at: chrono::Local::now(),
+        },
+    );
 
     Ok(ExecutionResult {
         jobs: results,
@@ -415,6 +434,7 @@ async fn execute_gitlab_pipeline(
             &HashMap::new(),
             &artifact_store,
             &cache_store,
+            config.event_sink.as_ref(),
         )
         .await?;
 
@@ -449,6 +469,13 @@ async fn execute_gitlab_pipeline(
     if has_failures {
         wrkflw_logging::error(&format!("Pipeline execution failed:{}", failure_details));
     }
+
+    crate::events::emit(
+        config.event_sink.as_ref(),
+        crate::events::ExecutionEvent::ExecutionCompleted {
+            ended_at: chrono::Local::now(),
+        },
+    );
 
     Ok(ExecutionResult {
         jobs: results,
@@ -625,6 +652,10 @@ pub struct ExecutionConfig {
     pub secrets_config: Option<SecretConfig>,
     pub show_action_messages: bool,
     pub target_job: Option<String>,
+    /// Optional sink for live execution events. Set by the TUI to drive its
+    /// per-step progress view; left `None` on the CLI path (no events are
+    /// emitted in that case).
+    pub event_sink: Option<crate::events::EventSink>,
 }
 
 pub struct ExecutionResult {
@@ -689,7 +720,12 @@ impl StepResult {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[allow(dead_code)]
+#[non_exhaustive]
 pub enum StepStatus {
+    /// Step is known to the execution plan but has not started yet.
+    Pending,
+    /// Step is currently executing.
+    Running,
     Success,
     Failure,
     Skipped,
@@ -698,6 +734,8 @@ pub enum StepStatus {
 impl std::fmt::Display for StepStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            StepStatus::Pending => f.write_str("pending"),
+            StepStatus::Running => f.write_str("running"),
             StepStatus::Success => f.write_str("success"),
             StepStatus::Failure => f.write_str("failure"),
             StepStatus::Skipped => f.write_str("skipped"),
@@ -1081,6 +1119,7 @@ async fn execute_native_docker_step(
             container_workspace,
             &volumes,
             entrypoint.as_deref(),
+            ctx.log_sink.as_ref(),
         )
         .await
         .map_err(|e| ExecutionError::Runtime(format!("{}", e)))?;
@@ -1723,6 +1762,7 @@ async fn execute_job_batch(
     all_job_results: &HashMap<String, String>,
     artifact_store: &crate::artifacts::ArtifactStore,
     cache_store: &crate::cache::CacheStore,
+    event_sink: Option<&crate::events::EventSink>,
 ) -> Result<Vec<JobResult>, ExecutionError> {
     // Execute jobs in parallel
     let futures = jobs.iter().map(|job_name| {
@@ -1739,6 +1779,7 @@ async fn execute_job_batch(
             all_job_results,
             artifact_store,
             cache_store,
+            event_sink.cloned(),
         )
     });
     // NOTE: execute_job_batch and execute_job_with_matrix retain their argument
@@ -1771,6 +1812,12 @@ struct JobExecutionContext<'a> {
     user_env: &'a HashMap<String, String>,
     verbose: bool,
     services: JobServices<'a>,
+    /// Optional sink for live execution events. Threaded through from
+    /// `ExecutionConfig.event_sink`; `None` on the CLI path.
+    event_sink: Option<crate::events::EventSink>,
+    /// Per-run unique id for this job instance (matrix combinations get
+    /// distinct ids). Minted by the caller before dispatch.
+    job_id: crate::events::JobId,
 }
 
 /// Execute a job, expanding matrix if present
@@ -1788,6 +1835,7 @@ async fn execute_job_with_matrix(
     all_job_results: &HashMap<String, String>,
     artifact_store: &crate::artifacts::ArtifactStore,
     cache_store: &crate::cache::CacheStore,
+    event_sink: Option<crate::events::EventSink>,
 ) -> Result<Vec<JobResult>, ExecutionError> {
     // NOTE: This function still has many arguments because it sits at the boundary
     // between per-run state (artifact_store, cache_store) and per-job state (needs
@@ -1807,6 +1855,23 @@ async fn execute_job_with_matrix(
                 job_name,
                 if_condition
             ));
+            // Emit a JobStarted/JobCompleted pair for the skipped job so the
+            // UI can surface it in the live view (it won't otherwise appear).
+            if let Some(sink) = event_sink.as_ref() {
+                let job_id = sink.allocate_job_id();
+                let started_at = chrono::Local::now();
+                sink.emit(crate::events::ExecutionEvent::JobStarted {
+                    job_id,
+                    name: job_name.to_string(),
+                    canonical_name: job_name.to_string(),
+                    started_at,
+                });
+                sink.emit(crate::events::ExecutionEvent::JobCompleted {
+                    job_id,
+                    status: JobStatus::Skipped,
+                    ended_at: started_at,
+                });
+            }
             // Return a skipped job result
             return Ok(vec![JobResult {
                 name: job_name.to_string(),
@@ -1879,10 +1944,11 @@ async fn execute_job_with_matrix(
             user_env,
             verbose,
             services,
+            event_sink,
         })
         .await
     } else {
-        // Regular job, no matrix
+        // Regular job, no matrix — mint one JobId for the whole job.
         let services = JobServices {
             secret_manager,
             secret_masker,
@@ -1892,6 +1958,10 @@ async fn execute_job_with_matrix(
             artifact_store,
             cache_store,
         };
+        let job_id = event_sink
+            .as_ref()
+            .map(|s| s.allocate_job_id())
+            .unwrap_or(0);
         let ctx = JobExecutionContext {
             job_name,
             workflow,
@@ -1900,6 +1970,8 @@ async fn execute_job_with_matrix(
             user_env,
             verbose,
             services,
+            event_sink,
+            job_id,
         };
         let result = execute_job(ctx).await?;
         Ok(vec![result])
@@ -1912,6 +1984,17 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
     let job = ctx.workflow.jobs.get(ctx.job_name).ok_or_else(|| {
         ExecutionError::Execution(format!("Job '{}' not found in workflow", ctx.job_name))
     })?;
+
+    // Emit JobStarted synchronously (before any .await) so the event
+    // ordering is guaranteed relative to nested StepStarted events.
+    if let Some(sink) = ctx.event_sink.as_ref() {
+        sink.emit(crate::events::ExecutionEvent::JobStarted {
+            job_id: ctx.job_id,
+            name: ctx.job_name.to_string(),
+            canonical_name: ctx.job_name.to_string(),
+            started_at: chrono::Local::now(),
+        });
+    }
 
     // Handle reusable workflow jobs (job-level 'uses')
     if let Some(uses) = &job.uses {
@@ -2010,6 +2093,9 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
                         cache_store: ctx.services.cache_store,
                     },
                     pending_cache_saves: &pending_cache_saves,
+                    event_sink: ctx.event_sink.as_ref(),
+                    job_id: ctx.job_id,
+                    log_sink: None,
                 },
             ),
         )
@@ -2028,14 +2114,28 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
             }
         };
 
-        if loop_state.process_outcome(
+        let abort = loop_state.process_outcome(
             outcome,
             step,
             ctx.verbose,
             &mut job_env,
             &mut job_user_env,
             ctx.services.secret_masker,
-        ) {
+        );
+        // Emit StepCompleted for the just-recorded step. process_outcome
+        // always pushes exactly one entry into step_results.
+        if let (Some(sink), Some(last)) = (ctx.event_sink.as_ref(), loop_state.step_results.last())
+        {
+            sink.emit(crate::events::ExecutionEvent::StepCompleted {
+                job_id: ctx.job_id,
+                step_idx: idx,
+                status: last.status,
+                outcome: last.outcome,
+                conclusion: last.conclusion,
+                ended_at: chrono::Local::now(),
+            });
+        }
+        if abort {
             job_success = false;
             break;
         }
@@ -2057,14 +2157,24 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
         &current_dir,
     );
 
+    let job_status = if job_success {
+        JobStatus::Success
+    } else {
+        JobStatus::Failure
+    };
+
+    if let Some(sink) = ctx.event_sink.as_ref() {
+        sink.emit(crate::events::ExecutionEvent::JobCompleted {
+            job_id: ctx.job_id,
+            status: job_status.clone(),
+            ended_at: chrono::Local::now(),
+        });
+    }
+
     Ok(JobResult {
         name: ctx.job_name.to_string(),
         canonical_name: ctx.job_name.to_string(),
-        status: if job_success {
-            JobStatus::Success
-        } else {
-            JobStatus::Failure
-        },
+        status: job_status,
         steps: loop_state.step_results,
         logs: loop_state.job_logs,
         outputs: job_outputs,
@@ -2085,6 +2195,9 @@ struct MatrixExecutionContext<'a> {
     user_env: &'a HashMap<String, String>,
     verbose: bool,
     services: JobServices<'a>,
+    /// Threaded through to each spawned `execute_matrix_job`; each
+    /// combination mints its own `JobId` from this sink's allocator.
+    event_sink: Option<crate::events::EventSink>,
 }
 
 /// Execute a set of matrix combinations
@@ -2098,10 +2211,27 @@ async fn execute_matrix_combinations(
     for chunk in ctx.combinations.chunks(ctx.max_parallel) {
         // Skip processing if fail-fast is enabled and a previous job failed
         if ctx.fail_fast && any_failed {
-            // Add skipped results for remaining combinations
+            // Add skipped results for remaining combinations. Each still gets
+            // a JobStarted/JobCompleted event pair so the UI sees them show up
+            // and transition to Skipped rather than being invisible.
             for combination in chunk {
                 let combination_name =
                     wrkflw_matrix::format_combination_name(ctx.job_name, combination);
+                if let Some(sink) = ctx.event_sink.as_ref() {
+                    let job_id = sink.allocate_job_id();
+                    let started_at = chrono::Local::now();
+                    sink.emit(crate::events::ExecutionEvent::JobStarted {
+                        job_id,
+                        name: combination_name.clone(),
+                        canonical_name: ctx.job_name.to_string(),
+                        started_at,
+                    });
+                    sink.emit(crate::events::ExecutionEvent::JobCompleted {
+                        job_id,
+                        status: JobStatus::Skipped,
+                        ended_at: started_at,
+                    });
+                }
                 results.push(JobResult {
                     name: combination_name,
                     canonical_name: ctx.job_name.to_string(),
@@ -2114,8 +2244,22 @@ async fn execute_matrix_combinations(
             continue;
         }
 
+        // Mint one job_id per combination, *before* spawning the futures so
+        // JobStarted events fire in deterministic order across the chunk.
+        let chunk_with_ids: Vec<(crate::events::JobId, &MatrixCombination)> = chunk
+            .iter()
+            .map(|combination| {
+                let id = ctx
+                    .event_sink
+                    .as_ref()
+                    .map(|s| s.allocate_job_id())
+                    .unwrap_or(0);
+                (id, combination)
+            })
+            .collect();
+
         // Process this chunk of combinations in parallel
-        let chunk_futures = chunk.iter().map(|combination| {
+        let chunk_futures = chunk_with_ids.iter().map(|(job_id, combination)| {
             execute_matrix_job(
                 ctx.job_name,
                 ctx.job_template,
@@ -2126,6 +2270,8 @@ async fn execute_matrix_combinations(
                 ctx.user_env,
                 ctx.verbose,
                 &ctx.services,
+                ctx.event_sink.as_ref(),
+                *job_id,
             )
         });
 
@@ -2168,9 +2314,22 @@ async fn execute_matrix_job(
     base_user_env: &HashMap<String, String>,
     verbose: bool,
     services: &JobServices<'_>,
+    event_sink: Option<&crate::events::EventSink>,
+    job_id: crate::events::JobId,
 ) -> Result<JobResult, ExecutionError> {
     // Create the matrix-specific job name
     let matrix_job_name = wrkflw_matrix::format_combination_name(job_name, combination);
+
+    // Emit JobStarted synchronously (before any .await) — keeps the event
+    // ordering predictable for concurrent matrix combinations in the chunk.
+    if let Some(sink) = event_sink {
+        sink.emit(crate::events::ExecutionEvent::JobStarted {
+            job_id,
+            name: matrix_job_name.clone(),
+            canonical_name: job_name.to_string(),
+            started_at: chrono::Local::now(),
+        });
+    }
 
     wrkflw_logging::info(&format!("Executing matrix job: {}", matrix_job_name));
 
@@ -2290,6 +2449,9 @@ async fn execute_matrix_job(
                             cache_store: services.cache_store,
                         },
                         pending_cache_saves: &pending_cache_saves,
+                        event_sink,
+                        job_id,
+                        log_sink: None,
                     },
                 ),
             )
@@ -2308,14 +2470,25 @@ async fn execute_matrix_job(
                 }
             };
 
-            if loop_state.process_outcome(
+            let abort = loop_state.process_outcome(
                 outcome,
                 step,
                 verbose,
                 &mut job_env,
                 &mut job_user_env,
                 services.secret_masker,
-            ) {
+            );
+            if let (Some(sink), Some(last)) = (event_sink, loop_state.step_results.last()) {
+                sink.emit(crate::events::ExecutionEvent::StepCompleted {
+                    job_id,
+                    step_idx: idx,
+                    status: last.status,
+                    outcome: last.outcome,
+                    conclusion: last.conclusion,
+                    ended_at: chrono::Local::now(),
+                });
+            }
+            if abort {
                 all_steps_ok = false;
                 break;
             }
@@ -2340,15 +2513,25 @@ async fn execute_matrix_job(
         &current_dir,
     );
 
+    let job_status = if job_success {
+        JobStatus::Success
+    } else {
+        JobStatus::Failure
+    };
+
+    if let Some(sink) = event_sink {
+        sink.emit(crate::events::ExecutionEvent::JobCompleted {
+            job_id,
+            status: job_status.clone(),
+            ended_at: chrono::Local::now(),
+        });
+    }
+
     // Return job result
     Ok(JobResult {
         name: matrix_job_name,
         canonical_name: job_name.to_string(),
-        status: if job_success {
-            JobStatus::Success
-        } else {
-            JobStatus::Failure
-        },
+        status: job_status,
         steps: loop_state.step_results,
         logs: loop_state.job_logs,
         outputs: job_outputs,
@@ -2479,6 +2662,14 @@ impl StepLoopState {
                     &mut self.job_status_str,
                 );
 
+                debug_assert!(
+                    matches!(
+                        result.status,
+                        StepStatus::Success | StepStatus::Failure | StepStatus::Skipped
+                    ),
+                    "recorded step must be in a terminal status, got {:?}",
+                    result.status
+                );
                 if verbose || result.status == StepStatus::Failure {
                     self.job_logs.push_str(&format!(
                         "\n=== Output from step '{}' ===\n{}\n=== End output ===\n\n",
@@ -2526,6 +2717,14 @@ fn record_step_status(
             (result.outcome.to_string(), result.conclusion.to_string()),
         );
     }
+    debug_assert!(
+        matches!(
+            result.conclusion,
+            StepStatus::Success | StepStatus::Failure | StepStatus::Skipped
+        ),
+        "step conclusion must be terminal, got {:?}",
+        result.conclusion
+    );
     if result.conclusion == StepStatus::Failure {
         *job_status_str = "failure".to_string();
     }
@@ -2614,12 +2813,54 @@ async fn run_step_with_guards(
     step_idx: usize,
     job_env: &HashMap<String, String>,
     workflow: &WorkflowDefinition,
-    step_exec_ctx: StepExecutionContext<'_>,
+    mut step_exec_ctx: StepExecutionContext<'_>,
 ) -> Result<StepOutcome, ExecutionError> {
     let step_name = step
         .name
         .clone()
         .unwrap_or_else(|| format!("Step {}", step_idx + 1));
+
+    // Emit StepStarted synchronously before evaluating any guards. This means
+    // an `if:`-skipped step still announces itself — the matching StepCompleted
+    // with status=Skipped fires later from the step loop's post-outcome block.
+    if let Some(sink) = step_exec_ctx.event_sink {
+        sink.emit(crate::events::ExecutionEvent::StepStarted {
+            job_id: step_exec_ctx.job_id,
+            step_idx,
+            name: step_name.clone(),
+            started_at: chrono::Local::now(),
+        });
+    }
+
+    // Wire up per-step log streaming when an event sink is present.
+    //
+    // The container runtime writes raw (LogStream, String) chunks to `tx`.
+    // A short-lived forwarder task pulls them off the channel and translates
+    // them into `StepLogChunk` events on the main event sink — this is what
+    // lets the TUI display container output line-by-line as it arrives.
+    //
+    // Dropping `tx` closes the channel, so the forwarder exits once
+    // `execute_step(ctx)` below returns and `ctx` is dropped.
+    let forwarder_handle = if let Some(sink) = step_exec_ctx.event_sink {
+        let (tx, mut rx) =
+            tokio::sync::mpsc::unbounded_channel::<(wrkflw_runtime::container::LogStream, String)>(
+            );
+        step_exec_ctx.log_sink = Some(tx);
+        let event_sink = sink.clone();
+        let job_id = step_exec_ctx.job_id;
+        Some(tokio::spawn(async move {
+            while let Some((stream, data)) = rx.recv().await {
+                event_sink.emit(crate::events::ExecutionEvent::StepLogChunk {
+                    job_id,
+                    step_idx,
+                    stream,
+                    data,
+                });
+            }
+        }))
+    } else {
+        None
+    };
 
     // Check step-level if condition
     if let Some(if_cond) = &step.if_condition {
@@ -2664,11 +2905,26 @@ async fn run_step_with_guards(
         execute_step(step_exec_ctx).await
     };
 
+    // `step_exec_ctx` has been moved into `execute_step` and dropped by now;
+    // the log channel is therefore closed. Drain the forwarder task so every
+    // `StepLogChunk` event has landed before the caller emits `StepCompleted`.
+    if let Some(handle) = forwarder_handle {
+        let _ = handle.await;
+    }
+
     // Apply continue-on-error semantics and set outcome/conclusion:
     //   outcome  = raw result (before continue-on-error)
     //   conclusion = effective result (after continue-on-error)
     match step_result {
         Ok(mut result) => {
+            debug_assert!(
+                matches!(
+                    result.status,
+                    StepStatus::Success | StepStatus::Failure | StepStatus::Skipped
+                ),
+                "run_step_with_guards received non-terminal status {:?}",
+                result.status
+            );
             let (abort_job, conclusion) = if result.status == StepStatus::Failure {
                 if step.continue_on_error == Some(true) {
                     wrkflw_logging::info(&format!(
@@ -2747,6 +3003,15 @@ struct StepExecutionContext<'a> {
     services: JobServices<'a>,
     /// Collects deferred `actions/cache` saves, flushed at end-of-job on success.
     pending_cache_saves: &'a std::sync::Mutex<Vec<PendingCacheSave>>,
+    /// Event sink threaded from the owning `JobExecutionContext`.
+    /// `None` on the CLI path (no events emitted).
+    event_sink: Option<&'a crate::events::EventSink>,
+    /// Per-run unique id for the owning job.
+    job_id: crate::events::JobId,
+    /// Per-step log sink used by the container runtime to stream stdout/stderr
+    /// chunks. Populated by `run_step_with_guards` when `event_sink` is set;
+    /// the associated forwarder task turns chunks into `StepLogChunk` events.
+    log_sink: Option<wrkflw_runtime::container::LogSink>,
 }
 
 impl<'a> StepExecutionContext<'a> {
@@ -3562,6 +3827,7 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                             container_workspace,
                             &volumes,
                             None,
+                            ctx.log_sink.as_ref(),
                         )
                         .await
                         .map_err(|e| ExecutionError::Runtime(format!("{}", e)))?;
@@ -3789,6 +4055,7 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                 &final_workspace,
                 &volumes,
                 None,
+                ctx.log_sink.as_ref(),
             )
             .await
         {
@@ -4453,6 +4720,9 @@ async fn run_called_workflow(
             &reusable_job_results,
             ctx.services.artifact_store,
             ctx.services.cache_store,
+            // V1: suppress event forwarding from nested reusable workflows.
+            // The parent emits a single synthetic step representing the call.
+            None,
         )
         .await?;
         for r in &results {
@@ -4472,7 +4742,10 @@ async fn run_called_workflow(
         logs.push_str(&format!("- {}: {:?}\n", r.name, r.status));
     }
 
-    // Represent as one summary step for UI
+    // Represent as one summary step for UI. V1 of the event stream collapses
+    // reusable workflows into a single synthetic step — nested jobs do not
+    // forward events to the parent's sink. TODO: revisit once the TUI can
+    // render nested workflow trees.
     let summary_step = StepResult::new(
         format!("Run reusable workflow: {}", uses),
         if any_failed {
@@ -4482,18 +4755,43 @@ async fn run_called_workflow(
         },
         logs.clone(),
     );
+    if let Some(sink) = ctx.event_sink.as_ref() {
+        let now = chrono::Local::now();
+        sink.emit(crate::events::ExecutionEvent::StepStarted {
+            job_id: ctx.job_id,
+            step_idx: 0,
+            name: summary_step.name.clone(),
+            started_at: now,
+        });
+        sink.emit(crate::events::ExecutionEvent::StepCompleted {
+            job_id: ctx.job_id,
+            step_idx: 0,
+            status: summary_step.status,
+            outcome: summary_step.outcome,
+            conclusion: summary_step.conclusion,
+            ended_at: now,
+        });
+    }
 
     // Aggregate outputs from all jobs in the called workflow
     let outputs = aggregate_reusable_workflow_outputs(&reusable_job_outputs);
 
+    let job_status = if any_failed {
+        JobStatus::Failure
+    } else {
+        JobStatus::Success
+    };
+    if let Some(sink) = ctx.event_sink.as_ref() {
+        sink.emit(crate::events::ExecutionEvent::JobCompleted {
+            job_id: ctx.job_id,
+            status: job_status.clone(),
+            ended_at: chrono::Local::now(),
+        });
+    }
     Ok(JobResult {
         name: ctx.job_name.to_string(),
         canonical_name: ctx.job_name.to_string(),
-        status: if any_failed {
-            JobStatus::Failure
-        } else {
-            JobStatus::Success
-        },
+        status: job_status,
         steps: vec![summary_step],
         logs,
         outputs,
@@ -4721,6 +5019,11 @@ async fn execute_composite_action(
                         cache_store: services.cache_store,
                     },
                     pending_cache_saves,
+                    // V1: composite action sub-steps don't forward events —
+                    // they're collapsed under the calling step in the UI.
+                    event_sink: None,
+                    job_id: 0,
+                    log_sink: None,
                 }))
                 .await?;
 
@@ -4756,6 +5059,14 @@ async fn execute_composite_action(
                 );
 
                 // Short-circuit on failure if needed
+                debug_assert!(
+                    matches!(
+                        step_result.status,
+                        StepStatus::Success | StepStatus::Failure | StepStatus::Skipped
+                    ),
+                    "composite step result must be terminal, got {:?}",
+                    step_result.status
+                );
                 if step_result.status == StepStatus::Failure {
                     // Still propagate whatever outputs were collected before the failure
                     propagate_composite_outputs(
@@ -6232,6 +6543,7 @@ runs:
             _working_dir: &Path,
             _volumes: &[(&Path, &Path)],
             entrypoint: Option<&str>,
+            _log_sink: Option<&wrkflw_runtime::container::LogSink>,
         ) -> Result<ContainerOutput, ContainerError> {
             self.run_calls.lock().unwrap().push(RunContainerCall {
                 image: image.to_string(),
@@ -6341,6 +6653,9 @@ runs:
             job_status: "success",
             services: test_services(),
             pending_cache_saves: &TEST_PENDING_CACHE_SAVES,
+            event_sink: None,
+            job_id: 0,
+            log_sink: None,
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -6393,6 +6708,9 @@ runs:
             job_status: "success",
             services: test_services(),
             pending_cache_saves: &TEST_PENDING_CACHE_SAVES,
+            event_sink: None,
+            job_id: 0,
+            log_sink: None,
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -6450,6 +6768,9 @@ runs:
             job_status: "success",
             services: test_services(),
             pending_cache_saves: &TEST_PENDING_CACHE_SAVES,
+            event_sink: None,
+            job_id: 0,
+            log_sink: None,
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -6500,6 +6821,9 @@ runs:
             job_status: "success",
             services: test_services(),
             pending_cache_saves: &TEST_PENDING_CACHE_SAVES,
+            event_sink: None,
+            job_id: 0,
+            log_sink: None,
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -6551,6 +6875,9 @@ runs:
             job_status: "success",
             services: test_services(),
             pending_cache_saves: &TEST_PENDING_CACHE_SAVES,
+            event_sink: None,
+            job_id: 0,
+            log_sink: None,
         };
 
         let result = execute_step(ctx).await;
@@ -6601,6 +6928,9 @@ runs:
             job_status: "success",
             services: test_services(),
             pending_cache_saves: &TEST_PENDING_CACHE_SAVES,
+            event_sink: None,
+            job_id: 0,
+            log_sink: None,
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -6649,6 +6979,9 @@ runs:
             job_status: "success",
             services: test_services(),
             pending_cache_saves: &TEST_PENDING_CACHE_SAVES,
+            event_sink: None,
+            job_id: 0,
+            log_sink: None,
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -7189,6 +7522,9 @@ runs:
             job_status: "success",
             services: test_services(),
             pending_cache_saves: &TEST_PENDING_CACHE_SAVES,
+            event_sink: None,
+            job_id: 0,
+            log_sink: None,
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -7237,6 +7573,9 @@ runs:
             job_status: "success",
             services: test_services(),
             pending_cache_saves: &TEST_PENDING_CACHE_SAVES,
+            event_sink: None,
+            job_id: 0,
+            log_sink: None,
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -7281,6 +7620,9 @@ runs:
             job_status: "success",
             services: test_services(),
             pending_cache_saves: &TEST_PENDING_CACHE_SAVES,
+            event_sink: None,
+            job_id: 0,
+            log_sink: None,
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -7317,6 +7659,9 @@ runs:
             job_status: "success",
             services: test_services(),
             pending_cache_saves: &TEST_PENDING_CACHE_SAVES,
+            event_sink: None,
+            job_id: 0,
+            log_sink: None,
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -7355,6 +7700,9 @@ runs:
             job_status: "success",
             services: test_services(),
             pending_cache_saves: &TEST_PENDING_CACHE_SAVES,
+            event_sink: None,
+            job_id: 0,
+            log_sink: None,
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -7404,6 +7752,9 @@ runs:
             job_status: "success",
             services: test_services(),
             pending_cache_saves: &TEST_PENDING_CACHE_SAVES,
+            event_sink: None,
+            job_id: 0,
+            log_sink: None,
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -7451,6 +7802,9 @@ runs:
             job_status: "success",
             services: test_services(),
             pending_cache_saves: &TEST_PENDING_CACHE_SAVES,
+            event_sink: None,
+            job_id: 0,
+            log_sink: None,
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -7498,6 +7852,9 @@ runs:
             job_status: "success",
             services: test_services(),
             pending_cache_saves: &TEST_PENDING_CACHE_SAVES,
+            event_sink: None,
+            job_id: 0,
+            log_sink: None,
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -7543,6 +7900,9 @@ runs:
             job_status: "success",
             services: test_services(),
             pending_cache_saves: &TEST_PENDING_CACHE_SAVES,
+            event_sink: None,
+            job_id: 0,
+            log_sink: None,
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -7972,6 +8332,9 @@ runs:
                 cache_store: &cache_store,
             },
             pending_cache_saves: &pending,
+            event_sink: None,
+            job_id: 0,
+            log_sink: None,
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -8019,6 +8382,9 @@ runs:
                 cache_store: &cache_store,
             },
             pending_cache_saves: &pending,
+            event_sink: None,
+            job_id: 0,
+            log_sink: None,
         };
 
         let dl_result = execute_step(dl_ctx).await.unwrap();
@@ -8095,6 +8461,9 @@ runs:
                 cache_store: &cache_store,
             },
             pending_cache_saves: &pending,
+            event_sink: None,
+            job_id: 0,
+            log_sink: None,
         };
         let run_result = execute_step(run_ctx).await.unwrap();
         assert_eq!(
@@ -8141,6 +8510,9 @@ runs:
                 cache_store: &cache_store,
             },
             pending_cache_saves: &pending,
+            event_sink: None,
+            job_id: 0,
+            log_sink: None,
         };
         let up_result = execute_step(up_ctx).await.unwrap();
         assert_eq!(
@@ -8193,6 +8565,9 @@ runs:
                 cache_store: &cache_store,
             },
             pending_cache_saves: &pending,
+            event_sink: None,
+            job_id: 0,
+            log_sink: None,
         };
         let dl_result = execute_step(dl_ctx).await.unwrap();
         assert_eq!(
@@ -8262,6 +8637,9 @@ runs:
                 cache_store: &cache_store,
             },
             pending_cache_saves: &pending,
+            event_sink: None,
+            job_id: 0,
+            log_sink: None,
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -8469,6 +8847,9 @@ runs:
                 cache_store: &cache_store,
             },
             pending_cache_saves: &pending,
+            event_sink: None,
+            job_id: 0,
+            log_sink: None,
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -8540,6 +8921,9 @@ runs:
                 cache_store: &cache_store,
             },
             pending_cache_saves: &pending,
+            event_sink: None,
+            job_id: 0,
+            log_sink: None,
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -8596,6 +8980,9 @@ runs:
                 cache_store: &cache_store,
             },
             pending_cache_saves: &pending,
+            event_sink: None,
+            job_id: 0,
+            log_sink: None,
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -8649,6 +9036,9 @@ runs:
                 cache_store: &cache_store,
             },
             pending_cache_saves: &pending,
+            event_sink: None,
+            job_id: 0,
+            log_sink: None,
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -8708,6 +9098,9 @@ runs:
                 cache_store: &cache_store,
             },
             pending_cache_saves: &pending,
+            event_sink: None,
+            job_id: 0,
+            log_sink: None,
         };
 
         let result = execute_step(ctx).await.unwrap();
@@ -8853,6 +9246,9 @@ runs:
                 cache_store: &cache_store,
             },
             pending_cache_saves: &pending,
+            event_sink: None,
+            job_id: 0,
+            log_sink: None,
         };
 
         let result = execute_step(ctx).await.unwrap();

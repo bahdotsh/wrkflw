@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use std::fs;
 use std::path::{Path, PathBuf};
+use tokio::sync::mpsc::UnboundedSender;
 use wrkflw_logging;
 
 /// Prefix for all locally-built images. Used to skip registry pulls.
@@ -8,6 +9,23 @@ pub const LOCAL_IMAGE_PREFIX: &str = "wrkflw-";
 
 /// Prefix for combined runtime images built by `resolve_runner_image`.
 pub const COMBINED_IMAGE_PREFIX: &str = "wrkflw-combined:";
+
+/// Which stream a log chunk came from. Used by the optional streaming-logs
+/// channel the executor can thread through `run_container`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogStream {
+    Stdout,
+    Stderr,
+}
+
+/// Channel a runtime writes to as bytes come off a container's stdout / stderr.
+///
+/// Runtimes that support streaming (all four do after C4) forward each chunk
+/// *before* returning from `run_container`, alongside accumulating into the
+/// returned `ContainerOutput.stdout/stderr` so the final `StepResult` still
+/// carries the full text. When `None`, the runtime doesn't stream — matching
+/// the historical behavior used by the CLI.
+pub type LogSink = UnboundedSender<(LogStream, String)>;
 
 #[async_trait]
 pub trait ContainerRuntime {
@@ -19,6 +37,11 @@ pub trait ContainerRuntime {
     ///
     /// `entrypoint` optionally overrides the image's ENTRYPOINT (used when an
     /// action.yml declares `runs.entrypoint`).
+    ///
+    /// When `log_sink` is `Some`, the runtime streams stdout/stderr chunks
+    /// through the sink as they arrive. The returned `ContainerOutput` still
+    /// contains the full accumulated output.
+    #[allow(clippy::too_many_arguments)]
     async fn run_container(
         &self,
         image: &str,
@@ -27,6 +50,7 @@ pub trait ContainerRuntime {
         working_dir: &Path,
         volumes: &[(&Path, &Path)],
         entrypoint: Option<&str>,
+        log_sink: Option<&LogSink>,
     ) -> Result<ContainerOutput, ContainerError>;
 
     async fn pull_image(&self, image: &str) -> Result<(), ContainerError>;

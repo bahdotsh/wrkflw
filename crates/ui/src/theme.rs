@@ -76,7 +76,7 @@ impl Theme {
         Self {
             is_dark: true,
 
-            accent: Color::Rgb(137, 180, 250),   // blue
+            accent: Color::Rgb(137, 180, 250),    // blue
             highlight: Color::Rgb(249, 226, 175), // yellow
 
             success: Color::Rgb(166, 227, 161), // green
@@ -91,28 +91,28 @@ impl Theme {
             fg_muted: Color::Rgb(108, 112, 134),  // overlay1
             help_hint: Color::Rgb(88, 91, 112),   // surface2
 
-            border: Color::Rgb(69, 71, 90),         // surface1
+            border: Color::Rgb(69, 71, 90),            // surface1
             border_focused: Color::Rgb(137, 180, 250), // blue
-            border_dim: Color::Rgb(49, 50, 68),     // surface0
+            border_dim: Color::Rgb(49, 50, 68),        // surface0
 
             bg_default: Color::Reset,
-            bg_selection: Color::Rgb(49, 50, 68),   // surface0
-            bg_header: Color::Rgb(24, 24, 37),      // crust
-            bg_modal: Color::Rgb(30, 30, 46),       // base
-            bg_modal_dim: Color::Rgb(17, 17, 27),   // mantle
-            bg_key_badge: Color::Rgb(49, 50, 68),   // surface0
-            bg_bar: Color::Rgb(24, 24, 37),         // crust
-            bg_dark: Color::Rgb(17, 17, 27),        // mantle
+            bg_selection: Color::Rgb(49, 50, 68), // surface0
+            bg_header: Color::Rgb(24, 24, 37),    // crust
+            bg_modal: Color::Rgb(30, 30, 46),     // base
+            bg_modal_dim: Color::Rgb(17, 17, 27), // mantle
+            bg_key_badge: Color::Rgb(49, 50, 68), // surface0
+            bg_bar: Color::Rgb(24, 24, 37),       // crust
+            bg_dark: Color::Rgb(17, 17, 27),      // mantle
 
-            fg_separator: Color::Rgb(49, 50, 68),     // surface0
-            fg_badge: Color::Rgb(24, 24, 37),         // crust (dark text on light badges)
-            scrollbar_track: Color::Rgb(49, 50, 68),  // surface0
+            fg_separator: Color::Rgb(49, 50, 68),    // surface0
+            fg_badge: Color::Rgb(24, 24, 37),        // crust (dark text on light badges)
+            scrollbar_track: Color::Rgb(49, 50, 68), // surface0
             scrollbar_thumb: Color::Rgb(127, 132, 156), // overlay2
 
-            runtime_docker: Color::Rgb(137, 180, 250),    // blue
-            runtime_podman: Color::Rgb(137, 220, 235),    // sky
+            runtime_docker: Color::Rgb(137, 180, 250), // blue
+            runtime_podman: Color::Rgb(137, 220, 235), // sky
             runtime_emulation: Color::Rgb(243, 139, 168), // red
-            runtime_secure: Color::Rgb(166, 227, 161),    // green
+            runtime_secure: Color::Rgb(166, 227, 161), // green
         }
     }
 
@@ -136,11 +136,11 @@ impl Theme {
             fg_muted: Color::Rgb(140, 143, 161),  // overlay1
             help_hint: Color::Rgb(172, 176, 190), // surface2
 
-            border: Color::Rgb(188, 192, 204),       // surface1
+            border: Color::Rgb(188, 192, 204),        // surface1
             border_focused: Color::Rgb(30, 102, 245), // blue
-            border_dim: Color::Rgb(204, 208, 218),   // surface0
+            border_dim: Color::Rgb(204, 208, 218),    // surface0
 
-            bg_default: Color::Rgb(239, 241, 245),  // base
+            bg_default: Color::Rgb(239, 241, 245),   // base
             bg_selection: Color::Rgb(220, 224, 232), // surface0
             bg_header: Color::Rgb(220, 224, 232),    // surface0
             bg_modal: Color::Rgb(239, 241, 245),     // base
@@ -149,15 +149,15 @@ impl Theme {
             bg_bar: Color::Rgb(230, 233, 239),       // mantle
             bg_dark: Color::Rgb(230, 233, 239),      // mantle
 
-            fg_separator: Color::Rgb(220, 224, 232),   // surface0
-            fg_badge: Color::Rgb(239, 241, 245),       // base (light text on dark badges)
+            fg_separator: Color::Rgb(220, 224, 232), // surface0
+            fg_badge: Color::Rgb(239, 241, 245),     // base (light text on dark badges)
             scrollbar_track: Color::Rgb(220, 224, 232), // surface0
             scrollbar_thumb: Color::Rgb(140, 143, 161), // overlay1
 
-            runtime_docker: Color::Rgb(30, 102, 245),   // blue
-            runtime_podman: Color::Rgb(4, 165, 229),    // sky
+            runtime_docker: Color::Rgb(30, 102, 245), // blue
+            runtime_podman: Color::Rgb(4, 165, 229),  // sky
             runtime_emulation: Color::Rgb(210, 15, 57), // red
-            runtime_secure: Color::Rgb(64, 160, 43),    // green
+            runtime_secure: Color::Rgb(64, 160, 43),  // green
         }
     }
 
@@ -179,7 +179,11 @@ impl Theme {
     }
 
     pub fn name(&self) -> &'static str {
-        if self.is_dark { "dark" } else { "light" }
+        if self.is_dark {
+            "dark"
+        } else {
+            "light"
+        }
     }
 }
 
@@ -218,7 +222,9 @@ pub fn label_style(t: &Theme) -> Style {
 }
 
 pub fn selected_style(t: &Theme) -> Style {
-    Style::default().bg(t.bg_selection).add_modifier(Modifier::BOLD)
+    Style::default()
+        .bg(t.bg_selection)
+        .add_modifier(Modifier::BOLD)
 }
 
 pub fn header_style(t: &Theme) -> Style {
@@ -290,9 +296,26 @@ pub fn job_status(t: &Theme, status: &JobStatus) -> (&'static str, Style) {
 
 pub fn step_status(t: &Theme, status: &StepStatus) -> (&'static str, Style) {
     match status {
+        StepStatus::Pending => (symbols::NOT_STARTED, Style::default().fg(t.fg_dim)),
+        StepStatus::Running => (symbols::RUNNING, Style::default().fg(t.info)),
         StepStatus::Success => (symbols::SUCCESS, Style::default().fg(t.success)),
         StepStatus::Failure => (symbols::FAILURE, Style::default().fg(t.error)),
         StepStatus::Skipped => (symbols::SKIPPED, Style::default().fg(t.fg_dim)),
+        _ => (symbols::NOT_STARTED, Style::default().fg(t.fg_dim)),
+    }
+}
+
+/// Same as `step_status`, but returns an animated spinner glyph for the
+/// `Running` state so callers that have access to `App.spinner_frame` can
+/// show live motion on the in-flight step.
+pub fn step_status_animated(
+    t: &Theme,
+    status: &StepStatus,
+    spinner_frame: usize,
+) -> (&'static str, Style) {
+    match status {
+        StepStatus::Running => (spinner(spinner_frame), Style::default().fg(t.info)),
+        other => step_status(t, other),
     }
 }
 

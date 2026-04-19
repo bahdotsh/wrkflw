@@ -5,10 +5,11 @@ use std::path::Path;
 use std::process::Stdio;
 use std::sync::Mutex;
 use tempfile;
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use wrkflw_logging;
 use wrkflw_runtime::container::{
-    ContainerError, ContainerOutput, ContainerRuntime, LOCAL_IMAGE_PREFIX,
+    ContainerError, ContainerOutput, ContainerRuntime, LogSink, LogStream, LOCAL_IMAGE_PREFIX,
 };
 use wrkflw_utils;
 use wrkflw_utils::fd;
@@ -141,10 +142,14 @@ impl PodmanRuntime {
         &self,
         args: &[&str],
         input: Option<&str>,
+        log_sink: Option<&LogSink>,
     ) -> Result<ContainerOutput, ContainerError> {
         let timeout_duration = std::time::Duration::from_secs(360); // 6 minutes timeout
 
-        let result = tokio::time::timeout(timeout_duration, async {
+        let stdout_sink = log_sink.cloned();
+        let stderr_sink = log_sink.cloned();
+
+        let result = tokio::time::timeout(timeout_duration, async move {
             let mut cmd = Command::new("podman");
             cmd.args(args);
 
@@ -179,14 +184,51 @@ impl PodmanRuntime {
                 }
             }
 
-            let output = child.wait_with_output().await.map_err(|e| {
+            // Drain stdout/stderr line-by-line, mirroring to the optional sink
+            // and accumulating to buffers that become the final ContainerOutput.
+            let stdout_handle = child.stdout.take();
+            let stderr_handle = child.stderr.take();
+
+            let stdout_task = tokio::spawn(async move {
+                let mut acc = String::new();
+                if let Some(stdout) = stdout_handle {
+                    let mut reader = BufReader::new(stdout).lines();
+                    while let Ok(Some(line)) = reader.next_line().await {
+                        if let Some(ref s) = stdout_sink {
+                            let _ = s.send((LogStream::Stdout, format!("{}\n", line)));
+                        }
+                        acc.push_str(&line);
+                        acc.push('\n');
+                    }
+                }
+                acc
+            });
+
+            let stderr_task = tokio::spawn(async move {
+                let mut acc = String::new();
+                if let Some(stderr) = stderr_handle {
+                    let mut reader = BufReader::new(stderr).lines();
+                    while let Ok(Some(line)) = reader.next_line().await {
+                        if let Some(ref s) = stderr_sink {
+                            let _ = s.send((LogStream::Stderr, format!("{}\n", line)));
+                        }
+                        acc.push_str(&line);
+                        acc.push('\n');
+                    }
+                }
+                acc
+            });
+
+            let status = child.wait().await.map_err(|e| {
                 ContainerError::ContainerExecution(format!("Podman command failed: {}", e))
             })?;
+            let stdout_str = stdout_task.await.unwrap_or_default();
+            let stderr_str = stderr_task.await.unwrap_or_default();
 
             Ok(ContainerOutput {
-                stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-                stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-                exit_code: output.status.code().unwrap_or(-1),
+                stdout: stdout_str,
+                stderr: stderr_str,
+                exit_code: status.code().unwrap_or(-1),
             })
         })
         .await;
@@ -473,6 +515,7 @@ impl ContainerRuntime for PodmanRuntime {
         working_dir: &Path,
         volumes: &[(&Path, &Path)],
         entrypoint: Option<&str>,
+        log_sink: Option<&LogSink>,
     ) -> Result<ContainerOutput, ContainerError> {
         // Print detailed debugging info
         wrkflw_logging::info(&format!("Podman: Running container with image: {}", image));
@@ -482,7 +525,15 @@ impl ContainerRuntime for PodmanRuntime {
         // Run the entire container operation with a timeout
         match tokio::time::timeout(
             timeout_duration,
-            self.run_container_inner(image, cmd, env_vars, working_dir, volumes, entrypoint),
+            self.run_container_inner(
+                image,
+                cmd,
+                env_vars,
+                working_dir,
+                volumes,
+                entrypoint,
+                log_sink,
+            ),
         )
         .await
         {
@@ -692,6 +743,7 @@ impl ContainerRuntime for PodmanRuntime {
 
 // Implementation of internal methods
 impl PodmanRuntime {
+    #[allow(clippy::too_many_arguments)]
     async fn run_container_inner(
         &self,
         image: &str,
@@ -700,6 +752,7 @@ impl PodmanRuntime {
         working_dir: &Path,
         volumes: &[(&Path, &Path)],
         entrypoint: Option<&str>,
+        log_sink: Option<&LogSink>,
     ) -> Result<ContainerOutput, ContainerError> {
         wrkflw_logging::debug(&format!("Running command in Podman: {:?}", cmd));
         wrkflw_logging::debug(&format!("Environment: {:?}", env_vars));
@@ -770,8 +823,9 @@ impl PodmanRuntime {
         // Track the container (even though we use --rm, track it for consistency)
         track_container(&container_name);
 
-        // Execute the command
-        let result = self.execute_podman_command(&args, None).await;
+        // Execute the command, forwarding the optional log sink so the TUI
+        // can see stdout/stderr lines as they arrive.
+        let result = self.execute_podman_command(&args, None, log_sink).await;
 
         // Handle container cleanup based on result and settings
         match &result {
@@ -876,7 +930,7 @@ impl PodmanRuntime {
 
     async fn pull_image_inner(&self, image: &str) -> Result<(), ContainerError> {
         let args = vec!["pull", image];
-        let output = self.execute_podman_command(&args, None).await?;
+        let output = self.execute_podman_command(&args, None, None).await?;
 
         if output.exit_code != 0 {
             return Err(ContainerError::ImagePull(format!(
@@ -898,7 +952,7 @@ impl PodmanRuntime {
         let context_dir_str = context_dir.to_string_lossy().to_string();
         let args = vec!["build", "-f", &dockerfile_str, "-t", tag, &context_dir_str];
 
-        let output = self.execute_podman_command(&args, None).await?;
+        let output = self.execute_podman_command(&args, None, None).await?;
 
         if output.exit_code != 0 {
             return Err(ContainerError::ImageBuild(format!(

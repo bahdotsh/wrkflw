@@ -194,8 +194,17 @@ fn run_tui_event_loop(
             last_tick = Instant::now();
         }
 
+        // Drain any live execution events emitted by the executor. Cheap on
+        // the CLI path where `event_rx` is `None`; keeps the steps table
+        // up-to-date in real time when the sender is wired.
+        app.drain_execution_events();
+
         // Non-blocking check for execution results
         if let Ok((workflow_idx, result)) = rx.try_recv() {
+            // Drain any trailing events before finalizing so no StepLogChunk /
+            // StepCompleted is orphaned.
+            app.drain_execution_events();
+            app.event_rx = None;
             app.process_execution_result(workflow_idx, result);
             app.current_execution = None;
 
@@ -559,6 +568,11 @@ fn run_tui_event_loop(
                     KeyCode::Char('f') => {
                         if app.selected_tab == 2 {
                             app.toggle_log_filter();
+                        } else if app.selected_tab == 1 && app.detailed_view {
+                            // Re-engage auto-follow in the live step view and
+                            // snap selection back to the running (or most-recent) step.
+                            app.auto_follow_step = true;
+                            app.snap_to_running_step();
                         }
                     }
                     KeyCode::Char('c') => {

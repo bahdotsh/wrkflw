@@ -10,11 +10,9 @@
 //   - wrkflw_gitlab::get_repo_info  (same, GitLab flavour)
 //   - wrkflw_gitlab::trigger_pipeline
 //
-// Repo info is resolved lazily per draw (cheap: reads `git remote`)
-// so the pane reflects the current working directory even if the
-// user cd's between runs. If either resolution fails — e.g. the user
-// is outside a git repo, or has no `origin` — we surface the error
-// in place rather than fake a plausible-looking repo name.
+// Repo info is resolved once per platform and cached on `App`
+// (`trigger_tab_target`) so we don't re-shell `git remote` on every
+// render. The cache is invalidated on platform toggle.
 
 use crate::app::{App, TriggerPlatform};
 use crate::theme::{self, BadgeKind, COLORS};
@@ -26,7 +24,7 @@ use ratatui::{
     Frame,
 };
 
-pub fn render_trigger_tab(f: &mut Frame<'_>, app: &App, area: Rect) {
+pub fn render_trigger_tab(f: &mut Frame<'_>, app: &mut App, area: Rect) {
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(2), Constraint::Min(0)])
@@ -43,16 +41,29 @@ pub fn render_trigger_tab(f: &mut Frame<'_>, app: &App, area: Rect) {
     render_preview_pane(f, app, body[1]);
 }
 
+/// An env token we treat as "set". Empty string doesn't count — users
+/// occasionally `export GITHUB_TOKEN=` to clear the value without
+/// unsetting the var, and calling that "authenticated" would mislead.
+fn token_is_set(var: &str) -> bool {
+    std::env::var(var).ok().is_some_and(|v| !v.is_empty())
+}
+
 fn render_header(f: &mut Frame<'_>, app: &App, area: Rect) {
     let auth_state = match app.trigger_platform {
-        TriggerPlatform::Github => std::env::var("GITHUB_TOKEN")
-            .ok()
-            .map(|_| ("authenticated", BadgeKind::Success))
-            .unwrap_or(("GITHUB_TOKEN missing", BadgeKind::Error)),
-        TriggerPlatform::Gitlab => std::env::var("GITLAB_TOKEN")
-            .ok()
-            .map(|_| ("authenticated", BadgeKind::Success))
-            .unwrap_or(("GITLAB_TOKEN missing", BadgeKind::Error)),
+        TriggerPlatform::Github => {
+            if token_is_set("GITHUB_TOKEN") {
+                ("authenticated", BadgeKind::Success)
+            } else {
+                ("GITHUB_TOKEN missing", BadgeKind::Error)
+            }
+        }
+        TriggerPlatform::Gitlab => {
+            if token_is_set("GITLAB_TOKEN") {
+                ("authenticated", BadgeKind::Success)
+            } else {
+                ("GITLAB_TOKEN missing", BadgeKind::Error)
+            }
+        }
     };
 
     let header = Line::from(vec![
@@ -63,66 +74,26 @@ fn render_header(f: &mut Frame<'_>, app: &App, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            format!("  ·  dispatch workflow on {}  ·  ", app.trigger_platform.as_str()),
+            format!(
+                "  ·  dispatch workflow on {}  ·  ",
+                app.trigger_platform.as_str()
+            ),
             Style::default().fg(COLORS.text_muted),
         ),
         theme::badge_outline(auth_state.0, auth_state.1),
     ]);
-    f.render_widget(
-        Paragraph::new(header).alignment(Alignment::Left),
-        area,
-    );
+    f.render_widget(Paragraph::new(header).alignment(Alignment::Left), area);
 }
 
-/// Resolved repo info; falls back to a placeholder on error so the
-/// tab stays readable while informing the user what's wrong.
-struct Target {
-    platform_label: String,
-    repo_label: String,
-    default_branch: String,
-    /// Non-fatal note surfaced in the UI when repo resolution fails.
-    note: Option<String>,
-}
-
-fn resolve_target(app: &App) -> Target {
-    match app.trigger_platform {
-        TriggerPlatform::Github => match wrkflw_github::get_repo_info() {
-            Ok(info) => Target {
-                platform_label: "GitHub".to_string(),
-                repo_label: format!("{}/{}", info.owner, info.repo),
-                default_branch: info.default_branch,
-                note: None,
-            },
-            Err(e) => Target {
-                platform_label: "GitHub".to_string(),
-                repo_label: "<unresolved>".to_string(),
-                default_branch: "main".to_string(),
-                note: Some(e.to_string()),
-            },
-        },
-        TriggerPlatform::Gitlab => match wrkflw_gitlab::get_repo_info() {
-            Ok(info) => Target {
-                platform_label: "GitLab".to_string(),
-                repo_label: format!("{}/{}", info.namespace, info.project),
-                default_branch: info.default_branch,
-                note: None,
-            },
-            Err(e) => Target {
-                platform_label: "GitLab".to_string(),
-                repo_label: "<unresolved>".to_string(),
-                default_branch: "main".to_string(),
-                note: Some(e.to_string()),
-            },
-        },
-    }
-}
-
-fn render_target_pane(f: &mut Frame<'_>, app: &App, area: Rect) {
+fn render_target_pane(f: &mut Frame<'_>, app: &mut App, area: Rect) {
     let block = theme::block_focused("Target");
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let target = resolve_target(app);
+    // Clone out of the cache so we don't hold an immutable borrow of
+    // `app` while the rest of this function reads other fields. The
+    // clone is a few small strings; cheap.
+    let target = app.trigger_tab_target().clone();
     let mut lines: Vec<Line> = Vec::new();
 
     // Platform row — pill group.
@@ -151,7 +122,10 @@ fn render_target_pane(f: &mut Frame<'_>, app: &App, area: Rect) {
             BadgeKind::Warning,
             matches!(app.trigger_platform, TriggerPlatform::Gitlab),
         ),
-        Span::styled("   press `p` to toggle", Style::default().fg(COLORS.text_muted)),
+        Span::styled(
+            "   press `p` to toggle",
+            Style::default().fg(COLORS.text_muted),
+        ),
     ]));
     lines.push(Line::from(""));
 
@@ -207,7 +181,7 @@ fn render_target_pane(f: &mut Frame<'_>, app: &App, area: Rect) {
         )]));
     } else {
         for (i, (k, v)) in app.trigger_inputs.iter().enumerate() {
-            let editing = app.trigger_input_cursor == i;
+            let editing = app.trigger_input_cursor == Some(i);
             let k_focus = editing && !app.trigger_input_on_value;
             let v_focus = editing && app.trigger_input_on_value;
             let k_display = if k.is_empty() && !k_focus {
@@ -287,10 +261,12 @@ fn render_preview_pane(f: &mut Frame<'_>, app: &App, area: Rect) {
     let lines: Vec<Line> = app
         .trigger_curl_preview()
         .split(" \\")
-        .map(|s| Line::from(Span::styled(
-            s.trim().to_string(),
-            Style::default().fg(COLORS.text),
-        )))
+        .map(|s| {
+            Line::from(Span::styled(
+                s.trim().to_string(),
+                Style::default().fg(COLORS.text),
+            ))
+        })
         .collect();
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
@@ -317,6 +293,9 @@ fn field_row_hl<'a>(label: &'a str, value: &'a str, hint: String) -> Line<'a> {
                 .fg(COLORS.text)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(format!("  [{}]", hint), Style::default().fg(COLORS.text_dim)),
+        Span::styled(
+            format!("  [{}]", hint),
+            Style::default().fg(COLORS.text_dim),
+        ),
     ])
 }

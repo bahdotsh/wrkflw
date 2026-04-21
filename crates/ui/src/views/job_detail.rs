@@ -422,18 +422,21 @@ fn render_matrix_pane(
             )]));
             // Key order: show axes in the order they were declared,
             // plus any extra keys an `include:` entry introduced,
-            // appended after. Keeps canonical axes on the left for
-            // easy scanning, while remaining honest about includes
-            // that carry extra fields.
-            let mut key_order: Vec<String> =
-                matrix.parameters.keys().cloned().collect();
+            // appended after (and sorted, since `MatrixCombination.values`
+            // is a HashMap whose iteration order is not stable — without
+            // a sort, include-only columns could jitter between frames
+            // or process runs).
+            let mut key_order: Vec<String> = matrix.parameters.keys().cloned().collect();
+            let mut extra: Vec<String> = Vec::new();
             for c in &combos {
                 for k in c.values.keys() {
-                    if !key_order.contains(k) {
-                        key_order.push(k.clone());
+                    if !key_order.contains(k) && !extra.contains(k) {
+                        extra.push(k.clone());
                     }
                 }
             }
+            extra.sort();
+            key_order.extend(extra);
             for c in combos.iter().take(32) {
                 let mut spans: Vec<Span> = vec![Span::raw("  ")];
                 let status_glyph = inherited_combo_glyph(workflow, job_name);
@@ -441,10 +444,7 @@ fn render_matrix_pane(
                 spans.push(Span::raw(" "));
                 for (i, k) in key_order.iter().enumerate() {
                     if i > 0 {
-                        spans.push(Span::styled(
-                            "  ",
-                            Style::default().fg(COLORS.text_muted),
-                        ));
+                        spans.push(Span::styled("  ", Style::default().fg(COLORS.text_muted)));
                     }
                     spans.push(Span::styled(
                         format!("{}=", k),
@@ -516,10 +516,7 @@ fn format_yaml_scalar(v: &serde_yaml::Value) -> String {
 /// Return a small colored glyph indicating what we know about the
 /// parent matrix job's state — per-combo status isn't tracked, so
 /// every row mirrors the parent.
-fn inherited_combo_glyph<'a>(
-    workflow: &'a crate::models::Workflow,
-    job_name: &'a str,
-) -> Span<'a> {
+fn inherited_combo_glyph<'a>(workflow: &'a crate::models::Workflow, job_name: &'a str) -> Span<'a> {
     let job = workflow
         .execution_details
         .as_ref()

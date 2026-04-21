@@ -48,9 +48,11 @@ pub fn render_help_content(f: &mut Frame<'_>, area: Rect, scroll_offset: usize) 
     left_lines.extend(section_header("NAVIGATION"));
     left_lines.push(Line::from(""));
     left_lines.push(key_line("Tab / Shift+Tab", "Switch between tabs"));
-    left_lines.push(key_line("1-4 / w,x,l,h", "Jump to specific tab"));
+    left_lines.push(key_line("1-7", "Jump to tab by number"));
+    left_lines.push(key_line("w,x,l,h", "Workflows / Execution / Logs / Help"));
     left_lines.push(key_line("\u{2191}/\u{2193} or k/j", "Navigate lists"));
     left_lines.push(key_line("Enter", "Select / View details"));
+    left_lines.push(key_line(",", "Toggle Tweaks overlay"));
     left_lines.push(key_line("Esc", "Back / Exit help"));
     left_lines.push(Line::from(""));
 
@@ -117,66 +119,53 @@ pub fn render_help_content(f: &mut Frame<'_>, area: Rect, scroll_offset: usize) 
 
     right_lines.extend(section_header("LOGS & SEARCH"));
     right_lines.push(Line::from(""));
-    right_lines.push(key_line("s", "Toggle log search"));
-    right_lines.push(key_line("f", "Toggle log filter"));
-    right_lines.push(key_line("c", "Clear search & filter"));
+    right_lines.push(key_line("s", "Toggle log search (Logs tab)"));
+    right_lines.push(key_line("f", "Toggle log filter (Logs tab)"));
+    right_lines.push(key_line("c", "Clear search & filter (Logs tab)"));
     right_lines.push(key_line("n", "Next search match"));
     right_lines.push(key_line("\u{2191}/\u{2193}", "Scroll logs / Navigate"));
     right_lines.push(Line::from(""));
 
+    right_lines.extend(section_header("DAG · TRIGGER · SECRETS"));
+    right_lines.push(Line::from(""));
+    right_lines.push(key_line("g", "DAG: toggle graph ↔ list"));
+    right_lines.push(key_line("p", "Trigger: flip platform github ↔ gitlab"));
+    right_lines.push(key_line("+", "Trigger: add a key=value input"));
+    right_lines.push(key_line("Tab", "Trigger: next field (in edit mode)"));
+    right_lines.push(key_line("Enter", "Trigger: dispatch (or commit edit)"));
+    right_lines.push(key_line("c", "Trigger: copy curl preview to logs"));
+    right_lines.push(key_line("m", "Secrets: reveal / mask value"));
+    right_lines.push(Line::from(""));
+
     right_lines.extend(section_header("TAB OVERVIEW"));
     right_lines.push(Line::from(""));
-    right_lines.push(Line::from(vec![
-        Span::styled(
-            "1. Workflows",
-            Style::default()
-                .fg(COLORS.accent)
-                .add_modifier(Modifier::BOLD),
+    for (idx, name, color, tag) in [
+        (
+            1u32,
+            "Workflows",
+            COLORS.accent,
+            "Browse & select workflows",
         ),
-        Span::styled(" \u{2500} Browse & select workflows", theme::dim_style()),
-    ]));
-    right_lines.push(Line::from(Span::styled(
-        "   View, select, and run workflows",
-        theme::muted_style(),
-    )));
-    right_lines.push(Line::from(""));
-    right_lines.push(Line::from(vec![
-        Span::styled(
-            "2. Execution",
-            Style::default()
-                .fg(COLORS.success)
-                .add_modifier(Modifier::BOLD),
+        (2, "Execution", COLORS.success, "Monitor job progress"),
+        (3, "DAG", COLORS.info, "Dependency graph / topological list"),
+        (4, "Logs", COLORS.info, "Execution logs · search · filter"),
+        (
+            5,
+            "Trigger",
+            COLORS.trigger,
+            "Dispatch remote workflow_dispatch",
         ),
-        Span::styled(" \u{2500} Monitor job progress", theme::dim_style()),
-    ]));
-    right_lines.push(Line::from(Span::styled(
-        "   Track jobs, steps, and output",
-        theme::muted_style(),
-    )));
-    right_lines.push(Line::from(""));
-    right_lines.push(Line::from(vec![
-        Span::styled(
-            "3. Logs",
-            Style::default()
-                .fg(COLORS.info)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" \u{2500} View execution logs", theme::dim_style()),
-    ]));
-    right_lines.push(Line::from(Span::styled(
-        "   Search, filter, real-time streaming",
-        theme::muted_style(),
-    )));
-    right_lines.push(Line::from(""));
-    right_lines.push(Line::from(vec![
-        Span::styled(
-            "4. Help",
-            Style::default()
-                .fg(COLORS.highlight)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" \u{2500} This guide", theme::dim_style()),
-    ]));
+        (6, "Secrets", COLORS.warning, "Provider routing & runtime"),
+        (7, "Help", COLORS.highlight, "This guide"),
+    ] {
+        right_lines.push(Line::from(vec![
+            Span::styled(
+                format!("{}. {}", idx, name),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!(" \u{2500} {}", tag), theme::dim_style()),
+        ]));
+    }
     right_lines.push(Line::from(""));
 
     right_lines.extend(section_header("QUICK ACTIONS"));

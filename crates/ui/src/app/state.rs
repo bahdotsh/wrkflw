@@ -8,10 +8,13 @@ use chrono::Local;
 use crossterm::event::KeyCode;
 use ratatui::widgets::{ListState, TableState};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
 use wrkflw_executor::{JobStatus, RuntimeType, StepStatus};
+use wrkflw_secrets::SecretConfig;
 
 /// Application state
 pub struct App {
@@ -120,19 +123,29 @@ pub struct App {
     /// can show a deterministic cursor position and preserve user-typed
     /// order in the curl preview.
     pub trigger_inputs: Vec<(String, String)>,
-    /// Index into `trigger_inputs` for the edit cursor. `usize::MAX`
-    /// when no row is being edited so an ESC cancels cleanly.
-    pub trigger_input_cursor: usize,
+    /// Index into `trigger_inputs` for the edit cursor. `None` when no
+    /// row is being edited.
+    pub trigger_input_cursor: Option<usize>,
     /// Which column of the currently-edited input row holds focus:
     /// false = key, true = value. Flipped with Tab.
     pub trigger_input_on_value: bool,
+    /// Shared in-flight flag so a double-`Enter` can't fire two
+    /// dispatches before the spawned task returns. Cleared by the
+    /// dispatch task on completion (success *or* error).
+    pub trigger_in_flight: Arc<AtomicBool>,
+    /// Cached resolution of the remote target (owner/repo, default
+    /// branch). Populated lazily by `trigger_tab_target()` so we don't
+    /// shell out to `git remote` every frame; invalidated on platform
+    /// toggle.
+    pub trigger_target_cache: Option<TriggerTarget>,
 
     // ── Secrets tab ───────────────────────────────────────────────
     /// Selected row in the secrets list.
     pub secrets_list_state: ListState,
     /// When true, the detail pane shows the value in cleartext. Toggled
-    /// with `m`. Auto-reverts when switching away from the tab so a user
-    /// leaving the terminal doesn't accidentally leave a secret exposed.
+    /// with `m`. Auto-reverts when switching away from the tab so a
+    /// user leaving the terminal doesn't accidentally leave a secret
+    /// exposed (see `switch_tab`).
     pub secrets_reveal: bool,
 
     // ── Tweaks overlay ────────────────────────────────────────────
@@ -467,8 +480,10 @@ impl App {
             trigger_workflow_idx: 0,
             trigger_branch: String::new(),
             trigger_inputs: Vec::new(),
-            trigger_input_cursor: usize::MAX,
+            trigger_input_cursor: None,
             trigger_input_on_value: false,
+            trigger_in_flight: Arc::new(AtomicBool::new(false)),
+            trigger_target_cache: None,
 
             secrets_list_state: {
                 let mut s = ListState::default();
@@ -1047,8 +1062,17 @@ impl App {
         }
     }
 
-    // Change the tab
+    // Change the tab.
+    //
+    // Re-engages secret masking when leaving the Secrets tab so a user
+    // who hit `m` to reveal and then context-switched isn't left with a
+    // cleartext-open pane waiting for them on return. This mirrors the
+    // "reveal 5s" timer in the original design.
     pub fn switch_tab(&mut self, tab: usize) {
+        const SECRETS_TAB: usize = 5;
+        if self.selected_tab == SECRETS_TAB && tab != SECRETS_TAB {
+            self.secrets_reveal = false;
+        }
         self.selected_tab = tab;
     }
 
@@ -1868,12 +1892,26 @@ impl App {
 
     pub fn trigger_tab_toggle_platform(&mut self) {
         self.trigger_platform = self.trigger_platform.toggle();
+        // Cached target is per-platform; drop it so the next render
+        // re-resolves for the now-active platform.
+        self.trigger_target_cache = None;
+    }
+
+    /// Return the resolved dispatch target, resolving once and caching
+    /// the result on `App`. Without this cache, `get_repo_info` (2-3
+    /// `git` subprocesses per call) would run on every render — ~20Hz
+    /// by default. The cache is invalidated by `trigger_tab_toggle_platform`.
+    pub fn trigger_tab_target(&mut self) -> &TriggerTarget {
+        if self.trigger_target_cache.is_none() {
+            self.trigger_target_cache = Some(resolve_trigger_target(self.trigger_platform));
+        }
+        self.trigger_target_cache.as_ref().expect("just populated")
     }
 
     /// Append a blank `key=value` row and put the edit cursor on it.
     pub fn trigger_tab_add_input(&mut self) {
         self.trigger_inputs.push((String::new(), String::new()));
-        self.trigger_input_cursor = self.trigger_inputs.len() - 1;
+        self.trigger_input_cursor = Some(self.trigger_inputs.len() - 1);
         self.trigger_input_on_value = false;
     }
 
@@ -1881,15 +1919,18 @@ impl App {
         if self.trigger_inputs.is_empty() {
             return;
         }
-        if self.trigger_input_cursor == usize::MAX {
-            self.trigger_input_cursor = 0;
-            self.trigger_input_on_value = false;
-        } else if !self.trigger_input_on_value {
-            self.trigger_input_on_value = true;
-        } else {
-            self.trigger_input_cursor =
-                (self.trigger_input_cursor + 1) % self.trigger_inputs.len();
-            self.trigger_input_on_value = false;
+        match self.trigger_input_cursor {
+            None => {
+                self.trigger_input_cursor = Some(0);
+                self.trigger_input_on_value = false;
+            }
+            Some(_) if !self.trigger_input_on_value => {
+                self.trigger_input_on_value = true;
+            }
+            Some(i) => {
+                self.trigger_input_cursor = Some((i + 1) % self.trigger_inputs.len());
+                self.trigger_input_on_value = false;
+            }
         }
     }
 
@@ -1897,17 +1938,19 @@ impl App {
         if self.trigger_inputs.is_empty() {
             return;
         }
-        if self.trigger_input_cursor == usize::MAX {
-            self.trigger_input_cursor = self.trigger_inputs.len() - 1;
-            self.trigger_input_on_value = true;
-        } else if self.trigger_input_on_value {
-            self.trigger_input_on_value = false;
-        } else {
-            self.trigger_input_cursor = (self.trigger_input_cursor
-                + self.trigger_inputs.len()
-                - 1)
-                % self.trigger_inputs.len();
-            self.trigger_input_on_value = true;
+        match self.trigger_input_cursor {
+            None => {
+                self.trigger_input_cursor = Some(self.trigger_inputs.len() - 1);
+                self.trigger_input_on_value = true;
+            }
+            Some(_) if self.trigger_input_on_value => {
+                self.trigger_input_on_value = false;
+            }
+            Some(i) => {
+                let n = self.trigger_inputs.len();
+                self.trigger_input_cursor = Some((i + n - 1) % n);
+                self.trigger_input_on_value = true;
+            }
         }
     }
 
@@ -1917,9 +1960,9 @@ impl App {
     /// and let the user see the result in the Logs tab. Blocking the
     /// UI thread on a `reqwest` POST would freeze the animation loop.
     pub fn trigger_tab_enter(&mut self) {
-        if self.trigger_input_cursor != usize::MAX {
+        if self.trigger_input_cursor.is_some() {
             // Commit edit.
-            self.trigger_input_cursor = usize::MAX;
+            self.trigger_input_cursor = None;
             self.trigger_input_on_value = false;
             return;
         }
@@ -1930,8 +1973,11 @@ impl App {
     /// Returns `true` if the key was consumed (so the caller should
     /// skip the global key map); `false` otherwise.
     pub fn trigger_handle_input_key(&mut self, code: KeyCode) -> bool {
-        let Some((k, v)) = self.trigger_inputs.get_mut(self.trigger_input_cursor) else {
-            self.trigger_input_cursor = usize::MAX;
+        let Some(idx) = self.trigger_input_cursor else {
+            return false;
+        };
+        let Some((k, v)) = self.trigger_inputs.get_mut(idx) else {
+            self.trigger_input_cursor = None;
             return false;
         };
         let buf = if self.trigger_input_on_value { v } else { k };
@@ -1945,7 +1991,7 @@ impl App {
                 true
             }
             KeyCode::Esc => {
-                self.trigger_input_cursor = usize::MAX;
+                self.trigger_input_cursor = None;
                 self.trigger_input_on_value = false;
                 true
             }
@@ -1983,7 +2029,7 @@ impl App {
                      https://api.github.com/repos/<owner>/<repo>/actions/workflows/{wf}/dispatches \
                      -d '{{\"ref\":\"{branch}\",\"inputs\":{inputs_json}}}'",
                     wf = strip_yaml_suffix(wf),
-                    branch = branch,
+                    branch = escape_shell_single(&branch),
                     inputs_json = inputs_json
                 )
             }
@@ -2001,10 +2047,17 @@ impl App {
 
     /// Fire the dispatch. We spawn a tokio task because the TUI event
     /// loop is synchronous — blocking on `.await` here would stall
-    /// rendering. Result ends up in `logs` via the channel.
+    /// rendering. An in-flight flag guards against double-Enter firing
+    /// two dispatches before the first returns.
     pub fn trigger_dispatch(&mut self) {
-        let Some(wf_name_raw) = self.trigger_selected_workflow_name().map(|s| s.to_string())
-        else {
+        if self.trigger_in_flight.load(Ordering::SeqCst) {
+            self.set_error_message(
+                "A trigger dispatch is already in flight — wait for it to complete.".to_string(),
+            );
+            return;
+        }
+
+        let Some(wf_name_raw) = self.trigger_selected_workflow_name().map(|s| s.to_string()) else {
             self.set_error_message("No workflow selected to dispatch.".to_string());
             return;
         };
@@ -2028,6 +2081,12 @@ impl App {
         ));
         self.trim_logs_to_cap();
 
+        // Flag flip happens before the spawn so rapid repeat Enters
+        // after this point see the flag and bail. The spawned task
+        // owns clearing it regardless of outcome.
+        self.trigger_in_flight.store(true, Ordering::SeqCst);
+        let in_flight = Arc::clone(&self.trigger_in_flight);
+
         tokio::spawn(async move {
             let outcome = match platform {
                 TriggerPlatform::Github => {
@@ -2035,14 +2094,22 @@ impl App {
                     wrkflw_github::trigger_workflow(
                         &wf,
                         branch.as_deref(),
-                        if inputs.is_empty() { None } else { Some(inputs) },
+                        if inputs.is_empty() {
+                            None
+                        } else {
+                            Some(inputs)
+                        },
                     )
                     .await
                     .map_err(|e| e.to_string())
                 }
                 TriggerPlatform::Gitlab => wrkflw_gitlab::trigger_pipeline(
                     branch.as_deref(),
-                    if inputs.is_empty() { None } else { Some(inputs) },
+                    if inputs.is_empty() {
+                        None
+                    } else {
+                        Some(inputs)
+                    },
                 )
                 .await
                 .map_err(|e| e.to_string()),
@@ -2051,6 +2118,7 @@ impl App {
                 Ok(_) => wrkflw_logging::info("Trigger dispatched successfully"),
                 Err(e) => wrkflw_logging::error(&format!("Trigger failed: {}", e)),
             }
+            in_flight.store(false, Ordering::SeqCst);
         });
     }
 
@@ -2060,7 +2128,7 @@ impl App {
     /// cursor never falls off (ratatui's ListState happily accepts an
     /// out-of-range index and silently renders nothing).
     pub fn secrets_tab_next(&mut self) {
-        let len = crate::views::secrets_provider_count();
+        let len = secrets_provider_count();
         if len == 0 {
             return;
         }
@@ -2072,7 +2140,7 @@ impl App {
     }
 
     pub fn secrets_tab_prev(&mut self) {
-        let len = crate::views::secrets_provider_count();
+        let len = secrets_provider_count();
         if len == 0 {
             return;
         }
@@ -2085,39 +2153,114 @@ impl App {
 }
 
 // ── Free helpers for the trigger curl preview ────────────────────
+
+/// Cached-resolve of the remote dispatch target. Owned by `App` so we
+/// can clear it on platform toggle instead of re-shelling `git remote`
+/// every frame.
+#[derive(Debug, Clone)]
+pub struct TriggerTarget {
+    pub platform_label: String,
+    pub repo_label: String,
+    pub default_branch: String,
+    /// Non-fatal note surfaced in the UI when repo resolution fails.
+    pub note: Option<String>,
+}
+
+/// Count of configured secret providers. Lives in state (not views) so
+/// state navigation code doesn't have to reach into the render layer
+/// just to bounds-check its cursor.
+pub fn secrets_provider_count() -> usize {
+    SecretConfig::default().providers.len()
+}
+
 fn strip_yaml_suffix(name: &str) -> &str {
     name.strip_suffix(".yml")
         .or_else(|| name.strip_suffix(".yaml"))
         .unwrap_or(name)
 }
 
-fn inputs_to_json(inputs: &[(String, String)]) -> String {
-    if inputs.is_empty() {
-        return "{}".to_string();
-    }
-    let mut parts: Vec<String> = Vec::new();
+/// Serialize the trigger inputs into the exact JSON object the GitHub
+/// dispatch endpoint expects. Using `serde_json` (vs hand-rolled
+/// escaping) is load-bearing: values may contain quotes, backslashes,
+/// newlines, or non-ASCII characters, all of which break a naive
+/// `replace('"', ...)` escaper.
+pub(crate) fn inputs_to_json(inputs: &[(String, String)]) -> String {
+    let mut map = serde_json::Map::with_capacity(inputs.len());
     for (k, v) in inputs {
         if k.is_empty() {
             continue;
         }
-        parts.push(format!("\"{}\":\"{}\"", escape_json(k), escape_json(v)));
+        map.insert(k.clone(), serde_json::Value::String(v.clone()));
     }
-    format!("{{{}}}", parts.join(","))
+    serde_json::to_string(&serde_json::Value::Object(map)).unwrap_or_else(|_| "{}".to_string())
 }
 
-fn gitlab_vars_form(inputs: &[(String, String)]) -> String {
+/// GitLab curl-preview builder. The value is wrapped in double quotes
+/// plus a shell-single-quote-escape pass on any embedded single quote
+/// so the generated one-liner is copy-paste safe. Anything that the
+/// shell *itself* would interpret (`$`, backticks) is left alone on
+/// purpose — echoing back what the user would type.
+pub(crate) fn gitlab_vars_form(inputs: &[(String, String)]) -> String {
     let mut out = String::new();
     for (k, v) in inputs {
         if k.is_empty() {
             continue;
         }
-        out.push_str(&format!(" -F \"variables[{}]={}\"", k, v));
+        out.push_str(&format!(
+            " -F \"variables[{}]={}\"",
+            escape_shell_double(k),
+            escape_shell_double(v),
+        ));
     }
     out
 }
 
-fn escape_json(s: &str) -> String {
+fn escape_shell_double(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// Escape into a shell single-quoted context: close the quote, emit an
+/// escaped single quote, and reopen. Used by the GitHub curl preview
+/// for the ref value.
+fn escape_shell_single(s: &str) -> String {
+    s.replace('\'', "'\\''")
+}
+
+/// Resolve repo info for the Trigger tab. Shells out to `git remote`
+/// via `wrkflw_{github,gitlab}::get_repo_info`; cheap on small repos,
+/// painful on every frame — which is why callers go through the
+/// `App::trigger_tab_target` cache.
+fn resolve_trigger_target(platform: TriggerPlatform) -> TriggerTarget {
+    match platform {
+        TriggerPlatform::Github => match wrkflw_github::get_repo_info() {
+            Ok(info) => TriggerTarget {
+                platform_label: "GitHub".to_string(),
+                repo_label: format!("{}/{}", info.owner, info.repo),
+                default_branch: info.default_branch,
+                note: None,
+            },
+            Err(e) => TriggerTarget {
+                platform_label: "GitHub".to_string(),
+                repo_label: "<unresolved>".to_string(),
+                default_branch: "main".to_string(),
+                note: Some(e.to_string()),
+            },
+        },
+        TriggerPlatform::Gitlab => match wrkflw_gitlab::get_repo_info() {
+            Ok(info) => TriggerTarget {
+                platform_label: "GitLab".to_string(),
+                repo_label: format!("{}/{}", info.namespace, info.project),
+                default_branch: info.default_branch,
+                note: None,
+            },
+            Err(e) => TriggerTarget {
+                platform_label: "GitLab".to_string(),
+                repo_label: "<unresolved>".to_string(),
+                default_branch: "main".to_string(),
+                note: Some(e.to_string()),
+            },
+        },
+    }
 }
 
 /// Run git + trigger evaluation as an async task on the ambient runtime.
@@ -2895,5 +3038,242 @@ mod tests {
 
         assert!(!app.job_selection_mode);
         assert!(app.available_jobs.is_empty());
+    }
+
+    // ── Added as part of the post-review cleanup ─────────────────
+
+    #[test]
+    fn accent_next_cycles_through_all_five_slots() {
+        let mut a = Accent::Cyan;
+        let mut seen = vec![a];
+        for _ in 0..5 {
+            a = a.next();
+            seen.push(a);
+        }
+        // Five steps returns to Cyan.
+        assert_eq!(seen.first(), seen.last());
+        // All five slots are visited before wrapping.
+        let mut distinct = seen.clone();
+        distinct.sort_by_key(|a| *a as u8);
+        distinct.dedup_by_key(|a| *a as u8);
+        assert_eq!(distinct.len(), 5);
+    }
+
+    #[test]
+    fn strip_yaml_suffix_handles_both_extensions_and_neither() {
+        assert_eq!(strip_yaml_suffix("ci.yml"), "ci");
+        assert_eq!(strip_yaml_suffix("ci.yaml"), "ci");
+        assert_eq!(strip_yaml_suffix("ci"), "ci");
+        assert_eq!(strip_yaml_suffix(""), "");
+        // Only the trailing suffix is stripped — embedded ".yml" inside
+        // a name stays.
+        assert_eq!(strip_yaml_suffix("my.yml.backup"), "my.yml.backup");
+    }
+
+    #[test]
+    fn inputs_to_json_is_empty_for_empty_and_skips_blank_keys() {
+        assert_eq!(inputs_to_json(&[]), "{}");
+        assert_eq!(inputs_to_json(&[(String::new(), "ignored".into())]), "{}");
+    }
+
+    #[test]
+    fn inputs_to_json_escapes_control_chars_via_serde_json() {
+        // The original hand-rolled escaper only handled `\` and `"`.
+        // serde_json handles the full JSON spec — newlines, tabs,
+        // quotes, backslashes — and we verify the round-trip.
+        let out = inputs_to_json(&[("key".into(), "line1\nline2\t\"quoted\"\\slash".into())]);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&out).expect("inputs_to_json must produce valid JSON");
+        assert_eq!(
+            parsed.get("key").and_then(|v| v.as_str()),
+            Some("line1\nline2\t\"quoted\"\\slash")
+        );
+    }
+
+    #[test]
+    fn gitlab_vars_form_escapes_quotes_and_backslashes() {
+        let out = gitlab_vars_form(&[("K".into(), "has \"quote\"".into())]);
+        // Value's double-quote must be escaped so the enclosing shell
+        // double-quoted string stays intact.
+        assert!(
+            out.contains("has \\\"quote\\\""),
+            "embedded quote not escaped: {}",
+            out
+        );
+    }
+
+    #[test]
+    fn gitlab_vars_form_skips_empty_keys() {
+        let out = gitlab_vars_form(&[(String::new(), "v".into()), ("k".into(), "v".into())]);
+        assert_eq!(out, " -F \"variables[k]=v\"");
+    }
+
+    #[test]
+    fn trigger_tab_add_input_sets_cursor_to_new_row_and_key_column() {
+        let mut app = make_app();
+        assert!(app.trigger_input_cursor.is_none());
+        app.trigger_tab_add_input();
+        assert_eq!(app.trigger_input_cursor, Some(0));
+        assert!(!app.trigger_input_on_value);
+        app.trigger_tab_add_input();
+        assert_eq!(app.trigger_input_cursor, Some(1));
+    }
+
+    #[test]
+    fn trigger_tab_next_and_prev_field_are_no_ops_when_no_inputs() {
+        let mut app = make_app();
+        assert!(app.trigger_inputs.is_empty());
+        app.trigger_tab_next_field();
+        assert!(app.trigger_input_cursor.is_none());
+        app.trigger_tab_prev_field();
+        assert!(app.trigger_input_cursor.is_none());
+    }
+
+    #[test]
+    fn trigger_tab_next_field_walks_key_then_value_then_wraps() {
+        let mut app = make_app();
+        app.trigger_inputs = vec![("a".into(), "1".into()), ("b".into(), "2".into())];
+        // From fresh state: None → row 0 key → row 0 value → row 1 key …
+        app.trigger_tab_next_field();
+        assert_eq!(
+            (app.trigger_input_cursor, app.trigger_input_on_value),
+            (Some(0), false)
+        );
+        app.trigger_tab_next_field();
+        assert_eq!(
+            (app.trigger_input_cursor, app.trigger_input_on_value),
+            (Some(0), true)
+        );
+        app.trigger_tab_next_field();
+        assert_eq!(
+            (app.trigger_input_cursor, app.trigger_input_on_value),
+            (Some(1), false)
+        );
+        app.trigger_tab_next_field();
+        assert_eq!(
+            (app.trigger_input_cursor, app.trigger_input_on_value),
+            (Some(1), true)
+        );
+        // Wraps back to row 0 key.
+        app.trigger_tab_next_field();
+        assert_eq!(
+            (app.trigger_input_cursor, app.trigger_input_on_value),
+            (Some(0), false)
+        );
+    }
+
+    #[test]
+    fn trigger_tab_prev_field_reverses_direction() {
+        let mut app = make_app();
+        app.trigger_inputs = vec![("a".into(), "1".into()), ("b".into(), "2".into())];
+        // From fresh state: None → row 1 value (backward wrap).
+        app.trigger_tab_prev_field();
+        assert_eq!(
+            (app.trigger_input_cursor, app.trigger_input_on_value),
+            (Some(1), true)
+        );
+        app.trigger_tab_prev_field();
+        assert_eq!(
+            (app.trigger_input_cursor, app.trigger_input_on_value),
+            (Some(1), false)
+        );
+        app.trigger_tab_prev_field();
+        assert_eq!(
+            (app.trigger_input_cursor, app.trigger_input_on_value),
+            (Some(0), true)
+        );
+    }
+
+    #[test]
+    fn trigger_handle_input_key_is_noop_without_cursor() {
+        let mut app = make_app();
+        assert!(!app.trigger_handle_input_key(KeyCode::Char('x')));
+    }
+
+    #[test]
+    fn trigger_handle_input_key_writes_into_active_column() {
+        let mut app = make_app();
+        app.trigger_tab_add_input();
+        assert!(app.trigger_handle_input_key(KeyCode::Char('n')));
+        assert!(app.trigger_handle_input_key(KeyCode::Char('s')));
+        assert_eq!(app.trigger_inputs[0].0, "ns");
+        app.trigger_input_on_value = true;
+        assert!(app.trigger_handle_input_key(KeyCode::Char('1')));
+        assert_eq!(app.trigger_inputs[0].1, "1");
+        assert!(app.trigger_handle_input_key(KeyCode::Backspace));
+        assert_eq!(app.trigger_inputs[0].1, "");
+        // Esc clears the cursor cleanly.
+        assert!(app.trigger_handle_input_key(KeyCode::Esc));
+        assert!(app.trigger_input_cursor.is_none());
+    }
+
+    #[test]
+    fn trigger_dispatch_sets_in_flight_flag_and_rejects_concurrent_calls() {
+        // We can't easily let the spawned task complete without a real
+        // tokio runtime, so assert the synchronous guard: after one
+        // dispatch, the flag is armed and a repeat call emits the
+        // "already in flight" status message without spawning again.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut app = make_app();
+            app.trigger_workflow_idx = 0;
+            app.trigger_dispatch();
+            assert!(app.trigger_in_flight.load(Ordering::SeqCst));
+            let before_status = app.status_message.clone();
+            app.trigger_dispatch();
+            // Second call must set an error message, not a second spawn.
+            assert_ne!(app.status_message, before_status);
+            assert!(app
+                .status_message
+                .as_deref()
+                .unwrap_or("")
+                .contains("already in flight"));
+        });
+    }
+
+    #[test]
+    fn trigger_tab_toggle_platform_drops_target_cache() {
+        let mut app = make_app();
+        app.trigger_target_cache = Some(TriggerTarget {
+            platform_label: "GitHub".into(),
+            repo_label: "x/y".into(),
+            default_branch: "main".into(),
+            note: None,
+        });
+        app.trigger_tab_toggle_platform();
+        assert!(app.trigger_target_cache.is_none());
+    }
+
+    #[test]
+    fn secrets_tab_navigation_is_noop_on_empty_and_bounded_otherwise() {
+        let mut app = make_app();
+        let provider_count = secrets_provider_count();
+        // Navigate `provider_count * 3` times without panicking and
+        // always land on a valid index.
+        for _ in 0..(provider_count.max(1) * 3) {
+            app.secrets_tab_next();
+            if let Some(i) = app.secrets_list_state.selected() {
+                assert!(i < provider_count.max(1));
+            }
+        }
+        for _ in 0..(provider_count.max(1) * 3) {
+            app.secrets_tab_prev();
+            if let Some(i) = app.secrets_list_state.selected() {
+                assert!(i < provider_count.max(1));
+            }
+        }
+    }
+
+    #[test]
+    fn switch_tab_auto_reverts_secrets_reveal_when_leaving_secrets() {
+        let mut app = make_app();
+        app.selected_tab = 5;
+        app.secrets_reveal = true;
+        app.switch_tab(0);
+        assert!(!app.secrets_reveal, "leaving Secrets must re-mask");
+        // Moving *within* Secrets does not flip reveal.
+        app.secrets_reveal = true;
+        app.switch_tab(5);
+        assert!(app.secrets_reveal);
     }
 }

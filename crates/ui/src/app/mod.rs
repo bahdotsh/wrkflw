@@ -223,23 +223,22 @@ fn run_tui_event_loop(
                     continue;
                 }
 
-                // When the Tweaks overlay is open, its keys take
-                // precedence. Esc and `,` close it; `a` rotates the
-                // accent; `d` toggles density. This blocks the global
-                // `d` (diff filter) so the overlay doesn't silently
-                // trigger two actions at once.
+                // When the Tweaks overlay is open it is modal: only
+                // its own shortcuts are honoured, everything else is
+                // swallowed so keys like `q`, `d`, or a tab number
+                // can't silently fire the global handler while the
+                // user is in edit-mode.
                 if app.tweaks_open {
                     match key.code {
                         KeyCode::Esc | KeyCode::Char(',') => {
                             app.tweaks_open = false;
-                            continue;
                         }
                         KeyCode::Char('a') | KeyCode::Char('A') => {
                             app.tweaks_accent = app.tweaks_accent.next();
-                            continue;
                         }
                         _ => {}
                     }
+                    continue;
                 }
 
                 // Trigger tab: if a text input row is focused, route
@@ -248,7 +247,7 @@ fn run_tui_event_loop(
                 // editing a value like "notify=slack" would trip the
                 // `s` logs shortcut below and jump tabs.
                 if app.selected_tab == 4
-                    && app.trigger_input_cursor != usize::MAX
+                    && app.trigger_input_cursor.is_some()
                     && app.trigger_handle_input_key(key.code)
                 {
                     continue;

@@ -30,7 +30,11 @@ use wrkflw_parser::workflow::WorkflowDefinition;
 
 pub fn render_dag_tab(f: &mut Frame<'_>, app: &App, area: Rect) {
     let Some(idx) = app.workflow_list_state.selected() else {
-        render_empty_state(f, area, "No workflow selected — pick one on the Workflows tab.");
+        render_empty_state(
+            f,
+            area,
+            "No workflow selected — pick one on the Workflows tab.",
+        );
         return;
     };
     let Some(workflow) = app.workflows.get(idx) else {
@@ -85,7 +89,10 @@ fn render_header(f: &mut Frame<'_>, app: &App, workflow: &crate::models::Workflo
                 .fg(COLORS.text)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled("  ·  dependency graph  ·  ", Style::default().fg(COLORS.text_muted)),
+        Span::styled(
+            "  ·  dependency graph  ·  ",
+            Style::default().fg(COLORS.text_muted),
+        ),
         theme::badge_outline(view_label, BadgeKind::Info),
         Span::raw("  "),
         Span::styled(
@@ -103,7 +110,10 @@ fn render_header(f: &mut Frame<'_>, app: &App, workflow: &crate::models::Workflo
 /// `WorkflowExecution` so a running nightly shows `build` as
 /// `Running`, mirroring the design's live DAG.
 fn state_for_job(app: &App, workflow: &crate::models::Workflow, name: &str) -> NodeState {
-    if !matches!(workflow.status, WorkflowStatus::Running | WorkflowStatus::Success | WorkflowStatus::Failed) {
+    if !matches!(
+        workflow.status,
+        WorkflowStatus::Running | WorkflowStatus::Success | WorkflowStatus::Failed
+    ) {
         return NodeState::Pending;
     }
     let Some(exec) = workflow.execution_details.as_ref() else {
@@ -116,12 +126,14 @@ fn state_for_job(app: &App, workflow: &crate::models::Workflow, name: &str) -> N
             JobStatus::Skipped => NodeState::Skipped,
         },
         None => {
-            if app.current_execution == Some(
-                app.workflows
-                    .iter()
-                    .position(|w| std::ptr::eq(w, workflow))
-                    .unwrap_or(usize::MAX),
-            ) {
+            if app.current_execution
+                == Some(
+                    app.workflows
+                        .iter()
+                        .position(|w| std::ptr::eq(w, workflow))
+                        .unwrap_or(usize::MAX),
+                )
+            {
                 NodeState::Running
             } else {
                 NodeState::Pending
@@ -155,23 +167,28 @@ fn render_graph(
     // because terminals wider than 6 stages of workflows are a separate
     // feature request).
     let col_count = levels.len().max(1) as u16;
-    let constraints: Vec<Constraint> =
-        (0..col_count).map(|_| Constraint::Ratio(1, col_count as u32)).collect();
+    let constraints: Vec<Constraint> = (0..col_count)
+        .map(|_| Constraint::Ratio(1, col_count as u32))
+        .collect();
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints(constraints)
         .split(inner);
 
-    let stage_labels = ["setup", "lint", "build", "test/docs", "publish", "post"];
-
+    // Column labels read straight off the topology ("Stage N"). The
+    // design handoff uses semantic names like "build" / "test", but
+    // no such grouping exists in GitHub Actions' workflow YAML today,
+    // so putting a name here would mean *inventing* one.
     for (li, layer) in levels.iter().enumerate() {
         let col = cols[li];
-        let stage = stage_labels.get(li).copied().unwrap_or("stage");
         let mut lines: Vec<Line> = Vec::new();
         lines.push(Line::from(vec![
-            Span::styled(format!("L{} ", li + 1), Style::default().fg(COLORS.text_muted)),
             Span::styled(
-                stage.to_string(),
+                format!("L{} ", li + 1),
+                Style::default().fg(COLORS.text_muted),
+            ),
+            Span::styled(
+                format!("stage {}", li + 1),
                 Style::default()
                     .fg(COLORS.highlight)
                     .add_modifier(Modifier::BOLD),
@@ -233,10 +250,7 @@ fn render_graph(
             if matrix_axes > 0 {
                 lines.push(Line::from(vec![
                     Span::styled("│ ", Style::default().fg(color)),
-                    theme::badge_outline(
-                        format!("matrix×{}", matrix_axes),
-                        BadgeKind::Info,
-                    ),
+                    theme::badge_outline(format!("matrix×{}", matrix_axes), BadgeKind::Info),
                     Span::styled("         │", Style::default().fg(color)),
                 ]));
             }
@@ -261,31 +275,33 @@ fn render_topo_list(
     f.render_widget(block, area);
 
     let levels = dag::topo_levels(def);
-    let stage_labels = ["setup", "lint", "build", "test/docs", "publish", "post"];
     let mut lines: Vec<Line> = Vec::new();
 
     for (li, layer) in levels.iter().enumerate() {
-        let stage = stage_labels.get(li).copied().unwrap_or("stage");
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!(" Stage {} · ", li + 1),
-                Style::default().fg(COLORS.highlight),
-            ),
-            Span::styled(
-                stage.to_string(),
-                Style::default()
-                    .fg(COLORS.highlight)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]));
+        lines.push(Line::from(vec![Span::styled(
+            format!(" Stage {}", li + 1),
+            Style::default()
+                .fg(COLORS.highlight)
+                .add_modifier(Modifier::BOLD),
+        )]));
         for name in layer {
             let st = state_for_job(app, workflow, name);
             let (glyph, style) = match st {
-                NodeState::Success => (theme::symbols::SUCCESS, Style::default().fg(COLORS.success)),
+                NodeState::Success => {
+                    (theme::symbols::SUCCESS, Style::default().fg(COLORS.success))
+                }
                 NodeState::Failure => (theme::symbols::FAILURE, Style::default().fg(COLORS.error)),
-                NodeState::Skipped => (theme::symbols::SKIPPED, Style::default().fg(COLORS.warning)),
-                NodeState::Running => (theme::spinner(app.spinner_frame), Style::default().fg(COLORS.info)),
-                NodeState::Pending => (theme::symbols::NOT_STARTED, Style::default().fg(COLORS.text_muted)),
+                NodeState::Skipped => {
+                    (theme::symbols::SKIPPED, Style::default().fg(COLORS.warning))
+                }
+                NodeState::Running => (
+                    theme::spinner(app.spinner_frame),
+                    Style::default().fg(COLORS.info),
+                ),
+                NodeState::Pending => (
+                    theme::symbols::NOT_STARTED,
+                    Style::default().fg(COLORS.text_muted),
+                ),
             };
             let needs: String = def
                 .jobs
@@ -336,11 +352,17 @@ fn render_legend(f: &mut Frame<'_>, app: &App, area: Rect) {
             Span::raw("  success"),
         ]),
         Line::from(vec![
-            Span::styled(theme::spinner(app.spinner_frame), Style::default().fg(COLORS.info)),
+            Span::styled(
+                theme::spinner(app.spinner_frame),
+                Style::default().fg(COLORS.info),
+            ),
             Span::raw("  running"),
         ]),
         Line::from(vec![
-            Span::styled(theme::symbols::NOT_STARTED, Style::default().fg(COLORS.text_muted)),
+            Span::styled(
+                theme::symbols::NOT_STARTED,
+                Style::default().fg(COLORS.text_muted),
+            ),
             Span::raw("  pending"),
         ]),
         Line::from(vec![

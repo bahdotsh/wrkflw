@@ -94,6 +94,7 @@ pub fn render_status_bar(f: &mut Frame<'_>, app: &App, area: Rect) {
 
 fn context_hints(app: &App) -> Vec<(&'static str, &'static str)> {
     match app.selected_tab {
+        // 0 — Workflows
         0 => {
             if app.job_selection_mode {
                 vec![
@@ -124,10 +125,11 @@ fn context_hints(app: &App) -> Vec<(&'static str, &'static str)> {
                 ]
             }
         }
+        // 1 — Execution
         1 => {
             if app.detailed_view {
                 vec![
-                    ("Tab", "switch pane"),
+                    ("Tab", "sub-tab"),
                     ("↑↓", "steps"),
                     ("Esc", "back"),
                     ("?", "help"),
@@ -136,20 +138,48 @@ fn context_hints(app: &App) -> Vec<(&'static str, &'static str)> {
                 vec![
                     ("j/k", "move"),
                     ("Enter", "inspect"),
-                    ("/", "search"),
-                    ("p", "pause"),
                     ("?", "help"),
+                    ("q", "quit"),
                 ]
             }
         }
+        // 2 — DAG
         2 => vec![
+            ("g", "graph/list"),
+            ("↑↓", "workflows"),
+            (",", "tweaks"),
+            ("?", "help"),
+        ],
+        // 3 — Logs
+        3 => vec![
             ("↑↓", "scroll"),
             ("s", "search"),
             ("f", "filter"),
+            ("c", "clear"),
+            ("n", "next match"),
             ("?", "help"),
             ("q", "quit"),
         ],
-        3 => vec![("↑↓", "scroll"), ("?", "close"), ("q", "quit")],
+        // 4 — Trigger
+        4 => vec![
+            ("p", "platform"),
+            ("↑↓", "workflow"),
+            ("+", "add input"),
+            ("Tab", "next field"),
+            ("Enter", "dispatch"),
+            ("c", "copy curl"),
+            ("?", "help"),
+        ],
+        // 5 — Secrets
+        5 => vec![
+            ("↑↓", "provider"),
+            ("m", "reveal/mask"),
+            ("e", "runtime"),
+            (",", "tweaks"),
+            ("?", "help"),
+        ],
+        // 6 — Help
+        6 => vec![("↑↓", "scroll"), ("?", "close"), ("q", "quit")],
         _ => vec![],
     }
 }

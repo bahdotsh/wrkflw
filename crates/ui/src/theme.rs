@@ -29,9 +29,7 @@ pub fn set_accent_override(color: Option<Color>) {
 /// Read the active accent color. Falls back to the static palette
 /// value when no override is installed.
 pub fn current_accent() -> Color {
-    ACCENT_OVERRIDE
-        .with(|c| c.get())
-        .unwrap_or(COLORS.accent)
+    ACCENT_OVERRIDE.with(|c| c.get()).unwrap_or(COLORS.accent)
 }
 
 // ── Color Palette ──────────────────────────────────────────────────

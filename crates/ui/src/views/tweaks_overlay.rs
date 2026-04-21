@@ -7,12 +7,13 @@
 // omitted rather than rendered as a dead toggle — matches the rule
 // from PR #104: "A UI without backing data is worse than no UI."
 //
+// The key dispatch in `app/mod.rs` treats the overlay as fully modal:
+// while `tweaks_open` is true, every key is either consumed by one of
+// the bindings below or swallowed outright. Unmatched keys do NOT
+// fall through to the global handler.
+//
 // Controls:
 //   - `a` / `A` : cycle accent forwards (wraps)
-//   - `d`       : toggle density (currently also bound globally to
-//                 diff-filter — but only within the Workflows tab. Here
-//                 we gate the keystroke on `tweaks_open`, so the
-//                 overlay wins.)
 //   - `esc` / `,` : close
 
 use crate::app::{Accent, App};
@@ -69,20 +70,27 @@ fn render_accent_row(f: &mut Frame<'_>, app: &App, area: Rect) {
         let label = format!(" {} ", if active { "●" } else { " " });
         Span::styled(
             label,
-            Style::default().bg(bg).fg(COLORS.bg_dark).add_modifier(
-                if active {
+            Style::default()
+                .bg(bg)
+                .fg(COLORS.bg_dark)
+                .add_modifier(if active {
                     Modifier::BOLD
                 } else {
                     Modifier::empty()
-                },
-            ),
+                }),
         )
     };
     let mut spans: Vec<Span> = vec![Span::styled(
         "accent  ",
         Style::default().fg(COLORS.text_muted),
     )];
-    for c in [Accent::Cyan, Accent::Amber, Accent::Green, Accent::Violet, Accent::Coral] {
+    for c in [
+        Accent::Cyan,
+        Accent::Amber,
+        Accent::Green,
+        Accent::Violet,
+        Accent::Coral,
+    ] {
         spans.push(swatch(c, app.tweaks_accent == c));
         spans.push(Span::raw(" "));
     }

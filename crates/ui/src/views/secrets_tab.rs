@@ -24,14 +24,6 @@ use ratatui::{
 use wrkflw_executor::RuntimeType;
 use wrkflw_secrets::{SecretConfig, SecretProviderConfig};
 
-/// Public so state.rs can clamp cursor moves. We load the default
-/// config (same one `wrkflw-secrets` ships with) because the TUI
-/// doesn't currently read a user secrets file — doing so without a
-/// --secrets flag would silently diverge from CLI behaviour.
-pub fn secrets_provider_count() -> usize {
-    SecretConfig::default().providers.len()
-}
-
 pub fn render_secrets_tab(f: &mut Frame<'_>, app: &mut App, area: Rect) {
     let outer = Layout::default()
         .direction(Direction::Vertical)
@@ -206,7 +198,10 @@ fn render_runtime_pane(f: &mut Frame<'_>, app: &App, area: Rect) {
         if active {
             vec![theme::badge_solid(label.to_string(), kind), Span::raw(" ")]
         } else {
-            vec![theme::badge_outline(label.to_string(), kind), Span::raw(" ")]
+            vec![
+                theme::badge_outline(label.to_string(), kind),
+                Span::raw(" "),
+            ]
         }
     };
     let mut pills: Vec<Span> = Vec::new();

@@ -7,15 +7,17 @@ This directory contains the Rust crates that make up the wrkflw workspace.
 | Crate | Purpose |
 |-------|---------|
 | **wrkflw** | CLI binary and library entry point |
-| **executor** | Workflow execution engine (Docker, Podman, emulation) |
+| **executor** | Workflow execution engine (Docker, Podman, emulation, secure emulation); `${{ }}` expression evaluator; artifact/cache/inter-job-output stores |
 | **parser** | Workflow file parsing and JSON Schema validation |
 | **evaluator** | Structural evaluation of workflow files |
 | **validators** | Validation rules for jobs, steps, triggers, matrix |
 | **runtime** | Container management and emulation runtime |
+| **trigger-filter** | Parses `on:` blocks and matches them against simulated event context and changed-file sets |
+| **watcher** | File watcher with trigger-aware re-execution for `wrkflw watch` |
 | **ui** | Terminal user interface (ratatui-based) |
 | **models** | Shared data structures (`ValidationResult`, GitLab models) |
 | **matrix** | Matrix expansion (`include`, `exclude`, `fail-fast`) |
-| **secrets** | Secrets management with multiple providers and encryption |
+| **secrets** | Secrets management with multiple providers and AES-256-GCM encryption |
 | **github** | GitHub API integration (list/trigger workflows) |
 | **gitlab** | GitLab API integration (trigger pipelines) |
 | **logging** | Thread-safe in-memory logging for TUI/CLI |

@@ -1,6 +1,8 @@
 # Breaking Changes
 
-## `wrkflw run --event` requires change-set input by default (v0.7.3)
+> The entries below ship in the next release (post-v0.7.3, currently unreleased on `main`).
+
+## `wrkflw run --event` requires change-set input by default (Unreleased)
 
 `wrkflw run` now supports trigger-aware filtering via `--event`, `--diff`,
 and `--changed-files`. When any of those flags is passed, the CLI runs a
@@ -27,7 +29,7 @@ evaluation time. Users would then file "why didn't my workflow fire?"
 issues for the non-obvious reason that no change set had been supplied.
 Strict mode turns that silent failure into a loud, actionable error up
 front — it is the default countermeasure for the same class of silent
-skip the rest of v0.7.3 patched iteratively.
+skip the rest of the trigger-filter work patched iteratively.
 
 ### Impact
 
@@ -75,10 +77,10 @@ Pick the option that matches your intent:
   ```
 
 - **Legacy warn-and-proceed behavior (not recommended):** opt out with
-  `--no-strict-filter`. This restores the pre-v0.7.3 behavior of logging
-  a warning and running every workflow anyway. Use this only if your
-  scripts have already adapted to the old silent-skip semantics and you
-  cannot change them right now.
+  `--no-strict-filter`. This restores the pre-strict-filter behavior of
+  logging a warning and running every workflow anyway. Use this only if
+  your scripts have already adapted to the old silent-skip semantics and
+  you cannot change them right now.
 
 ### Prefilter exit codes
 
@@ -99,7 +101,7 @@ Pick the option that matches your intent:
 
 ---
 
-## Shell now matches GitHub Actions invocation (v0.7.3)
+## Shell now matches GitHub Actions invocation (Unreleased)
 
 The `bash` shell now executes with `bash --noprofile --norc -e -o pipefail -c`, matching GitHub Actions behavior. The `sh` shell uses `sh -e -c`. This means:
 
@@ -134,7 +136,7 @@ If a step intentionally tolerates command failures, either:
 
 ---
 
-## EncryptedSecretStore serialization format (v0.7.3)
+## EncryptedSecretStore serialization format (Unreleased)
 
 The `EncryptedSecretStore` struct in `crates/secrets/src/storage.rs` has changed its serialization format:
 

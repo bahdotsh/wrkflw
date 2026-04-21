@@ -1,0 +1,85 @@
+name: DAG — Wide fan-out / fan-in
+
+# Realistic CI pipeline with several parallel jobs per stage. Good for
+# stress-testing the DAG tab's column layout (graph mode) and stage
+# labels (list mode). Also exercises the Workflows tab card with many
+# jobs summarised.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # Stage 0 — single root.
+  setup:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo "installing toolchain"
+
+  # Stage 1 — four parallel checks off the root.
+  lint-rust:
+    runs-on: ubuntu-latest
+    needs: [setup]
+    steps:
+      - run: cargo fmt --check
+
+  lint-yaml:
+    runs-on: ubuntu-latest
+    needs: [setup]
+    steps:
+      - run: echo "yamllint ."
+
+  audit:
+    runs-on: ubuntu-latest
+    needs: [setup]
+    steps:
+      - run: echo "cargo audit"
+
+  typecheck:
+    runs-on: ubuntu-latest
+    needs: [setup]
+    steps:
+      - run: echo "cargo check --all-targets"
+
+  # Stage 2 — tests gated by stage 1.
+  unit-tests:
+    runs-on: ubuntu-latest
+    needs: [lint-rust, typecheck]
+    steps:
+      - run: echo "cargo test --lib"
+
+  integration-tests:
+    runs-on: ubuntu-latest
+    needs: [lint-rust, typecheck]
+    steps:
+      - run: echo "cargo test --test '*'"
+
+  # Stage 3 — build once tests pass.
+  build:
+    runs-on: ubuntu-latest
+    needs: [unit-tests, integration-tests, lint-yaml, audit]
+    steps:
+      - run: cargo build --release
+
+  # Stage 4 — fan-out publish.
+  publish-crate:
+    runs-on: ubuntu-latest
+    needs: [build]
+    steps:
+      - run: echo "cargo publish --dry-run"
+
+  publish-image:
+    runs-on: ubuntu-latest
+    needs: [build]
+    steps:
+      - run: echo "docker build + push"
+
+  # Stage 5 — fan-in release.
+  release:
+    runs-on: ubuntu-latest
+    needs: [publish-crate, publish-image]
+    steps:
+      - run: echo "cutting release"

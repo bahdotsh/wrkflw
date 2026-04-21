@@ -1,0 +1,61 @@
+name: Status — mixed success / failure
+
+# Used to validate status rendering across the UI: job cards on the
+# Workflows tab, coloured nodes on the DAG tab, and the summary badge
+# on the Execution tab.
+#
+# `continue-on-error` on the flaky lane ensures downstream jobs still
+# run so the DAG shows a mix of states in one run.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "ok"
+
+  flaky:
+    runs-on: ubuntu-latest
+    needs: [setup]
+    continue-on-error: true
+    steps:
+      - name: coin flip
+        run: |
+          if [ $(( RANDOM % 2 )) -eq 0 ]; then
+            echo "heads"
+          else
+            echo "tails"
+            exit 1
+          fi
+
+  always-fails:
+    runs-on: ubuntu-latest
+    needs: [setup]
+    steps:
+      - run: |
+          echo "this job exists to produce a failure state"
+          exit 1
+
+  long-running:
+    runs-on: ubuntu-latest
+    needs: [setup]
+    steps:
+      - name: sleep 15
+        run: |
+          for i in 1 2 3 4 5; do
+            echo "tick $i"
+            sleep 3
+          done
+
+  downstream:
+    runs-on: ubuntu-latest
+    # Runs regardless of upstream outcomes so the DAG visibly shows a
+    # green node downstream of a red one.
+    needs: [flaky, always-fails, long-running]
+    if: ${{ always() }}
+    steps:
+      - run: echo "downstream observed upstream outcomes"

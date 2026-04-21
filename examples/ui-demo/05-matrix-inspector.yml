@@ -1,0 +1,61 @@
+name: Matrix — Step Inspector
+
+# Drives the Step Inspector's Matrix sub-tab. Uses include/exclude so
+# the expanded matrix is non-trivial (and so the exclude row disappears
+# from the rendered list — a good manual correctness check).
+#
+# Also has per-step env at workflow/job/step scope so the Env sub-tab
+# has three layers of inheritance to display.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+env:
+  WORKFLOW_SCOPE: "visible everywhere"
+  LOG_LEVEL: "info"
+
+jobs:
+  test:
+    name: test (${{ matrix.os }} · node ${{ matrix.node }})
+    runs-on: ${{ matrix.os }}
+    env:
+      JOB_SCOPE: "visible to all steps in this job"
+      LOG_LEVEL: "debug"  # overrides workflow-scope to test precedence
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        node: [18, 20, 22]
+        include:
+          - os: ubuntu-latest
+            node: 22
+            experimental: true
+        exclude:
+          - os: macos-latest
+            node: 18
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: show scope layering
+        env:
+          STEP_SCOPE: "visible only to this step"
+        run: |
+          echo "workflow: $WORKFLOW_SCOPE"
+          echo "job:      $JOB_SCOPE"
+          echo "step:     $STEP_SCOPE"
+          echo "log:      $LOG_LEVEL"
+
+      - name: setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: run tests
+        run: |
+          echo "os=${{ matrix.os }} node=${{ matrix.node }}"
+          if [ "${{ matrix.experimental }}" = "true" ]; then
+            echo "experimental lane — failures are non-blocking"
+          fi

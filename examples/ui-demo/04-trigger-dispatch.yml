@@ -1,0 +1,50 @@
+name: Trigger — workflow_dispatch with inputs
+
+# Primary target for the Trigger tab (screen 8). Renders with:
+#   - A branch input that defaults to the repo's default branch.
+#   - A key=value input grid seeded from the workflow's declared inputs.
+#   - A live curl preview of the POST to the GitHub dispatches endpoint.
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment"
+        required: true
+        default: "staging"
+        type: choice
+        options:
+          - staging
+          - production
+          - canary
+      version:
+        description: "Version tag to deploy (e.g. v1.4.2)"
+        required: true
+        type: string
+      dry_run:
+        description: "Skip destructive steps"
+        required: false
+        default: true
+        type: boolean
+      notes:
+        description: "Release notes (markdown, optional)"
+        required: false
+        type: string
+  push:
+    branches: [main]
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          echo "env=${{ inputs.environment }}"
+          echo "version=${{ inputs.version }}"
+          echo "dry_run=${{ inputs.dry_run }}"
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: [dispatch]
+    if: ${{ inputs.dry_run != true }}
+    steps:
+      - run: echo "deploying ${{ inputs.version }} to ${{ inputs.environment }}"

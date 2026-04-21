@@ -1,0 +1,39 @@
+name: Multi-event triggers
+
+# Exercises the trigger-matching logic the UI uses for its diff filter
+# and event badges. Pair this workflow with the `d` key on the
+# Workflows tab to toggle event-based filtering, and watch the status
+# badge flip between "matches" / "skipped".
+
+on:
+  push:
+    branches: [main, "release/*"]
+    paths:
+      - "src/**"
+      - "Cargo.toml"
+      - "!**/*.md"
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+  schedule:
+    # Every day at 03:30 UTC.
+    - cron: "30 3 * * *"
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: "Why are you running this manually?"
+        required: true
+        type: string
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: what triggered me
+        run: |
+          echo "event=${{ github.event_name }}"
+          echo "ref=${{ github.ref }}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "reason=${{ inputs.reason }}"
+          fi

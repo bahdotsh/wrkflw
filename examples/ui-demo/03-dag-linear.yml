@@ -1,0 +1,40 @@
+name: DAG — Linear chain
+
+# Five-job linear chain. Renders as five sequential columns in graph
+# mode and five single-job stages in list mode — the two views should
+# read identically on this one, which is the quickest way to spot a
+# regression in either renderer.
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  stage-a:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "a"
+
+  stage-b:
+    runs-on: ubuntu-latest
+    needs: [stage-a]
+    steps:
+      - run: echo "b"
+
+  stage-c:
+    runs-on: ubuntu-latest
+    needs: [stage-b]
+    steps:
+      - run: echo "c"
+
+  stage-d:
+    runs-on: ubuntu-latest
+    needs: [stage-c]
+    steps:
+      - run: echo "d"
+
+  stage-e:
+    runs-on: ubuntu-latest
+    needs: [stage-d]
+    steps:
+      - run: echo "e"

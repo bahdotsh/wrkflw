@@ -1,0 +1,36 @@
+name: DAG — Diamond
+
+# Classic diamond: one fan-out stage, one fan-in stage.
+# Exercises:
+#   - DAG tab graph mode: two middle-column nodes sharing a parent + child.
+#   - DAG tab list mode: three topological stages collapsed into rows.
+#   - `needs:` edge rendering in the left gutter.
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  checkout:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo "sources ready"
+
+  lint:
+    runs-on: ubuntu-latest
+    needs: [checkout]
+    steps:
+      - run: echo "linting"
+
+  test:
+    runs-on: ubuntu-latest
+    needs: [checkout]
+    steps:
+      - run: echo "running unit tests"
+
+  package:
+    runs-on: ubuntu-latest
+    needs: [lint, test]
+    steps:
+      - run: echo "packaging artifact"

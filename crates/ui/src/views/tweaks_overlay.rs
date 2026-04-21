@@ -7,14 +7,16 @@
 // omitted rather than rendered as a dead toggle — matches the rule
 // from PR #104: "A UI without backing data is worse than no UI."
 //
-// The key dispatch in `app/mod.rs` treats the overlay as fully modal:
-// while `tweaks_open` is true, every key is either consumed by one of
-// the bindings below or swallowed outright. Unmatched keys do NOT
-// fall through to the global handler.
+// The key dispatch in `app/mod.rs` treats the overlay as modal:
+// while `tweaks_open` is true, unmatched keys are swallowed instead
+// of falling through to the global handler. The one exception is `q`,
+// which always quits — swallowing quit silently is a discoverability
+// trap, and quit is universally modal-safe in this TUI.
 //
 // Controls:
 //   - `a` / `A` : cycle accent forwards (wraps)
 //   - `esc` / `,` : close
+//   - `q` : quit (same as anywhere else)
 
 use crate::app::{Accent, App};
 use crate::theme::{self, COLORS};

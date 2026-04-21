@@ -135,15 +135,12 @@ fn render_target_pane(f: &mut Frame<'_>, app: &mut App, area: Rect) {
     let wf_label = app
         .trigger_selected_workflow_name()
         .unwrap_or("<no workflow — add one>");
-    lines.push(field_row_hl(
-        "Workflow",
-        wf_label,
-        format!(
-            "{}/{}",
-            app.trigger_workflow_idx + 1,
-            app.workflows.len().max(1)
-        ),
-    ));
+    let wf_hint = format!(
+        "{}/{}",
+        app.trigger_workflow_idx + 1,
+        app.workflows.len().max(1)
+    );
+    lines.push(field_row_hl("Workflow", wf_label, &wf_hint));
     let branch_display = if app.trigger_branch.is_empty() {
         format!("(default: {})", target.default_branch)
     } else {
@@ -281,7 +278,7 @@ fn field_row<'a>(label: &'a str, value: &'a str) -> Line<'a> {
     ])
 }
 
-fn field_row_hl<'a>(label: &'a str, value: &'a str, hint: String) -> Line<'a> {
+fn field_row_hl<'a>(label: &'a str, value: &'a str, hint: &str) -> Line<'a> {
     Line::from(vec![
         Span::styled(
             format!("  {:<14}", label),

@@ -1,16 +1,16 @@
 // Secrets & runtime — screen 7 from the design.
 //
 // Honesty note: we don't have a rich secrets metadata store (last-used
-// timestamps, length, scope etc. are not persisted anywhere). What we
-// *do* have is `SecretConfig`, which is the enumerated list of
-// providers the user has configured (env / file / …). So this tab
-// renders what's real: the provider routing and the container
-// runtime, laid out in the same shape the design calls for.
+// timestamps, length, scope etc. are not persisted anywhere). We also
+// don't read the user's real secrets config file yet — the tab shows
+// `SecretConfig::default()`, i.e. the two providers that are always
+// wired (env + file). The header badge therefore says "defaults" so
+// the user isn't misled into believing a customised config has been
+// loaded.
 //
-// A future PR can flesh this out — e.g. plumb through a
-// `SecretManager::list_known_keys()` to populate the left pane — and
-// this layout will accommodate it without restructure. Until then,
-// the left pane is honest about what's configured vs aspirational.
+// A future PR can flesh this out — e.g. plumb through a real config
+// loader plus `SecretManager::list_known_keys()` for the left pane —
+// and this layout will accommodate it without restructure.
 
 use crate::app::App;
 use crate::theme::{self, BadgeKind, COLORS};
@@ -58,7 +58,12 @@ fn render_header(f: &mut Frame<'_>, area: Rect) {
         Span::styled("  ·  ", Style::default().fg(COLORS.text_muted)),
         theme::badge_outline("masking: on", BadgeKind::Success),
         Span::raw(" "),
-        theme::badge_outline("providers configured", BadgeKind::Info),
+        // "defaults" rather than "configured": the tab reads
+        // `SecretConfig::default()` unconditionally — a custom
+        // config file is not loaded yet. Labelling this "configured"
+        // would be the exact kind of quiet UI lie PR #104 set out to
+        // avoid.
+        theme::badge_outline("default providers", BadgeKind::Info),
     ];
     f.render_widget(
         Paragraph::new(Line::from(spans)).alignment(Alignment::Left),

@@ -230,11 +230,16 @@ fn run_tui_event_loop(
 
                 // When the Tweaks overlay is open it is modal: only
                 // its own shortcuts are honoured, everything else is
-                // swallowed so keys like `q`, `d`, or a tab number
-                // can't silently fire the global handler while the
-                // user is in edit-mode.
+                // swallowed so keys like `d` or a tab number can't
+                // silently fire the global handler while the user is
+                // in edit-mode. `q` is the one exception — quit is
+                // universally modal-safe in this TUI and swallowing
+                // it silently was a discoverability trap.
                 if app.tweaks_open {
                     match key.code {
+                        KeyCode::Char('q') => {
+                            break Ok(());
+                        }
                         KeyCode::Esc | KeyCode::Char(',') => {
                             app.tweaks_open = false;
                         }

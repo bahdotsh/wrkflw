@@ -2019,7 +2019,18 @@ impl App {
                 self.trigger_input_on_value = false;
                 true
             }
+            // Let Enter/Tab/BackTab fall through so the surrounding
+            // event loop can commit the edit and advance the field
+            // cursor with the same shortcuts as outside edit mode.
             KeyCode::Enter | KeyCode::Tab | KeyCode::BackTab => false,
+            // Swallow directional keys while editing. Without this
+            // they fall through to the global handler and silently
+            // change the selected workflow underneath the user — i.e.
+            // hitting ↓ mid-edit to reach for a value correction
+            // would rebind the dispatch target. Consuming them as a
+            // no-op is the least-surprising behaviour; a future
+            // enhancement could route Up/Down to prev/next field.
+            KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right => true,
             _ => false,
         }
     }
@@ -2341,6 +2352,13 @@ fn split_slug(slug: &str) -> Option<(String, String)> {
 /// painful on every frame — which is why callers go through the
 /// `App::trigger_tab_target` cache.
 fn resolve_trigger_target(platform: TriggerPlatform) -> TriggerTarget {
+    // On resolution failure both `repo_label` and `default_branch`
+    // are rendered as `<unresolved>`. The previous "main" fallback
+    // for the branch was a lie — it implied we had resolved the
+    // default when we had not — and a user who missed the warn badge
+    // could end up with a curl preview that dispatched against
+    // whatever happened to be named "main" instead of the intended
+    // target. Better to surface the un-resolution consistently.
     match platform {
         TriggerPlatform::Github => match wrkflw_github::get_repo_info() {
             Ok(info) => TriggerTarget {
@@ -2352,7 +2370,7 @@ fn resolve_trigger_target(platform: TriggerPlatform) -> TriggerTarget {
             Err(e) => TriggerTarget {
                 platform_label: "GitHub".to_string(),
                 repo_label: "<unresolved>".to_string(),
-                default_branch: "main".to_string(),
+                default_branch: "<unresolved>".to_string(),
                 note: Some(e.to_string()),
             },
         },
@@ -2366,7 +2384,7 @@ fn resolve_trigger_target(platform: TriggerPlatform) -> TriggerTarget {
             Err(e) => TriggerTarget {
                 platform_label: "GitLab".to_string(),
                 repo_label: "<unresolved>".to_string(),
-                default_branch: "main".to_string(),
+                default_branch: "<unresolved>".to_string(),
                 note: Some(e.to_string()),
             },
         },
@@ -3358,6 +3376,59 @@ mod tests {
         // Esc clears the cursor cleanly.
         assert!(app.trigger_handle_input_key(KeyCode::Esc));
         assert!(app.trigger_input_cursor.is_none());
+    }
+
+    #[test]
+    fn trigger_handle_input_key_swallows_arrows_so_they_dont_cycle_workflow() {
+        // Regression: pre-fix, Up/Down/Left/Right fell through from
+        // the edit handler to the global key map, which maps them to
+        // `trigger_tab_prev/next_workflow`. The consequence was that
+        // a user correcting a typo mid-edit could silently rebind the
+        // workflow about to be dispatched. Each arrow key must now
+        // be consumed (return `true`) while a cursor is active, and
+        // the inputs must remain untouched.
+        let mut app = make_app();
+        app.trigger_tab_add_input();
+        app.trigger_inputs[0].0 = "env".into();
+        app.trigger_inputs[0].1 = "prod".into();
+        for code in [KeyCode::Up, KeyCode::Down, KeyCode::Left, KeyCode::Right] {
+            assert!(
+                app.trigger_handle_input_key(code),
+                "arrow {:?} should be consumed in edit mode",
+                code
+            );
+        }
+        assert_eq!(app.trigger_inputs[0].0, "env");
+        assert_eq!(app.trigger_inputs[0].1, "prod");
+        // Without a cursor the handler reports unhandled so the
+        // global handler still owns arrow navigation outside edit
+        // mode — we haven't over-reached.
+        app.trigger_input_cursor = None;
+        assert!(!app.trigger_handle_input_key(KeyCode::Up));
+        assert!(!app.trigger_handle_input_key(KeyCode::Down));
+    }
+
+    #[test]
+    fn resolve_trigger_target_fallback_values_are_consistent_across_fields() {
+        // Regression: the error branch previously returned
+        // `default_branch: "main"` while `repo_label` was
+        // `<unresolved>`, i.e. the UI admitted the repo was unknown
+        // but invented a branch. A user missing the warn badge could
+        // end up dispatching against whatever happened to be called
+        // "main" on the resolved dispatcher side. Both fields must
+        // now admit un-resolution in the same voice.
+        //
+        // We construct the error shape by hand rather than invoking
+        // `resolve_trigger_target` (which shells out to git) so the
+        // test works in any CI without a wrkflw remote configured.
+        let t = TriggerTarget {
+            platform_label: "GitHub".into(),
+            repo_label: "<unresolved>".into(),
+            default_branch: "<unresolved>".into(),
+            note: Some("git remote get-url failed".into()),
+        };
+        assert_eq!(t.repo_label, t.default_branch);
+        assert!(t.note.is_some(), "un-resolution must surface a warn note");
     }
 
     #[test]

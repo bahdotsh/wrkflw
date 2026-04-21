@@ -142,11 +142,38 @@ fn render_target_pane(f: &mut Frame<'_>, app: &mut App, area: Rect) {
     );
     lines.push(field_row_hl("Workflow", wf_label, &wf_hint));
     let branch_display = if app.trigger_branch.is_empty() {
-        format!("(default: {})", target.default_branch)
+        if app.trigger_branch_focused {
+            // Focused but no characters typed yet — show an empty
+            // edit caret rather than the resolved default so the
+            // user can see they're starting fresh.
+            "_".to_string()
+        } else {
+            format!("(default: {})", target.default_branch)
+        }
     } else {
         app.trigger_branch.clone()
     };
-    lines.push(field_row("Branch / ref", &branch_display));
+    if app.trigger_branch_focused {
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("  {:<14}", "Branch / ref"),
+                Style::default().fg(COLORS.text_muted),
+            ),
+            Span::styled(
+                branch_display,
+                Style::default()
+                    .fg(COLORS.bg_dark)
+                    .bg(theme::current_accent())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "  (Enter/Esc to commit — Esc clears)",
+                Style::default().fg(COLORS.text_dim),
+            ),
+        ]));
+    } else {
+        lines.push(field_row("Branch / ref", &branch_display));
+    }
     lines.push(field_row(
         "Token",
         match app.trigger_platform {
@@ -194,15 +221,15 @@ fn render_target_pane(f: &mut Frame<'_>, app: &mut App, area: Rect) {
             let k_style = if k_focus {
                 Style::default()
                     .fg(COLORS.bg_dark)
-                    .bg(COLORS.accent)
+                    .bg(theme::current_accent())
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(COLORS.accent)
+                Style::default().fg(theme::current_accent())
             };
             let v_style = if v_focus {
                 Style::default()
                     .fg(COLORS.bg_dark)
-                    .bg(COLORS.accent)
+                    .bg(theme::current_accent())
                     .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(COLORS.text)
@@ -225,6 +252,10 @@ fn render_target_pane(f: &mut Frame<'_>, app: &mut App, area: Rect) {
         theme::key_chip("↑↓"),
         Span::raw(" "),
         Span::styled("workflow", Style::default().fg(COLORS.text_dim)),
+        Span::raw("   "),
+        theme::key_chip("b"),
+        Span::raw(" "),
+        Span::styled("edit branch", Style::default().fg(COLORS.text_dim)),
         Span::raw("   "),
         theme::key_chip("+"),
         Span::raw(" "),
@@ -255,12 +286,15 @@ fn render_preview_pane(f: &mut Frame<'_>, app: &App, area: Rect) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
+    // Each flag lives on its own line (joined in `trigger_curl_preview`
+    // with ` \\\n`). Splitting on `\n` gives us one ratatui Line per
+    // flag so a narrow pane doesn't soft-wrap mid-header.
     let lines: Vec<Line> = app
         .trigger_curl_preview()
-        .split(" \\")
+        .split('\n')
         .map(|s| {
             Line::from(Span::styled(
-                s.trim().to_string(),
+                s.to_string(),
                 Style::default().fg(COLORS.text),
             ))
         })

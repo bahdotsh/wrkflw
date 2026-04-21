@@ -164,6 +164,7 @@ fn context_hints(app: &App) -> Vec<(&'static str, &'static str)> {
         4 => vec![
             ("p", "platform"),
             ("↑↓", "workflow"),
+            ("b", "edit branch"),
             ("+", "add input"),
             ("Tab", "next field"),
             ("Enter", "dispatch"),
@@ -173,7 +174,6 @@ fn context_hints(app: &App) -> Vec<(&'static str, &'static str)> {
         // 5 — Secrets
         5 => vec![
             ("↑↓", "provider"),
-            ("m", "reveal/mask"),
             ("e", "runtime"),
             (",", "tweaks"),
             ("?", "help"),

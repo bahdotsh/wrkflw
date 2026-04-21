@@ -22,6 +22,17 @@ pub const TAB_LABELS: [&str; 7] = [
 ];
 pub const TAB_COUNT: usize = TAB_LABELS.len();
 
+// Canonical tab indices. Kept as `usize` constants rather than an enum
+// so they drop into the existing `selected_tab: usize` comparisons and
+// `switch_tab(usize)` calls without conversion.
+pub const TAB_WORKFLOWS: usize = 0;
+pub const TAB_EXECUTION: usize = 1;
+pub const TAB_DAG: usize = 2;
+pub const TAB_LOGS: usize = 3;
+pub const TAB_TRIGGER: usize = 4;
+pub const TAB_SECRETS: usize = 5;
+pub const TAB_HELP: usize = 6;
+
 pub fn render_title_bar(f: &mut Frame<'_>, app: &App, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Horizontal)

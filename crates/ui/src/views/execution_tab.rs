@@ -446,7 +446,7 @@ fn render_empty_state(f: &mut Frame<'_>, area: Rect) {
             Line::from(""),
             Line::from(vec![
                 Span::styled("Switch to ", Style::default().fg(COLORS.text_muted)),
-                Span::styled("Workflows", Style::default().fg(COLORS.accent)),
+                Span::styled("Workflows", Style::default().fg(theme::current_accent())),
                 Span::styled(" and press ", Style::default().fg(COLORS.text_muted)),
                 theme::key_chip("r"),
                 Span::styled(" to run, or ", Style::default().fg(COLORS.text_muted)),

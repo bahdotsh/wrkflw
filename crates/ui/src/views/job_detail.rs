@@ -125,7 +125,7 @@ fn render_tab_strip(f: &mut Frame<'_>, active: usize, area: Rect) {
             format!(" {} ", label),
             if is_active {
                 Style::default()
-                    .fg(COLORS.accent)
+                    .fg(theme::current_accent())
                     .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
             } else {
                 Style::default().fg(COLORS.text_dim)
@@ -380,7 +380,10 @@ fn render_matrix_pane(
             None => vec![format!("{:?}", value)],
         };
         lines.push(Line::from(vec![
-            Span::styled(format!("  {}: ", name), Style::default().fg(COLORS.accent)),
+            Span::styled(
+                format!("  {}: ", name),
+                Style::default().fg(theme::current_accent()),
+            ),
             Span::styled(values.join(", "), Style::default().fg(COLORS.text)),
         ]));
     }
@@ -448,7 +451,7 @@ fn render_matrix_pane(
                     }
                     spans.push(Span::styled(
                         format!("{}=", k),
-                        Style::default().fg(COLORS.accent),
+                        Style::default().fg(theme::current_accent()),
                     ));
                     let v = c
                         .values
@@ -502,15 +505,38 @@ fn render_matrix_pane(
 
 fn format_yaml_scalar(v: &serde_yaml::Value) -> String {
     match v {
-        serde_yaml::Value::String(s) => s.clone(),
+        serde_yaml::Value::String(s) => collapse_newlines(s),
         serde_yaml::Value::Bool(b) => b.to_string(),
         serde_yaml::Value::Number(n) => n.to_string(),
         serde_yaml::Value::Null => "~".to_string(),
-        other => serde_yaml::to_string(other)
-            .unwrap_or_default()
-            .trim()
-            .to_string(),
+        other => {
+            // Sequences and maps round-trip to multi-line YAML; each
+            // combo renders into a single ratatui Span, so embedded
+            // newlines would silently garble the layout. Collapse
+            // them into a visible ` · ` separator.
+            let raw = serde_yaml::to_string(other).unwrap_or_default();
+            collapse_newlines(raw.trim())
+        }
     }
+}
+
+/// Replace any `\n` / `\r` with a visible separator so multi-line
+/// payloads don't break single-Line rendering.
+fn collapse_newlines(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut last_was_sep = false;
+    for ch in s.chars() {
+        if ch == '\n' || ch == '\r' {
+            if !last_was_sep {
+                out.push_str(" · ");
+                last_was_sep = true;
+            }
+        } else {
+            out.push(ch);
+            last_was_sep = false;
+        }
+    }
+    out
 }
 
 /// Return a small colored glyph indicating what we know about the

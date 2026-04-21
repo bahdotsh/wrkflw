@@ -11,7 +11,9 @@ mod trigger_tab;
 mod tweaks_overlay;
 mod workflows_tab;
 
-pub use title_bar::TAB_COUNT;
+pub use title_bar::{
+    TAB_COUNT, TAB_DAG, TAB_EXECUTION, TAB_HELP, TAB_LOGS, TAB_SECRETS, TAB_TRIGGER, TAB_WORKFLOWS,
+};
 
 use crate::app::App;
 use ratatui::Frame;
@@ -71,20 +73,19 @@ pub fn render_ui(f: &mut Frame<'_>, app: &mut App) {
 
     // Render main content based on selected tab
     match app.selected_tab {
-        0 => workflows_tab::render_workflows_tab(f, app, main_chunks[1]),
-        1 => {
+        TAB_WORKFLOWS => workflows_tab::render_workflows_tab(f, app, main_chunks[1]),
+        TAB_EXECUTION => {
             if app.detailed_view {
                 job_detail::render_job_detail_view(f, app, main_chunks[1])
             } else {
                 execution_tab::render_execution_tab(f, app, main_chunks[1])
             }
         }
-        2 => dag_tab::render_dag_tab(f, app, main_chunks[1]),
-        3 => logs_tab::render_logs_tab(f, app, main_chunks[1]),
-        4 => trigger_tab::render_trigger_tab(f, app, main_chunks[1]),
-        // (note: 4 takes &mut app; see render_trigger_tab for why)
-        5 => secrets_tab::render_secrets_tab(f, app, main_chunks[1]),
-        6 => help_overlay::render_help_content(f, main_chunks[1], app.help_scroll),
+        TAB_DAG => dag_tab::render_dag_tab(f, app, main_chunks[1]),
+        TAB_LOGS => logs_tab::render_logs_tab(f, app, main_chunks[1]),
+        TAB_TRIGGER => trigger_tab::render_trigger_tab(f, app, main_chunks[1]),
+        TAB_SECRETS => secrets_tab::render_secrets_tab(f, app, main_chunks[1]),
+        TAB_HELP => help_overlay::render_help_content(f, main_chunks[1], app.help_scroll),
         _ => {}
     }
 

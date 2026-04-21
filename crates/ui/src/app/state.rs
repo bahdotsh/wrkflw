@@ -116,8 +116,15 @@ pub struct App {
     /// Cursor into `workflows` for the workflow-to-dispatch selector.
     pub trigger_workflow_idx: usize,
     /// The branch/ref input — owned by the app so typing doesn't lose
-    /// state between draws and so ESC reverts to the git-resolved default.
+    /// state between draws. Empty string means "use the resolved
+    /// default"; the curl preview and the dispatcher both honour that
+    /// fallback. Edited when `trigger_branch_focused` is set.
     pub trigger_branch: String,
+    /// True while the Branch / ref row holds the edit focus. Mutually
+    /// exclusive with `trigger_input_cursor.is_some()` — the main key
+    /// handler drives them as a single "is something being edited?"
+    /// question via [`App::trigger_editing`].
+    pub trigger_branch_focused: bool,
     /// Free-form `key=value` pairs to POST as `inputs:` (GitHub) or
     /// `variables:` (GitLab). Flat Vec rather than HashMap so the UI
     /// can show a deterministic cursor position and preserve user-typed
@@ -151,11 +158,6 @@ pub struct App {
     // ── Secrets tab ───────────────────────────────────────────────
     /// Selected row in the secrets list.
     pub secrets_list_state: ListState,
-    /// When true, the detail pane shows the value in cleartext. Toggled
-    /// with `m`. Auto-reverts when switching away from the tab so a
-    /// user leaving the terminal doesn't accidentally leave a secret
-    /// exposed (see `switch_tab`).
-    pub secrets_reveal: bool,
 
     // ── Tweaks overlay ────────────────────────────────────────────
     /// When true, the Tweaks panel overlays the current tab. Toggled
@@ -501,6 +503,7 @@ impl App {
             trigger_platform: TriggerPlatform::Github,
             trigger_workflow_idx: 0,
             trigger_branch: String::new(),
+            trigger_branch_focused: false,
             trigger_inputs: Vec::new(),
             trigger_input_cursor: None,
             trigger_input_on_value: false,
@@ -514,7 +517,6 @@ impl App {
                 s.select(Some(0));
                 s
             },
-            secrets_reveal: false,
 
             tweaks_open: false,
             tweaks_accent: Accent::default(),
@@ -1087,16 +1089,7 @@ impl App {
     }
 
     // Change the tab.
-    //
-    // Re-engages secret masking when leaving the Secrets tab so a user
-    // who hit `m` to reveal and then context-switched isn't left with a
-    // cleartext-open pane waiting for them on return. This mirrors the
-    // "reveal 5s" timer in the original design.
     pub fn switch_tab(&mut self, tab: usize) {
-        const SECRETS_TAB: usize = 5;
-        if self.selected_tab == SECRETS_TAB && tab != SECRETS_TAB {
-            self.secrets_reveal = false;
-        }
         self.selected_tab = tab;
     }
 
@@ -1659,7 +1652,7 @@ impl App {
                 self.current_execution = Some(selected_idx);
 
                 // Switch to execution tab for better user feedback
-                self.selected_tab = 1; // Switch to Execution tab manually to avoid the borrowing issue
+                self.selected_tab = crate::views::TAB_EXECUTION; // avoid the borrowing issue from calling switch_tab()
 
                 // Create a thread instead of using tokio runtime directly since send() is not async
                 std::thread::spawn(move || {
@@ -1932,48 +1925,113 @@ impl App {
         self.trigger_target_cache.as_ref().expect("just populated")
     }
 
+    /// True when any trigger-tab text field (branch or an input row)
+    /// is holding the edit cursor. The main key router consults this
+    /// to decide whether to route keystrokes into the field rather
+    /// than the global key map.
+    pub fn trigger_editing(&self) -> bool {
+        self.trigger_branch_focused || self.trigger_input_cursor.is_some()
+    }
+
     /// Append a blank `key=value` row and put the edit cursor on it.
     pub fn trigger_tab_add_input(&mut self) {
         self.trigger_inputs.push((String::new(), String::new()));
         self.trigger_input_cursor = Some(self.trigger_inputs.len() - 1);
         self.trigger_input_on_value = false;
+        self.trigger_branch_focused = false;
     }
 
+    /// Focus the Branch / ref row so the next keystrokes type into
+    /// `trigger_branch`. Clears any active input cursor — only one
+    /// field edits at a time.
+    pub fn trigger_tab_edit_branch(&mut self) {
+        self.trigger_branch_focused = true;
+        self.trigger_input_cursor = None;
+        self.trigger_input_on_value = false;
+    }
+
+    /// Field order: Branch → Input(0).key → Input(0).value →
+    /// Input(1).key → … → wrap back to Branch. Branch is always part
+    /// of the cycle so the user can reach it via Tab without needing
+    /// the `b` shortcut.
     pub fn trigger_tab_next_field(&mut self) {
-        if self.trigger_inputs.is_empty() {
+        // Not focused yet → land on Branch (start of the cycle).
+        if !self.trigger_editing() {
+            self.trigger_branch_focused = true;
             return;
         }
+        if self.trigger_branch_focused {
+            // Branch → first input key (if any); else stay on Branch.
+            if self.trigger_inputs.is_empty() {
+                return;
+            }
+            self.trigger_branch_focused = false;
+            self.trigger_input_cursor = Some(0);
+            self.trigger_input_on_value = false;
+            return;
+        }
+        // Inside the input grid.
         match self.trigger_input_cursor {
             None => {
-                self.trigger_input_cursor = Some(0);
-                self.trigger_input_on_value = false;
+                // Defensive: trigger_editing said yes but cursor is
+                // None and branch is not focused. Recover to Branch.
+                self.trigger_branch_focused = true;
             }
             Some(_) if !self.trigger_input_on_value => {
                 self.trigger_input_on_value = true;
             }
             Some(i) => {
-                self.trigger_input_cursor = Some((i + 1) % self.trigger_inputs.len());
-                self.trigger_input_on_value = false;
+                let n = self.trigger_inputs.len();
+                if i + 1 < n {
+                    self.trigger_input_cursor = Some(i + 1);
+                    self.trigger_input_on_value = false;
+                } else {
+                    // Past the last value: wrap back to Branch.
+                    self.trigger_input_cursor = None;
+                    self.trigger_input_on_value = false;
+                    self.trigger_branch_focused = true;
+                }
             }
         }
     }
 
     pub fn trigger_tab_prev_field(&mut self) {
-        if self.trigger_inputs.is_empty() {
+        // Not focused yet → wrap to the end of the cycle.
+        if !self.trigger_editing() {
+            if self.trigger_inputs.is_empty() {
+                self.trigger_branch_focused = true;
+            } else {
+                self.trigger_input_cursor = Some(self.trigger_inputs.len() - 1);
+                self.trigger_input_on_value = true;
+            }
+            return;
+        }
+        if self.trigger_branch_focused {
+            // Branch → last input value (if any); else stay on Branch.
+            if self.trigger_inputs.is_empty() {
+                return;
+            }
+            self.trigger_branch_focused = false;
+            self.trigger_input_cursor = Some(self.trigger_inputs.len() - 1);
+            self.trigger_input_on_value = true;
             return;
         }
         match self.trigger_input_cursor {
             None => {
-                self.trigger_input_cursor = Some(self.trigger_inputs.len() - 1);
-                self.trigger_input_on_value = true;
+                self.trigger_branch_focused = true;
             }
             Some(_) if self.trigger_input_on_value => {
                 self.trigger_input_on_value = false;
             }
             Some(i) => {
-                let n = self.trigger_inputs.len();
-                self.trigger_input_cursor = Some((i + n - 1) % n);
-                self.trigger_input_on_value = true;
+                if i == 0 {
+                    self.trigger_input_cursor = None;
+                    self.trigger_input_on_value = false;
+                    self.trigger_branch_focused = true;
+                } else {
+                    self.trigger_input_cursor = Some(i - 1);
+                    self.trigger_input_on_value = true;
+                }
             }
         }
     }
@@ -1984,8 +2042,9 @@ impl App {
     /// and let the user see the result in the Logs tab. Blocking the
     /// UI thread on a `reqwest` POST would freeze the animation loop.
     pub fn trigger_tab_enter(&mut self) {
-        if self.trigger_input_cursor.is_some() {
+        if self.trigger_editing() {
             // Commit edit.
+            self.trigger_branch_focused = false;
             self.trigger_input_cursor = None;
             self.trigger_input_on_value = false;
             return;
@@ -1993,10 +2052,34 @@ impl App {
         self.trigger_dispatch();
     }
 
-    /// Route a key event into the currently-edited trigger input.
-    /// Returns `true` if the key was consumed (so the caller should
-    /// skip the global key map); `false` otherwise.
+    /// Route a key event into whichever trigger-tab text field is
+    /// focused. Returns `true` if the key was consumed (so the caller
+    /// should skip the global key map); `false` otherwise.
     pub fn trigger_handle_input_key(&mut self, code: KeyCode) -> bool {
+        // Branch field: write into `self.trigger_branch`.
+        if self.trigger_branch_focused {
+            return match code {
+                KeyCode::Char(c) => {
+                    self.trigger_branch.push(c);
+                    true
+                }
+                KeyCode::Backspace => {
+                    self.trigger_branch.pop();
+                    true
+                }
+                KeyCode::Esc => {
+                    // Esc discards the branch override — back to the
+                    // git-resolved default, same as the original spec.
+                    self.trigger_branch.clear();
+                    self.trigger_branch_focused = false;
+                    true
+                }
+                KeyCode::Enter | KeyCode::Tab | KeyCode::BackTab => false,
+                KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right => true,
+                _ => false,
+            };
+        }
+
         let Some(idx) = self.trigger_input_cursor else {
             return false;
         };
@@ -2063,6 +2146,10 @@ impl App {
         } else {
             self.trigger_branch.clone()
         };
+        // Multi-line curl: each flag on its own line joined by ` \\\n`
+        // so a copy-paste into a terminal preserves the line
+        // continuations. The preview view splits on `\n` to render;
+        // the string itself is a valid shell heredoc-free one-liner.
         match self.trigger_platform {
             TriggerPlatform::Github => {
                 // The dispatcher posts to
@@ -2074,17 +2161,22 @@ impl App {
                     .and_then(|t| split_slug(&t.repo_label))
                     .unwrap_or(("<owner>".to_string(), "<repo>".to_string()));
                 let body = github_dispatches_body(&branch_raw, &self.trigger_inputs);
-                format!(
-                    "curl -X POST -H \"Authorization: Bearer $GITHUB_TOKEN\" \
-                     -H \"Accept: application/vnd.github+json\" \
-                     -H \"Content-Type: application/json\" \
-                     https://api.github.com/repos/{owner}/{repo}/actions/workflows/{wf}.yml/dispatches \
-                     -d '{body}'",
-                    owner = owner,
-                    repo = repo,
-                    wf = strip_yaml_suffix(wf),
-                    body = escape_shell_single(&body),
-                )
+                let wf_stripped = strip_yaml_suffix(wf);
+                let escaped = escape_shell_single(&body);
+                [
+                    "curl -X POST".to_string(),
+                    "  -H \"Authorization: Bearer $GITHUB_TOKEN\"".to_string(),
+                    "  -H \"Accept: application/vnd.github+json\"".to_string(),
+                    "  -H \"Content-Type: application/json\"".to_string(),
+                    format!(
+                        "  https://api.github.com/repos/{owner}/{repo}/actions/workflows/{wf}.yml/dispatches",
+                        owner = owner,
+                        repo = repo,
+                        wf = wf_stripped,
+                    ),
+                    format!("  -d '{body}'", body = escaped),
+                ]
+                .join(" \\\n")
             }
             TriggerPlatform::Gitlab => {
                 // The dispatcher posts to
@@ -2100,15 +2192,19 @@ impl App {
                 let enc_ns = urlencoding::encode(&ns);
                 let enc_proj = urlencoding::encode(&proj);
                 let body = gitlab_pipeline_body(&branch_raw, &self.trigger_inputs);
-                format!(
-                    "curl -X POST -H \"PRIVATE-TOKEN: $GITLAB_TOKEN\" \
-                     -H \"Content-Type: application/json\" \
-                     https://gitlab.com/api/v4/projects/{enc_ns}%2F{enc_proj}/pipeline \
-                     -d '{body}'",
-                    enc_ns = enc_ns,
-                    enc_proj = enc_proj,
-                    body = escape_shell_single(&body),
-                )
+                let escaped = escape_shell_single(&body);
+                [
+                    "curl -X POST".to_string(),
+                    "  -H \"PRIVATE-TOKEN: $GITLAB_TOKEN\"".to_string(),
+                    "  -H \"Content-Type: application/json\"".to_string(),
+                    format!(
+                        "  https://gitlab.com/api/v4/projects/{enc_ns}%2F{enc_proj}/pipeline",
+                        enc_ns = enc_ns,
+                        enc_proj = enc_proj,
+                    ),
+                    format!("  -d '{body}'", body = escaped),
+                ]
+                .join(" \\\n")
             }
         }
     }
@@ -2199,12 +2295,46 @@ impl App {
         });
     }
 
-    /// Drain any completed dispatch outcomes and reflect them on the
-    /// status bar. Called by the event loop once per iteration. Uses
-    /// `try_recv` so it never blocks; on disconnect the iterator
-    /// yields `Err` and we stop polling.
+    /// Drain any completed dispatch outcomes. Each outcome is pushed
+    /// to `self.logs` so nothing is lost if two arrive in one tick,
+    /// and the status bar is updated with the most recent one (an
+    /// Err takes precedence over an Ok that preceded it in the same
+    /// drain — the user wants to know about the failure). Uses
+    /// `try_recv` so the call never blocks.
     pub fn drain_trigger_outcomes(&mut self) {
+        let mut last: Option<DispatchOutcome> = None;
+        let mut drained = 0usize;
         while let Ok(outcome) = self.trigger_outcome_rx.try_recv() {
+            // Log every outcome so the Logs tab is the durable
+            // record — the status bar can only show one line.
+            let line = match &outcome.result {
+                Ok(_) => format!(
+                    "Dispatched {} on {}",
+                    outcome.workflow,
+                    outcome.platform.as_str()
+                ),
+                Err(e) => format!(
+                    "Dispatch {} on {} failed: {}",
+                    outcome.workflow,
+                    outcome.platform.as_str(),
+                    e
+                ),
+            };
+            self.logs.push(line);
+            // Prefer the most recent error over any later success,
+            // and the most recent outcome otherwise.
+            match (&last, &outcome.result) {
+                (Some(prev), Ok(_)) if prev.result.is_err() => {
+                    // Keep the prior error on screen.
+                }
+                _ => last = Some(outcome),
+            }
+            drained += 1;
+        }
+        if drained > 0 {
+            self.trim_logs_to_cap();
+        }
+        if let Some(outcome) = last {
             match outcome.result {
                 Ok(_) => self.set_info_message(format!(
                     "Dispatched {} on {}",
@@ -3291,30 +3421,48 @@ mod tests {
     }
 
     #[test]
-    fn trigger_tab_next_and_prev_field_are_no_ops_when_no_inputs() {
+    fn trigger_tab_next_field_lands_on_branch_when_no_inputs() {
         let mut app = make_app();
         assert!(app.trigger_inputs.is_empty());
+        assert!(!app.trigger_editing());
+        // With no inputs, Tab cycles through Branch only.
         app.trigger_tab_next_field();
+        assert!(app.trigger_branch_focused);
         assert!(app.trigger_input_cursor.is_none());
+        app.trigger_tab_next_field();
+        assert!(
+            app.trigger_branch_focused,
+            "stays on Branch when nothing else to cycle through"
+        );
+        // Prev from fresh state also lands on Branch when no inputs.
+        let mut app = make_app();
         app.trigger_tab_prev_field();
+        assert!(app.trigger_branch_focused);
         assert!(app.trigger_input_cursor.is_none());
     }
 
     #[test]
-    fn trigger_tab_next_field_walks_key_then_value_then_wraps() {
+    fn trigger_tab_next_field_walks_branch_then_inputs_and_wraps() {
         let mut app = make_app();
         app.trigger_inputs = vec![("a".into(), "1".into()), ("b".into(), "2".into())];
-        // From fresh state: None → row 0 key → row 0 value → row 1 key …
+        // From fresh state: None → Branch.
         app.trigger_tab_next_field();
+        assert!(app.trigger_branch_focused);
+        assert!(app.trigger_input_cursor.is_none());
+        // Branch → row 0 key.
+        app.trigger_tab_next_field();
+        assert!(!app.trigger_branch_focused);
         assert_eq!(
             (app.trigger_input_cursor, app.trigger_input_on_value),
             (Some(0), false)
         );
+        // Row 0 key → row 0 value.
         app.trigger_tab_next_field();
         assert_eq!(
             (app.trigger_input_cursor, app.trigger_input_on_value),
             (Some(0), true)
         );
+        // Row 0 value → row 1 key.
         app.trigger_tab_next_field();
         assert_eq!(
             (app.trigger_input_cursor, app.trigger_input_on_value),
@@ -3325,19 +3473,18 @@ mod tests {
             (app.trigger_input_cursor, app.trigger_input_on_value),
             (Some(1), true)
         );
-        // Wraps back to row 0 key.
+        // Past the last input value → wraps back to Branch.
         app.trigger_tab_next_field();
-        assert_eq!(
-            (app.trigger_input_cursor, app.trigger_input_on_value),
-            (Some(0), false)
-        );
+        assert!(app.trigger_branch_focused);
+        assert!(app.trigger_input_cursor.is_none());
     }
 
     #[test]
     fn trigger_tab_prev_field_reverses_direction() {
         let mut app = make_app();
         app.trigger_inputs = vec![("a".into(), "1".into()), ("b".into(), "2".into())];
-        // From fresh state: None → row 1 value (backward wrap).
+        // From fresh state: None → row 1 value (backward wrap through
+        // the input grid; Branch sits before row 0 in forward order).
         app.trigger_tab_prev_field();
         assert_eq!(
             (app.trigger_input_cursor, app.trigger_input_on_value),
@@ -3353,6 +3500,78 @@ mod tests {
             (app.trigger_input_cursor, app.trigger_input_on_value),
             (Some(0), true)
         );
+        app.trigger_tab_prev_field();
+        assert_eq!(
+            (app.trigger_input_cursor, app.trigger_input_on_value),
+            (Some(0), false)
+        );
+        // Row 0 key → Branch (backward).
+        app.trigger_tab_prev_field();
+        assert!(app.trigger_branch_focused);
+        assert!(app.trigger_input_cursor.is_none());
+        // Branch → last input value (backward wrap).
+        app.trigger_tab_prev_field();
+        assert_eq!(
+            (app.trigger_input_cursor, app.trigger_input_on_value),
+            (Some(1), true)
+        );
+    }
+
+    #[test]
+    fn trigger_tab_edit_branch_writes_into_trigger_branch() {
+        // Regression: pre-fix, the "Branch / ref" row was rendered as
+        // editable but no keystroke path ever wrote into
+        // `self.trigger_branch`. The user was stuck on the resolved
+        // default forever.
+        let mut app = make_app();
+        assert!(app.trigger_branch.is_empty());
+        app.trigger_tab_edit_branch();
+        assert!(app.trigger_editing());
+        assert!(app.trigger_branch_focused);
+        for c in "release/1.0".chars() {
+            assert!(app.trigger_handle_input_key(KeyCode::Char(c)));
+        }
+        assert_eq!(app.trigger_branch, "release/1.0");
+        assert!(app.trigger_handle_input_key(KeyCode::Backspace));
+        assert_eq!(app.trigger_branch, "release/1.");
+        // Enter falls through so the global handler can commit the
+        // edit (see `trigger_tab_enter`).
+        assert!(!app.trigger_handle_input_key(KeyCode::Enter));
+        app.trigger_tab_enter();
+        assert!(!app.trigger_branch_focused);
+        assert_eq!(app.trigger_branch, "release/1.");
+    }
+
+    #[test]
+    fn trigger_tab_edit_branch_esc_clears_override() {
+        let mut app = make_app();
+        app.trigger_tab_edit_branch();
+        for c in "junk".chars() {
+            app.trigger_handle_input_key(KeyCode::Char(c));
+        }
+        assert_eq!(app.trigger_branch, "junk");
+        assert!(app.trigger_handle_input_key(KeyCode::Esc));
+        assert!(!app.trigger_branch_focused);
+        assert_eq!(
+            app.trigger_branch, "",
+            "Esc must revert to the resolved default"
+        );
+    }
+
+    #[test]
+    fn trigger_tab_edit_branch_and_add_input_are_mutually_exclusive() {
+        let mut app = make_app();
+        app.trigger_tab_edit_branch();
+        assert!(app.trigger_branch_focused);
+        // Adding an input takes focus away from the branch row so the
+        // two invariants ("only one field edits at a time") hold.
+        app.trigger_tab_add_input();
+        assert!(!app.trigger_branch_focused);
+        assert_eq!(app.trigger_input_cursor, Some(0));
+        // Going back the other way.
+        app.trigger_tab_edit_branch();
+        assert!(app.trigger_input_cursor.is_none());
+        assert!(app.trigger_branch_focused);
     }
 
     #[test]
@@ -3557,18 +3776,5 @@ mod tests {
                 assert!(i < provider_count.max(1));
             }
         }
-    }
-
-    #[test]
-    fn switch_tab_auto_reverts_secrets_reveal_when_leaving_secrets() {
-        let mut app = make_app();
-        app.selected_tab = 5;
-        app.secrets_reveal = true;
-        app.switch_tab(0);
-        assert!(!app.secrets_reveal, "leaving Secrets must re-mask");
-        // Moving *within* Secrets does not flip reveal.
-        app.secrets_reveal = true;
-        app.switch_tab(5);
-        assert!(app.secrets_reveal);
     }
 }

@@ -8,9 +8,17 @@
 // the user isn't misled into believing a customised config has been
 // loaded.
 //
+// The design included a "reveal 5s" cleartext toggle on individual
+// secret values. We don't render that: there are no per-secret values
+// at this layer to reveal, only provider-source descriptors
+// (a filesystem path or an env-var prefix). Masking a filename is
+// theatre — it doesn't protect anything and confuses the user about
+// what "masking" means here. When `SecretManager::list_known_keys()`
+// lands the reveal toggle can come back attached to actual values.
+//
 // A future PR can flesh this out — e.g. plumb through a real config
-// loader plus `SecretManager::list_known_keys()` for the left pane —
-// and this layout will accommodate it without restructure.
+// loader plus a key-list for the left pane — and this layout will
+// accommodate it without restructure.
 
 use crate::app::App;
 use crate::theme::{self, BadgeKind, COLORS};
@@ -37,14 +45,16 @@ pub fn render_secrets_tab(f: &mut Frame<'_>, app: &mut App, area: Rect) {
         .constraints([Constraint::Percentage(55), Constraint::Min(0)])
         .split(outer[1]);
 
-    render_providers_pane(f, app, body[0]);
+    // One provider read per frame — the three panes share the same slice.
+    let rows = provider_entries();
+    render_providers_pane(f, app, &rows, body[0]);
 
     let right = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Percentage(40), Constraint::Min(0)])
         .split(body[1]);
-    render_detail_pane(f, app, right[0]);
-    render_runtime_pane(f, app, right[1]);
+    render_detail_pane(f, app, &rows, right[0]);
+    render_runtime_pane(f, app, &rows, right[1]);
 }
 
 fn render_header(f: &mut Frame<'_>, area: Rect) {
@@ -79,12 +89,15 @@ fn provider_entries() -> Vec<(String, SecretProviderConfig)> {
     rows
 }
 
-fn render_providers_pane(f: &mut Frame<'_>, app: &mut App, area: Rect) {
+fn render_providers_pane(
+    f: &mut Frame<'_>,
+    app: &mut App,
+    rows: &[(String, SecretProviderConfig)],
+    area: Rect,
+) {
     let block = theme::block_focused("Providers");
     let inner = block.inner(area);
     f.render_widget(block, area);
-
-    let rows = provider_entries();
 
     let items: Vec<ListItem> = rows
         .iter()
@@ -122,8 +135,12 @@ fn render_providers_pane(f: &mut Frame<'_>, app: &mut App, area: Rect) {
     f.render_stateful_widget(list, inner, &mut app.secrets_list_state);
 }
 
-fn render_detail_pane(f: &mut Frame<'_>, app: &App, area: Rect) {
-    let rows = provider_entries();
+fn render_detail_pane(
+    f: &mut Frame<'_>,
+    app: &App,
+    rows: &[(String, SecretProviderConfig)],
+    area: Rect,
+) {
     let sel = app.secrets_list_state.selected().unwrap_or(0);
     let (name, cfg) = match rows.get(sel) {
         Some(r) => r,
@@ -140,9 +157,10 @@ fn render_detail_pane(f: &mut Frame<'_>, app: &App, area: Rect) {
     f.render_widget(block, area);
 
     let mut lines: Vec<Line> = Vec::new();
-    // Value box — we don't have per-secret values at this level, so
-    // the "value" is the provider's source descriptor, optionally
-    // masked (matches the design's cleartext↔mask toggle).
+    // Source descriptor (file path or env-var prefix) — shown plainly.
+    // These aren't secret values, so bullet-masking them would be
+    // theatre (see module header). Real per-secret values will come
+    // later and land in a dedicated row with an actual reveal toggle.
     let (source_label, source_value) = match cfg {
         SecretProviderConfig::Environment { prefix } => (
             "Source".to_string(),
@@ -153,25 +171,12 @@ fn render_detail_pane(f: &mut Frame<'_>, app: &App, area: Rect) {
         ),
         SecretProviderConfig::File { path } => ("Path".to_string(), path.clone()),
     };
-
-    let value_render = if app.secrets_reveal {
-        source_value.clone()
-    } else {
-        "•".repeat(source_value.chars().count().min(32))
-    };
     lines.push(Line::from(vec![
         Span::styled(
             format!("{}: ", source_label),
             Style::default().fg(COLORS.text_muted),
         ),
-        Span::styled(
-            value_render,
-            Style::default().fg(if app.secrets_reveal {
-                COLORS.error
-            } else {
-                COLORS.warning
-            }),
-        ),
+        Span::styled(source_value, Style::default().fg(COLORS.text)),
     ]));
     lines.push(Line::from(""));
 
@@ -180,20 +185,17 @@ fn render_detail_pane(f: &mut Frame<'_>, app: &App, area: Rect) {
         SecretProviderConfig::File { .. } => "file",
     };
     lines.push(kv("Kind", kind_label));
-    lines.push(kv("Masking", "enabled"));
-    lines.push(kv(
-        "Reveal",
-        if app.secrets_reveal {
-            "on (press m to hide)"
-        } else {
-            "off (press m to reveal)"
-        },
-    ));
+    lines.push(kv("Masking", "applies to resolved values (not shown here)"));
 
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
-fn render_runtime_pane(f: &mut Frame<'_>, app: &App, area: Rect) {
+fn render_runtime_pane(
+    f: &mut Frame<'_>,
+    app: &App,
+    rows: &[(String, SecretProviderConfig)],
+    area: Rect,
+) {
     let block = theme::block("Runtime");
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -256,25 +258,22 @@ fn render_runtime_pane(f: &mut Frame<'_>, app: &App, area: Rect) {
             .fg(COLORS.highlight)
             .add_modifier(Modifier::BOLD),
     )]));
-    for (name, cfg) in provider_entries() {
+    for (name, cfg) in rows {
         let right = match cfg {
             SecretProviderConfig::Environment { prefix } => prefix
+                .clone()
                 .map(|p| format!("{}*", p))
                 .unwrap_or_else(|| "$*".to_string()),
-            SecretProviderConfig::File { path } => path,
+            SecretProviderConfig::File { path } => path.clone(),
         };
         lines.push(Line::from(vec![
-            Span::styled(name, Style::default().fg(COLORS.accent)),
+            Span::styled(name.clone(), Style::default().fg(theme::current_accent())),
             Span::raw(" → "),
             Span::styled(right, Style::default().fg(COLORS.text)),
         ]));
     }
     lines.push(Line::from(""));
     lines.push(Line::from(vec![
-        theme::key_chip("m"),
-        Span::raw(" "),
-        Span::styled("toggle mask", Style::default().fg(COLORS.text_dim)),
-        Span::raw("   "),
         theme::key_chip("e"),
         Span::raw(" "),
         Span::styled("cycle runtime", Style::default().fg(COLORS.text_dim)),

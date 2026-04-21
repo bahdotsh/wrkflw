@@ -63,9 +63,9 @@ pub fn render_dag_tab(f: &mut Frame<'_>, app: &App, area: Rect) {
         .split(outer[1]);
 
     if app.dag_list_view {
-        render_topo_list(f, app, def, workflow, body[0]);
+        render_topo_list(f, app, def, workflow, idx, body[0]);
     } else {
-        render_graph(f, app, def, workflow, body[0]);
+        render_graph(f, app, def, workflow, idx, body[0]);
     }
     render_legend(f, app, body[1]);
 }
@@ -108,8 +108,15 @@ fn render_header(f: &mut Frame<'_>, app: &App, workflow: &crate::models::Workflo
 
 /// State lookup for every named job — consults the current
 /// `WorkflowExecution` so a running nightly shows `build` as
-/// `Running`, mirroring the design's live DAG.
-fn state_for_job(app: &App, workflow: &crate::models::Workflow, name: &str) -> NodeState {
+/// `Running`, mirroring the design's live DAG. `workflow_idx` is the
+/// position of this workflow in `app.workflows`; it's threaded from
+/// the caller so we don't have to reach for pointer identity here.
+fn state_for_job(
+    app: &App,
+    workflow: &crate::models::Workflow,
+    workflow_idx: usize,
+    name: &str,
+) -> NodeState {
     if !matches!(
         workflow.status,
         WorkflowStatus::Running | WorkflowStatus::Success | WorkflowStatus::Failed
@@ -126,14 +133,7 @@ fn state_for_job(app: &App, workflow: &crate::models::Workflow, name: &str) -> N
             JobStatus::Skipped => NodeState::Skipped,
         },
         None => {
-            if app.current_execution
-                == Some(
-                    app.workflows
-                        .iter()
-                        .position(|w| std::ptr::eq(w, workflow))
-                        .unwrap_or(usize::MAX),
-                )
-            {
+            if app.current_execution == Some(workflow_idx) {
                 NodeState::Running
             } else {
                 NodeState::Pending
@@ -147,6 +147,7 @@ fn render_graph(
     app: &App,
     def: &WorkflowDefinition,
     workflow: &crate::models::Workflow,
+    workflow_idx: usize,
     area: Rect,
 ) {
     let block = theme::block_focused("DAG · topological columns");
@@ -209,7 +210,7 @@ fn render_graph(
         )]));
         lines.push(Line::from(""));
         for name in layer {
-            let st = state_for_job(app, workflow, name);
+            let st = state_for_job(app, workflow, workflow_idx, name);
             let color = match st {
                 NodeState::Success => COLORS.success,
                 NodeState::Failure => COLORS.error,
@@ -229,12 +230,14 @@ fn render_graph(
                 "╭────────────────╮",
                 Style::default().fg(color),
             )]));
+            let truncated = truncate(name, 12);
+            let padding = 12usize.saturating_sub(truncated.chars().count());
             lines.push(Line::from(vec![
                 Span::styled("│ ", Style::default().fg(color)),
                 Span::styled(glyph.to_string(), Style::default().fg(color)),
                 Span::raw(" "),
                 Span::styled(
-                    truncate(name, 12),
+                    truncated,
                     Style::default()
                         .fg(if matches!(st, NodeState::Running) {
                             COLORS.text
@@ -247,10 +250,7 @@ fn render_graph(
                             Modifier::empty()
                         }),
                 ),
-                Span::styled(
-                    " ".repeat(12usize.saturating_sub(truncate(name, 12).chars().count())),
-                    Style::default().fg(color),
-                ),
+                Span::styled(" ".repeat(padding), Style::default().fg(color)),
                 Span::styled(" │", Style::default().fg(color)),
             ]));
             // Matrix badge for nodes that carry a strategy.matrix.
@@ -309,6 +309,7 @@ fn render_topo_list(
     app: &App,
     def: &WorkflowDefinition,
     workflow: &crate::models::Workflow,
+    workflow_idx: usize,
     area: Rect,
 ) {
     let block = theme::block_focused("Jobs · topological order");
@@ -326,7 +327,7 @@ fn render_topo_list(
                 .add_modifier(Modifier::BOLD),
         )]));
         for name in layer {
-            let st = state_for_job(app, workflow, name);
+            let st = state_for_job(app, workflow, workflow_idx, name);
             let (glyph, style) = match st {
                 NodeState::Success => {
                     (theme::symbols::SUCCESS, Style::default().fg(COLORS.success))

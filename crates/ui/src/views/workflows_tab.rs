@@ -156,7 +156,7 @@ fn render_preview(f: &mut Frame<'_>, app: &App, area: Rect) {
 
     if let Some(def) = wf.definition.as_ref() {
         lines.push(Line::from(vec![
-            Span::styled("name: ", Style::default().fg(COLORS.accent)),
+            Span::styled("name: ", Style::default().fg(theme::current_accent())),
             Span::styled(
                 def.name.clone(),
                 Style::default()
@@ -170,11 +170,11 @@ fn render_preview(f: &mut Frame<'_>, app: &App, area: Rect) {
             def.on.join(", ")
         };
         lines.push(Line::from(vec![
-            Span::styled("on:   ", Style::default().fg(COLORS.accent)),
+            Span::styled("on:   ", Style::default().fg(theme::current_accent())),
             Span::styled(triggers, Style::default().fg(COLORS.text_dim)),
         ]));
         lines.push(Line::from(vec![
-            Span::styled("jobs: ", Style::default().fg(COLORS.accent)),
+            Span::styled("jobs: ", Style::default().fg(theme::current_accent())),
             Span::styled(
                 format!("{}", def.jobs.len()),
                 Style::default().fg(COLORS.text_dim),
@@ -234,7 +234,7 @@ fn render_preview(f: &mut Frame<'_>, app: &App, area: Rect) {
             Style::default().fg(COLORS.text_muted),
         )));
         lines.push(Line::from(vec![
-            Span::styled("jobs: ", Style::default().fg(COLORS.accent)),
+            Span::styled("jobs: ", Style::default().fg(theme::current_accent())),
             Span::styled(
                 format!("{}", wf.job_names.len()),
                 Style::default().fg(COLORS.text_dim),

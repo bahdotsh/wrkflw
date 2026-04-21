@@ -4,7 +4,10 @@ mod state;
 use crate::handlers::workflow::start_next_workflow_execution;
 use crate::models::{ExecutionResultMsg, QueuedExecution, Workflow, WorkflowStatus};
 use crate::utils::load_workflows;
-use crate::views::{render_ui, TAB_COUNT};
+use crate::views::{
+    render_ui, TAB_COUNT, TAB_DAG, TAB_EXECUTION, TAB_HELP, TAB_LOGS, TAB_SECRETS, TAB_TRIGGER,
+    TAB_WORKFLOWS,
+};
 use chrono::Local;
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers},
@@ -223,7 +226,7 @@ fn run_tui_event_loop(
         if event::poll(event_poll_timeout)? {
             if let Event::Key(key) = event::read()? {
                 // Handle search input first if we're in search mode and logs tab
-                if app.selected_tab == 3 && app.log_search_active {
+                if app.selected_tab == TAB_LOGS && app.log_search_active {
                     app.handle_log_search_input(key.code);
                     continue;
                 }
@@ -251,13 +254,14 @@ fn run_tui_event_loop(
                     continue;
                 }
 
-                // Trigger tab: if a text input row is focused, route
-                // printable characters and edit keys straight to that
-                // input before the global key-map fires. Otherwise
-                // editing a value like "notify=slack" would trip the
-                // `s` logs shortcut below and jump tabs.
-                if app.selected_tab == 4
-                    && app.trigger_input_cursor.is_some()
+                // Trigger tab: if a text field (branch or an input
+                // row) is focused, route printable characters and
+                // edit keys straight to that field before the global
+                // key-map fires. Otherwise editing a value like
+                // "notify=slack" would trip the `s` logs shortcut
+                // below and jump tabs.
+                if app.selected_tab == TAB_TRIGGER
+                    && app.trigger_editing()
                     && app.trigger_handle_input_key(key.code)
                 {
                     continue;
@@ -303,9 +307,9 @@ fn run_tui_event_loop(
                         // Inside the Step Inspector, Tab cycles inspector
                         // sub-tabs (Output / Env / Files / Matrix / Timeline);
                         // elsewhere it cycles top-level tabs.
-                        if app.selected_tab == 1 && app.detailed_view {
+                        if app.selected_tab == TAB_EXECUTION && app.detailed_view {
                             app.step_inspector_tab = (app.step_inspector_tab + 1) % 5;
-                        } else if app.selected_tab == 4 {
+                        } else if app.selected_tab == TAB_TRIGGER {
                             // In the Trigger tab Tab cycles inputs/fields.
                             app.trigger_tab_next_field();
                         } else {
@@ -313,21 +317,21 @@ fn run_tui_event_loop(
                         }
                     }
                     KeyCode::BackTab => {
-                        if app.selected_tab == 1 && app.detailed_view {
+                        if app.selected_tab == TAB_EXECUTION && app.detailed_view {
                             app.step_inspector_tab = (app.step_inspector_tab + 4) % 5;
-                        } else if app.selected_tab == 4 {
+                        } else if app.selected_tab == TAB_TRIGGER {
                             app.trigger_tab_prev_field();
                         } else {
                             app.switch_tab((app.selected_tab + TAB_COUNT - 1) % TAB_COUNT);
                         }
                     }
-                    KeyCode::Char('1') | KeyCode::Char('w') => app.switch_tab(0),
-                    KeyCode::Char('2') | KeyCode::Char('x') => app.switch_tab(1),
-                    KeyCode::Char('3') => app.switch_tab(2),
-                    KeyCode::Char('4') | KeyCode::Char('l') => app.switch_tab(3),
-                    KeyCode::Char('5') => app.switch_tab(4),
-                    KeyCode::Char('6') => app.switch_tab(5),
-                    KeyCode::Char('7') | KeyCode::Char('h') => app.switch_tab(6),
+                    KeyCode::Char('1') | KeyCode::Char('w') => app.switch_tab(TAB_WORKFLOWS),
+                    KeyCode::Char('2') | KeyCode::Char('x') => app.switch_tab(TAB_EXECUTION),
+                    KeyCode::Char('3') => app.switch_tab(TAB_DAG),
+                    KeyCode::Char('4') | KeyCode::Char('l') => app.switch_tab(TAB_LOGS),
+                    KeyCode::Char('5') => app.switch_tab(TAB_TRIGGER),
+                    KeyCode::Char('6') => app.switch_tab(TAB_SECRETS),
+                    KeyCode::Char('7') | KeyCode::Char('h') => app.switch_tab(TAB_HELP),
                     KeyCode::Char(',') => {
                         // `,` toggles the Tweaks overlay anywhere (global).
                         // Chosen because it never conflicts with our single-
@@ -338,67 +342,70 @@ fn run_tui_event_loop(
                         app.tweaks_open = !app.tweaks_open;
                     }
                     KeyCode::Up | KeyCode::Char('k') => match app.selected_tab {
-                        0 => {
+                        TAB_WORKFLOWS => {
                             if app.job_selection_mode {
                                 app.previous_available_job();
                             } else {
                                 app.previous_workflow();
                             }
                         }
-                        1 => {
+                        TAB_EXECUTION => {
                             if app.detailed_view {
                                 app.previous_step();
                             } else {
                                 app.previous_job();
                             }
                         }
-                        3 => {
+                        TAB_LOGS => {
                             if !app.log_search_matches.is_empty() {
                                 app.previous_search_match();
                             } else {
                                 app.scroll_logs_up();
                             }
                         }
-                        4 => app.trigger_tab_prev_workflow(),
-                        5 => app.secrets_tab_prev(),
-                        6 => app.scroll_help_up(),
+                        TAB_TRIGGER => app.trigger_tab_prev_workflow(),
+                        TAB_SECRETS => app.secrets_tab_prev(),
+                        TAB_HELP => app.scroll_help_up(),
                         _ => {}
                     },
                     KeyCode::Down | KeyCode::Char('j') => match app.selected_tab {
-                        0 => {
+                        TAB_WORKFLOWS => {
                             if app.job_selection_mode {
                                 app.next_available_job();
                             } else {
                                 app.next_workflow();
                             }
                         }
-                        1 => {
+                        TAB_EXECUTION => {
                             if app.detailed_view {
                                 app.next_step();
                             } else {
                                 app.next_job();
                             }
                         }
-                        3 => {
+                        TAB_LOGS => {
                             if !app.log_search_matches.is_empty() {
                                 app.next_search_match();
                             } else {
                                 app.scroll_logs_down();
                             }
                         }
-                        4 => app.trigger_tab_next_workflow(),
-                        5 => app.secrets_tab_next(),
-                        6 => app.scroll_help_down(),
+                        TAB_TRIGGER => app.trigger_tab_next_workflow(),
+                        TAB_SECRETS => app.secrets_tab_next(),
+                        TAB_HELP => app.scroll_help_down(),
                         _ => {}
                     },
                     KeyCode::Char(' ') => {
-                        if app.selected_tab == 0 && !app.running && !app.job_selection_mode {
+                        if app.selected_tab == TAB_WORKFLOWS
+                            && !app.running
+                            && !app.job_selection_mode
+                        {
                             app.toggle_selected();
                         }
                     }
                     KeyCode::Enter => {
                         match app.selected_tab {
-                            0 => {
+                            TAB_WORKFLOWS => {
                                 if !app.running {
                                     if app.job_selection_mode {
                                         // In job selection mode, run the selected job
@@ -419,11 +426,11 @@ fn run_tui_event_loop(
                                     }
                                 }
                             }
-                            1 => {
+                            TAB_EXECUTION => {
                                 // In execution tab, Enter shows job details
                                 app.toggle_detailed_view();
                             }
-                            4 => {
+                            TAB_TRIGGER => {
                                 // Trigger tab: Enter on a non-editing row
                                 // begins editing it (value first, then Tab
                                 // to swap); when already editing, Enter
@@ -478,7 +485,10 @@ fn run_tui_event_loop(
                     }
                     KeyCode::Char('J') => {
                         // Enter job selection mode for selected workflow
-                        if !app.running && app.selected_tab == 0 && !app.job_selection_mode {
+                        if !app.running
+                            && app.selected_tab == TAB_WORKFLOWS
+                            && !app.job_selection_mode
+                        {
                             app.enter_job_selection_mode();
                         }
                     }
@@ -493,7 +503,7 @@ fn run_tui_event_loop(
                         }
                     }
                     KeyCode::Char('d') => {
-                        if !app.running && app.selected_tab == 0 {
+                        if !app.running && app.selected_tab == TAB_WORKFLOWS {
                             app.toggle_diff_filter();
                         }
                     }
@@ -506,14 +516,14 @@ fn run_tui_event_loop(
                         // workflow gated on a non-push event — exactly
                         // the "stop lying about which workflows would
                         // run" failure mode the commit history fought.
-                        if !app.running && app.selected_tab == 0 {
+                        if !app.running && app.selected_tab == TAB_WORKFLOWS {
                             app.cycle_diff_filter_event();
                         }
                     }
                     KeyCode::Char('n') => {
-                        if app.selected_tab == 3 && !app.log_search_query.is_empty() {
+                        if app.selected_tab == TAB_LOGS && !app.log_search_query.is_empty() {
                             app.next_search_match();
-                        } else if app.selected_tab == 0 && !app.running {
+                        } else if app.selected_tab == TAB_WORKFLOWS && !app.running {
                             // Deselect all workflows
                             for workflow in &mut app.workflows {
                                 workflow.selected = false;
@@ -553,7 +563,7 @@ fn run_tui_event_loop(
                     }
                     KeyCode::Char('t') => {
                         // Only trigger workflow if not already running and we're in the workflows tab
-                        if !app.running && app.selected_tab == 0 {
+                        if !app.running && app.selected_tab == TAB_WORKFLOWS {
                             if let Some(selected_idx) = app.workflow_list_state.selected() {
                                 if selected_idx < app.workflows.len() {
                                     let workflow = &app.workflows[selected_idx];
@@ -623,30 +633,30 @@ fn run_tui_event_loop(
                             wrkflw_logging::warning(
                                 "Cannot trigger workflow while another operation is in progress",
                             );
-                        } else if app.selected_tab != 0 {
+                        } else if app.selected_tab != TAB_WORKFLOWS {
                             app.logs
                                 .push("Switch to Workflows tab to trigger a workflow".to_string());
                             wrkflw_logging::warning(
                                 "Switch to Workflows tab to trigger a workflow",
                             );
                             // For better UX, we could also automatically switch to the Workflows tab here
-                            app.switch_tab(0);
+                            app.switch_tab(TAB_WORKFLOWS);
                         }
                     }
                     KeyCode::Char('s') => {
-                        if app.selected_tab == 3 {
+                        if app.selected_tab == TAB_LOGS {
                             app.toggle_log_search();
                         }
                     }
                     KeyCode::Char('f') => {
-                        if app.selected_tab == 3 {
+                        if app.selected_tab == TAB_LOGS {
                             app.toggle_log_filter();
                         }
                     }
                     KeyCode::Char('c') => {
-                        if app.selected_tab == 3 {
+                        if app.selected_tab == TAB_LOGS {
                             app.clear_log_search_and_filter();
-                        } else if app.selected_tab == 4 {
+                        } else if app.selected_tab == TAB_TRIGGER {
                             // Trigger tab: copy curl preview into the
                             // status bar so the user can scrape it from
                             // their scrollback without shelling out of
@@ -657,24 +667,15 @@ fn run_tui_event_loop(
                         }
                     }
                     KeyCode::Char('g') => {
-                        if app.selected_tab == 2 {
+                        if app.selected_tab == TAB_DAG {
                             // Toggle DAG tab between graph and list view —
                             // matches the design's `g` shortcut on
                             // screen 4.
                             app.dag_list_view = !app.dag_list_view;
                         }
                     }
-                    KeyCode::Char('m') => {
-                        if app.selected_tab == 5 {
-                            // Secrets tab: toggle the 5-second value
-                            // reveal. (The design's "reveal 5s" button
-                            // is a soft timer; here we leave it to the
-                            // user to hit `m` again.)
-                            app.secrets_reveal = !app.secrets_reveal;
-                        }
-                    }
                     KeyCode::Char('p') => {
-                        if app.selected_tab == 4 {
+                        if app.selected_tab == TAB_TRIGGER {
                             // Trigger tab: flip github ↔ gitlab. Also
                             // rebinds the branch default because each
                             // platform has its own `get_repo_info`.
@@ -682,12 +683,22 @@ fn run_tui_event_loop(
                         }
                     }
                     KeyCode::Char('+') | KeyCode::Char('=') => {
-                        if app.selected_tab == 4 {
+                        if app.selected_tab == TAB_TRIGGER {
                             app.trigger_tab_add_input();
                         }
                     }
+                    KeyCode::Char('b') => {
+                        // Trigger tab: focus the Branch / ref row so
+                        // the user can type a non-default branch. The
+                        // previous revision rendered the field as
+                        // editable but provided no keystroke that
+                        // reached it.
+                        if app.selected_tab == TAB_TRIGGER {
+                            app.trigger_tab_edit_branch();
+                        }
+                    }
                     KeyCode::Char(c) => {
-                        if app.selected_tab == 3 && app.log_search_active {
+                        if app.selected_tab == TAB_LOGS && app.log_search_active {
                             app.handle_log_search_input(KeyCode::Char(c));
                         }
                     }

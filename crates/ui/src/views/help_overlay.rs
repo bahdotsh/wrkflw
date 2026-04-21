@@ -13,7 +13,7 @@ fn section_header<'a>(title: &'a str) -> Vec<Line<'a>> {
         Line::from(Span::styled(
             title,
             Style::default()
-                .fg(COLORS.accent)
+                .fg(theme::current_accent())
                 .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
         )),
         Line::from(Span::styled(
@@ -130,11 +130,11 @@ pub fn render_help_content(f: &mut Frame<'_>, area: Rect, scroll_offset: usize) 
     right_lines.push(Line::from(""));
     right_lines.push(key_line("g", "DAG: toggle graph ↔ list"));
     right_lines.push(key_line("p", "Trigger: flip platform github ↔ gitlab"));
+    right_lines.push(key_line("b", "Trigger: edit branch / ref"));
     right_lines.push(key_line("+", "Trigger: add a key=value input"));
     right_lines.push(key_line("Tab", "Trigger: next field (in edit mode)"));
     right_lines.push(key_line("Enter", "Trigger: dispatch (or commit edit)"));
     right_lines.push(key_line("c", "Trigger: copy curl preview to logs"));
-    right_lines.push(key_line("m", "Secrets: reveal / mask value"));
     right_lines.push(Line::from(""));
 
     right_lines.extend(section_header("TAB OVERVIEW"));
@@ -143,7 +143,7 @@ pub fn render_help_content(f: &mut Frame<'_>, area: Rect, scroll_offset: usize) 
         (
             1u32,
             "Workflows",
-            COLORS.accent,
+            theme::current_accent(),
             "Browse & select workflows",
         ),
         (2, "Execution", COLORS.success, "Monitor job progress"),

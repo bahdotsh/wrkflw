@@ -1,9 +1,9 @@
-// Status bar rendering
+// Status bar — left-aligned key chips, right-aligned runtime + meta.
 use crate::app::App;
 use crate::models::StatusSeverity;
-use crate::theme::{self, COLORS};
+use crate::theme::{self, BadgeKind, COLORS};
 use ratatui::{
-    layout::{Alignment, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
     widgets::Paragraph,
@@ -11,9 +11,7 @@ use ratatui::{
 };
 use wrkflw_executor::RuntimeType;
 
-// Render the status bar
 pub fn render_status_bar(f: &mut Frame<'_>, app: &App, area: Rect) {
-    // If we have a status message, show it as a toast
     if let Some(message) = &app.status_message {
         let bg = match app.status_message_severity {
             StatusSeverity::Success => COLORS.success,
@@ -21,144 +19,137 @@ pub fn render_status_bar(f: &mut Frame<'_>, app: &App, area: Rect) {
             StatusSeverity::Warning => COLORS.warning,
             StatusSeverity::Error => COLORS.error,
         };
-
-        let status_message = Paragraph::new(Line::from(vec![Span::styled(
+        let toast = Paragraph::new(Line::from(vec![Span::styled(
             format!(" {} ", message),
             Style::default()
                 .bg(bg)
-                .fg(COLORS.text)
+                .fg(COLORS.bg_dark)
                 .add_modifier(Modifier::BOLD),
         )]))
-        .alignment(Alignment::Center);
-
-        f.render_widget(status_message, area);
+        .alignment(Alignment::Center)
+        .style(Style::default().bg(COLORS.bg_bar));
+        f.render_widget(toast, area);
         return;
     }
 
-    // Normal status bar
-    let mut status_items = vec![];
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(0), Constraint::Length(48)])
+        .split(area);
 
-    // Runtime mode badge
-    status_items.push(theme::badge(
-        app.runtime_type_name(),
-        match app.runtime_type {
-            RuntimeType::Docker => COLORS.runtime_docker,
-            RuntimeType::Podman => COLORS.runtime_podman,
-            RuntimeType::SecureEmulation => COLORS.runtime_secure,
-            RuntimeType::Emulation => COLORS.runtime_emulation,
-        },
-        COLORS.text,
-    ));
-
-    // Container runtime status (uses cached availability from App state)
-    match app.runtime_type {
-        RuntimeType::Docker => {
-            status_items.push(Span::raw(" "));
-            status_items.push(theme::badge(
-                if app.runtime_available {
-                    "Docker: Connected"
-                } else {
-                    "Docker: Unavailable"
-                },
-                if app.runtime_available {
-                    COLORS.success
-                } else {
-                    COLORS.error
-                },
-                COLORS.text,
-            ));
+    // Left: key chips
+    let mut left: Vec<Span> = Vec::new();
+    for (i, (key, desc)) in context_hints(app).into_iter().enumerate() {
+        if i > 0 {
+            left.push(Span::raw("  "));
         }
-        RuntimeType::Podman => {
-            status_items.push(Span::raw(" "));
-            status_items.push(theme::badge(
-                if app.runtime_available {
-                    "Podman: Connected"
-                } else {
-                    "Podman: Unavailable"
-                },
-                if app.runtime_available {
-                    COLORS.success
-                } else {
-                    COLORS.error
-                },
-                COLORS.text,
-            ));
-        }
-        RuntimeType::SecureEmulation => {
-            status_items.push(Span::raw(" "));
-            status_items.push(Span::styled(
-                format!(" {}SECURE ", theme::symbols::LOCK),
-                Style::default().bg(COLORS.runtime_secure).fg(COLORS.text),
-            ));
-        }
-        RuntimeType::Emulation => {}
+        left.push(theme::key_chip(key));
+        left.push(Span::styled(format!(" {}", desc), theme::hint_style()));
     }
+    let left_p = Paragraph::new(Line::from(left))
+        .style(Style::default().bg(COLORS.bg_bar))
+        .alignment(Alignment::Left);
+    f.render_widget(left_p, chunks[0]);
 
-    // Validation/execution mode badge
-    status_items.push(Span::raw(" "));
+    // Right: validation chip + runtime badge
+    let mut right: Vec<Span> = Vec::new();
+
     if app.validation_mode {
-        status_items.push(theme::badge(
-            "Validation",
-            COLORS.warning,
-            ratatui::style::Color::Black,
-        ));
+        right.push(theme::badge_outline("validation", BadgeKind::Warning));
     } else {
-        status_items.push(theme::badge(
-            "Execution",
-            COLORS.success,
-            ratatui::style::Color::Black,
-        ));
+        right.push(theme::badge_outline("execution", BadgeKind::Success));
     }
-
-    // Separator
-    status_items.push(Span::styled(
-        format!(" {} ", theme::symbols::SEPARATOR),
+    right.push(Span::raw(" "));
+    let runtime_badge_kind = match app.runtime_type {
+        RuntimeType::Docker => BadgeKind::Docker,
+        RuntimeType::Podman => BadgeKind::Podman,
+        RuntimeType::SecureEmulation => BadgeKind::Secure,
+        RuntimeType::Emulation => BadgeKind::Emulation,
+    };
+    right.push(theme::badge_solid(
+        app.runtime_type_name(),
+        runtime_badge_kind,
+    ));
+    right.push(Span::raw(" "));
+    let avail_color = if app.runtime_available {
+        COLORS.success
+    } else {
+        COLORS.text_muted
+    };
+    right.push(Span::styled(
+        if app.runtime_available { "●" } else { "○" }.to_string(),
+        Style::default().fg(avail_color),
+    ));
+    right.push(Span::raw(" "));
+    right.push(Span::styled(
+        format!("{} workflows", app.workflows.len()),
         Style::default().fg(COLORS.text_muted),
     ));
 
-    // Context-specific help
-    let help_text = build_context_help(app);
-    status_items.push(Span::styled(help_text, theme::hint_style()));
-
-    let status_bar = Paragraph::new(Line::from(status_items))
+    let right_p = Paragraph::new(Line::from(right))
         .style(Style::default().bg(COLORS.bg_bar))
-        .alignment(Alignment::Left);
-
-    f.render_widget(status_bar, area);
+        .alignment(Alignment::Right);
+    f.render_widget(right_p, chunks[1]);
 }
 
-fn build_context_help(app: &App) -> String {
+fn context_hints(app: &App) -> Vec<(&'static str, &'static str)> {
     match app.selected_tab {
         0 => {
             if app.job_selection_mode {
-                "Enter run \u{2502} a all \u{2502} Esc back".to_string()
+                vec![
+                    ("Enter", "run"),
+                    ("a", "all"),
+                    ("Esc", "back"),
+                    ("?", "help"),
+                ]
             } else if app.diff_filter_active {
-                "Space toggle \u{2502} Enter run \u{2502} r queue \u{2502} t trig \u{2502} d diff:ON \u{2502} ? help \u{2502} q quit".to_string()
+                vec![
+                    ("↑↓", "navigate"),
+                    ("Space", "select"),
+                    ("Enter", "run"),
+                    ("r", "queue"),
+                    ("t", "trigger"),
+                    ("d", "diff:ON"),
+                    ("?", "help"),
+                ]
             } else {
-                "Space toggle \u{2502} Enter run \u{2502} r queue \u{2502} t trig \u{2502} d diff \u{2502} ? help \u{2502} q quit".to_string()
+                vec![
+                    ("↑↓", "navigate"),
+                    ("Space", "select"),
+                    ("Enter", "run"),
+                    ("r", "queue"),
+                    ("t", "trigger"),
+                    ("d", "diff"),
+                    ("?", "help"),
+                ]
             }
         }
         1 => {
             if app.detailed_view {
-                "Esc back \u{2502} \u{2191}\u{2193} steps \u{2502} ? help \u{2502} q quit"
-                    .to_string()
+                vec![
+                    ("Tab", "switch pane"),
+                    ("↑↓", "steps"),
+                    ("Esc", "back"),
+                    ("?", "help"),
+                ]
             } else {
-                "Enter details \u{2502} \u{2191}\u{2193} jobs \u{2502} ? help \u{2502} q quit"
-                    .to_string()
+                vec![
+                    ("j/k", "move"),
+                    ("Enter", "inspect"),
+                    ("/", "search"),
+                    ("p", "pause"),
+                    ("?", "help"),
+                ]
             }
         }
-        2 => {
-            let log_count = app.logs.len() + wrkflw_logging::get_logs().len();
-            if log_count > 0 {
-                format!(
-                    "{} logs \u{2502} \u{2191}\u{2193} scroll \u{2502} s search \u{2502} f filter \u{2502} ? help \u{2502} q quit",
-                    log_count
-                )
-            } else {
-                "No logs \u{2502} ? help \u{2502} q quit".to_string()
-            }
-        }
-        3 => "\u{2191}\u{2193} scroll \u{2502} ? close \u{2502} q quit".to_string(),
-        _ => String::new(),
+        2 => vec![
+            ("↑↓", "scroll"),
+            ("s", "search"),
+            ("f", "filter"),
+            ("?", "help"),
+            ("q", "quit"),
+        ],
+        3 => vec![("↑↓", "scroll"), ("?", "close"), ("q", "quit")],
+        _ => vec![],
     }
 }

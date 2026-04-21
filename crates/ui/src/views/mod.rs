@@ -25,9 +25,9 @@ pub fn render_ui(f: &mut Frame<'_>, app: &mut App) {
         .direction(ratatui::layout::Direction::Vertical)
         .constraints(
             [
-                ratatui::layout::Constraint::Length(3), // Title bar and tabs
+                ratatui::layout::Constraint::Length(1), // Title bar and tabs
                 ratatui::layout::Constraint::Min(5),    // Main content
-                ratatui::layout::Constraint::Length(2), // Status bar
+                ratatui::layout::Constraint::Length(1), // Status bar
             ]
             .as_ref(),
         )

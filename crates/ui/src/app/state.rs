@@ -95,6 +95,10 @@ pub struct App {
     /// task failure, so we don't tell the user "evaluation failed" for an
     /// action they took deliberately. Cleared once observed.
     pub diff_filter_aborted: bool,
+
+    /// Active sub-tab inside the Step Inspector (job-detail) view.
+    /// 0 Output, 1 Env, 2 Files, 3 Matrix, 4 Timeline.
+    pub step_inspector_tab: usize,
 }
 
 /// Result rows shipped from the background diff-filter task to the UI loop.
@@ -335,6 +339,7 @@ impl App {
             diff_filter_rx: None,
             diff_filter_task: None,
             diff_filter_aborted: false,
+            step_inspector_tab: 0,
         }
     }
 
@@ -1875,6 +1880,7 @@ mod tests {
                 execution_details: None,
                 job_names: vec!["build".to_string(), "lint".to_string(), "test".to_string()],
                 trigger_match: None,
+                definition: None,
             },
             Workflow {
                 name: "deploy".to_string(),
@@ -1884,6 +1890,7 @@ mod tests {
                 execution_details: None,
                 job_names: vec![],
                 trigger_match: None,
+                definition: None,
             },
         ];
         app.workflow_list_state.select(Some(0));
@@ -2024,6 +2031,7 @@ mod tests {
                 execution_details: None,
                 job_names: vec![],
                 trigger_match: None,
+                definition: None,
             },
             Workflow {
                 name: "ci".into(),
@@ -2033,6 +2041,7 @@ mod tests {
                 execution_details: None,
                 job_names: vec![],
                 trigger_match: None,
+                definition: None,
             },
         ];
 

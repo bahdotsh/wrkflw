@@ -69,7 +69,18 @@ pub async fn run_wrkflw_tui(
                 .to_string_lossy()
                 .into_owned();
 
-            let job_names = crate::utils::extract_job_names(path);
+            let (definition, job_names) = {
+                use std::sync::Arc;
+                use wrkflw_parser::workflow::parse_workflow;
+                match parse_workflow(path) {
+                    Ok(def) => {
+                        let mut names: Vec<String> = def.jobs.keys().cloned().collect();
+                        names.sort();
+                        (Some(Arc::new(def)), names)
+                    }
+                    Err(_) => (None, crate::utils::extract_job_names(path)),
+                }
+            };
 
             app.workflows = vec![Workflow {
                 name: name.clone(),
@@ -79,6 +90,7 @@ pub async fn run_wrkflw_tui(
                 execution_details: None,
                 job_names,
                 trigger_match: None,
+                definition,
             }];
 
             // Queue the single workflow for execution
@@ -248,12 +260,21 @@ fn run_tui_event_loop(
                         }
                     }
                     KeyCode::Tab => {
-                        // Cycle through tabs
-                        app.switch_tab((app.selected_tab + 1) % 4);
+                        // Inside the Step Inspector, Tab cycles inspector
+                        // sub-tabs (Output / Env / Files / Matrix / Timeline);
+                        // elsewhere it cycles top-level tabs.
+                        if app.selected_tab == 1 && app.detailed_view {
+                            app.step_inspector_tab = (app.step_inspector_tab + 1) % 5;
+                        } else {
+                            app.switch_tab((app.selected_tab + 1) % 4);
+                        }
                     }
                     KeyCode::BackTab => {
-                        // Cycle through tabs backwards
-                        app.switch_tab((app.selected_tab + 3) % 4);
+                        if app.selected_tab == 1 && app.detailed_view {
+                            app.step_inspector_tab = (app.step_inspector_tab + 4) % 5;
+                        } else {
+                            app.switch_tab((app.selected_tab + 3) % 4);
+                        }
                     }
                     KeyCode::Char('1') | KeyCode::Char('w') => app.switch_tab(0),
                     KeyCode::Char('2') | KeyCode::Char('x') => app.switch_tab(1),

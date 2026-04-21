@@ -1,8 +1,10 @@
 // UI Models for wrkflw
 use chrono::Local;
 use std::path::PathBuf;
+use std::sync::Arc;
 use wrkflw_executor::{JobStatus, StepStatus};
 use wrkflw_logging::symbols;
+use wrkflw_parser::workflow::WorkflowDefinition;
 
 /// Type alias for the complex execution result type
 pub type ExecutionResultMsg = (usize, Result<(Vec<wrkflw_executor::JobResult>, ()), String>);
@@ -25,6 +27,10 @@ pub struct Workflow {
     pub execution_details: Option<WorkflowExecution>,
     pub job_names: Vec<String>,
     pub trigger_match: Option<TriggerMatchStatus>,
+    /// Parsed workflow definition. Populated at load time so the Dashboard
+    /// preview / mini-DAG don't have to reparse on every render. `None` when
+    /// the file failed to parse (we still show the row so the user sees it).
+    pub definition: Option<Arc<WorkflowDefinition>>,
 }
 
 /// A workflow queued for execution, with its own target job

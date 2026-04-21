@@ -24,6 +24,9 @@ wrkflw-logging.workspace = true
 wrkflw-trigger-filter.workspace = true
 wrkflw-utils.workspace = true
 wrkflw-github.workspace = true
+wrkflw-gitlab.workspace = true
+wrkflw-matrix.workspace = true
+wrkflw-secrets.workspace = true
 
 # External dependencies
 chrono.workspace = true

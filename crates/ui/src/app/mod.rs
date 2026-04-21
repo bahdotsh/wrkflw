@@ -4,7 +4,7 @@ mod state;
 use crate::handlers::workflow::start_next_workflow_execution;
 use crate::models::{ExecutionResultMsg, QueuedExecution, Workflow, WorkflowStatus};
 use crate::utils::load_workflows;
-use crate::views::render_ui;
+use crate::views::{render_ui, TAB_COUNT};
 use chrono::Local;
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers},
@@ -18,7 +18,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use wrkflw_executor::RuntimeType;
 
-pub use state::App;
+pub use state::{Accent, App, TriggerPlatform};
 
 // Main entry point for the TUI interface
 #[allow(clippy::ptr_arg)]
@@ -218,8 +218,39 @@ fn run_tui_event_loop(
         if event::poll(event_poll_timeout)? {
             if let Event::Key(key) = event::read()? {
                 // Handle search input first if we're in search mode and logs tab
-                if app.selected_tab == 2 && app.log_search_active {
+                if app.selected_tab == 3 && app.log_search_active {
                     app.handle_log_search_input(key.code);
+                    continue;
+                }
+
+                // When the Tweaks overlay is open, its keys take
+                // precedence. Esc and `,` close it; `a` rotates the
+                // accent; `d` toggles density. This blocks the global
+                // `d` (diff filter) so the overlay doesn't silently
+                // trigger two actions at once.
+                if app.tweaks_open {
+                    match key.code {
+                        KeyCode::Esc | KeyCode::Char(',') => {
+                            app.tweaks_open = false;
+                            continue;
+                        }
+                        KeyCode::Char('a') | KeyCode::Char('A') => {
+                            app.tweaks_accent = app.tweaks_accent.next();
+                            continue;
+                        }
+                        _ => {}
+                    }
+                }
+
+                // Trigger tab: if a text input row is focused, route
+                // printable characters and edit keys straight to that
+                // input before the global key-map fires. Otherwise
+                // editing a value like "notify=slack" would trip the
+                // `s` logs shortcut below and jump tabs.
+                if app.selected_tab == 4
+                    && app.trigger_input_cursor != usize::MAX
+                    && app.trigger_handle_input_key(key.code)
+                {
                     continue;
                 }
 
@@ -265,67 +296,92 @@ fn run_tui_event_loop(
                         // elsewhere it cycles top-level tabs.
                         if app.selected_tab == 1 && app.detailed_view {
                             app.step_inspector_tab = (app.step_inspector_tab + 1) % 5;
+                        } else if app.selected_tab == 4 {
+                            // In the Trigger tab Tab cycles inputs/fields.
+                            app.trigger_tab_next_field();
                         } else {
-                            app.switch_tab((app.selected_tab + 1) % 4);
+                            app.switch_tab((app.selected_tab + 1) % TAB_COUNT);
                         }
                     }
                     KeyCode::BackTab => {
                         if app.selected_tab == 1 && app.detailed_view {
                             app.step_inspector_tab = (app.step_inspector_tab + 4) % 5;
+                        } else if app.selected_tab == 4 {
+                            app.trigger_tab_prev_field();
                         } else {
-                            app.switch_tab((app.selected_tab + 3) % 4);
+                            app.switch_tab((app.selected_tab + TAB_COUNT - 1) % TAB_COUNT);
                         }
                     }
                     KeyCode::Char('1') | KeyCode::Char('w') => app.switch_tab(0),
                     KeyCode::Char('2') | KeyCode::Char('x') => app.switch_tab(1),
-                    KeyCode::Char('3') | KeyCode::Char('l') => app.switch_tab(2),
-                    KeyCode::Char('4') | KeyCode::Char('h') => app.switch_tab(3),
-                    KeyCode::Up | KeyCode::Char('k') => {
-                        if app.selected_tab == 2 {
-                            if !app.log_search_matches.is_empty() {
-                                app.previous_search_match();
-                            } else {
-                                app.scroll_logs_up();
-                            }
-                        } else if app.selected_tab == 3 {
-                            app.scroll_help_up();
-                        } else if app.selected_tab == 0 {
+                    KeyCode::Char('3') => app.switch_tab(2),
+                    KeyCode::Char('4') | KeyCode::Char('l') => app.switch_tab(3),
+                    KeyCode::Char('5') => app.switch_tab(4),
+                    KeyCode::Char('6') => app.switch_tab(5),
+                    KeyCode::Char('7') | KeyCode::Char('h') => app.switch_tab(6),
+                    KeyCode::Char(',') => {
+                        // `,` toggles the Tweaks overlay anywhere (global).
+                        // Chosen because it never conflicts with our single-
+                        // letter tab shortcuts or with the log-search input
+                        // mode (which only consumes printable chars when
+                        // `log_search_active` is true, which we already
+                        // handled above with a `continue`).
+                        app.tweaks_open = !app.tweaks_open;
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => match app.selected_tab {
+                        0 => {
                             if app.job_selection_mode {
                                 app.previous_available_job();
                             } else {
                                 app.previous_workflow();
                             }
-                        } else if app.selected_tab == 1 {
+                        }
+                        1 => {
                             if app.detailed_view {
                                 app.previous_step();
                             } else {
                                 app.previous_job();
                             }
                         }
-                    }
-                    KeyCode::Down | KeyCode::Char('j') => {
-                        if app.selected_tab == 2 {
+                        3 => {
                             if !app.log_search_matches.is_empty() {
-                                app.next_search_match();
+                                app.previous_search_match();
                             } else {
-                                app.scroll_logs_down();
+                                app.scroll_logs_up();
                             }
-                        } else if app.selected_tab == 3 {
-                            app.scroll_help_down();
-                        } else if app.selected_tab == 0 {
+                        }
+                        4 => app.trigger_tab_prev_workflow(),
+                        5 => app.secrets_tab_prev(),
+                        6 => app.scroll_help_up(),
+                        _ => {}
+                    },
+                    KeyCode::Down | KeyCode::Char('j') => match app.selected_tab {
+                        0 => {
                             if app.job_selection_mode {
                                 app.next_available_job();
                             } else {
                                 app.next_workflow();
                             }
-                        } else if app.selected_tab == 1 {
+                        }
+                        1 => {
                             if app.detailed_view {
                                 app.next_step();
                             } else {
                                 app.next_job();
                             }
                         }
-                    }
+                        3 => {
+                            if !app.log_search_matches.is_empty() {
+                                app.next_search_match();
+                            } else {
+                                app.scroll_logs_down();
+                            }
+                        }
+                        4 => app.trigger_tab_next_workflow(),
+                        5 => app.secrets_tab_next(),
+                        6 => app.scroll_help_down(),
+                        _ => {}
+                    },
                     KeyCode::Char(' ') => {
                         if app.selected_tab == 0 && !app.running && !app.job_selection_mode {
                             app.toggle_selected();
@@ -357,6 +413,13 @@ fn run_tui_event_loop(
                             1 => {
                                 // In execution tab, Enter shows job details
                                 app.toggle_detailed_view();
+                            }
+                            4 => {
+                                // Trigger tab: Enter on a non-editing row
+                                // begins editing it (value first, then Tab
+                                // to swap); when already editing, Enter
+                                // commits the edit back to the row.
+                                app.trigger_tab_enter();
                             }
                             _ => {}
                         }
@@ -439,7 +502,7 @@ fn run_tui_event_loop(
                         }
                     }
                     KeyCode::Char('n') => {
-                        if app.selected_tab == 2 && !app.log_search_query.is_empty() {
+                        if app.selected_tab == 3 && !app.log_search_query.is_empty() {
                             app.next_search_match();
                         } else if app.selected_tab == 0 && !app.running {
                             // Deselect all workflows
@@ -562,22 +625,60 @@ fn run_tui_event_loop(
                         }
                     }
                     KeyCode::Char('s') => {
-                        if app.selected_tab == 2 {
+                        if app.selected_tab == 3 {
                             app.toggle_log_search();
                         }
                     }
                     KeyCode::Char('f') => {
-                        if app.selected_tab == 2 {
+                        if app.selected_tab == 3 {
                             app.toggle_log_filter();
                         }
                     }
                     KeyCode::Char('c') => {
-                        if app.selected_tab == 2 {
+                        if app.selected_tab == 3 {
                             app.clear_log_search_and_filter();
+                        } else if app.selected_tab == 4 {
+                            // Trigger tab: copy curl preview into the
+                            // status bar so the user can scrape it from
+                            // their scrollback without shelling out of
+                            // the TUI. No clipboard integration yet —
+                            // terminals vary too widely; a log line is
+                            // honest.
+                            app.trigger_tab_copy_curl();
+                        }
+                    }
+                    KeyCode::Char('g') => {
+                        if app.selected_tab == 2 {
+                            // Toggle DAG tab between graph and list view —
+                            // matches the design's `g` shortcut on
+                            // screen 4.
+                            app.dag_list_view = !app.dag_list_view;
+                        }
+                    }
+                    KeyCode::Char('m') => {
+                        if app.selected_tab == 5 {
+                            // Secrets tab: toggle the 5-second value
+                            // reveal. (The design's "reveal 5s" button
+                            // is a soft timer; here we leave it to the
+                            // user to hit `m` again.)
+                            app.secrets_reveal = !app.secrets_reveal;
+                        }
+                    }
+                    KeyCode::Char('p') => {
+                        if app.selected_tab == 4 {
+                            // Trigger tab: flip github ↔ gitlab. Also
+                            // rebinds the branch default because each
+                            // platform has its own `get_repo_info`.
+                            app.trigger_tab_toggle_platform();
+                        }
+                    }
+                    KeyCode::Char('+') | KeyCode::Char('=') => {
+                        if app.selected_tab == 4 {
+                            app.trigger_tab_add_input();
                         }
                     }
                     KeyCode::Char(c) => {
-                        if app.selected_tab == 2 && app.log_search_active {
+                        if app.selected_tab == 3 && app.log_search_active {
                             app.handle_log_search_input(KeyCode::Char(c));
                         }
                     }

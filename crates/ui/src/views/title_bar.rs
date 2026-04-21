@@ -11,7 +11,16 @@ use ratatui::{
 };
 use wrkflw_executor::RuntimeType;
 
-const TAB_LABELS: [&str; 4] = ["Workflows", "Execution", "Logs", "Help"];
+pub const TAB_LABELS: [&str; 7] = [
+    "Workflows",
+    "Execution",
+    "DAG",
+    "Logs",
+    "Trigger",
+    "Secrets",
+    "Help",
+];
+pub const TAB_COUNT: usize = TAB_LABELS.len();
 
 pub fn render_title_bar(f: &mut Frame<'_>, app: &App, area: Rect) {
     let chunks = Layout::default()
@@ -24,13 +33,12 @@ pub fn render_title_bar(f: &mut Frame<'_>, app: &App, area: Rect) {
         .split(area);
 
     // ─── Brand ────────────────────────────────────────────────
+    let accent = theme::current_accent();
     let brand = Paragraph::new(Line::from(vec![
-        Span::styled(" w∿w ", Style::default().fg(COLORS.accent)),
+        Span::styled(" w∿w ", Style::default().fg(accent)),
         Span::styled(
             "wrkflw",
-            Style::default()
-                .fg(COLORS.accent)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(accent).add_modifier(Modifier::BOLD),
         ),
     ]))
     .style(Style::default().bg(COLORS.bg_dark))

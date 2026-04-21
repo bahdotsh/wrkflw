@@ -99,6 +99,126 @@ pub struct App {
     /// Active sub-tab inside the Step Inspector (job-detail) view.
     /// 0 Output, 1 Env, 2 Files, 3 Matrix, 4 Timeline.
     pub step_inspector_tab: usize,
+
+    // ── DAG tab ───────────────────────────────────────────────────
+    /// When true, the DAG tab renders the topological-stage list view;
+    /// when false, the spatial column layout. Matches the design's
+    /// `graphView: 'graph' | 'list'` toggle (shortcut `g`).
+    pub dag_list_view: bool,
+
+    // ── Trigger tab ───────────────────────────────────────────────
+    /// Platform selected in the Trigger tab: "github" or "gitlab".
+    /// Toggled with `p` to keep the keyboard story explicit.
+    pub trigger_platform: TriggerPlatform,
+    /// Cursor into `workflows` for the workflow-to-dispatch selector.
+    pub trigger_workflow_idx: usize,
+    /// The branch/ref input — owned by the app so typing doesn't lose
+    /// state between draws and so ESC reverts to the git-resolved default.
+    pub trigger_branch: String,
+    /// Free-form `key=value` pairs to POST as `inputs:` (GitHub) or
+    /// `variables:` (GitLab). Flat Vec rather than HashMap so the UI
+    /// can show a deterministic cursor position and preserve user-typed
+    /// order in the curl preview.
+    pub trigger_inputs: Vec<(String, String)>,
+    /// Index into `trigger_inputs` for the edit cursor. `usize::MAX`
+    /// when no row is being edited so an ESC cancels cleanly.
+    pub trigger_input_cursor: usize,
+    /// Which column of the currently-edited input row holds focus:
+    /// false = key, true = value. Flipped with Tab.
+    pub trigger_input_on_value: bool,
+
+    // ── Secrets tab ───────────────────────────────────────────────
+    /// Selected row in the secrets list.
+    pub secrets_list_state: ListState,
+    /// When true, the detail pane shows the value in cleartext. Toggled
+    /// with `m`. Auto-reverts when switching away from the tab so a user
+    /// leaving the terminal doesn't accidentally leave a secret exposed.
+    pub secrets_reveal: bool,
+
+    // ── Tweaks overlay ────────────────────────────────────────────
+    /// When true, the Tweaks panel overlays the current tab. Toggled
+    /// with `,` (mirrors the design's edit-mode entry point).
+    pub tweaks_open: bool,
+    /// Accent color override. Matches the design's 5-slot palette.
+    /// The design exposes theme/density/graph-view too — we only ship
+    /// the knobs we actually plumb through (accent recolors the brand
+    /// + focused borders; the others would be dead toggles today).
+    pub tweaks_accent: Accent,
+}
+
+/// Target platform for the remote-trigger UI. GitLab path uses the
+/// existing `wrkflw_gitlab::trigger_pipeline` so the form is honest
+/// about what it will call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TriggerPlatform {
+    Github,
+    Gitlab,
+}
+
+impl TriggerPlatform {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TriggerPlatform::Github => "github",
+            TriggerPlatform::Gitlab => "gitlab",
+        }
+    }
+    pub fn toggle(self) -> Self {
+        match self {
+            TriggerPlatform::Github => TriggerPlatform::Gitlab,
+            TriggerPlatform::Gitlab => TriggerPlatform::Github,
+        }
+    }
+}
+
+/// Tweaks → accent. The five slots match the design file verbatim so
+/// the tweaks panel is an honest surface of what the theme actually
+/// plumbs, not an aspirational menu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Accent {
+    #[default]
+    Cyan,
+    Amber,
+    Green,
+    Violet,
+    Coral,
+}
+
+impl Accent {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Accent::Cyan => "cyan",
+            Accent::Amber => "amber",
+            Accent::Green => "green",
+            Accent::Violet => "violet",
+            Accent::Coral => "coral",
+        }
+    }
+
+    /// Rotate through the 5-slot palette in the order shown in the
+    /// design's TweaksPanel (matches user expectation if they've seen
+    /// the mockup).
+    pub fn next(self) -> Self {
+        match self {
+            Accent::Cyan => Accent::Amber,
+            Accent::Amber => Accent::Green,
+            Accent::Green => Accent::Violet,
+            Accent::Violet => Accent::Coral,
+            Accent::Coral => Accent::Cyan,
+        }
+    }
+
+    /// Matches the RGB values from the design handoff (`ACCENTS` table
+    /// in wrkflw TUI.html). Exposed as a 3-tuple so `theme.rs` can
+    /// translate into `ratatui::Color::Rgb`.
+    pub fn rgb(self) -> (u8, u8, u8) {
+        match self {
+            Accent::Cyan => (0x5f, 0xd3, 0xf3),
+            Accent::Amber => (0xf5, 0xd7, 0x6e),
+            Accent::Green => (0x8f, 0xce, 0x8f),
+            Accent::Violet => (0xd6, 0x8c, 0xff),
+            Accent::Coral => (0xff, 0x99, 0x77),
+        }
+    }
 }
 
 /// Result rows shipped from the background diff-filter task to the UI loop.
@@ -340,6 +460,25 @@ impl App {
             diff_filter_task: None,
             diff_filter_aborted: false,
             step_inspector_tab: 0,
+
+            dag_list_view: false,
+
+            trigger_platform: TriggerPlatform::Github,
+            trigger_workflow_idx: 0,
+            trigger_branch: String::new(),
+            trigger_inputs: Vec::new(),
+            trigger_input_cursor: usize::MAX,
+            trigger_input_on_value: false,
+
+            secrets_list_state: {
+                let mut s = ListState::default();
+                s.select(Some(0));
+                s
+            },
+            secrets_reveal: false,
+
+            tweaks_open: false,
+            tweaks_accent: Accent::default(),
         }
     }
 
@@ -1700,6 +1839,285 @@ impl App {
             self.logs.drain(0..excess);
         }
     }
+
+    // ── Trigger tab helpers ───────────────────────────────────────
+
+    /// Returns the workflow currently selected for dispatch in the
+    /// Trigger tab, clamped to the workflow list. `None` when there
+    /// are no workflows (e.g. empty directory).
+    pub fn trigger_selected_workflow_name(&self) -> Option<&str> {
+        self.workflows
+            .get(self.trigger_workflow_idx)
+            .map(|w| w.name.as_str())
+    }
+
+    pub fn trigger_tab_next_workflow(&mut self) {
+        if self.workflows.is_empty() {
+            return;
+        }
+        self.trigger_workflow_idx = (self.trigger_workflow_idx + 1) % self.workflows.len();
+    }
+
+    pub fn trigger_tab_prev_workflow(&mut self) {
+        if self.workflows.is_empty() {
+            return;
+        }
+        self.trigger_workflow_idx =
+            (self.trigger_workflow_idx + self.workflows.len() - 1) % self.workflows.len();
+    }
+
+    pub fn trigger_tab_toggle_platform(&mut self) {
+        self.trigger_platform = self.trigger_platform.toggle();
+    }
+
+    /// Append a blank `key=value` row and put the edit cursor on it.
+    pub fn trigger_tab_add_input(&mut self) {
+        self.trigger_inputs.push((String::new(), String::new()));
+        self.trigger_input_cursor = self.trigger_inputs.len() - 1;
+        self.trigger_input_on_value = false;
+    }
+
+    pub fn trigger_tab_next_field(&mut self) {
+        if self.trigger_inputs.is_empty() {
+            return;
+        }
+        if self.trigger_input_cursor == usize::MAX {
+            self.trigger_input_cursor = 0;
+            self.trigger_input_on_value = false;
+        } else if !self.trigger_input_on_value {
+            self.trigger_input_on_value = true;
+        } else {
+            self.trigger_input_cursor =
+                (self.trigger_input_cursor + 1) % self.trigger_inputs.len();
+            self.trigger_input_on_value = false;
+        }
+    }
+
+    pub fn trigger_tab_prev_field(&mut self) {
+        if self.trigger_inputs.is_empty() {
+            return;
+        }
+        if self.trigger_input_cursor == usize::MAX {
+            self.trigger_input_cursor = self.trigger_inputs.len() - 1;
+            self.trigger_input_on_value = true;
+        } else if self.trigger_input_on_value {
+            self.trigger_input_on_value = false;
+        } else {
+            self.trigger_input_cursor = (self.trigger_input_cursor
+                + self.trigger_inputs.len()
+                - 1)
+                % self.trigger_inputs.len();
+            self.trigger_input_on_value = true;
+        }
+    }
+
+    /// Enter in the Trigger tab commits the current edit (if any) and
+    /// otherwise dispatches the workflow. Dispatch is intentionally
+    /// async and fire-and-forget — we spawn a task, log the outcome,
+    /// and let the user see the result in the Logs tab. Blocking the
+    /// UI thread on a `reqwest` POST would freeze the animation loop.
+    pub fn trigger_tab_enter(&mut self) {
+        if self.trigger_input_cursor != usize::MAX {
+            // Commit edit.
+            self.trigger_input_cursor = usize::MAX;
+            self.trigger_input_on_value = false;
+            return;
+        }
+        self.trigger_dispatch();
+    }
+
+    /// Route a key event into the currently-edited trigger input.
+    /// Returns `true` if the key was consumed (so the caller should
+    /// skip the global key map); `false` otherwise.
+    pub fn trigger_handle_input_key(&mut self, code: KeyCode) -> bool {
+        let Some((k, v)) = self.trigger_inputs.get_mut(self.trigger_input_cursor) else {
+            self.trigger_input_cursor = usize::MAX;
+            return false;
+        };
+        let buf = if self.trigger_input_on_value { v } else { k };
+        match code {
+            KeyCode::Char(c) => {
+                buf.push(c);
+                true
+            }
+            KeyCode::Backspace => {
+                buf.pop();
+                true
+            }
+            KeyCode::Esc => {
+                self.trigger_input_cursor = usize::MAX;
+                self.trigger_input_on_value = false;
+                true
+            }
+            KeyCode::Enter | KeyCode::Tab | KeyCode::BackTab => false,
+            _ => false,
+        }
+    }
+
+    /// Render the would-be POST into the log buffer so the user has a
+    /// recipe they can paste. Non-destructive; doesn't hit the
+    /// network.
+    pub fn trigger_tab_copy_curl(&mut self) {
+        let curl = self.trigger_curl_preview();
+        self.logs.push(format!("curl: {}", curl));
+        self.trim_logs_to_cap();
+    }
+
+    /// Exposed as `pub` so the Trigger view can render the same string
+    /// it logs — single source of truth prevents preview drift.
+    pub fn trigger_curl_preview(&self) -> String {
+        let wf = self
+            .trigger_selected_workflow_name()
+            .unwrap_or("<no workflow>");
+        let branch = if self.trigger_branch.is_empty() {
+            "<default>".to_string()
+        } else {
+            self.trigger_branch.clone()
+        };
+        let inputs_json = inputs_to_json(&self.trigger_inputs);
+        match self.trigger_platform {
+            TriggerPlatform::Github => {
+                format!(
+                    "curl -X POST -H \"Authorization: Bearer $GITHUB_TOKEN\" \
+                     -H \"Accept: application/vnd.github+json\" \
+                     https://api.github.com/repos/<owner>/<repo>/actions/workflows/{wf}/dispatches \
+                     -d '{{\"ref\":\"{branch}\",\"inputs\":{inputs_json}}}'",
+                    wf = strip_yaml_suffix(wf),
+                    branch = branch,
+                    inputs_json = inputs_json
+                )
+            }
+            TriggerPlatform::Gitlab => {
+                format!(
+                    "curl -X POST -H \"PRIVATE-TOKEN: $GITLAB_TOKEN\" \
+                     https://gitlab.com/api/v4/projects/<id>/trigger/pipeline \
+                     -F ref={branch}{vars}",
+                    branch = branch,
+                    vars = gitlab_vars_form(&self.trigger_inputs)
+                )
+            }
+        }
+    }
+
+    /// Fire the dispatch. We spawn a tokio task because the TUI event
+    /// loop is synchronous — blocking on `.await` here would stall
+    /// rendering. Result ends up in `logs` via the channel.
+    pub fn trigger_dispatch(&mut self) {
+        let Some(wf_name_raw) = self.trigger_selected_workflow_name().map(|s| s.to_string())
+        else {
+            self.set_error_message("No workflow selected to dispatch.".to_string());
+            return;
+        };
+        let branch = if self.trigger_branch.is_empty() {
+            None
+        } else {
+            Some(self.trigger_branch.clone())
+        };
+        let inputs: std::collections::HashMap<String, String> = self
+            .trigger_inputs
+            .iter()
+            .filter(|(k, _)| !k.is_empty())
+            .cloned()
+            .collect();
+        let platform = self.trigger_platform;
+        self.logs.push(format!(
+            "Dispatching {} to {:?} (branch: {})",
+            wf_name_raw,
+            platform,
+            branch.as_deref().unwrap_or("<default>")
+        ));
+        self.trim_logs_to_cap();
+
+        tokio::spawn(async move {
+            let outcome = match platform {
+                TriggerPlatform::Github => {
+                    let wf = strip_yaml_suffix(&wf_name_raw).to_string();
+                    wrkflw_github::trigger_workflow(
+                        &wf,
+                        branch.as_deref(),
+                        if inputs.is_empty() { None } else { Some(inputs) },
+                    )
+                    .await
+                    .map_err(|e| e.to_string())
+                }
+                TriggerPlatform::Gitlab => wrkflw_gitlab::trigger_pipeline(
+                    branch.as_deref(),
+                    if inputs.is_empty() { None } else { Some(inputs) },
+                )
+                .await
+                .map_err(|e| e.to_string()),
+            };
+            match outcome {
+                Ok(_) => wrkflw_logging::info("Trigger dispatched successfully"),
+                Err(e) => wrkflw_logging::error(&format!("Trigger failed: {}", e)),
+            }
+        });
+    }
+
+    // ── Secrets tab helpers ───────────────────────────────────────
+
+    /// Navigate the secrets list downwards, wrapping at the end so the
+    /// cursor never falls off (ratatui's ListState happily accepts an
+    /// out-of-range index and silently renders nothing).
+    pub fn secrets_tab_next(&mut self) {
+        let len = crate::views::secrets_provider_count();
+        if len == 0 {
+            return;
+        }
+        let i = match self.secrets_list_state.selected() {
+            Some(i) => (i + 1) % len,
+            None => 0,
+        };
+        self.secrets_list_state.select(Some(i));
+    }
+
+    pub fn secrets_tab_prev(&mut self) {
+        let len = crate::views::secrets_provider_count();
+        if len == 0 {
+            return;
+        }
+        let i = match self.secrets_list_state.selected() {
+            Some(i) => (i + len - 1) % len,
+            None => 0,
+        };
+        self.secrets_list_state.select(Some(i));
+    }
+}
+
+// ── Free helpers for the trigger curl preview ────────────────────
+fn strip_yaml_suffix(name: &str) -> &str {
+    name.strip_suffix(".yml")
+        .or_else(|| name.strip_suffix(".yaml"))
+        .unwrap_or(name)
+}
+
+fn inputs_to_json(inputs: &[(String, String)]) -> String {
+    if inputs.is_empty() {
+        return "{}".to_string();
+    }
+    let mut parts: Vec<String> = Vec::new();
+    for (k, v) in inputs {
+        if k.is_empty() {
+            continue;
+        }
+        parts.push(format!("\"{}\":\"{}\"", escape_json(k), escape_json(v)));
+    }
+    format!("{{{}}}", parts.join(","))
+}
+
+fn gitlab_vars_form(inputs: &[(String, String)]) -> String {
+    let mut out = String::new();
+    for (k, v) in inputs {
+        if k.is_empty() {
+            continue;
+        }
+        out.push_str(&format!(" -F \"variables[{}]={}\"", k, v));
+    }
+    out
+}
+
+fn escape_json(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 /// Run git + trigger evaluation as an async task on the ambient runtime.

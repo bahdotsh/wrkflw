@@ -3740,9 +3740,12 @@ dependencies = [
  "wrkflw-evaluator",
  "wrkflw-executor",
  "wrkflw-github",
+ "wrkflw-gitlab",
  "wrkflw-logging",
+ "wrkflw-matrix",
  "wrkflw-models",
  "wrkflw-parser",
+ "wrkflw-secrets",
  "wrkflw-trigger-filter",
  "wrkflw-utils",
 ]

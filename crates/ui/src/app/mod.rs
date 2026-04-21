@@ -209,6 +209,11 @@ fn run_tui_event_loop(
             start_next_workflow_execution(app, tx_clone, verbose);
         }
 
+        // Surface any completed Trigger-tab dispatches on the status bar
+        // so the user sees the outcome where they fired it, rather than
+        // having to switch tabs to Logs.
+        app.drain_trigger_outcomes();
+
         // Start execution if we have a queued workflow and nothing is currently running
         if app.running && app.current_execution.is_none() && !app.execution_queue.is_empty() {
             start_next_workflow_execution(app, tx_clone, verbose);

@@ -164,11 +164,14 @@ pub async fn trigger_workflow(
 
     // Get repository information
     let repo_info = get_repo_info()?;
-    println!("Repository: {}/{}", repo_info.owner, repo_info.repo);
+    wrkflw_logging::info(&format!(
+        "Repository: {}/{}",
+        repo_info.owner, repo_info.repo
+    ));
 
     // Prepare the request payload
     let branch_ref = branch.unwrap_or(&repo_info.default_branch);
-    println!("Using branch: {}", branch_ref);
+    wrkflw_logging::info(&format!("Using branch: {}", branch_ref));
 
     // Extract just the workflow name from the path if it's a full path
     let workflow_name = if workflow_name.contains('/') {
@@ -180,7 +183,7 @@ pub async fn trigger_workflow(
         workflow_name
     };
 
-    println!("Using workflow name: {}", workflow_name);
+    wrkflw_logging::info(&format!("Using workflow name: {}", workflow_name));
 
     // Create simplified payload
     let mut payload = serde_json::json!({
@@ -190,7 +193,7 @@ pub async fn trigger_workflow(
     // Add inputs if provided
     if let Some(input_map) = inputs {
         payload["inputs"] = serde_json::json!(input_map);
-        println!("With inputs: {:?}", input_map);
+        wrkflw_logging::info(&format!("With inputs: {:?}", input_map));
     }
 
     // Send the workflow_dispatch event
@@ -199,7 +202,7 @@ pub async fn trigger_workflow(
         repo_info.owner, repo_info.repo, workflow_name
     );
 
-    println!("Triggering workflow at URL: {}", url);
+    wrkflw_logging::info(&format!("Triggering workflow at URL: {}", url));
 
     // Create a reqwest client
     let client = reqwest::Client::new();
@@ -243,39 +246,43 @@ pub async fn trigger_workflow(
         });
     }
 
-    println!("Workflow triggered successfully!");
-    println!(
+    wrkflw_logging::info("Workflow triggered successfully!");
+    wrkflw_logging::info(&format!(
         "View runs at: https://github.com/{}/{}/actions/workflows/{}.yml",
         repo_info.owner, repo_info.repo, workflow_name
-    );
+    ));
 
     // Attempt to verify the workflow was actually triggered
     match list_recent_workflow_runs(&repo_info, workflow_name, &token).await {
         Ok(runs) => {
             if !runs.is_empty() {
-                println!("\nRecent runs of this workflow:");
+                wrkflw_logging::info("Recent runs of this workflow:");
                 for run in runs.iter().take(3) {
-                    println!(
+                    wrkflw_logging::info(&format!(
                         "- Run #{} ({}): {}",
                         run.get("id").and_then(|id| id.as_u64()).unwrap_or(0),
                         run.get("status")
                             .and_then(|s| s.as_str())
                             .unwrap_or("unknown"),
                         run.get("html_url").and_then(|u| u.as_str()).unwrap_or("")
-                    );
+                    ));
                 }
             } else {
-                println!("\nNo recent runs found. The workflow might still be initializing.");
-                println!(
+                wrkflw_logging::info(
+                    "No recent runs found. The workflow might still be initializing.",
+                );
+                wrkflw_logging::info(&format!(
                     "Check GitHub UI in a few moments: https://github.com/{}/{}/actions",
                     repo_info.owner, repo_info.repo
-                );
+                ));
             }
         }
         Err(e) => {
-            println!("\nCould not fetch recent workflow runs: {}", e);
-            println!("This doesn't mean the trigger failed - check GitHub UI: https://github.com/{}/{}/actions", 
-                     repo_info.owner, repo_info.repo);
+            wrkflw_logging::warning(&format!("Could not fetch recent workflow runs: {}", e));
+            wrkflw_logging::info(&format!(
+                "This doesn't mean the trigger failed - check GitHub UI: https://github.com/{}/{}/actions",
+                repo_info.owner, repo_info.repo
+            ));
         }
     }
 

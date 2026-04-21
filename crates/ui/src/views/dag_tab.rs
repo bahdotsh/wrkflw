@@ -162,14 +162,33 @@ fn render_graph(
         return;
     }
 
-    // Allocate columns proportionally; cap at 5 visible columns before
-    // horizontal scrolling would be needed (we don't implement scroll
-    // because terminals wider than 6 stages of workflows are a separate
-    // feature request).
-    let col_count = levels.len().max(1) as u16;
-    let constraints: Vec<Constraint> = (0..col_count)
-        .map(|_| Constraint::Ratio(1, col_count as u32))
+    // Node cards are a fixed 18 cells wide ("╭────────────────╮").
+    // If we just split the area into `levels.len()` equal columns, each
+    // column can shrink below 18 on narrow terminals and the box-drawing
+    // characters wrap — which looks broken. Instead, clamp the visible
+    // column count to what fits, and render a trailing "… +N more
+    // stages" marker so the user knows they're seeing a subset.
+    const NODE_CARD_W: u16 = 18;
+    const OVERFLOW_W: u16 = 16; // width reserved for "… +N more" column
+    let total_stages = levels.len();
+    let max_visible = (inner.width / NODE_CARD_W).max(1) as usize;
+    let (visible_stages, truncated) = if total_stages > max_visible {
+        // Reserve space for the overflow column by dropping one more
+        // stage; ensures the tail marker has somewhere to live.
+        let capped = max_visible.saturating_sub(1).max(1);
+        (capped, total_stages - capped)
+    } else {
+        (total_stages, 0)
+    };
+
+    let mut constraints: Vec<Constraint> = (0..visible_stages)
+        .map(|_| Constraint::Length(NODE_CARD_W))
         .collect();
+    if truncated > 0 {
+        constraints.push(Constraint::Length(OVERFLOW_W));
+    }
+    constraints.push(Constraint::Min(0)); // trailing slack
+
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints(constraints)
@@ -179,21 +198,15 @@ fn render_graph(
     // design handoff uses semantic names like "build" / "test", but
     // no such grouping exists in GitHub Actions' workflow YAML today,
     // so putting a name here would mean *inventing* one.
-    for (li, layer) in levels.iter().enumerate() {
+    for (li, layer) in levels.iter().take(visible_stages).enumerate() {
         let col = cols[li];
         let mut lines: Vec<Line> = Vec::new();
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("L{} ", li + 1),
-                Style::default().fg(COLORS.text_muted),
-            ),
-            Span::styled(
-                format!("stage {}", li + 1),
-                Style::default()
-                    .fg(COLORS.highlight)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]));
+        lines.push(Line::from(vec![Span::styled(
+            format!("Stage {}", li + 1),
+            Style::default()
+                .fg(COLORS.highlight)
+                .add_modifier(Modifier::BOLD),
+        )]));
         lines.push(Line::from(""));
         for name in layer {
             let st = state_for_job(app, workflow, name);
@@ -260,6 +273,34 @@ fn render_graph(
             )]));
         }
         f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), col);
+    }
+
+    if truncated > 0 {
+        let overflow_col = cols[visible_stages];
+        let mut overflow_lines: Vec<Line> = Vec::new();
+        overflow_lines.push(Line::from(vec![Span::styled(
+            format!("+{}", truncated),
+            Style::default()
+                .fg(COLORS.text_muted)
+                .add_modifier(Modifier::BOLD),
+        )]));
+        overflow_lines.push(Line::from(Span::styled(
+            "more stages",
+            Style::default().fg(COLORS.text_dim),
+        )));
+        overflow_lines.push(Line::from(""));
+        overflow_lines.push(Line::from(Span::styled(
+            "press `g`",
+            Style::default().fg(COLORS.text_dim),
+        )));
+        overflow_lines.push(Line::from(Span::styled(
+            "for list view",
+            Style::default().fg(COLORS.text_dim),
+        )));
+        f.render_widget(
+            Paragraph::new(overflow_lines).wrap(Wrap { trim: false }),
+            overflow_col,
+        );
     }
 }
 

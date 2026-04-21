@@ -13,6 +13,7 @@ categories.workspace = true
 [dependencies]
 # Internal crates
 wrkflw-models.workspace = true
+wrkflw-logging.workspace = true
 
 # External dependencies
 lazy_static.workspace = true

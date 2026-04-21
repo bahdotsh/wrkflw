@@ -40,3 +40,4 @@ serde_json.workspace = true
 reqwest = { workspace = true, features = ["json"] }
 regex.workspace = true
 futures.workspace = true
+urlencoding.workspace = true

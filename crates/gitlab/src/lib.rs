@@ -143,14 +143,14 @@ pub async fn trigger_pipeline(
 
     // Get repository information
     let repo_info = get_repo_info()?;
-    println!(
+    wrkflw_logging::info(&format!(
         "GitLab Repository: {}/{}",
         repo_info.namespace, repo_info.project
-    );
+    ));
 
     // Prepare the request payload
     let branch_ref = branch.unwrap_or(&repo_info.default_branch);
-    println!("Using branch: {}", branch_ref);
+    wrkflw_logging::info(&format!("Using branch: {}", branch_ref));
 
     // Create simplified payload
     let mut payload = serde_json::json!({
@@ -171,7 +171,7 @@ pub async fn trigger_pipeline(
             .collect();
 
         payload["variables"] = serde_json::json!(formatted_vars);
-        println!("With variables: {:?}", vars_map);
+        wrkflw_logging::info(&format!("With variables: {:?}", vars_map));
     }
 
     // URL encode the namespace and project for use in URL
@@ -185,7 +185,7 @@ pub async fn trigger_pipeline(
         encoded_project = encoded_project,
     );
 
-    println!("Triggering pipeline at URL: {}", url);
+    wrkflw_logging::info(&format!("Triggering pipeline at URL: {}", url));
 
     // Create a reqwest client
     let client = reqwest::Client::new();
@@ -236,8 +236,8 @@ pub async fn trigger_pipeline(
         repo_info.namespace, repo_info.project, pipeline_id
     );
 
-    println!("Pipeline triggered successfully!");
-    println!("View pipeline at: {}", pipeline_url);
+    wrkflw_logging::info("Pipeline triggered successfully!");
+    wrkflw_logging::info(&format!("View pipeline at: {}", pipeline_url));
 
     Ok(())
 }

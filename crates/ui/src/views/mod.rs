@@ -16,14 +16,34 @@ pub use title_bar::TAB_COUNT;
 use crate::app::App;
 use ratatui::Frame;
 
+/// RAII guard that installs an accent override on construction and
+/// clears it on drop. Scoping the thread-local to one render pass
+/// stops later code (tests, alternate backends) from inheriting stale
+/// state — the thread-local is a handoff, not a setting.
+struct AccentScope;
+
+impl AccentScope {
+    fn install(color: ratatui::style::Color) -> Self {
+        crate::theme::set_accent_override(Some(color));
+        Self
+    }
+}
+
+impl Drop for AccentScope {
+    fn drop(&mut self) {
+        crate::theme::set_accent_override(None);
+    }
+}
+
 // Main render function for the UI
 pub fn render_ui(f: &mut Frame<'_>, app: &mut App) {
     // Plumb the Tweaks accent into the theme's thread-local so
     // anything that calls `theme::current_accent()` or uses
-    // `block_focused` picks up the user's choice. Set it before
-    // any widget is built and we don't need to pass `app` down.
+    // `block_focused` picks up the user's choice. The guard clears
+    // the override on drop so the override lives for exactly this
+    // frame.
     let (r, g, b) = app.tweaks_accent.rgb();
-    crate::theme::set_accent_override(Some(ratatui::style::Color::Rgb(r, g, b)));
+    let _accent = AccentScope::install(ratatui::style::Color::Rgb(r, g, b));
 
     // Check if help should be shown as an overlay
     if app.show_help {

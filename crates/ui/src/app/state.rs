@@ -138,6 +138,15 @@ pub struct App {
     /// shell out to `git remote` every frame; invalidated on platform
     /// toggle.
     pub trigger_target_cache: Option<TriggerTarget>,
+    /// Sender for dispatch outcomes. Cloned into the spawned tokio
+    /// task so the task can report success/failure back to the main
+    /// event loop without touching `&mut App` directly.
+    pub trigger_outcome_tx: mpsc::Sender<DispatchOutcome>,
+    /// Receiver for dispatch outcomes. Drained every tick by
+    /// [`App::drain_trigger_outcomes`] — the result updates the status
+    /// bar so the user gets confirmation on the Trigger tab itself,
+    /// not buried in the Logs tab.
+    pub trigger_outcome_rx: mpsc::Receiver<DispatchOutcome>,
 
     // ── Secrets tab ───────────────────────────────────────────────
     /// Selected row in the secrets list.
@@ -157,6 +166,17 @@ pub struct App {
     /// the knobs we actually plumb through (accent recolors the brand
     /// + focused borders; the others would be dead toggles today).
     pub tweaks_accent: Accent,
+}
+
+/// Outcome of a remote dispatch spawned from the Trigger tab.
+/// Reported back to the main event loop via an mpsc so the UI can
+/// surface the result on the status bar (instead of forcing the user
+/// to tab over to Logs).
+#[derive(Debug, Clone)]
+pub struct DispatchOutcome {
+    pub platform: TriggerPlatform,
+    pub workflow: String,
+    pub result: Result<(), String>,
 }
 
 /// Target platform for the remote-trigger UI. GitLab path uses the
@@ -294,6 +314,8 @@ impl App {
     ) -> App {
         let mut workflow_list_state = ListState::default();
         workflow_list_state.select(Some(0));
+
+        let (trigger_outcome_tx, trigger_outcome_rx) = mpsc::channel::<DispatchOutcome>();
 
         let mut job_list_state = ListState::default();
         job_list_state.select(Some(0));
@@ -484,6 +506,8 @@ impl App {
             trigger_input_on_value: false,
             trigger_in_flight: Arc::new(AtomicBool::new(false)),
             trigger_target_cache: None,
+            trigger_outcome_tx,
+            trigger_outcome_rx,
 
             secrets_list_state: {
                 let mut s = ListState::default();
@@ -2010,36 +2034,69 @@ impl App {
     }
 
     /// Exposed as `pub` so the Trigger view can render the same string
-    /// it logs — single source of truth prevents preview drift.
+    /// it logs — single source of truth prevents preview drift. The
+    /// preview is constructed to match exactly what
+    /// `wrkflw_{github,gitlab}` send on the wire: same endpoint, same
+    /// headers, same body shape. When the repo cache isn't populated
+    /// yet (first render after tab switch) we fall back to a
+    /// placeholder so users never see stale data, never a lie.
     pub fn trigger_curl_preview(&self) -> String {
         let wf = self
             .trigger_selected_workflow_name()
             .unwrap_or("<no workflow>");
-        let branch = if self.trigger_branch.is_empty() {
-            "<default>".to_string()
+        let branch_raw = if self.trigger_branch.is_empty() {
+            self.trigger_target_cache
+                .as_ref()
+                .map(|t| t.default_branch.clone())
+                .unwrap_or_else(|| "<default>".to_string())
         } else {
             self.trigger_branch.clone()
         };
-        let inputs_json = inputs_to_json(&self.trigger_inputs);
         match self.trigger_platform {
             TriggerPlatform::Github => {
+                // The dispatcher posts to
+                //   /repos/{owner}/{repo}/actions/workflows/{wf}.yml/dispatches
+                // with JSON body `{"ref": "...", "inputs": {...}}`.
+                let (owner, repo) = self
+                    .trigger_target_cache
+                    .as_ref()
+                    .and_then(|t| split_slug(&t.repo_label))
+                    .unwrap_or(("<owner>".to_string(), "<repo>".to_string()));
+                let body = github_dispatches_body(&branch_raw, &self.trigger_inputs);
                 format!(
                     "curl -X POST -H \"Authorization: Bearer $GITHUB_TOKEN\" \
                      -H \"Accept: application/vnd.github+json\" \
-                     https://api.github.com/repos/<owner>/<repo>/actions/workflows/{wf}/dispatches \
-                     -d '{{\"ref\":\"{branch}\",\"inputs\":{inputs_json}}}'",
+                     -H \"Content-Type: application/json\" \
+                     https://api.github.com/repos/{owner}/{repo}/actions/workflows/{wf}.yml/dispatches \
+                     -d '{body}'",
+                    owner = owner,
+                    repo = repo,
                     wf = strip_yaml_suffix(wf),
-                    branch = escape_shell_single(&branch),
-                    inputs_json = inputs_json
+                    body = escape_shell_single(&body),
                 )
             }
             TriggerPlatform::Gitlab => {
+                // The dispatcher posts to
+                //   /api/v4/projects/{enc_ns}%2F{enc_proj}/pipeline
+                // (note: `/pipeline`, NOT `/trigger/pipeline` — the
+                // latter needs a trigger token, not a PAT) with JSON
+                // body `{"ref": "...", "variables": [{"key":K,"value":V}]}`.
+                let (ns, proj) = self
+                    .trigger_target_cache
+                    .as_ref()
+                    .and_then(|t| split_slug(&t.repo_label))
+                    .unwrap_or(("<namespace>".to_string(), "<project>".to_string()));
+                let enc_ns = urlencoding::encode(&ns);
+                let enc_proj = urlencoding::encode(&proj);
+                let body = gitlab_pipeline_body(&branch_raw, &self.trigger_inputs);
                 format!(
                     "curl -X POST -H \"PRIVATE-TOKEN: $GITLAB_TOKEN\" \
-                     https://gitlab.com/api/v4/projects/<id>/trigger/pipeline \
-                     -F ref={branch}{vars}",
-                    branch = branch,
-                    vars = gitlab_vars_form(&self.trigger_inputs)
+                     -H \"Content-Type: application/json\" \
+                     https://gitlab.com/api/v4/projects/{enc_ns}%2F{enc_proj}/pipeline \
+                     -d '{body}'",
+                    enc_ns = enc_ns,
+                    enc_proj = enc_proj,
+                    body = escape_shell_single(&body),
                 )
             }
         }
@@ -2086,9 +2143,10 @@ impl App {
         // owns clearing it regardless of outcome.
         self.trigger_in_flight.store(true, Ordering::SeqCst);
         let in_flight = Arc::clone(&self.trigger_in_flight);
+        let outcome_tx = self.trigger_outcome_tx.clone();
 
         tokio::spawn(async move {
-            let outcome = match platform {
+            let result = match platform {
                 TriggerPlatform::Github => {
                     let wf = strip_yaml_suffix(&wf_name_raw).to_string();
                     wrkflw_github::trigger_workflow(
@@ -2114,12 +2172,42 @@ impl App {
                 .await
                 .map_err(|e| e.to_string()),
             };
-            match outcome {
+            match &result {
                 Ok(_) => wrkflw_logging::info("Trigger dispatched successfully"),
                 Err(e) => wrkflw_logging::error(&format!("Trigger failed: {}", e)),
             }
+            // Send the outcome even if the in-flight flag can't find
+            // a receiver (e.g. App dropped) — the send is cheap and
+            // logging already covered the visible error path.
+            let _ = outcome_tx.send(DispatchOutcome {
+                platform,
+                workflow: wf_name_raw,
+                result,
+            });
             in_flight.store(false, Ordering::SeqCst);
         });
+    }
+
+    /// Drain any completed dispatch outcomes and reflect them on the
+    /// status bar. Called by the event loop once per iteration. Uses
+    /// `try_recv` so it never blocks; on disconnect the iterator
+    /// yields `Err` and we stop polling.
+    pub fn drain_trigger_outcomes(&mut self) {
+        while let Ok(outcome) = self.trigger_outcome_rx.try_recv() {
+            match outcome.result {
+                Ok(_) => self.set_info_message(format!(
+                    "Dispatched {} on {}",
+                    outcome.workflow,
+                    outcome.platform.as_str()
+                )),
+                Err(e) => self.set_error_message(format!(
+                    "Dispatch {} on {} failed: {}",
+                    outcome.workflow,
+                    outcome.platform.as_str(),
+                    e
+                )),
+            }
+        }
     }
 
     // ── Secrets tab helpers ───────────────────────────────────────
@@ -2179,51 +2267,73 @@ fn strip_yaml_suffix(name: &str) -> &str {
         .unwrap_or(name)
 }
 
-/// Serialize the trigger inputs into the exact JSON object the GitHub
-/// dispatch endpoint expects. Using `serde_json` (vs hand-rolled
-/// escaping) is load-bearing: values may contain quotes, backslashes,
-/// newlines, or non-ASCII characters, all of which break a naive
-/// `replace('"', ...)` escaper.
-pub(crate) fn inputs_to_json(inputs: &[(String, String)]) -> String {
-    let mut map = serde_json::Map::with_capacity(inputs.len());
+/// Serialize the trigger inputs into the JSON body shape that
+/// `wrkflw_github::trigger_workflow` actually sends:
+/// `{"ref":"…","inputs":{"K":"V",…}}`. Using serde_json end-to-end
+/// keeps the preview honest for branch/input values that contain
+/// quotes, backslashes, or newlines.
+pub(crate) fn github_dispatches_body(branch: &str, inputs: &[(String, String)]) -> String {
+    let mut payload = serde_json::Map::new();
+    payload.insert(
+        "ref".to_string(),
+        serde_json::Value::String(branch.to_string()),
+    );
+    let mut input_map = serde_json::Map::new();
     for (k, v) in inputs {
         if k.is_empty() {
             continue;
         }
-        map.insert(k.clone(), serde_json::Value::String(v.clone()));
+        input_map.insert(k.clone(), serde_json::Value::String(v.clone()));
     }
-    serde_json::to_string(&serde_json::Value::Object(map)).unwrap_or_else(|_| "{}".to_string())
+    payload.insert("inputs".to_string(), serde_json::Value::Object(input_map));
+    serde_json::to_string(&serde_json::Value::Object(payload))
+        .unwrap_or_else(|_| "{\"ref\":\"\",\"inputs\":{}}".to_string())
 }
 
-/// GitLab curl-preview builder. The value is wrapped in double quotes
-/// plus a shell-single-quote-escape pass on any embedded single quote
-/// so the generated one-liner is copy-paste safe. Anything that the
-/// shell *itself* would interpret (`$`, backticks) is left alone on
-/// purpose — echoing back what the user would type.
-pub(crate) fn gitlab_vars_form(inputs: &[(String, String)]) -> String {
-    let mut out = String::new();
-    for (k, v) in inputs {
-        if k.is_empty() {
-            continue;
-        }
-        out.push_str(&format!(
-            " -F \"variables[{}]={}\"",
-            escape_shell_double(k),
-            escape_shell_double(v),
-        ));
+/// Serialize the trigger inputs into the JSON body shape that
+/// `wrkflw_gitlab::trigger_pipeline` actually sends:
+/// `{"ref":"…","variables":[{"key":K,"value":V},…]}`.
+/// Using `serde_json` end-to-end avoids hand-rolled escape drift
+/// between the preview and the dispatcher.
+pub(crate) fn gitlab_pipeline_body(branch: &str, inputs: &[(String, String)]) -> String {
+    let vars: Vec<serde_json::Value> = inputs
+        .iter()
+        .filter(|(k, _)| !k.is_empty())
+        .map(|(k, v)| {
+            serde_json::json!({
+                "key": k,
+                "value": v,
+            })
+        })
+        .collect();
+    let mut payload = serde_json::Map::new();
+    payload.insert(
+        "ref".to_string(),
+        serde_json::Value::String(branch.to_string()),
+    );
+    if !vars.is_empty() {
+        payload.insert("variables".to_string(), serde_json::Value::Array(vars));
     }
-    out
-}
-
-fn escape_shell_double(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"")
+    serde_json::to_string(&serde_json::Value::Object(payload))
+        .unwrap_or_else(|_| "{\"ref\":\"\"}".to_string())
 }
 
 /// Escape into a shell single-quoted context: close the quote, emit an
-/// escaped single quote, and reopen. Used by the GitHub curl preview
-/// for the ref value.
+/// escaped single quote, and reopen. Used by the curl preview so the
+/// one-liner round-trips a branch / body that contains `'`.
 fn escape_shell_single(s: &str) -> String {
     s.replace('\'', "'\\''")
+}
+
+/// Split a "a/b" slug into its two components. Returns `None` when the
+/// slug isn't the expected shape (e.g. `<unresolved>`), letting the
+/// caller choose a fallback rather than rendering garbage.
+fn split_slug(slug: &str) -> Option<(String, String)> {
+    let (a, b) = slug.split_once('/')?;
+    if a.is_empty() || b.is_empty() {
+        return None;
+    }
+    Some((a.to_string(), b.to_string()))
 }
 
 /// Resolve repo info for the Trigger tab. Shells out to `git remote`
@@ -3071,41 +3181,84 @@ mod tests {
     }
 
     #[test]
-    fn inputs_to_json_is_empty_for_empty_and_skips_blank_keys() {
-        assert_eq!(inputs_to_json(&[]), "{}");
-        assert_eq!(inputs_to_json(&[(String::new(), "ignored".into())]), "{}");
+    fn github_dispatches_body_matches_dispatcher_shape() {
+        // Empty inputs: still emits an empty `inputs: {}` object
+        // because the dispatcher unconditionally sets the key.
+        let body = github_dispatches_body("main", &[]);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["ref"], "main");
+        assert!(v["inputs"].as_object().unwrap().is_empty());
+
+        // Empty keys are filtered (the dispatcher would discard them).
+        let body = github_dispatches_body(
+            "release",
+            &[
+                ("env".into(), "prod".into()),
+                (String::new(), "dropped".into()),
+            ],
+        );
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["inputs"]["env"], "prod");
+        assert!(v["inputs"].as_object().unwrap().get("").is_none());
     }
 
     #[test]
-    fn inputs_to_json_escapes_control_chars_via_serde_json() {
-        // The original hand-rolled escaper only handled `\` and `"`.
-        // serde_json handles the full JSON spec — newlines, tabs,
-        // quotes, backslashes — and we verify the round-trip.
-        let out = inputs_to_json(&[("key".into(), "line1\nline2\t\"quoted\"\\slash".into())]);
+    fn github_dispatches_body_escapes_control_chars_via_serde_json() {
+        // Branch and value strings may contain quotes, backslashes,
+        // or newlines; the preview must survive them round-tripped
+        // through `serde_json::from_str`.
+        let body = github_dispatches_body(
+            "feat/with\"quote",
+            &[("key".into(), "line1\nline2\t\"quoted\"\\slash".into())],
+        );
         let parsed: serde_json::Value =
-            serde_json::from_str(&out).expect("inputs_to_json must produce valid JSON");
+            serde_json::from_str(&body).expect("body must be valid JSON");
+        assert_eq!(parsed["ref"], "feat/with\"quote");
+        assert_eq!(parsed["inputs"]["key"], "line1\nline2\t\"quoted\"\\slash");
+    }
+
+    #[test]
+    fn gitlab_pipeline_body_matches_dispatcher_shape() {
+        // Empty inputs: no `variables` key at all (mirrors the
+        // dispatcher which only adds the field when there's data).
+        let body = gitlab_pipeline_body("main", &[]);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["ref"], "main");
+        assert!(v.get("variables").is_none());
+
+        // Populated inputs: variables is an array of {key,value}
+        // objects — exactly what /api/v4/projects/:id/pipeline expects.
+        let body = gitlab_pipeline_body(
+            "release",
+            &[
+                ("K".into(), "has \"quote\"".into()),
+                (String::new(), "dropped".into()), // empty keys filtered
+                ("OTHER".into(), "v".into()),
+            ],
+        );
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["ref"], "release");
+        let vars = v["variables"].as_array().expect("variables array");
+        assert_eq!(vars.len(), 2);
+        assert_eq!(vars[0]["key"], "K");
+        assert_eq!(vars[0]["value"], "has \"quote\"");
+        assert_eq!(vars[1]["key"], "OTHER");
+    }
+
+    #[test]
+    fn split_slug_rejects_non_two_part_slugs() {
         assert_eq!(
-            parsed.get("key").and_then(|v| v.as_str()),
-            Some("line1\nline2\t\"quoted\"\\slash")
+            split_slug("owner/repo"),
+            Some(("owner".into(), "repo".into()))
         );
-    }
-
-    #[test]
-    fn gitlab_vars_form_escapes_quotes_and_backslashes() {
-        let out = gitlab_vars_form(&[("K".into(), "has \"quote\"".into())]);
-        // Value's double-quote must be escaped so the enclosing shell
-        // double-quoted string stays intact.
-        assert!(
-            out.contains("has \\\"quote\\\""),
-            "embedded quote not escaped: {}",
-            out
+        assert_eq!(split_slug("<unresolved>"), None);
+        assert_eq!(split_slug("/repo"), None);
+        assert_eq!(split_slug("owner/"), None);
+        // Deeper paths keep first slash only (valid for GitLab groups).
+        assert_eq!(
+            split_slug("group/subgroup/project"),
+            Some(("group".into(), "subgroup/project".into()))
         );
-    }
-
-    #[test]
-    fn gitlab_vars_form_skips_empty_keys() {
-        let out = gitlab_vars_form(&[(String::new(), "v".into()), ("k".into(), "v".into())]);
-        assert_eq!(out, " -F \"variables[k]=v\"");
     }
 
     #[test]
@@ -3208,27 +3361,98 @@ mod tests {
     }
 
     #[test]
-    fn trigger_dispatch_sets_in_flight_flag_and_rejects_concurrent_calls() {
-        // We can't easily let the spawned task complete without a real
-        // tokio runtime, so assert the synchronous guard: after one
-        // dispatch, the flag is armed and a repeat call emits the
-        // "already in flight" status message without spawning again.
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            let mut app = make_app();
-            app.trigger_workflow_idx = 0;
-            app.trigger_dispatch();
-            assert!(app.trigger_in_flight.load(Ordering::SeqCst));
-            let before_status = app.status_message.clone();
-            app.trigger_dispatch();
-            // Second call must set an error message, not a second spawn.
-            assert_ne!(app.status_message, before_status);
-            assert!(app
-                .status_message
-                .as_deref()
-                .unwrap_or("")
-                .contains("already in flight"));
+    fn trigger_dispatch_rejects_when_already_in_flight() {
+        // Strictly exercise the synchronous guard — pre-arm the flag
+        // rather than spawning a tokio task. This keeps the test off
+        // the network regardless of `GITHUB_TOKEN` being set in the
+        // environment, and runs without a tokio runtime.
+        let mut app = make_app();
+        app.trigger_workflow_idx = 0;
+        app.trigger_in_flight.store(true, Ordering::SeqCst);
+        let before_status = app.status_message.clone();
+        app.trigger_dispatch();
+        assert_ne!(app.status_message, before_status);
+        assert!(app
+            .status_message
+            .as_deref()
+            .unwrap_or("")
+            .contains("already in flight"));
+    }
+
+    #[test]
+    fn drain_trigger_outcomes_maps_success_and_failure_to_status_bar() {
+        let mut app = make_app();
+        // Success: info message.
+        app.trigger_outcome_tx
+            .send(DispatchOutcome {
+                platform: TriggerPlatform::Github,
+                workflow: "ci".into(),
+                result: Ok(()),
+            })
+            .unwrap();
+        app.drain_trigger_outcomes();
+        assert_eq!(app.status_message_severity, StatusSeverity::Info);
+        assert!(app
+            .status_message
+            .as_deref()
+            .unwrap_or("")
+            .contains("Dispatched ci"));
+
+        // Failure: error message overwrites the earlier info.
+        app.trigger_outcome_tx
+            .send(DispatchOutcome {
+                platform: TriggerPlatform::Gitlab,
+                workflow: "deploy".into(),
+                result: Err("401 Unauthorized".into()),
+            })
+            .unwrap();
+        app.drain_trigger_outcomes();
+        assert_eq!(app.status_message_severity, StatusSeverity::Error);
+        assert!(app
+            .status_message
+            .as_deref()
+            .unwrap_or("")
+            .contains("Dispatch deploy on gitlab failed"));
+    }
+
+    #[test]
+    fn trigger_curl_preview_github_uses_resolved_repo_and_escapes_branch() {
+        let mut app = make_app();
+        app.trigger_target_cache = Some(TriggerTarget {
+            platform_label: "GitHub".into(),
+            repo_label: "bahdotsh/wrkflw".into(),
+            default_branch: "main".into(),
+            note: None,
         });
+        app.trigger_branch = "release/1.0".into();
+        app.trigger_inputs = vec![("env".into(), "prod".into())];
+        let curl = app.trigger_curl_preview();
+        assert!(curl.contains("repos/bahdotsh/wrkflw/actions/workflows/ci.yml/dispatches"));
+        assert!(curl.contains("\"ref\":\"release/1.0\""));
+        assert!(curl.contains("\"env\":\"prod\""));
+    }
+
+    #[test]
+    fn trigger_curl_preview_gitlab_hits_pipeline_endpoint_not_trigger() {
+        let mut app = make_app();
+        app.trigger_platform = TriggerPlatform::Gitlab;
+        app.trigger_target_cache = Some(TriggerTarget {
+            platform_label: "GitLab".into(),
+            repo_label: "group/project".into(),
+            default_branch: "main".into(),
+            note: None,
+        });
+        app.trigger_branch = "main".into();
+        app.trigger_inputs = vec![("K".into(), "V".into())];
+        let curl = app.trigger_curl_preview();
+        // Real dispatcher hits `/pipeline`, not `/trigger/pipeline`.
+        assert!(curl.contains("/projects/group%2Fproject/pipeline"));
+        assert!(!curl.contains("/trigger/pipeline"));
+        assert!(curl.contains("PRIVATE-TOKEN: $GITLAB_TOKEN"));
+        // Body shape matches `{"ref":"…","variables":[{"key":…,"value":…}]}`.
+        assert!(curl.contains("\"ref\":\"main\""));
+        assert!(curl.contains("\"key\":\"K\""));
+        assert!(curl.contains("\"value\":\"V\""));
     }
 
     #[test]

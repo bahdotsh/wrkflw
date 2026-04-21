@@ -3596,6 +3596,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "thiserror",
+ "wrkflw-logging",
  "wrkflw-models",
 ]
 
@@ -3611,6 +3612,7 @@ dependencies = [
  "serde_yaml",
  "thiserror",
  "urlencoding",
+ "wrkflw-logging",
  "wrkflw-models",
 ]
 
@@ -3737,6 +3739,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "tokio",
+ "urlencoding",
  "wrkflw-evaluator",
  "wrkflw-executor",
  "wrkflw-github",

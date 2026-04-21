@@ -141,7 +141,9 @@ use wrkflw_executor::{JobStatus, StepStatus};
 
 pub fn workflow_status(status: &WorkflowStatus) -> (&'static str, Style) {
     match status {
-        WorkflowStatus::NotStarted => (symbols::NOT_STARTED, Style::default().fg(COLORS.text_muted)),
+        WorkflowStatus::NotStarted => {
+            (symbols::NOT_STARTED, Style::default().fg(COLORS.text_muted))
+        }
         WorkflowStatus::Running => (symbols::RUNNING, Style::default().fg(COLORS.info)),
         WorkflowStatus::Success => (symbols::SUCCESS, Style::default().fg(COLORS.success)),
         WorkflowStatus::Failed => (symbols::FAILURE, Style::default().fg(COLORS.error)),

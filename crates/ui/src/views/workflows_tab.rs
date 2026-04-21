@@ -57,9 +57,7 @@ fn render_workflow_list(f: &mut Frame<'_>, app: &mut App, area: Rect) {
             let (status_symbol, status_style) =
                 theme::workflow_status_animated(&workflow.status, spinner_frame);
             let (trigger_symbol, trigger_style) = match &workflow.trigger_match {
-                Some(TriggerMatchStatus::Matched(_)) => {
-                    ("●", Style::default().fg(COLORS.success))
-                }
+                Some(TriggerMatchStatus::Matched(_)) => ("●", Style::default().fg(COLORS.success)),
                 Some(TriggerMatchStatus::Skipped(_)) => {
                     ("○", Style::default().fg(COLORS.text_muted))
                 }
@@ -94,8 +92,7 @@ fn render_workflow_list(f: &mut Frame<'_>, app: &mut App, area: Rect) {
                         .add_modifier(Modifier::BOLD),
                 ),
                 Cell::from(path_shortened).style(theme::muted_style()),
-                Cell::from(format!("{}", jobs_n))
-                    .style(Style::default().fg(COLORS.text_muted)),
+                Cell::from(format!("{}", jobs_n)).style(Style::default().fg(COLORS.text_muted)),
             ])
         })
         .collect();
@@ -202,11 +199,7 @@ fn render_preview(f: &mut Frame<'_>, app: &App, area: Rect) {
             ));
             badges.push(Span::raw(" "));
         }
-        let matrix_jobs = def
-            .jobs
-            .values()
-            .filter(|j| j.strategy.is_some())
-            .count();
+        let matrix_jobs = def.jobs.values().filter(|j| j.strategy.is_some()).count();
         if matrix_jobs > 0 {
             badges.push(theme::badge_outline(
                 format!("matrix: {}", matrix_jobs),
@@ -292,14 +285,18 @@ fn render_trigger_filter(f: &mut Frame<'_>, app: &App, area: Rect) {
                 Span::raw(" matches → "),
                 Span::styled(
                     format!("{}", matched),
-                    Style::default().fg(COLORS.text).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(COLORS.text)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw("   "),
                 Span::styled("○", Style::default().fg(COLORS.text_muted)),
                 Span::raw(" skipped → "),
                 Span::styled(
                     format!("{}", skipped),
-                    Style::default().fg(COLORS.text).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(COLORS.text)
+                        .add_modifier(Modifier::BOLD),
                 ),
             ]),
         ];
@@ -313,10 +310,7 @@ fn render_trigger_filter(f: &mut Frame<'_>, app: &App, area: Rect) {
             Line::from(vec![
                 Span::styled("press ", Style::default().fg(COLORS.text_dim)),
                 theme::key_chip("d"),
-                Span::styled(
-                    " to enable",
-                    Style::default().fg(COLORS.text_dim),
-                ),
+                Span::styled(" to enable", Style::default().fg(COLORS.text_dim)),
             ]),
         ];
         f.render_widget(Paragraph::new(lines), inner_area);

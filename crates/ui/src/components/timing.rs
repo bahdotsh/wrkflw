@@ -62,10 +62,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, rows: &[TimingRow]) {
                     .fg(COLORS.text_muted)
                     .add_modifier(Modifier::DIM),
             ),
-            Span::styled(
-                summarise(rows),
-                Style::default().fg(COLORS.text_dim),
-            ),
+            Span::styled(summarise(rows), Style::default().fg(COLORS.text_dim)),
         ]));
     }
     frame.render_widget(Paragraph::new(lines), area);

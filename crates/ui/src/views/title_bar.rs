@@ -39,10 +39,7 @@ pub fn render_title_bar(f: &mut Frame<'_>, app: &App, area: Rect) {
 
     // ─── Tabs ─────────────────────────────────────────────────
     let mut tab_spans: Vec<Span> = Vec::with_capacity(TAB_LABELS.len() * 4);
-    tab_spans.push(Span::styled(
-        " │ ",
-        Style::default().fg(COLORS.border),
-    ));
+    tab_spans.push(Span::styled(" │ ", Style::default().fg(COLORS.border)));
     for (i, label) in TAB_LABELS.iter().enumerate() {
         let active = i == app.selected_tab;
         tab_spans.push(Span::styled(

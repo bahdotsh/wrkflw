@@ -158,8 +158,14 @@ fn render_jobs_pane(f: &mut Frame<'_>, app: &App, idx: usize, area: Rect) {
         let job_exec = exec.and_then(|e| e.jobs.iter().find(|j| j.name == *name));
         let (sym, sym_style) = match (job_exec, active_name.as_deref() == Some(name)) {
             (Some(j), _) => theme::job_status(&j.status),
-            (None, true) => (theme::spinner(app.spinner_frame), Style::default().fg(COLORS.info)),
-            (None, false) => (theme::symbols::NOT_STARTED, Style::default().fg(COLORS.text_muted)),
+            (None, true) => (
+                theme::spinner(app.spinner_frame),
+                Style::default().fg(COLORS.info),
+            ),
+            (None, false) => (
+                theme::symbols::NOT_STARTED,
+                Style::default().fg(COLORS.text_muted),
+            ),
         };
         let is_selected = i == app.job_list_state.selected().unwrap_or(0);
         let row_style = if is_selected {
@@ -197,13 +203,21 @@ fn render_jobs_pane(f: &mut Frame<'_>, app: &App, idx: usize, area: Rect) {
         })
         .unwrap_or(0);
     let failed = exec
-        .map(|e| e.jobs.iter().filter(|j| matches!(j.status, JobStatus::Failure)).count())
+        .map(|e| {
+            e.jobs
+                .iter()
+                .filter(|j| matches!(j.status, JobStatus::Failure))
+                .count()
+        })
         .unwrap_or(0);
     let pending = total.saturating_sub(done + failed);
 
     lines.push(Line::from(""));
     lines.push(Line::from(vec![
-        Span::styled(format!("{}/{}", done, total), Style::default().fg(COLORS.success)),
+        Span::styled(
+            format!("{}/{}", done, total),
+            Style::default().fg(COLORS.success),
+        ),
         Span::styled(" done · ", Style::default().fg(COLORS.text_muted)),
         Span::styled(format!("{}", failed), Style::default().fg(COLORS.error)),
         Span::styled(" failed · ", Style::default().fg(COLORS.text_muted)),
@@ -296,20 +310,14 @@ fn render_live_output_pane(f: &mut Frame<'_>, app: &App, area: Rect) {
                 Style::default().fg(COLORS.text_muted),
             ));
             spans.push(Span::raw(" "));
-            spans.push(Span::styled(
-                entry.log_type.clone(),
-                entry.log_style,
-            ));
+            spans.push(Span::styled(entry.log_type.clone(), entry.log_style));
             spans.push(Span::raw(" "));
             spans.extend(entry.content_spans.iter().cloned());
             Line::from(spans)
         })
         .collect();
 
-    f.render_widget(
-        Paragraph::new(lines).wrap(Wrap { trim: false }),
-        inner_area,
-    );
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner_area);
 }
 
 // ─── Mini DAG pane (right top) ────────────────────────────────────
@@ -438,15 +446,15 @@ fn render_empty_state(f: &mut Frame<'_>, area: Rect) {
             Line::from(""),
             Line::from(vec![
                 Span::styled("Switch to ", Style::default().fg(COLORS.text_muted)),
-                Span::styled(
-                    "Workflows",
-                    Style::default().fg(COLORS.accent),
-                ),
+                Span::styled("Workflows", Style::default().fg(COLORS.accent)),
                 Span::styled(" and press ", Style::default().fg(COLORS.text_muted)),
                 theme::key_chip("r"),
                 Span::styled(" to run, or ", Style::default().fg(COLORS.text_muted)),
                 theme::key_chip("t"),
-                Span::styled(" to trigger remotely.", Style::default().fg(COLORS.text_muted)),
+                Span::styled(
+                    " to trigger remotely.",
+                    Style::default().fg(COLORS.text_muted),
+                ),
             ]),
         ])
         .alignment(Alignment::Center),

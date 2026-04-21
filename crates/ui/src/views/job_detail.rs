@@ -132,10 +132,7 @@ fn render_tab_strip(f: &mut Frame<'_>, active: usize, area: Rect) {
             },
         ));
         if i + 1 < TABS.len() {
-            spans.push(Span::styled(
-                "·",
-                Style::default().fg(COLORS.text_muted),
-            ));
+            spans.push(Span::styled("·", Style::default().fg(COLORS.text_muted)));
         }
     }
     spans.push(Span::raw("  "));
@@ -251,13 +248,15 @@ fn render_step_stdout(
     }
     let lines: Vec<Line> = output
         .split('\n')
-        .map(|l| Line::from(Span::styled(l.to_string(), Style::default().fg(COLORS.text_dim))))
+        .map(|l| {
+            Line::from(Span::styled(
+                l.to_string(),
+                Style::default().fg(COLORS.text_dim),
+            ))
+        })
         .collect();
 
-    f.render_widget(
-        Paragraph::new(lines).wrap(Wrap { trim: false }),
-        inner_area,
-    );
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner_area);
 }
 
 // ─── Env pane (placeholder) ───────────────────────────────────────

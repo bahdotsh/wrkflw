@@ -173,10 +173,7 @@ pub fn render<F: Fn(&str) -> NodeState>(
                         color
                     }),
                 ),
-                Span::styled(
-                    active_marker.to_string(),
-                    Style::default().fg(COLORS.info),
-                ),
+                Span::styled(active_marker.to_string(), Style::default().fg(COLORS.info)),
             ]));
         }
     }

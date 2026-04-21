@@ -230,14 +230,16 @@ fn render_graph(
                 "╭────────────────╮",
                 Style::default().fg(color),
             )]));
-            let truncated = truncate(name, 12);
-            let padding = 12usize.saturating_sub(truncated.chars().count());
+            // Distinct name from the outer `truncated` stage-count
+            // binding so the shadow doesn't mislead a future reader.
+            let short_name = truncate(name, 12);
+            let padding = 12usize.saturating_sub(short_name.chars().count());
             lines.push(Line::from(vec![
                 Span::styled("│ ", Style::default().fg(color)),
                 Span::styled(glyph.to_string(), Style::default().fg(color)),
                 Span::raw(" "),
                 Span::styled(
-                    truncated,
+                    short_name,
                     Style::default()
                         .fg(if matches!(st, NodeState::Running) {
                             COLORS.text

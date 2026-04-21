@@ -108,16 +108,6 @@ pub fn title_style() -> Style {
         .add_modifier(Modifier::BOLD)
 }
 
-pub fn brand_style() -> Style {
-    Style::default()
-        .fg(COLORS.accent)
-        .add_modifier(Modifier::BOLD)
-}
-
-pub fn label_style() -> Style {
-    Style::default().fg(COLORS.accent)
-}
-
 pub fn selected_style() -> Style {
     Style::default()
         .bg(COLORS.bg_selected)
@@ -249,7 +239,9 @@ impl BadgeKind {
             BadgeKind::Warning => COLORS.warning,
             BadgeKind::Trigger => COLORS.trigger,
             BadgeKind::Dim => COLORS.text_dim,
-            BadgeKind::Accent => COLORS.accent,
+            // Resolve dynamically so Tweaks accent changes recolor
+            // `BadgeKind::Accent` call sites in the same frame.
+            BadgeKind::Accent => current_accent(),
             BadgeKind::Highlight => COLORS.highlight,
             BadgeKind::Docker => COLORS.runtime_docker,
             BadgeKind::Podman => COLORS.runtime_podman,

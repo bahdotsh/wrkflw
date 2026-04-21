@@ -98,3 +98,27 @@ pub fn render_ui(f: &mut Frame<'_>, app: &mut App) {
         tweaks_overlay::render_tweaks_overlay(f, app, size);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::AccentScope;
+    use crate::theme::{self, COLORS};
+    use ratatui::style::Color;
+
+    #[test]
+    fn accent_scope_clears_thread_local_on_drop() {
+        // Regression guard: the thread-local accent override is a
+        // per-frame handoff, not a setting. Installing it and dropping
+        // the guard must restore `current_accent()` to the static
+        // palette so later code (tests, alternate backends, the next
+        // frame) doesn't inherit stale state. Without this contract a
+        // test that renders with a Tweaks accent installed could leak
+        // the override into every subsequent test on the same thread.
+        assert_eq!(theme::current_accent(), COLORS.accent);
+        {
+            let _guard = AccentScope::install(Color::Rgb(0xff, 0x00, 0x00));
+            assert_eq!(theme::current_accent(), Color::Rgb(0xff, 0x00, 0x00));
+        }
+        assert_eq!(theme::current_accent(), COLORS.accent);
+    }
+}

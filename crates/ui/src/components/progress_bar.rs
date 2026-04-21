@@ -1,5 +1,5 @@
 // Progress bar component
-use crate::theme::COLORS;
+use crate::theme::{self, COLORS};
 use ratatui::{
     style::{Color, Style},
     widgets::Gauge,
@@ -18,7 +18,7 @@ impl ProgressBar {
         ProgressBar {
             progress: progress.clamp(0.0, 1.0),
             label: None,
-            color: COLORS.accent,
+            color: theme::current_accent(),
         }
     }
 

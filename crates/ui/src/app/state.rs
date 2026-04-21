@@ -2121,9 +2121,21 @@ impl App {
     /// Render the would-be POST into the log buffer so the user has a
     /// recipe they can paste. Non-destructive; doesn't hit the
     /// network.
+    ///
+    /// The preview is a multi-line string joined with ` \\\n`; the
+    /// logs pane renders one `Vec<String>` entry per line, so we split
+    /// before pushing. Otherwise the embedded newline lands in a
+    /// single entry and the log widget either collapses the break or
+    /// spills the entry across rows in a way the user can't copy.
     pub fn trigger_tab_copy_curl(&mut self) {
         let curl = self.trigger_curl_preview();
-        self.logs.push(format!("curl: {}", curl));
+        let mut lines = curl.lines();
+        if let Some(first) = lines.next() {
+            self.logs.push(format!("curl: {}", first));
+        }
+        for rest in lines {
+            self.logs.push(format!("curl: {}", rest));
+        }
         self.trim_logs_to_cap();
     }
 
@@ -2155,6 +2167,14 @@ impl App {
                 // The dispatcher posts to
                 //   /repos/{owner}/{repo}/actions/workflows/{wf}.yml/dispatches
                 // with JSON body `{"ref": "...", "inputs": {...}}`.
+                //
+                // owner/repo come from `git remote` and the workflow name
+                // comes from the user's filesystem. Neither is strongly
+                // constrained, so URL-encode each path segment before
+                // interpolating so the user can copy-paste the preview
+                // without ever pasting shell metacharacters we didn't
+                // vet. `encode` handles `/` → `%2F` which is what
+                // GitHub's REST API expects anyway.
                 let (owner, repo) = self
                     .trigger_target_cache
                     .as_ref()
@@ -2162,6 +2182,9 @@ impl App {
                     .unwrap_or(("<owner>".to_string(), "<repo>".to_string()));
                 let body = github_dispatches_body(&branch_raw, &self.trigger_inputs);
                 let wf_stripped = strip_yaml_suffix(wf);
+                let enc_owner = urlencoding::encode(&owner);
+                let enc_repo = urlencoding::encode(&repo);
+                let enc_wf = urlencoding::encode(wf_stripped);
                 let escaped = escape_shell_single(&body);
                 [
                     "curl -X POST".to_string(),
@@ -2169,10 +2192,7 @@ impl App {
                     "  -H \"Accept: application/vnd.github+json\"".to_string(),
                     "  -H \"Content-Type: application/json\"".to_string(),
                     format!(
-                        "  https://api.github.com/repos/{owner}/{repo}/actions/workflows/{wf}.yml/dispatches",
-                        owner = owner,
-                        repo = repo,
-                        wf = wf_stripped,
+                        "  https://api.github.com/repos/{enc_owner}/{enc_repo}/actions/workflows/{enc_wf}.yml/dispatches",
                     ),
                     format!("  -d '{body}'", body = escaped),
                 ]
@@ -2336,7 +2356,10 @@ impl App {
         }
         if let Some(outcome) = last {
             match outcome.result {
-                Ok(_) => self.set_info_message(format!(
+                // Success severity (green) makes a completed dispatch
+                // visually distinct from the cyan "dispatch queued"
+                // info messages that share the Trigger tab's accent.
+                Ok(_) => self.set_success_message(format!(
                     "Dispatched {} on {}",
                     outcome.workflow,
                     outcome.platform.as_str()
@@ -3598,6 +3621,34 @@ mod tests {
     }
 
     #[test]
+    fn trigger_handle_input_key_lets_enter_tab_fall_through_on_input_rows() {
+        // Enter/Tab/BackTab must return `false` from the edit handler
+        // so the surrounding event loop can commit the edit (Enter via
+        // `trigger_tab_enter`) or advance the field cursor (Tab via
+        // `trigger_tab_next_field`). The mirror contract is already
+        // covered for branch-field editing in
+        // `trigger_tab_edit_branch_writes_into_trigger_branch`; this
+        // test pins the input-row path so a future edit-handler
+        // refactor can't silently consume the commit/advance key.
+        let mut app = make_app();
+        app.trigger_tab_add_input();
+        app.trigger_inputs[0].0 = "env".into();
+        app.trigger_inputs[0].1 = "prod".into();
+        app.trigger_input_on_value = true;
+        for code in [KeyCode::Enter, KeyCode::Tab, KeyCode::BackTab] {
+            assert!(
+                !app.trigger_handle_input_key(code),
+                "{:?} must fall through to the global handler on an input row",
+                code
+            );
+        }
+        // The buffer is untouched — those three keys are routing
+        // signals, not content.
+        assert_eq!(app.trigger_inputs[0].0, "env");
+        assert_eq!(app.trigger_inputs[0].1, "prod");
+    }
+
+    #[test]
     fn trigger_handle_input_key_swallows_arrows_so_they_dont_cycle_workflow() {
         // Regression: pre-fix, Up/Down/Left/Right fell through from
         // the edit handler to the global key map, which maps them to
@@ -3672,7 +3723,9 @@ mod tests {
     #[test]
     fn drain_trigger_outcomes_maps_success_and_failure_to_status_bar() {
         let mut app = make_app();
-        // Success: info message.
+        // Success: success (green) severity so a completed dispatch is
+        // visually distinct from the cyan "queued" info messages that
+        // share the Trigger tab's accent color.
         app.trigger_outcome_tx
             .send(DispatchOutcome {
                 platform: TriggerPlatform::Github,
@@ -3681,7 +3734,7 @@ mod tests {
             })
             .unwrap();
         app.drain_trigger_outcomes();
-        assert_eq!(app.status_message_severity, StatusSeverity::Info);
+        assert_eq!(app.status_message_severity, StatusSeverity::Success);
         assert!(app
             .status_message
             .as_deref()
@@ -3720,6 +3773,80 @@ mod tests {
         assert!(curl.contains("repos/bahdotsh/wrkflw/actions/workflows/ci.yml/dispatches"));
         assert!(curl.contains("\"ref\":\"release/1.0\""));
         assert!(curl.contains("\"env\":\"prod\""));
+    }
+
+    #[test]
+    fn trigger_curl_preview_falls_back_to_angle_bracket_placeholders_with_no_cache() {
+        // Regression: on first render after a tab switch the target
+        // cache is None. The preview must show `<owner>/<repo>` (and
+        // for GitLab `<namespace>/<project>`) rather than silently
+        // stale-filling an old value or panicking. Users lean on the
+        // angle brackets as a visual cue that resolution is pending.
+        let mut app = make_app();
+        assert!(app.trigger_target_cache.is_none());
+        let gh = app.trigger_curl_preview();
+        assert!(
+            gh.contains("repos/%3Cowner%3E/%3Crepo%3E/"),
+            "GitHub fallback must url-encode the <owner>/<repo> placeholders, got {}",
+            gh
+        );
+
+        app.trigger_platform = TriggerPlatform::Gitlab;
+        let gl = app.trigger_curl_preview();
+        assert!(
+            gl.contains("/projects/%3Cnamespace%3E%2F%3Cproject%3E/pipeline"),
+            "GitLab fallback must url-encode the <namespace>/<project> placeholders, got {}",
+            gl
+        );
+    }
+
+    #[test]
+    fn trigger_curl_preview_github_url_encodes_path_segments() {
+        // Security: owner/repo come from `git remote` and the workflow
+        // name comes from the user's filesystem. Neither is strongly
+        // constrained, so the preview (which we explicitly invite the
+        // user to copy-paste) must run every segment through
+        // `urlencoding::encode` — otherwise a workflow filename
+        // containing shell metacharacters could produce a copy-paste
+        // that executes unintended commands.
+        let mut app = make_app();
+        app.trigger_target_cache = Some(TriggerTarget {
+            platform_label: "GitHub".into(),
+            repo_label: "bah dotsh/wrk;flw".into(),
+            default_branch: "main".into(),
+            note: None,
+        });
+        // Rename the selected workflow so its name exercises the
+        // encoder: spaces → %20, `;` → %3B, `/` → %2F.
+        app.workflows[0].name = "ci step/one.yml".to_string();
+        let curl = app.trigger_curl_preview();
+        assert!(
+            curl.contains("repos/bah%20dotsh/wrk%3Bflw/"),
+            "owner/repo must be url-encoded, got {}",
+            curl
+        );
+        assert!(
+            curl.contains("actions/workflows/ci%20step%2Fone.yml/dispatches"),
+            "workflow name must be url-encoded, got {}",
+            curl
+        );
+        // The raw `;` and space must NOT appear unescaped anywhere in
+        // the URL path — those are the characters that would make a
+        // copy-paste unsafe.
+        let url_line = curl
+            .lines()
+            .find(|l| l.contains("api.github.com"))
+            .expect("preview must contain the api.github.com line");
+        assert!(
+            !url_line.contains("wrk;flw"),
+            "raw `;` must not appear in the url line, got {}",
+            url_line
+        );
+        assert!(
+            !url_line.contains("ci step"),
+            "raw space must not appear in the url line, got {}",
+            url_line
+        );
     }
 
     #[test]

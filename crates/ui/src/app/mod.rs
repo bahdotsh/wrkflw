@@ -441,31 +441,29 @@ fn run_tui_event_loop(
                         }
                     }
                     KeyCode::Char('r') => {
-                        // Check if shift is pressed - this might be receiving the reset command
+                        // Some terminals deliver Shift+r as lowercase
+                        // `r` plus a SHIFT modifier instead of
+                        // uppercase `R` (see the `R` arm below).
+                        // Route both encodings to the reset path so
+                        // users don't have to reason about what their
+                        // terminal emits.
                         if key.modifiers.contains(KeyModifiers::SHIFT) {
-                            let timestamp = Local::now().format("%H:%M:%S").to_string();
-                            app.logs.push(format!(
-                                "[{}] DEBUG: Shift+r detected - this should be uppercase R",
-                                timestamp
-                            ));
-                            wrkflw_logging::info(
-                                "Shift+r detected as lowercase - this should be uppercase R",
-                            );
-
                             if !app.running {
-                                // Reset workflow status with Shift+r
-                                app.logs.push(format!(
-                                    "[{}] Attempting to reset workflow status via Shift+r...",
-                                    timestamp
-                                ));
                                 app.reset_workflow_status();
-
-                                // Force redraw to update UI immediately
                                 terminal.draw(|f| {
                                     render_ui(f, app);
                                 })?;
                             }
-                        } else if !app.running && !app.job_selection_mode {
+                        } else if !app.running
+                            && !app.job_selection_mode
+                            && app.selected_tab == TAB_WORKFLOWS
+                        {
+                            // Plain `r` queues the selected workflow
+                            // for execution — a Workflows-tab action.
+                            // Gate on the active tab so `r` typed on
+                            // the DAG/Trigger/Secrets tabs doesn't
+                            // silently mutate queue state behind the
+                            // user's back.
                             app.queue_selected_for_execution();
                             app.start_execution();
                         }
@@ -475,8 +473,13 @@ fn run_tui_event_loop(
                             if app.job_selection_mode {
                                 // In job selection mode, run all jobs
                                 app.run_from_job_selection(None);
-                            } else {
-                                // Select all workflows
+                            } else if app.selected_tab == TAB_WORKFLOWS {
+                                // Select-all is a Workflows-tab action.
+                                // Without this tab gate, pressing `a`
+                                // on DAG/Trigger/Secrets (outside edit
+                                // mode) would silently flip every
+                                // workflow to `selected` behind the
+                                // user's back.
                                 for workflow in &mut app.workflows {
                                     workflow.selected = true;
                                 }
@@ -531,30 +534,15 @@ fn run_tui_event_loop(
                         }
                     }
                     KeyCode::Char('R') => {
-                        let timestamp = Local::now().format("%H:%M:%S").to_string();
-                        app.logs.push(format!(
-                            "[{}] DEBUG: Reset key 'Shift+R' pressed",
-                            timestamp
-                        ));
-                        wrkflw_logging::info("Reset key 'Shift+R' pressed");
-
                         if !app.running {
-                            // Reset workflow status
-                            app.logs.push(format!(
-                                "[{}] Attempting to reset workflow status...",
-                                timestamp
-                            ));
                             app.reset_workflow_status();
-
-                            // Force redraw to update UI immediately
                             terminal.draw(|f| {
                                 render_ui(f, app);
                             })?;
                         } else {
-                            app.logs.push(format!(
-                                "[{}] Cannot reset workflow while another operation is running",
-                                timestamp
-                            ));
+                            app.add_timestamped_log(
+                                "Cannot reset workflow while another operation is running",
+                            );
                         }
                     }
                     KeyCode::Char('?') => {

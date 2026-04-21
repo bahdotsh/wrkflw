@@ -2165,26 +2165,30 @@ impl App {
         match self.trigger_platform {
             TriggerPlatform::Github => {
                 // The dispatcher posts to
-                //   /repos/{owner}/{repo}/actions/workflows/{wf}.yml/dispatches
-                // with JSON body `{"ref": "...", "inputs": {...}}`.
+                //   /repos/{owner}/{repo}/actions/workflows/{segment}/dispatches
+                // where `{segment}` is the bare basename-with-extension
+                // form produced by `wrkflw_github::workflow_dispatch_path_segment`.
+                // Going through the same helper as the dispatcher is
+                // load-bearing: it's what guarantees the copy-pasted
+                // curl lands on the identical endpoint the TUI will
+                // hit on Enter.
                 //
-                // owner/repo come from `git remote` and the workflow name
-                // comes from the user's filesystem. Neither is strongly
-                // constrained, so URL-encode each path segment before
-                // interpolating so the user can copy-paste the preview
-                // without ever pasting shell metacharacters we didn't
-                // vet. `encode` handles `/` → `%2F` which is what
-                // GitHub's REST API expects anyway.
+                // owner/repo come from `git remote`, so URL-encode
+                // each path segment before interpolating — that way
+                // shell metacharacters in a repo name (e.g. from a
+                // misconfigured remote) can't piggyback on the
+                // preview into a user's paste buffer.
                 let (owner, repo) = self
                     .trigger_target_cache
                     .as_ref()
                     .and_then(|t| split_slug(&t.repo_label))
                     .unwrap_or(("<owner>".to_string(), "<repo>".to_string()));
                 let body = github_dispatches_body(&branch_raw, &self.trigger_inputs);
-                let wf_stripped = strip_yaml_suffix(wf);
+                let wf_segment = wrkflw_github::workflow_dispatch_path_segment(wf)
+                    .unwrap_or_else(|| "<invalid>.yml".to_string());
                 let enc_owner = urlencoding::encode(&owner);
                 let enc_repo = urlencoding::encode(&repo);
-                let enc_wf = urlencoding::encode(wf_stripped);
+                let enc_wf = urlencoding::encode(&wf_segment);
                 let escaped = escape_shell_single(&body);
                 [
                     "curl -X POST".to_string(),
@@ -2192,7 +2196,7 @@ impl App {
                     "  -H \"Accept: application/vnd.github+json\"".to_string(),
                     "  -H \"Content-Type: application/json\"".to_string(),
                     format!(
-                        "  https://api.github.com/repos/{enc_owner}/{enc_repo}/actions/workflows/{enc_wf}.yml/dispatches",
+                        "  https://api.github.com/repos/{enc_owner}/{enc_repo}/actions/workflows/{enc_wf}/dispatches",
                     ),
                     format!("  -d '{body}'", body = escaped),
                 ]
@@ -2265,19 +2269,35 @@ impl App {
         ));
         self.trim_logs_to_cap();
 
-        // Flag flip happens before the spawn so rapid repeat Enters
-        // after this point see the flag and bail. The spawned task
-        // owns clearing it regardless of outcome.
+        // Flip the in-flight flag BEFORE the spawn so a rapid
+        // second Enter — dispatched from the same UI tick before
+        // the task has even started running — still sees the flag
+        // and bails at the `load` check above.
         self.trigger_in_flight.store(true, Ordering::SeqCst);
-        let in_flight = Arc::clone(&self.trigger_in_flight);
+        // Wrap the flag in a guard so its Drop impl is what actually
+        // clears it. `in_flight.store(false)` as a trailing
+        // statement only runs on normal return; if `reqwest` or the
+        // dispatcher panics, unwinding would skip it and strand the
+        // Trigger tab in "already in flight" until the TUI restarts.
+        let in_flight_guard = InFlightGuard::arm(Arc::clone(&self.trigger_in_flight));
         let outcome_tx = self.trigger_outcome_tx.clone();
 
         tokio::spawn(async move {
+            // Hold the in-flight guard for the full task lifetime.
+            // Drop clears the flag on every exit path — normal
+            // return, early `?`-style error return, *and* panic
+            // unwinding — so a panic inside `reqwest` or either
+            // dispatcher can't strand the Trigger tab in a
+            // permanent "already in flight" state.
+            let _in_flight_guard = in_flight_guard;
             let result = match platform {
                 TriggerPlatform::Github => {
-                    let wf = strip_yaml_suffix(&wf_name_raw).to_string();
+                    // Pass the raw identifier through — the
+                    // dispatcher normalizes it via
+                    // `workflow_dispatch_path_segment`, same as the
+                    // preview.
                     wrkflw_github::trigger_workflow(
-                        &wf,
+                        &wf_name_raw,
                         branch.as_deref(),
                         if inputs.is_empty() {
                             None
@@ -2303,15 +2323,14 @@ impl App {
                 Ok(_) => wrkflw_logging::info("Trigger dispatched successfully"),
                 Err(e) => wrkflw_logging::error(&format!("Trigger failed: {}", e)),
             }
-            // Send the outcome even if the in-flight flag can't find
-            // a receiver (e.g. App dropped) — the send is cheap and
-            // logging already covered the visible error path.
+            // Send the outcome even if the receiver is gone (e.g.
+            // App dropped) — the send is cheap and logging already
+            // covered the visible error path.
             let _ = outcome_tx.send(DispatchOutcome {
                 platform,
                 workflow: wf_name_raw,
                 result,
             });
-            in_flight.store(false, Ordering::SeqCst);
         });
     }
 
@@ -2406,6 +2425,36 @@ impl App {
 
 // ── Free helpers for the trigger curl preview ────────────────────
 
+/// RAII guard that owns the Trigger-tab in-flight flag for the
+/// lifetime of a single dispatch task. The flag is set to `true` by
+/// the caller BEFORE the spawn (so a second Enter on the same tick
+/// sees it and bails), and cleared here on Drop.
+///
+/// Putting the clear in a Drop impl — rather than as a trailing
+/// `store(false)` at the end of the spawned task — is what keeps
+/// the Trigger tab usable after an unexpected failure. `reqwest` or
+/// either dispatcher can panic (e.g. an internal assertion, an
+/// OOM-adjacent allocation failure, a bug in a future SDK update);
+/// if that happens, normal unwinding drops locals, the guard fires,
+/// and the flag returns to `false`. Without this, the tab locks into
+/// a permanent "already in flight" state and the user has to restart
+/// the TUI.
+struct InFlightGuard {
+    flag: Arc<AtomicBool>,
+}
+
+impl InFlightGuard {
+    fn arm(flag: Arc<AtomicBool>) -> Self {
+        Self { flag }
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.flag.store(false, Ordering::SeqCst);
+    }
+}
+
 /// Cached-resolve of the remote dispatch target. Owned by `App` so we
 /// can clear it on platform toggle instead of re-shelling `git remote`
 /// every frame.
@@ -2423,12 +2472,6 @@ pub struct TriggerTarget {
 /// just to bounds-check its cursor.
 pub fn secrets_provider_count() -> usize {
     SecretConfig::default().providers.len()
-}
-
-fn strip_yaml_suffix(name: &str) -> &str {
-    name.strip_suffix(".yml")
-        .or_else(|| name.strip_suffix(".yaml"))
-        .unwrap_or(name)
 }
 
 /// Serialize the trigger inputs into the JSON body shape that
@@ -3341,17 +3384,6 @@ mod tests {
     }
 
     #[test]
-    fn strip_yaml_suffix_handles_both_extensions_and_neither() {
-        assert_eq!(strip_yaml_suffix("ci.yml"), "ci");
-        assert_eq!(strip_yaml_suffix("ci.yaml"), "ci");
-        assert_eq!(strip_yaml_suffix("ci"), "ci");
-        assert_eq!(strip_yaml_suffix(""), "");
-        // Only the trailing suffix is stripped — embedded ".yml" inside
-        // a name stays.
-        assert_eq!(strip_yaml_suffix("my.yml.backup"), "my.yml.backup");
-    }
-
-    #[test]
     fn github_dispatches_body_matches_dispatcher_shape() {
         // Empty inputs: still emits an empty `inputs: {}` object
         // because the dispatcher unconditionally sets the key.
@@ -3801,14 +3833,19 @@ mod tests {
     }
 
     #[test]
-    fn trigger_curl_preview_github_url_encodes_path_segments() {
-        // Security: owner/repo come from `git remote` and the workflow
-        // name comes from the user's filesystem. Neither is strongly
-        // constrained, so the preview (which we explicitly invite the
-        // user to copy-paste) must run every segment through
-        // `urlencoding::encode` — otherwise a workflow filename
-        // containing shell metacharacters could produce a copy-paste
-        // that executes unintended commands.
+    fn trigger_curl_preview_github_matches_dispatcher_and_url_encodes_segments() {
+        // The preview MUST agree with what `wrkflw_github::trigger_workflow`
+        // actually POSTs — the user gets to copy-paste this string, and
+        // any divergence between the two is the exact "preview lies
+        // about the dispatch" failure mode this PR was built to close.
+        //
+        // Both paths route the workflow identifier through
+        // `workflow_dispatch_path_segment`, which: drops any subdir
+        // prefix (GitHub forbids subdirs under `.github/workflows/`
+        // anyway), preserves an existing `.yml`/`.yaml` suffix, and
+        // appends `.yml` when absent. The preview then url-encodes
+        // the segment so shell metacharacters in a filename can't
+        // ride a copy-paste into the user's terminal.
         let mut app = make_app();
         app.trigger_target_cache = Some(TriggerTarget {
             platform_label: "GitHub".into(),
@@ -3816,9 +3853,9 @@ mod tests {
             default_branch: "main".into(),
             note: None,
         });
-        // Rename the selected workflow so its name exercises the
-        // encoder: spaces → %20, `;` → %3B, `/` → %2F.
-        app.workflows[0].name = "ci step/one.yml".to_string();
+        // Subdir prefix must drop (dispatcher parity); space inside
+        // the basename must still be encoded (%20).
+        app.workflows[0].name = "subdir/ci step.yml".to_string();
         let curl = app.trigger_curl_preview();
         assert!(
             curl.contains("repos/bah%20dotsh/wrk%3Bflw/"),
@@ -3826,17 +3863,22 @@ mod tests {
             curl
         );
         assert!(
-            curl.contains("actions/workflows/ci%20step%2Fone.yml/dispatches"),
-            "workflow name must be url-encoded, got {}",
+            curl.contains("actions/workflows/ci%20step.yml/dispatches"),
+            "workflow segment must drop the subdir prefix and url-encode the rest, got {}",
             curl
         );
-        // The raw `;` and space must NOT appear unescaped anywhere in
-        // the URL path — those are the characters that would make a
-        // copy-paste unsafe.
         let url_line = curl
             .lines()
             .find(|l| l.contains("api.github.com"))
             .expect("preview must contain the api.github.com line");
+        // Subdir must not leak into the URL — the real dispatcher
+        // doesn't send it either.
+        assert!(
+            !url_line.contains("subdir"),
+            "subdir prefix must be stripped so the preview matches the dispatcher, got {}",
+            url_line
+        );
+        // Shell metacharacters must be encoded.
         assert!(
             !url_line.contains("wrk;flw"),
             "raw `;` must not appear in the url line, got {}",
@@ -3846,6 +3888,37 @@ mod tests {
             !url_line.contains("ci step"),
             "raw space must not appear in the url line, got {}",
             url_line
+        );
+        // The segment must use the shared helper: same input, same
+        // output on both sides.
+        let expected = wrkflw_github::workflow_dispatch_path_segment(&app.workflows[0].name)
+            .expect("shared helper must produce a segment");
+        assert!(
+            url_line.contains(&urlencoding::encode(&expected).to_string()),
+            "preview URL must contain the exact segment the dispatcher will POST, got {}",
+            url_line
+        );
+    }
+
+    #[test]
+    fn trigger_curl_preview_github_preserves_yaml_extension() {
+        // Regression: the old preview stripped `.yml` AND `.yaml` and
+        // then re-appended `.yml`, silently converting a `.yaml`
+        // workflow into a `.yml` URL. The shared helper preserves
+        // whichever extension the user has, so `.yaml` round-trips.
+        let mut app = make_app();
+        app.trigger_target_cache = Some(TriggerTarget {
+            platform_label: "GitHub".into(),
+            repo_label: "owner/repo".into(),
+            default_branch: "main".into(),
+            note: None,
+        });
+        app.workflows[0].name = "release.yaml".to_string();
+        let curl = app.trigger_curl_preview();
+        assert!(
+            curl.contains("actions/workflows/release.yaml/dispatches"),
+            ".yaml extension must round-trip unchanged, got {}",
+            curl
         );
     }
 
@@ -3883,6 +3956,41 @@ mod tests {
         });
         app.trigger_tab_toggle_platform();
         assert!(app.trigger_target_cache.is_none());
+    }
+
+    #[test]
+    fn in_flight_guard_clears_flag_on_normal_drop() {
+        // Straight-line: guard drops at end of scope, flag clears.
+        let flag = Arc::new(AtomicBool::new(true));
+        {
+            let _g = InFlightGuard::arm(Arc::clone(&flag));
+            assert!(flag.load(Ordering::SeqCst));
+        }
+        assert!(
+            !flag.load(Ordering::SeqCst),
+            "guard Drop must clear the in-flight flag so the Trigger tab unlocks"
+        );
+    }
+
+    #[test]
+    fn in_flight_guard_clears_flag_even_when_unwinding() {
+        // Regression: if the dispatch task panics inside reqwest
+        // (or any SDK we call) the trailing `store(false)` would be
+        // skipped and the Trigger tab would be locked into
+        // "already in flight" forever. Drop fires during unwinding,
+        // so the guard still clears the flag. `catch_unwind` is used
+        // here to observe the unwind without aborting the test run.
+        let flag = Arc::new(AtomicBool::new(true));
+        let flag_clone = Arc::clone(&flag);
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = InFlightGuard::arm(flag_clone);
+            panic!("simulated dispatcher panic");
+        }));
+        assert!(caught.is_err(), "test harness must observe the panic");
+        assert!(
+            !flag.load(Ordering::SeqCst),
+            "guard Drop must fire during unwinding so a panicking dispatch can't strand the tab"
+        );
     }
 
     #[test]

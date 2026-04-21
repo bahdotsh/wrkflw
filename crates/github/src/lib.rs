@@ -113,6 +113,33 @@ pub fn get_repo_info() -> Result<RepoInfo, GithubError> {
     }
 }
 
+/// Normalize a user-facing workflow identifier into the path segment
+/// GitHub's `workflow_dispatch` endpoint expects as `{workflow_file_name}`
+/// in `/repos/{owner}/{repo}/actions/workflows/{workflow_file_name}/dispatches`.
+///
+/// - Drops any directory prefix: `"release/prod.yml"` → `"prod.yml"`.
+/// - Preserves an existing `.yml` or `.yaml` suffix so workflows stored
+///   as `.yaml` don't have `.yml` tacked on.
+/// - Appends `.yml` when no extension is present so the result is
+///   always a valid filename reference.
+/// - Returns `None` for inputs with no extractable basename (empty
+///   string, bare path separator, trailing slash).
+///
+/// Used both by [`trigger_workflow`] to build the real dispatch URL
+/// and by the TUI's Trigger-tab curl preview via this crate's public
+/// API, so the preview and the actual POST land on the same endpoint.
+pub fn workflow_dispatch_path_segment(name: &str) -> Option<String> {
+    let basename = name.rsplit(['/', '\\']).next()?;
+    if basename.is_empty() {
+        return None;
+    }
+    if basename.ends_with(".yml") || basename.ends_with(".yaml") {
+        Some(basename.to_string())
+    } else {
+        Some(format!("{basename}.yml"))
+    }
+}
+
 /// Get the list of available workflows in the repository
 pub async fn list_workflows(_repo_info: &RepoInfo) -> Result<Vec<String>, GithubError> {
     let workflows_dir = Path::new(".github/workflows");
@@ -173,17 +200,16 @@ pub async fn trigger_workflow(
     let branch_ref = branch.unwrap_or(&repo_info.default_branch);
     wrkflw_logging::info(&format!("Using branch: {}", branch_ref));
 
-    // Extract just the workflow name from the path if it's a full path
-    let workflow_name = if workflow_name.contains('/') {
-        Path::new(workflow_name)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .ok_or_else(|| GithubError::GitParseError("Invalid workflow name".to_string()))?
-    } else {
-        workflow_name
-    };
+    // Normalize the user-facing identifier into the dispatch URL
+    // segment. Handles subdir prefixes (drop) and missing extensions
+    // (append `.yml`) so `"ci"`, `"ci.yml"`, `"ci.yaml"`, and
+    // `"release/prod.yml"` all produce the same URL shape the REST
+    // API expects. The TUI preview goes through the same helper so
+    // a copy-pasted curl lands on the same endpoint.
+    let workflow_segment = workflow_dispatch_path_segment(workflow_name)
+        .ok_or_else(|| GithubError::GitParseError("Invalid workflow name".to_string()))?;
 
-    wrkflw_logging::info(&format!("Using workflow name: {}", workflow_name));
+    wrkflw_logging::info(&format!("Using workflow file: {}", workflow_segment));
 
     // Create simplified payload
     let mut payload = serde_json::json!({
@@ -198,8 +224,8 @@ pub async fn trigger_workflow(
 
     // Send the workflow_dispatch event
     let url = format!(
-        "https://api.github.com/repos/{}/{}/actions/workflows/{}.yml/dispatches",
-        repo_info.owner, repo_info.repo, workflow_name
+        "https://api.github.com/repos/{}/{}/actions/workflows/{}/dispatches",
+        repo_info.owner, repo_info.repo, workflow_segment
     );
 
     wrkflw_logging::info(&format!("Triggering workflow at URL: {}", url));
@@ -248,12 +274,12 @@ pub async fn trigger_workflow(
 
     wrkflw_logging::info("Workflow triggered successfully!");
     wrkflw_logging::info(&format!(
-        "View runs at: https://github.com/{}/{}/actions/workflows/{}.yml",
-        repo_info.owner, repo_info.repo, workflow_name
+        "View runs at: https://github.com/{}/{}/actions/workflows/{}",
+        repo_info.owner, repo_info.repo, workflow_segment
     ));
 
     // Attempt to verify the workflow was actually triggered
-    match list_recent_workflow_runs(&repo_info, workflow_name, &token).await {
+    match list_recent_workflow_runs(&repo_info, &workflow_segment, &token).await {
         Ok(runs) => {
             if !runs.is_empty() {
                 wrkflw_logging::info("Recent runs of this workflow:");
@@ -289,26 +315,19 @@ pub async fn trigger_workflow(
     Ok(())
 }
 
-/// List recent workflow runs for a specific workflow
+/// List recent workflow runs for a specific workflow. `workflow_segment`
+/// must already be the basename-form produced by
+/// [`workflow_dispatch_path_segment`] (e.g. `"ci.yml"`), not the raw
+/// user-facing identifier — the caller has already normalized it.
 async fn list_recent_workflow_runs(
     repo_info: &RepoInfo,
-    workflow_name: &str,
+    workflow_segment: &str,
     token: &str,
 ) -> Result<Vec<serde_json::Value>, GithubError> {
-    // Extract just the workflow name from the path if it's a full path
-    let workflow_name = if workflow_name.contains('/') {
-        Path::new(workflow_name)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .ok_or_else(|| GithubError::GitParseError("Invalid workflow name".to_string()))?
-    } else {
-        workflow_name
-    };
-
     // Get recent workflow runs via GitHub API
     let url = format!(
-        "https://api.github.com/repos/{}/{}/actions/workflows/{}.yml/runs?per_page=5",
-        repo_info.owner, repo_info.repo, workflow_name
+        "https://api.github.com/repos/{}/{}/actions/workflows/{}/runs?per_page=5",
+        repo_info.owner, repo_info.repo, workflow_segment
     );
 
     let client = reqwest::Client::new();
@@ -343,5 +362,91 @@ async fn list_recent_workflow_runs(
         Ok(workflow_runs.clone())
     } else {
         Ok(Vec::new())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workflow_dispatch_path_segment_keeps_yml_extension() {
+        assert_eq!(
+            workflow_dispatch_path_segment("ci.yml"),
+            Some("ci.yml".into())
+        );
+    }
+
+    #[test]
+    fn workflow_dispatch_path_segment_keeps_yaml_extension() {
+        // Regression: the old dispatcher unconditionally appended
+        // `.yml`, turning `ci.yaml` into `ci.yaml.yml` which was a
+        // guaranteed 404. The helper must round-trip the `.yaml`
+        // form untouched.
+        assert_eq!(
+            workflow_dispatch_path_segment("ci.yaml"),
+            Some("ci.yaml".into())
+        );
+    }
+
+    #[test]
+    fn workflow_dispatch_path_segment_appends_yml_when_missing() {
+        assert_eq!(workflow_dispatch_path_segment("ci"), Some("ci.yml".into()));
+    }
+
+    #[test]
+    fn workflow_dispatch_path_segment_strips_subdir_prefix() {
+        // GitHub does not support subdirs under `.github/workflows/`,
+        // but the caller may pass a filesystem-like path. The helper
+        // drops everything before the final path separator so the
+        // segment always addresses the workflow by basename.
+        assert_eq!(
+            workflow_dispatch_path_segment("release/prod.yml"),
+            Some("prod.yml".into())
+        );
+        assert_eq!(
+            workflow_dispatch_path_segment("deep/nested/ci.yaml"),
+            Some("ci.yaml".into())
+        );
+    }
+
+    #[test]
+    fn workflow_dispatch_path_segment_rejects_inputs_with_no_basename() {
+        assert_eq!(workflow_dispatch_path_segment(""), None);
+        assert_eq!(workflow_dispatch_path_segment("/"), None);
+        assert_eq!(workflow_dispatch_path_segment("foo/"), None);
+    }
+
+    #[test]
+    fn workflow_dispatch_path_segment_matches_across_dispatcher_and_preview() {
+        // The whole point of the helper is that the preview and the
+        // real dispatcher produce the same URL segment for the same
+        // input. Pin the identities the Trigger-tab curl preview
+        // depends on so a refactor in either place can't silently
+        // drift them apart.
+        for input in [
+            "ci",
+            "ci.yml",
+            "ci.yaml",
+            "release/prod.yml",
+            "deep/nested/ci.yaml",
+            "has spaces.yml",
+            "weird;name.yml",
+        ] {
+            let segment = workflow_dispatch_path_segment(input)
+                .unwrap_or_else(|| panic!("helper produced None for {:?}", input));
+            assert!(
+                !segment.contains('/') && !segment.contains('\\'),
+                "segment {:?} for input {:?} must be a bare basename",
+                segment,
+                input
+            );
+            assert!(
+                segment.ends_with(".yml") || segment.ends_with(".yaml"),
+                "segment {:?} for input {:?} must carry an extension",
+                segment,
+                input
+            );
+        }
     }
 }

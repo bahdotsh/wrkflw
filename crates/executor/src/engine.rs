@@ -1521,13 +1521,16 @@ fn get_install_script(language: &str, version: &str) -> String {
             )
         }
         "python" => {
+            // --break-system-packages is required on Ubuntu 24.04+ (PEP 668)
+            // which marks the system Python as externally-managed. Without it,
+            // get-pip.py refuses to install into the system site-packages.
             format!(
                 "apt-get install -y software-properties-common && \
                  add-apt-repository -y ppa:deadsnakes/ppa && apt-get update && \
                  apt-get install -y python{ver} python{ver}-venv && \
                  ln -sf /usr/bin/python{ver} /usr/bin/python && \
                  ln -sf /usr/bin/python{ver} /usr/bin/python3 && \
-                 curl -sS https://bootstrap.pypa.io/get-pip.py | python{ver}",
+                 curl -sS https://bootstrap.pypa.io/get-pip.py | python{ver} - --break-system-packages",
                 ver = version
             )
         }

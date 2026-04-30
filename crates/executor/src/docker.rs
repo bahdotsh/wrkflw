@@ -19,6 +19,22 @@ use wrkflw_utils::fd;
 
 static RUNNING_CONTAINERS: Lazy<Mutex<Vec<String>>> = Lazy::new(|| Mutex::new(Vec::new()));
 static CREATED_NETWORKS: Lazy<Mutex<Vec<String>>> = Lazy::new(|| Mutex::new(Vec::new()));
+
+/// Per-container wait timeout, configurable via the
+/// `WRKFLW_CONTAINER_WAIT_SECS` env var. Defaults to 900 seconds (15
+/// minutes) so cold cargo / npm builds inside the runner image have
+/// breathing room before wrkflw declares the container failed.
+///
+/// Setting `WRKFLW_CONTAINER_WAIT_SECS=0` is treated as "no override"
+/// and falls back to the default.
+fn container_wait_timeout() -> std::time::Duration {
+    let secs: u64 = std::env::var("WRKFLW_CONTAINER_WAIT_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(900);
+    std::time::Duration::from_secs(secs)
+}
 // Map to track customized images for a job
 #[allow(dead_code)]
 static CUSTOMIZED_IMAGES: Lazy<Mutex<HashMap<String, String>>> =
@@ -1036,9 +1052,10 @@ impl DockerRuntime {
             }
         }
 
-        // Wait for container to finish with a timeout (300 seconds)
+        // Wait for container to finish. Timeout is configurable via
+        // `WRKFLW_CONTAINER_WAIT_SECS` (default: 900s / 15 minutes).
         let wait_result = tokio::time::timeout(
-            std::time::Duration::from_secs(300),
+            container_wait_timeout(),
             self.docker
                 .wait_container::<String>(&container.id, None)
                 .collect::<Vec<_>>(),

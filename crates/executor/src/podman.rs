@@ -14,6 +14,23 @@ use wrkflw_utils;
 use wrkflw_utils::fd;
 
 static RUNNING_CONTAINERS: Lazy<Mutex<Vec<String>>> = Lazy::new(|| Mutex::new(Vec::new()));
+
+/// Per-container wait timeout, configurable via the
+/// `WRKFLW_CONTAINER_WAIT_SECS` env var. Defaults to 900 seconds (15
+/// minutes) so cold cargo / npm builds inside the runner image have
+/// breathing room before wrkflw declares the container failed.
+///
+/// Setting `WRKFLW_CONTAINER_WAIT_SECS=0` is treated as "no override"
+/// and falls back to the default.
+fn container_wait_timeout() -> std::time::Duration {
+    let secs: u64 = std::env::var("WRKFLW_CONTAINER_WAIT_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(900);
+    std::time::Duration::from_secs(secs)
+}
+
 // Map to track customized images for a job
 #[allow(dead_code)]
 static CUSTOMIZED_IMAGES: Lazy<Mutex<HashMap<String, String>>> =
@@ -136,13 +153,15 @@ impl PodmanRuntime {
         }
     }
 
-    /// Execute a podman command with proper error handling and timeout
+    /// Execute a podman command with proper error handling and timeout.
+    /// Honors the `WRKFLW_CONTAINER_WAIT_SECS` env var (default 900s);
+    /// the upstream value was 360s.
     async fn execute_podman_command(
         &self,
         args: &[&str],
         input: Option<&str>,
     ) -> Result<ContainerOutput, ContainerError> {
-        let timeout_duration = std::time::Duration::from_secs(360); // 6 minutes timeout
+        let timeout_duration = container_wait_timeout();
 
         let result = tokio::time::timeout(timeout_duration, async {
             let mut cmd = Command::new("podman");
@@ -477,7 +496,8 @@ impl ContainerRuntime for PodmanRuntime {
         // Print detailed debugging info
         wrkflw_logging::info(&format!("Podman: Running container with image: {}", image));
 
-        let timeout_duration = std::time::Duration::from_secs(360); // 6 minutes timeout
+        // Honors WRKFLW_CONTAINER_WAIT_SECS (default 900s).
+        let timeout_duration = container_wait_timeout();
 
         // Run the entire container operation with a timeout
         match tokio::time::timeout(
@@ -488,7 +508,10 @@ impl ContainerRuntime for PodmanRuntime {
         {
             Ok(result) => result,
             Err(_) => {
-                wrkflw_logging::error("Podman operation timed out after 360 seconds");
+                wrkflw_logging::error(&format!(
+                    "Podman operation timed out after {}s",
+                    timeout_duration.as_secs()
+                ));
                 Err(ContainerError::ContainerExecution(
                     "Operation timed out".to_string(),
                 ))

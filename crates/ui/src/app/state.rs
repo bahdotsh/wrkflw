@@ -370,10 +370,11 @@ impl App {
                 };
 
                 if !is_docker_available {
-                    initial_logs.push(
-                        "Docker is not available or unresponsive. Using emulation mode instead."
-                            .to_string(),
-                    );
+                    initial_logs.push(format!(
+                        "[{}] {} Docker is not available or unresponsive. Using emulation mode instead.",
+                        Local::now().format("%H:%M:%S"),
+                        wrkflw_logging::symbols::WARNING,
+                    ));
                     wrkflw_logging::warning(
                         "Docker is not available or unresponsive. Using emulation mode instead.",
                     );
@@ -422,10 +423,11 @@ impl App {
                 };
 
                 if !is_podman_available {
-                    initial_logs.push(
-                        "Podman is not available or unresponsive. Using emulation mode instead."
-                            .to_string(),
-                    );
+                    initial_logs.push(format!(
+                        "[{}] {} Podman is not available or unresponsive. Using emulation mode instead.",
+                        Local::now().format("%H:%M:%S"),
+                        wrkflw_logging::symbols::WARNING,
+                    ));
                     wrkflw_logging::warning(
                         "Podman is not available or unresponsive. Using emulation mode instead.",
                     );

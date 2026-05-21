@@ -331,6 +331,59 @@ impl App {
         // Check container runtime availability if container runtime is selected
         let initial_logs = Vec::new();
         let runtime_type = match runtime_type {
+            RuntimeType::Auto => {
+                // Try Docker first, then Podman, then fall back to emulation.
+                let is_docker_available = std::thread::scope(|s| {
+                    let h = s.spawn(|| {
+                        wrkflw_utils::fd::with_stderr_to_null(wrkflw_executor::docker::is_available)
+                            .unwrap_or(false)
+                    });
+                    let start = std::time::Instant::now();
+                    let timeout = std::time::Duration::from_secs(1);
+                    while start.elapsed() < timeout {
+                        if h.is_finished() {
+                            return h.join().unwrap_or(false);
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    false
+                });
+                if is_docker_available {
+                    wrkflw_logging::info("Auto-detected Docker runtime");
+                    RuntimeType::Docker
+                } else {
+                    let is_podman_available = std::thread::scope(|s| {
+                        let h = s.spawn(|| {
+                            wrkflw_utils::fd::with_stderr_to_null(
+                                wrkflw_executor::podman::is_available,
+                            )
+                            .unwrap_or(false)
+                        });
+                        let start = std::time::Instant::now();
+                        let timeout = std::time::Duration::from_secs(1);
+                        while start.elapsed() < timeout {
+                            if h.is_finished() {
+                                return h.join().unwrap_or(false);
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
+                        false
+                    });
+                    if is_podman_available {
+                        wrkflw_logging::info("Auto-detected Podman runtime");
+                        RuntimeType::Podman
+                    } else {
+                        initial_logs.push(
+                            "No container runtime found (tried Docker and Podman). Using emulation mode instead."
+                                .to_string(),
+                        );
+                        wrkflw_logging::warning(
+                            "No container runtime found (tried Docker and Podman). Using emulation mode instead.",
+                        );
+                        RuntimeType::Emulation
+                    }
+                }
+            }
             RuntimeType::Docker => {
                 // Use a timeout for the Docker availability check to prevent hanging
                 let is_docker_available = match std::panic::catch_unwind(|| {
@@ -526,6 +579,7 @@ impl App {
 
     pub fn toggle_emulation_mode(&mut self) {
         self.runtime_type = match self.runtime_type {
+            RuntimeType::Auto => RuntimeType::Docker,
             RuntimeType::Docker => RuntimeType::Podman,
             RuntimeType::Podman => RuntimeType::SecureEmulation,
             RuntimeType::SecureEmulation => RuntimeType::Emulation,
@@ -902,6 +956,7 @@ impl App {
 
     pub fn runtime_type_name(&self) -> &str {
         match self.runtime_type {
+            RuntimeType::Auto => "Auto",
             RuntimeType::Docker => "Docker",
             RuntimeType::Podman => "Podman",
             RuntimeType::SecureEmulation => "Secure Emulation",

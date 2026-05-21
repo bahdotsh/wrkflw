@@ -158,6 +158,7 @@ async fn execute_github_workflow(
     env_context.insert(
         "WRKFLW_RUNTIME_MODE".to_string(),
         match config.runtime_type {
+            RuntimeType::Auto => "auto".to_string(),
             RuntimeType::Emulation => "emulation".to_string(),
             RuntimeType::SecureEmulation => "secure_emulation".to_string(),
             RuntimeType::Docker => "docker".to_string(),
@@ -351,6 +352,7 @@ async fn execute_gitlab_pipeline(
     env_context.insert(
         "WRKFLW_RUNTIME_MODE".to_string(),
         match config.runtime_type {
+            RuntimeType::Auto => "auto".to_string(),
             RuntimeType::Emulation => "emulation".to_string(),
             RuntimeType::SecureEmulation => "secure_emulation".to_string(),
             RuntimeType::Docker => "docker".to_string(),
@@ -568,6 +570,32 @@ fn initialize_runtime(
     preserve_containers_on_failure: bool,
 ) -> Result<Box<dyn ContainerRuntime>, ExecutionError> {
     match runtime_type {
+        RuntimeType::Auto => {
+            if docker::is_available() {
+                wrkflw_logging::info("Auto-detected Docker runtime");
+                match docker::DockerRuntime::new_with_config(preserve_containers_on_failure) {
+                    Ok(r) => return Ok(Box::new(r)),
+                    Err(e) => wrkflw_logging::error(&format!(
+                        "Failed to initialize Docker runtime: {}, trying Podman",
+                        e
+                    )),
+                }
+            }
+            if podman::is_available() {
+                wrkflw_logging::info("Auto-detected Podman runtime");
+                match podman::PodmanRuntime::new_with_config(preserve_containers_on_failure) {
+                    Ok(r) => return Ok(Box::new(r)),
+                    Err(e) => wrkflw_logging::error(&format!(
+                        "Failed to initialize Podman runtime: {}, falling back to emulation mode",
+                        e
+                    )),
+                }
+            }
+            wrkflw_logging::error(
+                "No container runtime found (tried Docker and Podman), falling back to emulation mode",
+            );
+            Ok(Box::new(emulation::EmulationRuntime::new()))
+        }
         RuntimeType::Docker => {
             if docker::is_available() {
                 // Handle the Result returned by DockerRuntime::new()
@@ -613,6 +641,8 @@ fn initialize_runtime(
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum RuntimeType {
+    /// Detect Docker first, then Podman, then fall back to emulation.
+    Auto,
     Docker,
     Podman,
     Emulation,
@@ -9391,6 +9421,28 @@ runs:
             runtime.build_count.load(Ordering::SeqCst),
             1,
             "build_image should be called exactly once despite concurrent jobs"
+        );
+    }
+
+    // --- RuntimeType::Auto tests ---
+
+    #[test]
+    fn auto_is_distinct_from_concrete_variants() {
+        assert_ne!(RuntimeType::Auto, RuntimeType::Docker);
+        assert_ne!(RuntimeType::Auto, RuntimeType::Podman);
+        assert_ne!(RuntimeType::Auto, RuntimeType::Emulation);
+        assert_ne!(RuntimeType::Auto, RuntimeType::SecureEmulation);
+    }
+
+    #[test]
+    fn initialize_runtime_auto_does_not_panic() {
+        // Auto should always succeed (falls back to emulation when nothing is available).
+        // This exercises the full cascade on whatever the test environment provides.
+        let result = initialize_runtime(RuntimeType::Auto, false);
+        assert!(
+            result.is_ok(),
+            "Auto runtime initialization returned Err: {:?}",
+            result.err()
         );
     }
 }

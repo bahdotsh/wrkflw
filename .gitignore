@@ -1,3 +1,5 @@
 /target
 .indxr-cache/
 .claude/todos/
+
+.idea/

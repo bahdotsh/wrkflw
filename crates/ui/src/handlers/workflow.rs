@@ -138,6 +138,26 @@ pub async fn execute_workflow_cli(
 
     // Check container runtime availability if container runtime is selected
     let runtime_type = match runtime_type {
+        RuntimeType::Auto => {
+            if wrkflw_executor::docker::is_available() {
+                wrkflw_logging::info("Auto-detected Docker runtime");
+                RuntimeType::Docker
+            } else if wrkflw_executor::podman::is_available() {
+                wrkflw_logging::info("Auto-detected Podman runtime");
+                RuntimeType::Podman
+            } else {
+                println!(
+                    "{}",
+                    cli_style::warning(
+                        "No container runtime found (tried Docker and Podman). Using emulation mode instead."
+                    )
+                );
+                wrkflw_logging::warning(
+                    "No container runtime found (tried Docker and Podman). Using emulation mode instead.",
+                );
+                RuntimeType::Emulation
+            }
+        }
         RuntimeType::Docker => {
             if !wrkflw_executor::docker::is_available() {
                 println!(
@@ -464,6 +484,33 @@ pub fn start_next_workflow_execution(
 
         // Check container runtime availability again if container runtime is selected
         let runtime_type = match app.runtime_type {
+            RuntimeType::Auto => {
+                let is_docker =
+                    wrkflw_utils::fd::with_stderr_to_null(wrkflw_executor::docker::is_available)
+                        .unwrap_or(false);
+                if is_docker {
+                    wrkflw_logging::info("Auto-detected Docker runtime");
+                    RuntimeType::Docker
+                } else {
+                    let is_podman = wrkflw_utils::fd::with_stderr_to_null(
+                        wrkflw_executor::podman::is_available,
+                    )
+                    .unwrap_or(false);
+                    if is_podman {
+                        wrkflw_logging::info("Auto-detected Podman runtime");
+                        RuntimeType::Podman
+                    } else {
+                        app.logs.push(
+                            "No container runtime found (tried Docker and Podman). Using emulation mode instead."
+                                .to_string(),
+                        );
+                        wrkflw_logging::warning(
+                            "No container runtime found (tried Docker and Podman). Using emulation mode instead.",
+                        );
+                        RuntimeType::Emulation
+                    }
+                }
+            }
             RuntimeType::Docker => {
                 // Use safe FD redirection to check Docker availability
                 let is_docker_available = match wrkflw_utils::fd::with_stderr_to_null(

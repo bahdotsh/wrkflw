@@ -232,7 +232,7 @@ pub struct Service {
     pub options: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct Step {
     #[serde(default)]
     pub name: Option<String>,

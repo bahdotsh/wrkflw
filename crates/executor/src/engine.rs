@@ -1691,6 +1691,7 @@ async fn build_combined_runtime_image(
 /// includes git and other tools needed by actions like `actions/checkout`).
 async fn resolve_runner_image(
     job: &Job,
+    steps: &[Step],
     runtime: &dyn ContainerRuntime,
 ) -> Result<String, ExecutionError> {
     let base_image = get_effective_runner_image(job);
@@ -1699,7 +1700,7 @@ async fn resolve_runner_image(
         return Ok(base_image);
     }
 
-    let setup_runtimes = detect_setup_runtimes(&job.steps);
+    let setup_runtimes = detect_setup_runtimes(steps);
     if setup_runtimes.is_empty() {
         Ok(base_image)
     } else {
@@ -1962,7 +1963,7 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
 
     // Execute job steps
     // Determine runner image: prefer job container, then detect setup actions, fall back to runs-on
-    let runner_image_value = resolve_runner_image(job, ctx.runtime).await?;
+    let runner_image_value = resolve_runner_image(job, &job.steps, ctx.runtime).await?;
 
     // GHA default job timeout is 360 minutes; sanitize to avoid panic on negative/NaN
     let timeout_mins = sanitize_timeout_minutes(job.timeout_minutes, 360.0);
@@ -2238,22 +2239,30 @@ async fn execute_matrix_job(
         ExecutionError::Execution(format!("Failed to get current directory: {}", e))
     })?;
 
+    // Pre-resolve ${{ matrix.X }} in all step `with` values so that every downstream
+    // consumer (detect_setup_runtimes, INPUT_* env vars, composite action inputs, etc.)
+    // sees the concrete value rather than the literal expression string. Other expression
+    // types (${{ env.X }}, ${{ steps.foo.outputs.bar }}) are left for per-step resolution.
+    let materialized_steps =
+        crate::substitution::apply_matrix_to_steps(&job_template.steps, &combination.values);
+
     let mut loop_state = StepLoopState::new();
     let pending_cache_saves = std::sync::Mutex::new(Vec::<PendingCacheSave>::new());
-    let job_success = if job_template.steps.is_empty() {
+    let job_success = if materialized_steps.is_empty() {
         wrkflw_logging::warning(&format!("Job '{}' has no steps", matrix_job_name));
         true
     } else {
         // Execute each step
         // Determine runner image: prefer job container, then detect setup actions, fall back to runs-on
-        let runner_image_value = resolve_runner_image(job_template, runtime).await?;
+        let runner_image_value =
+            resolve_runner_image(job_template, &materialized_steps, runtime).await?;
 
         let mut all_steps_ok = true;
         let timeout_mins = sanitize_timeout_minutes(job_template.timeout_minutes, 360.0);
         let job_timeout = std::time::Duration::from_secs_f64(timeout_mins * 60.0);
         let job_deadline = tokio::time::Instant::now() + job_timeout;
 
-        for (idx, step) in job_template.steps.iter().enumerate() {
+        for (idx, step) in materialized_steps.iter().enumerate() {
             let remaining = job_deadline.saturating_duration_since(tokio::time::Instant::now());
 
             let outcome = match tokio::time::timeout(
@@ -6933,6 +6942,48 @@ runs:
         let steps = vec![make_step_uses("actions/setup-node@v3", Some(with))];
         let runtimes = detect_setup_runtimes(&steps);
         assert!(runtimes.is_empty());
+    }
+
+    #[test]
+    fn detect_setup_runtimes_matrix_expr_skipped_without_substitution() {
+        // Raw ${{ matrix.java }} is not a valid version — without substitution the
+        // step is silently ignored.  This documents the pre-fix behavior and ensures
+        // the guard still works when a caller forgets to materialise steps.
+        let with = HashMap::from([("java-version".to_string(), "${{ matrix.java }}".to_string())]);
+        let steps = vec![make_step_uses("actions/setup-java@v4", Some(with))];
+        let runtimes = detect_setup_runtimes(&steps);
+        assert!(runtimes.is_empty());
+    }
+
+    #[test]
+    fn detect_setup_runtimes_after_matrix_substitution_resolves_java_version() {
+        // After apply_matrix_to_steps the expression is resolved; detection must
+        // produce the correct runtime rather than issuing the "invalid version" warning.
+        use serde_yaml::Value;
+        let combination_values =
+            HashMap::from([("java".to_string(), Value::String("17".to_string()))]);
+        let with = HashMap::from([("java-version".to_string(), "${{ matrix.java }}".to_string())]);
+        let raw_steps = vec![make_step_uses("actions/setup-java@v4", Some(with))];
+        let materialized =
+            crate::substitution::apply_matrix_to_steps(&raw_steps, &combination_values);
+        let runtimes = detect_setup_runtimes(&materialized);
+        assert_eq!(runtimes.len(), 1);
+        assert_eq!(runtimes[0].language, "java");
+        assert_eq!(runtimes[0].version, "17");
+    }
+
+    #[test]
+    fn detect_setup_runtimes_after_matrix_substitution_resolves_node_version() {
+        use serde_yaml::Value;
+        let combination_values = HashMap::from([("node".to_string(), Value::Number(20.into()))]);
+        let with = HashMap::from([("node-version".to_string(), "${{ matrix.node }}".to_string())]);
+        let raw_steps = vec![make_step_uses("actions/setup-node@v4", Some(with))];
+        let materialized =
+            crate::substitution::apply_matrix_to_steps(&raw_steps, &combination_values);
+        let runtimes = detect_setup_runtimes(&materialized);
+        assert_eq!(runtimes.len(), 1);
+        assert_eq!(runtimes[0].language, "node");
+        assert_eq!(runtimes[0].version, "20");
     }
 
     // --- deduplication tests ---

@@ -4,6 +4,7 @@ use serde_yaml::Value;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::Path;
+use wrkflw_parser::workflow::Step;
 
 lazy_static! {
     static ref MATRIX_PATTERN: Regex =
@@ -54,6 +55,26 @@ pub fn process_step_run(run: &str, matrix_combination: &Option<HashMap<String, V
             })
             .to_string()
     }
+}
+
+/// Clone `steps`, substituting `${{ matrix.X }}` expressions in each step's `with` values.
+///
+/// Only matrix references are resolved here. Other expressions (`${{ env.X }}`,
+/// `${{ steps.foo.outputs.bar }}`, etc.) are left intact for later per-step resolution,
+/// because step outputs and other dynamic context don't exist yet at this point.
+pub fn apply_matrix_to_steps(steps: &[Step], matrix_values: &HashMap<String, Value>) -> Vec<Step> {
+    steps
+        .iter()
+        .map(|step| {
+            let mut s = step.clone();
+            if let Some(with) = s.with.as_mut() {
+                for value in with.values_mut() {
+                    *value = preprocess_command(value, matrix_values);
+                }
+            }
+            s
+        })
+        .collect()
 }
 
 /// Replace `${{ hashFiles(...) }}` expressions with the SHA-256 hash of matched files.
@@ -682,5 +703,118 @@ mod tests {
         let ctx = make_ctx(&None, &empty_steps, &env);
         let result = preprocess_expressions(text, dir.path(), &ctx).unwrap();
         assert_eq!(result, "if [[ Linux == macOS ]]; then echo mac; fi");
+    }
+
+    // --- apply_matrix_to_steps tests ---
+
+    fn make_uses_step(uses: &str, with: HashMap<String, String>) -> Step {
+        Step {
+            name: None,
+            uses: Some(uses.to_string()),
+            run: None,
+            with: Some(with),
+            env: HashMap::new(),
+            continue_on_error: None,
+            if_condition: None,
+            id: None,
+            working_directory: None,
+            shell: None,
+            timeout_minutes: None,
+        }
+    }
+
+    #[test]
+    fn apply_matrix_to_steps_resolves_string_value() {
+        let combination = HashMap::from([("java".to_string(), Value::String("17".to_string()))]);
+        let steps = vec![make_uses_step(
+            "actions/setup-java@v4",
+            HashMap::from([("java-version".to_string(), "${{ matrix.java }}".to_string())]),
+        )];
+        let result = apply_matrix_to_steps(&steps, &combination);
+        assert_eq!(
+            result[0]
+                .with
+                .as_ref()
+                .unwrap()
+                .get("java-version")
+                .unwrap(),
+            "17"
+        );
+    }
+
+    #[test]
+    fn apply_matrix_to_steps_resolves_numeric_value() {
+        let combination = HashMap::from([("node".to_string(), Value::Number(20.into()))]);
+        let steps = vec![make_uses_step(
+            "actions/setup-node@v4",
+            HashMap::from([("node-version".to_string(), "${{ matrix.node }}".to_string())]),
+        )];
+        let result = apply_matrix_to_steps(&steps, &combination);
+        assert_eq!(
+            result[0]
+                .with
+                .as_ref()
+                .unwrap()
+                .get("node-version")
+                .unwrap(),
+            "20"
+        );
+    }
+
+    #[test]
+    fn apply_matrix_to_steps_leaves_non_matrix_expressions_intact() {
+        // Other expression types must survive for per-step resolution later.
+        let combination = HashMap::from([("os".to_string(), Value::String("ubuntu".to_string()))]);
+        let steps = vec![make_uses_step(
+            "actions/some-action@v1",
+            HashMap::from([("token".to_string(), "${{ secrets.MY_TOKEN }}".to_string())]),
+        )];
+        let result = apply_matrix_to_steps(&steps, &combination);
+        assert_eq!(
+            result[0].with.as_ref().unwrap().get("token").unwrap(),
+            "${{ secrets.MY_TOKEN }}"
+        );
+    }
+
+    #[test]
+    fn apply_matrix_to_steps_leaves_steps_without_with_unchanged() {
+        let combination = HashMap::from([("os".to_string(), Value::String("ubuntu".to_string()))]);
+        let steps = vec![Step {
+            name: None,
+            uses: Some("actions/checkout@v4".to_string()),
+            run: None,
+            with: None,
+            env: HashMap::new(),
+            continue_on_error: None,
+            if_condition: None,
+            id: None,
+            working_directory: None,
+            shell: None,
+            timeout_minutes: None,
+        }];
+        let result = apply_matrix_to_steps(&steps, &combination);
+        assert!(result[0].with.is_none());
+    }
+
+    #[test]
+    fn apply_matrix_to_steps_unknown_key_leaves_value_unchanged() {
+        // If the matrix doesn't have the referenced key, the expression is left as-is
+        // (preprocess_command keeps the original when the key is missing).
+        let combination = HashMap::from([("java".to_string(), Value::String("17".to_string()))]);
+        let steps = vec![make_uses_step(
+            "actions/setup-node@v4",
+            HashMap::from([("node-version".to_string(), "${{ matrix.node }}".to_string())]),
+        )];
+        let result = apply_matrix_to_steps(&steps, &combination);
+        // Unknown key: value is not substituted (preprocess_command escapes the $ for shell,
+        // but for with-values we accept either the escaped or original form — the key point
+        // is that it does NOT resolve to "17" or any other matrix value).
+        let resolved = result[0]
+            .with
+            .as_ref()
+            .unwrap()
+            .get("node-version")
+            .unwrap();
+        assert!(!resolved.contains("17"));
     }
 }

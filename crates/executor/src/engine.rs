@@ -1,10 +1,12 @@
 #[allow(unused_imports)]
 use bollard::Docker;
 use futures::future;
+use once_cell::sync::Lazy;
 use serde_yaml::Value;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 // std::process::Command replaced by tokio::process::Command for async safety
 use thiserror::Error;
 
@@ -1339,6 +1341,7 @@ fn determine_action_image(repository: &str) -> String {
 }
 
 /// A runtime detected from a setup action step (e.g., `actions/setup-node@v3`).
+#[derive(Clone)]
 struct SetupRuntime {
     /// Language identifier (e.g., "node", "php", "python")
     language: String,
@@ -1636,9 +1639,15 @@ fn combined_image_tag(runtimes: &[SetupRuntime], dockerfile: &str) -> String {
 }
 
 /// Build a Docker image that combines multiple language runtimes on an Ubuntu base.
+// Per-tag mutex map so parallel jobs building the same runtime image serialize
+// rather than all racing to build it simultaneously.
+static IMAGE_BUILD_LOCKS: Lazy<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
 ///
 /// Skips the build when an image with the same tag already exists locally,
-/// avoiding redundant work on repeated runs.
+/// avoiding redundant work on repeated runs. When multiple parallel jobs need
+/// the same image, only the first build runs; the others wait and then reuse it.
 async fn build_combined_runtime_image(
     runtimes: &[SetupRuntime],
     base_image: &str,
@@ -1647,7 +1656,27 @@ async fn build_combined_runtime_image(
     let dockerfile = generate_combined_dockerfile(runtimes, base_image);
     let tag = combined_image_tag(runtimes, &dockerfile);
 
-    // Skip the build if the image already exists locally.
+    // Fast path: image already exists, no locking needed.
+    let exists = runtime.image_exists(&tag).await.map_err(|e| {
+        ExecutionError::Runtime(format!("Failed to check for existing image: {}", e))
+    })?;
+    if exists {
+        wrkflw_logging::info(&format!("Reusing existing combined runtime image: {}", tag));
+        return Ok(tag);
+    }
+
+    // Acquire the per-tag build lock so concurrent jobs building the same image
+    // serialize here. The std::Mutex is held only long enough to clone the Arc.
+    let tag_lock = {
+        let mut locks = IMAGE_BUILD_LOCKS.lock().unwrap();
+        locks
+            .entry(tag.clone())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    };
+    let _build_guard = tag_lock.lock().await;
+
+    // Re-check after acquiring the lock: a concurrent job may have built it.
     let exists = runtime.image_exists(&tag).await.map_err(|e| {
         ExecutionError::Runtime(format!("Failed to check for existing image: {}", e))
     })?;
@@ -9228,5 +9257,89 @@ runs:
         // Value contains both base and _1
         let delim = generate_heredoc_delimiter("ghadelimiter\nghadelimiter_1\nother");
         assert_eq!(delim, "ghadelimiter_2");
+    }
+
+    // --- build_combined_runtime_image deduplication ---
+
+    #[tokio::test]
+    async fn build_combined_runtime_image_deduplicates_concurrent_builds() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        #[derive(Clone)]
+        struct CountingRuntime {
+            build_count: Arc<AtomicUsize>,
+            built: Arc<AtomicBool>,
+        }
+
+        #[async_trait::async_trait]
+        impl ContainerRuntime for CountingRuntime {
+            async fn run_container(
+                &self,
+                _image: &str,
+                _cmd: &[&str],
+                _env_vars: &[(&str, &str)],
+                _working_dir: &Path,
+                _volumes: &[(&Path, &Path)],
+                _entrypoint: Option<&str>,
+            ) -> Result<wrkflw_runtime::container::ContainerOutput, ContainerError> {
+                unimplemented!()
+            }
+
+            async fn pull_image(&self, _image: &str) -> Result<(), ContainerError> {
+                Ok(())
+            }
+
+            async fn build_image(
+                &self,
+                _dockerfile: &Path,
+                _tag: &str,
+                _context_dir: &Path,
+            ) -> Result<(), ContainerError> {
+                self.build_count.fetch_add(1, Ordering::SeqCst);
+                // Yield so other spawned tasks get scheduled and attempt concurrent builds.
+                tokio::task::yield_now().await;
+                self.built.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+
+            async fn prepare_language_environment(
+                &self,
+                _language: &str,
+                _version: Option<&str>,
+                _additional_packages: Option<Vec<String>>,
+            ) -> Result<String, ContainerError> {
+                Ok("mock:latest".to_string())
+            }
+
+            async fn image_exists(&self, _tag: &str) -> Result<bool, ContainerError> {
+                Ok(self.built.load(Ordering::SeqCst))
+            }
+        }
+
+        let runtime = CountingRuntime {
+            build_count: Arc::new(AtomicUsize::new(0)),
+            built: Arc::new(AtomicBool::new(false)),
+        };
+
+        let runtimes = vec![SetupRuntime {
+            language: "rust".to_string(),
+            version: "1.78".to_string(),
+            install_script: "curl https://sh.rustup.rs -sSf | sh -s -- -y".to_string(),
+        }];
+
+        let rt = &runtime as &dyn ContainerRuntime;
+        let tasks: Vec<_> = (0..5)
+            .map(|_| build_combined_runtime_image(&runtimes, "ubuntu:22.04", rt))
+            .collect();
+
+        for result in futures::future::join_all(tasks).await {
+            result.expect("build_combined_runtime_image failed");
+        }
+
+        assert_eq!(
+            runtime.build_count.load(Ordering::SeqCst),
+            1,
+            "build_image should be called exactly once despite concurrent jobs"
+        );
     }
 }

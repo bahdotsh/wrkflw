@@ -69,7 +69,19 @@ pub fn apply_matrix_to_steps(steps: &[Step], matrix_values: &HashMap<String, Val
             let mut s = step.clone();
             if let Some(with) = s.with.as_mut() {
                 for value in with.values_mut() {
-                    *value = preprocess_command(value, matrix_values);
+                    *value = MATRIX_PATTERN
+                        .replace_all(value, |caps: &regex::Captures| {
+                            let var_name = &caps[1];
+                            match matrix_values.get(var_name) {
+                                Some(Value::String(s)) => s.clone(),
+                                Some(Value::Number(n)) => n.to_string(),
+                                Some(Value::Bool(b)) => b.to_string(),
+                                // Preserve the original expression; with values are not shell
+                                // text so the shell-escape from preprocess_command is wrong here.
+                                _ => caps[0].to_string(),
+                            }
+                        })
+                        .into_owned();
                 }
             }
             s
@@ -798,23 +810,20 @@ mod tests {
 
     #[test]
     fn apply_matrix_to_steps_unknown_key_leaves_value_unchanged() {
-        // If the matrix doesn't have the referenced key, the expression is left as-is
-        // (preprocess_command keeps the original when the key is missing).
+        // If the matrix doesn't have the referenced key, the original expression must be
+        // preserved verbatim (no backslash escape) so downstream resolvers can still match it.
         let combination = HashMap::from([("java".to_string(), Value::String("17".to_string()))]);
         let steps = vec![make_uses_step(
             "actions/setup-node@v4",
             HashMap::from([("node-version".to_string(), "${{ matrix.node }}".to_string())]),
         )];
         let result = apply_matrix_to_steps(&steps, &combination);
-        // Unknown key: value is not substituted (preprocess_command escapes the $ for shell,
-        // but for with-values we accept either the escaped or original form — the key point
-        // is that it does NOT resolve to "17" or any other matrix value).
         let resolved = result[0]
             .with
             .as_ref()
             .unwrap()
             .get("node-version")
             .unwrap();
-        assert!(!resolved.contains("17"));
+        assert_eq!(resolved, "${{ matrix.node }}");
     }
 }

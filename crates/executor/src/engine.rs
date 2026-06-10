@@ -79,8 +79,9 @@ fn is_gitlab_pipeline(path: &Path) -> bool {
 /// Execute a GitHub Actions workflow file locally
 async fn execute_github_workflow(
     workflow_path: &Path,
-    config: ExecutionConfig,
+    mut config: ExecutionConfig,
 ) -> Result<ExecutionResult, ExecutionError> {
+    config.runtime_type = detect_runtime(config.runtime_type);
     // 1. Parse workflow file
     let workflow = parse_workflow(workflow_path)?;
 
@@ -307,8 +308,9 @@ async fn execute_github_workflow(
 /// Execute a GitLab CI/CD pipeline locally
 async fn execute_gitlab_pipeline(
     pipeline_path: &Path,
-    config: ExecutionConfig,
+    mut config: ExecutionConfig,
 ) -> Result<ExecutionResult, ExecutionError> {
+    config.runtime_type = detect_runtime(config.runtime_type);
     wrkflw_logging::info("Executing GitLab CI/CD pipeline");
 
     // 1. Parse the GitLab pipeline file
@@ -564,41 +566,35 @@ fn resolve_gitlab_dependencies(
     Ok(execution_plan)
 }
 
+/// Resolves `RuntimeType::Auto` to a concrete runtime by probing availability.
+/// All other variants pass through unchanged.
+pub fn detect_runtime(runtime_type: RuntimeType) -> RuntimeType {
+    match runtime_type {
+        RuntimeType::Auto => {
+            if docker::is_available() {
+                RuntimeType::Docker
+            } else if podman::is_available() {
+                RuntimeType::Podman
+            } else {
+                RuntimeType::Emulation
+            }
+        }
+        other => other,
+    }
+}
+
 // Determine if Docker/Podman is available or fall back to emulation
 fn initialize_runtime(
     runtime_type: RuntimeType,
     preserve_containers_on_failure: bool,
 ) -> Result<Box<dyn ContainerRuntime>, ExecutionError> {
     match runtime_type {
-        RuntimeType::Auto => {
-            if docker::is_available() {
-                wrkflw_logging::info("Auto-detected Docker runtime");
-                match docker::DockerRuntime::new_with_config(preserve_containers_on_failure) {
-                    Ok(r) => return Ok(Box::new(r)),
-                    Err(e) => wrkflw_logging::error(&format!(
-                        "Failed to initialize Docker runtime: {}, trying Podman",
-                        e
-                    )),
-                }
-            }
-            if podman::is_available() {
-                wrkflw_logging::info("Auto-detected Podman runtime");
-                match podman::PodmanRuntime::new_with_config(preserve_containers_on_failure) {
-                    Ok(r) => return Ok(Box::new(r)),
-                    Err(e) => wrkflw_logging::error(&format!(
-                        "Failed to initialize Podman runtime: {}, falling back to emulation mode",
-                        e
-                    )),
-                }
-            }
-            wrkflw_logging::error(
-                "No container runtime found (tried Docker and Podman), falling back to emulation mode",
-            );
-            Ok(Box::new(emulation::EmulationRuntime::new()))
-        }
+        RuntimeType::Auto => initialize_runtime(
+            detect_runtime(RuntimeType::Auto),
+            preserve_containers_on_failure,
+        ),
         RuntimeType::Docker => {
             if docker::is_available() {
-                // Handle the Result returned by DockerRuntime::new()
                 match docker::DockerRuntime::new_with_config(preserve_containers_on_failure) {
                     Ok(docker_runtime) => Ok(Box::new(docker_runtime)),
                     Err(e) => {
@@ -616,17 +612,9 @@ fn initialize_runtime(
         }
         RuntimeType::Podman => {
             if podman::is_available() {
-                // Handle the Result returned by PodmanRuntime::new()
-                match podman::PodmanRuntime::new_with_config(preserve_containers_on_failure) {
-                    Ok(podman_runtime) => Ok(Box::new(podman_runtime)),
-                    Err(e) => {
-                        wrkflw_logging::error(&format!(
-                            "Failed to initialize Podman runtime: {}, falling back to emulation mode",
-                            e
-                        ));
-                        Ok(Box::new(emulation::EmulationRuntime::new()))
-                    }
-                }
+                Ok(Box::new(podman::PodmanRuntime::new_unchecked(
+                    preserve_containers_on_failure,
+                )))
             } else {
                 wrkflw_logging::error("Podman not available, falling back to emulation mode");
                 Ok(Box::new(emulation::EmulationRuntime::new()))

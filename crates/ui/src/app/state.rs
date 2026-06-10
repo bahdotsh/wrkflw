@@ -329,50 +329,38 @@ impl App {
         step_table_state.select(Some(0));
 
         // Check container runtime availability if container runtime is selected
-        let initial_logs = Vec::new();
+        let mut initial_logs = Vec::new();
         let runtime_type = match runtime_type {
             RuntimeType::Auto => {
-                // Try Docker first, then Podman, then fall back to emulation.
-                let is_docker_available = std::thread::scope(|s| {
-                    let h = s.spawn(|| {
-                        wrkflw_utils::fd::with_stderr_to_null(wrkflw_executor::docker::is_available)
-                            .unwrap_or(false)
-                    });
-                    let start = std::time::Instant::now();
-                    let timeout = std::time::Duration::from_secs(1);
-                    while start.elapsed() < timeout {
-                        if h.is_finished() {
-                            return h.join().unwrap_or(false);
-                        }
-                        std::thread::sleep(std::time::Duration::from_millis(10));
-                    }
-                    false
-                });
-                if is_docker_available {
-                    wrkflw_logging::info("Auto-detected Docker runtime");
-                    RuntimeType::Docker
-                } else {
-                    let is_podman_available = std::thread::scope(|s| {
-                        let h = s.spawn(|| {
-                            wrkflw_utils::fd::with_stderr_to_null(
-                                wrkflw_executor::podman::is_available,
-                            )
-                            .unwrap_or(false)
-                        });
+                let detected = match std::panic::catch_unwind(|| {
+                    std::thread::scope(|s| {
+                        let h = s.spawn(|| wrkflw_executor::detect_runtime(RuntimeType::Auto));
                         let start = std::time::Instant::now();
                         let timeout = std::time::Duration::from_secs(1);
                         while start.elapsed() < timeout {
                             if h.is_finished() {
-                                return h.join().unwrap_or(false);
+                                return h.join().unwrap_or(RuntimeType::Emulation);
                             }
                             std::thread::sleep(std::time::Duration::from_millis(10));
                         }
-                        false
-                    });
-                    if is_podman_available {
-                        wrkflw_logging::info("Auto-detected Podman runtime");
-                        RuntimeType::Podman
-                    } else {
+                        wrkflw_logging::warning(
+                            "Auto runtime detection timed out, falling back to emulation mode",
+                        );
+                        RuntimeType::Emulation
+                    })
+                }) {
+                    Ok(r) => r,
+                    Err(_) => {
+                        wrkflw_logging::warning(
+                            "Auto runtime detection failed with panic, falling back to emulation mode",
+                        );
+                        RuntimeType::Emulation
+                    }
+                };
+                match detected {
+                    RuntimeType::Docker => wrkflw_logging::info("Auto-detected Docker runtime"),
+                    RuntimeType::Podman => wrkflw_logging::info("Auto-detected Podman runtime"),
+                    _ => {
                         initial_logs.push(
                             "No container runtime found (tried Docker and Podman). Using emulation mode instead."
                                 .to_string(),
@@ -380,9 +368,9 @@ impl App {
                         wrkflw_logging::warning(
                             "No container runtime found (tried Docker and Podman). Using emulation mode instead.",
                         );
-                        RuntimeType::Emulation
                     }
                 }
+                detected
             }
             RuntimeType::Docker => {
                 // Use a timeout for the Docker availability check to prevent hanging

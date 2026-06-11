@@ -329,7 +329,7 @@ impl App {
         step_table_state.select(Some(0));
 
         // Check container runtime availability if container runtime is selected
-        let mut initial_logs = Vec::new();
+        let initial_logs = Vec::new();
         let runtime_type = match runtime_type {
             RuntimeType::Docker => {
                 // Use a timeout for the Docker availability check to prevent hanging
@@ -370,11 +370,6 @@ impl App {
                 };
 
                 if !is_docker_available {
-                    initial_logs.push(format!(
-                        "[{}] {} Docker is not available or unresponsive. Using emulation mode instead.",
-                        Local::now().format("%H:%M:%S"),
-                        wrkflw_logging::symbols::WARNING,
-                    ));
                     wrkflw_logging::warning(
                         "Docker is not available or unresponsive. Using emulation mode instead.",
                     );
@@ -423,11 +418,6 @@ impl App {
                 };
 
                 if !is_podman_available {
-                    initial_logs.push(format!(
-                        "[{}] {} Podman is not available or unresponsive. Using emulation mode instead.",
-                        Local::now().format("%H:%M:%S"),
-                        wrkflw_logging::symbols::WARNING,
-                    ));
                     wrkflw_logging::warning(
                         "Podman is not available or unresponsive. Using emulation mode instead.",
                     );
@@ -548,8 +538,7 @@ impl App {
             _ => false,
         };
         self.last_availability_check = Instant::now();
-        self.logs
-            .push(format!("Switched to {} mode", self.runtime_type_name()));
+        self.add_timestamped_log(&format!("Switched to {} mode", self.runtime_type_name()));
     }
 
     /// Cycle through the event names the diff filter simulates.
@@ -762,7 +751,7 @@ impl App {
             for workflow in &mut self.workflows {
                 workflow.trigger_match = None;
             }
-            self.logs.push("Diff filter OFF".to_string());
+            self.add_timestamped_log("Diff filter OFF");
         }
     }
 
@@ -800,7 +789,7 @@ impl App {
                     if self.diff_filter_aborted {
                         self.diff_filter_aborted = false;
                     } else {
-                        self.logs.push("Diff filter: evaluation failed".to_string());
+                        self.add_timestamped_log("Diff filter: evaluation failed");
                     }
                     return;
                 }
@@ -832,7 +821,7 @@ impl App {
                     .iter()
                     .filter(|w| matches!(&w.trigger_match, Some(TriggerMatchStatus::Matched(_))))
                     .count();
-                self.logs.push(format!(
+                self.add_timestamped_log(&format!(
                     "Diff filter ON: {}/{} workflows would trigger",
                     matched,
                     self.workflows.len()
@@ -853,10 +842,12 @@ impl App {
                 // load-bearing to avoid the silent-skip mode this PR
                 // is built to plug.
                 if !warnings.is_empty() {
-                    self.logs
-                        .push(format!("Diff filter: {} warning(s)", warnings.len()));
+                    self.add_timestamped_log(&format!(
+                        "Diff filter: {} warning(s)",
+                        warnings.len()
+                    ));
                     for w in &warnings {
-                        self.logs.push(format!("  warning: {}", w));
+                        self.add_log(format!("  warning: {}", w));
                     }
                 }
 
@@ -866,13 +857,12 @@ impl App {
                 // Surface each failure individually so the YAML/glob
                 // typo is the first thing they see in the log pane.
                 if !parse_failures.is_empty() {
-                    self.logs.push(format!(
+                    self.add_timestamped_log(&format!(
                         "Diff filter: {} workflow file(s) failed to parse and were skipped",
                         parse_failures.len()
                     ));
                     for (path, reason) in &parse_failures {
-                        self.logs
-                            .push(format!("  parse error: {}: {}", path.display(), reason));
+                        self.add_log(format!("  parse error: {}: {}", path.display(), reason));
                     }
                 }
 
@@ -891,8 +881,7 @@ impl App {
                 for workflow in &mut self.workflows {
                     workflow.trigger_match = None;
                 }
-                self.logs
-                    .push(format!("Diff filter: evaluation failed — {}", reason));
+                self.add_timestamped_log(&format!("Diff filter: evaluation failed — {}", reason));
                 self.trim_logs_to_cap();
             }
         }
@@ -1264,8 +1253,10 @@ impl App {
         let target_job = entry.target_job;
         self.workflows[next].status = WorkflowStatus::Running;
         self.current_execution = Some(next);
-        self.logs
-            .push(format!("Executing workflow: {}", self.workflows[next].name));
+        self.add_timestamped_log(&format!(
+            "Executing workflow: {}",
+            self.workflows[next].name
+        ));
         wrkflw_logging::info(&format!(
             "Executing workflow: {}",
             self.workflows[next].name

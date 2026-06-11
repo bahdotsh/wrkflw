@@ -191,7 +191,7 @@ impl LogProcessor {
     }
 
     /// Process a single log entry into display format
-    fn process_log_entry(log_line: &str, search_query: &str) -> ProcessedLogEntry {
+    pub(crate) fn process_log_entry(log_line: &str, search_query: &str) -> ProcessedLogEntry {
         // Extract timestamp from log format [HH:MM:SS]
         let timestamp = if log_line.starts_with('[') && log_line.contains(']') {
             let end = log_line.find(']').unwrap_or(0);

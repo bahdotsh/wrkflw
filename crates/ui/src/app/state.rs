@@ -572,7 +572,7 @@ impl App {
             .unwrap_or(0);
         let next_idx = (current_idx + 1) % ROTATION.len();
         let next = ROTATION[next_idx].to_string();
-        self.logs.push(format!(
+        self.add_timestamped_log(&format!(
             "Diff filter event: {} -> {}",
             self.diff_filter_event, next
         ));
@@ -2124,12 +2124,11 @@ impl App {
         let curl = self.trigger_curl_preview();
         let mut lines = curl.lines();
         if let Some(first) = lines.next() {
-            self.logs.push(format!("curl: {}", first));
+            self.add_timestamped_log(&format!("curl: {}", first));
         }
         for rest in lines {
-            self.logs.push(format!("curl: {}", rest));
+            self.add_timestamped_log(&format!("curl: {}", rest));
         }
-        self.trim_logs_to_cap();
     }
 
     /// Exposed as `pub` so the Trigger view can render the same string
@@ -2254,13 +2253,12 @@ impl App {
             .cloned()
             .collect();
         let platform = self.trigger_platform;
-        self.logs.push(format!(
+        self.add_timestamped_log(&format!(
             "Dispatching {} to {:?} (branch: {})",
             wf_name_raw,
             platform,
             branch.as_deref().unwrap_or("<default>")
         ));
-        self.trim_logs_to_cap();
 
         // Flip the in-flight flag BEFORE the spawn so a rapid
         // second Enter — dispatched from the same UI tick before
@@ -2335,7 +2333,6 @@ impl App {
     /// `try_recv` so the call never blocks.
     pub fn drain_trigger_outcomes(&mut self) {
         let mut last: Option<DispatchOutcome> = None;
-        let mut drained = 0usize;
         while let Ok(outcome) = self.trigger_outcome_rx.try_recv() {
             // Log every outcome so the Logs tab is the durable
             // record — the status bar can only show one line.
@@ -2352,7 +2349,7 @@ impl App {
                     e
                 ),
             };
-            self.logs.push(line);
+            self.add_timestamped_log(&line);
             // Prefer the most recent error over any later success,
             // and the most recent outcome otherwise.
             match (&last, &outcome.result) {
@@ -2361,10 +2358,6 @@ impl App {
                 }
                 _ => last = Some(outcome),
             }
-            drained += 1;
-        }
-        if drained > 0 {
-            self.trim_logs_to_cap();
         }
         if let Some(outcome) = last {
             match outcome.result {
@@ -2775,6 +2768,13 @@ mod tests {
         app
     }
 
+    /// Run a log line through the real renderer-side parser and return
+    /// the timestamp it extracts — `??:??:??` means the line is missing
+    /// the `[HH:MM:SS]` prefix the Execution/Logs tabs depend on.
+    fn parsed_timestamp(line: &str) -> String {
+        crate::log_processor::LogProcessor::process_log_entry(line, "").timestamp
+    }
+
     #[test]
     fn log_buffer_caps_at_configured_size() {
         // Long-running TUI sessions (especially with rapid diff-filter
@@ -2823,6 +2823,73 @@ mod tests {
             app.diff_filter_event, "push",
             "rotation must wrap after exhausting the known-event list"
         );
+    }
+
+    #[test]
+    fn cycle_diff_filter_event_logs_timestamped_line() {
+        let mut app = make_app();
+        app.logs.clear();
+        app.cycle_diff_filter_event();
+        let line = app
+            .logs
+            .iter()
+            .find(|l| l.contains("Diff filter event: push -> pull_request"))
+            .expect("cycling must log the event transition");
+        assert_ne!(
+            parsed_timestamp(line),
+            "??:??:??",
+            "diff filter event line must carry a timestamp, got {:?}",
+            line
+        );
+    }
+
+    #[test]
+    fn trigger_tab_copy_curl_logs_timestamped_lines() {
+        let mut app = make_app();
+        app.logs.clear();
+        // No repo cache: the preview falls back to placeholder values,
+        // which is fine — only the log-line shape matters here.
+        app.trigger_tab_copy_curl();
+        assert!(!app.logs.is_empty(), "copy-curl must log the recipe");
+        for line in &app.logs {
+            assert!(line.contains("curl:"), "unexpected line {:?}", line);
+            assert_ne!(
+                parsed_timestamp(line),
+                "??:??:??",
+                "every curl line must carry a timestamp, got {:?}",
+                line
+            );
+        }
+    }
+
+    #[test]
+    fn drain_trigger_outcomes_logs_timestamped_lines() {
+        let mut app = make_app();
+        app.logs.clear();
+        app.trigger_outcome_tx
+            .send(DispatchOutcome {
+                platform: TriggerPlatform::Github,
+                workflow: "ci".into(),
+                result: Ok(()),
+            })
+            .unwrap();
+        app.trigger_outcome_tx
+            .send(DispatchOutcome {
+                platform: TriggerPlatform::Gitlab,
+                workflow: "deploy".into(),
+                result: Err("401 Unauthorized".into()),
+            })
+            .unwrap();
+        app.drain_trigger_outcomes();
+        assert_eq!(app.logs.len(), 2, "both outcomes must be logged");
+        for line in &app.logs {
+            assert_ne!(
+                parsed_timestamp(line),
+                "??:??:??",
+                "dispatch outcome line must carry a timestamp, got {:?}",
+                line
+            );
+        }
     }
 
     #[test]

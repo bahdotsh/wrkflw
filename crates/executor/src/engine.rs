@@ -79,8 +79,9 @@ fn is_gitlab_pipeline(path: &Path) -> bool {
 /// Execute a GitHub Actions workflow file locally
 async fn execute_github_workflow(
     workflow_path: &Path,
-    config: ExecutionConfig,
+    mut config: ExecutionConfig,
 ) -> Result<ExecutionResult, ExecutionError> {
+    config.runtime_type = detect_runtime(config.runtime_type);
     // 1. Parse workflow file
     let workflow = parse_workflow(workflow_path)?;
 
@@ -158,6 +159,7 @@ async fn execute_github_workflow(
     env_context.insert(
         "WRKFLW_RUNTIME_MODE".to_string(),
         match config.runtime_type {
+            RuntimeType::Auto => "auto".to_string(),
             RuntimeType::Emulation => "emulation".to_string(),
             RuntimeType::SecureEmulation => "secure_emulation".to_string(),
             RuntimeType::Docker => "docker".to_string(),
@@ -306,8 +308,9 @@ async fn execute_github_workflow(
 /// Execute a GitLab CI/CD pipeline locally
 async fn execute_gitlab_pipeline(
     pipeline_path: &Path,
-    config: ExecutionConfig,
+    mut config: ExecutionConfig,
 ) -> Result<ExecutionResult, ExecutionError> {
+    config.runtime_type = detect_runtime(config.runtime_type);
     wrkflw_logging::info("Executing GitLab CI/CD pipeline");
 
     // 1. Parse the GitLab pipeline file
@@ -351,6 +354,7 @@ async fn execute_gitlab_pipeline(
     env_context.insert(
         "WRKFLW_RUNTIME_MODE".to_string(),
         match config.runtime_type {
+            RuntimeType::Auto => "auto".to_string(),
             RuntimeType::Emulation => "emulation".to_string(),
             RuntimeType::SecureEmulation => "secure_emulation".to_string(),
             RuntimeType::Docker => "docker".to_string(),
@@ -562,15 +566,35 @@ fn resolve_gitlab_dependencies(
     Ok(execution_plan)
 }
 
+/// Resolves `RuntimeType::Auto` to a concrete runtime by probing availability.
+/// All other variants pass through unchanged.
+pub fn detect_runtime(runtime_type: RuntimeType) -> RuntimeType {
+    match runtime_type {
+        RuntimeType::Auto => {
+            if docker::is_available() {
+                RuntimeType::Docker
+            } else if podman::is_available() {
+                RuntimeType::Podman
+            } else {
+                RuntimeType::Emulation
+            }
+        }
+        other => other,
+    }
+}
+
 // Determine if Docker/Podman is available or fall back to emulation
 fn initialize_runtime(
     runtime_type: RuntimeType,
     preserve_containers_on_failure: bool,
 ) -> Result<Box<dyn ContainerRuntime>, ExecutionError> {
     match runtime_type {
+        RuntimeType::Auto => initialize_runtime(
+            detect_runtime(RuntimeType::Auto),
+            preserve_containers_on_failure,
+        ),
         RuntimeType::Docker => {
             if docker::is_available() {
-                // Handle the Result returned by DockerRuntime::new()
                 match docker::DockerRuntime::new_with_config(preserve_containers_on_failure) {
                     Ok(docker_runtime) => Ok(Box::new(docker_runtime)),
                     Err(e) => {
@@ -588,17 +612,9 @@ fn initialize_runtime(
         }
         RuntimeType::Podman => {
             if podman::is_available() {
-                // Handle the Result returned by PodmanRuntime::new()
-                match podman::PodmanRuntime::new_with_config(preserve_containers_on_failure) {
-                    Ok(podman_runtime) => Ok(Box::new(podman_runtime)),
-                    Err(e) => {
-                        wrkflw_logging::error(&format!(
-                            "Failed to initialize Podman runtime: {}, falling back to emulation mode",
-                            e
-                        ));
-                        Ok(Box::new(emulation::EmulationRuntime::new()))
-                    }
-                }
+                Ok(Box::new(podman::PodmanRuntime::new_unchecked(
+                    preserve_containers_on_failure,
+                )))
             } else {
                 wrkflw_logging::error("Podman not available, falling back to emulation mode");
                 Ok(Box::new(emulation::EmulationRuntime::new()))
@@ -613,6 +629,8 @@ fn initialize_runtime(
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum RuntimeType {
+    /// Detect Docker first, then Podman, then fall back to emulation.
+    Auto,
     Docker,
     Podman,
     Emulation,
@@ -9391,6 +9409,28 @@ runs:
             runtime.build_count.load(Ordering::SeqCst),
             1,
             "build_image should be called exactly once despite concurrent jobs"
+        );
+    }
+
+    // --- RuntimeType::Auto tests ---
+
+    #[test]
+    fn auto_is_distinct_from_concrete_variants() {
+        assert_ne!(RuntimeType::Auto, RuntimeType::Docker);
+        assert_ne!(RuntimeType::Auto, RuntimeType::Podman);
+        assert_ne!(RuntimeType::Auto, RuntimeType::Emulation);
+        assert_ne!(RuntimeType::Auto, RuntimeType::SecureEmulation);
+    }
+
+    #[test]
+    fn initialize_runtime_auto_does_not_panic() {
+        // Auto should always succeed (falls back to emulation when nothing is available).
+        // This exercises the full cascade on whatever the test environment provides.
+        let result = initialize_runtime(RuntimeType::Auto, false);
+        assert!(
+            result.is_ok(),
+            "Auto runtime initialization returned Err: {:?}",
+            result.err()
         );
     }
 }

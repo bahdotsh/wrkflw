@@ -10,6 +10,8 @@ mod watch_cmd;
 
 #[derive(Debug, Clone, ValueEnum)]
 pub(crate) enum RuntimeChoice {
+    /// Detect Docker first, then Podman, then fall back to emulation (default)
+    Auto,
     /// Use Docker containers for isolation
     Docker,
     /// Use Podman containers for isolation
@@ -23,6 +25,7 @@ pub(crate) enum RuntimeChoice {
 impl From<RuntimeChoice> for wrkflw_executor::RuntimeType {
     fn from(choice: RuntimeChoice) -> Self {
         match choice {
+            RuntimeChoice::Auto => wrkflw_executor::RuntimeType::Auto,
             RuntimeChoice::Docker => wrkflw_executor::RuntimeType::Docker,
             RuntimeChoice::Podman => wrkflw_executor::RuntimeType::Podman,
             RuntimeChoice::Emulation => wrkflw_executor::RuntimeType::Emulation,
@@ -78,7 +81,7 @@ enum Commands {
         path: PathBuf,
 
         /// Container runtime to use (docker, podman, emulation, secure-emulation)
-        #[arg(short, long, value_enum, default_value = "docker")]
+        #[arg(short, long, value_enum, default_value = "auto")]
         runtime: RuntimeChoice,
 
         /// Show 'Would execute GitHub action' messages in emulation mode
@@ -170,7 +173,7 @@ enum Commands {
         path: Option<PathBuf>,
 
         /// Container runtime to use (docker, podman, emulation, secure-emulation)
-        #[arg(short, long, value_enum, default_value = "docker")]
+        #[arg(short, long, value_enum, default_value = "auto")]
         runtime: RuntimeChoice,
 
         /// Debounce interval in milliseconds
@@ -255,7 +258,7 @@ enum Commands {
         path: Option<PathBuf>,
 
         /// Container runtime to use (docker, podman, emulation, secure-emulation)
-        #[arg(short, long, value_enum, default_value = "docker")]
+        #[arg(short, long, value_enum, default_value = "auto")]
         runtime: RuntimeChoice,
 
         /// Show 'Would execute GitHub action' messages in emulation mode
@@ -696,7 +699,7 @@ async fn main() {
             #[cfg(feature = "tui")]
             {
                 // Launch TUI by default when no command is provided
-                let runtime_type = wrkflw_executor::RuntimeType::Docker;
+                let runtime_type = wrkflw_executor::RuntimeType::Auto;
 
                 // Call the TUI implementation from the ui crate with default path
                 if let Err(e) =
@@ -932,5 +935,38 @@ fn list_workflows_and_pipelines(verbose: bool, show_jobs: bool) {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_choice_auto_maps_to_runtime_type_auto() {
+        let rt: wrkflw_executor::RuntimeType = RuntimeChoice::Auto.into();
+        assert_eq!(rt, wrkflw_executor::RuntimeType::Auto);
+    }
+
+    #[test]
+    fn runtime_choice_all_variants_map_correctly() {
+        use wrkflw_executor::RuntimeType;
+        assert_eq!(RuntimeType::from(RuntimeChoice::Auto), RuntimeType::Auto);
+        assert_eq!(
+            RuntimeType::from(RuntimeChoice::Docker),
+            RuntimeType::Docker
+        );
+        assert_eq!(
+            RuntimeType::from(RuntimeChoice::Podman),
+            RuntimeType::Podman
+        );
+        assert_eq!(
+            RuntimeType::from(RuntimeChoice::Emulation),
+            RuntimeType::Emulation
+        );
+        assert_eq!(
+            RuntimeType::from(RuntimeChoice::SecureEmulation),
+            RuntimeType::SecureEmulation
+        );
     }
 }

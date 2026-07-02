@@ -87,6 +87,7 @@ fn render_summary_strip(f: &mut Frame<'_>, app: &App, idx: usize, area: Rect) {
     // Left: workflow chip
     let (sym, sym_style) = theme::workflow_status_animated(&workflow.status, app.spinner_frame);
     let runtime_kind = match app.runtime_type {
+        RuntimeType::Auto => BadgeKind::Emulation,
         RuntimeType::Docker => BadgeKind::Docker,
         RuntimeType::Podman => BadgeKind::Podman,
         RuntimeType::SecureEmulation => BadgeKind::Secure,

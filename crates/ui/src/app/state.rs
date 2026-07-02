@@ -330,8 +330,49 @@ impl App {
         step_table_state.select(Some(0));
 
         // Check container runtime availability if container runtime is selected
-        let initial_logs = Vec::new();
         let runtime_type = match runtime_type {
+            RuntimeType::Auto => {
+                let detected = match std::panic::catch_unwind(|| {
+                    std::thread::scope(|s| {
+                        let h = s.spawn(|| wrkflw_executor::detect_runtime(RuntimeType::Auto));
+                        let start = std::time::Instant::now();
+                        let timeout = std::time::Duration::from_secs(1);
+                        while start.elapsed() < timeout {
+                            if h.is_finished() {
+                                return h.join().unwrap_or(RuntimeType::Emulation);
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
+                        wrkflw_logging::warning(
+                            "Auto runtime detection timed out, falling back to emulation mode",
+                        );
+                        RuntimeType::Emulation
+                    })
+                }) {
+                    Ok(r) => r,
+                    Err(_) => {
+                        wrkflw_logging::warning(
+                            "Auto runtime detection failed with panic, falling back to emulation mode",
+                        );
+                        RuntimeType::Emulation
+                    }
+                };
+                match detected {
+                    RuntimeType::Docker => wrkflw_logging::info("Auto-detected Docker runtime"),
+                    RuntimeType::Podman => wrkflw_logging::info("Auto-detected Podman runtime"),
+                    _ => {
+                        // System-logged only, matching the Docker/Podman arms
+                        // below. `get_combined_logs` folds the wrkflw_logging
+                        // store into the Logs tab with a real timestamp, so a
+                        // second app-side push would just render an
+                        // untimestamped duplicate.
+                        wrkflw_logging::warning(
+                            "No container runtime found (tried Docker and Podman). Using emulation mode instead.",
+                        );
+                    }
+                }
+                detected
+            }
             RuntimeType::Docker => {
                 // Use a timeout for the Docker availability check to prevent hanging
                 let is_docker_available = match std::panic::catch_unwind(|| {
@@ -447,7 +488,7 @@ impl App {
             show_action_messages,
             execution_queue: Vec::new(),
             current_execution: None,
-            logs: initial_logs,
+            logs: Vec::new(),
             log_scroll: 0,
             job_list_state,
             detailed_view: false,
@@ -528,6 +569,7 @@ impl App {
 
     pub fn toggle_emulation_mode(&mut self) {
         self.runtime_type = match self.runtime_type {
+            RuntimeType::Auto => RuntimeType::Docker,
             RuntimeType::Docker => RuntimeType::Podman,
             RuntimeType::Podman => RuntimeType::SecureEmulation,
             RuntimeType::SecureEmulation => RuntimeType::Emulation,
@@ -891,6 +933,7 @@ impl App {
 
     pub fn runtime_type_name(&self) -> &str {
         match self.runtime_type {
+            RuntimeType::Auto => "Auto",
             RuntimeType::Docker => "Docker",
             RuntimeType::Podman => "Podman",
             RuntimeType::SecureEmulation => "Secure Emulation",

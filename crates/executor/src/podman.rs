@@ -29,16 +29,20 @@ impl PodmanRuntime {
     }
 
     pub fn new_with_config(preserve_containers_on_failure: bool) -> Result<Self, ContainerError> {
-        // Check if podman command is available
         if !is_available() {
             return Err(ContainerError::ContainerStart(
                 "Podman is not available on this system".to_string(),
             ));
         }
+        Ok(Self::new_unchecked(preserve_containers_on_failure))
+    }
 
-        Ok(PodmanRuntime {
+    /// Construct without re-probing availability. Callers must have already verified
+    /// that Podman is available via `is_available()`.
+    pub(crate) fn new_unchecked(preserve_containers_on_failure: bool) -> Self {
+        PodmanRuntime {
             preserve_containers_on_failure,
-        })
+        }
     }
 
     // Add a method to store and retrieve customized images (e.g., with Python installed)

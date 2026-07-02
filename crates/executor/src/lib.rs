@@ -18,5 +18,6 @@ pub(crate) mod workflow_commands;
 // Re-export public items
 pub use docker::cleanup_resources;
 pub use engine::{
-    execute_workflow, ExecutionConfig, JobResult, JobStatus, RuntimeType, StepResult, StepStatus,
+    detect_runtime, execute_workflow, ExecutionConfig, JobResult, JobStatus, RuntimeType,
+    StepResult, StepStatus,
 };

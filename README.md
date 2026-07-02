@@ -103,8 +103,11 @@ wrkflw validate --verbose path/to/workflow.yml
 ### Execution
 
 ```bash
-# Run with Docker (default)
+# Run with auto-detection (default: tries Docker, then Podman, then emulation)
 wrkflw run .github/workflows/ci.yml
+
+# Run with Docker explicitly
+wrkflw run --runtime docker .github/workflows/ci.yml
 
 # Run with Podman
 wrkflw run --runtime podman .github/workflows/ci.yml
@@ -214,7 +217,8 @@ wrkflw trigger-gitlab --branch main --variable key=value
 
 | Mode | Description | Best for |
 |------|-------------|----------|
-| **Docker** (default) | Full container isolation, closest to GitHub runners | Production, CI/CD |
+| **Auto** (default) | Detects Docker, then Podman, then falls back to emulation | Most users |
+| **Docker** | Full container isolation, closest to GitHub runners | Production, CI/CD |
 | **Podman** | Rootless containers, no daemon required | Security-conscious environments |
 | **Emulation** | Runs directly on host, no containers needed | Quick local testing |
 | **Secure Emulation** | Sandboxed host processes with filesystem/network restrictions | Running untrusted workflows without a container runtime |

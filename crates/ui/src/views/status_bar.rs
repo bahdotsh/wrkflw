@@ -62,6 +62,7 @@ pub fn render_status_bar(f: &mut Frame<'_>, app: &App, area: Rect) {
     }
     right.push(Span::raw(" "));
     let runtime_badge_kind = match app.runtime_type {
+        RuntimeType::Auto => BadgeKind::Emulation,
         RuntimeType::Docker => BadgeKind::Docker,
         RuntimeType::Podman => BadgeKind::Podman,
         RuntimeType::SecureEmulation => BadgeKind::Secure,

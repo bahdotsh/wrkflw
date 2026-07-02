@@ -477,7 +477,9 @@ pub fn start_next_workflow_execution(
                 };
 
                 if !is_docker_available {
-                    app.add_timestamped_log("Docker is not available. Using emulation mode instead.");
+                    app.add_timestamped_log(
+                        "Docker is not available. Using emulation mode instead.",
+                    );
                     wrkflw_logging::warning(
                         "Docker is not available. Using emulation mode instead.",
                     );
@@ -501,7 +503,9 @@ pub fn start_next_workflow_execution(
                 };
 
                 if !is_podman_available {
-                    app.add_timestamped_log("Podman is not available. Using emulation mode instead.");
+                    app.add_timestamped_log(
+                        "Podman is not available. Using emulation mode instead.",
+                    );
                     wrkflw_logging::warning(
                         "Podman is not available. Using emulation mode instead.",
                     );

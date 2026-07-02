@@ -615,7 +615,9 @@ fn run_tui_event_loop(
                                 "Cannot trigger workflow while another operation is in progress",
                             );
                         } else if app.selected_tab != TAB_WORKFLOWS {
-                            app.add_timestamped_log("Switch to Workflows tab to trigger a workflow");
+                            app.add_timestamped_log(
+                                "Switch to Workflows tab to trigger a workflow",
+                            );
                             wrkflw_logging::warning(
                                 "Switch to Workflows tab to trigger a workflow",
                             );

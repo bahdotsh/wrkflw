@@ -30,18 +30,18 @@ pub struct App {
     pub execution_queue: Vec<QueuedExecution>, // Workflows queued for execution
     pub current_execution: Option<usize>,
     logs: Vec<String>, // Overall execution logs — private so every mutation routes through `add_log`
-    pub log_scroll: usize,                       // Scrolling position for logs
-    pub job_list_state: ListState,               // For viewing job details
-    pub detailed_view: bool,                     // Whether we're in detailed view mode
-    pub step_list_state: ListState,              // For selecting steps in detailed view
-    pub step_table_state: TableState,            // For the steps table in detailed view
-    pub last_tick: Instant,                      // For UI animations and updates
-    pub tick_rate: Duration,                     // How often to update the UI
-    pub spinner_frame: usize,                    // Current spinner animation frame
-    pub tx: mpsc::Sender<ExecutionResultMsg>,    // Channel for async communication
-    pub status_message: Option<String>,          // Temporary status message to display
+    pub log_scroll: usize, // Scrolling position for logs
+    pub job_list_state: ListState, // For viewing job details
+    pub detailed_view: bool, // Whether we're in detailed view mode
+    pub step_list_state: ListState, // For selecting steps in detailed view
+    pub step_table_state: TableState, // For the steps table in detailed view
+    pub last_tick: Instant, // For UI animations and updates
+    pub tick_rate: Duration, // How often to update the UI
+    pub spinner_frame: usize, // Current spinner animation frame
+    pub tx: mpsc::Sender<ExecutionResultMsg>, // Channel for async communication
+    pub status_message: Option<String>, // Temporary status message to display
     pub status_message_severity: StatusSeverity, // Severity of the current status message
-    pub status_message_time: Option<Instant>,    // When the message was set
+    pub status_message_time: Option<Instant>, // When the message was set
 
     // Search and filter functionality
     pub log_search_query: String, // Current search query for logs
@@ -867,7 +867,6 @@ impl App {
                         self.add_log(format!("  parse error: {}: {}", path.display(), reason));
                     }
                 }
-
             }
             DiffFilterOutcome::Failure(reason) => {
                 for workflow in &mut self.workflows {
@@ -2786,7 +2785,11 @@ mod tests {
         let revision_before = app.logs_revision;
         app.add_timestamped_log("one more while at cap");
 
-        assert_eq!(app.logs.len(), len_before, "len must stay pinned at the cap");
+        assert_eq!(
+            app.logs.len(),
+            len_before,
+            "len must stay pinned at the cap"
+        );
         assert_ne!(
             app.logs_revision, revision_before,
             "revision must advance even though len did not"

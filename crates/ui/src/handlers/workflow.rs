@@ -449,13 +449,11 @@ pub fn start_next_workflow_execution(
 
         // Log whether verbose mode is enabled
         if verbose {
-            app.logs
-                .push("Verbose mode: Step outputs will be displayed in full".to_string());
+            app.add_timestamped_log("Verbose mode: Step outputs will be displayed in full");
             wrkflw_logging::info("Verbose mode: Step outputs will be displayed in full");
         } else {
-            app.logs.push(
-                "Standard mode: Only step status will be shown (use --verbose for full output)"
-                    .to_string(),
+            app.add_timestamped_log(
+                "Standard mode: Only step status will be shown (use --verbose for full output)",
             );
             wrkflw_logging::info(
                 "Standard mode: Only step status will be shown (use --verbose for full output)",
@@ -479,8 +477,7 @@ pub fn start_next_workflow_execution(
                 };
 
                 if !is_docker_available {
-                    app.logs
-                        .push("Docker is not available. Using emulation mode instead.".to_string());
+                    app.add_timestamped_log("Docker is not available. Using emulation mode instead.");
                     wrkflw_logging::warning(
                         "Docker is not available. Using emulation mode instead.",
                     );
@@ -504,8 +501,7 @@ pub fn start_next_workflow_execution(
                 };
 
                 if !is_podman_available {
-                    app.logs
-                        .push("Podman is not available. Using emulation mode instead.".to_string());
+                    app.add_timestamped_log("Podman is not available. Using emulation mode instead.");
                     wrkflw_logging::warning(
                         "Podman is not available. Using emulation mode instead.",
                     );
@@ -629,9 +625,7 @@ pub fn start_next_workflow_execution(
         });
     } else {
         app.running = false;
-        let timestamp = Local::now().format("%H:%M:%S").to_string();
-        app.logs
-            .push(format!("[{}] All workflows completed execution", timestamp));
+        app.add_timestamped_log("All workflows completed execution");
         wrkflw_logging::info("All workflows completed execution");
     }
 }

@@ -35,9 +35,13 @@ impl ProcessedLogEntry {
 pub struct LogProcessingRequest {
     pub search_query: String,
     pub filter_level: Option<LogFilterLevel>,
-    pub app_logs: Vec<String>,    // Complete app logs
-    pub app_logs_count: usize,    // To detect changes in app logs
-    pub system_logs_count: usize, // To detect changes in system logs
+    pub app_logs: Vec<String>, // Complete app logs
+    // Change signal for app logs AND search/filter edits. A revision
+    // counter rather than `app_logs.len()`: once the app's buffer
+    // hits its cap, pushes stop changing the length (one old entry is
+    // dropped per new one), so a count would freeze the display.
+    pub app_logs_revision: u64,
+    pub system_logs_count: usize, // To detect changes in system logs (unbounded, so len works)
 }
 
 /// Response with processed logs
@@ -94,7 +98,9 @@ impl LogProcessor {
         let mut last_request: Option<LogProcessingRequest> = None;
         let mut last_processed_time = Instant::now();
         let mut cached_logs: Vec<String> = Vec::new();
-        let mut cached_app_logs_count = 0;
+        // u64::MAX so the first request always mismatches — the app's
+        // revision starts at 0.
+        let mut cached_app_logs_revision = u64::MAX;
         let mut cached_system_logs_count = 0;
 
         loop {
@@ -110,17 +116,17 @@ impl LogProcessor {
 
             if let Some(ref req) = last_request {
                 let should_process = last_processed_time.elapsed() > Duration::from_millis(50)
-                    && (cached_app_logs_count != req.app_logs_count
+                    && (cached_app_logs_revision != req.app_logs_revision
                         || cached_system_logs_count != req.system_logs_count
                         || cached_logs.is_empty());
 
                 if should_process {
-                    if cached_app_logs_count != req.app_logs_count
+                    if cached_app_logs_revision != req.app_logs_revision
                         || cached_system_logs_count != req.system_logs_count
                         || cached_logs.is_empty()
                     {
                         cached_logs = Self::get_combined_logs(&req.app_logs);
-                        cached_app_logs_count = req.app_logs_count;
+                        cached_app_logs_revision = req.app_logs_revision;
                         cached_system_logs_count = req.system_logs_count;
                     }
 

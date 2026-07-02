@@ -29,7 +29,7 @@ pub struct App {
     pub show_action_messages: bool,
     pub execution_queue: Vec<QueuedExecution>, // Workflows queued for execution
     pub current_execution: Option<usize>,
-    pub logs: Vec<String>,                       // Overall execution logs
+    logs: Vec<String>, // Overall execution logs — private so every mutation routes through `add_log`
     pub log_scroll: usize,                       // Scrolling position for logs
     pub job_list_state: ListState,               // For viewing job details
     pub detailed_view: bool,                     // Whether we're in detailed view mode
@@ -58,6 +58,7 @@ pub struct App {
     pub processed_logs: Vec<ProcessedLogEntry>,
     pub logs_need_update: bool,        // Flag to trigger log processing
     pub last_system_logs_count: usize, // Track system log changes
+    logs_revision: u64, // Bumped on every log/search/filter change; `logs.len()` goes stale at the cap
 
     // Job selection mode
     pub job_selection_mode: bool, // Are we viewing jobs of a workflow?
@@ -473,6 +474,7 @@ impl App {
             processed_logs: Vec::new(),
             logs_need_update: true,
             last_system_logs_count: 0,
+            logs_revision: 0,
 
             // Job selection mode
             job_selection_mode: false,
@@ -866,23 +868,12 @@ impl App {
                     }
                 }
 
-                // Ad-hoc `self.logs.push(...)` skips the cap that
-                // `add_log` / `mark_logs_for_update` normally enforce.
-                // A single large evaluation could push dozens of
-                // rows + warnings + parse failures all at once, and
-                // without this trim the buffer can temporarily exceed
-                // `LOG_BUFFER_CAP` until the next render pass happens
-                // to route through `mark_logs_for_update`. Mirror the
-                // `add_log` discipline here so the cap invariant is
-                // reasserted immediately.
-                self.trim_logs_to_cap();
             }
             DiffFilterOutcome::Failure(reason) => {
                 for workflow in &mut self.workflows {
                     workflow.trigger_match = None;
                 }
                 self.add_timestamped_log(&format!("Diff filter: evaluation failed — {}", reason));
-                self.trim_logs_to_cap();
             }
         }
     }
@@ -894,10 +885,9 @@ impl App {
         } else {
             "normal"
         };
-        let timestamp = Local::now().format("%H:%M:%S").to_string();
-        self.logs
-            .push(format!("[{}] Switched to {} mode", timestamp, mode));
-        wrkflw_logging::info(&format!("Switched to {} mode", mode));
+        let msg = format!("Switched to {} mode", mode);
+        self.add_timestamped_log(&msg);
+        wrkflw_logging::info(&msg);
     }
 
     pub fn runtime_type_name(&self) -> &str {
@@ -1110,9 +1100,7 @@ impl App {
 
             // Log only once at the beginning - don't initialize execution details here
             // since that will happen in start_next_workflow_execution
-            let timestamp = Local::now().format("%H:%M:%S").to_string();
-            self.logs
-                .push(format!("[{}] Starting workflow execution...", timestamp));
+            self.add_timestamped_log("Starting workflow execution...");
             wrkflw_logging::info("Starting workflow execution...");
         }
     }
@@ -1124,11 +1112,7 @@ impl App {
         result: Result<(Vec<wrkflw_executor::JobResult>, ()), String>,
     ) {
         if workflow_idx >= self.workflows.len() {
-            let timestamp = Local::now().format("%H:%M:%S").to_string();
-            self.logs.push(format!(
-                "[{}] Error: Invalid workflow index received",
-                timestamp
-            ));
+            self.add_timestamped_log("Error: Invalid workflow index received");
             wrkflw_logging::error("Invalid workflow index received in process_execution_result");
             return;
         }
@@ -1210,27 +1194,17 @@ impl App {
         match result {
             Ok(_) => {
                 workflow.status = WorkflowStatus::Success;
-                let timestamp = Local::now().format("%H:%M:%S").to_string();
-                self.logs.push(format!(
-                    "[{}] Workflow '{}' completed successfully!",
-                    timestamp, workflow.name
-                ));
-                wrkflw_logging::info(&format!(
-                    "[{}] Workflow '{}' completed successfully!",
-                    timestamp, workflow.name
-                ));
+                // `wrkflw_logging` stamps its own [HH:MM:SS] prefix,
+                // so it gets the bare message.
+                let msg = format!("Workflow '{}' completed successfully!", workflow.name);
+                self.add_timestamped_log(&msg);
+                wrkflw_logging::info(&msg);
             }
             Err(e) => {
                 workflow.status = WorkflowStatus::Failed;
-                let timestamp = Local::now().format("%H:%M:%S").to_string();
-                self.logs.push(format!(
-                    "[{}] Workflow '{}' failed: {}",
-                    timestamp, workflow.name, e
-                ));
-                wrkflw_logging::error(&format!(
-                    "[{}] Workflow '{}' failed: {}",
-                    timestamp, workflow.name, e
-                ));
+                let msg = format!("Workflow '{}' failed: {}", workflow.name, e);
+                self.add_timestamped_log(&msg);
+                wrkflw_logging::error(&msg);
             }
         }
 
@@ -1620,25 +1594,19 @@ impl App {
                 let workflow = &self.workflows[selected_idx];
 
                 if workflow.name.is_empty() {
-                    let timestamp = Local::now().format("%H:%M:%S").to_string();
-                    self.logs
-                        .push(format!("[{}] Error: Invalid workflow selection", timestamp));
+                    self.add_timestamped_log("Error: Invalid workflow selection");
                     wrkflw_logging::error(
                         "Invalid workflow selection in trigger_selected_workflow",
                     );
                     return;
                 }
 
-                // Set up background task to execute the workflow via GitHub Actions REST API
-                let timestamp = Local::now().format("%H:%M:%S").to_string();
-                self.logs.push(format!(
-                    "[{}] Triggering workflow: {}",
-                    timestamp, workflow.name
-                ));
-                wrkflw_logging::info(&format!("Triggering workflow: {}", workflow.name));
-
                 // Clone necessary values for the async task
                 let workflow_name = workflow.name.clone();
+
+                // Set up background task to execute the workflow via GitHub Actions REST API
+                self.add_timestamped_log(&format!("Triggering workflow: {}", workflow_name));
+                wrkflw_logging::info(&format!("Triggering workflow: {}", workflow_name));
                 let tx_clone = self.tx.clone();
 
                 // Set this tab as the current execution to ensure it shows in the Execution tab
@@ -1672,14 +1640,11 @@ impl App {
                     }
                 });
             } else {
-                let timestamp = Local::now().format("%H:%M:%S").to_string();
-                self.logs
-                    .push(format!("[{}] No workflow selected to trigger", timestamp));
+                self.add_timestamped_log("No workflow selected to trigger");
                 wrkflw_logging::warning("No workflow selected to trigger");
             }
         } else {
-            self.logs
-                .push("No workflow selected to trigger".to_string());
+            self.add_timestamped_log("No workflow selected to trigger");
             wrkflw_logging::warning("No workflow selected to trigger");
         }
     }
@@ -1688,24 +1653,21 @@ impl App {
     pub fn reset_workflow_status(&mut self) {
         // Log whether a selection exists
         if self.workflow_list_state.selected().is_none() {
-            let timestamp = Local::now().format("%H:%M:%S").to_string();
-            self.logs.push(format!(
-                "[{}] Debug: No workflow selected for reset",
-                timestamp
-            ));
+            self.add_timestamped_log("Debug: No workflow selected for reset");
             wrkflw_logging::warning("No workflow selected for reset");
             return;
         }
 
         if let Some(idx) = self.workflow_list_state.selected() {
             if idx < self.workflows.len() {
-                let workflow = &mut self.workflows[idx];
                 // Log before status
-                let timestamp = Local::now().format("%H:%M:%S").to_string();
-                self.logs.push(format!(
-                    "[{}] Debug: Attempting to reset workflow '{}' from {:?} state",
-                    timestamp, workflow.name, workflow.status
-                ));
+                let attempt_msg = format!(
+                    "Debug: Attempting to reset workflow '{}' from {:?} state",
+                    self.workflows[idx].name, self.workflows[idx].status
+                );
+                self.add_timestamped_log(&attempt_msg);
+
+                let workflow = &mut self.workflows[idx];
 
                 // Debug: Reset unconditionally for testing
                 // if workflow.status != WorkflowStatus::Running {
@@ -1725,15 +1687,12 @@ impl App {
                 // Clear execution details to reset all state
                 workflow.execution_details = None;
 
-                let timestamp = Local::now().format("%H:%M:%S").to_string();
-                self.logs.push(format!(
-                    "[{}] Reset workflow '{}' from {} state to NotStarted - status is now {:?}",
-                    timestamp, workflow.name, old_status, workflow.status
-                ));
-                wrkflw_logging::info(&format!(
+                let reset_msg = format!(
                     "Reset workflow '{}' from {} state to NotStarted - status is now {:?}",
                     workflow.name, old_status, workflow.status
-                ));
+                );
+                self.add_timestamped_log(&reset_msg);
+                wrkflw_logging::info(&reset_msg);
 
                 // Set a success status message
                 self.set_success_message(format!("Workflow '{}' has been reset!", workflow_name));
@@ -1747,7 +1706,7 @@ impl App {
             search_query: self.log_search_query.clone(),
             filter_level: self.log_filter_level.clone(),
             app_logs: self.logs.clone(),
-            app_logs_count: self.logs.len(),
+            app_logs_revision: self.logs_revision,
             system_logs_count: wrkflw_logging::get_logs().len(),
         };
 
@@ -1783,17 +1742,21 @@ impl App {
         }
     }
 
-    /// Trigger log processing when search/filter changes.
+    /// Trigger log processing when the logs or the search/filter
+    /// settings change.
     ///
-    /// Also enforces the log buffer cap so ad-hoc `self.logs.push(...)`
-    /// sites — which are sprinkled throughout the codebase for
-    /// historical reasons — don't need to each remember to call
-    /// [`trim_logs_to_cap`]. Every log mutation eventually routes
-    /// through `mark_logs_for_update` (that's what makes the logs
-    /// actually render), so trimming here is the single
-    /// unavoidable choke point.
+    /// This is the single choke point for the log pipeline: every
+    /// mutation routes through here (`logs` is private, so pushes go
+    /// via [`add_log`], and the search/filter setters call this
+    /// directly). It enforces the buffer cap and bumps the revision
+    /// the background processor uses for change detection.
     pub fn mark_logs_for_update(&mut self) {
         self.trim_logs_to_cap();
+        // Bump the revision AFTER trimming so the processor sees one
+        // revision per mutation. `logs.len()` cannot serve as the
+        // change signal: once the buffer is at LOG_BUFFER_CAP the
+        // trim keeps len constant while content still changes.
+        self.logs_revision = self.logs_revision.wrapping_add(1);
         self.logs_need_update = true;
         self.request_log_processing_update();
     }
@@ -1818,8 +1781,7 @@ impl App {
     /// Add a log entry and trigger log processing update
     pub fn add_log(&mut self, message: String) {
         self.logs.push(message);
-        self.trim_logs_to_cap();
-        self.mark_logs_for_update();
+        self.mark_logs_for_update(); // trims to the cap and bumps the revision
     }
 
     /// Add a formatted log entry with timestamp and trigger log processing update
@@ -1859,15 +1821,14 @@ impl App {
     const LOG_BUFFER_CAP: usize = 5000;
 
     /// Enforce [`LOG_BUFFER_CAP`] by dropping the oldest entries
-    /// until the buffer is within bounds. Called from every
-    /// [`add_log`] path AND from [`trim_logs_to_cap`] so ad-hoc
-    /// `self.logs.push(...)` sites can opt into the cap by calling
-    /// this once after pushing.
+    /// until the buffer is within bounds. Called from
+    /// [`mark_logs_for_update`], which every log mutation routes
+    /// through now that `logs` is private.
     ///
     /// Uses `drain(0..N)` instead of rebuilding the vec so the tail
     /// entries don't get re-cloned; the operation is O(n) in the
     /// number of *dropped* entries, which is zero on the fast path.
-    pub fn trim_logs_to_cap(&mut self) {
+    fn trim_logs_to_cap(&mut self) {
         if self.logs.len() > Self::LOG_BUFFER_CAP {
             let excess = self.logs.len() - Self::LOG_BUFFER_CAP;
             self.logs.drain(0..excess);
@@ -2778,11 +2739,11 @@ mod tests {
     #[test]
     fn log_buffer_caps_at_configured_size() {
         // Long-running TUI sessions (especially with rapid diff-filter
-        // toggles) previously grew `logs` unbounded. The cap has to
-        // hold even when callers push directly to `self.logs` without
-        // going through `add_log`, because every render path eventually
-        // routes through `mark_logs_for_update`. Verify the cap kicks
-        // in on both shapes.
+        // toggles) previously grew `logs` unbounded. `logs` is private
+        // now, so production code can only push via `add_log`, but the
+        // cap is enforced in `mark_logs_for_update` — verify it holds
+        // even for direct pushes (possible only here, inside the state
+        // module) once that choke point runs.
         let mut app = make_app();
         // Start from a clean slate so the setup-time log lines do not
         // pollute the size assertion.
@@ -2804,6 +2765,31 @@ mod tests {
                 .contains(&format!("{}", App::LOG_BUFFER_CAP + 199)),
             "newest entry must survive the drain, got {:?}",
             app.logs.last()
+        );
+    }
+
+    #[test]
+    fn log_revision_advances_while_len_is_pinned_at_cap() {
+        // Once the buffer sits at LOG_BUFFER_CAP, every push drains one
+        // old entry, so `logs.len()` never changes again. The background
+        // processor keys its change detection off `logs_revision` for
+        // exactly this reason — a length-based signal froze the Logs tab
+        // the moment the cap was reached.
+        let mut app = make_app();
+        app.logs.clear();
+        for i in 0..App::LOG_BUFFER_CAP {
+            app.logs.push(format!("line {}", i));
+        }
+        app.mark_logs_for_update();
+
+        let len_before = app.logs.len();
+        let revision_before = app.logs_revision;
+        app.add_timestamped_log("one more while at cap");
+
+        assert_eq!(app.logs.len(), len_before, "len must stay pinned at the cap");
+        assert_ne!(
+            app.logs_revision, revision_before,
+            "revision must advance even though len did not"
         );
     }
 

@@ -8,7 +8,6 @@ use crate::views::{
     render_ui, TAB_COUNT, TAB_DAG, TAB_EXECUTION, TAB_HELP, TAB_LOGS, TAB_SECRETS, TAB_TRIGGER,
     TAB_WORKFLOWS,
 };
-use chrono::Local;
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers},
     execute,
@@ -57,7 +56,7 @@ pub async fn run_wrkflw_tui(
     );
 
     if app.validation_mode {
-        app.logs.push("Starting in validation mode".to_string());
+        app.add_timestamped_log("Starting in validation mode");
         wrkflw_logging::info("Starting in validation mode");
     }
 
@@ -558,14 +557,12 @@ fn run_tui_event_loop(
                                     if workflow.status == WorkflowStatus::NotStarted {
                                         app.trigger_selected_workflow();
                                     } else if workflow.status == WorkflowStatus::Running {
-                                        app.logs.push(format!(
+                                        let msg = format!(
                                             "Workflow '{}' is already running",
                                             workflow.name
-                                        ));
-                                        wrkflw_logging::warning(&format!(
-                                            "Workflow '{}' is already running",
-                                            workflow.name
-                                        ));
+                                        );
+                                        app.add_timestamped_log(&msg);
+                                        wrkflw_logging::warning(&msg);
                                     } else {
                                         // First, get all the data we need from the workflow
                                         let workflow_name = workflow.name.clone();
@@ -588,19 +585,16 @@ fn run_tui_event_loop(
                                         ));
 
                                         // Add log entries
-                                        app.logs.push(format!(
+                                        app.add_timestamped_log(&format!(
                                             "Cannot trigger workflow '{}' in {} state",
                                             workflow_name, status_text
                                         ));
 
                                         // Add hint about using reset
                                         if needs_reset_hint {
-                                            let timestamp =
-                                                Local::now().format("%H:%M:%S").to_string();
-                                            app.logs.push(format!(
-                                                "[{}] Hint: Press 'Shift+R' to reset the workflow status and allow triggering",
-                                                timestamp
-                                            ));
+                                            app.add_timestamped_log(
+                                                "Hint: Press 'Shift+R' to reset the workflow status and allow triggering",
+                                            );
                                         }
 
                                         wrkflw_logging::warning(&format!(
@@ -610,20 +604,20 @@ fn run_tui_event_loop(
                                     }
                                 }
                             } else {
-                                app.logs.push("No workflow selected to trigger".to_string());
+                                app.add_timestamped_log("No workflow selected to trigger");
                                 wrkflw_logging::warning("No workflow selected to trigger");
                             }
                         } else if app.running {
-                            app.logs.push(
-                                "Cannot trigger workflow while another operation is in progress"
-                                    .to_string(),
+                            app.add_timestamped_log(
+                                "Cannot trigger workflow while another operation is in progress",
                             );
                             wrkflw_logging::warning(
                                 "Cannot trigger workflow while another operation is in progress",
                             );
                         } else if app.selected_tab != TAB_WORKFLOWS {
-                            app.logs
-                                .push("Switch to Workflows tab to trigger a workflow".to_string());
+                            app.add_timestamped_log(
+                                "Switch to Workflows tab to trigger a workflow",
+                            );
                             wrkflw_logging::warning(
                                 "Switch to Workflows tab to trigger a workflow",
                             );

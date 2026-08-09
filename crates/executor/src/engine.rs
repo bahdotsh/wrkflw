@@ -4365,6 +4365,24 @@ fn prepare_container_mounts(
         }
     }
 
+    // Composite actions seed GITHUB_ACTION_PATH with the host action directory
+    // (see `execute_composite_action`). Under docker/podman that host path is
+    // invisible inside the container, so mount it and remap the env var to the
+    // container-side path, mirroring the GITHUB_ENV remap above.
+    if is_container_runtime {
+        if let Some(action_path) = job_env.get("GITHUB_ACTION_PATH") {
+            let container_action_dir = Path::new("/github/action");
+            step_env.insert(
+                "GITHUB_ACTION_PATH".to_string(),
+                container_action_dir.to_string_lossy().to_string(),
+            );
+            owned_volume_paths.push((
+                PathBuf::from(action_path),
+                container_action_dir.to_path_buf(),
+            ));
+        }
+    }
+
     (owned_volume_paths, github_mount)
 }
 
@@ -4751,6 +4769,20 @@ async fn execute_composite_action(
             // go into action_env only, not action_user_env.
             let mut action_env = job_env.clone();
             let mut action_user_env = job_user_env.clone();
+
+            // GITHUB_ACTION_PATH: the composite action's own directory, so its
+            // steps can reference their sibling files (e.g. `"$GITHUB_ACTION_PATH/main.sh"`).
+            // Runner-internal, like INPUT_* above — action_env only.
+            // `prepare_container_mounts` remaps this to a container-side path
+            // and mounts the directory under docker/podman.
+            let action_path_abs = action_path
+                .canonicalize()
+                .unwrap_or_else(|_| action_path.to_path_buf());
+            action_env.insert(
+                "GITHUB_ACTION_PATH".to_string(),
+                action_path_abs.to_string_lossy().to_string(),
+            );
+
             if let Some(inputs_def) = action_def.get("inputs") {
                 if let Some(inputs_map) = inputs_def.as_mapping() {
                     for (input_name, input_def) in inputs_map {
@@ -9368,6 +9400,115 @@ runs:
         // Without a step_id, ::set-output:: commands should be silently ignored
         process_workflow_commands("::set-output name=x::val\n", None, &mut outputs, None);
         assert!(outputs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn composite_action_sets_github_action_path_for_host_runtime() {
+        let action_dir = tempfile::tempdir().unwrap();
+        fs::write(
+            action_dir.path().join("action.yml"),
+            r#"
+name: test action
+runs:
+  using: composite
+  steps:
+    - run: echo hi
+"#,
+        )
+        .unwrap();
+
+        let runtime = MockContainerRuntime::default();
+        let job_env = HashMap::new();
+        let working_dir = tempfile::tempdir().unwrap();
+        let step = make_run_step("noop");
+        let services = test_services();
+        let pending = std::sync::Mutex::new(Vec::<PendingCacheSave>::new());
+
+        let result = execute_composite_action(
+            &step,
+            action_dir.path(),
+            &job_env,
+            &job_env,
+            working_dir.path(),
+            &runtime,
+            "ubuntu:latest",
+            false,
+            &services,
+            &pending,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.status, StepStatus::Success);
+
+        let expected = action_dir.path().canonicalize().unwrap();
+        let calls = runtime.run_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        let action_path_env = calls[0]
+            .env_vars
+            .iter()
+            .find(|(k, _)| k == "GITHUB_ACTION_PATH")
+            .map(|(_, v)| v.clone());
+        assert_eq!(
+            action_path_env,
+            Some(expected.to_string_lossy().to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn composite_action_mounts_action_dir_for_container_runtime() {
+        let action_dir = tempfile::tempdir().unwrap();
+        fs::write(
+            action_dir.path().join("action.yml"),
+            r#"
+name: test action
+runs:
+  using: composite
+  steps:
+    - run: echo hi
+"#,
+        )
+        .unwrap();
+
+        let runtime = MockContainerRuntime::default();
+        let mut job_env = HashMap::new();
+        job_env.insert("WRKFLW_RUNTIME_MODE".to_string(), "docker".to_string());
+        let working_dir = tempfile::tempdir().unwrap();
+        let step = make_run_step("noop");
+        let services = test_services();
+        let pending = std::sync::Mutex::new(Vec::<PendingCacheSave>::new());
+
+        let result = execute_composite_action(
+            &step,
+            action_dir.path(),
+            &job_env,
+            &job_env,
+            working_dir.path(),
+            &runtime,
+            "ubuntu:latest",
+            false,
+            &services,
+            &pending,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.status, StepStatus::Success);
+
+        let expected_host = action_dir.path().canonicalize().unwrap();
+        let calls = runtime.run_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        let call = &calls[0];
+
+        let action_path_env = call
+            .env_vars
+            .iter()
+            .find(|(k, _)| k == "GITHUB_ACTION_PATH")
+            .map(|(_, v)| v.clone());
+        assert_eq!(action_path_env, Some("/github/action".to_string()));
+
+        assert!(call
+            .volumes
+            .iter()
+            .any(|(host, guest)| host == &expected_host && guest == Path::new("/github/action")));
     }
 
     #[test]

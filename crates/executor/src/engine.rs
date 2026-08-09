@@ -7590,6 +7590,56 @@ runs:
         assert!(!host_script.exists());
     }
 
+    /// End-to-end proof that a custom shell (`taiki-e/install-action`'s
+    /// `/usr/bin/env ... /bin/sh -eu {0}`) survives real emulation execution,
+    /// including a shell function definition — the exact shape that choked
+    /// the old re-join-and-`sh -c` path with `Syntax error: "(" unexpected`.
+    #[cfg(not(target_os = "windows"))]
+    #[tokio::test]
+    async fn custom_shell_script_executes_under_emulation() {
+        let runtime = emulation::EmulationRuntime::new();
+        let workflow = minimal_workflow();
+        let working_dir = tempfile::tempdir().unwrap();
+        let job_env = HashMap::new();
+
+        let mut step = make_step_run("bail() { echo \"failed\"; exit 1; }\necho ok");
+        step.shell = Some("/usr/bin/env -u ENV /bin/sh -eu {0}".to_string());
+
+        let ctx = StepExecutionContext {
+            step: &step,
+            step_idx: 0,
+            job_env: &job_env,
+            job_user_env: &job_env,
+            working_dir: working_dir.path(),
+            runtime: &runtime,
+            workflow: &workflow,
+            runner_image: "ubuntu:latest",
+            verbose: false,
+            matrix_combination: &None,
+            container_config: None,
+            workflow_defaults: None,
+            job_defaults: None,
+            step_outputs: &HashMap::new(),
+            step_statuses: &HashMap::new(),
+            job_status: "success",
+            services: test_services(),
+            pending_cache_saves: &TEST_PENDING_CACHE_SAVES,
+        };
+
+        let result = execute_step(ctx).await.unwrap();
+        assert_eq!(
+            result.status,
+            StepStatus::Success,
+            "custom shell step failed: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("ok"),
+            "expected stdout to contain 'ok', got: {}",
+            result.output
+        );
+    }
+
     // --- Working-directory path traversal tests ---
 
     #[tokio::test]

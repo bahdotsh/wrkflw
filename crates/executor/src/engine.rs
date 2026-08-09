@@ -3761,29 +3761,6 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
             })
             .unwrap_or("bash");
 
-        let cmd_parts = match effective_shell {
-            "bash" => vec![
-                "bash",
-                "--noprofile",
-                "--norc",
-                "-e",
-                "-o",
-                "pipefail",
-                "-c",
-                &resolved_run,
-            ],
-            "sh" => vec!["sh", "-e", "-c", &resolved_run],
-            "python" => vec!["python", "-c", &resolved_run],
-            "pwsh" | "powershell" => vec!["pwsh", "-command", &resolved_run],
-            other => {
-                wrkflw_logging::warning(&format!(
-                    "  Unrecognized shell '{}', falling back to '{} -c'",
-                    other, other
-                ));
-                vec![other, "-c", &resolved_run]
-            }
-        };
-
         // Resolve effective working directory: step > job defaults > workflow defaults
         let effective_wd = ctx
             .step
@@ -3829,6 +3806,66 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
 
         let mount_ctx =
             prepare_step_container_context(&mut step_env, ctx.job_env, ctx.container_config);
+
+        // Custom (non-built-in) shells write the script to a file the container
+        // can reach and clean it up once the run completes.
+        let mut custom_shell_host_script: Option<PathBuf> = None;
+
+        let cmd_parts: Vec<String> = match effective_shell {
+            "bash" => vec![
+                "bash".to_string(),
+                "--noprofile".to_string(),
+                "--norc".to_string(),
+                "-e".to_string(),
+                "-o".to_string(),
+                "pipefail".to_string(),
+                "-c".to_string(),
+                resolved_run.clone(),
+            ],
+            "sh" => vec![
+                "sh".to_string(),
+                "-e".to_string(),
+                "-c".to_string(),
+                resolved_run.clone(),
+            ],
+            "python" => vec!["python".to_string(), "-c".to_string(), resolved_run.clone()],
+            "pwsh" | "powershell" => vec![
+                "pwsh".to_string(),
+                "-command".to_string(),
+                resolved_run.clone(),
+            ],
+            "cmd" => vec!["cmd".to_string(), "-c".to_string(), resolved_run.clone()],
+            other => {
+                let (host_dir, guest_dir) = match &mount_ctx.github_mount {
+                    Some((host, guest)) => (host.clone(), guest.clone()),
+                    None => (ctx.working_dir.to_path_buf(), ctx.working_dir.to_path_buf()),
+                };
+
+                let name = format!("wrkflw-{}", uuid::Uuid::new_v4());
+                let host_script = host_dir.join(&name);
+                if let Err(e) = fs::write(&host_script, &resolved_run) {
+                    return Ok(StepResult::new(
+                        step_name,
+                        StepStatus::Failure,
+                        format!("Failed to write custom shell script: {}", e),
+                    ));
+                }
+
+                let guest_script = guest_dir.join(&name);
+                match custom_shell_argv(other, &guest_script.to_string_lossy()) {
+                    Ok(argv) => {
+                        custom_shell_host_script = Some(host_script);
+                        argv
+                    }
+                    Err(msg) => {
+                        let _ = fs::remove_file(&host_script);
+                        return Ok(StepResult::new(step_name, StepStatus::Failure, msg));
+                    }
+                }
+            }
+        };
+        let cmd_refs: Vec<&str> = cmd_parts.iter().map(String::as_str).collect();
+
         let volumes = mount_ctx.build_volumes(ctx.working_dir, container_workspace);
         let env_vars: Vec<(&str, &str)> = step_env
             .iter()
@@ -3836,18 +3873,23 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
             .collect();
 
         // Execute the command
-        match ctx
+        let run_result = ctx
             .runtime
             .run_container(
                 ctx.runner_image,
-                &cmd_parts,
+                &cmd_refs,
                 &env_vars,
                 &final_workspace,
                 &volumes,
                 None,
             )
-            .await
-        {
+            .await;
+
+        if let Some(host_script) = &custom_shell_host_script {
+            let _ = fs::remove_file(host_script);
+        }
+
+        match run_result {
             Ok(container_output) => {
                 // Add command details to output (show resolved version so
                 // users can see expression substitutions were applied)
@@ -4999,6 +5041,29 @@ fn propagate_composite_outputs(
             }
         }
     }
+}
+
+/// Tokenize a custom `shell:` specification and substitute `{0}` with the path
+/// of the generated script file. GitHub requires a custom shell to be a format
+/// string containing `{0}`; anything else is rejected, matching the runner.
+fn custom_shell_argv(shell: &str, script_path: &str) -> Result<Vec<String>, String> {
+    let invalid = || {
+        format!(
+            "Invalid shell option '{}'. Shell must be a valid built-in (bash, sh, python, pwsh, powershell) or a format string containing '{{0}}'.",
+            shell
+        )
+    };
+
+    let tokens = shlex::split(shell).ok_or_else(invalid)?;
+
+    if tokens.is_empty() || !tokens.iter().any(|t| t.contains("{0}")) {
+        return Err(invalid());
+    }
+
+    Ok(tokens
+        .into_iter()
+        .map(|t| t.replace("{0}", script_path))
+        .collect())
 }
 
 /// Generate a heredoc delimiter that does not appear as a standalone line in `value`.
@@ -6276,6 +6341,11 @@ runs:
         cmd: Vec<String>,
         env_vars: Vec<(String, String)>,
         entrypoint: Option<String>,
+        volumes: Vec<(PathBuf, PathBuf)>,
+        /// Contents of the host file the final `cmd` element resolves to
+        /// through `volumes`, if any (used to verify a generated script is
+        /// actually reachable inside the container).
+        script: Option<String>,
     }
 
     #[async_trait::async_trait]
@@ -6286,9 +6356,24 @@ runs:
             cmd: &[&str],
             env_vars: &[(&str, &str)],
             _working_dir: &Path,
-            _volumes: &[(&Path, &Path)],
+            volumes: &[(&Path, &Path)],
             entrypoint: Option<&str>,
         ) -> Result<ContainerOutput, ContainerError> {
+            let owned_volumes: Vec<(PathBuf, PathBuf)> = volumes
+                .iter()
+                .map(|(host, guest)| (host.to_path_buf(), guest.to_path_buf()))
+                .collect();
+
+            let script = cmd.last().and_then(|last| {
+                owned_volumes.iter().find_map(|(host, guest)| {
+                    Path::new(last)
+                        .strip_prefix(guest)
+                        .ok()
+                        .map(|rel| host.join(rel))
+                })
+            });
+            let script = script.and_then(|host_path| fs::read_to_string(host_path).ok());
+
             self.run_calls.lock().unwrap().push(RunContainerCall {
                 image: image.to_string(),
                 cmd: cmd.iter().map(|s| s.to_string()).collect(),
@@ -6297,6 +6382,8 @@ runs:
                     .map(|(k, v)| (k.to_string(), v.to_string()))
                     .collect(),
                 entrypoint: entrypoint.map(|s| s.to_string()),
+                volumes: owned_volumes,
+                script,
             });
             Ok(ContainerOutput {
                 stdout: "mock ok".to_string(),
@@ -7346,6 +7433,161 @@ runs:
         assert_eq!(cmd[1], "-e");
         assert_eq!(cmd[2], "-c");
         assert_eq!(cmd[3], "echo hello");
+    }
+
+    // --- custom_shell_argv tests ---
+
+    #[test]
+    fn custom_shell_argv_substitutes_script_path() {
+        let argv = custom_shell_argv(
+            "/usr/bin/env -u ENV -u BASH_ENV -u CDPATH -u SHELLOPTS -u BASHOPTS /bin/sh -eu {0}",
+            "/github/workflow/wrkflw-abc",
+        )
+        .unwrap();
+        assert_eq!(
+            argv,
+            vec![
+                "/usr/bin/env",
+                "-u",
+                "ENV",
+                "-u",
+                "BASH_ENV",
+                "-u",
+                "CDPATH",
+                "-u",
+                "SHELLOPTS",
+                "-u",
+                "BASHOPTS",
+                "/bin/sh",
+                "-eu",
+                "/github/workflow/wrkflw-abc",
+            ]
+        );
+    }
+
+    #[test]
+    fn custom_shell_argv_handles_quoted_arguments() {
+        let argv = custom_shell_argv(r#"my-shell --opt "a b" {0}"#, "/tmp/script").unwrap();
+        assert_eq!(argv, vec!["my-shell", "--opt", "a b", "/tmp/script"]);
+    }
+
+    #[test]
+    fn custom_shell_argv_substitutes_placeholder_within_token() {
+        let argv = custom_shell_argv("pwsh -command \". '{0}'\"", "/tmp/script").unwrap();
+        assert_eq!(argv[2], ". '/tmp/script'");
+    }
+
+    #[test]
+    fn custom_shell_argv_rejects_missing_placeholder() {
+        let err = custom_shell_argv("/bin/sh -eu", "/tmp/script").unwrap_err();
+        assert!(err.contains("bash"));
+        assert!(err.contains("sh"));
+        assert!(err.contains("python"));
+        assert!(err.contains("pwsh"));
+        assert!(err.contains("powershell"));
+    }
+
+    #[test]
+    fn custom_shell_argv_rejects_empty_shell() {
+        assert!(custom_shell_argv("", "/tmp/script").is_err());
+        assert!(custom_shell_argv("   ", "/tmp/script").is_err());
+    }
+
+    #[test]
+    fn custom_shell_argv_rejects_unmatched_quote() {
+        assert!(custom_shell_argv("my-shell \"{0}", "/tmp/script").is_err());
+    }
+
+    #[test]
+    fn custom_shell_argv_substitutes_placeholder_in_middle() {
+        let argv = custom_shell_argv("wrapper {0} --after", "/tmp/script").unwrap();
+        assert_eq!(argv, vec!["wrapper", "/tmp/script", "--after"]);
+    }
+
+    // --- Custom shell integration tests ---
+
+    #[tokio::test]
+    async fn custom_shell_writes_script_reachable_in_container() {
+        let runtime = MockContainerRuntime::default();
+        let workflow = minimal_workflow();
+        let tmp = tempfile::tempdir().unwrap();
+        let github_dir = tmp.path().join("github");
+        fs::create_dir_all(&github_dir).unwrap();
+
+        let mut job_env = HashMap::new();
+        job_env.insert("WRKFLW_RUNTIME_MODE".to_string(), "docker".to_string());
+        job_env.insert(
+            "GITHUB_ENV".to_string(),
+            github_dir.join("env").to_string_lossy().to_string(),
+        );
+
+        let working_dir = tmp.path().to_path_buf();
+
+        let mut step = make_run_step("echo hello");
+        step.shell = Some(
+            "/usr/bin/env -u ENV -u BASH_ENV -u CDPATH -u SHELLOPTS -u BASHOPTS /bin/sh -eu {0}"
+                .to_string(),
+        );
+
+        let ctx = StepExecutionContext {
+            step: &step,
+            step_idx: 0,
+            job_env: &job_env,
+            job_user_env: &job_env,
+            working_dir: &working_dir,
+            runtime: &runtime,
+            workflow: &workflow,
+            runner_image: "ubuntu:latest",
+            verbose: false,
+            matrix_combination: &None,
+            container_config: None,
+            workflow_defaults: None,
+            job_defaults: None,
+            step_outputs: &HashMap::new(),
+            step_statuses: &HashMap::new(),
+            job_status: "success",
+            services: test_services(),
+            pending_cache_saves: &TEST_PENDING_CACHE_SAVES,
+        };
+
+        let result = execute_step(ctx).await.unwrap();
+        assert_eq!(result.status, StepStatus::Success);
+
+        let calls = runtime.run_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        let call = &calls[0];
+
+        assert_eq!(call.cmd.len(), 14);
+        assert_eq!(call.cmd[0], "/usr/bin/env");
+        assert_eq!(call.cmd[1], "-u");
+        assert_eq!(call.cmd[2], "ENV");
+        assert_eq!(call.cmd[3], "-u");
+        assert_eq!(call.cmd[4], "BASH_ENV");
+        assert_eq!(call.cmd[5], "-u");
+        assert_eq!(call.cmd[6], "CDPATH");
+        assert_eq!(call.cmd[7], "-u");
+        assert_eq!(call.cmd[8], "SHELLOPTS");
+        assert_eq!(call.cmd[9], "-u");
+        assert_eq!(call.cmd[10], "BASHOPTS");
+        assert_eq!(call.cmd[11], "/bin/sh");
+        assert_eq!(call.cmd[12], "-eu");
+
+        for token in &call.cmd {
+            assert!(!token.contains("{0}"));
+            assert_ne!(token, "echo hello");
+        }
+
+        // The final argv element must resolve through a recorded mount, not a
+        // host path masquerading as a guest path.
+        let script_path = &call.cmd[13];
+        assert!(call
+            .volumes
+            .iter()
+            .any(|(_, guest)| Path::new(script_path).starts_with(guest)));
+        assert_eq!(call.script.as_deref(), Some("echo hello"));
+
+        let host_script = github_dir.join(Path::new(script_path).file_name().unwrap());
+        assert!(!host_script.exists());
     }
 
     // --- Working-directory path traversal tests ---

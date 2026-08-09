@@ -3842,6 +3842,29 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                 };
 
                 let name = format!("wrkflw-{}", uuid::Uuid::new_v4());
+                let guest_script = guest_dir.join(&name);
+
+                let mut argv = match custom_shell_argv(other, &guest_script.to_string_lossy()) {
+                    Ok(argv) => argv,
+                    Err(msg) => {
+                        return Ok(StepResult::new(step_name, StepStatus::Failure, msg));
+                    }
+                };
+
+                // Resolve the shell command to an absolute path, matching the
+                // runner's `WhichUtil.Which(..., require: true, ...)` — this also
+                // makes emulation's absolute-argv direct-exec rule fire universally.
+                match which::which(&argv[0]) {
+                    Ok(resolved) => argv[0] = resolved.to_string_lossy().into_owned(),
+                    Err(_) => {
+                        return Ok(StepResult::new(
+                            step_name,
+                            StepStatus::Failure,
+                            format!("Custom shell '{}' could not be found", argv[0]),
+                        ));
+                    }
+                }
+
                 let host_script = host_dir.join(&name);
                 if let Err(e) = fs::write(&host_script, &resolved_run) {
                     return Ok(StepResult::new(
@@ -3851,17 +3874,8 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                     ));
                 }
 
-                let guest_script = guest_dir.join(&name);
-                match custom_shell_argv(other, &guest_script.to_string_lossy()) {
-                    Ok(argv) => {
-                        custom_shell_host_script = Some(host_script);
-                        argv
-                    }
-                    Err(msg) => {
-                        let _ = fs::remove_file(&host_script);
-                        return Ok(StepResult::new(step_name, StepStatus::Failure, msg));
-                    }
-                }
+                custom_shell_host_script = Some(host_script);
+                argv
             }
         };
         let cmd_refs: Vec<&str> = cmd_parts.iter().map(String::as_str).collect();
@@ -5049,7 +5063,7 @@ fn propagate_composite_outputs(
 fn custom_shell_argv(shell: &str, script_path: &str) -> Result<Vec<String>, String> {
     let invalid = || {
         format!(
-            "Invalid shell option '{}'. Shell must be a valid built-in (bash, sh, python, pwsh, powershell) or a format string containing '{{0}}'.",
+            "Invalid shell option '{}'. Shell must be a valid built-in (bash, sh, python, pwsh, powershell, cmd) or a format string containing '{{0}}'.",
             shell
         )
     };
@@ -7485,6 +7499,7 @@ runs:
         assert!(err.contains("python"));
         assert!(err.contains("pwsh"));
         assert!(err.contains("powershell"));
+        assert!(err.contains("cmd"));
     }
 
     #[test]
@@ -7588,6 +7603,86 @@ runs:
 
         let host_script = github_dir.join(Path::new(script_path).file_name().unwrap());
         assert!(!host_script.exists());
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[tokio::test]
+    async fn custom_shell_resolves_relative_command_to_absolute_path() {
+        let runtime = MockContainerRuntime::default();
+        let workflow = minimal_workflow();
+        let job_env = HashMap::new();
+        let working_dir = std::env::current_dir().unwrap();
+
+        let mut step = make_run_step("echo hello");
+        step.shell = Some("env {0}".to_string());
+
+        let ctx = StepExecutionContext {
+            step: &step,
+            step_idx: 0,
+            job_env: &job_env,
+            job_user_env: &job_env,
+            working_dir: &working_dir,
+            runtime: &runtime,
+            workflow: &workflow,
+            runner_image: "ubuntu:latest",
+            verbose: false,
+            matrix_combination: &None,
+            container_config: None,
+            workflow_defaults: None,
+            job_defaults: None,
+            step_outputs: &HashMap::new(),
+            step_statuses: &HashMap::new(),
+            job_status: "success",
+            services: test_services(),
+            pending_cache_saves: &TEST_PENDING_CACHE_SAVES,
+        };
+
+        let result = execute_step(ctx).await.unwrap();
+        assert_eq!(result.status, StepStatus::Success);
+
+        let expected = which::which("env").expect("test requires 'env' on PATH");
+
+        let calls = runtime.run_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].cmd[0], expected.to_string_lossy());
+    }
+
+    #[tokio::test]
+    async fn custom_shell_unresolvable_command_fails_step() {
+        let runtime = MockContainerRuntime::default();
+        let workflow = minimal_workflow();
+        let job_env = HashMap::new();
+        let working_dir = std::env::current_dir().unwrap();
+
+        let mut step = make_run_step("echo hello");
+        step.shell = Some("wrkflw-no-such-shell {0}".to_string());
+
+        let ctx = StepExecutionContext {
+            step: &step,
+            step_idx: 0,
+            job_env: &job_env,
+            job_user_env: &job_env,
+            working_dir: &working_dir,
+            runtime: &runtime,
+            workflow: &workflow,
+            runner_image: "ubuntu:latest",
+            verbose: false,
+            matrix_combination: &None,
+            container_config: None,
+            workflow_defaults: None,
+            job_defaults: None,
+            step_outputs: &HashMap::new(),
+            step_statuses: &HashMap::new(),
+            job_status: "success",
+            services: test_services(),
+            pending_cache_saves: &TEST_PENDING_CACHE_SAVES,
+        };
+
+        let result = execute_step(ctx).await.unwrap();
+        assert_eq!(result.status, StepStatus::Failure);
+
+        let calls = runtime.run_calls.lock().unwrap();
+        assert!(calls.is_empty());
     }
 
     /// End-to-end proof that a custom shell (`taiki-e/install-action`'s

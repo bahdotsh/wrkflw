@@ -4729,6 +4729,14 @@ async fn execute_composite_action(
                 HashMap::new();
             let mut composite_step_statuses: HashMap<String, (String, String)> = HashMap::new();
             let mut composite_job_status = "success".to_string();
+            let composite_workflow = workflow::WorkflowDefinition {
+                name: "Composite Action".to_string(),
+                on: vec![],
+                on_raw: serde_yaml::Value::Null,
+                jobs: HashMap::new(),
+                defaults: None,
+                env: HashMap::new(),
+            };
             for (idx, step_def) in steps.iter().enumerate() {
                 // Convert the YAML step to our Step struct
                 let composite_step = match convert_yaml_to_step(step_def) {
@@ -4742,22 +4750,19 @@ async fn execute_composite_action(
                     }
                 };
 
-                // Execute the step - using Box::pin to handle async recursion
-                let step_result = Box::pin(execute_step(StepExecutionContext {
+                let step_name = composite_step
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| format!("Step {}", idx + 1));
+
+                let step_ctx = StepExecutionContext {
                     step: &composite_step,
                     step_idx: idx,
                     job_env: &action_env,
                     job_user_env: &action_user_env,
                     working_dir,
                     runtime,
-                    workflow: &workflow::WorkflowDefinition {
-                        name: "Composite Action".to_string(),
-                        on: vec![],
-                        on_raw: serde_yaml::Value::Null,
-                        jobs: HashMap::new(),
-                        defaults: None,
-                        env: HashMap::new(),
-                    },
+                    workflow: &composite_workflow,
                     runner_image,
                     verbose,
                     matrix_combination: &None,
@@ -4777,8 +4782,38 @@ async fn execute_composite_action(
                         cache_store: services.cache_store,
                     },
                     pending_cache_saves,
-                }))
-                .await?;
+                };
+
+                let should_run = match &composite_step.if_condition {
+                    Some(cond) => evaluate_condition_with_context(cond, &step_ctx.expr_context()),
+                    None => true,
+                };
+
+                if !should_run {
+                    let cond = composite_step.if_condition.as_deref().unwrap_or_default();
+                    wrkflw_logging::info(&format!(
+                        "  {} Skipping step '{}' due to condition: {}",
+                        wrkflw_logging::symbols::SKIPPED,
+                        step_name,
+                        cond
+                    ));
+                    let skipped = StepResult::new(
+                        step_name,
+                        StepStatus::Skipped,
+                        format!("Skipped due to condition: {}", cond),
+                    );
+                    record_step_status(
+                        composite_step.id.as_deref(),
+                        &skipped,
+                        &mut composite_step_statuses,
+                        &mut composite_job_status,
+                    );
+                    step_outputs.push(format!("Step {}: {}", idx + 1, skipped.output));
+                    continue;
+                }
+
+                // Execute the step - using Box::pin to handle async recursion
+                let step_result = Box::pin(execute_step(step_ctx)).await?;
 
                 // Track step status within composite scope
                 record_step_status(
@@ -8981,6 +9016,174 @@ runs:
         // Without a step_id, ::set-output:: commands should be silently ignored
         process_workflow_commands("::set-output name=x::val\n", None, &mut outputs, None);
         assert!(outputs.is_empty());
+    }
+
+    // --- Composite step if-condition tests ---
+
+    fn write_composite_action(action_dir: &Path, steps_yaml: &str) {
+        fs::write(
+            action_dir.join("action.yml"),
+            format!(
+                "name: test action\nruns:\n  using: composite\n  steps:\n{}\n",
+                steps_yaml
+            ),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn composite_step_with_false_condition_is_skipped() {
+        let action_dir = tempfile::tempdir().unwrap();
+        write_composite_action(
+            action_dir.path(),
+            "    - run: echo \"windows step ran\"\n      if: runner.os == 'Windows'\n      shell: bash\n    - run: echo \"linux step ran\"\n      shell: bash",
+        );
+
+        let runtime = MockContainerRuntime::default();
+        let mut job_env = HashMap::new();
+        job_env.insert("RUNNER_OS".to_string(), "Linux".to_string());
+        let working_dir = tempfile::tempdir().unwrap();
+        let step = make_run_step("noop");
+        let services = test_services();
+        let pending = std::sync::Mutex::new(Vec::<PendingCacheSave>::new());
+
+        let result = execute_composite_action(
+            &step,
+            action_dir.path(),
+            &job_env,
+            &job_env,
+            working_dir.path(),
+            &runtime,
+            "ubuntu:latest",
+            false,
+            &services,
+            &pending,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.status, StepStatus::Success);
+
+        let calls = runtime.run_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].cmd.iter().any(|c| c.contains("linux step ran")));
+        assert!(!calls[0].cmd.iter().any(|c| c.contains("windows step ran")));
+    }
+
+    #[tokio::test]
+    async fn composite_step_with_true_condition_runs() {
+        let action_dir = tempfile::tempdir().unwrap();
+        write_composite_action(
+            action_dir.path(),
+            "    - run: echo \"linux step ran\"\n      if: runner.os != 'Windows'\n      shell: bash",
+        );
+
+        let runtime = MockContainerRuntime::default();
+        let mut job_env = HashMap::new();
+        job_env.insert("RUNNER_OS".to_string(), "Linux".to_string());
+        let working_dir = tempfile::tempdir().unwrap();
+        let step = make_run_step("noop");
+        let services = test_services();
+        let pending = std::sync::Mutex::new(Vec::<PendingCacheSave>::new());
+
+        let result = execute_composite_action(
+            &step,
+            action_dir.path(),
+            &job_env,
+            &job_env,
+            working_dir.path(),
+            &runtime,
+            "ubuntu:latest",
+            false,
+            &services,
+            &pending,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.status, StepStatus::Success);
+
+        let calls = runtime.run_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].cmd.iter().any(|c| c.contains("linux step ran")));
+    }
+
+    #[tokio::test]
+    async fn composite_skipped_step_does_not_fail_the_action() {
+        // The second step's `if: success()` reads composite_job_status directly,
+        // so this pins that the skip path leaves it at "success" rather than
+        // relying on the always-true StepResult::status returned by execute_composite_action.
+        let action_dir = tempfile::tempdir().unwrap();
+        write_composite_action(
+            action_dir.path(),
+            "    - run: echo \"windows step ran\"\n      if: runner.os == 'Windows'\n      shell: bash\n    - run: echo \"linux step ran\"\n      if: success()\n      shell: bash",
+        );
+
+        let runtime = MockContainerRuntime::default();
+        let mut job_env = HashMap::new();
+        job_env.insert("RUNNER_OS".to_string(), "Linux".to_string());
+        let working_dir = tempfile::tempdir().unwrap();
+        let step = make_run_step("noop");
+        let services = test_services();
+        let pending = std::sync::Mutex::new(Vec::<PendingCacheSave>::new());
+
+        let result = execute_composite_action(
+            &step,
+            action_dir.path(),
+            &job_env,
+            &job_env,
+            working_dir.path(),
+            &runtime,
+            "ubuntu:latest",
+            false,
+            &services,
+            &pending,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.status, StepStatus::Success);
+
+        let calls = runtime.run_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].cmd.iter().any(|c| c.contains("linux step ran")));
+    }
+
+    #[tokio::test]
+    async fn composite_skipped_step_records_skipped_outcome() {
+        let action_dir = tempfile::tempdir().unwrap();
+        write_composite_action(
+            action_dir.path(),
+            "    - id: win\n      run: echo \"windows step ran\"\n      if: runner.os == 'Windows'\n      shell: bash\n    - run: echo \"followed skipped step\"\n      if: steps.win.outcome == 'skipped'\n      shell: bash",
+        );
+
+        let runtime = MockContainerRuntime::default();
+        let mut job_env = HashMap::new();
+        job_env.insert("RUNNER_OS".to_string(), "Linux".to_string());
+        let working_dir = tempfile::tempdir().unwrap();
+        let step = make_run_step("noop");
+        let services = test_services();
+        let pending = std::sync::Mutex::new(Vec::<PendingCacheSave>::new());
+
+        let result = execute_composite_action(
+            &step,
+            action_dir.path(),
+            &job_env,
+            &job_env,
+            working_dir.path(),
+            &runtime,
+            "ubuntu:latest",
+            false,
+            &services,
+            &pending,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.status, StepStatus::Success);
+
+        let calls = runtime.run_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0]
+            .cmd
+            .iter()
+            .any(|c| c.contains("followed skipped step")));
     }
 
     #[test]

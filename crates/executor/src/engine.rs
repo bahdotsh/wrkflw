@@ -7598,7 +7598,7 @@ runs:
         };
 
         let result = execute_step(ctx).await.unwrap();
-        assert_eq!(result.status, StepStatus::Success);
+        assert_eq!(result.status, StepStatus::Success, "{result:?}");
 
         let calls = runtime.run_calls.lock().unwrap();
         assert_eq!(calls.len(), 1);

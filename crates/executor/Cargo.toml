@@ -44,6 +44,7 @@ tempfile.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 uuid.workspace = true
+which.workspace = true
 
 [dev-dependencies]
 wiremock.workspace = true

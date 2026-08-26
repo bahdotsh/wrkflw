@@ -109,8 +109,7 @@ impl EmulationRuntime {
                         if source.is_file() {
                             if let Err(e) = fs::copy(&source, &dest) {
                                 eprintln!(
-                                    "Warning: Failed to copy file from {:?} to {:?}: {}",
-                                    &source, &dest, e
+                                    "Warning: Failed to copy file from {source:?} to {dest:?}: {e}"
                                 );
                             }
                         } else {

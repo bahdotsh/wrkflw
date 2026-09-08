@@ -80,7 +80,7 @@ impl PodmanRuntime {
         };
 
         // Look for any key that starts with the prefix
-        for (key, _) in image_keys.iter() {
+        for key in image_keys.keys() {
             if key.starts_with(prefix) {
                 return Some(key.clone());
             }

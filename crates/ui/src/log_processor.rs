@@ -1,5 +1,5 @@
 // Background log processor for asynchronous log filtering and formatting
-use crate::models::LogFilterLevel;
+use crate::models::{LogBadge, LogFilterLevel};
 use crate::theme;
 use ratatui::{
     style::Style,
@@ -20,6 +20,17 @@ pub struct ProcessedLogEntry {
 }
 
 impl ProcessedLogEntry {
+    /// The text the log panes actually draw, after the `[HH:MM:SS]` prefix
+    /// is stripped and the remainder trimmed. Leading whitespace does not
+    /// survive that trim, which is why nesting is carried by a glyph.
+    #[cfg(test)]
+    pub(crate) fn rendered_content(&self) -> String {
+        self.content_spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect()
+    }
+
     /// Convert to a table row for rendering
     pub fn to_row(&self) -> Row<'static> {
         Row::new(vec![
@@ -210,32 +221,11 @@ impl LogProcessor {
             "??:??:??".to_string()
         };
 
-        // Determine log type and style using theme badge styles
-        let (log_type, log_style) = if log_line.contains("Error")
-            || log_line.contains("error")
-            || log_line.contains(theme::symbols::FAILURE)
-        {
-            ("ERROR", theme::log_badge("ERROR"))
-        } else if log_line.contains("Warning")
-            || log_line.contains("warning")
-            || log_line.contains(theme::symbols::WARNING)
-        {
-            ("WARN", theme::log_badge("WARN"))
-        } else if log_line.contains("Success")
-            || log_line.contains("success")
-            || log_line.contains(theme::symbols::SUCCESS)
-        {
-            ("SUCCESS", theme::log_badge("SUCCESS"))
-        } else if log_line.contains("Running")
-            || log_line.contains("running")
-            || log_line.contains(theme::symbols::RUNNING)
-        {
-            ("INFO", theme::log_badge("INFO"))
-        } else if log_line.contains("Triggering") || log_line.contains("triggered") {
-            ("TRIG", theme::log_badge("TRIG"))
-        } else {
-            ("INFO", theme::log_badge(""))
-        };
+        // Determine log type and style. `LogBadge` is shared with
+        // `LogFilterLevel::matches` so the badge drawn here and the filter
+        // that hides the line can never disagree.
+        let badge = LogBadge::classify(log_line);
+        let (log_type, log_style) = (badge.as_str(), theme::log_badge(badge.style_key()));
 
         // Extract content after timestamp
         let content = if log_line.starts_with('[') && log_line.contains(']') {
@@ -323,5 +313,28 @@ mod tests {
     fn test_normal_timestamp_extraction() {
         let entry = LogProcessor::process_log_entry("[12:34:56] some log", "");
         assert_eq!(entry.timestamp, "12:34:56");
+    }
+
+    #[test]
+    fn leading_whitespace_is_trimmed_but_a_nesting_glyph_survives() {
+        // Why sub-item log lines are marked with a glyph instead of being
+        // indented: the content after the `[HH:MM:SS]` prefix is trimmed, so
+        // an indented line loses its nesting the moment it is timestamped.
+        let indented = LogProcessor::process_log_entry("[12:34:56]   warning: x", "");
+        assert_eq!(
+            indented.rendered_content(),
+            "warning: x",
+            "indentation must not survive the trim"
+        );
+
+        let nested = theme::symbols::NESTED;
+        let marked =
+            LogProcessor::process_log_entry(&format!("[12:34:56] {} warning: x", nested), "");
+        assert_eq!(
+            marked.rendered_content(),
+            format!("{} warning: x", nested),
+            "the nesting glyph must survive the trim"
+        );
+        assert_eq!(marked.timestamp, "12:34:56");
     }
 }

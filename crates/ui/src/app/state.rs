@@ -3296,6 +3296,59 @@ mod tests {
     }
 
     #[test]
+    fn diff_filter_warning_lines_survive_the_warning_filter() {
+        // The timestamp fix made these lines readable; this pins that they
+        // are also reachable. Each line is badged from the same classifier
+        // the filter uses, so a WARN-badged warning cannot be hidden by the
+        // Warning filter and an ERROR-badged parse failure cannot be hidden
+        // by the Error filter.
+        let mut app = make_app();
+        app.logs.clear();
+
+        let (tx, rx) = mpsc::channel();
+        app.diff_filter_rx = Some(rx);
+        app.diff_filter_active = true;
+        tx.send(DiffFilterOutcome::Success(DiffFilterReport {
+            rows: vec![(
+                PathBuf::from("ci.yml"),
+                Some(TriggerMatchStatus::Matched("matched ci".into())),
+            )],
+            parse_failures: vec![(
+                PathBuf::from("broken.yml"),
+                "Invalid glob pattern '[unclosed' under 'push.paths'".to_string(),
+            )],
+            warnings: vec![
+                "git ls-files --others failed (exit 128): fatal: unsafe repository".to_string(),
+            ],
+        }))
+        .unwrap();
+
+        app.check_diff_filter_results();
+
+        let warning_line = app
+            .logs
+            .iter()
+            .find(|l| l.contains("git ls-files --others failed"))
+            .expect("warning sub-item must be logged");
+        assert!(
+            crate::models::LogFilterLevel::Warning.matches(warning_line),
+            "warning sub-item is badged WARN but the Warning filter hides it: {:?}",
+            warning_line
+        );
+
+        let parse_line = app
+            .logs
+            .iter()
+            .find(|l| l.contains("broken.yml"))
+            .expect("parse-error sub-item must be logged");
+        assert!(
+            crate::models::LogFilterLevel::Error.matches(parse_line),
+            "parse-error sub-item is badged ERROR but the Error filter hides it: {:?}",
+            parse_line
+        );
+    }
+
+    #[test]
     fn check_diff_filter_results_surfaces_failure_reason_to_logs() {
         // Regression: previously, if auto_detect_context_default_base
         // errored (e.g. fresh repo with no remote default branch), the

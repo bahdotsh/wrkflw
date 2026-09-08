@@ -1,5 +1,5 @@
 // Background log processor for asynchronous log filtering and formatting
-use crate::models::LogFilterLevel;
+use crate::models::{LogBadge, LogFilterLevel};
 use crate::theme;
 use ratatui::{
     style::Style,
@@ -221,32 +221,11 @@ impl LogProcessor {
             "??:??:??".to_string()
         };
 
-        // Determine log type and style using theme badge styles
-        let (log_type, log_style) = if log_line.contains("Error")
-            || log_line.contains("error")
-            || log_line.contains(theme::symbols::FAILURE)
-        {
-            ("ERROR", theme::log_badge("ERROR"))
-        } else if log_line.contains("Warning")
-            || log_line.contains("warning")
-            || log_line.contains(theme::symbols::WARNING)
-        {
-            ("WARN", theme::log_badge("WARN"))
-        } else if log_line.contains("Success")
-            || log_line.contains("success")
-            || log_line.contains(theme::symbols::SUCCESS)
-        {
-            ("SUCCESS", theme::log_badge("SUCCESS"))
-        } else if log_line.contains("Running")
-            || log_line.contains("running")
-            || log_line.contains(theme::symbols::RUNNING)
-        {
-            ("INFO", theme::log_badge("INFO"))
-        } else if log_line.contains("Triggering") || log_line.contains("triggered") {
-            ("TRIG", theme::log_badge("TRIG"))
-        } else {
-            ("INFO", theme::log_badge(""))
-        };
+        // Determine log type and style. `LogBadge` is shared with
+        // `LogFilterLevel::matches` so the badge drawn here and the filter
+        // that hides the line can never disagree.
+        let badge = LogBadge::classify(log_line);
+        let (log_type, log_style) = (badge.as_str(), theme::log_badge(badge.style_key()));
 
         // Extract content after timestamp
         let content = if log_line.starts_with('[') && log_line.contains(']') {

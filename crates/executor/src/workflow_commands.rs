@@ -130,10 +130,9 @@ fn parse_command_line(line: &str) -> Option<WorkflowCommand> {
     let rest = line.strip_prefix("::").unwrap_or(line);
 
     // Find the second "::" that separates command+params from the message
-    let (cmd_part, raw_message) = if let Some(idx) = rest.find("::") {
+    let (cmd_part, raw_message) = {
+        let idx = rest.find("::")?;
         (&rest[..idx], rest[idx + 2..].to_string())
-    } else {
-        return None;
     };
 
     // Decode percent-encoded values in the message

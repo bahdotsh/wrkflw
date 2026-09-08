@@ -1178,7 +1178,6 @@ impl App {
                 jobs: Vec::new(),
                 start_time: Local::now(),
                 end_time: Some(Local::now()),
-                logs: Vec::new(),
                 progress: 1.0,
             });
         }
@@ -1189,10 +1188,6 @@ impl App {
 
             match &result {
                 Ok((jobs, _)) => {
-                    let timestamp = Local::now().format("%H:%M:%S").to_string();
-                    execution_details
-                        .logs
-                        .push(format!("[{}] Operation completed successfully.", timestamp));
                     execution_details.progress = 1.0;
 
                     // Convert wrkflw_executor::JobResult to our JobExecution struct
@@ -1223,10 +1218,6 @@ impl App {
                         .collect::<Vec<JobExecution>>();
                 }
                 Err(e) => {
-                    let timestamp = Local::now().format("%H:%M:%S").to_string();
-                    execution_details
-                        .logs
-                        .push(format!("[{}] Error: {}", timestamp, e));
                     execution_details.progress = 1.0;
 
                     // Create a dummy job with the error information so users can see details
@@ -1290,7 +1281,6 @@ impl App {
             jobs: Vec::new(),
             start_time: Local::now(),
             end_time: None,
-            logs: vec!["Execution started".to_string()],
             progress: 0.0, // Just started
         });
 

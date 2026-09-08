@@ -222,9 +222,50 @@ async fn execute_github_workflow(
     let mut all_job_results: HashMap<String, String> = HashMap::new();
 
     for job_batch in execution_plan {
+        // GitHub Actions: a job that declares `needs:` runs only if every needed
+        // job succeeded. If any needed job failed or was itself skipped, this job
+        // is skipped too, and its own dependents cascade. `resolve_dependencies`
+        // only orders the batches — it never enforces this — so do it here, before
+        // the batch runs. A job carrying an explicit `if:` is left for
+        // `execute_single_job` to evaluate: `if: always()` / `if: failure()` may
+        // deliberately opt back in.
+        let mut runnable: Vec<String> = Vec::with_capacity(job_batch.len());
+        for job_name in &job_batch {
+            match workflow
+                .jobs
+                .get(job_name)
+                .and_then(|job| job_blocked_by_needs(job, &all_job_results))
+            {
+                Some(reason) => {
+                    wrkflw_logging::info(&format!(
+                        "{} Skipping job '{}': {}",
+                        wrkflw_logging::symbols::SKIPPED,
+                        job_name,
+                        reason,
+                    ));
+                    let skipped = JobResult {
+                        name: job_name.clone(),
+                        canonical_name: job_name.clone(),
+                        status: JobStatus::Skipped,
+                        steps: Vec::new(),
+                        logs: String::new(),
+                        outputs: HashMap::new(),
+                    };
+                    all_job_results
+                        .insert(skipped.canonical_name.clone(), skipped.status.to_string());
+                    all_job_outputs.insert(skipped.canonical_name.clone(), skipped.outputs.clone());
+                    results.push(skipped);
+                }
+                None => runnable.push(job_name.clone()),
+            }
+        }
+        if runnable.is_empty() {
+            continue;
+        }
+
         // Execute jobs in parallel if they don't depend on each other
         let job_results = execute_job_batch(
-            &job_batch,
+            &runnable,
             &workflow,
             runtime.as_ref(),
             &env_context,
@@ -303,6 +344,32 @@ async fn execute_github_workflow(
             None
         },
     })
+}
+
+/// GitHub Actions `needs:` failure semantics: with no explicit `if:`, a job runs
+/// only when every job it needs succeeded. Returns `Some(reason)` when the job
+/// must be skipped because a needed job failed or was itself skipped, `None` when
+/// it may run. Jobs with an `if:` are always allowed through here —
+/// `execute_single_job` evaluates the condition and can opt back in on failure.
+fn job_blocked_by_needs(job: &Job, all_job_results: &HashMap<String, String>) -> Option<String> {
+    if job.if_condition.is_some() {
+        return None;
+    }
+    let needs = job.needs.as_ref()?;
+    for needed in needs {
+        match all_job_results.get(needed).map(String::as_str) {
+            // "success", or not-yet-recorded (a filtered target-job plan can omit
+            // an upstream job) — neither blocks.
+            Some("success") | None => {}
+            Some(other) => {
+                return Some(format!(
+                    "needed job '{}' did not succeed ({})",
+                    needed, other
+                ));
+            }
+        }
+    }
+    None
 }
 
 /// Execute a GitLab CI/CD pipeline locally

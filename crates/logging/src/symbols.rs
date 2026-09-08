@@ -30,6 +30,11 @@ pub const CHECKBOX_ON: &str = "[\u{2714}]"; // [✔]
 pub const CHECKBOX_OFF: &str = "[ ]";
 pub const TAB_DIVIDER: &str = " \u{2502} "; // │
 
+// Marks a log line as a sub-item of the line above it. A glyph rather than
+// leading whitespace because the log renderer trims the content after the
+// `[HH:MM:SS]` prefix, which erases indentation.
+pub const NESTED: &str = "\u{21B3}"; // ↳
+
 // Braille spinner frames for running animation
 pub const SPINNER: &[&str] = &[
     "\u{280B}", "\u{2819}", "\u{2839}", "\u{2838}", "\u{283C}", "\u{2834}", "\u{2826}", "\u{2827}",

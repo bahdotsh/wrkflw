@@ -708,7 +708,7 @@ impl App {
 
         let event_name = self.diff_filter_event.clone();
         let activity_type = self.diff_filter_activity_type.clone();
-        self.add_log(format!(
+        self.add_timestamped_log(&format!(
             "Diff filter: evaluating triggers (simulating '{}' event)...",
             event_name
         ));
@@ -890,8 +890,18 @@ impl App {
                         "Diff filter: {} warning(s)",
                         warnings.len()
                     ));
+                    // Sub-items are marked with a glyph rather than
+                    // leading whitespace: `process_log_entry` trims the
+                    // content after the `[HH:MM:SS]` prefix, so an
+                    // indented line would either lose its nesting or
+                    // have to skip the timestamp entirely (it used to do
+                    // the latter, rendering `??:??:??`).
                     for w in &warnings {
-                        self.add_log(format!("  warning: {}", w));
+                        self.add_timestamped_log(&format!(
+                            "{} warning: {}",
+                            crate::theme::symbols::NESTED,
+                            w
+                        ));
                     }
                 }
 
@@ -906,7 +916,12 @@ impl App {
                         parse_failures.len()
                     ));
                     for (path, reason) in &parse_failures {
-                        self.add_log(format!("  parse error: {}: {}", path.display(), reason));
+                        self.add_timestamped_log(&format!(
+                            "{} parse error: {}: {}",
+                            crate::theme::symbols::NESTED,
+                            path.display(),
+                            reason
+                        ));
                     }
                 }
             }
@@ -2778,6 +2793,17 @@ mod tests {
         crate::log_processor::LogProcessor::process_log_entry(line, "").timestamp
     }
 
+    /// The content the log panes actually draw, after the parser strips the
+    /// `[HH:MM:SS]` prefix and trims. Leading whitespace does not survive
+    /// this, which is why nesting is carried by a glyph.
+    fn rendered_content(line: &str) -> String {
+        crate::log_processor::LogProcessor::process_log_entry(line, "")
+            .content_spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect()
+    }
+
     #[test]
     fn log_buffer_caps_at_configured_size() {
         // Long-running TUI sessions (especially with rapid diff-filter
@@ -3172,6 +3198,99 @@ mod tests {
     }
 
     #[test]
+    fn check_diff_filter_results_timestamps_nested_sub_items() {
+        // Regression: the per-warning and per-parse-error sub-items were
+        // pushed through `add_log` with two leading spaces so the log pane
+        // showed them nested under their summary line. `process_log_entry`
+        // trims the content after the `[HH:MM:SS]` prefix, so the author
+        // dropped the timestamp to keep the indentation — and every one of
+        // those lines rendered `??:??:??`. The nesting is now carried by a
+        // glyph, which survives the trim, so the timestamp can come back.
+        let mut app = make_app();
+        app.logs.clear();
+
+        let (tx, rx) = mpsc::channel();
+        app.diff_filter_rx = Some(rx);
+        app.diff_filter_active = true;
+        tx.send(DiffFilterOutcome::Success(DiffFilterReport {
+            rows: vec![(
+                PathBuf::from("ci.yml"),
+                Some(TriggerMatchStatus::Matched("matched ci".into())),
+            )],
+            parse_failures: vec![(
+                PathBuf::from("broken.yml"),
+                "Invalid glob pattern '[unclosed' under 'push.paths'".to_string(),
+            )],
+            warnings: vec![
+                "git ls-files --others failed (exit 128): fatal: unsafe repository".to_string(),
+            ],
+        }))
+        .unwrap();
+
+        app.check_diff_filter_results();
+
+        // Every line in the burst — summaries and sub-items alike — must
+        // carry a real timestamp.
+        for line in &app.logs {
+            assert_ne!(
+                parsed_timestamp(line),
+                "??:??:??",
+                "diff-filter log line must carry a timestamp, got {:?}",
+                line
+            );
+        }
+
+        let nested = crate::theme::symbols::NESTED;
+        let warning_line = app
+            .logs
+            .iter()
+            .find(|l| l.contains("git ls-files --others failed"))
+            .expect("warning sub-item must be logged");
+        let parse_line = app
+            .logs
+            .iter()
+            .find(|l| l.contains("broken.yml"))
+            .expect("parse-error sub-item must be logged");
+
+        // Sub-items are marked as nested...
+        for line in [warning_line, parse_line] {
+            assert!(
+                line.contains(nested),
+                "sub-item must carry the nesting glyph, got {:?}",
+                line
+            );
+            // ...and the glyph must survive the renderer's trim, or the
+            // nesting is invisible to the user no matter what we store.
+            let rendered = rendered_content(line);
+            assert!(
+                rendered.starts_with(nested),
+                "nesting glyph must survive the content trim, got {:?}",
+                rendered
+            );
+        }
+
+        // Summary lines are NOT nested — they are the parents.
+        let summary_lines: Vec<&String> = app
+            .logs
+            .iter()
+            .filter(|l| l.contains("warning(s)") || l.contains("failed to parse"))
+            .collect();
+        assert_eq!(
+            summary_lines.len(),
+            2,
+            "expected both summary lines, got {:?}",
+            app.logs
+        );
+        for line in summary_lines {
+            assert!(
+                !line.contains(nested),
+                "summary line must not be marked as nested, got {:?}",
+                line
+            );
+        }
+    }
+
+    #[test]
     fn check_diff_filter_results_surfaces_failure_reason_to_logs() {
         // Regression: previously, if auto_detect_context_default_base
         // errored (e.g. fresh repo with no remote default branch), the
@@ -3286,6 +3405,35 @@ mod tests {
         assert!(
             app.diff_filter_aborted,
             "toggle with task in flight must arm the abort flag"
+        );
+
+        // Cancel the spawned task so the test doesn't leak it.
+        if let Some(handle) = app.diff_filter_task.take() {
+            handle.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn spawn_evaluation_logs_timestamped_line() {
+        // The "evaluating triggers" line is pushed synchronously by
+        // `spawn_evaluation` before the background task is spawned, so it is
+        // reachable here. It was the last remaining bare `add_log` on the
+        // diff-filter path and rendered `??:??:??`.
+        let mut app = make_app();
+        app.logs.clear();
+
+        app.toggle_diff_filter();
+
+        let line = app
+            .logs
+            .iter()
+            .find(|l| l.contains("evaluating triggers"))
+            .expect("toggling the filter ON must log the evaluation start");
+        assert_ne!(
+            parsed_timestamp(line),
+            "??:??:??",
+            "evaluation-start line must carry a timestamp, got {:?}",
+            line
         );
 
         // Cancel the spawned task so the test doesn't leak it.

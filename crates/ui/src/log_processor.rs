@@ -324,4 +324,37 @@ mod tests {
         let entry = LogProcessor::process_log_entry("[12:34:56] some log", "");
         assert_eq!(entry.timestamp, "12:34:56");
     }
+
+    #[test]
+    fn leading_whitespace_is_trimmed_but_a_nesting_glyph_survives() {
+        // Why sub-item log lines are marked with a glyph instead of being
+        // indented: the content after the `[HH:MM:SS]` prefix is trimmed, so
+        // an indented line loses its nesting the moment it is timestamped.
+        let indented = LogProcessor::process_log_entry("[12:34:56]   warning: x", "");
+        let rendered: String = indented
+            .content_spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(
+            rendered, "warning: x",
+            "indentation must not survive the trim"
+        );
+
+        let marked = LogProcessor::process_log_entry(
+            &format!("[12:34:56] {} warning: x", wrkflw_logging::symbols::NESTED),
+            "",
+        );
+        let rendered: String = marked
+            .content_spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(
+            rendered,
+            format!("{} warning: x", wrkflw_logging::symbols::NESTED),
+            "the nesting glyph must survive the trim"
+        );
+        assert_eq!(marked.timestamp, "12:34:56");
+    }
 }

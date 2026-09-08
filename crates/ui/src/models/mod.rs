@@ -230,6 +230,21 @@ mod tests {
             "[12:00:00] Triggering workflow: ci.yml",
             "[12:00:00] Workflow completed successfully",
             "[12:00:00] Diff filter OFF",
+            // Lines arriving from the `wrkflw_logging` store, which
+            // stamps a level glyph after the timestamp. Execution events
+            // are logged there and nowhere else, so these shapes are what
+            // the panes actually draw for them. The glyph is load-bearing:
+            // it is checked in the same tier as the level keyword, so it
+            // badges lines whose wording alone would badge them wrong.
+            // "failed" is not a keyword, and this line would be INFO
+            // without the failure glyph:
+            "[12:00:00] \u{2716} Workflow 'ci' failed: exit status 1",
+            // The Warn tier is tested before the Success tier, so the
+            // glyph wins over the "Success" in the state name:
+            "[12:00:00] \u{26A0} Cannot trigger workflow 'ci' in Success state",
+            "[12:00:00] \u{26A0} No workflow selected to trigger",
+            "[12:00:00] \u{25CF} Executing workflow: ci",
+            "[12:00:00] \u{25CF} Workflow 'ci' completed successfully!",
         ];
 
         let levels = [

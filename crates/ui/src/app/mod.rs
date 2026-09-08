@@ -56,7 +56,6 @@ pub async fn run_wrkflw_tui(
     );
 
     if app.validation_mode {
-        app.add_timestamped_log("Starting in validation mode");
         wrkflw_logging::info("Starting in validation mode");
     }
 
@@ -561,7 +560,6 @@ fn run_tui_event_loop(
                                             "Workflow '{}' is already running",
                                             workflow.name
                                         );
-                                        app.add_timestamped_log(&msg);
                                         wrkflw_logging::warning(&msg);
                                     } else {
                                         // First, get all the data we need from the workflow
@@ -584,40 +582,32 @@ fn run_tui_event_loop(
                                             status_text
                                         ));
 
-                                        // Add log entries
-                                        app.add_timestamped_log(&format!(
+                                        // Both lines go to the global store: it
+                                        // is the only sink `get_combined_logs`
+                                        // renders once, and the hint has to stay
+                                        // adjacent to the warning it explains.
+                                        // The warning carries the workflow name
+                                        // that the app-side copy used to add.
+                                        wrkflw_logging::warning(&format!(
                                             "Cannot trigger workflow '{}' in {} state",
                                             workflow_name, status_text
                                         ));
 
-                                        // Add hint about using reset
                                         if needs_reset_hint {
-                                            app.add_timestamped_log(
+                                            wrkflw_logging::info(
                                                 "Hint: Press 'Shift+R' to reset the workflow status and allow triggering",
                                             );
                                         }
-
-                                        wrkflw_logging::warning(&format!(
-                                            "Cannot trigger workflow in {} state",
-                                            status_text
-                                        ));
                                     }
                                 }
                             } else {
-                                app.add_timestamped_log("No workflow selected to trigger");
                                 wrkflw_logging::warning("No workflow selected to trigger");
                             }
                         } else if app.running {
-                            app.add_timestamped_log(
-                                "Cannot trigger workflow while another operation is in progress",
-                            );
                             wrkflw_logging::warning(
                                 "Cannot trigger workflow while another operation is in progress",
                             );
                         } else if app.selected_tab != TAB_WORKFLOWS {
-                            app.add_timestamped_log(
-                                "Switch to Workflows tab to trigger a workflow",
-                            );
                             wrkflw_logging::warning(
                                 "Switch to Workflows tab to trigger a workflow",
                             );

@@ -1,6 +1,6 @@
 # Codebase Index: wrkflw
 
-> Generated: 2026-09-08 14:45:14 UTC | Files: 202 | Lines: 71166
+> Generated: 2026-09-08 17:28:51 UTC | Files: 202 | Lines: 72893
 > Languages: JSON (4), Markdown (24), Rust (113), Shell (5), TOML (18), YAML (38)
 
 ## Directory Structure
@@ -1400,7 +1400,7 @@ wrkflw/
 
 ## INDEX.md
 
-**Language:** Markdown | **Size:** 94.2 KB | **Lines:** 4002
+**Language:** Markdown | **Size:** 145.0 KB | **Lines:** 5741
 
 **Declarations:**
 
@@ -3622,7 +3622,7 @@ wrkflw/
 
 ## crates/ui/src/app/state.rs
 
-**Language:** Rust | **Size:** 177.5 KB | **Lines:** 4398
+**Language:** Rust | **Size:** 176.9 KB | **Lines:** 4388
 
 **Imports:**
 - `crate::log_processor::{LogProcessingRequest, LogProcessor, ProcessedLogEntry}`
@@ -4030,7 +4030,7 @@ wrkflw/
 
 ## crates/ui/src/handlers/workflow.rs
 
-**Language:** Rust | **Size:** 25.3 KB | **Lines:** 667
+**Language:** Rust | **Size:** 25.3 KB | **Lines:** 666
 
 **Imports:**
 - `crate::cli_style`
@@ -4115,7 +4115,7 @@ wrkflw/
 
 ## crates/ui/src/models/mod.rs
 
-**Language:** Rust | **Size:** 10.9 KB | **Lines:** 314
+**Language:** Rust | **Size:** 10.9 KB | **Lines:** 313
 
 **Imports:**
 - `chrono::Local`

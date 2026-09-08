@@ -564,7 +564,6 @@ pub fn start_next_workflow_execution(
                 jobs: Vec::new(),
                 start_time: Local::now(),
                 end_time: None,
-                logs: Vec::new(),
                 progress: 0.0,
             });
         }

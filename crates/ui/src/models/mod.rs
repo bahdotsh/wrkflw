@@ -54,7 +54,6 @@ pub struct WorkflowExecution {
     pub jobs: Vec<JobExecution>,
     pub start_time: chrono::DateTime<Local>,
     pub end_time: Option<chrono::DateTime<Local>>,
-    pub logs: Vec<String>,
     pub progress: f64, // 0.0 - 1.0 for progress bar
 }
 

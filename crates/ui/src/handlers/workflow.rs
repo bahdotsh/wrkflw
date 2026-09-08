@@ -469,12 +469,8 @@ pub fn start_next_workflow_execution(
 
         // Log whether verbose mode is enabled
         if verbose {
-            app.add_timestamped_log("Verbose mode: Step outputs will be displayed in full");
             wrkflw_logging::info("Verbose mode: Step outputs will be displayed in full");
         } else {
-            app.add_timestamped_log(
-                "Standard mode: Only step status will be shown (use --verbose for full output)",
-            );
             wrkflw_logging::info(
                 "Standard mode: Only step status will be shown (use --verbose for full output)",
             );
@@ -498,9 +494,6 @@ pub fn start_next_workflow_execution(
                         wrkflw_logging::info("Auto-detected Podman runtime");
                         RuntimeType::Podman
                     } else {
-                        app.add_timestamped_log(
-                            "No container runtime found (tried Docker and Podman). Using emulation mode instead.",
-                        );
                         wrkflw_logging::warning(
                             "No container runtime found (tried Docker and Podman). Using emulation mode instead.",
                         );
@@ -523,9 +516,6 @@ pub fn start_next_workflow_execution(
                 };
 
                 if !is_docker_available {
-                    app.add_timestamped_log(
-                        "Docker is not available. Using emulation mode instead.",
-                    );
                     wrkflw_logging::warning(
                         "Docker is not available. Using emulation mode instead.",
                     );
@@ -549,9 +539,6 @@ pub fn start_next_workflow_execution(
                 };
 
                 if !is_podman_available {
-                    app.add_timestamped_log(
-                        "Podman is not available. Using emulation mode instead.",
-                    );
                     wrkflw_logging::warning(
                         "Podman is not available. Using emulation mode instead.",
                     );
@@ -675,7 +662,6 @@ pub fn start_next_workflow_execution(
         });
     } else {
         app.running = false;
-        app.add_timestamped_log("All workflows completed execution");
         wrkflw_logging::info("All workflows completed execution");
     }
 }

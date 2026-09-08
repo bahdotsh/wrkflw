@@ -941,9 +941,7 @@ impl App {
         } else {
             "normal"
         };
-        let msg = format!("Switched to {} mode", mode);
-        self.add_timestamped_log(&msg);
-        wrkflw_logging::info(&msg);
+        wrkflw_logging::info(&format!("Switched to {} mode", mode));
     }
 
     pub fn runtime_type_name(&self) -> &str {
@@ -1157,7 +1155,6 @@ impl App {
 
             // Log only once at the beginning - don't initialize execution details here
             // since that will happen in start_next_workflow_execution
-            self.add_timestamped_log("Starting workflow execution...");
             wrkflw_logging::info("Starting workflow execution...");
         }
     }
@@ -1169,7 +1166,6 @@ impl App {
         result: Result<(Vec<wrkflw_executor::JobResult>, ()), String>,
     ) {
         if workflow_idx >= self.workflows.len() {
-            self.add_timestamped_log("Error: Invalid workflow index received");
             wrkflw_logging::error("Invalid workflow index received in process_execution_result");
             return;
         }
@@ -1251,16 +1247,16 @@ impl App {
         match result {
             Ok(_) => {
                 workflow.status = WorkflowStatus::Success;
-                // `wrkflw_logging` stamps its own [HH:MM:SS] prefix,
-                // so it gets the bare message.
+                // Single sink: `wrkflw_logging` stamps its own [HH:MM:SS]
+                // prefix and level glyph, and `get_combined_logs` folds the
+                // store into the log panes. A second app-side push would
+                // render the same line twice.
                 let msg = format!("Workflow '{}' completed successfully!", workflow.name);
-                self.add_timestamped_log(&msg);
                 wrkflw_logging::info(&msg);
             }
             Err(e) => {
                 workflow.status = WorkflowStatus::Failed;
                 let msg = format!("Workflow '{}' failed: {}", workflow.name, e);
-                self.add_timestamped_log(&msg);
                 wrkflw_logging::error(&msg);
             }
         }
@@ -1284,10 +1280,6 @@ impl App {
         let target_job = entry.target_job;
         self.workflows[next].status = WorkflowStatus::Running;
         self.current_execution = Some(next);
-        self.add_timestamped_log(&format!(
-            "Executing workflow: {}",
-            self.workflows[next].name
-        ));
         wrkflw_logging::info(&format!(
             "Executing workflow: {}",
             self.workflows[next].name
@@ -1651,7 +1643,6 @@ impl App {
                 let workflow = &self.workflows[selected_idx];
 
                 if workflow.name.is_empty() {
-                    self.add_timestamped_log("Error: Invalid workflow selection");
                     wrkflw_logging::error(
                         "Invalid workflow selection in trigger_selected_workflow",
                     );
@@ -1662,7 +1653,6 @@ impl App {
                 let workflow_name = workflow.name.clone();
 
                 // Set up background task to execute the workflow via GitHub Actions REST API
-                self.add_timestamped_log(&format!("Triggering workflow: {}", workflow_name));
                 wrkflw_logging::info(&format!("Triggering workflow: {}", workflow_name));
                 let tx_clone = self.tx.clone();
 
@@ -1697,11 +1687,9 @@ impl App {
                     }
                 });
             } else {
-                self.add_timestamped_log("No workflow selected to trigger");
                 wrkflw_logging::warning("No workflow selected to trigger");
             }
         } else {
-            self.add_timestamped_log("No workflow selected to trigger");
             wrkflw_logging::warning("No workflow selected to trigger");
         }
     }
@@ -1710,7 +1698,6 @@ impl App {
     pub fn reset_workflow_status(&mut self) {
         // Log whether a selection exists
         if self.workflow_list_state.selected().is_none() {
-            self.add_timestamped_log("Debug: No workflow selected for reset");
             wrkflw_logging::warning("No workflow selected for reset");
             return;
         }
@@ -1748,7 +1735,6 @@ impl App {
                     "Reset workflow '{}' from {} state to NotStarted - status is now {:?}",
                     workflow.name, old_status, workflow.status
                 );
-                self.add_timestamped_log(&reset_msg);
                 wrkflw_logging::info(&reset_msg);
 
                 // Set a success status message
@@ -1850,7 +1836,15 @@ impl App {
         self.mark_logs_for_update(); // trims to the cap and bumps the revision
     }
 
-    /// Add a formatted log entry with timestamp and trigger log processing update
+    /// Add a formatted log entry with timestamp and trigger log processing update.
+    ///
+    /// One message, one sink. `get_combined_logs` concatenates this buffer
+    /// with the `wrkflw_logging` store and does not deduplicate, so a
+    /// message sent to both renders twice in the Logs and Execution tabs.
+    /// Anything `wrkflw_logging` already records must NOT be passed here:
+    /// that store stamps its own `[HH:MM:SS]` prefix and level glyph, so
+    /// the global copy is the better-badged one. This buffer is for lines
+    /// with no global counterpart.
     pub fn add_timestamped_log(&mut self, message: &str) {
         let timestamp = Local::now().format("%H:%M:%S").to_string();
         let formatted_message = format!("[{}] {}", timestamp, message);
@@ -3623,6 +3617,97 @@ mod tests {
     fn get_next_workflow_to_execute_returns_none_when_empty() {
         let mut app = make_app();
         assert!(app.get_next_workflow_to_execute().is_none());
+    }
+
+    #[test]
+    fn executing_workflow_is_logged_once_across_both_sinks() {
+        // `get_combined_logs` concatenates the app buffer and the global
+        // `wrkflw_logging` store with no deduplication, so a message
+        // written to both renders twice in the Logs and Execution tabs.
+        // The global store is the single sink for execution events: it
+        // stamps its own timestamp and level glyph.
+        let mut app = make_app();
+        // The global store is process-wide, never cleared, and shared by
+        // every test in this binary, so the count assertion has to key
+        // off a workflow name no other test produces. `make_app` uses
+        // "ci" and "deploy", and the sibling test above executes "ci".
+        let name = "dedup-probe-workflow";
+        app.workflows[0].name = name.to_string();
+        app.logs.clear();
+        app.execution_queue.push(QueuedExecution {
+            workflow_idx: 0,
+            target_job: None,
+        });
+
+        app.get_next_workflow_to_execute();
+
+        assert!(
+            !app.logs.iter().any(|line| line.contains(name)),
+            "the execution message must not be pushed to the app buffer; \
+             the global store owns it, got {:?}",
+            app.logs
+        );
+        let rendered = format!("Executing workflow: {}", name);
+        let hits = app
+            .get_combined_logs()
+            .iter()
+            .filter(|line| line.contains(&rendered))
+            .count();
+        assert_eq!(
+            hits, 1,
+            "the merged view must render the message exactly once"
+        );
+    }
+
+    #[test]
+    fn dual_logged_events_do_not_also_land_in_the_app_buffer() {
+        // Each action below records its message through `wrkflw_logging`.
+        // None may also push to `self.logs`, or the merge renders it
+        // twice. Counting the app buffer is what pins that: the global
+        // store cannot be cleared between cases.
+        fn app_lines_after(action: impl FnOnce(&mut App)) -> usize {
+            let mut app = make_app();
+            app.logs.clear();
+            action(&mut app);
+            app.logs.len()
+        }
+
+        assert_eq!(
+            app_lines_after(|app| app.toggle_validation_mode()),
+            0,
+            "toggle_validation_mode logs to the global store only"
+        );
+        assert_eq!(
+            app_lines_after(|app| {
+                app.execution_queue.push(QueuedExecution {
+                    workflow_idx: 0,
+                    target_job: None,
+                });
+                app.start_execution();
+            }),
+            0,
+            "start_execution logs to the global store only"
+        );
+        assert_eq!(
+            app_lines_after(|app| app.process_execution_result(0, Ok((Vec::new(), ())))),
+            0,
+            "the success arm of process_execution_result logs to the global store only"
+        );
+        assert_eq!(
+            app_lines_after(|app| {
+                app.process_execution_result(0, Err("execution blew up".to_string()))
+            }),
+            0,
+            "the failure arm of process_execution_result logs to the global store only"
+        );
+        // `reset_workflow_status` keeps exactly one app-side line: the
+        // "Attempting to reset" trace has no global counterpart, so it
+        // is not a duplicate.
+        assert_eq!(
+            app_lines_after(|app| app.reset_workflow_status()),
+            1,
+            "reset_workflow_status keeps only its app-only trace line"
+        );
     }
 
     #[test]

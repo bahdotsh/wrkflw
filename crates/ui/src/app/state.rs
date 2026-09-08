@@ -1835,8 +1835,17 @@ impl App {
         all_logs
     }
 
-    /// Add a log entry and trigger log processing update
-    pub fn add_log(&mut self, message: String) {
+    /// Add a raw log entry and trigger log processing update.
+    ///
+    /// Deliberately private. Every line in the log panes is drawn with the
+    /// timestamp parsed out of its `[HH:MM:SS]` prefix, so a line pushed
+    /// without one renders `??:??:??`. Three separate fixes have been needed
+    /// for callers that reached past `add_timestamped_log` to get here;
+    /// keeping this private makes that a compile error rather than a
+    /// cosmetic bug nobody notices until a screenshot. Use
+    /// [`Self::add_timestamped_log`], and mark sub-items with
+    /// [`crate::theme::symbols::NESTED`] rather than leading whitespace.
+    fn add_log(&mut self, message: String) {
         self.logs.push(message);
         self.mark_logs_for_update(); // trims to the cap and bumps the revision
     }
@@ -2797,11 +2806,7 @@ mod tests {
     /// `[HH:MM:SS]` prefix and trims. Leading whitespace does not survive
     /// this, which is why nesting is carried by a glyph.
     fn rendered_content(line: &str) -> String {
-        crate::log_processor::LogProcessor::process_log_entry(line, "")
-            .content_spans
-            .iter()
-            .map(|s| s.content.as_ref())
-            .collect()
+        crate::log_processor::LogProcessor::process_log_entry(line, "").rendered_content()
     }
 
     #[test]

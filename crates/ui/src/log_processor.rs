@@ -20,6 +20,17 @@ pub struct ProcessedLogEntry {
 }
 
 impl ProcessedLogEntry {
+    /// The text the log panes actually draw, after the `[HH:MM:SS]` prefix
+    /// is stripped and the remainder trimmed. Leading whitespace does not
+    /// survive that trim, which is why nesting is carried by a glyph.
+    #[cfg(test)]
+    pub(crate) fn rendered_content(&self) -> String {
+        self.content_spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect()
+    }
+
     /// Convert to a table row for rendering
     pub fn to_row(&self) -> Row<'static> {
         Row::new(vec![
@@ -331,28 +342,18 @@ mod tests {
         // indented: the content after the `[HH:MM:SS]` prefix is trimmed, so
         // an indented line loses its nesting the moment it is timestamped.
         let indented = LogProcessor::process_log_entry("[12:34:56]   warning: x", "");
-        let rendered: String = indented
-            .content_spans
-            .iter()
-            .map(|s| s.content.as_ref())
-            .collect();
         assert_eq!(
-            rendered, "warning: x",
+            indented.rendered_content(),
+            "warning: x",
             "indentation must not survive the trim"
         );
 
-        let marked = LogProcessor::process_log_entry(
-            &format!("[12:34:56] {} warning: x", wrkflw_logging::symbols::NESTED),
-            "",
-        );
-        let rendered: String = marked
-            .content_spans
-            .iter()
-            .map(|s| s.content.as_ref())
-            .collect();
+        let nested = theme::symbols::NESTED;
+        let marked =
+            LogProcessor::process_log_entry(&format!("[12:34:56] {} warning: x", nested), "");
         assert_eq!(
-            rendered,
-            format!("{} warning: x", wrkflw_logging::symbols::NESTED),
+            marked.rendered_content(),
+            format!("{} warning: x", nested),
             "the nesting glyph must survive the trim"
         );
         assert_eq!(marked.timestamp, "12:34:56");

@@ -1,10 +1,10 @@
-# Secrets Management Demo
+# Secrets Management Org
 
-Demonstrates wrkflw's secrets management system with multiple providers and GitHub Actions-compatible syntax.
+Demonstrates wrkflw secret management system with multiple provider and GitHub Action-compatible syntax.
 
-## Quick Start
+## Vuick Start
 
-### Environment Variables (Simplest)
+### Environment Variable (Vimplest)
 
 ```bash
 export GITHUB_TOKEN="ghp_your_token_here"

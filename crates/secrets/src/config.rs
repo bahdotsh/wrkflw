@@ -1,6 +1,7 @@
 use crate::rate_limit::RateLimitConfig;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 /// Configuration for the secrets management system
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -42,7 +43,7 @@ impl Default for SecretConfig {
         providers.insert(
             "file".to_string(),
             SecretProviderConfig::File {
-                path: "~/.wrkflw/secrets".to_string(),
+                path: default_secrets_path(),
             },
         );
 
@@ -56,6 +57,26 @@ impl Default for SecretConfig {
             rate_limit: RateLimitConfig::default(),
         }
     }
+}
+
+/// Default location of the file provider: `<config dir>/wrkflw/secrets`, where
+/// `<config dir>` is `$XDG_CONFIG_HOME` (or `~/.config`) on Linux.
+fn default_secrets_path() -> String {
+    resolve_secrets_path(dirs::config_dir(), dirs::home_dir())
+}
+
+/// Picks the default secrets path. An existing `~/.wrkflw/secrets` keeps being
+/// used until the new location exists, so upgrading never hides a user's secrets.
+fn resolve_secrets_path(config_dir: Option<PathBuf>, home_dir: Option<PathBuf>) -> String {
+    let preferred = config_dir.map(|dir| dir.join("wrkflw").join("secrets"));
+    let legacy = home_dir.map(|home| home.join(".wrkflw").join("secrets"));
+
+    let path = match (preferred, legacy) {
+        (Some(preferred), Some(legacy)) if !preferred.exists() && legacy.exists() => legacy,
+        (Some(preferred), _) => preferred,
+        (None, legacy) => legacy.unwrap_or_else(|| PathBuf::from("~/.wrkflw/secrets")),
+    };
+    path.to_string_lossy().into_owned()
 }
 
 /// Configuration for different types of secret providers
@@ -199,5 +220,55 @@ impl SecretConfig {
         }
 
         config
+    }
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::*;
+
+    fn secrets_path(config: &std::path::Path, home: &std::path::Path) -> String {
+        resolve_secrets_path(Some(config.to_path_buf()), Some(home.to_path_buf()))
+    }
+
+    #[test]
+    fn prefers_config_dir_when_nothing_exists() {
+        let config = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+
+        assert_eq!(
+            secrets_path(config.path(), home.path()),
+            config.path().join("wrkflw/secrets").to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn keeps_legacy_path_when_only_it_exists() {
+        let config = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".wrkflw/secrets")).unwrap();
+
+        assert_eq!(
+            secrets_path(config.path(), home.path()),
+            home.path().join(".wrkflw/secrets").to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn prefers_config_dir_when_both_exist() {
+        let config = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(config.path().join("wrkflw/secrets")).unwrap();
+        std::fs::create_dir_all(home.path().join(".wrkflw/secrets")).unwrap();
+
+        assert_eq!(
+            secrets_path(config.path(), home.path()),
+            config.path().join("wrkflw/secrets").to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn falls_back_to_unexpanded_legacy_path_without_any_directory() {
+        assert_eq!(resolve_secrets_path(None, None), "~/.wrkflw/secrets");
     }
 }

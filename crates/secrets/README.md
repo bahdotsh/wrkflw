@@ -39,7 +39,7 @@ async fn main() -> SecretResult<()> {
 
 ## Configuration
 
-Create `~/.wrkflw/secrets.yml`:
+Create `~/.config/wrkflw/secrets.yml`:
 
 ```yaml
 default_provider: env
@@ -54,7 +54,7 @@ providers:
     prefix: "WRKFLW_SECRET_"
   file:
     type: file
-    path: "~/.wrkflw/secrets.json"
+    path: "~/.config/wrkflw/secrets.json"
   vault:
     type: vault
     url: "https://vault.example.com"

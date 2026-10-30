@@ -255,7 +255,7 @@ export GITHUB_TOKEN="ghp_..."
 wrkflw run .github/workflows/ci.yml
 
 # File-based secrets (JSON, YAML, or .env format)
-# Configure in ~/.wrkflw/secrets.yml
+# On Linux, put them in ~/.config/wrkflw/secrets/ (read by the `file` provider)
 ```
 
 Supported providers: environment variables, file-based, HashiCorp Vault, AWS Secrets Manager, Azure Key Vault, Google Cloud Secret Manager. See the [secrets demo](examples/secrets-demo/) for detailed examples.

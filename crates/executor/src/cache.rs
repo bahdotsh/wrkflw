@@ -1,6 +1,7 @@
 //! Local cache storage for GitHub Actions `actions/cache` emulation.
 //!
-//! Caches are stored under `~/.wrkflw/cache/` (persistent across runs)
+//! Caches are stored under the platform cache directory (persistent across
+//! runs), e.g. `$XDG_CACHE_HOME/wrkflw/cache/` on Linux,
 //! and keyed by a SHA-256 hash of the cache key string.
 
 use sha2::{Digest, Sha256};
@@ -29,12 +30,13 @@ pub struct CacheStore {
 }
 
 impl CacheStore {
-    /// Create a new cache store. Uses `~/.wrkflw/cache/` by default.
+    /// Create a new cache store. Uses `<cache dir>/wrkflw/cache/` by default,
+    /// where `<cache dir>` is `$XDG_CACHE_HOME` (or `~/.cache`) on Linux.
     pub fn new() -> Result<Self, String> {
-        let home = dirs::home_dir()
-            .or_else(|| std::env::var("HOME").ok().map(std::path::PathBuf::from))
-            .ok_or_else(|| "Could not determine home directory (HOME is not set).".to_string())?;
-        let root = home.join(".wrkflw").join("cache");
+        let root = dirs::cache_dir()
+            .ok_or_else(|| "Could not determine cache directory (HOME is not set).".to_string())?
+            .join("wrkflw")
+            .join("cache");
         std::fs::create_dir_all(&root).map_err(|e| {
             format!(
                 "Failed to create cache directory '{}': {}",

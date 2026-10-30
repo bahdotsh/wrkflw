@@ -37,6 +37,12 @@ pub async fn run_wrkflw_tui(
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
+    // Some terminals (e.g. iTerm2) carry the primary screen's contents
+    // into the alternate screen. ratatui assumes it starts from a blank
+    // screen and only redraws cells that change, so any widget area left
+    // unpainted would keep showing that stale text. Clear explicitly so
+    // the first frame starts from a known-empty screen.
+    terminal.clear()?;
 
     // Suppress logging to stdout/stderr while TUI owns the terminal
     wrkflw_logging::set_quiet_mode(true);

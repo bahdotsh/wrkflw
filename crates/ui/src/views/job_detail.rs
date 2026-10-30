@@ -490,14 +490,16 @@ fn render_matrix_pane(
         }
     }
 
-    if !matrix.exclude.is_empty() {
-        lines.push(Line::from(""));
-        lines.push(Line::from(vec![Span::styled(
-            format!("EXCLUDE ({})", matrix.exclude.len()),
-            Style::default()
-                .fg(COLORS.highlight)
-                .add_modifier(Modifier::BOLD),
-        )]));
+    if let wrkflw_matrix::MatrixEntries::List(exclude) = &matrix.exclude {
+        if !exclude.is_empty() {
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![Span::styled(
+                format!("EXCLUDE ({})", exclude.len()),
+                Style::default()
+                    .fg(COLORS.highlight)
+                    .add_modifier(Modifier::BOLD),
+            )]));
+        }
     }
 
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner_area);

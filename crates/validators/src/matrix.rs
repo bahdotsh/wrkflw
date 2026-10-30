@@ -54,6 +54,14 @@ pub fn validate_matrix(matrix: &Value, result: &mut ValidationResult) {
 }
 
 fn validate_include_exclude(section: &Value, section_name: &str, result: &mut ValidationResult) {
+    // An expression such as `${{ fromJSON(...) }}` is only known at run time
+    if let Some(expr) = section.as_str().filter(|s| wrkflw_matrix::is_expression(s)) {
+        if let Err(e) = wrkflw_matrix::check_strategy_expression(expr) {
+            result.add_issue(format!("{} {}", section_name, e));
+        }
+        return;
+    }
+
     if !section.is_sequence() {
         result.add_issue(format!("{} must be an array of objects", section_name));
         return;
@@ -115,5 +123,49 @@ fn get_value_type(value: &Value) -> &'static str {
         Value::Sequence(_) => "array",
         Value::Mapping(_) => "object",
         _ => "unknown",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn issues_for(yaml: &str) -> Vec<String> {
+        let matrix: Value = serde_yaml::from_str(yaml).unwrap();
+        let mut result = ValidationResult::new();
+        validate_matrix(&matrix, &mut result);
+        result.issues
+    }
+
+    #[test]
+    fn accepts_expression_include_and_exclude() {
+        let issues = issues_for(
+            "os: [ubuntu]\ninclude: ${{ fromJSON(needs.a.outputs.m) }}\nexclude: ${{ fromJSON(inputs.x) }}\n",
+        );
+        assert!(issues.is_empty(), "{:?}", issues);
+    }
+
+    #[test]
+    fn rejects_contexts_unavailable_in_strategy() {
+        let issues = issues_for("os: [ubuntu]\nexclude: ${{ fromJSON(env.X) }}\n");
+        assert_eq!(issues.len(), 1, "{:?}", issues);
+        assert!(issues[0].starts_with("exclude "), "{:?}", issues);
+        assert!(issues[0].contains("uses env"), "{:?}", issues);
+    }
+
+    #[test]
+    fn rejects_plain_string_include() {
+        assert_eq!(
+            issues_for("os: [ubuntu]\ninclude: not-an-expression\n"),
+            vec!["include must be an array of objects".to_string()]
+        );
+    }
+
+    #[test]
+    fn rejects_non_object_include_items() {
+        assert_eq!(
+            issues_for("os: [ubuntu]\ninclude:\n  - ubuntu\n"),
+            vec!["include item at index 0 must be an object".to_string()]
+        );
     }
 }

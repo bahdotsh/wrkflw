@@ -256,16 +256,15 @@ fn render_graph(
                 Span::styled(" │", Style::default().fg(color)),
             ]));
             // Matrix badge for nodes that carry a strategy.matrix.
-            let matrix_axes = def
+            let matrix_size = def
                 .jobs
                 .get(name)
                 .and_then(|j| j.matrix_config())
-                .map(|m| m.parameters.len())
-                .unwrap_or(0);
-            if matrix_axes > 0 {
+                .and_then(matrix_size_label);
+            if let Some(size) = matrix_size {
                 lines.push(Line::from(vec![
                     Span::styled("│ ", Style::default().fg(color)),
-                    theme::badge_outline(format!("matrix×{}", matrix_axes), BadgeKind::Info),
+                    theme::badge_outline(format!("matrix×{}", size), BadgeKind::Info),
                     Span::styled("         │", Style::default().fg(color)),
                 ]));
             }
@@ -363,7 +362,8 @@ fn render_topo_list(
                 .jobs
                 .get(name)
                 .and_then(|j| j.matrix_config())
-                .map(|m| format!(" matrix×{}", m.parameters.len()))
+                .and_then(matrix_size_label)
+                .map(|size| format!(" matrix×{}", size))
                 .unwrap_or_default();
             lines.push(Line::from(vec![
                 Span::raw("   "),
@@ -445,5 +445,21 @@ fn truncate(s: &str, n: usize) -> String {
         let mut out: String = s.chars().take(n.saturating_sub(1)).collect();
         out.push('…');
         out
+    }
+}
+
+/// The size shown on a job's matrix badge: its axis count, or for a matrix made
+/// only of `include` entries, the entry count (`?` while that is only known at
+/// run time). `None` when the job has no effective matrix.
+fn matrix_size_label(matrix: &wrkflw_matrix::MatrixConfig) -> Option<String> {
+    use wrkflw_matrix::MatrixEntries;
+
+    if !matrix.parameters.is_empty() {
+        return Some(matrix.parameters.len().to_string());
+    }
+    match &matrix.include {
+        MatrixEntries::Expression(_) => Some("?".to_string()),
+        MatrixEntries::List(entries) if !entries.is_empty() => Some(entries.len().to_string()),
+        MatrixEntries::List(_) => None,
     }
 }

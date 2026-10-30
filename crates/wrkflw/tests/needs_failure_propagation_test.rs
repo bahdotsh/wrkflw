@@ -182,3 +182,244 @@ jobs:
     assert_eq!(status_of(&result, "b"), "skipped");
     assert_eq!(status_of(&result, "c"), "success");
 }
+
+/// Run an inline workflow and return the result.
+async fn run(yaml: &str) -> ExecutionResult {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("ci.yml");
+    write_file(&path, yaml);
+    execute_workflow(&path, emulation_cfg())
+        .await
+        .expect("workflow execution completed")
+}
+
+/// `if: failure()` must run when a need failed, and `if: success()` must not.
+#[tokio::test]
+async fn status_functions_see_the_failed_need() {
+    let result = run(r#"
+name: CI
+on: push
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - run: exit 1
+  on_failure:
+    runs-on: ubuntu-latest
+    needs: [deploy]
+    if: failure()
+    steps:
+      - run: echo "cleanup"
+  on_success:
+    runs-on: ubuntu-latest
+    needs: [deploy]
+    if: success()
+    steps:
+      - run: echo "should not run"
+"#)
+    .await;
+
+    assert_eq!(status_of(&result, "deploy"), "failure");
+    assert_eq!(status_of(&result, "on_failure"), "success");
+    assert_eq!(status_of(&result, "on_success"), "skipped");
+}
+
+/// `needs.<id>.result` is populated when a job-level `if:` is evaluated.
+#[tokio::test]
+async fn needs_result_is_visible_to_job_if() {
+    let result = run(r#"
+name: CI
+on: push
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - run: exit 1
+  report:
+    runs-on: ubuntu-latest
+    needs: [deploy]
+    if: always() && needs.deploy.result == 'failure'
+    steps:
+      - run: echo "deploy failed"
+"#)
+    .await;
+
+    assert_eq!(status_of(&result, "report"), "success");
+}
+
+/// An `if:` without a status function gets an implicit `success() &&`.
+#[tokio::test]
+async fn plain_if_is_still_gated_on_needs() {
+    let result = run(r#"
+name: CI
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: exit 1
+  publish:
+    runs-on: ubuntu-latest
+    needs: [build]
+    if: ${{ true }}
+    steps:
+      - run: echo "should not run"
+"#)
+    .await;
+
+    assert_eq!(status_of(&result, "publish"), "skipped");
+}
+
+/// A need skipped by its own `if:` skips its dependents.
+#[tokio::test]
+async fn need_skipped_by_its_own_if_skips_dependents() {
+    let result = run(r#"
+name: CI
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    if: false
+    steps:
+      - run: echo hi
+  test:
+    runs-on: ubuntu-latest
+    needs: [build]
+    steps:
+      - run: echo hi
+"#)
+    .await;
+
+    assert_eq!(status_of(&result, "build"), "skipped");
+    assert_eq!(status_of(&result, "test"), "skipped");
+}
+
+/// One failed need is enough to skip, even when another need succeeded.
+#[tokio::test]
+async fn any_failed_need_among_several_skips() {
+    let result = run(r#"
+name: CI
+on: push
+jobs:
+  ok:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok
+  bad:
+    runs-on: ubuntu-latest
+    steps:
+      - run: exit 1
+  merge:
+    runs-on: ubuntu-latest
+    needs: [ok, bad]
+    steps:
+      - run: echo hi
+"#)
+    .await;
+
+    assert_eq!(status_of(&result, "ok"), "success");
+    assert_eq!(status_of(&result, "merge"), "skipped");
+}
+
+/// A failed grandparent keeps `success()` false even when the parent ran via
+/// `if: always()`, matching GitHub's ancestor semantics.
+#[tokio::test]
+async fn ancestor_failure_propagates_past_an_always_job() {
+    let result = run(r#"
+name: CI
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: exit 1
+  notify:
+    runs-on: ubuntu-latest
+    needs: [build]
+    if: always()
+    steps:
+      - run: echo notify
+  deploy:
+    runs-on: ubuntu-latest
+    needs: [notify]
+    steps:
+      - run: echo "should not run"
+  cleanup:
+    runs-on: ubuntu-latest
+    needs: [notify]
+    if: failure()
+    steps:
+      - run: echo cleanup
+"#)
+    .await;
+
+    assert_eq!(status_of(&result, "notify"), "success");
+    assert_eq!(status_of(&result, "deploy"), "skipped");
+    assert_eq!(status_of(&result, "cleanup"), "success");
+}
+
+/// Jobs inside a reusable workflow follow the same `needs:` rules.
+#[tokio::test]
+async fn reusable_workflow_jobs_skip_after_failed_need() {
+    // Local reusable-workflow paths must stay inside the current directory
+    // (the repository root), so the temp dir is created there.
+    let dir = tempfile::Builder::new()
+        .prefix(".needs-reusable-")
+        .tempdir_in(".")
+        .unwrap();
+    let dir_name = dir
+        .path()
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let called = dir.path().join("called.yml");
+    write_file(
+        &called,
+        r#"
+name: Called
+on: workflow_call
+jobs:
+  inner_build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: exit 1
+  inner_deploy:
+    runs-on: ubuntu-latest
+    needs: [inner_build]
+    steps:
+      - run: echo "should not run"
+"#,
+    );
+    let caller = dir.path().join("ci.yml");
+    write_file(
+        &caller,
+        &format!(
+            r#"
+name: CI
+on: push
+jobs:
+  call:
+    uses: ./{}/called.yml
+"#,
+            dir_name
+        ),
+    );
+
+    let result = execute_workflow(&caller, emulation_cfg())
+        .await
+        .expect("workflow execution completed");
+
+    assert_eq!(status_of(&result, "call"), "failure");
+    let logs = &result
+        .jobs
+        .iter()
+        .find(|j| j.canonical_name == "call")
+        .unwrap()
+        .logs;
+    assert!(
+        logs.contains("- inner_deploy: Skipped"),
+        "inner_deploy must be skipped because inner_build failed; logs:\n{}",
+        logs
+    );
+}

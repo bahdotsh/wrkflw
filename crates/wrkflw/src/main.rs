@@ -52,6 +52,12 @@ struct Wrkflw {
     /// Run in debug mode with extensive execution details
     #[arg(short, long, global = true)]
     debug: bool,
+
+    /// TUI color theme: auto, dark or light. Defaults to WRKFLW_THEME, then auto,
+    /// which follows the terminal background
+    #[cfg(feature = "tui")]
+    #[arg(long, global = true, value_name = "THEME")]
+    theme: Option<wrkflw_ui::theme::ThemePreference>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -667,6 +673,7 @@ async fn main() {
                 verbose,
                 *preserve_containers_on_failure,
                 *show_action_messages,
+                cli.theme,
             )
             .await
             {
@@ -703,7 +710,8 @@ async fn main() {
 
                 // Call the TUI implementation from the ui crate with default path
                 if let Err(e) =
-                    wrkflw_ui::run_wrkflw_tui(None, runtime_type, verbose, false, false).await
+                    wrkflw_ui::run_wrkflw_tui(None, runtime_type, verbose, false, false, cli.theme)
+                        .await
                 {
                     eprintln!("Error running TUI: {}", e);
                     std::process::exit(1);

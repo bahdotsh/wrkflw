@@ -2,10 +2,11 @@
 // ratatui popup.
 //
 // We wire up the knobs that actually plumb through to the theme and
-// layouts. Anything we *can't* back up end-to-end (e.g. a full light
-// theme, which would need to re-table all the COLORS constants) is
-// omitted rather than rendered as a dead toggle — matches the rule
-// from PR #104: "A UI without backing data is worse than no UI."
+// layouts. Anything we *can't* back up end-to-end (e.g. switching
+// between the dark and light themes mid-session, which log entries
+// cached with the old palette would not follow) is omitted rather than
+// rendered as a dead toggle — matches the rule from PR #104: "A UI
+// without backing data is worse than no UI."
 //
 // The key dispatch in `app/mod.rs` treats the overlay as modal:
 // while `tweaks_open` is true, unmatched keys are swallowed instead

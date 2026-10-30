@@ -4,6 +4,7 @@ use crate::models::{
     ExecutionResultMsg, JobExecution, LogFilterLevel, QueuedExecution, StatusSeverity,
     StepExecution, TriggerMatchStatus, Workflow, WorkflowExecution, WorkflowStatus,
 };
+use crate::theme::{self, ThemeMode};
 use chrono::Local;
 use crossterm::event::KeyCode;
 use ratatui::widgets::{ListState, TableState};
@@ -243,16 +244,27 @@ impl Accent {
         }
     }
 
-    /// Matches the RGB values from the design handoff (`ACCENTS` table
-    /// in wrkflw TUI.html). Exposed as a 3-tuple so `theme.rs` can
-    /// translate into `ratatui::Color::Rgb`.
+    /// The accent's color in the active theme. Exposed as a 3-tuple so
+    /// `theme.rs` can translate into `ratatui::Color::Rgb`.
     pub fn rgb(self) -> (u8, u8, u8) {
-        match self {
-            Accent::Cyan => (0x5f, 0xd3, 0xf3),
-            Accent::Amber => (0xf5, 0xd7, 0x6e),
-            Accent::Green => (0x8f, 0xce, 0x8f),
-            Accent::Violet => (0xd6, 0x8c, 0xff),
-            Accent::Coral => (0xff, 0x99, 0x77),
+        self.rgb_for(theme::mode())
+    }
+
+    /// Dark values match the design handoff (`ACCENTS` table in wrkflw
+    /// TUI.html). Those are too pale for a light background, so the
+    /// light theme uses darker shades of the same hues.
+    pub fn rgb_for(self, mode: ThemeMode) -> (u8, u8, u8) {
+        match (self, mode) {
+            (Accent::Cyan, ThemeMode::Dark) => (0x5f, 0xd3, 0xf3),
+            (Accent::Amber, ThemeMode::Dark) => (0xf5, 0xd7, 0x6e),
+            (Accent::Green, ThemeMode::Dark) => (0x8f, 0xce, 0x8f),
+            (Accent::Violet, ThemeMode::Dark) => (0xd6, 0x8c, 0xff),
+            (Accent::Coral, ThemeMode::Dark) => (0xff, 0x99, 0x77),
+            (Accent::Cyan, ThemeMode::Light) => (0x00, 0x6d, 0x87),
+            (Accent::Amber, ThemeMode::Light) => (0x85, 0x55, 0x00),
+            (Accent::Green, ThemeMode::Light) => (0x1f, 0x75, 0x1f),
+            (Accent::Violet, ThemeMode::Light) => (0x7b, 0x2f, 0xbf),
+            (Accent::Coral, ThemeMode::Light) => (0xb0, 0x3a, 0x1a),
         }
     }
 }

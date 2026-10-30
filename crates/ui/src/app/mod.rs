@@ -20,6 +20,8 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use wrkflw_executor::RuntimeType;
 
+use crate::theme::ThemePreference;
+
 pub use state::{Accent, App, TriggerPlatform};
 
 // Main entry point for the TUI interface
@@ -30,7 +32,12 @@ pub async fn run_wrkflw_tui(
     verbose: bool,
     preserve_containers_on_failure: bool,
     show_action_messages: bool,
+    theme: Option<ThemePreference>,
 ) -> io::Result<()> {
+    // Picks the palette, which may query the terminal, so it has to
+    // happen before raw mode and the event loop take over the tty.
+    crate::theme::install(theme);
+
     // Terminal setup
     enable_raw_mode()?;
     let mut stdout = stdout();

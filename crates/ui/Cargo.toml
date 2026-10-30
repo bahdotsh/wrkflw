@@ -12,7 +12,7 @@ categories.workspace = true
 
 [features]
 default = ["tui"]
-tui = ["dep:crossterm", "dep:ratatui"]
+tui = ["dep:crossterm", "dep:ratatui", "dep:terminal-colorsaurus"]
 
 [dependencies]
 # Internal crates
@@ -33,6 +33,7 @@ chrono.workspace = true
 colored.workspace = true
 crossterm = { workspace = true, optional = true }
 ratatui = { workspace = true, optional = true }
+terminal-colorsaurus = { workspace = true, optional = true }
 serde.workspace = true
 serde_yaml.workspace = true
 tokio.workspace = true

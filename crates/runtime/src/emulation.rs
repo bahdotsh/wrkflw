@@ -233,10 +233,12 @@ impl ContainerRuntime for EmulationRuntime {
             .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or(command[0]);
+        // `run_container`'s `cmd: &[&str]` is an argv contract, so an absolute
+        // `argv[0]` is unambiguously a program to exec, never a shell line to re-parse.
         let use_direct_exec = matches!(
             cmd_basename,
             "bash" | "sh" | "python" | "python3" | "pwsh" | "powershell" | "cargo" | "rustup"
-        );
+        ) || Path::new(command[0]).is_absolute();
 
         let mut cmd;
         if use_direct_exec {
@@ -823,6 +825,31 @@ mod tests {
             msg.contains("emulation:"),
             "error should carry runtime label, got: {}",
             msg
+        );
+    }
+
+    /// An absolute `argv[0]` (e.g. `/usr/bin/env`) must be exec'd directly.
+    /// The unfixed code re-joins the argv into a string and hands it to an
+    /// outer `sh -c`, which re-parses it and expands `$WRKFLW_LITERAL` itself.
+    #[cfg(not(target_os = "windows"))]
+    #[tokio::test]
+    async fn emulation_direct_execs_absolute_command_without_reparsing() {
+        let runtime = EmulationRuntime::new();
+        let result = runtime
+            .run_container(
+                "alpine:latest",
+                &["/usr/bin/env", "printf", "%s", "$WRKFLW_LITERAL"],
+                &[("WRKFLW_LITERAL", "expanded")],
+                Path::new("."),
+                &[(Path::new("."), Path::new("/github/workspace"))],
+                None,
+            )
+            .await;
+
+        let output = result.expect("direct exec of an absolute command should succeed");
+        assert_eq!(
+            output.stdout, "$WRKFLW_LITERAL",
+            "an absolute argv[0] must be exec'd directly, not re-joined and re-parsed by an outer shell"
         );
     }
 }

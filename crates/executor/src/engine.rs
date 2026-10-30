@@ -3807,9 +3807,9 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
         let mount_ctx =
             prepare_step_container_context(&mut step_env, ctx.job_env, ctx.container_config);
 
-        // Custom (non-built-in) shells write the script to a file the container
-        // can reach and clean it up once the run completes.
-        let mut custom_shell_host_script: Option<PathBuf> = None;
+        // Custom (non-built-in) shells run a script file. Holding the guard here
+        // keeps the file alive for the run and removes it on every exit path.
+        let mut custom_shell_script: Option<CustomShellScript> = None;
 
         let cmd_parts: Vec<String> = match effective_shell {
             "bash" => vec![
@@ -3836,55 +3836,15 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
             ],
             "cmd" => vec!["cmd".to_string(), "-c".to_string(), resolved_run.clone()],
             other => {
-                let (host_dir, guest_dir) = match &mount_ctx.github_mount {
-                    Some((host, guest)) => (host.clone(), guest.clone()),
-                    None => (ctx.working_dir.to_path_buf(), ctx.working_dir.to_path_buf()),
-                };
-
-                let name = format!("wrkflw-{}", uuid::Uuid::new_v4());
-                let guest_script = guest_dir.join(&name);
-
-                let mut argv = match custom_shell_argv(other, &guest_script.to_string_lossy()) {
-                    Ok(argv) => argv,
+                match prepare_custom_shell(other, &resolved_run, &mount_ctx, ctx.working_dir) {
+                    Ok((argv, script)) => {
+                        custom_shell_script = Some(script);
+                        argv
+                    }
                     Err(msg) => {
                         return Ok(StepResult::new(step_name, StepStatus::Failure, msg));
                     }
-                };
-
-                // Resolve the shell command to an absolute path, matching the
-                // runner's `WhichUtil.Which(..., require: true, ...)` — this also
-                // makes emulation's absolute-argv direct-exec rule fire universally.
-                // Only for host-side runtimes: under docker/podman the shell has
-                // to exist in the container image, so the container resolves it
-                // through its own PATH and a host lookup would be meaningless.
-                let is_container_runtime = step_env
-                    .get("WRKFLW_RUNTIME_MODE")
-                    .map(|m| m == "docker" || m == "podman")
-                    .unwrap_or(false);
-                if !is_container_runtime {
-                    match which::which(&argv[0]) {
-                        Ok(resolved) => argv[0] = resolved.to_string_lossy().into_owned(),
-                        Err(_) => {
-                            return Ok(StepResult::new(
-                                step_name,
-                                StepStatus::Failure,
-                                format!("Custom shell '{}' could not be found", argv[0]),
-                            ));
-                        }
-                    }
                 }
-
-                let host_script = host_dir.join(&name);
-                if let Err(e) = fs::write(&host_script, &resolved_run) {
-                    return Ok(StepResult::new(
-                        step_name,
-                        StepStatus::Failure,
-                        format!("Failed to write custom shell script: {}", e),
-                    ));
-                }
-
-                custom_shell_host_script = Some(host_script);
-                argv
             }
         };
         let cmd_refs: Vec<&str> = cmd_parts.iter().map(String::as_str).collect();
@@ -3908,9 +3868,7 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
             )
             .await;
 
-        if let Some(host_script) = &custom_shell_host_script {
-            let _ = fs::remove_file(host_script);
-        }
+        drop(custom_shell_script);
 
         match run_result {
             Ok(container_output) => {
@@ -4225,6 +4183,9 @@ fn get_effective_runner_image(job: &Job) -> String {
 struct StepContainerContext {
     owned_volume_paths: Vec<VolumePathPair>,
     github_mount: Option<VolumePathPair>,
+    /// Steps run inside a Docker/Podman container, so host paths are not
+    /// visible to them and must be mounted and remapped.
+    is_container_runtime: bool,
 }
 
 impl StepContainerContext {
@@ -4256,15 +4217,26 @@ fn prepare_step_container_context(
     job_env: &HashMap<String, String>,
     container_config: Option<&JobContainer>,
 ) -> StepContainerContext {
+    let is_container_runtime = uses_container_runtime(step_env);
     let (owned_volume_paths, github_mount) =
         prepare_container_mounts(step_env, job_env, container_config);
     StepContainerContext {
         owned_volume_paths,
         github_mount,
+        is_container_runtime,
     }
 }
 
 type VolumePathPair = (PathBuf, PathBuf);
+
+/// True when steps execute inside a Docker/Podman container rather than on
+/// the host. `Auto` is resolved to a concrete runtime before this is seeded.
+fn uses_container_runtime(step_env: &HashMap<String, String>) -> bool {
+    step_env
+        .get("WRKFLW_RUNTIME_MODE")
+        .map(|m| m == "docker" || m == "podman")
+        .unwrap_or(false)
+}
 
 /// Prepare container volume mounts and remap GitHub environment file paths for container runtimes.
 ///
@@ -4277,10 +4249,7 @@ fn prepare_container_mounts(
     container_config: Option<&JobContainer>,
 ) -> (Vec<VolumePathPair>, Option<VolumePathPair>) {
     let container_github_dir = Path::new("/github/workflow");
-    let is_container_runtime = step_env
-        .get("WRKFLW_RUNTIME_MODE")
-        .map(|m| m == "docker" || m == "podman")
-        .unwrap_or(false);
+    let is_container_runtime = uses_container_runtime(step_env);
 
     // Mount GitHub environment files directory and remap paths
     let github_mount = if let Some(github_env_path) = job_env.get("GITHUB_ENV") {
@@ -5098,10 +5067,88 @@ fn propagate_composite_outputs(
     }
 }
 
-/// Tokenize a custom `shell:` specification and substitute `{0}` with the path
-/// of the generated script file. GitHub requires a custom shell to be a format
-/// string containing `{0}`; anything else is rejected, matching the runner.
-fn custom_shell_argv(shell: &str, script_path: &str) -> Result<Vec<String>, String> {
+/// A custom-shell script written to the host for a single `run:` step.
+/// The file is removed when this value is dropped, so every exit path of the
+/// step cleans it up.
+struct CustomShellScript {
+    host_path: PathBuf,
+}
+
+impl Drop for CustomShellScript {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.host_path);
+    }
+}
+
+/// Write `script` to a file the step can reach and build the argv for a
+/// custom (non-built-in) `shell:` specification.
+///
+/// Under docker/podman the script goes into the mounted GitHub workflow
+/// directory and `{0}` becomes its container-side path. On host-side runtimes
+/// the host path is used directly and the shell command is resolved with
+/// `which`, matching the runner's `WhichUtil.Which(..., require: true)`.
+///
+/// Returns the argv to run and a guard that removes the script when dropped.
+fn prepare_custom_shell(
+    shell: &str,
+    script: &str,
+    mount_ctx: &StepContainerContext,
+    working_dir: &Path,
+) -> Result<(Vec<String>, CustomShellScript), String> {
+    // Validate the spec first so an invalid `shell:` is reported as such,
+    // whatever the state of the mounts.
+    let tokens = parse_custom_shell(shell)?;
+    let name = format!("wrkflw-{}", uuid::Uuid::new_v4());
+
+    let (host_dir, script_path) = if mount_ctx.is_container_runtime {
+        // GitHub workflows always seed GITHUB_ENV, so this only fires for a
+        // caller that skips `create_github_context` (e.g. GitLab pipelines,
+        // which today never produce a custom `shell:`).
+        let (host, guest) = mount_ctx.github_mount.as_ref().ok_or_else(|| {
+            format!(
+                "Custom shell '{}' needs the GitHub workflow directory mounted into the container, but GITHUB_ENV is not set",
+                shell
+            )
+        })?;
+        // The guest path lives inside a Linux container, so build it as a
+        // POSIX string: `Path::join` would insert `\` on a Windows host.
+        let guest = guest.to_string_lossy();
+        let guest_script = format!("{}/{}", guest.trim_end_matches('/'), name);
+        (host.clone(), guest_script)
+    } else {
+        let dir = mount_ctx
+            .github_mount
+            .as_ref()
+            .map(|(host, _)| host.clone())
+            .unwrap_or_else(|| working_dir.to_path_buf());
+        let host_script = dir.join(&name).to_string_lossy().into_owned();
+        (dir, host_script)
+    };
+
+    let mut argv = substitute_script_path(tokens, &script_path);
+
+    // Under docker/podman the shell must exist in the image and the container
+    // resolves it through its own PATH, so a host lookup would be meaningless.
+    // On the host, an absolute argv[0] also makes emulation direct-exec it.
+    if !mount_ctx.is_container_runtime {
+        let resolved = which::which(&argv[0])
+            .map_err(|_| format!("Custom shell '{}' could not be found", argv[0]))?;
+        argv[0] = resolved.to_string_lossy().into_owned();
+    }
+
+    let host_path = host_dir.join(&name);
+    fs::write(&host_path, script)
+        .map_err(|e| format!("Failed to write custom shell script: {}", e))?;
+
+    wrkflw_logging::info(&format!("  Custom shell: {}", argv.join(" ")));
+
+    Ok((argv, CustomShellScript { host_path }))
+}
+
+/// Tokenize a custom `shell:` specification. GitHub requires a custom shell to
+/// be a format string containing `{0}`; anything else is rejected, matching
+/// the runner.
+fn parse_custom_shell(shell: &str) -> Result<Vec<String>, String> {
     let invalid = || {
         format!(
             "Invalid shell option '{}'. Shell must be a valid built-in (bash, sh, python, pwsh, powershell, cmd) or a format string containing '{{0}}'.",
@@ -5115,10 +5162,15 @@ fn custom_shell_argv(shell: &str, script_path: &str) -> Result<Vec<String>, Stri
         return Err(invalid());
     }
 
-    Ok(tokens
+    Ok(tokens)
+}
+
+/// Substitute every `{0}` in a parsed custom shell with the script path.
+fn substitute_script_path(tokens: Vec<String>, script_path: &str) -> Vec<String> {
+    tokens
         .into_iter()
         .map(|t| t.replace("{0}", script_path))
-        .collect())
+        .collect()
 }
 
 /// Generate a heredoc delimiter that does not appear as a standalone line in `value`.
@@ -7492,6 +7544,10 @@ runs:
 
     // --- custom_shell_argv tests ---
 
+    fn custom_shell_argv(shell: &str, script_path: &str) -> Result<Vec<String>, String> {
+        parse_custom_shell(shell).map(|tokens| substitute_script_path(tokens, script_path))
+    }
+
     #[test]
     fn custom_shell_argv_substitutes_script_path() {
         let argv = custom_shell_argv(
@@ -7558,6 +7614,115 @@ runs:
     fn custom_shell_argv_substitutes_placeholder_in_middle() {
         let argv = custom_shell_argv("wrapper {0} --after", "/tmp/script").unwrap();
         assert_eq!(argv, vec!["wrapper", "/tmp/script", "--after"]);
+    }
+
+    // --- prepare_custom_shell tests ---
+
+    fn container_mount_ctx(github_mount: Option<VolumePathPair>) -> StepContainerContext {
+        StepContainerContext {
+            owned_volume_paths: Vec::new(),
+            github_mount,
+            is_container_runtime: true,
+        }
+    }
+
+    fn host_mount_ctx(github_mount: Option<VolumePathPair>) -> StepContainerContext {
+        StepContainerContext {
+            is_container_runtime: false,
+            ..container_mount_ctx(github_mount)
+        }
+    }
+
+    /// The `{0}` path is handed to a Linux container, so it must be a POSIX
+    /// path on every host OS, including Windows where `Path::join` uses `\`.
+    #[test]
+    fn prepare_custom_shell_uses_posix_guest_path_under_container_runtime() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mount_ctx = container_mount_ctx(Some((
+            tmp.path().to_path_buf(),
+            PathBuf::from("/github/workflow"),
+        )));
+
+        let (argv, script) =
+            prepare_custom_shell("sh -eu {0}", "echo hi", &mount_ctx, tmp.path()).unwrap();
+
+        let guest = argv.last().unwrap();
+        assert!(guest.starts_with("/github/workflow/wrkflw-"), "{guest}");
+        assert!(!guest.contains('\\'), "{guest}");
+        // No host resolution under a container runtime.
+        assert_eq!(argv[0], "sh");
+
+        let name = guest.rsplit('/').next().unwrap();
+        let host_path = tmp.path().join(name);
+        assert_eq!(fs::read_to_string(&host_path).unwrap(), "echo hi");
+
+        drop(script);
+        assert!(!host_path.exists(), "script must be removed on drop");
+    }
+
+    #[test]
+    fn prepare_custom_shell_fails_without_github_mount_under_container_runtime() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mount_ctx = container_mount_ctx(None);
+
+        let err = prepare_custom_shell("sh -eu {0}", "echo hi", &mount_ctx, tmp.path())
+            .err()
+            .expect("container runtime without a GitHub mount must fail");
+        assert!(err.contains("GITHUB_ENV"), "{err}");
+        // Nothing may be written to a host path the container cannot see.
+        assert_eq!(fs::read_dir(tmp.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn prepare_custom_shell_rejects_missing_placeholder_without_writing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mount_ctx = container_mount_ctx(Some((
+            tmp.path().to_path_buf(),
+            PathBuf::from("/github/workflow"),
+        )));
+
+        assert!(prepare_custom_shell("zsh", "echo hi", &mount_ctx, tmp.path()).is_err());
+        assert_eq!(fs::read_dir(tmp.path()).unwrap().count(), 0);
+    }
+
+    /// An invalid `shell:` must be reported as such, not masked by the
+    /// missing-mount error that would otherwise fire first.
+    #[test]
+    fn prepare_custom_shell_reports_invalid_spec_before_missing_mount() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mount_ctx = container_mount_ctx(None);
+
+        let err = prepare_custom_shell("zsh", "echo hi", &mount_ctx, tmp.path())
+            .err()
+            .expect("a spec without {0} must fail");
+        assert!(err.starts_with("Invalid shell option 'zsh'"), "{err}");
+    }
+
+    /// Host-side runtimes (emulation) with a GitHub mount: the script goes in
+    /// the mount's host dir, never `working_dir`, `{0}` is that host path,
+    /// and the shell is resolved to an absolute path.
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn prepare_custom_shell_writes_to_github_mount_on_host_runtime() {
+        let github_dir = tempfile::tempdir().unwrap();
+        let working_dir = tempfile::tempdir().unwrap();
+        let mount_ctx = host_mount_ctx(Some((
+            github_dir.path().to_path_buf(),
+            github_dir.path().to_path_buf(),
+        )));
+
+        let (argv, script) =
+            prepare_custom_shell("sh -eu {0}", "echo hi", &mount_ctx, working_dir.path()).unwrap();
+
+        assert_eq!(argv[0], which::which("sh").unwrap().to_string_lossy());
+        let host_path = PathBuf::from(argv.last().unwrap());
+        assert!(host_path.is_absolute(), "{host_path:?}");
+        assert_eq!(host_path.parent(), Some(github_dir.path()));
+        assert_eq!(fs::read_to_string(&host_path).unwrap(), "echo hi");
+        assert_eq!(fs::read_dir(working_dir.path()).unwrap().count(), 0);
+
+        drop(script);
+        assert!(!host_path.exists(), "script must be removed on drop");
     }
 
     // --- Custom shell integration tests ---
@@ -7652,7 +7817,8 @@ runs:
         let runtime = MockContainerRuntime::default();
         let workflow = minimal_workflow();
         let job_env = HashMap::new();
-        let working_dir = std::env::current_dir().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let working_dir = tmp.path().to_path_buf();
 
         let mut step = make_run_step("echo hello");
         step.shell = Some("env {0}".to_string());

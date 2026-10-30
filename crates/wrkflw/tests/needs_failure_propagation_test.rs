@@ -513,3 +513,68 @@ jobs:
 
     assert_eq!(status_of(&result, "cleanup"), "success");
 }
+
+/// `needs.<id>.outputs` is populated when a job-level `if:` is evaluated.
+#[tokio::test]
+async fn needs_outputs_are_visible_to_job_if() {
+    let result = run(r#"
+name: CI
+on: push
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      go: ${{ steps.decide.outputs.go }}
+    steps:
+      - id: decide
+        run: echo "go=yes" >> "$GITHUB_OUTPUT"
+  deploy:
+    runs-on: ubuntu-latest
+    needs: [plan]
+    if: needs.plan.outputs.go == 'yes'
+    steps:
+      - run: echo deploy
+  hold:
+    runs-on: ubuntu-latest
+    needs: [plan]
+    if: needs.plan.outputs.go == 'no'
+    steps:
+      - run: echo "should not run"
+"#)
+    .await;
+
+    assert_eq!(status_of(&result, "plan"), "success");
+    assert_eq!(status_of(&result, "deploy"), "success");
+    assert_eq!(status_of(&result, "hold"), "skipped");
+}
+
+/// A need skipped by the gate (not by its own `if:`) reports `skipped` to its
+/// dependents' `needs.<id>.result`.
+#[tokio::test]
+async fn gate_skipped_need_reports_skipped_result() {
+    let result = run(r#"
+name: CI
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    if: false
+    steps:
+      - run: echo hi
+  test:
+    runs-on: ubuntu-latest
+    needs: [build]
+    steps:
+      - run: echo hi
+  summary:
+    runs-on: ubuntu-latest
+    needs: [test]
+    if: always() && needs.test.result == 'skipped'
+    steps:
+      - run: echo summary
+"#)
+    .await;
+
+    assert_eq!(status_of(&result, "test"), "skipped");
+    assert_eq!(status_of(&result, "summary"), "success");
+}

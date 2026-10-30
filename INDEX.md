@@ -1,7 +1,7 @@
 # Codebase Index: wrkflw
 
-> Generated: 2026-09-08 17:28:51 UTC | Files: 202 | Lines: 72893
-> Languages: JSON (4), Markdown (24), Rust (113), Shell (5), TOML (18), YAML (38)
+> Generated: 2026-10-30 09:32:28 UTC | Files: 205 | Lines: 76868
+> Languages: JSON (4), Markdown (24), Rust (116), Shell (5), TOML (18), YAML (38)
 
 ## Directory Structure
 
@@ -72,6 +72,7 @@ wrkflw/
         github-workflow.json
         gitlab-ci.json
         gitlab.rs
+        gitlab_config.rs
         lib.rs
         schema.rs
         workflow.rs
@@ -200,6 +201,8 @@ wrkflw/
         run_workflow_cmd.rs
         watch_cmd.rs
       tests/
+        dynamic_matrix_test.rs
+        needs_failure_propagation_test.rs
         target_job_test.rs
   examples/
     secrets-demo/
@@ -313,11 +316,12 @@ wrkflw/
 - `# Ignore extra directories on top of the built-in list`
 - `# Open TUI with default directory`
 - `# Open with specific runtime`
+- `# Force a color theme`
 - `# GitHub (requires GITHUB_TOKEN env var)`
 - `# GitLab (requires GITLAB_TOKEN env var)`
 - `# Environment variables (simplest)`
 - `# File-based secrets (JSON, YAML, or .env format)`
-- `# Configure in ~/.wrkflw/secrets.yml`
+- `# On Linux, put them in ~/.config/wrkflw/secrets/ (read by the `file` provider)`
 
 **RELEASE_POST.md**
 - `# wrkflw v0.8.0 — run GitHub Actions locally, now with a real `${{ ... }}` evaluator`
@@ -407,6 +411,8 @@ wrkflw/
 - `pub struct ExpressionContext<'a>`
 - `pub fn evaluate(expr: &str, ctx: &ExpressionContext) -> Result<ExprValue, String>`
 - `pub fn evaluate_as_bool(expr: &str, ctx: &ExpressionContext) -> Result<bool, String>`
+- `pub fn strip_expression_wrapper(expr: &str) -> &str`
+- `pub fn calls_status_function(expr: &str) -> bool`
 
 **crates/executor/src/github_env_files.rs**
 - `pub struct StepEnvironmentUpdates`
@@ -533,6 +539,9 @@ wrkflw/
 - `## wrkflw-matrix`
 
 **crates/matrix/src/lib.rs**
+- `pub enum MatrixEntries`
+- `pub fn is_expression(value: &str) -> bool`
+- `pub fn check_strategy_expression(expr: &str) -> Result<(), String>`
 - `pub struct MatrixConfig`
 - `pub struct MatrixCombination`
 - `pub enum MatrixError`
@@ -583,6 +592,9 @@ wrkflw/
 - `pub fn parse_pipeline(pipeline_path: &Path) -> Result<Pipeline, GitlabParserError>`
 - `pub fn validate_pipeline_structure(pipeline: &Pipeline) -> ValidationResult`
 - `pub fn convert_to_workflow_format(pipeline: &Pipeline) -> workflow::WorkflowDefinition`
+
+**crates/parser/src/gitlab_config.rs**
+- `pub fn load_pipeline(path: &Path) -> Result<Value, String>`
 
 **crates/parser/src/lib.rs**
 - `pub mod gitlab`
@@ -802,7 +814,7 @@ wrkflw/
 - `# })?;`
 
 **crates/ui/src/app/mod.rs**
-- `pub async fn run_wrkflw_tui( path: Option<&PathBuf>, runtime_type: RuntimeType, verbose: bool, preserve_containers_on_failure: bool, show_action_messages: bool, ) -> io::Result<()>`
+- `pub async fn run_wrkflw_tui( path: Option<&PathBuf>, runtime_type: RuntimeType, verbose: bool, preserve_containers_on_failure: bool, show_action_messages: bool, theme: Option<ThemePreference>, ) -> io::Result<()>`
 
 **crates/ui/src/app/state.rs**
 - `pub struct App`
@@ -905,8 +917,13 @@ wrkflw/
 **crates/ui/src/theme.rs**
 - `pub fn set_accent_override(color: Option<Color>)`
 - `pub fn current_accent() -> Color`
+- `pub enum ThemeMode`
+- `pub enum ThemePreference`
+- `pub fn mode() -> ThemeMode`
+- `pub fn install(flag: Option<ThemePreference>)`
 - `pub struct Colors`
-- `pub const COLORS: Colors = Colors`
+- `pub struct ActiveColors`
+- `pub static COLORS: ActiveColors = ActiveColors`
 - `pub fn title_style() -> Style`
 - `pub fn selected_style() -> Style`
 - `pub fn header_style() -> Style`
@@ -1081,8 +1098,8 @@ wrkflw/
 **examples/secrets-demo/README.md**
 - `# Secrets Management Demo`
 - `# .github/workflows/secrets-demo.yml`
-- `# ~/.wrkflw/secrets.yml`
-- `# ~/.wrkflw/secrets.yml`
+- `# ~/.config/wrkflw/secrets.yml`
+- `# ~/.config/wrkflw/secrets.yml`
 - `# Original: "token": "ghp_1234567890abcdef"`
 - `# Masked:   "token": "ghp_***"`
 
@@ -1376,7 +1393,7 @@ wrkflw/
 
 ## BREAKING_CHANGES.md
 
-**Language:** Markdown | **Size:** 6.6 KB | **Lines:** 166
+**Language:** Markdown | **Size:** 7.6 KB | **Lines:** 186
 
 **Declarations:**
 
@@ -1392,7 +1409,7 @@ wrkflw/
 
 ## Cargo.toml
 
-**Language:** TOML | **Size:** 2.4 KB | **Lines:** 78
+**Language:** TOML | **Size:** 2.4 KB | **Lines:** 79
 
 **Declarations:**
 
@@ -1408,7 +1425,7 @@ wrkflw/
 
 ## README.md
 
-**Language:** Markdown | **Size:** 10.6 KB | **Lines:** 288
+**Language:** Markdown | **Size:** 11.0 KB | **Lines:** 293
 
 **Declarations:**
 
@@ -1474,7 +1491,7 @@ wrkflw/
 
 ## crates/executor/Cargo.toml
 
-**Language:** TOML | **Size:** 1.2 KB | **Lines:** 49
+**Language:** TOML | **Size:** 1.2 KB | **Lines:** 50
 
 **Imports:**
 - `ignore`
@@ -1568,7 +1585,7 @@ wrkflw/
 
 ## crates/executor/src/cache.rs
 
-**Language:** Rust | **Size:** 24.6 KB | **Lines:** 668
+**Language:** Rust | **Size:** 24.6 KB | **Lines:** 670
 
 **Imports:**
 - `sha2::{Digest, Sha256}`
@@ -1725,7 +1742,7 @@ wrkflw/
 
 ## crates/executor/src/engine.rs
 
-**Language:** Rust | **Size:** 341.9 KB | **Lines:** 9436
+**Language:** Rust | **Size:** 383.7 KB | **Lines:** 10566
 
 **Imports:**
 - `bollard::Docker`
@@ -1746,6 +1763,8 @@ wrkflw/
 
 `async fn execute_github_workflow( workflow_path: &Path, mut config: ExecutionConfig, ) -> Result<ExecutionResult, ExecutionError>`
 
+`fn record_job_results( job_results: &[JobResult], all_job_outputs: &mut HashMap<String, HashMap<String, String>>, all_job_results: &mut HashMap<String, String>, )`
+
 `async fn execute_gitlab_pipeline( pipeline_path: &Path, mut config: ExecutionConfig, ) -> Result<ExecutionResult, ExecutionError>`
 
 `fn create_gitlab_context(pipeline: &Pipeline, workspace_dir: &Path) -> HashMap<String, String>`
@@ -1753,6 +1772,16 @@ wrkflw/
 `fn resolve_gitlab_dependencies( pipeline: &Pipeline, workflow: &WorkflowDefinition, ) -> Result<Vec<Vec<String>>, ExecutionError>`
 
 `fn initialize_runtime( runtime_type: RuntimeType, preserve_containers_on_failure: bool, ) -> Result<Box<dyn ContainerRuntime>, ExecutionError>`
+
+**`impl JobResult`**
+  `fn skipped( name: impl Into<String>, canonical_name: impl Into<String>, logs: impl Into<String>, ) -> Self`
+
+  `fn failed_before_steps( name: impl Into<String>, step_name: impl Into<String>, reason: impl Into<String>, ) -> Self`
+
+
+**`impl JobStatus`**
+  `fn aggregate_rank(&self) -> u8`
+
 
 **`impl std::fmt::Display for JobStatus`**
   `fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result`
@@ -1893,7 +1922,7 @@ wrkflw/
 `fn get_effective_runner_image(job: &Job) -> String`
 
 `struct StepContainerContext`
-> Fields: `owned_volume_paths: Vec<VolumePathPair>`, `github_mount: Option<VolumePathPair>`
+> Fields: `owned_volume_paths: Vec<VolumePathPair>`, `github_mount: Option<VolumePathPair>`, `is_container_runtime: bool`
 
 **`impl StepContainerContext`**
   `fn build_volumes<'a>( &'a self, working_dir: &'a Path, container_workspace: &'a Path, ) -> Vec<(&'a Path, &'a Path)>`
@@ -1902,6 +1931,8 @@ wrkflw/
 `fn prepare_step_container_context( step_env: &mut HashMap<String, String>, job_env: &HashMap<String, String>, container_config: Option<&JobContainer>, ) -> StepContainerContext`
 
 `type VolumePathPair = (PathBuf, PathBuf)`
+
+`fn uses_container_runtime(step_env: &HashMap<String, String>) -> bool`
 
 `fn prepare_container_mounts( step_env: &mut HashMap<String, String>, job_env: &HashMap<String, String>, container_config: Option<&JobContainer>, ) -> (Vec<VolumePathPair>, Option<VolumePathPair>)`
 
@@ -1921,11 +1952,33 @@ wrkflw/
 
 `fn propagate_composite_outputs( action_def: &serde_yaml::Value, composite_step_outputs: &HashMap<String, HashMap<String, String>>, action_env: &HashMap<String, String>, action_user_env: &HashMap<String, String>, caller_job_env: &HashMap<String, String>, working_dir: &Path, job_status: &str, )`
 
+`struct CustomShellScript`
+> Fields: `host_path: PathBuf`
+
+**`impl Drop for CustomShellScript`**
+  `fn drop(&mut self)`
+
+
+`fn prepare_custom_shell( shell: &str, script: &str, mount_ctx: &StepContainerContext, working_dir: &Path, ) -> Result<(Vec<String>, CustomShellScript), String>`
+
+`fn parse_custom_shell(shell: &str) -> Result<Vec<String>, String>`
+
+`fn substitute_script_path(tokens: Vec<String>, script_path: &str) -> Vec<String>`
+
 `fn generate_heredoc_delimiter(value: &str) -> String`
 
 `fn convert_yaml_to_step(step_yaml: &serde_yaml::Value) -> Result<workflow::Step, String>`
 
-`fn evaluate_job_condition( condition: &str, env_context: &HashMap<String, String>, user_env: &HashMap<String, String>, _workflow: &WorkflowDefinition, ) -> bool`
+`struct NeedsState<'a>`
+> Fields: `status: &'static str`, `outputs: &'a HashMap<String, HashMap<String, String>>`, `results: &'a HashMap<String, String>`
+
+`fn upstream_status( job_name: &str, job: &Job, jobs: &HashMap<String, Job>, all_job_results: &HashMap<String, String>, ) -> &'static str`
+
+`fn needs_skip_reason(job: &Job, needs_results: &HashMap<String, String>) -> String`
+
+`fn evaluate_job_condition( condition: &str, env_context: &HashMap<String, String>, user_env: &HashMap<String, String>, needs: &NeedsState<'_>, ) -> bool`
+
+`fn resolve_matrix_expressions( matrix: &wrkflw_matrix::MatrixConfig, env_context: &HashMap<String, String>, user_env: &HashMap<String, String>, needs_context: &HashMap<String, HashMap<String, String>>, needs_results: &HashMap<String, String>, ) -> Result<wrkflw_matrix::MatrixConfig, wrkflw_matrix::MatrixError>`
 
 `fn evaluate_condition_with_context( condition: &str, ctx: &crate::expression::ExpressionContext<'_>, ) -> bool`
 
@@ -1989,7 +2042,7 @@ wrkflw/
 
 ## crates/executor/src/expression.rs
 
-**Language:** Rust | **Size:** 109.3 KB | **Lines:** 2711
+**Language:** Rust | **Size:** 112.5 KB | **Lines:** 2791
 
 **Imports:**
 - `serde_yaml::Value`
@@ -2338,7 +2391,7 @@ wrkflw/
 
 ## crates/matrix/Cargo.toml
 
-**Language:** TOML | **Size:** 514 B | **Lines:** 21
+**Language:** TOML | **Size:** 542 B | **Lines:** 22
 
 **Declarations:**
 
@@ -2354,19 +2407,39 @@ wrkflw/
 
 ## crates/matrix/src/lib.rs
 
-**Language:** Rust | **Size:** 13.6 KB | **Lines:** 422
+**Language:** Rust | **Size:** 26.1 KB | **Lines:** 783
 
 **Imports:**
 - `indexmap::IndexMap`
-- `serde::{Deserialize, Serialize}`
+- `serde::{de, Deserialize, Deserializer, Serialize}`
 - `serde_yaml::Value`
 - `std::collections::HashMap`
 - `thiserror::Error`
 
 **Declarations:**
 
+**`impl<'de> Deserialize<'de> for MatrixEntries`**
+  `fn deserialize<D>(deserializer: D) -> Result<Self, D::Error> where D: Deserializer<'de>,`
+
+
+`fn expression_body(value: &str) -> Option<&str>`
+
+**`impl Default for MatrixEntries`**
+  `fn default() -> Self`
+
+
+**`impl MatrixEntries`**
+  `fn resolve<F>(&self, section: &str, evaluate: &mut F) -> Result<Self, MatrixError> where F: FnMut(&str) -> Result<String, String>,`
+
+  `fn literal(&self, section: &str) -> Result<&[HashMap<String, Value>], MatrixError>`
+
+
 **`impl Default for MatrixConfig`**
   `fn default() -> Self`
+
+
+**`impl MatrixConfig`**
+  `pub fn resolve_expressions<F>(&self, mut evaluate: F) -> Result<Self, MatrixError> where F: FnMut(&str) -> Result<String, String>,`
 
 
 **`impl MatrixCombination`**
@@ -2375,7 +2448,7 @@ wrkflw/
   `pub fn from_include(values: HashMap<String, Value>) -> Self`
 
 
-`fn generate_base_combinations( matrix: &MatrixConfig, ) -> Result<Vec<MatrixCombination>, MatrixError>`
+`fn generate_base_combinations( matrix: &MatrixConfig, include: &[HashMap<String, Value>], ) -> Result<Vec<MatrixCombination>, MatrixError>`
 
 `fn generate_combinations( param_names: &[String], param_values: &[Vec<Value>], current_depth: usize, current_combination: &mut HashMap<String, Value>, ) -> Result<Vec<MatrixCombination>, MatrixError>`
 
@@ -2407,7 +2480,7 @@ wrkflw/
 
 ## crates/models/src/lib.rs
 
-**Language:** Rust | **Size:** 14.8 KB | **Lines:** 444
+**Language:** Rust | **Size:** 15.6 KB | **Lines:** 471
 
 **Declarations:**
 
@@ -2425,7 +2498,7 @@ wrkflw/
 
 ## crates/parser/Cargo.toml
 
-**Language:** TOML | **Size:** 607 B | **Lines:** 26
+**Language:** TOML | **Size:** 684 B | **Lines:** 29
 
 **Imports:**
 - `tempfile`
@@ -2452,7 +2525,7 @@ wrkflw/
 
 ## crates/parser/src/gitlab-ci.json
 
-**Language:** JSON | **Size:** 104.7 KB | **Lines:** 3012
+**Language:** JSON | **Size:** 104.7 KB | **Lines:** 3014
 
 **Declarations:**
 
@@ -2460,13 +2533,13 @@ wrkflw/
 
 ## crates/parser/src/gitlab.rs
 
-**Language:** Rust | **Size:** 8.4 KB | **Lines:** 268
+**Language:** Rust | **Size:** 10.1 KB | **Lines:** 329
 
 **Imports:**
+- `crate::gitlab_config`
 - `crate::schema::{SchemaType, SchemaValidator}`
 - `crate::workflow`
 - `std::collections::HashMap`
-- `std::fs`
 - `std::path::Path`
 - `thiserror::Error`
 - `wrkflw_models::gitlab::Pipeline`
@@ -2478,17 +2551,101 @@ wrkflw/
 
 ---
 
-## crates/parser/src/lib.rs
+## crates/parser/src/gitlab_config.rs
 
-**Language:** Rust | **Size:** 67 B | **Lines:** 5
+**Language:** Rust | **Size:** 31.3 KB | **Lines:** 968
+
+**Imports:**
+- `regex::Regex`
+- `serde::Deserialize`
+- `serde_yaml::{Mapping, Value}`
+- `std::collections::HashMap`
+- `std::fs`
+- `std::path::{Path, PathBuf}`
+- `std::sync::OnceLock`
 
 **Declarations:**
+
+`const MAX_INCLUDES: usize = 150`
+
+`const MAX_EXTENDS_DEPTH: usize = 11`
+
+`const MAX_REFERENCE_DEPTH: usize = 10`
+
+`const SCRIPT_KEYS: [&str`
+
+`const GLOBAL_KEYWORDS: [&str`
+
+`struct Loader`
+> Fields: `root: PathBuf`, `stack: Vec<PathBuf>`, `included: usize`
+
+**`impl Loader`**
+  `fn load_file(&mut self, path: &Path, inputs: Option<&Mapping>) -> Result<Value, String>`
+
+  `fn resolve_include(&self, entry: &Value) -> Result<Vec<(PathBuf, Option<Mapping>)>, String>`
+
+  `fn local_files(&self, pattern: &str) -> Result<Vec<PathBuf>, String>`
+
+
+`fn skip_include(kind: &str, target: &str) -> Vec<(PathBuf, Option<Mapping>)>`
+
+`fn include_entries(include: Value) -> Vec<Value>`
+
+`fn split_documents(content: &str) -> Result<(Option<Value>, Value), String>`
+
+`fn resolve_inputs( spec: &Value, provided: Option<&Mapping>, ) -> Result<HashMap<String, Value>, String>`
+
+`fn interpolation_pattern() -> &'static Regex`
+
+`fn interpolate(value: &mut Value, inputs: &HashMap<String, Value>) -> Result<(), String>`
+
+`fn interpolate_string( text: &str, inputs: &HashMap<String, Value>, ) -> Result<Option<Value>, String>`
+
+`fn evaluate_expression(expression: &str, inputs: &HashMap<String, Value>) -> Result<Value, String>`
+
+`fn apply_function(function: &str, text: String) -> Result<String, String>`
+
+`fn posix_escape(text: &str) -> String`
+
+`fn display_value(value: &Value) -> String`
+
+`fn key_name(key: &Value) -> String`
+
+`fn deep_merge(base: &mut Value, overlay: Value)`
+
+`fn is_job_key(name: &str) -> bool`
+
+`fn resolve_extends(config: &mut Value) -> Result<(), String>`
+
+`fn resolve_job( name: &str, map: &Mapping, resolved: &mut HashMap<String, Value>, chain: &mut Vec<String>, ) -> Result<Value, String>`
+
+`fn resolve_references(config: &mut Value) -> Result<(), String>`
+
+`fn resolve_references_in(value: &mut Value, root: &Value, depth: usize) -> Result<(), String>`
+
+`fn finalize(config: &mut Value)`
+
+`fn flatten_scripts(map: &mut Mapping)`
+
+`fn flatten_into(items: Vec<Value>, out: &mut Vec<Value>)`
+
+`mod tests`
+
+---
+
+## crates/parser/src/lib.rs
+
+**Language:** Rust | **Size:** 86 B | **Lines:** 6
+
+**Declarations:**
+
+`mod gitlab_config`
 
 ---
 
 ## crates/parser/src/schema.rs
 
-**Language:** Rust | **Size:** 3.8 KB | **Lines:** 111
+**Language:** Rust | **Size:** 4.3 KB | **Lines:** 125
 
 **Imports:**
 - `jsonschema::JSONSchema`
@@ -2508,6 +2665,8 @@ wrkflw/
   `pub fn validate_workflow(&self, workflow_path: &Path) -> Result<(), String>`
 
   `pub fn validate_with_specific_schema( &self, content: &str, schema_type: SchemaType, ) -> Result<(), String>`
+
+  `pub fn validate_json( &self, workflow_json: &Value, schema_type: SchemaType, ) -> Result<(), String>`
 
 
 ---
@@ -2608,7 +2767,7 @@ wrkflw/
 
 ## crates/runtime/src/emulation.rs
 
-**Language:** Rust | **Size:** 30.1 KB | **Lines:** 828
+**Language:** Rust | **Size:** 31.3 KB | **Lines:** 855
 
 **Imports:**
 - `crate::container::{
@@ -2836,18 +2995,23 @@ wrkflw/
 
 ## crates/secrets/src/config.rs
 
-**Language:** Rust | **Size:** 6.1 KB | **Lines:** 203
+**Language:** Rust | **Size:** 8.8 KB | **Lines:** 285
 
 **Imports:**
 - `crate::rate_limit::RateLimitConfig`
 - `serde::{Deserialize, Serialize}`
 - `std::collections::HashMap`
+- `std::path::PathBuf`
 
 **Declarations:**
 
 **`impl Default for SecretConfig`**
   `fn default() -> Self`
 
+
+`fn default_secrets_path() -> String`
+
+`fn resolve_secrets_path(config_dir: Option<PathBuf>, home_dir: Option<PathBuf>) -> String`
 
 **`impl SecretConfig`**
   `pub fn from_file(path: &str) -> crate::SecretResult<Self>`
@@ -2856,6 +3020,8 @@ wrkflw/
 
   `pub fn from_env() -> Self`
 
+
+`mod path_tests`
 
 ---
 
@@ -3569,11 +3735,12 @@ wrkflw/
 
 ## crates/ui/Cargo.toml
 
-**Language:** TOML | **Size:** 1.1 KB | **Lines:** 43
+**Language:** TOML | **Size:** 1.2 KB | **Lines:** 44
 
 **Imports:**
 - `crossterm`
 - `ratatui`
+- `terminal-colorsaurus`
 - `reqwest`
 
 **Declarations:**
@@ -3590,7 +3757,7 @@ wrkflw/
 
 ## crates/ui/src/app/mod.rs
 
-**Language:** Rust | **Size:** 30.8 KB | **Lines:** 682
+**Language:** Rust | **Size:** 31.4 KB | **Lines:** 695
 
 **Imports:**
 - `crate::handlers::workflow::start_next_workflow_execution`
@@ -3610,7 +3777,7 @@ wrkflw/
 - `std::path::PathBuf`
 - `std::sync::mpsc`
 - `std::time::{Duration, Instant}`
-- *... and 2 more imports*
+- *... and 3 more imports*
 
 **Declarations:**
 
@@ -3622,7 +3789,7 @@ wrkflw/
 
 ## crates/ui/src/app/state.rs
 
-**Language:** Rust | **Size:** 176.9 KB | **Lines:** 4388
+**Language:** Rust | **Size:** 177.6 KB | **Lines:** 4400
 
 **Imports:**
 - `crate::log_processor::{LogProcessingRequest, LogProcessor, ProcessedLogEntry}`
@@ -3630,6 +3797,7 @@ wrkflw/
     ExecutionResultMsg, JobExecution, LogFilterLevel, QueuedExecution, StatusSeverity,
     StepExecution, TriggerMatchStatus, Workflow, WorkflowExecution, WorkflowStatus,
 }`
+- `crate::theme::{self, ThemeMode}`
 - `chrono::Local`
 - `crossterm::event::KeyCode`
 - `ratatui::widgets::{ListState, TableState}`
@@ -3637,8 +3805,7 @@ wrkflw/
 - `std::sync::atomic::{AtomicBool, Ordering}`
 - `std::sync::mpsc`
 - `std::sync::Arc`
-- `std::time::{Duration, Instant}`
-- *... and 3 more imports*
+- *... and 4 more imports*
 
 **Declarations:**
 
@@ -3654,6 +3821,8 @@ wrkflw/
   `pub fn next(self) -> Self`
 
   `pub fn rgb(self) -> (u8, u8, u8)`
+
+  `pub fn rgb_for(self, mode: ThemeMode) -> (u8, u8, u8)`
 
 
 **`impl App`**
@@ -4149,7 +4318,7 @@ wrkflw/
 
 ## crates/ui/src/theme.rs
 
-**Language:** Rust | **Size:** 9.9 KB | **Lines:** 311
+**Language:** Rust | **Size:** 18.3 KB | **Lines:** 572
 
 **Imports:**
 - `ratatui::{
@@ -4158,15 +4327,44 @@ wrkflw/
     widgets::{Block, BorderType, Borders},
 }`
 - `std::cell::Cell`
+- `std::ops::Deref`
+- `std::str::FromStr`
+- `std::sync::atomic::{AtomicBool, Ordering}`
 - `pub use wrkflw_logging::symbols`
 - `crate::models::WorkflowStatus`
 - `wrkflw_executor::{JobStatus, StepStatus}`
 
 **Declarations:**
 
+**`impl ThemeMode`**
+  `fn colors(self) -> &'static Colors`
+
+
+**`impl FromStr for ThemePreference`**
+  `fn from_str(s: &str) -> Result<Self, Self::Err>`
+
+
+`const THEME_ENV: &str = "WRKFLW_THEME"`
+
+`static LIGHT_MODE: AtomicBool = AtomicBool::new(false)`
+
+`fn detect_mode() -> ThemeMode`
+
+`fn mode_from_colorfgbg(value: &str) -> Option<ThemeMode>`
+
+**`impl Deref for ActiveColors`**
+  `fn deref(&self) -> &Colors`
+
+
+`static DARK: Colors = Colors`
+
+`static LIGHT: Colors = Colors`
+
 **`impl BadgeKind`**
   `pub fn fg(self) -> Color`
 
+
+`mod tests`
 
 ---
 
@@ -4189,7 +4387,7 @@ wrkflw/
 
 ## crates/ui/src/views/dag_tab.rs
 
-**Language:** Rust | **Size:** 16.0 KB | **Lines:** 449
+**Language:** Rust | **Size:** 16.7 KB | **Lines:** 465
 
 **Imports:**
 - `crate::app::App`
@@ -4221,6 +4419,8 @@ wrkflw/
 `fn render_legend(f: &mut Frame<'_>, app: &App, area: Rect)`
 
 `fn truncate(s: &str, n: usize) -> String`
+
+`fn matrix_size_label(matrix: &wrkflw_matrix::MatrixConfig) -> Option<String>`
 
 ---
 
@@ -4274,13 +4474,13 @@ wrkflw/
 
 ## crates/ui/src/views/help_overlay.rs
 
-**Language:** Rust | **Size:** 10.4 KB | **Lines:** 286
+**Language:** Rust | **Size:** 10.4 KB | **Lines:** 290
 
 **Imports:**
 - `crate::theme::{self, COLORS}`
 - `ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Paragraph, Wrap},
     Frame,
@@ -4296,7 +4496,7 @@ wrkflw/
 
 ## crates/ui/src/views/job_detail.rs
 
-**Language:** Rust | **Size:** 20.3 KB | **Lines:** 591
+**Language:** Rust | **Size:** 20.4 KB | **Lines:** 593
 
 **Imports:**
 - `crate::app::App`
@@ -4522,7 +4722,7 @@ wrkflw/
 
 ## crates/ui/src/views/tweaks_overlay.rs
 
-**Language:** Rust | **Size:** 3.8 KB | **Lines:** 117
+**Language:** Rust | **Size:** 3.8 KB | **Lines:** 118
 
 **Imports:**
 - `crate::app::{Accent, App}`
@@ -4723,7 +4923,7 @@ wrkflw/
 
 ## crates/validators/src/matrix.rs
 
-**Language:** Rust | **Size:** 4.2 KB | **Lines:** 119
+**Language:** Rust | **Size:** 5.9 KB | **Lines:** 171
 
 **Imports:**
 - `serde_yaml::Value`
@@ -4736,6 +4936,8 @@ wrkflw/
 `fn validate_matrix_parameter(name: &str, value: &Value, result: &mut ValidationResult)`
 
 `fn get_value_type(value: &Value) -> &'static str`
+
+`mod tests`
 
 ---
 
@@ -5144,7 +5346,7 @@ wrkflw/
 
 ## crates/wrkflw/src/main.rs
 
-**Language:** Rust | **Size:** 36.0 KB | **Lines:** 972
+**Language:** Rust | **Size:** 36.4 KB | **Lines:** 980
 
 **Imports:**
 - `bollard::Docker`
@@ -5169,7 +5371,7 @@ wrkflw/
 
 
 `struct Wrkflw`
-> Fields: `command: Option<Commands>`, `verbose: bool`, `debug: bool`
+> Fields: `command: Option<Commands>`, `verbose: bool`, `debug: bool`, `theme: Option<wrkflw_ui::theme::ThemePreference>`
 
 `enum Commands`
 > Variants: `Validate`, `Run`, `Watch`, `Tui`, `Trigger`, `TriggerGitlab`, `List`
@@ -5259,6 +5461,102 @@ wrkflw/
 
 ---
 
+## crates/wrkflw/tests/dynamic_matrix_test.rs
+
+**Language:** Rust | **Size:** 6.5 KB | **Lines:** 239
+
+**Imports:**
+- `std::fs`
+- `tempfile::tempdir`
+- `wrkflw_lib::executor::engine::{
+    execute_workflow, ExecutionConfig, ExecutionResult, JobStatus, RuntimeType,
+}`
+
+**Declarations:**
+
+`fn emulation_cfg() -> ExecutionConfig`
+
+`async fn run(yaml: &str) -> Result<ExecutionResult, String>`
+
+`fn job_outcomes(result: &ExecutionResult, job: &str) -> Vec<(String, bool)>`
+
+`fn workflow(matrix: &str, output: &str) -> String`
+
+`async fn include_from_needs_output_merges_into_axes()`
+
+`async fn include_only_matrix_comes_from_needs_output()`
+
+`async fn exclude_from_needs_output_filters_axes()`
+
+`fn job_status(result: &ExecutionResult, job: &str) -> JobStatus`
+
+`fn failure_details(result: &ExecutionResult) -> &str`
+
+`async fn include_that_is_not_a_list_fails_the_job()`
+
+`async fn exclude_that_is_not_a_list_fails_the_job()`
+
+`async fn context_unavailable_in_strategy_fails_the_job()`
+
+`async fn github_context_is_available_to_strategy()`
+
+`async fn empty_include_only_matrix_fails_that_job_and_the_run_carries_on()`
+
+---
+
+## crates/wrkflw/tests/needs_failure_propagation_test.rs
+
+**Language:** Rust | **Size:** 13.3 KB | **Lines:** 580
+
+**Imports:**
+- `std::fs`
+- `tempfile::tempdir`
+- `wrkflw_lib::executor::engine::{
+    execute_workflow, ExecutionConfig, ExecutionResult, JobStatus, RuntimeType,
+}`
+
+**Declarations:**
+
+`fn write_file(path: &std::path::Path, content: &str)`
+
+`fn emulation_cfg() -> ExecutionConfig`
+
+`fn status_of<'a>(result: &'a ExecutionResult, job: &str) -> &'a str`
+
+`async fn dependent_job_is_skipped_when_need_fails()`
+
+`async fn skip_cascades_through_the_needs_chain()`
+
+`async fn explicit_if_condition_still_runs_after_a_failed_need()`
+
+`async fn unrelated_jobs_still_run_after_a_failure()`
+
+`async fn run(yaml: &str) -> ExecutionResult`
+
+`async fn status_functions_see_the_failed_need()`
+
+`async fn needs_result_is_visible_to_job_if()`
+
+`async fn plain_if_is_still_gated_on_needs()`
+
+`async fn need_skipped_by_its_own_if_skips_dependents()`
+
+`async fn any_failed_need_among_several_skips()`
+
+`async fn ancestor_failure_propagates_past_an_always_job()`
+
+`async fn reusable_workflow_jobs_skip_after_failed_need()`
+
+`async fn matrix_need_with_one_failed_combination_counts_as_failed()`
+
+`async fn fail_fast_matrix_need_counts_as_failed()`
+
+`async fn needs_outputs_are_visible_to_job_if()`
+
+`async fn gate_skipped_need_reports_skipped_result()`
+
+---
+
 ## crates/wrkflw/tests/target_job_test.rs
 
 **Language:** Rust | **Size:** 3.6 KB | **Lines:** 141
@@ -5282,7 +5580,7 @@ wrkflw/
 
 ## examples/secrets-demo/README.md
 
-**Language:** Markdown | **Size:** 2.5 KB | **Lines:** 123
+**Language:** Markdown | **Size:** 2.6 KB | **Lines:** 123
 
 **Declarations:**
 
@@ -5503,7 +5801,7 @@ wrkflw/
 - `indexmap::IndexMap`
 - `serde_yaml::Value`
 - `std::collections::HashMap`
-- `wrkflw::matrix::{self, MatrixCombination, MatrixConfig}`
+- `wrkflw::matrix::{self, MatrixCombination, MatrixConfig, MatrixEntries}`
 
 **Declarations:**
 

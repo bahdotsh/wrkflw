@@ -702,6 +702,29 @@ impl JobResult {
             outputs: HashMap::new(),
         }
     }
+
+    /// A job that failed before any of its steps ran. The reason is carried on a
+    /// failed step because failure summaries are built from failed steps.
+    fn failed_before_steps(
+        name: impl Into<String>,
+        step_name: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Self {
+        let name = name.into();
+        let reason = reason.into();
+        JobResult {
+            canonical_name: name.clone(),
+            name,
+            status: JobStatus::Failure,
+            steps: vec![StepResult::new(
+                step_name.into(),
+                StepStatus::Failure,
+                reason.clone(),
+            )],
+            logs: reason,
+            outputs: HashMap::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1935,19 +1958,26 @@ async fn execute_job_with_matrix(
     // Check if this is a matrix job
     if let Some(matrix_config) = job.matrix_config() {
         // `include`/`exclude` may be expressions over upstream job outputs, which
-        // are only available now, so resolve them before expanding.
-        let matrix_config = resolve_matrix_expressions(
+        // are only available now, so resolve them before expanding. As on GitHub,
+        // a matrix that can't be computed fails this job, and the run carries on.
+        let expansion = resolve_matrix_expressions(
             matrix_config,
             env_context,
             user_env,
             &needs_ctx,
             &needs_res,
         )
-        .map_err(|e| ExecutionError::Execution(format!("Failed to expand matrix: {}", e)))?;
-
-        // Expand the matrix into combinations
-        let combinations = wrkflw_matrix::expand_matrix(&matrix_config)
-            .map_err(|e| ExecutionError::Execution(format!("Failed to expand matrix: {}", e)))?;
+        .and_then(|resolved| wrkflw_matrix::expand_matrix(&resolved));
+        let combinations = match expansion {
+            Ok(combinations) => combinations,
+            Err(e) => {
+                return Ok(vec![JobResult::failed_before_steps(
+                    job_name,
+                    "Expand matrix",
+                    format!("Failed to expand matrix: {}", e),
+                )]);
+            }
+        };
 
         if combinations.is_empty() {
             wrkflw_logging::info(&format!(

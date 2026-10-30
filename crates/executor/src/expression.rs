@@ -972,6 +972,9 @@ fn call_builtin(
                 return Err("fromJSON() requires 1 argument".to_string());
             }
             let s = args[0].to_output_string();
+            // Arrays and objects stay as JSON text: `ExprValue` has no array
+            // variant, and `resolve_matrix_expressions` in engine.rs parses this
+            // text back into matrix entries.
             // Basic parsing
             match s.as_str() {
                 "null" => Ok(ExprValue::Null),
@@ -1840,6 +1843,33 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&s).expect("should be valid JSON");
         let obj = parsed.as_object().expect("should be a JSON object");
         assert!(obj.is_empty(), "should be empty with no env vars: {}", s);
+    }
+
+    #[test]
+    fn fromjson_of_an_array_keeps_its_json_text() {
+        // `resolve_matrix_expressions` relies on this to read matrix entries.
+        let env = HashMap::new();
+        let step_outputs = HashMap::new();
+        let step_statuses = HashMap::new();
+        let secrets = HashMap::new();
+        let needs = HashMap::new();
+        let needs_results = HashMap::new();
+        let ctx = ExpressionContext {
+            env_context: &env,
+            step_outputs: &step_outputs,
+            matrix_combination: &None,
+            step_statuses: &step_statuses,
+            job_status: "success",
+            secrets_context: &secrets,
+            needs_context: &needs,
+            needs_results: &needs_results,
+            user_env: &env,
+        };
+        let json = r#"[{"os":"ubuntu","node":14}]"#;
+
+        let result = evaluate(&format!("fromJSON('{}')", json), &ctx).unwrap();
+
+        assert_eq!(result.to_output_string(), json);
     }
 
     #[test]

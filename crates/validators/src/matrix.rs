@@ -55,7 +55,10 @@ pub fn validate_matrix(matrix: &Value, result: &mut ValidationResult) {
 
 fn validate_include_exclude(section: &Value, section_name: &str, result: &mut ValidationResult) {
     // An expression such as `${{ fromJSON(...) }}` is only known at run time
-    if section.as_str().is_some_and(is_expression) {
+    if let Some(expr) = section.as_str().filter(|s| wrkflw_matrix::is_expression(s)) {
+        if let Err(e) = wrkflw_matrix::check_strategy_expression(expr) {
+            result.add_issue(format!("{} {}", section_name, e));
+        }
         return;
     }
 
@@ -79,11 +82,6 @@ fn validate_include_exclude(section: &Value, section_name: &str, result: &mut Va
         // This is a safeguard, though we already checked if it's a sequence above
         result.add_issue(format!("Failed to process {} sequence", section_name));
     }
-}
-
-fn is_expression(value: &str) -> bool {
-    let trimmed = value.trim();
-    trimmed.starts_with("${{") && trimmed.ends_with("}}")
 }
 
 fn validate_matrix_parameter(name: &str, value: &Value, result: &mut ValidationResult) {
@@ -142,9 +140,17 @@ mod tests {
     #[test]
     fn accepts_expression_include_and_exclude() {
         let issues = issues_for(
-            "os: [ubuntu]\ninclude: ${{ fromJSON(needs.a.outputs.m) }}\nexclude: ${{ fromJSON(env.X) }}\n",
+            "os: [ubuntu]\ninclude: ${{ fromJSON(needs.a.outputs.m) }}\nexclude: ${{ fromJSON(inputs.x) }}\n",
         );
         assert!(issues.is_empty(), "{:?}", issues);
+    }
+
+    #[test]
+    fn rejects_contexts_unavailable_in_strategy() {
+        let issues = issues_for("os: [ubuntu]\nexclude: ${{ fromJSON(env.X) }}\n");
+        assert_eq!(issues.len(), 1, "{:?}", issues);
+        assert!(issues[0].starts_with("exclude "), "{:?}", issues);
+        assert!(issues[0].contains("uses env"), "{:?}", issues);
     }
 
     #[test]

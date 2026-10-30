@@ -1,7 +1,7 @@
 // matrix crate
 
 use indexmap::IndexMap;
-use serde::{Deserialize, Serialize};
+use serde::{de, Deserialize, Deserializer, Serialize};
 use serde_yaml::Value;
 use std::collections::HashMap;
 use thiserror::Error;
@@ -9,11 +9,106 @@ use thiserror::Error;
 /// The value of a matrix `include` or `exclude` key: either a literal list, or
 /// an expression such as `${{ fromJSON(needs.setup.outputs.matrix) }}` that can
 /// only be evaluated once the job is about to run.
-#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(untagged)]
 pub enum MatrixEntries {
     List(Vec<HashMap<String, Value>>),
     Expression(String),
+}
+
+impl<'de> Deserialize<'de> for MatrixEntries {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        match Value::deserialize(deserializer)? {
+            Value::String(expr) if is_expression(&expr) => Ok(MatrixEntries::Expression(expr)),
+            list @ Value::Sequence(_) => serde_yaml::from_value(list)
+                .map(MatrixEntries::List)
+                .map_err(de::Error::custom),
+            _ => Err(de::Error::custom(
+                "matrix include/exclude must be an array of objects or a ${{ }} expression",
+            )),
+        }
+    }
+}
+
+/// Whether `value` is a single `${{ ... }}` expression.
+pub fn is_expression(value: &str) -> bool {
+    expression_body(value).is_some()
+}
+
+fn expression_body(value: &str) -> Option<&str> {
+    let body = value.trim().strip_prefix("${{")?.strip_suffix("}}")?;
+    (!body.contains("${{")).then_some(body)
+}
+
+/// Check that an expression only uses what GitHub Actions allows under
+/// `jobs.<job_id>.strategy`: the `github`, `needs`, `vars` and `inputs` contexts,
+/// and no special functions. Returns an error naming whatever else it uses.
+pub fn check_strategy_expression(expr: &str) -> Result<(), String> {
+    const CONTEXTS: [&str; 4] = ["github", "needs", "vars", "inputs"];
+    const LITERALS: [&str; 3] = ["true", "false", "null"];
+    const SPECIAL_FUNCTIONS: [&str; 5] = ["success", "failure", "always", "cancelled", "hashfiles"];
+
+    let body = expression_body(expr).unwrap_or(expr);
+    let bytes = body.as_bytes();
+    let mut disallowed: Vec<&str> = Vec::new();
+    let mut previous = 0u8;
+    let mut i = 0;
+    while i < bytes.len() {
+        let byte = bytes[i];
+        if byte == b'\'' {
+            // A doubled quote reads as two adjacent strings, which is equivalent here
+            i += 1;
+            while i < bytes.len() && bytes[i] != b'\'' {
+                i += 1;
+            }
+            i += 1;
+            previous = byte;
+        } else if byte.is_ascii_digit() {
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'.') {
+                i += 1;
+            }
+            previous = byte;
+        } else if byte.is_ascii_alphabetic() || byte == b'_' {
+            let start = i;
+            while i < bytes.len()
+                && (bytes[i].is_ascii_alphanumeric() || matches!(bytes[i], b'_' | b'-'))
+            {
+                i += 1;
+            }
+            let word = &body[start..i];
+            let lower = word.to_ascii_lowercase();
+            let is_call = body[i..].trim_start().starts_with('(');
+            // Property names follow a dot, and only the root names a context
+            let allowed = previous == b'.'
+                || if is_call {
+                    !SPECIAL_FUNCTIONS.contains(&lower.as_str())
+                } else {
+                    CONTEXTS.contains(&lower.as_str()) || LITERALS.contains(&lower.as_str())
+                };
+            if !allowed && !disallowed.contains(&word) {
+                disallowed.push(word);
+            }
+            previous = byte;
+        } else {
+            if !byte.is_ascii_whitespace() {
+                previous = byte;
+            }
+            i += 1;
+        }
+    }
+
+    if disallowed.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "'{}' uses {}, not available in strategy (allowed contexts: github, needs, vars, inputs)",
+            expr,
+            disallowed.join(", ")
+        ))
+    }
 }
 
 impl Default for MatrixEntries {
@@ -32,8 +127,16 @@ impl MatrixEntries {
         let MatrixEntries::Expression(expr) = self else {
             return Ok(self.clone());
         };
+        check_strategy_expression(expr)
+            .map_err(|e| MatrixError::ExpressionError(format!("{} {}", section, e)))?;
         let json = evaluate(expr)
             .map_err(|e| MatrixError::ExpressionError(format!("{} '{}': {}", section, expr, e)))?;
+        if json.trim().is_empty() {
+            return Err(MatrixError::ExpressionError(format!(
+                "{} '{}' must evaluate to an array of objects, got an empty value",
+                section, expr
+            )));
+        }
         let entries = serde_json::from_str(&json).map_err(|e| {
             MatrixError::ExpressionError(format!(
                 "{} '{}' must evaluate to an array of objects, got '{}': {}",
@@ -531,7 +634,7 @@ mod tests {
     #[test]
     fn expand_rejects_unresolved_expressions() {
         let mut matrix = make_matrix(vec![("os", vec!["ubuntu"])]);
-        matrix.include = MatrixEntries::Expression("${{ x }}".to_string());
+        matrix.include = MatrixEntries::Expression("${{ needs.a.outputs.m }}".to_string());
 
         assert!(matches!(
             expand_matrix(&matrix),
@@ -541,8 +644,10 @@ mod tests {
 
     #[test]
     fn resolved_include_merges_numbers_with_yaml_axes() {
-        let matrix: MatrixConfig =
-            serde_yaml::from_str("os: [ubuntu]\nnode: [14, 16]\ninclude: ${{ x }}\n").unwrap();
+        let matrix: MatrixConfig = serde_yaml::from_str(
+            "os: [ubuntu]\nnode: [14, 16]\ninclude: ${{ needs.a.outputs.m }}\n",
+        )
+        .unwrap();
 
         let resolved = matrix
             .resolve_expressions(|_| Ok(r#"[{"node": 14, "npm": 6}]"#.to_string()))
@@ -562,7 +667,8 @@ mod tests {
     #[test]
     fn resolved_exclude_filters_combinations() {
         let matrix: MatrixConfig =
-            serde_yaml::from_str("os: [ubuntu, windows]\nexclude: ${{ x }}\n").unwrap();
+            serde_yaml::from_str("os: [ubuntu, windows]\nexclude: ${{ needs.a.outputs.m }}\n")
+                .unwrap();
 
         let resolved = matrix
             .resolve_expressions(|_| Ok(r#"[{"os": "windows"}]"#.to_string()))
@@ -576,7 +682,7 @@ mod tests {
     #[test]
     fn resolve_rejects_non_list_results() {
         let matrix: MatrixConfig =
-            serde_yaml::from_str("os: [ubuntu]\ninclude: ${{ x }}\n").unwrap();
+            serde_yaml::from_str("os: [ubuntu]\ninclude: ${{ needs.a.outputs.m }}\n").unwrap();
 
         for bad in ["", "not json", "5", r#"{"os": "ubuntu"}"#, "[1, 2]"] {
             let result = matrix.resolve_expressions(|_| Ok(bad.to_string()));
@@ -589,9 +695,84 @@ mod tests {
     }
 
     #[test]
+    fn empty_result_is_reported_as_empty() {
+        let matrix: MatrixConfig =
+            serde_yaml::from_str("os: [ubuntu]\ninclude: ${{ needs.a.outputs.m }}\n").unwrap();
+
+        let err = matrix
+            .resolve_expressions(|_| Ok("  ".to_string()))
+            .unwrap_err();
+
+        assert!(err.to_string().contains("got an empty value"), "{}", err);
+    }
+
+    #[test]
+    fn resolve_refuses_contexts_strategy_cannot_see() {
+        let matrix: MatrixConfig =
+            serde_yaml::from_str("os: [ubuntu]\ninclude: ${{ fromJSON(env.X) }}\n").unwrap();
+
+        let err = matrix
+            .resolve_expressions(|_| panic!("must not be evaluated"))
+            .unwrap_err();
+
+        assert!(err.to_string().contains("uses env"), "{}", err);
+    }
+
+    #[test]
+    fn strategy_expressions_allow_github_needs_vars_and_inputs() {
+        for expr in [
+            "${{ fromJSON(needs.a-b.outputs.m) }}",
+            "${{ fromJSON(inputs.list) }}",
+            "${{ fromJSON(vars.LIST) }}",
+            "${{ github.event_name == 'push' && fromJSON(needs.a.outputs.env) || null }}",
+            "${{ contains(github.ref, 'env.X') && 'it''s env' }}",
+            "${{ NEEDS.a.outputs.m }}",
+            "${{ needs.a.outputs['matrix'] == 1.5 }}",
+        ] {
+            assert_eq!(check_strategy_expression(expr), Ok(()), "{}", expr);
+        }
+    }
+
+    #[test]
+    fn strategy_expressions_reject_other_contexts_and_special_functions() {
+        for (expr, name) in [
+            ("${{ env.X }}", "env"),
+            ("${{ fromJSON(secrets.LIST) }}", "secrets"),
+            ("${{ matrix.os }}", "matrix"),
+            ("${{ steps.a.outputs.b }}", "steps"),
+            ("${{ runner.os }}", "runner"),
+            ("${{ success() && needs.a.outputs.m }}", "success"),
+            ("${{ hashFiles('x') }}", "hashFiles"),
+        ] {
+            let err = check_strategy_expression(expr).unwrap_err();
+            assert!(err.contains(&format!("uses {}", name)), "{}", err);
+        }
+    }
+
+    #[test]
+    fn non_expression_values_are_rejected_when_parsing() {
+        for bad in [
+            "not-an-expression",
+            "5",
+            "{ os: ubuntu }",
+            "'${{ a }} ${{ b }}'",
+        ] {
+            let err =
+                serde_yaml::from_str::<MatrixConfig>(&format!("os: [ubuntu]\ninclude: {}\n", bad))
+                    .unwrap_err();
+            assert!(
+                err.to_string().contains("array of objects"),
+                "{}: {}",
+                bad,
+                err
+            );
+        }
+    }
+
+    #[test]
     fn resolve_propagates_evaluation_errors() {
         let matrix: MatrixConfig =
-            serde_yaml::from_str("os: [ubuntu]\ninclude: ${{ x }}\n").unwrap();
+            serde_yaml::from_str("os: [ubuntu]\ninclude: ${{ needs.a.outputs.m }}\n").unwrap();
 
         let err = matrix
             .resolve_expressions(|_| Err("bad token".to_string()))

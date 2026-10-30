@@ -5390,71 +5390,6 @@ fn needs_skip_reason(job: &Job, needs_results: &HashMap<String, String>) -> Stri
         .unwrap_or_else(|| "because an upstream job failed".to_string())
 }
 
-/// Strip an optional `${{ ... }}` wrapper from an `if:` expression.
-fn strip_expression_wrapper(expr: &str) -> &str {
-    let trimmed = expr.trim();
-    if trimmed.starts_with("${{") && trimmed.ends_with("}}") {
-        trimmed[3..trimmed.len() - 2].trim()
-    } else {
-        trimmed
-    }
-}
-
-/// Whether an expression calls one of the status functions `success()`,
-/// `failure()`, `always()` or `cancelled()`, ignoring text inside string
-/// literals and property names such as `steps.success`.
-fn has_status_function(expr: &str) -> bool {
-    const STATUS_FUNCTIONS: [&str; 4] = ["success", "failure", "always", "cancelled"];
-    let bytes = expr.as_bytes();
-    let mut i = 0;
-    let mut in_string = false;
-    while i < bytes.len() {
-        let c = bytes[i];
-        if in_string {
-            if c == b'\'' {
-                // `''` is an escaped quote inside a string literal.
-                if bytes.get(i + 1) == Some(&b'\'') {
-                    i += 2;
-                    continue;
-                }
-                in_string = false;
-            }
-            i += 1;
-            continue;
-        }
-        if c == b'\'' {
-            in_string = true;
-            i += 1;
-            continue;
-        }
-        if c.is_ascii_alphabetic() || c == b'_' {
-            let start = i;
-            while i < bytes.len()
-                && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' || bytes[i] == b'-')
-            {
-                i += 1;
-            }
-            let ident = &expr[start..i];
-            let is_property = start > 0 && bytes[start - 1] == b'.';
-            let mut j = i;
-            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
-                j += 1;
-            }
-            if !is_property
-                && bytes.get(j) == Some(&b'(')
-                && STATUS_FUNCTIONS
-                    .iter()
-                    .any(|f| f.eq_ignore_ascii_case(ident))
-            {
-                return true;
-            }
-            continue;
-        }
-        i += 1;
-    }
-    false
-}
-
 /// Evaluate a job-level `if:` expression against the job's upstream state.
 ///
 /// Follows GitHub Actions: when the expression calls none of the status
@@ -5466,8 +5401,8 @@ fn evaluate_job_condition(
     user_env: &HashMap<String, String>,
     needs: &NeedsState<'_>,
 ) -> bool {
-    let inner = strip_expression_wrapper(condition);
-    let effective = if has_status_function(inner) {
+    let inner = crate::expression::strip_expression_wrapper(condition);
+    let effective = if crate::expression::calls_status_function(inner) {
         inner.to_string()
     } else {
         format!("success() && ({})", inner)
@@ -6164,21 +6099,6 @@ mod tests {
             needs.join(", ")
         ))
         .expect("valid job yaml")
-    }
-
-    #[test]
-    fn has_status_function_detects_calls_only() {
-        assert!(has_status_function("always()"));
-        assert!(has_status_function("!cancelled()"));
-        assert!(has_status_function("failure ( )"));
-        assert!(has_status_function("Success()"));
-        assert!(has_status_function("github.ref == 'x' && failure()"));
-        assert!(!has_status_function("github.ref == 'refs/heads/main'"));
-        assert!(!has_status_function("needs.build.result == 'failure'"));
-        assert!(!has_status_function("'always()' == 'x'"));
-        assert!(!has_status_function("'it''s always()' == 'x'"));
-        assert!(!has_status_function("steps.success.outcome"));
-        assert!(!has_status_function("success_flag(x)"));
     }
 
     #[test]

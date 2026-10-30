@@ -1034,15 +1034,43 @@ pub fn evaluate(expr: &str, ctx: &ExpressionContext) -> Result<ExprValue, String
 ///
 /// Used for `if:` conditions. Strips `${{ }}` wrappers if present.
 pub fn evaluate_as_bool(expr: &str, ctx: &ExpressionContext) -> Result<bool, String> {
+    let val = evaluate(strip_expression_wrapper(expr), ctx)?;
+    Ok(val.is_truthy())
+}
+
+/// Strip an optional `${{ ... }}` wrapper and surrounding whitespace.
+pub fn strip_expression_wrapper(expr: &str) -> &str {
     let trimmed = expr.trim();
-    // Strip ${{ }} if present
-    let inner = if trimmed.starts_with("${{") && trimmed.ends_with("}}") {
-        &trimmed[3..trimmed.len() - 2]
+    if trimmed.starts_with("${{") && trimmed.ends_with("}}") {
+        trimmed[3..trimmed.len() - 2].trim()
     } else {
         trimmed
+    }
+}
+
+/// Whether an expression calls one of the status functions `success()`,
+/// `failure()`, `always()` or `cancelled()`.
+///
+/// Uses the expression tokenizer, so text inside string literals and property
+/// names such as `steps.success` do not count. Function names match
+/// case-insensitively, as in GitHub Actions. An expression that does not
+/// tokenize returns `false`; evaluating it fails anyway.
+pub fn calls_status_function(expr: &str) -> bool {
+    const STATUS_FUNCTIONS: [&str; 4] = ["success", "failure", "always", "cancelled"];
+    let Ok(tokens) = Tokenizer::new(expr.trim()).tokenize() else {
+        return false;
     };
-    let val = evaluate(inner, ctx)?;
-    Ok(val.is_truthy())
+    tokens.windows(2).enumerate().any(|(i, pair)| {
+        let Token::Ident(name) = &pair[0] else {
+            return false;
+        };
+        let is_property = i > 0 && tokens[i - 1] == Token::Dot;
+        !is_property
+            && pair[1] == Token::LParen
+            && STATUS_FUNCTIONS
+                .iter()
+                .any(|f| f.eq_ignore_ascii_case(name))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1052,6 +1080,28 @@ pub fn evaluate_as_bool(expr: &str, ctx: &ExpressionContext) -> Result<bool, Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn calls_status_function_detects_calls_only() {
+        assert!(calls_status_function("always()"));
+        assert!(calls_status_function("!cancelled()"));
+        assert!(calls_status_function("failure ( )"));
+        assert!(calls_status_function("Success()"));
+        assert!(calls_status_function("github.ref == 'x' && failure()"));
+        assert!(!calls_status_function("github.ref == 'refs/heads/main'"));
+        assert!(!calls_status_function("needs.build.result == 'failure'"));
+        assert!(!calls_status_function("'always()' == 'x'"));
+        assert!(!calls_status_function("'it''s always()' == 'x'"));
+        assert!(!calls_status_function("steps.success.outcome"));
+        assert!(!calls_status_function("success_flag(x)"));
+        assert!(!calls_status_function("'unterminated"));
+    }
+
+    #[test]
+    fn strip_expression_wrapper_handles_both_forms() {
+        assert_eq!(strip_expression_wrapper("  ${{ a && b }} "), "a && b");
+        assert_eq!(strip_expression_wrapper(" a && b "), "a && b");
+    }
 
     lazy_static::lazy_static! {
         static ref EMPTY_ENV: HashMap<String, String> = HashMap::new();

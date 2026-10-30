@@ -238,7 +238,11 @@ mod path_tests {
 
         assert_eq!(
             secrets_path(config.path(), home.path()),
-            config.path().join("wrkflw/secrets").to_string_lossy()
+            config
+                .path()
+                .join("wrkflw")
+                .join("secrets")
+                .to_string_lossy()
         );
     }
 
@@ -250,7 +254,10 @@ mod path_tests {
 
         assert_eq!(
             secrets_path(config.path(), home.path()),
-            home.path().join(".wrkflw/secrets").to_string_lossy()
+            home.path()
+                .join(".wrkflw")
+                .join("secrets")
+                .to_string_lossy()
         );
     }
 
@@ -263,7 +270,11 @@ mod path_tests {
 
         assert_eq!(
             secrets_path(config.path(), home.path()),
-            config.path().join("wrkflw/secrets").to_string_lossy()
+            config
+                .path()
+                .join("wrkflw")
+                .join("secrets")
+                .to_string_lossy()
         );
     }
 

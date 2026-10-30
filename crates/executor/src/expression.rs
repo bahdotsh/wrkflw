@@ -361,7 +361,8 @@ impl<'a> ExpressionContext<'a> {
                 .get(&parts[1])
                 .map(|v| ExprValue::String(v.clone()))
                 .unwrap_or(ExprValue::Null),
-            "github" if parts.len() >= 2 => {
+            // Gitea exposes the same context under both names.
+            "github" | "gitea" if parts.len() >= 2 => {
                 // Support nested github context like github.event.action,
                 // github.event.pull_request.number, etc.
                 // Map dotted path to GITHUB_ env var with underscores.
@@ -486,7 +487,7 @@ impl<'a> ExpressionContext<'a> {
                     .collect();
                 ExprValue::Object(map)
             }
-            "github" if parts.len() == 1 => {
+            "github" | "gitea" if parts.len() == 1 => {
                 // Build a flat object from GITHUB_* env vars by stripping the
                 // prefix and lowercasing the remainder, inverting the dotted-access
                 // mapping (`github.sha` → `GITHUB_SHA`). Runner-internal keys that
@@ -1349,6 +1350,23 @@ mod tests {
         assert_eq!(
             evaluate("env.MY_VAR", &ctx).unwrap(),
             ExprValue::String("hello".to_string())
+        );
+    }
+
+    #[test]
+    fn eval_gitea_context_aliases_github() {
+        let mut env = HashMap::new();
+        env.insert("GITHUB_REPOSITORY".to_string(), "owner/repo".to_string());
+        let empty_steps = HashMap::new();
+        let ctx = make_ctx(&env, &empty_steps, &None);
+
+        assert_eq!(
+            evaluate("gitea.repository", &ctx).unwrap(),
+            ExprValue::String("owner/repo".to_string())
+        );
+        assert_eq!(
+            evaluate("gitea", &ctx).unwrap(),
+            evaluate("github", &ctx).unwrap()
         );
     }
 

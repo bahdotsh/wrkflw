@@ -1,6 +1,42 @@
 // utils crate
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+/// Default workflow directory for GitHub Actions.
+pub const GITHUB_WORKFLOWS_DIR: &str = ".github/workflows";
+
+/// Default workflow directory for Gitea Actions.
+pub const GITEA_WORKFLOWS_DIR: &str = ".gitea/workflows";
+
+/// Returns the default workflow directories that exist under `root`, in
+/// Gitea's lookup order: `.gitea/workflows` first, then `.github/workflows`.
+///
+/// Gitea itself only runs the first directory that exists, but a repository
+/// mirrored to both forges legitimately has both, so commands that can cover
+/// several directories should use all of them.
+pub fn default_workflow_dirs_in(root: &Path) -> Vec<PathBuf> {
+    [GITEA_WORKFLOWS_DIR, GITHUB_WORKFLOWS_DIR]
+        .iter()
+        .map(|dir| root.join(dir))
+        .filter(|dir| dir.is_dir())
+        .collect()
+}
+
+/// [`default_workflow_dirs_in`] relative to the current directory. Paths stay
+/// relative so they read as `.gitea/workflows`, not `./.gitea/workflows`.
+pub fn default_workflow_dirs() -> Vec<PathBuf> {
+    default_workflow_dirs_in(Path::new(""))
+}
+
+/// The single default workflow directory, for commands that take only one.
+/// Falls back to `.github/workflows` when neither directory exists, so the
+/// caller's "not found" error names the conventional location.
+pub fn default_workflow_dir() -> PathBuf {
+    default_workflow_dirs()
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| PathBuf::from(GITHUB_WORKFLOWS_DIR))
+}
 
 pub fn is_workflow_file(path: &Path) -> bool {
     // First, check for GitLab CI files by name
@@ -179,6 +215,24 @@ pub mod fd {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn default_workflow_dirs_prefer_gitea_and_skip_missing() {
+        let tmp = std::env::temp_dir().join(format!("wrkflw-dirs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        assert!(super::default_workflow_dirs_in(&tmp).is_empty());
+
+        let github = tmp.join(super::GITHUB_WORKFLOWS_DIR);
+        std::fs::create_dir_all(&github).unwrap();
+        assert_eq!(super::default_workflow_dirs_in(&tmp), vec![github.clone()]);
+
+        let gitea = tmp.join(super::GITEA_WORKFLOWS_DIR);
+        std::fs::create_dir_all(&gitea).unwrap();
+        assert_eq!(super::default_workflow_dirs_in(&tmp), vec![gitea, github]);
+
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
     use super::*;
 
     #[test]

@@ -27,11 +27,13 @@ A command-line tool for validating and executing GitHub Actions workflows locall
 - **Secrets management** — multiple providers (env, file, Vault, AWS, Azure, GCP) with masking and AES-256-GCM encrypted storage
 - **Remote triggering** — trigger `workflow_dispatch` runs on GitHub or GitLab pipelines
 - **GitLab support** — validate and trigger GitLab CI pipelines
+- **Gitea support** — discover, validate, and run workflows from `.gitea/workflows`, including the `gitea` expression context
 
 ## Not yet supported
 
 - GitHub encrypted secrets and fine-grained permissions
 - Event triggers other than `workflow_dispatch` for the remote `trigger` command
+- Absolute-URL actions such as `uses: https://gitea.com/actions/checkout@v4` — they pass validation, but at run time the URL is not resolved and the step falls back to built-in handling
 - Private repos for remote `uses:` — reusable workflows clone over unauthenticated HTTPS
 - `concurrency:` groups and `cancel-in-progress` — parsed but not enforced
 - Service containers — `services:` is parsed but never started, in any runtime
@@ -60,7 +62,7 @@ cargo build --release
 ## Quick Start
 
 ```bash
-# Launch the TUI (auto-detects .github/workflows)
+# Launch the TUI (auto-detects .gitea/workflows and .github/workflows)
 wrkflw
 
 # Validate workflows
@@ -81,7 +83,7 @@ wrkflw list
 ### Validation
 
 ```bash
-# Validate all workflows in .github/workflows
+# Validate all workflows in .gitea/workflows and .github/workflows
 wrkflw validate
 
 # Validate specific files or directories

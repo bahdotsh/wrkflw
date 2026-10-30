@@ -1,5 +1,25 @@
 # Breaking Changes
 
+## `~/.wrkflw` moved to the platform base directories (unreleased)
+
+wrkflw no longer writes to a hardcoded `~/.wrkflw/`. The new locations follow
+the XDG Base Directory spec on Linux and the native conventions elsewhere:
+
+| Purpose | Before | Linux | macOS |
+|---------|--------|-------|-------|
+| `actions/cache` store | `~/.wrkflw/cache` | `$XDG_CACHE_HOME/wrkflw/cache` (`~/.cache/...`) | `~/Library/Caches/wrkflw/cache` |
+| `RUNNER_TOOL_CACHE` | `~/.wrkflw/tools` | `$XDG_CACHE_HOME/wrkflw/tools` (`~/.cache/...`) | `~/Library/Caches/wrkflw/tools` |
+| Default `file` secrets provider | `~/.wrkflw/secrets` | `$XDG_CONFIG_HOME/wrkflw/secrets` (`~/.config/...`) | `~/Library/Application Support/wrkflw/secrets` |
+
+### Migration
+
+Existing caches are not carried over: they repopulate on the next run, and the
+old directories can be deleted with `rm -rf ~/.wrkflw/cache ~/.wrkflw/tools`.
+
+`~/.wrkflw/secrets` keeps working as long as the new secrets location does not
+exist. Move it to adopt the new path. Once the new location exists, the old one
+is ignored.
+
 > The entries below shipped in v0.8.0.
 
 ## `wrkflw run --event` requires change-set input by default (0.8.0)

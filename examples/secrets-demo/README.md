@@ -54,7 +54,7 @@ Create a secrets file in JSON, YAML, or `.env` format:
 Configure wrkflw:
 
 ```yaml
-# ~/.wrkflw/secrets.yml
+# ~/.config/wrkflw/secrets.yml
 default_provider: file
 enable_masking: true
 timeout_seconds: 30
@@ -70,7 +70,7 @@ providers:
 For production, use HashiCorp Vault, AWS Secrets Manager, Azure Key Vault, or GCP Secret Manager:
 
 ```yaml
-# ~/.wrkflw/secrets.yml
+# ~/.config/wrkflw/secrets.yml
 default_provider: vault
 enable_masking: true
 enable_caching: true

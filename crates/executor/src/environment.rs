@@ -302,9 +302,9 @@ fn get_temp_dir() -> String {
 }
 
 fn get_tool_cache_dir() -> String {
-    let home_dir = dirs::home_dir().unwrap_or_default();
-    home_dir
-        .join(".wrkflw")
+    let cache_dir = dirs::cache_dir().unwrap_or_default();
+    cache_dir
+        .join("wrkflw")
         .join("tools")
         .to_string_lossy()
         .to_string()

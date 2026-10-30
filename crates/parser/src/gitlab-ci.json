@@ -273,8 +273,8 @@
           "additionalProperties": false,
           "properties": {
             "annotations": {
-              "type": "string",
-              "description": "Path to JSON file with annotations report."
+              "$ref": "#/definitions/string_file_list",
+              "description": "Path to JSON file(s) with annotations report."
             },
             "junit": {
               "description": "Path for file(s) that should be parsed as JUnit XML result",
@@ -1274,7 +1274,8 @@
               "type": [
                 "boolean",
                 "number",
-                "string"
+                "string",
+                "null"
               ]
             },
             {
@@ -1318,7 +1319,8 @@
               "type": [
                 "boolean",
                 "number",
-                "string"
+                "string",
+                "null"
               ]
             },
             {

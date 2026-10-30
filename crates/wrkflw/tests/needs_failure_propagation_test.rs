@@ -428,3 +428,88 @@ jobs:
         logs
     );
 }
+
+/// A matrix job's result is the aggregate of its combinations: one failed
+/// combination fails the job even when a later combination succeeded.
+#[tokio::test]
+async fn matrix_need_with_one_failed_combination_counts_as_failed() {
+    let result = run(r#"
+name: CI
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [bad, good]
+    steps:
+      - run: test "${{ matrix.target }}" = good
+  deploy:
+    runs-on: ubuntu-latest
+    needs: [build]
+    steps:
+      - run: echo "should not run"
+  cleanup:
+    runs-on: ubuntu-latest
+    needs: [build]
+    if: failure()
+    steps:
+      - run: echo cleanup
+  report:
+    runs-on: ubuntu-latest
+    needs: [build]
+    if: always() && needs.build.result == 'failure'
+    steps:
+      - run: echo report
+"#)
+    .await;
+
+    let build: Vec<&str> = result
+        .jobs
+        .iter()
+        .filter(|j| j.canonical_name == "build")
+        .map(|j| match j.status {
+            JobStatus::Success => "success",
+            JobStatus::Failure => "failure",
+            JobStatus::Skipped => "skipped",
+        })
+        .collect();
+    assert!(
+        build.contains(&"failure") && build.contains(&"success"),
+        "expected one failed and one successful combination, got {:?}",
+        build
+    );
+    assert_eq!(status_of(&result, "deploy"), "skipped");
+    assert_eq!(status_of(&result, "cleanup"), "success");
+    assert_eq!(status_of(&result, "report"), "success");
+}
+
+/// With fail-fast, combinations after the failure are skipped. The job still
+/// counts as failed, not skipped.
+#[tokio::test]
+async fn fail_fast_matrix_need_counts_as_failed() {
+    let result = run(r#"
+name: CI
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      max-parallel: 1
+      matrix:
+        target: [bad, good]
+    steps:
+      - run: test "${{ matrix.target }}" = good
+  cleanup:
+    runs-on: ubuntu-latest
+    needs: [build]
+    if: failure()
+    steps:
+      - run: echo cleanup
+"#)
+    .await;
+
+    assert_eq!(status_of(&result, "cleanup"), "success");
+}

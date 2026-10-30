@@ -222,9 +222,9 @@ async fn execute_github_workflow(
     let mut all_job_results: HashMap<String, String> = HashMap::new();
 
     for job_batch in execution_plan {
-        // Execute jobs in parallel if they don't depend on each other
+        // Execute jobs in parallel if they don't depend on each other.
         // `needs:` failure propagation and `if:` evaluation happen per job inside
-        // `execute_single_job`, so this loop and `run_called_workflow` share them.
+        // `execute_job_with_matrix`, so this loop and `run_called_workflow` share them.
         let job_results = execute_job_batch(
             &job_batch,
             &workflow,
@@ -241,29 +241,7 @@ async fn execute_github_workflow(
         )
         .await?;
 
-        // Collect job outputs and results for downstream jobs' `needs.*` context.
-        // For matrix jobs, multiple combinations share the same canonical_name — the last
-        // combination to complete wins.  This matches GitHub Actions' behavior where matrix
-        // job outputs are non-deterministic when multiple combinations set the same key.
-        for job_result in &job_results {
-            if all_job_outputs.contains_key(&job_result.canonical_name)
-                && job_result.name != job_result.canonical_name
-            {
-                wrkflw_logging::warning(&format!(
-                    "Matrix job '{}' overwrites outputs for '{}' — \
-                     needs.{}.outputs will reflect the last combination only",
-                    job_result.name, job_result.canonical_name, job_result.canonical_name,
-                ));
-            }
-            all_job_results.insert(
-                job_result.canonical_name.clone(),
-                job_result.status.to_string(),
-            );
-            all_job_outputs.insert(
-                job_result.canonical_name.clone(),
-                job_result.outputs.clone(),
-            );
-        }
+        record_job_results(&job_results, &mut all_job_outputs, &mut all_job_results);
 
         // Check for job failures and collect details
         for job_result in &job_results {
@@ -305,6 +283,47 @@ async fn execute_github_workflow(
             None
         },
     })
+}
+
+/// Record one batch's results for downstream jobs' `needs.*` context.
+///
+/// A matrix job yields one `JobResult` per combination, all sharing a
+/// `canonical_name`. Outputs follow GitHub Actions: the last combination to set
+/// a key wins, which is non-deterministic across combinations. The result is
+/// the aggregate, as on GitHub: `failure` if any combination failed, otherwise
+/// `success` if any succeeded, otherwise `skipped`.
+fn record_job_results(
+    job_results: &[JobResult],
+    all_job_outputs: &mut HashMap<String, HashMap<String, String>>,
+    all_job_results: &mut HashMap<String, String>,
+) {
+    let mut aggregate: HashMap<&str, &JobStatus> = HashMap::new();
+    for job_result in job_results {
+        if all_job_outputs.contains_key(&job_result.canonical_name)
+            && job_result.name != job_result.canonical_name
+        {
+            wrkflw_logging::warning(&format!(
+                "Matrix job '{}' overwrites outputs for '{}' — \
+                 needs.{}.outputs will reflect the last combination only",
+                job_result.name, job_result.canonical_name, job_result.canonical_name,
+            ));
+        }
+        all_job_outputs.insert(
+            job_result.canonical_name.clone(),
+            job_result.outputs.clone(),
+        );
+        aggregate
+            .entry(job_result.canonical_name.as_str())
+            .and_modify(|status| {
+                if job_result.status.aggregate_rank() > status.aggregate_rank() {
+                    *status = &job_result.status;
+                }
+            })
+            .or_insert(&job_result.status);
+    }
+    for (name, status) in aggregate {
+        all_job_results.insert(name.to_string(), status.to_string());
+    }
 }
 
 /// Execute a GitLab CI/CD pipeline locally
@@ -669,13 +688,17 @@ pub struct JobResult {
 
 impl JobResult {
     /// A job (or matrix combination) that never ran.
-    fn skipped(name: &str, canonical_name: &str, logs: &str) -> Self {
+    fn skipped(
+        name: impl Into<String>,
+        canonical_name: impl Into<String>,
+        logs: impl Into<String>,
+    ) -> Self {
         JobResult {
-            name: name.to_string(),
-            canonical_name: canonical_name.to_string(),
+            name: name.into(),
+            canonical_name: canonical_name.into(),
             status: JobStatus::Skipped,
             steps: Vec::new(),
-            logs: logs.to_string(),
+            logs: logs.into(),
             outputs: HashMap::new(),
         }
     }
@@ -687,6 +710,18 @@ pub enum JobStatus {
     Success,
     Failure,
     Skipped,
+}
+
+impl JobStatus {
+    /// Precedence when combining matrix combinations into one job result:
+    /// any failure fails the job, otherwise any success makes it succeed.
+    fn aggregate_rank(&self) -> u8 {
+        match self {
+            JobStatus::Skipped => 0,
+            JobStatus::Success => 1,
+            JobStatus::Failure => 2,
+        }
+    }
 }
 
 impl std::fmt::Display for JobStatus {
@@ -2171,7 +2206,7 @@ async fn execute_matrix_combinations(
                 let combination_name =
                     wrkflw_matrix::format_combination_name(ctx.job_name, combination);
                 results.push(JobResult::skipped(
-                    &combination_name,
+                    combination_name,
                     ctx.job_name,
                     "Job skipped due to previous matrix job failure",
                 ));
@@ -2197,7 +2232,7 @@ async fn execute_matrix_combinations(
         let chunk_results = future::join_all(chunk_futures).await;
 
         // Process results from this chunk
-        for result in chunk_results {
+        for (combination, result) in chunk.iter().zip(chunk_results) {
             match result {
                 Ok(job_result) => {
                     if job_result.status == JobStatus::Failure {
@@ -2213,6 +2248,16 @@ async fn execute_matrix_combinations(
                     if ctx.fail_fast {
                         return Err(e);
                     }
+                    // Record the combination as failed so the job's aggregate
+                    // `needs.<id>.result` reflects it.
+                    results.push(JobResult {
+                        name: wrkflw_matrix::format_combination_name(ctx.job_name, combination),
+                        canonical_name: ctx.job_name.to_string(),
+                        status: JobStatus::Failure,
+                        steps: Vec::new(),
+                        logs: e.to_string(),
+                        outputs: HashMap::new(),
+                    });
                 }
             }
         }
@@ -4580,13 +4625,12 @@ async fn run_called_workflow(
             ctx.services.cache_store,
         )
         .await?;
-        for r in &results {
-            if r.status == JobStatus::Failure {
-                any_failed = true;
-            }
-            reusable_job_results.insert(r.canonical_name.clone(), r.status.to_string());
-            reusable_job_outputs.insert(r.canonical_name.clone(), r.outputs.clone());
-        }
+        any_failed |= results.iter().any(|r| r.status == JobStatus::Failure);
+        record_job_results(
+            &results,
+            &mut reusable_job_outputs,
+            &mut reusable_job_results,
+        );
         all_results.extend(results);
     }
 

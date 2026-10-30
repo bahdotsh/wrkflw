@@ -222,50 +222,11 @@ async fn execute_github_workflow(
     let mut all_job_results: HashMap<String, String> = HashMap::new();
 
     for job_batch in execution_plan {
-        // GitHub Actions: a job that declares `needs:` runs only if every needed
-        // job succeeded. If any needed job failed or was itself skipped, this job
-        // is skipped too, and its own dependents cascade. `resolve_dependencies`
-        // only orders the batches — it never enforces this — so do it here, before
-        // the batch runs. A job carrying an explicit `if:` is left for
-        // `execute_single_job` to evaluate: `if: always()` / `if: failure()` may
-        // deliberately opt back in.
-        let mut runnable: Vec<String> = Vec::with_capacity(job_batch.len());
-        for job_name in &job_batch {
-            match workflow
-                .jobs
-                .get(job_name)
-                .and_then(|job| job_blocked_by_needs(job, &all_job_results))
-            {
-                Some(reason) => {
-                    wrkflw_logging::info(&format!(
-                        "{} Skipping job '{}': {}",
-                        wrkflw_logging::symbols::SKIPPED,
-                        job_name,
-                        reason,
-                    ));
-                    let skipped = JobResult {
-                        name: job_name.clone(),
-                        canonical_name: job_name.clone(),
-                        status: JobStatus::Skipped,
-                        steps: Vec::new(),
-                        logs: String::new(),
-                        outputs: HashMap::new(),
-                    };
-                    all_job_results
-                        .insert(skipped.canonical_name.clone(), skipped.status.to_string());
-                    all_job_outputs.insert(skipped.canonical_name.clone(), skipped.outputs.clone());
-                    results.push(skipped);
-                }
-                None => runnable.push(job_name.clone()),
-            }
-        }
-        if runnable.is_empty() {
-            continue;
-        }
-
-        // Execute jobs in parallel if they don't depend on each other
+        // Execute jobs in parallel if they don't depend on each other.
+        // `needs:` failure propagation and `if:` evaluation happen per job inside
+        // `execute_job_with_matrix`, so this loop and `run_called_workflow` share them.
         let job_results = execute_job_batch(
-            &runnable,
+            &job_batch,
             &workflow,
             runtime.as_ref(),
             &env_context,
@@ -280,29 +241,7 @@ async fn execute_github_workflow(
         )
         .await?;
 
-        // Collect job outputs and results for downstream jobs' `needs.*` context.
-        // For matrix jobs, multiple combinations share the same canonical_name — the last
-        // combination to complete wins.  This matches GitHub Actions' behavior where matrix
-        // job outputs are non-deterministic when multiple combinations set the same key.
-        for job_result in &job_results {
-            if all_job_outputs.contains_key(&job_result.canonical_name)
-                && job_result.name != job_result.canonical_name
-            {
-                wrkflw_logging::warning(&format!(
-                    "Matrix job '{}' overwrites outputs for '{}' — \
-                     needs.{}.outputs will reflect the last combination only",
-                    job_result.name, job_result.canonical_name, job_result.canonical_name,
-                ));
-            }
-            all_job_results.insert(
-                job_result.canonical_name.clone(),
-                job_result.status.to_string(),
-            );
-            all_job_outputs.insert(
-                job_result.canonical_name.clone(),
-                job_result.outputs.clone(),
-            );
-        }
+        record_job_results(&job_results, &mut all_job_outputs, &mut all_job_results);
 
         // Check for job failures and collect details
         for job_result in &job_results {
@@ -346,30 +285,45 @@ async fn execute_github_workflow(
     })
 }
 
-/// GitHub Actions `needs:` failure semantics: with no explicit `if:`, a job runs
-/// only when every job it needs succeeded. Returns `Some(reason)` when the job
-/// must be skipped because a needed job failed or was itself skipped, `None` when
-/// it may run. Jobs with an `if:` are always allowed through here —
-/// `execute_single_job` evaluates the condition and can opt back in on failure.
-fn job_blocked_by_needs(job: &Job, all_job_results: &HashMap<String, String>) -> Option<String> {
-    if job.if_condition.is_some() {
-        return None;
-    }
-    let needs = job.needs.as_ref()?;
-    for needed in needs {
-        match all_job_results.get(needed).map(String::as_str) {
-            // "success", or not-yet-recorded (a filtered target-job plan can omit
-            // an upstream job) — neither blocks.
-            Some("success") | None => {}
-            Some(other) => {
-                return Some(format!(
-                    "needed job '{}' did not succeed ({})",
-                    needed, other
-                ));
-            }
+/// Record one batch's results for downstream jobs' `needs.*` context.
+///
+/// A matrix job yields one `JobResult` per combination, all sharing a
+/// `canonical_name`. Outputs follow GitHub Actions: the last combination to set
+/// a key wins, which is non-deterministic across combinations. The result is
+/// the aggregate, as on GitHub: `failure` if any combination failed, otherwise
+/// `success` if any succeeded, otherwise `skipped`.
+fn record_job_results(
+    job_results: &[JobResult],
+    all_job_outputs: &mut HashMap<String, HashMap<String, String>>,
+    all_job_results: &mut HashMap<String, String>,
+) {
+    let mut aggregate: HashMap<&str, &JobStatus> = HashMap::new();
+    for job_result in job_results {
+        if all_job_outputs.contains_key(&job_result.canonical_name)
+            && job_result.name != job_result.canonical_name
+        {
+            wrkflw_logging::warning(&format!(
+                "Matrix job '{}' overwrites outputs for '{}' — \
+                 needs.{}.outputs will reflect the last combination only",
+                job_result.name, job_result.canonical_name, job_result.canonical_name,
+            ));
         }
+        all_job_outputs.insert(
+            job_result.canonical_name.clone(),
+            job_result.outputs.clone(),
+        );
+        aggregate
+            .entry(job_result.canonical_name.as_str())
+            .and_modify(|status| {
+                if job_result.status.aggregate_rank() > status.aggregate_rank() {
+                    *status = &job_result.status;
+                }
+            })
+            .or_insert(&job_result.status);
     }
-    None
+    for (name, status) in aggregate {
+        all_job_results.insert(name.to_string(), status.to_string());
+    }
 }
 
 /// Execute a GitLab CI/CD pipeline locally
@@ -732,12 +686,42 @@ pub struct JobResult {
     pub outputs: HashMap<String, String>,
 }
 
+impl JobResult {
+    /// A job (or matrix combination) that never ran.
+    fn skipped(
+        name: impl Into<String>,
+        canonical_name: impl Into<String>,
+        logs: impl Into<String>,
+    ) -> Self {
+        JobResult {
+            name: name.into(),
+            canonical_name: canonical_name.into(),
+            status: JobStatus::Skipped,
+            steps: Vec::new(),
+            logs: logs.into(),
+            outputs: HashMap::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
 pub enum JobStatus {
     Success,
     Failure,
     Skipped,
+}
+
+impl JobStatus {
+    /// Precedence when combining matrix combinations into one job result:
+    /// any failure fails the job, otherwise any success makes it succeed.
+    fn aggregate_rank(&self) -> u8 {
+        match self {
+            JobStatus::Skipped => 0,
+            JobStatus::Success => 1,
+            JobStatus::Failure => 2,
+        }
+    }
 }
 
 impl std::fmt::Display for JobStatus {
@@ -1912,30 +1896,34 @@ async fn execute_job_with_matrix(
         ExecutionError::Execution(format!("Job '{}' not found in workflow", job_name))
     })?;
 
-    // Evaluate job condition if present
-    if let Some(if_condition) = &job.if_condition {
-        let should_run = evaluate_job_condition(if_condition, env_context, user_env, workflow);
-        if !should_run {
-            wrkflw_logging::info(&format!(
-                "{} Skipping job '{}' due to condition: {}",
-                wrkflw_logging::symbols::SKIPPED,
-                job_name,
-                if_condition
-            ));
-            // Return a skipped job result
-            return Ok(vec![JobResult {
-                name: job_name.to_string(),
-                canonical_name: job_name.to_string(),
-                status: JobStatus::Skipped,
-                steps: Vec::new(),
-                logs: String::new(),
-                outputs: HashMap::new(),
-            }]);
-        }
-    }
-
     // Build filtered needs context for this job (only jobs declared in `needs:`)
     let (needs_ctx, needs_res) = build_needs_context(job, all_job_outputs, all_job_results);
+
+    // GitHub Actions job gating: a job with no `if:` runs only when `success()`,
+    // i.e. every needed job succeeded and no ancestor failed. An explicit `if:`
+    // is evaluated against the same upstream state, so `failure()`, `success()`
+    // and `needs.<id>.result` see real results.
+    if job.if_condition.is_some() || job.needs.is_some() {
+        let needs_state = NeedsState {
+            status: upstream_status(job_name, job, &workflow.jobs, all_job_results),
+            outputs: &needs_ctx,
+            results: &needs_res,
+        };
+        let condition = job.if_condition.as_deref().unwrap_or("success()");
+        if !evaluate_job_condition(condition, env_context, user_env, &needs_state) {
+            let reason = match &job.if_condition {
+                Some(cond) => format!("due to condition: {}", cond),
+                None => needs_skip_reason(job, &needs_res),
+            };
+            wrkflw_logging::info(&format!(
+                "{} Skipping job '{}' {}",
+                wrkflw_logging::symbols::SKIPPED,
+                job_name,
+                reason
+            ));
+            return Ok(vec![JobResult::skipped(job_name, job_name, "")]);
+        }
+    }
 
     // Pre-resolve secrets once for this job (shared across matrix combinations and non-matrix path)
     let secrets_context: HashMap<String, String> = if let Some(secret_mgr) = secret_manager {
@@ -2217,14 +2205,11 @@ async fn execute_matrix_combinations(
             for combination in chunk {
                 let combination_name =
                     wrkflw_matrix::format_combination_name(ctx.job_name, combination);
-                results.push(JobResult {
-                    name: combination_name,
-                    canonical_name: ctx.job_name.to_string(),
-                    status: JobStatus::Skipped,
-                    steps: Vec::new(),
-                    logs: "Job skipped due to previous matrix job failure".to_string(),
-                    outputs: HashMap::new(),
-                });
+                results.push(JobResult::skipped(
+                    combination_name,
+                    ctx.job_name,
+                    "Job skipped due to previous matrix job failure",
+                ));
             }
             continue;
         }
@@ -2247,7 +2232,7 @@ async fn execute_matrix_combinations(
         let chunk_results = future::join_all(chunk_futures).await;
 
         // Process results from this chunk
-        for result in chunk_results {
+        for (combination, result) in chunk.iter().zip(chunk_results) {
             match result {
                 Ok(job_result) => {
                     if job_result.status == JobStatus::Failure {
@@ -2263,6 +2248,16 @@ async fn execute_matrix_combinations(
                     if ctx.fail_fast {
                         return Err(e);
                     }
+                    // Record the combination as failed so the job's aggregate
+                    // `needs.<id>.result` reflects it.
+                    results.push(JobResult {
+                        name: wrkflw_matrix::format_combination_name(ctx.job_name, combination),
+                        canonical_name: ctx.job_name.to_string(),
+                        status: JobStatus::Failure,
+                        steps: Vec::new(),
+                        logs: e.to_string(),
+                        outputs: HashMap::new(),
+                    });
                 }
             }
         }
@@ -4630,13 +4625,12 @@ async fn run_called_workflow(
             ctx.services.cache_store,
         )
         .await?;
-        for r in &results {
-            if r.status == JobStatus::Failure {
-                any_failed = true;
-            }
-            reusable_job_results.insert(r.canonical_name.clone(), r.status.to_string());
-            reusable_job_outputs.insert(r.canonical_name.clone(), r.outputs.clone());
-        }
+        any_failed |= results.iter().any(|r| r.status == JobStatus::Failure);
+        record_job_results(
+            &results,
+            &mut reusable_job_outputs,
+            &mut reusable_job_results,
+        );
         all_results.extend(results);
     }
 
@@ -5374,30 +5368,101 @@ fn convert_yaml_to_step(step_yaml: &serde_yaml::Value) -> Result<workflow::Step,
     })
 }
 
-/// Evaluate a job condition expression
-/// This is a simplified implementation that handles basic GitHub Actions expressions.
-/// Note: step-level expressions like `steps.<id>.outcome`, `success()`, `failure()`,
-/// `always()`, and `cancelled()` are not yet fully supported — a warning is emitted
-/// and the condition defaults to its most likely state (`always()`/`success()` → true,
-/// `failure()`/`cancelled()` → false).
+/// Upstream state a job-level `if:` is evaluated against.
+struct NeedsState<'a> {
+    /// What `success()` / `failure()` see: "success", "failure" or "skipped".
+    /// See [`upstream_status`].
+    status: &'static str,
+    /// `needs.<id>.outputs.*`, limited to the job's direct `needs:`.
+    outputs: &'a HashMap<String, HashMap<String, String>>,
+    /// `needs.<id>.result`, limited to the job's direct `needs:`.
+    results: &'a HashMap<String, String>,
+}
+
+/// Status of the jobs upstream of `job_name`, as GitHub Actions' job-level
+/// status functions see it:
+///
+/// - "failure" if any transitive ancestor failed. GitHub documents that
+///   `failure()` is true when any ancestor job failed, and `success()` is then
+///   false even if the direct need ran via `if: always()`.
+/// - "skipped" if no ancestor failed but a direct need did not succeed (it was
+///   skipped). `success()` and `failure()` are both false.
+/// - "success" otherwise.
+///
+/// A need with no recorded result is ignored. That happens when a matrix job
+/// expands to zero combinations and so produces no `JobResult`.
+fn upstream_status(
+    job_name: &str,
+    job: &Job,
+    jobs: &HashMap<String, Job>,
+    all_job_results: &HashMap<String, String>,
+) -> &'static str {
+    let ancestor_failed = dependency::collect_transitive_deps(job_name, jobs)
+        .iter()
+        .filter(|name| name.as_str() != job_name)
+        .any(|name| all_job_results.get(name).map(String::as_str) == Some("failure"));
+    if ancestor_failed {
+        return "failure";
+    }
+    let direct_needs_ok = job.needs.iter().flatten().all(|needed| {
+        matches!(
+            all_job_results.get(needed).map(String::as_str),
+            Some("success") | None
+        )
+    });
+    if direct_needs_ok {
+        "success"
+    } else {
+        "skipped"
+    }
+}
+
+/// Log text for a job skipped by the implicit `success()` gate.
+fn needs_skip_reason(job: &Job, needs_results: &HashMap<String, String>) -> String {
+    job.needs
+        .iter()
+        .flatten()
+        .find_map(
+            |needed| match needs_results.get(needed).map(String::as_str) {
+                Some("success") | None => None,
+                Some(other) => Some(format!(
+                    "because needed job '{}' did not succeed ({})",
+                    needed, other
+                )),
+            },
+        )
+        .unwrap_or_else(|| "because an upstream job failed".to_string())
+}
+
+/// Evaluate a job-level `if:` expression against the job's upstream state.
+///
+/// Follows GitHub Actions: when the expression calls none of the status
+/// functions, it is evaluated as `success() && (<expr>)`, so a plain
+/// `if: github.ref == 'refs/heads/main'` still skips after a failed need.
 fn evaluate_job_condition(
     condition: &str,
     env_context: &HashMap<String, String>,
     user_env: &HashMap<String, String>,
-    _workflow: &WorkflowDefinition,
+    needs: &NeedsState<'_>,
 ) -> bool {
+    let inner = crate::expression::strip_expression_wrapper(condition);
+    let effective = if crate::expression::calls_status_function(inner) {
+        inner.to_string()
+    } else {
+        format!("success() && ({})", inner)
+    };
     let ctx = crate::expression::ExpressionContext {
         env_context,
         step_outputs: &HashMap::new(),
         matrix_combination: &None,
         step_statuses: &HashMap::new(),
-        job_status: "success",
+        job_status: needs.status,
         secrets_context: &HashMap::new(),
-        needs_context: &HashMap::new(),
-        needs_results: &HashMap::new(),
+        needs_context: needs.outputs,
+        needs_results: needs.results,
         user_env,
     };
-    evaluate_condition_with_context(condition, &ctx)
+    evaluate_condition_with_context(&effective, &ctx)
 }
 
 /// Evaluate a job/step `if:` condition using the expression evaluator.
@@ -6052,125 +6117,165 @@ mod tests {
         }
     }
 
+    /// Evaluate a job condition with no upstream jobs (all needs "succeeded").
+    fn eval_cond(condition: &str, env: &HashMap<String, String>) -> bool {
+        eval_cond_with(condition, env, "success", &HashMap::new())
+    }
+
+    fn eval_cond_with(
+        condition: &str,
+        env: &HashMap<String, String>,
+        status: &'static str,
+        results: &HashMap<String, String>,
+    ) -> bool {
+        let outputs = HashMap::new();
+        let needs = NeedsState {
+            status,
+            outputs: &outputs,
+            results,
+        };
+        evaluate_job_condition(condition, env, env, &needs)
+    }
+
+    fn job_needing(needs: &[&str]) -> Job {
+        serde_yaml::from_str(&format!(
+            "runs-on: ubuntu-latest\nneeds: [{}]\nsteps: []\n",
+            needs.join(", ")
+        ))
+        .expect("valid job yaml")
+    }
+
+    #[test]
+    fn job_condition_implicit_success_after_failed_need() {
+        let env = HashMap::new();
+        let results = HashMap::from([("build".to_string(), "failure".to_string())]);
+        // No status function → implicitly `success() && (...)` → skipped.
+        assert!(!eval_cond_with("true", &env, "failure", &results));
+        assert!(!eval_cond_with("${{ true }}", &env, "failure", &results));
+        // Status functions see the real upstream status.
+        assert!(eval_cond_with("failure()", &env, "failure", &results));
+        assert!(!eval_cond_with("success()", &env, "failure", &results));
+        assert!(eval_cond_with("always()", &env, "failure", &results));
+        assert!(eval_cond_with(
+            "always() && needs.build.result == 'failure'",
+            &env,
+            "failure",
+            &results
+        ));
+    }
+
+    #[test]
+    fn job_condition_after_skipped_need() {
+        let env = HashMap::new();
+        let results = HashMap::from([("build".to_string(), "skipped".to_string())]);
+        assert!(!eval_cond_with("success()", &env, "skipped", &results));
+        assert!(!eval_cond_with("failure()", &env, "skipped", &results));
+        assert!(eval_cond_with("always()", &env, "skipped", &results));
+    }
+
+    #[test]
+    fn upstream_status_classifies_needs() {
+        let mut jobs = HashMap::new();
+        jobs.insert("a".to_string(), job_needing(&[]));
+        jobs.insert("b".to_string(), job_needing(&["a"]));
+        jobs.insert("c".to_string(), job_needing(&["b"]));
+        let c = job_needing(&["b"]);
+        let results = |pairs: &[(&str, &str)]| -> HashMap<String, String> {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+
+        let all_ok = results(&[("a", "success"), ("b", "success")]);
+        assert_eq!(upstream_status("c", &c, &jobs, &all_ok), "success");
+
+        // Grandparent failed, parent ran via always(): still "failure".
+        let ancestor_failed = results(&[("a", "failure"), ("b", "success")]);
+        assert_eq!(upstream_status("c", &c, &jobs, &ancestor_failed), "failure");
+
+        let parent_skipped = results(&[("a", "success"), ("b", "skipped")]);
+        assert_eq!(upstream_status("c", &c, &jobs, &parent_skipped), "skipped");
+
+        // Unrecorded need (zero-combination matrix) does not block.
+        let unrecorded = results(&[("a", "success")]);
+        assert_eq!(upstream_status("c", &c, &jobs, &unrecorded), "success");
+    }
+
     #[test]
     fn condition_true_false_literals() {
         let env = HashMap::new();
-        let wf = empty_workflow();
-        assert!(evaluate_job_condition("true", &env, &env, &wf));
-        assert!(!evaluate_job_condition("false", &env, &env, &wf));
+        assert!(eval_cond("true", &env));
+        assert!(!eval_cond("false", &env));
     }
 
     #[test]
     fn condition_steps_reference_evaluates_null_for_unknown_step() {
         let env = HashMap::new();
-        let wf = empty_workflow();
         // Unknown step IDs resolve to null (matching GitHub Actions behavior),
         // so comparisons to any string are false.
-        assert!(!evaluate_job_condition(
-            "steps.build.outcome == 'success'",
-            &env,
-            &env,
-            &wf
-        ));
-        assert!(!evaluate_job_condition(
-            "steps.build.outcome == 'failure'",
-            &env,
-            &env,
-            &wf
-        ));
+        assert!(!eval_cond("steps.build.outcome == 'success'", &env));
+        assert!(!eval_cond("steps.build.outcome == 'failure'", &env));
     }
 
     #[test]
     fn condition_success_function_defaults_true() {
         let env = HashMap::new();
-        let wf = empty_workflow();
-        assert!(evaluate_job_condition("success()", &env, &env, &wf));
+        assert!(eval_cond("success()", &env));
     }
 
     #[test]
     fn condition_failure_function_defaults_false() {
         let env = HashMap::new();
-        let wf = empty_workflow();
-        assert!(!evaluate_job_condition("failure()", &env, &env, &wf));
+        assert!(!eval_cond("failure()", &env));
     }
 
     #[test]
     fn condition_always_function_defaults_true() {
         let env = HashMap::new();
-        let wf = empty_workflow();
-        assert!(evaluate_job_condition("always()", &env, &env, &wf));
+        assert!(eval_cond("always()", &env));
     }
 
     #[test]
     fn condition_cancelled_function_defaults_false() {
         let env = HashMap::new();
-        let wf = empty_workflow();
-        assert!(!evaluate_job_condition("cancelled()", &env, &env, &wf));
+        assert!(!eval_cond("cancelled()", &env));
     }
 
     #[test]
     fn condition_compound_failure_or_success_defaults_true() {
         let env = HashMap::new();
-        let wf = empty_workflow();
         // success() is present, so compound expression should default to true
-        assert!(evaluate_job_condition(
-            "failure() || success()",
-            &env,
-            &env,
-            &wf
-        ));
+        assert!(eval_cond("failure() || success()", &env));
     }
 
     #[test]
     fn condition_compound_failure_and_cancelled_defaults_false() {
         let env = HashMap::new();
-        let wf = empty_workflow();
         // Only negative functions, no positive counterpart → false
-        assert!(!evaluate_job_condition(
-            "failure() || cancelled()",
-            &env,
-            &env,
-            &wf
-        ));
+        assert!(!eval_cond("failure() || cancelled()", &env));
     }
 
     #[test]
     fn condition_always_and_failure_evaluates_correctly() {
         let env = HashMap::new();
-        let wf = empty_workflow();
         // always() → true, failure() → false, true && false → false
         // The expression evaluator correctly evaluates the compound expression
-        assert!(!evaluate_job_condition(
-            "always() && failure()",
-            &env,
-            &env,
-            &wf
-        ));
+        assert!(!eval_cond("always() && failure()", &env));
         // always() alone → true
-        assert!(evaluate_job_condition("always()", &env, &env, &wf));
+        assert!(eval_cond("always()", &env));
         // always() || failure() → true (|| returns first truthy)
-        assert!(evaluate_job_condition(
-            "always() || failure()",
-            &env,
-            &env,
-            &wf
-        ));
+        assert!(eval_cond("always() || failure()", &env));
     }
 
     #[test]
     fn condition_parse_error_returns_false() {
         let env = HashMap::new();
-        let wf = empty_workflow();
         // Malformed conditions should evaluate to false (not true) — matching
         // GitHub Actions behavior where unparseable expressions error out.
-        assert!(!evaluate_job_condition(
-            "&&& invalid syntax",
-            &env,
-            &env,
-            &wf
-        ));
-        assert!(!evaluate_job_condition("== broken", &env, &env, &wf));
-        assert!(!evaluate_job_condition("((( unmatched", &env, &env, &wf));
+        assert!(!eval_cond("&&& invalid syntax", &env));
+        assert!(!eval_cond("== broken", &env));
+        assert!(!eval_cond("((( unmatched", &env));
     }
 
     #[test]
@@ -6178,27 +6283,11 @@ mod tests {
         let mut env = HashMap::new();
         env.insert("MY_STEPS_COUNT".to_string(), "5".to_string());
         env.insert("_STEPS_CHECK".to_string(), "ok".to_string());
-        let wf = empty_workflow();
         // env.MY_STEPS_COUNT resolves via the env context, not as a steps ref
-        assert!(evaluate_job_condition(
-            "env.MY_STEPS_COUNT == '5'",
-            &env,
-            &env,
-            &wf
-        ));
-        assert!(evaluate_job_condition(
-            "env._STEPS_CHECK == 'ok'",
-            &env,
-            &env,
-            &wf
-        ));
+        assert!(eval_cond("env.MY_STEPS_COUNT == '5'", &env));
+        assert!(eval_cond("env._STEPS_CHECK == 'ok'", &env));
         // Missing env var → null, null != '5' → false
-        assert!(!evaluate_job_condition(
-            "env.MISSING_VAR == '5'",
-            &env,
-            &env,
-            &wf
-        ));
+        assert!(!eval_cond("env.MISSING_VAR == '5'", &env));
     }
 
     // --- volume path traversal tests ---

@@ -173,7 +173,12 @@ wrkflw tui
 
 # Open with specific runtime
 wrkflw tui --runtime podman
+
+# Force a color theme
+wrkflw tui --theme light
 ```
+
+The TUI follows your terminal's background and uses a light or dark palette to match. Set `--theme` or `WRKFLW_THEME` to `auto`, `dark` or `light` to override it. The theme is chosen at startup, so restart the TUI after switching your terminal's theme.
 
 **Tabs:** Workflows · Execution · DAG · Logs · Trigger · Secrets · Help.
 

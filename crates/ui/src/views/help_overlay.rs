@@ -2,7 +2,7 @@
 use crate::theme::{self, COLORS};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Paragraph, Wrap},
     Frame,
@@ -259,15 +259,19 @@ pub fn render_help_overlay(f: &mut Frame<'_>, scroll_offset: usize) {
         height,
     };
 
-    // Dark background
-    let clear = Block::default().style(Style::default().bg(Color::Black));
+    // Opaque backdrop
+    let clear = Block::default().style(Style::default().bg(COLORS.bg_dark));
     f.render_widget(clear, size);
 
     // Overlay border
     let overlay_block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Double)
-        .style(Style::default().bg(Color::Black).fg(COLORS.border_focused))
+        .style(
+            Style::default()
+                .bg(COLORS.bg_dark)
+                .fg(COLORS.border_focused),
+        )
         .title(Span::styled(
             " Press ? or Esc to close ",
             theme::muted_style(),

@@ -20,7 +20,7 @@ use wrkflw_ui::run_wrkflw_tui;
 
 # tokio_test::block_on(async {
 let path = PathBuf::from(".github/workflows");
-run_wrkflw_tui(Some(&path), RuntimeType::Docker, /* verbose */ true, /* preserve_containers_on_failure */ false, /* show_action_messages */ false).await?;
+run_wrkflw_tui(Some(&path), RuntimeType::Docker, /* verbose */ true, /* preserve_containers_on_failure */ false, /* show_action_messages */ false, /* theme */ None).await?;
 # Ok::<_, Box<dyn std::error::Error>>(())
 # })?;
 ```

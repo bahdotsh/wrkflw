@@ -6,14 +6,62 @@ use serde_yaml::Value;
 use std::collections::HashMap;
 use thiserror::Error;
 
+/// The value of a matrix `include` or `exclude` key: either a literal list, or
+/// an expression such as `${{ fromJSON(needs.setup.outputs.matrix) }}` that can
+/// only be evaluated once the job is about to run.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum MatrixEntries {
+    List(Vec<HashMap<String, Value>>),
+    Expression(String),
+}
+
+impl Default for MatrixEntries {
+    fn default() -> Self {
+        MatrixEntries::List(Vec::new())
+    }
+}
+
+impl MatrixEntries {
+    /// Replace an expression with the list it evaluates to. `evaluate` receives
+    /// the expression and returns its result as JSON text.
+    fn resolve<F>(&self, section: &str, evaluate: &mut F) -> Result<Self, MatrixError>
+    where
+        F: FnMut(&str) -> Result<String, String>,
+    {
+        let MatrixEntries::Expression(expr) = self else {
+            return Ok(self.clone());
+        };
+        let json = evaluate(expr)
+            .map_err(|e| MatrixError::ExpressionError(format!("{} '{}': {}", section, expr, e)))?;
+        let entries = serde_json::from_str(&json).map_err(|e| {
+            MatrixError::ExpressionError(format!(
+                "{} '{}' must evaluate to an array of objects, got '{}': {}",
+                section, expr, json, e
+            ))
+        })?;
+        Ok(MatrixEntries::List(entries))
+    }
+
+    fn literal(&self, section: &str) -> Result<&[HashMap<String, Value>], MatrixError> {
+        match self {
+            MatrixEntries::List(entries) => Ok(entries),
+            MatrixEntries::Expression(expr) => Err(MatrixError::ExpressionError(format!(
+                "{} '{}' is only known at run time",
+                section, expr
+            ))),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct MatrixConfig {
     #[serde(flatten)]
     pub parameters: IndexMap<String, Value>,
     #[serde(default)]
-    pub include: Vec<HashMap<String, Value>>,
+    pub include: MatrixEntries,
     #[serde(default)]
-    pub exclude: Vec<HashMap<String, Value>>,
+    pub exclude: MatrixEntries,
     #[serde(default, rename = "max-parallel")]
     pub max_parallel: Option<usize>,
     #[serde(default, rename = "fail-fast")]
@@ -24,11 +72,26 @@ impl Default for MatrixConfig {
     fn default() -> Self {
         Self {
             parameters: IndexMap::new(),
-            include: Vec::new(),
-            exclude: Vec::new(),
+            include: MatrixEntries::default(),
+            exclude: MatrixEntries::default(),
             max_parallel: None,
             fail_fast: Some(true),
         }
+    }
+}
+
+impl MatrixConfig {
+    /// Returns a copy with any `include`/`exclude` expression replaced by the
+    /// list it evaluates to, ready for [`expand_matrix`].
+    pub fn resolve_expressions<F>(&self, mut evaluate: F) -> Result<Self, MatrixError>
+    where
+        F: FnMut(&str) -> Result<String, String>,
+    {
+        Ok(Self {
+            include: self.include.resolve("include", &mut evaluate)?,
+            exclude: self.exclude.resolve("exclude", &mut evaluate)?,
+            ..self.clone()
+        })
     }
 }
 
@@ -61,23 +124,28 @@ pub enum MatrixError {
 
     #[error("Failed to expand matrix: {0}")]
     ExpansionError(String),
+
+    #[error("Invalid matrix expression: {0}")]
+    ExpressionError(String),
 }
 
 /// Expands a matrix configuration into a list of all valid combinations
 pub fn expand_matrix(matrix: &MatrixConfig) -> Result<Vec<MatrixCombination>, MatrixError> {
     let mut combinations = Vec::new();
+    let include = matrix.include.literal("include")?;
+    let exclude = matrix.exclude.literal("exclude")?;
 
     // Step 1: Generate base combinations from parameter arrays
-    let param_combinations = generate_base_combinations(matrix)?;
+    let param_combinations = generate_base_combinations(matrix, include)?;
 
     // Step 2: Filter out any combinations that match the exclude patterns
-    let filtered_combinations = apply_exclude_filters(param_combinations, &matrix.exclude);
+    let filtered_combinations = apply_exclude_filters(param_combinations, exclude);
     combinations.extend(filtered_combinations);
 
     // Step 3: Process include entries per GitHub Actions semantics:
     // If an include entry matches all shared keys of an existing combination,
     // merge extra keys into it. Otherwise, add as a new standalone combination.
-    for include_item in &matrix.include {
+    for include_item in include {
         let mut merged = false;
         for combo in &mut combinations {
             let all_shared_keys_match = include_item.iter().all(|(key, value)| {
@@ -121,6 +189,7 @@ pub fn expand_matrix(matrix: &MatrixConfig) -> Result<Vec<MatrixCombination>, Ma
 /// Generates all possible combinations of the base matrix parameters
 fn generate_base_combinations(
     matrix: &MatrixConfig,
+    include: &[HashMap<String, Value>],
 ) -> Result<Vec<MatrixCombination>, MatrixError> {
     // Extract parameter arrays and prepare for combination generation
     let mut param_arrays: IndexMap<String, Vec<Value>> = IndexMap::new();
@@ -139,6 +208,10 @@ fn generate_base_combinations(
     }
 
     if param_arrays.is_empty() {
+        // A matrix may consist of nothing but `include` entries
+        if !include.is_empty() {
+            return Ok(Vec::new());
+        }
         return Err(MatrixError::InvalidParameterFormat(
             "Matrix has no valid parameters".to_string(),
         ));
@@ -295,8 +368,8 @@ mod tests {
         }
         MatrixConfig {
             parameters,
-            include: Vec::new(),
-            exclude: Vec::new(),
+            include: MatrixEntries::default(),
+            exclude: MatrixEntries::default(),
             max_parallel: None,
             fail_fast: Some(true),
         }
@@ -309,7 +382,7 @@ mod tests {
         let mut include_entry = HashMap::new();
         include_entry.insert("os".to_string(), val("ubuntu"));
         include_entry.insert("compiler".to_string(), val("gcc"));
-        matrix.include.push(include_entry);
+        matrix.include = MatrixEntries::List(vec![include_entry]);
 
         let combos = expand_matrix(&matrix).unwrap();
 
@@ -336,7 +409,7 @@ mod tests {
         let mut include_entry = HashMap::new();
         include_entry.insert("os".to_string(), val("macos"));
         include_entry.insert("special".to_string(), val("true"));
-        matrix.include.push(include_entry);
+        matrix.include = MatrixEntries::List(vec![include_entry]);
 
         let combos = expand_matrix(&matrix).unwrap();
 
@@ -361,7 +434,7 @@ mod tests {
         let mut include_entry = HashMap::new();
         include_entry.insert("os".to_string(), val("ubuntu"));
         include_entry.insert("extra".to_string(), val("yes"));
-        matrix.include.push(include_entry);
+        matrix.include = MatrixEntries::List(vec![include_entry]);
 
         let combos = expand_matrix(&matrix).unwrap();
 
@@ -392,7 +465,7 @@ mod tests {
         // Include entry with only keys that don't exist in base combos
         let mut include_entry = HashMap::new();
         include_entry.insert("arch".to_string(), val("arm64"));
-        matrix.include.push(include_entry);
+        matrix.include = MatrixEntries::List(vec![include_entry]);
 
         let combos = expand_matrix(&matrix).unwrap();
 
@@ -409,7 +482,7 @@ mod tests {
         let mut exclude_entry = HashMap::new();
         exclude_entry.insert("os".to_string(), val("windows"));
         exclude_entry.insert("node".to_string(), val("16"));
-        matrix.exclude.push(exclude_entry);
+        matrix.exclude = MatrixEntries::List(vec![exclude_entry]);
 
         let combos = expand_matrix(&matrix).unwrap();
 
@@ -418,5 +491,112 @@ mod tests {
         assert!(!combos.iter().any(|c| {
             c.values.get("os") == Some(&val("windows")) && c.values.get("node") == Some(&val("16"))
         }));
+    }
+
+    #[test]
+    fn include_only_matrix_expands_to_its_entries() {
+        let mut entry = HashMap::new();
+        entry.insert("os".to_string(), val("ubuntu"));
+        let matrix = MatrixConfig {
+            include: MatrixEntries::List(vec![entry]),
+            ..MatrixConfig::default()
+        };
+
+        let combos = expand_matrix(&matrix).unwrap();
+
+        assert_eq!(combos.len(), 1);
+        assert_eq!(combos[0].values.get("os"), Some(&val("ubuntu")));
+    }
+
+    #[test]
+    fn empty_matrix_is_still_an_error() {
+        assert!(expand_matrix(&MatrixConfig::default()).is_err());
+    }
+
+    #[test]
+    fn expressions_deserialize_alongside_axes() {
+        let matrix: MatrixConfig = serde_yaml::from_str(
+            "os: [ubuntu]\ninclude: ${{ fromJSON(needs.a.outputs.m) }}\nexclude:\n  - os: ubuntu\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            matrix.include,
+            MatrixEntries::Expression("${{ fromJSON(needs.a.outputs.m) }}".to_string())
+        );
+        assert!(matches!(matrix.exclude, MatrixEntries::List(ref l) if l.len() == 1));
+        assert!(matrix.parameters.contains_key("os"));
+    }
+
+    #[test]
+    fn expand_rejects_unresolved_expressions() {
+        let mut matrix = make_matrix(vec![("os", vec!["ubuntu"])]);
+        matrix.include = MatrixEntries::Expression("${{ x }}".to_string());
+
+        assert!(matches!(
+            expand_matrix(&matrix),
+            Err(MatrixError::ExpressionError(_))
+        ));
+    }
+
+    #[test]
+    fn resolved_include_merges_numbers_with_yaml_axes() {
+        let matrix: MatrixConfig =
+            serde_yaml::from_str("os: [ubuntu]\nnode: [14, 16]\ninclude: ${{ x }}\n").unwrap();
+
+        let resolved = matrix
+            .resolve_expressions(|_| Ok(r#"[{"node": 14, "npm": 6}]"#.to_string()))
+            .unwrap();
+        let combos = expand_matrix(&resolved).unwrap();
+
+        assert_eq!(combos.len(), 2);
+        assert_eq!(
+            combos
+                .iter()
+                .filter(|c| c.values.contains_key("npm"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn resolved_exclude_filters_combinations() {
+        let matrix: MatrixConfig =
+            serde_yaml::from_str("os: [ubuntu, windows]\nexclude: ${{ x }}\n").unwrap();
+
+        let resolved = matrix
+            .resolve_expressions(|_| Ok(r#"[{"os": "windows"}]"#.to_string()))
+            .unwrap();
+        let combos = expand_matrix(&resolved).unwrap();
+
+        assert_eq!(combos.len(), 1);
+        assert_eq!(combos[0].values.get("os"), Some(&val("ubuntu")));
+    }
+
+    #[test]
+    fn resolve_rejects_non_list_results() {
+        let matrix: MatrixConfig =
+            serde_yaml::from_str("os: [ubuntu]\ninclude: ${{ x }}\n").unwrap();
+
+        for bad in ["", "not json", "5", r#"{"os": "ubuntu"}"#, "[1, 2]"] {
+            let result = matrix.resolve_expressions(|_| Ok(bad.to_string()));
+            assert!(
+                matches!(result, Err(MatrixError::ExpressionError(_))),
+                "{:?} should be rejected",
+                bad
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_propagates_evaluation_errors() {
+        let matrix: MatrixConfig =
+            serde_yaml::from_str("os: [ubuntu]\ninclude: ${{ x }}\n").unwrap();
+
+        let err = matrix
+            .resolve_expressions(|_| Err("bad token".to_string()))
+            .unwrap_err();
+
+        assert!(err.to_string().contains("bad token"));
     }
 }

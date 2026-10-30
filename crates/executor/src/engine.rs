@@ -1934,8 +1934,19 @@ async fn execute_job_with_matrix(
 
     // Check if this is a matrix job
     if let Some(matrix_config) = job.matrix_config() {
+        // `include`/`exclude` may be expressions over upstream job outputs, which
+        // are only available now, so resolve them before expanding.
+        let matrix_config = resolve_matrix_expressions(
+            matrix_config,
+            env_context,
+            user_env,
+            &needs_ctx,
+            &needs_res,
+        )
+        .map_err(|e| ExecutionError::Execution(format!("Failed to expand matrix: {}", e)))?;
+
         // Expand the matrix into combinations
-        let combinations = wrkflw_matrix::expand_matrix(matrix_config)
+        let combinations = wrkflw_matrix::expand_matrix(&matrix_config)
             .map_err(|e| ExecutionError::Execution(format!("Failed to expand matrix: {}", e)))?;
 
         if combinations.is_empty() {
@@ -5463,6 +5474,33 @@ fn evaluate_job_condition(
         user_env,
     };
     evaluate_condition_with_context(&effective, &ctx)
+}
+
+/// Resolve `include`/`exclude` expressions of a matrix against the contexts
+/// available to `strategy:`, which runs before any step of the job.
+fn resolve_matrix_expressions(
+    matrix: &wrkflw_matrix::MatrixConfig,
+    env_context: &HashMap<String, String>,
+    user_env: &HashMap<String, String>,
+    needs_context: &HashMap<String, HashMap<String, String>>,
+    needs_results: &HashMap<String, String>,
+) -> Result<wrkflw_matrix::MatrixConfig, wrkflw_matrix::MatrixError> {
+    let ctx = crate::expression::ExpressionContext {
+        env_context,
+        step_outputs: &HashMap::new(),
+        matrix_combination: &None,
+        step_statuses: &HashMap::new(),
+        job_status: "success",
+        secrets_context: &HashMap::new(),
+        needs_context,
+        needs_results,
+        user_env,
+    };
+    matrix.resolve_expressions(|expr| {
+        let inner = crate::expression::strip_expression_wrapper(expr);
+        // `fromJSON` yields the JSON text itself, and objects render as JSON.
+        crate::expression::evaluate(inner, &ctx).map(|value| value.to_output_string())
+    })
 }
 
 /// Evaluate a job/step `if:` condition using the expression evaluator.

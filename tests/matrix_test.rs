@@ -1,7 +1,7 @@
 use indexmap::IndexMap;
 use serde_yaml::Value;
 use std::collections::HashMap;
-use wrkflw::matrix::{self, MatrixCombination, MatrixConfig};
+use wrkflw::matrix::{self, MatrixCombination, MatrixConfig, MatrixEntries};
 
 fn create_test_matrix() -> MatrixConfig {
     let mut matrix = MatrixConfig::default();
@@ -33,7 +33,7 @@ fn create_test_matrix() -> MatrixConfig {
         "node".to_string(),
         Value::Number(serde_yaml::Number::from(14)),
     );
-    matrix.exclude = vec![exclude_item];
+    matrix.exclude = MatrixEntries::List(vec![exclude_item]);
 
     // Add include pattern
     let mut include_item = HashMap::new();
@@ -43,7 +43,7 @@ fn create_test_matrix() -> MatrixConfig {
         Value::Number(serde_yaml::Number::from(18)),
     );
     include_item.insert("experimental".to_string(), Value::Bool(true));
-    matrix.include = vec![include_item];
+    matrix.include = MatrixEntries::List(vec![include_item]);
 
     // Set max-parallel
     matrix.max_parallel = Some(2);

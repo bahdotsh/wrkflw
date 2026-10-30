@@ -64,7 +64,7 @@ struct Wrkflw {
 enum Commands {
     /// Validate workflow or pipeline files
     Validate {
-        /// Path(s) to workflow/pipeline file(s) or directory(ies) (defaults to .github/workflows if none provided)
+        /// Path(s) to workflow/pipeline file(s) or directory(ies) (defaults to .gitea/workflows and .github/workflows if none provided)
         #[arg(value_name = "path", num_args = 0..)]
         paths: Vec<PathBuf>,
 
@@ -175,7 +175,7 @@ enum Commands {
     /// after ~10s — long enough for normal teardown, short enough
     /// that a hung subprocess cannot wedge the session.
     Watch {
-        /// Path to workflow file or directory (defaults to .github/workflows)
+        /// Path to workflow file or directory (defaults to .gitea/workflows if it exists, else .github/workflows)
         path: Option<PathBuf>,
 
         /// Container runtime to use (docker, podman, emulation, secure-emulation)
@@ -260,7 +260,7 @@ enum Commands {
     /// Open TUI interface to manage workflows
     #[cfg(feature = "tui")]
     Tui {
-        /// Path to workflow file or directory (defaults to .github/workflows)
+        /// Path to workflow file or directory (defaults to .gitea/workflows and .github/workflows)
         path: Option<PathBuf>,
 
         /// Container runtime to use (docker, podman, emulation, secure-emulation)
@@ -489,9 +489,16 @@ async fn main() {
             exit_code,
             no_exit_code,
         }) => {
-            // Determine the paths to validate (default to .github/workflows when none provided)
+            // Determine the paths to validate. With none provided, cover every
+            // default directory that exists; if there are none, fall through
+            // with the conventional path so the "does not exist" error names it.
             let validate_paths: Vec<PathBuf> = if paths.is_empty() {
-                vec![PathBuf::from(".github/workflows")]
+                let dirs = wrkflw_utils::default_workflow_dirs();
+                if dirs.is_empty() {
+                    vec![wrkflw_utils::default_workflow_dir()]
+                } else {
+                    dirs
+                }
             } else {
                 paths.clone()
             };
@@ -789,87 +796,101 @@ fn validate_gitlab_pipeline(path: &Path, verbose: bool) -> bool {
     }
 }
 
-/// List available workflows and pipelines in the repository
-fn list_workflows_and_pipelines(verbose: bool, show_jobs: bool) {
+/// Print the workflow files in `dir`, optionally with their job names.
+fn list_workflow_dir(dir: &Path, show_jobs: bool) {
     use colored::Colorize;
     use wrkflw_ui::cli_style;
 
-    // Check for GitHub workflows
-    let github_path = PathBuf::from(".github/workflows");
-    if github_path.exists() && github_path.is_dir() {
-        println!("{}", "GitHub Workflows".bold().cyan());
+    match std::fs::read_dir(dir) {
+        Ok(rd) => {
+            let entries: Vec<_> = rd
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| {
+                    entry.path().is_file()
+                        && entry
+                            .path()
+                            .extension()
+                            .is_some_and(|ext| ext == "yml" || ext == "yaml")
+                })
+                .collect();
 
-        match std::fs::read_dir(&github_path) {
-            Ok(rd) => {
-                let entries: Vec<_> = rd
-                    .filter_map(|entry| entry.ok())
-                    .filter(|entry| {
-                        entry.path().is_file()
-                            && entry
-                                .path()
-                                .extension()
-                                .is_some_and(|ext| ext == "yml" || ext == "yaml")
-                    })
-                    .collect();
-
-                if entries.is_empty() {
-                    println!(
-                        "{}",
-                        cli_style::dim("  No workflow files found in .github/workflows")
-                    );
-                } else {
-                    for (i, entry) in entries.iter().enumerate() {
-                        let is_last = i == entries.len() - 1;
-                        let connector = if is_last {
-                            "\u{2514}\u{2500}\u{2500}"
-                        } else {
-                            "\u{251C}\u{2500}\u{2500}"
-                        };
-                        println!("{} {}", connector.dimmed(), entry.path().display());
-                        if show_jobs {
-                            let prefix = if is_last { "    " } else { "\u{2502}   " };
-                            match wrkflw_parser::workflow::parse_workflow(&entry.path()) {
-                                Ok(workflow) => {
-                                    let mut job_names: Vec<&String> =
-                                        workflow.jobs.keys().collect();
-                                    job_names.sort();
-                                    println!(
-                                        "{}{}",
-                                        prefix.dimmed(),
-                                        format!(
-                                            "Jobs: {}",
-                                            job_names
-                                                .iter()
-                                                .map(|s| s.as_str())
-                                                .collect::<Vec<_>>()
-                                                .join(", ")
-                                        )
-                                        .dimmed()
-                                    );
-                                }
-                                Err(e) => {
-                                    eprintln!("{}Could not parse workflow: {}", prefix, e);
-                                }
+            if entries.is_empty() {
+                println!(
+                    "{}",
+                    cli_style::dim(&format!("  No workflow files found in {}", dir.display()))
+                );
+            } else {
+                for (i, entry) in entries.iter().enumerate() {
+                    let is_last = i == entries.len() - 1;
+                    let connector = if is_last {
+                        "\u{2514}\u{2500}\u{2500}"
+                    } else {
+                        "\u{251C}\u{2500}\u{2500}"
+                    };
+                    println!("{} {}", connector.dimmed(), entry.path().display());
+                    if show_jobs {
+                        let prefix = if is_last { "    " } else { "\u{2502}   " };
+                        match wrkflw_parser::workflow::parse_workflow(&entry.path()) {
+                            Ok(workflow) => {
+                                let mut job_names: Vec<&String> = workflow.jobs.keys().collect();
+                                job_names.sort();
+                                println!(
+                                    "{}{}",
+                                    prefix.dimmed(),
+                                    format!(
+                                        "Jobs: {}",
+                                        job_names
+                                            .iter()
+                                            .map(|s| s.as_str())
+                                            .collect::<Vec<_>>()
+                                            .join(", ")
+                                    )
+                                    .dimmed()
+                                );
+                            }
+                            Err(e) => {
+                                eprintln!("{}Could not parse workflow: {}", prefix, e);
                             }
                         }
                     }
                 }
             }
-            Err(e) => {
-                eprintln!(
-                    "{}",
-                    cli_style::error(&format!(
-                        "Failed to read directory {}: {}",
-                        github_path.display(),
-                        e
-                    ))
-                );
-            }
         }
-    } else {
+        Err(e) => {
+            eprintln!(
+                "{}",
+                cli_style::error(&format!(
+                    "Failed to read directory {}: {}",
+                    dir.display(),
+                    e
+                ))
+            );
+        }
+    }
+}
+
+/// List available workflows and pipelines in the repository
+fn list_workflows_and_pipelines(verbose: bool, show_jobs: bool) {
+    use colored::Colorize;
+    use wrkflw_ui::cli_style;
+
+    // Check for Gitea and GitHub workflows
+    let dirs = wrkflw_utils::default_workflow_dirs();
+    for dir in &dirs {
+        let title = if dir.starts_with(".gitea") {
+            "Gitea Workflows"
+        } else {
+            "GitHub Workflows"
+        };
+        println!("{}", title.bold().cyan());
+        list_workflow_dir(dir, show_jobs);
+    }
+    if dirs.is_empty() {
         println!(
             "{}",
-            cli_style::dim("GitHub Workflows: No .github/workflows directory found")
+            cli_style::dim(
+                "GitHub/Gitea Workflows: No .github/workflows or .gitea/workflows directory found"
+            )
         );
     }
 

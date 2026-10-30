@@ -1,6 +1,6 @@
 # Codebase Index: wrkflw
 
-> Generated: 2026-10-30 09:32:28 UTC | Files: 205 | Lines: 76868
+> Generated: 2026-10-30 10:15:01 UTC | Files: 205 | Lines: 77306
 > Languages: JSON (4), Markdown (24), Rust (116), Shell (5), TOML (18), YAML (38)
 
 ## Directory Structure
@@ -288,12 +288,12 @@ wrkflw/
 
 **README.md**
 - `# WRKFLW`
-- `# Launch the TUI (auto-detects .github/workflows)`
+- `# Launch the TUI (auto-detects .gitea/workflows and .github/workflows)`
 - `# Validate workflows`
 - `# Run a workflow`
 - `# Rerun workflows automatically on file changes`
 - `# List detected workflows and pipelines`
-- `# Validate all workflows in .github/workflows`
+- `# Validate all workflows in .gitea/workflows and .github/workflows`
 - `# Validate specific files or directories`
 - `# Validate multiple paths`
 - `# GitLab pipelines`
@@ -1007,6 +1007,11 @@ wrkflw/
 - `## wrkflw-utils`
 
 **crates/utils/src/lib.rs**
+- `pub const GITHUB_WORKFLOWS_DIR: &str = ".github/workflows"`
+- `pub const GITEA_WORKFLOWS_DIR: &str = ".gitea/workflows"`
+- `pub fn default_workflow_dirs_in(root: &Path) -> Vec<PathBuf>`
+- `pub fn default_workflow_dirs() -> Vec<PathBuf>`
+- `pub fn default_workflow_dir() -> PathBuf`
 - `pub fn is_workflow_file(path: &Path) -> bool`
 - `pub mod fd`
 
@@ -1417,7 +1422,7 @@ wrkflw/
 
 ## INDEX.md
 
-**Language:** Markdown | **Size:** 145.0 KB | **Lines:** 5741
+**Language:** Markdown | **Size:** 153.9 KB | **Lines:** 6039
 
 **Declarations:**
 
@@ -1425,7 +1430,7 @@ wrkflw/
 
 ## README.md
 
-**Language:** Markdown | **Size:** 11.0 KB | **Lines:** 293
+**Language:** Markdown | **Size:** 11.4 KB | **Lines:** 295
 
 **Declarations:**
 
@@ -1742,7 +1747,7 @@ wrkflw/
 
 ## crates/executor/src/engine.rs
 
-**Language:** Rust | **Size:** 383.7 KB | **Lines:** 10566
+**Language:** Rust | **Size:** 384.4 KB | **Lines:** 10583
 
 **Imports:**
 - `bollard::Docker`
@@ -2042,7 +2047,7 @@ wrkflw/
 
 ## crates/executor/src/expression.rs
 
-**Language:** Rust | **Size:** 112.5 KB | **Lines:** 2791
+**Language:** Rust | **Size:** 113.2 KB | **Lines:** 2809
 
 **Imports:**
 - `serde_yaml::Value`
@@ -2767,7 +2772,7 @@ wrkflw/
 
 ## crates/runtime/src/emulation.rs
 
-**Language:** Rust | **Size:** 31.3 KB | **Lines:** 855
+**Language:** Rust | **Size:** 32.1 KB | **Lines:** 872
 
 **Imports:**
 - `crate::container::{
@@ -3757,7 +3762,7 @@ wrkflw/
 
 ## crates/ui/src/app/mod.rs
 
-**Language:** Rust | **Size:** 31.4 KB | **Lines:** 695
+**Language:** Rust | **Size:** 31.5 KB | **Lines:** 699
 
 **Imports:**
 - `crate::handlers::workflow::start_next_workflow_execution`
@@ -4370,7 +4375,7 @@ wrkflw/
 
 ## crates/ui/src/utils/mod.rs
 
-**Language:** Rust | **Size:** 3.0 KB | **Lines:** 84
+**Language:** Rust | **Size:** 2.9 KB | **Lines:** 84
 
 **Imports:**
 - `crate::models::{Workflow, WorkflowStatus}`
@@ -4797,10 +4802,10 @@ wrkflw/
 
 ## crates/utils/src/lib.rs
 
-**Language:** Rust | **Size:** 6.8 KB | **Lines:** 199
+**Language:** Rust | **Size:** 9.0 KB | **Lines:** 253
 
 **Imports:**
-- `std::path::Path`
+- `std::path::{Path, PathBuf}`
 
 **Declarations:**
 
@@ -5346,7 +5351,7 @@ wrkflw/
 
 ## crates/wrkflw/src/main.rs
 
-**Language:** Rust | **Size:** 36.4 KB | **Lines:** 980
+**Language:** Rust | **Size:** 36.8 KB | **Lines:** 1001
 
 **Imports:**
 - `bollard::Docker`
@@ -5389,6 +5394,8 @@ wrkflw/
 `fn validate_github_workflow(path: &Path, verbose: bool) -> bool`
 
 `fn validate_gitlab_pipeline(path: &Path, verbose: bool) -> bool`
+
+`fn list_workflow_dir(dir: &Path, show_jobs: bool)`
 
 `fn list_workflows_and_pipelines(verbose: bool, show_jobs: bool)`
 
@@ -5445,7 +5452,7 @@ wrkflw/
 
 ## crates/wrkflw/src/watch_cmd.rs
 
-**Language:** Rust | **Size:** 10.3 KB | **Lines:** 248
+**Language:** Rust | **Size:** 10.6 KB | **Lines:** 255
 
 **Imports:**
 - `crate::prefilter`

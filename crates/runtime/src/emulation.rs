@@ -440,6 +440,7 @@ fn copy_directory_contents_with_gitignore(
         if file_name_str.starts_with(".")
             && file_name_str != ".gitignore"
             && file_name_str != ".github"
+            && file_name_str != ".gitea"
             && !file_name_str.starts_with(".env")
         {
             continue;
@@ -752,6 +753,22 @@ pub fn get_tracked_processes() -> Vec<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workspace_copy_keeps_forge_dirs_and_skips_other_hidden_dirs() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        for dir in [".gitea/workflows", ".github/workflows", ".cache"] {
+            std::fs::create_dir_all(src.path().join(dir)).unwrap();
+            std::fs::write(src.path().join(dir).join("ci.yml"), "x").unwrap();
+        }
+
+        copy_directory_contents(src.path(), dst.path()).unwrap();
+
+        assert!(dst.path().join(".gitea/workflows/ci.yml").is_file());
+        assert!(dst.path().join(".github/workflows/ci.yml").is_file());
+        assert!(!dst.path().join(".cache").exists());
+    }
 
     #[tokio::test]
     async fn test_nonzero_exit_code_returns_ok() {

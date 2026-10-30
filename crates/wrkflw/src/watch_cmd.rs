@@ -44,10 +44,17 @@ pub(crate) struct WatchCtx {
 /// observes a shutdown signal cleanly.
 pub(crate) async fn run(ctx: WatchCtx) {
     let strict_filter = prefilter::effective_strict_filter(ctx.strict_filter, ctx.no_strict_filter);
-    let workflow_dir = ctx
-        .path
-        .clone()
-        .unwrap_or_else(|| PathBuf::from(".github/workflows"));
+    let workflow_dir = ctx.path.clone().unwrap_or_else(|| {
+        let default_dirs = wrkflw_utils::default_workflow_dirs();
+        if let [watched, skipped, ..] = default_dirs.as_slice() {
+            eprintln!(
+                "Note: watching {}; pass {} as the path to watch it instead.",
+                watched.display(),
+                skipped.display()
+            );
+        }
+        wrkflw_utils::default_workflow_dir()
+    });
     if !workflow_dir.exists() {
         eprintln!(
             "Error: workflow directory not found: {}",

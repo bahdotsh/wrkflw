@@ -28,9 +28,9 @@ pub fn extract_job_names(path: &Path) -> Vec<String> {
 pub fn load_workflows(dir_path: &Path) -> Vec<Workflow> {
     let mut workflows = Vec::new();
 
-    // Default path is .github/workflows
-    let default_workflows_dir = Path::new(".github").join("workflows");
-    let is_default_dir = dir_path == default_workflows_dir || dir_path.ends_with("workflows");
+    // Any `workflows` directory counts, which covers both .github/workflows
+    // and .gitea/workflows.
+    let is_default_dir = dir_path.ends_with("workflows");
 
     if let Ok(entries) = std::fs::read_dir(dir_path) {
         for entry in entries.flatten() {

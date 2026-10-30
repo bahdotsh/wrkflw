@@ -73,8 +73,8 @@ pub async fn run_wrkflw_tui(
     }
 
     // Load workflows
-    let dir_path = match path {
-        Some(path) if path.is_dir() => path.clone(),
+    let dir_paths = match path {
+        Some(path) if path.is_dir() => vec![path.clone()],
         Some(path) if path.is_file() => {
             // Single workflow file
             let name = path
@@ -115,16 +115,20 @@ pub async fn run_wrkflw_tui(
             app.start_execution();
 
             // Return parent dir or current dir if no parent
-            path.parent()
+            vec![path
+                .parent()
                 .map(|p| p.to_path_buf())
-                .unwrap_or_else(|| PathBuf::from("."))
+                .unwrap_or_else(|| PathBuf::from("."))]
         }
-        _ => PathBuf::from(".github/workflows"),
+        _ => wrkflw_utils::default_workflow_dirs(),
     };
 
     // Only load directory if we haven't already loaded a single file
     if app.workflows.is_empty() {
-        app.workflows = load_workflows(&dir_path);
+        app.workflows = dir_paths
+            .iter()
+            .flat_map(|dir| load_workflows(dir))
+            .collect();
     }
 
     // Run the main event loop

@@ -14,6 +14,7 @@ categories.workspace = true
 # Internal crates
 wrkflw-models.workspace = true
 wrkflw-matrix.workspace = true
+wrkflw-logging.workspace = true
 
 # External dependencies
 jsonschema.workspace = true
@@ -21,6 +22,8 @@ serde.workspace = true
 serde_yaml.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+regex.workspace = true
+glob.workspace = true
 
 [dev-dependencies]
 tempfile = "3.7"

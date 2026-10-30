@@ -3664,12 +3664,15 @@ dependencies = [
 name = "wrkflw-parser"
 version = "0.8.0"
 dependencies = [
+ "glob",
  "jsonschema",
+ "regex",
  "serde",
  "serde_json",
  "serde_yaml",
  "tempfile",
  "thiserror",
+ "wrkflw-logging",
  "wrkflw-matrix",
  "wrkflw-models",
 ]

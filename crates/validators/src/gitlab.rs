@@ -40,9 +40,9 @@ fn validate_jobs(jobs: &HashMap<String, Job>, result: &mut ValidationResult) {
         }
 
         // Check for script or extends
-        if job.script.is_none() && job.extends.is_none() {
+        if job.script.is_none() && job.extends.is_none() && job.trigger.is_none() {
             result.add_issue(format!(
-                "Job '{}' must have a script section or extend another job",
+                "Job '{}' must have a script or trigger section or extend another job",
                 job_name
             ));
         }

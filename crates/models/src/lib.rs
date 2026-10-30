@@ -164,7 +164,7 @@ pub mod gitlab {
 
         /// Allow job failure
         #[serde(skip_serializing_if = "Option::is_none")]
-        pub allow_failure: Option<bool>,
+        pub allow_failure: Option<AllowFailure>,
 
         /// Services to run alongside the job
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -237,6 +237,33 @@ pub mod gitlab {
         /// Whether the job can be interrupted by a newer pipeline
         #[serde(skip_serializing_if = "Option::is_none")]
         pub interruptible: Option<bool>,
+
+        /// Downstream pipeline to trigger instead of running a script
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub trigger: Option<serde_yaml::Value>,
+    }
+
+    /// Whether a job may fail without failing the pipeline
+    #[derive(Debug, Serialize, Deserialize, Clone)]
+    #[serde(untagged)]
+    pub enum AllowFailure {
+        /// Allow (or disallow) failure for any exit code
+        Bool(bool),
+        /// Allow failure only for specific exit codes
+        ExitCodes {
+            /// A single exit code or a list of exit codes
+            exit_codes: ExitCodes,
+        },
+    }
+
+    /// One or more process exit codes
+    #[derive(Debug, Serialize, Deserialize, Clone)]
+    #[serde(untagged)]
+    pub enum ExitCodes {
+        /// A single exit code
+        Single(i32),
+        /// A list of exit codes
+        Multiple(Vec<i32>),
     }
 
     /// Docker image configuration

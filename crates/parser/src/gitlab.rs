@@ -1,7 +1,7 @@
+use crate::gitlab_config;
 use crate::schema::{SchemaType, SchemaValidator};
 use crate::workflow;
 use std::collections::HashMap;
-use std::fs;
 use std::path::Path;
 use thiserror::Error;
 use wrkflw_models::gitlab::Pipeline;
@@ -23,19 +23,26 @@ pub enum GitlabParserError {
 }
 
 /// Parse a GitLab CI/CD pipeline file
+///
+/// Local includes, `spec:inputs`, `extends`, `!reference` tags and hidden
+/// (`.`-prefixed) templates are resolved first, so the returned pipeline
+/// contains only the jobs GitLab would actually create.
 pub fn parse_pipeline(pipeline_path: &Path) -> Result<Pipeline, GitlabParserError> {
-    // Read the pipeline file
-    let pipeline_content = fs::read_to_string(pipeline_path)?;
+    // Assemble the full configuration from the pipeline file and its includes
+    let config =
+        gitlab_config::load_pipeline(pipeline_path).map_err(GitlabParserError::InvalidStructure)?;
 
     // Validate against schema
     let validator = SchemaValidator::new().map_err(GitlabParserError::SchemaValidationError)?;
+    let config_json = serde_json::to_value(&config)
+        .map_err(|e| GitlabParserError::InvalidStructure(e.to_string()))?;
 
     validator
-        .validate_with_specific_schema(&pipeline_content, SchemaType::GitLab)
+        .validate_json(&config_json, SchemaType::GitLab)
         .map_err(GitlabParserError::SchemaValidationError)?;
 
-    // Parse the pipeline YAML
-    let pipeline: Pipeline = serde_yaml::from_str(&pipeline_content)?;
+    // Parse the resolved configuration
+    let pipeline: Pipeline = serde_yaml::from_value(config)?;
 
     // Return the parsed pipeline
     Ok(pipeline)
@@ -58,9 +65,9 @@ pub fn validate_pipeline_structure(pipeline: &Pipeline) -> ValidationResult {
         }
 
         // Check for script or extends
-        if job.script.is_none() && job.extends.is_none() {
+        if job.script.is_none() && job.extends.is_none() && job.trigger.is_none() {
             result.add_issue(format!(
-                "Job '{}' must have a script section or extend another job",
+                "Job '{}' must have a script or trigger section or extend another job",
                 job_name
             ));
         }
@@ -223,6 +230,7 @@ pub fn convert_to_workflow_format(pipeline: &Pipeline) -> workflow::WorkflowDefi
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     // use std::path::PathBuf; // unused
     use tempfile::NamedTempFile;
 
@@ -264,5 +272,58 @@ test_job:
         let test_job = pipeline.jobs.get("test_job").unwrap();
         assert_eq!(test_job.stage.as_ref().unwrap(), "test");
         assert_eq!(test_job.script.as_ref().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_parse_pipeline_with_templates_and_includes() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".gitlab")).unwrap();
+        fs::write(
+            dir.path().join(".gitlab/templates.yml"),
+            r#"
+.build_template:
+  stage: build
+  script:
+    - make build
+  allow_failure:
+    exit_codes: [47]
+"#,
+        )
+        .unwrap();
+        let path = dir.path().join(".gitlab-ci.yml");
+        fs::write(
+            &path,
+            r#"
+include:
+  - local: .gitlab/templates.yml
+
+stages:
+  - build
+  - deploy
+
+build_job:
+  extends: .build_template
+
+downstream:
+  stage: deploy
+  trigger:
+    project: group/downstream
+"#,
+        )
+        .unwrap();
+
+        let pipeline = parse_pipeline(&path).unwrap();
+
+        let mut names: Vec<_> = pipeline.jobs.keys().cloned().collect();
+        names.sort();
+        assert_eq!(names, ["build_job", "downstream"]);
+
+        let build_job = &pipeline.jobs["build_job"];
+        assert_eq!(build_job.stage.as_deref(), Some("build"));
+        assert_eq!(build_job.script.as_ref().unwrap(), &["make build"]);
+        assert!(build_job.extends.is_none());
+
+        let result = validate_pipeline_structure(&pipeline);
+        assert!(result.is_valid, "{:?}", result.issues);
     }
 }

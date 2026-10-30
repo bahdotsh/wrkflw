@@ -87,10 +87,19 @@ impl SchemaValidator {
         let workflow_json: Value =
             serde_yaml::from_str(content).map_err(|e| format!("Failed to parse YAML: {}", e))?;
 
+        self.validate_json(&workflow_json, schema_type)
+    }
+
+    /// Validate an already-parsed document against the given schema.
+    pub fn validate_json(
+        &self,
+        workflow_json: &Value,
+        schema_type: SchemaType,
+    ) -> Result<(), String> {
         // Validate against the appropriate schema
         let validation_result = match schema_type {
-            SchemaType::GitHub => self.github_schema.validate(&workflow_json),
-            SchemaType::GitLab => self.gitlab_schema.validate(&workflow_json),
+            SchemaType::GitHub => self.github_schema.validate(workflow_json),
+            SchemaType::GitLab => self.gitlab_schema.validate(workflow_json),
         };
 
         // Handle validation errors
@@ -101,7 +110,12 @@ impl SchemaValidator {
             };
             let mut error_msg = format!("{} validation failed:\n", schema_name);
             for error in errors {
-                error_msg.push_str(&format!("- {}\n", error));
+                let path = error.instance_path.to_string();
+                if path.is_empty() {
+                    error_msg.push_str(&format!("- {}\n", error));
+                } else {
+                    error_msg.push_str(&format!("- {}: {}\n", path, error));
+                }
             }
             return Err(error_msg);
         }

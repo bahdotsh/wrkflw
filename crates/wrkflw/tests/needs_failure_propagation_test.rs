@@ -1,3 +1,8 @@
+// These tests run real `bash` steps through the emulation runtime. On
+// windows-latest `bash` resolves to the WSL launcher, which has no distribution
+// installed, so every step fails. Engine unit tests use the same gate.
+#![cfg(not(target_os = "windows"))]
+
 use std::fs;
 use tempfile::tempdir;
 use wrkflw_lib::executor::engine::{

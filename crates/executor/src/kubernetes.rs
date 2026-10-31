@@ -294,11 +294,11 @@ struct PodGuard {
 }
 
 impl PodGuard {
-    fn new(pod: PodRef) -> Self {
+    fn new(pod: PodRef, kubectl: OsString) -> Self {
         track_pod(&pod);
         PodGuard {
             pod,
-            kubectl: "kubectl".into(),
+            kubectl,
             armed: true,
         }
     }
@@ -704,6 +704,11 @@ fn pod_failure_message(pod: &Value) -> String {
 pub struct KubernetesRuntime {
     config: KubernetesConfig,
     preserve_pods_on_failure: bool,
+    kubectl: OsString,
+    /// Arguments placed before every kubectl command line. Lets tests run a
+    /// script through `sh`, which unlike a freshly written executable cannot
+    /// fail with `ETXTBSY` when another test forks at the wrong moment.
+    kubectl_prefix: Vec<String>,
 }
 
 impl KubernetesRuntime {
@@ -713,11 +718,15 @@ impl KubernetesRuntime {
         KubernetesRuntime {
             config,
             preserve_pods_on_failure,
+            kubectl: "kubectl".into(),
+            kubectl_prefix: Vec::new(),
         }
     }
 
     fn kubectl_args(&self) -> Vec<String> {
-        self.config.kubectl_args()
+        let mut args = self.kubectl_prefix.clone();
+        args.extend(self.config.kubectl_args());
+        args
     }
 
     /// Run `kubectl <args>` to completion, feeding `stdin` if given.
@@ -726,7 +735,7 @@ impl KubernetesRuntime {
         args: &[&str],
         stdin: Option<Vec<u8>>,
     ) -> Result<std::process::Output, ContainerError> {
-        let mut cmd = Command::new("kubectl");
+        let mut cmd = Command::new(&self.kubectl);
         cmd.args(self.kubectl_args()).args(args);
         cmd.stdin(if stdin.is_some() {
             Stdio::piped()
@@ -905,10 +914,11 @@ impl KubernetesRuntime {
             ));
             return Ok(());
         }
+        let kubectl = self.kubectl.clone();
         let base = self.kubectl_args();
         let pod = name.to_string();
         let mount = mount.clone();
-        tokio::task::spawn_blocking(move || copy_dir_into_pod(&base, &pod, &mount))
+        tokio::task::spawn_blocking(move || copy_dir_into_pod(&kubectl, &base, &pod, &mount))
             .await
             .map_err(|e| ContainerError::ContainerExecution(format!("copy task failed: {}", e)))?
     }
@@ -923,12 +933,15 @@ impl KubernetesRuntime {
         if !mount.host.is_absolute() {
             return Ok(());
         }
+        let kubectl = self.kubectl.clone();
         let base = self.kubectl_args();
         let pod = name.to_string();
         let mount = mount.clone();
-        tokio::task::spawn_blocking(move || copy_dir_out_of_pod(&base, &pod, &mount, &excludes))
-            .await
-            .map_err(|e| ContainerError::ContainerExecution(format!("copy task failed: {}", e)))?
+        tokio::task::spawn_blocking(move || {
+            copy_dir_out_of_pod(&kubectl, &base, &pod, &mount, &excludes)
+        })
+        .await
+        .map_err(|e| ContainerError::ContainerExecution(format!("copy task failed: {}", e)))?
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -961,10 +974,13 @@ impl KubernetesRuntime {
         wrkflw_logging::debug(&format!("Working directory: {}", working_dir.display()));
 
         // Armed before the pod exists: cancellation can land inside `create`.
-        let mut guard = PodGuard::new(PodRef {
-            kubectl_args: self.kubectl_args(),
-            name: name.to_string(),
-        });
+        let mut guard = PodGuard::new(
+            PodRef {
+                kubectl_args: self.kubectl_args(),
+                name: name.to_string(),
+            },
+            self.kubectl.clone(),
+        );
         let result = self.run_pod(name, &manifest, working_dir, &mounts).await;
 
         match &result {
@@ -1195,12 +1211,13 @@ fn drain_stderr(child: &mut std::process::Child) -> std::thread::JoinHandle<Stri
 
 /// Blocking: tar `mount.host` and pipe it into `tar -x` in the wait container.
 fn copy_dir_into_pod(
+    kubectl: &OsStr,
     kubectl_args: &[String],
     pod: &str,
     mount: &Mount,
 ) -> Result<(), ContainerError> {
     let dest = mount.container.to_string_lossy().to_string();
-    let mut command = std::process::Command::new("kubectl");
+    let mut command = std::process::Command::new(kubectl);
     command.args(kubectl_args).args([
         "exec",
         "-i",
@@ -1419,6 +1436,7 @@ fn prune_unlisted(
 
 /// Blocking: run `tar -c` in the sync container and unpack it onto `mount.host`.
 fn copy_dir_out_of_pod(
+    kubectl: &OsStr,
     kubectl_args: &[String],
     pod: &str,
     mount: &Mount,
@@ -1438,7 +1456,7 @@ fn copy_dir_out_of_pod(
     }
     tar_args.extend(["-cf".into(), "-".into(), ".".into()]);
 
-    let mut command = std::process::Command::new("kubectl");
+    let mut command = std::process::Command::new(kubectl);
     command
         .args(kubectl_args)
         .args(["exec", pod, "-c", SYNC_CONTAINER, "--"])
@@ -2493,16 +2511,17 @@ mod tests {
     /// A guard whose "kubectl" records its arguments in `log` instead.
     #[cfg(unix)]
     fn recording_guard(name: &str, log: &Path) -> PodGuard {
-        let mut guard = PodGuard::new(PodRef {
-            kubectl_args: vec![
-                "-c".into(),
-                format!("echo \"$@\" > {}.tmp && mv {0}.tmp {0}", log.display()),
-                "sh".into(),
-            ],
-            name: name.into(),
-        });
-        guard.kubectl = "sh".into();
-        guard
+        PodGuard::new(
+            PodRef {
+                kubectl_args: vec![
+                    "-c".into(),
+                    format!("echo \"$@\" > {}.tmp && mv {0}.tmp {0}", log.display()),
+                    "sh".into(),
+                ],
+                name: name.into(),
+            },
+            "sh".into(),
+        )
     }
 
     #[cfg(unix)]

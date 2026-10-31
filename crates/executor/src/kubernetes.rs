@@ -512,6 +512,19 @@ fn pod_name() -> String {
     format!("wrkflw-{}", uuid::Uuid::new_v4().simple())
 }
 
+/// How long to wait before asking about a pod again.
+///
+/// Every poll is a new `kubectl` process, which re-runs the kubeconfig's exec
+/// credential plugin: on EKS that is an STS call. Short steps stay snappy and
+/// a long training run does not cost one of those per second.
+fn poll_interval(elapsed: Duration) -> Duration {
+    match elapsed.as_secs() {
+        0..=9 => Duration::from_millis(500),
+        10..=59 => Duration::from_secs(1),
+        _ => Duration::from_secs(5),
+    }
+}
+
 /// `status.<list>[name == container].state`, if reported yet.
 fn container_state<'a>(pod: &'a Value, list: &str, container: &str) -> Option<&'a Value> {
     pod.pointer(&format!("/status/{}", list))?
@@ -724,6 +737,7 @@ impl KubernetesRuntime {
     /// Block until the wait container runs, so volumes can be streamed into it.
     async fn wait_for_init_running(&self, name: &str) -> Result<(), ContainerError> {
         let mut warned_unschedulable = false;
+        let started = std::time::Instant::now();
         loop {
             let pod = self.get_pod(name).await?;
             if let Some(reason) = fatal_waiting_reason(&pod) {
@@ -758,12 +772,13 @@ impl KubernetesRuntime {
                     warned_unschedulable = true;
                 }
             }
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            tokio::time::sleep(poll_interval(started.elapsed())).await;
         }
     }
 
     /// Block until the step container has exited, returning its exit code.
     async fn wait_for_main_terminated(&self, name: &str) -> Result<i32, ContainerError> {
+        let started = std::time::Instant::now();
         loop {
             let pod = self.get_pod(name).await?;
             if let Some(code) =
@@ -784,7 +799,7 @@ impl KubernetesRuntime {
                     pod_failure_message(&pod)
                 )));
             }
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            tokio::time::sleep(poll_interval(started.elapsed())).await;
         }
     }
 
@@ -2116,6 +2131,19 @@ mod tests {
         assert!(name
             .chars()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'));
+    }
+
+    #[test]
+    fn polling_backs_off_as_a_step_runs() {
+        assert_eq!(poll_interval(Duration::ZERO), Duration::from_millis(500));
+        assert_eq!(
+            poll_interval(Duration::from_secs(30)),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            poll_interval(Duration::from_secs(3600)),
+            Duration::from_secs(5)
+        );
     }
 
     fn pod_status(status: Value) -> Value {

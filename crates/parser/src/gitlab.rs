@@ -1,10 +1,11 @@
 use crate::gitlab_config;
 use crate::schema::{SchemaType, SchemaValidator};
 use crate::workflow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use thiserror::Error;
-use wrkflw_models::gitlab::Pipeline;
+use wrkflw_matrix::{MatrixConfig, MatrixEntries};
+use wrkflw_models::gitlab::{Parallel, Pipeline};
 use wrkflw_models::ValidationResult;
 
 #[derive(Error, Debug)]
@@ -118,6 +119,67 @@ pub fn validate_pipeline_structure(pipeline: &Pipeline) -> ValidationResult {
     result
 }
 
+/// Run a job once per `parallel` instance through a matrix, exposing each
+/// instance's variables as environment variables, as GitLab does.
+fn apply_parallel(job: &mut workflow::Job, parallel: &Parallel) {
+    let combinations: Vec<HashMap<String, serde_yaml::Value>> = match parallel {
+        Parallel::Count(total) => {
+            job.env
+                .insert("CI_NODE_TOTAL".to_string(), total.to_string());
+            (1..=*total)
+                .map(|index| {
+                    HashMap::from([(
+                        "CI_NODE_INDEX".to_string(),
+                        serde_yaml::Value::from(index as u64),
+                    )])
+                })
+                .collect()
+        }
+        Parallel::Matrix { matrix } => matrix.iter().flat_map(expand_parallel_entry).collect(),
+    };
+
+    let variables: HashSet<&String> = combinations.iter().flat_map(HashMap::keys).collect();
+    for variable in variables {
+        job.env
+            .insert(variable.clone(), format!("${{{{ matrix.{} }}}}", variable));
+    }
+    // GitLab runs every instance even when one fails.
+    job.strategy = Some(workflow::Strategy {
+        matrix: Some(MatrixConfig {
+            include: MatrixEntries::List(combinations),
+            ..MatrixConfig::default()
+        }),
+        fail_fast: Some(false),
+        max_parallel: None,
+    });
+}
+
+/// The Cartesian product of one `parallel:matrix` entry's variables.
+fn expand_parallel_entry(
+    entry: &HashMap<String, serde_yaml::Value>,
+) -> Vec<HashMap<String, serde_yaml::Value>> {
+    let mut variables: Vec<_> = entry.iter().collect();
+    variables.sort_by_key(|(name, _)| name.as_str());
+    variables
+        .into_iter()
+        .fold(vec![HashMap::new()], |combinations, (name, values)| {
+            let values = match values {
+                serde_yaml::Value::Sequence(values) => values.clone(),
+                value => vec![value.clone()],
+            };
+            combinations
+                .iter()
+                .flat_map(|combination| {
+                    values.iter().map(|value| {
+                        let mut combination = combination.clone();
+                        combination.insert(name.clone(), value.clone());
+                        combination
+                    })
+                })
+                .collect()
+        })
+}
+
 /// Convert a GitLab CI/CD pipeline to a format compatible with the workflow executor
 pub fn convert_to_workflow_format(pipeline: &Pipeline) -> workflow::WorkflowDefinition {
     // Create a new workflow with required fields
@@ -159,6 +221,10 @@ pub fn convert_to_workflow_format(pipeline: &Pipeline) -> workflow::WorkflowDefi
         // Add job-specific environment variables
         if let Some(variables) = &gitlab_job.variables {
             job.env.extend(variables.clone());
+        }
+
+        if let Some(parallel) = &gitlab_job.parallel {
+            apply_parallel(&mut job, parallel);
         }
 
         // Add global variables if they exist
@@ -325,5 +391,42 @@ downstream:
 
         let result = validate_pipeline_structure(&pipeline);
         assert!(result.is_valid, "{:?}", result.issues);
+    }
+
+    fn convert(yaml: &str) -> workflow::WorkflowDefinition {
+        convert_to_workflow_format(&serde_yaml::from_str(yaml).unwrap())
+    }
+
+    #[test]
+    fn parallel_matrix_expands_each_entry() {
+        let workflow = convert(
+            r#"
+stages: [test]
+job:
+  stage: test
+  script: [echo]
+  parallel:
+    matrix:
+      - A: [x, y]
+        B: "1"
+      - C: z
+"#,
+        );
+        let job = &workflow.jobs["job"];
+        let combinations = wrkflw_matrix::expand_matrix(job.matrix_config().unwrap()).unwrap();
+        assert_eq!(combinations.len(), 3);
+        assert_eq!(job.env["A"], "${{ matrix.A }}");
+        assert_eq!(job.env["C"], "${{ matrix.C }}");
+        assert!(!job.fail_fast());
+    }
+
+    #[test]
+    fn parallel_count_sets_node_variables() {
+        let workflow = convert("job:\n  script: [echo]\n  parallel: 3\n");
+        let job = &workflow.jobs["job"];
+        let combinations = wrkflw_matrix::expand_matrix(job.matrix_config().unwrap()).unwrap();
+        assert_eq!(combinations.len(), 3);
+        assert_eq!(job.env["CI_NODE_TOTAL"], "3");
+        assert_eq!(job.env["CI_NODE_INDEX"], "${{ matrix.CI_NODE_INDEX }}");
     }
 }

@@ -216,7 +216,7 @@ pub mod gitlab {
 
         /// Mark job as parallel and specify instance count
         #[serde(skip_serializing_if = "Option::is_none")]
-        pub parallel: Option<usize>,
+        pub parallel: Option<Parallel>,
 
         /// Flag to indicate this is a template job
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -253,6 +253,19 @@ pub mod gitlab {
         ExitCodes {
             /// A single exit code or a list of exit codes
             exit_codes: ExitCodes,
+        },
+    }
+
+    /// How many copies of a job to run
+    #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+    #[serde(untagged)]
+    pub enum Parallel {
+        /// A fixed number of instances
+        Count(usize),
+        /// One instance per combination of variables
+        Matrix {
+            /// Each entry's variables are a value or a list of values
+            matrix: Vec<HashMap<String, serde_yaml::Value>>,
         },
     }
 

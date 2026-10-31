@@ -3242,8 +3242,13 @@ impl<'a> StepExecutionContext<'a> {
 
 /// Evaluate `${{ }}` in a `working-directory`. A failed expression is an error,
 /// since falling back to an empty value would run the step in the wrong place.
-fn resolve_working_directory(wd: &str, ctx: &StepExecutionContext<'_>) -> Result<String, String> {
-    let expr_ctx = ctx.expr_context();
+fn resolve_working_directory(
+    wd: &str,
+    ctx: &StepExecutionContext<'_>,
+    step_env: &HashMap<String, String>,
+    step_user_env: &HashMap<String, String>,
+) -> Result<String, String> {
+    let expr_ctx = ctx.expr_context_with_env(step_env, step_user_env);
     let resolved =
         crate::substitution::preprocess_expressions_strict(wd, ctx.working_dir, &expr_ctx)
             .map_err(|e| format!("Invalid working-directory '{}': {}", wd, e))?;
@@ -4211,7 +4216,7 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                 ctx.workflow_defaults
                     .and_then(|d| d.run.as_ref()?.working_directory.as_deref())
             })
-            .map(|wd| resolve_working_directory(wd, &ctx))
+            .map(|wd| resolve_working_directory(wd, &ctx, &step_env, &step_user_env))
             .transpose();
         let effective_wd = match effective_wd {
             Ok(wd) => wd,
@@ -9527,6 +9532,20 @@ runs:
         let result = run_step(&step, &job_env, &runtime).await;
         assert_eq!(result.status, StepStatus::Failure);
         assert!(result.output.contains("must be within workspace"));
+    }
+
+    #[tokio::test]
+    async fn working_directory_sees_the_steps_own_env() {
+        let job_env = HashMap::from([("GITHUB_WORKSPACE".to_string(), "/host/repo".to_string())]);
+        let runtime = MockContainerRuntime::default();
+        let mut step = make_run_step("echo ok");
+        step.env.insert("SUBDIR".to_string(), "src".to_string());
+        step.working_directory = Some("${{ env.SUBDIR }}".to_string());
+
+        let result = run_step(&step, &job_env, &runtime).await;
+        assert_eq!(result.status, StepStatus::Success, "{}", result.output);
+        let calls = runtime.run_calls.lock().unwrap();
+        assert_eq!(calls[0].working_dir, Path::new("/github/workspace/src"));
     }
 
     #[tokio::test]

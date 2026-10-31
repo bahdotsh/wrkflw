@@ -641,18 +641,11 @@ fn initialize_runtime(
         // Kubernetes is never auto-detected and never silently replaced:
         // a job meant for a GPU node must not quietly run on the laptop.
         RuntimeType::Kubernetes => {
-            if kubernetes::is_available_with(kubernetes) {
-                Ok(Box::new(kubernetes::KubernetesRuntime::new(
-                    kubernetes.clone(),
-                    preserve_containers_on_failure,
-                )))
-            } else {
-                Err(ExecutionError::Runtime(format!(
-                    "Kubernetes cluster is not reachable ({}); check kubectl, \
-                     KUBECONFIG and --k8s-context",
-                    kubernetes.describe()
-                )))
-            }
+            kubernetes::check_available(kubernetes).map_err(ExecutionError::Runtime)?;
+            Ok(Box::new(kubernetes::KubernetesRuntime::new(
+                kubernetes.clone(),
+                preserve_containers_on_failure,
+            )))
         }
         RuntimeType::Emulation => Ok(Box::new(emulation::EmulationRuntime::new())),
         RuntimeType::SecureEmulation => Ok(Box::new(

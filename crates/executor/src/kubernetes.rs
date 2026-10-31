@@ -24,6 +24,7 @@ use async_trait::async_trait;
 use once_cell::sync::Lazy;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashSet};
+use std::ffi::{OsStr, OsString};
 use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
@@ -183,10 +184,34 @@ pub fn is_available() -> bool {
 
 /// True when `kubectl` is installed and the configured context answers.
 pub fn is_available_with(config: &KubernetesConfig) -> bool {
-    if which::which("kubectl").is_err() {
-        return false;
+    check_available(config).is_ok()
+}
+
+/// Check that `kubectl` is installed and the configured context answers,
+/// saying which of the two failed.
+pub fn check_available(config: &KubernetesConfig) -> Result<(), String> {
+    check_available_using("kubectl".as_ref(), config)
+}
+
+fn check_available_using(kubectl: &OsStr, config: &KubernetesConfig) -> Result<(), String> {
+    if which::which(kubectl).is_err() {
+        return Err(format!(
+            "{} was not found on PATH; the Kubernetes runtime needs it installed",
+            kubectl.to_string_lossy()
+        ));
     }
-    let child = std::process::Command::new("kubectl")
+    if cluster_answers(kubectl, config) {
+        Ok(())
+    } else {
+        Err(format!(
+            "Kubernetes cluster is not reachable ({}); check KUBECONFIG and --k8s-context",
+            config.describe()
+        ))
+    }
+}
+
+fn cluster_answers(kubectl: &OsStr, config: &KubernetesConfig) -> bool {
+    let child = std::process::Command::new(kubectl)
         .args(config.kubectl_args())
         .args(["--request-timeout=3s", "get", "--raw", "/version"])
         .stdin(Stdio::null())
@@ -196,8 +221,8 @@ pub fn is_available_with(config: &KubernetesConfig) -> bool {
     let Ok(mut child) = child else {
         return false;
     };
-    // `--request-timeout` does not cover exec credential plugins, and the TUI
-    // calls this from its event loop, so enforce the limit here as well.
+    // `--request-timeout` does not cover exec credential plugins, and a run
+    // or a TUI probe must not wait on one forever, so enforce the limit here.
     let deadline = std::time::Instant::now() + AVAILABILITY_TIMEOUT;
     loop {
         match child.try_wait() {
@@ -264,7 +289,7 @@ fn untrack_pod(name: &str) {
 /// the tokio runtime.
 struct PodGuard {
     pod: PodRef,
-    kubectl: std::ffi::OsString,
+    kubectl: OsString,
     armed: bool,
 }
 
@@ -1836,6 +1861,20 @@ mod tests {
             active_deadline_seconds(&with_timeout(u64::MAX)),
             i64::MAX as u64
         );
+    }
+
+    #[test]
+    fn missing_kubectl_is_not_reported_as_an_unreachable_cluster() {
+        let err = check_available_using("wrkflw-no-such-kubectl".as_ref(), &cfg()).unwrap_err();
+        assert!(err.contains("not found on PATH"), "{}", err);
+        assert!(!err.contains("not reachable"), "{}", err);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreachable_cluster_is_reported_as_one() {
+        let err = check_available_using("false".as_ref(), &cfg()).unwrap_err();
+        assert!(err.contains("not reachable"), "{}", err);
     }
 
     #[test]

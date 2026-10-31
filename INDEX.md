@@ -1,6 +1,6 @@
 # Codebase Index: wrkflw
 
-> Generated: 2026-10-31 17:49:42 UTC | Files: 208 | Lines: 83592
+> Generated: 2026-10-31 18:03:24 UTC | Files: 208 | Lines: 83608
 > Languages: JSON (4), Markdown (24), Rust (119), Shell (5), TOML (18), YAML (38)
 
 ## Directory Structure
@@ -415,6 +415,8 @@ wrkflw/
 **crates/executor/src/environment.rs**
 - `pub fn setup_github_environment_files(workspace_dir: &Path) -> io::Result<()>`
 - `pub fn isolate_github_environment_files( job_env: &mut HashMap<String, String>, ) -> io::Result<tempfile::TempDir>`
+- `pub const CONTAINER_WORKSPACE: &str = "/github/workspace"`
+- `pub const CONTAINER_GITHUB_DIR: &str = "/github/workflow"`
 - `pub fn apply_github_container_context(env: &mut HashMap<String, String>)`
 - `pub fn apply_gitlab_container_context(env: &mut HashMap<String, String>)`
 - `pub fn create_github_context( workflow: &WorkflowDefinition, workspace_dir: &Path, ) -> HashMap<String, String>`
@@ -1475,7 +1477,7 @@ wrkflw/
 
 ## INDEX.md
 
-**Language:** Markdown | **Size:** 169.6 KB | **Lines:** 6424
+**Language:** Markdown | **Size:** 169.7 KB | **Lines:** 6429
 
 **Declarations:**
 
@@ -1483,7 +1485,7 @@ wrkflw/
 
 ## README.md
 
-**Language:** Markdown | **Size:** 19.0 KB | **Lines:** 379
+**Language:** Markdown | **Size:** 19.1 KB | **Lines:** 379
 
 **Declarations:**
 
@@ -1804,7 +1806,7 @@ wrkflw/
 
 ## crates/executor/src/engine.rs
 
-**Language:** Rust | **Size:** 431.2 KB | **Lines:** 11839
+**Language:** Rust | **Size:** 430.5 KB | **Lines:** 11815
 
 **Imports:**
 - `bollard::Docker`
@@ -1843,6 +1845,8 @@ wrkflw/
 `fn initialize_runtime( runtime_type: RuntimeType, preserve_containers_on_failure: bool, kubernetes: &KubernetesConfig, ) -> Result<(Box<dyn ContainerRuntime>, RuntimeType), ExecutionError>`
 
 **`impl RuntimeType`**
+  `fn runs_in_container(&self) -> bool`
+
   `pub fn mode_name(&self) -> &'static str`
 
 
@@ -1982,7 +1986,7 @@ wrkflw/
 
 `fn resolve_working_directory(wd: &str, ctx: &StepExecutionContext<'_>) -> Result<String, String>`
 
-`fn workspace_relative_input(path: &str, ctx: &StepExecutionContext<'_>) -> String`
+`fn workspace_relative_input(path: &str, job_env: &HashMap<String, String>) -> String`
 
 `fn relative_to_workspace(path: &str, workspace: &str) -> String`
 
@@ -2085,7 +2089,7 @@ wrkflw/
 
 ## crates/executor/src/environment.rs
 
-**Language:** Rust | **Size:** 16.2 KB | **Lines:** 532
+**Language:** Rust | **Size:** 17.6 KB | **Lines:** 566
 
 **Imports:**
 - `chrono::Utc`
@@ -2097,7 +2101,11 @@ wrkflw/
 
 **Declarations:**
 
-`const CONTAINER_WORKSPACE: &str = "/github/workspace"`
+`fn create_runner_temp(dir: &Path) -> io::Result<()>`
+
+`const RUNNER_TEMP_DIR: &str = "runner_temp"`
+
+`const CONTAINER_RUNNER_TEMP: &str = "/github/workflow/runner_temp"`
 
 `fn value_to_string(value: &Value) -> String`
 
@@ -2252,19 +2260,20 @@ wrkflw/
 
 ## crates/executor/src/kubernetes/manifest.rs
 
-**Language:** Rust | **Size:** 20.5 KB | **Lines:** 551
+**Language:** Rust | **Size:** 20.6 KB | **Lines:** 552
 
 **Imports:**
 - `super::{
     KubernetesConfig, DEADLINE_MARGIN_SECS, MAIN_CONTAINER, MANAGED_BY_LABEL, READY_MARKER,
     SESSION_ID, SESSION_LABEL, SYNC_CONTAINER, SYNC_DIR, SYNC_VOLUME, WAIT_CONTAINER,
 }`
+- `crate::environment::{CONTAINER_GITHUB_DIR, CONTAINER_WORKSPACE}`
 - `serde_json::{json, Value}`
 - `std::path::{Path, PathBuf}`
 
 **Declarations:**
 
-`const MIRRORED_MOUNTS: &[&str] = &["/github/workspace", "/github/workflow"]`
+`const MIRRORED_MOUNTS: &[&str] = &[CONTAINER_WORKSPACE, CONTAINER_GITHUB_DIR]`
 
 **`impl Mount`**
   `pub(super) fn mirrored(&self) -> bool`

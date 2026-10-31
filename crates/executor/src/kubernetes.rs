@@ -63,13 +63,20 @@ const SESSION_LABEL: &str = "wrkflw.dev/session";
 /// Waiting reasons that never resolve on their own. Anything else (plain
 /// `ContainerCreating`, `PodInitializing`) is waited out.
 const FATAL_WAITING_REASONS: &[&str] = &[
-    "ErrImagePull",
-    "ImagePullBackOff",
     "ErrImageNeverPull",
     "InvalidImageName",
     "CreateContainerConfigError",
     "CreateContainerError",
 ];
+
+/// Waiting reasons of a pull the kubelet is still retrying. A bad image and a
+/// registry blip look the same here: both go from `ErrImagePull` to
+/// `ImagePullBackOff` within seconds. Only time tells them apart.
+const PULL_RETRY_REASONS: &[&str] = &["ErrImagePull", "ImagePullBackOff"];
+
+/// How long a pull may keep failing before the step gives up. The kubelet
+/// retries after 10, 20 and 40 seconds, so this covers two or three attempts.
+const PULL_RETRY_GRACE: Duration = Duration::from_secs(60);
 
 /// One id per process, stamped on every pod as a label so a crashed run's
 /// pods can be found with `kubectl get pods -l wrkflw.dev/session=<id>`.
@@ -565,6 +572,51 @@ fn terminated_exit_code(state: Option<&Value>) -> Option<i32> {
 /// A container stuck in a waiting state that will never clear, as
 /// `"<container>: <reason>: <message>"`.
 fn fatal_waiting_reason(pod: &Value) -> Option<String> {
+    waiting_reason(pod, FATAL_WAITING_REASONS)
+}
+
+/// Why a pod cannot make progress, if it cannot: a fatal waiting reason, or an
+/// image pull that has outlasted [`PULL_RETRY_GRACE`].
+fn stuck_reason(pod: &Value, name: &str, watch: &mut PullWatch) -> Option<String> {
+    fatal_waiting_reason(pod)
+        .or_else(|| watch.check(pod, name, std::time::Instant::now(), PULL_RETRY_GRACE))
+}
+
+/// Tracks how long a pod has been failing to pull an image.
+#[derive(Default)]
+struct PullWatch {
+    first_failure: Option<std::time::Instant>,
+}
+
+impl PullWatch {
+    /// The failure to report once a pull has been failing for `grace`.
+    ///
+    /// A retry in flight can report `ContainerCreating` between two failures,
+    /// so the clock never resets: a pull that later works moves the pod on,
+    /// and one that does not must not wait out `--k8s-timeout`.
+    fn check(
+        &mut self,
+        pod: &Value,
+        name: &str,
+        now: std::time::Instant,
+        grace: Duration,
+    ) -> Option<String> {
+        let reason = waiting_reason(pod, PULL_RETRY_REASONS)?;
+        let first_failure = *self.first_failure.get_or_insert_with(|| {
+            wrkflw_logging::warning(&format!(
+                "Pod {} failed to pull an image, retrying for up to {} seconds: {}",
+                name,
+                grace.as_secs(),
+                reason
+            ));
+            now
+        });
+        (now.duration_since(first_failure) >= grace).then_some(reason)
+    }
+}
+
+/// The first container waiting for one of `reasons`.
+fn waiting_reason(pod: &Value, reasons: &[&str]) -> Option<String> {
     for list in ["initContainerStatuses", "containerStatuses"] {
         // A list that is not reported yet must not hide the other one.
         let Some(statuses) = pod
@@ -576,7 +628,7 @@ fn fatal_waiting_reason(pod: &Value) -> Option<String> {
         for status in statuses {
             let waiting = &status["state"]["waiting"];
             if let Some(reason) = waiting["reason"].as_str() {
-                if FATAL_WAITING_REASONS.contains(&reason) {
+                if reasons.contains(&reason) {
                     return Some(format!(
                         "container '{}': {}: {}",
                         status["name"].as_str().unwrap_or("?"),
@@ -750,10 +802,11 @@ impl KubernetesRuntime {
     /// Block until the wait container runs, so volumes can be streamed into it.
     async fn wait_for_init_running(&self, name: &str) -> Result<(), ContainerError> {
         let mut warned_unschedulable = false;
+        let mut pull_watch = PullWatch::default();
         let started = std::time::Instant::now();
         loop {
             let pod = self.get_pod(name).await?;
-            if let Some(reason) = fatal_waiting_reason(&pod) {
+            if let Some(reason) = stuck_reason(&pod, name, &mut pull_watch) {
                 return Err(ContainerError::ContainerStart(format!(
                     "pod {} cannot start: {}",
                     name, reason
@@ -791,6 +844,7 @@ impl KubernetesRuntime {
 
     /// Block until the step container has exited, returning its exit code.
     async fn wait_for_main_terminated(&self, name: &str) -> Result<i32, ContainerError> {
+        let mut pull_watch = PullWatch::default();
         let started = std::time::Instant::now();
         loop {
             let pod = self.get_pod(name).await?;
@@ -799,7 +853,7 @@ impl KubernetesRuntime {
             {
                 return Ok(code);
             }
-            if let Some(reason) = fatal_waiting_reason(&pod) {
+            if let Some(reason) = stuck_reason(&pod, name, &mut pull_watch) {
                 return Err(ContainerError::ContainerStart(format!(
                     "pod {} cannot start: {}",
                     name, reason
@@ -2247,17 +2301,27 @@ mod tests {
     }
 
     #[test]
-    fn fatal_waiting_reason_flags_image_pull_failures_only() {
+    fn fatal_waiting_reason_flags_unrecoverable_states_only() {
         let pod = pod_status(json!({
             "containerStatuses": [{
                 "name": MAIN_CONTAINER,
-                "state": { "waiting": { "reason": "ImagePullBackOff", "message": "no such image" } }
+                "state": { "waiting": { "reason": "InvalidImageName", "message": "bad ref" } }
             }]
         }));
         let reason = fatal_waiting_reason(&pod).unwrap();
         assert!(reason.contains("container 'main'"));
-        assert!(reason.contains("ImagePullBackOff"));
-        assert!(reason.contains("no such image"));
+        assert!(reason.contains("InvalidImageName"));
+        assert!(reason.contains("bad ref"));
+
+        for retried in PULL_RETRY_REASONS {
+            let pod = pod_status(json!({
+                "containerStatuses": [{
+                    "name": MAIN_CONTAINER,
+                    "state": { "waiting": { "reason": retried } }
+                }]
+            }));
+            assert!(fatal_waiting_reason(&pod).is_none(), "{}", retried);
+        }
 
         let pod = pod_status(json!({
             "initContainerStatuses": [{
@@ -2266,6 +2330,36 @@ mod tests {
             }]
         }));
         assert!(fatal_waiting_reason(&pod).is_none());
+    }
+
+    fn pod_pulling(reason: &str) -> Value {
+        pod_status(json!({
+            "containerStatuses": [{
+                "name": MAIN_CONTAINER,
+                "state": { "waiting": { "reason": reason, "message": "registry said no" } }
+            }]
+        }))
+    }
+
+    #[test]
+    fn a_failing_pull_gets_a_grace_period_that_a_retry_does_not_reset() {
+        let grace = Duration::from_secs(60);
+        let start = std::time::Instant::now();
+        let at = |secs| start + Duration::from_secs(secs);
+        let mut watch = PullWatch::default();
+
+        let pulling = pod_pulling("ErrImagePull");
+        let backing_off = pod_pulling("ImagePullBackOff");
+        let retrying = pod_pulling("ContainerCreating");
+        assert!(watch.check(&pulling, "p", at(0), grace).is_none());
+        assert!(watch.check(&backing_off, "p", at(30), grace).is_none());
+        assert!(watch.check(&retrying, "p", at(59), grace).is_none());
+        // The retry above did not restart the clock.
+        let reason = watch.check(&backing_off, "p", at(60), grace).unwrap();
+        assert!(reason.contains("ImagePullBackOff"));
+        assert!(reason.contains("registry said no"));
+        // Only a failure being reported right now can end the step.
+        assert!(watch.check(&retrying, "p", at(90), grace).is_none());
     }
 
     #[test]

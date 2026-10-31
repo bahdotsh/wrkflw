@@ -82,6 +82,7 @@ async fn execute_github_workflow(
     mut config: ExecutionConfig,
 ) -> Result<ExecutionResult, ExecutionError> {
     config.runtime_type = detect_runtime(config.runtime_type);
+    warn_if_overrides_unused(&config);
     // 1. Parse workflow file
     let workflow = parse_workflow(workflow_path)?;
 
@@ -238,6 +239,7 @@ async fn execute_github_workflow(
             &all_job_results,
             &artifact_store,
             &cache_store,
+            &config.platform_overrides,
         )
         .await?;
 
@@ -332,6 +334,7 @@ async fn execute_gitlab_pipeline(
     mut config: ExecutionConfig,
 ) -> Result<ExecutionResult, ExecutionError> {
     config.runtime_type = detect_runtime(config.runtime_type);
+    warn_if_overrides_unused(&config);
     wrkflw_logging::info("Executing GitLab CI/CD pipeline");
 
     // 1. Parse the GitLab pipeline file
@@ -442,6 +445,7 @@ async fn execute_gitlab_pipeline(
             &HashMap::new(),
             &artifact_store,
             &cache_store,
+            &config.platform_overrides,
         )
         .await?;
 
@@ -666,6 +670,40 @@ pub struct ExecutionConfig {
     pub secrets_config: Option<SecretConfig>,
     pub show_action_messages: bool,
     pub target_job: Option<String>,
+    /// User-supplied `runs-on` label to image mappings. They win over the
+    /// built-in table but lose to a job-level `container:`. Labels match
+    /// case-insensitively.
+    pub platform_overrides: HashMap<String, String>,
+}
+
+/// Parse a `LABEL=IMAGE` runner override, as given to `--platform`.
+pub fn parse_platform_override(s: &str) -> Result<(String, String), String> {
+    let (label, image) = s
+        .split_once('=')
+        .ok_or_else(|| format!("invalid LABEL=IMAGE: no `=` found in `{}`", s))?;
+    let (label, image) = (label.trim(), image.trim());
+    if label.is_empty() || image.is_empty() {
+        return Err(format!(
+            "invalid LABEL=IMAGE: label and image must both be set in `{}`",
+            s
+        ));
+    }
+    Ok((label.to_string(), image.to_string()))
+}
+
+/// Overrides only change which image a container runs, so they do nothing
+/// when no container runs. Say so rather than ignoring the flag silently.
+fn warn_if_overrides_unused(config: &ExecutionConfig) {
+    if !config.platform_overrides.is_empty()
+        && matches!(
+            config.runtime_type,
+            RuntimeType::Emulation | RuntimeType::SecureEmulation
+        )
+    {
+        wrkflw_logging::warning(
+            "--platform has no effect in emulation mode: steps run on the host, not in an image",
+        );
+    }
 }
 
 pub struct ExecutionResult {
@@ -1692,6 +1730,11 @@ fn generate_combined_dockerfile(runtimes: &[SetupRuntime], base_image: &str) -> 
 
     dockerfile.push_str(" && \\\n    rm -rf /var/lib/apt/lists/*\n");
 
+    // Base images can bundle tools ahead of the system directories. The act
+    // images do this with Node, which would shadow the version a setup action
+    // just installed. Every install script lands in one of these directories.
+    dockerfile.push_str("ENV PATH=/usr/local/bin:/usr/bin:$PATH\n");
+
     dockerfile
 }
 
@@ -1814,8 +1857,10 @@ async fn resolve_runner_image(
     job: &Job,
     steps: &[Step],
     runtime: &dyn ContainerRuntime,
+    platform_overrides: &HashMap<String, String>,
+    matrix: Option<&HashMap<String, Value>>,
 ) -> Result<String, ExecutionError> {
-    let base_image = get_effective_runner_image(job);
+    let base_image = get_effective_runner_image(job, platform_overrides, matrix);
 
     if job.container.is_some() {
         return Ok(base_image);
@@ -1845,6 +1890,7 @@ async fn execute_job_batch(
     all_job_results: &HashMap<String, String>,
     artifact_store: &crate::artifacts::ArtifactStore,
     cache_store: &crate::cache::CacheStore,
+    platform_overrides: &HashMap<String, String>,
 ) -> Result<Vec<JobResult>, ExecutionError> {
     // Execute jobs in parallel
     let futures = jobs.iter().map(|job_name| {
@@ -1861,6 +1907,7 @@ async fn execute_job_batch(
             all_job_results,
             artifact_store,
             cache_store,
+            platform_overrides,
         )
     });
     // NOTE: execute_job_batch and execute_job_with_matrix retain their argument
@@ -1910,6 +1957,7 @@ async fn execute_job_with_matrix(
     all_job_results: &HashMap<String, String>,
     artifact_store: &crate::artifacts::ArtifactStore,
     cache_store: &crate::cache::CacheStore,
+    platform_overrides: &HashMap<String, String>,
 ) -> Result<Vec<JobResult>, ExecutionError> {
     // NOTE: This function still has many arguments because it sits at the boundary
     // between per-run state (artifact_store, cache_store) and per-job state (needs
@@ -2008,6 +2056,7 @@ async fn execute_job_with_matrix(
             needs_results: &needs_res,
             artifact_store,
             cache_store,
+            platform_overrides,
         };
 
         // Execute matrix combinations
@@ -2035,6 +2084,7 @@ async fn execute_job_with_matrix(
             needs_results: &needs_res,
             artifact_store,
             cache_store,
+            platform_overrides,
         };
         let ctx = JobExecutionContext {
             job_name,
@@ -2106,7 +2156,14 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
 
     // Execute job steps
     // Determine runner image: prefer job container, then detect setup actions, fall back to runs-on
-    let runner_image_value = resolve_runner_image(job, &job.steps, ctx.runtime).await?;
+    let runner_image_value = resolve_runner_image(
+        job,
+        &job.steps,
+        ctx.runtime,
+        ctx.services.platform_overrides,
+        None,
+    )
+    .await?;
 
     // GHA default job timeout is 360 minutes; sanitize to avoid panic on negative/NaN
     let timeout_mins = sanitize_timeout_minutes(job.timeout_minutes, 360.0);
@@ -2152,6 +2209,7 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
                         needs_results: ctx.services.needs_results,
                         artifact_store: ctx.services.artifact_store,
                         cache_store: ctx.services.cache_store,
+                        platform_overrides: ctx.services.platform_overrides,
                     },
                     pending_cache_saves: &pending_cache_saves,
                 },
@@ -2404,8 +2462,14 @@ async fn execute_matrix_job(
     } else {
         // Execute each step
         // Determine runner image: prefer job container, then detect setup actions, fall back to runs-on
-        let runner_image_value =
-            resolve_runner_image(job_template, &materialized_steps, runtime).await?;
+        let runner_image_value = resolve_runner_image(
+            job_template,
+            &materialized_steps,
+            runtime,
+            services.platform_overrides,
+            Some(&combination.values),
+        )
+        .await?;
 
         let mut all_steps_ok = true;
         let timeout_mins = sanitize_timeout_minutes(job_template.timeout_minutes, 360.0);
@@ -2447,6 +2511,7 @@ async fn execute_matrix_job(
                             needs_results: services.needs_results,
                             artifact_store: services.artifact_store,
                             cache_store: services.cache_store,
+                            platform_overrides: services.platform_overrides,
                         },
                         pending_cache_saves: &pending_cache_saves,
                     },
@@ -2550,6 +2615,8 @@ pub(crate) struct JobServices<'a> {
     pub artifact_store: &'a crate::artifacts::ArtifactStore,
     /// Cache store shared across the workflow run (persistent across runs).
     pub cache_store: &'a crate::cache::CacheStore,
+    /// User-supplied `runs-on` label to image mappings for the run.
+    pub platform_overrides: &'a HashMap<String, String>,
 }
 
 /// Flush pending cache saves. Called at end-of-job only when the job succeeded,
@@ -4267,17 +4334,45 @@ fn get_runner_image_from_opt(runs_on: &Option<Vec<String>>) -> String {
     get_runner_image(ro)
 }
 
-fn get_effective_runner_image(job: &Job) -> String {
+/// Find the user's image for a job's `runs-on`. Labels are tried in order, so
+/// `runs-on: [self-hosted, linux]` can be mapped by either label.
+///
+/// `runs-on: ${{ matrix.os }}` has to be expanded here because nothing upstream
+/// resolves it. The built-in table deliberately keeps seeing the raw label:
+/// resolving it there too would send `windows-latest` matrix legs to a Windows
+/// image.
+fn find_platform_override(
+    runs_on: &Option<Vec<String>>,
+    platform_overrides: &HashMap<String, String>,
+    matrix: Option<&HashMap<String, Value>>,
+) -> Option<String> {
+    runs_on.iter().flatten().find_map(|label| {
+        let label = match matrix {
+            Some(values) => crate::substitution::preprocess_command(label, values),
+            None => label.clone(),
+        };
+        platform_overrides
+            .iter()
+            .find(|(key, _)| key.trim().eq_ignore_ascii_case(label.trim()))
+            .map(|(_, image)| image.clone())
+    })
+}
+
+/// Pick a job's base image: `container:`, then the user's overrides, then the
+/// built-in `runs-on` table.
+fn get_effective_runner_image(
+    job: &Job,
+    platform_overrides: &HashMap<String, String>,
+    matrix: Option<&HashMap<String, Value>>,
+) -> String {
     if let Some(ref container) = job.container {
-        if container.image.is_empty() {
-            wrkflw_logging::warning("container image is empty, falling back to runs-on");
-            get_runner_image_from_opt(&job.runs_on)
-        } else {
-            container.image.clone()
+        if !container.image.is_empty() {
+            return container.image.clone();
         }
-    } else {
-        get_runner_image_from_opt(&job.runs_on)
+        wrkflw_logging::warning("container image is empty, falling back to runs-on");
     }
+    find_platform_override(&job.runs_on, platform_overrides, matrix)
+        .unwrap_or_else(|| get_runner_image_from_opt(&job.runs_on))
 }
 
 /// Owned data returned by [`prepare_step_container_context`].
@@ -4665,6 +4760,7 @@ async fn run_called_workflow(
             &reusable_job_results,
             ctx.services.artifact_store,
             ctx.services.cache_store,
+            ctx.services.platform_overrides,
         )
         .await?;
         any_failed |= results.iter().any(|r| r.status == JobStatus::Failure);
@@ -4949,6 +5045,7 @@ async fn execute_composite_action(
                         needs_results: services.needs_results,
                         artifact_store: services.artifact_store,
                         cache_store: services.cache_store,
+                        platform_overrides: services.platform_overrides,
                     },
                     pending_cache_saves,
                 };
@@ -5752,6 +5849,7 @@ mod tests {
             needs_results: &EMPTY_NEEDS_RESULTS,
             artifact_store: &TEST_ARTIFACT_STORE,
             cache_store: &TEST_CACHE_STORE,
+            platform_overrides: &EMPTY_SECRETS,
         }
     }
 
@@ -5795,6 +5893,115 @@ mod tests {
         assert!(!is_git_sha("a81bbbf8298c0fa03ea29cdc473d45769f9536750"));
     }
 
+    // --- platform override tests ---
+
+    fn overrides(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn container_with(image: &str) -> JobContainer {
+        JobContainer {
+            image: image.to_string(),
+            credentials: None,
+            env: HashMap::new(),
+            ports: None,
+            volumes: None,
+            options: None,
+        }
+    }
+
+    fn labels(values: &[&str]) -> Option<Vec<String>> {
+        Some(values.iter().map(|v| v.to_string()).collect())
+    }
+
+    #[test]
+    fn platform_override_replaces_builtin_image() {
+        let job = make_job(None, labels(&["ubuntu-latest"]));
+        let map = overrides(&[("ubuntu-latest", "my/image:1")]);
+        assert_eq!(get_effective_runner_image(&job, &map, None), "my/image:1");
+    }
+
+    #[test]
+    fn platform_override_ignores_other_labels() {
+        let job = make_job(None, labels(&["ubuntu-22.04"]));
+        let map = overrides(&[("ubuntu-latest", "my/image:1")]);
+        assert_eq!(get_effective_runner_image(&job, &map, None), "ubuntu:22.04");
+    }
+
+    #[test]
+    fn platform_override_matches_label_case_insensitively() {
+        let job = make_job(None, labels(&["Ubuntu-Latest"]));
+        let map = overrides(&[("ubuntu-latest", "my/image:1")]);
+        assert_eq!(get_effective_runner_image(&job, &map, None), "my/image:1");
+    }
+
+    #[test]
+    fn platform_override_tries_every_runs_on_label() {
+        let job = make_job(None, labels(&["self-hosted", "linux"]));
+        let map = overrides(&[("linux", "my/image:1")]);
+        assert_eq!(get_effective_runner_image(&job, &map, None), "my/image:1");
+    }
+
+    #[test]
+    fn platform_override_loses_to_job_container() {
+        let job = make_job(
+            Some(container_with("alpine:3.22")),
+            labels(&["ubuntu-latest"]),
+        );
+        let map = overrides(&[("ubuntu-latest", "my/image:1")]);
+        assert_eq!(get_effective_runner_image(&job, &map, None), "alpine:3.22");
+    }
+
+    #[test]
+    fn platform_override_applies_when_container_image_is_empty() {
+        let job = make_job(Some(container_with("")), labels(&["ubuntu-latest"]));
+        let map = overrides(&[("ubuntu-latest", "my/image:1")]);
+        assert_eq!(get_effective_runner_image(&job, &map, None), "my/image:1");
+    }
+
+    #[test]
+    fn platform_override_resolves_matrix_runs_on() {
+        let job = make_job(None, labels(&["${{ matrix.os }}"]));
+        let map = overrides(&[("ubuntu-latest", "my/image:1")]);
+        let matrix =
+            HashMap::from([("os".to_string(), Value::String("ubuntu-latest".to_string()))]);
+        assert_eq!(
+            get_effective_runner_image(&job, &map, Some(&matrix)),
+            "my/image:1"
+        );
+    }
+
+    #[test]
+    fn matrix_runs_on_without_override_keeps_builtin_fallback() {
+        let job = make_job(None, labels(&["${{ matrix.os }}"]));
+        let matrix = HashMap::from([(
+            "os".to_string(),
+            Value::String("windows-latest".to_string()),
+        )]);
+        assert_eq!(
+            get_effective_runner_image(&job, &HashMap::new(), Some(&matrix)),
+            "ubuntu:latest"
+        );
+    }
+
+    #[test]
+    fn parse_platform_override_splits_on_first_equals() {
+        assert_eq!(
+            parse_platform_override("ubuntu-latest=ghcr.io/a/b:c=d").unwrap(),
+            ("ubuntu-latest".to_string(), "ghcr.io/a/b:c=d".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_platform_override_rejects_malformed_values() {
+        for bad in ["ubuntu-latest", "=image", "label=", " = "] {
+            assert!(parse_platform_override(bad).is_err(), "{bad} should fail");
+        }
+    }
+
     // --- get_effective_runner_image tests ---
 
     fn make_job(container: Option<JobContainer>, runs_on: Option<Vec<String>>) -> Job {
@@ -5830,13 +6037,16 @@ mod tests {
             }),
             Some(vec!["ubuntu-latest".into()]),
         );
-        assert_eq!(get_effective_runner_image(&job), "alpine:3.22");
+        assert_eq!(
+            get_effective_runner_image(&job, &HashMap::new(), None),
+            "alpine:3.22"
+        );
     }
 
     #[test]
     fn effective_runner_image_falls_back_to_runs_on() {
         let job = make_job(None, Some(vec!["ubuntu-latest".into()]));
-        let image = get_effective_runner_image(&job);
+        let image = get_effective_runner_image(&job, &HashMap::new(), None);
         // Should delegate to get_runner_image_from_opt, not return empty
         assert!(!image.is_empty());
     }
@@ -6032,7 +6242,7 @@ mod tests {
             }),
             Some(vec!["ubuntu-latest".into()]),
         );
-        let image = get_effective_runner_image(&job);
+        let image = get_effective_runner_image(&job, &HashMap::new(), None);
         // Should fall back to runs-on, not return empty string
         assert!(!image.is_empty());
     }
@@ -7613,6 +7823,17 @@ runs:
     }
 
     #[test]
+    fn generate_combined_dockerfile_puts_installed_runtimes_first_on_path() {
+        let runtimes = vec![SetupRuntime {
+            language: "node".to_string(),
+            version: "20".to_string(),
+            install_script: get_install_script("node", "20"),
+        }];
+        let df = generate_combined_dockerfile(&runtimes, "catthehacker/ubuntu:act-latest");
+        assert!(df.ends_with("ENV PATH=/usr/local/bin:/usr/bin:$PATH\n"));
+    }
+
+    #[test]
     fn generate_combined_dockerfile_multi_runtime_single_run() {
         let runtimes = vec![
             SetupRuntime {
@@ -8938,6 +9159,7 @@ runs:
                 needs_results: &HashMap::new(),
                 artifact_store: &artifact_store,
                 cache_store: &cache_store,
+                platform_overrides: &HashMap::new(),
             },
             pending_cache_saves: &pending,
         };
@@ -8985,6 +9207,7 @@ runs:
                 needs_results: &HashMap::new(),
                 artifact_store: &artifact_store,
                 cache_store: &cache_store,
+                platform_overrides: &HashMap::new(),
             },
             pending_cache_saves: &pending,
         };
@@ -9061,6 +9284,7 @@ runs:
                 needs_results: &HashMap::new(),
                 artifact_store: &artifact_store,
                 cache_store: &cache_store,
+                platform_overrides: &HashMap::new(),
             },
             pending_cache_saves: &pending,
         };
@@ -9107,6 +9331,7 @@ runs:
                 needs_results: &HashMap::new(),
                 artifact_store: &artifact_store,
                 cache_store: &cache_store,
+                platform_overrides: &HashMap::new(),
             },
             pending_cache_saves: &pending,
         };
@@ -9159,6 +9384,7 @@ runs:
                 needs_results: &HashMap::new(),
                 artifact_store: &artifact_store,
                 cache_store: &cache_store,
+                platform_overrides: &HashMap::new(),
             },
             pending_cache_saves: &pending,
         };
@@ -9228,6 +9454,7 @@ runs:
                 needs_results: &HashMap::new(),
                 artifact_store: &artifact_store,
                 cache_store: &cache_store,
+                platform_overrides: &HashMap::new(),
             },
             pending_cache_saves: &pending,
         };
@@ -9435,6 +9662,7 @@ runs:
                 needs_results: &HashMap::new(),
                 artifact_store: &artifact_store,
                 cache_store: &cache_store,
+                platform_overrides: &HashMap::new(),
             },
             pending_cache_saves: &pending,
         };
@@ -9506,6 +9734,7 @@ runs:
                 needs_results: &HashMap::new(),
                 artifact_store: &artifact_store,
                 cache_store: &cache_store,
+                platform_overrides: &HashMap::new(),
             },
             pending_cache_saves: &pending,
         };
@@ -9562,6 +9791,7 @@ runs:
                 needs_results: &HashMap::new(),
                 artifact_store: &artifact_store,
                 cache_store: &cache_store,
+                platform_overrides: &HashMap::new(),
             },
             pending_cache_saves: &pending,
         };
@@ -9615,6 +9845,7 @@ runs:
                 needs_results: &HashMap::new(),
                 artifact_store: &artifact_store,
                 cache_store: &cache_store,
+                platform_overrides: &HashMap::new(),
             },
             pending_cache_saves: &pending,
         };
@@ -9674,6 +9905,7 @@ runs:
                 needs_results: &HashMap::new(),
                 artifact_store: &artifact_store,
                 cache_store: &cache_store,
+                platform_overrides: &HashMap::new(),
             },
             pending_cache_saves: &pending,
         };
@@ -9819,6 +10051,7 @@ runs:
                 needs_results: &HashMap::new(),
                 artifact_store: &artifact_store,
                 cache_store: &cache_store,
+                platform_overrides: &HashMap::new(),
             },
             pending_cache_saves: &pending,
         };

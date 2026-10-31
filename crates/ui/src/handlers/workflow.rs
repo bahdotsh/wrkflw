@@ -1,5 +1,6 @@
 // Workflow handlers
 use crate::cli_style;
+use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use wrkflw_evaluator::evaluate_workflow_file;
@@ -100,6 +101,7 @@ pub async fn execute_workflow_cli(
     runtime_type: RuntimeType,
     verbose: bool,
     show_action_messages: bool,
+    platform_overrides: HashMap<String, String>,
 ) -> io::Result<()> {
     if !path.exists() {
         return Err(io::Error::new(
@@ -210,6 +212,7 @@ pub async fn execute_workflow_cli(
         secrets_config: None,                  // Use default secrets configuration
         show_action_messages,
         target_job: None,
+        platform_overrides,
     };
 
     match wrkflw_executor::execute_workflow(path, config).await {
@@ -553,6 +556,7 @@ pub fn start_next_workflow_execution(
 
         let validation_mode = app.validation_mode;
         let preserve_containers_on_failure = app.preserve_containers_on_failure;
+        let platform_overrides = app.platform_overrides.clone();
         let show_action_messages = app.show_action_messages;
 
         // Update workflow status and add execution details
@@ -635,6 +639,7 @@ pub fn start_next_workflow_execution(
                         secrets_config: None, // Use default secrets configuration
                         show_action_messages,
                         target_job,
+                        platform_overrides,
                     };
 
                     let execution_result = wrkflw_utils::fd::with_stderr_to_null(|| {

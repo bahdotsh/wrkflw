@@ -1,5 +1,17 @@
 # Breaking Changes
 
+## Jobs on act images now report real step results (unreleased)
+
+Under the Docker runtime, any image name containing both `catthehacker` and
+`act-` was treated as macOS emulation. Each step's command was discarded, so
+steps on `ubuntu-*-medium` runners passed without running. Those steps now run
+and can fail. Workflows that were passing there may start failing for real.
+
+`RUNNER_OS`, `PATH` and `HOME` are also no longer overridden for those images.
+
+Combined images for `actions/setup-*` jobs now put `/usr/local/bin` and
+`/usr/bin` first on `PATH`, so they are rebuilt once on the next run.
+
 ## `~/.wrkflw` moved to the platform base directories (unreleased)
 
 wrkflw no longer writes to a hardcoded `~/.wrkflw/`. The new locations follow

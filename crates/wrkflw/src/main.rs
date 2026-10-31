@@ -58,6 +58,20 @@ struct Wrkflw {
     #[cfg(feature = "tui")]
     #[arg(long, global = true, value_name = "THEME")]
     theme: Option<wrkflw_ui::theme::ThemePreference>,
+
+    /// Run `runs-on` LABEL in IMAGE instead of the built-in image, e.g.
+    /// ubuntu-latest=catthehacker/ubuntu:act-latest. Repeatable or comma-separated.
+    /// A job-level `container:` still wins
+    #[arg(
+        short = 'P',
+        long = "platform",
+        global = true,
+        value_name = "LABEL=IMAGE",
+        env = "WRKFLW_PLATFORM",
+        value_delimiter = ',',
+        value_parser = parse_platform_arg
+    )]
+    platform: Vec<Option<(String, String)>>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -309,6 +323,15 @@ enum Commands {
     },
 }
 
+// An empty value is skipped rather than rejected, so an exported but empty
+// WRKFLW_PLATFORM or a trailing comma can't fail every command.
+fn parse_platform_arg(s: &str) -> Result<Option<(String, String)>, String> {
+    if s.trim().is_empty() {
+        return Ok(None);
+    }
+    wrkflw_executor::parse_platform_override(s).map(Some)
+}
+
 // Parser function for key-value pairs
 fn parse_key_val(s: &str) -> Result<(String, String), String> {
     let pos = s
@@ -482,6 +505,9 @@ async fn main() {
     // Setup a Ctrl+C handler that runs in the background
     tokio::spawn(handle_signals());
 
+    let platform_overrides: HashMap<String, String> =
+        cli.platform.iter().flatten().cloned().collect();
+
     match &cli.command {
         Some(Commands::Validate {
             paths,
@@ -615,6 +641,7 @@ async fn main() {
                 strict_filter: *strict_filter,
                 no_strict_filter: *no_strict_filter,
                 verbose,
+                platform_overrides,
             })
             .await;
         }
@@ -648,6 +675,7 @@ async fn main() {
                 strict_filter: *strict_filter,
                 no_strict_filter: *no_strict_filter,
                 verbose,
+                platform_overrides,
             })
             .await;
         }
@@ -681,6 +709,7 @@ async fn main() {
                 *preserve_containers_on_failure,
                 *show_action_messages,
                 cli.theme,
+                platform_overrides,
             )
             .await
             {
@@ -716,9 +745,16 @@ async fn main() {
                 let runtime_type = wrkflw_executor::RuntimeType::Auto;
 
                 // Call the TUI implementation from the ui crate with default path
-                if let Err(e) =
-                    wrkflw_ui::run_wrkflw_tui(None, runtime_type, verbose, false, false, cli.theme)
-                        .await
+                if let Err(e) = wrkflw_ui::run_wrkflw_tui(
+                    None,
+                    runtime_type,
+                    verbose,
+                    false,
+                    false,
+                    cli.theme,
+                    platform_overrides,
+                )
+                .await
                 {
                     eprintln!("Error running TUI: {}", e);
                     std::process::exit(1);

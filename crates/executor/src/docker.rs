@@ -889,7 +889,7 @@ impl DockerRuntime {
         }
 
         // Collect environment variables
-        let mut env: Vec<String> = env_vars
+        let env: Vec<String> = env_vars
             .iter()
             .map(|(k, v)| format!("{}={}", k, v))
             .collect();
@@ -915,19 +915,6 @@ impl DockerRuntime {
         let is_windows_image = image.contains("windows")
             || image.contains("servercore")
             || image.contains("nanoserver");
-        let is_macos_emu =
-            image.contains("act-") && (image.contains("catthehacker") || image.contains("nektos"));
-
-        // Add platform-specific environment variables
-        if is_macos_emu {
-            // Add macOS-specific environment variables
-            env.push("RUNNER_OS=macOS".to_string());
-            env.push("RUNNER_ARCH=X64".to_string());
-            env.push("TMPDIR=/tmp".to_string());
-            env.push("HOME=/root".to_string());
-            env.push("GITHUB_WORKSPACE=/github/workspace".to_string());
-            env.push("PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin".to_string());
-        }
 
         // Create appropriate container options based on platform
         let options = Some(CreateContainerOptions {
@@ -954,7 +941,7 @@ impl DockerRuntime {
         };
 
         // Create container config with platform-specific settings
-        let mut config = Config {
+        let config = Config {
             image: Some(image.to_string()),
             // Empty cmd means "use the image's built-in ENTRYPOINT/CMD"
             cmd: if has_cmd { Some(cmd_vec) } else { None },
@@ -965,31 +952,15 @@ impl DockerRuntime {
             user: if is_windows_image {
                 Some("ContainerAdministrator".to_string())
             } else {
-                None // Don't specify user for macOS emulation - use default root user
-            },
-            // Map appropriate entrypoint for different platforms.
-            // Priority: explicit entrypoint from action.yml > macOS bash wrapper > image default.
-            // Only apply the macOS bash wrapper when there is an explicit command to wrap;
-            // an empty cmd means "use the image's native ENTRYPOINT/CMD"
-            // and overriding it with bash would hang or discard the real entrypoint.
-            entrypoint: if let Some(ep) = entrypoint.filter(|s| !s.is_empty()) {
-                Some(vec![ep.to_string()])
-            } else if is_macos_emu && has_cmd {
-                // For macOS, ensure we use bash
-                Some(vec!["bash".to_string(), "-l".to_string(), "-c".to_string()])
-            } else {
                 None
             },
+            // An explicit entrypoint from action.yml wins. Otherwise keep the
+            // image's own, which an empty cmd relies on.
+            entrypoint: entrypoint
+                .filter(|s| !s.is_empty())
+                .map(|ep| vec![ep.to_string()]),
             ..Default::default()
         };
-
-        // Run platform-specific container setup
-        if is_macos_emu {
-            // Add special labels for macOS
-            let mut labels = HashMap::new();
-            labels.insert("wrkflw.platform".to_string(), "macos".to_string());
-            config.labels = Some(labels);
-        }
 
         // Create container with a shorter timeout
         let create_result = tokio::time::timeout(

@@ -14,6 +14,7 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
+use std::collections::HashMap;
 use std::io::{self, stdout};
 use std::path::PathBuf;
 use std::sync::mpsc;
@@ -33,6 +34,7 @@ pub async fn run_wrkflw_tui(
     preserve_containers_on_failure: bool,
     show_action_messages: bool,
     theme: Option<ThemePreference>,
+    platform_overrides: HashMap<String, String>,
 ) -> io::Result<()> {
     // Picks the palette, which may query the terminal, so it has to
     // happen before raw mode and the event loop take over the tty.
@@ -66,6 +68,7 @@ pub async fn run_wrkflw_tui(
         tx.clone(),
         preserve_containers_on_failure,
         show_action_messages,
+        platform_overrides.clone(),
     );
 
     if app.validation_mode {
@@ -163,6 +166,7 @@ pub async fn run_wrkflw_tui(
                         runtime_type,
                         verbose,
                         show_action_messages,
+                        platform_overrides,
                     )
                     .await
                 } else if path.is_dir() {

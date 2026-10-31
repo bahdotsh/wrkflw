@@ -150,9 +150,25 @@ pub struct WorkflowDefinition {
     pub env: HashMap<String, String>,
 }
 
+/// A matrix is a mapping, or one expression that evaluates to a mapping.
+fn deserialize_matrix<'de, D>(deserializer: D) -> Result<Option<MatrixConfig>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    match Option::<serde_yaml::Value>::deserialize(deserializer)? {
+        None => Ok(None),
+        Some(serde_yaml::Value::String(expr)) if wrkflw_matrix::is_expression(&expr) => {
+            Ok(Some(MatrixConfig::from_expression(expr)))
+        }
+        Some(value) => serde_yaml::from_value(value)
+            .map(Some)
+            .map_err(serde::de::Error::custom),
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize, Default)]
 pub struct Strategy {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_matrix")]
     pub matrix: Option<MatrixConfig>,
     #[serde(default, rename = "fail-fast")]
     pub fail_fast: Option<bool>,

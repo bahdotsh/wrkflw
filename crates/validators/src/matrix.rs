@@ -2,6 +2,14 @@ use serde_yaml::Value;
 use wrkflw_models::ValidationResult;
 
 pub fn validate_matrix(matrix: &Value, result: &mut ValidationResult) {
+    // A whole matrix given as an expression is only known at run time
+    if let Some(expr) = matrix.as_str().filter(|s| wrkflw_matrix::is_expression(s)) {
+        if let Err(e) = wrkflw_matrix::check_strategy_expression(expr) {
+            result.add_issue(format!("matrix {}", e));
+        }
+        return;
+    }
+
     // Check if matrix is a mapping
     if !matrix.is_mapping() {
         result.add_issue("Matrix must be a mapping".to_string());
@@ -151,6 +159,26 @@ mod tests {
         assert_eq!(issues.len(), 1, "{:?}", issues);
         assert!(issues[0].starts_with("exclude "), "{:?}", issues);
         assert!(issues[0].contains("uses env"), "{:?}", issues);
+    }
+
+    #[test]
+    fn accepts_a_whole_matrix_expression() {
+        assert!(issues_for("${{ fromJSON(needs.a.outputs.m) }}").is_empty());
+    }
+
+    #[test]
+    fn rejects_whole_matrix_expression_with_unavailable_context() {
+        let issues = issues_for("${{ fromJSON(env.X) }}");
+        assert_eq!(issues.len(), 1, "{:?}", issues);
+        assert!(issues[0].contains("uses env"), "{:?}", issues);
+    }
+
+    #[test]
+    fn rejects_plain_string_matrix() {
+        assert_eq!(
+            issues_for("nope"),
+            vec!["Matrix must be a mapping".to_string()]
+        );
     }
 
     #[test]

@@ -169,11 +169,16 @@ pub struct MatrixConfig {
     pub max_parallel: Option<usize>,
     #[serde(default, rename = "fail-fast")]
     pub fail_fast: Option<bool>,
+    /// Set when the whole matrix is one expression, such as
+    /// `matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}`.
+    #[serde(skip)]
+    pub expression: Option<String>,
 }
 
 impl Default for MatrixConfig {
     fn default() -> Self {
         Self {
+            expression: None,
             parameters: IndexMap::new(),
             include: MatrixEntries::default(),
             exclude: MatrixEntries::default(),
@@ -184,17 +189,80 @@ impl Default for MatrixConfig {
 }
 
 impl MatrixConfig {
-    /// Returns a copy with any `include`/`exclude` expression replaced by the
-    /// list it evaluates to, ready for [`expand_matrix`].
+    /// A matrix given as one `${{ }}` expression, known only at run time.
+    pub fn from_expression(expr: String) -> Self {
+        Self {
+            expression: Some(expr),
+            fail_fast: None,
+            ..Self::default()
+        }
+    }
+
+    /// Returns a copy with every expression (the whole matrix, an axis, or
+    /// `include`/`exclude`) replaced by what it evaluates to, ready for
+    /// [`expand_matrix`].
     pub fn resolve_expressions<F>(&self, mut evaluate: F) -> Result<Self, MatrixError>
     where
         F: FnMut(&str) -> Result<String, String>,
     {
+        let whole;
+        let matrix = match &self.expression {
+            Some(expr) => {
+                whole = Self::evaluate_whole(expr, &mut evaluate)?;
+                &whole
+            }
+            None => self,
+        };
+        let mut parameters = IndexMap::with_capacity(matrix.parameters.len());
+        for (axis, value) in &matrix.parameters {
+            let value = match value {
+                Value::String(expr) if is_expression(expr) => {
+                    resolve_axis(axis, expr, &mut evaluate)?
+                }
+                other => other.clone(),
+            };
+            parameters.insert(axis.clone(), value);
+        }
         Ok(Self {
-            include: self.include.resolve("include", &mut evaluate)?,
-            exclude: self.exclude.resolve("exclude", &mut evaluate)?,
-            ..self.clone()
+            parameters,
+            include: matrix.include.resolve("include", &mut evaluate)?,
+            exclude: matrix.exclude.resolve("exclude", &mut evaluate)?,
+            ..matrix.clone()
         })
+    }
+
+    fn evaluate_whole<F>(expr: &str, evaluate: &mut F) -> Result<Self, MatrixError>
+    where
+        F: FnMut(&str) -> Result<String, String>,
+    {
+        check_strategy_expression(expr)
+            .map_err(|e| MatrixError::ExpressionError(format!("matrix {}", e)))?;
+        let json = evaluate(expr)
+            .map_err(|e| MatrixError::ExpressionError(format!("matrix '{}': {}", expr, e)))?;
+        serde_json::from_str(&json).map_err(|e| {
+            MatrixError::ExpressionError(format!(
+                "matrix '{}' must evaluate to an object, got '{}': {}",
+                expr, json, e
+            ))
+        })
+    }
+}
+
+/// Evaluate an axis such as `os: ${{ fromJSON(needs.setup.outputs.os) }}`.
+fn resolve_axis<F>(axis: &str, expr: &str, evaluate: &mut F) -> Result<Value, MatrixError>
+where
+    F: FnMut(&str) -> Result<String, String>,
+{
+    check_strategy_expression(expr)
+        .map_err(|e| MatrixError::ExpressionError(format!("matrix axis '{}' {}", axis, e)))?;
+    let json = evaluate(expr)
+        .map_err(|e| MatrixError::ExpressionError(format!("matrix axis '{}': {}", axis, e)))?;
+    match serde_json::from_str(&json) {
+        Ok(value @ Value::Sequence(_)) => Ok(value),
+        _ => Err(MatrixError::ExpressionError(format!(
+            "matrix axis '{}' '{}' must evaluate to an array, got '{}'",
+            axis, expr, json
+        ))),
     }
 }
 
@@ -234,6 +302,12 @@ pub enum MatrixError {
 
 /// Expands a matrix configuration into a list of all valid combinations
 pub fn expand_matrix(matrix: &MatrixConfig) -> Result<Vec<MatrixCombination>, MatrixError> {
+    if let Some(expr) = &matrix.expression {
+        return Err(MatrixError::ExpressionError(format!(
+            "matrix '{}' is only known at run time",
+            expr
+        )));
+    }
     let mut combinations = Vec::new();
     let include = matrix.include.literal("include")?;
     let exclude = matrix.exclude.literal("exclude")?;
@@ -470,6 +544,7 @@ mod tests {
             );
         }
         MatrixConfig {
+            expression: None,
             parameters,
             include: MatrixEntries::default(),
             exclude: MatrixEntries::default(),
@@ -779,5 +854,53 @@ mod tests {
             .unwrap_err();
 
         assert!(err.to_string().contains("bad token"));
+    }
+
+    #[test]
+    fn whole_matrix_expression_resolves_with_axes_and_include() {
+        let matrix = MatrixConfig::from_expression("${{ fromJSON(needs.a.outputs.m) }}".into());
+        assert!(expand_matrix(&matrix).is_err());
+
+        let resolved = matrix
+            .resolve_expressions(|_| {
+                Ok(r#"{"os":["a","b"],"n":[1],"include":[{"os":"c","n":9}]}"#.to_string())
+            })
+            .unwrap();
+        assert_eq!(expand_matrix(&resolved).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn whole_matrix_expression_must_be_an_object() {
+        let matrix = MatrixConfig::from_expression("${{ fromJSON(needs.a.outputs.m) }}".into());
+        let err = matrix
+            .resolve_expressions(|_| Ok("[1,2]".to_string()))
+            .unwrap_err();
+        assert!(err.to_string().contains("must evaluate to an object"));
+    }
+
+    #[test]
+    fn whole_matrix_expression_checks_allowed_contexts() {
+        let matrix = MatrixConfig::from_expression("${{ fromJSON(steps.a.outputs.m) }}".into());
+        assert!(matrix
+            .resolve_expressions(|_| Ok("{}".to_string()))
+            .is_err());
+    }
+
+    #[test]
+    fn axis_expression_resolves_to_its_array() {
+        let mut matrix = MatrixConfig::default();
+        matrix.parameters.insert(
+            "os".to_string(),
+            Value::String("${{ fromJSON(needs.a.outputs.os) }}".to_string()),
+        );
+        let resolved = matrix
+            .resolve_expressions(|_| Ok(r#"["a","b"]"#.to_string()))
+            .unwrap();
+        assert_eq!(expand_matrix(&resolved).unwrap().len(), 2);
+
+        let err = matrix
+            .resolve_expressions(|_| Ok("".to_string()))
+            .unwrap_err();
+        assert!(err.to_string().contains("must evaluate to an array"));
     }
 }

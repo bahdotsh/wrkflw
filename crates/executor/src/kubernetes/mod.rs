@@ -1660,6 +1660,40 @@ esac
         wait_for_delete(work.path());
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_preserved_failure_keeps_the_pod_and_forgets_it() {
+        let work = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::write(ws.path().join("deleted.txt"), "x").unwrap();
+        let mut rt = runtime_with_fake_cluster(work.path());
+        rt.preserve_pods_on_failure = true;
+
+        let output = rt
+            .run_container(
+                "ubuntu:22.04",
+                &["sh", "-c", "exit 3"],
+                &[],
+                Path::new("/github/workspace"),
+                &[(ws.path(), Path::new("/github/workspace"))],
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(output.exit_code, 3);
+
+        let log = std::fs::read_to_string(work.path().join("log")).unwrap();
+        assert!(!log.contains("delete pod"), "{}", log);
+        assert!(
+            !RUNNING_PODS
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|p| log.contains(&p.name)),
+            "a preserved pod must not be swept on exit"
+        );
+    }
+
     /// A "kubectl" that records its arguments in `log` instead.
     #[cfg(unix)]
     fn recording_pod(name: &str, log: &Path) -> PodRef {

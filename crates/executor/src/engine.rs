@@ -7286,6 +7286,7 @@ runs:
     /// so jobs never overlap there.
     struct OverlappingRuntime {
         all_steps_running: tokio::sync::Barrier,
+        github_dirs: Mutex<std::collections::HashSet<PathBuf>>,
     }
 
     #[async_trait::async_trait]
@@ -7304,12 +7305,16 @@ runs:
                     .iter()
                     .find(|(k, _)| *k == key)
                     .map(|(_, v)| v.to_string())
-                    .unwrap()
+                    .unwrap_or_default()
             };
             let (github_dir, _) = volumes
                 .iter()
                 .find(|(_, container)| *container == Path::new("/github/workflow"))
                 .unwrap();
+            self.github_dirs
+                .lock()
+                .unwrap()
+                .insert(github_dir.to_path_buf());
             fs::write(
                 github_dir.join("output"),
                 format!("value={}\n", env("GITHUB_JOB")),
@@ -7351,28 +7356,18 @@ runs:
         }
     }
 
-    /// Parallel jobs sharing run-level files would read and truncate each
-    /// other's `GITHUB_OUTPUT` when their steps end.
-    #[tokio::test]
-    async fn parallel_jobs_keep_their_own_github_files() {
+    /// Run `jobs` of `yaml` at once, each step held open until two overlap.
+    async fn run_overlapping(
+        yaml: &str,
+        jobs: &[&str],
+    ) -> (
+        Vec<JobResult>,
+        std::collections::HashSet<PathBuf>,
+        tempfile::TempDir,
+    ) {
         let run_dir = tempfile::tempdir().unwrap();
         let path = run_dir.path().join("ci.yml");
-        let job = |name: &str| {
-            format!(
-                "  {name}:\n    runs-on: ubuntu-latest\n    outputs:\n      \
-                 value: ${{{{ steps.write.outputs.value }}}}\n    steps:\n      \
-                 - id: write\n        run: echo unused\n"
-            )
-        };
-        fs::write(
-            &path,
-            format!(
-                "name: CI\non: push\njobs:\n{}{}",
-                job("first"),
-                job("second")
-            ),
-        )
-        .unwrap();
+        fs::write(&path, yaml).unwrap();
         let workflow = parse_workflow(&path).unwrap();
 
         environment::setup_github_environment_files(run_dir.path()).unwrap();
@@ -7390,8 +7385,9 @@ runs:
 
         let runtime = OverlappingRuntime {
             all_steps_running: tokio::sync::Barrier::new(2),
+            github_dirs: Mutex::default(),
         };
-        let jobs = vec!["first".to_string(), "second".to_string()];
+        let jobs: Vec<String> = jobs.iter().map(|job| job.to_string()).collect();
         let results = tokio::time::timeout(
             std::time::Duration::from_secs(30),
             execute_job_batch(
@@ -7411,8 +7407,29 @@ runs:
             ),
         )
         .await
-        .expect("both jobs must reach their step")
+        .expect("both steps must overlap")
         .unwrap();
+        let github_dirs = runtime.github_dirs.into_inner().unwrap();
+        (results, github_dirs, run_dir)
+    }
+
+    /// Parallel jobs sharing run-level files would read and truncate each
+    /// other's `GITHUB_OUTPUT` when their steps end.
+    #[tokio::test]
+    async fn parallel_jobs_keep_their_own_github_files() {
+        let job = |name: &str| {
+            format!(
+                "  {name}:\n    runs-on: ubuntu-latest\n    outputs:\n      \
+                 value: ${{{{ steps.write.outputs.value }}}}\n    steps:\n      \
+                 - id: write\n        run: echo unused\n"
+            )
+        };
+        let yaml = format!(
+            "name: CI\non: push\njobs:\n{}{}",
+            job("first"),
+            job("second")
+        );
+        let (results, _, _run_dir) = run_overlapping(&yaml, &["first", "second"]).await;
 
         for result in &results {
             assert_eq!(
@@ -7423,6 +7440,16 @@ runs:
             );
         }
         assert_eq!(results.len(), 2);
+    }
+
+    /// Matrix legs take a separate path through the engine from plain jobs.
+    #[tokio::test]
+    async fn parallel_matrix_legs_keep_their_own_github_files() {
+        let yaml = "name: CI\non: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    \
+                    strategy:\n      matrix:\n        leg: [one, two]\n    steps:\n      \
+                    - run: echo unused\n";
+        let (_, github_dirs, _run_dir) = run_overlapping(yaml, &["build"]).await;
+        assert_eq!(github_dirs.len(), 2, "{:?}", github_dirs);
     }
 
     /// Helper to build a minimal `WorkflowDefinition`.

@@ -90,6 +90,15 @@ const PULL_RETRY_REASONS: &[&str] = &["ErrImagePull", "ImagePullBackOff"];
 /// retries after 10, 20 and 40 seconds, so this covers two or three attempts.
 const PULL_RETRY_GRACE: Duration = Duration::from_secs(60);
 
+/// How long `kubectl get pod` may keep failing before a step gives up. A remote
+/// API server can drop a request at any time, and one lost poll must not cost
+/// a long step its work.
+const POLL_FAILURE_GRACE: Duration = Duration::from_secs(60);
+
+/// Passed to every status poll. Without it a request lost on the network
+/// hangs instead of failing, and no failure would ever be counted.
+const POLL_REQUEST_TIMEOUT: &str = "--request-timeout=30s";
+
 /// One id per process, stamped on every pod as a label so a crashed run's
 /// pods can be found with `kubectl get pods -l wrkflw.dev/session=<id>`.
 static SESSION_ID: Lazy<String> = Lazy::new(|| uuid::Uuid::new_v4().simple().to_string());
@@ -449,6 +458,46 @@ impl PullWatch {
     }
 }
 
+/// Tracks how long `kubectl get pod` has been failing without a success.
+#[derive(Default)]
+struct PollFailures {
+    first_failure: Option<std::time::Instant>,
+}
+
+impl PollFailures {
+    /// `Ok` while a failed poll is worth repeating. A pod that is gone will
+    /// not come back, so that ends the step at once.
+    fn check(
+        &mut self,
+        name: &str,
+        error: ContainerError,
+        now: std::time::Instant,
+        grace: Duration,
+    ) -> Result<(), ContainerError> {
+        if error.to_string().contains("(NotFound)") {
+            return Err(error);
+        }
+        let first_failure = *self.first_failure.get_or_insert_with(|| {
+            wrkflw_logging::warning(&format!(
+                "Could not read the status of pod {}, retrying for up to {} seconds: {}",
+                name,
+                grace.as_secs(),
+                error
+            ));
+            now
+        });
+        if now.duration_since(first_failure) >= grace {
+            Err(error)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn clear(&mut self) {
+        self.first_failure = None;
+    }
+}
+
 /// The first container waiting for one of `reasons`.
 fn waiting_reason(pod: &Value, reasons: &[&str]) -> Option<String> {
     for list in ["initContainerStatuses", "containerStatuses"] {
@@ -597,7 +646,11 @@ impl KubernetesRuntime {
 
     async fn get_pod(&self, name: &str) -> Result<Value, ContainerError> {
         let raw = self
-            .kubectl_ok(&["get", "pod", name, "-o", "json"], None, "kubectl get pod")
+            .kubectl_ok(
+                &["get", "pod", name, "-o", "json", POLL_REQUEST_TIMEOUT],
+                None,
+                "kubectl get pod",
+            )
             .await?;
         serde_json::from_str(&raw).map_err(|e| {
             ContainerError::ContainerExecution(format!(
@@ -605,6 +658,25 @@ impl KubernetesRuntime {
                 e
             ))
         })
+    }
+
+    /// [`Self::get_pod`] for polling loops: `None` means this poll failed and
+    /// the caller should try again after its usual sleep.
+    async fn poll_pod(
+        &self,
+        name: &str,
+        failures: &mut PollFailures,
+    ) -> Result<Option<Value>, ContainerError> {
+        match self.get_pod(name).await {
+            Ok(pod) => {
+                failures.clear();
+                Ok(Some(pod))
+            }
+            Err(e) => {
+                failures.check(name, e, std::time::Instant::now(), POLL_FAILURE_GRACE)?;
+                Ok(None)
+            }
+        }
     }
 
     async fn delete_pod(&self, name: &str) {
@@ -646,9 +718,13 @@ impl KubernetesRuntime {
     async fn wait_for_init_running(&self, name: &str) -> Result<(), ContainerError> {
         let mut unschedulable_since = None;
         let mut pull_watch = PullWatch::default();
+        let mut failures = PollFailures::default();
         let started = std::time::Instant::now();
         loop {
-            let pod = self.get_pod(name).await?;
+            let Some(pod) = self.poll_pod(name, &mut failures).await? else {
+                tokio::time::sleep(poll_interval(started.elapsed())).await;
+                continue;
+            };
             if let Some(reason) = stuck_reason(&pod, name, &mut pull_watch) {
                 return Err(ContainerError::ContainerStart(format!(
                     "pod {} cannot start: {}",
@@ -703,9 +779,13 @@ impl KubernetesRuntime {
     /// Block until the step container has exited, returning its exit code.
     async fn wait_for_main_terminated(&self, name: &str) -> Result<i32, ContainerError> {
         let mut pull_watch = PullWatch::default();
+        let mut failures = PollFailures::default();
         let started = std::time::Instant::now();
         loop {
-            let pod = self.get_pod(name).await?;
+            let Some(pod) = self.poll_pod(name, &mut failures).await? else {
+                tokio::time::sleep(poll_interval(started.elapsed())).await;
+                continue;
+            };
             if let Some(code) =
                 terminated_exit_code(container_state(&pod, "containerStatuses", MAIN_CONTAINER))
             {
@@ -1697,6 +1777,74 @@ esac
                 .any(|p| log.contains(&p.name)),
             "a preserved pod must not be swept on exit"
         );
+    }
+
+    #[test]
+    fn failed_polls_are_retried_until_the_grace_period_runs_out() {
+        let grace = Duration::from_secs(60);
+        let lost = || ContainerError::ContainerExecution("connection reset".to_string());
+        let start = std::time::Instant::now();
+        let mut failures = PollFailures::default();
+
+        assert!(failures.check("p", lost(), start, grace).is_ok());
+        let later = start + Duration::from_secs(59);
+        assert!(failures.check("p", lost(), later, grace).is_ok());
+        let expired = start + grace;
+        assert!(failures.check("p", lost(), expired, grace).is_err());
+
+        // A poll that worked starts the clock over.
+        failures.clear();
+        assert!(failures.check("p", lost(), expired, grace).is_ok());
+    }
+
+    #[test]
+    fn a_pod_that_is_gone_is_not_retried() {
+        let gone = ContainerError::ContainerExecution(
+            "kubectl get pod failed: Error from server (NotFound): pods \"p\" not found"
+                .to_string(),
+        );
+        let result = PollFailures::default().check(
+            "p",
+            gone,
+            std::time::Instant::now(),
+            Duration::from_secs(60),
+        );
+        assert!(result.is_err());
+    }
+
+    /// The API server drops polls in both waits, and the step still finishes.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_step_survives_an_api_server_that_drops_polls() {
+        let work = tempfile::tempdir().unwrap();
+        let script = work.path().join("kubectl.sh");
+        let body = r#"
+work="$(dirname "$0")"
+case "$1" in
+create) cat >/dev/null ;;
+get)
+    polls=$(($(cat "$work/polls" 2>/dev/null || echo 0) + 1))
+    echo "$polls" > "$work/polls"
+    case "$polls" in
+    1|3|4) echo "connection reset" >&2; exit 1 ;;
+    2) echo '{"status":{"phase":"Pending","initContainerStatuses":[{"name":"wrkflw-wait","state":{"running":{}}}]}}' ;;
+    *) echo '{"status":{"phase":"Running","containerStatuses":[{"name":"main","state":{"terminated":{"exitCode":0}}}]}}' ;;
+    esac
+    ;;
+logs) echo step output ;;
+esac
+"#;
+        std::fs::write(&script, body).unwrap();
+        let mut rt = KubernetesRuntime::new(cfg(), false);
+        rt.kubectl = "sh".into();
+        rt.kubectl_prefix = vec![script.to_string_lossy().to_string()];
+
+        let output = rt
+            .run_container("ubuntu", &[], &[], Path::new("/"), &[], None)
+            .await
+            .unwrap();
+        assert_eq!(output.exit_code, 0);
+        assert_eq!(output.stdout.trim(), "step output");
     }
 
     /// A "kubectl" that records its arguments in `log` instead.

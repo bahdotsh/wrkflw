@@ -1,7 +1,7 @@
 # Codebase Index: wrkflw
 
-> Generated: 2026-10-30 10:15:01 UTC | Files: 205 | Lines: 77306
-> Languages: JSON (4), Markdown (24), Rust (116), Shell (5), TOML (18), YAML (38)
+> Generated: 2026-10-31 18:45:07 UTC | Files: 208 | Lines: 83665
+> Languages: JSON (4), Markdown (24), Rust (119), Shell (5), TOML (18), YAML (38)
 
 ## Directory Structure
 
@@ -35,6 +35,10 @@ wrkflw/
         environment.rs
         expression.rs
         github_env_files.rs
+        kubernetes/
+          manifest.rs
+          mod.rs
+          sync.rs
         lib.rs
         podman.rs
         substitution.rs
@@ -301,11 +305,14 @@ wrkflw/
 - `# Run with auto-detection (default: tries Docker, then Podman, then emulation)`
 - `# Run with Docker explicitly`
 - `# Run with Podman`
+- `# Run each step as a pod in a Kubernetes cluster`
 - `# Run in emulation mode (no containers)`
 - `# Run in sandboxed secure emulation`
 - `# Run a specific job`
 - `# List jobs in a workflow`
 - `# Preserve failed containers for debugging`
+- `# Repeat the flag or separate entries with commas`
+- `# Set it once for every command, including the TUI and watch mode`
 - `# Auto-detect changed files from git (vs origin/HEAD, main/master, or HEAD~1)`
 - `# Pin the diff range`
 - `# Supply changed files explicitly (e.g. from a CI wrapper)`
@@ -319,6 +326,10 @@ wrkflw/
 - `# Force a color theme`
 - `# GitHub (requires GITHUB_TOKEN env var)`
 - `# GitLab (requires GITLAB_TOKEN env var)`
+- `# Pick the cluster and namespace, then run as usual`
+- `# Land on GPU nodes and request an accelerator for every step`
+- `# Private registry, and a registry wrkflw can push locally built images to`
+- `# Every flag has a WRKFLW_K8S_* environment variable, so set them once`
 - `# Environment variables (simplest)`
 - `# File-based secrets (JSON, YAML, or .env format)`
 - `# On Linux, put them in ~/.config/wrkflw/secrets/ (read by the `file` provider)`
@@ -393,6 +404,7 @@ wrkflw/
 - `pub fn detect_runtime(runtime_type: RuntimeType) -> RuntimeType`
 - `pub enum RuntimeType`
 - `pub struct ExecutionConfig`
+- `pub fn parse_platform_override(s: &str) -> Result<(String, String), String>`
 - `pub struct ExecutionResult`
 - `pub struct JobResult`
 - `pub enum JobStatus`
@@ -402,6 +414,11 @@ wrkflw/
 
 **crates/executor/src/environment.rs**
 - `pub fn setup_github_environment_files(workspace_dir: &Path) -> io::Result<()>`
+- `pub fn isolate_github_environment_files( job_env: &mut HashMap<String, String>, ) -> io::Result<tempfile::TempDir>`
+- `pub const CONTAINER_WORKSPACE: &str = "/github/workspace"`
+- `pub const CONTAINER_GITHUB_DIR: &str = "/github/workflow"`
+- `pub fn apply_github_container_context(env: &mut HashMap<String, String>)`
+- `pub fn apply_gitlab_container_context(env: &mut HashMap<String, String>)`
 - `pub fn create_github_context( workflow: &WorkflowDefinition, workspace_dir: &Path, ) -> HashMap<String, String>`
 - `pub fn add_job_context(env: &mut HashMap<String, String>, job_name: &str)`
 - `pub fn add_matrix_context( env: &mut HashMap<String, String>, matrix_combination: &MatrixCombination, )`
@@ -422,6 +439,41 @@ wrkflw/
 - `pub fn apply_step_environment_updates( job_env: &mut HashMap<String, String>, job_user_env: &mut HashMap<String, String>, step_outputs_map: &mut HashMap<String, HashMap<String, String>>, step_id: Option<&str>, )`
 - `pub fn clear_step_files(job_env: &HashMap<String, String>)`
 
+**crates/executor/src/kubernetes/manifest.rs**
+- `pub(super) struct Mount`
+- `pub(super) fn plan_mounts(volumes: &[(&Path, &Path)]) -> Vec<Mount>`
+- `pub(super) fn nested_excludes(mount: &Mount, all: &[Mount]) -> Vec<String>`
+- `pub(super) fn is_nested(mount: &Mount, all: &[Mount]) -> bool`
+- `pub(super) struct PodInput<'a>`
+- `pub(super) fn build_pod_manifest(config: &KubernetesConfig, input: &PodInput<'_>) -> Value`
+- `pub(super) fn active_deadline_seconds(config: &KubernetesConfig) -> u64`
+- `pub(super) fn helper_resources() -> Value`
+- `pub(super) fn escape_k8s_expansion(s: &str) -> String`
+
+**crates/executor/src/kubernetes/mod.rs**
+- `pub const DEFAULT_HELPER_IMAGE: &str = "busybox:1.36@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662"`
+- `pub const DEFAULT_TIMEOUT_SECS: u64 = 6 * 60 * 60`
+- `pub const DEFAULT_SCHEDULE_TIMEOUT_SECS: u64 = 10 * 60`
+- `pub struct KubernetesConfig`
+- `pub fn parse_key_value(s: &str) -> Result<(String, String), String>`
+- `pub fn is_available() -> bool`
+- `pub fn is_available_with(config: &KubernetesConfig) -> bool`
+- `pub fn check_available(config: &KubernetesConfig) -> Result<(), String>`
+- `pub async fn cleanup_resources()`
+- `pub struct KubernetesRuntime`
+
+**crates/executor/src/kubernetes/sync.rs**
+- `pub(super) fn drain_stderr(child: &mut std::process::Child) -> std::thread::JoinHandle<String>`
+- `pub(super) fn copy_dir_into_pod( kubectl: &OsStr, kubectl_args: &[String], pod: &str, mount: &Mount, ) -> Result<(), ContainerError>`
+- `pub(super) fn stream_dir_into( mut command: std::process::Command, mount: &Mount, ) -> Result<(), ContainerError>`
+- `pub(super) fn unpack_archive<R: io::Read>( reader: R, host: &Path, cancelled: &AtomicBool, ) -> io::Result<HashSet<PathBuf>>`
+- `pub(super) fn prune_to_archive( host: &Path, seen: &HashSet<PathBuf>, keep: &[String], ) -> io::Result<()>`
+- `pub(super) fn safe_relative_path(path: &Path) -> Option<PathBuf>`
+- `pub(super) fn clear_type_conflict( host: &Path, rel: &Path, incoming_is_dir: bool, ) -> io::Result<()>`
+- `pub(super) fn prune_unlisted( host: &Path, rel: &Path, seen: &HashSet<PathBuf>, keep: &[PathBuf], ) -> io::Result<()>`
+- `pub(super) fn copy_dir_out_of_pod( kubectl: &OsStr, kubectl_args: &[String], pod: &str, mount: &Mount, excludes: &[String], cancelled: &AtomicBool, ) -> Result<(), ContainerError>`
+- `pub(super) fn sync_from( mut command: std::process::Command, src: &str, host: &Path, excludes: &[String], prune: bool, cancelled: &AtomicBool, ) -> Result<(), ContainerError>`
+
 **crates/executor/src/lib.rs**
 - `pub mod action_resolver`
 - `pub mod dependency`
@@ -430,6 +482,7 @@ wrkflw/
 - `pub mod environment`
 - `pub mod expression`
 - `pub mod github_env_files`
+- `pub mod kubernetes`
 - `pub mod podman`
 - `pub mod substitution`
 
@@ -447,7 +500,9 @@ wrkflw/
 - `pub fn process_step_run(run: &str, matrix_combination: &Option<HashMap<String, Value>>) -> String`
 - `pub fn apply_matrix_to_steps(steps: &[Step], matrix_values: &HashMap<String, Value>) -> Vec<Step>`
 - `pub fn preprocess_hash_files(text: &str, workspace: &Path) -> Result<String, String>`
+- `pub fn expand_hash_files(expr: &str, workspace: &Path) -> Result<String, String>`
 - `pub fn preprocess_expressions( text: &str, workspace: &Path, ctx: &crate::expression::ExpressionContext<'_>, ) -> Result<String, String>`
+- `pub fn preprocess_expressions_strict( text: &str, workspace: &Path, ctx: &crate::expression::ExpressionContext<'_>, ) -> Result<String, String>`
 
 **crates/executor/src/workflow_commands.rs**
 - `pub enum WorkflowCommand`
@@ -814,7 +869,7 @@ wrkflw/
 - `# })?;`
 
 **crates/ui/src/app/mod.rs**
-- `pub async fn run_wrkflw_tui( path: Option<&PathBuf>, runtime_type: RuntimeType, verbose: bool, preserve_containers_on_failure: bool, show_action_messages: bool, theme: Option<ThemePreference>, ) -> io::Result<()>`
+- `pub async fn run_wrkflw_tui( path: Option<&PathBuf>, runtime_type: RuntimeType, verbose: bool, preserve_containers_on_failure: bool, show_action_messages: bool, theme: Option<ThemePreference>, platform_overrides: HashMap<String, String>, kubernetes: wrkflw_executor::KubernetesConfig, ) -> io::Result<()>`
 
 **crates/ui/src/app/state.rs**
 - `pub struct App`
@@ -880,7 +935,7 @@ wrkflw/
 
 **crates/ui/src/handlers/workflow.rs**
 - `pub fn validate_workflow(path: &Path, verbose: bool) -> io::Result<()>`
-- `pub async fn execute_workflow_cli( path: &Path, runtime_type: RuntimeType, verbose: bool, show_action_messages: bool, ) -> io::Result<()>`
+- `pub async fn execute_workflow_cli( path: &Path, runtime_type: RuntimeType, verbose: bool, show_action_messages: bool, platform_overrides: HashMap<String, String>, kubernetes: wrkflw_executor::KubernetesConfig, ) -> io::Result<()>`
 - `pub async fn execute_curl_trigger( workflow_name: &str, branch: Option<&str>, ) -> Result<(Vec<wrkflw_executor::JobResult>, ()), String>`
 - `pub fn start_next_workflow_execution( app: &mut App, tx_clone: &mpsc::Sender<ExecutionResultMsg>, verbose: bool, )`
 
@@ -1398,7 +1453,7 @@ wrkflw/
 
 ## BREAKING_CHANGES.md
 
-**Language:** Markdown | **Size:** 7.6 KB | **Lines:** 186
+**Language:** Markdown | **Size:** 8.9 KB | **Lines:** 210
 
 **Declarations:**
 
@@ -1422,7 +1477,7 @@ wrkflw/
 
 ## INDEX.md
 
-**Language:** Markdown | **Size:** 153.9 KB | **Lines:** 6039
+**Language:** Markdown | **Size:** 170.1 KB | **Lines:** 6438
 
 **Declarations:**
 
@@ -1430,7 +1485,7 @@ wrkflw/
 
 ## README.md
 
-**Language:** Markdown | **Size:** 11.4 KB | **Lines:** 295
+**Language:** Markdown | **Size:** 19.2 KB | **Lines:** 379
 
 **Declarations:**
 
@@ -1507,7 +1562,7 @@ wrkflw/
 
 ## crates/executor/README.md
 
-**Language:** Markdown | **Size:** 1.7 KB | **Lines:** 37
+**Language:** Markdown | **Size:** 1.6 KB | **Lines:** 35
 
 **Declarations:**
 
@@ -1656,7 +1711,7 @@ wrkflw/
 
 ## crates/executor/src/docker.rs
 
-**Language:** Rust | **Size:** 49.0 KB | **Lines:** 1303
+**Language:** Rust | **Size:** 49.6 KB | **Lines:** 1352
 
 **Imports:**
 - `async_trait::async_trait`
@@ -1716,6 +1771,8 @@ wrkflw/
   `async fn image_exists(&self, tag: &str) -> Result<bool, ContainerError>`
 
 
+`fn build_container_config( image: &str, cmd: Vec<String>, env: Vec<String>, working_dir: &Path, host_config: HostConfig, is_windows_image: bool, entrypoint: Option<&str>, ) -> Config<String>`
+
 **`impl DockerRuntime`**
   `async fn run_container_inner( &self, image: &str, cmd: &[&str], env_vars: &[(&str, &str)], working_dir: &Path, volumes: &[(&Path, &Path)], entrypoint: Option<&str>, ) -> Result<ContainerOutput, ContainerError>`
 
@@ -1723,6 +1780,8 @@ wrkflw/
 
   `async fn build_image_inner( &self, dockerfile: &Path, tag: &str, context_dir: &Path, ) -> Result<(), ContainerError>`
 
+
+`mod tests`
 
 ---
 
@@ -1747,7 +1806,7 @@ wrkflw/
 
 ## crates/executor/src/engine.rs
 
-**Language:** Rust | **Size:** 384.4 KB | **Lines:** 10583
+**Language:** Rust | **Size:** 431.9 KB | **Lines:** 11856
 
 **Imports:**
 - `bollard::Docker`
@@ -1760,7 +1819,7 @@ wrkflw/
 - `std::sync::{Arc, Mutex}`
 - `thiserror::Error`
 - `ignore::{gitignore::GitignoreBuilder, Match}`
-- *... and 13 more imports*
+- *... and 14 more imports*
 
 **Declarations:**
 
@@ -1776,7 +1835,28 @@ wrkflw/
 
 `fn resolve_gitlab_dependencies( pipeline: &Pipeline, workflow: &WorkflowDefinition, ) -> Result<Vec<Vec<String>>, ExecutionError>`
 
-`fn initialize_runtime( runtime_type: RuntimeType, preserve_containers_on_failure: bool, ) -> Result<Box<dyn ContainerRuntime>, ExecutionError>`
+`type EnvMap = HashMap<String, String>`
+
+`fn github_run_env( workflow: &WorkflowDefinition, workspace_dir: &Path, runtime: &RuntimeType, ) -> Result<(EnvMap, EnvMap), ExecutionError>`
+
+`enum CiPlatform`
+> Variants: `GitHub`, `GitLab`
+
+`fn seed_runtime_context( env: &mut HashMap<String, String>, runtime: &RuntimeType, platform: CiPlatform, )`
+
+`fn emulation_runtime() -> (Box<dyn ContainerRuntime>, RuntimeType)`
+
+`fn initialize_runtime( runtime_type: RuntimeType, preserve_containers_on_failure: bool, kubernetes: &KubernetesConfig, ) -> Result<(Box<dyn ContainerRuntime>, RuntimeType), ExecutionError>`
+
+**`impl RuntimeType`**
+  `fn runs_in_container(&self) -> bool`
+
+  `pub fn mode_name(&self) -> &'static str`
+
+
+`fn warn_if_overrides_unused(config: &ExecutionConfig)`
+
+`fn overrides_unused( platform_overrides: &HashMap<String, String>, runtime_type: &RuntimeType, ) -> bool`
 
 **`impl JobResult`**
   `fn skipped( name: impl Into<String>, canonical_name: impl Into<String>, logs: impl Into<String>, ) -> Self`
@@ -1847,14 +1927,18 @@ wrkflw/
 
 `async fn build_combined_runtime_image( runtimes: &[SetupRuntime], base_image: &str, runtime: &dyn ContainerRuntime, ) -> Result<String, ExecutionError>`
 
-`async fn resolve_runner_image( job: &Job, steps: &[Step], runtime: &dyn ContainerRuntime, ) -> Result<String, ExecutionError>`
+`fn action_context_hash(dockerfile: &Path, context_dir: &Path) -> std::io::Result<String>`
 
-`async fn execute_job_batch( jobs: &[String], workflow: &WorkflowDefinition, runtime: &dyn ContainerRuntime, env_context: &HashMap<String, String>, user_env: &HashMap<String, String>, verbose: bool, secret_manager: Option<&SecretManager>, secret_masker: Option<&SecretMasker>, all_job_outputs: &HashMap<String, HashMap<String, String>>, all_job_results: &HashMap<String, String>, artifact_store: &crate::artifacts::ArtifactStore, cache_store: &crate::cache::CacheStore, ) -> Result<Vec<JobResult>, ExecutionError>`
+`async fn ensure_action_image( runtime: &dyn ContainerRuntime, tag_prefix: &str, dockerfile: &Path, context_dir: &Path, ) -> Result<String, wrkflw_runtime::container::ContainerError>`
+
+`async fn resolve_runner_image( job: &Job, steps: &[Step], runtime: &dyn ContainerRuntime, platform_overrides: &HashMap<String, String>, matrix: Option<&HashMap<String, Value>>, ) -> Result<String, ExecutionError>`
+
+`async fn execute_job_batch( jobs: &[String], workflow: &WorkflowDefinition, runtime: &dyn ContainerRuntime, env_context: &HashMap<String, String>, user_env: &HashMap<String, String>, verbose: bool, secret_manager: Option<&SecretManager>, secret_masker: Option<&SecretMasker>, all_job_outputs: &HashMap<String, HashMap<String, String>>, all_job_results: &HashMap<String, String>, artifact_store: &crate::artifacts::ArtifactStore, cache_store: &crate::cache::CacheStore, platform_overrides: &HashMap<String, String>, ) -> Result<Vec<JobResult>, ExecutionError>`
 
 `struct JobExecutionContext<'a>`
 > Fields: `job_name: &'a str`, `workflow: &'a WorkflowDefinition`, `runtime: &'a dyn ContainerRuntime`, `env_context: &'a HashMap<String, String>`, `user_env: &'a HashMap<String, String>`, `verbose: bool`, `services: JobServices<'a>`
 
-`async fn execute_job_with_matrix( job_name: &str, workflow: &WorkflowDefinition, runtime: &dyn ContainerRuntime, env_context: &HashMap<String, String>, user_env: &HashMap<String, String>, verbose: bool, secret_manager: Option<&SecretManager>, secret_masker: Option<&SecretMasker>, all_job_outputs: &HashMap<String, HashMap<String, String>>, all_job_results: &HashMap<String, String>, artifact_store: &crate::artifacts::ArtifactStore, cache_store: &crate::cache::CacheStore, ) -> Result<Vec<JobResult>, ExecutionError>`
+`async fn execute_job_with_matrix( job_name: &str, workflow: &WorkflowDefinition, runtime: &dyn ContainerRuntime, env_context: &HashMap<String, String>, user_env: &HashMap<String, String>, verbose: bool, secret_manager: Option<&SecretManager>, secret_masker: Option<&SecretMasker>, all_job_outputs: &HashMap<String, HashMap<String, String>>, all_job_results: &HashMap<String, String>, artifact_store: &crate::artifacts::ArtifactStore, cache_store: &crate::cache::CacheStore, platform_overrides: &HashMap<String, String>, ) -> Result<Vec<JobResult>, ExecutionError>`
 
 `async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, ExecutionError>`
 
@@ -1872,7 +1956,7 @@ wrkflw/
 > Fields: `key: String`, `path: String`, `workspace: std::path::PathBuf`
 
 `pub(crate) struct JobServices<'a>`
-> Fields: `secret_manager: Option<&'a SecretManager>`, `secret_masker: Option<&'a SecretMasker>`, `secrets_context: &'a HashMap<String, String>`, `needs_context: &'a HashMap<String, HashMap<String, String>>`, `needs_results: &'a HashMap<String, String>`, `artifact_store: &'a crate::artifacts::ArtifactStore`, `cache_store: &'a crate::cache::CacheStore`
+> Fields: `secret_manager: Option<&'a SecretManager>`, `secret_masker: Option<&'a SecretMasker>`, `secrets_context: &'a HashMap<String, String>`, `needs_context: &'a HashMap<String, HashMap<String, String>>`, `needs_results: &'a HashMap<String, String>`, `artifact_store: &'a crate::artifacts::ArtifactStore`, `cache_store: &'a crate::cache::CacheStore`, `platform_overrides: &'a HashMap<String, String>`
 
 `async fn flush_pending_cache_saves( pending: &std::sync::Mutex<Vec<PendingCacheSave>>, cache_store: &crate::cache::CacheStore, )`
 
@@ -1904,6 +1988,12 @@ wrkflw/
   `fn expr_context_with_env<'e>( &self, env: &'e HashMap<String, String>, user_env: &'e HashMap<String, String>, ) -> crate::expression::ExpressionContext<'e> where 'a: 'e,`
 
 
+`fn resolve_working_directory( wd: &str, ctx: &StepExecutionContext<'_>, step_env: &HashMap<String, String>, step_user_env: &HashMap<String, String>, ) -> Result<String, String>`
+
+`fn workspace_relative_input(path: &str, job_env: &HashMap<String, String>) -> String`
+
+`fn relative_to_workspace(path: &str, workspace: &str) -> String`
+
 `fn preprocess_with_value(value: &str, ctx: &StepExecutionContext<'_>) -> String`
 
 `async fn handle_upload_artifact( step_name: &str, ctx: &StepExecutionContext<'_>, ) -> Result<StepResult, ExecutionError>`
@@ -1924,7 +2014,9 @@ wrkflw/
 
 `fn get_runner_image_from_opt(runs_on: &Option<Vec<String>>) -> String`
 
-`fn get_effective_runner_image(job: &Job) -> String`
+`fn find_platform_override( runs_on: &Option<Vec<String>>, platform_overrides: &HashMap<String, String>, matrix: Option<&HashMap<String, Value>>, ) -> Option<String>`
+
+`fn get_effective_runner_image( job: &Job, platform_overrides: &HashMap<String, String>, matrix: Option<&HashMap<String, Value>>, ) -> String`
 
 `struct StepContainerContext`
 > Fields: `owned_volume_paths: Vec<VolumePathPair>`, `github_mount: Option<VolumePathPair>`, `is_container_runtime: bool`
@@ -1933,13 +2025,13 @@ wrkflw/
   `fn build_volumes<'a>( &'a self, working_dir: &'a Path, container_workspace: &'a Path, ) -> Vec<(&'a Path, &'a Path)>`
 
 
-`fn prepare_step_container_context( step_env: &mut HashMap<String, String>, job_env: &HashMap<String, String>, container_config: Option<&JobContainer>, ) -> StepContainerContext`
+`fn prepare_step_container_context( step_env: &mut HashMap<String, String>, job_env: &HashMap<String, String>, container_config: Option<&JobContainer>, mounts_are_copies: bool, ) -> StepContainerContext`
 
 `type VolumePathPair = (PathBuf, PathBuf)`
 
 `fn uses_container_runtime(step_env: &HashMap<String, String>) -> bool`
 
-`fn prepare_container_mounts( step_env: &mut HashMap<String, String>, job_env: &HashMap<String, String>, container_config: Option<&JobContainer>, ) -> (Vec<VolumePathPair>, Option<VolumePathPair>)`
+`fn prepare_container_mounts( step_env: &mut HashMap<String, String>, job_env: &HashMap<String, String>, container_config: Option<&JobContainer>, mounts_are_copies: bool, ) -> (Vec<VolumePathPair>, Option<VolumePathPair>)`
 
 `fn warn_unsupported_container_fields(container: &JobContainer)`
 
@@ -1985,6 +2077,8 @@ wrkflw/
 
 `fn resolve_matrix_expressions( matrix: &wrkflw_matrix::MatrixConfig, env_context: &HashMap<String, String>, user_env: &HashMap<String, String>, needs_context: &HashMap<String, HashMap<String, String>>, needs_results: &HashMap<String, String>, ) -> Result<wrkflw_matrix::MatrixConfig, wrkflw_matrix::MatrixError>`
 
+`fn evaluate_step_condition( condition: &str, working_dir: &Path, ctx: &crate::expression::ExpressionContext<'_>, ) -> bool`
+
 `fn evaluate_condition_with_context( condition: &str, ctx: &crate::expression::ExpressionContext<'_>, ) -> bool`
 
 `fn build_needs_context( job: &Job, all_outputs: &HashMap<String, HashMap<String, String>>, all_results: &HashMap<String, String>, ) -> ( HashMap<String, HashMap<String, String>>, HashMap<String, String>, )`
@@ -1999,7 +2093,7 @@ wrkflw/
 
 ## crates/executor/src/environment.rs
 
-**Language:** Rust | **Size:** 12.3 KB | **Lines:** 432
+**Language:** Rust | **Size:** 17.9 KB | **Lines:** 573
 
 **Imports:**
 - `chrono::Utc`
@@ -2010,6 +2104,12 @@ wrkflw/
 - `wrkflw_parser::workflow::WorkflowDefinition`
 
 **Declarations:**
+
+`fn create_runner_temp(dir: &Path) -> io::Result<()>`
+
+`const RUNNER_TEMP_DIR: &str = "runner_temp"`
+
+`fn container_runner_temp() -> String`
 
 `fn value_to_string(value: &Value) -> String`
 
@@ -2047,7 +2147,7 @@ wrkflw/
 
 ## crates/executor/src/expression.rs
 
-**Language:** Rust | **Size:** 113.2 KB | **Lines:** 2809
+**Language:** Rust | **Size:** 125.4 KB | **Lines:** 3130
 
 **Imports:**
 - `serde_yaml::Value`
@@ -2061,9 +2161,13 @@ wrkflw/
 
   `pub fn to_output_string(&self) -> String`
 
+  `fn to_number(&self) -> f64`
+
+
+`fn parse_number(s: &str) -> f64`
 
 `enum Token`
-> Variants: `Ident`, `StringLit`, `NumberLit`, `True`, `False`, `Null`, `Dot`, `LParen`, `RParen`, `Comma`, `Eq`, `Ne`, `Lt`, `Le`, `Gt`, `Ge`, `And`, `Or`, `Not`, `Eof`
+> Variants: `Ident`, `StringLit`, `NumberLit`, `True`, `False`, `Null`, `Dot`, `LParen`, `LBracket`, `RBracket`, `Star`, `RParen`, `Comma`, `Eq`, `Ne`, `Lt`, `Le`, `Gt`, `Ge`, `And`, `Or`, `Not`, `Eof`
 
 `struct Tokenizer<'a>`
 > Fields: `input: &'a str`, `pos: usize`
@@ -2087,10 +2191,18 @@ wrkflw/
 `pub(crate) fn github_context_suffix(key: &str) -> Option<String>`
 
 **`impl<'a> ExpressionContext<'a>`**
+  `fn resolve_path(&self, parts: &[String]) -> ExprValue`
+
   `fn resolve(&self, parts: &[String]) -> ExprValue`
 
 
 `fn yaml_value_to_expr(v: &Value) -> ExprValue`
+
+`fn json_value_to_expr(v: &serde_json::Value) -> ExprValue`
+
+`fn index_value(value: &ExprValue, key: &ExprValue) -> ExprValue`
+
+`fn filter_children(value: &ExprValue) -> Vec<ExprValue>`
 
 `struct Parser`
 > Fields: `tokens: Vec<Token>`, `pos: usize`
@@ -2117,6 +2229,8 @@ wrkflw/
   `fn parse_primary(&mut self, ctx: &ExpressionContext) -> Result<ExprValue, String>`
 
   `fn parse_ident_or_call(&mut self, ctx: &ExpressionContext) -> Result<ExprValue, String>`
+
+  `fn parse_postfix( &mut self, mut value: ExprValue, ctx: &ExpressionContext, ) -> Result<ExprValue, String>`
 
 
 `fn expr_eq(a: &ExprValue, b: &ExprValue) -> bool`
@@ -2148,16 +2262,274 @@ wrkflw/
 
 ---
 
+## crates/executor/src/kubernetes/manifest.rs
+
+**Language:** Rust | **Size:** 20.6 KB | **Lines:** 552
+
+**Imports:**
+- `super::{
+    KubernetesConfig, DEADLINE_MARGIN_SECS, MAIN_CONTAINER, MANAGED_BY_LABEL, READY_MARKER,
+    SESSION_ID, SESSION_LABEL, SYNC_CONTAINER, SYNC_DIR, SYNC_VOLUME, WAIT_CONTAINER,
+}`
+- `crate::environment::{CONTAINER_GITHUB_DIR, CONTAINER_WORKSPACE}`
+- `serde_json::{json, Value}`
+- `std::path::{Path, PathBuf}`
+
+**Declarations:**
+
+`const MIRRORED_MOUNTS: &[&str] = &[CONTAINER_WORKSPACE, CONTAINER_GITHUB_DIR]`
+
+**`impl Mount`**
+  `pub(super) fn mirrored(&self) -> bool`
+
+
+`mod tests`
+
+---
+
+## crates/executor/src/kubernetes/mod.rs
+
+**Language:** Rust | **Size:** 70.7 KB | **Lines:** 2033
+
+**Imports:**
+- `async_trait::async_trait`
+- `manifest::{build_pod_manifest, is_nested, nested_excludes, plan_mounts, Mount, PodInput}`
+- `once_cell::sync::Lazy`
+- `serde_json::Value`
+- `std::collections::{BTreeMap, HashSet}`
+- `std::ffi::{OsStr, OsString}`
+- `std::path::Path`
+- `std::process::Stdio`
+- `std::sync::atomic::{AtomicBool, Ordering}`
+- `std::sync::{Arc, Mutex}`
+- *... and 4 more imports*
+
+**Declarations:**
+
+`mod manifest`
+
+`mod sync`
+
+`const DEADLINE_MARGIN_SECS: u64 = 30`
+
+`const AVAILABILITY_TIMEOUT: Duration = Duration::from_secs(5)`
+
+`const MAIN_CONTAINER: &str = "main"`
+
+`const WAIT_CONTAINER: &str = "wrkflw-wait"`
+
+`const SYNC_CONTAINER: &str = "wrkflw-sync"`
+
+`const SYNC_VOLUME: &str = "wrkflw-sync"`
+
+`const SYNC_DIR: &str = "/wrkflw-sync"`
+
+`const READY_MARKER: &str = "/wrkflw-sync/ready"`
+
+`const MANAGED_BY_LABEL: &str = "app.kubernetes.io/managed-by"`
+
+`const SESSION_LABEL: &str = "wrkflw.dev/session"`
+
+`const FATAL_WAITING_REASONS: &[&str] = &[ "ErrImageNeverPull", "InvalidImageName", "CreateContainerConfigError", "CreateContainerError", ]`
+
+`const PULL_RETRY_REASONS: &[&str] = &["ErrImagePull", "ImagePullBackOff"]`
+
+`const PULL_RETRY_GRACE: Duration = Duration::from_secs(60)`
+
+`const POLL_FAILURE_GRACE: Duration = Duration::from_secs(60)`
+
+`const POLL_REQUEST_TIMEOUT: &str = "--request-timeout=30s"`
+
+`static SESSION_ID: Lazy<String> = Lazy::new(|| uuid::Uuid::new_v4().simple().to_string())`
+
+`static RUNNING_PODS: Lazy<Mutex<Vec<PodRef>>> = Lazy::new(|| Mutex::new(Vec::new()))`
+
+`static PUSHED_IMAGES: Lazy<Mutex<HashSet<String>>> = Lazy::new(|| Mutex::new(HashSet::new()))`
+
+`struct PodRef`
+> Fields: `kubectl: OsString`, `kubectl_args: Vec<String>`, `name: String`
+
+`static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false)`
+
+`fn shutdown_error() -> ContainerError`
+
+**`impl KubernetesConfig`**
+  `pub fn helper_image(&self) -> &str`
+
+  `pub fn timeout(&self) -> Duration`
+
+  `pub fn schedule_timeout(&self) -> Duration`
+
+  `fn kubectl_args(&self) -> Vec<String>`
+
+  `pub fn describe(&self) -> String`
+
+
+`fn check_available_using(kubectl: &OsStr, config: &KubernetesConfig) -> Result<(), String>`
+
+`fn cluster_answers(kubectl: &OsStr, config: &KubernetesConfig) -> bool`
+
+`fn delete_args(name: &str) -> [&str; 5]`
+
+`async fn delete_tracked_pod(pod: &PodRef)`
+
+`fn track_pod(pod: &PodRef)`
+
+`fn untrack_pod(name: &str)`
+
+`struct PodGuard`
+> Fields: `pod: PodRef`, `armed: bool`, `preserve: bool`, `cancelled: Arc<AtomicBool>`
+
+**`impl PodGuard`**
+  `fn new(pod: PodRef, preserve: bool) -> Self`
+
+  `fn disarm(&mut self)`
+
+
+**`impl Drop for PodGuard`**
+  `fn drop(&mut self)`
+
+
+`fn inspect_hint(name: &str) -> String`
+
+`fn registry_ref(registry: &str, tag: &str) -> String`
+
+`fn is_locally_built(image: &str) -> bool`
+
+`fn pod_name() -> String`
+
+`fn poll_interval(elapsed: Duration) -> Duration`
+
+`fn container_state<'a>(pod: &'a Value, list: &str, container: &str) -> Option<&'a Value>`
+
+`fn is_running(state: Option<&Value>) -> bool`
+
+`fn terminated_exit_code(state: Option<&Value>) -> Option<i32>`
+
+`fn fatal_waiting_reason(pod: &Value) -> Option<String>`
+
+`fn stuck_reason(pod: &Value, name: &str, watch: &mut PullWatch) -> Option<String>`
+
+`struct PullWatch`
+> Fields: `first_failure: Option<std::time::Instant>`
+
+**`impl PullWatch`**
+  `fn check( &mut self, pod: &Value, name: &str, now: std::time::Instant, grace: Duration, ) -> Option<String>`
+
+
+`struct PollFailures`
+> Fields: `first_failure: Option<std::time::Instant>`
+
+**`impl PollFailures`**
+  `fn check( &mut self, name: &str, error: ContainerError, now: std::time::Instant, grace: Duration, ) -> Result<(), ContainerError>`
+
+  `fn clear(&mut self)`
+
+
+`fn waiting_reason(pod: &Value, reasons: &[&str]) -> Option<String>`
+
+`fn unschedulable_message(pod: &Value) -> Option<String>`
+
+`fn pod_phase(pod: &Value) -> &str`
+
+`fn pod_failure_message(pod: &Value) -> String`
+
+**`impl KubernetesRuntime`**
+  `pub fn new(config: KubernetesConfig, preserve_pods_on_failure: bool) -> Self`
+
+  `fn kubectl_args(&self) -> Vec<String>`
+
+  `async fn kubectl( &self, args: &[&str], stdin: Option<Vec<u8>>, ) -> Result<std::process::Output, ContainerError>`
+
+  `async fn kubectl_ok( &self, args: &[&str], stdin: Option<Vec<u8>>, what: &str, ) -> Result<String, ContainerError>`
+
+  `async fn get_pod(&self, name: &str) -> Result<Value, ContainerError>`
+
+  `async fn poll_pod( &self, name: &str, failures: &mut PollFailures, ) -> Result<Option<Value>, ContainerError>`
+
+  `async fn delete_pod(&self, name: &str)`
+
+  `fn pushed_ref(&self, tag: &str) -> Option<String>`
+
+  `fn cluster_image(&self, image: &str) -> Result<String, ContainerError>`
+
+  `async fn wait_for_init_running(&self, name: &str) -> Result<(), ContainerError>`
+
+  `async fn wait_for_main_terminated(&self, name: &str) -> Result<i32, ContainerError>`
+
+  `async fn clear_mount(&self, name: &str, mount: &Mount) -> Result<(), ContainerError>`
+
+  `async fn copy_in(&self, name: &str, mount: &Mount) -> Result<(), ContainerError>`
+
+  `async fn copy_out( &self, name: &str, mount: &Mount, excludes: Vec<String>, cancelled: Arc<AtomicBool>, ) -> Result<(), ContainerError>`
+
+  `async fn run_container_inner( &self, name: &str, image: &str, cmd: &[&str], env_vars: &[(&str, &str)], working_dir: &Path, volumes: &[(&Path, &Path)], entrypoint: Option<&str>, ) -> Result<ContainerOutput, ContainerError>`
+
+  `async fn run_pod( &self, name: &str, manifest: &Value, working_dir: &Path, mounts: &[Mount], cancelled: Arc<AtomicBool>, ) -> Result<ContainerOutput, ContainerError>`
+
+  `fn local_builder() -> Option<&'static str>`
+
+  `fn registry(&self) -> Result<&str, ContainerError>`
+
+  `async fn builder_command( &self, builder: &str, args: &[&str], timeout: Duration, what: &str, ) -> Result<(), ContainerError>`
+
+  `async fn push_local_image(&self, builder: &str, tag: &str) -> Result<(), ContainerError>`
+
+
+**`impl ContainerRuntime for KubernetesRuntime`**
+  `async fn run_container( &self, image: &str, cmd: &[&str], env_vars: &[(&str, &str)], working_dir: &Path, volumes: &[(&Path, &Path)], entrypoint: Option<&str>, ) -> Result<ContainerOutput, ContainerError>`
+
+  `async fn pull_image(&self, image: &str) -> Result<(), ContainerError>`
+
+  `async fn build_image( &self, dockerfile: &Path, tag: &str, context_dir: &Path, ) -> Result<(), ContainerError>`
+
+  `fn mounts_are_copies(&self) -> bool`
+
+  `async fn prepare_language_environment( &self, language: &str, _version: Option<&str>, _additional_packages: Option<Vec<String>>, ) -> Result<String, ContainerError>`
+
+  `async fn image_exists(&self, tag: &str) -> Result<bool, ContainerError>`
+
+
+`mod tests`
+
+---
+
+## crates/executor/src/kubernetes/sync.rs
+
+**Language:** Rust | **Size:** 29.9 KB | **Lines:** 845
+
+**Imports:**
+- `super::manifest::Mount`
+- `super::{SYNC_CONTAINER, WAIT_CONTAINER}`
+- `std::collections::HashSet`
+- `std::ffi::OsStr`
+- `std::io::{self, Read}`
+- `std::path::{Component, Path, PathBuf}`
+- `std::process::Stdio`
+- `std::sync::atomic::{AtomicBool, Ordering}`
+- `wrkflw_runtime::container::ContainerError`
+
+**Declarations:**
+
+`const MAX_STDERR_BYTES: usize = 64 * 1024`
+
+`fn append_tree<W: io::Write>(builder: &mut tar::Builder<W>, root: &Path) -> io::Result<()>`
+
+`mod tests`
+
+---
+
 ## crates/executor/src/lib.rs
 
-**Language:** Rust | **Size:** 533 B | **Lines:** 23
+**Language:** Rust | **Size:** 658 B | **Lines:** 25
 
 **Imports:**
 - `pub use docker::cleanup_resources`
 - `pub use engine::{
-    detect_runtime, execute_workflow, ExecutionConfig, JobResult, JobStatus, RuntimeType,
-    StepResult, StepStatus,
+    detect_runtime, execute_workflow, parse_platform_override, ExecutionConfig, JobResult,
+    JobStatus, RuntimeType, StepResult, StepStatus,
 }`
+- `pub use kubernetes::{parse_key_value as parse_k8s_key_value, KubernetesConfig}`
 
 **Declarations:**
 
@@ -2238,7 +2610,7 @@ wrkflw/
 
 ## crates/executor/src/substitution.rs
 
-**Language:** Rust | **Size:** 30.4 KB | **Lines:** 829
+**Language:** Rust | **Size:** 34.5 KB | **Lines:** 942
 
 **Imports:**
 - `lazy_static::lazy_static`
@@ -2251,7 +2623,11 @@ wrkflw/
 
 **Declarations:**
 
+`fn expression_end(text: &str, start: usize) -> Option<usize>`
+
 `fn compute_hash_files(args_raw: &str, workspace: &Path) -> Result<String, String>`
+
+`fn expand_expressions( text: &str, workspace: &Path, ctx: &crate::expression::ExpressionContext<'_>, strict: bool, ) -> Result<String, String>`
 
 `mod tests`
 
@@ -2747,7 +3123,7 @@ wrkflw/
 
 ## crates/runtime/src/container.rs
 
-**Language:** Rust | **Size:** 12.4 KB | **Lines:** 326
+**Language:** Rust | **Size:** 12.7 KB | **Lines:** 334
 
 **Imports:**
 - `async_trait::async_trait`
@@ -3762,7 +4138,7 @@ wrkflw/
 
 ## crates/ui/src/app/mod.rs
 
-**Language:** Rust | **Size:** 31.5 KB | **Lines:** 699
+**Language:** Rust | **Size:** 31.8 KB | **Lines:** 706
 
 **Imports:**
 - `crate::handlers::workflow::start_next_workflow_execution`
@@ -3778,11 +4154,11 @@ wrkflw/
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 }`
 - `ratatui::{backend::CrosstermBackend, Terminal}`
+- `std::collections::HashMap`
 - `std::io::{self, stdout}`
 - `std::path::PathBuf`
 - `std::sync::mpsc`
-- `std::time::{Duration, Instant}`
-- *... and 3 more imports*
+- *... and 4 more imports*
 
 **Declarations:**
 
@@ -3794,7 +4170,7 @@ wrkflw/
 
 ## crates/ui/src/app/state.rs
 
-**Language:** Rust | **Size:** 177.6 KB | **Lines:** 4400
+**Language:** Rust | **Size:** 181.3 KB | **Lines:** 4502
 
 **Imports:**
 - `crate::log_processor::{LogProcessingRequest, LogProcessor, ProcessedLogEntry}`
@@ -3806,13 +4182,15 @@ wrkflw/
 - `chrono::Local`
 - `crossterm::event::KeyCode`
 - `ratatui::widgets::{ListState, TableState}`
+- `std::collections::HashMap`
 - `std::path::{Path, PathBuf}`
 - `std::sync::atomic::{AtomicBool, Ordering}`
 - `std::sync::mpsc`
-- `std::sync::Arc`
-- *... and 4 more imports*
+- *... and 5 more imports*
 
 **Declarations:**
+
+`fn start_availability_probe( runtime: &RuntimeType, kubernetes: &wrkflw_executor::KubernetesConfig, ) -> Option<mpsc::Receiver<bool>>`
 
 **`impl TriggerPlatform`**
   `pub fn as_str(&self) -> &'static str`
@@ -3831,7 +4209,7 @@ wrkflw/
 
 
 **`impl App`**
-  `pub fn new( runtime_type: RuntimeType, tx: mpsc::Sender<ExecutionResultMsg>, preserve_containers_on_failure: bool, show_action_messages: bool, ) -> App`
+  `pub fn new( runtime_type: RuntimeType, tx: mpsc::Sender<ExecutionResultMsg>, preserve_containers_on_failure: bool, show_action_messages: bool, platform_overrides: HashMap<String, String>, kubernetes: wrkflw_executor::KubernetesConfig, ) -> App`
 
   `pub fn toggle_selected(&mut self)`
 
@@ -3850,6 +4228,8 @@ wrkflw/
   `pub fn check_diff_filter_results(&mut self)`
 
   `pub fn toggle_validation_mode(&mut self)`
+
+  `fn collect_availability_probe(&mut self)`
 
   `pub fn runtime_type_name(&self) -> &str`
 
@@ -4204,10 +4584,11 @@ wrkflw/
 
 ## crates/ui/src/handlers/workflow.rs
 
-**Language:** Rust | **Size:** 25.3 KB | **Lines:** 666
+**Language:** Rust | **Size:** 25.9 KB | **Lines:** 679
 
 **Imports:**
 - `crate::cli_style`
+- `std::collections::HashMap`
 - `std::io`
 - `std::path::{Path, PathBuf}`
 - `wrkflw_evaluator::evaluate_workflow_file`
@@ -4323,7 +4704,7 @@ wrkflw/
 
 ## crates/ui/src/theme.rs
 
-**Language:** Rust | **Size:** 18.3 KB | **Lines:** 572
+**Language:** Rust | **Size:** 18.6 KB | **Lines:** 578
 
 **Imports:**
 - `ratatui::{
@@ -4431,7 +4812,7 @@ wrkflw/
 
 ## crates/ui/src/views/execution_tab.rs
 
-**Language:** Rust | **Size:** 16.4 KB | **Lines:** 464
+**Language:** Rust | **Size:** 16.5 KB | **Lines:** 465
 
 **Imports:**
 - `crate::app::App`
@@ -4616,7 +4997,7 @@ wrkflw/
 
 ## crates/ui/src/views/secrets_tab.rs
 
-**Language:** Rust | **Size:** 9.8 KB | **Lines:** 292
+**Language:** Rust | **Size:** 10.0 KB | **Lines:** 297
 
 **Imports:**
 - `crate::app::App`
@@ -4649,7 +5030,7 @@ wrkflw/
 
 ## crates/ui/src/views/status_bar.rs
 
-**Language:** Rust | **Size:** 5.7 KB | **Lines:** 180
+**Language:** Rust | **Size:** 5.8 KB | **Lines:** 181
 
 **Imports:**
 - `super::{TAB_DAG, TAB_EXECUTION, TAB_HELP, TAB_LOGS, TAB_SECRETS, TAB_TRIGGER, TAB_WORKFLOWS}`
@@ -4673,7 +5054,7 @@ wrkflw/
 
 ## crates/ui/src/views/title_bar.rs
 
-**Language:** Rust | **Size:** 4.9 KB | **Lines:** 132
+**Language:** Rust | **Size:** 4.9 KB | **Lines:** 133
 
 **Imports:**
 - `crate::app::App`
@@ -5260,7 +5641,7 @@ wrkflw/
 
 ## crates/watcher/src/watcher.rs
 
-**Language:** Rust | **Size:** 51.6 KB | **Lines:** 1189
+**Language:** Rust | **Size:** 52.1 KB | **Lines:** 1199
 
 **Imports:**
 - `crate::error::WatchError`
@@ -5324,7 +5705,7 @@ wrkflw/
 
 ## crates/wrkflw/README.md
 
-**Language:** Markdown | **Size:** 4.8 KB | **Lines:** 131
+**Language:** Markdown | **Size:** 4.7 KB | **Lines:** 128
 
 **Declarations:**
 
@@ -5351,7 +5732,7 @@ wrkflw/
 
 ## crates/wrkflw/src/main.rs
 
-**Language:** Rust | **Size:** 36.8 KB | **Lines:** 1001
+**Language:** Rust | **Size:** 49.3 KB | **Lines:** 1353
 
 **Imports:**
 - `bollard::Docker`
@@ -5369,17 +5750,30 @@ wrkflw/
 `mod watch_cmd`
 
 `pub(crate) enum RuntimeChoice`
-> Variants: `Auto`, `Docker`, `Podman`, `Emulation`, `SecureEmulation`
+> Variants: `Auto`, `Docker`, `Podman`, `Kubernetes`, `Emulation`, `SecureEmulation`
 
 **`impl From<RuntimeChoice> for wrkflw_executor::RuntimeType`**
   `fn from(choice: RuntimeChoice) -> Self`
 
 
 `struct Wrkflw`
-> Fields: `command: Option<Commands>`, `verbose: bool`, `debug: bool`, `theme: Option<wrkflw_ui::theme::ThemePreference>`
+> Fields: `command: Option<Commands>`, `verbose: bool`, `debug: bool`, `theme: Option<wrkflw_ui::theme::ThemePreference>`, `platform: Vec<Option<(String, String)>>`, `kubernetes: KubernetesArgs`
+
+`struct KubernetesArgs`
+> Fields: `k8s_context: Option<String>`, `k8s_namespace: Option<String>`, `k8s_node_selector: Vec<Option<(String, String)>>`, `k8s_resource: Vec<Option<(String, String)>>`, `k8s_image_pull_secret: Vec<String>`, `k8s_registry: Option<String>`, `k8s_helper_image: Option<String>`, `k8s_timeout: Option<u64>`, `k8s_schedule_timeout: Option<u64>`
+
+**`impl KubernetesArgs`**
+  `fn to_config(&self) -> wrkflw_executor::KubernetesConfig`
+
 
 `enum Commands`
 > Variants: `Validate`, `Run`, `Watch`, `Tui`, `Trigger`, `TriggerGitlab`, `List`
+
+`fn parse_platform_arg(s: &str) -> Result<Option<(String, String)>, String>`
+
+`fn parse_k8s_key_val(s: &str) -> Result<Option<(String, String)>, String>`
+
+`fn collect_platform_overrides(entries: &[Option<(String, String)>]) -> HashMap<String, String>`
 
 `fn parse_key_val(s: &str) -> Result<(String, String), String>`
 
@@ -5434,17 +5828,18 @@ wrkflw/
 
 ## crates/wrkflw/src/run_workflow_cmd.rs
 
-**Language:** Rust | **Size:** 8.6 KB | **Lines:** 221
+**Language:** Rust | **Size:** 8.9 KB | **Lines:** 226
 
 **Imports:**
 - `crate::prefilter`
 - `crate::{is_gitlab_pipeline, RuntimeChoice}`
+- `std::collections::HashMap`
 - `std::path::PathBuf`
 
 **Declarations:**
 
 `pub(crate) struct RunCtx`
-> Fields: `path: PathBuf`, `runtime: RuntimeChoice`, `show_action_messages: bool`, `preserve_containers_on_failure: bool`, `gitlab: bool`, `job: Option<String>`, `event: Option<String>`, `diff: bool`, `changed_files: Option<Vec<String>>`, `diff_base: Option<String>`, `diff_head: Option<String>`, `base_branch: Option<String>`, `activity_type: Option<String>`, `strict_filter: bool`, `no_strict_filter: bool`, `verbose: bool`
+> Fields: `path: PathBuf`, `runtime: RuntimeChoice`, `show_action_messages: bool`, `preserve_containers_on_failure: bool`, `gitlab: bool`, `job: Option<String>`, `event: Option<String>`, `diff: bool`, `changed_files: Option<Vec<String>>`, `diff_base: Option<String>`, `diff_head: Option<String>`, `base_branch: Option<String>`, `activity_type: Option<String>`, `strict_filter: bool`, `no_strict_filter: bool`, `verbose: bool`, `platform_overrides: HashMap<String, String>`, `kubernetes: wrkflw_executor::KubernetesConfig`
 
 `pub(crate) async fn run(ctx: RunCtx)`
 
@@ -5452,17 +5847,18 @@ wrkflw/
 
 ## crates/wrkflw/src/watch_cmd.rs
 
-**Language:** Rust | **Size:** 10.6 KB | **Lines:** 255
+**Language:** Rust | **Size:** 10.8 KB | **Lines:** 260
 
 **Imports:**
 - `crate::prefilter`
 - `crate::RuntimeChoice`
+- `std::collections::HashMap`
 - `std::path::PathBuf`
 
 **Declarations:**
 
 `pub(crate) struct WatchCtx`
-> Fields: `path: Option<PathBuf>`, `runtime: RuntimeChoice`, `debounce: u64`, `event: String`, `show_action_messages: bool`, `preserve_containers_on_failure: bool`, `max_concurrency: usize`, `base_branch: Option<String>`, `activity_type: Option<String>`, `max_pending_events: Option<usize>`, `ignore_dirs: Vec<String>`, `strict_filter: bool`, `no_strict_filter: bool`, `verbose: bool`
+> Fields: `path: Option<PathBuf>`, `runtime: RuntimeChoice`, `debounce: u64`, `event: String`, `show_action_messages: bool`, `preserve_containers_on_failure: bool`, `max_concurrency: usize`, `base_branch: Option<String>`, `activity_type: Option<String>`, `max_pending_events: Option<usize>`, `ignore_dirs: Vec<String>`, `strict_filter: bool`, `no_strict_filter: bool`, `verbose: bool`, `platform_overrides: HashMap<String, String>`, `kubernetes: wrkflw_executor::KubernetesConfig`
 
 `pub(crate) async fn run(ctx: WatchCtx)`
 
@@ -5470,7 +5866,7 @@ wrkflw/
 
 ## crates/wrkflw/tests/dynamic_matrix_test.rs
 
-**Language:** Rust | **Size:** 6.5 KB | **Lines:** 239
+**Language:** Rust | **Size:** 6.6 KB | **Lines:** 241
 
 **Imports:**
 - `std::fs`
@@ -5513,7 +5909,7 @@ wrkflw/
 
 ## crates/wrkflw/tests/needs_failure_propagation_test.rs
 
-**Language:** Rust | **Size:** 13.3 KB | **Lines:** 580
+**Language:** Rust | **Size:** 13.3 KB | **Lines:** 582
 
 **Imports:**
 - `std::fs`
@@ -5566,7 +5962,7 @@ wrkflw/
 
 ## crates/wrkflw/tests/target_job_test.rs
 
-**Language:** Rust | **Size:** 3.6 KB | **Lines:** 141
+**Language:** Rust | **Size:** 3.8 KB | **Lines:** 147
 
 **Imports:**
 - `std::fs`
@@ -5822,7 +6218,7 @@ wrkflw/
 
 ## tests/reusable_workflow_execution_test.rs
 
-**Language:** Rust | **Size:** 3.1 KB | **Lines:** 122
+**Language:** Rust | **Size:** 3.2 KB | **Lines:** 124
 
 **Imports:**
 - `std::fs`

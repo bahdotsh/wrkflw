@@ -5,6 +5,7 @@ use super::{
     KubernetesConfig, DEADLINE_MARGIN_SECS, MAIN_CONTAINER, MANAGED_BY_LABEL, READY_MARKER,
     SESSION_ID, SESSION_LABEL, SYNC_CONTAINER, SYNC_DIR, SYNC_VOLUME, WAIT_CONTAINER,
 };
+use crate::environment::{CONTAINER_GITHUB_DIR, CONTAINER_WORKSPACE};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
@@ -12,7 +13,7 @@ use std::path::{Path, PathBuf};
 /// Nothing else on those host directories can be lost, so only these are
 /// mirrored. `/github/action` is left out: a local action lives in the user's
 /// repository. Exact paths, so a user volume nested below one does not qualify.
-const MIRRORED_MOUNTS: &[&str] = &["/github/workspace", "/github/workflow"];
+const MIRRORED_MOUNTS: &[&str] = &[CONTAINER_WORKSPACE, CONTAINER_GITHUB_DIR];
 
 /// One host directory and the container path it is exposed at. An empty
 /// `host` is a volume that exists only in the pod.

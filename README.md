@@ -38,7 +38,8 @@ A command-line tool for validating and executing GitHub Actions workflows locall
 - Private repos for remote `uses:` — reusable workflows clone over unauthenticated HTTPS
 - `concurrency:` groups and `cancel-in-progress` — parsed but not enforced
 - Service containers — `services:` is parsed but never started, in any runtime
-- Windows and macOS runners — `runs-on: windows-*` / `macos-*` is silently mapped to a container image (macOS → a Linux image, Windows → a Windows container that won't run on Linux/macOS hosts). `${{ runner.os }}` reflects the host OS, not `runs-on`.
+- Windows and macOS runners — `runs-on: windows-*` / `macos-*` is silently mapped to a container image (macOS → a Linux image, Windows → a Windows container that won't run on Linux/macOS hosts). In container runtimes `${{ runner.os }}` is `Linux` and `runner.temp` and the other runner paths are Linux paths, even for a Windows image, so a job on a Windows container sees the wrong values. In emulation `runner.os` is the host OS.
+- `working-directory` outside the workspace — it must stay inside the workspace, so `${{ runner.temp }}/build` fails the step instead of running there.
 
 ## Installation
 
@@ -300,7 +301,7 @@ Every pod carries `activeDeadlineSeconds`, set to `--k8s-timeout` (at least 1) p
 Things to know:
 
 - Only `kubectl` is needed on your machine. Jobs that build an image (`actions/setup-*` on a standard runner image, Dockerfile actions) also need Docker or Podman locally and `--k8s-registry`, because the cluster cannot see your local image store.
-- Each step syncs the workspace in and out, so large workspaces cost time per step.
+- Each step syncs the workspace and `RUNNER_TEMP` in and out, so large workspaces and large temporary files cost time per step.
 - A failed image pull is retried for 60 seconds before the step fails, so a bad image name takes that long to report.
 - Mounts are copies. Job `container.volumes` directories are copied in and written back after each step, so parallel jobs sharing one do not see each other's changes and the last to finish wins. Write-back only adds and updates: a file a step deletes from such a directory stays on the host, and files other processes create there are left alone. Only the job's workspace and `GITHUB_*` files mirror the pod exactly. A single-path volume such as `/cache` lives only in the pod and is never written back. Single files and sockets cannot be mounted and are skipped with a warning, sockets inside a mounted directory are not synced, and named volumes start empty.
 - Logs are read from the kubelet when the step ends, so a step that outgrows the node's container log rotation (10 MiB by default) loses its earliest lines.

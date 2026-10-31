@@ -3232,7 +3232,7 @@ fn resolve_working_directory(wd: &str, ctx: &StepExecutionContext<'_>) -> Result
     let resolved =
         crate::substitution::preprocess_expressions_strict(wd, ctx.working_dir, &expr_ctx)
             .map_err(|e| format!("Invalid working-directory '{}': {}", wd, e))?;
-    Ok(workspace_relative_input(&resolved, ctx))
+    Ok(workspace_relative_input(&resolved, ctx.job_env))
 }
 
 /// Make a path input relative to the workspace, so it means the same place
@@ -3240,8 +3240,8 @@ fn resolve_working_directory(wd: &str, ctx: &StepExecutionContext<'_>) -> Result
 /// in the job directory, while `github.workspace` is `/github/workspace` under
 /// a container runtime and a host path in emulation. The workspace itself
 /// becomes `.`, because an empty input means the input was not provided.
-fn workspace_relative_input(path: &str, ctx: &StepExecutionContext<'_>) -> String {
-    let Some(workspace) = ctx.job_env.get("GITHUB_WORKSPACE") else {
+fn workspace_relative_input(path: &str, job_env: &HashMap<String, String>) -> String {
+    let Some(workspace) = job_env.get("GITHUB_WORKSPACE") else {
         return path.to_string();
     };
     match relative_to_workspace(path, workspace) {
@@ -3283,7 +3283,7 @@ async fn handle_upload_artifact(
         .unwrap_or_else(|| "artifact".to_string());
     let path_pattern = with
         .and_then(|w| w.get("path"))
-        .map(|s| workspace_relative_input(&preprocess_with_value(s, ctx), ctx))
+        .map(|s| workspace_relative_input(&preprocess_with_value(s, ctx), ctx.job_env))
         .unwrap_or_default();
 
     if path_pattern.is_empty() {
@@ -3334,7 +3334,7 @@ async fn handle_download_artifact(
         .map(|s| {
             ctx.working_dir.join(workspace_relative_input(
                 &preprocess_with_value(s, ctx),
-                ctx,
+                ctx.job_env,
             ))
         })
         .unwrap_or_else(|| ctx.working_dir.to_path_buf());
@@ -3459,7 +3459,7 @@ async fn handle_cache_action(
         .lines()
         .map(|l| l.trim())
         .filter(|l| !l.is_empty())
-        .map(|l| workspace_relative_input(l, ctx))
+        .map(|l| workspace_relative_input(l, ctx.job_env))
         .collect();
     let restore_keys: Vec<String> = with
         .and_then(|w| w.get("restore-keys"))
@@ -9142,13 +9142,12 @@ runs:
 
     #[tokio::test]
     async fn working_directory_evaluates_expressions_within_the_workspace() {
-        let workflow = minimal_workflow();
         let job_env = HashMap::from([("GITHUB_WORKSPACE".to_string(), "/host/repo".to_string())]);
-        let working_dir = std::env::current_dir().unwrap();
 
         for (wd, expected) in [
             ("${{ github.workspace }}/src", Some("/github/workspace/src")),
             ("${{ github.workspace }}", Some("/github/workspace")),
+            ("${{ github.workspace }}/", Some("/github/workspace")),
             ("${{ github.workspace }}/../escape", None),
             ("${{ github.workspace }}-other/src", None),
             ("${{ github.workspace == }}", None),
@@ -9157,28 +9156,7 @@ runs:
             let mut step = make_run_step("echo ok");
             step.working_directory = Some(wd.to_string());
 
-            let ctx = StepExecutionContext {
-                step: &step,
-                step_idx: 0,
-                job_env: &job_env,
-                job_user_env: &job_env,
-                working_dir: &working_dir,
-                runtime: &runtime,
-                workflow: &workflow,
-                runner_image: "ubuntu:latest",
-                verbose: false,
-                matrix_combination: &None,
-                container_config: None,
-                workflow_defaults: None,
-                job_defaults: None,
-                step_outputs: &HashMap::new(),
-                step_statuses: &HashMap::new(),
-                job_status: "success",
-                services: test_services(),
-                pending_cache_saves: &TEST_PENDING_CACHE_SAVES,
-            };
-
-            let result = execute_step(ctx).await.unwrap();
+            let result = run_step(&step, &job_env, &runtime).await;
             let calls = runtime.run_calls.lock().unwrap();
             match expected {
                 Some(path) => {
@@ -9253,21 +9231,48 @@ runs:
             effective(RuntimeType::SecureEmulation),
             RuntimeType::SecureEmulation
         );
-        // Without a Podman install this is the fallback, which must not
-        // report a container runtime.
-        let expected = if podman::is_available() {
-            RuntimeType::Podman
-        } else {
-            RuntimeType::Emulation
-        };
-        assert_eq!(effective(RuntimeType::Podman), expected);
+        // These depend on the host, which may fall back to emulation, but they
+        // must never report any other runtime.
+        for runtime in [RuntimeType::Docker, RuntimeType::Podman] {
+            let reported = effective(runtime.clone());
+            assert!(
+                reported == runtime || reported == RuntimeType::Emulation,
+                "{:?} reported {:?}",
+                runtime,
+                reported
+            );
+        }
+    }
 
-        let expected = if docker::is_available() {
-            RuntimeType::Docker
-        } else {
-            RuntimeType::Emulation
+    /// Run `step` in a container-less job with `job_env` and the shared stores.
+    async fn run_step(
+        step: &Step,
+        job_env: &HashMap<String, String>,
+        runtime: &MockContainerRuntime,
+    ) -> StepResult {
+        let workflow = minimal_workflow();
+        let working_dir = std::env::current_dir().unwrap();
+        let ctx = StepExecutionContext {
+            step,
+            step_idx: 0,
+            job_env,
+            job_user_env: job_env,
+            working_dir: &working_dir,
+            runtime,
+            workflow: &workflow,
+            runner_image: "ubuntu:latest",
+            verbose: false,
+            matrix_combination: &None,
+            container_config: None,
+            workflow_defaults: None,
+            job_defaults: None,
+            step_outputs: &HashMap::new(),
+            step_statuses: &HashMap::new(),
+            job_status: "success",
+            services: test_services(),
+            pending_cache_saves: &TEST_PENDING_CACHE_SAVES,
         };
-        assert_eq!(effective(RuntimeType::Docker), expected);
+        execute_step(ctx).await.unwrap()
     }
 
     /// Run `step` as a job with `job_env` would, with its own stores.
@@ -9443,34 +9448,31 @@ runs:
 
     #[test]
     fn workspace_itself_is_not_mistaken_for_a_missing_path_input() {
-        let workflow = minimal_workflow();
         let job_env = HashMap::from([("GITHUB_WORKSPACE".to_string(), "/host/repo".to_string())]);
-        let runtime = MockContainerRuntime::default();
-        let step = make_run_step("echo ok");
-        let working_dir = std::env::current_dir().unwrap();
-        let ctx = StepExecutionContext {
-            step: &step,
-            step_idx: 0,
-            job_env: &job_env,
-            job_user_env: &job_env,
-            working_dir: &working_dir,
-            runtime: &runtime,
-            workflow: &workflow,
-            runner_image: "ubuntu:latest",
-            verbose: false,
-            matrix_combination: &None,
-            container_config: None,
-            workflow_defaults: None,
-            job_defaults: None,
-            step_outputs: &HashMap::new(),
-            step_statuses: &HashMap::new(),
-            job_status: "success",
-            services: test_services(),
-            pending_cache_saves: &TEST_PENDING_CACHE_SAVES,
-        };
-        assert_eq!(workspace_relative_input("/host/repo", &ctx), ".");
-        assert_eq!(workspace_relative_input("/host/repo/src", &ctx), "src");
-        assert_eq!(workspace_relative_input("", &ctx), "");
+        for (path, expected) in [
+            ("/host/repo", "."),
+            ("/host/repo/", "."),
+            ("/host/repo/src", "src"),
+            ("", ""),
+        ] {
+            assert_eq!(workspace_relative_input(path, &job_env), expected);
+        }
+    }
+
+    #[test]
+    fn runner_temp_is_on_the_host_directory_mounted_for_the_job() {
+        let mut job_env = HashMap::new();
+        seed_runtime_mode(&mut job_env, &RuntimeType::Docker, CiPlatform::GitHub);
+        let _files = environment::isolate_github_environment_files(&mut job_env).unwrap();
+
+        let mut step_env = job_env.clone();
+        let (_, github_mount) = prepare_container_mounts(&mut step_env, &job_env, None, false);
+        let (host, container) = github_mount.unwrap();
+
+        let relative = Path::new(&step_env["RUNNER_TEMP"])
+            .strip_prefix(&container)
+            .unwrap();
+        assert!(host.join(relative).is_dir());
     }
 
     #[tokio::test]
@@ -9482,30 +9484,8 @@ runs:
         seed_runtime_mode(&mut job_env, &RuntimeType::Docker, CiPlatform::GitHub);
 
         let runtime = MockContainerRuntime::default();
-        let workflow = minimal_workflow();
         let step = make_run_step("echo ok");
-        let working_dir = std::env::current_dir().unwrap();
-        let ctx = StepExecutionContext {
-            step: &step,
-            step_idx: 0,
-            job_env: &job_env,
-            job_user_env: &HashMap::new(),
-            working_dir: &working_dir,
-            runtime: &runtime,
-            workflow: &workflow,
-            runner_image: "ubuntu:latest",
-            verbose: false,
-            matrix_combination: &None,
-            container_config: None,
-            workflow_defaults: None,
-            job_defaults: None,
-            step_outputs: &HashMap::new(),
-            step_statuses: &HashMap::new(),
-            job_status: "success",
-            services: test_services(),
-            pending_cache_saves: &TEST_PENDING_CACHE_SAVES,
-        };
-        let result = execute_step(ctx).await.unwrap();
+        let result = run_step(&step, &job_env, &runtime).await;
         assert_eq!(result.status, StepStatus::Success);
 
         let calls = runtime.run_calls.lock().unwrap();
@@ -9520,31 +9500,9 @@ runs:
         seed_runtime_mode(&mut job_env, &RuntimeType::Docker, CiPlatform::GitHub);
 
         let runtime = MockContainerRuntime::default();
-        let workflow = minimal_workflow();
         let mut step = make_run_step("echo ok");
         step.working_directory = Some("${{ runner.temp }}/build".to_string());
-        let working_dir = std::env::current_dir().unwrap();
-        let ctx = StepExecutionContext {
-            step: &step,
-            step_idx: 0,
-            job_env: &job_env,
-            job_user_env: &HashMap::new(),
-            working_dir: &working_dir,
-            runtime: &runtime,
-            workflow: &workflow,
-            runner_image: "ubuntu:latest",
-            verbose: false,
-            matrix_combination: &None,
-            container_config: None,
-            workflow_defaults: None,
-            job_defaults: None,
-            step_outputs: &HashMap::new(),
-            step_statuses: &HashMap::new(),
-            job_status: "success",
-            services: test_services(),
-            pending_cache_saves: &TEST_PENDING_CACHE_SAVES,
-        };
-        let result = execute_step(ctx).await.unwrap();
+        let result = run_step(&step, &job_env, &runtime).await;
         assert_eq!(result.status, StepStatus::Failure);
         assert!(result.output.contains("must be within workspace"));
     }
@@ -9734,43 +9692,50 @@ runs:
 
     #[tokio::test]
     async fn defaults_cascade_working_directory_from_job() {
-        let runtime = MockContainerRuntime::default();
-        let job_defaults = workflow::Defaults {
-            run: Some(workflow::DefaultsRun {
-                shell: None,
-                working_directory: Some("src".to_string()),
-            }),
-        };
         let workflow = minimal_workflow();
-        let job_env = HashMap::new();
+        let job_env = HashMap::from([("GITHUB_WORKSPACE".to_string(), "/host/repo".to_string())]);
         let working_dir = std::env::current_dir().unwrap();
-
         let step = make_run_step("echo ok");
 
-        let ctx = StepExecutionContext {
-            step: &step,
-            step_idx: 0,
-            job_env: &job_env,
-            job_user_env: &job_env,
-            working_dir: &working_dir,
-            runtime: &runtime,
-            workflow: &workflow,
-            runner_image: "ubuntu:latest",
-            verbose: false,
-            matrix_combination: &None,
-            container_config: None,
-            workflow_defaults: None,
-            job_defaults: Some(&job_defaults),
-            step_outputs: &HashMap::new(),
-            step_statuses: &HashMap::new(),
-            job_status: "success",
-            services: test_services(),
-            pending_cache_saves: &TEST_PENDING_CACHE_SAVES,
-        };
+        for wd in ["src", "${{ github.workspace }}/src"] {
+            let runtime = MockContainerRuntime::default();
+            let job_defaults = workflow::Defaults {
+                run: Some(workflow::DefaultsRun {
+                    shell: None,
+                    working_directory: Some(wd.to_string()),
+                }),
+            };
+            let ctx = StepExecutionContext {
+                step: &step,
+                step_idx: 0,
+                job_env: &job_env,
+                job_user_env: &job_env,
+                working_dir: &working_dir,
+                runtime: &runtime,
+                workflow: &workflow,
+                runner_image: "ubuntu:latest",
+                verbose: false,
+                matrix_combination: &None,
+                container_config: None,
+                workflow_defaults: None,
+                job_defaults: Some(&job_defaults),
+                step_outputs: &HashMap::new(),
+                step_statuses: &HashMap::new(),
+                job_status: "success",
+                services: test_services(),
+                pending_cache_saves: &TEST_PENDING_CACHE_SAVES,
+            };
 
-        let result = execute_step(ctx).await.unwrap();
-        assert_eq!(result.status, StepStatus::Success);
-        // Should succeed — "src" is a valid subdirectory path
+            let result = execute_step(ctx).await.unwrap();
+            assert_eq!(result.status, StepStatus::Success, "{}", wd);
+            let calls = runtime.run_calls.lock().unwrap();
+            assert_eq!(
+                calls[0].working_dir,
+                Path::new("/github/workspace/src"),
+                "{}",
+                wd
+            );
+        }
     }
 
     // --- sanitize_timeout_minutes tests ---

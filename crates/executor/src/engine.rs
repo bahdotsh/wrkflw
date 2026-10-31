@@ -2187,6 +2187,9 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
     // Add job-specific context (runner-internal — GITHUB_JOB; not user env)
     environment::add_job_context(&mut job_env, ctx.job_name);
 
+    // Parallel jobs must not share GITHUB_ENV, GITHUB_OUTPUT and friends.
+    let _job_env_files = environment::isolate_github_environment_files(&mut job_env)?;
+
     // Create a temporary directory for this job execution
     let job_dir = tempfile::tempdir()
         .map_err(|e| ExecutionError::Execution(format!("Failed to create job directory: {}", e)))?;
@@ -2483,6 +2486,9 @@ async fn execute_matrix_job(
             job_user_env.insert(key, value);
         }
     }
+
+    // Parallel matrix legs must not share GITHUB_ENV, GITHUB_OUTPUT and friends.
+    let _job_env_files = environment::isolate_github_environment_files(&mut job_env)?;
 
     // Create a temporary directory for this job execution
     let job_dir = tempfile::tempdir()

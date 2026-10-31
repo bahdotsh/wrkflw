@@ -1,3 +1,6 @@
+// Emulation runs `run:` steps through a POSIX shell.
+#![cfg(not(target_os = "windows"))]
+
 use std::fs;
 use tempfile::tempdir;
 use wrkflw_lib::executor::engine::{

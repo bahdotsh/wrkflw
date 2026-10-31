@@ -454,6 +454,9 @@ fn truncate(s: &str, n: usize) -> String {
 fn matrix_size_label(matrix: &wrkflw_matrix::MatrixConfig) -> Option<String> {
     use wrkflw_matrix::MatrixEntries;
 
+    if matrix.expression.is_some() {
+        return Some("?".to_string());
+    }
     if !matrix.parameters.is_empty() {
         return Some(matrix.parameters.len().to_string());
     }

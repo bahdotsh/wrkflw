@@ -407,6 +407,14 @@ fn nested_excludes(mount: &Mount, all: &[Mount]) -> Vec<String> {
         .collect()
 }
 
+/// True when `mount` sits inside another mount. The parent's archive writes
+/// straight through into it, where Docker's bind mount would hide those files.
+fn is_nested(mount: &Mount, all: &[Mount]) -> bool {
+    all.iter().any(|other| {
+        other.container != mount.container && mount.container.starts_with(&other.container)
+    })
+}
+
 /// Everything that goes into one pod, independent of the cluster.
 struct PodInput<'a> {
     name: &'a str,
@@ -904,6 +912,29 @@ impl KubernetesRuntime {
         }
     }
 
+    /// Empty `mount.container`, keeping the mount itself.
+    async fn clear_mount(&self, name: &str, mount: &Mount) -> Result<(), ContainerError> {
+        let path = mount.container.to_string_lossy().to_string();
+        self.kubectl_ok(
+            &[
+                "exec",
+                name,
+                "-c",
+                WAIT_CONTAINER,
+                "--",
+                "sh",
+                "-c",
+                "cd \"$1\" && rm -rf ./* ./.[!.]* ./..?*",
+                "sh",
+                &path,
+            ],
+            None,
+            "clearing a nested mount",
+        )
+        .await
+        .map(drop)
+    }
+
     /// Stream `host` into `mount.container` inside the wait container.
     async fn copy_in(&self, name: &str, mount: &Mount) -> Result<(), ContainerError> {
         if !mount.host.is_absolute() || !mount.host.exists() {
@@ -1045,6 +1076,9 @@ impl KubernetesRuntime {
 
         self.wait_for_init_running(name).await?;
         for mount in mounts {
+            if is_nested(mount, mounts) {
+                self.clear_mount(name, mount).await?;
+            }
             self.copy_in(name, mount).await?;
         }
         // Create the working directory if it is inside a fresh volume, then
@@ -1896,6 +1930,21 @@ mod tests {
     }
 
     #[test]
+    fn is_nested_finds_mounts_inside_other_mounts() {
+        let mounts = plan_mounts(&[
+            (Path::new("/h/ws"), Path::new("/github/workspace")),
+            (Path::new("/h/sub"), Path::new("/github/workspace/sub")),
+            (Path::new("/h/gh"), Path::new("/github/workflow")),
+        ]);
+        let nested: Vec<_> = mounts
+            .iter()
+            .filter(|m| is_nested(m, &mounts))
+            .map(|m| m.container.clone())
+            .collect();
+        assert_eq!(nested, vec![PathBuf::from("/github/workspace/sub")]);
+    }
+
+    #[test]
     fn manifest_serializes_as_valid_json_with_no_volumes() {
         let m = build_pod_manifest(
             &cfg(),
@@ -2506,6 +2555,115 @@ mod tests {
             .await
             .is_err());
         assert!(rt.pull_image("anything").await.is_ok());
+    }
+
+    /// A runtime whose "kubectl" is a script playing a cluster: pods are
+    /// directories under `work/pod`, and one step exits 3 after deleting
+    /// `deleted.txt` and writing `new.txt` in the `/ws` mount.
+    #[cfg(unix)]
+    fn runtime_with_fake_cluster(work: &Path) -> KubernetesRuntime {
+        let script = work.join("kubectl.sh");
+        let body = r#"
+work="$(dirname "$0")"
+echo "$*" >> "$work/log"
+case "$1" in
+create) cat > "$work/manifest.json" ;;
+get)
+    polls=$(($(cat "$work/polls" 2>/dev/null || echo 0) + 1))
+    echo "$polls" > "$work/polls"
+    case "$polls" in
+    1) echo '{"status":{"phase":"Pending"}}' ;;
+    2) echo '{"status":{"phase":"Pending","initContainerStatuses":[{"name":"wrkflw-wait","state":{"running":{}}}]}}' ;;
+    3) echo '{"status":{"phase":"Running","containerStatuses":[{"name":"main","state":{"running":{}}}]}}' ;;
+    *) echo '{"status":{"phase":"Running","containerStatuses":[{"name":"main","state":{"terminated":{"exitCode":3}}}]}}' ;;
+    esac
+    ;;
+logs)
+    rm "$work/pod/ws/deleted.txt"
+    echo made in the pod > "$work/pod/ws/new.txt"
+    echo step output
+    ;;
+exec)
+    while [ "$1" != "--" ]; do shift; done
+    shift
+    if [ "$1" = tar ]; then
+        dir="$work/pod$3"
+        mkdir -p "$dir"
+        shift 3
+        case "$*" in
+        *-xof*) tar -C "$dir" -xf - ;;
+        *) tar -C "$dir" "$@" ;;
+        esac
+    fi
+    ;;
+esac
+"#;
+        std::fs::write(&script, body).unwrap();
+        let mut rt = KubernetesRuntime::new(cfg(), false);
+        rt.kubectl = "sh".into();
+        rt.kubectl_prefix = vec![script.to_string_lossy().to_string()];
+        rt
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_step_runs_from_pod_creation_to_sync_back_and_delete() {
+        let work = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        let nested = tempfile::tempdir().unwrap();
+        std::fs::write(ws.path().join("deleted.txt"), "x").unwrap();
+        std::fs::create_dir(ws.path().join("sub")).unwrap();
+        std::fs::write(ws.path().join("sub/kept-on-host.txt"), "x").unwrap();
+        std::fs::write(nested.path().join("nested.txt"), "x").unwrap();
+
+        let rt = runtime_with_fake_cluster(work.path());
+        let output = rt
+            .run_container(
+                "ubuntu:22.04",
+                &["sh", "-c", "exit 3"],
+                &[],
+                Path::new("/ws"),
+                &[
+                    (ws.path(), Path::new("/ws")),
+                    (nested.path(), Path::new("/ws/sub")),
+                ],
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(output.exit_code, 3);
+        assert_eq!(output.stdout.trim(), "step output");
+        assert!(ws.path().join("new.txt").exists());
+        assert!(!ws.path().join("deleted.txt").exists());
+        assert!(
+            ws.path().join("sub/kept-on-host.txt").exists(),
+            "a nested mount's path is not the parent's to prune"
+        );
+
+        let log = std::fs::read_to_string(work.path().join("log")).unwrap();
+        let line_of = |needle: &str| {
+            log.lines()
+                .position(|line| line.contains(needle))
+                .unwrap_or_else(|| panic!("no `{}` in:\n{}", needle, log))
+        };
+        let order = [
+            "create -f -",
+            "rm -rf",
+            "/ws/sub -xof",
+            "touch /wrkflw-sync/ready",
+            "logs ",
+            "-cf - .",
+            "delete pod",
+        ];
+        let lines: Vec<_> = order.iter().map(|needle| line_of(needle)).collect();
+        assert!(lines.windows(2).all(|w| w[0] < w[1]), "{}", log);
+        assert!(line_of("--exclude=./sub") > line_of("logs "), "{}", log);
+        assert!(!RUNNING_PODS
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|p| log.contains(&p.name)));
     }
 
     /// A guard whose "kubectl" records its arguments in `log` instead.

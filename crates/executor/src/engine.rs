@@ -160,11 +160,7 @@ async fn execute_github_workflow(
     }
 
     // Add runtime mode to environment
-    seed_runtime_mode(
-        &mut env_context,
-        &config.runtime_type,
-        environment::apply_github_container_context,
-    );
+    seed_runtime_mode(&mut env_context, &config.runtime_type, CiPlatform::GitHub);
 
     // show=true means hide=false (inverted for the env var)
     env_context.insert(
@@ -375,11 +371,7 @@ async fn execute_gitlab_pipeline(
     let mut env_context = create_gitlab_context(&pipeline, workspace_dir.path());
 
     // Add runtime mode to environment
-    seed_runtime_mode(
-        &mut env_context,
-        &config.runtime_type,
-        environment::apply_gitlab_container_context,
-    );
+    seed_runtime_mode(&mut env_context, &config.runtime_type, CiPlatform::GitLab);
 
     // Setup environment files
     environment::setup_github_environment_files(workspace_dir.path()).map_err(|e| {
@@ -603,23 +595,33 @@ pub fn detect_runtime(runtime_type: RuntimeType) -> RuntimeType {
     }
 }
 
+/// The CI system whose variables a run exposes to its steps.
+#[derive(Debug, Clone, Copy)]
+enum CiPlatform {
+    GitHub,
+    GitLab,
+}
+
 /// Record the runtime steps will use and, for a container runtime, swap in the
 /// values steps see inside the container.
 fn seed_runtime_mode(
     env: &mut HashMap<String, String>,
     runtime: &RuntimeType,
-    apply_container_context: fn(&mut HashMap<String, String>),
+    platform: CiPlatform,
 ) {
     env.insert(
         "WRKFLW_RUNTIME_MODE".to_string(),
         runtime.mode_name().to_string(),
     );
     if uses_container_runtime(env) {
-        apply_container_context(env);
+        match platform {
+            CiPlatform::GitHub => environment::apply_github_container_context(env),
+            CiPlatform::GitLab => environment::apply_gitlab_container_context(env),
+        }
     }
 }
 
-fn emulation_fallback() -> (Box<dyn ContainerRuntime>, RuntimeType) {
+fn emulation_runtime() -> (Box<dyn ContainerRuntime>, RuntimeType) {
     (
         Box::new(emulation::EmulationRuntime::new()),
         RuntimeType::Emulation,
@@ -649,12 +651,12 @@ fn initialize_runtime(
                             "Failed to initialize Docker runtime: {}, falling back to emulation mode",
                             e
                         ));
-                        Ok(emulation_fallback())
+                        Ok(emulation_runtime())
                     }
                 }
             } else {
                 wrkflw_logging::error("Docker not available, falling back to emulation mode");
-                Ok(emulation_fallback())
+                Ok(emulation_runtime())
             }
         }
         RuntimeType::Podman => {
@@ -667,7 +669,7 @@ fn initialize_runtime(
                 ))
             } else {
                 wrkflw_logging::error("Podman not available, falling back to emulation mode");
-                Ok(emulation_fallback())
+                Ok(emulation_runtime())
             }
         }
         // Kubernetes is never auto-detected and never silently replaced:
@@ -682,7 +684,7 @@ fn initialize_runtime(
                 RuntimeType::Kubernetes,
             ))
         }
-        RuntimeType::Emulation => Ok(emulation_fallback()),
+        RuntimeType::Emulation => Ok(emulation_runtime()),
         RuntimeType::SecureEmulation => Ok((
             Box::new(wrkflw_runtime::secure_emulation::SecureEmulationRuntime::new()),
             RuntimeType::SecureEmulation,
@@ -9185,21 +9187,13 @@ runs:
 
         for runtime in [RuntimeType::Emulation, RuntimeType::SecureEmulation] {
             let mut env = host_env();
-            seed_runtime_mode(
-                &mut env,
-                &runtime,
-                environment::apply_github_container_context,
-            );
+            seed_runtime_mode(&mut env, &runtime, CiPlatform::GitHub);
             assert_eq!(env["RUNNER_OS"], "macOS", "{:?}", runtime);
             assert_eq!(env["WRKFLW_RUNTIME_MODE"], runtime.mode_name());
         }
 
         let mut env = host_env();
-        seed_runtime_mode(
-            &mut env,
-            &RuntimeType::Docker,
-            environment::apply_github_container_context,
-        );
+        seed_runtime_mode(&mut env, &RuntimeType::Docker, CiPlatform::GitHub);
         assert_eq!(env["RUNNER_OS"], "Linux");
     }
 
@@ -9209,20 +9203,12 @@ runs:
         let host = Path::new("/host/workspace");
 
         let mut env = create_gitlab_context(&pipeline, host);
-        seed_runtime_mode(
-            &mut env,
-            &RuntimeType::Podman,
-            environment::apply_gitlab_container_context,
-        );
+        seed_runtime_mode(&mut env, &RuntimeType::Podman, CiPlatform::GitLab);
         assert_eq!(env["CI_PROJECT_DIR"], "/github/workspace");
         assert_eq!(env["GITHUB_WORKSPACE"], "/github/workspace");
 
         let mut env = create_gitlab_context(&pipeline, host);
-        seed_runtime_mode(
-            &mut env,
-            &RuntimeType::Emulation,
-            environment::apply_gitlab_container_context,
-        );
+        seed_runtime_mode(&mut env, &RuntimeType::Emulation, CiPlatform::GitLab);
         assert_eq!(env["CI_PROJECT_DIR"], "/host/workspace");
     }
 

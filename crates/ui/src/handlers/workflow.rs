@@ -102,6 +102,7 @@ pub async fn execute_workflow_cli(
     verbose: bool,
     show_action_messages: bool,
     platform_overrides: HashMap<String, String>,
+    kubernetes: wrkflw_executor::KubernetesConfig,
 ) -> io::Result<()> {
     if !path.exists() {
         return Err(io::Error::new(
@@ -184,6 +185,9 @@ pub async fn execute_workflow_cli(
                 RuntimeType::Podman
             }
         }
+        // Reachability is checked by the executor, which fails the run
+        // instead of falling back to the host.
+        RuntimeType::Kubernetes => RuntimeType::Kubernetes,
         RuntimeType::SecureEmulation => RuntimeType::SecureEmulation,
         RuntimeType::Emulation => RuntimeType::Emulation,
     };
@@ -213,6 +217,7 @@ pub async fn execute_workflow_cli(
         show_action_messages,
         target_job: None,
         platform_overrides,
+        kubernetes,
     };
 
     match wrkflw_executor::execute_workflow(path, config).await {
@@ -550,6 +555,7 @@ pub fn start_next_workflow_execution(
                     RuntimeType::Podman
                 }
             }
+            RuntimeType::Kubernetes => RuntimeType::Kubernetes,
             RuntimeType::SecureEmulation => RuntimeType::SecureEmulation,
             RuntimeType::Emulation => RuntimeType::Emulation,
         };
@@ -557,6 +563,7 @@ pub fn start_next_workflow_execution(
         let validation_mode = app.validation_mode;
         let preserve_containers_on_failure = app.preserve_containers_on_failure;
         let platform_overrides = app.platform_overrides.clone();
+        let kubernetes = app.kubernetes.clone();
         let show_action_messages = app.show_action_messages;
 
         // Update workflow status and add execution details
@@ -640,6 +647,7 @@ pub fn start_next_workflow_execution(
                         show_action_messages,
                         target_job,
                         platform_overrides,
+                        kubernetes,
                     };
 
                     let execution_result = wrkflw_utils::fd::with_stderr_to_null(|| {

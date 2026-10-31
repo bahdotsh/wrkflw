@@ -38,6 +38,7 @@ pub(crate) struct RunCtx {
     pub(crate) no_strict_filter: bool,
     pub(crate) verbose: bool,
     pub(crate) platform_overrides: HashMap<String, String>,
+    pub(crate) kubernetes: wrkflw_executor::KubernetesConfig,
 }
 
 /// Execute the `wrkflw run` command. Exits the process on every
@@ -107,6 +108,7 @@ pub(crate) async fn run(ctx: RunCtx) {
         show_action_messages: ctx.show_action_messages,
         target_job: ctx.job.clone(),
         platform_overrides: ctx.platform_overrides,
+        kubernetes: ctx.kubernetes,
     };
     let workflow_type = if is_gitlab {
         "GitLab CI pipeline"

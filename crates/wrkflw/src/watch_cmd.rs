@@ -37,6 +37,7 @@ pub(crate) struct WatchCtx {
     pub(crate) no_strict_filter: bool,
     pub(crate) verbose: bool,
     pub(crate) platform_overrides: HashMap<String, String>,
+    pub(crate) kubernetes: wrkflw_executor::KubernetesConfig,
 }
 
 /// Execute the `wrkflw watch` command. Exits the process on every
@@ -101,6 +102,7 @@ pub(crate) async fn run(ctx: WatchCtx) {
         show_action_messages: ctx.show_action_messages,
         target_job: None,
         platform_overrides: ctx.platform_overrides,
+        kubernetes: ctx.kubernetes,
     };
 
     use wrkflw_ui::cli_style;

@@ -16,6 +16,7 @@ use crate::action_resolver;
 use crate::dependency;
 use crate::docker;
 use crate::environment;
+use crate::kubernetes::{self, KubernetesConfig};
 use crate::podman;
 use wrkflw_logging;
 use wrkflw_matrix::MatrixCombination;
@@ -101,6 +102,7 @@ async fn execute_github_workflow(
     let runtime = initialize_runtime(
         config.runtime_type.clone(),
         config.preserve_containers_on_failure,
+        &config.kubernetes,
     )?;
 
     // Create a temporary workspace directory
@@ -159,13 +161,7 @@ async fn execute_github_workflow(
     // Add runtime mode to environment
     env_context.insert(
         "WRKFLW_RUNTIME_MODE".to_string(),
-        match config.runtime_type {
-            RuntimeType::Auto => "auto".to_string(),
-            RuntimeType::Emulation => "emulation".to_string(),
-            RuntimeType::SecureEmulation => "secure_emulation".to_string(),
-            RuntimeType::Docker => "docker".to_string(),
-            RuntimeType::Podman => "podman".to_string(),
-        },
+        config.runtime_type.mode_name().to_string(),
     );
 
     // show=true means hide=false (inverted for the env var)
@@ -365,6 +361,7 @@ async fn execute_gitlab_pipeline(
     let runtime = initialize_runtime(
         config.runtime_type.clone(),
         config.preserve_containers_on_failure,
+        &config.kubernetes,
     )?;
 
     // Create a temporary workspace directory
@@ -377,13 +374,7 @@ async fn execute_gitlab_pipeline(
     // Add runtime mode to environment
     env_context.insert(
         "WRKFLW_RUNTIME_MODE".to_string(),
-        match config.runtime_type {
-            RuntimeType::Auto => "auto".to_string(),
-            RuntimeType::Emulation => "emulation".to_string(),
-            RuntimeType::SecureEmulation => "secure_emulation".to_string(),
-            RuntimeType::Docker => "docker".to_string(),
-            RuntimeType::Podman => "podman".to_string(),
-        },
+        config.runtime_type.mode_name().to_string(),
     );
 
     // Setup environment files
@@ -612,11 +603,13 @@ pub fn detect_runtime(runtime_type: RuntimeType) -> RuntimeType {
 fn initialize_runtime(
     runtime_type: RuntimeType,
     preserve_containers_on_failure: bool,
+    kubernetes: &KubernetesConfig,
 ) -> Result<Box<dyn ContainerRuntime>, ExecutionError> {
     match runtime_type {
         RuntimeType::Auto => initialize_runtime(
             detect_runtime(RuntimeType::Auto),
             preserve_containers_on_failure,
+            kubernetes,
         ),
         RuntimeType::Docker => {
             if docker::is_available() {
@@ -645,6 +638,15 @@ fn initialize_runtime(
                 Ok(Box::new(emulation::EmulationRuntime::new()))
             }
         }
+        // Kubernetes is never auto-detected and never silently replaced:
+        // a job meant for a GPU node must not quietly run on the laptop.
+        RuntimeType::Kubernetes => {
+            kubernetes::check_available(kubernetes).map_err(ExecutionError::Runtime)?;
+            Ok(Box::new(kubernetes::KubernetesRuntime::new(
+                kubernetes.clone(),
+                preserve_containers_on_failure,
+            )))
+        }
         RuntimeType::Emulation => Ok(Box::new(emulation::EmulationRuntime::new())),
         RuntimeType::SecureEmulation => Ok(Box::new(
             wrkflw_runtime::secure_emulation::SecureEmulationRuntime::new(),
@@ -659,8 +661,25 @@ pub enum RuntimeType {
     Auto,
     Docker,
     Podman,
+    /// Run each step as a pod in a Kubernetes cluster. Selected explicitly
+    /// only; see `--k8s-*` flags and [`KubernetesConfig`].
+    Kubernetes,
     Emulation,
     SecureEmulation,
+}
+
+impl RuntimeType {
+    /// The value steps see in `WRKFLW_RUNTIME_MODE`.
+    pub fn mode_name(&self) -> &'static str {
+        match self {
+            RuntimeType::Auto => "auto",
+            RuntimeType::Emulation => "emulation",
+            RuntimeType::SecureEmulation => "secure_emulation",
+            RuntimeType::Docker => "docker",
+            RuntimeType::Podman => "podman",
+            RuntimeType::Kubernetes => "kubernetes",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -676,6 +695,8 @@ pub struct ExecutionConfig {
     /// lowercase, as [`parse_platform_override`] returns them, because labels
     /// match case-insensitively.
     pub platform_overrides: HashMap<String, String>,
+    /// Cluster settings used when `runtime_type` is [`RuntimeType::Kubernetes`].
+    pub kubernetes: KubernetesConfig,
 }
 
 /// Parse a `LABEL=IMAGE` runner override, as given to `--platform`.
@@ -942,10 +963,7 @@ async fn prepare_action(
         let dockerfile = action_dir.join("Dockerfile");
         if dockerfile.exists() {
             // It's a Docker action, build it
-            let tag = format!("wrkflw-local-action:{}", uuid::Uuid::new_v4());
-
-            runtime
-                .build_image(&dockerfile, &tag, action_dir)
+            let tag = ensure_action_image(runtime, "wrkflw-local-action:", &dockerfile, action_dir)
                 .await
                 .map_err(|e| ExecutionError::Runtime(format!("Failed to build image: {}", e)))?;
 
@@ -1120,16 +1138,15 @@ async fn prepare_action(
                     }
 
                     // Build the image
-                    let tag = format!("wrkflw-action:{}", uuid::Uuid::new_v4());
-                    runtime
-                        .build_image(&dockerfile, &tag, &action_dir)
-                        .await
-                        .map_err(|e| {
-                            ExecutionError::Runtime(format!(
-                                "Failed to build Dockerfile for action '{}': {}",
-                                action.repository, e
-                            ))
-                        })?;
+                    let tag =
+                        ensure_action_image(runtime, "wrkflw-action:", &dockerfile, &action_dir)
+                            .await
+                            .map_err(|e| {
+                                ExecutionError::Runtime(format!(
+                                    "Failed to build Dockerfile for action '{}': {}",
+                                    action.repository, e
+                                ))
+                            })?;
 
                     let (entrypoint, args) =
                         extract_docker_runs_config(resolved.definition.as_ref()).map_err(|e| {
@@ -1865,6 +1882,97 @@ async fn build_combined_runtime_image(
     Ok(tag)
 }
 
+/// Hash everything a Dockerfile action's image is built from, so the same
+/// action always gets the same tag. Git metadata is left out: a fresh clone of
+/// an unchanged action must hash the same.
+fn action_context_hash(dockerfile: &Path, context_dir: &Path) -> std::io::Result<String> {
+    use sha2::{Digest, Sha256};
+
+    fn visit(dir: &Path, rel: &Path, hasher: &mut Sha256) -> std::io::Result<()> {
+        let mut entries = std::fs::read_dir(dir)?.collect::<std::io::Result<Vec<_>>>()?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            if entry.file_name() == ".git" {
+                continue;
+            }
+            let path = entry.path();
+            let rel = rel.join(entry.file_name());
+            let file_type = entry.file_type()?;
+            hasher.update(rel.to_string_lossy().as_bytes());
+            hasher.update([0]);
+            if file_type.is_dir() {
+                hasher.update(b"d");
+                visit(&path, &rel, hasher)?;
+            } else if file_type.is_symlink() {
+                hasher.update(b"l");
+                hasher.update(std::fs::read_link(&path)?.to_string_lossy().as_bytes());
+            } else if file_type.is_file() {
+                hasher.update(b"f");
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    hasher.update(entry.metadata()?.permissions().mode().to_le_bytes());
+                }
+                let body = std::fs::read(&path)?;
+                hasher.update((body.len() as u64).to_le_bytes());
+                hasher.update(&body);
+            }
+        }
+        Ok(())
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(std::fs::read(dockerfile)?);
+    hasher.update([0]);
+    visit(context_dir, Path::new(""), &mut hasher)?;
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Build a Dockerfile action's image under a tag derived from its content,
+/// unless the runtime already has it. Tags are stable because a registry keeps
+/// every tag it is given: with a fresh one per step, `--k8s-registry` would
+/// grow on every run.
+async fn ensure_action_image(
+    runtime: &dyn ContainerRuntime,
+    tag_prefix: &str,
+    dockerfile: &Path,
+    context_dir: &Path,
+) -> Result<String, wrkflw_runtime::container::ContainerError> {
+    let hash = {
+        let dockerfile = dockerfile.to_path_buf();
+        let context_dir = context_dir.to_path_buf();
+        tokio::task::spawn_blocking(move || action_context_hash(&dockerfile, &context_dir))
+            .await
+            .map_err(|e| {
+                wrkflw_runtime::container::ContainerError::ImageBuild(format!(
+                    "hashing task failed: {}",
+                    e
+                ))
+            })?
+            .map_err(|e| {
+                wrkflw_runtime::container::ContainerError::ImageBuild(format!(
+                    "failed to hash the build context: {}",
+                    e
+                ))
+            })?
+    };
+    let tag = format!("{}{}", tag_prefix, hash);
+
+    // Parallel jobs using one action build it once.
+    let tag_lock = {
+        let mut locks = IMAGE_BUILD_LOCKS.lock().unwrap();
+        locks
+            .entry(tag.clone())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    };
+    let _build_guard = tag_lock.lock().await;
+    if !runtime.image_exists(&tag).await? {
+        runtime.build_image(dockerfile, &tag, context_dir).await?;
+    }
+    Ok(tag)
+}
+
 /// Determine the effective runner image for a job, taking setup actions into account.
 ///
 /// If the job has an explicit `container:` config, that takes precedence.
@@ -2158,6 +2266,9 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
 
     // Add job-specific context (runner-internal — GITHUB_JOB; not user env)
     environment::add_job_context(&mut job_env, ctx.job_name);
+
+    // Parallel jobs must not share GITHUB_ENV, GITHUB_OUTPUT and friends.
+    let _job_env_files = environment::isolate_github_environment_files(&mut job_env)?;
 
     // Create a temporary directory for this job execution
     let job_dir = tempfile::tempdir()
@@ -2455,6 +2566,9 @@ async fn execute_matrix_job(
             job_user_env.insert(key, value);
         }
     }
+
+    // Parallel matrix legs must not share GITHUB_ENV, GITHUB_OUTPUT and friends.
+    let _job_env_files = environment::isolate_github_environment_files(&mut job_env)?;
 
     // Create a temporary directory for this job execution
     let job_dir = tempfile::tempdir()
@@ -4445,12 +4559,12 @@ fn prepare_step_container_context(
 
 type VolumePathPair = (PathBuf, PathBuf);
 
-/// True when steps execute inside a Docker/Podman container rather than on
-/// the host. `Auto` is resolved to a concrete runtime before this is seeded.
+/// True when steps execute inside a Docker/Podman/Kubernetes container
+/// rather than on the host. `Auto` is resolved to a concrete runtime before this is seeded.
 fn uses_container_runtime(step_env: &HashMap<String, String>) -> bool {
     step_env
         .get("WRKFLW_RUNTIME_MODE")
-        .map(|m| m == "docker" || m == "podman")
+        .map(|m| m == "docker" || m == "podman" || m == "kubernetes")
         .unwrap_or(false)
 }
 
@@ -7007,6 +7121,45 @@ runs:
     use std::sync::{Arc, Mutex};
     use wrkflw_runtime::container::{ContainerError, ContainerOutput};
 
+    #[test]
+    fn action_context_hash_follows_content_and_ignores_git_metadata() {
+        let write_action = |body: &str| {
+            let dir = tempfile::tempdir().unwrap();
+            fs::write(dir.path().join("Dockerfile"), "FROM alpine\n").unwrap();
+            fs::create_dir(dir.path().join("src")).unwrap();
+            fs::write(dir.path().join("src/run.sh"), body).unwrap();
+            dir
+        };
+        let hash = |dir: &tempfile::TempDir| {
+            action_context_hash(&dir.path().join("Dockerfile"), dir.path()).unwrap()
+        };
+
+        let first = write_action("echo one");
+        let same = write_action("echo one");
+        fs::create_dir(same.path().join(".git")).unwrap();
+        fs::write(same.path().join(".git/HEAD"), "ref: unrelated").unwrap();
+        assert_eq!(hash(&first), hash(&same));
+
+        assert_ne!(hash(&first), hash(&write_action("echo two")));
+    }
+
+    #[test]
+    fn mode_name_is_what_container_detection_expects() {
+        for runtime in [
+            RuntimeType::Docker,
+            RuntimeType::Podman,
+            RuntimeType::Kubernetes,
+        ] {
+            let mut env = HashMap::new();
+            env.insert(
+                "WRKFLW_RUNTIME_MODE".to_string(),
+                runtime.mode_name().to_string(),
+            );
+            assert!(uses_container_runtime(&env), "{:?}", runtime);
+        }
+        assert_eq!(RuntimeType::SecureEmulation.mode_name(), "secure_emulation");
+    }
+
     /// Records all `run_container` calls for later assertion.
     #[derive(Clone, Default)]
     struct MockContainerRuntime {
@@ -7095,6 +7248,150 @@ runs:
         async fn image_exists(&self, _tag: &str) -> Result<bool, ContainerError> {
             Ok(false)
         }
+    }
+
+    /// Holds every job's step open at once, after each has written its output.
+    /// Emulation cannot show this: its steps block the one task running them,
+    /// so jobs never overlap there.
+    struct OverlappingRuntime {
+        all_steps_running: tokio::sync::Barrier,
+    }
+
+    #[async_trait::async_trait]
+    impl ContainerRuntime for OverlappingRuntime {
+        async fn run_container(
+            &self,
+            _image: &str,
+            _cmd: &[&str],
+            env_vars: &[(&str, &str)],
+            _working_dir: &Path,
+            volumes: &[(&Path, &Path)],
+            _entrypoint: Option<&str>,
+        ) -> Result<ContainerOutput, ContainerError> {
+            let env = |key: &str| {
+                env_vars
+                    .iter()
+                    .find(|(k, _)| *k == key)
+                    .map(|(_, v)| v.to_string())
+                    .unwrap()
+            };
+            let (github_dir, _) = volumes
+                .iter()
+                .find(|(_, container)| *container == Path::new("/github/workflow"))
+                .unwrap();
+            fs::write(
+                github_dir.join("output"),
+                format!("value={}\n", env("GITHUB_JOB")),
+            )
+            .unwrap();
+            assert_eq!(env("GITHUB_OUTPUT"), "/github/workflow/output");
+            self.all_steps_running.wait().await;
+            Ok(ContainerOutput {
+                stdout: String::new(),
+                stderr: String::new(),
+                exit_code: 0,
+            })
+        }
+
+        async fn pull_image(&self, _image: &str) -> Result<(), ContainerError> {
+            Ok(())
+        }
+
+        async fn build_image(
+            &self,
+            _dockerfile: &Path,
+            _tag: &str,
+            _context_dir: &Path,
+        ) -> Result<(), ContainerError> {
+            Ok(())
+        }
+
+        async fn prepare_language_environment(
+            &self,
+            _language: &str,
+            _version: Option<&str>,
+            _additional_packages: Option<Vec<String>>,
+        ) -> Result<String, ContainerError> {
+            Ok("mock:latest".to_string())
+        }
+
+        async fn image_exists(&self, _tag: &str) -> Result<bool, ContainerError> {
+            Ok(true)
+        }
+    }
+
+    /// Parallel jobs sharing run-level files would read and truncate each
+    /// other's `GITHUB_OUTPUT` when their steps end.
+    #[tokio::test]
+    async fn parallel_jobs_keep_their_own_github_files() {
+        let run_dir = tempfile::tempdir().unwrap();
+        let path = run_dir.path().join("ci.yml");
+        let job = |name: &str| {
+            format!(
+                "  {name}:\n    runs-on: ubuntu-latest\n    outputs:\n      \
+                 value: ${{{{ steps.write.outputs.value }}}}\n    steps:\n      \
+                 - id: write\n        run: echo unused\n"
+            )
+        };
+        fs::write(
+            &path,
+            format!(
+                "name: CI\non: push\njobs:\n{}{}",
+                job("first"),
+                job("second")
+            ),
+        )
+        .unwrap();
+        let workflow = parse_workflow(&path).unwrap();
+
+        environment::setup_github_environment_files(run_dir.path()).unwrap();
+        let mut env_context = HashMap::new();
+        env_context.insert("WRKFLW_RUNTIME_MODE".to_string(), "docker".to_string());
+        for (key, file) in [
+            ("GITHUB_OUTPUT", "output"),
+            ("GITHUB_ENV", "env"),
+            ("GITHUB_PATH", "path"),
+            ("GITHUB_STEP_SUMMARY", "step_summary"),
+        ] {
+            let shared = run_dir.path().join("github").join(file);
+            env_context.insert(key.to_string(), shared.to_string_lossy().to_string());
+        }
+
+        let runtime = OverlappingRuntime {
+            all_steps_running: tokio::sync::Barrier::new(2),
+        };
+        let jobs = vec!["first".to_string(), "second".to_string()];
+        let results = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            execute_job_batch(
+                &jobs,
+                &workflow,
+                &runtime,
+                &env_context,
+                &HashMap::new(),
+                false,
+                None,
+                None,
+                &HashMap::new(),
+                &HashMap::new(),
+                &crate::artifacts::ArtifactStore::new(run_dir.path()).unwrap(),
+                &crate::cache::CacheStore::new().unwrap(),
+                &HashMap::new(),
+            ),
+        )
+        .await
+        .expect("both jobs must reach their step")
+        .unwrap();
+
+        for result in &results {
+            assert_eq!(
+                result.outputs.get("value"),
+                Some(&result.canonical_name),
+                "{}",
+                result.logs
+            );
+        }
+        assert_eq!(results.len(), 2);
     }
 
     /// Helper to build a minimal `WorkflowDefinition`.
@@ -10891,7 +11188,7 @@ runs:
     fn initialize_runtime_auto_does_not_panic() {
         // Auto should always succeed (falls back to emulation when nothing is available).
         // This exercises the full cascade on whatever the test environment provides.
-        let result = initialize_runtime(RuntimeType::Auto, false);
+        let result = initialize_runtime(RuntimeType::Auto, false, &KubernetesConfig::default());
         assert!(
             result.is_ok(),
             "Auto runtime initialization returned Err: {:?}",

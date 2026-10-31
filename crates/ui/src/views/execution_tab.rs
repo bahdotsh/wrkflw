@@ -90,6 +90,7 @@ fn render_summary_strip(f: &mut Frame<'_>, app: &App, idx: usize, area: Rect) {
         RuntimeType::Auto => BadgeKind::Emulation,
         RuntimeType::Docker => BadgeKind::Docker,
         RuntimeType::Podman => BadgeKind::Podman,
+        RuntimeType::Kubernetes => BadgeKind::Kubernetes,
         RuntimeType::SecureEmulation => BadgeKind::Secure,
         RuntimeType::Emulation => BadgeKind::Emulation,
     };

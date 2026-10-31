@@ -223,6 +223,11 @@ fn render_runtime_pane(
         matches!(app.runtime_type, RuntimeType::Podman),
     ));
     pills.extend(pill(
+        "Kubernetes",
+        BadgeKind::Kubernetes,
+        matches!(app.runtime_type, RuntimeType::Kubernetes),
+    ));
+    pills.extend(pill(
         "Emulation",
         BadgeKind::Emulation,
         matches!(app.runtime_type, RuntimeType::Emulation),

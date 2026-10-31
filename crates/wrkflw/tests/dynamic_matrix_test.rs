@@ -18,6 +18,7 @@ fn emulation_cfg() -> ExecutionConfig {
         show_action_messages: false,
         target_job: None,
         platform_overrides: Default::default(),
+        kubernetes: Default::default(),
     }
 }
 

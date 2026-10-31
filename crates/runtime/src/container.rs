@@ -48,6 +48,13 @@ pub trait ContainerRuntime {
     /// Check whether a Docker/OCI image is usable by this runtime without
     /// building it. A cheap, read-only check; callers may repeat it.
     async fn image_exists(&self, tag: &str) -> Result<bool, ContainerError>;
+
+    /// True when `run_container` copies volumes to the step and back instead
+    /// of sharing them with the host, so a volume's contents end up on the
+    /// host whether or not the step meant them to.
+    fn mounts_are_copies(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Debug)]

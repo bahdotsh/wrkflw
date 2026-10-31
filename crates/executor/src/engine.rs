@@ -1212,7 +1212,12 @@ async fn execute_native_docker_step(
     }
 
     let container_workspace = Path::new("/github/workspace");
-    let mount_ctx = prepare_step_container_context(step_env, ctx.job_env, ctx.container_config);
+    let mount_ctx = prepare_step_container_context(
+        step_env,
+        ctx.job_env,
+        ctx.container_config,
+        ctx.runtime.mounts_are_copies(),
+    );
     let volumes = mount_ctx.build_volumes(ctx.working_dir, container_workspace);
     let env_vars: Vec<(&str, &str)> = step_env
         .iter()
@@ -3927,6 +3932,7 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                         &mut step_env,
                         ctx.job_env,
                         ctx.container_config,
+                        ctx.runtime.mounts_are_copies(),
                     );
                     let volumes = mount_ctx.build_volumes(ctx.working_dir, container_workspace);
                     let env_vars: Vec<(&str, &str)> = step_env
@@ -4129,8 +4135,12 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
             container_workspace.to_path_buf()
         };
 
-        let mount_ctx =
-            prepare_step_container_context(&mut step_env, ctx.job_env, ctx.container_config);
+        let mount_ctx = prepare_step_container_context(
+            &mut step_env,
+            ctx.job_env,
+            ctx.container_config,
+            ctx.runtime.mounts_are_copies(),
+        );
 
         // Custom (non-built-in) shells run a script file. Holding the guard here
         // keeps the file alive for the run and removes it on every exit path.
@@ -4569,10 +4579,11 @@ fn prepare_step_container_context(
     step_env: &mut HashMap<String, String>,
     job_env: &HashMap<String, String>,
     container_config: Option<&JobContainer>,
+    mounts_are_copies: bool,
 ) -> StepContainerContext {
     let is_container_runtime = uses_container_runtime(step_env);
     let (owned_volume_paths, github_mount) =
-        prepare_container_mounts(step_env, job_env, container_config);
+        prepare_container_mounts(step_env, job_env, container_config, mounts_are_copies);
     StepContainerContext {
         owned_volume_paths,
         github_mount,
@@ -4587,7 +4598,15 @@ type VolumePathPair = (PathBuf, PathBuf);
 fn uses_container_runtime(step_env: &HashMap<String, String>) -> bool {
     step_env
         .get("WRKFLW_RUNTIME_MODE")
-        .map(|m| m == "docker" || m == "podman" || m == "kubernetes")
+        .map(|mode| {
+            [
+                RuntimeType::Docker,
+                RuntimeType::Podman,
+                RuntimeType::Kubernetes,
+            ]
+            .iter()
+            .any(|runtime| runtime.mode_name() == mode)
+        })
         .unwrap_or(false)
 }
 
@@ -4600,6 +4619,7 @@ fn prepare_container_mounts(
     step_env: &mut HashMap<String, String>,
     job_env: &HashMap<String, String>,
     container_config: Option<&JobContainer>,
+    mounts_are_copies: bool,
 ) -> (Vec<VolumePathPair>, Option<VolumePathPair>) {
     let container_github_dir = Path::new("/github/workflow");
     let is_container_runtime = uses_container_runtime(step_env);
@@ -4689,13 +4709,11 @@ fn prepare_container_mounts(
                 }
                 _ => {
                     // Single path: mount at same location inside container.
-                    // GitHub makes this an anonymous volume. A pod's mounts are
-                    // written back to the host, so on Kubernetes an empty host
-                    // path keeps a path like `/tmp` from reaching the host's.
+                    // GitHub makes this an anonymous volume. Copied mounts are
+                    // written back to the host, so there an empty host path
+                    // keeps a path like `/tmp` from reaching the host's.
                     let p = PathBuf::from(parts[0]);
-                    let host = if step_env.get("WRKFLW_RUNTIME_MODE").map(String::as_str)
-                        == Some(RuntimeType::Kubernetes.mode_name())
-                    {
+                    let host = if mounts_are_copies {
                         PathBuf::new()
                     } else {
                         p.clone()
@@ -6299,7 +6317,8 @@ mod tests {
             "/tmp/abc/github/step_summary".into(),
         );
 
-        let (volumes, github_mount) = prepare_container_mounts(&mut step_env, &job_env, None);
+        let (volumes, github_mount) =
+            prepare_container_mounts(&mut step_env, &job_env, None, false);
 
         // Env vars should be remapped to container paths
         assert_eq!(step_env.get("GITHUB_ENV").unwrap(), "/github/workflow/env");
@@ -6333,7 +6352,8 @@ mod tests {
         let mut job_env = HashMap::new();
         job_env.insert("GITHUB_ENV".into(), "/tmp/abc/github/env".into());
 
-        let (_volumes, github_mount) = prepare_container_mounts(&mut step_env, &job_env, None);
+        let (_volumes, github_mount) =
+            prepare_container_mounts(&mut step_env, &job_env, None, false);
 
         // Env vars should NOT be remapped
         assert!(!step_env.contains_key("GITHUB_ENV"));
@@ -6348,7 +6368,8 @@ mod tests {
         let mut step_env = HashMap::new();
         let job_env = HashMap::new(); // no GITHUB_ENV
 
-        let (volumes, github_mount) = prepare_container_mounts(&mut step_env, &job_env, None);
+        let (volumes, github_mount) =
+            prepare_container_mounts(&mut step_env, &job_env, None, false);
 
         assert!(github_mount.is_none());
         assert!(volumes.is_empty());
@@ -6368,7 +6389,8 @@ mod tests {
             options: None,
         };
 
-        let (volumes, _) = prepare_container_mounts(&mut step_env, &job_env, Some(&container));
+        let (volumes, _) =
+            prepare_container_mounts(&mut step_env, &job_env, Some(&container), false);
 
         assert_eq!(volumes.len(), 1);
         assert_eq!(volumes[0].0, PathBuf::from("/host/data"));
@@ -6376,9 +6398,8 @@ mod tests {
     }
 
     #[test]
-    fn container_mounts_keep_single_path_volumes_off_the_host_on_kubernetes() {
+    fn container_mounts_keep_single_path_volumes_off_the_host_when_copied() {
         let mut step_env = HashMap::new();
-        step_env.insert("WRKFLW_RUNTIME_MODE".into(), "kubernetes".into());
         let container = JobContainer {
             image: "ubuntu".into(),
             credentials: None,
@@ -6388,7 +6409,7 @@ mod tests {
             options: None,
         };
         let (volumes, _) =
-            prepare_container_mounts(&mut step_env, &HashMap::new(), Some(&container));
+            prepare_container_mounts(&mut step_env, &HashMap::new(), Some(&container), true);
         assert_eq!(volumes[0], (PathBuf::new(), PathBuf::from("/tmp")));
         assert_eq!(
             volumes[1],
@@ -6410,7 +6431,8 @@ mod tests {
             options: None,
         };
 
-        let (volumes, _) = prepare_container_mounts(&mut step_env, &job_env, Some(&container));
+        let (volumes, _) =
+            prepare_container_mounts(&mut step_env, &job_env, Some(&container), false);
 
         assert_eq!(volumes.len(), 1);
         assert_eq!(volumes[0].0, PathBuf::from("/data"));
@@ -6431,7 +6453,8 @@ mod tests {
             options: None,
         };
 
-        let (volumes, _) = prepare_container_mounts(&mut step_env, &job_env, Some(&container));
+        let (volumes, _) =
+            prepare_container_mounts(&mut step_env, &job_env, Some(&container), false);
 
         assert_eq!(volumes.len(), 2);
         // :ro should be stripped — container path should be clean
@@ -6456,7 +6479,7 @@ mod tests {
             "/tmp/xyz/github/step_summary".into(),
         );
 
-        let (_, github_mount) = prepare_container_mounts(&mut step_env, &job_env, None);
+        let (_, github_mount) = prepare_container_mounts(&mut step_env, &job_env, None, false);
 
         // Podman should behave identically to Docker for remapping
         assert_eq!(step_env.get("GITHUB_ENV").unwrap(), "/github/workflow/env");
@@ -6472,7 +6495,7 @@ mod tests {
         // Only set GITHUB_ENV — the others are absent
         job_env.insert("GITHUB_ENV".into(), "/tmp/abc/github/env".into());
 
-        let (_, _) = prepare_container_mounts(&mut step_env, &job_env, None);
+        let (_, _) = prepare_container_mounts(&mut step_env, &job_env, None, false);
 
         // GITHUB_ENV should be remapped
         assert_eq!(step_env.get("GITHUB_ENV").unwrap(), "/github/workflow/env");
@@ -6514,7 +6537,8 @@ mod tests {
             options: None,
         };
 
-        let (volumes, _) = prepare_container_mounts(&mut step_env, &job_env, Some(&container));
+        let (volumes, _) =
+            prepare_container_mounts(&mut step_env, &job_env, Some(&container), false);
 
         // Both specs have an empty path component and should be skipped
         assert!(volumes.is_empty());

@@ -1129,6 +1129,11 @@ impl ContainerRuntime for KubernetesRuntime {
         self.push_local_image(builder, tag).await
     }
 
+    /// Mounts are streamed into `emptyDir` volumes and back after the step.
+    fn mounts_are_copies(&self) -> bool {
+        true
+    }
+
     /// Steps run in the image as given; there is no host-side image to
     /// customize. The executor treats this error as "use the image as-is".
     async fn prepare_language_environment(

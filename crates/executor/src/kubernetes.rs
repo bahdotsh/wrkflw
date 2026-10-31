@@ -210,19 +210,23 @@ pub async fn cleanup_resources() {
     futures::future::join_all(pods.iter().map(force_delete_pod)).await;
 }
 
+fn force_delete_args(name: &str) -> [&str; 7] {
+    [
+        "delete",
+        "pod",
+        name,
+        "--ignore-not-found",
+        "--wait=false",
+        "--grace-period=0",
+        "--force",
+    ]
+}
+
 async fn force_delete_pod(pod: &PodRef) {
     wrkflw_logging::info(&format!("Deleting Kubernetes pod {}", pod.name));
     let _ = Command::new("kubectl")
         .args(&pod.kubectl_args)
-        .args([
-            "delete",
-            "pod",
-            &pod.name,
-            "--ignore-not-found",
-            "--wait=false",
-            "--grace-period=0",
-            "--force",
-        ])
+        .args(force_delete_args(&pod.name))
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
@@ -238,6 +242,67 @@ fn track_pod(pod: &PodRef) {
 fn untrack_pod(name: &str) {
     if let Ok(mut pods) = RUNNING_PODS.lock() {
         pods.retain(|p| p.name != name);
+    }
+}
+
+/// Owns a pod for as long as a step runs.
+///
+/// The engine enforces `timeout-minutes` by dropping the step's future, so
+/// cleanup after an `.await` is not enough: nothing past the await point runs.
+/// `Drop` cannot await either, and the process may exit right after the job
+/// fails, so it starts a `kubectl delete` that outlives both this future and
+/// the tokio runtime.
+struct PodGuard {
+    pod: PodRef,
+    kubectl: std::ffi::OsString,
+    armed: bool,
+}
+
+impl PodGuard {
+    fn new(pod: PodRef) -> Self {
+        track_pod(&pod);
+        PodGuard {
+            pod,
+            kubectl: "kubectl".into(),
+            armed: true,
+        }
+    }
+
+    /// The pod was deleted or deliberately kept; leave it alone.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PodGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        untrack_pod(&self.pod.name);
+        wrkflw_logging::info(&format!(
+            "Step cancelled, deleting Kubernetes pod {}",
+            self.pod.name
+        ));
+        let child = std::process::Command::new(&self.kubectl)
+            .args(&self.pod.kubectl_args)
+            .args(force_delete_args(&self.pod.name))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+        match child {
+            // Only reaps it. If wrkflw exits first, the delete still finishes.
+            Ok(mut child) => {
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
+            }
+            Err(e) => wrkflw_logging::warning(&format!(
+                "Failed to delete pod {}: {}; activeDeadlineSeconds will stop it",
+                self.pod.name, e
+            )),
+        }
     }
 }
 
@@ -553,6 +618,8 @@ impl KubernetesRuntime {
             Stdio::null()
         });
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        // A cancelled step must not leave a `kubectl create` racing its delete.
+        cmd.kill_on_drop(true);
         wrkflw_logging::debug(&format!("Running: kubectl {}", args.join(" ")));
 
         let mut child = cmd.spawn().map_err(|e| {
@@ -774,11 +841,11 @@ impl KubernetesRuntime {
         wrkflw_logging::debug(&format!("Command: {:?}", cmd));
         wrkflw_logging::debug(&format!("Working directory: {}", working_dir.display()));
 
-        let pod_ref = PodRef {
+        // Armed before the pod exists: cancellation can land inside `create`.
+        let mut guard = PodGuard::new(PodRef {
             kubectl_args: self.kubectl_args(),
             name: name.to_string(),
-        };
-        track_pod(&pod_ref);
+        });
         let result = self.run_pod(name, &manifest, working_dir, &mounts).await;
 
         match &result {
@@ -804,6 +871,7 @@ impl KubernetesRuntime {
                 self.delete_pod(name).await;
             }
         }
+        guard.disarm();
         result
     }
 
@@ -1293,13 +1361,7 @@ impl ContainerRuntime for KubernetesRuntime {
                     "Kubernetes step timed out after {} seconds",
                     timeout.as_secs()
                 ));
-                // Only this step's pod: parallel jobs have pods of their own.
-                untrack_pod(&name);
-                force_delete_pod(&PodRef {
-                    kubectl_args: self.kubectl_args(),
-                    name,
-                })
-                .await;
+                // Dropping the step's future already deleted its pod.
                 Err(ContainerError::ContainerExecution(format!(
                     "Operation timed out after {} seconds (--k8s-timeout)",
                     timeout.as_secs()
@@ -2024,6 +2086,64 @@ mod tests {
             .await
             .is_err());
         assert!(rt.pull_image("anything").await.is_ok());
+    }
+
+    /// A guard whose "kubectl" records its arguments in `log` instead.
+    #[cfg(unix)]
+    fn recording_guard(name: &str, log: &Path) -> PodGuard {
+        let mut guard = PodGuard::new(PodRef {
+            kubectl_args: vec![
+                "-c".into(),
+                format!("echo \"$@\" > {}.tmp && mv {0}.tmp {0}", log.display()),
+                "sh".into(),
+            ],
+            name: name.into(),
+        });
+        guard.kubectl = "sh".into();
+        guard
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelling_a_step_deletes_its_pod() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("kubectl.log");
+        let guard = recording_guard("wrkflw-cancelled", &log);
+
+        // Exactly what the engine's `timeout-minutes` does to a running step.
+        let step = async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+        };
+        assert!(tokio::time::timeout(Duration::from_millis(10), step)
+            .await
+            .is_err());
+
+        assert!(!RUNNING_PODS
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|p| p.name == "wrkflw-cancelled"));
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !log.exists() {
+            assert!(std::time::Instant::now() < deadline, "delete never ran");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let args = std::fs::read_to_string(&log).unwrap();
+        assert!(args.starts_with("delete pod wrkflw-cancelled "), "{}", args);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_disarmed_guard_leaves_the_pod_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("kubectl.log");
+        let mut guard = recording_guard("wrkflw-preserved", &log);
+        guard.disarm();
+        drop(guard);
+        untrack_pod("wrkflw-preserved");
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!log.exists());
     }
 
     #[test]

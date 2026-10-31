@@ -42,7 +42,10 @@ use wrkflw_runtime::container::{
 
 /// Image used for the wait and sync helper containers. Anything with `sh`,
 /// `tar`, `mkdir` and `touch` works.
-pub const DEFAULT_HELPER_IMAGE: &str = "busybox:1.36";
+///
+/// Pinned by digest because this image runs as root with every mount attached.
+pub const DEFAULT_HELPER_IMAGE: &str =
+    "busybox:1.36@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662";
 
 /// Upper bound for one step, from pod creation to volume sync-back. Matches
 /// the engine's default job timeout, so `timeout-minutes` governs as it does

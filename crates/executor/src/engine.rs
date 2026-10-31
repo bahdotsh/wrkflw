@@ -963,10 +963,7 @@ async fn prepare_action(
         let dockerfile = action_dir.join("Dockerfile");
         if dockerfile.exists() {
             // It's a Docker action, build it
-            let tag = format!("wrkflw-local-action:{}", uuid::Uuid::new_v4());
-
-            runtime
-                .build_image(&dockerfile, &tag, action_dir)
+            let tag = ensure_action_image(runtime, "wrkflw-local-action:", &dockerfile, action_dir)
                 .await
                 .map_err(|e| ExecutionError::Runtime(format!("Failed to build image: {}", e)))?;
 
@@ -1141,16 +1138,15 @@ async fn prepare_action(
                     }
 
                     // Build the image
-                    let tag = format!("wrkflw-action:{}", uuid::Uuid::new_v4());
-                    runtime
-                        .build_image(&dockerfile, &tag, &action_dir)
-                        .await
-                        .map_err(|e| {
-                            ExecutionError::Runtime(format!(
-                                "Failed to build Dockerfile for action '{}': {}",
-                                action.repository, e
-                            ))
-                        })?;
+                    let tag =
+                        ensure_action_image(runtime, "wrkflw-action:", &dockerfile, &action_dir)
+                            .await
+                            .map_err(|e| {
+                                ExecutionError::Runtime(format!(
+                                    "Failed to build Dockerfile for action '{}': {}",
+                                    action.repository, e
+                                ))
+                            })?;
 
                     let (entrypoint, args) =
                         extract_docker_runs_config(resolved.definition.as_ref()).map_err(|e| {
@@ -1883,6 +1879,97 @@ async fn build_combined_runtime_image(
             ExecutionError::Runtime(format!("Failed to build combined runtime image: {}", e))
         })?;
 
+    Ok(tag)
+}
+
+/// Hash everything a Dockerfile action's image is built from, so the same
+/// action always gets the same tag. Git metadata is left out: a fresh clone of
+/// an unchanged action must hash the same.
+fn action_context_hash(dockerfile: &Path, context_dir: &Path) -> std::io::Result<String> {
+    use sha2::{Digest, Sha256};
+
+    fn visit(dir: &Path, rel: &Path, hasher: &mut Sha256) -> std::io::Result<()> {
+        let mut entries = std::fs::read_dir(dir)?.collect::<std::io::Result<Vec<_>>>()?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            if entry.file_name() == ".git" {
+                continue;
+            }
+            let path = entry.path();
+            let rel = rel.join(entry.file_name());
+            let file_type = entry.file_type()?;
+            hasher.update(rel.to_string_lossy().as_bytes());
+            hasher.update([0]);
+            if file_type.is_dir() {
+                hasher.update(b"d");
+                visit(&path, &rel, hasher)?;
+            } else if file_type.is_symlink() {
+                hasher.update(b"l");
+                hasher.update(std::fs::read_link(&path)?.to_string_lossy().as_bytes());
+            } else if file_type.is_file() {
+                hasher.update(b"f");
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    hasher.update(entry.metadata()?.permissions().mode().to_le_bytes());
+                }
+                let body = std::fs::read(&path)?;
+                hasher.update((body.len() as u64).to_le_bytes());
+                hasher.update(&body);
+            }
+        }
+        Ok(())
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(std::fs::read(dockerfile)?);
+    hasher.update([0]);
+    visit(context_dir, Path::new(""), &mut hasher)?;
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Build a Dockerfile action's image under a tag derived from its content,
+/// unless the runtime already has it. Tags are stable because a registry keeps
+/// every tag it is given: with a fresh one per step, `--k8s-registry` would
+/// grow on every run.
+async fn ensure_action_image(
+    runtime: &dyn ContainerRuntime,
+    tag_prefix: &str,
+    dockerfile: &Path,
+    context_dir: &Path,
+) -> Result<String, wrkflw_runtime::container::ContainerError> {
+    let hash = {
+        let dockerfile = dockerfile.to_path_buf();
+        let context_dir = context_dir.to_path_buf();
+        tokio::task::spawn_blocking(move || action_context_hash(&dockerfile, &context_dir))
+            .await
+            .map_err(|e| {
+                wrkflw_runtime::container::ContainerError::ImageBuild(format!(
+                    "hashing task failed: {}",
+                    e
+                ))
+            })?
+            .map_err(|e| {
+                wrkflw_runtime::container::ContainerError::ImageBuild(format!(
+                    "failed to hash the build context: {}",
+                    e
+                ))
+            })?
+    };
+    let tag = format!("{}{}", tag_prefix, hash);
+
+    // Parallel jobs using one action build it once.
+    let tag_lock = {
+        let mut locks = IMAGE_BUILD_LOCKS.lock().unwrap();
+        locks
+            .entry(tag.clone())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    };
+    let _build_guard = tag_lock.lock().await;
+    if !runtime.image_exists(&tag).await? {
+        runtime.build_image(dockerfile, &tag, context_dir).await?;
+    }
     Ok(tag)
 }
 
@@ -7033,6 +7120,28 @@ runs:
 
     use std::sync::{Arc, Mutex};
     use wrkflw_runtime::container::{ContainerError, ContainerOutput};
+
+    #[test]
+    fn action_context_hash_follows_content_and_ignores_git_metadata() {
+        let write_action = |body: &str| {
+            let dir = tempfile::tempdir().unwrap();
+            fs::write(dir.path().join("Dockerfile"), "FROM alpine\n").unwrap();
+            fs::create_dir(dir.path().join("src")).unwrap();
+            fs::write(dir.path().join("src/run.sh"), body).unwrap();
+            dir
+        };
+        let hash = |dir: &tempfile::TempDir| {
+            action_context_hash(&dir.path().join("Dockerfile"), dir.path()).unwrap()
+        };
+
+        let first = write_action("echo one");
+        let same = write_action("echo one");
+        fs::create_dir(same.path().join(".git")).unwrap();
+        fs::write(same.path().join(".git/HEAD"), "ref: unrelated").unwrap();
+        assert_eq!(hash(&first), hash(&same));
+
+        assert_ne!(hash(&first), hash(&write_action("echo two")));
+    }
 
     #[test]
     fn mode_name_is_what_container_detection_expects() {

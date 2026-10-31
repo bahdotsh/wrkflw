@@ -178,6 +178,22 @@ where
     }
 }
 
+/// `continue-on-error` is a boolean or an expression such as `${{ matrix.experimental }}`.
+fn deserialize_bool_or_expression<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    match Option::<serde_yaml::Value>::deserialize(deserializer)? {
+        None => Ok(None),
+        Some(serde_yaml::Value::Bool(value)) => Ok(Some(value.to_string())),
+        Some(serde_yaml::Value::String(value)) => Ok(Some(value)),
+        Some(other) => Err(serde::de::Error::custom(format!(
+            "expected a boolean or expression, got {:?}",
+            other
+        ))),
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize, Default)]
 pub struct Strategy {
     #[serde(
@@ -225,6 +241,12 @@ pub struct Job {
     pub timeout_minutes: Option<f64>,
     #[serde(default)]
     pub defaults: Option<Defaults>,
+    #[serde(
+        default,
+        rename = "continue-on-error",
+        deserialize_with = "deserialize_bool_or_expression"
+    )]
+    pub continue_on_error: Option<String>,
 }
 
 impl Job {
@@ -276,8 +298,12 @@ pub struct Step {
     pub with: Option<HashMap<String, String>>,
     #[serde(default)]
     pub env: HashMap<String, String>,
-    #[serde(default, rename = "continue-on-error")]
-    pub continue_on_error: Option<bool>,
+    #[serde(
+        default,
+        rename = "continue-on-error",
+        deserialize_with = "deserialize_bool_or_expression"
+    )]
+    pub continue_on_error: Option<String>,
     #[serde(default, rename = "if")]
     pub if_condition: Option<String>,
     #[serde(default)]
@@ -783,7 +809,7 @@ jobs:
         assert_eq!(step.shell.as_deref(), Some("bash"));
         assert_eq!(step.working_directory.as_deref(), Some("./src"));
         assert_eq!(step.timeout_minutes, Some(10.5));
-        assert_eq!(step.continue_on_error, Some(true));
+        assert_eq!(step.continue_on_error.as_deref(), Some("true"));
     }
 
     #[test]
@@ -954,7 +980,7 @@ jobs:
         // Verify continue-on-error parsing
         let job = parsed.jobs.get("test-continue").unwrap();
         assert_eq!(job.steps.len(), 2);
-        assert_eq!(job.steps[0].continue_on_error, Some(true));
+        assert_eq!(job.steps[0].continue_on_error.as_deref(), Some("true"));
         assert_eq!(job.steps[1].continue_on_error, None);
 
         // Verify step-level if condition parsing

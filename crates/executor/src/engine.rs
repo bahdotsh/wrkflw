@@ -193,7 +193,7 @@ async fn execute_github_workflow(
 
         // Check for job failures and collect details
         for job_result in &job_results {
-            if job_result.status == JobStatus::Failure {
+            if job_result.fails_run() {
                 has_failures = true;
                 failure_details.push_str(&format!(
                     "\n{} Job failed: {}\n",
@@ -247,6 +247,12 @@ fn record_job_results(
 ) {
     let mut aggregate: HashMap<&str, &JobStatus> = HashMap::new();
     for job_result in job_results {
+        // Dependents treat an allowed failure as success, so they still run.
+        let status = if job_result.failure_allowed {
+            &JobStatus::Success
+        } else {
+            &job_result.status
+        };
         if all_job_outputs.contains_key(&job_result.canonical_name)
             && job_result.name != job_result.canonical_name
         {
@@ -262,12 +268,12 @@ fn record_job_results(
         );
         aggregate
             .entry(job_result.canonical_name.as_str())
-            .and_modify(|status| {
-                if job_result.status.aggregate_rank() > status.aggregate_rank() {
-                    *status = &job_result.status;
+            .and_modify(|existing| {
+                if status.aggregate_rank() > existing.aggregate_rank() {
+                    *existing = status;
                 }
             })
-            .or_insert(&job_result.status);
+            .or_insert(status);
     }
     for (name, status) in aggregate {
         all_job_results.insert(name.to_string(), status.to_string());
@@ -390,7 +396,7 @@ async fn execute_gitlab_pipeline(
 
         // Check for job failures and collect details
         for job_result in &job_results {
-            if job_result.status == JobStatus::Failure {
+            if job_result.fails_run() {
                 has_failures = true;
                 failure_details.push_str(&format!(
                     "\n{} Job failed: {}\n",
@@ -825,9 +831,17 @@ pub struct JobResult {
     pub logs: String,
     /// Resolved job outputs (from the job's `outputs:` mapping).
     pub outputs: HashMap<String, String>,
+    /// `continue-on-error` applies: a failure here doesn't fail the run or
+    /// block dependent jobs, though the job is still reported as failed.
+    pub failure_allowed: bool,
 }
 
 impl JobResult {
+    /// Whether this result should fail the run and trigger `fail-fast`.
+    fn fails_run(&self) -> bool {
+        self.status == JobStatus::Failure && !self.failure_allowed
+    }
+
     /// A job (or matrix combination) that never ran.
     fn skipped(
         name: impl Into<String>,
@@ -841,6 +855,7 @@ impl JobResult {
             steps: Vec::new(),
             logs: logs.into(),
             outputs: HashMap::new(),
+            failure_allowed: false,
         }
     }
 
@@ -864,6 +879,7 @@ impl JobResult {
             )],
             logs: reason,
             outputs: HashMap::new(),
+            failure_allowed: false,
         }
     }
 }
@@ -2221,6 +2237,13 @@ async fn execute_job_with_matrix(
         HashMap::new()
     };
 
+    if !job.services.is_empty() {
+        wrkflw_logging::warning(&format!(
+            "Job '{}' declares services, which wrkflw doesn't start yet: its steps can't reach them",
+            job_name
+        ));
+    }
+
     // Check if this is a matrix job
     if let Some(matrix_config) = job.matrix_config() {
         // The matrix, an axis or `include`/`exclude` may be expressions over
@@ -2492,6 +2515,13 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
         steps: loop_state.step_results,
         logs: loop_state.job_logs,
         outputs: job_outputs,
+        failure_allowed: job_failure_allowed(
+            job,
+            &None,
+            ctx.env_context,
+            ctx.user_env,
+            &ctx.services,
+        ),
     })
 }
 
@@ -2556,7 +2586,7 @@ async fn execute_matrix_combinations(
         for (combination, result) in chunk.iter().zip(chunk_results) {
             match result {
                 Ok(job_result) => {
-                    if job_result.status == JobStatus::Failure {
+                    if job_result.fails_run() {
                         any_failed = true;
                     }
                     results.push(job_result);
@@ -2578,6 +2608,7 @@ async fn execute_matrix_combinations(
                         steps: Vec::new(),
                         logs: e.to_string(),
                         outputs: HashMap::new(),
+                        failure_allowed: false,
                     });
                 }
             }
@@ -2801,6 +2832,13 @@ async fn execute_matrix_job(
         steps: loop_state.step_results,
         logs: loop_state.job_logs,
         outputs: job_outputs,
+        failure_allowed: job_failure_allowed(
+            job_template,
+            &Some(combination.values.clone()),
+            &job_env,
+            &job_user_env,
+            services,
+        ),
     })
 }
 
@@ -3091,6 +3129,11 @@ async fn run_step_with_guards(
         }
     }
 
+    let continue_on_error = continues_on_error(
+        step.continue_on_error.as_deref(),
+        &step_exec_ctx.expr_context(),
+    );
+
     // Wrap step execution with optional step-level timeout; sanitize to avoid panic on negative/NaN.
     // Note: the job-level timeout already wraps the entire step execution, so the step
     // timeout only fires when it is shorter than the remaining job time.
@@ -3121,7 +3164,7 @@ async fn run_step_with_guards(
     match step_result {
         Ok(mut result) => {
             let (abort_job, conclusion) = if result.status == StepStatus::Failure {
-                if step.continue_on_error == Some(true) {
+                if continue_on_error {
                     wrkflw_logging::info(&format!(
                         "  Step '{}' failed but continue-on-error is set, continuing",
                         result.name
@@ -3138,7 +3181,7 @@ async fn run_step_with_guards(
             Ok(StepOutcome::Completed { result, abort_job })
         }
         Err(e) => {
-            let (abort_job, conclusion) = if step.continue_on_error == Some(true) {
+            let (abort_job, conclusion) = if continue_on_error {
                 wrkflw_logging::info(&format!(
                     "  Step '{}' errored but continue-on-error is set, continuing",
                     step_name
@@ -3159,6 +3202,36 @@ async fn run_step_with_guards(
             })
         }
     }
+}
+
+/// Whether a `continue-on-error` value (`true`, `false` or an expression) holds.
+fn continues_on_error(value: Option<&str>, ctx: &crate::expression::ExpressionContext<'_>) -> bool {
+    value.is_some_and(|value| evaluate_condition_with_context(value, ctx))
+}
+
+/// Whether a job's `continue-on-error` tolerates its failure. Evaluated per
+/// matrix combination, so `${{ matrix.experimental }}` applies to just those.
+fn job_failure_allowed(
+    job: &Job,
+    matrix_combination: &Option<HashMap<String, serde_yaml::Value>>,
+    env_context: &HashMap<String, String>,
+    user_env: &HashMap<String, String>,
+    services: &JobServices<'_>,
+) -> bool {
+    continues_on_error(
+        job.continue_on_error.as_deref(),
+        &crate::expression::ExpressionContext {
+            env_context,
+            step_outputs: &HashMap::new(),
+            matrix_combination,
+            step_statuses: &HashMap::new(),
+            job_status: "success",
+            secrets_context: services.secrets_context,
+            needs_context: services.needs_context,
+            needs_results: services.needs_results,
+            user_env,
+        },
+    )
 }
 
 /// Sanitize a timeout-minutes value, returning a safe positive finite number.
@@ -5101,7 +5174,7 @@ async fn run_called_workflow(
             ctx.services.platform_overrides,
         )
         .await?;
-        any_failed |= results.iter().any(|r| r.status == JobStatus::Failure);
+        any_failed |= results.iter().any(JobResult::fails_run);
         record_job_results(
             &results,
             &mut reusable_job_outputs,
@@ -5143,6 +5216,15 @@ async fn run_called_workflow(
         steps: vec![summary_step],
         logs,
         outputs,
+        failure_allowed: job_failure_allowed(
+            ctx.workflow.jobs.get(ctx.job_name).ok_or_else(|| {
+                ExecutionError::Execution(format!("Job '{}' not found", ctx.job_name))
+            })?,
+            &None,
+            ctx.env_context,
+            ctx.user_env,
+            &ctx.services,
+        ),
     })
 }
 
@@ -5889,7 +5971,11 @@ fn convert_yaml_to_step(step_yaml: &serde_yaml::Value) -> Result<workflow::Step,
     let final_run = run;
 
     // Extract continue_on_error
-    let continue_on_error = step_yaml.get("continue-on-error").and_then(|v| v.as_bool());
+    let continue_on_error = step_yaml.get("continue-on-error").and_then(|v| match v {
+        serde_yaml::Value::Bool(b) => Some(b.to_string()),
+        serde_yaml::Value::String(s) => Some(s.clone()),
+        _ => None,
+    });
 
     // A null `if:` means no condition, not a condition that can't be parsed.
     let if_condition = step_yaml
@@ -6593,6 +6679,7 @@ mod tests {
             secrets: None,
             timeout_minutes: None,
             defaults: None,
+            continue_on_error: None,
         }
     }
 

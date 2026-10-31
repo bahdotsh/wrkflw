@@ -154,6 +154,11 @@ pub fn convert_to_workflow_format(pipeline: &Pipeline) -> workflow::WorkflowDefi
             secrets: None,
             timeout_minutes: None,
             defaults: None,
+            continue_on_error: matches!(
+                gitlab_job.allow_failure,
+                Some(wrkflw_models::gitlab::AllowFailure::Bool(true))
+            )
+            .then(|| "true".to_string()),
         };
 
         // Add job-specific environment variables
@@ -194,7 +199,7 @@ pub fn convert_to_workflow_format(pipeline: &Pipeline) -> workflow::WorkflowDefi
             for (i, cmd) in after_script.iter().enumerate() {
                 let mut step =
                     workflow::Step::with_run(format!("After script {}", i + 1), cmd.clone());
-                step.continue_on_error = Some(true); // After script should continue even if previous steps fail
+                step.continue_on_error = Some("true".to_string()); // After script should continue even if previous steps fail
                 job.steps.push(step);
             }
         }

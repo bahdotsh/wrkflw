@@ -2223,8 +2223,9 @@ async fn execute_job_with_matrix(
 
     // Check if this is a matrix job
     if let Some(matrix_config) = job.matrix_config() {
-        // `include`/`exclude` may be expressions over upstream job outputs, which
-        // are only available now, so resolve them before expanding. As on GitHub,
+        // The matrix, an axis or `include`/`exclude` may be expressions over
+        // upstream job outputs, which are only available now, so resolve them
+        // before expanding. As on GitHub,
         // a matrix that can't be computed fails this job, and the run carries on.
         let expansion = resolve_matrix_expressions(
             matrix_config,
@@ -5908,8 +5909,9 @@ fn evaluate_job_condition(
     evaluate_condition_with_context(&effective, &ctx)
 }
 
-/// Resolve `include`/`exclude` expressions of a matrix against the contexts
-/// available to `strategy:`, which runs before any step of the job.
+/// Resolve every expression of a matrix (the whole matrix, an axis, or
+/// `include`/`exclude`) against the contexts available to `strategy:`, which
+/// runs before any step of the job.
 fn resolve_matrix_expressions(
     matrix: &wrkflw_matrix::MatrixConfig,
     env_context: &HashMap<String, String>,
@@ -5928,11 +5930,50 @@ fn resolve_matrix_expressions(
         needs_results,
         user_env,
     };
-    matrix.resolve_expressions(|expr| {
-        let inner = crate::expression::strip_expression_wrapper(expr);
-        // Arrays and objects render as JSON.
-        crate::expression::evaluate(inner, &ctx).map(|value| value.to_output_string())
-    })
+    matrix.resolve_expressions(|expr| matrix_expression_json(expr, &ctx))
+}
+
+/// Evaluate a matrix expression to JSON text.
+///
+/// `ExprValue` objects are unordered, so going through one would sort the axes
+/// and with them the order jobs run in. `fromJSON(x)` hands back the text of `x`
+/// untouched instead, which keeps the order the author wrote.
+fn matrix_expression_json(
+    expr: &str,
+    ctx: &crate::expression::ExpressionContext<'_>,
+) -> Result<String, String> {
+    let inner = crate::expression::strip_expression_wrapper(expr);
+    if let Some(argument) = from_json_argument(inner) {
+        let text = crate::expression::evaluate(argument, ctx)?.to_output_string();
+        if serde_json::from_str::<serde_json::Value>(&text).is_ok() {
+            return Ok(text);
+        }
+    }
+    crate::expression::evaluate(inner, ctx).map(|value| value.to_output_string())
+}
+
+/// The argument of `expr` if all of it is one `fromJSON(...)` call.
+fn from_json_argument(expr: &str) -> Option<&str> {
+    let name = expr.get(..8)?;
+    if !name.eq_ignore_ascii_case("fromjson") {
+        return None;
+    }
+    let argument = expr[8..]
+        .trim_start()
+        .strip_prefix('(')?
+        .strip_suffix(')')?;
+    let mut depth = 0usize;
+    let mut quoted = false;
+    for ch in argument.chars() {
+        match ch {
+            '\'' => quoted = !quoted,
+            '(' if !quoted => depth += 1,
+            // The call closed early, as in `fromJSON(a) || fromJSON(b)`
+            ')' if !quoted => depth = depth.checked_sub(1)?,
+            _ => {}
+        }
+    }
+    Some(argument)
 }
 
 /// Evaluate a step `if:` condition. Unlike a job's, it may call `hashFiles`.
@@ -6131,6 +6172,35 @@ async fn resolve_secrets_for_context(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dynamic_matrix_keeps_axis_order_from_needs_output() {
+        let matrix = wrkflw_matrix::MatrixConfig::from_expression(
+            "${{ fromJSON(needs.setup.outputs.matrix) }}".to_string(),
+        );
+        let outputs = HashMap::from([(
+            "matrix".to_string(),
+            r#"{"zeta":["a","b"],"alpha":[1],"include":[{"zeta":"c","alpha":2}]}"#.to_string(),
+        )]);
+        let needs = HashMap::from([("setup".to_string(), outputs)]);
+        let results = HashMap::from([("setup".to_string(), "success".to_string())]);
+        let env = HashMap::new();
+
+        let resolved = resolve_matrix_expressions(&matrix, &env, &env, &needs, &results).unwrap();
+
+        let axes: Vec<_> = resolved.parameters.keys().collect();
+        assert_eq!(axes, ["zeta", "alpha"]);
+        assert_eq!(wrkflw_matrix::expand_matrix(&resolved).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn from_json_argument_only_matches_a_single_call() {
+        assert_eq!(from_json_argument("fromJSON(a.b)"), Some("a.b"));
+        assert_eq!(from_json_argument("fromjson (f('x)'))"), Some("f('x)')"));
+        assert_eq!(from_json_argument("fromJSON(a) || fromJSON(b)"), None);
+        assert_eq!(from_json_argument("toJSON(a)"), None);
+        assert_eq!(from_json_argument("github.event"), None);
+    }
 
     #[test]
     fn workspace_copy_keeps_forge_dirs_and_skips_other_hidden_dirs() {

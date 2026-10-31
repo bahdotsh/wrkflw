@@ -160,7 +160,7 @@ async fn execute_github_workflow(
     }
 
     // Add runtime mode to environment
-    seed_runtime_mode(&mut env_context, &config.runtime_type, CiPlatform::GitHub);
+    seed_runtime_context(&mut env_context, &config.runtime_type, CiPlatform::GitHub);
 
     // show=true means hide=false (inverted for the env var)
     env_context.insert(
@@ -371,7 +371,7 @@ async fn execute_gitlab_pipeline(
     let mut env_context = create_gitlab_context(&pipeline, workspace_dir.path());
 
     // Add runtime mode to environment
-    seed_runtime_mode(&mut env_context, &config.runtime_type, CiPlatform::GitLab);
+    seed_runtime_context(&mut env_context, &config.runtime_type, CiPlatform::GitLab);
 
     // Setup environment files
     environment::setup_github_environment_files(workspace_dir.path()).map_err(|e| {
@@ -604,7 +604,7 @@ enum CiPlatform {
 
 /// Record the runtime steps will use and, for a container runtime, swap in the
 /// values steps see inside the container.
-fn seed_runtime_mode(
+fn seed_runtime_context(
     env: &mut HashMap<String, String>,
     runtime: &RuntimeType,
     platform: CiPlatform,
@@ -9189,18 +9189,18 @@ runs:
     }
 
     #[test]
-    fn seed_runtime_mode_applies_container_context_only_to_container_runtimes() {
+    fn seed_runtime_context_applies_container_context_only_to_container_runtimes() {
         let host_env = || HashMap::from([("RUNNER_OS".to_string(), "macOS".to_string())]);
 
         for runtime in [RuntimeType::Emulation, RuntimeType::SecureEmulation] {
             let mut env = host_env();
-            seed_runtime_mode(&mut env, &runtime, CiPlatform::GitHub);
+            seed_runtime_context(&mut env, &runtime, CiPlatform::GitHub);
             assert_eq!(env["RUNNER_OS"], "macOS", "{:?}", runtime);
             assert_eq!(env["WRKFLW_RUNTIME_MODE"], runtime.mode_name());
         }
 
         let mut env = host_env();
-        seed_runtime_mode(&mut env, &RuntimeType::Docker, CiPlatform::GitHub);
+        seed_runtime_context(&mut env, &RuntimeType::Docker, CiPlatform::GitHub);
         assert_eq!(env["RUNNER_OS"], "Linux");
     }
 
@@ -9210,12 +9210,12 @@ runs:
         let host = Path::new("/host/workspace");
 
         let mut env = create_gitlab_context(&pipeline, host);
-        seed_runtime_mode(&mut env, &RuntimeType::Podman, CiPlatform::GitLab);
+        seed_runtime_context(&mut env, &RuntimeType::Podman, CiPlatform::GitLab);
         assert_eq!(env["CI_PROJECT_DIR"], "/github/workspace");
         assert_eq!(env["GITHUB_WORKSPACE"], "/github/workspace");
 
         let mut env = create_gitlab_context(&pipeline, host);
-        seed_runtime_mode(&mut env, &RuntimeType::Emulation, CiPlatform::GitLab);
+        seed_runtime_context(&mut env, &RuntimeType::Emulation, CiPlatform::GitLab);
         assert_eq!(env["CI_PROJECT_DIR"], "/host/workspace");
     }
 
@@ -9462,7 +9462,7 @@ runs:
     #[test]
     fn runner_temp_is_on_the_host_directory_mounted_for_the_job() {
         let mut job_env = HashMap::new();
-        seed_runtime_mode(&mut job_env, &RuntimeType::Docker, CiPlatform::GitHub);
+        seed_runtime_context(&mut job_env, &RuntimeType::Docker, CiPlatform::GitHub);
         let _files = environment::isolate_github_environment_files(&mut job_env).unwrap();
 
         let mut step_env = job_env.clone();
@@ -9481,7 +9481,7 @@ runs:
             ("RUNNER_OS".to_string(), "macOS".to_string()),
             ("GITHUB_WORKSPACE".to_string(), "/Users/me/repo".to_string()),
         ]);
-        seed_runtime_mode(&mut job_env, &RuntimeType::Docker, CiPlatform::GitHub);
+        seed_runtime_context(&mut job_env, &RuntimeType::Docker, CiPlatform::GitHub);
 
         let runtime = MockContainerRuntime::default();
         let step = make_run_step("echo ok");
@@ -9497,7 +9497,7 @@ runs:
     #[tokio::test]
     async fn working_directory_outside_the_workspace_is_rejected_even_for_runner_temp() {
         let mut job_env = HashMap::new();
-        seed_runtime_mode(&mut job_env, &RuntimeType::Docker, CiPlatform::GitHub);
+        seed_runtime_context(&mut job_env, &RuntimeType::Docker, CiPlatform::GitHub);
 
         let runtime = MockContainerRuntime::default();
         let mut step = make_run_step("echo ok");

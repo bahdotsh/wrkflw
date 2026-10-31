@@ -10,6 +10,7 @@ use std::ffi::OsStr;
 use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use wrkflw_runtime::container::ContainerError;
 
 /// How much of a sync's stderr is kept for its error message.
@@ -157,12 +158,25 @@ fn append_tree<W: io::Write>(builder: &mut tar::Builder<W>, root: &Path) -> io::
 /// symlink or leaves `host`. A clean return does not prove the archive is
 /// whole: tar has no length header, so a stream that stops between two entries
 /// reads as a normal end of file. Only the sender's exit status can tell.
-pub(super) fn unpack_archive<R: io::Read>(reader: R, host: &Path) -> io::Result<HashSet<PathBuf>> {
+///
+/// Stops with an error at the next entry once `cancelled` is set. Returning
+/// drops `reader`, which ends the sender's stream.
+pub(super) fn unpack_archive<R: io::Read>(
+    reader: R,
+    host: &Path,
+    cancelled: &AtomicBool,
+) -> io::Result<HashSet<PathBuf>> {
     let mut archive = tar::Archive::new(reader);
     let mut seen: HashSet<PathBuf> = HashSet::new();
     let mut directories = Vec::new();
 
     for entry in archive.entries()? {
+        if cancelled.load(Ordering::SeqCst) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "the step was cancelled",
+            ));
+        }
         let mut entry = entry?;
         let Some(rel) = safe_relative_path(&entry.path()?) else {
             continue;
@@ -310,7 +324,12 @@ pub(super) fn copy_dir_out_of_pod(
     pod: &str,
     mount: &Mount,
     excludes: &[String],
+    cancelled: &AtomicBool,
 ) -> Result<(), ContainerError> {
+    // The directory may be gone already, and must not be created again.
+    if cancelled.load(Ordering::SeqCst) {
+        return Ok(());
+    }
     std::fs::create_dir_all(&mount.host).map_err(|e| {
         ContainerError::ContainerExecution(format!(
             "failed to create {}: {}",
@@ -331,7 +350,7 @@ pub(super) fn copy_dir_out_of_pod(
         .args(["exec", pod, "-c", SYNC_CONTAINER, "--"])
         .args(&tar_args);
     let prune = mount.mirrored();
-    sync_from(command, &src, &mount.host, excludes, prune)?;
+    sync_from(command, &src, &mount.host, excludes, prune, cancelled)?;
     wrkflw_logging::debug(&format!(
         "Kubernetes: synced {}:{} -> {}",
         pod,
@@ -350,6 +369,7 @@ pub(super) fn sync_from(
     host: &Path,
     excludes: &[String],
     prune: bool,
+    cancelled: &AtomicBool,
 ) -> Result<(), ContainerError> {
     let mut child = command
         .stdin(Stdio::null())
@@ -364,7 +384,7 @@ pub(super) fn sync_from(
     let stdout = child.stdout.take().ok_or_else(|| {
         ContainerError::ContainerExecution("kubectl exec stdout was not captured".to_string())
     })?;
-    let unpacked = unpack_archive(stdout, host);
+    let unpacked = unpack_archive(stdout, host, cancelled);
 
     let status = child.wait().map_err(|e| {
         ContainerError::ContainerExecution(format!("kubectl exec did not complete: {}", e))
@@ -385,7 +405,7 @@ pub(super) fn sync_from(
         ))
     };
     let seen = unpacked.map_err(unpack_error)?;
-    if prune {
+    if prune && !cancelled.load(Ordering::SeqCst) {
         prune_to_archive(host, &seen, excludes).map_err(unpack_error)?;
     }
     Ok(())
@@ -397,7 +417,7 @@ mod tests {
 
     /// What [`sync_from`] does once the stream is known to be complete.
     fn unpack_mirroring<R: io::Read>(reader: R, host: &Path, keep: &[String]) -> io::Result<()> {
-        let seen = unpack_archive(reader, host)?;
+        let seen = unpack_archive(reader, host, &AtomicBool::new(false))?;
         prune_to_archive(host, &seen, keep)
     }
 
@@ -590,6 +610,7 @@ mod tests {
             host.path(),
             &[],
             true,
+            &AtomicBool::new(false),
         )
         .expect_err("a failed exec must fail the sync");
 
@@ -605,10 +626,62 @@ mod tests {
         std::fs::write(host.path().join("deleted.txt"), "x").unwrap();
 
         let tar = write_tar(work.path(), |b| add_file(b, "./kept.txt", b"x"));
-        sync_from(sender("cat \"$1\"", &tar), "src", host.path(), &[], true).unwrap();
+        sync_from(
+            sender("cat \"$1\"", &tar),
+            "src",
+            host.path(),
+            &[],
+            true,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
 
         assert!(host.path().join("kept.txt").exists());
         assert!(!host.path().join("deleted.txt").exists());
+    }
+
+    /// A cancelled step's job directory is on its way out, so the sync must
+    /// neither write to it nor take a short archive for a complete one.
+    #[cfg(unix)]
+    #[test]
+    fn a_cancelled_sync_stops_writing_and_never_prunes() {
+        let work = tempfile::tempdir().unwrap();
+        let host = tempfile::tempdir().unwrap();
+        std::fs::write(host.path().join("existing.txt"), "x").unwrap();
+
+        let tar = write_tar(work.path(), |b| add_file(b, "./late.txt", b"x"));
+        let err = sync_from(
+            sender("cat \"$1\"", &tar),
+            "src",
+            host.path(),
+            &[],
+            true,
+            &AtomicBool::new(true),
+        )
+        .expect_err("a cancelled sync must not report success");
+
+        assert!(err.to_string().contains("cancelled"), "{}", err);
+        assert!(!host.path().join("late.txt").exists());
+        assert!(host.path().join("existing.txt").exists());
+    }
+
+    #[test]
+    fn a_cancelled_copy_out_does_not_recreate_the_job_directory() {
+        let parent = tempfile::tempdir().unwrap();
+        let mount = Mount {
+            host: parent.path().join("removed"),
+            container: PathBuf::from("/github/workspace"),
+        };
+        copy_dir_out_of_pod(
+            OsStr::new("kubectl-that-must-not-run"),
+            &[],
+            "pod",
+            &mount,
+            &[],
+            &AtomicBool::new(true),
+        )
+        .unwrap();
+        assert!(!mount.host.exists());
     }
 
     /// A user's directory may hold files the pod never saw.
@@ -620,7 +693,15 @@ mod tests {
         std::fs::write(host.path().join("written-meanwhile.txt"), "x").unwrap();
 
         let tar = write_tar(work.path(), |b| add_file(b, "./from-pod.txt", b"x"));
-        sync_from(sender("cat \"$1\"", &tar), "src", host.path(), &[], false).unwrap();
+        sync_from(
+            sender("cat \"$1\"", &tar),
+            "src",
+            host.path(),
+            &[],
+            false,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
 
         assert!(host.path().join("from-pod.txt").exists());
         assert!(host.path().join("written-meanwhile.txt").exists());
@@ -681,6 +762,7 @@ mod tests {
             host.path(),
             &[],
             true,
+            &AtomicBool::new(false),
         )
         .unwrap();
         assert!(host.path().join("f.txt").exists());

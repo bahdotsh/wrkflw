@@ -295,7 +295,7 @@ How a step runs:
 3. After the step exits, its logs are collected and every mount is streamed back out through the sidecar, so `GITHUB_OUTPUT`, artifacts and workspace changes reach the next step.
 4. The pod is deleted. With `--preserve-containers-on-failure` a failed pod is kept for `kubectl logs <pod> -c main` and `kubectl exec -it <pod> -c wrkflw-sync -- sh`.
 
-Every pod carries `activeDeadlineSeconds`, set to `--k8s-timeout` (at least 1) plus 30 seconds, so the cluster stops it even if wrkflw is killed. A preserved pod is stopped at that deadline too. Its logs stay readable until you delete it, but `kubectl exec` no longer works.
+Every pod carries `activeDeadlineSeconds`, set to `--k8s-timeout` (at least 1) plus 30 seconds, so the cluster stops it even if wrkflw is killed. A preserved pod is stopped at that deadline too, and keeps its resources until then, GPUs included. Its logs stay readable until you delete it, but `kubectl exec` no longer works. `--preserve-containers-on-failure` also keeps a pod whose step timed out. After `--k8s-timeout` the deadline is only 30 seconds away, so read its logs instead. After a shorter `timeout-minutes`, `kubectl exec` works until the deadline. Ctrl+C always deletes pods.
 
 Things to know:
 

@@ -32,7 +32,7 @@ use std::ffi::{OsStr, OsString};
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use sync::{copy_dir_into_pod, copy_dir_out_of_pod};
 use tokio::process::Command;
@@ -321,12 +321,22 @@ fn untrack_pod(name: &str) {
 struct PodGuard {
     pod: PodRef,
     armed: bool,
+    /// Keep the pod for inspection when the step is cancelled. The exit sweep
+    /// still deletes it: nobody asked to keep pods after pressing Ctrl+C.
+    preserve: bool,
+    /// Tells a copy-out thread, which cancellation cannot stop, to give up.
+    cancelled: Arc<AtomicBool>,
 }
 
 impl PodGuard {
-    fn new(pod: PodRef) -> Self {
+    fn new(pod: PodRef, preserve: bool) -> Self {
         track_pod(&pod);
-        PodGuard { pod, armed: true }
+        PodGuard {
+            pod,
+            armed: true,
+            preserve,
+            cancelled: Arc::default(),
+        }
     }
 
     /// The pod was deleted or deliberately kept; leave it alone.
@@ -340,7 +350,17 @@ impl Drop for PodGuard {
         if !self.armed {
             return;
         }
+        self.cancelled.store(true, Ordering::SeqCst);
         untrack_pod(&self.pod.name);
+        if self.preserve && !SHUTTING_DOWN.load(Ordering::SeqCst) {
+            wrkflw_logging::info(&format!(
+                "Step cancelled, preserving pod {} for debugging. It keeps its resources \
+                 until activeDeadlineSeconds stops it. {}",
+                self.pod.name,
+                inspect_hint(&self.pod.name)
+            ));
+            return;
+        }
         wrkflw_logging::info(&format!(
             "Step cancelled, deleting Kubernetes pod {}",
             self.pod.name
@@ -365,6 +385,15 @@ impl Drop for PodGuard {
             )),
         }
     }
+}
+
+/// How to look at a preserved pod and get rid of it.
+fn inspect_hint(name: &str) -> String {
+    format!(
+        "Inspect with 'kubectl logs {} -c {}' or 'kubectl exec -it {} -c {} -- sh', \
+         then delete it with 'kubectl delete pod {}'.",
+        name, MAIN_CONTAINER, name, SYNC_CONTAINER, name
+    )
 }
 
 /// Registry reference a local `tag` is pushed under.
@@ -853,14 +882,15 @@ impl KubernetesRuntime {
     /// Stream `mount.container` out of the sync container onto `host`.
     ///
     /// `spawn_blocking` work cannot be cancelled, so a step timeout that lands
-    /// here leaves this thread running until the pod's delete ends its stream.
-    /// That stream then fails, which skips the prune, so at worst a few files
-    /// land in a job directory that is on its way out.
+    /// here leaves this thread running. `cancelled` stops it at the next
+    /// archive entry and before any prune, because the job directory it writes
+    /// to is on its way out.
     async fn copy_out(
         &self,
         name: &str,
         mount: &Mount,
         excludes: Vec<String>,
+        cancelled: Arc<AtomicBool>,
     ) -> Result<(), ContainerError> {
         if !mount.host.is_absolute() {
             return Ok(());
@@ -870,7 +900,7 @@ impl KubernetesRuntime {
         let pod = name.to_string();
         let mount = mount.clone();
         tokio::task::spawn_blocking(move || {
-            copy_dir_out_of_pod(&kubectl, &base, &pod, &mount, &excludes)
+            copy_dir_out_of_pod(&kubectl, &base, &pod, &mount, &excludes, &cancelled)
         })
         .await
         .map_err(|e| ContainerError::ContainerExecution(format!("copy task failed: {}", e)))?
@@ -906,21 +936,32 @@ impl KubernetesRuntime {
         wrkflw_logging::debug(&format!("Working directory: {}", working_dir.display()));
 
         // Armed before the pod exists: cancellation can land inside `create`.
-        let mut guard = PodGuard::new(PodRef {
-            kubectl: self.kubectl.clone(),
-            kubectl_args: self.kubectl_args(),
-            name: name.to_string(),
-        });
-        let result = self.run_pod(name, &manifest, working_dir, &mounts).await;
+        let mut guard = PodGuard::new(
+            PodRef {
+                kubectl: self.kubectl.clone(),
+                kubectl_args: self.kubectl_args(),
+                name: name.to_string(),
+            },
+            self.preserve_pods_on_failure,
+        );
+        let result = self
+            .run_pod(
+                name,
+                &manifest,
+                working_dir,
+                &mounts,
+                guard.cancelled.clone(),
+            )
+            .await;
 
         match &result {
             Ok(output) if output.exit_code == 0 => self.delete_pod(name).await,
             Ok(output) if self.preserve_pods_on_failure => {
                 wrkflw_logging::info(&format!(
-                    "Preserving failed pod {} for debugging (exit code: {}). \
-                     Inspect with 'kubectl logs {} -c {}' or 'kubectl exec -it {} -c {} -- sh', \
-                     then delete it with 'kubectl delete pod {}'.",
-                    name, output.exit_code, name, MAIN_CONTAINER, name, SYNC_CONTAINER, name
+                    "Preserving failed pod {} for debugging (exit code: {}). {}",
+                    name,
+                    output.exit_code,
+                    inspect_hint(name)
                 ));
                 untrack_pod(name);
             }
@@ -947,6 +988,7 @@ impl KubernetesRuntime {
         manifest: &Value,
         working_dir: &Path,
         mounts: &[Mount],
+        cancelled: Arc<AtomicBool>,
     ) -> Result<ContainerOutput, ContainerError> {
         if SHUTTING_DOWN.load(Ordering::SeqCst) {
             return Err(shutdown_error());
@@ -1023,8 +1065,13 @@ impl KubernetesRuntime {
         };
 
         for mount in mounts {
-            self.copy_out(name, mount, nested_excludes(mount, mounts))
-                .await?;
+            self.copy_out(
+                name,
+                mount,
+                nested_excludes(mount, mounts),
+                cancelled.clone(),
+            )
+            .await?;
         }
 
         // Kubernetes interleaves stdout and stderr in one log stream.
@@ -1155,7 +1202,7 @@ impl ContainerRuntime for KubernetesRuntime {
                     "Kubernetes step timed out after {} seconds",
                     timeout.as_secs()
                 ));
-                // Dropping the step's future already deleted its pod.
+                // Dropping the step's future already dealt with its pod.
                 Err(ContainerError::ContainerExecution(format!(
                     "Operation timed out after {} seconds (--k8s-timeout)",
                     timeout.as_secs()
@@ -1325,7 +1372,7 @@ mod tests {
             container: PathBuf::from("/data"),
         };
         rt.copy_in("no-such-pod", &mount).await.unwrap();
-        rt.copy_out("no-such-pod", &mount, Vec::new())
+        rt.copy_out("no-such-pod", &mount, Vec::new(), Arc::default())
             .await
             .unwrap();
         assert!(!Path::new("named-volume").exists());
@@ -1779,6 +1826,36 @@ esac
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_preserved_step_timeout_keeps_the_pod_and_forgets_it() {
+        let work = tempfile::tempdir().unwrap();
+        let mut rt = runtime_stuck_at(
+            work.path(),
+            r#"{"status":{"phase":"Pending"}}"#,
+            KubernetesConfig {
+                timeout_secs: Some(1),
+                ..Default::default()
+            },
+        );
+        rt.preserve_pods_on_failure = true;
+        rt.run_container("ubuntu", &[], &[], Path::new("/"), &[], None)
+            .await
+            .expect_err("must time out");
+
+        std::thread::sleep(Duration::from_millis(200));
+        let log = std::fs::read_to_string(work.path().join("log")).unwrap();
+        assert!(!log.contains("delete pod"), "{}", log);
+        assert!(
+            !RUNNING_PODS
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|p| log.contains(&p.name)),
+            "a preserved pod must not be swept on exit"
+        );
+    }
+
     #[test]
     fn failed_polls_are_retried_until_the_grace_period_runs_out() {
         let grace = Duration::from_secs(60);
@@ -1863,7 +1940,7 @@ esac
 
     #[cfg(unix)]
     fn recording_guard(name: &str, log: &Path) -> PodGuard {
-        PodGuard::new(recording_pod(name, log))
+        PodGuard::new(recording_pod(name, log), false)
     }
 
     /// The Ctrl+C sweep has to reach the same kubectl as everything else.
@@ -1907,6 +1984,17 @@ esac
         assert!(args.starts_with("delete pod wrkflw-cancelled "), "{}", args);
         assert!(!args.contains("--force"), "{}", args);
         assert!(!args.contains("--grace-period"), "{}", args);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropping_a_guard_stops_its_copy_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("kubectl.log");
+        let guard = recording_guard("wrkflw-copying", &log);
+        let cancelled = guard.cancelled.clone();
+        drop(guard);
+        assert!(cancelled.load(Ordering::SeqCst));
     }
 
     #[cfg(unix)]

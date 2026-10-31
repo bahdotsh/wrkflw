@@ -1,3 +1,4 @@
+use crate::container_guard::ContainerGuard;
 use async_trait::async_trait;
 use bollard::{
     container::{Config, CreateContainerOptions},
@@ -643,24 +644,10 @@ impl ContainerRuntime for DockerRuntime {
         // Print detailed debugging info
         wrkflw_logging::info(&format!("Docker: Running container with image: {}", image));
 
-        // Add a global timeout for all Docker operations to prevent freezing
-        let timeout_duration = std::time::Duration::from_secs(360); // Increased outer timeout to 6 minutes
-
-        // Run the entire container operation with a timeout
-        match tokio::time::timeout(
-            timeout_duration,
-            self.run_container_inner(image, cmd, env_vars, working_dir, volumes, entrypoint),
-        )
-        .await
-        {
-            Ok(result) => result,
-            Err(_) => {
-                wrkflw_logging::error("Docker operation timed out after 360 seconds");
-                Err(ContainerError::ContainerExecution(
-                    "Operation timed out".to_string(),
-                ))
-            }
-        }
+        // A step runs as long as its job or step `timeout-minutes` allows. The
+        // engine enforces those, and dropping this future stops the container.
+        self.run_container_inner(image, cmd, env_vars, working_dir, volumes, entrypoint)
+            .await
     }
 
     async fn pull_image(&self, image: &str) -> Result<(), ContainerError> {
@@ -1004,6 +991,11 @@ impl DockerRuntime {
 
         // Track the container before starting it to ensure cleanup even if starting fails
         track_container(&container.id);
+        let mut guard = ContainerGuard::new(
+            "docker",
+            &container.id,
+            !self.preserve_containers_on_failure,
+        );
 
         // Start container with a timeout
         let start_result = tokio::time::timeout(
@@ -1030,24 +1022,17 @@ impl DockerRuntime {
             }
         }
 
-        // Wait for container to finish with a timeout (300 seconds)
-        let wait_result = tokio::time::timeout(
-            std::time::Duration::from_secs(300),
-            self.docker
-                .wait_container::<String>(&container.id, None)
-                .collect::<Vec<_>>(),
-        )
-        .await;
+        // Wait for the container to finish
+        let wait_result = self
+            .docker
+            .wait_container::<String>(&container.id, None)
+            .collect::<Vec<_>>()
+            .await;
+        guard.disarm();
 
-        let exit_code = match wait_result {
-            Ok(results) => match results.first() {
-                Some(Ok(exit)) => exit.status_code as i32,
-                _ => -1,
-            },
-            Err(_) => {
-                wrkflw_logging::warning("Container wait operation timed out, treating as failure");
-                -1
-            }
+        let exit_code = match wait_result.first() {
+            Some(Ok(exit)) => exit.status_code as i32,
+            _ => -1,
         };
 
         // Get logs with a timeout

@@ -5,6 +5,7 @@
 pub mod action_resolver;
 pub(crate) mod artifacts;
 pub(crate) mod cache;
+mod container_guard;
 pub mod dependency;
 pub mod docker;
 pub mod engine;

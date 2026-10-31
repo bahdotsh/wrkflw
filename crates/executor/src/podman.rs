@@ -1,3 +1,4 @@
+use crate::container_guard::ContainerGuard;
 use async_trait::async_trait;
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
@@ -148,54 +149,7 @@ impl PodmanRuntime {
     ) -> Result<ContainerOutput, ContainerError> {
         let timeout_duration = std::time::Duration::from_secs(360); // 6 minutes timeout
 
-        let result = tokio::time::timeout(timeout_duration, async {
-            let mut cmd = Command::new("podman");
-            cmd.args(args);
-
-            if input.is_some() {
-                cmd.stdin(Stdio::piped());
-            }
-            cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-
-            wrkflw_logging::debug(&format!(
-                "Running Podman command: podman {}",
-                args.join(" ")
-            ));
-
-            let mut child = cmd.spawn().map_err(|e| {
-                ContainerError::ContainerStart(format!("Failed to spawn podman command: {}", e))
-            })?;
-
-            // Send input if provided
-            if let Some(input_data) = input {
-                if let Some(stdin) = child.stdin.take() {
-                    use tokio::io::AsyncWriteExt;
-                    let mut stdin = stdin;
-                    stdin.write_all(input_data.as_bytes()).await.map_err(|e| {
-                        ContainerError::ContainerExecution(format!(
-                            "Failed to write to stdin: {}",
-                            e
-                        ))
-                    })?;
-                    stdin.shutdown().await.map_err(|e| {
-                        ContainerError::ContainerExecution(format!("Failed to close stdin: {}", e))
-                    })?;
-                }
-            }
-
-            let output = child.wait_with_output().await.map_err(|e| {
-                ContainerError::ContainerExecution(format!("Podman command failed: {}", e))
-            })?;
-
-            Ok(ContainerOutput {
-                stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-                stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-                exit_code: output.status.code().unwrap_or(-1),
-            })
-        })
-        .await;
-
-        match result {
+        match tokio::time::timeout(timeout_duration, self.run_podman_command(args, input)).await {
             Ok(output) => output,
             Err(_) => {
                 wrkflw_logging::error("Podman operation timed out after 360 seconds");
@@ -204,6 +158,54 @@ impl PodmanRuntime {
                 ))
             }
         }
+    }
+
+    /// Run podman to completion, however long that takes.
+    async fn run_podman_command(
+        &self,
+        args: &[&str],
+        input: Option<&str>,
+    ) -> Result<ContainerOutput, ContainerError> {
+        let mut cmd = Command::new("podman");
+        cmd.args(args);
+
+        if input.is_some() {
+            cmd.stdin(Stdio::piped());
+        }
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+        wrkflw_logging::debug(&format!(
+            "Running Podman command: podman {}",
+            args.join(" ")
+        ));
+
+        let mut child = cmd.spawn().map_err(|e| {
+            ContainerError::ContainerStart(format!("Failed to spawn podman command: {}", e))
+        })?;
+
+        // Send input if provided
+        if let Some(input_data) = input {
+            if let Some(stdin) = child.stdin.take() {
+                use tokio::io::AsyncWriteExt;
+                let mut stdin = stdin;
+                stdin.write_all(input_data.as_bytes()).await.map_err(|e| {
+                    ContainerError::ContainerExecution(format!("Failed to write to stdin: {}", e))
+                })?;
+                stdin.shutdown().await.map_err(|e| {
+                    ContainerError::ContainerExecution(format!("Failed to close stdin: {}", e))
+                })?;
+            }
+        }
+
+        let output = child.wait_with_output().await.map_err(|e| {
+            ContainerError::ContainerExecution(format!("Podman command failed: {}", e))
+        })?;
+
+        Ok(ContainerOutput {
+            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+            exit_code: output.status.code().unwrap_or(-1),
+        })
     }
 }
 
@@ -481,23 +483,10 @@ impl ContainerRuntime for PodmanRuntime {
         // Print detailed debugging info
         wrkflw_logging::info(&format!("Podman: Running container with image: {}", image));
 
-        let timeout_duration = std::time::Duration::from_secs(360); // 6 minutes timeout
-
-        // Run the entire container operation with a timeout
-        match tokio::time::timeout(
-            timeout_duration,
-            self.run_container_inner(image, cmd, env_vars, working_dir, volumes, entrypoint),
-        )
-        .await
-        {
-            Ok(result) => result,
-            Err(_) => {
-                wrkflw_logging::error("Podman operation timed out after 360 seconds");
-                Err(ContainerError::ContainerExecution(
-                    "Operation timed out".to_string(),
-                ))
-            }
-        }
+        // A step runs as long as its job or step `timeout-minutes` allows. The
+        // engine enforces those, and dropping this future stops the container.
+        self.run_container_inner(image, cmd, env_vars, working_dir, volumes, entrypoint)
+            .await
     }
 
     async fn pull_image(&self, image: &str) -> Result<(), ContainerError> {
@@ -774,8 +763,15 @@ impl PodmanRuntime {
         // Track the container (even though we use --rm, track it for consistency)
         track_container(&container_name);
 
+        let mut guard = ContainerGuard::new(
+            "podman",
+            &container_name,
+            !self.preserve_containers_on_failure,
+        );
+
         // Execute the command
-        let result = self.execute_podman_command(&args, None).await;
+        let result = self.run_podman_command(&args, None).await;
+        guard.disarm();
 
         // Handle container cleanup based on result and settings
         match &result {

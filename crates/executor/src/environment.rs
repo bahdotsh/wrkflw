@@ -25,6 +25,32 @@ pub fn setup_github_environment_files(workspace_dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Point `job_env` at a fresh set of `GITHUB_*` files owned by one job.
+///
+/// The run-level files are shared, but each step's env file updates are read
+/// back and truncated by the engine, so parallel jobs sharing them would eat
+/// each other's `GITHUB_ENV` and `GITHUB_OUTPUT` entries. The returned
+/// directory must outlive the job.
+pub fn isolate_github_environment_files(
+    job_env: &mut HashMap<String, String>,
+) -> io::Result<tempfile::TempDir> {
+    let dir = tempfile::tempdir()?;
+    setup_github_environment_files(dir.path())?;
+    let github_dir = dir.path().join("github");
+    for (key, file) in [
+        ("GITHUB_OUTPUT", "output"),
+        ("GITHUB_ENV", "env"),
+        ("GITHUB_PATH", "path"),
+        ("GITHUB_STEP_SUMMARY", "step_summary"),
+    ] {
+        job_env.insert(
+            key.to_string(),
+            github_dir.join(file).to_string_lossy().to_string(),
+        );
+    }
+    Ok(dir)
+}
+
 pub fn create_github_context(
     workflow: &WorkflowDefinition,
     workspace_dir: &Path,
@@ -428,5 +454,25 @@ mod tests {
     #[test]
     fn extract_repo_from_invalid_url() {
         assert_eq!(extract_repo_from_url("not-a-url"), None);
+    }
+
+    #[test]
+    fn each_job_gets_its_own_empty_github_files() {
+        let mut first = HashMap::new();
+        let mut second = HashMap::new();
+        let first_dir = isolate_github_environment_files(&mut first).unwrap();
+        let second_dir = isolate_github_environment_files(&mut second).unwrap();
+
+        for key in [
+            "GITHUB_OUTPUT",
+            "GITHUB_ENV",
+            "GITHUB_PATH",
+            "GITHUB_STEP_SUMMARY",
+        ] {
+            assert_ne!(first[key], second[key], "{} is shared", key);
+            assert_eq!(fs::read_to_string(&first[key]).unwrap(), "");
+        }
+        assert!(Path::new(&first["GITHUB_ENV"]).starts_with(first_dir.path()));
+        assert!(Path::new(&second["GITHUB_ENV"]).starts_with(second_dir.path()));
     }
 }

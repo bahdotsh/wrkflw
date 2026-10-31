@@ -172,6 +172,7 @@ pub struct Colors {
     // Runtime badges
     pub runtime_docker: Color,
     pub runtime_podman: Color,
+    pub runtime_kubernetes: Color,
     pub runtime_emulation: Color,
     pub runtime_secure: Color,
 }
@@ -214,6 +215,7 @@ static DARK: Colors = Colors {
 
     runtime_docker: Color::Rgb(0x5f, 0xa3, 0xff),
     runtime_podman: Color::Rgb(0x5f, 0xd3, 0xf3),
+    runtime_kubernetes: Color::Rgb(0x9f, 0x8f, 0xff),
     runtime_emulation: Color::Rgb(0xff, 0x99, 0x66),
     runtime_secure: Color::Rgb(0x8f, 0xce, 0x8f),
 };
@@ -244,6 +246,7 @@ static LIGHT: Colors = Colors {
 
     runtime_docker: Color::Rgb(0x1f, 0x5f, 0xbf),
     runtime_podman: Color::Rgb(0x00, 0x6d, 0x87),
+    runtime_kubernetes: Color::Rgb(0x4b, 0x3f, 0xb3),
     runtime_emulation: Color::Rgb(0xa8, 0x47, 0x00),
     runtime_secure: Color::Rgb(0x1f, 0x75, 0x1f),
 };
@@ -378,6 +381,7 @@ pub enum BadgeKind {
     Highlight,
     Docker,
     Podman,
+    Kubernetes,
     Emulation,
     Secure,
 }
@@ -397,6 +401,7 @@ impl BadgeKind {
             BadgeKind::Highlight => COLORS.highlight,
             BadgeKind::Docker => COLORS.runtime_docker,
             BadgeKind::Podman => COLORS.runtime_podman,
+            BadgeKind::Kubernetes => COLORS.runtime_kubernetes,
             BadgeKind::Emulation => COLORS.runtime_emulation,
             BadgeKind::Secure => COLORS.runtime_secure,
         }
@@ -503,6 +508,7 @@ mod tests {
             ("text_muted", c.text_muted),
             ("runtime_docker", c.runtime_docker),
             ("runtime_podman", c.runtime_podman),
+            ("runtime_kubernetes", c.runtime_kubernetes),
             ("runtime_emulation", c.runtime_emulation),
             ("runtime_secure", c.runtime_secure),
         ]

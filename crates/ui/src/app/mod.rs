@@ -26,7 +26,7 @@ use crate::theme::ThemePreference;
 pub use state::{Accent, App, TriggerPlatform};
 
 // Main entry point for the TUI interface
-#[allow(clippy::ptr_arg)]
+#[allow(clippy::ptr_arg, clippy::too_many_arguments)]
 pub async fn run_wrkflw_tui(
     path: Option<&PathBuf>,
     runtime_type: RuntimeType,
@@ -35,6 +35,7 @@ pub async fn run_wrkflw_tui(
     show_action_messages: bool,
     theme: Option<ThemePreference>,
     platform_overrides: HashMap<String, String>,
+    kubernetes: wrkflw_executor::KubernetesConfig,
 ) -> io::Result<()> {
     // Picks the palette, which may query the terminal, so it has to
     // happen before raw mode and the event loop take over the tty.
@@ -69,6 +70,7 @@ pub async fn run_wrkflw_tui(
         preserve_containers_on_failure,
         show_action_messages,
         platform_overrides.clone(),
+        kubernetes.clone(),
     );
 
     if app.validation_mode {
@@ -167,6 +169,7 @@ pub async fn run_wrkflw_tui(
                         verbose,
                         show_action_messages,
                         platform_overrides,
+                        kubernetes,
                     )
                     .await
                 } else if path.is_dir() {

@@ -16,6 +16,8 @@ pub(crate) enum RuntimeChoice {
     Docker,
     /// Use Podman containers for isolation
     Podman,
+    /// Run each step as a pod in a Kubernetes cluster (see --k8s-* options)
+    Kubernetes,
     /// Use process emulation mode (no containers, UNSAFE)
     Emulation,
     /// Use secure emulation mode with sandboxing (recommended for untrusted code)
@@ -28,6 +30,7 @@ impl From<RuntimeChoice> for wrkflw_executor::RuntimeType {
             RuntimeChoice::Auto => wrkflw_executor::RuntimeType::Auto,
             RuntimeChoice::Docker => wrkflw_executor::RuntimeType::Docker,
             RuntimeChoice::Podman => wrkflw_executor::RuntimeType::Podman,
+            RuntimeChoice::Kubernetes => wrkflw_executor::RuntimeType::Kubernetes,
             RuntimeChoice::Emulation => wrkflw_executor::RuntimeType::Emulation,
             RuntimeChoice::SecureEmulation => wrkflw_executor::RuntimeType::SecureEmulation,
         }
@@ -39,7 +42,7 @@ impl From<RuntimeChoice> for wrkflw_executor::RuntimeType {
     name = "wrkflw",
     about = "GitHub & GitLab CI/CD validator and executor",
     version,
-    long_about = "A CI/CD validator and executor that runs workflows locally.\n\nExamples:\n  wrkflw validate                             # Validate all workflows in .github/workflows\n  wrkflw run .github/workflows/build.yml      # Run a specific workflow\n  wrkflw run .gitlab-ci.yml                   # Run a GitLab CI pipeline\n  wrkflw --verbose run .github/workflows/build.yml  # Run with more output\n  wrkflw --debug run .github/workflows/build.yml    # Run with detailed debug information\n  wrkflw run --runtime emulation .github/workflows/build.yml  # Use emulation mode instead of containers\n  wrkflw run --runtime podman .github/workflows/build.yml     # Use Podman instead of Docker\n  wrkflw run --preserve-containers-on-failure .github/workflows/build.yml  # Keep failed containers for debugging"
+    long_about = "A CI/CD validator and executor that runs workflows locally.\n\nExamples:\n  wrkflw validate                             # Validate all workflows in .github/workflows\n  wrkflw run .github/workflows/build.yml      # Run a specific workflow\n  wrkflw run .gitlab-ci.yml                   # Run a GitLab CI pipeline\n  wrkflw --verbose run .github/workflows/build.yml  # Run with more output\n  wrkflw --debug run .github/workflows/build.yml    # Run with detailed debug information\n  wrkflw run --runtime emulation .github/workflows/build.yml  # Use emulation mode instead of containers\n  wrkflw run --runtime podman .github/workflows/build.yml     # Use Podman instead of Docker\n  wrkflw run --runtime kubernetes --k8s-namespace ci --k8s-resource nvidia.com/gpu=1 .github/workflows/train.yml  # Run steps as pods in a cluster\n  wrkflw run --preserve-containers-on-failure .github/workflows/build.yml  # Keep failed containers for debugging"
 )]
 struct Wrkflw {
     #[command(subcommand)]
@@ -72,6 +75,127 @@ struct Wrkflw {
         value_parser = parse_platform_arg
     )]
     platform: Vec<Option<(String, String)>>,
+
+    #[command(flatten)]
+    kubernetes: KubernetesArgs,
+}
+
+/// Cluster settings for `--runtime kubernetes`. Global so they sit next to
+/// `--platform` and apply to run, watch and tui alike.
+#[derive(Debug, Default, clap::Args)]
+#[command(next_help_heading = "Kubernetes options")]
+struct KubernetesArgs {
+    /// kubeconfig context to run pods in (default: current context)
+    #[arg(
+        long = "k8s-context",
+        global = true,
+        value_name = "NAME",
+        env = "WRKFLW_K8S_CONTEXT"
+    )]
+    k8s_context: Option<String>,
+
+    /// Namespace to create pods in (default: the context's namespace)
+    #[arg(
+        long = "k8s-namespace",
+        global = true,
+        value_name = "NAME",
+        env = "WRKFLW_K8S_NAMESPACE"
+    )]
+    k8s_namespace: Option<String>,
+
+    /// nodeSelector applied to every pod, e.g. accelerator=a100. Repeatable or comma-separated
+    #[arg(
+        long = "k8s-node-selector",
+        global = true,
+        value_name = "KEY=VALUE",
+        env = "WRKFLW_K8S_NODE_SELECTOR",
+        value_delimiter = ',',
+        value_parser = parse_k8s_key_val
+    )]
+    k8s_node_selector: Vec<Option<(String, String)>>,
+
+    /// Resource limit and request for the step container, e.g. nvidia.com/gpu=1 or memory=8Gi.
+    /// Repeatable or comma-separated
+    #[arg(
+        long = "k8s-resource",
+        global = true,
+        value_name = "NAME=QUANTITY",
+        env = "WRKFLW_K8S_RESOURCE",
+        value_delimiter = ',',
+        value_parser = parse_k8s_key_val
+    )]
+    k8s_resource: Vec<Option<(String, String)>>,
+
+    /// imagePullSecrets name added to every pod. Repeatable or comma-separated
+    #[arg(
+        long = "k8s-image-pull-secret",
+        global = true,
+        value_name = "NAME",
+        env = "WRKFLW_K8S_IMAGE_PULL_SECRET",
+        value_delimiter = ','
+    )]
+    k8s_image_pull_secret: Vec<String>,
+
+    /// Registry prefix that images built locally are pushed to so the cluster can pull them,
+    /// e.g. registry.example.com/ci. Needed for setup-* actions and Dockerfile actions
+    #[arg(
+        long = "k8s-registry",
+        global = true,
+        value_name = "REGISTRY",
+        env = "WRKFLW_K8S_REGISTRY"
+    )]
+    k8s_registry: Option<String>,
+
+    /// Image for the helper containers that sync the workspace; needs sh and tar
+    #[arg(
+        long = "k8s-helper-image",
+        global = true,
+        value_name = "IMAGE",
+        env = "WRKFLW_K8S_HELPER_IMAGE"
+    )]
+    k8s_helper_image: Option<String>,
+
+    /// Per-step timeout in seconds, from pod creation to workspace sync-back
+    #[arg(
+        long = "k8s-timeout",
+        global = true,
+        value_name = "SECONDS",
+        env = "WRKFLW_K8S_TIMEOUT",
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    k8s_timeout: Option<u64>,
+
+    /// Seconds a pod may stay unschedulable before the step fails. Raise it if an autoscaler
+    /// needs longer to bring up a node
+    #[arg(
+        long = "k8s-schedule-timeout",
+        global = true,
+        value_name = "SECONDS",
+        env = "WRKFLW_K8S_SCHEDULE_TIMEOUT",
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    k8s_schedule_timeout: Option<u64>,
+}
+
+impl KubernetesArgs {
+    fn to_config(&self) -> wrkflw_executor::KubernetesConfig {
+        wrkflw_executor::KubernetesConfig {
+            context: self.k8s_context.clone(),
+            namespace: self.k8s_namespace.clone(),
+            node_selector: self.k8s_node_selector.iter().flatten().cloned().collect(),
+            resources: self.k8s_resource.iter().flatten().cloned().collect(),
+            image_pull_secrets: self
+                .k8s_image_pull_secret
+                .iter()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect(),
+            registry: self.k8s_registry.clone(),
+            helper_image: self.k8s_helper_image.clone(),
+            timeout_secs: self.k8s_timeout,
+            schedule_timeout_secs: self.k8s_schedule_timeout,
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -100,7 +224,7 @@ enum Commands {
         /// Path to workflow/pipeline file to execute
         path: PathBuf,
 
-        /// Container runtime to use (docker, podman, emulation, secure-emulation)
+        /// Container runtime to use (docker, podman, kubernetes, emulation, secure-emulation)
         #[arg(short, long, value_enum, default_value = "auto")]
         runtime: RuntimeChoice,
 
@@ -192,7 +316,7 @@ enum Commands {
         /// Path to workflow file or directory (defaults to .gitea/workflows if it exists, else .github/workflows)
         path: Option<PathBuf>,
 
-        /// Container runtime to use (docker, podman, emulation, secure-emulation)
+        /// Container runtime to use (docker, podman, kubernetes, emulation, secure-emulation)
         #[arg(short, long, value_enum, default_value = "auto")]
         runtime: RuntimeChoice,
 
@@ -277,7 +401,7 @@ enum Commands {
         /// Path to workflow file or directory (defaults to .gitea/workflows and .github/workflows)
         path: Option<PathBuf>,
 
-        /// Container runtime to use (docker, podman, emulation, secure-emulation)
+        /// Container runtime to use (docker, podman, kubernetes, emulation, secure-emulation)
         #[arg(short, long, value_enum, default_value = "auto")]
         runtime: RuntimeChoice,
 
@@ -332,6 +456,15 @@ fn parse_platform_arg(s: &str) -> Result<Option<(String, String)>, String> {
     wrkflw_executor::parse_platform_override(s).map(Some)
 }
 
+// Same leniency as `--platform`: an exported but empty WRKFLW_K8S_* or a
+// trailing comma is skipped rather than failing every command.
+fn parse_k8s_key_val(s: &str) -> Result<Option<(String, String)>, String> {
+    if s.trim().is_empty() {
+        return Ok(None);
+    }
+    wrkflw_executor::parse_k8s_key_value(s).map(Some)
+}
+
 // Later entries win, so repeating a label behaves the same whatever its case.
 fn collect_platform_overrides(entries: &[Option<(String, String)>]) -> HashMap<String, String> {
     entries.iter().flatten().cloned().collect()
@@ -350,8 +483,11 @@ fn parse_key_val(s: &str) -> Result<(String, String), String> {
 // Or call wrkflw_executor::cleanup and wrkflw_runtime::cleanup directly?
 // Let's try calling them directly for now.
 async fn cleanup_on_exit() {
-    // Clean up Docker resources if available, but don't let it block indefinitely
-    match tokio::time::timeout(std::time::Duration::from_secs(3), async {
+    // Clean up Docker resources if available, but don't let it block indefinitely.
+    // Runs alongside the Kubernetes sweep: these timeouts plus the emulation one
+    // would otherwise add up to the whole of handle_signals' hard exit budget,
+    // and a stuck daemon must not cost a GPU pod its delete.
+    let docker_cleanup = tokio::time::timeout(std::time::Duration::from_secs(3), async {
         match Docker::connect_with_local_defaults() {
             Ok(docker) => {
                 // Assuming cleanup_resources exists in executor crate
@@ -362,13 +498,23 @@ async fn cleanup_on_exit() {
                 wrkflw_logging::info("Docker not available, skipping Docker cleanup");
             }
         }
-    })
-    .await
-    {
+    });
+    // Delete any pods a Kubernetes run still has in flight
+    let kubernetes_cleanup = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        wrkflw_executor::kubernetes::cleanup_resources(),
+    );
+
+    let (docker_result, kubernetes_result) = tokio::join!(docker_cleanup, kubernetes_cleanup);
+    match docker_result {
         Ok(_) => wrkflw_logging::debug("Docker cleanup completed successfully"),
         Err(_) => wrkflw_logging::warning(
             "Docker cleanup timed out after 3 seconds, continuing with shutdown",
         ),
+    }
+    match kubernetes_result {
+        Ok(_) => wrkflw_logging::debug("Kubernetes cleanup completed successfully"),
+        Err(_) => wrkflw_logging::warning("Kubernetes cleanup timed out, continuing with shutdown"),
     }
 
     // Always clean up emulation resources
@@ -511,6 +657,7 @@ async fn main() {
     tokio::spawn(handle_signals());
 
     let platform_overrides = collect_platform_overrides(&cli.platform);
+    let kubernetes = cli.kubernetes.to_config();
 
     match &cli.command {
         Some(Commands::Validate {
@@ -646,6 +793,7 @@ async fn main() {
                 no_strict_filter: *no_strict_filter,
                 verbose,
                 platform_overrides,
+                kubernetes,
             })
             .await;
         }
@@ -680,6 +828,7 @@ async fn main() {
                 no_strict_filter: *no_strict_filter,
                 verbose,
                 platform_overrides,
+                kubernetes,
             })
             .await;
         }
@@ -714,6 +863,7 @@ async fn main() {
                 *show_action_messages,
                 cli.theme,
                 platform_overrides,
+                kubernetes,
             )
             .await
             {
@@ -757,6 +907,7 @@ async fn main() {
                     false,
                     cli.theme,
                     platform_overrides,
+                    kubernetes,
                 )
                 .await
                 {
@@ -1030,6 +1181,10 @@ mod tests {
             RuntimeType::Podman
         );
         assert_eq!(
+            RuntimeType::from(RuntimeChoice::Kubernetes),
+            RuntimeType::Kubernetes
+        );
+        assert_eq!(
             RuntimeType::from(RuntimeChoice::Emulation),
             RuntimeType::Emulation
         );
@@ -1042,6 +1197,99 @@ mod tests {
     fn platform_overrides_from(args: &[&str]) -> HashMap<String, String> {
         let cli = Wrkflw::try_parse_from(args).unwrap();
         collect_platform_overrides(&cli.platform)
+    }
+
+    fn k8s_config_from(args: &[&str]) -> wrkflw_executor::KubernetesConfig {
+        Wrkflw::try_parse_from(args).unwrap().kubernetes.to_config()
+    }
+
+    #[test]
+    fn k8s_flags_default_to_an_empty_config() {
+        let cfg = k8s_config_from(&["wrkflw", "run", "ci.yml"]);
+        assert_eq!(cfg, wrkflw_executor::KubernetesConfig::default());
+    }
+
+    #[test]
+    fn k8s_flags_build_the_config_and_work_after_a_subcommand() {
+        let cfg = k8s_config_from(&[
+            "wrkflw",
+            "run",
+            "ci.yml",
+            "--runtime",
+            "kubernetes",
+            "--k8s-context",
+            "gpu",
+            "--k8s-namespace",
+            "ci",
+            "--k8s-node-selector",
+            "accelerator=a100,zone=eu",
+            "--k8s-node-selector",
+            "zone=us",
+            "--k8s-resource",
+            "nvidia.com/gpu=1",
+            "--k8s-image-pull-secret",
+            "regcred, ,other",
+            "--k8s-registry",
+            "registry.example.com/ci",
+            "--k8s-helper-image",
+            "alpine:3.19",
+            "--k8s-timeout",
+            "120",
+            "--k8s-schedule-timeout",
+            "900",
+        ]);
+        assert_eq!(cfg.context.as_deref(), Some("gpu"));
+        assert_eq!(cfg.namespace.as_deref(), Some("ci"));
+        assert_eq!(
+            cfg.node_selector.get("accelerator").map(String::as_str),
+            Some("a100")
+        );
+        assert_eq!(
+            cfg.node_selector.get("zone").map(String::as_str),
+            Some("us"),
+            "later wins"
+        );
+        assert_eq!(
+            cfg.resources.get("nvidia.com/gpu").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(cfg.image_pull_secrets, vec!["regcred", "other"]);
+        assert_eq!(cfg.registry.as_deref(), Some("registry.example.com/ci"));
+        assert_eq!(cfg.helper_image.as_deref(), Some("alpine:3.19"));
+        assert_eq!(cfg.timeout_secs, Some(120));
+        assert_eq!(cfg.schedule_timeout_secs, Some(900));
+    }
+
+    #[test]
+    fn k8s_flags_skip_empty_entries_and_reject_malformed_pairs() {
+        let cfg = k8s_config_from(&["wrkflw", "--k8s-node-selector", "", "--k8s-resource", " "]);
+        assert!(cfg.node_selector.is_empty());
+        assert!(cfg.resources.is_empty());
+        assert!(Wrkflw::try_parse_from(["wrkflw", "--k8s-resource", "gpu"]).is_err());
+        assert!(Wrkflw::try_parse_from(["wrkflw", "--k8s-node-selector", "=x"]).is_err());
+    }
+
+    #[test]
+    fn k8s_timeout_rejects_zero() {
+        assert!(Wrkflw::try_parse_from(["wrkflw", "--k8s-timeout", "0"]).is_err());
+        assert!(Wrkflw::try_parse_from(["wrkflw", "--k8s-schedule-timeout", "0"]).is_err());
+        assert_eq!(
+            k8s_config_from(&["wrkflw", "--k8s-timeout", "1"]).timeout_secs,
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn runtime_choice_accepts_kubernetes() {
+        use wrkflw_executor::RuntimeType;
+        let cli =
+            Wrkflw::try_parse_from(["wrkflw", "run", "ci.yml", "--runtime", "kubernetes"]).unwrap();
+        match cli.command {
+            Some(Commands::Run { runtime, .. }) => {
+                assert_eq!(RuntimeType::from(runtime), RuntimeType::Kubernetes)
+            }
+            other => panic!("unexpected command: {:?}", other),
+        }
     }
 
     #[test]

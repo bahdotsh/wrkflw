@@ -23,7 +23,7 @@
 use async_trait::async_trait;
 use once_cell::sync::Lazy;
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
@@ -77,6 +77,10 @@ static SESSION_ID: Lazy<String> = Lazy::new(|| uuid::Uuid::new_v4().simple().to_
 
 /// Pods created by this process that have not been deleted yet.
 static RUNNING_PODS: Lazy<Mutex<Vec<PodRef>>> = Lazy::new(|| Mutex::new(Vec::new()));
+
+/// Registry references pushed by this process. Global so the TUI, which
+/// creates a runtime per run, does not push the same content-hashed image again.
+static PUSHED_IMAGES: Lazy<Mutex<HashSet<String>>> = Lazy::new(|| Mutex::new(HashSet::new()));
 
 #[derive(Debug, Clone)]
 struct PodRef {
@@ -500,6 +504,10 @@ fn registry_ref(registry: &str, tag: &str) -> String {
     format!("{}/{}", registry.trim_end_matches('/'), tag)
 }
 
+fn is_locally_built(image: &str) -> bool {
+    image.starts_with(LOCAL_IMAGE_PREFIX) || image.starts_with(COMBINED_IMAGE_PREFIX)
+}
+
 fn pod_name() -> String {
     format!("wrkflw-{}", uuid::Uuid::new_v4().simple())
 }
@@ -588,8 +596,6 @@ fn pod_failure_message(pod: &Value) -> String {
 pub struct KubernetesRuntime {
     config: KubernetesConfig,
     preserve_pods_on_failure: bool,
-    /// Local tag → registry reference, for images built with [`Self::build_image`].
-    pushed_images: Mutex<HashMap<String, String>>,
 }
 
 impl KubernetesRuntime {
@@ -599,7 +605,6 @@ impl KubernetesRuntime {
         KubernetesRuntime {
             config,
             preserve_pods_on_failure,
-            pushed_images: Mutex::new(HashMap::new()),
         }
     }
 
@@ -695,21 +700,25 @@ impl KubernetesRuntime {
         untrack_pod(name);
     }
 
+    /// Where a locally built `tag` lives once [`Self::build_image`] pushed it.
+    fn pushed_ref(&self, tag: &str) -> Option<String> {
+        let remote = registry_ref(self.config.registry.as_deref()?, tag);
+        let pushed = PUSHED_IMAGES.lock().ok()?;
+        pushed.contains(&remote).then_some(remote)
+    }
+
     /// Image reference the cluster can pull for `image`.
     fn cluster_image(&self, image: &str) -> Result<String, ContainerError> {
-        if let Ok(pushed) = self.pushed_images.lock() {
-            if let Some(remote) = pushed.get(image) {
-                return Ok(remote.clone());
-            }
+        if !is_locally_built(image) {
+            return Ok(image.to_string());
         }
-        if image.starts_with(LOCAL_IMAGE_PREFIX) || image.starts_with(COMBINED_IMAGE_PREFIX) {
-            return Err(ContainerError::ContainerStart(format!(
+        self.pushed_ref(image).ok_or_else(|| {
+            ContainerError::ContainerStart(format!(
                 "image '{}' was built locally and is not reachable from the cluster; \
                  pass --k8s-registry so wrkflw can push it",
                 image
-            )));
-        }
-        Ok(image.to_string())
+            ))
+        })
     }
 
     /// Block until the wait container runs, so volumes can be streamed into it.
@@ -1027,8 +1036,8 @@ impl KubernetesRuntime {
         Ok(())
     }
 
-    /// Tag a local image for the registry, push it and remember the mapping.
-    async fn push_local_image(&self, builder: &str, tag: &str) -> Result<String, ContainerError> {
+    /// Tag a local image for the registry, push it and remember that it is there.
+    async fn push_local_image(&self, builder: &str, tag: &str) -> Result<(), ContainerError> {
         let remote = registry_ref(self.registry()?, tag);
         self.builder_command(
             builder,
@@ -1045,22 +1054,10 @@ impl KubernetesRuntime {
             "pushing image",
         )
         .await?;
-        if let Ok(mut pushed) = self.pushed_images.lock() {
-            pushed.insert(tag.to_string(), remote.clone());
+        if let Ok(mut pushed) = PUSHED_IMAGES.lock() {
+            pushed.insert(remote);
         }
-        Ok(remote)
-    }
-
-    async fn local_image_exists(&self, builder: &str, tag: &str) -> bool {
-        Command::new(builder)
-            .args(["image", "inspect", tag])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .await
-            .map(|s| s.success())
-            .unwrap_or(false)
+        Ok(())
     }
 }
 
@@ -1470,8 +1467,7 @@ impl ContainerRuntime for KubernetesRuntime {
             "building image",
         )
         .await?;
-        self.push_local_image(builder, tag).await?;
-        Ok(())
+        self.push_local_image(builder, tag).await
     }
 
     /// Steps run in the image as given; there is no host-side image to
@@ -1488,34 +1484,12 @@ impl ContainerRuntime for KubernetesRuntime {
         )))
     }
 
-    /// For locally built tags, "exists" means "already pushed to the
-    /// registry". A tag still in the local Docker/Podman store is pushed on
-    /// the spot so a rebuild is not needed.
+    /// For locally built tags, "exists" means "this process pushed it". A tag
+    /// still in the local Docker/Podman store reports false, and the rebuild
+    /// that follows is a cache hit that ends in the push.
     async fn image_exists(&self, tag: &str) -> Result<bool, ContainerError> {
-        if let Ok(pushed) = self.pushed_images.lock() {
-            if pushed.contains_key(tag) {
-                return Ok(true);
-            }
-        }
-        if !(tag.starts_with(LOCAL_IMAGE_PREFIX) || tag.starts_with(COMBINED_IMAGE_PREFIX)) {
-            // A registry image: the kubelet resolves it when the pod starts.
-            return Ok(true);
-        }
-        if self.config.registry.is_none() {
-            return Ok(false);
-        }
-        let Some(builder) = Self::local_builder() else {
-            return Ok(false);
-        };
-        if !self.local_image_exists(builder, tag).await {
-            return Ok(false);
-        }
-        wrkflw_logging::info(&format!(
-            "Reusing locally built image {} for the cluster",
-            tag
-        ));
-        self.push_local_image(builder, tag).await?;
-        Ok(true)
+        // A registry image: the kubelet resolves it when the pod starts.
+        Ok(!is_locally_built(tag) || self.pushed_ref(tag).is_some())
     }
 }
 
@@ -2239,22 +2213,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cluster_image_refuses_unpushed_local_images() {
-        let rt = KubernetesRuntime::new(cfg(), false);
-        assert_eq!(rt.cluster_image("ubuntu:22.04").unwrap(), "ubuntu:22.04");
-        let err = rt
-            .cluster_image("wrkflw-combined:abc")
-            .expect_err("local image must be rejected");
-        assert!(err.to_string().contains("--k8s-registry"), "{}", err);
+    async fn pushed_images_are_found_without_touching_a_builder() {
+        let config = KubernetesConfig {
+            registry: Some("reg.test".into()),
+            ..Default::default()
+        };
+        let rt = KubernetesRuntime::new(config.clone(), false);
+        let tag = "wrkflw-combined:pushed-test";
 
-        rt.pushed_images.lock().unwrap().insert(
-            "wrkflw-combined:abc".into(),
-            "reg/wrkflw-combined:abc".into(),
-        );
+        assert_eq!(rt.cluster_image("ubuntu:22.04").unwrap(), "ubuntu:22.04");
+        let err = rt.cluster_image(tag).expect_err("not pushed yet");
+        assert!(err.to_string().contains("--k8s-registry"), "{}", err);
+        // Reports false rather than pushing as a side effect of a check.
+        assert!(!rt.image_exists(tag).await.unwrap());
+
+        PUSHED_IMAGES
+            .lock()
+            .unwrap()
+            .insert(registry_ref("reg.test", tag));
         assert_eq!(
-            rt.cluster_image("wrkflw-combined:abc").unwrap(),
-            "reg/wrkflw-combined:abc"
+            rt.cluster_image(tag).unwrap(),
+            "reg.test/wrkflw-combined:pushed-test"
         );
+        // A later runtime in the same process, as the TUI creates per run.
+        let later = KubernetesRuntime::new(config, false);
+        assert!(later.image_exists(tag).await.unwrap());
     }
 
     #[tokio::test]

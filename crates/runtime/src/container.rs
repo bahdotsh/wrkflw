@@ -45,7 +45,8 @@ pub trait ContainerRuntime {
         additional_packages: Option<Vec<String>>,
     ) -> Result<String, ContainerError>;
 
-    /// Check whether a Docker/OCI image exists locally.
+    /// Check whether a Docker/OCI image is usable by this runtime without
+    /// building it. A cheap, read-only check; callers may repeat it.
     async fn image_exists(&self, tag: &str) -> Result<bool, ContainerError>;
 }
 

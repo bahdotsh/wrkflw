@@ -955,6 +955,11 @@ impl KubernetesRuntime {
     }
 
     /// Stream `mount.container` out of the sync container onto `host`.
+    ///
+    /// `spawn_blocking` work cannot be cancelled, so a step timeout that lands
+    /// here leaves this thread running until the pod's delete ends its stream.
+    /// That stream then fails, which skips the prune, so at worst a few files
+    /// land in a job directory that is on its way out.
     async fn copy_out(
         &self,
         name: &str,
@@ -1613,12 +1618,17 @@ impl ContainerRuntime for KubernetesRuntime {
         context_dir: &Path,
     ) -> Result<(), ContainerError> {
         self.registry()?;
-        let builder = Self::local_builder().ok_or_else(|| {
-            ContainerError::ImageBuild(
-                "this job needs an image built locally, but neither Docker nor Podman is available"
-                    .to_string(),
-            )
-        })?;
+        // Each probe can block for seconds.
+        let builder = tokio::task::spawn_blocking(Self::local_builder)
+            .await
+            .map_err(|e| ContainerError::ImageBuild(format!("builder probe failed: {}", e)))?
+            .ok_or_else(|| {
+                ContainerError::ImageBuild(
+                    "this job needs an image built locally, but neither Docker nor Podman \
+                     is available"
+                        .to_string(),
+                )
+            })?;
         let dockerfile_str = dockerfile.to_string_lossy().to_string();
         let context_str = context_dir.to_string_lossy().to_string();
         let timeout = if tag.starts_with(COMBINED_IMAGE_PREFIX) {

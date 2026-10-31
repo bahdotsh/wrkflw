@@ -51,22 +51,28 @@ pub fn isolate_github_environment_files(
     Ok(dir)
 }
 
-/// Replace host values with what a step sees inside a Linux container, where
-/// the workspace is mounted at `/github/workspace`. Without this `runner.os`
-/// reports the host OS and paths like `$GITHUB_WORKSPACE` don't exist in the
-/// container.
-pub fn apply_container_context(env: &mut HashMap<String, String>) {
-    const WORKSPACE: &str = "/github/workspace";
+/// Where the workspace is mounted inside a step's container.
+const CONTAINER_WORKSPACE: &str = "/github/workspace";
+
+/// Replace host values with what a GitHub step sees inside a Linux container.
+/// Without this `runner.os` reports the host OS and paths like
+/// `$GITHUB_WORKSPACE` don't exist in the container.
+pub fn apply_github_container_context(env: &mut HashMap<String, String>) {
     for (key, value) in [
-        ("GITHUB_WORKSPACE", WORKSPACE),
+        ("GITHUB_WORKSPACE", CONTAINER_WORKSPACE),
         ("RUNNER_OS", "Linux"),
         ("RUNNER_TEMP", "/tmp"),
         ("RUNNER_TOOL_CACHE", "/opt/hostedtoolcache"),
     ] {
         env.insert(key.to_string(), value.to_string());
     }
-    if env.contains_key("CI_PROJECT_DIR") {
-        env.insert("CI_PROJECT_DIR".to_string(), WORKSPACE.to_string());
+}
+
+/// Replace host paths with what a GitLab job sees inside a container. GitLab
+/// pipelines carry `GITHUB_WORKSPACE` too, since they share the step executor.
+pub fn apply_gitlab_container_context(env: &mut HashMap<String, String>) {
+    for key in ["CI_PROJECT_DIR", "GITHUB_WORKSPACE"] {
+        env.insert(key.to_string(), CONTAINER_WORKSPACE.to_string());
     }
 }
 
@@ -496,22 +502,31 @@ mod tests {
     }
 
     #[test]
-    fn container_context_replaces_host_values() {
+    fn github_container_context_replaces_host_values() {
         let mut env = HashMap::from([
             ("RUNNER_OS".to_string(), "macOS".to_string()),
             ("GITHUB_WORKSPACE".to_string(), "/Users/me/repo".to_string()),
             ("RUNNER_TEMP".to_string(), "/var/folders/x".to_string()),
             ("OTHER".to_string(), "kept".to_string()),
         ]);
-        apply_container_context(&mut env);
+        apply_github_container_context(&mut env);
         assert_eq!(env["RUNNER_OS"], "Linux");
         assert_eq!(env["GITHUB_WORKSPACE"], "/github/workspace");
         assert_eq!(env["RUNNER_TEMP"], "/tmp");
+        assert_eq!(env["RUNNER_TOOL_CACHE"], "/opt/hostedtoolcache");
         assert_eq!(env["OTHER"], "kept");
         assert!(!env.contains_key("CI_PROJECT_DIR"));
+    }
 
-        let mut gitlab = HashMap::from([("CI_PROJECT_DIR".to_string(), "/host".to_string())]);
-        apply_container_context(&mut gitlab);
-        assert_eq!(gitlab["CI_PROJECT_DIR"], "/github/workspace");
+    #[test]
+    fn gitlab_container_context_replaces_paths_only() {
+        let mut env = HashMap::from([
+            ("CI_PROJECT_DIR".to_string(), "/host".to_string()),
+            ("GITHUB_WORKSPACE".to_string(), "/host".to_string()),
+        ]);
+        apply_gitlab_container_context(&mut env);
+        assert_eq!(env["CI_PROJECT_DIR"], "/github/workspace");
+        assert_eq!(env["GITHUB_WORKSPACE"], "/github/workspace");
+        assert!(!env.contains_key("RUNNER_OS"));
     }
 }

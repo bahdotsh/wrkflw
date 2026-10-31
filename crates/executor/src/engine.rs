@@ -99,11 +99,12 @@ async fn execute_github_workflow(
     };
 
     // 3. Initialize appropriate runtime
-    let runtime = initialize_runtime(
+    let (runtime, effective_runtime) = initialize_runtime(
         config.runtime_type.clone(),
         config.preserve_containers_on_failure,
         &config.kubernetes,
     )?;
+    config.runtime_type = effective_runtime;
 
     // Create a temporary workspace directory
     let workspace_dir = tempfile::tempdir()
@@ -159,13 +160,11 @@ async fn execute_github_workflow(
     }
 
     // Add runtime mode to environment
-    env_context.insert(
-        "WRKFLW_RUNTIME_MODE".to_string(),
-        config.runtime_type.mode_name().to_string(),
+    seed_runtime_mode(
+        &mut env_context,
+        &config.runtime_type,
+        environment::apply_github_container_context,
     );
-    if uses_container_runtime(&env_context) {
-        environment::apply_container_context(&mut env_context);
-    }
 
     // show=true means hide=false (inverted for the env var)
     env_context.insert(
@@ -361,11 +360,12 @@ async fn execute_gitlab_pipeline(
     };
 
     // 4. Initialize appropriate runtime
-    let runtime = initialize_runtime(
+    let (runtime, effective_runtime) = initialize_runtime(
         config.runtime_type.clone(),
         config.preserve_containers_on_failure,
         &config.kubernetes,
     )?;
+    config.runtime_type = effective_runtime;
 
     // Create a temporary workspace directory
     let workspace_dir = tempfile::tempdir()
@@ -375,13 +375,11 @@ async fn execute_gitlab_pipeline(
     let mut env_context = create_gitlab_context(&pipeline, workspace_dir.path());
 
     // Add runtime mode to environment
-    env_context.insert(
-        "WRKFLW_RUNTIME_MODE".to_string(),
-        config.runtime_type.mode_name().to_string(),
+    seed_runtime_mode(
+        &mut env_context,
+        &config.runtime_type,
+        environment::apply_gitlab_container_context,
     );
-    if uses_container_runtime(&env_context) {
-        environment::apply_container_context(&mut env_context);
-    }
 
     // Setup environment files
     environment::setup_github_environment_files(workspace_dir.path()).map_err(|e| {
@@ -605,12 +603,37 @@ pub fn detect_runtime(runtime_type: RuntimeType) -> RuntimeType {
     }
 }
 
-// Determine if Docker/Podman is available or fall back to emulation
+/// Record the runtime steps will use and, for a container runtime, swap in the
+/// values steps see inside the container.
+fn seed_runtime_mode(
+    env: &mut HashMap<String, String>,
+    runtime: &RuntimeType,
+    apply_container_context: fn(&mut HashMap<String, String>),
+) {
+    env.insert(
+        "WRKFLW_RUNTIME_MODE".to_string(),
+        runtime.mode_name().to_string(),
+    );
+    if uses_container_runtime(env) {
+        apply_container_context(env);
+    }
+}
+
+fn emulation_fallback() -> (Box<dyn ContainerRuntime>, RuntimeType) {
+    (
+        Box::new(emulation::EmulationRuntime::new()),
+        RuntimeType::Emulation,
+    )
+}
+
+/// Determine if Docker/Podman is available or fall back to emulation. Returns
+/// the runtime with its type, which is `Emulation` after a fallback whatever
+/// was requested.
 fn initialize_runtime(
     runtime_type: RuntimeType,
     preserve_containers_on_failure: bool,
     kubernetes: &KubernetesConfig,
-) -> Result<Box<dyn ContainerRuntime>, ExecutionError> {
+) -> Result<(Box<dyn ContainerRuntime>, RuntimeType), ExecutionError> {
     match runtime_type {
         RuntimeType::Auto => initialize_runtime(
             detect_runtime(RuntimeType::Auto),
@@ -620,42 +643,49 @@ fn initialize_runtime(
         RuntimeType::Docker => {
             if docker::is_available() {
                 match docker::DockerRuntime::new_with_config(preserve_containers_on_failure) {
-                    Ok(docker_runtime) => Ok(Box::new(docker_runtime)),
+                    Ok(docker_runtime) => Ok((Box::new(docker_runtime), RuntimeType::Docker)),
                     Err(e) => {
                         wrkflw_logging::error(&format!(
                             "Failed to initialize Docker runtime: {}, falling back to emulation mode",
                             e
                         ));
-                        Ok(Box::new(emulation::EmulationRuntime::new()))
+                        Ok(emulation_fallback())
                     }
                 }
             } else {
                 wrkflw_logging::error("Docker not available, falling back to emulation mode");
-                Ok(Box::new(emulation::EmulationRuntime::new()))
+                Ok(emulation_fallback())
             }
         }
         RuntimeType::Podman => {
             if podman::is_available() {
-                Ok(Box::new(podman::PodmanRuntime::new_unchecked(
-                    preserve_containers_on_failure,
-                )))
+                Ok((
+                    Box::new(podman::PodmanRuntime::new_unchecked(
+                        preserve_containers_on_failure,
+                    )),
+                    RuntimeType::Podman,
+                ))
             } else {
                 wrkflw_logging::error("Podman not available, falling back to emulation mode");
-                Ok(Box::new(emulation::EmulationRuntime::new()))
+                Ok(emulation_fallback())
             }
         }
         // Kubernetes is never auto-detected and never silently replaced:
         // a job meant for a GPU node must not quietly run on the laptop.
         RuntimeType::Kubernetes => {
             kubernetes::check_available(kubernetes).map_err(ExecutionError::Runtime)?;
-            Ok(Box::new(kubernetes::KubernetesRuntime::new(
-                kubernetes.clone(),
-                preserve_containers_on_failure,
-            )))
+            Ok((
+                Box::new(kubernetes::KubernetesRuntime::new(
+                    kubernetes.clone(),
+                    preserve_containers_on_failure,
+                )),
+                RuntimeType::Kubernetes,
+            ))
         }
-        RuntimeType::Emulation => Ok(Box::new(emulation::EmulationRuntime::new())),
-        RuntimeType::SecureEmulation => Ok(Box::new(
-            wrkflw_runtime::secure_emulation::SecureEmulationRuntime::new(),
+        RuntimeType::Emulation => Ok(emulation_fallback()),
+        RuntimeType::SecureEmulation => Ok((
+            Box::new(wrkflw_runtime::secure_emulation::SecureEmulationRuntime::new()),
+            RuntimeType::SecureEmulation,
         )),
     }
 }
@@ -4632,7 +4662,8 @@ fn prepare_step_container_context(
 type VolumePathPair = (PathBuf, PathBuf);
 
 /// True when steps execute inside a Docker/Podman/Kubernetes container
-/// rather than on the host. `Auto` is resolved to a concrete runtime before this is seeded.
+/// rather than on the host. The mode is seeded from the runtime `initialize_runtime`
+/// returned, so `Auto` and any fallback to emulation are already resolved.
 fn uses_container_runtime(step_env: &HashMap<String, String>) -> bool {
     step_env
         .get("WRKFLW_RUNTIME_MODE")
@@ -9126,6 +9157,75 @@ runs:
     fn relative_to_workspace_handles_windows_paths() {
         let relative = relative_to_workspace(r"C:\repo/src".to_string(), r"C:\repo");
         assert_eq!(relative, "src");
+    }
+
+    #[test]
+    fn seed_runtime_mode_applies_container_context_only_to_container_runtimes() {
+        let host_env = || HashMap::from([("RUNNER_OS".to_string(), "macOS".to_string())]);
+
+        for runtime in [RuntimeType::Emulation, RuntimeType::SecureEmulation] {
+            let mut env = host_env();
+            seed_runtime_mode(
+                &mut env,
+                &runtime,
+                environment::apply_github_container_context,
+            );
+            assert_eq!(env["RUNNER_OS"], "macOS", "{:?}", runtime);
+            assert_eq!(env["WRKFLW_RUNTIME_MODE"], runtime.mode_name());
+        }
+
+        let mut env = host_env();
+        seed_runtime_mode(
+            &mut env,
+            &RuntimeType::Docker,
+            environment::apply_github_container_context,
+        );
+        assert_eq!(env["RUNNER_OS"], "Linux");
+    }
+
+    #[test]
+    fn gitlab_pipeline_sees_container_paths_only_under_a_container_runtime() {
+        let pipeline: Pipeline = serde_yaml::from_str("stages: [build]").unwrap();
+        let host = Path::new("/host/workspace");
+
+        let mut env = create_gitlab_context(&pipeline, host);
+        seed_runtime_mode(
+            &mut env,
+            &RuntimeType::Podman,
+            environment::apply_gitlab_container_context,
+        );
+        assert_eq!(env["CI_PROJECT_DIR"], "/github/workspace");
+        assert_eq!(env["GITHUB_WORKSPACE"], "/github/workspace");
+
+        let mut env = create_gitlab_context(&pipeline, host);
+        seed_runtime_mode(
+            &mut env,
+            &RuntimeType::Emulation,
+            environment::apply_gitlab_container_context,
+        );
+        assert_eq!(env["CI_PROJECT_DIR"], "/host/workspace");
+    }
+
+    #[test]
+    fn initialize_runtime_reports_the_runtime_it_returns() {
+        let effective = |runtime| {
+            initialize_runtime(runtime, false, &KubernetesConfig::default())
+                .map(|(_, effective)| effective)
+                .unwrap()
+        };
+        assert_eq!(effective(RuntimeType::Emulation), RuntimeType::Emulation);
+        assert_eq!(
+            effective(RuntimeType::SecureEmulation),
+            RuntimeType::SecureEmulation
+        );
+        // Without a Podman install this is the fallback, which must not
+        // report a container runtime.
+        let expected = if podman::is_available() {
+            RuntimeType::Podman
+        } else {
+            RuntimeType::Emulation
+        };
+        assert_eq!(effective(RuntimeType::Podman), expected);
     }
 
     #[tokio::test]

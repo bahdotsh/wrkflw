@@ -52,7 +52,10 @@ pub fn isolate_github_environment_files(
 }
 
 /// Where the workspace is mounted inside a step's container.
-const CONTAINER_WORKSPACE: &str = "/github/workspace";
+pub const CONTAINER_WORKSPACE: &str = "/github/workspace";
+
+/// Where a job's `GITHUB_*` files are mounted inside a step's container.
+pub const CONTAINER_GITHUB_DIR: &str = "/github/workflow";
 
 /// Replace host values with what a GitHub step sees inside a Linux container.
 /// Without this `runner.os` reports the host OS and paths like

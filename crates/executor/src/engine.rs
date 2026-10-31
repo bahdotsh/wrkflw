@@ -613,7 +613,7 @@ fn seed_runtime_mode(
         "WRKFLW_RUNTIME_MODE".to_string(),
         runtime.mode_name().to_string(),
     );
-    if uses_container_runtime(env) {
+    if runtime.runs_in_container() {
         match platform {
             CiPlatform::GitHub => environment::apply_github_container_context(env),
             CiPlatform::GitLab => environment::apply_gitlab_container_context(env),
@@ -707,6 +707,17 @@ pub enum RuntimeType {
 }
 
 impl RuntimeType {
+    /// The runtimes whose steps run in a container rather than on the host.
+    const CONTAINER_RUNTIMES: [RuntimeType; 3] = [
+        RuntimeType::Docker,
+        RuntimeType::Podman,
+        RuntimeType::Kubernetes,
+    ];
+
+    fn runs_in_container(&self) -> bool {
+        Self::CONTAINER_RUNTIMES.contains(self)
+    }
+
     /// The value steps see in `WRKFLW_RUNTIME_MODE`.
     pub fn mode_name(&self) -> &'static str {
         match self {
@@ -1249,7 +1260,7 @@ async fn execute_native_docker_step(
         }
     }
 
-    let container_workspace = Path::new("/github/workspace");
+    let container_workspace = Path::new(environment::CONTAINER_WORKSPACE);
     let mount_ctx = prepare_step_container_context(
         step_env,
         ctx.job_env,
@@ -4007,7 +4018,7 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                         }
                     }
 
-                    let container_workspace = Path::new("/github/workspace");
+                    let container_workspace = Path::new(environment::CONTAINER_WORKSPACE);
                     let mount_ctx = prepare_step_container_context(
                         &mut step_env,
                         ctx.job_env,
@@ -4195,7 +4206,7 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
         };
 
         // Define the standard workspace path inside the container
-        let container_workspace = Path::new("/github/workspace");
+        let container_workspace = Path::new(environment::CONTAINER_WORKSPACE);
         let final_workspace = if let Some(wd) = &effective_wd {
             let joined = container_workspace.join(wd);
             // Canonicalize logically to catch ".." traversal and absolute path replacement
@@ -4688,13 +4699,9 @@ fn uses_container_runtime(step_env: &HashMap<String, String>) -> bool {
     step_env
         .get("WRKFLW_RUNTIME_MODE")
         .map(|mode| {
-            [
-                RuntimeType::Docker,
-                RuntimeType::Podman,
-                RuntimeType::Kubernetes,
-            ]
-            .iter()
-            .any(|runtime| runtime.mode_name() == mode)
+            RuntimeType::CONTAINER_RUNTIMES
+                .iter()
+                .any(|runtime| runtime.mode_name() == mode)
         })
         .unwrap_or(false)
 }
@@ -4710,7 +4717,7 @@ fn prepare_container_mounts(
     container_config: Option<&JobContainer>,
     mounts_are_copies: bool,
 ) -> (Vec<VolumePathPair>, Option<VolumePathPair>) {
-    let container_github_dir = Path::new("/github/workflow");
+    let container_github_dir = Path::new(environment::CONTAINER_GITHUB_DIR);
     let is_container_runtime = uses_container_runtime(step_env);
 
     // Mount GitHub environment files directory and remap paths
@@ -4730,7 +4737,11 @@ fn prepare_container_mounts(
                         if let Some(filename) = Path::new(host_path).file_name() {
                             step_env.insert(
                                 env_key.to_string(),
-                                format!("/github/workflow/{}", filename.to_string_lossy()),
+                                format!(
+                                    "{}/{}",
+                                    environment::CONTAINER_GITHUB_DIR,
+                                    filename.to_string_lossy()
+                                ),
                             );
                         }
                     }

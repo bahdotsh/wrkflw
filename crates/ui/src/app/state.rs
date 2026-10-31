@@ -18,6 +18,34 @@ use tokio::task::JoinHandle;
 use wrkflw_executor::{JobStatus, RuntimeType, StepStatus};
 use wrkflw_secrets::SecretConfig;
 
+/// Ask whether `runtime` answers, on a thread of its own: a cluster or a slow
+/// credential plugin can take seconds, and this must never stall the event
+/// loop. `None` for runtimes that have nothing to probe.
+fn start_availability_probe(
+    runtime: &RuntimeType,
+    kubernetes: &wrkflw_executor::KubernetesConfig,
+) -> Option<mpsc::Receiver<bool>> {
+    let runtime = runtime.clone();
+    if !matches!(
+        runtime,
+        RuntimeType::Docker | RuntimeType::Podman | RuntimeType::Kubernetes
+    ) {
+        return None;
+    }
+    let kubernetes = kubernetes.clone();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let available = match runtime {
+            RuntimeType::Docker => wrkflw_executor::docker::is_available(),
+            RuntimeType::Podman => wrkflw_executor::podman::is_available(),
+            _ => wrkflw_executor::kubernetes::is_available_with(&kubernetes),
+        };
+        // The receiver is gone if the user has already moved on.
+        let _ = tx.send(available);
+    });
+    Some(rx)
+}
+
 /// Application state
 pub struct App {
     pub workflows: Vec<Workflow>,
@@ -72,6 +100,8 @@ pub struct App {
     // Cached container runtime availability (avoids re-checking every render frame)
     pub runtime_available: bool,
     pub last_availability_check: Instant,
+    /// Answer to a probe still running off the event loop, if any.
+    availability_probe: Option<mpsc::Receiver<bool>>,
 
     // Diff-aware trigger filtering
     pub diff_filter_active: bool,
@@ -493,14 +523,13 @@ impl App {
             RuntimeType::SecureEmulation => RuntimeType::SecureEmulation,
         };
 
-        // If we're still Docker/Podman after the availability check above, it was available
-        let runtime_available = match runtime_type {
-            RuntimeType::Docker | RuntimeType::Podman => true,
-            RuntimeType::Kubernetes => wrkflw_utils::fd::with_stderr_to_null(|| {
-                wrkflw_executor::kubernetes::is_available_with(&kubernetes)
-            })
-            .unwrap_or(false),
-            _ => false,
+        // If we're still Docker/Podman after the availability check above, it
+        // was available. A cluster can take seconds to answer, so its first
+        // answer arrives on a later tick instead of delaying startup.
+        let runtime_available = matches!(runtime_type, RuntimeType::Docker | RuntimeType::Podman);
+        let availability_probe = match runtime_type {
+            RuntimeType::Kubernetes => start_availability_probe(&runtime_type, &kubernetes),
+            _ => None,
         };
 
         App {
@@ -553,6 +582,7 @@ impl App {
 
             runtime_available,
             last_availability_check: Instant::now(),
+            availability_probe,
 
             diff_filter_active: false,
             diff_filter_event: "push".to_string(),
@@ -605,8 +635,10 @@ impl App {
             RuntimeType::SecureEmulation => RuntimeType::Emulation,
             RuntimeType::Emulation => RuntimeType::Docker,
         };
-        // Re-check availability for the new runtime immediately
-        self.runtime_available = self.probe_runtime_available();
+        // Re-check availability for the new runtime right away. Replacing the
+        // receiver discards any answer about the runtime we just left.
+        self.runtime_available = false;
+        self.availability_probe = start_availability_probe(&self.runtime_type, &self.kubernetes);
         self.last_availability_check = Instant::now();
         self.add_timestamped_log(&format!("Switched to {} mode", self.runtime_type_name()));
     }
@@ -970,15 +1002,18 @@ impl App {
         wrkflw_logging::info(&format!("Switched to {} mode", mode));
     }
 
-    /// Whether the selected container runtime answers right now.
-    fn probe_runtime_available(&self) -> bool {
-        match self.runtime_type {
-            RuntimeType::Docker => wrkflw_executor::docker::is_available(),
-            RuntimeType::Podman => wrkflw_executor::podman::is_available(),
-            RuntimeType::Kubernetes => {
-                wrkflw_executor::kubernetes::is_available_with(&self.kubernetes)
+    /// Apply the running availability probe's answer once it has one.
+    fn collect_availability_probe(&mut self) {
+        let Some(probe) = &self.availability_probe else {
+            return;
+        };
+        match probe.try_recv() {
+            Ok(available) => {
+                self.runtime_available = available;
+                self.availability_probe = None;
             }
-            _ => false,
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => self.availability_probe = None,
         }
     }
 
@@ -1637,6 +1672,8 @@ impl App {
     pub fn tick(&mut self) -> bool {
         let now = Instant::now();
 
+        self.collect_availability_probe();
+
         // Check if we should clear a status message (after 3 seconds)
         if let Some(message_time) = self.status_message_time {
             if now.duration_since(message_time).as_secs() >= 3 {
@@ -1652,7 +1689,10 @@ impl App {
             // Refresh container runtime availability every 30 seconds
             if now.duration_since(self.last_availability_check) >= Duration::from_secs(30) {
                 self.last_availability_check = now;
-                self.runtime_available = self.probe_runtime_available();
+                if self.availability_probe.is_none() {
+                    self.availability_probe =
+                        start_availability_probe(&self.runtime_type, &self.kubernetes);
+                }
             }
 
             true
@@ -2819,6 +2859,38 @@ mod tests {
         ];
         app.workflow_list_state.select(Some(0));
         app
+    }
+
+    #[test]
+    fn availability_arrives_through_tick_without_blocking() {
+        let mut app = make_app();
+        let (tx, rx) = mpsc::channel();
+        app.availability_probe = Some(rx);
+
+        app.tick();
+        assert!(!app.runtime_available, "no answer yet");
+        assert!(app.availability_probe.is_some());
+
+        tx.send(true).unwrap();
+        app.tick();
+        assert!(app.runtime_available);
+        assert!(app.availability_probe.is_none());
+    }
+
+    #[test]
+    fn switching_runtime_discards_the_old_runtimes_answer() {
+        let mut app = make_app();
+        app.runtime_type = RuntimeType::Kubernetes;
+        app.runtime_available = true;
+        let (tx, rx) = mpsc::channel();
+        app.availability_probe = Some(rx);
+
+        app.toggle_emulation_mode();
+        assert_eq!(app.runtime_type, RuntimeType::SecureEmulation);
+        assert!(!app.runtime_available);
+        assert!(tx.send(true).is_err(), "the stale probe must be dropped");
+        app.tick();
+        assert!(!app.runtime_available);
     }
 
     /// Run a log line through the real renderer-side parser and return

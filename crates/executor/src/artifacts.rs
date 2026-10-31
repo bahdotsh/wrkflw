@@ -34,6 +34,58 @@ fn sanitize_artifact_name(name: &str) -> Result<String, String> {
     Ok(name.to_string())
 }
 
+/// Files within the workspace matching a glob or directory path, as
+/// (original, canonical) pairs.
+fn matching_files(
+    workspace: &Path,
+    pattern: &str,
+    canonical_workspace: &Path,
+) -> Result<Vec<(PathBuf, PathBuf)>, String> {
+    let trimmed = pattern.trim_end_matches('/');
+    let path = workspace.join(trimmed);
+    let full_pattern = if path.is_dir() {
+        path.join("**").join("*")
+    } else {
+        path
+    };
+    Ok(glob::glob(&full_pattern.to_string_lossy())
+        .map_err(|e| format!("Invalid glob pattern '{}': {}", pattern, e))?
+        .filter_map(|e| e.ok())
+        .filter(|p| p.is_file() && !p.is_symlink())
+        .filter_map(|p| {
+            p.canonicalize()
+                .ok()
+                .filter(|c| c.starts_with(canonical_workspace))
+                .map(|c| (p, c))
+        })
+        .collect())
+}
+
+/// The directory a `path:` line starts from: its part before the first
+/// wildcard, or the parent of a single file.
+fn search_root(workspace: &Path, pattern: &str) -> PathBuf {
+    let path = workspace.join(pattern.trim_end_matches('/'));
+    let wildcard = path
+        .components()
+        .position(|c| c.as_os_str().to_string_lossy().contains(['*', '?', '[']));
+    match wildcard {
+        Some(index) => path.components().take(index).collect(),
+        None if path.is_dir() => path,
+        None => path.parent().map(Path::to_path_buf).unwrap_or(path),
+    }
+}
+
+/// The deepest directory containing every path. `paths` must not be empty.
+fn common_ancestor(paths: &[PathBuf]) -> PathBuf {
+    let mut root = paths[0].clone();
+    while !paths.iter().all(|path| path.starts_with(&root)) {
+        if !root.pop() {
+            break;
+        }
+    }
+    root
+}
+
 /// Recursively collect all regular files under `dir`, skipping symlinks.
 fn walk_files(dir: &Path) -> Result<Vec<PathBuf>, String> {
     let mut files = Vec::new();
@@ -95,46 +147,58 @@ impl ArtifactStore {
         let ad = artifact_dir.clone();
         let ws = workspace.clone();
         let count = tokio::task::spawn_blocking(move || -> Result<usize, String> {
-            std::fs::create_dir_all(&ad)
-                .map_err(|e| format!("Failed to create artifact directory: {}", e))?;
-
             let canonical_workspace = ws
                 .canonicalize()
                 .map_err(|e| format!("Failed to canonicalize workspace: {}", e))?;
-            let full_pattern = ws.join(&pattern).to_string_lossy().to_string();
+            let lines: Vec<&str> = pattern
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .collect();
+            let includes: Vec<&str> = lines
+                .iter()
+                .copied()
+                .filter(|line| !line.starts_with('!'))
+                .collect();
+            let excludes: Vec<&str> = lines.iter().filter_map(|l| l.strip_prefix('!')).collect();
+
             // Collect (original, canonical) pairs in one pass to avoid
             // double-canonicalize per file.
-            let entries: Vec<(PathBuf, PathBuf)> = glob::glob(&full_pattern)
-                .map_err(|e| format!("Invalid glob pattern '{}': {}", pattern, e))?
-                .filter_map(|e| e.ok())
-                .filter(|p| p.is_file() && !p.is_symlink())
-                .filter_map(|p| {
-                    p.canonicalize()
-                        .ok()
-                        .filter(|c| c.starts_with(&canonical_workspace))
-                        .map(|c| (p, c))
-                })
-                .collect();
+            let mut entries: Vec<(PathBuf, PathBuf)> = Vec::new();
+            for include in &includes {
+                entries.extend(matching_files(&ws, include, &canonical_workspace)?);
+            }
+            for exclude in &excludes {
+                let excluded = matching_files(&ws, exclude, &canonical_workspace)?;
+                entries.retain(|(_, canonical)| !excluded.iter().any(|(_, c)| c == canonical));
+            }
+            entries.sort_by(|a, b| a.1.cmp(&b.1));
+            entries.dedup_by(|a, b| a.1 == b.1);
 
             if entries.is_empty() {
-                return Err(format!(
-                    "No files found matching pattern '{}' in {}",
-                    pattern,
-                    ws.display()
-                ));
+                return Ok(0);
             }
+
+            std::fs::create_dir_all(&ad)
+                .map_err(|e| format!("Failed to create artifact directory: {}", e))?;
+
+            // Like upload-artifact, paths are relative to where the search
+            // started, or to what the search paths share when there are several.
+            let search_roots: Vec<PathBuf> = includes
+                .iter()
+                .filter_map(|include| search_root(&ws, include).canonicalize().ok())
+                .collect();
+            let root = common_ancestor(&search_roots);
 
             let mut count = 0;
             for (entry, canonical_entry) in &entries {
-                let rel = canonical_entry
-                    .strip_prefix(&canonical_workspace)
-                    .map_err(|_| {
-                        format!(
-                            "File '{}' is not within workspace '{}'",
-                            entry.display(),
-                            ws.display()
-                        )
-                    })?;
+                let rel = canonical_entry.strip_prefix(&root).map_err(|_| {
+                    format!(
+                        "File '{}' is not within workspace '{}'",
+                        entry.display(),
+                        ws.display()
+                    )
+                })?;
                 let dest = ad.join(rel);
                 if let Some(parent) = dest.parent() {
                     std::fs::create_dir_all(parent)
@@ -148,6 +212,10 @@ impl ArtifactStore {
         })
         .await
         .map_err(|e| format!("Upload task panicked: {}", e))??;
+
+        if count == 0 {
+            return Ok(0);
+        }
 
         let mut idx = self.index.write().await;
         idx.insert(
@@ -267,8 +335,75 @@ mod tests {
         let result = store
             .upload("empty", "*.nonexistent", workspace.path())
             .await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("No files found"));
+        assert_eq!(result.unwrap(), 0);
+        assert!(store.list().await.is_empty());
+    }
+
+    /// Upload `path`, then download it, returning the downloaded directory.
+    async fn round_trip(files: &[&str], path: &str) -> tempfile::TempDir {
+        let run_dir = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        for file in files {
+            let file = workspace.path().join(file);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, "x").unwrap();
+        }
+        let store = ArtifactStore::new(run_dir.path()).unwrap();
+        store.upload("a", path, workspace.path()).await.unwrap();
+        let target = tempdir().unwrap();
+        store.download("a", target.path()).await.unwrap();
+        target
+    }
+
+    #[tokio::test]
+    async fn directory_paths_upload_their_contents_relative_to_the_directory() {
+        for path in ["out", "out/"] {
+            let target = round_trip(&["out/a.txt", "out/sub/b.txt", "other.txt"], path).await;
+            assert!(target.path().join("a.txt").is_file(), "{}", path);
+            assert!(target.path().join("sub/b.txt").is_file(), "{}", path);
+            assert!(!target.path().join("other.txt").exists(), "{}", path);
+        }
+    }
+
+    #[tokio::test]
+    async fn single_file_lands_at_the_artifact_root() {
+        let target = round_trip(&["out/deep/a.txt"], "out/deep/a.txt").await;
+        assert!(target.path().join("a.txt").is_file());
+    }
+
+    #[tokio::test]
+    async fn wildcards_keep_the_hierarchy_after_the_first_wildcard() {
+        let target = round_trip(&["out/a/b/c.txt"], "out/**/*.txt").await;
+        assert!(target.path().join("a/b/c.txt").is_file());
+
+        let target = round_trip(&["out/c.txt"], "out/*").await;
+        assert!(target.path().join("c.txt").is_file());
+    }
+
+    #[tokio::test]
+    async fn multiple_lines_keep_paths_below_their_common_parent() {
+        let target = round_trip(
+            &["dist/a/1.txt", "dist/b/2.txt", "dist/b/skip.log"],
+            "dist/a/\n\n  dist/b/*\n!dist/b/*.log\n",
+        )
+        .await;
+        assert!(target.path().join("a/1.txt").is_file());
+        assert!(target.path().join("b/2.txt").is_file());
+        assert!(!target.path().join("b/skip.log").exists());
+    }
+
+    #[tokio::test]
+    async fn paths_outside_the_workspace_are_not_collected() {
+        let run_dir = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let store = ArtifactStore::new(run_dir.path()).unwrap();
+        let outside = run_dir.path().join("secret.txt");
+        std::fs::write(&outside, "x").unwrap();
+        let count = store
+            .upload("a", &outside.to_string_lossy(), workspace.path())
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
     }
 
     #[tokio::test]

@@ -3215,6 +3215,21 @@ async fn handle_upload_artifact(
         .upload(&name, &path_pattern, ctx.working_dir)
         .await
     {
+        Ok(0) => {
+            let message = format!("No files were found with the path: {}", path_pattern);
+            let if_no_files = with
+                .and_then(|w| w.get("if-no-files-found"))
+                .map(|s| preprocess_with_value(s, ctx));
+            let status = match if_no_files.as_deref() {
+                Some("error") => StepStatus::Failure,
+                Some("ignore") => StepStatus::Success,
+                _ => {
+                    wrkflw_logging::warning(&message);
+                    StepStatus::Success
+                }
+            };
+            Ok(StepResult::new(step_name.to_string(), status, message))
+        }
         Ok(count) => {
             wrkflw_logging::info(&format!(
                 "  Uploaded artifact '{}': {} file(s)",
@@ -9899,13 +9914,9 @@ runs:
             dl_result.output
         );
 
-        let downloaded = std::fs::read_to_string(
-            dl_workspace
-                .path()
-                .join("dl")
-                .join("artifact-dir/payload.txt"),
-        )
-        .expect("downloaded payload.txt should exist");
+        let downloaded =
+            std::fs::read_to_string(dl_workspace.path().join("dl").join("payload.txt"))
+                .expect("downloaded payload.txt should exist");
         assert_eq!(downloaded, "hello\n");
     }
 

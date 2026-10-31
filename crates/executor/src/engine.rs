@@ -83,7 +83,6 @@ async fn execute_github_workflow(
     mut config: ExecutionConfig,
 ) -> Result<ExecutionResult, ExecutionError> {
     config.runtime_type = detect_runtime(config.runtime_type);
-    warn_if_overrides_unused(&config);
     // 1. Parse workflow file
     let workflow = parse_workflow(workflow_path)?;
 
@@ -105,6 +104,7 @@ async fn execute_github_workflow(
         &config.kubernetes,
     )?;
     config.runtime_type = effective_runtime;
+    warn_if_overrides_unused(&config);
 
     // Create a temporary workspace directory
     let workspace_dir = tempfile::tempdir()
@@ -328,7 +328,6 @@ async fn execute_gitlab_pipeline(
     mut config: ExecutionConfig,
 ) -> Result<ExecutionResult, ExecutionError> {
     config.runtime_type = detect_runtime(config.runtime_type);
-    warn_if_overrides_unused(&config);
     wrkflw_logging::info("Executing GitLab CI/CD pipeline");
 
     // 1. Parse the GitLab pipeline file
@@ -362,6 +361,7 @@ async fn execute_gitlab_pipeline(
         &config.kubernetes,
     )?;
     config.runtime_type = effective_runtime;
+    warn_if_overrides_unused(&config);
 
     // Create a temporary workspace directory
     let workspace_dir = tempfile::tempdir()

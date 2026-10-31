@@ -7148,6 +7148,150 @@ runs:
         }
     }
 
+    /// Holds every job's step open at once, after each has written its output.
+    /// Emulation cannot show this: its steps block the one task running them,
+    /// so jobs never overlap there.
+    struct OverlappingRuntime {
+        all_steps_running: tokio::sync::Barrier,
+    }
+
+    #[async_trait::async_trait]
+    impl ContainerRuntime for OverlappingRuntime {
+        async fn run_container(
+            &self,
+            _image: &str,
+            _cmd: &[&str],
+            env_vars: &[(&str, &str)],
+            _working_dir: &Path,
+            volumes: &[(&Path, &Path)],
+            _entrypoint: Option<&str>,
+        ) -> Result<ContainerOutput, ContainerError> {
+            let env = |key: &str| {
+                env_vars
+                    .iter()
+                    .find(|(k, _)| *k == key)
+                    .map(|(_, v)| v.to_string())
+                    .unwrap()
+            };
+            let (github_dir, _) = volumes
+                .iter()
+                .find(|(_, container)| *container == Path::new("/github/workflow"))
+                .unwrap();
+            fs::write(
+                github_dir.join("output"),
+                format!("value={}\n", env("GITHUB_JOB")),
+            )
+            .unwrap();
+            assert_eq!(env("GITHUB_OUTPUT"), "/github/workflow/output");
+            self.all_steps_running.wait().await;
+            Ok(ContainerOutput {
+                stdout: String::new(),
+                stderr: String::new(),
+                exit_code: 0,
+            })
+        }
+
+        async fn pull_image(&self, _image: &str) -> Result<(), ContainerError> {
+            Ok(())
+        }
+
+        async fn build_image(
+            &self,
+            _dockerfile: &Path,
+            _tag: &str,
+            _context_dir: &Path,
+        ) -> Result<(), ContainerError> {
+            Ok(())
+        }
+
+        async fn prepare_language_environment(
+            &self,
+            _language: &str,
+            _version: Option<&str>,
+            _additional_packages: Option<Vec<String>>,
+        ) -> Result<String, ContainerError> {
+            Ok("mock:latest".to_string())
+        }
+
+        async fn image_exists(&self, _tag: &str) -> Result<bool, ContainerError> {
+            Ok(true)
+        }
+    }
+
+    /// Parallel jobs sharing run-level files would read and truncate each
+    /// other's `GITHUB_OUTPUT` when their steps end.
+    #[tokio::test]
+    async fn parallel_jobs_keep_their_own_github_files() {
+        let run_dir = tempfile::tempdir().unwrap();
+        let path = run_dir.path().join("ci.yml");
+        let job = |name: &str| {
+            format!(
+                "  {name}:\n    runs-on: ubuntu-latest\n    outputs:\n      \
+                 value: ${{{{ steps.write.outputs.value }}}}\n    steps:\n      \
+                 - id: write\n        run: echo unused\n"
+            )
+        };
+        fs::write(
+            &path,
+            format!(
+                "name: CI\non: push\njobs:\n{}{}",
+                job("first"),
+                job("second")
+            ),
+        )
+        .unwrap();
+        let workflow = parse_workflow(&path).unwrap();
+
+        environment::setup_github_environment_files(run_dir.path()).unwrap();
+        let mut env_context = HashMap::new();
+        env_context.insert("WRKFLW_RUNTIME_MODE".to_string(), "docker".to_string());
+        for (key, file) in [
+            ("GITHUB_OUTPUT", "output"),
+            ("GITHUB_ENV", "env"),
+            ("GITHUB_PATH", "path"),
+            ("GITHUB_STEP_SUMMARY", "step_summary"),
+        ] {
+            let shared = run_dir.path().join("github").join(file);
+            env_context.insert(key.to_string(), shared.to_string_lossy().to_string());
+        }
+
+        let runtime = OverlappingRuntime {
+            all_steps_running: tokio::sync::Barrier::new(2),
+        };
+        let jobs = vec!["first".to_string(), "second".to_string()];
+        let results = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            execute_job_batch(
+                &jobs,
+                &workflow,
+                &runtime,
+                &env_context,
+                &HashMap::new(),
+                false,
+                None,
+                None,
+                &HashMap::new(),
+                &HashMap::new(),
+                &crate::artifacts::ArtifactStore::new(run_dir.path()).unwrap(),
+                &crate::cache::CacheStore::new().unwrap(),
+                &HashMap::new(),
+            ),
+        )
+        .await
+        .expect("both jobs must reach their step")
+        .unwrap();
+
+        for result in &results {
+            assert_eq!(
+                result.outputs.get("value"),
+                Some(&result.canonical_name),
+                "{}",
+                result.logs
+            );
+        }
+        assert_eq!(results.len(), 2);
+    }
+
     /// Helper to build a minimal `WorkflowDefinition`.
     fn minimal_workflow() -> WorkflowDefinition {
         WorkflowDefinition {

@@ -332,6 +332,11 @@ fn parse_platform_arg(s: &str) -> Result<Option<(String, String)>, String> {
     wrkflw_executor::parse_platform_override(s).map(Some)
 }
 
+// Later entries win, so repeating a label behaves the same whatever its case.
+fn collect_platform_overrides(entries: &[Option<(String, String)>]) -> HashMap<String, String> {
+    entries.iter().flatten().cloned().collect()
+}
+
 // Parser function for key-value pairs
 fn parse_key_val(s: &str) -> Result<(String, String), String> {
     let pos = s
@@ -505,8 +510,7 @@ async fn main() {
     // Setup a Ctrl+C handler that runs in the background
     tokio::spawn(handle_signals());
 
-    let platform_overrides: HashMap<String, String> =
-        cli.platform.iter().flatten().cloned().collect();
+    let platform_overrides = collect_platform_overrides(&cli.platform);
 
     match &cli.command {
         Some(Commands::Validate {
@@ -1033,5 +1037,50 @@ mod tests {
             RuntimeType::from(RuntimeChoice::SecureEmulation),
             RuntimeType::SecureEmulation
         );
+    }
+
+    fn platform_overrides_from(args: &[&str]) -> HashMap<String, String> {
+        let cli = Wrkflw::try_parse_from(args).unwrap();
+        collect_platform_overrides(&cli.platform)
+    }
+
+    #[test]
+    fn platform_flag_accepts_repeats_and_commas() {
+        let map = platform_overrides_from(&[
+            "wrkflw",
+            "-P",
+            "a=one:1,b=two:2",
+            "--platform",
+            "c=three:3",
+        ]);
+        assert_eq!(map.len(), 3);
+        assert_eq!(map["a"], "one:1");
+        assert_eq!(map["b"], "two:2");
+        assert_eq!(map["c"], "three:3");
+    }
+
+    #[test]
+    fn platform_flag_works_after_a_subcommand() {
+        let map = platform_overrides_from(&["wrkflw", "run", "ci.yml", "-P", "a=one:1"]);
+        assert_eq!(map["a"], "one:1");
+    }
+
+    #[test]
+    fn platform_flag_skips_empty_entries() {
+        assert!(platform_overrides_from(&["wrkflw", "-P", ""]).is_empty());
+        let map = platform_overrides_from(&["wrkflw", "-P", "a=one:1,"]);
+        assert_eq!(map.len(), 1);
+    }
+
+    #[test]
+    fn platform_flag_last_value_wins_across_label_case() {
+        let map = platform_overrides_from(&["wrkflw", "-P", "Ubuntu=one:1", "-P", "ubuntu=two:2"]);
+        assert_eq!(map.len(), 1);
+        assert_eq!(map["ubuntu"], "two:2");
+    }
+
+    #[test]
+    fn platform_flag_rejects_malformed_values() {
+        assert!(Wrkflw::try_parse_from(["wrkflw", "-P", "no-equals"]).is_err());
     }
 }

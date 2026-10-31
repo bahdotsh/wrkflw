@@ -671,12 +671,17 @@ pub struct ExecutionConfig {
     pub show_action_messages: bool,
     pub target_job: Option<String>,
     /// User-supplied `runs-on` label to image mappings. They win over the
-    /// built-in table but lose to a job-level `container:`. Labels match
-    /// case-insensitively.
+    /// built-in table but lose to a job-level `container:`. Keys must be
+    /// lowercase, as [`parse_platform_override`] returns them, because labels
+    /// match case-insensitively.
     pub platform_overrides: HashMap<String, String>,
 }
 
 /// Parse a `LABEL=IMAGE` runner override, as given to `--platform`.
+///
+/// The label is lowercased so labels differing only by case share one map key.
+/// The image is later written to a Dockerfile `FROM` line, so whitespace is
+/// rejected. No valid image reference contains any.
 pub fn parse_platform_override(s: &str) -> Result<(String, String), String> {
     let (label, image) = s
         .split_once('=')
@@ -688,22 +693,34 @@ pub fn parse_platform_override(s: &str) -> Result<(String, String), String> {
             s
         ));
     }
-    Ok((label.to_string(), image.to_string()))
+    if image.chars().any(char::is_whitespace) {
+        return Err(format!(
+            "invalid LABEL=IMAGE: image must not contain whitespace in `{}`",
+            s
+        ));
+    }
+    Ok((label.to_ascii_lowercase(), image.to_string()))
 }
 
 /// Overrides only change which image a container runs, so they do nothing
 /// when no container runs. Say so rather than ignoring the flag silently.
 fn warn_if_overrides_unused(config: &ExecutionConfig) {
-    if !config.platform_overrides.is_empty()
-        && matches!(
-            config.runtime_type,
-            RuntimeType::Emulation | RuntimeType::SecureEmulation
-        )
-    {
+    if overrides_unused(&config.platform_overrides, &config.runtime_type) {
         wrkflw_logging::warning(
             "--platform has no effect in emulation mode: steps run on the host, not in an image",
         );
     }
+}
+
+fn overrides_unused(
+    platform_overrides: &HashMap<String, String>,
+    runtime_type: &RuntimeType,
+) -> bool {
+    !platform_overrides.is_empty()
+        && matches!(
+            runtime_type,
+            RuntimeType::Emulation | RuntimeType::SecureEmulation
+        )
 }
 
 pub struct ExecutionResult {
@@ -4352,9 +4369,8 @@ fn find_platform_override(
             None => label.clone(),
         };
         platform_overrides
-            .iter()
-            .find(|(key, _)| key.trim().eq_ignore_ascii_case(label.trim()))
-            .map(|(_, image)| image.clone())
+            .get(&label.trim().to_ascii_lowercase())
+            .cloned()
     })
 }
 
@@ -5836,6 +5852,7 @@ mod tests {
         static ref TEST_PENDING_CACHE_SAVES: std::sync::Mutex<Vec<PendingCacheSave>> =
             std::sync::Mutex::new(Vec::new());
         static ref EMPTY_SECRETS: HashMap<String, String> = HashMap::new();
+        static ref EMPTY_PLATFORM_OVERRIDES: HashMap<String, String> = HashMap::new();
         static ref EMPTY_NEEDS: HashMap<String, HashMap<String, String>> = HashMap::new();
         static ref EMPTY_NEEDS_RESULTS: HashMap<String, String> = HashMap::new();
     }
@@ -5849,7 +5866,7 @@ mod tests {
             needs_results: &EMPTY_NEEDS_RESULTS,
             artifact_store: &TEST_ARTIFACT_STORE,
             cache_store: &TEST_CACHE_STORE,
-            platform_overrides: &EMPTY_SECRETS,
+            platform_overrides: &EMPTY_PLATFORM_OVERRIDES,
         }
     }
 
@@ -6000,6 +6017,55 @@ mod tests {
         for bad in ["ubuntu-latest", "=image", "label=", " = "] {
             assert!(parse_platform_override(bad).is_err(), "{bad} should fail");
         }
+    }
+
+    #[test]
+    fn parse_platform_override_lowercases_label_only() {
+        assert_eq!(
+            parse_platform_override("Ubuntu-Latest=My/Image:1").unwrap(),
+            ("ubuntu-latest".to_string(), "My/Image:1".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_platform_override_rejects_whitespace_in_image() {
+        for bad in [
+            "ubuntu-latest=my/image:1\nRUN id",
+            "ubuntu-latest=my/image:1\r\nRUN id",
+            "ubuntu-latest=my image:1",
+            "ubuntu-latest=my\timage:1",
+        ] {
+            assert!(parse_platform_override(bad).is_err(), "{bad:?} should fail");
+        }
+    }
+
+    #[test]
+    fn overrides_are_unused_only_in_emulation_with_overrides_set() {
+        let map = overrides(&[("ubuntu-latest", "my/image:1")]);
+        assert!(overrides_unused(&map, &RuntimeType::Emulation));
+        assert!(overrides_unused(&map, &RuntimeType::SecureEmulation));
+        assert!(!overrides_unused(&map, &RuntimeType::Docker));
+        assert!(!overrides_unused(&map, &RuntimeType::Podman));
+        assert!(!overrides_unused(&HashMap::new(), &RuntimeType::Emulation));
+    }
+
+    #[tokio::test]
+    async fn resolve_runner_image_builds_setup_runtimes_on_override() {
+        let job = make_job(None, labels(&["ubuntu-latest"]));
+        let steps = vec![make_step_uses("actions/setup-node@v4", None)];
+        let map = overrides(&[("ubuntu-latest", "my/image:1")]);
+        let runtime = MockContainerRuntime::default();
+
+        let image = resolve_runner_image(&job, &steps, &runtime, &map, None)
+            .await
+            .unwrap();
+
+        let dockerfile = generate_combined_dockerfile(&detect_setup_runtimes(&steps), "my/image:1");
+        assert!(dockerfile.starts_with("FROM my/image:1\n"));
+        assert_eq!(
+            image,
+            combined_image_tag(&detect_setup_runtimes(&steps), &dockerfile)
+        );
     }
 
     // --- get_effective_runner_image tests ---

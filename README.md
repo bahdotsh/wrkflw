@@ -145,7 +145,7 @@ export WRKFLW_PLATFORM=ubuntu-latest=catthehacker/ubuntu:act-latest
 ```
 
 - A job-level `container:` still wins over `--platform`, which wins over the built-in image.
-- Labels match case-insensitively. Every label in `runs-on: [self-hosted, linux]` is tried, and `runs-on: ${{ matrix.os }}` is resolved per matrix combination.
+- Labels match case-insensitively, and the last value given for a label wins. Every label in `runs-on: [self-hosted, linux]` is tried, and `runs-on: ${{ matrix.os }}` is resolved per matrix combination.
 - Runtimes from `actions/setup-*` are installed on top of your image, so the image must be Debian or Ubuntu based for those jobs.
 - `--platform` replaces `WRKFLW_PLATFORM` entirely when both are set. It has no effect in emulation mode.
 

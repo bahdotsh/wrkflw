@@ -7,6 +7,11 @@ Under the Docker runtime, any image name containing both `catthehacker` and
 steps on `ubuntu-*-medium` runners passed without running. Those steps now run
 and can fail. Workflows that were passing there may start failing for real.
 
+This also affected `uses:` steps on any runner label, because actions such as
+`actions/cache` and the `actions/setup-*` family are sent to
+`catthehacker/ubuntu:act-latest`. Their commands now run too, including those
+derived from a `with.command` input, such as `npm run`, `cargo` and `pip`.
+
 `RUNNER_OS`, `PATH` and `HOME` are also no longer overridden for those images.
 
 Combined images for `actions/setup-*` jobs now put `/usr/local/bin` and

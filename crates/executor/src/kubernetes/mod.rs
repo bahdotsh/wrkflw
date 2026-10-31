@@ -100,6 +100,7 @@ static PUSHED_IMAGES: Lazy<Mutex<HashSet<String>>> = Lazy::new(|| Mutex::new(Has
 
 #[derive(Debug, Clone)]
 struct PodRef {
+    kubectl: OsString,
     kubectl_args: Vec<String>,
     name: String,
 }
@@ -277,7 +278,7 @@ fn delete_args(name: &str) -> [&str; 5] {
 
 async fn delete_tracked_pod(pod: &PodRef) {
     wrkflw_logging::info(&format!("Deleting Kubernetes pod {}", pod.name));
-    let _ = Command::new("kubectl")
+    let _ = Command::new(&pod.kubectl)
         .args(&pod.kubectl_args)
         .args(delete_args(&pod.name))
         .stdout(Stdio::null())
@@ -307,18 +308,13 @@ fn untrack_pod(name: &str) {
 /// the tokio runtime.
 struct PodGuard {
     pod: PodRef,
-    kubectl: OsString,
     armed: bool,
 }
 
 impl PodGuard {
-    fn new(pod: PodRef, kubectl: OsString) -> Self {
+    fn new(pod: PodRef) -> Self {
         track_pod(&pod);
-        PodGuard {
-            pod,
-            kubectl,
-            armed: true,
-        }
+        PodGuard { pod, armed: true }
     }
 
     /// The pod was deleted or deliberately kept; leave it alone.
@@ -337,7 +333,7 @@ impl Drop for PodGuard {
             "Step cancelled, deleting Kubernetes pod {}",
             self.pod.name
         ));
-        let child = std::process::Command::new(&self.kubectl)
+        let child = std::process::Command::new(&self.pod.kubectl)
             .args(&self.pod.kubectl_args)
             .args(delete_args(&self.pod.name))
             .stdin(Stdio::null())
@@ -827,13 +823,11 @@ impl KubernetesRuntime {
         wrkflw_logging::debug(&format!("Working directory: {}", working_dir.display()));
 
         // Armed before the pod exists: cancellation can land inside `create`.
-        let mut guard = PodGuard::new(
-            PodRef {
-                kubectl_args: self.kubectl_args(),
-                name: name.to_string(),
-            },
-            self.kubectl.clone(),
-        );
+        let mut guard = PodGuard::new(PodRef {
+            kubectl: self.kubectl.clone(),
+            kubectl_args: self.kubectl_args(),
+            name: name.to_string(),
+        });
         let result = self.run_pod(name, &manifest, working_dir, &mounts).await;
 
         match &result {
@@ -1663,20 +1657,34 @@ esac
         wait_for_delete(work.path());
     }
 
-    /// A guard whose "kubectl" records its arguments in `log` instead.
+    /// A "kubectl" that records its arguments in `log` instead.
+    #[cfg(unix)]
+    fn recording_pod(name: &str, log: &Path) -> PodRef {
+        PodRef {
+            kubectl: "sh".into(),
+            kubectl_args: vec![
+                "-c".into(),
+                format!("echo \"$@\" > {}.tmp && mv {0}.tmp {0}", log.display()),
+                "sh".into(),
+            ],
+            name: name.into(),
+        }
+    }
+
     #[cfg(unix)]
     fn recording_guard(name: &str, log: &Path) -> PodGuard {
-        PodGuard::new(
-            PodRef {
-                kubectl_args: vec![
-                    "-c".into(),
-                    format!("echo \"$@\" > {}.tmp && mv {0}.tmp {0}", log.display()),
-                    "sh".into(),
-                ],
-                name: name.into(),
-            },
-            "sh".into(),
-        )
+        PodGuard::new(recording_pod(name, log))
+    }
+
+    /// The Ctrl+C sweep has to reach the same kubectl as everything else.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_exit_sweep_uses_the_pods_own_kubectl() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("kubectl.log");
+        delete_tracked_pod(&recording_pod("wrkflw-swept", &log)).await;
+        let args = std::fs::read_to_string(&log).unwrap();
+        assert!(args.starts_with("delete pod wrkflw-swept "), "{}", args);
     }
 
     #[cfg(unix)]
@@ -1727,6 +1735,7 @@ esac
     #[test]
     fn pod_tracking_adds_and_removes() {
         let pod = PodRef {
+            kubectl: "kubectl".into(),
             kubectl_args: vec![],
             name: "wrkflw-tracked".into(),
         };

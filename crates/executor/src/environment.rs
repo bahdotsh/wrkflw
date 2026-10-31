@@ -51,6 +51,25 @@ pub fn isolate_github_environment_files(
     Ok(dir)
 }
 
+/// Replace host values with what a step sees inside a Linux container, where
+/// the workspace is mounted at `/github/workspace`. Without this `runner.os`
+/// reports the host OS and paths like `$GITHUB_WORKSPACE` don't exist in the
+/// container.
+pub fn apply_container_context(env: &mut HashMap<String, String>) {
+    const WORKSPACE: &str = "/github/workspace";
+    for (key, value) in [
+        ("GITHUB_WORKSPACE", WORKSPACE),
+        ("RUNNER_OS", "Linux"),
+        ("RUNNER_TEMP", "/tmp"),
+        ("RUNNER_TOOL_CACHE", "/opt/hostedtoolcache"),
+    ] {
+        env.insert(key.to_string(), value.to_string());
+    }
+    if env.contains_key("CI_PROJECT_DIR") {
+        env.insert("CI_PROJECT_DIR".to_string(), WORKSPACE.to_string());
+    }
+}
+
 pub fn create_github_context(
     workflow: &WorkflowDefinition,
     workspace_dir: &Path,
@@ -474,5 +493,25 @@ mod tests {
         }
         assert!(Path::new(&first["GITHUB_ENV"]).starts_with(first_dir.path()));
         assert!(Path::new(&second["GITHUB_ENV"]).starts_with(second_dir.path()));
+    }
+
+    #[test]
+    fn container_context_replaces_host_values() {
+        let mut env = HashMap::from([
+            ("RUNNER_OS".to_string(), "macOS".to_string()),
+            ("GITHUB_WORKSPACE".to_string(), "/Users/me/repo".to_string()),
+            ("RUNNER_TEMP".to_string(), "/var/folders/x".to_string()),
+            ("OTHER".to_string(), "kept".to_string()),
+        ]);
+        apply_container_context(&mut env);
+        assert_eq!(env["RUNNER_OS"], "Linux");
+        assert_eq!(env["GITHUB_WORKSPACE"], "/github/workspace");
+        assert_eq!(env["RUNNER_TEMP"], "/tmp");
+        assert_eq!(env["OTHER"], "kept");
+        assert!(!env.contains_key("CI_PROJECT_DIR"));
+
+        let mut gitlab = HashMap::from([("CI_PROJECT_DIR".to_string(), "/host".to_string())]);
+        apply_container_context(&mut gitlab);
+        assert_eq!(gitlab["CI_PROJECT_DIR"], "/github/workspace");
     }
 }

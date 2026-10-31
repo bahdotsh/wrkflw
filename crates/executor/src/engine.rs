@@ -163,6 +163,9 @@ async fn execute_github_workflow(
         "WRKFLW_RUNTIME_MODE".to_string(),
         config.runtime_type.mode_name().to_string(),
     );
+    if uses_container_runtime(&env_context) {
+        environment::apply_container_context(&mut env_context);
+    }
 
     // show=true means hide=false (inverted for the env var)
     env_context.insert(
@@ -376,6 +379,9 @@ async fn execute_gitlab_pipeline(
         "WRKFLW_RUNTIME_MODE".to_string(),
         config.runtime_type.mode_name().to_string(),
     );
+    if uses_container_runtime(&env_context) {
+        environment::apply_container_context(&mut env_context);
+    }
 
     // Setup environment files
     environment::setup_github_environment_files(workspace_dir.path()).map_err(|e| {
@@ -3176,6 +3182,18 @@ impl<'a> StepExecutionContext<'a> {
     }
 }
 
+/// Evaluate `${{ }}` in a `working-directory`. A path under `$GITHUB_WORKSPACE`
+/// becomes relative, since steps always see the workspace at the same place and
+/// `github.workspace` is the host path in emulation.
+fn resolve_working_directory(wd: &str, ctx: &StepExecutionContext<'_>) -> String {
+    let resolved = preprocess_with_value(wd, ctx);
+    ctx.job_env
+        .get("GITHUB_WORKSPACE")
+        .and_then(|workspace| resolved.strip_prefix(workspace.as_str()))
+        .map(|relative| relative.trim_start_matches('/').to_string())
+        .unwrap_or(resolved)
+}
+
 /// Resolve `${{ }}` expressions in an action `with` parameter value.
 ///
 /// On expression error, returns empty string (matching GitHub Actions behavior
@@ -4104,11 +4122,12 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
             .or_else(|| {
                 ctx.workflow_defaults
                     .and_then(|d| d.run.as_ref()?.working_directory.as_deref())
-            });
+            })
+            .map(|wd| resolve_working_directory(wd, &ctx));
 
         // Define the standard workspace path inside the container
         let container_workspace = Path::new("/github/workspace");
-        let final_workspace = if let Some(wd) = effective_wd {
+        let final_workspace = if let Some(wd) = &effective_wd {
             let joined = container_workspace.join(wd);
             // Canonicalize logically to catch ".." traversal and absolute path replacement
             let mut normalized = std::path::PathBuf::new();
@@ -9016,6 +9035,47 @@ runs:
         // No container calls should have failed
         let calls = runtime.run_calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn working_directory_evaluates_expressions_within_the_workspace() {
+        let workflow = minimal_workflow();
+        let job_env = HashMap::from([("GITHUB_WORKSPACE".to_string(), "/host/repo".to_string())]);
+        let working_dir = std::env::current_dir().unwrap();
+
+        for (wd, expected) in [
+            ("${{ github.workspace }}/src", StepStatus::Success),
+            ("${{ github.workspace }}", StepStatus::Success),
+            ("${{ github.workspace }}/../escape", StepStatus::Failure),
+        ] {
+            let runtime = MockContainerRuntime::default();
+            let mut step = make_run_step("echo ok");
+            step.working_directory = Some(wd.to_string());
+
+            let ctx = StepExecutionContext {
+                step: &step,
+                step_idx: 0,
+                job_env: &job_env,
+                job_user_env: &job_env,
+                working_dir: &working_dir,
+                runtime: &runtime,
+                workflow: &workflow,
+                runner_image: "ubuntu:latest",
+                verbose: false,
+                matrix_combination: &None,
+                container_config: None,
+                workflow_defaults: None,
+                job_defaults: None,
+                step_outputs: &HashMap::new(),
+                step_statuses: &HashMap::new(),
+                job_status: "success",
+                services: test_services(),
+                pending_cache_saves: &TEST_PENDING_CACHE_SAVES,
+            };
+
+            let result = execute_step(ctx).await.unwrap();
+            assert_eq!(result.status, expected, "{}", wd);
+        }
     }
 
     #[tokio::test]

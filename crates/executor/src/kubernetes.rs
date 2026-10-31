@@ -457,7 +457,7 @@ fn build_pod_manifest(config: &KubernetesConfig, input: &PodInput<'_>) -> Value 
         "terminationGracePeriodSeconds": 2,
         // The sidecar never exits on its own. If wrkflw dies, this is what
         // stops an orphaned pod from holding its node's GPUs forever.
-        "activeDeadlineSeconds": config.timeout().as_secs() + DEADLINE_MARGIN_SECS,
+        "activeDeadlineSeconds": active_deadline_seconds(config),
         "initContainers": [wait],
         "containers": [main, sync],
         "volumes": volumes,
@@ -485,6 +485,16 @@ fn build_pod_manifest(config: &KubernetesConfig, input: &PodInput<'_>) -> Value 
         },
         "spec": spec,
     })
+}
+
+/// `activeDeadlineSeconds` for `config`. The API field is a signed 64-bit
+/// integer, and a wrapped sum would kill the pod during its own workspace sync.
+fn active_deadline_seconds(config: &KubernetesConfig) -> u64 {
+    config
+        .timeout()
+        .as_secs()
+        .saturating_add(DEADLINE_MARGIN_SECS)
+        .min(i64::MAX as u64)
 }
 
 /// Requests and limits for the helper containers. They only run `sh` and
@@ -1756,6 +1766,22 @@ mod tests {
         for helper in [&spec["initContainers"][0], &spec["containers"][1]] {
             assert_eq!(helper["resources"], helper_resources());
         }
+    }
+
+    #[test]
+    fn active_deadline_never_wraps_or_overflows_the_api_field() {
+        let with_timeout = |secs| KubernetesConfig {
+            timeout_secs: Some(secs),
+            ..Default::default()
+        };
+        assert_eq!(
+            active_deadline_seconds(&with_timeout(120)),
+            120 + DEADLINE_MARGIN_SECS
+        );
+        assert_eq!(
+            active_deadline_seconds(&with_timeout(u64::MAX)),
+            i64::MAX as u64
+        );
     }
 
     #[test]

@@ -160,7 +160,8 @@ struct KubernetesArgs {
         long = "k8s-timeout",
         global = true,
         value_name = "SECONDS",
-        env = "WRKFLW_K8S_TIMEOUT"
+        env = "WRKFLW_K8S_TIMEOUT",
+        value_parser = clap::value_parser!(u64).range(1..)
     )]
     k8s_timeout: Option<u64>,
 }
@@ -1251,6 +1252,15 @@ mod tests {
         assert!(cfg.resources.is_empty());
         assert!(Wrkflw::try_parse_from(["wrkflw", "--k8s-resource", "gpu"]).is_err());
         assert!(Wrkflw::try_parse_from(["wrkflw", "--k8s-node-selector", "=x"]).is_err());
+    }
+
+    #[test]
+    fn k8s_timeout_rejects_zero() {
+        assert!(Wrkflw::try_parse_from(["wrkflw", "--k8s-timeout", "0"]).is_err());
+        assert_eq!(
+            k8s_config_from(&["wrkflw", "--k8s-timeout", "1"]).timeout_secs,
+            Some(1)
+        );
     }
 
     #[test]

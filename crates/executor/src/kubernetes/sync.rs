@@ -1,7 +1,7 @@
 //! Streaming mounts between the host and a pod as tar archives.
 //!
-//! The way back deserves the care it gets here: it deletes host files based
-//! on what a workflow left in a pod.
+//! The way back deserves the care it gets here: for mounts the executor owns
+//! it deletes host files based on what a workflow left in a pod.
 
 use super::manifest::Mount;
 use super::{SYNC_CONTAINER, WAIT_CONTAINER};
@@ -96,8 +96,7 @@ pub(super) fn stream_dir_into(
     // discards it. Symlinks are shipped as symlinks, not followed.
     builder.mode(tar::HeaderMode::Complete);
     builder.follow_symlinks(false);
-    let archived = builder
-        .append_dir_all(".", &mount.host)
+    let archived = append_tree(&mut builder, &mount.host)
         .and_then(|_| builder.into_inner())
         .map(drop);
 
@@ -119,6 +118,37 @@ pub(super) fn stream_dir_into(
             e
         ))
     })
+}
+
+/// Archive everything under `root` as `./...`, like `append_dir_all`, except
+/// that a socket is skipped: tar cannot carry one, and one left behind by a
+/// dev server must not fail the step. Copy-out leaves host sockets alone too.
+fn append_tree<W: io::Write>(builder: &mut tar::Builder<W>, root: &Path) -> io::Result<()> {
+    builder.append_path_with_name(root, ".")?;
+    let mut pending = vec![PathBuf::new()];
+    while let Some(rel) = pending.pop() {
+        for entry in std::fs::read_dir(root.join(&rel))? {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            let child = rel.join(entry.file_name());
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::FileTypeExt;
+                if file_type.is_socket() {
+                    wrkflw_logging::debug(&format!(
+                        "Kubernetes: not syncing socket {}",
+                        entry.path().display()
+                    ));
+                    continue;
+                }
+            }
+            builder.append_path_with_name(entry.path(), Path::new(".").join(&child))?;
+            if file_type.is_dir() {
+                pending.push(child);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Write the tar archive in `reader` onto `host`, returning every path it held.
@@ -300,7 +330,8 @@ pub(super) fn copy_dir_out_of_pod(
         .args(kubectl_args)
         .args(["exec", pod, "-c", SYNC_CONTAINER, "--"])
         .args(&tar_args);
-    mirror_from(command, &src, &mount.host, excludes)?;
+    let prune = mount.mirrored();
+    sync_from(command, &src, &mount.host, excludes, prune)?;
     wrkflw_logging::debug(&format!(
         "Kubernetes: synced {}:{} -> {}",
         pod,
@@ -310,13 +341,15 @@ pub(super) fn copy_dir_out_of_pod(
     Ok(())
 }
 
-/// Blocking: unpack the tar archive `command` prints onto `host`, then prune.
-/// `src` only names the source in errors.
-pub(super) fn mirror_from(
+/// Blocking: unpack the tar archive `command` prints onto `host`, then remove
+/// what it did not hold if `prune` is set. `src` only names the source in
+/// errors.
+pub(super) fn sync_from(
     mut command: std::process::Command,
     src: &str,
     host: &Path,
     excludes: &[String],
+    prune: bool,
 ) -> Result<(), ContainerError> {
     let mut child = command
         .stdin(Stdio::null())
@@ -352,14 +385,17 @@ pub(super) fn mirror_from(
         ))
     };
     let seen = unpacked.map_err(unpack_error)?;
-    prune_to_archive(host, &seen, excludes).map_err(unpack_error)
+    if prune {
+        prune_to_archive(host, &seen, excludes).map_err(unpack_error)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// What [`mirror_from`] does once the stream is known to be complete.
+    /// What [`sync_from`] does once the stream is known to be complete.
     fn unpack_mirroring<R: io::Read>(reader: R, host: &Path, keep: &[String]) -> io::Result<()> {
         let seen = unpack_archive(reader, host)?;
         prune_to_archive(host, &seen, keep)
@@ -548,11 +584,12 @@ mod tests {
         std::fs::write(host.path().join("not-yet-sent.txt"), "precious").unwrap();
 
         let tar = write_tar(work.path(), |b| add_file(b, "./first.txt", b"x"));
-        let err = mirror_from(
+        let err = sync_from(
             sender("head -c 1024 \"$1\"; echo lost >&2; exit 1", &tar),
             "/github/workspace",
             host.path(),
             &[],
+            true,
         )
         .expect_err("a failed exec must fail the sync");
 
@@ -568,10 +605,67 @@ mod tests {
         std::fs::write(host.path().join("deleted.txt"), "x").unwrap();
 
         let tar = write_tar(work.path(), |b| add_file(b, "./kept.txt", b"x"));
-        mirror_from(sender("cat \"$1\"", &tar), "src", host.path(), &[]).unwrap();
+        sync_from(sender("cat \"$1\"", &tar), "src", host.path(), &[], true).unwrap();
 
         assert!(host.path().join("kept.txt").exists());
         assert!(!host.path().join("deleted.txt").exists());
+    }
+
+    /// A user's directory may hold files the pod never saw.
+    #[cfg(unix)]
+    #[test]
+    fn a_mount_that_is_not_mirrored_only_gains_files() {
+        let work = tempfile::tempdir().unwrap();
+        let host = tempfile::tempdir().unwrap();
+        std::fs::write(host.path().join("written-meanwhile.txt"), "x").unwrap();
+
+        let tar = write_tar(work.path(), |b| add_file(b, "./from-pod.txt", b"x"));
+        sync_from(sender("cat \"$1\"", &tar), "src", host.path(), &[], false).unwrap();
+
+        assert!(host.path().join("from-pod.txt").exists());
+        assert!(host.path().join("written-meanwhile.txt").exists());
+    }
+
+    /// A stale dev-server socket must not fail the step, and everything else
+    /// has to arrive with its type intact.
+    #[cfg(unix)]
+    #[test]
+    fn sockets_are_left_out_of_the_copy_in() {
+        let host = tempfile::tempdir().unwrap();
+        std::fs::create_dir(host.path().join("sub")).unwrap();
+        std::fs::write(host.path().join("sub/f.txt"), "body").unwrap();
+        std::os::unix::fs::symlink("sub/f.txt", host.path().join("link")).unwrap();
+        let _listener =
+            std::os::unix::net::UnixListener::bind(host.path().join("dev.sock")).unwrap();
+
+        let mut builder = tar::Builder::new(Vec::new());
+        builder.mode(tar::HeaderMode::Complete);
+        builder.follow_symlinks(false);
+        append_tree(&mut builder, host.path()).unwrap();
+        let bytes = builder.into_inner().unwrap();
+
+        let mut archive = tar::Archive::new(bytes.as_slice());
+        let entries: Vec<(String, tar::EntryType)> = archive
+            .entries()
+            .unwrap()
+            .map(|e| {
+                let e = e.unwrap();
+                (
+                    e.path().unwrap().to_string_lossy().to_string(),
+                    e.header().entry_type(),
+                )
+            })
+            .collect();
+        let kind = |name: &str| {
+            entries
+                .iter()
+                .find(|(path, _)| path.trim_end_matches('/') == name)
+                .map(|(_, kind)| *kind)
+        };
+        assert_eq!(kind("sub"), Some(tar::EntryType::Directory));
+        assert_eq!(kind("sub/f.txt"), Some(tar::EntryType::Regular));
+        assert_eq!(kind("link"), Some(tar::EntryType::Symlink));
+        assert_eq!(kind("dev.sock"), None);
     }
 
     /// More stderr than a pipe holds, before any stdout. Unread, this hangs.
@@ -581,11 +675,12 @@ mod tests {
         let work = tempfile::tempdir().unwrap();
         let host = tempfile::tempdir().unwrap();
         let tar = write_tar(work.path(), |b| add_file(b, "./f.txt", b"x"));
-        mirror_from(
+        sync_from(
             sender("head -c 1000000 /dev/zero >&2; cat \"$1\"", &tar),
             "src",
             host.path(),
             &[],
+            true,
         )
         .unwrap();
         assert!(host.path().join("f.txt").exists());

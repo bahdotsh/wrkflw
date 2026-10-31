@@ -4665,9 +4665,19 @@ fn prepare_container_mounts(
                     owned_volume_paths.push((PathBuf::from(parts[0]), PathBuf::from(parts[1])));
                 }
                 _ => {
-                    // Single path: mount at same location inside container
+                    // Single path: mount at same location inside container.
+                    // GitHub makes this an anonymous volume. A pod's mounts are
+                    // written back to the host, so on Kubernetes an empty host
+                    // path keeps a path like `/tmp` from reaching the host's.
                     let p = PathBuf::from(parts[0]);
-                    owned_volume_paths.push((p.clone(), p));
+                    let host = if step_env.get("WRKFLW_RUNTIME_MODE").map(String::as_str)
+                        == Some(RuntimeType::Kubernetes.mode_name())
+                    {
+                        PathBuf::new()
+                    } else {
+                        p.clone()
+                    };
+                    owned_volume_paths.push((host, p));
                 }
             }
         }
@@ -6340,6 +6350,27 @@ mod tests {
         assert_eq!(volumes.len(), 1);
         assert_eq!(volumes[0].0, PathBuf::from("/host/data"));
         assert_eq!(volumes[0].1, PathBuf::from("/container/data"));
+    }
+
+    #[test]
+    fn container_mounts_keep_single_path_volumes_off_the_host_on_kubernetes() {
+        let mut step_env = HashMap::new();
+        step_env.insert("WRKFLW_RUNTIME_MODE".into(), "kubernetes".into());
+        let container = JobContainer {
+            image: "ubuntu".into(),
+            credentials: None,
+            env: HashMap::new(),
+            ports: None,
+            volumes: Some(vec!["/tmp".into(), "/host/data:/data".into()]),
+            options: None,
+        };
+        let (volumes, _) =
+            prepare_container_mounts(&mut step_env, &HashMap::new(), Some(&container));
+        assert_eq!(volumes[0], (PathBuf::new(), PathBuf::from("/tmp")));
+        assert_eq!(
+            volumes[1],
+            (PathBuf::from("/host/data"), PathBuf::from("/data"))
+        );
     }
 
     #[test]

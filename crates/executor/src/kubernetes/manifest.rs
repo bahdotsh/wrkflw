@@ -8,11 +8,29 @@ use super::{
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
-/// One host directory and the container path it is exposed at.
+/// Container paths backed by directories the executor created for this job.
+/// Nothing else on those host directories can be lost, so only these are
+/// mirrored. `/github/action` is left out: a local action lives in the user's
+/// repository. Exact paths, so a user volume nested below one does not qualify.
+const MIRRORED_MOUNTS: &[&str] = &["/github/workspace", "/github/workflow"];
+
+/// One host directory and the container path it is exposed at. An empty
+/// `host` is a volume that exists only in the pod.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Mount {
     pub(super) host: PathBuf,
     pub(super) container: PathBuf,
+}
+
+impl Mount {
+    /// True when the host directory must end up exactly as the pod left it,
+    /// deletions included. Any other mount belongs to the user and may hold
+    /// files the pod never saw, so copy-out only adds to it.
+    pub(super) fn mirrored(&self) -> bool {
+        MIRRORED_MOUNTS
+            .iter()
+            .any(|path| self.container == Path::new(path))
+    }
 }
 
 /// Turn the caller's `(host, container)` pairs into an ordered mount plan.
@@ -32,7 +50,7 @@ pub(super) fn plan_mounts(volumes: &[(&Path, &Path)]) -> Vec<Mount> {
             ));
             continue;
         }
-        if !host.is_absolute() {
+        if !host.is_absolute() && !host.as_os_str().is_empty() {
             wrkflw_logging::warning(&format!(
                 "Kubernetes: mounting {} empty: host path '{}' is not absolute, \
                  and named volumes do not exist on a cluster",
@@ -489,6 +507,31 @@ mod tests {
         assert_eq!(main["args"][2], "echo $$$$ $$(date)");
         assert_eq!(main["env"][0]["value"], "a$$(HOME)b");
         assert_eq!(main["command"][0], "/bin/$$x");
+    }
+
+    #[test]
+    fn only_the_executors_own_directories_are_mirrored() {
+        let mirrored = |container: &str| {
+            Mount {
+                host: PathBuf::from("/h"),
+                container: PathBuf::from(container),
+            }
+            .mirrored()
+        };
+        assert!(mirrored("/github/workspace"));
+        assert!(mirrored("/github/workflow"));
+        assert!(!mirrored("/github/action"));
+        assert!(!mirrored("/github/workspace/cache"));
+        assert!(!mirrored("/github"));
+        assert!(!mirrored("/tmp"));
+    }
+
+    #[test]
+    fn plan_mounts_keeps_pod_only_volumes() {
+        let mounts = plan_mounts(&[(Path::new(""), Path::new("/scratch"))]);
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0].container, Path::new("/scratch"));
+        assert!(mounts[0].host.as_os_str().is_empty());
     }
 
     #[test]

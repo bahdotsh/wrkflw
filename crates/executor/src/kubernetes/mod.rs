@@ -1444,7 +1444,7 @@ mod tests {
 
     /// A runtime whose "kubectl" is a script playing a cluster: pods are
     /// directories under `work/pod`, and one step exits 3 after deleting
-    /// `deleted.txt` and writing `new.txt` in the `/ws` mount.
+    /// `deleted.txt` and writing `new.txt` in the workspace mount.
     #[cfg(unix)]
     fn runtime_with_fake_cluster(work: &Path) -> KubernetesRuntime {
         let script = work.join("kubectl.sh");
@@ -1464,8 +1464,8 @@ get)
     esac
     ;;
 logs)
-    rm "$work/pod/ws/deleted.txt"
-    echo made in the pod > "$work/pod/ws/new.txt"
+    rm "$work/pod/github/workspace/deleted.txt"
+    echo made in the pod > "$work/pod/github/workspace/new.txt"
     echo step output
     ;;
 exec)
@@ -1507,10 +1507,10 @@ esac
                 "ubuntu:22.04",
                 &["sh", "-c", "exit 3"],
                 &[],
-                Path::new("/ws"),
+                Path::new("/github/workspace"),
                 &[
-                    (ws.path(), Path::new("/ws")),
-                    (nested.path(), Path::new("/ws/sub")),
+                    (ws.path(), Path::new("/github/workspace")),
+                    (nested.path(), Path::new("/github/workspace/sub")),
                 ],
                 None,
             )
@@ -1535,7 +1535,7 @@ esac
         let order = [
             "create -f -",
             "rm -rf",
-            "/ws/sub -xof",
+            "/github/workspace/sub -xof",
             "touch /wrkflw-sync/ready",
             "logs ",
             "-cf - .",

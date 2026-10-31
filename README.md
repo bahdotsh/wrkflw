@@ -303,6 +303,8 @@ Things to know:
 - Mounts are copies. Job `container.volumes` directories are copied in and written back after each step, so parallel jobs sharing one do not see each other's changes and the last to finish wins. A file another process creates in that directory while a step runs is removed when the step ends, because the pod never held it. Single files and sockets cannot be mounted and are skipped with a warning, a socket inside a mounted directory fails the step, and named volumes start empty.
 - Synced files are owned by root in the pod, so run steps in images that run as root, as GitHub requires for container actions. Other users can read the workspace but not write to it, and namespaces enforcing the `restricted` Pod Security Standard are not supported.
 - Stdout and stderr come back as one stream, as Kubernetes logs them.
+- Helper containers declare small fixed CPU and memory requests and limits, so namespaces with a `ResourceQuota` accept them.
+- Kubernetes validates environment variable names itself, and older clusters reject names Docker accepts. Such a step fails when its pod is created.
 - Secrets reach the step as plain pod environment variables, visible to anyone who can read pods in that namespace. Pods do not mount a service account token.
 - `--platform` and `runs-on` work as elsewhere: they pick the image. Node placement comes from `--k8s-node-selector`.
 

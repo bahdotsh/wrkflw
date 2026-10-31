@@ -445,12 +445,14 @@ fn build_pod_manifest(config: &KubernetesConfig, input: &PodInput<'_>) -> Value 
         "image": config.helper_image(),
         "command": ["sh", "-c", format!("until [ -f {} ]; do sleep 0.2; done", READY_MARKER)],
         "volumeMounts": helper_mounts,
+        "resources": helper_resources(),
     });
     let sync = json!({
         "name": SYNC_CONTAINER,
         "image": config.helper_image(),
         "command": ["sh", "-c", "while true; do sleep 3600; done"],
         "volumeMounts": helper_mounts,
+        "resources": helper_resources(),
     });
 
     let mut spec = json!({
@@ -486,6 +488,16 @@ fn build_pod_manifest(config: &KubernetesConfig, input: &PodInput<'_>) -> Value 
             },
         },
         "spec": spec,
+    })
+}
+
+/// Requests and limits for the helper containers. They only run `sh` and
+/// `tar`, but a namespace with a `ResourceQuota` rejects any container that
+/// does not declare these, and there would be no flag to fix it with.
+fn helper_resources() -> Value {
+    json!({
+        "requests": { "cpu": "10m", "memory": "32Mi" },
+        "limits": { "cpu": "500m", "memory": "256Mi" },
     })
 }
 
@@ -1741,8 +1753,10 @@ mod tests {
         assert_eq!(resources["limits"]["nvidia.com/gpu"], "1");
         assert_eq!(resources["requests"]["nvidia.com/gpu"], "1");
         assert_eq!(resources["limits"]["memory"], "8Gi");
-        // Helpers never request accelerators.
-        assert!(spec["containers"][1]["resources"].is_null());
+        // Helpers never request accelerators, but do satisfy resource quotas.
+        for helper in [&spec["initContainers"][0], &spec["containers"][1]] {
+            assert_eq!(helper["resources"], helper_resources());
+        }
     }
 
     #[test]

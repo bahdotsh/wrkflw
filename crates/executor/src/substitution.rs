@@ -11,10 +11,27 @@ lazy_static! {
         Regex::new(r"\$\{\{\s*matrix\.([a-zA-Z0-9_]+)\s*\}\}").unwrap();
     static ref HASH_FILES_PATTERN: Regex =
         Regex::new(r"\$\{\{\s*hashFiles\(([^)]+)\)\s*\}\}").unwrap();
-    /// Matches any `${{ ... }}` expression. Handles single `}` inside format
-    /// placeholders like `{0}` by requiring the closing `}}` pair.
-    static ref EXPRESSION_PATTERN: Regex =
-        Regex::new(r"\$\{\{(?:[^}]|\}[^}])*\}\}").unwrap();
+    static ref HASH_FILES_CALL: Regex = Regex::new(r"(?i)\bhashFiles\(([^)]*)\)").unwrap();
+}
+
+/// Find the end of the `${{ ... }}` starting at `start`: the offset just past
+/// its closing `}}`. A `}}` inside a quoted string, as in
+/// `fromJSON('{"a":{"b":1}}')`, doesn't close the expression. If the quotes
+/// never balance, the first `}}` does.
+fn expression_end(text: &str, start: usize) -> Option<usize> {
+    let body_start = start + 3;
+    let body = &text[body_start..];
+    let mut in_string = false;
+    for (i, byte) in body.bytes().enumerate() {
+        match byte {
+            b'\'' => in_string = !in_string,
+            b'}' if !in_string && body.as_bytes().get(i + 1) == Some(&b'}') => {
+                return Some(body_start + i + 2);
+            }
+            _ => {}
+        }
+    }
+    body.find("}}").map(|i| body_start + i + 2)
 }
 
 /// Preprocesses a command string to replace GitHub-style matrix variable references
@@ -119,6 +136,29 @@ pub fn preprocess_hash_files(text: &str, workspace: &Path) -> Result<String, Str
     }
 }
 
+/// Replace `hashFiles(...)` calls inside an expression with their result as a
+/// string literal. The evaluator has no filesystem access, so this is how calls
+/// in `if:` conditions and compound expressions such as
+/// `format('k-{0}', hashFiles('a'))` get their value.
+pub fn expand_hash_files(expr: &str, workspace: &Path) -> Result<String, String> {
+    let mut output = String::with_capacity(expr.len());
+    let mut last = 0;
+    for caps in HASH_FILES_CALL.captures_iter(expr) {
+        let call = caps.get(0).expect("group 0 always exists");
+        // An odd number of quotes before the call means it's inside a string.
+        if expr[..call.start()].matches('\'').count() % 2 == 1 {
+            continue;
+        }
+        output.push_str(&expr[last..call.start()]);
+        output.push('\'');
+        output.push_str(&compute_hash_files(&caps[1], workspace)?);
+        output.push('\'');
+        last = call.end();
+    }
+    output.push_str(&expr[last..]);
+    Ok(output)
+}
+
 /// Compute a SHA-256 hash of the contents of all files matching the given glob patterns.
 ///
 /// `args_raw` is the raw argument string inside `hashFiles(...)`, e.g.
@@ -170,8 +210,9 @@ fn compute_hash_files(args_raw: &str, workspace: &Path) -> Result<String, String
     }
 
     if matched_files.is_empty() {
-        // GHA returns the SHA-256 of empty input when no files match
-        return Ok(format!("{:x}", Sha256::new().finalize()));
+        // GHA returns an empty string when no files match, which is what makes
+        // `if: hashFiles('x') != ''` work as an existence check.
+        return Ok(String::new());
     }
 
     // Sort for deterministic output (GHA sorts lexicographically)
@@ -213,26 +254,30 @@ pub fn preprocess_expressions(
     let result = preprocess_hash_files(text, workspace)?;
 
     // Evaluate all remaining ${{ ... }} expressions through the expression evaluator
-    let result = EXPRESSION_PATTERN
-        .replace_all(&result, |caps: &regex::Captures| {
-            let full_match = &caps[0];
-            // Extract the inner expression (strip "${{" and "}}")
-            let inner = &full_match[3..full_match.len() - 2];
-            match evaluate(inner, ctx) {
-                Ok(val) => val.to_output_string(),
-                Err(e) => {
-                    wrkflw_logging::debug(&format!(
-                        "Expression evaluation failed for '{}': {} — substituting empty string",
-                        inner.trim(),
-                        e
-                    ));
-                    String::new()
-                }
+    let mut output = String::with_capacity(result.len());
+    let mut rest = result.as_str();
+    while let Some(start) = rest.find("${{") {
+        let Some(end) = expression_end(rest, start) else {
+            break;
+        };
+        output.push_str(&rest[..start]);
+        // Extract the inner expression (strip "${{" and "}}")
+        let inner = expand_hash_files(&rest[start + 3..end - 2], workspace)?;
+        match evaluate(&inner, ctx) {
+            Ok(val) => output.push_str(&val.to_output_string()),
+            Err(e) => {
+                wrkflw_logging::debug(&format!(
+                    "Expression evaluation failed for '{}': {} — substituting empty string",
+                    inner.trim(),
+                    e
+                ));
             }
-        })
-        .into_owned();
+        }
+        rest = &rest[end..];
+    }
+    output.push_str(rest);
 
-    Ok(result)
+    Ok(output)
 }
 
 #[cfg(test)]
@@ -349,16 +394,13 @@ mod tests {
     }
 
     #[test]
-    fn hash_files_no_matches_returns_hash_of_empty() {
+    fn hash_files_no_matches_returns_empty_string() {
         let dir = tempdir().unwrap();
 
         let text = "${{ hashFiles('nonexistent-*.xyz') }}";
         let result = preprocess_hash_files(text, dir.path()).unwrap();
 
-        // GHA returns SHA-256 of empty input when no files match
-        let expected = format!("{:x}", Sha256::new().finalize());
-        assert_eq!(result, expected);
-        assert_eq!(result.len(), 64);
+        assert_eq!(result, "");
     }
 
     #[test]
@@ -825,5 +867,55 @@ mod tests {
             .get("node-version")
             .unwrap();
         assert_eq!(resolved, "${{ matrix.node }}");
+    }
+
+    #[test]
+    fn preprocess_expressions_ignores_closing_braces_in_strings() {
+        let dir = tempdir().unwrap();
+        let (matrix, steps, env) = (None, HashMap::new(), HashMap::new());
+        let ctx = make_ctx(&matrix, &steps, &env);
+        for (text, expected) in [
+            (r#"${{ fromJSON('{"a":{"b":"deep"}}').a.b }}"#, "deep"),
+            ("${{ format('{{x}} {0}', 'v') }}!", "{x} v!"),
+            ("a ${{ 'it''s }}' }} b ${{ 1 }} c", "a it's }} b 1 c"),
+            ("${{ 'unbalanced }} tail", " tail"),
+            ("left ${{ open", "left ${{ open"),
+        ] {
+            assert_eq!(
+                preprocess_expressions(text, dir.path(), &ctx).unwrap(),
+                expected,
+                "{}",
+                text
+            );
+        }
+    }
+
+    #[test]
+    fn hash_files_works_inside_compound_expressions() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("a.lock"), "content").unwrap();
+        let (matrix, steps, env) = (None, HashMap::new(), HashMap::new());
+        let ctx = make_ctx(&matrix, &steps, &env);
+        let eval = |text| preprocess_expressions(text, dir.path(), &ctx).unwrap();
+
+        let hash = eval("${{ hashFiles('a.lock') }}");
+        assert_eq!(hash.len(), 64);
+        assert_eq!(
+            eval("${{ format('k-{0}', hashFiles('a.lock')) }}"),
+            format!("k-{}", hash)
+        );
+        assert_eq!(eval("${{ hashFiles('a.lock') != '' }}"), "true");
+        assert_eq!(eval("${{ hashFiles('missing.lock') != '' }}"), "false");
+        assert_eq!(eval("${{ 'hashFiles(''a'')' }}"), "hashFiles('a')");
+    }
+
+    #[test]
+    fn expand_hash_files_rewrites_conditions() {
+        let dir = tempdir().unwrap();
+        assert_eq!(
+            expand_hash_files("hashFiles('none') != ''", dir.path()).unwrap(),
+            "'' != ''"
+        );
+        assert!(expand_hash_files("hashFiles('../x') != ''", dir.path()).is_err());
     }
 }

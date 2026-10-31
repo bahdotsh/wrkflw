@@ -16,6 +16,7 @@ use crate::action_resolver;
 use crate::dependency;
 use crate::docker;
 use crate::environment;
+use crate::kubernetes::{self, KubernetesConfig};
 use crate::podman;
 use wrkflw_logging;
 use wrkflw_matrix::MatrixCombination;
@@ -101,6 +102,7 @@ async fn execute_github_workflow(
     let runtime = initialize_runtime(
         config.runtime_type.clone(),
         config.preserve_containers_on_failure,
+        &config.kubernetes,
     )?;
 
     // Create a temporary workspace directory
@@ -165,6 +167,7 @@ async fn execute_github_workflow(
             RuntimeType::SecureEmulation => "secure_emulation".to_string(),
             RuntimeType::Docker => "docker".to_string(),
             RuntimeType::Podman => "podman".to_string(),
+            RuntimeType::Kubernetes => "kubernetes".to_string(),
         },
     );
 
@@ -365,6 +368,7 @@ async fn execute_gitlab_pipeline(
     let runtime = initialize_runtime(
         config.runtime_type.clone(),
         config.preserve_containers_on_failure,
+        &config.kubernetes,
     )?;
 
     // Create a temporary workspace directory
@@ -383,6 +387,7 @@ async fn execute_gitlab_pipeline(
             RuntimeType::SecureEmulation => "secure_emulation".to_string(),
             RuntimeType::Docker => "docker".to_string(),
             RuntimeType::Podman => "podman".to_string(),
+            RuntimeType::Kubernetes => "kubernetes".to_string(),
         },
     );
 
@@ -612,11 +617,13 @@ pub fn detect_runtime(runtime_type: RuntimeType) -> RuntimeType {
 fn initialize_runtime(
     runtime_type: RuntimeType,
     preserve_containers_on_failure: bool,
+    kubernetes: &KubernetesConfig,
 ) -> Result<Box<dyn ContainerRuntime>, ExecutionError> {
     match runtime_type {
         RuntimeType::Auto => initialize_runtime(
             detect_runtime(RuntimeType::Auto),
             preserve_containers_on_failure,
+            kubernetes,
         ),
         RuntimeType::Docker => {
             if docker::is_available() {
@@ -645,6 +652,22 @@ fn initialize_runtime(
                 Ok(Box::new(emulation::EmulationRuntime::new()))
             }
         }
+        // Kubernetes is never auto-detected and never silently replaced:
+        // a job meant for a GPU node must not quietly run on the laptop.
+        RuntimeType::Kubernetes => {
+            if kubernetes::is_available_with(kubernetes) {
+                Ok(Box::new(kubernetes::KubernetesRuntime::new(
+                    kubernetes.clone(),
+                    preserve_containers_on_failure,
+                )))
+            } else {
+                Err(ExecutionError::Runtime(format!(
+                    "Kubernetes cluster is not reachable ({}); check kubectl, \
+                     KUBECONFIG and --k8s-context",
+                    kubernetes.describe()
+                )))
+            }
+        }
         RuntimeType::Emulation => Ok(Box::new(emulation::EmulationRuntime::new())),
         RuntimeType::SecureEmulation => Ok(Box::new(
             wrkflw_runtime::secure_emulation::SecureEmulationRuntime::new(),
@@ -659,6 +682,9 @@ pub enum RuntimeType {
     Auto,
     Docker,
     Podman,
+    /// Run each step as a pod in a Kubernetes cluster. Selected explicitly
+    /// only; see `--k8s-*` flags and [`KubernetesConfig`].
+    Kubernetes,
     Emulation,
     SecureEmulation,
 }
@@ -676,6 +702,8 @@ pub struct ExecutionConfig {
     /// lowercase, as [`parse_platform_override`] returns them, because labels
     /// match case-insensitively.
     pub platform_overrides: HashMap<String, String>,
+    /// Cluster settings used when `runtime_type` is [`RuntimeType::Kubernetes`].
+    pub kubernetes: KubernetesConfig,
 }
 
 /// Parse a `LABEL=IMAGE` runner override, as given to `--platform`.
@@ -4445,12 +4473,12 @@ fn prepare_step_container_context(
 
 type VolumePathPair = (PathBuf, PathBuf);
 
-/// True when steps execute inside a Docker/Podman container rather than on
-/// the host. `Auto` is resolved to a concrete runtime before this is seeded.
+/// True when steps execute inside a Docker/Podman/Kubernetes container
+/// rather than on the host. `Auto` is resolved to a concrete runtime before this is seeded.
 fn uses_container_runtime(step_env: &HashMap<String, String>) -> bool {
     step_env
         .get("WRKFLW_RUNTIME_MODE")
-        .map(|m| m == "docker" || m == "podman")
+        .map(|m| m == "docker" || m == "podman" || m == "kubernetes")
         .unwrap_or(false)
 }
 
@@ -10891,7 +10919,7 @@ runs:
     fn initialize_runtime_auto_does_not_panic() {
         // Auto should always succeed (falls back to emulation when nothing is available).
         // This exercises the full cascade on whatever the test environment provides.
-        let result = initialize_runtime(RuntimeType::Auto, false);
+        let result = initialize_runtime(RuntimeType::Auto, false, &KubernetesConfig::default());
         assert!(
             result.is_ok(),
             "Auto runtime initialization returned Err: {:?}",

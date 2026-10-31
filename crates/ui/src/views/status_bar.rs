@@ -65,6 +65,7 @@ pub fn render_status_bar(f: &mut Frame<'_>, app: &App, area: Rect) {
         RuntimeType::Auto => BadgeKind::Emulation,
         RuntimeType::Docker => BadgeKind::Docker,
         RuntimeType::Podman => BadgeKind::Podman,
+        RuntimeType::Kubernetes => BadgeKind::Kubernetes,
         RuntimeType::SecureEmulation => BadgeKind::Secure,
         RuntimeType::Emulation => BadgeKind::Emulation,
     };

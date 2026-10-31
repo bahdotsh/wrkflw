@@ -29,6 +29,7 @@ pub struct App {
     pub validation_mode: bool,
     pub preserve_containers_on_failure: bool,
     pub platform_overrides: HashMap<String, String>,
+    pub kubernetes: wrkflw_executor::KubernetesConfig,
     pub show_action_messages: bool,
     pub execution_queue: Vec<QueuedExecution>, // Workflows queued for execution
     pub current_execution: Option<usize>,
@@ -329,6 +330,7 @@ impl App {
         preserve_containers_on_failure: bool,
         show_action_messages: bool,
         platform_overrides: HashMap<String, String>,
+        kubernetes: wrkflw_executor::KubernetesConfig,
     ) -> App {
         let mut workflow_list_state = ListState::default();
         workflow_list_state.select(Some(0));
@@ -484,12 +486,22 @@ impl App {
                     RuntimeType::Podman
                 }
             }
+            // Never replaced by emulation: a job meant for the cluster must
+            // not quietly run on the host. The status bar shows reachability.
+            RuntimeType::Kubernetes => RuntimeType::Kubernetes,
             RuntimeType::Emulation => RuntimeType::Emulation,
             RuntimeType::SecureEmulation => RuntimeType::SecureEmulation,
         };
 
         // If we're still Docker/Podman after the availability check above, it was available
-        let runtime_available = matches!(runtime_type, RuntimeType::Docker | RuntimeType::Podman);
+        let runtime_available = match runtime_type {
+            RuntimeType::Docker | RuntimeType::Podman => true,
+            RuntimeType::Kubernetes => wrkflw_utils::fd::with_stderr_to_null(|| {
+                wrkflw_executor::kubernetes::is_available_with(&kubernetes)
+            })
+            .unwrap_or(false),
+            _ => false,
+        };
 
         App {
             workflows: Vec::new(),
@@ -501,6 +513,7 @@ impl App {
             validation_mode: false,
             preserve_containers_on_failure,
             platform_overrides,
+            kubernetes,
             show_action_messages,
             execution_queue: Vec::new(),
             current_execution: None,
@@ -587,16 +600,13 @@ impl App {
         self.runtime_type = match self.runtime_type {
             RuntimeType::Auto => RuntimeType::Docker,
             RuntimeType::Docker => RuntimeType::Podman,
-            RuntimeType::Podman => RuntimeType::SecureEmulation,
+            RuntimeType::Podman => RuntimeType::Kubernetes,
+            RuntimeType::Kubernetes => RuntimeType::SecureEmulation,
             RuntimeType::SecureEmulation => RuntimeType::Emulation,
             RuntimeType::Emulation => RuntimeType::Docker,
         };
         // Re-check availability for the new runtime immediately
-        self.runtime_available = match self.runtime_type {
-            RuntimeType::Docker => wrkflw_executor::docker::is_available(),
-            RuntimeType::Podman => wrkflw_executor::podman::is_available(),
-            _ => false,
-        };
+        self.runtime_available = self.probe_runtime_available();
         self.last_availability_check = Instant::now();
         self.add_timestamped_log(&format!("Switched to {} mode", self.runtime_type_name()));
     }
@@ -960,11 +970,24 @@ impl App {
         wrkflw_logging::info(&format!("Switched to {} mode", mode));
     }
 
+    /// Whether the selected container runtime answers right now.
+    fn probe_runtime_available(&self) -> bool {
+        match self.runtime_type {
+            RuntimeType::Docker => wrkflw_executor::docker::is_available(),
+            RuntimeType::Podman => wrkflw_executor::podman::is_available(),
+            RuntimeType::Kubernetes => {
+                wrkflw_executor::kubernetes::is_available_with(&self.kubernetes)
+            }
+            _ => false,
+        }
+    }
+
     pub fn runtime_type_name(&self) -> &str {
         match self.runtime_type {
             RuntimeType::Auto => "Auto",
             RuntimeType::Docker => "Docker",
             RuntimeType::Podman => "Podman",
+            RuntimeType::Kubernetes => "Kubernetes",
             RuntimeType::SecureEmulation => "Secure Emulation",
             RuntimeType::Emulation => "Emulation (Unsafe)",
         }
@@ -1629,11 +1652,7 @@ impl App {
             // Refresh container runtime availability every 30 seconds
             if now.duration_since(self.last_availability_check) >= Duration::from_secs(30) {
                 self.last_availability_check = now;
-                self.runtime_available = match self.runtime_type {
-                    RuntimeType::Docker => wrkflw_executor::docker::is_available(),
-                    RuntimeType::Podman => wrkflw_executor::podman::is_available(),
-                    _ => false,
-                };
+                self.runtime_available = self.probe_runtime_available();
             }
 
             true
@@ -2768,7 +2787,14 @@ mod tests {
 
     fn make_app() -> App {
         let (tx, _rx) = mpsc::channel();
-        let mut app = App::new(RuntimeType::Emulation, tx, false, false, HashMap::new());
+        let mut app = App::new(
+            RuntimeType::Emulation,
+            tx,
+            false,
+            false,
+            HashMap::new(),
+            Default::default(),
+        );
         app.workflows = vec![
             Workflow {
                 name: "ci".to_string(),

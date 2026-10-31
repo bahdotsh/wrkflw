@@ -349,6 +349,7 @@ mod tests {
                 show_action_messages: false,
                 target_job: None,
                 platform_overrides: Default::default(),
+                kubernetes: Default::default(),
             },
         );
         WorkflowWatcher::from_config(cfg)
@@ -635,6 +636,7 @@ mod tests {
                 show_action_messages: false,
                 target_job: None,
                 platform_overrides: Default::default(),
+                kubernetes: Default::default(),
             },
         )
         .with_debounce(Duration::from_millis(50));
@@ -779,6 +781,7 @@ mod tests {
                 show_action_messages: false,
                 target_job: None,
                 platform_overrides: Default::default(),
+                kubernetes: Default::default(),
             },
         );
         let watcher = WorkflowWatcher::from_config(cfg);
@@ -897,6 +900,7 @@ mod tests {
                 show_action_messages: false,
                 target_job: None,
                 platform_overrides: Default::default(),
+                kubernetes: Default::default(),
             },
         )
         .with_debounce(Duration::from_secs(5));
@@ -1052,6 +1056,7 @@ mod tests {
                 show_action_messages: false,
                 target_job: None,
                 platform_overrides: Default::default(),
+                kubernetes: Default::default(),
             },
         )
         .with_debounce(Duration::from_millis(50));

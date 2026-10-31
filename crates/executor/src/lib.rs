@@ -11,6 +11,7 @@ pub mod engine;
 pub mod environment;
 pub mod expression;
 pub mod github_env_files;
+pub mod kubernetes;
 pub mod podman;
 pub mod substitution;
 pub(crate) mod workflow_commands;
@@ -21,3 +22,4 @@ pub use engine::{
     detect_runtime, execute_workflow, parse_platform_override, ExecutionConfig, JobResult,
     JobStatus, RuntimeType, StepResult, StepStatus,
 };
+pub use kubernetes::{parse_key_value as parse_k8s_key_value, KubernetesConfig};

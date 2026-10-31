@@ -1,4 +1,4 @@
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
@@ -166,9 +166,25 @@ where
     }
 }
 
+/// The inverse of [`deserialize_matrix`]: an expression is written back as the
+/// string it came from, since `MatrixConfig` on its own would drop it.
+fn serialize_matrix<S>(matrix: &Option<MatrixConfig>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    match matrix.as_ref().and_then(|m| m.expression.as_ref()) {
+        Some(expr) => serializer.serialize_some(expr),
+        None => matrix.serialize(serializer),
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize, Default)]
 pub struct Strategy {
-    #[serde(default, deserialize_with = "deserialize_matrix")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_matrix",
+        serialize_with = "serialize_matrix"
+    )]
     pub matrix: Option<MatrixConfig>,
     #[serde(default, rename = "fail-fast")]
     pub fail_fast: Option<bool>,
@@ -845,6 +861,30 @@ jobs:
         // Job without defaults
         let no_defaults_job = parsed.jobs.get("no-defaults").unwrap();
         assert!(no_defaults_job.defaults.is_none());
+    }
+
+    #[test]
+    fn strategy_matrix_can_be_one_expression() {
+        let expr = "${{ fromJSON(needs.setup.outputs.matrix) }}";
+        let strategy: Strategy =
+            serde_yaml::from_str(&format!("fail-fast: false\nmatrix: {}\n", expr)).unwrap();
+        let matrix = strategy.matrix.as_ref().unwrap();
+        assert_eq!(matrix.expression.as_deref(), Some(expr));
+        assert!(matrix.parameters.is_empty());
+
+        let yaml = serde_yaml::to_string(&strategy).unwrap();
+        let reparsed: Strategy = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(reparsed.matrix.unwrap().expression.as_deref(), Some(expr));
+    }
+
+    #[test]
+    fn strategy_matrix_must_be_a_mapping_or_an_expression() {
+        assert!(serde_yaml::from_str::<Strategy>("matrix: nope\n").is_err());
+
+        let strategy: Strategy = serde_yaml::from_str("matrix:\n  os: [a, b]\n").unwrap();
+        let matrix = strategy.matrix.unwrap();
+        assert_eq!(matrix.expression, None);
+        assert!(matrix.parameters.contains_key("os"));
     }
 
     #[test]

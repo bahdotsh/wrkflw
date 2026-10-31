@@ -1888,6 +1888,27 @@ async fn build_combined_runtime_image(
 fn action_context_hash(dockerfile: &Path, context_dir: &Path) -> std::io::Result<String> {
     use sha2::{Digest, Sha256};
 
+    /// A `.dockerignore` may well exclude what cannot be read, and the build
+    /// reports anything it does need. Only the build can tell which it is.
+    fn skip_if_unreadable(
+        result: std::io::Result<()>,
+        path: &Path,
+        hasher: &mut Sha256,
+    ) -> std::io::Result<()> {
+        match result {
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                wrkflw_logging::warning(&format!(
+                    "Leaving {} out of the action image's tag: {}",
+                    path.display(),
+                    e
+                ));
+                hasher.update(b"unreadable");
+                Ok(())
+            }
+            other => other,
+        }
+    }
+
     fn visit(dir: &Path, rel: &Path, hasher: &mut Sha256) -> std::io::Result<()> {
         let mut entries = std::fs::read_dir(dir)?.collect::<std::io::Result<Vec<_>>>()?;
         entries.sort_by_key(|entry| entry.file_name());
@@ -1902,7 +1923,7 @@ fn action_context_hash(dockerfile: &Path, context_dir: &Path) -> std::io::Result
             hasher.update([0]);
             if file_type.is_dir() {
                 hasher.update(b"d");
-                visit(&path, &rel, hasher)?;
+                skip_if_unreadable(visit(&path, &rel, hasher), &path, hasher)?;
             } else if file_type.is_symlink() {
                 hasher.update(b"l");
                 hasher.update(std::fs::read_link(&path)?.to_string_lossy().as_bytes());
@@ -1913,9 +1934,11 @@ fn action_context_hash(dockerfile: &Path, context_dir: &Path) -> std::io::Result
                     use std::os::unix::fs::PermissionsExt;
                     hasher.update(entry.metadata()?.permissions().mode().to_le_bytes());
                 }
-                let body = std::fs::read(&path)?;
-                hasher.update((body.len() as u64).to_le_bytes());
-                hasher.update(&body);
+                let body = std::fs::read(&path).map(|body| {
+                    hasher.update((body.len() as u64).to_le_bytes());
+                    hasher.update(&body);
+                });
+                skip_if_unreadable(body, &path, hasher)?;
             }
         }
         Ok(())
@@ -7172,6 +7195,22 @@ runs:
         assert_eq!(hash(&first), hash(&same));
 
         assert_ne!(hash(&first), hash(&write_action("echo two")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn action_context_hash_survives_an_unreadable_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("Dockerfile"), "FROM alpine\n").unwrap();
+        let secret = dir.path().join("secret");
+        fs::write(&secret, "x").unwrap();
+        fs::set_permissions(&secret, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let hash = action_context_hash(&dir.path().join("Dockerfile"), dir.path());
+
+        fs::set_permissions(&secret, fs::Permissions::from_mode(0o644)).unwrap();
+        hash.unwrap();
     }
 
     #[test]

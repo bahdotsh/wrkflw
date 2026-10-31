@@ -161,14 +161,7 @@ async fn execute_github_workflow(
     // Add runtime mode to environment
     env_context.insert(
         "WRKFLW_RUNTIME_MODE".to_string(),
-        match config.runtime_type {
-            RuntimeType::Auto => "auto".to_string(),
-            RuntimeType::Emulation => "emulation".to_string(),
-            RuntimeType::SecureEmulation => "secure_emulation".to_string(),
-            RuntimeType::Docker => "docker".to_string(),
-            RuntimeType::Podman => "podman".to_string(),
-            RuntimeType::Kubernetes => "kubernetes".to_string(),
-        },
+        config.runtime_type.mode_name().to_string(),
     );
 
     // show=true means hide=false (inverted for the env var)
@@ -381,14 +374,7 @@ async fn execute_gitlab_pipeline(
     // Add runtime mode to environment
     env_context.insert(
         "WRKFLW_RUNTIME_MODE".to_string(),
-        match config.runtime_type {
-            RuntimeType::Auto => "auto".to_string(),
-            RuntimeType::Emulation => "emulation".to_string(),
-            RuntimeType::SecureEmulation => "secure_emulation".to_string(),
-            RuntimeType::Docker => "docker".to_string(),
-            RuntimeType::Podman => "podman".to_string(),
-            RuntimeType::Kubernetes => "kubernetes".to_string(),
-        },
+        config.runtime_type.mode_name().to_string(),
     );
 
     // Setup environment files
@@ -687,6 +673,20 @@ pub enum RuntimeType {
     Kubernetes,
     Emulation,
     SecureEmulation,
+}
+
+impl RuntimeType {
+    /// The value steps see in `WRKFLW_RUNTIME_MODE`.
+    pub fn mode_name(&self) -> &'static str {
+        match self {
+            RuntimeType::Auto => "auto",
+            RuntimeType::Emulation => "emulation",
+            RuntimeType::SecureEmulation => "secure_emulation",
+            RuntimeType::Docker => "docker",
+            RuntimeType::Podman => "podman",
+            RuntimeType::Kubernetes => "kubernetes",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -7040,6 +7040,23 @@ runs:
 
     use std::sync::{Arc, Mutex};
     use wrkflw_runtime::container::{ContainerError, ContainerOutput};
+
+    #[test]
+    fn mode_name_is_what_container_detection_expects() {
+        for runtime in [
+            RuntimeType::Docker,
+            RuntimeType::Podman,
+            RuntimeType::Kubernetes,
+        ] {
+            let mut env = HashMap::new();
+            env.insert(
+                "WRKFLW_RUNTIME_MODE".to_string(),
+                runtime.mode_name().to_string(),
+            );
+            assert!(uses_container_runtime(&env), "{:?}", runtime);
+        }
+        assert_eq!(RuntimeType::SecureEmulation.mode_name(), "secure_emulation");
+    }
 
     /// Records all `run_container` calls for later assertion.
     #[derive(Clone, Default)]

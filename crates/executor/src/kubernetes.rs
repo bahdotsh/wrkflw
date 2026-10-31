@@ -24,7 +24,7 @@ use async_trait::async_trait;
 use once_cell::sync::Lazy;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::io;
+use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -47,6 +47,9 @@ pub const DEFAULT_TIMEOUT_SECS: u64 = 3600;
 const DEADLINE_MARGIN_SECS: u64 = 30;
 
 const AVAILABILITY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How much of a sync's stderr is kept for its error message.
+const MAX_STDERR_BYTES: usize = 64 * 1024;
 
 const MAIN_CONTAINER: &str = "main";
 const WAIT_CONTAINER: &str = "wrkflw-wait";
@@ -1061,6 +1064,31 @@ impl KubernetesRuntime {
     }
 }
 
+/// Read `child`'s stderr to the end on its own thread, keeping the first
+/// [`MAX_STDERR_BYTES`].
+///
+/// Whoever is busy with the child's stdin or stdout cannot also read stderr.
+/// A child that fills that pipe would block with us blocked on it in turn,
+/// until `--k8s-timeout` ended the step.
+fn drain_stderr(child: &mut std::process::Child) -> std::thread::JoinHandle<String> {
+    let stderr = child.stderr.take();
+    std::thread::spawn(move || {
+        let Some(mut stderr) = stderr else {
+            return String::new();
+        };
+        let mut kept = Vec::new();
+        let mut buf = [0u8; 8192];
+        while let Ok(n) = stderr.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            let room = MAX_STDERR_BYTES - kept.len();
+            kept.extend_from_slice(&buf[..n.min(room)]);
+        }
+        String::from_utf8_lossy(&kept).trim().to_string()
+    })
+}
+
 /// Blocking: tar `mount.host` and pipe it into `tar -x` in the wait container.
 fn copy_dir_into_pod(
     kubectl_args: &[String],
@@ -1068,60 +1096,21 @@ fn copy_dir_into_pod(
     mount: &Mount,
 ) -> Result<(), ContainerError> {
     let dest = mount.container.to_string_lossy().to_string();
-    let mut child = std::process::Command::new("kubectl")
-        .args(kubectl_args)
-        .args([
-            "exec",
-            "-i",
-            pod,
-            "-c",
-            WAIT_CONTAINER,
-            "--",
-            "tar",
-            "-C",
-            &dest,
-            "-xof",
-            "-",
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| {
-            ContainerError::ContainerStart(format!("Failed to spawn kubectl exec: {}", e))
-        })?;
-
-    let stdin = child.stdin.take().ok_or_else(|| {
-        ContainerError::ContainerExecution("kubectl exec stdin was not captured".to_string())
-    })?;
-    let mut builder = tar::Builder::new(stdin);
-    // Keep mtimes and modes so tools comparing timestamps behave as they would
-    // on a bind mount. The host's uid means nothing in the pod, so `tar -xo`
-    // above discards it. Symlinks are shipped as symlinks, not followed.
-    builder.mode(tar::HeaderMode::Complete);
-    builder.follow_symlinks(false);
-    let archived = builder
-        .append_dir_all(".", &mount.host)
-        .and_then(|_| builder.into_inner())
-        .map(drop);
-
-    let output = child.wait_with_output().map_err(|e| {
-        ContainerError::ContainerExecution(format!("kubectl exec did not complete: {}", e))
-    })?;
-    if !output.status.success() {
-        return Err(ContainerError::ContainerExecution(format!(
-            "syncing {} into the pod failed: {}",
-            mount.host.display(),
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
-    }
-    archived.map_err(|e| {
-        ContainerError::ContainerExecution(format!(
-            "failed to archive {}: {}",
-            mount.host.display(),
-            e
-        ))
-    })?;
+    let mut command = std::process::Command::new("kubectl");
+    command.args(kubectl_args).args([
+        "exec",
+        "-i",
+        pod,
+        "-c",
+        WAIT_CONTAINER,
+        "--",
+        "tar",
+        "-C",
+        &dest,
+        "-xof",
+        "-",
+    ]);
+    stream_dir_into(command, mount)?;
     wrkflw_logging::debug(&format!(
         "Kubernetes: synced {} -> {}:{}",
         mount.host.display(),
@@ -1131,17 +1120,62 @@ fn copy_dir_into_pod(
     Ok(())
 }
 
-/// Make `host` match the tar archive in `reader`, as if the pod's directory had
-/// been bind mounted: entries are written, and whatever the archive no longer
-/// holds is removed, so a step's `rm` or `mv` is seen by the next step.
-///
-/// `keep` lists paths in `tar --exclude` form that belong to nested mounts;
-/// they are absent from the archive on purpose and must survive the prune.
+/// Blocking: write `mount.host` as a tar archive to `command`'s stdin.
+fn stream_dir_into(
+    mut command: std::process::Command,
+    mount: &Mount,
+) -> Result<(), ContainerError> {
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| {
+            ContainerError::ContainerStart(format!("Failed to spawn kubectl exec: {}", e))
+        })?;
+    let stderr = drain_stderr(&mut child);
+
+    let stdin = child.stdin.take().ok_or_else(|| {
+        ContainerError::ContainerExecution("kubectl exec stdin was not captured".to_string())
+    })?;
+    let mut builder = tar::Builder::new(stdin);
+    // Keep mtimes and modes so tools comparing timestamps behave as they would
+    // on a bind mount. The host's uid means nothing in the pod, so `tar -xo`
+    // discards it. Symlinks are shipped as symlinks, not followed.
+    builder.mode(tar::HeaderMode::Complete);
+    builder.follow_symlinks(false);
+    let archived = builder
+        .append_dir_all(".", &mount.host)
+        .and_then(|_| builder.into_inner())
+        .map(drop);
+
+    let status = child.wait().map_err(|e| {
+        ContainerError::ContainerExecution(format!("kubectl exec did not complete: {}", e))
+    })?;
+    let stderr = stderr.join().unwrap_or_default();
+    if !status.success() {
+        return Err(ContainerError::ContainerExecution(format!(
+            "syncing {} into the pod failed: {}",
+            mount.host.display(),
+            stderr
+        )));
+    }
+    archived.map_err(|e| {
+        ContainerError::ContainerExecution(format!(
+            "failed to archive {}: {}",
+            mount.host.display(),
+            e
+        ))
+    })
+}
+
+/// Write the tar archive in `reader` onto `host`, returning every path it held.
 ///
 /// The archive comes from a workflow-controlled pod, so nothing here follows a
-/// symlink or leaves `host`. Pruning runs last: a stream that breaks halfway
-/// returns an error before anything has been deleted.
-fn unpack_mirroring<R: io::Read>(reader: R, host: &Path, keep: &[String]) -> io::Result<()> {
+/// symlink or leaves `host`. A clean return does not prove the archive is
+/// whole: tar has no length header, so a stream that stops between two entries
+/// reads as a normal end of file. Only the sender's exit status can tell.
+fn unpack_archive<R: io::Read>(reader: R, host: &Path) -> io::Result<HashSet<PathBuf>> {
     let mut archive = tar::Archive::new(reader);
     let mut seen: HashSet<PathBuf> = HashSet::new();
     let mut directories = Vec::new();
@@ -1172,12 +1206,21 @@ fn unpack_mirroring<R: io::Read>(reader: R, host: &Path, keep: &[String]) -> io:
     for mut dir in directories {
         dir.unpack_in(host)?;
     }
+    Ok(seen)
+}
 
+/// Remove what the pod no longer holds, as if its directory had been bind
+/// mounted, so a step's `rm` or `mv` is seen by the next step.
+///
+/// `keep` lists paths in `tar --exclude` form that belong to nested mounts;
+/// they are absent from the archive on purpose and must survive. Call this
+/// only once the whole archive is known to have arrived.
+fn prune_to_archive(host: &Path, seen: &HashSet<PathBuf>, keep: &[String]) -> io::Result<()> {
     let keep: Vec<PathBuf> = keep
         .iter()
         .filter_map(|p| safe_relative_path(Path::new(p)))
         .collect();
-    prune_unlisted(host, Path::new(""), &seen, &keep)
+    prune_unlisted(host, Path::new(""), seen, &keep)
 }
 
 /// `path` without `.` components, or `None` if it could leave its root.
@@ -1243,8 +1286,12 @@ fn prune_unlisted(
             continue;
         } else if file_type.is_dir() {
             std::fs::remove_dir_all(entry.path())
-        } else {
+        } else if file_type.is_file() || file_type.is_symlink() {
             std::fs::remove_file(entry.path())
+        } else {
+            // tar cannot carry a socket, so one that appeared on the host
+            // during the step says nothing about what the step deleted.
+            continue;
         };
         // A leftover file is not worth failing a step that already succeeded.
         if let Err(e) = removed {
@@ -1279,41 +1326,12 @@ fn copy_dir_out_of_pod(
     }
     tar_args.extend(["-cf".into(), "-".into(), ".".into()]);
 
-    let mut child = std::process::Command::new("kubectl")
+    let mut command = std::process::Command::new("kubectl");
+    command
         .args(kubectl_args)
         .args(["exec", pod, "-c", SYNC_CONTAINER, "--"])
-        .args(&tar_args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| {
-            ContainerError::ContainerStart(format!("Failed to spawn kubectl exec: {}", e))
-        })?;
-
-    let stdout = child.stdout.take().ok_or_else(|| {
-        ContainerError::ContainerExecution("kubectl exec stdout was not captured".to_string())
-    })?;
-    let unpacked = unpack_mirroring(stdout, &mount.host, excludes);
-
-    let output = child.wait_with_output().map_err(|e| {
-        ContainerError::ContainerExecution(format!("kubectl exec did not complete: {}", e))
-    })?;
-    if !output.status.success() {
-        return Err(ContainerError::ContainerExecution(format!(
-            "syncing {} back from the pod failed: {}",
-            src,
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
-    }
-    unpacked.map_err(|e| {
-        ContainerError::ContainerExecution(format!(
-            "failed to unpack {} into {}: {}",
-            src,
-            mount.host.display(),
-            e
-        ))
-    })?;
+        .args(&tar_args);
+    mirror_from(command, &src, &mount.host, excludes)?;
     wrkflw_logging::debug(&format!(
         "Kubernetes: synced {}:{} -> {}",
         pod,
@@ -1321,6 +1339,51 @@ fn copy_dir_out_of_pod(
         mount.host.display()
     ));
     Ok(())
+}
+
+/// Blocking: unpack the tar archive `command` prints onto `host`, then prune.
+/// `src` only names the source in errors.
+fn mirror_from(
+    mut command: std::process::Command,
+    src: &str,
+    host: &Path,
+    excludes: &[String],
+) -> Result<(), ContainerError> {
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| {
+            ContainerError::ContainerStart(format!("Failed to spawn kubectl exec: {}", e))
+        })?;
+    let stderr = drain_stderr(&mut child);
+
+    let stdout = child.stdout.take().ok_or_else(|| {
+        ContainerError::ContainerExecution("kubectl exec stdout was not captured".to_string())
+    })?;
+    let unpacked = unpack_archive(stdout, host);
+
+    let status = child.wait().map_err(|e| {
+        ContainerError::ContainerExecution(format!("kubectl exec did not complete: {}", e))
+    })?;
+    let stderr = stderr.join().unwrap_or_default();
+    if !status.success() {
+        return Err(ContainerError::ContainerExecution(format!(
+            "syncing {} back from the pod failed: {}",
+            src, stderr
+        )));
+    }
+    let unpack_error = |e: io::Error| {
+        ContainerError::ContainerExecution(format!(
+            "failed to unpack {} into {}: {}",
+            src,
+            host.display(),
+            e
+        ))
+    };
+    let seen = unpacked.map_err(unpack_error)?;
+    prune_to_archive(host, &seen, excludes).map_err(unpack_error)
 }
 
 #[async_trait]
@@ -1770,6 +1833,12 @@ mod tests {
         assert!(!Path::new("named-volume").exists());
     }
 
+    /// What [`mirror_from`] does once the stream is known to be complete.
+    fn unpack_mirroring<R: io::Read>(reader: R, host: &Path, keep: &[String]) -> io::Result<()> {
+        let seen = unpack_archive(reader, host)?;
+        prune_to_archive(host, &seen, keep)
+    }
+
     /// Tar builder for the mirroring tests.
     fn archive(build: impl FnOnce(&mut tar::Builder<Vec<u8>>)) -> Vec<u8> {
         let mut b = tar::Builder::new(Vec::new());
@@ -1908,6 +1977,138 @@ mod tests {
         tar.truncate(1024);
         assert!(unpack_mirroring(tar.as_slice(), host.path(), &[]).is_err());
         assert!(host.path().join("existing.txt").exists());
+    }
+
+    /// `sh -c script` with the archive in `$1`, standing in for `kubectl exec`.
+    #[cfg(unix)]
+    fn sender(script: &str, tar: &Path) -> std::process::Command {
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", script, "sh"]).arg(tar);
+        command
+    }
+
+    #[cfg(unix)]
+    fn write_tar(dir: &Path, build: impl FnOnce(&mut tar::Builder<Vec<u8>>)) -> PathBuf {
+        let path = dir.join("stream.tar");
+        std::fs::write(&path, archive(build)).unwrap();
+        path
+    }
+
+    /// A connection lost between two entries is a clean EOF to the tar reader,
+    /// and everything not yet received would otherwise look deleted.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_exec_never_prunes_even_if_the_stream_looks_complete() {
+        let work = tempfile::tempdir().unwrap();
+        let host = tempfile::tempdir().unwrap();
+        std::fs::write(host.path().join("not-yet-sent.txt"), "precious").unwrap();
+
+        let tar = write_tar(work.path(), |b| add_file(b, "./first.txt", b"x"));
+        let err = mirror_from(
+            sender("head -c 1024 \"$1\"; echo lost >&2; exit 1", &tar),
+            "/github/workspace",
+            host.path(),
+            &[],
+        )
+        .expect_err("a failed exec must fail the sync");
+
+        assert!(err.to_string().contains("lost"), "{}", err);
+        assert!(host.path().join("not-yet-sent.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_successful_exec_mirrors_and_prunes() {
+        let work = tempfile::tempdir().unwrap();
+        let host = tempfile::tempdir().unwrap();
+        std::fs::write(host.path().join("deleted.txt"), "x").unwrap();
+
+        let tar = write_tar(work.path(), |b| add_file(b, "./kept.txt", b"x"));
+        mirror_from(sender("cat \"$1\"", &tar), "src", host.path(), &[]).unwrap();
+
+        assert!(host.path().join("kept.txt").exists());
+        assert!(!host.path().join("deleted.txt").exists());
+    }
+
+    /// More stderr than a pipe holds, before any stdout. Unread, this hangs.
+    #[cfg(unix)]
+    #[test]
+    fn a_noisy_stderr_does_not_stall_the_sync_out() {
+        let work = tempfile::tempdir().unwrap();
+        let host = tempfile::tempdir().unwrap();
+        let tar = write_tar(work.path(), |b| add_file(b, "./f.txt", b"x"));
+        mirror_from(
+            sender("head -c 1000000 /dev/zero >&2; cat \"$1\"", &tar),
+            "src",
+            host.path(),
+            &[],
+        )
+        .unwrap();
+        assert!(host.path().join("f.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_noisy_stderr_does_not_stall_the_sync_in() {
+        let host = tempfile::tempdir().unwrap();
+        std::fs::write(host.path().join("f.txt"), "x").unwrap();
+        let mut command = std::process::Command::new("sh");
+        command.args([
+            "-c",
+            "head -c 1000000 /dev/zero >&2; cat >/dev/null; echo refused >&2; exit 2",
+        ]);
+        let mount = Mount {
+            host: host.path().to_path_buf(),
+            container: PathBuf::from("/data"),
+        };
+        let err = stream_dir_into(command, &mount).expect_err("must report the failure");
+        // Only the first bytes of a flood are kept, and it was all NULs.
+        assert!(err.to_string().contains("into the pod failed"), "{}", err);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pruning_leaves_sockets_alone() {
+        let host = tempfile::tempdir().unwrap();
+        let socket = host.path().join("s");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let tar = archive(|b| add_dir(b, "./", 0o755));
+        unpack_mirroring(tar.as_slice(), host.path(), &[]).unwrap();
+        assert!(socket.exists());
+    }
+
+    #[test]
+    fn mirroring_unpacks_hard_links_inside_the_host_directory() {
+        let host = tempfile::tempdir().unwrap();
+        let tar = archive(|b| {
+            add_file(b, "./original", b"same");
+            let mut h = tar::Header::new_gnu();
+            h.set_entry_type(tar::EntryType::Link);
+            h.set_size(0);
+            h.set_mode(0o644);
+            b.append_link(&mut h, "./linked", "./original").unwrap();
+        });
+        unpack_mirroring(tar.as_slice(), host.path(), &[]).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(host.path().join("linked")).unwrap(),
+            "same"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_that_cannot_be_pruned_does_not_fail_the_step() {
+        use std::os::unix::fs::PermissionsExt;
+        let host = tempfile::tempdir().unwrap();
+        let locked = host.path().join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::write(locked.join("stuck.txt"), "x").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let tar = archive(|b| add_dir(b, "./locked/", 0o555));
+        let result = unpack_mirroring(tar.as_slice(), host.path(), &[]);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        result.unwrap();
     }
 
     #[test]

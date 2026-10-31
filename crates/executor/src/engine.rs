@@ -3221,20 +3221,32 @@ fn resolve_working_directory(wd: &str, ctx: &StepExecutionContext<'_>) -> Result
     let resolved =
         crate::substitution::preprocess_expressions_strict(wd, ctx.working_dir, &expr_ctx)
             .map_err(|e| format!("Invalid working-directory '{}': {}", wd, e))?;
-    Ok(match ctx.job_env.get("GITHUB_WORKSPACE") {
-        Some(workspace) => relative_to_workspace(resolved, workspace),
-        None => resolved,
-    })
+    Ok(workspace_relative_input(&resolved, ctx))
+}
+
+/// Make a path input relative to the workspace, so it means the same place
+/// wherever it is used. Steps and the actions wrkflw handles itself both work
+/// in the job directory, while `github.workspace` is `/github/workspace` under
+/// a container runtime and a host path in emulation. The workspace itself
+/// becomes `.`, because an empty input means the input was not provided.
+fn workspace_relative_input(path: &str, ctx: &StepExecutionContext<'_>) -> String {
+    let Some(workspace) = ctx.job_env.get("GITHUB_WORKSPACE") else {
+        return path.to_string();
+    };
+    match relative_to_workspace(path, workspace) {
+        relative if relative.is_empty() && !path.is_empty() => ".".to_string(),
+        relative => relative,
+    }
 }
 
 /// Make a path under `workspace` relative, since steps see the workspace under
 /// `/github/workspace` and `github.workspace` is the host path in emulation. The
 /// comparison is by path component, so a sibling like `<workspace>-old` stays
 /// absolute and fails the check that keeps steps inside the workspace.
-fn relative_to_workspace(path: String, workspace: &str) -> String {
-    match Path::new(&path).strip_prefix(workspace) {
+fn relative_to_workspace(path: &str, workspace: &str) -> String {
+    match Path::new(path).strip_prefix(workspace) {
         Ok(relative) => relative.to_string_lossy().into_owned(),
-        Err(_) => path,
+        Err(_) => path.to_string(),
     }
 }
 
@@ -3260,7 +3272,7 @@ async fn handle_upload_artifact(
         .unwrap_or_else(|| "artifact".to_string());
     let path_pattern = with
         .and_then(|w| w.get("path"))
-        .map(|s| preprocess_with_value(s, ctx))
+        .map(|s| workspace_relative_input(&preprocess_with_value(s, ctx), ctx))
         .unwrap_or_default();
 
     if path_pattern.is_empty() {
@@ -3308,7 +3320,12 @@ async fn handle_download_artifact(
         .unwrap_or_default();
     let download_path = with
         .and_then(|w| w.get("path"))
-        .map(|s| ctx.working_dir.join(preprocess_with_value(s, ctx)))
+        .map(|s| {
+            ctx.working_dir.join(workspace_relative_input(
+                &preprocess_with_value(s, ctx),
+                ctx,
+            ))
+        })
         .unwrap_or_else(|| ctx.working_dir.to_path_buf());
 
     // Validate download path stays within workspace (prevent path traversal).
@@ -3429,8 +3446,9 @@ async fn handle_cache_action(
     // actions/cache supports multi-line `path` input (one path per line)
     let cache_paths: Vec<String> = cache_path_raw
         .lines()
-        .map(|l| l.trim().to_string())
+        .map(|l| l.trim())
         .filter(|l| !l.is_empty())
+        .map(|l| workspace_relative_input(l, ctx))
         .collect();
     let restore_keys: Vec<String> = with
         .and_then(|w| w.get("restore-keys"))
@@ -9167,7 +9185,7 @@ runs:
 
     #[test]
     fn relative_to_workspace_compares_path_components() {
-        let relative = |path: &str| relative_to_workspace(path.to_string(), "/host/repo");
+        let relative = |path: &str| relative_to_workspace(path, "/host/repo");
         assert_eq!(relative("/host/repo/src"), "src");
         assert_eq!(relative("/host/repo"), "");
         assert_eq!(relative("/host/repo-old/src"), "/host/repo-old/src");
@@ -9177,7 +9195,7 @@ runs:
     #[cfg(windows)]
     #[test]
     fn relative_to_workspace_handles_windows_paths() {
-        let relative = relative_to_workspace(r"C:\repo/src".to_string(), r"C:\repo");
+        let relative = relative_to_workspace(r"C:\repo/src", r"C:\repo");
         assert_eq!(relative, "src");
     }
 
@@ -9232,6 +9250,209 @@ runs:
             RuntimeType::Emulation
         };
         assert_eq!(effective(RuntimeType::Podman), expected);
+    }
+
+    /// Run `step` as a job with `job_env` would, with its own stores.
+    async fn run_step_in(
+        step: &Step,
+        job_env: &HashMap<String, String>,
+        working_dir: &Path,
+        runtime: &MockContainerRuntime,
+        artifact_store: &crate::artifacts::ArtifactStore,
+        cache_store: &crate::cache::CacheStore,
+        pending: &std::sync::Mutex<Vec<PendingCacheSave>>,
+    ) -> StepResult {
+        let workflow = minimal_workflow();
+        let ctx = StepExecutionContext {
+            step,
+            step_idx: 0,
+            job_env,
+            job_user_env: job_env,
+            working_dir,
+            runtime,
+            workflow: &workflow,
+            runner_image: "ubuntu:latest",
+            verbose: false,
+            matrix_combination: &None,
+            container_config: None,
+            workflow_defaults: None,
+            job_defaults: None,
+            step_outputs: &HashMap::new(),
+            step_statuses: &HashMap::new(),
+            job_status: "success",
+            services: JobServices {
+                secret_manager: None,
+                secret_masker: None,
+                secrets_context: &HashMap::new(),
+                needs_context: &HashMap::new(),
+                needs_results: &HashMap::new(),
+                artifact_store,
+                cache_store,
+                platform_overrides: &HashMap::new(),
+            },
+            pending_cache_saves: pending,
+        };
+        execute_step(ctx).await.unwrap()
+    }
+
+    /// What `github.workspace` is under a container runtime and in emulation.
+    /// Neither is the job directory the actions work in.
+    fn workspace_envs() -> [HashMap<String, String>; 2] {
+        [
+            HashMap::from([
+                (
+                    "GITHUB_WORKSPACE".to_string(),
+                    "/github/workspace".to_string(),
+                ),
+                ("WRKFLW_RUNTIME_MODE".to_string(), "docker".to_string()),
+            ]),
+            HashMap::from([
+                ("GITHUB_WORKSPACE".to_string(), "/host/repo".to_string()),
+                ("WRKFLW_RUNTIME_MODE".to_string(), "emulation".to_string()),
+            ]),
+        ]
+    }
+
+    #[tokio::test]
+    async fn artifact_paths_under_github_workspace_resolve_to_the_job_directory() {
+        for job_env in workspace_envs() {
+            let runtime = MockContainerRuntime::default();
+            let working_dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir(working_dir.path().join("dist")).unwrap();
+            std::fs::write(working_dir.path().join("dist/app.txt"), "built").unwrap();
+            let artifact_dir = tempfile::tempdir().unwrap();
+            let artifacts = crate::artifacts::ArtifactStore::new(artifact_dir.path()).unwrap();
+            let cache_dir = tempfile::tempdir().unwrap();
+            let cache =
+                crate::cache::CacheStore::with_root(cache_dir.path().to_path_buf()).unwrap();
+            let pending = std::sync::Mutex::new(Vec::new());
+
+            let upload = make_step(
+                "upload",
+                "actions/upload-artifact@v4",
+                Some(HashMap::from([
+                    ("name".to_string(), "app".to_string()),
+                    (
+                        "path".to_string(),
+                        "${{ github.workspace }}/dist/*".to_string(),
+                    ),
+                ])),
+                HashMap::new(),
+            );
+            let result = run_step_in(
+                &upload,
+                &job_env,
+                working_dir.path(),
+                &runtime,
+                &artifacts,
+                &cache,
+                &pending,
+            )
+            .await;
+            assert_eq!(result.status, StepStatus::Success, "{}", result.output);
+
+            let download = make_step(
+                "download",
+                "actions/download-artifact@v4",
+                Some(HashMap::from([
+                    ("name".to_string(), "app".to_string()),
+                    (
+                        "path".to_string(),
+                        "${{ github.workspace }}/out".to_string(),
+                    ),
+                ])),
+                HashMap::new(),
+            );
+            let result = run_step_in(
+                &download,
+                &job_env,
+                working_dir.path(),
+                &runtime,
+                &artifacts,
+                &cache,
+                &pending,
+            )
+            .await;
+            assert_eq!(result.status, StepStatus::Success, "{}", result.output);
+            assert!(working_dir.path().join("out").exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn cache_paths_under_github_workspace_resolve_to_the_job_directory() {
+        for job_env in workspace_envs() {
+            let runtime = MockContainerRuntime::default();
+            let working_dir = tempfile::tempdir().unwrap();
+            let artifact_dir = tempfile::tempdir().unwrap();
+            let artifacts = crate::artifacts::ArtifactStore::new(artifact_dir.path()).unwrap();
+            let cache_dir = tempfile::tempdir().unwrap();
+            let cache =
+                crate::cache::CacheStore::with_root(cache_dir.path().to_path_buf()).unwrap();
+            let pending = std::sync::Mutex::new(Vec::new());
+            let step = make_step(
+                "cache",
+                "actions/cache@v4",
+                Some(HashMap::from([
+                    ("key".to_string(), "deps-v1".to_string()),
+                    (
+                        "path".to_string(),
+                        "${{ github.workspace }}/deps\nvendor".to_string(),
+                    ),
+                ])),
+                HashMap::new(),
+            );
+
+            let result = run_step_in(
+                &step,
+                &job_env,
+                working_dir.path(),
+                &runtime,
+                &artifacts,
+                &cache,
+                &pending,
+            )
+            .await;
+            assert_eq!(result.status, StepStatus::Success, "{}", result.output);
+            let saved: Vec<String> = pending
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|save| save.path.clone())
+                .collect();
+            assert_eq!(saved, ["deps", "vendor"]);
+        }
+    }
+
+    #[test]
+    fn workspace_itself_is_not_mistaken_for_a_missing_path_input() {
+        let workflow = minimal_workflow();
+        let job_env = HashMap::from([("GITHUB_WORKSPACE".to_string(), "/host/repo".to_string())]);
+        let runtime = MockContainerRuntime::default();
+        let step = make_run_step("echo ok");
+        let working_dir = std::env::current_dir().unwrap();
+        let ctx = StepExecutionContext {
+            step: &step,
+            step_idx: 0,
+            job_env: &job_env,
+            job_user_env: &job_env,
+            working_dir: &working_dir,
+            runtime: &runtime,
+            workflow: &workflow,
+            runner_image: "ubuntu:latest",
+            verbose: false,
+            matrix_combination: &None,
+            container_config: None,
+            workflow_defaults: None,
+            job_defaults: None,
+            step_outputs: &HashMap::new(),
+            step_statuses: &HashMap::new(),
+            job_status: "success",
+            services: test_services(),
+            pending_cache_saves: &TEST_PENDING_CACHE_SAVES,
+        };
+        assert_eq!(workspace_relative_input("/host/repo", &ctx), ".");
+        assert_eq!(workspace_relative_input("/host/repo/src", &ctx), "src");
+        assert_eq!(workspace_relative_input("", &ctx), "");
     }
 
     #[tokio::test]

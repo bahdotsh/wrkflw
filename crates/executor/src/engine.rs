@@ -111,56 +111,8 @@ async fn execute_github_workflow(
         .map_err(|e| ExecutionError::Execution(format!("Failed to create workspace: {}", e)))?;
 
     // 4. Set up GitHub-like environment
-    let mut env_context = environment::create_github_context(&workflow, workspace_dir.path());
-    // Track the user-declared slice of env separately so `toJSON(env)` only
-    // dumps what the user actually wrote in YAML (and later, what steps write
-    // to `$GITHUB_ENV`). Starts empty — `create_github_context` only seeds
-    // runner-internal vars.
-    let mut user_env: HashMap<String, String> = HashMap::new();
-
-    // Add workflow-level environment variables (lowest precedence — does not override
-    // built-in GITHUB_*/RUNNER_* vars; job and step env override these later).
-    // Resolve ${{ }} expressions (e.g. ${{ github.repository }}) in values.
-    {
-        // At this point workflow.env hasn't been merged yet — user_env is empty.
-        let wf_expr_ctx = crate::expression::ExpressionContext {
-            env_context: &env_context,
-            step_outputs: &HashMap::new(),
-            matrix_combination: &None,
-            step_statuses: &HashMap::new(),
-            job_status: "success",
-            secrets_context: &HashMap::new(),
-            needs_context: &HashMap::new(),
-            needs_results: &HashMap::new(),
-            user_env: &user_env,
-        };
-        let cwd = std::env::current_dir().map_err(|e| {
-            ExecutionError::Execution(format!("Failed to get current directory: {}", e))
-        })?;
-        let resolved_env: Vec<(String, String)> = workflow
-            .env
-            .iter()
-            .map(|(key, value)| {
-                let resolved =
-                    crate::substitution::preprocess_expressions(value, &cwd, &wf_expr_ctx)
-                        .unwrap_or_else(|_| value.clone());
-                (key.clone(), resolved)
-            })
-            .collect();
-        for (key, value) in resolved_env {
-            // `or_insert` semantics: workflow.env does not override runner-seeded
-            // vars. user_env mirrors the same precedence — a workflow.env key that
-            // collides with a runner var is dropped from env_context AND not added
-            // to user_env (real GHA doesn't let workflow.env shadow runner vars).
-            env_context.entry(key.clone()).or_insert_with(|| {
-                user_env.insert(key, value.clone());
-                value
-            });
-        }
-    }
-
-    // Add runtime mode to environment
-    seed_runtime_context(&mut env_context, &config.runtime_type, CiPlatform::GitHub);
+    let (mut env_context, user_env) =
+        github_run_env(&workflow, workspace_dir.path(), &config.runtime_type)?;
 
     // show=true means hide=false (inverted for the env var)
     env_context.insert(
@@ -593,6 +545,69 @@ pub fn detect_runtime(runtime_type: RuntimeType) -> RuntimeType {
         }
         other => other,
     }
+}
+
+type EnvMap = HashMap<String, String>;
+
+/// Build the run-level env for a GitHub workflow. Returns the full lookup map
+/// and the user-declared slice of it.
+fn github_run_env(
+    workflow: &WorkflowDefinition,
+    workspace_dir: &Path,
+    runtime: &RuntimeType,
+) -> Result<(EnvMap, EnvMap), ExecutionError> {
+    let mut env_context = environment::create_github_context(workflow, workspace_dir);
+    // Before the workflow env below, whose expressions must see what steps see.
+    seed_runtime_context(&mut env_context, runtime, CiPlatform::GitHub);
+
+    // Track the user-declared slice of env separately so `toJSON(env)` only
+    // dumps what the user actually wrote in YAML (and later, what steps write
+    // to `$GITHUB_ENV`). Starts empty — `create_github_context` only seeds
+    // runner-internal vars.
+    let mut user_env: HashMap<String, String> = HashMap::new();
+
+    // Add workflow-level environment variables (lowest precedence — does not override
+    // built-in GITHUB_*/RUNNER_* vars; job and step env override these later).
+    // Resolve ${{ }} expressions (e.g. ${{ github.repository }}) in values.
+    {
+        // At this point workflow.env hasn't been merged yet — user_env is empty.
+        let wf_expr_ctx = crate::expression::ExpressionContext {
+            env_context: &env_context,
+            step_outputs: &HashMap::new(),
+            matrix_combination: &None,
+            step_statuses: &HashMap::new(),
+            job_status: "success",
+            secrets_context: &HashMap::new(),
+            needs_context: &HashMap::new(),
+            needs_results: &HashMap::new(),
+            user_env: &user_env,
+        };
+        let cwd = std::env::current_dir().map_err(|e| {
+            ExecutionError::Execution(format!("Failed to get current directory: {}", e))
+        })?;
+        let resolved_env: Vec<(String, String)> = workflow
+            .env
+            .iter()
+            .map(|(key, value)| {
+                let resolved =
+                    crate::substitution::preprocess_expressions(value, &cwd, &wf_expr_ctx)
+                        .unwrap_or_else(|_| value.clone());
+                (key.clone(), resolved)
+            })
+            .collect();
+        for (key, value) in resolved_env {
+            // `or_insert` semantics: workflow.env does not override runner-seeded
+            // vars. user_env mirrors the same precedence — a workflow.env key that
+            // collides with a runner var is dropped from env_context AND not added
+            // to user_env (real GHA doesn't let workflow.env shadow runner vars).
+            env_context.entry(key.clone()).or_insert_with(|| {
+                user_env.insert(key, value.clone());
+                value
+            });
+        }
+    }
+
+    Ok((env_context, user_env))
 }
 
 /// The CI system whose variables a run exposes to its steps.
@@ -9217,6 +9232,30 @@ runs:
         let mut env = create_gitlab_context(&pipeline, host);
         seed_runtime_context(&mut env, &RuntimeType::Emulation, CiPlatform::GitLab);
         assert_eq!(env["CI_PROJECT_DIR"], "/host/workspace");
+    }
+
+    #[test]
+    fn workflow_env_expressions_see_what_steps_see() {
+        let mut workflow = minimal_workflow();
+        for (key, value) in [
+            ("BUILD_DIR", "${{ github.workspace }}/build"),
+            ("TARGET_OS", "${{ runner.os }}"),
+        ] {
+            workflow.env.insert(key.to_string(), value.to_string());
+        }
+        let workspace = Path::new("/host/workspace");
+
+        let (env, user_env) = github_run_env(&workflow, workspace, &RuntimeType::Docker).unwrap();
+        assert_eq!(env["BUILD_DIR"], "/github/workspace/build");
+        assert_eq!(env["TARGET_OS"], "Linux");
+        assert_eq!(user_env["BUILD_DIR"], "/github/workspace/build");
+
+        let (env, _) = github_run_env(&workflow, workspace, &RuntimeType::Emulation).unwrap();
+        assert_eq!(
+            env["BUILD_DIR"],
+            format!("{}/build", env["GITHUB_WORKSPACE"])
+        );
+        assert_ne!(env["GITHUB_WORKSPACE"], "/github/workspace");
     }
 
     #[test]

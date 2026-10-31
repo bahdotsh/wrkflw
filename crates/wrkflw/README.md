@@ -97,10 +97,7 @@ use wrkflw::executor::{execute_workflow, ExecutionConfig, RuntimeType};
 let cfg = ExecutionConfig {
     runtime_type: RuntimeType::Docker,
     verbose: true,
-    preserve_containers_on_failure: false,
-    secrets_config: None,
-    show_action_messages: false,
-    target_job: None,
+    ..Default::default()
 };
 let result = execute_workflow(Path::new(".github/workflows/ci.yml"), cfg).await?;
 for job in &result.jobs {

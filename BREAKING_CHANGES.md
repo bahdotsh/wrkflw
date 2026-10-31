@@ -1,5 +1,12 @@
 # Breaking Changes
 
+## `ExecutionConfig` gained a `platform_overrides` field (unreleased)
+
+Code that builds `wrkflw_executor::ExecutionConfig` as a struct literal must set
+the new field, or it no longer compiles. `ExecutionConfig` and `RuntimeType` now
+implement `Default`, so end a literal with `..Default::default()` to stay
+compatible with later additions. The default runtime is `RuntimeType::Auto`.
+
 ## Jobs on act images now report real step results (unreleased)
 
 Under the Docker runtime, any image name containing both `catthehacker` and

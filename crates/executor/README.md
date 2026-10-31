@@ -21,10 +21,8 @@ use wrkflw_executor::{execute_workflow, ExecutionConfig, RuntimeType};
 let cfg = ExecutionConfig {
     runtime_type: RuntimeType::Docker,
     verbose: true,
-    preserve_containers_on_failure: false,
-    secrets_config: None,
-    show_action_messages: false,
     target_job: Some("build".to_string()), // run a single job
+    ..Default::default()
 };
 
 let workflow_path = std::path::Path::new(".github/workflows/ci.yml");

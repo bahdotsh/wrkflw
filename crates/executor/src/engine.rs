@@ -652,9 +652,10 @@ fn initialize_runtime(
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub enum RuntimeType {
     /// Detect Docker first, then Podman, then fall back to emulation.
+    #[default]
     Auto,
     Docker,
     Podman,
@@ -662,7 +663,7 @@ pub enum RuntimeType {
     SecureEmulation,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ExecutionConfig {
     pub runtime_type: RuntimeType,
     pub verbose: bool,
@@ -6002,6 +6003,13 @@ mod tests {
             get_effective_runner_image(&job, &HashMap::new(), Some(&matrix)),
             "ubuntu:latest"
         );
+    }
+
+    #[test]
+    fn execution_config_default_auto_detects_runtime_with_no_overrides() {
+        let config = ExecutionConfig::default();
+        assert_eq!(config.runtime_type, RuntimeType::Auto);
+        assert!(config.platform_overrides.is_empty());
     }
 
     #[test]

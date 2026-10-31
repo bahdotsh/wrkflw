@@ -235,6 +235,22 @@ pub fn preprocess_expressions(
     Ok(result)
 }
 
+/// Like [`preprocess_expressions`], but an expression that fails to evaluate
+/// is an error rather than an empty string. Use it where a silently empty
+/// value would change what runs, as with a `working-directory`.
+pub fn preprocess_expressions_strict(
+    text: &str,
+    workspace: &Path,
+    ctx: &crate::expression::ExpressionContext<'_>,
+) -> Result<String, String> {
+    let result = preprocess_hash_files(text, workspace)?;
+    for expression in EXPRESSION_PATTERN.find_iter(&result) {
+        let expression = expression.as_str();
+        crate::expression::evaluate(&expression[3..expression.len() - 2], ctx)?;
+    }
+    preprocess_expressions(&result, workspace, ctx)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

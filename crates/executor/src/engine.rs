@@ -3182,16 +3182,28 @@ impl<'a> StepExecutionContext<'a> {
     }
 }
 
-/// Evaluate `${{ }}` in a `working-directory`. A path under `$GITHUB_WORKSPACE`
-/// becomes relative, since steps always see the workspace at the same place and
-/// `github.workspace` is the host path in emulation.
-fn resolve_working_directory(wd: &str, ctx: &StepExecutionContext<'_>) -> String {
-    let resolved = preprocess_with_value(wd, ctx);
-    ctx.job_env
-        .get("GITHUB_WORKSPACE")
-        .and_then(|workspace| resolved.strip_prefix(workspace.as_str()))
-        .map(|relative| relative.trim_start_matches('/').to_string())
-        .unwrap_or(resolved)
+/// Evaluate `${{ }}` in a `working-directory`. A failed expression is an error,
+/// since falling back to an empty value would run the step in the wrong place.
+fn resolve_working_directory(wd: &str, ctx: &StepExecutionContext<'_>) -> Result<String, String> {
+    let expr_ctx = ctx.expr_context();
+    let resolved =
+        crate::substitution::preprocess_expressions_strict(wd, ctx.working_dir, &expr_ctx)
+            .map_err(|e| format!("Invalid working-directory '{}': {}", wd, e))?;
+    Ok(match ctx.job_env.get("GITHUB_WORKSPACE") {
+        Some(workspace) => relative_to_workspace(resolved, workspace),
+        None => resolved,
+    })
+}
+
+/// Make a path under `workspace` relative, since steps see the workspace under
+/// `/github/workspace` and `github.workspace` is the host path in emulation. The
+/// comparison is by path component, so a sibling like `<workspace>-old` stays
+/// absolute and fails the check that keeps steps inside the workspace.
+fn relative_to_workspace(path: String, workspace: &str) -> String {
+    match Path::new(&path).strip_prefix(workspace) {
+        Ok(relative) => relative.to_string_lossy().into_owned(),
+        Err(_) => path,
+    }
 }
 
 /// Resolve `${{ }}` expressions in an action `with` parameter value.
@@ -4123,7 +4135,14 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                 ctx.workflow_defaults
                     .and_then(|d| d.run.as_ref()?.working_directory.as_deref())
             })
-            .map(|wd| resolve_working_directory(wd, &ctx));
+            .map(|wd| resolve_working_directory(wd, &ctx))
+            .transpose();
+        let effective_wd = match effective_wd {
+            Ok(wd) => wd,
+            Err(msg) => {
+                return Ok(StepResult::new(step_name, StepStatus::Failure, msg));
+            }
+        };
 
         // Define the standard workspace path inside the container
         let container_workspace = Path::new("/github/workspace");
@@ -7286,6 +7305,7 @@ runs:
         env_vars: Vec<(String, String)>,
         entrypoint: Option<String>,
         volumes: Vec<(PathBuf, PathBuf)>,
+        working_dir: PathBuf,
         /// Contents of the host file the final `cmd` element resolves to
         /// through `volumes`, if any (used to verify a generated script is
         /// actually reachable inside the container).
@@ -7299,7 +7319,7 @@ runs:
             image: &str,
             cmd: &[&str],
             env_vars: &[(&str, &str)],
-            _working_dir: &Path,
+            working_dir: &Path,
             volumes: &[(&Path, &Path)],
             entrypoint: Option<&str>,
         ) -> Result<ContainerOutput, ContainerError> {
@@ -7327,6 +7347,7 @@ runs:
                     .collect(),
                 entrypoint: entrypoint.map(|s| s.to_string()),
                 volumes: owned_volumes,
+                working_dir: working_dir.to_path_buf(),
                 script,
             });
             Ok(ContainerOutput {
@@ -9044,9 +9065,11 @@ runs:
         let working_dir = std::env::current_dir().unwrap();
 
         for (wd, expected) in [
-            ("${{ github.workspace }}/src", StepStatus::Success),
-            ("${{ github.workspace }}", StepStatus::Success),
-            ("${{ github.workspace }}/../escape", StepStatus::Failure),
+            ("${{ github.workspace }}/src", Some("/github/workspace/src")),
+            ("${{ github.workspace }}", Some("/github/workspace")),
+            ("${{ github.workspace }}/../escape", None),
+            ("${{ github.workspace }}-other/src", None),
+            ("${{ github.workspace == }}", None),
         ] {
             let runtime = MockContainerRuntime::default();
             let mut step = make_run_step("echo ok");
@@ -9074,8 +9097,35 @@ runs:
             };
 
             let result = execute_step(ctx).await.unwrap();
-            assert_eq!(result.status, expected, "{}", wd);
+            let calls = runtime.run_calls.lock().unwrap();
+            match expected {
+                Some(path) => {
+                    assert_eq!(result.status, StepStatus::Success, "{}", wd);
+                    assert_eq!(calls[0].working_dir, Path::new(path), "{}", wd);
+                }
+                None => {
+                    assert_eq!(result.status, StepStatus::Failure, "{}", wd);
+                    assert!(result.output.contains("Invalid working-directory"));
+                    assert!(calls.is_empty(), "{}", wd);
+                }
+            }
         }
+    }
+
+    #[test]
+    fn relative_to_workspace_compares_path_components() {
+        let relative = |path: &str| relative_to_workspace(path.to_string(), "/host/repo");
+        assert_eq!(relative("/host/repo/src"), "src");
+        assert_eq!(relative("/host/repo"), "");
+        assert_eq!(relative("/host/repo-old/src"), "/host/repo-old/src");
+        assert_eq!(relative("src"), "src");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn relative_to_workspace_handles_windows_paths() {
+        let relative = relative_to_workspace(r"C:\repo/src".to_string(), r"C:\repo");
+        assert_eq!(relative, "src");
     }
 
     #[tokio::test]

@@ -4,7 +4,7 @@ use crate::workflow;
 use std::collections::HashMap;
 use std::path::Path;
 use thiserror::Error;
-use wrkflw_models::gitlab::Pipeline;
+use wrkflw_models::gitlab::{Image, Job, Pipeline};
 use wrkflw_models::ValidationResult;
 
 #[derive(Error, Debug)]
@@ -118,6 +118,155 @@ pub fn validate_pipeline_structure(pipeline: &Pipeline) -> ValidationResult {
     result
 }
 
+/// When a job runs relative to the outcome of the stages before it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobWhen {
+    OnSuccess,
+    OnFailure,
+    Always,
+    /// Excluded from the pipeline. Includes `manual`, since nobody can press
+    /// play on a local run.
+    Skip,
+}
+
+impl JobWhen {
+    fn parse(when: Option<&str>) -> Self {
+        match when {
+            None | Some("on_success") | Some("delayed") => JobWhen::OnSuccess,
+            Some("on_failure") => JobWhen::OnFailure,
+            Some("always") => JobWhen::Always,
+            Some(_) => JobWhen::Skip,
+        }
+    }
+}
+
+/// Decide when a job runs. The first matching rule wins and a job whose rules
+/// all miss is excluded, as in GitLab. `variables` are the job's CI variables.
+pub fn job_when(job: &Job, variables: &HashMap<String, String>) -> JobWhen {
+    let job_level = job.when.as_deref();
+    let Some(rules) = &job.rules else {
+        return JobWhen::parse(job_level);
+    };
+    rules
+        .iter()
+        .find(|rule| {
+            rule.if_
+                .as_deref()
+                .is_none_or(|condition| rule_condition_matches(condition, variables))
+        })
+        .map_or(JobWhen::Skip, |rule| {
+            JobWhen::parse(rule.when.as_deref().or(job_level))
+        })
+}
+
+/// Evaluate a `rules:if` condition: `||` of `&&` of comparisons, without
+/// parentheses. Anything else matches, with a warning, because running an extra
+/// job is easier to notice than silently dropping one.
+fn rule_condition_matches(condition: &str, variables: &HashMap<String, String>) -> bool {
+    split_outside_quotes(condition, "||").iter().any(|any_of| {
+        split_outside_quotes(any_of, "&&").iter().all(|term| {
+            rule_term_matches(term.trim(), variables).unwrap_or_else(|| {
+                wrkflw_logging::warning(&format!(
+                    "Unsupported rules:if condition '{}': treating it as a match",
+                    term.trim()
+                ));
+                true
+            })
+        })
+    })
+}
+
+fn rule_term_matches(term: &str, variables: &HashMap<String, String>) -> Option<bool> {
+    if term.contains(['(', ')']) && !term.contains("=~") && !term.contains("!~") {
+        return None;
+    }
+    for (operator, negated) in [("==", false), ("!=", true)] {
+        if let Some((left, right)) = term.split_once(operator) {
+            let equal = rule_operand(left, variables)? == rule_operand(right, variables)?;
+            return Some(equal != negated);
+        }
+    }
+    for (operator, negated) in [("=~", false), ("!~", true)] {
+        if let Some((left, right)) = term.split_once(operator) {
+            let value = rule_operand(left, variables)?.unwrap_or_default();
+            let pattern = right.trim().strip_prefix('/')?;
+            let (pattern, flags) = pattern.rsplit_once('/')?;
+            let insensitive = if flags.contains('i') { "(?i)" } else { "" };
+            let regex = regex::Regex::new(&format!("{}{}", insensitive, pattern)).ok()?;
+            return Some(regex.is_match(&value) != negated);
+        }
+    }
+    let value = rule_operand(term, variables)?;
+    Some(value.is_some_and(|value| !value.is_empty()))
+}
+
+/// A variable, quoted string or `null`. `None` means it isn't one of those.
+fn rule_operand(operand: &str, variables: &HashMap<String, String>) -> Option<Option<String>> {
+    let operand = operand.trim();
+    if operand == "null" {
+        return Some(None);
+    }
+    if let Some(name) = operand.strip_prefix('$') {
+        let name = name.trim_start_matches('{').trim_end_matches('}');
+        return Some(variables.get(name).cloned());
+    }
+    ['"', '\'']
+        .iter()
+        .find_map(|quote| operand.strip_prefix(*quote)?.strip_suffix(*quote))
+        .map(|text| Some(text.to_string()))
+}
+
+fn split_outside_quotes<'a>(text: &'a str, separator: &str) -> Vec<&'a str> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut quote = None;
+    for (index, ch) in text.char_indices() {
+        match quote {
+            Some(open) if ch == open => quote = None,
+            Some(_) => {}
+            None if ch == '"' || ch == '\'' => quote = Some(ch),
+            None if text[index..].starts_with(separator) => {
+                parts.push(&text[start..index]);
+                start = index + separator.len();
+            }
+            None => {}
+        }
+    }
+    parts.push(&text[start..]);
+    parts
+}
+
+/// A string-or-list key from the pipeline's `default:` section.
+fn default_list(pipeline: &Pipeline, key: &str) -> Option<Vec<String>> {
+    match pipeline.default.as_ref()?.get(key)? {
+        serde_yaml::Value::String(line) => Some(vec![line.clone()]),
+        serde_yaml::Value::Sequence(lines) => Some(
+            lines
+                .iter()
+                .filter_map(|line| line.as_str().map(str::to_string))
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
+/// The image a job runs in: its own, then `default:`, then the top-level one.
+fn job_image(pipeline: &Pipeline, job: &Job) -> Option<String> {
+    let name = |image: &Image| match image {
+        Image::Simple(name) | Image::Detailed { name, .. } => name.clone(),
+    };
+    job.image
+        .as_ref()
+        .map(name)
+        .or_else(|| {
+            let image = pipeline.default.as_ref()?.get("image")?;
+            serde_yaml::from_value::<Image>(image.clone())
+                .ok()
+                .map(|image| name(&image))
+        })
+        .or_else(|| pipeline.image.as_ref().map(name))
+}
+
 /// Convert a GitLab CI/CD pipeline to a format compatible with the workflow executor
 pub fn convert_to_workflow_format(pipeline: &Pipeline) -> workflow::WorkflowDefinition {
     // Create a new workflow with required fields
@@ -137,11 +286,20 @@ pub fn convert_to_workflow_format(pipeline: &Pipeline) -> workflow::WorkflowDefi
             continue;
         }
 
+        let image = job_image(pipeline, gitlab_job);
+
         // Create a new job
         let mut job = workflow::Job {
             runs_on: Some(vec!["ubuntu-latest".to_string()]), // Default runner
             needs: None,
-            container: None,
+            container: image.clone().map(|image| workflow::JobContainer {
+                image,
+                credentials: None,
+                env: HashMap::new(),
+                ports: None,
+                volumes: None,
+                options: None,
+            }),
             steps: Vec::new(),
             env: HashMap::new(),
             strategy: None,
@@ -153,7 +311,13 @@ pub fn convert_to_workflow_format(pipeline: &Pipeline) -> workflow::WorkflowDefi
             with: None,
             secrets: None,
             timeout_minutes: None,
-            defaults: None,
+            // Pipeline images often have no bash, which GitLab falls back from.
+            defaults: image.is_some().then(|| workflow::Defaults {
+                run: Some(workflow::DefaultsRun {
+                    shell: Some("sh".to_string()),
+                    working_directory: None,
+                }),
+            }),
         };
 
         // Add job-specific environment variables
@@ -170,7 +334,12 @@ pub fn convert_to_workflow_format(pipeline: &Pipeline) -> workflow::WorkflowDefi
         }
 
         // Convert before_script to steps if it exists
-        if let Some(before_script) = &gitlab_job.before_script {
+        let before_script = gitlab_job
+            .before_script
+            .clone()
+            .or_else(|| default_list(pipeline, "before_script"))
+            .or_else(|| pipeline.before_script.clone());
+        if let Some(before_script) = &before_script {
             for (i, cmd) in before_script.iter().enumerate() {
                 job.steps.push(workflow::Step::with_run(
                     format!("Before script {}", i + 1),
@@ -190,7 +359,12 @@ pub fn convert_to_workflow_format(pipeline: &Pipeline) -> workflow::WorkflowDefi
         }
 
         // Convert after_script to steps if it exists
-        if let Some(after_script) = &gitlab_job.after_script {
+        let after_script = gitlab_job
+            .after_script
+            .clone()
+            .or_else(|| default_list(pipeline, "after_script"))
+            .or_else(|| pipeline.after_script.clone());
+        if let Some(after_script) = &after_script {
             for (i, cmd) in after_script.iter().enumerate() {
                 let mut step =
                     workflow::Step::with_run(format!("After script {}", i + 1), cmd.clone());
@@ -325,5 +499,135 @@ downstream:
 
         let result = validate_pipeline_structure(&pipeline);
         assert!(result.is_valid, "{:?}", result.issues);
+    }
+
+    fn convert(yaml: &str) -> workflow::WorkflowDefinition {
+        convert_to_workflow_format(&serde_yaml::from_str(yaml).unwrap())
+    }
+
+    fn variables(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn when_of(job_yaml: &str, vars: &[(&str, &str)]) -> JobWhen {
+        let job: Job = serde_yaml::from_str(job_yaml).unwrap();
+        job_when(&job, &variables(vars))
+    }
+
+    #[test]
+    fn job_when_reads_the_job_level_key() {
+        assert_eq!(when_of("script: [a]", &[]), JobWhen::OnSuccess);
+        assert_eq!(when_of("script: [a]\nwhen: manual", &[]), JobWhen::Skip);
+        assert_eq!(when_of("script: [a]\nwhen: never", &[]), JobWhen::Skip);
+        assert_eq!(when_of("script: [a]\nwhen: always", &[]), JobWhen::Always);
+        assert_eq!(
+            when_of("script: [a]\nwhen: on_failure", &[]),
+            JobWhen::OnFailure
+        );
+    }
+
+    #[test]
+    fn first_matching_rule_decides() {
+        let job = r#"
+script: [a]
+rules:
+  - if: '$V == "top"'
+    when: never
+  - when: always
+"#;
+        assert_eq!(when_of(job, &[("V", "top")]), JobWhen::Skip);
+        assert_eq!(when_of(job, &[("V", "other")]), JobWhen::Always);
+    }
+
+    #[test]
+    fn a_job_whose_rules_all_miss_is_excluded() {
+        let job = "script: [a]\nwhen: always\nrules:\n  - if: '$NOPE == \"1\"'\n";
+        assert_eq!(when_of(job, &[]), JobWhen::Skip);
+        assert_eq!(when_of(job, &[("NOPE", "1")]), JobWhen::Always);
+    }
+
+    #[test]
+    fn rule_conditions_cover_the_common_operators() {
+        let vars = variables(&[("A", "main"), ("B", "x"), ("EMPTY", "")]);
+        for (condition, expected) in [
+            ("$A", true),
+            ("$MISSING", false),
+            ("$EMPTY", false),
+            ("$A == 'main'", true),
+            ("$A != \"main\"", false),
+            ("$A == $B", false),
+            ("$MISSING == null", true),
+            ("$A != null", true),
+            ("$A =~ /^ma/", true),
+            ("$A =~ /^MA/i", true),
+            ("$A !~ /^ma/", false),
+            ("$A =~ /(main|dev)/", true),
+            ("$A == 'main' && $B == 'x'", true),
+            ("$A == 'nope' || $B == 'x'", true),
+            ("$A == 'nope' && $B == 'x'", false),
+            ("$A == 'a||b' || $B == 'nope'", false),
+            ("${A} == 'main'", true),
+            // Parentheses aren't supported, so these match with a warning.
+            ("($A == 'nope')", true),
+        ] {
+            assert_eq!(
+                rule_condition_matches(condition, &vars),
+                expected,
+                "{}",
+                condition
+            );
+        }
+    }
+
+    #[test]
+    fn image_and_scripts_fall_back_to_defaults() {
+        let workflow = convert(
+            r#"
+image: top:1
+default:
+  image: dflt:1
+  before_script: [echo before]
+  after_script: echo after
+inherit:
+  script: [echo]
+own:
+  image: own:1
+  before_script: [echo mine]
+  script: [echo]
+"#,
+        );
+        let inherit = &workflow.jobs["inherit"];
+        assert_eq!(inherit.container.as_ref().unwrap().image, "dflt:1");
+        let steps: Vec<_> = inherit
+            .steps
+            .iter()
+            .filter_map(|s| s.run.as_deref())
+            .collect();
+        assert_eq!(steps, ["echo before", "echo", "echo after"]);
+
+        let own = &workflow.jobs["own"];
+        assert_eq!(own.container.as_ref().unwrap().image, "own:1");
+        assert_eq!(own.steps[0].run.as_deref(), Some("echo mine"));
+        assert_eq!(
+            own.defaults
+                .as_ref()
+                .unwrap()
+                .run
+                .as_ref()
+                .unwrap()
+                .shell
+                .as_deref(),
+            Some("sh")
+        );
+    }
+
+    #[test]
+    fn jobs_without_any_image_keep_the_default_runner() {
+        let workflow = convert("job:\n  script: [echo]\n");
+        assert!(workflow.jobs["job"].container.is_none());
+        assert!(workflow.jobs["job"].defaults.is_none());
     }
 }

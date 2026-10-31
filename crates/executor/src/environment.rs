@@ -289,7 +289,7 @@ fn get_current_sha() -> String {
     "0000000000000000000000000000000000000000".to_string()
 }
 
-fn get_current_ref() -> String {
+pub(crate) fn get_current_ref() -> String {
     if let Ok(output) = std::process::Command::new("git")
         .args(["symbolic-ref", "--short", "HEAD"])
         .output()

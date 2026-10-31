@@ -341,6 +341,7 @@ async fn execute_gitlab_pipeline(
     let workflow = gitlab::convert_to_workflow_format(&pipeline);
 
     // 3. Resolve job dependencies based on stages
+    let job_conditions = gitlab_job_conditions(&pipeline, pipeline_path);
     let execution_plan = resolve_gitlab_dependencies(&pipeline, &workflow)?;
 
     // Filter to target job and its stage-based dependencies if specified.
@@ -418,6 +419,32 @@ async fn execute_gitlab_pipeline(
     let mut failure_details = String::new();
 
     for job_batch in execution_plan {
+        // A stage only runs the jobs its predecessors' outcome selects.
+        let (job_batch, skipped): (Vec<String>, Vec<String>) =
+            job_batch
+                .into_iter()
+                .partition(|job_name| match job_conditions.get(job_name) {
+                    Some(gitlab::JobWhen::Always) => true,
+                    Some(gitlab::JobWhen::OnFailure) => has_failures,
+                    Some(gitlab::JobWhen::Skip) => false,
+                    Some(gitlab::JobWhen::OnSuccess) | None => !has_failures,
+                });
+        for job_name in skipped {
+            wrkflw_logging::info(&format!(
+                "  {} Skipping job '{}'",
+                wrkflw_logging::symbols::SKIPPED,
+                job_name
+            ));
+            results.push(JobResult::skipped(
+                job_name.clone(),
+                job_name,
+                "Skipped by when/rules or an earlier failure",
+            ));
+        }
+        if job_batch.is_empty() {
+            continue;
+        }
+
         // Execute jobs in parallel if they don't depend on each other.
         // GitLab CI uses artifacts/variables for inter-job communication, not `needs.*`
         // context, so we pass empty maps here.
@@ -516,6 +543,34 @@ fn create_gitlab_context(pipeline: &Pipeline, workspace_dir: &Path) -> HashMap<S
 }
 
 /// Resolve GitLab CI/CD pipeline dependencies
+/// Evaluate each job's `when:`/`rules:` against the variables CI would give it.
+fn gitlab_job_conditions(
+    pipeline: &Pipeline,
+    pipeline_path: &Path,
+) -> HashMap<String, gitlab::JobWhen> {
+    let mut base: HashMap<String, String> = std::env::vars().collect();
+    base.extend(pipeline.variables.clone().unwrap_or_default());
+    base.insert("CI".to_string(), "true".to_string());
+    base.insert("CI_PIPELINE_SOURCE".to_string(), "push".to_string());
+    base.insert(
+        "CI_CONFIG_PATH".to_string(),
+        pipeline_path.display().to_string(),
+    );
+    if let Some(branch) = environment::get_current_ref().strip_prefix("refs/heads/") {
+        base.insert("CI_COMMIT_BRANCH".to_string(), branch.to_string());
+        base.insert("CI_COMMIT_REF_NAME".to_string(), branch.to_string());
+    }
+    pipeline
+        .jobs
+        .iter()
+        .map(|(name, job)| {
+            let mut variables = base.clone();
+            variables.extend(job.variables.clone().unwrap_or_default());
+            (name.clone(), gitlab::job_when(job, &variables))
+        })
+        .collect()
+}
+
 fn resolve_gitlab_dependencies(
     pipeline: &Pipeline,
     workflow: &WorkflowDefinition,

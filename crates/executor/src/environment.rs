@@ -78,7 +78,8 @@ const CONTAINER_RUNNER_TEMP: &str = "/github/workflow/runner_temp";
 
 /// Replace host values with what a GitHub step sees inside a Linux container.
 /// Without this `runner.os` reports the host OS and paths like
-/// `$GITHUB_WORKSPACE` don't exist in the container.
+/// `$GITHUB_WORKSPACE` don't exist in the container. This is set once per run,
+/// before any job has picked an image, so a Windows image gets these values too.
 pub fn apply_github_container_context(env: &mut HashMap<String, String>) {
     for (key, value) in [
         ("GITHUB_WORKSPACE", CONTAINER_WORKSPACE),

@@ -285,7 +285,8 @@ export WRKFLW_K8S_NAMESPACE=ci WRKFLW_K8S_RESOURCE=nvidia.com/gpu=1
 | `--k8s-image-pull-secret NAME` | `WRKFLW_K8S_IMAGE_PULL_SECRET` | `imagePullSecrets` for every pod; repeatable |
 | `--k8s-registry REGISTRY` | `WRKFLW_K8S_REGISTRY` | Where images built locally are pushed so the cluster can pull them |
 | `--k8s-helper-image IMAGE` | `WRKFLW_K8S_HELPER_IMAGE` | Image for the sync helpers (default `busybox:1.36`; needs `sh` and `tar`) |
-| `--k8s-timeout SECONDS` | `WRKFLW_K8S_TIMEOUT` | Per-step limit, pod creation to sync-back (default 3600) |
+| `--k8s-timeout SECONDS` | `WRKFLW_K8S_TIMEOUT` | Per-step limit, pod creation to sync-back (default 21600, the engine's job timeout) |
+| `--k8s-schedule-timeout SECONDS` | `WRKFLW_K8S_SCHEDULE_TIMEOUT` | How long a pod may stay unschedulable before the step fails (default 600) |
 
 How a step runs:
 
@@ -303,6 +304,7 @@ Things to know:
 - A failed image pull is retried for 60 seconds before the step fails, so a bad image name takes that long to report.
 - Mounts are copies. Job `container.volumes` directories are copied in and written back after each step, so parallel jobs sharing one do not see each other's changes and the last to finish wins. Write-back only adds and updates: a file a step deletes from such a directory stays on the host, and files other processes create there are left alone. Only the job's workspace and `GITHUB_*` files mirror the pod exactly. A single-path volume such as `/cache` lives only in the pod and is never written back. Single files and sockets cannot be mounted and are skipped with a warning, sockets inside a mounted directory are not synced, and named volumes start empty.
 - Logs are read from the kubelet when the step ends, so a step that outgrows the node's container log rotation (10 MiB by default) loses its earliest lines.
+- A pod the scheduler cannot place fails the step after `--k8s-schedule-timeout`. Raise it if your autoscaler takes longer than 10 minutes to bring up a node.
 - Synced files are owned by root in the pod, so run steps in images that run as root, as GitHub requires for container actions. Other users can read the workspace but not write to it, and namespaces enforcing the `restricted` Pod Security Standard are not supported.
 - Stdout and stderr come back as one stream, as Kubernetes logs them.
 - Helper containers declare small fixed CPU and memory requests and limits, so namespaces with a `ResourceQuota` accept them.

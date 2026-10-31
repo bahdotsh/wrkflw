@@ -44,8 +44,15 @@ use wrkflw_runtime::container::{
 /// `tar`, `mkdir` and `touch` works.
 pub const DEFAULT_HELPER_IMAGE: &str = "busybox:1.36";
 
-/// Upper bound for one step, from pod creation to volume sync-back.
-pub const DEFAULT_TIMEOUT_SECS: u64 = 3600;
+/// Upper bound for one step, from pod creation to volume sync-back. Matches
+/// the engine's default job timeout, so `timeout-minutes` governs as it does
+/// on Docker and a long training step is not cut short.
+pub const DEFAULT_TIMEOUT_SECS: u64 = 6 * 60 * 60;
+
+/// How long a pod may stay unschedulable. Long enough for an autoscaler to
+/// bring up a node, short enough that a mistyped selector does not take the
+/// whole step timeout to report.
+pub const DEFAULT_SCHEDULE_TIMEOUT_SECS: u64 = 10 * 60;
 
 /// Added to the step timeout for `activeDeadlineSeconds`, so the client's own
 /// timeout normally fires first and reports the failure properly.
@@ -126,6 +133,9 @@ pub struct KubernetesConfig {
     pub registry: Option<String>,
     /// Per-step timeout; see [`DEFAULT_TIMEOUT_SECS`].
     pub timeout_secs: Option<u64>,
+    /// How long a pod may stay unschedulable; see
+    /// [`DEFAULT_SCHEDULE_TIMEOUT_SECS`].
+    pub schedule_timeout_secs: Option<u64>,
 }
 
 impl KubernetesConfig {
@@ -135,6 +145,13 @@ impl KubernetesConfig {
 
     pub fn timeout(&self) -> Duration {
         Duration::from_secs(self.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS))
+    }
+
+    pub fn schedule_timeout(&self) -> Duration {
+        Duration::from_secs(
+            self.schedule_timeout_secs
+                .unwrap_or(DEFAULT_SCHEDULE_TIMEOUT_SECS),
+        )
     }
 
     /// Global kubectl flags selecting the cluster and namespace.
@@ -460,8 +477,8 @@ fn waiting_reason(pod: &Value, reasons: &[&str]) -> Option<String> {
     None
 }
 
-/// The scheduler's message when the pod cannot be placed yet. Not fatal: an
-/// autoscaler may still bring up a matching node.
+/// The scheduler's message when the pod cannot be placed yet. Not fatal at
+/// first: an autoscaler may still bring up a matching node.
 fn unschedulable_message(pod: &Value) -> Option<String> {
     pod.pointer("/status/conditions")?
         .as_array()?
@@ -628,7 +645,7 @@ impl KubernetesRuntime {
 
     /// Block until the wait container runs, so volumes can be streamed into it.
     async fn wait_for_init_running(&self, name: &str) -> Result<(), ContainerError> {
-        let mut warned_unschedulable = false;
+        let mut unschedulable_since = None;
         let mut pull_watch = PullWatch::default();
         let started = std::time::Instant::now();
         loop {
@@ -656,14 +673,29 @@ impl KubernetesRuntime {
                 }
                 _ => {}
             }
-            if !warned_unschedulable {
-                if let Some(msg) = unschedulable_message(&pod) {
-                    wrkflw_logging::warning(&format!(
-                        "Pod {} is not schedulable yet, waiting: {}",
-                        name, msg
-                    ));
-                    warned_unschedulable = true;
+            match unschedulable_message(&pod) {
+                Some(msg) => {
+                    let limit = self.config.schedule_timeout();
+                    let since = *unschedulable_since.get_or_insert_with(|| {
+                        wrkflw_logging::warning(&format!(
+                            "Pod {} is not schedulable yet, waiting up to {} seconds: {}",
+                            name,
+                            limit.as_secs(),
+                            msg
+                        ));
+                        std::time::Instant::now()
+                    });
+                    if since.elapsed() >= limit {
+                        return Err(ContainerError::ContainerStart(format!(
+                            "pod {} could not be scheduled within {} seconds \
+                             (--k8s-schedule-timeout): {}",
+                            name,
+                            limit.as_secs(),
+                            msg
+                        )));
+                    }
                 }
+                None => unschedulable_since = None,
             }
             tokio::time::sleep(poll_interval(started.elapsed())).await;
         }
@@ -1163,6 +1195,10 @@ mod tests {
         let c = cfg();
         assert_eq!(c.helper_image(), DEFAULT_HELPER_IMAGE);
         assert_eq!(c.timeout(), Duration::from_secs(DEFAULT_TIMEOUT_SECS));
+        assert_eq!(
+            c.schedule_timeout(),
+            Duration::from_secs(DEFAULT_SCHEDULE_TIMEOUT_SECS)
+        );
         assert!(c.kubectl_args().is_empty());
         assert_eq!(c.describe(), "context 'current', namespace 'current'");
     }
@@ -1549,6 +1585,82 @@ esac
             .unwrap()
             .iter()
             .any(|p| log.contains(&p.name)));
+    }
+
+    /// A runtime whose "kubectl" answers every `get` with `pod`, for steps
+    /// that never get past scheduling.
+    #[cfg(unix)]
+    fn runtime_stuck_at(work: &Path, pod: &str, config: KubernetesConfig) -> KubernetesRuntime {
+        let script = work.join("kubectl.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "echo \"$*\" >> \"$(dirname \"$0\")/log\"\n\
+                 case \"$1\" in create) cat >/dev/null ;; get) echo '{}' ;; esac\n",
+                pod
+            ),
+        )
+        .unwrap();
+        let mut rt = KubernetesRuntime::new(config, false);
+        rt.kubectl = "sh".into();
+        rt.kubectl_prefix = vec![script.to_string_lossy().to_string()];
+        rt
+    }
+
+    #[cfg(unix)]
+    fn wait_for_delete(work: &Path) -> String {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let log = std::fs::read_to_string(work.join("log")).unwrap_or_default();
+            if log.contains("delete pod") {
+                return log;
+            }
+            assert!(std::time::Instant::now() < deadline, "no delete in:\n{log}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unschedulable_pod_gives_up_at_the_schedule_timeout() {
+        let work = tempfile::tempdir().unwrap();
+        let pod = r#"{"status":{"phase":"Pending","conditions":[{"type":"PodScheduled","reason":"Unschedulable","message":"no node matches"}]}}"#;
+        let rt = runtime_stuck_at(
+            work.path(),
+            pod,
+            KubernetesConfig {
+                schedule_timeout_secs: Some(1),
+                ..Default::default()
+            },
+        );
+        let err = rt
+            .run_container("ubuntu", &[], &[], Path::new("/"), &[], None)
+            .await
+            .expect_err("must not wait out the step timeout");
+        let err = err.to_string();
+        assert!(err.contains("--k8s-schedule-timeout"), "{}", err);
+        assert!(err.contains("no node matches"), "{}", err);
+        wait_for_delete(work.path());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_step_timeout_names_the_flag_and_deletes_the_pod() {
+        let work = tempfile::tempdir().unwrap();
+        let rt = runtime_stuck_at(
+            work.path(),
+            r#"{"status":{"phase":"Pending"}}"#,
+            KubernetesConfig {
+                timeout_secs: Some(1),
+                ..Default::default()
+            },
+        );
+        let err = rt
+            .run_container("ubuntu", &[], &[], Path::new("/"), &[], None)
+            .await
+            .expect_err("must time out");
+        assert!(err.to_string().contains("--k8s-timeout"), "{}", err);
+        wait_for_delete(work.path());
     }
 
     /// A guard whose "kubectl" records its arguments in `log` instead.

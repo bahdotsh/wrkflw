@@ -164,6 +164,17 @@ struct KubernetesArgs {
         value_parser = clap::value_parser!(u64).range(1..)
     )]
     k8s_timeout: Option<u64>,
+
+    /// Seconds a pod may stay unschedulable before the step fails. Raise it if an autoscaler
+    /// needs longer to bring up a node
+    #[arg(
+        long = "k8s-schedule-timeout",
+        global = true,
+        value_name = "SECONDS",
+        env = "WRKFLW_K8S_SCHEDULE_TIMEOUT",
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    k8s_schedule_timeout: Option<u64>,
 }
 
 impl KubernetesArgs {
@@ -182,6 +193,7 @@ impl KubernetesArgs {
             registry: self.k8s_registry.clone(),
             helper_image: self.k8s_helper_image.clone(),
             timeout_secs: self.k8s_timeout,
+            schedule_timeout_secs: self.k8s_schedule_timeout,
         }
     }
 }
@@ -1223,6 +1235,8 @@ mod tests {
             "alpine:3.19",
             "--k8s-timeout",
             "120",
+            "--k8s-schedule-timeout",
+            "900",
         ]);
         assert_eq!(cfg.context.as_deref(), Some("gpu"));
         assert_eq!(cfg.namespace.as_deref(), Some("ci"));
@@ -1243,6 +1257,7 @@ mod tests {
         assert_eq!(cfg.registry.as_deref(), Some("registry.example.com/ci"));
         assert_eq!(cfg.helper_image.as_deref(), Some("alpine:3.19"));
         assert_eq!(cfg.timeout_secs, Some(120));
+        assert_eq!(cfg.schedule_timeout_secs, Some(900));
     }
 
     #[test]
@@ -1257,6 +1272,7 @@ mod tests {
     #[test]
     fn k8s_timeout_rejects_zero() {
         assert!(Wrkflw::try_parse_from(["wrkflw", "--k8s-timeout", "0"]).is_err());
+        assert!(Wrkflw::try_parse_from(["wrkflw", "--k8s-schedule-timeout", "0"]).is_err());
         assert_eq!(
             k8s_config_from(&["wrkflw", "--k8s-timeout", "1"]).timeout_secs,
             Some(1)

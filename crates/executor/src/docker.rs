@@ -867,6 +867,42 @@ impl ContainerRuntime for DockerRuntime {
 }
 
 // Move the actual implementation to internal methods
+/// Build the create-container config for a step.
+///
+/// The image name must not change how a step's command runs. Wrapping `cmd`
+/// in an entrypoint for particular images is how act images once lost every
+/// step's command while reporting success.
+fn build_container_config(
+    image: &str,
+    cmd: Vec<String>,
+    env: Vec<String>,
+    working_dir: &Path,
+    host_config: HostConfig,
+    is_windows_image: bool,
+    entrypoint: Option<&str>,
+) -> Config<String> {
+    Config {
+        image: Some(image.to_string()),
+        // Empty cmd means "use the image's built-in ENTRYPOINT/CMD"
+        cmd: if cmd.is_empty() { None } else { Some(cmd) },
+        env: Some(env),
+        working_dir: Some(working_dir.to_string_lossy().to_string()),
+        host_config: Some(host_config),
+        // Windows containers need specific configuration
+        user: if is_windows_image {
+            Some("ContainerAdministrator".to_string())
+        } else {
+            None
+        },
+        // An explicit entrypoint from action.yml wins. Otherwise keep the
+        // image's own, which an empty cmd relies on.
+        entrypoint: entrypoint
+            .filter(|s| !s.is_empty())
+            .map(|ep| vec![ep.to_string()]),
+        ..Default::default()
+    }
+}
+
 impl DockerRuntime {
     async fn run_container_inner(
         &self,
@@ -905,7 +941,6 @@ impl DockerRuntime {
 
         // Convert command vector to Vec<String>
         let cmd_vec: Vec<String> = cmd.iter().map(|&s| s.to_string()).collect();
-        let has_cmd = !cmd_vec.is_empty();
 
         wrkflw_logging::debug(&format!("Running command in Docker: {:?}", cmd_vec));
         wrkflw_logging::debug(&format!("Environment: {:?}", env));
@@ -940,27 +975,15 @@ impl DockerRuntime {
             }
         };
 
-        // Create container config with platform-specific settings
-        let config = Config {
-            image: Some(image.to_string()),
-            // Empty cmd means "use the image's built-in ENTRYPOINT/CMD"
-            cmd: if has_cmd { Some(cmd_vec) } else { None },
-            env: Some(env),
-            working_dir: Some(working_dir.to_string_lossy().to_string()),
-            host_config: Some(host_config),
-            // Windows containers need specific configuration
-            user: if is_windows_image {
-                Some("ContainerAdministrator".to_string())
-            } else {
-                None
-            },
-            // An explicit entrypoint from action.yml wins. Otherwise keep the
-            // image's own, which an empty cmd relies on.
-            entrypoint: entrypoint
-                .filter(|s| !s.is_empty())
-                .map(|ep| vec![ep.to_string()]),
-            ..Default::default()
-        };
+        let config = build_container_config(
+            image,
+            cmd_vec,
+            env,
+            working_dir,
+            host_config,
+            is_windows_image,
+            entrypoint,
+        );
 
         // Create container with a shorter timeout
         let create_result = tokio::time::timeout(
@@ -1270,5 +1293,60 @@ pub fn get_tracked_networks() -> Vec<String> {
         networks.clone()
     } else {
         vec![]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config_for(image: &str, cmd: &[&str], entrypoint: Option<&str>) -> Config<String> {
+        build_container_config(
+            image,
+            cmd.iter().map(|s| s.to_string()).collect(),
+            Vec::new(),
+            Path::new("/github/workspace"),
+            HostConfig::default(),
+            false,
+            entrypoint,
+        )
+    }
+
+    #[test]
+    fn act_image_keeps_step_command_and_image_entrypoint() {
+        for image in [
+            "catthehacker/ubuntu:act-latest",
+            "nektos/act-environments-ubuntu:18.04",
+        ] {
+            let config = config_for(image, &["sh", "-c", "exit 7"], None);
+            assert_eq!(config.entrypoint, None, "{image}");
+            assert_eq!(
+                config.cmd,
+                Some(vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "exit 7".to_string()
+                ]),
+                "{image}"
+            );
+            assert_eq!(config.labels, None, "{image}");
+        }
+    }
+
+    #[test]
+    fn empty_cmd_leaves_the_image_defaults_in_place() {
+        let config = config_for("my/image:1", &[], None);
+        assert_eq!(config.cmd, None);
+        assert_eq!(config.entrypoint, None);
+    }
+
+    #[test]
+    fn explicit_entrypoint_wins_and_empty_one_is_ignored() {
+        let config = config_for("my/image:1", &["arg"], Some("/entry.sh"));
+        assert_eq!(config.entrypoint, Some(vec!["/entry.sh".to_string()]));
+        assert_eq!(
+            config_for("my/image:1", &["arg"], Some("")).entrypoint,
+            None
+        );
     }
 }

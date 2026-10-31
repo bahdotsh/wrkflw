@@ -214,26 +214,22 @@ pub async fn cleanup_resources() {
         Ok(mut guard) => guard.drain(..).collect(),
         Err(_) => return,
     };
-    futures::future::join_all(pods.iter().map(force_delete_pod)).await;
+    futures::future::join_all(pods.iter().map(delete_tracked_pod)).await;
 }
 
-fn force_delete_args(name: &str) -> [&str; 7] {
-    [
-        "delete",
-        "pod",
-        name,
-        "--ignore-not-found",
-        "--wait=false",
-        "--grace-period=0",
-        "--force",
-    ]
+/// Never `--force`: that frees the pod's GPUs in the scheduler while the
+/// kubelet may still be killing the process using them, and the next pod
+/// placed there fails to initialise the device. `--wait=false` returns at once
+/// and `terminationGracePeriodSeconds` bounds the rest.
+fn delete_args(name: &str) -> [&str; 5] {
+    ["delete", "pod", name, "--ignore-not-found", "--wait=false"]
 }
 
-async fn force_delete_pod(pod: &PodRef) {
+async fn delete_tracked_pod(pod: &PodRef) {
     wrkflw_logging::info(&format!("Deleting Kubernetes pod {}", pod.name));
     let _ = Command::new("kubectl")
         .args(&pod.kubectl_args)
-        .args(force_delete_args(&pod.name))
+        .args(delete_args(&pod.name))
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
@@ -293,7 +289,7 @@ impl Drop for PodGuard {
         ));
         let child = std::process::Command::new(&self.kubectl)
             .args(&self.pod.kubectl_args)
-            .args(force_delete_args(&self.pod.name))
+            .args(delete_args(&self.pod.name))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -707,12 +703,7 @@ impl KubernetesRuntime {
     }
 
     async fn delete_pod(&self, name: &str) {
-        let output = self
-            .kubectl(
-                &["delete", "pod", name, "--ignore-not-found", "--wait=false"],
-                None,
-            )
-            .await;
+        let output = self.kubectl(&delete_args(name), None).await;
         match output {
             Ok(o) if o.status.success() => wrkflw_logging::debug(&format!("Deleted pod {}", name)),
             Ok(o) => wrkflw_logging::warning(&format!(
@@ -2383,6 +2374,8 @@ mod tests {
         }
         let args = std::fs::read_to_string(&log).unwrap();
         assert!(args.starts_with("delete pod wrkflw-cancelled "), "{}", args);
+        assert!(!args.contains("--force"), "{}", args);
+        assert!(!args.contains("--grace-period"), "{}", args);
     }
 
     #[cfg(unix)]

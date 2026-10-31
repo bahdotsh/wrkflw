@@ -470,8 +470,11 @@ fn parse_key_val(s: &str) -> Result<(String, String), String> {
 // Or call wrkflw_executor::cleanup and wrkflw_runtime::cleanup directly?
 // Let's try calling them directly for now.
 async fn cleanup_on_exit() {
-    // Clean up Docker resources if available, but don't let it block indefinitely
-    match tokio::time::timeout(std::time::Duration::from_secs(3), async {
+    // Clean up Docker resources if available, but don't let it block indefinitely.
+    // Runs alongside the Kubernetes sweep: these timeouts plus the emulation one
+    // would otherwise add up to the whole of handle_signals' hard exit budget,
+    // and a stuck daemon must not cost a GPU pod its delete.
+    let docker_cleanup = tokio::time::timeout(std::time::Duration::from_secs(3), async {
         match Docker::connect_with_local_defaults() {
             Ok(docker) => {
                 // Assuming cleanup_resources exists in executor crate
@@ -482,22 +485,21 @@ async fn cleanup_on_exit() {
                 wrkflw_logging::info("Docker not available, skipping Docker cleanup");
             }
         }
-    })
-    .await
-    {
+    });
+    // Delete any pods a Kubernetes run still has in flight
+    let kubernetes_cleanup = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        wrkflw_executor::kubernetes::cleanup_resources(),
+    );
+
+    let (docker_result, kubernetes_result) = tokio::join!(docker_cleanup, kubernetes_cleanup);
+    match docker_result {
         Ok(_) => wrkflw_logging::debug("Docker cleanup completed successfully"),
         Err(_) => wrkflw_logging::warning(
             "Docker cleanup timed out after 3 seconds, continuing with shutdown",
         ),
     }
-
-    // Delete any pods a Kubernetes run still has in flight
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        wrkflw_executor::kubernetes::cleanup_resources(),
-    )
-    .await
-    {
+    match kubernetes_result {
         Ok(_) => wrkflw_logging::debug("Kubernetes cleanup completed successfully"),
         Err(_) => wrkflw_logging::warning("Kubernetes cleanup timed out, continuing with shutdown"),
     }

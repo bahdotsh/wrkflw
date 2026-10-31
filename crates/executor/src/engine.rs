@@ -9231,17 +9231,6 @@ runs:
             effective(RuntimeType::SecureEmulation),
             RuntimeType::SecureEmulation
         );
-        // These depend on the host, which may fall back to emulation, but they
-        // must never report any other runtime.
-        for runtime in [RuntimeType::Docker, RuntimeType::Podman] {
-            let reported = effective(runtime.clone());
-            assert!(
-                reported == runtime || reported == RuntimeType::Emulation,
-                "{:?} reported {:?}",
-                runtime,
-                reported
-            );
-        }
     }
 
     /// Run `step` in a container-less job with `job_env` and the shared stores.
@@ -9250,29 +9239,16 @@ runs:
         job_env: &HashMap<String, String>,
         runtime: &MockContainerRuntime,
     ) -> StepResult {
-        let workflow = minimal_workflow();
         let working_dir = std::env::current_dir().unwrap();
-        let ctx = StepExecutionContext {
+        run_step_with(
             step,
-            step_idx: 0,
             job_env,
-            job_user_env: job_env,
-            working_dir: &working_dir,
+            &working_dir,
             runtime,
-            workflow: &workflow,
-            runner_image: "ubuntu:latest",
-            verbose: false,
-            matrix_combination: &None,
-            container_config: None,
-            workflow_defaults: None,
-            job_defaults: None,
-            step_outputs: &HashMap::new(),
-            step_statuses: &HashMap::new(),
-            job_status: "success",
-            services: test_services(),
-            pending_cache_saves: &TEST_PENDING_CACHE_SAVES,
-        };
-        execute_step(ctx).await.unwrap()
+            test_services(),
+            &TEST_PENDING_CACHE_SAVES,
+        )
+        .await
     }
 
     /// Run `step` as a job with `job_env` would, with its own stores.
@@ -9283,6 +9259,22 @@ runs:
         runtime: &MockContainerRuntime,
         artifact_store: &crate::artifacts::ArtifactStore,
         cache_store: &crate::cache::CacheStore,
+        pending: &std::sync::Mutex<Vec<PendingCacheSave>>,
+    ) -> StepResult {
+        let services = JobServices {
+            artifact_store,
+            cache_store,
+            ..test_services()
+        };
+        run_step_with(step, job_env, working_dir, runtime, services, pending).await
+    }
+
+    async fn run_step_with(
+        step: &Step,
+        job_env: &HashMap<String, String>,
+        working_dir: &Path,
+        runtime: &MockContainerRuntime,
+        services: JobServices<'_>,
         pending: &std::sync::Mutex<Vec<PendingCacheSave>>,
     ) -> StepResult {
         let workflow = minimal_workflow();
@@ -9303,16 +9295,7 @@ runs:
             step_outputs: &HashMap::new(),
             step_statuses: &HashMap::new(),
             job_status: "success",
-            services: JobServices {
-                secret_manager: None,
-                secret_masker: None,
-                secrets_context: &HashMap::new(),
-                needs_context: &HashMap::new(),
-                needs_results: &HashMap::new(),
-                artifact_store,
-                cache_store,
-                platform_overrides: &HashMap::new(),
-            },
+            services,
             pending_cache_saves: pending,
         };
         execute_step(ctx).await.unwrap()

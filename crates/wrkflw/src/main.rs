@@ -1079,6 +1079,25 @@ mod tests {
         assert_eq!(map["ubuntu"], "two:2");
     }
 
+    // The only test that sets this variable. Every other platform test passes
+    // -P, which replaces it, so running alongside them is safe.
+    #[test]
+    fn platform_env_applies_unless_the_flag_is_given() {
+        std::env::set_var("WRKFLW_PLATFORM", "a=env:1,b=env:2");
+        let from_env = platform_overrides_from(&["wrkflw"]);
+        let from_flag = platform_overrides_from(&["wrkflw", "-P", "a=flag:1"]);
+        std::env::set_var("WRKFLW_PLATFORM", "");
+        let from_empty = platform_overrides_from(&["wrkflw"]);
+        std::env::remove_var("WRKFLW_PLATFORM");
+
+        assert_eq!(from_env.len(), 2);
+        assert_eq!(from_env["a"], "env:1");
+        assert_eq!(from_env["b"], "env:2");
+        assert_eq!(from_flag.len(), 1);
+        assert_eq!(from_flag["a"], "flag:1");
+        assert!(from_empty.is_empty());
+    }
+
     #[test]
     fn platform_flag_rejects_malformed_values() {
         assert!(Wrkflw::try_parse_from(["wrkflw", "-P", "no-equals"]).is_err());

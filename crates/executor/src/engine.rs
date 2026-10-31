@@ -6006,6 +6006,17 @@ mod tests {
     }
 
     #[test]
+    fn matrix_runs_on_with_unknown_key_falls_back_to_builtin() {
+        let job = make_job(None, labels(&["${{ matrix.os }}"]));
+        let map = overrides(&[("ubuntu-latest", "my/image:1")]);
+        let matrix = HashMap::from([("node".to_string(), Value::String("20".to_string()))]);
+        assert_eq!(
+            get_effective_runner_image(&job, &map, Some(&matrix)),
+            "ubuntu:latest"
+        );
+    }
+
+    #[test]
     fn execution_config_default_auto_detects_runtime_with_no_overrides() {
         let config = ExecutionConfig::default();
         assert_eq!(config.runtime_type, RuntimeType::Auto);

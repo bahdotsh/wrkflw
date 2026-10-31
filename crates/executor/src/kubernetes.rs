@@ -1214,6 +1214,14 @@ fn unpack_archive<R: io::Read>(reader: R, host: &Path) -> io::Result<HashSet<Pat
         }
         let is_dir = entry.header().entry_type().is_dir();
         clear_type_conflict(host, &rel, is_dir)?;
+        // Not every tar writes an entry for each parent, and whatever is
+        // missing from `seen` is deleted by the prune.
+        seen.extend(
+            rel.ancestors()
+                .skip(1)
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .map(Path::to_path_buf),
+        );
         seen.insert(rel);
         if is_dir {
             directories.push(entry);
@@ -1887,6 +1895,24 @@ mod tests {
         assert_eq!(read("fresh/f.txt"), "made in pod");
         assert!(!host.path().join("deleted.txt").exists());
         assert!(!host.path().join("gone").exists());
+    }
+
+    /// `tar` is free to leave parents implicit, and `--k8s-helper-image` lets
+    /// users pick the tar.
+    #[test]
+    fn mirroring_keeps_directories_the_archive_only_implies() {
+        let host = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(host.path().join("a/b")).unwrap();
+        std::fs::write(host.path().join("a/b/stale.txt"), "x").unwrap();
+
+        let tar = archive(|b| add_file(b, "./a/b/f.txt", b"from the pod"));
+        unpack_mirroring(tar.as_slice(), host.path(), &[]).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(host.path().join("a/b/f.txt")).unwrap(),
+            "from the pod"
+        );
+        assert!(!host.path().join("a/b/stale.txt").exists());
     }
 
     #[test]

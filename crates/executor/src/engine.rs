@@ -3046,7 +3046,7 @@ async fn run_step_with_guards(
     // Check step-level if condition
     if let Some(if_cond) = &step.if_condition {
         let cond_ctx = step_exec_ctx.expr_context();
-        let should_run = evaluate_condition_with_context(if_cond, &cond_ctx);
+        let should_run = evaluate_step_condition(if_cond, step_exec_ctx.working_dir, &cond_ctx);
         if !should_run {
             wrkflw_logging::info(&format!(
                 "  {} Skipping step '{}' due to condition: {}",
@@ -5302,7 +5302,9 @@ async fn execute_composite_action(
                 };
 
                 let should_run = match &composite_step.if_condition {
-                    Some(cond) => evaluate_condition_with_context(cond, &step_ctx.expr_context()),
+                    Some(cond) => {
+                        evaluate_step_condition(cond, working_dir, &step_ctx.expr_context())
+                    }
                     None => true,
                 };
 
@@ -5877,9 +5879,27 @@ fn resolve_matrix_expressions(
     };
     matrix.resolve_expressions(|expr| {
         let inner = crate::expression::strip_expression_wrapper(expr);
-        // `fromJSON` yields the JSON text itself, and objects render as JSON.
+        // Arrays and objects render as JSON.
         crate::expression::evaluate(inner, &ctx).map(|value| value.to_output_string())
     })
+}
+
+/// Evaluate a step `if:` condition. Unlike a job's, it may call `hashFiles`.
+fn evaluate_step_condition(
+    condition: &str,
+    working_dir: &Path,
+    ctx: &crate::expression::ExpressionContext<'_>,
+) -> bool {
+    match crate::substitution::expand_hash_files(condition, working_dir) {
+        Ok(expanded) => evaluate_condition_with_context(&expanded, ctx),
+        Err(e) => {
+            wrkflw_logging::warning(&format!(
+                "Condition '{}' failed: {} — treating as false (step will be skipped)",
+                condition, e
+            ));
+            false
+        }
+    }
 }
 
 /// Evaluate a job/step `if:` condition using the expression evaluator.

@@ -1,6 +1,6 @@
 # Codebase Index: wrkflw
 
-> Generated: 2026-10-31 17:27:53 UTC | Files: 208 | Lines: 82485
+> Generated: 2026-10-31 17:30:42 UTC | Files: 208 | Lines: 83280
 > Languages: JSON (4), Markdown (24), Rust (119), Shell (5), TOML (18), YAML (38)
 
 ## Directory Structure
@@ -498,6 +498,7 @@ wrkflw/
 - `pub fn process_step_run(run: &str, matrix_combination: &Option<HashMap<String, Value>>) -> String`
 - `pub fn apply_matrix_to_steps(steps: &[Step], matrix_values: &HashMap<String, Value>) -> Vec<Step>`
 - `pub fn preprocess_hash_files(text: &str, workspace: &Path) -> Result<String, String>`
+- `pub fn expand_hash_files(expr: &str, workspace: &Path) -> Result<String, String>`
 - `pub fn preprocess_expressions( text: &str, workspace: &Path, ctx: &crate::expression::ExpressionContext<'_>, ) -> Result<String, String>`
 - `pub fn preprocess_expressions_strict( text: &str, workspace: &Path, ctx: &crate::expression::ExpressionContext<'_>, ) -> Result<String, String>`
 
@@ -1474,7 +1475,7 @@ wrkflw/
 
 ## INDEX.md
 
-**Language:** Markdown | **Size:** 154.3 KB | **Lines:** 6046
+**Language:** Markdown | **Size:** 168.8 KB | **Lines:** 6403
 
 **Declarations:**
 
@@ -1803,7 +1804,7 @@ wrkflw/
 
 ## crates/executor/src/engine.rs
 
-**Language:** Rust | **Size:** 419.3 KB | **Lines:** 11529
+**Language:** Rust | **Size:** 419.9 KB | **Lines:** 11549
 
 **Imports:**
 - `bollard::Docker`
@@ -2063,6 +2064,8 @@ wrkflw/
 
 `fn resolve_matrix_expressions( matrix: &wrkflw_matrix::MatrixConfig, env_context: &HashMap<String, String>, user_env: &HashMap<String, String>, needs_context: &HashMap<String, HashMap<String, String>>, needs_results: &HashMap<String, String>, ) -> Result<wrkflw_matrix::MatrixConfig, wrkflw_matrix::MatrixError>`
 
+`fn evaluate_step_condition( condition: &str, working_dir: &Path, ctx: &crate::expression::ExpressionContext<'_>, ) -> bool`
+
 `fn evaluate_condition_with_context( condition: &str, ctx: &crate::expression::ExpressionContext<'_>, ) -> bool`
 
 `fn build_needs_context( job: &Job, all_outputs: &HashMap<String, HashMap<String, String>>, all_results: &HashMap<String, String>, ) -> ( HashMap<String, HashMap<String, String>>, HashMap<String, String>, )`
@@ -2127,7 +2130,7 @@ wrkflw/
 
 ## crates/executor/src/expression.rs
 
-**Language:** Rust | **Size:** 113.2 KB | **Lines:** 2809
+**Language:** Rust | **Size:** 125.4 KB | **Lines:** 3130
 
 **Imports:**
 - `serde_yaml::Value`
@@ -2141,9 +2144,13 @@ wrkflw/
 
   `pub fn to_output_string(&self) -> String`
 
+  `fn to_number(&self) -> f64`
+
+
+`fn parse_number(s: &str) -> f64`
 
 `enum Token`
-> Variants: `Ident`, `StringLit`, `NumberLit`, `True`, `False`, `Null`, `Dot`, `LParen`, `RParen`, `Comma`, `Eq`, `Ne`, `Lt`, `Le`, `Gt`, `Ge`, `And`, `Or`, `Not`, `Eof`
+> Variants: `Ident`, `StringLit`, `NumberLit`, `True`, `False`, `Null`, `Dot`, `LParen`, `LBracket`, `RBracket`, `Star`, `RParen`, `Comma`, `Eq`, `Ne`, `Lt`, `Le`, `Gt`, `Ge`, `And`, `Or`, `Not`, `Eof`
 
 `struct Tokenizer<'a>`
 > Fields: `input: &'a str`, `pos: usize`
@@ -2167,10 +2174,18 @@ wrkflw/
 `pub(crate) fn github_context_suffix(key: &str) -> Option<String>`
 
 **`impl<'a> ExpressionContext<'a>`**
+  `fn resolve_path(&self, parts: &[String]) -> ExprValue`
+
   `fn resolve(&self, parts: &[String]) -> ExprValue`
 
 
 `fn yaml_value_to_expr(v: &Value) -> ExprValue`
+
+`fn json_value_to_expr(v: &serde_json::Value) -> ExprValue`
+
+`fn index_value(value: &ExprValue, key: &ExprValue) -> ExprValue`
+
+`fn filter_children(value: &ExprValue) -> Vec<ExprValue>`
 
 `struct Parser`
 > Fields: `tokens: Vec<Token>`, `pos: usize`
@@ -2197,6 +2212,8 @@ wrkflw/
   `fn parse_primary(&mut self, ctx: &ExpressionContext) -> Result<ExprValue, String>`
 
   `fn parse_ident_or_call(&mut self, ctx: &ExpressionContext) -> Result<ExprValue, String>`
+
+  `fn parse_postfix( &mut self, mut value: ExprValue, ctx: &ExpressionContext, ) -> Result<ExprValue, String>`
 
 
 `fn expr_eq(a: &ExprValue, b: &ExprValue) -> bool`
@@ -2575,7 +2592,7 @@ wrkflw/
 
 ## crates/executor/src/substitution.rs
 
-**Language:** Rust | **Size:** 31.0 KB | **Lines:** 845
+**Language:** Rust | **Size:** 34.5 KB | **Lines:** 942
 
 **Imports:**
 - `lazy_static::lazy_static`
@@ -2588,7 +2605,11 @@ wrkflw/
 
 **Declarations:**
 
+`fn expression_end(text: &str, start: usize) -> Option<usize>`
+
 `fn compute_hash_files(args_raw: &str, workspace: &Path) -> Result<String, String>`
+
+`fn expand_expressions( text: &str, workspace: &Path, ctx: &crate::expression::ExpressionContext<'_>, strict: bool, ) -> Result<String, String>`
 
 `mod tests`
 

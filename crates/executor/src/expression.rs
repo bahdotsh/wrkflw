@@ -26,6 +26,8 @@ pub enum ExprValue {
     Null,
     /// A key-value map, used for context objects like `env`, `github`, etc.
     Object(HashMap<String, ExprValue>),
+    /// A list, produced by `fromJSON`, matrix values and `.*` filters.
+    Array(Vec<ExprValue>),
 }
 
 impl ExprValue {
@@ -36,7 +38,7 @@ impl ExprValue {
             ExprValue::Number(n) => *n != 0.0 && !n.is_nan(),
             ExprValue::String(s) => !s.is_empty(),
             ExprValue::Null => false,
-            ExprValue::Object(_) => true,
+            ExprValue::Object(_) | ExprValue::Array(_) => true,
         }
     }
 
@@ -59,8 +61,37 @@ impl ExprValue {
                     map.iter().map(|(k, v)| (k, expr_to_json(v))).collect();
                 serde_json::to_string_pretty(&sorted).unwrap_or_else(|_| "{}".to_string())
             }
+            ExprValue::Array(_) => serde_json::to_string_pretty(&expr_to_json(self))
+                .unwrap_or_else(|_| "[]".to_string()),
         }
     }
+
+    /// GitHub Actions number coercion: `null` and `''` are 0, booleans are 0/1,
+    /// strings parse as JSON-style numbers, and everything else is NaN.
+    fn to_number(&self) -> f64 {
+        match self {
+            ExprValue::Null => 0.0,
+            ExprValue::Bool(b) => f64::from(u8::from(*b)),
+            ExprValue::Number(n) => *n,
+            ExprValue::String(s) => parse_number(s),
+            ExprValue::Object(_) | ExprValue::Array(_) => f64::NAN,
+        }
+    }
+}
+
+fn parse_number(s: &str) -> f64 {
+    let s = s.trim();
+    if s.is_empty() {
+        return 0.0;
+    }
+    if let Some(hex) = s.strip_prefix("0x") {
+        return i64::from_str_radix(hex, 16).map_or(f64::NAN, |n| n as f64);
+    }
+    // Rust also accepts `nan` and `inf`, which are not numbers here.
+    if s.chars().any(|c| matches!(c, 'n' | 'N' | 'i' | 'I')) {
+        return f64::NAN;
+    }
+    s.parse().unwrap_or(f64::NAN)
 }
 
 // ---------------------------------------------------------------------------
@@ -77,6 +108,9 @@ enum Token {
     Null,
     Dot,
     LParen,
+    LBracket,
+    RBracket,
+    Star,
     RParen,
     Comma,
     Eq,  // ==
@@ -135,6 +169,18 @@ impl<'a> Tokenizer<'a> {
                     tokens.push(Token::Comma);
                     self.pos += 1;
                 }
+                '[' => {
+                    tokens.push(Token::LBracket);
+                    self.pos += 1;
+                }
+                ']' => {
+                    tokens.push(Token::RBracket);
+                    self.pos += 1;
+                }
+                '*' => {
+                    tokens.push(Token::Star);
+                    self.pos += 1;
+                }
                 '=' => {
                     if self.peek_next_byte() == Some(b'=') {
                         tokens.push(Token::Eq);
@@ -190,6 +236,9 @@ impl<'a> Tokenizer<'a> {
                     tokens.push(self.read_string()?);
                 }
                 c if c.is_ascii_digit() => {
+                    tokens.push(self.read_number()?);
+                }
+                '-' if self.peek_next_byte().is_some_and(|b| b.is_ascii_digit()) => {
                     tokens.push(self.read_number()?);
                 }
                 c if c.is_ascii_alphabetic() || c == '_' => {
@@ -251,10 +300,36 @@ impl<'a> Tokenizer<'a> {
     fn read_number(&mut self) -> Result<Token, String> {
         let start = self.pos;
         let bytes = self.input.as_bytes();
+        if bytes[self.pos] == b'-' {
+            self.pos += 1;
+        }
+        if bytes[self.pos..].starts_with(b"0x") {
+            self.pos += 2;
+            while self.pos < bytes.len() && bytes[self.pos].is_ascii_hexdigit() {
+                self.pos += 1;
+            }
+            let s = &self.input[start..self.pos];
+            let digits = s.trim_start_matches('-').trim_start_matches("0x");
+            let n = i64::from_str_radix(digits, 16)
+                .map_err(|e| format!("invalid number '{}': {}", s, e))? as f64;
+            return Ok(Token::NumberLit(if s.starts_with('-') { -n } else { n }));
+        }
         while self.pos < bytes.len()
             && (bytes[self.pos].is_ascii_digit() || bytes[self.pos] == b'.')
         {
             self.pos += 1;
+        }
+        if matches!(bytes.get(self.pos), Some(b'e' | b'E')) {
+            let sign = usize::from(matches!(bytes.get(self.pos + 1), Some(b'+' | b'-')));
+            if bytes
+                .get(self.pos + 1 + sign)
+                .is_some_and(u8::is_ascii_digit)
+            {
+                self.pos += 1 + sign;
+                while self.pos < bytes.len() && bytes[self.pos].is_ascii_digit() {
+                    self.pos += 1;
+                }
+            }
         }
         let s = &self.input[start..self.pos];
         let n: f64 = s
@@ -340,6 +415,20 @@ pub struct ExpressionContext<'a> {
 }
 
 impl<'a> ExpressionContext<'a> {
+    /// Resolve a context path, walking into the longest prefix that names a
+    /// value, so `matrix.cfg.name` and `steps.a.outputs` both resolve.
+    fn resolve_path(&self, parts: &[String]) -> ExprValue {
+        (1..=parts.len())
+            .rev()
+            .map(|n| (self.resolve(&parts[..n]), &parts[n..]))
+            .find(|(value, _)| *value != ExprValue::Null)
+            .map_or(ExprValue::Null, |(value, rest)| {
+                rest.iter().fold(value, |value, part| {
+                    index_value(&value, &ExprValue::String(part.clone()))
+                })
+            })
+    }
+
     /// Resolve a dotted context reference like `inputs.toolchain` or
     /// `steps.build.outputs.version`.
     fn resolve(&self, parts: &[String]) -> ExprValue {
@@ -592,12 +681,62 @@ fn yaml_value_to_expr(v: &Value) -> ExprValue {
         Value::Number(n) => ExprValue::Number(n.as_f64().unwrap_or(0.0)),
         Value::Bool(b) => ExprValue::Bool(*b),
         Value::Null => ExprValue::Null,
-        _ => ExprValue::String(
-            serde_yaml::to_string(v)
-                .unwrap_or_else(|_| format!("{:?}", v))
-                .trim()
-                .to_string(),
+        Value::Sequence(items) => ExprValue::Array(items.iter().map(yaml_value_to_expr).collect()),
+        Value::Mapping(map) => ExprValue::Object(
+            map.iter()
+                .filter_map(|(k, v)| Some((k.as_str()?.to_string(), yaml_value_to_expr(v))))
+                .collect(),
         ),
+        Value::Tagged(tagged) => yaml_value_to_expr(&tagged.value),
+    }
+}
+
+fn json_value_to_expr(v: &serde_json::Value) -> ExprValue {
+    match v {
+        serde_json::Value::Null => ExprValue::Null,
+        serde_json::Value::Bool(b) => ExprValue::Bool(*b),
+        serde_json::Value::Number(n) => ExprValue::Number(n.as_f64().unwrap_or(0.0)),
+        serde_json::Value::String(s) => ExprValue::String(s.clone()),
+        serde_json::Value::Array(items) => {
+            ExprValue::Array(items.iter().map(json_value_to_expr).collect())
+        }
+        serde_json::Value::Object(map) => ExprValue::Object(
+            map.iter()
+                .map(|(k, v)| (k.clone(), json_value_to_expr(v)))
+                .collect(),
+        ),
+    }
+}
+
+/// `value[key]`: property names match case-insensitively, as in GitHub Actions.
+/// A missing property or an index out of range is `null`.
+fn index_value(value: &ExprValue, key: &ExprValue) -> ExprValue {
+    match (value, key) {
+        (ExprValue::Object(map), ExprValue::String(name)) => map
+            .get(name)
+            .or_else(|| {
+                map.iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                    .map(|(_, v)| v)
+            })
+            .cloned()
+            .unwrap_or(ExprValue::Null),
+        (ExprValue::Array(items), ExprValue::Number(n)) if *n >= 0.0 && n.fract() == 0.0 => {
+            items.get(*n as usize).cloned().unwrap_or(ExprValue::Null)
+        }
+        _ => ExprValue::Null,
+    }
+}
+
+/// The children selected by `.*`, in a stable order for objects.
+fn filter_children(value: &ExprValue) -> Vec<ExprValue> {
+    match value {
+        ExprValue::Array(items) => items.clone(),
+        ExprValue::Object(map) => {
+            let sorted: std::collections::BTreeMap<_, _> = map.iter().collect();
+            sorted.into_values().cloned().collect()
+        }
+        _ => Vec::new(),
     }
 }
 
@@ -749,7 +888,7 @@ impl Parser {
                 self.advance();
                 let val = self.parse_expr(ctx)?;
                 self.expect(&Token::RParen)?;
-                Ok(val)
+                self.parse_postfix(val, ctx)
             }
             Token::Ident(_) => self.parse_ident_or_call(ctx),
             Token::Not => self.parse_unary(ctx),
@@ -777,20 +916,100 @@ impl Parser {
                 }
             }
             self.expect(&Token::RParen)?;
-            return call_builtin(&name, &args, ctx);
+            let value = call_builtin(&name, &args, ctx)?;
+            return self.parse_postfix(value, ctx);
         }
 
-        // Context reference: ident.ident.ident...
+        // Context reference: ident.ident['ident']...
         let mut parts = vec![name];
-        while *self.peek() == Token::Dot {
-            self.advance(); // consume '.'
-            match self.advance() {
-                Token::Ident(part) => parts.push(part),
-                other => return Err(format!("expected identifier after '.', got {:?}", other)),
+        loop {
+            match (self.peek(), self.tokens.get(self.pos + 1)) {
+                (Token::Dot | Token::LBracket, Some(Token::Star)) => break,
+                (Token::Dot, _) => {
+                    self.advance();
+                    match self.advance() {
+                        Token::Ident(part) => parts.push(part),
+                        other => {
+                            return Err(format!("expected identifier after '.', got {:?}", other))
+                        }
+                    }
+                }
+                (Token::LBracket, _) => {
+                    let start = self.pos;
+                    self.advance();
+                    let ExprValue::String(part) = self.parse_expr(ctx)? else {
+                        // A numeric index applies to a value, not a context path.
+                        self.pos = start;
+                        break;
+                    };
+                    self.expect(&Token::RBracket)?;
+                    parts.push(part);
+                }
+                _ => break,
             }
         }
 
-        Ok(ctx.resolve(&parts))
+        let value = ctx.resolve_path(&parts);
+        self.parse_postfix(value, ctx)
+    }
+
+    // postfix = ( '.' ident | '.' '*' | '[' expr ']' | '[' '*' ']' )*
+    fn parse_postfix(
+        &mut self,
+        mut value: ExprValue,
+        ctx: &ExpressionContext,
+    ) -> Result<ExprValue, String> {
+        // After `.*`, each following accessor applies to every selected element
+        // and elements without that property are dropped.
+        let mut filtered = false;
+        loop {
+            let key = match (self.peek(), self.tokens.get(self.pos + 1)) {
+                (Token::Dot | Token::LBracket, Some(Token::Star)) => {
+                    let bracket = *self.peek() == Token::LBracket;
+                    self.pos += 2;
+                    if bracket {
+                        self.expect(&Token::RBracket)?;
+                    }
+                    value = ExprValue::Array(if filtered {
+                        filter_children(&value)
+                            .iter()
+                            .flat_map(filter_children)
+                            .collect()
+                    } else {
+                        filter_children(&value)
+                    });
+                    filtered = true;
+                    continue;
+                }
+                (Token::Dot, _) => {
+                    self.advance();
+                    match self.advance() {
+                        Token::Ident(part) => ExprValue::String(part),
+                        other => {
+                            return Err(format!("expected identifier after '.', got {:?}", other))
+                        }
+                    }
+                }
+                (Token::LBracket, _) => {
+                    self.advance();
+                    let key = self.parse_expr(ctx)?;
+                    self.expect(&Token::RBracket)?;
+                    key
+                }
+                _ => return Ok(value),
+            };
+            value = if filtered {
+                ExprValue::Array(
+                    filter_children(&value)
+                        .iter()
+                        .map(|item| index_value(item, &key))
+                        .filter(|item| *item != ExprValue::Null)
+                        .collect(),
+                )
+            } else {
+                index_value(&value, &key)
+            };
+        }
     }
 }
 
@@ -802,46 +1021,36 @@ fn expr_eq(a: &ExprValue, b: &ExprValue) -> bool {
     // GitHub Actions does loose type coercion for ==
     match (a, b) {
         (ExprValue::Null, ExprValue::Null) => true,
-        (ExprValue::Null, _) | (_, ExprValue::Null) => false,
         (ExprValue::Bool(a), ExprValue::Bool(b)) => a == b,
-        (ExprValue::Number(a), ExprValue::Number(b)) => (a - b).abs() < f64::EPSILON,
         (ExprValue::String(a), ExprValue::String(b)) => a.eq_ignore_ascii_case(b),
-        // Coerce number to string for comparison
-        (ExprValue::String(s), ExprValue::Number(n))
-        | (ExprValue::Number(n), ExprValue::String(s)) => {
-            if let Ok(parsed) = s.parse::<f64>() {
-                (parsed - n).abs() < f64::EPSILON
-            } else {
-                false
-            }
-        }
-        // Coerce bool to number: true=1, false=0
-        (ExprValue::Bool(b), ExprValue::Number(n)) | (ExprValue::Number(n), ExprValue::Bool(b)) => {
-            let bv = if *b { 1.0 } else { 0.0 };
-            (bv - n).abs() < f64::EPSILON
-        }
         (ExprValue::Bool(b), ExprValue::String(s)) | (ExprValue::String(s), ExprValue::Bool(b)) => {
-            // GitHub Actions coerces strings to booleans for comparison:
-            // "true" (case-insensitive) → true, everything else → false.
-            // This means `false == "random"` is true (both coerce to false).
+            // Inputs and outputs are stored as strings here, so `inputs.flag == true`
+            // has to compare by meaning: "true" (case-insensitive) is true and
+            // everything else is false. GitHub's typed inputs get there natively.
             let sv = s.eq_ignore_ascii_case("true");
             *b == sv
         }
-        // Objects are not comparable via ==
-        (ExprValue::Object(_), _) | (_, ExprValue::Object(_)) => false,
+        // Objects and arrays are not comparable via ==
+        (ExprValue::Object(_) | ExprValue::Array(_), _)
+        | (_, ExprValue::Object(_) | ExprValue::Array(_)) => false,
+        // Everything else coerces to numbers; NaN never compares equal.
+        _ => {
+            let (a, b) = (a.to_number(), b.to_number());
+            (a - b).abs() < f64::EPSILON
+        }
     }
 }
 
 fn expr_cmp(a: &ExprValue, b: &ExprValue) -> Option<std::cmp::Ordering> {
     match (a, b) {
-        (ExprValue::Number(a), ExprValue::Number(b)) => a.partial_cmp(b),
         (ExprValue::String(a), ExprValue::String(b)) => {
             Some(a.to_lowercase().cmp(&b.to_lowercase()))
         }
         // Objects are not orderable — comparisons like `env < env` yield None
         // (meaning the comparison expression will evaluate to false).
-        (ExprValue::Object(_), _) | (_, ExprValue::Object(_)) => None,
-        _ => None,
+        (ExprValue::Object(_) | ExprValue::Array(_), _)
+        | (_, ExprValue::Object(_) | ExprValue::Array(_)) => None,
+        _ => a.to_number().partial_cmp(&b.to_number()),
     }
 }
 
@@ -853,6 +1062,8 @@ fn expr_cmp(a: &ExprValue, b: &ExprValue) -> Option<std::cmp::Ordering> {
 fn expr_to_json(v: &ExprValue) -> serde_json::Value {
     match v {
         ExprValue::String(s) => serde_json::Value::String(s.clone()),
+        // Whole numbers stay integers so `[1, 2]` doesn't render as `[1.0, 2.0]`.
+        ExprValue::Number(n) if n.is_finite() && n.fract() == 0.0 => serde_json::json!(*n as i64),
         ExprValue::Number(n) => serde_json::json!(n),
         ExprValue::Bool(b) => serde_json::Value::Bool(*b),
         ExprValue::Null => serde_json::Value::Null,
@@ -863,6 +1074,9 @@ fn expr_to_json(v: &ExprValue) -> serde_json::Value {
                 .collect();
             serde_json::Value::Object(obj)
         }
+        ExprValue::Array(items) => {
+            serde_json::Value::Array(items.iter().map(expr_to_json).collect())
+        }
     }
 }
 
@@ -871,16 +1085,22 @@ fn call_builtin(
     args: &[ExprValue],
     ctx: &ExpressionContext,
 ) -> Result<ExprValue, String> {
-    match name {
+    // Function names are case-insensitive.
+    match name.to_ascii_lowercase().as_str() {
         "contains" => {
             if args.len() != 2 {
                 return Err("contains() requires 2 arguments".to_string());
+            }
+            if let ExprValue::Array(items) = &args[0] {
+                return Ok(ExprValue::Bool(
+                    items.iter().any(|item| expr_eq(item, &args[1])),
+                ));
             }
             let haystack = args[0].to_output_string().to_lowercase();
             let needle = args[1].to_output_string().to_lowercase();
             Ok(ExprValue::Bool(haystack.contains(&needle)))
         }
-        "startsWith" | "startswith" => {
+        "startswith" => {
             if args.len() != 2 {
                 return Err("startsWith() requires 2 arguments".to_string());
             }
@@ -888,7 +1108,7 @@ fn call_builtin(
             let prefix = args[1].to_output_string().to_lowercase();
             Ok(ExprValue::Bool(s.starts_with(&prefix)))
         }
-        "endsWith" | "endswith" => {
+        "endswith" => {
             if args.len() != 2 {
                 return Err("endsWith() requires 2 arguments".to_string());
             }
@@ -907,6 +1127,12 @@ fn call_builtin(
             let mut result = String::with_capacity(fmt.len());
             let mut chars = fmt.char_indices().peekable();
             while let Some((i, ch)) = chars.next() {
+                // `{{` and `}}` are escapes for literal braces
+                if matches!(ch, '{' | '}') && chars.peek().is_some_and(|(_, next)| *next == ch) {
+                    chars.next();
+                    result.push(ch);
+                    continue;
+                }
                 if ch == '{' {
                     // Look for {N} pattern
                     let rest = &fmt[i + 1..];
@@ -938,12 +1164,18 @@ fn call_builtin(
             } else {
                 ",".to_string()
             };
-            // Best-effort: just return the value as-is since we don't have arrays
-            Ok(ExprValue::String(
-                args[0].to_output_string().replace(',', &sep),
-            ))
+            match &args[0] {
+                ExprValue::Array(items) => Ok(ExprValue::String(
+                    items
+                        .iter()
+                        .map(ExprValue::to_output_string)
+                        .collect::<Vec<_>>()
+                        .join(&sep),
+                )),
+                other => Ok(ExprValue::String(other.to_output_string())),
+            }
         }
-        "toJSON" | "tojson" => {
+        "tojson" => {
             if args.len() != 1 {
                 return Err("toJSON() requires 1 argument".to_string());
             }
@@ -966,34 +1198,19 @@ fn call_builtin(
                         serde_json::to_string_pretty(&sorted).unwrap_or_else(|_| "{}".to_string()),
                     ))
                 }
+                array @ ExprValue::Array(_) => Ok(ExprValue::String(array.to_output_string())),
             }
         }
-        "fromJSON" | "fromjson" => {
+        "fromjson" => {
             if args.len() != 1 {
                 return Err("fromJSON() requires 1 argument".to_string());
             }
             let s = args[0].to_output_string();
-            // Arrays and objects stay as JSON text: `ExprValue` has no array
-            // variant, and `resolve_matrix_expressions` in engine.rs parses this
-            // text back into matrix entries.
-            // Basic parsing
-            match s.as_str() {
-                "null" => Ok(ExprValue::Null),
-                "true" => Ok(ExprValue::Bool(true)),
-                "false" => Ok(ExprValue::Bool(false)),
-                _ => {
-                    if let Ok(n) = s.parse::<f64>() {
-                        Ok(ExprValue::Number(n))
-                    } else {
-                        // Strip one layer of quotes if present
-                        let stripped = s
-                            .strip_prefix('"')
-                            .and_then(|s| s.strip_suffix('"'))
-                            .unwrap_or(&s);
-                        Ok(ExprValue::String(stripped.to_string()))
-                    }
-                }
-            }
+            // Text that isn't JSON passes through: both sides of `&&` are always
+            // evaluated here, so `x != '' && fromJSON(x)` must not error on an empty `x`.
+            Ok(serde_json::from_str(&s)
+                .map(|json| json_value_to_expr(&json))
+                .unwrap_or(ExprValue::String(s)))
         }
         // Status functions — consult job_status from context
         "success" => Ok(ExprValue::Bool(ctx.job_status == "success")),
@@ -1864,7 +2081,7 @@ mod tests {
     }
 
     #[test]
-    fn fromjson_of_an_array_keeps_its_json_text() {
+    fn fromjson_of_an_array_renders_back_to_json() {
         // `resolve_matrix_expressions` relies on this to read matrix entries.
         let env = HashMap::new();
         let step_outputs = HashMap::new();
@@ -1887,14 +2104,13 @@ mod tests {
 
         let result = evaluate(&format!("fromJSON('{}')", json), &ctx).unwrap();
 
-        assert_eq!(result.to_output_string(), json);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&result.to_output_string()).expect("renders as JSON");
+        assert_eq!(parsed, serde_json::json!([{"os": "ubuntu", "node": 14}]));
     }
 
     #[test]
     fn fromjson_tojson_env_produces_parseable_json() {
-        // Note: fromJSON currently returns an ExprValue::String containing
-        // the raw JSON text, not an ExprValue::Object. This test verifies
-        // that the string output is valid, parseable JSON with expected keys.
         let mut env = HashMap::new();
         env.insert("MY_VAR".to_string(), "hello".to_string());
         env.insert("OTHER".to_string(), "world".to_string());
@@ -2761,11 +2977,7 @@ mod tests {
     }
 
     #[test]
-    fn tojson_matrix_yaml_sequence_falls_through_to_string() {
-        // Matrix values that aren't scalar (sequences, mappings) currently
-        // render via `yaml_value_to_expr`'s fallback branch as a YAML-string.
-        // Pins the current behaviour; a future switch to a nested structure
-        // would be a deliberate decision.
+    fn tojson_matrix_keeps_sequences_as_arrays() {
         let mut matrix = HashMap::new();
         matrix.insert(
             "versions".to_string(),
@@ -2777,16 +2989,9 @@ mod tests {
         let matrix = Some(matrix);
         let ctx = make_ctx(&EMPTY_ENV, &EMPTY_STEPS, &matrix);
         let result = evaluate("toJSON(matrix)", &ctx).unwrap();
-        let s = result.to_output_string();
-        let parsed: serde_json::Value = serde_json::from_str(&s).expect("should be valid JSON");
-        let obj = parsed.as_object().expect("should be a JSON object");
-        let versions = obj.get("versions").expect("versions key present");
-        let rendered = versions.as_str().expect("rendered as JSON string");
-        assert!(
-            rendered.contains("- a") && rendered.contains("- b"),
-            "expected YAML sequence rendering, got: {}",
-            rendered
-        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(&result.to_output_string()).expect("should be valid JSON");
+        assert_eq!(parsed, serde_json::json!({"versions": ["a", "b"]}));
     }
 
     #[test]
@@ -2805,5 +3010,121 @@ mod tests {
         assert!(!result.is_truthy(), "env <= env should be false");
         let result = evaluate("env >= env", &ctx).unwrap();
         assert!(!result.is_truthy(), "env >= env should be false");
+    }
+
+    fn eval_str(expr: &str) -> String {
+        evaluate(expr, &empty_ctx()).unwrap().to_output_string()
+    }
+
+    #[test]
+    fn fromjson_values_can_be_indexed_and_passed_on() {
+        assert_eq!(
+            eval_str(r#"fromJSON('{"a":{"b":[1,2,{"c":"deep"}]}}').a.b[2].c"#),
+            "deep"
+        );
+        assert_eq!(eval_str(r#"fromJSON('{"a":1}')['a']"#), "1");
+        assert_eq!(eval_str("fromJSON('[1,2]')[5]"), "");
+        assert_eq!(eval_str("join(fromJSON('[\"a\",\"b\"]'), '+')"), "a+b");
+        assert_eq!(eval_str("join(fromJSON('[1,2]'))"), "1,2");
+        assert_eq!(eval_str("join('a,b', '+')"), "a,b");
+        assert_eq!(eval_str("contains(fromJSON('[\"a\",\"b\"]'), 'B')"), "true");
+        assert_eq!(eval_str("contains(fromJSON('[\"ab\"]'), 'a')"), "false");
+        assert_eq!(eval_str("contains(fromJSON('[1,2]'), '2')"), "true");
+    }
+
+    #[test]
+    fn tojson_of_an_array_is_pretty_with_integers() {
+        assert_eq!(eval_str("toJSON(fromJSON('[1,2]'))"), "[\n  1,\n  2\n]");
+        assert_eq!(eval_str("toJSON(fromJSON('[1.5]'))"), "[\n  1.5\n]");
+    }
+
+    #[test]
+    fn object_filters_select_across_elements() {
+        let list = r#"fromJSON('[{"n":"a","t":[{"x":1}]},{"n":"b","t":[{"x":2}]},{"o":1}]')"#;
+        assert_eq!(eval_str(&format!("join({}.*.n, ',')", list)), "a,b");
+        assert_eq!(eval_str(&format!("join({}[*].n, ',')", list)), "a,b");
+        assert_eq!(eval_str(&format!("join({}.*.t.*.x, ',')", list)), "1,2");
+        assert_eq!(
+            eval_str(r#"join(fromJSON('{"b":{"v":2},"a":{"v":1}}').*.v, ',')"#),
+            "1,2"
+        );
+    }
+
+    #[test]
+    fn contexts_accept_bracket_and_nested_access() {
+        let mut env = HashMap::new();
+        env.insert("MY_VAR".to_string(), "value".to_string());
+        let matrix = Some(HashMap::from([(
+            "cfg".to_string(),
+            serde_yaml::from_str::<Value>("{name: x, tags: [p, q]}").unwrap(),
+        )]));
+        let mut steps = HashMap::new();
+        steps.insert(
+            "a-b".to_string(),
+            HashMap::from([("out".to_string(), "1".to_string())]),
+        );
+        let ctx = make_ctx(&env, &steps, &matrix);
+        let eval = |expr| evaluate(expr, &ctx).unwrap().to_output_string();
+        assert_eq!(eval("env['MY_VAR']"), "value");
+        assert_eq!(eval("matrix['cfg'].name"), "x");
+        assert_eq!(eval("matrix.cfg.NAME"), "x");
+        assert_eq!(eval("matrix.cfg.tags[1]"), "q");
+        assert_eq!(eval("steps['a-b'].outputs['out']"), "1");
+        assert_eq!(eval("steps.a-b.outputs.missing"), "");
+    }
+
+    #[test]
+    fn mixed_type_comparisons_coerce_to_numbers() {
+        for (expr, expected) in [
+            ("'' == 0", "true"),
+            ("null == false", "true"),
+            ("null == 0", "true"),
+            ("null == ''", "true"),
+            ("null == 'x'", "false"),
+            ("'0x10' == 16", "true"),
+            ("' 5 ' == 5", "true"),
+            ("'abc' == 0", "false"),
+            ("'nan' == 0", "false"),
+            ("'10' > 5", "true"),
+            ("'abc' > 5", "false"),
+            ("null < 1", "true"),
+            ("true > 0", "true"),
+            ("fromJSON('[]') == fromJSON('[]')", "false"),
+            // Inputs are strings here, so these keep comparing by meaning.
+            ("'true' == true", "true"),
+            ("'false' == false", "true"),
+        ] {
+            assert_eq!(eval_str(expr), expected, "{}", expr);
+        }
+    }
+
+    #[test]
+    fn number_literals_support_hex_exponents_and_signs() {
+        assert_eq!(eval_str("0x10"), "16");
+        assert_eq!(eval_str("-0x10"), "-16");
+        assert_eq!(eval_str("1e3"), "1000");
+        assert_eq!(eval_str("2.5E-1"), "0.25");
+        assert_eq!(eval_str("-3"), "-3");
+        assert_eq!(eval_str("-3 < 0"), "true");
+    }
+
+    #[test]
+    fn format_unescapes_doubled_braces() {
+        assert_eq!(eval_str("format('{{a}} {0}', 'v')"), "{a} v");
+        assert_eq!(eval_str("format('{{0}}', 'v')"), "{0}");
+    }
+
+    #[test]
+    fn function_names_are_case_insensitive() {
+        assert_eq!(eval_str("TOJSON(1)"), "1");
+        assert_eq!(eval_str("STARTSWITH('ab', 'a')"), "true");
+        assert_eq!(eval_str("Contains('ab', 'b')"), "true");
+    }
+
+    #[test]
+    fn fromjson_passes_non_json_text_through() {
+        assert_eq!(eval_str("fromJSON('')"), "");
+        assert_eq!(eval_str("fromJSON('not json')"), "not json");
+        assert_eq!(eval_str("'' != '' && fromJSON('')"), "false");
     }
 }

@@ -3568,7 +3568,7 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                         // Handle local composite action
                         let action_path = Path::new(&action_info.repository);
                         execute_composite_action(
-                            ctx.step,
+                            &composite_call_step(&ctx, &step_env, &step_user_env),
                             action_path,
                             &step_env,
                             &step_user_env,
@@ -3624,7 +3624,7 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                         };
                         // tempdir must stay alive until execute_composite_action completes
                         execute_composite_action(
-                            ctx.step,
+                            &composite_call_step(&ctx, &step_env, &step_user_env),
                             &action_dir,
                             &step_env,
                             &step_user_env,
@@ -4895,9 +4895,41 @@ async fn run_called_workflow(
 ) -> Result<JobResult, ExecutionError> {
     // Create child env context
     let mut child_env = ctx.env_context.clone();
+    let expr_ctx = crate::expression::ExpressionContext {
+        env_context: ctx.env_context,
+        step_outputs: &HashMap::new(),
+        matrix_combination: &None,
+        step_statuses: &HashMap::new(),
+        job_status: "success",
+        secrets_context: ctx.services.secrets_context,
+        needs_context: ctx.services.needs_context,
+        needs_results: ctx.services.needs_results,
+        user_env: ctx.user_env,
+    };
+    let cwd = std::env::current_dir().map_err(|e| {
+        ExecutionError::Execution(format!("Failed to get current directory: {}", e))
+    })?;
+    let evaluate = |value: &str| {
+        crate::substitution::preprocess_expressions(value, &cwd, &expr_ctx).unwrap_or_default()
+    };
+
+    // Declared defaults first, so `with:` overrides them.
+    let declared_inputs = called
+        .on_raw
+        .get("workflow_call")
+        .and_then(|call| call.get("inputs"))
+        .and_then(|inputs| inputs.as_mapping());
+    for (name, definition) in declared_inputs.into_iter().flatten() {
+        if let (Some(name), Some(default)) = (
+            name.as_str(),
+            definition.get("default").and_then(yaml_scalar_to_string),
+        ) {
+            child_env.insert(input_env_key(name), evaluate(&default));
+        }
+    }
     if let Some(with_map) = with {
         for (k, v) in with_map {
-            child_env.insert(format!("INPUT_{}", k.to_uppercase()), v.clone());
+            child_env.insert(input_env_key(k), evaluate(v));
         }
     }
     if let Some(secrets_val) = secrets {
@@ -4909,7 +4941,7 @@ async fn run_called_workflow(
         } else if let Some(map) = secrets_val.as_mapping() {
             for (k, v) in map {
                 if let (Some(key), Some(value)) = (k.as_str(), v.as_str()) {
-                    child_env.insert(format!("SECRET_{}", key.to_uppercase()), value.to_string());
+                    child_env.insert(format!("SECRET_{}", key.to_uppercase()), evaluate(value));
                 }
             }
         }
@@ -4973,7 +5005,9 @@ async fn run_called_workflow(
     );
 
     // Aggregate outputs from all jobs in the called workflow
-    let outputs = aggregate_reusable_workflow_outputs(&reusable_job_outputs);
+    let outputs =
+        declared_reusable_workflow_outputs(called, &reusable_job_outputs, ctx.env_context)
+            .unwrap_or_else(|| aggregate_reusable_workflow_outputs(&reusable_job_outputs));
 
     Ok(JobResult {
         name: ctx.job_name.to_string(),
@@ -4989,12 +5023,47 @@ async fn run_called_workflow(
     })
 }
 
-/// Merge per-job outputs from a reusable workflow into a flat map.
+/// Evaluate `on.workflow_call.outputs` against the called workflow's job
+/// outputs. Returns `None` when the workflow declares no outputs.
+fn declared_reusable_workflow_outputs(
+    called: &WorkflowDefinition,
+    job_outputs: &HashMap<String, HashMap<String, String>>,
+    env_context: &HashMap<String, String>,
+) -> Option<HashMap<String, String>> {
+    let declared = called
+        .on_raw
+        .get("workflow_call")?
+        .get("outputs")?
+        .as_mapping()?;
+    let ctx = crate::expression::ExpressionContext {
+        env_context,
+        step_outputs: &HashMap::new(),
+        matrix_combination: &None,
+        step_statuses: &HashMap::new(),
+        job_status: "success",
+        secrets_context: &HashMap::new(),
+        // `jobs.<id>.outputs.*` resolves through the needs context.
+        needs_context: job_outputs,
+        needs_results: &HashMap::new(),
+        user_env: &HashMap::new(),
+    };
+    let cwd = std::env::current_dir().ok()?;
+    Some(
+        declared
+            .iter()
+            .filter_map(|(name, definition)| {
+                let value = definition.get("value")?.as_str()?;
+                let resolved =
+                    crate::substitution::preprocess_expressions(value, &cwd, &ctx).ok()?;
+                Some((name.as_str()?.to_string(), resolved))
+            })
+            .collect(),
+    )
+}
+
+/// Merge per-job outputs from a reusable workflow into a flat map, for called
+/// workflows that don't declare `on.workflow_call.outputs`.
 ///
-/// In GitHub Actions, reusable workflow outputs are declared via
-/// `on.workflow_call.outputs` which maps output names to job output
-/// expressions. Since we don't parse that declaration yet, we use a
-/// pragmatic approximation: flatten all job outputs into a single map.
 /// Jobs are iterated in sorted order by name for deterministic merging;
 /// later jobs (alphabetically) overwrite earlier jobs if keys collide.
 fn aggregate_reusable_workflow_outputs(
@@ -5074,6 +5143,40 @@ fn extract_language_info(image: &str) -> Option<(&'static str, Option<&str>)> {
     }
 }
 
+/// The env var holding an input, as read back by `inputs.<name>`.
+fn input_env_key(name: &str) -> String {
+    format!("INPUT_{}", name.to_uppercase().replace('-', "_"))
+}
+
+/// YAML scalars as the strings they become in `with:` and `env:`.
+fn yaml_scalar_to_string(value: &serde_yaml::Value) -> Option<String> {
+    match value {
+        serde_yaml::Value::String(s) => Some(s.clone()),
+        serde_yaml::Value::Number(n) => Some(n.to_string()),
+        serde_yaml::Value::Bool(b) => Some(b.to_string()),
+        serde_yaml::Value::Null => Some(String::new()),
+        _ => None,
+    }
+}
+
+/// The calling step with its `with:` evaluated, so a composite action's
+/// `inputs.*` are values rather than `${{ }}` text from the caller's scope.
+fn composite_call_step(
+    ctx: &StepExecutionContext<'_>,
+    step_env: &HashMap<String, String>,
+    step_user_env: &HashMap<String, String>,
+) -> workflow::Step {
+    let expr_ctx = ctx.expr_context_with_env(step_env, step_user_env);
+    let mut step = ctx.step.clone();
+    if let Some(with) = &mut step.with {
+        for value in with.values_mut() {
+            *value = crate::substitution::preprocess_expressions(value, ctx.working_dir, &expr_ctx)
+                .unwrap_or_default();
+        }
+    }
+    step
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn execute_composite_action(
     step: &workflow::Step,
@@ -5149,22 +5252,19 @@ async fn execute_composite_action(
                             // Get default value if available
                             let default_value = input_def
                                 .get("default")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("");
+                                .and_then(yaml_scalar_to_string)
+                                .unwrap_or_default();
 
                             // Check if the input was provided in the 'with' section
                             let input_value = step
                                 .with
                                 .as_ref()
                                 .and_then(|with| with.get(input_name_str))
-                                .unwrap_or(&default_value.to_string())
+                                .unwrap_or(&default_value)
                                 .clone();
 
                             // Add to environment as INPUT_X
-                            action_env.insert(
-                                format!("INPUT_{}", input_name_str.to_uppercase()),
-                                input_value,
-                            );
+                            action_env.insert(input_env_key(input_name_str), input_value);
                         }
                     }
                 }
@@ -5630,8 +5730,8 @@ fn convert_yaml_to_step(step_yaml: &serde_yaml::Value) -> Result<workflow::Step,
     let with = step_yaml.get("with").and_then(|v| v.as_mapping()).map(|m| {
         let mut with_map = HashMap::new();
         for (k, v) in m {
-            if let (Some(key), Some(value)) = (k.as_str(), v.as_str()) {
-                with_map.insert(key.to_string(), value.to_string());
+            if let (Some(key), Some(value)) = (k.as_str(), yaml_scalar_to_string(v)) {
+                with_map.insert(key.to_string(), value);
             }
         }
         with_map
@@ -5643,8 +5743,8 @@ fn convert_yaml_to_step(step_yaml: &serde_yaml::Value) -> Result<workflow::Step,
         .map(|m| {
             let mut env_map = HashMap::new();
             for (k, v) in m {
-                if let (Some(key), Some(value)) = (k.as_str(), v.as_str()) {
-                    env_map.insert(key.to_string(), value.to_string());
+                if let (Some(key), Some(value)) = (k.as_str(), yaml_scalar_to_string(v)) {
+                    env_map.insert(key.to_string(), value);
                 }
             }
             env_map
@@ -5657,10 +5757,7 @@ fn convert_yaml_to_step(step_yaml: &serde_yaml::Value) -> Result<workflow::Step,
     // Extract continue_on_error
     let continue_on_error = step_yaml.get("continue-on-error").and_then(|v| v.as_bool());
 
-    let if_condition = step_yaml
-        .get("if")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
+    let if_condition = step_yaml.get("if").and_then(yaml_scalar_to_string);
 
     let id = step_yaml
         .get("id")
@@ -9476,6 +9573,119 @@ runs:
         );
 
         assert_eq!(result.get("missing").unwrap(), "");
+    }
+
+    fn workflow_with_trigger(on: &str) -> WorkflowDefinition {
+        let mut workflow = minimal_workflow();
+        workflow.on_raw = serde_yaml::from_str(on).unwrap();
+        workflow
+    }
+
+    #[test]
+    fn declared_reusable_outputs_map_job_outputs_to_their_names() {
+        let called = workflow_with_trigger(
+            "workflow_call:\n  outputs:\n    result:\n      value: ${{ jobs.inner.outputs.r }}-x\n    missing:\n      value: ${{ jobs.none.outputs.r }}\n",
+        );
+        let job_outputs = HashMap::from([(
+            "inner".to_string(),
+            HashMap::from([("r".to_string(), "1".to_string())]),
+        )]);
+
+        let outputs =
+            declared_reusable_workflow_outputs(&called, &job_outputs, &HashMap::new()).unwrap();
+
+        assert_eq!(outputs["result"], "1-x");
+        assert_eq!(outputs["missing"], "");
+        assert!(!outputs.contains_key("r"));
+    }
+
+    #[test]
+    fn undeclared_reusable_outputs_fall_back_to_flattening() {
+        let called = workflow_with_trigger("workflow_call: {}\n");
+        assert!(
+            declared_reusable_workflow_outputs(&called, &HashMap::new(), &HashMap::new()).is_none()
+        );
+    }
+
+    #[test]
+    fn composite_steps_keep_non_string_scalars() {
+        let step = convert_yaml_to_step(
+            &serde_yaml::from_str(
+                "run: echo\nif: true\nenv:\n  PORT: 5432\n  ON: true\nwith:\n  n: 1.5\n",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(step.env["PORT"], "5432");
+        assert_eq!(step.env["ON"], "true");
+        assert_eq!(step.with.unwrap()["n"], "1.5");
+        assert_eq!(step.if_condition.as_deref(), Some("true"));
+    }
+
+    #[test]
+    fn input_env_keys_match_what_the_inputs_context_reads() {
+        assert_eq!(input_env_key("my-input"), "INPUT_MY_INPUT");
+        assert_eq!(input_env_key("name"), "INPUT_NAME");
+    }
+
+    #[tokio::test]
+    async fn composite_inputs_get_defaults_and_evaluated_caller_values() {
+        let action_dir = tempfile::tempdir().unwrap();
+        fs::write(
+            action_dir.path().join("action.yml"),
+            r#"
+name: test action
+inputs:
+  my-input:
+    description: hyphenated
+  count:
+    description: numeric default
+    default: 3
+runs:
+  using: composite
+  steps:
+    - run: echo hi
+      env:
+        A: ${{ inputs.my-input }}
+        B: ${{ inputs.count }}
+"#,
+        )
+        .unwrap();
+
+        let runtime = MockContainerRuntime::default();
+        let job_env = HashMap::new();
+        let working_dir = tempfile::tempdir().unwrap();
+        let mut step = make_run_step("noop");
+        step.with = Some(HashMap::from([("my-input".to_string(), "v".to_string())]));
+        let services = test_services();
+        let pending = std::sync::Mutex::new(Vec::<PendingCacheSave>::new());
+
+        let result = execute_composite_action(
+            &step,
+            action_dir.path(),
+            &job_env,
+            &job_env,
+            working_dir.path(),
+            &runtime,
+            "ubuntu:latest",
+            false,
+            &services,
+            &pending,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.status, StepStatus::Success);
+
+        let calls = runtime.run_calls.lock().unwrap();
+        let env = |key: &str| {
+            calls[0]
+                .env_vars
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(env("A"), Some("v"));
+        assert_eq!(env("B"), Some("3"));
     }
 
     #[test]

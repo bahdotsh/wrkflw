@@ -22,6 +22,18 @@ pub fn setup_github_environment_files(workspace_dir: &Path) -> io::Result<()> {
     fs::write(&github_path, "")?;
     fs::write(&github_step_summary, "")?;
 
+    create_runner_temp(&github_dir.join(RUNNER_TEMP_DIR))
+}
+
+/// Create the `RUNNER_TEMP` directory. A job container may run as a different
+/// user from the host's, and it must still be able to write here.
+fn create_runner_temp(dir: &Path) -> io::Result<()> {
+    fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o777))?;
+    }
     Ok(())
 }
 
@@ -57,6 +69,13 @@ pub const CONTAINER_WORKSPACE: &str = "/github/workspace";
 /// Where a job's `GITHUB_*` files are mounted inside a step's container.
 pub const CONTAINER_GITHUB_DIR: &str = "/github/workflow";
 
+/// The directory beside a job's `GITHUB_*` files that backs `RUNNER_TEMP`.
+const RUNNER_TEMP_DIR: &str = "runner_temp";
+
+/// `RUNNER_TEMP` inside a step's container. Each step gets a new container, so
+/// it has to be on a mount for files to reach the job's later steps.
+const CONTAINER_RUNNER_TEMP: &str = "/github/workflow/runner_temp";
+
 /// Replace host values with what a GitHub step sees inside a Linux container.
 /// Without this `runner.os` reports the host OS and paths like
 /// `$GITHUB_WORKSPACE` don't exist in the container.
@@ -64,7 +83,7 @@ pub fn apply_github_container_context(env: &mut HashMap<String, String>) {
     for (key, value) in [
         ("GITHUB_WORKSPACE", CONTAINER_WORKSPACE),
         ("RUNNER_OS", "Linux"),
-        ("RUNNER_TEMP", "/tmp"),
+        ("RUNNER_TEMP", CONTAINER_RUNNER_TEMP),
         ("RUNNER_TOOL_CACHE", "/opt/hostedtoolcache"),
     ] {
         env.insert(key.to_string(), value.to_string());
@@ -505,6 +524,17 @@ mod tests {
     }
 
     #[test]
+    fn container_runner_temp_is_the_directory_in_the_job_mount() {
+        assert_eq!(
+            Path::new(CONTAINER_RUNNER_TEMP),
+            Path::new(CONTAINER_GITHUB_DIR).join(RUNNER_TEMP_DIR)
+        );
+        let mut env = HashMap::new();
+        let dir = isolate_github_environment_files(&mut env).unwrap();
+        assert!(dir.path().join("github").join(RUNNER_TEMP_DIR).is_dir());
+    }
+
+    #[test]
     fn github_container_context_replaces_host_values() {
         let mut env = HashMap::from([
             ("RUNNER_OS".to_string(), "macOS".to_string()),
@@ -515,7 +545,7 @@ mod tests {
         apply_github_container_context(&mut env);
         assert_eq!(env["RUNNER_OS"], "Linux");
         assert_eq!(env["GITHUB_WORKSPACE"], "/github/workspace");
-        assert_eq!(env["RUNNER_TEMP"], "/tmp");
+        assert_eq!(env["RUNNER_TEMP"], "/github/workflow/runner_temp");
         assert_eq!(env["RUNNER_TOOL_CACHE"], "/opt/hostedtoolcache");
         assert_eq!(env["OTHER"], "kept");
         assert!(!env.contains_key("CI_PROJECT_DIR"));

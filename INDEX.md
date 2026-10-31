@@ -1,6 +1,6 @@
 # Codebase Index: wrkflw
 
-> Generated: 2026-10-31 17:30:42 UTC | Files: 208 | Lines: 83280
+> Generated: 2026-10-31 17:49:42 UTC | Files: 208 | Lines: 83592
 > Languages: JSON (4), Markdown (24), Rust (119), Shell (5), TOML (18), YAML (38)
 
 ## Directory Structure
@@ -1475,7 +1475,7 @@ wrkflw/
 
 ## INDEX.md
 
-**Language:** Markdown | **Size:** 168.8 KB | **Lines:** 6403
+**Language:** Markdown | **Size:** 169.6 KB | **Lines:** 6424
 
 **Declarations:**
 
@@ -1483,7 +1483,7 @@ wrkflw/
 
 ## README.md
 
-**Language:** Markdown | **Size:** 18.9 KB | **Lines:** 378
+**Language:** Markdown | **Size:** 19.0 KB | **Lines:** 379
 
 **Declarations:**
 
@@ -1804,7 +1804,7 @@ wrkflw/
 
 ## crates/executor/src/engine.rs
 
-**Language:** Rust | **Size:** 419.9 KB | **Lines:** 11549
+**Language:** Rust | **Size:** 431.2 KB | **Lines:** 11839
 
 **Imports:**
 - `bollard::Docker`
@@ -1833,9 +1833,12 @@ wrkflw/
 
 `fn resolve_gitlab_dependencies( pipeline: &Pipeline, workflow: &WorkflowDefinition, ) -> Result<Vec<Vec<String>>, ExecutionError>`
 
-`fn seed_runtime_mode( env: &mut HashMap<String, String>, runtime: &RuntimeType, apply_container_context: fn(&mut HashMap<String, String>), )`
+`enum CiPlatform`
+> Variants: `GitHub`, `GitLab`
 
-`fn emulation_fallback() -> (Box<dyn ContainerRuntime>, RuntimeType)`
+`fn seed_runtime_mode( env: &mut HashMap<String, String>, runtime: &RuntimeType, platform: CiPlatform, )`
+
+`fn emulation_runtime() -> (Box<dyn ContainerRuntime>, RuntimeType)`
 
 `fn initialize_runtime( runtime_type: RuntimeType, preserve_containers_on_failure: bool, kubernetes: &KubernetesConfig, ) -> Result<(Box<dyn ContainerRuntime>, RuntimeType), ExecutionError>`
 
@@ -1979,7 +1982,9 @@ wrkflw/
 
 `fn resolve_working_directory(wd: &str, ctx: &StepExecutionContext<'_>) -> Result<String, String>`
 
-`fn relative_to_workspace(path: String, workspace: &str) -> String`
+`fn workspace_relative_input(path: &str, ctx: &StepExecutionContext<'_>) -> String`
+
+`fn relative_to_workspace(path: &str, workspace: &str) -> String`
 
 `fn preprocess_with_value(value: &str, ctx: &StepExecutionContext<'_>) -> String`
 

@@ -26,13 +26,14 @@ pub fn setup_github_environment_files(workspace_dir: &Path) -> io::Result<()> {
 }
 
 /// Create the `RUNNER_TEMP` directory. A job container may run as a different
-/// user from the host's, and it must still be able to write here.
+/// user from the host's, and it must still be able to write here. The mode is
+/// that of `/tmp`, so users can't remove each other's files.
 fn create_runner_temp(dir: &Path) -> io::Result<()> {
     fs::create_dir_all(dir)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(dir, fs::Permissions::from_mode(0o777))?;
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o1777))?;
     }
     Ok(())
 }
@@ -74,7 +75,9 @@ const RUNNER_TEMP_DIR: &str = "runner_temp";
 
 /// `RUNNER_TEMP` inside a step's container. Each step gets a new container, so
 /// it has to be on a mount for files to reach the job's later steps.
-const CONTAINER_RUNNER_TEMP: &str = "/github/workflow/runner_temp";
+fn container_runner_temp() -> String {
+    format!("{}/{}", CONTAINER_GITHUB_DIR, RUNNER_TEMP_DIR)
+}
 
 /// Replace host values with what a GitHub step sees inside a Linux container.
 /// Without this `runner.os` reports the host OS and paths like
@@ -84,7 +87,7 @@ pub fn apply_github_container_context(env: &mut HashMap<String, String>) {
     for (key, value) in [
         ("GITHUB_WORKSPACE", CONTAINER_WORKSPACE),
         ("RUNNER_OS", "Linux"),
-        ("RUNNER_TEMP", CONTAINER_RUNNER_TEMP),
+        ("RUNNER_TEMP", &container_runner_temp()),
         ("RUNNER_TOOL_CACHE", "/opt/hostedtoolcache"),
     ] {
         env.insert(key.to_string(), value.to_string());
@@ -526,13 +529,17 @@ mod tests {
 
     #[test]
     fn container_runner_temp_is_the_directory_in_the_job_mount() {
-        assert_eq!(
-            Path::new(CONTAINER_RUNNER_TEMP),
-            Path::new(CONTAINER_GITHUB_DIR).join(RUNNER_TEMP_DIR)
-        );
+        assert_eq!(container_runner_temp(), "/github/workflow/runner_temp");
         let mut env = HashMap::new();
         let dir = isolate_github_environment_files(&mut env).unwrap();
-        assert!(dir.path().join("github").join(RUNNER_TEMP_DIR).is_dir());
+        let runner_temp = dir.path().join("github").join(RUNNER_TEMP_DIR);
+        assert!(runner_temp.is_dir());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&runner_temp).unwrap().permissions().mode();
+            assert_eq!(mode & 0o7777, 0o1777);
+        }
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # Codebase Index: wrkflw
 
-> Generated: 2026-10-31 18:03:24 UTC | Files: 208 | Lines: 83608
+> Generated: 2026-10-31 18:45:07 UTC | Files: 208 | Lines: 83665
 > Languages: JSON (4), Markdown (24), Rust (119), Shell (5), TOML (18), YAML (38)
 
 ## Directory Structure
@@ -1477,7 +1477,7 @@ wrkflw/
 
 ## INDEX.md
 
-**Language:** Markdown | **Size:** 169.7 KB | **Lines:** 6429
+**Language:** Markdown | **Size:** 170.1 KB | **Lines:** 6438
 
 **Declarations:**
 
@@ -1485,7 +1485,7 @@ wrkflw/
 
 ## README.md
 
-**Language:** Markdown | **Size:** 19.1 KB | **Lines:** 379
+**Language:** Markdown | **Size:** 19.2 KB | **Lines:** 379
 
 **Declarations:**
 
@@ -1806,7 +1806,7 @@ wrkflw/
 
 ## crates/executor/src/engine.rs
 
-**Language:** Rust | **Size:** 430.5 KB | **Lines:** 11815
+**Language:** Rust | **Size:** 431.9 KB | **Lines:** 11856
 
 **Imports:**
 - `bollard::Docker`
@@ -1835,10 +1835,14 @@ wrkflw/
 
 `fn resolve_gitlab_dependencies( pipeline: &Pipeline, workflow: &WorkflowDefinition, ) -> Result<Vec<Vec<String>>, ExecutionError>`
 
+`type EnvMap = HashMap<String, String>`
+
+`fn github_run_env( workflow: &WorkflowDefinition, workspace_dir: &Path, runtime: &RuntimeType, ) -> Result<(EnvMap, EnvMap), ExecutionError>`
+
 `enum CiPlatform`
 > Variants: `GitHub`, `GitLab`
 
-`fn seed_runtime_mode( env: &mut HashMap<String, String>, runtime: &RuntimeType, platform: CiPlatform, )`
+`fn seed_runtime_context( env: &mut HashMap<String, String>, runtime: &RuntimeType, platform: CiPlatform, )`
 
 `fn emulation_runtime() -> (Box<dyn ContainerRuntime>, RuntimeType)`
 
@@ -1984,7 +1988,7 @@ wrkflw/
   `fn expr_context_with_env<'e>( &self, env: &'e HashMap<String, String>, user_env: &'e HashMap<String, String>, ) -> crate::expression::ExpressionContext<'e> where 'a: 'e,`
 
 
-`fn resolve_working_directory(wd: &str, ctx: &StepExecutionContext<'_>) -> Result<String, String>`
+`fn resolve_working_directory( wd: &str, ctx: &StepExecutionContext<'_>, step_env: &HashMap<String, String>, step_user_env: &HashMap<String, String>, ) -> Result<String, String>`
 
 `fn workspace_relative_input(path: &str, job_env: &HashMap<String, String>) -> String`
 
@@ -2089,7 +2093,7 @@ wrkflw/
 
 ## crates/executor/src/environment.rs
 
-**Language:** Rust | **Size:** 17.6 KB | **Lines:** 566
+**Language:** Rust | **Size:** 17.9 KB | **Lines:** 573
 
 **Imports:**
 - `chrono::Utc`
@@ -2105,7 +2109,7 @@ wrkflw/
 
 `const RUNNER_TEMP_DIR: &str = "runner_temp"`
 
-`const CONTAINER_RUNNER_TEMP: &str = "/github/workflow/runner_temp"`
+`fn container_runner_temp() -> String`
 
 `fn value_to_string(value: &Value) -> String`
 

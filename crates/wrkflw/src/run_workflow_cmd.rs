@@ -13,6 +13,7 @@
 
 use crate::prefilter;
 use crate::{is_gitlab_pipeline, RuntimeChoice};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 /// Owned copy of the clap `Commands::Run` variant fields plus the
@@ -36,6 +37,7 @@ pub(crate) struct RunCtx {
     pub(crate) strict_filter: bool,
     pub(crate) no_strict_filter: bool,
     pub(crate) verbose: bool,
+    pub(crate) platform_overrides: HashMap<String, String>,
 }
 
 /// Execute the `wrkflw run` command. Exits the process on every
@@ -104,6 +106,7 @@ pub(crate) async fn run(ctx: RunCtx) {
         secrets_config: None, // Use default secrets configuration
         show_action_messages: ctx.show_action_messages,
         target_job: ctx.job.clone(),
+        platform_overrides: ctx.platform_overrides,
     };
     let workflow_type = if is_gitlab {
         "GitLab CI pipeline"

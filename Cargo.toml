@@ -32,7 +32,7 @@ wrkflw-watcher = { path = "crates/watcher", version = "0.8.0" }
 wrkflw-validators = { path = "crates/validators", version = "0.8.0" }
 
 # External dependencies
-clap = { version = "4.3", features = ["derive"] }
+clap = { version = "4.3", features = ["derive", "env"] }
 colored = "2.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_yaml = "0.9"

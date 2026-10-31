@@ -130,6 +130,25 @@ wrkflw run --jobs .github/workflows/ci.yml
 wrkflw run --preserve-containers-on-failure .github/workflows/ci.yml
 ```
 
+### Custom runner images
+
+By default `runs-on` maps to a small built-in image, so `ubuntu-latest` runs in `ubuntu:latest`, which has few of the tools a GitHub runner has. Use `-P`/`--platform` to pick the image for a label, for example the larger images made for [act](https://github.com/nektos/act):
+
+```bash
+wrkflw run -P ubuntu-latest=catthehacker/ubuntu:act-latest .github/workflows/ci.yml
+
+# Repeat the flag or separate entries with commas
+wrkflw run -P ubuntu-latest=my/image:1 -P ubuntu-22.04=my/image:2 .github/workflows/ci.yml
+
+# Set it once for every command, including the TUI and watch mode
+export WRKFLW_PLATFORM=ubuntu-latest=catthehacker/ubuntu:act-latest
+```
+
+- A job-level `container:` still wins over `--platform`, which wins over the built-in image.
+- Labels match case-insensitively, and the last value given for a label wins. Every label in `runs-on: [self-hosted, linux]` is tried, and `runs-on: ${{ matrix.os }}` is resolved per matrix combination.
+- Runtimes from `actions/setup-*` are installed on top of your image, so the image must be Debian or Ubuntu based for those jobs.
+- `--platform` replaces `WRKFLW_PLATFORM` entirely when both are set. It has no effect in emulation mode.
+
 ### Trigger-aware execution
 
 Skip workflows whose `on:` block wouldn't fire for a given event/change set. Strict mode is on by default: `wrkflw run --event …` without `--diff` or `--changed-files` is rejected up front rather than silently skipping every `paths:`-gated workflow.

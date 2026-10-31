@@ -348,6 +348,7 @@ mod tests {
                 secrets_config: None,
                 show_action_messages: false,
                 target_job: None,
+                platform_overrides: Default::default(),
             },
         );
         WorkflowWatcher::from_config(cfg)
@@ -633,6 +634,7 @@ mod tests {
                 secrets_config: None,
                 show_action_messages: false,
                 target_job: None,
+                platform_overrides: Default::default(),
             },
         )
         .with_debounce(Duration::from_millis(50));
@@ -776,6 +778,7 @@ mod tests {
                 secrets_config: None,
                 show_action_messages: false,
                 target_job: None,
+                platform_overrides: Default::default(),
             },
         );
         let watcher = WorkflowWatcher::from_config(cfg);
@@ -893,6 +896,7 @@ mod tests {
                 secrets_config: None,
                 show_action_messages: false,
                 target_job: None,
+                platform_overrides: Default::default(),
             },
         )
         .with_debounce(Duration::from_secs(5));
@@ -1047,6 +1051,7 @@ mod tests {
                 secrets_config: None,
                 show_action_messages: false,
                 target_job: None,
+                platform_overrides: Default::default(),
             },
         )
         .with_debounce(Duration::from_millis(50));

@@ -15,6 +15,7 @@
 
 use crate::prefilter;
 use crate::RuntimeChoice;
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 /// Owned copy of the clap `Commands::Watch` variant fields plus the
@@ -35,6 +36,7 @@ pub(crate) struct WatchCtx {
     pub(crate) strict_filter: bool,
     pub(crate) no_strict_filter: bool,
     pub(crate) verbose: bool,
+    pub(crate) platform_overrides: HashMap<String, String>,
 }
 
 /// Execute the `wrkflw watch` command. Exits the process on every
@@ -98,6 +100,7 @@ pub(crate) async fn run(ctx: WatchCtx) {
         secrets_config: None,
         show_action_messages: ctx.show_action_messages,
         target_job: None,
+        platform_overrides: ctx.platform_overrides,
     };
 
     use wrkflw_ui::cli_style;

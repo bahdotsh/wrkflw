@@ -8,6 +8,7 @@ use crate::theme::{self, ThemeMode};
 use chrono::Local;
 use crossterm::event::KeyCode;
 use ratatui::widgets::{ListState, TableState};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -27,6 +28,7 @@ pub struct App {
     pub runtime_type: RuntimeType,
     pub validation_mode: bool,
     pub preserve_containers_on_failure: bool,
+    pub platform_overrides: HashMap<String, String>,
     pub show_action_messages: bool,
     pub execution_queue: Vec<QueuedExecution>, // Workflows queued for execution
     pub current_execution: Option<usize>,
@@ -326,6 +328,7 @@ impl App {
         tx: mpsc::Sender<ExecutionResultMsg>,
         preserve_containers_on_failure: bool,
         show_action_messages: bool,
+        platform_overrides: HashMap<String, String>,
     ) -> App {
         let mut workflow_list_state = ListState::default();
         workflow_list_state.select(Some(0));
@@ -497,6 +500,7 @@ impl App {
             runtime_type,
             validation_mode: false,
             preserve_containers_on_failure,
+            platform_overrides,
             show_action_messages,
             execution_queue: Vec::new(),
             current_execution: None,
@@ -2764,7 +2768,7 @@ mod tests {
 
     fn make_app() -> App {
         let (tx, _rx) = mpsc::channel();
-        let mut app = App::new(RuntimeType::Emulation, tx, false, false);
+        let mut app = App::new(RuntimeType::Emulation, tx, false, false, HashMap::new());
         app.workflows = vec![
             Workflow {
                 name: "ci".to_string(),

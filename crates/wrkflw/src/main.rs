@@ -58,6 +58,20 @@ struct Wrkflw {
     #[cfg(feature = "tui")]
     #[arg(long, global = true, value_name = "THEME")]
     theme: Option<wrkflw_ui::theme::ThemePreference>,
+
+    /// Run `runs-on` LABEL in IMAGE instead of the built-in image, e.g.
+    /// ubuntu-latest=catthehacker/ubuntu:act-latest. Repeatable or comma-separated.
+    /// A job-level `container:` still wins
+    #[arg(
+        short = 'P',
+        long = "platform",
+        global = true,
+        value_name = "LABEL=IMAGE",
+        env = "WRKFLW_PLATFORM",
+        value_delimiter = ',',
+        value_parser = parse_platform_arg
+    )]
+    platform: Vec<Option<(String, String)>>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -309,6 +323,20 @@ enum Commands {
     },
 }
 
+// An empty value is skipped rather than rejected, so an exported but empty
+// WRKFLW_PLATFORM or a trailing comma can't fail every command.
+fn parse_platform_arg(s: &str) -> Result<Option<(String, String)>, String> {
+    if s.trim().is_empty() {
+        return Ok(None);
+    }
+    wrkflw_executor::parse_platform_override(s).map(Some)
+}
+
+// Later entries win, so repeating a label behaves the same whatever its case.
+fn collect_platform_overrides(entries: &[Option<(String, String)>]) -> HashMap<String, String> {
+    entries.iter().flatten().cloned().collect()
+}
+
 // Parser function for key-value pairs
 fn parse_key_val(s: &str) -> Result<(String, String), String> {
     let pos = s
@@ -482,6 +510,8 @@ async fn main() {
     // Setup a Ctrl+C handler that runs in the background
     tokio::spawn(handle_signals());
 
+    let platform_overrides = collect_platform_overrides(&cli.platform);
+
     match &cli.command {
         Some(Commands::Validate {
             paths,
@@ -615,6 +645,7 @@ async fn main() {
                 strict_filter: *strict_filter,
                 no_strict_filter: *no_strict_filter,
                 verbose,
+                platform_overrides,
             })
             .await;
         }
@@ -648,6 +679,7 @@ async fn main() {
                 strict_filter: *strict_filter,
                 no_strict_filter: *no_strict_filter,
                 verbose,
+                platform_overrides,
             })
             .await;
         }
@@ -681,6 +713,7 @@ async fn main() {
                 *preserve_containers_on_failure,
                 *show_action_messages,
                 cli.theme,
+                platform_overrides,
             )
             .await
             {
@@ -716,9 +749,16 @@ async fn main() {
                 let runtime_type = wrkflw_executor::RuntimeType::Auto;
 
                 // Call the TUI implementation from the ui crate with default path
-                if let Err(e) =
-                    wrkflw_ui::run_wrkflw_tui(None, runtime_type, verbose, false, false, cli.theme)
-                        .await
+                if let Err(e) = wrkflw_ui::run_wrkflw_tui(
+                    None,
+                    runtime_type,
+                    verbose,
+                    false,
+                    false,
+                    cli.theme,
+                    platform_overrides,
+                )
+                .await
                 {
                     eprintln!("Error running TUI: {}", e);
                     std::process::exit(1);
@@ -997,5 +1037,69 @@ mod tests {
             RuntimeType::from(RuntimeChoice::SecureEmulation),
             RuntimeType::SecureEmulation
         );
+    }
+
+    fn platform_overrides_from(args: &[&str]) -> HashMap<String, String> {
+        let cli = Wrkflw::try_parse_from(args).unwrap();
+        collect_platform_overrides(&cli.platform)
+    }
+
+    #[test]
+    fn platform_flag_accepts_repeats_and_commas() {
+        let map = platform_overrides_from(&[
+            "wrkflw",
+            "-P",
+            "a=one:1,b=two:2",
+            "--platform",
+            "c=three:3",
+        ]);
+        assert_eq!(map.len(), 3);
+        assert_eq!(map["a"], "one:1");
+        assert_eq!(map["b"], "two:2");
+        assert_eq!(map["c"], "three:3");
+    }
+
+    #[test]
+    fn platform_flag_works_after_a_subcommand() {
+        let map = platform_overrides_from(&["wrkflw", "run", "ci.yml", "-P", "a=one:1"]);
+        assert_eq!(map["a"], "one:1");
+    }
+
+    #[test]
+    fn platform_flag_skips_empty_entries() {
+        assert!(platform_overrides_from(&["wrkflw", "-P", ""]).is_empty());
+        let map = platform_overrides_from(&["wrkflw", "-P", "a=one:1,"]);
+        assert_eq!(map.len(), 1);
+    }
+
+    #[test]
+    fn platform_flag_last_value_wins_across_label_case() {
+        let map = platform_overrides_from(&["wrkflw", "-P", "Ubuntu=one:1", "-P", "ubuntu=two:2"]);
+        assert_eq!(map.len(), 1);
+        assert_eq!(map["ubuntu"], "two:2");
+    }
+
+    // The only test that sets this variable. Every other platform test passes
+    // -P, which replaces it, so running alongside them is safe.
+    #[test]
+    fn platform_env_applies_unless_the_flag_is_given() {
+        std::env::set_var("WRKFLW_PLATFORM", "a=env:1,b=env:2");
+        let from_env = platform_overrides_from(&["wrkflw"]);
+        let from_flag = platform_overrides_from(&["wrkflw", "-P", "a=flag:1"]);
+        std::env::set_var("WRKFLW_PLATFORM", "");
+        let from_empty = platform_overrides_from(&["wrkflw"]);
+        std::env::remove_var("WRKFLW_PLATFORM");
+
+        assert_eq!(from_env.len(), 2);
+        assert_eq!(from_env["a"], "env:1");
+        assert_eq!(from_env["b"], "env:2");
+        assert_eq!(from_flag.len(), 1);
+        assert_eq!(from_flag["a"], "flag:1");
+        assert!(from_empty.is_empty());
+    }
+
+    #[test]
+    fn platform_flag_rejects_malformed_values() {
+        assert!(Wrkflw::try_parse_from(["wrkflw", "-P", "no-equals"]).is_err());
     }
 }

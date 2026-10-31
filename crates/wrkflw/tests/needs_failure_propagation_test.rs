@@ -21,6 +21,7 @@ fn emulation_cfg() -> ExecutionConfig {
         secrets_config: None,
         show_action_messages: false,
         target_job: None,
+        platform_overrides: Default::default(),
     }
 }
 

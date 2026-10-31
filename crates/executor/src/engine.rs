@@ -83,7 +83,6 @@ async fn execute_github_workflow(
     mut config: ExecutionConfig,
 ) -> Result<ExecutionResult, ExecutionError> {
     config.runtime_type = detect_runtime(config.runtime_type);
-    warn_if_overrides_unused(&config);
     // 1. Parse workflow file
     let workflow = parse_workflow(workflow_path)?;
 
@@ -99,70 +98,21 @@ async fn execute_github_workflow(
     };
 
     // 3. Initialize appropriate runtime
-    let runtime = initialize_runtime(
+    let (runtime, effective_runtime) = initialize_runtime(
         config.runtime_type.clone(),
         config.preserve_containers_on_failure,
         &config.kubernetes,
     )?;
+    config.runtime_type = effective_runtime;
+    warn_if_overrides_unused(&config);
 
     // Create a temporary workspace directory
     let workspace_dir = tempfile::tempdir()
         .map_err(|e| ExecutionError::Execution(format!("Failed to create workspace: {}", e)))?;
 
     // 4. Set up GitHub-like environment
-    let mut env_context = environment::create_github_context(&workflow, workspace_dir.path());
-    // Track the user-declared slice of env separately so `toJSON(env)` only
-    // dumps what the user actually wrote in YAML (and later, what steps write
-    // to `$GITHUB_ENV`). Starts empty — `create_github_context` only seeds
-    // runner-internal vars.
-    let mut user_env: HashMap<String, String> = HashMap::new();
-
-    // Add workflow-level environment variables (lowest precedence — does not override
-    // built-in GITHUB_*/RUNNER_* vars; job and step env override these later).
-    // Resolve ${{ }} expressions (e.g. ${{ github.repository }}) in values.
-    {
-        // At this point workflow.env hasn't been merged yet — user_env is empty.
-        let wf_expr_ctx = crate::expression::ExpressionContext {
-            env_context: &env_context,
-            step_outputs: &HashMap::new(),
-            matrix_combination: &None,
-            step_statuses: &HashMap::new(),
-            job_status: "success",
-            secrets_context: &HashMap::new(),
-            needs_context: &HashMap::new(),
-            needs_results: &HashMap::new(),
-            user_env: &user_env,
-        };
-        let cwd = std::env::current_dir().map_err(|e| {
-            ExecutionError::Execution(format!("Failed to get current directory: {}", e))
-        })?;
-        let resolved_env: Vec<(String, String)> = workflow
-            .env
-            .iter()
-            .map(|(key, value)| {
-                let resolved =
-                    crate::substitution::preprocess_expressions(value, &cwd, &wf_expr_ctx)
-                        .unwrap_or_else(|_| value.clone());
-                (key.clone(), resolved)
-            })
-            .collect();
-        for (key, value) in resolved_env {
-            // `or_insert` semantics: workflow.env does not override runner-seeded
-            // vars. user_env mirrors the same precedence — a workflow.env key that
-            // collides with a runner var is dropped from env_context AND not added
-            // to user_env (real GHA doesn't let workflow.env shadow runner vars).
-            env_context.entry(key.clone()).or_insert_with(|| {
-                user_env.insert(key, value.clone());
-                value
-            });
-        }
-    }
-
-    // Add runtime mode to environment
-    env_context.insert(
-        "WRKFLW_RUNTIME_MODE".to_string(),
-        config.runtime_type.mode_name().to_string(),
-    );
+    let (mut env_context, user_env) =
+        github_run_env(&workflow, workspace_dir.path(), &config.runtime_type)?;
 
     // show=true means hide=false (inverted for the env var)
     env_context.insert(
@@ -330,7 +280,6 @@ async fn execute_gitlab_pipeline(
     mut config: ExecutionConfig,
 ) -> Result<ExecutionResult, ExecutionError> {
     config.runtime_type = detect_runtime(config.runtime_type);
-    warn_if_overrides_unused(&config);
     wrkflw_logging::info("Executing GitLab CI/CD pipeline");
 
     // 1. Parse the GitLab pipeline file
@@ -358,11 +307,13 @@ async fn execute_gitlab_pipeline(
     };
 
     // 4. Initialize appropriate runtime
-    let runtime = initialize_runtime(
+    let (runtime, effective_runtime) = initialize_runtime(
         config.runtime_type.clone(),
         config.preserve_containers_on_failure,
         &config.kubernetes,
     )?;
+    config.runtime_type = effective_runtime;
+    warn_if_overrides_unused(&config);
 
     // Create a temporary workspace directory
     let workspace_dir = tempfile::tempdir()
@@ -372,10 +323,7 @@ async fn execute_gitlab_pipeline(
     let mut env_context = create_gitlab_context(&pipeline, workspace_dir.path());
 
     // Add runtime mode to environment
-    env_context.insert(
-        "WRKFLW_RUNTIME_MODE".to_string(),
-        config.runtime_type.mode_name().to_string(),
-    );
+    seed_runtime_context(&mut env_context, &config.runtime_type, CiPlatform::GitLab);
 
     // Setup environment files
     environment::setup_github_environment_files(workspace_dir.path()).map_err(|e| {
@@ -599,12 +547,110 @@ pub fn detect_runtime(runtime_type: RuntimeType) -> RuntimeType {
     }
 }
 
-// Determine if Docker/Podman is available or fall back to emulation
+type EnvMap = HashMap<String, String>;
+
+/// Build the run-level env for a GitHub workflow. Returns the full lookup map
+/// and the user-declared slice of it.
+fn github_run_env(
+    workflow: &WorkflowDefinition,
+    workspace_dir: &Path,
+    runtime: &RuntimeType,
+) -> Result<(EnvMap, EnvMap), ExecutionError> {
+    let mut env_context = environment::create_github_context(workflow, workspace_dir);
+    // Before the workflow env below, whose expressions must see what steps see.
+    seed_runtime_context(&mut env_context, runtime, CiPlatform::GitHub);
+
+    // Track the user-declared slice of env separately so `toJSON(env)` only
+    // dumps what the user actually wrote in YAML (and later, what steps write
+    // to `$GITHUB_ENV`). Starts empty — `create_github_context` only seeds
+    // runner-internal vars.
+    let mut user_env: HashMap<String, String> = HashMap::new();
+
+    // Add workflow-level environment variables (lowest precedence — does not override
+    // built-in GITHUB_*/RUNNER_* vars; job and step env override these later).
+    // Resolve ${{ }} expressions (e.g. ${{ github.repository }}) in values.
+    {
+        // At this point workflow.env hasn't been merged yet — user_env is empty.
+        let wf_expr_ctx = crate::expression::ExpressionContext {
+            env_context: &env_context,
+            step_outputs: &HashMap::new(),
+            matrix_combination: &None,
+            step_statuses: &HashMap::new(),
+            job_status: "success",
+            secrets_context: &HashMap::new(),
+            needs_context: &HashMap::new(),
+            needs_results: &HashMap::new(),
+            user_env: &user_env,
+        };
+        let cwd = std::env::current_dir().map_err(|e| {
+            ExecutionError::Execution(format!("Failed to get current directory: {}", e))
+        })?;
+        let resolved_env: Vec<(String, String)> = workflow
+            .env
+            .iter()
+            .map(|(key, value)| {
+                let resolved =
+                    crate::substitution::preprocess_expressions(value, &cwd, &wf_expr_ctx)
+                        .unwrap_or_else(|_| value.clone());
+                (key.clone(), resolved)
+            })
+            .collect();
+        for (key, value) in resolved_env {
+            // `or_insert` semantics: workflow.env does not override runner-seeded
+            // vars. user_env mirrors the same precedence — a workflow.env key that
+            // collides with a runner var is dropped from env_context AND not added
+            // to user_env (real GHA doesn't let workflow.env shadow runner vars).
+            env_context.entry(key.clone()).or_insert_with(|| {
+                user_env.insert(key, value.clone());
+                value
+            });
+        }
+    }
+
+    Ok((env_context, user_env))
+}
+
+/// The CI system whose variables a run exposes to its steps.
+#[derive(Debug, Clone, Copy)]
+enum CiPlatform {
+    GitHub,
+    GitLab,
+}
+
+/// Record the runtime steps will use and, for a container runtime, swap in the
+/// values steps see inside the container.
+fn seed_runtime_context(
+    env: &mut HashMap<String, String>,
+    runtime: &RuntimeType,
+    platform: CiPlatform,
+) {
+    env.insert(
+        "WRKFLW_RUNTIME_MODE".to_string(),
+        runtime.mode_name().to_string(),
+    );
+    if runtime.runs_in_container() {
+        match platform {
+            CiPlatform::GitHub => environment::apply_github_container_context(env),
+            CiPlatform::GitLab => environment::apply_gitlab_container_context(env),
+        }
+    }
+}
+
+fn emulation_runtime() -> (Box<dyn ContainerRuntime>, RuntimeType) {
+    (
+        Box::new(emulation::EmulationRuntime::new()),
+        RuntimeType::Emulation,
+    )
+}
+
+/// Determine if Docker/Podman is available or fall back to emulation. Returns
+/// the runtime with its type, which is `Emulation` after a fallback whatever
+/// was requested.
 fn initialize_runtime(
     runtime_type: RuntimeType,
     preserve_containers_on_failure: bool,
     kubernetes: &KubernetesConfig,
-) -> Result<Box<dyn ContainerRuntime>, ExecutionError> {
+) -> Result<(Box<dyn ContainerRuntime>, RuntimeType), ExecutionError> {
     match runtime_type {
         RuntimeType::Auto => initialize_runtime(
             detect_runtime(RuntimeType::Auto),
@@ -614,42 +660,49 @@ fn initialize_runtime(
         RuntimeType::Docker => {
             if docker::is_available() {
                 match docker::DockerRuntime::new_with_config(preserve_containers_on_failure) {
-                    Ok(docker_runtime) => Ok(Box::new(docker_runtime)),
+                    Ok(docker_runtime) => Ok((Box::new(docker_runtime), RuntimeType::Docker)),
                     Err(e) => {
                         wrkflw_logging::error(&format!(
                             "Failed to initialize Docker runtime: {}, falling back to emulation mode",
                             e
                         ));
-                        Ok(Box::new(emulation::EmulationRuntime::new()))
+                        Ok(emulation_runtime())
                     }
                 }
             } else {
                 wrkflw_logging::error("Docker not available, falling back to emulation mode");
-                Ok(Box::new(emulation::EmulationRuntime::new()))
+                Ok(emulation_runtime())
             }
         }
         RuntimeType::Podman => {
             if podman::is_available() {
-                Ok(Box::new(podman::PodmanRuntime::new_unchecked(
-                    preserve_containers_on_failure,
-                )))
+                Ok((
+                    Box::new(podman::PodmanRuntime::new_unchecked(
+                        preserve_containers_on_failure,
+                    )),
+                    RuntimeType::Podman,
+                ))
             } else {
                 wrkflw_logging::error("Podman not available, falling back to emulation mode");
-                Ok(Box::new(emulation::EmulationRuntime::new()))
+                Ok(emulation_runtime())
             }
         }
         // Kubernetes is never auto-detected and never silently replaced:
         // a job meant for a GPU node must not quietly run on the laptop.
         RuntimeType::Kubernetes => {
             kubernetes::check_available(kubernetes).map_err(ExecutionError::Runtime)?;
-            Ok(Box::new(kubernetes::KubernetesRuntime::new(
-                kubernetes.clone(),
-                preserve_containers_on_failure,
-            )))
+            Ok((
+                Box::new(kubernetes::KubernetesRuntime::new(
+                    kubernetes.clone(),
+                    preserve_containers_on_failure,
+                )),
+                RuntimeType::Kubernetes,
+            ))
         }
-        RuntimeType::Emulation => Ok(Box::new(emulation::EmulationRuntime::new())),
-        RuntimeType::SecureEmulation => Ok(Box::new(
-            wrkflw_runtime::secure_emulation::SecureEmulationRuntime::new(),
+        RuntimeType::Emulation => Ok(emulation_runtime()),
+        RuntimeType::SecureEmulation => Ok((
+            Box::new(wrkflw_runtime::secure_emulation::SecureEmulationRuntime::new()),
+            RuntimeType::SecureEmulation,
         )),
     }
 }
@@ -669,6 +722,17 @@ pub enum RuntimeType {
 }
 
 impl RuntimeType {
+    /// The runtimes whose steps run in a container rather than on the host.
+    const CONTAINER_RUNTIMES: [RuntimeType; 3] = [
+        RuntimeType::Docker,
+        RuntimeType::Podman,
+        RuntimeType::Kubernetes,
+    ];
+
+    fn runs_in_container(&self) -> bool {
+        Self::CONTAINER_RUNTIMES.contains(self)
+    }
+
     /// The value steps see in `WRKFLW_RUNTIME_MODE`.
     pub fn mode_name(&self) -> &'static str {
         match self {
@@ -1211,7 +1275,7 @@ async fn execute_native_docker_step(
         }
     }
 
-    let container_workspace = Path::new("/github/workspace");
+    let container_workspace = Path::new(environment::CONTAINER_WORKSPACE);
     let mount_ctx = prepare_step_container_context(
         step_env,
         ctx.job_env,
@@ -3176,6 +3240,47 @@ impl<'a> StepExecutionContext<'a> {
     }
 }
 
+/// Evaluate `${{ }}` in a `working-directory`. A failed expression is an error,
+/// since falling back to an empty value would run the step in the wrong place.
+fn resolve_working_directory(
+    wd: &str,
+    ctx: &StepExecutionContext<'_>,
+    step_env: &HashMap<String, String>,
+    step_user_env: &HashMap<String, String>,
+) -> Result<String, String> {
+    let expr_ctx = ctx.expr_context_with_env(step_env, step_user_env);
+    let resolved =
+        crate::substitution::preprocess_expressions_strict(wd, ctx.working_dir, &expr_ctx)
+            .map_err(|e| format!("Invalid working-directory '{}': {}", wd, e))?;
+    Ok(workspace_relative_input(&resolved, ctx.job_env))
+}
+
+/// Make a path input relative to the workspace, so it means the same place
+/// wherever it is used. Steps and the actions wrkflw handles itself both work
+/// in the job directory, while `github.workspace` is `/github/workspace` under
+/// a container runtime and a host path in emulation. The workspace itself
+/// becomes `.`, because an empty input means the input was not provided.
+fn workspace_relative_input(path: &str, job_env: &HashMap<String, String>) -> String {
+    let Some(workspace) = job_env.get("GITHUB_WORKSPACE") else {
+        return path.to_string();
+    };
+    match relative_to_workspace(path, workspace) {
+        relative if relative.is_empty() && !path.is_empty() => ".".to_string(),
+        relative => relative,
+    }
+}
+
+/// Make a path under `workspace` relative, since steps see the workspace under
+/// `/github/workspace` and `github.workspace` is the host path in emulation. The
+/// comparison is by path component, so a sibling like `<workspace>-old` stays
+/// absolute and fails the check that keeps steps inside the workspace.
+fn relative_to_workspace(path: &str, workspace: &str) -> String {
+    match Path::new(path).strip_prefix(workspace) {
+        Ok(relative) => relative.to_string_lossy().into_owned(),
+        Err(_) => path.to_string(),
+    }
+}
+
 /// Resolve `${{ }}` expressions in an action `with` parameter value.
 ///
 /// On expression error, returns empty string (matching GitHub Actions behavior
@@ -3198,7 +3303,7 @@ async fn handle_upload_artifact(
         .unwrap_or_else(|| "artifact".to_string());
     let path_pattern = with
         .and_then(|w| w.get("path"))
-        .map(|s| preprocess_with_value(s, ctx))
+        .map(|s| workspace_relative_input(&preprocess_with_value(s, ctx), ctx.job_env))
         .unwrap_or_default();
 
     if path_pattern.is_empty() {
@@ -3246,7 +3351,12 @@ async fn handle_download_artifact(
         .unwrap_or_default();
     let download_path = with
         .and_then(|w| w.get("path"))
-        .map(|s| ctx.working_dir.join(preprocess_with_value(s, ctx)))
+        .map(|s| {
+            ctx.working_dir.join(workspace_relative_input(
+                &preprocess_with_value(s, ctx),
+                ctx.job_env,
+            ))
+        })
         .unwrap_or_else(|| ctx.working_dir.to_path_buf());
 
     // Validate download path stays within workspace (prevent path traversal).
@@ -3367,8 +3477,9 @@ async fn handle_cache_action(
     // actions/cache supports multi-line `path` input (one path per line)
     let cache_paths: Vec<String> = cache_path_raw
         .lines()
-        .map(|l| l.trim().to_string())
+        .map(|l| l.trim())
         .filter(|l| !l.is_empty())
+        .map(|l| workspace_relative_input(l, ctx.job_env))
         .collect();
     let restore_keys: Vec<String> = with
         .and_then(|w| w.get("restore-keys"))
@@ -3927,7 +4038,7 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                         }
                     }
 
-                    let container_workspace = Path::new("/github/workspace");
+                    let container_workspace = Path::new(environment::CONTAINER_WORKSPACE);
                     let mount_ctx = prepare_step_container_context(
                         &mut step_env,
                         ctx.job_env,
@@ -4104,11 +4215,19 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
             .or_else(|| {
                 ctx.workflow_defaults
                     .and_then(|d| d.run.as_ref()?.working_directory.as_deref())
-            });
+            })
+            .map(|wd| resolve_working_directory(wd, &ctx, &step_env, &step_user_env))
+            .transpose();
+        let effective_wd = match effective_wd {
+            Ok(wd) => wd,
+            Err(msg) => {
+                return Ok(StepResult::new(step_name, StepStatus::Failure, msg));
+            }
+        };
 
         // Define the standard workspace path inside the container
-        let container_workspace = Path::new("/github/workspace");
-        let final_workspace = if let Some(wd) = effective_wd {
+        let container_workspace = Path::new(environment::CONTAINER_WORKSPACE);
+        let final_workspace = if let Some(wd) = &effective_wd {
             let joined = container_workspace.join(wd);
             // Canonicalize logically to catch ".." traversal and absolute path replacement
             let mut normalized = std::path::PathBuf::new();
@@ -4594,18 +4713,15 @@ fn prepare_step_container_context(
 type VolumePathPair = (PathBuf, PathBuf);
 
 /// True when steps execute inside a Docker/Podman/Kubernetes container
-/// rather than on the host. `Auto` is resolved to a concrete runtime before this is seeded.
+/// rather than on the host. The mode is seeded from the runtime `initialize_runtime`
+/// returned, so `Auto` and any fallback to emulation are already resolved.
 fn uses_container_runtime(step_env: &HashMap<String, String>) -> bool {
     step_env
         .get("WRKFLW_RUNTIME_MODE")
         .map(|mode| {
-            [
-                RuntimeType::Docker,
-                RuntimeType::Podman,
-                RuntimeType::Kubernetes,
-            ]
-            .iter()
-            .any(|runtime| runtime.mode_name() == mode)
+            RuntimeType::CONTAINER_RUNTIMES
+                .iter()
+                .any(|runtime| runtime.mode_name() == mode)
         })
         .unwrap_or(false)
 }
@@ -4621,7 +4737,7 @@ fn prepare_container_mounts(
     container_config: Option<&JobContainer>,
     mounts_are_copies: bool,
 ) -> (Vec<VolumePathPair>, Option<VolumePathPair>) {
-    let container_github_dir = Path::new("/github/workflow");
+    let container_github_dir = Path::new(environment::CONTAINER_GITHUB_DIR);
     let is_container_runtime = uses_container_runtime(step_env);
 
     // Mount GitHub environment files directory and remap paths
@@ -4641,7 +4757,11 @@ fn prepare_container_mounts(
                         if let Some(filename) = Path::new(host_path).file_name() {
                             step_env.insert(
                                 env_key.to_string(),
-                                format!("/github/workflow/{}", filename.to_string_lossy()),
+                                format!(
+                                    "{}/{}",
+                                    environment::CONTAINER_GITHUB_DIR,
+                                    filename.to_string_lossy()
+                                ),
                             );
                         }
                     }
@@ -7287,6 +7407,7 @@ runs:
         env_vars: Vec<(String, String)>,
         entrypoint: Option<String>,
         volumes: Vec<(PathBuf, PathBuf)>,
+        working_dir: PathBuf,
         /// Contents of the host file the final `cmd` element resolves to
         /// through `volumes`, if any (used to verify a generated script is
         /// actually reachable inside the container).
@@ -7300,7 +7421,7 @@ runs:
             image: &str,
             cmd: &[&str],
             env_vars: &[(&str, &str)],
-            _working_dir: &Path,
+            working_dir: &Path,
             volumes: &[(&Path, &Path)],
             entrypoint: Option<&str>,
         ) -> Result<ContainerOutput, ContainerError> {
@@ -7328,6 +7449,7 @@ runs:
                     .collect(),
                 entrypoint: entrypoint.map(|s| s.to_string()),
                 volumes: owned_volumes,
+                working_dir: working_dir.to_path_buf(),
                 script,
             });
             Ok(ContainerOutput {
@@ -9039,6 +9161,394 @@ runs:
     }
 
     #[tokio::test]
+    async fn working_directory_evaluates_expressions_within_the_workspace() {
+        let job_env = HashMap::from([("GITHUB_WORKSPACE".to_string(), "/host/repo".to_string())]);
+
+        for (wd, expected) in [
+            ("${{ github.workspace }}/src", Some("/github/workspace/src")),
+            ("${{ github.workspace }}", Some("/github/workspace")),
+            ("${{ github.workspace }}/", Some("/github/workspace")),
+            ("${{ github.workspace }}/../escape", None),
+            ("${{ github.workspace }}-other/src", None),
+            ("${{ github.workspace == }}", None),
+        ] {
+            let runtime = MockContainerRuntime::default();
+            let mut step = make_run_step("echo ok");
+            step.working_directory = Some(wd.to_string());
+
+            let result = run_step(&step, &job_env, &runtime).await;
+            let calls = runtime.run_calls.lock().unwrap();
+            match expected {
+                Some(path) => {
+                    assert_eq!(result.status, StepStatus::Success, "{}", wd);
+                    assert_eq!(calls[0].working_dir, Path::new(path), "{}", wd);
+                }
+                None => {
+                    assert_eq!(result.status, StepStatus::Failure, "{}", wd);
+                    assert!(result.output.contains("Invalid working-directory"));
+                    assert!(calls.is_empty(), "{}", wd);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn relative_to_workspace_compares_path_components() {
+        let relative = |path: &str| relative_to_workspace(path, "/host/repo");
+        assert_eq!(relative("/host/repo/src"), "src");
+        assert_eq!(relative("/host/repo"), "");
+        assert_eq!(relative("/host/repo-old/src"), "/host/repo-old/src");
+        assert_eq!(relative("src"), "src");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn relative_to_workspace_handles_windows_paths() {
+        let relative = relative_to_workspace(r"C:\repo/src", r"C:\repo");
+        assert_eq!(relative, "src");
+    }
+
+    #[test]
+    fn seed_runtime_context_applies_container_context_only_to_container_runtimes() {
+        let host_env = || HashMap::from([("RUNNER_OS".to_string(), "macOS".to_string())]);
+
+        for runtime in [RuntimeType::Emulation, RuntimeType::SecureEmulation] {
+            let mut env = host_env();
+            seed_runtime_context(&mut env, &runtime, CiPlatform::GitHub);
+            assert_eq!(env["RUNNER_OS"], "macOS", "{:?}", runtime);
+            assert_eq!(env["WRKFLW_RUNTIME_MODE"], runtime.mode_name());
+        }
+
+        let mut env = host_env();
+        seed_runtime_context(&mut env, &RuntimeType::Docker, CiPlatform::GitHub);
+        assert_eq!(env["RUNNER_OS"], "Linux");
+    }
+
+    #[test]
+    fn gitlab_pipeline_sees_container_paths_only_under_a_container_runtime() {
+        let pipeline: Pipeline = serde_yaml::from_str("stages: [build]").unwrap();
+        let host = Path::new("/host/workspace");
+
+        let mut env = create_gitlab_context(&pipeline, host);
+        seed_runtime_context(&mut env, &RuntimeType::Podman, CiPlatform::GitLab);
+        assert_eq!(env["CI_PROJECT_DIR"], "/github/workspace");
+        assert_eq!(env["GITHUB_WORKSPACE"], "/github/workspace");
+
+        let mut env = create_gitlab_context(&pipeline, host);
+        seed_runtime_context(&mut env, &RuntimeType::Emulation, CiPlatform::GitLab);
+        assert_eq!(env["CI_PROJECT_DIR"], "/host/workspace");
+    }
+
+    #[test]
+    fn workflow_env_expressions_see_what_steps_see() {
+        let mut workflow = minimal_workflow();
+        for (key, value) in [
+            ("BUILD_DIR", "${{ github.workspace }}/build"),
+            ("TARGET_OS", "${{ runner.os }}"),
+        ] {
+            workflow.env.insert(key.to_string(), value.to_string());
+        }
+        let workspace = Path::new("/host/workspace");
+
+        let (env, user_env) = github_run_env(&workflow, workspace, &RuntimeType::Docker).unwrap();
+        assert_eq!(env["BUILD_DIR"], "/github/workspace/build");
+        assert_eq!(env["TARGET_OS"], "Linux");
+        assert_eq!(user_env["BUILD_DIR"], "/github/workspace/build");
+
+        let (env, _) = github_run_env(&workflow, workspace, &RuntimeType::Emulation).unwrap();
+        assert_eq!(
+            env["BUILD_DIR"],
+            format!("{}/build", env["GITHUB_WORKSPACE"])
+        );
+        assert_ne!(env["GITHUB_WORKSPACE"], "/github/workspace");
+    }
+
+    #[test]
+    fn initialize_runtime_reports_the_runtime_it_returns() {
+        let effective = |runtime| {
+            initialize_runtime(runtime, false, &KubernetesConfig::default())
+                .map(|(_, effective)| effective)
+                .unwrap()
+        };
+        assert_eq!(effective(RuntimeType::Emulation), RuntimeType::Emulation);
+        assert_eq!(
+            effective(RuntimeType::SecureEmulation),
+            RuntimeType::SecureEmulation
+        );
+    }
+
+    /// Run `step` in a container-less job with `job_env` and the shared stores.
+    async fn run_step(
+        step: &Step,
+        job_env: &HashMap<String, String>,
+        runtime: &MockContainerRuntime,
+    ) -> StepResult {
+        let working_dir = std::env::current_dir().unwrap();
+        run_step_with(
+            step,
+            job_env,
+            &working_dir,
+            runtime,
+            test_services(),
+            &TEST_PENDING_CACHE_SAVES,
+        )
+        .await
+    }
+
+    /// Run `step` as a job with `job_env` would, with its own stores.
+    async fn run_step_in(
+        step: &Step,
+        job_env: &HashMap<String, String>,
+        working_dir: &Path,
+        runtime: &MockContainerRuntime,
+        artifact_store: &crate::artifacts::ArtifactStore,
+        cache_store: &crate::cache::CacheStore,
+        pending: &std::sync::Mutex<Vec<PendingCacheSave>>,
+    ) -> StepResult {
+        let services = JobServices {
+            artifact_store,
+            cache_store,
+            ..test_services()
+        };
+        run_step_with(step, job_env, working_dir, runtime, services, pending).await
+    }
+
+    async fn run_step_with(
+        step: &Step,
+        job_env: &HashMap<String, String>,
+        working_dir: &Path,
+        runtime: &MockContainerRuntime,
+        services: JobServices<'_>,
+        pending: &std::sync::Mutex<Vec<PendingCacheSave>>,
+    ) -> StepResult {
+        let workflow = minimal_workflow();
+        let ctx = StepExecutionContext {
+            step,
+            step_idx: 0,
+            job_env,
+            job_user_env: job_env,
+            working_dir,
+            runtime,
+            workflow: &workflow,
+            runner_image: "ubuntu:latest",
+            verbose: false,
+            matrix_combination: &None,
+            container_config: None,
+            workflow_defaults: None,
+            job_defaults: None,
+            step_outputs: &HashMap::new(),
+            step_statuses: &HashMap::new(),
+            job_status: "success",
+            services,
+            pending_cache_saves: pending,
+        };
+        execute_step(ctx).await.unwrap()
+    }
+
+    /// What `github.workspace` is under a container runtime and in emulation.
+    /// Neither is the job directory the actions work in.
+    fn workspace_envs() -> [HashMap<String, String>; 2] {
+        [
+            HashMap::from([
+                (
+                    "GITHUB_WORKSPACE".to_string(),
+                    "/github/workspace".to_string(),
+                ),
+                ("WRKFLW_RUNTIME_MODE".to_string(), "docker".to_string()),
+            ]),
+            HashMap::from([
+                ("GITHUB_WORKSPACE".to_string(), "/host/repo".to_string()),
+                ("WRKFLW_RUNTIME_MODE".to_string(), "emulation".to_string()),
+            ]),
+        ]
+    }
+
+    #[tokio::test]
+    async fn artifact_paths_under_github_workspace_resolve_to_the_job_directory() {
+        for job_env in workspace_envs() {
+            let runtime = MockContainerRuntime::default();
+            let working_dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir(working_dir.path().join("dist")).unwrap();
+            std::fs::write(working_dir.path().join("dist/app.txt"), "built").unwrap();
+            let artifact_dir = tempfile::tempdir().unwrap();
+            let artifacts = crate::artifacts::ArtifactStore::new(artifact_dir.path()).unwrap();
+            let cache_dir = tempfile::tempdir().unwrap();
+            let cache =
+                crate::cache::CacheStore::with_root(cache_dir.path().to_path_buf()).unwrap();
+            let pending = std::sync::Mutex::new(Vec::new());
+
+            let upload = make_step(
+                "upload",
+                "actions/upload-artifact@v4",
+                Some(HashMap::from([
+                    ("name".to_string(), "app".to_string()),
+                    (
+                        "path".to_string(),
+                        "${{ github.workspace }}/dist/*".to_string(),
+                    ),
+                ])),
+                HashMap::new(),
+            );
+            let result = run_step_in(
+                &upload,
+                &job_env,
+                working_dir.path(),
+                &runtime,
+                &artifacts,
+                &cache,
+                &pending,
+            )
+            .await;
+            assert_eq!(result.status, StepStatus::Success, "{}", result.output);
+
+            let download = make_step(
+                "download",
+                "actions/download-artifact@v4",
+                Some(HashMap::from([
+                    ("name".to_string(), "app".to_string()),
+                    (
+                        "path".to_string(),
+                        "${{ github.workspace }}/out".to_string(),
+                    ),
+                ])),
+                HashMap::new(),
+            );
+            let result = run_step_in(
+                &download,
+                &job_env,
+                working_dir.path(),
+                &runtime,
+                &artifacts,
+                &cache,
+                &pending,
+            )
+            .await;
+            assert_eq!(result.status, StepStatus::Success, "{}", result.output);
+            assert!(working_dir.path().join("out").exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn cache_paths_under_github_workspace_resolve_to_the_job_directory() {
+        for job_env in workspace_envs() {
+            let runtime = MockContainerRuntime::default();
+            let working_dir = tempfile::tempdir().unwrap();
+            let artifact_dir = tempfile::tempdir().unwrap();
+            let artifacts = crate::artifacts::ArtifactStore::new(artifact_dir.path()).unwrap();
+            let cache_dir = tempfile::tempdir().unwrap();
+            let cache =
+                crate::cache::CacheStore::with_root(cache_dir.path().to_path_buf()).unwrap();
+            let pending = std::sync::Mutex::new(Vec::new());
+            let step = make_step(
+                "cache",
+                "actions/cache@v4",
+                Some(HashMap::from([
+                    ("key".to_string(), "deps-v1".to_string()),
+                    (
+                        "path".to_string(),
+                        "${{ github.workspace }}/deps\nvendor".to_string(),
+                    ),
+                ])),
+                HashMap::new(),
+            );
+
+            let result = run_step_in(
+                &step,
+                &job_env,
+                working_dir.path(),
+                &runtime,
+                &artifacts,
+                &cache,
+                &pending,
+            )
+            .await;
+            assert_eq!(result.status, StepStatus::Success, "{}", result.output);
+            let saved: Vec<String> = pending
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|save| save.path.clone())
+                .collect();
+            assert_eq!(saved, ["deps", "vendor"]);
+        }
+    }
+
+    #[test]
+    fn workspace_itself_is_not_mistaken_for_a_missing_path_input() {
+        let job_env = HashMap::from([("GITHUB_WORKSPACE".to_string(), "/host/repo".to_string())]);
+        for (path, expected) in [
+            ("/host/repo", "."),
+            ("/host/repo/", "."),
+            ("/host/repo/src", "src"),
+            ("", ""),
+        ] {
+            assert_eq!(workspace_relative_input(path, &job_env), expected);
+        }
+    }
+
+    #[test]
+    fn runner_temp_is_on_the_host_directory_mounted_for_the_job() {
+        let mut job_env = HashMap::new();
+        seed_runtime_context(&mut job_env, &RuntimeType::Docker, CiPlatform::GitHub);
+        let _files = environment::isolate_github_environment_files(&mut job_env).unwrap();
+
+        let mut step_env = job_env.clone();
+        let (_, github_mount) = prepare_container_mounts(&mut step_env, &job_env, None, false);
+        let (host, container) = github_mount.unwrap();
+
+        let relative = Path::new(&step_env["RUNNER_TEMP"])
+            .strip_prefix(&container)
+            .unwrap();
+        assert!(host.join(relative).is_dir());
+    }
+
+    #[tokio::test]
+    async fn container_step_receives_the_container_context() {
+        let mut job_env = HashMap::from([
+            ("RUNNER_OS".to_string(), "macOS".to_string()),
+            ("GITHUB_WORKSPACE".to_string(), "/Users/me/repo".to_string()),
+        ]);
+        seed_runtime_context(&mut job_env, &RuntimeType::Docker, CiPlatform::GitHub);
+
+        let runtime = MockContainerRuntime::default();
+        let step = make_run_step("echo ok");
+        let result = run_step(&step, &job_env, &runtime).await;
+        assert_eq!(result.status, StepStatus::Success);
+
+        let calls = runtime.run_calls.lock().unwrap();
+        let env: HashMap<_, _> = calls[0].env_vars.iter().cloned().collect();
+        assert_eq!(env["RUNNER_OS"], "Linux");
+        assert_eq!(env["GITHUB_WORKSPACE"], "/github/workspace");
+    }
+
+    #[tokio::test]
+    async fn working_directory_outside_the_workspace_is_rejected_even_for_runner_temp() {
+        let mut job_env = HashMap::new();
+        seed_runtime_context(&mut job_env, &RuntimeType::Docker, CiPlatform::GitHub);
+
+        let runtime = MockContainerRuntime::default();
+        let mut step = make_run_step("echo ok");
+        step.working_directory = Some("${{ runner.temp }}/build".to_string());
+        let result = run_step(&step, &job_env, &runtime).await;
+        assert_eq!(result.status, StepStatus::Failure);
+        assert!(result.output.contains("must be within workspace"));
+    }
+
+    #[tokio::test]
+    async fn working_directory_sees_the_steps_own_env() {
+        let job_env = HashMap::from([("GITHUB_WORKSPACE".to_string(), "/host/repo".to_string())]);
+        let runtime = MockContainerRuntime::default();
+        let mut step = make_run_step("echo ok");
+        step.env.insert("SUBDIR".to_string(), "src".to_string());
+        step.working_directory = Some("${{ env.SUBDIR }}".to_string());
+
+        let result = run_step(&step, &job_env, &runtime).await;
+        assert_eq!(result.status, StepStatus::Success, "{}", result.output);
+        let calls = runtime.run_calls.lock().unwrap();
+        assert_eq!(calls[0].working_dir, Path::new("/github/workspace/src"));
+    }
+
+    #[tokio::test]
     async fn working_directory_rejects_absolute_path() {
         let runtime = MockContainerRuntime::default();
         let workflow = minimal_workflow();
@@ -9223,43 +9733,50 @@ runs:
 
     #[tokio::test]
     async fn defaults_cascade_working_directory_from_job() {
-        let runtime = MockContainerRuntime::default();
-        let job_defaults = workflow::Defaults {
-            run: Some(workflow::DefaultsRun {
-                shell: None,
-                working_directory: Some("src".to_string()),
-            }),
-        };
         let workflow = minimal_workflow();
-        let job_env = HashMap::new();
+        let job_env = HashMap::from([("GITHUB_WORKSPACE".to_string(), "/host/repo".to_string())]);
         let working_dir = std::env::current_dir().unwrap();
-
         let step = make_run_step("echo ok");
 
-        let ctx = StepExecutionContext {
-            step: &step,
-            step_idx: 0,
-            job_env: &job_env,
-            job_user_env: &job_env,
-            working_dir: &working_dir,
-            runtime: &runtime,
-            workflow: &workflow,
-            runner_image: "ubuntu:latest",
-            verbose: false,
-            matrix_combination: &None,
-            container_config: None,
-            workflow_defaults: None,
-            job_defaults: Some(&job_defaults),
-            step_outputs: &HashMap::new(),
-            step_statuses: &HashMap::new(),
-            job_status: "success",
-            services: test_services(),
-            pending_cache_saves: &TEST_PENDING_CACHE_SAVES,
-        };
+        for wd in ["src", "${{ github.workspace }}/src"] {
+            let runtime = MockContainerRuntime::default();
+            let job_defaults = workflow::Defaults {
+                run: Some(workflow::DefaultsRun {
+                    shell: None,
+                    working_directory: Some(wd.to_string()),
+                }),
+            };
+            let ctx = StepExecutionContext {
+                step: &step,
+                step_idx: 0,
+                job_env: &job_env,
+                job_user_env: &job_env,
+                working_dir: &working_dir,
+                runtime: &runtime,
+                workflow: &workflow,
+                runner_image: "ubuntu:latest",
+                verbose: false,
+                matrix_combination: &None,
+                container_config: None,
+                workflow_defaults: None,
+                job_defaults: Some(&job_defaults),
+                step_outputs: &HashMap::new(),
+                step_statuses: &HashMap::new(),
+                job_status: "success",
+                services: test_services(),
+                pending_cache_saves: &TEST_PENDING_CACHE_SAVES,
+            };
 
-        let result = execute_step(ctx).await.unwrap();
-        assert_eq!(result.status, StepStatus::Success);
-        // Should succeed — "src" is a valid subdirectory path
+            let result = execute_step(ctx).await.unwrap();
+            assert_eq!(result.status, StepStatus::Success, "{}", wd);
+            let calls = runtime.run_calls.lock().unwrap();
+            assert_eq!(
+                calls[0].working_dir,
+                Path::new("/github/workspace/src"),
+                "{}",
+                wd
+            );
+        }
     }
 
     // --- sanitize_timeout_minutes tests ---

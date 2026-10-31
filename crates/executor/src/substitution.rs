@@ -247,6 +247,15 @@ pub fn preprocess_expressions(
     workspace: &Path,
     ctx: &crate::expression::ExpressionContext<'_>,
 ) -> Result<String, String> {
+    expand_expressions(text, workspace, ctx, false)
+}
+
+fn expand_expressions(
+    text: &str,
+    workspace: &Path,
+    ctx: &crate::expression::ExpressionContext<'_>,
+    strict: bool,
+) -> Result<String, String> {
     use crate::expression::evaluate;
 
     // Resolve hashFiles first (needs filesystem access not available in the
@@ -265,6 +274,7 @@ pub fn preprocess_expressions(
         let inner = expand_hash_files(&rest[start + 3..end - 2], workspace)?;
         match evaluate(&inner, ctx) {
             Ok(val) => output.push_str(&val.to_output_string()),
+            Err(e) if strict => return Err(e),
             Err(e) => {
                 wrkflw_logging::debug(&format!(
                     "Expression evaluation failed for '{}': {} — substituting empty string",
@@ -278,6 +288,17 @@ pub fn preprocess_expressions(
     output.push_str(rest);
 
     Ok(output)
+}
+
+/// Like [`preprocess_expressions`], but an expression that fails to evaluate
+/// is an error rather than an empty string. Use it where a silently empty
+/// value would change what runs, as with a `working-directory`.
+pub fn preprocess_expressions_strict(
+    text: &str,
+    workspace: &Path,
+    ctx: &crate::expression::ExpressionContext<'_>,
+) -> Result<String, String> {
+    expand_expressions(text, workspace, ctx, true)
 }
 
 #[cfg(test)]

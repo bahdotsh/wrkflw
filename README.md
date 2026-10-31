@@ -39,6 +39,7 @@ A command-line tool for validating and executing GitHub Actions workflows locall
 - `concurrency:` groups and `cancel-in-progress` — parsed but not enforced
 - Service containers — `services:` is parsed but never started, in any runtime
 - Windows and macOS runners — `runs-on: windows-*` / `macos-*` is silently mapped to a container image (macOS → a Linux image, Windows → a Windows container that won't run on Linux/macOS hosts). In container runtimes `${{ runner.os }}` is always `Linux`; in emulation it is the host OS.
+- `working-directory` outside the workspace — it must stay inside the workspace, so `${{ runner.temp }}/build` fails the step instead of running there.
 
 ## Installation
 

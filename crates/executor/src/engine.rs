@@ -9250,6 +9250,13 @@ runs:
             RuntimeType::Emulation
         };
         assert_eq!(effective(RuntimeType::Podman), expected);
+
+        let expected = if docker::is_available() {
+            RuntimeType::Docker
+        } else {
+            RuntimeType::Emulation
+        };
+        assert_eq!(effective(RuntimeType::Docker), expected);
     }
 
     /// Run `step` as a job with `job_env` would, with its own stores.
@@ -9453,6 +9460,82 @@ runs:
         assert_eq!(workspace_relative_input("/host/repo", &ctx), ".");
         assert_eq!(workspace_relative_input("/host/repo/src", &ctx), "src");
         assert_eq!(workspace_relative_input("", &ctx), "");
+    }
+
+    #[tokio::test]
+    async fn container_step_receives_the_container_context() {
+        let mut job_env = HashMap::from([
+            ("RUNNER_OS".to_string(), "macOS".to_string()),
+            ("GITHUB_WORKSPACE".to_string(), "/Users/me/repo".to_string()),
+        ]);
+        seed_runtime_mode(&mut job_env, &RuntimeType::Docker, CiPlatform::GitHub);
+
+        let runtime = MockContainerRuntime::default();
+        let workflow = minimal_workflow();
+        let step = make_run_step("echo ok");
+        let working_dir = std::env::current_dir().unwrap();
+        let ctx = StepExecutionContext {
+            step: &step,
+            step_idx: 0,
+            job_env: &job_env,
+            job_user_env: &HashMap::new(),
+            working_dir: &working_dir,
+            runtime: &runtime,
+            workflow: &workflow,
+            runner_image: "ubuntu:latest",
+            verbose: false,
+            matrix_combination: &None,
+            container_config: None,
+            workflow_defaults: None,
+            job_defaults: None,
+            step_outputs: &HashMap::new(),
+            step_statuses: &HashMap::new(),
+            job_status: "success",
+            services: test_services(),
+            pending_cache_saves: &TEST_PENDING_CACHE_SAVES,
+        };
+        let result = execute_step(ctx).await.unwrap();
+        assert_eq!(result.status, StepStatus::Success);
+
+        let calls = runtime.run_calls.lock().unwrap();
+        let env: HashMap<_, _> = calls[0].env_vars.iter().cloned().collect();
+        assert_eq!(env["RUNNER_OS"], "Linux");
+        assert_eq!(env["GITHUB_WORKSPACE"], "/github/workspace");
+    }
+
+    #[tokio::test]
+    async fn working_directory_outside_the_workspace_is_rejected_even_for_runner_temp() {
+        let mut job_env = HashMap::new();
+        seed_runtime_mode(&mut job_env, &RuntimeType::Docker, CiPlatform::GitHub);
+
+        let runtime = MockContainerRuntime::default();
+        let workflow = minimal_workflow();
+        let mut step = make_run_step("echo ok");
+        step.working_directory = Some("${{ runner.temp }}/build".to_string());
+        let working_dir = std::env::current_dir().unwrap();
+        let ctx = StepExecutionContext {
+            step: &step,
+            step_idx: 0,
+            job_env: &job_env,
+            job_user_env: &HashMap::new(),
+            working_dir: &working_dir,
+            runtime: &runtime,
+            workflow: &workflow,
+            runner_image: "ubuntu:latest",
+            verbose: false,
+            matrix_combination: &None,
+            container_config: None,
+            workflow_defaults: None,
+            job_defaults: None,
+            step_outputs: &HashMap::new(),
+            step_statuses: &HashMap::new(),
+            job_status: "success",
+            services: test_services(),
+            pending_cache_saves: &TEST_PENDING_CACHE_SAVES,
+        };
+        let result = execute_step(ctx).await.unwrap();
+        assert_eq!(result.status, StepStatus::Failure);
+        assert!(result.output.contains("must be within workspace"));
     }
 
     #[tokio::test]

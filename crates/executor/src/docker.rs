@@ -1,7 +1,8 @@
+use crate::container_guard::ContainerGuard;
 use async_trait::async_trait;
 use bollard::{
     container::{Config, CreateContainerOptions},
-    models::HostConfig,
+    models::{ContainerWaitResponse, HostConfig},
     network::CreateNetworkOptions,
     Docker,
 };
@@ -420,6 +421,25 @@ pub fn is_available() -> bool {
     false
 }
 
+/// The exit code of a finished container, or -1 if it can't be determined.
+fn wait_exit_code(
+    wait_result: Option<&Result<ContainerWaitResponse, bollard::errors::Error>>,
+) -> i32 {
+    match wait_result {
+        Some(Ok(exit)) => exit.status_code as i32,
+        // bollard reports a non-zero exit as an error
+        Some(Err(bollard::errors::Error::DockerContainerWaitError { code, .. })) => *code as i32,
+        Some(Err(e)) => {
+            wrkflw_logging::warning(&format!("Failed to wait for container: {}", e));
+            -1
+        }
+        None => {
+            wrkflw_logging::warning("Container wait returned no result");
+            -1
+        }
+    }
+}
+
 // Add container to tracking
 pub fn track_container(id: &str) {
     if let Ok(mut containers) = RUNNING_CONTAINERS.lock() {
@@ -643,24 +663,10 @@ impl ContainerRuntime for DockerRuntime {
         // Print detailed debugging info
         wrkflw_logging::info(&format!("Docker: Running container with image: {}", image));
 
-        // Add a global timeout for all Docker operations to prevent freezing
-        let timeout_duration = std::time::Duration::from_secs(360); // Increased outer timeout to 6 minutes
-
-        // Run the entire container operation with a timeout
-        match tokio::time::timeout(
-            timeout_duration,
-            self.run_container_inner(image, cmd, env_vars, working_dir, volumes, entrypoint),
-        )
-        .await
-        {
-            Ok(result) => result,
-            Err(_) => {
-                wrkflw_logging::error("Docker operation timed out after 360 seconds");
-                Err(ContainerError::ContainerExecution(
-                    "Operation timed out".to_string(),
-                ))
-            }
-        }
+        // A step runs as long as its job or step `timeout-minutes` allows. The
+        // engine enforces those, and dropping this future stops the container.
+        self.run_container_inner(image, cmd, env_vars, working_dir, volumes, entrypoint)
+            .await
     }
 
     async fn pull_image(&self, image: &str) -> Result<(), ContainerError> {
@@ -1004,6 +1010,12 @@ impl DockerRuntime {
 
         // Track the container before starting it to ensure cleanup even if starting fails
         track_container(&container.id);
+        let mut guard = ContainerGuard::new(
+            "docker",
+            &container.id,
+            self.preserve_containers_on_failure,
+            untrack_container,
+        );
 
         // Start container with a timeout
         let start_result = tokio::time::timeout(
@@ -1018,37 +1030,27 @@ impl DockerRuntime {
                 // Clean up the container if start fails
                 let _ = self.docker.remove_container(&container.id, None).await;
                 untrack_container(&container.id);
+                guard.disarm();
                 return Err(ContainerError::ContainerExecution(e.to_string()));
             }
             Err(_) => {
                 // Clean up the container if starting times out
                 let _ = self.docker.remove_container(&container.id, None).await;
                 untrack_container(&container.id);
+                guard.disarm();
                 return Err(ContainerError::ContainerExecution(
                     "Container start timed out".to_string(),
                 ));
             }
         }
 
-        // Wait for container to finish with a timeout (300 seconds)
-        let wait_result = tokio::time::timeout(
-            std::time::Duration::from_secs(300),
-            self.docker
-                .wait_container::<String>(&container.id, None)
-                .collect::<Vec<_>>(),
-        )
-        .await;
-
-        let exit_code = match wait_result {
-            Ok(results) => match results.first() {
-                Some(Ok(exit)) => exit.status_code as i32,
-                _ => -1,
-            },
-            Err(_) => {
-                wrkflw_logging::warning("Container wait operation timed out, treating as failure");
-                -1
-            }
-        };
+        // Wait for the container to finish
+        let wait_result = self
+            .docker
+            .wait_container::<String>(&container.id, None)
+            .collect::<Vec<_>>()
+            .await;
+        let exit_code = wait_exit_code(wait_result.first());
 
         // Get logs with a timeout
         let log_options = Some(bollard::container::LogsOptions::<String> {
@@ -1100,6 +1102,7 @@ impl DockerRuntime {
             // Still untrack it from the automatic cleanup system to prevent it from being cleaned up later
             untrack_container(&container.id);
         }
+        guard.disarm();
 
         // Log detailed information about the command execution for debugging
         if exit_code != 0 {
@@ -1298,6 +1301,38 @@ pub fn get_tracked_networks() -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    use super::wait_exit_code;
+    use bollard::errors::Error;
+    use bollard::models::ContainerWaitResponse;
+
+    #[test]
+    fn wait_exit_code_keeps_a_zero_exit() {
+        let wait = Ok(ContainerWaitResponse {
+            status_code: 0,
+            error: None,
+        });
+        assert_eq!(wait_exit_code(Some(&wait)), 0);
+    }
+
+    #[test]
+    fn wait_exit_code_recovers_a_non_zero_exit_from_the_error() {
+        let wait = Err(Error::DockerContainerWaitError {
+            error: String::new(),
+            code: 42,
+        });
+        assert_eq!(wait_exit_code(Some(&wait)), 42);
+    }
+
+    #[test]
+    fn wait_exit_code_is_unknown_when_the_wait_fails() {
+        let wait = Err(Error::DockerResponseServerError {
+            status_code: 500,
+            message: "daemon went away".to_string(),
+        });
+        assert_eq!(wait_exit_code(Some(&wait)), -1);
+        assert_eq!(wait_exit_code(None), -1);
+    }
+
     use super::*;
 
     fn config_for(image: &str, cmd: &[&str], entrypoint: Option<&str>) -> Config<String> {

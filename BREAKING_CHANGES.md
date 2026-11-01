@@ -1,5 +1,22 @@
 # Breaking Changes
 
+## `actions/upload-artifact` follows GitHub's layout and rules (unreleased)
+
+Artifact paths are now relative to where the `path:` search started, as on
+GitHub. After uploading `out/*` or `out/f.txt` and downloading into `got/`, the
+file is at `got/f.txt`, not `got/out/f.txt`. Update steps that read the old path.
+
+A step that matches no files now passes with a warning. Set
+`if-no-files-found: error` to keep failing, or `ignore` to silence the warning.
+A missing artifact otherwise shows up at download, or not at all.
+
+`!` lines apply in order, so a later line can re-include a file. A `path:` line
+outside the workspace now fails the step instead of being skipped.
+
+Uploading to an existing artifact name replaces it. Files used to be merged into
+the earlier upload, so matrix jobs sharing a name now keep only the last upload.
+Give each job its own name, as GitHub requires.
+
 ## `ExecutionConfig` gained a `platform_overrides` field (unreleased)
 
 Code that builds `wrkflw_executor::ExecutionConfig` as a struct literal must set

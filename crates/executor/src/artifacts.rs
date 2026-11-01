@@ -55,26 +55,44 @@ fn normalize(path: &Path) -> PathBuf {
     normalized
 }
 
-/// Files within the workspace matching a glob or directory path, as
-/// (normalized, original) pairs. Containment is decided on the canonical path;
-/// the normalized path is what names the file in the artifact, so a file
-/// reached through a symlinked directory keeps the path it was found at.
+/// One glob or path from a `path:` input, resolved against the workspace.
+struct PathLine<'a> {
+    /// The line without trailing slashes, unless it is only slashes.
+    text: &'a str,
+    /// The line joined to the workspace. Absolute lines stay as written.
+    path: PathBuf,
+    /// Whether the line names an existing directory.
+    is_dir: bool,
+}
+
+impl<'a> PathLine<'a> {
+    fn parse(workspace: &Path, line: &'a str) -> Self {
+        let trimmed = line.trim_end_matches('/');
+        let text = if trimmed.is_empty() { line } else { trimmed };
+        let path = workspace.join(text);
+        let is_dir = path.is_dir();
+        Self { text, path, is_dir }
+    }
+}
+
+/// Files within the workspace matching a path line, as (normalized, original)
+/// pairs. Containment is decided on the canonical path; the normalized path is
+/// what names the file in the artifact, so a file reached through a symlinked
+/// directory keeps the path it was found at.
 fn matching_files(
     workspace: &Path,
-    pattern: &str,
+    line: &PathLine<'_>,
     canonical_workspace: &Path,
 ) -> Result<Vec<(PathBuf, PathBuf)>, String> {
-    let trimmed = pattern.trim_end_matches('/');
-    let literal = workspace.join(trimmed);
-    let full_pattern = if literal.is_dir() {
-        PathBuf::from(glob::Pattern::escape(&literal.to_string_lossy()))
+    let full_pattern = if line.is_dir {
+        PathBuf::from(glob::Pattern::escape(&line.path.to_string_lossy()))
             .join("**")
             .join("*")
     } else {
-        let glob_path = if Path::new(trimmed).is_absolute() {
-            PathBuf::from(trimmed)
+        let glob_path = if Path::new(line.text).is_absolute() {
+            PathBuf::from(line.text)
         } else {
-            PathBuf::from(glob::Pattern::escape(&workspace.to_string_lossy())).join(trimmed)
+            PathBuf::from(glob::Pattern::escape(&workspace.to_string_lossy())).join(line.text)
         };
         // The glob crate's trailing `**` matches directories only, whereas
         // `dist/**` in a workflow means everything under `dist`.
@@ -85,7 +103,7 @@ fn matching_files(
         }
     };
     Ok(glob::glob(&full_pattern.to_string_lossy())
-        .map_err(|e| format!("Invalid glob pattern '{}': {}", pattern, e))?
+        .map_err(|e| format!("Invalid glob pattern '{}': {}", line.text, e))?
         .filter_map(|e| e.ok())
         .filter(|p| p.is_file() && !p.is_symlink())
         .filter(|p| {
@@ -99,19 +117,20 @@ fn matching_files(
 /// The directory a `path:` line starts from: the directory it names, its part
 /// before the first wildcard, or the parent of a single file. Only the line
 /// itself is searched for wildcards, as the workspace path may contain them.
-fn search_root(workspace: &Path, pattern: &str) -> PathBuf {
-    let trimmed = pattern.trim_end_matches('/');
-    let path = workspace.join(trimmed);
-    if path.is_dir() {
-        return normalize(&path);
+fn search_root(workspace: &Path, line: &PathLine<'_>) -> PathBuf {
+    if line.is_dir {
+        return normalize(&line.path);
     }
-    let line = Path::new(trimmed);
-    let wildcard = line
+    let text = Path::new(line.text);
+    let wildcard = text
         .components()
         .position(|c| c.as_os_str().to_string_lossy().contains(['*', '?', '[']));
     let root = match wildcard {
-        Some(index) => workspace.join(line.components().take(index).collect::<PathBuf>()),
-        None => path.parent().map(Path::to_path_buf).unwrap_or(path),
+        Some(index) => workspace.join(text.components().take(index).collect::<PathBuf>()),
+        None => line
+            .path
+            .parent()
+            .map_or_else(|| line.path.clone(), Path::to_path_buf),
     };
     normalize(&root)
 }
@@ -172,9 +191,14 @@ impl ArtifactStore {
 
     /// Upload the files selected by a `path:` input into a named artifact.
     ///
-    /// `path_pattern` holds one glob or path per line. Lines starting with `!`
-    /// exclude files and lines starting with `#` are comments. Paths in the
-    /// artifact are relative to the search root of the lines.
+    /// `path_pattern` holds one glob or path per line. Lines apply in order, so
+    /// a later line overrides an earlier one: lines starting with `!` exclude
+    /// files, and lines starting with `#` are comments. Paths in the artifact
+    /// are relative to the search root of the lines. A line outside the
+    /// workspace is an error, as its files could not be uploaded.
+    ///
+    /// Uploading replaces any artifact of the same name. Unlike upload-artifact,
+    /// hidden files are included.
     ///
     /// Returns the number of files uploaded. When that is zero, no artifact is
     /// recorded; whether that is an error is the caller's decision.
@@ -195,27 +219,40 @@ impl ArtifactStore {
             let canonical_workspace = ws
                 .canonicalize()
                 .map_err(|e| format!("Failed to canonicalize workspace: {}", e))?;
-            let lines: Vec<&str> = pattern
-                .lines()
-                .map(str::trim)
-                .filter(|line| !line.is_empty() && !line.starts_with('#'))
-                .collect();
-            let includes: Vec<&str> = lines
-                .iter()
-                .copied()
-                .filter(|line| !line.starts_with('!'))
-                .collect();
-            let excludes: Vec<&str> = lines.iter().filter_map(|l| l.strip_prefix('!')).collect();
+            // Paths are compared lexically below, which needs every one of
+            // them to be absolute.
+            let ws = std::path::absolute(&ws)
+                .map_err(|e| format!("Failed to resolve workspace path: {}", e))?;
+            let normalized_workspace = normalize(&ws);
 
             // Keyed by normalized path: this removes files matched by several
             // lines, and a file stays selected under each path it is found at.
             let mut entries: BTreeMap<PathBuf, PathBuf> = BTreeMap::new();
-            for include in &includes {
-                entries.extend(matching_files(&ws, include, &canonical_workspace)?);
-            }
-            for exclude in &excludes {
-                for (normalized, _) in matching_files(&ws, exclude, &canonical_workspace)? {
-                    entries.remove(&normalized);
+            let mut search_roots: Vec<PathBuf> = Vec::new();
+            for line in pattern
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            {
+                if let Some(exclude) = line.strip_prefix('!') {
+                    let exclude = PathLine::parse(&ws, exclude);
+                    for (normalized, _) in matching_files(&ws, &exclude, &canonical_workspace)? {
+                        entries.remove(&normalized);
+                    }
+                } else {
+                    let include = PathLine::parse(&ws, line);
+                    let root = search_root(&ws, &include);
+                    if !root.starts_with(&normalized_workspace)
+                        && !root.starts_with(&canonical_workspace)
+                    {
+                        return Err(format!(
+                            "Path '{}' is outside the workspace '{}'",
+                            include.text,
+                            ws.display()
+                        ));
+                    }
+                    search_roots.push(root);
+                    entries.extend(matching_files(&ws, &include, &canonical_workspace)?);
                 }
             }
 
@@ -223,18 +260,13 @@ impl ArtifactStore {
                 return Ok(0);
             }
 
-            std::fs::create_dir_all(&ad)
-                .map_err(|e| format!("Failed to create artifact directory: {}", e))?;
-
             // Like upload-artifact, paths are relative to where the search
             // started, or to what the search paths share when there are several.
-            let search_roots: Vec<PathBuf> = includes
-                .iter()
-                .map(|include| search_root(&ws, include))
-                .collect();
-            let root = common_ancestor(&search_roots).unwrap_or_else(|| normalize(&ws));
+            let root = common_ancestor(&search_roots).unwrap_or(normalized_workspace);
 
-            let mut count = 0;
+            // Resolve every destination first, so that a failure leaves any
+            // earlier artifact of this name in place.
+            let mut copies = Vec::with_capacity(entries.len());
             for (normalized, entry) in &entries {
                 let rel = normalized.strip_prefix(&root).map_err(|_| {
                     format!(
@@ -243,7 +275,27 @@ impl ArtifactStore {
                         root.display()
                     )
                 })?;
-                let dest = ad.join(rel);
+                // Joining anything else could name the source file itself,
+                // which copying would truncate.
+                if rel.as_os_str().is_empty() || rel.is_absolute() {
+                    return Err(format!(
+                        "File '{}' has no path relative to the artifact root '{}'",
+                        entry.display(),
+                        root.display()
+                    ));
+                }
+                copies.push((entry, ad.join(rel)));
+            }
+
+            if ad.exists() {
+                std::fs::remove_dir_all(&ad)
+                    .map_err(|e| format!("Failed to replace artifact directory: {}", e))?;
+            }
+            std::fs::create_dir_all(&ad)
+                .map_err(|e| format!("Failed to create artifact directory: {}", e))?;
+
+            let mut count = 0;
+            for (entry, dest) in copies {
                 if let Some(parent) = dest.parent() {
                     std::fs::create_dir_all(parent)
                         .map_err(|e| format!("Failed to create directory: {}", e))?;
@@ -443,11 +495,116 @@ mod tests {
         let store = ArtifactStore::new(run_dir.path()).unwrap();
         let outside = run_dir.path().join("secret.txt");
         std::fs::write(&outside, "x").unwrap();
-        let count = store
+        let result = store
             .upload("a", &outside.to_string_lossy(), workspace.path())
+            .await;
+        assert!(result.unwrap_err().contains("outside the workspace"));
+    }
+
+    #[tokio::test]
+    async fn a_line_outside_the_workspace_fails_rather_than_moving_the_root() {
+        for outside in ["../nope/", "/nope", "/", "../*.txt"] {
+            let run_dir = tempdir().unwrap();
+            let workspace = tempdir().unwrap();
+            std::fs::create_dir_all(workspace.path().join("out")).unwrap();
+            std::fs::write(workspace.path().join("out/a.txt"), "x").unwrap();
+            let store = ArtifactStore::new(run_dir.path()).unwrap();
+            let path = format!("out/\n{}", outside);
+            let result = store.upload("a", &path, workspace.path()).await;
+            assert!(
+                result.unwrap_err().contains("outside the workspace"),
+                "{}",
+                outside
+            );
+            assert!(store.list().await.is_empty(), "{}", outside);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_relative_workspace_never_overwrites_its_source_files() {
+        let run_dir = tempdir().unwrap();
+        let workspace = tempfile::tempdir_in(".").unwrap();
+        std::fs::create_dir_all(workspace.path().join("out")).unwrap();
+        std::fs::write(workspace.path().join("out/a.txt"), "payload").unwrap();
+        std::fs::write(workspace.path().join("b.txt"), "x").unwrap();
+        let absolute = workspace.path().join("out").canonicalize().unwrap();
+        let store = ArtifactStore::new(run_dir.path()).unwrap();
+        let path = format!("b.txt\n{}", absolute.display());
+        let count = store.upload("a", &path, workspace.path()).await.unwrap();
+        assert_eq!(count, 2);
+        let source = std::fs::read_to_string(workspace.path().join("out/a.txt")).unwrap();
+        assert_eq!(source, "payload");
+        let target = tempdir().unwrap();
+        store.download("a", target.path()).await.unwrap();
+        assert!(target.path().join("b.txt").is_file());
+        assert!(target.path().join("out/a.txt").is_file());
+    }
+
+    #[tokio::test]
+    async fn a_later_line_overrides_an_earlier_exclusion() {
+        let target = round_trip(&["out/a.log", "out/b.log"], "out/\n!out/*.log\nout/a.log").await;
+        assert!(target.path().join("a.log").is_file());
+        assert!(!target.path().join("b.log").exists());
+    }
+
+    #[tokio::test]
+    async fn an_exclusion_only_applies_to_earlier_lines() {
+        let target = round_trip(&["out/a.log"], "!out/*.log\nout/").await;
+        assert!(target.path().join("a.log").is_file());
+    }
+
+    #[tokio::test]
+    async fn a_file_matched_under_two_spellings_is_uploaded_once() {
+        let run_dir = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        std::fs::create_dir_all(workspace.path().join("out")).unwrap();
+        std::fs::write(workspace.path().join("out/a.txt"), "x").unwrap();
+        let store = ArtifactStore::new(run_dir.path()).unwrap();
+        let count = store
+            .upload("a", "out/../out/\nout/", workspace.path())
             .await
             .unwrap();
-        assert_eq!(count, 0);
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn uploading_again_replaces_the_artifact() {
+        let run_dir = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        std::fs::create_dir_all(workspace.path().join("out")).unwrap();
+        std::fs::write(workspace.path().join("out/a.txt"), "x").unwrap();
+        std::fs::write(workspace.path().join("out/b.txt"), "x").unwrap();
+        let store = ArtifactStore::new(run_dir.path()).unwrap();
+        store.upload("a", "out/", workspace.path()).await.unwrap();
+        std::fs::remove_file(workspace.path().join("out/b.txt")).unwrap();
+        store.upload("a", "out/", workspace.path()).await.unwrap();
+        let target = tempdir().unwrap();
+        assert_eq!(store.download("a", target.path()).await.unwrap(), 1);
+        assert!(!target.path().join("b.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn a_failed_upload_keeps_the_earlier_artifact() {
+        let run_dir = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        std::fs::write(workspace.path().join("a.txt"), "x").unwrap();
+        let store = ArtifactStore::new(run_dir.path()).unwrap();
+        store.upload("a", "a.txt", workspace.path()).await.unwrap();
+        assert!(store
+            .upload("a", "../nope", workspace.path())
+            .await
+            .is_err());
+        assert_eq!(store.upload("a", "*.none", workspace.path()).await, Ok(0));
+        let target = tempdir().unwrap();
+        assert_eq!(store.download("a", target.path()).await.unwrap(), 1);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_trailing_backslash_names_a_directory() {
+        let target = round_trip(&["out/a.txt"], "out\\").await;
+        assert!(target.path().join("a.txt").is_file());
     }
 
     #[tokio::test]

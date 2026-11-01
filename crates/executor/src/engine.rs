@@ -3676,11 +3676,12 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
 
             match prepared {
                 PreparedAction::Composite => {
+                    let call_step = composite_call_step(&ctx, &step_env, &step_user_env);
                     if action_info.is_local {
                         // Handle local composite action
                         let action_path = Path::new(&action_info.repository);
                         execute_composite_action(
-                            &composite_call_step(&ctx, &step_env, &step_user_env),
+                            &call_step,
                             action_path,
                             &step_env,
                             &step_user_env,
@@ -3736,7 +3737,7 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                         };
                         // tempdir must stay alive until execute_composite_action completes
                         execute_composite_action(
-                            &composite_call_step(&ctx, &step_env, &step_user_env),
+                            &call_step,
                             &action_dir,
                             &step_env,
                             &step_user_env,
@@ -5272,6 +5273,9 @@ fn extract_language_info(image: &str) -> Option<(&'static str, Option<&str>)> {
 }
 
 /// The env var holding an input, as read back by `inputs.<name>`.
+///
+/// Only for the `inputs` context. Docker and JavaScript actions keep hyphens in
+/// `INPUT_<NAME>`, because that is the name `core.getInput` looks up.
 fn input_env_key(name: &str) -> String {
     format!("INPUT_{}", name.to_uppercase().replace('-', "_"))
 }
@@ -10269,7 +10273,7 @@ runs:
     }
 
     #[tokio::test]
-    async fn composite_inputs_get_defaults_and_evaluated_caller_values() {
+    async fn composite_inputs_get_hyphenated_names_and_scalar_defaults() {
         let action_dir = tempfile::tempdir().unwrap();
         fs::write(
             action_dir.path().join("action.yml"),
@@ -10326,6 +10330,101 @@ runs:
         };
         assert_eq!(env("A"), Some("v"));
         assert_eq!(env("B"), Some("3"));
+    }
+
+    #[tokio::test]
+    async fn composite_with_is_evaluated_in_each_callers_scope() {
+        // `uses: ./x` resolves against the process cwd, so the actions have to
+        // live under it.
+        let actions = tempfile::tempdir_in(".").unwrap();
+        let relative = Path::new(actions.path().file_name().unwrap());
+        let outer_uses = format!("./{}", relative.join("outer").display());
+        let inner_uses = format!("./{}", relative.join("inner").display());
+        fs::create_dir(actions.path().join("outer")).unwrap();
+        fs::create_dir(actions.path().join("inner")).unwrap();
+        fs::write(
+            actions.path().join("outer/action.yml"),
+            format!(
+                r#"
+name: outer
+inputs:
+  who:
+    description: from the job
+runs:
+  using: composite
+  steps:
+    - uses: {inner_uses}
+      with:
+        value: ${{{{ inputs.who }}}}
+"#
+            ),
+        )
+        .unwrap();
+        fs::write(
+            actions.path().join("inner/action.yml"),
+            r#"
+name: inner
+inputs:
+  value:
+    description: from the outer action
+runs:
+  using: composite
+  steps:
+    - run: echo hi
+      env:
+        DIRECT: ${{ inputs.value }}
+"#,
+        )
+        .unwrap();
+
+        let runtime = MockContainerRuntime::default();
+        let workflow = minimal_workflow();
+        let job_env = HashMap::from([("WHO".to_string(), "resolved".to_string())]);
+        let working_dir = tempfile::tempdir().unwrap();
+        let step = make_step(
+            "composite",
+            &outer_uses,
+            Some(HashMap::from([(
+                "who".to_string(),
+                "${{ env.WHO }}".to_string(),
+            )])),
+            HashMap::new(),
+        );
+
+        let ctx = StepExecutionContext {
+            step: &step,
+            step_idx: 0,
+            job_env: &job_env,
+            job_user_env: &job_env,
+            working_dir: working_dir.path(),
+            runtime: &runtime,
+            workflow: &workflow,
+            runner_image: "ubuntu:latest",
+            verbose: false,
+            matrix_combination: &None,
+            container_config: None,
+            workflow_defaults: None,
+            job_defaults: None,
+            step_outputs: &HashMap::new(),
+            step_statuses: &HashMap::new(),
+            job_status: "success",
+            services: test_services(),
+            pending_cache_saves: &TEST_PENDING_CACHE_SAVES,
+        };
+
+        let result = execute_step(ctx).await.unwrap();
+        assert_eq!(result.status, StepStatus::Success, "{}", result.output);
+
+        let calls = runtime.run_calls.lock().unwrap();
+        let env = |key: &str| {
+            calls[0]
+                .env_vars
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(env("DIRECT"), Some("resolved"));
+        assert_eq!(env("INPUT_VALUE"), Some("resolved"));
     }
 
     #[test]

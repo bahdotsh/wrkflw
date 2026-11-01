@@ -584,6 +584,8 @@ fn resolve_gitlab_dependencies(
         ],
     };
 
+    let stages_include_test = stages.iter().any(|stage| stage == "test");
+
     // Create an execution plan based on stages
     let mut execution_plan = Vec::new();
 
@@ -612,7 +614,11 @@ fn resolve_gitlab_dependencies(
         }
     }
 
-    // Also create a batch for jobs without a stage
+    // Jobs without a stage belong to `test`. They only need a batch of their
+    // own when the pipeline doesn't define that stage.
+    if stages_include_test {
+        return Ok(execution_plan);
+    }
     let mut stageless_jobs = Vec::new();
 
     for (job_name, job) in &pipeline.jobs {
@@ -12724,6 +12730,20 @@ runs:
         let (run, skipped) = select_stage_jobs(stage(), &conditions, true);
         assert_eq!(run, ["failure", "always"]);
         assert_eq!(names(skipped), ["success", "manual", "unconditioned"]);
+    }
+
+    #[test]
+    fn stageless_jobs_are_planned_once() {
+        let plan = |yaml: &str| {
+            let pipeline: Pipeline = serde_yaml::from_str(yaml).unwrap();
+            let workflow = gitlab::convert_to_workflow_format(&pipeline);
+            resolve_gitlab_dependencies(&pipeline, &workflow).unwrap()
+        };
+        assert_eq!(plan("job:\n  script: [echo]\n"), [["job"]]);
+        assert_eq!(
+            plan("stages: [build]\njob:\n  script: [echo]\n"),
+            [["job"]]
+        );
     }
 
     #[test]

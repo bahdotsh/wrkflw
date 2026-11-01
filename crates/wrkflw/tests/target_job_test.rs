@@ -43,6 +43,7 @@ jobs:
         target_job: Some("test".to_string()),
         platform_overrides: Default::default(),
         kubernetes: Default::default(),
+        variables: Default::default(),
     };
 
     let result = execute_workflow(&workflow_path, cfg)
@@ -86,6 +87,7 @@ jobs:
         target_job: Some("nonexistent".to_string()),
         platform_overrides: Default::default(),
         kubernetes: Default::default(),
+        variables: Default::default(),
     };
 
     let result = execute_workflow(&workflow_path, cfg).await;
@@ -136,6 +138,7 @@ jobs:
         target_job: Some("lint".to_string()),
         platform_overrides: Default::default(),
         kubernetes: Default::default(),
+        variables: Default::default(),
     };
 
     let result = execute_workflow(&workflow_path, cfg)

@@ -218,6 +218,7 @@ pub async fn execute_workflow_cli(
         target_job: None,
         platform_overrides,
         kubernetes,
+        variables: Default::default(),
     };
 
     match wrkflw_executor::execute_workflow(path, config).await {
@@ -653,6 +654,7 @@ pub fn start_next_workflow_execution(
                         target_job,
                         platform_overrides,
                         kubernetes,
+                        variables: Default::default(),
                     };
 
                     let execution_result = wrkflw_utils::fd::with_stderr_to_null(|| {

@@ -94,6 +94,7 @@ jobs:
         target_job: None,
         platform_overrides: Default::default(),
         kubernetes: Default::default(),
+        variables: Default::default(),
     };
 
     let result = execute_workflow(&caller_path, cfg)

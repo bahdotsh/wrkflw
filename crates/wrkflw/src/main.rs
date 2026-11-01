@@ -240,9 +240,15 @@ enum Commands {
         #[arg(long)]
         gitlab: bool,
 
-        /// Run only a specific job by name
+        /// Run only a specific job by name. A GitLab job runs even if its
+        /// `rules:`, `only:`, `except:` or `when:` would exclude it.
         #[arg(long)]
         job: Option<String>,
+
+        /// Set a GitLab pipeline variable as KEY=value (repeatable). It wins
+        /// over the pipeline's and jobs' own, and `rules:` see it.
+        #[arg(short = 'V', long = "variable", value_parser = parse_key_val)]
+        variables: Vec<(String, String)>,
 
         /// Simulate a specific event type for trigger filtering (e.g., push, pull_request)
         #[arg(long)]
@@ -765,6 +771,7 @@ async fn main() {
             preserve_containers_on_failure,
             gitlab,
             job,
+            variables,
             event,
             diff,
             changed_files,
@@ -782,6 +789,7 @@ async fn main() {
                 preserve_containers_on_failure: *preserve_containers_on_failure,
                 gitlab: *gitlab,
                 job: job.clone(),
+                variables: variables.iter().cloned().collect(),
                 event: event.clone(),
                 diff: *diff,
                 changed_files: changed_files.clone(),

@@ -23,6 +23,7 @@ fn emulation_cfg() -> ExecutionConfig {
         target_job: None,
         platform_overrides: Default::default(),
         kubernetes: Default::default(),
+        variables: Default::default(),
     }
 }
 

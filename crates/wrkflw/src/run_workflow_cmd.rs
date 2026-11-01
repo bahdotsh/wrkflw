@@ -27,6 +27,7 @@ pub(crate) struct RunCtx {
     pub(crate) preserve_containers_on_failure: bool,
     pub(crate) gitlab: bool,
     pub(crate) job: Option<String>,
+    pub(crate) variables: HashMap<String, String>,
     pub(crate) event: Option<String>,
     pub(crate) diff: bool,
     pub(crate) changed_files: Option<Vec<String>>,
@@ -53,6 +54,11 @@ pub(crate) async fn run(ctx: RunCtx) {
     // file as a GitHub workflow, which surfaced a confusing
     // `Error parsing workflow: ...` from deep in the YAML parser.
     let is_gitlab = ctx.gitlab || is_gitlab_pipeline(&ctx.path);
+
+    if !is_gitlab && !ctx.variables.is_empty() {
+        eprintln!("Error: --variable is only supported for GitLab CI pipelines.");
+        std::process::exit(1);
+    }
 
     // Evaluate trigger filter at the call site before executing
     if ctx.diff || ctx.event.is_some() || ctx.changed_files.is_some() {
@@ -109,6 +115,7 @@ pub(crate) async fn run(ctx: RunCtx) {
         target_job: ctx.job.clone(),
         platform_overrides: ctx.platform_overrides,
         kubernetes: ctx.kubernetes,
+        variables: ctx.variables,
     };
     let workflow_type = if is_gitlab {
         "GitLab CI pipeline"

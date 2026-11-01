@@ -48,6 +48,10 @@ impl SecureEmulationRuntime {
 
 #[async_trait]
 impl ContainerRuntime for SecureEmulationRuntime {
+    fn flattens_commands(&self) -> bool {
+        true
+    }
+
     async fn run_container(
         &self,
         image: &str,

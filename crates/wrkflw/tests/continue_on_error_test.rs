@@ -21,6 +21,7 @@ async fn run(yaml: &str) -> ExecutionResult {
         target_job: None,
         platform_overrides: Default::default(),
         kubernetes: Default::default(),
+        variables: Default::default(),
     };
     execute_workflow(&path, cfg).await.unwrap()
 }

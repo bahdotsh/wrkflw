@@ -3376,6 +3376,34 @@ fn preprocess_with_value(value: &str, ctx: &StepExecutionContext<'_>) -> String 
         .unwrap_or_default()
 }
 
+/// The `if-no-files-found` input of `actions/upload-artifact`.
+#[derive(Clone, Copy)]
+enum IfNoFilesFound {
+    Warn,
+    Error,
+    Ignore,
+}
+
+impl IfNoFilesFound {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "warn" => Some(Self::Warn),
+            "error" => Some(Self::Error),
+            "ignore" => Some(Self::Ignore),
+            _ => None,
+        }
+    }
+}
+
+/// A boolean action input, accepting the spellings of `core.getBooleanInput`.
+fn parse_boolean_input(value: &str) -> Option<bool> {
+    match value {
+        "true" | "True" | "TRUE" => Some(true),
+        "false" | "False" | "FALSE" => Some(false),
+        _ => None,
+    }
+}
+
 /// Handle `actions/upload-artifact` emulation.
 async fn handle_upload_artifact(
     step_name: &str,
@@ -3399,12 +3427,67 @@ async fn handle_upload_artifact(
         ));
     }
 
+    // `core.getInput` trims what it returns.
+    let input = |key: &str, default: &str| {
+        with.and_then(|w| w.get(key))
+            .map(|s| preprocess_with_value(s, ctx).trim().to_string())
+            .unwrap_or_else(|| default.to_string())
+    };
+
+    let if_no_files_input = input("if-no-files-found", "warn");
+    let Some(if_no_files) = IfNoFilesFound::parse(&if_no_files_input) else {
+        return Ok(StepResult::new(
+            step_name.to_string(),
+            StepStatus::Failure,
+            format!(
+                "Unrecognized if-no-files-found input. Provided: {}. Available options: warn, error, ignore",
+                if_no_files_input
+            ),
+        ));
+    };
+
+    let boolean = |key: &str| {
+        let value = input(key, "false");
+        parse_boolean_input(&value).ok_or_else(|| {
+            StepResult::new(
+                step_name.to_string(),
+                StepStatus::Failure,
+                format!(
+                    "Unrecognized {} input. Provided: {}. Available options: true, false",
+                    key, value
+                ),
+            )
+        })
+    };
+    let options = crate::artifacts::UploadOptions {
+        include_hidden: match boolean("include-hidden-files") {
+            Ok(value) => value,
+            Err(result) => return Ok(result),
+        },
+        overwrite: match boolean("overwrite") {
+            Ok(value) => value,
+            Err(result) => return Ok(result),
+        },
+    };
+
     match ctx
         .services
         .artifact_store
-        .upload(&name, &path_pattern, ctx.working_dir)
+        .upload(&name, &path_pattern, ctx.working_dir, options)
         .await
     {
+        Ok(0) => {
+            let message = format!("No files were found with the path: {}", path_pattern);
+            let status = match if_no_files {
+                IfNoFilesFound::Error => StepStatus::Failure,
+                IfNoFilesFound::Ignore => StepStatus::Success,
+                IfNoFilesFound::Warn => {
+                    wrkflw_logging::warning(&message);
+                    StepStatus::Success
+                }
+            };
+            Ok(StepResult::new(step_name.to_string(), status, message))
+        }
         Ok(count) => {
             wrkflw_logging::info(&format!(
                 "  Uploaded artifact '{}': {} file(s)",
@@ -10657,6 +10740,152 @@ runs:
 
     // ---- Integration tests for artifact, cache, and needs.* wiring ----
 
+    /// Run an upload-artifact step in an empty workspace.
+    async fn upload_matching_nothing(if_no_files_found: Option<&str>) -> (StepResult, Vec<String>) {
+        let mut with = HashMap::new();
+        if let Some(value) = if_no_files_found {
+            with.insert("if-no-files-found".to_string(), value.to_string());
+        }
+        upload_step(with, "nothing/here", &[]).await
+    }
+
+    /// Run an upload-artifact step over a workspace holding `files`.
+    async fn upload_step(
+        mut with: HashMap<String, String>,
+        path: &str,
+        files: &[&str],
+    ) -> (StepResult, Vec<String>) {
+        let runtime = MockContainerRuntime::default();
+        let workflow = minimal_workflow();
+        let working_dir = tempfile::tempdir().unwrap();
+        let artifact_dir = tempfile::tempdir().unwrap();
+        let artifact_store = crate::artifacts::ArtifactStore::new(artifact_dir.path()).unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache_store =
+            crate::cache::CacheStore::with_root(cache_dir.path().to_path_buf()).unwrap();
+        let pending = std::sync::Mutex::new(Vec::<PendingCacheSave>::new());
+
+        for file in files {
+            std::fs::write(working_dir.path().join(file), "x").unwrap();
+        }
+
+        with.insert("name".to_string(), "missing".to_string());
+        with.insert("path".to_string(), path.to_string());
+        let step = make_step(
+            "upload",
+            "actions/upload-artifact@v4",
+            Some(with),
+            HashMap::new(),
+        );
+        let job_env = HashMap::new();
+        let ctx = StepExecutionContext {
+            step: &step,
+            step_idx: 0,
+            job_env: &job_env,
+            job_user_env: &job_env,
+            working_dir: working_dir.path(),
+            runtime: &runtime,
+            workflow: &workflow,
+            runner_image: "ubuntu:latest",
+            verbose: false,
+            matrix_combination: &None,
+            container_config: None,
+            workflow_defaults: None,
+            job_defaults: None,
+            step_outputs: &HashMap::new(),
+            step_statuses: &HashMap::new(),
+            job_status: "success",
+            services: JobServices {
+                secret_manager: None,
+                secret_masker: None,
+                secrets_context: &HashMap::new(),
+                needs_context: &HashMap::new(),
+                needs_results: &HashMap::new(),
+                artifact_store: &artifact_store,
+                cache_store: &cache_store,
+                platform_overrides: &HashMap::new(),
+            },
+            pending_cache_saves: &pending,
+        };
+
+        let result = execute_step(ctx).await.unwrap();
+        (result, artifact_store.list().await)
+    }
+
+    #[tokio::test]
+    async fn upload_with_no_files_passes_by_default_and_on_warn_and_ignore() {
+        for mode in [None, Some("warn"), Some("ignore")] {
+            let (result, artifacts) = upload_matching_nothing(mode).await;
+            assert_eq!(result.status, StepStatus::Success, "{:?}", mode);
+            assert!(result.output.contains("nothing/here"), "{:?}", mode);
+            assert!(artifacts.is_empty(), "{:?}", mode);
+        }
+    }
+
+    #[tokio::test]
+    async fn upload_with_no_files_fails_on_error() {
+        let (result, artifacts) = upload_matching_nothing(Some("error")).await;
+        assert_eq!(result.status, StepStatus::Failure);
+        assert!(result.output.contains("nothing/here"));
+        assert!(artifacts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn upload_rejects_an_unrecognized_if_no_files_found() {
+        for value in ["fail", "ERROR", ""] {
+            let (result, _) = upload_matching_nothing(Some(value)).await;
+            assert_eq!(result.status, StepStatus::Failure, "{:?}", value);
+            assert!(
+                result.output.contains("Unrecognized if-no-files-found"),
+                "{:?}: {}",
+                value,
+                result.output
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn upload_trims_its_inputs_as_get_input_does() {
+        let (result, _) = upload_matching_nothing(Some(" error\n")).await;
+        assert_eq!(result.status, StepStatus::Failure);
+        assert!(result.output.contains("No files were found"));
+
+        let with = HashMap::from([("include-hidden-files".to_string(), " true\n".to_string())]);
+        let (result, artifacts) = upload_step(with, ".env", &[".env"]).await;
+        assert_eq!(result.status, StepStatus::Success);
+        assert_eq!(artifacts.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn upload_rejects_an_unrecognized_overwrite() {
+        let with = HashMap::from([("overwrite".to_string(), "yes".to_string())]);
+        let (result, _) = upload_step(with, "a.txt", &["a.txt"]).await;
+        assert_eq!(result.status, StepStatus::Failure);
+        assert!(result.output.contains("Unrecognized overwrite"));
+    }
+
+    #[tokio::test]
+    async fn upload_passes_include_hidden_files() {
+        let hidden = |value: Option<&str>| {
+            let mut with = HashMap::new();
+            if let Some(value) = value {
+                with.insert("include-hidden-files".to_string(), value.to_string());
+            }
+            with
+        };
+        let (result, artifacts) = upload_step(hidden(None), ".env", &[".env"]).await;
+        assert_eq!(result.status, StepStatus::Success);
+        assert!(artifacts.is_empty());
+
+        let (result, artifacts) = upload_step(hidden(Some("true")), ".env", &[".env"]).await;
+        assert_eq!(result.status, StepStatus::Success);
+        assert_eq!(artifacts.len(), 1);
+
+        let (result, _) = upload_step(hidden(Some("yes")), ".env", &[".env"]).await;
+        assert_eq!(result.status, StepStatus::Failure);
+        assert!(result.output.contains("Unrecognized include-hidden-files"));
+    }
+
     #[tokio::test]
     async fn upload_artifact_step_wiring() {
         let runtime = MockContainerRuntime::default();
@@ -10946,13 +11175,9 @@ runs:
             dl_result.output
         );
 
-        let downloaded = std::fs::read_to_string(
-            dl_workspace
-                .path()
-                .join("dl")
-                .join("artifact-dir/payload.txt"),
-        )
-        .expect("downloaded payload.txt should exist");
+        let downloaded =
+            std::fs::read_to_string(dl_workspace.path().join("dl").join("payload.txt"))
+                .expect("downloaded payload.txt should exist");
         assert_eq!(downloaded, "hello\n");
     }
 
@@ -11235,11 +11460,11 @@ runs:
         let artifact_dir = tempfile::tempdir().unwrap();
         let artifact_store = crate::artifacts::ArtifactStore::new(artifact_dir.path()).unwrap();
         artifact_store
-            .upload("art-a", "a.txt", working_dir.path())
+            .upload("art-a", "a.txt", working_dir.path(), Default::default())
             .await
             .unwrap();
         artifact_store
-            .upload("art-b", "b.txt", working_dir.path())
+            .upload("art-b", "b.txt", working_dir.path(), Default::default())
             .await
             .unwrap();
 

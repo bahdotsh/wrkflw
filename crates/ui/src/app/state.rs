@@ -1288,6 +1288,7 @@ impl App {
                                 })
                                 .collect::<Vec<StepExecution>>(),
                             logs: vec![job_result.logs.clone()],
+                            failure_allowed: job_result.failure_allowed,
                         })
                         .collect::<Vec<JobExecution>>();
                 }
@@ -1304,6 +1305,7 @@ impl App {
                             output: format!("Error: {}\n\nThis error prevented the workflow from executing properly.", e),
                         }],
                         logs: vec![format!("Workflow execution error: {}", e)],
+                        failure_allowed: false,
                     }];
                 }
             }

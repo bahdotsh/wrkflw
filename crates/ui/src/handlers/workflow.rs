@@ -229,6 +229,9 @@ pub async fn execute_workflow_cli(
             for job in &result.jobs {
                 match job.status {
                     JobStatus::Success => println!("\n{}", cli_style::job_success(&job.name)),
+                    JobStatus::Failure if job.failure_allowed => {
+                        println!("\n{}", cli_style::job_failure_allowed(&job.name));
+                    }
                     JobStatus::Failure => {
                         println!("\n{}", cli_style::job_failure(&job.name));
                         any_job_failed = true;

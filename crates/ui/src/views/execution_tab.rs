@@ -200,7 +200,9 @@ fn render_jobs_pane(f: &mut Frame<'_>, app: &App, idx: usize, area: Rect) {
         .map(|e| {
             e.jobs
                 .iter()
-                .filter(|j| matches!(j.status, JobStatus::Success | JobStatus::Skipped))
+                .filter(|j| {
+                    j.failure_allowed || matches!(j.status, JobStatus::Success | JobStatus::Skipped)
+                })
                 .count()
         })
         .unwrap_or(0);
@@ -208,7 +210,7 @@ fn render_jobs_pane(f: &mut Frame<'_>, app: &App, idx: usize, area: Rect) {
         .map(|e| {
             e.jobs
                 .iter()
-                .filter(|j| matches!(j.status, JobStatus::Failure))
+                .filter(|j| !j.failure_allowed && matches!(j.status, JobStatus::Failure))
                 .count()
         })
         .unwrap_or(0);
@@ -378,6 +380,7 @@ fn render_timing_pane(f: &mut Frame<'_>, workflow: &crate::models::Workflow, are
         .iter()
         .map(|j| match j.status {
             JobStatus::Success => "ok".to_string(),
+            JobStatus::Failure if j.failure_allowed => "allowed".to_string(),
             JobStatus::Failure => "fail".to_string(),
             JobStatus::Skipped => "skip".to_string(),
         })
@@ -410,7 +413,7 @@ fn active_job_execution(
         // interesting place; fall back to the last job.
         exec.jobs
             .iter()
-            .rfind(|j| matches!(j.status, JobStatus::Failure))
+            .rfind(|j| !j.failure_allowed && matches!(j.status, JobStatus::Failure))
             .or_else(|| exec.jobs.last())
     }
 }

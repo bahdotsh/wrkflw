@@ -168,6 +168,9 @@ impl PodmanRuntime {
     ) -> Result<ContainerOutput, ContainerError> {
         let mut cmd = Command::new("podman");
         cmd.args(args);
+        // A cancelled `podman run` may still be pulling, with no container for
+        // ContainerGuard to remove yet, and would otherwise start one later.
+        cmd.kill_on_drop(true);
 
         if input.is_some() {
             cmd.stdin(Stdio::piped());
@@ -766,7 +769,8 @@ impl PodmanRuntime {
         let mut guard = ContainerGuard::new(
             "podman",
             &container_name,
-            !self.preserve_containers_on_failure,
+            self.preserve_containers_on_failure,
+            untrack_container,
         );
 
         // Execute the command

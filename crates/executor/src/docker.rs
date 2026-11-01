@@ -1013,7 +1013,8 @@ impl DockerRuntime {
         let mut guard = ContainerGuard::new(
             "docker",
             &container.id,
-            !self.preserve_containers_on_failure,
+            self.preserve_containers_on_failure,
+            untrack_container,
         );
 
         // Start container with a timeout
@@ -1029,12 +1030,14 @@ impl DockerRuntime {
                 // Clean up the container if start fails
                 let _ = self.docker.remove_container(&container.id, None).await;
                 untrack_container(&container.id);
+                guard.disarm();
                 return Err(ContainerError::ContainerExecution(e.to_string()));
             }
             Err(_) => {
                 // Clean up the container if starting times out
                 let _ = self.docker.remove_container(&container.id, None).await;
                 untrack_container(&container.id);
+                guard.disarm();
                 return Err(ContainerError::ContainerExecution(
                     "Container start timed out".to_string(),
                 ));
@@ -1047,8 +1050,6 @@ impl DockerRuntime {
             .wait_container::<String>(&container.id, None)
             .collect::<Vec<_>>()
             .await;
-        guard.disarm();
-
         let exit_code = wait_exit_code(wait_result.first());
 
         // Get logs with a timeout
@@ -1101,6 +1102,7 @@ impl DockerRuntime {
             // Still untrack it from the automatic cleanup system to prevent it from being cleaned up later
             untrack_container(&container.id);
         }
+        guard.disarm();
 
         // Log detailed information about the command execution for debugging
         if exit_code != 0 {

@@ -17,10 +17,10 @@ Hidden files are skipped unless `include-hidden-files: true` is set, as in
 upload-artifact v4. A file or directory is hidden if its name starts with a dot,
 so `path: .` no longer uploads `.git`, and `path: .config/` matches nothing.
 
-Uploading to an existing artifact name replaces it. Files used to be merged into
-the earlier upload. Matrix jobs sharing a name now keep exactly one job's files,
-and with parallel jobs which one is not defined. Give each job its own name, as
-GitHub requires.
+Uploading to an existing artifact name now fails the step, as on GitHub. Files
+used to be merged into the earlier upload. Give each matrix job its own name, or
+set `overwrite: true` to replace the artifact. With `overwrite: true`, parallel
+jobs sharing a name keep exactly one job's files, and which one is not defined.
 
 ## `ExecutionConfig` gained a `platform_overrides` field (unreleased)
 

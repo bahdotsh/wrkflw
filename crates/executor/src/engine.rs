@@ -3237,10 +3237,14 @@ async fn handle_upload_artifact(
         ));
     }
 
-    let if_no_files_input = with
-        .and_then(|w| w.get("if-no-files-found"))
-        .map(|s| preprocess_with_value(s, ctx))
-        .unwrap_or_else(|| "warn".to_string());
+    // `core.getInput` trims what it returns.
+    let input = |key: &str, default: &str| {
+        with.and_then(|w| w.get(key))
+            .map(|s| preprocess_with_value(s, ctx).trim().to_string())
+            .unwrap_or_else(|| default.to_string())
+    };
+
+    let if_no_files_input = input("if-no-files-found", "warn");
     let Some(if_no_files) = IfNoFilesFound::parse(&if_no_files_input) else {
         return Ok(StepResult::new(
             step_name.to_string(),
@@ -3252,25 +3256,34 @@ async fn handle_upload_artifact(
         ));
     };
 
-    let include_hidden_input = with
-        .and_then(|w| w.get("include-hidden-files"))
-        .map(|s| preprocess_with_value(s, ctx))
-        .unwrap_or_else(|| "false".to_string());
-    let Some(include_hidden) = parse_boolean_input(&include_hidden_input) else {
-        return Ok(StepResult::new(
-            step_name.to_string(),
-            StepStatus::Failure,
-            format!(
-                "Unrecognized include-hidden-files input. Provided: {}. Available options: true, false",
-                include_hidden_input
-            ),
-        ));
+    let boolean = |key: &str| {
+        let value = input(key, "false");
+        parse_boolean_input(&value).ok_or_else(|| {
+            StepResult::new(
+                step_name.to_string(),
+                StepStatus::Failure,
+                format!(
+                    "Unrecognized {} input. Provided: {}. Available options: true, false",
+                    key, value
+                ),
+            )
+        })
+    };
+    let options = crate::artifacts::UploadOptions {
+        include_hidden: match boolean("include-hidden-files") {
+            Ok(value) => value,
+            Err(result) => return Ok(result),
+        },
+        overwrite: match boolean("overwrite") {
+            Ok(value) => value,
+            Err(result) => return Ok(result),
+        },
     };
 
     match ctx
         .services
         .artifact_store
-        .upload(&name, &path_pattern, ctx.working_dir, include_hidden)
+        .upload(&name, &path_pattern, ctx.working_dir, options)
         .await
     {
         Ok(0) => {
@@ -9785,6 +9798,26 @@ runs:
     }
 
     #[tokio::test]
+    async fn upload_trims_its_inputs_as_get_input_does() {
+        let (result, _) = upload_matching_nothing(Some(" error\n")).await;
+        assert_eq!(result.status, StepStatus::Failure);
+        assert!(result.output.contains("No files were found"));
+
+        let with = HashMap::from([("include-hidden-files".to_string(), " true\n".to_string())]);
+        let (result, artifacts) = upload_step(with, ".env", &[".env"]).await;
+        assert_eq!(result.status, StepStatus::Success);
+        assert_eq!(artifacts.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn upload_rejects_an_unrecognized_overwrite() {
+        let with = HashMap::from([("overwrite".to_string(), "yes".to_string())]);
+        let (result, _) = upload_step(with, "a.txt", &["a.txt"]).await;
+        assert_eq!(result.status, StepStatus::Failure);
+        assert!(result.output.contains("Unrecognized overwrite"));
+    }
+
+    #[tokio::test]
     async fn upload_passes_include_hidden_files() {
         let hidden = |value: Option<&str>| {
             let mut with = HashMap::new();
@@ -10380,11 +10413,11 @@ runs:
         let artifact_dir = tempfile::tempdir().unwrap();
         let artifact_store = crate::artifacts::ArtifactStore::new(artifact_dir.path()).unwrap();
         artifact_store
-            .upload("art-a", "a.txt", working_dir.path(), false)
+            .upload("art-a", "a.txt", working_dir.path(), Default::default())
             .await
             .unwrap();
         artifact_store
-            .upload("art-b", "b.txt", working_dir.path(), false)
+            .upload("art-b", "b.txt", working_dir.path(), Default::default())
             .await
             .unwrap();
 

@@ -6,6 +6,7 @@
 //! `actions/upload-artifact` does.
 
 use std::borrow::Cow;
+use std::collections::hash_map::Entry;
 use std::collections::{BTreeSet, HashMap};
 use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
@@ -374,6 +375,15 @@ fn walk_files(dir: &Path) -> Result<Vec<PathBuf>, String> {
     Ok(files)
 }
 
+/// The inputs of `actions/upload-artifact` that change how an upload behaves.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct UploadOptions {
+    /// Upload hidden files and hidden search directories.
+    pub include_hidden: bool,
+    /// Replace an artifact of the same name instead of failing.
+    pub overwrite: bool,
+}
+
 struct ArtifactMetadata {
     /// Path to the artifact directory on disk, unique to each upload.
     path: PathBuf,
@@ -408,9 +418,11 @@ impl ArtifactStore {
     /// Like upload-artifact, hidden files are skipped unless `include_hidden` is
     /// set, and so are hidden search directories such as `.config/`.
     ///
-    /// Uploading replaces any artifact of the same name, all at once: the files
-    /// are copied aside first, so a failed upload keeps the earlier artifact,
-    /// and of several concurrent uploads exactly one is kept, whole.
+    /// An existing artifact of the same name is an error unless `overwrite` is
+    /// set, when it is replaced all at once. The files are copied aside first,
+    /// so a failed upload keeps the earlier artifact, and of several concurrent
+    /// uploads exactly one is kept, whole. An upload selecting no files changes
+    /// nothing, so it does not conflict either.
     ///
     /// Returns the number of files uploaded. When that is zero, no artifact is
     /// recorded; whether that is an error is the caller's decision.
@@ -419,7 +431,7 @@ impl ArtifactStore {
         name: &str,
         path_pattern: &str,
         workspace: &Path,
-        include_hidden: bool,
+        options: UploadOptions,
     ) -> Result<usize, String> {
         let safe_name = sanitize_artifact_name(name)?;
         let store_root = self.root.clone();
@@ -427,7 +439,7 @@ impl ArtifactStore {
         let pattern = path_pattern.to_string();
 
         let staged = tokio::task::spawn_blocking(move || {
-            let selection = select_files(&workspace, &pattern, include_hidden)?;
+            let selection = select_files(&workspace, &pattern, options.include_hidden)?;
             if selection.files.is_empty() {
                 return Ok(None);
             }
@@ -450,19 +462,36 @@ impl ArtifactStore {
             return Ok(0);
         };
 
-        // Downloads hold the read lock, so none is reading what is removed here.
         let mut idx = self.index.write().await;
-        if let Some(replaced) = idx.insert(safe_name, ArtifactMetadata { path }) {
-            if let Err(e) = tokio::fs::remove_dir_all(&replaced.path).await {
-                wrkflw_logging::warning(&format!(
-                    "Failed to remove replaced artifact '{}': {}",
-                    replaced.path.display(),
-                    e
-                ));
+        let (result, unused) = match idx.entry(safe_name) {
+            Entry::Vacant(entry) => {
+                entry.insert(ArtifactMetadata { path });
+                return Ok(count);
             }
-        }
+            Entry::Occupied(_) if !options.overwrite => (
+                Err(format!(
+                    "An artifact named '{}' already exists. Set overwrite: true or use a unique name",
+                    name
+                )),
+                path,
+            ),
+            Entry::Occupied(mut entry) => (
+                Ok(count),
+                std::mem::replace(&mut entry.get_mut().path, path),
+            ),
+        };
+        // Taking the write lock waited for any download of the replaced files,
+        // and later ones find the new path, so nothing can be reading `unused`.
+        drop(idx);
 
-        Ok(count)
+        if let Err(e) = tokio::fs::remove_dir_all(&unused).await {
+            wrkflw_logging::warning(&format!(
+                "Failed to remove unused artifact files '{}': {}",
+                unused.display(),
+                e
+            ));
+        }
+        result
     }
 
     /// Download a named artifact into `target_dir`.
@@ -519,6 +548,15 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    const REPLACE: UploadOptions = UploadOptions {
+        include_hidden: false,
+        overwrite: true,
+    };
+    const HIDDEN: UploadOptions = UploadOptions {
+        include_hidden: true,
+        overwrite: false,
+    };
+
     #[tokio::test]
     async fn upload_and_download() {
         let run_dir = tempdir().unwrap();
@@ -533,7 +571,12 @@ mod tests {
 
         // Upload
         let count = store
-            .upload("my-artifact", "**/*.txt", workspace.path(), false)
+            .upload(
+                "my-artifact",
+                "**/*.txt",
+                workspace.path(),
+                UploadOptions::default(),
+            )
             .await
             .unwrap();
         assert_eq!(count, 2);
@@ -575,7 +618,12 @@ mod tests {
         let workspace = tempdir().unwrap();
         let store = ArtifactStore::new(run_dir.path()).unwrap();
         let result = store
-            .upload("empty", "*.nonexistent", workspace.path(), false)
+            .upload(
+                "empty",
+                "*.nonexistent",
+                workspace.path(),
+                UploadOptions::default(),
+            )
             .await;
         assert_eq!(result.unwrap(), 0);
         assert!(store.list().await.is_empty());
@@ -592,7 +640,7 @@ mod tests {
         }
         let store = ArtifactStore::new(run_dir.path()).unwrap();
         store
-            .upload("a", path, workspace.path(), false)
+            .upload("a", path, workspace.path(), UploadOptions::default())
             .await
             .unwrap();
         let target = tempdir().unwrap();
@@ -645,7 +693,12 @@ mod tests {
         let outside = run_dir.path().join("secret.txt");
         std::fs::write(&outside, "x").unwrap();
         let result = store
-            .upload("a", &outside.to_string_lossy(), workspace.path(), false)
+            .upload(
+                "a",
+                &outside.to_string_lossy(),
+                workspace.path(),
+                UploadOptions::default(),
+            )
             .await;
         assert!(result.unwrap_err().contains("outside the workspace"));
     }
@@ -659,7 +712,9 @@ mod tests {
             std::fs::write(workspace.path().join("out/a.txt"), "x").unwrap();
             let store = ArtifactStore::new(run_dir.path()).unwrap();
             let path = format!("out/\n{}", outside);
-            let result = store.upload("a", &path, workspace.path(), false).await;
+            let result = store
+                .upload("a", &path, workspace.path(), UploadOptions::default())
+                .await;
             assert!(
                 result.unwrap_err().contains("outside the workspace"),
                 "{}",
@@ -681,7 +736,7 @@ mod tests {
         let store = ArtifactStore::new(run_dir.path()).unwrap();
         let path = format!("b.txt\n{}", absolute.display());
         let count = store
-            .upload("a", &path, workspace.path(), false)
+            .upload("a", &path, workspace.path(), UploadOptions::default())
             .await
             .unwrap();
         assert_eq!(count, 2);
@@ -714,7 +769,12 @@ mod tests {
         std::fs::write(workspace.path().join("out/a.txt"), "x").unwrap();
         let store = ArtifactStore::new(run_dir.path()).unwrap();
         let count = store
-            .upload("a", "out/../out/\nout/", workspace.path(), false)
+            .upload(
+                "a",
+                "out/../out/\nout/",
+                workspace.path(),
+                UploadOptions::default(),
+            )
             .await
             .unwrap();
         assert_eq!(count, 1);
@@ -729,12 +789,12 @@ mod tests {
         std::fs::write(workspace.path().join("out/b.txt"), "x").unwrap();
         let store = ArtifactStore::new(run_dir.path()).unwrap();
         store
-            .upload("a", "out/", workspace.path(), false)
+            .upload("a", "out/", workspace.path(), UploadOptions::default())
             .await
             .unwrap();
         std::fs::remove_file(workspace.path().join("out/b.txt")).unwrap();
         store
-            .upload("a", "out/", workspace.path(), false)
+            .upload("a", "out/", workspace.path(), REPLACE)
             .await
             .unwrap();
         let target = tempdir().unwrap();
@@ -749,15 +809,17 @@ mod tests {
         std::fs::write(workspace.path().join("a.txt"), "x").unwrap();
         let store = ArtifactStore::new(run_dir.path()).unwrap();
         store
-            .upload("a", "a.txt", workspace.path(), false)
+            .upload("a", "a.txt", workspace.path(), UploadOptions::default())
             .await
             .unwrap();
         assert!(store
-            .upload("a", "../nope", workspace.path(), false)
+            .upload("a", "../nope", workspace.path(), UploadOptions::default())
             .await
             .is_err());
         assert_eq!(
-            store.upload("a", "*.none", workspace.path(), false).await,
+            store
+                .upload("a", "*.none", workspace.path(), UploadOptions::default())
+                .await,
             Ok(0)
         );
         let target = tempdir().unwrap();
@@ -769,6 +831,66 @@ mod tests {
     async fn a_trailing_backslash_names_a_directory() {
         let target = round_trip(&["out/a.txt"], "out\\").await;
         assert!(target.path().join("a.txt").is_file());
+    }
+
+    #[tokio::test]
+    async fn an_existing_name_fails_and_keeps_the_artifact_unless_overwriting() {
+        let run_dir = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        std::fs::write(workspace.path().join("a.txt"), "first").unwrap();
+        let store = ArtifactStore::new(run_dir.path()).unwrap();
+        let options = UploadOptions::default();
+        store
+            .upload("a", "a.txt", workspace.path(), options)
+            .await
+            .unwrap();
+
+        std::fs::write(workspace.path().join("a.txt"), "second").unwrap();
+        let result = store.upload("a", "a.txt", workspace.path(), options).await;
+        assert!(result.unwrap_err().contains("already exists"));
+        let target = tempdir().unwrap();
+        store.download("a", target.path()).await.unwrap();
+        let kept = std::fs::read_to_string(target.path().join("a.txt")).unwrap();
+        assert_eq!(kept, "first");
+        let stored = std::fs::read_dir(run_dir.path().join("artifacts")).unwrap();
+        assert_eq!(stored.count(), 1);
+
+        // Selecting nothing changes nothing, so it is not a conflict.
+        let count = store.upload("a", "*.none", workspace.path(), options).await;
+        assert_eq!(count, Ok(0));
+
+        store
+            .upload("a", "a.txt", workspace.path(), REPLACE)
+            .await
+            .unwrap();
+        store.download("a", target.path()).await.unwrap();
+        let replaced = std::fs::read_to_string(target.path().join("a.txt")).unwrap();
+        assert_eq!(replaced, "second");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_uploads_of_one_name_let_one_win_without_overwrite() {
+        let run_dir = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        std::fs::write(workspace.path().join("a.txt"), "x").unwrap();
+        let store = ArtifactStore::new(run_dir.path()).unwrap();
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let store = store.clone();
+            let path = workspace.path().to_path_buf();
+            tasks.push(tokio::spawn(async move {
+                store
+                    .upload("shared", "a.txt", &path, UploadOptions::default())
+                    .await
+            }));
+        }
+        let mut won = 0;
+        for task in tasks {
+            won += usize::from(task.await.unwrap().is_ok());
+        }
+        assert_eq!(won, 1);
+        let stored = std::fs::read_dir(run_dir.path().join("artifacts")).unwrap();
+        assert_eq!(stored.count(), 1);
     }
 
     #[tokio::test]
@@ -810,7 +932,12 @@ mod tests {
         let store = ArtifactStore::new(run_dir.path()).unwrap();
         let path = workspace.path().join("out");
         store
-            .upload("a", &path.to_string_lossy(), workspace.path(), false)
+            .upload(
+                "a",
+                &path.to_string_lossy(),
+                workspace.path(),
+                UploadOptions::default(),
+            )
             .await
             .unwrap();
         let target = tempdir().unwrap();
@@ -831,7 +958,7 @@ mod tests {
         std::fs::write(workspace.path().join("a.txt"), "x").unwrap();
         let store = ArtifactStore::new(run_dir.path()).unwrap();
         let count = store
-            .upload("a", "!*.log", workspace.path(), false)
+            .upload("a", "!*.log", workspace.path(), UploadOptions::default())
             .await
             .unwrap();
         assert_eq!(count, 0);
@@ -851,7 +978,7 @@ mod tests {
             ("out/*/*.txt", "sub/a.txt"),
             ("b.txt", "b.txt"),
         ] {
-            store.upload("a", path, &workspace, false).await.unwrap();
+            store.upload("a", path, &workspace, REPLACE).await.unwrap();
             let target = tempdir().unwrap();
             store.download("a", target.path()).await.unwrap();
             assert!(target.path().join(expected).is_file(), "{}", path);
@@ -874,7 +1001,7 @@ mod tests {
         .unwrap();
         let store = ArtifactStore::new(run_dir.path()).unwrap();
         store
-            .upload("a", "out/", workspace.path(), false)
+            .upload("a", "out/", workspace.path(), UploadOptions::default())
             .await
             .unwrap();
         let target = tempdir().unwrap();
@@ -895,7 +1022,7 @@ mod tests {
         std::os::unix::fs::symlink(outside.path(), workspace.path().join("out/link")).unwrap();
         let store = ArtifactStore::new(run_dir.path()).unwrap();
         let count = store
-            .upload("a", "out/", workspace.path(), false)
+            .upload("a", "out/", workspace.path(), UploadOptions::default())
             .await
             .unwrap();
         assert_eq!(count, 1);
@@ -911,7 +1038,7 @@ mod tests {
         std::os::unix::fs::symlink("..", workspace.path().join("out/sub/loop")).unwrap();
         let store = ArtifactStore::new(run_dir.path()).unwrap();
         for path in ["out/", "out/**", "out/**/*.txt"] {
-            let count = store.upload("a", path, workspace.path(), false).await;
+            let count = store.upload("a", path, workspace.path(), REPLACE).await;
             assert_eq!(count, Ok(1), "{}", path);
         }
     }
@@ -932,7 +1059,10 @@ mod tests {
             std::os::unix::fs::symlink("../x", root.join("out/y").join(link)).unwrap();
         }
         let store = ArtifactStore::new(run_dir.path()).unwrap();
-        let count = store.upload("a", "out/", root, false).await.unwrap();
+        let count = store
+            .upload("a", "out/", root, UploadOptions::default())
+            .await
+            .unwrap();
         assert!(count >= 1);
     }
 
@@ -948,7 +1078,12 @@ mod tests {
         std::os::unix::fs::symlink(root.join("shared"), root.join("out/one")).unwrap();
         std::os::unix::fs::symlink(root.join("shared"), root.join("out/two")).unwrap();
         let store = ArtifactStore::new(run_dir.path()).unwrap();
-        assert_eq!(store.upload("a", "out/", root, false).await, Ok(2));
+        assert_eq!(
+            store
+                .upload("a", "out/", root, UploadOptions::default())
+                .await,
+            Ok(2)
+        );
     }
 
     #[cfg(unix)]
@@ -969,7 +1104,12 @@ mod tests {
             canonical.display(),
             canonical.display()
         );
-        assert_eq!(store.upload("a", &path, &link, false).await, Ok(2));
+        assert_eq!(
+            store
+                .upload("a", &path, &link, UploadOptions::default())
+                .await,
+            Ok(2)
+        );
         let target = tempdir().unwrap();
         store.download("a", target.path()).await.unwrap();
         assert!(target.path().join("b.txt").is_file());
@@ -1003,12 +1143,19 @@ mod tests {
         std::fs::write(workspace.path().join(".env"), "x").unwrap();
         let store = ArtifactStore::new(run_dir.path()).unwrap();
         for path in [".config/", ".config/*", ".env"] {
-            let count = store.upload("a", path, workspace.path(), false).await;
+            let count = store
+                .upload("a", path, workspace.path(), UploadOptions::default())
+                .await;
             assert_eq!(count, Ok(0), "{}", path);
         }
         // Only the name of the file itself counts for a single file.
         let count = store
-            .upload("a", ".config/a.txt", workspace.path(), false)
+            .upload(
+                "a",
+                ".config/a.txt",
+                workspace.path(),
+                UploadOptions::default(),
+            )
             .await;
         assert_eq!(count, Ok(1));
     }
@@ -1022,7 +1169,7 @@ mod tests {
         std::fs::write(workspace.path().join("out/.cache/c.txt"), "x").unwrap();
         let store = ArtifactStore::new(run_dir.path()).unwrap();
         let count = store
-            .upload("a", "out/\n!out/.cache/", workspace.path(), true)
+            .upload("a", "out/\n!out/.cache/", workspace.path(), HIDDEN)
             .await;
         assert_eq!(count, Ok(1));
         let target = tempdir().unwrap();
@@ -1038,7 +1185,9 @@ mod tests {
         std::fs::write(workspace.path().join("a.txt"), "x").unwrap();
         let store = ArtifactStore::new(run_dir.path()).unwrap();
         for path in ["*.txt\n!", "*.txt\n!   "] {
-            let result = store.upload("a", path, workspace.path(), false).await;
+            let result = store
+                .upload("a", path, workspace.path(), UploadOptions::default())
+                .await;
             assert!(result.unwrap_err().contains("nothing to exclude"));
         }
     }
@@ -1054,7 +1203,9 @@ mod tests {
         let run_dir = tempdir().unwrap();
         let workspace = tempdir().unwrap();
         let store = ArtifactStore::new(run_dir.path()).unwrap();
-        let result = store.upload("a", "out/***", workspace.path(), false).await;
+        let result = store
+            .upload("a", "out/***", workspace.path(), UploadOptions::default())
+            .await;
         assert!(result.unwrap_err().contains("Invalid glob pattern"));
     }
 
@@ -1081,7 +1232,7 @@ mod tests {
             let path = workspace.path().to_path_buf();
             workspaces.push(workspace);
             tasks.push(tokio::spawn(async move {
-                store.upload("shared", "*.txt", &path, false).await
+                store.upload("shared", "*.txt", &path, REPLACE).await
             }));
         }
         for task in tasks {
@@ -1114,7 +1265,7 @@ mod tests {
         std::fs::write(workspace.path().join("a.txt"), "first").unwrap();
         let store = ArtifactStore::new(run_dir.path()).unwrap();
         store
-            .upload("a", "a.txt", workspace.path(), false)
+            .upload("a", "a.txt", workspace.path(), UploadOptions::default())
             .await
             .unwrap();
 
@@ -1124,7 +1275,7 @@ mod tests {
             return; // Running as root, permissions cannot make the copy fail.
         }
         std::fs::write(workspace.path().join("a.txt"), "second").unwrap();
-        let result = store.upload("a", "*.txt", workspace.path(), false).await;
+        let result = store.upload("a", "*.txt", workspace.path(), REPLACE).await;
         assert!(result.unwrap_err().contains("Failed to copy"));
 
         let target = tempdir().unwrap();
@@ -1156,13 +1307,23 @@ mod tests {
         let store = ArtifactStore::new(run_dir.path()).unwrap();
 
         let result = store
-            .upload("../../escape", "*.txt", workspace.path(), false)
+            .upload(
+                "../../escape",
+                "*.txt",
+                workspace.path(),
+                UploadOptions::default(),
+            )
             .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Invalid artifact name"));
 
         let result = store
-            .upload("foo/bar", "*.txt", workspace.path(), false)
+            .upload(
+                "foo/bar",
+                "*.txt",
+                workspace.path(),
+                UploadOptions::default(),
+            )
             .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Invalid artifact name"));

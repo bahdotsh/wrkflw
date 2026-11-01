@@ -214,7 +214,7 @@ pub mod gitlab {
         #[serde(skip_serializing_if = "Option::is_none")]
         pub timeout: Option<String>,
 
-        /// Mark job as parallel and specify instance count
+        /// Run the job several times: a fixed count, or once per `parallel:matrix` combination
         #[serde(skip_serializing_if = "Option::is_none")]
         pub parallel: Option<Parallel>,
 

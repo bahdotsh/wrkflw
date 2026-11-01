@@ -4,7 +4,8 @@
 use std::fs;
 use tempfile::tempdir;
 use wrkflw_lib::executor::engine::{
-    execute_workflow, ExecutionConfig, ExecutionResult, JobStatus, RuntimeType,
+    execute_workflow, ExecutionConfig, ExecutionResult, JobResult, JobStatus, RuntimeType,
+    StepStatus,
 };
 
 async fn run(yaml: &str) -> ExecutionResult {
@@ -24,12 +25,23 @@ async fn run(yaml: &str) -> ExecutionResult {
     execute_workflow(&path, cfg).await.unwrap()
 }
 
-fn status(result: &ExecutionResult, name: &str) -> JobStatus {
+fn job<'a>(result: &'a ExecutionResult, name: &str) -> &'a JobResult {
     result
         .jobs
         .iter()
         .find(|job| job.name == name)
         .unwrap_or_else(|| panic!("no job named {}", name))
+}
+
+fn status(result: &ExecutionResult, name: &str) -> JobStatus {
+    job(result, name).status.clone()
+}
+
+fn step_status(job: &JobResult, name: &str) -> StepStatus {
+    job.steps
+        .iter()
+        .find(|step| step.name == name)
+        .unwrap_or_else(|| panic!("no step named {}", name))
         .status
         .clone()
 }
@@ -59,6 +71,95 @@ jobs:
 }
 
 #[tokio::test]
+async fn dependents_read_an_allowed_failure_as_success() {
+    let result = run(r#"
+name: t
+on: push
+jobs:
+  flaky:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - run: exit 1
+  after:
+    needs: flaky
+    runs-on: ubuntu-latest
+    steps:
+      - name: saw-success
+        if: ${{ needs.flaky.result == 'success' }}
+        run: echo ran
+      - name: saw-failure
+        if: ${{ needs.flaky.result == 'failure' }}
+        run: echo ran
+"#)
+    .await;
+
+    let after = job(&result, "after");
+    assert_eq!(step_status(after, "saw-success"), StepStatus::Success);
+    assert_eq!(step_status(after, "saw-failure"), StepStatus::Skipped);
+}
+
+#[tokio::test]
+async fn explicit_false_still_fails_the_run() {
+    let result = run(r#"
+name: t
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    continue-on-error: false
+    steps:
+      - run: exit 1
+"#)
+    .await;
+
+    assert!(!job(&result, "build").failure_allowed);
+    assert!(result.failure_details.is_some());
+}
+
+#[tokio::test]
+async fn unevaluable_expression_warns_and_counts_the_failure() {
+    let result = run(r#"
+name: t
+on: push
+jobs:
+  unevaluable-job:
+    runs-on: ubuntu-latest
+    continue-on-error: ${{ 1 == }}
+    steps:
+      - run: exit 1
+"#)
+    .await;
+
+    assert!(!job(&result, "unevaluable-job").failure_allowed);
+    assert!(result.failure_details.is_some());
+    assert!(wrkflw_logging::get_logs()
+        .iter()
+        .any(|line| line.contains("a failure here will still count")));
+}
+
+#[tokio::test]
+async fn services_warn_that_they_are_not_started() {
+    run(r#"
+name: t
+on: push
+jobs:
+  with-services:
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis
+    steps:
+      - run: echo ran
+"#)
+    .await;
+
+    assert!(wrkflw_logging::get_logs()
+        .iter()
+        .any(|line| line.contains("Job 'with-services' declares services")));
+}
+
+#[tokio::test]
 async fn job_expression_applies_per_matrix_combination() {
     let result = run(r#"
 name: t
@@ -77,10 +178,14 @@ jobs:
     .await;
 
     assert!(result.jobs.iter().all(|j| j.status == JobStatus::Failure));
-    assert!(
-        result.failure_details.is_some(),
-        "stable leg must fail the run"
-    );
+    assert!(job(&result, "build (experimental: true)").failure_allowed);
+    assert!(!job(&result, "build (experimental: false)").failure_allowed);
+
+    let details = result
+        .failure_details
+        .expect("stable leg must fail the run");
+    assert!(details.contains("build (experimental: false)"));
+    assert!(!details.contains("build (experimental: true)"));
 }
 
 #[tokio::test]

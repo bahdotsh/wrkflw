@@ -248,6 +248,9 @@ fn record_job_results(
     let mut aggregate: HashMap<&str, &JobStatus> = HashMap::new();
     for job_result in job_results {
         // Dependents treat an allowed failure as success, so they still run.
+        // GitHub documents that the run passes, but not what
+        // `needs.<job>.result` reads. `success` is the reported behaviour:
+        // https://www.kenmuse.com/blog/how-to-handle-step-and-job-errors-in-github-actions/
         let status = if job_result.failure_allowed {
             &JobStatus::Success
         } else {
@@ -2515,13 +2518,7 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
         steps: loop_state.step_results,
         logs: loop_state.job_logs,
         outputs: job_outputs,
-        failure_allowed: job_failure_allowed(
-            job,
-            &None,
-            ctx.env_context,
-            ctx.user_env,
-            &ctx.services,
-        ),
+        failure_allowed: job_failure_allowed(job, &None, &job_env, &job_user_env, &ctx.services),
     })
 }
 
@@ -3205,12 +3202,26 @@ async fn run_step_with_guards(
 }
 
 /// Whether a `continue-on-error` value (`true`, `false` or an expression) holds.
+/// A value that can't be evaluated doesn't, so the failure still counts.
 fn continues_on_error(value: Option<&str>, ctx: &crate::expression::ExpressionContext<'_>) -> bool {
-    value.is_some_and(|value| evaluate_condition_with_context(value, ctx))
+    value.is_some_and(
+        |value| match crate::expression::evaluate_as_bool(value, ctx) {
+            Ok(holds) => holds,
+            Err(e) => {
+                wrkflw_logging::warning(&format!(
+                    "continue-on-error value '{}' failed to evaluate: {} — a failure here will still count",
+                    value, e
+                ));
+                false
+            }
+        },
+    )
 }
 
 /// Whether a job's `continue-on-error` tolerates its failure. Evaluated per
 /// matrix combination, so `${{ matrix.experimental }}` applies to just those.
+/// The step and job-status contexts are empty because GitHub doesn't offer
+/// them here, only `github`, `needs`, `strategy`, `matrix`, `vars` and `inputs`.
 fn job_failure_allowed(
     job: &Job,
     matrix_combination: &Option<HashMap<String, serde_yaml::Value>>,

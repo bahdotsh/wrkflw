@@ -22,6 +22,10 @@ used to be merged into the earlier upload. Give each matrix job its own name, or
 set `overwrite: true` to replace the artifact. With `overwrite: true`, parallel
 jobs sharing a name keep exactly one job's files, and which one is not defined.
 
+A wildcard line that matches a directory now selects everything below it, as on
+GitHub. `packages/*/dist` uploads the contents of each `dist`, `!**/node_modules`
+excludes the contents, and `out/*` includes files in subdirectories of `out`.
+
 ## `ExecutionConfig` gained a `platform_overrides` field (unreleased)
 
 Code that builds `wrkflw_executor::ExecutionConfig` as a struct literal must set

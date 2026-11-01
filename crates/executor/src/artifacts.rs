@@ -130,6 +130,11 @@ fn search_root(workspace: &Path, line: &PathLine<'_>) -> PathBuf {
 /// A recursive search below one directory. Symlinked directories are followed
 /// as upload-artifact follows them, unless they leave the workspace or lead
 /// back to a directory the search is already inside.
+///
+/// A directory matching the pattern selects everything below it, as
+/// upload-artifact searches with implicit descendants: `out/*` includes
+/// `out/sub/a.txt`, and `!**/node_modules` excludes what is inside.
+#[derive(Clone, Copy)]
 struct Search<'a> {
     pattern: Option<&'a glob::Pattern>,
     /// How deep the pattern can match. `None` when it holds a `**`.
@@ -148,11 +153,19 @@ impl Search<'_> {
             if !self.include_hidden && is_hidden(&name) {
                 continue;
             }
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
             let path = dir.join(&name);
             let relative = relative.join(&name);
-            if path.is_dir() {
-                self.descend(&path, &relative, chain, out);
-            } else if path.is_file() && !path.is_symlink() && self.matches(&relative) {
+            // Only a symlink needs another stat. Symlinked files are not uploaded.
+            if kind.is_dir() || (kind.is_symlink() && path.is_dir()) {
+                if self.matches(&relative) {
+                    self.everything().descend(&path, &relative, chain, out);
+                } else {
+                    self.descend(&path, &relative, chain, out);
+                }
+            } else if kind.is_file() && self.matches(&relative) {
                 out.push(path);
             }
         }
@@ -182,6 +195,15 @@ impl Search<'_> {
         chain.pop();
     }
 
+    /// This search without its pattern, for what is below a matched directory.
+    fn everything(&self) -> Self {
+        Self {
+            pattern: None,
+            max_depth: None,
+            ..*self
+        }
+    }
+
     fn matches(&self, relative: &Path) -> bool {
         let options = glob::MatchOptions {
             require_literal_separator: true,
@@ -197,9 +219,11 @@ impl Search<'_> {
 /// keeps the path it was found at.
 ///
 /// Unless `include_hidden` is set, hidden files and directories are skipped,
-/// including the line's own file or search directory. The workspace itself is
-/// exempt, as its name is not the user's choice: temporary directories start
-/// with a dot.
+/// including the line's own file or search directory. Only names that are
+/// visited count, as in upload-artifact: `.config/*` selects nothing, while
+/// `.config/sub/*` searches from `sub` and selects its files. The workspace
+/// itself is exempt, as its name is not the user's choice: temporary directories
+/// start with a dot.
 fn matching_files(
     workspace: &Path,
     canonical_workspace: &Path,
@@ -831,6 +855,62 @@ mod tests {
     async fn a_trailing_backslash_names_a_directory() {
         let target = round_trip(&["out/a.txt"], "out\\").await;
         assert!(target.path().join("a.txt").is_file());
+    }
+
+    #[tokio::test]
+    async fn a_glob_matching_a_directory_uploads_its_contents() {
+        let files = ["packages/a/dist/x.js", "packages/a/dist/sub/y.js"];
+        let target = round_trip(&files, "packages/*/dist").await;
+        assert!(target.path().join("a/dist/x.js").is_file());
+        assert!(target.path().join("a/dist/sub/y.js").is_file());
+
+        let target = round_trip(&files, "**/dist").await;
+        assert!(target.path().join("packages/a/dist/x.js").is_file());
+    }
+
+    #[tokio::test]
+    async fn a_star_includes_what_is_below_the_directories_it_matches() {
+        let target = round_trip(&["out/a.txt", "out/sub/deep/b.txt"], "out/*").await;
+        assert!(target.path().join("a.txt").is_file());
+        assert!(target.path().join("sub/deep/b.txt").is_file());
+    }
+
+    #[tokio::test]
+    async fn an_exclusion_matching_a_directory_excludes_its_contents() {
+        let files = [
+            "out/k.js",
+            "out/node_modules/m.js",
+            "out/a/node_modules/n.js",
+        ];
+        let target = round_trip(&files, "out/\n!**/node_modules").await;
+        assert!(target.path().join("k.js").is_file());
+        assert!(!target.path().join("node_modules").exists());
+        assert!(!target.path().join("a/node_modules").exists());
+    }
+
+    #[tokio::test]
+    async fn hidden_files_stay_skipped_below_a_matched_directory() {
+        let target = round_trip(&["out/dist/a.txt", "out/dist/.env"], "out/*").await;
+        assert!(target.path().join("dist/a.txt").is_file());
+        assert!(!target.path().join("dist/.env").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn links_leaving_the_workspace_stay_skipped_below_a_matched_directory() {
+        let run_dir = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        std::fs::create_dir_all(workspace.path().join("out/dist")).unwrap();
+        std::fs::write(workspace.path().join("out/dist/a.txt"), "x").unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "x").unwrap();
+        std::os::unix::fs::symlink(outside.path(), workspace.path().join("out/dist/link")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), workspace.path().join("out/link")).unwrap();
+        let store = ArtifactStore::new(run_dir.path()).unwrap();
+        let count = store
+            .upload("a", "out/*", workspace.path(), UploadOptions::default())
+            .await;
+        assert_eq!(count, Ok(1));
     }
 
     #[tokio::test]

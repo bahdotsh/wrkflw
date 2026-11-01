@@ -292,14 +292,19 @@ async fn execute_gitlab_pipeline(
     wrkflw_logging::info("Executing GitLab CI/CD pipeline");
 
     // 1. Parse the GitLab pipeline file
-    let pipeline = parse_pipeline(pipeline_path)
+    let mut pipeline = parse_pipeline(pipeline_path)
         .map_err(|e| ExecutionError::Parse(format!("Failed to parse GitLab pipeline: {}", e)))?;
+    apply_gitlab_variable_overrides(&mut pipeline, &config.variables);
 
     // 2. Convert the GitLab pipeline to a format compatible with the workflow executor
     let workflow = gitlab::convert_to_workflow_format(&pipeline);
 
     // 3. Resolve job dependencies based on stages
-    let job_conditions = gitlab_job_conditions(&pipeline, pipeline_path);
+    let predefined_variables = gitlab_predefined_variables(pipeline_path);
+    let mut job_conditions = gitlab_job_conditions(&pipeline, &predefined_variables);
+    if let Some(target_job) = &config.target_job {
+        force_target_job(&mut job_conditions, target_job);
+    }
     let execution_plan = resolve_gitlab_dependencies(&pipeline, &workflow)?;
 
     // Filter to target job and its stage-based dependencies if specified.
@@ -316,6 +321,35 @@ async fn execute_gitlab_pipeline(
         execution_plan
     };
 
+    // A pipeline `workflow:rules` wouldn't create has nothing to run, unless
+    // a job was asked for by name.
+    let mut pipeline_variables = predefined_variables.clone();
+    pipeline_variables.extend(pipeline.variables.clone().unwrap_or_default());
+    if let Some(reason) = gitlab::pipeline_exclusion(&pipeline, &pipeline_variables) {
+        let reason = gitlab::JobWhen::Skip(reason)
+            .skip_reason(false)
+            .unwrap_or_default();
+        if config.target_job.is_some() {
+            wrkflw_logging::warning(&format!(
+                "Running --job although workflow:rules excludes this pipeline: {}",
+                reason
+            ));
+        } else {
+            wrkflw_logging::info(&format!("Pipeline skipped by workflow:rules: {}", reason));
+            return Ok(ExecutionResult {
+                jobs: execution_plan
+                    .into_iter()
+                    .flatten()
+                    .map(|job_name| {
+                        let logs = format!("Skipped: workflow:rules: {}", reason);
+                        JobResult::skipped(job_name.clone(), job_name, logs)
+                    })
+                    .collect(),
+                failure_details: None,
+            });
+        }
+    }
+
     // 4. Initialize appropriate runtime
     let (runtime, effective_runtime) = initialize_runtime(
         config.runtime_type.clone(),
@@ -330,7 +364,8 @@ async fn execute_gitlab_pipeline(
         .map_err(|e| ExecutionError::Execution(format!("Failed to create workspace: {}", e)))?;
 
     // 5. Set up GitLab-like environment
-    let mut env_context = create_gitlab_context(&pipeline, pipeline_path, workspace_dir.path());
+    let mut env_context =
+        create_gitlab_context(&pipeline, predefined_variables, workspace_dir.path());
 
     // Add runtime mode to environment
     seed_runtime_context(&mut env_context, &config.runtime_type, CiPlatform::GitLab);
@@ -458,6 +493,37 @@ async fn execute_gitlab_pipeline(
     })
 }
 
+/// Make `--variable` values win over the pipeline's and the job's own, as
+/// variables given for a run do on GitLab. Rules, images and scripts all read
+/// the pipeline, so this reaches every one of them.
+fn apply_gitlab_variable_overrides(pipeline: &mut Pipeline, overrides: &HashMap<String, String>) {
+    if overrides.is_empty() {
+        return;
+    }
+    pipeline
+        .variables
+        .get_or_insert_with(HashMap::new)
+        .extend(overrides.clone());
+    for job in pipeline.jobs.values_mut() {
+        if let Some(variables) = &mut job.variables {
+            variables.extend(overrides.clone());
+        }
+    }
+}
+
+/// A job asked for by name runs even if its rules exclude it, since that's the
+/// only way to try a manual or tag-only job locally. Earlier stages still count.
+fn force_target_job(conditions: &mut HashMap<String, gitlab::JobWhen>, target_job: &str) {
+    if let Some(when @ gitlab::JobWhen::Skip(_)) = conditions.get_mut(target_job) {
+        wrkflw_logging::warning(&format!(
+            "Running job '{}' because --job named it, although it would be skipped: {}",
+            target_job,
+            when.skip_reason(false).unwrap_or_default()
+        ));
+        *when = gitlab::JobWhen::OnSuccess;
+    }
+}
+
 /// Split a stage into the jobs that run and those that don't, with the reason.
 /// A stage only runs the jobs its predecessors' outcome selects.
 fn select_stage_jobs(
@@ -516,10 +582,10 @@ fn gitlab_predefined_variables_for(
 /// Create an environment context for GitLab CI/CD pipeline execution
 fn create_gitlab_context(
     pipeline: &Pipeline,
-    pipeline_path: &Path,
+    predefined_variables: HashMap<String, String>,
     workspace_dir: &Path,
 ) -> HashMap<String, String> {
-    let mut env_context = gitlab_predefined_variables(pipeline_path);
+    let mut env_context = predefined_variables;
 
     // Add custom environment variable to indicate use in wrkflw
     env_context.insert("WRKFLW_CI".to_string(), "true".to_string());
@@ -551,9 +617,9 @@ fn create_gitlab_context(
 /// environment is left out, so that a run doesn't depend on what's exported.
 fn gitlab_job_conditions(
     pipeline: &Pipeline,
-    pipeline_path: &Path,
+    predefined_variables: &HashMap<String, String>,
 ) -> HashMap<String, gitlab::JobWhen> {
-    let mut base = gitlab_predefined_variables(pipeline_path);
+    let mut base = predefined_variables.clone();
     base.extend(pipeline.variables.clone().unwrap_or_default());
     pipeline
         .jobs
@@ -870,6 +936,9 @@ pub struct ExecutionConfig {
     pub platform_overrides: HashMap<String, String>,
     /// Cluster settings used when `runtime_type` is [`RuntimeType::Kubernetes`].
     pub kubernetes: KubernetesConfig,
+    /// Variables given for this run. GitLab pipelines only: they override the
+    /// pipeline's and jobs' own and feed `rules:`, images and scripts.
+    pub variables: HashMap<String, String>,
 }
 
 /// Parse a `LABEL=IMAGE` runner override, as given to `--platform`.
@@ -9705,12 +9774,12 @@ runs:
         let pipeline: Pipeline = serde_yaml::from_str("stages: [build]").unwrap();
         let host = Path::new("/host/workspace");
 
-        let mut env = create_gitlab_context(&pipeline, Path::new(".gitlab-ci.yml"), host);
+        let mut env = create_gitlab_context(&pipeline, HashMap::new(), host);
         seed_runtime_context(&mut env, &RuntimeType::Podman, CiPlatform::GitLab);
         assert_eq!(env["CI_PROJECT_DIR"], "/github/workspace");
         assert_eq!(env["GITHUB_WORKSPACE"], "/github/workspace");
 
-        let mut env = create_gitlab_context(&pipeline, Path::new(".gitlab-ci.yml"), host);
+        let mut env = create_gitlab_context(&pipeline, HashMap::new(), host);
         seed_runtime_context(&mut env, &RuntimeType::Emulation, CiPlatform::GitLab);
         assert_eq!(env["CI_PROJECT_DIR"], "/host/workspace");
     }
@@ -12733,6 +12802,51 @@ runs:
     }
 
     #[test]
+    fn force_target_job_only_lifts_an_exclusion() {
+        use gitlab::{JobWhen, SkipReason};
+        let mut conditions = HashMap::from([
+            ("manual".to_string(), JobWhen::Skip(SkipReason::Manual)),
+            ("other".to_string(), JobWhen::Skip(SkipReason::Manual)),
+            ("failure".to_string(), JobWhen::OnFailure),
+        ]);
+        force_target_job(&mut conditions, "manual");
+        force_target_job(&mut conditions, "failure");
+        force_target_job(&mut conditions, "absent");
+        assert_eq!(conditions["manual"], JobWhen::OnSuccess);
+        assert_eq!(conditions["other"], JobWhen::Skip(SkipReason::Manual));
+        assert_eq!(conditions["failure"], JobWhen::OnFailure);
+    }
+
+    #[test]
+    fn variable_overrides_beat_pipeline_and_job_variables() {
+        let mut pipeline: Pipeline = serde_yaml::from_str(
+            r#"
+variables:
+  V: pipeline
+job:
+  image: rust:$V
+  script: [echo]
+  variables:
+    V: job
+  rules:
+    - if: $V == "cli"
+"#,
+        )
+        .unwrap();
+        let overrides = HashMap::from([("V".to_string(), "cli".to_string())]);
+        apply_gitlab_variable_overrides(&mut pipeline, &overrides);
+
+        let conditions = gitlab_job_conditions(&pipeline, &HashMap::new());
+        assert_eq!(conditions["job"], gitlab::JobWhen::OnSuccess);
+        let workflow = gitlab::convert_to_workflow_format(&pipeline);
+        assert_eq!(workflow.jobs["job"].env["V"], "cli");
+        assert_eq!(
+            workflow.jobs["job"].container.as_ref().unwrap().image,
+            "rust:cli"
+        );
+    }
+
+    #[test]
     fn stageless_jobs_are_planned_once() {
         let plan = |yaml: &str| {
             let pipeline: Pipeline = serde_yaml::from_str(yaml).unwrap();
@@ -12740,10 +12854,7 @@ runs:
             resolve_gitlab_dependencies(&pipeline, &workflow).unwrap()
         };
         assert_eq!(plan("job:\n  script: [echo]\n"), [["job"]]);
-        assert_eq!(
-            plan("stages: [build]\njob:\n  script: [echo]\n"),
-            [["job"]]
-        );
+        assert_eq!(plan("stages: [build]\njob:\n  script: [echo]\n"), [["job"]]);
     }
 
     #[test]
@@ -12784,7 +12895,9 @@ job_wins:
 "#,
         )
         .unwrap();
-        let conditions = gitlab_job_conditions(&pipeline, Path::new(".gitlab-ci.yml"));
+        let predefined =
+            gitlab_predefined_variables_for(Path::new(".gitlab-ci.yml"), None, "main".to_string());
+        let conditions = gitlab_job_conditions(&pipeline, &predefined);
         assert_eq!(
             conditions["host"],
             gitlab::JobWhen::Skip(gitlab::SkipReason::NoRuleMatched)

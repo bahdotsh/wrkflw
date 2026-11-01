@@ -128,6 +128,9 @@ wrkflw run --runtime secure-emulation .github/workflows/ci.yml
 # Run a specific job
 wrkflw run --job build .github/workflows/ci.yml
 
+# Set GitLab pipeline variables, which rules and scripts both see
+wrkflw run --variable CI_COMMIT_TAG=v1.0.0 .gitlab-ci.yml
+
 # List jobs in a workflow
 wrkflw run --jobs .github/workflows/ci.yml
 

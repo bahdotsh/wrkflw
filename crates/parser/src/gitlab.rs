@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use thiserror::Error;
 use wrkflw_matrix::MatrixConfig;
-use wrkflw_models::gitlab::{Image, Job, Parallel, Pipeline, Rule};
+use wrkflw_models::gitlab::{Except, Image, Job, Only, Parallel, Pipeline, Rule};
 use wrkflw_models::ValidationResult;
 
 #[derive(Error, Debug)]
@@ -122,7 +122,9 @@ pub fn validate_pipeline_structure(pipeline: &Pipeline) -> ValidationResult {
 }
 
 /// Runs a job's scripts in bash when its image has it and in `sh` otherwise,
-/// as GitLab does. A value for `defaults.run.shell`.
+/// as GitLab does. An internal value for `defaults.run.shell`: `execute_step`
+/// must match it before its custom-shell fallback, and it never reaches the
+/// GitHub workflow schema, whose shell enum doesn't list it.
 pub const SHELL_BASH_OR_SH: &str = "wrkflw-bash-or-sh";
 
 /// When a job runs relative to the outcome of the stages before it.
@@ -144,7 +146,9 @@ pub enum SkipReason {
     Manual,
     /// The job has `rules:` and none of them matched.
     NoRuleMatched,
-    /// A `rules:if` couldn't be evaluated.
+    /// `only:` doesn't select this run, or `except:` excludes it.
+    RefFilter,
+    /// A `rules:if` or `only:`/`except:` condition couldn't be evaluated.
     InvalidCondition,
     /// A `when:` value that isn't one of GitLab's.
     UnknownWhen,
@@ -176,8 +180,9 @@ impl JobWhen {
                 Some("when: manual jobs can't be started on a local run")
             }
             JobWhen::Skip(SkipReason::NoRuleMatched) => Some("no rule matched"),
+            JobWhen::Skip(SkipReason::RefFilter) => Some("only/except excludes this run"),
             JobWhen::Skip(SkipReason::InvalidCondition) => {
-                Some("a rules:if condition couldn't be evaluated")
+                Some("a condition couldn't be evaluated")
             }
             JobWhen::Skip(SkipReason::UnknownWhen) => Some("unknown when value"),
         }
@@ -185,37 +190,227 @@ impl JobWhen {
 }
 
 /// Decide when a job runs. The first matching rule wins and a job whose rules
-/// all miss is excluded, as in GitLab. A condition that can't be evaluated
-/// excludes the job, because guessing could run a guarded deploy. `variables`
-/// are the job's CI variables.
+/// all miss is excluded, as in GitLab. A job without `rules:` goes through its
+/// `only:`/`except:`. A condition that can't be evaluated excludes the job,
+/// because guessing could run a guarded deploy. `variables` are the job's CI
+/// variables.
 pub fn job_when(job_name: &str, job: &Job, variables: &HashMap<String, String>) -> JobWhen {
+    let owner = format!("Job '{}'", job_name);
     let job_level = job.when.as_deref();
-    let Some(rules) = &job.rules else {
-        return JobWhen::parse(job_level);
+    let when = match &job.rules {
+        Some(rules) => match first_matching_rule(&owner, rules, variables) {
+            Ok(Some(rule)) => rule.when.as_deref().or(job_level),
+            Ok(None) => return JobWhen::Skip(SkipReason::NoRuleMatched),
+            Err(reason) => return JobWhen::Skip(reason),
+        },
+        None => {
+            if let Some(reason) = ref_filter_exclusion(&owner, job, variables) {
+                return JobWhen::Skip(reason);
+            }
+            job_level
+        }
     };
+    if when == Some("delayed") {
+        wrkflw_logging::warning(&format!(
+            "{}: when: delayed runs without waiting for start_in",
+            owner
+        ));
+    }
+    JobWhen::parse(when)
+}
+
+/// Why `workflow:rules` doesn't create this pipeline, or `None` if it does.
+pub fn pipeline_exclusion(
+    pipeline: &Pipeline,
+    variables: &HashMap<String, String>,
+) -> Option<SkipReason> {
+    let rules = &pipeline.workflow.as_ref()?.rules;
+    if rules.is_empty() {
+        return None;
+    }
+    match first_matching_rule("The pipeline", rules, variables) {
+        Ok(Some(rule)) => (rule.when.as_deref() == Some("never")).then_some(SkipReason::Never),
+        Ok(None) => Some(SkipReason::NoRuleMatched),
+        Err(reason) => Some(reason),
+    }
+}
+
+/// The first rule that matches. `owner` names what the rules belong to in
+/// warnings, and a condition that can't be evaluated stops the search.
+fn first_matching_rule<'a>(
+    owner: &str,
+    rules: &'a [Rule],
+    variables: &HashMap<String, String>,
+) -> Result<Option<&'a Rule>, SkipReason> {
     for rule in rules {
         let matched = match rule.if_.as_deref() {
-            Some(condition) => match evaluate_rule_condition(condition, variables) {
-                Ok(matched) => matched,
-                Err(error) => {
-                    wrkflw_logging::warning(&format!(
-                        "Job '{}' is excluded: can't evaluate rules:if '{}': {}",
-                        job_name, condition, error
-                    ));
-                    return JobWhen::Skip(SkipReason::InvalidCondition);
-                }
-            },
+            Some(condition) => evaluate_or_warn(owner, "rules:if", condition, variables)?,
             None => true,
         };
         if matched {
-            warn_about_ignored_clauses(job_name, rule);
-            return JobWhen::parse(rule.when.as_deref().or(job_level));
+            warn_about_ignored_clauses(owner, rule);
+            return Ok(Some(rule));
         }
     }
-    JobWhen::Skip(SkipReason::NoRuleMatched)
+    Ok(None)
 }
 
-fn warn_about_ignored_clauses(job_name: &str, rule: &Rule) {
+fn evaluate_or_warn(
+    owner: &str,
+    keyword: &str,
+    condition: &str,
+    variables: &HashMap<String, String>,
+) -> Result<bool, SkipReason> {
+    evaluate_rule_condition(condition, variables).map_err(|error| {
+        wrkflw_logging::warning(&format!(
+            "{} is excluded: can't evaluate {} '{}': {}",
+            owner, keyword, condition, error
+        ));
+        SkipReason::InvalidCondition
+    })
+}
+
+/// The parts of an `only:` or `except:`.
+struct RefFilter<'a> {
+    refs: Vec<&'a str>,
+    variables: &'a [String],
+    has_changes: bool,
+}
+
+impl<'a> RefFilter<'a> {
+    fn new(
+        ref_lists: [&'a Option<Vec<String>>; 3],
+        variables: &'a Option<Vec<String>>,
+        has_changes: bool,
+    ) -> Self {
+        RefFilter {
+            refs: ref_lists
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(String::as_str)
+                .collect(),
+            variables: variables.as_deref().unwrap_or_default(),
+            has_changes,
+        }
+    }
+
+    fn from_only(only: &'a Only) -> Self {
+        match only {
+            Only::Refs(refs) => Self::from_refs(refs),
+            Only::Complex {
+                refs,
+                branches,
+                tags,
+                variables,
+                changes,
+            } => Self::new([refs, branches, tags], variables, changes.is_some()),
+        }
+    }
+
+    fn from_except(except: &'a Except) -> Self {
+        match except {
+            Except::Refs(refs) => Self::from_refs(refs),
+            Except::Complex {
+                refs,
+                branches,
+                tags,
+                variables,
+                changes,
+            } => Self::new([refs, branches, tags], variables, changes.is_some()),
+        }
+    }
+
+    fn from_refs(refs: &'a [String]) -> Self {
+        RefFilter {
+            refs: refs.iter().map(String::as_str).collect(),
+            variables: &[],
+            has_changes: false,
+        }
+    }
+
+    fn is_evaluated(&self) -> bool {
+        !self.refs.is_empty() || !self.variables.is_empty()
+    }
+
+    /// Whether this run matches: any ref, and any variables expression.
+    fn matches(&self, owner: &str, vars: &HashMap<String, String>) -> Result<bool, SkipReason> {
+        let mut refs_match = self.refs.is_empty();
+        for pattern in &self.refs {
+            refs_match |= ref_pattern_matches(pattern, vars).map_err(|error| {
+                wrkflw_logging::warning(&format!(
+                    "{} is excluded: can't evaluate ref pattern '{}': {}",
+                    owner, pattern, error
+                ));
+                SkipReason::InvalidCondition
+            })?;
+        }
+        let mut variables_match = self.variables.is_empty();
+        for condition in self.variables {
+            variables_match |= evaluate_or_warn(owner, "only/except", condition, vars)?;
+        }
+        Ok(refs_match && variables_match)
+    }
+}
+
+/// Whether a run matches one `only:`/`except:` ref: a keyword, a `/regex/`, or
+/// an exact ref name. A tag pipeline has no branch, as on GitLab.
+fn ref_pattern_matches(pattern: &str, vars: &HashMap<String, String>) -> Result<bool, String> {
+    let value = |name: &str| vars.get(name).map(String::as_str).filter(|v| !v.is_empty());
+    let tag = value("CI_COMMIT_TAG");
+    let branch = value("CI_COMMIT_BRANCH").filter(|_| tag.is_none());
+    let source = |expected: &str| value("CI_PIPELINE_SOURCE") == Some(expected);
+    Ok(match pattern {
+        "branches" => branch.is_some(),
+        "tags" => tag.is_some(),
+        "api" | "chat" | "external" | "web" => source(pattern),
+        "external_pull_requests" => source("external_pull_request_event"),
+        "merge_requests" => source("merge_request_event"),
+        "pipelines" => source("pipeline"),
+        "pushes" => source("push"),
+        "schedules" => source("schedule"),
+        "triggers" => source("trigger"),
+        _ => {
+            let current = tag.or(branch);
+            if pattern.starts_with('/') {
+                let regex = compile_rule_regex(pattern)?;
+                current.is_some_and(|name| regex.is_match(name))
+            } else {
+                current == Some(pattern)
+            }
+        }
+    })
+}
+
+/// Why a job's `only:`/`except:` excludes it, or `None` if it doesn't.
+/// `changes` isn't evaluated: alone, it neither selects nor excludes a run.
+fn ref_filter_exclusion(
+    owner: &str,
+    job: &Job,
+    variables: &HashMap<String, String>,
+) -> Option<SkipReason> {
+    let check = |filter: &RefFilter, keyword: &str, exclude_on_match: bool| {
+        if filter.has_changes {
+            wrkflw_logging::warning(&format!("{}: {}:changes isn't evaluated", owner, keyword));
+        }
+        if !filter.is_evaluated() {
+            return None;
+        }
+        match filter.matches(owner, variables) {
+            Ok(matched) => (matched == exclude_on_match).then_some(SkipReason::RefFilter),
+            Err(reason) => Some(reason),
+        }
+    };
+    job.only
+        .as_ref()
+        .and_then(|only| check(&RefFilter::from_only(only), "only", false))
+        .or_else(|| {
+            let except = job.except.as_ref()?;
+            check(&RefFilter::from_except(except), "except", true)
+        })
+}
+
+fn warn_about_ignored_clauses(owner: &str, rule: &Rule) {
     for (clause, present) in [
         ("changes", rule.changes.is_some()),
         ("exists", rule.exists.is_some()),
@@ -223,8 +418,8 @@ fn warn_about_ignored_clauses(job_name: &str, rule: &Rule) {
     ] {
         if present {
             wrkflw_logging::warning(&format!(
-                "Job '{}': rules:{} isn't evaluated, so this rule applies as if it passed",
-                job_name, clause
+                "{}: rules:{} isn't evaluated, so this rule applies as if it passed",
+                owner, clause
             ));
         }
     }
@@ -319,10 +514,10 @@ fn tokenize_rule_condition(condition: &str) -> Result<Vec<RuleToken>, String> {
                     index += 1;
                 }
             }
-            _ if chars[index..]
-                .iter()
-                .collect::<String>()
-                .starts_with("null") =>
+            _ if chars[index..].starts_with(&['n', 'u', 'l', 'l'])
+                && !chars
+                    .get(index + 4)
+                    .is_some_and(|ch| ch.is_alphanumeric() || *ch == '_') =>
             {
                 tokens.push(RuleToken::Null);
                 index += 4;
@@ -339,9 +534,16 @@ fn compile_rule_regex(pattern: &str) -> Result<regex::Regex, String> {
         .strip_prefix('/')
         .and_then(|rest| rest.rsplit_once('/'))
         .unwrap_or((pattern, ""));
+    if let Some(flag) = flags.chars().find(|flag| !"ims".contains(*flag)) {
+        return Err(format!("unsupported regular expression flag '{}'", flag));
+    }
     let unescaped = pattern.replace("\\/", "/");
-    let insensitive = if flags.contains('i') { "(?i)" } else { "" };
-    regex::Regex::new(&format!("{}{}", insensitive, unescaped)).map_err(|error| error.to_string())
+    let inline_flags = if flags.is_empty() {
+        String::new()
+    } else {
+        format!("(?{})", flags)
+    };
+    regex::Regex::new(&format!("{}{}", inline_flags, unescaped)).map_err(|error| error.to_string())
 }
 
 /// Recursive-descent evaluator for `rules:if`, where `&&` binds tighter than
@@ -497,20 +699,24 @@ fn default_list(pipeline: &Pipeline, key: &str) -> Option<Vec<String>> {
 /// The image a job runs in: its own, then `default:`, then the top-level one,
 /// with the pipeline's and the job's variables expanded.
 fn job_image(job_name: &str, pipeline: &Pipeline, job: &Job) -> Option<String> {
-    let name = |image: &Image| match image {
-        Image::Simple(name) | Image::Detailed { name, .. } => name.clone(),
-    };
     let image = job
         .image
-        .as_ref()
-        .map(name)
+        .clone()
         .or_else(|| {
             let image = pipeline.default.as_ref()?.get("image")?;
-            serde_yaml::from_value::<Image>(image.clone())
-                .ok()
-                .map(|image| name(&image))
+            serde_yaml::from_value::<Image>(image.clone()).ok()
         })
-        .or_else(|| pipeline.image.as_ref().map(name))?;
+        .or_else(|| pipeline.image.clone())?;
+    let (image, entrypoint) = match image {
+        Image::Simple(name) => (name, None),
+        Image::Detailed { name, entrypoint } => (name, entrypoint),
+    };
+    if entrypoint.is_some() {
+        wrkflw_logging::warning(&format!(
+            "Job '{}': image entrypoint isn't applied, so '{}' keeps its own",
+            job_name, image
+        ));
+    }
 
     let mut variables = pipeline.variables.clone().unwrap_or_default();
     variables.extend(job.variables.clone().unwrap_or_default());
@@ -1162,6 +1368,151 @@ own:
                 .as_deref(),
             Some(SHELL_BASH_OR_SH)
         );
+    }
+
+    #[test]
+    fn only_and_except_decide_when_there_are_no_rules() {
+        let branch = [("CI_COMMIT_BRANCH", "dev"), ("CI_PIPELINE_SOURCE", "push")];
+        let tag = [
+            ("CI_COMMIT_BRANCH", "dev"),
+            ("CI_COMMIT_TAG", "v1.2"),
+            ("CI_PIPELINE_SOURCE", "push"),
+        ];
+        let excluded = JobWhen::Skip(SkipReason::RefFilter);
+        for (filter, vars, expected) in [
+            ("only: [main]", &branch[..], excluded),
+            ("only: [dev]", &branch, JobWhen::OnSuccess),
+            ("only: [branches]", &branch, JobWhen::OnSuccess),
+            ("only: [tags]", &branch, excluded),
+            ("only: [tags]", &tag, JobWhen::OnSuccess),
+            ("only: [branches]", &tag, excluded),
+            ("only: [pushes]", &branch, JobWhen::OnSuccess),
+            ("only: [merge_requests]", &branch, excluded),
+            ("only: ['/^de/']", &branch, JobWhen::OnSuccess),
+            ("only: ['/^v/']", &tag, JobWhen::OnSuccess),
+            ("except: [dev]", &branch, excluded),
+            ("except: [main]", &branch, JobWhen::OnSuccess),
+            ("except: [tags]", &tag, excluded),
+            ("only: {refs: [dev], variables: ['$X']}", &branch, excluded),
+            (
+                "only: {refs: [main], variables: ['$CI_COMMIT_BRANCH']}",
+                &branch,
+                excluded,
+            ),
+            (
+                "only: {variables: ['$CI_COMMIT_BRANCH']}",
+                &branch,
+                JobWhen::OnSuccess,
+            ),
+            ("only: {changes: [docs/*]}", &branch, JobWhen::OnSuccess),
+            ("except: {changes: [docs/*]}", &branch, JobWhen::OnSuccess),
+            (
+                "except: {refs: [dev], variables: ['$X']}",
+                &branch,
+                JobWhen::OnSuccess,
+            ),
+            (
+                "only: ['/(/']",
+                &branch,
+                JobWhen::Skip(SkipReason::InvalidCondition),
+            ),
+        ] {
+            assert_eq!(
+                when_of(&format!("script: [a]\n{}", filter), vars),
+                expected,
+                "{}",
+                filter
+            );
+        }
+    }
+
+    #[test]
+    fn rules_take_precedence_over_only() {
+        let job = "script: [a]\nonly: [main]\nrules:\n  - when: always\n";
+        assert_eq!(
+            when_of(job, &[("CI_COMMIT_BRANCH", "dev")]),
+            JobWhen::Always
+        );
+    }
+
+    #[test]
+    fn delayed_runs_like_on_success() {
+        assert_eq!(
+            when_of("script: [a]\nwhen: delayed\nstart_in: 1 hour", &[]),
+            JobWhen::OnSuccess
+        );
+    }
+
+    #[test]
+    fn workflow_rules_decide_whether_the_pipeline_exists() {
+        let pipeline = |rules: &str| -> Pipeline {
+            serde_yaml::from_str(&format!(
+                "workflow:\n  rules:\n{}\njob:\n  script: [a]\n",
+                rules
+            ))
+            .unwrap()
+        };
+        let vars = variables(&[("CI_PIPELINE_SOURCE", "push")]);
+        let none: Pipeline = serde_yaml::from_str("job:\n  script: [a]\n").unwrap();
+        assert_eq!(pipeline_exclusion(&none, &vars), None);
+        for (rules, expected) in [
+            ("    - if: $CI_PIPELINE_SOURCE == \"push\"", None),
+            (
+                "    - if: $CI_PIPELINE_SOURCE == \"web\"",
+                Some(SkipReason::NoRuleMatched),
+            ),
+            (
+                "    - if: $CI_PIPELINE_SOURCE\n      when: never\n    - when: always",
+                Some(SkipReason::Never),
+            ),
+            ("    - if: '($X'", Some(SkipReason::InvalidCondition)),
+        ] {
+            assert_eq!(
+                pipeline_exclusion(&pipeline(rules), &vars),
+                expected,
+                "{}",
+                rules
+            );
+        }
+    }
+
+    #[test]
+    fn rule_conditions_handle_null_prefixes_and_regex_flags() {
+        let vars = variables(&[("A", "line\nnext"), ("B", "x")]);
+        assert_eq!(
+            evaluate_rule_condition("$A =~ /line.next/s", &vars),
+            Ok(true)
+        );
+        assert_eq!(
+            evaluate_rule_condition("$A =~ /LINE.NEXT/is", &vars),
+            Ok(true)
+        );
+        assert_eq!(evaluate_rule_condition("$A =~ /^next$/m", &vars), Ok(true));
+        assert_eq!(evaluate_rule_condition("$B == null", &vars), Ok(false));
+        assert!(evaluate_rule_condition("$A =~ /x/g", &vars).is_err());
+        assert!(evaluate_rule_condition("$A == nullable", &vars).is_err());
+    }
+
+    #[test]
+    fn detailed_images_use_their_name_at_every_level() {
+        let workflow = convert(
+            r#"
+default:
+  image:
+    name: dflt:1
+    entrypoint: [""]
+inherit:
+  script: [echo]
+own:
+  image:
+    name: own:1
+    entrypoint: [""]
+  script: [echo]
+"#,
+        );
+        let image = |job: &str| workflow.jobs[job].container.as_ref().unwrap().image.clone();
+        assert_eq!(image("inherit"), "dflt:1");
+        assert_eq!(image("own"), "own:1");
     }
 
     #[test]

@@ -238,6 +238,7 @@ mod tests {
             secrets: None,
             timeout_minutes: None,
             defaults: None,
+            continue_on_error: None,
         }
     }
 

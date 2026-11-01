@@ -171,6 +171,9 @@ pub(crate) async fn run(ctx: RunCtx) {
                 wrkflw_executor::JobStatus::Success => {
                     println!("  {}", cli_style::job_success(&job.name))
                 }
+                wrkflw_executor::JobStatus::Failure if job.failure_allowed => {
+                    println!("  {}", cli_style::job_failure_allowed(&job.name))
+                }
                 wrkflw_executor::JobStatus::Failure => {
                     println!("  {}", cli_style::job_failure(&job.name))
                 }

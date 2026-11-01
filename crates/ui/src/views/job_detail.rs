@@ -78,6 +78,7 @@ fn render_breadcrumb(
     let (sym, sym_style) = theme::job_status(&job.status);
     let status_text = match job.status {
         JobStatus::Success => ("success", BadgeKind::Success),
+        JobStatus::Failure if job.failure_allowed => ("failed (allowed)", BadgeKind::Warning),
         JobStatus::Failure => ("failed", BadgeKind::Error),
         JobStatus::Skipped => ("skipped", BadgeKind::Warning),
     };

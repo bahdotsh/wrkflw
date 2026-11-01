@@ -83,7 +83,6 @@ async fn execute_github_workflow(
     mut config: ExecutionConfig,
 ) -> Result<ExecutionResult, ExecutionError> {
     config.runtime_type = detect_runtime(config.runtime_type);
-    warn_if_overrides_unused(&config);
     // 1. Parse workflow file
     let workflow = parse_workflow(workflow_path)?;
 
@@ -99,70 +98,21 @@ async fn execute_github_workflow(
     };
 
     // 3. Initialize appropriate runtime
-    let runtime = initialize_runtime(
+    let (runtime, effective_runtime) = initialize_runtime(
         config.runtime_type.clone(),
         config.preserve_containers_on_failure,
         &config.kubernetes,
     )?;
+    config.runtime_type = effective_runtime;
+    warn_if_overrides_unused(&config);
 
     // Create a temporary workspace directory
     let workspace_dir = tempfile::tempdir()
         .map_err(|e| ExecutionError::Execution(format!("Failed to create workspace: {}", e)))?;
 
     // 4. Set up GitHub-like environment
-    let mut env_context = environment::create_github_context(&workflow, workspace_dir.path());
-    // Track the user-declared slice of env separately so `toJSON(env)` only
-    // dumps what the user actually wrote in YAML (and later, what steps write
-    // to `$GITHUB_ENV`). Starts empty — `create_github_context` only seeds
-    // runner-internal vars.
-    let mut user_env: HashMap<String, String> = HashMap::new();
-
-    // Add workflow-level environment variables (lowest precedence — does not override
-    // built-in GITHUB_*/RUNNER_* vars; job and step env override these later).
-    // Resolve ${{ }} expressions (e.g. ${{ github.repository }}) in values.
-    {
-        // At this point workflow.env hasn't been merged yet — user_env is empty.
-        let wf_expr_ctx = crate::expression::ExpressionContext {
-            env_context: &env_context,
-            step_outputs: &HashMap::new(),
-            matrix_combination: &None,
-            step_statuses: &HashMap::new(),
-            job_status: "success",
-            secrets_context: &HashMap::new(),
-            needs_context: &HashMap::new(),
-            needs_results: &HashMap::new(),
-            user_env: &user_env,
-        };
-        let cwd = std::env::current_dir().map_err(|e| {
-            ExecutionError::Execution(format!("Failed to get current directory: {}", e))
-        })?;
-        let resolved_env: Vec<(String, String)> = workflow
-            .env
-            .iter()
-            .map(|(key, value)| {
-                let resolved =
-                    crate::substitution::preprocess_expressions(value, &cwd, &wf_expr_ctx)
-                        .unwrap_or_else(|_| value.clone());
-                (key.clone(), resolved)
-            })
-            .collect();
-        for (key, value) in resolved_env {
-            // `or_insert` semantics: workflow.env does not override runner-seeded
-            // vars. user_env mirrors the same precedence — a workflow.env key that
-            // collides with a runner var is dropped from env_context AND not added
-            // to user_env (real GHA doesn't let workflow.env shadow runner vars).
-            env_context.entry(key.clone()).or_insert_with(|| {
-                user_env.insert(key, value.clone());
-                value
-            });
-        }
-    }
-
-    // Add runtime mode to environment
-    env_context.insert(
-        "WRKFLW_RUNTIME_MODE".to_string(),
-        config.runtime_type.mode_name().to_string(),
-    );
+    let (mut env_context, user_env) =
+        github_run_env(&workflow, workspace_dir.path(), &config.runtime_type)?;
 
     // show=true means hide=false (inverted for the env var)
     env_context.insert(
@@ -243,7 +193,7 @@ async fn execute_github_workflow(
 
         // Check for job failures and collect details
         for job_result in &job_results {
-            if job_result.status == JobStatus::Failure {
+            if job_result.fails_run() {
                 has_failures = true;
                 failure_details.push_str(&format!(
                     "\n{} Job failed: {}\n",
@@ -297,6 +247,15 @@ fn record_job_results(
 ) {
     let mut aggregate: HashMap<&str, &JobStatus> = HashMap::new();
     for job_result in job_results {
+        // Dependents treat an allowed failure as success, so they still run.
+        // GitHub documents that the run passes, but not what
+        // `needs.<job>.result` reads. `success` is the reported behaviour:
+        // https://www.kenmuse.com/blog/how-to-handle-step-and-job-errors-in-github-actions/
+        let status = if job_result.failure_allowed {
+            &JobStatus::Success
+        } else {
+            &job_result.status
+        };
         if all_job_outputs.contains_key(&job_result.canonical_name)
             && job_result.name != job_result.canonical_name
         {
@@ -312,12 +271,12 @@ fn record_job_results(
         );
         aggregate
             .entry(job_result.canonical_name.as_str())
-            .and_modify(|status| {
-                if job_result.status.aggregate_rank() > status.aggregate_rank() {
-                    *status = &job_result.status;
+            .and_modify(|existing| {
+                if status.aggregate_rank() > existing.aggregate_rank() {
+                    *existing = status;
                 }
             })
-            .or_insert(&job_result.status);
+            .or_insert(status);
     }
     for (name, status) in aggregate {
         all_job_results.insert(name.to_string(), status.to_string());
@@ -330,7 +289,6 @@ async fn execute_gitlab_pipeline(
     mut config: ExecutionConfig,
 ) -> Result<ExecutionResult, ExecutionError> {
     config.runtime_type = detect_runtime(config.runtime_type);
-    warn_if_overrides_unused(&config);
     wrkflw_logging::info("Executing GitLab CI/CD pipeline");
 
     // 1. Parse the GitLab pipeline file
@@ -359,11 +317,13 @@ async fn execute_gitlab_pipeline(
     };
 
     // 4. Initialize appropriate runtime
-    let runtime = initialize_runtime(
+    let (runtime, effective_runtime) = initialize_runtime(
         config.runtime_type.clone(),
         config.preserve_containers_on_failure,
         &config.kubernetes,
     )?;
+    config.runtime_type = effective_runtime;
+    warn_if_overrides_unused(&config);
 
     // Create a temporary workspace directory
     let workspace_dir = tempfile::tempdir()
@@ -373,10 +333,7 @@ async fn execute_gitlab_pipeline(
     let mut env_context = create_gitlab_context(&pipeline, workspace_dir.path());
 
     // Add runtime mode to environment
-    env_context.insert(
-        "WRKFLW_RUNTIME_MODE".to_string(),
-        config.runtime_type.mode_name().to_string(),
-    );
+    seed_runtime_context(&mut env_context, &config.runtime_type, CiPlatform::GitLab);
 
     // Setup environment files
     environment::setup_github_environment_files(workspace_dir.path()).map_err(|e| {
@@ -469,7 +426,7 @@ async fn execute_gitlab_pipeline(
 
         // Check for job failures and collect details
         for job_result in &job_results {
-            if job_result.status == JobStatus::Failure {
+            if job_result.fails_run() {
                 has_failures = true;
                 failure_details.push_str(&format!(
                     "\n{} Job failed: {}\n",
@@ -654,12 +611,110 @@ pub fn detect_runtime(runtime_type: RuntimeType) -> RuntimeType {
     }
 }
 
-// Determine if Docker/Podman is available or fall back to emulation
+type EnvMap = HashMap<String, String>;
+
+/// Build the run-level env for a GitHub workflow. Returns the full lookup map
+/// and the user-declared slice of it.
+fn github_run_env(
+    workflow: &WorkflowDefinition,
+    workspace_dir: &Path,
+    runtime: &RuntimeType,
+) -> Result<(EnvMap, EnvMap), ExecutionError> {
+    let mut env_context = environment::create_github_context(workflow, workspace_dir);
+    // Before the workflow env below, whose expressions must see what steps see.
+    seed_runtime_context(&mut env_context, runtime, CiPlatform::GitHub);
+
+    // Track the user-declared slice of env separately so `toJSON(env)` only
+    // dumps what the user actually wrote in YAML (and later, what steps write
+    // to `$GITHUB_ENV`). Starts empty — `create_github_context` only seeds
+    // runner-internal vars.
+    let mut user_env: HashMap<String, String> = HashMap::new();
+
+    // Add workflow-level environment variables (lowest precedence — does not override
+    // built-in GITHUB_*/RUNNER_* vars; job and step env override these later).
+    // Resolve ${{ }} expressions (e.g. ${{ github.repository }}) in values.
+    {
+        // At this point workflow.env hasn't been merged yet — user_env is empty.
+        let wf_expr_ctx = crate::expression::ExpressionContext {
+            env_context: &env_context,
+            step_outputs: &HashMap::new(),
+            matrix_combination: &None,
+            step_statuses: &HashMap::new(),
+            job_status: "success",
+            secrets_context: &HashMap::new(),
+            needs_context: &HashMap::new(),
+            needs_results: &HashMap::new(),
+            user_env: &user_env,
+        };
+        let cwd = std::env::current_dir().map_err(|e| {
+            ExecutionError::Execution(format!("Failed to get current directory: {}", e))
+        })?;
+        let resolved_env: Vec<(String, String)> = workflow
+            .env
+            .iter()
+            .map(|(key, value)| {
+                let resolved =
+                    crate::substitution::preprocess_expressions(value, &cwd, &wf_expr_ctx)
+                        .unwrap_or_else(|_| value.clone());
+                (key.clone(), resolved)
+            })
+            .collect();
+        for (key, value) in resolved_env {
+            // `or_insert` semantics: workflow.env does not override runner-seeded
+            // vars. user_env mirrors the same precedence — a workflow.env key that
+            // collides with a runner var is dropped from env_context AND not added
+            // to user_env (real GHA doesn't let workflow.env shadow runner vars).
+            env_context.entry(key.clone()).or_insert_with(|| {
+                user_env.insert(key, value.clone());
+                value
+            });
+        }
+    }
+
+    Ok((env_context, user_env))
+}
+
+/// The CI system whose variables a run exposes to its steps.
+#[derive(Debug, Clone, Copy)]
+enum CiPlatform {
+    GitHub,
+    GitLab,
+}
+
+/// Record the runtime steps will use and, for a container runtime, swap in the
+/// values steps see inside the container.
+fn seed_runtime_context(
+    env: &mut HashMap<String, String>,
+    runtime: &RuntimeType,
+    platform: CiPlatform,
+) {
+    env.insert(
+        "WRKFLW_RUNTIME_MODE".to_string(),
+        runtime.mode_name().to_string(),
+    );
+    if runtime.runs_in_container() {
+        match platform {
+            CiPlatform::GitHub => environment::apply_github_container_context(env),
+            CiPlatform::GitLab => environment::apply_gitlab_container_context(env),
+        }
+    }
+}
+
+fn emulation_runtime() -> (Box<dyn ContainerRuntime>, RuntimeType) {
+    (
+        Box::new(emulation::EmulationRuntime::new()),
+        RuntimeType::Emulation,
+    )
+}
+
+/// Determine if Docker/Podman is available or fall back to emulation. Returns
+/// the runtime with its type, which is `Emulation` after a fallback whatever
+/// was requested.
 fn initialize_runtime(
     runtime_type: RuntimeType,
     preserve_containers_on_failure: bool,
     kubernetes: &KubernetesConfig,
-) -> Result<Box<dyn ContainerRuntime>, ExecutionError> {
+) -> Result<(Box<dyn ContainerRuntime>, RuntimeType), ExecutionError> {
     match runtime_type {
         RuntimeType::Auto => initialize_runtime(
             detect_runtime(RuntimeType::Auto),
@@ -669,42 +724,49 @@ fn initialize_runtime(
         RuntimeType::Docker => {
             if docker::is_available() {
                 match docker::DockerRuntime::new_with_config(preserve_containers_on_failure) {
-                    Ok(docker_runtime) => Ok(Box::new(docker_runtime)),
+                    Ok(docker_runtime) => Ok((Box::new(docker_runtime), RuntimeType::Docker)),
                     Err(e) => {
                         wrkflw_logging::error(&format!(
                             "Failed to initialize Docker runtime: {}, falling back to emulation mode",
                             e
                         ));
-                        Ok(Box::new(emulation::EmulationRuntime::new()))
+                        Ok(emulation_runtime())
                     }
                 }
             } else {
                 wrkflw_logging::error("Docker not available, falling back to emulation mode");
-                Ok(Box::new(emulation::EmulationRuntime::new()))
+                Ok(emulation_runtime())
             }
         }
         RuntimeType::Podman => {
             if podman::is_available() {
-                Ok(Box::new(podman::PodmanRuntime::new_unchecked(
-                    preserve_containers_on_failure,
-                )))
+                Ok((
+                    Box::new(podman::PodmanRuntime::new_unchecked(
+                        preserve_containers_on_failure,
+                    )),
+                    RuntimeType::Podman,
+                ))
             } else {
                 wrkflw_logging::error("Podman not available, falling back to emulation mode");
-                Ok(Box::new(emulation::EmulationRuntime::new()))
+                Ok(emulation_runtime())
             }
         }
         // Kubernetes is never auto-detected and never silently replaced:
         // a job meant for a GPU node must not quietly run on the laptop.
         RuntimeType::Kubernetes => {
             kubernetes::check_available(kubernetes).map_err(ExecutionError::Runtime)?;
-            Ok(Box::new(kubernetes::KubernetesRuntime::new(
-                kubernetes.clone(),
-                preserve_containers_on_failure,
-            )))
+            Ok((
+                Box::new(kubernetes::KubernetesRuntime::new(
+                    kubernetes.clone(),
+                    preserve_containers_on_failure,
+                )),
+                RuntimeType::Kubernetes,
+            ))
         }
-        RuntimeType::Emulation => Ok(Box::new(emulation::EmulationRuntime::new())),
-        RuntimeType::SecureEmulation => Ok(Box::new(
-            wrkflw_runtime::secure_emulation::SecureEmulationRuntime::new(),
+        RuntimeType::Emulation => Ok(emulation_runtime()),
+        RuntimeType::SecureEmulation => Ok((
+            Box::new(wrkflw_runtime::secure_emulation::SecureEmulationRuntime::new()),
+            RuntimeType::SecureEmulation,
         )),
     }
 }
@@ -724,6 +786,17 @@ pub enum RuntimeType {
 }
 
 impl RuntimeType {
+    /// The runtimes whose steps run in a container rather than on the host.
+    const CONTAINER_RUNTIMES: [RuntimeType; 3] = [
+        RuntimeType::Docker,
+        RuntimeType::Podman,
+        RuntimeType::Kubernetes,
+    ];
+
+    fn runs_in_container(&self) -> bool {
+        Self::CONTAINER_RUNTIMES.contains(self)
+    }
+
     /// The value steps see in `WRKFLW_RUNTIME_MODE`.
     pub fn mode_name(&self) -> &'static str {
         match self {
@@ -816,9 +889,17 @@ pub struct JobResult {
     pub logs: String,
     /// Resolved job outputs (from the job's `outputs:` mapping).
     pub outputs: HashMap<String, String>,
+    /// `continue-on-error` applies: a failure here doesn't fail the run or
+    /// block dependent jobs, though the job is still reported as failed.
+    pub failure_allowed: bool,
 }
 
 impl JobResult {
+    /// Whether this result should fail the run and trigger `fail-fast`.
+    fn fails_run(&self) -> bool {
+        self.status == JobStatus::Failure && !self.failure_allowed
+    }
+
     /// A job (or matrix combination) that never ran.
     fn skipped(
         name: impl Into<String>,
@@ -832,6 +913,7 @@ impl JobResult {
             steps: Vec::new(),
             logs: logs.into(),
             outputs: HashMap::new(),
+            failure_allowed: false,
         }
     }
 
@@ -855,6 +937,7 @@ impl JobResult {
             )],
             logs: reason,
             outputs: HashMap::new(),
+            failure_allowed: false,
         }
     }
 }
@@ -1266,7 +1349,7 @@ async fn execute_native_docker_step(
         }
     }
 
-    let container_workspace = Path::new("/github/workspace");
+    let container_workspace = Path::new(environment::CONTAINER_WORKSPACE);
     let mount_ctx = prepare_step_container_context(
         step_env,
         ctx.job_env,
@@ -2212,10 +2295,18 @@ async fn execute_job_with_matrix(
         HashMap::new()
     };
 
+    if !job.services.is_empty() {
+        wrkflw_logging::warning(&format!(
+            "Job '{}' declares services, which wrkflw doesn't start yet: its steps can't reach them",
+            job_name
+        ));
+    }
+
     // Check if this is a matrix job
     if let Some(matrix_config) = job.matrix_config() {
-        // `include`/`exclude` may be expressions over upstream job outputs, which
-        // are only available now, so resolve them before expanding. As on GitHub,
+        // The matrix, an axis or `include`/`exclude` may be expressions over
+        // upstream job outputs, which are only available now, so resolve them
+        // before expanding. As on GitHub,
         // a matrix that can't be computed fails this job, and the run carries on.
         let expansion = resolve_matrix_expressions(
             matrix_config,
@@ -2482,6 +2573,7 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
         steps: loop_state.step_results,
         logs: loop_state.job_logs,
         outputs: job_outputs,
+        failure_allowed: job_failure_allowed(job, &None, &job_env, &job_user_env, &ctx.services),
     })
 }
 
@@ -2546,7 +2638,7 @@ async fn execute_matrix_combinations(
         for (combination, result) in chunk.iter().zip(chunk_results) {
             match result {
                 Ok(job_result) => {
-                    if job_result.status == JobStatus::Failure {
+                    if job_result.fails_run() {
                         any_failed = true;
                     }
                     results.push(job_result);
@@ -2568,6 +2660,7 @@ async fn execute_matrix_combinations(
                         steps: Vec::new(),
                         logs: e.to_string(),
                         outputs: HashMap::new(),
+                        failure_allowed: false,
                     });
                 }
             }
@@ -2791,6 +2884,13 @@ async fn execute_matrix_job(
         steps: loop_state.step_results,
         logs: loop_state.job_logs,
         outputs: job_outputs,
+        failure_allowed: job_failure_allowed(
+            job_template,
+            &Some(combination.values.clone()),
+            &job_env,
+            &job_user_env,
+            services,
+        ),
     })
 }
 
@@ -3065,7 +3165,7 @@ async fn run_step_with_guards(
     // Check step-level if condition
     if let Some(if_cond) = &step.if_condition {
         let cond_ctx = step_exec_ctx.expr_context();
-        let should_run = evaluate_condition_with_context(if_cond, &cond_ctx);
+        let should_run = evaluate_step_condition(if_cond, step_exec_ctx.working_dir, &cond_ctx);
         if !should_run {
             wrkflw_logging::info(&format!(
                 "  {} Skipping step '{}' due to condition: {}",
@@ -3080,6 +3180,11 @@ async fn run_step_with_guards(
             )));
         }
     }
+
+    let continue_on_error = continues_on_error(
+        step.continue_on_error.as_deref(),
+        &step_exec_ctx.expr_context(),
+    );
 
     // Wrap step execution with optional step-level timeout; sanitize to avoid panic on negative/NaN.
     // Note: the job-level timeout already wraps the entire step execution, so the step
@@ -3111,7 +3216,7 @@ async fn run_step_with_guards(
     match step_result {
         Ok(mut result) => {
             let (abort_job, conclusion) = if result.status == StepStatus::Failure {
-                if step.continue_on_error == Some(true) {
+                if continue_on_error {
                     wrkflw_logging::info(&format!(
                         "  Step '{}' failed but continue-on-error is set, continuing",
                         result.name
@@ -3128,7 +3233,7 @@ async fn run_step_with_guards(
             Ok(StepOutcome::Completed { result, abort_job })
         }
         Err(e) => {
-            let (abort_job, conclusion) = if step.continue_on_error == Some(true) {
+            let (abort_job, conclusion) = if continue_on_error {
                 wrkflw_logging::info(&format!(
                     "  Step '{}' errored but continue-on-error is set, continuing",
                     step_name
@@ -3149,6 +3254,50 @@ async fn run_step_with_guards(
             })
         }
     }
+}
+
+/// Whether a `continue-on-error` value (`true`, `false` or an expression) holds.
+/// A value that can't be evaluated doesn't, so the failure still counts.
+fn continues_on_error(value: Option<&str>, ctx: &crate::expression::ExpressionContext<'_>) -> bool {
+    value.is_some_and(
+        |value| match crate::expression::evaluate_as_bool(value, ctx) {
+            Ok(holds) => holds,
+            Err(e) => {
+                wrkflw_logging::warning(&format!(
+                    "continue-on-error value '{}' failed to evaluate: {} — a failure here will still count",
+                    value, e
+                ));
+                false
+            }
+        },
+    )
+}
+
+/// Whether a job's `continue-on-error` tolerates its failure. Evaluated per
+/// matrix combination, so `${{ matrix.experimental }}` applies to just those.
+/// The step and job-status contexts are empty because GitHub doesn't offer
+/// them here, only `github`, `needs`, `strategy`, `matrix`, `vars` and `inputs`.
+fn job_failure_allowed(
+    job: &Job,
+    matrix_combination: &Option<HashMap<String, serde_yaml::Value>>,
+    env_context: &HashMap<String, String>,
+    user_env: &HashMap<String, String>,
+    services: &JobServices<'_>,
+) -> bool {
+    continues_on_error(
+        job.continue_on_error.as_deref(),
+        &crate::expression::ExpressionContext {
+            env_context,
+            step_outputs: &HashMap::new(),
+            matrix_combination,
+            step_statuses: &HashMap::new(),
+            job_status: "success",
+            secrets_context: services.secrets_context,
+            needs_context: services.needs_context,
+            needs_results: services.needs_results,
+            user_env,
+        },
+    )
 }
 
 /// Sanitize a timeout-minutes value, returning a safe positive finite number.
@@ -3231,6 +3380,47 @@ impl<'a> StepExecutionContext<'a> {
     }
 }
 
+/// Evaluate `${{ }}` in a `working-directory`. A failed expression is an error,
+/// since falling back to an empty value would run the step in the wrong place.
+fn resolve_working_directory(
+    wd: &str,
+    ctx: &StepExecutionContext<'_>,
+    step_env: &HashMap<String, String>,
+    step_user_env: &HashMap<String, String>,
+) -> Result<String, String> {
+    let expr_ctx = ctx.expr_context_with_env(step_env, step_user_env);
+    let resolved =
+        crate::substitution::preprocess_expressions_strict(wd, ctx.working_dir, &expr_ctx)
+            .map_err(|e| format!("Invalid working-directory '{}': {}", wd, e))?;
+    Ok(workspace_relative_input(&resolved, ctx.job_env))
+}
+
+/// Make a path input relative to the workspace, so it means the same place
+/// wherever it is used. Steps and the actions wrkflw handles itself both work
+/// in the job directory, while `github.workspace` is `/github/workspace` under
+/// a container runtime and a host path in emulation. The workspace itself
+/// becomes `.`, because an empty input means the input was not provided.
+fn workspace_relative_input(path: &str, job_env: &HashMap<String, String>) -> String {
+    let Some(workspace) = job_env.get("GITHUB_WORKSPACE") else {
+        return path.to_string();
+    };
+    match relative_to_workspace(path, workspace) {
+        relative if relative.is_empty() && !path.is_empty() => ".".to_string(),
+        relative => relative,
+    }
+}
+
+/// Make a path under `workspace` relative, since steps see the workspace under
+/// `/github/workspace` and `github.workspace` is the host path in emulation. The
+/// comparison is by path component, so a sibling like `<workspace>-old` stays
+/// absolute and fails the check that keeps steps inside the workspace.
+fn relative_to_workspace(path: &str, workspace: &str) -> String {
+    match Path::new(path).strip_prefix(workspace) {
+        Ok(relative) => relative.to_string_lossy().into_owned(),
+        Err(_) => path.to_string(),
+    }
+}
+
 /// Resolve `${{ }}` expressions in an action `with` parameter value.
 ///
 /// On expression error, returns empty string (matching GitHub Actions behavior
@@ -3239,6 +3429,34 @@ fn preprocess_with_value(value: &str, ctx: &StepExecutionContext<'_>) -> String 
     let expr_ctx = ctx.expr_context();
     crate::substitution::preprocess_expressions(value, ctx.working_dir, &expr_ctx)
         .unwrap_or_default()
+}
+
+/// The `if-no-files-found` input of `actions/upload-artifact`.
+#[derive(Clone, Copy)]
+enum IfNoFilesFound {
+    Warn,
+    Error,
+    Ignore,
+}
+
+impl IfNoFilesFound {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "warn" => Some(Self::Warn),
+            "error" => Some(Self::Error),
+            "ignore" => Some(Self::Ignore),
+            _ => None,
+        }
+    }
+}
+
+/// A boolean action input, accepting the spellings of `core.getBooleanInput`.
+fn parse_boolean_input(value: &str) -> Option<bool> {
+    match value {
+        "true" | "True" | "TRUE" => Some(true),
+        "false" | "False" | "FALSE" => Some(false),
+        _ => None,
+    }
 }
 
 /// Handle `actions/upload-artifact` emulation.
@@ -3253,7 +3471,7 @@ async fn handle_upload_artifact(
         .unwrap_or_else(|| "artifact".to_string());
     let path_pattern = with
         .and_then(|w| w.get("path"))
-        .map(|s| preprocess_with_value(s, ctx))
+        .map(|s| workspace_relative_input(&preprocess_with_value(s, ctx), ctx.job_env))
         .unwrap_or_default();
 
     if path_pattern.is_empty() {
@@ -3264,12 +3482,67 @@ async fn handle_upload_artifact(
         ));
     }
 
+    // `core.getInput` trims what it returns.
+    let input = |key: &str, default: &str| {
+        with.and_then(|w| w.get(key))
+            .map(|s| preprocess_with_value(s, ctx).trim().to_string())
+            .unwrap_or_else(|| default.to_string())
+    };
+
+    let if_no_files_input = input("if-no-files-found", "warn");
+    let Some(if_no_files) = IfNoFilesFound::parse(&if_no_files_input) else {
+        return Ok(StepResult::new(
+            step_name.to_string(),
+            StepStatus::Failure,
+            format!(
+                "Unrecognized if-no-files-found input. Provided: {}. Available options: warn, error, ignore",
+                if_no_files_input
+            ),
+        ));
+    };
+
+    let boolean = |key: &str| {
+        let value = input(key, "false");
+        parse_boolean_input(&value).ok_or_else(|| {
+            StepResult::new(
+                step_name.to_string(),
+                StepStatus::Failure,
+                format!(
+                    "Unrecognized {} input. Provided: {}. Available options: true, false",
+                    key, value
+                ),
+            )
+        })
+    };
+    let options = crate::artifacts::UploadOptions {
+        include_hidden: match boolean("include-hidden-files") {
+            Ok(value) => value,
+            Err(result) => return Ok(result),
+        },
+        overwrite: match boolean("overwrite") {
+            Ok(value) => value,
+            Err(result) => return Ok(result),
+        },
+    };
+
     match ctx
         .services
         .artifact_store
-        .upload(&name, &path_pattern, ctx.working_dir)
+        .upload(&name, &path_pattern, ctx.working_dir, options)
         .await
     {
+        Ok(0) => {
+            let message = format!("No files were found with the path: {}", path_pattern);
+            let status = match if_no_files {
+                IfNoFilesFound::Error => StepStatus::Failure,
+                IfNoFilesFound::Ignore => StepStatus::Success,
+                IfNoFilesFound::Warn => {
+                    wrkflw_logging::warning(&message);
+                    StepStatus::Success
+                }
+            };
+            Ok(StepResult::new(step_name.to_string(), status, message))
+        }
         Ok(count) => {
             wrkflw_logging::info(&format!(
                 "  Uploaded artifact '{}': {} file(s)",
@@ -3301,7 +3574,12 @@ async fn handle_download_artifact(
         .unwrap_or_default();
     let download_path = with
         .and_then(|w| w.get("path"))
-        .map(|s| ctx.working_dir.join(preprocess_with_value(s, ctx)))
+        .map(|s| {
+            ctx.working_dir.join(workspace_relative_input(
+                &preprocess_with_value(s, ctx),
+                ctx.job_env,
+            ))
+        })
         .unwrap_or_else(|| ctx.working_dir.to_path_buf());
 
     // Validate download path stays within workspace (prevent path traversal).
@@ -3422,8 +3700,9 @@ async fn handle_cache_action(
     // actions/cache supports multi-line `path` input (one path per line)
     let cache_paths: Vec<String> = cache_path_raw
         .lines()
-        .map(|l| l.trim().to_string())
+        .map(|l| l.trim())
         .filter(|l| !l.is_empty())
+        .map(|l| workspace_relative_input(l, ctx.job_env))
         .collect();
     let restore_keys: Vec<String> = with
         .and_then(|w| w.get("restore-keys"))
@@ -3619,11 +3898,12 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
 
             match prepared {
                 PreparedAction::Composite => {
+                    let call_step = composite_call_step(&ctx, &step_env, &step_user_env);
                     if action_info.is_local {
                         // Handle local composite action
                         let action_path = Path::new(&action_info.repository);
                         execute_composite_action(
-                            ctx.step,
+                            &call_step,
                             action_path,
                             &step_env,
                             &step_user_env,
@@ -3679,7 +3959,7 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                         };
                         // tempdir must stay alive until execute_composite_action completes
                         execute_composite_action(
-                            ctx.step,
+                            &call_step,
                             &action_dir,
                             &step_env,
                             &step_user_env,
@@ -3982,7 +4262,7 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                         }
                     }
 
-                    let container_workspace = Path::new("/github/workspace");
+                    let container_workspace = Path::new(environment::CONTAINER_WORKSPACE);
                     let mount_ctx = prepare_step_container_context(
                         &mut step_env,
                         ctx.job_env,
@@ -4159,11 +4439,19 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
             .or_else(|| {
                 ctx.workflow_defaults
                     .and_then(|d| d.run.as_ref()?.working_directory.as_deref())
-            });
+            })
+            .map(|wd| resolve_working_directory(wd, &ctx, &step_env, &step_user_env))
+            .transpose();
+        let effective_wd = match effective_wd {
+            Ok(wd) => wd,
+            Err(msg) => {
+                return Ok(StepResult::new(step_name, StepStatus::Failure, msg));
+            }
+        };
 
         // Define the standard workspace path inside the container
-        let container_workspace = Path::new("/github/workspace");
-        let final_workspace = if let Some(wd) = effective_wd {
+        let container_workspace = Path::new(environment::CONTAINER_WORKSPACE);
+        let final_workspace = if let Some(wd) = &effective_wd {
             let joined = container_workspace.join(wd);
             // Canonicalize logically to catch ".." traversal and absolute path replacement
             let mut normalized = std::path::PathBuf::new();
@@ -4649,18 +4937,15 @@ fn prepare_step_container_context(
 type VolumePathPair = (PathBuf, PathBuf);
 
 /// True when steps execute inside a Docker/Podman/Kubernetes container
-/// rather than on the host. `Auto` is resolved to a concrete runtime before this is seeded.
+/// rather than on the host. The mode is seeded from the runtime `initialize_runtime`
+/// returned, so `Auto` and any fallback to emulation are already resolved.
 fn uses_container_runtime(step_env: &HashMap<String, String>) -> bool {
     step_env
         .get("WRKFLW_RUNTIME_MODE")
         .map(|mode| {
-            [
-                RuntimeType::Docker,
-                RuntimeType::Podman,
-                RuntimeType::Kubernetes,
-            ]
-            .iter()
-            .any(|runtime| runtime.mode_name() == mode)
+            RuntimeType::CONTAINER_RUNTIMES
+                .iter()
+                .any(|runtime| runtime.mode_name() == mode)
         })
         .unwrap_or(false)
 }
@@ -4676,7 +4961,7 @@ fn prepare_container_mounts(
     container_config: Option<&JobContainer>,
     mounts_are_copies: bool,
 ) -> (Vec<VolumePathPair>, Option<VolumePathPair>) {
-    let container_github_dir = Path::new("/github/workflow");
+    let container_github_dir = Path::new(environment::CONTAINER_GITHUB_DIR);
     let is_container_runtime = uses_container_runtime(step_env);
 
     // Mount GitHub environment files directory and remap paths
@@ -4696,7 +4981,11 @@ fn prepare_container_mounts(
                         if let Some(filename) = Path::new(host_path).file_name() {
                             step_env.insert(
                                 env_key.to_string(),
-                                format!("/github/workflow/{}", filename.to_string_lossy()),
+                                format!(
+                                    "{}/{}",
+                                    environment::CONTAINER_GITHUB_DIR,
+                                    filename.to_string_lossy()
+                                ),
                             );
                         }
                     }
@@ -4950,9 +5239,43 @@ async fn run_called_workflow(
 ) -> Result<JobResult, ExecutionError> {
     // Create child env context
     let mut child_env = ctx.env_context.clone();
+    let expr_ctx = crate::expression::ExpressionContext {
+        env_context: ctx.env_context,
+        step_outputs: &HashMap::new(),
+        // `execute_matrix_job` doesn't dispatch `uses:` jobs, so a caller with
+        // a matrix never gets here. Pass the combination in if that changes.
+        matrix_combination: &None,
+        step_statuses: &HashMap::new(),
+        job_status: "success",
+        secrets_context: ctx.services.secrets_context,
+        needs_context: ctx.services.needs_context,
+        needs_results: ctx.services.needs_results,
+        user_env: ctx.user_env,
+    };
+    let cwd = std::env::current_dir().map_err(|e| {
+        ExecutionError::Execution(format!("Failed to get current directory: {}", e))
+    })?;
+    let evaluate = |value: &str| {
+        crate::substitution::preprocess_expressions(value, &cwd, &expr_ctx).unwrap_or_default()
+    };
+
+    // Declared defaults first, so `with:` overrides them.
+    let declared_inputs = called
+        .on_raw
+        .get("workflow_call")
+        .and_then(|call| call.get("inputs"))
+        .and_then(|inputs| inputs.as_mapping());
+    for (name, definition) in declared_inputs.into_iter().flatten() {
+        if let (Some(name), Some(default)) = (
+            name.as_str(),
+            definition.get("default").and_then(yaml_scalar_to_string),
+        ) {
+            child_env.insert(input_env_key(name), evaluate(&default));
+        }
+    }
     if let Some(with_map) = with {
         for (k, v) in with_map {
-            child_env.insert(format!("INPUT_{}", k.to_uppercase()), v.clone());
+            child_env.insert(input_env_key(k), evaluate(v));
         }
     }
     if let Some(secrets_val) = secrets {
@@ -4963,8 +5286,8 @@ async fn run_called_workflow(
             }
         } else if let Some(map) = secrets_val.as_mapping() {
             for (k, v) in map {
-                if let (Some(key), Some(value)) = (k.as_str(), v.as_str()) {
-                    child_env.insert(format!("SECRET_{}", key.to_uppercase()), value.to_string());
+                if let (Some(key), Some(value)) = (k.as_str(), yaml_scalar_to_string(v)) {
+                    child_env.insert(format!("SECRET_{}", key.to_uppercase()), evaluate(&value));
                 }
             }
         }
@@ -5000,7 +5323,7 @@ async fn run_called_workflow(
             ctx.services.platform_overrides,
         )
         .await?;
-        any_failed |= results.iter().any(|r| r.status == JobStatus::Failure);
+        any_failed |= results.iter().any(JobResult::fails_run);
         record_job_results(
             &results,
             &mut reusable_job_outputs,
@@ -5028,7 +5351,8 @@ async fn run_called_workflow(
     );
 
     // Aggregate outputs from all jobs in the called workflow
-    let outputs = aggregate_reusable_workflow_outputs(&reusable_job_outputs);
+    let outputs = declared_reusable_workflow_outputs(called, &reusable_job_outputs, &child_env)
+        .unwrap_or_else(|| aggregate_reusable_workflow_outputs(&reusable_job_outputs));
 
     Ok(JobResult {
         name: ctx.job_name.to_string(),
@@ -5041,15 +5365,65 @@ async fn run_called_workflow(
         steps: vec![summary_step],
         logs,
         outputs,
+        failure_allowed: job_failure_allowed(
+            ctx.workflow.jobs.get(ctx.job_name).ok_or_else(|| {
+                ExecutionError::Execution(format!("Job '{}' not found", ctx.job_name))
+            })?,
+            &None,
+            ctx.env_context,
+            ctx.user_env,
+            &ctx.services,
+        ),
     })
 }
 
-/// Merge per-job outputs from a reusable workflow into a flat map.
+/// Evaluate `on.workflow_call.outputs` against the called workflow's job
+/// outputs. `env_context` must be the called workflow's env, since `inputs.*`
+/// may appear in an output's `value:`. Every declared name stays in the map, so
+/// a value that can't be evaluated reads as empty. Returns `None` when the
+/// workflow declares no outputs.
+fn declared_reusable_workflow_outputs(
+    called: &WorkflowDefinition,
+    job_outputs: &HashMap<String, HashMap<String, String>>,
+    env_context: &HashMap<String, String>,
+) -> Option<HashMap<String, String>> {
+    let declared = called
+        .on_raw
+        .get("workflow_call")?
+        .get("outputs")?
+        .as_mapping()?;
+    let ctx = crate::expression::ExpressionContext {
+        env_context,
+        step_outputs: &HashMap::new(),
+        matrix_combination: &None,
+        step_statuses: &HashMap::new(),
+        job_status: "success",
+        secrets_context: &HashMap::new(),
+        // `jobs.<id>.outputs.*` resolves through the needs context.
+        needs_context: job_outputs,
+        needs_results: &HashMap::new(),
+        user_env: &HashMap::new(),
+    };
+    let cwd = std::env::current_dir().ok()?;
+    Some(
+        declared
+            .iter()
+            .filter_map(|(name, definition)| {
+                let value = definition
+                    .get("value")
+                    .and_then(yaml_scalar_to_string)
+                    .unwrap_or_default();
+                let resolved = crate::substitution::preprocess_expressions(&value, &cwd, &ctx)
+                    .unwrap_or_default();
+                Some((name.as_str()?.to_string(), resolved))
+            })
+            .collect(),
+    )
+}
+
+/// Merge per-job outputs from a reusable workflow into a flat map, for called
+/// workflows that don't declare `on.workflow_call.outputs`.
 ///
-/// In GitHub Actions, reusable workflow outputs are declared via
-/// `on.workflow_call.outputs` which maps output names to job output
-/// expressions. Since we don't parse that declaration yet, we use a
-/// pragmatic approximation: flatten all job outputs into a single map.
 /// Jobs are iterated in sorted order by name for deterministic merging;
 /// later jobs (alphabetically) overwrite earlier jobs if keys collide.
 fn aggregate_reusable_workflow_outputs(
@@ -5129,6 +5503,43 @@ fn extract_language_info(image: &str) -> Option<(&'static str, Option<&str>)> {
     }
 }
 
+/// The env var holding an input, as read back by `inputs.<name>`.
+///
+/// Only for the `inputs` context. Docker and JavaScript actions keep hyphens in
+/// `INPUT_<NAME>`, because that is the name `core.getInput` looks up.
+fn input_env_key(name: &str) -> String {
+    format!("INPUT_{}", name.to_uppercase().replace('-', "_"))
+}
+
+/// YAML scalars as the strings they become in `with:` and `env:`.
+fn yaml_scalar_to_string(value: &serde_yaml::Value) -> Option<String> {
+    match value {
+        serde_yaml::Value::String(s) => Some(s.clone()),
+        serde_yaml::Value::Number(n) => Some(n.to_string()),
+        serde_yaml::Value::Bool(b) => Some(b.to_string()),
+        serde_yaml::Value::Null => Some(String::new()),
+        _ => None,
+    }
+}
+
+/// The calling step with its `with:` evaluated, so a composite action's
+/// `inputs.*` are values rather than `${{ }}` text from the caller's scope.
+fn composite_call_step(
+    ctx: &StepExecutionContext<'_>,
+    step_env: &HashMap<String, String>,
+    step_user_env: &HashMap<String, String>,
+) -> workflow::Step {
+    let expr_ctx = ctx.expr_context_with_env(step_env, step_user_env);
+    let mut step = ctx.step.clone();
+    if let Some(with) = &mut step.with {
+        for value in with.values_mut() {
+            *value = crate::substitution::preprocess_expressions(value, ctx.working_dir, &expr_ctx)
+                .unwrap_or_default();
+        }
+    }
+    step
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn execute_composite_action(
     step: &workflow::Step,
@@ -5204,22 +5615,19 @@ async fn execute_composite_action(
                             // Get default value if available
                             let default_value = input_def
                                 .get("default")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("");
+                                .and_then(yaml_scalar_to_string)
+                                .unwrap_or_default();
 
                             // Check if the input was provided in the 'with' section
                             let input_value = step
                                 .with
                                 .as_ref()
                                 .and_then(|with| with.get(input_name_str))
-                                .unwrap_or(&default_value.to_string())
+                                .unwrap_or(&default_value)
                                 .clone();
 
                             // Add to environment as INPUT_X
-                            action_env.insert(
-                                format!("INPUT_{}", input_name_str.to_uppercase()),
-                                input_value,
-                            );
+                            action_env.insert(input_env_key(input_name_str), input_value);
                         }
                     }
                 }
@@ -5288,7 +5696,9 @@ async fn execute_composite_action(
                 };
 
                 let should_run = match &composite_step.if_condition {
-                    Some(cond) => evaluate_condition_with_context(cond, &step_ctx.expr_context()),
+                    Some(cond) => {
+                        evaluate_step_condition(cond, working_dir, &step_ctx.expr_context())
+                    }
                     None => true,
                 };
 
@@ -5685,8 +6095,8 @@ fn convert_yaml_to_step(step_yaml: &serde_yaml::Value) -> Result<workflow::Step,
     let with = step_yaml.get("with").and_then(|v| v.as_mapping()).map(|m| {
         let mut with_map = HashMap::new();
         for (k, v) in m {
-            if let (Some(key), Some(value)) = (k.as_str(), v.as_str()) {
-                with_map.insert(key.to_string(), value.to_string());
+            if let (Some(key), Some(value)) = (k.as_str(), yaml_scalar_to_string(v)) {
+                with_map.insert(key.to_string(), value);
             }
         }
         with_map
@@ -5698,8 +6108,8 @@ fn convert_yaml_to_step(step_yaml: &serde_yaml::Value) -> Result<workflow::Step,
         .map(|m| {
             let mut env_map = HashMap::new();
             for (k, v) in m {
-                if let (Some(key), Some(value)) = (k.as_str(), v.as_str()) {
-                    env_map.insert(key.to_string(), value.to_string());
+                if let (Some(key), Some(value)) = (k.as_str(), yaml_scalar_to_string(v)) {
+                    env_map.insert(key.to_string(), value);
                 }
             }
             env_map
@@ -5710,12 +6120,17 @@ fn convert_yaml_to_step(step_yaml: &serde_yaml::Value) -> Result<workflow::Step,
     let final_run = run;
 
     // Extract continue_on_error
-    let continue_on_error = step_yaml.get("continue-on-error").and_then(|v| v.as_bool());
+    let continue_on_error = step_yaml.get("continue-on-error").and_then(|v| match v {
+        serde_yaml::Value::Bool(b) => Some(b.to_string()),
+        serde_yaml::Value::String(s) => Some(s.clone()),
+        _ => None,
+    });
 
+    // A null `if:` means no condition, not a condition that can't be parsed.
     let if_condition = step_yaml
         .get("if")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
+        .and_then(yaml_scalar_to_string)
+        .filter(|condition| !condition.is_empty());
 
     let id = step_yaml
         .get("id")
@@ -5841,8 +6256,9 @@ fn evaluate_job_condition(
     evaluate_condition_with_context(&effective, &ctx)
 }
 
-/// Resolve `include`/`exclude` expressions of a matrix against the contexts
-/// available to `strategy:`, which runs before any step of the job.
+/// Resolve every expression of a matrix (the whole matrix, an axis, or
+/// `include`/`exclude`) against the contexts available to `strategy:`, which
+/// runs before any step of the job.
 fn resolve_matrix_expressions(
     matrix: &wrkflw_matrix::MatrixConfig,
     env_context: &HashMap<String, String>,
@@ -5861,11 +6277,68 @@ fn resolve_matrix_expressions(
         needs_results,
         user_env,
     };
-    matrix.resolve_expressions(|expr| {
-        let inner = crate::expression::strip_expression_wrapper(expr);
-        // `fromJSON` yields the JSON text itself, and objects render as JSON.
-        crate::expression::evaluate(inner, &ctx).map(|value| value.to_output_string())
-    })
+    matrix.resolve_expressions(|expr| matrix_expression_json(expr, &ctx))
+}
+
+/// Evaluate a matrix expression to JSON text.
+///
+/// `ExprValue` objects are unordered, so going through one would sort the axes
+/// and with them the order jobs run in. `fromJSON(x)` hands back the text of `x`
+/// untouched instead, which keeps the order the author wrote.
+fn matrix_expression_json(
+    expr: &str,
+    ctx: &crate::expression::ExpressionContext<'_>,
+) -> Result<String, String> {
+    let inner = crate::expression::strip_expression_wrapper(expr);
+    if let Some(argument) = from_json_argument(inner) {
+        let text = crate::expression::evaluate(argument, ctx)?.to_output_string();
+        if serde_json::from_str::<serde_json::Value>(&text).is_ok() {
+            return Ok(text);
+        }
+    }
+    crate::expression::evaluate(inner, ctx).map(|value| value.to_output_string())
+}
+
+/// The argument of `expr` if all of it is one `fromJSON(...)` call.
+fn from_json_argument(expr: &str) -> Option<&str> {
+    let name = expr.get(..8)?;
+    if !name.eq_ignore_ascii_case("fromjson") {
+        return None;
+    }
+    let argument = expr[8..]
+        .trim_start()
+        .strip_prefix('(')?
+        .strip_suffix(')')?;
+    let mut depth = 0usize;
+    let mut quoted = false;
+    for ch in argument.chars() {
+        match ch {
+            '\'' => quoted = !quoted,
+            '(' if !quoted => depth += 1,
+            // The call closed early, as in `fromJSON(a) || fromJSON(b)`
+            ')' if !quoted => depth = depth.checked_sub(1)?,
+            _ => {}
+        }
+    }
+    Some(argument)
+}
+
+/// Evaluate a step `if:` condition. Unlike a job's, it may call `hashFiles`.
+fn evaluate_step_condition(
+    condition: &str,
+    working_dir: &Path,
+    ctx: &crate::expression::ExpressionContext<'_>,
+) -> bool {
+    match crate::substitution::expand_hash_files(condition, working_dir) {
+        Ok(expanded) => evaluate_condition_with_context(&expanded, ctx),
+        Err(e) => {
+            wrkflw_logging::warning(&format!(
+                "Condition '{}' failed: {} — treating as false (step will be skipped)",
+                condition, e
+            ));
+            false
+        }
+    }
 }
 
 /// Evaluate a job/step `if:` condition using the expression evaluator.
@@ -6046,6 +6519,35 @@ async fn resolve_secrets_for_context(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dynamic_matrix_keeps_axis_order_from_needs_output() {
+        let matrix = wrkflw_matrix::MatrixConfig::from_expression(
+            "${{ fromJSON(needs.setup.outputs.matrix) }}".to_string(),
+        );
+        let outputs = HashMap::from([(
+            "matrix".to_string(),
+            r#"{"zeta":["a","b"],"alpha":[1],"include":[{"zeta":"c","alpha":2}]}"#.to_string(),
+        )]);
+        let needs = HashMap::from([("setup".to_string(), outputs)]);
+        let results = HashMap::from([("setup".to_string(), "success".to_string())]);
+        let env = HashMap::new();
+
+        let resolved = resolve_matrix_expressions(&matrix, &env, &env, &needs, &results).unwrap();
+
+        let axes: Vec<_> = resolved.parameters.keys().collect();
+        assert_eq!(axes, ["zeta", "alpha"]);
+        assert_eq!(wrkflw_matrix::expand_matrix(&resolved).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn from_json_argument_only_matches_a_single_call() {
+        assert_eq!(from_json_argument("fromJSON(a.b)"), Some("a.b"));
+        assert_eq!(from_json_argument("fromjson (f('x)'))"), Some("f('x)')"));
+        assert_eq!(from_json_argument("fromJSON(a) || fromJSON(b)"), None);
+        assert_eq!(from_json_argument("toJSON(a)"), None);
+        assert_eq!(from_json_argument("github.event"), None);
+    }
 
     #[test]
     fn workspace_copy_keeps_forge_dirs_and_skips_other_hidden_dirs() {
@@ -6326,6 +6828,7 @@ mod tests {
             secrets: None,
             timeout_minutes: None,
             defaults: None,
+            continue_on_error: None,
         }
     }
 
@@ -7322,6 +7825,7 @@ runs:
         env_vars: Vec<(String, String)>,
         entrypoint: Option<String>,
         volumes: Vec<(PathBuf, PathBuf)>,
+        working_dir: PathBuf,
         /// Contents of the host file the final `cmd` element resolves to
         /// through `volumes`, if any (used to verify a generated script is
         /// actually reachable inside the container).
@@ -7335,7 +7839,7 @@ runs:
             image: &str,
             cmd: &[&str],
             env_vars: &[(&str, &str)],
-            _working_dir: &Path,
+            working_dir: &Path,
             volumes: &[(&Path, &Path)],
             entrypoint: Option<&str>,
         ) -> Result<ContainerOutput, ContainerError> {
@@ -7363,6 +7867,7 @@ runs:
                     .collect(),
                 entrypoint: entrypoint.map(|s| s.to_string()),
                 volumes: owned_volumes,
+                working_dir: working_dir.to_path_buf(),
                 script,
             });
             Ok(ContainerOutput {
@@ -9074,6 +9579,394 @@ runs:
     }
 
     #[tokio::test]
+    async fn working_directory_evaluates_expressions_within_the_workspace() {
+        let job_env = HashMap::from([("GITHUB_WORKSPACE".to_string(), "/host/repo".to_string())]);
+
+        for (wd, expected) in [
+            ("${{ github.workspace }}/src", Some("/github/workspace/src")),
+            ("${{ github.workspace }}", Some("/github/workspace")),
+            ("${{ github.workspace }}/", Some("/github/workspace")),
+            ("${{ github.workspace }}/../escape", None),
+            ("${{ github.workspace }}-other/src", None),
+            ("${{ github.workspace == }}", None),
+        ] {
+            let runtime = MockContainerRuntime::default();
+            let mut step = make_run_step("echo ok");
+            step.working_directory = Some(wd.to_string());
+
+            let result = run_step(&step, &job_env, &runtime).await;
+            let calls = runtime.run_calls.lock().unwrap();
+            match expected {
+                Some(path) => {
+                    assert_eq!(result.status, StepStatus::Success, "{}", wd);
+                    assert_eq!(calls[0].working_dir, Path::new(path), "{}", wd);
+                }
+                None => {
+                    assert_eq!(result.status, StepStatus::Failure, "{}", wd);
+                    assert!(result.output.contains("Invalid working-directory"));
+                    assert!(calls.is_empty(), "{}", wd);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn relative_to_workspace_compares_path_components() {
+        let relative = |path: &str| relative_to_workspace(path, "/host/repo");
+        assert_eq!(relative("/host/repo/src"), "src");
+        assert_eq!(relative("/host/repo"), "");
+        assert_eq!(relative("/host/repo-old/src"), "/host/repo-old/src");
+        assert_eq!(relative("src"), "src");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn relative_to_workspace_handles_windows_paths() {
+        let relative = relative_to_workspace(r"C:\repo/src", r"C:\repo");
+        assert_eq!(relative, "src");
+    }
+
+    #[test]
+    fn seed_runtime_context_applies_container_context_only_to_container_runtimes() {
+        let host_env = || HashMap::from([("RUNNER_OS".to_string(), "macOS".to_string())]);
+
+        for runtime in [RuntimeType::Emulation, RuntimeType::SecureEmulation] {
+            let mut env = host_env();
+            seed_runtime_context(&mut env, &runtime, CiPlatform::GitHub);
+            assert_eq!(env["RUNNER_OS"], "macOS", "{:?}", runtime);
+            assert_eq!(env["WRKFLW_RUNTIME_MODE"], runtime.mode_name());
+        }
+
+        let mut env = host_env();
+        seed_runtime_context(&mut env, &RuntimeType::Docker, CiPlatform::GitHub);
+        assert_eq!(env["RUNNER_OS"], "Linux");
+    }
+
+    #[test]
+    fn gitlab_pipeline_sees_container_paths_only_under_a_container_runtime() {
+        let pipeline: Pipeline = serde_yaml::from_str("stages: [build]").unwrap();
+        let host = Path::new("/host/workspace");
+
+        let mut env = create_gitlab_context(&pipeline, host);
+        seed_runtime_context(&mut env, &RuntimeType::Podman, CiPlatform::GitLab);
+        assert_eq!(env["CI_PROJECT_DIR"], "/github/workspace");
+        assert_eq!(env["GITHUB_WORKSPACE"], "/github/workspace");
+
+        let mut env = create_gitlab_context(&pipeline, host);
+        seed_runtime_context(&mut env, &RuntimeType::Emulation, CiPlatform::GitLab);
+        assert_eq!(env["CI_PROJECT_DIR"], "/host/workspace");
+    }
+
+    #[test]
+    fn workflow_env_expressions_see_what_steps_see() {
+        let mut workflow = minimal_workflow();
+        for (key, value) in [
+            ("BUILD_DIR", "${{ github.workspace }}/build"),
+            ("TARGET_OS", "${{ runner.os }}"),
+        ] {
+            workflow.env.insert(key.to_string(), value.to_string());
+        }
+        let workspace = Path::new("/host/workspace");
+
+        let (env, user_env) = github_run_env(&workflow, workspace, &RuntimeType::Docker).unwrap();
+        assert_eq!(env["BUILD_DIR"], "/github/workspace/build");
+        assert_eq!(env["TARGET_OS"], "Linux");
+        assert_eq!(user_env["BUILD_DIR"], "/github/workspace/build");
+
+        let (env, _) = github_run_env(&workflow, workspace, &RuntimeType::Emulation).unwrap();
+        assert_eq!(
+            env["BUILD_DIR"],
+            format!("{}/build", env["GITHUB_WORKSPACE"])
+        );
+        assert_ne!(env["GITHUB_WORKSPACE"], "/github/workspace");
+    }
+
+    #[test]
+    fn initialize_runtime_reports_the_runtime_it_returns() {
+        let effective = |runtime| {
+            initialize_runtime(runtime, false, &KubernetesConfig::default())
+                .map(|(_, effective)| effective)
+                .unwrap()
+        };
+        assert_eq!(effective(RuntimeType::Emulation), RuntimeType::Emulation);
+        assert_eq!(
+            effective(RuntimeType::SecureEmulation),
+            RuntimeType::SecureEmulation
+        );
+    }
+
+    /// Run `step` in a container-less job with `job_env` and the shared stores.
+    async fn run_step(
+        step: &Step,
+        job_env: &HashMap<String, String>,
+        runtime: &MockContainerRuntime,
+    ) -> StepResult {
+        let working_dir = std::env::current_dir().unwrap();
+        run_step_with(
+            step,
+            job_env,
+            &working_dir,
+            runtime,
+            test_services(),
+            &TEST_PENDING_CACHE_SAVES,
+        )
+        .await
+    }
+
+    /// Run `step` as a job with `job_env` would, with its own stores.
+    async fn run_step_in(
+        step: &Step,
+        job_env: &HashMap<String, String>,
+        working_dir: &Path,
+        runtime: &MockContainerRuntime,
+        artifact_store: &crate::artifacts::ArtifactStore,
+        cache_store: &crate::cache::CacheStore,
+        pending: &std::sync::Mutex<Vec<PendingCacheSave>>,
+    ) -> StepResult {
+        let services = JobServices {
+            artifact_store,
+            cache_store,
+            ..test_services()
+        };
+        run_step_with(step, job_env, working_dir, runtime, services, pending).await
+    }
+
+    async fn run_step_with(
+        step: &Step,
+        job_env: &HashMap<String, String>,
+        working_dir: &Path,
+        runtime: &MockContainerRuntime,
+        services: JobServices<'_>,
+        pending: &std::sync::Mutex<Vec<PendingCacheSave>>,
+    ) -> StepResult {
+        let workflow = minimal_workflow();
+        let ctx = StepExecutionContext {
+            step,
+            step_idx: 0,
+            job_env,
+            job_user_env: job_env,
+            working_dir,
+            runtime,
+            workflow: &workflow,
+            runner_image: "ubuntu:latest",
+            verbose: false,
+            matrix_combination: &None,
+            container_config: None,
+            workflow_defaults: None,
+            job_defaults: None,
+            step_outputs: &HashMap::new(),
+            step_statuses: &HashMap::new(),
+            job_status: "success",
+            services,
+            pending_cache_saves: pending,
+        };
+        execute_step(ctx).await.unwrap()
+    }
+
+    /// What `github.workspace` is under a container runtime and in emulation.
+    /// Neither is the job directory the actions work in.
+    fn workspace_envs() -> [HashMap<String, String>; 2] {
+        [
+            HashMap::from([
+                (
+                    "GITHUB_WORKSPACE".to_string(),
+                    "/github/workspace".to_string(),
+                ),
+                ("WRKFLW_RUNTIME_MODE".to_string(), "docker".to_string()),
+            ]),
+            HashMap::from([
+                ("GITHUB_WORKSPACE".to_string(), "/host/repo".to_string()),
+                ("WRKFLW_RUNTIME_MODE".to_string(), "emulation".to_string()),
+            ]),
+        ]
+    }
+
+    #[tokio::test]
+    async fn artifact_paths_under_github_workspace_resolve_to_the_job_directory() {
+        for job_env in workspace_envs() {
+            let runtime = MockContainerRuntime::default();
+            let working_dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir(working_dir.path().join("dist")).unwrap();
+            std::fs::write(working_dir.path().join("dist/app.txt"), "built").unwrap();
+            let artifact_dir = tempfile::tempdir().unwrap();
+            let artifacts = crate::artifacts::ArtifactStore::new(artifact_dir.path()).unwrap();
+            let cache_dir = tempfile::tempdir().unwrap();
+            let cache =
+                crate::cache::CacheStore::with_root(cache_dir.path().to_path_buf()).unwrap();
+            let pending = std::sync::Mutex::new(Vec::new());
+
+            let upload = make_step(
+                "upload",
+                "actions/upload-artifact@v4",
+                Some(HashMap::from([
+                    ("name".to_string(), "app".to_string()),
+                    (
+                        "path".to_string(),
+                        "${{ github.workspace }}/dist/*".to_string(),
+                    ),
+                ])),
+                HashMap::new(),
+            );
+            let result = run_step_in(
+                &upload,
+                &job_env,
+                working_dir.path(),
+                &runtime,
+                &artifacts,
+                &cache,
+                &pending,
+            )
+            .await;
+            assert_eq!(result.status, StepStatus::Success, "{}", result.output);
+
+            let download = make_step(
+                "download",
+                "actions/download-artifact@v4",
+                Some(HashMap::from([
+                    ("name".to_string(), "app".to_string()),
+                    (
+                        "path".to_string(),
+                        "${{ github.workspace }}/out".to_string(),
+                    ),
+                ])),
+                HashMap::new(),
+            );
+            let result = run_step_in(
+                &download,
+                &job_env,
+                working_dir.path(),
+                &runtime,
+                &artifacts,
+                &cache,
+                &pending,
+            )
+            .await;
+            assert_eq!(result.status, StepStatus::Success, "{}", result.output);
+            assert!(working_dir.path().join("out").exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn cache_paths_under_github_workspace_resolve_to_the_job_directory() {
+        for job_env in workspace_envs() {
+            let runtime = MockContainerRuntime::default();
+            let working_dir = tempfile::tempdir().unwrap();
+            let artifact_dir = tempfile::tempdir().unwrap();
+            let artifacts = crate::artifacts::ArtifactStore::new(artifact_dir.path()).unwrap();
+            let cache_dir = tempfile::tempdir().unwrap();
+            let cache =
+                crate::cache::CacheStore::with_root(cache_dir.path().to_path_buf()).unwrap();
+            let pending = std::sync::Mutex::new(Vec::new());
+            let step = make_step(
+                "cache",
+                "actions/cache@v4",
+                Some(HashMap::from([
+                    ("key".to_string(), "deps-v1".to_string()),
+                    (
+                        "path".to_string(),
+                        "${{ github.workspace }}/deps\nvendor".to_string(),
+                    ),
+                ])),
+                HashMap::new(),
+            );
+
+            let result = run_step_in(
+                &step,
+                &job_env,
+                working_dir.path(),
+                &runtime,
+                &artifacts,
+                &cache,
+                &pending,
+            )
+            .await;
+            assert_eq!(result.status, StepStatus::Success, "{}", result.output);
+            let saved: Vec<String> = pending
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|save| save.path.clone())
+                .collect();
+            assert_eq!(saved, ["deps", "vendor"]);
+        }
+    }
+
+    #[test]
+    fn workspace_itself_is_not_mistaken_for_a_missing_path_input() {
+        let job_env = HashMap::from([("GITHUB_WORKSPACE".to_string(), "/host/repo".to_string())]);
+        for (path, expected) in [
+            ("/host/repo", "."),
+            ("/host/repo/", "."),
+            ("/host/repo/src", "src"),
+            ("", ""),
+        ] {
+            assert_eq!(workspace_relative_input(path, &job_env), expected);
+        }
+    }
+
+    #[test]
+    fn runner_temp_is_on_the_host_directory_mounted_for_the_job() {
+        let mut job_env = HashMap::new();
+        seed_runtime_context(&mut job_env, &RuntimeType::Docker, CiPlatform::GitHub);
+        let _files = environment::isolate_github_environment_files(&mut job_env).unwrap();
+
+        let mut step_env = job_env.clone();
+        let (_, github_mount) = prepare_container_mounts(&mut step_env, &job_env, None, false);
+        let (host, container) = github_mount.unwrap();
+
+        let relative = Path::new(&step_env["RUNNER_TEMP"])
+            .strip_prefix(&container)
+            .unwrap();
+        assert!(host.join(relative).is_dir());
+    }
+
+    #[tokio::test]
+    async fn container_step_receives_the_container_context() {
+        let mut job_env = HashMap::from([
+            ("RUNNER_OS".to_string(), "macOS".to_string()),
+            ("GITHUB_WORKSPACE".to_string(), "/Users/me/repo".to_string()),
+        ]);
+        seed_runtime_context(&mut job_env, &RuntimeType::Docker, CiPlatform::GitHub);
+
+        let runtime = MockContainerRuntime::default();
+        let step = make_run_step("echo ok");
+        let result = run_step(&step, &job_env, &runtime).await;
+        assert_eq!(result.status, StepStatus::Success);
+
+        let calls = runtime.run_calls.lock().unwrap();
+        let env: HashMap<_, _> = calls[0].env_vars.iter().cloned().collect();
+        assert_eq!(env["RUNNER_OS"], "Linux");
+        assert_eq!(env["GITHUB_WORKSPACE"], "/github/workspace");
+    }
+
+    #[tokio::test]
+    async fn working_directory_outside_the_workspace_is_rejected_even_for_runner_temp() {
+        let mut job_env = HashMap::new();
+        seed_runtime_context(&mut job_env, &RuntimeType::Docker, CiPlatform::GitHub);
+
+        let runtime = MockContainerRuntime::default();
+        let mut step = make_run_step("echo ok");
+        step.working_directory = Some("${{ runner.temp }}/build".to_string());
+        let result = run_step(&step, &job_env, &runtime).await;
+        assert_eq!(result.status, StepStatus::Failure);
+        assert!(result.output.contains("must be within workspace"));
+    }
+
+    #[tokio::test]
+    async fn working_directory_sees_the_steps_own_env() {
+        let job_env = HashMap::from([("GITHUB_WORKSPACE".to_string(), "/host/repo".to_string())]);
+        let runtime = MockContainerRuntime::default();
+        let mut step = make_run_step("echo ok");
+        step.env.insert("SUBDIR".to_string(), "src".to_string());
+        step.working_directory = Some("${{ env.SUBDIR }}".to_string());
+
+        let result = run_step(&step, &job_env, &runtime).await;
+        assert_eq!(result.status, StepStatus::Success, "{}", result.output);
+        let calls = runtime.run_calls.lock().unwrap();
+        assert_eq!(calls[0].working_dir, Path::new("/github/workspace/src"));
+    }
+
+    #[tokio::test]
     async fn working_directory_rejects_absolute_path() {
         let runtime = MockContainerRuntime::default();
         let workflow = minimal_workflow();
@@ -9258,43 +10151,50 @@ runs:
 
     #[tokio::test]
     async fn defaults_cascade_working_directory_from_job() {
-        let runtime = MockContainerRuntime::default();
-        let job_defaults = workflow::Defaults {
-            run: Some(workflow::DefaultsRun {
-                shell: None,
-                working_directory: Some("src".to_string()),
-            }),
-        };
         let workflow = minimal_workflow();
-        let job_env = HashMap::new();
+        let job_env = HashMap::from([("GITHUB_WORKSPACE".to_string(), "/host/repo".to_string())]);
         let working_dir = std::env::current_dir().unwrap();
-
         let step = make_run_step("echo ok");
 
-        let ctx = StepExecutionContext {
-            step: &step,
-            step_idx: 0,
-            job_env: &job_env,
-            job_user_env: &job_env,
-            working_dir: &working_dir,
-            runtime: &runtime,
-            workflow: &workflow,
-            runner_image: "ubuntu:latest",
-            verbose: false,
-            matrix_combination: &None,
-            container_config: None,
-            workflow_defaults: None,
-            job_defaults: Some(&job_defaults),
-            step_outputs: &HashMap::new(),
-            step_statuses: &HashMap::new(),
-            job_status: "success",
-            services: test_services(),
-            pending_cache_saves: &TEST_PENDING_CACHE_SAVES,
-        };
+        for wd in ["src", "${{ github.workspace }}/src"] {
+            let runtime = MockContainerRuntime::default();
+            let job_defaults = workflow::Defaults {
+                run: Some(workflow::DefaultsRun {
+                    shell: None,
+                    working_directory: Some(wd.to_string()),
+                }),
+            };
+            let ctx = StepExecutionContext {
+                step: &step,
+                step_idx: 0,
+                job_env: &job_env,
+                job_user_env: &job_env,
+                working_dir: &working_dir,
+                runtime: &runtime,
+                workflow: &workflow,
+                runner_image: "ubuntu:latest",
+                verbose: false,
+                matrix_combination: &None,
+                container_config: None,
+                workflow_defaults: None,
+                job_defaults: Some(&job_defaults),
+                step_outputs: &HashMap::new(),
+                step_statuses: &HashMap::new(),
+                job_status: "success",
+                services: test_services(),
+                pending_cache_saves: &TEST_PENDING_CACHE_SAVES,
+            };
 
-        let result = execute_step(ctx).await.unwrap();
-        assert_eq!(result.status, StepStatus::Success);
-        // Should succeed — "src" is a valid subdirectory path
+            let result = execute_step(ctx).await.unwrap();
+            assert_eq!(result.status, StepStatus::Success, "{}", wd);
+            let calls = runtime.run_calls.lock().unwrap();
+            assert_eq!(
+                calls[0].working_dir,
+                Path::new("/github/workspace/src"),
+                "{}",
+                wd
+            );
+        }
     }
 
     // --- sanitize_timeout_minutes tests ---
@@ -9533,6 +10433,236 @@ runs:
         assert_eq!(result.get("missing").unwrap(), "");
     }
 
+    fn workflow_with_trigger(on: &str) -> WorkflowDefinition {
+        let mut workflow = minimal_workflow();
+        workflow.on_raw = serde_yaml::from_str(on).unwrap();
+        workflow
+    }
+
+    #[test]
+    fn declared_reusable_outputs_map_job_outputs_to_their_names() {
+        let called = workflow_with_trigger(
+            "workflow_call:\n  outputs:\n    result:\n      value: ${{ jobs.inner.outputs.r }}-x\n    missing:\n      value: ${{ jobs.none.outputs.r }}\n",
+        );
+        let job_outputs = HashMap::from([(
+            "inner".to_string(),
+            HashMap::from([("r".to_string(), "1".to_string())]),
+        )]);
+
+        let outputs =
+            declared_reusable_workflow_outputs(&called, &job_outputs, &HashMap::new()).unwrap();
+
+        assert_eq!(outputs["result"], "1-x");
+        assert_eq!(outputs["missing"], "");
+        assert!(!outputs.contains_key("r"));
+    }
+
+    #[test]
+    fn declared_reusable_outputs_read_inputs_and_keep_non_string_values() {
+        let called = workflow_with_trigger(
+            "workflow_call:\n  outputs:\n    prefixed:\n      value: ${{ inputs.prefix }}-x\n    number:\n      value: 5\n    no-value:\n      description: nothing\n",
+        );
+        let child_env = HashMap::from([("INPUT_PREFIX".to_string(), "p".to_string())]);
+
+        let outputs =
+            declared_reusable_workflow_outputs(&called, &HashMap::new(), &child_env).unwrap();
+
+        assert_eq!(outputs["prefixed"], "p-x");
+        assert_eq!(outputs["number"], "5");
+        assert_eq!(outputs["no-value"], "");
+    }
+
+    #[test]
+    fn undeclared_reusable_outputs_fall_back_to_flattening() {
+        let called = workflow_with_trigger("workflow_call: {}\n");
+        assert!(
+            declared_reusable_workflow_outputs(&called, &HashMap::new(), &HashMap::new()).is_none()
+        );
+    }
+
+    #[test]
+    fn composite_steps_keep_non_string_scalars() {
+        let step = convert_yaml_to_step(
+            &serde_yaml::from_str(
+                "run: echo\nif: true\nenv:\n  PORT: 5432\n  ON: true\nwith:\n  n: 1.5\n",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(step.env["PORT"], "5432");
+        assert_eq!(step.env["ON"], "true");
+        assert_eq!(step.with.unwrap()["n"], "1.5");
+        assert_eq!(step.if_condition.as_deref(), Some("true"));
+    }
+
+    #[test]
+    fn composite_step_with_null_if_has_no_condition() {
+        let step =
+            convert_yaml_to_step(&serde_yaml::from_str("run: echo\nif: ~\n").unwrap()).unwrap();
+        assert_eq!(step.if_condition, None);
+    }
+
+    #[test]
+    fn input_env_keys_match_what_the_inputs_context_reads() {
+        assert_eq!(input_env_key("my-input"), "INPUT_MY_INPUT");
+        assert_eq!(input_env_key("name"), "INPUT_NAME");
+    }
+
+    #[tokio::test]
+    async fn composite_inputs_get_hyphenated_names_and_scalar_defaults() {
+        let action_dir = tempfile::tempdir().unwrap();
+        fs::write(
+            action_dir.path().join("action.yml"),
+            r#"
+name: test action
+inputs:
+  my-input:
+    description: hyphenated
+  count:
+    description: numeric default
+    default: 3
+runs:
+  using: composite
+  steps:
+    - run: echo hi
+      env:
+        A: ${{ inputs.my-input }}
+        B: ${{ inputs.count }}
+"#,
+        )
+        .unwrap();
+
+        let runtime = MockContainerRuntime::default();
+        let job_env = HashMap::new();
+        let working_dir = tempfile::tempdir().unwrap();
+        let mut step = make_run_step("noop");
+        step.with = Some(HashMap::from([("my-input".to_string(), "v".to_string())]));
+        let services = test_services();
+        let pending = std::sync::Mutex::new(Vec::<PendingCacheSave>::new());
+
+        let result = execute_composite_action(
+            &step,
+            action_dir.path(),
+            &job_env,
+            &job_env,
+            working_dir.path(),
+            &runtime,
+            "ubuntu:latest",
+            false,
+            &services,
+            &pending,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.status, StepStatus::Success);
+
+        let calls = runtime.run_calls.lock().unwrap();
+        let env = |key: &str| {
+            calls[0]
+                .env_vars
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(env("A"), Some("v"));
+        assert_eq!(env("B"), Some("3"));
+    }
+
+    #[tokio::test]
+    async fn composite_with_is_evaluated_in_each_callers_scope() {
+        // `uses: ./x` resolves against the process cwd, so the actions have to
+        // live under it.
+        let actions = tempfile::tempdir_in(".").unwrap();
+        let relative = Path::new(actions.path().file_name().unwrap());
+        let outer_uses = format!("./{}", relative.join("outer").display());
+        let inner_uses = format!("./{}", relative.join("inner").display());
+        fs::create_dir(actions.path().join("outer")).unwrap();
+        fs::create_dir(actions.path().join("inner")).unwrap();
+        fs::write(
+            actions.path().join("outer/action.yml"),
+            format!(
+                r#"
+name: outer
+inputs:
+  who:
+    description: from the job
+runs:
+  using: composite
+  steps:
+    - uses: {inner_uses}
+      with:
+        value: ${{{{ inputs.who }}}}
+"#
+            ),
+        )
+        .unwrap();
+        fs::write(
+            actions.path().join("inner/action.yml"),
+            r#"
+name: inner
+inputs:
+  value:
+    description: from the outer action
+runs:
+  using: composite
+  steps:
+    - run: echo hi
+      env:
+        DIRECT: ${{ inputs.value }}
+"#,
+        )
+        .unwrap();
+
+        let runtime = MockContainerRuntime::default();
+        let workflow = minimal_workflow();
+        let job_env = HashMap::from([("WHO".to_string(), "resolved".to_string())]);
+        let working_dir = tempfile::tempdir().unwrap();
+        let step = make_step(
+            "composite",
+            &outer_uses,
+            Some(HashMap::from([(
+                "who".to_string(),
+                "${{ env.WHO }}".to_string(),
+            )])),
+            HashMap::new(),
+        );
+
+        let ctx = StepExecutionContext {
+            step: &step,
+            step_idx: 0,
+            job_env: &job_env,
+            job_user_env: &job_env,
+            working_dir: working_dir.path(),
+            runtime: &runtime,
+            workflow: &workflow,
+            runner_image: "ubuntu:latest",
+            verbose: false,
+            matrix_combination: &None,
+            container_config: None,
+            workflow_defaults: None,
+            job_defaults: None,
+            step_outputs: &HashMap::new(),
+            step_statuses: &HashMap::new(),
+            job_status: "success",
+            services: test_services(),
+            pending_cache_saves: &TEST_PENDING_CACHE_SAVES,
+        };
+
+        let result = execute_step(ctx).await.unwrap();
+        assert_eq!(result.status, StepStatus::Success, "{}", result.output);
+
+        let calls = runtime.run_calls.lock().unwrap();
+        let env = |key: &str| {
+            calls[0]
+                .env_vars
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(env("DIRECT"), Some("resolved"));
+        assert_eq!(env("INPUT_VALUE"), Some("resolved"));
+    }
+
     #[test]
     fn aggregate_reusable_workflow_outputs_merges_all_jobs() {
         let mut job_outputs = HashMap::new();
@@ -9664,6 +10794,152 @@ runs:
     }
 
     // ---- Integration tests for artifact, cache, and needs.* wiring ----
+
+    /// Run an upload-artifact step in an empty workspace.
+    async fn upload_matching_nothing(if_no_files_found: Option<&str>) -> (StepResult, Vec<String>) {
+        let mut with = HashMap::new();
+        if let Some(value) = if_no_files_found {
+            with.insert("if-no-files-found".to_string(), value.to_string());
+        }
+        upload_step(with, "nothing/here", &[]).await
+    }
+
+    /// Run an upload-artifact step over a workspace holding `files`.
+    async fn upload_step(
+        mut with: HashMap<String, String>,
+        path: &str,
+        files: &[&str],
+    ) -> (StepResult, Vec<String>) {
+        let runtime = MockContainerRuntime::default();
+        let workflow = minimal_workflow();
+        let working_dir = tempfile::tempdir().unwrap();
+        let artifact_dir = tempfile::tempdir().unwrap();
+        let artifact_store = crate::artifacts::ArtifactStore::new(artifact_dir.path()).unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache_store =
+            crate::cache::CacheStore::with_root(cache_dir.path().to_path_buf()).unwrap();
+        let pending = std::sync::Mutex::new(Vec::<PendingCacheSave>::new());
+
+        for file in files {
+            std::fs::write(working_dir.path().join(file), "x").unwrap();
+        }
+
+        with.insert("name".to_string(), "missing".to_string());
+        with.insert("path".to_string(), path.to_string());
+        let step = make_step(
+            "upload",
+            "actions/upload-artifact@v4",
+            Some(with),
+            HashMap::new(),
+        );
+        let job_env = HashMap::new();
+        let ctx = StepExecutionContext {
+            step: &step,
+            step_idx: 0,
+            job_env: &job_env,
+            job_user_env: &job_env,
+            working_dir: working_dir.path(),
+            runtime: &runtime,
+            workflow: &workflow,
+            runner_image: "ubuntu:latest",
+            verbose: false,
+            matrix_combination: &None,
+            container_config: None,
+            workflow_defaults: None,
+            job_defaults: None,
+            step_outputs: &HashMap::new(),
+            step_statuses: &HashMap::new(),
+            job_status: "success",
+            services: JobServices {
+                secret_manager: None,
+                secret_masker: None,
+                secrets_context: &HashMap::new(),
+                needs_context: &HashMap::new(),
+                needs_results: &HashMap::new(),
+                artifact_store: &artifact_store,
+                cache_store: &cache_store,
+                platform_overrides: &HashMap::new(),
+            },
+            pending_cache_saves: &pending,
+        };
+
+        let result = execute_step(ctx).await.unwrap();
+        (result, artifact_store.list().await)
+    }
+
+    #[tokio::test]
+    async fn upload_with_no_files_passes_by_default_and_on_warn_and_ignore() {
+        for mode in [None, Some("warn"), Some("ignore")] {
+            let (result, artifacts) = upload_matching_nothing(mode).await;
+            assert_eq!(result.status, StepStatus::Success, "{:?}", mode);
+            assert!(result.output.contains("nothing/here"), "{:?}", mode);
+            assert!(artifacts.is_empty(), "{:?}", mode);
+        }
+    }
+
+    #[tokio::test]
+    async fn upload_with_no_files_fails_on_error() {
+        let (result, artifacts) = upload_matching_nothing(Some("error")).await;
+        assert_eq!(result.status, StepStatus::Failure);
+        assert!(result.output.contains("nothing/here"));
+        assert!(artifacts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn upload_rejects_an_unrecognized_if_no_files_found() {
+        for value in ["fail", "ERROR", ""] {
+            let (result, _) = upload_matching_nothing(Some(value)).await;
+            assert_eq!(result.status, StepStatus::Failure, "{:?}", value);
+            assert!(
+                result.output.contains("Unrecognized if-no-files-found"),
+                "{:?}: {}",
+                value,
+                result.output
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn upload_trims_its_inputs_as_get_input_does() {
+        let (result, _) = upload_matching_nothing(Some(" error\n")).await;
+        assert_eq!(result.status, StepStatus::Failure);
+        assert!(result.output.contains("No files were found"));
+
+        let with = HashMap::from([("include-hidden-files".to_string(), " true\n".to_string())]);
+        let (result, artifacts) = upload_step(with, ".env", &[".env"]).await;
+        assert_eq!(result.status, StepStatus::Success);
+        assert_eq!(artifacts.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn upload_rejects_an_unrecognized_overwrite() {
+        let with = HashMap::from([("overwrite".to_string(), "yes".to_string())]);
+        let (result, _) = upload_step(with, "a.txt", &["a.txt"]).await;
+        assert_eq!(result.status, StepStatus::Failure);
+        assert!(result.output.contains("Unrecognized overwrite"));
+    }
+
+    #[tokio::test]
+    async fn upload_passes_include_hidden_files() {
+        let hidden = |value: Option<&str>| {
+            let mut with = HashMap::new();
+            if let Some(value) = value {
+                with.insert("include-hidden-files".to_string(), value.to_string());
+            }
+            with
+        };
+        let (result, artifacts) = upload_step(hidden(None), ".env", &[".env"]).await;
+        assert_eq!(result.status, StepStatus::Success);
+        assert!(artifacts.is_empty());
+
+        let (result, artifacts) = upload_step(hidden(Some("true")), ".env", &[".env"]).await;
+        assert_eq!(result.status, StepStatus::Success);
+        assert_eq!(artifacts.len(), 1);
+
+        let (result, _) = upload_step(hidden(Some("yes")), ".env", &[".env"]).await;
+        assert_eq!(result.status, StepStatus::Failure);
+        assert!(result.output.contains("Unrecognized include-hidden-files"));
+    }
 
     #[tokio::test]
     async fn upload_artifact_step_wiring() {
@@ -9954,13 +11230,9 @@ runs:
             dl_result.output
         );
 
-        let downloaded = std::fs::read_to_string(
-            dl_workspace
-                .path()
-                .join("dl")
-                .join("artifact-dir/payload.txt"),
-        )
-        .expect("downloaded payload.txt should exist");
+        let downloaded =
+            std::fs::read_to_string(dl_workspace.path().join("dl").join("payload.txt"))
+                .expect("downloaded payload.txt should exist");
         assert_eq!(downloaded, "hello\n");
     }
 
@@ -10243,11 +11515,11 @@ runs:
         let artifact_dir = tempfile::tempdir().unwrap();
         let artifact_store = crate::artifacts::ArtifactStore::new(artifact_dir.path()).unwrap();
         artifact_store
-            .upload("art-a", "a.txt", working_dir.path())
+            .upload("art-a", "a.txt", working_dir.path(), Default::default())
             .await
             .unwrap();
         artifact_store
-            .upload("art-b", "b.txt", working_dir.path())
+            .upload("art-b", "b.txt", working_dir.path(), Default::default())
             .await
             .unwrap();
 

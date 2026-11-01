@@ -1,5 +1,31 @@
 # Breaking Changes
 
+## `actions/upload-artifact` follows GitHub's layout and rules (unreleased)
+
+Artifact paths are now relative to where the `path:` search started, as on
+GitHub. After uploading `out/*` or `out/f.txt` and downloading into `got/`, the
+file is at `got/f.txt`, not `got/out/f.txt`. Update steps that read the old path.
+
+A step that matches no files now passes with a warning. Set
+`if-no-files-found: error` to keep failing, or `ignore` to silence the warning.
+A missing artifact otherwise shows up at download, or not at all.
+
+`!` lines apply in order, so a later line can re-include a file. A `path:` line
+outside the workspace now fails the step instead of being skipped.
+
+Hidden files are skipped unless `include-hidden-files: true` is set, as in
+upload-artifact v4. A file or directory is hidden if its name starts with a dot,
+so `path: .` no longer uploads `.git`, and `path: .config/` matches nothing.
+
+Uploading to an existing artifact name now fails the step, as on GitHub. Files
+used to be merged into the earlier upload. Give each matrix job its own name, or
+set `overwrite: true` to replace the artifact. With `overwrite: true`, parallel
+jobs sharing a name keep exactly one job's files, and which one is not defined.
+
+A wildcard line that matches a directory now selects everything below it, as on
+GitHub. `packages/*/dist` uploads the contents of each `dist`, `!**/node_modules`
+excludes the contents, and `out/*` includes files in subdirectories of `out`.
+
 ## `ExecutionConfig` gained a `platform_overrides` field (unreleased)
 
 Code that builds `wrkflw_executor::ExecutionConfig` as a struct literal must set

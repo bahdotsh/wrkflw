@@ -449,8 +449,8 @@ fn truncate(s: &str, n: usize) -> String {
 }
 
 /// The size shown on a job's matrix badge: its axis count, or for a matrix made
-/// only of `include` entries, the entry count (`?` while that is only known at
-/// run time). `None` when the job has no effective matrix.
+/// only of `include` entries or literal combinations, their count (`?` while
+/// that is only known at run time). `None` when the job has no effective matrix.
 fn matrix_size_label(matrix: &wrkflw_matrix::MatrixConfig) -> Option<String> {
     use wrkflw_matrix::MatrixEntries;
 
@@ -459,6 +459,9 @@ fn matrix_size_label(matrix: &wrkflw_matrix::MatrixConfig) -> Option<String> {
     }
     if !matrix.parameters.is_empty() {
         return Some(matrix.parameters.len().to_string());
+    }
+    if let Some(combinations) = &matrix.combinations {
+        return (!combinations.is_empty()).then(|| combinations.len().to_string());
     }
     match &matrix.include {
         MatrixEntries::Expression(_) => Some("?".to_string()),

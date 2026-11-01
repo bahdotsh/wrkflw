@@ -1,10 +1,11 @@
 use crate::gitlab_config;
 use crate::schema::{SchemaType, SchemaValidator};
 use crate::workflow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use thiserror::Error;
-use wrkflw_models::gitlab::Pipeline;
+use wrkflw_matrix::MatrixConfig;
+use wrkflw_models::gitlab::{Parallel, Pipeline};
 use wrkflw_models::ValidationResult;
 
 #[derive(Error, Debug)]
@@ -43,6 +44,8 @@ pub fn parse_pipeline(pipeline_path: &Path) -> Result<Pipeline, GitlabParserErro
 
     // Parse the resolved configuration
     let pipeline: Pipeline = serde_yaml::from_value(config)?;
+
+    check_parallel(&pipeline).map_err(GitlabParserError::InvalidStructure)?;
 
     // Return the parsed pipeline
     Ok(pipeline)
@@ -118,6 +121,119 @@ pub fn validate_pipeline_structure(pipeline: &Pipeline) -> ValidationResult {
     result
 }
 
+/// The most instances GitLab creates from one job's `parallel`
+const MAX_PARALLEL_INSTANCES: usize = 200;
+
+/// Reject `parallel:matrix` mistakes the schema can't express. The schema
+/// already bounds `parallel: N` and the number of matrix entries, but not how
+/// many instances those entries multiply out to, or what's inside them.
+fn check_parallel(pipeline: &Pipeline) -> Result<(), String> {
+    let mut issues = Vec::new();
+    for (job_name, job) in &pipeline.jobs {
+        if let Some(Parallel::Matrix { matrix }) = &job.parallel {
+            issues.extend(
+                matrix_issues(matrix)
+                    .into_iter()
+                    .map(|issue| format!("Job '{}': parallel:matrix {}", job_name, issue)),
+            );
+        }
+    }
+    if issues.is_empty() {
+        return Ok(());
+    }
+    issues.sort();
+    Err(issues.join("; "))
+}
+
+fn matrix_issues(matrix: &[HashMap<String, serde_yaml::Value>]) -> Vec<String> {
+    let mut issues = Vec::new();
+    let mut total = 0usize;
+    for entry in matrix {
+        if entry.is_empty() {
+            issues.push("has an entry with no variables".to_string());
+        }
+        let mut instances = 1usize;
+        for (name, value) in entry {
+            if !is_variable_name(name) {
+                issues.push(format!("variable '{}' is not a valid name", name));
+            }
+            let values = match value {
+                serde_yaml::Value::Sequence(values) => values.len(),
+                _ => 1,
+            };
+            if values == 0 {
+                issues.push(format!("variable '{}' has no values", name));
+            }
+            instances = instances.saturating_mul(values);
+        }
+        total = total.saturating_add(instances);
+    }
+    if total > MAX_PARALLEL_INSTANCES {
+        issues.push(format!(
+            "expands to more than {} instances",
+            MAX_PARALLEL_INSTANCES
+        ));
+    }
+    issues
+}
+
+fn is_variable_name(name: &str) -> bool {
+    !name.starts_with(|c: char| c.is_ascii_digit())
+        && !name.is_empty()
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Run a job once per `parallel` instance through a matrix, exposing each
+/// instance's variables as environment variables, as GitLab does. Every
+/// instance also gets `CI_NODE_INDEX` and `CI_NODE_TOTAL`.
+fn apply_parallel(job: &mut workflow::Job, parallel: &Parallel) {
+    let mut combinations: Vec<HashMap<String, serde_yaml::Value>> = match parallel {
+        Parallel::Count(total) => vec![HashMap::new(); *total],
+        Parallel::Matrix { matrix } => matrix.iter().flat_map(expand_parallel_entry).collect(),
+    };
+    for (index, combination) in combinations.iter_mut().enumerate() {
+        combination.insert(
+            "CI_NODE_INDEX".to_string(),
+            serde_yaml::Value::from(index as u64 + 1),
+        );
+    }
+    job.env
+        .insert("CI_NODE_TOTAL".to_string(), combinations.len().to_string());
+
+    let variables: HashSet<&String> = combinations.iter().flat_map(HashMap::keys).collect();
+    for variable in variables {
+        job.env
+            .insert(variable.clone(), format!("${{{{ matrix.{} }}}}", variable));
+    }
+    // GitLab runs every instance even when one fails.
+    job.strategy = Some(workflow::Strategy {
+        matrix: Some(MatrixConfig::from_combinations(combinations)),
+        fail_fast: Some(false),
+        max_parallel: None,
+    });
+}
+
+/// The Cartesian product of one `parallel:matrix` entry's variables. Entries
+/// are independent: GitLab creates each one's instances, even if they overlap.
+/// An entry with nothing to expand has no instances; `check_parallel` reports it.
+fn expand_parallel_entry(
+    entry: &HashMap<String, serde_yaml::Value>,
+) -> Vec<HashMap<String, serde_yaml::Value>> {
+    // Sorted so that each instance's CI_NODE_INDEX is stable between runs
+    let mut variables: Vec<_> = entry.iter().collect();
+    variables.sort_by_key(|(name, _)| name.as_str());
+    let matrix = MatrixConfig {
+        parameters: variables
+            .into_iter()
+            .map(|(name, values)| (name.clone(), values.clone()))
+            .collect(),
+        ..MatrixConfig::default()
+    };
+    wrkflw_matrix::expand_matrix(&matrix)
+        .map(|combinations| combinations.into_iter().map(|c| c.values).collect())
+        .unwrap_or_default()
+}
+
 /// Convert a GitLab CI/CD pipeline to a format compatible with the workflow executor
 /// A `continue-on-error` value that holds whatever the job or step did.
 const CONTINUE_ON_ERROR_ALWAYS: &str = "true";
@@ -167,6 +283,10 @@ pub fn convert_to_workflow_format(pipeline: &Pipeline) -> workflow::WorkflowDefi
         // Add job-specific environment variables
         if let Some(variables) = &gitlab_job.variables {
             job.env.extend(variables.clone());
+        }
+
+        if let Some(parallel) = &gitlab_job.parallel {
+            apply_parallel(&mut job, parallel);
         }
 
         // Add global variables if they exist
@@ -379,5 +499,237 @@ downstream:
 
         let result = validate_pipeline_structure(&pipeline);
         assert!(result.is_valid, "{:?}", result.issues);
+    }
+
+    fn convert(yaml: &str) -> workflow::WorkflowDefinition {
+        convert_to_workflow_format(&serde_yaml::from_str(yaml).unwrap())
+    }
+
+    /// Each instance's variables, sorted so that tests can compare them
+    fn instances(workflow: &workflow::WorkflowDefinition) -> Vec<Vec<(String, String)>> {
+        let matrix = workflow.jobs["job"].matrix_config().unwrap();
+        let mut instances: Vec<Vec<(String, String)>> = wrkflw_matrix::expand_matrix(matrix)
+            .unwrap()
+            .into_iter()
+            .map(|combination| {
+                let mut values: Vec<_> = combination
+                    .values
+                    .into_iter()
+                    .filter(|(name, _)| name != "CI_NODE_INDEX")
+                    .map(|(name, value)| {
+                        let value = serde_yaml::to_string(&value).unwrap();
+                        (name, value.trim().to_string())
+                    })
+                    .collect();
+                values.sort();
+                values
+            })
+            .collect();
+        instances.sort();
+        instances
+    }
+
+    fn pairs(values: &[(&str, &str)]) -> Vec<(String, String)> {
+        values
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect()
+    }
+
+    fn parse(yaml: &str) -> Result<Pipeline, GitlabParserError> {
+        let file = NamedTempFile::new().unwrap();
+        fs::write(file.path(), yaml).unwrap();
+        parse_pipeline(file.path())
+    }
+
+    fn parse_matrix(matrix: &str) -> Result<Pipeline, GitlabParserError> {
+        parse(&format!(
+            "job:\n  script: [echo]\n  parallel:\n    matrix:\n{}",
+            matrix
+        ))
+    }
+
+    #[test]
+    fn parallel_matrix_expands_each_entry() {
+        let workflow = convert(
+            r#"
+stages: [test]
+job:
+  stage: test
+  script: [echo]
+  parallel:
+    matrix:
+      - A: [x, y]
+        B: "1"
+      - C: z
+"#,
+        );
+        let job = &workflow.jobs["job"];
+        assert_eq!(
+            instances(&workflow),
+            vec![
+                pairs(&[("A", "x"), ("B", "'1'")]),
+                pairs(&[("A", "y"), ("B", "'1'")]),
+                pairs(&[("C", "z")]),
+            ]
+        );
+        assert_eq!(job.env["A"], "${{ matrix.A }}");
+        assert_eq!(job.env["C"], "${{ matrix.C }}");
+        assert!(!job.fail_fast());
+    }
+
+    #[test]
+    fn parallel_matrix_keeps_overlapping_entries_apart() {
+        let workflow = convert(
+            r#"
+job:
+  script: [echo]
+  parallel:
+    matrix:
+      - OS: [linux, windows]
+      - OS: linux
+        ARCH: arm64
+"#,
+        );
+        assert_eq!(
+            instances(&workflow),
+            vec![
+                pairs(&[("ARCH", "arm64"), ("OS", "linux")]),
+                pairs(&[("OS", "linux")]),
+                pairs(&[("OS", "windows")]),
+            ]
+        );
+    }
+
+    #[test]
+    fn parallel_matrix_keeps_an_entry_that_another_extends() {
+        let workflow = convert(
+            r#"
+job:
+  script: [echo]
+  parallel:
+    matrix:
+      - A: x
+      - A: x
+        B: [1, 2]
+"#,
+        );
+        assert_eq!(
+            instances(&workflow),
+            vec![
+                pairs(&[("A", "x")]),
+                pairs(&[("A", "x"), ("B", "1")]),
+                pairs(&[("A", "x"), ("B", "2")]),
+            ]
+        );
+    }
+
+    #[test]
+    fn parallel_matrix_keeps_number_values() {
+        let workflow =
+            convert("job:\n  script: [echo]\n  parallel:\n    matrix:\n      - RETRIES: [1, 2]\n");
+        assert_eq!(
+            instances(&workflow),
+            vec![pairs(&[("RETRIES", "1")]), pairs(&[("RETRIES", "2")])]
+        );
+    }
+
+    #[test]
+    fn parallel_matrix_overrides_a_job_variable_of_the_same_name() {
+        let workflow = convert(
+            r#"
+variables:
+  GLOBAL: global
+  OS: global
+job:
+  variables:
+    OS: job
+  script: [echo]
+  parallel:
+    matrix:
+      - OS: [linux]
+"#,
+        );
+        let job = &workflow.jobs["job"];
+        assert_eq!(job.env["OS"], "${{ matrix.OS }}");
+        assert_eq!(job.env["GLOBAL"], "global");
+    }
+
+    fn node_indexes(workflow: &workflow::WorkflowDefinition) -> Vec<u64> {
+        let matrix = workflow.jobs["job"].matrix_config().unwrap();
+        let mut indexes: Vec<u64> = wrkflw_matrix::expand_matrix(matrix)
+            .unwrap()
+            .iter()
+            .map(|combination| combination.values["CI_NODE_INDEX"].as_u64().unwrap())
+            .collect();
+        indexes.sort();
+        indexes
+    }
+
+    #[test]
+    fn parallel_count_sets_node_variables() {
+        let workflow = convert("job:\n  script: [echo]\n  parallel: 3\n");
+        let job = &workflow.jobs["job"];
+        assert_eq!(node_indexes(&workflow), vec![1, 2, 3]);
+        assert_eq!(job.env["CI_NODE_TOTAL"], "3");
+        assert_eq!(job.env["CI_NODE_INDEX"], "${{ matrix.CI_NODE_INDEX }}");
+    }
+
+    #[test]
+    fn parallel_matrix_sets_node_variables() {
+        let workflow = convert(
+            "job:\n  script: [echo]\n  parallel:\n    matrix:\n      - A: [x, y]\n      - B: z\n",
+        );
+        let job = &workflow.jobs["job"];
+        assert_eq!(node_indexes(&workflow), vec![1, 2, 3]);
+        assert_eq!(job.env["CI_NODE_TOTAL"], "3");
+    }
+
+    #[test]
+    fn parallel_count_is_bounded_when_parsing() {
+        for count in ["1", "200"] {
+            let yaml = format!("job:\n  script: [echo]\n  parallel: {}\n", count);
+            assert!(parse(&yaml).is_ok(), "parallel: {}", count);
+        }
+        for count in ["0", "201", "\"3\""] {
+            let yaml = format!("job:\n  script: [echo]\n  parallel: {}\n", count);
+            assert!(
+                matches!(
+                    parse(&yaml),
+                    Err(GitlabParserError::SchemaValidationError(_))
+                ),
+                "parallel: {}",
+                count
+            );
+        }
+    }
+
+    #[test]
+    fn parallel_matrix_is_limited_to_200_instances() {
+        let values = |count: usize| (0..count).map(|v| format!("v{}", v)).collect::<Vec<_>>();
+        let entry = |count: usize| format!("      - A: [{}]\n", values(count).join(", "));
+
+        assert!(parse_matrix(&entry(200)).is_ok());
+        let error = parse_matrix(&format!("{}{}", entry(200), entry(1)))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Job 'job'"), "{}", error);
+        assert!(error.contains("more than 200"), "{}", error);
+    }
+
+    #[test]
+    fn parallel_matrix_rejects_entries_that_run_nothing() {
+        let error = parse_matrix("      - {}\n").unwrap_err().to_string();
+        assert!(error.contains("no variables"), "{}", error);
+        let error = parse_matrix("      - A: []\n").unwrap_err().to_string();
+        assert!(error.contains("'A' has no values"), "{}", error);
+    }
+
+    #[test]
+    fn parallel_matrix_rejects_invalid_variable_names() {
+        let error = parse_matrix("      - \"NOT VALID\": x\n")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("'NOT VALID'"), "{}", error);
     }
 }

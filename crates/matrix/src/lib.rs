@@ -181,6 +181,11 @@ pub struct MatrixConfig {
     pub include: MatrixEntries,
     #[serde(default)]
     pub exclude: MatrixEntries,
+    /// Combinations to run exactly as given, set by [`MatrixConfig::from_combinations`].
+    /// Skipped by serde because no workflow syntax writes this: a matrix key
+    /// called `combinations` is an ordinary axis.
+    #[serde(skip)]
+    pub combinations: Option<Vec<HashMap<String, Value>>>,
     #[serde(default, rename = "max-parallel")]
     pub max_parallel: Option<usize>,
     #[serde(default, rename = "fail-fast")]
@@ -201,6 +206,7 @@ impl Default for MatrixConfig {
             parameters: IndexMap::new(),
             include: MatrixEntries::default(),
             exclude: MatrixEntries::default(),
+            combinations: None,
             max_parallel: None,
             fail_fast: Some(true),
         }
@@ -309,6 +315,20 @@ impl MatrixCombination {
     }
 }
 
+impl MatrixConfig {
+    /// A matrix whose combinations are already known. [`expand_matrix`] returns
+    /// them unchanged, so unlike `include` entries they never merge together,
+    /// even when they share keys.
+    pub fn from_combinations(combinations: Vec<HashMap<String, Value>>) -> Self {
+        Self {
+            combinations: Some(combinations),
+            // Same as a parsed mapping, so `Job::fail_fast` applies its own default
+            fail_fast: None,
+            ..Self::default()
+        }
+    }
+}
+
 #[derive(Error, Debug)]
 pub enum MatrixError {
     #[error("Invalid matrix parameter format: {0}")]
@@ -332,6 +352,19 @@ pub fn expand_matrix(matrix: &MatrixConfig) -> Result<Vec<MatrixCombination>, Ma
     let mut combinations = Vec::new();
     let include = matrix.include.literal("include")?;
     let exclude = matrix.exclude.literal("exclude")?;
+
+    if let Some(literal) = &matrix.combinations {
+        if literal.is_empty() {
+            return Err(MatrixError::ExpansionError(
+                "Matrix has no combinations".to_string(),
+            ));
+        }
+        return Ok(literal
+            .iter()
+            .cloned()
+            .map(MatrixCombination::new)
+            .collect());
+    }
 
     // Step 1: Generate base combinations from parameter arrays
     let param_combinations = generate_base_combinations(matrix, include)?;
@@ -511,9 +544,10 @@ fn is_excluded(
 
 /// Formats a combination name for display, e.g. "test (ubuntu, node 14)"
 pub fn format_combination_name(job_name: &str, combination: &MatrixCombination) -> String {
-    let params = combination
-        .values
-        .iter()
+    let mut values: Vec<_> = combination.values.iter().collect();
+    values.sort_by_key(|(key, _)| key.as_str());
+    let params = values
+        .into_iter()
         .map(|(k, v)| format!("{}: {}", k, value_to_string(v)))
         .collect::<Vec<_>>()
         .join(", ");
@@ -569,9 +603,43 @@ mod tests {
             parameters,
             include: MatrixEntries::default(),
             exclude: MatrixEntries::default(),
+            combinations: None,
             max_parallel: None,
             fail_fast: Some(true),
         }
+    }
+
+    #[test]
+    fn literal_combinations_are_returned_unmerged() {
+        let linux = HashMap::from([("os".to_string(), Value::from("linux"))]);
+        let mut arm = linux.clone();
+        arm.insert("arch".to_string(), Value::from("arm64"));
+
+        let matrix = MatrixConfig::from_combinations(vec![linux.clone(), arm.clone()]);
+        let combinations = expand_matrix(&matrix).unwrap();
+
+        assert_eq!(combinations.len(), 2);
+        assert_eq!(combinations[0].values, linux);
+        assert_eq!(combinations[1].values, arm);
+        assert!(!combinations[0].is_included);
+    }
+
+    #[test]
+    fn literal_combinations_must_not_be_empty() {
+        assert!(expand_matrix(&MatrixConfig::from_combinations(Vec::new())).is_err());
+    }
+
+    #[test]
+    fn combination_names_list_keys_in_order() {
+        let combination = MatrixCombination::new(HashMap::from([
+            ("b".to_string(), Value::from("2")),
+            ("a".to_string(), Value::from("1")),
+            ("c".to_string(), Value::from("3")),
+        ]));
+        assert_eq!(
+            format_combination_name("job", &combination),
+            "job (a: 1, b: 2, c: 3)"
+        );
     }
 
     #[test]

@@ -119,6 +119,9 @@ pub fn validate_pipeline_structure(pipeline: &Pipeline) -> ValidationResult {
 }
 
 /// Convert a GitLab CI/CD pipeline to a format compatible with the workflow executor
+/// A `continue-on-error` value that holds whatever the job or step did.
+const CONTINUE_ON_ERROR_ALWAYS: &str = "true";
+
 pub fn convert_to_workflow_format(pipeline: &Pipeline) -> workflow::WorkflowDefinition {
     // Create a new workflow with required fields
     let mut workflow = workflow::WorkflowDefinition {
@@ -154,6 +157,11 @@ pub fn convert_to_workflow_format(pipeline: &Pipeline) -> workflow::WorkflowDefi
             secrets: None,
             timeout_minutes: None,
             defaults: None,
+            continue_on_error: matches!(
+                gitlab_job.allow_failure,
+                Some(wrkflw_models::gitlab::AllowFailure::Bool(true))
+            )
+            .then(|| CONTINUE_ON_ERROR_ALWAYS.to_string()),
         };
 
         // Add job-specific environment variables
@@ -194,7 +202,7 @@ pub fn convert_to_workflow_format(pipeline: &Pipeline) -> workflow::WorkflowDefi
             for (i, cmd) in after_script.iter().enumerate() {
                 let mut step =
                     workflow::Step::with_run(format!("After script {}", i + 1), cmd.clone());
-                step.continue_on_error = Some(true); // After script should continue even if previous steps fail
+                step.continue_on_error = Some(CONTINUE_ON_ERROR_ALWAYS.to_string()); // After script should continue even if previous steps fail
                 job.steps.push(step);
             }
         }
@@ -272,6 +280,52 @@ test_job:
         let test_job = pipeline.jobs.get("test_job").unwrap();
         assert_eq!(test_job.stage.as_ref().unwrap(), "test");
         assert_eq!(test_job.script.as_ref().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn allow_failure_maps_to_continue_on_error_only_when_unconditional() {
+        let file = NamedTempFile::new().unwrap();
+        fs::write(
+            file.path(),
+            r#"
+stages:
+  - test
+
+allowed:
+  stage: test
+  script:
+    - make test
+  allow_failure: true
+
+disallowed:
+  stage: test
+  script:
+    - make test
+  allow_failure: false
+
+by_exit_code:
+  stage: test
+  script:
+    - make test
+  allow_failure:
+    exit_codes: [47]
+
+unset:
+  stage: test
+  script:
+    - make test
+"#,
+        )
+        .unwrap();
+
+        let pipeline = parse_pipeline(file.path()).unwrap();
+        let workflow = convert_to_workflow_format(&pipeline);
+        let value = |job: &str| workflow.jobs[job].continue_on_error.as_deref();
+
+        assert_eq!(value("allowed"), Some("true"));
+        assert_eq!(value("disallowed"), None);
+        assert_eq!(value("by_exit_code"), None);
+        assert_eq!(value("unset"), None);
     }
 
     #[test]

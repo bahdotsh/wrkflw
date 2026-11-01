@@ -229,6 +229,9 @@ pub async fn execute_workflow_cli(
             for job in &result.jobs {
                 match job.status {
                     JobStatus::Success => println!("\n{}", cli_style::job_success(&job.name)),
+                    JobStatus::Failure if job.failure_allowed => {
+                        println!("\n{}", cli_style::job_failure_allowed(&job.name));
+                    }
                     JobStatus::Failure => {
                         println!("\n{}", cli_style::job_failure(&job.name));
                         any_job_failed = true;
@@ -458,6 +461,7 @@ pub async fn execute_curl_trigger(
         }],
         logs: "Workflow triggered remotely on GitHub".to_string(),
         outputs: std::collections::HashMap::new(),
+        failure_allowed: false,
     };
 
     Ok((vec![job_result], ()))
@@ -631,6 +635,7 @@ pub fn start_next_workflow_execution(
                                     }
                                 ),
                                 outputs: std::collections::HashMap::new(),
+                                failure_allowed: false,
                             }];
 
                             Ok((jobs, ()))

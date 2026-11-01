@@ -63,6 +63,8 @@ pub struct JobExecution {
     pub status: JobStatus,
     pub steps: Vec<StepExecution>,
     pub logs: Vec<String>,
+    /// The job failed, but `continue-on-error` keeps the run green.
+    pub failure_allowed: bool,
 }
 
 /// Step execution details

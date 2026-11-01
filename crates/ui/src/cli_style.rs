@@ -48,6 +48,15 @@ pub fn job_failure(name: &str) -> String {
     format!("{} Job failed: {}", symbols::FAILURE.red(), name.bold())
 }
 
+/// A failed job whose `continue-on-error` keeps the run green.
+pub fn job_failure_allowed(name: &str) -> String {
+    format!(
+        "{} Job failed (allowed): {}",
+        symbols::FAILURE.yellow(),
+        name.bold()
+    )
+}
+
 pub fn job_skipped(name: &str) -> String {
     format!("{} Job skipped: {}", symbols::SKIPPED.dimmed(), name.bold())
 }

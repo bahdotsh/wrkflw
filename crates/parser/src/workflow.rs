@@ -178,6 +178,35 @@ where
     }
 }
 
+/// `continue-on-error` is a boolean or an expression such as `${{ matrix.experimental }}`.
+fn deserialize_bool_or_expression<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    match Option::<serde_yaml::Value>::deserialize(deserializer)? {
+        None => Ok(None),
+        Some(serde_yaml::Value::Bool(value)) => Ok(Some(value.to_string())),
+        Some(serde_yaml::Value::String(value)) => Ok(Some(value)),
+        Some(other) => Err(serde::de::Error::custom(format!(
+            "expected a boolean or expression, got {:?}",
+            other
+        ))),
+    }
+}
+
+/// The inverse of [`deserialize_bool_or_expression`]: `true` and `false` are
+/// written as booleans, since GitHub rejects a quoted `"true"` here.
+fn serialize_bool_or_expression<S>(value: &Option<String>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    match value.as_deref() {
+        Some("true") => serializer.serialize_some(&true),
+        Some("false") => serializer.serialize_some(&false),
+        other => other.serialize(serializer),
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize, Default)]
 pub struct Strategy {
     #[serde(
@@ -225,6 +254,13 @@ pub struct Job {
     pub timeout_minutes: Option<f64>,
     #[serde(default)]
     pub defaults: Option<Defaults>,
+    #[serde(
+        default,
+        rename = "continue-on-error",
+        deserialize_with = "deserialize_bool_or_expression",
+        serialize_with = "serialize_bool_or_expression"
+    )]
+    pub continue_on_error: Option<String>,
 }
 
 impl Job {
@@ -276,8 +312,13 @@ pub struct Step {
     pub with: Option<HashMap<String, String>>,
     #[serde(default)]
     pub env: HashMap<String, String>,
-    #[serde(default, rename = "continue-on-error")]
-    pub continue_on_error: Option<bool>,
+    #[serde(
+        default,
+        rename = "continue-on-error",
+        deserialize_with = "deserialize_bool_or_expression",
+        serialize_with = "serialize_bool_or_expression"
+    )]
+    pub continue_on_error: Option<String>,
     #[serde(default, rename = "if")]
     pub if_condition: Option<String>,
     #[serde(default)]
@@ -783,7 +824,7 @@ jobs:
         assert_eq!(step.shell.as_deref(), Some("bash"));
         assert_eq!(step.working_directory.as_deref(), Some("./src"));
         assert_eq!(step.timeout_minutes, Some(10.5));
-        assert_eq!(step.continue_on_error, Some(true));
+        assert_eq!(step.continue_on_error.as_deref(), Some("true"));
     }
 
     #[test]
@@ -954,7 +995,7 @@ jobs:
         // Verify continue-on-error parsing
         let job = parsed.jobs.get("test-continue").unwrap();
         assert_eq!(job.steps.len(), 2);
-        assert_eq!(job.steps[0].continue_on_error, Some(true));
+        assert_eq!(job.steps[0].continue_on_error.as_deref(), Some("true"));
         assert_eq!(job.steps[1].continue_on_error, None);
 
         // Verify step-level if condition parsing
@@ -963,5 +1004,50 @@ jobs:
         assert_eq!(job2.steps[0].if_condition, None);
         assert_eq!(job2.steps[1].if_condition.as_deref(), Some("false"));
         assert_eq!(job2.steps[2].if_condition, None);
+    }
+
+    fn continue_on_error_job(value: &str) -> Result<Job, serde_yaml::Error> {
+        serde_yaml::from_str(&format!(
+            "runs-on: ubuntu-latest\ncontinue-on-error: {}\nsteps:\n  - run: echo\n",
+            value
+        ))
+    }
+
+    #[test]
+    fn job_continue_on_error_accepts_booleans_and_expressions() {
+        let value = |yaml| continue_on_error_job(yaml).unwrap().continue_on_error;
+
+        assert_eq!(value("true").as_deref(), Some("true"));
+        assert_eq!(value("false").as_deref(), Some("false"));
+        assert_eq!(
+            value("${{ matrix.experimental }}").as_deref(),
+            Some("${{ matrix.experimental }}")
+        );
+    }
+
+    #[test]
+    fn job_continue_on_error_rejects_other_types() {
+        assert!(continue_on_error_job("1").is_err());
+        assert!(continue_on_error_job("[true]").is_err());
+    }
+
+    #[test]
+    fn continue_on_error_serializes_as_it_was_written() {
+        let yaml = |value| {
+            let job = continue_on_error_job(value).unwrap();
+            serde_yaml::to_value(&job).unwrap()["continue-on-error"].clone()
+        };
+        let step = serde_yaml::from_str::<Step>("run: echo\ncontinue-on-error: true\n").unwrap();
+
+        assert_eq!(yaml("true"), serde_yaml::Value::Bool(true));
+        assert_eq!(yaml("false"), serde_yaml::Value::Bool(false));
+        assert_eq!(
+            yaml("${{ matrix.experimental }}"),
+            serde_yaml::Value::String("${{ matrix.experimental }}".to_string())
+        );
+        assert_eq!(
+            serde_yaml::to_value(&step).unwrap()["continue-on-error"],
+            serde_yaml::Value::Bool(true)
+        );
     }
 }

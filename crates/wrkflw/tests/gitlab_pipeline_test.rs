@@ -177,3 +177,135 @@ async fn variables_reach_scripts() {
     .await;
     assert_eq!(status(&result, "job"), JobStatus::Success);
 }
+
+const APPROVAL_PIPELINE: &str = r#"
+stages: [gate, deploy]
+approve:
+  stage: gate
+  rules:
+    - when: manual
+  script: ["true"]
+deploy:
+  stage: deploy
+  script: ["true"]
+cleanup:
+  stage: deploy
+  when: always
+  script: ["true"]
+"#;
+
+#[tokio::test]
+async fn a_blocking_manual_job_stops_later_stages() {
+    let result = run(APPROVAL_PIPELINE, None, &[]).await;
+    assert_eq!(status(&result, "approve"), JobStatus::Skipped);
+    assert_eq!(status(&result, "deploy"), JobStatus::Skipped);
+    assert_eq!(status(&result, "cleanup"), JobStatus::Skipped);
+    assert!(result.failure_details.is_none());
+
+    let named = run(APPROVAL_PIPELINE, Some("deploy"), &[]).await;
+    assert_eq!(status(&named, "deploy"), JobStatus::Success);
+}
+
+#[tokio::test]
+async fn an_optional_manual_job_does_not_stop_later_stages() {
+    let result = run(
+        r#"
+stages: [gate, deploy]
+optional:
+  stage: gate
+  when: manual
+  script: ["true"]
+deploy:
+  stage: deploy
+  script: ["true"]
+"#,
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(status(&result, "optional"), JobStatus::Skipped);
+    assert_eq!(status(&result, "deploy"), JobStatus::Success);
+}
+
+#[tokio::test]
+async fn a_rule_can_allow_a_failure() {
+    let result = run(
+        r#"
+stages: [first, second]
+flaky:
+  stage: first
+  rules:
+    - allow_failure: true
+  script: ["exit 1"]
+after:
+  stage: second
+  script: ["true"]
+"#,
+        None,
+        &[],
+    )
+    .await;
+    assert!(result.failure_details.is_none());
+    assert_eq!(status(&result, "after"), JobStatus::Success);
+}
+
+#[tokio::test]
+async fn a_tag_pipeline_has_no_branch_for_rules() {
+    let result = run(
+        r#"
+on_main:
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+  script: ["true"]
+tagged:
+  rules:
+    - if: $CI_COMMIT_REF_NAME == "v1"
+  script: ["true"]
+"#,
+        None,
+        &[("CI_COMMIT_TAG", "v1")],
+    )
+    .await;
+    assert_eq!(status(&result, "on_main"), JobStatus::Skipped);
+    assert_eq!(status(&result, "tagged"), JobStatus::Success);
+}
+
+#[tokio::test]
+async fn a_named_job_still_follows_the_stages_before_it() {
+    let pipeline = r#"
+stages: [first, second]
+breaks:
+  stage: first
+  script: ["exit 1"]
+gated:
+  stage: first
+  when: manual
+  script: ["exit 1"]
+named:
+  stage: second
+  when: manual
+  script: ["true"]
+"#;
+    let result = run(pipeline, Some("named"), &[]).await;
+    assert_eq!(status(&result, "breaks"), JobStatus::Failure);
+    assert_eq!(status(&result, "gated"), JobStatus::Skipped);
+    assert_eq!(status(&result, "named"), JobStatus::Skipped);
+}
+
+#[tokio::test]
+async fn a_job_with_an_image_runs_its_scripts() {
+    let result = run(
+        r#"
+variables:
+  VERSION: "3.20"
+job:
+  image: alpine:$VERSION
+  before_script: ['test "$VERSION" = 3.20']
+  script: ["true"]
+"#,
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(status(&result, "job"), JobStatus::Success);
+}

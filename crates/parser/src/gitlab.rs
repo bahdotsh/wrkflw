@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use thiserror::Error;
 use wrkflw_matrix::MatrixConfig;
-use wrkflw_models::gitlab::{Except, Image, Job, Only, Parallel, Pipeline, Rule};
+use wrkflw_models::gitlab::{AllowFailure, Except, Image, Job, Only, Parallel, Pipeline, Rule};
 use wrkflw_models::ValidationResult;
 
 #[derive(Error, Debug)]
@@ -144,14 +144,27 @@ pub enum SkipReason {
     Never,
     /// `when: manual`: nobody can press play on a local run.
     Manual,
+    /// A manual job that later stages wait for, which here never happens.
+    BlockingManual,
     /// The job has `rules:` and none of them matched.
     NoRuleMatched,
     /// `only:` doesn't select this run, or `except:` excludes it.
     RefFilter,
     /// A `rules:if` or `only:`/`except:` condition couldn't be evaluated.
     InvalidCondition,
+    /// A `rules:if` reads a `parallel:matrix` variable. Rules are decided once
+    /// per job, so no single answer holds for every instance.
+    MatrixCondition,
     /// A `when:` value that isn't one of GitLab's.
     UnknownWhen,
+}
+
+/// What a job's rules decided for this run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JobDecision {
+    pub when: JobWhen,
+    /// The matched rule's `allow_failure`, which overrides the job's own.
+    pub allow_failure: Option<bool>,
 }
 
 impl JobWhen {
@@ -166,6 +179,12 @@ impl JobWhen {
         }
     }
 
+    /// Whether later stages wait for this job, as they do for a manual job
+    /// that isn't allowed to fail.
+    pub fn blocks_later_stages(self) -> bool {
+        self == JobWhen::Skip(SkipReason::BlockingManual)
+    }
+
     /// Why this job doesn't run given the outcome of the earlier stages, or
     /// `None` if it does.
     pub fn skip_reason(self, earlier_failure: bool) -> Option<&'static str> {
@@ -178,6 +197,12 @@ impl JobWhen {
             JobWhen::Skip(SkipReason::Never) => Some("when: never"),
             JobWhen::Skip(SkipReason::Manual) => {
                 Some("when: manual jobs can't be started on a local run")
+            }
+            JobWhen::Skip(SkipReason::BlockingManual) => {
+                Some("when: manual jobs can't be started on a local run, so later stages wait")
+            }
+            JobWhen::Skip(SkipReason::MatrixCondition) => {
+                Some("a rule reads a parallel:matrix variable, which isn't evaluated")
             }
             JobWhen::Skip(SkipReason::NoRuleMatched) => Some("no rule matched"),
             JobWhen::Skip(SkipReason::RefFilter) => Some("only/except excludes this run"),
@@ -194,20 +219,41 @@ impl JobWhen {
 /// `only:`/`except:`. A condition that can't be evaluated excludes the job,
 /// because guessing could run a guarded deploy. `variables` are the job's CI
 /// variables.
-pub fn job_when(job_name: &str, job: &Job, variables: &HashMap<String, String>) -> JobWhen {
+pub fn job_decision(job_name: &str, job: &Job, variables: &HashMap<String, String>) -> JobDecision {
+    let excluded = |reason| JobDecision {
+        when: JobWhen::Skip(reason),
+        allow_failure: None,
+    };
     let owner = format!("Job '{}'", job_name);
+    if job.needs.is_some() {
+        wrkflw_logging::warning(&format!(
+            "{}: needs isn't evaluated, so the job follows stage order",
+            owner
+        ));
+    }
+    if let Some(variable) = matrix_variable_in_rules(job) {
+        wrkflw_logging::warning(&format!(
+            "{} is excluded: its rules read parallel:matrix variable '{}', and rules aren't \
+             evaluated per instance. Name it with --job to run every instance",
+            owner, variable
+        ));
+        return excluded(SkipReason::MatrixCondition);
+    }
     let job_level = job.when.as_deref();
-    let when = match &job.rules {
+    let (when, rule_allow_failure) = match &job.rules {
         Some(rules) => match first_matching_rule(&owner, rules, variables) {
-            Ok(Some(rule)) => rule.when.as_deref().or(job_level),
-            Ok(None) => return JobWhen::Skip(SkipReason::NoRuleMatched),
-            Err(reason) => return JobWhen::Skip(reason),
+            Ok(Some(rule)) => (
+                rule.when.as_deref().or(job_level),
+                rule.allow_failure.as_ref().and_then(allow_failure_flag),
+            ),
+            Ok(None) => return excluded(SkipReason::NoRuleMatched),
+            Err(reason) => return excluded(reason),
         },
         None => {
             if let Some(reason) = ref_filter_exclusion(&owner, job, variables) {
-                return JobWhen::Skip(reason);
+                return excluded(reason);
             }
-            job_level
+            (job_level, None)
         }
     };
     if when == Some("delayed") {
@@ -216,7 +262,44 @@ pub fn job_when(job_name: &str, job: &Job, variables: &HashMap<String, String>) 
             owner
         ));
     }
-    JobWhen::parse(when)
+    // As on GitLab, only a job-level `when: manual` defaults to being allowed
+    // to fail, so a manual rule blocks unless something says otherwise.
+    let allowed = rule_allow_failure
+        .or(job.allow_failure.as_ref().and_then(allow_failure_flag))
+        .unwrap_or(job_level == Some("manual"));
+    let when = match JobWhen::parse(when) {
+        JobWhen::Skip(SkipReason::Manual) if !allowed => JobWhen::Skip(SkipReason::BlockingManual),
+        when => when,
+    };
+    JobDecision {
+        when,
+        allow_failure: rule_allow_failure,
+    }
+}
+
+fn allow_failure_flag(allow_failure: &AllowFailure) -> Option<bool> {
+    match allow_failure {
+        AllowFailure::Bool(allowed) => Some(*allowed),
+        AllowFailure::ExitCodes { .. } => None,
+    }
+}
+
+/// A `parallel:matrix` variable that one of the job's `rules:if` reads.
+fn matrix_variable_in_rules(job: &Job) -> Option<String> {
+    let Some(Parallel::Matrix { matrix }) = &job.parallel else {
+        return None;
+    };
+    job.rules
+        .iter()
+        .flatten()
+        .filter_map(|rule| rule.if_.as_deref())
+        .flat_map(|condition| tokenize_rule_condition(condition).unwrap_or_default())
+        .find_map(|token| match token {
+            RuleToken::Variable(name) if matrix.iter().any(|entry| entry.contains_key(&name)) => {
+                Some(name)
+            }
+            _ => None,
+        })
 }
 
 /// Why `workflow:rules` doesn't create this pipeline, or `None` if it does.
@@ -333,9 +416,16 @@ impl<'a> RefFilter<'a> {
         !self.refs.is_empty() || !self.variables.is_empty()
     }
 
-    /// Whether this run matches: any ref, and any variables expression.
-    fn matches(&self, owner: &str, vars: &HashMap<String, String>) -> Result<bool, SkipReason> {
-        let mut refs_match = self.refs.is_empty();
+    /// Whether this run matches. A key matches when any of its conditions
+    /// does. `only:` needs every key it sets to match, while one matching key
+    /// is enough for `except:`.
+    fn matches(
+        &self,
+        owner: &str,
+        vars: &HashMap<String, String>,
+        every_key: bool,
+    ) -> Result<bool, SkipReason> {
+        let mut refs_match = false;
         for pattern in &self.refs {
             refs_match |= ref_pattern_matches(pattern, vars).map_err(|error| {
                 wrkflw_logging::warning(&format!(
@@ -345,11 +435,15 @@ impl<'a> RefFilter<'a> {
                 SkipReason::InvalidCondition
             })?;
         }
-        let mut variables_match = self.variables.is_empty();
+        let mut variables_match = false;
         for condition in self.variables {
             variables_match |= evaluate_or_warn(owner, "only/except", condition, vars)?;
         }
-        Ok(refs_match && variables_match)
+        Ok(if every_key {
+            (refs_match || self.refs.is_empty()) && (variables_match || self.variables.is_empty())
+        } else {
+            refs_match || variables_match
+        })
     }
 }
 
@@ -396,7 +490,7 @@ fn ref_filter_exclusion(
         if !filter.is_evaluated() {
             return None;
         }
-        match filter.matches(owner, variables) {
+        match filter.matches(owner, variables, !exclude_on_match) {
             Ok(matched) => (matched == exclude_on_match).then_some(SkipReason::RefFilter),
             Err(reason) => Some(reason),
         }
@@ -411,10 +505,15 @@ fn ref_filter_exclusion(
 }
 
 fn warn_about_ignored_clauses(owner: &str, rule: &Rule) {
+    if rule.variables.is_some() {
+        wrkflw_logging::warning(&format!(
+            "{}: rules:variables isn't applied, so the job keeps its other values",
+            owner
+        ));
+    }
     for (clause, present) in [
         ("changes", rule.changes.is_some()),
         ("exists", rule.exists.is_some()),
-        ("variables", rule.variables.is_some()),
     ] {
         if present {
             wrkflw_logging::warning(&format!(
@@ -604,10 +703,8 @@ impl RuleEvaluator<'_> {
                 .pattern()?
                 .map(|p| compile_rule_regex(&p))
                 .transpose()?;
-            let matched = match (left, regex) {
-                (Some(value), Some(regex)) => regex.is_match(&value),
-                _ => false,
-            };
+            // An undefined left side matches as an empty string, as on GitLab.
+            let matched = regex.is_some_and(|regex| regex.is_match(&left.unwrap_or_default()));
             return Ok(matched != negated);
         }
         Ok((left == self.operand()?) != negated)
@@ -697,7 +794,8 @@ fn default_list(pipeline: &Pipeline, key: &str) -> Option<Vec<String>> {
 }
 
 /// The image a job runs in: its own, then `default:`, then the top-level one,
-/// with the pipeline's and the job's variables expanded.
+/// with the pipeline's and the job's variables expanded. A `parallel:matrix`
+/// variable becomes a matrix reference, which each instance fills in.
 fn job_image(job_name: &str, pipeline: &Pipeline, job: &Job) -> Option<String> {
     let image = job
         .image
@@ -720,10 +818,15 @@ fn job_image(job_name: &str, pipeline: &Pipeline, job: &Job) -> Option<String> {
 
     let mut variables = pipeline.variables.clone().unwrap_or_default();
     variables.extend(job.variables.clone().unwrap_or_default());
+    if let Some(Parallel::Matrix { matrix }) = &job.parallel {
+        for name in matrix.iter().flat_map(HashMap::keys) {
+            variables.insert(name.clone(), format!("${{{{ matrix.{} }}}}", name));
+        }
+    }
     let expanded = expand_variables(&image, &variables);
-    if expanded.contains('$') {
+    if expanded.replace("${{", "").contains('$') {
         wrkflw_logging::warning(&format!(
-            "Job '{}': image '{}' still refers to an undefined variable",
+            "Job '{}': image '{}' refers to an undefined variable. Set it with --variable",
             job_name, expanded
         ));
     }
@@ -845,7 +948,7 @@ fn expand_parallel_entry(
 
 /// Convert a GitLab CI/CD pipeline to a format compatible with the workflow executor
 /// A `continue-on-error` value that holds whatever the job or step did.
-const CONTINUE_ON_ERROR_ALWAYS: &str = "true";
+pub const CONTINUE_ON_ERROR_ALWAYS: &str = "true";
 
 pub fn convert_to_workflow_format(pipeline: &Pipeline) -> workflow::WorkflowDefinition {
     // Create a new workflow with required fields
@@ -896,11 +999,8 @@ pub fn convert_to_workflow_format(pipeline: &Pipeline) -> workflow::WorkflowDefi
                     working_directory: None,
                 }),
             }),
-            continue_on_error: matches!(
-                gitlab_job.allow_failure,
-                Some(wrkflw_models::gitlab::AllowFailure::Bool(true))
-            )
-            .then(|| CONTINUE_ON_ERROR_ALWAYS.to_string()),
+            continue_on_error: matches!(gitlab_job.allow_failure, Some(AllowFailure::Bool(true)))
+                .then(|| CONTINUE_ON_ERROR_ALWAYS.to_string()),
         };
 
         // Add job-specific environment variables
@@ -1147,7 +1247,7 @@ downstream:
 
     fn when_of(job_yaml: &str, vars: &[(&str, &str)]) -> JobWhen {
         let job: Job = serde_yaml::from_str(job_yaml).unwrap();
-        job_when("job", &job, &variables(vars))
+        job_decision("job", &job, &variables(vars)).when
     }
 
     #[test]
@@ -1233,7 +1333,8 @@ rules:
             ("$A !~ $PATTERN", false),
             ("$A =~ $BARE_PATTERN", true),
             ("$A =~ $MISSING", false),
-            ("$MISSING =~ /^$/", false),
+            ("$MISSING =~ /^$/", true),
+            ("$MISSING !~ /^$/", false),
             ("$MISSING !~ /x/", true),
         ] {
             assert_eq!(
@@ -1275,7 +1376,10 @@ rules:
             serde_yaml::from_str("script: [a]\nrules:\n  - changes: [docs/*]\n").unwrap();
         let rules = job.rules.as_ref().unwrap();
         assert!(rules[0].changes.is_some());
-        assert_eq!(job_when("job", &job, &HashMap::new()), JobWhen::OnSuccess);
+        assert_eq!(
+            job_decision("job", &job, &HashMap::new()).when,
+            JobWhen::OnSuccess
+        );
     }
 
     #[test]
@@ -1409,6 +1513,16 @@ own:
             (
                 "except: {refs: [dev], variables: ['$X']}",
                 &branch,
+                excluded,
+            ),
+            (
+                "except: {refs: [main], variables: ['$CI_COMMIT_BRANCH']}",
+                &branch,
+                excluded,
+            ),
+            (
+                "except: {refs: [main], variables: ['$X']}",
+                &branch,
                 JobWhen::OnSuccess,
             ),
             (
@@ -1424,6 +1538,88 @@ own:
                 filter
             );
         }
+    }
+
+    #[test]
+    fn manual_jobs_block_unless_allowed_to_fail() {
+        let blocking = JobWhen::Skip(SkipReason::BlockingManual);
+        let optional = JobWhen::Skip(SkipReason::Manual);
+        for (job, expected) in [
+            ("when: manual", optional),
+            ("when: manual\nallow_failure: false", blocking),
+            ("rules:\n  - when: manual", blocking),
+            ("allow_failure: true\nrules:\n  - when: manual", optional),
+            (
+                "rules:\n  - when: manual\n    allow_failure: true",
+                optional,
+            ),
+            (
+                "allow_failure: true\nrules:\n  - when: manual\n    allow_failure: false",
+                blocking,
+            ),
+        ] {
+            assert_eq!(
+                when_of(&format!("script: [a]\n{}", job), &[]),
+                expected,
+                "{}",
+                job
+            );
+        }
+        assert!(blocking.blocks_later_stages());
+        assert!(!optional.blocks_later_stages());
+    }
+
+    #[test]
+    fn the_matched_rule_supplies_allow_failure() {
+        let decide = |vars: &[(&str, &str)]| {
+            let job: Job = serde_yaml::from_str(
+                "script: [a]\nrules:\n  - if: $V\n    allow_failure: true\n  - when: on_success\n",
+            )
+            .unwrap();
+            job_decision("job", &job, &variables(vars)).allow_failure
+        };
+        assert_eq!(decide(&[("V", "1")]), Some(true));
+        assert_eq!(decide(&[]), None);
+    }
+
+    #[test]
+    fn rules_reading_a_matrix_variable_exclude_the_job() {
+        let matrix = "script: [a]\nparallel:\n  matrix:\n    - CLOUD: [aws, gcp]\n";
+        assert_eq!(
+            when_of(
+                &format!(
+                    "{}rules:\n  - if: $CLOUD == \"gcp\"\n    when: never\n  - when: on_success\n",
+                    matrix
+                ),
+                &[]
+            ),
+            JobWhen::Skip(SkipReason::MatrixCondition)
+        );
+        assert_eq!(
+            when_of(
+                &format!("{}rules:\n  - if: $OTHER\n", matrix),
+                &[("OTHER", "1")]
+            ),
+            JobWhen::OnSuccess
+        );
+    }
+
+    #[test]
+    fn matrix_variables_in_an_image_become_matrix_references() {
+        let workflow = convert(
+            r#"
+job:
+  image: ruby:$RUBY
+  parallel:
+    matrix:
+      - RUBY: ["3.2", "3.3"]
+  script: [echo]
+"#,
+        );
+        assert_eq!(
+            workflow.jobs["job"].container.as_ref().unwrap().image,
+            "ruby:${{ matrix.RUBY }}"
+        );
     }
 
     #[test]

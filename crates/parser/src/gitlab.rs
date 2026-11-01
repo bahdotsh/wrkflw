@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use thiserror::Error;
 use wrkflw_matrix::MatrixConfig;
-use wrkflw_models::gitlab::{Image, Job, Parallel, Pipeline};
+use wrkflw_models::gitlab::{Image, Job, Parallel, Pipeline, Rule};
 use wrkflw_models::ValidationResult;
 
 #[derive(Error, Debug)]
@@ -121,15 +121,33 @@ pub fn validate_pipeline_structure(pipeline: &Pipeline) -> ValidationResult {
     result
 }
 
+/// Runs a job's scripts in bash when its image has it and in `sh` otherwise,
+/// as GitLab does. A value for `defaults.run.shell`.
+pub const SHELL_BASH_OR_SH: &str = "wrkflw-bash-or-sh";
+
 /// When a job runs relative to the outcome of the stages before it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobWhen {
     OnSuccess,
     OnFailure,
     Always,
-    /// Excluded from the pipeline. Includes `manual`, since nobody can press
-    /// play on a local run.
-    Skip,
+    /// Excluded from the pipeline whatever the earlier stages did.
+    Skip(SkipReason),
+}
+
+/// Why a job is excluded from the pipeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkipReason {
+    /// `when: never`.
+    Never,
+    /// `when: manual`: nobody can press play on a local run.
+    Manual,
+    /// The job has `rules:` and none of them matched.
+    NoRuleMatched,
+    /// A `rules:if` couldn't be evaluated.
+    InvalidCondition,
+    /// A `when:` value that isn't one of GitLab's.
+    UnknownWhen,
 }
 
 impl JobWhen {
@@ -138,105 +156,328 @@ impl JobWhen {
             None | Some("on_success") | Some("delayed") => JobWhen::OnSuccess,
             Some("on_failure") => JobWhen::OnFailure,
             Some("always") => JobWhen::Always,
-            Some(_) => JobWhen::Skip,
+            Some("never") => JobWhen::Skip(SkipReason::Never),
+            Some("manual") => JobWhen::Skip(SkipReason::Manual),
+            Some(_) => JobWhen::Skip(SkipReason::UnknownWhen),
+        }
+    }
+
+    /// Why this job doesn't run given the outcome of the earlier stages, or
+    /// `None` if it does.
+    pub fn skip_reason(self, earlier_failure: bool) -> Option<&'static str> {
+        match self {
+            JobWhen::Always => None,
+            JobWhen::OnSuccess if earlier_failure => Some("an earlier stage failed"),
+            JobWhen::OnSuccess => None,
+            JobWhen::OnFailure if earlier_failure => None,
+            JobWhen::OnFailure => Some("when: on_failure and no earlier stage failed"),
+            JobWhen::Skip(SkipReason::Never) => Some("when: never"),
+            JobWhen::Skip(SkipReason::Manual) => {
+                Some("when: manual jobs can't be started on a local run")
+            }
+            JobWhen::Skip(SkipReason::NoRuleMatched) => Some("no rule matched"),
+            JobWhen::Skip(SkipReason::InvalidCondition) => {
+                Some("a rules:if condition couldn't be evaluated")
+            }
+            JobWhen::Skip(SkipReason::UnknownWhen) => Some("unknown when value"),
         }
     }
 }
 
 /// Decide when a job runs. The first matching rule wins and a job whose rules
-/// all miss is excluded, as in GitLab. `variables` are the job's CI variables.
-pub fn job_when(job: &Job, variables: &HashMap<String, String>) -> JobWhen {
+/// all miss is excluded, as in GitLab. A condition that can't be evaluated
+/// excludes the job, because guessing could run a guarded deploy. `variables`
+/// are the job's CI variables.
+pub fn job_when(job_name: &str, job: &Job, variables: &HashMap<String, String>) -> JobWhen {
     let job_level = job.when.as_deref();
     let Some(rules) = &job.rules else {
         return JobWhen::parse(job_level);
     };
-    rules
-        .iter()
-        .find(|rule| {
-            rule.if_
-                .as_deref()
-                .is_none_or(|condition| rule_condition_matches(condition, variables))
-        })
-        .map_or(JobWhen::Skip, |rule| {
-            JobWhen::parse(rule.when.as_deref().or(job_level))
-        })
-}
-
-/// Evaluate a `rules:if` condition: `||` of `&&` of comparisons, without
-/// parentheses. Anything else matches, with a warning, because running an extra
-/// job is easier to notice than silently dropping one.
-fn rule_condition_matches(condition: &str, variables: &HashMap<String, String>) -> bool {
-    split_outside_quotes(condition, "||").iter().any(|any_of| {
-        split_outside_quotes(any_of, "&&").iter().all(|term| {
-            rule_term_matches(term.trim(), variables).unwrap_or_else(|| {
-                wrkflw_logging::warning(&format!(
-                    "Unsupported rules:if condition '{}': treating it as a match",
-                    term.trim()
-                ));
-                true
-            })
-        })
-    })
-}
-
-fn rule_term_matches(term: &str, variables: &HashMap<String, String>) -> Option<bool> {
-    if term.contains(['(', ')']) && !term.contains("=~") && !term.contains("!~") {
-        return None;
-    }
-    for (operator, negated) in [("==", false), ("!=", true)] {
-        if let Some((left, right)) = term.split_once(operator) {
-            let equal = rule_operand(left, variables)? == rule_operand(right, variables)?;
-            return Some(equal != negated);
+    for rule in rules {
+        let matched = match rule.if_.as_deref() {
+            Some(condition) => match evaluate_rule_condition(condition, variables) {
+                Ok(matched) => matched,
+                Err(error) => {
+                    wrkflw_logging::warning(&format!(
+                        "Job '{}' is excluded: can't evaluate rules:if '{}': {}",
+                        job_name, condition, error
+                    ));
+                    return JobWhen::Skip(SkipReason::InvalidCondition);
+                }
+            },
+            None => true,
+        };
+        if matched {
+            warn_about_ignored_clauses(job_name, rule);
+            return JobWhen::parse(rule.when.as_deref().or(job_level));
         }
     }
-    for (operator, negated) in [("=~", false), ("!~", true)] {
-        if let Some((left, right)) = term.split_once(operator) {
-            let value = rule_operand(left, variables)?.unwrap_or_default();
-            let pattern = right.trim().strip_prefix('/')?;
-            let (pattern, flags) = pattern.rsplit_once('/')?;
-            let insensitive = if flags.contains('i') { "(?i)" } else { "" };
-            let regex = regex::Regex::new(&format!("{}{}", insensitive, pattern)).ok()?;
-            return Some(regex.is_match(&value) != negated);
+    JobWhen::Skip(SkipReason::NoRuleMatched)
+}
+
+fn warn_about_ignored_clauses(job_name: &str, rule: &Rule) {
+    for (clause, present) in [
+        ("changes", rule.changes.is_some()),
+        ("exists", rule.exists.is_some()),
+        ("variables", rule.variables.is_some()),
+    ] {
+        if present {
+            wrkflw_logging::warning(&format!(
+                "Job '{}': rules:{} isn't evaluated, so this rule applies as if it passed",
+                job_name, clause
+            ));
         }
     }
-    let value = rule_operand(term, variables)?;
-    Some(value.is_some_and(|value| !value.is_empty()))
 }
 
-/// A variable, quoted string or `null`. `None` means it isn't one of those.
-fn rule_operand(operand: &str, variables: &HashMap<String, String>) -> Option<Option<String>> {
-    let operand = operand.trim();
-    if operand == "null" {
-        return Some(None);
-    }
-    if let Some(name) = operand.strip_prefix('$') {
-        let name = name.trim_start_matches('{').trim_end_matches('}');
-        return Some(variables.get(name).cloned());
-    }
-    ['"', '\'']
-        .iter()
-        .find_map(|quote| operand.strip_prefix(*quote)?.strip_suffix(*quote))
-        .map(|text| Some(text.to_string()))
+#[derive(Debug, Clone, PartialEq)]
+enum RuleToken {
+    OpenParen,
+    CloseParen,
+    And,
+    Or,
+    Equal,
+    NotEqual,
+    Match,
+    NotMatch,
+    Null,
+    Variable(String),
+    Text(String),
+    Regex(String),
 }
 
-fn split_outside_quotes<'a>(text: &'a str, separator: &str) -> Vec<&'a str> {
-    let mut parts = Vec::new();
-    let mut start = 0;
-    let mut quote = None;
-    for (index, ch) in text.char_indices() {
-        match quote {
-            Some(open) if ch == open => quote = None,
-            Some(_) => {}
-            None if ch == '"' || ch == '\'' => quote = Some(ch),
-            None if text[index..].starts_with(separator) => {
-                parts.push(&text[start..index]);
-                start = index + separator.len();
+fn tokenize_rule_condition(condition: &str) -> Result<Vec<RuleToken>, String> {
+    let chars: Vec<char> = condition.chars().collect();
+    let mut tokens = Vec::new();
+    let mut index = 0;
+    while index < chars.len() {
+        let two: String = chars[index..chars.len().min(index + 2)].iter().collect();
+        let operator = match two.as_str() {
+            "&&" => Some(RuleToken::And),
+            "||" => Some(RuleToken::Or),
+            "==" => Some(RuleToken::Equal),
+            "!=" => Some(RuleToken::NotEqual),
+            "=~" => Some(RuleToken::Match),
+            "!~" => Some(RuleToken::NotMatch),
+            _ => None,
+        };
+        if let Some(operator) = operator {
+            tokens.push(operator);
+            index += 2;
+            continue;
+        }
+        match chars[index] {
+            ch if ch.is_whitespace() => index += 1,
+            '(' => {
+                tokens.push(RuleToken::OpenParen);
+                index += 1;
             }
-            None => {}
+            ')' => {
+                tokens.push(RuleToken::CloseParen);
+                index += 1;
+            }
+            quote @ ('"' | '\'') => {
+                let close = chars[index + 1..]
+                    .iter()
+                    .position(|ch| *ch == quote)
+                    .ok_or("unterminated string")?;
+                let end = index + 1 + close;
+                tokens.push(RuleToken::Text(chars[index + 1..end].iter().collect()));
+                index = end + 1;
+            }
+            '/' => {
+                let mut end = index + 1;
+                while end < chars.len() && chars[end] != '/' {
+                    end += if chars[end] == '\\' { 2 } else { 1 };
+                }
+                if end >= chars.len() {
+                    return Err("unterminated regular expression".to_string());
+                }
+                end += 1;
+                while end < chars.len() && chars[end].is_ascii_alphabetic() {
+                    end += 1;
+                }
+                tokens.push(RuleToken::Regex(chars[index..end].iter().collect()));
+                index = end;
+            }
+            '$' => {
+                let braced = chars.get(index + 1) == Some(&'{');
+                let start = index + 1 + usize::from(braced);
+                let mut end = start;
+                while end < chars.len() && (chars[end].is_alphanumeric() || chars[end] == '_') {
+                    end += 1;
+                }
+                if end == start {
+                    return Err("expected a variable name after '$'".to_string());
+                }
+                tokens.push(RuleToken::Variable(chars[start..end].iter().collect()));
+                index = end;
+                if braced {
+                    if chars.get(index) != Some(&'}') {
+                        return Err("unterminated '${'".to_string());
+                    }
+                    index += 1;
+                }
+            }
+            _ if chars[index..]
+                .iter()
+                .collect::<String>()
+                .starts_with("null") =>
+            {
+                tokens.push(RuleToken::Null);
+                index += 4;
+            }
+            ch => return Err(format!("unexpected '{}'", ch)),
         }
     }
-    parts.push(&text[start..]);
-    parts
+    Ok(tokens)
+}
+
+/// Compile the pattern of a `=~`: `/pattern/flags`, or a bare pattern.
+fn compile_rule_regex(pattern: &str) -> Result<regex::Regex, String> {
+    let (pattern, flags) = pattern
+        .strip_prefix('/')
+        .and_then(|rest| rest.rsplit_once('/'))
+        .unwrap_or((pattern, ""));
+    let unescaped = pattern.replace("\\/", "/");
+    let insensitive = if flags.contains('i') { "(?i)" } else { "" };
+    regex::Regex::new(&format!("{}{}", insensitive, unescaped)).map_err(|error| error.to_string())
+}
+
+/// Recursive-descent evaluator for `rules:if`, where `&&` binds tighter than
+/// `||`. Both sides of an operator are always evaluated, so that a mistake is
+/// reported however the rest of the condition turns out.
+struct RuleEvaluator<'a> {
+    tokens: Vec<RuleToken>,
+    position: usize,
+    variables: &'a HashMap<String, String>,
+}
+
+impl RuleEvaluator<'_> {
+    fn peek(&self) -> Option<&RuleToken> {
+        self.tokens.get(self.position)
+    }
+
+    fn accept(&mut self, token: &RuleToken) -> bool {
+        let accepted = self.peek() == Some(token);
+        self.position += usize::from(accepted);
+        accepted
+    }
+
+    fn any_of(&mut self) -> Result<bool, String> {
+        let mut result = self.all_of()?;
+        while self.accept(&RuleToken::Or) {
+            result |= self.all_of()?;
+        }
+        Ok(result)
+    }
+
+    fn all_of(&mut self) -> Result<bool, String> {
+        let mut result = self.term()?;
+        while self.accept(&RuleToken::And) {
+            result &= self.term()?;
+        }
+        Ok(result)
+    }
+
+    fn term(&mut self) -> Result<bool, String> {
+        if self.accept(&RuleToken::OpenParen) {
+            let result = self.any_of()?;
+            if !self.accept(&RuleToken::CloseParen) {
+                return Err("missing ')'".to_string());
+            }
+            return Ok(result);
+        }
+        let left = self.operand()?;
+        let negated = match self.peek() {
+            Some(RuleToken::Equal | RuleToken::Match) => false,
+            Some(RuleToken::NotEqual | RuleToken::NotMatch) => true,
+            // A bare value is true when it's set and not empty.
+            _ => return Ok(left.is_some_and(|value| !value.is_empty())),
+        };
+        let is_regex = matches!(self.peek(), Some(RuleToken::Match | RuleToken::NotMatch));
+        self.position += 1;
+        if is_regex {
+            let regex = self
+                .pattern()?
+                .map(|p| compile_rule_regex(&p))
+                .transpose()?;
+            let matched = match (left, regex) {
+                (Some(value), Some(regex)) => regex.is_match(&value),
+                _ => false,
+            };
+            return Ok(matched != negated);
+        }
+        Ok((left == self.operand()?) != negated)
+    }
+
+    /// A variable, quoted string or `null`, where `None` means null.
+    fn operand(&mut self) -> Result<Option<String>, String> {
+        let token = self.peek().cloned();
+        self.position += 1;
+        match token {
+            Some(RuleToken::Null) => Ok(None),
+            Some(RuleToken::Text(text)) => Ok(Some(text)),
+            Some(RuleToken::Variable(name)) => Ok(self.variables.get(&name).cloned()),
+            Some(token) => Err(format!("unexpected {:?}", token)),
+            None => Err("the condition ends too early".to_string()),
+        }
+    }
+
+    /// The right side of a `=~`, which may hold its pattern in a variable.
+    fn pattern(&mut self) -> Result<Option<String>, String> {
+        if let Some(RuleToken::Regex(pattern)) = self.peek().cloned() {
+            self.position += 1;
+            return Ok(Some(pattern));
+        }
+        self.operand()
+    }
+}
+
+/// Evaluate a `rules:if` condition, or say why it can't be.
+fn evaluate_rule_condition(
+    condition: &str,
+    variables: &HashMap<String, String>,
+) -> Result<bool, String> {
+    let mut evaluator = RuleEvaluator {
+        tokens: tokenize_rule_condition(condition)?,
+        position: 0,
+        variables,
+    };
+    let result = evaluator.any_of()?;
+    match evaluator.peek() {
+        None => Ok(result),
+        Some(token) => Err(format!("unexpected {:?}", token)),
+    }
+}
+
+/// Expand `$NAME` and `${NAME}`, including variables that refer to others. An
+/// undefined reference stays in place, so that the error it causes names it.
+fn expand_variables(text: &str, variables: &HashMap<String, String>) -> String {
+    /// More than enough for real pipelines, and stops a variable that refers
+    /// to itself.
+    const MAX_DEPTH: usize = 8;
+    let reference = regex::Regex::new(r"\$(?:\{(\w+)\}|(\w+))").expect("valid regex");
+    let mut expanded = text.to_string();
+    for _ in 0..MAX_DEPTH {
+        let next = reference
+            .replace_all(&expanded, |captures: &regex::Captures| {
+                let name = captures
+                    .get(1)
+                    .or(captures.get(2))
+                    .map_or("", |m| m.as_str());
+                variables
+                    .get(name)
+                    .cloned()
+                    .unwrap_or_else(|| captures[0].to_string())
+            })
+            .into_owned();
+        if next == expanded {
+            break;
+        }
+        expanded = next;
+    }
+    expanded
 }
 
 /// A string-or-list key from the pipeline's `default:` section.
@@ -253,12 +494,14 @@ fn default_list(pipeline: &Pipeline, key: &str) -> Option<Vec<String>> {
     }
 }
 
-/// The image a job runs in: its own, then `default:`, then the top-level one.
-fn job_image(pipeline: &Pipeline, job: &Job) -> Option<String> {
+/// The image a job runs in: its own, then `default:`, then the top-level one,
+/// with the pipeline's and the job's variables expanded.
+fn job_image(job_name: &str, pipeline: &Pipeline, job: &Job) -> Option<String> {
     let name = |image: &Image| match image {
         Image::Simple(name) | Image::Detailed { name, .. } => name.clone(),
     };
-    job.image
+    let image = job
+        .image
         .as_ref()
         .map(name)
         .or_else(|| {
@@ -267,7 +510,18 @@ fn job_image(pipeline: &Pipeline, job: &Job) -> Option<String> {
                 .ok()
                 .map(|image| name(&image))
         })
-        .or_else(|| pipeline.image.as_ref().map(name))
+        .or_else(|| pipeline.image.as_ref().map(name))?;
+
+    let mut variables = pipeline.variables.clone().unwrap_or_default();
+    variables.extend(job.variables.clone().unwrap_or_default());
+    let expanded = expand_variables(&image, &variables);
+    if expanded.contains('$') {
+        wrkflw_logging::warning(&format!(
+            "Job '{}': image '{}' still refers to an undefined variable",
+            job_name, expanded
+        ));
+    }
+    Some(expanded)
 }
 
 /// The most instances GitLab creates from one job's `parallel`
@@ -405,7 +659,7 @@ pub fn convert_to_workflow_format(pipeline: &Pipeline) -> workflow::WorkflowDefi
             continue;
         }
 
-        let image = job_image(pipeline, gitlab_job);
+        let image = job_image(job_name, pipeline, gitlab_job);
 
         // Create a new job
         let mut job = workflow::Job {
@@ -430,10 +684,9 @@ pub fn convert_to_workflow_format(pipeline: &Pipeline) -> workflow::WorkflowDefi
             with: None,
             secrets: None,
             timeout_minutes: None,
-            // Pipeline images often have no bash, which GitLab falls back from.
             defaults: image.is_some().then(|| workflow::Defaults {
                 run: Some(workflow::DefaultsRun {
-                    shell: Some("sh".to_string()),
+                    shell: Some(SHELL_BASH_OR_SH.to_string()),
                     working_directory: None,
                 }),
             }),
@@ -688,14 +941,20 @@ downstream:
 
     fn when_of(job_yaml: &str, vars: &[(&str, &str)]) -> JobWhen {
         let job: Job = serde_yaml::from_str(job_yaml).unwrap();
-        job_when(&job, &variables(vars))
+        job_when("job", &job, &variables(vars))
     }
 
     #[test]
     fn job_when_reads_the_job_level_key() {
         assert_eq!(when_of("script: [a]", &[]), JobWhen::OnSuccess);
-        assert_eq!(when_of("script: [a]\nwhen: manual", &[]), JobWhen::Skip);
-        assert_eq!(when_of("script: [a]\nwhen: never", &[]), JobWhen::Skip);
+        assert_eq!(
+            when_of("script: [a]\nwhen: manual", &[]),
+            JobWhen::Skip(SkipReason::Manual)
+        );
+        assert_eq!(
+            when_of("script: [a]\nwhen: never", &[]),
+            JobWhen::Skip(SkipReason::Never)
+        );
         assert_eq!(when_of("script: [a]\nwhen: always", &[]), JobWhen::Always);
         assert_eq!(
             when_of("script: [a]\nwhen: on_failure", &[]),
@@ -712,20 +971,31 @@ rules:
     when: never
   - when: always
 "#;
-        assert_eq!(when_of(job, &[("V", "top")]), JobWhen::Skip);
+        assert_eq!(
+            when_of(job, &[("V", "top")]),
+            JobWhen::Skip(SkipReason::Never)
+        );
         assert_eq!(when_of(job, &[("V", "other")]), JobWhen::Always);
     }
 
     #[test]
     fn a_job_whose_rules_all_miss_is_excluded() {
         let job = "script: [a]\nwhen: always\nrules:\n  - if: '$NOPE == \"1\"'\n";
-        assert_eq!(when_of(job, &[]), JobWhen::Skip);
+        assert_eq!(when_of(job, &[]), JobWhen::Skip(SkipReason::NoRuleMatched));
         assert_eq!(when_of(job, &[("NOPE", "1")]), JobWhen::Always);
     }
 
     #[test]
     fn rule_conditions_cover_the_common_operators() {
-        let vars = variables(&[("A", "main"), ("B", "x"), ("EMPTY", "")]);
+        let vars = variables(&[
+            ("A", "main"),
+            ("B", "x"),
+            ("EMPTY", ""),
+            ("QUOTED", "a==b"),
+            ("PATH_LIKE", "release/1.0"),
+            ("PATTERN", "/^MAIN$/i"),
+            ("BARE_PATTERN", "^ma"),
+        ]);
         for (condition, expected) in [
             ("$A", true),
             ("$MISSING", false),
@@ -744,16 +1014,112 @@ rules:
             ("$A == 'nope' && $B == 'x'", false),
             ("$A == 'a||b' || $B == 'nope'", false),
             ("${A} == 'main'", true),
-            // Parentheses aren't supported, so these match with a warning.
-            ("($A == 'nope')", true),
+            ("($A == 'nope')", false),
+            ("($A == 'nope' || $B == 'x') && $A == 'main'", true),
+            ("$A == 'main' && ($B == 'nope' || $B == 'y')", false),
+            ("$A == 'main' || $B == 'x' && $B == 'nope'", true),
+            ("$A=='main'", true),
+            ("$QUOTED != \"a==b\"", false),
+            ("$QUOTED == \"a==b\"", true),
+            ("$PATH_LIKE =~ /^release\\/.*/", true),
+            ("$A =~ /(main)&&(dev)/", false),
+            ("$A =~ $PATTERN", true),
+            ("$A !~ $PATTERN", false),
+            ("$A =~ $BARE_PATTERN", true),
+            ("$A =~ $MISSING", false),
+            ("$MISSING =~ /^$/", false),
+            ("$MISSING !~ /x/", true),
         ] {
             assert_eq!(
-                rule_condition_matches(condition, &vars),
-                expected,
+                evaluate_rule_condition(condition, &vars),
+                Ok(expected),
                 "{}",
                 condition
             );
         }
+    }
+
+    #[test]
+    fn a_condition_that_cannot_be_evaluated_excludes_the_job() {
+        for condition in [
+            "($A == 'x'",
+            "$A ==",
+            "$A == 'x' extra",
+            "$A =~ /(/",
+            "'unterminated",
+            "&& $A",
+        ] {
+            assert!(
+                evaluate_rule_condition(condition, &HashMap::new()).is_err(),
+                "{}",
+                condition
+            );
+        }
+        // Even when the broken rule would have been `when: never`.
+        let job = "script: [a]\nrules:\n  - if: '($A'\n    when: never\n  - when: always\n";
+        assert_eq!(
+            when_of(job, &[]),
+            JobWhen::Skip(SkipReason::InvalidCondition)
+        );
+    }
+
+    #[test]
+    fn rule_clauses_that_arent_evaluated_are_kept_on_the_rule() {
+        let job: Job =
+            serde_yaml::from_str("script: [a]\nrules:\n  - changes: [docs/*]\n").unwrap();
+        let rules = job.rules.as_ref().unwrap();
+        assert!(rules[0].changes.is_some());
+        assert_eq!(job_when("job", &job, &HashMap::new()), JobWhen::OnSuccess);
+    }
+
+    #[test]
+    fn skip_reason_follows_the_outcome_of_earlier_stages() {
+        for (when, runs_after_success, runs_after_failure) in [
+            (JobWhen::OnSuccess, true, false),
+            (JobWhen::OnFailure, false, true),
+            (JobWhen::Always, true, true),
+            (JobWhen::Skip(SkipReason::Manual), false, false),
+        ] {
+            assert_eq!(when.skip_reason(false).is_none(), runs_after_success);
+            assert_eq!(when.skip_reason(true).is_none(), runs_after_failure);
+        }
+    }
+
+    #[test]
+    fn image_names_expand_variables() {
+        let workflow = convert(
+            r#"
+variables:
+  VERSION: "1.76"
+  IMAGE: rust:${VERSION}
+  CUSTOM: global
+plain:
+  image: rust:${VERSION}
+  script: [echo]
+own:
+  image: $CUSTOM:1
+  variables:
+    CUSTOM: job
+  script: [echo]
+nested:
+  image: $IMAGE
+  script: [echo]
+undefined:
+  image: rust:$NOPE
+  script: [echo]
+"#,
+        );
+        let image = |job: &str| workflow.jobs[job].container.as_ref().unwrap().image.clone();
+        assert_eq!(image("plain"), "rust:1.76");
+        assert_eq!(image("own"), "job:1");
+        assert_eq!(image("nested"), "rust:1.76");
+        assert_eq!(image("undefined"), "rust:$NOPE");
+    }
+
+    #[test]
+    fn a_variable_that_refers_to_itself_stops_expanding() {
+        let vars = variables(&[("A", "x$A")]);
+        assert!(expand_variables("$A", &vars).starts_with("xxx"));
     }
 
     #[test]
@@ -794,7 +1160,7 @@ own:
                 .unwrap()
                 .shell
                 .as_deref(),
-            Some("sh")
+            Some(SHELL_BASH_OR_SH)
         );
     }
 

@@ -376,6 +376,12 @@ pub mod gitlab {
         /// Variables to set if condition is true
         #[serde(skip_serializing_if = "Option::is_none")]
         pub variables: Option<HashMap<String, String>>,
+        /// Files whose changes the rule depends on. Not evaluated.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub changes: Option<serde_yaml::Value>,
+        /// Files whose presence the rule depends on. Not evaluated.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub exists: Option<serde_yaml::Value>,
     }
 
     /// Only/except configuration

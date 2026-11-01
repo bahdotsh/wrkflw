@@ -340,20 +340,35 @@ fn get_current_sha() -> String {
     "0000000000000000000000000000000000000000".to_string()
 }
 
-pub(crate) fn get_current_ref() -> String {
-    if let Ok(output) = std::process::Command::new("git")
-        .args(["symbolic-ref", "--short", "HEAD"])
+/// Run `git symbolic-ref --short` on a ref, or `None` if it isn't symbolic.
+fn symbolic_ref(name: &str) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(["symbolic-ref", "--short", name])
         .output()
-    {
-        if output.status.success() {
-            return format!(
-                "refs/heads/{}",
-                String::from_utf8_lossy(&output.stdout).trim()
-            );
-        }
-    }
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
 
-    "refs/heads/main".to_string()
+/// The checked-out branch, or `None` on a detached HEAD or outside a repository.
+pub(crate) fn current_branch() -> Option<String> {
+    symbolic_ref("HEAD")
+}
+
+/// The branch `origin/HEAD` points at, falling back to `main`.
+pub(crate) fn default_branch() -> String {
+    symbolic_ref("refs/remotes/origin/HEAD")
+        .and_then(|name| name.strip_prefix("origin/").map(str::to_string))
+        .unwrap_or_else(|| "main".to_string())
+}
+
+fn get_current_ref() -> String {
+    format!(
+        "refs/heads/{}",
+        current_branch().unwrap_or_else(|| "main".to_string())
+    )
 }
 
 fn get_runner_os() -> String {

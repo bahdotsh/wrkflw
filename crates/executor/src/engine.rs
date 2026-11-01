@@ -5887,7 +5887,11 @@ fn convert_yaml_to_step(step_yaml: &serde_yaml::Value) -> Result<workflow::Step,
     // Extract continue_on_error
     let continue_on_error = step_yaml.get("continue-on-error").and_then(|v| v.as_bool());
 
-    let if_condition = step_yaml.get("if").and_then(yaml_scalar_to_string);
+    // A null `if:` means no condition, not a condition that can't be parsed.
+    let if_condition = step_yaml
+        .get("if")
+        .and_then(yaml_scalar_to_string)
+        .filter(|condition| !condition.is_empty());
 
     let id = step_yaml
         .get("id")
@@ -10249,6 +10253,13 @@ runs:
         assert_eq!(step.env["ON"], "true");
         assert_eq!(step.with.unwrap()["n"], "1.5");
         assert_eq!(step.if_condition.as_deref(), Some("true"));
+    }
+
+    #[test]
+    fn composite_step_with_null_if_has_no_condition() {
+        let step =
+            convert_yaml_to_step(&serde_yaml::from_str("run: echo\nif: ~\n").unwrap()).unwrap();
+        assert_eq!(step.if_condition, None);
     }
 
     #[test]

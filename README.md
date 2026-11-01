@@ -334,7 +334,7 @@ jobs:
 - `with:` entries become `INPUT_<KEY>` env vars; `secrets:` become `SECRET_<KEY>`
 - Outputs from called jobs are merged back into `needs.<id>.outputs.*`
 
-**Limitations:** private repos for remote `uses:` are not yet supported (the clone is unauthenticated); declared `on.workflow_call.outputs` is approximated by flattening all called-job outputs (the explicit mapping is not yet parsed).
+**Limitations:** private repos for remote `uses:` are not yet supported (the clone is unauthenticated). A called workflow that declares no `on.workflow_call.outputs` exposes all of its job outputs.
 
 ## Secrets Management
 

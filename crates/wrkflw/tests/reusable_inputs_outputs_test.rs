@@ -33,6 +33,10 @@ on:
       result:
         description: mapped from a job output
         value: ${{ jobs.inner.outputs.r }}
+      prefixed:
+        value: ${{ inputs.name }}-${{ jobs.inner.outputs.r }}
+      fixed:
+        value: 5
 jobs:
   inner:
     runs-on: ubuntu-latest
@@ -41,6 +45,7 @@ jobs:
     steps:
       - id: s
         run: echo "r=${{ inputs.name }}:${{ inputs.with-default }}:${{ inputs.number }}" >> "$GITHUB_OUTPUT"
+      - run: test "$SECRET_TOKEN" = dynamic && test "$SECRET_PIN" = 1234
 "#;
     write_file(&called_path, called);
 
@@ -60,17 +65,24 @@ jobs:
     uses: ./called.yml
     with:
       name: ${{ needs.pre.outputs.v }}
+    secrets:
+      token: ${{ needs.pre.outputs.v }}
+      pin: 1234
   after:
     needs: call
     runs-on: ubuntu-latest
     steps:
       - env:
           O: ${{ needs.call.outputs.result }}
-        run: test "$O" = "dynamic:dflt:7"
+          P: ${{ needs.call.outputs.prefixed }}
+          F: ${{ needs.call.outputs.fixed }}
+        run: test "$O" = "dynamic:dflt:7" && test "$P" = "dynamic-dynamic:dflt:7" && test "$F" = 5
 "#;
     write_file(&caller_path, caller);
 
-    // Local reusable workflows must live under the current directory.
+    // Local reusable workflows must live under the current directory. The cwd
+    // is process-wide, so a second test in this file would race with this one.
+    // Give it its own test binary instead.
     std::env::set_current_dir(dir.path()).unwrap();
 
     let cfg = ExecutionConfig {

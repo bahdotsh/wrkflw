@@ -5019,6 +5019,8 @@ async fn run_called_workflow(
     let expr_ctx = crate::expression::ExpressionContext {
         env_context: ctx.env_context,
         step_outputs: &HashMap::new(),
+        // `execute_matrix_job` doesn't dispatch `uses:` jobs, so a caller with
+        // a matrix never gets here. Pass the combination in if that changes.
         matrix_combination: &None,
         step_statuses: &HashMap::new(),
         job_status: "success",
@@ -5061,8 +5063,8 @@ async fn run_called_workflow(
             }
         } else if let Some(map) = secrets_val.as_mapping() {
             for (k, v) in map {
-                if let (Some(key), Some(value)) = (k.as_str(), v.as_str()) {
-                    child_env.insert(format!("SECRET_{}", key.to_uppercase()), evaluate(value));
+                if let (Some(key), Some(value)) = (k.as_str(), yaml_scalar_to_string(v)) {
+                    child_env.insert(format!("SECRET_{}", key.to_uppercase()), evaluate(&value));
                 }
             }
         }
@@ -5126,9 +5128,8 @@ async fn run_called_workflow(
     );
 
     // Aggregate outputs from all jobs in the called workflow
-    let outputs =
-        declared_reusable_workflow_outputs(called, &reusable_job_outputs, ctx.env_context)
-            .unwrap_or_else(|| aggregate_reusable_workflow_outputs(&reusable_job_outputs));
+    let outputs = declared_reusable_workflow_outputs(called, &reusable_job_outputs, &child_env)
+        .unwrap_or_else(|| aggregate_reusable_workflow_outputs(&reusable_job_outputs));
 
     Ok(JobResult {
         name: ctx.job_name.to_string(),
@@ -5145,7 +5146,10 @@ async fn run_called_workflow(
 }
 
 /// Evaluate `on.workflow_call.outputs` against the called workflow's job
-/// outputs. Returns `None` when the workflow declares no outputs.
+/// outputs. `env_context` must be the called workflow's env, since `inputs.*`
+/// may appear in an output's `value:`. Every declared name stays in the map, so
+/// a value that can't be evaluated reads as empty. Returns `None` when the
+/// workflow declares no outputs.
 fn declared_reusable_workflow_outputs(
     called: &WorkflowDefinition,
     job_outputs: &HashMap<String, HashMap<String, String>>,
@@ -5173,9 +5177,12 @@ fn declared_reusable_workflow_outputs(
         declared
             .iter()
             .filter_map(|(name, definition)| {
-                let value = definition.get("value")?.as_str()?;
-                let resolved =
-                    crate::substitution::preprocess_expressions(value, &cwd, &ctx).ok()?;
+                let value = definition
+                    .get("value")
+                    .and_then(yaml_scalar_to_string)
+                    .unwrap_or_default();
+                let resolved = crate::substitution::preprocess_expressions(&value, &cwd, &ctx)
+                    .unwrap_or_default();
                 Some((name.as_str()?.to_string(), resolved))
             })
             .collect(),
@@ -10204,6 +10211,21 @@ runs:
         assert_eq!(outputs["result"], "1-x");
         assert_eq!(outputs["missing"], "");
         assert!(!outputs.contains_key("r"));
+    }
+
+    #[test]
+    fn declared_reusable_outputs_read_inputs_and_keep_non_string_values() {
+        let called = workflow_with_trigger(
+            "workflow_call:\n  outputs:\n    prefixed:\n      value: ${{ inputs.prefix }}-x\n    number:\n      value: 5\n    no-value:\n      description: nothing\n",
+        );
+        let child_env = HashMap::from([("INPUT_PREFIX".to_string(), "p".to_string())]);
+
+        let outputs =
+            declared_reusable_workflow_outputs(&called, &HashMap::new(), &child_env).unwrap();
+
+        assert_eq!(outputs["prefixed"], "p-x");
+        assert_eq!(outputs["number"], "5");
+        assert_eq!(outputs["no-value"], "");
     }
 
     #[test]

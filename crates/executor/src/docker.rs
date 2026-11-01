@@ -2,7 +2,7 @@ use crate::container_guard::ContainerGuard;
 use async_trait::async_trait;
 use bollard::{
     container::{Config, CreateContainerOptions},
-    models::HostConfig,
+    models::{ContainerWaitResponse, HostConfig},
     network::CreateNetworkOptions,
     Docker,
 };
@@ -419,6 +419,25 @@ pub fn is_available() -> bool {
         "Docker availability check timed out, assuming Docker is not available",
     );
     false
+}
+
+/// The exit code of a finished container, or -1 if it can't be determined.
+fn wait_exit_code(
+    wait_result: Option<&Result<ContainerWaitResponse, bollard::errors::Error>>,
+) -> i32 {
+    match wait_result {
+        Some(Ok(exit)) => exit.status_code as i32,
+        // bollard reports a non-zero exit as an error
+        Some(Err(bollard::errors::Error::DockerContainerWaitError { code, .. })) => *code as i32,
+        Some(Err(e)) => {
+            wrkflw_logging::warning(&format!("Failed to wait for container: {}", e));
+            -1
+        }
+        None => {
+            wrkflw_logging::warning("Container wait returned no result");
+            -1
+        }
+    }
 }
 
 // Add container to tracking
@@ -1030,10 +1049,7 @@ impl DockerRuntime {
             .await;
         guard.disarm();
 
-        let exit_code = match wait_result.first() {
-            Some(Ok(exit)) => exit.status_code as i32,
-            _ => -1,
-        };
+        let exit_code = wait_exit_code(wait_result.first());
 
         // Get logs with a timeout
         let log_options = Some(bollard::container::LogsOptions::<String> {
@@ -1283,6 +1299,38 @@ pub fn get_tracked_networks() -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    use super::wait_exit_code;
+    use bollard::errors::Error;
+    use bollard::models::ContainerWaitResponse;
+
+    #[test]
+    fn wait_exit_code_keeps_a_zero_exit() {
+        let wait = Ok(ContainerWaitResponse {
+            status_code: 0,
+            error: None,
+        });
+        assert_eq!(wait_exit_code(Some(&wait)), 0);
+    }
+
+    #[test]
+    fn wait_exit_code_recovers_a_non_zero_exit_from_the_error() {
+        let wait = Err(Error::DockerContainerWaitError {
+            error: String::new(),
+            code: 42,
+        });
+        assert_eq!(wait_exit_code(Some(&wait)), 42);
+    }
+
+    #[test]
+    fn wait_exit_code_is_unknown_when_the_wait_fails() {
+        let wait = Err(Error::DockerResponseServerError {
+            status_code: 500,
+            message: "daemon went away".to_string(),
+        });
+        assert_eq!(wait_exit_code(Some(&wait)), -1);
+        assert_eq!(wait_exit_code(None), -1);
+    }
+
     use super::*;
 
     fn config_for(image: &str, cmd: &[&str], entrypoint: Option<&str>) -> Config<String> {

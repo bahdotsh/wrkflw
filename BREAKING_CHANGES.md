@@ -13,9 +13,14 @@ A missing artifact otherwise shows up at download, or not at all.
 `!` lines apply in order, so a later line can re-include a file. A `path:` line
 outside the workspace now fails the step instead of being skipped.
 
+Hidden files are skipped unless `include-hidden-files: true` is set, as in
+upload-artifact v4. A file or directory is hidden if its name starts with a dot,
+so `path: .` no longer uploads `.git`, and `path: .config/` matches nothing.
+
 Uploading to an existing artifact name replaces it. Files used to be merged into
-the earlier upload, so matrix jobs sharing a name now keep only the last upload.
-Give each job its own name, as GitHub requires.
+the earlier upload. Matrix jobs sharing a name now keep exactly one job's files,
+and with parallel jobs which one is not defined. Give each job its own name, as
+GitHub requires.
 
 ## `ExecutionConfig` gained a `platform_overrides` field (unreleased)
 

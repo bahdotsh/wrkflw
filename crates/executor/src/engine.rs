@@ -421,7 +421,9 @@ async fn execute_gitlab_pipeline(
 
     for job_batch in execution_plan {
         // Naming a job is how to get past a gate, so it doesn't wait for one.
+        // After a failure a manual job is skipped instead of waiting.
         let stage_blocks = config.target_job.is_none()
+            && !has_failures
             && job_batch.iter().any(|job_name| {
                 job_conditions
                     .get(job_name)
@@ -522,9 +524,21 @@ fn apply_gitlab_variable_overrides(pipeline: &mut Pipeline, overrides: &HashMap<
         .variables
         .get_or_insert_with(HashMap::new)
         .extend(overrides.clone());
-    for job in pipeline.jobs.values_mut() {
+    for (job_name, job) in pipeline.jobs.iter_mut() {
         if let Some(variables) = &mut job.variables {
             variables.extend(overrides.clone());
+        }
+        if let Some(wrkflw_models::gitlab::Parallel::Matrix { matrix }) = &job.parallel {
+            for name in matrix
+                .iter()
+                .flat_map(HashMap::keys)
+                .filter(|name| overrides.contains_key(*name))
+            {
+                wrkflw_logging::warning(&format!(
+                    "Job '{}': parallel:matrix sets '{}', so --variable doesn't reach its instances",
+                    job_name, name
+                ));
+            }
         }
     }
 }
@@ -601,8 +615,8 @@ fn gitlab_predefined_variables(
 }
 
 /// A tag pipeline has no branch, so a tag given or found hides the checked-out
-/// branch from rules and scripts alike. `CI_COMMIT_REF_NAME` follows whichever
-/// ref the run ends up on.
+/// branch from rules and scripts alike, and so does simulating a merge request
+/// pipeline. `CI_COMMIT_REF_NAME` follows whichever ref the run ends up on.
 fn gitlab_predefined_variables_for(
     pipeline_path: &Path,
     branch: Option<String>,
@@ -611,10 +625,13 @@ fn gitlab_predefined_variables_for(
     overrides: &HashMap<String, String>,
 ) -> HashMap<String, String> {
     let given = |name: &str| overrides.get(name).cloned();
+    let merge_request =
+        overrides.get("CI_PIPELINE_SOURCE").map(String::as_str) == Some("merge_request_event");
+    let branch_given = overrides.contains_key("CI_COMMIT_BRANCH");
     let branch = given("CI_COMMIT_BRANCH").or(branch);
     let tag = match given("CI_COMMIT_TAG") {
         Some(tag) => Some(tag),
-        None if overrides.contains_key("CI_COMMIT_BRANCH") => None,
+        None if branch_given => None,
         None => tag,
     }
     .filter(|tag| !tag.is_empty());
@@ -635,7 +652,9 @@ fn gitlab_predefined_variables_for(
             variables.insert("CI_COMMIT_REF_NAME".to_string(), tag);
         }
         (None, Some(branch)) => {
-            variables.insert("CI_COMMIT_BRANCH".to_string(), branch.clone());
+            if branch_given || !merge_request {
+                variables.insert("CI_COMMIT_BRANCH".to_string(), branch.clone());
+            }
             variables.insert("CI_COMMIT_REF_NAME".to_string(), branch);
         }
         (None, None) => {}
@@ -4684,7 +4703,10 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
         let mut custom_shell_script: Option<CustomShellScript> = None;
 
         let cmd_parts: Vec<String> = match effective_shell {
-            "bash" => vec![
+            gitlab::SHELL_BASH_OR_SH if !ctx.runtime.flattens_commands() => {
+                bash_or_sh_command(&resolved_run)
+            }
+            "bash" | gitlab::SHELL_BASH_OR_SH => vec![
                 "bash".to_string(),
                 "--noprofile".to_string(),
                 "--norc".to_string(),
@@ -4700,7 +4722,6 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                 "-c".to_string(),
                 resolved_run.clone(),
             ],
-            gitlab::SHELL_BASH_OR_SH => bash_or_sh_command(&resolved_run),
             "python" => vec!["python".to_string(), "-c".to_string(), resolved_run.clone()],
             "pwsh" | "powershell" => vec![
                 "pwsh".to_string(),
@@ -12996,6 +13017,14 @@ job:
 
         let no_tag = resolve(Some("main"), Some("v1"), &[("CI_COMMIT_TAG", "")]);
         assert_eq!(no_tag["CI_COMMIT_BRANCH"], "main");
+
+        let source = ("CI_PIPELINE_SOURCE", "merge_request_event");
+        let merge_request = resolve(Some("main"), None, &[source]);
+        assert!(!merge_request.contains_key("CI_COMMIT_BRANCH"));
+        assert_eq!(merge_request["CI_COMMIT_REF_NAME"], "main");
+
+        let both = resolve(Some("main"), None, &[source, ("CI_COMMIT_BRANCH", "dev")]);
+        assert_eq!(both["CI_COMMIT_BRANCH"], "dev");
     }
 
     #[test]
@@ -13011,6 +13040,31 @@ job:
             environment::current_branch(repository.path()).as_deref(),
             Some("pipeline-branch")
         );
+
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+                .args(args)
+                .current_dir(repository.path())
+                .status()
+                .unwrap();
+            assert!(status.success(), "{:?}", args);
+        };
+        assert_eq!(environment::default_branch(repository.path()), "main");
+        git(&["commit", "-q", "--allow-empty", "-m", "first"]);
+        assert_eq!(environment::exact_tag(repository.path()), None);
+        git(&["tag", "v1"]);
+        assert_eq!(
+            environment::exact_tag(repository.path()).as_deref(),
+            Some("v1")
+        );
+        git(&["update-ref", "refs/remotes/origin/trunk", "HEAD"]);
+        git(&[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/trunk",
+        ]);
+        assert_eq!(environment::default_branch(repository.path()), "trunk");
     }
 
     #[test]

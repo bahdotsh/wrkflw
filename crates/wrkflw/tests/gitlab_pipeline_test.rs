@@ -9,11 +9,20 @@ use wrkflw_lib::executor::engine::{
 };
 
 async fn run(yaml: &str, target_job: Option<&str>, variables: &[(&str, &str)]) -> ExecutionResult {
+    run_in(RuntimeType::Emulation, yaml, target_job, variables).await
+}
+
+async fn run_in(
+    runtime_type: RuntimeType,
+    yaml: &str,
+    target_job: Option<&str>,
+    variables: &[(&str, &str)],
+) -> ExecutionResult {
     let dir = tempdir().unwrap();
     let path = dir.path().join(".gitlab-ci.yml");
     fs::write(&path, yaml).unwrap();
     let cfg = ExecutionConfig {
-        runtime_type: RuntimeType::Emulation,
+        runtime_type,
         verbose: false,
         preserve_containers_on_failure: false,
         secrets_config: None,
@@ -293,7 +302,7 @@ named:
 }
 
 #[tokio::test]
-async fn a_job_with_an_image_runs_its_scripts() {
+async fn a_job_with_an_image_runs_through_the_shell_selector() {
     let result = run(
         r#"
 variables:
@@ -308,4 +317,92 @@ job:
     )
     .await;
     assert_eq!(status(&result, "job"), JobStatus::Success);
+}
+
+#[tokio::test]
+async fn a_job_with_an_image_runs_under_secure_emulation() {
+    let result = run_in(
+        RuntimeType::SecureEmulation,
+        "job:\n  image: alpine:3.20\n  script: [\"true\"]\n",
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(status(&result, "job"), JobStatus::Success);
+}
+
+#[tokio::test]
+async fn a_manual_job_skipped_by_a_failure_does_not_block() {
+    let result = run(
+        r#"
+stages: [test, deploy, cleanup]
+unit:
+  stage: test
+  script: ["exit 1"]
+deploy:
+  stage: deploy
+  rules:
+    - when: manual
+  script: ["true"]
+teardown:
+  stage: cleanup
+  when: always
+  script: ["true"]
+notify:
+  stage: cleanup
+  when: on_failure
+  script: ["true"]
+"#,
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(status(&result, "deploy"), JobStatus::Skipped);
+    assert_eq!(status(&result, "teardown"), JobStatus::Success);
+    assert_eq!(status(&result, "notify"), JobStatus::Success);
+}
+
+#[tokio::test]
+async fn a_rule_that_forbids_failure_stops_later_stages() {
+    let result = run(
+        r#"
+stages: [first, second]
+strict:
+  stage: first
+  allow_failure: true
+  rules:
+    - allow_failure: false
+  script: ["exit 1"]
+after:
+  stage: second
+  script: ["true"]
+"#,
+        None,
+        &[],
+    )
+    .await;
+    assert!(result.failure_details.is_some());
+    assert_eq!(status(&result, "after"), JobStatus::Skipped);
+}
+
+#[tokio::test]
+async fn naming_a_matrix_job_runs_past_its_matrix_condition() {
+    let pipeline = r#"
+job:
+  parallel:
+    matrix:
+      - CLOUD: [aws]
+  rules:
+    - if: $CLOUD == "aws"
+  script: ["true"]
+"#;
+    let excluded = run(pipeline, None, &[]).await;
+    assert_eq!(status(&excluded, "job"), JobStatus::Skipped);
+
+    let named = run(pipeline, Some("job"), &[]).await;
+    assert!(named.failure_details.is_none());
+    assert!(named
+        .jobs
+        .iter()
+        .all(|job| job.status == JobStatus::Success));
 }

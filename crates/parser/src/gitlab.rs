@@ -152,8 +152,8 @@ pub enum SkipReason {
     RefFilter,
     /// A `rules:if` or `only:`/`except:` condition couldn't be evaluated.
     InvalidCondition,
-    /// A `rules:if` reads a `parallel:matrix` variable. Rules are decided once
-    /// per job, so no single answer holds for every instance.
+    /// A condition reads a `parallel:matrix` variable. Conditions are decided
+    /// once per job, so no single answer holds for every instance.
     MatrixCondition,
     /// A `when:` value that isn't one of GitLab's.
     UnknownWhen,
@@ -202,7 +202,7 @@ impl JobWhen {
                 Some("when: manual jobs can't be started on a local run, so later stages wait")
             }
             JobWhen::Skip(SkipReason::MatrixCondition) => {
-                Some("a rule reads a parallel:matrix variable, which isn't evaluated")
+                Some("a condition reads a parallel:matrix variable, which isn't evaluated")
             }
             JobWhen::Skip(SkipReason::NoRuleMatched) => Some("no rule matched"),
             JobWhen::Skip(SkipReason::RefFilter) => Some("only/except excludes this run"),
@@ -231,10 +231,10 @@ pub fn job_decision(job_name: &str, job: &Job, variables: &HashMap<String, Strin
             owner
         ));
     }
-    if let Some(variable) = matrix_variable_in_rules(job) {
+    if let Some(variable) = matrix_variable_in_conditions(job) {
         wrkflw_logging::warning(&format!(
-            "{} is excluded: its rules read parallel:matrix variable '{}', and rules aren't \
-             evaluated per instance. Name it with --job to run every instance",
+            "{} is excluded: its conditions read parallel:matrix variable '{}', and they \
+             aren't evaluated per instance. Name it with --job to run every instance",
             owner, variable
         ));
         return excluded(SkipReason::MatrixCondition);
@@ -284,15 +284,22 @@ fn allow_failure_flag(allow_failure: &AllowFailure) -> Option<bool> {
     }
 }
 
-/// A `parallel:matrix` variable that one of the job's `rules:if` reads.
-fn matrix_variable_in_rules(job: &Job) -> Option<String> {
+/// A `parallel:matrix` variable that one of the job's `rules:if` or
+/// `only:`/`except:` variables expressions reads.
+fn matrix_variable_in_conditions(job: &Job) -> Option<String> {
     let Some(Parallel::Matrix { matrix }) = &job.parallel else {
         return None;
     };
+    let filters = job
+        .only
+        .iter()
+        .map(RefFilter::from_only)
+        .chain(job.except.iter().map(RefFilter::from_except));
     job.rules
         .iter()
         .flatten()
         .filter_map(|rule| rule.if_.as_deref())
+        .chain(filters.flat_map(|filter| filter.variables.iter().map(String::as_str)))
         .flat_map(|condition| tokenize_rule_condition(condition).unwrap_or_default())
         .find_map(|token| match token {
             RuleToken::Variable(name) if matrix.iter().any(|entry| entry.contains_key(&name)) => {
@@ -1583,6 +1590,18 @@ own:
     }
 
     #[test]
+    fn a_rule_can_forbid_what_the_job_allows() {
+        let job: Job = serde_yaml::from_str(
+            "script: [a]\nallow_failure: true\nrules:\n  - allow_failure: false\n",
+        )
+        .unwrap();
+        assert_eq!(
+            job_decision("job", &job, &HashMap::new()).allow_failure,
+            Some(false)
+        );
+    }
+
+    #[test]
     fn rules_reading_a_matrix_variable_exclude_the_job() {
         let matrix = "script: [a]\nparallel:\n  matrix:\n    - CLOUD: [aws, gcp]\n";
         assert_eq!(
@@ -1602,6 +1621,22 @@ own:
             ),
             JobWhen::OnSuccess
         );
+    }
+
+    #[test]
+    fn only_and_except_reading_a_matrix_variable_exclude_the_job() {
+        let matrix = "script: [a]\nparallel:\n  matrix:\n    - CLOUD: [aws, gcp]\n";
+        for filter in [
+            "except: {variables: ['$CLOUD == \"gcp\"']}",
+            "only: {variables: ['$CLOUD == \"aws\"']}",
+        ] {
+            assert_eq!(
+                when_of(&format!("{}{}", matrix, filter), &[]),
+                JobWhen::Skip(SkipReason::MatrixCondition),
+                "{}",
+                filter
+            );
+        }
     }
 
     #[test]

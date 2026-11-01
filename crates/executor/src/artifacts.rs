@@ -2,10 +2,11 @@
 //! `actions/download-artifact` emulation.
 //!
 //! Artifacts are stored as plain files under a per-workflow-run temporary
-//! directory, preserving directory structure relative to the workspace.
+//! directory, laid out relative to where the `path:` search started, as
+//! `actions/upload-artifact` does.
 
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::collections::{BTreeMap, HashMap};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -34,56 +35,96 @@ fn sanitize_artifact_name(name: &str) -> Result<String, String> {
     Ok(name.to_string())
 }
 
+/// Resolve `.` and `..` lexically, so that paths from the same `path:` line
+/// compare equal however they were spelled.
+fn normalize(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => match normalized.components().next_back() {
+                Some(Component::Normal(_)) => {
+                    normalized.pop();
+                }
+                Some(Component::ParentDir) | None => normalized.push(".."),
+                _ => {}
+            },
+            other => normalized.push(other),
+        }
+    }
+    normalized
+}
+
 /// Files within the workspace matching a glob or directory path, as
-/// (original, canonical) pairs.
+/// (normalized, original) pairs. Containment is decided on the canonical path;
+/// the normalized path is what names the file in the artifact, so a file
+/// reached through a symlinked directory keeps the path it was found at.
 fn matching_files(
     workspace: &Path,
     pattern: &str,
     canonical_workspace: &Path,
 ) -> Result<Vec<(PathBuf, PathBuf)>, String> {
     let trimmed = pattern.trim_end_matches('/');
-    let path = workspace.join(trimmed);
-    let full_pattern = if path.is_dir() {
-        path.join("**").join("*")
+    let literal = workspace.join(trimmed);
+    let full_pattern = if literal.is_dir() {
+        PathBuf::from(glob::Pattern::escape(&literal.to_string_lossy()))
+            .join("**")
+            .join("*")
     } else {
-        path
+        let glob_path = if Path::new(trimmed).is_absolute() {
+            PathBuf::from(trimmed)
+        } else {
+            PathBuf::from(glob::Pattern::escape(&workspace.to_string_lossy())).join(trimmed)
+        };
+        // The glob crate's trailing `**` matches directories only, whereas
+        // `dist/**` in a workflow means everything under `dist`.
+        if glob_path.file_name().is_some_and(|name| name == "**") {
+            glob_path.join("*")
+        } else {
+            glob_path
+        }
     };
     Ok(glob::glob(&full_pattern.to_string_lossy())
         .map_err(|e| format!("Invalid glob pattern '{}': {}", pattern, e))?
         .filter_map(|e| e.ok())
         .filter(|p| p.is_file() && !p.is_symlink())
-        .filter_map(|p| {
+        .filter(|p| {
             p.canonicalize()
-                .ok()
-                .filter(|c| c.starts_with(canonical_workspace))
-                .map(|c| (p, c))
+                .is_ok_and(|c| c.starts_with(canonical_workspace))
         })
+        .map(|p| (normalize(&p), p))
         .collect())
 }
 
-/// The directory a `path:` line starts from: its part before the first
-/// wildcard, or the parent of a single file.
+/// The directory a `path:` line starts from: the directory it names, its part
+/// before the first wildcard, or the parent of a single file. Only the line
+/// itself is searched for wildcards, as the workspace path may contain them.
 fn search_root(workspace: &Path, pattern: &str) -> PathBuf {
-    let path = workspace.join(pattern.trim_end_matches('/'));
-    let wildcard = path
+    let trimmed = pattern.trim_end_matches('/');
+    let path = workspace.join(trimmed);
+    if path.is_dir() {
+        return normalize(&path);
+    }
+    let line = Path::new(trimmed);
+    let wildcard = line
         .components()
         .position(|c| c.as_os_str().to_string_lossy().contains(['*', '?', '[']));
-    match wildcard {
-        Some(index) => path.components().take(index).collect(),
-        None if path.is_dir() => path,
+    let root = match wildcard {
+        Some(index) => workspace.join(line.components().take(index).collect::<PathBuf>()),
         None => path.parent().map(Path::to_path_buf).unwrap_or(path),
-    }
+    };
+    normalize(&root)
 }
 
-/// The deepest directory containing every path. `paths` must not be empty.
-fn common_ancestor(paths: &[PathBuf]) -> PathBuf {
-    let mut root = paths[0].clone();
+/// The deepest directory containing every path, or `None` if there are none.
+fn common_ancestor(paths: &[PathBuf]) -> Option<PathBuf> {
+    let mut root = paths.first()?.clone();
     while !paths.iter().all(|path| path.starts_with(&root)) {
         if !root.pop() {
             break;
         }
     }
-    root
+    Some(root)
 }
 
 /// Recursively collect all regular files under `dir`, skipping symlinks.
@@ -129,10 +170,14 @@ impl ArtifactStore {
         })
     }
 
-    /// Upload files matching a glob pattern into a named artifact.
+    /// Upload the files selected by a `path:` input into a named artifact.
     ///
-    /// Files are copied from `workspace` preserving their relative paths.
-    /// Returns the number of files uploaded.
+    /// `path_pattern` holds one glob or path per line. Lines starting with `!`
+    /// exclude files and lines starting with `#` are comments. Paths in the
+    /// artifact are relative to the search root of the lines.
+    ///
+    /// Returns the number of files uploaded. When that is zero, no artifact is
+    /// recorded; whether that is an error is the caller's decision.
     pub async fn upload(
         &self,
         name: &str,
@@ -153,7 +198,7 @@ impl ArtifactStore {
             let lines: Vec<&str> = pattern
                 .lines()
                 .map(str::trim)
-                .filter(|line| !line.is_empty())
+                .filter(|line| !line.is_empty() && !line.starts_with('#'))
                 .collect();
             let includes: Vec<&str> = lines
                 .iter()
@@ -162,18 +207,17 @@ impl ArtifactStore {
                 .collect();
             let excludes: Vec<&str> = lines.iter().filter_map(|l| l.strip_prefix('!')).collect();
 
-            // Collect (original, canonical) pairs in one pass to avoid
-            // double-canonicalize per file.
-            let mut entries: Vec<(PathBuf, PathBuf)> = Vec::new();
+            // Keyed by normalized path: this removes files matched by several
+            // lines, and a file stays selected under each path it is found at.
+            let mut entries: BTreeMap<PathBuf, PathBuf> = BTreeMap::new();
             for include in &includes {
                 entries.extend(matching_files(&ws, include, &canonical_workspace)?);
             }
             for exclude in &excludes {
-                let excluded = matching_files(&ws, exclude, &canonical_workspace)?;
-                entries.retain(|(_, canonical)| !excluded.iter().any(|(_, c)| c == canonical));
+                for (normalized, _) in matching_files(&ws, exclude, &canonical_workspace)? {
+                    entries.remove(&normalized);
+                }
             }
-            entries.sort_by(|a, b| a.1.cmp(&b.1));
-            entries.dedup_by(|a, b| a.1 == b.1);
 
             if entries.is_empty() {
                 return Ok(0);
@@ -186,17 +230,17 @@ impl ArtifactStore {
             // started, or to what the search paths share when there are several.
             let search_roots: Vec<PathBuf> = includes
                 .iter()
-                .filter_map(|include| search_root(&ws, include).canonicalize().ok())
+                .map(|include| search_root(&ws, include))
                 .collect();
-            let root = common_ancestor(&search_roots);
+            let root = common_ancestor(&search_roots).unwrap_or_else(|| normalize(&ws));
 
             let mut count = 0;
-            for (entry, canonical_entry) in &entries {
-                let rel = canonical_entry.strip_prefix(&root).map_err(|_| {
+            for (normalized, entry) in &entries {
+                let rel = normalized.strip_prefix(&root).map_err(|_| {
                     format!(
-                        "File '{}' is not within workspace '{}'",
+                        "File '{}' is not under the artifact root '{}'",
                         entry.display(),
-                        ws.display()
+                        root.display()
                     )
                 })?;
                 let dest = ad.join(rel);
@@ -404,6 +448,140 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn trailing_double_star_uploads_everything_below_it() {
+        let target = round_trip(&["out/a.txt", "out/sub/b.txt", "other.txt"], "out/**").await;
+        assert!(target.path().join("a.txt").is_file());
+        assert!(target.path().join("sub/b.txt").is_file());
+        assert!(!target.path().join("other.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn trailing_double_star_works_in_exclusions() {
+        let target = round_trip(&["out/a.txt", "out/cache/b.txt"], "out/\n!out/cache/**").await;
+        assert!(target.path().join("a.txt").is_file());
+        assert!(!target.path().join("cache/b.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn comment_lines_are_ignored() {
+        let target = round_trip(&["out/a.txt", "other/b.txt"], "# other/\nout/").await;
+        assert!(target.path().join("a.txt").is_file());
+        assert!(!target.path().join("b.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn dot_paths_are_relative_to_the_workspace() {
+        for path in [".", "./out/..", "./*"] {
+            let target = round_trip(&["a.txt", "out/b.txt"], path).await;
+            assert!(target.path().join("a.txt").is_file(), "{}", path);
+        }
+    }
+
+    #[tokio::test]
+    async fn absolute_paths_inside_the_workspace_are_uploaded() {
+        let run_dir = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        std::fs::create_dir_all(workspace.path().join("out")).unwrap();
+        std::fs::write(workspace.path().join("out/a.txt"), "x").unwrap();
+        let store = ArtifactStore::new(run_dir.path()).unwrap();
+        let path = workspace.path().join("out");
+        store
+            .upload("a", &path.to_string_lossy(), workspace.path())
+            .await
+            .unwrap();
+        let target = tempdir().unwrap();
+        store.download("a", target.path()).await.unwrap();
+        assert!(target.path().join("a.txt").is_file());
+    }
+
+    #[tokio::test]
+    async fn a_line_matching_nothing_still_counts_towards_the_root() {
+        let target = round_trip(&["dist/a/1.txt"], "dist/a/\ndist/missing/").await;
+        assert!(target.path().join("a/1.txt").is_file());
+    }
+
+    #[tokio::test]
+    async fn only_exclusions_select_nothing() {
+        let run_dir = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        std::fs::write(workspace.path().join("a.txt"), "x").unwrap();
+        let store = ArtifactStore::new(run_dir.path()).unwrap();
+        let count = store.upload("a", "!*.log", workspace.path()).await.unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn glob_characters_in_the_workspace_path_are_literal() {
+        let run_dir = tempdir().unwrap();
+        let base = tempdir().unwrap();
+        let workspace = base.path().join("proj[1]");
+        std::fs::create_dir_all(workspace.join("out/sub")).unwrap();
+        std::fs::write(workspace.join("out/sub/a.txt"), "x").unwrap();
+        std::fs::write(workspace.join("b.txt"), "x").unwrap();
+        let store = ArtifactStore::new(run_dir.path()).unwrap();
+        for (path, expected) in [
+            ("out/", "sub/a.txt"),
+            ("out/*/*.txt", "sub/a.txt"),
+            ("b.txt", "b.txt"),
+        ] {
+            store.upload("a", path, &workspace).await.unwrap();
+            let target = tempdir().unwrap();
+            store.download("a", target.path()).await.unwrap();
+            assert!(target.path().join(expected).is_file(), "{}", path);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlinked_directories_keep_the_path_they_were_found_at() {
+        let run_dir = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        std::fs::create_dir_all(workspace.path().join("out")).unwrap();
+        std::fs::create_dir_all(workspace.path().join("shared")).unwrap();
+        std::fs::write(workspace.path().join("out/a.txt"), "x").unwrap();
+        std::fs::write(workspace.path().join("shared/s.txt"), "x").unwrap();
+        std::os::unix::fs::symlink(
+            workspace.path().join("shared"),
+            workspace.path().join("out/link"),
+        )
+        .unwrap();
+        let store = ArtifactStore::new(run_dir.path()).unwrap();
+        store.upload("a", "out/", workspace.path()).await.unwrap();
+        let target = tempdir().unwrap();
+        store.download("a", target.path()).await.unwrap();
+        assert!(target.path().join("a.txt").is_file());
+        assert!(target.path().join("link/s.txt").is_file());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlinked_directories_leaving_the_workspace_are_not_collected() {
+        let run_dir = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        std::fs::create_dir_all(workspace.path().join("out")).unwrap();
+        std::fs::write(workspace.path().join("out/a.txt"), "x").unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "x").unwrap();
+        std::os::unix::fs::symlink(outside.path(), workspace.path().join("out/link")).unwrap();
+        let store = ArtifactStore::new(run_dir.path()).unwrap();
+        let count = store.upload("a", "out/", workspace.path()).await.unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn common_ancestor_of_nothing_is_none() {
+        assert_eq!(common_ancestor(&[]), None);
+    }
+
+    #[test]
+    fn normalize_resolves_dot_components() {
+        assert_eq!(normalize(Path::new("/a/./b/../c")), Path::new("/a/c"));
+        assert_eq!(normalize(Path::new("./a")), Path::new("a"));
+        assert_eq!(normalize(Path::new("../a")), Path::new("../a"));
+        assert_eq!(normalize(Path::new("/../a")), Path::new("/a"));
     }
 
     #[tokio::test]

@@ -840,8 +840,17 @@ fn exit_on_parse_error(error: clap::Error) -> ! {
     std::process::exit(2);
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("failed to start the async runtime");
+    // On the heap, because the future for every command is far bigger than
+    // the 1 MiB main thread stack Windows gives a debug build.
+    runtime.block_on(Box::pin(run_cli()));
+}
+
+async fn run_cli() {
     // Gracefully handle Broken pipe (EPIPE) when output is piped (e.g., to `head`)
     let default_panic_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {

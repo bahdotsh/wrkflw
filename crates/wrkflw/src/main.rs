@@ -729,6 +729,14 @@ pub(crate) fn is_gitlab_pipeline(path: &Path) -> bool {
     false
 }
 
+/// The arguments as text. Clap rejects arguments that aren't valid UTF-8, so
+/// this runs on exactly the ones `std::env::args` would panic on.
+fn raw_args() -> impl Iterator<Item = String> {
+    std::env::args_os()
+        .skip(1)
+        .map(|arg| arg.to_string_lossy().into_owned())
+}
+
 /// Whether the raw arguments ask for JSON. Parsing failed, so this is all
 /// there is to go on.
 fn args_request_json(args: impl Iterator<Item = String>) -> bool {
@@ -747,7 +755,7 @@ fn exit_on_parse_error(error: clap::Error) -> ! {
             | ErrorKind::DisplayVersion
             | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
     );
-    if !is_usage_error || !args_request_json(std::env::args().skip(1)) {
+    if !is_usage_error || !args_request_json(raw_args()) {
         error.exit();
     }
     wrkflw_runs::emit_line(&serde_json::json!({
@@ -1378,6 +1386,16 @@ fn list_workflows_and_pipelines(verbose: bool, show_jobs: bool) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn json_is_only_requested_ahead_of_the_path_separator() {
+        let requests =
+            |args: &[&str]| super::args_request_json(args.iter().map(|arg| arg.to_string()));
+        assert!(requests(&["--format", "json", "run"]));
+        assert!(requests(&["run", "--format=json"]));
+        assert!(!requests(&["run", "--", "--format", "json"]));
+        assert!(!requests(&["run", "--format", "text"]));
+    }
+
     use super::*;
 
     #[test]

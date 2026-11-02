@@ -59,6 +59,9 @@ fn event_flags(cli: &mut Vec<String>, args: &Value) {
     if args["diff"].as_bool() == Some(true) {
         cli.push("--diff".to_string());
     }
+    if args["no_strict_filter"].as_bool() == Some(true) {
+        cli.push("--no-strict-filter".to_string());
+    }
 }
 
 fn required_path(args: &Value) -> Result<String, String> {
@@ -98,6 +101,13 @@ fn tool_command(name: &str, args: &Value) -> Result<(Vec<String>, u64), String> 
             push_opt(&mut cli, "--runtime", string_arg(args, "runtime"));
             push_opt(&mut cli, "--intent", string_arg(args, "intent"));
             push_opt(&mut cli, "--from-step", string_arg(args, "from_step"));
+            for (key, value) in args["variables"].as_object().into_iter().flatten() {
+                let value = value
+                    .as_str()
+                    .map_or_else(|| value.to_string(), str::to_string);
+                cli.push("--variable".into());
+                cli.push(format!("{key}={value}"));
+            }
             cli.push("--".into());
             cli.push(required_path(args)?);
             timeout = args["timeout_seconds"]
@@ -270,6 +280,7 @@ fn event_properties() -> Value {
         "activity_type": {"type": "string", "description": "Activity type, e.g. opened, for `types:` filters."},
         "changed_files": {"type": "array", "items": {"type": "string"}, "description": "Repo-relative changed files."},
         "diff": {"type": "boolean", "description": "Take changed files from git diff."},
+        "no_strict_filter": {"type": "boolean", "description": "Proceed without changed files even though the workflow has a `paths:` filter, which then cannot match."},
     })
 }
 
@@ -282,6 +293,7 @@ fn tools() -> Value {
     });
     run_properties["intent"] = json!({"type": "string", "description": "Why you are running this. Stored on the run record."});
     run_properties["from_step"] = json!({"type": "string", "description": "Requires `job`. Start at this step, by name or 1-based position. Earlier steps' outputs and files are missing."});
+    run_properties["variables"] = json!({"type": "object", "additionalProperties": {"type": "string"}, "description": "GitLab CI variables. Masked in output and never stored."});
     run_properties["timeout_seconds"] =
         json!({"type": "integer", "description": "Stop the run after this long. Default 1800."});
     let run_id = json!({"type": "string", "description": "Run id, unique prefix, or `latest`. Default `latest`."});
@@ -393,6 +405,20 @@ pub(crate) async fn serve() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn run_workflow_passes_variables_and_the_strict_filter_opt_out() {
+        let args = json!({
+            "path": "ci.yml",
+            "no_strict_filter": true,
+            "variables": {"DEPLOY": "yes"},
+        });
+        let (cli, _) = tool_command("run_workflow", &args).unwrap();
+        let separator = cli.iter().position(|arg| arg == "--").unwrap();
+        let flags = &cli[..separator];
+        assert!(flags.contains(&"--no-strict-filter".to_string()));
+        assert!(flags.windows(2).any(|f| f == ["--variable", "DEPLOY=yes"]));
+    }
 
     #[test]
     fn format_flag_stays_ahead_of_the_path_separator() {

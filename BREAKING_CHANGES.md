@@ -1,5 +1,17 @@
 # Breaking Changes
 
+## `services:` start and can fail a job (unreleased)
+
+On Docker and Podman, a job's `services:` now start, and its steps run in one container with them. A service that can't start or never turns healthy fails the job's container steps. These jobs used to log a warning and run without the service. Emulation, secure emulation, Kubernetes and called workflows still warn.
+
+## Job-level `concurrency:` is enforced within a run (unreleased)
+
+Jobs that share a `concurrency:` group now run one at a time, where they used to overlap. `cancel-in-progress` has no effect, and a run takes longer if it relied on the overlap.
+
+## New public fields on `ExecutionConfig` and `Job` (unreleased)
+
+`wrkflw_executor::ExecutionConfig` gains `acceleration`, and `wrkflw_parser::workflow::Job` gains `concurrency`. Code that builds either with a struct literal has to set the new field. `Default::default()` is what `acceleration` was before, and `None` is what `concurrency` was.
+
 ## A missing secret no longer fails a `run:` step (unreleased)
 
 A `${{ secrets.X }}` that no provider has now expands to an empty string in `run:`, as it already did in `env:` and as it does on GitHub. The step used to fail with `Secret not found`. Anything relying on that failure should check for the value itself. A provider that fails for any other reason still fails the step.

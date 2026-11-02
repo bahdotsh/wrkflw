@@ -1,5 +1,29 @@
 # Breaking Changes
 
+## A missing secret no longer fails a `run:` step (unreleased)
+
+A `${{ secrets.X }}` that no provider has now expands to an empty string in `run:`, as it already did in `env:` and as it does on GitHub. The step used to fail with `Secret not found`. Anything relying on that failure should check for the value itself. A provider that fails for any other reason still fails the step.
+
+## `wrkflw validate` reports more problems (unreleased)
+
+Files that passed may now fail with these rules: `unknown-trigger-filter`, `unterminated-expression`, `undefined-step-reference`, `undefined-need-reference` and `undefined-matrix-key`.
+
+## Failure digests fold matrix legs (unreleased)
+
+Legs of a matrix job that failed the same way share one entry in `failures`, with the others in `also_failed_in`. Code counting failed legs should read `jobs` on `run_finished`.
+
+## `--event` needs a change set only for `paths:` filters (unreleased)
+
+`--event` without `--diff` or `--changed-files` used to fail for every workflow under `--strict-filter`. It now fails only if the workflow has a `paths:` or `paths-ignore:` filter on that event.
+
+## Unnamed `uses:` steps report the action (unreleased)
+
+An unnamed step with `uses:` is reported as `actions/checkout@v4` rather than `Step 1`, including in run history. Log file names change with it. Unnamed `run:` steps keep `Step N`, and `--from-step` and `--step` still accept a 1-based position.
+
+## Step output in events and history has relative paths (unreleased)
+
+The job workspace prefix is removed from `step_finished.output` and stored step logs, so `/tmp/.tmpAbC123/src/lib.rs` reads `src/lib.rs`.
+
 ## Step output is masked, and `run` steps report their exit code (unreleased)
 
 `StepResult::output` and job logs now have secrets replaced with `***`, including values matching built-in token patterns. Previously nothing masked step output. Code that compared a secret's value against output will no longer match. Step outputs set with `::set-output::` keep their real values.

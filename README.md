@@ -378,6 +378,8 @@ wrkflw run .github/workflows/ci.yml
 # On Linux, put them in ~/.config/wrkflw/secrets/ (read by the `file` provider)
 ```
 
+A secret no provider has expands to an empty string, as on GitHub. `wrkflw plan` lists these, and a step that reads one ends its output with a warning.
+
 Supported providers: environment variables, file-based, HashiCorp Vault, AWS Secrets Manager, Azure Key Vault, Google Cloud Secret Manager. See the [secrets demo](examples/secrets-demo/) for detailed examples.
 
 ## Project Structure

@@ -1,7 +1,7 @@
 # Codebase Index: wrkflw
 
-> Generated: 2026-11-02 06:00:28 UTC | Files: 227 | Lines: 94155
-> Languages: JSON (4), Markdown (26), Rust (135), Shell (5), TOML (19), YAML (38)
+> Generated: 2026-11-02 07:53:51 UTC | Files: 229 | Lines: 96917
+> Languages: JSON (4), Markdown (26), Rust (137), Shell (5), TOML (19), YAML (38)
 
 ## Directory Structure
 
@@ -87,6 +87,7 @@ wrkflw/
       Cargo.toml
       src/
         digest.rs
+        env.rs
         lib.rs
         record.rs
         recorder.rs
@@ -185,6 +186,7 @@ wrkflw/
       README.md
       src/
         actions.rs
+        expressions.rs
         gitlab.rs
         jobs.rs
         lib.rs
@@ -729,6 +731,8 @@ wrkflw/
 **crates/runs/Cargo.toml**
 - `[package]`
 - `[dependencies]`
+- `[target.'cfg(unix)'.dependencies]`
+- `[target.'cfg(windows)'.dependencies]`
 
 **crates/runs/src/digest.rs**
 - `pub const DEFAULT_TAIL_LINES: usize = 40`
@@ -736,6 +740,19 @@ wrkflw/
 - `pub struct FailedStep`
 - `pub fn failure_digest( store: &RunStore, run: &RunRecord, tail_lines: usize, ) -> Option<FailureDigest>`
 - `pub fn render_digest(digest: &FailureDigest) -> String`
+
+**crates/runs/src/env.rs**
+- `pub const HOME: &str = "WRKFLW_HOME"`
+- `pub const NO_HISTORY: &str = "WRKFLW_NO_HISTORY"`
+- `pub const RUNS_KEEP: &str = "WRKFLW_RUNS_KEEP"`
+- `pub const AGENT: &str = "WRKFLW_AGENT"`
+- `pub const INTENT: &str = "WRKFLW_INTENT"`
+- `pub const CLAUDE_CODE: &str = "CLAUDECODE"`
+- `pub const MCP: &str = "WRKFLW_MCP"`
+- `pub const REPLAY_OF: &str = "WRKFLW_REPLAY_OF"`
+
+**crates/runs/src/lib.rs**
+- `pub mod env`
 
 **crates/runs/src/record.rs**
 - `pub const SCHEMA_VERSION: u32 = 1`
@@ -1173,6 +1190,9 @@ wrkflw/
 **crates/validators/src/actions.rs**
 - `pub fn validate_action_reference( action_ref: &str, with_params: Option<&serde_yaml::Mapping>, job_name: &str, step_idx: usize, repo_root: Option<&Path>, result: &mut ValidationResult, )`
 
+**crates/validators/src/expressions.rs**
+- `pub fn validate_expressions(workflow: &Value, result: &mut ValidationResult)`
+
 **crates/validators/src/gitlab.rs**
 - `pub fn validate_gitlab_pipeline(pipeline: &Pipeline) -> ValidationResult`
 
@@ -1549,7 +1569,7 @@ wrkflw/
 
 ## AGENTS.md
 
-**Language:** Markdown | **Size:** 3.0 KB | **Lines:** 53
+**Language:** Markdown | **Size:** 3.8 KB | **Lines:** 61
 
 **Declarations:**
 
@@ -1557,7 +1577,7 @@ wrkflw/
 
 ## BREAKING_CHANGES.md
 
-**Language:** Markdown | **Size:** 11.3 KB | **Lines:** 254
+**Language:** Markdown | **Size:** 13.5 KB | **Lines:** 284
 
 **Declarations:**
 
@@ -1581,7 +1601,7 @@ wrkflw/
 
 ## INDEX.md
 
-**Language:** Markdown | **Size:** 170.3 KB | **Lines:** 6442
+**Language:** Markdown | **Size:** 202.6 KB | **Lines:** 7510
 
 **Declarations:**
 
@@ -1589,7 +1609,7 @@ wrkflw/
 
 ## README.md
 
-**Language:** Markdown | **Size:** 20.3 KB | **Lines:** 408
+**Language:** Markdown | **Size:** 20.5 KB | **Lines:** 410
 
 **Declarations:**
 
@@ -1637,7 +1657,7 @@ wrkflw/
 
 ## crates/evaluator/src/lib.rs
 
-**Language:** Rust | **Size:** 11.5 KB | **Lines:** 381
+**Language:** Rust | **Size:** 11.5 KB | **Lines:** 383
 
 **Imports:**
 - `colored::*`
@@ -1645,7 +1665,7 @@ wrkflw/
 - `std::fs`
 - `std::path::{Path, PathBuf}`
 - `wrkflw_models::ValidationResult`
-- `wrkflw_validators::{validate_env, validate_jobs, validate_triggers}`
+- `wrkflw_validators::{validate_env, validate_expressions, validate_jobs, validate_triggers}`
 
 **Declarations:**
 
@@ -1843,7 +1863,7 @@ wrkflw/
 
 ## crates/executor/src/container_guard.rs
 
-**Language:** Rust | **Size:** 5.2 KB | **Lines:** 159
+**Language:** Rust | **Size:** 5.8 KB | **Lines:** 176
 
 **Imports:**
 - `std::process::{Command, Stdio}`
@@ -1982,14 +2002,14 @@ wrkflw/
 
 ## crates/executor/src/engine.rs
 
-**Language:** Rust | **Size:** 485.7 KB | **Lines:** 13326
+**Language:** Rust | **Size:** 489.9 KB | **Lines:** 13427
 
 **Imports:**
 - `bollard::Docker`
 - `futures::future`
 - `once_cell::sync::Lazy`
 - `serde_yaml::Value`
-- `std::collections::HashMap`
+- `std::collections::{HashMap, HashSet}`
 - `std::fs`
 - `std::path::{Path, PathBuf}`
 - `std::sync::{Arc, Mutex}`
@@ -2069,7 +2089,7 @@ wrkflw/
 **`impl StepResult`**
   `fn new(name: String, status: StepStatus, output: String) -> Self`
 
-  `pub fn exit_code(&self) -> Option<i32>`
+  `fn with_exit_code(mut self, exit_code: i32) -> Self`
 
 
 **`impl std::fmt::Display for StepStatus`**
@@ -2157,14 +2177,23 @@ wrkflw/
 `async fn flush_pending_cache_saves( pending: &std::sync::Mutex<Vec<PendingCacheSave>>, cache_store: &crate::cache::CacheStore, )`
 
 `struct StepLoopState`
-> Fields: `step_results: Vec<StepResult>`, `job_logs: String`, `step_outputs_map: HashMap<String, HashMap<String, String>>`, `step_status_map: HashMap<String, (String, String)>`, `job_status_str: String`, `job_label: String`, `job_started: std::time::Instant`, `step_started: std::time::Instant`, `current_step: Option<(usize, Option<String>, Option<String>)>`
+> Fields: `step_results: Vec<StepResult>`, `job_logs: String`, `step_outputs_map: HashMap<String, HashMap<String, String>>`, `step_status_map: HashMap<String, (String, String)>`, `job_status_str: String`, `job_label: String`, `job_started: std::time::Instant`, `step_started: std::time::Instant`, `current_step: Option<InFlightStep>`, `workspace_prefixes: Vec<String>`, `known_secrets: HashSet<String>`
+
+`struct InFlightStep`
+> Fields: `index: usize`, `command: Option<String>`, `uses: Option<String>`
 
 **`impl StepLoopState`**
   `fn new(job_label: &str, canonical_name: &str) -> Self`
 
+  `fn with_job_context(mut self, workspace: &Path, secrets: &HashMap<String, String>) -> Self`
+
+  `fn relative_to_workspace(&self, output: &str) -> String`
+
   `fn begin_step(&mut self, index: usize, step: &workflow::Step)`
 
   `fn emit_step_finished(&self, result: &StepResult, env_set: Vec<(String, String)>)`
+
+  `fn fail_step_on_timeout(&mut self, step: &workflow::Step, index: usize, message: String)`
 
   `fn emit_job_finished(&self, success: bool, failure_allowed: bool)`
 
@@ -2184,6 +2213,10 @@ wrkflw/
 `async fn run_step_with_guards( step: &Step, step_idx: usize, job_env: &HashMap<String, String>, workflow: &WorkflowDefinition, step_exec_ctx: StepExecutionContext<'_>, ) -> Result<StepOutcome, ExecutionError>`
 
 `fn step_display_name(step: &Step, index: usize) -> String`
+
+`fn workspace_prefixes(workspace: &Path) -> Vec<String>`
+
+`fn missing_secrets_note(step: &Step, known: &HashSet<String>) -> Option<String>`
 
 `fn continues_on_error(value: Option<&str>, ctx: &crate::expression::ExpressionContext<'_>) -> bool`
 
@@ -2390,7 +2423,7 @@ wrkflw/
 
 ## crates/executor/src/events.rs
 
-**Language:** Rust | **Size:** 3.8 KB | **Lines:** 128
+**Language:** Rust | **Size:** 4.1 KB | **Lines:** 133
 
 **Imports:**
 - `crate::engine::{JobStatus, StepStatus}`
@@ -3146,7 +3179,7 @@ wrkflw/
 
 ## crates/models/src/lib.rs
 
-**Language:** Rust | **Size:** 28.7 KB | **Lines:** 824
+**Language:** Rust | **Size:** 29.2 KB | **Lines:** 831
 
 **Imports:**
 - `serde::Serialize`
@@ -3514,10 +3547,7 @@ wrkflw/
 
 ## crates/runs/Cargo.toml
 
-**Language:** TOML | **Size:** 634 B | **Lines:** 24
-
-**Imports:**
-- `nix`
+**Language:** TOML | **Size:** 800 B | **Lines:** 28
 
 **Declarations:**
 
@@ -3525,7 +3555,7 @@ wrkflw/
 
 ## crates/runs/src/digest.rs
 
-**Language:** Rust | **Size:** 5.8 KB | **Lines:** 185
+**Language:** Rust | **Size:** 12.0 KB | **Lines:** 358
 
 **Imports:**
 - `crate::record::{JobRecord, RunRecord, RunStatus, StepRecord, SCHEMA_VERSION}`
@@ -3534,15 +3564,37 @@ wrkflw/
 
 **Declarations:**
 
+`const MAX_ERROR_LINES: usize = 10`
+
+`const ERROR_WORDS: [&str`
+
 `fn tail(text: &str, lines: usize) -> (Vec<String>, usize)`
 
+`fn error_lines(text: &str, tail_lines: usize) -> Vec<String>`
+
+`fn without_durations(line: &str) -> String`
+
+`fn same_failure(a: &FailedStep, b: &FailedStep) -> bool`
+
+`fn failed_steps(store: &RunStore, run: &RunRecord, tail_lines: usize) -> Vec<FailedStep>`
+
 `fn failed_step( store: &RunStore, run: &RunRecord, job: &JobRecord, tail_lines: usize, ) -> FailedStep`
+
+`mod tests`
+
+---
+
+## crates/runs/src/env.rs
+
+**Language:** Rust | **Size:** 1.1 KB | **Lines:** 23
+
+**Declarations:**
 
 ---
 
 ## crates/runs/src/lib.rs
 
-**Language:** Rust | **Size:** 642 B | **Lines:** 17
+**Language:** Rust | **Size:** 655 B | **Lines:** 18
 
 **Imports:**
 - `pub use digest::{failure_digest, render_digest, FailedStep, FailureDigest, DEFAULT_TAIL_LINES}`
@@ -3567,7 +3619,7 @@ wrkflw/
 
 ## crates/runs/src/record.rs
 
-**Language:** Rust | **Size:** 3.0 KB | **Lines:** 97
+**Language:** Rust | **Size:** 3.1 KB | **Lines:** 100
 
 **Imports:**
 - `serde::{Deserialize, Serialize}`
@@ -3582,10 +3634,11 @@ wrkflw/
 
 ## crates/runs/src/recorder.rs
 
-**Language:** Rust | **Size:** 17.5 KB | **Lines:** 537
+**Language:** Rust | **Size:** 21.7 KB | **Lines:** 685
 
 **Imports:**
 - `crate::digest::{failure_digest, FailureDigest, DEFAULT_TAIL_LINES}`
+- `crate::env`
 - `crate::record::{JobRecord, RunRecord, RunStatus, StepRecord, SCHEMA_VERSION}`
 - `crate::store::{history_disabled, RunStore, DEFAULT_KEEP}`
 - `serde_json::{json, Value}`
@@ -3594,10 +3647,7 @@ wrkflw/
 - `std::sync::{Arc, Mutex}`
 - `std::time::{Duration, Instant}`
 - `wrkflw_executor::engine::{ExecutionError, ExecutionResult}`
-- `wrkflw_executor::{
-    with_run_hooks, ExecutionConfig, ExecutionEvent, ExecutionObserver, FromStep, JobResult,
-    RunHooks,
-}`
+- *... and 1 more imports*
 
 **Declarations:**
 
@@ -3619,6 +3669,8 @@ wrkflw/
 `fn new_run_id() -> String`
 
 `fn slug(name: &str) -> String`
+
+`fn job_dir(name: &str) -> String`
 
 `fn tail_bytes(text: &str, max: usize) -> (&str, bool)`
 
@@ -3653,13 +3705,16 @@ wrkflw/
 
 `fn conclude( recorder: Arc<Recorder>, record: RunRecord, result: Result<ExecutionResult, ExecutionError>, ) -> RecordedRun`
 
+`mod tests`
+
 ---
 
 ## crates/runs/src/store.rs
 
-**Language:** Rust | **Size:** 9.1 KB | **Lines:** 268
+**Language:** Rust | **Size:** 10.8 KB | **Lines:** 320
 
 **Imports:**
+- `crate::env`
 - `crate::record::{RunRecord, RunStatus}`
 - `std::fs`
 - `std::io::{self, Write}`
@@ -3695,7 +3750,13 @@ wrkflw/
 
 `fn create_private_dir(path: &Path) -> io::Result<()>`
 
+`fn create_private_dir(path: &Path) -> io::Result<()>`
+
 `fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()>`
+
+`fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()>`
+
+`fn process_alive(pid: u32) -> bool`
 
 `fn process_alive(pid: u32) -> bool`
 
@@ -4378,10 +4439,10 @@ wrkflw/
 
 ## crates/secrets/src/substitution.rs
 
-**Language:** Rust | **Size:** 8.8 KB | **Lines:** 252
+**Language:** Rust | **Size:** 10.6 KB | **Lines:** 303
 
 **Imports:**
-- `crate::{SecretManager, SecretResult}`
+- `crate::{SecretError, SecretManager, SecretResult}`
 - `regex::Regex`
 - `std::collections::HashMap`
 
@@ -4389,6 +4450,10 @@ wrkflw/
 
 **`impl<'a> SecretSubstitution<'a>`**
   `pub fn new(manager: &'a SecretManager) -> Self`
+
+  `pub fn allowing_missing(manager: &'a SecretManager) -> Self`
+
+  `fn value_of(&self, lookup: SecretResult<crate::SecretValue>) -> SecretResult<String>`
 
   `pub async fn substitute(&mut self, text: &str) -> SecretResult<String>`
 
@@ -4507,7 +4572,7 @@ wrkflw/
 
 ## crates/trigger-filter/src/eval.rs
 
-**Language:** Rust | **Size:** 32.5 KB | **Lines:** 896
+**Language:** Rust | **Size:** 34.2 KB | **Lines:** 936
 
 **Imports:**
 - `crate::model::{
@@ -5195,7 +5260,7 @@ wrkflw/
 
 ## crates/ui/src/handlers/workflow.rs
 
-**Language:** Rust | **Size:** 26.7 KB | **Lines:** 697
+**Language:** Rust | **Size:** 26.8 KB | **Lines:** 699
 
 **Imports:**
 - `crate::cli_style`
@@ -5871,6 +5936,46 @@ wrkflw/
 
 ---
 
+## crates/validators/src/expressions.rs
+
+**Language:** Rust | **Size:** 12.4 KB | **Lines:** 372
+
+**Imports:**
+- `serde_yaml::{Mapping, Value}`
+- `std::collections::HashSet`
+- `wrkflw_models::ValidationResult`
+
+**Declarations:**
+
+`struct Scope`
+> Fields: `steps: Option<HashSet<String>>`, `needs: Option<HashSet<String>>`, `matrix: Option<HashSet<String>>`
+
+`fn check_job(job: &Mapping, result: &mut ValidationResult)`
+
+`fn needs_of(job: &Mapping) -> HashSet<String>`
+
+`fn matrix_keys(job: &Mapping) -> Option<HashSet<String>>`
+
+`fn walk(value: &Value, scope: &Scope, result: &mut ValidationResult)`
+
+`fn check_condition(value: &Value, scope: &Scope, result: &mut ValidationResult)`
+
+`fn check_text(text: &str, scope: &Scope, result: &mut ValidationResult)`
+
+`fn check_references(expression: &str, scope: &Scope, result: &mut ValidationResult)`
+
+`fn expressions_in(text: &str) -> (Vec<&str>, bool)`
+
+`fn closing_braces(text: &str) -> Option<usize>`
+
+`fn without_strings(expression: &str) -> String`
+
+`fn references(code: &str, context: &str) -> Vec<String>`
+
+`mod tests`
+
+---
+
 ## crates/validators/src/gitlab.rs
 
 **Language:** Rust | **Size:** 12.6 KB | **Lines:** 380
@@ -5923,10 +6028,11 @@ wrkflw/
 
 ## crates/validators/src/lib.rs
 
-**Language:** Rust | **Size:** 1.4 KB | **Lines:** 51
+**Language:** Rust | **Size:** 1.5 KB | **Lines:** 53
 
 **Imports:**
 - `pub use actions::validate_action_reference`
+- `pub use expressions::validate_expressions`
 - `pub use gitlab::validate_gitlab_pipeline`
 - `pub use jobs::validate_jobs`
 - `pub use matrix::validate_matrix`
@@ -5938,6 +6044,8 @@ wrkflw/
 **Declarations:**
 
 `mod actions`
+
+`mod expressions`
 
 `mod gitlab`
 
@@ -5994,13 +6102,17 @@ wrkflw/
 
 ## crates/validators/src/triggers.rs
 
-**Language:** Rust | **Size:** 9.2 KB | **Lines:** 286
+**Language:** Rust | **Size:** 10.8 KB | **Lines:** 333
 
 **Imports:**
-- `serde_yaml::Value`
+- `serde_yaml::{Mapping, Value}`
 - `wrkflw_models::ValidationResult`
 
 **Declarations:**
+
+`fn event_filters(event: &str) -> &'static [&'static str]`
+
+`fn check_filters(event: &str, filters: &Mapping, result: &mut ValidationResult)`
 
 `fn validate_cron_syntax(cron: &str, result: &mut ValidationResult)`
 
@@ -6344,9 +6456,10 @@ wrkflw/
 
 ## crates/wrkflw/Cargo.toml
 
-**Language:** TOML | **Size:** 1.6 KB | **Lines:** 73
+**Language:** TOML | **Size:** 1.7 KB | **Lines:** 74
 
 **Imports:**
+- `nix`
 - `walkdir`
 
 **Declarations:**
@@ -6413,7 +6526,7 @@ wrkflw/
 
 ## crates/wrkflw/src/main.rs
 
-**Language:** Rust | **Size:** 55.0 KB | **Lines:** 1538
+**Language:** Rust | **Size:** 56.2 KB | **Lines:** 1568
 
 **Imports:**
 - `bollard::Docker`
@@ -6482,6 +6595,10 @@ wrkflw/
 
 `pub(crate) fn is_gitlab_pipeline(path: &Path) -> bool`
 
+`fn args_request_json(args: impl Iterator<Item = String>) -> bool`
+
+`fn exit_on_parse_error(error: clap::Error) -> !`
+
 `async fn main()`
 
 `fn validate_github_workflow(path: &Path, verbose: bool) -> bool`
@@ -6498,14 +6615,15 @@ wrkflw/
 
 ## crates/wrkflw/src/mcp_cmd.rs
 
-**Language:** Rust | **Size:** 16.2 KB | **Lines:** 397
+**Language:** Rust | **Size:** 20.8 KB | **Lines:** 518
 
 **Imports:**
 - `serde_json::{json, Value}`
-- `std::process::Stdio`
+- `std::process::{Output, Stdio}`
 - `std::sync::Arc`
 - `std::time::Duration`
 - `tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader}`
+- `tokio::process::Command`
 - `tokio::sync::Mutex`
 
 **Declarations:**
@@ -6515,6 +6633,8 @@ wrkflw/
 `const DEFAULT_RUN_TIMEOUT_SECS: u64 = 1800`
 
 `const QUICK_TIMEOUT_SECS: u64 = 120`
+
+`const STOP_GRACE: Duration = Duration::from_secs(15)`
 
 `const INSTRUCTIONS: &str = "wrkflw validates and runs GitHub Actions and GitLab CI workflows locally. \ Call validate_workflows after editing YAML, plan_workflow to see what would run and why a trigger \ would or would not fire, and run_workflow to execute. run_workflow returns a failure digest. Use \ list_runs and get_run_failure before rerunning: earlier results are recorded."`
 
@@ -6538,6 +6658,12 @@ wrkflw/
 
 `async fn call_tool(name: &str, args: &Value, agent: Option<&str>) -> Value`
 
+`async fn run_with_deadline( child: tokio::process::Child, limit: Duration, grace: Duration, ) -> Option<std::io::Result<Output>>`
+
+`fn interrupt(pid: u32)`
+
+`fn interrupt(_pid: u32)`
+
 `fn tool( name: &str, description: &str, read_only: bool, properties: Value, required: &[&str], ) -> Value`
 
 `fn event_properties() -> Value`
@@ -6560,14 +6686,15 @@ wrkflw/
 
 ## crates/wrkflw/src/plan_cmd.rs
 
-**Language:** Rust | **Size:** 8.6 KB | **Lines:** 261
+**Language:** Rust | **Size:** 10.2 KB | **Lines:** 303
 
 **Imports:**
 - `crate::{is_gitlab_pipeline, prefilter, OutputFormat}`
 - `serde_json::{json, Value}`
-- `std::path::PathBuf`
+- `std::path::{Path, PathBuf}`
 - `wrkflw_parser::workflow::{Job, WorkflowDefinition}`
 - `wrkflw_runs::SCHEMA_VERSION`
+- `wrkflw_secrets::{SecretError, SecretManager, SecretSubstitution}`
 
 **Declarations:**
 
@@ -6575,6 +6702,8 @@ wrkflw/
 > Fields: `path: PathBuf`, `gitlab: bool`, `job: Option<String>`, `event: Option<String>`, `diff: bool`, `changed_files: Option<Vec<String>>`, `diff_base: Option<String>`, `diff_head: Option<String>`, `base_branch: Option<String>`, `activity_type: Option<String>`, `strict_filter: bool`, `no_strict_filter: bool`, `verbose: bool`, `format: OutputFormat`
 
 `async fn trigger(ctx: &PlanCtx) -> Result<Value, String>`
+
+`async fn missing_secrets(path: &Path) -> Result<Vec<String>, String>`
 
 `fn matrix_json(job: &Job) -> Value`
 
@@ -6594,7 +6723,7 @@ wrkflw/
 
 ## crates/wrkflw/src/prefilter.rs
 
-**Language:** Rust | **Size:** 37.9 KB | **Lines:** 900
+**Language:** Rust | **Size:** 39.6 KB | **Lines:** 946
 
 **Imports:**
 - `std::path::{Path, PathBuf}`
@@ -6613,7 +6742,7 @@ wrkflw/
 
 `pub(crate) async fn run_trigger_prefilter( req: PrefilterRequest<'_>, ) -> Result<PrefilterDecision, String>`
 
-`pub(crate) async fn build_event_context( req: &PrefilterRequest<'_>, event_name: &str, cwd_for_git: Option<&Path>, ) -> Result<wrkflw_trigger_filter::EventContext, String>`
+`pub(crate) async fn build_event_context( req: &PrefilterRequest<'_>, event_name: &str, paths_matter: bool, cwd_for_git: Option<&Path>, ) -> Result<wrkflw_trigger_filter::EventContext, String>`
 
 `pub(crate) fn apply_base_branch( ctx: &mut wrkflw_trigger_filter::EventContext, event_name: &str, base_branch: Option<&String>, strict_filter: bool, ) -> Result<(), String>`
 
@@ -6623,7 +6752,7 @@ wrkflw/
 
 ## crates/wrkflw/src/run_workflow_cmd.rs
 
-**Language:** Rust | **Size:** 13.9 KB | **Lines:** 381
+**Language:** Rust | **Size:** 15.6 KB | **Lines:** 425
 
 **Imports:**
 - `crate::prefilter`
@@ -6645,6 +6774,8 @@ wrkflw/
 
 `fn strip_variable_args(args: impl Iterator<Item = String>) -> Vec<String>`
 
+`fn variable_in_short_cluster(arg: &str) -> Option<(&str, bool)>`
+
 `pub(crate) async fn run(ctx: RunCtx)`
 
 `mod tests`
@@ -6653,7 +6784,7 @@ wrkflw/
 
 ## crates/wrkflw/src/runs_cmd.rs
 
-**Language:** Rust | **Size:** 11.5 KB | **Lines:** 362
+**Language:** Rust | **Size:** 13.1 KB | **Lines:** 410
 
 **Imports:**
 - `crate::OutputFormat`
@@ -6687,9 +6818,13 @@ wrkflw/
 
 `fn logs( store: &RunStore, run: &RunRecord, job: Option<&str>, step: Option<&str>, tail: Option<usize>, ) -> Vec<Value>`
 
+`fn replay_args(argv: &[String], variables: &[String], format: OutputFormat) -> Vec<String>`
+
 `fn replay(run: &RunRecord, variables: &[String], format: OutputFormat) -> !`
 
 `pub(crate) async fn run(command: RunsCommand, format: OutputFormat)`
+
+`mod tests`
 
 ---
 
@@ -6715,7 +6850,7 @@ wrkflw/
 
 ## crates/wrkflw/tests/agent_cli_test.rs
 
-**Language:** Rust | **Size:** 19.6 KB | **Lines:** 651
+**Language:** Rust | **Size:** 28.1 KB | **Lines:** 921
 
 **Imports:**
 - `serde_json::{json, Value}`
@@ -6768,6 +6903,14 @@ wrkflw/
 
 `fn variables_are_not_stored_and_replay_keeps_the_arguments()`
 
+`fn variable_values_printed_by_a_step_are_masked()`
+
+`fn replay_works_after_a_path_separator()`
+
+`fn replay_with_variables_works_after_a_path_separator()`
+
+`fn matrix_legs_with_similar_names_keep_their_own_logs()`
+
 `fn no_record_leaves_no_history_but_keeps_the_digest()`
 
 `fn retention_prunes_the_oldest_runs()`
@@ -6799,9 +6942,25 @@ wrkflw/
 
 `fn mcp_server_speaks_the_protocol_and_runs_tools()`
 
+`fn mcp_timeout_stops_the_run_and_replay_of_an_mcp_run_works()`
+
 `fn text_mode_prints_the_digest_on_failure()`
 
 `fn watch_streams_json_cycles_and_records_runs()`
+
+`fn a_missing_secret_is_empty_and_named_as_on_github()`
+
+`fn identical_matrix_failures_fold_and_paths_are_relative()`
+
+`fn unnamed_action_steps_report_the_action()`
+
+`fn from_step_failures_say_earlier_steps_did_not_run()`
+
+`fn a_missing_workflow_is_an_error_and_not_a_run()`
+
+`fn usage_errors_are_json_in_json_mode()`
+
+`fn validate_catches_filter_and_expression_mistakes()`
 
 ---
 
@@ -7153,7 +7312,7 @@ wrkflw/
 
 ## skills/wrkflw/SKILL.md
 
-**Language:** Markdown | **Size:** 1.4 KB | **Lines:** 20
+**Language:** Markdown | **Size:** 1.6 KB | **Lines:** 22
 
 **Declarations:**
 

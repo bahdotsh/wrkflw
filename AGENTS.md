@@ -43,7 +43,7 @@ Exit codes: 0 for success or skipped, 1 for a failed run or failed validation, 2
 
 ## Secrets
 
-A secret no provider has expands to an empty string, as on GitHub. `plan` lists these under `missing_secrets`, and a step that reads one ends its output with a warning naming it. To provide a value, set an environment variable with the secret's exact name, such as `DEPLOY_TOKEN`, before running wrkflw.
+A secret no provider has expands to an empty string, as on GitHub. `plan` lists these under `missing_secrets`, and a step that reads one ends its output with a warning naming it. To provide a value, set an environment variable with the secret's exact name, such as `DEPLOY_TOKEN`, before running wrkflw. A secret read from a named provider, as in `secrets.vault:TOKEN`, is listed as `vault:TOKEN` and has to be added to that provider.
 
 ## History
 

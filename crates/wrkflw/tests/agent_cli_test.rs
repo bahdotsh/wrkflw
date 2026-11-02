@@ -921,6 +921,54 @@ fn validate_catches_filter_and_expression_mistakes() {
 }
 
 #[test]
+fn a_provider_failure_is_not_reported_as_a_missing_secret() {
+    let sandbox = Sandbox::new();
+    sandbox.write(
+        "broken.yml",
+        "name: b\non: [push]\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - name: read\n        run: echo ${{ secrets.no_such_provider:TOKEN }}\n",
+    );
+    let path = ".github/workflows/broken.yml";
+
+    let plan = json_doc(&sandbox.run(&["--format", "json", "plan", path]));
+    assert_eq!(plan["missing_secrets"], json!([]));
+
+    let output = sandbox.run(&["--format", "json", "run", "--runtime", "emulation", path]);
+    let events = json_lines(&output);
+    assert_eq!(events.last().unwrap()["status"], "failure");
+    let step = events
+        .iter()
+        .find(|e| e["type"] == "step_finished" && e["step"] == "read")
+        .unwrap();
+    let text = step["output"].as_str().unwrap();
+    assert!(text.contains("Secret substitution failed"), "{text}");
+    assert!(!text.contains("not set"), "{text}");
+}
+
+#[test]
+fn a_secret_missing_from_a_named_provider_keeps_its_provider() {
+    let sandbox = Sandbox::new();
+    sandbox.write(
+        "named.yml",
+        "name: n\non: [push]\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - name: read\n        run: echo ${{ secrets.env:WRKFLW_TEST_UNSET }}\n",
+    );
+    let path = ".github/workflows/named.yml";
+
+    let plan = json_doc(&sandbox.run(&["--format", "json", "plan", path]));
+    assert_eq!(plan["missing_secrets"], json!(["env:WRKFLW_TEST_UNSET"]));
+
+    let output = sandbox.run(&["--format", "json", "run", "--runtime", "emulation", path]);
+    let events = json_lines(&output);
+    let step = events
+        .iter()
+        .find(|e| e["type"] == "step_finished" && e["step"] == "read")
+        .unwrap();
+    let text = step["output"].as_str().unwrap();
+    assert!(text.contains("env:WRKFLW_TEST_UNSET"), "{text}");
+    assert!(text.contains("to that provider"), "{text}");
+    assert!(!text.contains("environment variable"), "{text}");
+}
+
+#[test]
 fn a_reported_step_name_can_be_passed_back_to_from_step() {
     let sandbox = Sandbox::new();
     sandbox.write(

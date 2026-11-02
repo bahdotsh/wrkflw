@@ -172,6 +172,23 @@ pub struct SecretRef {
 }
 
 impl SecretRef {
+    /// How to name this secret to a person: `API_KEY`, or `vault:API_KEY`
+    /// when it comes from a specific provider.
+    pub fn qualified_name(&self) -> String {
+        match &self.provider {
+            Some(provider) => format!("{}:{}", provider, self.name),
+            None => self.name.clone(),
+        }
+    }
+
+    /// Look this secret up where the reference says it lives.
+    pub async fn lookup(&self, manager: &SecretManager) -> SecretResult<crate::SecretValue> {
+        match &self.provider {
+            Some(provider) => manager.get_secret_from_provider(provider, &self.name).await,
+            None => manager.get_secret(&self.name).await,
+        }
+    }
+
     /// Get the cache key for this secret reference
     pub fn cache_key(&self) -> String {
         match &self.provider {

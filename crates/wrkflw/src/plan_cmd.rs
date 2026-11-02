@@ -63,16 +63,13 @@ async fn missing_secrets(path: &Path) -> Result<Vec<String>, String> {
     let manager = SecretManager::default().await.map_err(|e| e.to_string())?;
     let mut missing = Vec::new();
     for secret in SecretSubstitution::extract_secret_refs(&text) {
-        let lookup = match &secret.provider {
-            Some(provider) => {
-                manager
-                    .get_secret_from_provider(provider, &secret.name)
-                    .await
-            }
-            None => manager.get_secret(&secret.name).await,
-        };
-        if matches!(lookup, Err(SecretError::NotFound { .. })) && !missing.contains(&secret.name) {
-            missing.push(secret.name);
+        let name = secret.qualified_name();
+        if matches!(
+            secret.lookup(&manager).await,
+            Err(SecretError::NotFound { .. })
+        ) && !missing.contains(&name)
+        {
+            missing.push(name);
         }
     }
     missing.sort();

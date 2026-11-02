@@ -52,6 +52,9 @@ pub struct RunRecord {
     pub agent: Option<String>,
     pub intent: Option<String>,
     pub replay_of: Option<String>,
+    /// The step `--from-step` started at. Earlier steps did not run.
+    #[serde(default)]
+    pub from_step: Option<String>,
     /// Arguments after `wrkflw`, without `--variable` values.
     pub argv: Vec<String>,
     /// Names of the `--variable`s passed. Values are never stored.

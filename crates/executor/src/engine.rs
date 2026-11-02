@@ -3,7 +3,7 @@ use bollard::Docker;
 use futures::future;
 use once_cell::sync::Lazy;
 use serde_yaml::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -2704,7 +2704,8 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
     let timeout_mins = sanitize_timeout_minutes(job.timeout_minutes, 360.0);
     let job_timeout = std::time::Duration::from_secs_f64(timeout_mins * 60.0);
 
-    let mut loop_state = StepLoopState::new(ctx.job_name, ctx.job_name);
+    let mut loop_state = StepLoopState::new(ctx.job_name, ctx.job_name)
+        .with_job_context(job_dir.path(), ctx.services.secrets_context);
     let pending_cache_saves = std::sync::Mutex::new(Vec::<PendingCacheSave>::new());
 
     let job_deadline = tokio::time::Instant::now() + job_timeout;
@@ -3002,7 +3003,8 @@ async fn execute_matrix_job(
     let materialized_steps =
         crate::substitution::apply_matrix_to_steps(&job_template.steps, &combination.values);
 
-    let mut loop_state = StepLoopState::new(&matrix_job_name, job_name);
+    let mut loop_state = StepLoopState::new(&matrix_job_name, job_name)
+        .with_job_context(job_dir.path(), services.secrets_context);
     let pending_cache_saves = std::sync::Mutex::new(Vec::<PendingCacheSave>::new());
     let job_success = if materialized_steps.is_empty() {
         wrkflw_logging::warning(&format!("Job '{}' has no steps", matrix_job_name));
@@ -3231,6 +3233,10 @@ struct StepLoopState {
     job_started: std::time::Instant,
     step_started: std::time::Instant,
     current_step: Option<InFlightStep>,
+    /// Prefixes dropped from reported output, so paths are repo-relative.
+    workspace_prefixes: Vec<String>,
+    /// Secrets the job's steps can read.
+    known_secrets: HashSet<String>,
 }
 
 /// The step being executed, as its finish event reports it.
@@ -3257,7 +3263,24 @@ impl StepLoopState {
             job_started: now,
             step_started: now,
             current_step: None,
+            workspace_prefixes: Vec::new(),
+            known_secrets: HashSet::new(),
         }
+    }
+
+    /// Tell the loop what it needs to make reported output readable.
+    fn with_job_context(mut self, workspace: &Path, secrets: &HashMap<String, String>) -> Self {
+        self.workspace_prefixes = workspace_prefixes(workspace);
+        self.known_secrets = secrets.keys().cloned().collect();
+        self
+    }
+
+    /// `output` with workspace paths made relative. Each job has a throwaway
+    /// workspace, so the absolute path means nothing once the job is over.
+    fn relative_to_workspace(&self, output: &str) -> String {
+        self.workspace_prefixes
+            .iter()
+            .fold(output.to_string(), |text, prefix| text.replace(prefix, ""))
     }
 
     /// Mark `step` as in flight, so its finish event can report timing.
@@ -3290,7 +3313,7 @@ impl StepLoopState {
             conclusion: result.conclusion,
             exit_code: result.exit_code,
             duration_ms: self.step_started.elapsed().as_millis() as u64,
-            output: result.output.clone(),
+            output: self.relative_to_workspace(&result.output),
             command: current.command.clone(),
             uses: current.uses.clone(),
             env_set,
@@ -3391,6 +3414,9 @@ impl StepLoopState {
                 );
                 if let Some(masker) = secret_masker {
                     result.output = masker.mask(&result.output);
+                }
+                if let Some(note) = missing_secrets_note(step, &self.known_secrets) {
+                    result.output = format!("{}\n{}\n", result.output.trim_end(), note);
                 }
 
                 if verbose || result.status == StepStatus::Failure {
@@ -3543,10 +3569,7 @@ async fn run_step_with_guards(
     workflow: &WorkflowDefinition,
     step_exec_ctx: StepExecutionContext<'_>,
 ) -> Result<StepOutcome, ExecutionError> {
-    let step_name = step
-        .name
-        .clone()
-        .unwrap_or_else(|| format!("Step {}", step_idx + 1));
+    let step_name = step_display_name(step, step_idx);
 
     // Check step-level if condition
     if let Some(if_cond) = &step.if_condition {
@@ -3643,11 +3666,51 @@ async fn run_step_with_guards(
     }
 }
 
-/// The name a step reports under: its `name:`, or its 1-based position.
+/// The name a step reports under: its `name:`, its action, or its 1-based
+/// position.
 fn step_display_name(step: &Step, index: usize) -> String {
     step.name
         .clone()
+        .or_else(|| step.uses.clone())
         .unwrap_or_else(|| format!("Step {}", index + 1))
+}
+
+/// Paths a job's workspace appears under in step output: the directory on
+/// this machine, resolved and not, and its fixed location in a container.
+fn workspace_prefixes(workspace: &Path) -> Vec<String> {
+    let mut prefixes = vec!["/github/workspace/".to_string()];
+    let resolved = workspace.canonicalize().ok();
+    for path in resolved.as_deref().into_iter().chain([workspace]) {
+        let prefix = format!("{}/", path.display());
+        if !prefixes.contains(&prefix) {
+            prefixes.push(prefix);
+        }
+    }
+    prefixes
+}
+
+/// A line naming the secrets `step` reads that no provider has, because an
+/// empty value is otherwise a confusing way for a step to fail.
+fn missing_secrets_note(step: &Step, known: &HashSet<String>) -> Option<String> {
+    let texts = step
+        .run
+        .iter()
+        .chain(step.env.values())
+        .chain(step.with.iter().flat_map(|with| with.values()));
+    let mut missing: Vec<String> = texts
+        .flat_map(|text| SecretSubstitution::extract_secret_refs(text))
+        .map(|secret| secret.name)
+        .filter(|name| !known.contains(name))
+        .collect();
+    missing.sort();
+    missing.dedup();
+    (!missing.is_empty()).then(|| {
+        format!(
+            "Warning: not set, so empty in this step: {}. \
+             Set an environment variable of the same name to provide a value.",
+            missing.join(", ")
+        )
+    })
 }
 
 /// Whether a `continue-on-error` value (`true`, `false` or an expression) holds.
@@ -4186,11 +4249,7 @@ async fn handle_cache_action(
 }
 
 async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, ExecutionError> {
-    let step_name = ctx
-        .step
-        .name
-        .clone()
-        .unwrap_or_else(|| format!("Step {}", ctx.step_idx + 1));
+    let step_name = step_display_name(ctx.step, ctx.step_idx);
 
     if ctx.verbose {
         wrkflw_logging::info(&format!("  Executing step: {}", step_name));
@@ -4205,7 +4264,7 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
     // Add step-level environment variables (with secret + expression substitution)
     for (key, value) in &ctx.step.env {
         let resolved_value = if let Some(secret_manager) = ctx.services.secret_manager {
-            let mut substitution = SecretSubstitution::new(secret_manager);
+            let mut substitution = SecretSubstitution::allowing_missing(secret_manager);
             match substitution.substitute(value).await {
                 Ok(resolved) => resolved,
                 Err(e) => {
@@ -4773,7 +4832,7 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
 
         // Perform secret substitution if secret manager is available
         let resolved_run = if let Some(secret_manager) = ctx.services.secret_manager {
-            let mut substitution = SecretSubstitution::new(secret_manager);
+            let mut substitution = SecretSubstitution::allowing_missing(secret_manager);
             match substitution.substitute(run).await {
                 Ok(resolved) => resolved,
                 Err(e) => {

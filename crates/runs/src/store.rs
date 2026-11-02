@@ -244,6 +244,7 @@ mod tests {
             duration_ms: None,
             error: None,
             skip_reason: None,
+            from_step: None,
             jobs: Vec::new(),
         }
     }

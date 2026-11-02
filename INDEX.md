@@ -1,7 +1,7 @@
 # Codebase Index: wrkflw
 
-> Generated: 2026-11-02 11:11:37 UTC | Files: 229 | Lines: 97446
-> Languages: JSON (4), Markdown (26), Rust (137), Shell (5), TOML (19), YAML (38)
+> Generated: 2026-11-02 12:04:34 UTC | Files: 230 | Lines: 97995
+> Languages: JSON (4), Markdown (26), Rust (138), Shell (5), TOML (19), YAML (38)
 
 ## Directory Structure
 
@@ -159,6 +159,7 @@ wrkflw/
         log_processor.rs
         models/
           mod.rs
+        selection.rs
         theme.rs
         utils/
           mod.rs
@@ -1055,6 +1056,7 @@ wrkflw/
 - `pub mod components`
 - `pub mod log_processor`
 - `pub mod models`
+- `pub mod selection`
 - `pub mod theme`
 - `pub mod utils`
 - `pub mod views`
@@ -1077,6 +1079,13 @@ wrkflw/
 - `pub enum StatusSeverity`
 - `pub enum LogBadge`
 - `pub enum LogFilterLevel`
+
+**crates/ui/src/selection.rs**
+- `pub struct Selection`
+- `pub fn handle_mouse(selection: &mut Option<Selection>, mouse: MouseEvent) -> Option<KeyCode>`
+- `pub fn apply(selection: &mut Option<Selection>, buf: &mut Buffer) -> Option<String>`
+- `pub enum CopyMethod`
+- `pub fn copy_to_clipboard(text: &str) -> io::Result<CopyMethod>`
 
 **crates/ui/src/theme.rs**
 - `pub fn set_accent_override(color: Option<Color>)`
@@ -1605,7 +1614,7 @@ wrkflw/
 
 ## INDEX.md
 
-**Language:** Markdown | **Size:** 207.2 KB | **Lines:** 7669
+**Language:** Markdown | **Size:** 208.4 KB | **Lines:** 7705
 
 **Declarations:**
 
@@ -1613,7 +1622,7 @@ wrkflw/
 
 ## README.md
 
-**Language:** Markdown | **Size:** 20.5 KB | **Lines:** 410
+**Language:** Markdown | **Size:** 20.8 KB | **Lines:** 412
 
 **Declarations:**
 
@@ -4808,12 +4817,14 @@ wrkflw/
 
 ## crates/ui/Cargo.toml
 
-**Language:** TOML | **Size:** 1.3 KB | **Lines:** 45
+**Language:** TOML | **Size:** 1.4 KB | **Lines:** 53
 
 **Imports:**
+- `base64`
 - `crossterm`
 - `ratatui`
 - `terminal-colorsaurus`
+- `unicode-width`
 - `reqwest`
 
 **Declarations:**
@@ -4830,18 +4841,21 @@ wrkflw/
 
 ## crates/ui/src/app/mod.rs
 
-**Language:** Rust | **Size:** 32.0 KB | **Lines:** 709
+**Language:** Rust | **Size:** 33.1 KB | **Lines:** 736
 
 **Imports:**
 - `crate::handlers::workflow::start_next_workflow_execution`
 - `crate::models::{ExecutionResultMsg, QueuedExecution, Workflow, WorkflowStatus}`
+- `crate::selection`
 - `crate::utils::load_workflows`
 - `crate::views::{
     render_ui, TAB_COUNT, TAB_DAG, TAB_EXECUTION, TAB_HELP, TAB_LOGS, TAB_RUNS, TAB_SECRETS,
     TAB_TRIGGER, TAB_WORKFLOWS,
 }`
 - `crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 }`
@@ -4849,8 +4863,7 @@ wrkflw/
 - `std::collections::HashMap`
 - `std::io::{self, stdout}`
 - `std::path::PathBuf`
-- `std::sync::mpsc`
-- *... and 4 more imports*
+- *... and 5 more imports*
 
 **Declarations:**
 
@@ -4862,7 +4875,7 @@ wrkflw/
 
 ## crates/ui/src/app/state.rs
 
-**Language:** Rust | **Size:** 182.4 KB | **Lines:** 4533
+**Language:** Rust | **Size:** 183.3 KB | **Lines:** 4555
 
 **Imports:**
 - `crate::log_processor::{LogProcessingRequest, LogProcessor, ProcessedLogEntry}`
@@ -4998,6 +5011,8 @@ wrkflw/
   `pub fn set_info_message(&mut self, message: String)`
 
   `pub fn set_success_message(&mut self, message: String)`
+
+  `pub fn report_copy( &mut self, text: &str, result: std::io::Result<crate::selection::CopyMethod>, )`
 
   `pub fn tick(&mut self) -> bool`
 
@@ -5307,7 +5322,7 @@ wrkflw/
 
 ## crates/ui/src/lib.rs
 
-**Language:** Rust | **Size:** 980 B | **Lines:** 35
+**Language:** Rust | **Size:** 1.1 KB | **Lines:** 38
 
 **Imports:**
 - `pub use app::run_wrkflw_tui`
@@ -5397,6 +5412,52 @@ wrkflw/
 
   `pub fn as_str(&self) -> &str`
 
+
+`mod tests`
+
+---
+
+## crates/ui/src/selection.rs
+
+**Language:** Rust | **Size:** 15.2 KB | **Lines:** 445
+
+**Imports:**
+- `crate::theme::COLORS`
+- `base64::{engine::general_purpose::STANDARD, Engine as _}`
+- `crossterm::event::{KeyCode, MouseButton, MouseEvent, MouseEventKind}`
+- `ratatui::{buffer::Buffer, layout::Rect, style::Style}`
+- `std::io::{self, Write}`
+- `std::process::{Command, Stdio}`
+- `std::time::{Duration, Instant}`
+- `unicode_width::UnicodeWidthStr`
+
+**Declarations:**
+
+`const CLIPBOARD_TOOL_TIMEOUT: Duration = Duration::from_millis(500)`
+
+`const VERTICAL_BORDERS: &str = "│┃║"`
+
+`const BORDER_JOINS: &str = "╭╮╰╯┌┐└┘├┤┬┴┼╔╗╚╝╠╣╦╩╬┏┓┗┛┣┫┳┻╋"`
+
+**`impl Selection`**
+  `fn new(anchor: (u16, u16)) -> Self`
+
+  `fn row_spans(&self, bounds: Rect) -> Vec<(u16, u16, u16)>`
+
+  `fn text(&self, buf: &Buffer, bounds: Rect) -> String`
+
+
+`fn symbol_in(buf: &Buffer, col: u16, row: u16, set: &str) -> bool`
+
+`fn is_wall(buf: &Buffer, col: u16, row: u16) -> bool`
+
+`fn enclosing_pane(buf: &Buffer, (col, row): (u16, u16)) -> Rect`
+
+`fn osc52(text: &str, in_tmux: bool) -> String`
+
+`fn native_tools() -> Vec<(&'static str, &'static [&'static str])>`
+
+`fn run_tool(program: &str, args: &[&str], text: &str) -> io::Result<()>`
 
 `mod tests`
 
@@ -5560,7 +5621,7 @@ wrkflw/
 
 ## crates/ui/src/views/help_overlay.rs
 
-**Language:** Rust | **Size:** 10.5 KB | **Lines:** 296
+**Language:** Rust | **Size:** 10.8 KB | **Lines:** 302
 
 **Imports:**
 - `crate::theme::{self, COLORS}`

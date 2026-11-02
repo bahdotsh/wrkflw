@@ -339,6 +339,50 @@ fn variable_values_printed_by_a_step_are_masked() {
 }
 
 #[test]
+fn replay_works_after_a_path_separator() {
+    let sandbox = Sandbox::new();
+    let first = sandbox.run(&[
+        "--format",
+        "json",
+        "run",
+        "--runtime",
+        "emulation",
+        "--",
+        ".github/workflows/passing.yml",
+    ]);
+    let first_id = json_lines(&first)[0]["run_id"].clone();
+
+    let replay = sandbox.run(&["--format", "json", "runs", "replay"]);
+    assert!(replay.status.success(), "{}", stdout(&replay));
+    let events = json_lines(&replay);
+    assert_ne!(events[0]["run_id"], first_id);
+    let shown = json_doc(&sandbox.run(&["--format", "json", "runs", "show"]));
+    assert_eq!(shown["replay_of"], first_id);
+}
+
+#[test]
+fn replay_with_variables_works_after_a_path_separator() {
+    let sandbox = Sandbox::new();
+    fs::write(
+        sandbox.repo.path().join(".gitlab-ci.yml"),
+        "stages: [test]\nunit:\n  stage: test\n  script:\n    - echo \"$API_KEY\"\n",
+    )
+    .unwrap();
+    sandbox.run(&[
+        "run",
+        "--runtime",
+        "emulation",
+        "-V",
+        "API_KEY=first",
+        "--",
+        ".gitlab-ci.yml",
+    ]);
+    let replay = sandbox.run(&["--format", "json", "runs", "replay", "-V", "API_KEY=again"]);
+    assert!(replay.status.success(), "{}", stdout(&replay));
+    json_lines(&replay);
+}
+
+#[test]
 fn no_record_leaves_no_history_but_keeps_the_digest() {
     let sandbox = Sandbox::new();
     let output = sandbox

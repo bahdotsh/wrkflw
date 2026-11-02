@@ -221,6 +221,22 @@ fn logs(
     out
 }
 
+/// The recorded arguments plus this replay's flags. Those go before any `--`,
+/// which MCP runs always have, because clap reads what follows it as paths.
+fn replay_args(argv: &[String], variables: &[String], format: OutputFormat) -> Vec<String> {
+    let separator = argv.iter().position(|arg| arg == "--");
+    let (flags, positional) = argv.split_at(separator.unwrap_or(argv.len()));
+    let mut args = flags.to_vec();
+    for variable in variables {
+        args.extend(["--variable".to_string(), variable.clone()]);
+    }
+    if format.is_json() {
+        args.extend(["--format".to_string(), "json".to_string()]);
+    }
+    args.extend_from_slice(positional);
+    args
+}
+
 fn replay(run: &RunRecord, variables: &[String], format: OutputFormat) -> ! {
     if run.argv.is_empty() {
         die(
@@ -236,14 +252,8 @@ fn replay(run: &RunRecord, variables: &[String], format: OutputFormat) -> ! {
     }
     let exe = std::env::current_exe().unwrap_or_else(|e| die(format, &e.to_string()));
     let mut command = std::process::Command::new(exe);
-    command.args(&run.argv);
-    for variable in variables {
-        command.arg("--variable").arg(variable);
-    }
-    if format.is_json() {
-        command.args(["--format", "json"]);
-    }
     command
+        .args(replay_args(&run.argv, variables, format))
         .current_dir(&run.cwd)
         .env(wrkflw_runs::env::REPLAY_OF, &run.id);
     match command.status() {
@@ -358,5 +368,43 @@ pub(crate) async fn run(command: RunsCommand, format: OutputFormat) {
             }
             replay(&record, &variables, format);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn strings(args: &[&str]) -> Vec<String> {
+        args.iter().map(|arg| arg.to_string()).collect()
+    }
+
+    #[test]
+    fn replay_flags_stay_ahead_of_the_separator() {
+        let args = replay_args(
+            &strings(&["run", "--", "ci.yml"]),
+            &strings(&["A=b"]),
+            OutputFormat::Json,
+        );
+        assert_eq!(
+            args,
+            strings(&[
+                "run",
+                "--variable",
+                "A=b",
+                "--format",
+                "json",
+                "--",
+                "ci.yml"
+            ])
+        );
+    }
+
+    #[test]
+    fn replay_without_a_separator_appends_its_flags() {
+        let args = replay_args(&strings(&["run", "ci.yml"]), &[], OutputFormat::Json);
+        assert_eq!(args, strings(&["run", "ci.yml", "--format", "json"]));
+        let args = replay_args(&strings(&["run", "ci.yml"]), &[], OutputFormat::Text);
+        assert_eq!(args, strings(&["run", "ci.yml"]));
     }
 }

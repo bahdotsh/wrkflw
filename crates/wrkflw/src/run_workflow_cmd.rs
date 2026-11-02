@@ -103,17 +103,38 @@ fn strip_variable_args(args: impl Iterator<Item = String>) -> Vec<String> {
     let mut kept = Vec::new();
     let mut args = args;
     while let Some(arg) = args.next() {
+        // Everything after `--` is positional, even if it looks like a flag.
+        if arg == "--" {
+            kept.push(arg);
+            kept.extend(args);
+            break;
+        }
         // `--format` is the replayer's choice, and clap rejects it twice.
-        if arg == "-V" || arg == "--variable" || arg == "--format" {
+        if arg == "--variable" || arg == "--format" {
             args.next();
-        } else if !arg.starts_with("--variable=")
-            && !arg.starts_with("--format=")
-            && !(arg.starts_with("-V") && arg.len() > 2)
-        {
+        } else if let Some((flags, inline_value)) = variable_in_short_cluster(&arg) {
+            if !flags.is_empty() {
+                kept.push(format!("-{flags}"));
+            }
+            if !inline_value {
+                args.next();
+            }
+        } else if !arg.starts_with("--variable=") && !arg.starts_with("--format=") {
             kept.push(arg);
         }
     }
     kept
+}
+
+/// Finds `-V` in a short-flag cluster such as `-V`, `-VA=b` or `-dV`. Returns
+/// the boolean flags before it and whether its value is part of `arg`.
+fn variable_in_short_cluster(arg: &str) -> Option<(&str, bool)> {
+    let cluster = arg.strip_prefix('-').filter(|c| !c.starts_with('-'))?;
+    let (flags, value) = cluster.split_once('V')?;
+    flags
+        .chars()
+        .all(|flag| flag == 'v' || flag == 'd')
+        .then_some((flags, !value.is_empty()))
 }
 
 /// Execute the `wrkflw run` command. Exits the process on every
@@ -141,11 +162,12 @@ pub(crate) async fn run(ctx: RunCtx) {
 
     let mut variable_names: Vec<String> = ctx.variables.keys().cloned().collect();
     variable_names.sort();
-    let mut meta = wrkflw_runs::RunMeta::new(if std::env::var_os(wrkflw_runs::env::MCP).is_some() {
-        "mcp"
-    } else {
-        "cli"
-    });
+    let mut meta =
+        wrkflw_runs::RunMeta::new(if std::env::var_os(wrkflw_runs::env::MCP).is_some() {
+            "mcp"
+        } else {
+            "cli"
+        });
     meta.agent = ctx.agent.clone().or(meta.agent);
     meta.intent = ctx.intent.clone();
     meta.event = ctx.event.clone();
@@ -377,5 +399,19 @@ mod tests {
         ];
         let kept = strip_variable_args(args.iter().map(|s| s.to_string()));
         assert_eq!(kept, vec!["run", "ci.yml", "--job", "build"]);
+    }
+
+    #[test]
+    fn variable_values_in_short_flag_clusters_are_removed() {
+        let args = ["run", "-dV", "TOKEN=a", "-vdVB=b", "-v", "ci.yml"];
+        let kept = strip_variable_args(args.iter().map(|s| s.to_string()));
+        assert_eq!(kept, vec!["run", "-d", "-vd", "-v", "ci.yml"]);
+    }
+
+    #[test]
+    fn arguments_after_the_separator_are_kept_verbatim() {
+        let args = ["run", "--", "-Vfile.yml", "--format"];
+        let kept = strip_variable_args(args.iter().map(|s| s.to_string()));
+        assert_eq!(kept, args);
     }
 }

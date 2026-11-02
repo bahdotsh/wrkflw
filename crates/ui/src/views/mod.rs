@@ -4,6 +4,7 @@ mod execution_tab;
 mod help_overlay;
 mod job_detail;
 mod logs_tab;
+mod runs_tab;
 mod secrets_tab;
 mod status_bar;
 mod title_bar;
@@ -12,7 +13,8 @@ mod tweaks_overlay;
 mod workflows_tab;
 
 pub use title_bar::{
-    TAB_COUNT, TAB_DAG, TAB_EXECUTION, TAB_HELP, TAB_LOGS, TAB_SECRETS, TAB_TRIGGER, TAB_WORKFLOWS,
+    TAB_COUNT, TAB_DAG, TAB_EXECUTION, TAB_HELP, TAB_LOGS, TAB_RUNS, TAB_SECRETS, TAB_TRIGGER,
+    TAB_WORKFLOWS,
 };
 
 use crate::app::App;
@@ -85,6 +87,7 @@ pub fn render_ui(f: &mut Frame<'_>, app: &mut App) {
         TAB_LOGS => logs_tab::render_logs_tab(f, app, main_chunks[1]),
         TAB_TRIGGER => trigger_tab::render_trigger_tab(f, app, main_chunks[1]),
         TAB_SECRETS => secrets_tab::render_secrets_tab(f, app, main_chunks[1]),
+        TAB_RUNS => runs_tab::render_runs_tab(f, app, main_chunks[1]),
         TAB_HELP => help_overlay::render_help_content(f, main_chunks[1], app.help_scroll),
         _ => {}
     }

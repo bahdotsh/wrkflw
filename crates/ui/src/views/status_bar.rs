@@ -1,5 +1,7 @@
 // Status bar — left-aligned key chips, right-aligned runtime + meta.
-use super::{TAB_DAG, TAB_EXECUTION, TAB_HELP, TAB_LOGS, TAB_SECRETS, TAB_TRIGGER, TAB_WORKFLOWS};
+use super::{
+    TAB_DAG, TAB_EXECUTION, TAB_HELP, TAB_LOGS, TAB_RUNS, TAB_SECRETS, TAB_TRIGGER, TAB_WORKFLOWS,
+};
 use crate::app::App;
 use crate::models::StatusSeverity;
 use crate::theme::{self, BadgeKind, COLORS};
@@ -175,6 +177,7 @@ fn context_hints(app: &App) -> Vec<(&'static str, &'static str)> {
             (",", "tweaks"),
             ("?", "help"),
         ],
+        TAB_RUNS => vec![("↑↓", "select"), ("q", "quit")],
         TAB_HELP => vec![("↑↓", "scroll"), ("?", "close"), ("q", "quit")],
         _ => vec![],
     }

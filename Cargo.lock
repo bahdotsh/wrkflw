@@ -3582,6 +3582,7 @@ dependencies = [
  "wrkflw-matrix",
  "wrkflw-models",
  "wrkflw-parser",
+ "wrkflw-runs",
  "wrkflw-runtime",
  "wrkflw-trigger-filter",
  "wrkflw-ui",
@@ -3720,6 +3721,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "wrkflw-runs"
+version = "0.8.0"
+dependencies = [
+ "chrono",
+ "dirs",
+ "nix",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "uuid",
+ "wrkflw-executor",
+ "wrkflw-logging",
+]
+
+[[package]]
 name = "wrkflw-runtime"
 version = "0.8.0"
 dependencies = [
@@ -3806,6 +3823,7 @@ dependencies = [
  "wrkflw-matrix",
  "wrkflw-models",
  "wrkflw-parser",
+ "wrkflw-runs",
  "wrkflw-secrets",
  "wrkflw-trigger-filter",
  "wrkflw-utils",
@@ -3844,6 +3862,7 @@ dependencies = [
  "wrkflw-executor",
  "wrkflw-logging",
  "wrkflw-parser",
+ "wrkflw-runs",
  "wrkflw-trigger-filter",
 ]
 

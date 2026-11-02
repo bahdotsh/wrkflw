@@ -47,6 +47,9 @@ fn start_availability_probe(
 }
 
 /// Application state
+/// Runs loaded into the Runs tab.
+const MAX_RUNS_SHOWN: usize = 200;
+
 pub struct App {
     pub workflows: Vec<Workflow>,
     pub workflow_list_state: ListState,
@@ -84,6 +87,8 @@ pub struct App {
 
     // Help tab scrolling
     pub help_scroll: usize, // Scrolling position for help content
+    pub runs: Vec<wrkflw_runs::RunRecord>,
+    pub runs_selected: usize,
 
     // Background log processing
     pub log_processor: LogProcessor,
@@ -567,6 +572,8 @@ impl App {
             log_search_matches: Vec::new(),
             log_search_match_idx: 0,
             help_scroll: 0,
+            runs: Vec::new(),
+            runs_selected: 0,
 
             // Background log processing
             log_processor: LogProcessor::new(),
@@ -1201,6 +1208,28 @@ impl App {
     // Change the tab.
     pub fn switch_tab(&mut self, tab: usize) {
         self.selected_tab = tab;
+        if tab == crate::views::TAB_RUNS {
+            self.refresh_runs();
+        }
+    }
+
+    /// Reload the history. Bounded so a long history stays cheap to open.
+    pub fn refresh_runs(&mut self) {
+        self.runs = wrkflw_runs::RunStore::open_default()
+            .map(|store| store.list())
+            .unwrap_or_default();
+        self.runs.truncate(MAX_RUNS_SHOWN);
+        self.runs_selected = self.runs_selected.min(self.runs.len().saturating_sub(1));
+    }
+
+    pub fn select_next_run(&mut self) {
+        if self.runs_selected + 1 < self.runs.len() {
+            self.runs_selected += 1;
+        }
+    }
+
+    pub fn select_previous_run(&mut self) {
+        self.runs_selected = self.runs_selected.saturating_sub(1);
     }
 
     // Queue selected workflows for execution

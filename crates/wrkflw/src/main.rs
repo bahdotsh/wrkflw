@@ -4,9 +4,29 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
 
+mod json_output;
+mod mcp_cmd;
+mod plan_cmd;
 mod prefilter;
 mod run_workflow_cmd;
+mod runs_cmd;
 mod watch_cmd;
+
+/// How a command reports its result.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
+pub(crate) enum OutputFormat {
+    /// Human-readable text (default)
+    #[default]
+    Text,
+    /// JSON on stdout. Commands that stream, like `run`, emit one object per line
+    Json,
+}
+
+impl OutputFormat {
+    pub(crate) fn is_json(self) -> bool {
+        self == OutputFormat::Json
+    }
+}
 
 #[derive(Debug, Clone, ValueEnum)]
 pub(crate) enum RuntimeChoice {
@@ -55,6 +75,10 @@ struct Wrkflw {
     /// Run in debug mode with extensive execution details
     #[arg(short, long, global = true)]
     debug: bool,
+
+    /// Output format. `json` keeps stdout machine-readable and sends logs to stderr
+    #[arg(long, global = true, value_enum, default_value = "text")]
+    format: OutputFormat,
 
     /// TUI color theme: auto, dark or light. Defaults to WRKFLW_THEME, then auto,
     /// which follows the terminal background
@@ -307,6 +331,23 @@ enum Commands {
         /// site.
         #[arg(long = "no-strict-filter", conflicts_with = "strict_filter")]
         no_strict_filter: bool,
+
+        /// Why this run is happening. Stored on the run record
+        #[arg(long, env = "WRKFLW_INTENT", value_name = "TEXT")]
+        intent: Option<String>,
+
+        /// Who started this run. Defaults to WRKFLW_AGENT, then a detected coding agent
+        #[arg(long, value_name = "NAME")]
+        agent: Option<String>,
+
+        /// Don't record this run in the history
+        #[arg(long)]
+        no_record: bool,
+
+        /// With --job, start at this step (name or 1-based position). Earlier steps are
+        /// skipped, except actions/checkout, so their outputs and files are missing
+        #[arg(long, value_name = "STEP", requires = "job")]
+        from_step: Option<String>,
     },
 
     /// Watch for file changes and re-run affected workflows.
@@ -451,6 +492,74 @@ enum Commands {
         #[arg(long)]
         jobs: bool,
     },
+
+    /// Show what a run would do without executing anything
+    Plan {
+        /// Path to workflow/pipeline file
+        path: PathBuf,
+
+        /// Explicitly treat as a GitLab CI/CD pipeline
+        #[arg(long)]
+        gitlab: bool,
+
+        /// Plan only this job and what it needs
+        #[arg(long)]
+        job: Option<String>,
+
+        /// Event to evaluate the trigger against (e.g., push, pull_request)
+        #[arg(long)]
+        event: Option<String>,
+
+        /// Use git diff to determine changed files
+        #[arg(long)]
+        diff: bool,
+
+        /// Changed files (comma-separated)
+        #[arg(long, value_delimiter = ',')]
+        changed_files: Option<Vec<String>>,
+
+        /// Base ref for diff comparison
+        #[arg(long)]
+        diff_base: Option<String>,
+
+        /// Head ref for diff comparison (default: working tree)
+        #[arg(long)]
+        diff_head: Option<String>,
+
+        /// Target branch for pull_request events
+        #[arg(long)]
+        base_branch: Option<String>,
+
+        /// Activity type for `types:` filters (e.g. opened)
+        #[arg(long)]
+        activity_type: Option<String>,
+
+        /// Reject degraded filter contexts instead of warning
+        #[arg(long = "strict-filter", default_value_t = true)]
+        strict_filter: bool,
+
+        /// Warn about degraded filter contexts instead of rejecting them
+        #[arg(long = "no-strict-filter", conflicts_with = "strict_filter")]
+        no_strict_filter: bool,
+    },
+
+    /// Inspect and replay recorded runs
+    Runs {
+        #[command(subcommand)]
+        command: runs_cmd::RunsCommand,
+    },
+
+    /// Model Context Protocol server for coding agents
+    Mcp {
+        #[command(subcommand)]
+        command: McpCommand,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Subcommand)]
+enum McpCommand {
+    /// Serve over stdio until stdin closes
+    Serve,
 }
 
 // An empty value is skipped rather than rejected, so an exported but empty
@@ -648,6 +757,12 @@ async fn main() {
     let verbose = cli.verbose;
     let debug = cli.debug;
 
+    // stdout is a protocol in these modes, so logs must stay off it.
+    let format = cli.format;
+    if format.is_json() || matches!(cli.command, Some(Commands::Mcp { .. })) {
+        wrkflw_logging::set_console_to_stderr(true);
+    }
+
     // Set log level based on command line flags
     if debug {
         wrkflw_logging::set_log_level(wrkflw_logging::LogLevel::Debug);
@@ -689,6 +804,14 @@ async fn main() {
             // Determine if we're validating a GitLab pipeline based on the --gitlab flag or file detection
             let force_gitlab = *gitlab;
             let mut validation_failed = false;
+
+            if format.is_json() {
+                let failed = json_output::validate(&validate_paths, force_gitlab);
+                if failed && *exit_code && !*no_exit_code {
+                    std::process::exit(1);
+                }
+                return;
+            }
 
             for validate_path in validate_paths {
                 // Check if the path exists; if not, mark failure but continue
@@ -781,6 +904,10 @@ async fn main() {
             activity_type,
             strict_filter,
             no_strict_filter,
+            intent,
+            agent,
+            no_record,
+            from_step,
         }) => {
             run_workflow_cmd::run(run_workflow_cmd::RunCtx {
                 path: path.clone(),
@@ -802,6 +929,11 @@ async fn main() {
                 verbose,
                 platform_overrides,
                 kubernetes,
+                format,
+                intent: intent.clone(),
+                agent: agent.clone(),
+                no_record: *no_record,
+                from_step: from_step.clone(),
             })
             .await;
         }
@@ -837,6 +969,7 @@ async fn main() {
                 verbose,
                 platform_overrides,
                 kubernetes,
+                format,
             })
             .await;
         }
@@ -898,7 +1031,51 @@ async fn main() {
             }
         }
         Some(Commands::List { jobs }) => {
-            list_workflows_and_pipelines(verbose, *jobs);
+            if format.is_json() {
+                json_output::list();
+            } else {
+                list_workflows_and_pipelines(verbose, *jobs);
+            }
+        }
+        Some(Commands::Plan {
+            path,
+            gitlab,
+            job,
+            event,
+            diff,
+            changed_files,
+            diff_base,
+            diff_head,
+            base_branch,
+            activity_type,
+            strict_filter,
+            no_strict_filter,
+        }) => {
+            plan_cmd::run(plan_cmd::PlanCtx {
+                path: path.clone(),
+                gitlab: *gitlab,
+                job: job.clone(),
+                event: event.clone(),
+                diff: *diff,
+                changed_files: changed_files.clone(),
+                diff_base: diff_base.clone(),
+                diff_head: diff_head.clone(),
+                base_branch: base_branch.clone(),
+                activity_type: activity_type.clone(),
+                strict_filter: *strict_filter,
+                no_strict_filter: *no_strict_filter,
+                verbose,
+                format,
+            })
+            .await;
+        }
+        Some(Commands::Runs { command }) => {
+            runs_cmd::run(command.clone(), format).await;
+        }
+        Some(Commands::Mcp {
+            command: McpCommand::Serve,
+        }) => {
+            mcp_cmd::serve().await;
         }
         None => {
             #[cfg(feature = "tui")]

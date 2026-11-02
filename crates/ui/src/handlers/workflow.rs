@@ -659,7 +659,18 @@ pub fn start_next_workflow_execution(
 
                     let execution_result = wrkflw_utils::fd::with_stderr_to_null(|| {
                         futures::executor::block_on(async {
-                            wrkflw_executor::execute_workflow(&workflow_path, config).await
+                            wrkflw_runs::execute_recorded(
+                                &workflow_path,
+                                config,
+                                wrkflw_runs::RunOptions {
+                                    meta: wrkflw_runs::RunMeta::new("tui"),
+                                    ndjson: false,
+                                    record: true,
+                                    from_step: None,
+                                },
+                            )
+                            .await
+                            .result
                         })
                     })
                     .map_err(|e| format!("Failed to redirect stderr during execution: {}", e))?;

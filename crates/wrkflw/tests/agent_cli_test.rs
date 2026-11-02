@@ -1021,3 +1021,21 @@ fn a_reported_step_name_can_be_passed_back_to_from_step() {
     let note = events.last().unwrap()["failure"]["note"].to_string();
     assert!(note.contains("Step 3"), "{note}");
 }
+
+#[test]
+fn undefined_references_warn_without_failing_validation() {
+    let sandbox = Sandbox::new();
+    let path = sandbox.write(
+        "warned.yml",
+        "name: w\non: [push]\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ${{ steps.nope.outputs.x }}\n",
+    );
+    let output = sandbox.run(&["--format", "json", "validate", path.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(0));
+    let report = json_doc(&output);
+    assert_eq!(report["files"][0]["valid"], true);
+    assert_eq!(report["files"][0]["issues"][0]["severity"], "warning");
+    assert_eq!(
+        report["files"][0]["issues"][0]["rule"],
+        "undefined-step-reference"
+    );
+}

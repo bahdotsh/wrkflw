@@ -38,6 +38,7 @@ fn file_report(
             "valid": false,
             "issues": [{
                 "rule": rule,
+                "severity": "error",
                 "message": message,
                 "path": null,
                 "line": yaml_error_line(&message),

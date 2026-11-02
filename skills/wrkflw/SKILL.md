@@ -7,7 +7,7 @@ description: Validate, plan and run GitHub Actions or GitLab CI workflows locall
 
 Check workflow changes locally before pushing them. Use the wrkflw MCP tools when they are available, otherwise the CLI with `--format json`.
 
-1. Validate after every YAML edit with `validate_workflows`, or `wrkflw --format json validate`. Each issue has a rule, YAML path, line and sometimes a hint.
+1. Validate after every YAML edit with `validate_workflows`, or `wrkflw --format json validate`. Each issue has a rule, severity, YAML path, line and sometimes a hint. A `warning` leaves the file valid but is usually worth fixing.
 2. Before running, call `plan_workflow`, or `wrkflw --format json plan <file>`. It explains whether the trigger fires, lists jobs in order and names `missing_secrets` without executing anything.
 3. Run with `run_workflow`, or `wrkflw --format json run <file> --intent "<why>"`. Always say why, because the reason is stored on the run.
 4. On failure, read the digest in the result. It names the failed step, script, exit code, earlier exported env and output tail.

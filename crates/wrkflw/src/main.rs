@@ -1153,6 +1153,9 @@ fn validate_github_workflow(path: &Path, verbose: bool) -> bool {
                 if verbose {
                     println!("{}", cli_style::dim("  All validation checks passed"));
                 }
+                for warning in result.warnings() {
+                    println!("{}", cli_style::indent(&format!("warning: {}", warning)));
+                }
             } else {
                 println!("{}", cli_style::error("Invalid"));
                 for (i, issue) in result.issues.iter().enumerate() {

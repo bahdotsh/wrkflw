@@ -17,7 +17,9 @@ struct Scope {
     matrix: Option<HashSet<String>>,
 }
 
-/// Check every expression in `workflow`.
+/// Check every expression in `workflow`. An unclosed expression is an error.
+/// An undefined reference is a warning: GitHub accepts it, and finding names
+/// in text can mistake something else for a reference.
 pub fn validate_expressions(workflow: &Value, result: &mut ValidationResult) {
     let Some(sections) = workflow.as_mapping() else {
         return;
@@ -183,7 +185,7 @@ fn check_references(expression: &str, scope: &Scope, result: &mut ValidationResu
             };
             for name in references(&code, context) {
                 if !known.contains(&name) {
-                    result.report(rule, message(&name));
+                    result.warn(rule, message(&name));
                 }
             }
         };
@@ -272,6 +274,20 @@ mod tests {
         let mut result = ValidationResult::new();
         validate_expressions(&workflow, &mut result);
         result.details.into_iter().map(|d| d.rule).collect()
+    }
+
+    #[test]
+    fn only_an_unclosed_expression_invalidates_the_workflow() {
+        let validate = |text: &str| {
+            let workflow: Value = serde_yaml::from_str(text).unwrap();
+            let mut result = ValidationResult::new();
+            validate_expressions(&workflow, &mut result);
+            result
+        };
+        let undefined = validate(&run_step("echo ${{ steps.nope.outputs.x }}"));
+        assert!(undefined.is_valid);
+        assert_eq!(undefined.warnings().count(), 1);
+        assert!(!validate(&run_step("echo ${{ github.sha")).is_valid);
     }
 
     fn job(body: &str) -> String {

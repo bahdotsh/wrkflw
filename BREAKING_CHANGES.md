@@ -6,7 +6,9 @@ A `${{ secrets.X }}` that no provider has now expands to an empty string in `run
 
 ## `wrkflw validate` reports more problems (unreleased)
 
-Files that passed may now fail with these rules: `unknown-trigger-filter`, `unterminated-expression`, `undefined-step-reference`, `undefined-need-reference` and `undefined-matrix-key`.
+Files that passed may now fail with `unknown-trigger-filter` and `unterminated-expression`, which GitHub rejects too.
+
+`undefined-step-reference`, `undefined-need-reference` and `undefined-matrix-key` are warnings: GitHub accepts these workflows, so they appear in `issues` with `severity: warning` and leave `valid` true. Every issue now has a `severity`, and code treating any entry in `issues` as a failure should read `valid` instead.
 
 ## Failure digests fold matrix legs (unreleased)
 

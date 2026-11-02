@@ -45,6 +45,10 @@ Exit codes: 0 for success or skipped, 1 for a failed run or failed validation, 2
 
 A secret no provider has expands to an empty string, as on GitHub. `plan` lists these under `missing_secrets`, and a step that reads one ends its output with a warning naming it. To provide a value, set an environment variable with the secret's exact name, such as `DEPLOY_TOKEN`, before running wrkflw. A secret read from a named provider, as in `secrets.vault:TOKEN`, is listed as `vault:TOKEN` and has to be added to that provider.
 
+## Validation
+
+Each issue has a `severity`. An `error` makes the file invalid. A `warning`, such as a reference to an undefined step, leaves `valid` true because GitHub accepts it, but it usually means the value will be empty.
+
 ## History
 
 Runs are stored under `$WRKFLW_HOME/runs`, defaulting to the platform's local data directory. The newest 500 are kept, or `WRKFLW_RUNS_KEEP`. Use `--no-record` or `WRKFLW_NO_HISTORY=1` to skip recording.

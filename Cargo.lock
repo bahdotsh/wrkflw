@@ -3804,6 +3804,7 @@ dependencies = [
 name = "wrkflw-ui"
 version = "0.8.0"
 dependencies = [
+ "base64 0.21.7",
  "chrono",
  "colored",
  "crossterm",
@@ -3816,6 +3817,7 @@ dependencies = [
  "serde_yaml",
  "terminal-colorsaurus",
  "tokio",
+ "unicode-width",
  "urlencoding",
  "wrkflw-evaluator",
  "wrkflw-executor",

@@ -236,7 +236,7 @@ The TUI follows your terminal's background and uses a light or dark palette to m
 
 Logs tab adds `s` (search), `f` (filter), `c` (clear), `n` (next match). Trigger tab adds `p` (github↔gitlab), `b` (edit branch), `+` (add input), `c` (copy curl preview).
 
-The TUI does not capture the mouse, so you can select text by dragging and copy it with your terminal's usual shortcut.
+Drag with the mouse to select text; it is copied to the clipboard when you release. A selection stays inside the pane it started in, a click or any key clears it, and the wheel scrolls. Hold your terminal's bypass modifier (usually Shift, or Option in iTerm2) to use its native selection instead. Over SSH, copying relies on your terminal supporting OSC 52.
 
 ### Remote Triggering
 

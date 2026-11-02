@@ -137,6 +137,12 @@ pub fn render_help_content(f: &mut Frame<'_>, area: Rect, scroll_offset: usize) 
     right_lines.push(key_line("c", "Trigger: copy curl preview to logs"));
     right_lines.push(Line::from(""));
 
+    right_lines.extend(section_header("MOUSE"));
+    right_lines.push(Line::from(""));
+    right_lines.push(key_line("Drag", "Select text, copies on release"));
+    right_lines.push(key_line("Wheel", "Same as \u{2191}/\u{2193}"));
+    right_lines.push(Line::from(""));
+
     right_lines.extend(section_header("TAB OVERVIEW"));
     right_lines.push(Line::from(""));
     for (idx, name, color, tag) in [

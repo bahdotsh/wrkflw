@@ -5,6 +5,7 @@
 // - models: Contains the data structures for the UI
 // - components: Contains reusable UI elements
 // - handlers: Contains workflow handling logic
+// - selection: Contains mouse text selection and clipboard copy
 // - utils: Contains utility functions
 // - views: Contains UI rendering code
 
@@ -21,6 +22,8 @@ pub mod components;
 pub mod log_processor;
 #[cfg(feature = "tui")]
 pub mod models;
+#[cfg(feature = "tui")]
+pub mod selection;
 #[cfg(feature = "tui")]
 pub mod theme;
 #[cfg(feature = "tui")]

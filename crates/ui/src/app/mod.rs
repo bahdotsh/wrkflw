@@ -9,7 +9,7 @@ use crate::views::{
     TAB_TRIGGER, TAB_WORKFLOWS,
 };
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers},
+    event::{self, Event, KeyCode, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -41,10 +41,14 @@ pub async fn run_wrkflw_tui(
     // happen before raw mode and the event loop take over the tty.
     crate::theme::install(theme);
 
-    // Terminal setup
+    // Terminal setup. Mouse capture is deliberately left off: the TUI
+    // handles no mouse events, and enabling capture would make the
+    // terminal send drags to us instead of selecting text, which
+    // breaks the terminal's own select-and-copy (the behaviour users
+    // get in Claude Code and most other TUIs).
     enable_raw_mode()?;
     let mut stdout = stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     // Some terminals (e.g. iTerm2) carry the primary screen's contents
@@ -145,11 +149,7 @@ pub async fn run_wrkflw_tui(
     // Clean up terminal
     wrkflw_logging::set_quiet_mode(false);
     disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
 
     match result {

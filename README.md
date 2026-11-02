@@ -236,6 +236,8 @@ The TUI follows your terminal's background and uses a light or dark palette to m
 
 Logs tab adds `s` (search), `f` (filter), `c` (clear), `n` (next match). Trigger tab adds `p` (github↔gitlab), `b` (edit branch), `+` (add input), `c` (copy curl preview).
 
+The TUI does not capture the mouse, so you can select text by dragging and copy it with your terminal's usual shortcut.
+
 ### Remote Triggering
 
 Trigger `workflow_dispatch` events on GitHub or GitLab.

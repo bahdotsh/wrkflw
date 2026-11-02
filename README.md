@@ -28,6 +28,7 @@ A command-line tool for validating and executing GitHub Actions workflows locall
 - **Secrets management** — multiple providers (env, file, Vault, AWS, Azure, GCP) with masking and AES-256-GCM encrypted storage
 - **Remote triggering** — trigger `workflow_dispatch` runs on GitHub or GitLab pipelines
 - **GitLab support** — validate and trigger GitLab CI pipelines
+- **Agent support** — `--format json` on every command, recorded run history with failure digests, `wrkflw plan`, and an MCP server (see [AGENTS.md](AGENTS.md))
 - **Gitea support** — discover, validate, and run workflows from `.gitea/workflows`, including the `gitea` expression context
 
 ## Not yet supported
@@ -246,6 +247,31 @@ wrkflw trigger workflow-name --branch main --input key=value
 # GitLab (requires GITLAB_TOKEN env var)
 wrkflw trigger-gitlab --branch main --variable key=value
 ```
+
+### Using wrkflw from coding agents
+
+```bash
+# Machine-readable output: stdout is JSON only, logs go to stderr
+wrkflw --format json validate
+wrkflw --format json run .github/workflows/ci.yml --intent "check the new cache step"
+
+# See what would run, and why a trigger fires, without running anything
+wrkflw plan .github/workflows/ci.yml --event push --diff
+
+# Every run is recorded
+wrkflw runs list
+wrkflw runs failure latest
+wrkflw runs logs latest --step test --tail 50
+wrkflw runs replay latest
+
+# Resume a job at a step
+wrkflw run .github/workflows/ci.yml --job test --from-step "Run tests"
+
+# Serve all of this over the Model Context Protocol
+wrkflw mcp serve
+```
+
+The TUI's Runs tab shows the same history, including which agent started each run and why. See [AGENTS.md](AGENTS.md) for the output contract, and `skills/wrkflw` for a Claude Code skill.
 
 ## Runtime Modes
 

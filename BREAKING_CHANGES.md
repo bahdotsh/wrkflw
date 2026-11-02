@@ -1,5 +1,23 @@
 # Breaking Changes
 
+## Step output is masked, and `run` steps report their exit code (unreleased)
+
+`StepResult::output` and job logs now have secrets replaced with `***`, including values matching built-in token patterns. Previously nothing masked step output. Code that compared a secret's value against output will no longer match. Step outputs set with `::set-output::` keep their real values.
+
+`run:` step output now starts with an `Exit code: N` line. Read it with `StepResult::exit_code()`.
+
+## TUI: `7` opens the Runs tab, Help moved to `8` (unreleased)
+
+The `h` and `?` shortcuts for Help are unchanged.
+
+## `ValidationResult` gained `details` (unreleased)
+
+Code that builds `ValidationResult` with a struct literal must use `ValidationResult::new()`. `issues` is unchanged.
+
+## Runs are recorded by default (unreleased)
+
+`wrkflw run`, `watch` and TUI runs now write logs to the local data directory, keeping the newest 500. Pass `--no-record` or set `WRKFLW_NO_HISTORY=1` to opt out.
+
 ## `actions/upload-artifact` follows GitHub's layout and rules (unreleased)
 
 Artifact paths are now relative to where the `path:` search started, as on

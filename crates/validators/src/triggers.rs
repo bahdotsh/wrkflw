@@ -1,5 +1,50 @@
-use serde_yaml::Value;
+use serde_yaml::{Mapping, Value};
 use wrkflw_models::ValidationResult;
+
+/// The keys `event` accepts. A misspelled one matters more than it looks:
+/// GitHub rejects the workflow, while a simulated run ignores the filter.
+fn event_filters(event: &str) -> &'static [&'static str] {
+    match event {
+        "push" => &[
+            "branches",
+            "branches-ignore",
+            "tags",
+            "tags-ignore",
+            "paths",
+            "paths-ignore",
+        ],
+        "pull_request" | "pull_request_target" => &[
+            "types",
+            "branches",
+            "branches-ignore",
+            "paths",
+            "paths-ignore",
+        ],
+        "merge_group" => &["types", "branches", "branches-ignore"],
+        "workflow_run" => &["types", "workflows", "branches", "branches-ignore"],
+        "workflow_dispatch" => &["inputs"],
+        "workflow_call" => &["inputs", "outputs", "secrets"],
+        _ => &["types"],
+    }
+}
+
+fn check_filters(event: &str, filters: &Mapping, result: &mut ValidationResult) {
+    let allowed = event_filters(event);
+    for key in filters.keys().filter_map(Value::as_str) {
+        if !allowed.contains(&key) {
+            result.report_at(
+                "unknown-trigger-filter",
+                key,
+                format!(
+                    "Event '{}' has no filter '{}' (expected one of: {})",
+                    event,
+                    key,
+                    allowed.join(", ")
+                ),
+            );
+        }
+    }
+}
 
 pub fn validate_triggers(on: &Value, result: &mut ValidationResult) {
     let valid_events = vec![
@@ -61,7 +106,7 @@ pub fn validate_triggers(on: &Value, result: &mut ValidationResult) {
             }
         }
         Value::Mapping(event_map) => {
-            for (event, _) in event_map {
+            for (event, config) in event_map {
                 if let Some(event_str) = event.as_str() {
                     if !valid_events.contains(&event_str) {
                         result.report_at(
@@ -69,6 +114,8 @@ pub fn validate_triggers(on: &Value, result: &mut ValidationResult) {
                             event_str,
                             format!("Unknown trigger event: '{}'", event_str),
                         );
+                    } else if let Value::Mapping(filters) = config {
+                        result.scoped(event_str, |r| check_filters(event_str, filters, r));
                     }
                 }
             }

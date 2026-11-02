@@ -129,6 +129,13 @@ pub fn rule_hint(rule: &str) -> Option<&'static str> {
         "missing-jobs" => "Add a top-level `jobs:` mapping with at least one job.",
         "missing-triggers" => "Add a top-level `on:` section, e.g. `on: [push]`.",
         "unknown-trigger" => "Use an event from the GitHub Actions events list, e.g. `push`.",
+        "unknown-trigger-filter" => "Check the spelling: filters are plural, e.g. `branches:`.",
+        "unterminated-expression" => "Close the expression with `}}`.",
+        "undefined-step-reference" => {
+            "Give an earlier step in this job that `id:`, or fix the reference."
+        }
+        "undefined-need-reference" => "Add the job to this job's `needs:`, or fix the reference.",
+        "undefined-matrix-key" => "Add the key to `strategy.matrix`, or fix the reference.",
         "missing-runs-on" => {
             "Add `runs-on: ubuntu-latest`, or call a reusable workflow with `uses:`."
         }

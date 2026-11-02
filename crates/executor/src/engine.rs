@@ -1194,6 +1194,8 @@ pub struct StepResult {
     pub outcome: StepStatus,
     /// Effective result after `continue-on-error` is applied.
     pub conclusion: StepStatus,
+    /// The process exit code, when the step ran a process.
+    pub exit_code: Option<i32>,
 }
 
 impl StepResult {
@@ -1205,22 +1207,13 @@ impl StepResult {
             conclusion: status,
             status,
             output,
+            exit_code: None,
         }
     }
 
-    /// The process exit code, when the step ran a process.
-    ///
-    /// Read from the `Exit code: N` line step execution writes before the
-    /// process's own output. Only the very first line counts: any later one
-    /// could be something the step printed.
-    pub fn exit_code(&self) -> Option<i32> {
-        self.output
-            .lines()
-            .next()?
-            .strip_prefix("Exit code: ")?
-            .trim()
-            .parse()
-            .ok()
+    fn with_exit_code(mut self, exit_code: i32) -> Self {
+        self.exit_code = Some(exit_code);
+        self
     }
 }
 
@@ -1634,7 +1627,8 @@ async fn execute_native_docker_step(
             "Exit code: {}\n{}\n{}",
             output.exit_code, output.stdout, output.stderr
         ),
-    ))
+    )
+    .with_exit_code(output.exit_code))
 }
 
 /// Sanitize a sub-path component from an action reference (e.g. `owner/repo/sub/path`).
@@ -2767,13 +2761,8 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
                     "Job '{}' exceeded timeout of {} minutes",
                     ctx.job_name, timeout_mins
                 );
-                wrkflw_logging::error(&msg);
-                loop_state.job_logs.push_str(&format!("\n{}\n", msg));
+                loop_state.fail_step_on_timeout(step, idx, msg);
                 job_success = false;
-                loop_state.emit_step_finished(
-                    &StepResult::new(step_display_name(step, idx), StepStatus::Failure, msg),
-                    Vec::new(),
-                );
                 break;
             }
         };
@@ -3088,13 +3077,8 @@ async fn execute_matrix_job(
                         "Job '{}' exceeded timeout of {} minutes",
                         matrix_job_name, timeout_mins
                     );
-                    wrkflw_logging::error(&msg);
-                    loop_state.job_logs.push_str(&format!("\n{}\n", msg));
+                    loop_state.fail_step_on_timeout(step, idx, msg);
                     all_steps_ok = false;
-                    loop_state.emit_step_finished(
-                        &StepResult::new(step_display_name(step, idx), StepStatus::Failure, msg),
-                        Vec::new(),
-                    );
                     break;
                 }
             };
@@ -3243,8 +3227,14 @@ struct StepLoopState {
     job_label: String,
     job_started: std::time::Instant,
     step_started: std::time::Instant,
-    /// Index and definition summary of the step in flight.
-    current_step: Option<(usize, Option<String>, Option<String>)>,
+    current_step: Option<InFlightStep>,
+}
+
+/// The step being executed, as its finish event reports it.
+struct InFlightStep {
+    index: usize,
+    command: Option<String>,
+    uses: Option<String>,
 }
 
 impl StepLoopState {
@@ -3269,39 +3259,55 @@ impl StepLoopState {
 
     /// Mark `step` as in flight, so its finish event can report timing.
     fn begin_step(&mut self, index: usize, step: &workflow::Step) {
-        let name = step
-            .name
-            .clone()
-            .unwrap_or_else(|| format!("Step {}", index + 1));
         crate::events::emit(|| crate::events::ExecutionEvent::StepStarted {
             job: self.job_label.clone(),
-            step: name,
+            step: step_display_name(step, index),
             index,
         });
         self.step_started = std::time::Instant::now();
-        self.current_step = Some((index, step.run.clone(), step.uses.clone()));
+        self.current_step = Some(InFlightStep {
+            index,
+            command: step.run.clone(),
+            uses: step.uses.clone(),
+        });
     }
 
     /// Report the step in flight as finished. `result.output` must already
     /// be masked, because observers persist it.
     fn emit_step_finished(&self, result: &StepResult, env_set: Vec<(String, String)>) {
-        let Some((index, command, uses)) = &self.current_step else {
+        let Some(current) = &self.current_step else {
             return;
         };
         crate::events::emit(|| crate::events::ExecutionEvent::StepFinished {
             job: self.job_label.clone(),
             step: result.name.clone(),
-            index: *index,
+            index: current.index,
             status: result.status,
             outcome: result.outcome,
             conclusion: result.conclusion,
-            exit_code: result.exit_code(),
+            exit_code: result.exit_code,
             duration_ms: self.step_started.elapsed().as_millis() as u64,
             output: result.output.clone(),
-            command: command.clone(),
-            uses: uses.clone(),
+            command: current.command.clone(),
+            uses: current.uses.clone(),
             env_set,
         });
+    }
+
+    /// Fail the step in flight because the job ran out of time. The step's
+    /// future was dropped, so it has no outcome of its own to process.
+    fn fail_step_on_timeout(&mut self, step: &workflow::Step, index: usize, message: String) {
+        wrkflw_logging::error(&message);
+        self.job_logs.push_str(&format!("\n{}\n", message));
+        let result = StepResult::new(step_display_name(step, index), StepStatus::Failure, message);
+        self.emit_step_finished(&result, Vec::new());
+        record_step_status(
+            step.id.as_deref(),
+            &result,
+            &mut self.step_status_map,
+            &mut self.job_status_str,
+        );
+        self.step_results.push(result);
     }
 
     /// Report the end of the job. Call once, after the step loop.
@@ -3322,12 +3328,8 @@ impl StepLoopState {
     /// Record a step `--from-step` skipped.
     fn skip_step(&mut self, index: usize, step: &workflow::Step) {
         self.begin_step(index, step);
-        let name = step
-            .name
-            .clone()
-            .unwrap_or_else(|| format!("Step {}", index + 1));
         let result = StepResult::new(
-            name,
+            step_display_name(step, index),
             StepStatus::Skipped,
             "Skipped by --from-step".to_string(),
         );
@@ -3630,6 +3632,7 @@ async fn run_step_with_guards(
                     output: format!("Error: {}", e),
                     outcome: StepStatus::Failure,
                     conclusion,
+                    exit_code: None,
                 },
                 abort_job,
             })
@@ -4754,12 +4757,14 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                             output.exit_code, output.stdout, output.stderr
                         ),
                     )
+                    .with_exit_code(output.exit_code)
                 }
             }
         }
     } else if let Some(run) = &ctx.step.run {
         // Run step
         let mut output = String::new();
+        let mut exit_code = None;
         let mut status = StepStatus::Success;
         let mut error_details = None;
 
@@ -4941,6 +4946,7 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
 
         match run_result {
             Ok(container_output) => {
+                exit_code = Some(container_output.exit_code);
                 // Add command details to output (show resolved version so
                 // users can see expression substitutions were applied)
                 output.push_str(&format!("Exit code: {}\n", container_output.exit_code));
@@ -4999,7 +5005,11 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
             output.push_str(&details);
         }
 
-        StepResult::new(step_name, status, output)
+        let result = StepResult::new(step_name, status, output);
+        match exit_code {
+            Some(code) => result.with_exit_code(code),
+            None => result,
+        }
     } else {
         return Ok(StepResult::new(
             step_name,
@@ -10673,6 +10683,33 @@ runs:
     // ---- Tests for review findings ----
 
     #[test]
+    fn a_timed_out_step_is_kept_on_the_job_and_fails_it() {
+        let mut step = make_run_step("sleep 30");
+        step.name = Some("sleeper".to_string());
+        step.id = Some("nap".to_string());
+        let mut state = StepLoopState::new("job", "job");
+        state.begin_step(0, &step);
+
+        state.fail_step_on_timeout(&step, 0, "out of time".to_string());
+
+        assert_eq!(state.step_results.len(), 1);
+        let result = &state.step_results[0];
+        assert_eq!(result.name, "sleeper");
+        assert_eq!(result.status, StepStatus::Failure);
+        assert_eq!(result.exit_code, None);
+        assert!(state.job_logs.contains("out of time"));
+        assert_eq!(state.job_status_str, "failure");
+        assert_eq!(state.step_status_map["nap"].0, "failure");
+    }
+
+    #[test]
+    fn exit_code_stays_typed_when_the_output_is_masked() {
+        let result = StepResult::new("s".to_string(), StepStatus::Failure, "***".to_string())
+            .with_exit_code(137);
+        assert_eq!(result.exit_code, Some(137));
+    }
+
+    #[test]
     fn record_step_status_tracks_outcome_and_conclusion() {
         let mut map = HashMap::new();
         let mut status = "success".to_string();
@@ -10683,6 +10720,7 @@ runs:
             output: String::new(),
             outcome: StepStatus::Failure,
             conclusion: StepStatus::Success, // continue-on-error
+            exit_code: None,
         };
         record_step_status(Some("build"), &result, &mut map, &mut status);
 
@@ -11773,6 +11811,7 @@ runs:
             output: String::new(),
             outcome: StepStatus::Failure,
             conclusion: StepStatus::Success,
+            exit_code: None,
         };
         record_step_status(Some("lint"), &result, &mut step_statuses, &mut job_status);
 

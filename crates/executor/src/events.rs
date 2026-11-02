@@ -91,6 +91,11 @@ pub async fn with_run_hooks<F: Future>(hooks: RunHooks, future: F) -> F::Output 
 }
 
 /// Send an event to the active observers. `build` only runs if one exists.
+///
+/// Outside `with_run_hooks` this does nothing, which is correct for a run
+/// nobody observes. It also means a `tokio::spawn` inside the executor loses
+/// its events without an error, because task-locals don't cross into new
+/// tasks, so anything that emits has to stay on the run's own task.
 pub(crate) fn emit(build: impl FnOnce() -> ExecutionEvent) {
     let _ = HOOKS.try_with(|hooks| {
         if hooks.observers.is_empty() {

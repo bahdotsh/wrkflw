@@ -231,7 +231,7 @@ impl Recorder {
                     status: step.status.to_string(),
                     outcome: step.outcome.to_string(),
                     conclusion: step.conclusion.to_string(),
-                    exit_code: step.exit_code(),
+                    exit_code: step.exit_code,
                     duration_ms: None,
                     command: None,
                     uses: None,

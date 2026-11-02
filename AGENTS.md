@@ -41,7 +41,7 @@ Exit codes: 0 for success or skipped, 1 for a failed run or failed validation, 2
 
 Runs are stored under `$WRKFLW_HOME/runs`, defaulting to the platform's local data directory. The newest 500 are kept, or `WRKFLW_RUNS_KEEP`. Use `--no-record` or `WRKFLW_NO_HISTORY=1` to skip recording.
 
-Known secrets and `::add-mask::` values are masked before output is stored. `--variable` values are never stored, so pass them again to `runs replay`. Logs can still hold anything a step printed that wrkflw did not recognise as a secret, so run directories are readable only by the owner.
+Known secrets and `::add-mask::` values are masked before output is stored. `--variable` values are never stored, so pass them again to `runs replay`. Logs can still hold anything a step printed that wrkflw did not recognise as a secret, so run directories are readable only by the owner on Unix. On Windows they rely on the data directory's permissions.
 
 Identify yourself with `WRKFLW_AGENT=<name>` or `--agent`. `WRKFLW_INTENT` or `--intent` records why you ran it.
 

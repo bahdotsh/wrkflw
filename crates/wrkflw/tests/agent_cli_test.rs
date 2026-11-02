@@ -1,5 +1,7 @@
 //! End-to-end checks of the agent-facing surface, through the real binary:
 //! stdout contracts, run history, failure digests, replay, plan and MCP.
+//! Fixtures use POSIX shell steps, so this file only runs on Unix.
+#![cfg(unix)]
 
 use serde_json::{json, Value};
 use std::fs;

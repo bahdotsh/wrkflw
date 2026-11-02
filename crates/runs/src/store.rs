@@ -148,6 +148,7 @@ impl RunStore {
 }
 
 /// Logs can carry anything a step printed, so nobody else gets to read them.
+#[cfg(unix)]
 fn create_private_dir(path: &Path) -> io::Result<()> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     fs::DirBuilder::new()
@@ -157,6 +158,13 @@ fn create_private_dir(path: &Path) -> io::Result<()> {
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))
 }
 
+/// On Windows the per-user data directory's ACL already restricts access.
+#[cfg(not(unix))]
+fn create_private_dir(path: &Path) -> io::Result<()> {
+    fs::create_dir_all(path)
+}
+
+#[cfg(unix)]
 fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
     let mut file = fs::OpenOptions::new()
@@ -168,6 +176,12 @@ fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
     file.write_all(bytes)
 }
 
+#[cfg(not(unix))]
+fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    fs::File::create(path)?.write_all(bytes)
+}
+
+#[cfg(unix)]
 fn process_alive(pid: u32) -> bool {
     use nix::errno::Errno;
     use nix::sys::signal::kill;
@@ -175,10 +189,16 @@ fn process_alive(pid: u32) -> bool {
     !matches!(kill(Pid::from_raw(pid as i32), None), Err(Errno::ESRCH))
 }
 
+/// No cheap liveness check here. Reporting a dead run as running is safer
+/// than the reverse, because pruning would delete a live run's directory.
+#[cfg(not(unix))]
+fn process_alive(_pid: u32) -> bool {
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
 
     fn record(id: &str, repo: &str) -> RunRecord {
         RunRecord {
@@ -233,6 +253,7 @@ mod tests {
         assert!(store.load("a/b").is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_dead_running_process_reads_as_interrupted() {
         let dir = tempfile::tempdir().unwrap();
@@ -254,8 +275,10 @@ mod tests {
         assert_eq!(store.list().len(), 1);
     }
 
+    #[cfg(unix)]
     #[test]
     fn run_data_is_private_to_the_owner() {
+        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let store = RunStore::at(dir.path());
         store.save(&record("r", "/one")).unwrap();

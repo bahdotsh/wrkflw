@@ -18,7 +18,7 @@ Prefer the MCP server if your client supports MCP:
 
 ## Before pushing
 
-Run `wrkflw gate`. It runs what a push would run, reusing jobs that already passed on the same files, and exits 1 if anything fails. Add `--reuse-results` to `wrkflw run` to get the same reuse while iterating. A reused job reports one `Reuse result` step, so its output isn't there to read. See "Spending less on CI" in the README for `.wrkflw/affected.yml`.
+Run `wrkflw gate`. It runs what a push would run, reusing jobs that already passed on the same files, and exits 1 if anything fails. Add `--reuse-results` to `wrkflw run` to get the same reuse while iterating. A reused job reports one `Reuse result` step and an unaffected job one `Not affected` step, so their output isn't there to read. See "Spending less on CI" in the README for `.wrkflw/affected.yml`.
 
 ## Simulating events
 

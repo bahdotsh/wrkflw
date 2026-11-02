@@ -200,12 +200,12 @@ wrkflw run .github/workflows/ci.yml --event push --affected
 wrkflw run .github/workflows/ci.yml --job-container --dep-cache
 ```
 
-- **`--reuse-results`** skips a job when an identical job already passed on identical inputs. The fingerprint covers the job definition, workflow `env` and `defaults`, `needs` outputs, event, ref, runtime, `--platform` overrides and file contents. Stored outputs still reach dependent jobs. Results expire after 7 days, or `WRKFLW_RESULT_TTL_SECS`, because images and floating action tags such as `@v4` aren't in the fingerprint.
-- **`--affected`** also skips a job when none of its declared paths changed, even with no stored result. It trusts the base you compare against to be green. It needs `--event`, and only applies to jobs listed in `.wrkflw/affected.yml`. A job still runs if it has `outputs` or a matrix, if a job it needs ran, or if a workflow file changed.
+- **`--reuse-results`** skips a job when an identical job already passed on identical inputs. The fingerprint covers the job definition, workflow `env` and `defaults`, `needs` outputs, event, ref, runtime, operating system, CPU architecture, `--platform` overrides and file contents. Stored outputs still reach dependent jobs. Results expire after 7 days, or `WRKFLW_RESULT_TTL_SECS`, because images and floating action tags such as `@v4` aren't in the fingerprint.
+- **`--affected`** also skips a job when none of its declared paths changed, even with no stored result. It trusts the base you compare against to be green. It needs `--event`, and only applies to jobs listed in `.wrkflw/affected.yml`. Such a job counts as passed for its dependents and reports one `Not affected` step. A job still runs if it has `outputs` or a matrix, if a job it needs ran, or if a workflow file changed.
 - **`--job-container`** runs a job's `run:` steps in one container, on Docker and Podman. Files a step leaves outside the workspace are there for the next step, as on GitHub. It's ignored with `--preserve-containers-on-failure`.
-- **`--dep-cache`** mounts host directories over the cargo, npm, pip and Go caches under `/root`, so it helps images that run as root.
+- **`--dep-cache`** mounts host directories over the cargo, npm, pip and Go caches under `/root`, so it helps images that run as root. The host directories live under `WRKFLW_DEP_CACHE_DIR` if set, or the user cache directory.
 
-Reuse is only as safe as its inputs. wrkflw always runs a job that reads secrets, has `write` permissions, exchanges artifacts or calls a reusable workflow, because those can have effects it can't see. For anything else with outside effects, set `cache: false`.
+Reuse is only as safe as its inputs. wrkflw always runs a job that reads secrets, has `write` permissions, exchanges artifacts or calls a reusable workflow, because those can have effects it can't see. It also always runs a job with `outputs` that uses `needs` when a job upstream reads secrets, so a passed-along secret doesn't get stored. For anything else with outside effects, set `cache: false`.
 
 By default every file in the repository is an input, so any change reruns every job. `.wrkflw/affected.yml` narrows that. It lives outside the workflow file because GitHub rejects unknown keys there.
 
@@ -232,7 +232,9 @@ wrkflw run ci.yml --reuse-results --remote-cache https://cache.example.com/wrkfl
 wrkflw run ci.yml --reuse-results --remote-cache https://cache.example.com/wrkflw
 ```
 
-The location is a directory, a `file://` path, or an `https://` base that serves `GET` and `PUT` on `<base>/<key>.json`. Entries are HMAC-signed, and one that doesn't verify is ignored. The key is symmetric, so anyone who can read results with it could also forge one given write access to the store. Keep store write access to trusted CI, and don't expose the key to pull requests from forks.
+The location is a directory, a `file://` path, or an `https://` base that serves `GET` and `PUT` on `<base>/<key>.json`. Entries are HMAC-signed, and one that doesn't verify is ignored. The key is symmetric, so anyone who can read results with it could also forge one given write access to the store. A forged result does more than mark a job as passed: its outputs reach `run:` scripts of dependent jobs, so the key plus write access means running commands on every machine that reads the store. Keep store write access to trusted CI, and don't expose the key to pull requests from forks.
+
+Stored outputs aren't encrypted. A job that runs in emulation never pushes, because its result depends on the tools of that machine.
 
 ### Watch mode
 

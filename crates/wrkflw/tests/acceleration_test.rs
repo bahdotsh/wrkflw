@@ -232,6 +232,15 @@ fn affected_sees_a_new_untracked_file() {
 }
 
 #[test]
+fn a_reused_job_and_an_unaffected_job_report_differently() {
+    let repo = Repo::new(TWO_JOBS, Some(HINTS));
+    fs::write(repo.root().join("docs/a"), "two").unwrap();
+    let output = repo.run(&["--event", "push", "--affected", "--diff-base", "HEAD"]);
+    assert_ok(&output);
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Not affected"));
+}
+
+#[test]
 fn affected_runs_a_job_without_hints() {
     let repo = Repo::new(TWO_JOBS, Some("jobs:\n  docs: {paths: ['docs/**']}\n"));
     fs::write(repo.root().join("src/a"), "two").unwrap();
@@ -243,20 +252,6 @@ fn affected_runs_a_job_without_hints() {
 fn a_broken_sidecar_stops_the_run() {
     let repo = Repo::new(TWO_JOBS, Some("jobs:\n  build: {pathz: []}\n"));
     assert!(!repo.run(&["--reuse-results"]).status.success());
-    assert!(repo.take_ran().is_empty());
-}
-
-#[test]
-fn a_shared_result_skips_the_job_on_another_machine() {
-    let repo = Repo::new(TWO_JOBS, None);
-    let remote = repo.remote.path().display().to_string();
-    let push = ["--reuse-results", "--remote-cache", &remote, "--cache-push"];
-    assert_ok(&repo.run(&push));
-    repo.take_ran();
-    for entry in fs::read_dir(repo.results.path()).unwrap() {
-        fs::remove_file(entry.unwrap().path()).unwrap();
-    }
-    assert_ok(&repo.run(&["--reuse-results", "--remote-cache", &remote]));
     assert!(repo.take_ran().is_empty());
 }
 
@@ -305,6 +300,14 @@ fn the_gate_counts_a_passing_workflow_as_run() {
     let output = repo.wrkflw(&["gate", "--runtime", "emulation", "--diff-base", "HEAD"]);
     assert_ok(&output);
     assert!(String::from_utf8_lossy(&output.stdout).contains("1 workflow(s) ran, 0 skipped"));
+}
+
+#[test]
+fn an_emulated_result_is_not_pushed() {
+    let repo = Repo::new(TWO_JOBS, None);
+    let remote = repo.remote.path().display().to_string();
+    assert_ok(&repo.run(&["--reuse-results", "--remote-cache", &remote, "--cache-push"]));
+    assert_eq!(fs::read_dir(repo.remote.path()).unwrap().count(), 0);
 }
 
 #[test]

@@ -43,7 +43,11 @@ pub async fn execute_workflow(
     let is_gitlab = is_gitlab_pipeline(workflow_path);
 
     if is_gitlab {
-        return execute_gitlab_pipeline(workflow_path, config.clone()).await;
+        return crate::acceleration::without_run_state(execute_gitlab_pipeline(
+            workflow_path,
+            config.clone(),
+        ))
+        .await;
     }
     crate::acceleration::validate_remote(&config.acceleration)
         .map_err(ExecutionError::Execution)?;
@@ -1134,31 +1138,14 @@ impl JobResult {
     }
 
     /// A job that didn't run because an earlier pass still stands. Dependents
-    /// see a success, and the events make it look like what it is in reports.
-    fn reused(stored: crate::acceleration::StoredJob, note: &str) -> Self {
-        crate::events::emit(|| crate::events::ExecutionEvent::JobStarted {
-            job: stored.name.clone(),
-            canonical_name: stored.canonical_name.clone(),
-        });
-        crate::events::emit(|| crate::events::ExecutionEvent::JobFinished {
-            job: stored.name.clone(),
-            status: JobStatus::Success,
-            failure_allowed: false,
-            duration_ms: 0,
-            logs: note.to_string(),
-        });
-        wrkflw_logging::info(&format!(
-            "{} Job '{}': {}",
-            wrkflw_logging::symbols::SKIPPED,
-            stored.name,
-            note
-        ));
+    /// see a success, and `step` says why in reports.
+    fn reused(stored: crate::acceleration::StoredJob, step: &str, note: &str) -> Self {
         JobResult {
             name: stored.name,
             canonical_name: stored.canonical_name,
             status: JobStatus::Success,
             steps: vec![StepResult::new(
-                "Reuse result".to_string(),
+                step.to_string(),
                 StepStatus::Success,
                 note.to_string(),
             )],
@@ -2602,10 +2589,13 @@ async fn execute_job_with_matrix(
     })
     .await;
     let result_key = match decision {
-        crate::acceleration::Decision::Reuse { jobs, note } => {
+        crate::acceleration::Decision::Reuse { jobs, note, step } => {
             return Ok(jobs
                 .into_iter()
-                .map(|stored| JobResult::reused(stored, &note))
+                .map(|stored| {
+                    announce_reused(&stored, &note);
+                    JobResult::reused(stored, step, &note)
+                })
                 .collect());
         }
         crate::acceleration::Decision::Run { key } => key,
@@ -2685,7 +2675,7 @@ async fn execute_job_with_matrix(
             services,
         })
         .await?;
-        store_passing_result(result_key.as_deref(), &results).await;
+        store_passing_result(result_key.as_deref(), &results, env_context).await;
         Ok(results)
     } else {
         // Regular job, no matrix
@@ -2711,13 +2701,38 @@ async fn execute_job_with_matrix(
         };
         let result = crate::job_session::with_job_session(job, runtime, execute_job(ctx)).await?;
         let results = vec![result];
-        store_passing_result(result_key.as_deref(), &results).await;
+        store_passing_result(result_key.as_deref(), &results, env_context).await;
         Ok(results)
     }
 }
 
+/// Report a job that won't run, the way a run job reports itself.
+fn announce_reused(stored: &crate::acceleration::StoredJob, note: &str) {
+    crate::events::emit(|| crate::events::ExecutionEvent::JobStarted {
+        job: stored.name.clone(),
+        canonical_name: stored.canonical_name.clone(),
+    });
+    crate::events::emit(|| crate::events::ExecutionEvent::JobFinished {
+        job: stored.name.clone(),
+        status: JobStatus::Success,
+        failure_allowed: false,
+        duration_ms: 0,
+        logs: note.to_string(),
+    });
+    wrkflw_logging::info(&format!(
+        "{} Job '{}': {}",
+        wrkflw_logging::symbols::SKIPPED,
+        stored.name,
+        note
+    ));
+}
+
 /// File `results` under `key` if every job and matrix leg passed.
-async fn store_passing_result(key: Option<&str>, results: &[JobResult]) {
+async fn store_passing_result(
+    key: Option<&str>,
+    results: &[JobResult],
+    env_context: &HashMap<String, String>,
+) {
     let Some(key) = key else { return };
     if results.is_empty() || results.iter().any(|r| r.status != JobStatus::Success) {
         return;
@@ -2730,7 +2745,7 @@ async fn store_passing_result(key: Option<&str>, results: &[JobResult]) {
             outputs: result.outputs.clone(),
         })
         .collect();
-    crate::acceleration::store(key, jobs).await;
+    crate::acceleration::store(key, jobs, env_context).await;
 }
 
 #[allow(unused_variables, unused_assignments)]

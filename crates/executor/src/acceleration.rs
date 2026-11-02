@@ -16,9 +16,9 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use store::ResultStore;
 pub(crate) use store::StoredJob;
 use tokio::sync::{OnceCell, Semaphore};
@@ -220,18 +220,53 @@ pub(crate) fn uncacheable_reason(
     }) {
         return Some("it exchanges artifacts");
     }
+    if reads_secrets(job, workflow)? {
+        return Some("it reads secrets");
+    }
+    let job_text = serde_json::to_string(job).ok()?.to_lowercase();
+    if job.outputs.as_ref().is_some_and(|o| !o.is_empty())
+        && job_text.contains("needs.")
+        && upstream_reads_secrets(job, workflow)
+    {
+        return Some("its outputs may carry a secret from a job it needs");
+    }
+    None
+}
+
+/// Whether `job` or the workflow `env` refers to a credential. `None` if
+/// either can't be serialized.
+fn reads_secrets(job: &Job, workflow: &WorkflowDefinition) -> Option<bool> {
     let job_text = serde_json::to_string(job).ok()?.to_lowercase();
     let env_text = serde_json::to_string(&sorted(&workflow.env))
         .ok()?
         .to_lowercase();
-    if job.secrets.is_some()
-        || SECRET_REFERENCES
-            .iter()
-            .any(|needle| job_text.contains(needle) || env_text.contains(needle))
-    {
-        return Some("it reads secrets");
+    Some(
+        job.secrets.is_some()
+            || SECRET_REFERENCES
+                .iter()
+                .any(|needle| job_text.contains(needle) || env_text.contains(needle)),
+    )
+}
+
+/// Whether any job `job` needs, directly or not, reads a credential. Stored
+/// outputs go to the remote in plain text, so a value passed along must not
+/// end up there.
+fn upstream_reads_secrets(job: &Job, workflow: &WorkflowDefinition) -> bool {
+    let mut seen = HashSet::new();
+    let mut pending: Vec<&String> = job.needs.iter().flatten().collect();
+    while let Some(name) = pending.pop() {
+        if !seen.insert(name) {
+            continue;
+        }
+        let Some(upstream) = workflow.jobs.get(name) else {
+            continue;
+        };
+        if reads_secrets(upstream, workflow) != Some(false) {
+            return true;
+        }
+        pending.extend(upstream.needs.iter().flatten());
     }
-    None
+    false
 }
 
 fn sorted(map: &HashMap<String, String>) -> BTreeMap<&String, &String> {
@@ -259,34 +294,143 @@ fn canonical(value: Value) -> Value {
 /// `path -> content hash` for every tracked or untracked-but-not-ignored file.
 pub(crate) type TreeHashes = BTreeMap<String, String>;
 
-/// Hash the files checkout would hand to a job. `None` outside a git work
+/// Identify the files checkout would hand to a job. `None` outside a git work
 /// tree, where there's no reliable list of source files.
+///
+/// Git already knows the blob of every clean tracked file, so only changed and
+/// untracked files are read. Those get the blob id too, so committing a tree
+/// that passed doesn't change its fingerprint.
 pub(crate) fn hash_tree(root: &Path) -> Option<TreeHashes> {
-    let output = std::process::Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args([
+    let files = git_paths(
+        root,
+        &[
             "ls-files",
             "-z",
             "--cached",
             "--others",
             "--exclude-standard",
-        ])
+        ],
+    )?;
+    let dirty: HashSet<String> = git_paths(root, &["ls-files", "-z", "--modified"])?
+        .into_iter()
+        .collect();
+    let index = index_blobs(root)?;
+    let excluded = compile_globs(NEVER_INPUT);
+
+    let mut hashes = TreeHashes::new();
+    let mut unknown = Vec::new();
+    for relative in files {
+        if matches_any(&relative, &excluded) {
+            continue;
+        }
+        match index.get(&relative).filter(|_| !dirty.contains(&relative)) {
+            Some(blob) => {
+                hashes.insert(relative, blob.clone());
+            }
+            None => unknown.push(relative),
+        }
+    }
+
+    let (plain, odd): (Vec<String>, Vec<String>) = unknown
+        .into_iter()
+        .partition(|relative| is_plain_file(&root.join(relative)) && !relative.contains('\n'));
+    let blobs = hash_objects(root, &plain);
+    for (position, relative) in plain.into_iter().enumerate() {
+        let path = root.join(&relative);
+        let value = match blobs.as_ref().map(|ids| &ids[position]) {
+            Some(id) => format!("{} {}", file_mode(&path), id),
+            None => hash_path(&path),
+        };
+        hashes.insert(relative, value);
+    }
+    for relative in odd {
+        let value = hash_path(&root.join(&relative));
+        hashes.insert(relative, value);
+    }
+    Some(hashes)
+}
+
+fn git_paths(root: &Path, args: &[&str]) -> Option<Vec<String>> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
         .output()
         .ok()?;
     if !output.status.success() {
         return None;
     }
-    let excluded = compile_globs(NEVER_INPUT);
-    let mut hashes = TreeHashes::new();
-    for raw in output.stdout.split(|b| *b == 0).filter(|p| !p.is_empty()) {
-        let relative = String::from_utf8_lossy(raw).into_owned();
-        if matches_any(&relative, &excluded) {
+    Some(
+        output
+            .stdout
+            .split(|b| *b == 0)
+            .filter(|path| !path.is_empty())
+            .map(|path| String::from_utf8_lossy(path).into_owned())
+            .collect(),
+    )
+}
+
+/// `path -> "mode blob"` for merged index entries. Unmerged paths are absent,
+/// so they get read.
+fn index_blobs(root: &Path) -> Option<HashMap<String, String>> {
+    let mut blobs = HashMap::new();
+    for entry in git_paths(root, &["ls-files", "-z", "--stage"])? {
+        let Some((meta, path)) = entry.split_once('\t') else {
             continue;
+        };
+        let mut fields = meta.split(' ');
+        if let (Some(mode), Some(blob), Some("0")) = (fields.next(), fields.next(), fields.next()) {
+            blobs.insert(path.to_string(), format!("{} {}", mode, blob));
         }
-        hashes.insert(relative.clone(), hash_path(&root.join(&relative)));
     }
-    Some(hashes)
+    Some(blobs)
+}
+
+fn is_plain_file(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_file())
+}
+
+/// The mode git would record for the file at `path`.
+fn file_mode(path: &Path) -> &'static str {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if std::fs::metadata(path).is_ok_and(|meta| meta.permissions().mode() & 0o111 != 0) {
+            return "100755";
+        }
+    }
+    "100644"
+}
+
+/// The blob ids of `paths`, in order. `None` if git can't read one of them,
+/// which leaves the caller hashing the content itself.
+fn hash_objects(root: &Path, paths: &[String]) -> Option<Vec<String>> {
+    if paths.is_empty() {
+        return Some(Vec::new());
+    }
+    let mut child = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["hash-object", "--stdin-paths"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut stdin = child.stdin.take()?;
+    let list = paths.join("\n") + "\n";
+    // On a thread, as git answers as it reads and a full pipe would block both.
+    let writer = std::thread::spawn(move || stdin.write_all(list.as_bytes()));
+    let output = child.wait_with_output().ok()?;
+    writer.join().ok()?.ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let ids: Vec<String> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect();
+    (ids.len() == paths.len()).then_some(ids)
 }
 
 fn hash_path(path: &Path) -> String {
@@ -372,6 +516,8 @@ pub(crate) fn job_key(input: &KeyInput<'_>) -> Option<String> {
         "ref": env("GITHUB_REF"),
         "base_ref": env("GITHUB_BASE_REF"),
         "runtime": env("WRKFLW_RUNTIME_MODE"),
+        "os": std::env::consts::OS,
+        "arch": std::env::consts::ARCH,
         "inputs": inputs,
     });
     let text = serde_json::to_string(&canonical(document)).ok()?;
@@ -390,6 +536,7 @@ pub(crate) struct RunState {
     /// unaffected when something it consumes has just changed.
     executed: Mutex<HashSet<String>>,
     groups: Mutex<HashMap<String, Arc<Semaphore>>>,
+    dep_mounts: OnceLock<Vec<(PathBuf, PathBuf)>>,
 }
 
 tokio::task_local! {
@@ -405,6 +552,26 @@ fn results_dir() -> Option<PathBuf> {
     Some(dirs::cache_dir()?.join("wrkflw").join("results"))
 }
 
+/// Paths in the sidecar and from `git diff` start at the repository root, so
+/// neither lines up from a subdirectory.
+fn warn_outside_repo_root(root: &Path) {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "--show-prefix"])
+        .output();
+    if let Ok(output) = output {
+        let prefix = String::from_utf8_lossy(&output.stdout);
+        if output.status.success() && !prefix.trim().is_empty() {
+            wrkflw_logging::warning(&format!(
+                "Running from {}, not the repository root: {} and changed paths may not apply",
+                prefix.trim(),
+                SIDECAR_PATH
+            ));
+        }
+    }
+}
+
 impl RunState {
     pub(crate) fn new(
         accel: Acceleration,
@@ -412,6 +579,7 @@ impl RunState {
         root: PathBuf,
     ) -> Result<Self, String> {
         let sidecar = if accel.reuse_results || accel.changed_files.is_some() {
+            warn_outside_repo_root(&root);
             Some(Sidecar::load(&root)?)
         } else {
             None
@@ -426,6 +594,7 @@ impl RunState {
             tree: OnceCell::new(),
             executed: Mutex::new(HashSet::new()),
             groups: Mutex::new(HashMap::new()),
+            dep_mounts: OnceLock::new(),
         })
     }
 
@@ -469,10 +638,18 @@ pub(crate) fn current() -> Option<Arc<RunState>> {
 
 /// Host and container paths of the `--dep-cache` mounts.
 pub(crate) fn dep_cache_mounts(mounts_are_copies: bool) -> Vec<(PathBuf, PathBuf)> {
-    if mounts_are_copies || !current().is_some_and(|run| run.accel.dep_cache) {
+    let Some(run) = current().filter(|run| run.accel.dep_cache && !mounts_are_copies) else {
         return Vec::new();
-    }
-    let Some(root) = dirs::cache_dir().map(|d| d.join("wrkflw").join("deps")) else {
+    };
+    run.dep_mounts.get_or_init(create_dep_cache_dirs).clone()
+}
+
+/// The host side of the mounts: `WRKFLW_DEP_CACHE_DIR`, or the cache directory.
+fn create_dep_cache_dirs() -> Vec<(PathBuf, PathBuf)> {
+    let root = std::env::var_os("WRKFLW_DEP_CACHE_DIR")
+        .map(PathBuf::from)
+        .or_else(|| dirs::cache_dir().map(|d| d.join("wrkflw").join("deps")));
+    let Some(root) = root else {
         return Vec::new();
     };
     DEP_CACHE_DIRS
@@ -526,8 +703,12 @@ pub(crate) async fn acquire_concurrency(job: &Job) -> Option<tokio::sync::OwnedS
 pub(crate) enum Decision {
     /// Run it. A `Some` key means a pass can be stored under it.
     Run { key: Option<String> },
-    /// Don't run it: this result stands.
-    Reuse { jobs: Vec<StoredJob>, note: String },
+    /// Don't run it: this result stands. `step` names what reports show.
+    Reuse {
+        jobs: Vec<StoredJob>,
+        note: String,
+        step: &'static str,
+    },
 }
 
 pub(crate) struct Lookup<'a> {
@@ -577,7 +758,16 @@ fn unaffected(
 /// Decide whether `lookup`'s job has to run.
 pub(crate) async fn decide(lookup: Lookup<'_>) -> Decision {
     let run_it = Decision::Run { key: None };
-    let Some(run) = current() else {
+    let Ok(run) = RUN.try_with(Option::clone) else {
+        // Every run sets the scope, even if to `None`, so this is a job that
+        // left the run's task and lost reuse, sessions and services with it.
+        wrkflw_logging::warning(&format!(
+            "Job '{}' lost its run state: acceleration doesn't apply to it",
+            lookup.job_name
+        ));
+        return run_it;
+    };
+    let Some(run) = run else {
         return run_it;
     };
     let wants_reuse = run.accel.reuse_results || run.accel.changed_files.is_some();
@@ -616,8 +806,12 @@ pub(crate) async fn decide(lookup: Lookup<'_>) -> Decision {
                     outputs: HashMap::new(),
                 }],
                 note: "Not affected: no changed file is among this job's paths".to_string(),
+                step: "Not affected",
             };
         }
+    }
+    if !run.accel.reuse_results {
+        return run_it;
     }
     let Some(tree) = run.tree().await else {
         return run_it;
@@ -636,13 +830,12 @@ pub(crate) async fn decide(lookup: Lookup<'_>) -> Decision {
     let Some(key) = key else {
         return run_it;
     };
-    if run.accel.reuse_results {
-        if let Some(entry) = run.store.load(&key).await {
-            return Decision::Reuse {
-                jobs: entry.jobs,
-                note: format!("Reused the passing result {}", &key[..12]),
-            };
-        }
+    if let Some(entry) = run.store.load(&key).await {
+        return Decision::Reuse {
+            jobs: entry.jobs,
+            note: format!("Reused the passing result {}", &key[..12]),
+            step: "Reuse result",
+        };
     }
     Decision::Run { key: Some(key) }
 }
@@ -656,11 +849,19 @@ pub(crate) fn mark_executed(job_name: &str) {
     }
 }
 
-/// Store a passing result under the key `decide` returned.
-pub(crate) async fn store(key: &str, jobs: Vec<StoredJob>) {
-    if let Some(run) = current() {
-        run.store.save(key, jobs).await;
+/// Store a passing result under the key `decide` returned. A job that ran on
+/// the host passed with that host's tools, so its result stays on this machine.
+pub(crate) async fn store(key: &str, jobs: Vec<StoredJob>, env: &HashMap<String, String>) {
+    let Some(run) = current() else { return };
+    let on_host = env
+        .get("WRKFLW_RUNTIME_MODE")
+        .is_some_and(|mode| mode.contains("emulation"));
+    if on_host && run.accel.push_results {
+        wrkflw_logging::warning(
+            "Not pushing this job's result: emulation depends on this machine's tools",
+        );
     }
+    run.store.save(key, jobs, !on_host).await;
 }
 
 #[cfg(test)]
@@ -823,6 +1024,97 @@ mod tests {
             assert!(reason.contains(needle), "{}: {}", yaml, reason);
         }
         assert!(uncacheable_reason(&job("steps:\n  - run: x\n"), &wf, None).is_none());
+    }
+
+    #[test]
+    fn outputs_passed_along_from_a_job_with_secrets_are_not_cacheable() {
+        let wf: WorkflowDefinition = serde_yaml::from_str(
+            r#"
+name: t
+on: push
+jobs:
+  login:
+    steps:
+      - run: echo ${{ secrets.TOKEN }}
+  middle:
+    needs: login
+    steps:
+      - run: x
+  relay:
+    needs: middle
+    outputs: {v: '${{ needs.middle.outputs.v }}'}
+    steps:
+      - run: x
+  plain:
+    needs: middle
+    steps:
+      - run: x
+"#,
+        )
+        .unwrap();
+        let reason = uncacheable_reason(&wf.jobs["relay"], &wf, None).unwrap();
+        assert!(reason.contains("outputs"), "{}", reason);
+        assert!(uncacheable_reason(&wf.jobs["plain"], &wf, None).is_none());
+    }
+
+    #[test]
+    fn committing_a_tree_keeps_its_key() {
+        let dir = repo();
+        git(dir.path(), &["commit", "-qm", "base"]);
+        let wf = workflow();
+        let definition = job("steps:\n  - run: make\n");
+        std::fs::write(dir.path().join("src/a.rs"), "edited").unwrap();
+        std::fs::write(dir.path().join("src/new.rs"), "new").unwrap();
+        let dirty = key_for(&definition, &wf, &hash_tree(dir.path()).unwrap(), None);
+        git(dir.path(), &["add", "."]);
+        git(dir.path(), &["commit", "-qm", "edit"]);
+        let clean = key_for(&definition, &wf, &hash_tree(dir.path()).unwrap(), None);
+        assert_eq!(dirty, clean);
+    }
+
+    #[test]
+    fn the_tree_covers_deletions_and_the_executable_bit() {
+        let dir = repo();
+        git(dir.path(), &["commit", "-qm", "base"]);
+        let before = hash_tree(dir.path()).unwrap();
+        std::fs::remove_file(dir.path().join("docs/a.md")).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let script = dir.path().join("src/a.rs");
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let after = hash_tree(dir.path()).unwrap();
+        assert_ne!(before["docs/a.md"], after["docs/a.md"]);
+        #[cfg(unix)]
+        assert_ne!(before["src/a.rs"], after["src/a.rs"]);
+    }
+
+    #[tokio::test]
+    async fn affected_alone_stores_nothing() {
+        let wf = workflow();
+        let definition = job("steps:\n  - run: x\n");
+        let accel = Acceleration {
+            changed_files: Some(vec!["src/a.rs".to_string()]),
+            ..Default::default()
+        };
+        let state = RunState::new(accel, false, PathBuf::from(".")).unwrap();
+        let empty = HashMap::new();
+        let decision = with_run_state(
+            Arc::new(state),
+            decide(Lookup {
+                job_name: "a",
+                job: &definition,
+                workflow: &wf,
+                env_context: &empty,
+                platform_overrides: &empty,
+                needs_outputs: &HashMap::new(),
+                needs_results: &empty,
+                partial: false,
+            }),
+        )
+        .await;
+        assert!(matches!(decision, Decision::Run { key: None }));
     }
 
     #[test]

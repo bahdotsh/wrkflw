@@ -227,8 +227,9 @@ impl ResultStore {
         }
     }
 
-    /// Store a passing result. Failing to do so never fails the job.
-    pub(crate) async fn save(&self, key: &str, jobs: Vec<StoredJob>) {
+    /// Store a passing result, and upload it if `shareable` and this run
+    /// pushes. Failing to do so never fails the job.
+    pub(crate) async fn save(&self, key: &str, jobs: Vec<StoredJob>, shareable: bool) {
         let entry = Entry {
             schema: ENTRY_SCHEMA,
             key: key.to_string(),
@@ -236,7 +237,7 @@ impl ResultStore {
             jobs,
         };
         self.save_local(&entry);
-        if !self.push {
+        if !self.push || !shareable {
             return;
         }
         let (Some(remote), Some(signing_key)) = (&self.remote, &self.key) else {
@@ -287,7 +288,7 @@ mod tests {
     async fn a_stored_result_comes_back_and_a_copy_under_another_key_does_not() {
         let dir = TempDir::new().unwrap();
         let store = store_with(dir.path(), &Acceleration::default());
-        store.save("aaa", stored()).await;
+        store.save("aaa", stored(), true).await;
         assert_eq!(store.load("aaa").await.unwrap().jobs, stored());
         std::fs::copy(
             dir.path().join("local/aaa.json"),
@@ -301,7 +302,7 @@ mod tests {
     async fn an_expired_entry_is_a_miss() {
         let dir = TempDir::new().unwrap();
         let store = store_with(dir.path(), &Acceleration::default());
-        store.save("aaa", stored()).await;
+        store.save("aaa", stored(), true).await;
         let path = dir.path().join("local/aaa.json");
         let mut entry: Entry =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
@@ -314,7 +315,7 @@ mod tests {
     async fn a_remote_result_reaches_another_machine_only_with_the_right_key() {
         let dir = TempDir::new().unwrap();
         let writer = store_with(dir.path(), &remote_accel(dir.path(), "right"));
-        writer.save("aaa", stored()).await;
+        writer.save("aaa", stored(), true).await;
         std::fs::remove_dir_all(dir.path().join("local")).unwrap();
 
         let forged = store_with(dir.path(), &remote_accel(dir.path(), "wrong"));
@@ -325,10 +326,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_result_that_is_not_shareable_stays_local() {
+        let dir = TempDir::new().unwrap();
+        let store = store_with(dir.path(), &remote_accel(dir.path(), "k"));
+        store.save("aaa", stored(), false).await;
+        assert!(dir.path().join("local/aaa.json").exists());
+        assert!(!dir.path().join("remote/aaa.json").exists());
+    }
+
+    #[tokio::test]
     async fn a_tampered_remote_body_is_rejected() {
         let dir = TempDir::new().unwrap();
         let store = store_with(dir.path(), &remote_accel(dir.path(), "k"));
-        store.save("aaa", stored()).await;
+        store.save("aaa", stored(), true).await;
         std::fs::remove_dir_all(dir.path().join("local")).unwrap();
         let path = dir.path().join("remote/aaa.json");
         let text = std::fs::read_to_string(&path).unwrap();
@@ -357,7 +367,9 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        store_with(dir.path(), &accel).save("aaa", stored()).await;
+        store_with(dir.path(), &accel)
+            .save("aaa", stored(), true)
+            .await;
         let requests = server.received_requests().await.unwrap();
         let uploaded = String::from_utf8(requests[0].body.clone()).unwrap();
 

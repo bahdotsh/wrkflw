@@ -4,6 +4,7 @@
 //! `grep` works on it, and pruning is a directory delete. Run ids sort by
 //! time, so a listing is a reverse-sorted `read_dir`.
 
+use crate::env;
 use crate::record::{RunRecord, RunStatus};
 use std::fs;
 use std::io::{self, Write};
@@ -14,7 +15,7 @@ pub const DEFAULT_KEEP: usize = 500;
 
 /// `WRKFLW_HOME`, or the platform's local data directory.
 pub fn home_dir() -> Option<PathBuf> {
-    if let Some(home) = std::env::var_os("WRKFLW_HOME").filter(|h| !h.is_empty()) {
+    if let Some(home) = std::env::var_os(env::HOME).filter(|h| !h.is_empty()) {
         return Some(PathBuf::from(home));
     }
     dirs::data_local_dir().map(|d| d.join("wrkflw"))
@@ -22,7 +23,7 @@ pub fn home_dir() -> Option<PathBuf> {
 
 /// Whether history is switched off with `WRKFLW_NO_HISTORY`.
 pub fn history_disabled() -> bool {
-    std::env::var_os("WRKFLW_NO_HISTORY").is_some_and(|v| !v.is_empty() && v != "0")
+    std::env::var_os(env::NO_HISTORY).is_some_and(|v| !v.is_empty() && v != "0")
 }
 
 #[derive(Debug, Clone)]

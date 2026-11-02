@@ -178,14 +178,14 @@ async fn call_tool(name: &str, args: &Value, agent: Option<&str>) -> Value {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .env("WRKFLW_MCP", "1")
+        .env(wrkflw_runs::env::MCP, "1")
         .kill_on_drop(true);
     if let Some(cwd) = string_arg(args, "cwd") {
         command.current_dir(cwd);
     }
     if let Some(agent) = agent {
-        if std::env::var_os("WRKFLW_AGENT").is_none() {
-            command.env("WRKFLW_AGENT", agent);
+        if std::env::var_os(wrkflw_runs::env::AGENT).is_none() {
+            command.env(wrkflw_runs::env::AGENT, agent);
         }
     }
     match tokio::time::timeout(Duration::from_secs(timeout), command.output()).await {

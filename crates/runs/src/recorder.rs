@@ -1,6 +1,7 @@
 //! Runs a workflow while recording it and streaming it as NDJSON.
 
 use crate::digest::{failure_digest, FailureDigest, DEFAULT_TAIL_LINES};
+use crate::env;
 use crate::record::{JobRecord, RunRecord, RunStatus, StepRecord, SCHEMA_VERSION};
 use crate::store::{history_disabled, RunStore, DEFAULT_KEEP};
 use serde_json::{json, Value};
@@ -34,7 +35,7 @@ impl RunMeta {
         Self {
             source: source.to_string(),
             agent: detect_agent(),
-            replay_of: non_empty_env("WRKFLW_REPLAY_OF"),
+            replay_of: non_empty_env(env::REPLAY_OF),
             ..Default::default()
         }
     }
@@ -46,8 +47,8 @@ fn non_empty_env(name: &str) -> Option<String> {
 
 /// `WRKFLW_AGENT`, or the coding agent that announces itself in the environment.
 pub fn detect_agent() -> Option<String> {
-    non_empty_env("WRKFLW_AGENT")
-        .or_else(|| non_empty_env("CLAUDECODE").map(|_| "claude-code".to_string()))
+    non_empty_env(env::AGENT)
+        .or_else(|| non_empty_env(env::CLAUDE_CODE).map(|_| "claude-code".to_string()))
 }
 
 #[derive(Clone, Debug, Default)]
@@ -459,7 +460,7 @@ async fn begin(path: &Path, config: &ExecutionConfig, options: &RunOptions) -> A
 }
 
 fn keep_limit() -> usize {
-    non_empty_env("WRKFLW_RUNS_KEEP")
+    non_empty_env(env::RUNS_KEEP)
         .and_then(|keep| keep.parse().ok())
         .unwrap_or(DEFAULT_KEEP)
 }

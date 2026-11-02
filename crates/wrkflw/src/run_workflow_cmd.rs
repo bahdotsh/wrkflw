@@ -141,7 +141,7 @@ pub(crate) async fn run(ctx: RunCtx) {
 
     let mut variable_names: Vec<String> = ctx.variables.keys().cloned().collect();
     variable_names.sort();
-    let mut meta = wrkflw_runs::RunMeta::new(if std::env::var_os("WRKFLW_MCP").is_some() {
+    let mut meta = wrkflw_runs::RunMeta::new(if std::env::var_os(wrkflw_runs::env::MCP).is_some() {
         "mcp"
     } else {
         "cli"

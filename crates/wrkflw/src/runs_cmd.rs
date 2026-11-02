@@ -245,7 +245,7 @@ fn replay(run: &RunRecord, variables: &[String], format: OutputFormat) -> ! {
     }
     command
         .current_dir(&run.cwd)
-        .env("WRKFLW_REPLAY_OF", &run.id);
+        .env(wrkflw_runs::env::REPLAY_OF, &run.id);
     match command.status() {
         Ok(status) => std::process::exit(status.code().unwrap_or(1)),
         Err(e) => die(format, &format!("could not start replay: {e}")),

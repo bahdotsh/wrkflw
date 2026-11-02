@@ -4,6 +4,7 @@
 //! read instead of a rerun. See [`execute_recorded`].
 
 mod digest;
+pub mod env;
 mod record;
 mod recorder;
 mod store;

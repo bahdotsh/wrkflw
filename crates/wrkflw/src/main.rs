@@ -333,7 +333,7 @@ enum Commands {
         no_strict_filter: bool,
 
         /// Why this run is happening. Stored on the run record
-        #[arg(long, env = "WRKFLW_INTENT", value_name = "TEXT")]
+        #[arg(long, env = wrkflw_runs::env::INTENT, value_name = "TEXT")]
         intent: Option<String>,
 
         /// Who started this run. Defaults to WRKFLW_AGENT, then a detected coding agent

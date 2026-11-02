@@ -6,16 +6,20 @@
 //! also means a tool result is exactly what the CLI's JSON contract promises.
 
 use serde_json::{json, Value};
-use std::process::Stdio;
+use std::process::{Output, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::Command;
 use tokio::sync::Mutex;
 
 const SUPPORTED_PROTOCOLS: [&str; 3] = ["2025-06-18", "2025-03-26", "2024-11-05"];
 const DEFAULT_RUN_TIMEOUT_SECS: u64 = 1800;
 /// Longest a read-only tool may take. These only parse files and read history.
 const QUICK_TIMEOUT_SECS: u64 = 120;
+/// How long a timed-out child gets to clean up. Longer than the 10 seconds
+/// after which its own signal handler forces an exit.
+const STOP_GRACE: Duration = Duration::from_secs(15);
 
 const INSTRUCTIONS: &str =
     "wrkflw validates and runs GitHub Actions and GitLab CI workflows locally. \
@@ -172,7 +176,7 @@ async fn call_tool(name: &str, args: &Value, agent: Option<&str>) -> Value {
         Ok(exe) => exe,
         Err(e) => return error_result(&e.to_string()),
     };
-    let mut command = tokio::process::Command::new(exe);
+    let mut command = Command::new(exe);
     command
         .args(&cli)
         .stdin(Stdio::null())
@@ -188,18 +192,56 @@ async fn call_tool(name: &str, args: &Value, agent: Option<&str>) -> Value {
             command.env(wrkflw_runs::env::AGENT, agent);
         }
     }
-    match tokio::time::timeout(Duration::from_secs(timeout), command.output()).await {
-        Ok(Ok(output)) => tool_result(
+    let child = match command.spawn() {
+        Ok(child) => child,
+        Err(e) => return error_result(&format!("could not start wrkflw: {e}")),
+    };
+    match run_with_deadline(child, Duration::from_secs(timeout), STOP_GRACE).await {
+        Some(Ok(output)) => tool_result(
             &String::from_utf8_lossy(&output.stdout),
             &String::from_utf8_lossy(&output.stderr),
             output.status.success(),
         ),
-        Ok(Err(e)) => error_result(&format!("could not start wrkflw: {e}")),
-        Err(_) => error_result(&format!(
+        Some(Err(e)) => error_result(&format!("could not read wrkflw's output: {e}")),
+        None => error_result(&format!(
             "{name} timed out after {timeout}s and was stopped"
         )),
     }
 }
+
+/// Wait for `child`, or stop it once `limit` has passed and return `None`.
+///
+/// It is interrupted first, because only its signal handler removes the
+/// containers it started. A kill is the fallback: it needs `kill_on_drop`.
+async fn run_with_deadline(
+    child: tokio::process::Child,
+    limit: Duration,
+    grace: Duration,
+) -> Option<std::io::Result<Output>> {
+    let pid = child.id();
+    let output = child.wait_with_output();
+    tokio::pin!(output);
+    if let Ok(result) = tokio::time::timeout(limit, &mut output).await {
+        return Some(result);
+    }
+    if let Some(pid) = pid {
+        interrupt(pid);
+    }
+    let _ = tokio::time::timeout(grace, &mut output).await;
+    None
+}
+
+#[cfg(unix)]
+fn interrupt(pid: u32) {
+    use nix::sys::signal::{kill, Signal};
+    use nix::unistd::Pid;
+    let _ = kill(Pid::from_raw(pid as i32), Signal::SIGINT);
+}
+
+/// Windows can't send Ctrl+C to one child, so the grace period runs out and
+/// the child is killed. Its containers outlive it there.
+#[cfg(not(unix))]
+fn interrupt(_pid: u32) {}
 
 fn tool(
     name: &str,
@@ -383,6 +425,59 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("run_finished"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_timed_out_child_is_interrupted_before_it_is_killed() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("interrupted");
+        let script = format!(
+            "trap 'echo yes > {}; exit 0' INT; sleep 30 > /dev/null 2>&1 & wait",
+            marker.display()
+        );
+        let child = Command::new("sh")
+            .args(["-c", &script])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let limit = Duration::from_millis(300);
+        let outcome = run_with_deadline(child, limit, Duration::from_secs(5)).await;
+        assert!(outcome.is_none());
+        assert!(marker.exists(), "the child never saw SIGINT");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_child_ignoring_the_interrupt_is_killed_after_the_grace_period() {
+        let child = Command::new("sh")
+            .args(["-c", "trap '' INT; sleep 30 > /dev/null 2>&1 & wait; wait"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let started = std::time::Instant::now();
+        let short = Duration::from_millis(100);
+        assert!(run_with_deadline(child, short, short).await.is_none());
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_child_inside_the_limit_returns_its_output() {
+        let child = Command::new("sh")
+            .args(["-c", "echo done"])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let second = Duration::from_secs(5);
+        let output = run_with_deadline(child, second, second).await.unwrap();
+        assert_eq!(output.unwrap().stdout, b"done\n");
     }
 
     #[test]

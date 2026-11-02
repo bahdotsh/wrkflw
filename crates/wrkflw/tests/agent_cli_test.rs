@@ -658,6 +658,40 @@ fn mcp_server_speaks_the_protocol_and_runs_tools() {
 }
 
 #[test]
+fn mcp_timeout_stops_the_run_and_replay_of_an_mcp_run_works() {
+    let sandbox = Sandbox::new();
+    sandbox.write(
+        "slow.yml",
+        "name: slow\non: [push]\njobs:\n  slow:\n    runs-on: ubuntu-latest\n    steps:\n      - run: sleep 8\n",
+    );
+    let mut mcp = Mcp::start(&sandbox);
+    let started = std::time::Instant::now();
+    let (message, is_error) = mcp.tool(
+        "run_workflow",
+        json!({
+            "path": ".github/workflows/slow.yml",
+            "runtime": "emulation",
+            "timeout_seconds": 2,
+        }),
+    );
+    assert!(is_error);
+    assert!(message.as_str().unwrap().contains("timed out"));
+    assert!(started.elapsed() < std::time::Duration::from_secs(20));
+
+    let (run, _) = mcp.tool("get_run", json!({}));
+    assert_eq!(run["status"], "interrupted");
+
+    let (finished, _) = mcp.tool(
+        "run_workflow",
+        json!({"path": ".github/workflows/passing.yml", "runtime": "emulation"}),
+    );
+    assert_eq!(finished["status"], "success");
+    let replay = sandbox.run(&["--format", "json", "runs", "replay"]);
+    assert!(replay.status.success(), "{}", stdout(&replay));
+    json_lines(&replay);
+}
+
+#[test]
 fn text_mode_prints_the_digest_on_failure() {
     let sandbox = Sandbox::new();
     let output = sandbox.run(&[

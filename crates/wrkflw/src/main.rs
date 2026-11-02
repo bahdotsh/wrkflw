@@ -655,12 +655,12 @@ async fn handle_signals() {
     // Wait for Ctrl+C
     match tokio::signal::ctrl_c().await {
         Ok(_) => {
-            println!("Received Ctrl+C, shutting down and cleaning up...");
+            eprintln!("Received Ctrl+C, shutting down and cleaning up...");
         }
         Err(e) => {
             // Log the error but continue with cleanup
             eprintln!("Warning: Failed to properly listen for ctrl+c event: {}", e);
-            println!("Shutting down and cleaning up...");
+            eprintln!("Shutting down and cleaning up...");
         }
     }
 

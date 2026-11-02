@@ -1,6 +1,8 @@
 //! `--reuse-results`, `--affected` and `gate`, through the
 //! real binary, in a throwaway repository. Everything runs in emulation, so
-//! these need no container runtime.
+//! these need no container runtime. Fixtures use POSIX shell steps, so this
+//! file only runs on Unix.
+#![cfg(unix)]
 
 use std::fs;
 use std::path::{Path, PathBuf};

@@ -2,6 +2,7 @@ pub mod symbols;
 
 use chrono::Local;
 use once_cell::sync::Lazy;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 // Thread-safe log storage
@@ -13,6 +14,16 @@ static LOG_LEVEL: Lazy<Arc<Mutex<LogLevel>>> = Lazy::new(|| Arc::new(Mutex::new(
 // When true, log() stores messages but does not print to stdout/stderr.
 // Enable this while a TUI owns the terminal to prevent display corruption.
 static QUIET_MODE: Lazy<Arc<Mutex<bool>>> = Lazy::new(|| Arc::new(Mutex::new(false)));
+
+// When true, every console log line goes to stderr, so stdout can carry a
+// machine-readable stream.
+static CONSOLE_TO_STDERR: AtomicBool = AtomicBool::new(false);
+
+/// Send all console logging to stderr. Used by `--format json` and the MCP
+/// server, where stdout is a protocol.
+pub fn set_console_to_stderr(enabled: bool) {
+    CONSOLE_TO_STDERR.store(enabled, Ordering::Relaxed);
+}
 
 // Log levels
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -78,6 +89,9 @@ pub fn log(level: LogLevel, message: &str) {
             if level >= *current_level {
                 match level {
                     LogLevel::Error | LogLevel::Warning => eprintln!("{}", formatted),
+                    _ if CONSOLE_TO_STDERR.load(Ordering::Relaxed) => {
+                        eprintln!("{}", formatted)
+                    }
                     _ => println!("{}", formatted),
                 }
             }

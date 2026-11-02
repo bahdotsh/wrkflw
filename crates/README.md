@@ -14,6 +14,7 @@ This directory contains the Rust crates that make up the wrkflw workspace.
 | **runtime** | Container management and emulation runtime |
 | **trigger-filter** | Parses `on:` blocks and matches them against simulated event context and changed-file sets |
 | **watcher** | File watcher with trigger-aware re-execution for `wrkflw watch` |
+| **runs** | Run history, failure digests and NDJSON events |
 | **ui** | Terminal user interface (ratatui-based) |
 | **models** | Shared data structures (`ValidationResult`, GitLab models) |
 | **matrix** | Matrix expansion (`include`, `exclude`, `fail-fast`) |

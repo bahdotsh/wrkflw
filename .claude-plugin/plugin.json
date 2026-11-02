@@ -1,0 +1,12 @@
+{
+  "name": "wrkflw",
+  "description": "Validate, plan and run GitHub Actions and GitLab CI workflows locally, with recorded run history",
+  "homepage": "https://github.com/bahdotsh/wrkflw",
+  "license": "MIT",
+  "mcpServers": {
+    "wrkflw": {
+      "command": "wrkflw",
+      "args": ["mcp", "serve"]
+    }
+  }
+}

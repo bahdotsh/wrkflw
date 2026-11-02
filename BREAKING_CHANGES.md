@@ -1,5 +1,29 @@
 # Breaking Changes
 
+## Step output is masked, and `run` steps report their exit code (unreleased)
+
+`StepResult::output` and job logs now have secrets replaced with `***`, including values matching built-in token patterns. Previously nothing masked step output. Code that compared a secret's value against output will no longer match. Step outputs set with `::set-output::` keep their real values.
+
+`run:` step output now starts with an `Exit code: N` line. `StepResult` gained an `exit_code` field holding the same number, so code that builds `StepResult` with a struct literal must set it.
+
+GitLab `--variable` values are masked too, because they are often credentials. A value that is also ordinary text, such as `-V DEPLOY=true`, is replaced wherever that text appears in the output. Values under 3 characters are not masked.
+
+## Container steps are no longer capped at 6 minutes (unreleased)
+
+The Docker and Podman runtimes used to stop every step after 300 to 360 seconds. Steps now run until their job's or step's `timeout-minutes`, which defaults to 360 minutes as on GitHub. A step that hangs now holds its job for that long, so set `timeout-minutes` on steps that can hang.
+
+## TUI: `7` opens the Runs tab, Help moved to `8` (unreleased)
+
+The `h` and `?` shortcuts for Help are unchanged.
+
+## `ValidationResult` gained `details` (unreleased)
+
+Code that builds `ValidationResult` with a struct literal must use `ValidationResult::new()`. `issues` is unchanged.
+
+## Runs are recorded by default (unreleased)
+
+`wrkflw run`, `watch` and TUI runs now write logs to the local data directory, keeping the newest 500. Pass `--no-record` or set `WRKFLW_NO_HISTORY=1` to opt out.
+
 ## `actions/upload-artifact` follows GitHub's layout and rules (unreleased)
 
 Artifact paths are now relative to where the `path:` search started, as on

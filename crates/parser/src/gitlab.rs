@@ -57,7 +57,7 @@ pub fn validate_pipeline_structure(pipeline: &Pipeline) -> ValidationResult {
 
     // Check for at least one job
     if pipeline.jobs.is_empty() {
-        result.add_issue("Pipeline must contain at least one job".to_string());
+        result.report("empty-pipeline", "Pipeline must contain at least one job");
     }
 
     // Check for script in jobs
@@ -69,10 +69,15 @@ pub fn validate_pipeline_structure(pipeline: &Pipeline) -> ValidationResult {
 
         // Check for script or extends
         if job.script.is_none() && job.extends.is_none() && job.trigger.is_none() {
-            result.add_issue(format!(
-                "Job '{}' must have a script or trigger section or extend another job",
-                job_name
-            ));
+            result.scoped(job_name.as_str(), |r| {
+                r.report(
+                    "job-missing-script",
+                    format!(
+                        "Job '{}' must have a script or trigger section or extend another job",
+                        job_name
+                    ),
+                )
+            });
         }
     }
 
@@ -81,10 +86,13 @@ pub fn validate_pipeline_structure(pipeline: &Pipeline) -> ValidationResult {
         for (job_name, job) in &pipeline.jobs {
             if let Some(stage) = &job.stage {
                 if !stages.contains(stage) {
-                    result.add_issue(format!(
-                        "Job '{}' references undefined stage '{}'",
-                        job_name, stage
-                    ));
+                    result.scoped(job_name.as_str(), |r| {
+                        r.report_at(
+                            "undefined-stage",
+                            "stage",
+                            format!("Job '{}' references undefined stage '{}'", job_name, stage),
+                        )
+                    });
                 }
             }
         }
@@ -95,10 +103,16 @@ pub fn validate_pipeline_structure(pipeline: &Pipeline) -> ValidationResult {
         if let Some(dependencies) = &job.dependencies {
             for dependency in dependencies {
                 if !pipeline.jobs.contains_key(dependency) {
-                    result.add_issue(format!(
-                        "Job '{}' depends on undefined job '{}'",
-                        job_name, dependency
-                    ));
+                    result.scoped(job_name.as_str(), |r| {
+                        r.report_at(
+                            "undefined-dependency",
+                            "dependencies",
+                            format!(
+                                "Job '{}' depends on undefined job '{}'",
+                                job_name, dependency
+                            ),
+                        )
+                    });
                 }
             }
         }
@@ -109,10 +123,13 @@ pub fn validate_pipeline_structure(pipeline: &Pipeline) -> ValidationResult {
         if let Some(extends) = &job.extends {
             for extend in extends {
                 if !pipeline.jobs.contains_key(extend) {
-                    result.add_issue(format!(
-                        "Job '{}' extends undefined job '{}'",
-                        job_name, extend
-                    ));
+                    result.scoped(job_name.as_str(), |r| {
+                        r.report_at(
+                            "undefined-extends",
+                            "extends",
+                            format!("Job '{}' extends undefined job '{}'", job_name, extend),
+                        )
+                    });
                 }
             }
         }

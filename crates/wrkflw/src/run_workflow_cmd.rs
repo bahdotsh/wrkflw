@@ -12,7 +12,8 @@
 //! win here; further lifting of `exit` calls is a separate follow-up.
 
 use crate::prefilter;
-use crate::{is_gitlab_pipeline, RuntimeChoice};
+use crate::{is_gitlab_pipeline, OutputFormat, RuntimeChoice};
+use serde_json::json;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -40,6 +41,100 @@ pub(crate) struct RunCtx {
     pub(crate) verbose: bool,
     pub(crate) platform_overrides: HashMap<String, String>,
     pub(crate) kubernetes: wrkflw_executor::KubernetesConfig,
+    pub(crate) format: OutputFormat,
+    pub(crate) intent: Option<String>,
+    pub(crate) agent: Option<String>,
+    pub(crate) no_record: bool,
+    pub(crate) from_step: Option<String>,
+}
+
+/// Print a terminal error in the active format and exit 1.
+fn fail(format: OutputFormat, message: &str) -> ! {
+    if format.is_json() {
+        wrkflw_runs::emit_line(&json!({
+            "schema_version": wrkflw_runs::SCHEMA_VERSION,
+            "type": "error",
+            "message": message,
+        }));
+    }
+    eprintln!("Error: {}", message);
+    std::process::exit(1);
+}
+
+/// `--from-step` as the executor wants it, after checking the job and step
+/// exist, so a typo fails here rather than silently running every step.
+fn resolve_from_step(
+    ctx: &RunCtx,
+    is_gitlab: bool,
+) -> Result<Option<wrkflw_executor::FromStep>, String> {
+    let Some(step) = ctx.from_step.clone() else {
+        return Ok(None);
+    };
+    if is_gitlab {
+        return Err("--from-step is only supported for GitHub Actions workflows".to_string());
+    }
+    let job = ctx.job.clone().unwrap_or_default();
+    let workflow = wrkflw_parser::workflow::parse_workflow(&ctx.path)?;
+    let definition = workflow
+        .jobs
+        .get(&job)
+        .ok_or_else(|| format!("job '{}' not found in {}", job, ctx.path.display()))?;
+    let from = wrkflw_executor::FromStep { job, step };
+    if from.resolve(&definition.steps).is_none() {
+        return Err(format!(
+            "step '{}' not found in job '{}': pass a step name or a 1-based position",
+            from.step, from.job
+        ));
+    }
+    wrkflw_logging::warning(
+        "--from-step: earlier steps are skipped, so their outputs and any files they \
+         created are missing. Only actions/checkout still runs.",
+    );
+    Ok(Some(from))
+}
+
+/// Arguments of this invocation with `--variable` values removed, for replay.
+/// Variables are often credentials, so they never reach the run store.
+pub(crate) fn replayable_argv() -> Vec<String> {
+    strip_variable_args(std::env::args().skip(1))
+}
+
+fn strip_variable_args(args: impl Iterator<Item = String>) -> Vec<String> {
+    let mut kept = Vec::new();
+    let mut args = args;
+    while let Some(arg) = args.next() {
+        // Everything after `--` is positional, even if it looks like a flag.
+        if arg == "--" {
+            kept.push(arg);
+            kept.extend(args);
+            break;
+        }
+        // `--format` is the replayer's choice, and clap rejects it twice.
+        if arg == "--variable" || arg == "--format" {
+            args.next();
+        } else if let Some((flags, inline_value)) = variable_in_short_cluster(&arg) {
+            if !flags.is_empty() {
+                kept.push(format!("-{flags}"));
+            }
+            if !inline_value {
+                args.next();
+            }
+        } else if !arg.starts_with("--variable=") && !arg.starts_with("--format=") {
+            kept.push(arg);
+        }
+    }
+    kept
+}
+
+/// Finds `-V` in a short-flag cluster such as `-V`, `-VA=b` or `-dV`. Returns
+/// the boolean flags before it and whether its value is part of `arg`.
+fn variable_in_short_cluster(arg: &str) -> Option<(&str, bool)> {
+    let cluster = arg.strip_prefix('-').filter(|c| !c.starts_with('-'))?;
+    let (flags, value) = cluster.split_once('V')?;
+    flags
+        .chars()
+        .all(|flag| flag == 'v' || flag == 'd')
+        .then_some((flags, !value.is_empty()))
 }
 
 /// Execute the `wrkflw run` command. Exits the process on every
@@ -55,23 +150,50 @@ pub(crate) async fn run(ctx: RunCtx) {
     // `Error parsing workflow: ...` from deep in the YAML parser.
     let is_gitlab = ctx.gitlab || is_gitlab_pipeline(&ctx.path);
 
+    let format = ctx.format;
+    let from_step = resolve_from_step(&ctx, is_gitlab).unwrap_or_else(|e| fail(format, &e));
+
     if !is_gitlab && !ctx.variables.is_empty() {
-        eprintln!("Error: --variable is only supported for GitLab CI pipelines.");
-        std::process::exit(1);
+        fail(
+            format,
+            "--variable is only supported for GitLab CI pipelines.",
+        );
     }
+
+    let mut variable_names: Vec<String> = ctx.variables.keys().cloned().collect();
+    variable_names.sort();
+    let mut meta =
+        wrkflw_runs::RunMeta::new(if std::env::var_os(wrkflw_runs::env::MCP).is_some() {
+            "mcp"
+        } else {
+            "cli"
+        });
+    meta.agent = ctx.agent.clone().or(meta.agent);
+    meta.intent = ctx.intent.clone();
+    meta.event = ctx.event.clone();
+    meta.argv = replayable_argv();
+    meta.variables = variable_names;
+    let options = wrkflw_runs::RunOptions {
+        meta,
+        ndjson: format.is_json(),
+        record: !ctx.no_record,
+        from_step,
+    };
 
     // Evaluate trigger filter at the call site before executing
     if ctx.diff || ctx.event.is_some() || ctx.changed_files.is_some() {
         if is_gitlab {
-            eprintln!(
-                "Error: --diff, --event, and --changed-files are only \
-                 supported for GitHub Actions workflows.\n\
-                 {} appears to be a GitLab CI pipeline — trigger \
-                 filtering is GitHub Actions-specific and cannot be \
-                 evaluated against GitLab `rules:`/`only:`/`except:`.",
-                ctx.path.display()
+            fail(
+                format,
+                &format!(
+                    "--diff, --event, and --changed-files are only \
+                     supported for GitHub Actions workflows.\n\
+                     {} appears to be a GitLab CI pipeline — trigger \
+                     filtering is GitHub Actions-specific and cannot be \
+                     evaluated against GitLab `rules:`/`only:`/`except:`.",
+                    ctx.path.display()
+                ),
             );
-            std::process::exit(1);
         }
         let decision = prefilter::run_trigger_prefilter(prefilter::PrefilterRequest {
             workflow_path: &ctx.path,
@@ -87,21 +209,25 @@ pub(crate) async fn run(ctx: RunCtx) {
         })
         .await;
         match decision {
-            Ok(prefilter::PrefilterDecision::Proceed) => {
+            Ok(prefilter::PrefilterDecision::Proceed { .. }) => {
                 // Match — fall through to the executor below.
             }
             Ok(prefilter::PrefilterDecision::Skip { reason }) => {
                 use wrkflw_ui::cli_style;
-                println!(
-                    "{}",
-                    cli_style::dim(&format!("Workflow skipped: {}", reason))
-                );
+                let config = wrkflw_executor::ExecutionConfig {
+                    runtime_type: ctx.runtime.into(),
+                    ..Default::default()
+                };
+                wrkflw_runs::record_skipped(&ctx.path, &config, &options, &reason).await;
+                if !format.is_json() {
+                    println!(
+                        "{}",
+                        cli_style::dim(&format!("Workflow skipped: {}", reason))
+                    );
+                }
                 std::process::exit(0);
             }
-            Err(msg) => {
-                eprintln!("Error: {}", msg);
-                std::process::exit(1);
-            }
+            Err(msg) => fail(format, &msg),
         }
     }
 
@@ -130,12 +256,23 @@ pub(crate) async fn run(ctx: RunCtx) {
     ));
 
     // Execute the workflow
-    let result = wrkflw_executor::execute_workflow(&ctx.path, config)
-        .await
-        .unwrap_or_else(|e| {
+    let recorded = wrkflw_runs::execute_recorded(&ctx.path, config, options).await;
+    let digest = recorded.digest;
+    let result = match recorded.result {
+        Ok(result) => result,
+        // In JSON mode `run_finished` has already carried the error too.
+        Err(e) => {
             eprintln!("Error executing workflow: {}", e);
             std::process::exit(1);
-        });
+        }
+    };
+
+    if format.is_json() {
+        if result.failure_details.is_some() {
+            std::process::exit(1);
+        }
+        return;
+    }
 
     // Print execution summary
     use wrkflw_ui::cli_style;
@@ -164,6 +301,10 @@ pub(crate) async fn run(ctx: RunCtx) {
                     );
                 }
             }
+        }
+        if let Some(digest) = &digest {
+            eprintln!("\n{}", cli_style::section("Failure digest"));
+            eprint!("{}", wrkflw_runs::render_digest(digest));
         }
         std::process::exit(1);
     } else {
@@ -233,4 +374,44 @@ pub(crate) async fn run(ctx: RunCtx) {
     }
 
     // Cleanup is handled automatically via the signal handler
+}
+
+#[cfg(test)]
+mod tests {
+    use super::strip_variable_args;
+
+    #[test]
+    fn variable_values_never_reach_the_stored_argv() {
+        let args = [
+            "run",
+            "ci.yml",
+            "-V",
+            "TOKEN=a",
+            "--variable",
+            "B=b",
+            "--variable=C=c",
+            "-VD=d",
+            "--format",
+            "json",
+            "--format=json",
+            "--job",
+            "build",
+        ];
+        let kept = strip_variable_args(args.iter().map(|s| s.to_string()));
+        assert_eq!(kept, vec!["run", "ci.yml", "--job", "build"]);
+    }
+
+    #[test]
+    fn variable_values_in_short_flag_clusters_are_removed() {
+        let args = ["run", "-dV", "TOKEN=a", "-vdVB=b", "-v", "ci.yml"];
+        let kept = strip_variable_args(args.iter().map(|s| s.to_string()));
+        assert_eq!(kept, vec!["run", "-d", "-vd", "-v", "ci.yml"]);
+    }
+
+    #[test]
+    fn arguments_after_the_separator_are_kept_verbatim() {
+        let args = ["run", "--", "-Vfile.yml", "--format"];
+        let kept = strip_variable_args(args.iter().map(|s| s.to_string()));
+        assert_eq!(kept, args);
+    }
 }

@@ -40,14 +40,22 @@ pub fn validate_triggers(on: &Value, result: &mut ValidationResult) {
     match on {
         Value::String(event) => {
             if !valid_events.contains(&event.as_str()) {
-                result.add_issue(format!("Unknown trigger event: '{}'", event));
+                result.report(
+                    "unknown-trigger",
+                    format!("Unknown trigger event: '{}'", event),
+                );
             }
         }
         Value::Sequence(events) => {
-            for event in events {
+            for (index, event) in events.iter().enumerate() {
                 if let Some(event_str) = event.as_str() {
                     if !valid_events.contains(&event_str) {
-                        result.add_issue(format!("Unknown trigger event: '{}'", event_str));
+                        result.push_index(index);
+                        result.report(
+                            "unknown-trigger",
+                            format!("Unknown trigger event: '{}'", event_str),
+                        );
+                        result.pop_scope();
                     }
                 }
             }
@@ -56,7 +64,11 @@ pub fn validate_triggers(on: &Value, result: &mut ValidationResult) {
             for (event, _) in event_map {
                 if let Some(event_str) = event.as_str() {
                     if !valid_events.contains(&event_str) {
-                        result.add_issue(format!("Unknown trigger event: '{}'", event_str));
+                        result.report_at(
+                            "unknown-trigger",
+                            event_str,
+                            format!("Unknown trigger event: '{}'", event_str),
+                        );
                     }
                 }
             }
@@ -65,21 +77,29 @@ pub fn validate_triggers(on: &Value, result: &mut ValidationResult) {
             if let Some(Value::Sequence(schedules)) =
                 event_map.get(Value::String("schedule".to_string()))
             {
-                for schedule in schedules {
+                result.push_scope("schedule");
+                for (index, schedule) in schedules.iter().enumerate() {
                     if let Some(schedule_map) = schedule.as_mapping() {
+                        result.push_index(index);
                         if let Some(Value::String(cron)) =
                             schedule_map.get(Value::String("cron".to_string()))
                         {
-                            validate_cron_syntax(cron, result);
+                            result.scoped("cron", |r| validate_cron_syntax(cron, r));
                         } else {
-                            result.add_issue("Schedule is missing 'cron' expression".to_string());
+                            result.report_at(
+                                "missing-cron",
+                                "cron",
+                                "Schedule is missing 'cron' expression",
+                            );
                         }
+                        result.pop_scope();
                     }
                 }
+                result.pop_scope();
             }
         }
         _ => {
-            result.add_issue("'on' section has invalid format".to_string());
+            result.report("invalid-triggers", "'on' section has invalid format");
         }
     }
 }
@@ -87,7 +107,7 @@ pub fn validate_triggers(on: &Value, result: &mut ValidationResult) {
 fn validate_cron_syntax(cron: &str, result: &mut ValidationResult) {
     let parts: Vec<&str> = cron.split_whitespace().collect();
     if parts.len() != 5 {
-        result.add_issue(format!(
+        result.report("invalid-cron", format!(
             "Invalid cron syntax '{}': should have 5 components (minute hour day month day-of-week)",
             cron
         ));
@@ -104,10 +124,13 @@ fn validate_cron_syntax(cron: &str, result: &mut ValidationResult) {
 
     for (part, (name, min, max)) in parts.iter().zip(field_specs.iter()) {
         if !is_valid_cron_field(part, *min, *max) {
-            result.add_issue(format!(
-                "Invalid cron {} value '{}' in '{}': expected {}-{}, *, or a valid expression",
-                name, part, cron, min, max
-            ));
+            result.report(
+                "invalid-cron",
+                format!(
+                    "Invalid cron {} value '{}' in '{}': expected {}-{}, *, or a valid expression",
+                    name, part, cron, min, max
+                ),
+            );
         }
     }
 }

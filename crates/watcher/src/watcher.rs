@@ -72,6 +72,8 @@ pub struct WatchEvent {
 /// should be added here instead of as additional positional arguments.
 #[derive(Debug, Clone)]
 pub struct WatcherConfig {
+    /// When set, runs are recorded and streamed per these options.
+    pub run_options: Option<wrkflw_runs::RunOptions>,
     pub workflow_dir: PathBuf,
     pub repo_root: PathBuf,
     pub event_name: String,
@@ -116,6 +118,7 @@ impl WatcherConfig {
     pub fn new(workflow_dir: PathBuf, repo_root: PathBuf, execution: ExecutionConfig) -> Self {
         let trigger_filter = TriggerFilterConfig::default();
         Self {
+            run_options: None,
             workflow_dir,
             repo_root,
             event_name: trigger_filter.default_event.clone(),
@@ -153,6 +156,12 @@ impl WatcherConfig {
     /// linear over a typically-tiny list.
     pub fn with_extra_ignore_dirs(mut self, dirs: Vec<String>) -> Self {
         self.extra_ignore_dirs = dirs;
+        self
+    }
+
+    /// Record runs in the history, and stream them if the options say so.
+    pub fn with_run_options(mut self, options: wrkflw_runs::RunOptions) -> Self {
+        self.run_options = Some(options);
         self
     }
 

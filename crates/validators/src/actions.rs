@@ -15,12 +15,16 @@ pub fn validate_action_reference(
 
     // For non-local actions, enforce standard format
     if !is_local_action && !action_ref.contains('/') && !action_ref.contains('.') {
-        result.add_issue(format!(
-            "Job '{}', step {}: Invalid action reference format '{}'",
-            job_name,
-            step_idx + 1,
-            action_ref
-        ));
+        result.report_at(
+            "action-invalid-reference",
+            "uses",
+            format!(
+                "Job '{}', step {}: Invalid action reference format '{}'",
+                job_name,
+                step_idx + 1,
+                action_ref
+            ),
+        );
         return;
     }
 
@@ -28,21 +32,29 @@ pub fn validate_action_reference(
     if !is_local_action && action_ref.contains('@') {
         let parts: Vec<&str> = action_ref.split('@').collect();
         if parts.len() != 2 || parts[1].is_empty() {
-            result.add_issue(format!(
-                "Job '{}', step {}: Action '{}' has invalid version/ref format",
-                job_name,
-                step_idx + 1,
-                action_ref
-            ));
+            result.report_at(
+                "action-invalid-version",
+                "uses",
+                format!(
+                    "Job '{}', step {}: Action '{}' has invalid version/ref format",
+                    job_name,
+                    step_idx + 1,
+                    action_ref
+                ),
+            );
         }
     } else if !is_local_action {
         // Missing version tag is not recommended for non-local actions
-        result.add_issue(format!(
-            "Job '{}', step {}: Action '{}' is missing version tag (@v2, @main, etc.)",
-            job_name,
-            step_idx + 1,
-            action_ref
-        ));
+        result.report_at(
+            "action-missing-version",
+            "uses",
+            format!(
+                "Job '{}', step {}: Action '{}' is missing version tag (@v2, @main, etc.)",
+                job_name,
+                step_idx + 1,
+                action_ref
+            ),
+        );
     }
 
     // For local actions, validate the path and cross-check inputs
@@ -66,19 +78,27 @@ pub fn validate_action_reference(
             match action_file {
                 None => {
                     if !action_dir.exists() {
-                        result.add_issue(format!(
-                            "Job '{}', step {}: Local action path '{}' does not exist",
-                            job_name,
-                            step_idx + 1,
-                            action_ref
-                        ));
+                        result.report_at(
+                            "action-local-path-missing",
+                            "uses",
+                            format!(
+                                "Job '{}', step {}: Local action path '{}' does not exist",
+                                job_name,
+                                step_idx + 1,
+                                action_ref
+                            ),
+                        );
                     } else {
-                        result.add_issue(format!(
-                            "Job '{}', step {}: No action.yml or action.yaml found in '{}'",
-                            job_name,
-                            step_idx + 1,
-                            action_ref
-                        ));
+                        result.report_at(
+                            "action-missing-metadata",
+                            "uses",
+                            format!(
+                                "Job '{}', step {}: No action.yml or action.yaml found in '{}'",
+                                job_name,
+                                step_idx + 1,
+                                action_ref
+                            ),
+                        );
                     }
                 }
                 Some(action_file_path) => {
@@ -113,12 +133,16 @@ fn validate_local_action_inputs(
     let action_def: serde_yaml::Value = match serde_yaml::from_str(&content) {
         Ok(v) => v,
         Err(_) => {
-            result.add_issue(format!(
-                "Job '{}', step {}: Failed to parse action definition at '{}'",
-                job_name,
-                step_idx + 1,
-                action_ref
-            ));
+            result.report_at(
+                "action-invalid-metadata",
+                "uses",
+                format!(
+                    "Job '{}', step {}: Failed to parse action definition at '{}'",
+                    job_name,
+                    step_idx + 1,
+                    action_ref
+                ),
+            );
             return;
         }
     };
@@ -155,13 +179,13 @@ fn validate_local_action_inputs(
         let has_default = input_def.get("default").is_some();
 
         if is_required && !has_default && !provided_keys.contains(&input_name_str.to_lowercase()) {
-            result.add_issue(format!(
+            result.scoped("with", |r| r.report_at("action-missing-input", input_name_str, format!(
                 "Job '{}', step {}: Local action '{}' requires input '{}' but it is not provided in 'with'",
                 job_name,
                 step_idx + 1,
                 action_ref,
                 input_name_str
-            ));
+            )));
         }
     }
 }

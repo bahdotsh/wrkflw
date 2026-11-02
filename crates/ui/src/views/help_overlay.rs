@@ -156,7 +156,13 @@ pub fn render_help_content(f: &mut Frame<'_>, area: Rect, scroll_offset: usize) 
             "Dispatch remote workflow_dispatch",
         ),
         (6, "Secrets", COLORS.warning, "Provider routing & runtime"),
-        (7, "Help", COLORS.highlight, "This guide"),
+        (
+            7,
+            "Runs",
+            COLORS.highlight,
+            "Recorded runs, with agent and intent",
+        ),
+        (8, "Help", COLORS.highlight, "This guide"),
     ] {
         right_lines.push(Line::from(vec![
             Span::styled(

@@ -14,7 +14,8 @@
 //! first edit.
 
 use crate::prefilter;
-use crate::RuntimeChoice;
+use crate::{OutputFormat, RuntimeChoice};
+use serde_json::json;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -38,6 +39,7 @@ pub(crate) struct WatchCtx {
     pub(crate) verbose: bool,
     pub(crate) platform_overrides: HashMap<String, String>,
     pub(crate) kubernetes: wrkflw_executor::KubernetesConfig,
+    pub(crate) format: OutputFormat,
 }
 
 /// Execute the `wrkflw watch` command. Exits the process on every
@@ -107,13 +109,23 @@ pub(crate) async fn run(ctx: WatchCtx) {
     };
 
     use wrkflw_ui::cli_style;
-    println!(
-        "{}",
-        cli_style::success(&format!(
-            "Watching for changes (event={}, debounce={}ms)... Press Ctrl+C to stop.",
-            ctx.event, ctx.debounce
-        ))
-    );
+    let json_output = ctx.format.is_json();
+    if json_output {
+        wrkflw_runs::emit_line(&json!({
+            "schema_version": wrkflw_runs::SCHEMA_VERSION,
+            "type": "watch_started",
+            "event": ctx.event,
+            "debounce_ms": ctx.debounce,
+        }));
+    } else {
+        println!(
+            "{}",
+            cli_style::success(&format!(
+                "Watching for changes (event={}, debounce={}ms)... Press Ctrl+C to stop.",
+                ctx.event, ctx.debounce
+            ))
+        );
+    }
 
     // Hard-error on the load-bearing `pull_request + no base-branch`
     // combination under the default `--strict-filter`. Previously
@@ -159,7 +171,17 @@ pub(crate) async fn run(ctx: WatchCtx) {
         None => 0,
     };
 
+    let mut run_meta = wrkflw_runs::RunMeta::new("watch");
+    run_meta.event = Some(ctx.event.clone());
+    let run_options = wrkflw_runs::RunOptions {
+        meta: run_meta,
+        ndjson: json_output,
+        record: true,
+        from_step: None,
+    };
+
     let watcher_cfg = wrkflw_watcher::WatcherConfig::new(workflow_dir, repo_root, config)
+        .with_run_options(run_options)
         .with_event(ctx.event.clone())
         .with_base_branch(ctx.base_branch.clone())
         .with_activity_type(ctx.activity_type.clone())
@@ -220,7 +242,20 @@ pub(crate) async fn run(ctx: WatchCtx) {
     });
 
     let watch_result = watcher
-        .run(shutdown, |watch_event| {
+        .run(shutdown, move |watch_event| {
+            if json_output {
+                wrkflw_runs::emit_line(&json!({
+                    "schema_version": wrkflw_runs::SCHEMA_VERSION,
+                    "type": "watch_cycle",
+                    "changed_files": watch_event.changed_files,
+                    "triggered": watch_event.triggered_workflows,
+                    "skipped": watch_event.skipped_workflows,
+                    "dropped_events": watch_event.dropped_events,
+                    "warnings": watch_event.warnings,
+                    "error": watch_event.error,
+                }));
+                return;
+            }
             println!(
                 "\n{}",
                 cli_style::section(&format!(

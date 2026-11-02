@@ -792,6 +792,7 @@ pub(crate) async fn evaluate_and_execute(
             triggered.push(label);
 
             let exec_config = watcher.cfg.execution.clone();
+            let run_options = watcher.cfg.run_options.clone();
             let wf_path = result.workflow_path.clone();
             exec_futures.push(async move {
                 let log_path = wf_path.clone();
@@ -799,10 +800,17 @@ pub(crate) async fn evaluate_and_execute(
                 // from inside the executor so a single rogue workflow
                 // cannot kill the watch loop. See the type-level docs
                 // above for why we use this instead of `tokio::spawn`.
-                let outcome =
-                    AssertUnwindSafe(wrkflw_executor::execute_workflow(&wf_path, exec_config))
-                        .catch_unwind()
-                        .await;
+                let execution = async {
+                    match run_options {
+                        Some(options) => {
+                            wrkflw_runs::execute_recorded(&wf_path, exec_config, options)
+                                .await
+                                .result
+                        }
+                        None => wrkflw_executor::execute_workflow(&wf_path, exec_config).await,
+                    }
+                };
+                let outcome = AssertUnwindSafe(execution).catch_unwind().await;
                 match outcome {
                     Ok(Ok(exec_result)) => {
                         if exec_result.failure_details.is_some() {

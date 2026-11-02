@@ -10,6 +10,7 @@ pub mod dependency;
 pub mod docker;
 pub mod engine;
 pub mod environment;
+pub mod events;
 pub mod expression;
 pub mod github_env_files;
 pub mod kubernetes;
@@ -23,4 +24,5 @@ pub use engine::{
     detect_runtime, execute_workflow, parse_platform_override, ExecutionConfig, JobResult,
     JobStatus, RuntimeType, StepResult, StepStatus,
 };
+pub use events::{with_run_hooks, ExecutionEvent, ExecutionObserver, FromStep, RunHooks};
 pub use kubernetes::{parse_key_value as parse_k8s_key_value, KubernetesConfig};

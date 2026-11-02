@@ -1207,6 +1207,21 @@ impl StepResult {
             output,
         }
     }
+
+    /// The process exit code, when the step ran a process.
+    ///
+    /// Read from the `Exit code: N` line step execution writes before the
+    /// process's own output. Only the very first line counts: any later one
+    /// could be something the step printed.
+    pub fn exit_code(&self) -> Option<i32> {
+        self.output
+            .lines()
+            .next()?
+            .strip_prefix("Exit code: ")?
+            .trim()
+            .parse()
+            .ok()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -2507,6 +2522,13 @@ async fn execute_job_with_matrix(
     } else {
         HashMap::new()
     };
+    // Output is masked before it is shown or persisted, so the masker has to
+    // know every value this job can read.
+    if let Some(masker) = secret_masker {
+        for value in secrets_context.values().filter(|v| !v.is_empty()) {
+            masker.add_secret(value);
+        }
+    }
 
     if !job.services.is_empty() {
         wrkflw_logging::warning(&format!(
@@ -2685,12 +2707,18 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
     let timeout_mins = sanitize_timeout_minutes(job.timeout_minutes, 360.0);
     let job_timeout = std::time::Duration::from_secs_f64(timeout_mins * 60.0);
 
-    let mut loop_state = StepLoopState::new();
+    let mut loop_state = StepLoopState::new(ctx.job_name, ctx.job_name);
     let pending_cache_saves = std::sync::Mutex::new(Vec::<PendingCacheSave>::new());
 
     let job_deadline = tokio::time::Instant::now() + job_timeout;
+    let first_step = crate::events::first_step_for(ctx.job_name, &job.steps);
 
     for (idx, step) in job.steps.iter().enumerate() {
+        if crate::events::skipped_by_from_step(idx, first_step, step) {
+            loop_state.skip_step(idx, step);
+            continue;
+        }
+        loop_state.begin_step(idx, step);
         let remaining = job_deadline.saturating_duration_since(tokio::time::Instant::now());
 
         let outcome = match tokio::time::timeout(
@@ -2742,6 +2770,10 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
                 wrkflw_logging::error(&msg);
                 loop_state.job_logs.push_str(&format!("\n{}\n", msg));
                 job_success = false;
+                loop_state.emit_step_finished(
+                    &StepResult::new(step_display_name(step, idx), StepStatus::Failure, msg),
+                    Vec::new(),
+                );
                 break;
             }
         };
@@ -2775,6 +2807,9 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
         &current_dir,
     );
 
+    let failure_allowed = job_failure_allowed(job, &None, &job_env, &job_user_env, &ctx.services);
+    loop_state.emit_job_finished(job_success, failure_allowed);
+
     Ok(JobResult {
         name: ctx.job_name.to_string(),
         canonical_name: ctx.job_name.to_string(),
@@ -2786,7 +2821,7 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
         steps: loop_state.step_results,
         logs: loop_state.job_logs,
         outputs: job_outputs,
-        failure_allowed: job_failure_allowed(job, &None, &job_env, &job_user_env, &ctx.services),
+        failure_allowed,
     })
 }
 
@@ -2975,7 +3010,7 @@ async fn execute_matrix_job(
     let materialized_steps =
         crate::substitution::apply_matrix_to_steps(&job_template.steps, &combination.values);
 
-    let mut loop_state = StepLoopState::new();
+    let mut loop_state = StepLoopState::new(&matrix_job_name, job_name);
     let pending_cache_saves = std::sync::Mutex::new(Vec::<PendingCacheSave>::new());
     let job_success = if materialized_steps.is_empty() {
         wrkflw_logging::warning(&format!("Job '{}' has no steps", matrix_job_name));
@@ -2997,7 +3032,14 @@ async fn execute_matrix_job(
         let job_timeout = std::time::Duration::from_secs_f64(timeout_mins * 60.0);
         let job_deadline = tokio::time::Instant::now() + job_timeout;
 
+        let first_step = crate::events::first_step_for(job_name, &materialized_steps);
+
         for (idx, step) in materialized_steps.iter().enumerate() {
+            if crate::events::skipped_by_from_step(idx, first_step, step) {
+                loop_state.skip_step(idx, step);
+                continue;
+            }
+            loop_state.begin_step(idx, step);
             let remaining = job_deadline.saturating_duration_since(tokio::time::Instant::now());
 
             let outcome = match tokio::time::timeout(
@@ -3049,6 +3091,10 @@ async fn execute_matrix_job(
                     wrkflw_logging::error(&msg);
                     loop_state.job_logs.push_str(&format!("\n{}\n", msg));
                     all_steps_ok = false;
+                    loop_state.emit_step_finished(
+                        &StepResult::new(step_display_name(step, idx), StepStatus::Failure, msg),
+                        Vec::new(),
+                    );
                     break;
                 }
             };
@@ -3085,6 +3131,15 @@ async fn execute_matrix_job(
         &current_dir,
     );
 
+    let failure_allowed = job_failure_allowed(
+        job_template,
+        &Some(combination.values.clone()),
+        &job_env,
+        &job_user_env,
+        services,
+    );
+    loop_state.emit_job_finished(job_success, failure_allowed);
+
     // Return job result
     Ok(JobResult {
         name: matrix_job_name,
@@ -3097,13 +3152,7 @@ async fn execute_matrix_job(
         steps: loop_state.step_results,
         logs: loop_state.job_logs,
         outputs: job_outputs,
-        failure_allowed: job_failure_allowed(
-            job_template,
-            &Some(combination.values.clone()),
-            &job_env,
-            &job_user_env,
-            services,
-        ),
+        failure_allowed,
     })
 }
 
@@ -3190,17 +3239,106 @@ struct StepLoopState {
     step_outputs_map: HashMap<String, HashMap<String, String>>,
     step_status_map: HashMap<String, (String, String)>,
     job_status_str: String,
+    /// Display name of the job, reported on execution events.
+    job_label: String,
+    job_started: std::time::Instant,
+    step_started: std::time::Instant,
+    /// Index and definition summary of the step in flight.
+    current_step: Option<(usize, Option<String>, Option<String>)>,
 }
 
 impl StepLoopState {
-    fn new() -> Self {
+    fn new(job_label: &str, canonical_name: &str) -> Self {
+        crate::events::emit(|| crate::events::ExecutionEvent::JobStarted {
+            job: job_label.to_string(),
+            canonical_name: canonical_name.to_string(),
+        });
+        let now = std::time::Instant::now();
         Self {
             step_results: Vec::new(),
             job_logs: String::new(),
             step_outputs_map: HashMap::new(),
             step_status_map: HashMap::new(),
             job_status_str: "success".to_string(),
+            job_label: job_label.to_string(),
+            job_started: now,
+            step_started: now,
+            current_step: None,
         }
+    }
+
+    /// Mark `step` as in flight, so its finish event can report timing.
+    fn begin_step(&mut self, index: usize, step: &workflow::Step) {
+        let name = step
+            .name
+            .clone()
+            .unwrap_or_else(|| format!("Step {}", index + 1));
+        crate::events::emit(|| crate::events::ExecutionEvent::StepStarted {
+            job: self.job_label.clone(),
+            step: name,
+            index,
+        });
+        self.step_started = std::time::Instant::now();
+        self.current_step = Some((index, step.run.clone(), step.uses.clone()));
+    }
+
+    /// Report the step in flight as finished. `result.output` must already
+    /// be masked, because observers persist it.
+    fn emit_step_finished(&self, result: &StepResult, env_set: Vec<(String, String)>) {
+        let Some((index, command, uses)) = &self.current_step else {
+            return;
+        };
+        crate::events::emit(|| crate::events::ExecutionEvent::StepFinished {
+            job: self.job_label.clone(),
+            step: result.name.clone(),
+            index: *index,
+            status: result.status,
+            outcome: result.outcome,
+            conclusion: result.conclusion,
+            exit_code: result.exit_code(),
+            duration_ms: self.step_started.elapsed().as_millis() as u64,
+            output: result.output.clone(),
+            command: command.clone(),
+            uses: uses.clone(),
+            env_set,
+        });
+    }
+
+    /// Report the end of the job. Call once, after the step loop.
+    fn emit_job_finished(&self, success: bool, failure_allowed: bool) {
+        crate::events::emit(|| crate::events::ExecutionEvent::JobFinished {
+            job: self.job_label.clone(),
+            status: if success {
+                JobStatus::Success
+            } else {
+                JobStatus::Failure
+            },
+            failure_allowed,
+            duration_ms: self.job_started.elapsed().as_millis() as u64,
+            logs: self.job_logs.clone(),
+        });
+    }
+
+    /// Record a step `--from-step` skipped.
+    fn skip_step(&mut self, index: usize, step: &workflow::Step) {
+        self.begin_step(index, step);
+        let name = step
+            .name
+            .clone()
+            .unwrap_or_else(|| format!("Step {}", index + 1));
+        let result = StepResult::new(
+            name,
+            StepStatus::Skipped,
+            "Skipped by --from-step".to_string(),
+        );
+        self.emit_step_finished(&result, Vec::new());
+        record_step_status(
+            step.id.as_deref(),
+            &result,
+            &mut self.step_status_map,
+            &mut self.job_status_str,
+        );
+        self.step_results.push(result);
     }
 
     /// Process one step outcome: record status, log, parse workflow commands,
@@ -3216,6 +3354,7 @@ impl StepLoopState {
     ) -> bool {
         match outcome {
             StepOutcome::Skipped(result) => {
+                self.emit_step_finished(&result, Vec::new());
                 record_step_status(
                     step.id.as_deref(),
                     &result,
@@ -3225,13 +3364,29 @@ impl StepLoopState {
                 self.step_results.push(result);
                 false
             }
-            StepOutcome::Completed { result, abort_job } => {
+            StepOutcome::Completed {
+                mut result,
+                abort_job,
+            } => {
                 record_step_status(
                     step.id.as_deref(),
                     &result,
                     &mut self.step_status_map,
                     &mut self.job_status_str,
                 );
+
+                // Commands first: `::add-mask::` in this output must take
+                // effect on this output, and `::set-output::` needs the
+                // real value. Everything below only sees the masked text.
+                process_workflow_commands(
+                    &result.output,
+                    step.id.as_deref(),
+                    &mut self.step_outputs_map,
+                    secret_masker,
+                );
+                if let Some(masker) = secret_masker {
+                    result.output = masker.mask(&result.output);
+                }
 
                 if verbose || result.status == StepStatus::Failure {
                     self.job_logs.push_str(&format!(
@@ -3245,15 +3400,7 @@ impl StepLoopState {
                     ));
                 }
 
-                process_workflow_commands(
-                    &result.output,
-                    step.id.as_deref(),
-                    &mut self.step_outputs_map,
-                    secret_masker,
-                );
-
-                self.step_results.push(result);
-
+                let env_before = job_env.clone();
                 crate::github_env_files::apply_step_environment_updates(
                     job_env,
                     job_user_env,
@@ -3261,10 +3408,31 @@ impl StepLoopState {
                     step.id.as_deref(),
                 );
 
+                self.emit_step_finished(&result, changed_env(&env_before, job_env, secret_masker));
+                self.step_results.push(result);
+
                 abort_job
             }
         }
     }
+}
+
+/// Variables `after` adds or changes, with secrets masked, sorted by name.
+fn changed_env(
+    before: &HashMap<String, String>,
+    after: &HashMap<String, String>,
+    masker: Option<&SecretMasker>,
+) -> Vec<(String, String)> {
+    let mut changed: Vec<(String, String)> = after
+        .iter()
+        .filter(|(key, value)| before.get(*key) != Some(*value))
+        .map(|(key, value)| {
+            let shown = masker.map_or_else(|| value.clone(), |m| m.mask(value));
+            (key.clone(), shown)
+        })
+        .collect();
+    changed.sort();
+    changed
 }
 
 /// Record a step's outcome/conclusion in the status tracking map and update job status.
@@ -3467,6 +3635,13 @@ async fn run_step_with_guards(
             })
         }
     }
+}
+
+/// The name a step reports under: its `name:`, or its 1-based position.
+fn step_display_name(step: &Step, index: usize) -> String {
+    step.name
+        .clone()
+        .unwrap_or_else(|| format!("Step {}", index + 1))
 }
 
 /// Whether a `continue-on-error` value (`true`, `false` or an expression) holds.
@@ -4768,6 +4943,7 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
             Ok(container_output) => {
                 // Add command details to output (show resolved version so
                 // users can see expression substitutions were applied)
+                output.push_str(&format!("Exit code: {}\n", container_output.exit_code));
                 output.push_str(&format!("Command: {}\n\n", resolved_run));
 
                 if !container_output.stdout.is_empty() {

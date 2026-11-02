@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
 
+mod gate_cmd;
 mod json_output;
 mod mcp_cmd;
 mod plan_cmd;
@@ -42,6 +43,20 @@ pub(crate) enum RuntimeChoice {
     Emulation,
     /// Use secure emulation mode with sandboxing (recommended for untrusted code)
     SecureEmulation,
+}
+
+impl RuntimeChoice {
+    /// The value `--runtime` takes for this choice.
+    pub(crate) fn as_flag(&self) -> &'static str {
+        match self {
+            RuntimeChoice::Auto => "auto",
+            RuntimeChoice::Docker => "docker",
+            RuntimeChoice::Podman => "podman",
+            RuntimeChoice::Kubernetes => "kubernetes",
+            RuntimeChoice::Emulation => "emulation",
+            RuntimeChoice::SecureEmulation => "secure-emulation",
+        }
+    }
 }
 
 impl From<RuntimeChoice> for wrkflw_executor::RuntimeType {
@@ -348,6 +363,64 @@ enum Commands {
         /// skipped, except actions/checkout, so their outputs and files are missing
         #[arg(long, value_name = "STEP", requires = "job")]
         from_step: Option<String>,
+
+        /// Don't run a job whose fingerprint already passed. See .wrkflw/affected.yml
+        #[arg(long)]
+        reuse_results: bool,
+
+        /// Also skip jobs whose .wrkflw/affected.yml paths have no changed file.
+        /// Needs --event. Changed files come from --changed-files, or the git diff
+        #[arg(long, requires = "event")]
+        affected: bool,
+
+        /// Run a job's steps in one container instead of one per step
+        #[arg(long)]
+        job_container: bool,
+
+        /// Mount cargo, npm, pip and Go caches from the host into containers
+        #[arg(long)]
+        dep_cache: bool,
+
+        /// Directory or URL of shared results. Needs WRKFLW_CACHE_SIGNING_KEY
+        #[arg(long, env = "WRKFLW_REMOTE_CACHE", value_name = "LOCATION")]
+        remote_cache: Option<String>,
+
+        /// Upload passing results to --remote-cache
+        #[arg(long)]
+        cache_push: bool,
+    },
+
+    /// Run what a push would run, and fail if any of it fails.
+    ///
+    /// Each workflow that fires for the event runs with result reuse, a job
+    /// container and dependency caches. Use it before pushing, or as a hook.
+    Gate {
+        /// Directory or file of workflows (defaults to the detected directory)
+        path: Option<PathBuf>,
+
+        /// Event to simulate
+        #[arg(long, default_value = "push")]
+        event: String,
+
+        /// Target branch, for a pull_request event
+        #[arg(long)]
+        base_branch: Option<String>,
+
+        /// Compare against this ref (default: detected, as with --diff)
+        #[arg(long)]
+        diff_base: Option<String>,
+
+        /// Container runtime to use
+        #[arg(short, long, value_enum, default_value = "auto")]
+        runtime: RuntimeChoice,
+
+        /// Directory or URL of shared results. Needs WRKFLW_CACHE_SIGNING_KEY
+        #[arg(long, env = "WRKFLW_REMOTE_CACHE", value_name = "LOCATION")]
+        remote_cache: Option<String>,
+
+        /// Install this as the repository's pre-push hook, then exit
+        #[arg(long)]
+        install_hook: bool,
     },
 
     /// Watch for file changes and re-run affected workflows.
@@ -946,6 +1019,12 @@ async fn main() {
             agent,
             no_record,
             from_step,
+            reuse_results,
+            affected,
+            job_container,
+            dep_cache,
+            remote_cache,
+            cache_push,
         }) => {
             run_workflow_cmd::run(run_workflow_cmd::RunCtx {
                 path: path.clone(),
@@ -972,6 +1051,12 @@ async fn main() {
                 agent: agent.clone(),
                 no_record: *no_record,
                 from_step: from_step.clone(),
+                reuse_results: *reuse_results,
+                affected: *affected,
+                job_container: *job_container,
+                dep_cache: *dep_cache,
+                remote_cache: remote_cache.clone(),
+                cache_push: *cache_push,
             })
             .await;
         }
@@ -1074,6 +1159,25 @@ async fn main() {
             } else {
                 list_workflows_and_pipelines(verbose, *jobs);
             }
+        }
+        Some(Commands::Gate {
+            path,
+            event,
+            base_branch,
+            diff_base,
+            runtime,
+            remote_cache,
+            install_hook,
+        }) => {
+            gate_cmd::run(gate_cmd::GateCtx {
+                path: path.clone(),
+                event: event.clone(),
+                base_branch: base_branch.clone(),
+                diff_base: diff_base.clone(),
+                runtime: runtime.clone(),
+                remote_cache: remote_cache.clone(),
+                install_hook: *install_hook,
+            });
         }
         Some(Commands::Plan {
             path,

@@ -651,6 +651,10 @@ pub async fn create_job_network(docker: &Docker) -> Result<String, ContainerErro
 
 #[async_trait]
 impl ContainerRuntime for DockerRuntime {
+    fn session_cli(&self) -> Option<&'static str> {
+        Some("docker")
+    }
+
     async fn run_container(
         &self,
         image: &str,

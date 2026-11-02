@@ -22,6 +22,7 @@ async fn run_in(
     let path = dir.path().join(".gitlab-ci.yml");
     fs::write(&path, yaml).unwrap();
     let cfg = ExecutionConfig {
+        acceleration: Default::default(),
         runtime_type,
         verbose: false,
         preserve_containers_on_failure: false,

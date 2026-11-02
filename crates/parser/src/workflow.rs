@@ -261,6 +261,9 @@ pub struct Job {
         serialize_with = "serialize_bool_or_expression"
     )]
     pub continue_on_error: Option<String>,
+    /// A group name, or a mapping with `group` and `cancel-in-progress`.
+    #[serde(default)]
+    pub concurrency: Option<serde_yaml::Value>,
 }
 
 impl Job {

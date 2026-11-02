@@ -474,6 +474,10 @@ pub async fn cleanup_containers() -> Result<(), String> {
 
 #[async_trait]
 impl ContainerRuntime for PodmanRuntime {
+    fn session_cli(&self) -> Option<&'static str> {
+        Some("podman")
+    }
+
     async fn run_container(
         &self,
         image: &str,

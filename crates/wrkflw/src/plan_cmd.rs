@@ -44,7 +44,7 @@ async fn trigger(ctx: &PlanCtx) -> Result<Value, String> {
     .await?;
     let event = ctx.event.clone().unwrap_or_else(|| "push".to_string());
     Ok(match decision {
-        prefilter::PrefilterDecision::Proceed { reason } => {
+        prefilter::PrefilterDecision::Proceed { reason, .. } => {
             json!({"event": event, "matches": true, "reason": reason})
         }
         prefilter::PrefilterDecision::Skip { reason } => {

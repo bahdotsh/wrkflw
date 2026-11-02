@@ -35,6 +35,7 @@ jobs:
     // Run only the "test" job — should include "build" (dependency) and "test",
     // but NOT "deploy".
     let cfg = ExecutionConfig {
+        acceleration: Default::default(),
         runtime_type: RuntimeType::Emulation,
         verbose: false,
         preserve_containers_on_failure: false,
@@ -79,6 +80,7 @@ jobs:
     write_file(&workflow_path, workflow);
 
     let cfg = ExecutionConfig {
+        acceleration: Default::default(),
         runtime_type: RuntimeType::Emulation,
         verbose: false,
         preserve_containers_on_failure: false,
@@ -130,6 +132,7 @@ jobs:
 
     // Target "lint" which has no dependencies — only lint should run
     let cfg = ExecutionConfig {
+        acceleration: Default::default(),
         runtime_type: RuntimeType::Emulation,
         verbose: false,
         preserve_containers_on_failure: false,

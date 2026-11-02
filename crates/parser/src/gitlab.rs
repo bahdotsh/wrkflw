@@ -1023,6 +1023,7 @@ pub fn convert_to_workflow_format(pipeline: &Pipeline) -> workflow::WorkflowDefi
                     working_directory: None,
                 }),
             }),
+            concurrency: None,
             continue_on_error: matches!(gitlab_job.allow_failure, Some(AllowFailure::Bool(true)))
                 .then(|| CONTINUE_ON_ERROR_ALWAYS.to_string()),
         };

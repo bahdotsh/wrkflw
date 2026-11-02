@@ -402,6 +402,9 @@ async fn execute_gitlab_pipeline(
     };
 
     let secret_masker = SecretMasker::new();
+    // `--variable` values are often credentials, and they are never stored
+    // on purpose, so they can't be left to reach the step logs either.
+    secret_masker.add_secrets(config.variables.values().cloned());
 
     // Create artifact store for this pipeline run
     let artifact_store =

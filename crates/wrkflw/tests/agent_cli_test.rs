@@ -315,6 +315,30 @@ fn variables_are_not_stored_and_replay_keeps_the_arguments() {
 }
 
 #[test]
+fn variable_values_printed_by_a_step_are_masked() {
+    let sandbox = Sandbox::new();
+    fs::write(
+        sandbox.repo.path().join(".gitlab-ci.yml"),
+        "stages: [test]\nunit:\n  stage: test\n  script:\n    - echo \"key is $API_KEY\"\n",
+    )
+    .unwrap();
+    let output = sandbox.run(&[
+        "--format",
+        "json",
+        "run",
+        "--runtime",
+        "emulation",
+        "-V",
+        "API_KEY=topsecretvalue",
+        ".gitlab-ci.yml",
+    ]);
+    let events = stdout(&output);
+    assert!(events.contains("key is ***"), "{events}");
+    assert!(!events.contains("topsecretvalue"));
+    assert!(!sandbox.stored_text().contains("topsecretvalue"));
+}
+
+#[test]
 fn no_record_leaves_no_history_but_keeps_the_digest() {
     let sandbox = Sandbox::new();
     let output = sandbox

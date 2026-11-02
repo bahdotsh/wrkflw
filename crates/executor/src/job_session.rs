@@ -124,6 +124,9 @@ struct State {
     busy: bool,
     /// Starting failed for a reason other than the services, so don't retry.
     unusable: bool,
+    /// A service failed to start. Every later step fails with this, so an
+    /// `if: always()` step doesn't wait for the same service all over again.
+    failed: Option<String>,
 }
 
 pub(crate) struct JobSession {
@@ -156,14 +159,39 @@ fn track(cli: &str, id: &str) {
 
 /// Variables the CLI itself reads. Handing these over through the CLI's own
 /// environment would point it at another daemon or binary, so they go in
-/// `argv`. Everything else goes by name, which keeps secrets out of `ps`.
+/// `argv`. Everything else goes by name, which keeps secrets out of `ps`, so
+/// this is an exact list: a prefix would catch `DOCKER_PASSWORD`.
 fn reaches_the_cli(name: &str) -> bool {
-    matches!(name, "PATH" | "HOME" | "TMPDIR" | "USER" | "LOGNAME")
-        || name.starts_with("DOCKER_")
-        || name.starts_with("CONTAINER")
-        || name.starts_with("PODMAN_")
-        || name.starts_with("XDG_")
-        || name.starts_with("SSL_")
+    matches!(
+        name,
+        "PATH"
+            | "HOME"
+            | "TMPDIR"
+            | "USER"
+            | "LOGNAME"
+            | "DOCKER_API_VERSION"
+            | "DOCKER_CERT_PATH"
+            | "DOCKER_CLI_HOME"
+            | "DOCKER_CONFIG"
+            | "DOCKER_CONTEXT"
+            | "DOCKER_DEFAULT_PLATFORM"
+            | "DOCKER_HOST"
+            | "DOCKER_TLS"
+            | "DOCKER_TLS_VERIFY"
+            | "CONTAINER_CONNECTION"
+            | "CONTAINER_HOST"
+            | "CONTAINER_SSHKEY"
+            | "CONTAINERS_CONF"
+            | "CONTAINERS_REGISTRIES_CONF"
+            | "CONTAINERS_STORAGE_CONF"
+            | "PODMAN_USERNS"
+            | "SSL_CERT_DIR"
+            | "SSL_CERT_FILE"
+            | "XDG_CACHE_HOME"
+            | "XDG_CONFIG_HOME"
+            | "XDG_DATA_HOME"
+            | "XDG_RUNTIME_DIR"
+    )
 }
 
 /// The `-e` flags for `env`.
@@ -439,6 +467,9 @@ impl JobSession {
             .map(|(host, container)| (host.to_path_buf(), container.to_path_buf()))
             .collect();
         let mut state = self.state.lock().await;
+        if let Some(message) = &state.failed {
+            return Err(message.clone());
+        }
         if state.unusable {
             return Ok(None);
         }
@@ -457,7 +488,10 @@ impl JobSession {
                     state.unusable = true;
                     return Ok(None);
                 }
-                Err(e) => return Err(e),
+                Err(e) => {
+                    state.failed = Some(e.clone());
+                    return Err(e);
+                }
             }
         }
         let Some(live) = &state.live else {
@@ -475,10 +509,9 @@ impl JobSession {
         let output = cli_output(self.cli, &args, |command| {
             set_named_env(command, env.iter().copied())
         })
-        .await
-        .map_err(|e| e.to_string())?;
+        .await;
         state.busy = false;
-        Ok(Some(output))
+        output.map(Some).map_err(|e| e.to_string())
     }
 }
 
@@ -536,6 +569,139 @@ mod tests {
         let passed: Vec<_> = command.as_std().get_envs().collect();
         assert_eq!(passed.len(), 1);
         assert_eq!(passed[0].0, "TOKEN");
+    }
+
+    #[test]
+    fn credentials_with_a_cli_prefix_stay_out_of_argv() {
+        for name in [
+            "DOCKER_PASSWORD",
+            "DOCKER_TOKEN",
+            "DOCKERHUB_TOKEN",
+            "CONTAINER_REGISTRY_PASSWORD",
+            "PODMAN_PASSWORD",
+            "SSL_KEY_PASSPHRASE",
+            "XDG_SECRET",
+        ] {
+            assert_eq!(env_flags([(name, "hunter2")].into_iter()), ["-e", name]);
+        }
+    }
+
+    /// A stand-in CLI that logs its arguments and answers like docker, apart
+    /// from anything `fails` matches.
+    #[cfg(unix)]
+    fn fake_cli(dir: &Path, fails: &str) -> (&'static str, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let log = dir.join("calls");
+        let script = dir.join("cli");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\necho \"$1 $*\" >> '{}'\ncase \"$*\" in\n{}) exit 1;;\nrm*) exit 0;;\ninspect*) echo running; exit 0;;\nexec*) echo step; exit 0;;\nesac\necho id-$$\n",
+                log.display(),
+                fails
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let cli: &'static str = Box::leak(script.display().to_string().into_boxed_str());
+        (cli, log)
+    }
+
+    #[cfg(unix)]
+    fn session(cli: &'static str, services: Vec<ServiceSpec>) -> JobSession {
+        JobSession {
+            cli,
+            services,
+            state: tokio::sync::Mutex::new(State::default()),
+        }
+    }
+
+    #[cfg(unix)]
+    fn db_service() -> ServiceSpec {
+        ServiceSpec {
+            name: "db".to_string(),
+            image: "postgres:16".to_string(),
+            env: HashMap::new(),
+            volumes: vec![],
+            options: None,
+            ports: vec![],
+        }
+    }
+
+    #[cfg(unix)]
+    async fn step(session: &JobSession, image: &str) -> Result<Option<ContainerOutput>, String> {
+        session
+            .run(image, &["true"], &[], Path::new("/w"), &[], &|v| {
+                v.to_string()
+            })
+            .await
+    }
+
+    #[cfg(unix)]
+    fn calls(log: &Path, verb: &str) -> usize {
+        std::fs::read_to_string(log)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| line.starts_with(&format!("{} ", verb)))
+            .count()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn steps_share_one_container() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cli, log) = fake_cli(dir.path(), "nothing-fails");
+        let session = session(cli, vec![]);
+        assert!(step(&session, "ubuntu").await.unwrap().is_some());
+        assert!(step(&session, "ubuntu").await.unwrap().is_some());
+        assert_eq!(calls(&log, "run"), 1);
+        assert_eq!(calls(&log, "exec"), 2);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn another_image_falls_back_to_its_own_container() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cli, log) = fake_cli(dir.path(), "nothing-fails");
+        let session = session(cli, vec![]);
+        step(&session, "ubuntu").await.unwrap();
+        assert!(step(&session, "alpine").await.unwrap().is_none());
+        assert_eq!(calls(&log, "exec"), 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_start_failure_without_services_falls_back_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cli, log) = fake_cli(dir.path(), "run*");
+        let session = session(cli, vec![]);
+        assert!(step(&session, "ubuntu").await.unwrap().is_none());
+        assert!(step(&session, "ubuntu").await.unwrap().is_none());
+        assert_eq!(calls(&log, "run"), 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_service_failure_fails_every_step_without_retrying() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cli, log) = fake_cli(dir.path(), "run*postgres*");
+        let session = session(cli, vec![db_service()]);
+        let first = step(&session, "ubuntu").await.unwrap_err();
+        assert!(first.contains("didn't start"), "{}", first);
+        assert_eq!(step(&session, "ubuntu").await.unwrap_err(), first);
+        assert_eq!(calls(&log, "run"), 2);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_cancelled_step_retires_its_container() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cli, log) = fake_cli(dir.path(), "nothing-fails");
+        let session = session(cli, vec![]);
+        step(&session, "ubuntu").await.unwrap();
+        session.state.lock().await.busy = true;
+        step(&session, "ubuntu").await.unwrap();
+        assert_eq!(calls(&log, "run"), 2);
     }
 
     #[test]

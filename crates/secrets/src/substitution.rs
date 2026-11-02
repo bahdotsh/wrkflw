@@ -1,4 +1,4 @@
-use crate::{SecretManager, SecretResult};
+use crate::{SecretError, SecretManager, SecretResult};
 use regex::Regex;
 use std::collections::HashMap;
 
@@ -18,6 +18,7 @@ lazy_static::lazy_static! {
 pub struct SecretSubstitution<'a> {
     manager: &'a SecretManager,
     resolved_secrets: HashMap<String, String>,
+    allow_missing: bool,
 }
 
 impl<'a> SecretSubstitution<'a> {
@@ -26,6 +27,27 @@ impl<'a> SecretSubstitution<'a> {
         Self {
             manager,
             resolved_secrets: HashMap::new(),
+            allow_missing: false,
+        }
+    }
+
+    /// Like [`Self::new`], but a secret no provider has expands to an empty
+    /// string, as it does on GitHub. Any other provider failure is still an
+    /// error, because that secret may well exist.
+    pub fn allowing_missing(manager: &'a SecretManager) -> Self {
+        Self {
+            allow_missing: true,
+            ..Self::new(manager)
+        }
+    }
+
+    /// The value of a lookup, or an empty one for a secret that is allowed
+    /// to be missing.
+    fn value_of(&self, lookup: SecretResult<crate::SecretValue>) -> SecretResult<String> {
+        match lookup {
+            Ok(secret) => Ok(secret.value().to_string()),
+            Err(SecretError::NotFound { .. }) if self.allow_missing => Ok(String::new()),
+            Err(e) => Err(e),
         }
     }
 
@@ -56,11 +78,11 @@ impl<'a> SecretSubstitution<'a> {
             let secret_value = if let Some(cached) = self.resolved_secrets.get(&cache_key) {
                 cached.clone()
             } else {
-                let secret = self
+                let lookup = self
                     .manager
                     .get_secret_from_provider(provider, secret_name)
-                    .await?;
-                let value = secret.value().to_string();
+                    .await;
+                let value = self.value_of(lookup)?;
                 self.resolved_secrets.insert(cache_key, value.clone());
                 value
             };
@@ -82,8 +104,8 @@ impl<'a> SecretSubstitution<'a> {
             let secret_value = if let Some(cached) = self.resolved_secrets.get(secret_name) {
                 cached.clone()
             } else {
-                let secret = self.manager.get_secret(secret_name).await?;
-                let value = secret.value().to_string();
+                let lookup = self.manager.get_secret(secret_name).await;
+                let value = self.value_of(lookup)?;
                 self.resolved_secrets
                     .insert(secret_name.to_string(), value.clone());
                 value
@@ -150,6 +172,23 @@ pub struct SecretRef {
 }
 
 impl SecretRef {
+    /// How to name this secret to a person: `API_KEY`, or `vault:API_KEY`
+    /// when it comes from a specific provider.
+    pub fn qualified_name(&self) -> String {
+        match &self.provider {
+            Some(provider) => format!("{}:{}", provider, self.name),
+            None => self.name.clone(),
+        }
+    }
+
+    /// Look this secret up where the reference says it lives.
+    pub async fn lookup(&self, manager: &SecretManager) -> SecretResult<crate::SecretValue> {
+        match &self.provider {
+            Some(provider) => manager.get_secret_from_provider(provider, &self.name).await,
+            None => manager.get_secret(&self.name).await,
+        }
+    }
+
     /// Get the cache key for this secret reference
     pub fn cache_key(&self) -> String {
         match &self.provider {
@@ -219,6 +258,35 @@ mod tests {
         let vault_ref = &refs.iter().find(|r| r.name == "API_KEY").unwrap();
         assert_eq!(vault_ref.provider, Some("vault".to_string()));
         assert_eq!(vault_ref.full_text, "${{ secrets.vault:API_KEY }}");
+    }
+
+    #[tokio::test]
+    async fn missing_secrets_are_empty_only_when_allowed() {
+        let name = format!("WRKFLW_UNSET_{}", std::process::id());
+        let text = format!("[${{{{ secrets.{name} }}}}]");
+        let manager = SecretManager::default().await.unwrap();
+
+        let error = SecretSubstitution::new(&manager)
+            .substitute(&text)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, SecretError::NotFound { .. }));
+
+        let result = SecretSubstitution::allowing_missing(&manager)
+            .substitute(&text)
+            .await
+            .unwrap();
+        assert_eq!(result, "[]");
+    }
+
+    #[tokio::test]
+    async fn only_a_missing_secret_is_allowed() {
+        let manager = SecretManager::default().await.unwrap();
+        let error = SecretSubstitution::allowing_missing(&manager)
+            .substitute("${{ secrets.no_such_provider:TOKEN }}")
+            .await
+            .unwrap_err();
+        assert!(matches!(error, SecretError::ProviderNotFound { .. }));
     }
 
     #[tokio::test]

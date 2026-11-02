@@ -3,7 +3,7 @@ use bollard::Docker;
 use futures::future;
 use once_cell::sync::Lazy;
 use serde_yaml::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -16,6 +16,7 @@ use crate::action_resolver;
 use crate::dependency;
 use crate::docker;
 use crate::environment;
+use crate::events::{step_display_name, EXIT_CODE_LABEL, STDERR_HEADER, STDOUT_HEADER};
 use crate::kubernetes::{self, KubernetesConfig};
 use crate::podman;
 use wrkflw_logging;
@@ -2514,10 +2515,10 @@ async fn execute_job_with_matrix(
     }
 
     // Pre-resolve secrets once for this job (shared across matrix combinations and non-matrix path)
-    let secrets_context: HashMap<String, String> = if let Some(secret_mgr) = secret_manager {
+    let (secrets_context, missing_secrets) = if let Some(secret_mgr) = secret_manager {
         resolve_secrets_for_context(secret_mgr, job).await
     } else {
-        HashMap::new()
+        (HashMap::new(), HashSet::new())
     };
     // Output is masked before it is shown or persisted, so the masker has to
     // know every value this job can read.
@@ -2584,6 +2585,7 @@ async fn execute_job_with_matrix(
             secret_manager,
             secret_masker,
             secrets_context: &secrets_context,
+            missing_secrets: &missing_secrets,
             needs_context: &needs_ctx,
             needs_results: &needs_res,
             artifact_store,
@@ -2612,6 +2614,7 @@ async fn execute_job_with_matrix(
             secret_manager,
             secret_masker,
             secrets_context: &secrets_context,
+            missing_secrets: &missing_secrets,
             needs_context: &needs_ctx,
             needs_results: &needs_res,
             artifact_store,
@@ -2704,7 +2707,8 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
     let timeout_mins = sanitize_timeout_minutes(job.timeout_minutes, 360.0);
     let job_timeout = std::time::Duration::from_secs_f64(timeout_mins * 60.0);
 
-    let mut loop_state = StepLoopState::new(ctx.job_name, ctx.job_name);
+    let mut loop_state = StepLoopState::new(ctx.job_name, ctx.job_name)
+        .with_job_context(job_dir.path(), ctx.services.missing_secrets);
     let pending_cache_saves = std::sync::Mutex::new(Vec::<PendingCacheSave>::new());
 
     let job_deadline = tokio::time::Instant::now() + job_timeout;
@@ -2746,6 +2750,7 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
                         secret_manager: ctx.services.secret_manager,
                         secret_masker: ctx.services.secret_masker,
                         secrets_context: ctx.services.secrets_context,
+                        missing_secrets: ctx.services.missing_secrets,
                         needs_context: ctx.services.needs_context,
                         needs_results: ctx.services.needs_results,
                         artifact_store: ctx.services.artifact_store,
@@ -3002,7 +3007,8 @@ async fn execute_matrix_job(
     let materialized_steps =
         crate::substitution::apply_matrix_to_steps(&job_template.steps, &combination.values);
 
-    let mut loop_state = StepLoopState::new(&matrix_job_name, job_name);
+    let mut loop_state = StepLoopState::new(&matrix_job_name, job_name)
+        .with_job_context(job_dir.path(), services.missing_secrets);
     let pending_cache_saves = std::sync::Mutex::new(Vec::<PendingCacheSave>::new());
     let job_success = if materialized_steps.is_empty() {
         wrkflw_logging::warning(&format!("Job '{}' has no steps", matrix_job_name));
@@ -3062,6 +3068,7 @@ async fn execute_matrix_job(
                             secret_manager: services.secret_manager,
                             secret_masker: services.secret_masker,
                             secrets_context: services.secrets_context,
+                            missing_secrets: services.missing_secrets,
                             needs_context: services.needs_context,
                             needs_results: services.needs_results,
                             artifact_store: services.artifact_store,
@@ -3171,6 +3178,11 @@ pub(crate) struct JobServices<'a> {
     pub secret_masker: Option<&'a SecretMasker>,
     /// Pre-resolved secrets for expression context (resolved once per job).
     pub secrets_context: &'a HashMap<String, String>,
+    /// Secrets no provider has, by [`SecretRef::qualified_name`]. A provider
+    /// that failed some other way may well have the secret, so it isn't here.
+    ///
+    /// [`SecretRef::qualified_name`]: wrkflw_secrets::SecretRef::qualified_name
+    pub missing_secrets: &'a HashSet<String>,
     /// Job outputs from upstream jobs: `job_name -> { output_key -> output_value }`.
     pub needs_context: &'a HashMap<String, HashMap<String, String>>,
     /// Job results from upstream jobs: `job_name -> "success" | "failure" | "skipped"`.
@@ -3231,6 +3243,10 @@ struct StepLoopState {
     job_started: std::time::Instant,
     step_started: std::time::Instant,
     current_step: Option<InFlightStep>,
+    /// Prefixes dropped from reported output, so paths are repo-relative.
+    workspace_prefixes: Vec<String>,
+    /// Secrets the job reads that no provider has.
+    missing_secrets: HashSet<String>,
 }
 
 /// The step being executed, as its finish event reports it.
@@ -3257,7 +3273,24 @@ impl StepLoopState {
             job_started: now,
             step_started: now,
             current_step: None,
+            workspace_prefixes: Vec::new(),
+            missing_secrets: HashSet::new(),
         }
+    }
+
+    /// Tell the loop what it needs to make reported output readable.
+    fn with_job_context(mut self, workspace: &Path, missing_secrets: &HashSet<String>) -> Self {
+        self.workspace_prefixes = workspace_prefixes(workspace);
+        self.missing_secrets = missing_secrets.clone();
+        self
+    }
+
+    /// `output` with workspace paths made relative. Each job has a throwaway
+    /// workspace, so the absolute path means nothing once the job is over.
+    fn relative_to_workspace(&self, output: &str) -> String {
+        self.workspace_prefixes
+            .iter()
+            .fold(output.to_string(), |text, prefix| text.replace(prefix, ""))
     }
 
     /// Mark `step` as in flight, so its finish event can report timing.
@@ -3290,7 +3323,7 @@ impl StepLoopState {
             conclusion: result.conclusion,
             exit_code: result.exit_code,
             duration_ms: self.step_started.elapsed().as_millis() as u64,
-            output: result.output.clone(),
+            output: self.relative_to_workspace(&result.output),
             command: current.command.clone(),
             uses: current.uses.clone(),
             env_set,
@@ -3391,6 +3424,9 @@ impl StepLoopState {
                 );
                 if let Some(masker) = secret_masker {
                     result.output = masker.mask(&result.output);
+                }
+                if let Some(note) = missing_secrets_note(step, &self.missing_secrets) {
+                    result.output = format!("{}\n{}\n", result.output.trim_end(), note);
                 }
 
                 if verbose || result.status == StepStatus::Failure {
@@ -3543,10 +3579,7 @@ async fn run_step_with_guards(
     workflow: &WorkflowDefinition,
     step_exec_ctx: StepExecutionContext<'_>,
 ) -> Result<StepOutcome, ExecutionError> {
-    let step_name = step
-        .name
-        .clone()
-        .unwrap_or_else(|| format!("Step {}", step_idx + 1));
+    let step_name = step_display_name(step, step_idx);
 
     // Check step-level if condition
     if let Some(if_cond) = &step.if_condition {
@@ -3643,11 +3676,55 @@ async fn run_step_with_guards(
     }
 }
 
-/// The name a step reports under: its `name:`, or its 1-based position.
-fn step_display_name(step: &Step, index: usize) -> String {
-    step.name
-        .clone()
-        .unwrap_or_else(|| format!("Step {}", index + 1))
+/// Paths a job's workspace appears under in step output: the directory on
+/// this machine, resolved and not, and its fixed location in a container.
+fn workspace_prefixes(workspace: &Path) -> Vec<String> {
+    let mut prefixes = vec!["/github/workspace/".to_string()];
+    let resolved = workspace.canonicalize().ok();
+    for path in resolved.as_deref().into_iter().chain([workspace]) {
+        let prefix = format!("{}/", path.display());
+        if !prefixes.contains(&prefix) {
+            prefixes.push(prefix);
+        }
+    }
+    prefixes
+}
+
+/// The parts of `step` that can read a secret.
+fn step_texts(step: &Step) -> impl Iterator<Item = &String> {
+    step.run
+        .iter()
+        .chain(step.if_condition.iter())
+        .chain(step.env.values())
+        .chain(step.with.iter().flat_map(|with| with.values()))
+}
+
+/// A line naming the secrets `step` reads that no provider has, because an
+/// empty value is otherwise a confusing way for a step to fail.
+fn missing_secrets_note(step: &Step, missing: &HashSet<String>) -> Option<String> {
+    let mut names: Vec<String> = step_texts(step)
+        .flat_map(|text| SecretSubstitution::extract_secret_refs(text))
+        .map(|secret| secret.qualified_name())
+        .filter(|name| missing.contains(name))
+        .collect();
+    names.sort();
+    names.dedup();
+    if names.is_empty() {
+        return None;
+    }
+    let (qualified, plain): (Vec<&String>, Vec<&String>) =
+        names.iter().partition(|name| name.contains(':'));
+    let mut note = format!(
+        "Warning: not set, so empty in this step: {}.",
+        names.join(", ")
+    );
+    if !plain.is_empty() {
+        note.push_str(" Set an environment variable of the same name to provide a value.");
+    }
+    if !qualified.is_empty() {
+        note.push_str(" Add a `provider:NAME` secret to that provider to provide a value.");
+    }
+    Some(note)
 }
 
 /// Whether a `continue-on-error` value (`true`, `false` or an expression) holds.
@@ -4186,11 +4263,7 @@ async fn handle_cache_action(
 }
 
 async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, ExecutionError> {
-    let step_name = ctx
-        .step
-        .name
-        .clone()
-        .unwrap_or_else(|| format!("Step {}", ctx.step_idx + 1));
+    let step_name = step_display_name(ctx.step, ctx.step_idx);
 
     if ctx.verbose {
         wrkflw_logging::info(&format!("  Executing step: {}", step_name));
@@ -4205,7 +4278,7 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
     // Add step-level environment variables (with secret + expression substitution)
     for (key, value) in &ctx.step.env {
         let resolved_value = if let Some(secret_manager) = ctx.services.secret_manager {
-            let mut substitution = SecretSubstitution::new(secret_manager);
+            let mut substitution = SecretSubstitution::allowing_missing(secret_manager);
             match substitution.substitute(value).await {
                 Ok(resolved) => resolved,
                 Err(e) => {
@@ -4773,7 +4846,7 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
 
         // Perform secret substitution if secret manager is available
         let resolved_run = if let Some(secret_manager) = ctx.services.secret_manager {
-            let mut substitution = SecretSubstitution::new(secret_manager);
+            let mut substitution = SecretSubstitution::allowing_missing(secret_manager);
             match substitution.substitute(run).await {
                 Ok(resolved) => resolved,
                 Err(e) => {
@@ -4952,17 +5025,20 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                 exit_code = Some(container_output.exit_code);
                 // Add command details to output (show resolved version so
                 // users can see expression substitutions were applied)
-                output.push_str(&format!("Exit code: {}\n", container_output.exit_code));
+                output.push_str(&format!(
+                    "{EXIT_CODE_LABEL} {}\n",
+                    container_output.exit_code
+                ));
                 output.push_str(&format!("Command: {}\n\n", resolved_run));
 
                 if !container_output.stdout.is_empty() {
-                    output.push_str("Standard Output:\n");
+                    output.push_str(&format!("{STDOUT_HEADER}\n"));
                     output.push_str(&container_output.stdout);
                     output.push('\n');
                 }
 
                 if !container_output.stderr.is_empty() {
-                    output.push_str("Standard Error:\n");
+                    output.push_str(&format!("{STDERR_HEADER}\n"));
                     output.push_str(&container_output.stderr);
                     output.push('\n');
                 }
@@ -6094,6 +6170,7 @@ async fn execute_composite_action(
                         secret_manager: services.secret_manager,
                         secret_masker: services.secret_masker,
                         secrets_context: services.secrets_context,
+                        missing_secrets: services.missing_secrets,
                         needs_context: services.needs_context,
                         needs_results: services.needs_results,
                         artifact_store: services.artifact_store,
@@ -6865,31 +6942,18 @@ fn resolve_job_outputs(
 async fn resolve_secrets_for_context(
     secret_manager: &SecretManager,
     job: &Job,
-) -> HashMap<String, String> {
-    use wrkflw_secrets::SecretSubstitution;
+) -> (HashMap<String, String>, HashSet<String>) {
+    use wrkflw_secrets::{SecretError, SecretSubstitution};
 
     let mut secrets = HashMap::new();
+    let mut missing = HashSet::new();
     let mut all_text = String::new();
 
     // Collect all text that might contain secrets references
     for step in &job.steps {
-        if let Some(run) = &step.run {
-            all_text.push_str(run);
+        for text in step_texts(step) {
+            all_text.push_str(text);
             all_text.push('\n');
-        }
-        if let Some(cond) = &step.if_condition {
-            all_text.push_str(cond);
-            all_text.push('\n');
-        }
-        for value in step.env.values() {
-            all_text.push_str(value);
-            all_text.push('\n');
-        }
-        if let Some(with) = &step.with {
-            for value in with.values() {
-                all_text.push_str(value);
-                all_text.push('\n');
-            }
         }
     }
     // Also check job-level if condition and env
@@ -6911,29 +6975,30 @@ async fn resolve_secrets_for_context(
 
     // Extract secret names and resolve them
     let refs = SecretSubstitution::extract_secret_refs(&all_text);
+    let mut seen = HashSet::new();
     for secret_ref in refs {
-        let name = &secret_ref.name;
-        if secrets.contains_key(name) {
+        let qualified = secret_ref.qualified_name();
+        if !seen.insert(qualified.clone()) {
             continue;
         }
-        let result = if let Some(provider) = &secret_ref.provider {
-            secret_manager
-                .get_secret_from_provider(provider, name)
-                .await
-        } else {
-            secret_manager.get_secret(name).await
-        };
-        match result {
+        match secret_ref.lookup(secret_manager).await {
             Ok(value) => {
-                secrets.insert(name.clone(), value.value().to_string());
+                secrets
+                    .entry(secret_ref.name)
+                    .or_insert_with(|| value.value().to_string());
+            }
+            Err(SecretError::NotFound { .. }) => {
+                // Leave it out so the expression resolves to Null.
+                missing.insert(qualified);
             }
             Err(_) => {
-                // Secret not found — leave it out so expression resolves to Null
+                // Not known to be missing, and the step using it reports the
+                // real failure when it substitutes the secret.
             }
         }
     }
 
-    secrets
+    (secrets, missing)
 }
 
 #[cfg(test)]
@@ -6995,6 +7060,7 @@ mod tests {
         static ref TEST_PENDING_CACHE_SAVES: std::sync::Mutex<Vec<PendingCacheSave>> =
             std::sync::Mutex::new(Vec::new());
         static ref EMPTY_SECRETS: HashMap<String, String> = HashMap::new();
+        static ref EMPTY_MISSING_SECRETS: HashSet<String> = HashSet::new();
         static ref EMPTY_PLATFORM_OVERRIDES: HashMap<String, String> = HashMap::new();
         static ref EMPTY_NEEDS: HashMap<String, HashMap<String, String>> = HashMap::new();
         static ref EMPTY_NEEDS_RESULTS: HashMap<String, String> = HashMap::new();
@@ -7005,6 +7071,7 @@ mod tests {
             secret_manager: None,
             secret_masker: None,
             secrets_context: &EMPTY_SECRETS,
+            missing_secrets: &EMPTY_MISSING_SECRETS,
             needs_context: &EMPTY_NEEDS,
             needs_results: &EMPTY_NEEDS_RESULTS,
             artifact_store: &TEST_ARTIFACT_STORE,
@@ -11302,6 +11369,7 @@ runs:
                 secret_manager: None,
                 secret_masker: None,
                 secrets_context: &HashMap::new(),
+                missing_secrets: &HashSet::new(),
                 needs_context: &HashMap::new(),
                 needs_results: &HashMap::new(),
                 artifact_store: &artifact_store,
@@ -11437,6 +11505,7 @@ runs:
                 secret_manager: None,
                 secret_masker: None,
                 secrets_context: &HashMap::new(),
+                missing_secrets: &HashSet::new(),
                 needs_context: &HashMap::new(),
                 needs_results: &HashMap::new(),
                 artifact_store: &artifact_store,
@@ -11485,6 +11554,7 @@ runs:
                 secret_manager: None,
                 secret_masker: None,
                 secrets_context: &HashMap::new(),
+                missing_secrets: &HashSet::new(),
                 needs_context: &HashMap::new(),
                 needs_results: &HashMap::new(),
                 artifact_store: &artifact_store,
@@ -11562,6 +11632,7 @@ runs:
                 secret_manager: None,
                 secret_masker: None,
                 secrets_context: &HashMap::new(),
+                missing_secrets: &HashSet::new(),
                 needs_context: &HashMap::new(),
                 needs_results: &HashMap::new(),
                 artifact_store: &artifact_store,
@@ -11609,6 +11680,7 @@ runs:
                 secret_manager: None,
                 secret_masker: None,
                 secrets_context: &HashMap::new(),
+                missing_secrets: &HashSet::new(),
                 needs_context: &HashMap::new(),
                 needs_results: &HashMap::new(),
                 artifact_store: &artifact_store,
@@ -11662,6 +11734,7 @@ runs:
                 secret_manager: None,
                 secret_masker: None,
                 secrets_context: &HashMap::new(),
+                missing_secrets: &HashSet::new(),
                 needs_context: &HashMap::new(),
                 needs_results: &HashMap::new(),
                 artifact_store: &artifact_store,
@@ -11728,6 +11801,7 @@ runs:
                 secret_manager: None,
                 secret_masker: None,
                 secrets_context: &HashMap::new(),
+                missing_secrets: &HashSet::new(),
                 needs_context: &HashMap::new(),
                 needs_results: &HashMap::new(),
                 artifact_store: &artifact_store,
@@ -11937,6 +12011,7 @@ runs:
                 secret_manager: None,
                 secret_masker: None,
                 secrets_context: &HashMap::new(),
+                missing_secrets: &HashSet::new(),
                 needs_context: &HashMap::new(),
                 needs_results: &HashMap::new(),
                 artifact_store: &artifact_store,
@@ -12009,6 +12084,7 @@ runs:
                 secret_manager: None,
                 secret_masker: None,
                 secrets_context: &HashMap::new(),
+                missing_secrets: &HashSet::new(),
                 needs_context: &HashMap::new(),
                 needs_results: &HashMap::new(),
                 artifact_store: &artifact_store,
@@ -12066,6 +12142,7 @@ runs:
                 secret_manager: None,
                 secret_masker: None,
                 secrets_context: &HashMap::new(),
+                missing_secrets: &HashSet::new(),
                 needs_context: &HashMap::new(),
                 needs_results: &HashMap::new(),
                 artifact_store: &artifact_store,
@@ -12120,6 +12197,7 @@ runs:
                 secret_manager: None,
                 secret_masker: None,
                 secrets_context: &HashMap::new(),
+                missing_secrets: &HashSet::new(),
                 needs_context: &HashMap::new(),
                 needs_results: &HashMap::new(),
                 artifact_store: &artifact_store,
@@ -12180,6 +12258,7 @@ runs:
                 secret_manager: None,
                 secret_masker: None,
                 secrets_context: &HashMap::new(),
+                missing_secrets: &HashSet::new(),
                 needs_context: &HashMap::new(),
                 needs_results: &HashMap::new(),
                 artifact_store: &artifact_store,
@@ -12326,6 +12405,7 @@ runs:
                 secret_manager: None,
                 secret_masker: None,
                 secrets_context: &HashMap::new(),
+                missing_secrets: &HashSet::new(),
                 needs_context: &HashMap::new(),
                 needs_results: &HashMap::new(),
                 artifact_store: &artifact_store,

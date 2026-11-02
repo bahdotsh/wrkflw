@@ -60,6 +60,9 @@ pub fn validate_workflow(path: &Path, verbose: bool) -> io::Result<()> {
                             cli_style::dim(&workflow_path.display().to_string())
                         ))
                     );
+                    for warning in result.warnings() {
+                        println!("{}", cli_style::indent(&format!("warning: {}", warning)));
+                    }
                     valid_count += 1;
                 } else {
                     println!(

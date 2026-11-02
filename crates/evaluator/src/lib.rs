@@ -4,7 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use wrkflw_models::ValidationResult;
-use wrkflw_validators::{validate_env, validate_jobs, validate_triggers};
+use wrkflw_validators::{validate_env, validate_expressions, validate_jobs, validate_triggers};
 
 pub fn evaluate_workflow_file(path: &Path, verbose: bool) -> Result<ValidationResult, String> {
     let content = fs::read_to_string(path).map_err(|e| format!("Failed to read file: {}", e))?;
@@ -64,6 +64,8 @@ pub fn evaluate_workflow_file(path: &Path, verbose: bool) -> Result<ValidationRe
             );
         }
     }
+
+    validate_expressions(&workflow, &mut result);
 
     if verbose && result.is_valid {
         println!(

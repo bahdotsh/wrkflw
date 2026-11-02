@@ -792,3 +792,250 @@ fn watch_streams_json_cycles_and_records_runs() {
     let listed = json_doc(&sandbox.run(&["--format", "json", "runs", "list"]));
     assert_eq!(listed["runs"][0]["source"], "watch");
 }
+
+#[test]
+fn a_missing_secret_is_empty_and_named_as_on_github() {
+    let sandbox = Sandbox::new();
+    sandbox.write(
+        "secret.yml",
+        "name: s\non: [push]\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - name: read\n        run: echo \"value=${{ secrets.WRKFLW_TEST_UNSET }}.\"\n",
+    );
+    let path = ".github/workflows/secret.yml";
+
+    let plan = json_doc(&sandbox.run(&["--format", "json", "plan", path]));
+    assert_eq!(plan["missing_secrets"], json!(["WRKFLW_TEST_UNSET"]));
+
+    let output = sandbox.run(&["--format", "json", "run", "--runtime", "emulation", path]);
+    let events = json_lines(&output);
+    assert_eq!(events.last().unwrap()["status"], "success");
+    let step = events
+        .iter()
+        .find(|e| e["type"] == "step_finished" && e["step"] == "read")
+        .unwrap();
+    let text = step["output"].as_str().unwrap();
+    assert!(text.contains("value=."), "{text}");
+    assert!(text.contains("WRKFLW_TEST_UNSET"), "{text}");
+}
+
+#[test]
+fn identical_matrix_failures_fold_and_paths_are_relative() {
+    let sandbox = Sandbox::new();
+    sandbox.write(
+        "wide.yml",
+        "name: w\non: [push]\njobs:\n  t:\n    runs-on: ubuntu-latest\n    strategy:\n      fail-fast: false\n      matrix:\n        n: [1, 2, 3]\n    steps:\n      - name: check\n        run: |\n          echo \"failed at $PWD/src/lib.rs\"\n          exit 1\n",
+    );
+    let output = sandbox.run(&[
+        "--format",
+        "json",
+        "run",
+        "--runtime",
+        "emulation",
+        ".github/workflows/wide.yml",
+    ]);
+    let events = json_lines(&output);
+    let failures = &events.last().unwrap()["failure"]["failures"];
+    assert_eq!(failures.as_array().unwrap().len(), 1, "{failures}");
+    assert_eq!(failures[0]["also_failed_in"].as_array().unwrap().len(), 2);
+    let tail = failures[0]["output_tail"].to_string();
+    assert!(tail.contains("failed at src/lib.rs"), "{tail}");
+}
+
+#[test]
+fn unnamed_action_steps_report_the_action() {
+    let sandbox = Sandbox::new();
+    sandbox.write(
+        "checkout.yml",
+        "name: c\non: [push]\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n",
+    );
+    let output = sandbox.run(&[
+        "--format",
+        "json",
+        "run",
+        "--runtime",
+        "emulation",
+        ".github/workflows/checkout.yml",
+    ]);
+    assert!(json_lines(&output)
+        .iter()
+        .any(|e| e["step"] == "actions/checkout@v4"));
+}
+
+#[test]
+fn from_step_failures_say_earlier_steps_did_not_run() {
+    let sandbox = Sandbox::new();
+    let output = sandbox.run(&[
+        "--format",
+        "json",
+        "run",
+        "--runtime",
+        "emulation",
+        "--job",
+        "build",
+        "--from-step",
+        "boom",
+        ".github/workflows/failing.yml",
+    ]);
+    let events = json_lines(&output);
+    let note = events.last().unwrap()["failure"]["note"].to_string();
+    assert!(note.contains("'boom'"), "{note}");
+}
+
+#[test]
+fn a_missing_workflow_is_an_error_and_not_a_run() {
+    let sandbox = Sandbox::new();
+    let output = sandbox.run(&["--format", "json", "run", "nope.yml"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(json_doc(&output)["type"], "error");
+    assert!(sandbox.stored_text().is_empty());
+}
+
+#[test]
+fn usage_errors_are_json_in_json_mode() {
+    let sandbox = Sandbox::new();
+    let output = sandbox.run(&["--format", "json", "run", "--bogus"]);
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(json_doc(&output)["type"], "error");
+
+    let output = sandbox.run(&["run", "--bogus"]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(stdout(&output).is_empty());
+}
+
+#[test]
+fn validate_catches_filter_and_expression_mistakes() {
+    let sandbox = Sandbox::new();
+    let path = sandbox.write(
+        "typos.yml",
+        "name: t\non:\n  pull_request:\n    branch: [main]\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ${{ steps.nope.outputs.x }}\n      - run: echo ${{ github.sha\n",
+    );
+    let output = sandbox.run(&["--format", "json", "validate", path.to_str().unwrap()]);
+    let report = json_doc(&output);
+    let rules = report["files"][0]["issues"].to_string();
+    for rule in [
+        "unknown-trigger-filter",
+        "undefined-step-reference",
+        "unterminated-expression",
+    ] {
+        assert!(rules.contains(rule), "{rule} in {rules}");
+    }
+}
+
+#[test]
+fn a_provider_failure_is_not_reported_as_a_missing_secret() {
+    let sandbox = Sandbox::new();
+    sandbox.write(
+        "broken.yml",
+        "name: b\non: [push]\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - name: read\n        run: echo ${{ secrets.no_such_provider:TOKEN }}\n",
+    );
+    let path = ".github/workflows/broken.yml";
+
+    let plan = json_doc(&sandbox.run(&["--format", "json", "plan", path]));
+    assert_eq!(plan["missing_secrets"], json!([]));
+
+    let output = sandbox.run(&["--format", "json", "run", "--runtime", "emulation", path]);
+    let events = json_lines(&output);
+    assert_eq!(events.last().unwrap()["status"], "failure");
+    let step = events
+        .iter()
+        .find(|e| e["type"] == "step_finished" && e["step"] == "read")
+        .unwrap();
+    let text = step["output"].as_str().unwrap();
+    assert!(text.contains("Secret substitution failed"), "{text}");
+    assert!(!text.contains("not set"), "{text}");
+}
+
+#[test]
+fn a_secret_missing_from_a_named_provider_keeps_its_provider() {
+    let sandbox = Sandbox::new();
+    sandbox.write(
+        "named.yml",
+        "name: n\non: [push]\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - name: read\n        run: echo ${{ secrets.env:WRKFLW_TEST_UNSET }}\n",
+    );
+    let path = ".github/workflows/named.yml";
+
+    let plan = json_doc(&sandbox.run(&["--format", "json", "plan", path]));
+    assert_eq!(plan["missing_secrets"], json!(["env:WRKFLW_TEST_UNSET"]));
+
+    let output = sandbox.run(&["--format", "json", "run", "--runtime", "emulation", path]);
+    let events = json_lines(&output);
+    let step = events
+        .iter()
+        .find(|e| e["type"] == "step_finished" && e["step"] == "read")
+        .unwrap();
+    let text = step["output"].as_str().unwrap();
+    assert!(text.contains("env:WRKFLW_TEST_UNSET"), "{text}");
+    assert!(text.contains("to that provider"), "{text}");
+    assert!(!text.contains("environment variable"), "{text}");
+}
+
+#[test]
+fn matrix_failures_fold_when_only_the_script_differs() {
+    let sandbox = Sandbox::new();
+    sandbox.write(
+        "scripted.yml",
+        "name: s\non: [push]\njobs:\n  t:\n    runs-on: ubuntu-latest\n    strategy:\n      fail-fast: false\n      matrix:\n        n: [1, 2, 3]\n    steps:\n      - name: check\n        run: |\n          : ${{ matrix.n }}\n          echo boom\n          exit 1\n",
+    );
+    let output = sandbox.run(&[
+        "--format",
+        "json",
+        "run",
+        "--runtime",
+        "emulation",
+        ".github/workflows/scripted.yml",
+    ]);
+    let events = json_lines(&output);
+    let failures = &events.last().unwrap()["failure"]["failures"];
+    assert_eq!(failures.as_array().unwrap().len(), 1, "{failures}");
+    assert_eq!(failures[0]["also_failed_in"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn a_reported_step_name_can_be_passed_back_to_from_step() {
+    let sandbox = Sandbox::new();
+    sandbox.write(
+        "unnamed.yml",
+        "name: u\non: [push]\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n      - run: echo one\n      - run: exit 1\n",
+    );
+    let path = ".github/workflows/unnamed.yml";
+    let output = sandbox.run(&["--format", "json", "run", "--runtime", "emulation", path]);
+    let events = json_lines(&output);
+    let reported = events.last().unwrap()["failure"]["failures"][0]["step"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(reported, "Step 3");
+
+    let output = sandbox.run(&[
+        "--format",
+        "json",
+        "run",
+        "--runtime",
+        "emulation",
+        "--job",
+        "a",
+        "--from-step",
+        &reported,
+        path,
+    ]);
+    let events = json_lines(&output);
+    let note = events.last().unwrap()["failure"]["note"].to_string();
+    assert!(note.contains("Step 3"), "{note}");
+}
+
+#[test]
+fn undefined_references_warn_without_failing_validation() {
+    let sandbox = Sandbox::new();
+    let path = sandbox.write(
+        "warned.yml",
+        "name: w\non: [push]\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ${{ steps.nope.outputs.x }}\n",
+    );
+    let output = sandbox.run(&["--format", "json", "validate", path.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(0));
+    let report = json_doc(&output);
+    assert_eq!(report["files"][0]["valid"], true);
+    assert_eq!(report["files"][0]["issues"][0]["severity"], "warning");
+    assert_eq!(
+        report["files"][0]["issues"][0]["rule"],
+        "undefined-step-reference"
+    );
+}

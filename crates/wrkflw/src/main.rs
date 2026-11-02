@@ -729,6 +729,44 @@ pub(crate) fn is_gitlab_pipeline(path: &Path) -> bool {
     false
 }
 
+/// The arguments as text. Clap rejects arguments that aren't valid UTF-8, so
+/// this runs on exactly the ones `std::env::args` would panic on.
+fn raw_args() -> impl Iterator<Item = String> {
+    std::env::args_os()
+        .skip(1)
+        .map(|arg| arg.to_string_lossy().into_owned())
+}
+
+/// Whether the raw arguments ask for JSON. Parsing failed, so this is all
+/// there is to go on.
+fn args_request_json(args: impl Iterator<Item = String>) -> bool {
+    let args: Vec<String> = args.take_while(|arg| arg != "--").collect();
+    args.iter().any(|arg| arg == "--format=json")
+        || args.windows(2).any(|pair| pair == ["--format", "json"])
+}
+
+/// Report a command line clap rejected, keeping the promise that stdout is
+/// JSON in JSON mode, and exit 2. Help and version are not failures.
+fn exit_on_parse_error(error: clap::Error) -> ! {
+    use clap::error::ErrorKind;
+    let is_usage_error = !matches!(
+        error.kind(),
+        ErrorKind::DisplayHelp
+            | ErrorKind::DisplayVersion
+            | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+    );
+    if !is_usage_error || !args_request_json(raw_args()) {
+        error.exit();
+    }
+    wrkflw_runs::emit_line(&serde_json::json!({
+        "schema_version": wrkflw_runs::SCHEMA_VERSION,
+        "type": "error",
+        "message": error.render().to_string().trim(),
+    }));
+    let _ = error.print();
+    std::process::exit(2);
+}
+
 #[tokio::main]
 async fn main() {
     // Gracefully handle Broken pipe (EPIPE) when output is piped (e.g., to `head`)
@@ -753,7 +791,7 @@ async fn main() {
         default_panic_hook(info);
     }));
 
-    let cli = Wrkflw::parse();
+    let cli = Wrkflw::try_parse().unwrap_or_else(|e| exit_on_parse_error(e));
     let verbose = cli.verbose;
     let debug = cli.debug;
 
@@ -1123,6 +1161,9 @@ fn validate_github_workflow(path: &Path, verbose: bool) -> bool {
                 if verbose {
                     println!("{}", cli_style::dim("  All validation checks passed"));
                 }
+                for warning in result.warnings() {
+                    println!("{}", cli_style::indent(&format!("warning: {}", warning)));
+                }
             } else {
                 println!("{}", cli_style::error("Invalid"));
                 for (i, issue) in result.issues.iter().enumerate() {
@@ -1345,6 +1386,16 @@ fn list_workflows_and_pipelines(verbose: bool, show_jobs: bool) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn json_is_only_requested_ahead_of_the_path_separator() {
+        let requests =
+            |args: &[&str]| super::args_request_json(args.iter().map(|arg| arg.to_string()));
+        assert!(requests(&["--format", "json", "run"]));
+        assert!(requests(&["run", "--format=json"]));
+        assert!(!requests(&["run", "--", "--format", "json"]));
+        assert!(!requests(&["run", "--format", "text"]));
+    }
+
     use super::*;
 
     #[test]

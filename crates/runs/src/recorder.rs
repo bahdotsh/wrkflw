@@ -427,6 +427,7 @@ async fn begin(path: &Path, config: &ExecutionConfig, options: &RunOptions) -> A
         agent: options.meta.agent.clone(),
         intent: options.meta.intent.clone(),
         replay_of: options.meta.replay_of.clone(),
+        from_step: options.from_step.as_ref().map(|from| from.step.clone()),
         argv: options.meta.argv.clone(),
         variables: options.meta.variables.clone(),
         pid: std::process::id(),

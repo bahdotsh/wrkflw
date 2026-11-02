@@ -151,6 +151,14 @@ pub(crate) async fn run(ctx: RunCtx) {
     let is_gitlab = ctx.gitlab || is_gitlab_pipeline(&ctx.path);
 
     let format = ctx.format;
+    // Checked before the run is recorded: a typo is not a run to look back
+    // on, and there would be nothing to replay.
+    if !ctx.path.is_file() {
+        fail(
+            format,
+            &format!("workflow file not found: {}", ctx.path.display()),
+        );
+    }
     let from_step = resolve_from_step(&ctx, is_gitlab).unwrap_or_else(|e| fail(format, &e));
 
     if !is_gitlab && !ctx.variables.is_empty() {

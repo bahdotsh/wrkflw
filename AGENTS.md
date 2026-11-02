@@ -20,7 +20,7 @@ Prefer the MCP server if your client supports MCP:
 
 - `--event pull_request` needs `--base-branch main`. Without it the command fails, on purpose.
 - Add `--activity-type opened` if the workflow uses `types:`.
-- Pair `--event` with `--diff` or `--changed-files a,b`, or `paths:` filters have nothing to match.
+- If the event has a `paths:` filter, pair `--event` with `--diff` or `--changed-files a,b`, or the command fails, because the filter would have nothing to match.
 - A skipped run exits 0 with `run_finished` status `skipped`. Check `status`, not only the exit code.
 
 ## Output contract
@@ -35,7 +35,19 @@ Prefer the MCP server if your client supports MCP:
 
 `step_finished.output` holds the last 64 KiB of a step's output, delivered when the step ends. Output is not streamed while a step runs.
 
+`failures` has one entry per distinct failure, not per failed job, so count `jobs` on `run_finished` instead. `also_failed_in` lists matrix legs where the same step failed with the same exit code and output, ignoring durations, and `command` is the first leg's script. `error_lines` holds lines above `output_tail` that look like errors. `note` warns about the run itself, such as `--from-step` having skipped earlier steps.
+
+Workspace paths in step output are relative, so `tests/test_app.py` means that file in your repository.
+
 Exit codes: 0 for success or skipped, 1 for a failed run or failed validation, 2 for a usage error.
+
+## Secrets
+
+A secret no provider has expands to an empty string, as on GitHub. `plan` lists these under `missing_secrets`, and a step that reads one ends its output with a warning naming it. To provide a value, set an environment variable with the secret's exact name, such as `DEPLOY_TOKEN`, before running wrkflw. A secret read from a named provider, as in `secrets.vault:TOKEN`, is listed as `vault:TOKEN` and has to be added to that provider.
+
+## Validation
+
+Each issue has a `severity`. An `error` makes the file invalid. A `warning`, such as a reference to an undefined step, leaves `valid` true because GitHub accepts it, but it usually means the value will be empty.
 
 ## History
 

@@ -1,5 +1,15 @@
 use serde::Serialize;
 
+/// How much a finding matters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Severity {
+    /// The workflow is wrong, so validation fails.
+    Error,
+    /// Probably a mistake, but GitHub would accept it, so validation passes.
+    Warning,
+}
+
 /// One structured validation finding, for `--format json` consumers.
 ///
 /// `message` is the same text as the matching entry in
@@ -8,6 +18,7 @@ use serde::Serialize;
 pub struct ValidationIssue {
     /// Stable kebab-case identifier of the check, e.g. `unknown-trigger`.
     pub rule: String,
+    pub severity: Severity,
     pub message: String,
     /// Where in the document the issue is, e.g. `jobs.build.steps[0].uses`.
     pub path: Option<String>,
@@ -57,14 +68,29 @@ impl ValidationResult {
     /// Record an issue at the current scope under a stable rule id.
     pub fn report(&mut self, rule: &str, message: impl Into<String>) {
         let segments = self.scope.clone();
-        self.push_issue(rule, message.into(), segments);
+        self.push_issue(Severity::Error, rule, message.into(), segments);
+    }
+
+    /// Like [`report`](Self::report), for a finding that leaves the workflow
+    /// valid. Use it where the check can be wrong or GitHub would accept it.
+    pub fn warn(&mut self, rule: &str, message: impl Into<String>) {
+        let segments = self.scope.clone();
+        self.push_issue(Severity::Warning, rule, message.into(), segments);
+    }
+
+    /// Messages of the findings that don't affect `is_valid`.
+    pub fn warnings(&self) -> impl Iterator<Item = &str> {
+        self.details
+            .iter()
+            .filter(|issue| issue.severity == Severity::Warning)
+            .map(|issue| issue.message.as_str())
     }
 
     /// Record an issue at `key` below the current scope.
     pub fn report_at(&mut self, rule: &str, key: &str, message: impl Into<String>) {
         let mut segments = self.scope.clone();
         segments.push(key.to_string());
-        self.push_issue(rule, message.into(), segments);
+        self.push_issue(Severity::Error, rule, message.into(), segments);
     }
 
     /// Enter a YAML key for everything reported until the matching
@@ -97,11 +123,18 @@ impl ValidationResult {
         }
     }
 
-    fn push_issue(&mut self, rule: &str, message: String, segments: Vec<String>) {
-        self.is_valid = false;
+    fn push_issue(
+        &mut self,
+        severity: Severity,
+        rule: &str,
+        message: String,
+        segments: Vec<String>,
+    ) {
+        self.is_valid &= severity != Severity::Error;
         self.issues.push(message.clone());
         self.details.push(ValidationIssue {
             rule: rule.to_string(),
+            severity,
             message,
             path: render_path(&segments),
             line: None,
@@ -129,6 +162,13 @@ pub fn rule_hint(rule: &str) -> Option<&'static str> {
         "missing-jobs" => "Add a top-level `jobs:` mapping with at least one job.",
         "missing-triggers" => "Add a top-level `on:` section, e.g. `on: [push]`.",
         "unknown-trigger" => "Use an event from the GitHub Actions events list, e.g. `push`.",
+        "unknown-trigger-filter" => "Check the spelling: filters are plural, e.g. `branches:`.",
+        "unterminated-expression" => "Close the expression with `}}`.",
+        "undefined-step-reference" => {
+            "Give an earlier step in this job that `id:`, or fix the reference."
+        }
+        "undefined-need-reference" => "Add the job to this job's `needs:`, or fix the reference.",
+        "undefined-matrix-key" => "Add the key to `strategy.matrix`, or fix the reference.",
         "missing-runs-on" => {
             "Add `runs-on: ubuntu-latest`, or call a reusable workflow with `uses:`."
         }

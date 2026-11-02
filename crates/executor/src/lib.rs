@@ -24,5 +24,8 @@ pub use engine::{
     detect_runtime, execute_workflow, parse_platform_override, ExecutionConfig, JobResult,
     JobStatus, RuntimeType, StepResult, StepStatus,
 };
-pub use events::{with_run_hooks, ExecutionEvent, ExecutionObserver, FromStep, RunHooks};
+pub use events::{
+    with_run_hooks, ExecutionEvent, ExecutionObserver, FromStep, RunHooks, EXIT_CODE_LABEL,
+    STDERR_HEADER, STDOUT_HEADER,
+};
 pub use kubernetes::{parse_key_value as parse_k8s_key_value, KubernetesConfig};

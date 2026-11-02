@@ -166,12 +166,14 @@ fn combined_pattern_sources(includes: &[GlobPattern], ignores: &[GlobPattern]) -
 }
 
 /// Build a human-readable diagnostic explaining which sub-filter caused
-/// `filter` to reject `context`.
+/// `filter` to reject `context`. Sub-filters that passed are left out: naming
+/// them sends the reader off to fix something that isn't broken.
 fn explain_filter_failure(filter: &EventFilter, context: &EventContext) -> String {
     let mut parts = Vec::new();
 
     let has_branches = !filter.branches.is_empty() || !filter.branches_ignore.is_empty();
     let has_tags = !filter.tags.is_empty() || !filter.tags_ignore.is_empty();
+    let ref_rejected = !ref_filters_pass(filter, context);
 
     // When BOTH axes are set, GHA treats them as OR (see
     // [`ref_filters_pass`]). The diagnostic must reflect that — saying
@@ -179,7 +181,7 @@ fn explain_filter_failure(filter: &EventFilter, context: &EventContext) -> Strin
     // but misleads the user into thinking the tags axis was not
     // considered. Render the combined failure as a single "neither
     // branch nor tag matched" line so the OR semantics are obvious.
-    if has_branches && has_tags {
+    if ref_rejected && has_branches && has_tags {
         let branch_sources = combined_pattern_sources(&filter.branches, &filter.branches_ignore);
         let tag_sources = combined_pattern_sources(&filter.tags, &filter.tags_ignore);
         let branch_part = match branch_for_filter(context) {
@@ -194,7 +196,7 @@ fn explain_filter_failure(filter: &EventFilter, context: &EventContext) -> Strin
             "neither ref axis matched ({}; {}) — GHA fires on either branches: OR tags:",
             branch_part, tag_part
         ));
-    } else if has_branches {
+    } else if ref_rejected && has_branches {
         // Combined pattern list: a rejection driven by `branches-ignore:`
         // alone (or inline `!`-negations routed into `branches_ignore`)
         // must render the offending rule instead of
@@ -217,7 +219,7 @@ fn explain_filter_failure(filter: &EventFilter, context: &EventContext) -> Strin
                 parts.push(what.to_string());
             }
         }
-    } else if has_tags {
+    } else if ref_rejected && has_tags {
         // Same treatment as branches — see `combined_pattern_sources`.
         let pattern_sources = combined_pattern_sources(&filter.tags, &filter.tags_ignore);
         match &context.tag {
@@ -227,6 +229,7 @@ fn explain_filter_failure(filter: &EventFilter, context: &EventContext) -> Strin
     }
     if !filter.types.is_empty() {
         match &context.activity_type {
+            Some(activity) if filter.types.contains(activity) => {}
             Some(activity) => {
                 parts.push(format!("activity '{}' not in {:?}", activity, filter.types))
             }
@@ -235,7 +238,13 @@ fn explain_filter_failure(filter: &EventFilter, context: &EventContext) -> Strin
             }
         }
     }
-    if !filter.paths.is_empty() {
+    let paths_rejected = (!filter.paths.is_empty() || !filter.paths_ignore.is_empty())
+        && !path_matcher::matches_paths(
+            &context.changed_files,
+            &filter.paths,
+            &filter.paths_ignore,
+        );
+    if paths_rejected && !filter.paths.is_empty() {
         let sources: Vec<&str> = filter.paths.iter().map(|p| p.source.as_str()).collect();
         // When the change set is empty the path filter cannot possibly
         // match. Distinguish two cases so the user is not blamed for a
@@ -268,7 +277,7 @@ fn explain_filter_failure(filter: &EventFilter, context: &EventContext) -> Strin
         };
         parts.push(detail);
     }
-    if !filter.paths_ignore.is_empty() {
+    if paths_rejected && !filter.paths_ignore.is_empty() {
         let sources: Vec<&str> = filter
             .paths_ignore
             .iter()
@@ -300,6 +309,37 @@ mod tests {
             events,
             warnings: MustDrainWarnings::new(),
         }
+    }
+
+    #[test]
+    fn skip_reason_names_only_the_filter_that_rejected() {
+        let config = make_config(vec![EventFilter {
+            event_name: "pull_request".into(),
+            branches: vec![gp("main")],
+            types: vec!["opened".into()],
+            paths: vec![gp("src/**")],
+            ..Default::default()
+        }]);
+        let ctx = EventContext {
+            event_name: "pull_request".into(),
+            base_branch: Some("main".into()),
+            activity_type: Some("opened".into()),
+            changed_files: vec!["README.md".into()],
+            ..Default::default()
+        };
+        let reason = evaluate_trigger(&config, &ctx).reason;
+        assert!(reason.contains("paths"), "{reason}");
+        assert!(!reason.contains("branch"), "{reason}");
+        assert!(!reason.contains("activity"), "{reason}");
+
+        let ctx = EventContext {
+            base_branch: Some("develop".into()),
+            changed_files: vec!["src/lib.rs".into()],
+            ..ctx
+        };
+        let reason = evaluate_trigger(&config, &ctx).reason;
+        assert!(reason.contains("branch 'develop'"), "{reason}");
+        assert!(!reason.contains("paths"), "{reason}");
     }
 
     #[test]

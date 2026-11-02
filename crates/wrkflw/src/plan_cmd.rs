@@ -2,9 +2,10 @@
 
 use crate::{is_gitlab_pipeline, prefilter, OutputFormat};
 use serde_json::{json, Value};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use wrkflw_parser::workflow::{Job, WorkflowDefinition};
 use wrkflw_runs::SCHEMA_VERSION;
+use wrkflw_secrets::{SecretError, SecretManager, SecretSubstitution};
 
 pub(crate) struct PlanCtx {
     pub(crate) path: PathBuf,
@@ -50,6 +51,29 @@ async fn trigger(ctx: &PlanCtx) -> Result<Value, String> {
             json!({"event": event, "matches": false, "reason": reason})
         }
     })
+}
+
+/// Secrets the workflow reads that no provider has. They expand to nothing
+/// in a run, which is worth knowing before the run fails for it.
+async fn missing_secrets(path: &Path) -> Result<Vec<String>, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    // Round-tripped through YAML so that commented-out lines don't count.
+    let parsed: serde_yaml::Value = serde_yaml::from_str(&text).map_err(|e| e.to_string())?;
+    let text = serde_yaml::to_string(&parsed).map_err(|e| e.to_string())?;
+    let manager = SecretManager::default().await.map_err(|e| e.to_string())?;
+    let mut missing = Vec::new();
+    for secret in SecretSubstitution::extract_secret_refs(&text) {
+        let name = secret.qualified_name();
+        if matches!(
+            secret.lookup(&manager).await,
+            Err(SecretError::NotFound { .. })
+        ) && !missing.contains(&name)
+        {
+            missing.push(name);
+        }
+    }
+    missing.sort();
+    Ok(missing)
 }
 
 /// Expanded matrix legs. A matrix computed at run time can't be expanded yet,
@@ -168,6 +192,11 @@ async fn build(ctx: &PlanCtx) -> Result<Value, String> {
         );
     }
     let trigger = trigger(ctx).await?;
+    let missing = if is_gitlab {
+        Vec::new()
+    } else {
+        missing_secrets(&ctx.path).await?
+    };
     let (name, (batches, jobs)) = if is_gitlab {
         (None, gitlab_plan(ctx)?)
     } else {
@@ -185,6 +214,7 @@ async fn build(ctx: &PlanCtx) -> Result<Value, String> {
         "would_run": trigger.is_null() || trigger["matches"] == true,
         "batches": batches,
         "jobs": jobs,
+        "missing_secrets": missing,
     }))
 }
 
@@ -209,6 +239,15 @@ fn print_text(plan: &Value) {
             plan["trigger"]["event"].as_str().unwrap_or(""),
             reason
         );
+    }
+    let missing: Vec<&str> = plan["missing_secrets"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect();
+    if !missing.is_empty() {
+        println!("Missing secrets, empty in a run: {}", missing.join(", "));
     }
     let batches = plan["batches"].as_array().cloned().unwrap_or_default();
     for (index, batch) in batches.iter().enumerate() {

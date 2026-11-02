@@ -202,7 +202,43 @@ pub(crate) async fn run_trigger_prefilter(
         };
     let cwd_for_git: Option<&Path> = repo_root.as_deref();
 
-    let mut event_context = build_event_context(&req, &event_name, cwd_for_git).await?;
+    // Parse workflow and evaluate trigger before executing.
+    //
+    // `load_trigger_config` performs blocking file I/O + YAML parsing
+    // (documented in `wrkflw_trigger_filter::lib.rs`). Move it onto a
+    // blocking thread so we don't stall the tokio reactor. The latency
+    // hit for a single file is small, but the contract should match
+    // the watcher and TUI, both of which already do this — drifting
+    // here is exactly how the silent-failure holes accumulated.
+    let workflow_path_owned = req.workflow_path.to_path_buf();
+    let tf_config = wrkflw_trigger_filter::TriggerFilterConfig::default();
+    let mut trigger_config = tokio::task::spawn_blocking(move || {
+        // Route through the shared LRU cache so every wrkflw entry
+        // point (CLI prefilter, TUI diff-filter, watcher hot loop)
+        // contends over the same compiled-pattern store. Unifying
+        // the three call sites was a review ask to prevent drift —
+        // the same file never pays the YAML-parse cost twice.
+        wrkflw_trigger_filter::load_trigger_config_cached(&workflow_path_owned, &tf_config)
+    })
+    .await
+    .map_err(|e| format!("workflow parse task panicked: {}", e))?
+    .map_err(|e| format!("parsing workflow: {}", e))?;
+    // Drain parser-collected diagnostics (unknown event names, etc.)
+    // — the library decouples from the log sink by design, so every
+    // host must drain this field or reintroduce the silent-skip
+    // failure mode. `take()` also satisfies the `MustDrainWarnings`
+    // Drop-check contract that catches the regression in debug
+    // builds.
+    for w in trigger_config.warnings.take() {
+        wrkflw_logging::warning(&w);
+    }
+    let paths_matter = trigger_config
+        .events
+        .iter()
+        .any(|e| e.event_name == event_name && !(e.paths.is_empty() && e.paths_ignore.is_empty()));
+
+    let mut event_context =
+        build_event_context(&req, &event_name, paths_matter, cwd_for_git).await?;
     apply_base_branch(
         &mut event_context,
         &event_name,
@@ -248,36 +284,6 @@ pub(crate) async fn run_trigger_prefilter(
         ));
     }
 
-    // Parse workflow and evaluate trigger before executing.
-    //
-    // `load_trigger_config` performs blocking file I/O + YAML parsing
-    // (documented in `wrkflw_trigger_filter::lib.rs`). Move it onto a
-    // blocking thread so we don't stall the tokio reactor. The latency
-    // hit for a single file is small, but the contract should match
-    // the watcher and TUI, both of which already do this — drifting
-    // here is exactly how the silent-failure holes accumulated.
-    let workflow_path_owned = req.workflow_path.to_path_buf();
-    let tf_config = wrkflw_trigger_filter::TriggerFilterConfig::default();
-    let mut trigger_config = tokio::task::spawn_blocking(move || {
-        // Route through the shared LRU cache so every wrkflw entry
-        // point (CLI prefilter, TUI diff-filter, watcher hot loop)
-        // contends over the same compiled-pattern store. Unifying
-        // the three call sites was a review ask to prevent drift —
-        // the same file never pays the YAML-parse cost twice.
-        wrkflw_trigger_filter::load_trigger_config_cached(&workflow_path_owned, &tf_config)
-    })
-    .await
-    .map_err(|e| format!("workflow parse task panicked: {}", e))?
-    .map_err(|e| format!("parsing workflow: {}", e))?;
-    // Drain parser-collected diagnostics (unknown event names, etc.)
-    // — the library decouples from the log sink by design, so every
-    // host must drain this field or reintroduce the silent-skip
-    // failure mode. `take()` also satisfies the `MustDrainWarnings`
-    // Drop-check contract that catches the regression in debug
-    // builds.
-    for w in trigger_config.warnings.take() {
-        wrkflw_logging::warning(&w);
-    }
     let match_result = wrkflw_trigger_filter::evaluate_trigger(&trigger_config, &event_context);
 
     if !match_result.matches {
@@ -301,6 +307,7 @@ pub(crate) async fn run_trigger_prefilter(
 pub(crate) async fn build_event_context(
     req: &PrefilterRequest<'_>,
     event_name: &str,
+    paths_matter: bool,
     cwd_for_git: Option<&Path>,
 ) -> Result<wrkflw_trigger_filter::EventContext, String> {
     if let Some(files) = req.changed_files {
@@ -354,7 +361,13 @@ pub(crate) async fn build_event_context(
     // filter silently rejects — the exact silent-skip failure mode
     // the rest of this PR has been plugging. In strict mode (the
     // default) refuse to proceed so CI scripts fail loudly and the
-    // operator has something actionable to fix.
+    // operator has something actionable to fix. Without a path filter
+    // on this event there is nothing to go wrong, so don't ask.
+    if !paths_matter {
+        return wrkflw_trigger_filter::context_from_changed_files(event_name, vec![], cwd_for_git)
+            .await
+            .map_err(|e| format!("failed to build event context: {}", e));
+    }
     if req.strict_filter {
         return Err(
             "--event was supplied without --diff or --changed-files, so no changed files \
@@ -584,9 +597,11 @@ mod prefilter_tests {
             strict_filter: false,
         };
 
-        let ctx = build_event_context(&req, "push", Some(&repo)).await.expect(
-            "build_event_context must succeed when --diff-head=HEAD and --diff-base is absent",
-        );
+        let ctx = build_event_context(&req, "push", true, Some(&repo))
+            .await
+            .expect(
+                "build_event_context must succeed when --diff-head=HEAD and --diff-base is absent",
+            );
 
         // The branch under test constructs a range `base..head` and
         // runs `git diff --name-only` on it. Base defaults to HEAD,
@@ -662,6 +677,38 @@ mod prefilter_tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn strict_filter_accepts_event_alone_without_a_paths_filter() {
+        // No `paths:` on this event means no change set can be missing, so
+        // there is nothing for strict mode to protect against.
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let wf = tmp.path().join("ci.yml");
+        std::fs::write(
+            &wf,
+            "name: ci\n\
+             on:\n  push:\n    branches: [main]\n  pull_request:\n    paths: ['src/**']\n\
+             jobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+        )
+        .expect("write workflow");
+
+        let event = "push".to_string();
+        let req = PrefilterRequest {
+            workflow_path: &wf,
+            event: Some(&event),
+            diff: false,
+            changed_files: None,
+            diff_base: None,
+            diff_head: None,
+            base_branch: None,
+            activity_type: None,
+            verbose: false,
+            strict_filter: true,
+        };
+        run_trigger_prefilter(req)
+            .await
+            .expect("no path filter on push, so no change set is needed");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn strict_filter_rejects_event_alone_without_diff_or_changed_files() {
         // Regression pin for the strict-filter default-on gate in
         // `build_event_context`: passing `--event push` with neither
@@ -677,8 +724,7 @@ mod prefilter_tests {
         // silently flipping it back to warn-and-proceed.
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let wf = tmp.path().join("ci.yml");
-        // Any parseable workflow works; `build_event_context` fails
-        // before parsing.
+        // The `paths:` filter is what makes the change set necessary.
         std::fs::write(
             &wf,
             "name: ci\n\

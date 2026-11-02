@@ -190,11 +190,29 @@ fn process_alive(pid: u32) -> bool {
     !matches!(kill(Pid::from_raw(pid as i32), None), Err(Errno::ESRCH))
 }
 
-/// No cheap liveness check here. Reporting a dead run as running is safer
+/// When in doubt this says alive: reporting a dead run as running is safer
 /// than the reverse, because pruning would delete a live run's directory.
-#[cfg(not(unix))]
-fn process_alive(_pid: u32) -> bool {
-    true
+#[cfg(windows)]
+fn process_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, GetLastError, ERROR_INVALID_PARAMETER, STILL_ACTIVE,
+    };
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    // SAFETY: the handle is checked before use and closed exactly once, and
+    // `code` outlives the call that writes to it.
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            // Anything else, such as access denied, means the pid exists.
+            return GetLastError() != ERROR_INVALID_PARAMETER;
+        }
+        let mut code = 0u32;
+        let queried = GetExitCodeProcess(handle, &mut code);
+        CloseHandle(handle);
+        queried == 0 || code == STILL_ACTIVE as u32
+    }
 }
 
 #[cfg(test)]
@@ -254,7 +272,6 @@ mod tests {
         assert!(store.load("a/b").is_err());
     }
 
-    #[cfg(unix)]
     #[test]
     fn a_dead_running_process_reads_as_interrupted() {
         let dir = tempfile::tempdir().unwrap();
@@ -264,6 +281,16 @@ mod tests {
         run.pid = i32::MAX as u32;
         store.save(&run).unwrap();
         assert_eq!(store.load("r").unwrap().status, RunStatus::Interrupted);
+    }
+
+    #[test]
+    fn a_live_running_process_stays_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = RunStore::at(dir.path());
+        let mut run = record("r", "/one");
+        run.status = RunStatus::Running;
+        store.save(&run).unwrap();
+        assert_eq!(store.load("r").unwrap().status, RunStatus::Running);
     }
 
     #[test]

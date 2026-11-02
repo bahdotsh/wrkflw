@@ -388,6 +388,11 @@ enum Commands {
         /// Upload passing results to --remote-cache
         #[arg(long)]
         cache_push: bool,
+
+        /// Exit with this code when the workflow's triggers don't match, so
+        /// `gate` can tell a skip from a pass
+        #[arg(long, hide = true, value_name = "CODE")]
+        skip_exit_code: Option<i32>,
     },
 
     /// Run what a push would run, and fail if any of it fails.
@@ -1034,6 +1039,7 @@ async fn run_cli() {
             dep_cache,
             remote_cache,
             cache_push,
+            skip_exit_code,
         }) => {
             run_workflow_cmd::run(run_workflow_cmd::RunCtx {
                 path: path.clone(),
@@ -1066,6 +1072,7 @@ async fn run_cli() {
                 dep_cache: *dep_cache,
                 remote_cache: remote_cache.clone(),
                 cache_push: *cache_push,
+                skip_exit_code: *skip_exit_code,
             })
             .await;
         }

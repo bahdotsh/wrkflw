@@ -52,6 +52,7 @@ pub(crate) struct RunCtx {
     pub(crate) dep_cache: bool,
     pub(crate) remote_cache: Option<String>,
     pub(crate) cache_push: bool,
+    pub(crate) skip_exit_code: Option<i32>,
 }
 
 /// A variable holding a credential, so it never has to be in `argv`.
@@ -277,7 +278,7 @@ pub(crate) async fn run(ctx: RunCtx) {
                         cli_style::dim(&format!("Workflow skipped: {}", reason))
                     );
                 }
-                std::process::exit(0);
+                std::process::exit(ctx.skip_exit_code.unwrap_or(0));
             }
             Err(msg) => fail(format, &msg),
         }

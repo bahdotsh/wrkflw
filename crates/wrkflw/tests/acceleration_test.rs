@@ -293,8 +293,18 @@ fn the_gate_fails_when_a_workflow_fails_and_passes_when_it_is_fixed() {
 fn the_gate_skips_a_workflow_the_event_does_not_trigger() {
     let workflow = "name: ci\non: workflow_dispatch\njobs:\n  check:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo check >> LOG; exit 1\n";
     let repo = Repo::new(workflow, None);
-    assert_ok(&repo.wrkflw(&["gate", "--runtime", "emulation", "--diff-base", "HEAD"]));
+    let output = repo.wrkflw(&["gate", "--runtime", "emulation", "--diff-base", "HEAD"]);
+    assert_ok(&output);
     assert!(repo.take_ran().is_empty());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("0 workflow(s) ran, 1 skipped"));
+}
+
+#[test]
+fn the_gate_counts_a_passing_workflow_as_run() {
+    let repo = Repo::new(TWO_JOBS, None);
+    let output = repo.wrkflw(&["gate", "--runtime", "emulation", "--diff-base", "HEAD"]);
+    assert_ok(&output);
+    assert!(String::from_utf8_lossy(&output.stdout).contains("1 workflow(s) ran, 0 skipped"));
 }
 
 #[test]

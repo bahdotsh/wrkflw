@@ -383,6 +383,45 @@ fn replay_with_variables_works_after_a_path_separator() {
 }
 
 #[test]
+fn matrix_legs_with_similar_names_keep_their_own_logs() {
+    let sandbox = Sandbox::new();
+    sandbox.write(
+        "legs.yml",
+        r#"
+name: legs
+on: [push]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        leg: ["a/b", "a-b"]
+    steps:
+      - name: show
+        run: echo "leg ${{ matrix.leg }}"
+"#,
+    );
+    sandbox.run(&[
+        "--format",
+        "json",
+        "run",
+        "--runtime",
+        "emulation",
+        ".github/workflows/legs.yml",
+    ]);
+    let logs = json_doc(&sandbox.run(&["--format", "json", "runs", "logs", "--step", "show"]));
+    let texts: Vec<&str> = logs["logs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["text"].as_str().unwrap())
+        .collect();
+    assert_eq!(texts.len(), 2);
+    assert!(texts.iter().any(|t| t.contains("leg a/b")), "{texts:?}");
+    assert!(texts.iter().any(|t| t.contains("leg a-b")), "{texts:?}");
+}
+
+#[test]
 fn no_record_leaves_no_history_but_keeps_the_digest() {
     let sandbox = Sandbox::new();
     let output = sandbox

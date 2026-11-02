@@ -143,6 +143,20 @@ fn slug(name: &str) -> String {
     }
 }
 
+/// Directory of a job's logs. Matrix legs differ only in characters `slug`
+/// flattens or cuts off, so a name it changed gets a hash of the original:
+/// without one, two legs would write over each other's logs.
+fn job_dir(name: &str) -> String {
+    let readable = slug(name);
+    if readable == name {
+        return readable;
+    }
+    let hash = name.bytes().fold(0x811c_9dc5_u32, |hash, byte| {
+        (hash ^ u32::from(byte)).wrapping_mul(0x0100_0193)
+    });
+    format!("{readable}-{hash:08x}")
+}
+
 /// Keep the end of `text`, on a character boundary: failures print last.
 fn tail_bytes(text: &str, max: usize) -> (&str, bool) {
     if text.len() <= max {
@@ -221,10 +235,10 @@ impl Recorder {
             if !existing.steps.is_empty() {
                 continue;
             }
-            let job_slug = slug(&job.name);
+            let job_dir = job_dir(&job.name);
             let mut steps = Vec::new();
             for (index, step) in job.steps.iter().enumerate() {
-                let relative = format!("logs/{job_slug}/{:02}-{}.log", index, slug(&step.name));
+                let relative = format!("logs/{job_dir}/{:02}-{}.log", index, slug(&step.name));
                 steps.push(StepRecord {
                     index,
                     name: step.name.clone(),
@@ -239,7 +253,7 @@ impl Recorder {
                     log: self.write_log(&id, &relative, &step.output),
                 });
             }
-            let relative = format!("logs/{job_slug}/job.log");
+            let relative = format!("logs/{job_dir}/job.log");
             let log = (!job.logs.is_empty())
                 .then(|| self.write_log(&id, &relative, &job.logs))
                 .flatten();
@@ -296,7 +310,7 @@ impl ExecutionObserver for Recorder {
                 uses,
                 env_set,
             } => {
-                let relative = format!("logs/{}/{:02}-{}.log", slug(job), index, slug(step));
+                let relative = format!("logs/{}/{:02}-{}.log", job_dir(job), index, slug(step));
                 let log = self.write_log(&id, &relative, output);
                 Self::job_mut(&mut record, job, job).steps.push(StepRecord {
                     index: *index,
@@ -320,7 +334,7 @@ impl ExecutionObserver for Recorder {
                 duration_ms,
                 logs,
             } => {
-                let relative = format!("logs/{}/job.log", slug(job));
+                let relative = format!("logs/{}/job.log", job_dir(job));
                 let log = self.write_log(&id, &relative, logs);
                 let entry = Self::job_mut(&mut record, job, job);
                 entry.status = status.to_string();
@@ -535,4 +549,136 @@ pub async fn record_skipped(
     let recorder = begin(path, config, options).await;
     let record = recorder.finish(RunStatus::Skipped, None, Some(reason.to_string()), &[]);
     recorder.line(run_finished_json(&record, None));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wrkflw_executor::{JobStatus, StepStatus};
+
+    fn keys(value: &Value) -> Vec<&str> {
+        let mut keys: Vec<&str> = value
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        keys
+    }
+
+    #[test]
+    fn job_dirs_keep_matrix_legs_apart() {
+        assert_eq!(job_dir("build"), "build");
+        assert_ne!(job_dir("test (a/b)"), job_dir("test (a-b)"));
+        assert_ne!(job_dir(&"x".repeat(60)), job_dir(&"x".repeat(61)));
+        assert_eq!(job_dir("test (a/b)"), job_dir("test (a/b)"));
+    }
+
+    // Field names are a public contract, so changing one must fail a test.
+    #[test]
+    fn event_fields_are_pinned() {
+        let started = ExecutionEvent::JobStarted {
+            job: "j".to_string(),
+            canonical_name: "j".to_string(),
+        };
+        assert_eq!(
+            keys(&event_json(&started)),
+            ["canonical_name", "job", "type"]
+        );
+
+        let step = ExecutionEvent::StepStarted {
+            job: "j".to_string(),
+            step: "s".to_string(),
+            index: 0,
+        };
+        assert_eq!(keys(&event_json(&step)), ["index", "job", "step", "type"]);
+
+        let finished = ExecutionEvent::StepFinished {
+            job: "j".to_string(),
+            step: "s".to_string(),
+            index: 0,
+            status: StepStatus::Success,
+            outcome: StepStatus::Success,
+            conclusion: StepStatus::Success,
+            exit_code: Some(0),
+            duration_ms: 1,
+            output: String::new(),
+            command: None,
+            uses: None,
+            env_set: Vec::new(),
+        };
+        assert_eq!(
+            keys(&event_json(&finished)),
+            [
+                "conclusion",
+                "duration_ms",
+                "exit_code",
+                "index",
+                "job",
+                "outcome",
+                "output",
+                "output_truncated",
+                "status",
+                "step",
+                "type",
+            ]
+        );
+
+        let job = ExecutionEvent::JobFinished {
+            job: "j".to_string(),
+            status: JobStatus::Success,
+            failure_allowed: false,
+            duration_ms: 1,
+            logs: String::new(),
+        };
+        assert_eq!(
+            keys(&event_json(&job)),
+            ["duration_ms", "failure_allowed", "job", "status", "type"]
+        );
+    }
+
+    #[test]
+    fn run_finished_fields_are_pinned() {
+        let record: RunRecord = serde_json::from_value(json!({
+            "schema_version": SCHEMA_VERSION,
+            "id": "r",
+            "status": "success",
+            "workflow": "ci.yml",
+            "cwd": "/repo",
+            "repo_root": "/repo",
+            "git_sha": null,
+            "git_branch": null,
+            "git_dirty": null,
+            "runtime": "emulation",
+            "event": null,
+            "source": "cli",
+            "agent": null,
+            "intent": null,
+            "replay_of": null,
+            "argv": [],
+            "variables": [],
+            "pid": 1,
+            "started_at": "",
+            "finished_at": null,
+            "duration_ms": null,
+            "error": null,
+            "skip_reason": null,
+            "jobs": [],
+        }))
+        .unwrap();
+        assert_eq!(
+            keys(&run_finished_json(&record, None)),
+            [
+                "duration_ms",
+                "error",
+                "exit_code",
+                "failure",
+                "jobs",
+                "skip_reason",
+                "status",
+                "type",
+            ]
+        );
+    }
 }

@@ -1,6 +1,6 @@
 # Codebase Index: wrkflw
 
-> Generated: 2026-11-02 07:53:51 UTC | Files: 229 | Lines: 96917
+> Generated: 2026-11-02 11:11:37 UTC | Files: 229 | Lines: 97446
 > Languages: JSON (4), Markdown (26), Rust (137), Shell (5), TOML (19), YAML (38)
 
 ## Directory Structure
@@ -461,6 +461,9 @@ wrkflw/
 **crates/executor/src/events.rs**
 - `pub enum ExecutionEvent`
 - `pub trait ExecutionObserver: Send + Sync`
+- `pub const EXIT_CODE_LABEL: &str = "Exit code:"`
+- `pub const STDOUT_HEADER: &str = "Standard Output:"`
+- `pub const STDERR_HEADER: &str = "Standard Error:"`
 - `pub struct FromStep`
 - `pub struct RunHooks`
 - `pub async fn with_run_hooks<F: Future>(hooks: RunHooks, future: F) -> F::Output`
@@ -655,6 +658,7 @@ wrkflw/
 - `## wrkflw-models`
 
 **crates/models/src/lib.rs**
+- `pub enum Severity`
 - `pub struct ValidationIssue`
 - `pub const UNCLASSIFIED_RULE: &str = "unclassified"`
 - `pub struct ValidationResult`
@@ -1569,7 +1573,7 @@ wrkflw/
 
 ## AGENTS.md
 
-**Language:** Markdown | **Size:** 3.8 KB | **Lines:** 61
+**Language:** Markdown | **Size:** 4.3 KB | **Lines:** 65
 
 **Declarations:**
 
@@ -1577,7 +1581,7 @@ wrkflw/
 
 ## BREAKING_CHANGES.md
 
-**Language:** Markdown | **Size:** 13.5 KB | **Lines:** 284
+**Language:** Markdown | **Size:** 13.9 KB | **Lines:** 286
 
 **Declarations:**
 
@@ -1601,7 +1605,7 @@ wrkflw/
 
 ## INDEX.md
 
-**Language:** Markdown | **Size:** 202.6 KB | **Lines:** 7510
+**Language:** Markdown | **Size:** 207.2 KB | **Lines:** 7669
 
 **Declarations:**
 
@@ -2002,7 +2006,7 @@ wrkflw/
 
 ## crates/executor/src/engine.rs
 
-**Language:** Rust | **Size:** 489.9 KB | **Lines:** 13427
+**Language:** Rust | **Size:** 491.4 KB | **Lines:** 13448
 
 **Imports:**
 - `bollard::Docker`
@@ -2015,7 +2019,7 @@ wrkflw/
 - `std::sync::{Arc, Mutex}`
 - `thiserror::Error`
 - `ignore::{gitignore::GitignoreBuilder, Match}`
-- *... and 14 more imports*
+- *... and 15 more imports*
 
 **Declarations:**
 
@@ -2172,12 +2176,12 @@ wrkflw/
 > Fields: `key: String`, `path: String`, `workspace: std::path::PathBuf`
 
 `pub(crate) struct JobServices<'a>`
-> Fields: `secret_manager: Option<&'a SecretManager>`, `secret_masker: Option<&'a SecretMasker>`, `secrets_context: &'a HashMap<String, String>`, `needs_context: &'a HashMap<String, HashMap<String, String>>`, `needs_results: &'a HashMap<String, String>`, `artifact_store: &'a crate::artifacts::ArtifactStore`, `cache_store: &'a crate::cache::CacheStore`, `platform_overrides: &'a HashMap<String, String>`
+> Fields: `secret_manager: Option<&'a SecretManager>`, `secret_masker: Option<&'a SecretMasker>`, `secrets_context: &'a HashMap<String, String>`, `missing_secrets: &'a HashSet<String>`, `needs_context: &'a HashMap<String, HashMap<String, String>>`, `needs_results: &'a HashMap<String, String>`, `artifact_store: &'a crate::artifacts::ArtifactStore`, `cache_store: &'a crate::cache::CacheStore`, `platform_overrides: &'a HashMap<String, String>`
 
 `async fn flush_pending_cache_saves( pending: &std::sync::Mutex<Vec<PendingCacheSave>>, cache_store: &crate::cache::CacheStore, )`
 
 `struct StepLoopState`
-> Fields: `step_results: Vec<StepResult>`, `job_logs: String`, `step_outputs_map: HashMap<String, HashMap<String, String>>`, `step_status_map: HashMap<String, (String, String)>`, `job_status_str: String`, `job_label: String`, `job_started: std::time::Instant`, `step_started: std::time::Instant`, `current_step: Option<InFlightStep>`, `workspace_prefixes: Vec<String>`, `known_secrets: HashSet<String>`
+> Fields: `step_results: Vec<StepResult>`, `job_logs: String`, `step_outputs_map: HashMap<String, HashMap<String, String>>`, `step_status_map: HashMap<String, (String, String)>`, `job_status_str: String`, `job_label: String`, `job_started: std::time::Instant`, `step_started: std::time::Instant`, `current_step: Option<InFlightStep>`, `workspace_prefixes: Vec<String>`, `missing_secrets: HashSet<String>`
 
 `struct InFlightStep`
 > Fields: `index: usize`, `command: Option<String>`, `uses: Option<String>`
@@ -2185,7 +2189,7 @@ wrkflw/
 **`impl StepLoopState`**
   `fn new(job_label: &str, canonical_name: &str) -> Self`
 
-  `fn with_job_context(mut self, workspace: &Path, secrets: &HashMap<String, String>) -> Self`
+  `fn with_job_context(mut self, workspace: &Path, missing_secrets: &HashSet<String>) -> Self`
 
   `fn relative_to_workspace(&self, output: &str) -> String`
 
@@ -2212,11 +2216,11 @@ wrkflw/
 
 `async fn run_step_with_guards( step: &Step, step_idx: usize, job_env: &HashMap<String, String>, workflow: &WorkflowDefinition, step_exec_ctx: StepExecutionContext<'_>, ) -> Result<StepOutcome, ExecutionError>`
 
-`fn step_display_name(step: &Step, index: usize) -> String`
-
 `fn workspace_prefixes(workspace: &Path) -> Vec<String>`
 
-`fn missing_secrets_note(step: &Step, known: &HashSet<String>) -> Option<String>`
+`fn step_texts(step: &Step) -> impl Iterator<Item = &String>`
+
+`fn missing_secrets_note(step: &Step, missing: &HashSet<String>) -> Option<String>`
 
 `fn continues_on_error(value: Option<&str>, ctx: &crate::expression::ExpressionContext<'_>) -> bool`
 
@@ -2353,7 +2357,7 @@ wrkflw/
 
 `fn resolve_job_outputs( job: &Job, step_outputs_map: &HashMap<String, HashMap<String, String>>, step_status_map: &HashMap<String, (String, String)>, env_context: &HashMap<String, String>, user_env: &HashMap<String, String>, job_status: &str, working_dir: &Path, ) -> HashMap<String, String>`
 
-`async fn resolve_secrets_for_context( secret_manager: &SecretManager, job: &Job, ) -> HashMap<String, String>`
+`async fn resolve_secrets_for_context( secret_manager: &SecretManager, job: &Job, ) -> (HashMap<String, String>, HashSet<String>)`
 
 `mod tests`
 
@@ -2423,7 +2427,7 @@ wrkflw/
 
 ## crates/executor/src/events.rs
 
-**Language:** Rust | **Size:** 4.1 KB | **Lines:** 133
+**Language:** Rust | **Size:** 6.2 KB | **Lines:** 202
 
 **Imports:**
 - `crate::engine::{JobStatus, StepStatus}`
@@ -2432,6 +2436,8 @@ wrkflw/
 - `wrkflw_parser::workflow::Step`
 
 **Declarations:**
+
+`pub(crate) fn step_display_name(step: &Step, index: usize) -> String`
 
 **`impl FromStep`**
   `pub fn resolve(&self, steps: &[Step]) -> Option<usize>`
@@ -2442,6 +2448,8 @@ wrkflw/
 `pub(crate) fn first_step_for(job: &str, steps: &[Step]) -> usize`
 
 `pub(crate) fn skipped_by_from_step(index: usize, first_step: usize, step: &Step) -> bool`
+
+`mod tests`
 
 ---
 
@@ -2821,7 +2829,7 @@ wrkflw/
 
 ## crates/executor/src/lib.rs
 
-**Language:** Rust | **Size:** 784 B | **Lines:** 28
+**Language:** Rust | **Size:** 842 B | **Lines:** 31
 
 **Imports:**
 - `pub use docker::cleanup_resources`
@@ -2829,7 +2837,10 @@ wrkflw/
     detect_runtime, execute_workflow, parse_platform_override, ExecutionConfig, JobResult,
     JobStatus, RuntimeType, StepResult, StepStatus,
 }`
-- `pub use events::{with_run_hooks, ExecutionEvent, ExecutionObserver, FromStep, RunHooks}`
+- `pub use events::{
+    with_run_hooks, ExecutionEvent, ExecutionObserver, FromStep, RunHooks, EXIT_CODE_LABEL,
+    STDERR_HEADER, STDOUT_HEADER,
+}`
 - `pub use kubernetes::{parse_key_value as parse_k8s_key_value, KubernetesConfig}`
 
 **Declarations:**
@@ -3179,7 +3190,7 @@ wrkflw/
 
 ## crates/models/src/lib.rs
 
-**Language:** Rust | **Size:** 29.2 KB | **Lines:** 831
+**Language:** Rust | **Size:** 30.3 KB | **Lines:** 864
 
 **Imports:**
 - `serde::Serialize`
@@ -3197,6 +3208,10 @@ wrkflw/
 
   `pub fn report(&mut self, rule: &str, message: impl Into<String>)`
 
+  `pub fn warn(&mut self, rule: &str, message: impl Into<String>)`
+
+  `pub fn warnings(&self) -> impl Iterator<Item = &str>`
+
   `pub fn report_at(&mut self, rule: &str, key: &str, message: impl Into<String>)`
 
   `pub fn push_scope(&mut self, key: impl Into<String>)`
@@ -3209,7 +3224,7 @@ wrkflw/
 
   `pub fn locate_lines(&mut self, source: &str)`
 
-  `fn push_issue(&mut self, rule: &str, message: String, segments: Vec<String>)`
+  `fn push_issue( &mut self, severity: Severity, rule: &str, message: String, segments: Vec<String>, )`
 
 
 `fn render_path(segments: &[String]) -> Option<String>`
@@ -3555,12 +3570,13 @@ wrkflw/
 
 ## crates/runs/src/digest.rs
 
-**Language:** Rust | **Size:** 12.0 KB | **Lines:** 358
+**Language:** Rust | **Size:** 14.3 KB | **Lines:** 421
 
 **Imports:**
 - `crate::record::{JobRecord, RunRecord, RunStatus, StepRecord, SCHEMA_VERSION}`
 - `crate::store::RunStore`
 - `serde::Serialize`
+- `wrkflw_executor::{EXIT_CODE_LABEL, STDERR_HEADER, STDOUT_HEADER}`
 
 **Declarations:**
 
@@ -3569,6 +3585,10 @@ wrkflw/
 `const ERROR_WORDS: [&str`
 
 `fn tail(text: &str, lines: usize) -> (Vec<String>, usize)`
+
+`fn is_output_header(line: &str) -> bool`
+
+`fn output_start<S: AsRef<str>>(lines: &[S]) -> usize`
 
 `fn error_lines(text: &str, tail_lines: usize) -> Vec<String>`
 
@@ -4439,7 +4459,7 @@ wrkflw/
 
 ## crates/secrets/src/substitution.rs
 
-**Language:** Rust | **Size:** 10.6 KB | **Lines:** 303
+**Language:** Rust | **Size:** 11.3 KB | **Lines:** 320
 
 **Imports:**
 - `crate::{SecretError, SecretManager, SecretResult}`
@@ -4469,6 +4489,10 @@ wrkflw/
 
 
 **`impl SecretRef`**
+  `pub fn qualified_name(&self) -> String`
+
+  `pub async fn lookup(&self, manager: &SecretManager) -> SecretResult<crate::SecretValue>`
+
   `pub fn cache_key(&self) -> String`
 
 
@@ -5260,7 +5284,7 @@ wrkflw/
 
 ## crates/ui/src/handlers/workflow.rs
 
-**Language:** Rust | **Size:** 26.8 KB | **Lines:** 699
+**Language:** Rust | **Size:** 27.0 KB | **Lines:** 702
 
 **Imports:**
 - `crate::cli_style`
@@ -5938,7 +5962,7 @@ wrkflw/
 
 ## crates/validators/src/expressions.rs
 
-**Language:** Rust | **Size:** 12.4 KB | **Lines:** 372
+**Language:** Rust | **Size:** 13.2 KB | **Lines:** 388
 
 **Imports:**
 - `serde_yaml::{Mapping, Value}`
@@ -6476,7 +6500,7 @@ wrkflw/
 
 ## crates/wrkflw/src/json_output.rs
 
-**Language:** Rust | **Size:** 4.7 KB | **Lines:** 144
+**Language:** Rust | **Size:** 4.7 KB | **Lines:** 145
 
 **Imports:**
 - `crate::is_gitlab_pipeline`
@@ -6526,7 +6550,7 @@ wrkflw/
 
 ## crates/wrkflw/src/main.rs
 
-**Language:** Rust | **Size:** 56.2 KB | **Lines:** 1568
+**Language:** Rust | **Size:** 57.0 KB | **Lines:** 1589
 
 **Imports:**
 - `bollard::Docker`
@@ -6594,6 +6618,8 @@ wrkflw/
 `async fn handle_signals()`
 
 `pub(crate) fn is_gitlab_pipeline(path: &Path) -> bool`
+
+`fn raw_args() -> impl Iterator<Item = String>`
 
 `fn args_request_json(args: impl Iterator<Item = String>) -> bool`
 
@@ -6686,7 +6712,7 @@ wrkflw/
 
 ## crates/wrkflw/src/plan_cmd.rs
 
-**Language:** Rust | **Size:** 10.2 KB | **Lines:** 303
+**Language:** Rust | **Size:** 10.0 KB | **Lines:** 300
 
 **Imports:**
 - `crate::{is_gitlab_pipeline, prefilter, OutputFormat}`
@@ -6850,7 +6876,7 @@ wrkflw/
 
 ## crates/wrkflw/tests/agent_cli_test.rs
 
-**Language:** Rust | **Size:** 28.1 KB | **Lines:** 921
+**Language:** Rust | **Size:** 32.5 KB | **Lines:** 1041
 
 **Imports:**
 - `serde_json::{json, Value}`
@@ -6961,6 +6987,16 @@ wrkflw/
 `fn usage_errors_are_json_in_json_mode()`
 
 `fn validate_catches_filter_and_expression_mistakes()`
+
+`fn a_provider_failure_is_not_reported_as_a_missing_secret()`
+
+`fn a_secret_missing_from_a_named_provider_keeps_its_provider()`
+
+`fn matrix_failures_fold_when_only_the_script_differs()`
+
+`fn a_reported_step_name_can_be_passed_back_to_from_step()`
+
+`fn undefined_references_warn_without_failing_validation()`
 
 ---
 
@@ -7312,7 +7348,7 @@ wrkflw/
 
 ## skills/wrkflw/SKILL.md
 
-**Language:** Markdown | **Size:** 1.6 KB | **Lines:** 22
+**Language:** Markdown | **Size:** 1.7 KB | **Lines:** 22
 
 **Declarations:**
 

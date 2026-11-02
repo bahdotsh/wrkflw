@@ -16,7 +16,7 @@ use crate::action_resolver;
 use crate::dependency;
 use crate::docker;
 use crate::environment;
-use crate::events::step_display_name;
+use crate::events::{step_display_name, EXIT_CODE_LABEL, STDERR_HEADER, STDOUT_HEADER};
 use crate::kubernetes::{self, KubernetesConfig};
 use crate::podman;
 use wrkflw_logging;
@@ -5025,17 +5025,20 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                 exit_code = Some(container_output.exit_code);
                 // Add command details to output (show resolved version so
                 // users can see expression substitutions were applied)
-                output.push_str(&format!("Exit code: {}\n", container_output.exit_code));
+                output.push_str(&format!(
+                    "{EXIT_CODE_LABEL} {}\n",
+                    container_output.exit_code
+                ));
                 output.push_str(&format!("Command: {}\n\n", resolved_run));
 
                 if !container_output.stdout.is_empty() {
-                    output.push_str("Standard Output:\n");
+                    output.push_str(&format!("{STDOUT_HEADER}\n"));
                     output.push_str(&container_output.stdout);
                     output.push('\n');
                 }
 
                 if !container_output.stderr.is_empty() {
-                    output.push_str("Standard Error:\n");
+                    output.push_str(&format!("{STDERR_HEADER}\n"));
                     output.push_str(&container_output.stderr);
                     output.push('\n');
                 }

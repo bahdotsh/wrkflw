@@ -35,7 +35,7 @@ Prefer the MCP server if your client supports MCP:
 
 `step_finished.output` holds the last 64 KiB of a step's output, delivered when the step ends. Output is not streamed while a step runs.
 
-A failure has one entry per distinct failure. `also_failed_in` lists matrix legs that failed the same way, ignoring durations. `error_lines` holds lines above `output_tail` that look like errors. `note` warns about the run itself, such as `--from-step` having skipped earlier steps.
+`failures` has one entry per distinct failure, not per failed job, so count `jobs` on `run_finished` instead. `also_failed_in` lists matrix legs where the same step failed with the same exit code and output, ignoring durations, and `command` is the first leg's script. `error_lines` holds lines above `output_tail` that look like errors. `note` warns about the run itself, such as `--from-step` having skipped earlier steps.
 
 Workspace paths in step output are relative, so `tests/test_app.py` means that file in your repository.
 

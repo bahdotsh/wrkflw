@@ -969,6 +969,27 @@ fn a_secret_missing_from_a_named_provider_keeps_its_provider() {
 }
 
 #[test]
+fn matrix_failures_fold_when_only_the_script_differs() {
+    let sandbox = Sandbox::new();
+    sandbox.write(
+        "scripted.yml",
+        "name: s\non: [push]\njobs:\n  t:\n    runs-on: ubuntu-latest\n    strategy:\n      fail-fast: false\n      matrix:\n        n: [1, 2, 3]\n    steps:\n      - name: check\n        run: |\n          : ${{ matrix.n }}\n          echo boom\n          exit 1\n",
+    );
+    let output = sandbox.run(&[
+        "--format",
+        "json",
+        "run",
+        "--runtime",
+        "emulation",
+        ".github/workflows/scripted.yml",
+    ]);
+    let events = json_lines(&output);
+    let failures = &events.last().unwrap()["failure"]["failures"];
+    assert_eq!(failures.as_array().unwrap().len(), 1, "{failures}");
+    assert_eq!(failures[0]["also_failed_in"].as_array().unwrap().len(), 2);
+}
+
+#[test]
 fn a_reported_step_name_can_be_passed_back_to_from_step() {
     let sandbox = Sandbox::new();
     sandbox.write(

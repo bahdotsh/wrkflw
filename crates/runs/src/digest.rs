@@ -3,6 +3,7 @@
 use crate::record::{JobRecord, RunRecord, RunStatus, StepRecord, SCHEMA_VERSION};
 use crate::store::RunStore;
 use serde::Serialize;
+use wrkflw_executor::{EXIT_CODE_LABEL, STDERR_HEADER, STDOUT_HEADER};
 
 /// Lines of output kept per failed step.
 pub const DEFAULT_TAIL_LINES: usize = 40;
@@ -56,21 +57,38 @@ fn tail(text: &str, lines: usize) -> (Vec<String>, usize) {
     (kept, all.len())
 }
 
+fn is_output_header(line: &str) -> bool {
+    line == STDOUT_HEADER || line == STDERR_HEADER
+}
+
+/// Index of the first line a step printed. wrkflw reports the exit code and
+/// script ahead of the output, and a step that printed nothing has only
+/// those. Lines from anywhere else, such as a job log, are all output.
+fn output_start<S: AsRef<str>>(lines: &[S]) -> usize {
+    match lines.iter().position(|l| is_output_header(l.as_ref())) {
+        Some(header) => header + 1,
+        None if lines
+            .first()
+            .is_some_and(|l| l.as_ref().starts_with(EXIT_CODE_LABEL)) =>
+        {
+            lines.len()
+        }
+        None => 0,
+    }
+}
+
 /// Up to [`MAX_ERROR_LINES`] of the lines above the last `tail_lines` that
-/// mention an error. wrkflw prints the script ahead of the output, so a word
-/// in the script is not evidence and everything before the output is ignored.
+/// mention an error. A word in the script is not evidence, so only what the
+/// step printed counts.
 fn error_lines(text: &str, tail_lines: usize) -> Vec<String> {
     let all: Vec<&str> = text.lines().collect();
-    let above_tail = &all[..all.len().saturating_sub(tail_lines)];
-    let output_start = above_tail
-        .iter()
-        .position(|line| matches!(*line, "Standard Output:" | "Standard Error:"))
-        .unwrap_or(0);
-    let found: Vec<&&str> = above_tail[output_start..]
+    let tail_start = all.len().saturating_sub(tail_lines);
+    let above_tail = all.get(output_start(&all)..tail_start).unwrap_or(&[]);
+    let found: Vec<&&str> = above_tail
         .iter()
         .filter(|line| {
             let lower = line.to_lowercase();
-            ERROR_WORDS.iter().any(|word| lower.contains(word))
+            !is_output_header(line) && ERROR_WORDS.iter().any(|word| lower.contains(word))
         })
         .collect();
     found[found.len().saturating_sub(MAX_ERROR_LINES)..]
@@ -87,7 +105,7 @@ fn without_durations(line: &str) -> String {
         let word = word.trim_matches(|c| matches!(c, '(' | ')' | '[' | ']' | ','));
         word.strip_suffix("ms")
             .or_else(|| word.strip_suffix('s'))
-            .is_some_and(|number| number.parse::<f64>().is_ok())
+            .is_some_and(|number| number.parse::<f64>().is_ok_and(f64::is_finite))
     };
     let words: Vec<&str> = line
         .split_whitespace()
@@ -102,17 +120,18 @@ fn without_durations(line: &str) -> String {
     words.join(" ")
 }
 
-/// Whether two failures are one leg's failure repeated by another.
+/// Whether two failures of one job are one leg's failure repeated by another.
+/// Scripts and step names are left out: they often differ by nothing but the
+/// matrix value, and the same step printing the same thing is the same bug.
 fn same_failure(a: &FailedStep, b: &FailedStep) -> bool {
-    let tail = |failure: &FailedStep| -> Vec<String> {
-        failure
-            .output_tail
+    let printed = |failure: &FailedStep| -> Vec<String> {
+        let lines = &failure.output_tail;
+        lines[output_start(lines)..]
             .iter()
             .map(|line| without_durations(line))
             .collect()
     };
-    (&a.step, &a.command, &a.uses, a.exit_code) == (&b.step, &b.command, &b.uses, b.exit_code)
-        && tail(a) == tail(b)
+    (a.step_index, a.exit_code) == (b.step_index, b.exit_code) && printed(a) == printed(b)
 }
 
 /// The failures of `run`, with the legs of a matrix job that failed the same
@@ -338,6 +357,50 @@ mod tests {
             &failure(&["assert 5 != 6"]),
             &failure(&["assert 7 != 8"]),
         ));
+    }
+
+    #[test]
+    fn failures_differing_only_in_the_script_are_the_same() {
+        let leg = |version: &str| {
+            let command = format!("pytest --python {version}");
+            let tail = format!("Exit code: 1\nCommand: {command}\n\nStandard Output:\nboom");
+            FailedStep {
+                command: Some(command),
+                ..failure(&tail.lines().collect::<Vec<_>>())
+            }
+        };
+        assert!(same_failure(&leg("3.11"), &leg("3.12")));
+    }
+
+    #[test]
+    fn silent_failures_differing_only_in_the_script_are_the_same() {
+        assert!(same_failure(
+            &failure(&["Exit code: 1", "Command: run 1", ""]),
+            &failure(&["Exit code: 1", "Command: run 2", ""]),
+        ));
+    }
+
+    #[test]
+    fn failures_of_different_steps_are_not_the_same() {
+        let later = FailedStep {
+            step_index: Some(1),
+            ..failure(&["boom"])
+        };
+        assert!(!same_failure(&failure(&["boom"]), &later));
+    }
+
+    #[test]
+    fn output_headers_are_not_error_lines() {
+        let text = "Exit code: 1\nCommand: x\n\nStandard Output:\nout\n\
+                    Standard Error:\nerror: the cause\nnoise\nmore\n";
+        assert_eq!(error_lines(text, 2), ["error: the cause"]);
+    }
+
+    #[test]
+    fn a_long_script_above_a_short_output_is_not_error_lines() {
+        let text = "Exit code: 1\nCommand: echo error\necho fatal\necho failed\n\n\
+                    Standard Output:\nok\n";
+        assert!(error_lines(text, 3).is_empty());
     }
 
     #[test]

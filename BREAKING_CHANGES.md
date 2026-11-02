@@ -10,7 +10,7 @@ Files that passed may now fail with these rules: `unknown-trigger-filter`, `unte
 
 ## Failure digests fold matrix legs (unreleased)
 
-Legs of a matrix job that failed the same way share one entry in `failures`, with the others in `also_failed_in`. Code counting failed legs should read `jobs` on `run_finished`.
+Legs of a matrix job whose same step failed with the same exit code and output share one entry in `failures`, with the others in `also_failed_in`. The entry's `command` is the first leg's script. Code counting failed legs should read `jobs` on `run_finished`.
 
 ## `--event` needs a change set only for `paths:` filters (unreleased)
 

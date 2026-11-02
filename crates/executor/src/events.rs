@@ -53,6 +53,12 @@ pub trait ExecutionObserver: Send + Sync {
     fn on_event(&self, event: &ExecutionEvent);
 }
 
+/// How step output begins in a report: these lines separate what wrkflw
+/// printed about the step from what the step printed.
+pub const EXIT_CODE_LABEL: &str = "Exit code:";
+pub const STDOUT_HEADER: &str = "Standard Output:";
+pub const STDERR_HEADER: &str = "Standard Error:";
+
 /// The name a step reports under: its `name:`, its action, or its 1-based
 /// position.
 pub(crate) fn step_display_name(step: &Step, index: usize) -> String {

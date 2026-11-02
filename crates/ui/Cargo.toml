@@ -12,7 +12,13 @@ categories.workspace = true
 
 [features]
 default = ["tui"]
-tui = ["dep:crossterm", "dep:ratatui", "dep:terminal-colorsaurus"]
+tui = [
+    "dep:base64",
+    "dep:crossterm",
+    "dep:ratatui",
+    "dep:terminal-colorsaurus",
+    "dep:unicode-width",
+]
 
 [dependencies]
 # Internal crates
@@ -32,9 +38,11 @@ wrkflw-secrets.workspace = true
 # External dependencies
 chrono.workspace = true
 colored.workspace = true
+base64 = { version = "0.21", optional = true }
 crossterm = { workspace = true, optional = true }
 ratatui = { workspace = true, optional = true }
 terminal-colorsaurus = { workspace = true, optional = true }
+unicode-width = { version = "0.1", optional = true }
 serde.workspace = true
 serde_yaml.workspace = true
 tokio.workspace = true

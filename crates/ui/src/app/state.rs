@@ -87,6 +87,7 @@ pub struct App {
 
     // Help tab scrolling
     pub help_scroll: usize, // Scrolling position for help content
+    pub selection: Option<crate::selection::Selection>, // Mouse text selection
     pub runs: Vec<wrkflw_runs::RunRecord>,
     pub runs_selected: usize,
 
@@ -572,6 +573,7 @@ impl App {
             log_search_matches: Vec::new(),
             log_search_match_idx: 0,
             help_scroll: 0,
+            selection: None,
             runs: Vec::new(),
             runs_selected: 0,
 
@@ -1697,6 +1699,26 @@ impl App {
         self.status_message = Some(message);
         self.status_message_severity = StatusSeverity::Success;
         self.status_message_time = Some(Instant::now());
+    }
+
+    /// Reports a finished mouse copy on the status bar. Only a native
+    /// tool confirms the copy; OSC 52 is fire-and-forget, so that case
+    /// says what was done rather than claiming it worked.
+    pub fn report_copy(
+        &mut self,
+        text: &str,
+        result: std::io::Result<crate::selection::CopyMethod>,
+    ) {
+        let chars = text.chars().count();
+        match result {
+            Ok(crate::selection::CopyMethod::Native) => {
+                self.set_success_message(format!("Copied {} characters", chars));
+            }
+            Ok(crate::selection::CopyMethod::Terminal) => {
+                self.set_info_message(format!("Sent {} characters to the terminal", chars));
+            }
+            Err(e) => self.set_error_message(format!("Copy failed: {}", e)),
+        }
     }
 
     // Check if tick should happen

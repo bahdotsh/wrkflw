@@ -3,13 +3,16 @@ mod state;
 
 use crate::handlers::workflow::start_next_workflow_execution;
 use crate::models::{ExecutionResultMsg, QueuedExecution, Workflow, WorkflowStatus};
+use crate::selection;
 use crate::utils::load_workflows;
 use crate::views::{
     render_ui, TAB_COUNT, TAB_DAG, TAB_EXECUTION, TAB_HELP, TAB_LOGS, TAB_RUNS, TAB_SECRETS,
     TAB_TRIGGER, TAB_WORKFLOWS,
 };
 use crossterm::{
-    event::{self, Event, KeyCode, KeyModifiers},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -41,14 +44,11 @@ pub async fn run_wrkflw_tui(
     // happen before raw mode and the event loop take over the tty.
     crate::theme::install(theme);
 
-    // Terminal setup. Mouse capture is deliberately left off: the TUI
-    // handles no mouse events, and enabling capture would make the
-    // terminal send drags to us instead of selecting text, which
-    // breaks the terminal's own select-and-copy (the behaviour users
-    // get in Claude Code and most other TUIs).
+    // Terminal setup. Mouse capture hands drags to us so selection can
+    // stay inside one pane and copy on release; see `crate::selection`.
     enable_raw_mode()?;
     let mut stdout = stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     // Some terminals (e.g. iTerm2) carry the primary screen's contents
@@ -149,7 +149,11 @@ pub async fn run_wrkflw_tui(
     // Clean up terminal
     wrkflw_logging::set_quiet_mode(false);
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
     terminal.show_cursor()?;
 
     match result {
@@ -202,9 +206,14 @@ fn run_tui_event_loop(
 
     loop {
         // Always redraw the UI on each loop iteration to keep it responsive
+        let mut copied = None;
         terminal.draw(|f| {
             render_ui(f, app);
+            copied = selection::apply(&mut app.selection, f.buffer_mut());
         })?;
+        if let Some(text) = copied {
+            app.report_copy(&text, selection::copy_to_clipboard(&text));
+        }
 
         // Update the UI on every tick
         if last_tick.elapsed() >= tick_rate {
@@ -246,7 +255,25 @@ fn run_tui_event_loop(
 
         // Handle key events with a short timeout
         if event::poll(event_poll_timeout)? {
-            if let Event::Key(key) = event::read()? {
+            let event = match event::read()? {
+                Event::Mouse(mouse) => match selection::handle_mouse(&mut app.selection, mouse) {
+                    Some(code) => Event::Key(KeyEvent::from(code)),
+                    None => continue,
+                },
+                // Selections are in screen cells, which a resize reflows.
+                Event::Resize(..) => {
+                    app.selection = None;
+                    continue;
+                }
+                other => other,
+            };
+            if let Event::Key(key) = event {
+                // Any key dismisses a selection. Esc stops there, so
+                // clearing a highlight can't also quit the TUI.
+                if app.selection.take().is_some() && key.code == KeyCode::Esc {
+                    continue;
+                }
+
                 // Handle search input first if we're in search mode and logs tab
                 if app.selected_tab == TAB_LOGS && app.log_search_active {
                     app.handle_log_search_input(key.code);

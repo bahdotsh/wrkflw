@@ -96,12 +96,29 @@ mod tests {
         let cli = dir.join("fake-cli");
         fs::write(
             &cli,
-            format!("#!/bin/sh\necho \"$@\" >> {}\n", log.display()),
+            format!(
+                "#!/bin/sh\n[ \"$1\" = probe ] && exit 0\necho \"$@\" >> {}\n",
+                log.display()
+            ),
         )
         .unwrap();
         fs::set_permissions(&cli, fs::Permissions::from_mode(0o755)).unwrap();
+        // A fork on another test thread can briefly inherit the write handle,
+        // and exec then fails with ETXTBSY. The guard only spawns once, so
+        // wait here until the script can be executed.
+        for _ in 0..200 {
+            match Command::new(&cli).arg("probe").status() {
+                Err(e) if e.raw_os_error() == Some(ETXTBSY) => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                _ => break,
+            }
+        }
         (Box::leak(cli.display().to_string().into_boxed_str()), log)
     }
+
+    /// The same number on every Unix wrkflw builds for.
+    const ETXTBSY: i32 = 26;
 
     fn wait_for(path: &std::path::Path) -> Option<String> {
         for _ in 0..100 {

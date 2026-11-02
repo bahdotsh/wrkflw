@@ -16,6 +16,7 @@ use crate::action_resolver;
 use crate::dependency;
 use crate::docker;
 use crate::environment;
+use crate::events::step_display_name;
 use crate::kubernetes::{self, KubernetesConfig};
 use crate::podman;
 use wrkflw_logging;
@@ -3664,15 +3665,6 @@ async fn run_step_with_guards(
             })
         }
     }
-}
-
-/// The name a step reports under: its `name:`, its action, or its 1-based
-/// position.
-fn step_display_name(step: &Step, index: usize) -> String {
-    step.name
-        .clone()
-        .or_else(|| step.uses.clone())
-        .unwrap_or_else(|| format!("Step {}", index + 1))
 }
 
 /// Paths a job's workspace appears under in step output: the directory on

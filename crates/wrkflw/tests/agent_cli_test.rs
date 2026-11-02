@@ -919,3 +919,36 @@ fn validate_catches_filter_and_expression_mistakes() {
         assert!(rules.contains(rule), "{rule} in {rules}");
     }
 }
+
+#[test]
+fn a_reported_step_name_can_be_passed_back_to_from_step() {
+    let sandbox = Sandbox::new();
+    sandbox.write(
+        "unnamed.yml",
+        "name: u\non: [push]\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n      - run: echo one\n      - run: exit 1\n",
+    );
+    let path = ".github/workflows/unnamed.yml";
+    let output = sandbox.run(&["--format", "json", "run", "--runtime", "emulation", path]);
+    let events = json_lines(&output);
+    let reported = events.last().unwrap()["failure"]["failures"][0]["step"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(reported, "Step 3");
+
+    let output = sandbox.run(&[
+        "--format",
+        "json",
+        "run",
+        "--runtime",
+        "emulation",
+        "--job",
+        "a",
+        "--from-step",
+        &reported,
+        path,
+    ]);
+    let events = json_lines(&output);
+    let note = events.last().unwrap()["failure"]["note"].to_string();
+    assert!(note.contains("Step 3"), "{note}");
+}

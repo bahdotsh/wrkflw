@@ -53,20 +53,33 @@ pub trait ExecutionObserver: Send + Sync {
     fn on_event(&self, event: &ExecutionEvent);
 }
 
+/// The name a step reports under: its `name:`, its action, or its 1-based
+/// position.
+pub(crate) fn step_display_name(step: &Step, index: usize) -> String {
+    step.name
+        .clone()
+        .or_else(|| step.uses.clone())
+        .unwrap_or_else(|| format!("Step {}", index + 1))
+}
+
 /// Where a job should start, from `--from-step`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FromStep {
     pub job: String,
-    /// A step name, or a 1-based position.
+    /// A step's reported name, or a 1-based position.
     pub step: String,
 }
 
 impl FromStep {
     /// Index of the step to start from, among `steps`.
     pub fn resolve(&self, steps: &[Step]) -> Option<usize> {
+        // The name a run reports has to work here, so that a step named in
+        // a failure can be passed straight back. Repeated names resolve to
+        // the first, and a position tells them apart.
         let by_name = steps
             .iter()
-            .position(|s| s.name.as_deref() == Some(self.step.as_str()));
+            .enumerate()
+            .position(|(index, step)| step_display_name(step, index) == self.step);
         by_name.or_else(|| {
             let position: usize = self.step.parse().ok()?;
             (1..=steps.len()).contains(&position).then(|| position - 1)
@@ -130,4 +143,54 @@ pub(crate) fn skipped_by_from_step(index: usize, first_step: usize, step: &Step)
         .as_deref()
         .is_some_and(|uses| uses.starts_with("actions/checkout"));
     index < first_step && !is_checkout
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn step(name: Option<&str>, uses: Option<&str>) -> Step {
+        serde_yaml::from_value(
+            serde_yaml::to_value(serde_json::json!({
+                "name": name,
+                "uses": uses,
+            }))
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn resolve(wanted: &str, steps: &[Step]) -> Option<usize> {
+        FromStep {
+            job: "build".to_string(),
+            step: wanted.to_string(),
+        }
+        .resolve(steps)
+    }
+
+    #[test]
+    fn every_reported_step_name_resolves_to_its_step() {
+        let steps = [
+            step(None, Some("actions/checkout@v4")),
+            step(Some("build"), None),
+            step(None, None),
+        ];
+        for (index, step) in steps.iter().enumerate() {
+            assert_eq!(
+                resolve(&step_display_name(step, index), &steps),
+                Some(index)
+            );
+        }
+    }
+
+    #[test]
+    fn a_position_reaches_a_repeated_action() {
+        let steps = [
+            step(None, Some("actions/cache@v4")),
+            step(None, Some("actions/cache@v4")),
+        ];
+        assert_eq!(resolve("actions/cache@v4", &steps), Some(0));
+        assert_eq!(resolve("2", &steps), Some(1));
+        assert_eq!(resolve("3", &steps), None);
+    }
 }

@@ -18,7 +18,7 @@ Legs of a matrix job that failed the same way share one entry in `failures`, wit
 
 ## Unnamed `uses:` steps report the action (unreleased)
 
-An unnamed step with `uses:` is reported as `actions/checkout@v4` rather than `Step 1`, including in run history. Log file names change with it. Unnamed `run:` steps keep `Step N`, and `--from-step` and `--step` still accept a 1-based position.
+An unnamed step with `uses:` is reported as `actions/checkout@v4` rather than `Step 1`, including in run history. Log file names change with it. Unnamed `run:` steps keep `Step N`. `--from-step` accepts any name a run reports, and still accepts a 1-based position, which is how to reach a repeated action after the first.
 
 ## Step output in events and history has relative paths (unreleased)
 

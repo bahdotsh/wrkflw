@@ -8,112 +8,137 @@ use wrkflw_models::ValidationResult;
 pub fn validate_jobs(jobs: &Value, repo_root: Option<&Path>, result: &mut ValidationResult) {
     if let Value::Mapping(jobs_map) = jobs {
         if jobs_map.is_empty() {
-            result.add_issue("'jobs' section is empty".to_string());
+            result.report("empty-jobs", "'jobs' section is empty");
             return;
         }
 
         for (job_name, job_config) in jobs_map {
             if let Some(job_name) = job_name.as_str() {
-                if let Some(job_config) = job_config.as_mapping() {
-                    // Check if this is a reusable workflow job (has 'uses' field)
-                    let is_reusable_workflow =
-                        job_config.contains_key(Value::String("uses".to_string()));
-
-                    // Only check for 'runs-on' if it's not a reusable workflow
-                    if !is_reusable_workflow
-                        && !job_config.contains_key(Value::String("runs-on".to_string()))
-                    {
-                        result.add_issue(format!("Job '{}' is missing 'runs-on' field", job_name));
-                    }
-
-                    // Only check for steps if it's not a reusable workflow
-                    if !is_reusable_workflow {
-                        match job_config.get(Value::String("steps".to_string())) {
-                            Some(Value::Sequence(steps)) => {
-                                if steps.is_empty() {
-                                    result.add_issue(format!(
-                                        "Job '{}' has empty 'steps' section",
-                                        job_name
-                                    ));
-                                } else {
-                                    validate_steps(steps, job_name, repo_root, result);
-                                }
-                            }
-                            Some(_) => {
-                                result.add_issue(format!(
-                                    "Job '{}': 'steps' section is not a sequence",
-                                    job_name
-                                ));
-                            }
-                            None => {
-                                result.add_issue(format!(
-                                    "Job '{}' is missing 'steps' section",
-                                    job_name
-                                ));
-                            }
-                        }
-                    } else {
-                        // For reusable workflows, validate the 'uses' field format
-                        if let Some(Value::String(uses)) =
-                            job_config.get(Value::String("uses".to_string()))
-                        {
-                            // Simple validation for reusable workflow reference format
-                            if !uses.contains('/') && !uses.contains('.') {
-                                result.add_issue(format!(
-                                    "Job '{}': Invalid reusable workflow reference format '{}'",
-                                    job_name, uses
-                                ));
-                            }
-                        }
-                    }
-
-                    // Check for job dependencies
-                    if let Some(Value::Sequence(needs)) =
-                        job_config.get(Value::String("needs".to_string()))
-                    {
-                        for need in needs {
-                            if let Some(need_str) = need.as_str() {
-                                if !jobs_map.contains_key(Value::String(need_str.to_string())) {
-                                    result.add_issue(format!(
-                                        "Job '{}' depends on non-existent job '{}'",
-                                        job_name, need_str
-                                    ));
-                                }
-                            }
-                        }
-                    } else if let Some(Value::String(need)) =
-                        job_config.get(Value::String("needs".to_string()))
-                    {
-                        if !jobs_map.contains_key(Value::String(need.clone())) {
-                            result.add_issue(format!(
-                                "Job '{}' depends on non-existent job '{}'",
-                                job_name, need
-                            ));
-                        }
-                    }
-
-                    // Validate env is a mapping, not a bare string
-                    if let Some(env_val) = job_config.get(Value::String("env".to_string())) {
-                        validate_env(env_val, &format!("Job '{}'", job_name), result);
-                    }
-
-                    // Validate matrix configuration if present
-                    if let Some(strategy) = job_config.get(Value::String("strategy".to_string())) {
-                        if let Some(strategy_map) = strategy.as_mapping() {
-                            if let Some(matrix) =
-                                strategy_map.get(Value::String("matrix".to_string()))
-                            {
-                                validate_matrix(matrix, result);
-                            }
-                        }
-                    }
-                } else {
-                    result.add_issue(format!("Job '{}' configuration is not a mapping", job_name));
-                }
+                result.scoped(job_name, |r| {
+                    validate_job(job_name, job_config, jobs_map, repo_root, r)
+                });
             }
         }
 
         detect_cyclic_needs(jobs_map, result);
+    }
+}
+
+/// Validate one job. Expects `result` to be scoped to the job's key.
+fn validate_job(
+    job_name: &str,
+    job_config: &Value,
+    jobs_map: &serde_yaml::Mapping,
+    repo_root: Option<&Path>,
+    result: &mut ValidationResult,
+) {
+    let Some(job_config) = job_config.as_mapping() else {
+        result.report(
+            "job-not-mapping",
+            format!("Job '{}' configuration is not a mapping", job_name),
+        );
+        return;
+    };
+
+    // Check if this is a reusable workflow job (has 'uses' field)
+    let is_reusable_workflow = job_config.contains_key(Value::String("uses".to_string()));
+
+    // Only check for 'runs-on' if it's not a reusable workflow
+    if !is_reusable_workflow && !job_config.contains_key(Value::String("runs-on".to_string())) {
+        result.report_at(
+            "missing-runs-on",
+            "runs-on",
+            format!("Job '{}' is missing 'runs-on' field", job_name),
+        );
+    }
+
+    // Only check for steps if it's not a reusable workflow
+    if !is_reusable_workflow {
+        match job_config.get(Value::String("steps".to_string())) {
+            Some(Value::Sequence(steps)) => {
+                if steps.is_empty() {
+                    result.report_at(
+                        "empty-steps",
+                        "steps",
+                        format!("Job '{}' has empty 'steps' section", job_name),
+                    );
+                } else {
+                    result.scoped("steps", |r| validate_steps(steps, job_name, repo_root, r));
+                }
+            }
+            Some(_) => {
+                result.report_at(
+                    "steps-not-sequence",
+                    "steps",
+                    format!("Job '{}': 'steps' section is not a sequence", job_name),
+                );
+            }
+            None => {
+                result.report_at(
+                    "missing-steps",
+                    "steps",
+                    format!("Job '{}' is missing 'steps' section", job_name),
+                );
+            }
+        }
+    } else {
+        // For reusable workflows, validate the 'uses' field format
+        if let Some(Value::String(uses)) = job_config.get(Value::String("uses".to_string())) {
+            // Simple validation for reusable workflow reference format
+            if !uses.contains('/') && !uses.contains('.') {
+                result.report_at(
+                    "invalid-reusable-workflow",
+                    "uses",
+                    format!(
+                        "Job '{}': Invalid reusable workflow reference format '{}'",
+                        job_name, uses
+                    ),
+                );
+            }
+        }
+    }
+
+    // Check for job dependencies
+    if let Some(Value::Sequence(needs)) = job_config.get(Value::String("needs".to_string())) {
+        for need in needs {
+            if let Some(need_str) = need.as_str() {
+                if !jobs_map.contains_key(Value::String(need_str.to_string())) {
+                    result.report_at(
+                        "undefined-need",
+                        "needs",
+                        format!(
+                            "Job '{}' depends on non-existent job '{}'",
+                            job_name, need_str
+                        ),
+                    );
+                }
+            }
+        }
+    } else if let Some(Value::String(need)) = job_config.get(Value::String("needs".to_string())) {
+        if !jobs_map.contains_key(Value::String(need.clone())) {
+            result.report_at(
+                "undefined-need",
+                "needs",
+                format!("Job '{}' depends on non-existent job '{}'", job_name, need),
+            );
+        }
+    }
+
+    // Validate env is a mapping, not a bare string
+    if let Some(env_val) = job_config.get(Value::String("env".to_string())) {
+        let context = format!("Job '{}'", job_name);
+        result.scoped("env", |r| validate_env(env_val, &context, r));
+    }
+
+    // Validate matrix configuration if present
+    if let Some(strategy) = job_config.get(Value::String("strategy".to_string())) {
+        if let Some(strategy_map) = strategy.as_mapping() {
+            if let Some(matrix) = strategy_map.get(Value::String("matrix".to_string())) {
+                result.scoped("strategy", |r| {
+                    r.scoped("matrix", |r| validate_matrix(matrix, r))
+                });
+            }
+        }
     }
 }
 
@@ -209,10 +234,15 @@ fn dfs_detect_cycle(
                             .cloned()
                             .collect::<Vec<_>>()
                             .join(" -> ");
-                        result.add_issue(format!(
-                            "Circular dependency detected in 'needs': {}",
-                            display
-                        ));
+                        // Anchor on the normalized first node so the location
+                        // does not depend on where the DFS happened to start.
+                        result.scoped(cycle_nodes[0].as_str(), |r| {
+                            r.report_at(
+                                "circular-needs",
+                                "needs",
+                                format!("Circular dependency detected in 'needs': {}", display),
+                            )
+                        });
                     }
                 }
             } else if !visited.contains(neighbor.as_str()) {

@@ -29,10 +29,13 @@ pub fn validate_env(env: &Value, context: &str, result: &mut ValidationResult) {
         return;
     }
     let kind = yaml_type_name(env);
-    result.add_issue(format!(
-        "{}: 'env' must be a mapping of key-value pairs, not a {}",
-        context, kind
-    ));
+    result.report(
+        "env-not-mapping",
+        format!(
+            "{}: 'env' must be a mapping of key-value pairs, not a {}",
+            context, kind
+        ),
+    );
 }
 
 fn yaml_type_name(v: &Value) -> &'static str {

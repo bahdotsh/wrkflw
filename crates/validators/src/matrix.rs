@@ -5,33 +5,45 @@ pub fn validate_matrix(matrix: &Value, result: &mut ValidationResult) {
     // A whole matrix given as an expression is only known at run time
     if let Some(expr) = matrix.as_str().filter(|s| wrkflw_matrix::is_expression(s)) {
         if let Err(e) = wrkflw_matrix::check_strategy_expression(expr) {
-            result.add_issue(format!("matrix {}", e));
+            result.report("matrix-invalid-expression", format!("matrix {}", e));
         }
         return;
     }
 
     // Check if matrix is a mapping
     if !matrix.is_mapping() {
-        result.add_issue("Matrix must be a mapping".to_string());
+        result.report("matrix-not-mapping", "Matrix must be a mapping".to_string());
         return;
     }
 
     // Check for include and exclude sections
     if let Some(include) = matrix.get("include") {
-        validate_include_exclude(include, "include", result);
+        result.scoped("include", |r| {
+            validate_include_exclude(include, "include", r)
+        });
     }
 
     if let Some(exclude) = matrix.get("exclude") {
-        validate_include_exclude(exclude, "exclude", result);
+        result.scoped("exclude", |r| {
+            validate_include_exclude(exclude, "exclude", r)
+        });
     }
 
     // Check max-parallel
     if let Some(max_parallel) = matrix.get("max-parallel") {
         if !max_parallel.is_number() {
-            result.add_issue("max-parallel must be a number".to_string());
+            result.report_at(
+                "matrix-invalid-max-parallel",
+                "max-parallel",
+                "max-parallel must be a number".to_string(),
+            );
         } else if let Some(value) = max_parallel.as_u64() {
             if value == 0 {
-                result.add_issue("max-parallel must be greater than 0".to_string());
+                result.report_at(
+                    "matrix-invalid-max-parallel",
+                    "max-parallel",
+                    "max-parallel must be greater than 0".to_string(),
+                );
             }
         }
     }
@@ -39,7 +51,11 @@ pub fn validate_matrix(matrix: &Value, result: &mut ValidationResult) {
     // Check fail-fast
     if let Some(fail_fast) = matrix.get("fail-fast") {
         if !fail_fast.is_bool() {
-            result.add_issue("fail-fast must be a boolean".to_string());
+            result.report_at(
+                "matrix-invalid-fail-fast",
+                "fail-fast",
+                "fail-fast must be a boolean".to_string(),
+            );
         }
     }
 
@@ -49,15 +65,21 @@ pub fn validate_matrix(matrix: &Value, result: &mut ValidationResult) {
     // Use if let to avoid unwrap
     if let Some(mapping) = matrix.as_mapping() {
         for (key, value) in mapping {
-            // Safely get the key string, using an empty string as fallback
-            let key_str = key.as_str().unwrap_or("");
-            if !special_keys.contains(&key_str) {
-                validate_matrix_parameter(key_str, value, result);
+            // Non-string keys have no path of their own, so they stay at the matrix
+            match key.as_str() {
+                Some(key_str) if special_keys.contains(&key_str) => {}
+                Some(key_str) => {
+                    result.scoped(key_str, |r| validate_matrix_parameter(key_str, value, r));
+                }
+                None => validate_matrix_parameter("", value, result),
             }
         }
     } else {
         // This is a safeguard, though we already checked if it's a mapping above
-        result.add_issue("Failed to process matrix mapping".to_string());
+        result.report(
+            "matrix-not-mapping",
+            "Failed to process matrix mapping".to_string(),
+        );
     }
 }
 
@@ -65,13 +87,19 @@ fn validate_include_exclude(section: &Value, section_name: &str, result: &mut Va
     // An expression such as `${{ fromJSON(...) }}` is only known at run time
     if let Some(expr) = section.as_str().filter(|s| wrkflw_matrix::is_expression(s)) {
         if let Err(e) = wrkflw_matrix::check_strategy_expression(expr) {
-            result.add_issue(format!("{} {}", section_name, e));
+            result.report(
+                "matrix-invalid-expression",
+                format!("{} {}", section_name, e),
+            );
         }
         return;
     }
 
     if !section.is_sequence() {
-        result.add_issue(format!("{} must be an array of objects", section_name));
+        result.report(
+            "matrix-section-not-array",
+            format!("{} must be an array of objects", section_name),
+        );
         return;
     }
 
@@ -80,15 +108,20 @@ fn validate_include_exclude(section: &Value, section_name: &str, result: &mut Va
     if let Some(sequence) = section.as_sequence() {
         for (index, item) in sequence.iter().enumerate() {
             if !item.is_mapping() {
-                result.add_issue(format!(
-                    "{} item at index {} must be an object",
-                    section_name, index
-                ));
+                result.push_index(index);
+                result.report(
+                    "matrix-item-not-object",
+                    format!("{} item at index {} must be an object", section_name, index),
+                );
+                result.pop_scope();
             }
         }
     } else {
         // This is a safeguard, though we already checked if it's a sequence above
-        result.add_issue(format!("Failed to process {} sequence", section_name));
+        result.report(
+            "matrix-section-not-array",
+            format!("Failed to process {} sequence", section_name),
+        );
     }
 }
 
@@ -104,10 +137,12 @@ fn validate_matrix_parameter(name: &str, value: &Value, result: &mut ValidationR
                     for (i, item) in seq.iter().enumerate().skip(1) {
                         let item_type = get_value_type(item);
                         if item_type != first_type {
-                            result.add_issue(format!(
+                            result.push_index(i);
+                            result.report("matrix-inconsistent-types", format!(
                                 "Matrix parameter '{}' has inconsistent types: item at index {} is {}, but expected {}",
                                 name, i, item_type, first_type
                             ));
+                            result.pop_scope();
                         }
                     }
                 }
@@ -120,7 +155,10 @@ fn validate_matrix_parameter(name: &str, value: &Value, result: &mut ValidationR
         // An expression must stick to what `strategy` can see, as at run time
         Value::String(expr) if wrkflw_matrix::is_expression(expr) => {
             if let Err(e) = wrkflw_matrix::check_strategy_expression(expr) {
-                result.add_issue(format!("matrix axis {} {}", name, e));
+                result.report(
+                    "matrix-invalid-expression",
+                    format!("matrix axis {} {}", name, e),
+                );
             }
         }
         // Other types (string, number, bool) are valid as single values

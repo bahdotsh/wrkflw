@@ -57,8 +57,7 @@ struct Live {
     volumes: Vec<(PathBuf, PathBuf)>,
     id: String,
     /// Removes the containers when the session ends, however it ends.
-    #[allow(dead_code)]
-    containers: Containers,
+    _cleanup: Containers,
 }
 
 /// Every container of a session, oldest first.
@@ -91,10 +90,6 @@ impl Drop for Containers {
         if self.ids.is_empty() {
             return;
         }
-        let untrack = untrack_for(self.cli);
-        for id in &self.ids {
-            untrack(id);
-        }
         let spawned = std::process::Command::new(self.cli)
             .args(self.removal_args())
             .stdin(Stdio::null())
@@ -103,6 +98,12 @@ impl Drop for Containers {
             .spawn();
         match spawned {
             Ok(mut child) => {
+                // Only now: if removal couldn't start, the cleanup on exit
+                // still has to know about these containers.
+                let untrack = untrack_for(self.cli);
+                for id in &self.ids {
+                    untrack(id);
+                }
                 std::thread::spawn(move || {
                     let _ = child.wait();
                 });
@@ -443,7 +444,7 @@ impl JobSession {
             image: image.to_string(),
             volumes: volumes.to_vec(),
             id,
-            containers,
+            _cleanup: containers,
         })
     }
 
@@ -451,8 +452,9 @@ impl JobSession {
     ///
     /// `Ok(None)` means the caller should run the step the ordinary way: the
     /// step wants another image or other mounts, or the image can't idle.
-    /// `Err` is a service failure, which fails the step. Falling back there
-    /// would run tests against a database that isn't there.
+    /// Never with services, as a step outside the job container can't reach
+    /// them: that is an `Err`, which fails the step rather than running tests
+    /// against a database that isn't there.
     pub(crate) async fn run(
         &self,
         image: &str,
@@ -500,7 +502,21 @@ impl JobSession {
         let same_mounts = live.volumes.len() == wanted.len()
             && wanted.iter().all(|volume| live.volumes.contains(volume));
         if live.image != image || !same_mounts {
-            return Ok(None);
+            if self.services.is_empty() {
+                return Ok(None);
+            }
+            let difference = if live.image != image {
+                format!(
+                    "uses image {}, not the job container's {}",
+                    image, live.image
+                )
+            } else {
+                "needs other mounts than the job container".to_string()
+            };
+            return Err(format!(
+                "this step {}, so it can't reach the job's services",
+                difference
+            ));
         }
         let id = live.id.clone();
         state.busy = true;
@@ -690,6 +706,18 @@ mod tests {
         assert!(first.contains("didn't start"), "{}", first);
         assert_eq!(step(&session, "ubuntu").await.unwrap_err(), first);
         assert_eq!(calls(&log, "run"), 2);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn another_image_fails_a_step_that_needs_services() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cli, log) = fake_cli(dir.path(), "nothing-fails");
+        let session = session(cli, vec![db_service()]);
+        assert!(step(&session, "ubuntu").await.unwrap().is_some());
+        let error = step(&session, "alpine").await.unwrap_err();
+        assert!(error.contains("services"), "{}", error);
+        assert_eq!(calls(&log, "exec"), 1);
     }
 
     #[cfg(unix)]

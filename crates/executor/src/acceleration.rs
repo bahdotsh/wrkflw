@@ -524,12 +524,35 @@ fn create_dep_cache_dirs() -> Vec<(PathBuf, PathBuf)> {
 pub(crate) enum Decision {
     /// Run it. A `Some` key means a pass can be stored under it.
     Run { key: Option<String> },
-    /// Don't run it: this result stands. `step` names what reports show.
-    Reuse {
-        jobs: Vec<StoredJob>,
-        note: String,
-        step: &'static str,
-    },
+    /// Don't run it: this result stands.
+    Reuse { jobs: Vec<StoredJob>, why: Reused },
+}
+
+/// Why a job's earlier result stands in for running it.
+pub(crate) enum Reused {
+    /// `--affected`: none of its paths changed.
+    Unaffected,
+    /// A pass is stored under this fingerprint.
+    Stored { key: String },
+}
+
+impl Reused {
+    /// The one step reports show for the job.
+    pub(crate) fn step(&self) -> &'static str {
+        match self {
+            Reused::Unaffected => "Not affected",
+            Reused::Stored { .. } => "Reuse result",
+        }
+    }
+
+    pub(crate) fn note(&self) -> String {
+        match self {
+            Reused::Unaffected => {
+                "Not affected: no changed file is among this job's paths".to_string()
+            }
+            Reused::Stored { key } => format!("Reused the passing result {}", &key[..12]),
+        }
+    }
 }
 
 pub(crate) struct Lookup<'a> {
@@ -628,8 +651,7 @@ pub(crate) async fn decide(lookup: Lookup<'_>) -> Decision {
                     canonical_name: lookup.job_name.to_string(),
                     outputs: HashMap::new(),
                 }],
-                note: "Not affected: no changed file is among this job's paths".to_string(),
-                step: "Not affected",
+                why: Reused::Unaffected,
             };
         }
     }
@@ -653,8 +675,7 @@ pub(crate) async fn decide(lookup: Lookup<'_>) -> Decision {
     if let Some(entry) = store.load(&key).await {
         return Decision::Reuse {
             jobs: entry.jobs,
-            note: format!("Reused the passing result {}", &key[..12]),
-            step: "Reuse result",
+            why: Reused::Stored { key },
         };
     }
     Decision::Run { key: Some(key) }

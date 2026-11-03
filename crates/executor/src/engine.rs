@@ -2586,7 +2586,8 @@ async fn execute_job_with_matrix(
     })
     .await;
     let result_key = match decision {
-        acceleration::Decision::Reuse { jobs, note, step } => {
+        acceleration::Decision::Reuse { jobs, why } => {
+            let (note, step) = (why.note(), why.step());
             return Ok(jobs
                 .into_iter()
                 .map(|stored| {

@@ -8544,6 +8544,8 @@ runs:
     struct OverlappingRuntime {
         all_steps_running: tokio::sync::Barrier,
         github_dirs: Mutex<std::collections::HashSet<PathBuf>>,
+        /// For each step: whether the run's acceleration state reached it.
+        saw_run_state: Mutex<Vec<bool>>,
     }
 
     #[async_trait::async_trait]
@@ -8572,6 +8574,10 @@ runs:
                 .lock()
                 .unwrap()
                 .insert(github_dir.to_path_buf());
+            self.saw_run_state
+                .lock()
+                .unwrap()
+                .push(acceleration::current().is_some());
             fs::write(
                 github_dir.join("output"),
                 format!("value={}\n", env("GITHUB_JOB")),
@@ -8643,29 +8649,46 @@ runs:
         let runtime = OverlappingRuntime {
             all_steps_running: tokio::sync::Barrier::new(2),
             github_dirs: Mutex::default(),
+            saw_run_state: Mutex::default(),
         };
         let jobs: Vec<String> = jobs.iter().map(|job| job.to_string()).collect();
+        let state = acceleration::RunState::new(
+            acceleration::Acceleration::default(),
+            false,
+            run_dir.path().to_path_buf(),
+        )
+        .unwrap();
         let results = tokio::time::timeout(
             std::time::Duration::from_secs(30),
-            execute_job_batch(
-                &jobs,
-                &workflow,
-                &runtime,
-                &env_context,
-                &HashMap::new(),
-                false,
-                None,
-                None,
-                &HashMap::new(),
-                &HashMap::new(),
-                &crate::artifacts::ArtifactStore::new(run_dir.path()).unwrap(),
-                &crate::cache::CacheStore::new().unwrap(),
-                &HashMap::new(),
+            acceleration::with_run_state(
+                std::sync::Arc::new(state),
+                execute_job_batch(
+                    &jobs,
+                    &workflow,
+                    &runtime,
+                    &env_context,
+                    &HashMap::new(),
+                    false,
+                    None,
+                    None,
+                    &HashMap::new(),
+                    &HashMap::new(),
+                    &crate::artifacts::ArtifactStore::new(run_dir.path()).unwrap(),
+                    &crate::cache::CacheStore::new().unwrap(),
+                    &HashMap::new(),
+                ),
             ),
         )
         .await
         .expect("both steps must overlap")
         .unwrap();
+        let saw_run_state = runtime.saw_run_state.into_inner().unwrap();
+        assert!(
+            !saw_run_state.is_empty() && saw_run_state.iter().all(|saw| *saw),
+            "a parallel job left the run's task and lost reuse, job containers \
+             and services: {:?}",
+            saw_run_state
+        );
         let github_dirs = runtime.github_dirs.into_inner().unwrap();
         (results, github_dirs, run_dir)
     }

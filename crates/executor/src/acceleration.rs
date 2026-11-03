@@ -225,11 +225,18 @@ fn matches_any(path: &str, patterns: &[glob::Pattern]) -> bool {
 }
 
 /// `hints.paths` plus the files that always count, or `None` for every file.
-fn input_patterns(hints: Option<&JobHints>) -> Result<Option<Vec<glob::Pattern>>, String> {
+///
+/// The files that always count include every local action `job` uses, as a
+/// step loads `uses: ./tools/x` without the job's paths naming it.
+fn input_patterns(
+    job: &Job,
+    hints: Option<&JobHints>,
+) -> Result<Option<Vec<glob::Pattern>>, String> {
     let Some(paths) = hints.and_then(|h| h.paths.as_ref()) else {
         return Ok(None);
     };
     let mut patterns = compile_globs(ALWAYS_INPUT);
+    patterns.extend(local_action_patterns(job));
     for path in paths {
         patterns.push(
             glob::Pattern::new(path)
@@ -237,6 +244,22 @@ fn input_patterns(hints: Option<&JobHints>) -> Result<Option<Vec<glob::Pattern>>
         );
     }
     Ok(Some(patterns))
+}
+
+/// A pattern for the directory of each `uses: ./<dir>` step in `job`.
+fn local_action_patterns(job: &Job) -> Vec<glob::Pattern> {
+    job.steps
+        .iter()
+        .filter_map(|step| step.uses.as_deref()?.strip_prefix("./"))
+        .filter_map(|dir| {
+            let dir = dir.trim_end_matches('/');
+            if dir.is_empty() {
+                // An action at the repository root can read any file.
+                return glob::Pattern::new("**").ok();
+            }
+            glob::Pattern::new(&format!("{}/**", glob::Pattern::escape(dir))).ok()
+        })
+        .collect()
 }
 
 /// Whether `permissions:`, at the job or workflow level, grants any write.
@@ -624,7 +647,7 @@ fn unaffected(
     if job.outputs.as_ref().is_some_and(|o| !o.is_empty()) || job.matrix_config().is_some() {
         return Ok(false);
     }
-    let Some(patterns) = input_patterns(hints)? else {
+    let Some(patterns) = input_patterns(job, hints)? else {
         return Ok(false);
     };
     let needs_ran = job
@@ -672,7 +695,7 @@ pub(crate) async fn decide(lookup: Lookup<'_>) -> Decision {
         ));
         return run_it;
     }
-    let patterns = match input_patterns(hints) {
+    let patterns = match input_patterns(lookup.job, hints) {
         Ok(patterns) => patterns,
         Err(e) => {
             wrkflw_logging::warning(&format!("{}. Running job '{}'", e, lookup.job_name));
@@ -795,7 +818,7 @@ mod tests {
         paths: Option<Vec<String>>,
     ) -> String {
         let hints = JobHints { paths, cache: true };
-        let patterns = input_patterns(Some(&hints)).unwrap();
+        let patterns = input_patterns(job_def, Some(&hints)).unwrap();
         let empty_env = HashMap::new();
         let empty_outputs = HashMap::new();
         let empty_results = HashMap::new();
@@ -1223,6 +1246,23 @@ jobs:
         }
         let reads_only = job("permissions: {contents: read}\nsteps:\n  - run: x\n");
         assert!(uncacheable_reason(&reads_only, &with("write-all"), None).is_none());
+    }
+
+    #[test]
+    fn a_local_action_counts_even_with_a_path_hint() {
+        let dir = repo();
+        std::fs::create_dir_all(dir.path().join("tools/act")).unwrap();
+        std::fs::write(dir.path().join("tools/act/action.yml"), "a").unwrap();
+        git(dir.path(), &["add", "."]);
+        let wf = workflow();
+        let definition = job("steps:\n  - uses: ./tools/act/\n");
+        let hint = || Some(vec!["src/**".to_string()]);
+        let before = key_for(&definition, &wf, &hash_tree(dir.path()).unwrap(), hint());
+        std::fs::write(dir.path().join("tools/act/action.yml"), "b").unwrap();
+        let after = key_for(&definition, &wf, &hash_tree(dir.path()).unwrap(), hint());
+        assert_ne!(before, after);
+        let patterns = local_action_patterns(&job("steps:\n  - uses: ./\n"));
+        assert!(matches_any("any/file", &patterns));
     }
 
     #[test]

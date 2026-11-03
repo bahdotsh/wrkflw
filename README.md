@@ -222,7 +222,7 @@ jobs:
     cache: false                      # never reuse this job
 ```
 
-Paths you leave out go unnoticed, so list everything the job reads. `*` doesn't cross `/`, so `*.rs` only matches files at the root. Use `**/*.rs`, and wrkflw warns about a wildcard path with no `/`. `.github/actions/**`, `.gitea/actions/**` and this file always count.
+Paths you leave out go unnoticed, so list everything the job reads. `*` doesn't cross `/`, so `*.rs` only matches files at the root. Use `**/*.rs`, and wrkflw warns about a wildcard path with no `/`. `.github/actions/**`, `.gitea/actions/**`, this file and the directory of each local action the job uses, such as `uses: ./tools/release`, always count.
 
 #### Sharing results across machines
 

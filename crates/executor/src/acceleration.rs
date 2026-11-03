@@ -868,8 +868,10 @@ pub(crate) async fn decide(lookup: Lookup<'_>) -> Decision {
     let Some(run) = run else {
         return run_it;
     };
-    let wants_reuse = run.accel.reuse_results || run.accel.changed_files.is_some();
-    if !wants_reuse || lookup.partial {
+    // A key is needed to reuse a result, and also to publish one: a trusted
+    // CI that always runs fresh still has to file what it ran.
+    let wants_key = run.accel.reuse_results || run.accel.push_results;
+    if !(wants_key || run.accel.changed_files.is_some()) || lookup.partial {
         return run_it;
     }
     let hints = run.hints(lookup.job_name);
@@ -908,7 +910,7 @@ pub(crate) async fn decide(lookup: Lookup<'_>) -> Decision {
             };
         }
     }
-    let Some(store) = run.store.as_ref().filter(|_| run.accel.reuse_results) else {
+    let Some(store) = run.store.as_ref().filter(|_| wants_key) else {
         return run_it;
     };
     let Some(tree) = run.tree().await else {
@@ -922,6 +924,9 @@ pub(crate) async fn decide(lookup: Lookup<'_>) -> Decision {
     let Some(key) = key else {
         return run_it;
     };
+    if !run.accel.reuse_results {
+        return Decision::Run { key: Some(key) };
+    }
     if let Some(entry) = store.load(&key).await {
         return Decision::Reuse {
             jobs: entry.jobs,
@@ -1212,6 +1217,69 @@ jobs:
         )
         .await;
         assert!(matches!(decision, Decision::Run { key: None }));
+    }
+
+    /// A run in `dir`, a git work tree, that keeps results in `results`.
+    fn state_in(dir: &Path, results: &Path, accel: &Acceleration) -> RunState {
+        let mut state = RunState::new(accel.clone(), false, dir.to_path_buf()).unwrap();
+        state.store = Some(ResultStore::new(results.to_path_buf(), accel));
+        state
+    }
+
+    /// `decide` for a one-step job in `dir`.
+    async fn decide_in(dir: &Path, results: &Path, accel: &Acceleration) -> Decision {
+        let wf = workflow();
+        let definition = job("steps:\n  - run: x\n");
+        let state = state_in(dir, results, accel);
+        let empty = HashMap::new();
+        with_run_state(
+            Arc::new(state),
+            decide(Lookup {
+                job_name: "a",
+                job: &definition,
+                workflow: &wf,
+                env_context: &empty,
+                platform_overrides: &empty,
+                needs_outputs: &HashMap::new(),
+                needs_results: &empty,
+                partial: false,
+            }),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn pushing_files_a_result_without_reusing_one() {
+        let dir = repo();
+        let results = TempDir::new().unwrap();
+        // Outside the work tree, whose files are inputs.
+        let remote = TempDir::new().unwrap();
+        let pushing = Acceleration {
+            remote_cache: Some(remote.path().display().to_string()),
+            push_results: true,
+            signing_key: Some(Secret("k".to_string())),
+            ..Default::default()
+        };
+        let Decision::Run { key: Some(key) } =
+            decide_in(dir.path(), results.path(), &pushing).await
+        else {
+            panic!("a pushing run needs a key to file its result under");
+        };
+        // A stored pass must not stop a run that didn't ask for reuse.
+        let state = state_in(dir.path(), results.path(), &pushing);
+        state.store.as_ref().unwrap().save(&key, vec![], true).await;
+        assert!(matches!(
+            decide_in(dir.path(), results.path(), &pushing).await,
+            Decision::Run { key: Some(_) }
+        ));
+        let reusing = Acceleration {
+            reuse_results: true,
+            ..pushing
+        };
+        assert!(matches!(
+            decide_in(dir.path(), results.path(), &reusing).await,
+            Decision::Reuse { .. }
+        ));
     }
 
     #[test]

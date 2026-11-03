@@ -229,14 +229,16 @@ Paths you leave out go unnoticed, so list everything the job reads. `.github/act
 export WRKFLW_CACHE_SIGNING_KEY=...       # required
 export WRKFLW_REMOTE_CACHE_TOKEN=...      # optional bearer token
 
-# In trusted CI on your main branch: publish
-wrkflw run ci.yml --reuse-results --remote-cache https://cache.example.com/wrkflw --cache-push
+# In trusted CI on your main branch: run every job and publish its result
+wrkflw run ci.yml --remote-cache https://cache.example.com/wrkflw --cache-push
 
 # Anywhere else: read
 wrkflw run ci.yml --reuse-results --remote-cache https://cache.example.com/wrkflw
 ```
 
 The location is a directory, a `file://` path, or an `https://` base that serves `GET` and `PUT` on `<base>/<key>.json`. Entries are HMAC-signed, and one that doesn't verify is ignored. The key is symmetric, so anyone who can read results with it could also forge one given write access to the store. A forged result does more than mark a job as passed: its outputs reach `run:` scripts of dependent jobs, so the key plus write access means running commands on every machine that reads the store. Keep store write access to trusted CI, and don't expose the key to pull requests from forks.
+
+`--cache-push` publishes every passing job, with or without `--reuse-results`. Add `--reuse-results` to also skip jobs the store already has.
 
 Stored outputs aren't encrypted. A job that runs in emulation never pushes, because its result depends on the tools of that machine. wrkflw removes `WRKFLW_CACHE_SIGNING_KEY` and `WRKFLW_REMOTE_CACHE_TOKEN` from its own environment at startup, so steps it runs, in emulation or not, never see them.
 

@@ -20,6 +20,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use store::ResultStore;
 pub(crate) use store::StoredJob;
@@ -451,6 +452,8 @@ pub(crate) struct RunState {
     executed: Mutex<HashSet<String>>,
     groups: Mutex<HashMap<String, Arc<Semaphore>>>,
     dep_mounts: OnceLock<Vec<(PathBuf, PathBuf)>>,
+    /// Set once the run has said it won't push an emulated result.
+    warned_on_host_push: AtomicBool,
 }
 
 tokio::task_local! {
@@ -518,6 +521,7 @@ impl RunState {
             executed: Mutex::new(HashSet::new()),
             groups: Mutex::new(HashMap::new()),
             dep_mounts: OnceLock::new(),
+            warned_on_host_push: AtomicBool::new(false),
         })
     }
 
@@ -784,9 +788,9 @@ pub(crate) async fn store(key: &str, jobs: Vec<StoredJob>, env: &HashMap<String,
     let on_host = env
         .get("WRKFLW_RUNTIME_MODE")
         .is_some_and(|mode| mode.contains("emulation"));
-    if on_host && run.accel.push_results {
+    if on_host && run.accel.push_results && !run.warned_on_host_push.swap(true, Ordering::Relaxed) {
         wrkflw_logging::warning(
-            "Not pushing this job's result: emulation depends on this machine's tools",
+            "Not pushing results from this run: emulation depends on this machine's tools",
         );
     }
     store.save(key, jobs, !on_host).await;

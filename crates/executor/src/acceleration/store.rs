@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const ENTRY_SCHEMA: u32 = 1;
 /// Images and floating action tags aren't in the key, so a hit must not live
@@ -86,6 +87,9 @@ pub(crate) struct ResultStore {
     remote: Option<Remote>,
     push: bool,
     key: Option<Secret>,
+    /// Set after the remote fails once, so later jobs don't each wait out
+    /// its timeout. A run reads it again next time.
+    remote_down: AtomicBool,
 }
 
 enum Remote {
@@ -114,11 +118,13 @@ impl Remote {
         Some(Remote::Dir(PathBuf::from(path)))
     }
 
-    async fn get(&self, key: &str) -> Option<String> {
+    /// The entry text for `key`. `Ok(None)` is a miss, `Err` means the
+    /// remote itself is failing.
+    async fn get(&self, key: &str) -> Result<Option<String>, String> {
         match self {
-            Remote::Dir(dir) => tokio::fs::read_to_string(dir.join(entry_file(key)))
+            Remote::Dir(dir) => Ok(tokio::fs::read_to_string(dir.join(entry_file(key)))
                 .await
-                .ok(),
+                .ok()),
             Remote::Http {
                 base,
                 client,
@@ -128,11 +134,15 @@ impl Remote {
                 if let Some(token) = token {
                     request = request.bearer_auth(&token.0);
                 }
-                let response = request.send().await.ok()?;
-                if !response.status().is_success() {
-                    return None;
+                let response = request.send().await.map_err(|e| e.to_string())?;
+                let status = response.status();
+                if status.is_server_error() {
+                    return Err(format!("HTTP {}", status));
                 }
-                response.text().await.ok()
+                if !status.is_success() {
+                    return Ok(None);
+                }
+                response.text().await.map(Some).map_err(|e| e.to_string())
             }
         }
     }
@@ -190,6 +200,24 @@ impl ResultStore {
                 .and_then(|r| Remote::parse(r, accel.remote_token.clone())),
             push: accel.push_results,
             key: accel.signing_key.clone(),
+            remote_down: AtomicBool::new(false),
+        }
+    }
+
+    /// The remote, unless it has already failed in this run.
+    fn live_remote(&self) -> Option<&Remote> {
+        self.remote
+            .as_ref()
+            .filter(|_| !self.remote_down.load(Ordering::Relaxed))
+    }
+
+    /// Stop using the remote for this run, saying so once.
+    fn remote_failed(&self, error: &str) {
+        if !self.remote_down.swap(true, Ordering::Relaxed) {
+            wrkflw_logging::warning(&format!(
+                "Remote cache failed ({}): not using it for the rest of this run",
+                error
+            ));
         }
     }
 
@@ -204,7 +232,13 @@ impl ResultStore {
         if local.is_some() {
             return local;
         }
-        let text = self.remote.as_ref()?.get(key).await?;
+        let text = match self.live_remote()?.get(key).await {
+            Ok(text) => text?,
+            Err(e) => {
+                self.remote_failed(&e);
+                return None;
+            }
+        };
         let signed: SignedEntry = serde_json::from_str(&text).ok()?;
         let entry = verify(self.key.as_ref()?, &signed);
         if entry.is_none() {
@@ -240,7 +274,7 @@ impl ResultStore {
         if !self.push || !shareable {
             return;
         }
-        let (Some(remote), Some(signing_key)) = (&self.remote, &self.key) else {
+        let (Some(remote), Some(signing_key)) = (self.live_remote(), &self.key) else {
             return;
         };
         let Ok(body) = serde_json::to_string(&entry) else {
@@ -253,7 +287,7 @@ impl ResultStore {
             return;
         };
         if let Err(e) = remote.put(key, signed).await {
-            wrkflw_logging::warning(&format!("Could not push job result {}: {}", key, e));
+            self.remote_failed(&format!("pushing {}: {}", key, e));
         }
     }
 }
@@ -383,5 +417,26 @@ mod tests {
         assert_eq!(reader.load("aaa").await.unwrap().jobs, stored());
         // A miss and an outage both mean the job runs.
         assert!(reader.load("bbb").await.is_none());
+        assert!(!reader.remote_down.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_remote_is_tried_once_per_run() {
+        // A port that was free a moment ago refuses connections.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let dir = TempDir::new().unwrap();
+        let accel = Acceleration {
+            remote_cache: Some(format!("http://127.0.0.1:{}", port)),
+            signing_key: Some(Secret("k".to_string())),
+            ..Default::default()
+        };
+        let store = store_with(dir.path(), &accel);
+        assert!(store.load("aaa").await.is_none());
+        assert!(store.remote_down.load(Ordering::Relaxed));
+        assert!(store.live_remote().is_none());
     }
 }

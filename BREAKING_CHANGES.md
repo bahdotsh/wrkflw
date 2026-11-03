@@ -9,6 +9,8 @@ For such a job, this also changes how its steps run:
 - Steps share one container, so files a step leaves outside the workspace are there for the next one. Each step used to start clean.
 - The job's image needs `sh` and `env`, which the shared container uses to run steps. An image without them fails the job.
 - `--preserve-containers-on-failure` doesn't keep the shared container or the services.
+- A step that times out leaves a fresh container, and restarted services, for the next step, as the old one may still be running it. Data a step put in a service is gone after that.
+- A `shell: sh` step in a Debian or Ubuntu image can't pass a variable whose name isn't an identifier, such as `INPUT_MY-INPUT`, on to its children, as dash drops it. This matches GitHub.
 - A service's `volumes:` can't mount a host path, and its `options:` only take flags that shape the service container. `--privileged`, `-v`, `--mount`, `--network`, `--pid`, `--cap-add` and the like fail the job, as they would let workflow YAML reach this machine.
 
 ## Job-level `concurrency:` is enforced within a run (unreleased)

@@ -74,6 +74,13 @@ struct Containers {
 impl Containers {
     fn add(&mut self, id: &str) {
         track(self.cli, id);
+        // Cleanup on exit removes tracked containers in order, and Podman
+        // won't remove the job container while a service uses its network.
+        // So the job container, the first one, moves behind each service.
+        if let Some(job) = self.ids.first() {
+            untrack_for(self.cli)(job);
+            track(self.cli, job);
+        }
         self.ids.push(id.to_string());
     }
 
@@ -158,76 +165,215 @@ fn track(cli: &str, id: &str) {
     }
 }
 
-/// Variables the CLI itself reads. Handing these over through the CLI's own
-/// environment would point it at another daemon or binary, so they go in
-/// `argv`. Everything else goes by name, which keeps secrets out of `ps`, so
-/// this is an exact list: a prefix would catch `DOCKER_PASSWORD`.
-fn reaches_the_cli(name: &str) -> bool {
-    matches!(
-        name,
-        "PATH"
-            | "HOME"
-            | "TMPDIR"
-            | "USER"
-            | "LOGNAME"
-            | "DOCKER_API_VERSION"
-            | "DOCKER_CERT_PATH"
-            | "DOCKER_CLI_HOME"
-            | "DOCKER_CONFIG"
-            | "DOCKER_CONTEXT"
-            | "DOCKER_DEFAULT_PLATFORM"
-            | "DOCKER_HOST"
-            | "DOCKER_TLS"
-            | "DOCKER_TLS_VERIFY"
-            | "CONTAINER_CONNECTION"
-            | "CONTAINER_HOST"
-            | "CONTAINER_SSHKEY"
-            | "CONTAINERS_CONF"
-            | "CONTAINERS_REGISTRIES_CONF"
-            | "CONTAINERS_STORAGE_CONF"
-            | "PODMAN_USERNS"
-            | "SSL_CERT_DIR"
-            | "SSL_CERT_FILE"
-            | "XDG_CACHE_HOME"
-            | "XDG_CONFIG_HOME"
-            | "XDG_DATA_HOME"
-            | "XDG_RUNTIME_DIR"
-    )
+/// Runs a step with the variables it reads on stdin.
+///
+/// The step's variables reach the container this way, not through `-e`. A
+/// value in `argv` shows in `ps`, and a value in the CLI's own environment
+/// would let a workflow set `LD_PRELOAD` or `DOCKER_HOST` for a program that
+/// runs on this machine. stdin carries `set -- 'NAME=value' ... "$@"`, and
+/// `env` takes names that `export` can't, such as `INPUT_MY-INPUT`.
+const ENV_LOADER: &str = "eval \"$(cat)\" && exec env \"$@\"";
+
+/// `value` as one word of a POSIX shell script.
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-/// The `-e` flags for `env`.
-fn env_flags<'a>(env: impl Iterator<Item = (&'a str, &'a str)>) -> Vec<String> {
-    let mut args = Vec::new();
-    for (name, value) in env {
-        args.push("-e".to_string());
-        if reaches_the_cli(name) {
-            args.push(format!("{}={}", name, value));
-        } else {
-            args.push(name.to_string());
-        }
-    }
-    args
-}
-
-/// Give `command` the values `env_flags` passed by name.
-fn set_named_env<'a>(command: &mut Command, env: impl Iterator<Item = (&'a str, &'a str)>) {
-    for (name, value) in env {
-        if !reaches_the_cli(name) {
-            command.env(name, value);
-        }
+/// Why `name` can't be handed to a container, or `None` if it can.
+fn bad_env_name(name: &str) -> Option<&'static str> {
+    if name.is_empty() {
+        Some("it's empty")
+    } else if name.starts_with('-') {
+        Some("it starts with '-'")
+    } else if name.contains(['=', '\0', '\n', '\r']) {
+        Some("it contains '=' or a control character")
+    } else {
+        None
     }
 }
 
-fn exec_args(id: &str, working_dir: &Path, env_args: Vec<String>, cmd: &[&str]) -> Vec<String> {
-    let mut args = vec![
-        "exec".to_string(),
-        "-w".to_string(),
-        working_dir.display().to_string(),
-    ];
-    args.extend(env_args);
+/// The script `ENV_LOADER` reads, which puts `env` ahead of the command.
+fn env_script<'a>(env: impl Iterator<Item = (&'a str, &'a str)>) -> Result<String, String> {
+    let mut script = String::from("set --");
+    for (name, value) in env {
+        if let Some(reason) = bad_env_name(name) {
+            return Err(format!("can't pass variable '{}': {}", name, reason));
+        }
+        if value.contains('\0') {
+            return Err(format!(
+                "can't pass variable '{}': it holds a NUL byte",
+                name
+            ));
+        }
+        script.push(' ');
+        script.push_str(&shell_quote(&format!("{}={}", name, value)));
+    }
+    script.push_str(" \"$@\"\n");
+    Ok(script)
+}
+
+fn exec_args(id: &str, working_dir: &Path, cmd: &[&str]) -> Vec<String> {
+    let mut args: Vec<String> = ["exec", "-i", "-w"]
+        .iter()
+        .map(|part| part.to_string())
+        .collect();
+    args.push(working_dir.display().to_string());
     args.push(id.to_string());
+    args.extend(["sh", "-c", ENV_LOADER, "wrkflw-env"].map(str::to_string));
     args.extend(cmd.iter().map(|part| part.to_string()));
     args
+}
+
+/// Whether an env file holds `value` as written. It can't hold a line break,
+/// and Podman 5 reads a leading quote as the start of a quoted value.
+fn fits_env_file(value: &str) -> bool {
+    !value.contains(['\n', '\r', '\0']) && !value.starts_with(['"', '\''])
+}
+
+/// A service's environment, for `docker run`: an `--env-file` that only this
+/// user can read, plus `-e NAME=value` for a value an env file can't hold.
+/// The file has to outlive the command.
+fn service_env<'a>(
+    service: &str,
+    env: impl Iterator<Item = (&'a str, &'a str)>,
+) -> Result<(Option<tempfile::NamedTempFile>, Vec<String>), String> {
+    use std::io::Write;
+    let mut lines = String::new();
+    let mut args = Vec::new();
+    for (name, value) in env {
+        if let Some(reason) = bad_env_name(name) {
+            return Err(format!(
+                "service '{}': can't pass variable '{}': {}",
+                service, name, reason
+            ));
+        }
+        if fits_env_file(value) {
+            lines.push_str(&format!("{}={}\n", name, value));
+        } else {
+            wrkflw_logging::warning(&format!(
+                "Service '{}': {} spans lines, so it goes on the command line, \
+                 where other users of this machine can see it",
+                service, name
+            ));
+            args.push("-e".to_string());
+            args.push(format!("{}={}", name, value));
+        }
+    }
+    if lines.is_empty() {
+        return Ok((None, args));
+    }
+    // `NamedTempFile` creates the file readable by this user only.
+    let mut file = tempfile::NamedTempFile::new()
+        .map_err(|e| format!("service '{}': can't write its env file: {}", service, e))?;
+    file.write_all(lines.as_bytes())
+        .and_then(|_| file.flush())
+        .map_err(|e| format!("service '{}': can't write its env file: {}", service, e))?;
+    let mut all = vec!["--env-file".to_string(), file.path().display().to_string()];
+    all.extend(args);
+    Ok((Some(file), all))
+}
+
+/// Flags a service's `options:` may take with a value. They shape the
+/// service container and nothing outside it. Anything that mounts, shares a
+/// namespace or adds privileges would let workflow YAML reach this machine.
+const SERVICE_FLAGS_WITH_VALUE: &[&str] = &[
+    "--health-cmd",
+    "--health-interval",
+    "--health-timeout",
+    "--health-retries",
+    "--health-start-period",
+    "--health-start-interval",
+    "--user",
+    "-u",
+    "--entrypoint",
+    "--tmpfs",
+    "--shm-size",
+    "--ulimit",
+    "--env",
+    "-e",
+    "--label",
+    "-l",
+    "--workdir",
+    "-w",
+    "--memory",
+    "-m",
+    "--memory-swap",
+    "--cpus",
+    "--stop-signal",
+    "--stop-timeout",
+    "--platform",
+];
+
+/// Flags a service's `options:` may take on their own.
+const SERVICE_FLAGS_BARE: &[&str] = &["--no-healthcheck", "--init", "--read-only"];
+
+/// A service's `options:`, checked against the flags above.
+fn service_options(service: &str, options: &str) -> Result<Vec<String>, String> {
+    let tokens = shlex::split(options)
+        .ok_or_else(|| format!("service '{}': can't parse options", service))?;
+    let mut tokens = tokens.into_iter();
+    let mut args = Vec::new();
+    while let Some(token) = tokens.next() {
+        let (flag, inline) = if token.starts_with("--") {
+            match token.split_once('=') {
+                Some((flag, value)) => (flag.to_string(), Some(value.to_string())),
+                None => (token.clone(), None),
+            }
+        } else if token.starts_with('-') && token.len() > 2 {
+            let value = token[2..].strip_prefix('=').unwrap_or(&token[2..]);
+            (token[..2].to_string(), Some(value.to_string()))
+        } else {
+            (token.clone(), None)
+        };
+        if SERVICE_FLAGS_BARE.contains(&flag.as_str()) {
+            args.push(token);
+            continue;
+        }
+        if !SERVICE_FLAGS_WITH_VALUE.contains(&flag.as_str()) {
+            return Err(format!(
+                "service '{}': option '{}' isn't allowed locally, as it could reach \
+                 this machine. Allowed: {}, {}",
+                service,
+                flag,
+                SERVICE_FLAGS_WITH_VALUE.join(" "),
+                SERVICE_FLAGS_BARE.join(" ")
+            ));
+        }
+        let value = inline
+            .or_else(|| tokens.next())
+            .ok_or_else(|| format!("service '{}': option '{}' needs a value", service, flag))?;
+        if matches!(flag.as_str(), "--env" | "-e") && !value.contains('=') {
+            return Err(format!(
+                "service '{}': '{} {}' would copy a variable from this machine. \
+                 Give it a value, or use the service's env",
+                service, flag, value
+            ));
+        }
+        args.push(flag);
+        args.push(value);
+    }
+    Ok(args)
+}
+
+/// A service's `volumes:` entry, if it stays off this machine's filesystem: a
+/// named volume, or a bare container path for an anonymous one.
+fn service_volume(service: &str, volume: &str) -> Result<String, String> {
+    let parts: Vec<&str> = volume.split(':').collect();
+    let source = parts[0];
+    let named = source.len() > 1
+        && source.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && source
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'));
+    let anonymous = parts.len() == 1 && source.starts_with('/');
+    if (named || anonymous) && !volume.contains('\\') {
+        return Ok(volume.to_string());
+    }
+    Err(format!(
+        "service '{}': volume '{}' mounts a path from this machine, which wrkflw \
+         doesn't allow for services. Use a named volume",
+        service, volume
+    ))
 }
 
 fn start_args(
@@ -269,12 +415,10 @@ fn service_args(
     args.extend(env_args);
     for volume in &spec.volumes {
         args.push("-v".to_string());
-        args.push(volume.clone());
+        args.push(service_volume(&spec.name, volume)?);
     }
     if let Some(options) = &spec.options {
-        let parsed = shlex::split(options)
-            .ok_or_else(|| format!("service '{}': can't parse options", spec.name))?;
-        args.extend(parsed);
+        args.extend(service_options(&spec.name, options)?);
     }
     args.push(image.to_string());
     Ok(args)
@@ -290,23 +434,37 @@ fn remapped_port(port: &str) -> bool {
     }
 }
 
+/// Run `cli` with `args`, writing `stdin` to it if given.
 async fn cli_output(
     cli: &str,
     args: &[String],
-    prepare: impl FnOnce(&mut Command),
+    stdin: Option<&str>,
 ) -> Result<ContainerOutput, ContainerError> {
-    let mut command = Command::new(cli);
-    command
+    use tokio::io::AsyncWriteExt;
+    let start_error =
+        |e: std::io::Error| ContainerError::ContainerStart(format!("Failed to run {}: {}", cli, e));
+    let mut child = Command::new(cli)
         .args(args)
-        .stdin(Stdio::null())
+        .stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    prepare(&mut command);
-    let output = command
-        .output()
-        .await
-        .map_err(|e| ContainerError::ContainerStart(format!("Failed to run {}: {}", cli, e)))?;
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(start_error)?;
+    let pipe = child.stdin.take();
+    // Written while the output is read, so neither side waits on a full pipe.
+    // A failed write shows as the command's own failure, so it's ignored.
+    let write = async move {
+        if let (Some(mut pipe), Some(input)) = (pipe, stdin) {
+            let _ = pipe.write_all(input.as_bytes()).await;
+        }
+    };
+    let ((), output) = tokio::join!(write, child.wait_with_output());
+    let output = output.map_err(start_error)?;
     Ok(ContainerOutput {
         stdout: String::from_utf8_lossy(&output.stdout).to_string(),
         stderr: String::from_utf8_lossy(&output.stderr).to_string(),
@@ -344,14 +502,14 @@ impl JobSession {
             .collect();
         let deadline = tokio::time::Instant::now() + SERVICE_READY_TIMEOUT;
         loop {
-            let output = cli_output(self.cli, &args, |_| {})
+            let output = cli_output(self.cli, &args, None)
                 .await
                 .map_err(|e| e.to_string())?;
             match readiness(&output.stdout) {
                 Readiness::Ready => return Ok(()),
                 Readiness::Failed => {
                     let log_args = vec!["logs".to_string(), name.to_string()];
-                    let logs = cli_output(self.cli, &log_args, |_| {}).await.ok();
+                    let logs = cli_output(self.cli, &log_args, None).await.ok();
                     let tail = logs.map(|l| l.stderr + &l.stdout).unwrap_or_default();
                     return Err(format!(
                         "service '{}' failed ({}): {}",
@@ -395,9 +553,11 @@ impl JobSession {
                 .iter()
                 .map(|(k, v)| (k.clone(), resolve(v)))
                 .collect();
-            let pairs = || env.iter().map(|(k, v)| (k.as_str(), v.as_str()));
-            let args = service_args(&name, job_id, spec, &image, env_flags(pairs()))?;
-            let output = cli_output(self.cli, &args, |command| set_named_env(command, pairs()))
+            let pairs = env.iter().map(|(k, v)| (k.as_str(), v.as_str()));
+            // `_env_file` is read by the CLI, so it lives until the command ends.
+            let (_env_file, env_args) = service_env(&spec.name, pairs)?;
+            let args = service_args(&name, job_id, spec, &image, env_args)?;
+            let output = cli_output(self.cli, &args, None)
                 .await
                 .map_err(|e| e.to_string())?;
             if output.exit_code != 0 {
@@ -424,7 +584,7 @@ impl JobSession {
         let name = format!("wrkflw-job-{}", uuid::Uuid::new_v4());
         let service_names: Vec<&str> = self.services.iter().map(|s| s.name.as_str()).collect();
         let args = start_args(&name, image, volumes, &service_names);
-        let output = cli_output(self.cli, &args, |_| {})
+        let output = cli_output(self.cli, &args, None)
             .await
             .map_err(|e| e.to_string())?;
         if output.exit_code != 0 {
@@ -519,13 +679,11 @@ impl JobSession {
             ));
         }
         let id = live.id.clone();
+        let script = env_script(env.iter().copied())?;
         state.busy = true;
 
-        let args = exec_args(&id, working_dir, env_flags(env.iter().copied()), cmd);
-        let output = cli_output(self.cli, &args, |command| {
-            set_named_env(command, env.iter().copied())
-        })
-        .await;
+        let args = exec_args(&id, working_dir, cmd);
+        let output = cli_output(self.cli, &args, Some(&script)).await;
         state.busy = false;
         output.map(Some).map_err(|e| e.to_string())
     }
@@ -560,6 +718,14 @@ pub(crate) async fn with_job_session<F: Future>(
             .map(|(name, service)| ServiceSpec::new(name, service))
             .collect();
         services.sort_by(|a, b| a.name.cmp(&b.name));
+        if !services.is_empty()
+            && acceleration::current().is_some_and(|run| run.preserve_containers)
+        {
+            wrkflw_logging::warning(
+                "--preserve-containers-on-failure doesn't apply to a job with services: \
+                 its steps share one container with them, which is always removed",
+            );
+        }
         Arc::new(JobSession {
             cli,
             services,
@@ -574,31 +740,140 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_secret_goes_by_name_and_cli_variables_go_by_value() {
-        let env = [("TOKEN", "hunter2"), ("DOCKER_HOST", "tcp://x")];
-        let mut command = Command::new("true");
-        set_named_env(&mut command, env.into_iter());
-        assert_eq!(
-            env_flags(env.into_iter()),
-            ["-e", "TOKEN", "-e", "DOCKER_HOST=tcp://x"]
+    fn exec_puts_no_variable_in_argv() {
+        let args = exec_args("id", Path::new("/w"), &["true"]);
+        assert!(args.contains(&"-i".to_string()));
+        assert!(args.windows(2).any(|w| w == ["-c", ENV_LOADER]));
+        assert!(!args.iter().any(|arg| arg == "-e"));
+    }
+
+    /// Run `cmd` the way a job container would, with `env` on stdin.
+    #[cfg(unix)]
+    fn through_loader(env: &[(&str, &str)], cmd: &str) -> String {
+        use std::io::Write;
+        let script = env_script(env.iter().copied()).unwrap();
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", ENV_LOADER, "wrkflw-env", "sh", "-c", cmd])
+            .env_clear()
+            .env("PATH", std::env::var("PATH").unwrap())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(script.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success());
+        String::from_utf8(output.stdout).unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn variables_reach_the_step_exactly() {
+        let key = "-----BEGIN KEY-----\nab'c\"d $(x) `y`\n-----END KEY-----\n\n";
+        let printed = through_loader(
+            &[("KEY", key), ("EMPTY", ""), ("INPUT_MY-INPUT", "v")],
+            r#"printf '%s|%s|' "$KEY" "${EMPTY-unset}"; env | grep '^INPUT_MY-INPUT='"#,
         );
-        let passed: Vec<_> = command.as_std().get_envs().collect();
-        assert_eq!(passed.len(), 1);
-        assert_eq!(passed[0].0, "TOKEN");
+        assert_eq!(printed, format!("{}||INPUT_MY-INPUT=v\n", key));
     }
 
     #[test]
-    fn credentials_with_a_cli_prefix_stay_out_of_argv() {
-        for name in [
-            "DOCKER_PASSWORD",
-            "DOCKER_TOKEN",
-            "DOCKERHUB_TOKEN",
-            "CONTAINER_REGISTRY_PASSWORD",
-            "PODMAN_PASSWORD",
-            "SSL_KEY_PASSPHRASE",
-            "XDG_SECRET",
+    fn a_name_the_container_cant_take_is_an_error() {
+        for name in ["", "-x", "A=B", "A\nB"] {
+            assert!(env_script([(name, "v")].into_iter()).is_err(), "{:?}", name);
+        }
+    }
+
+    #[test]
+    fn service_env_goes_in_a_file_and_only_odd_values_in_argv() {
+        let env = [("PASSWORD", "hunter2"), ("CERT", "a\nb"), ("Q", "\"x\"")];
+        let (file, args) = service_env("db", env.into_iter()).unwrap();
+        let file = file.unwrap();
+        assert_eq!(
+            args[..2],
+            ["--env-file".to_string(), file.path().display().to_string()]
+        );
+        assert_eq!(
+            std::fs::read_to_string(file.path()).unwrap(),
+            "PASSWORD=hunter2\n"
+        );
+        assert!(!args.iter().any(|arg| arg.contains("hunter2")));
+        assert!(args.contains(&"CERT=a\nb".to_string()));
+        assert!(args.contains(&"Q=\"x\"".to_string()));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(file.path()).unwrap().permissions().mode();
+            assert_eq!(mode & 0o077, 0);
+        }
+    }
+
+    #[test]
+    fn service_options_that_reach_the_host_are_refused() {
+        for options in [
+            "--privileged",
+            "-v /:/host",
+            "--volume=/:/host",
+            "--mount type=bind,src=/,dst=/h",
+            "--pid=host",
+            "--network host",
+            "--cap-add SYS_ADMIN",
+            "--security-opt seccomp=unconfined",
+            "--device /dev/sda",
+            "--env-file /etc/passwd",
+            "-e AWS_SECRET_ACCESS_KEY",
+            "-it",
+            "postgres:16",
         ] {
-            assert_eq!(env_flags([(name, "hunter2")].into_iter()), ["-e", name]);
+            assert!(service_options("db", options).is_err(), "{}", options);
+        }
+    }
+
+    #[test]
+    fn service_options_for_the_service_itself_are_kept() {
+        let args = service_options(
+            "db",
+            "--health-cmd 'pg_isready -U x' --health-interval=1s -e A=1 -eB=2 --init --tmpfs /run",
+        )
+        .unwrap();
+        assert_eq!(
+            args,
+            [
+                "--health-cmd",
+                "pg_isready -U x",
+                "--health-interval",
+                "1s",
+                "-e",
+                "A=1",
+                "-e",
+                "B=2",
+                "--init",
+                "--tmpfs",
+                "/run"
+            ]
+        );
+        assert!(service_options("db", "--health-cmd").is_err());
+    }
+
+    #[test]
+    fn service_volumes_must_stay_off_this_machine() {
+        for volume in ["pgdata:/var/lib/postgresql/data", "cache:/c:ro", "/scratch"] {
+            assert!(service_volume("db", volume).is_ok(), "{}", volume);
+        }
+        for volume in [
+            "/home/me/.ssh:/x",
+            "./data:/x",
+            "~/data:/x",
+            "C:/data:/x",
+            "C:\\data:/x",
+            "../x:/x",
+        ] {
+            assert!(service_volume("db", volume).is_err(), "{}", volume);
         }
     }
 
@@ -733,6 +1008,30 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_on_exit_reaches_the_job_container_after_its_services() {
+        let job = format!("job-{}", uuid::Uuid::new_v4());
+        let db = format!("db-{}", uuid::Uuid::new_v4());
+        let cache = format!("cache-{}", uuid::Uuid::new_v4());
+        let mut containers = Containers {
+            cli: "docker",
+            ids: Vec::new(),
+        };
+        for id in [&job, &db, &cache] {
+            containers.add(id);
+        }
+        let ours: Vec<String> = crate::docker::tracked_containers()
+            .into_iter()
+            .filter(|id| [&job, &db, &cache].contains(&id))
+            .collect();
+        assert_eq!(ours, [db.clone(), cache.clone(), job.clone()]);
+        for id in &containers.ids {
+            crate::docker::untrack_container(id);
+        }
+        // Nothing to remove: these containers never existed.
+        containers.ids.clear();
+    }
+
+    #[test]
     fn services_are_removed_before_the_job_container_they_depend_on() {
         let mut containers = Containers {
             cli: "true",
@@ -749,18 +1048,20 @@ mod tests {
         let args = exec_args(
             "id",
             Path::new("/github/workspace/sub"),
-            vec!["-e".to_string(), "A".to_string()],
             &["bash", "-c", "echo one\necho two"],
         );
         assert_eq!(
             args,
             [
                 "exec",
+                "-i",
                 "-w",
                 "/github/workspace/sub",
-                "-e",
-                "A",
                 "id",
+                "sh",
+                "-c",
+                ENV_LOADER,
+                "wrkflw-env",
                 "bash",
                 "-c",
                 "echo one\necho two"

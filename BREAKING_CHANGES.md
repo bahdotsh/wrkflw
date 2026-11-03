@@ -4,6 +4,13 @@
 
 On Docker and Podman, a job's `services:` now start, and its steps run in one container with them. A service that can't start or never turns healthy fails the job's container steps. These jobs used to log a warning and run without the service. Emulation, secure emulation, Kubernetes and called workflows still warn.
 
+For such a job, this also changes how its steps run:
+
+- Steps share one container, so files a step leaves outside the workspace are there for the next one. Each step used to start clean.
+- The job's image needs `sh` and `env`, which the shared container uses to run steps. An image without them fails the job.
+- `--preserve-containers-on-failure` doesn't keep the shared container or the services.
+- A service's `volumes:` can't mount a host path, and its `options:` only take flags that shape the service container. `--privileged`, `-v`, `--mount`, `--network`, `--pid`, `--cap-add` and the like fail the job, as they would let workflow YAML reach this machine.
+
 ## Job-level `concurrency:` is enforced within a run (unreleased)
 
 Jobs that share a `concurrency:` group now run one at a time, where they used to overlap. `cancel-in-progress` has no effect, and a run takes longer if it relied on the overlap.

@@ -454,6 +454,15 @@ pub fn untrack_container(id: &str) {
     }
 }
 
+/// The tracked containers, in the order cleanup removes them.
+#[cfg(test)]
+pub(crate) fn tracked_containers() -> Vec<String> {
+    RUNNING_CONTAINERS
+        .lock()
+        .map(|containers| containers.clone())
+        .unwrap_or_default()
+}
+
 // Add network to tracking
 pub fn track_network(id: &str) {
     if let Ok(mut networks) = CREATED_NETWORKS.lock() {

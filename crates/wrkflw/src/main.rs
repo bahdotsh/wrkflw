@@ -845,14 +845,31 @@ fn exit_on_parse_error(error: clap::Error) -> ! {
     std::process::exit(2);
 }
 
+/// Stack for the thread that runs the CLI and for the runtime's workers.
+///
+/// Windows gives the main thread 1 MiB, and a debug build overflows that in
+/// clap's synchronous help and parsing frames before any command runs, so
+/// boxing the future alone isn't enough. Other platforms default to 8 MiB.
+const CLI_STACK_BYTES: usize = 16 * 1024 * 1024;
+
 fn main() {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .expect("failed to start the async runtime");
-    // On the heap, because the future for every command is far bigger than
-    // the 1 MiB main thread stack Windows gives a debug build.
-    runtime.block_on(Box::pin(run_cli()));
+    let cli = std::thread::Builder::new()
+        .name("wrkflw-main".to_string())
+        .stack_size(CLI_STACK_BYTES)
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .thread_stack_size(CLI_STACK_BYTES)
+                .build()
+                .expect("failed to start the async runtime");
+            // On the heap too: the future for every command is large.
+            runtime.block_on(Box::pin(run_cli()));
+        })
+        .expect("failed to start the main thread");
+    if cli.join().is_err() {
+        // The panic hook has already reported it.
+        std::process::exit(101);
+    }
 }
 
 async fn run_cli() {

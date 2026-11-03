@@ -530,7 +530,9 @@ pub(crate) struct RunState {
     pub preserve_containers: bool,
     root: PathBuf,
     sidecar: Option<Sidecar>,
-    store: ResultStore,
+    /// `None` unless this run reuses or shares results, so a run that doesn't
+    /// never needs a cache directory.
+    store: Option<ResultStore>,
     tree: OnceCell<Option<Arc<TreeHashes>>>,
     /// Jobs whose steps really ran, so a dependent can't be skipped as
     /// unaffected when something it consumes has just changed.
@@ -584,9 +586,17 @@ impl RunState {
         } else {
             None
         };
-        let store_root = results_dir().ok_or("could not determine the cache directory")?;
+        let store = if accel.reuse_results || accel.remote_cache.is_some() {
+            let store_root = results_dir().ok_or(
+                "could not determine the cache directory for --reuse-results: \
+                 set WRKFLW_RESULTS_DIR",
+            )?;
+            Some(ResultStore::new(store_root, &accel))
+        } else {
+            None
+        };
         Ok(Self {
-            store: ResultStore::new(store_root, &accel),
+            store,
             accel,
             preserve_containers,
             root,
@@ -810,9 +820,9 @@ pub(crate) async fn decide(lookup: Lookup<'_>) -> Decision {
             };
         }
     }
-    if !run.accel.reuse_results {
+    let Some(store) = run.store.as_ref().filter(|_| run.accel.reuse_results) else {
         return run_it;
-    }
+    };
     let Some(tree) = run.tree().await else {
         return run_it;
     };
@@ -830,7 +840,7 @@ pub(crate) async fn decide(lookup: Lookup<'_>) -> Decision {
     let Some(key) = key else {
         return run_it;
     };
-    if let Some(entry) = run.store.load(&key).await {
+    if let Some(entry) = store.load(&key).await {
         return Decision::Reuse {
             jobs: entry.jobs,
             note: format!("Reused the passing result {}", &key[..12]),
@@ -853,6 +863,7 @@ pub(crate) fn mark_executed(job_name: &str) {
 /// the host passed with that host's tools, so its result stays on this machine.
 pub(crate) async fn store(key: &str, jobs: Vec<StoredJob>, env: &HashMap<String, String>) {
     let Some(run) = current() else { return };
+    let Some(store) = &run.store else { return };
     let on_host = env
         .get("WRKFLW_RUNTIME_MODE")
         .is_some_and(|mode| mode.contains("emulation"));
@@ -861,7 +872,7 @@ pub(crate) async fn store(key: &str, jobs: Vec<StoredJob>, env: &HashMap<String,
             "Not pushing this job's result: emulation depends on this machine's tools",
         );
     }
-    run.store.save(key, jobs, !on_host).await;
+    store.save(key, jobs, !on_host).await;
 }
 
 #[cfg(test)]
@@ -1115,6 +1126,18 @@ jobs:
         )
         .await;
         assert!(matches!(decision, Decision::Run { key: None }));
+    }
+
+    #[test]
+    fn a_run_without_reuse_needs_no_result_store() {
+        let state = RunState::new(Acceleration::default(), false, PathBuf::from(".")).unwrap();
+        assert!(state.store.is_none());
+        let reuse = Acceleration {
+            reuse_results: true,
+            ..Default::default()
+        };
+        let state = RunState::new(reuse, false, PathBuf::from(".")).unwrap();
+        assert!(state.store.is_some());
     }
 
     #[test]

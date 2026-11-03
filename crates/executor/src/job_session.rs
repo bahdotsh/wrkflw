@@ -172,6 +172,10 @@ fn track(cli: &str, id: &str) {
 /// would let a workflow set `LD_PRELOAD` or `DOCKER_HOST` for a program that
 /// runs on this machine. stdin carries `set -- 'NAME=value' ... "$@"`, and
 /// `env` takes names that `export` can't, such as `INPUT_MY-INPUT`.
+///
+/// `env` hands such a name to the step's shell, but dash, the `sh` of Debian
+/// and Ubuntu images, drops names that aren't identifiers. So a `shell: sh`
+/// step there can't pass `INPUT_MY-INPUT` on to its children, as on GitHub.
 const ENV_LOADER: &str = "eval \"$(cat)\" && exec env \"$@\"";
 
 /// `value` as one word of a POSIX shell script.
@@ -747,13 +751,15 @@ mod tests {
         assert!(!args.iter().any(|arg| arg == "-e"));
     }
 
-    /// Run `cmd` the way a job container would, with `env` on stdin.
+    /// Run `cmd` the way a job container would, with `env` on stdin. The step
+    /// itself runs in bash, the default `run:` shell: dash, which is `sh` on
+    /// Ubuntu, drops variable names that aren't identifiers.
     #[cfg(unix)]
     fn through_loader(env: &[(&str, &str)], cmd: &str) -> String {
         use std::io::Write;
         let script = env_script(env.iter().copied()).unwrap();
         let mut child = std::process::Command::new("sh")
-            .args(["-c", ENV_LOADER, "wrkflw-env", "sh", "-c", cmd])
+            .args(["-c", ENV_LOADER, "wrkflw-env", "bash", "-c", cmd])
             .env_clear()
             .env("PATH", std::env::var("PATH").unwrap())
             .stdin(Stdio::piped())

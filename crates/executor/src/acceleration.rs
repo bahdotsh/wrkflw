@@ -635,16 +635,28 @@ pub(crate) struct Lookup<'a> {
 }
 
 /// The `--affected` verdict: true when `hints` names the job's inputs, no
-/// changed file is among them, and nothing it consumes just ran.
+/// changed file is among them, nothing it consumes just ran, and everything
+/// it needs passed.
 fn unaffected(
     job_name: &str,
     job: &Job,
     hints: Option<&JobHints>,
     changed: &[String],
     executed: &HashSet<String>,
+    needs_results: &HashMap<String, String>,
 ) -> Result<bool, String> {
     // A job with outputs has to run: a dependent needs the values.
     if job.outputs.as_ref().is_some_and(|o| !o.is_empty()) || job.matrix_config().is_some() {
+        return Ok(false);
+    }
+    // A job that runs after a failure, such as one with `if: always()`, is
+    // in a state the base never proved, so it can't stand in as a pass.
+    let needs_passed = job
+        .needs
+        .iter()
+        .flatten()
+        .all(|need| needs_results.get(need).map(String::as_str) == Some("success"));
+    if !needs_passed {
         return Ok(false);
     }
     let Some(patterns) = input_patterns(job, hints)? else {
@@ -709,7 +721,14 @@ pub(crate) async fn decide(lookup: Lookup<'_>) -> Decision {
             .map(|set| set.clone())
             .unwrap_or_default();
         if matches!(
-            unaffected(lookup.job_name, lookup.job, hints, changed, &executed),
+            unaffected(
+                lookup.job_name,
+                lookup.job,
+                hints,
+                changed,
+                &executed,
+                lookup.needs_results
+            ),
             Ok(true)
         ) {
             return Decision::Reuse {
@@ -1193,9 +1212,25 @@ jobs:
         let none = HashSet::new();
         let docs = ["docs/a.md".to_string()];
         let source = ["src/deep/a.rs".to_string()];
-        assert!(unaffected("a", &definition, Some(&hints), &docs, &none).unwrap());
-        assert!(!unaffected("a", &definition, Some(&hints), &source, &none).unwrap());
-        assert!(!unaffected("a", &definition, None, &docs, &none).unwrap());
+        assert!(unaffected(
+            "a",
+            &definition,
+            Some(&hints),
+            &docs,
+            &none,
+            &HashMap::new()
+        )
+        .unwrap());
+        assert!(!unaffected(
+            "a",
+            &definition,
+            Some(&hints),
+            &source,
+            &none,
+            &HashMap::new()
+        )
+        .unwrap());
+        assert!(!unaffected("a", &definition, None, &docs, &none, &HashMap::new()).unwrap());
     }
 
     #[test]
@@ -1206,7 +1241,15 @@ jobs:
             cache: true,
         };
         let changed = [".github/workflows/ci.yml".to_string()];
-        assert!(!unaffected("a", &definition, Some(&hints), &changed, &HashSet::new()).unwrap());
+        assert!(!unaffected(
+            "a",
+            &definition,
+            Some(&hints),
+            &changed,
+            &HashSet::new(),
+            &HashMap::new()
+        )
+        .unwrap());
     }
 
     #[test]
@@ -1218,9 +1261,17 @@ jobs:
         let docs = ["docs/a.md".to_string()];
         let dependent = job("needs: build\nsteps:\n  - run: x\n");
         let ran = HashSet::from(["build".to_string()]);
-        assert!(!unaffected("a", &dependent, Some(&hints), &docs, &ran).unwrap());
+        assert!(!unaffected("a", &dependent, Some(&hints), &docs, &ran, &passed()).unwrap());
         let with_outputs = job("outputs: {v: '1'}\nsteps:\n  - run: x\n");
-        assert!(!unaffected("a", &with_outputs, Some(&hints), &docs, &HashSet::new()).unwrap());
+        assert!(!unaffected(
+            "a",
+            &with_outputs,
+            Some(&hints),
+            &docs,
+            &HashSet::new(),
+            &HashMap::new()
+        )
+        .unwrap());
     }
 
     #[test]
@@ -1263,6 +1314,26 @@ jobs:
         assert_ne!(before, after);
         let patterns = local_action_patterns(&job("steps:\n  - uses: ./\n"));
         assert!(matches_any("any/file", &patterns));
+    }
+
+    fn passed() -> HashMap<String, String> {
+        HashMap::from([("build".to_string(), "success".to_string())])
+    }
+
+    #[test]
+    fn a_need_that_did_not_pass_keeps_a_job_affected() {
+        let hints = JobHints {
+            paths: Some(vec!["src/**".to_string()]),
+            cache: true,
+        };
+        let docs = ["docs/a.md".to_string()];
+        let after_failure = job("needs: build\nif: always()\nsteps:\n  - run: x\n");
+        let none = HashSet::new();
+        let failed = HashMap::from([("build".to_string(), "failure".to_string())]);
+        assert!(!unaffected("a", &after_failure, Some(&hints), &docs, &none, &failed).unwrap());
+        let skipped = HashMap::from([("build".to_string(), "skipped".to_string())]);
+        assert!(!unaffected("a", &after_failure, Some(&hints), &docs, &none, &skipped).unwrap());
+        assert!(unaffected("a", &after_failure, Some(&hints), &docs, &none, &passed()).unwrap());
     }
 
     #[test]

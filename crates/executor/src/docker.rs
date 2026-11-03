@@ -504,7 +504,9 @@ pub async fn cleanup_resources(docker: &Docker) {
     }
 }
 
-// Clean up all tracked containers
+// Clean up all tracked containers, in the order they are tracked. Job sessions
+// rely on that order: `job_session::Containers::add` keeps a job container
+// behind its services, which Podman won't let go of it before.
 pub async fn cleanup_containers(docker: &Docker) -> Result<(), String> {
     // Getting the containers to clean up should not take a long time
     let containers_to_cleanup =

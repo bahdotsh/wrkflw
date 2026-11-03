@@ -84,9 +84,11 @@ impl Containers {
         self.ids.push(id.to_string());
     }
 
-    /// Dependents before what they depend on.
+    /// Dependents before what they depend on. `-v` takes the anonymous
+    /// volumes with them: database images declare one, and without it every
+    /// run would leave one behind per service.
     fn removal_args(&self) -> Vec<String> {
-        let mut args = vec!["rm".to_string(), "-f".to_string()];
+        let mut args = vec!["rm".to_string(), "-f".to_string(), "-v".to_string()];
         args.extend(self.ids.iter().rev().cloned());
         args
     }
@@ -1045,7 +1047,7 @@ mod tests {
         };
         containers.ids.push("job".to_string());
         containers.ids.push("db".to_string());
-        assert_eq!(containers.removal_args(), ["rm", "-f", "db", "job"]);
+        assert_eq!(containers.removal_args(), ["rm", "-f", "-v", "db", "job"]);
         containers.ids.clear();
     }
 

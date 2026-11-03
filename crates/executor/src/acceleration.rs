@@ -164,11 +164,42 @@ impl Sidecar {
         match std::fs::read_to_string(&path) {
             Ok(text) if text.trim().is_empty() => Ok(Self::default()),
             Ok(text) => {
-                serde_yaml::from_str(&text).map_err(|e| format!("invalid {}: {}", SIDECAR_PATH, e))
+                let sidecar: Self = serde_yaml::from_str(&text)
+                    .map_err(|e| format!("invalid {}: {}", SIDECAR_PATH, e))?;
+                for (job, path) in sidecar.root_only_paths() {
+                    wrkflw_logging::warning(&format!(
+                        "{}: '{}' for job '{}' only matches at the repository root, \
+                         as '*' doesn't cross '/'. Use '**/{}' for any directory",
+                        SIDECAR_PATH, path, job, path
+                    ));
+                }
+                Ok(sidecar)
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(format!("cannot read {}: {}", SIDECAR_PATH, e)),
         }
+    }
+}
+
+impl Sidecar {
+    /// `(job, path)` for each path with a wildcard but no `/`. `*` never
+    /// crosses a separator, so `*.rs` misses `src/a.rs`, and a missed input
+    /// is a job skipped that should have run.
+    fn root_only_paths(&self) -> Vec<(&str, &str)> {
+        let mut found: Vec<(&str, &str)> = self
+            .jobs
+            .iter()
+            .flat_map(|(job, hints)| {
+                hints
+                    .paths
+                    .iter()
+                    .flatten()
+                    .map(move |path| (job.as_str(), path.as_str()))
+            })
+            .filter(|(_, path)| !path.contains('/') && path.contains(['*', '?', '[']))
+            .collect();
+        found.sort();
+        found
     }
 }
 
@@ -1105,6 +1136,15 @@ jobs:
         )
         .unwrap();
         assert!(Sidecar::load(dir.path()).is_err());
+    }
+
+    #[test]
+    fn a_wildcard_without_a_slash_is_flagged_as_root_only() {
+        let sidecar: Sidecar = serde_yaml::from_str(
+            "jobs:\n  a: {paths: ['*.rs', 'src/**', 'Cargo.lock', '**/*.md']}\n",
+        )
+        .unwrap();
+        assert_eq!(sidecar.root_only_paths(), [("a", "*.rs")]);
     }
 
     #[test]

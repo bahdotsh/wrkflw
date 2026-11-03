@@ -41,10 +41,25 @@ impl Entry {
 }
 
 fn ttl_secs() -> i64 {
-    std::env::var("WRKFLW_RESULT_TTL_SECS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(DEFAULT_TTL_SECS)
+    parse_ttl(std::env::var("WRKFLW_RESULT_TTL_SECS").ok().as_deref())
+}
+
+/// `WRKFLW_RESULT_TTL_SECS` as seconds. Unset, unparsable or negative means
+/// the default, saying so for the last two so a typo doesn't go unseen.
+fn parse_ttl(value: Option<&str>) -> i64 {
+    let Some(value) = value else {
+        return DEFAULT_TTL_SECS;
+    };
+    match value.trim().parse::<i64>() {
+        Ok(secs) if secs >= 0 => secs,
+        _ => {
+            wrkflw_logging::warning(&format!(
+                "Ignoring WRKFLW_RESULT_TTL_SECS={}: not a whole number of seconds",
+                value
+            ));
+            DEFAULT_TTL_SECS
+        }
+    }
 }
 
 /// The wire form of an entry. The signature covers the exact bytes of `body`.
@@ -90,6 +105,8 @@ pub(crate) struct ResultStore {
     /// Set after the remote fails once, so later jobs don't each wait out
     /// its timeout. A run reads it again next time.
     remote_down: AtomicBool,
+    /// Set once this run has swept expired entries from `root`.
+    pruned: AtomicBool,
 }
 
 enum Remote {
@@ -204,6 +221,38 @@ impl ResultStore {
             push: accel.push_results,
             key: accel.signing_key.clone(),
             remote_down: AtomicBool::new(false),
+            pruned: AtomicBool::new(false),
+        }
+    }
+
+    /// Remove local entries, and temporary files a crash left, older than the
+    /// TTL. Reads already ignore them, so this only bounds the directory,
+    /// which would otherwise grow with every run. Once per run, and by
+    /// modification time, so no entry is opened.
+    fn prune_expired(&self) {
+        if self.pruned.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(&self.root) else {
+            return;
+        };
+        let max_age = std::time::Duration::from_secs(ttl_secs() as u64);
+        let now = std::time::SystemTime::now();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let ours = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(".json") || name.ends_with(".tmp"));
+            let expired = entry
+                .metadata()
+                .and_then(|meta| meta.modified())
+                .ok()
+                .and_then(|modified| now.duration_since(modified).ok())
+                .is_some_and(|age| age > max_age);
+            if ours && expired {
+                let _ = std::fs::remove_file(&path);
+            }
         }
     }
 
@@ -262,6 +311,7 @@ impl ResultStore {
         if let Err(e) = written {
             wrkflw_logging::warning(&format!("Could not store job result: {}", e));
         }
+        self.prune_expired();
     }
 
     /// Store a passing result, and upload it if `shareable` and this run
@@ -465,5 +515,41 @@ mod tests {
         assert!(store.remote_down.load(Ordering::Relaxed));
         assert!(store.load("bbb").await.is_none());
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn storing_a_result_sweeps_out_expired_ones() {
+        let dir = TempDir::new().unwrap();
+        let local = dir.path().join("local");
+        std::fs::create_dir_all(&local).unwrap();
+        let old = local.join("old.json");
+        let crashed = local.join(".x.tmp");
+        let unrelated = local.join("notes.txt");
+        for path in [&old, &crashed, &unrelated] {
+            std::fs::write(path, "{}").unwrap();
+            let long_ago = std::time::SystemTime::now()
+                - std::time::Duration::from_secs(DEFAULT_TTL_SECS as u64 + 3600);
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(long_ago)
+                .unwrap();
+        }
+        let store = store_with(dir.path(), &Acceleration::default());
+        store.save("fresh", stored(), true).await;
+        assert!(local.join("fresh.json").exists());
+        assert!(!old.exists());
+        assert!(!crashed.exists());
+        assert!(unrelated.exists());
+    }
+
+    #[test]
+    fn the_ttl_comes_from_the_environment_or_the_default() {
+        assert_eq!(parse_ttl(None), DEFAULT_TTL_SECS);
+        assert_eq!(parse_ttl(Some("60")), 60);
+        assert_eq!(parse_ttl(Some(" 0 ")), 0);
+        assert_eq!(parse_ttl(Some("-5")), DEFAULT_TTL_SECS);
+        assert_eq!(parse_ttl(Some("1w")), DEFAULT_TTL_SECS);
     }
 }

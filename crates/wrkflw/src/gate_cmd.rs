@@ -79,19 +79,80 @@ exec "$wrkflw" "$@"
     )
 }
 
+/// One `git rev-parse` answer, as an absolute path.
+fn git_path_query(args: &[&str]) -> Option<PathBuf> {
+    let output = Command::new("git")
+        .arg("rev-parse")
+        .args(args)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let path = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    if path.as_os_str().is_empty() {
+        return None;
+    }
+    Some(if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir().ok()?.join(path)
+    })
+}
+
+/// `path` with symlinks resolved as far as it exists, so a hook that hasn't
+/// been written yet still compares against canonical roots.
+fn resolve_existing(path: &Path) -> PathBuf {
+    let mut missing = Vec::new();
+    let mut current = path.to_path_buf();
+    loop {
+        if let Ok(real) = current.canonicalize() {
+            return missing.iter().rev().fold(real, |acc, part| acc.join(part));
+        }
+        match (current.file_name(), current.parent()) {
+            (Some(name), Some(parent)) => {
+                missing.push(name.to_os_string());
+                current = parent.to_path_buf();
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
+}
+
+/// Whether `hook` belongs to this repository: inside its git directory, or
+/// inside its work tree, as a hooks directory checked into it is.
+fn hook_is_local(hook: &Path, roots: &[PathBuf]) -> bool {
+    let hook = resolve_existing(hook);
+    roots
+        .iter()
+        .any(|root| hook.starts_with(resolve_existing(root)))
+}
+
 /// Where git looks for `pre-push` here. Asking git covers worktrees and
 /// `core.hooksPath`, where `.git/hooks` is the wrong place.
+///
+/// A `core.hooksPath` outside the repository, such as one set globally, is
+/// shared with other repositories. A hook pinned to this binary and runtime
+/// doesn't belong there, so that is an error.
 fn hook_path() -> Result<PathBuf, String> {
-    let output = Command::new("git")
-        .args(["rev-parse", "--git-path", "hooks/pre-push"])
-        .output()
-        .map_err(|e| format!("could not run git: {}", e))?;
-    if !output.status.success() {
-        return Err("not inside a git repository".to_string());
+    let path = git_path_query(&["--git-path", "hooks/pre-push"])
+        .ok_or_else(|| "not inside a git repository".to_string())?;
+    let roots: Vec<PathBuf> = [
+        git_path_query(&["--git-common-dir"]),
+        git_path_query(&["--show-toplevel"]),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if !hook_is_local(&path, &roots) {
+        return Err(format!(
+            "git would run {}, which is outside this repository, so it may be shared \
+             with others (core.hooksPath is set). Add `wrkflw gate` to that hook by hand, \
+             or unset core.hooksPath for this repository",
+            path.display()
+        ));
     }
-    Ok(PathBuf::from(
-        String::from_utf8_lossy(&output.stdout).trim(),
-    ))
+    Ok(path)
 }
 
 /// Write the hook. An existing hook that isn't ours is left alone: it may be
@@ -286,6 +347,8 @@ mod tests {
         let git = |args: &[&str]| {
             let output = Command::new("git")
                 .current_dir(dir.path())
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
                 .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
                 .args(args)
                 .output()
@@ -346,6 +409,22 @@ mod tests {
 
         let (by_hand, _) = hook_args(|_| String::new());
         assert_eq!(by_hand, "gate --runtime docker");
+    }
+
+    #[test]
+    fn a_hook_outside_the_repository_is_not_ours_to_write() {
+        let repo = tempfile::tempdir().unwrap();
+        let shared = tempfile::tempdir().unwrap();
+        let git_dir = repo.path().join(".git");
+        std::fs::create_dir_all(git_dir.join("hooks")).unwrap();
+        let roots = vec![git_dir.clone(), repo.path().to_path_buf()];
+        assert!(hook_is_local(&git_dir.join("hooks/pre-push"), &roots));
+        assert!(hook_is_local(&repo.path().join(".husky/pre-push"), &roots));
+        assert!(!hook_is_local(&shared.path().join("pre-push"), &roots));
+        assert!(!hook_is_local(
+            &repo.path().join("../elsewhere/pre-push"),
+            &roots
+        ));
     }
 
     #[test]

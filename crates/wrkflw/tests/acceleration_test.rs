@@ -9,6 +9,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use tempfile::TempDir;
 
+/// Stands in for the user's git config, so a global `core.hooksPath` or
+/// hook can't change what these tests see or write.
+const NO_GIT_CONFIG: &str = "/dev/null";
+
 struct Repo {
     dir: TempDir,
     results: TempDir,
@@ -55,6 +59,8 @@ impl Repo {
     fn git(&self, args: &[&str]) {
         let status = Command::new("git")
             .current_dir(self.root())
+            .env("GIT_CONFIG_GLOBAL", NO_GIT_CONFIG)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
             .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
             .args(args)
             .status()
@@ -65,6 +71,8 @@ impl Repo {
     fn wrkflw(&self, args: &[&str]) -> Output {
         Command::new(env!("CARGO_BIN_EXE_wrkflw"))
             .current_dir(self.root())
+            .env("GIT_CONFIG_GLOBAL", NO_GIT_CONFIG)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("WRKFLW_RESULTS_DIR", self.results.path())
             .env("WRKFLW_NO_HISTORY", "1")
             .env("WRKFLW_CACHE_SIGNING_KEY", "test-key")
@@ -260,6 +268,8 @@ fn a_remote_cache_needs_a_signing_key() {
     let repo = Repo::new(TWO_JOBS, None);
     let output = Command::new(env!("CARGO_BIN_EXE_wrkflw"))
         .current_dir(repo.root())
+        .env("GIT_CONFIG_GLOBAL", NO_GIT_CONFIG)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("WRKFLW_NO_HISTORY", "1")
         .env_remove("WRKFLW_CACHE_SIGNING_KEY")
         .args(["run", ".github/workflows/ci.yml", "--runtime", "emulation"])
@@ -324,6 +334,8 @@ fn a_step_never_sees_the_cache_credentials() {
     let repo = Repo::new(workflow, None);
     let output = Command::new(env!("CARGO_BIN_EXE_wrkflw"))
         .current_dir(repo.root())
+        .env("GIT_CONFIG_GLOBAL", NO_GIT_CONFIG)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("WRKFLW_RESULTS_DIR", repo.results.path())
         .env("WRKFLW_NO_HISTORY", "1")
         .env("WRKFLW_CACHE_SIGNING_KEY", "test-key")

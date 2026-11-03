@@ -136,11 +136,14 @@ impl Remote {
                 }
                 let response = request.send().await.map_err(|e| e.to_string())?;
                 let status = response.status();
-                if status.is_server_error() {
-                    return Err(format!("HTTP {}", status));
+                // Only "not there" is a miss. Anything else, a refused token
+                // above all, would otherwise make every job ask and run cold
+                // without a word.
+                if status == reqwest::StatusCode::NOT_FOUND {
+                    return Ok(None);
                 }
                 if !status.is_success() {
-                    return Ok(None);
+                    return Err(format!("HTTP {}", status));
                 }
                 response.text().await.map(Some).map_err(|e| e.to_string())
             }
@@ -438,5 +441,29 @@ mod tests {
         assert!(store.load("aaa").await.is_none());
         assert!(store.remote_down.load(Ordering::Relaxed));
         assert!(store.live_remote().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_refused_token_stops_the_remote_instead_of_missing_quietly() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+        let dir = TempDir::new().unwrap();
+        let accel = Acceleration {
+            remote_cache: Some(server.uri()),
+            signing_key: Some(Secret("k".to_string())),
+            remote_token: Some(Secret("stale".to_string())),
+            ..Default::default()
+        };
+        let store = store_with(dir.path(), &accel);
+        assert!(store.load("aaa").await.is_none());
+        assert!(store.remote_down.load(Ordering::Relaxed));
+        assert!(store.load("bbb").await.is_none());
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 }

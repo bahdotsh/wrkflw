@@ -55,6 +55,7 @@ const SECRET_REFERENCES: &[&str] = &[
     "secrets[",
     "secrets)",
     "secrets }",
+    "secrets}",
     "github.token",
     "github_token",
 ];
@@ -220,38 +221,45 @@ pub(crate) fn uncacheable_reason(
     }) {
         return Some("it exchanges artifacts");
     }
-    if reads_secrets(job, workflow)? {
+    const UNREADABLE: &str = "its definition can't be checked for secrets";
+    let Some(env_text) = searchable(&sorted(&workflow.env)) else {
+        return Some(UNREADABLE);
+    };
+    let Some(job_text) = searchable(job) else {
+        return Some(UNREADABLE);
+    };
+    if reads_secrets(job, &job_text, &env_text) {
         return Some("it reads secrets");
     }
-    let job_text = serde_json::to_string(job).ok()?.to_lowercase();
     if job.outputs.as_ref().is_some_and(|o| !o.is_empty())
         && job_text.contains("needs.")
-        && upstream_reads_secrets(job, workflow)
+        && upstream_reads_secrets(job, workflow, &env_text)
     {
         return Some("its outputs may carry a secret from a job it needs");
     }
     None
 }
 
-/// Whether `job` or the workflow `env` refers to a credential. `None` if
-/// either can't be serialized.
-fn reads_secrets(job: &Job, workflow: &WorkflowDefinition) -> Option<bool> {
-    let job_text = serde_json::to_string(job).ok()?.to_lowercase();
-    let env_text = serde_json::to_string(&sorted(&workflow.env))
-        .ok()?
-        .to_lowercase();
-    Some(
-        job.secrets.is_some()
-            || SECRET_REFERENCES
-                .iter()
-                .any(|needle| job_text.contains(needle) || env_text.contains(needle)),
-    )
+/// `value` as lowercase JSON, for the text checks below.
+fn searchable(value: &impl serde::Serialize) -> Option<String> {
+    serde_json::to_string(value)
+        .ok()
+        .map(|text| text.to_lowercase())
+}
+
+/// Whether a job, given its `searchable` text and the workflow `env`'s,
+/// refers to a credential.
+fn reads_secrets(job: &Job, job_text: &str, env_text: &str) -> bool {
+    job.secrets.is_some()
+        || SECRET_REFERENCES
+            .iter()
+            .any(|needle| job_text.contains(needle) || env_text.contains(needle))
 }
 
 /// Whether any job `job` needs, directly or not, reads a credential. Stored
 /// outputs go to the remote in plain text, so a value passed along must not
 /// end up there.
-fn upstream_reads_secrets(job: &Job, workflow: &WorkflowDefinition) -> bool {
+fn upstream_reads_secrets(job: &Job, workflow: &WorkflowDefinition, env_text: &str) -> bool {
     let mut seen = HashSet::new();
     let mut pending: Vec<&String> = job.needs.iter().flatten().collect();
     while let Some(name) = pending.pop() {
@@ -261,7 +269,9 @@ fn upstream_reads_secrets(job: &Job, workflow: &WorkflowDefinition) -> bool {
         let Some(upstream) = workflow.jobs.get(name) else {
             continue;
         };
-        if reads_secrets(upstream, workflow) != Some(false) {
+        let reads =
+            searchable(upstream).is_none_or(|text| reads_secrets(upstream, &text, env_text));
+        if reads {
             return true;
         }
         pending.extend(upstream.needs.iter().flatten());
@@ -300,7 +310,20 @@ pub(crate) type TreeHashes = BTreeMap<String, String>;
 /// Git already knows the blob of every clean tracked file, so only changed and
 /// untracked files are read. Those get the blob id too, so committing a tree
 /// that passed doesn't change its fingerprint.
+///
+/// A submodule with changes, or an untracked repository inside this one, is
+/// hashed as a tree of its own. `None` if one of those can't be read either.
 pub(crate) fn hash_tree(root: &Path) -> Option<TreeHashes> {
+    hash_tree_at(root, 0)
+}
+
+/// How deep nested repositories are followed before giving up.
+const MAX_NESTED_REPOS: usize = 8;
+
+fn hash_tree_at(root: &Path, depth: usize) -> Option<TreeHashes> {
+    if depth > MAX_NESTED_REPOS {
+        return None;
+    }
     let files = git_paths(
         root,
         &[
@@ -338,16 +361,29 @@ pub(crate) fn hash_tree(root: &Path) -> Option<TreeHashes> {
     for (position, relative) in plain.into_iter().enumerate() {
         let path = root.join(&relative);
         let value = match blobs.as_ref().map(|ids| &ids[position]) {
-            Some(id) => format!("{} {}", file_mode(&path), id),
+            Some(id) => format!("{} {}", file_mode(&path, index.get(&relative)), id),
             None => hash_path(&path),
         };
         hashes.insert(relative, value);
     }
     for relative in odd {
-        let value = hash_path(&root.join(&relative));
+        let path = root.join(&relative);
+        let value = if is_real_dir(&path) {
+            // A changed submodule or an untracked repository. Git lists it as
+            // one path, so its contents have to be hashed from inside it.
+            let nested = hash_tree_at(&path, depth + 1)?;
+            let text = serde_json::to_string(&nested).ok()?;
+            format!("repo {}", hex(&Sha256::digest(text.as_bytes())))
+        } else {
+            hash_path(&path)
+        };
         hashes.insert(relative, value);
     }
     Some(hashes)
+}
+
+fn is_real_dir(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir())
 }
 
 fn git_paths(root: &Path, args: &[&str]) -> Option<Vec<String>> {
@@ -390,16 +426,29 @@ fn is_plain_file(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_file())
 }
 
-/// The mode git would record for the file at `path`.
-fn file_mode(path: &Path) -> &'static str {
+/// The mode git would record for the file at `path`. `index_entry` is its
+/// `"mode blob"` from the index, if it's tracked.
+fn file_mode<'a>(path: &Path, index_entry: Option<&'a String>) -> &'a str {
     #[cfg(unix)]
     {
+        let _ = index_entry;
         use std::os::unix::fs::PermissionsExt;
         if std::fs::metadata(path).is_ok_and(|meta| meta.permissions().mode() & 0o111 != 0) {
             return "100755";
         }
+        "100644"
     }
-    "100644"
+    // No executable bit to read here, so a tracked file keeps the mode git
+    // has for it, as git itself does with `core.fileMode` off. Otherwise an
+    // edited script would never match its committed fingerprint.
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        index_entry
+            .and_then(|entry| entry.split(' ').next())
+            .filter(|mode| *mode == "100755")
+            .unwrap_or("100644")
+    }
 }
 
 /// The blob ids of `paths`, in order. `None` if git can't read one of them,
@@ -618,7 +667,8 @@ impl RunState {
                     .flatten();
                 if hashed.is_none() {
                     wrkflw_logging::warning(
-                        "Not reusing job results: this directory isn't a git work tree",
+                        "Not reusing job results: this directory isn't a git work tree, \
+                         or a repository inside it can't be read",
                     );
                 }
                 hashed.map(Arc::new)
@@ -1129,6 +1179,21 @@ jobs:
     }
 
     #[test]
+    fn secrets_without_spaces_are_still_secrets() {
+        let wf = workflow();
+        for yaml in [
+            "steps:\n  - run: echo ${{secrets}}\n",
+            "steps:\n  - run: echo ${{secrets.TOKEN}}\n",
+        ] {
+            assert!(
+                uncacheable_reason(&job(yaml), &wf, None).is_some(),
+                "{}",
+                yaml
+            );
+        }
+    }
+
+    #[test]
     fn a_run_without_reuse_needs_no_result_store() {
         let state = RunState::new(Acceleration::default(), false, PathBuf::from(".")).unwrap();
         assert!(state.store.is_none());
@@ -1138,6 +1203,29 @@ jobs:
         };
         let state = RunState::new(reuse, false, PathBuf::from(".")).unwrap();
         assert!(state.store.is_some());
+    }
+
+    #[test]
+    fn a_repository_inside_the_tree_is_hashed_by_its_contents() {
+        let dir = repo();
+        let nested = dir.path().join("vendor/lib");
+        std::fs::create_dir_all(&nested).unwrap();
+        git(&nested, &["init", "-q"]);
+        std::fs::write(nested.join("lib.rs"), "one").unwrap();
+        git(&nested, &["add", "."]);
+        git(&nested, &["commit", "-qm", "lib"]);
+        let first = hash_tree(dir.path()).unwrap();
+        let entry = first
+            .keys()
+            .find(|path| path.starts_with("vendor/lib"))
+            .expect("the nested repository is an input")
+            .clone();
+        std::fs::write(nested.join("lib.rs"), "two").unwrap();
+        let edited = hash_tree(dir.path()).unwrap();
+        assert_ne!(first[&entry], edited[&entry]);
+        std::fs::write(nested.join("new.rs"), "new").unwrap();
+        let added = hash_tree(dir.path()).unwrap();
+        assert_ne!(edited[&entry], added[&entry]);
     }
 
     #[test]

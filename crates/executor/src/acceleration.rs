@@ -106,13 +106,25 @@ pub fn validate_remote(accel: &Acceleration) -> Result<(), String> {
                 .to_string(),
         );
     }
-    if let Some(rest) = remote.strip_prefix("http://") {
-        let host = rest.split(['/', ':']).next().unwrap_or_default();
-        if !matches!(host, "localhost" | "127.0.0.1") {
-            return Err("--remote-cache must use https unless the host is local".to_string());
-        }
+    if remote.starts_with("http://") && !is_loopback_url(remote) {
+        return Err("--remote-cache must use https unless the host is local".to_string());
     }
     Ok(())
+}
+
+/// Whether `url` names this machine, by name or by a loopback address.
+fn is_loopback_url(url: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    match bare.parse::<std::net::IpAddr>() {
+        Ok(ip) => ip.is_loopback(),
+        Err(_) => host.eq_ignore_ascii_case("localhost"),
+    }
 }
 
 /// One job's entry in `.wrkflw/affected.yml`.
@@ -1423,11 +1435,29 @@ jobs:
             ..base.clone()
         };
         assert!(validate_remote(&plain).unwrap_err().contains("https"));
-        let local = Acceleration {
-            remote_cache: Some("http://localhost:9090".to_string()),
-            ..base
-        };
-        assert!(validate_remote(&local).is_ok());
+        for local in [
+            "http://localhost:9090",
+            "http://127.0.0.1/x",
+            "http://127.1.2.3",
+            "http://[::1]:9090/x",
+        ] {
+            let accel = Acceleration {
+                remote_cache: Some(local.to_string()),
+                ..base.clone()
+            };
+            assert!(validate_remote(&accel).is_ok(), "{}", local);
+        }
+        for remote in [
+            "http://localhost.evil.com",
+            "http://localhost@evil.com/",
+            "http://[::2]",
+        ] {
+            let accel = Acceleration {
+                remote_cache: Some(remote.to_string()),
+                ..base.clone()
+            };
+            assert!(validate_remote(&accel).is_err(), "{}", remote);
+        }
         let push_only = Acceleration {
             push_results: true,
             ..Default::default()

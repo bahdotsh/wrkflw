@@ -9,19 +9,25 @@
 //! structs, the same way `events::HOOKS` does. A `tokio::spawn` inside the
 //! executor would lose it, so job execution has to stay on the run's task.
 
+mod concurrency;
 mod store;
+mod tree;
 
+pub(crate) use concurrency::acquire_concurrency;
 use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
-use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use store::ResultStore;
 pub(crate) use store::StoredJob;
 use tokio::sync::{OnceCell, Semaphore};
+pub(crate) use tree::hash_tree;
+use tree::Tree;
+#[cfg(test)]
+use tree::TreeHashes;
 use wrkflw_parser::workflow::{Job, WorkflowDefinition};
 
 /// The sidecar that holds what a workflow file can't: GitHub rejects unknown
@@ -313,247 +319,6 @@ fn canonical(value: Value) -> Value {
     }
 }
 
-/// `path -> content hash` for every tracked or untracked-but-not-ignored file.
-pub(crate) type TreeHashes = BTreeMap<String, String>;
-
-/// A hashed tree, with one digest of all of it for jobs that read every file.
-/// Without it each such job's key would serialize every path in the
-/// repository, which on a large one is megabytes per job.
-pub(crate) struct Tree {
-    files: TreeHashes,
-    digest: String,
-}
-
-impl Tree {
-    pub(crate) fn new(files: TreeHashes) -> Option<Self> {
-        let text = serde_json::to_string(&files).ok()?;
-        let digest = hex(&Sha256::digest(text.as_bytes()));
-        Some(Self { files, digest })
-    }
-}
-
-/// Identify the files checkout would hand to a job. `None` outside a git work
-/// tree, where there's no reliable list of source files.
-///
-/// Git already knows the blob of every clean tracked file, so only changed and
-/// untracked files are read. Those get the blob id too, so committing a tree
-/// that passed doesn't change its fingerprint.
-///
-/// A submodule with changes, or an untracked repository inside this one, is
-/// hashed as a tree of its own. `None` if one of those can't be read either.
-pub(crate) fn hash_tree(root: &Path) -> Option<TreeHashes> {
-    hash_tree_at(root, 0)
-}
-
-/// How deep nested repositories are followed before giving up.
-const MAX_NESTED_REPOS: usize = 8;
-
-fn hash_tree_at(root: &Path, depth: usize) -> Option<TreeHashes> {
-    if depth > MAX_NESTED_REPOS {
-        return None;
-    }
-    let files = git_paths(
-        root,
-        &[
-            "ls-files",
-            "-z",
-            "--cached",
-            "--others",
-            "--exclude-standard",
-        ],
-    )?;
-    let dirty: HashSet<String> = git_paths(root, &["ls-files", "-z", "--modified"])?
-        .into_iter()
-        .collect();
-    let index = index_blobs(root)?;
-    let excluded = compile_globs(NEVER_INPUT);
-
-    let mut hashes = TreeHashes::new();
-    let mut unknown = Vec::new();
-    for relative in files {
-        if matches_any(&relative, &excluded) {
-            continue;
-        }
-        match index.get(&relative).filter(|_| !dirty.contains(&relative)) {
-            Some(blob) => {
-                hashes.insert(relative, blob.clone());
-            }
-            None => unknown.push(relative),
-        }
-    }
-
-    let (plain, odd): (Vec<String>, Vec<String>) = unknown
-        .into_iter()
-        .partition(|relative| is_plain_file(&root.join(relative)) && !relative.contains('\n'));
-    let blobs = hash_objects(root, &plain);
-    for (position, relative) in plain.into_iter().enumerate() {
-        let path = root.join(&relative);
-        let value = match blobs.as_ref().map(|ids| &ids[position]) {
-            Some(id) => format!("{} {}", file_mode(&path, index.get(&relative)), id),
-            None => hash_path(&path),
-        };
-        hashes.insert(relative, value);
-    }
-    for relative in odd {
-        let path = root.join(&relative);
-        let value = if is_real_dir(&path) {
-            // A changed submodule or an untracked repository. Git lists it as
-            // one path, so its contents have to be hashed from inside it.
-            let nested = hash_tree_at(&path, depth + 1)?;
-            let text = serde_json::to_string(&nested).ok()?;
-            format!("repo {}", hex(&Sha256::digest(text.as_bytes())))
-        } else {
-            hash_path(&path)
-        };
-        hashes.insert(relative, value);
-    }
-    Some(hashes)
-}
-
-fn is_real_dir(path: &Path) -> bool {
-    std::fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir())
-}
-
-fn git_paths(root: &Path, args: &[&str]) -> Option<Vec<String>> {
-    let output = std::process::Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(args)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    Some(
-        output
-            .stdout
-            .split(|b| *b == 0)
-            .filter(|path| !path.is_empty())
-            .map(|path| String::from_utf8_lossy(path).into_owned())
-            .collect(),
-    )
-}
-
-/// `path -> "mode blob"` for merged index entries. Unmerged paths are absent,
-/// so they get read.
-fn index_blobs(root: &Path) -> Option<HashMap<String, String>> {
-    let mut blobs = HashMap::new();
-    for entry in git_paths(root, &["ls-files", "-z", "--stage"])? {
-        let Some((meta, path)) = entry.split_once('\t') else {
-            continue;
-        };
-        let mut fields = meta.split(' ');
-        if let (Some(mode), Some(blob), Some("0")) = (fields.next(), fields.next(), fields.next()) {
-            blobs.insert(path.to_string(), format!("{} {}", mode, blob));
-        }
-    }
-    Some(blobs)
-}
-
-fn is_plain_file(path: &Path) -> bool {
-    std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_file())
-}
-
-/// The mode git would record for the file at `path`. `index_entry` is its
-/// `"mode blob"` from the index, if it's tracked.
-fn file_mode<'a>(path: &Path, index_entry: Option<&'a String>) -> &'a str {
-    #[cfg(unix)]
-    {
-        let _ = index_entry;
-        use std::os::unix::fs::PermissionsExt;
-        if std::fs::metadata(path).is_ok_and(|meta| meta.permissions().mode() & 0o111 != 0) {
-            return "100755";
-        }
-        "100644"
-    }
-    // No executable bit to read here, so a tracked file keeps the mode git
-    // has for it, as git itself does with `core.fileMode` off. Otherwise an
-    // edited script would never match its committed fingerprint.
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-        index_entry
-            .and_then(|entry| entry.split(' ').next())
-            .filter(|mode| *mode == "100755")
-            .unwrap_or("100644")
-    }
-}
-
-/// The blob ids of `paths`, in order. `None` if git can't read one of them,
-/// which leaves the caller hashing the content itself.
-fn hash_objects(root: &Path, paths: &[String]) -> Option<Vec<String>> {
-    if paths.is_empty() {
-        return Some(Vec::new());
-    }
-    let mut child = std::process::Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["hash-object", "--stdin-paths"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .ok()?;
-    let mut stdin = child.stdin.take()?;
-    let list = paths.join("\n") + "\n";
-    // On a thread, as git answers as it reads and a full pipe would block both.
-    let writer = std::thread::spawn(move || stdin.write_all(list.as_bytes()));
-    let output = child.wait_with_output().ok()?;
-    writer.join().ok()?.ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let ids: Vec<String> = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .map(str::to_string)
-        .collect();
-    (ids.len() == paths.len()).then_some(ids)
-}
-
-fn hash_path(path: &Path) -> String {
-    let mut hasher = Sha256::new();
-    match std::fs::symlink_metadata(path) {
-        // A tracked file deleted in the work tree differs from its content.
-        Err(_) => hasher.update(b"missing"),
-        Ok(meta) if meta.file_type().is_symlink() => {
-            hasher.update(b"link:");
-            if let Ok(target) = std::fs::read_link(path) {
-                hasher.update(target.to_string_lossy().as_bytes());
-            }
-        }
-        Ok(meta) if meta.is_dir() => hasher.update(b"dir"),
-        Ok(meta) => {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                // Whether a script is executable changes what a job does.
-                hasher.update(if meta.permissions().mode() & 0o111 != 0 {
-                    b"x"
-                } else {
-                    b"-"
-                });
-            }
-            match std::fs::File::open(path) {
-                Ok(mut file) => {
-                    let mut buffer = [0u8; 64 * 1024];
-                    loop {
-                        match file.read(&mut buffer) {
-                            Ok(0) => break,
-                            Ok(n) => hasher.update(&buffer[..n]),
-                            Err(_) => {
-                                hasher.update(b"unreadable");
-                                break;
-                            }
-                        }
-                    }
-                }
-                Err(_) => hasher.update(b"unreadable"),
-            }
-        }
-    }
-    hex(&hasher.finalize())
-}
-
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
@@ -753,60 +518,6 @@ fn create_dep_cache_dirs() -> Vec<(PathBuf, PathBuf)> {
             Some((host, PathBuf::from(container)))
         })
         .collect()
-}
-
-/// A job's `concurrency:`: a group name, or a mapping with `group` and
-/// `cancel-in-progress`.
-struct Concurrency {
-    group: String,
-    /// Asked for, though nothing here can honour it.
-    cancel_in_progress: bool,
-}
-
-fn concurrency_group(job: &Job) -> Option<Concurrency> {
-    match job.concurrency.as_ref()? {
-        serde_yaml::Value::String(group) => Some(Concurrency {
-            group: group.clone(),
-            cancel_in_progress: false,
-        }),
-        serde_yaml::Value::Mapping(map) => Some(Concurrency {
-            group: map.get("group")?.as_str()?.to_string(),
-            cancel_in_progress: map
-                .get("cancel-in-progress")
-                .is_some_and(|v| v.as_bool() != Some(false)),
-        }),
-        _ => None,
-    }
-}
-
-/// Wait until no other job in this run holds `job`'s concurrency group.
-///
-/// Groups compare as written, so expressions aren't evaluated. Equal text
-/// serializes, which is the safe direction. `cancel-in-progress` doesn't
-/// apply: a local run has no earlier run of the same group to cancel.
-pub(crate) async fn acquire_concurrency(
-    job_name: &str,
-    job: &Job,
-) -> Option<tokio::sync::OwnedSemaphorePermit> {
-    let Concurrency {
-        group,
-        cancel_in_progress,
-    } = concurrency_group(job)?;
-    let run = current()?;
-    if cancel_in_progress {
-        wrkflw_logging::warning(&format!(
-            "Job '{}': cancel-in-progress has no effect locally, so it waits its turn in '{}'",
-            job_name, group
-        ));
-    }
-    let semaphore = {
-        let mut groups = run.groups.lock().ok()?;
-        groups
-            .entry(group)
-            .or_insert_with(|| Arc::new(Semaphore::new(1)))
-            .clone()
-    };
-    semaphore.acquire_owned().await.ok()
 }
 
 /// What to do with a job before running it.
@@ -1472,51 +1183,5 @@ jobs:
             ..Default::default()
         };
         assert!(!format!("{:?}", accel).contains("hunter2"));
-    }
-
-    /// The most jobs inside their critical section at once.
-    async fn peak_overlap(first: &str, second: &str) -> usize {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        let active = AtomicUsize::new(0);
-        let peak = AtomicUsize::new(0);
-        let definitions = [job(first), job(second)];
-        let state = RunState::new(Acceleration::default(), false, PathBuf::from(".")).unwrap();
-        with_run_state(Arc::new(state), async {
-            futures::future::join_all(definitions.iter().map(|definition| async {
-                let _permit = acquire_concurrency("j", definition).await;
-                let now = active.fetch_add(1, Ordering::SeqCst) + 1;
-                peak.fetch_max(now, Ordering::SeqCst);
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-                active.fetch_sub(1, Ordering::SeqCst);
-            }))
-            .await;
-        })
-        .await;
-        peak.load(Ordering::SeqCst)
-    }
-
-    #[tokio::test]
-    async fn a_group_serializes_its_jobs_and_other_jobs_overlap() {
-        let lock = "concurrency: lock\nsteps: []\n";
-        let other = "concurrency: other\nsteps: []\n";
-        let free = "steps: []\n";
-        assert_eq!(peak_overlap(lock, lock).await, 1);
-        assert_eq!(peak_overlap(lock, other).await, 2);
-        assert_eq!(peak_overlap(free, free).await, 2);
-    }
-
-    #[test]
-    fn concurrency_groups_come_from_a_string_or_a_mapping() {
-        let group =
-            |yaml: &str| concurrency_group(&job(yaml)).map(|c| (c.group, c.cancel_in_progress));
-        assert_eq!(
-            group("concurrency: db\nsteps: []\n"),
-            Some(("db".to_string(), false))
-        );
-        assert_eq!(
-            group("concurrency:\n  group: db\n  cancel-in-progress: true\nsteps: []\n"),
-            Some(("db".to_string(), true))
-        );
-        assert_eq!(group("steps: []\n"), None);
     }
 }

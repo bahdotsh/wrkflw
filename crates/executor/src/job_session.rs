@@ -440,6 +440,56 @@ fn remapped_port(port: &str) -> bool {
     }
 }
 
+/// The port inside the container that a `ports:` entry names.
+fn container_port(port: &str) -> &str {
+    let without_protocol = port.split('/').next().unwrap_or(port);
+    without_protocol
+        .rsplit(':')
+        .next()
+        .unwrap_or(without_protocol)
+}
+
+/// The repository part of an image reference, without tag or digest.
+fn image_repository(image: &str) -> &str {
+    let without_digest = image.split('@').next().unwrap_or(image);
+    match without_digest.rsplit_once(':') {
+        // A colon after the last '/' starts a tag. One before it is a
+        // registry port, as in `localhost:5000/postgres`.
+        Some((repository, tag)) if !tag.contains('/') => repository,
+        _ => without_digest,
+    }
+}
+
+/// Services share the job container's network namespace, so two that listen
+/// on one port can't both start. An error for ports the workflow declares,
+/// which would otherwise surface as a health check timing out, and a warning
+/// for two services of one image, which most likely listen on the same one.
+fn check_ports(services: &[ServiceSpec]) -> Result<(), String> {
+    let mut ports: HashMap<&str, &str> = HashMap::new();
+    let mut images: HashMap<&str, &str> = HashMap::new();
+    for spec in services {
+        let declared: std::collections::BTreeSet<&str> =
+            spec.ports.iter().map(|port| container_port(port)).collect();
+        for port in declared {
+            if let Some(other) = ports.insert(port, &spec.name) {
+                return Err(format!(
+                    "services '{}' and '{}' both listen on port {}, and locally \
+                     services share one network, so only one of them can",
+                    other, spec.name, port
+                ));
+            }
+        }
+        if let Some(other) = images.insert(image_repository(&spec.image), &spec.name) {
+            wrkflw_logging::warning(&format!(
+                "Services '{}' and '{}' use the same image, and locally services share \
+                 one network, so they may both try to listen on the same port",
+                other, spec.name
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Run `cli` with `args`, writing `stdin` to it if given.
 async fn cli_output(
     cli: &str,
@@ -543,6 +593,7 @@ impl JobSession {
         containers: &mut Containers,
         resolve: &dyn Fn(&str) -> String,
     ) -> Result<(), String> {
+        check_ports(&self.services)?;
         let suffix = uuid::Uuid::new_v4().simple().to_string();
         for spec in &self.services {
             if spec.ports.iter().any(|port| remapped_port(port)) {
@@ -1114,6 +1165,57 @@ mod tests {
         assert!(!remapped_port("5432:5432"));
         assert!(!remapped_port("5432"));
         assert!(!remapped_port("5432/tcp"));
+    }
+
+    #[test]
+    fn two_services_on_one_port_are_refused() {
+        let service = |name: &str, image: &str, ports: &[&str]| ServiceSpec {
+            name: name.to_string(),
+            image: image.to_string(),
+            env: HashMap::new(),
+            volumes: vec![],
+            options: None,
+            ports: ports.iter().map(|p| p.to_string()).collect(),
+        };
+        let clash = check_ports(&[
+            service("primary", "postgres:16", &["5432:5432"]),
+            service("replica", "postgres:16", &["5433:5432/tcp"]),
+        ])
+        .unwrap_err();
+        assert!(clash.contains("5432"), "{}", clash);
+        assert!(check_ports(&[
+            service("db", "postgres:16", &["5432"]),
+            service("cache", "redis:7", &["6379", "6379/tcp"]),
+        ])
+        .is_ok());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_port_clash_fails_before_any_service_starts() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cli, log) = fake_cli(dir.path(), "nothing-fails");
+        let mut primary = db_service();
+        primary.ports = vec!["5432".to_string()];
+        let mut replica = primary.clone();
+        replica.name = "replica".to_string();
+        let session = session(cli, vec![primary, replica]);
+        let error = step(&session, "ubuntu").await.unwrap_err();
+        assert!(error.contains("port 5432"), "{}", error);
+        // Only the job container started, and it's removed with the session.
+        assert_eq!(calls(&log, "run"), 1);
+    }
+
+    #[test]
+    fn an_image_repository_drops_tag_and_digest_but_not_a_registry_port() {
+        assert_eq!(image_repository("postgres:16"), "postgres");
+        assert_eq!(image_repository("postgres"), "postgres");
+        assert_eq!(
+            image_repository("localhost:5000/pg:16"),
+            "localhost:5000/pg"
+        );
+        assert_eq!(image_repository("localhost:5000/pg"), "localhost:5000/pg");
+        assert_eq!(image_repository("pg@sha256:abc"), "pg");
     }
 
     #[test]

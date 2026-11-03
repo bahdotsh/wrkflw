@@ -1,7 +1,7 @@
 //! Stored job results: on this machine, and optionally in a shared location
 //! whose entries are HMAC-signed.
 
-use super::{hex, Acceleration, SigningKey};
+use super::{hex, Acceleration, Secret};
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
@@ -55,7 +55,7 @@ struct SignedEntry {
 
 type HmacSha256 = Hmac<Sha256>;
 
-fn sign(key: &SigningKey, body: &str) -> Option<String> {
+fn sign(key: &Secret, body: &str) -> Option<String> {
     let mut mac = HmacSha256::new_from_slice(key.0.as_bytes()).ok()?;
     mac.update(body.as_bytes());
     Some(hex(&mac.finalize().into_bytes()))
@@ -72,7 +72,7 @@ fn unhex(text: &str) -> Option<Vec<u8>> {
 }
 
 /// The entry in `signed`, if `key` made it.
-fn verify(key: &SigningKey, signed: &SignedEntry) -> Option<Entry> {
+fn verify(key: &Secret, signed: &SignedEntry) -> Option<Entry> {
     let mut mac = HmacSha256::new_from_slice(key.0.as_bytes()).ok()?;
     mac.update(signed.body.as_bytes());
     // `verify_slice` compares in constant time.
@@ -85,7 +85,7 @@ pub(crate) struct ResultStore {
     root: PathBuf,
     remote: Option<Remote>,
     push: bool,
-    key: Option<SigningKey>,
+    key: Option<Secret>,
 }
 
 enum Remote {
@@ -93,12 +93,12 @@ enum Remote {
     Http {
         base: String,
         client: reqwest::Client,
-        token: Option<SigningKey>,
+        token: Option<Secret>,
     },
 }
 
 impl Remote {
-    fn parse(location: &str, token: Option<SigningKey>) -> Option<Self> {
+    fn parse(location: &str, token: Option<Secret>) -> Option<Self> {
         if location.starts_with("http://") || location.starts_with("https://") {
             let client = reqwest::Client::builder()
                 .timeout(REMOTE_TIMEOUT)
@@ -279,7 +279,7 @@ mod tests {
         Acceleration {
             remote_cache: Some(dir.join("remote").display().to_string()),
             push_results: true,
-            signing_key: Some(SigningKey(key.to_string())),
+            signing_key: Some(Secret(key.to_string())),
             ..Default::default()
         }
     }
@@ -356,8 +356,8 @@ mod tests {
         let accel = Acceleration {
             remote_cache: Some(server.uri()),
             push_results: true,
-            signing_key: Some(SigningKey("k".to_string())),
-            remote_token: Some(SigningKey("tok".to_string())),
+            signing_key: Some(Secret("k".to_string())),
+            remote_token: Some(Secret("tok".to_string())),
             ..Default::default()
         };
         Mock::given(method("PUT"))

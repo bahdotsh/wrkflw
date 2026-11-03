@@ -56,8 +56,8 @@ pub(crate) struct RunCtx {
 }
 
 /// A credential from the environment, so it never has to be in `argv`.
-fn secret_from_env(name: &str) -> Option<wrkflw_executor::SigningKey> {
-    crate::cli_secrets::get(name).map(wrkflw_executor::SigningKey)
+fn secret_from_env(name: &str) -> Option<wrkflw_executor::Secret> {
+    crate::cli_secrets::get(name).map(wrkflw_executor::Secret)
 }
 
 fn acceleration_for(
@@ -282,6 +282,8 @@ pub(crate) async fn run(ctx: RunCtx) {
     }
 
     let acceleration = acceleration_for(&ctx, affected_files);
+    // The executor checks this too. Checking here fails before the run is
+    // recorded, and in the requested output format.
     if let Err(e) = wrkflw_executor::validate_remote(&acceleration) {
         fail(format, &e);
     }

@@ -21,7 +21,7 @@ pub mod substitution;
 pub(crate) mod workflow_commands;
 
 // Re-export public items
-pub use acceleration::{validate_remote, Acceleration, Sidecar, SigningKey, SIDECAR_PATH};
+pub use acceleration::{validate_remote, Acceleration, Secret, Sidecar, SIDECAR_PATH};
 pub use docker::cleanup_resources;
 pub use engine::{
     detect_runtime, execute_workflow, parse_platform_override, ExecutionConfig, JobResult,

@@ -60,13 +60,13 @@ const SECRET_REFERENCES: &[&str] = &[
     "github_token",
 ];
 
-/// A secret that must not reach logs through `Debug`.
+/// A credential that must not reach logs through `Debug`.
 #[derive(Clone, Default, PartialEq)]
-pub struct SigningKey(pub String);
+pub struct Secret(pub String);
 
-impl std::fmt::Debug for SigningKey {
+impl std::fmt::Debug for Secret {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("SigningKey([REDACTED])")
+        f.write_str("Secret([REDACTED])")
     }
 }
 
@@ -86,9 +86,9 @@ pub struct Acceleration {
     /// Upload this run's results to `remote_cache`.
     pub push_results: bool,
     /// Signs and verifies remote entries. Required with `remote_cache`.
-    pub signing_key: Option<SigningKey>,
+    pub signing_key: Option<Secret>,
     /// Bearer token for an `https://` remote.
-    pub remote_token: Option<SigningKey>,
+    pub remote_token: Option<Secret>,
 }
 
 /// Why a remote cache setting can't be used.
@@ -530,15 +530,10 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
-/// Everything that makes a job's result this job's result.
+/// Everything that makes a job's result this job's result: the job as
+/// `decide` sees it, and the files it reads.
 pub(crate) struct KeyInput<'a> {
-    pub job_name: &'a str,
-    pub job: &'a Job,
-    pub workflow: &'a WorkflowDefinition,
-    pub env_context: &'a HashMap<String, String>,
-    pub platform_overrides: &'a HashMap<String, String>,
-    pub needs_outputs: &'a HashMap<String, HashMap<String, String>>,
-    pub needs_results: &'a HashMap<String, String>,
+    pub lookup: &'a Lookup<'a>,
     pub tree: &'a TreeHashes,
     pub patterns: Option<&'a [glob::Pattern]>,
 }
@@ -546,21 +541,22 @@ pub(crate) struct KeyInput<'a> {
 /// The fingerprint a stored result is filed under. `None` if the job can't be
 /// serialized, which leaves it running as normal.
 pub(crate) fn job_key(input: &KeyInput<'_>) -> Option<String> {
+    let lookup = input.lookup;
     let inputs: BTreeMap<&String, &String> = input
         .tree
         .iter()
         .filter(|(path, _)| input.patterns.is_none_or(|p| matches_any(path, p)))
         .collect();
-    let env = |name: &str| input.env_context.get(name).cloned();
+    let env = |name: &str| lookup.env_context.get(name).cloned();
     let document = serde_json::json!({
         "version": KEY_VERSION,
-        "job_name": input.job_name,
-        "job": serde_json::to_value(input.job).ok()?,
-        "workflow_env": input.workflow.env,
-        "workflow_defaults": serde_json::to_value(&input.workflow.defaults).ok()?,
-        "platform_overrides": input.platform_overrides,
-        "needs_outputs": input.needs_outputs,
-        "needs_results": input.needs_results,
+        "job_name": lookup.job_name,
+        "job": serde_json::to_value(lookup.job).ok()?,
+        "workflow_env": lookup.workflow.env,
+        "workflow_defaults": serde_json::to_value(&lookup.workflow.defaults).ok()?,
+        "platform_overrides": lookup.platform_overrides,
+        "needs_outputs": lookup.needs_outputs,
+        "needs_results": lookup.needs_results,
         "event": env("GITHUB_EVENT_NAME"),
         "ref": env("GITHUB_REF"),
         "base_ref": env("GITHUB_BASE_REF"),
@@ -629,6 +625,7 @@ impl RunState {
         preserve_containers: bool,
         root: PathBuf,
     ) -> Result<Self, String> {
+        validate_remote(&accel)?;
         let sidecar = if accel.reuse_results || accel.changed_files.is_some() {
             warn_outside_repo_root(&root);
             Some(Sidecar::load(&root)?)
@@ -722,21 +719,26 @@ fn create_dep_cache_dirs() -> Vec<(PathBuf, PathBuf)> {
         .collect()
 }
 
-/// The `concurrency:` group of a job: a string, or a mapping with `group`.
-fn concurrency_group(job: &Job) -> Option<String> {
+/// A job's `concurrency:`: a group name, or a mapping with `group` and
+/// `cancel-in-progress`.
+struct Concurrency {
+    group: String,
+    /// Asked for, though nothing here can honour it.
+    cancel_in_progress: bool,
+}
+
+fn concurrency_group(job: &Job) -> Option<Concurrency> {
     match job.concurrency.as_ref()? {
-        serde_yaml::Value::String(group) => Some(group.clone()),
-        serde_yaml::Value::Mapping(map) => {
-            if map
+        serde_yaml::Value::String(group) => Some(Concurrency {
+            group: group.clone(),
+            cancel_in_progress: false,
+        }),
+        serde_yaml::Value::Mapping(map) => Some(Concurrency {
+            group: map.get("group")?.as_str()?.to_string(),
+            cancel_in_progress: map
                 .get("cancel-in-progress")
-                .is_some_and(|v| v.as_bool() != Some(false))
-            {
-                wrkflw_logging::warning(
-                    "cancel-in-progress has no effect locally: jobs in a group wait their turn",
-                );
-            }
-            map.get("group")?.as_str().map(str::to_string)
-        }
+                .is_some_and(|v| v.as_bool() != Some(false)),
+        }),
         _ => None,
     }
 }
@@ -746,9 +748,21 @@ fn concurrency_group(job: &Job) -> Option<String> {
 /// Groups compare as written, so expressions aren't evaluated. Equal text
 /// serializes, which is the safe direction. `cancel-in-progress` doesn't
 /// apply: a local run has no earlier run of the same group to cancel.
-pub(crate) async fn acquire_concurrency(job: &Job) -> Option<tokio::sync::OwnedSemaphorePermit> {
-    let group = concurrency_group(job)?;
+pub(crate) async fn acquire_concurrency(
+    job_name: &str,
+    job: &Job,
+) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    let Concurrency {
+        group,
+        cancel_in_progress,
+    } = concurrency_group(job)?;
     let run = current()?;
+    if cancel_in_progress {
+        wrkflw_logging::warning(&format!(
+            "Job '{}': cancel-in-progress has no effect locally, so it waits its turn in '{}'",
+            job_name, group
+        ));
+    }
     let semaphore = {
         let mut groups = run.groups.lock().ok()?;
         groups
@@ -877,13 +891,7 @@ pub(crate) async fn decide(lookup: Lookup<'_>) -> Decision {
         return run_it;
     };
     let key = job_key(&KeyInput {
-        job_name: lookup.job_name,
-        job: lookup.job,
-        workflow: lookup.workflow,
-        env_context: lookup.env_context,
-        platform_overrides: lookup.platform_overrides,
-        needs_outputs: lookup.needs_outputs,
-        needs_results: lookup.needs_results,
+        lookup: &lookup,
         tree: &tree,
         patterns: patterns.as_deref(),
     });
@@ -974,7 +982,7 @@ mod tests {
         let empty_env = HashMap::new();
         let empty_outputs = HashMap::new();
         let empty_results = HashMap::new();
-        job_key(&KeyInput {
+        let lookup = Lookup {
             job_name: "build",
             job: job_def,
             workflow: wf,
@@ -982,6 +990,10 @@ mod tests {
             platform_overrides: &empty_env,
             needs_outputs: &empty_outputs,
             needs_results: &empty_results,
+            partial: false,
+        };
+        job_key(&KeyInput {
+            lookup: &lookup,
             tree,
             patterns: patterns.as_deref(),
         })
@@ -1303,7 +1315,7 @@ jobs:
     fn remote_settings_are_validated() {
         let base = Acceleration {
             remote_cache: Some("https://cache.example.com".to_string()),
-            signing_key: Some(SigningKey("k".to_string())),
+            signing_key: Some(Secret("k".to_string())),
             ..Default::default()
         };
         assert!(validate_remote(&base).is_ok());
@@ -1334,7 +1346,7 @@ jobs:
     #[test]
     fn the_signing_key_stays_out_of_debug_output() {
         let accel = Acceleration {
-            signing_key: Some(SigningKey("hunter2".to_string())),
+            signing_key: Some(Secret("hunter2".to_string())),
             ..Default::default()
         };
         assert!(!format!("{:?}", accel).contains("hunter2"));
@@ -1349,7 +1361,7 @@ jobs:
         let state = RunState::new(Acceleration::default(), false, PathBuf::from(".")).unwrap();
         with_run_state(Arc::new(state), async {
             futures::future::join_all(definitions.iter().map(|definition| async {
-                let _permit = acquire_concurrency(definition).await;
+                let _permit = acquire_concurrency("j", definition).await;
                 let now = active.fetch_add(1, Ordering::SeqCst) + 1;
                 peak.fetch_max(now, Ordering::SeqCst);
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -1373,14 +1385,16 @@ jobs:
 
     #[test]
     fn concurrency_groups_come_from_a_string_or_a_mapping() {
+        let group =
+            |yaml: &str| concurrency_group(&job(yaml)).map(|c| (c.group, c.cancel_in_progress));
         assert_eq!(
-            concurrency_group(&job("concurrency: db\nsteps: []\n")).as_deref(),
-            Some("db")
+            group("concurrency: db\nsteps: []\n"),
+            Some(("db".to_string(), false))
         );
         assert_eq!(
-            concurrency_group(&job("concurrency:\n  group: db\nsteps: []\n")).as_deref(),
-            Some("db")
+            group("concurrency:\n  group: db\n  cancel-in-progress: true\nsteps: []\n"),
+            Some(("db".to_string(), true))
         );
-        assert_eq!(concurrency_group(&job("steps: []\n")), None);
+        assert_eq!(group("steps: []\n"), None);
     }
 }

@@ -12,11 +12,13 @@ use thiserror::Error;
 
 use ignore::{gitignore::GitignoreBuilder, Match};
 
+use crate::acceleration;
 use crate::action_resolver;
 use crate::dependency;
 use crate::docker;
 use crate::environment;
 use crate::events::{step_display_name, EXIT_CODE_LABEL, STDERR_HEADER, STDOUT_HEADER};
+use crate::job_session;
 use crate::kubernetes::{self, KubernetesConfig};
 use crate::podman;
 use wrkflw_logging;
@@ -43,24 +45,22 @@ pub async fn execute_workflow(
     let is_gitlab = is_gitlab_pipeline(workflow_path);
 
     if is_gitlab {
-        return crate::acceleration::without_run_state(execute_gitlab_pipeline(
+        return acceleration::without_run_state(execute_gitlab_pipeline(
             workflow_path,
             config.clone(),
         ))
         .await;
     }
-    crate::acceleration::validate_remote(&config.acceleration)
-        .map_err(ExecutionError::Execution)?;
     let root = std::env::current_dir().map_err(|e| {
         ExecutionError::Execution(format!("Failed to get current directory: {}", e))
     })?;
-    let state = crate::acceleration::RunState::new(
+    let state = acceleration::RunState::new(
         config.acceleration.clone(),
         config.preserve_containers_on_failure,
         root,
     )
     .map_err(ExecutionError::Execution)?;
-    crate::acceleration::with_run_state(
+    acceleration::with_run_state(
         std::sync::Arc::new(state),
         execute_github_workflow(workflow_path, config.clone()),
     )
@@ -1061,7 +1061,7 @@ pub struct ExecutionConfig {
     /// pipeline's and jobs' own and feed `rules:`, images and scripts.
     pub variables: HashMap<String, String>,
     /// What this run may do to avoid work. GitHub workflows only.
-    pub acceleration: crate::acceleration::Acceleration,
+    pub acceleration: acceleration::Acceleration,
 }
 
 /// Parse a `LABEL=IMAGE` runner override, as given to `--platform`.
@@ -1139,7 +1139,7 @@ impl JobResult {
 
     /// A job that didn't run because an earlier pass still stands. Dependents
     /// see a success, and `step` says why in reports.
-    fn reused(stored: crate::acceleration::StoredJob, step: &str, note: &str) -> Self {
+    fn reused(stored: acceleration::StoredJob, step: &str, note: &str) -> Self {
         JobResult {
             name: stored.name,
             canonical_name: stored.canonical_name,
@@ -2566,7 +2566,7 @@ async fn execute_job_with_matrix(
         }
     }
 
-    if !job.services.is_empty() && crate::job_session::wanted_for(job, runtime).is_none() {
+    if !job.services.is_empty() && job_session::wanted_for(job, runtime).is_none() {
         wrkflw_logging::warning(&format!(
             "Job '{}' declares services, which need Docker or Podman and aren't started \
              in a called workflow: its steps can't reach them",
@@ -2574,7 +2574,7 @@ async fn execute_job_with_matrix(
         ));
     }
 
-    let decision = crate::acceleration::decide(crate::acceleration::Lookup {
+    let decision = acceleration::decide(acceleration::Lookup {
         job_name,
         job,
         workflow,
@@ -2586,7 +2586,7 @@ async fn execute_job_with_matrix(
     })
     .await;
     let result_key = match decision {
-        crate::acceleration::Decision::Reuse { jobs, note, step } => {
+        acceleration::Decision::Reuse { jobs, note, step } => {
             return Ok(jobs
                 .into_iter()
                 .map(|stored| {
@@ -2595,12 +2595,12 @@ async fn execute_job_with_matrix(
                 })
                 .collect());
         }
-        crate::acceleration::Decision::Run { key } => key,
+        acceleration::Decision::Run { key } => key,
     };
     // Held for the whole job, across its matrix legs, as GitHub holds a group.
     // Taken after the decision, so a reused job never waits on a running one.
-    let _concurrency_permit = crate::acceleration::acquire_concurrency(job).await;
-    crate::acceleration::mark_executed(job_name);
+    let _concurrency_permit = acceleration::acquire_concurrency(job_name, job).await;
+    acceleration::mark_executed(job_name);
 
     // Check if this is a matrix job
     if let Some(matrix_config) = job.matrix_config() {
@@ -2699,7 +2699,7 @@ async fn execute_job_with_matrix(
             verbose,
             services,
         };
-        let result = crate::job_session::with_job_session(job, runtime, execute_job(ctx)).await?;
+        let result = job_session::with_job_session(job, runtime, execute_job(ctx)).await?;
         let results = vec![result];
         store_passing_result(result_key.as_deref(), &results, env_context).await;
         Ok(results)
@@ -2707,7 +2707,7 @@ async fn execute_job_with_matrix(
 }
 
 /// Report a job that won't run, the way a run job reports itself.
-fn announce_reused(stored: &crate::acceleration::StoredJob, note: &str) {
+fn announce_reused(stored: &acceleration::StoredJob, note: &str) {
     crate::events::emit(|| crate::events::ExecutionEvent::JobStarted {
         job: stored.name.clone(),
         canonical_name: stored.canonical_name.clone(),
@@ -2739,13 +2739,13 @@ async fn store_passing_result(
     }
     let jobs = results
         .iter()
-        .map(|result| crate::acceleration::StoredJob {
+        .map(|result| acceleration::StoredJob {
             name: result.name.clone(),
             canonical_name: result.canonical_name.clone(),
             outputs: result.outputs.clone(),
         })
         .collect();
-    crate::acceleration::store(key, jobs, env_context).await;
+    acceleration::store(key, jobs, env_context).await;
 }
 
 #[allow(unused_variables, unused_assignments)]
@@ -2977,7 +2977,7 @@ async fn execute_matrix_combinations(
 
         // Process this chunk of combinations in parallel
         let chunk_futures = chunk.iter().map(|combination| {
-            crate::job_session::with_job_session(
+            job_session::with_job_session(
                 ctx.job_template,
                 ctx.runtime,
                 execute_matrix_job(
@@ -5116,7 +5116,7 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
         };
         let cmd_refs: Vec<&str> = cmd_parts.iter().map(String::as_str).collect();
 
-        let dep_mounts = crate::acceleration::dep_cache_mounts(ctx.runtime.mounts_are_copies());
+        let dep_mounts = acceleration::dep_cache_mounts(ctx.runtime.mounts_are_copies());
         let mut volumes = mount_ctx.build_volumes(ctx.working_dir, container_workspace);
         volumes.extend(
             dep_mounts
@@ -5129,7 +5129,7 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
             .collect();
 
         // Execute the command, in the job's container if it has one
-        let session_result = match crate::job_session::current() {
+        let session_result = match job_session::current() {
             Some(session) => {
                 let resolve = |value: &str| preprocess_with_value(value, &ctx);
                 session
@@ -5937,7 +5937,7 @@ async fn run_called_workflow(
     // for now; job-level env merges still populate it correctly downstream.
     let child_user_env: HashMap<String, String> = HashMap::new();
     for batch in plan {
-        let results = crate::acceleration::without_run_state(execute_job_batch(
+        let results = acceleration::without_run_state(execute_job_batch(
             &batch,
             called,
             ctx.runtime,

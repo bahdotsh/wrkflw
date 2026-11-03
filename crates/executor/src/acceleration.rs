@@ -239,6 +239,18 @@ fn input_patterns(hints: Option<&JobHints>) -> Result<Option<Vec<glob::Pattern>>
     Ok(Some(patterns))
 }
 
+/// Whether `permissions:`, at the job or workflow level, grants any write.
+/// `write-all` is the one string form that does.
+fn grants_write(permissions: &serde_yaml::Value) -> bool {
+    match permissions {
+        serde_yaml::Value::String(all) => all == "write-all",
+        serde_yaml::Value::Mapping(scopes) => scopes
+            .values()
+            .any(|access| access.as_str() == Some("write")),
+        _ => false,
+    }
+}
+
 /// Why a job's result must not be reused, or `None` if it may be.
 ///
 /// wrkflw can't see what a step does, so this rules out what it can detect:
@@ -255,11 +267,12 @@ pub(crate) fn uncacheable_reason(
     if job.uses.is_some() {
         return Some("a reusable workflow's contents aren't in the fingerprint");
     }
-    if job
-        .permissions
-        .as_ref()
-        .is_some_and(|p| p.values().any(|v| v == "write"))
-    {
+    // A job's own `permissions:` replaces the workflow's, as on GitHub.
+    let writes = match &job.permissions {
+        Some(own) => own.values().any(|v| v == "write"),
+        None => workflow.permissions.as_ref().is_some_and(grants_write),
+    };
+    if writes {
         return Some("it has write permissions");
     }
     if job.steps.iter().any(|step| {
@@ -1185,6 +1198,31 @@ jobs:
         assert!(!unaffected("a", &dependent, Some(&hints), &docs, &ran).unwrap());
         let with_outputs = job("outputs: {v: '1'}\nsteps:\n  - run: x\n");
         assert!(!unaffected("a", &with_outputs, Some(&hints), &docs, &HashSet::new()).unwrap());
+    }
+
+    #[test]
+    fn workflow_permissions_count_unless_the_job_sets_its_own() {
+        let with = |permissions: &str| -> WorkflowDefinition {
+            serde_yaml::from_str(&format!(
+                "name: t\non: push\npermissions: {}\njobs: {{}}\n",
+                permissions
+            ))
+            .unwrap()
+        };
+        let plain = job("steps:\n  - run: x\n");
+        for writes in ["{contents: write}", "write-all"] {
+            let reason = uncacheable_reason(&plain, &with(writes), None);
+            assert_eq!(reason, Some("it has write permissions"), "{}", writes);
+        }
+        for reads in ["{contents: read}", "read-all", "{}"] {
+            assert!(
+                uncacheable_reason(&plain, &with(reads), None).is_none(),
+                "{}",
+                reads
+            );
+        }
+        let reads_only = job("permissions: {contents: read}\nsteps:\n  - run: x\n");
+        assert!(uncacheable_reason(&reads_only, &with("write-all"), None).is_none());
     }
 
     #[test]

@@ -17,9 +17,9 @@ For such a job, this also changes how its steps run:
 
 Jobs that share a `concurrency:` group now run one at a time, where they used to overlap. `cancel-in-progress` has no effect, and a run takes longer if it relied on the overlap.
 
-## New public fields on `ExecutionConfig` and `Job` (unreleased)
+## New public fields on `ExecutionConfig`, `Job` and `WorkflowDefinition` (unreleased)
 
-`wrkflw_executor::ExecutionConfig` gains `acceleration`, and `wrkflw_parser::workflow::Job` gains `concurrency`. Code that builds either with a struct literal has to set the new field. `Default::default()` is what `acceleration` was before, and `None` is what `concurrency` was.
+`wrkflw_executor::ExecutionConfig` gains `acceleration`, `wrkflw_parser::workflow::Job` gains `concurrency`, and `wrkflw_parser::workflow::WorkflowDefinition` gains `permissions`. Code that builds any of them with a struct literal has to set the new field. `Default::default()` is what `acceleration` was before, and `None` is what `concurrency` and `permissions` were.
 
 ## A missing secret no longer fails a `run:` step (unreleased)
 

@@ -148,6 +148,10 @@ pub struct WorkflowDefinition {
     pub defaults: Option<Defaults>,
     #[serde(default)]
     pub env: HashMap<String, String>,
+    /// The `GITHUB_TOKEN` scopes every job gets unless it sets its own: a
+    /// mapping of scope to access, or `read-all` / `write-all`.
+    #[serde(default)]
+    pub permissions: Option<serde_yaml::Value>,
 }
 
 /// A matrix is a mapping, or one expression that evaluates to a mapping.
@@ -490,6 +494,7 @@ mod tests {
             on_raw: serde_yaml::Value::Null,
             jobs: Default::default(),
             defaults: None,
+            permissions: None,
             env: HashMap::new(),
         };
         let info = wd.resolve_action("actions/checkout@v4");
@@ -508,6 +513,7 @@ mod tests {
             on_raw: serde_yaml::Value::Null,
             jobs: Default::default(),
             defaults: None,
+            permissions: None,
             env: HashMap::new(),
         };
         let info = wd.resolve_action("owner/repo");
@@ -524,6 +530,7 @@ mod tests {
             on_raw: serde_yaml::Value::Null,
             jobs: Default::default(),
             defaults: None,
+            permissions: None,
             env: HashMap::new(),
         };
         let info = wd.resolve_action("docker://alpine:3.18");
@@ -541,6 +548,7 @@ mod tests {
             on_raw: serde_yaml::Value::Null,
             jobs: Default::default(),
             defaults: None,
+            permissions: None,
             env: HashMap::new(),
         };
         let info = wd.resolve_action("./my-action");
@@ -558,6 +566,7 @@ mod tests {
             on_raw: serde_yaml::Value::Null,
             jobs: Default::default(),
             defaults: None,
+            permissions: None,
             env: HashMap::new(),
         };
         // Docker image references can use @sha256:digest — the full string is the image ref
@@ -576,6 +585,7 @@ mod tests {
             on_raw: serde_yaml::Value::Null,
             jobs: Default::default(),
             defaults: None,
+            permissions: None,
             env: HashMap::new(),
         };
         let info = wd.resolve_action("actions/checkout@a81bbbf8298c0fa03ea29cdc473d45769f953675");
@@ -592,6 +602,7 @@ mod tests {
             on_raw: serde_yaml::Value::Null,
             jobs: Default::default(),
             defaults: None,
+            permissions: None,
             env: HashMap::new(),
         };
         let info = wd.resolve_action("owner/repo/path/to/action@v2");
@@ -610,6 +621,7 @@ mod tests {
             on_raw: serde_yaml::Value::Null,
             jobs: Default::default(),
             defaults: None,
+            permissions: None,
             env: HashMap::new(),
         };
         let info = wd.resolve_action("github/codeql-action/init@v3");

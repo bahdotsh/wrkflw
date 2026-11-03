@@ -6276,6 +6276,7 @@ async fn execute_composite_action(
                 on_raw: serde_yaml::Value::Null,
                 jobs: HashMap::new(),
                 defaults: None,
+                permissions: None,
                 env: HashMap::new(),
             };
             for (idx, step_def) in steps.iter().enumerate() {
@@ -7878,6 +7879,7 @@ mod tests {
             on_raw: serde_yaml::Value::Null,
             jobs: HashMap::new(),
             defaults: None,
+            permissions: None,
             env: HashMap::new(),
         }
     }
@@ -8741,6 +8743,7 @@ runs:
             on_raw: serde_yaml::Value::Null,
             jobs: Default::default(),
             defaults: None,
+            permissions: None,
             env: HashMap::new(),
         }
     }

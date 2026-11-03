@@ -2574,9 +2574,6 @@ async fn execute_job_with_matrix(
         ));
     }
 
-    // Held for the whole job, across its matrix legs, as GitHub holds a group.
-    let _concurrency_permit = crate::acceleration::acquire_concurrency(job).await;
-
     let decision = crate::acceleration::decide(crate::acceleration::Lookup {
         job_name,
         job,
@@ -2600,6 +2597,9 @@ async fn execute_job_with_matrix(
         }
         crate::acceleration::Decision::Run { key } => key,
     };
+    // Held for the whole job, across its matrix legs, as GitHub holds a group.
+    // Taken after the decision, so a reused job never waits on a running one.
+    let _concurrency_permit = crate::acceleration::acquire_concurrency(job).await;
     crate::acceleration::mark_executed(job_name);
 
     // Check if this is a matrix job

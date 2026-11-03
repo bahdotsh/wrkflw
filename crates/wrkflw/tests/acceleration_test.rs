@@ -317,3 +317,21 @@ fn the_gate_installs_a_pre_push_hook() {
     let hook = fs::read_to_string(repo.root().join(".git/hooks/pre-push")).unwrap();
     assert!(hook.contains("wrkflw gate"));
 }
+
+#[test]
+fn a_step_never_sees_the_cache_credentials() {
+    let workflow = "name: ci\non: push\njobs:\n  peek:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo \"${WRKFLW_CACHE_SIGNING_KEY:-none} ${WRKFLW_REMOTE_CACHE_TOKEN:-none}\" >> LOG\n";
+    let repo = Repo::new(workflow, None);
+    let output = Command::new(env!("CARGO_BIN_EXE_wrkflw"))
+        .current_dir(repo.root())
+        .env("WRKFLW_RESULTS_DIR", repo.results.path())
+        .env("WRKFLW_NO_HISTORY", "1")
+        .env("WRKFLW_CACHE_SIGNING_KEY", "test-key")
+        .env("WRKFLW_REMOTE_CACHE_TOKEN", "test-token")
+        .env_remove("WRKFLW_REMOTE_CACHE")
+        .args(["run", ".github/workflows/ci.yml", "--runtime", "emulation"])
+        .output()
+        .unwrap();
+    assert_ok(&output);
+    assert_eq!(repo.take_ran(), ["none none"]);
+}

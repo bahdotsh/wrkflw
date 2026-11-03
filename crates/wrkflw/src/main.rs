@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
 
+mod cli_secrets;
 mod gate_cmd;
 mod json_output;
 mod mcp_cmd;
@@ -853,6 +854,8 @@ fn exit_on_parse_error(error: clap::Error) -> ! {
 const CLI_STACK_BYTES: usize = 16 * 1024 * 1024;
 
 fn main() {
+    // Before the thread below exists. See `cli_secrets`.
+    cli_secrets::capture();
     let cli = std::thread::Builder::new()
         .name("wrkflw-main".to_string())
         .stack_size(CLI_STACK_BYTES)

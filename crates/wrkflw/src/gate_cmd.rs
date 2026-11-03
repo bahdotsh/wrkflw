@@ -169,10 +169,12 @@ pub(crate) fn run(ctx: GateCtx) {
     let mut skipped = 0;
     for file in &files {
         println!("{}", cli_style::dim(&format!("gate: {}", file.display())));
-        let status = Command::new(&program)
+        let mut child = Command::new(&program);
+        child
             .args(run_args(&ctx, file))
-            .args(["--runtime", runtime])
-            .status();
+            .args(["--runtime", runtime]);
+        crate::cli_secrets::pass_to(&mut child);
+        let status = child.status();
         match status.map(|status| status.code()) {
             Ok(Some(0)) => {}
             Ok(Some(SKIPPED_EXIT)) => skipped += 1,

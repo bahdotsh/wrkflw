@@ -55,12 +55,9 @@ pub(crate) struct RunCtx {
     pub(crate) skip_exit_code: Option<i32>,
 }
 
-/// A variable holding a credential, so it never has to be in `argv`.
+/// A credential from the environment, so it never has to be in `argv`.
 fn secret_from_env(name: &str) -> Option<wrkflw_executor::SigningKey> {
-    std::env::var(name)
-        .ok()
-        .filter(|value| !value.is_empty())
-        .map(wrkflw_executor::SigningKey)
+    crate::cli_secrets::get(name).map(wrkflw_executor::SigningKey)
 }
 
 fn acceleration_for(
@@ -74,8 +71,8 @@ fn acceleration_for(
         dep_cache: ctx.dep_cache,
         remote_cache: ctx.remote_cache.clone(),
         push_results: ctx.cache_push,
-        signing_key: secret_from_env("WRKFLW_CACHE_SIGNING_KEY"),
-        remote_token: secret_from_env("WRKFLW_REMOTE_CACHE_TOKEN"),
+        signing_key: secret_from_env(crate::cli_secrets::SIGNING_KEY),
+        remote_token: secret_from_env(crate::cli_secrets::REMOTE_TOKEN),
     }
 }
 

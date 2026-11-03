@@ -29,7 +29,7 @@ use wrkflw_parser::workflow::{Job, WorkflowDefinition};
 pub const SIDECAR_PATH: &str = ".wrkflw/affected.yml";
 
 /// Bump when the fingerprint's inputs change, so old entries stop matching.
-const KEY_VERSION: u32 = 1;
+const KEY_VERSION: u32 = 2;
 
 /// Host directories mounted into containers under `--dep-cache`.
 const DEP_CACHE_DIRS: &[(&str, &str)] = &[
@@ -304,6 +304,22 @@ fn canonical(value: Value) -> Value {
 /// `path -> content hash` for every tracked or untracked-but-not-ignored file.
 pub(crate) type TreeHashes = BTreeMap<String, String>;
 
+/// A hashed tree, with one digest of all of it for jobs that read every file.
+/// Without it each such job's key would serialize every path in the
+/// repository, which on a large one is megabytes per job.
+pub(crate) struct Tree {
+    files: TreeHashes,
+    digest: String,
+}
+
+impl Tree {
+    pub(crate) fn new(files: TreeHashes) -> Option<Self> {
+        let text = serde_json::to_string(&files).ok()?;
+        let digest = hex(&Sha256::digest(text.as_bytes()));
+        Some(Self { files, digest })
+    }
+}
+
 /// Identify the files checkout would hand to a job. `None` outside a git work
 /// tree, where there's no reliable list of source files.
 ///
@@ -534,7 +550,7 @@ fn hex(bytes: &[u8]) -> String {
 /// `decide` sees it, and the files it reads.
 pub(crate) struct KeyInput<'a> {
     pub lookup: &'a Lookup<'a>,
-    pub tree: &'a TreeHashes,
+    pub tree: &'a Tree,
     pub patterns: Option<&'a [glob::Pattern]>,
 }
 
@@ -542,11 +558,18 @@ pub(crate) struct KeyInput<'a> {
 /// serialized, which leaves it running as normal.
 pub(crate) fn job_key(input: &KeyInput<'_>) -> Option<String> {
     let lookup = input.lookup;
-    let inputs: BTreeMap<&String, &String> = input
-        .tree
-        .iter()
-        .filter(|(path, _)| input.patterns.is_none_or(|p| matches_any(path, p)))
-        .collect();
+    let inputs = match input.patterns {
+        None => Value::String(input.tree.digest.clone()),
+        Some(patterns) => {
+            let files: BTreeMap<&String, &String> = input
+                .tree
+                .files
+                .iter()
+                .filter(|(path, _)| matches_any(path, patterns))
+                .collect();
+            serde_json::to_value(files).ok()?
+        }
+    };
     let env = |name: &str| lookup.env_context.get(name).cloned();
     let document = serde_json::json!({
         "version": KEY_VERSION,
@@ -578,7 +601,7 @@ pub(crate) struct RunState {
     /// `None` unless this run reuses or shares results, so a run that doesn't
     /// never needs a cache directory.
     store: Option<ResultStore>,
-    tree: OnceCell<Option<Arc<TreeHashes>>>,
+    tree: OnceCell<Option<Arc<Tree>>>,
     /// Jobs whose steps really ran, so a dependent can't be skipped as
     /// unaffected when something it consumes has just changed.
     executed: Mutex<HashSet<String>>,
@@ -654,14 +677,15 @@ impl RunState {
         })
     }
 
-    async fn tree(&self) -> Option<Arc<TreeHashes>> {
+    async fn tree(&self) -> Option<Arc<Tree>> {
         self.tree
             .get_or_init(|| async {
                 let root = self.root.clone();
-                let hashed = tokio::task::spawn_blocking(move || hash_tree(&root))
-                    .await
-                    .ok()
-                    .flatten();
+                let hashed =
+                    tokio::task::spawn_blocking(move || hash_tree(&root).and_then(Tree::new))
+                        .await
+                        .ok()
+                        .flatten();
                 if hashed.is_none() {
                     wrkflw_logging::warning(
                         "Not reusing job results: this directory isn't a git work tree, \
@@ -994,7 +1018,7 @@ mod tests {
         };
         job_key(&KeyInput {
             lookup: &lookup,
-            tree,
+            tree: &Tree::new(tree.clone()).unwrap(),
             patterns: patterns.as_deref(),
         })
         .unwrap()

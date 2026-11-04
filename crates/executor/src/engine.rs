@@ -2080,6 +2080,36 @@ fn detect_setup_runtimes(steps: &[Step]) -> Vec<SetupRuntime> {
         }
     }
 
+    // Every Rust toolchain step's components and targets go into the image,
+    // so each step's own container has them, as GitHub's runner keeps them
+    // for the rest of the job. Ones set by an expression aren't known yet.
+    if let Some(rust) = runtimes.iter_mut().find(|rt| rt.language == "rust") {
+        let repos = SETUP_ACTIONS
+            .iter()
+            .find(|def| def.language == "rust")
+            .map(|def| def.repos)
+            .unwrap_or_default();
+        let mut extras: Vec<String> = Vec::new();
+        for step in steps {
+            let Some(uses) = &step.uses else { continue };
+            let repo = uses.split_once('@').map_or(uses.as_str(), |(r, _)| r);
+            if !repos.contains(&repo) {
+                continue;
+            }
+            if let Some(with) = &step.with {
+                for command in rust_toolchain_extras(with, static_input) {
+                    if !extras.contains(&command) {
+                        extras.push(command);
+                    }
+                }
+            }
+        }
+        for command in extras {
+            rust.install_script.push_str(" && ");
+            rust.install_script.push_str(&command);
+        }
+    }
+
     runtimes
 }
 
@@ -2143,14 +2173,18 @@ fn get_install_script(language: &str, version: &str) -> String {
         }
         // Images such as `rust:1` already have rustup, under a `CARGO_HOME`
         // other than `~/.cargo`, so use the one there and only install it
-        // when it's missing.
+        // when it's missing. Its directory is linked into /usr/local/bin
+        // unless it is already a system directory on PATH: linking all of
+        // /usr/bin would be wrong, and linking /usr/local/bin into itself
+        // fails and would stop the build.
         "rust" => {
             format!(
                 "export PATH=\"${{CARGO_HOME:-$HOME/.cargo}}/bin:$PATH\" && \
                  (command -v rustup >/dev/null 2>&1 || \
                   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --default-toolchain {v}) && \
                  rustup default {v} && \
-                 ln -sf \"$(dirname \"$(command -v rustup)\")\"/* /usr/local/bin/",
+                 d=\"$(dirname \"$(command -v rustup)\")\" && \
+                 case \"$d\" in /usr/local/bin|/usr/bin|/bin) ;; *) ln -sf \"$d\"/* /usr/local/bin/ ;; esac",
                 v = version
             )
         }
@@ -4039,26 +4073,19 @@ fn relative_to_workspace(path: &str, workspace: &str) -> String {
     }
 }
 
-/// True when steps run in a container rather than on this machine.
-fn runs_in_container_mode(job_env: &HashMap<String, String>) -> bool {
-    matches!(
-        job_env.get("WRKFLW_RUNTIME_MODE").map(String::as_str),
-        Some("docker" | "podman" | "kubernetes")
-    )
-}
-
 /// The `rustup` commands that add what a Rust toolchain step's `components`
-/// and `targets` (or `target`) inputs ask for, or `None` if it asks for none.
-/// Names are split on commas and whitespace, as `dtolnay/rust-toolchain` does.
-fn rust_toolchain_extras_script(
-    step: &workflow::Step,
-    ctx: &StepExecutionContext<'_>,
-) -> Option<String> {
-    let with = step.with.as_ref()?;
+/// and `targets` (or `target`) inputs ask for, empty if it asks for none.
+/// Names are split on commas and whitespace, as `dtolnay/rust-toolchain`
+/// does. `resolve` gives an input's final value, or `None` when it can't be
+/// known yet, which leaves that input out.
+fn rust_toolchain_extras(
+    with: &HashMap<String, String>,
+    resolve: impl Fn(&str) -> Option<String>,
+) -> Vec<String> {
     let names = |keys: &[&str]| -> Vec<String> {
         keys.iter()
             .filter_map(|key| with.get(*key))
-            .map(|value| preprocess_with_value(value, ctx))
+            .filter_map(|value| resolve(value))
             .flat_map(|value| {
                 value
                     .split(|c: char| c == ',' || c.is_whitespace())
@@ -4066,18 +4093,18 @@ fn rust_toolchain_extras_script(
                     .map(str::to_string)
                     .collect::<Vec<_>>()
             })
+            // Names reach a shell, so anything but a plain rustup name is
+            // refused, as is one rustup would read as an option.
+            .filter(|name| {
+                !name.starts_with('-')
+                    && name
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+            })
             .collect()
     };
-    // Names reach a shell, so anything but a plain rustup name is refused.
-    let plain = |name: &String| {
-        name.chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
-    };
-    let components: Vec<String> = names(&["components"]).into_iter().filter(plain).collect();
-    let targets: Vec<String> = names(&["targets", "target"])
-        .into_iter()
-        .filter(plain)
-        .collect();
+    let components = names(&["components"]);
+    let targets = names(&["targets", "target"]);
     let mut commands = Vec::new();
     if !components.is_empty() {
         commands.push(format!("rustup component add {}", components.join(" ")));
@@ -4085,11 +4112,13 @@ fn rust_toolchain_extras_script(
     if !targets.is_empty() {
         commands.push(format!("rustup target add {}", targets.join(" ")));
     }
-    if commands.is_empty() {
-        None
-    } else {
-        Some(format!("set -e\n{}\n", commands.join("\n")))
-    }
+    commands
+}
+
+/// An input's value when it holds no expression, so it is known before the
+/// job runs and can go into the runner image.
+fn static_input(value: &str) -> Option<String> {
+    (!value.contains("${{")).then(|| value.to_string())
 }
 
 /// Resolve `${{ }}` expressions in an action `with` parameter value.
@@ -4672,18 +4701,35 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                         if uses.starts_with("actions-rs/toolchain@")
                             || uses.starts_with("dtolnay/rust-toolchain@")
                         {
-                            // The runner image already has the toolchain, but
-                            // not the components or targets the step asks
-                            // for, such as `rustfmt` for `cargo fmt`. Add them
-                            // in the job's container. In emulation that would
-                            // change the user's own toolchain, so it doesn't.
-                            if let Some(script) = rust_toolchain_extras_script(ctx.step, &ctx) {
-                                if runs_in_container_mode(ctx.job_env) {
+                            // The components and targets the step asks for,
+                            // such as `rustfmt` for `cargo fmt`, must be there
+                            // for later steps. Without a `container:`, the
+                            // runner image is built with the ones known
+                            // before the run. A job container keeps whatever
+                            // a step adds, so they are added there too, which
+                            // costs nothing when the image has them. A step's
+                            // own container would lose them when it ends.
+                            let with = ctx.step.with.clone().unwrap_or_default();
+                            let wanted = rust_toolchain_extras(&with, |value| {
+                                Some(preprocess_with_value(value, &ctx))
+                            });
+                            if !wanted.is_empty() {
+                                let baked = ctx.container_config.is_none()
+                                    && ctx.runner_image.starts_with(COMBINED_IMAGE_PREFIX)
+                                    && rust_toolchain_extras(&with, static_input) == wanted;
+                                if !uses_container_runtime(ctx.job_env) {
+                                    wrkflw_logging::warning(&format!(
+                                        "{}: components and targets aren't installed in \
+                                         emulation; add them to your own toolchain if a later \
+                                         step needs them",
+                                        uses
+                                    ));
+                                } else if job_session::current().is_some() {
                                     let mut extras = ctx.step.clone();
                                     extras.uses = None;
                                     extras.with = None;
                                     extras.shell = Some("sh".to_string());
-                                    extras.run = Some(script);
+                                    extras.run = Some(format!("set -e\n{}\n", wanted.join("\n")));
                                     let mut result = Box::pin(execute_step(StepExecutionContext {
                                         step: &extras,
                                         ..ctx
@@ -4691,12 +4737,15 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                                     .await?;
                                     result.name = step_name;
                                     return Ok(result);
+                                } else if !baked {
+                                    wrkflw_logging::warning(&format!(
+                                        "{}: components and targets can't be added for later \
+                                         steps, as each step runs in a container of its own \
+                                         from {}. Pass --job-container, or add them in a run \
+                                         step of the steps that need them",
+                                        uses, ctx.runner_image
+                                    ));
                                 }
-                                wrkflw_logging::warning(&format!(
-                                    "{}: components and targets aren't installed in emulation; \
-                                     add them to your own toolchain if a later step needs them",
-                                    uses
-                                ));
                             }
                             let rustc_version = tokio::process::Command::new("rustc")
                                 .arg("--version")
@@ -9419,6 +9468,58 @@ runs:
         assert_eq!(runtimes.len(), 1);
         assert_eq!(runtimes[0].language, "rust");
         assert_eq!(runtimes[0].version, "stable");
+    }
+
+    #[test]
+    fn detect_setup_runtimes_rust_bakes_components_and_targets() {
+        let with = |pairs: &[(&str, &str)]| {
+            Some(
+                pairs
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect::<HashMap<_, _>>(),
+            )
+        };
+        let steps = vec![
+            make_step_uses(
+                "dtolnay/rust-toolchain@stable",
+                with(&[
+                    ("components", "rustfmt, clippy"),
+                    ("targets", "wasm32-unknown-unknown"),
+                ]),
+            ),
+            // Known only at run time, so it can't go into the image.
+            make_step_uses(
+                "dtolnay/rust-toolchain@stable",
+                with(&[("components", "${{ matrix.component }}")]),
+            ),
+            // Not a rustup name, so it never reaches the shell.
+            make_step_uses(
+                "dtolnay/rust-toolchain@stable",
+                with(&[("components", "rustfmt;rm -rf /")]),
+            ),
+        ];
+        let runtimes = detect_setup_runtimes(&steps);
+        let script = &runtimes[0].install_script;
+        assert!(
+            script.ends_with(
+                " && rustup component add rustfmt clippy && rustup target add wasm32-unknown-unknown"
+            ),
+            "{}",
+            script
+        );
+        assert!(!script.contains("matrix"), "{}", script);
+        assert!(!script.contains("rm -rf"), "{}", script);
+    }
+
+    #[test]
+    fn rust_install_script_never_links_a_system_directory() {
+        let script = get_install_script("rust", "stable");
+        assert!(
+            script.contains("case \"$d\" in /usr/local/bin|/usr/bin|/bin) ;;"),
+            "{}",
+            script
+        );
     }
 
     #[test]

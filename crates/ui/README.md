@@ -8,7 +8,9 @@ Terminal user interface for browsing workflows, running them, and viewing logs.
 - Diff-aware trigger filter (`d` / `D`) and Tweaks overlay (`,`)
 - Log search (`s`), filter (`f`), and match navigation (`n`)
 - Runtime cycling across Docker / Podman / Kubernetes / Secure Emulation / Emulation (`e`)
-- Hotkeys: `1`–`8` for tab jumps, `Tab`/`Shift+Tab`, `w/x/l/h` shortcuts, `Enter`, `r`, `Shift+R`, `Shift+J`, `t`, `v`, `?`, `q`, etc.
+- Hotkeys: `1`–`8` for tab jumps, `Tab`/`Shift+Tab`, `w/x/l/h` shortcuts, `Enter`, `r`, `Shift+R`, `Shift+J`, `t`, `v`, `?`, `q`/`Ctrl+C`, etc.
+- Step inspector: Output (with ANSI colours, following the tail; `PgUp`/`PgDn` to scroll) and Matrix with per-combination status
+- Responsive layout from small terminals up, built on ratatui 0.30
 - Mouse selection: drag to select text, copied to the clipboard on release (OSC 52)
 - Light and dark themes, following the terminal background unless `--theme` or `WRKFLW_THEME` says otherwise
 - Optional: enabled via the `tui` cargo feature flag

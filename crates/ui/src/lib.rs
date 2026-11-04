@@ -25,6 +25,8 @@ pub mod models;
 #[cfg(feature = "tui")]
 pub mod selection;
 #[cfg(feature = "tui")]
+pub mod text;
+#[cfg(feature = "tui")]
 pub mod theme;
 #[cfg(feature = "tui")]
 pub mod utils;
@@ -36,3 +38,6 @@ pub mod views;
 pub use app::run_wrkflw_tui;
 pub use handlers::workflow::execute_workflow_cli;
 pub use handlers::workflow::validate_workflow;
+
+#[cfg(all(test, feature = "tui"))]
+mod stress_tests;

@@ -4,7 +4,7 @@
 // timestamps, length, scope etc. are not persisted anywhere). We also
 // don't read the user's real secrets config file yet — the tab shows
 // `SecretConfig::default()`, i.e. the two providers that are always
-// wired (env + file). The header badge therefore says "defaults" so
+// wired (env + file). The providers badge therefore says "defaults" so
 // the user isn't misled into believing a customised config has been
 // loaded.
 //
@@ -21,64 +21,44 @@
 // accommodate it without restructure.
 
 use crate::app::App;
+use crate::text;
 use crate::theme::{self, BadgeKind, COLORS};
 use ratatui::{
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{List, ListItem, Paragraph, Wrap},
+    widgets::{HighlightSpacing, List, ListItem, Paragraph},
     Frame,
 };
 use wrkflw_executor::RuntimeType;
 use wrkflw_secrets::{SecretConfig, SecretProviderConfig};
 
 pub fn render_secrets_tab(f: &mut Frame<'_>, app: &mut App, area: Rect) {
-    let outer = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(2), Constraint::Min(0)])
-        .split(area);
-
-    render_header(f, outer[0]);
-
-    let body = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(55), Constraint::Min(0)])
-        .split(outer[1]);
-
-    // One provider read per frame — the three panes share the same slice.
     let rows = provider_entries();
-    render_providers_pane(f, app, &rows, body[0]);
+    let (left, right) = if area.width >= 90 {
+        let body = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(45), Constraint::Min(0)])
+            .split(area);
+        (body[0], body[1])
+    } else {
+        let body = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(rows.len() as u16 + 2),
+                Constraint::Min(0),
+            ])
+            .split(area);
+        (body[0], body[1])
+    };
+    render_providers_pane(f, app, &rows, left);
 
     let right = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(40), Constraint::Min(0)])
-        .split(body[1]);
+        .constraints([Constraint::Length(5), Constraint::Min(0)])
+        .split(right);
     render_detail_pane(f, app, &rows, right[0]);
-    render_runtime_pane(f, app, &rows, right[1]);
-}
-
-fn render_header(f: &mut Frame<'_>, area: Rect) {
-    let spans = vec![
-        Span::styled(
-            "Secrets & runtime",
-            Style::default()
-                .fg(COLORS.text)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("  ·  ", Style::default().fg(COLORS.text_muted)),
-        theme::badge_outline("masking: on", BadgeKind::Success),
-        Span::raw(" "),
-        // "defaults" rather than "configured": the tab reads
-        // `SecretConfig::default()` unconditionally — a custom
-        // config file is not loaded yet. Labelling this "configured"
-        // would be the exact kind of quiet UI lie PR #104 set out to
-        // avoid.
-        theme::badge_outline("default providers", BadgeKind::Info),
-    ];
-    f.render_widget(
-        Paragraph::new(Line::from(spans)).alignment(Alignment::Left),
-        area,
-    );
+    render_runtime_pane(f, app, right[1]);
 }
 
 fn provider_entries() -> Vec<(String, SecretProviderConfig)> {
@@ -95,44 +75,50 @@ fn render_providers_pane(
     rows: &[(String, SecretProviderConfig)],
     area: Rect,
 ) {
-    let block = theme::block_focused("Providers");
+    let block = theme::with_badge(theme::block_focused("Secret providers"), "defaults");
     let inner = block.inner(area);
-    f.render_widget(block, area);
+    let w = inner.width as usize;
 
     let items: Vec<ListItem> = rows
         .iter()
         .map(|(name, cfg)| {
-            let kind = match cfg {
-                SecretProviderConfig::Environment { prefix } => match prefix {
-                    Some(p) => format!("env (prefix: {})", p),
-                    None => "env".to_string(),
-                },
-                SecretProviderConfig::File { path } => format!("file → {}", path),
+            let detail = match cfg {
+                SecretProviderConfig::Environment { prefix: Some(p) } => format!("{p}*"),
+                SecretProviderConfig::Environment { prefix: None } => "environment".to_string(),
+                SecretProviderConfig::File { path } => path.clone(),
             };
-            let spans = vec![
-                Span::styled("◉ ", Style::default().fg(COLORS.warning)),
+            let used = 2 + text::width(name) + 2;
+            ListItem::new(Line::from(vec![
                 Span::styled(
                     name.clone(),
                     Style::default()
                         .fg(COLORS.text)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled("  ", Style::default()),
-                Span::styled(kind, Style::default().fg(COLORS.text_dim)),
-            ];
-            ListItem::new(Line::from(spans))
+                Span::raw("  "),
+                Span::styled(
+                    text::truncate_left(&detail, w.saturating_sub(used)).into_owned(),
+                    theme::muted_style(),
+                ),
+            ]))
         })
         .collect();
 
     let list = List::new(items)
-        .highlight_style(
-            Style::default()
-                .bg(COLORS.bg_selected)
-                .add_modifier(Modifier::BOLD),
-        )
-        .highlight_symbol(" ▸ ");
+        .block(block)
+        .highlight_style(theme::selected_style())
+        .highlight_symbol(theme::SELECTED_MARK)
+        .highlight_spacing(HighlightSpacing::Always);
 
-    f.render_stateful_widget(list, inner, &mut app.secrets_list_state);
+    if app
+        .secrets_list_state
+        .selected()
+        .is_none_or(|i| i >= rows.len())
+    {
+        app.secrets_list_state
+            .select((!rows.is_empty()).then_some(0));
+    }
+    f.render_stateful_widget(list, area, &mut app.secrets_list_state);
 }
 
 fn render_detail_pane(
@@ -142,13 +128,9 @@ fn render_detail_pane(
     area: Rect,
 ) {
     let sel = app.secrets_list_state.selected().unwrap_or(0);
-    let (name, cfg) = match rows.get(sel) {
-        Some(r) => r,
-        None => {
-            let block = theme::block("Detail");
-            f.render_widget(block, area);
-            return;
-        }
+    let Some((name, cfg)) = rows.get(sel) else {
+        f.render_widget(theme::block("Provider"), area);
+        return;
     };
 
     let title = format!("Provider · {}", name);
@@ -156,142 +138,93 @@ fn render_detail_pane(
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let mut lines: Vec<Line> = Vec::new();
-    // Source descriptor (file path or env-var prefix) — shown plainly.
-    // These aren't secret values, so bullet-masking them would be
-    // theatre (see module header). Real per-secret values will come
-    // later and land in a dedicated row with an actual reveal toggle.
-    let (source_label, source_value) = match cfg {
-        SecretProviderConfig::Environment { prefix } => (
-            "Source".to_string(),
-            prefix
-                .clone()
-                .map(|p| format!("env vars matching {}*", p))
-                .unwrap_or_else(|| "any env var".to_string()),
-        ),
-        SecretProviderConfig::File { path } => ("Path".to_string(), path.clone()),
+    // Source descriptors (a path or an env-var prefix) aren't secret
+    // values, so they're shown plainly.
+    let w = inner.width as usize;
+    let mut lines = match cfg {
+        SecretProviderConfig::Environment { prefix } => vec![
+            kv("Kind", "environment variables", w),
+            kv(
+                "Reads",
+                &prefix
+                    .as_ref()
+                    .map(|p| format!("variables starting with {p}"))
+                    .unwrap_or_else(|| "any variable".to_string()),
+                w,
+            ),
+        ],
+        SecretProviderConfig::File { path } => vec![kv("Kind", "file", w), kv("Path", path, w)],
     };
-    lines.push(Line::from(vec![
-        Span::styled(
-            format!("{}: ", source_label),
-            Style::default().fg(COLORS.text_muted),
-        ),
-        Span::styled(source_value, Style::default().fg(COLORS.text)),
-    ]));
-    lines.push(Line::from(""));
-
-    let kind_label = match cfg {
-        SecretProviderConfig::Environment { .. } => "environment",
-        SecretProviderConfig::File { .. } => "file",
-    };
-    lines.push(kv("Kind", kind_label));
-    lines.push(kv("Masking", "applies to resolved values (not shown here)"));
-
-    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+    lines.push(kv("Masking", "values are hidden in logs", w));
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
-fn render_runtime_pane(
-    f: &mut Frame<'_>,
-    app: &App,
-    rows: &[(String, SecretProviderConfig)],
-    area: Rect,
-) {
-    let block = theme::block("Runtime");
+fn render_runtime_pane(f: &mut Frame<'_>, app: &App, area: Rect) {
+    let block = theme::with_badge(theme::block("Runtime"), "e to cycle");
     let inner = block.inner(area);
     f.render_widget(block, area);
+    let w = inner.width as usize;
 
-    // Pills row.
-    let pill = |label: &str, kind: BadgeKind, active: bool| -> Vec<Span<'_>> {
-        if active {
-            vec![theme::badge_solid(label.to_string(), kind), Span::raw(" ")]
-        } else {
-            vec![
-                theme::badge_outline(label.to_string(), kind),
-                Span::raw(" "),
-            ]
+    let options = [
+        ("Docker", BadgeKind::Docker, RuntimeType::Docker),
+        ("Podman", BadgeKind::Podman, RuntimeType::Podman),
+        ("Kubernetes", BadgeKind::Kubernetes, RuntimeType::Kubernetes),
+        (
+            "Secure emulation",
+            BadgeKind::Secure,
+            RuntimeType::SecureEmulation,
+        ),
+        ("Emulation", BadgeKind::Emulation, RuntimeType::Emulation),
+    ];
+    let mut lines: Vec<Line> = options
+        .iter()
+        .map(|(label, kind, runtime)| {
+            if app.runtime_type == *runtime {
+                Line::from(vec![
+                    Span::styled(theme::SELECTED_MARK, Style::default().fg(kind.fg())),
+                    Span::styled(
+                        label.to_string(),
+                        Style::default().fg(kind.fg()).add_modifier(Modifier::BOLD),
+                    ),
+                ])
+            } else {
+                Line::from(Span::styled(format!("  {label}"), theme::muted_style()))
+            }
+        })
+        .collect();
+
+    let reachable = match app.runtime_type {
+        RuntimeType::Docker | RuntimeType::Podman | RuntimeType::Kubernetes => {
+            if app.runtime_available {
+                "reachable"
+            } else {
+                "not reachable · runs will fail"
+            }
         }
+        RuntimeType::SecureEmulation => "always · sandboxed on this machine",
+        _ => "always · runs directly on this machine",
     };
-    let mut pills: Vec<Span> = Vec::new();
-    pills.extend(pill(
-        "Docker",
-        BadgeKind::Docker,
-        matches!(app.runtime_type, RuntimeType::Docker),
-    ));
-    pills.extend(pill(
-        "Podman",
-        BadgeKind::Podman,
-        matches!(app.runtime_type, RuntimeType::Podman),
-    ));
-    pills.extend(pill(
-        "Kubernetes",
-        BadgeKind::Kubernetes,
-        matches!(app.runtime_type, RuntimeType::Kubernetes),
-    ));
-    pills.extend(pill(
-        "Emulation",
-        BadgeKind::Emulation,
-        matches!(app.runtime_type, RuntimeType::Emulation),
-    ));
-    pills.extend(pill(
-        "Secure-emu",
-        BadgeKind::Secure,
-        matches!(app.runtime_type, RuntimeType::SecureEmulation),
-    ));
-    let mut lines: Vec<Line> = vec![Line::from(pills)];
     lines.push(Line::from(""));
-    lines.push(kv("Active", app.runtime_type_name()));
+    lines.push(kv("Available", reachable, w));
     lines.push(kv(
-        "Available",
-        if app.runtime_available {
-            "yes"
-        } else {
-            "no (will use emulation)"
-        },
-    ));
-    lines.push(kv(
-        "Preserve on failure",
+        "On failure",
         if app.preserve_containers_on_failure {
-            "on"
+            "containers are kept"
         } else {
-            "off"
+            "containers are removed"
         },
+        w,
     ));
-    lines.push(Line::from(""));
-    lines.push(Line::from(vec![Span::styled(
-        "PROVIDERS · routing",
-        Style::default()
-            .fg(COLORS.highlight)
-            .add_modifier(Modifier::BOLD),
-    )]));
-    for (name, cfg) in rows {
-        let right = match cfg {
-            SecretProviderConfig::Environment { prefix } => prefix
-                .clone()
-                .map(|p| format!("{}*", p))
-                .unwrap_or_else(|| "$*".to_string()),
-            SecretProviderConfig::File { path } => path.clone(),
-        };
-        lines.push(Line::from(vec![
-            Span::styled(name.clone(), Style::default().fg(theme::current_accent())),
-            Span::raw(" → "),
-            Span::styled(right, Style::default().fg(COLORS.text)),
-        ]));
-    }
-    lines.push(Line::from(""));
-    lines.push(Line::from(vec![
-        theme::key_chip("e"),
-        Span::raw(" "),
-        Span::styled("cycle runtime", Style::default().fg(COLORS.text_dim)),
-    ]));
-    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
-fn kv<'a>(key: &'a str, value: impl Into<String>) -> Line<'a> {
+fn kv(key: &str, value: &str, w: usize) -> Line<'static> {
+    const KEY_W: usize = 12;
     Line::from(vec![
+        Span::styled(format!("{key:<KEY_W$}"), theme::muted_style()),
         Span::styled(
-            format!("  {:<20}", key),
-            Style::default().fg(COLORS.text_muted),
+            text::truncate(value, w.saturating_sub(KEY_W)).into_owned(),
+            Style::default().fg(COLORS.text),
         ),
-        Span::styled(value.into(), Style::default().fg(COLORS.text)),
     ])
 }

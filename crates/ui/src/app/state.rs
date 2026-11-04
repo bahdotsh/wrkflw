@@ -66,15 +66,19 @@ pub struct App {
     pub current_execution: Option<usize>,
     logs: Vec<String>, // Overall execution logs — private so every mutation routes through `add_log`
     pub log_scroll: usize, // Scrolling position for logs
-    pub job_list_state: ListState, // For viewing job details
-    pub detailed_view: bool, // Whether we're in detailed view mode
-    pub step_list_state: ListState, // For selecting steps in detailed view
-    pub step_table_state: TableState, // For the steps table in detailed view
-    pub last_tick: Instant, // For UI animations and updates
-    pub tick_rate: Duration, // How often to update the UI
-    pub spinner_frame: usize, // Current spinner animation frame
+    /// Keep the newest log line selected as lines arrive.
+    pub log_follow: bool,
+    /// First visible log row, kept across frames so scrolling is smooth.
+    pub log_offset: usize,
+    pub job_list_state: ListState,            // For viewing job details
+    pub detailed_view: bool,                  // Whether we're in detailed view mode
+    pub step_list_state: ListState,           // For selecting steps in detailed view
+    pub step_table_state: TableState,         // For the steps table in detailed view
+    pub last_tick: Instant,                   // For UI animations and updates
+    pub tick_rate: Duration,                  // How often to update the UI
+    pub spinner_frame: usize,                 // Current spinner animation frame
     pub tx: mpsc::Sender<ExecutionResultMsg>, // Channel for async communication
-    pub status_message: Option<String>, // Temporary status message to display
+    pub status_message: Option<String>,       // Temporary status message to display
     pub status_message_severity: StatusSeverity, // Severity of the current status message
     pub status_message_time: Option<Instant>, // When the message was set
 
@@ -143,6 +147,11 @@ pub struct App {
     /// Active sub-tab inside the Step Inspector (job-detail) view.
     /// 0 Output, 1 Env, 2 Files, 3 Matrix, 4 Timeline.
     pub step_inspector_tab: usize,
+    /// Lines scrolled back from the end of the inspected step's output;
+    /// 0 follows the tail.
+    pub step_output_scroll: usize,
+    /// Stage scrolled to in the DAG graph view.
+    pub dag_scroll: usize,
 
     // ── DAG tab ───────────────────────────────────────────────────
     /// When true, the DAG tab renders the topological-stage list view;
@@ -470,6 +479,8 @@ impl App {
             current_execution: None,
             logs: Vec::new(),
             log_scroll: 0,
+            log_follow: true,
+            log_offset: 0,
             job_list_state,
             detailed_view: false,
             step_list_state,
@@ -516,6 +527,8 @@ impl App {
             diff_filter_task: None,
             diff_filter_aborted: false,
             step_inspector_tab: 0,
+            step_output_scroll: 0,
+            dag_scroll: 0,
 
             dag_list_view: false,
 
@@ -1018,6 +1031,8 @@ impl App {
 
                 // Reset step selection when changing jobs
                 self.step_list_state.select(Some(0));
+                self.step_table_state.select(Some(0));
+                self.step_output_scroll = 0;
             }
         }
     }
@@ -1049,6 +1064,8 @@ impl App {
 
                 // Reset step selection when changing jobs
                 self.step_list_state.select(Some(0));
+                self.step_table_state.select(Some(0));
+                self.step_output_scroll = 0;
             }
         }
     }
@@ -1082,6 +1099,7 @@ impl App {
                         self.step_list_state.select(Some(i));
                         // Update the table state to match
                         self.step_table_state.select(Some(i));
+                        self.step_output_scroll = 0;
                     }
                 }
             }
@@ -1117,6 +1135,7 @@ impl App {
                         self.step_list_state.select(Some(i));
                         // Update the table state to match
                         self.step_table_state.select(Some(i));
+                        self.step_output_scroll = 0;
                     }
                 }
             }
@@ -1216,6 +1235,7 @@ impl App {
                         .iter()
                         .map(|job_result| JobExecution {
                             name: job_result.name.clone(),
+                            canonical_name: job_result.canonical_name.clone(),
                             status: match job_result.status {
                                 wrkflw_executor::JobStatus::Success => JobStatus::Success,
                                 wrkflw_executor::JobStatus::Failure => JobStatus::Failure,
@@ -1232,6 +1252,7 @@ impl App {
                                         wrkflw_executor::StepStatus::Skipped => StepStatus::Skipped,
                                     },
                                     output: step_result.output.clone(),
+                                    exit_code: step_result.exit_code,
                                 })
                                 .collect::<Vec<StepExecution>>(),
                             logs: vec![job_result.logs.clone()],
@@ -1245,20 +1266,58 @@ impl App {
                     // Create a dummy job with the error information so users can see details
                     execution_details.jobs = vec![JobExecution {
                         name: "Workflow Execution".to_string(),
+                        canonical_name: String::new(),
                         status: JobStatus::Failure,
                         steps: vec![StepExecution {
                             name: "Execution Error".to_string(),
                             status: StepStatus::Failure,
                             output: format!("Error: {}\n\nThis error prevented the workflow from executing properly.", e),
+                            exit_code: None,
                         }],
                         logs: vec![format!("Workflow execution error: {}", e)],
                         failure_allowed: false,
                     }];
                 }
             }
+
+            // Open the panes on the problem: the first job that failed
+            // the run, and its first failing step.
+            let job = execution_details
+                .jobs
+                .iter()
+                .position(|j| j.status == JobStatus::Failure && !j.failure_allowed)
+                .unwrap_or(0);
+            let step = execution_details
+                .jobs
+                .get(job)
+                .and_then(|j| j.steps.iter().position(|s| s.status == StepStatus::Failure))
+                .unwrap_or(0);
+            self.job_list_state.select(Some(job));
+            self.step_list_state.select(Some(step));
+            self.step_table_state.select(Some(step));
+            self.step_output_scroll = 0;
         }
 
+        // The executor returns Ok with per-job results even when a job
+        // failed; only a failure that `continue-on-error` doesn't cover
+        // fails the run, as it does on the CLI.
+        let failed_job = match &result {
+            Ok((jobs, _)) => jobs
+                .iter()
+                .find(|j| j.status == wrkflw_executor::JobStatus::Failure && !j.failure_allowed)
+                .map(|j| j.name.clone()),
+            Err(_) => None,
+        };
         match result {
+            Ok(_) if failed_job.is_some() => {
+                workflow.status = WorkflowStatus::Failed;
+                let msg = format!(
+                    "Workflow '{}' failed: job '{}' failed",
+                    workflow.name,
+                    failed_job.unwrap_or_default()
+                );
+                wrkflw_logging::error(&msg);
+            }
             Ok(_) => {
                 workflow.status = WorkflowStatus::Success;
                 // Single sink: `wrkflw_logging` stamps its own [HH:MM:SS]
@@ -1517,6 +1576,7 @@ impl App {
                 (self.log_search_match_idx + 1) % self.log_search_matches.len();
             if let Some(&idx) = self.log_search_matches.get(self.log_search_match_idx) {
                 self.log_scroll = idx;
+                self.log_follow = false;
 
                 // Set status message showing which match we're on
                 self.set_success_message(format!(
@@ -1539,6 +1599,7 @@ impl App {
             };
             if let Some(&idx) = self.log_search_matches.get(self.log_search_match_idx) {
                 self.log_scroll = idx;
+                self.log_follow = false;
 
                 // Set status message showing which match we're on
                 self.set_success_message(format!(
@@ -1553,16 +1614,37 @@ impl App {
 
     // Scroll logs up
     pub fn scroll_logs_up(&mut self) {
-        self.log_scroll = self.log_scroll.saturating_sub(1);
+        self.scroll_logs_by(-1);
     }
 
     // Scroll logs down
     pub fn scroll_logs_down(&mut self) {
-        // Get total log count including system logs
-        let total_logs = self.logs.len() + wrkflw_logging::get_logs().len();
-        if total_logs > 0 {
-            self.log_scroll = (self.log_scroll + 1).min(total_logs - 1);
+        self.scroll_logs_by(1);
+    }
+
+    /// Moves the log cursor by `delta` rows over the lines on screen
+    /// (after search and filter). Reaching the last line resumes
+    /// following new output; moving off it pauses that.
+    pub fn scroll_logs_by(&mut self, delta: isize) {
+        let total = self.processed_logs.len();
+        if total == 0 {
+            self.log_scroll = 0;
+            self.log_follow = true;
+            return;
         }
+        let next = self.log_scroll.min(total - 1).saturating_add_signed(delta);
+        self.log_scroll = next.min(total - 1);
+        self.log_follow = self.log_scroll == total - 1;
+    }
+
+    pub fn scroll_logs_to_start(&mut self) {
+        self.log_scroll = 0;
+        self.log_follow = self.processed_logs.len() <= 1;
+    }
+
+    pub fn scroll_logs_to_end(&mut self) {
+        self.log_scroll = self.processed_logs.len().saturating_sub(1);
+        self.log_follow = true;
     }
 
     // Scroll help content up
@@ -1572,9 +1654,8 @@ impl App {
 
     // Scroll help content down
     pub fn scroll_help_down(&mut self) {
-        // The help content has a fixed number of lines, so we set a reasonable max
-        const MAX_HELP_SCROLL: usize = 30; // Adjust based on help content length
-        self.help_scroll = (self.help_scroll + 1).min(MAX_HELP_SCROLL);
+        // Rendering clamps this to the content that doesn't fit.
+        self.help_scroll = self.help_scroll.saturating_add(1);
     }
 
     // Update progress for running workflows
@@ -1805,15 +1886,24 @@ impl App {
 
         if let Some(response) = self.log_processor.try_get_update() {
             self.processed_logs = response.processed_logs;
+            let had_matches = !self.log_search_matches.is_empty();
             self.log_search_matches = response.search_matches;
 
-            // Update scroll position to first match if we have search results
+            // Jump to the first match only when a search starts matching.
+            // Doing it on every update would yank the cursor back each
+            // time a running workflow logs a line.
             if !self.log_search_matches.is_empty() && !self.log_search_query.is_empty() {
-                self.log_search_match_idx = 0;
-                if let Some(&idx) = self.log_search_matches.first() {
-                    self.log_scroll = idx;
+                if !had_matches || self.log_search_match_idx >= self.log_search_matches.len() {
+                    self.log_search_match_idx = 0;
+                    self.log_scroll = self.log_search_matches[0];
+                    self.log_follow = false;
                 }
+            } else if self.log_follow {
+                self.log_scroll = self.processed_logs.len().saturating_sub(1);
             }
+            self.log_scroll = self
+                .log_scroll
+                .min(self.processed_logs.len().saturating_sub(1));
 
             self.logs_need_update = false;
         }
@@ -2828,6 +2918,50 @@ mod tests {
         ];
         app.workflow_list_state.select(Some(0));
         app
+    }
+
+    fn job_result(
+        name: &str,
+        status: wrkflw_executor::JobStatus,
+        allowed: bool,
+    ) -> wrkflw_executor::JobResult {
+        wrkflw_executor::JobResult {
+            name: name.to_string(),
+            canonical_name: name.to_string(),
+            status,
+            steps: Vec::new(),
+            logs: String::new(),
+            outputs: HashMap::new(),
+            failure_allowed: allowed,
+        }
+    }
+
+    #[test]
+    fn a_failed_job_fails_the_run_unless_it_is_allowed_to() {
+        use wrkflw_executor::JobStatus as S;
+        let mut app = make_app();
+        app.process_execution_result(0, Ok((vec![job_result("build", S::Failure, false)], ())));
+        assert_eq!(app.workflows[0].status, WorkflowStatus::Failed);
+
+        app.process_execution_result(0, Ok((vec![job_result("build", S::Failure, true)], ())));
+        assert_eq!(app.workflows[0].status, WorkflowStatus::Success);
+
+        app.process_execution_result(
+            0,
+            Ok((
+                vec![
+                    job_result("lint", S::Success, false),
+                    job_result("test", S::Failure, false),
+                ],
+                (),
+            )),
+        );
+        assert_eq!(app.workflows[0].status, WorkflowStatus::Failed);
+        assert_eq!(
+            app.job_list_state.selected(),
+            Some(1),
+            "opens on the failed job"
+        );
     }
 
     #[test]

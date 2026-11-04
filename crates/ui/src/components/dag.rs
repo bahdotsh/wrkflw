@@ -1,11 +1,9 @@
-// Mini job-dependency view.
-//
-// The design's full DAG is a free-form SVG; in a terminal we render a tighter
-// columns-by-topological-level layout using box-drawing chars. When `needs:`
-// data is unavailable we fall back to a single linear column so the panel
-// is never empty.
+// Job-dependency helpers: topological stages and the compact stage list
+// the Execution tab shows beside a run.
 
-use crate::theme::{self, BadgeKind, COLORS};
+use crate::models::{JobState, Workflow};
+use crate::text;
+use crate::theme::{self, COLORS};
 use ratatui::{
     layout::Rect,
     style::{Modifier, Style},
@@ -15,36 +13,6 @@ use ratatui::{
 };
 use std::collections::{HashMap, HashSet};
 use wrkflw_parser::workflow::WorkflowDefinition;
-
-/// Status of a job *as it appears live* — synthesised from `WorkflowExecution`.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum NodeState {
-    Success,
-    Failure,
-    Skipped,
-    Running,
-    Pending,
-}
-
-fn state_color(s: NodeState) -> ratatui::style::Color {
-    match s {
-        NodeState::Success => COLORS.success,
-        NodeState::Failure => COLORS.error,
-        NodeState::Skipped => COLORS.warning,
-        NodeState::Running => COLORS.info,
-        NodeState::Pending => COLORS.text_muted,
-    }
-}
-
-fn state_glyph(s: NodeState, spinner_frame: usize) -> &'static str {
-    match s {
-        NodeState::Success => theme::symbols::SUCCESS,
-        NodeState::Failure => theme::symbols::FAILURE,
-        NodeState::Skipped => theme::symbols::SKIPPED,
-        NodeState::Running => theme::spinner(spinner_frame),
-        NodeState::Pending => theme::symbols::NOT_STARTED,
-    }
-}
 
 /// Compute topological levels (Kahn's algorithm). Returns columns of job names.
 /// Jobs not present in the dependency graph go into the first column.
@@ -106,100 +74,60 @@ pub fn topo_levels(def: &WorkflowDefinition) -> Vec<Vec<String>> {
     levels
 }
 
-/// Render the mini DAG into `area`. `state_of` resolves a job name to its
-/// current node state.
-pub fn render<F: Fn(&str) -> NodeState>(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    def: Option<&WorkflowDefinition>,
-    state_of: F,
-    spinner_frame: usize,
-) {
-    let mut lines: Vec<Line> = Vec::new();
-
-    let levels: Vec<Vec<String>> = match def {
-        Some(d) => topo_levels(d),
-        None => Vec::new(),
+/// Compact stage-by-stage job list for side panes.
+pub fn render(frame: &mut Frame<'_>, area: Rect, workflow: &Workflow, spinner_frame: usize) {
+    let Some(def) = workflow.definition.as_deref() else {
+        theme::empty_state(frame, area, "Couldn't parse this workflow", vec![]);
+        return;
     };
-
+    let levels = topo_levels(def);
     if levels.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "no parsed workflow",
-            Style::default().fg(COLORS.text_muted),
-        )));
-        frame.render_widget(Paragraph::new(lines), area);
+        theme::empty_state(frame, area, "No jobs", vec![]);
         return;
     }
 
-    // Render one row per (column, name) up to a few — narrow text panel.
-    // Format:  L1: setup   ✓
-    //          L2: fmt     ✓
-    //              clippy  ✓
-    //          L3: build   ⠋  ◀
-    let stage_labels = ["setup", "lint", "build", "test/docs", "publish"];
+    let w = area.width as usize;
+    let mut lines: Vec<Line> = Vec::new();
     for (li, layer) in levels.iter().enumerate() {
-        // Stage header
-        let stage = stage_labels.get(li).copied().unwrap_or("stage");
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("L{} ", li + 1),
-                Style::default().fg(COLORS.text_muted),
-            ),
-            Span::styled(
-                stage.to_string(),
-                Style::default()
-                    .fg(COLORS.highlight)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]));
+        lines.push(Line::from(Span::styled(
+            format!("Stage {}", li + 1),
+            Style::default()
+                .fg(COLORS.text_muted)
+                .add_modifier(Modifier::BOLD),
+        )));
         for name in layer {
-            let st = state_of(name);
-            let color = state_color(st);
-            let glyph = state_glyph(st, spinner_frame);
-            let active_marker = if matches!(st, NodeState::Running) {
-                "  ◀"
-            } else {
-                ""
+            let state = workflow.job_state(name);
+            let (glyph, style) = theme::job_state(state, spinner_frame);
+            let name_style = match state {
+                JobState::Pending | JobState::Skipped => Style::default().fg(COLORS.text_muted),
+                JobState::Failure => Style::default().fg(COLORS.error),
+                _ => Style::default().fg(COLORS.text),
             };
             lines.push(Line::from(vec![
-                Span::raw("  "),
-                Span::styled(glyph.to_string(), Style::default().fg(color)),
+                Span::styled("├ ", Style::default().fg(COLORS.border)),
+                Span::styled(glyph.to_string(), style),
                 Span::raw(" "),
                 Span::styled(
-                    truncate(name, 14),
-                    Style::default().fg(if matches!(st, NodeState::Running) {
-                        COLORS.text
-                    } else {
-                        color
-                    }),
+                    text::truncate(&text::sanitize(name), w.saturating_sub(4)).into_owned(),
+                    name_style,
                 ),
-                Span::styled(active_marker.to_string(), Style::default().fg(COLORS.info)),
             ]));
         }
     }
-
-    // Tiny legend strip (matches the design's "active critical path" idea).
-    lines.push(Line::from(vec![Span::styled(
-        " ",
-        Style::default().fg(COLORS.text_muted),
-    )]));
-    lines.push(Line::from(vec![
-        theme::badge_outline("running", BadgeKind::Info),
-        Span::raw(" "),
-        theme::badge_outline("done", BadgeKind::Success),
-        Span::raw(" "),
-        theme::badge_outline("pending", BadgeKind::Dim),
-    ]));
-
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-fn truncate(s: &str, n: usize) -> String {
-    if s.chars().count() <= n {
-        s.to_string()
-    } else {
-        let mut out: String = s.chars().take(n.saturating_sub(1)).collect();
-        out.push('…');
-        out
+/// How many runs a matrix job expands into, `?` when that is only known
+/// once an expression is evaluated.
+pub fn matrix_size_label(matrix: &wrkflw_matrix::MatrixConfig) -> Option<String> {
+    use wrkflw_matrix::MatrixEntries;
+
+    if matrix.expression.is_some() || matches!(matrix.include, MatrixEntries::Expression(_)) {
+        return Some("?".to_string());
+    }
+    match wrkflw_matrix::expand_matrix(matrix) {
+        Ok(combos) if !combos.is_empty() => Some(combos.len().to_string()),
+        Ok(_) => None,
+        Err(_) => Some("?".to_string()),
     }
 }

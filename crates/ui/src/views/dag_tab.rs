@@ -1,373 +1,287 @@
-// DAG full view — screen 4 from the design.
-//
-// Two modes behind a single tab (toggled with `g`):
-//
-//   - Graph: jobs laid out in topological columns, each column prefixed
-//     with a stage label. Edges are drawn on the left gutter of each
-//     column so a user can see `needs:` at a glance without us having
-//     to pretend we're an SVG canvas.
-//   - List: topological stages as headers with jobs listed under each —
-//     the same data as the design's `TopoList`. Denser, read-easier on
-//     narrow terminals.
-//
-// The workflow shown is the one currently focused in the Workflows
-// tab. This deliberately mirrors the design (no workflow picker on
-// this screen) — the Workflows tab is the selector.
+// DAG tab — the selected workflow's jobs as stage columns of status
+// cards (or an indented list with `g`). ←/→ scroll when the stages don't
+// all fit, ↑/↓ switch workflow, Enter opens the run on Execution.
 
 use crate::app::App;
-use crate::components::dag::{self, NodeState};
-use crate::models::WorkflowStatus;
-use crate::theme::{self, BadgeKind, COLORS};
+use crate::components::dag::{self, matrix_size_label};
+use crate::models::{JobState, Workflow};
+use crate::text;
+use crate::theme::{self, COLORS};
 use ratatui::{
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Paragraph, Wrap},
+    widgets::Paragraph,
     Frame,
 };
-use wrkflw_executor::JobStatus;
 use wrkflw_parser::workflow::WorkflowDefinition;
 
-pub fn render_dag_tab(f: &mut Frame<'_>, app: &App, area: Rect) {
-    let Some(idx) = app.workflow_list_state.selected() else {
-        render_empty_state(
-            f,
-            area,
-            "No workflow selected — pick one on the Workflows tab.",
-        );
-        return;
-    };
-    let Some(workflow) = app.workflows.get(idx) else {
-        render_empty_state(f, area, "Workflow selection out of range.");
-        return;
-    };
-    let Some(def) = workflow.definition.as_ref() else {
-        render_empty_state(
-            f,
-            area,
-            &format!("Couldn't parse {} — DAG unavailable.", workflow.name),
-        );
-        return;
-    };
+const MIN_CARD_W: u16 = 16;
+const MAX_CARD_W: u16 = 28;
+const GAP: u16 = 3;
+const CARD_H: u16 = 3;
 
-    let outer = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(2), Constraint::Min(0)])
-        .split(area);
-
-    render_header(f, app, workflow, outer[0]);
-
+pub fn render_dag_tab(f: &mut Frame<'_>, app: &mut App, area: Rect) {
+    let legend_w = if area.width >= 96 { 24 } else { 0 };
     let body = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(0), Constraint::Length(30)])
-        .split(outer[1]);
-
-    if app.dag_list_view {
-        render_topo_list(f, app, def, workflow, idx, body[0]);
-    } else {
-        render_graph(f, app, def, workflow, idx, body[0]);
+        .constraints([Constraint::Min(0), Constraint::Length(legend_w)])
+        .split(area);
+    if legend_w > 0 {
+        render_legend(f, app, body[1]);
     }
-    render_legend(f, app, body[1]);
+
+    let workflow = app
+        .workflow_list_state
+        .selected()
+        .and_then(|i| app.workflows.get(i));
+    let Some(workflow) = workflow else {
+        let block = theme::block_focused("Graph");
+        let inner = block.inner(body[0]);
+        f.render_widget(block, body[0]);
+        theme::empty_state(f, inner, "No workflow selected", vec![]);
+        return;
+    };
+    let Some(def) = workflow.definition.clone() else {
+        let block = theme::block_focused("Graph");
+        let inner = block.inner(body[0]);
+        f.render_widget(block, body[0]);
+        theme::empty_state(
+            f,
+            inner,
+            "Couldn't parse this workflow",
+            vec![Span::styled(
+                "Validate it from the Workflows tab to see why",
+                theme::muted_style(),
+            )],
+        );
+        return;
+    };
+
+    let levels = dag::topo_levels(&def);
+    let scroll = if app.dag_list_view {
+        render_list(f, app, workflow, &def, &levels, body[0])
+    } else {
+        render_graph(f, app, workflow, &def, &levels, body[0])
+    };
+    app.dag_scroll = scroll;
 }
 
-fn render_empty_state(f: &mut Frame<'_>, area: Rect, msg: &str) {
-    let block = theme::block("DAG");
+fn title(workflow: &Workflow) -> String {
+    format!("Graph · {}", text::sanitize(&workflow.name))
+}
+
+fn state_color(state: JobState) -> ratatui::style::Color {
+    match state {
+        JobState::Success => COLORS.success,
+        JobState::Failure => COLORS.error,
+        JobState::FailureAllowed => COLORS.warning,
+        JobState::Running => COLORS.info,
+        JobState::Skipped | JobState::Pending => COLORS.text_muted,
+    }
+}
+
+/// Draws the stage columns from `app.dag_scroll`, returning the scroll
+/// clamped to the stages that exist.
+fn render_graph(
+    f: &mut Frame<'_>,
+    app: &App,
+    workflow: &Workflow,
+    def: &WorkflowDefinition,
+    levels: &[Vec<String>],
+    area: Rect,
+) -> usize {
+    let title = title(workflow);
+    let block = theme::block_focused(&title);
     let inner = block.inner(area);
-    f.render_widget(block, area);
-    f.render_widget(
-        Paragraph::new(msg).style(Style::default().fg(COLORS.text_muted)),
-        inner,
-    );
+
+    if levels.is_empty() {
+        f.render_widget(block, area);
+        theme::empty_state(f, inner, "No jobs", vec![]);
+        return 0;
+    }
+
+    let fit = ((inner.width + GAP) / (MIN_CARD_W + GAP)).max(1) as usize;
+    let visible = fit.min(levels.len());
+    let first = app.dag_scroll.min(levels.len() - visible);
+    let card_w = ((inner.width + GAP) / visible as u16)
+        .saturating_sub(GAP)
+        .clamp(MIN_CARD_W.min(inner.width), MAX_CARD_W);
+
+    let mut badge = format!("{} stages", levels.len());
+    if visible < levels.len() {
+        badge = format!(
+            "{}{}–{} of {}{}",
+            if first > 0 { "‹ " } else { "" },
+            first + 1,
+            first + visible,
+            levels.len(),
+            if first + visible < levels.len() {
+                " ›"
+            } else {
+                ""
+            },
+        );
+    }
+    f.render_widget(theme::with_badge(block, badge), area);
+
+    let max_cards = (inner.height.saturating_sub(2) / CARD_H).max(1) as usize;
+    for (col, (li, layer)) in levels
+        .iter()
+        .enumerate()
+        .skip(first)
+        .take(visible)
+        .enumerate()
+    {
+        let x = inner.x + col as u16 * (card_w + GAP);
+        if x + card_w > inner.right() {
+            break;
+        }
+        let head = Rect::new(x, inner.y, card_w, 1);
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    format!("Stage {}", li + 1),
+                    Style::default()
+                        .fg(COLORS.text_dim)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(format!("  {}", layer.len()), theme::muted_style()),
+            ])),
+            head,
+        );
+
+        let overflow = layer.len() > max_cards;
+        let shown = if overflow {
+            max_cards.saturating_sub(1).max(1)
+        } else {
+            layer.len()
+        };
+        for (row, name) in layer.iter().take(shown).enumerate() {
+            let y = inner.y + 2 + row as u16 * CARD_H;
+            if y + CARD_H > inner.bottom() {
+                break;
+            }
+            let card = Rect::new(x, y, card_w, CARD_H);
+            render_card(f, app, workflow, def, name, card);
+
+            let has_needs = def
+                .jobs
+                .get(name)
+                .and_then(|j| j.needs.as_ref())
+                .is_some_and(|n| !n.is_empty());
+            if has_needs && col > 0 {
+                f.render_widget(
+                    Paragraph::new(Span::styled("─▶ ", theme::muted_style())),
+                    Rect::new(x - GAP, y + 1, GAP, 1),
+                );
+            }
+        }
+        if overflow {
+            let y = inner.y + 2 + shown as u16 * CARD_H;
+            if y < inner.bottom() {
+                f.render_widget(
+                    Paragraph::new(Span::styled(
+                        format!("  +{} more", layer.len() - shown),
+                        theme::muted_style(),
+                    )),
+                    Rect::new(x, y, card_w, 1),
+                );
+            }
+        }
+    }
+    first
 }
 
-fn render_header(f: &mut Frame<'_>, app: &App, workflow: &crate::models::Workflow, area: Rect) {
-    let view_label = if app.dag_list_view { "list" } else { "graph" };
-    let spans = vec![
-        Span::styled(
-            workflow.name.clone(),
-            Style::default()
-                .fg(COLORS.text)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            "  ·  dependency graph  ·  ",
-            Style::default().fg(COLORS.text_muted),
-        ),
-        theme::badge_outline(view_label, BadgeKind::Info),
-        Span::raw("  "),
-        Span::styled(
-            "press `g` to toggle",
-            Style::default().fg(COLORS.text_muted),
-        ),
-    ];
+fn render_card(
+    f: &mut Frame<'_>,
+    app: &App,
+    workflow: &Workflow,
+    def: &WorkflowDefinition,
+    name: &str,
+    area: Rect,
+) {
+    let state = workflow.job_state(name);
+    let color = state_color(state);
+    let (glyph, glyph_style) = theme::job_state(state, app.spinner_frame);
+    let matrix = def
+        .jobs
+        .get(name)
+        .and_then(|j| j.matrix_config())
+        .and_then(matrix_size_label)
+        .map(|n| format!(" ×{n}"))
+        .unwrap_or_default();
+
+    let block = ratatui::widgets::Block::bordered()
+        .border_type(ratatui::widgets::BorderType::Rounded)
+        .border_style(Style::default().fg(if state == JobState::Pending {
+            COLORS.border
+        } else {
+            color
+        }));
+    let inner = block.inner(area);
+    let room = (inner.width as usize).saturating_sub(3 + matrix.len());
+    let name_style = match state {
+        JobState::Pending | JobState::Skipped => theme::muted_style(),
+        _ => Style::default()
+            .fg(COLORS.text)
+            .add_modifier(Modifier::BOLD),
+    };
     f.render_widget(
-        Paragraph::new(Line::from(spans)).alignment(Alignment::Left),
+        Paragraph::new(Line::from(vec![
+            Span::raw(" "),
+            Span::styled(glyph, glyph_style),
+            Span::raw(" "),
+            Span::styled(
+                text::truncate(&text::sanitize(name), room).into_owned(),
+                name_style,
+            ),
+            Span::styled(matrix, Style::default().fg(COLORS.info)),
+        ]))
+        .block(block),
         area,
     );
 }
 
-/// State lookup for every named job — consults the current
-/// `WorkflowExecution` so a running nightly shows `build` as
-/// `Running`, mirroring the design's live DAG. `workflow_idx` is the
-/// position of this workflow in `app.workflows`; it's threaded from
-/// the caller so we don't have to reach for pointer identity here.
-fn state_for_job(
-    app: &App,
-    workflow: &crate::models::Workflow,
-    workflow_idx: usize,
-    name: &str,
-) -> NodeState {
-    if !matches!(
-        workflow.status,
-        WorkflowStatus::Running | WorkflowStatus::Success | WorkflowStatus::Failed
-    ) {
-        return NodeState::Pending;
-    }
-    let Some(exec) = workflow.execution_details.as_ref() else {
-        return NodeState::Pending;
-    };
-    match exec.jobs.iter().find(|j| j.name == name) {
-        Some(j) => match j.status {
-            JobStatus::Success => NodeState::Success,
-            JobStatus::Failure => NodeState::Failure,
-            JobStatus::Skipped => NodeState::Skipped,
-        },
-        None => {
-            if app.current_execution == Some(workflow_idx) {
-                NodeState::Running
-            } else {
-                NodeState::Pending
-            }
-        }
-    }
-}
-
-fn render_graph(
+/// Draws the indented list from line `app.dag_scroll`, returning the
+/// clamped scroll.
+fn render_list(
     f: &mut Frame<'_>,
     app: &App,
+    workflow: &Workflow,
     def: &WorkflowDefinition,
-    workflow: &crate::models::Workflow,
-    workflow_idx: usize,
+    levels: &[Vec<String>],
     area: Rect,
-) {
-    let block = theme::block_focused("DAG · topological columns");
+) -> usize {
+    let title = title(workflow);
+    let block = theme::with_badge(theme::block_focused(&title), "list");
     let inner = block.inner(area);
     f.render_widget(block, area);
+    let w = inner.width as usize;
 
-    let levels = dag::topo_levels(def);
-    if levels.is_empty() {
-        f.render_widget(
-            Paragraph::new("no jobs").style(Style::default().fg(COLORS.text_muted)),
-            inner,
-        );
-        return;
-    }
-
-    // Node cards are a fixed 18 cells wide ("╭────────────────╮").
-    // If we just split the area into `levels.len()` equal columns, each
-    // column can shrink below 18 on narrow terminals and the box-drawing
-    // characters wrap — which looks broken. Instead, clamp the visible
-    // column count to what fits, and render a trailing "… +N more
-    // stages" marker so the user knows they're seeing a subset.
-    const NODE_CARD_W: u16 = 18;
-    const OVERFLOW_W: u16 = 16; // width reserved for "… +N more" column
-    let total_stages = levels.len();
-    let max_visible = (inner.width / NODE_CARD_W).max(1) as usize;
-    let (visible_stages, truncated) = if total_stages > max_visible {
-        // Reserve space for the overflow column by dropping one more
-        // stage; ensures the tail marker has somewhere to live.
-        let capped = max_visible.saturating_sub(1).max(1);
-        (capped, total_stages - capped)
-    } else {
-        (total_stages, 0)
-    };
-
-    let mut constraints: Vec<Constraint> = (0..visible_stages)
-        .map(|_| Constraint::Length(NODE_CARD_W))
-        .collect();
-    if truncated > 0 {
-        constraints.push(Constraint::Length(OVERFLOW_W));
-    }
-    constraints.push(Constraint::Min(0)); // trailing slack
-
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints(constraints)
-        .split(inner);
-
-    // Column labels read straight off the topology ("Stage N"). The
-    // design handoff uses semantic names like "build" / "test", but
-    // no such grouping exists in GitHub Actions' workflow YAML today,
-    // so putting a name here would mean *inventing* one.
-    for (li, layer) in levels.iter().take(visible_stages).enumerate() {
-        let col = cols[li];
-        let mut lines: Vec<Line> = Vec::new();
-        lines.push(Line::from(vec![Span::styled(
-            format!("Stage {}", li + 1),
-            Style::default()
-                .fg(COLORS.highlight)
-                .add_modifier(Modifier::BOLD),
-        )]));
-        lines.push(Line::from(""));
-        for name in layer {
-            let st = state_for_job(app, workflow, workflow_idx, name);
-            let color = match st {
-                NodeState::Success => COLORS.success,
-                NodeState::Failure => COLORS.error,
-                NodeState::Skipped => COLORS.warning,
-                NodeState::Running => COLORS.info,
-                NodeState::Pending => COLORS.text_muted,
-            };
-            let glyph = match st {
-                NodeState::Success => theme::symbols::SUCCESS,
-                NodeState::Failure => theme::symbols::FAILURE,
-                NodeState::Skipped => theme::symbols::SKIPPED,
-                NodeState::Running => theme::spinner(app.spinner_frame),
-                NodeState::Pending => theme::symbols::NOT_STARTED,
-            };
-            // Node card: two-line "┌─ name ─┐" style in plain text.
-            lines.push(Line::from(vec![Span::styled(
-                "╭────────────────╮",
-                Style::default().fg(color),
-            )]));
-            // Distinct name from the outer `truncated` stage-count
-            // binding so the shadow doesn't mislead a future reader.
-            let short_name = truncate(name, 12);
-            let padding = 12usize.saturating_sub(short_name.chars().count());
-            lines.push(Line::from(vec![
-                Span::styled("│ ", Style::default().fg(color)),
-                Span::styled(glyph.to_string(), Style::default().fg(color)),
-                Span::raw(" "),
-                Span::styled(
-                    short_name,
-                    Style::default()
-                        .fg(if matches!(st, NodeState::Running) {
-                            COLORS.text
-                        } else {
-                            color
-                        })
-                        .add_modifier(if matches!(st, NodeState::Running) {
-                            Modifier::BOLD
-                        } else {
-                            Modifier::empty()
-                        }),
-                ),
-                Span::styled(" ".repeat(padding), Style::default().fg(color)),
-                Span::styled(" │", Style::default().fg(color)),
-            ]));
-            // Matrix badge for nodes that carry a strategy.matrix.
-            let matrix_size = def
-                .jobs
-                .get(name)
-                .and_then(|j| j.matrix_config())
-                .and_then(matrix_size_label);
-            if let Some(size) = matrix_size {
-                lines.push(Line::from(vec![
-                    Span::styled("│ ", Style::default().fg(color)),
-                    theme::badge_outline(format!("matrix×{}", size), BadgeKind::Info),
-                    Span::styled("         │", Style::default().fg(color)),
-                ]));
-            }
-            lines.push(Line::from(vec![Span::styled(
-                "╰────────────────╯",
-                Style::default().fg(color),
-            )]));
-        }
-        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), col);
-    }
-
-    if truncated > 0 {
-        let overflow_col = cols[visible_stages];
-        let mut overflow_lines: Vec<Line> = Vec::new();
-        overflow_lines.push(Line::from(vec![Span::styled(
-            format!("+{}", truncated),
-            Style::default()
-                .fg(COLORS.text_muted)
-                .add_modifier(Modifier::BOLD),
-        )]));
-        overflow_lines.push(Line::from(Span::styled(
-            "more stages",
-            Style::default().fg(COLORS.text_dim),
-        )));
-        overflow_lines.push(Line::from(""));
-        overflow_lines.push(Line::from(Span::styled(
-            "press `g`",
-            Style::default().fg(COLORS.text_dim),
-        )));
-        overflow_lines.push(Line::from(Span::styled(
-            "for list view",
-            Style::default().fg(COLORS.text_dim),
-        )));
-        f.render_widget(
-            Paragraph::new(overflow_lines).wrap(Wrap { trim: false }),
-            overflow_col,
-        );
-    }
-}
-
-fn render_topo_list(
-    f: &mut Frame<'_>,
-    app: &App,
-    def: &WorkflowDefinition,
-    workflow: &crate::models::Workflow,
-    workflow_idx: usize,
-    area: Rect,
-) {
-    let block = theme::block_focused("Jobs · topological order");
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-
-    let levels = dag::topo_levels(def);
     let mut lines: Vec<Line> = Vec::new();
-
     for (li, layer) in levels.iter().enumerate() {
-        lines.push(Line::from(vec![Span::styled(
-            format!(" Stage {}", li + 1),
-            Style::default()
-                .fg(COLORS.highlight)
-                .add_modifier(Modifier::BOLD),
-        )]));
+        if li > 0 {
+            lines.push(Line::from(""));
+        }
+        lines.push(theme::section(format!("Stage {}", li + 1)));
         for name in layer {
-            let st = state_for_job(app, workflow, workflow_idx, name);
-            let (glyph, style) = match st {
-                NodeState::Success => {
-                    (theme::symbols::SUCCESS, Style::default().fg(COLORS.success))
-                }
-                NodeState::Failure => (theme::symbols::FAILURE, Style::default().fg(COLORS.error)),
-                NodeState::Skipped => {
-                    (theme::symbols::SKIPPED, Style::default().fg(COLORS.warning))
-                }
-                NodeState::Running => (
-                    theme::spinner(app.spinner_frame),
-                    Style::default().fg(COLORS.info),
-                ),
-                NodeState::Pending => (
-                    theme::symbols::NOT_STARTED,
-                    Style::default().fg(COLORS.text_muted),
-                ),
-            };
-            let needs: String = def
-                .jobs
-                .get(name)
+            let state = workflow.job_state(name);
+            let (glyph, style) = theme::job_state(state, app.spinner_frame);
+            let job = def.jobs.get(name);
+            let needs = job
                 .and_then(|j| j.needs.as_ref())
-                .map(|n| {
-                    if n.is_empty() {
-                        "—".to_string()
-                    } else {
-                        n.join(", ")
-                    }
-                })
-                .unwrap_or_else(|| "—".to_string());
-            let matrix_badge = def
-                .jobs
-                .get(name)
+                .filter(|n| !n.is_empty())
+                .map(|n| format!("  ← {}", n.join(", ")))
+                .unwrap_or_default();
+            let matrix = job
                 .and_then(|j| j.matrix_config())
                 .and_then(matrix_size_label)
-                .map(|size| format!(" matrix×{}", size))
+                .map(|n| format!(" ×{n}"))
                 .unwrap_or_default();
-            lines.push(Line::from(vec![
-                Span::raw("   "),
-                Span::styled(glyph.to_string(), style),
+            let name = text::sanitize(name).into_owned();
+            let mut spans = vec![
+                Span::styled(glyph, style),
                 Span::raw(" "),
                 Span::styled(
                     name.clone(),
@@ -375,14 +289,23 @@ fn render_topo_list(
                         .fg(COLORS.text)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(matrix_badge, Style::default().fg(COLORS.info)),
-                Span::styled("  needs: ", Style::default().fg(COLORS.text_muted)),
-                Span::styled(needs, Style::default().fg(COLORS.text_dim)),
-            ]));
+                Span::styled(matrix.clone(), Style::default().fg(COLORS.info)),
+            ];
+            let used = 2 + text::width(&name) + text::width(&matrix);
+            spans.push(Span::styled(
+                text::truncate(&needs, w.saturating_sub(used)).into_owned(),
+                theme::muted_style(),
+            ));
+            lines.push(Line::from(spans));
         }
-        lines.push(Line::from(""));
     }
-    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+
+    let viewport = inner.height as usize;
+    let total = lines.len();
+    let scroll = app.dag_scroll.min(total.saturating_sub(viewport));
+    f.render_widget(Paragraph::new(lines).scroll((scroll as u16, 0)), inner);
+    theme::scrollbar(f, area, total, scroll, viewport);
+    scroll
 }
 
 fn render_legend(f: &mut Frame<'_>, app: &App, area: Rect) {
@@ -390,82 +313,52 @@ fn render_legend(f: &mut Frame<'_>, app: &App, area: Rect) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let lines = vec![
+    let mut lines: Vec<Line> = [
+        JobState::Success,
+        JobState::Failure,
+        JobState::FailureAllowed,
+        JobState::Running,
+        JobState::Skipped,
+        JobState::Pending,
+    ]
+    .into_iter()
+    .map(|state| {
+        let (glyph, style) = theme::job_state(state, app.spinner_frame);
+        let label = match state {
+            JobState::Success => "passed",
+            JobState::Failure => "failed",
+            JobState::FailureAllowed => "failed, allowed",
+            JobState::Running => "running",
+            JobState::Skipped => "skipped",
+            JobState::Pending => "not run",
+        };
         Line::from(vec![
-            Span::styled(theme::symbols::SUCCESS, Style::default().fg(COLORS.success)),
-            Span::raw("  success"),
-        ]),
-        Line::from(vec![
+            Span::styled(glyph, style),
+            Span::styled(format!("  {label}"), Style::default().fg(COLORS.text_dim)),
+        ])
+    })
+    .collect();
+    lines.push(Line::from(vec![
+        Span::styled("×6", Style::default().fg(COLORS.info)),
+        Span::styled(" matrix runs", Style::default().fg(COLORS.text_dim)),
+    ]));
+    lines.push(Line::from(""));
+    lines.push(theme::section("Keys"));
+    for (k, d) in [
+        ("g", "graph / list"),
+        ("←→", "scroll"),
+        ("↑↓", "workflow"),
+        ("Enter", "open run"),
+    ] {
+        lines.push(Line::from(vec![
             Span::styled(
-                theme::spinner(app.spinner_frame),
-                Style::default().fg(COLORS.info),
+                format!("{k:<6}"),
+                Style::default()
+                    .fg(theme::current_accent())
+                    .add_modifier(Modifier::BOLD),
             ),
-            Span::raw("  running"),
-        ]),
-        Line::from(vec![
-            Span::styled(
-                theme::symbols::NOT_STARTED,
-                Style::default().fg(COLORS.text_muted),
-            ),
-            Span::raw("  pending"),
-        ]),
-        Line::from(vec![
-            Span::styled(theme::symbols::SKIPPED, Style::default().fg(COLORS.warning)),
-            Span::raw("  skipped"),
-        ]),
-        Line::from(vec![
-            Span::styled(theme::symbols::FAILURE, Style::default().fg(COLORS.error)),
-            Span::raw("  failed"),
-        ]),
-        Line::from(""),
-        Line::from(vec![Span::styled(
-            "SHORTCUTS",
-            Style::default()
-                .fg(COLORS.highlight)
-                .add_modifier(Modifier::BOLD),
-        )]),
-        Line::from(vec![
-            theme::key_chip("g"),
-            Span::raw(" "),
-            Span::styled("toggle graph/list", Style::default().fg(COLORS.text_dim)),
-        ]),
-        Line::from(vec![
-            theme::key_chip("enter"),
-            Span::raw(" "),
-            Span::styled("open Execution", Style::default().fg(COLORS.text_dim)),
-        ]),
-    ];
+            Span::styled(d, Style::default().fg(COLORS.text_dim)),
+        ]));
+    }
     f.render_widget(Paragraph::new(lines), inner);
-}
-
-fn truncate(s: &str, n: usize) -> String {
-    if s.chars().count() <= n {
-        s.to_string()
-    } else {
-        let mut out: String = s.chars().take(n.saturating_sub(1)).collect();
-        out.push('…');
-        out
-    }
-}
-
-/// The size shown on a job's matrix badge: its axis count, or for a matrix made
-/// only of `include` entries or literal combinations, their count (`?` while
-/// that is only known at run time). `None` when the job has no effective matrix.
-fn matrix_size_label(matrix: &wrkflw_matrix::MatrixConfig) -> Option<String> {
-    use wrkflw_matrix::MatrixEntries;
-
-    if matrix.expression.is_some() {
-        return Some("?".to_string());
-    }
-    if !matrix.parameters.is_empty() {
-        return Some(matrix.parameters.len().to_string());
-    }
-    if let Some(combinations) = &matrix.combinations {
-        return (!combinations.is_empty()).then(|| combinations.len().to_string());
-    }
-    match &matrix.include {
-        MatrixEntries::Expression(_) => Some("?".to_string()),
-        MatrixEntries::List(entries) if !entries.is_empty() => Some(entries.len().to_string()),
-        MatrixEntries::List(_) => None,
-    }
 }

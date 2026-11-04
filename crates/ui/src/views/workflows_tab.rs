@@ -1,13 +1,14 @@
 // Dashboard layout — workflows table on the left, preview / trigger filter /
 // quick actions on the right. Mirrors `DashboardScreen` from the design.
 use crate::app::App;
-use crate::models::{TriggerMatchStatus, WorkflowStatus};
+use crate::models::TriggerMatchStatus;
+use crate::text;
 use crate::theme::{self, BadgeKind, COLORS};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Cell, Paragraph, Row, Table, TableState, Wrap},
+    widgets::{Cell, HighlightSpacing, Paragraph, Row, Table, TableState},
     Frame,
 };
 
@@ -17,30 +18,79 @@ pub fn render_workflows_tab(f: &mut Frame<'_>, app: &mut App, area: Rect) {
         return;
     }
 
+    // The side column is context, not controls: below ~76 columns the
+    // table needs every cell, so the column goes rather than squeezing
+    // the list into unreadable slivers.
+    let side = match area.width {
+        w if w >= 110 => 42,
+        w if w >= 76 => 32,
+        _ => 0,
+    };
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(40), Constraint::Length(40)])
-        .margin(1)
+        .constraints([Constraint::Min(0), Constraint::Length(side)])
         .split(area);
 
     render_workflow_list(f, app, chunks[0]);
-    render_right_column(f, app, chunks[1]);
+    if side > 0 {
+        render_right_column(f, app, chunks[1]);
+    }
 }
 
 fn render_workflow_list(f: &mut Frame<'_>, app: &mut App, area: Rect) {
     let selected_count = app.workflows.iter().filter(|w| w.selected).count();
-    let diff_indicator = if app.diff_filter_active {
-        format!("  [DIFF: {}]", app.diff_filter_event)
-    } else {
-        String::new()
-    };
-    let block_title = format!("Workflows ({} selected){}", selected_count, diff_indicator);
+    let mut block = theme::block_focused("Workflows");
+    let mut badge = format!("{} total", app.workflows.len());
+    if selected_count > 0 {
+        badge = format!("{selected_count} selected · {badge}");
+    }
+    if app.diff_filter_active {
+        badge = format!("diff: {} · {badge}", app.diff_filter_event);
+    }
+    block = theme::with_badge(block, badge);
+    let inner = block.inner(area);
 
-    let header_cells = ["", "ST", "TR", "NAME", "PATH", "JOBS"];
+    if app.workflows.is_empty() {
+        f.render_widget(block, area);
+        theme::empty_state(
+            f,
+            inner,
+            "No workflows found",
+            vec![Span::styled(
+                "Add .github/workflows/*.yml or pass a path: wrkflw tui <dir>",
+                theme::muted_style(),
+            )],
+        );
+        return;
+    }
+
+    let show_trigger =
+        app.diff_filter_active || app.workflows.iter().any(|w| w.trigger_match.is_some());
+    // Fixed columns: mark(2) checkbox(3) status(1) trigger(1) jobs(6),
+    // plus one cell of spacing between each.
+    let fixed = 2 + 3 + 1 + 6 + 4 + if show_trigger { 2 } else { 0 };
+    let flexible = (inner.width as usize).saturating_sub(fixed);
+    let show_path = flexible >= 40;
+    let (name_w, path_w) = if show_path {
+        let name_w = (flexible * 45 / 100).clamp(16, 48);
+        (name_w, flexible.saturating_sub(name_w + 1))
+    } else {
+        (flexible, 0)
+    };
+
+    let mut header_cells = vec!["", ""];
+    if show_trigger {
+        header_cells.push("");
+    }
+    header_cells.push("NAME");
+    if show_path {
+        header_cells.push("PATH");
+    }
+    header_cells.push("  JOBS");
     let header = Row::new(
         header_cells
-            .iter()
-            .map(|h| Cell::from(*h).style(theme::header_style())),
+            .into_iter()
+            .map(|h| Cell::from(h).style(theme::header_style())),
     )
     .height(1);
 
@@ -49,95 +99,111 @@ fn render_workflow_list(f: &mut Frame<'_>, app: &mut App, area: Rect) {
         .workflows
         .iter()
         .map(|workflow| {
-            let checkbox = if workflow.selected {
-                theme::symbols::CHECKBOX_ON
+            let (checkbox, checkbox_color) = if workflow.selected {
+                (theme::symbols::CHECKBOX_ON, COLORS.success)
             } else {
-                theme::symbols::CHECKBOX_OFF
+                (theme::symbols::CHECKBOX_OFF, COLORS.text_muted)
             };
             let (status_symbol, status_style) =
                 theme::workflow_status_animated(&workflow.status, spinner_frame);
-            let (trigger_symbol, trigger_style) = match &workflow.trigger_match {
-                Some(TriggerMatchStatus::Matched(_)) => ("●", Style::default().fg(COLORS.success)),
-                Some(TriggerMatchStatus::Skipped(_)) => {
-                    ("○", Style::default().fg(COLORS.text_muted))
-                }
-                None => (" ", Style::default().fg(COLORS.text_muted)),
-            };
-
-            let path_display = workflow.path.to_string_lossy();
-            let path_shortened = if path_display.len() > 40 {
-                let start = path_display
-                    .char_indices()
-                    .rev()
-                    .nth(39)
-                    .map(|(i, _)| i)
-                    .unwrap_or(0);
-                format!("…{}", &path_display[start..])
-            } else {
-                path_display.to_string()
-            };
-
-            let jobs_n = workflow.job_names.len();
-            Row::new(vec![
-                Cell::from(checkbox).style(Style::default().fg(if workflow.selected {
-                    COLORS.success
-                } else {
-                    COLORS.text_muted
-                })),
+            let mut cells = vec![
+                Cell::from(checkbox).style(Style::default().fg(checkbox_color)),
                 Cell::from(status_symbol).style(status_style),
-                Cell::from(trigger_symbol).style(trigger_style),
-                Cell::from(workflow.name.clone()).style(
-                    Style::default()
-                        .fg(COLORS.text)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Cell::from(path_shortened).style(theme::muted_style()),
-                Cell::from(format!("{}", jobs_n)).style(Style::default().fg(COLORS.text_muted)),
-            ])
+            ];
+            if show_trigger {
+                let (sym, style) = match &workflow.trigger_match {
+                    Some(TriggerMatchStatus::Matched(_)) => {
+                        ("●", Style::default().fg(COLORS.success))
+                    }
+                    Some(TriggerMatchStatus::Skipped(_)) => ("○", theme::muted_style()),
+                    None => (" ", theme::muted_style()),
+                };
+                cells.push(Cell::from(sym).style(style));
+            }
+            let name_style = if workflow.definition.is_some() {
+                Style::default().fg(COLORS.text)
+            } else {
+                Style::default().fg(COLORS.error)
+            };
+            cells.push(
+                Cell::from(text::truncate(&text::sanitize(&workflow.name), name_w).into_owned())
+                    .style(name_style),
+            );
+            if show_path {
+                let path = workflow.path.to_string_lossy();
+                cells.push(
+                    Cell::from(text::truncate_left(&text::sanitize(&path), path_w).into_owned())
+                        .style(theme::muted_style()),
+                );
+            }
+            // Unparseable files show a red ✖ instead of a misleading 0.
+            let (jobs, jobs_style) = if workflow.definition.is_none() {
+                (
+                    theme::symbols::FAILURE.to_string(),
+                    Style::default().fg(COLORS.error),
+                )
+            } else {
+                (workflow.job_names.len().to_string(), theme::muted_style())
+            };
+            cells.push(Cell::from(text::pad_left(&jobs, 6)).style(jobs_style));
+            Row::new(cells)
         })
         .collect();
 
-    let widths = [
-        Constraint::Length(3), // checkbox
-        Constraint::Length(2), // status
-        Constraint::Length(2), // trigger
-        Constraint::Min(16),   // name
-        Constraint::Min(16),   // path
-        Constraint::Length(5), // jobs
-    ];
+    let mut widths = vec![Constraint::Length(3), Constraint::Length(1)];
+    if show_trigger {
+        widths.push(Constraint::Length(1));
+    }
+    widths.push(Constraint::Length(name_w as u16));
+    if show_path {
+        widths.push(Constraint::Length(path_w as u16));
+    }
+    widths.push(Constraint::Length(6));
 
+    let total = rows.len();
     let table = Table::new(rows, widths)
         .header(header)
-        .block(theme::block_focused(&block_title))
-        .highlight_style(theme::selected_style())
-        .highlight_symbol(theme::symbols::SELECTED);
+        .block(block)
+        .row_highlight_style(theme::selected_style())
+        .highlight_symbol(theme::SELECTED_MARK)
+        .highlight_spacing(HighlightSpacing::Always);
 
-    let mut table_state = TableState::default();
-    table_state.select(app.workflow_list_state.selected());
-
+    // Carry the scroll offset across frames so the list doesn't jump
+    // back to the top-anchored position every redraw.
+    let mut table_state = TableState::default()
+        .with_offset(app.workflow_list_state.offset())
+        .with_selected(app.workflow_list_state.selected());
     f.render_stateful_widget(table, area, &mut table_state);
     app.workflow_list_state.select(table_state.selected());
+    *app.workflow_list_state.offset_mut() = table_state.offset();
+
+    let viewport = inner.height.saturating_sub(1) as usize;
+    theme::scrollbar(f, area, total, table_state.offset(), viewport);
 }
 
 fn render_right_column(f: &mut Frame<'_>, app: &App, area: Rect) {
+    let show_actions = area.height >= 30;
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(11),
-            Constraint::Length(7),
-            Constraint::Min(0),
+            Constraint::Min(6),
+            Constraint::Length(5),
+            Constraint::Length(if show_actions { 8 } else { 0 }),
         ])
         .split(area);
 
     render_preview(f, app, chunks[0]);
     render_trigger_filter(f, app, chunks[1]);
-    render_quick_actions(f, chunks[2]);
+    if show_actions {
+        render_quick_actions(f, chunks[2]);
+    }
 }
 
 fn render_preview(f: &mut Frame<'_>, app: &App, area: Rect) {
     let block = theme::block("Preview");
     let inner_area = block.inner(area);
     f.render_widget(block, area);
+    let w = inner_area.width as usize;
 
     let mut lines: Vec<Line> = Vec::new();
     let selected = app
@@ -146,46 +212,44 @@ fn render_preview(f: &mut Frame<'_>, app: &App, area: Rect) {
         .and_then(|i| app.workflows.get(i));
 
     let Some(wf) = selected else {
-        lines.push(Line::from(Span::styled(
-            "(no workflow selected)",
-            Style::default().fg(COLORS.text_muted),
-        )));
-        f.render_widget(Paragraph::new(lines), inner_area);
+        theme::empty_state(f, inner_area, "No workflow selected", vec![]);
         return;
     };
 
+    let label = |k: &'static str| Span::styled(format!("{k:<6}"), theme::muted_style());
+
     if let Some(def) = wf.definition.as_ref() {
-        lines.push(Line::from(vec![
-            Span::styled("name: ", Style::default().fg(theme::current_accent())),
-            Span::styled(
-                def.name.clone(),
-                Style::default()
-                    .fg(COLORS.text)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]));
+        let title = if def.name.is_empty() {
+            &wf.name
+        } else {
+            &def.name
+        };
+        lines.push(Line::from(Span::styled(
+            text::truncate(&text::sanitize(title), w).into_owned(),
+            Style::default()
+                .fg(COLORS.text)
+                .add_modifier(Modifier::BOLD),
+        )));
         let triggers = if def.on.is_empty() {
             "—".to_string()
         } else {
             def.on.join(", ")
         };
         lines.push(Line::from(vec![
-            Span::styled("on:   ", Style::default().fg(theme::current_accent())),
-            Span::styled(triggers, Style::default().fg(COLORS.text_dim)),
+            label("on"),
+            Span::styled(
+                text::truncate(&triggers, w.saturating_sub(6)).into_owned(),
+                Style::default().fg(COLORS.text_dim),
+            ),
         ]));
         lines.push(Line::from(vec![
-            Span::styled("jobs: ", Style::default().fg(theme::current_accent())),
+            label("jobs"),
             Span::styled(
                 format!("{}", def.jobs.len()),
                 Style::default().fg(COLORS.text_dim),
             ),
         ]));
-        let chain = build_chain(def);
-        lines.push(Line::from(vec![Span::styled(
-            chain,
-            Style::default().fg(COLORS.text_muted),
-        )]));
-        lines.push(Line::from(""));
+
         let mut badges: Vec<Span> = Vec::new();
         let needs_count = def
             .jobs
@@ -194,18 +258,16 @@ fn render_preview(f: &mut Frame<'_>, app: &App, area: Rect) {
             .count();
         if needs_count > 0 {
             badges.push(theme::badge_outline(
-                format!("needs: {}", needs_count),
+                format!("needs {}", needs_count),
                 BadgeKind::Success,
             ));
-            badges.push(Span::raw(" "));
         }
         let matrix_jobs = def.jobs.values().filter(|j| j.strategy.is_some()).count();
         if matrix_jobs > 0 {
             badges.push(theme::badge_outline(
-                format!("matrix: {}", matrix_jobs),
+                format!("matrix {}", matrix_jobs),
                 BadgeKind::Info,
             ));
-            badges.push(Span::raw(" "));
         }
         let uses_count = def
             .jobs
@@ -215,47 +277,75 @@ fn render_preview(f: &mut Frame<'_>, app: &App, area: Rect) {
             .count();
         if uses_count > 0 {
             badges.push(theme::badge_outline(
-                format!("uses: {}", uses_count),
+                format!("uses {}", uses_count),
                 BadgeKind::Warning,
             ));
         }
-        if !badges.is_empty() {
+        if !badges.is_empty() && text::spans_width(&badges) <= w {
             lines.push(Line::from(badges));
         }
+
+        let levels = crate::components::dag::topo_levels(def);
+        if !levels.is_empty() {
+            lines.push(Line::from(""));
+            lines.push(theme::section("Stages"));
+            let room = (inner_area.height as usize).saturating_sub(lines.len());
+            let shown = if levels.len() > room {
+                room.saturating_sub(1)
+            } else {
+                levels.len()
+            };
+            for (i, layer) in levels.iter().take(shown).enumerate() {
+                lines.push(Line::from(vec![
+                    Span::styled(format!("{:>2} ", i + 1), theme::muted_style()),
+                    Span::styled(
+                        text::truncate(&layer.join(" · "), w.saturating_sub(3)).into_owned(),
+                        Style::default().fg(COLORS.text_dim),
+                    ),
+                ]));
+            }
+            if shown < levels.len() {
+                lines.push(Line::from(Span::styled(
+                    format!("   +{} more stages", levels.len() - shown),
+                    theme::muted_style(),
+                )));
+            }
+        }
     } else {
-        lines.push(Line::from(vec![Span::styled(
-            wf.name.clone(),
+        lines.push(Line::from(Span::styled(
+            text::truncate(&text::sanitize(&wf.name), w).into_owned(),
             Style::default()
                 .fg(COLORS.text)
                 .add_modifier(Modifier::BOLD),
-        )]));
-        lines.push(Line::from(Span::styled(
-            "(failed to parse — check YAML)",
-            Style::default().fg(COLORS.text_muted),
         )));
         lines.push(Line::from(vec![
-            Span::styled("jobs: ", Style::default().fg(theme::current_accent())),
+            Span::styled(theme::symbols::FAILURE, Style::default().fg(COLORS.error)),
             Span::styled(
-                format!("{}", wf.job_names.len()),
-                Style::default().fg(COLORS.text_dim),
+                " couldn't parse this file",
+                Style::default().fg(COLORS.error),
             ),
+        ]));
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            Span::styled("press ", theme::muted_style()),
+            Span::styled(
+                "v",
+                Style::default()
+                    .fg(theme::current_accent())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" then ", theme::muted_style()),
+            Span::styled(
+                "Enter",
+                Style::default()
+                    .fg(theme::current_accent())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" to see why", theme::muted_style()),
         ]));
     }
 
-    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner_area);
-}
-
-fn build_chain(def: &wrkflw_parser::workflow::WorkflowDefinition) -> String {
-    use crate::components::dag::topo_levels;
-    let levels = topo_levels(def);
-    if levels.is_empty() {
-        return String::new();
-    }
-    levels
-        .into_iter()
-        .map(|layer| layer.join(","))
-        .collect::<Vec<_>>()
-        .join(" → ")
+    f.render_widget(Paragraph::new(lines), inner_area);
 }
 
 fn render_trigger_filter(f: &mut Frame<'_>, app: &App, area: Rect) {
@@ -277,27 +367,25 @@ fn render_trigger_filter(f: &mut Frame<'_>, app: &App, area: Rect) {
 
         let lines = vec![
             Line::from(vec![
-                Span::styled("event: ", Style::default().fg(COLORS.text_dim)),
+                Span::styled("event  ", theme::muted_style()),
                 theme::badge_solid(app.diff_filter_event.clone(), BadgeKind::Info),
+                Span::styled("  D to change", theme::muted_style()),
             ]),
             Line::from(vec![
-                Span::styled("●", Style::default().fg(COLORS.success)),
-                Span::raw(" matches → "),
                 Span::styled(
-                    format!("{}", matched),
+                    format!("● {matched}"),
                     Style::default()
-                        .fg(COLORS.text)
+                        .fg(COLORS.success)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::raw("   "),
-                Span::styled("○", Style::default().fg(COLORS.text_muted)),
-                Span::raw(" skipped → "),
+                Span::styled(" would run   ", theme::muted_style()),
                 Span::styled(
-                    format!("{}", skipped),
+                    format!("○ {skipped}"),
                     Style::default()
-                        .fg(COLORS.text)
+                        .fg(COLORS.text_dim)
                         .add_modifier(Modifier::BOLD),
                 ),
+                Span::styled(" skip", theme::muted_style()),
             ]),
         ];
         f.render_widget(Paragraph::new(lines), inner_area);
@@ -336,10 +424,8 @@ fn render_quick_actions(f: &mut Frame<'_>, area: Rect) {
         .map(|(k, label, kind)| {
             Line::from(vec![
                 theme::key_chip(*k),
-                Span::raw("  "),
-                Span::styled(label.to_string(), Style::default().fg(COLORS.text)),
-                Span::raw("  "),
-                Span::styled("▸", Style::default().fg(kind.fg())),
+                Span::raw(" "),
+                Span::styled(label.to_string(), Style::default().fg(kind.fg())),
             ])
         })
         .collect();
@@ -352,53 +438,40 @@ fn render_job_selection(f: &mut Frame<'_>, app: &mut App, area: Rect) {
         .workflow_list_state
         .selected()
         .and_then(|idx| app.workflows.get(idx))
-        .map(|w| w.name.as_str())
-        .unwrap_or("Unknown");
+        .map(|w| text::sanitize(&w.name).into_owned())
+        .unwrap_or_else(|| "Unknown".to_string());
 
-    let block_title = format!("Jobs in '{}'", workflow_name);
+    let title = format!("Run one job · {}", workflow_name);
+    let block = theme::with_badge(
+        theme::block_focused(&title),
+        format!("{} jobs", app.available_jobs.len()),
+    );
+    let inner = block.inner(area);
 
-    let header_cells = ["#", "Job Name"]
-        .iter()
-        .map(|h| Cell::from(*h).style(theme::header_style()));
+    if app.available_jobs.is_empty() {
+        f.render_widget(block, area);
+        theme::empty_state(f, inner, "This workflow has no jobs", vec![]);
+        return;
+    }
 
-    let header = Row::new(header_cells).height(1);
-
+    let name_w = (inner.width as usize).saturating_sub(7);
     let rows = app.available_jobs.iter().enumerate().map(|(i, job_name)| {
         Row::new(vec![
-            Cell::from(format!("{}", i + 1)).style(theme::muted_style()),
-            Cell::from(job_name.clone()).style(Style::default().fg(COLORS.text)),
+            Cell::from(format!("{:>3}", i + 1)).style(theme::muted_style()),
+            Cell::from(text::truncate(&text::sanitize(job_name), name_w).into_owned())
+                .style(Style::default().fg(COLORS.text)),
         ])
     });
 
-    let widths = [Constraint::Length(4), Constraint::Percentage(90)];
-    let jobs_table = Table::new(rows, widths)
-        .header(header)
-        .block(theme::block_focused(&block_title))
-        .highlight_style(theme::selected_style())
-        .highlight_symbol(theme::symbols::SELECTED);
+    let total = app.available_jobs.len();
+    let jobs_table = Table::new(rows, [Constraint::Length(3), Constraint::Min(0)])
+        .block(block)
+        .row_highlight_style(theme::selected_style())
+        .highlight_symbol(theme::SELECTED_MARK)
+        .highlight_spacing(HighlightSpacing::Always);
 
-    let mut table_state = TableState::default();
-    table_state.select(Some(app.selected_job_index));
-
-    let inner = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(0)].as_ref())
-        .margin(1)
-        .split(area);
-
-    f.render_stateful_widget(jobs_table, inner[0], &mut table_state);
-}
-
-// ── Helpers used by other tabs (kept here so badges around statuses stay
-//    consistent with the dashboard styling). Currently unused publicly; kept
-//    as a marker that this is the canonical location for new dashboard helpers.
-#[allow(dead_code)]
-fn workflow_status_badge(status: &WorkflowStatus) -> Span<'static> {
-    match status {
-        WorkflowStatus::Running => theme::badge_solid("RUNNING", BadgeKind::Info),
-        WorkflowStatus::Success => theme::badge_outline("SUCCESS", BadgeKind::Success),
-        WorkflowStatus::Failed => theme::badge_outline("FAILED", BadgeKind::Error),
-        WorkflowStatus::Skipped => theme::badge_outline("SKIPPED", BadgeKind::Warning),
-        WorkflowStatus::NotStarted => theme::badge_outline("IDLE", BadgeKind::Dim),
-    }
+    let mut table_state = TableState::default()
+        .with_selected(Some(app.selected_job_index.min(total.saturating_sub(1))));
+    f.render_stateful_widget(jobs_table, area, &mut table_state);
+    theme::scrollbar(f, area, total, table_state.offset(), inner.height as usize);
 }

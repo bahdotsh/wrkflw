@@ -11,7 +11,8 @@ use crate::views::{
 };
 use crossterm::{
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+        KeyModifiers,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -25,6 +26,7 @@ use std::time::{Duration, Instant};
 use wrkflw_executor::RuntimeType;
 
 use crate::theme::ThemePreference;
+use crate::views::INSPECTOR_TABS;
 
 pub use state::{Accent, App, TriggerPlatform};
 
@@ -46,6 +48,7 @@ pub async fn run_wrkflw_tui(
 
     // Terminal setup. Mouse capture hands drags to us so selection can
     // stay inside one pane and copy on release; see `crate::selection`.
+    install_panic_hook();
     enable_raw_mode()?;
     let mut stdout = stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
@@ -188,6 +191,18 @@ pub async fn run_wrkflw_tui(
     }
 }
 
+/// Puts the terminal back before a panic message prints, so a crash
+/// leaves a usable shell and a readable error instead of raw mode on the
+/// alternate screen.
+fn install_panic_hook() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = disable_raw_mode();
+        let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
+        previous(info);
+    }));
+}
+
 // Helper function to run the main event loop
 #[allow(clippy::collapsible_match)]
 fn run_tui_event_loop(
@@ -268,6 +283,15 @@ fn run_tui_event_loop(
                 other => other,
             };
             if let Event::Key(key) = event {
+                // Windows reports releases and repeats as key events too;
+                // acting on them would fire every binding twice.
+                if key.kind == KeyEventKind::Release {
+                    continue;
+                }
+                if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                    break Ok(());
+                }
+
                 // Any key dismisses a selection. Esc stops there, so
                 // clearing a highlight can't also quit the TUI.
                 if app.selection.take().is_some() && key.code == KeyCode::Esc {
@@ -316,23 +340,46 @@ fn run_tui_event_loop(
                     continue;
                 }
 
-                // Handle help overlay scrolling
+                // The help overlay is modal: it scrolls, closes, or quits.
                 if app.show_help {
                     match key.code {
-                        KeyCode::Up | KeyCode::Char('k') => {
-                            app.scroll_help_up();
-                            continue;
-                        }
-                        KeyCode::Down | KeyCode::Char('j') => {
-                            app.scroll_help_down();
-                            continue;
-                        }
-                        KeyCode::Esc | KeyCode::Char('?') => {
-                            app.show_help = false;
-                            continue;
-                        }
-                        _ => {}
+                        KeyCode::Up | KeyCode::Char('k') => app.scroll_help_up(),
+                        KeyCode::Down | KeyCode::Char('j') => app.scroll_help_down(),
+                        KeyCode::PageUp => app.help_scroll = app.help_scroll.saturating_sub(10),
+                        KeyCode::PageDown => app.help_scroll = app.help_scroll.saturating_add(10),
+                        KeyCode::Char('q') => break Ok(()),
+                        _ => app.show_help = false,
                     }
+                    continue;
+                }
+
+                // Paging keys, which no tab binds to anything else.
+                match (key.code, app.selected_tab) {
+                    (KeyCode::PageUp, TAB_LOGS) => app.scroll_logs_by(-20),
+                    (KeyCode::PageDown, TAB_LOGS) => app.scroll_logs_by(20),
+                    (KeyCode::Home, TAB_LOGS) => app.scroll_logs_to_start(),
+                    (KeyCode::End, TAB_LOGS) => app.scroll_logs_to_end(),
+                    (KeyCode::PageUp, TAB_EXECUTION) if app.detailed_view => {
+                        app.step_output_scroll = app.step_output_scroll.saturating_add(20)
+                    }
+                    (KeyCode::PageDown, TAB_EXECUTION) if app.detailed_view => {
+                        app.step_output_scroll = app.step_output_scroll.saturating_sub(20)
+                    }
+                    (KeyCode::Home, TAB_EXECUTION) if app.detailed_view => {
+                        app.step_output_scroll = usize::MAX
+                    }
+                    (KeyCode::End, TAB_EXECUTION) if app.detailed_view => {
+                        app.step_output_scroll = 0
+                    }
+                    (KeyCode::PageUp, TAB_HELP) => {
+                        app.help_scroll = app.help_scroll.saturating_sub(10)
+                    }
+                    (KeyCode::PageDown, TAB_HELP) => {
+                        app.help_scroll = app.help_scroll.saturating_add(10)
+                    }
+                    (KeyCode::Left, TAB_DAG) => app.dag_scroll = app.dag_scroll.saturating_sub(1),
+                    (KeyCode::Right, TAB_DAG) => app.dag_scroll = app.dag_scroll.saturating_add(1),
+                    _ => {}
                 }
 
                 match key.code {
@@ -357,9 +404,14 @@ fn run_tui_event_loop(
                         // sub-tabs (Output / Env / Files / Matrix / Timeline);
                         // elsewhere it cycles top-level tabs.
                         if app.selected_tab == TAB_EXECUTION && app.detailed_view {
-                            app.step_inspector_tab = (app.step_inspector_tab + 1) % 5;
-                        } else if app.selected_tab == TAB_TRIGGER {
-                            // In the Trigger tab Tab cycles inputs/fields.
+                            app.step_inspector_tab = (app.step_inspector_tab + 1) % INSPECTOR_TABS;
+                        } else if app.selected_tab == TAB_TRIGGER && app.trigger_editing() {
+                            // While a Trigger field is being edited, Tab
+                            // moves between fields. Outside edit mode it
+                            // switches tabs like everywhere else; cycling
+                            // fields there dropped the cursor into Branch,
+                            // where digits and `q` became text and the
+                            // only way out was Esc.
                             app.trigger_tab_next_field();
                         } else {
                             app.switch_tab((app.selected_tab + 1) % TAB_COUNT);
@@ -367,8 +419,9 @@ fn run_tui_event_loop(
                     }
                     KeyCode::BackTab => {
                         if app.selected_tab == TAB_EXECUTION && app.detailed_view {
-                            app.step_inspector_tab = (app.step_inspector_tab + 4) % 5;
-                        } else if app.selected_tab == TAB_TRIGGER {
+                            app.step_inspector_tab =
+                                (app.step_inspector_tab + INSPECTOR_TABS - 1) % INSPECTOR_TABS;
+                        } else if app.selected_tab == TAB_TRIGGER && app.trigger_editing() {
                             app.trigger_tab_prev_field();
                         } else {
                             app.switch_tab((app.selected_tab + TAB_COUNT - 1) % TAB_COUNT);
@@ -413,6 +466,10 @@ fn run_tui_event_loop(
                                 app.scroll_logs_up();
                             }
                         }
+                        TAB_DAG => {
+                            app.previous_workflow();
+                            app.dag_scroll = 0;
+                        }
                         TAB_TRIGGER => app.trigger_tab_prev_workflow(),
                         TAB_SECRETS => app.secrets_tab_prev(),
                         TAB_HELP => app.scroll_help_up(),
@@ -440,6 +497,10 @@ fn run_tui_event_loop(
                             } else {
                                 app.scroll_logs_down();
                             }
+                        }
+                        TAB_DAG => {
+                            app.next_workflow();
+                            app.dag_scroll = 0;
                         }
                         TAB_TRIGGER => app.trigger_tab_next_workflow(),
                         TAB_SECRETS => app.secrets_tab_next(),
@@ -482,6 +543,7 @@ fn run_tui_event_loop(
                                 // In execution tab, Enter shows job details
                                 app.toggle_detailed_view();
                             }
+                            TAB_DAG => app.switch_tab(TAB_EXECUTION),
                             TAB_TRIGGER => {
                                 // Trigger tab: Enter on a non-editing row
                                 // begins editing it (value first, then Tab
@@ -698,6 +760,7 @@ fn run_tui_event_loop(
                             // matches the design's `g` shortcut on
                             // screen 4.
                             app.dag_list_view = !app.dag_list_view;
+                            app.dag_scroll = 0;
                         }
                     }
                     KeyCode::Char('p') => {

@@ -52,8 +52,8 @@ dirs = "5.0"
 thiserror = "1.0"
 log = "0.4"
 which = "4.4"
-crossterm = "0.28"
-ratatui = { version = "0.28", features = ["crossterm"] }
+crossterm = "0.29"
+ratatui = { version = "0.30", features = ["crossterm", "unstable-rendered-line-info"] }
 terminal-colorsaurus = "1.0"
 once_cell = "1.19.0"
 itertools = "0.11.0"

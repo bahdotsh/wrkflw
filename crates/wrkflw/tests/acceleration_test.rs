@@ -324,8 +324,46 @@ fn an_emulated_result_is_not_pushed() {
 fn the_gate_installs_a_pre_push_hook() {
     let repo = Repo::new(TWO_JOBS, None);
     assert_ok(&repo.wrkflw(&["gate", "--install-hook"]));
-    let hook = fs::read_to_string(repo.root().join(".git/hooks/pre-push")).unwrap();
+    let path = repo.root().join(".git/hooks/pre-push");
+    let hook = fs::read_to_string(&path).unwrap();
     assert!(hook.contains("wrkflw gate"));
+    use std::os::unix::fs::PermissionsExt;
+    let mode = fs::metadata(&path).unwrap().permissions().mode();
+    assert_eq!(
+        mode & 0o111,
+        0o111,
+        "the hook must be executable: {:o}",
+        mode
+    );
+}
+
+#[test]
+fn every_matrix_leg_is_reused_and_reaches_dependents() {
+    let workflow = r#"
+name: ci
+on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        n: [1, 2]
+    steps:
+      - run: echo "test ${{ matrix.n }}" >> LOG
+  after:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - run: test "${{ needs.test.result }}" = success && echo after >> LOG
+"#;
+    let repo = Repo::new(workflow, Some("jobs:\n  after: {cache: false}\n"));
+    assert_ok(&repo.run(&["--reuse-results"]));
+    assert_eq!(repo.take_ran(), ["after", "test 1", "test 2"]);
+    let output = repo.run(&["--reuse-results"]);
+    assert_ok(&output);
+    assert_eq!(repo.take_ran(), ["after"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(stdout.matches("Reuse result").count(), 2, "{}", stdout);
 }
 
 #[test]

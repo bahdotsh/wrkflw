@@ -359,14 +359,24 @@ fn resolve_links(path: &Path) -> PathBuf {
     path
 }
 
-/// Replace the file `path` resolves to, keeping its permissions.
+/// Replace the file `path` resolves to, keeping its permissions. A new file
+/// gets the usual 0644 rather than the temporary file's 0600.
 fn write_atomically(path: &Path, text: &str) -> std::io::Result<()> {
     use std::io::Write;
     let path = resolve_links(path);
     let dir = path.parent().unwrap_or(Path::new("."));
     let mut file = tempfile::NamedTempFile::new_in(dir)?;
-    if let Ok(meta) = std::fs::metadata(&path) {
-        file.as_file().set_permissions(meta.permissions())?;
+    match std::fs::metadata(&path) {
+        Ok(meta) => file.as_file().set_permissions(meta.permissions())?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                file.as_file()
+                    .set_permissions(std::fs::Permissions::from_mode(0o644))?;
+            }
+        }
+        Err(e) => return Err(e),
     }
     file.write_all(text.as_bytes())?;
     file.as_file().sync_all()?;
@@ -895,6 +905,12 @@ mod tests {
         assert!(std::fs::symlink_metadata(&link).unwrap().is_symlink());
         assert!(std::fs::read_to_string(&real).unwrap().contains("wrkflw"));
         let mode = std::fs::metadata(&real).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o644);
+
+        // A new file is 0644, not the temporary file's 0600.
+        let fresh = managed.join("fresh.json");
+        install_json(&fresh, "mcpServers", &entry(), WRITE);
+        let mode = std::fs::metadata(&fresh).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o644);
 
         // A relative link to a file that doesn't exist yet.

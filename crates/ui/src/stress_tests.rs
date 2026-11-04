@@ -284,6 +284,68 @@ fn every_screen_renders_at_every_size_without_panicking() {
     );
 }
 
+fn screen_text(terminal: &Terminal<TestBackend>) -> String {
+    let buf = terminal.backend().buffer();
+    let area = buf.area;
+    let mut out = String::new();
+    for y in 0..area.height {
+        for x in 0..area.width {
+            out.push_str(buf[(x, y)].symbol());
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// Wrapped step output past 65,535 rows used to overflow ratatui's u16
+/// scroll offset, so the tail, where a failure explains itself, could
+/// not be reached.
+#[test]
+fn inspector_reaches_the_tail_of_output_longer_than_a_u16_scroll() {
+    let dir = std::env::temp_dir().join(format!("wrkflw-tail-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut a = app(1, &dir);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // At 24 columns the output pane is 20 cells wide, so 1,000 lines of
+    // 1,404 cells wrap to about 70,000 rows.
+    let mut output: Vec<String> = (0..999)
+        .map(|i| format!("{i:04}{}", "x".repeat(1400)))
+        .collect();
+    output.push("THE-LAST-LINE".to_string());
+    let exec = a.workflows[0]
+        .execution_details
+        .get_or_insert_with(|| execution(1, 1));
+    exec.jobs[0].steps[0].output = output.join("\n");
+
+    a.current_execution = Some(0);
+    a.selected_tab = TAB_EXECUTION;
+    a.detailed_view = true;
+    a.step_inspector_tab = 0;
+    a.job_list_state.select(Some(0));
+    a.step_table_state.select(Some(0));
+    a.step_output_scroll = 0;
+
+    let mut terminal = Terminal::new(TestBackend::new(24, 30)).unwrap();
+    terminal.draw(|f| views::render_ui(f, &mut a)).unwrap();
+    assert!(
+        screen_text(&terminal).contains("THE-LAST-LINE"),
+        "the tail is on screen"
+    );
+
+    // Scrolling all the way back reaches the first line.
+    a.step_output_scroll = usize::MAX;
+    terminal.draw(|f| views::render_ui(f, &mut a)).unwrap();
+    assert!(
+        screen_text(&terminal).contains("0000xxx"),
+        "the head is reachable"
+    );
+    assert!(
+        a.step_output_scroll > u16::MAX as usize,
+        "clamped to rows, not to u16"
+    );
+}
+
 /// `cargo test -p wrkflw-ui dump_screens -- --ignored --nocapture` prints
 /// every screen as text, for eyeballing a layout change.
 #[test]

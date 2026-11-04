@@ -409,16 +409,18 @@ fn run_tui_event_loop(
                     (KeyCode::PageDown, TAB_LOGS) => app.scroll_logs_by(20),
                     (KeyCode::Home, TAB_LOGS) => app.scroll_logs_to_start(),
                     (KeyCode::End, TAB_LOGS) => app.scroll_logs_to_end(),
-                    (KeyCode::PageUp, TAB_EXECUTION) if app.detailed_view => {
+                    // Step output only scrolls on the inspector's Output
+                    // sub-tab, where rendering clamps it to the text.
+                    (KeyCode::PageUp, TAB_EXECUTION) if app.inspecting_output() => {
                         app.step_output_scroll = app.step_output_scroll.saturating_add(20)
                     }
-                    (KeyCode::PageDown, TAB_EXECUTION) if app.detailed_view => {
+                    (KeyCode::PageDown, TAB_EXECUTION) if app.inspecting_output() => {
                         app.step_output_scroll = app.step_output_scroll.saturating_sub(20)
                     }
-                    (KeyCode::Home, TAB_EXECUTION) if app.detailed_view => {
+                    (KeyCode::Home, TAB_EXECUTION) if app.inspecting_output() => {
                         app.step_output_scroll = usize::MAX
                     }
-                    (KeyCode::End, TAB_EXECUTION) if app.detailed_view => {
+                    (KeyCode::End, TAB_EXECUTION) if app.inspecting_output() => {
                         app.step_output_scroll = 0
                     }
                     (KeyCode::PageUp, TAB_HELP) => {

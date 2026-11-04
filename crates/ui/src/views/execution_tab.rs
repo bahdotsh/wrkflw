@@ -226,13 +226,12 @@ fn render_jobs_pane(f: &mut Frame<'_>, app: &App, workflow: &Workflow, area: Rec
     let selected = app.job_list_state.selected().filter(|&i| i < jobs.len());
     let mut lines: Vec<Line> = Vec::with_capacity(total);
     for (i, job) in jobs.iter().enumerate() {
-        let state = workflow.job_state(&job.canonical_name);
-        let state = match (job.status.clone(), state) {
-            // A matrix leg reports its own status, not the merged one.
-            (JobStatus::Success, _) => JobState::Success,
-            (JobStatus::Skipped, _) => JobState::Skipped,
-            (JobStatus::Failure, _) if job.failure_allowed => JobState::FailureAllowed,
-            (JobStatus::Failure, _) => JobState::Failure,
+        // A matrix leg shows its own status, not the merged one.
+        let state = match job.status {
+            JobStatus::Success => JobState::Success,
+            JobStatus::Skipped => JobState::Skipped,
+            JobStatus::Failure if job.failure_allowed => JobState::FailureAllowed,
+            JobStatus::Failure => JobState::Failure,
         };
         let (sym, sym_style) = theme::job_state(state, app.spinner_frame);
         let is_sel = selected == Some(i);

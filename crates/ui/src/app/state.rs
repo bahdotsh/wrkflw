@@ -152,6 +152,11 @@ pub struct App {
     pub step_output_scroll: usize,
     /// Stage scrolled to in the DAG graph view.
     pub dag_scroll: usize,
+    /// Bumped whenever a workflow's results are replaced, so caches
+    /// keyed by workflow/job/step index can tell a rerun apart.
+    pub run_generation: u64,
+    /// Parsed output of the step the inspector last showed.
+    pub step_output_cache: Option<crate::views::StepOutputCache>,
 
     // ── DAG tab ───────────────────────────────────────────────────
     /// When true, the DAG tab renders the topological-stage list view;
@@ -529,6 +534,8 @@ impl App {
             step_inspector_tab: 0,
             step_output_scroll: 0,
             dag_scroll: 0,
+            run_generation: 0,
+            step_output_cache: None,
 
             dag_list_view: false,
 
@@ -1213,6 +1220,7 @@ impl App {
         // Once no run is in flight, the Execution tab shows the workflow
         // highlighted in the Workflows list.
         let shown_after_run = self.workflow_list_state.selected() == Some(workflow_idx);
+        self.run_generation = self.run_generation.wrapping_add(1);
 
         let workflow = &mut self.workflows[workflow_idx];
 
@@ -1369,6 +1377,7 @@ impl App {
         ));
 
         // Initialize execution details
+        self.run_generation = self.run_generation.wrapping_add(1);
         self.workflows[next].execution_details = Some(WorkflowExecution {
             jobs: Vec::new(),
             start_time: Local::now(),
@@ -2104,6 +2113,12 @@ impl App {
             self.trigger_target_cache = Some(resolve_trigger_target(self.trigger_platform));
         }
         self.trigger_target_cache.as_ref().expect("just populated")
+    }
+
+    /// True while the step inspector shows a step's output, the only
+    /// view PgUp/PgDn/Home/End scroll on the Execution tab.
+    pub fn inspecting_output(&self) -> bool {
+        self.detailed_view && self.step_inspector_tab == 0
     }
 
     /// True when any trigger-tab text field (branch or an input row)

@@ -12,6 +12,8 @@ mod trigger_tab;
 mod tweaks_overlay;
 mod workflows_tab;
 
+pub use job_detail::StepOutputCache;
+
 /// Number of sub-tabs in the step inspector, for Tab cycling.
 pub const INSPECTOR_TABS: usize = job_detail::INSPECTOR_TABS.len();
 

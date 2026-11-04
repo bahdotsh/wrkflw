@@ -61,11 +61,93 @@ pub fn render_job_detail_view(f: &mut Frame<'_>, app: &mut App, area: Rect) {
     match app.step_inspector_tab {
         1 => render_matrix_pane(f, workflow, &job.canonical_name, outer[1]),
         _ => {
-            let scroll = app.step_output_scroll;
+            let output = OutputSource {
+                key: selected_step_idx.map(|s| (app.run_generation, workflow_idx, job_idx, s)),
+                scroll_back: app.step_output_scroll,
+                cache: &mut app.step_output_cache,
+            };
             app.step_output_scroll =
-                render_output_pane(f, job, selected_step_idx, scroll, outer[1]);
+                render_output_pane(f, job, selected_step_idx, output, outer[1]);
         }
     }
+}
+
+/// Parsed output of one step, kept across frames. Parsing ANSI and
+/// measuring wrapped rows over thousands of lines on every 250 ms tick
+/// is wasted work once a step has finished, which is the only time its
+/// output exists.
+#[derive(Default)]
+pub struct StepOutputCache {
+    /// (run generation, workflow, job, step) the lines belong to.
+    key: (u64, usize, usize, usize),
+    lines: Vec<Line<'static>>,
+    /// Width `rows` was measured at.
+    width: u16,
+    /// Wrapped rows each line takes at `width`.
+    rows: Vec<usize>,
+    total: usize,
+}
+
+impl StepOutputCache {
+    fn build(key: (u64, usize, usize, usize), output: &str) -> Self {
+        let all: Vec<&str> = output.lines().collect();
+        let skipped = all.len().saturating_sub(MAX_OUTPUT_LINES);
+        let mut lines: Vec<Line<'static>> = Vec::with_capacity(all.len() - skipped + 1);
+        if skipped > 0 {
+            lines.push(Line::from(Span::styled(
+                format!("… {skipped} earlier lines not shown"),
+                theme::muted_style(),
+            )));
+        }
+        let base = Style::default().fg(COLORS.text);
+        lines.extend(all[skipped..].iter().map(|l| text::ansi_line(l, base)));
+        Self {
+            key,
+            lines,
+            ..Self::default()
+        }
+    }
+
+    /// Measures every line's wrapped height at `width`, once per width.
+    fn measure(&mut self, width: u16) {
+        if self.width == width && self.rows.len() == self.lines.len() {
+            return;
+        }
+        self.rows = self
+            .lines
+            .iter()
+            .map(|l| {
+                Paragraph::new(l.clone())
+                    .wrap(Wrap { trim: false })
+                    .line_count(width)
+                    .max(1)
+            })
+            .collect();
+        self.total = self.rows.iter().sum();
+        self.width = width;
+    }
+
+    /// The line holding wrapped row `row`, and how many of that line's
+    /// rows come before it.
+    fn locate(&self, row: usize) -> (usize, usize) {
+        let mut seen = 0;
+        for (i, &r) in self.rows.iter().enumerate() {
+            if seen + r > row {
+                return (i, row - seen);
+            }
+            seen += r;
+        }
+        (self.rows.len(), 0)
+    }
+}
+
+/// What the output pane needs from `App` besides the job itself.
+struct OutputSource<'a> {
+    /// Identifies the selected step's output; `None` with no step.
+    key: Option<(u64, usize, usize, usize)>,
+    /// Rows scrolled back from the tail.
+    scroll_back: usize,
+    cache: &'a mut Option<StepOutputCache>,
 }
 
 /// `workflow › job  Output · Matrix            failed` on one row.
@@ -137,7 +219,7 @@ fn render_output_pane(
     f: &mut Frame<'_>,
     job: &crate::models::JobExecution,
     selected: Option<usize>,
-    scroll_back: usize,
+    output: OutputSource<'_>,
     area: Rect,
 ) -> usize {
     // Side by side when there's room, stacked on narrow terminals.
@@ -156,7 +238,7 @@ fn render_output_pane(
         .split(area);
 
     render_steps_list(f, job, selected, cols[0]);
-    render_step_output(f, job, selected, scroll_back, cols[1])
+    render_step_output(f, job, selected, output, cols[1])
 }
 
 fn render_steps_list(
@@ -201,7 +283,7 @@ fn render_step_output(
     f: &mut Frame<'_>,
     job: &crate::models::JobExecution,
     selected: Option<usize>,
-    scroll_back: usize,
+    output: OutputSource<'_>,
     area: Rect,
 ) -> usize {
     let step = selected.and_then(|i| job.steps.get(i));
@@ -213,7 +295,7 @@ fn render_step_output(
     let block = theme::block_focused(&title);
     let inner = block.inner(area);
 
-    let Some(step) = step else {
+    let (Some(step), Some(key)) = (step, output.key) else {
         f.render_widget(block, area);
         theme::empty_state(f, inner, "Select a step", vec![]);
         return 0;
@@ -223,25 +305,37 @@ fn render_step_output(
         theme::empty_state(f, inner, "This step printed nothing", vec![]);
         return 0;
     }
-
-    let all: Vec<&str> = step.output.lines().collect();
-    let skipped = all.len().saturating_sub(MAX_OUTPUT_LINES);
-    let mut lines: Vec<Line> = Vec::with_capacity(all.len() - skipped + 1);
-    if skipped > 0 {
-        lines.push(Line::from(Span::styled(
-            format!("… {skipped} earlier lines not shown"),
-            theme::muted_style(),
-        )));
+    if inner.width == 0 || inner.height == 0 {
+        f.render_widget(block, area);
+        return output.scroll_back;
     }
-    let base = Style::default().fg(COLORS.text);
-    lines.extend(all[skipped..].iter().map(|l| text::ansi_line(l, base)));
 
-    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
-    let total = paragraph.line_count(inner.width);
+    let cache = match output.cache {
+        Some(c) if c.key == key => c,
+        slot => slot.insert(StepOutputCache::build(key, &step.output)),
+    };
+    cache.measure(inner.width);
+
+    let total = cache.total;
     let viewport = inner.height as usize;
     let max_back = total.saturating_sub(viewport);
-    let back = scroll_back.min(max_back);
+    let back = output.scroll_back.min(max_back);
     let offset = max_back - back;
+
+    // Hand the paragraph only the lines that reach the screen, so the
+    // scroll it gets is a few rows into the first of them. Scrolling the
+    // whole text by `offset` would overflow ratatui's u16 scroll once
+    // wrapped output passes 65,535 rows, and re-wrap every line.
+    let (first, skip) = cache.locate(offset);
+    let mut visible: Vec<Line<'static>> = Vec::new();
+    let mut rows = 0;
+    for (line, &r) in cache.lines[first..].iter().zip(&cache.rows[first..]) {
+        visible.push(line.clone());
+        rows += r;
+        if rows >= skip + viewport {
+            break;
+        }
+    }
 
     let badge = if back == 0 {
         "tail".to_string()
@@ -249,7 +343,13 @@ fn render_step_output(
         format!("{}/{}", offset + viewport.min(total), total)
     };
     let block = theme::with_badge(block, badge);
-    f.render_widget(paragraph.block(block).scroll((offset as u16, 0)), area);
+    f.render_widget(
+        Paragraph::new(visible)
+            .wrap(Wrap { trim: false })
+            .block(block)
+            .scroll((skip.min(u16::MAX as usize) as u16, 0)),
+        area,
+    );
     theme::scrollbar(f, area, total, offset, viewport);
     back
 }

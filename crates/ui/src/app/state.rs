@@ -2122,6 +2122,19 @@ impl App {
         self.trigger_branch_focused = false;
     }
 
+    /// Put the edit cursor on the first input's key, adding a blank row
+    /// when there are none. With Tab now switching tabs outside edit
+    /// mode, this is the direct way into the input grid.
+    pub fn trigger_tab_edit_inputs(&mut self) {
+        if self.trigger_inputs.is_empty() {
+            self.trigger_tab_add_input();
+            return;
+        }
+        self.trigger_input_cursor = Some(0);
+        self.trigger_input_on_value = false;
+        self.trigger_branch_focused = false;
+    }
+
     /// Focus the Branch / ref row so the next keystrokes type into
     /// `trigger_branch`. Clears any active input cursor — only one
     /// field edits at a time.
@@ -2136,9 +2149,9 @@ impl App {
     /// of the cycle so the user can reach it via Tab without needing
     /// the `b` shortcut.
     pub fn trigger_tab_next_field(&mut self) {
-        // Not focused yet → land on Branch (start of the cycle).
+        // Outside edit mode Tab switches tabs; grabbing focus here is
+        // what used to trap the user in the Branch field.
         if !self.trigger_editing() {
-            self.trigger_branch_focused = true;
             return;
         }
         if self.trigger_branch_focused {
@@ -2177,14 +2190,8 @@ impl App {
     }
 
     pub fn trigger_tab_prev_field(&mut self) {
-        // Not focused yet → wrap to the end of the cycle.
+        // See `trigger_tab_next_field`: only cycles while editing.
         if !self.trigger_editing() {
-            if self.trigger_inputs.is_empty() {
-                self.trigger_branch_focused = true;
-            } else {
-                self.trigger_input_cursor = Some(self.trigger_inputs.len() - 1);
-                self.trigger_input_on_value = true;
-            }
             return;
         }
         if self.trigger_branch_focused {
@@ -4198,21 +4205,27 @@ mod tests {
     }
 
     #[test]
-    fn trigger_tab_next_field_lands_on_branch_when_no_inputs() {
+    fn trigger_tab_field_cycling_never_grabs_focus_outside_edit_mode() {
+        // Regression: Tab used to drop the cursor into Branch, where
+        // digits and `q` became text and only Esc got you out.
+        let mut app = make_app();
+        app.trigger_inputs = vec![("a".into(), "1".into())];
+        app.trigger_tab_next_field();
+        assert!(!app.trigger_editing());
+        app.trigger_tab_prev_field();
+        assert!(!app.trigger_editing());
+    }
+
+    #[test]
+    fn trigger_tab_next_field_stays_on_branch_when_no_inputs() {
         let mut app = make_app();
         assert!(app.trigger_inputs.is_empty());
-        assert!(!app.trigger_editing());
-        // With no inputs, Tab cycles through Branch only.
-        app.trigger_tab_next_field();
-        assert!(app.trigger_branch_focused);
-        assert!(app.trigger_input_cursor.is_none());
+        app.trigger_tab_edit_branch();
         app.trigger_tab_next_field();
         assert!(
             app.trigger_branch_focused,
             "stays on Branch when nothing else to cycle through"
         );
-        // Prev from fresh state also lands on Branch when no inputs.
-        let mut app = make_app();
         app.trigger_tab_prev_field();
         assert!(app.trigger_branch_focused);
         assert!(app.trigger_input_cursor.is_none());
@@ -4222,8 +4235,7 @@ mod tests {
     fn trigger_tab_next_field_walks_branch_then_inputs_and_wraps() {
         let mut app = make_app();
         app.trigger_inputs = vec![("a".into(), "1".into()), ("b".into(), "2".into())];
-        // From fresh state: None → Branch.
-        app.trigger_tab_next_field();
+        app.trigger_tab_edit_branch();
         assert!(app.trigger_branch_focused);
         assert!(app.trigger_input_cursor.is_none());
         // Branch → row 0 key.
@@ -4257,11 +4269,38 @@ mod tests {
     }
 
     #[test]
+    fn trigger_tab_edit_inputs_opens_the_first_row_or_adds_one() {
+        let mut app = make_app();
+        app.trigger_tab_edit_inputs();
+        assert_eq!(
+            app.trigger_inputs.len(),
+            1,
+            "adds a row when there are none"
+        );
+        assert_eq!(
+            (app.trigger_input_cursor, app.trigger_input_on_value),
+            (Some(0), false)
+        );
+
+        let mut app = make_app();
+        app.trigger_inputs = vec![("a".into(), "1".into()), ("b".into(), "2".into())];
+        app.trigger_tab_edit_branch();
+        app.trigger_tab_edit_inputs();
+        assert!(!app.trigger_branch_focused);
+        assert_eq!(app.trigger_inputs.len(), 2);
+        assert_eq!(
+            (app.trigger_input_cursor, app.trigger_input_on_value),
+            (Some(0), false)
+        );
+    }
+
+    #[test]
     fn trigger_tab_prev_field_reverses_direction() {
         let mut app = make_app();
         app.trigger_inputs = vec![("a".into(), "1".into()), ("b".into(), "2".into())];
-        // From fresh state: None → row 1 value (backward wrap through
-        // the input grid; Branch sits before row 0 in forward order).
+        // Branch → last input value (backward wrap through the input
+        // grid; Branch sits before row 0 in forward order).
+        app.trigger_tab_edit_branch();
         app.trigger_tab_prev_field();
         assert_eq!(
             (app.trigger_input_cursor, app.trigger_input_on_value),

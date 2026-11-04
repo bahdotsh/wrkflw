@@ -81,6 +81,7 @@ fn sections() -> Vec<Section> {
                 (k("p"), "GitHub ↔ GitLab"),
                 (k("↑↓"), "workflow"),
                 (k("b"), "edit branch"),
+                (k("i"), "edit inputs"),
                 (k("+"), "add an input"),
                 (k("Tab"), "next field, while editing"),
                 (k("Enter"), "dispatch / finish editing"),

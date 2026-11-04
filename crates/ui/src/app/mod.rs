@@ -331,8 +331,10 @@ fn run_tui_event_loop(
                 other => other,
             };
             if let Event::Key(key) = event {
-                // Windows reports releases and repeats as key events too;
-                // acting on them would fire every binding twice.
+                // Windows (and terminals using the kitty keyboard
+                // protocol) report key releases too; acting on them would
+                // fire every binding twice. Repeats are kept so a held
+                // arrow key keeps scrolling.
                 if key.kind == KeyEventKind::Release {
                     continue;
                 }
@@ -832,6 +834,14 @@ fn run_tui_event_loop(
                         // reached it.
                         if app.selected_tab == TAB_TRIGGER {
                             app.trigger_tab_edit_branch();
+                        }
+                    }
+                    KeyCode::Char('i') => {
+                        // Trigger tab: jump into the input grid. Tab only
+                        // cycles fields while one is being edited, so
+                        // this is the direct way to reach an input row.
+                        if app.selected_tab == TAB_TRIGGER {
+                            app.trigger_tab_edit_inputs();
                         }
                     }
                     KeyCode::Char(c) => {

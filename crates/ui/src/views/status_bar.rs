@@ -204,6 +204,7 @@ fn context_hints(app: &App) -> Vec<(&'static str, &'static str)> {
             ("↑↓", "workflow"),
             ("p", "platform"),
             ("b", "branch"),
+            ("i", "inputs"),
             ("+", "input"),
             ("c", "copy curl"),
         ],

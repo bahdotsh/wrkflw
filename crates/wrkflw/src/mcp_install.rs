@@ -30,17 +30,12 @@ pub(crate) enum Client {
 }
 
 impl Client {
-    fn name(self) -> &'static str {
-        match self {
-            Client::ClaudeCode => "claude-code",
-            Client::Codex => "codex",
-            Client::Cursor => "cursor",
-            Client::Windsurf => "windsurf",
-            Client::Vscode => "vscode",
-            Client::Gemini => "gemini",
-            Client::Opencode => "opencode",
-            Client::ClaudeDesktop => "claude-desktop",
-        }
+    /// The name on the command line, such as `claude-code`.
+    fn name(self) -> String {
+        self.to_possible_value()
+            .expect("no client is skipped")
+            .get_name()
+            .to_string()
     }
 }
 
@@ -61,15 +56,27 @@ struct Dirs {
     home: PathBuf,
     /// The platform's per-user config directory, e.g. `~/Library/Application Support`.
     config: PathBuf,
+    /// Where Claude Code keeps `.claude.json`.
+    claude: PathBuf,
 }
 
 impl Dirs {
     fn current() -> Option<Self> {
+        let home = dirs::home_dir()?;
         Some(Self {
-            home: dirs::home_dir()?,
+            claude: claude_dir(&home, std::env::var_os("CLAUDE_CONFIG_DIR")),
             config: dirs::config_dir()?,
+            home,
         })
     }
+}
+
+/// `CLAUDE_CONFIG_DIR` moves `.claude.json` out of the home directory.
+fn claude_dir(home: &Path, configured: Option<std::ffi::OsString>) -> PathBuf {
+    configured
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.to_path_buf())
 }
 
 /// The command a client should launch. `wrkflw` when it is on PATH, so the
@@ -83,12 +90,13 @@ struct Launch {
 
 impl Launch {
     fn detect() -> Self {
-        let absolute = which::which(SERVER)
-            .ok()
+        let on_path = which::which(SERVER).ok();
+        let absolute = on_path
+            .clone()
             .or_else(|| std::env::current_exe().ok())
             .map(|path| path.to_string_lossy().into_owned())
             .unwrap_or_else(|| SERVER.to_string());
-        let command = if which::which(SERVER).is_ok() {
+        let command = if on_path.is_some() {
             SERVER.to_string()
         } else {
             absolute.clone()
@@ -180,8 +188,10 @@ impl Status {
         }
     }
 
+    /// Whether the client was left without the wanted entry. `Differs`
+    /// counts, so a script can tell that nothing was registered.
     fn is_failure(self) -> bool {
-        matches!(self, Status::Failed | Status::NotFound)
+        matches!(self, Status::Failed | Status::NotFound | Status::Differs)
     }
 }
 
@@ -261,19 +271,58 @@ fn upsert_json(
         return Ok((status, None));
     }
     servers.insert(SERVER.to_string(), entry);
-    let mut text =
-        serde_json::to_string_pretty(&Ordered::Object(root)).map_err(|e| e.to_string())?;
+    let indent = text.map_or(DEFAULT_INDENT, indent_of);
+    let mut out = Vec::new();
+    let formatter = serde_json::ser::PrettyFormatter::with_indent(indent.as_bytes());
+    let mut serializer = serde_json::Serializer::with_formatter(&mut out, formatter);
+    Ordered::Object(root)
+        .serialize(&mut serializer)
+        .map_err(|e| e.to_string())?;
+    let mut text = String::from_utf8(out).map_err(|e| e.to_string())?;
     text.push('\n');
     Ok((status, Some(text)))
 }
 
+const DEFAULT_INDENT: &str = "  ";
+
+/// The indentation of the first indented line, so a rewrite keeps the file's style.
+fn indent_of(text: &str) -> &str {
+    text.lines()
+        .find_map(|line| {
+            let rest = line.trim_start_matches([' ', '\t']);
+            let indent = &line[..line.len() - rest.len()];
+            (!indent.is_empty() && !rest.is_empty()).then_some(indent)
+        })
+        .unwrap_or(DEFAULT_INDENT)
+}
+
+/// The file `path` finally points to. Dotfile managers symlink these configs,
+/// and renaming over the link would detach it from the managed copy. Works for
+/// a link whose target doesn't exist yet, unlike `canonicalize`.
+fn resolve_links(path: &Path) -> PathBuf {
+    let mut path = path.to_path_buf();
+    // Bounded, so a link cycle can't loop forever.
+    for _ in 0..32 {
+        let Ok(target) = std::fs::read_link(&path) else {
+            break;
+        };
+        path = path.parent().unwrap_or(Path::new("")).join(target);
+    }
+    path
+}
+
+/// Replace the file `path` resolves to, keeping its permissions.
 fn write_atomically(path: &Path, text: &str) -> std::io::Result<()> {
     use std::io::Write;
+    let path = resolve_links(path);
     let dir = path.parent().unwrap_or(Path::new("."));
     let mut file = tempfile::NamedTempFile::new_in(dir)?;
+    if let Ok(meta) = std::fs::metadata(&path) {
+        file.as_file().set_permissions(meta.permissions())?;
+    }
     file.write_all(text.as_bytes())?;
     file.as_file().sync_all()?;
-    file.persist(path).map_err(|e| e.error)?;
+    file.persist(&path).map_err(|e| e.error)?;
     Ok(())
 }
 
@@ -315,10 +364,10 @@ fn check(program: &str, args: &[&str]) -> Result<(), String> {
 
 /// Whether Claude Code has a user-scoped `wrkflw` server, and whether it matches.
 ///
-/// Read from `~/.claude.json` rather than `claude mcp get`, which also reports
+/// Read from `.claude.json` rather than `claude mcp get`, which also reports
 /// servers from the current project's `.mcp.json`.
 fn claude_code_existing(dirs: &Dirs, command: &str) -> Option<bool> {
-    let text = std::fs::read_to_string(dirs.home.join(".claude.json")).ok()?;
+    let text = std::fs::read_to_string(dirs.claude.join(".claude.json")).ok()?;
     let config: Value = serde_json::from_str(&text).ok()?;
     let server = config.get("mcpServers")?.get(SERVER)?;
     Some(server["command"] == command && server["args"] == json!(SERVE_ARGS))
@@ -340,35 +389,36 @@ fn install_cli(
     command: &str,
     policy: Policy,
 ) -> (Status, Option<String>) {
-    let existing = match client {
-        Client::ClaudeCode => claude_code_existing(dirs, command),
-        _ => codex_existing(command),
+    let (program, existing, scope): (&str, _, &[&str]) = match client {
+        Client::ClaudeCode => (
+            "claude",
+            claude_code_existing(dirs, command),
+            &["--scope", "user"],
+        ),
+        Client::Codex => ("codex", codex_existing(command), &[]),
+        Client::Cursor
+        | Client::Windsurf
+        | Client::Vscode
+        | Client::Gemini
+        | Client::Opencode
+        | Client::ClaudeDesktop => unreachable!("{} is configured by file", client.name()),
     };
     let (status, write) = policy.settle(existing);
     if !write {
         return (status, None);
     }
-    let mut serve = vec!["--", command];
-    serve.extend(SERVE_ARGS);
-    let result = match client {
-        Client::ClaudeCode => {
-            if status == Status::Replaced {
-                let _ = check("claude", &["mcp", "remove", "--scope", "user", SERVER]);
-            }
-            let mut add = vec!["mcp", "add", "--scope", "user", SERVER];
-            add.extend(&serve);
-            check("claude", &add)
-        }
-        _ => {
-            if status == Status::Replaced {
-                let _ = check("codex", &["mcp", "remove", SERVER]);
-            }
-            let mut add = vec!["mcp", "add", SERVER];
-            add.extend(&serve);
-            check("codex", &add)
-        }
-    };
-    match result {
+    if status == Status::Replaced {
+        // A failed remove shows up as the add failing on the duplicate name.
+        let mut remove = vec!["mcp", "remove"];
+        remove.extend(scope);
+        remove.push(SERVER);
+        let _ = check(program, &remove);
+    }
+    let mut add = vec!["mcp", "add"];
+    add.extend(scope);
+    add.extend([SERVER, "--", command]);
+    add.extend(SERVE_ARGS);
+    match check(program, &add) {
         Ok(()) => (status, None),
         Err(e) => (Status::Failed, Some(e)),
     }
@@ -413,30 +463,34 @@ fn install_one(
     })
 }
 
-fn report(outcomes: &[Outcome], format: OutputFormat, launch: &Launch) {
-    if format.is_json() {
-        let clients: Vec<Value> = outcomes
-            .iter()
-            .map(|outcome| {
-                json!({
-                    "client": outcome.client.name(),
-                    "status": outcome.status.as_str(),
-                    "target": outcome.target,
-                    "detail": outcome.detail,
-                })
+fn report_json(outcomes: &[Outcome], launch: &Launch) -> Value {
+    let clients: Vec<Value> = outcomes
+        .iter()
+        .map(|outcome| {
+            json!({
+                "client": outcome.client.name(),
+                "status": outcome.status.as_str(),
+                "target": outcome.target,
+                "detail": outcome.detail,
             })
-            .collect();
-        wrkflw_runs::emit_line(&json!({
-            "schema_version": SCHEMA_VERSION,
-            "type": "mcp_install",
-            "command": launch.command,
-            "args": args(),
-            "clients": clients,
-        }));
+        })
+        .collect();
+    json!({
+        "schema_version": SCHEMA_VERSION,
+        "type": "mcp_install",
+        "command": launch.command,
+        "args": args(),
+        "clients": clients,
+    })
+}
+
+fn report(outcomes: &[Outcome], format: OutputFormat, launch: &Launch, policy: Policy) {
+    if format.is_json() {
+        wrkflw_runs::emit_line(&report_json(outcomes, launch));
         return;
     }
     if outcomes.is_empty() {
-        let supported: Vec<&str> = Client::value_variants().iter().map(|c| c.name()).collect();
+        let supported: Vec<String> = Client::value_variants().iter().map(|c| c.name()).collect();
         println!(
             "No supported coding agent found. Supported: {}.",
             supported.join(", ")
@@ -465,15 +519,20 @@ fn report(outcomes: &[Outcome], format: OutputFormat, launch: &Launch) {
         println!("Restart the agent to load the wrkflw MCP server.");
     }
     if launch.command != SERVER {
+        let registered = if policy.dry_run {
+            "would be registered"
+        } else {
+            "was registered"
+        };
         println!(
-            "wrkflw isn't on PATH, so {} was registered. Rerun this after installing it.",
+            "wrkflw isn't on PATH, so {} {registered}. Rerun this after installing it.",
             launch.command
         );
     }
 }
 
 /// Register the server with `clients`, or with every detected client when empty.
-/// Exits 1 if any client failed or none was found.
+/// Exits 1 if none was found, or any client failed or kept a different entry.
 pub(crate) fn install(clients: &[Client], dry_run: bool, force: bool, format: OutputFormat) {
     let Some(dirs) = Dirs::current() else {
         eprintln!("Error: no home directory");
@@ -491,7 +550,7 @@ pub(crate) fn install(clients: &[Client], dry_run: bool, force: bool, format: Ou
         .into_iter()
         .filter_map(|client| install_one(client, &dirs, &launch, policy, named))
         .collect();
-    report(&outcomes, format, &launch);
+    report(&outcomes, format, &launch, policy);
     if outcomes.is_empty() || outcomes.iter().any(|o| o.status.is_failure()) {
         std::process::exit(1);
     }
@@ -597,6 +656,7 @@ mod tests {
         let dirs = Dirs {
             home: root.path().join("home"),
             config: root.path().join("config"),
+            claude: root.path().join("home"),
         };
         let launch = Launch {
             command: "wrkflw".to_string(),
@@ -625,6 +685,7 @@ mod tests {
         let dirs = Dirs {
             home: PathBuf::from("/h"),
             config: PathBuf::from("/c"),
+            claude: PathBuf::from("/h"),
         };
         let Method::Json { key, entry, .. } = method(Client::Opencode, &dirs, "wrkflw") else {
             panic!("opencode is a file");
@@ -635,5 +696,123 @@ mod tests {
             panic!("vscode is a file");
         };
         assert_eq!((key, &entry["type"]), ("servers", &json!("stdio")));
+    }
+    #[test]
+    fn settle_covers_every_case() {
+        let policy = |dry_run, force| Policy { dry_run, force };
+        let cases = [
+            (policy(false, false), Some(true), (Status::Unchanged, false)),
+            (policy(true, true), Some(true), (Status::Unchanged, false)),
+            (policy(false, false), Some(false), (Status::Differs, false)),
+            (policy(true, false), Some(false), (Status::Differs, false)),
+            (
+                policy(true, true),
+                Some(false),
+                (Status::WouldReplace, false),
+            ),
+            (policy(false, true), Some(false), (Status::Replaced, true)),
+            (policy(true, false), None, (Status::WouldAdd, false)),
+            (policy(false, false), None, (Status::Added, true)),
+        ];
+        for (policy, existing, expected) in cases {
+            assert_eq!(policy.settle(existing), expected, "{existing:?}");
+        }
+        assert!(Status::Differs.is_failure());
+    }
+
+    #[test]
+    fn a_rewrite_keeps_the_files_indentation() {
+        let text = "{\n    \"mcpServers\": {}\n}\n";
+        let (_, out) = upsert_json(Some(text), "mcpServers", &entry(), WRITE).unwrap();
+        assert!(out.unwrap().contains("\n        \"wrkflw\": {"));
+
+        let tabs = "{\n\t\"a\": 1\n}";
+        let (_, out) = upsert_json(Some(tabs), "mcpServers", &entry(), WRITE).unwrap();
+        assert!(out.unwrap().contains("\n\t\"mcpServers\""));
+
+        let (_, out) = upsert_json(Some("{}"), "mcpServers", &entry(), WRITE).unwrap();
+        assert!(out.unwrap().contains("\n  \"mcpServers\""));
+    }
+
+    #[test]
+    fn claude_code_config_follows_claude_config_dir() {
+        let home = Path::new("/h");
+        assert_eq!(claude_dir(home, None), home);
+        assert_eq!(claude_dir(home, Some("".into())), home);
+        assert_eq!(claude_dir(home, Some("/c".into())), Path::new("/c"));
+
+        let root = tempfile::tempdir().unwrap();
+        let dirs = Dirs {
+            home: root.path().join("home"),
+            config: root.path().join("config"),
+            claude: root.path().to_path_buf(),
+        };
+        std::fs::write(
+            root.path().join(".claude.json"),
+            r#"{"mcpServers": {"wrkflw": {"command": "wrkflw", "args": ["mcp", "serve"]}}}"#,
+        )
+        .unwrap();
+        assert_eq!(claude_code_existing(&dirs, "wrkflw"), Some(true));
+        assert_eq!(claude_code_existing(&dirs, "/other"), Some(false));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_config_stays_a_link_and_keeps_its_mode() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let root = tempfile::tempdir().unwrap();
+        let managed = root.path().join("dotfiles");
+        let linked = root.path().join("cursor");
+        std::fs::create_dir_all(&managed).unwrap();
+        std::fs::create_dir_all(&linked).unwrap();
+
+        let real = managed.join("mcp.json");
+        std::fs::write(&real, "{}").unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let link = linked.join("mcp.json");
+        symlink(&real, &link).unwrap();
+        let (status, _) = install_json(&link, "mcpServers", &entry(), WRITE);
+        assert_eq!(status, Status::Added);
+        assert!(std::fs::symlink_metadata(&link).unwrap().is_symlink());
+        assert!(std::fs::read_to_string(&real).unwrap().contains("wrkflw"));
+        let mode = std::fs::metadata(&real).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o644);
+
+        // A relative link to a file that doesn't exist yet.
+        let dangling = linked.join("other.json");
+        symlink("../dotfiles/other.json", &dangling).unwrap();
+        let (status, _) = install_json(&dangling, "mcpServers", &entry(), WRITE);
+        assert_eq!(status, Status::Added);
+        assert!(std::fs::symlink_metadata(&dangling).unwrap().is_symlink());
+        assert!(managed.join("other.json").exists());
+    }
+
+    #[test]
+    fn the_json_report_names_each_client() {
+        let launch = Launch {
+            command: "wrkflw".to_string(),
+            absolute: "/bin/wrkflw".to_string(),
+        };
+        let outcomes = [Outcome {
+            client: Client::ClaudeDesktop,
+            status: Status::Differs,
+            target: "/c/claude_desktop_config.json".to_string(),
+            detail: None,
+        }];
+        assert_eq!(
+            report_json(&outcomes, &launch),
+            json!({
+                "schema_version": SCHEMA_VERSION,
+                "type": "mcp_install",
+                "command": "wrkflw",
+                "args": ["mcp", "serve"],
+                "clients": [{
+                    "client": "claude-desktop",
+                    "status": "differs",
+                    "target": "/c/claude_desktop_config.json",
+                    "detail": null,
+                }],
+            })
+        );
     }
 }

@@ -1,6 +1,6 @@
 # Codebase Index: wrkflw
 
-> Generated: 2026-11-04 14:21:21 UTC | Files: 242 | Lines: 105216
+> Generated: 2026-11-04 14:46:00 UTC | Files: 242 | Lines: 106274
 > Languages: JSON (4), Markdown (26), Rust (150), Shell (5), TOML (19), YAML (38)
 
 ## Directory Structure
@@ -1665,7 +1665,7 @@ wrkflw/
 
 ## INDEX.md
 
-**Language:** Markdown | **Size:** 210.2 KB | **Lines:** 7766
+**Language:** Markdown | **Size:** 236.5 KB | **Lines:** 8638
 
 **Declarations:**
 
@@ -7409,7 +7409,7 @@ wrkflw/
 
 ## crates/wrkflw/src/mcp_install.rs
 
-**Language:** Rust | **Size:** 20.4 KB | **Lines:** 639
+**Language:** Rust | **Size:** 27.4 KB | **Lines:** 818
 
 **Imports:**
 - `crate::OutputFormat`
@@ -7431,18 +7431,20 @@ wrkflw/
 > Variants: `ClaudeCode`, `Codex`, `Cursor`, `Windsurf`, `Vscode`, `Gemini`, `Opencode`, `ClaudeDesktop`
 
 **`impl Client`**
-  `fn name(self) -> &'static str`
+  `fn name(self) -> String`
 
 
 `enum Method`
 > Variants: `Cli`, `Json`
 
 `struct Dirs`
-> Fields: `home: PathBuf`, `config: PathBuf`
+> Fields: `home: PathBuf`, `config: PathBuf`, `claude: PathBuf`
 
 **`impl Dirs`**
   `fn current() -> Option<Self>`
 
+
+`fn claude_dir(home: &Path, configured: Option<std::ffi::OsString>) -> PathBuf`
 
 `struct Launch`
 > Fields: `command: String`, `absolute: String`
@@ -7483,6 +7485,12 @@ wrkflw/
 
 `fn upsert_json( text: Option<&str>, key: &str, entry: &Value, policy: Policy, ) -> Result<(Status, Option<String>), String>`
 
+`const DEFAULT_INDENT: &str = " "`
+
+`fn indent_of(text: &str) -> &str`
+
+`fn resolve_links(path: &Path) -> PathBuf`
+
 `fn write_atomically(path: &Path, text: &str) -> std::io::Result<()>`
 
 `fn install_json(path: &Path, key: &str, entry: &Value, policy: Policy) -> (Status, Option<String>)`
@@ -7499,7 +7507,9 @@ wrkflw/
 
 `fn install_one( client: Client, dirs: &Dirs, launch: &Launch, policy: Policy, named: bool, ) -> Option<Outcome>`
 
-`fn report(outcomes: &[Outcome], format: OutputFormat, launch: &Launch)`
+`fn report_json(outcomes: &[Outcome], launch: &Launch) -> Value`
+
+`fn report(outcomes: &[Outcome], format: OutputFormat, launch: &Launch, policy: Policy)`
 
 `pub(crate) fn install(clients: &[Client], dry_run: bool, force: bool, format: OutputFormat)`
 
@@ -7575,7 +7585,7 @@ wrkflw/
 
 ## crates/wrkflw/src/run_workflow_cmd.rs
 
-**Language:** Rust | **Size:** 17.6 KB | **Lines:** 479
+**Language:** Rust | **Size:** 17.8 KB | **Lines:** 486
 
 **Imports:**
 - `crate::prefilter`

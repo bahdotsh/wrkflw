@@ -383,13 +383,16 @@ impl App {
         step_table_state.select(Some(0));
 
         // Check container runtime availability if container runtime is selected
+        let requested = runtime_type.clone();
         let runtime_type = match runtime_type {
             RuntimeType::Auto => {
                 let detected = match std::panic::catch_unwind(|| {
                     std::thread::scope(|s| {
                         let h = s.spawn(|| wrkflw_executor::detect_runtime(RuntimeType::Auto));
+                        // The probes bound themselves. A shorter limit here
+                        // would only call a slow but working runtime missing.
                         let start = std::time::Instant::now();
-                        let timeout = std::time::Duration::from_secs(1);
+                        let timeout = std::time::Duration::from_secs(30);
                         while start.elapsed() < timeout {
                             if h.is_finished() {
                                 return h.join().unwrap_or(RuntimeType::Emulation);
@@ -426,102 +429,11 @@ impl App {
                 }
                 detected
             }
-            RuntimeType::Docker => {
-                // Use a timeout for the Docker availability check to prevent hanging
-                let is_docker_available = match std::panic::catch_unwind(|| {
-                    // Use a very short timeout to prevent blocking the UI
-                    let result = std::thread::scope(|s| {
-                        let handle = s.spawn(|| {
-                            wrkflw_utils::fd::with_stderr_to_null(
-                                wrkflw_executor::docker::is_available,
-                            )
-                            .unwrap_or(false)
-                        });
-
-                        // Set a short timeout for the thread
-                        let start = std::time::Instant::now();
-                        let timeout = std::time::Duration::from_secs(1);
-
-                        while start.elapsed() < timeout {
-                            if handle.is_finished() {
-                                return handle.join().unwrap_or(false);
-                            }
-                            std::thread::sleep(std::time::Duration::from_millis(10));
-                        }
-
-                        // If we reach here, the check took too long
-                        wrkflw_logging::warning(
-                            "Docker availability check timed out, falling back to emulation mode",
-                        );
-                        false
-                    });
-                    result
-                }) {
-                    Ok(result) => result,
-                    Err(_) => {
-                        wrkflw_logging::warning("Docker availability check failed with panic, falling back to emulation mode");
-                        false
-                    }
-                };
-
-                if !is_docker_available {
-                    wrkflw_logging::warning(
-                        "Docker is not available or unresponsive. Using emulation mode instead.",
-                    );
-                    RuntimeType::Emulation
-                } else {
-                    wrkflw_logging::info("Docker is available, using Docker runtime");
-                    RuntimeType::Docker
-                }
-            }
-            RuntimeType::Podman => {
-                // Use a timeout for the Podman availability check to prevent hanging
-                let is_podman_available = match std::panic::catch_unwind(|| {
-                    // Use a very short timeout to prevent blocking the UI
-                    let result = std::thread::scope(|s| {
-                        let handle = s.spawn(|| {
-                            wrkflw_utils::fd::with_stderr_to_null(
-                                wrkflw_executor::podman::is_available,
-                            )
-                            .unwrap_or(false)
-                        });
-
-                        // Set a short timeout for the thread
-                        let start = std::time::Instant::now();
-                        let timeout = std::time::Duration::from_secs(1);
-
-                        while start.elapsed() < timeout {
-                            if handle.is_finished() {
-                                return handle.join().unwrap_or(false);
-                            }
-                            std::thread::sleep(std::time::Duration::from_millis(10));
-                        }
-
-                        // If we reach here, the check took too long
-                        wrkflw_logging::warning(
-                            "Podman availability check timed out, falling back to emulation mode",
-                        );
-                        false
-                    });
-                    result
-                }) {
-                    Ok(result) => result,
-                    Err(_) => {
-                        wrkflw_logging::warning("Podman availability check failed with panic, falling back to emulation mode");
-                        false
-                    }
-                };
-
-                if !is_podman_available {
-                    wrkflw_logging::warning(
-                        "Podman is not available or unresponsive. Using emulation mode instead.",
-                    );
-                    RuntimeType::Emulation
-                } else {
-                    wrkflw_logging::info("Podman is available, using Podman runtime");
-                    RuntimeType::Podman
-                }
-            }
+            // Asked for by name, so never swapped for emulation: a run then
+            // fails with the executor's error rather than running the steps
+            // on this machine. The probe below only feeds the status bar.
+            RuntimeType::Docker => RuntimeType::Docker,
+            RuntimeType::Podman => RuntimeType::Podman,
             // Never replaced by emulation: a job meant for the cluster must
             // not quietly run on the host. The status bar shows reachability.
             RuntimeType::Kubernetes => RuntimeType::Kubernetes,
@@ -529,13 +441,17 @@ impl App {
             RuntimeType::SecureEmulation => RuntimeType::SecureEmulation,
         };
 
-        // If we're still Docker/Podman after the availability check above, it
-        // was available. A cluster can take seconds to answer, so its first
-        // answer arrives on a later tick instead of delaying startup.
-        let runtime_available = matches!(runtime_type, RuntimeType::Docker | RuntimeType::Podman);
-        let availability_probe = match runtime_type {
-            RuntimeType::Kubernetes => start_availability_probe(&runtime_type, &kubernetes),
-            _ => None,
+        // Auto resolved to Docker or Podman only if one answered. An explicit
+        // runtime and a cluster are probed off the event loop, as either can
+        // take seconds to answer, so their first answer arrives on a later
+        // tick instead of delaying startup.
+        let auto_found_container = matches!(requested, RuntimeType::Auto)
+            && matches!(runtime_type, RuntimeType::Docker | RuntimeType::Podman);
+        let runtime_available = auto_found_container;
+        let availability_probe = if auto_found_container {
+            None
+        } else {
+            start_availability_probe(&runtime_type, &kubernetes)
         };
 
         App {

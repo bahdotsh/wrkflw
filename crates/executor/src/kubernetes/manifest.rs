@@ -130,8 +130,9 @@ pub(super) fn build_pod_manifest(config: &KubernetesConfig, input: &PodInput<'_>
         .collect();
     volumes.push(json!({ "name": SYNC_VOLUME, "emptyDir": {} }));
 
-    let env: Vec<Value> = input
-        .env_vars
+    // The image's PATH isn't known here, so `$GITHUB_PATH` additions go in
+    // front of the usual Linux one rather than the host's.
+    let env: Vec<Value> = wrkflw_runtime::container::container_env(input.env_vars, None)
         .iter()
         .map(|(k, v)| json!({ "name": k, "value": escape_k8s_expansion(v) }))
         .collect();

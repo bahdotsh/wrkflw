@@ -22,7 +22,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::process::Command;
 use wrkflw_parser::workflow::{Job, Service};
-use wrkflw_runtime::container::{ContainerError, ContainerOutput, ContainerRuntime};
+use wrkflw_runtime::container::{
+    ContainerError, ContainerOutput, ContainerRuntime, PATH_ADDITIONS_ENV,
+};
 
 const SERVICE_READY_TIMEOUT: Duration = Duration::from_secs(180);
 const SERVICE_POLL: Duration = Duration::from_millis(500);
@@ -52,10 +54,16 @@ impl ServiceSpec {
     }
 }
 
+/// Where a composite action's own directory appears in a step's container,
+/// as `GITHUB_ACTION_PATH`.
+pub(crate) const CONTAINER_ACTION_DIR: &str = "/github/action";
+
 struct Live {
     image: String,
     volumes: Vec<(PathBuf, PathBuf)>,
     id: String,
+    /// The action directory last copied to [`CONTAINER_ACTION_DIR`].
+    action_dir: Option<PathBuf>,
     /// Removes the containers when the session ends, however it ends.
     _cleanup: Containers,
 }
@@ -225,9 +233,23 @@ fn bad_env_name(name: &str) -> Option<&'static str> {
 }
 
 /// The script `ENV_LOADER` reads, which puts `env` ahead of the command.
+///
+/// Directories steps added through `$GITHUB_PATH` go in front of the
+/// container's own PATH, which `exec` started this shell with, instead of the
+/// job's `PATH`, which was built on the host's.
 fn env_script<'a>(env: impl Iterator<Item = (&'a str, &'a str)>) -> Result<String, String> {
+    let env: Vec<(&str, &str)> = env.collect();
+    let additions = env
+        .iter()
+        .rev()
+        .find(|(name, _)| *name == PATH_ADDITIONS_ENV)
+        .map(|(_, value)| *value)
+        .filter(|value| !value.is_empty());
     let mut script = String::from("set --");
     for (name, value) in env {
+        if name == PATH_ADDITIONS_ENV || (additions.is_some() && name == "PATH") {
+            continue;
+        }
         if let Some(reason) = bad_env_name(name) {
             return Err(format!("can't pass variable '{}': {}", name, reason));
         }
@@ -239,6 +261,14 @@ fn env_script<'a>(env: impl Iterator<Item = (&'a str, &'a str)>) -> Result<Strin
         }
         script.push(' ');
         script.push_str(&shell_quote(&format!("{}={}", name, value)));
+    }
+    if let Some(additions) = additions {
+        if additions.contains('\0') {
+            return Err("can't pass PATH: it holds a NUL byte".to_string());
+        }
+        script.push(' ');
+        script.push_str(&shell_quote(&format!("PATH={}:", additions)));
+        script.push_str("\"$PATH\"");
     }
     script.push_str(" \"$@\"\n");
     Ok(script)
@@ -691,8 +721,30 @@ impl JobSession {
             image: image.to_string(),
             volumes: volumes.to_vec(),
             id,
+            action_dir: None,
             _cleanup: containers,
         })
+    }
+
+    /// Replace [`CONTAINER_ACTION_DIR`] in container `id` with a copy of `dir`.
+    async fn copy_action_dir(&self, id: &str, dir: &Path) -> Result<(), String> {
+        let clear: Vec<String> = ["exec", id, "rm", "-rf", CONTAINER_ACTION_DIR]
+            .map(str::to_string)
+            .to_vec();
+        let copy = vec![
+            "cp".to_string(),
+            dir.display().to_string(),
+            format!("{}:{}", id, CONTAINER_ACTION_DIR),
+        ];
+        for args in [clear, copy] {
+            let output = cli_output(self.cli, &args, None)
+                .await
+                .map_err(|e| e.to_string())?;
+            if output.exit_code != 0 {
+                return Err(output.stderr.trim().to_string());
+            }
+        }
+        Ok(())
     }
 
     /// Run a step in the session.
@@ -711,8 +763,21 @@ impl JobSession {
         volumes: &[(&Path, &Path)],
         resolve: &dyn Fn(&str) -> String,
     ) -> Result<Option<ContainerOutput>, String> {
+        // A composite action's steps mount its directory, which a running
+        // container can't gain. They only read it, so it is copied in below
+        // instead, and the step keeps the toolchain and files earlier steps
+        // left, as on GitHub.
+        let mut action_dir: Option<PathBuf> = None;
         let wanted: Vec<(PathBuf, PathBuf)> = volumes
             .iter()
+            .filter(|(host, container)| {
+                if *container == Path::new(CONTAINER_ACTION_DIR) && host.is_dir() {
+                    action_dir = Some(host.to_path_buf());
+                    false
+                } else {
+                    true
+                }
+            })
             .map(|(host, container)| (host.to_path_buf(), container.to_path_buf()))
             .collect();
         let mut state = self.state.lock().await;
@@ -774,6 +839,28 @@ impl JobSession {
             return Ok(None);
         }
         let id = live.id.clone();
+        if let Some(dir) = action_dir {
+            if live.action_dir.as_ref() != Some(&dir) {
+                if let Err(e) = self.copy_action_dir(&id, &dir).await {
+                    if !self.services.is_empty() {
+                        return Err(format!(
+                            "this step's action directory couldn't be copied to the job \
+                             container, so it can't reach the job's services: {}",
+                            e
+                        ));
+                    }
+                    wrkflw_logging::warning(&format!(
+                        "A step runs in a container of its own, as its action directory \
+                         couldn't be copied to the job container: {}",
+                        e
+                    ));
+                    return Ok(None);
+                }
+                if let Some(live) = state.live.as_mut() {
+                    live.action_dir = Some(dir);
+                }
+            }
+        }
         let script = env_script(env.iter().copied())?;
         state.busy = true;
 
@@ -866,6 +953,30 @@ mod tests {
         let output = child.wait_with_output().unwrap();
         assert!(output.status.success());
         String::from_utf8(output.stdout).unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_additions_extend_the_containers_own_path() {
+        let container_path = std::env::var("PATH").unwrap();
+        let printed = through_loader(
+            &[
+                ("PATH", "/host/only/bin"),
+                (PATH_ADDITIONS_ENV, "/opt/new:/opt/o'ld"),
+            ],
+            r#"printf '%s|%s' "$PATH" "${WRKFLW_PATH_ADDITIONS-unset}""#,
+        );
+        assert_eq!(
+            printed,
+            format!("/opt/new:/opt/o'ld:{}|unset", container_path)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_passes_through_when_no_step_added_to_it() {
+        let printed = through_loader(&[("PATH", "/usr/bin:/bin")], r#"printf '%s' "$PATH""#);
+        assert_eq!(printed, "/usr/bin:/bin");
     }
 
     #[cfg(unix)]

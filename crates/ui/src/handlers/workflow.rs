@@ -164,29 +164,25 @@ pub async fn execute_workflow_cli(
                 RuntimeType::Emulation
             }
         }
+        // Asked for by name, so a missing runtime fails the run rather than
+        // running the steps on this machine instead.
         RuntimeType::Docker => {
             if !wrkflw_executor::docker::is_available() {
-                println!(
-                    "{}",
-                    cli_style::warning("Docker is not available. Using emulation mode instead.")
-                );
-                wrkflw_logging::warning("Docker is not available. Using emulation mode instead.");
-                RuntimeType::Emulation
-            } else {
-                RuntimeType::Docker
+                return Err(io::Error::other(
+                    "Docker is not available: the daemon did not answer. Start Docker, \
+                     or use the auto runtime to fall back to another one",
+                ));
             }
+            RuntimeType::Docker
         }
         RuntimeType::Podman => {
             if !wrkflw_executor::podman::is_available() {
-                println!(
-                    "{}",
-                    cli_style::warning("Podman is not available. Using emulation mode instead.")
-                );
-                wrkflw_logging::warning("Podman is not available. Using emulation mode instead.");
-                RuntimeType::Emulation
-            } else {
-                RuntimeType::Podman
+                return Err(io::Error::other(
+                    "Podman is not available: it did not answer. Start the Podman machine, \
+                     or use the auto runtime to fall back to another one",
+                ));
             }
+            RuntimeType::Podman
         }
         // Reachability is checked by the executor, which fails the run
         // instead of falling back to the host.
@@ -519,52 +515,11 @@ pub fn start_next_workflow_execution(
                     }
                 }
             }
-            RuntimeType::Docker => {
-                // Use safe FD redirection to check Docker availability
-                let is_docker_available = match wrkflw_utils::fd::with_stderr_to_null(
-                    wrkflw_executor::docker::is_available,
-                ) {
-                    Ok(result) => result,
-                    Err(_) => {
-                        wrkflw_logging::debug(
-                            "Failed to redirect stderr when checking Docker availability.",
-                        );
-                        false
-                    }
-                };
-
-                if !is_docker_available {
-                    wrkflw_logging::warning(
-                        "Docker is not available. Using emulation mode instead.",
-                    );
-                    RuntimeType::Emulation
-                } else {
-                    RuntimeType::Docker
-                }
-            }
-            RuntimeType::Podman => {
-                // Use safe FD redirection to check Podman availability
-                let is_podman_available = match wrkflw_utils::fd::with_stderr_to_null(
-                    wrkflw_executor::podman::is_available,
-                ) {
-                    Ok(result) => result,
-                    Err(_) => {
-                        wrkflw_logging::debug(
-                            "Failed to redirect stderr when checking Podman availability.",
-                        );
-                        false
-                    }
-                };
-
-                if !is_podman_available {
-                    wrkflw_logging::warning(
-                        "Podman is not available. Using emulation mode instead.",
-                    );
-                    RuntimeType::Emulation
-                } else {
-                    RuntimeType::Podman
-                }
-            }
+            // Asked for by name, so a runtime that doesn't answer fails the
+            // run with the executor's error rather than running the steps on
+            // this machine instead.
+            RuntimeType::Docker => RuntimeType::Docker,
+            RuntimeType::Podman => RuntimeType::Podman,
             RuntimeType::Kubernetes => RuntimeType::Kubernetes,
             RuntimeType::SecureEmulation => RuntimeType::SecureEmulation,
             RuntimeType::Emulation => RuntimeType::Emulation,

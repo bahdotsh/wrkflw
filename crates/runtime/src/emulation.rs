@@ -188,6 +188,21 @@ impl ContainerRuntime for EmulationRuntime {
             });
         }
 
+        // `shell: python` runs `python`, which GitHub's runners have. Many
+        // hosts, macOS among them, only have `python3`.
+        let python3_argv: Vec<&str>;
+        let command: &[&str] = if command[0] == "python"
+            && which::which("python").is_err()
+            && which::which("python3").is_ok()
+        {
+            python3_argv = std::iter::once("python3")
+                .chain(command[1..].iter().copied())
+                .collect();
+            &python3_argv
+        } else {
+            command
+        };
+
         // Print each command part separately for debugging
         for (i, part) in command.iter().enumerate() {
             wrkflw_logging::info(&format!("Command part {}: '{}'", i, part));

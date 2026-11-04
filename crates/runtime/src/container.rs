@@ -69,6 +69,56 @@ pub trait ContainerRuntime {
     }
 }
 
+/// Directories steps added through `$GITHUB_PATH`, newest first, joined with
+/// `:`. The job's `PATH` is built on the host's PATH, so a container runtime
+/// uses this instead and puts it in front of the image's own PATH.
+pub const PATH_ADDITIONS_ENV: &str = "WRKFLW_PATH_ADDITIONS";
+
+/// The PATH of a Linux image whose config doesn't set one, as Docker uses.
+pub const DEFAULT_CONTAINER_PATH: &str =
+    "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
+/// The `PATH` a container step should get: the `$GITHUB_PATH` additions in
+/// front of `image_path`, or `None` when no step added any. `image_path` is
+/// the image's own PATH, and [`DEFAULT_CONTAINER_PATH`] stands in when it's
+/// unknown.
+pub fn container_path(env_vars: &[(&str, &str)], image_path: Option<&str>) -> Option<String> {
+    let additions = env_vars
+        .iter()
+        .rev()
+        .find(|(name, _)| *name == PATH_ADDITIONS_ENV)
+        .map(|(_, value)| *value)
+        .filter(|value| !value.is_empty())?;
+    let base = image_path
+        .filter(|path| !path.is_empty())
+        .unwrap_or(DEFAULT_CONTAINER_PATH);
+    Some(format!("{}:{}", additions, base))
+}
+
+/// `env_vars` for a container, with `PATH` from [`container_path`] in place
+/// of the host-based one when steps added to it. The additions variable
+/// itself is dropped, since it only means something to wrkflw.
+pub fn container_env(env_vars: &[(&str, &str)], image_path: Option<&str>) -> Vec<(String, String)> {
+    let path = container_path(env_vars, image_path);
+    let mut env: Vec<(String, String)> = env_vars
+        .iter()
+        .filter(|(name, _)| *name != PATH_ADDITIONS_ENV && !(path.is_some() && *name == "PATH"))
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .collect();
+    if let Some(path) = path {
+        env.push(("PATH".to_string(), path));
+    }
+    env
+}
+
+/// The `PATH` entry of an image config's `Env` list, such as `PATH=/a:/b`.
+pub fn path_from_image_env<S: AsRef<str>>(env: &[S]) -> Option<String> {
+    env.iter()
+        .filter_map(|entry| entry.as_ref().strip_prefix("PATH="))
+        .last()
+        .map(str::to_string)
+}
+
 #[derive(Debug)]
 #[must_use]
 pub struct ContainerOutput {
@@ -342,5 +392,61 @@ mod tests {
         let expected = host_root.path().join("sub/nested");
         assert_eq!(resolved, expected);
         assert!(expected.exists(), "helper should have created the subdir");
+    }
+
+    #[test]
+    fn container_path_puts_additions_in_front_of_the_image_path() {
+        let env = [
+            ("PATH", "/opt/homebrew/bin:/usr/bin"),
+            (PATH_ADDITIONS_ENV, "/opt/new:/opt/old"),
+        ];
+        assert_eq!(
+            container_path(&env, Some("/usr/local/cargo/bin:/usr/bin")).as_deref(),
+            Some("/opt/new:/opt/old:/usr/local/cargo/bin:/usr/bin")
+        );
+        assert_eq!(
+            container_path(&env, None).as_deref(),
+            Some(&*format!("/opt/new:/opt/old:{}", DEFAULT_CONTAINER_PATH))
+        );
+    }
+
+    #[test]
+    fn container_env_replaces_the_host_path_only_when_steps_added_to_it() {
+        let untouched = [("PATH", "/custom"), ("A", "1")];
+        let env = container_env(&untouched, Some("/usr/bin"));
+        assert_eq!(
+            env,
+            vec![
+                ("PATH".to_string(), "/custom".to_string()),
+                ("A".to_string(), "1".to_string())
+            ]
+        );
+
+        let added = [
+            ("PATH", "/opt/x:/opt/homebrew/bin"),
+            (PATH_ADDITIONS_ENV, "/opt/x"),
+            ("A", "1"),
+        ];
+        let env = container_env(&added, Some("/usr/local/cargo/bin:/usr/bin"));
+        assert_eq!(
+            env,
+            vec![
+                ("A".to_string(), "1".to_string()),
+                (
+                    "PATH".to_string(),
+                    "/opt/x:/usr/local/cargo/bin:/usr/bin".to_string()
+                )
+            ]
+        );
+    }
+
+    #[test]
+    fn path_from_image_env_reads_the_path_entry() {
+        let env = ["HOME=/root", "PATH=/usr/local/cargo/bin:/usr/bin"];
+        assert_eq!(
+            path_from_image_env(&env).as_deref(),
+            Some("/usr/local/cargo/bin:/usr/bin")
+        );
+        assert_eq!(path_from_image_env(&["HOME=/root"]), None);
     }
 }

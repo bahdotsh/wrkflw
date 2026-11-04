@@ -13,7 +13,8 @@ use std::path::Path;
 use std::sync::Mutex;
 use wrkflw_logging;
 use wrkflw_runtime::container::{
-    ContainerError, ContainerOutput, ContainerRuntime, COMBINED_IMAGE_PREFIX, LOCAL_IMAGE_PREFIX,
+    container_env, container_path, path_from_image_env, ContainerError, ContainerOutput,
+    ContainerRuntime, COMBINED_IMAGE_PREFIX, LOCAL_IMAGE_PREFIX,
 };
 use wrkflw_utils;
 use wrkflw_utils::fd;
@@ -24,6 +25,35 @@ static CREATED_NETWORKS: Lazy<Mutex<Vec<String>>> = Lazy::new(|| Mutex::new(Vec:
 #[allow(dead_code)]
 static CUSTOMIZED_IMAGES: Lazy<Mutex<HashMap<String, String>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// Images this run has pulled or tried to pull, so later steps don't ask the
+/// registry again. A failed pull counts too: an offline machine or an
+/// unreachable registry would otherwise cost every step another try and
+/// another warning.
+static PULLED_IMAGES: Lazy<Mutex<std::collections::HashSet<String>>> =
+    Lazy::new(|| Mutex::new(std::collections::HashSet::new()));
+
+fn already_pulled(image: &str) -> bool {
+    PULLED_IMAGES
+        .lock()
+        .map(|pulled| pulled.contains(image))
+        .unwrap_or(false)
+}
+
+fn mark_pulled(image: &str) {
+    if let Ok(mut pulled) = PULLED_IMAGES.lock() {
+        pulled.insert(image.to_string());
+    }
+}
+
+/// Forget which images were pulled, so the next run asks the registry about
+/// each again, as a run on GitHub would. Called when a run sets up Docker, so
+/// a long TUI session still refreshes a floating tag between runs.
+pub fn forget_pulled_images() {
+    if let Ok(mut pulled) = PULLED_IMAGES.lock() {
+        pulled.clear();
+    }
+}
 
 pub struct DockerRuntime {
     docker: Docker,
@@ -279,9 +309,19 @@ impl DockerRuntime {
     }
 }
 
+/// How long the availability probe waits for the CLI to answer.
+const PROBE_CLI_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+/// How long the availability probe waits for the daemon to answer a ping.
+const PROBE_DAEMON_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// How long the whole availability probe may take.
+const PROBE_OVERALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
 pub fn is_available() -> bool {
-    // Use a very short timeout for the entire availability check
-    let overall_timeout = std::time::Duration::from_secs(3);
+    // A stopped daemon or a missing CLI fails at once, so these limits only
+    // matter for one that is slow to answer, as Docker Desktop is while it
+    // wakes from Resource Saver. Giving up too early there would run the
+    // workflow somewhere other than the container the user asked for.
+    let overall_timeout = PROBE_OVERALL_TIMEOUT;
 
     // Spawn a thread with the timeout to prevent blocking the main thread
     let handle = std::thread::spawn(move || {
@@ -302,8 +342,8 @@ pub fn is_available() -> bool {
                     Ok(mut child) => {
                         // Set a very short timeout for the process
                         let status = std::thread::scope(|_| {
-                            // Try to wait for a short time
-                            for _ in 0..10 {
+                            let deadline = std::time::Instant::now() + PROBE_CLI_TIMEOUT;
+                            while std::time::Instant::now() < deadline {
                                 match child.try_wait() {
                                     Ok(Some(status)) => return status.success(),
                                     Ok(None) => {
@@ -344,16 +384,11 @@ pub fn is_available() -> bool {
             };
 
             runtime.block_on(async {
-                match tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                match tokio::time::timeout(PROBE_DAEMON_TIMEOUT, async {
                     match Docker::connect_with_local_defaults() {
                         Ok(docker) => {
                             // Try to ping the Docker daemon with a short timeout
-                            match tokio::time::timeout(
-                                std::time::Duration::from_secs(1),
-                                docker.ping(),
-                            )
-                            .await
-                            {
+                            match tokio::time::timeout(PROBE_DAEMON_TIMEOUT, docker.ping()).await {
                                 Ok(Ok(_)) => true,
                                 Ok(Err(e)) => {
                                     wrkflw_logging::debug(&format!(
@@ -363,9 +398,7 @@ pub fn is_available() -> bool {
                                     false
                                 }
                                 Err(_) => {
-                                    wrkflw_logging::debug(
-                                        "Docker daemon ping timed out after 1 second",
-                                    );
+                                    wrkflw_logging::debug("Docker daemon ping timed out");
                                     false
                                 }
                             }
@@ -685,10 +718,15 @@ impl ContainerRuntime for DockerRuntime {
     }
 
     async fn pull_image(&self, image: &str) -> Result<(), ContainerError> {
+        if already_pulled(image) {
+            return Ok(());
+        }
         // Add a timeout for pull operations
         let timeout_duration = std::time::Duration::from_secs(30);
 
-        match tokio::time::timeout(timeout_duration, self.pull_image_inner(image)).await {
+        let outcome = tokio::time::timeout(timeout_duration, self.pull_image_inner(image)).await;
+        mark_pulled(image);
+        match outcome {
             Ok(result) => result,
             Err(_) => {
                 wrkflw_logging::warning(&format!(
@@ -934,10 +972,15 @@ impl DockerRuntime {
         volumes: &[(&Path, &Path)],
         entrypoint: Option<&str>,
     ) -> Result<ContainerOutput, ContainerError> {
-        // Try to pull the image if it's not available locally.
-        // Skip pull for locally-built images (e.g., combined runtime images).
-        if !image.starts_with(LOCAL_IMAGE_PREFIX) {
-            if let Err(e) = self.pull_image_inner(image).await {
+        // Pull each image once per run, which keeps a floating tag such as
+        // `ubuntu:latest` as fresh as a run on GitHub. Asking the registry
+        // again before every step cost about 1.5s a step even for an image
+        // already here. Skip pull for locally-built images (e.g., combined
+        // runtime images).
+        if !image.starts_with(LOCAL_IMAGE_PREFIX) && !already_pulled(image) {
+            let pulled = self.pull_image_inner(image).await;
+            mark_pulled(image);
+            if let Err(e) = pulled {
                 wrkflw_logging::warning(&format!(
                     "Failed to pull image {}: {}. Attempting to continue with existing image.",
                     image, e
@@ -945,9 +988,16 @@ impl DockerRuntime {
             }
         }
 
-        // Collect environment variables
-        let env: Vec<String> = env_vars
-            .iter()
+        // Steps that added to `$GITHUB_PATH` extend the image's PATH, not
+        // the host's, so look the image's up only when there is something
+        // to add to it.
+        let image_path = if container_path(env_vars, None).is_some() {
+            self.image_path(image).await
+        } else {
+            None
+        };
+        let env: Vec<String> = container_env(env_vars, image_path.as_deref())
+            .into_iter()
             .map(|(k, v)| format!("{}={}", k, v))
             .collect();
 
@@ -1137,6 +1187,12 @@ impl DockerRuntime {
         })
     }
 
+    /// The PATH `image` sets in its config, if it can be read.
+    async fn image_path(&self, image: &str) -> Option<String> {
+        let inspect = self.docker.inspect_image(image).await.ok()?;
+        path_from_image_env(&inspect.config?.env?)
+    }
+
     async fn pull_image_inner(&self, image: &str) -> Result<(), ContainerError> {
         let options = bollard::image::CreateImageOptions {
             from_image: image,
@@ -1280,13 +1336,38 @@ impl DockerRuntime {
             .docker
             .build_image(options, None, Some(tar_buffer.into()));
 
+        // The last lines of build output, so a failure says which command
+        // failed and how rather than only that the build stopped.
+        let mut tail: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+        let build_failed = |message: &str, tail: &std::collections::VecDeque<String>| {
+            let mut text = format!("{} (image {})", message.trim(), tag);
+            if !tail.is_empty() {
+                text.push_str("\nLast build output:\n");
+                text.push_str(&tail.iter().cloned().collect::<Vec<_>>().join("\n"));
+            }
+            ContainerError::ImageBuild(text)
+        };
         while let Some(result) = stream.next().await {
             match result {
-                Ok(_) => {
-                    // For verbose output, we could log the build progress here
+                Ok(info) => {
+                    if let Some(error) = info.error {
+                        return Err(build_failed(&error, &tail));
+                    }
+                    for line in info.stream.iter().flat_map(|text| text.lines()) {
+                        if line.trim().is_empty() {
+                            continue;
+                        }
+                        if tail.len() == 20 {
+                            tail.pop_front();
+                        }
+                        tail.push_back(line.to_string());
+                    }
+                }
+                Err(bollard::errors::Error::DockerStreamError { error }) => {
+                    return Err(build_failed(&error, &tail));
                 }
                 Err(e) => {
-                    return Err(ContainerError::ImageBuild(e.to_string()));
+                    return Err(build_failed(&e.to_string(), &tail));
                 }
             }
         }

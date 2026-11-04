@@ -179,6 +179,11 @@ pub struct Colors {
     pub runtime_kubernetes: Color,
     pub runtime_emulation: Color,
     pub runtime_secure: Color,
+
+    // Tool output: the two basic ANSI colours that have no semantic
+    // status of their own.
+    pub ansi_blue: Color,
+    pub ansi_magenta: Color,
 }
 
 /// The active palette. Dereferences to [`Colors`], so `COLORS.text`
@@ -222,6 +227,8 @@ static DARK: Colors = Colors {
     runtime_kubernetes: Color::Rgb(0x9f, 0x8f, 0xff),
     runtime_emulation: Color::Rgb(0xff, 0x99, 0x66),
     runtime_secure: Color::Rgb(0x8f, 0xce, 0x8f),
+    ansi_blue: Color::Rgb(0x5f, 0xa3, 0xff),
+    ansi_magenta: Color::Rgb(0xd6, 0x8c, 0xff),
 };
 
 // `bg_dark` keeps its role here: it is the bar background and the text on
@@ -253,6 +260,8 @@ static LIGHT: Colors = Colors {
     runtime_kubernetes: Color::Rgb(0x4b, 0x3f, 0xb3),
     runtime_emulation: Color::Rgb(0xa8, 0x47, 0x00),
     runtime_secure: Color::Rgb(0x1f, 0x75, 0x1f),
+    ansi_blue: Color::Rgb(0x1f, 0x5f, 0xbf),
+    ansi_magenta: Color::Rgb(0x7b, 0x2f, 0xbf),
 };
 
 // ── Symbols ────────────────────────────────────────────────────────

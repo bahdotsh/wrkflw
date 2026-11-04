@@ -20,9 +20,10 @@ pub fn width(s: &str) -> usize {
     UnicodeWidthStr::width(s)
 }
 
-/// Replaces tabs with spaces up to the next tab stop and drops other
-/// control characters, which ratatui would otherwise render as nothing
-/// and silently glue neighbouring words together.
+/// Replaces tabs with spaces up to the next tab stop, line breaks with a
+/// single space, and drops other control characters, which ratatui would
+/// otherwise render as nothing and silently glue neighbouring words
+/// together.
 pub fn sanitize(s: &str) -> Cow<'_, str> {
     if !s.chars().any(|c| c.is_control()) {
         return Cow::Borrowed(s);
@@ -35,6 +36,10 @@ pub fn sanitize(s: &str) -> Cow<'_, str> {
                 let n = TAB_STOP - col % TAB_STOP;
                 out.extend(std::iter::repeat_n(' ', n));
                 col += n;
+            }
+            '\n' | '\r' => {
+                out.push(' ');
+                col += 1;
             }
             c if c.is_control() => {}
             c => {
@@ -171,68 +176,121 @@ pub fn ansi_line(raw: &str, base: Style) -> Line<'static> {
     Line::from(spans)
 }
 
+/// Applies one SGR parameter string (the part between `ESC[` and `m`).
+///
+/// Parameters are `;`-separated. A group may also carry `:`-separated
+/// sub-parameters (ITU T.416 form, e.g. `38:2::r:g:b` or `4:3`), which
+/// is self-contained and never borrows the following groups.
 fn apply_sgr(mut style: Style, base: Style, params: &str) -> Style {
-    let codes: Vec<u16> = if params.is_empty() {
-        vec![0]
-    } else {
-        params
-            .split([';', ':'])
-            .map(|p| p.parse().unwrap_or(0))
-            .collect()
-    };
+    if params.is_empty() {
+        return base;
+    }
+    let groups: Vec<&str> = params.split(';').collect();
+    let num = |s: &str| s.parse::<u16>().unwrap_or(0);
     let mut i = 0;
-    while i < codes.len() {
-        match codes[i] {
-            0 => style = base,
-            1 => style = style.add_modifier(Modifier::BOLD),
-            2 => style = style.add_modifier(Modifier::DIM),
-            3 => style = style.add_modifier(Modifier::ITALIC),
-            4 => style = style.add_modifier(Modifier::UNDERLINED),
-            7 => style = style.add_modifier(Modifier::REVERSED),
-            9 => style = style.add_modifier(Modifier::CROSSED_OUT),
-            22 => style = style.remove_modifier(Modifier::BOLD | Modifier::DIM),
-            23 => style = style.remove_modifier(Modifier::ITALIC),
-            24 => style = style.remove_modifier(Modifier::UNDERLINED),
-            27 => style = style.remove_modifier(Modifier::REVERSED),
-            29 => style = style.remove_modifier(Modifier::CROSSED_OUT),
-            n @ 30..=37 => style = style.fg(ansi_color(n - 30)),
-            n @ 90..=97 => style = style.fg(ansi_color(n - 90 + 8)),
-            n @ 40..=47 => style = style.bg(ansi_color(n - 40)),
-            n @ 100..=107 => style = style.bg(ansi_color(n - 100 + 8)),
-            39 => style.fg = base.fg,
-            49 => style.bg = base.bg,
-            n @ (38 | 48) => {
-                let color = match codes.get(i + 1) {
-                    Some(5) => {
-                        let c = codes.get(i + 2).map(|&v| Color::Indexed(v as u8));
-                        i += 2;
-                        c
-                    }
-                    Some(2) => {
-                        let rgb = (codes.get(i + 2), codes.get(i + 3), codes.get(i + 4));
-                        i += 4;
-                        match rgb {
-                            (Some(&r), Some(&g), Some(&b)) => {
-                                Some(Color::Rgb(r as u8, g as u8, b as u8))
-                            }
-                            _ => None,
-                        }
-                    }
-                    _ => None,
-                };
-                if let Some(color) = color {
-                    style = if n == 38 {
-                        style.fg(color)
-                    } else {
-                        style.bg(color)
-                    };
-                }
-            }
-            _ => {}
-        }
+    while i < groups.len() {
+        let group = groups[i];
         i += 1;
+        if group.contains(':') {
+            let sub: Vec<Option<u16>> = group.split(':').map(|p| p.parse().ok()).collect();
+            match sub[0] {
+                Some(n @ (38 | 48)) => {
+                    let color = match sub.get(1).copied().flatten() {
+                        Some(5) => sub.get(2).copied().flatten().map(indexed),
+                        // `38:2:cs:r:g:b` names a colour space before the
+                        // channels; `38:2:r:g:b` omits it.
+                        Some(2) => {
+                            let rgb = if sub.len() >= 6 {
+                                &sub[3..6]
+                            } else {
+                                &sub[2..]
+                            };
+                            match rgb {
+                                [Some(r), Some(g), Some(b), ..] => Some(rgb_color(*r, *g, *b)),
+                                _ => None,
+                            }
+                        }
+                        _ => None,
+                    };
+                    style = set_color(style, n, color);
+                }
+                // `4:0` turns underline off; `4:1`..`4:5` are styles of it.
+                Some(4) if sub.get(1).copied().flatten() == Some(0) => {
+                    style = style.remove_modifier(Modifier::UNDERLINED);
+                }
+                Some(n) => style = apply_code(style, base, n),
+                None => {}
+            }
+            continue;
+        }
+        let code = num(group);
+        if code == 38 || code == 48 {
+            // Legacy form: `38;5;n` or `38;2;r;g;b` across groups.
+            let color = match groups.get(i).map(|g| num(g)) {
+                Some(5) => {
+                    let c = groups.get(i + 1).map(|g| indexed(num(g)));
+                    i += 2;
+                    c
+                }
+                Some(2) => {
+                    let rgb = (groups.get(i + 1), groups.get(i + 2), groups.get(i + 3));
+                    i += 4;
+                    match rgb {
+                        (Some(r), Some(g), Some(b)) => Some(rgb_color(num(r), num(g), num(b))),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            };
+            style = set_color(style, code, color);
+            continue;
+        }
+        style = apply_code(style, base, code);
     }
     style
+}
+
+/// Applies a single SGR code that takes no arguments.
+fn apply_code(style: Style, base: Style, code: u16) -> Style {
+    let mut style = style;
+    match code {
+        0 => style = base,
+        1 => style = style.add_modifier(Modifier::BOLD),
+        2 => style = style.add_modifier(Modifier::DIM),
+        3 => style = style.add_modifier(Modifier::ITALIC),
+        4 => style = style.add_modifier(Modifier::UNDERLINED),
+        7 => style = style.add_modifier(Modifier::REVERSED),
+        9 => style = style.add_modifier(Modifier::CROSSED_OUT),
+        22 => style = style.remove_modifier(Modifier::BOLD | Modifier::DIM),
+        23 => style = style.remove_modifier(Modifier::ITALIC),
+        24 => style = style.remove_modifier(Modifier::UNDERLINED),
+        27 => style = style.remove_modifier(Modifier::REVERSED),
+        29 => style = style.remove_modifier(Modifier::CROSSED_OUT),
+        n @ 30..=37 => style = style.fg(ansi_color(n - 30)),
+        n @ 90..=97 => style = style.fg(ansi_color(n - 90 + 8)),
+        n @ 40..=47 => style = style.bg(ansi_color(n - 40)),
+        n @ 100..=107 => style = style.bg(ansi_color(n - 100 + 8)),
+        39 => style.fg = base.fg,
+        49 => style.bg = base.bg,
+        _ => {}
+    }
+    style
+}
+
+fn set_color(style: Style, code: u16, color: Option<Color>) -> Style {
+    match (code, color) {
+        (38, Some(c)) => style.fg(c),
+        (48, Some(c)) => style.bg(c),
+        _ => style,
+    }
+}
+
+fn indexed(v: u16) -> Color {
+    Color::Indexed(v.min(255) as u8)
+}
+
+fn rgb_color(r: u16, g: u16, b: u16) -> Color {
+    Color::Rgb(r.min(255) as u8, g.min(255) as u8, b.min(255) as u8)
 }
 
 /// Maps the 16 basic ANSI colours onto the palette so tool output
@@ -243,8 +301,8 @@ fn ansi_color(n: u16) -> Color {
         1 => COLORS.error,
         2 => COLORS.success,
         3 => COLORS.warning,
-        4 => COLORS.runtime_docker,
-        5 => COLORS.trigger,
+        4 => COLORS.ansi_blue,
+        5 => COLORS.ansi_magenta,
         6 => COLORS.info,
         _ => COLORS.text,
     }
@@ -268,7 +326,8 @@ mod tests {
     fn sanitize_expands_tabs_and_drops_controls() {
         assert_eq!(sanitize("a\tb"), "a   b");
         assert_eq!(sanitize("ab\tc"), "ab  c");
-        assert_eq!(sanitize("x\u{7}y\r"), "xy");
+        assert_eq!(sanitize("x\u{7}y"), "xy");
+        assert_eq!(sanitize("one\ntwo\rthree"), "one two three");
     }
 
     #[test]
@@ -281,6 +340,30 @@ mod tests {
         assert!(err.style.add_modifier.contains(Modifier::BOLD));
         let tail = line.spans.last().unwrap();
         assert_eq!(tail.style, Style::default());
+    }
+
+    #[test]
+    fn ansi_colon_form_colours_keep_their_channels() {
+        let fg = |raw: &str| ansi_line(raw, Style::default()).spans[0].style.fg;
+        // Empty colour-space id, as kitty and recent cargo emit.
+        assert_eq!(fg("\x1b[38:2::1:2:3mx"), Some(Color::Rgb(1, 2, 3)));
+        assert_eq!(fg("\x1b[38:2:0:1:2:3mx"), Some(Color::Rgb(1, 2, 3)));
+        assert_eq!(fg("\x1b[38:2:1:2:3mx"), Some(Color::Rgb(1, 2, 3)));
+        assert_eq!(fg("\x1b[38:5:200mx"), Some(Color::Indexed(200)));
+        // A colon group must not swallow the groups after it.
+        let line = ansi_line("\x1b[38:5:1;1mx", Style::default());
+        assert_eq!(line.spans[0].style.fg, Some(Color::Indexed(1)));
+        assert!(line.spans[0].style.add_modifier.contains(Modifier::BOLD));
+        // Out-of-range channels clamp instead of wrapping.
+        assert_eq!(fg("\x1b[38;2;300;0;0mx"), Some(Color::Rgb(255, 0, 0)));
+    }
+
+    #[test]
+    fn ansi_curly_underline_and_underline_off() {
+        let s = ansi_line("\x1b[4:3mx", Style::default()).spans[0].style;
+        assert!(s.add_modifier.contains(Modifier::UNDERLINED));
+        let s = ansi_line("\x1b[4m\x1b[4:0mx", Style::default()).spans[0].style;
+        assert!(!s.add_modifier.contains(Modifier::UNDERLINED));
     }
 
     #[test]

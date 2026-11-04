@@ -141,7 +141,8 @@ fn strip_variable_args(args: impl Iterator<Item = String>) -> Vec<String> {
             break;
         }
         // `--format` is the replayer's choice, and clap rejects it twice.
-        if arg == "--variable" || arg == "--format" {
+        // `--session` belongs to whoever replays, not to the original run.
+        if arg == "--variable" || arg == "--format" || arg == "--session" {
             args.next();
         } else if let Some((flags, inline_value)) = variable_in_short_cluster(&arg) {
             if !flags.is_empty() {
@@ -150,7 +151,10 @@ fn strip_variable_args(args: impl Iterator<Item = String>) -> Vec<String> {
             if !inline_value {
                 args.next();
             }
-        } else if !arg.starts_with("--variable=") && !arg.starts_with("--format=") {
+        } else if !["--variable=", "--format=", "--session="]
+            .iter()
+            .any(|prefix| arg.starts_with(prefix))
+        {
             kept.push(arg);
         }
     }
@@ -443,7 +447,7 @@ mod tests {
     use super::strip_variable_args;
 
     #[test]
-    fn variable_values_never_reach_the_stored_argv() {
+    fn variables_format_and_session_never_reach_the_stored_argv() {
         let args = [
             "run",
             "ci.yml",
@@ -456,6 +460,9 @@ mod tests {
             "--format",
             "json",
             "--format=json",
+            "--session",
+            "old",
+            "--session=old",
             "--job",
             "build",
         ];

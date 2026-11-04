@@ -106,7 +106,7 @@ impl Dirs {
             kiro: kiro_home(&home, set("KIRO_HOME")),
             pi: set("PI_CODING_AGENT_DIR")
                 .map_or_else(|| home.join(".pi/agent"), |dir| expand_tilde(&home, dir)),
-            zed: zed_dir(&home, &config, set("XDG_CONFIG_HOME")),
+            zed: zed_dir(&home, &config),
             home,
             config,
         }
@@ -131,16 +131,16 @@ fn expand_tilde(home: &Path, dir: OsString) -> PathBuf {
     }
 }
 
-/// Zed keeps settings in `~/.config/zed` on macOS, the XDG config directory on
-/// Linux and the BSDs, and `%APPDATA%\Zed` on Windows.
-fn zed_dir(home: &Path, config: &Path, xdg: Option<OsString>) -> PathBuf {
-    if cfg!(windows) {
-        config.join("Zed")
-    } else if cfg!(target_os = "macos") {
+/// Zed keeps settings in `~/.config/zed` on macOS, `%APPDATA%\Zed` on Windows,
+/// and the XDG config directory elsewhere. `config` already follows the XDG
+/// rules, including ignoring a relative `XDG_CONFIG_HOME`.
+fn zed_dir(home: &Path, config: &Path) -> PathBuf {
+    if cfg!(target_os = "macos") {
         home.join(".config/zed")
+    } else if cfg!(windows) {
+        config.join("Zed")
     } else {
-        xdg.map_or_else(|| home.join(".config"), PathBuf::from)
-            .join("zed")
+        config.join("zed")
     }
 }
 
@@ -435,7 +435,7 @@ fn upsert_json(
     }
     let mut text = root.to_string();
     if !text.ends_with('\n') {
-        text.push('\n');
+        text.push_str(if text.contains("\r\n") { "\r\n" } else { "\n" });
     }
     Ok((status, Some(text)))
 }
@@ -580,20 +580,24 @@ fn install_cli(
     if !write {
         return (status, None);
     }
-    if status == Status::Replaced {
-        // A failed remove shows up as the add failing on the duplicate name.
+    // Every CLI client documents `mcp remove <name>`. If it fails, the add
+    // usually fails on the duplicate name, so both errors are reported.
+    let removed = if status == Status::Replaced {
         let mut remove = vec!["mcp", "remove"];
         remove.extend(scope);
         remove.push(SERVER);
-        let _ = check(program, &remove);
-    }
+        check(program, &remove)
+    } else {
+        Ok(())
+    };
     let mut add = vec!["mcp", "add"];
     add.extend(scope);
     add.extend([SERVER, "--", command]);
     add.extend(SERVE_ARGS);
-    match check(program, &add) {
-        Ok(()) => (status, None),
-        Err(e) => (Status::Failed, Some(e)),
+    match (check(program, &add), removed) {
+        (Ok(()), _) => (status, None),
+        (Err(add), Ok(())) => (Status::Failed, Some(add)),
+        (Err(add), Err(remove)) => (Status::Failed, Some(format!("{remove}, then {add}"))),
     }
 }
 
@@ -1130,9 +1134,40 @@ mod tests {
     }
 
     #[test]
+    fn force_replaces_an_entry_that_isnt_an_object() {
+        let force = Policy {
+            dry_run: false,
+            force: true,
+        };
+        for current in ["null", "\"wrkflw\"", "[]"] {
+            let text = format!("{{\"mcpServers\": {{\"wrkflw\": {current}}}}}");
+            let (status, out) = upsert_json(Some(&text), "mcpServers", &entry(), WRITE).unwrap();
+            assert_eq!((status, out), (Status::Differs, None), "{current}");
+            let (status, out) = upsert_json(Some(&text), "mcpServers", &entry(), force).unwrap();
+            assert_eq!(status, Status::Replaced, "{current}");
+            let written: Value = serde_json::from_str(&out.unwrap()).unwrap();
+            assert_eq!(written["mcpServers"]["wrkflw"], entry(), "{current}");
+        }
+    }
+
+    #[test]
+    fn crlf_line_endings_are_kept() {
+        for text in ["{\r\n  \"a\": 1\r\n}\r\n", "{\r\n  \"a\": 1\r\n}"] {
+            let (_, out) = upsert_json(Some(text), "mcpServers", &entry(), WRITE).unwrap();
+            let out = out.unwrap();
+            assert!(out.ends_with("}\r\n"), "{out:?}");
+            assert!(!out.replace("\r\n", "").contains('\n'), "{out:?}");
+        }
+    }
+
+    #[test]
     fn a_named_client_gets_its_config_created() {
         let root = tempfile::tempdir().unwrap();
         let dirs = dirs_in(root.path().join("home"), root.path().join("config"));
+        let dry = Policy {
+            dry_run: true,
+            force: false,
+        };
         for client in [
             Client::Cursor,
             Client::Kiro,
@@ -1142,6 +1177,16 @@ mod tests {
         ] {
             // Not installed, so skipped unless named.
             assert!(install_one(client, &dirs, &launch(), WRITE, false).is_none());
+            // A dry run reports the add but creates nothing, not even the directory.
+            let outcome = install_one(client, &dirs, &launch(), dry, true).unwrap();
+            assert_eq!(
+                outcome.status,
+                Status::WouldAdd,
+                "{}",
+                outcome.client.name()
+            );
+            let parent = Path::new(&outcome.target).parent().unwrap().to_path_buf();
+            assert!(!parent.exists(), "{}", parent.display());
             let outcome = install_one(client, &dirs, &launch(), WRITE, true).unwrap();
             assert_eq!(outcome.status, Status::Added, "{}", outcome.client.name());
             assert!(Path::new(&outcome.target).is_file(), "{}", outcome.target);
@@ -1251,21 +1296,18 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     #[test]
     fn zed_settings_live_where_zed_reads_them() {
         let home = Path::new("/home/u");
         let config = Path::new("/c");
-        let dir = zed_dir(home, config, Some("/xdg".into()));
-        if cfg!(target_os = "macos") {
-            assert_eq!(dir, Path::new("/home/u/.config/zed"));
+        let expected = if cfg!(target_os = "macos") {
+            home.join(".config/zed")
+        } else if cfg!(windows) {
+            config.join("Zed")
         } else {
-            assert_eq!(dir, Path::new("/xdg/zed"));
-            assert_eq!(
-                zed_dir(home, config, None),
-                Path::new("/home/u/.config/zed")
-            );
-        }
+            config.join("zed")
+        };
+        assert_eq!(zed_dir(home, config), expected);
     }
 
     #[test]
@@ -1273,7 +1315,7 @@ mod tests {
         let text = "model = \"grok-4\"\n\n[mcp_servers.wrkflw]\ncommand = \"wrkflw\"\nargs = [\"mcp\", \"serve\"]\n";
         assert_eq!(toml_server_matches(text, "wrkflw"), Some(true));
         assert_eq!(toml_server_matches(text, "/other"), Some(false));
-        let other = "[mcp_servers.atuin]\ncommand = \"atuin\"\nargs = [\"mcp\"]\n";
+        let other = "[mcp_servers.other]\ncommand = \"other\"\nargs = [\"mcp\"]\n";
         assert_eq!(toml_server_matches(other, "wrkflw"), None);
         assert_eq!(toml_server_matches("not = [toml", "wrkflw"), None);
     }

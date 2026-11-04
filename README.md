@@ -220,8 +220,12 @@ jobs:
   test:
     paths: ['src/**', 'Cargo.lock']   # what this job reads
   publish-preview:
-    cache: false                      # never reuse this job
+    cache: false                      # always run: never reuse or skip it
+  deploy:
+    gate: false                       # leave it to CI: `wrkflw gate` skips it
 ```
+
+`wrkflw gate` runs every job a push would, with this machine's credentials, and it can't tell a deploy from a test. Mark deploys, releases and anything else that must only run in CI with `gate: false`. The gate reports them as skipped, and skips the jobs that need them too. It warns about a job that always runs because it reads secrets or publishes, unless that job has `gate: false` or `cache: false`.
 
 Paths you leave out go unnoticed, so list everything the job reads. `*` doesn't cross `/`, so `*.rs` only matches files at the root. Use `**/*.rs`, and wrkflw warns about a wildcard path with no `/`. `.github/actions/**`, `.gitea/actions/**`, this file and the directory of each local action the job uses, such as `uses: ./tools/release`, always count.
 

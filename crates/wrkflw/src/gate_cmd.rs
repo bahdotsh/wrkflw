@@ -220,6 +220,7 @@ fn run_args(ctx: &GateCtx, file: &Path) -> Vec<String> {
         "--reuse-results".to_string(),
         "--job-container".to_string(),
         "--dep-cache".to_string(),
+        "--gate-mode".to_string(),
         "--intent".to_string(),
         "wrkflw gate".to_string(),
         "--skip-exit-code".to_string(),
@@ -454,6 +455,7 @@ mod tests {
             "--reuse-results",
             "--job-container",
             "--dep-cache",
+            "--gate-mode",
         ] {
             assert!(args.iter().any(|arg| arg == flag), "{}", flag);
         }

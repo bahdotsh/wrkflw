@@ -53,6 +53,7 @@ pub(crate) struct RunCtx {
     pub(crate) remote_cache: Option<String>,
     pub(crate) cache_push: bool,
     pub(crate) skip_exit_code: Option<i32>,
+    pub(crate) gate_mode: bool,
 }
 
 /// A credential from the environment, so it never has to be in `argv`.
@@ -73,6 +74,7 @@ fn acceleration_for(
         push_results: ctx.cache_push,
         signing_key: secret_from_env(crate::cli_secrets::SIGNING_KEY),
         remote_token: secret_from_env(crate::cli_secrets::REMOTE_TOKEN),
+        gate: ctx.gate_mode,
     }
 }
 

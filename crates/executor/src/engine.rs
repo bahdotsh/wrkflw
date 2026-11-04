@@ -2596,6 +2596,15 @@ async fn execute_job_with_matrix(
                 })
                 .collect());
         }
+        acceleration::Decision::Skip { reason } => {
+            wrkflw_logging::info(&format!(
+                "{} Skipping job '{}': {}",
+                wrkflw_logging::symbols::SKIPPED,
+                job_name,
+                reason
+            ));
+            return Ok(vec![JobResult::skipped(job_name, job_name, reason)]);
+        }
         acceleration::Decision::Run { key } => key,
     };
     // Held for the whole job, across its matrix legs, as GitHub holds a group.

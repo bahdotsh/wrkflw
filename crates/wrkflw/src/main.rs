@@ -394,6 +394,10 @@ enum Commands {
         /// `gate` can tell a skip from a pass
         #[arg(long, hide = true, value_name = "CODE")]
         skip_exit_code: Option<i32>,
+
+        /// Run as `gate` does: skip jobs .wrkflw/affected.yml marks `gate: false`
+        #[arg(long, hide = true)]
+        gate_mode: bool,
     },
 
     /// Run what a push would run, and fail if any of it fails.
@@ -1060,6 +1064,7 @@ async fn run_cli() {
             remote_cache,
             cache_push,
             skip_exit_code,
+            gate_mode,
         }) => {
             run_workflow_cmd::run(run_workflow_cmd::RunCtx {
                 path: path.clone(),
@@ -1093,6 +1098,7 @@ async fn run_cli() {
                 remote_cache: remote_cache.clone(),
                 cache_push: *cache_push,
                 skip_exit_code: *skip_exit_code,
+                gate_mode: *gate_mode,
             })
             .await;
         }

@@ -366,6 +366,33 @@ jobs:
     assert_eq!(stdout.matches("Reuse result").count(), 2, "{}", stdout);
 }
 
+const DEPLOY: &str = r#"
+name: ci
+on: push
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo check >> LOG
+  deploy:
+    runs-on: ubuntu-latest
+    needs: check
+    steps:
+      - run: echo deploy >> LOG; exit 1
+"#;
+
+#[test]
+fn the_gate_leaves_a_job_to_ci_when_the_sidecar_says_so() {
+    let repo = Repo::new(DEPLOY, Some("jobs:\n  deploy: {gate: false}\n"));
+    let gate = ["gate", "--runtime", "emulation", "--diff-base", "HEAD"];
+    let output = repo.wrkflw(&gate);
+    assert_ok(&output);
+    assert_eq!(repo.take_ran(), ["check"]);
+    // A plain run still runs it.
+    assert!(!repo.run(&[]).status.success());
+    assert_eq!(repo.take_ran(), ["check", "deploy"]);
+}
+
 #[test]
 fn a_step_never_sees_the_cache_credentials() {
     let workflow = "name: ci\non: push\njobs:\n  peek:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo \"${WRKFLW_CACHE_SIGNING_KEY:-none} ${WRKFLW_REMOTE_CACHE_TOKEN:-none}\" >> LOG\n";

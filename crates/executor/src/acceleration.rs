@@ -146,6 +146,9 @@ pub struct Acceleration {
     pub signing_key: Option<Secret>,
     /// Bearer token for an `https://` remote.
     pub remote_token: Option<Secret>,
+    /// This run is `wrkflw gate`'s: jobs the sidecar marks `gate: false` are
+    /// skipped and left to CI.
+    pub gate: bool,
 }
 
 /// Why a remote cache setting can't be used.
@@ -475,8 +478,10 @@ impl RunState {
         preserve_containers: bool,
         root: PathBuf,
     ) -> Result<Self, String> {
+        // The CLI validates first, to fail in its output format before the run
+        // is recorded. This covers library callers that build the config.
         validate_remote(&accel)?;
-        let sidecar = if accel.reuse_results || accel.changed_files.is_some() {
+        let sidecar = if accel.reuse_results || accel.changed_files.is_some() || accel.gate {
             warn_outside_repo_root(&root);
             Some(Sidecar::load(&root)?)
         } else {
@@ -577,6 +582,8 @@ pub(crate) enum Decision {
     Run { key: Option<String> },
     /// Don't run it: this result stands.
     Reuse { jobs: Vec<StoredJob>, why: Reused },
+    /// Don't run it, and report it skipped, as a false `if:` would.
+    Skip { reason: String },
 }
 
 /// Why a job's earlier result stands in for running it.
@@ -677,18 +684,30 @@ pub(crate) async fn decide(lookup: Lookup<'_>) -> Decision {
     let Some(run) = run else {
         return run_it;
     };
+    let hints = run.hints(lookup.job_name);
+    if run.accel.gate && hints.is_some_and(|h| !h.gate) {
+        return Decision::Skip {
+            reason: format!("gate: false in {}, so it's left to CI", SIDECAR_PATH),
+        };
+    }
     // A key is needed to reuse a result, and also to publish one: a trusted
     // CI that always runs fresh still has to file what it ran.
     let wants_key = run.accel.reuse_results || run.accel.push_results;
     if !(wants_key || run.accel.changed_files.is_some()) || lookup.partial {
         return run_it;
     }
-    let hints = run.hints(lookup.job_name);
     if let Some(reason) = uncacheable_reason(lookup.job, lookup.workflow, hints) {
         wrkflw_logging::info(&format!(
             "Job '{}' always runs: {}",
             lookup.job_name, reason
         ));
+        if run.accel.gate && hints.is_none_or(|h| h.cache) {
+            wrkflw_logging::warning(&format!(
+                "Job '{}' runs on every push from here, with this machine's credentials. \
+                 If it deploys or publishes, set `gate: false` for it in {}",
+                lookup.job_name, SIDECAR_PATH
+            ));
+        }
         return run_it;
     }
     let patterns = match input_patterns(lookup.job, hints) {
@@ -820,7 +839,10 @@ mod tests {
         tree: &TreeHashes,
         paths: Option<Vec<String>>,
     ) -> String {
-        let hints = JobHints { paths, cache: true };
+        let hints = JobHints {
+            paths,
+            ..Default::default()
+        };
         let patterns = input_patterns(job_def, Some(&hints)).unwrap();
         let empty_env = HashMap::new();
         let empty_outputs = HashMap::new();
@@ -1159,6 +1181,7 @@ jobs:
         let hints = JobHints {
             paths: None,
             cache: false,
+            ..Default::default()
         };
         let reason = uncacheable_reason(&job("steps:\n  - run: x\n"), &workflow(), Some(&hints));
         assert_eq!(reason, Some("cache: false in the sidecar"));
@@ -1192,6 +1215,7 @@ jobs:
         let hints = JobHints {
             paths: Some(vec!["src/**".to_string()]),
             cache: true,
+            ..Default::default()
         };
         let none = HashSet::new();
         let docs = ["docs/a.md".to_string()];
@@ -1223,6 +1247,7 @@ jobs:
         let hints = JobHints {
             paths: Some(vec!["src/**".to_string()]),
             cache: true,
+            ..Default::default()
         };
         let changed = [".github/workflows/ci.yml".to_string()];
         assert!(!unaffected(
@@ -1241,6 +1266,7 @@ jobs:
         let hints = JobHints {
             paths: Some(vec!["src/**".to_string()]),
             cache: true,
+            ..Default::default()
         };
         let docs = ["docs/a.md".to_string()];
         let dependent = job("needs: build\nsteps:\n  - run: x\n");
@@ -1309,6 +1335,7 @@ jobs:
         let hints = JobHints {
             paths: Some(vec!["src/**".to_string()]),
             cache: true,
+            ..Default::default()
         };
         let docs = ["docs/a.md".to_string()];
         let after_failure = job("needs: build\nif: always()\nsteps:\n  - run: x\n");
@@ -1408,6 +1435,31 @@ jobs:
                 yaml
             );
         }
+    }
+
+    #[tokio::test]
+    async fn the_gate_skips_a_job_the_sidecar_leaves_to_ci() {
+        let dir = repo();
+        std::fs::create_dir_all(dir.path().join(".wrkflw")).unwrap();
+        std::fs::write(dir.path().join(SIDECAR_PATH), "jobs:\n  a: {gate: false}\n").unwrap();
+        let results = TempDir::new().unwrap();
+        let gate = Acceleration {
+            reuse_results: true,
+            gate: true,
+            ..Default::default()
+        };
+        assert!(matches!(
+            decide_in(dir.path(), results.path(), &gate).await,
+            Decision::Skip { .. }
+        ));
+        let plain = Acceleration {
+            gate: false,
+            ..gate
+        };
+        assert!(matches!(
+            decide_in(dir.path(), results.path(), &plain).await,
+            Decision::Run { .. }
+        ));
     }
 
     #[test]

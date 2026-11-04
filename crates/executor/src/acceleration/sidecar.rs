@@ -7,15 +7,32 @@ use std::collections::HashMap;
 use std::path::Path;
 
 /// One job's entry in `.wrkflw/affected.yml`.
-#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct JobHints {
     /// Globs of the files this job reads, relative to the repository root.
     #[serde(default)]
     pub paths: Option<Vec<String>>,
-    /// False never reuses this job, for a job with effects wrkflw can't see.
+    /// False means this job always runs: never reused from a stored result
+    /// and never skipped as unaffected. For a job with effects wrkflw can't
+    /// see.
     #[serde(default = "default_true")]
     pub cache: bool,
+    /// False leaves this job to CI: `wrkflw gate` skips it, as it would a
+    /// job whose `if:` is false. For a deploy, a release, or anything else
+    /// that must not run from a developer's machine on every push.
+    #[serde(default = "default_true")]
+    pub gate: bool,
+}
+
+impl Default for JobHints {
+    fn default() -> Self {
+        Self {
+            paths: None,
+            cache: true,
+            gate: true,
+        }
+    }
 }
 
 fn default_true() -> bool {
@@ -52,9 +69,7 @@ impl Sidecar {
             Err(e) => Err(format!("cannot read {}: {}", SIDECAR_PATH, e)),
         }
     }
-}
 
-impl Sidecar {
     /// `(job, path)` for each path with a wildcard but no `/`. `*` never
     /// crosses a separator, so `*.rs` misses `src/a.rs`, and a missed input
     /// is a job skipped that should have run.
@@ -73,5 +88,19 @@ impl Sidecar {
             .collect();
         found.sort();
         found
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_job_is_cached_and_gated_unless_the_sidecar_says_otherwise() {
+        let sidecar: Sidecar =
+            serde_yaml::from_str("jobs:\n  a: {}\n  deploy: {gate: false}\n").unwrap();
+        assert_eq!(sidecar.jobs["a"], JobHints::default());
+        assert!(sidecar.jobs["deploy"].cache);
+        assert!(!sidecar.jobs["deploy"].gate);
     }
 }

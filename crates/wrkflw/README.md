@@ -22,7 +22,7 @@ cargo install wrkflw
 ### Quick start
 
 ```bash
-# Launch the TUI (auto-loads .gitea/workflows if it exists, else .github/workflows)
+# Launch the TUI (auto-loads .gitea/workflows and .github/workflows, whichever exist)
 wrkflw
 
 # Validate all workflows in the default directory
@@ -67,7 +67,7 @@ wrkflw tui --runtime podman
 ### Commands
 
 - **validate**: Validate workflow/pipeline files and/or directories
-  - GitHub (default): `.gitea/workflows` if it exists, else `.github/workflows`
+  - GitHub (default): `.gitea/workflows` and `.github/workflows`, whichever exist
   - GitLab: `.gitlab-ci.yml` or files ending with `gitlab-ci.yml`
   - Accepts multiple paths in a single invocation
   - Exit code behavior (by default): `1` when any validation failure is detected
@@ -109,6 +109,7 @@ Global flags: `--format json` (stdout carries only JSON, logs go to stderr), `--
 - **GITLAB_TOKEN**: Required for `trigger-gitlab` (api scope)
 - **WRKFLW_PLATFORM**, **WRKFLW_THEME**, **WRKFLW_K8S_\***: Defaults for `--platform`, `--theme` and the `--k8s-*` flags
 - **WRKFLW_AGENT**, **WRKFLW_SESSION**, **WRKFLW_INTENT**: Recorded on each run
+- **WRKFLW_REMOTE_CACHE**: Default for `--remote-cache`
 - **WRKFLW_CACHE_SIGNING_KEY**, **WRKFLW_REMOTE_CACHE_TOKEN**: Sign and authenticate a `--remote-cache`
 
 ### Exit codes

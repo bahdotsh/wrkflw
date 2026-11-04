@@ -11,8 +11,8 @@ The execution engine that runs GitHub Actions, Gitea and GitLab CI workflows loc
 - Job-level `container:` directive support, `services:` on Docker and Podman with health checks, and `--platform` image overrides for `runs-on`
 - Job-level `continue-on-error` (also as an expression) and job-level `concurrency:` groups within a run
 - Matrices computed by expressions, including from an earlier job's outputs
-- Result reuse (`reuse_results`): a job whose fingerprint matches a passing run is skipped, with its outputs replayed, from a local store or a signed remote cache
-- Affected-job skipping from `.wrkflw/affected.yml`, one container per job (`job_container`) and shared dependency caches (`dep_cache`)
+- Result reuse (`acceleration.reuse_results`): a job whose fingerprint matches a passing run is skipped, with its outputs replayed, from a local store or a signed remote cache
+- Affected-job skipping from `.wrkflw/affected.yml`, one container per job (`acceleration.job_container`) and shared dependency caches (`acceleration.dep_cache`)
 - GitLab CI pipelines, including `parallel`, `parallel:matrix`, `rules`, `when` and stages
 - Local `actions/upload-artifact`, `actions/download-artifact`, and `actions/cache` via shared artifact and cache stores
 - Reusable workflow execution (`jobs.<id>.uses`, local or `owner/repo/path@ref`) with output aggregation into `needs.<id>.outputs.*`

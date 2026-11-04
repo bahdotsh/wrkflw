@@ -48,7 +48,7 @@ pub fn render_help_content(f: &mut Frame<'_>, area: Rect, scroll_offset: usize) 
     left_lines.extend(section_header("NAVIGATION"));
     left_lines.push(Line::from(""));
     left_lines.push(key_line("Tab / Shift+Tab", "Switch between tabs"));
-    left_lines.push(key_line("1-7", "Jump to tab by number"));
+    left_lines.push(key_line("1-8", "Jump to tab by number"));
     left_lines.push(key_line("w,x,l,h", "Workflows / Execution / Logs / Help"));
     left_lines.push(key_line("\u{2191}/\u{2193} or k/j", "Navigate lists"));
     left_lines.push(key_line("Enter", "Select / View details"));

@@ -651,7 +651,7 @@ enum McpCommand {
     Serve,
     /// Register the server with coding agents: every one found, or those named
     Install {
-        /// Agents to register with. Defaults to every one whose CLI or config directory exists
+        /// Agents to register with. Defaults to every one whose CLI or config directory exists. A named agent gets its config file created if needed
         #[arg(value_enum)]
         clients: Vec<mcp_install::Client>,
         /// Show what would change without changing anything. Exits 1, like a real run,

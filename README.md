@@ -361,10 +361,15 @@ wrkflw mcp install --dry-run  # show what would change
 | Gemini CLI | `gemini` | `~/.gemini/settings.json` |
 | opencode | `opencode` | `~/.config/opencode/opencode.json` |
 | Claude Desktop | `claude-desktop` | `claude_desktop_config.json`, with the absolute path to `wrkflw`. Restart Claude Desktop afterwards |
+| GitHub Copilot CLI | `copilot` | `~/.copilot/mcp-config.json`, or under `$COPILOT_HOME` |
+| Grok Build | `grok` | Runs `grok mcp add` |
+| Kiro CLI | `kiro` | `~/.kiro/settings/mcp.json`, or under `$KIRO_HOME`, with the absolute path to `wrkflw` |
+| pi | `pi` | `~/.pi/agent/mcp.json`, or under `$PI_CODING_AGENT_DIR` |
+| Zed | `zed` | `context_servers` in Zed's `settings.json` |
 
-An agent counts as installed when its CLI is on `PATH` or its config directory exists. A config file with comments is reported rather than rewritten, so add the entry by hand there. For any other client, add a stdio server named `wrkflw` that runs `wrkflw mcp serve`.
+Without names, `install` sets up every agent whose CLI is on `PATH` or whose config directory exists. A named agent gets its config file even if it doesn't exist yet, so you can set up wrkflw before the agent's first run. Config files are edited in place, so comments, trailing commas and formatting are kept. For any other client, add a stdio server named `wrkflw` that runs `wrkflw mcp serve`.
 
-Runs record which agent started them and from which session. The agent comes from `--agent` or `WRKFLW_AGENT`, or is detected from `AI_AGENT` and what Claude Code, Codex, Gemini CLI, opencode, Cursor and Augment set. The session comes from `--session` or `WRKFLW_SESSION`, or from `CLAUDE_CODE_SESSION_ID` or `CODEX_THREAD_ID`. Filter on either with `wrkflw runs list --agent claude-code --session <id>`.
+Runs record which agent started them and from which session. The agent comes from `--agent` or `WRKFLW_AGENT`, or is detected from `AI_AGENT` and what Claude Code, Codex, Gemini CLI, opencode, Cursor and Augment set. Other agents, such as Kiro, Grok Build, pi and Copilot CLI, set nothing wrkflw can rely on, so set `WRKFLW_AGENT` in their environment. The session comes from `--session` or `WRKFLW_SESSION`, or from `CLAUDE_CODE_SESSION_ID` or `CODEX_THREAD_ID`. Filter on either with `wrkflw runs list --agent claude-code --session <id>`.
 
 The TUI's Runs tab shows the same history, including which agent started each run and why. See [AGENTS.md](AGENTS.md) for the output contract, and `skills/wrkflw` for a Claude Code skill.
 

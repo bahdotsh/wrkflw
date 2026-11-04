@@ -62,6 +62,8 @@ itertools.workspace = true
 once_cell.workspace = true
 walkdir = "2.4"
 which.workspace = true
+jsonc-parser = { version = "0.34", features = ["cst", "serde_json"] }
+toml = "0.9"
 
 [lib]
 name = "wrkflw_lib"

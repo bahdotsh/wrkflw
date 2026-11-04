@@ -1,7 +1,7 @@
 # Codebase Index: wrkflw
 
-> Generated: 2026-11-04 15:38:55 UTC | Files: 242 | Lines: 106831
-> Languages: JSON (4), Markdown (26), Rust (150), Shell (5), TOML (19), YAML (38)
+> Generated: 2026-11-04 18:23:15 UTC | Files: 244 | Lines: 108476
+> Languages: JSON (4), Markdown (27), Rust (151), Shell (5), TOML (19), YAML (38)
 
 ## Directory Structure
 
@@ -92,6 +92,7 @@ wrkflw/
         workflow.rs
     runs/
       Cargo.toml
+      README.md
       src/
         digest.rs
         env.rs
@@ -158,7 +159,6 @@ wrkflw/
           mod.rs
           progress_bar.rs
           progress_dots.rs
-          timing.rs
         handlers/
           mod.rs
           workflow.rs
@@ -167,6 +167,8 @@ wrkflw/
         models/
           mod.rs
         selection.rs
+        stress_tests.rs
+        text.rs
         theme.rs
         utils/
           mod.rs
@@ -352,7 +354,7 @@ wrkflw/
 - `# Run in sandboxed secure emulation`
 - `# Run a specific job`
 - `# Set GitLab pipeline variables, which rules and scripts both see`
-- `# List jobs in a workflow`
+- `# List workflows and their jobs`
 - `# Preserve failed containers for debugging`
 - `# Repeat the flag or separate entries with commas`
 - `# Set it once for every command, including the TUI and watch mode`
@@ -773,6 +775,9 @@ wrkflw/
 - `[target.'cfg(unix)'.dependencies]`
 - `[target.'cfg(windows)'.dependencies]`
 
+**crates/runs/README.md**
+- `## wrkflw-runs`
+
 **crates/runs/src/digest.rs**
 - `pub const DEFAULT_TAIL_LINES: usize = 40`
 - `pub struct FailureDigest`
@@ -1070,14 +1075,13 @@ wrkflw/
 - `pub struct Checkbox`
 
 **crates/ui/src/components/dag.rs**
-- `pub enum NodeState`
 - `pub fn topo_levels(def: &WorkflowDefinition) -> Vec<Vec<String>>`
-- `pub fn render<F: Fn(&str) -> NodeState>( frame: &mut Frame<'_>, area: Rect, def: Option<&WorkflowDefinition>, state_of: F, spinner_frame: usize, )`
+- `pub fn render(frame: &mut Frame<'_>, area: Rect, workflow: &Workflow, spinner_frame: usize)`
+- `pub fn matrix_size_label(matrix: &wrkflw_matrix::MatrixConfig) -> Option<String>`
 
 **crates/ui/src/components/mod.rs**
 - `pub mod dag`
 - `pub mod progress_dots`
-- `pub mod timing`
 
 **crates/ui/src/components/progress_bar.rs**
 - `pub struct ProgressBar`
@@ -1086,10 +1090,6 @@ wrkflw/
 - `pub enum DotState`
 - `pub fn render(frame: &mut Frame<'_>, area: Rect, dots: &[DotState], done: usize, total: usize)`
 - `pub fn synthesise( completed: &[StepStatus], total: usize, workflow_status: &WorkflowStatus, ) -> Vec<DotState>`
-
-**crates/ui/src/components/timing.rs**
-- `pub struct TimingRow<'a>`
-- `pub fn render(frame: &mut Frame<'_>, area: Rect, rows: &[TimingRow])`
 
 **crates/ui/src/handlers/mod.rs**
 - `pub mod workflow`
@@ -1108,6 +1108,7 @@ wrkflw/
 - `pub mod log_processor`
 - `pub mod models`
 - `pub mod selection`
+- `pub mod text`
 - `pub mod theme`
 - `pub mod utils`
 - `pub mod views`
@@ -1122,6 +1123,7 @@ wrkflw/
 - `pub type ExecutionResultMsg = (usize, Result<(Vec<wrkflw_executor::JobResult>, ()), String>)`
 - `pub enum TriggerMatchStatus`
 - `pub struct Workflow`
+- `pub enum JobState`
 - `pub struct QueuedExecution`
 - `pub enum WorkflowStatus`
 - `pub struct WorkflowExecution`
@@ -1138,6 +1140,16 @@ wrkflw/
 - `pub enum CopyMethod`
 - `pub fn copy_to_clipboard(text: &str) -> io::Result<CopyMethod>`
 
+**crates/ui/src/text.rs**
+- `pub fn width(s: &str) -> usize`
+- `pub fn sanitize(s: &str) -> Cow<'_, str>`
+- `pub fn truncate(s: &str, max: usize) -> Cow<'_, str>`
+- `pub fn truncate_left(s: &str, max: usize) -> Cow<'_, str>`
+- `pub fn fit(s: &str, cells: usize) -> String`
+- `pub fn pad_left(s: &str, cells: usize) -> String`
+- `pub fn spans_width(spans: &[Span<'_>]) -> usize`
+- `pub fn ansi_line(raw: &str, base: Style) -> Line<'static>`
+
 **crates/ui/src/theme.rs**
 - `pub fn set_accent_override(color: Option<Color>)`
 - `pub fn current_accent() -> Color`
@@ -1150,6 +1162,7 @@ wrkflw/
 - `pub static COLORS: ActiveColors = ActiveColors`
 - `pub fn title_style() -> Style`
 - `pub fn selected_style() -> Style`
+- `pub const SELECTED_MARK: &str = "▌ "`
 - `pub fn header_style() -> Style`
 - `pub fn search_highlight() -> Style`
 - `pub fn dim_style() -> Style`
@@ -1160,10 +1173,17 @@ wrkflw/
 - `pub fn workflow_status(status: &WorkflowStatus) -> (&'static str, Style)`
 - `pub fn spinner(frame: usize) -> &'static str`
 - `pub fn workflow_status_animated( status: &WorkflowStatus, spinner_frame: usize, ) -> (&'static str, Style)`
+- `pub fn job_state(state: crate::models::JobState, spinner_frame: usize) -> (&'static str, Style)`
 - `pub fn job_status(status: &JobStatus) -> (&'static str, Style)`
 - `pub fn step_status(status: &StepStatus) -> (&'static str, Style)`
 - `pub fn block<'a>(title: &'a str) -> Block<'a>`
 - `pub fn block_focused<'a>(title: &'a str) -> Block<'a>`
+- `pub fn panel<'a>(title: &'a str, focused: bool) -> Block<'a>`
+- `pub fn with_badge<'a>(block: Block<'a>, badge: impl Into<String>) -> Block<'a>`
+- `pub fn section<'a>(title: impl Into<String>) -> Line<'a>`
+- `pub fn hint_spans<'a>(hints: &[(&str, &str)], max_width: usize) -> Vec<Span<'a>>`
+- `pub fn scrollbar(f: &mut Frame<'_>, area: Rect, total: usize, position: usize, viewport: usize)`
+- `pub fn empty_state(f: &mut Frame<'_>, area: Rect, title: &str, hint: Vec<Span<'_>>)`
 - `pub enum BadgeKind`
 - `pub fn badge_outline<'a>(text: impl Into<String>, kind: BadgeKind) -> Span<'a>`
 - `pub fn badge_solid<'a>(text: impl Into<String>, kind: BadgeKind) -> Span<'a>`
@@ -1177,22 +1197,25 @@ wrkflw/
 - `pub fn load_workflows(dir_path: &Path) -> Vec<Workflow>`
 
 **crates/ui/src/views/dag_tab.rs**
-- `pub fn render_dag_tab(f: &mut Frame<'_>, app: &App, area: Rect)`
+- `pub fn render_dag_tab(f: &mut Frame<'_>, app: &mut App, area: Rect)`
 
 **crates/ui/src/views/execution_tab.rs**
 - `pub fn render_execution_tab(f: &mut Frame<'_>, app: &mut App, area: Rect)`
 
 **crates/ui/src/views/help_overlay.rs**
-- `pub fn render_help_content(f: &mut Frame<'_>, area: Rect, scroll_offset: usize)`
-- `pub fn render_help_overlay(f: &mut Frame<'_>, scroll_offset: usize)`
+- `pub fn render_help_content(f: &mut Frame<'_>, area: Rect, scroll: &mut usize)`
+- `pub fn render_help_overlay(f: &mut Frame<'_>, scroll: &mut usize)`
 
 **crates/ui/src/views/job_detail.rs**
+- `pub const INSPECTOR_TABS: [&str`
 - `pub fn render_job_detail_view(f: &mut Frame<'_>, app: &mut App, area: Rect)`
+- `pub struct StepOutputCache`
 
 **crates/ui/src/views/logs_tab.rs**
-- `pub fn render_logs_tab(f: &mut Frame<'_>, app: &App, area: Rect)`
+- `pub fn render_logs_tab(f: &mut Frame<'_>, app: &mut App, area: Rect)`
 
 **crates/ui/src/views/mod.rs**
+- `pub const INSPECTOR_TABS: usize = job_detail::INSPECTOR_TABS.len()`
 - `pub fn render_ui(f: &mut Frame<'_>, app: &mut App)`
 
 **crates/ui/src/views/runs_tab.rs**
@@ -1316,13 +1339,15 @@ wrkflw/
 
 **crates/wrkflw/README.md**
 - `## WRKFLW (CLI and Library)`
-- `# Launch the TUI (auto-loads .github/workflows)`
+- `# Launch the TUI (auto-loads .gitea/workflows and .github/workflows, whichever exist)`
 - `# Validate all workflows in the default directory`
 - `# Validate a specific file or directory`
 - `# Validate multiple files and/or directories`
-- `# Run a workflow (Docker by default)`
-- `# Use Podman, emulation, or sandboxed secure emulation instead of Docker`
+- `# Run a workflow (auto-detects Docker, then Podman, then falls back to emulation)`
+- `# Pick a runtime explicitly`
 - `# Diff-aware filtering (skip workflows whose on: block doesn't match)`
+- `# Check everything a push would run, reusing what already passed`
+- `# See what a run would do, then explain the last failure`
 - `# Watch for changes and rerun affected workflows`
 - `# Open the TUI explicitly`
 - `# tokio_test::block_on(async {`
@@ -1420,8 +1445,8 @@ wrkflw/
 - `# Testing`
 - `# All tests`
 - `# Unit tests only`
-- `# Integration tests only`
-- `# End-to-end tests only`
+- `# Integration tests of the CLI crate only`
+- `# One integration test file`
 - `# A specific test`
 
 **tests/fixtures/gitlab-ci/advanced.gitlab-ci.yml**
@@ -1633,7 +1658,7 @@ wrkflw/
 
 ## AGENTS.md
 
-**Language:** Markdown | **Size:** 5.8 KB | **Lines:** 74
+**Language:** Markdown | **Size:** 6.0 KB | **Lines:** 75
 
 **Declarations:**
 
@@ -1641,7 +1666,7 @@ wrkflw/
 
 ## BREAKING_CHANGES.md
 
-**Language:** Markdown | **Size:** 16.1 KB | **Lines:** 308
+**Language:** Markdown | **Size:** 17.3 KB | **Lines:** 320
 
 **Declarations:**
 
@@ -1657,7 +1682,7 @@ wrkflw/
 
 ## Cargo.toml
 
-**Language:** TOML | **Size:** 2.5 KB | **Lines:** 81
+**Language:** TOML | **Size:** 2.7 KB | **Lines:** 83
 
 **Declarations:**
 
@@ -1665,7 +1690,7 @@ wrkflw/
 
 ## INDEX.md
 
-**Language:** Markdown | **Size:** 237.1 KB | **Lines:** 8660
+**Language:** Markdown | **Size:** 242.4 KB | **Lines:** 8835
 
 **Declarations:**
 
@@ -1673,7 +1698,7 @@ wrkflw/
 
 ## README.md
 
-**Language:** Markdown | **Size:** 31.1 KB | **Lines:** 512
+**Language:** Markdown | **Size:** 31.9 KB | **Lines:** 516
 
 **Declarations:**
 
@@ -1697,7 +1722,7 @@ wrkflw/
 
 ## crates/README.md
 
-**Language:** Markdown | **Size:** 1.7 KB | **Lines:** 47
+**Language:** Markdown | **Size:** 1.9 KB | **Lines:** 47
 
 **Declarations:**
 
@@ -1752,7 +1777,7 @@ wrkflw/
 
 ## crates/executor/README.md
 
-**Language:** Markdown | **Size:** 1.6 KB | **Lines:** 35
+**Language:** Markdown | **Size:** 2.5 KB | **Lines:** 41
 
 **Declarations:**
 
@@ -2984,7 +3009,7 @@ wrkflw/
 
 ## crates/executor/src/job_session.rs
 
-**Language:** Rust | **Size:** 49.7 KB | **Lines:** 1398
+**Language:** Rust | **Size:** 50.4 KB | **Lines:** 1412
 
 **Imports:**
 - `crate::acceleration`
@@ -3652,7 +3677,7 @@ wrkflw/
 
 ## crates/matrix/README.md
 
-**Language:** Markdown | **Size:** 532 B | **Lines:** 20
+**Language:** Markdown | **Size:** 720 B | **Lines:** 21
 
 **Declarations:**
 
@@ -4118,6 +4143,14 @@ wrkflw/
 ## crates/runs/Cargo.toml
 
 **Language:** TOML | **Size:** 800 B | **Lines:** 28
+
+**Declarations:**
+
+---
+
+## crates/runs/README.md
+
+**Language:** Markdown | **Size:** 1.2 KB | **Lines:** 29
 
 **Declarations:**
 
@@ -5383,7 +5416,7 @@ wrkflw/
 
 ## crates/ui/README.md
 
-**Language:** Markdown | **Size:** 1.1 KB | **Lines:** 28
+**Language:** Markdown | **Size:** 1.7 KB | **Lines:** 42
 
 **Declarations:**
 
@@ -5391,7 +5424,7 @@ wrkflw/
 
 ## crates/ui/src/app/mod.rs
 
-**Language:** Rust | **Size:** 33.1 KB | **Lines:** 736
+**Language:** Rust | **Size:** 39.0 KB | **Lines:** 859
 
 **Imports:**
 - `crate::handlers::workflow::start_next_workflow_execution`
@@ -5404,7 +5437,8 @@ wrkflw/
 }`
 - `crossterm::{
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+        KeyModifiers,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -5413,11 +5447,19 @@ wrkflw/
 - `std::collections::HashMap`
 - `std::io::{self, stdout}`
 - `std::path::PathBuf`
-- *... and 5 more imports*
+- *... and 7 more imports*
 
 **Declarations:**
 
 `mod state`
+
+`static TUI_ACTIVE: AtomicBool = AtomicBool::new(false)`
+
+`static BACKGROUND_PANICS: Mutex<Vec<String>> = Mutex::new(Vec::new())`
+
+`fn install_panic_hook()`
+
+`fn report_background_panics(app: &mut App)`
 
 `fn run_tui_event_loop( terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App, tx_clone: &mpsc::Sender<ExecutionResultMsg>, rx: &mpsc::Receiver<ExecutionResultMsg>, verbose: bool, ) -> io::Result<()>`
 
@@ -5425,7 +5467,7 @@ wrkflw/
 
 ## crates/ui/src/app/state.rs
 
-**Language:** Rust | **Size:** 179.6 KB | **Lines:** 4471
+**Language:** Rust | **Size:** 192.2 KB | **Lines:** 4798
 
 **Imports:**
 - `crate::log_processor::{LogProcessingRequest, LogProcessor, ProcessedLogEntry}`
@@ -5532,6 +5574,8 @@ wrkflw/
 
   `pub fn handle_log_search_input(&mut self, key: KeyCode)`
 
+  `fn restart_log_search(&mut self)`
+
   `pub fn toggle_log_search(&mut self)`
 
   `pub fn toggle_log_filter(&mut self)`
@@ -5547,6 +5591,14 @@ wrkflw/
   `pub fn scroll_logs_up(&mut self)`
 
   `pub fn scroll_logs_down(&mut self)`
+
+  `pub fn scroll_logs_by(&mut self, delta: isize)`
+
+  `pub fn sync_log_cursor(&mut self)`
+
+  `pub fn scroll_logs_to_start(&mut self)`
+
+  `pub fn scroll_logs_to_end(&mut self)`
 
   `pub fn scroll_help_up(&mut self)`
 
@@ -5574,6 +5626,8 @@ wrkflw/
 
   `pub fn check_log_processing_updates(&mut self)`
 
+  `pub(crate) fn apply_log_update( &mut self, processed: Vec<crate::log_processor::ProcessedLogEntry>, matches: Vec<usize>, )`
+
   `pub fn mark_logs_for_update(&mut self)`
 
   `pub fn get_combined_logs(&self) -> Vec<String>`
@@ -5594,9 +5648,13 @@ wrkflw/
 
   `pub fn trigger_tab_target(&mut self) -> &TriggerTarget`
 
+  `pub fn inspecting_output(&self) -> bool`
+
   `pub fn trigger_editing(&self) -> bool`
 
   `pub fn trigger_tab_add_input(&mut self)`
+
+  `pub fn trigger_tab_edit_inputs(&mut self)`
 
   `pub fn trigger_tab_edit_branch(&mut self)`
 
@@ -5716,10 +5774,12 @@ wrkflw/
 
 ## crates/ui/src/components/dag.rs
 
-**Language:** Rust | **Size:** 6.4 KB | **Lines:** 205
+**Language:** Rust | **Size:** 4.5 KB | **Lines:** 133
 
 **Imports:**
-- `crate::theme::{self, BadgeKind, COLORS}`
+- `crate::models::{JobState, Workflow}`
+- `crate::text`
+- `crate::theme::{self, COLORS}`
 - `ratatui::{
     layout::Rect,
     style::{Modifier, Style},
@@ -5732,17 +5792,11 @@ wrkflw/
 
 **Declarations:**
 
-`fn state_color(s: NodeState) -> ratatui::style::Color`
-
-`fn state_glyph(s: NodeState, spinner_frame: usize) -> &'static str`
-
-`fn truncate(s: &str, n: usize) -> String`
-
 ---
 
 ## crates/ui/src/components/mod.rs
 
-**Language:** Rust | **Size:** 244 B | **Lines:** 13
+**Language:** Rust | **Size:** 228 B | **Lines:** 12
 
 **Imports:**
 - `pub use button::Button`
@@ -5812,33 +5866,6 @@ wrkflw/
 
 ---
 
-## crates/ui/src/components/timing.rs
-
-**Language:** Rust | **Size:** 3.4 KB | **Lines:** 112
-
-**Imports:**
-- `crate::theme::COLORS`
-- `ratatui::{
-    layout::Rect,
-    style::{Modifier, Style},
-    text::{Line, Span},
-    widgets::Paragraph,
-    Frame,
-}`
-- `wrkflw_executor::JobStatus`
-
-**Declarations:**
-
-`fn bar_props(s: Option<JobStatus>) -> (ratatui::style::Color, f32)`
-
-`fn pad_right(s: &str, n: usize) -> String`
-
-`fn pad_left(s: &str, n: usize) -> String`
-
-`fn summarise(rows: &[TimingRow]) -> String`
-
----
-
 ## crates/ui/src/handlers/mod.rs
 
 **Language:** Rust | **Size:** 42 B | **Lines:** 3
@@ -5872,7 +5899,7 @@ wrkflw/
 
 ## crates/ui/src/lib.rs
 
-**Language:** Rust | **Size:** 1.1 KB | **Lines:** 38
+**Language:** Rust | **Size:** 1.2 KB | **Lines:** 43
 
 **Imports:**
 - `pub use app::run_wrkflw_tui`
@@ -5881,11 +5908,13 @@ wrkflw/
 
 **Declarations:**
 
+`mod stress_tests`
+
 ---
 
 ## crates/ui/src/log_processor.rs
 
-**Language:** Rust | **Size:** 11.5 KB | **Lines:** 340
+**Language:** Rust | **Size:** 11.7 KB | **Lines:** 345
 
 **Imports:**
 - `crate::models::{LogBadge, LogFilterLevel}`
@@ -5935,7 +5964,7 @@ wrkflw/
 
 ## crates/ui/src/models/mod.rs
 
-**Language:** Rust | **Size:** 11.0 KB | **Lines:** 315
+**Language:** Rust | **Size:** 13.2 KB | **Lines:** 387
 
 **Imports:**
 - `chrono::Local`
@@ -5946,6 +5975,16 @@ wrkflw/
 - `wrkflw_parser::workflow::WorkflowDefinition`
 
 **Declarations:**
+
+**`impl JobExecution`**
+  `pub fn is_for(&self, key: &str) -> bool`
+
+
+**`impl Workflow`**
+  `pub fn job_state(&self, key: &str) -> JobState`
+
+  `pub fn unreported_jobs(&self) -> Vec<&str>`
+
 
 **`impl LogBadge`**
   `pub fn classify(log: &str) -> Self`
@@ -6013,15 +6052,102 @@ wrkflw/
 
 ---
 
+## crates/ui/src/stress_tests.rs
+
+**Language:** Rust | **Size:** 14.1 KB | **Lines:** 404
+
+**Imports:**
+- `crate::app::App`
+- `crate::log_processor::ProcessedLogEntry`
+- `crate::models::{
+    JobExecution, StepExecution, TriggerMatchStatus, Workflow, WorkflowExecution, WorkflowStatus,
+}`
+- `crate::theme`
+- `crate::views::{self, TAB_COUNT, TAB_EXECUTION, TAB_WORKFLOWS}`
+- `ratatui::{backend::TestBackend, text::Span, Terminal}`
+- `std::collections::HashMap`
+- `std::path::PathBuf`
+- `std::sync::{mpsc, Arc}`
+- `wrkflw_executor::{JobStatus, RuntimeType, StepStatus}`
+
+**Declarations:**
+
+`const SIZES: &[(u16, u16)] = &[ (1, 1), (2, 2), (5, 3), (10, 5), (3, 80), (80, 3), (20, 8), (40, 12), (60, 20), (80, 24), (100, 30), (120, 40), (200, 60), (300, 100), ]`
+
+`const NASTY: &[&str] = &[ "", "a", "日本語のワークフロー名前がとても長い場合", "🚀🔥 emoji-heavy ✨ workflow 🎉", "tab\tseparated\tname", "a-really-really-really-really-really-really-really-really-long-workflow-name-that-never-ends", "e\u`
+
+`fn big_definition( dir: &std::path::Path, jobs: usize, ) -> Arc<wrkflw_parser::workflow::WorkflowDefinition>`
+
+`fn parse_big( dir: &std::path::Path, jobs: usize, ) -> Arc<wrkflw_parser::workflow::WorkflowDefinition>`
+
+`fn execution(jobs: usize, steps: usize) -> WorkflowExecution`
+
+`fn app(workflows: usize, dir: &std::path::Path) -> App`
+
+`type Scenario = (&'static str, fn(&mut App))`
+
+`fn scenarios() -> Vec<Scenario>`
+
+`fn render(app: &mut App, w: u16, h: u16)`
+
+`fn every_screen_renders_at_every_size_without_panicking()`
+
+`fn screen_text(terminal: &Terminal<TestBackend>) -> String`
+
+`fn inspector_reaches_the_tail_of_output_longer_than_a_u16_scroll()`
+
+`fn dump_screens()`
+
+---
+
+## crates/ui/src/text.rs
+
+**Language:** Rust | **Size:** 13.2 KB | **Lines:** 380
+
+**Imports:**
+- `crate::theme::COLORS`
+- `ratatui::{
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+}`
+- `std::borrow::Cow`
+- `unicode_width::{UnicodeWidthChar, UnicodeWidthStr}`
+
+**Declarations:**
+
+`const ELLIPSIS: char = '…'`
+
+`const TAB_STOP: usize = 4`
+
+`fn apply_sgr(mut style: Style, base: Style, params: &str) -> Style`
+
+`fn apply_code(style: Style, base: Style, code: u16) -> Style`
+
+`fn set_color(style: Style, code: u16, color: Option<Color>) -> Style`
+
+`fn indexed(v: u16) -> Color`
+
+`fn rgb_color(r: u16, g: u16, b: u16) -> Color`
+
+`fn ansi_color(n: u16) -> Color`
+
+`mod tests`
+
+---
+
 ## crates/ui/src/theme.rs
 
-**Language:** Rust | **Size:** 18.6 KB | **Lines:** 578
+**Language:** Rust | **Size:** 23.3 KB | **Lines:** 717
 
 **Imports:**
 - `ratatui::{
+    layout::{Margin, Rect},
     style::{Color, Modifier, Style},
-    text::Span,
-    widgets::{Block, BorderType, Borders},
+    text::{Line, Span},
+    widgets::{
+        Block, BorderType, Borders, Padding, Scrollbar, ScrollbarOrientation, ScrollbarState,
+    },
+    Frame,
 }`
 - `std::cell::Cell`
 - `std::ops::Deref`
@@ -6084,12 +6210,139 @@ wrkflw/
 
 ## crates/ui/src/views/dag_tab.rs
 
-**Language:** Rust | **Size:** 16.9 KB | **Lines:** 471
+**Language:** Rust | **Size:** 12.4 KB | **Lines:** 388
 
 **Imports:**
 - `crate::app::App`
-- `crate::components::dag::{self, NodeState}`
-- `crate::models::WorkflowStatus`
+- `crate::components::dag::{self, matrix_size_label}`
+- `crate::models::{JobState, Workflow}`
+- `crate::text`
+- `crate::theme::{self, COLORS}`
+- `ratatui::{
+    layout::{Constraint, Direction, Layout, Rect},
+    style::{Modifier, Style},
+    text::{Line, Span},
+    widgets::Paragraph,
+    Frame,
+}`
+- `std::collections::HashMap`
+- `std::sync::Arc`
+- `wrkflw_parser::workflow::WorkflowDefinition`
+
+**Declarations:**
+
+`type MatrixLabels = HashMap<String, String>`
+
+`const MIN_CARD_W: u16 = 16`
+
+`const MAX_CARD_W: u16 = 28`
+
+`const GAP: u16 = 3`
+
+`const CARD_H: u16 = 3`
+
+`fn matrix_suffix(labels: &MatrixLabels, job: &str) -> String`
+
+`fn title(workflow: &Workflow) -> String`
+
+`fn state_color(state: JobState) -> ratatui::style::Color`
+
+`fn render_graph( f: &mut Frame<'_>, app: &App, workflow: &Workflow, def: &WorkflowDefinition, labels: &MatrixLabels, levels: &[Vec<String>], area: Rect, ) -> usize`
+
+`fn render_card( f: &mut Frame<'_>, app: &App, workflow: &Workflow, labels: &MatrixLabels, name: &str, area: Rect, )`
+
+`fn render_list( f: &mut Frame<'_>, app: &App, workflow: &Workflow, def: &WorkflowDefinition, labels: &MatrixLabels, levels: &[Vec<String>], area: Rect, ) -> usize`
+
+`fn render_legend(f: &mut Frame<'_>, app: &App, area: Rect)`
+
+---
+
+## crates/ui/src/views/execution_tab.rs
+
+**Language:** Rust | **Size:** 17.9 KB | **Lines:** 513
+
+**Imports:**
+- `crate::app::App`
+- `crate::components::dag`
+- `crate::models::{JobExecution, JobState, Workflow, WorkflowStatus}`
+- `crate::text`
+- `crate::theme::{self, BadgeKind, COLORS}`
+- `ratatui::{
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    style::{Modifier, Style},
+    text::{Line, Span},
+    widgets::Paragraph,
+    Frame,
+}`
+- `wrkflw_executor::{JobStatus, StepStatus}`
+
+**Declarations:**
+
+`fn selected_job<'a>(app: &App, workflow: &'a Workflow) -> Option<&'a JobExecution>`
+
+`fn render_summary_strip(f: &mut Frame<'_>, app: &App, workflow: &Workflow, area: Rect)`
+
+`pub(crate) fn format_duration(secs: i64) -> String`
+
+`struct Counts`
+> Fields: `passed: usize`, `failed: usize`, `skipped: usize`, `pending: usize`
+
+`fn job_counts(workflow: &Workflow) -> Counts`
+
+`fn render_jobs_pane(f: &mut Frame<'_>, app: &App, workflow: &Workflow, area: Rect)`
+
+`fn render_steps_pane( f: &mut Frame<'_>, workflow: &Workflow, job: Option<&JobExecution>, area: Rect, )`
+
+`pub(crate) fn step_line(i: usize, step: &crate::models::StepExecution, w: usize) -> Line<'static>`
+
+`fn render_output_pane(f: &mut Frame<'_>, app: &App, area: Rect)`
+
+`fn render_dag_pane(f: &mut Frame<'_>, app: &App, workflow: &Workflow, area: Rect)`
+
+`fn render_results_pane(f: &mut Frame<'_>, workflow: &Workflow, area: Rect)`
+
+`fn active_job_execution(workflow: &Workflow) -> Option<&JobExecution>`
+
+`fn render_empty_state(f: &mut Frame<'_>, area: Rect)`
+
+`mod tests`
+
+---
+
+## crates/ui/src/views/help_overlay.rs
+
+**Language:** Rust | **Size:** 7.0 KB | **Lines:** 211
+
+**Imports:**
+- `crate::text`
+- `crate::theme::{self, COLORS}`
+- `ratatui::{
+    layout::{Constraint, Direction, Layout, Rect},
+    style::{Modifier, Style},
+    text::{Line, Span},
+    widgets::{Clear, Paragraph},
+    Frame,
+}`
+
+**Declarations:**
+
+`type Section = (&'static str, Vec<(String, &'static str)>)`
+
+`fn sections() -> Vec<Section>`
+
+`const KEY_W: usize = 17`
+
+`fn section_lines(section: &Section, w: usize) -> Vec<Line<'static>>`
+
+---
+
+## crates/ui/src/views/job_detail.rs
+
+**Language:** Rust | **Size:** 20.3 KB | **Lines:** 576
+
+**Imports:**
+- `crate::app::App`
+- `crate::text`
 - `crate::theme::{self, BadgeKind, COLORS}`
 - `ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
@@ -6099,132 +6352,29 @@ wrkflw/
     Frame,
 }`
 - `wrkflw_executor::JobStatus`
-- `wrkflw_parser::workflow::WorkflowDefinition`
 
 **Declarations:**
 
-`fn render_empty_state(f: &mut Frame<'_>, area: Rect, msg: &str)`
+`const MAX_OUTPUT_LINES: usize = 5000`
 
-`fn render_header(f: &mut Frame<'_>, app: &App, workflow: &crate::models::Workflow, area: Rect)`
+**`impl StepOutputCache`**
+  `fn build(key: (u64, usize, usize, usize), output: &str) -> Self`
 
-`fn state_for_job( app: &App, workflow: &crate::models::Workflow, workflow_idx: usize, name: &str, ) -> NodeState`
+  `fn measure(&mut self, width: u16)`
 
-`fn render_graph( f: &mut Frame<'_>, app: &App, def: &WorkflowDefinition, workflow: &crate::models::Workflow, workflow_idx: usize, area: Rect, )`
+  `fn locate(&self, row: usize) -> (usize, usize)`
 
-`fn render_topo_list( f: &mut Frame<'_>, app: &App, def: &WorkflowDefinition, workflow: &crate::models::Workflow, workflow_idx: usize, area: Rect, )`
 
-`fn render_legend(f: &mut Frame<'_>, app: &App, area: Rect)`
+`struct OutputSource<'a>`
+> Fields: `key: Option<(u64, usize, usize, usize)>`, `scroll_back: usize`, `cache: &'a mut Option<StepOutputCache>`
 
-`fn truncate(s: &str, n: usize) -> String`
+`fn render_header( f: &mut Frame<'_>, workflow_name: &str, job: &crate::models::JobExecution, active_tab: usize, area: Rect, )`
 
-`fn matrix_size_label(matrix: &wrkflw_matrix::MatrixConfig) -> Option<String>`
-
----
-
-## crates/ui/src/views/execution_tab.rs
-
-**Language:** Rust | **Size:** 16.7 KB | **Lines:** 468
-
-**Imports:**
-- `crate::app::App`
-- `crate::components::{
-    dag,
-    progress_dots::{self, DotState},
-    timing::{self, TimingRow},
-}`
-- `crate::models::WorkflowStatus`
-- `crate::theme::{self, BadgeKind, COLORS}`
-- `ratatui::{
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
-    style::{Modifier, Style},
-    text::{Line, Span},
-    widgets::{Paragraph, Wrap},
-    Frame,
-}`
-- `wrkflw_executor::{JobStatus, RuntimeType, StepStatus}`
-
-**Declarations:**
-
-`const RIGHT_PANE_WIDTH: u16 = 40`
-
-`const LEFT_PANE_WIDTH: u16 = 30`
-
-`fn render_summary_strip(f: &mut Frame<'_>, app: &App, idx: usize, area: Rect)`
-
-`fn render_jobs_pane(f: &mut Frame<'_>, app: &App, idx: usize, area: Rect)`
-
-`fn render_steps_pane(f: &mut Frame<'_>, workflow: &crate::models::Workflow, area: Rect)`
-
-`fn render_live_output_pane(f: &mut Frame<'_>, app: &App, area: Rect)`
-
-`fn render_dag_pane(f: &mut Frame<'_>, app: &App, idx: usize, area: Rect)`
-
-`fn render_timing_pane(f: &mut Frame<'_>, workflow: &crate::models::Workflow, area: Rect)`
-
-`fn active_job_execution( workflow: &crate::models::Workflow, ) -> Option<&crate::models::JobExecution>`
-
-`fn active_job_name(workflow: &crate::models::Workflow) -> Option<String>`
-
-`fn render_empty_state(f: &mut Frame<'_>, area: Rect)`
-
----
-
-## crates/ui/src/views/help_overlay.rs
-
-**Language:** Rust | **Size:** 10.8 KB | **Lines:** 302
-
-**Imports:**
-- `crate::theme::{self, COLORS}`
-- `ratatui::{
-    layout::{Constraint, Direction, Layout, Rect},
-    style::{Modifier, Style},
-    text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Paragraph, Wrap},
-    Frame,
-}`
-
-**Declarations:**
-
-`fn section_header<'a>(title: &'a str) -> Vec<Line<'a>>`
-
-`fn key_line<'a>(key: &'a str, desc: &'a str) -> Line<'a>`
-
----
-
-## crates/ui/src/views/job_detail.rs
-
-**Language:** Rust | **Size:** 20.5 KB | **Lines:** 594
-
-**Imports:**
-- `crate::app::App`
-- `crate::components::timing::{self, TimingRow}`
-- `crate::theme::{self, BadgeKind, COLORS}`
-- `ratatui::{
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
-    style::{Modifier, Style},
-    text::{Line, Span},
-    widgets::{Paragraph, Wrap},
-    Frame,
-}`
-- `wrkflw_executor::{JobStatus, StepStatus}`
-
-**Declarations:**
-
-`const TABS: [&str`
-
-`fn render_breadcrumb( f: &mut Frame<'_>, workflow_name: &str, job: &crate::models::JobExecution, area: Rect, )`
-
-`fn render_tab_strip(f: &mut Frame<'_>, active: usize, area: Rect)`
-
-`fn render_output_pane( f: &mut Frame<'_>, job: &crate::models::JobExecution, selected_step: Option<usize>, area: Rect, )`
+`fn render_output_pane( f: &mut Frame<'_>, job: &crate::models::JobExecution, selected: Option<usize>, output: OutputSource<'_>, area: Rect, ) -> usize`
 
 `fn render_steps_list( f: &mut Frame<'_>, job: &crate::models::JobExecution, selected: Option<usize>, area: Rect, )`
 
-`fn render_step_stdout( f: &mut Frame<'_>, job: &crate::models::JobExecution, selected: Option<usize>, area: Rect, )`
-
-`fn render_env_pane(f: &mut Frame<'_>, area: Rect)`
-
-`fn render_files_pane(f: &mut Frame<'_>, area: Rect)`
+`fn render_step_output( f: &mut Frame<'_>, job: &crate::models::JobExecution, selected: Option<usize>, output: OutputSource<'_>, area: Rect, ) -> usize`
 
 `fn render_matrix_pane( f: &mut Frame<'_>, workflow: &crate::models::Workflow, job_name: &str, area: Rect, )`
 
@@ -6232,36 +6382,39 @@ wrkflw/
 
 `fn collapse_newlines(s: &str) -> String`
 
-`fn inherited_combo_glyph<'a>(workflow: &'a crate::models::Workflow, job_name: &'a str) -> Span<'a>`
-
-`fn render_timeline_pane(f: &mut Frame<'_>, job: &crate::models::JobExecution, area: Rect)`
+`fn combo_glyph<'a>( workflow: &'a crate::models::Workflow, job_name: &str, combo: &wrkflw_matrix::MatrixCombination, ) -> Span<'a>`
 
 ---
 
 ## crates/ui/src/views/logs_tab.rs
 
-**Language:** Rust | **Size:** 4.2 KB | **Lines:** 126
+**Language:** Rust | **Size:** 4.2 KB | **Lines:** 135
 
 **Imports:**
 - `crate::app::App`
+- `crate::models::LogFilterLevel`
+- `crate::text`
 - `crate::theme::{self, COLORS}`
 - `ratatui::{
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
-    style::Style,
+    layout::{Constraint, Direction, Layout, Rect},
+    style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Cell, Paragraph, Row, Table, TableState},
+    widgets::{HighlightSpacing, Paragraph, Table, TableState},
     Frame,
 }`
 
 **Declarations:**
 
+`fn render_search_bar(f: &mut Frame<'_>, app: &App, area: Rect)`
+
 ---
 
 ## crates/ui/src/views/mod.rs
 
-**Language:** Rust | **Size:** 4.3 KB | **Lines:** 127
+**Language:** Rust | **Size:** 4.4 KB | **Lines:** 128
 
 **Imports:**
+- `pub use job_detail::StepOutputCache`
 - `pub use title_bar::{
     TAB_COUNT, TAB_DAG, TAB_EXECUTION, TAB_HELP, TAB_LOGS, TAB_RUNS, TAB_SECRETS, TAB_TRIGGER,
     TAB_WORKFLOWS,
@@ -6311,25 +6464,32 @@ wrkflw/
 
 ## crates/ui/src/views/runs_tab.rs
 
-**Language:** Rust | **Size:** 4.6 KB | **Lines:** 130
+**Language:** Rust | **Size:** 9.2 KB | **Lines:** 266
 
 **Imports:**
 - `crate::app::App`
-- `crate::theme::COLORS`
+- `crate::text`
+- `crate::theme::{self, COLORS}`
 - `ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Paragraph, Wrap},
     Frame,
 }`
 - `wrkflw_runs::{RunRecord, RunStatus}`
 
 **Declarations:**
 
-`fn status_color(status: RunStatus) -> ratatui::style::Color`
+`fn status_glyph(status: RunStatus) -> (&'static str, ratatui::style::Color)`
 
-`fn run_row(run: &RunRecord) -> ListItem<'static>`
+`fn text_status(status: &str) -> (&'static str, ratatui::style::Color)`
+
+`fn when(started_at: &str) -> String`
+
+`fn duration(ms: Option<u64>) -> String`
+
+`fn run_row(run: &RunRecord, w: usize, selected: bool) -> Line<'static>`
 
 `fn detail_lines(run: &RunRecord) -> Vec<Line<'static>>`
 
@@ -6339,16 +6499,17 @@ wrkflw/
 
 ## crates/ui/src/views/secrets_tab.rs
 
-**Language:** Rust | **Size:** 10.0 KB | **Lines:** 297
+**Language:** Rust | **Size:** 8.0 KB | **Lines:** 230
 
 **Imports:**
 - `crate::app::App`
+- `crate::text`
 - `crate::theme::{self, BadgeKind, COLORS}`
 - `ratatui::{
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{List, ListItem, Paragraph, Wrap},
+    widgets::{HighlightSpacing, List, ListItem, Paragraph},
     Frame,
 }`
 - `wrkflw_executor::RuntimeType`
@@ -6356,23 +6517,21 @@ wrkflw/
 
 **Declarations:**
 
-`fn render_header(f: &mut Frame<'_>, area: Rect)`
-
 `fn provider_entries() -> Vec<(String, SecretProviderConfig)>`
 
 `fn render_providers_pane( f: &mut Frame<'_>, app: &mut App, rows: &[(String, SecretProviderConfig)], area: Rect, )`
 
 `fn render_detail_pane( f: &mut Frame<'_>, app: &App, rows: &[(String, SecretProviderConfig)], area: Rect, )`
 
-`fn render_runtime_pane( f: &mut Frame<'_>, app: &App, rows: &[(String, SecretProviderConfig)], area: Rect, )`
+`fn render_runtime_pane(f: &mut Frame<'_>, app: &App, area: Rect)`
 
-`fn kv<'a>(key: &'a str, value: impl Into<String>) -> Line<'a>`
+`fn kv(key: &str, value: &str, w: usize) -> Line<'static>`
 
 ---
 
 ## crates/ui/src/views/status_bar.rs
 
-**Language:** Rust | **Size:** 5.9 KB | **Lines:** 184
+**Language:** Rust | **Size:** 7.5 KB | **Lines:** 216
 
 **Imports:**
 - `super::{
@@ -6380,6 +6539,7 @@ wrkflw/
 }`
 - `crate::app::App`
 - `crate::models::StatusSeverity`
+- `crate::text`
 - `crate::theme::{self, BadgeKind, COLORS}`
 - `ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
@@ -6398,12 +6558,13 @@ wrkflw/
 
 ## crates/ui/src/views/title_bar.rs
 
-**Language:** Rust | **Size:** 5.0 KB | **Lines:** 135
+**Language:** Rust | **Size:** 5.3 KB | **Lines:** 168
 
 **Imports:**
 - `crate::app::App`
 - `crate::models::WorkflowStatus`
-- `crate::theme::{self, BadgeKind, COLORS}`
+- `crate::text`
+- `crate::theme::{self, COLORS}`
 - `ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
@@ -6411,9 +6572,15 @@ wrkflw/
     widgets::Paragraph,
     Frame,
 }`
-- `wrkflw_executor::RuntimeType`
 
 **Declarations:**
+
+`fn fit_tabs(selected: usize, budget: usize) -> Vec<Span<'static>>`
+
+`enum TabStyle`
+> Variants: `Full`, `Compact`, `ActiveOnly`
+
+`fn tab_spans(selected: usize, style: TabStyle) -> Vec<Span<'static>>`
 
 `fn live_elapsed(app: &App) -> Option<String>`
 
@@ -6421,13 +6588,14 @@ wrkflw/
 
 ## crates/ui/src/views/trigger_tab.rs
 
-**Language:** Rust | **Size:** 11.1 KB | **Lines:** 332
+**Language:** Rust | **Size:** 9.4 KB | **Lines:** 287
 
 **Imports:**
 - `crate::app::{App, TriggerPlatform}`
+- `crate::text`
 - `crate::theme::{self, BadgeKind, COLORS}`
 - `ratatui::{
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Paragraph, Wrap},
@@ -6438,15 +6606,17 @@ wrkflw/
 
 `fn token_is_set(var: &str) -> bool`
 
-`fn render_header(f: &mut Frame<'_>, app: &App, area: Rect)`
-
 `fn render_target_pane(f: &mut Frame<'_>, app: &mut App, area: Rect)`
 
 `fn render_preview_pane(f: &mut Frame<'_>, app: &App, area: Rect)`
 
-`fn field_row<'a>(label: &'a str, value: &'a str) -> Line<'a>`
+`const LABEL_W: usize = 12`
 
-`fn field_row_hl<'a>(label: &'a str, value: &'a str, hint: &str) -> Line<'a>`
+`fn label_span(label: &str) -> Span<'static>`
+
+`fn editing_style() -> Style`
+
+`fn field_row(label: &str, value: &str, room: usize, bold: bool) -> Line<'static>`
 
 ---
 
@@ -6475,17 +6645,18 @@ wrkflw/
 
 ## crates/ui/src/views/workflows_tab.rs
 
-**Language:** Rust | **Size:** 14.0 KB | **Lines:** 404
+**Language:** Rust | **Size:** 16.7 KB | **Lines:** 477
 
 **Imports:**
 - `crate::app::App`
-- `crate::models::{TriggerMatchStatus, WorkflowStatus}`
+- `crate::models::TriggerMatchStatus`
+- `crate::text`
 - `crate::theme::{self, BadgeKind, COLORS}`
 - `ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Cell, Paragraph, Row, Table, TableState, Wrap},
+    widgets::{Cell, HighlightSpacing, Paragraph, Row, Table, TableState},
     Frame,
 }`
 
@@ -6497,15 +6668,11 @@ wrkflw/
 
 `fn render_preview(f: &mut Frame<'_>, app: &App, area: Rect)`
 
-`fn build_chain(def: &wrkflw_parser::workflow::WorkflowDefinition) -> String`
-
 `fn render_trigger_filter(f: &mut Frame<'_>, app: &App, area: Rect)`
 
 `fn render_quick_actions(f: &mut Frame<'_>, area: Rect)`
 
 `fn render_job_selection(f: &mut Frame<'_>, app: &mut App, area: Rect)`
-
-`fn workflow_status_badge(status: &WorkflowStatus) -> Span<'static>`
 
 ---
 
@@ -6519,7 +6686,7 @@ wrkflw/
 
 ## crates/utils/README.md
 
-**Language:** Markdown | **Size:** 562 B | **Lines:** 21
+**Language:** Markdown | **Size:** 588 B | **Lines:** 21
 
 **Declarations:**
 
@@ -6548,7 +6715,7 @@ wrkflw/
 
 ## crates/validators/README.md
 
-**Language:** Markdown | **Size:** 719 B | **Lines:** 29
+**Language:** Markdown | **Size:** 816 B | **Lines:** 30
 
 **Declarations:**
 
@@ -7105,7 +7272,7 @@ wrkflw/
 
 ## crates/wrkflw/README.md
 
-**Language:** Markdown | **Size:** 4.7 KB | **Lines:** 128
+**Language:** Markdown | **Size:** 7.5 KB | **Lines:** 171
 
 **Declarations:**
 
@@ -7411,7 +7578,7 @@ wrkflw/
 
 ## crates/wrkflw/src/mcp_install.rs
 
-**Language:** Rust | **Size:** 45.7 KB | **Lines:** 1280
+**Language:** Rust | **Size:** 47.5 KB | **Lines:** 1322
 
 **Imports:**
 - `crate::OutputFormat`
@@ -7453,7 +7620,7 @@ wrkflw/
 
 `fn expand_tilde(home: &Path, dir: OsString) -> PathBuf`
 
-`fn zed_dir(home: &Path, config: &Path, xdg: Option<OsString>) -> PathBuf`
+`fn zed_dir(home: &Path, config: &Path) -> PathBuf`
 
 `struct Launch`
 > Fields: `command: String`, `absolute: String`
@@ -8311,7 +8478,7 @@ wrkflw/
 
 ## skills/wrkflw/SKILL.md
 
-**Language:** Markdown | **Size:** 1.8 KB | **Lines:** 22
+**Language:** Markdown | **Size:** 2.0 KB | **Lines:** 23
 
 **Declarations:**
 
@@ -8319,7 +8486,7 @@ wrkflw/
 
 ## tests/README.md
 
-**Language:** Markdown | **Size:** 974 B | **Lines:** 37
+**Language:** Markdown | **Size:** 1.5 KB | **Lines:** 42
 
 **Declarations:**
 

@@ -34,6 +34,74 @@ pub struct Workflow {
 }
 
 /// A workflow queued for execution, with its own target job
+/// Where one workflow job stands in the latest run, merged across
+/// the matrix combinations it expanded into.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum JobState {
+    Success,
+    Failure,
+    /// Failed under `continue-on-error`, so the run carried on.
+    FailureAllowed,
+    Skipped,
+    Running,
+    Pending,
+}
+
+impl JobExecution {
+    /// Whether this result belongs to the workflow job keyed `key`.
+    pub fn is_for(&self, key: &str) -> bool {
+        self.canonical_name == key || self.name == key
+    }
+}
+
+impl Workflow {
+    /// State of the job keyed `key`. Results only arrive when a run
+    /// ends, so while one is in flight every unreported job counts as
+    /// running.
+    pub fn job_state(&self, key: &str) -> JobState {
+        let results: Vec<&JobExecution> = self
+            .execution_details
+            .as_ref()
+            .map(|e| e.jobs.iter().filter(|j| j.is_for(key)).collect())
+            .unwrap_or_default();
+        if results.is_empty() {
+            return if self.status == WorkflowStatus::Running {
+                JobState::Running
+            } else {
+                JobState::Pending
+            };
+        }
+        let failed = |allowed: bool| {
+            results
+                .iter()
+                .any(|j| j.status == JobStatus::Failure && j.failure_allowed == allowed)
+        };
+        if failed(false) {
+            JobState::Failure
+        } else if failed(true) {
+            JobState::FailureAllowed
+        } else if results.iter().all(|j| j.status == JobStatus::Skipped) {
+            JobState::Skipped
+        } else {
+            JobState::Success
+        }
+    }
+
+    /// Workflow job keys that no reported result covers yet, in order.
+    pub fn unreported_jobs(&self) -> Vec<&str> {
+        let jobs = self
+            .execution_details
+            .as_ref()
+            .map(|e| &e.jobs[..])
+            .unwrap_or(&[]);
+        self.job_names
+            .iter()
+            .filter(|n| !jobs.iter().any(|j| j.is_for(n)))
+            .map(String::as_str)
+            .collect()
+    }
+}
+
 pub struct QueuedExecution {
     pub workflow_idx: usize,
     pub target_job: Option<String>,
@@ -60,6 +128,9 @@ pub struct WorkflowExecution {
 /// Job execution details
 pub struct JobExecution {
     pub name: String,
+    /// The job's key in the workflow. Differs from `name` for matrix
+    /// jobs, whose name carries the combination, e.g. `build (os: x)`.
+    pub canonical_name: String,
     pub status: JobStatus,
     pub steps: Vec<StepExecution>,
     pub logs: Vec<String>,
@@ -72,6 +143,7 @@ pub struct StepExecution {
     pub name: String,
     pub status: StepStatus,
     pub output: String,
+    pub exit_code: Option<i32>,
 }
 
 /// Severity level for status bar toast messages

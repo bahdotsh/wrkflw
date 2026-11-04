@@ -1,7 +1,9 @@
-// Title bar — brand mark, numbered tabs, right-side LIVE + runtime indicator.
+// Title bar — brand mark, numbered tabs, right-side LIVE timer. Tabs
+// collapse to numbers on narrow terminals so all of them stay reachable.
 use crate::app::App;
 use crate::models::WorkflowStatus;
-use crate::theme::{self, BadgeKind, COLORS};
+use crate::text;
+use crate::theme::{self, COLORS};
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
@@ -9,7 +11,6 @@ use ratatui::{
     widgets::Paragraph,
     Frame,
 };
-use wrkflw_executor::RuntimeType;
 
 pub const TAB_LABELS: [&str; 8] = [
     "Workflows",
@@ -36,87 +37,119 @@ pub const TAB_RUNS: usize = 6;
 pub const TAB_HELP: usize = 7;
 
 pub fn render_title_bar(f: &mut Frame<'_>, app: &App, area: Rect) {
-    let chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Length(14), // brand
-            Constraint::Min(0),     // tabs
-            Constraint::Length(34), // right indicators
-        ])
-        .split(area);
-
-    // ─── Brand ────────────────────────────────────────────────
+    f.render_widget(
+        Paragraph::new("").style(Style::default().bg(COLORS.bg_bar)),
+        area,
+    );
     let accent = theme::current_accent();
-    let brand = Paragraph::new(Line::from(vec![
-        Span::styled(" w∿w ", Style::default().fg(accent)),
+    let width = area.width as usize;
+
+    let brand = vec![
         Span::styled(
-            "wrkflw",
-            Style::default().fg(accent).add_modifier(Modifier::BOLD),
+            " w∿w wrkflw ",
+            Style::default()
+                .bg(accent)
+                .fg(COLORS.bg_dark)
+                .add_modifier(Modifier::BOLD),
         ),
-    ]))
-    .style(Style::default().bg(COLORS.bg_dark))
-    .alignment(Alignment::Left);
-    f.render_widget(brand, chunks[0]);
+        Span::raw(" "),
+    ];
 
-    // ─── Tabs ─────────────────────────────────────────────────
-    let mut tab_spans: Vec<Span> = Vec::with_capacity(TAB_LABELS.len() * 4);
-    tab_spans.push(Span::styled(" │ ", Style::default().fg(COLORS.border)));
-    for (i, label) in TAB_LABELS.iter().enumerate() {
-        let active = i == app.selected_tab;
-        tab_spans.push(Span::styled(
-            format!("{}", i + 1),
-            Style::default().fg(COLORS.text_muted),
-        ));
-        tab_spans.push(Span::raw(" "));
-        tab_spans.push(Span::styled(
-            label.to_string(),
-            if active {
-                Style::default()
-                    .fg(COLORS.text)
-                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
-            } else {
-                Style::default().fg(COLORS.text_dim)
-            },
-        ));
-        if i + 1 < TAB_LABELS.len() {
-            tab_spans.push(Span::raw("   "));
-        }
-    }
-    let tabs = Paragraph::new(Line::from(tab_spans))
-        .style(Style::default().bg(COLORS.bg_dark))
-        .alignment(Alignment::Left);
-    f.render_widget(tabs, chunks[1]);
-
-    // ─── Right: LIVE + runtime ────────────────────────────────
     let mut right: Vec<Span> = Vec::new();
     if let Some(elapsed) = live_elapsed(app) {
-        right.push(Span::styled("●", theme::pulse_style(app.spinner_frame)));
-        right.push(Span::raw(" "));
+        right.push(Span::styled("● ", theme::pulse_style(app.spinner_frame)));
         right.push(Span::styled(
-            "LIVE",
+            "LIVE ",
             Style::default()
                 .fg(COLORS.text)
                 .add_modifier(Modifier::BOLD),
         ));
-        right.push(Span::raw(" "));
         right.push(Span::styled(elapsed, Style::default().fg(COLORS.text_dim)));
-        right.push(Span::raw("  "));
+        right.push(Span::raw(" "));
     }
-    let runtime_kind = match app.runtime_type {
-        RuntimeType::Auto => BadgeKind::Emulation,
-        RuntimeType::Docker => BadgeKind::Docker,
-        RuntimeType::Podman => BadgeKind::Podman,
-        RuntimeType::Kubernetes => BadgeKind::Kubernetes,
-        RuntimeType::SecureEmulation => BadgeKind::Secure,
-        RuntimeType::Emulation => BadgeKind::Emulation,
-    };
-    right.push(theme::badge_outline(app.runtime_type_name(), runtime_kind));
-    right.push(Span::raw(" "));
 
-    let right_p = Paragraph::new(Line::from(right))
-        .style(Style::default().bg(COLORS.bg_dark))
-        .alignment(Alignment::Right);
-    f.render_widget(right_p, chunks[2]);
+    let brand_w = text::spans_width(&brand);
+    let mut right_w = text::spans_width(&right);
+    let mut tabs = fit_tabs(app.selected_tab, width.saturating_sub(brand_w + right_w));
+    // The tabs matter more than the timer, which the Execution tab also shows.
+    if text::spans_width(&tabs) > width.saturating_sub(brand_w + right_w) {
+        right.clear();
+        right_w = 0;
+        tabs = fit_tabs(app.selected_tab, width.saturating_sub(brand_w));
+    }
+
+    let mut left = Vec::new();
+    if brand_w + text::spans_width(&tabs) <= width {
+        left.extend(brand);
+    }
+    left.extend(tabs);
+
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(0), Constraint::Length(right_w as u16)])
+        .split(area);
+    f.render_widget(Paragraph::new(Line::from(left)), chunks[0]);
+    f.render_widget(
+        Paragraph::new(Line::from(right)).alignment(Alignment::Right),
+        chunks[1],
+    );
+}
+
+/// The roomiest tab strip that fits in `budget` cells.
+fn fit_tabs(selected: usize, budget: usize) -> Vec<Span<'static>> {
+    let mut tabs = tab_spans(selected, TabStyle::Full);
+    for style in [TabStyle::Compact, TabStyle::ActiveOnly] {
+        if text::spans_width(&tabs) <= budget {
+            break;
+        }
+        tabs = tab_spans(selected, style);
+    }
+    tabs
+}
+
+#[derive(Copy, Clone)]
+enum TabStyle {
+    /// Every tab shows its number and label.
+    Full,
+    /// Only the active tab keeps its label; the rest shrink to numbers.
+    Compact,
+    /// Just the active tab, for very narrow terminals.
+    ActiveOnly,
+}
+
+fn tab_spans(selected: usize, style: TabStyle) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    for (i, label) in TAB_LABELS.iter().enumerate() {
+        let active = i == selected;
+        if active {
+            spans.push(Span::styled(
+                format!(" {} {} ", i + 1, label),
+                Style::default()
+                    .bg(COLORS.bg_selected)
+                    .fg(theme::current_accent())
+                    .add_modifier(Modifier::BOLD),
+            ));
+            continue;
+        }
+        match style {
+            TabStyle::Full => {
+                spans.push(Span::styled(
+                    format!(" {}", i + 1),
+                    Style::default().fg(COLORS.text_muted),
+                ));
+                spans.push(Span::styled(
+                    format!(" {} ", label),
+                    Style::default().fg(COLORS.text_dim),
+                ));
+            }
+            TabStyle::Compact => spans.push(Span::styled(
+                format!(" {} ", i + 1),
+                Style::default().fg(COLORS.text_muted),
+            )),
+            TabStyle::ActiveOnly => {}
+        }
+    }
+    spans
 }
 
 /// Format elapsed time on the active execution as `mm:ss`. Returns `None`

@@ -66,15 +66,19 @@ pub struct App {
     pub current_execution: Option<usize>,
     logs: Vec<String>, // Overall execution logs — private so every mutation routes through `add_log`
     pub log_scroll: usize, // Scrolling position for logs
-    pub job_list_state: ListState, // For viewing job details
-    pub detailed_view: bool, // Whether we're in detailed view mode
-    pub step_list_state: ListState, // For selecting steps in detailed view
-    pub step_table_state: TableState, // For the steps table in detailed view
-    pub last_tick: Instant, // For UI animations and updates
-    pub tick_rate: Duration, // How often to update the UI
-    pub spinner_frame: usize, // Current spinner animation frame
+    /// Keep the newest log line selected as lines arrive.
+    pub log_follow: bool,
+    /// First visible log row, kept across frames so scrolling is smooth.
+    pub log_offset: usize,
+    pub job_list_state: ListState,            // For viewing job details
+    pub detailed_view: bool,                  // Whether we're in detailed view mode
+    pub step_list_state: ListState,           // For selecting steps in detailed view
+    pub step_table_state: TableState,         // For the steps table in detailed view
+    pub last_tick: Instant,                   // For UI animations and updates
+    pub tick_rate: Duration,                  // How often to update the UI
+    pub spinner_frame: usize,                 // Current spinner animation frame
     pub tx: mpsc::Sender<ExecutionResultMsg>, // Channel for async communication
-    pub status_message: Option<String>, // Temporary status message to display
+    pub status_message: Option<String>,       // Temporary status message to display
     pub status_message_severity: StatusSeverity, // Severity of the current status message
     pub status_message_time: Option<Instant>, // When the message was set
 
@@ -143,6 +147,22 @@ pub struct App {
     /// Active sub-tab inside the Step Inspector (job-detail) view.
     /// 0 Output, 1 Env, 2 Files, 3 Matrix, 4 Timeline.
     pub step_inspector_tab: usize,
+    /// Lines scrolled back from the end of the inspected step's output;
+    /// 0 follows the tail.
+    pub step_output_scroll: usize,
+    /// Stage scrolled to in the DAG graph view.
+    pub dag_scroll: usize,
+    /// Bumped whenever a workflow's results are replaced, so caches
+    /// keyed by workflow/job/step index can tell a rerun apart.
+    pub run_generation: u64,
+    /// Parsed output of the step the inspector last showed.
+    pub step_output_cache: Option<crate::views::StepOutputCache>,
+    /// Matrix run counts for the DAG cards, computed once per parsed
+    /// workflow rather than expanding every matrix on every frame.
+    pub dag_matrix_labels: Option<(
+        Arc<wrkflw_parser::workflow::WorkflowDefinition>,
+        HashMap<String, String>,
+    )>,
 
     // ── DAG tab ───────────────────────────────────────────────────
     /// When true, the DAG tab renders the topological-stage list view;
@@ -470,6 +490,8 @@ impl App {
             current_execution: None,
             logs: Vec::new(),
             log_scroll: 0,
+            log_follow: true,
+            log_offset: 0,
             job_list_state,
             detailed_view: false,
             step_list_state,
@@ -516,6 +538,11 @@ impl App {
             diff_filter_task: None,
             diff_filter_aborted: false,
             step_inspector_tab: 0,
+            step_output_scroll: 0,
+            dag_scroll: 0,
+            run_generation: 0,
+            step_output_cache: None,
+            dag_matrix_labels: None,
 
             dag_list_view: false,
 
@@ -1018,6 +1045,8 @@ impl App {
 
                 // Reset step selection when changing jobs
                 self.step_list_state.select(Some(0));
+                self.step_table_state.select(Some(0));
+                self.step_output_scroll = 0;
             }
         }
     }
@@ -1049,6 +1078,8 @@ impl App {
 
                 // Reset step selection when changing jobs
                 self.step_list_state.select(Some(0));
+                self.step_table_state.select(Some(0));
+                self.step_output_scroll = 0;
             }
         }
     }
@@ -1082,6 +1113,7 @@ impl App {
                         self.step_list_state.select(Some(i));
                         // Update the table state to match
                         self.step_table_state.select(Some(i));
+                        self.step_output_scroll = 0;
                     }
                 }
             }
@@ -1117,6 +1149,7 @@ impl App {
                         self.step_list_state.select(Some(i));
                         // Update the table state to match
                         self.step_table_state.select(Some(i));
+                        self.step_output_scroll = 0;
                     }
                 }
             }
@@ -1191,6 +1224,11 @@ impl App {
             return;
         }
 
+        // Once no run is in flight, the Execution tab shows the workflow
+        // highlighted in the Workflows list.
+        let shown_after_run = self.workflow_list_state.selected() == Some(workflow_idx);
+        self.run_generation = self.run_generation.wrapping_add(1);
+
         let workflow = &mut self.workflows[workflow_idx];
 
         // Ensure execution details exist
@@ -1216,6 +1254,7 @@ impl App {
                         .iter()
                         .map(|job_result| JobExecution {
                             name: job_result.name.clone(),
+                            canonical_name: job_result.canonical_name.clone(),
                             status: match job_result.status {
                                 wrkflw_executor::JobStatus::Success => JobStatus::Success,
                                 wrkflw_executor::JobStatus::Failure => JobStatus::Failure,
@@ -1232,6 +1271,7 @@ impl App {
                                         wrkflw_executor::StepStatus::Skipped => StepStatus::Skipped,
                                     },
                                     output: step_result.output.clone(),
+                                    exit_code: step_result.exit_code,
                                 })
                                 .collect::<Vec<StepExecution>>(),
                             logs: vec![job_result.logs.clone()],
@@ -1245,20 +1285,64 @@ impl App {
                     // Create a dummy job with the error information so users can see details
                     execution_details.jobs = vec![JobExecution {
                         name: "Workflow Execution".to_string(),
+                        canonical_name: String::new(),
                         status: JobStatus::Failure,
                         steps: vec![StepExecution {
                             name: "Execution Error".to_string(),
                             status: StepStatus::Failure,
                             output: format!("Error: {}\n\nThis error prevented the workflow from executing properly.", e),
+                            exit_code: None,
                         }],
                         logs: vec![format!("Workflow execution error: {}", e)],
                         failure_allowed: false,
                     }];
                 }
             }
+
+            // Open the panes on the problem: the first job that failed
+            // the run, and its first failing step. The job and step
+            // cursors are shared by every workflow, so only move them
+            // for the run the Execution tab shows once this one ends;
+            // a queued run finishing in the background must not move
+            // the cursor on the run being inspected.
+            if shown_after_run {
+                let job = execution_details
+                    .jobs
+                    .iter()
+                    .position(|j| j.status == JobStatus::Failure && !j.failure_allowed)
+                    .unwrap_or(0);
+                let step = execution_details
+                    .jobs
+                    .get(job)
+                    .and_then(|j| j.steps.iter().position(|s| s.status == StepStatus::Failure))
+                    .unwrap_or(0);
+                self.job_list_state.select(Some(job));
+                self.step_list_state.select(Some(step));
+                self.step_table_state.select(Some(step));
+                self.step_output_scroll = 0;
+            }
         }
 
+        // The executor returns Ok with per-job results even when a job
+        // failed; only a failure that `continue-on-error` doesn't cover
+        // fails the run, as it does on the CLI.
+        let failed_job = match &result {
+            Ok((jobs, _)) => jobs
+                .iter()
+                .find(|j| j.status == wrkflw_executor::JobStatus::Failure && !j.failure_allowed)
+                .map(|j| j.name.clone()),
+            Err(_) => None,
+        };
         match result {
+            Ok(_) if failed_job.is_some() => {
+                workflow.status = WorkflowStatus::Failed;
+                let msg = format!(
+                    "Workflow '{}' failed: job '{}' failed",
+                    workflow.name,
+                    failed_job.unwrap_or_default()
+                );
+                wrkflw_logging::error(&msg);
+            }
             Ok(_) => {
                 workflow.status = WorkflowStatus::Success;
                 // Single sink: `wrkflw_logging` stamps its own [HH:MM:SS]
@@ -1300,6 +1384,7 @@ impl App {
         ));
 
         // Initialize execution details
+        self.run_generation = self.run_generation.wrapping_add(1);
         self.workflows[next].execution_details = Some(WorkflowExecution {
             jobs: Vec::new(),
             start_time: Local::now(),
@@ -1412,7 +1497,7 @@ impl App {
             }
             KeyCode::Backspace => {
                 self.log_search_query.pop();
-                self.mark_logs_for_update();
+                self.restart_log_search();
             }
             KeyCode::Enter => {
                 self.log_search_active = false;
@@ -1420,10 +1505,20 @@ impl App {
             }
             KeyCode::Char(c) => {
                 self.log_search_query.push(c);
-                self.mark_logs_for_update();
+                self.restart_log_search();
             }
             _ => {}
         }
+    }
+
+    /// The query changed, so the old matches no longer apply. Dropping
+    /// them makes the next processed update jump to the new query's
+    /// first match, instead of leaving the cursor on a line that may
+    /// not match at all.
+    fn restart_log_search(&mut self) {
+        self.log_search_matches.clear();
+        self.log_search_match_idx = 0;
+        self.mark_logs_for_update();
     }
 
     // Toggle log search mode
@@ -1517,6 +1612,7 @@ impl App {
                 (self.log_search_match_idx + 1) % self.log_search_matches.len();
             if let Some(&idx) = self.log_search_matches.get(self.log_search_match_idx) {
                 self.log_scroll = idx;
+                self.log_follow = false;
 
                 // Set status message showing which match we're on
                 self.set_success_message(format!(
@@ -1539,6 +1635,7 @@ impl App {
             };
             if let Some(&idx) = self.log_search_matches.get(self.log_search_match_idx) {
                 self.log_scroll = idx;
+                self.log_follow = false;
 
                 // Set status message showing which match we're on
                 self.set_success_message(format!(
@@ -1553,16 +1650,48 @@ impl App {
 
     // Scroll logs up
     pub fn scroll_logs_up(&mut self) {
-        self.log_scroll = self.log_scroll.saturating_sub(1);
+        self.scroll_logs_by(-1);
     }
 
     // Scroll logs down
     pub fn scroll_logs_down(&mut self) {
-        // Get total log count including system logs
-        let total_logs = self.logs.len() + wrkflw_logging::get_logs().len();
-        if total_logs > 0 {
-            self.log_scroll = (self.log_scroll + 1).min(total_logs - 1);
+        self.scroll_logs_by(1);
+    }
+
+    /// Moves the log cursor by `delta` rows over the lines on screen
+    /// (after search and filter). Reaching the last line resumes
+    /// following new output; moving off it pauses that.
+    pub fn scroll_logs_by(&mut self, delta: isize) {
+        let total = self.processed_logs.len();
+        if total == 0 {
+            self.log_scroll = 0;
+            self.log_follow = true;
+            return;
         }
+        let next = self.log_scroll.min(total - 1).saturating_add_signed(delta);
+        self.log_scroll = next.min(total - 1);
+        self.log_follow = self.log_scroll == total - 1;
+    }
+
+    /// Keeps the log cursor on a line that exists, and on the newest
+    /// line while following. The one place that reconciles the two, so
+    /// processing an update and drawing the tab can't disagree.
+    pub fn sync_log_cursor(&mut self) {
+        let last = self.processed_logs.len().saturating_sub(1);
+        if self.log_follow {
+            self.log_scroll = last;
+        }
+        self.log_scroll = self.log_scroll.min(last);
+    }
+
+    pub fn scroll_logs_to_start(&mut self) {
+        self.log_scroll = 0;
+        self.log_follow = self.processed_logs.len() <= 1;
+    }
+
+    pub fn scroll_logs_to_end(&mut self) {
+        self.log_scroll = self.processed_logs.len().saturating_sub(1);
+        self.log_follow = true;
     }
 
     // Scroll help content up
@@ -1572,9 +1701,8 @@ impl App {
 
     // Scroll help content down
     pub fn scroll_help_down(&mut self) {
-        // The help content has a fixed number of lines, so we set a reasonable max
-        const MAX_HELP_SCROLL: usize = 30; // Adjust based on help content length
-        self.help_scroll = (self.help_scroll + 1).min(MAX_HELP_SCROLL);
+        // Rendering clamps this to the content that doesn't fit.
+        self.help_scroll = self.help_scroll.saturating_add(1);
     }
 
     // Update progress for running workflows
@@ -1804,19 +1932,40 @@ impl App {
         }
 
         if let Some(response) = self.log_processor.try_get_update() {
-            self.processed_logs = response.processed_logs;
-            self.log_search_matches = response.search_matches;
-
-            // Update scroll position to first match if we have search results
-            if !self.log_search_matches.is_empty() && !self.log_search_query.is_empty() {
-                self.log_search_match_idx = 0;
-                if let Some(&idx) = self.log_search_matches.first() {
-                    self.log_scroll = idx;
-                }
-            }
-
+            self.apply_log_update(response.processed_logs, response.search_matches);
             self.logs_need_update = false;
         }
+    }
+
+    /// Takes a processed batch of log lines and the indices that match
+    /// the search, and places the cursor.
+    ///
+    /// The cursor jumps to the first match when a search starts
+    /// matching, or when it sits on a line the current query doesn't
+    /// match (the query changed, or a response for an older query
+    /// arrived first). Otherwise it stays put: jumping on every update
+    /// would yank it back each time a running workflow logs a line.
+    pub(crate) fn apply_log_update(
+        &mut self,
+        processed: Vec<crate::log_processor::ProcessedLogEntry>,
+        matches: Vec<usize>,
+    ) {
+        self.processed_logs = processed;
+        let had_matches = !self.log_search_matches.is_empty();
+        self.log_search_matches = matches;
+
+        if !self.log_search_matches.is_empty() && !self.log_search_query.is_empty() {
+            let off_match = !self.log_follow && !self.log_search_matches.contains(&self.log_scroll);
+            if !had_matches
+                || self.log_search_match_idx >= self.log_search_matches.len()
+                || off_match
+            {
+                self.log_search_match_idx = 0;
+                self.log_scroll = self.log_search_matches[0];
+                self.log_follow = false;
+            }
+        }
+        self.sync_log_cursor();
     }
 
     /// Trigger log processing when the logs or the search/filter
@@ -1973,6 +2122,12 @@ impl App {
         self.trigger_target_cache.as_ref().expect("just populated")
     }
 
+    /// True while the step inspector shows a step's output, the only
+    /// view PgUp/PgDn/Home/End scroll on the Execution tab.
+    pub fn inspecting_output(&self) -> bool {
+        self.detailed_view && self.step_inspector_tab == 0
+    }
+
     /// True when any trigger-tab text field (branch or an input row)
     /// is holding the edit cursor. The main key router consults this
     /// to decide whether to route keystrokes into the field rather
@@ -1985,6 +2140,19 @@ impl App {
     pub fn trigger_tab_add_input(&mut self) {
         self.trigger_inputs.push((String::new(), String::new()));
         self.trigger_input_cursor = Some(self.trigger_inputs.len() - 1);
+        self.trigger_input_on_value = false;
+        self.trigger_branch_focused = false;
+    }
+
+    /// Put the edit cursor on the first input's key, adding a blank row
+    /// when there are none. With Tab now switching tabs outside edit
+    /// mode, this is the direct way into the input grid.
+    pub fn trigger_tab_edit_inputs(&mut self) {
+        if self.trigger_inputs.is_empty() {
+            self.trigger_tab_add_input();
+            return;
+        }
+        self.trigger_input_cursor = Some(0);
         self.trigger_input_on_value = false;
         self.trigger_branch_focused = false;
     }
@@ -2003,9 +2171,9 @@ impl App {
     /// of the cycle so the user can reach it via Tab without needing
     /// the `b` shortcut.
     pub fn trigger_tab_next_field(&mut self) {
-        // Not focused yet → land on Branch (start of the cycle).
+        // Outside edit mode Tab switches tabs; grabbing focus here is
+        // what used to trap the user in the Branch field.
         if !self.trigger_editing() {
-            self.trigger_branch_focused = true;
             return;
         }
         if self.trigger_branch_focused {
@@ -2044,14 +2212,8 @@ impl App {
     }
 
     pub fn trigger_tab_prev_field(&mut self) {
-        // Not focused yet → wrap to the end of the cycle.
+        // See `trigger_tab_next_field`: only cycles while editing.
         if !self.trigger_editing() {
-            if self.trigger_inputs.is_empty() {
-                self.trigger_branch_focused = true;
-            } else {
-                self.trigger_input_cursor = Some(self.trigger_inputs.len() - 1);
-                self.trigger_input_on_value = true;
-            }
             return;
         }
         if self.trigger_branch_focused {
@@ -2830,6 +2992,50 @@ mod tests {
         app
     }
 
+    fn job_result(
+        name: &str,
+        status: wrkflw_executor::JobStatus,
+        allowed: bool,
+    ) -> wrkflw_executor::JobResult {
+        wrkflw_executor::JobResult {
+            name: name.to_string(),
+            canonical_name: name.to_string(),
+            status,
+            steps: Vec::new(),
+            logs: String::new(),
+            outputs: HashMap::new(),
+            failure_allowed: allowed,
+        }
+    }
+
+    #[test]
+    fn a_failed_job_fails_the_run_unless_it_is_allowed_to() {
+        use wrkflw_executor::JobStatus as S;
+        let mut app = make_app();
+        app.process_execution_result(0, Ok((vec![job_result("build", S::Failure, false)], ())));
+        assert_eq!(app.workflows[0].status, WorkflowStatus::Failed);
+
+        app.process_execution_result(0, Ok((vec![job_result("build", S::Failure, true)], ())));
+        assert_eq!(app.workflows[0].status, WorkflowStatus::Success);
+
+        app.process_execution_result(
+            0,
+            Ok((
+                vec![
+                    job_result("lint", S::Success, false),
+                    job_result("test", S::Failure, false),
+                ],
+                (),
+            )),
+        );
+        assert_eq!(app.workflows[0].status, WorkflowStatus::Failed);
+        assert_eq!(
+            app.job_list_state.selected(),
+            Some(1),
+            "opens on the failed job"
+        );
+    }
+
     #[test]
     fn availability_arrives_through_tick_without_blocking() {
         let mut app = make_app();
@@ -2844,6 +3050,30 @@ mod tests {
         app.tick();
         assert!(app.runtime_available);
         assert!(app.availability_probe.is_none());
+    }
+
+    #[test]
+    fn a_background_run_finishing_leaves_the_shown_runs_cursor_alone() {
+        use wrkflw_executor::JobStatus as S;
+        let mut app = make_app();
+        app.workflow_list_state.select(Some(0));
+        app.job_list_state.select(Some(2));
+        app.step_table_state.select(Some(3));
+
+        // Workflow 1 isn't the one on screen.
+        app.process_execution_result(
+            1,
+            Ok((
+                vec![
+                    job_result("a", S::Success, false),
+                    job_result("b", S::Failure, false),
+                ],
+                (),
+            )),
+        );
+        assert_eq!(app.workflows[1].status, WorkflowStatus::Failed);
+        assert_eq!(app.job_list_state.selected(), Some(2));
+        assert_eq!(app.step_table_state.selected(), Some(3));
     }
 
     #[test]
@@ -2874,6 +3104,71 @@ mod tests {
     /// this, which is why nesting is carried by a glyph.
     fn rendered_content(line: &str) -> String {
         crate::log_processor::LogProcessor::process_log_entry(line, "").rendered_content()
+    }
+
+    fn log_lines(n: usize) -> Vec<crate::log_processor::ProcessedLogEntry> {
+        (0..n)
+            .map(|i| crate::log_processor::ProcessedLogEntry {
+                timestamp: "00:00:00".into(),
+                log_type: "INFO".into(),
+                log_style: ratatui::style::Style::default(),
+                content_spans: vec![ratatui::text::Span::raw(format!("line {i}"))],
+            })
+            .collect()
+    }
+
+    #[test]
+    fn refining_a_search_moves_the_cursor_to_the_new_first_match() {
+        let mut app = make_app();
+        app.log_search_active = true;
+
+        app.handle_log_search_input(KeyCode::Char('e'));
+        app.apply_log_update(log_lines(20), vec![2, 5, 9]);
+        assert_eq!(app.log_scroll, 2);
+
+        // A new line arriving must not yank the cursor once it moved on.
+        app.next_search_match();
+        assert_eq!(app.log_scroll, 5);
+        app.apply_log_update(log_lines(21), vec![2, 5, 9]);
+        assert_eq!(app.log_scroll, 5, "stays on the match the user chose");
+
+        // Typing more drops the old matches and re-anchors on the new
+        // query's first one.
+        app.handle_log_search_input(KeyCode::Char('r'));
+        assert!(app.log_search_matches.is_empty());
+        app.apply_log_update(log_lines(21), vec![7, 12]);
+        assert_eq!((app.log_scroll, app.log_search_match_idx), (7, 0));
+    }
+
+    #[test]
+    fn a_stale_search_response_cannot_strand_the_cursor_off_a_match() {
+        let mut app = make_app();
+        app.log_search_active = true;
+        app.handle_log_search_input(KeyCode::Char('e'));
+        app.handle_log_search_input(KeyCode::Char('r'));
+        // The worker answers the old query `e` first, then `er`.
+        app.apply_log_update(log_lines(20), vec![2, 5, 9]);
+        assert_eq!(app.log_scroll, 2);
+        app.apply_log_update(log_lines(20), vec![9, 14]);
+        assert_eq!(app.log_scroll, 9);
+    }
+
+    #[test]
+    fn log_follow_resumes_at_the_last_line_and_pauses_off_it() {
+        let mut app = make_app();
+        app.apply_log_update(log_lines(10), vec![]);
+        assert!(app.log_follow);
+        assert_eq!(app.log_scroll, 9);
+
+        app.scroll_logs_by(-3);
+        assert!(!app.log_follow);
+        app.apply_log_update(log_lines(12), vec![]);
+        assert_eq!(app.log_scroll, 6, "paused: new lines don't move the cursor");
+
+        app.scroll_logs_by(100);
+        assert!(app.log_follow, "reaching the end follows again");
+        app.apply_log_update(log_lines(15), vec![]);
+        assert_eq!(app.log_scroll, 14);
     }
 
     #[test]
@@ -3932,21 +4227,27 @@ mod tests {
     }
 
     #[test]
-    fn trigger_tab_next_field_lands_on_branch_when_no_inputs() {
+    fn trigger_tab_field_cycling_never_grabs_focus_outside_edit_mode() {
+        // Regression: Tab used to drop the cursor into Branch, where
+        // digits and `q` became text and only Esc got you out.
+        let mut app = make_app();
+        app.trigger_inputs = vec![("a".into(), "1".into())];
+        app.trigger_tab_next_field();
+        assert!(!app.trigger_editing());
+        app.trigger_tab_prev_field();
+        assert!(!app.trigger_editing());
+    }
+
+    #[test]
+    fn trigger_tab_next_field_stays_on_branch_when_no_inputs() {
         let mut app = make_app();
         assert!(app.trigger_inputs.is_empty());
-        assert!(!app.trigger_editing());
-        // With no inputs, Tab cycles through Branch only.
-        app.trigger_tab_next_field();
-        assert!(app.trigger_branch_focused);
-        assert!(app.trigger_input_cursor.is_none());
+        app.trigger_tab_edit_branch();
         app.trigger_tab_next_field();
         assert!(
             app.trigger_branch_focused,
             "stays on Branch when nothing else to cycle through"
         );
-        // Prev from fresh state also lands on Branch when no inputs.
-        let mut app = make_app();
         app.trigger_tab_prev_field();
         assert!(app.trigger_branch_focused);
         assert!(app.trigger_input_cursor.is_none());
@@ -3956,8 +4257,7 @@ mod tests {
     fn trigger_tab_next_field_walks_branch_then_inputs_and_wraps() {
         let mut app = make_app();
         app.trigger_inputs = vec![("a".into(), "1".into()), ("b".into(), "2".into())];
-        // From fresh state: None → Branch.
-        app.trigger_tab_next_field();
+        app.trigger_tab_edit_branch();
         assert!(app.trigger_branch_focused);
         assert!(app.trigger_input_cursor.is_none());
         // Branch → row 0 key.
@@ -3991,11 +4291,38 @@ mod tests {
     }
 
     #[test]
+    fn trigger_tab_edit_inputs_opens_the_first_row_or_adds_one() {
+        let mut app = make_app();
+        app.trigger_tab_edit_inputs();
+        assert_eq!(
+            app.trigger_inputs.len(),
+            1,
+            "adds a row when there are none"
+        );
+        assert_eq!(
+            (app.trigger_input_cursor, app.trigger_input_on_value),
+            (Some(0), false)
+        );
+
+        let mut app = make_app();
+        app.trigger_inputs = vec![("a".into(), "1".into()), ("b".into(), "2".into())];
+        app.trigger_tab_edit_branch();
+        app.trigger_tab_edit_inputs();
+        assert!(!app.trigger_branch_focused);
+        assert_eq!(app.trigger_inputs.len(), 2);
+        assert_eq!(
+            (app.trigger_input_cursor, app.trigger_input_on_value),
+            (Some(0), false)
+        );
+    }
+
+    #[test]
     fn trigger_tab_prev_field_reverses_direction() {
         let mut app = make_app();
         app.trigger_inputs = vec![("a".into(), "1".into()), ("b".into(), "2".into())];
-        // From fresh state: None → row 1 value (backward wrap through
-        // the input grid; Branch sits before row 0 in forward order).
+        // Branch → last input value (backward wrap through the input
+        // grid; Branch sits before row 0 in forward order).
+        app.trigger_tab_edit_branch();
         app.trigger_tab_prev_field();
         assert_eq!(
             (app.trigger_input_cursor, app.trigger_input_on_value),

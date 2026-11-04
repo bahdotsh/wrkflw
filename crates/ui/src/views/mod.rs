@@ -12,6 +12,11 @@ mod trigger_tab;
 mod tweaks_overlay;
 mod workflows_tab;
 
+pub use job_detail::StepOutputCache;
+
+/// Number of sub-tabs in the step inspector, for Tab cycling.
+pub const INSPECTOR_TABS: usize = job_detail::INSPECTOR_TABS.len();
+
 pub use title_bar::{
     TAB_COUNT, TAB_DAG, TAB_EXECUTION, TAB_HELP, TAB_LOGS, TAB_RUNS, TAB_SECRETS, TAB_TRIGGER,
     TAB_WORKFLOWS,
@@ -49,25 +54,16 @@ pub fn render_ui(f: &mut Frame<'_>, app: &mut App) {
     let (r, g, b) = app.tweaks_accent.rgb();
     let _accent = AccentScope::install(ratatui::style::Color::Rgb(r, g, b));
 
-    // Check if help should be shown as an overlay
-    if app.show_help {
-        help_overlay::render_help_overlay(f, app.help_scroll);
-        return;
-    }
-
     let size = f.area();
 
     // Create main layout
     let main_chunks = ratatui::layout::Layout::default()
         .direction(ratatui::layout::Direction::Vertical)
-        .constraints(
-            [
-                ratatui::layout::Constraint::Length(1), // Title bar and tabs
-                ratatui::layout::Constraint::Min(5),    // Main content
-                ratatui::layout::Constraint::Length(1), // Status bar
-            ]
-            .as_ref(),
-        )
+        .constraints([
+            ratatui::layout::Constraint::Length(1), // Title bar and tabs
+            ratatui::layout::Constraint::Min(0),    // Main content
+            ratatui::layout::Constraint::Length(1), // Status bar
+        ])
         .split(size);
 
     // Render title bar with tabs
@@ -88,7 +84,7 @@ pub fn render_ui(f: &mut Frame<'_>, app: &mut App) {
         TAB_TRIGGER => trigger_tab::render_trigger_tab(f, app, main_chunks[1]),
         TAB_SECRETS => secrets_tab::render_secrets_tab(f, app, main_chunks[1]),
         TAB_RUNS => runs_tab::render_runs_tab(f, app, main_chunks[1]),
-        TAB_HELP => help_overlay::render_help_content(f, main_chunks[1], app.help_scroll),
+        TAB_HELP => help_overlay::render_help_content(f, main_chunks[1], &mut app.help_scroll),
         _ => {}
     }
 
@@ -99,6 +95,11 @@ pub fn render_ui(f: &mut Frame<'_>, app: &mut App) {
     // (matches the floating `TweaksPanel` in the design's bottom-right).
     if app.tweaks_open {
         tweaks_overlay::render_tweaks_overlay(f, app, size);
+    }
+
+    // Help floats over the current screen so it stays in context.
+    if app.show_help {
+        help_overlay::render_help_overlay(f, &mut app.help_scroll);
     }
 }
 

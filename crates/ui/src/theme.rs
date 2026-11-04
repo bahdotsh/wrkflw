@@ -6,9 +6,13 @@
 // from this module instead of hardcoding.
 
 use ratatui::{
+    layout::{Margin, Rect},
     style::{Color, Modifier, Style},
-    text::Span,
-    widgets::{Block, BorderType, Borders},
+    text::{Line, Span},
+    widgets::{
+        Block, BorderType, Borders, Padding, Scrollbar, ScrollbarOrientation, ScrollbarState,
+    },
+    Frame,
 };
 use std::cell::Cell;
 use std::ops::Deref;
@@ -175,6 +179,11 @@ pub struct Colors {
     pub runtime_kubernetes: Color,
     pub runtime_emulation: Color,
     pub runtime_secure: Color,
+
+    // Tool output: the two basic ANSI colours that have no semantic
+    // status of their own.
+    pub ansi_blue: Color,
+    pub ansi_magenta: Color,
 }
 
 /// The active palette. Dereferences to [`Colors`], so `COLORS.text`
@@ -203,12 +212,12 @@ static DARK: Colors = Colors {
 
     text: Color::Rgb(0xd7, 0xdd, 0xe4),
     text_dim: Color::Rgb(0x88, 0x90, 0xa0),
-    text_muted: Color::Rgb(0x56, 0x5e, 0x6b),
+    text_muted: Color::Rgb(0x6b, 0x73, 0x82),
 
-    border: Color::Rgb(0x2a, 0x2f, 0x38),
+    border: Color::Rgb(0x3e, 0x45, 0x52),
     border_focused: Color::Rgb(0x5f, 0xd3, 0xf3),
 
-    bg_selected: Color::Rgb(0x1a, 0x20, 0x28),
+    bg_selected: Color::Rgb(0x2c, 0x34, 0x42),
     bg_panel: Color::Rgb(0x0f, 0x12, 0x16),
     bg_bar: Color::Rgb(0x14, 0x17, 0x1c),
     bg_dark: Color::Rgb(0x07, 0x09, 0x0b),
@@ -218,6 +227,8 @@ static DARK: Colors = Colors {
     runtime_kubernetes: Color::Rgb(0x9f, 0x8f, 0xff),
     runtime_emulation: Color::Rgb(0xff, 0x99, 0x66),
     runtime_secure: Color::Rgb(0x8f, 0xce, 0x8f),
+    ansi_blue: Color::Rgb(0x5f, 0xa3, 0xff),
+    ansi_magenta: Color::Rgb(0xd6, 0x8c, 0xff),
 };
 
 // `bg_dark` keeps its role here: it is the bar background and the text on
@@ -249,6 +260,8 @@ static LIGHT: Colors = Colors {
     runtime_kubernetes: Color::Rgb(0x4b, 0x3f, 0xb3),
     runtime_emulation: Color::Rgb(0xa8, 0x47, 0x00),
     runtime_secure: Color::Rgb(0x1f, 0x75, 0x1f),
+    ansi_blue: Color::Rgb(0x1f, 0x5f, 0xbf),
+    ansi_magenta: Color::Rgb(0x7b, 0x2f, 0xbf),
 };
 
 // ── Symbols ────────────────────────────────────────────────────────
@@ -269,9 +282,12 @@ pub fn selected_style() -> Style {
         .add_modifier(Modifier::BOLD)
 }
 
+/// Gutter marker drawn beside the selected row of every list.
+pub const SELECTED_MARK: &str = "▌ ";
+
 pub fn header_style() -> Style {
     Style::default()
-        .fg(COLORS.highlight)
+        .fg(COLORS.text_muted)
         .add_modifier(Modifier::BOLD)
 }
 
@@ -333,6 +349,18 @@ pub fn workflow_status_animated(
     }
 }
 
+pub fn job_state(state: crate::models::JobState, spinner_frame: usize) -> (&'static str, Style) {
+    use crate::models::JobState;
+    match state {
+        JobState::Success => (symbols::SUCCESS, Style::default().fg(COLORS.success)),
+        JobState::Failure => (symbols::FAILURE, Style::default().fg(COLORS.error)),
+        JobState::FailureAllowed => (symbols::FAILURE, Style::default().fg(COLORS.warning)),
+        JobState::Skipped => (symbols::SKIPPED, Style::default().fg(COLORS.text_muted)),
+        JobState::Running => (spinner(spinner_frame), Style::default().fg(COLORS.info)),
+        JobState::Pending => (symbols::NOT_STARTED, Style::default().fg(COLORS.text_muted)),
+    }
+}
+
 pub fn job_status(status: &JobStatus) -> (&'static str, Style) {
     match status {
         JobStatus::Success => (symbols::SUCCESS, Style::default().fg(COLORS.success)),
@@ -352,22 +380,133 @@ pub fn step_status(status: &StepStatus) -> (&'static str, Style) {
 // ── Block Helpers ──────────────────────────────────────────────────
 
 pub fn block<'a>(title: &'a str) -> Block<'a> {
-    Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(COLORS.border))
-        .title(Span::styled(format!(" {} ", title), title_style()))
+    panel(title, false)
 }
 
 pub fn block_focused<'a>(title: &'a str) -> Block<'a> {
-    Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(current_accent()))
-        .title(Span::styled(format!(" {} ", title), title_style()))
+    panel(title, true)
 }
 
-// ── Badge Helpers ──────────────────────────────────────────────────
+/// The one panel style every pane shares: rounded border, a title that
+/// lights up with the accent when the pane has focus, and a cell of
+/// horizontal padding so text never touches the border.
+pub fn panel<'a>(title: &'a str, focused: bool) -> Block<'a> {
+    let (border, title_style) = if focused {
+        (
+            current_accent(),
+            Style::default()
+                .fg(current_accent())
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        (
+            COLORS.border,
+            Style::default()
+                .fg(COLORS.text_dim)
+                .add_modifier(Modifier::BOLD),
+        )
+    };
+    let mut block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(border))
+        .padding(Padding::horizontal(1));
+    if !title.is_empty() {
+        block = block.title(Line::from(Span::styled(format!(" {title} "), title_style)));
+    }
+    block
+}
+
+/// Adds a dim right-aligned label to a panel's top border, for counts
+/// and positions like `3/40`.
+pub fn with_badge<'a>(block: Block<'a>, badge: impl Into<String>) -> Block<'a> {
+    let badge = badge.into();
+    if badge.is_empty() {
+        return block;
+    }
+    block.title_top(Line::from(Span::styled(format!(" {badge} "), muted_style())).right_aligned())
+}
+
+/// Small-caps style heading for a group of rows inside a panel.
+pub fn section<'a>(title: impl Into<String>) -> Line<'a> {
+    Line::from(Span::styled(
+        title.into().to_uppercase(),
+        Style::default()
+            .fg(COLORS.text_muted)
+            .add_modifier(Modifier::BOLD),
+    ))
+}
+
+/// Builds `key desc  key desc …`, dropping whole hints from the end
+/// rather than cutting one in half when the row is too narrow.
+pub fn hint_spans<'a>(hints: &[(&str, &str)], max_width: usize) -> Vec<Span<'a>> {
+    let mut spans: Vec<Span> = Vec::new();
+    let mut used = 0;
+    for (i, (key, desc)) in hints.iter().enumerate() {
+        let sep = if i == 0 { 0 } else { 3 };
+        let w = sep + crate::text::width(key) + 1 + crate::text::width(desc);
+        if used + w > max_width {
+            break;
+        }
+        if sep > 0 {
+            spans.push(Span::styled("   ", muted_style()));
+        }
+        spans.push(Span::styled(
+            key.to_string(),
+            Style::default()
+                .fg(current_accent())
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(format!(" {desc}"), hint_style()));
+        used += w;
+    }
+    spans
+}
+
+/// Draws a slim vertical scrollbar over the right border of `area` when
+/// `total` rows don't fit in `viewport`.
+pub fn scrollbar(f: &mut Frame<'_>, area: Rect, total: usize, position: usize, viewport: usize) {
+    if total <= viewport || area.height < 3 {
+        return;
+    }
+    let mut state = ScrollbarState::new(total.saturating_sub(viewport))
+        .position(position.min(total.saturating_sub(viewport)))
+        .viewport_content_length(viewport);
+    let bar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+        .begin_symbol(None)
+        .end_symbol(None)
+        .track_symbol(Some("│"))
+        .thumb_symbol("┃")
+        .track_style(Style::default().fg(COLORS.border))
+        .thumb_style(Style::default().fg(current_accent()));
+    f.render_stateful_widget(
+        bar,
+        area.inner(Margin {
+            vertical: 1,
+            horizontal: 0,
+        }),
+        &mut state,
+    );
+}
+
+/// Centred, muted message for a pane with nothing to show yet.
+pub fn empty_state(f: &mut Frame<'_>, area: Rect, title: &str, hint: Vec<Span<'_>>) {
+    let top = area.height.saturating_sub(2) / 2;
+    let mut lines: Vec<Line> = (0..top).map(|_| Line::from("")).collect();
+    lines.push(Line::from(Span::styled(
+        title.to_string(),
+        Style::default()
+            .fg(COLORS.text_dim)
+            .add_modifier(Modifier::BOLD),
+    )));
+    if !hint.is_empty() {
+        lines.push(Line::from(hint));
+    }
+    f.render_widget(
+        ratatui::widgets::Paragraph::new(lines).alignment(ratatui::layout::Alignment::Center),
+        area,
+    );
+}
 
 #[derive(Copy, Clone, Debug)]
 pub enum BadgeKind {
@@ -437,8 +576,8 @@ pub fn key_chip<'a>(key: impl Into<String>) -> Span<'a> {
     Span::styled(
         format!(" {} ", key.into()),
         Style::default()
-            .bg(COLORS.bg_bar)
-            .fg(COLORS.highlight)
+            .bg(COLORS.bg_selected)
+            .fg(current_accent())
             .add_modifier(Modifier::BOLD),
     )
 }

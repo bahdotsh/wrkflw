@@ -36,7 +36,12 @@ impl ProcessedLogEntry {
         Row::new(vec![
             Cell::from(self.timestamp.clone()).style(theme::muted_style()),
             Cell::from(format!(" {} ", self.log_type)).style(self.log_style),
-            Cell::from(Line::from(self.content_spans.clone())),
+            Cell::from(Line::from(
+                self.content_spans
+                    .iter()
+                    .map(|s| Span::styled(crate::text::sanitize(&s.content).into_owned(), s.style))
+                    .collect::<Vec<_>>(),
+            )),
         ])
     }
 }

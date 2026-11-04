@@ -5,7 +5,6 @@ mod progress_bar;
 
 pub mod dag;
 pub mod progress_dots;
-pub mod timing;
 
 // Re-export components for easier access
 pub use button::Button;

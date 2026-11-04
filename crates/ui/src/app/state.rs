@@ -157,6 +157,12 @@ pub struct App {
     pub run_generation: u64,
     /// Parsed output of the step the inspector last showed.
     pub step_output_cache: Option<crate::views::StepOutputCache>,
+    /// Matrix run counts for the DAG cards, computed once per parsed
+    /// workflow rather than expanding every matrix on every frame.
+    pub dag_matrix_labels: Option<(
+        Arc<wrkflw_parser::workflow::WorkflowDefinition>,
+        HashMap<String, String>,
+    )>,
 
     // ── DAG tab ───────────────────────────────────────────────────
     /// When true, the DAG tab renders the topological-stage list view;
@@ -536,6 +542,7 @@ impl App {
             dag_scroll: 0,
             run_generation: 0,
             step_output_cache: None,
+            dag_matrix_labels: None,
 
             dag_list_view: false,
 

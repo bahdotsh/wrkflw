@@ -14,7 +14,12 @@ use ratatui::{
     widgets::Paragraph,
     Frame,
 };
+use std::collections::HashMap;
+use std::sync::Arc;
 use wrkflw_parser::workflow::WorkflowDefinition;
+
+/// Job name → matrix run count label, e.g. `6` or `?`.
+type MatrixLabels = HashMap<String, String>;
 
 const MIN_CARD_W: u16 = 16;
 const MAX_CARD_W: u16 = 28;
@@ -58,13 +63,40 @@ pub fn render_dag_tab(f: &mut Frame<'_>, app: &mut App, area: Rect) {
         return;
     };
 
+    // Expanding a matrix materialises every combination; do it once per
+    // parsed workflow, not for every card on every frame.
+    let fresh = matches!(&app.dag_matrix_labels, Some((d, _)) if Arc::ptr_eq(d, &def));
+    if !fresh {
+        let labels: MatrixLabels = def
+            .jobs
+            .iter()
+            .filter_map(|(name, job)| {
+                let label = job.matrix_config().and_then(matrix_size_label)?;
+                Some((name.clone(), label))
+            })
+            .collect();
+        app.dag_matrix_labels = Some((Arc::clone(&def), labels));
+    }
+    let labels = app
+        .dag_matrix_labels
+        .as_ref()
+        .map(|(_, l)| l)
+        .expect("labels were just filled");
+
     let levels = dag::topo_levels(&def);
     let scroll = if app.dag_list_view {
-        render_list(f, app, workflow, &def, &levels, body[0])
+        render_list(f, app, workflow, &def, labels, &levels, body[0])
     } else {
-        render_graph(f, app, workflow, &def, &levels, body[0])
+        render_graph(f, app, workflow, &def, labels, &levels, body[0])
     };
     app.dag_scroll = scroll;
+}
+
+fn matrix_suffix(labels: &MatrixLabels, job: &str) -> String {
+    labels
+        .get(job)
+        .map(|n| format!(" ×{n}"))
+        .unwrap_or_default()
 }
 
 fn title(workflow: &Workflow) -> String {
@@ -88,6 +120,7 @@ fn render_graph(
     app: &App,
     workflow: &Workflow,
     def: &WorkflowDefinition,
+    labels: &MatrixLabels,
     levels: &[Vec<String>],
     area: Rect,
 ) -> usize {
@@ -163,7 +196,7 @@ fn render_graph(
                 break;
             }
             let card = Rect::new(x, y, card_w, CARD_H);
-            render_card(f, app, workflow, def, name, card);
+            render_card(f, app, workflow, labels, name, card);
 
             let has_needs = def
                 .jobs
@@ -197,20 +230,14 @@ fn render_card(
     f: &mut Frame<'_>,
     app: &App,
     workflow: &Workflow,
-    def: &WorkflowDefinition,
+    labels: &MatrixLabels,
     name: &str,
     area: Rect,
 ) {
     let state = workflow.job_state(name);
     let color = state_color(state);
     let (glyph, glyph_style) = theme::job_state(state, app.spinner_frame);
-    let matrix = def
-        .jobs
-        .get(name)
-        .and_then(|j| j.matrix_config())
-        .and_then(matrix_size_label)
-        .map(|n| format!(" ×{n}"))
-        .unwrap_or_default();
+    let matrix = matrix_suffix(labels, name);
 
     let block = ratatui::widgets::Block::bordered()
         .border_type(ratatui::widgets::BorderType::Rounded)
@@ -250,6 +277,7 @@ fn render_list(
     app: &App,
     workflow: &Workflow,
     def: &WorkflowDefinition,
+    labels: &MatrixLabels,
     levels: &[Vec<String>],
     area: Rect,
 ) -> usize {
@@ -274,11 +302,7 @@ fn render_list(
                 .filter(|n| !n.is_empty())
                 .map(|n| format!("  ← {}", n.join(", ")))
                 .unwrap_or_default();
-            let matrix = job
-                .and_then(|j| j.matrix_config())
-                .and_then(matrix_size_label)
-                .map(|n| format!(" ×{n}"))
-                .unwrap_or_default();
+            let matrix = matrix_suffix(labels, name);
             let name = text::sanitize(name).into_owned();
             let mut spans = vec![
                 Span::styled(glyph, style),

@@ -388,8 +388,10 @@ impl App {
                 let detected = match std::panic::catch_unwind(|| {
                     std::thread::scope(|s| {
                         let h = s.spawn(|| wrkflw_executor::detect_runtime(RuntimeType::Auto));
+                        // The probes bound themselves. A shorter limit here
+                        // would only call a slow but working runtime missing.
                         let start = std::time::Instant::now();
-                        let timeout = std::time::Duration::from_secs(1);
+                        let timeout = std::time::Duration::from_secs(30);
                         while start.elapsed() < timeout {
                             if h.is_finished() {
                                 return h.join().unwrap_or(RuntimeType::Emulation);
@@ -438,9 +440,10 @@ impl App {
                             .unwrap_or(false)
                         });
 
-                        // Set a short timeout for the thread
+                        // The probe bounds itself. A shorter limit here would
+                        // only call a slow but working runtime unavailable.
                         let start = std::time::Instant::now();
-                        let timeout = std::time::Duration::from_secs(1);
+                        let timeout = std::time::Duration::from_secs(15);
 
                         while start.elapsed() < timeout {
                             if handle.is_finished() {
@@ -486,9 +489,10 @@ impl App {
                             .unwrap_or(false)
                         });
 
-                        // Set a short timeout for the thread
+                        // The probe bounds itself. A shorter limit here would
+                        // only call a slow but working runtime unavailable.
                         let start = std::time::Instant::now();
-                        let timeout = std::time::Duration::from_secs(1);
+                        let timeout = std::time::Duration::from_secs(15);
 
                         while start.elapsed() < timeout {
                             if handle.is_finished() {

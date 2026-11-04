@@ -164,29 +164,25 @@ pub async fn execute_workflow_cli(
                 RuntimeType::Emulation
             }
         }
+        // Asked for by name, so a missing runtime fails the run rather than
+        // running the steps on this machine instead.
         RuntimeType::Docker => {
             if !wrkflw_executor::docker::is_available() {
-                println!(
-                    "{}",
-                    cli_style::warning("Docker is not available. Using emulation mode instead.")
-                );
-                wrkflw_logging::warning("Docker is not available. Using emulation mode instead.");
-                RuntimeType::Emulation
-            } else {
-                RuntimeType::Docker
+                return Err(io::Error::other(
+                    "Docker is not available: the daemon did not answer. Start Docker, \
+                     or use the auto runtime to fall back to another one",
+                ));
             }
+            RuntimeType::Docker
         }
         RuntimeType::Podman => {
             if !wrkflw_executor::podman::is_available() {
-                println!(
-                    "{}",
-                    cli_style::warning("Podman is not available. Using emulation mode instead.")
-                );
-                wrkflw_logging::warning("Podman is not available. Using emulation mode instead.");
-                RuntimeType::Emulation
-            } else {
-                RuntimeType::Podman
+                return Err(io::Error::other(
+                    "Podman is not available: it did not answer. Start the Podman machine, \
+                     or use the auto runtime to fall back to another one",
+                ));
             }
+            RuntimeType::Podman
         }
         // Reachability is checked by the executor, which fails the run
         // instead of falling back to the host.

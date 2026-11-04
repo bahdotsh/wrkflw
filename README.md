@@ -356,6 +356,8 @@ The TUI's Runs tab shows the same history, including which agent started each ru
 | **Emulation** | Runs directly on host, no containers needed | Quick local testing |
 | **Secure Emulation** | Sandboxed host processes with filesystem/network restrictions | Running untrusted workflows without a container runtime |
 
+Only **Auto** falls back. If you pass `--runtime docker` or `--runtime podman` and it doesn't answer, the run fails rather than running your steps on this machine.
+
 ### Kubernetes runtime
 
 `--runtime kubernetes` dispatches every step to the cluster `kubectl` is configured for. It is never auto-detected, and it never falls back to running on your machine: if the cluster is unreachable, the run fails.

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
+use wrkflw_runtime::container::PATH_ADDITIONS_ENV;
 
 /// Parsed results from all 4 GitHub Actions environment files after a step runs.
 #[derive(Default)]
@@ -174,11 +175,21 @@ pub fn apply_step_environment_updates(
             .unwrap_or_default();
         let new_entries = updates.path_entries.join(":");
         let new_path = if current_path.is_empty() {
-            new_entries
+            new_entries.clone()
         } else {
             format!("{}:{}", new_entries, current_path)
         };
         job_env.insert("PATH".to_string(), new_path);
+
+        // `PATH` above is built on this machine's PATH, which is right for
+        // emulation but not inside a container, whose image has its own.
+        // Container runtimes put these entries in front of the image's PATH
+        // instead, as GitHub's runner does for container jobs.
+        let additions = match job_env.get(PATH_ADDITIONS_ENV) {
+            Some(older) if !older.is_empty() => format!("{}:{}", new_entries, older),
+            _ => new_entries,
+        };
+        job_env.insert(PATH_ADDITIONS_ENV.to_string(), additions);
     }
 
     // Clear files so the next step doesn't re-process these entries
@@ -444,6 +455,8 @@ mod tests {
         assert_eq!(job_user_env.get("CC").unwrap(), "gcc");
         // Path prepended
         assert_eq!(job_env.get("PATH").unwrap(), "/opt/gcc/bin:/usr/bin");
+        // and recorded on its own, for a container to put in front of its PATH
+        assert_eq!(job_env.get(PATH_ADDITIONS_ENV).unwrap(), "/opt/gcc/bin");
         // PATH updates from $GITHUB_PATH must NOT appear in user_env
         assert!(
             !job_user_env.contains_key("PATH"),

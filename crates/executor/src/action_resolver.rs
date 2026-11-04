@@ -71,11 +71,16 @@ impl BoundedCache {
 
 static ACTION_CACHE: Lazy<RwLock<BoundedCache>> = Lazy::new(|| RwLock::new(BoundedCache::new()));
 
+/// How long to wait for an action's metadata. Results are cached, so this is
+/// paid once per action. The fallback ignores the action's inputs, so a slow
+/// network is better waited for than given up on: some take 7s or more just
+/// to connect to GitHub.
+const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
 /// Shared HTTP client to avoid repeated TLS initialization.
-/// Timeout is kept low (5s) since resolution is best-effort with a fallback.
 static HTTP_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
     reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
+        .timeout(FETCH_TIMEOUT)
         .user_agent("wrkflw")
         .build()
         .expect("Failed to create HTTP client")
@@ -86,7 +91,7 @@ static HTTP_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
 /// Reused across requests to avoid per-request TLS initialization.
 static NO_REDIRECT_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
     reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
+        .timeout(FETCH_TIMEOUT)
         .user_agent("wrkflw")
         .redirect(reqwest::redirect::Policy::none())
         .build()

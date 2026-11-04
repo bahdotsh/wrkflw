@@ -192,16 +192,42 @@ fn compute_hash_files(args_raw: &str, workspace: &Path) -> Result<String, String
         .canonicalize()
         .map_err(|e| format!("hashFiles: cannot canonicalize workspace: {}", e))?;
     let mut matched_files = Vec::new();
+    // The glob crate's trailing `**` matches the directories below the one it
+    // follows but not that one, so `app/**` would miss the files in `app`
+    // itself. Matching the parent too, which expands to every file under it
+    // below, gives GitHub's meaning.
+    let mut globs: Vec<String> = Vec::new();
     for pattern in &patterns {
         let full_pattern = workspace.join(pattern).to_string_lossy().to_string();
-        if let Ok(entries) = glob::glob(&full_pattern) {
+        if let Some(parent) = pattern.strip_suffix("**") {
+            let parent = parent.trim_end_matches('/');
+            globs.push(workspace.join(parent).to_string_lossy().to_string());
+        }
+        globs.push(full_pattern);
+    }
+    for full_pattern in &globs {
+        if let Ok(entries) = glob::glob(full_pattern) {
             for entry in entries.flatten() {
-                if entry.is_file() && !entry.is_symlink() {
+                if entry.is_symlink() {
+                    continue;
+                }
+                // A pattern that matches a directory stands for every file
+                // under it, as in GitHub's glob. That is what makes
+                // `hashFiles('src/**')` hash the files in `src`: here `**`
+                // only matches directories.
+                let files = if entry.is_dir() {
+                    files_under(&entry)
+                } else if entry.is_file() {
+                    vec![entry]
+                } else {
+                    Vec::new()
+                };
+                for file in files {
                     // Verify the resolved file stays within the workspace
                     // (prevents symlink traversal outside the repo).
-                    if let Ok(canonical) = entry.canonicalize() {
+                    if let Ok(canonical) = file.canonicalize() {
                         if canonical.starts_with(&canonical_workspace) {
-                            matched_files.push(entry);
+                            matched_files.push(file);
                         }
                     }
                 }
@@ -229,6 +255,28 @@ fn compute_hash_files(args_raw: &str, workspace: &Path) -> Result<String, String
     }
 
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Every regular file under `dir`, without following symbolic links.
+fn files_under(dir: &Path) -> Vec<std::path::PathBuf> {
+    let mut files = Vec::new();
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_dir() {
+                pending.push(entry.path());
+            } else if kind.is_file() {
+                files.push(entry.path());
+            }
+        }
+    }
+    files
 }
 
 /// Apply all expression substitutions to a text string.
@@ -448,6 +496,44 @@ mod tests {
         let result = preprocess_hash_files(text, dir.path()).unwrap();
 
         assert_eq!(result.len(), 64);
+    }
+
+    #[test]
+    fn hash_files_directory_pattern_hashes_the_files_under_it() {
+        let dir = tempdir().unwrap();
+        let app = dir.path().join("app");
+        fs::create_dir_all(app.join("nested")).unwrap();
+        fs::write(app.join("main.py"), "print(1)").unwrap();
+        fs::write(app.join("nested").join("lib.py"), "x = 1").unwrap();
+
+        let star_star = preprocess_hash_files("${{ hashFiles('app/**') }}", dir.path()).unwrap();
+        assert_eq!(star_star.len(), 64, "app/** must match the files in app");
+        // The directory itself, and an explicit file list, hash the same files.
+        assert_eq!(
+            preprocess_hash_files("${{ hashFiles('app') }}", dir.path()).unwrap(),
+            star_star
+        );
+        assert_eq!(
+            preprocess_hash_files(
+                "${{ hashFiles('app/main.py', 'app/nested/lib.py') }}",
+                dir.path()
+            )
+            .unwrap(),
+            star_star
+        );
+
+        // A wildcard before the trailing `**` works the same way.
+        assert_eq!(
+            preprocess_hash_files("${{ hashFiles('ap*/**') }}", dir.path()).unwrap(),
+            star_star
+        );
+
+        // A change to a nested file changes the hash.
+        fs::write(app.join("nested").join("lib.py"), "x = 2").unwrap();
+        assert_ne!(
+            preprocess_hash_files("${{ hashFiles('app/**') }}", dir.path()).unwrap(),
+            star_star
+        );
     }
 
     #[test]

@@ -9,7 +9,8 @@ use tempfile;
 use tokio::process::Command;
 use wrkflw_logging;
 use wrkflw_runtime::container::{
-    ContainerError, ContainerOutput, ContainerRuntime, LOCAL_IMAGE_PREFIX,
+    container_env, container_path, path_from_image_env, ContainerError, ContainerOutput,
+    ContainerRuntime, LOCAL_IMAGE_PREFIX,
 };
 use wrkflw_utils;
 use wrkflw_utils::fd;
@@ -212,9 +213,19 @@ impl PodmanRuntime {
     }
 }
 
+/// How long the availability probe waits for the CLI to answer.
+const PROBE_CLI_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+/// How long the availability probe waits for the daemon to answer.
+const PROBE_DAEMON_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// How long the whole availability probe may take.
+const PROBE_OVERALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
 pub fn is_available() -> bool {
-    // Use a very short timeout for the entire availability check
-    let overall_timeout = std::time::Duration::from_secs(3);
+    // A stopped daemon or a missing CLI fails at once, so these limits only
+    // matter for one that is slow to answer, as Docker Desktop is while it
+    // wakes from Resource Saver. Giving up too early there would run the
+    // workflow somewhere other than the container the user asked for.
+    let overall_timeout = PROBE_OVERALL_TIMEOUT;
 
     // Spawn a thread with the timeout to prevent blocking the main thread
     let handle = std::thread::spawn(move || {
@@ -235,8 +246,8 @@ pub fn is_available() -> bool {
                     Ok(mut child) => {
                         // Set a very short timeout for the process
                         let status = std::thread::scope(|_| {
-                            // Try to wait for a short time
-                            for _ in 0..10 {
+                            let deadline = std::time::Instant::now() + PROBE_CLI_TIMEOUT;
+                            while std::time::Instant::now() < deadline {
                                 match child.try_wait() {
                                     Ok(Some(status)) => return status.success(),
                                     Ok(None) => {
@@ -277,14 +288,12 @@ pub fn is_available() -> bool {
             };
 
             runtime.block_on(async {
-                match tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                match tokio::time::timeout(PROBE_DAEMON_TIMEOUT, async {
                     let mut cmd = Command::new("podman");
                     cmd.args(["info", "--format", "{{.Host.Hostname}}"]);
                     cmd.stdout(Stdio::null()).stderr(Stdio::null());
 
-                    match tokio::time::timeout(std::time::Duration::from_secs(1), cmd.output())
-                        .await
-                    {
+                    match tokio::time::timeout(PROBE_DAEMON_TIMEOUT, cmd.output()).await {
                         Ok(Ok(output)) => {
                             if output.status.success() {
                                 true
@@ -298,7 +307,7 @@ pub fn is_available() -> bool {
                             false
                         }
                         Err(_) => {
-                            wrkflw_logging::debug("Podman info command timed out after 1 second");
+                            wrkflw_logging::debug("Podman info command timed out");
                             false
                         }
                     }
@@ -692,6 +701,50 @@ impl ContainerRuntime for PodmanRuntime {
     }
 }
 
+/// The PATH `image` sets in its config, pulling the image first if it isn't
+/// local yet. `None` if neither works.
+async fn image_path(image: &str) -> Option<String> {
+    async fn inspect(image: &str) -> Option<String> {
+        let output = Command::new("podman")
+            .args([
+                "image",
+                "inspect",
+                "--format",
+                "{{range .Config.Env}}{{println .}}{{end}}",
+                image,
+            ])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .await
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let text = String::from_utf8_lossy(&output.stdout);
+        path_from_image_env(&text.lines().collect::<Vec<_>>())
+    }
+    if let Some(path) = inspect(image).await {
+        return Some(path);
+    }
+    if image.starts_with(LOCAL_IMAGE_PREFIX) {
+        return None;
+    }
+    let pulled = Command::new("podman")
+        .args(["pull", "--quiet", image])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .ok()?;
+    if pulled.success() {
+        inspect(image).await
+    } else {
+        None
+    }
+}
+
 // Implementation of internal methods
 impl PodmanRuntime {
     async fn run_container_inner(
@@ -715,8 +768,15 @@ impl PodmanRuntime {
         let mut env_strings = Vec::new();
         let mut volume_strings = Vec::new();
 
-        // Prepare environment variable strings
-        for (key, value) in env_vars {
+        // Steps that added to `$GITHUB_PATH` extend the image's PATH, not
+        // the host's, so look the image's up only when there is something
+        // to add to it.
+        let image_path = if container_path(env_vars, None).is_some() {
+            image_path(image).await
+        } else {
+            None
+        };
+        for (key, value) in container_env(env_vars, image_path.as_deref()) {
             env_strings.push(format!("{}={}", key, value));
         }
 

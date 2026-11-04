@@ -275,19 +275,24 @@ fn record_job_results(
         } else {
             &job_result.status
         };
-        if all_job_outputs.contains_key(&job_result.canonical_name)
-            && job_result.name != job_result.canonical_name
-        {
-            wrkflw_logging::warning(&format!(
-                "Matrix job '{}' overwrites outputs for '{}' — \
-                 needs.{}.outputs will reflect the last combination only",
-                job_result.name, job_result.canonical_name, job_result.canonical_name,
-            ));
+        let outputs = all_job_outputs
+            .entry(job_result.canonical_name.clone())
+            .or_default();
+        for (key, value) in &job_result.outputs {
+            if let Some(previous) = outputs.insert(key.clone(), value.clone()) {
+                if previous != *value && job_result.name != job_result.canonical_name {
+                    wrkflw_logging::warning(&format!(
+                        "Matrix job '{}' overwrites output '{}' of '{}' — \
+                         needs.{}.outputs.{} will reflect the last combination to set it",
+                        job_result.name,
+                        key,
+                        job_result.canonical_name,
+                        job_result.canonical_name,
+                        key,
+                    ));
+                }
+            }
         }
-        all_job_outputs.insert(
-            job_result.canonical_name.clone(),
-            job_result.outputs.clone(),
-        );
         aggregate
             .entry(job_result.canonical_name.as_str())
             .and_modify(|existing| {
@@ -939,9 +944,10 @@ fn emulation_runtime() -> (Box<dyn ContainerRuntime>, RuntimeType) {
     )
 }
 
-/// Determine if Docker/Podman is available or fall back to emulation. Returns
-/// the runtime with its type, which is `Emulation` after a fallback whatever
-/// was requested.
+/// Set up the runtime to run on. `Auto` falls back to emulation when no
+/// container runtime answers. An explicit Docker or Podman request never
+/// does: emulation runs steps on this machine, which is not what someone who
+/// asked for a container agreed to, so it is an error instead.
 fn initialize_runtime(
     runtime_type: RuntimeType,
     preserve_containers_on_failure: bool,
@@ -954,34 +960,35 @@ fn initialize_runtime(
             kubernetes,
         ),
         RuntimeType::Docker => {
-            if docker::is_available() {
-                match docker::DockerRuntime::new_with_config(preserve_containers_on_failure) {
-                    Ok(docker_runtime) => Ok((Box::new(docker_runtime), RuntimeType::Docker)),
-                    Err(e) => {
-                        wrkflw_logging::error(&format!(
-                            "Failed to initialize Docker runtime: {}, falling back to emulation mode",
-                            e
-                        ));
-                        Ok(emulation_runtime())
-                    }
-                }
-            } else {
-                wrkflw_logging::error("Docker not available, falling back to emulation mode");
-                Ok(emulation_runtime())
+            if !docker::is_available() {
+                return Err(ExecutionError::Runtime(
+                    "Docker is not available: the daemon did not answer. Start Docker, \
+                     or pass --runtime auto to fall back to another runtime"
+                        .to_string(),
+                ));
+            }
+            match docker::DockerRuntime::new_with_config(preserve_containers_on_failure) {
+                Ok(docker_runtime) => Ok((Box::new(docker_runtime), RuntimeType::Docker)),
+                Err(e) => Err(ExecutionError::Runtime(format!(
+                    "Failed to initialize Docker runtime: {}",
+                    e
+                ))),
             }
         }
         RuntimeType::Podman => {
-            if podman::is_available() {
-                Ok((
-                    Box::new(podman::PodmanRuntime::new_unchecked(
-                        preserve_containers_on_failure,
-                    )),
-                    RuntimeType::Podman,
-                ))
-            } else {
-                wrkflw_logging::error("Podman not available, falling back to emulation mode");
-                Ok(emulation_runtime())
+            if !podman::is_available() {
+                return Err(ExecutionError::Runtime(
+                    "Podman is not available: it did not answer. Start the Podman machine, \
+                     or pass --runtime auto to fall back to another runtime"
+                        .to_string(),
+                ));
             }
+            Ok((
+                Box::new(podman::PodmanRuntime::new_unchecked(
+                    preserve_containers_on_failure,
+                )),
+                RuntimeType::Podman,
+            ))
         }
         // Kubernetes is never auto-detected and never silently replaced:
         // a job meant for a GPU node must not quietly run on the laptop.
@@ -2133,12 +2140,17 @@ fn get_install_script(language: &str, version: &str) -> String {
                 version
             )
         }
+        // Images such as `rust:1` already have rustup, under a `CARGO_HOME`
+        // other than `~/.cargo`, so use the one there and only install it
+        // when it's missing.
         "rust" => {
             format!(
-                "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain {} && \
-                 . $HOME/.cargo/env && \
-                 ln -s $HOME/.cargo/bin/* /usr/local/bin/",
-                version
+                "export PATH=\"${{CARGO_HOME:-$HOME/.cargo}}/bin:$PATH\" && \
+                 (command -v rustup >/dev/null 2>&1 || \
+                  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --default-toolchain {v}) && \
+                 rustup default {v} && \
+                 ln -sf \"$(dirname \"$(command -v rustup)\")\"/* /usr/local/bin/",
+                v = version
             )
         }
         _ => String::new(),
@@ -3304,6 +3316,7 @@ struct PendingCacheSave {
 ///
 /// Groups secret management, artifact/cache stores, pre-resolved secrets, and
 /// upstream job context into a single struct to reduce parameter count.
+#[derive(Clone, Copy)]
 pub(crate) struct JobServices<'a> {
     /// Secret manager for resolving secrets.
     pub secret_manager: Option<&'a SecretManager>,
@@ -3916,7 +3929,7 @@ fn sanitize_timeout_minutes(raw: Option<f64>, default: f64) -> f64 {
     }
 }
 
-// Before the execute_step function, add this struct
+#[derive(Clone, Copy)]
 struct StepExecutionContext<'a> {
     step: &'a workflow::Step,
     step_idx: usize,
@@ -4022,6 +4035,59 @@ fn relative_to_workspace(path: &str, workspace: &str) -> String {
     match Path::new(path).strip_prefix(workspace) {
         Ok(relative) => relative.to_string_lossy().into_owned(),
         Err(_) => path.to_string(),
+    }
+}
+
+/// True when steps run in a container rather than on this machine.
+fn runs_in_container_mode(job_env: &HashMap<String, String>) -> bool {
+    matches!(
+        job_env.get("WRKFLW_RUNTIME_MODE").map(String::as_str),
+        Some("docker" | "podman" | "kubernetes")
+    )
+}
+
+/// The `rustup` commands that add what a Rust toolchain step's `components`
+/// and `targets` (or `target`) inputs ask for, or `None` if it asks for none.
+/// Names are split on commas and whitespace, as `dtolnay/rust-toolchain` does.
+fn rust_toolchain_extras_script(
+    step: &workflow::Step,
+    ctx: &StepExecutionContext<'_>,
+) -> Option<String> {
+    let with = step.with.as_ref()?;
+    let names = |keys: &[&str]| -> Vec<String> {
+        keys.iter()
+            .filter_map(|key| with.get(*key))
+            .map(|value| preprocess_with_value(value, ctx))
+            .flat_map(|value| {
+                value
+                    .split(|c: char| c == ',' || c.is_whitespace())
+                    .filter(|name| !name.is_empty())
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    };
+    // Names reach a shell, so anything but a plain rustup name is refused.
+    let plain = |name: &String| {
+        name.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    };
+    let components: Vec<String> = names(&["components"]).into_iter().filter(plain).collect();
+    let targets: Vec<String> = names(&["targets", "target"])
+        .into_iter()
+        .filter(plain)
+        .collect();
+    let mut commands = Vec::new();
+    if !components.is_empty() {
+        commands.push(format!("rustup component add {}", components.join(" ")));
+    }
+    if !targets.is_empty() {
+        commands.push(format!("rustup target add {}", targets.join(" ")));
+    }
+    if commands.is_empty() {
+        None
+    } else {
+        Some(format!("set -e\n{}\n", commands.join("\n")))
     }
 }
 
@@ -4605,6 +4671,32 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                         if uses.starts_with("actions-rs/toolchain@")
                             || uses.starts_with("dtolnay/rust-toolchain@")
                         {
+                            // The runner image already has the toolchain, but
+                            // not the components or targets the step asks
+                            // for, such as `rustfmt` for `cargo fmt`. Add them
+                            // in the job's container. In emulation that would
+                            // change the user's own toolchain, so it doesn't.
+                            if let Some(script) = rust_toolchain_extras_script(ctx.step, &ctx) {
+                                if runs_in_container_mode(ctx.job_env) {
+                                    let mut extras = ctx.step.clone();
+                                    extras.uses = None;
+                                    extras.with = None;
+                                    extras.shell = Some("sh".to_string());
+                                    extras.run = Some(script);
+                                    let mut result = Box::pin(execute_step(StepExecutionContext {
+                                        step: &extras,
+                                        ..ctx
+                                    }))
+                                    .await?;
+                                    result.name = step_name;
+                                    return Ok(result);
+                                }
+                                wrkflw_logging::warning(&format!(
+                                    "{}: components and targets aren't installed in emulation; \
+                                     add them to your own toolchain if a later step needs them",
+                                    uses
+                                ));
+                            }
                             let rustc_version = tokio::process::Command::new("rustc")
                                 .arg("--version")
                                 .output()
@@ -5720,7 +5812,7 @@ fn prepare_container_mounts(
     // container-side path, mirroring the GITHUB_ENV remap above.
     if is_container_runtime {
         if let Some(action_path) = job_env.get("GITHUB_ACTION_PATH") {
-            let container_action_dir = Path::new("/github/action");
+            let container_action_dir = Path::new(crate::job_session::CONTAINER_ACTION_DIR);
             step_env.insert(
                 "GITHUB_ACTION_PATH".to_string(),
                 container_action_dir.to_string_lossy().to_string(),
@@ -7168,6 +7260,36 @@ async fn resolve_secrets_for_context(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn matrix_outputs_merge_per_key() {
+        let combo = |name: &str, outputs: &[(&str, &str)]| JobResult {
+            name: name.to_string(),
+            canonical_name: "build".to_string(),
+            status: JobStatus::Success,
+            steps: Vec::new(),
+            logs: String::new(),
+            outputs: outputs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            failure_allowed: false,
+        };
+        let results = vec![
+            combo("build (os: a)", &[("linux", "a.tar")]),
+            combo("build (os: b)", &[("mac", "b.tar")]),
+        ];
+        let mut outputs = HashMap::new();
+        let mut statuses = HashMap::new();
+        record_job_results(&results, &mut outputs, &mut statuses);
+        let build = &outputs["build"];
+        assert_eq!(
+            build["linux"], "a.tar",
+            "an earlier combination's key is kept"
+        );
+        assert_eq!(build["mac"], "b.tar");
+        assert_eq!(statuses["build"], "success");
+    }
 
     #[test]
     fn dynamic_matrix_keeps_axis_order_from_needs_output() {

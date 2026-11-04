@@ -6,6 +6,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{Read, Write};
 use std::path::Path;
+use std::sync::Mutex;
 
 /// `path -> content hash` for every tracked or untracked-but-not-ignored file.
 pub(crate) type TreeHashes = BTreeMap<String, String>;
@@ -16,14 +17,44 @@ pub(crate) type TreeHashes = BTreeMap<String, String>;
 pub(crate) struct Tree {
     pub(super) files: TreeHashes,
     pub(super) digest: String,
+    /// The digest of the files a set of path patterns selects, by pattern
+    /// text. Jobs often share their paths, and matching every file against
+    /// every pattern is the costly part on a large repository.
+    pub(super) selected: Mutex<HashMap<Vec<String>, String>>,
 }
 
 impl Tree {
     pub(crate) fn new(files: TreeHashes) -> Option<Self> {
-        let text = serde_json::to_string(&files).ok()?;
-        let digest = hex(&Sha256::digest(text.as_bytes()));
-        Some(Self { files, digest })
+        let digest = digest_of(&files)?;
+        Some(Self {
+            files,
+            digest,
+            selected: Mutex::new(HashMap::new()),
+        })
     }
+
+    /// One digest of the files `patterns` match.
+    pub(super) fn digest_matching(&self, patterns: &[glob::Pattern]) -> Option<String> {
+        let id: Vec<String> = patterns.iter().map(|p| p.as_str().to_string()).collect();
+        if let Some(digest) = self.selected.lock().ok().and_then(|s| s.get(&id).cloned()) {
+            return Some(digest);
+        }
+        let files: BTreeMap<&String, &String> = self
+            .files
+            .iter()
+            .filter(|(path, _)| matches_any(path, patterns))
+            .collect();
+        let digest = digest_of(&files)?;
+        if let Ok(mut selected) = self.selected.lock() {
+            selected.insert(id, digest.clone());
+        }
+        Some(digest)
+    }
+}
+
+fn digest_of(files: &impl serde::Serialize) -> Option<String> {
+    let text = serde_json::to_string(files).ok()?;
+    Some(hex(&Sha256::digest(text.as_bytes())))
 }
 
 /// Identify the files checkout would hand to a job. `None` outside a git work

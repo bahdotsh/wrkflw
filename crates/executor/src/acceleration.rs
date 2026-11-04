@@ -37,7 +37,7 @@ use wrkflw_parser::workflow::{Job, WorkflowDefinition};
 pub const SIDECAR_PATH: &str = ".wrkflw/affected.yml";
 
 /// Bump when the fingerprint's inputs change, so old entries stop matching.
-const KEY_VERSION: u32 = 2;
+const KEY_VERSION: u32 = 3;
 
 /// Host directories mounted into containers under `--dep-cache`.
 const DEP_CACHE_DIRS: &[(&str, &str)] = &[
@@ -335,16 +335,8 @@ pub(crate) struct KeyInput<'a> {
 pub(crate) fn job_key(input: &KeyInput<'_>) -> Option<String> {
     let lookup = input.lookup;
     let inputs = match input.patterns {
-        None => Value::String(input.tree.digest.clone()),
-        Some(patterns) => {
-            let files: BTreeMap<&String, &String> = input
-                .tree
-                .files
-                .iter()
-                .filter(|(path, _)| matches_any(path, patterns))
-                .collect();
-            serde_json::to_value(files).ok()?
-        }
+        None => input.tree.digest.clone(),
+        Some(patterns) => input.tree.digest_matching(patterns)?,
     };
     let env = |name: &str| lookup.env_context.get(name).cloned();
     let document = serde_json::json!({
@@ -1319,6 +1311,19 @@ jobs:
             ..Default::default()
         };
         assert!(validate_remote(&push_only).is_err());
+    }
+
+    #[test]
+    fn jobs_sharing_paths_share_one_digest_of_them() {
+        let dir = repo();
+        let tree = Tree::new(hash_tree(dir.path()).unwrap()).unwrap();
+        let src = compile_globs(&["src/**"]);
+        let docs = compile_globs(&["docs/**"]);
+        let first = tree.digest_matching(&src).unwrap();
+        assert_eq!(tree.selected.lock().unwrap().len(), 1);
+        assert_eq!(tree.digest_matching(&src).unwrap(), first);
+        assert_eq!(tree.selected.lock().unwrap().len(), 1);
+        assert_ne!(tree.digest_matching(&docs).unwrap(), first);
     }
 
     #[test]

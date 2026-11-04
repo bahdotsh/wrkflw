@@ -422,3 +422,73 @@ fn a_step_never_sees_the_cache_credentials() {
     assert_ok(&output);
     assert_eq!(repo.take_ran(), ["none none"]);
 }
+
+#[test]
+fn a_reused_job_with_new_outputs_still_reruns_its_dependents_under_affected() {
+    let workflow = r#"
+name: ci
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      v: ${{ steps.a.outputs.v }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: a
+        run: echo "v=$(cat src/a)" >> "$GITHUB_OUTPUT"
+  test:
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - run: echo "test ${{ needs.build.outputs.v }}" >> LOG
+"#;
+    let hints = "jobs:\n  build: {paths: ['src/**']}\n  test: {paths: ['docs/**']}\n";
+    let repo = Repo::new(workflow, Some(hints));
+    // A change only `build` reads. Running `build` alone stores its pass,
+    // whose output the base's `test` never saw.
+    fs::write(repo.root().join("src/a"), "two").unwrap();
+    assert_ok(&repo.run(&["--reuse-results", "--job", "build"]));
+    repo.take_ran();
+    let output = repo.run(&[
+        "--event",
+        "push",
+        "--affected",
+        "--reuse-results",
+        "--diff-base",
+        "HEAD",
+    ]);
+    assert_ok(&output);
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("Reuse result"),
+        "build should come from the store"
+    );
+    assert_eq!(repo.take_ran(), ["test two"]);
+}
+
+#[test]
+fn the_gate_skips_the_jobs_that_need_a_job_left_to_ci() {
+    let workflow = r#"
+name: ci
+on: push
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo check >> LOG
+  deploy:
+    runs-on: ubuntu-latest
+    needs: check
+    steps:
+      - run: echo deploy >> LOG
+  announce:
+    runs-on: ubuntu-latest
+    needs: deploy
+    steps:
+      - run: echo announce >> LOG
+"#;
+    let repo = Repo::new(workflow, Some("jobs:\n  deploy: {gate: false}\n"));
+    let output = repo.wrkflw(&["gate", "--runtime", "emulation", "--diff-base", "HEAD"]);
+    assert_ok(&output);
+    assert_eq!(repo.take_ran(), ["check"]);
+}

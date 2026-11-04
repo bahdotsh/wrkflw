@@ -64,6 +64,7 @@ Identify yourself with `WRKFLW_AGENT=<name>` or `--agent`. `WRKFLW_INTENT` or `-
 ## Limits
 
 - `--affected` trusts the paths in `.wrkflw/affected.yml`. A path left out of a job's list won't rerun that job.
+- `wrkflw gate` checks the working tree, not the commits you push, and skips jobs marked `gate: false` in `.wrkflw/affected.yml`.
 - Parallel jobs run one after another in emulation, so `--runtime emulation` won't show a race between jobs.
 - `--from-step` needs `--job`. Earlier steps are skipped apart from `actions/checkout`, so their outputs and files are missing. Use it to iterate on a step that doesn't depend on them.
 - `runs replay` reruns against the current working tree. Compare `git_sha` and `git_dirty` on the record if the result differs.

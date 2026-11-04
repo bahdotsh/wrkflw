@@ -197,7 +197,8 @@ wrkflw gate
 # Run it on every push (an existing hook is left alone). The hook keeps the
 # --runtime and --remote-cache given here, and compares against what the
 # remote already has for the pushed branch. It refuses a core.hooksPath
-# outside the repository, which other repositories share.
+# outside the repository, which other repositories share. It checks the
+# working tree, so uncommitted changes count, and it warns when there are any.
 wrkflw gate --install-hook
 
 # The same pieces, one at a time

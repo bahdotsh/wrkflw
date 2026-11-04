@@ -394,6 +394,16 @@ fn the_gate_leaves_a_job_to_ci_when_the_sidecar_says_so() {
 }
 
 #[test]
+fn the_gate_warns_about_uncommitted_changes() {
+    let repo = Repo::new(TWO_JOBS, None);
+    fs::write(repo.root().join("src/a"), "edited").unwrap();
+    let output = repo.wrkflw(&["gate", "--runtime", "emulation", "--diff-base", "HEAD"]);
+    assert_ok(&output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("uncommitted changes (src/a)"), "{}", stderr);
+}
+
+#[test]
 fn a_step_never_sees_the_cache_credentials() {
     let workflow = "name: ci\non: push\njobs:\n  peek:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo \"${WRKFLW_CACHE_SIGNING_KEY:-none} ${WRKFLW_REMOTE_CACHE_TOKEN:-none}\" >> LOG\n";
     let repo = Repo::new(workflow, None);

@@ -37,6 +37,10 @@ fn shell_quote(value: &str) -> String {
 /// as GUI git clients often run hooks with a shorter `PATH` than a terminal.
 /// It keeps the `--runtime` and `--remote-cache` given at install time.
 ///
+/// It checks the working tree, not the commits being pushed: uncommitted
+/// edits and untracked files are part of what it runs. `gate` warns when the
+/// tree is dirty.
+///
 /// git writes `<local ref> <local sha> <remote ref> <remote sha>` on stdin
 /// for each ref pushed. The first remote sha that exists here is what the
 /// remote already has, so it's the base for `--affected`. A new branch has
@@ -54,6 +58,7 @@ fn hook_script(program: &Path, runtime: &str, remote_cache: Option<&str>) -> Str
         r#"#!/bin/sh
 {marker}
 # Skip it once with: git push --no-verify
+# It checks the working tree, so uncommitted changes count as pushed.
 wrkflw={program}
 [ -x "$wrkflw" ] || wrkflw=wrkflw
 refs=0
@@ -181,6 +186,44 @@ fn install_hook_at(path: &Path, script: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Changes in the working tree that aren't committed, as `git status` lists
+/// them. Empty when the tree is clean or git can't say.
+fn uncommitted_changes() -> Vec<String> {
+    let Ok(output) = Command::new("git")
+        .args(["status", "--porcelain", "--untracked-files=normal"])
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.get(3..))
+        .map(str::to_string)
+        .collect()
+}
+
+/// The warning for a dirty tree, which the gate checks in place of what a
+/// push would send.
+fn dirty_tree_warning(changes: &[String]) -> Option<String> {
+    const SHOWN: usize = 5;
+    if changes.is_empty() {
+        return None;
+    }
+    let mut listed = changes[..changes.len().min(SHOWN)].join(", ");
+    if changes.len() > SHOWN {
+        listed.push_str(&format!(" and {} more", changes.len() - SHOWN));
+    }
+    Some(format!(
+        "Warning: the gate checks the working tree, which has uncommitted changes ({}). \
+         A push sends only commits, so the result may differ from CI. Commit or stash them \
+         to check exactly what you push",
+        listed
+    ))
+}
+
 /// The workflow files under `path`, or under the detected directories.
 fn workflow_files(path: Option<&Path>) -> Result<Vec<PathBuf>, String> {
     let roots = match path {
@@ -264,6 +307,9 @@ pub(crate) fn run(ctx: GateCtx) {
         std::process::exit(1);
     });
     let runtime = ctx.runtime.as_flag();
+    if let Some(warning) = dirty_tree_warning(&uncommitted_changes()) {
+        eprintln!("{}", cli_style::dim(&warning));
+    }
 
     // Every workflow runs even after a failure, so one push shows all of them.
     let mut failed = Vec::new();
@@ -463,6 +509,17 @@ mod tests {
         assert!(args
             .windows(2)
             .any(|w| w == ["--skip-exit-code", SKIPPED_EXIT.to_string().as_str()]));
+    }
+
+    #[test]
+    fn a_dirty_tree_is_named_and_a_clean_one_is_not() {
+        assert_eq!(dirty_tree_warning(&[]), None);
+        let few = dirty_tree_warning(&["src/a.rs".to_string()]).unwrap();
+        assert!(few.contains("src/a.rs"), "{}", few);
+        let many: Vec<String> = (0..7).map(|i| format!("f{}", i)).collect();
+        let warning = dirty_tree_warning(&many).unwrap();
+        assert!(warning.contains("f4 and 2 more"), "{}", warning);
+        assert!(!warning.contains("f5"), "{}", warning);
     }
 
     #[test]

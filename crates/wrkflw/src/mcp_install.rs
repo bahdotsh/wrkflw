@@ -154,7 +154,7 @@ fn method(client: Client, dirs: &Dirs, command: &str) -> Method {
         ),
         // opencode reads ~/.config on every platform, not the platform's config dir.
         Client::Opencode => file(
-            dirs.home.join(".config/opencode/opencode.json"),
+            opencode_config(&dirs.home.join(".config/opencode")),
             "mcp",
             json!({"type": "local", "command": [command, "mcp", "serve"], "enabled": true}),
         ),
@@ -163,6 +163,18 @@ fn method(client: Client, dirs: &Dirs, command: &str) -> Method {
             "mcpServers",
             standard,
         ),
+    }
+}
+
+/// `opencode.json`, or `opencode.jsonc` when only that one exists, so the entry
+/// goes in the file opencode reads instead of a new file beside it.
+fn opencode_config(dir: &Path) -> PathBuf {
+    let json = dir.join("opencode.json");
+    let jsonc = dir.join("opencode.jsonc");
+    if !json.exists() && jsonc.exists() {
+        jsonc
+    } else {
+        json
     }
 }
 
@@ -674,7 +686,19 @@ mod tests {
         assert!(out.unwrap().contains("\"command\": \"wrkflw\""));
     }
 
-    /// Captured from `codex mcp get indxr --json`, codex-cli 0.147.0.
+    #[test]
+    fn opencode_uses_its_jsonc_file_when_that_is_the_only_one() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path();
+        assert_eq!(opencode_config(dir), dir.join("opencode.json"));
+        std::fs::write(dir.join("opencode.jsonc"), "{}").unwrap();
+        assert_eq!(opencode_config(dir), dir.join("opencode.jsonc"));
+        std::fs::write(dir.join("opencode.json"), "{}").unwrap();
+        assert_eq!(opencode_config(dir), dir.join("opencode.json"));
+    }
+
+    /// `codex mcp get <server> --json` from codex-cli 0.147.0, with the name and
+    /// launch changed to wrkflw's.
     const CODEX_GET: &str = r#"{
   "name": "wrkflw",
   "enabled": true,

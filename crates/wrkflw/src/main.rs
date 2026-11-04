@@ -654,7 +654,8 @@ enum McpCommand {
         /// Agents to register with. Defaults to every one whose CLI or config directory exists
         #[arg(value_enum)]
         clients: Vec<mcp_install::Client>,
-        /// Show what would change without changing anything
+        /// Show what would change without changing anything. Exits 1, like a real run,
+        /// if an agent would be left without the entry
         #[arg(long)]
         dry_run: bool,
         /// Replace a wrkflw entry that launches a different command

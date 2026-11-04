@@ -202,9 +202,16 @@ impl Status {
     }
 
     /// Whether the client was left without the wanted entry. `Differs`
-    /// counts, so a script can tell that nothing was registered.
+    /// counts, so a script can tell that nothing was registered. Under
+    /// `--dry-run` it counts too: the real run would leave the entry alone.
     fn is_failure(self) -> bool {
         matches!(self, Status::Failed | Status::NotFound | Status::Differs)
+    }
+
+    /// Why the client was left alone, when the status alone doesn't say.
+    fn reason(self) -> Option<String> {
+        (self == Status::Differs)
+            .then(|| "registered with another command, pass --force to replace it".to_string())
     }
 }
 
@@ -250,8 +257,24 @@ enum Ordered {
     Object(IndexMap<String, Ordered>),
 }
 
+/// The keys that decide what an entry launches. Others, such as `env` or
+/// `disabled`, are the user's and are kept.
+const LAUNCH_KEYS: [&str; 2] = ["command", "args"];
+
+/// Whether `current` launches what `wanted` does.
+fn same_launch(current: &Ordered, wanted: &IndexMap<String, Ordered>) -> bool {
+    let Ordered::Object(current) = current else {
+        return false;
+    };
+    LAUNCH_KEYS
+        .iter()
+        .all(|key| current.get(*key) == wanted.get(*key))
+}
+
 /// Add `entry` as server `wrkflw` under `key` in the config `text`.
 ///
+/// An existing entry is compared by what it launches, and on replace the
+/// wanted keys are merged into it, so keys the user added survive `--force`.
 /// Returns the status and, when the file should change, its new text.
 fn upsert_json(
     text: Option<&str>,
@@ -271,19 +294,31 @@ fn upsert_json(
             }
         },
     };
-    let entry: Ordered = serde_json::from_value(entry.clone()).map_err(|e| e.to_string())?;
+    let Ordered::Object(entry) =
+        serde_json::from_value(entry.clone()).map_err(|e: serde_json::Error| e.to_string())?
+    else {
+        return Err("the entry isn't a JSON object".to_string());
+    };
     let servers = root
         .entry(key.to_string())
         .or_insert_with(|| Ordered::Object(IndexMap::new()));
     let Ordered::Object(servers) = servers else {
         return Err(format!("`{key}` isn't a JSON object"));
     };
-    let existing = servers.get(SERVER).map(|current| *current == entry);
+    let existing = servers
+        .get(SERVER)
+        .map(|current| same_launch(current, &entry));
     let (status, write) = policy.settle(existing);
     if !write {
         return Ok((status, None));
     }
-    servers.insert(SERVER.to_string(), entry);
+    match servers.get_mut(SERVER) {
+        // `extend` keeps the position of keys already there.
+        Some(Ordered::Object(current)) => current.extend(entry),
+        _ => {
+            servers.insert(SERVER.to_string(), Ordered::Object(entry));
+        }
+    }
     let indent = text.map_or(DEFAULT_INDENT, indent_of);
     let mut out = Vec::new();
     let formatter = serde_json::ser::PrettyFormatter::with_indent(indent.as_bytes());
@@ -470,7 +505,7 @@ fn install_one(
         client,
         status,
         target,
-        detail,
+        detail: detail.or_else(|| status.reason()),
     })
 }
 
@@ -510,13 +545,11 @@ fn report(outcomes: &[Outcome], format: OutputFormat, launch: &Launch, policy: P
     }
     for outcome in outcomes {
         let status = outcome.status.as_str().replace('_', " ");
-        let detail = match (&outcome.detail, outcome.status) {
-            (Some(detail), _) => format!(": {detail}"),
-            (None, Status::Differs) => {
-                ": registered with another command, pass --force to replace it".to_string()
-            }
-            _ => String::new(),
-        };
+        let detail = outcome
+            .detail
+            .as_ref()
+            .map(|detail| format!(": {detail}"))
+            .unwrap_or_default();
         println!(
             "{:<15} {status} ({}){detail}",
             outcome.client.name(),
@@ -543,7 +576,8 @@ fn report(outcomes: &[Outcome], format: OutputFormat, launch: &Launch, policy: P
 }
 
 /// Register the server with `clients`, or with every detected client when empty.
-/// Exits 1 if none was found, or any client failed or kept a different entry.
+/// Exits 1 if none was found, or any client failed or kept a different entry,
+/// including under `dry_run`, where it means the real run would do the same.
 pub(crate) fn install(clients: &[Client], dry_run: bool, force: bool, format: OutputFormat) {
     let Some(dirs) = Dirs::current() else {
         eprintln!("Error: no home directory");
@@ -654,6 +688,54 @@ mod tests {
         assert!(codex_matches(CODEX_GET.as_bytes(), "wrkflw"));
         assert!(!codex_matches(CODEX_GET.as_bytes(), "/other/wrkflw"));
         assert!(!codex_matches(b"not json", "wrkflw"));
+    }
+
+    #[test]
+    fn only_the_launch_decides_and_force_keeps_the_users_keys() {
+        let extra = r#"{"mcpServers": {"wrkflw": {"command": "wrkflw", "args": ["mcp", "serve"], "env": {"WRKFLW_HOME": "/x"}, "disabled": false}}}"#;
+        let (status, out) = upsert_json(Some(extra), "mcpServers", &entry(), WRITE).unwrap();
+        assert_eq!((status, out), (Status::Unchanged, None));
+
+        let other = r#"{"mcpServers": {"wrkflw": {"env": {"WRKFLW_HOME": "/x"}, "command": "/old/wrkflw", "args": ["mcp", "serve"]}}}"#;
+        let force = Policy {
+            dry_run: false,
+            force: true,
+        };
+        let (status, out) = upsert_json(Some(other), "mcpServers", &entry(), force).unwrap();
+        assert_eq!(status, Status::Replaced);
+        let out = out.unwrap();
+        let written: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            written["mcpServers"]["wrkflw"],
+            json!({"env": {"WRKFLW_HOME": "/x"}, "command": "wrkflw", "args": ["mcp", "serve"]})
+        );
+        assert!(
+            out.find("\"env\"").unwrap() < out.find("\"command\"").unwrap(),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn a_differing_entry_says_why_in_both_outputs() {
+        let root = tempfile::tempdir().unwrap();
+        let dirs = Dirs {
+            home: root.path().to_path_buf(),
+            config: root.path().join("config"),
+            claude: root.path().to_path_buf(),
+        };
+        std::fs::create_dir_all(root.path().join(".cursor")).unwrap();
+        std::fs::write(
+            root.path().join(".cursor/mcp.json"),
+            r#"{"mcpServers": {"wrkflw": {"command": "/old", "args": ["mcp", "serve"]}}}"#,
+        )
+        .unwrap();
+        let launch = Launch {
+            command: "wrkflw".to_string(),
+            absolute: "/bin/wrkflw".to_string(),
+        };
+        let outcome = install_one(Client::Cursor, &dirs, &launch, WRITE, false).unwrap();
+        assert_eq!(outcome.status, Status::Differs);
+        assert!(outcome.detail.unwrap().contains("--force"));
     }
 
     #[test]

@@ -1039,3 +1039,62 @@ fn undefined_references_warn_without_failing_validation() {
         "undefined-step-reference"
     );
 }
+
+/// `dirs` reads `HOME` on Unix only, so this can't be pointed at a temporary
+/// home on Windows without touching the real profile.
+#[cfg(unix)]
+#[test]
+fn mcp_install_registers_once_and_leaves_other_commands_alone() {
+    let sandbox = Sandbox::new();
+    let home = TempDir::new().unwrap();
+    fs::create_dir_all(home.path().join(".cursor")).unwrap();
+    let config = home.path().join(".cursor/mcp.json");
+    let install = |args: &[&str]| {
+        let mut all = vec!["--format", "json", "mcp", "install", "cursor"];
+        all.extend(args);
+        sandbox
+            .command(&all)
+            .env("HOME", home.path())
+            .output()
+            .unwrap()
+    };
+
+    let output = install(&["--dry-run"]);
+    assert!(output.status.success(), "{}", stdout(&output));
+    assert_eq!(json_doc(&output)["clients"][0]["status"], "would_add");
+    assert!(!config.exists());
+
+    let output = install(&[]);
+    assert!(output.status.success(), "{}", stdout(&output));
+    let report = json_doc(&output);
+    assert_eq!(report["type"], "mcp_install");
+    assert_eq!(report["clients"][0]["client"], "cursor");
+    assert_eq!(report["clients"][0]["status"], "added");
+    let written: Value = serde_json::from_str(&fs::read_to_string(&config).unwrap()).unwrap();
+    assert_eq!(
+        written["mcpServers"]["wrkflw"],
+        json!({"command": report["command"], "args": ["mcp", "serve"]})
+    );
+
+    let output = install(&[]);
+    assert!(output.status.success());
+    assert_eq!(json_doc(&output)["clients"][0]["status"], "unchanged");
+
+    fs::write(
+        &config,
+        r#"{"mcpServers": {"wrkflw": {"command": "/old/wrkflw", "args": ["mcp", "serve"], "env": {"A": "1"}}}}"#,
+    )
+    .unwrap();
+    let output = install(&[]);
+    assert_eq!(output.status.code(), Some(1));
+    let client = &json_doc(&output)["clients"][0];
+    assert_eq!(client["status"], "differs");
+    assert!(client["detail"].as_str().unwrap().contains("--force"));
+
+    let output = install(&["--force"]);
+    assert!(output.status.success());
+    assert_eq!(json_doc(&output)["clients"][0]["status"], "replaced");
+    let written: Value = serde_json::from_str(&fs::read_to_string(&config).unwrap()).unwrap();
+    assert_eq!(written["mcpServers"]["wrkflw"]["env"], json!({"A": "1"}));
+    assert_ne!(written["mcpServers"]["wrkflw"]["command"], "/old/wrkflw");
+}

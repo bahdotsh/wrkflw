@@ -2,7 +2,7 @@
 
 Shared helpers used across crates.
 
-- Workflow file detection (`.github/workflows/*.yml`, `.gitlab-ci.yml`)
+- Workflow file detection (`.gitea/workflows/*.yml`, `.github/workflows/*.yml`, `.gitlab-ci.yml`)
 - File-descriptor redirection utilities for silencing noisy subprocess output (Unix only; Windows support is limited)
 
 ### Example

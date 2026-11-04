@@ -23,7 +23,8 @@ if let Some(on) = yaml.get("on") {
     validate_triggers(on, &mut res);
 }
 if let Some(jobs) = yaml.get("jobs") {
-    validate_jobs(jobs, &mut res);
+    // The repository root lets local `uses: ./...` actions be checked; `None` skips that.
+    validate_jobs(jobs, None, &mut res);
 }
 assert!(res.is_valid);
 ```

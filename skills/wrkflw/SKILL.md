@@ -12,6 +12,7 @@ Check workflow changes locally before pushing them. Use the wrkflw MCP tools whe
 3. Run with `run_workflow`, or `wrkflw --format json run <file> --intent "<why>"`. Always say why, because the reason is stored on the run. Through MCP, also pass your session id as `session` if you know it, such as `$CLAUDE_CODE_SESSION_ID`.
 4. On failure, read the digest in the result. It names the failed step, script, exit code, earlier exported env and output tail.
 5. Before rerunning, check `list_runs` and `get_run_failure`. The answer may already be recorded.
+6. Before pushing, run `wrkflw gate`. It runs every workflow the push would fire, reusing jobs that already passed on the same files, and exits 1 if anything fails. It has no MCP tool and prints text even with `--format json`, so on failure read `wrkflw --format json runs failure latest`.
 
 For `pull_request`, pass `event` and `base_branch`. If the workflow has a `paths:` filter, also pass `diff` or `changed_files`. Add `activity_type` if the workflow filters on `types:`.
 

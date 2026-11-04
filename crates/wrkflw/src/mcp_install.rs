@@ -41,8 +41,13 @@ impl Client {
 
 /// How a client's config is changed.
 enum Method {
-    /// Through the client's CLI.
-    Cli(&'static str),
+    /// Through the client's CLI: `program mcp add [scope] wrkflw -- ...`.
+    Cli {
+        program: &'static str,
+        scope: &'static [&'static str],
+        /// Whether a `wrkflw` server is registered, and whether it launches `command`.
+        existing: fn(&Dirs, &str) -> Option<bool>,
+    },
     /// By editing `path`, adding `entry` under `key`.
     Json {
         path: PathBuf,
@@ -121,8 +126,16 @@ fn method(client: Client, dirs: &Dirs, command: &str) -> Method {
     let standard = json!({"command": command, "args": SERVE_ARGS});
     let file = |path: PathBuf, key, entry| Method::Json { path, key, entry };
     match client {
-        Client::ClaudeCode => Method::Cli("claude"),
-        Client::Codex => Method::Cli("codex"),
+        Client::ClaudeCode => Method::Cli {
+            program: "claude",
+            scope: &["--scope", "user"],
+            existing: claude_code_existing,
+        },
+        Client::Codex => Method::Cli {
+            program: "codex",
+            scope: &[],
+            existing: |_, command| codex_existing(command),
+        },
         Client::Cursor => file(dirs.home.join(".cursor/mcp.json"), "mcpServers", standard),
         Client::Windsurf => file(
             dirs.home.join(".codeium/windsurf/mcp_config.json"),
@@ -156,7 +169,7 @@ fn method(client: Client, dirs: &Dirs, command: &str) -> Method {
 /// A client is installed when its CLI is on PATH or its config directory exists.
 fn detected(method: &Method) -> bool {
     match method {
-        Method::Cli(program) => which::which(program).is_ok(),
+        Method::Cli { program, .. } => which::which(program).is_ok(),
         Method::Json { path, .. } => path.parent().is_some_and(Path::is_dir),
     }
 }
@@ -378,31 +391,25 @@ fn codex_existing(command: &str) -> Option<bool> {
     if !output.status.success() {
         return None;
     }
-    let server: Value = serde_json::from_slice(&output.stdout).ok()?;
+    Some(codex_matches(&output.stdout, command))
+}
+
+/// Whether `codex mcp get --json` output describes a server launching `command`.
+fn codex_matches(stdout: &[u8], command: &str) -> bool {
+    let Ok(server) = serde_json::from_slice::<Value>(stdout) else {
+        return false;
+    };
     let transport = &server["transport"];
-    Some(transport["command"] == command && transport["args"] == json!(SERVE_ARGS))
+    transport["command"] == command && transport["args"] == json!(SERVE_ARGS)
 }
 
 fn install_cli(
-    client: Client,
-    dirs: &Dirs,
+    program: &str,
+    scope: &[&str],
+    existing: Option<bool>,
     command: &str,
     policy: Policy,
 ) -> (Status, Option<String>) {
-    let (program, existing, scope): (&str, _, &[&str]) = match client {
-        Client::ClaudeCode => (
-            "claude",
-            claude_code_existing(dirs, command),
-            &["--scope", "user"],
-        ),
-        Client::Codex => ("codex", codex_existing(command), &[]),
-        Client::Cursor
-        | Client::Windsurf
-        | Client::Vscode
-        | Client::Gemini
-        | Client::Opencode
-        | Client::ClaudeDesktop => unreachable!("{} is configured by file", client.name()),
-    };
     let (status, write) = policy.settle(existing);
     if !write {
         return (status, None);
@@ -434,7 +441,7 @@ fn install_one(
     let command = launch.for_client(client);
     let method = method(client, dirs, command);
     let target = match &method {
-        Method::Cli(program) => program.to_string(),
+        Method::Cli { program, .. } => program.to_string(),
         Method::Json { path, .. } => path.to_string_lossy().into_owned(),
     };
     if !detected(&method) {
@@ -443,7 +450,7 @@ fn install_one(
             client,
             status: Status::NotFound,
             detail: Some(match &method {
-                Method::Cli(program) => format!("`{program}` isn't on PATH"),
+                Method::Cli { program, .. } => format!("`{program}` isn't on PATH"),
                 Method::Json { path, .. } => {
                     format!("{} doesn't exist", path.parent().unwrap_or(path).display())
                 }
@@ -452,7 +459,11 @@ fn install_one(
         });
     }
     let (status, detail) = match &method {
-        Method::Cli(_) => install_cli(client, dirs, command, policy),
+        Method::Cli {
+            program,
+            scope,
+            existing,
+        } => install_cli(program, scope, existing(dirs, command), command, policy),
         Method::Json { path, key, entry } => install_json(path, key, entry, policy),
     };
     Some(Outcome {
@@ -617,6 +628,32 @@ mod tests {
         let (status, out) = upsert_json(Some(other), "mcpServers", &entry(), force).unwrap();
         assert_eq!(status, Status::Replaced);
         assert!(out.unwrap().contains("\"command\": \"wrkflw\""));
+    }
+
+    /// Captured from `codex mcp get indxr --json`, codex-cli 0.147.0.
+    const CODEX_GET: &str = r#"{
+  "name": "wrkflw",
+  "enabled": true,
+  "disabled_reason": null,
+  "transport": {
+    "type": "stdio",
+    "command": "wrkflw",
+    "args": ["mcp", "serve"],
+    "env": null,
+    "env_vars": [],
+    "cwd": null
+  },
+  "enabled_tools": null,
+  "disabled_tools": null,
+  "startup_timeout_sec": null,
+  "tool_timeout_sec": null
+}"#;
+
+    #[test]
+    fn codex_get_output_is_matched_on_its_transport() {
+        assert!(codex_matches(CODEX_GET.as_bytes(), "wrkflw"));
+        assert!(!codex_matches(CODEX_GET.as_bytes(), "/other/wrkflw"));
+        assert!(!codex_matches(b"not json", "wrkflw"));
     }
 
     #[test]

@@ -674,6 +674,7 @@ fn mcp_server_speaks_the_protocol_and_runs_tools() {
             "path": ".github/workflows/failing.yml",
             "runtime": "emulation",
             "intent": "mcp test",
+            "session": "session-1",
         }),
     );
     assert!(!is_error, "a failed workflow is a result, not a tool error");
@@ -684,6 +685,11 @@ fn mcp_server_speaks_the_protocol_and_runs_tools() {
     assert_eq!(runs["runs"][0]["source"], "mcp");
     assert_eq!(runs["runs"][0]["agent"], "test-client");
     assert_eq!(runs["runs"][0]["intent"], "mcp test");
+    assert_eq!(runs["runs"][0]["session"], "session-1");
+    let (runs, _) = mcp.tool("list_runs", json!({"session": "session-1"}));
+    assert_eq!(runs["runs"].as_array().unwrap().len(), 1);
+    let (runs, _) = mcp.tool("list_runs", json!({"session": "other"}));
+    assert_eq!(runs["runs"], json!([]));
 
     let (failure, _) = mcp.tool("get_run_failure", json!({}));
     assert_eq!(failure["failures"][0]["step"], "boom");

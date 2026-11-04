@@ -21,7 +21,8 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 use std::collections::HashMap;
 use std::io::{self, stdout};
 use std::path::PathBuf;
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Mutex};
 use std::time::{Duration, Instant};
 use wrkflw_executor::RuntimeType;
 
@@ -150,6 +151,7 @@ pub async fn run_wrkflw_tui(
     let result = run_tui_event_loop(&mut terminal, &mut app, &tx_clone, &rx, verbose);
 
     // Clean up terminal
+    TUI_ACTIVE.store(false, Ordering::SeqCst);
     wrkflw_logging::set_quiet_mode(false);
     disable_raw_mode()?;
     execute!(
@@ -191,16 +193,61 @@ pub async fn run_wrkflw_tui(
     }
 }
 
-/// Puts the terminal back before a panic message prints, so a crash
-/// leaves a usable shell and a readable error instead of raw mode on the
-/// alternate screen.
+/// True while the TUI owns the terminal; the panic hook only steps in
+/// then.
+static TUI_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Panics from threads other than the UI thread, waiting to be shown in
+/// the Logs tab.
+static BACKGROUND_PANICS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Puts the terminal back before a panic on the UI thread prints, so a
+/// crash leaves a usable shell and a readable error instead of raw mode
+/// on the alternate screen.
+///
+/// Other threads (the log processor, probes, spawned tasks such as a
+/// Trigger dispatch) are left alone: the TUI survived their panics
+/// before and still does. Printing their message to stderr would
+/// scribble over the alternate screen, so it is queued for the event
+/// loop to log instead. `try_lock` keeps the hook from deadlocking if
+/// the panic hit while that lock was held.
 fn install_panic_hook() {
+    let ui_thread = std::thread::current().id();
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
-        previous(info);
+        if !TUI_ACTIVE.load(Ordering::SeqCst) {
+            previous(info);
+            return;
+        }
+        let current = std::thread::current();
+        if current.id() == ui_thread {
+            let _ = disable_raw_mode();
+            let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
+            previous(info);
+            return;
+        }
+        if let Ok(mut queue) = BACKGROUND_PANICS.try_lock() {
+            queue.push(format!(
+                "thread '{}' panicked: {info}",
+                current.name().unwrap_or("<unnamed>")
+            ));
+        }
     }));
+    TUI_ACTIVE.store(true, Ordering::SeqCst);
+}
+
+/// Moves queued background-thread panics into the log and status bar.
+fn report_background_panics(app: &mut App) {
+    let drained: Vec<String> = match BACKGROUND_PANICS.lock() {
+        Ok(mut queue) if !queue.is_empty() => std::mem::take(&mut *queue),
+        _ => return,
+    };
+    for msg in &drained {
+        wrkflw_logging::error(msg);
+    }
+    if let Some(last) = drained.last() {
+        app.set_error_message(last.clone());
+    }
 }
 
 // Helper function to run the main event loop
@@ -262,6 +309,7 @@ fn run_tui_event_loop(
         // so the user sees the outcome where they fired it, rather than
         // having to switch tabs to Logs.
         app.drain_trigger_outcomes();
+        report_background_panics(app);
 
         // Start execution if we have a queued workflow and nothing is currently running
         if app.running && app.current_execution.is_none() && !app.execution_queue.is_empty() {

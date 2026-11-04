@@ -81,10 +81,7 @@ pub fn render_logs_tab(f: &mut Frame<'_>, app: &mut App, area: Rect) {
         .highlight_symbol(theme::SELECTED_MARK)
         .highlight_spacing(HighlightSpacing::Always);
 
-    if app.log_follow {
-        app.log_scroll = total - 1;
-    }
-    app.log_scroll = app.log_scroll.min(total - 1);
+    app.sync_log_cursor();
     let mut state = TableState::default()
         .with_offset(app.log_offset)
         .with_selected(Some(app.log_scroll));

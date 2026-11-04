@@ -1471,7 +1471,7 @@ impl App {
             }
             KeyCode::Backspace => {
                 self.log_search_query.pop();
-                self.mark_logs_for_update();
+                self.restart_log_search();
             }
             KeyCode::Enter => {
                 self.log_search_active = false;
@@ -1479,10 +1479,20 @@ impl App {
             }
             KeyCode::Char(c) => {
                 self.log_search_query.push(c);
-                self.mark_logs_for_update();
+                self.restart_log_search();
             }
             _ => {}
         }
+    }
+
+    /// The query changed, so the old matches no longer apply. Dropping
+    /// them makes the next processed update jump to the new query's
+    /// first match, instead of leaving the cursor on a line that may
+    /// not match at all.
+    fn restart_log_search(&mut self) {
+        self.log_search_matches.clear();
+        self.log_search_match_idx = 0;
+        self.mark_logs_for_update();
     }
 
     // Toggle log search mode
@@ -1635,6 +1645,17 @@ impl App {
         let next = self.log_scroll.min(total - 1).saturating_add_signed(delta);
         self.log_scroll = next.min(total - 1);
         self.log_follow = self.log_scroll == total - 1;
+    }
+
+    /// Keeps the log cursor on a line that exists, and on the newest
+    /// line while following. The one place that reconciles the two, so
+    /// processing an update and drawing the tab can't disagree.
+    pub fn sync_log_cursor(&mut self) {
+        let last = self.processed_logs.len().saturating_sub(1);
+        if self.log_follow {
+            self.log_scroll = last;
+        }
+        self.log_scroll = self.log_scroll.min(last);
     }
 
     pub fn scroll_logs_to_start(&mut self) {
@@ -1885,28 +1906,40 @@ impl App {
         }
 
         if let Some(response) = self.log_processor.try_get_update() {
-            self.processed_logs = response.processed_logs;
-            let had_matches = !self.log_search_matches.is_empty();
-            self.log_search_matches = response.search_matches;
-
-            // Jump to the first match only when a search starts matching.
-            // Doing it on every update would yank the cursor back each
-            // time a running workflow logs a line.
-            if !self.log_search_matches.is_empty() && !self.log_search_query.is_empty() {
-                if !had_matches || self.log_search_match_idx >= self.log_search_matches.len() {
-                    self.log_search_match_idx = 0;
-                    self.log_scroll = self.log_search_matches[0];
-                    self.log_follow = false;
-                }
-            } else if self.log_follow {
-                self.log_scroll = self.processed_logs.len().saturating_sub(1);
-            }
-            self.log_scroll = self
-                .log_scroll
-                .min(self.processed_logs.len().saturating_sub(1));
-
+            self.apply_log_update(response.processed_logs, response.search_matches);
             self.logs_need_update = false;
         }
+    }
+
+    /// Takes a processed batch of log lines and the indices that match
+    /// the search, and places the cursor.
+    ///
+    /// The cursor jumps to the first match when a search starts
+    /// matching, or when it sits on a line the current query doesn't
+    /// match (the query changed, or a response for an older query
+    /// arrived first). Otherwise it stays put: jumping on every update
+    /// would yank it back each time a running workflow logs a line.
+    pub(crate) fn apply_log_update(
+        &mut self,
+        processed: Vec<crate::log_processor::ProcessedLogEntry>,
+        matches: Vec<usize>,
+    ) {
+        self.processed_logs = processed;
+        let had_matches = !self.log_search_matches.is_empty();
+        self.log_search_matches = matches;
+
+        if !self.log_search_matches.is_empty() && !self.log_search_query.is_empty() {
+            let off_match = !self.log_follow && !self.log_search_matches.contains(&self.log_scroll);
+            if !had_matches
+                || self.log_search_match_idx >= self.log_search_matches.len()
+                || off_match
+            {
+                self.log_search_match_idx = 0;
+                self.log_scroll = self.log_search_matches[0];
+                self.log_follow = false;
+            }
+        }
+        self.sync_log_cursor();
     }
 
     /// Trigger log processing when the logs or the search/filter
@@ -3008,6 +3041,71 @@ mod tests {
     /// this, which is why nesting is carried by a glyph.
     fn rendered_content(line: &str) -> String {
         crate::log_processor::LogProcessor::process_log_entry(line, "").rendered_content()
+    }
+
+    fn log_lines(n: usize) -> Vec<crate::log_processor::ProcessedLogEntry> {
+        (0..n)
+            .map(|i| crate::log_processor::ProcessedLogEntry {
+                timestamp: "00:00:00".into(),
+                log_type: "INFO".into(),
+                log_style: ratatui::style::Style::default(),
+                content_spans: vec![ratatui::text::Span::raw(format!("line {i}"))],
+            })
+            .collect()
+    }
+
+    #[test]
+    fn refining_a_search_moves_the_cursor_to_the_new_first_match() {
+        let mut app = make_app();
+        app.log_search_active = true;
+
+        app.handle_log_search_input(KeyCode::Char('e'));
+        app.apply_log_update(log_lines(20), vec![2, 5, 9]);
+        assert_eq!(app.log_scroll, 2);
+
+        // A new line arriving must not yank the cursor once it moved on.
+        app.next_search_match();
+        assert_eq!(app.log_scroll, 5);
+        app.apply_log_update(log_lines(21), vec![2, 5, 9]);
+        assert_eq!(app.log_scroll, 5, "stays on the match the user chose");
+
+        // Typing more drops the old matches and re-anchors on the new
+        // query's first one.
+        app.handle_log_search_input(KeyCode::Char('r'));
+        assert!(app.log_search_matches.is_empty());
+        app.apply_log_update(log_lines(21), vec![7, 12]);
+        assert_eq!((app.log_scroll, app.log_search_match_idx), (7, 0));
+    }
+
+    #[test]
+    fn a_stale_search_response_cannot_strand_the_cursor_off_a_match() {
+        let mut app = make_app();
+        app.log_search_active = true;
+        app.handle_log_search_input(KeyCode::Char('e'));
+        app.handle_log_search_input(KeyCode::Char('r'));
+        // The worker answers the old query `e` first, then `er`.
+        app.apply_log_update(log_lines(20), vec![2, 5, 9]);
+        assert_eq!(app.log_scroll, 2);
+        app.apply_log_update(log_lines(20), vec![9, 14]);
+        assert_eq!(app.log_scroll, 9);
+    }
+
+    #[test]
+    fn log_follow_resumes_at_the_last_line_and_pauses_off_it() {
+        let mut app = make_app();
+        app.apply_log_update(log_lines(10), vec![]);
+        assert!(app.log_follow);
+        assert_eq!(app.log_scroll, 9);
+
+        app.scroll_logs_by(-3);
+        assert!(!app.log_follow);
+        app.apply_log_update(log_lines(12), vec![]);
+        assert_eq!(app.log_scroll, 6, "paused: new lines don't move the cursor");
+
+        app.scroll_logs_by(100);
+        assert!(app.log_follow, "reaching the end follows again");
+        app.apply_log_update(log_lines(15), vec![]);
+        assert_eq!(app.log_scroll, 14);
     }
 
     #[test]

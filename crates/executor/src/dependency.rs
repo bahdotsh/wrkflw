@@ -239,6 +239,7 @@ mod tests {
             timeout_minutes: None,
             defaults: None,
             continue_on_error: None,
+            concurrency: None,
         }
     }
 

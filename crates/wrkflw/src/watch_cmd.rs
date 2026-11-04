@@ -97,6 +97,7 @@ pub(crate) async fn run(ctx: WatchCtx) {
     let debounce_duration = std::time::Duration::from_millis(ctx.debounce);
 
     let config = wrkflw_executor::ExecutionConfig {
+        acceleration: Default::default(),
         runtime_type: ctx.runtime.into(),
         verbose: ctx.verbose,
         preserve_containers_on_failure: ctx.preserve_containers_on_failure,

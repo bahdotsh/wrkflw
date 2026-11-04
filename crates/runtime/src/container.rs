@@ -56,6 +56,12 @@ pub trait ContainerRuntime {
         false
     }
 
+    /// The CLI that manages this runtime's containers, when it can keep one
+    /// running and exec into it. Job sessions and services need that.
+    fn session_cli(&self) -> Option<&'static str> {
+        None
+    }
+
     /// True when `run_container` joins `cmd` into one string for a shell, so
     /// an argument holding a multi-line script doesn't survive as one argument.
     fn flattens_commands(&self) -> bool {

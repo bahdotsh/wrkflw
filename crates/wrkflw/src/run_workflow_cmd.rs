@@ -46,6 +46,36 @@ pub(crate) struct RunCtx {
     pub(crate) agent: Option<String>,
     pub(crate) no_record: bool,
     pub(crate) from_step: Option<String>,
+    pub(crate) reuse_results: bool,
+    pub(crate) affected: bool,
+    pub(crate) job_container: bool,
+    pub(crate) dep_cache: bool,
+    pub(crate) remote_cache: Option<String>,
+    pub(crate) cache_push: bool,
+    pub(crate) skip_exit_code: Option<i32>,
+    pub(crate) gate_mode: bool,
+}
+
+/// A credential from the environment, so it never has to be in `argv`.
+fn secret_from_env(name: &str) -> Option<wrkflw_executor::Secret> {
+    crate::cli_secrets::get(name).map(wrkflw_executor::Secret)
+}
+
+fn acceleration_for(
+    ctx: &RunCtx,
+    changed_files: Option<Vec<String>>,
+) -> wrkflw_executor::Acceleration {
+    wrkflw_executor::Acceleration {
+        reuse_results: ctx.reuse_results,
+        changed_files,
+        job_container: ctx.job_container,
+        dep_cache: ctx.dep_cache,
+        remote_cache: ctx.remote_cache.clone(),
+        push_results: ctx.cache_push,
+        signing_key: secret_from_env(crate::cli_secrets::SIGNING_KEY),
+        remote_token: secret_from_env(crate::cli_secrets::REMOTE_TOKEN),
+        gate: ctx.gate_mode,
+    }
 }
 
 /// Print a terminal error in the active format and exit 1.
@@ -188,8 +218,19 @@ pub(crate) async fn run(ctx: RunCtx) {
         from_step,
     };
 
+    if is_gitlab && (ctx.reuse_results || ctx.job_container || ctx.dep_cache) {
+        fail(
+            format,
+            "--reuse-results, --job-container and --dep-cache are only supported for \
+             GitHub Actions workflows.",
+        );
+    }
+    let mut affected_files = None;
+    // `--affected` needs the change set, so it asks for the diff itself.
+    let want_diff = ctx.diff || (ctx.affected && ctx.changed_files.is_none());
+
     // Evaluate trigger filter at the call site before executing
-    if ctx.diff || ctx.event.is_some() || ctx.changed_files.is_some() {
+    if want_diff || ctx.event.is_some() || ctx.changed_files.is_some() {
         if is_gitlab {
             fail(
                 format,
@@ -206,7 +247,7 @@ pub(crate) async fn run(ctx: RunCtx) {
         let decision = prefilter::run_trigger_prefilter(prefilter::PrefilterRequest {
             workflow_path: &ctx.path,
             event: ctx.event.as_ref(),
-            diff: ctx.diff,
+            diff: want_diff,
             changed_files: ctx.changed_files.as_ref(),
             diff_base: ctx.diff_base.as_deref(),
             diff_head: ctx.diff_head.as_ref(),
@@ -217,8 +258,11 @@ pub(crate) async fn run(ctx: RunCtx) {
         })
         .await;
         match decision {
-            Ok(prefilter::PrefilterDecision::Proceed { .. }) => {
+            Ok(prefilter::PrefilterDecision::Proceed { changed_files, .. }) => {
                 // Match — fall through to the executor below.
+                if ctx.affected {
+                    affected_files = Some(changed_files);
+                }
             }
             Ok(prefilter::PrefilterDecision::Skip { reason }) => {
                 use wrkflw_ui::cli_style;
@@ -233,14 +277,22 @@ pub(crate) async fn run(ctx: RunCtx) {
                         cli_style::dim(&format!("Workflow skipped: {}", reason))
                     );
                 }
-                std::process::exit(0);
+                std::process::exit(ctx.skip_exit_code.unwrap_or(0));
             }
             Err(msg) => fail(format, &msg),
         }
     }
 
+    let acceleration = acceleration_for(&ctx, affected_files);
+    // The executor checks this too. Checking here fails before the run is
+    // recorded, and in the requested output format.
+    if let Err(e) = wrkflw_executor::validate_remote(&acceleration) {
+        fail(format, &e);
+    }
+
     // Create execution configuration
     let config = wrkflw_executor::ExecutionConfig {
+        acceleration,
         runtime_type: ctx.runtime.into(),
         verbose: ctx.verbose,
         preserve_containers_on_failure: ctx.preserve_containers_on_failure,

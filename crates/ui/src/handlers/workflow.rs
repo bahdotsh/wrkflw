@@ -213,6 +213,7 @@ pub async fn execute_workflow_cli(
     ));
 
     let config = wrkflw_executor::ExecutionConfig {
+        acceleration: Default::default(),
         runtime_type,
         verbose,
         preserve_containers_on_failure: false, // Default for this path
@@ -651,6 +652,7 @@ pub fn start_next_workflow_execution(
                 } else {
                     // Use safe FD redirection for execution
                     let config = wrkflw_executor::ExecutionConfig {
+                        acceleration: Default::default(),
                         runtime_type,
                         verbose,
                         preserve_containers_on_failure,

@@ -454,6 +454,15 @@ pub fn untrack_container(id: &str) {
     }
 }
 
+/// The tracked containers, in the order cleanup removes them.
+#[cfg(test)]
+pub(crate) fn tracked_containers() -> Vec<String> {
+    RUNNING_CONTAINERS
+        .lock()
+        .map(|containers| containers.clone())
+        .unwrap_or_default()
+}
+
 // Add network to tracking
 pub fn track_network(id: &str) {
     if let Ok(mut networks) = CREATED_NETWORKS.lock() {
@@ -495,7 +504,9 @@ pub async fn cleanup_resources(docker: &Docker) {
     }
 }
 
-// Clean up all tracked containers
+// Clean up all tracked containers, in the order they are tracked. Job sessions
+// rely on that order: `job_session::Containers::add` keeps a job container
+// behind its services, which Podman won't let go of it before.
 pub async fn cleanup_containers(docker: &Docker) -> Result<(), String> {
     // Getting the containers to clean up should not take a long time
     let containers_to_cleanup =
@@ -651,6 +662,10 @@ pub async fn create_job_network(docker: &Docker) -> Result<String, ContainerErro
 
 #[async_trait]
 impl ContainerRuntime for DockerRuntime {
+    fn session_cli(&self) -> Option<&'static str> {
+        Some("docker")
+    }
+
     async fn run_container(
         &self,
         image: &str,

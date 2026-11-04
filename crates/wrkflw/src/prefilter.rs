@@ -40,7 +40,11 @@ use std::path::{Path, PathBuf};
 pub(crate) enum PrefilterDecision {
     /// The workflow's triggers matched the event context — main
     /// should proceed to execute the workflow.
-    Proceed { reason: String },
+    Proceed {
+        reason: String,
+        /// The changed files the trigger was evaluated against.
+        changed_files: Vec<String>,
+    },
     /// The workflow's triggers did NOT match — main should print the
     /// reason (already formatted for the user) and exit 0.
     Skip { reason: String },
@@ -294,6 +298,7 @@ pub(crate) async fn run_trigger_prefilter(
     wrkflw_logging::info(&format!("Trigger matched: {}", match_result.reason));
     Ok(PrefilterDecision::Proceed {
         reason: match_result.reason,
+        changed_files: event_context.changed_files.clone(),
     })
 }
 

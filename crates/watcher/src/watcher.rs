@@ -351,6 +351,7 @@ mod tests {
             workflow_dir,
             repo.to_path_buf(),
             wrkflw_executor::ExecutionConfig {
+                acceleration: Default::default(),
                 runtime_type: wrkflw_executor::RuntimeType::Emulation,
                 verbose: false,
                 preserve_containers_on_failure: false,
@@ -639,6 +640,7 @@ mod tests {
             workflow_dir,
             repo_canonical.clone(),
             wrkflw_executor::ExecutionConfig {
+                acceleration: Default::default(),
                 runtime_type: wrkflw_executor::RuntimeType::Emulation,
                 verbose: false,
                 preserve_containers_on_failure: false,
@@ -785,6 +787,7 @@ mod tests {
             repo_canonical.join(".github").join("workflows"),
             repo_canonical,
             wrkflw_executor::ExecutionConfig {
+                acceleration: Default::default(),
                 runtime_type: wrkflw_executor::RuntimeType::Emulation,
                 verbose: false,
                 preserve_containers_on_failure: false,
@@ -905,6 +908,7 @@ mod tests {
             workflow_dir,
             repo_canonical.clone(),
             wrkflw_executor::ExecutionConfig {
+                acceleration: Default::default(),
                 runtime_type: wrkflw_executor::RuntimeType::Emulation,
                 verbose: false,
                 preserve_containers_on_failure: false,
@@ -1062,6 +1066,7 @@ mod tests {
             workflow_dir,
             repo_canonical.clone(),
             wrkflw_executor::ExecutionConfig {
+                acceleration: Default::default(),
                 runtime_type: wrkflw_executor::RuntimeType::Emulation,
                 verbose: false,
                 preserve_containers_on_failure: false,

@@ -12,11 +12,13 @@ use thiserror::Error;
 
 use ignore::{gitignore::GitignoreBuilder, Match};
 
+use crate::acceleration;
 use crate::action_resolver;
 use crate::dependency;
 use crate::docker;
 use crate::environment;
 use crate::events::{step_display_name, EXIT_CODE_LABEL, STDERR_HEADER, STDOUT_HEADER};
+use crate::job_session;
 use crate::kubernetes::{self, KubernetesConfig};
 use crate::podman;
 use wrkflw_logging;
@@ -43,10 +45,26 @@ pub async fn execute_workflow(
     let is_gitlab = is_gitlab_pipeline(workflow_path);
 
     if is_gitlab {
-        execute_gitlab_pipeline(workflow_path, config.clone()).await
-    } else {
-        execute_github_workflow(workflow_path, config.clone()).await
+        return acceleration::without_run_state(execute_gitlab_pipeline(
+            workflow_path,
+            config.clone(),
+        ))
+        .await;
     }
+    let root = std::env::current_dir().map_err(|e| {
+        ExecutionError::Execution(format!("Failed to get current directory: {}", e))
+    })?;
+    let state = acceleration::RunState::new(
+        config.acceleration.clone(),
+        config.preserve_containers_on_failure,
+        root,
+    )
+    .map_err(ExecutionError::Execution)?;
+    acceleration::with_run_state(
+        std::sync::Arc::new(state),
+        execute_github_workflow(workflow_path, config.clone()),
+    )
+    .await
 }
 
 /// Determine if a file is a GitLab CI/CD pipeline
@@ -1042,6 +1060,8 @@ pub struct ExecutionConfig {
     /// Variables given for this run. GitLab pipelines only: they override the
     /// pipeline's and jobs' own and feed `rules:`, images and scripts.
     pub variables: HashMap<String, String>,
+    /// What this run may do to avoid work. GitHub workflows only.
+    pub acceleration: acceleration::Acceleration,
 }
 
 /// Parse a `LABEL=IMAGE` runner override, as given to `--platform`.
@@ -1115,6 +1135,24 @@ impl JobResult {
     /// Whether this result should fail the run and trigger `fail-fast`.
     fn fails_run(&self) -> bool {
         self.status == JobStatus::Failure && !self.failure_allowed
+    }
+
+    /// A job that didn't run because an earlier pass still stands. Dependents
+    /// see a success, and `step` says why in reports.
+    fn reused(stored: acceleration::StoredJob, step: &str, note: &str) -> Self {
+        JobResult {
+            name: stored.name,
+            canonical_name: stored.canonical_name,
+            status: JobStatus::Success,
+            steps: vec![StepResult::new(
+                step.to_string(),
+                StepStatus::Success,
+                note.to_string(),
+            )],
+            logs: note.to_string(),
+            outputs: stored.outputs,
+            failure_allowed: false,
+        }
     }
 
     /// A job (or matrix combination) that never ran.
@@ -2528,12 +2566,51 @@ async fn execute_job_with_matrix(
         }
     }
 
-    if !job.services.is_empty() {
+    if !job.services.is_empty() && job_session::wanted_for(job, runtime).is_none() {
         wrkflw_logging::warning(&format!(
-            "Job '{}' declares services, which wrkflw doesn't start yet: its steps can't reach them",
+            "Job '{}' declares services, which need Docker or Podman and aren't started \
+             in a called workflow: its steps can't reach them",
             job_name
         ));
     }
+
+    let decision = acceleration::decide(acceleration::Lookup {
+        job_name,
+        job,
+        workflow,
+        env_context,
+        platform_overrides,
+        needs_outputs: &needs_ctx,
+        needs_results: &needs_res,
+        partial: crate::events::first_step_for(job_name, &job.steps) > 0,
+    })
+    .await;
+    let result_key = match decision {
+        acceleration::Decision::Reuse { jobs, why } => {
+            let (note, step) = (why.note(), why.step());
+            return Ok(jobs
+                .into_iter()
+                .map(|stored| {
+                    announce_reused(&stored, &note);
+                    JobResult::reused(stored, step, &note)
+                })
+                .collect());
+        }
+        acceleration::Decision::Skip { reason } => {
+            wrkflw_logging::info(&format!(
+                "{} Skipping job '{}': {}",
+                wrkflw_logging::symbols::SKIPPED,
+                job_name,
+                reason
+            ));
+            return Ok(vec![JobResult::skipped(job_name, job_name, reason)]);
+        }
+        acceleration::Decision::Run { key } => key,
+    };
+    // Held for the whole job, across its matrix legs, as GitHub holds a group.
+    // Taken after the decision, so a reused job never waits on a running one.
+    let _concurrency_permit = acceleration::acquire_concurrency(job_name, job).await;
+    acceleration::mark_executed(job_name);
 
     // Check if this is a matrix job
     if let Some(matrix_config) = job.matrix_config() {
@@ -2594,7 +2671,7 @@ async fn execute_job_with_matrix(
         };
 
         // Execute matrix combinations
-        execute_matrix_combinations(MatrixExecutionContext {
+        let results = execute_matrix_combinations(MatrixExecutionContext {
             job_name,
             job_template: job,
             combinations: &combinations,
@@ -2607,7 +2684,9 @@ async fn execute_job_with_matrix(
             verbose,
             services,
         })
-        .await
+        .await?;
+        store_passing_result(result_key.as_deref(), &results, env_context).await;
+        Ok(results)
     } else {
         // Regular job, no matrix
         let services = JobServices {
@@ -2630,9 +2709,53 @@ async fn execute_job_with_matrix(
             verbose,
             services,
         };
-        let result = execute_job(ctx).await?;
-        Ok(vec![result])
+        let result = job_session::with_job_session(job, runtime, execute_job(ctx)).await?;
+        let results = vec![result];
+        store_passing_result(result_key.as_deref(), &results, env_context).await;
+        Ok(results)
     }
+}
+
+/// Report a job that won't run, the way a run job reports itself.
+fn announce_reused(stored: &acceleration::StoredJob, note: &str) {
+    crate::events::emit(|| crate::events::ExecutionEvent::JobStarted {
+        job: stored.name.clone(),
+        canonical_name: stored.canonical_name.clone(),
+    });
+    crate::events::emit(|| crate::events::ExecutionEvent::JobFinished {
+        job: stored.name.clone(),
+        status: JobStatus::Success,
+        failure_allowed: false,
+        duration_ms: 0,
+        logs: note.to_string(),
+    });
+    wrkflw_logging::info(&format!(
+        "{} Job '{}': {}",
+        wrkflw_logging::symbols::SKIPPED,
+        stored.name,
+        note
+    ));
+}
+
+/// File `results` under `key` if every job and matrix leg passed.
+async fn store_passing_result(
+    key: Option<&str>,
+    results: &[JobResult],
+    env_context: &HashMap<String, String>,
+) {
+    let Some(key) = key else { return };
+    if results.is_empty() || results.iter().any(|r| r.status != JobStatus::Success) {
+        return;
+    }
+    let jobs = results
+        .iter()
+        .map(|result| acceleration::StoredJob {
+            name: result.name.clone(),
+            canonical_name: result.canonical_name.clone(),
+            outputs: result.outputs.clone(),
+        })
+        .collect();
+    acceleration::store(key, jobs, env_context).await;
 }
 
 #[allow(unused_variables, unused_assignments)]
@@ -2864,16 +2987,20 @@ async fn execute_matrix_combinations(
 
         // Process this chunk of combinations in parallel
         let chunk_futures = chunk.iter().map(|combination| {
-            execute_matrix_job(
-                ctx.job_name,
+            job_session::with_job_session(
                 ctx.job_template,
-                combination,
-                ctx.workflow,
                 ctx.runtime,
-                ctx.env_context,
-                ctx.user_env,
-                ctx.verbose,
-                &ctx.services,
+                execute_matrix_job(
+                    ctx.job_name,
+                    ctx.job_template,
+                    combination,
+                    ctx.workflow,
+                    ctx.runtime,
+                    ctx.env_context,
+                    ctx.user_env,
+                    ctx.verbose,
+                    &ctx.services,
+                ),
             )
         });
 
@@ -4999,24 +5126,53 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
         };
         let cmd_refs: Vec<&str> = cmd_parts.iter().map(String::as_str).collect();
 
-        let volumes = mount_ctx.build_volumes(ctx.working_dir, container_workspace);
+        let dep_mounts = acceleration::dep_cache_mounts(ctx.runtime.mounts_are_copies());
+        let mut volumes = mount_ctx.build_volumes(ctx.working_dir, container_workspace);
+        volumes.extend(
+            dep_mounts
+                .iter()
+                .map(|(host, container)| (host.as_path(), container.as_path())),
+        );
         let env_vars: Vec<(&str, &str)> = step_env
             .iter()
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
 
-        // Execute the command
-        let run_result = ctx
-            .runtime
-            .run_container(
-                ctx.runner_image,
-                &cmd_refs,
-                &env_vars,
-                &final_workspace,
-                &volumes,
-                None,
-            )
-            .await;
+        // Execute the command, in the job's container if it has one
+        let session_result = match job_session::current() {
+            Some(session) => {
+                let resolve = |value: &str| preprocess_with_value(value, &ctx);
+                session
+                    .run(
+                        ctx.runner_image,
+                        &cmd_refs,
+                        &env_vars,
+                        &final_workspace,
+                        &volumes,
+                        &resolve,
+                    )
+                    .await
+            }
+            None => Ok(None),
+        };
+        let run_result = match session_result {
+            Ok(Some(output)) => Ok(output),
+            Ok(None) => {
+                ctx.runtime
+                    .run_container(
+                        ctx.runner_image,
+                        &cmd_refs,
+                        &env_vars,
+                        &final_workspace,
+                        &volumes,
+                        None,
+                    )
+                    .await
+            }
+            Err(message) => Err(wrkflw_runtime::container::ContainerError::ContainerStart(
+                message,
+            )),
+        };
 
         drop(custom_shell_script);
 
@@ -5587,7 +5743,8 @@ fn warn_unsupported_container_fields(container: &JobContainer) {
     }
     if container.ports.is_some() {
         wrkflw_logging::warning(
-            "container 'ports' field is not yet supported (service containers are not implemented)",
+            "container 'ports' field is not supported locally and will be ignored: \
+             nothing outside the job reaches its container",
         );
     }
 }
@@ -5791,7 +5948,7 @@ async fn run_called_workflow(
     // for now; job-level env merges still populate it correctly downstream.
     let child_user_env: HashMap<String, String> = HashMap::new();
     for batch in plan {
-        let results = execute_job_batch(
+        let results = acceleration::without_run_state(execute_job_batch(
             &batch,
             called,
             ctx.runtime,
@@ -5805,7 +5962,7 @@ async fn run_called_workflow(
             ctx.services.artifact_store,
             ctx.services.cache_store,
             ctx.services.platform_overrides,
-        )
+        ))
         .await?;
         any_failed |= results.iter().any(JobResult::fails_run);
         record_job_results(
@@ -6129,6 +6286,7 @@ async fn execute_composite_action(
                 on_raw: serde_yaml::Value::Null,
                 jobs: HashMap::new(),
                 defaults: None,
+                permissions: None,
                 env: HashMap::new(),
             };
             for (idx, step_def) in steps.iter().enumerate() {
@@ -7316,6 +7474,7 @@ mod tests {
             timeout_minutes: None,
             defaults: None,
             continue_on_error: None,
+            concurrency: None,
         }
     }
 
@@ -7730,6 +7889,7 @@ mod tests {
             on_raw: serde_yaml::Value::Null,
             jobs: HashMap::new(),
             defaults: None,
+            permissions: None,
             env: HashMap::new(),
         }
     }
@@ -8397,6 +8557,8 @@ runs:
     struct OverlappingRuntime {
         all_steps_running: tokio::sync::Barrier,
         github_dirs: Mutex<std::collections::HashSet<PathBuf>>,
+        /// For each step: whether the run's acceleration state reached it.
+        saw_run_state: Mutex<Vec<bool>>,
     }
 
     #[async_trait::async_trait]
@@ -8425,6 +8587,10 @@ runs:
                 .lock()
                 .unwrap()
                 .insert(github_dir.to_path_buf());
+            self.saw_run_state
+                .lock()
+                .unwrap()
+                .push(acceleration::current().is_some());
             fs::write(
                 github_dir.join("output"),
                 format!("value={}\n", env("GITHUB_JOB")),
@@ -8496,29 +8662,46 @@ runs:
         let runtime = OverlappingRuntime {
             all_steps_running: tokio::sync::Barrier::new(2),
             github_dirs: Mutex::default(),
+            saw_run_state: Mutex::default(),
         };
         let jobs: Vec<String> = jobs.iter().map(|job| job.to_string()).collect();
+        let state = acceleration::RunState::new(
+            acceleration::Acceleration::default(),
+            false,
+            run_dir.path().to_path_buf(),
+        )
+        .unwrap();
         let results = tokio::time::timeout(
             std::time::Duration::from_secs(30),
-            execute_job_batch(
-                &jobs,
-                &workflow,
-                &runtime,
-                &env_context,
-                &HashMap::new(),
-                false,
-                None,
-                None,
-                &HashMap::new(),
-                &HashMap::new(),
-                &crate::artifacts::ArtifactStore::new(run_dir.path()).unwrap(),
-                &crate::cache::CacheStore::new().unwrap(),
-                &HashMap::new(),
+            acceleration::with_run_state(
+                std::sync::Arc::new(state),
+                execute_job_batch(
+                    &jobs,
+                    &workflow,
+                    &runtime,
+                    &env_context,
+                    &HashMap::new(),
+                    false,
+                    None,
+                    None,
+                    &HashMap::new(),
+                    &HashMap::new(),
+                    &crate::artifacts::ArtifactStore::new(run_dir.path()).unwrap(),
+                    &crate::cache::CacheStore::new().unwrap(),
+                    &HashMap::new(),
+                ),
             ),
         )
         .await
         .expect("both steps must overlap")
         .unwrap();
+        let saw_run_state = runtime.saw_run_state.into_inner().unwrap();
+        assert!(
+            !saw_run_state.is_empty() && saw_run_state.iter().all(|saw| *saw),
+            "a parallel job left the run's task and lost reuse, job containers \
+             and services: {:?}",
+            saw_run_state
+        );
         let github_dirs = runtime.github_dirs.into_inner().unwrap();
         (results, github_dirs, run_dir)
     }
@@ -8570,6 +8753,7 @@ runs:
             on_raw: serde_yaml::Value::Null,
             jobs: Default::default(),
             defaults: None,
+            permissions: None,
             env: HashMap::new(),
         }
     }

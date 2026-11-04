@@ -28,6 +28,8 @@ A command-line tool for validating and executing GitHub Actions workflows locall
 - **Secrets management** — multiple providers (env, file, Vault, AWS, Azure, GCP) with masking and AES-256-GCM encrypted storage
 - **Remote triggering** — trigger `workflow_dispatch` runs on GitHub or GitLab pipelines
 - **GitLab support** — validate and trigger GitLab CI pipelines
+- **Faster reruns** — reuse passing job results, skip jobs a change can't affect, run a job in one container, share dependency caches, and gate pushes (see [Spending less on CI](#spending-less-on-ci))
+- **Service containers** — `services:` start next to the job on Docker and Podman, with health checks
 - **Agent support** — `--format json` on every command, recorded run history with failure digests, `wrkflw plan`, and an MCP server (see [AGENTS.md](AGENTS.md))
 - **Gitea support** — discover, validate, and run workflows from `.gitea/workflows`, including the `gitea` expression context
 
@@ -37,8 +39,11 @@ A command-line tool for validating and executing GitHub Actions workflows locall
 - Event triggers other than `workflow_dispatch` for the remote `trigger` command
 - Absolute-URL actions such as `uses: https://gitea.com/actions/checkout@v4` — they pass validation, but at run time the URL is not resolved and the step falls back to built-in handling
 - Private repos for remote `uses:` — reusable workflows clone over unauthenticated HTTPS
-- `concurrency:` groups and `cancel-in-progress` — parsed but not enforced
-- Service containers — `services:` is parsed but never started, in any runtime
+- `cancel-in-progress` and workflow-level `concurrency:` — job-level groups are enforced within a run, but a local run has nothing earlier to cancel
+- Service containers outside Docker and Podman — emulation, secure emulation, Kubernetes and jobs inside a called workflow don't start `services:`
+- Service settings that reach the host — a service's `volumes:` can only name a volume, not a host path, and its `options:` only take flags that shape the service container itself, such as `--health-cmd`, `--user`, `--tmpfs` and `-e NAME=value`. Anything else, such as `--privileged` or `-v`, fails the job.
+- Services that listen on the same port — services share the job container's network, as they do on a GitHub runner, so two Postgres services can't both have 5432. wrkflw refuses two services whose `ports:` name the same container port, and warns about two services of one image.
+- A job with `services:` runs its steps in one container with them, which needs `sh` and `env` in the job's image. Files a step leaves outside the workspace are there for the next step, and `--preserve-containers-on-failure` doesn't keep that container.
 - Windows and macOS runners — `runs-on: windows-*` / `macos-*` is silently mapped to a container image (macOS → a Linux image, Windows → a Windows container that won't run on Linux/macOS hosts). In container runtimes `${{ runner.os }}` is `Linux` and `runner.temp` and the other runner paths are Linux paths, even for a Windows image, so a job on a Windows container sees the wrong values. In emulation `runner.os` is the host OS.
 - `working-directory` outside the workspace — it must stay inside the workspace, so `${{ runner.temp }}/build` fails the step instead of running there.
 
@@ -180,6 +185,71 @@ wrkflw run --event push --no-strict-filter .github/workflows/ci.yml
 ```
 
 See [BREAKING_CHANGES.md](BREAKING_CHANGES.md) for full migration notes.
+
+### Spending less on CI
+
+All of this is opt-in. Without these flags a run behaves as it always has.
+
+```bash
+# Check everything a push would run, reusing what already passed
+wrkflw gate
+
+# Run it on every push (an existing hook is left alone). The hook keeps the
+# --runtime and --remote-cache given here, and compares against what the
+# remote already has for the pushed branch. It refuses a core.hooksPath
+# outside the repository, which other repositories share. It checks the
+# working tree, so uncommitted changes count, and it warns when there are any.
+wrkflw gate --install-hook
+
+# The same pieces, one at a time
+wrkflw run .github/workflows/ci.yml --reuse-results
+wrkflw run .github/workflows/ci.yml --event push --affected
+wrkflw run .github/workflows/ci.yml --job-container --dep-cache
+```
+
+- **`--reuse-results`** skips a job when an identical job already passed on identical inputs. The fingerprint covers the job definition, workflow `env` and `defaults`, `needs` outputs, event, ref, runtime, operating system, CPU architecture, `--platform` overrides and file contents. Stored outputs still reach dependent jobs. Results expire after 7 days, or `WRKFLW_RESULT_TTL_SECS`, because images and floating action tags such as `@v4` aren't in the fingerprint.
+- **`--affected`** also skips a job when none of its declared paths changed, even with no stored result. It trusts the base you compare against to be green. The pre-push hook compares against the remote tip of the branch you push, which is green only if that push's CI passed. If it may not have, run `wrkflw gate --diff-base origin/main` by hand. It needs `--event`, and only applies to jobs listed in `.wrkflw/affected.yml`. Such a job counts as passed for its dependents and reports one `Not affected` step. A job still runs if it has `outputs` or a matrix, if a job it needs ran or didn't pass, or if a workflow file changed.
+- **`--job-container`** runs a job's `run:` steps in one container, on Docker and Podman. Files a step leaves outside the workspace are there for the next step, as on GitHub. A step that times out may still be running in that container, so the next step gets a fresh one, and a job's services restart with it. It's ignored with `--preserve-containers-on-failure`.
+- **`--dep-cache`** mounts host directories over the cargo, npm, pip and Go caches under `/root`, so it helps images that run as root. The host directories live under `WRKFLW_DEP_CACHE_DIR` if set, or the user cache directory. Steps can write to them, so a job you don't trust can leave packages there for later runs. They are wrkflw's own directories, not your `~/.cargo` or `~/.npm`.
+
+Reuse is only as safe as its inputs. wrkflw always runs a job that reads secrets or a `github-token` input, has `write` permissions of its own or from the workflow's `permissions:`, exchanges artifacts, uses a known publishing action such as `actions/github-script`, `softprops/action-gh-release` or `docker/build-push-action`, or calls a reusable workflow, because those can have effects it can't see. It also always runs a job with `outputs` that uses `needs` when a job upstream reads secrets, so a passed-along secret doesn't get stored. A job with no `permissions:`, in a workflow with none, counts as read-only, though on GitHub it gets the repository's default token permissions, which are write-all for repositories created before February 2023. For anything else with outside effects, set `cache: false`. That includes a job that gets its credentials from the machine rather than from `secrets`, such as a deploy that uses `~/.aws`, `gh auth` or `~/.npmrc` in emulation: wrkflw can't see those, so it would reuse the result and the deploy would silently not happen.
+
+By default every file in the repository is an input, so any change reruns every job. `.wrkflw/affected.yml` narrows that. It lives outside the workflow file because GitHub rejects unknown keys there.
+
+```yaml
+jobs:
+  test:
+    paths: ['src/**', 'Cargo.lock']   # what this job reads
+  publish-preview:
+    cache: false                      # always run: never reuse or skip it
+  deploy:
+    gate: false                       # leave it to CI: `wrkflw gate` skips it
+```
+
+`wrkflw gate` runs every job a push would, with this machine's credentials, and it can't tell a deploy from a test. Mark deploys, releases and anything else that must only run in CI with `gate: false`. The gate reports them as skipped, and skips the jobs that need them too. It warns about a job that always runs because it reads secrets or publishes, unless that job has `gate: false` or `cache: false`.
+
+Paths you leave out go unnoticed, so list everything the job reads. `*` doesn't cross `/`, so `*.rs` only matches files at the root. Use `**/*.rs`, and wrkflw warns about a wildcard path with no `/`. `.github/actions/**`, `.gitea/actions/**`, this file and the directory of each local action the job uses, such as `uses: ./tools/release`, always count.
+
+#### Sharing results across machines
+
+```bash
+export WRKFLW_CACHE_SIGNING_KEY=...       # required
+export WRKFLW_REMOTE_CACHE_TOKEN=...      # optional bearer token
+
+# In trusted CI on your main branch: run every job and publish its result
+wrkflw run ci.yml --remote-cache https://cache.example.com/wrkflw --cache-push
+
+# Anywhere else: read
+wrkflw run ci.yml --reuse-results --remote-cache https://cache.example.com/wrkflw
+```
+
+The location is a directory, a `file://` path, or an `https://` base that serves `GET` and `PUT` on `<base>/<key>.json`. Entries are HMAC-signed, and one that doesn't verify is ignored. The key is symmetric, so anyone who can read results with it could also forge one given write access to the store. A forged result does more than mark a job as passed: its outputs reach `run:` scripts of dependent jobs, so the key plus write access means running commands on every machine that reads the store. Keep store write access to trusted CI, and don't expose the key to pull requests from forks.
+
+`--cache-push` publishes every passing job, with or without `--reuse-results`. Add `--reuse-results` to also skip jobs the store already has. If the remote fails to answer, or refuses the token, wrkflw warns, stops using it for the rest of that run and runs the jobs. Only a 404 counts as a miss.
+
+Local results older than the TTL are removed the first time a run stores one.
+
+Stored outputs aren't encrypted. A job that runs in emulation never pushes, because its result depends on the tools of that machine. wrkflw removes `WRKFLW_CACHE_SIGNING_KEY` and `WRKFLW_REMOTE_CACHE_TOKEN` from its own environment at startup, so steps it runs, in emulation or not, never see them.
 
 ### Watch mode
 

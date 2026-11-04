@@ -16,6 +16,10 @@ Prefer the MCP server if your client supports MCP:
 {"mcpServers": {"wrkflw": {"command": "wrkflw", "args": ["mcp", "serve"]}}}
 ```
 
+## Before pushing
+
+Run `wrkflw gate`. It runs what a push would run, reusing jobs that already passed on the same files, and exits 1 if anything fails. Add `--reuse-results` to `wrkflw run` to get the same reuse while iterating. A reused job reports one `Reuse result` step and an unaffected job one `Not affected` step, so their output isn't there to read. See "Spending less on CI" in the README for `.wrkflw/affected.yml`.
+
 ## Simulating events
 
 - `--event pull_request` needs `--base-branch main`. Without it the command fails, on purpose.
@@ -59,6 +63,9 @@ Identify yourself with `WRKFLW_AGENT=<name>` or `--agent`. `WRKFLW_INTENT` or `-
 
 ## Limits
 
+- `--affected` trusts the paths in `.wrkflw/affected.yml`. A path left out of a job's list won't rerun that job.
+- `wrkflw gate` checks the working tree, not the commits you push, and skips jobs marked `gate: false` in `.wrkflw/affected.yml`.
+- Parallel jobs run one after another in emulation, so `--runtime emulation` won't show a race between jobs.
 - `--from-step` needs `--job`. Earlier steps are skipped apart from `actions/checkout`, so their outputs and files are missing. Use it to iterate on a step that doesn't depend on them.
 - `runs replay` reruns against the current working tree. Compare `git_sha` and `git_dirty` on the record if the result differs.
 - `--runtime emulation` runs steps directly on this machine. Use a container runtime or `secure-emulation` for code you don't trust.

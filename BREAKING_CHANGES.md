@@ -1,5 +1,27 @@
 # Breaking Changes
 
+## `services:` start and can fail a job (unreleased)
+
+On Docker and Podman, a job's `services:` now start, and its steps run in one container with them. A service that can't start or never turns healthy fails the job's container steps. These jobs used to log a warning and run without the service. Emulation, secure emulation, Kubernetes and called workflows still warn.
+
+For such a job, this also changes how its steps run:
+
+- Steps share one container, so files a step leaves outside the workspace are there for the next one. Each step used to start clean.
+- The job's image needs `sh` and `env`, which the shared container uses to run steps. An image without them fails the job.
+- `--preserve-containers-on-failure` doesn't keep the shared container or the services.
+- A step that times out leaves a fresh container, and restarted services, for the next step, as the old one may still be running it. Data a step put in a service is gone after that.
+- A `shell: sh` step in a Debian or Ubuntu image can't pass a variable whose name isn't an identifier, such as `INPUT_MY-INPUT`, on to its children, as dash drops it. This matches GitHub.
+- Two services whose `ports:` name the same container port fail the job, as services share one network.
+- A service's `volumes:` can't mount a host path, and its `options:` only take flags that shape the service container. `--privileged`, `-v`, `--mount`, `--network`, `--pid`, `--cap-add` and the like fail the job, as they would let workflow YAML reach this machine.
+
+## Job-level `concurrency:` is enforced within a run (unreleased)
+
+Jobs that share a `concurrency:` group now run one at a time, where they used to overlap. `cancel-in-progress` has no effect, and a run takes longer if it relied on the overlap.
+
+## New public fields on `ExecutionConfig`, `Job` and `WorkflowDefinition` (unreleased)
+
+`wrkflw_executor::ExecutionConfig` gains `acceleration`, `wrkflw_parser::workflow::Job` gains `concurrency`, and `wrkflw_parser::workflow::WorkflowDefinition` gains `permissions`. Code that builds any of them with a struct literal has to set the new field. `Default::default()` is what `acceleration` was before, and `None` is what `concurrency` and `permissions` were.
+
 ## A missing secret no longer fails a `run:` step (unreleased)
 
 A `${{ secrets.X }}` that no provider has now expands to an empty string in `run:`, as it already did in `env:` and as it does on GitHub. The step used to fail with `Secret not found`. Anything relying on that failure should check for the value itself. A provider that fails for any other reason still fails the step.

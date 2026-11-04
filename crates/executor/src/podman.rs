@@ -376,7 +376,9 @@ pub async fn cleanup_resources() {
     }
 }
 
-// Clean up all tracked containers
+// Clean up all tracked containers, in the order they are tracked. Job sessions
+// rely on that order: `job_session::Containers::add` keeps a job container
+// behind its services, which Podman won't let go of it before.
 pub async fn cleanup_containers() -> Result<(), String> {
     // Getting the containers to clean up should not take a long time
     let containers_to_cleanup =
@@ -474,6 +476,10 @@ pub async fn cleanup_containers() -> Result<(), String> {
 
 #[async_trait]
 impl ContainerRuntime for PodmanRuntime {
+    fn session_cli(&self) -> Option<&'static str> {
+        Some("podman")
+    }
+
     async fn run_container(
         &self,
         image: &str,

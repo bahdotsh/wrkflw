@@ -982,6 +982,7 @@ pub fn convert_to_workflow_format(pipeline: &Pipeline) -> workflow::WorkflowDefi
         on_raw: serde_yaml::Value::String("push".to_string()),
         jobs: HashMap::new(),
         defaults: None,
+        permissions: None,
         env: HashMap::new(),
     };
 
@@ -1023,6 +1024,7 @@ pub fn convert_to_workflow_format(pipeline: &Pipeline) -> workflow::WorkflowDefi
                     working_directory: None,
                 }),
             }),
+            concurrency: None,
             continue_on_error: matches!(gitlab_job.allow_failure, Some(AllowFailure::Bool(true)))
                 .then(|| CONTINUE_ON_ERROR_ALWAYS.to_string()),
         };

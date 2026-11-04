@@ -86,6 +86,7 @@ jobs:
     std::env::set_current_dir(dir.path()).unwrap();
 
     let cfg = ExecutionConfig {
+        acceleration: Default::default(),
         runtime_type: RuntimeType::Emulation,
         verbose: false,
         preserve_containers_on_failure: false,

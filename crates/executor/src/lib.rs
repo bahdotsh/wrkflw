@@ -2,6 +2,7 @@
 
 #![allow(unused_variables, unused_assignments)]
 
+pub mod acceleration;
 pub mod action_resolver;
 pub(crate) mod artifacts;
 pub(crate) mod cache;
@@ -13,12 +14,14 @@ pub mod environment;
 pub mod events;
 pub mod expression;
 pub mod github_env_files;
+pub(crate) mod job_session;
 pub mod kubernetes;
 pub mod podman;
 pub mod substitution;
 pub(crate) mod workflow_commands;
 
 // Re-export public items
+pub use acceleration::{validate_remote, Acceleration, Secret, Sidecar, SIDECAR_PATH};
 pub use docker::cleanup_resources;
 pub use engine::{
     detect_runtime, execute_workflow, parse_platform_override, ExecutionConfig, JobResult,

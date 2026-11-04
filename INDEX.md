@@ -1,6 +1,6 @@
 # Codebase Index: wrkflw
 
-> Generated: 2026-11-04 14:46:00 UTC | Files: 242 | Lines: 106274
+> Generated: 2026-11-04 15:11:36 UTC | Files: 242 | Lines: 106521
 > Languages: JSON (4), Markdown (26), Rust (150), Shell (5), TOML (19), YAML (38)
 
 ## Directory Structure
@@ -1665,7 +1665,7 @@ wrkflw/
 
 ## INDEX.md
 
-**Language:** Markdown | **Size:** 236.5 KB | **Lines:** 8638
+**Language:** Markdown | **Size:** 237.1 KB | **Lines:** 8660
 
 **Declarations:**
 
@@ -7233,7 +7233,7 @@ wrkflw/
 
 ## crates/wrkflw/src/main.rs
 
-**Language:** Rust | **Size:** 63.2 KB | **Lines:** 1772
+**Language:** Rust | **Size:** 63.3 KB | **Lines:** 1773
 
 **Imports:**
 - `bollard::Docker`
@@ -7409,7 +7409,7 @@ wrkflw/
 
 ## crates/wrkflw/src/mcp_install.rs
 
-**Language:** Rust | **Size:** 27.4 KB | **Lines:** 818
+**Language:** Rust | **Size:** 33.3 KB | **Lines:** 977
 
 **Imports:**
 - `crate::OutputFormat`
@@ -7459,6 +7459,8 @@ wrkflw/
 
 `fn method(client: Client, dirs: &Dirs, command: &str) -> Method`
 
+`fn opencode_config(dir: &Path) -> PathBuf`
+
 `fn detected(method: &Method) -> bool`
 
 `enum Status`
@@ -7468,6 +7470,8 @@ wrkflw/
   `fn as_str(self) -> &'static str`
 
   `fn is_failure(self) -> bool`
+
+  `fn reason(self) -> Option<String>`
 
 
 `struct Outcome`
@@ -7482,6 +7486,10 @@ wrkflw/
 
 `enum Ordered`
 > Variants: `Null`, `Bool`, `Number`, `String`, `Array`, `Object`
+
+`const LAUNCH_KEYS: [&str`
+
+`fn same_launch(current: &Ordered, wanted: &IndexMap<String, Ordered>) -> bool`
 
 `fn upsert_json( text: Option<&str>, key: &str, entry: &Value, policy: Policy, ) -> Result<(Status, Option<String>), String>`
 
@@ -7503,7 +7511,9 @@ wrkflw/
 
 `fn codex_existing(command: &str) -> Option<bool>`
 
-`fn install_cli( client: Client, dirs: &Dirs, command: &str, policy: Policy, ) -> (Status, Option<String>)`
+`fn codex_matches(stdout: &[u8], command: &str) -> bool`
+
+`fn install_cli( program: &str, scope: &[&str], existing: Option<bool>, command: &str, policy: Policy, ) -> (Status, Option<String>)`
 
 `fn install_one( client: Client, dirs: &Dirs, launch: &Launch, policy: Policy, named: bool, ) -> Option<Outcome>`
 
@@ -7776,7 +7786,7 @@ wrkflw/
 
 ## crates/wrkflw/tests/agent_cli_test.rs
 
-**Language:** Rust | **Size:** 32.5 KB | **Lines:** 1041
+**Language:** Rust | **Size:** 35.2 KB | **Lines:** 1106
 
 **Imports:**
 - `serde_json::{json, Value}`
@@ -7897,6 +7907,8 @@ wrkflw/
 `fn a_reported_step_name_can_be_passed_back_to_from_step()`
 
 `fn undefined_references_warn_without_failing_validation()`
+
+`fn mcp_install_registers_once_and_leaves_other_commands_alone()`
 
 ---
 

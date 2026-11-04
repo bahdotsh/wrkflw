@@ -235,6 +235,7 @@ mod tests {
             source: "cli".to_string(),
             agent: None,
             intent: None,
+            session: None,
             replay_of: None,
             argv: Vec::new(),
             variables: Vec::new(),

@@ -24,6 +24,7 @@ pub struct RunMeta {
     pub source: String,
     pub agent: Option<String>,
     pub intent: Option<String>,
+    pub session: Option<String>,
     pub event: Option<String>,
     pub argv: Vec<String>,
     pub variables: Vec<String>,
@@ -35,6 +36,7 @@ impl RunMeta {
         Self {
             source: source.to_string(),
             agent: detect_agent(),
+            session: detect_session(),
             replay_of: non_empty_env(env::REPLAY_OF),
             ..Default::default()
         }
@@ -47,8 +49,54 @@ fn non_empty_env(name: &str) -> Option<String> {
 
 /// `WRKFLW_AGENT`, or the coding agent that announces itself in the environment.
 pub fn detect_agent() -> Option<String> {
-    non_empty_env(env::AGENT)
-        .or_else(|| non_empty_env(env::CLAUDE_CODE).map(|_| "claude-code".to_string()))
+    agent_from(non_empty_env)
+}
+
+/// `WRKFLW_SESSION`, or the session id the detected agent exports.
+pub fn detect_session() -> Option<String> {
+    session_from(non_empty_env)
+}
+
+fn agent_from(get: impl Fn(&str) -> Option<String>) -> Option<String> {
+    if let Some(agent) = get(env::AGENT) {
+        return Some(agent);
+    }
+    // Claude Code sets `claude-code_2-1-314_agent`: name, version, kind.
+    if let Some(agent) = get(env::AI_AGENT) {
+        let name = agent.split('_').next().unwrap_or_default().trim();
+        if !name.is_empty() {
+            return Some(name.to_string());
+        }
+    }
+    let announced = |names: &[&str]| names.iter().any(|name| get(name).is_some());
+    let agent = if announced(&[env::CLAUDE_CODE]) {
+        "claude-code"
+    } else if announced(&[env::CODEX_THREAD, env::CODEX_SANDBOX, env::CODEX_CI]) {
+        "codex"
+    } else if announced(&[env::GEMINI_CLI]) {
+        "gemini"
+    } else if announced(&[env::OPENCODE, env::OPENCODE_CLIENT]) {
+        "opencode"
+    } else if announced(&[env::CURSOR_AGENT]) {
+        "cursor"
+    } else if announced(&[env::AUGMENT_AGENT]) {
+        "augment"
+    } else {
+        return None;
+    };
+    Some(agent.to_string())
+}
+
+fn session_from(get: impl Fn(&str) -> Option<String>) -> Option<String> {
+    if let Some(session) = get(env::SESSION) {
+        return Some(session);
+    }
+    // An MCP server outlives the agent's session: Claude Code keeps the id it
+    // was started with across `/clear`. A stale id is worse than none.
+    if get(env::MCP).is_some() {
+        return None;
+    }
+    get(env::CLAUDE_CODE_SESSION).or_else(|| get(env::CODEX_THREAD))
 }
 
 #[derive(Clone, Debug, Default)]
@@ -426,6 +474,7 @@ async fn begin(path: &Path, config: &ExecutionConfig, options: &RunOptions) -> A
         source: options.meta.source.clone(),
         agent: options.meta.agent.clone(),
         intent: options.meta.intent.clone(),
+        session: options.meta.session.clone(),
         replay_of: options.meta.replay_of.clone(),
         from_step: options.from_step.as_ref().map(|from| from.step.clone()),
         argv: options.meta.argv.clone(),
@@ -470,6 +519,7 @@ async fn begin(path: &Path, config: &ExecutionConfig, options: &RunOptions) -> A
         "git_sha": record.git_sha,
         "agent": record.agent,
         "intent": record.intent,
+        "session": record.session,
     }));
     recorder
 }
@@ -556,6 +606,68 @@ pub async fn record_skipped(
 mod tests {
     use super::*;
     use wrkflw_executor::{JobStatus, StepStatus};
+
+    /// Environment variables, and what detection should make of them.
+    type Case<'a> = (&'a [(&'a str, &'a str)], Option<&'a str>);
+
+    fn vars<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |name| {
+            pairs
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| value.to_string())
+        }
+    }
+
+    #[test]
+    fn agents_are_detected_from_what_they_export() {
+        let cases: &[Case] = &[
+            (&[], None),
+            (&[(env::CLAUDE_CODE, "1")], Some("claude-code")),
+            (
+                &[(env::AI_AGENT, "claude-code_2-1-314_agent")],
+                Some("claude-code"),
+            ),
+            (
+                &[(env::AI_AGENT, "github-copilot-cli")],
+                Some("github-copilot-cli"),
+            ),
+            (
+                &[(env::AI_AGENT, "_"), (env::GEMINI_CLI, "1")],
+                Some("gemini"),
+            ),
+            (&[(env::CODEX_THREAD, "t")], Some("codex")),
+            (&[(env::CODEX_SANDBOX, "seatbelt")], Some("codex")),
+            (&[(env::OPENCODE_CLIENT, "cli")], Some("opencode")),
+            (&[(env::CURSOR_AGENT, "1")], Some("cursor")),
+            (&[(env::AUGMENT_AGENT, "1")], Some("augment")),
+            (&[(env::AGENT, "me"), (env::CLAUDE_CODE, "1")], Some("me")),
+        ];
+        for (pairs, expected) in cases {
+            assert_eq!(agent_from(vars(pairs)).as_deref(), *expected, "{pairs:?}");
+        }
+    }
+
+    #[test]
+    fn sessions_come_from_the_agent_unless_under_mcp() {
+        let cases: &[Case] = &[
+            (&[], None),
+            (&[(env::CLAUDE_CODE_SESSION, "c")], Some("c")),
+            (&[(env::CODEX_THREAD, "t")], Some("t")),
+            (
+                &[(env::SESSION, "s"), (env::CLAUDE_CODE_SESSION, "c")],
+                Some("s"),
+            ),
+            (
+                &[(env::MCP, "1"), (env::CLAUDE_CODE_SESSION, "stale")],
+                None,
+            ),
+            (&[(env::MCP, "1"), (env::SESSION, "s")], Some("s")),
+        ];
+        for (pairs, expected) in cases {
+            assert_eq!(session_from(vars(pairs)).as_deref(), *expected, "{pairs:?}");
+        }
+    }
 
     fn keys(value: &Value) -> Vec<&str> {
         let mut keys: Vec<&str> = value
@@ -656,6 +768,7 @@ mod tests {
             "source": "cli",
             "agent": null,
             "intent": null,
+            "session": null,
             "replay_of": null,
             "argv": [],
             "variables": [],

@@ -61,6 +61,7 @@ num_cpus.workspace = true
 itertools.workspace = true
 once_cell.workspace = true
 walkdir = "2.4"
+which.workspace = true
 
 [lib]
 name = "wrkflw_lib"

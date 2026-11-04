@@ -44,6 +44,7 @@ pub(crate) struct RunCtx {
     pub(crate) format: OutputFormat,
     pub(crate) intent: Option<String>,
     pub(crate) agent: Option<String>,
+    pub(crate) session: Option<String>,
     pub(crate) no_record: bool,
     pub(crate) from_step: Option<String>,
     pub(crate) reuse_results: bool,
@@ -207,6 +208,7 @@ pub(crate) async fn run(ctx: RunCtx) {
             "cli"
         });
     meta.agent = ctx.agent.clone().or(meta.agent);
+    meta.session = ctx.session.clone().or(meta.session);
     meta.intent = ctx.intent.clone();
     meta.event = ctx.event.clone();
     meta.argv = replayable_argv();

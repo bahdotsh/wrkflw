@@ -10,7 +10,7 @@ wrkflw validates and runs GitHub Actions and GitLab CI workflows locally. Use it
 4. On failure, read the `failure` object in the final `run_finished` line. Don't rerun to see the error again.
 5. For earlier runs, use `wrkflw runs list`, `runs failure <id>` and `runs logs <id> --step <name>`.
 
-Prefer the MCP server if your client supports MCP:
+Prefer the MCP server if your client supports MCP. `wrkflw mcp install` registers it with Claude Code, Codex, Cursor, Windsurf, VS Code, Gemini CLI, opencode and Claude Desktop. Pass a name, such as `wrkflw mcp install codex`, for one agent, and `--dry-run` to see the change first. By hand:
 
 ```json
 {"mcpServers": {"wrkflw": {"command": "wrkflw", "args": ["mcp", "serve"]}}}
@@ -59,7 +59,9 @@ Runs are stored under `$WRKFLW_HOME/runs`, defaulting to the platform's local da
 
 Known secrets and `::add-mask::` values are masked before output is stored. `--variable` values are masked in output and never stored, so pass them again to `runs replay`. Logs can still hold anything a step printed that wrkflw did not recognise as a secret, so run directories are readable only by the owner on Unix. On Windows they rely on the data directory's permissions.
 
-Identify yourself with `WRKFLW_AGENT=<name>` or `--agent`. `WRKFLW_INTENT` or `--intent` records why you ran it.
+Identify yourself with `WRKFLW_AGENT=<name>` or `--agent`. Without either, the agent comes from `AI_AGENT`, or from what Claude Code, Codex, Gemini CLI, opencode, Cursor or Augment set. `WRKFLW_INTENT` or `--intent` records why you ran it.
+
+The run also records your session, from `--session`, `WRKFLW_SESSION`, `CLAUDE_CODE_SESSION_ID` or `CODEX_THREAD_ID`. Use `wrkflw runs list --session <id>` to find the runs of one session. Under MCP the server can outlive your session, so the inherited id is ignored: pass `session` to `run_workflow` instead.
 
 ## Limits
 

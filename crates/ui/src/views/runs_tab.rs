@@ -45,6 +45,9 @@ fn detail_lines(run: &RunRecord) -> Vec<Line<'static>> {
     if let Some(intent) = &run.intent {
         lines.push(Line::from(format!("intent:   {intent}")));
     }
+    if let Some(session) = &run.session {
+        lines.push(Line::from(format!("session:  {session}")));
+    }
     if let Some(sha) = &run.git_sha {
         lines.push(Line::from(format!(
             "commit:   {}",

@@ -2,12 +2,15 @@
 
 Terminal user interface for browsing workflows, running them, and viewing logs.
 
-- Tabs: Workflows, Execution, DAG, Logs, Trigger, Secrets, Help
+- Tabs: Workflows, Execution, DAG, Logs, Trigger, Secrets, Runs, Help
+- Runs tab: recorded run history, with the agent and intent behind each run
 - Job selection mode: pick and run individual jobs within a workflow
 - Diff-aware trigger filter (`d` / `D`) and Tweaks overlay (`,`)
 - Log search (`s`), filter (`f`), and match navigation (`n`)
-- Runtime cycling across Docker / Podman / Emulation / Secure Emulation (`e`)
-- Hotkeys: `1`–`7` for tab jumps, `Tab`/`Shift+Tab`, `w/x/l/h` shortcuts, `Enter`, `r`, `Shift+R`, `Shift+J`, `t`, `v`, `?`, `q`, etc.
+- Runtime cycling across Docker / Podman / Kubernetes / Secure Emulation / Emulation (`e`)
+- Hotkeys: `1`–`8` for tab jumps, `Tab`/`Shift+Tab`, `w/x/l/h` shortcuts, `Enter`, `r`, `Shift+R`, `Shift+J`, `t`, `v`, `?`, `q`, etc.
+- Mouse selection: drag to select text, copied to the clipboard on release (OSC 52)
+- Light and dark themes, following the terminal background unless `--theme` or `WRKFLW_THEME` says otherwise
 - Optional: enabled via the `tui` cargo feature flag
 - Integrates with `wrkflw-executor` and `wrkflw-logging`
 
@@ -20,7 +23,16 @@ use wrkflw_ui::run_wrkflw_tui;
 
 # tokio_test::block_on(async {
 let path = PathBuf::from(".github/workflows");
-run_wrkflw_tui(Some(&path), RuntimeType::Docker, /* verbose */ true, /* preserve_containers_on_failure */ false, /* show_action_messages */ false, /* theme */ None).await?;
+run_wrkflw_tui(
+    Some(&path),
+    RuntimeType::Auto,
+    /* verbose */ true,
+    /* preserve_containers_on_failure */ false,
+    /* show_action_messages */ false,
+    /* theme */ None,
+    /* platform_overrides */ Default::default(),
+    /* kubernetes */ Default::default(),
+).await?;
 # Ok::<_, Box<dyn std::error::Error>>(())
 # })?;
 ```

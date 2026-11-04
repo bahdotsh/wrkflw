@@ -1,5 +1,17 @@
 # Breaking Changes
 
+## An explicit `--runtime docker` or `--runtime podman` no longer falls back to the host (unreleased)
+
+If Docker or Podman didn't answer within about a second, for example while Docker Desktop woke from Resource Saver, an explicit `--runtime docker` or `--runtime podman` ran every step on this machine and reported success. The TUI did the same after its runtime probe. Now the availability check waits longer, and a runtime you named that doesn't answer fails the run with a message saying what to start.
+
+Only `--runtime auto`, the default, still falls back to emulation. If you relied on the fallback, drop `--runtime` or pass `--runtime emulation`.
+
+The same release also changes what container steps see:
+
+- Folders a step adds to `$GITHUB_PATH` go in front of the image's own `PATH`. They used to replace it with this machine's `PATH`, so tools in the image could vanish.
+- Docker pulls each image once per run instead of before every step. A floating tag such as `ubuntu:latest` that moves during a run isn't picked up until the next run.
+- `hashFiles('dir/**')` hashes the files under the directory. It used to return an empty string, so cache keys built from it change.
+
 ## `services:` start and can fail a job (unreleased)
 
 On Docker and Podman, a job's `services:` now start, and its steps run in one container with them. A service that can't start or never turns healthy fails the job's container steps. These jobs used to log a warning and run without the service. Emulation, secure emulation, Kubernetes and called workflows still warn.

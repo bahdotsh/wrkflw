@@ -11,7 +11,7 @@ A command-line tool for validating and executing GitHub Actions workflows locall
 
 ## Features
 
-- **TUI interface** — interactive terminal UI with Workflows, Execution, DAG, Logs, Trigger, Secrets, and Help tabs
+- **TUI interface** — interactive terminal UI with Workflows, Execution, DAG, Logs, Trigger, Secrets, Runs, and Help tabs
 - **Workflow validation** — syntax checks, structural validation, and composite action input cross-checking with CI/CD-friendly exit codes
 - **Local execution** — Docker, Podman, emulation, or sandboxed **secure emulation** (no containers)
 - **Kubernetes execution** — run each step as a pod in your own cluster, with node selectors and GPU resource requests
@@ -27,7 +27,7 @@ A command-line tool for validating and executing GitHub Actions workflows locall
 - **Matrix builds** — full support for `include`, `exclude`, `max-parallel`, and `fail-fast`, including a whole matrix, an axis or `include`/`exclude` computed by an earlier job (`${{ fromJSON(needs.setup.outputs.matrix) }}`). An axis expression must evaluate to an array
 - **Secrets management** — multiple providers (env, file, Vault, AWS, Azure, GCP) with masking and AES-256-GCM encrypted storage
 - **Remote triggering** — trigger `workflow_dispatch` runs on GitHub or GitLab pipelines
-- **GitLab support** — validate and trigger GitLab CI pipelines
+- **GitLab support** — validate, run and trigger GitLab CI pipelines, including `parallel`, `parallel:matrix`, `rules`, `when` and stages
 - **Faster reruns** — reuse passing job results, skip jobs a change can't affect, run a job in one container, share dependency caches, and gate pushes (see [Spending less on CI](#spending-less-on-ci))
 - **Service containers** — `services:` start next to the job on Docker and Podman, with health checks
 - **Agent support** — `--format json` on every command, recorded run history with failure digests, `wrkflw plan`, and an MCP server (see [AGENTS.md](AGENTS.md))
@@ -280,14 +280,14 @@ wrkflw tui --theme light
 
 The TUI follows your terminal's background and uses a light or dark palette to match. Set `--theme` or `WRKFLW_THEME` to `auto`, `dark` or `light` to override it. The theme is chosen at startup, so restart the TUI after switching your terminal's theme.
 
-**Tabs:** Workflows · Execution · DAG · Logs · Trigger · Secrets · Help.
+**Tabs:** Workflows · Execution · DAG · Logs · Trigger · Secrets · Runs · Help.
 
 **Controls:**
 
 | Key | Action |
 |-----|--------|
 | `Tab` / `Shift+Tab` | Switch tabs |
-| `1`–`7` | Jump to tab by number |
+| `1`–`8` | Jump to tab by number |
 | `w` / `x` / `l` / `h` | Jump to Workflows / Execution / Logs / Help |
 | `↑`/`↓` or `k`/`j` | Navigate / scroll |
 | `Space` | Toggle workflow selection |
@@ -495,9 +495,10 @@ WRKFLW is organized as a Cargo workspace with focused crates:
 | `wrkflw-parser` | Workflow file parsing and schema validation |
 | `wrkflw-evaluator` | Structural evaluation of workflow files |
 | `wrkflw-validators` | Validation rules for jobs, steps, triggers |
-| `wrkflw-runtime` | Container and emulation runtime abstractions |
+| `wrkflw-runtime` | Container (Docker, Podman, Kubernetes) and emulation runtime abstractions |
 | `wrkflw-trigger-filter` | `on:` block parsing and change-set matching |
 | `wrkflw-watcher` | File watcher with trigger-aware re-execution |
+| `wrkflw-runs` | Run history, failure digests and JSON events |
 | `wrkflw-ui` | Terminal user interface |
 | `wrkflw-models` | Shared data structures |
 | `wrkflw-matrix` | Matrix expansion utilities |

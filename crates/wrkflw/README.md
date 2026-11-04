@@ -75,7 +75,7 @@ wrkflw tui --runtime podman
 
 - **run**: Execute a workflow or pipeline locally
   - Runtimes: `auto` (default), `docker`, `podman`, `kubernetes`, `emulation`, `secure-emulation`. Only `auto` falls back; an explicit runtime that doesn't answer fails the run
-  - Flags: `--runtime`, `--job`, `--jobs`, `--from-step`, `--variable`, `--preserve-containers-on-failure`, `--show-action-messages`, `--gitlab`, `--verbose`
+  - Flags: `--runtime`, `--job`, `--from-step`, `--variable`, `--preserve-containers-on-failure`, `--show-action-messages`, `--gitlab`, `--verbose`
   - Trigger filter flags: `--event`, `--diff`, `--changed-files`, `--diff-base`, `--diff-head`, `--base-branch`, `--activity-type`, `--strict-filter` (default on), `--no-strict-filter`
   - CI-saving flags: `--reuse-results`, `--affected`, `--job-container`, `--dep-cache`, `--remote-cache`, `--cache-push`
   - History flags: `--intent`, `--agent`, `--session`, `--no-record`

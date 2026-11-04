@@ -1,16 +1,19 @@
 # Testing
 
-This directory contains integration and end-to-end tests for wrkflw.
+This directory holds test fixtures, test workflows and scripts for wrkflw.
 
 ## Test Organization
 
 - **Unit tests**: alongside source files in `src/` using `#[cfg(test)]` modules
-- **Integration tests**: in this `tests/` directory
-  - `matrix_test.rs` — matrix expansion
-  - `reusable_workflow_test.rs` — reusable workflow validation
-  - `reusable_workflow_execution_test.rs` — reusable workflow execution, inputs and outputs
-- **End-to-end tests**: also in this directory
-  - `cleanup_test.rs` — cleanup with Docker resources
+- **Integration tests**: in each crate's own `tests/` directory, mainly `crates/wrkflw/tests/`
+  (acceleration, agent CLI, container fidelity, `continue-on-error`, dynamic matrices,
+  GitLab pipelines, `needs` failure propagation, reusable workflow inputs and outputs,
+  startup, and `--job` targeting)
+
+The `.rs` files in this top-level directory (`matrix_test.rs`, `reusable_workflow_test.rs`,
+`reusable_workflow_execution_test.rs`, `cleanup_test.rs`) are not compiled. The root
+`Cargo.toml` is a virtual workspace, so no package owns them and `cargo test` never runs them.
+Keep them as reference only, and add new tests under a crate's `tests/` directory.
 
 ## Directory Structure
 
@@ -28,11 +31,11 @@ cargo test
 # Unit tests only
 cargo test --lib
 
-# Integration tests only
-cargo test --test matrix_test --test reusable_workflow_test --test reusable_workflow_execution_test
+# Integration tests of the CLI crate only
+cargo test -p wrkflw --tests
 
-# End-to-end tests only
-cargo test --test cleanup_test
+# One integration test file
+cargo test -p wrkflw --test reusable_inputs_outputs_test
 
 # A specific test
 cargo test test_name

@@ -4,7 +4,6 @@ Runtime abstractions for executing steps in containers, on the host, or in a
 local sandbox.
 
 - Container management primitives used by the executor (Docker, Podman)
-- Kubernetes runtime: each step runs as a pod in a cluster `kubectl` points at, with the workspace synced in and out
 - Emulation mode helpers (run on host without containers)
 - Secure emulation runtime: sandboxed host processes with filesystem and
   network restrictions for running untrusted workflows without a container

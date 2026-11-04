@@ -11,7 +11,7 @@ This directory contains the Rust crates that make up the wrkflw workspace.
 | **parser** | Workflow file parsing and JSON Schema validation |
 | **evaluator** | Structural evaluation of workflow files |
 | **validators** | Validation rules for jobs, steps, triggers, matrix |
-| **runtime** | Container management (Docker, Podman, Kubernetes) and emulation runtime |
+| **runtime** | Container management (Docker, Podman) and emulation runtime |
 | **trigger-filter** | Parses `on:` blocks and matches them against simulated event context and changed-file sets |
 | **watcher** | File watcher with trigger-aware re-execution for `wrkflw watch` |
 | **runs** | Run history, failure digests and NDJSON events behind `wrkflw runs`, `--format json` and the MCP server |

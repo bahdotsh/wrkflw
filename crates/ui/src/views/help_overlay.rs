@@ -37,6 +37,8 @@ fn key_line<'a>(key: &'a str, desc: &'a str) -> Line<'a> {
 
 // Render the help tab with scroll support
 pub fn render_help_content(f: &mut Frame<'_>, area: Rect, scroll_offset: usize) {
+    // Built from TAB_COUNT so a new tab can't leave this hint stale.
+    let tab_keys = format!("1-{}", super::TAB_COUNT);
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)].as_ref())
@@ -48,7 +50,7 @@ pub fn render_help_content(f: &mut Frame<'_>, area: Rect, scroll_offset: usize) 
     left_lines.extend(section_header("NAVIGATION"));
     left_lines.push(Line::from(""));
     left_lines.push(key_line("Tab / Shift+Tab", "Switch between tabs"));
-    left_lines.push(key_line("1-8", "Jump to tab by number"));
+    left_lines.push(key_line(&tab_keys, "Jump to tab by number"));
     left_lines.push(key_line("w,x,l,h", "Workflows / Execution / Logs / Help"));
     left_lines.push(key_line("\u{2191}/\u{2193} or k/j", "Navigate lists"));
     left_lines.push(key_line("Enter", "Select / View details"));

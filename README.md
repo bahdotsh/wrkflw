@@ -137,8 +137,8 @@ wrkflw run --job build .github/workflows/ci.yml
 # Set GitLab pipeline variables, which rules and scripts both see
 wrkflw run --variable CI_COMMIT_TAG=v1.0.0 .gitlab-ci.yml
 
-# List jobs in a workflow
-wrkflw run --jobs .github/workflows/ci.yml
+# List workflows and their jobs
+wrkflw list --jobs
 
 # Preserve failed containers for debugging
 wrkflw run --preserve-containers-on-failure .github/workflows/ci.yml
@@ -495,7 +495,7 @@ WRKFLW is organized as a Cargo workspace with focused crates:
 | `wrkflw-parser` | Workflow file parsing and schema validation |
 | `wrkflw-evaluator` | Structural evaluation of workflow files |
 | `wrkflw-validators` | Validation rules for jobs, steps, triggers |
-| `wrkflw-runtime` | Container (Docker, Podman, Kubernetes) and emulation runtime abstractions |
+| `wrkflw-runtime` | Container (Docker, Podman) and emulation runtime abstractions |
 | `wrkflw-trigger-filter` | `on:` block parsing and change-set matching |
 | `wrkflw-watcher` | File watcher with trigger-aware re-execution |
 | `wrkflw-runs` | Run history, failure digests and JSON events |

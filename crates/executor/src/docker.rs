@@ -26,7 +26,10 @@ static CREATED_NETWORKS: Lazy<Mutex<Vec<String>>> = Lazy::new(|| Mutex::new(Vec:
 static CUSTOMIZED_IMAGES: Lazy<Mutex<HashMap<String, String>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
-/// Images this process has pulled, so later steps don't ask the registry again.
+/// Images this run has pulled or tried to pull, so later steps don't ask the
+/// registry again. A failed pull counts too: an offline machine or an
+/// unreachable registry would otherwise cost every step another try and
+/// another warning.
 static PULLED_IMAGES: Lazy<Mutex<std::collections::HashSet<String>>> =
     Lazy::new(|| Mutex::new(std::collections::HashSet::new()));
 
@@ -40,6 +43,15 @@ fn already_pulled(image: &str) -> bool {
 fn mark_pulled(image: &str) {
     if let Ok(mut pulled) = PULLED_IMAGES.lock() {
         pulled.insert(image.to_string());
+    }
+}
+
+/// Forget which images were pulled, so the next run asks the registry about
+/// each again, as a run on GitHub would. Called when a run sets up Docker, so
+/// a long TUI session still refreshes a floating tag between runs.
+pub fn forget_pulled_images() {
+    if let Ok(mut pulled) = PULLED_IMAGES.lock() {
+        pulled.clear();
     }
 }
 
@@ -712,13 +724,10 @@ impl ContainerRuntime for DockerRuntime {
         // Add a timeout for pull operations
         let timeout_duration = std::time::Duration::from_secs(30);
 
-        match tokio::time::timeout(timeout_duration, self.pull_image_inner(image)).await {
-            Ok(result) => {
-                if result.is_ok() {
-                    mark_pulled(image);
-                }
-                result
-            }
+        let outcome = tokio::time::timeout(timeout_duration, self.pull_image_inner(image)).await;
+        mark_pulled(image);
+        match outcome {
+            Ok(result) => result,
             Err(_) => {
                 wrkflw_logging::warning(&format!(
                     "Pull of image {} timed out, continuing with existing image",
@@ -969,12 +978,13 @@ impl DockerRuntime {
         // already here. Skip pull for locally-built images (e.g., combined
         // runtime images).
         if !image.starts_with(LOCAL_IMAGE_PREFIX) && !already_pulled(image) {
-            match self.pull_image_inner(image).await {
-                Ok(()) => mark_pulled(image),
-                Err(e) => wrkflw_logging::warning(&format!(
+            let pulled = self.pull_image_inner(image).await;
+            mark_pulled(image);
+            if let Err(e) = pulled {
+                wrkflw_logging::warning(&format!(
                     "Failed to pull image {}: {}. Attempting to continue with existing image.",
                     image, e
-                )),
+                ));
             }
         }
 

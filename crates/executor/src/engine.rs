@@ -967,6 +967,7 @@ fn initialize_runtime(
                         .to_string(),
                 ));
             }
+            docker::forget_pulled_images();
             match docker::DockerRuntime::new_with_config(preserve_containers_on_failure) {
                 Ok(docker_runtime) => Ok((Box::new(docker_runtime), RuntimeType::Docker)),
                 Err(e) => Err(ExecutionError::Runtime(format!(

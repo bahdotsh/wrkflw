@@ -1,6 +1,6 @@
 # Codebase Index: wrkflw
 
-> Generated: 2026-11-04 15:11:36 UTC | Files: 242 | Lines: 106521
+> Generated: 2026-11-04 15:38:55 UTC | Files: 242 | Lines: 106831
 > Languages: JSON (4), Markdown (26), Rust (150), Shell (5), TOML (19), YAML (38)
 
 ## Directory Structure
@@ -1633,7 +1633,7 @@ wrkflw/
 
 ## AGENTS.md
 
-**Language:** Markdown | **Size:** 5.7 KB | **Lines:** 74
+**Language:** Markdown | **Size:** 5.8 KB | **Lines:** 74
 
 **Declarations:**
 
@@ -1673,7 +1673,7 @@ wrkflw/
 
 ## README.md
 
-**Language:** Markdown | **Size:** 30.5 KB | **Lines:** 507
+**Language:** Markdown | **Size:** 31.1 KB | **Lines:** 512
 
 **Declarations:**
 
@@ -7091,11 +7091,13 @@ wrkflw/
 
 ## crates/wrkflw/Cargo.toml
 
-**Language:** TOML | **Size:** 1.7 KB | **Lines:** 75
+**Language:** TOML | **Size:** 1.8 KB | **Lines:** 77
 
 **Imports:**
 - `nix`
 - `walkdir`
+- `jsonc-parser`
+- `toml`
 
 **Declarations:**
 
@@ -7409,14 +7411,15 @@ wrkflw/
 
 ## crates/wrkflw/src/mcp_install.rs
 
-**Language:** Rust | **Size:** 33.3 KB | **Lines:** 977
+**Language:** Rust | **Size:** 45.7 KB | **Lines:** 1280
 
 **Imports:**
 - `crate::OutputFormat`
 - `clap::ValueEnum`
-- `indexmap::IndexMap`
-- `serde::{Deserialize, Serialize}`
+- `jsonc_parser::cst::{CstInputValue, CstRootNode}`
+- `jsonc_parser::ParseOptions`
 - `serde_json::{json, Value}`
+- `std::ffi::OsString`
 - `std::path::{Path, PathBuf}`
 - `std::process::Command`
 - `wrkflw_runs::SCHEMA_VERSION`
@@ -7428,7 +7431,7 @@ wrkflw/
 `const SERVE_ARGS: [&str`
 
 `pub(crate) enum Client`
-> Variants: `ClaudeCode`, `Codex`, `Cursor`, `Windsurf`, `Vscode`, `Gemini`, `Opencode`, `ClaudeDesktop`
+> Variants: `ClaudeCode`, `Codex`, `Cursor`, `Windsurf`, `Vscode`, `Gemini`, `Opencode`, `ClaudeDesktop`, `Copilot`, `Grok`, `Kiro`, `Pi`, `Zed`
 
 **`impl Client`**
   `fn name(self) -> String`
@@ -7438,13 +7441,19 @@ wrkflw/
 > Variants: `Cli`, `Json`
 
 `struct Dirs`
-> Fields: `home: PathBuf`, `config: PathBuf`, `claude: PathBuf`
+> Fields: `home: PathBuf`, `config: PathBuf`, `claude: PathBuf`, `copilot: PathBuf`, `grok: PathBuf`, `kiro: PathBuf`, `pi: PathBuf`, `zed: PathBuf`
 
 **`impl Dirs`**
   `fn current() -> Option<Self>`
 
+  `fn resolve(home: PathBuf, config: PathBuf, var: impl Fn(&str) -> Option<OsString>) -> Self`
 
-`fn claude_dir(home: &Path, configured: Option<std::ffi::OsString>) -> PathBuf`
+
+`fn kiro_home(home: &Path, configured: Option<OsString>) -> PathBuf`
+
+`fn expand_tilde(home: &Path, dir: OsString) -> PathBuf`
+
+`fn zed_dir(home: &Path, config: &Path, xdg: Option<OsString>) -> PathBuf`
 
 `struct Launch`
 > Fields: `command: String`, `absolute: String`
@@ -7484,18 +7493,13 @@ wrkflw/
   `fn settle(self, existing: Option<bool>) -> (Status, bool)`
 
 
-`enum Ordered`
-> Variants: `Null`, `Bool`, `Number`, `String`, `Array`, `Object`
-
 `const LAUNCH_KEYS: [&str`
 
-`fn same_launch(current: &Ordered, wanted: &IndexMap<String, Ordered>) -> bool`
+`fn same_launch(current: &Value, wanted: &Value) -> bool`
+
+`fn to_cst(value: &Value) -> CstInputValue`
 
 `fn upsert_json( text: Option<&str>, key: &str, entry: &Value, policy: Policy, ) -> Result<(Status, Option<String>), String>`
-
-`const DEFAULT_INDENT: &str = " "`
-
-`fn indent_of(text: &str) -> &str`
 
 `fn resolve_links(path: &Path) -> PathBuf`
 
@@ -7508,6 +7512,10 @@ wrkflw/
 `fn check(program: &str, args: &[&str]) -> Result<(), String>`
 
 `fn claude_code_existing(dirs: &Dirs, command: &str) -> Option<bool>`
+
+`fn grok_existing(dirs: &Dirs, command: &str) -> Option<bool>`
+
+`fn toml_server_matches(text: &str, command: &str) -> Option<bool>`
 
 `fn codex_existing(command: &str) -> Option<bool>`
 

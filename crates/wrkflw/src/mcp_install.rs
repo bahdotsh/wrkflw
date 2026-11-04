@@ -1,15 +1,17 @@
 //! `wrkflw mcp install`: register `wrkflw mcp serve` with coding agents.
 //!
-//! Claude Code and Codex are changed through their own CLIs. Claude Code
-//! rewrites `~/.claude.json` while it runs and Codex keeps TOML, so editing
-//! either file here would race it or lose formatting. The other clients keep
-//! plain JSON, which is edited in place with key order kept.
+//! Claude Code, Codex and Grok Build are changed through their own CLIs.
+//! Claude Code rewrites `~/.claude.json` while it runs, and Codex and Grok keep
+//! TOML, so editing those files here would race the agent or lose formatting.
+//! The other clients keep JSON, which is edited in place. Comments, key order
+//! and layout are kept, so a commented file such as Zed's settings survives.
 
 use crate::OutputFormat;
 use clap::ValueEnum;
-use indexmap::IndexMap;
-use serde::{Deserialize, Serialize};
+use jsonc_parser::cst::{CstInputValue, CstRootNode};
+use jsonc_parser::ParseOptions;
 use serde_json::{json, Value};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use wrkflw_runs::SCHEMA_VERSION;
@@ -27,6 +29,14 @@ pub(crate) enum Client {
     Gemini,
     Opencode,
     ClaudeDesktop,
+    /// GitHub Copilot CLI.
+    Copilot,
+    /// Grok Build.
+    Grok,
+    /// Kiro CLI.
+    Kiro,
+    Pi,
+    Zed,
 }
 
 impl Client {
@@ -53,6 +63,8 @@ enum Method {
         path: PathBuf,
         key: &'static str,
         entry: Value,
+        /// The directory whose existence means the client is installed.
+        marker: PathBuf,
     },
 }
 
@@ -63,30 +75,78 @@ struct Dirs {
     config: PathBuf,
     /// Where Claude Code keeps `.claude.json`.
     claude: PathBuf,
+    /// `$COPILOT_HOME`, else `~/.copilot`.
+    copilot: PathBuf,
+    /// `$GROK_HOME`, else `~/.grok`.
+    grok: PathBuf,
+    /// `$KIRO_HOME` when Kiro accepts it, else `~/.kiro`.
+    kiro: PathBuf,
+    /// `$PI_CODING_AGENT_DIR`, else `~/.pi/agent`.
+    pi: PathBuf,
+    /// Zed's config directory, which holds `settings.json`.
+    zed: PathBuf,
 }
 
 impl Dirs {
     fn current() -> Option<Self> {
-        let home = dirs::home_dir()?;
-        Some(Self {
-            claude: claude_dir(&home, std::env::var_os("CLAUDE_CONFIG_DIR")),
-            config: dirs::config_dir()?,
+        Some(Self::resolve(
+            dirs::home_dir()?,
+            dirs::config_dir()?,
+            |name| std::env::var_os(name),
+        ))
+    }
+
+    /// The directories for `home` and `config`, with overrides read through `var`.
+    fn resolve(home: PathBuf, config: PathBuf, var: impl Fn(&str) -> Option<OsString>) -> Self {
+        let set = |name: &str| var(name).filter(|value| !value.is_empty());
+        Self {
+            claude: set("CLAUDE_CONFIG_DIR").map_or_else(|| home.clone(), PathBuf::from),
+            copilot: set("COPILOT_HOME").map_or_else(|| home.join(".copilot"), PathBuf::from),
+            grok: set("GROK_HOME").map_or_else(|| home.join(".grok"), PathBuf::from),
+            kiro: kiro_home(&home, set("KIRO_HOME")),
+            pi: set("PI_CODING_AGENT_DIR")
+                .map_or_else(|| home.join(".pi/agent"), |dir| expand_tilde(&home, dir)),
+            zed: zed_dir(&home, &config),
             home,
-        })
+            config,
+        }
     }
 }
 
-/// `CLAUDE_CONFIG_DIR` moves `.claude.json` out of the home directory.
-fn claude_dir(home: &Path, configured: Option<std::ffi::OsString>) -> PathBuf {
-    configured
-        .filter(|dir| !dir.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home.to_path_buf())
+/// Kiro ignores a `KIRO_HOME` that is relative, a filesystem root, or the home
+/// directory or one of its ancestors, and falls back to `~/.kiro`.
+fn kiro_home(home: &Path, configured: Option<OsString>) -> PathBuf {
+    match configured.map(PathBuf::from) {
+        Some(dir) if dir.is_absolute() && dir.parent().is_some() && !home.starts_with(&dir) => dir,
+        _ => home.join(".kiro"),
+    }
+}
+
+/// pi expands a leading `~` in `PI_CODING_AGENT_DIR` itself.
+fn expand_tilde(home: &Path, dir: OsString) -> PathBuf {
+    let dir = PathBuf::from(dir);
+    match dir.strip_prefix("~") {
+        Ok(rest) => home.join(rest),
+        Err(_) => dir,
+    }
+}
+
+/// Zed keeps settings in `~/.config/zed` on macOS, `%APPDATA%\Zed` on Windows,
+/// and the XDG config directory elsewhere. `config` already follows the XDG
+/// rules, including ignoring a relative `XDG_CONFIG_HOME`.
+fn zed_dir(home: &Path, config: &Path) -> PathBuf {
+    if cfg!(target_os = "macos") {
+        home.join(".config/zed")
+    } else if cfg!(windows) {
+        config.join("Zed")
+    } else {
+        config.join("zed")
+    }
 }
 
 /// The command a client should launch. `wrkflw` when it is on PATH, so the
-/// entry survives upgrades. Claude Desktop starts servers without the shell's
-/// PATH, so it always gets an absolute path.
+/// entry survives upgrades. Claude Desktop and Kiro start servers without the
+/// shell's PATH, so they always get an absolute path.
 #[derive(Clone)]
 struct Launch {
     command: String,
@@ -110,7 +170,7 @@ impl Launch {
     }
 
     fn for_client(&self, client: Client) -> &str {
-        if client == Client::ClaudeDesktop {
+        if matches!(client, Client::ClaudeDesktop | Client::Kiro) {
             &self.absolute
         } else {
             &self.command
@@ -124,7 +184,14 @@ fn args() -> Vec<String> {
 
 fn method(client: Client, dirs: &Dirs, command: &str) -> Method {
     let standard = json!({"command": command, "args": SERVE_ARGS});
-    let file = |path: PathBuf, key, entry| Method::Json { path, key, entry };
+    // With an env object, as the client itself writes one.
+    let with_env = json!({"command": command, "args": SERVE_ARGS, "env": {}});
+    let file = |path: PathBuf, key, entry| Method::Json {
+        marker: path.parent().unwrap_or(&path).to_path_buf(),
+        path,
+        key,
+        entry,
+    };
     match client {
         Client::ClaudeCode => Method::Cli {
             program: "claude",
@@ -163,6 +230,26 @@ fn method(client: Client, dirs: &Dirs, command: &str) -> Method {
             "mcpServers",
             standard,
         ),
+        Client::Copilot => file(
+            dirs.copilot.join("mcp-config.json"),
+            "mcpServers",
+            json!({"type": "local", "command": command, "args": SERVE_ARGS, "env": {}, "tools": ["*"]}),
+        ),
+        Client::Grok => Method::Cli {
+            program: "grok",
+            scope: &[],
+            existing: grok_existing,
+        },
+        // The file `kiro-cli mcp add --scope global` writes. Detected by Kiro's
+        // home, since `settings/` may not exist yet.
+        Client::Kiro => Method::Json {
+            path: dirs.kiro.join("settings/mcp.json"),
+            key: "mcpServers",
+            entry: with_env,
+            marker: dirs.kiro.clone(),
+        },
+        Client::Pi => file(dirs.pi.join("mcp.json"), "mcpServers", standard),
+        Client::Zed => file(dirs.zed.join("settings.json"), "context_servers", with_env),
     }
 }
 
@@ -182,7 +269,7 @@ fn opencode_config(dir: &Path) -> PathBuf {
 fn detected(method: &Method) -> bool {
     match method {
         Method::Cli { program, .. } => which::which(program).is_ok(),
-        Method::Json { path, .. } => path.parent().is_some_and(Path::is_dir),
+        Method::Json { marker, .. } => marker.is_dir(),
     }
 }
 
@@ -257,103 +344,100 @@ impl Policy {
     }
 }
 
-/// JSON with object key order kept, so rewriting a config keeps its layout.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(untagged)]
-enum Ordered {
-    Null,
-    Bool(bool),
-    Number(serde_json::Number),
-    String(String),
-    Array(Vec<Ordered>),
-    Object(IndexMap<String, Ordered>),
-}
-
 /// The keys that decide what an entry launches. Others, such as `env` or
 /// `disabled`, are the user's and are kept.
 const LAUNCH_KEYS: [&str; 2] = ["command", "args"];
 
 /// Whether `current` launches what `wanted` does.
-fn same_launch(current: &Ordered, wanted: &IndexMap<String, Ordered>) -> bool {
-    let Ordered::Object(current) = current else {
-        return false;
-    };
-    LAUNCH_KEYS
-        .iter()
-        .all(|key| current.get(*key) == wanted.get(*key))
+fn same_launch(current: &Value, wanted: &Value) -> bool {
+    current.is_object()
+        && LAUNCH_KEYS
+            .iter()
+            .all(|key| current.get(*key) == wanted.get(*key))
+}
+
+/// `value` as a node to insert into a config.
+fn to_cst(value: &Value) -> CstInputValue {
+    match value {
+        Value::Null => CstInputValue::Null,
+        Value::Bool(value) => CstInputValue::Bool(*value),
+        Value::Number(value) => CstInputValue::Number(value.to_string()),
+        Value::String(value) => CstInputValue::String(value.clone()),
+        Value::Array(items) => CstInputValue::Array(items.iter().map(to_cst).collect()),
+        Value::Object(map) => CstInputValue::Object(
+            map.iter()
+                .map(|(key, value)| (key.clone(), to_cst(value)))
+                .collect(),
+        ),
+    }
 }
 
 /// Add `entry` as server `wrkflw` under `key` in the config `text`.
 ///
-/// An existing entry is compared by what it launches, and on replace the
-/// wanted keys are merged into it, so keys the user added survive `--force`.
-/// Returns the status and, when the file should change, its new text.
+/// The text is edited, not re-serialised, so comments, trailing commas, key
+/// order and indentation all survive. An existing entry is compared by what it
+/// launches, and on replace the wanted keys are merged into it, so keys the
+/// user added survive `--force`. Returns the status and, when the file should
+/// change, its new text.
 fn upsert_json(
     text: Option<&str>,
     key: &str,
     entry: &Value,
     policy: Policy,
 ) -> Result<(Status, Option<String>), String> {
-    let mut root = match text.filter(|text| !text.trim().is_empty()) {
-        None => IndexMap::new(),
-        Some(text) => match serde_json::from_str::<Ordered>(text) {
-            Ok(Ordered::Object(root)) => root,
-            Ok(_) => return Err("the file isn't a JSON object".to_string()),
-            Err(e) => {
-                return Err(format!(
-                    "can't parse it as plain JSON ({e}). Comments aren't supported; add the entry by hand"
-                ))
-            }
-        },
+    let text = text.filter(|text| !text.trim().is_empty());
+    let root = CstRootNode::parse(text.unwrap_or("{}"), &ParseOptions::default())
+        .map_err(|e| format!("can't parse it as JSON ({e}); add the entry by hand"))?;
+    let Some(config) = root.object_value() else {
+        return Err("the file isn't a JSON object".to_string());
     };
-    let Ordered::Object(entry) =
-        serde_json::from_value(entry.clone()).map_err(|e: serde_json::Error| e.to_string())?
-    else {
-        return Err("the entry isn't a JSON object".to_string());
-    };
-    let servers = root
-        .entry(key.to_string())
-        .or_insert_with(|| Ordered::Object(IndexMap::new()));
-    let Ordered::Object(servers) = servers else {
-        return Err(format!("`{key}` isn't a JSON object"));
+    let servers = match config.get(key) {
+        None => None,
+        Some(prop) => Some(
+            prop.object_value()
+                .ok_or_else(|| format!("`{key}` isn't a JSON object"))?,
+        ),
     };
     let existing = servers
-        .get(SERVER)
-        .map(|current| same_launch(current, &entry));
+        .as_ref()
+        .and_then(|servers| servers.get(SERVER))
+        .map(|prop| {
+            prop.value()
+                .and_then(|current| current.to_serde_value())
+                .is_some_and(|current| same_launch(&current, entry))
+        });
     let (status, write) = policy.settle(existing);
     if !write {
         return Ok((status, None));
     }
-    match servers.get_mut(SERVER) {
-        // `extend` keeps the position of keys already there.
-        Some(Ordered::Object(current)) => current.extend(entry),
-        _ => {
-            servers.insert(SERVER.to_string(), Ordered::Object(entry));
+    let Value::Object(fields) = entry else {
+        return Err("the entry isn't a JSON object".to_string());
+    };
+    let servers = servers.unwrap_or_else(|| config.object_value_or_set(key));
+    match servers.get(SERVER) {
+        // Set in place, which keeps the position of keys already there.
+        Some(prop) => match prop.object_value() {
+            Some(current) => {
+                for (name, value) in fields {
+                    match current.get(name) {
+                        Some(field) => field.set_value(to_cst(value)),
+                        None => {
+                            current.append(name, to_cst(value));
+                        }
+                    }
+                }
+            }
+            None => prop.set_value(to_cst(entry)),
+        },
+        None => {
+            servers.append(SERVER, to_cst(entry));
         }
     }
-    let indent = text.map_or(DEFAULT_INDENT, indent_of);
-    let mut out = Vec::new();
-    let formatter = serde_json::ser::PrettyFormatter::with_indent(indent.as_bytes());
-    let mut serializer = serde_json::Serializer::with_formatter(&mut out, formatter);
-    Ordered::Object(root)
-        .serialize(&mut serializer)
-        .map_err(|e| e.to_string())?;
-    let mut text = String::from_utf8(out).map_err(|e| e.to_string())?;
-    text.push('\n');
+    let mut text = root.to_string();
+    if !text.ends_with('\n') {
+        text.push_str(if text.contains("\r\n") { "\r\n" } else { "\n" });
+    }
     Ok((status, Some(text)))
-}
-
-const DEFAULT_INDENT: &str = "  ";
-
-/// The indentation of the first indented line, so a rewrite keeps the file's style.
-fn indent_of(text: &str) -> &str {
-    text.lines()
-        .find_map(|line| {
-            let rest = line.trim_start_matches([' ', '\t']);
-            let indent = &line[..line.len() - rest.len()];
-            (!indent.is_empty() && !rest.is_empty()).then_some(indent)
-        })
-        .unwrap_or(DEFAULT_INDENT)
 }
 
 /// The file `path` finally points to. Dotfile managers symlink these configs,
@@ -371,12 +455,15 @@ fn resolve_links(path: &Path) -> PathBuf {
     path
 }
 
-/// Replace the file `path` resolves to, keeping its permissions. A new file
-/// gets the usual 0644 rather than the temporary file's 0600.
+/// Replace the file `path` resolves to, keeping its permissions, and create
+/// its directory if needed. A new file gets the usual 0644 rather than the
+/// temporary file's 0600.
 fn write_atomically(path: &Path, text: &str) -> std::io::Result<()> {
     use std::io::Write;
     let path = resolve_links(path);
     let dir = path.parent().unwrap_or(Path::new("."));
+    // A client named on the command line may not have its directory yet.
+    std::fs::create_dir_all(dir)?;
     let mut file = tempfile::NamedTempFile::new_in(dir)?;
     match std::fs::metadata(&path) {
         Ok(meta) => file.as_file().set_permissions(meta.permissions())?,
@@ -443,6 +530,28 @@ fn claude_code_existing(dirs: &Dirs, command: &str) -> Option<bool> {
     Some(server["command"] == command && server["args"] == json!(SERVE_ARGS))
 }
 
+/// Whether Grok Build's `config.toml` has a `wrkflw` server, and whether it
+/// launches `command`. `grok mcp add` writes `[mcp_servers.<name>]` there.
+fn grok_existing(dirs: &Dirs, command: &str) -> Option<bool> {
+    let text = std::fs::read_to_string(dirs.grok.join("config.toml")).ok()?;
+    toml_server_matches(&text, command)
+}
+
+/// The `wrkflw` entry under `[mcp_servers]` in `text`: `None` when there is
+/// none, else whether it launches `command`.
+fn toml_server_matches(text: &str, command: &str) -> Option<bool> {
+    let config: toml::Table = text.parse().ok()?;
+    let server = config.get("mcp_servers")?.get(SERVER)?;
+    let args: Option<Vec<&str>> = server
+        .get("args")
+        .and_then(|args| args.as_array())
+        .map(|args| args.iter().filter_map(|arg| arg.as_str()).collect());
+    Some(
+        server.get("command").and_then(|c| c.as_str()) == Some(command)
+            && args.as_deref() == Some(&SERVE_ARGS[..]),
+    )
+}
+
 fn codex_existing(command: &str) -> Option<bool> {
     let output = run("codex", &["mcp", "get", SERVER, "--json"]).ok()?;
     if !output.status.success() {
@@ -471,20 +580,24 @@ fn install_cli(
     if !write {
         return (status, None);
     }
-    if status == Status::Replaced {
-        // A failed remove shows up as the add failing on the duplicate name.
+    // Every CLI client documents `mcp remove <name>`. If it fails, the add
+    // usually fails on the duplicate name, so both errors are reported.
+    let removed = if status == Status::Replaced {
         let mut remove = vec!["mcp", "remove"];
         remove.extend(scope);
         remove.push(SERVER);
-        let _ = check(program, &remove);
-    }
+        check(program, &remove)
+    } else {
+        Ok(())
+    };
     let mut add = vec!["mcp", "add"];
     add.extend(scope);
     add.extend([SERVER, "--", command]);
     add.extend(SERVE_ARGS);
-    match check(program, &add) {
-        Ok(()) => (status, None),
-        Err(e) => (Status::Failed, Some(e)),
+    match (check(program, &add), removed) {
+        (Ok(()), _) => (status, None),
+        (Err(add), Ok(())) => (Status::Failed, Some(add)),
+        (Err(add), Err(remove)) => (Status::Failed, Some(format!("{remove}, then {add}"))),
     }
 }
 
@@ -502,18 +615,21 @@ fn install_one(
         Method::Json { path, .. } => path.to_string_lossy().into_owned(),
     };
     if !detected(&method) {
-        // Only report a client nobody asked for if it was named.
-        return named.then(|| Outcome {
-            client,
-            status: Status::NotFound,
-            detail: Some(match &method {
-                Method::Cli { program, .. } => format!("`{program}` isn't on PATH"),
-                Method::Json { path, .. } => {
-                    format!("{} doesn't exist", path.parent().unwrap_or(path).display())
-                }
-            }),
-            target,
-        });
+        match (&method, named) {
+            // Skip a client nobody asked for.
+            (_, false) => return None,
+            // A named client gets its config file even before it has one, so
+            // wrkflw can be set up before the agent first runs.
+            (Method::Json { .. }, true) => {}
+            (Method::Cli { program, .. }, true) => {
+                return Some(Outcome {
+                    client,
+                    status: Status::NotFound,
+                    detail: Some(format!("`{program}` isn't on PATH")),
+                    target,
+                })
+            }
+        }
     }
     let (status, detail) = match &method {
         Method::Cli {
@@ -521,7 +637,9 @@ fn install_one(
             scope,
             existing,
         } => install_cli(program, scope, existing(dirs, command), command, policy),
-        Method::Json { path, key, entry } => install_json(path, key, entry, policy),
+        Method::Json {
+            path, key, entry, ..
+        } => install_json(path, key, entry, policy),
     };
     Some(Outcome {
         client,
@@ -634,6 +752,18 @@ mod tests {
 
     fn entry() -> Value {
         json!({"command": "wrkflw", "args": SERVE_ARGS})
+    }
+
+    /// Directories under `home` and `config`, with no overrides set.
+    fn dirs_in(home: impl Into<PathBuf>, config: impl Into<PathBuf>) -> Dirs {
+        Dirs::resolve(home.into(), config.into(), |_| None)
+    }
+
+    fn launch() -> Launch {
+        Launch {
+            command: "wrkflw".to_string(),
+            absolute: "/bin/wrkflw".to_string(),
+        }
     }
 
     #[test]
@@ -752,11 +882,7 @@ mod tests {
     #[test]
     fn a_differing_entry_says_why_in_both_outputs() {
         let root = tempfile::tempdir().unwrap();
-        let dirs = Dirs {
-            home: root.path().to_path_buf(),
-            config: root.path().join("config"),
-            claude: root.path().to_path_buf(),
-        };
+        let dirs = dirs_in(root.path(), root.path().join("config"));
         std::fs::create_dir_all(root.path().join(".cursor")).unwrap();
         std::fs::write(
             root.path().join(".cursor/mcp.json"),
@@ -790,12 +916,8 @@ mod tests {
     }
 
     #[test]
-    fn comments_and_odd_shapes_are_refused() {
-        for text in [
-            "// mine\n{\"mcpServers\": {}}",
-            "[]",
-            r#"{"mcpServers": []}"#,
-        ] {
+    fn odd_shapes_are_refused() {
+        for text in ["[]", r#"{"mcpServers": []}"#, "{\"mcpServers\": {"] {
             assert!(
                 upsert_json(Some(text), "mcpServers", &entry(), WRITE).is_err(),
                 "{text}"
@@ -806,18 +928,12 @@ mod tests {
     #[test]
     fn json_clients_are_detected_by_their_config_directory() {
         let root = tempfile::tempdir().unwrap();
-        let dirs = Dirs {
-            home: root.path().join("home"),
-            config: root.path().join("config"),
-            claude: root.path().join("home"),
-        };
+        let dirs = dirs_in(root.path().join("home"), root.path().join("config"));
         let launch = Launch {
             command: "wrkflw".to_string(),
             absolute: "/bin/wrkflw".to_string(),
         };
         assert!(install_one(Client::Cursor, &dirs, &launch, WRITE, false).is_none());
-        let missing = install_one(Client::Cursor, &dirs, &launch, WRITE, true).unwrap();
-        assert_eq!(missing.status, Status::NotFound);
 
         std::fs::create_dir_all(dirs.config.join("Claude")).unwrap();
         let added = install_one(Client::ClaudeDesktop, &dirs, &launch, WRITE, false).unwrap();
@@ -835,11 +951,7 @@ mod tests {
 
     #[test]
     fn each_client_gets_its_own_entry_shape() {
-        let dirs = Dirs {
-            home: PathBuf::from("/h"),
-            config: PathBuf::from("/c"),
-            claude: PathBuf::from("/h"),
-        };
+        let dirs = dirs_in("/h", "/c");
         let Method::Json { key, entry, .. } = method(Client::Opencode, &dirs, "wrkflw") else {
             panic!("opencode is a file");
         };
@@ -889,17 +1001,23 @@ mod tests {
 
     #[test]
     fn claude_code_config_follows_claude_config_dir() {
-        let home = Path::new("/h");
-        assert_eq!(claude_dir(home, None), home);
-        assert_eq!(claude_dir(home, Some("".into())), home);
-        assert_eq!(claude_dir(home, Some("/c".into())), Path::new("/c"));
+        let claude = |value: Option<&str>| {
+            Dirs::resolve("/h".into(), "/c".into(), |name| {
+                (name == "CLAUDE_CONFIG_DIR").then(|| value.map(OsString::from))?
+            })
+            .claude
+        };
+        assert_eq!(claude(None), Path::new("/h"));
+        assert_eq!(claude(Some("")), Path::new("/h"));
+        assert_eq!(claude(Some("/cc")), Path::new("/cc"));
 
         let root = tempfile::tempdir().unwrap();
-        let dirs = Dirs {
-            home: root.path().join("home"),
-            config: root.path().join("config"),
-            claude: root.path().to_path_buf(),
-        };
+        let path = root.path().to_path_buf();
+        let dirs = Dirs::resolve(
+            root.path().join("home"),
+            root.path().join("config"),
+            |name| (name == "CLAUDE_CONFIG_DIR").then(|| path.clone().into_os_string()),
+        );
         std::fs::write(
             root.path().join(".claude.json"),
             r#"{"mcpServers": {"wrkflw": {"command": "wrkflw", "args": ["mcp", "serve"]}}}"#,
@@ -973,5 +1091,232 @@ mod tests {
                 }],
             })
         );
+    }
+
+    #[test]
+    fn comments_trailing_commas_and_layout_survive() {
+        // The shape of the settings file Zed creates.
+        let text = "// Zed settings\n//\n// See https://zed.dev/docs\n{\n    \"vim_mode\": true, // mine\n    \"agent\": {\n        \"model\": \"x\",\n    },\n}\n";
+        let wanted = json!({"command": "wrkflw", "args": SERVE_ARGS, "env": {}});
+        let (status, out) = upsert_json(Some(text), "context_servers", &wanted, WRITE).unwrap();
+        assert_eq!(status, Status::Added);
+        let out = out.unwrap();
+        assert!(
+            out.starts_with("// Zed settings\n//\n// See https://zed.dev/docs\n{\n"),
+            "{out}"
+        );
+        assert!(out.contains("\"vim_mode\": true, // mine\n"), "{out}");
+        assert!(
+            out.contains("\n    \"context_servers\": {\n        \"wrkflw\": {"),
+            "{out}"
+        );
+        assert!(out.ends_with("}\n"), "{out}");
+
+        // Read back, it is unchanged on a second run.
+        let (status, again) = upsert_json(Some(&out), "context_servers", &wanted, WRITE).unwrap();
+        assert_eq!((status, again), (Status::Unchanged, None));
+    }
+
+    #[test]
+    fn force_on_a_commented_file_keeps_its_comments() {
+        let text = "{\n  \"mcpServers\": {\n    // pinned build\n    \"wrkflw\": {\"command\": \"/old\", \"args\": [\"mcp\", \"serve\"], \"env\": {\"A\": \"1\"}},\n  },\n}\n";
+        let force = Policy {
+            dry_run: false,
+            force: true,
+        };
+        let (status, out) = upsert_json(Some(text), "mcpServers", &entry(), force).unwrap();
+        assert_eq!(status, Status::Replaced);
+        let out = out.unwrap();
+        assert!(out.contains("// pinned build"), "{out}");
+        assert!(out.contains("\"command\": \"wrkflw\""), "{out}");
+        assert!(out.contains("\"env\": {\"A\": \"1\"}"), "{out}");
+        assert!(!out.contains("/old"), "{out}");
+    }
+
+    #[test]
+    fn force_replaces_an_entry_that_isnt_an_object() {
+        let force = Policy {
+            dry_run: false,
+            force: true,
+        };
+        for current in ["null", "\"wrkflw\"", "[]"] {
+            let text = format!("{{\"mcpServers\": {{\"wrkflw\": {current}}}}}");
+            let (status, out) = upsert_json(Some(&text), "mcpServers", &entry(), WRITE).unwrap();
+            assert_eq!((status, out), (Status::Differs, None), "{current}");
+            let (status, out) = upsert_json(Some(&text), "mcpServers", &entry(), force).unwrap();
+            assert_eq!(status, Status::Replaced, "{current}");
+            let written: Value = serde_json::from_str(&out.unwrap()).unwrap();
+            assert_eq!(written["mcpServers"]["wrkflw"], entry(), "{current}");
+        }
+    }
+
+    #[test]
+    fn crlf_line_endings_are_kept() {
+        for text in ["{\r\n  \"a\": 1\r\n}\r\n", "{\r\n  \"a\": 1\r\n}"] {
+            let (_, out) = upsert_json(Some(text), "mcpServers", &entry(), WRITE).unwrap();
+            let out = out.unwrap();
+            assert!(out.ends_with("}\r\n"), "{out:?}");
+            assert!(!out.replace("\r\n", "").contains('\n'), "{out:?}");
+        }
+    }
+
+    #[test]
+    fn a_named_client_gets_its_config_created() {
+        let root = tempfile::tempdir().unwrap();
+        let dirs = dirs_in(root.path().join("home"), root.path().join("config"));
+        let dry = Policy {
+            dry_run: true,
+            force: false,
+        };
+        for client in [
+            Client::Cursor,
+            Client::Kiro,
+            Client::Pi,
+            Client::Zed,
+            Client::Copilot,
+        ] {
+            // Not installed, so skipped unless named.
+            assert!(install_one(client, &dirs, &launch(), WRITE, false).is_none());
+            // A dry run reports the add but creates nothing, not even the directory.
+            let outcome = install_one(client, &dirs, &launch(), dry, true).unwrap();
+            assert_eq!(
+                outcome.status,
+                Status::WouldAdd,
+                "{}",
+                outcome.client.name()
+            );
+            let parent = Path::new(&outcome.target).parent().unwrap().to_path_buf();
+            assert!(!parent.exists(), "{}", parent.display());
+            let outcome = install_one(client, &dirs, &launch(), WRITE, true).unwrap();
+            assert_eq!(outcome.status, Status::Added, "{}", outcome.client.name());
+            assert!(Path::new(&outcome.target).is_file(), "{}", outcome.target);
+        }
+        // A CLI client can't be set up without its CLI.
+        let mut missing = dirs_in(root.path().join("home"), root.path().join("config"));
+        missing.grok = root.path().join("no-grok");
+        if which::which("grok").is_err() {
+            let outcome = install_one(Client::Grok, &missing, &launch(), WRITE, true).unwrap();
+            assert_eq!(outcome.status, Status::NotFound);
+        }
+    }
+
+    #[test]
+    fn kiro_is_detected_by_its_home_and_launched_by_absolute_path() {
+        let root = tempfile::tempdir().unwrap();
+        let dirs = dirs_in(root.path().join("home"), root.path().join("config"));
+        std::fs::create_dir_all(&dirs.kiro).unwrap();
+        let outcome = install_one(Client::Kiro, &dirs, &launch(), WRITE, false).unwrap();
+        assert_eq!(outcome.status, Status::Added);
+        let written: Value = serde_json::from_str(
+            &std::fs::read_to_string(dirs.kiro.join("settings/mcp.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            written,
+            json!({"mcpServers": {"wrkflw": {"command": "/bin/wrkflw", "args": ["mcp", "serve"], "env": {}}}})
+        );
+    }
+
+    #[test]
+    fn new_clients_get_the_entry_each_one_documents() {
+        let dirs = dirs_in("/h", "/c");
+        let shape = |client| match method(client, &dirs, "wrkflw") {
+            Method::Json {
+                path, key, entry, ..
+            } => (path, key, entry),
+            Method::Cli { .. } => panic!("{} is a file", client.name()),
+        };
+        let (path, key, entry) = shape(Client::Copilot);
+        assert_eq!(path, Path::new("/h/.copilot/mcp-config.json"));
+        assert_eq!(key, "mcpServers");
+        assert_eq!(
+            entry,
+            json!({"type": "local", "command": "wrkflw", "args": ["mcp", "serve"], "env": {}, "tools": ["*"]})
+        );
+        let (path, key, _) = shape(Client::Pi);
+        assert_eq!(
+            (path.as_path(), key),
+            (Path::new("/h/.pi/agent/mcp.json"), "mcpServers")
+        );
+        let (path, key, entry) = shape(Client::Zed);
+        assert_eq!(path, dirs.zed.join("settings.json"));
+        assert_eq!(key, "context_servers");
+        assert_eq!(
+            entry,
+            json!({"command": "wrkflw", "args": ["mcp", "serve"], "env": {}})
+        );
+        assert!(matches!(
+            method(Client::Grok, &dirs, "wrkflw"),
+            Method::Cli {
+                program: "grok",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn agent_homes_follow_their_variables() {
+        let vars = |pairs: &'static [(&'static str, &'static str)]| {
+            Dirs::resolve("/home/u".into(), "/c".into(), move |name| {
+                pairs
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| OsString::from(value))
+            })
+        };
+        let dirs = vars(&[
+            ("COPILOT_HOME", "/x/copilot"),
+            ("GROK_HOME", "/x/grok"),
+            ("PI_CODING_AGENT_DIR", "~/pi-agent"),
+        ]);
+        assert_eq!(dirs.copilot, Path::new("/x/copilot"));
+        assert_eq!(dirs.grok, Path::new("/x/grok"));
+        assert_eq!(dirs.pi, Path::new("/home/u/pi-agent"));
+
+        let defaults = vars(&[]);
+        assert_eq!(defaults.copilot, Path::new("/home/u/.copilot"));
+        assert_eq!(defaults.grok, Path::new("/home/u/.grok"));
+        assert_eq!(defaults.kiro, Path::new("/home/u/.kiro"));
+        assert_eq!(defaults.pi, Path::new("/home/u/.pi/agent"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kiro_home_follows_kiros_rule() {
+        let home = Path::new("/home/u");
+        let kiro = |value: Option<&str>| kiro_home(home, value.map(OsString::from));
+        assert_eq!(kiro(None), Path::new("/home/u/.kiro"));
+        assert_eq!(kiro(Some("/srv/kiro")), Path::new("/srv/kiro"));
+        assert_eq!(
+            kiro(Some("/home/u/kiro-home")),
+            Path::new("/home/u/kiro-home")
+        );
+        for ignored in ["kiro", "/", "/home/u", "/home"] {
+            assert_eq!(kiro(Some(ignored)), Path::new("/home/u/.kiro"), "{ignored}");
+        }
+    }
+
+    #[test]
+    fn zed_settings_live_where_zed_reads_them() {
+        let home = Path::new("/home/u");
+        let config = Path::new("/c");
+        let expected = if cfg!(target_os = "macos") {
+            home.join(".config/zed")
+        } else if cfg!(windows) {
+            config.join("Zed")
+        } else {
+            config.join("zed")
+        };
+        assert_eq!(zed_dir(home, config), expected);
+    }
+
+    #[test]
+    fn grok_config_is_matched_on_its_mcp_server_table() {
+        let text = "model = \"grok-4\"\n\n[mcp_servers.wrkflw]\ncommand = \"wrkflw\"\nargs = [\"mcp\", \"serve\"]\n";
+        assert_eq!(toml_server_matches(text, "wrkflw"), Some(true));
+        assert_eq!(toml_server_matches(text, "/other"), Some(false));
+        let other = "[mcp_servers.other]\ncommand = \"other\"\nargs = [\"mcp\"]\n";
+        assert_eq!(toml_server_matches(other, "wrkflw"), None);
+        assert_eq!(toml_server_matches("not = [toml", "wrkflw"), None);
     }
 }

@@ -1102,6 +1102,20 @@ mod tests {
         )
         .unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // A process another test forked while the script was open for writing
+        // holds it until that process execs, and running the script meanwhile
+        // fails with ETXTBSY. Once one run succeeds no writer is left, so wait
+        // for that here instead of in the code under test.
+        for _ in 0..100 {
+            match std::process::Command::new(&script).arg("probe").output() {
+                Err(e) if e.raw_os_error() == Some(26) => {
+                    std::thread::sleep(std::time::Duration::from_millis(10))
+                }
+                Err(e) => panic!("can't run the fake CLI: {e}"),
+                Ok(_) => break,
+            }
+        }
+        let _ = std::fs::remove_file(&log);
         let cli: &'static str = Box::leak(script.display().to_string().into_boxed_str());
         (cli, log)
     }

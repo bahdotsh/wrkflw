@@ -2587,6 +2587,12 @@ async fn execute_job_with_matrix(
     .await;
     let result_key = match decision {
         acceleration::Decision::Reuse { jobs, why } => {
+            // A stored pass comes from some earlier tree, not the diff base, so
+            // its outputs may be new to the jobs that need it. It counts as
+            // run, so `--affected` doesn't skip those jobs as unchanged.
+            if matches!(why, acceleration::Reused::Stored { .. }) {
+                acceleration::mark_executed(job_name);
+            }
             let (note, step) = (why.note(), why.step());
             return Ok(jobs
                 .into_iter()

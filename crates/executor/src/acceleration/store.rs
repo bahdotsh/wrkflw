@@ -131,6 +131,10 @@ impl Remote {
                 token,
             });
         }
+        // `validate_remote` refuses other schemes. Never read one as a path.
+        if location.contains("://") && !location.starts_with("file://") {
+            return None;
+        }
         let path = location.strip_prefix("file://").unwrap_or(location);
         Some(Remote::Dir(PathBuf::from(path)))
     }
@@ -515,6 +519,38 @@ mod tests {
         assert!(store.remote_down.load(Ordering::Relaxed));
         assert!(store.load("bbb").await.is_none());
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_failing_server_stops_the_remote_for_the_run() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        let dir = TempDir::new().unwrap();
+        let accel = Acceleration {
+            remote_cache: Some(server.uri()),
+            signing_key: Some(Secret("k".to_string())),
+            ..Default::default()
+        };
+        let store = store_with(dir.path(), &accel);
+        assert!(store.load("aaa").await.is_none());
+        assert!(store.remote_down.load(Ordering::Relaxed));
+        assert!(store.load("bbb").await.is_none());
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn an_unknown_scheme_is_never_read_as_a_directory() {
+        assert!(Remote::parse("s3://bucket/x", None).is_none());
+        assert!(matches!(
+            Remote::parse("file:///srv/x", None),
+            Some(Remote::Dir(path)) if path == Path::new("/srv/x")
+        ));
     }
 
     #[tokio::test]

@@ -100,13 +100,21 @@ const MUTATING_ACTIONS: &[&str] = &[
     "peaceiris/actions-gh-pages",
 ];
 
-/// The `uses:` of a step in `job` that is known to change something outside
-/// the repository.
-fn mutating_action(job: &Job) -> Option<&str> {
+/// Actions that hand files to another job. A reused job hands over nothing,
+/// so the job that needs them would fail.
+const ARTIFACT_ACTIONS: &[&str] = &[
+    "actions/upload-artifact",
+    "actions/download-artifact",
+    "actions/upload-pages-artifact",
+];
+
+/// The `uses:` of the first step in `job` that runs one of `actions`, at any
+/// version or subpath. Lowercased, as GitHub matches action names.
+fn uses_one_of<'a>(job: &'a Job, actions: &[&str]) -> Option<&'a str> {
     job.steps.iter().find_map(|step| {
         let uses = step.uses.as_deref()?;
         let lower = uses.to_ascii_lowercase();
-        MUTATING_ACTIONS
+        actions
             .iter()
             .any(|action| {
                 lower
@@ -159,6 +167,15 @@ pub fn validate_remote(accel: &Acceleration) -> Result<(), String> {
         }
         return Ok(());
     };
+    if let Some((scheme, _)) = remote.split_once("://") {
+        if !matches!(scheme, "file" | "http" | "https") {
+            return Err(format!(
+                "--remote-cache doesn't support {}://. Use a directory, a file:// path \
+                 or an https:// URL",
+                scheme
+            ));
+        }
+    }
     if accel.signing_key.as_ref().is_none_or(|k| k.0.is_empty()) {
         return Err(
             "--remote-cache needs WRKFLW_CACHE_SIGNING_KEY: an unsigned result would let \
@@ -287,15 +304,10 @@ pub(crate) fn uncacheable_reason(
     if writes {
         return Some("it has write permissions");
     }
-    if job.steps.iter().any(|step| {
-        step.uses.as_deref().is_some_and(|uses| {
-            uses.starts_with("actions/upload-artifact")
-                || uses.starts_with("actions/download-artifact")
-        })
-    }) {
+    if uses_one_of(job, ARTIFACT_ACTIONS).is_some() {
         return Some("it exchanges artifacts");
     }
-    if mutating_action(job).is_some() {
+    if uses_one_of(job, MUTATING_ACTIONS).is_some() {
         return Some("it uses an action that publishes or writes to GitHub");
     }
     const UNREADABLE: &str = "its definition can't be checked for secrets";
@@ -555,17 +567,34 @@ pub(crate) fn dep_cache_mounts(mounts_are_copies: bool) -> Vec<(PathBuf, PathBuf
     let Some(run) = current().filter(|run| run.accel.dep_cache && !mounts_are_copies) else {
         return Vec::new();
     };
-    run.dep_mounts.get_or_init(create_dep_cache_dirs).clone()
+    run.dep_mounts
+        .get_or_init(|| create_dep_cache_dirs(&run.root))
+        .clone()
 }
 
-/// The host side of the mounts: `WRKFLW_DEP_CACHE_DIR`, or the cache directory.
-fn create_dep_cache_dirs() -> Vec<(PathBuf, PathBuf)> {
-    let root = std::env::var_os("WRKFLW_DEP_CACHE_DIR")
+/// The host side of the mounts for the repository at `repo`, under
+/// `WRKFLW_DEP_CACHE_DIR` or the cache directory.
+fn create_dep_cache_dirs(repo: &Path) -> Vec<(PathBuf, PathBuf)> {
+    let base = std::env::var_os("WRKFLW_DEP_CACHE_DIR")
         .map(PathBuf::from)
         .or_else(|| dirs::cache_dir().map(|d| d.join("wrkflw").join("deps")));
-    let Some(root) = root else {
-        return Vec::new();
-    };
+    match base {
+        Some(base) => dep_cache_dirs_in(&base, repo),
+        None => Vec::new(),
+    }
+}
+
+/// A short id for the repository at `repo`.
+fn repo_cache_id(repo: &Path) -> String {
+    let canonical = repo.canonicalize().unwrap_or_else(|_| repo.to_path_buf());
+    hex(&Sha256::digest(canonical.to_string_lossy().as_bytes()))[..16].to_string()
+}
+
+/// Each repository gets caches of its own under `base`. Steps can write to
+/// them, so a job in one repository must not leave packages that another
+/// repository's jobs then install.
+fn dep_cache_dirs_in(base: &Path, repo: &Path) -> Vec<(PathBuf, PathBuf)> {
+    let root = base.join(repo_cache_id(repo));
     DEP_CACHE_DIRS
         .iter()
         .filter_map(|(name, container)| {
@@ -954,6 +983,18 @@ mod tests {
             ),
             (
                 "steps:\n  - uses: actions/download-artifact@v4\n",
+                "artifacts",
+            ),
+            (
+                "steps:\n  - uses: actions/upload-pages-artifact@v3\n",
+                "artifacts",
+            ),
+            (
+                "steps:\n  - uses: actions/upload-artifact/merge@v4\n",
+                "artifacts",
+            ),
+            (
+                "steps:\n  - uses: Actions/Upload-Artifact@v4\n",
                 "artifacts",
             ),
             ("uses: ./.github/workflows/x.yml\n", "reusable"),
@@ -1383,6 +1424,9 @@ jobs:
             "http://localhost.evil.com",
             "http://localhost@evil.com/",
             "http://[::2]",
+            "s3://bucket/results",
+            "gs://bucket/results",
+            "HTTPS://cache.example.com",
         ] {
             let accel = Acceleration {
                 remote_cache: Some(remote.to_string()),
@@ -1460,6 +1504,36 @@ jobs:
             decide_in(dir.path(), results.path(), &plain).await,
             Decision::Run { .. }
         ));
+    }
+
+    #[test]
+    fn a_file_url_is_a_valid_remote() {
+        let accel = Acceleration {
+            remote_cache: Some("file:///srv/wrkflw".to_string()),
+            signing_key: Some(Secret("k".to_string())),
+            ..Default::default()
+        };
+        assert!(validate_remote(&accel).is_ok());
+    }
+
+    #[test]
+    fn each_repository_gets_its_own_dependency_caches() {
+        let base = TempDir::new().unwrap();
+        let first = TempDir::new().unwrap();
+        let second = TempDir::new().unwrap();
+        let hosts = |repo: &Path| -> Vec<PathBuf> {
+            dep_cache_dirs_in(base.path(), repo)
+                .into_iter()
+                .map(|(host, _)| host)
+                .collect()
+        };
+        let mine = hosts(first.path());
+        assert_eq!(mine.len(), DEP_CACHE_DIRS.len());
+        assert!(mine.iter().all(|dir| dir.is_dir()));
+        let theirs = hosts(second.path());
+        assert!(mine.iter().all(|dir| !theirs.contains(dir)));
+        // The same repository, by another spelling, keeps its caches.
+        assert_eq!(hosts(&first.path().join(".")), mine);
     }
 
     #[test]

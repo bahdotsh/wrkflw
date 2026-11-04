@@ -422,6 +422,10 @@ fn start_args(
         args.push("-v".to_string());
         args.push(format!("{}:{}", host.display(), container.display()));
     }
+    // Services join this container's network, and Docker and Podman then hand
+    // them this container's /etc/hosts, so these names resolve in every
+    // service too. Both refuse `--add-host` on a container that joins
+    // another's network, so services must not be given entries of their own.
     for service in service_names {
         args.push("--add-host".to_string());
         args.push(format!("{}:127.0.0.1", service));

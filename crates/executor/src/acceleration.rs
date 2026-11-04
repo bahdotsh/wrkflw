@@ -66,7 +66,56 @@ const SECRET_REFERENCES: &[&str] = &[
     "secrets}",
     "github.token",
     "github_token",
+    "github-token",
 ];
+
+/// Actions that change something on GitHub or a registry, and take
+/// `github.token` by default, so a job that uses them reads a credential
+/// without its YAML saying so. Matched as a prefix of `uses:`, lowercased.
+const MUTATING_ACTIONS: &[&str] = &[
+    "actions/github-script",
+    "actions/create-release",
+    "actions/upload-release-asset",
+    "actions/labeler",
+    "actions/stale",
+    "actions/first-interaction",
+    "actions/deploy-pages",
+    "actions/attest",
+    "softprops/action-gh-release",
+    "ncipollo/release-action",
+    "peter-evans/create-pull-request",
+    "peter-evans/create-or-update-comment",
+    "peter-evans/repository-dispatch",
+    "marocchino/sticky-pull-request-comment",
+    "thollander/actions-comment-pull-request",
+    "stefanzweifel/git-auto-commit-action",
+    "ad-m/github-push-action",
+    "googleapis/release-please-action",
+    "changesets/action",
+    "docker/login-action",
+    "docker/build-push-action",
+    "pypa/gh-action-pypi-publish",
+    "js-devtools/npm-publish",
+    "jamesives/github-pages-deploy-action",
+    "peaceiris/actions-gh-pages",
+];
+
+/// The `uses:` of a step in `job` that is known to change something outside
+/// the repository.
+fn mutating_action(job: &Job) -> Option<&str> {
+    job.steps.iter().find_map(|step| {
+        let uses = step.uses.as_deref()?;
+        let lower = uses.to_ascii_lowercase();
+        MUTATING_ACTIONS
+            .iter()
+            .any(|action| {
+                lower
+                    .strip_prefix(action)
+                    .is_some_and(|rest| rest.is_empty() || rest.starts_with(['@', '/']))
+            })
+            .then_some(uses)
+    })
+}
 
 /// A credential that must not reach logs through `Debug`.
 #[derive(Clone, Default, PartialEq)]
@@ -211,6 +260,11 @@ fn grants_write(permissions: &serde_yaml::Value) -> bool {
 /// wrkflw can't see what a step does, so this rules out what it can detect:
 /// a job that touches credentials probably changes something outside the
 /// repository, and a skipped job produces no artifacts for downstream jobs.
+///
+/// A job and workflow with no `permissions:` count as read-only here, though
+/// on GitHub that means the repository's default, which is write-all on
+/// repositories created before February 2023. Treating that as a write would
+/// rule out nearly every job. The README asks for `cache: false` instead.
 pub(crate) fn uncacheable_reason(
     job: &Job,
     workflow: &WorkflowDefinition,
@@ -237,6 +291,9 @@ pub(crate) fn uncacheable_reason(
         })
     }) {
         return Some("it exchanges artifacts");
+    }
+    if mutating_action(job).is_some() {
+        return Some("it uses an action that publishes or writes to GitHub");
     }
     const UNREADABLE: &str = "its definition can't be checked for secrets";
     let Some(env_text) = searchable(&sorted(&workflow.env)) else {
@@ -1324,6 +1381,33 @@ jobs:
         assert_eq!(tree.digest_matching(&src).unwrap(), first);
         assert_eq!(tree.selected.lock().unwrap().len(), 1);
         assert_ne!(tree.digest_matching(&docs).unwrap(), first);
+    }
+
+    #[test]
+    fn actions_that_publish_make_a_job_uncacheable() {
+        let wf = workflow();
+        for yaml in [
+            "steps:\n  - uses: actions/github-script@v7\n    with: {script: 'x'}\n",
+            "steps:\n  - uses: Softprops/Action-GH-Release@v2\n",
+            "steps:\n  - uses: peter-evans/create-pull-request@v6\n",
+            "steps:\n  - uses: x/y@v1\n    with: {github-token: abc}\n",
+        ] {
+            assert!(
+                uncacheable_reason(&job(yaml), &wf, None).is_some(),
+                "{}",
+                yaml
+            );
+        }
+        for yaml in [
+            "steps:\n  - uses: actions/checkout@v4\n",
+            "steps:\n  - uses: actions/github-scripts-helper@v1\n",
+        ] {
+            assert!(
+                uncacheable_reason(&job(yaml), &wf, None).is_none(),
+                "{}",
+                yaml
+            );
+        }
     }
 
     #[test]

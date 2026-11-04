@@ -60,6 +60,22 @@ struct Live {
     _cleanup: Containers,
 }
 
+/// Why a removal failed, or `None` if it worked.
+fn removal_failure(output: std::io::Result<std::process::Output>) -> Option<String> {
+    match output {
+        Ok(output) if output.status.success() => None,
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            Some(if stderr.is_empty() {
+                format!("exited with {}", output.status)
+            } else {
+                stderr
+            })
+        }
+        Err(e) => Some(e.to_string()),
+    }
+}
+
 /// Every container of a session, oldest first.
 ///
 /// Removed with one command, unlike `ContainerGuard`: a service lives in the
@@ -103,18 +119,25 @@ impl Drop for Containers {
             .args(self.removal_args())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn();
         match spawned {
-            Ok(mut child) => {
+            Ok(child) => {
                 // Only now: if removal couldn't start, the cleanup on exit
                 // still has to know about these containers.
                 let untrack = untrack_for(self.cli);
                 for id in &self.ids {
                     untrack(id);
                 }
+                let ids = self.ids.join(" ");
+                let cli = self.cli;
                 std::thread::spawn(move || {
-                    let _ = child.wait();
+                    if let Some(message) = removal_failure(child.wait_with_output()) {
+                        wrkflw_logging::warning(&format!(
+                            "Failed to remove containers {}: {}. Remove them with `{} rm -f -v {}`",
+                            ids, message, cli, ids
+                        ));
+                    }
                 });
             }
             Err(e) => wrkflw_logging::warning(&format!(
@@ -137,6 +160,9 @@ struct State {
     /// A service failed to start. Every later step fails with this, so an
     /// `if: always()` step doesn't wait for the same service all over again.
     failed: Option<String>,
+    /// Set once a step has been sent to its own container, so the warning
+    /// that says so comes once per job.
+    warned_outside: bool,
 }
 
 pub(crate) struct JobSession {
@@ -719,9 +745,6 @@ impl JobSession {
         let same_mounts = live.volumes.len() == wanted.len()
             && wanted.iter().all(|volume| live.volumes.contains(volume));
         if live.image != image || !same_mounts {
-            if self.services.is_empty() {
-                return Ok(None);
-            }
             let difference = if live.image != image {
                 format!(
                     "uses image {}, not the job container's {}",
@@ -730,10 +753,21 @@ impl JobSession {
             } else {
                 "needs other mounts than the job container".to_string()
             };
-            return Err(format!(
-                "this step {}, so it can't reach the job's services",
-                difference
-            ));
+            if !self.services.is_empty() {
+                return Err(format!(
+                    "this step {}, so it can't reach the job's services",
+                    difference
+                ));
+            }
+            if !state.warned_outside {
+                state.warned_outside = true;
+                wrkflw_logging::warning(&format!(
+                    "A step {}, so it runs in a container of its own: files it leaves \
+                     outside the workspace won't be there for later steps",
+                    difference
+                ));
+            }
+            return Ok(None);
         }
         let id = live.id.clone();
         let script = env_script(env.iter().copied())?;
@@ -1016,6 +1050,8 @@ mod tests {
         let session = session(cli, vec![]);
         step(&session, "ubuntu").await.unwrap();
         assert!(step(&session, "alpine").await.unwrap().is_none());
+        assert!(session.state.lock().await.warned_outside);
+        assert!(step(&session, "alpine").await.unwrap().is_none());
         assert_eq!(calls(&log, "exec"), 1);
     }
 
@@ -1088,6 +1124,23 @@ mod tests {
         }
         // Nothing to remove: these containers never existed.
         containers.ids.clear();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_removal_says_why() {
+        let run = |script: &str| {
+            std::process::Command::new("sh")
+                .args(["-c", script])
+                .stderr(Stdio::piped())
+                .output()
+        };
+        assert_eq!(removal_failure(run("exit 0")), None);
+        assert_eq!(
+            removal_failure(run("echo 'no such container' >&2; exit 1")).as_deref(),
+            Some("no such container")
+        );
+        assert!(removal_failure(run("exit 3")).unwrap().contains('3'));
     }
 
     #[test]

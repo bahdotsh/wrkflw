@@ -5734,7 +5734,8 @@ fn warn_unsupported_container_fields(container: &JobContainer) {
     }
     if container.ports.is_some() {
         wrkflw_logging::warning(
-            "container 'ports' field is not yet supported (service containers are not implemented)",
+            "container 'ports' field is not supported locally and will be ignored: \
+             nothing outside the job reaches its container",
         );
     }
 }

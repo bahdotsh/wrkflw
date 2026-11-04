@@ -1210,6 +1210,10 @@ impl App {
             return;
         }
 
+        // Once no run is in flight, the Execution tab shows the workflow
+        // highlighted in the Workflows list.
+        let shown_after_run = self.workflow_list_state.selected() == Some(workflow_idx);
+
         let workflow = &mut self.workflows[workflow_idx];
 
         // Ensure execution details exist
@@ -1281,21 +1285,27 @@ impl App {
             }
 
             // Open the panes on the problem: the first job that failed
-            // the run, and its first failing step.
-            let job = execution_details
-                .jobs
-                .iter()
-                .position(|j| j.status == JobStatus::Failure && !j.failure_allowed)
-                .unwrap_or(0);
-            let step = execution_details
-                .jobs
-                .get(job)
-                .and_then(|j| j.steps.iter().position(|s| s.status == StepStatus::Failure))
-                .unwrap_or(0);
-            self.job_list_state.select(Some(job));
-            self.step_list_state.select(Some(step));
-            self.step_table_state.select(Some(step));
-            self.step_output_scroll = 0;
+            // the run, and its first failing step. The job and step
+            // cursors are shared by every workflow, so only move them
+            // for the run the Execution tab shows once this one ends;
+            // a queued run finishing in the background must not move
+            // the cursor on the run being inspected.
+            if shown_after_run {
+                let job = execution_details
+                    .jobs
+                    .iter()
+                    .position(|j| j.status == JobStatus::Failure && !j.failure_allowed)
+                    .unwrap_or(0);
+                let step = execution_details
+                    .jobs
+                    .get(job)
+                    .and_then(|j| j.steps.iter().position(|s| s.status == StepStatus::Failure))
+                    .unwrap_or(0);
+                self.job_list_state.select(Some(job));
+                self.step_list_state.select(Some(step));
+                self.step_table_state.select(Some(step));
+                self.step_output_scroll = 0;
+            }
         }
 
         // The executor returns Ok with per-job results even when a job
@@ -3011,6 +3021,30 @@ mod tests {
         app.tick();
         assert!(app.runtime_available);
         assert!(app.availability_probe.is_none());
+    }
+
+    #[test]
+    fn a_background_run_finishing_leaves_the_shown_runs_cursor_alone() {
+        use wrkflw_executor::JobStatus as S;
+        let mut app = make_app();
+        app.workflow_list_state.select(Some(0));
+        app.job_list_state.select(Some(2));
+        app.step_table_state.select(Some(3));
+
+        // Workflow 1 isn't the one on screen.
+        app.process_execution_result(
+            1,
+            Ok((
+                vec![
+                    job_result("a", S::Success, false),
+                    job_result("b", S::Failure, false),
+                ],
+                (),
+            )),
+        );
+        assert_eq!(app.workflows[1].status, WorkflowStatus::Failed);
+        assert_eq!(app.job_list_state.selected(), Some(2));
+        assert_eq!(app.step_table_state.selected(), Some(3));
     }
 
     #[test]

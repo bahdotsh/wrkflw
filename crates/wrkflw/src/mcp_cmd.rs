@@ -100,6 +100,7 @@ fn tool_command(name: &str, args: &Value) -> Result<(Vec<String>, u64), String> 
             event_flags(&mut cli, args);
             push_opt(&mut cli, "--runtime", string_arg(args, "runtime"));
             push_opt(&mut cli, "--intent", string_arg(args, "intent"));
+            push_opt(&mut cli, "--session", string_arg(args, "session"));
             push_opt(&mut cli, "--from-step", string_arg(args, "from_step"));
             for (key, value) in args["variables"].as_object().into_iter().flatten() {
                 let value = value
@@ -118,6 +119,7 @@ fn tool_command(name: &str, args: &Value) -> Result<(Vec<String>, u64), String> 
             cli.extend(["runs".to_string(), "list".to_string()]);
             push_opt(&mut cli, "--status", string_arg(args, "status"));
             push_opt(&mut cli, "--agent", string_arg(args, "agent"));
+            push_opt(&mut cli, "--session", string_arg(args, "session"));
             push_opt(&mut cli, "--workflow", string_arg(args, "workflow"));
             if let Some(limit) = args["limit"].as_u64() {
                 cli.push("--limit".into());
@@ -292,6 +294,7 @@ fn tools() -> Value {
         "description": "`emulation` runs steps directly on this machine.",
     });
     run_properties["intent"] = json!({"type": "string", "description": "Why you are running this. Stored on the run record."});
+    run_properties["session"] = json!({"type": "string", "description": "Your session id, such as $CLAUDE_CODE_SESSION_ID or $CODEX_THREAD_ID. Stored on the run record."});
     run_properties["from_step"] = json!({"type": "string", "description": "Requires `job`. Start at this step, by name or 1-based position. Earlier steps' outputs and files are missing."});
     run_properties["variables"] = json!({"type": "object", "additionalProperties": {"type": "string"}, "description": "GitLab CI variables. Masked in output and never stored."});
     run_properties["timeout_seconds"] =
@@ -304,7 +307,7 @@ fn tools() -> Value {
         tool("plan_workflow", "Show what a run would do without executing anything: whether the trigger fires and why, job order, matrix legs and steps.", true, event_properties(), &["path"]),
         tool("run_workflow", "Execute a workflow locally. This runs the workflow's code. Returns status, job results and a failure digest. The run is recorded.", false, run_properties, &["path"]),
         tool("list_runs", "List recorded runs of this repository, newest first.", true,
-            json!({"limit": {"type": "integer"}, "status": {"type": "string"}, "agent": {"type": "string"}, "workflow": {"type": "string"}}), &[]),
+            json!({"limit": {"type": "integer"}, "status": {"type": "string"}, "agent": {"type": "string"}, "session": {"type": "string"}, "workflow": {"type": "string"}}), &[]),
         tool("get_run", "Get one recorded run: jobs, steps, exit codes, timings.", true, json!({"run_id": run_id}), &[]),
         tool("get_run_failure", "Explain why a recorded run failed: failed step, script, env from earlier steps, output tail.", true,
             json!({"run_id": run_id, "tail": {"type": "integer", "description": "Output lines per failed step."}}), &[]),

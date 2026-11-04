@@ -3574,6 +3574,7 @@ dependencies = [
  "urlencoding",
  "uuid",
  "walkdir",
+ "which",
  "wrkflw-evaluator",
  "wrkflw-executor",
  "wrkflw-github",

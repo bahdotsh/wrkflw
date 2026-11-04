@@ -51,6 +51,9 @@ pub struct RunRecord {
     pub source: String,
     pub agent: Option<String>,
     pub intent: Option<String>,
+    /// The agent session that started the run, such as a Claude Code session id.
+    #[serde(default)]
+    pub session: Option<String>,
     pub replay_of: Option<String>,
     /// The step `--from-step` started at. Earlier steps did not run.
     #[serde(default)]

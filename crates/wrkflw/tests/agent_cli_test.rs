@@ -674,6 +674,7 @@ fn mcp_server_speaks_the_protocol_and_runs_tools() {
             "path": ".github/workflows/failing.yml",
             "runtime": "emulation",
             "intent": "mcp test",
+            "session": "session-1",
         }),
     );
     assert!(!is_error, "a failed workflow is a result, not a tool error");
@@ -684,6 +685,11 @@ fn mcp_server_speaks_the_protocol_and_runs_tools() {
     assert_eq!(runs["runs"][0]["source"], "mcp");
     assert_eq!(runs["runs"][0]["agent"], "test-client");
     assert_eq!(runs["runs"][0]["intent"], "mcp test");
+    assert_eq!(runs["runs"][0]["session"], "session-1");
+    let (runs, _) = mcp.tool("list_runs", json!({"session": "session-1"}));
+    assert_eq!(runs["runs"].as_array().unwrap().len(), 1);
+    let (runs, _) = mcp.tool("list_runs", json!({"session": "other"}));
+    assert_eq!(runs["runs"], json!([]));
 
     let (failure, _) = mcp.tool("get_run_failure", json!({}));
     assert_eq!(failure["failures"][0]["step"], "boom");
@@ -1038,4 +1044,63 @@ fn undefined_references_warn_without_failing_validation() {
         report["files"][0]["issues"][0]["rule"],
         "undefined-step-reference"
     );
+}
+
+/// `dirs` reads `HOME` on Unix only, so this can't be pointed at a temporary
+/// home on Windows without touching the real profile.
+#[cfg(unix)]
+#[test]
+fn mcp_install_registers_once_and_leaves_other_commands_alone() {
+    let sandbox = Sandbox::new();
+    let home = TempDir::new().unwrap();
+    fs::create_dir_all(home.path().join(".cursor")).unwrap();
+    let config = home.path().join(".cursor/mcp.json");
+    let install = |args: &[&str]| {
+        let mut all = vec!["--format", "json", "mcp", "install", "cursor"];
+        all.extend(args);
+        sandbox
+            .command(&all)
+            .env("HOME", home.path())
+            .output()
+            .unwrap()
+    };
+
+    let output = install(&["--dry-run"]);
+    assert!(output.status.success(), "{}", stdout(&output));
+    assert_eq!(json_doc(&output)["clients"][0]["status"], "would_add");
+    assert!(!config.exists());
+
+    let output = install(&[]);
+    assert!(output.status.success(), "{}", stdout(&output));
+    let report = json_doc(&output);
+    assert_eq!(report["type"], "mcp_install");
+    assert_eq!(report["clients"][0]["client"], "cursor");
+    assert_eq!(report["clients"][0]["status"], "added");
+    let written: Value = serde_json::from_str(&fs::read_to_string(&config).unwrap()).unwrap();
+    assert_eq!(
+        written["mcpServers"]["wrkflw"],
+        json!({"command": report["command"], "args": ["mcp", "serve"]})
+    );
+
+    let output = install(&[]);
+    assert!(output.status.success());
+    assert_eq!(json_doc(&output)["clients"][0]["status"], "unchanged");
+
+    fs::write(
+        &config,
+        r#"{"mcpServers": {"wrkflw": {"command": "/old/wrkflw", "args": ["mcp", "serve"], "env": {"A": "1"}}}}"#,
+    )
+    .unwrap();
+    let output = install(&[]);
+    assert_eq!(output.status.code(), Some(1));
+    let client = &json_doc(&output)["clients"][0];
+    assert_eq!(client["status"], "differs");
+    assert!(client["detail"].as_str().unwrap().contains("--force"));
+
+    let output = install(&["--force"]);
+    assert!(output.status.success());
+    assert_eq!(json_doc(&output)["clients"][0]["status"], "replaced");
+    let written: Value = serde_json::from_str(&fs::read_to_string(&config).unwrap()).unwrap();
+    assert_eq!(written["mcpServers"]["wrkflw"]["env"], json!({"A": "1"}));
+    assert_ne!(written["mcpServers"]["wrkflw"]["command"], "/old/wrkflw");
 }

@@ -24,6 +24,9 @@ pub(crate) enum RunsCommand {
         /// Only runs by this agent
         #[arg(long)]
         agent: Option<String>,
+        /// Only runs from this agent session
+        #[arg(long)]
+        session: Option<String>,
         /// Only runs of workflows whose path contains this text
         #[arg(long)]
         workflow: Option<String>,
@@ -106,6 +109,7 @@ fn summary_json(run: &RunRecord) -> Value {
         "source": run.source,
         "agent": run.agent,
         "intent": run.intent,
+        "session": run.session,
         "git_sha": run.git_sha,
         "git_branch": run.git_branch,
         "started_at": run.started_at,
@@ -156,6 +160,9 @@ fn print_run(run: &RunRecord) {
             &sha[..sha.len().min(10)],
             dirty
         );
+    }
+    if let Some(session) = &run.session {
+        println!("    session: {session}");
     }
     if let Some(reason) = &run.skip_reason {
         println!("    skipped: {reason}");
@@ -270,6 +277,7 @@ pub(crate) async fn run(command: RunsCommand, format: OutputFormat) {
             all,
             status,
             agent,
+            session,
             workflow,
         } => {
             let repo = current_repo().await;
@@ -282,6 +290,11 @@ pub(crate) async fn run(command: RunsCommand, format: OutputFormat) {
                     agent
                         .as_deref()
                         .is_none_or(|a| run.agent.as_deref() == Some(a))
+                })
+                .filter(|run| {
+                    session
+                        .as_deref()
+                        .is_none_or(|id| run.session.as_deref() == Some(id))
                 })
                 .filter(|run| workflow.as_deref().is_none_or(|w| run.workflow.contains(w)))
                 .take(limit)

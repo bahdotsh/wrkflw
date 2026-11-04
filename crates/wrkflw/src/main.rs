@@ -8,6 +8,7 @@ mod cli_secrets;
 mod gate_cmd;
 mod json_output;
 mod mcp_cmd;
+mod mcp_install;
 mod plan_cmd;
 mod prefilter;
 mod run_workflow_cmd;
@@ -356,6 +357,11 @@ enum Commands {
         #[arg(long, value_name = "NAME")]
         agent: Option<String>,
 
+        /// The agent session this run belongs to. Defaults to WRKFLW_SESSION, then the
+        /// session id the detected coding agent exports
+        #[arg(long, value_name = "ID")]
+        session: Option<String>,
+
         /// Don't record this run in the history
         #[arg(long)]
         no_record: bool,
@@ -639,10 +645,23 @@ enum Commands {
     },
 }
 
-#[derive(Debug, Clone, Copy, Subcommand)]
+#[derive(Debug, Clone, Subcommand)]
 enum McpCommand {
     /// Serve over stdio until stdin closes
     Serve,
+    /// Register the server with coding agents: every one found, or those named
+    Install {
+        /// Agents to register with. Defaults to every one whose CLI or config directory exists
+        #[arg(value_enum)]
+        clients: Vec<mcp_install::Client>,
+        /// Show what would change without changing anything. Exits 1, like a real run,
+        /// if an agent would be left without the entry
+        #[arg(long)]
+        dry_run: bool,
+        /// Replace a wrkflw entry that launches a different command
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 // An empty value is skipped rather than rejected, so an exported but empty
@@ -908,7 +927,14 @@ async fn run_cli() {
 
     // stdout is a protocol in these modes, so logs must stay off it.
     let format = cli.format;
-    if format.is_json() || matches!(cli.command, Some(Commands::Mcp { .. })) {
+    if format.is_json()
+        || matches!(
+            cli.command,
+            Some(Commands::Mcp {
+                command: McpCommand::Serve
+            })
+        )
+    {
         wrkflw_logging::set_console_to_stderr(true);
     }
 
@@ -1055,6 +1081,7 @@ async fn run_cli() {
             no_strict_filter,
             intent,
             agent,
+            session,
             no_record,
             from_step,
             reuse_results,
@@ -1089,6 +1116,7 @@ async fn run_cli() {
                 format,
                 intent: intent.clone(),
                 agent: agent.clone(),
+                session: session.clone(),
                 no_record: *no_record,
                 from_step: from_step.clone(),
                 reuse_results: *reuse_results,
@@ -1260,6 +1288,16 @@ async fn run_cli() {
             command: McpCommand::Serve,
         }) => {
             mcp_cmd::serve().await;
+        }
+        Some(Commands::Mcp {
+            command:
+                McpCommand::Install {
+                    clients,
+                    dry_run,
+                    force,
+                },
+        }) => {
+            mcp_install::install(clients, *dry_run, *force, format);
         }
         None => {
             #[cfg(feature = "tui")]

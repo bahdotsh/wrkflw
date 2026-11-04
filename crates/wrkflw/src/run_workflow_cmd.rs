@@ -44,6 +44,7 @@ pub(crate) struct RunCtx {
     pub(crate) format: OutputFormat,
     pub(crate) intent: Option<String>,
     pub(crate) agent: Option<String>,
+    pub(crate) session: Option<String>,
     pub(crate) no_record: bool,
     pub(crate) from_step: Option<String>,
     pub(crate) reuse_results: bool,
@@ -140,7 +141,8 @@ fn strip_variable_args(args: impl Iterator<Item = String>) -> Vec<String> {
             break;
         }
         // `--format` is the replayer's choice, and clap rejects it twice.
-        if arg == "--variable" || arg == "--format" {
+        // `--session` belongs to whoever replays, not to the original run.
+        if arg == "--variable" || arg == "--format" || arg == "--session" {
             args.next();
         } else if let Some((flags, inline_value)) = variable_in_short_cluster(&arg) {
             if !flags.is_empty() {
@@ -149,7 +151,10 @@ fn strip_variable_args(args: impl Iterator<Item = String>) -> Vec<String> {
             if !inline_value {
                 args.next();
             }
-        } else if !arg.starts_with("--variable=") && !arg.starts_with("--format=") {
+        } else if !["--variable=", "--format=", "--session="]
+            .iter()
+            .any(|prefix| arg.starts_with(prefix))
+        {
             kept.push(arg);
         }
     }
@@ -207,6 +212,7 @@ pub(crate) async fn run(ctx: RunCtx) {
             "cli"
         });
     meta.agent = ctx.agent.clone().or(meta.agent);
+    meta.session = ctx.session.clone().or(meta.session);
     meta.intent = ctx.intent.clone();
     meta.event = ctx.event.clone();
     meta.argv = replayable_argv();
@@ -441,7 +447,7 @@ mod tests {
     use super::strip_variable_args;
 
     #[test]
-    fn variable_values_never_reach_the_stored_argv() {
+    fn variables_format_and_session_never_reach_the_stored_argv() {
         let args = [
             "run",
             "ci.yml",
@@ -454,6 +460,9 @@ mod tests {
             "--format",
             "json",
             "--format=json",
+            "--session",
+            "old",
+            "--session=old",
             "--job",
             "build",
         ];

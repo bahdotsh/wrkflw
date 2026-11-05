@@ -205,6 +205,37 @@ impl WorkflowExecution {
         }
         out
     }
+
+    /// Workflow keys with a job that started and has not finished. A matrix
+    /// job has a time in [`Self::job_durations_ms`] once its first leg
+    /// finishes, so this says whether that time is final yet.
+    pub fn unfinished_jobs(&self) -> std::collections::HashSet<String> {
+        let mut canonical = std::collections::HashMap::new();
+        let mut running: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        for entry in &self.timeline {
+            match entry {
+                TimelineEntry::JobStarted {
+                    job,
+                    canonical_name,
+                } => {
+                    canonical.insert(job.as_str(), canonical_name.as_str());
+                    *running.entry(canonical_name.as_str()).or_default() += 1;
+                }
+                TimelineEntry::JobFinished { job, .. } => {
+                    let key = canonical.get(job.as_str()).copied().unwrap_or(job.as_str());
+                    if let Some(count) = running.get_mut(key) {
+                        *count = count.saturating_sub(1);
+                    }
+                }
+                TimelineEntry::StepFinished { .. } => {}
+            }
+        }
+        running
+            .into_iter()
+            .filter(|(_, count)| *count > 0)
+            .map(|(key, _)| key.to_string())
+            .collect()
+    }
 }
 
 /// Lines of a failed step's output kept in the timeline.

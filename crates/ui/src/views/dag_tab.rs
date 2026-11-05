@@ -99,6 +99,8 @@ struct Timing {
     critical: HashSet<String>,
     /// The run has ended, so every job that will report a time has.
     settled: bool,
+    /// Jobs with a leg still running, whose time may yet grow.
+    unfinished: HashSet<String>,
 }
 
 impl Timing {
@@ -106,6 +108,7 @@ impl Timing {
         let exec = workflow.execution_details.as_ref();
         let durations = exec.map(|e| e.job_durations_ms()).unwrap_or_default();
         let settled = exec.is_some_and(|e| e.end_time.is_some());
+        let unfinished = exec.map(|e| e.unfinished_jobs()).unwrap_or_default();
         // Mid-run, unfinished jobs would count as taking no time, and the
         // path would move as they finish; it is only drawn once it's known.
         let critical = if settled {
@@ -117,17 +120,21 @@ impl Timing {
             durations,
             critical,
             settled,
+            unfinished,
         }
     }
 
     /// Wall time of a stage: its jobs run side by side, so the slowest.
-    /// While the run goes on, only once every job in the stage has finished.
+    /// While the run goes on, only once every job in the stage has finished,
+    /// every matrix leg included.
     fn stage_ms(&self, layer: &[String]) -> Option<u64> {
         let times: Vec<u64> = layer
             .iter()
             .filter_map(|j| self.durations.get(j).copied())
             .collect();
-        if !self.settled && times.len() < layer.len() {
+        let pending =
+            times.len() < layer.len() || layer.iter().any(|j| self.unfinished.contains(j));
+        if !self.settled && pending {
             return None;
         }
         times.into_iter().max()
@@ -542,6 +549,7 @@ mod timing_tests {
             durations: HashMap::from([("lint".to_string(), 2_000)]),
             critical: HashSet::new(),
             settled: false,
+            unfinished: HashSet::new(),
         };
         assert_eq!(timing.stage_ms(&layer), None);
         timing.durations.insert("test".to_string(), 9_000);
@@ -550,5 +558,43 @@ mod timing_tests {
         timing.durations.remove("test");
         timing.settled = true;
         assert_eq!(timing.stage_ms(&layer), Some(2_000));
+    }
+
+    #[test]
+    fn a_matrix_stage_waits_for_its_last_leg() {
+        use crate::models::TimelineEntry as T;
+        use wrkflw_executor::JobStatus;
+        let started = |job: &str| T::JobStarted {
+            job: job.into(),
+            canonical_name: "build".into(),
+        };
+        let finished = |job: &str, ms| T::JobFinished {
+            job: job.into(),
+            status: JobStatus::Success,
+            failure_allowed: false,
+            duration_ms: ms,
+            repeated_from: None,
+        };
+        let mut exec = crate::models::WorkflowExecution {
+            jobs: Vec::new(),
+            start_time: chrono::Local::now(),
+            end_time: None,
+            progress: 0.0,
+            timeline: vec![started("build (os: a)"), started("build (os: b)")],
+            live: Default::default(),
+        };
+        let layer = vec!["build".to_string()];
+        let timing = |exec: &crate::models::WorkflowExecution| Timing {
+            durations: exec.job_durations_ms(),
+            critical: HashSet::new(),
+            settled: false,
+            unfinished: exec.unfinished_jobs(),
+        };
+
+        exec.timeline.push(finished("build (os: a)", 900));
+        assert_eq!(timing(&exec).stage_ms(&layer), None, "one leg still runs");
+
+        exec.timeline.push(finished("build (os: b)", 1_400));
+        assert_eq!(timing(&exec).stage_ms(&layer), Some(1_400));
     }
 }

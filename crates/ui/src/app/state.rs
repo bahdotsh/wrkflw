@@ -2669,10 +2669,11 @@ impl App {
     /// running workflow's timeline. Call before handling a run's result, so
     /// the events it sent before finishing are in place first.
     pub fn drain_timeline(&mut self) {
-        while let Ok((idx, entry)) = self.timeline_rx.try_recv() {
+        while let Ok((idx, generation, entry)) = self.timeline_rx.try_recv() {
             // Only the run in flight may write: anything else belongs to a
-            // run whose result has already been handled.
-            if self.current_execution != Some(idx) {
+            // run whose result has already been handled, which may have
+            // been an earlier run of the same workflow.
+            if self.current_execution != Some(idx) || generation != self.run_generation {
                 continue;
             }
             if let Some(exec) = self
@@ -4197,6 +4198,43 @@ mod tests {
         assert_eq!(app.workflow_list_state.selected(), Some(0));
     }
 
+    fn run_record(id: &str, cwd: &std::path::Path, workflow: &str) -> wrkflw_runs::RunRecord {
+        let record = serde_json::json!({
+            "schema_version": 1, "id": id, "status": "success", "workflow": workflow,
+            "cwd": cwd.to_string_lossy(), "repo_root": cwd.to_string_lossy(),
+            "git_sha": null, "git_branch": null, "git_dirty": null, "runtime": "emulation",
+            "event": null, "source": "cli", "agent": null, "intent": null, "replay_of": null,
+            "argv": [], "variables": [], "pid": 1, "started_at": "2026-11-05T12:00:00Z",
+            "finished_at": null, "duration_ms": null, "error": null, "skip_reason": null,
+            "jobs": []
+        });
+        serde_json::from_value(record).unwrap()
+    }
+
+    #[test]
+    fn each_workflow_finds_its_newest_recorded_run() {
+        let repo = tempfile::tempdir().unwrap();
+        let flows = repo.path().join(".github/workflows");
+        std::fs::create_dir_all(&flows).unwrap();
+        for file in ["ci.yml", "deploy.yml"] {
+            std::fs::write(flows.join(file), "on: push").unwrap();
+        }
+        let mut app = make_app();
+        app.workflows[0].path = flows.join("ci.yml");
+        app.workflows[1].path = flows.join("deploy.yml");
+        // Newest first, as history lists them. Runs record the workflow
+        // relative to where they ran, which may be a subdirectory.
+        app.runs = vec![
+            run_record("new-ci", repo.path(), ".github/workflows/ci.yml"),
+            run_record("old-ci", &flows, "ci.yml"),
+            run_record("other", repo.path(), ".github/workflows/nightly.yml"),
+        ];
+        app.match_runs_to_workflows();
+        assert_eq!(app.last_run(0).map(|r| r.id.as_str()), Some("new-ci"));
+        assert_eq!(app.last_run(1).map(|r| r.id.as_str()), None);
+        assert!(app.last_run(99).is_none());
+    }
+
     #[test]
     fn timeline_only_reaches_the_workflow_in_flight() {
         let mut app = make_app();
@@ -4210,9 +4248,18 @@ mod tests {
             canonical_name: job.into(),
         };
         let update = |job: &str| crate::models::RunUpdate::Entry(entry(job));
-        app.timeline_tx.send((0, update("build"))).unwrap();
+        let generation = app.run_generation;
+        app.timeline_tx
+            .send((0, generation, update("build")))
+            .unwrap();
         // A late event for a workflow that is no longer running.
-        app.timeline_tx.send((1, update("stale"))).unwrap();
+        app.timeline_tx
+            .send((1, generation, update("stale")))
+            .unwrap();
+        // A late event from an earlier run of the workflow now running.
+        app.timeline_tx
+            .send((0, generation.wrapping_sub(1), update("earlier")))
+            .unwrap();
         app.drain_timeline();
         let timeline = &app.workflows[0]
             .execution_details
@@ -4242,7 +4289,11 @@ mod tests {
         // The executor's last event, sent just before its result and not
         // yet drained by the event loop.
         app.timeline_tx
-            .send((0, crate::models::RunUpdate::Entry(finished.clone())))
+            .send((
+                0,
+                app.run_generation,
+                crate::models::RunUpdate::Entry(finished.clone()),
+            ))
             .unwrap();
         app.finish_execution(0, Ok((Vec::new(), ())));
         assert_eq!(app.current_execution, None);

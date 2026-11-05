@@ -476,6 +476,8 @@ pub async fn execute_curl_trigger(
 #[cfg(feature = "tui")]
 struct TimelineObserver {
     workflow_idx: usize,
+    /// The TUI's `run_generation` for this run.
+    generation: u64,
     tx: mpsc::Sender<TimelineMsg>,
 }
 
@@ -485,7 +487,7 @@ impl wrkflw_executor::ExecutionObserver for TimelineObserver {
         if let Some(entry) = RunUpdate::from_event(event) {
             // The TUI may have quit; a run that outlives it has no one to
             // tell, and that is fine.
-            let _ = self.tx.send((self.workflow_idx, entry));
+            let _ = self.tx.send((self.workflow_idx, self.generation, entry));
         }
     }
 }
@@ -502,6 +504,7 @@ pub fn start_next_workflow_execution(
         let tx_clone_inner = tx_clone.clone();
         let workflow_path = app.workflows[next_idx].path.clone();
         let timeline_tx = app.timeline_tx.clone();
+        let generation = app.run_generation;
 
         // Check container runtime availability again if container runtime is selected
         let runtime_type = match app.runtime_type {
@@ -646,6 +649,7 @@ pub fn start_next_workflow_execution(
                                     from_step: None,
                                     observers: vec![std::sync::Arc::new(TimelineObserver {
                                         workflow_idx: next_idx,
+                                        generation,
                                         tx: timeline_tx,
                                     })],
                                 },

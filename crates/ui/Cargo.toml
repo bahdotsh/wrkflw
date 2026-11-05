@@ -51,3 +51,6 @@ reqwest = { workspace = true, features = ["json"] }
 regex.workspace = true
 futures.workspace = true
 urlencoding.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -356,11 +356,13 @@ fn render_output_pane(
     selected: Option<&str>,
     area: Rect,
 ) {
-    // While steps run, show what they print: the selected job's step if
-    // it has printed anything, else whichever step printed last.
+    // While steps run, show what they print: the selected job's running
+    // step, else whichever step started or printed last. Once the run ends
+    // the pane goes back to the run's log.
     if let Some((job, tail)) = workflow
         .execution_details
         .as_ref()
+        .filter(|exec| exec.end_time.is_none())
         .and_then(|exec| exec.live.pick(selected))
     {
         let title = format!(

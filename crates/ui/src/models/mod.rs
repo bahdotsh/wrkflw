@@ -339,13 +339,24 @@ impl RunUpdate {
                 step: step.clone(),
                 lines: lines.clone(),
             }),
+            // No lines yet, but the job's tail now belongs to this step, so
+            // a step that prints nothing isn't shown under the last one's name.
+            wrkflw_executor::ExecutionEvent::StepStarted { job, step, index } => {
+                Some(RunUpdate::Output {
+                    job: job.clone(),
+                    index: *index,
+                    step: step.clone(),
+                    lines: Vec::new(),
+                })
+            }
             other => TimelineEntry::from_event(other).map(RunUpdate::Entry),
         }
     }
 }
 
-/// An update for the workflow at the index.
-pub type TimelineMsg = (usize, RunUpdate);
+/// An update for the workflow at the index, from the run that the TUI's
+/// `run_generation` numbered with the second field.
+pub type TimelineMsg = (usize, u64, RunUpdate);
 
 /// Job execution details
 pub struct JobExecution {
@@ -536,6 +547,41 @@ mod tests {
         assert_eq!(tail.step, "test");
         assert_eq!(tail.lines.len(), LIVE_TAIL_LINES);
         assert_eq!(tail.lines.back().map(String::as_str), Some("509"));
+    }
+
+    #[test]
+    fn a_step_starting_takes_over_its_jobs_tail_before_it_prints() {
+        use wrkflw_executor::ExecutionEvent as E;
+        let mut live = LiveTails::default();
+        let mut apply = |event: E| match RunUpdate::from_event(&event) {
+            Some(RunUpdate::Output {
+                job,
+                index,
+                step,
+                lines,
+            }) => live.push(&job, index, &step, lines),
+            other => panic!("expected output, got {other:?}"),
+        };
+        apply(E::StepStarted {
+            job: "build".into(),
+            step: "compile".into(),
+            index: 0,
+        });
+        apply(E::StepOutput {
+            job: "build".into(),
+            step: "compile".into(),
+            index: 0,
+            lines: vec!["Finished dev".into()],
+        });
+        // The next step compiles silently: its tail is empty, not the last one's.
+        apply(E::StepStarted {
+            job: "build".into(),
+            step: "test".into(),
+            index: 1,
+        });
+        let tail = &live.jobs["build"];
+        assert_eq!((tail.index, tail.step.as_str()), (1, "test"));
+        assert!(tail.lines.is_empty());
     }
 
     #[test]

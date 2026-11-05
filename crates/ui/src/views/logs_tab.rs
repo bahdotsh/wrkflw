@@ -449,4 +449,32 @@ mod tests {
             assert!(text::width(line) <= 60, "{line:?} overflows");
         }
     }
+
+    #[test]
+    fn a_running_job_shows_the_step_that_is_running() {
+        let timeline = vec![
+            TimelineEntry::JobStarted {
+                job: "build".into(),
+                canonical_name: "build".into(),
+            },
+            TimelineEntry::StepFinished {
+                job: "build".into(),
+                step: "compile".into(),
+                status: StepStatus::Success,
+                exit_code: Some(0),
+                duration_ms: 10_000,
+                tail: Vec::new(),
+            },
+        ];
+        let mut live = crate::models::LiveTails::default();
+        live.push("build", 0, "compile", vec!["Finished dev".into()]);
+        // The next step has started and printed nothing yet.
+        live.push("build", 1, "test", Vec::new());
+        let lines = text_of(&story_lines(&timeline, Some(&live), 60, 0));
+        assert_eq!(lines[2].trim(), format!("{} test", theme::spinner(0)));
+        assert!(
+            !lines.iter().any(|l| l.contains("Finished dev")),
+            "{lines:?}"
+        );
+    }
 }

@@ -97,29 +97,40 @@ pub fn render_dag_tab(f: &mut Frame<'_>, app: &mut App, area: Rect) {
 struct Timing {
     durations: HashMap<String, u64>,
     critical: HashSet<String>,
+    /// The run has ended, so every job that will report a time has.
+    settled: bool,
 }
 
 impl Timing {
     fn of(workflow: &Workflow, def: &WorkflowDefinition, levels: &[Vec<String>]) -> Self {
-        let durations = workflow
-            .execution_details
-            .as_ref()
-            .map(|e| e.job_durations_ms())
-            .unwrap_or_default();
-        let critical = critical_path(def, levels, &durations);
+        let exec = workflow.execution_details.as_ref();
+        let durations = exec.map(|e| e.job_durations_ms()).unwrap_or_default();
+        let settled = exec.is_some_and(|e| e.end_time.is_some());
+        // Mid-run, unfinished jobs would count as taking no time, and the
+        // path would move as they finish; it is only drawn once it's known.
+        let critical = if settled {
+            critical_path(def, levels, &durations)
+        } else {
+            HashSet::new()
+        };
         Timing {
             durations,
             critical,
+            settled,
         }
     }
 
     /// Wall time of a stage: its jobs run side by side, so the slowest.
+    /// While the run goes on, only once every job in the stage has finished.
     fn stage_ms(&self, layer: &[String]) -> Option<u64> {
-        layer
+        let times: Vec<u64> = layer
             .iter()
-            .filter_map(|j| self.durations.get(j))
-            .max()
-            .copied()
+            .filter_map(|j| self.durations.get(j).copied())
+            .collect();
+        if !self.settled && times.len() < layer.len() {
+            return None;
+        }
+        times.into_iter().max()
     }
 }
 
@@ -506,5 +517,38 @@ mod timing_tests {
             .collect();
         assert_eq!(path, expected);
         assert!(critical_path(&def, &levels, &HashMap::new()).is_empty());
+    }
+
+    #[test]
+    fn equal_chains_pick_the_same_path_every_time() {
+        let def = def(
+            "name: d\non: push\njobs:\n  a:\n    runs-on: x\n    steps: [{run: a}]\n  b:\n    runs-on: x\n    steps: [{run: a}]\n  c:\n    runs-on: x\n    needs: a\n    steps: [{run: a}]\n  d:\n    runs-on: x\n    needs: b\n    steps: [{run: a}]\n",
+        );
+        let levels = dag::topo_levels(&def);
+        let durations: HashMap<String, u64> = ["a", "b", "c", "d"]
+            .into_iter()
+            .map(|k| (k.to_string(), 1_000))
+            .collect();
+        let expected: HashSet<String> = ["a", "c"].into_iter().map(String::from).collect();
+        for _ in 0..20 {
+            assert_eq!(critical_path(&def, &levels, &durations), expected);
+        }
+    }
+
+    #[test]
+    fn stage_times_wait_for_the_stage_while_the_run_goes_on() {
+        let layer = vec!["lint".to_string(), "test".to_string()];
+        let mut timing = Timing {
+            durations: HashMap::from([("lint".to_string(), 2_000)]),
+            critical: HashSet::new(),
+            settled: false,
+        };
+        assert_eq!(timing.stage_ms(&layer), None);
+        timing.durations.insert("test".to_string(), 9_000);
+        assert_eq!(timing.stage_ms(&layer), Some(9_000));
+        // Once the run has ended, a job that never reported doesn't hide it.
+        timing.durations.remove("test");
+        timing.settled = true;
+        assert_eq!(timing.stage_ms(&layer), Some(2_000));
     }
 }

@@ -167,8 +167,16 @@ export WRKFLW_PLATFORM=ubuntu-latest=catthehacker/ubuntu:act-latest
 
 Two defaults make a rerun cheaper than a hosted runner's cold start. Both work the same for any language or toolchain.
 
-- **Each job keeps its workspace.** Checkout syncs the source files into it, and leaves alone anything the repository ignores, such as build output, `node_modules` or a virtualenv. The second run of a build is therefore incremental. Unchanged files keep their timestamps, and files deleted from the repository are deleted from the workspace too. Workspaces live under your cache directory in `wrkflw/workspaces` (`~/Library/Caches` on macOS, `~/.cache` on Linux), one per repository, workflow and job. Deleting that directory is always safe. `--fresh-workspace` or `WRKFLW_FRESH_WORKSPACE=1` gives every job an empty workspace, as a hosted runner does.
-- **Matrix legs that only pick a runner run once.** Locally, `runs-on: ${{ matrix.os }}` maps every OS to the same image. If a leg differs from another only in values that `runs-on` reads, and the two would run in the same image, that leg reports the other's result instead of repeating it. A leg whose steps read the value, or which runs in a different image (see `--platform`), still runs. `--every-matrix-leg` or `WRKFLW_EVERY_MATRIX_LEG=1` runs them all.
+- **Each job keeps its workspace.** Checkout syncs the source files into it, and leaves alone anything the repository ignores, such as build output, `node_modules` or a virtualenv. The second run of a build is therefore incremental. Unchanged files keep their timestamps, and files deleted from the repository are deleted from the workspace too. Workspaces live under your cache directory in `wrkflw/workspaces` (`~/Library/Caches` on macOS, `~/.cache` on Linux), one per repository, workflow file and job. `--fresh-workspace` or `WRKFLW_FRESH_WORKSPACE=1` gives every job an empty workspace, as a hosted runner does.
+- **Matrix legs that only pick a runner run once.** Locally, `runs-on: ${{ matrix.os }}` maps every OS to the same image. If a leg differs from another only in values that `runs-on` reads, and the two would run in the same image, that leg reports the other's result instead of repeating it. Its history record and its `job_finished` event carry `repeated_from` with the leg it repeats. A leg whose steps read the value, or which runs in a different image (see `--platform`), still runs. `--every-matrix-leg` or `WRKFLW_EVERY_MATRIX_LEG=1` runs them all.
+
+What a kept workspace means in practice:
+
+- In a git repository, checkout follows git's ignore rules: the repository's `.gitignore`, `.git/info/exclude` and your global excludes file. Tracked dotfiles such as `.cargo/config.toml` are synced. Hidden files a tool leaves in the workspace, such as `.pytest_cache`, are kept. Outside a git repository, most hidden files are skipped.
+- `.git` is mirrored so `git describe` and `git diff` work. Its objects are hard-linked where the cache directory shares a filesystem with the repository, so they take no extra space. Hooks are left out, as in a fresh clone.
+- A job that never runs `actions/checkout` finds whatever its last run left behind, not an empty directory. The run log says when a job reuses its workspace.
+- Files a step writes, including credentials such as `.npmrc` or a kubeconfig, stay in the workspace until the next run overwrites them or you clean it. Use `--fresh-workspace` for jobs where that matters.
+- `wrkflw clean` removes every kept workspace no run is using. Deleting the directory by hand is also safe; each job then starts cold once.
 
 While a step runs, the TUI shows what it prints: the Run tab's Output pane shows the full output, and the Log story shows its last lines.
 

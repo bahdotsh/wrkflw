@@ -62,7 +62,10 @@ pub async fn execute_workflow(
     .map_err(ExecutionError::Execution)?;
     acceleration::with_run_state(
         std::sync::Arc::new(state),
-        execute_github_workflow(workflow_path, config.clone()),
+        crate::workspace::with_workflow_file(
+            workflow_path,
+            Box::pin(execute_github_workflow(workflow_path, config.clone())),
+        ),
     )
     .await
 }
@@ -5941,10 +5944,19 @@ fn create_gitignore_matcher(
 ) -> Result<Option<ignore::gitignore::Gitignore>, ExecutionError> {
     let mut builder = GitignoreBuilder::new(dir);
 
-    // Try to add .gitignore file if it exists
-    let gitignore_path = dir.join(".gitignore");
-    if gitignore_path.exists() {
-        builder.add(&gitignore_path);
+    // The repository's own ignore rules, then the ones git applies on top:
+    // `.git/info/exclude` and the user's global excludes file. Hidden files
+    // are synced by these rules in a git checkout, and editor state such as
+    // `.idea` is often only ignored globally.
+    let excludes = [
+        Some(dir.join(".gitignore")),
+        Some(dir.join(".git").join("info").join("exclude")),
+        ignore::gitignore::gitconfig_excludes_path(),
+    ];
+    for path in excludes.into_iter().flatten() {
+        if path.is_file() {
+            builder.add(&path);
+        }
     }
 
     // Add some common ignore patterns as fallback
@@ -5978,19 +5990,32 @@ fn copy_directory_contents(from: &Path, to: &Path) -> Result<(), ExecutionError>
             return Ok(());
         }
     }
-    copy_directory_contents_with_gitignore(from, to, None)?;
+    copy_directory_contents_with_gitignore(from, to, &SyncRules::for_root(from)?)?;
     // A checkout is a git repository, and steps run `git describe`, `git
     // diff` and the like. A `.git` file (a worktree or submodule) points at a
     // host path a container can't see, so only a directory is mirrored.
     let git_dir = from.join(".git");
     if git_dir.is_dir() && !git_dir.is_symlink() {
-        mirror_directory(&git_dir, &to.join(".git"))?;
+        // Hooks stay out: a clone has none, and a step that commits must
+        // not run the developer's. Objects are never changed once written,
+        // so they are hard-linked where the filesystem allows instead of
+        // copied into every job's workspace.
+        mirror_directory(&git_dir, &to.join(".git"), false, &["hooks"], &["objects"])?;
     }
     Ok(())
 }
 
 /// Make `to` an exact copy of `from`, copying only files that changed.
-fn mirror_directory(from: &Path, to: &Path) -> Result<(), ExecutionError> {
+/// Files are hard-linked rather than copied when `link`. Of `from`'s own
+/// entries, those named in `skip` are left out and those in `link_dirs`
+/// are linked.
+fn mirror_directory(
+    from: &Path,
+    to: &Path,
+    link: bool,
+    skip: &[&str],
+    link_dirs: &[&str],
+) -> Result<(), ExecutionError> {
     let io_err = |what: &str, e: std::io::Error| ExecutionError::Execution(format!("{what}: {e}"));
     if to.exists() && !to.is_dir() {
         std::fs::remove_file(to).map_err(|e| io_err("Failed to replace file with dir", e))?;
@@ -6001,16 +6026,21 @@ fn mirror_directory(from: &Path, to: &Path) -> Result<(), ExecutionError> {
     for entry in std::fs::read_dir(from).map_err(|e| io_err("Failed to read directory", e))? {
         let entry = entry.map_err(|e| io_err("Failed to read entry", e))?;
         let path = entry.path();
-        if path.is_symlink() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if path.is_symlink() || skip.contains(&name_str.as_ref()) {
             continue;
         }
-        let dest_path = to.join(entry.file_name());
+        let dest_path = to.join(&name);
         if path.is_dir() {
-            mirror_directory(&path, &dest_path)?;
+            let link = link || link_dirs.contains(&name_str.as_ref());
+            mirror_directory(&path, &dest_path, link, &[], &[])?;
+        } else if link {
+            link_file(&path, &dest_path)?;
         } else {
             sync_file(&path, &dest_path)?;
         }
-        synced.insert(entry.file_name());
+        synced.insert(name);
     }
 
     for entry in std::fs::read_dir(to)
@@ -6031,43 +6061,62 @@ fn mirror_directory(from: &Path, to: &Path) -> Result<(), ExecutionError> {
     Ok(())
 }
 
-/// Whether a directory entry named `name` counts as a source file: not a
-/// symlink, not ignored, and not one of the hidden files a checkout skips.
-fn is_source_entry(
-    path: &Path,
-    name: &str,
-    relative: &Path,
-    gitignore: Option<&ignore::gitignore::Gitignore>,
-) -> bool {
-    if path.is_symlink() {
-        return false;
+/// Which entries of a source tree a checkout brings into the workspace.
+struct SyncRules {
+    gitignore: Option<ignore::gitignore::Gitignore>,
+    /// The source is a git repository. Its ignore rules then decide what is
+    /// a source file, hidden or not, as they do for a clone: tracked
+    /// dotfiles such as `.cargo/config.toml` belong in the checkout.
+    git_checkout: bool,
+}
+
+impl SyncRules {
+    fn for_root(root: &Path) -> Result<Self, ExecutionError> {
+        Ok(SyncRules {
+            gitignore: create_gitignore_matcher(root)?,
+            git_checkout: root.join(".git").exists(),
+        })
     }
-    if let Some(gitignore) = gitignore {
-        if let Match::Ignore(_) = gitignore.matched(relative, path.is_dir()) {
+
+    /// Whether `source`, an entry named `name` in the source tree, is
+    /// synced. `source` must be a path under the root, so ignore rules
+    /// anchored to the root still match in subdirectories.
+    fn syncs(&self, source: &Path, name: &str, is_dir: bool) -> bool {
+        // `.git` is mirrored separately, or not at all when it is a file.
+        if name == ".git" {
             return false;
         }
+        if let Some(gitignore) = &self.gitignore {
+            if let Match::Ignore(_) = gitignore.matched(source, is_dir) {
+                return false;
+            }
+        }
+        self.git_checkout || !Self::hidden(name)
     }
-    // Skip most hidden files but allow important ones
-    !(name.starts_with('.')
-        && name != ".gitignore"
-        && name != ".github"
-        && name != ".gitea"
-        && !name.starts_with(".env"))
+
+    /// Whether a workspace entry with no source counterpart may be deleted.
+    /// Hidden entries never are: they may be tool state (`.pytest_cache`,
+    /// `.venv`) a repository doesn't bother to ignore.
+    fn may_delete(&self, source: &Path, name: &str, is_dir: bool) -> bool {
+        !name.starts_with('.') && self.syncs(source, name, is_dir)
+    }
+
+    /// Outside a git repository, most hidden files are editor and tool
+    /// state rather than source.
+    fn hidden(name: &str) -> bool {
+        name.starts_with('.')
+            && name != ".gitignore"
+            && name != ".github"
+            && name != ".gitea"
+            && !name.starts_with(".env")
+    }
 }
 
 fn copy_directory_contents_with_gitignore(
     from: &Path,
     to: &Path,
-    gitignore: Option<&ignore::gitignore::Gitignore>,
+    rules: &SyncRules,
 ) -> Result<(), ExecutionError> {
-    // If no gitignore provided, try to create one for the root directory
-    let root_gitignore;
-    let gitignore = if gitignore.is_none() {
-        root_gitignore = create_gitignore_matcher(from)?;
-        root_gitignore.as_ref()
-    } else {
-        gitignore
-    };
     let io_err = |what: &str, e: std::io::Error| ExecutionError::Execution(format!("{what}: {e}"));
 
     wrkflw_logging::debug(&format!(
@@ -6081,8 +6130,7 @@ fn copy_directory_contents_with_gitignore(
         let entry = entry.map_err(|e| io_err("Failed to read entry", e))?;
         let path = entry.path();
         let name = entry.file_name();
-        let relative = path.strip_prefix(from).unwrap_or(&path);
-        if !is_source_entry(&path, &name.to_string_lossy(), relative, gitignore) {
+        if path.is_symlink() || !rules.syncs(&path, &name.to_string_lossy(), path.is_dir()) {
             continue;
         }
         synced.insert(name.clone());
@@ -6094,9 +6142,7 @@ fn copy_directory_contents_with_gitignore(
                     .map_err(|e| io_err("Failed to replace file with dir", e))?;
             }
             std::fs::create_dir_all(&dest_path).map_err(|e| io_err("Failed to create dir", e))?;
-
-            // Recursively copy subdirectories with the same gitignore
-            copy_directory_contents_with_gitignore(&path, &dest_path, gitignore)?;
+            copy_directory_contents_with_gitignore(&path, &dest_path, rules)?;
         } else {
             sync_file(&path, &dest_path)?;
         }
@@ -6114,7 +6160,10 @@ fn copy_directory_contents_with_gitignore(
             continue;
         }
         let path = entry.path();
-        if !is_source_entry(&path, &name.to_string_lossy(), Path::new(&name), gitignore) {
+        // Judge it by where it would be in the source, so ignore rules
+        // anchored to the root apply.
+        let source = from.join(&name);
+        if path.is_symlink() || !rules.may_delete(&source, &name.to_string_lossy(), path.is_dir()) {
             continue;
         }
         let removed = if path.is_dir() {
@@ -6136,6 +6185,28 @@ fn copy_directory_contents_with_gitignore(
     }
 
     Ok(())
+}
+
+/// Hard-link `from` at `to`, or copy it where linking fails (another
+/// filesystem, or one without links). Only for files nothing rewrites in
+/// place, since the link shares the source's contents.
+fn link_file(from: &Path, to: &Path) -> Result<(), ExecutionError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let (Ok(a), Ok(b)) = (std::fs::metadata(from), std::fs::metadata(to)) {
+            if a.dev() == b.dev() && a.ino() == b.ino() {
+                return Ok(());
+            }
+        }
+    }
+    if to.exists() {
+        let _ = std::fs::remove_file(to);
+    }
+    if std::fs::hard_link(from, to).is_ok() {
+        return Ok(());
+    }
+    sync_file(from, to)
 }
 
 /// Copy `from` to `to` unless `to` already matches it, keeping the source's
@@ -8072,6 +8143,78 @@ mod tests {
             std::fs::read_to_string(dst.path().join(".git/HEAD")).unwrap(),
             "ref: refs/heads/main"
         );
+    }
+
+    #[test]
+    fn a_git_checkout_brings_tracked_dotfiles_and_leaves_tool_state() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(src.path().join(".git")).unwrap();
+        std::fs::write(src.path().join(".git/HEAD"), "ref: refs/heads/main").unwrap();
+        std::fs::create_dir_all(src.path().join(".cargo")).unwrap();
+        std::fs::write(src.path().join(".cargo/config.toml"), "[build]").unwrap();
+        std::fs::write(src.path().join(".rustfmt.toml"), "").unwrap();
+        std::fs::write(src.path().join(".gitignore"), ".secret-local\n").unwrap();
+        std::fs::write(src.path().join(".secret-local"), "x").unwrap();
+        copy_directory_contents(src.path(), dst.path()).unwrap();
+
+        assert!(dst.path().join(".cargo/config.toml").is_file());
+        assert!(dst.path().join(".rustfmt.toml").is_file());
+        assert!(!dst.path().join(".secret-local").exists());
+
+        // A tool leaves hidden state the repository doesn't ignore; the
+        // next sync keeps it.
+        std::fs::create_dir_all(dst.path().join(".pytest_cache")).unwrap();
+        copy_directory_contents(src.path(), dst.path()).unwrap();
+        assert!(dst.path().join(".pytest_cache").is_dir());
+    }
+
+    #[test]
+    fn workspace_sync_applies_anchored_ignores_in_subdirectories() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join(".gitignore"), "/web/dist/\n").unwrap();
+        std::fs::create_dir_all(src.path().join("web/dist")).unwrap();
+        std::fs::write(src.path().join("web/index.ts"), "src").unwrap();
+        std::fs::write(src.path().join("web/dist/host.js"), "host build").unwrap();
+        // The job's own build output from its last run.
+        std::fs::create_dir_all(dst.path().join("web/dist")).unwrap();
+        std::fs::write(dst.path().join("web/dist/app.js"), "job build").unwrap();
+
+        copy_directory_contents(src.path(), dst.path()).unwrap();
+
+        assert!(dst.path().join("web/index.ts").is_file());
+        assert!(dst.path().join("web/dist/app.js").is_file());
+        assert!(!dst.path().join("web/dist/host.js").exists());
+    }
+
+    #[test]
+    fn git_mirror_leaves_out_hooks_and_links_objects() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        for dir in [".git/hooks", ".git/objects/ab"] {
+            std::fs::create_dir_all(src.path().join(dir)).unwrap();
+        }
+        std::fs::write(src.path().join(".git/hooks/pre-commit"), "exit 1").unwrap();
+        std::fs::write(src.path().join(".git/objects/ab/cdef"), "blob").unwrap();
+        std::fs::write(src.path().join(".git/HEAD"), "ref: refs/heads/main").unwrap();
+        copy_directory_contents(src.path(), dst.path()).unwrap();
+
+        assert!(!dst.path().join(".git/hooks").exists());
+        assert!(dst.path().join(".git/HEAD").is_file());
+        let object = dst.path().join(".git/objects/ab/cdef");
+        assert_eq!(std::fs::read_to_string(&object).unwrap(), "blob");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let a = std::fs::metadata(src.path().join(".git/objects/ab/cdef")).unwrap();
+            let b = std::fs::metadata(&object).unwrap();
+            // Linked where the filesystem allows; tempdirs share one.
+            assert_eq!(a.ino(), b.ino());
+        }
+        // A second sync leaves the link alone.
+        copy_directory_contents(src.path(), dst.path()).unwrap();
+        assert!(object.is_file());
     }
 
     #[test]

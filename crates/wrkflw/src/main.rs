@@ -646,6 +646,10 @@ enum Commands {
         no_strict_filter: bool,
     },
 
+    /// Remove the job workspaces kept between runs, except ones a run is
+    /// using. Each job starts from an empty workspace once afterwards
+    Clean,
+
     /// Inspect and replay recorded runs
     Runs {
         #[command(subcommand)]
@@ -1239,6 +1243,28 @@ async fn run_cli() {
                 std::process::exit(1);
             }
         }
+        Some(Commands::Clean) => match wrkflw_executor::workspace::clean() {
+            Ok(report) if format.is_json() => {
+                wrkflw_runs::emit_line(&serde_json::json!({
+                    "removed": report.removed,
+                    "in_use": report.in_use,
+                }));
+            }
+            Ok(report) => {
+                println!("Removed {} job workspace(s).", report.removed);
+                if report.in_use > 0 {
+                    println!(
+                        "Left {} in use by a running workflow; run `wrkflw clean` again once \
+                         it finishes.",
+                        report.in_use
+                    );
+                }
+            }
+            Err(e) => {
+                eprintln!("Failed to clean job workspaces: {}", e);
+                std::process::exit(1);
+            }
+        },
         Some(Commands::List { jobs }) => {
             if format.is_json() {
                 json_output::list();

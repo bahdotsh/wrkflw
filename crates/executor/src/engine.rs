@@ -3842,7 +3842,7 @@ impl LiveLines {
             let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
             let mut chunk = chunk;
             if pending.dropping_command {
-                match chunk.find(['\n', '\r']) {
+                match chunk.find('\n') {
                     Some(at) => {
                         pending.dropping_command = false;
                         chunk = &chunk[at + 1..];
@@ -3851,7 +3851,9 @@ impl LiveLines {
                 }
             }
             pending.text.push_str(chunk);
-            let cut = match pending.text.rfind(['\n', '\r']) {
+            // Only a newline ends a line. A carriage return redraws it, as
+            // a progress bar does; `send` keeps the line's last state.
+            let cut = match pending.text.rfind('\n') {
                 Some(at) => at + 1,
                 None if pending.text.len() > LIVE_LINE_LIMIT => {
                     if pending.text.starts_with("::add-mask::") {
@@ -3887,19 +3889,9 @@ impl LiveLines {
 
     fn send(&self, text: &str) {
         let mut lines: Vec<String> = Vec::new();
-        for line in text.split(['\n', '\r']).filter(|line| !line.is_empty()) {
-            // Workflow commands are instructions to the runner, not output,
-            // though annotations are shown the way GitHub shows them.
-            // `::add-mask::` has to take effect here, before the lines after
-            // it are masked, not when the step ends: the value is on this
-            // very line, and the step may print it again before finishing.
-            // A line that only looks like a command is ordinary output.
-            let line = match crate::workflow_commands::parse_command_line(line.trim_end()) {
-                None => line.to_string(),
-                Some(command) => match live_annotation(command) {
-                    Some(shown) => shown,
-                    None => continue,
-                },
+        for line in text.split('\n') {
+            let Some(line) = visible_line(line) else {
+                continue;
             };
             let line = crate::log_redaction::mask(&line);
             lines.push(
@@ -3922,6 +3914,35 @@ impl LiveLines {
             observer.on_event(&event);
         }
     }
+}
+
+/// What a line of live output shows, if anything.
+///
+/// A carriage return redraws the line, so a progress bar's hundred states
+/// are one line showing the last of them. Workflow commands are
+/// instructions to the runner, not output, though annotations are shown the
+/// way GitHub shows them. `::add-mask::` has to take effect here, before
+/// the lines after it are masked, not when the step ends: the value is on
+/// this very line, and the step may print it again before finishing. So
+/// every state of a line is read for commands, even those redrawn over.
+/// A line that only looks like a command is ordinary output.
+fn visible_line(line: &str) -> Option<String> {
+    let line = line.strip_suffix('\r').unwrap_or(line);
+    let mut states = line
+        .split('\r')
+        .filter(|state| !state.is_empty())
+        .peekable();
+    let mut shown = None;
+    while let Some(state) = states.next() {
+        let text = match crate::workflow_commands::parse_command_line(state.trim_end()) {
+            None => Some(state.to_string()),
+            Some(command) => live_annotation(command),
+        };
+        if states.peek().is_none() {
+            shown = text;
+        }
+    }
+    shown
 }
 
 /// How a workflow command reads in live output: annotations as GitHub
@@ -4054,6 +4075,38 @@ mod live_line_tests {
         lines.flush();
         let seen = seen.0.lock().unwrap();
         assert_eq!(*seen, vec!["after".to_string()]);
+    }
+
+    #[test]
+    fn a_redrawn_line_shows_only_its_last_state() {
+        let seen = Arc::new(Seen::default());
+        let lines = live(seen.clone());
+        lines.push("Downloading 10%\rDownloading 50%");
+        lines.push("\rDownloading 100%\r\n");
+        lines.push("windows line\r\n");
+        // A line ending in a bare carriage return is held until its newline.
+        lines.push("split\r");
+        lines.push("\nnext\n");
+        lines.flush();
+        let seen = seen.0.lock().unwrap();
+        assert_eq!(
+            *seen,
+            vec!["Downloading 100%", "windows line", "split", "next"],
+            "{seen:?}"
+        );
+    }
+
+    #[test]
+    fn a_mask_redrawn_over_still_takes_effect() {
+        let seen = Arc::new(Seen::default());
+        let lines = live(seen.clone());
+        let value = "redrawn-mask-sentinel-5e7d";
+        lines.push(&format!("::add-mask::{value}\rprogress\n"));
+        lines.push(&format!("leak? {value}\n"));
+        lines.flush();
+        let seen = seen.0.lock().unwrap();
+        assert!(!seen.iter().any(|l| l.contains(value)), "{seen:?}");
+        assert_eq!(*seen, vec!["progress", "leak? ***"]);
     }
 
     #[test]

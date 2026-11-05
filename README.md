@@ -180,7 +180,7 @@ What a kept workspace means in practice:
 - `wrkflw clean` removes every kept workspace no run is using. It leaves each job's small lock file, so a run starting at the same moment still has the workspace to itself. Deleting the directory by hand is also safe; each job then starts cold once.
 - `cargo test` in this repository sets `WRKFLW_FRESH_WORKSPACE=1` through `.cargo/config.toml`, so tests never keep workspaces. The same applies to `cargo run`; set `WRKFLW_FRESH_WORKSPACE=0` to try kept workspaces from a source build.
 
-While a step runs, the TUI shows what it prints: the Run tab's Output pane shows the full output, and the Log story shows its last lines. Error, warning and notice annotations appear as `Error: …` lines, as on GitHub. Other workflow commands are hidden, and every line is masked before it is shown.
+While a step runs, the TUI shows what it prints: the Run tab's Output pane shows the full output, and the Log story shows its last lines. Error, warning and notice annotations appear as `Error: …` lines, as on GitHub. Other workflow commands are hidden, and every line is masked before it is shown. A progress bar that redraws its line with carriage returns shows as one line in its latest state.
 
 wrkflw's own log, shown in the TUI and with `--verbose`, masks every secret, every `::add-mask::` value, and each `--variable` value whose name suggests a credential (`TOKEN`, `SECRET`, `PASSWORD`, `KEY` and the like) or that is 16 characters or longer. Other `--variable` values, such as `BRANCH=main`, stay readable there. Step output is masked for every `--variable` value.
 

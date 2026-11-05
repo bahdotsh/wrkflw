@@ -30,6 +30,51 @@ impl OutputTap {
     }
 }
 
+/// Turns a byte stream read in arbitrary chunks into text without breaking
+/// a character that straddles two chunks: the incomplete tail of one chunk
+/// is held and completed by the next. Bytes that can never form valid
+/// UTF-8 still become U+FFFD, as `String::from_utf8_lossy` makes them.
+#[derive(Default)]
+pub struct Utf8Chunks {
+    held: Vec<u8>,
+}
+
+impl Utf8Chunks {
+    /// The text `bytes` completes, holding back a trailing partial character.
+    pub fn push(&mut self, bytes: &[u8]) -> String {
+        self.held.extend_from_slice(bytes);
+        let keep = incomplete_tail(&self.held);
+        let complete_len = self.held.len() - keep;
+        let text = String::from_utf8_lossy(&self.held[..complete_len]).into_owned();
+        self.held.drain(..complete_len);
+        text
+    }
+
+    /// Whatever is still held; a stream that ends mid-character ends with
+    /// a replacement character, as a lossy conversion of the whole would.
+    pub fn finish(&mut self) -> String {
+        let text = String::from_utf8_lossy(&self.held).into_owned();
+        self.held.clear();
+        text
+    }
+}
+
+/// How many bytes at the end of `bytes` begin a character that the next
+/// chunk may still complete. A character is at most four bytes, so only the
+/// last three can be such a prefix; std's decoder says whether they are one.
+fn incomplete_tail(bytes: &[u8]) -> usize {
+    let mut start = bytes.len().saturating_sub(3);
+    // Continuation bytes at the window's start belong to an earlier character.
+    while start < bytes.len() && bytes[start] & 0b1100_0000 == 0b1000_0000 {
+        start += 1;
+    }
+    match std::str::from_utf8(&bytes[start..]) {
+        // `error_len() == None`: the input ended inside a valid prefix.
+        Err(e) if e.error_len().is_none() => bytes.len() - start - e.valid_up_to(),
+        _ => 0,
+    }
+}
+
 tokio::task_local! {
     static TAP: OutputTap;
 }
@@ -83,12 +128,14 @@ async fn read_live<R: tokio::io::AsyncRead + Unpin>(
         return Ok(all);
     };
     let mut buf = [0u8; 8192];
+    let mut text = Utf8Chunks::default();
     loop {
         let n = pipe.read(&mut buf).await?;
         if n == 0 {
+            tap.send(&text.finish());
             return Ok(all);
         }
-        tap.send(&String::from_utf8_lossy(&buf[..n]));
+        tap.send(&text.push(&buf[..n]));
         all.extend_from_slice(&buf[..n]);
     }
 }
@@ -112,12 +159,14 @@ pub fn blocking_wait_with_live_output(
                 return Ok(all);
             };
             let mut buf = [0u8; 8192];
+            let mut text = Utf8Chunks::default();
             loop {
                 let n = pipe.read(&mut buf)?;
                 if n == 0 {
+                    tap.send(&text.finish());
                     return Ok(all);
                 }
-                tap.send(&String::from_utf8_lossy(&buf[..n]));
+                tap.send(&text.push(&buf[..n]));
                 all.extend_from_slice(&buf[..n]);
             }
         })
@@ -183,6 +232,35 @@ mod tests {
         let output = blocking_wait_with_live_output(child, Some(tap)).unwrap();
         assert_eq!(String::from_utf8_lossy(&output.stdout), "out\n");
         assert!(seen.lock().unwrap().contains("err\n"));
+    }
+
+    #[test]
+    fn a_character_split_across_reads_arrives_whole() {
+        let text = "ok — 日本 🦀 done";
+        let bytes = text.as_bytes();
+        // Every split point, including inside each multibyte character.
+        for cut in 0..=bytes.len() {
+            let mut chunks = Utf8Chunks::default();
+            let mut out = chunks.push(&bytes[..cut]);
+            out.push_str(&chunks.push(&bytes[cut..]));
+            out.push_str(&chunks.finish());
+            assert_eq!(out, text, "split at byte {cut}");
+        }
+        // One byte at a time.
+        let mut chunks = Utf8Chunks::default();
+        let out: String = bytes.iter().map(|b| chunks.push(&[*b])).collect();
+        assert_eq!(out + &chunks.finish(), text);
+    }
+
+    #[test]
+    fn invalid_bytes_are_replaced_not_held() {
+        let mut chunks = Utf8Chunks::default();
+        // 0xFF never starts a character; 0xE0 0x80 can never be completed.
+        assert_eq!(chunks.push(b"a\xFFb"), "a\u{FFFD}b");
+        assert_eq!(chunks.push(b"c\xE0\x80"), "c\u{FFFD}\u{FFFD}");
+        // A stream that ends mid-character ends with a replacement.
+        assert_eq!(chunks.push(b"\xE6\x97"), "");
+        assert_eq!(chunks.finish(), "\u{FFFD}");
     }
 
     #[test]

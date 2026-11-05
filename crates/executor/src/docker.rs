@@ -1124,19 +1124,27 @@ impl DockerRuntime {
         let mut stdout = String::new();
         let mut stderr = String::new();
         let mut logs = self.docker.logs(&container.id, log_options);
+        // Frames split output wherever the container's writes did, so a
+        // character can straddle two; each stream is decoded as a whole.
+        let mut stdout_text = wrkflw_runtime::live_output::Utf8Chunks::default();
+        let mut stderr_text = wrkflw_runtime::live_output::Utf8Chunks::default();
         // Returns why the stream broke off, if it did.
         let follow = async {
+            let mut problem = None;
             while let Some(log) = logs.next().await {
                 let log = match log {
                     Ok(log) => log,
-                    Err(e) => return Some(e.to_string()),
+                    Err(e) => {
+                        problem = Some(e.to_string());
+                        break;
+                    }
                 };
                 let (text, into) = match log {
                     bollard::container::LogOutput::StdOut { message } => {
-                        (String::from_utf8_lossy(&message).into_owned(), &mut stdout)
+                        (stdout_text.push(&message), &mut stdout)
                     }
                     bollard::container::LogOutput::StdErr { message } => {
-                        (String::from_utf8_lossy(&message).into_owned(), &mut stderr)
+                        (stderr_text.push(&message), &mut stderr)
                     }
                     _ => continue,
                 };
@@ -1145,7 +1153,16 @@ impl DockerRuntime {
                 }
                 into.push_str(&text);
             }
-            None
+            for (text, into) in [
+                (stdout_text.finish(), &mut stdout),
+                (stderr_text.finish(), &mut stderr),
+            ] {
+                if let Some(tap) = &tap {
+                    tap.send(&text);
+                }
+                into.push_str(&text);
+            }
+            problem
         };
         let wait = self
             .docker

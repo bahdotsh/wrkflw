@@ -178,7 +178,7 @@ What a kept workspace means in practice:
 - Files a step writes, including credentials such as `.npmrc` or a kubeconfig, stay in the workspace until the next run overwrites them or you clean it. Use `--fresh-workspace` for jobs where that matters.
 - `wrkflw clean` removes every kept workspace no run is using. Deleting the directory by hand is also safe; each job then starts cold once.
 
-While a step runs, the TUI shows what it prints: the Run tab's Output pane shows the full output, and the Log story shows its last lines.
+While a step runs, the TUI shows what it prints: the Run tab's Output pane shows the full output, and the Log story shows its last lines. Error, warning and notice annotations appear as `Error: …` lines, as on GitHub. Other workflow commands are hidden, and every line is masked before it is shown.
 
 ### Trigger-aware execution
 

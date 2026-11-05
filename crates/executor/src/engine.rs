@@ -3789,8 +3789,9 @@ struct LiveStep {
 const LIVE_LINE_LIMIT: usize = 4096;
 
 /// When a partial line outgrows [`LIVE_LINE_LIMIT`], this much of its end
-/// is held back with the next chunk, so a secret straddling the cut is
-/// still whole when it is masked.
+/// is held back with the next chunk. The line is masked before it is cut,
+/// so only a secret still arriving can straddle the cut, and the held-back
+/// end keeps such a secret whole until the rest of it comes.
 const LIVE_LINE_OVERLAP: usize = 1024;
 
 impl LiveStep {
@@ -3805,7 +3806,7 @@ impl LiveStep {
         let state = Arc::new(LiveLines {
             step: self,
             observers,
-            pending: Mutex::new(String::new()),
+            pending: Mutex::default(),
         });
         let sink = state.clone();
         let tap = wrkflw_runtime::live_output::OutputTap::new(move |chunk| sink.push(chunk));
@@ -3818,54 +3819,86 @@ impl LiveStep {
 struct LiveLines {
     step: LiveStep,
     observers: Vec<Arc<dyn crate::events::ExecutionObserver>>,
-    /// Output after the last newline. Lines are held until complete so a
-    /// secret split across two chunks is still masked.
-    pending: Mutex<String>,
+    pending: Mutex<PendingLine>,
+}
+
+/// Output after the last newline. Lines are held until complete so a
+/// secret split across two chunks is still masked.
+#[derive(Default)]
+struct PendingLine {
+    text: String,
+    /// An `::add-mask::` line outgrew [`LIVE_LINE_LIMIT`] and is being
+    /// dropped up to its newline. Cutting it would show the rest of the line
+    /// as output, and the rest of the line is the value it masks.
+    dropping_command: bool,
 }
 
 impl LiveLines {
     fn push(&self, chunk: &str) {
         let lines = {
             let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-            pending.push_str(chunk);
-            let cut = match pending.rfind(['\n', '\r']) {
+            let mut chunk = chunk;
+            if pending.dropping_command {
+                match chunk.find(['\n', '\r']) {
+                    Some(at) => {
+                        pending.dropping_command = false;
+                        chunk = &chunk[at + 1..];
+                    }
+                    None => return,
+                }
+            }
+            pending.text.push_str(chunk);
+            let cut = match pending.text.rfind(['\n', '\r']) {
                 Some(at) => at + 1,
-                None if pending.len() > LIVE_LINE_LIMIT => {
-                    let mut at = pending.len() - LIVE_LINE_OVERLAP;
-                    while !pending.is_char_boundary(at) {
+                None if pending.text.len() > LIVE_LINE_LIMIT => {
+                    if pending.text.starts_with("::add-mask::") {
+                        pending.text.clear();
+                        pending.dropping_command = true;
+                        return;
+                    }
+                    // Mask the whole line before cutting it, so a secret
+                    // already in it can't end up half on either side.
+                    pending.text = crate::log_redaction::mask(&pending.text);
+                    let mut at = pending.text.len().saturating_sub(LIVE_LINE_OVERLAP);
+                    while !pending.text.is_char_boundary(at) {
                         at -= 1;
                     }
                     at
                 }
                 None => return,
             };
-            let complete: String = pending.drain(..cut).collect();
+            let complete: String = pending.text.drain(..cut).collect();
             complete
         };
         self.send(&lines);
     }
 
     fn flush(&self) {
-        let rest = std::mem::take(&mut *self.pending.lock().unwrap_or_else(|e| e.into_inner()));
+        let rest = {
+            let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+            pending.dropping_command = false;
+            std::mem::take(&mut pending.text)
+        };
         self.send(&rest);
     }
 
     fn send(&self, text: &str) {
         let mut lines: Vec<String> = Vec::new();
         for line in text.split(['\n', '\r']).filter(|line| !line.is_empty()) {
-            // Workflow commands are instructions to the runner, not output.
+            // Workflow commands are instructions to the runner, not output,
+            // though annotations are shown the way GitHub shows them.
             // `::add-mask::` has to take effect here, before the lines after
             // it are masked, not when the step ends: the value is on this
             // very line, and the step may print it again before finishing.
-            if line.starts_with("::") {
-                for command in crate::workflow_commands::parse_workflow_commands(line) {
-                    if let crate::workflow_commands::WorkflowCommand::AddMask { value } = command {
-                        crate::log_redaction::register(&value);
-                    }
-                }
-                continue;
-            }
-            let line = crate::log_redaction::mask(line);
+            // A line that only looks like a command is ordinary output.
+            let line = match crate::workflow_commands::parse_command_line(line.trim_end()) {
+                None => line.to_string(),
+                Some(command) => match live_annotation(command) {
+                    Some(shown) => shown,
+                    None => continue,
+                },
+            };
+            let line = crate::log_redaction::mask(&line);
             lines.push(
                 self.step
                     .workspace_prefixes
@@ -3886,6 +3919,42 @@ impl LiveLines {
             observer.on_event(&event);
         }
     }
+}
+
+/// How a workflow command reads in live output: annotations as GitHub
+/// shows them, and nothing for the rest. Registers `::add-mask::` values.
+fn live_annotation(command: crate::workflow_commands::WorkflowCommand) -> Option<String> {
+    use crate::workflow_commands::WorkflowCommand as C;
+    let (kind, message, file, line, col) = match command {
+        C::AddMask { value } => {
+            crate::log_redaction::register(&value);
+            return None;
+        }
+        C::Error {
+            message,
+            file,
+            line,
+            col,
+            ..
+        } => ("Error", message, file, line, col),
+        C::Warning {
+            message,
+            file,
+            line,
+            col,
+            ..
+        } => ("Warning", message, file, line, col),
+        C::Notice {
+            message,
+            file,
+            line,
+            col,
+            ..
+        } => ("Notice", message, file, line, col),
+        _ => return None,
+    };
+    let loc = format_annotation_location(file.as_deref(), line, col);
+    Some(format!("{kind}: {loc}{message}"))
 }
 
 #[cfg(test)]
@@ -3912,7 +3981,7 @@ mod live_line_tests {
                 workspace_prefixes: Vec::new(),
             },
             observers: vec![seen],
-            pending: Mutex::new(String::new()),
+            pending: Mutex::default(),
         }
     }
 
@@ -3949,6 +4018,54 @@ mod live_line_tests {
         let joined: String = seen.0.lock().unwrap().concat();
         assert!(!joined.contains(head), "half the secret leaked");
         assert!(joined.contains("***"));
+    }
+
+    #[test]
+    fn a_secret_already_buffered_across_the_cut_point_is_masked() {
+        let secret = "live-straddle-sentinel-8c3a"; // 27 bytes
+        crate::log_redaction::register(secret);
+        let seen = Arc::new(Seen::default());
+        let lines = live(seen.clone());
+        // One chunk with no newline, over the limit, whose cut point
+        // (LIVE_LINE_OVERLAP from the end) falls inside the secret.
+        let chunk = format!(
+            "{}{secret}{}",
+            "x".repeat(LIVE_LINE_LIMIT),
+            "y".repeat(LIVE_LINE_OVERLAP - 10)
+        );
+        lines.push(&chunk);
+        lines.flush();
+        let joined: String = seen.0.lock().unwrap().concat();
+        assert!(!joined.contains(&secret[..8]), "the secret's start leaked");
+        assert!(!joined.contains(&secret[8..]), "the secret's end leaked");
+        assert!(joined.contains("***"));
+    }
+
+    #[test]
+    fn an_add_mask_line_too_long_to_hold_is_never_shown() {
+        let seen = Arc::new(Seen::default());
+        let lines = live(seen.clone());
+        let value = "z".repeat(LIVE_LINE_LIMIT + 10);
+        lines.push(&format!("::add-mask::{}", &value[..LIVE_LINE_LIMIT]));
+        lines.push(&format!("{}\nafter\n", &value[LIVE_LINE_LIMIT..]));
+        lines.flush();
+        let seen = seen.0.lock().unwrap();
+        assert_eq!(*seen, vec!["after".to_string()]);
+    }
+
+    #[test]
+    fn annotations_show_and_lookalike_lines_are_output() {
+        let seen = Arc::new(Seen::default());
+        let lines = live(seen.clone());
+        lines.push("::error file=a.rs,line=3::broken\n::warning::careful\n");
+        lines.push("::group::Build\n::endgroup::\n::std::mem::take\n:: plain\n");
+        lines.flush();
+        let seen = seen.0.lock().unwrap();
+        assert_eq!(seen.len(), 4, "{seen:?}");
+        assert!(seen[0].starts_with("Error: ") && seen[0].ends_with("broken"));
+        assert_eq!(seen[1], "Warning: careful");
+        assert_eq!(seen[2], "::std::mem::take");
+        assert_eq!(seen[3], ":: plain");
     }
 }
 

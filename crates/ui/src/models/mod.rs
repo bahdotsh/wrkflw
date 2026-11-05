@@ -148,6 +148,9 @@ pub struct LiveTail {
     pub step: String,
     pub lines: std::collections::VecDeque<String>,
     pub updated: u64,
+    /// The job has finished, so these are its last step's final lines,
+    /// not a step still running.
+    pub finished: bool,
 }
 
 impl LiveTails {
@@ -161,20 +164,29 @@ impl LiveTails {
             tail.step = step.to_string();
             tail.lines.clear();
         }
+        tail.finished = false;
         tail.lines.extend(lines);
         let excess = tail.lines.len().saturating_sub(LIVE_TAIL_LINES);
         tail.lines.drain(..excess);
         tail.updated = self.seq;
     }
 
-    /// The tail to show: `job`'s if it has one, else the newest.
+    /// Mark `job` finished; its tail stays, as what its last step printed.
+    pub fn finish(&mut self, job: &str) {
+        if let Some(tail) = self.jobs.get_mut(job) {
+            tail.finished = true;
+        }
+    }
+
+    /// The tail to show: `job`'s if it has one, else the newest of a job
+    /// still running, else the newest.
     pub fn pick(&self, job: Option<&str>) -> Option<(&str, &LiveTail)> {
         if let Some((name, tail)) = job.and_then(|j| self.jobs.get_key_value(j)) {
             return Some((name.as_str(), tail));
         }
         self.jobs
             .iter()
-            .max_by_key(|(_, tail)| tail.updated)
+            .max_by_key(|(_, tail)| (!tail.finished, tail.updated))
             .map(|(name, tail)| (name.as_str(), tail))
     }
 }
@@ -578,6 +590,21 @@ mod tests {
         assert_eq!(tail.step, "test");
         assert_eq!(tail.lines.len(), LIVE_TAIL_LINES);
         assert_eq!(tail.lines.back().map(String::as_str), Some("509"));
+    }
+
+    #[test]
+    fn a_running_job_is_shown_ahead_of_a_finished_one() {
+        let mut live = LiveTails::default();
+        live.push("lint", 0, "clippy", vec!["Checking a".into()]);
+        live.push("build", 0, "compile", vec!["Finished".into()]);
+        live.finish("build");
+        assert_eq!(live.pick(None).map(|(job, _)| job), Some("lint"));
+        // Asked for by name, a finished job's tail is still there.
+        let (_, tail) = live.pick(Some("build")).unwrap();
+        assert!(tail.finished);
+        // Once everything has finished, the newest tail is shown.
+        live.finish("lint");
+        assert_eq!(live.pick(None).map(|(job, _)| job), Some("build"));
     }
 
     #[test]

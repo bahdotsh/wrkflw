@@ -366,9 +366,10 @@ fn render_output_pane(
         .and_then(|exec| exec.live.pick(selected))
     {
         let title = format!(
-            "Output · {} › {}",
+            "Output · {} › {}{}",
             text::sanitize(job),
-            text::sanitize(&tail.step)
+            text::sanitize(&tail.step),
+            if tail.finished { " · finished" } else { "" }
         );
         let block = theme::block(&title);
         let inner = block.inner(area);

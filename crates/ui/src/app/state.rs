@@ -2682,7 +2682,12 @@ impl App {
                 .and_then(|w| w.execution_details.as_mut())
             {
                 match entry {
-                    crate::models::RunUpdate::Entry(entry) => exec.timeline.push(entry),
+                    crate::models::RunUpdate::Entry(entry) => {
+                        if let crate::models::TimelineEntry::JobFinished { job, .. } = &entry {
+                            exec.live.finish(job);
+                        }
+                        exec.timeline.push(entry);
+                    }
                     crate::models::RunUpdate::Output {
                         job,
                         index,
@@ -4269,6 +4274,50 @@ mod tests {
             .timeline;
         assert_eq!(timeline, &vec![entry("build")]);
         assert!(app.workflows[1].execution_details.is_none());
+    }
+
+    #[test]
+    fn live_output_reaches_its_job_and_is_marked_finished_with_it() {
+        let mut app = make_app();
+        app.execution_queue.push(QueuedExecution {
+            workflow_idx: 0,
+            target_job: None,
+        });
+        app.get_next_workflow_to_execute();
+        let generation = app.run_generation;
+        let send = |app: &App, update| app.timeline_tx.send((0, generation, update)).unwrap();
+        send(
+            &app,
+            crate::models::RunUpdate::Output {
+                job: "build".into(),
+                index: 0,
+                step: "compile".into(),
+                lines: vec!["Compiling a".into()],
+            },
+        );
+        app.drain_timeline();
+        let live = |app: &App| {
+            let exec = app.workflows[0].execution_details.as_ref().unwrap();
+            let tail = &exec.live.jobs["build"];
+            (
+                tail.lines.iter().cloned().collect::<Vec<_>>(),
+                tail.finished,
+            )
+        };
+        assert_eq!(live(&app), (vec!["Compiling a".to_string()], false));
+
+        send(
+            &app,
+            crate::models::RunUpdate::Entry(crate::models::TimelineEntry::JobFinished {
+                job: "build".into(),
+                status: wrkflw_executor::JobStatus::Success,
+                failure_allowed: false,
+                duration_ms: 10,
+                repeated_from: None,
+            }),
+        );
+        app.drain_timeline();
+        assert_eq!(live(&app), (vec!["Compiling a".to_string()], true));
     }
 
     #[test]

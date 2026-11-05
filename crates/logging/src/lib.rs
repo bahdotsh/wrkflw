@@ -3,7 +3,7 @@ pub mod symbols;
 use chrono::Local;
 use once_cell::sync::Lazy;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 // Thread-safe log storage
 static LOGS: Lazy<Arc<Mutex<Vec<String>>>> = Lazy::new(|| Arc::new(Mutex::new(Vec::new())));
@@ -23,6 +23,26 @@ static CONSOLE_TO_STDERR: AtomicBool = AtomicBool::new(false);
 /// server, where stdout is a protocol.
 pub fn set_console_to_stderr(enabled: bool) {
     CONSOLE_TO_STDERR.store(enabled, Ordering::Relaxed);
+}
+
+/// Rewrites a message before it is stored or printed. Installed once by the
+/// executor, which knows the secret values a run can read.
+type Redactor = Box<dyn Fn(&str) -> String + Send + Sync>;
+
+static REDACTOR: OnceLock<Redactor> = OnceLock::new();
+
+/// Install the function every log message passes through before it is
+/// stored or printed, so secret values never reach a log. Only the first
+/// call wins; later calls return `false` and change nothing.
+pub fn set_redactor(redactor: impl Fn(&str) -> String + Send + Sync + 'static) -> bool {
+    REDACTOR.set(Box::new(redactor)).is_ok()
+}
+
+fn redact(message: &str) -> std::borrow::Cow<'_, str> {
+    match REDACTOR.get() {
+        Some(redactor) => std::borrow::Cow::Owned(redactor(message)),
+        None => std::borrow::Cow::Borrowed(message),
+    }
 }
 
 // Log levels
@@ -76,6 +96,7 @@ pub fn log(level: LogLevel, message: &str) {
     let timestamp = Local::now().format("%H:%M:%S").to_string();
 
     // Always include timestamp in [HH:MM:SS] format to ensure consistency
+    let message = redact(message);
     let formatted = format!("[{}] {} {}", timestamp, level.prefix(), message);
 
     if let Ok(mut logs) = LOGS.lock() {
@@ -138,4 +159,21 @@ pub fn warning(message: &str) {
 
 pub fn error(message: &str) {
     log(LogLevel::Error, message);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redactor_masks_stored_logs() {
+        assert!(set_redactor(|m| m.replace("hunter2-sentinel", "***")));
+        set_quiet_mode(true);
+        info("password=hunter2-sentinel");
+        let logs = get_logs();
+        assert!(logs.iter().any(|l| l.ends_with("password=***")));
+        assert!(!logs.iter().any(|l| l.contains("hunter2-sentinel")));
+        // The first redactor stays in place.
+        assert!(!set_redactor(|m| m.to_string()));
+    }
 }

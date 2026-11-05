@@ -123,7 +123,141 @@ pub struct WorkflowExecution {
     pub start_time: chrono::DateTime<Local>,
     pub end_time: Option<chrono::DateTime<Local>>,
     pub progress: f64, // 0.0 - 1.0 for progress bar
+    /// The run as it happened, from the executor's events.
+    pub timeline: Vec<TimelineEntry>,
 }
+
+impl WorkflowExecution {
+    /// Wall time of each finished job, keyed by its workflow key. A matrix
+    /// job's entries ran side by side, so the key keeps the slowest.
+    pub fn job_durations_ms(&self) -> std::collections::HashMap<String, u64> {
+        let mut canonical = std::collections::HashMap::new();
+        let mut out: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+        for entry in &self.timeline {
+            match entry {
+                TimelineEntry::JobStarted {
+                    job,
+                    canonical_name,
+                } => {
+                    canonical.insert(job.as_str(), canonical_name.as_str());
+                }
+                TimelineEntry::JobFinished {
+                    job, duration_ms, ..
+                } => {
+                    let key = canonical.get(job.as_str()).copied().unwrap_or(job.as_str());
+                    let slot = out.entry(key.to_string()).or_default();
+                    *slot = (*slot).max(*duration_ms);
+                }
+                TimelineEntry::StepFinished { .. } => {}
+            }
+        }
+        out
+    }
+}
+
+/// Lines of a failed step's output kept in the timeline.
+pub const TIMELINE_FAILURE_TAIL: usize = 6;
+
+/// One line of a run's story, built from the executor's events. Every text
+/// field is already masked by the executor.
+#[derive(Clone, Debug, PartialEq)]
+pub enum TimelineEntry {
+    JobStarted {
+        job: String,
+        canonical_name: String,
+    },
+    StepFinished {
+        job: String,
+        step: String,
+        status: StepStatus,
+        exit_code: Option<i32>,
+        duration_ms: u64,
+        /// The end of the output, kept only when the step failed.
+        tail: Vec<String>,
+    },
+    JobFinished {
+        job: String,
+        status: JobStatus,
+        failure_allowed: bool,
+        duration_ms: u64,
+    },
+}
+
+impl TimelineEntry {
+    /// The entry for `event`, or `None` for events the story leaves out.
+    pub fn from_event(event: &wrkflw_executor::ExecutionEvent) -> Option<Self> {
+        use wrkflw_executor::ExecutionEvent as E;
+        match event {
+            E::JobStarted {
+                job,
+                canonical_name,
+            } => Some(TimelineEntry::JobStarted {
+                job: job.clone(),
+                canonical_name: canonical_name.clone(),
+            }),
+            E::StepStarted { .. } => None,
+            E::StepFinished {
+                job,
+                step,
+                status,
+                exit_code,
+                duration_ms,
+                output,
+                ..
+            } => Some(TimelineEntry::StepFinished {
+                job: job.clone(),
+                step: step.clone(),
+                status: *status,
+                exit_code: *exit_code,
+                duration_ms: *duration_ms,
+                tail: if *status == StepStatus::Failure {
+                    failure_tail(output)
+                } else {
+                    Vec::new()
+                },
+            }),
+            E::JobFinished {
+                job,
+                status,
+                failure_allowed,
+                duration_ms,
+                ..
+            } => Some(TimelineEntry::JobFinished {
+                job: job.clone(),
+                status: status.clone(),
+                failure_allowed: *failure_allowed,
+                duration_ms: *duration_ms,
+            }),
+        }
+    }
+}
+
+/// The last few non-blank lines the step itself printed, which is where a
+/// failure explains itself. wrkflw reports the exit code and the script
+/// ahead of the output, under headers, and that preamble is left out.
+fn failure_tail(output: &str) -> Vec<String> {
+    use wrkflw_executor::{EXIT_CODE_LABEL, STDERR_HEADER, STDOUT_HEADER};
+    let all: Vec<&str> = output.lines().map(str::trim_end).collect();
+    let is_header = |l: &str| l == STDOUT_HEADER || l == STDERR_HEADER;
+    let start = match all.iter().position(|l| is_header(l)) {
+        Some(header) => header + 1,
+        // Only the preamble: the step printed nothing.
+        None if all.first().is_some_and(|l| l.starts_with(EXIT_CODE_LABEL)) => all.len(),
+        None => 0,
+    };
+    let lines: Vec<&str> = all[start..]
+        .iter()
+        .copied()
+        .filter(|l| !l.trim().is_empty() && !is_header(l))
+        .collect();
+    lines[lines.len().saturating_sub(TIMELINE_FAILURE_TAIL)..]
+        .iter()
+        .map(|l| l.to_string())
+        .collect()
+}
+
+/// A timeline entry for the workflow at the index.
+pub type TimelineMsg = (usize, TimelineEntry);
 
 /// Job execution details
 pub struct JobExecution {
@@ -175,6 +309,9 @@ pub enum LogBadge {
     /// Active work. Rendered `INFO` with the info accent.
     Running,
     Trigger,
+    /// Logged at debug level: executor diagnostics, hidden unless the TUI
+    /// was started with `--verbose`.
+    Debug,
     /// Everything else. Also rendered `INFO`, but dimmed.
     Plain,
 }
@@ -182,7 +319,16 @@ pub enum LogBadge {
 impl LogBadge {
     /// Classify a raw log line, timestamp prefix and all.
     pub fn classify(log: &str) -> Self {
-        if log.contains("Error") || log.contains("error") || log.contains(symbols::FAILURE) {
+        // The level glyph wrkflw_logging writes after the timestamp wins
+        // over keywords: a diagnostic that mentions an error is still a
+        // diagnostic.
+        let level_glyph = log
+            .strip_prefix('[')
+            .and_then(|rest| rest.split_once("] "))
+            .map(|(_, body)| body);
+        if level_glyph.is_some_and(|body| body.starts_with(symbols::DEBUG)) {
+            LogBadge::Debug
+        } else if log.contains("Error") || log.contains("error") || log.contains(symbols::FAILURE) {
             LogBadge::Error
         } else if log.contains("Warning")
             || log.contains("warning")
@@ -214,6 +360,7 @@ impl LogBadge {
             LogBadge::Success => "SUCCESS",
             LogBadge::Running | LogBadge::Plain => "INFO",
             LogBadge::Trigger => "TRIG",
+            LogBadge::Debug => "DEBUG",
         }
     }
 
@@ -285,6 +432,99 @@ impl LogFilterLevel {
 mod tests {
     use super::*;
 
+    #[test]
+    fn debug_lines_are_classified_by_their_level_glyph() {
+        let line = format!("[12:00:00] {} Failed command: error", symbols::DEBUG);
+        assert_eq!(LogBadge::classify(&line), LogBadge::Debug);
+        assert!(!LogFilterLevel::Info.matches(&line));
+        assert!(!LogFilterLevel::Error.matches(&line));
+        let info = format!("[12:00:00] {} build failed with an error", symbols::INFO);
+        assert_eq!(LogBadge::classify(&info), LogBadge::Error);
+    }
+
+    fn step_event(status: StepStatus, output: &str) -> wrkflw_executor::ExecutionEvent {
+        wrkflw_executor::ExecutionEvent::StepFinished {
+            job: "build (os: a)".into(),
+            step: "test".into(),
+            index: 0,
+            status,
+            outcome: status,
+            conclusion: status,
+            exit_code: Some(1),
+            duration_ms: 1500,
+            output: output.into(),
+            command: None,
+            uses: None,
+            env_set: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn timeline_keeps_the_tail_of_failed_steps_only() {
+        let output = (1..=10)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let Some(TimelineEntry::StepFinished { tail, .. }) =
+            TimelineEntry::from_event(&step_event(StepStatus::Failure, &output))
+        else {
+            panic!("a step event becomes a step entry");
+        };
+        assert_eq!(tail.len(), TIMELINE_FAILURE_TAIL);
+        assert_eq!(tail.last().map(String::as_str), Some("line 10"));
+        let Some(TimelineEntry::StepFinished { tail, .. }) =
+            TimelineEntry::from_event(&step_event(StepStatus::Success, &output))
+        else {
+            panic!("a step event becomes a step entry");
+        };
+        assert!(tail.is_empty());
+    }
+
+    #[test]
+    fn failure_tail_keeps_only_what_the_step_printed() {
+        let output = "Exit code: 1\nCommand: make test\nmake test\nStandard Output:\nok 1\nStandard Error:\nboom\n";
+        let Some(TimelineEntry::StepFinished { tail, .. }) =
+            TimelineEntry::from_event(&step_event(StepStatus::Failure, output))
+        else {
+            panic!("a step event becomes a step entry");
+        };
+        assert_eq!(tail, vec!["ok 1".to_string(), "boom".to_string()]);
+        let silent = "Exit code: 1\nCommand: false\nfalse\n";
+        let Some(TimelineEntry::StepFinished { tail, .. }) =
+            TimelineEntry::from_event(&step_event(StepStatus::Failure, silent))
+        else {
+            panic!("a step event becomes a step entry");
+        };
+        assert!(tail.is_empty());
+    }
+
+    #[test]
+    fn job_durations_take_the_slowest_matrix_entry_per_job_key() {
+        let started = |job: &str| TimelineEntry::JobStarted {
+            job: job.into(),
+            canonical_name: "build".into(),
+        };
+        let finished = |job: &str, ms| TimelineEntry::JobFinished {
+            job: job.into(),
+            status: JobStatus::Success,
+            failure_allowed: false,
+            duration_ms: ms,
+        };
+        let exec = WorkflowExecution {
+            jobs: Vec::new(),
+            start_time: Local::now(),
+            end_time: None,
+            progress: 0.0,
+            timeline: vec![
+                started("build (os: a)"),
+                started("build (os: b)"),
+                finished("build (os: a)", 900),
+                finished("build (os: b)", 2_500),
+            ],
+        };
+        assert_eq!(exec.job_durations_ms().get("build"), Some(&2_500));
+    }
+
     /// The invariant this type exists to hold: whatever badge the log pane
     /// draws, the filter named after that badge must show the line.
     /// Before `LogFilterLevel` classified through `LogBadge`, the two kept
@@ -348,6 +588,9 @@ mod tests {
                     LogBadge::Success => "SUCCESS",
                     LogBadge::Trigger => "TRIGGER",
                     LogBadge::Running | LogBadge::Plain => "INFO",
+                    // Debug lines are shown only by `All`, never one of
+                    // these, and the cases above carry no debug glyph.
+                    LogBadge::Debug => unreachable!("{line:?} is a debug line"),
                 },
                 "{:?} is badged {} but shown by the {} filter",
                 line,

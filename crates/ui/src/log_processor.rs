@@ -58,6 +58,8 @@ pub struct LogProcessingRequest {
     // dropped per new one), so a count would freeze the display.
     pub app_logs_revision: u64,
     pub system_logs_count: usize, // To detect changes in system logs (unbounded, so len works)
+    /// Keep debug-level lines. Off unless the TUI runs with `--verbose`.
+    pub show_debug: bool,
 }
 
 /// Response with processed logs
@@ -179,6 +181,9 @@ impl LogProcessor {
         let mut search_matches = Vec::new();
 
         for (idx, log) in all_logs.iter().enumerate() {
+            if !request.show_debug && LogBadge::classify(log) == LogBadge::Debug {
+                continue;
+            }
             let passes_filter = match &request.filter_level {
                 None => true,
                 Some(level) => level.matches(log),

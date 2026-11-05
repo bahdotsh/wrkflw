@@ -99,7 +99,7 @@ fn session_from(get: impl Fn(&str) -> Option<String>) -> Option<String> {
     get(env::CLAUDE_CODE_SESSION).or_else(|| get(env::CODEX_THREAD))
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct RunOptions {
     pub meta: RunMeta,
     /// Write NDJSON events to stdout.
@@ -107,6 +107,21 @@ pub struct RunOptions {
     /// Keep a history record. Also subject to `WRKFLW_NO_HISTORY`.
     pub record: bool,
     pub from_step: Option<FromStep>,
+    /// Also receive the run's events, after the recorder. The TUI uses this
+    /// to tell the run as it happens.
+    pub observers: Vec<Arc<dyn ExecutionObserver>>,
+}
+
+impl std::fmt::Debug for RunOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RunOptions")
+            .field("meta", &self.meta)
+            .field("ndjson", &self.ndjson)
+            .field("record", &self.record)
+            .field("from_step", &self.from_step)
+            .field("observers", &self.observers.len())
+            .finish()
+    }
 }
 
 pub struct RecordedRun {
@@ -554,8 +569,10 @@ pub async fn execute_recorded(
     options: RunOptions,
 ) -> RecordedRun {
     let recorder = begin(path, &config, &options).await;
+    let mut observers: Vec<Arc<dyn ExecutionObserver>> = vec![recorder.clone()];
+    observers.extend(options.observers.iter().cloned());
     let hooks = RunHooks {
-        observers: vec![recorder.clone()],
+        observers,
         from_step: options.from_step.clone(),
     };
     let result = with_run_hooks(hooks, wrkflw_executor::execute_workflow(path, config)).await;

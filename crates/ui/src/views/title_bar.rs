@@ -18,7 +18,7 @@ pub const TAB_LABELS: [&str; 8] = [
     "DAG",
     "Logs",
     "Trigger",
-    "Secrets",
+    "Setup",
     "Runs",
     "Help",
 ];

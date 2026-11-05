@@ -189,7 +189,14 @@ fn context_hints(app: &App) -> Vec<(&'static str, &'static str)> {
             ("Enter", "open run"),
         ],
         TAB_LOGS if app.log_search_active => vec![("Enter", "keep"), ("Esc", "cancel")],
+        TAB_LOGS if app.log_story => vec![
+            ("o", "raw log"),
+            ("↑↓", "scroll"),
+            ("End", "follow"),
+            ("s", "search raw"),
+        ],
         TAB_LOGS => vec![
+            ("o", "story"),
             ("s", "search"),
             ("f", "filter"),
             ("n", "next match"),
@@ -208,7 +215,7 @@ fn context_hints(app: &App) -> Vec<(&'static str, &'static str)> {
             ("+", "input"),
             ("c", "copy curl"),
         ],
-        TAB_SECRETS => vec![("↑↓", "provider"), ("e", "runtime"), ("?", "help")],
+        TAB_SECRETS => vec![("e", "cycle runtime"), ("↑↓", "provider"), ("?", "help")],
         TAB_RUNS => vec![("↑↓", "select"), ("?", "help")],
         TAB_HELP => vec![("↑↓", "scroll"), ("q", "quit")],
         _ => vec![],

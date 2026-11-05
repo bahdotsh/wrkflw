@@ -12,7 +12,7 @@ use ratatui::{
 };
 use wrkflw_runs::{RunRecord, RunStatus};
 
-fn status_glyph(status: RunStatus) -> (&'static str, ratatui::style::Color) {
+pub(crate) fn status_glyph(status: RunStatus) -> (&'static str, ratatui::style::Color) {
     match status {
         RunStatus::Success => (theme::symbols::SUCCESS, COLORS.success),
         RunStatus::Failure => (theme::symbols::FAILURE, COLORS.error),
@@ -33,7 +33,7 @@ fn text_status(status: &str) -> (&'static str, ratatui::style::Color) {
     }
 }
 
-fn when(started_at: &str) -> String {
+pub(crate) fn when(started_at: &str) -> String {
     chrono::DateTime::parse_from_rfc3339(started_at)
         .map(|t| {
             let local = t.with_timezone(&chrono::Local);
@@ -46,7 +46,7 @@ fn when(started_at: &str) -> String {
         .unwrap_or_default()
 }
 
-fn duration(ms: Option<u64>) -> String {
+pub(crate) fn duration(ms: Option<u64>) -> String {
     ms.map(|ms| {
         if ms < 1000 {
             format!("{ms}ms")

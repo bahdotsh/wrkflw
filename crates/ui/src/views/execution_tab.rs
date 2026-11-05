@@ -106,11 +106,19 @@ fn render_summary_strip(f: &mut Frame<'_>, app: &App, workflow: &Workflow, area:
             .signed_duration_since(exec.start_time)
             .num_seconds()
             .max(0);
+        right.push(Span::styled("started ", theme::muted_style()));
         right.push(Span::styled(
             exec.start_time.format("%H:%M:%S").to_string(),
+            Style::default().fg(COLORS.text_dim),
+        ));
+        right.push(Span::styled(
+            if exec.end_time.is_some() {
+                " · took "
+            } else {
+                " · running "
+            },
             theme::muted_style(),
         ));
-        right.push(Span::styled("  ", theme::muted_style()));
         right.push(Span::styled(
             format_duration(secs),
             Style::default().fg(COLORS.text_dim),
@@ -164,6 +172,16 @@ fn render_summary_strip(f: &mut Frame<'_>, app: &App, workflow: &Workflow, area:
         Paragraph::new(Line::from(shown_right)).alignment(Alignment::Right),
         chunks[1],
     );
+}
+
+/// A step or job duration: milliseconds under a second, tenths under a
+/// minute, then the coarser `format_duration`.
+pub(crate) fn format_ms(ms: u64) -> String {
+    match ms {
+        ms if ms < 1000 => format!("{ms}ms"),
+        ms if ms < 60_000 => format!("{:.1}s", ms as f64 / 1000.0),
+        ms => format_duration((ms / 1000) as i64),
+    }
 }
 
 pub(crate) fn format_duration(secs: i64) -> String {

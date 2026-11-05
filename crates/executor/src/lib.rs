@@ -16,6 +16,7 @@ pub mod expression;
 pub mod github_env_files;
 pub(crate) mod job_session;
 pub mod kubernetes;
+pub(crate) mod log_redaction;
 pub mod podman;
 pub mod substitution;
 pub(crate) mod workflow_commands;

@@ -104,6 +104,7 @@ fn execution(jobs: usize, steps: usize) -> WorkflowExecution {
         start_time: chrono::Local::now() - chrono::Duration::seconds(3725),
         end_time: None,
         progress: 0.42,
+        timeline: Vec::new(),
     }
 }
 

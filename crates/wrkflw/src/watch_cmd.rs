@@ -179,6 +179,7 @@ pub(crate) async fn run(ctx: WatchCtx) {
         ndjson: json_output,
         record: true,
         from_step: None,
+        observers: Vec::new(),
     };
 
     let watcher_cfg = wrkflw_watcher::WatcherConfig::new(workflow_dir, repo_root, config)

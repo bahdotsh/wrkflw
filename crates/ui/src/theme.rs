@@ -489,6 +489,30 @@ pub fn scrollbar(f: &mut Frame<'_>, area: Rect, total: usize, position: usize, v
     );
 }
 
+/// Opens a modal: mutes everything already drawn, then clears and returns
+/// a `width`×`height` rect centred on the screen, shrunk to fit. Muting the
+/// colours rather than relying on the terminal's dim attribute keeps the
+/// backdrop consistent across terminals and in both palettes.
+pub fn modal(f: &mut Frame<'_>, width: u16, height: u16) -> Rect {
+    let screen = f.area();
+    f.buffer_mut().set_style(
+        screen,
+        Style::default()
+            .fg(COLORS.border)
+            .remove_modifier(Modifier::BOLD),
+    );
+    let area = screen.centered(
+        ratatui::layout::Constraint::Length(width.min(screen.width)),
+        ratatui::layout::Constraint::Length(height.min(screen.height)),
+    );
+    f.render_widget(ratatui::widgets::Clear, area);
+    f.render_widget(
+        ratatui::widgets::Paragraph::new("").style(Style::default().bg(COLORS.bg_panel)),
+        area,
+    );
+    area
+}
+
 /// Centred, muted message for a pane with nothing to show yet.
 pub fn empty_state(f: &mut Frame<'_>, area: Rect, title: &str, hint: Vec<Span<'_>>) {
     let top = area.height.saturating_sub(2) / 2;

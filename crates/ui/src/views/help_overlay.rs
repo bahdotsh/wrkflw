@@ -7,7 +7,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Clear, Paragraph},
+    widgets::Paragraph,
     Frame,
 };
 
@@ -33,10 +33,11 @@ fn sections() -> Vec<Section> {
         (
             "Workflows",
             vec![
-                (k("Space"), "select or unselect"),
-                (k("a / n"), "select all / none"),
+                (k("Space"), "check or uncheck"),
+                (k("a / n"), "check all / none"),
                 (k("Enter"), "run the highlighted workflow"),
-                (k("r"), "run the selection"),
+                (k("r"), "run checked, else highlighted"),
+                (k("Home / End"), "first / last workflow"),
                 (k("Shift+J"), "pick one job to run"),
                 (k("Shift+R"), "reset statuses"),
                 (k("t"), "trigger on GitHub / GitLab"),
@@ -49,6 +50,7 @@ fn sections() -> Vec<Section> {
             "Execution",
             vec![
                 (k("↑↓"), "choose a job"),
+                (k("Home / End"), "first / last job"),
                 (k("Enter"), "inspect its steps"),
                 (k("Tab"), "Output ↔ Matrix (inspector)"),
                 (k("PgUp / PgDn"), "scroll step output"),
@@ -67,7 +69,8 @@ fn sections() -> Vec<Section> {
         (
             "Logs",
             vec![
-                (k("s"), "search"),
+                (k("o"), "story ↔ raw log"),
+                (k("s"), "search the raw log"),
                 (k("n / ↑↓"), "next / previous match"),
                 (k("f"), "filter by level"),
                 (k("c"), "clear search and filter"),
@@ -87,6 +90,20 @@ fn sections() -> Vec<Section> {
                 (k("Enter"), "dispatch / finish editing"),
                 (k("Esc"), "stop editing"),
                 (k("c"), "copy the curl command to Logs"),
+            ],
+        ),
+        (
+            "Setup",
+            vec![
+                (k("e"), "cycle runtime (works on any tab)"),
+                (k("↑↓"), "secret provider"),
+            ],
+        ),
+        (
+            "Runs",
+            vec![
+                (k("↑↓"), "choose a run"),
+                (k("Home / End"), "newest / oldest"),
             ],
         ),
         (
@@ -181,23 +198,15 @@ pub fn render_help_content(f: &mut Frame<'_>, area: Rect, scroll: &mut usize) {
 /// Help floating over whatever screen is open.
 pub fn render_help_overlay(f: &mut Frame<'_>, scroll: &mut usize) {
     let screen = f.area();
-    let area = if screen.width < 60 || screen.height < 16 {
-        screen
+    let (width, height) = if screen.width < 60 || screen.height < 16 {
+        (screen.width, screen.height)
     } else {
-        let width = (screen.width * 9 / 10).min(110);
-        let height = (screen.height * 9 / 10).min(36);
-        Rect::new(
-            screen.x + (screen.width - width) / 2,
-            screen.y + (screen.height - height) / 2,
-            width,
-            height,
+        (
+            (screen.width * 9 / 10).min(120),
+            (screen.height * 9 / 10).min(38),
         )
     };
-    f.render_widget(Clear, area);
-    f.render_widget(
-        Paragraph::new("").style(Style::default().bg(COLORS.bg_panel)),
-        area,
-    );
+    let area = theme::modal(f, width, height);
     render_help_content(f, area, scroll);
     // A muted close hint along the bottom border.
     if area.height > 2 && area.width > 20 {

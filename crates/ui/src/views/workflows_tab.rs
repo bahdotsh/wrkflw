@@ -285,6 +285,16 @@ fn render_preview(f: &mut Frame<'_>, app: &App, area: Rect) {
             lines.push(Line::from(badges));
         }
 
+        if let Some(run) = app
+            .workflow_list_state
+            .selected()
+            .and_then(|i| app.last_run(i))
+        {
+            lines.push(Line::from(""));
+            lines.push(theme::section("Last run"));
+            lines.push(last_run_line(run, w));
+        }
+
         let levels = crate::components::dag::topo_levels(def);
         if !levels.is_empty() {
             lines.push(Line::from(""));
@@ -349,7 +359,7 @@ fn render_preview(f: &mut Frame<'_>, app: &App, area: Rect) {
 }
 
 fn render_trigger_filter(f: &mut Frame<'_>, app: &App, area: Rect) {
-    let block = theme::block_focused("Trigger filter");
+    let block = theme::block_focused("Diff filter");
     let inner_area = block.inner(area);
     f.render_widget(block, area);
 
@@ -474,4 +484,40 @@ fn render_job_selection(f: &mut Frame<'_>, app: &mut App, area: Rect) {
         .with_selected(Some(app.selected_job_index.min(total.saturating_sub(1))));
     f.render_stateful_widget(jobs_table, area, &mut table_state);
     theme::scrollbar(f, area, total, table_state.offset(), inner.height as usize);
+}
+
+/// One line about a recorded run: outcome, when, how long, and the first
+/// job that failed.
+fn last_run_line(run: &wrkflw_runs::RunRecord, w: usize) -> Line<'static> {
+    use crate::views::runs_tab::{duration, status_glyph, when};
+    let (glyph, color) = status_glyph(run.status);
+    let mut spans = vec![
+        Span::styled(format!("{glyph} "), Style::default().fg(color)),
+        Span::styled(
+            run.status.as_str().to_string(),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
+    ];
+    let mut facts = vec![when(&run.started_at)];
+    let took = duration(run.duration_ms);
+    if !took.is_empty() {
+        facts.push(took);
+    }
+    if let Some(job) = run
+        .jobs
+        .iter()
+        .find(|j| j.status == "failure" && !j.failure_allowed)
+    {
+        facts.push(format!("in {}", job.name));
+    }
+    for fact in facts.into_iter().filter(|f| !f.is_empty()) {
+        spans.push(Span::styled(" · ", theme::muted_style()));
+        spans.push(Span::styled(fact, Style::default().fg(COLORS.text_dim)));
+    }
+    let mut fitted = text::fit_spans(spans, w);
+    // Drop the padding: the line sits in a paragraph, not a column.
+    if fitted.last().is_some_and(|s| s.content.trim().is_empty()) {
+        fitted.pop();
+    }
+    Line::from(fitted)
 }

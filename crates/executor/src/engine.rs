@@ -429,6 +429,7 @@ async fn execute_gitlab_pipeline(
     // `--variable` values are often credentials, and they are never stored
     // on purpose, so they can't be left to reach the step logs either.
     secret_masker.add_secrets(config.variables.values().cloned());
+    crate::log_redaction::register_all(config.variables.values());
 
     // Create artifact store for this pipeline run
     let artifact_store =
@@ -2612,6 +2613,9 @@ async fn execute_job_with_matrix(
             masker.add_secret(value);
         }
     }
+    // Runtimes log commands and environments through the global logger,
+    // which this job's values must not reach either.
+    crate::log_redaction::register_all(secrets_context.values());
 
     if !job.services.is_empty() && job_session::wanted_for(job, runtime).is_none() {
         wrkflw_logging::warning(&format!(
@@ -3731,6 +3735,7 @@ fn process_workflow_commands(
                 wrkflw_logging::debug(&format!("[debug] {}", message));
             }
             crate::workflow_commands::WorkflowCommand::AddMask { value } => {
+                crate::log_redaction::register(&value);
                 if let Some(masker) = secret_masker {
                     masker.add_secret(value);
                 }

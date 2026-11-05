@@ -11,7 +11,7 @@ A command-line tool for validating and executing GitHub Actions workflows locall
 
 ## Features
 
-- **TUI interface** — interactive terminal UI with Workflows, Execution, DAG, Logs, Trigger, Secrets, Runs, and Help tabs
+- **TUI interface** — interactive terminal UI with Workflows, Execution, DAG, Logs, Trigger, Setup, Runs, and Help tabs
 - **Workflow validation** — syntax checks, structural validation, and composite action input cross-checking with CI/CD-friendly exit codes
 - **Local execution** — Docker, Podman, emulation, or sandboxed **secure emulation** (no containers)
 - **Kubernetes execution** — run each step as a pod in your own cluster, with node selectors and GPU resource requests
@@ -280,7 +280,7 @@ wrkflw tui --theme light
 
 The TUI follows your terminal's background and uses a light or dark palette to match. Set `--theme` or `WRKFLW_THEME` to `auto`, `dark` or `light` to override it. The theme is chosen at startup, so restart the TUI after switching your terminal's theme.
 
-**Tabs:** Workflows · Execution · DAG · Logs · Trigger · Secrets · Runs · Help.
+**Tabs:** Workflows · Execution · DAG · Logs · Trigger · Setup (runtime and secret providers) · Runs · Help.
 
 **Controls:**
 

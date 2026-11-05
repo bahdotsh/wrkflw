@@ -222,6 +222,7 @@ pub(crate) async fn run(ctx: RunCtx) {
         ndjson: format.is_json(),
         record: !ctx.no_record,
         from_step,
+        observers: Vec::new(),
     };
 
     if is_gitlab && (ctx.reuse_results || ctx.job_container || ctx.dep_cache) {

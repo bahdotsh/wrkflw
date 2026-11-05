@@ -14,7 +14,7 @@ use ratatui::{
     widgets::Paragraph,
     Frame,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use wrkflw_parser::workflow::WorkflowDefinition;
 
@@ -92,6 +92,78 @@ pub fn render_dag_tab(f: &mut Frame<'_>, app: &mut App, area: Rect) {
     app.dag_scroll = scroll;
 }
 
+/// How long each finished job took, and the chain of dependent jobs that
+/// set the run's length.
+struct Timing {
+    durations: HashMap<String, u64>,
+    critical: HashSet<String>,
+}
+
+impl Timing {
+    fn of(workflow: &Workflow, def: &WorkflowDefinition, levels: &[Vec<String>]) -> Self {
+        let durations = workflow
+            .execution_details
+            .as_ref()
+            .map(|e| e.job_durations_ms())
+            .unwrap_or_default();
+        let critical = critical_path(def, levels, &durations);
+        Timing {
+            durations,
+            critical,
+        }
+    }
+
+    /// Wall time of a stage: its jobs run side by side, so the slowest.
+    fn stage_ms(&self, layer: &[String]) -> Option<u64> {
+        layer
+            .iter()
+            .filter_map(|j| self.durations.get(j))
+            .max()
+            .copied()
+    }
+}
+
+/// The longest chain through `needs`, weighted by how long each job took.
+/// Empty until the run has timings, and for single-stage workflows, where
+/// every job is trivially on it.
+fn critical_path(
+    def: &WorkflowDefinition,
+    levels: &[Vec<String>],
+    durations: &HashMap<String, u64>,
+) -> HashSet<String> {
+    if durations.is_empty() || levels.len() < 2 {
+        return HashSet::new();
+    }
+    // Levels are topological, so every job's needs are scored before it.
+    let mut best: HashMap<&str, (u64, Option<&str>)> = HashMap::new();
+    for job in levels.iter().flatten() {
+        let own = durations.get(job).copied().unwrap_or(0);
+        let before = def
+            .jobs
+            .get(job)
+            .and_then(|j| j.needs.as_ref())
+            .into_iter()
+            .flatten()
+            .filter_map(|n| best.get(n.as_str()).map(|(t, _)| (*t, n.as_str())))
+            .max_by_key(|(t, _)| *t);
+        let (t, prev) = match before {
+            Some((t, n)) => (t + own, Some(n)),
+            None => (own, None),
+        };
+        best.insert(job.as_str(), (t, prev));
+    }
+    let mut path = HashSet::new();
+    let mut at = best
+        .iter()
+        .max_by_key(|(name, (t, _))| (*t, std::cmp::Reverse(*name)))
+        .map(|(name, _)| *name);
+    while let Some(job) = at {
+        path.insert(job.to_string());
+        at = best.get(job).and_then(|(_, prev)| *prev);
+    }
+    path
+}
+
 fn matrix_suffix(labels: &MatrixLabels, job: &str) -> String {
     labels
         .get(job)
@@ -158,6 +230,7 @@ fn render_graph(
     }
     f.render_widget(theme::with_badge(block, badge), area);
 
+    let timing = Timing::of(workflow, def, levels);
     let max_cards = (inner.height.saturating_sub(2) / CARD_H).max(1) as usize;
     for (col, (li, layer)) in levels
         .iter()
@@ -180,6 +253,13 @@ fn render_graph(
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(format!("  {}", layer.len()), theme::muted_style()),
+                Span::styled(
+                    timing
+                        .stage_ms(layer)
+                        .map(|ms| format!(" · {}", crate::views::execution_tab::format_ms(ms)))
+                        .unwrap_or_default(),
+                    Style::default().fg(COLORS.text_dim),
+                ),
             ])),
             head,
         );
@@ -196,7 +276,7 @@ fn render_graph(
                 break;
             }
             let card = Rect::new(x, y, card_w, CARD_H);
-            render_card(f, app, workflow, labels, name, card);
+            render_card(f, app, workflow, labels, &timing, name, card);
 
             let has_needs = def
                 .jobs
@@ -231,6 +311,7 @@ fn render_card(
     app: &App,
     workflow: &Workflow,
     labels: &MatrixLabels,
+    timing: &Timing,
     name: &str,
     area: Rect,
 ) {
@@ -239,15 +320,40 @@ fn render_card(
     let (glyph, glyph_style) = theme::job_state(state, app.spinner_frame);
     let matrix = matrix_suffix(labels, name);
 
+    // The critical path gets a heavy border; the colour still says how
+    // the job went.
     let block = ratatui::widgets::Block::bordered()
-        .border_type(ratatui::widgets::BorderType::Rounded)
+        .border_type(if timing.critical.contains(name) {
+            ratatui::widgets::BorderType::Thick
+        } else {
+            ratatui::widgets::BorderType::Rounded
+        })
         .border_style(Style::default().fg(if state == JobState::Pending {
             COLORS.border
         } else {
             color
         }));
     let inner = block.inner(area);
+    let took = timing
+        .durations
+        .get(name)
+        .map(|ms| crate::views::execution_tab::format_ms(*ms))
+        .unwrap_or_default();
     let room = (inner.width as usize).saturating_sub(3 + matrix.len());
+    // Show the time only when the name still has room to be read.
+    // The time keeps a cell of margin from the border, like the glyph.
+    let (room, took) = if !took.is_empty() && room >= text::width(&took) + 9 {
+        (room - text::width(&took) - 2, format!("{took} "))
+    } else {
+        (room, String::new())
+    };
+    let shown_name = text::truncate(&text::sanitize(name), room).into_owned();
+    // Right-align the time: pad what the name left of its room.
+    let pad = if took.is_empty() {
+        0
+    } else {
+        room.saturating_sub(text::width(&shown_name)) + 1
+    };
     let name_style = match state {
         JobState::Pending | JobState::Skipped => theme::muted_style(),
         _ => Style::default()
@@ -259,11 +365,10 @@ fn render_card(
             Span::raw(" "),
             Span::styled(glyph, glyph_style),
             Span::raw(" "),
-            Span::styled(
-                text::truncate(&text::sanitize(name), room).into_owned(),
-                name_style,
-            ),
+            Span::styled(shown_name.clone(), name_style),
             Span::styled(matrix, Style::default().fg(COLORS.info)),
+            Span::raw(" ".repeat(pad)),
+            Span::styled(took, theme::muted_style()),
         ]))
         .block(block),
         area,
@@ -366,6 +471,10 @@ fn render_legend(f: &mut Frame<'_>, app: &App, area: Rect) {
         Span::styled("×6", Style::default().fg(COLORS.info)),
         Span::styled(" matrix runs", Style::default().fg(COLORS.text_dim)),
     ]));
+    lines.push(Line::from(vec![
+        Span::styled("┃", Style::default().fg(COLORS.text_dim)),
+        Span::styled("  critical path", Style::default().fg(COLORS.text_dim)),
+    ]));
     lines.push(Line::from(""));
     lines.push(theme::section("Keys"));
     for (k, d) in [
@@ -385,4 +494,37 @@ fn render_legend(f: &mut Frame<'_>, app: &App, area: Rect) {
         ]));
     }
     f.render_widget(Paragraph::new(lines), inner);
+}
+
+#[cfg(test)]
+mod timing_tests {
+    use super::*;
+
+    fn def(yaml: &str) -> WorkflowDefinition {
+        serde_yaml::from_str(yaml).expect("test workflow parses")
+    }
+
+    #[test]
+    fn critical_path_follows_the_slowest_chain() {
+        let def = def(
+            "name: d\non: push\njobs:\n  checkout:\n    runs-on: x\n    steps: [{run: a}]\n  lint:\n    runs-on: x\n    needs: checkout\n    steps: [{run: a}]\n  test:\n    runs-on: x\n    needs: checkout\n    steps: [{run: a}]\n  package:\n    runs-on: x\n    needs: [lint, test]\n    steps: [{run: a}]\n",
+        );
+        let levels = dag::topo_levels(&def);
+        let durations: HashMap<String, u64> = [
+            ("checkout", 1_000),
+            ("lint", 2_000),
+            ("test", 9_000),
+            ("package", 500),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+        let path = critical_path(&def, &levels, &durations);
+        let expected: HashSet<String> = ["checkout", "test", "package"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        assert_eq!(path, expected);
+        assert!(critical_path(&def, &levels, &HashMap::new()).is_empty());
+    }
 }

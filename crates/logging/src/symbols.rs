@@ -18,7 +18,8 @@ pub const GEAR: &str = "\u{2699}"; // ⚙
 // ── UI chrome ──────────────────────────────────────────────────────
 
 pub const LOCK: &str = "\u{26BF}"; // ⚿
-pub const BLOCKED: &str = "\u{26D4}"; // ⛔
+                                   // One cell wide, like every symbol here: ⛔ took two and shifted columns.
+pub const BLOCKED: &str = "\u{25FC}"; // ◼
 pub const SEPARATOR: &str = "\u{2502}"; // │
 pub const ARROW: &str = "\u{2192}"; // →
 pub const HRULE: &str = "\u{2500}"; // ─

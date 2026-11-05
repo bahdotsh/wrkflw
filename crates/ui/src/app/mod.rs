@@ -701,7 +701,10 @@ fn run_tui_event_loop(
                         }
                     }
                     KeyCode::Char('n') => {
+                        // Matches are in the raw log, so `n` shows it, as
+                        // `s` and `f` do.
                         if app.selected_tab == TAB_LOGS && !app.log_search_query.is_empty() {
+                            app.log_story = false;
                             app.next_search_match();
                         } else if app.selected_tab == TAB_WORKFLOWS && !app.running {
                             // Deselect all workflows

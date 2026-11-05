@@ -6195,7 +6195,7 @@ fn mirror_directory(
 ) -> Result<(), ExecutionError> {
     let io_err = |what: &str, e: std::io::Error| ExecutionError::Execution(format!("{what}: {e}"));
     if to.exists() && !to.is_dir() {
-        std::fs::remove_file(to).map_err(|e| io_err("Failed to replace file with dir", e))?;
+        remove_file_even_read_only(to).map_err(|e| io_err("Failed to replace file with dir", e))?;
     }
     std::fs::create_dir_all(to).map_err(|e| io_err("Failed to create dir", e))?;
 
@@ -6231,7 +6231,7 @@ fn mirror_directory(
         let removed = if path.is_dir() && !path.is_symlink() {
             std::fs::remove_dir_all(&path)
         } else {
-            std::fs::remove_file(&path)
+            remove_file_even_read_only(&path)
         };
         removed.map_err(|e| io_err(&format!("Failed to remove {}", path.display()), e))?;
     }
@@ -6380,7 +6380,7 @@ fn copy_directory_contents_with_gitignore(
 
         if path.is_dir() {
             if dest_path.exists() && !dest_path.is_dir() {
-                std::fs::remove_file(&dest_path)
+                remove_file_even_read_only(&dest_path)
                     .map_err(|e| io_err("Failed to replace file with dir", e))?;
             }
             std::fs::create_dir_all(&dest_path).map_err(|e| io_err("Failed to create dir", e))?;
@@ -6420,7 +6420,7 @@ fn copy_directory_contents_with_gitignore(
         let removed = if path.is_dir() {
             std::fs::remove_dir_all(&path)
         } else {
-            std::fs::remove_file(&path)
+            remove_file_even_read_only(&path)
         };
         removed.map_err(|e| {
             io_err(
@@ -6451,8 +6451,15 @@ fn link_file(from: &Path, to: &Path) -> Result<(), ExecutionError> {
             }
         }
     }
-    if to.exists() {
-        let _ = std::fs::remove_file(to);
+    // Where links fail, an earlier run left a copy; keep it if it is current,
+    // rather than copying the whole object store again on every run.
+    if unchanged_copy(from, to) {
+        return Ok(());
+    }
+    if to.symlink_metadata().is_ok() {
+        remove_file_even_read_only(to).map_err(|e| {
+            ExecutionError::Execution(format!("Failed to replace {}: {}", to.display(), e))
+        })?;
     }
     if std::fs::hard_link(from, to).is_ok() {
         return Ok(());
@@ -6460,29 +6467,83 @@ fn link_file(from: &Path, to: &Path) -> Result<(), ExecutionError> {
     sync_file(from, to)
 }
 
+/// Whether `to` is already a copy of `from` as [`sync_file`] makes one:
+/// same size and modification time.
+fn unchanged_copy(from: &Path, to: &Path) -> bool {
+    match (std::fs::metadata(from), std::fs::metadata(to)) {
+        (Ok(source), Ok(dest)) => {
+            dest.is_file()
+                && dest.len() == source.len()
+                && dest.modified().ok() == source.modified().ok()
+        }
+        _ => false,
+    }
+}
+
 /// Copy `from` to `to` unless `to` already matches it, keeping the source's
-/// modification time so build tools see the file as unchanged.
+/// modification time so build tools see the file as unchanged. Read-only
+/// files, such as generated code or git objects, are replaced and keep
+/// their time too.
 fn sync_file(from: &Path, to: &Path) -> Result<(), ExecutionError> {
     let source = std::fs::metadata(from)
         .map_err(|e| ExecutionError::Execution(format!("Failed to read file: {}", e)))?;
-    if to.is_dir() {
+    if to.is_dir() && !to.is_symlink() {
         std::fs::remove_dir_all(to).map_err(|e| {
             ExecutionError::Execution(format!("Failed to replace dir with file: {}", e))
         })?;
     }
-    if let Ok(dest) = std::fs::metadata(to) {
-        if dest.len() == source.len() && dest.modified().ok() == source.modified().ok() {
-            return Ok(());
-        }
+    if unchanged_copy(from, to) {
+        return Ok(());
+    }
+    // `fs::copy` writes into an existing file, which a read-only one
+    // refuses; a new file takes the source's permissions either way.
+    if to.symlink_metadata().is_ok() {
+        remove_file_even_read_only(to).map_err(|e| {
+            ExecutionError::Execution(format!("Failed to replace {}: {}", to.display(), e))
+        })?;
     }
     std::fs::copy(from, to)
         .map_err(|e| ExecutionError::Execution(format!("Failed to copy file: {}", e)))?;
     if let Ok(modified) = source.modified() {
-        if let Ok(file) = std::fs::File::options().write(true).open(to) {
-            let _ = file.set_modified(modified);
+        if let Err(e) = set_modified(to, modified) {
+            // Not fatal: the file is current, it is only copied again next run.
+            wrkflw_logging::debug(&format!(
+                "Could not keep the modification time of {}: {}",
+                to.display(),
+                e
+            ));
         }
     }
     Ok(())
+}
+
+/// Set `path`'s modification time without needing write access to it: the
+/// owner may change a read-only file's times.
+fn set_modified(path: &Path, time: std::time::SystemTime) -> std::io::Result<()> {
+    #[cfg(windows)]
+    let file = {
+        use std::os::windows::fs::OpenOptionsExt;
+        // FILE_WRITE_ATTRIBUTES, which a read-only file still grants.
+        std::fs::File::options().access_mode(0x100).open(path)?
+    };
+    #[cfg(not(windows))]
+    let file = std::fs::File::open(path)?;
+    file.set_modified(time)
+}
+
+/// Remove a file, clearing its read-only flag first where the platform
+/// needs that (Windows refuses to delete read-only files).
+fn remove_file_even_read_only(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            let mut permissions = std::fs::symlink_metadata(path)?.permissions();
+            #[allow(clippy::permissions_set_readonly_false)]
+            permissions.set_readonly(false);
+            std::fs::set_permissions(path, permissions)?;
+            std::fs::remove_file(path)
+        }
+        other => other,
+    }
 }
 
 fn get_runner_image(runs_on: &str) -> String {
@@ -8371,6 +8432,56 @@ mod tests {
                 .modified()
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn workspace_sync_replaces_read_only_files_and_keeps_their_time() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let file = src.path().join("gen.pb.go");
+        let read_only = |path: &Path, on: bool| {
+            let mut permissions = std::fs::metadata(path).unwrap().permissions();
+            #[allow(clippy::permissions_set_readonly_false)]
+            permissions.set_readonly(on);
+            std::fs::set_permissions(path, permissions).unwrap();
+        };
+        std::fs::write(&file, "v1").unwrap();
+        read_only(&file, true);
+        copy_directory_contents(src.path(), dst.path()).unwrap();
+        let copy = dst.path().join("gen.pb.go");
+        let mtime = |path: &Path| std::fs::metadata(path).unwrap().modified().unwrap();
+        assert_eq!(mtime(&copy), mtime(&file), "the copy's time was not kept");
+
+        // Regenerated between runs, still read-only.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        read_only(&file, false);
+        std::fs::write(&file, "v2!").unwrap();
+        read_only(&file, true);
+        copy_directory_contents(src.path(), dst.path()).unwrap();
+        assert_eq!(std::fs::read_to_string(&copy).unwrap(), "v2!");
+        assert_eq!(mtime(&copy), mtime(&file));
+
+        // Deleted between runs: the read-only copy goes too.
+        read_only(&file, false);
+        std::fs::remove_file(&file).unwrap();
+        copy_directory_contents(src.path(), dst.path()).unwrap();
+        assert!(!copy.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_file_that_fell_back_to_a_copy_is_not_copied_again() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let from = dir.path().join("object");
+        let to = dir.path().join("copy");
+        std::fs::write(&from, "blob").unwrap();
+        // What an earlier run leaves where links fail: a copy, not a link.
+        sync_file(&from, &to).unwrap();
+        let before = std::fs::metadata(&to).unwrap().ino();
+        link_file(&from, &to).unwrap();
+        let after = std::fs::metadata(&to).unwrap().ino();
+        assert_eq!(after, before, "the current copy was replaced");
     }
 
     #[test]

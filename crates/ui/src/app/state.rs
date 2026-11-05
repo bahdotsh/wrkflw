@@ -3171,6 +3171,7 @@ mod tests {
             logs: String::new(),
             outputs: HashMap::new(),
             failure_allowed: allowed,
+            repeated_from: None,
         }
     }
 

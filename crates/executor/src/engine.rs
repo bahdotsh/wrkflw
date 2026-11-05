@@ -1145,6 +1145,9 @@ pub struct JobResult {
     /// `continue-on-error` applies: a failure here doesn't fail the run or
     /// block dependent jobs, though the job is still reported as failed.
     pub failure_allowed: bool,
+    /// Set on a matrix leg that was not run because it would only have
+    /// repeated the named leg; `status` is that leg's.
+    pub repeated_from: Option<String>,
 }
 
 impl JobResult {
@@ -1168,6 +1171,7 @@ impl JobResult {
             logs: note.to_string(),
             outputs: stored.outputs,
             failure_allowed: false,
+            repeated_from: None,
         }
     }
 
@@ -1185,6 +1189,7 @@ impl JobResult {
             logs: logs.into(),
             outputs: HashMap::new(),
             failure_allowed: false,
+            repeated_from: None,
         }
     }
 
@@ -1209,6 +1214,7 @@ impl JobResult {
             logs: reason,
             outputs: HashMap::new(),
             failure_allowed: false,
+            repeated_from: None,
         }
     }
 }
@@ -3016,6 +3022,7 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
         logs: loop_state.job_logs,
         outputs: job_outputs,
         failure_allowed,
+        repeated_from: None,
     })
 }
 
@@ -3132,6 +3139,7 @@ async fn execute_matrix_combinations(
                         logs: e.to_string(),
                         outputs: HashMap::new(),
                         failure_allowed: false,
+                        repeated_from: None,
                     });
                 }
             }
@@ -3310,6 +3318,7 @@ fn repeated_leg(name: &str, original: &JobResult, image: &str) -> JobResult {
     JobResult {
         name: name.to_string(),
         logs: format!("{}\n\n{}", note, original.logs),
+        repeated_from: Some(original.name.clone()),
         ..(*original).clone()
     }
 }
@@ -3676,6 +3685,7 @@ async fn execute_matrix_job(
         logs: loop_state.job_logs,
         outputs: job_outputs,
         failure_allowed,
+        repeated_from: None,
     })
 }
 
@@ -7177,6 +7187,7 @@ async fn run_called_workflow(
             ctx.user_env,
             &ctx.services,
         ),
+        repeated_from: None,
     })
 }
 
@@ -8338,6 +8349,7 @@ mod tests {
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
             failure_allowed: false,
+            repeated_from: None,
         };
         let results = vec![
             combo("build (os: a)", &[("linux", "a.tar")]),

@@ -396,6 +396,17 @@ pub(crate) async fn run(ctx: RunCtx) {
                     println!("  {}", cli_style::job_skipped(&job.name))
                 }
             }
+            // A folded matrix leg reports another leg's result; say so, so
+            // its status is not read as a run of its own.
+            if let Some(original) = &job.repeated_from {
+                println!(
+                    "    {}",
+                    cli_style::dim(&format!(
+                        "not run: repeats {original} locally (--every-matrix-leg runs it)"
+                    ))
+                );
+                continue;
+            }
 
             for step in job.steps {
                 match step.status {

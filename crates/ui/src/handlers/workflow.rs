@@ -466,6 +466,7 @@ pub async fn execute_curl_trigger(
         logs: "Workflow triggered remotely on GitHub".to_string(),
         outputs: std::collections::HashMap::new(),
         failure_allowed: false,
+        repeated_from: None,
     };
 
     Ok((vec![job_result], ()))
@@ -616,6 +617,7 @@ pub fn start_next_workflow_execution(
                                 ),
                                 outputs: std::collections::HashMap::new(),
                                 failure_allowed: false,
+                                repeated_from: None,
                             }];
 
                             Ok((jobs, ()))

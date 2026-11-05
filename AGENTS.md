@@ -39,6 +39,8 @@ Run `wrkflw gate`. It runs what a push would run, reusing jobs that already pass
 
 `step_finished.output` holds the last 64 KiB of a step's output, delivered when the step ends. Output is not streamed while a step runs.
 
+`clean` prints `{"removed": n, "bytes": n, "in_use": n}`: workspaces removed, the bytes they held, and workspaces left because a run holds them.
+
 A `job_finished` with `repeated_from` is a matrix leg that did not run, because locally it would only have repeated the named leg. Its `status` is that leg's and its `duration_ms` is 0. Pass `--every-matrix-leg` to run every leg.
 
 `failures` has one entry per distinct failure, not per failed job, so count `jobs` on `run_finished` instead. `also_failed_in` lists matrix legs where the same step failed with the same exit code and output, ignoring durations, and `command` is the first leg's script. `error_lines` holds lines above `output_tail` that look like errors. `note` warns about the run itself, such as `--from-step` having skipped earlier steps.

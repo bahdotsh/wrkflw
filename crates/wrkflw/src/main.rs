@@ -1263,11 +1263,16 @@ async fn run_cli() {
             Ok(report) if format.is_json() => {
                 wrkflw_runs::emit_line(&serde_json::json!({
                     "removed": report.removed,
+                    "bytes": report.bytes,
                     "in_use": report.in_use,
                 }));
             }
             Ok(report) => {
-                println!("Removed {} job workspace(s).", report.removed);
+                println!(
+                    "Removed {} job workspace(s), freeing {}.",
+                    report.removed,
+                    human_bytes(report.bytes)
+                );
                 if report.in_use > 0 {
                     println!(
                         "Left {} in use by a running workflow; run `wrkflw clean` again once \
@@ -1626,6 +1631,22 @@ fn list_workflows_and_pipelines(verbose: bool, show_jobs: bool) {
     }
 }
 
+/// `bytes` in the largest unit that keeps it at or above one, e.g. "1.4 GB".
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -1827,6 +1848,14 @@ mod tests {
     #[test]
     fn platform_flag_rejects_malformed_values() {
         assert!(Wrkflw::try_parse_from(["wrkflw", "-P", "no-equals"]).is_err());
+    }
+
+    #[test]
+    fn human_bytes_picks_a_readable_unit() {
+        assert_eq!(human_bytes(0), "0 B");
+        assert_eq!(human_bytes(1023), "1023 B");
+        assert_eq!(human_bytes(1536), "1.5 KB");
+        assert_eq!(human_bytes(3 * 1024 * 1024 * 1024), "3.0 GB");
     }
 
     #[test]

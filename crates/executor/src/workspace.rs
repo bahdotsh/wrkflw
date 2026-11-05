@@ -160,6 +160,9 @@ pub fn workspaces_root() -> Option<PathBuf> {
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct CleanReport {
     pub removed: usize,
+    /// Bytes the removed workspaces held. Hard-linked git objects are
+    /// counted although removing a link frees nothing the repository uses.
+    pub bytes: u64,
     /// Workspaces left alone because a run holds them.
     pub in_use: usize,
 }
@@ -206,11 +209,29 @@ fn clean_under(root: &Path) -> std::io::Result<CleanReport> {
             // The lock file stays. A run may already have it open, waiting
             // to lock it; removing it would let a later run create a second
             // lock file for the same workspace, and both would get it.
+            let bytes = size_of(&dir);
             std::fs::remove_dir_all(&dir)?;
             report.removed += 1;
+            report.bytes += bytes;
         }
     }
     Ok(report)
+}
+
+/// Total size of the files under `dir`, not following symlinks. Entries
+/// that can't be read count as empty.
+fn size_of(dir: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .map(|entry| match entry.metadata() {
+            Ok(meta) if meta.is_dir() => size_of(&entry.path()),
+            Ok(meta) if meta.is_file() => meta.len(),
+            _ => 0,
+        })
+        .sum()
 }
 
 fn slug(text: &str) -> String {
@@ -364,6 +385,7 @@ mod tests {
             report,
             CleanReport {
                 removed: 1,
+                bytes: 5,
                 in_use: 1
             }
         );

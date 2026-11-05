@@ -783,8 +783,9 @@ mod tests {
         (a.max(b) + 0.05) / (a.min(b) + 0.05)
     }
 
-    fn light_foregrounds() -> Vec<(String, Color)> {
-        let c = &LIGHT;
+    /// Every color a palette draws text in, with each accent the user can
+    /// pick for `mode`.
+    fn foregrounds(c: &Colors, mode: ThemeMode) -> Vec<(String, Color)> {
         let mut colors: Vec<(String, Color)> = [
             ("accent", c.accent),
             ("highlight", c.highlight),
@@ -812,10 +813,14 @@ mod tests {
             Accent::Violet,
             Accent::Coral,
         ] {
-            let (r, g, b) = accent.rgb_for(ThemeMode::Light);
+            let (r, g, b) = accent.rgb_for(mode);
             colors.push((format!("accent {}", accent.as_str()), Color::Rgb(r, g, b)));
         }
         colors
+    }
+
+    fn light_foregrounds() -> Vec<(String, Color)> {
+        foregrounds(&LIGHT, ThemeMode::Light)
     }
 
     #[test]
@@ -838,28 +843,13 @@ mod tests {
     #[test]
     fn dark_foregrounds_are_readable_on_every_dark_background() {
         let c = &DARK;
-        let foregrounds = [
-            ("accent", c.accent),
-            ("highlight", c.highlight),
-            ("success", c.success),
-            ("error", c.error),
-            ("warning", c.warning),
-            ("info", c.info),
-            ("trigger", c.trigger),
-            ("text", c.text),
-            ("text_dim", c.text_dim),
-            ("text_muted", c.text_muted),
-            ("runtime_docker", c.runtime_docker),
-            ("runtime_podman", c.runtime_podman),
-            ("runtime_kubernetes", c.runtime_kubernetes),
-        ];
         let backgrounds = [
             ("bg_selected", c.bg_selected),
             ("bg_panel", c.bg_panel),
             ("bg_bar", c.bg_bar),
             ("bg_dark", c.bg_dark),
         ];
-        for (fg_name, fg) in foregrounds {
+        for (fg_name, fg) in foregrounds(c, ThemeMode::Dark) {
             for (bg_name, bg) in backgrounds {
                 let ratio = contrast(fg, bg);
                 assert!(ratio >= 4.5, "{fg_name} on {bg_name} is only {ratio:.2}:1");
@@ -890,6 +880,18 @@ mod tests {
                 continue;
             }
             let ratio = contrast(LIGHT.bg_dark, color);
+            assert!(ratio >= 4.5, "chip on {name} is only {ratio:.2}:1");
+        }
+    }
+
+    #[test]
+    fn dark_solid_chips_are_readable() {
+        // Solid chips and lit buttons draw `bg_dark` text on a color.
+        for (name, color) in foregrounds(&DARK, ThemeMode::Dark) {
+            if name == "text" || name == "text_dim" || name == "text_muted" {
+                continue;
+            }
+            let ratio = contrast(DARK.bg_dark, color);
             assert!(ratio >= 4.5, "chip on {name} is only {ratio:.2}:1");
         }
     }

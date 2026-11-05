@@ -173,6 +173,14 @@ pub struct Colors {
     pub bg_bar: Color,
     pub bg_dark: Color,
 
+    // The menu and key bars, drawn inverted like a DOS menu bar:
+    // `chrome_text` on `chrome`, hotkeys in `chrome_key`.
+    pub chrome: Color,
+    pub chrome_text: Color,
+    pub chrome_key: Color,
+    /// Drop shadows under raised buttons and floating windows.
+    pub shadow: Color,
+
     // Runtime badges
     pub runtime_docker: Color,
     pub runtime_podman: Color,
@@ -200,71 +208,84 @@ impl Deref for ActiveColors {
     }
 }
 
+// "Blueprint": a cyanotype. Prussian-blue paper, chalk-white lines and a
+// yellow drafting pencil for the accent, the way a schematic is marked up.
+// Status colors stay clear of the pencil so a failure still reads at a
+// glance.
 static DARK: Colors = Colors {
-    accent: Color::Rgb(0x5f, 0xd3, 0xf3),
-    highlight: Color::Rgb(0xf5, 0xd7, 0x6e),
+    accent: Color::Rgb(0xf5, 0xcf, 0x4a),
+    highlight: Color::Rgb(0xff, 0xe5, 0x8a),
 
-    success: Color::Rgb(0x8f, 0xce, 0x8f),
-    error: Color::Rgb(0xff, 0x7a, 0x7a),
-    warning: Color::Rgb(0xf5, 0xd7, 0x6e),
-    info: Color::Rgb(0x5f, 0xd3, 0xf3),
-    trigger: Color::Rgb(0xd6, 0x8c, 0xff),
+    success: Color::Rgb(0x6f, 0xd6, 0xa0),
+    error: Color::Rgb(0xff, 0x7b, 0x6e),
+    warning: Color::Rgb(0xf7, 0xa6, 0x5a),
+    info: Color::Rgb(0x7f, 0xc4, 0xf2),
+    trigger: Color::Rgb(0xc3, 0xa6, 0xff),
 
-    text: Color::Rgb(0xd7, 0xdd, 0xe4),
-    text_dim: Color::Rgb(0x88, 0x90, 0xa0),
-    text_muted: Color::Rgb(0x6b, 0x73, 0x82),
+    text: Color::Rgb(0xea, 0xf0, 0xf4),
+    text_dim: Color::Rgb(0xb0, 0xc2, 0xd2),
+    text_muted: Color::Rgb(0x93, 0xa9, 0xbd),
 
-    border: Color::Rgb(0x3e, 0x45, 0x52),
-    border_focused: Color::Rgb(0x5f, 0xd3, 0xf3),
+    border: Color::Rgb(0x4a, 0x6f, 0x92),
+    border_focused: Color::Rgb(0xf5, 0xcf, 0x4a),
 
-    bg_selected: Color::Rgb(0x2c, 0x34, 0x42),
-    bg_panel: Color::Rgb(0x0f, 0x12, 0x16),
-    bg_bar: Color::Rgb(0x14, 0x17, 0x1c),
-    bg_dark: Color::Rgb(0x07, 0x09, 0x0b),
+    bg_selected: Color::Rgb(0x1b, 0x3b, 0x5c),
+    bg_panel: Color::Rgb(0x0e, 0x21, 0x34),
+    bg_bar: Color::Rgb(0x12, 0x2a, 0x42),
+    bg_dark: Color::Rgb(0x09, 0x17, 0x26),
 
-    runtime_docker: Color::Rgb(0x5f, 0xa3, 0xff),
-    runtime_podman: Color::Rgb(0x5f, 0xd3, 0xf3),
-    runtime_kubernetes: Color::Rgb(0x9f, 0x8f, 0xff),
-    runtime_emulation: Color::Rgb(0xff, 0x99, 0x66),
-    runtime_secure: Color::Rgb(0x8f, 0xce, 0x8f),
-    ansi_blue: Color::Rgb(0x5f, 0xa3, 0xff),
-    ansi_magenta: Color::Rgb(0xd6, 0x8c, 0xff),
+    chrome: Color::Rgb(0xb4, 0xc3, 0xd1),
+    chrome_text: Color::Rgb(0x0a, 0x1a, 0x2b),
+    chrome_key: Color::Rgb(0x8a, 0x1c, 0x12),
+    shadow: Color::Rgb(0x02, 0x07, 0x0d),
+
+    runtime_docker: Color::Rgb(0x7f, 0xb2, 0xf5),
+    runtime_podman: Color::Rgb(0xa3, 0xd9, 0xe8),
+    runtime_kubernetes: Color::Rgb(0xad, 0xa6, 0xff),
+    runtime_emulation: Color::Rgb(0xf5, 0xcf, 0x4a),
+    runtime_secure: Color::Rgb(0x6f, 0xd6, 0xa0),
+    ansi_blue: Color::Rgb(0x7f, 0xb2, 0xf5),
+    ansi_magenta: Color::Rgb(0xe0, 0x9c, 0xeb),
 };
 
-// `bg_dark` keeps its role here: it is the bar background and the text on
-// solid chips, so it stays the color furthest from the foregrounds.
+// Blueprint on drafting paper: blueprint-blue ink on cream. `bg_dark`
+// keeps its role: it is the text on solid chips, so it stays the color
+// furthest from the foregrounds.
 static LIGHT: Colors = Colors {
-    accent: Color::Rgb(0x00, 0x6d, 0x87),
-    highlight: Color::Rgb(0x85, 0x55, 0x00),
+    accent: Color::Rgb(0x1c, 0x4f, 0xa1),
+    highlight: Color::Rgb(0x8a, 0x5b, 0x00),
 
-    success: Color::Rgb(0x1f, 0x75, 0x1f),
-    error: Color::Rgb(0xbb, 0x22, 0x2a),
-    warning: Color::Rgb(0x85, 0x55, 0x00),
-    info: Color::Rgb(0x00, 0x6d, 0x87),
-    trigger: Color::Rgb(0x7b, 0x2f, 0xbf),
+    success: Color::Rgb(0x1e, 0x6b, 0x43),
+    error: Color::Rgb(0xb0, 0x2a, 0x1f),
+    warning: Color::Rgb(0x8a, 0x5b, 0x00),
+    info: Color::Rgb(0x1d, 0x5e, 0x7a),
+    trigger: Color::Rgb(0x6b, 0x3f, 0xa0),
 
-    text: Color::Rgb(0x1f, 0x23, 0x28),
-    text_dim: Color::Rgb(0x4a, 0x52, 0x5e),
-    text_muted: Color::Rgb(0x5c, 0x64, 0x70),
+    text: Color::Rgb(0x10, 0x2a, 0x43),
+    text_dim: Color::Rgb(0x34, 0x50, 0x6b),
+    text_muted: Color::Rgb(0x4d, 0x63, 0x77),
 
-    border: Color::Rgb(0xc3, 0xc9, 0xd1),
-    border_focused: Color::Rgb(0x00, 0x6d, 0x87),
+    border: Color::Rgb(0x7d, 0x8b, 0x99),
+    border_focused: Color::Rgb(0x1c, 0x4f, 0xa1),
 
-    bg_selected: Color::Rgb(0xe4, 0xe8, 0xed),
-    bg_panel: Color::Rgb(0xf4, 0xf5, 0xf7),
-    bg_bar: Color::Rgb(0xec, 0xee, 0xf1),
-    bg_dark: Color::Rgb(0xf7, 0xf8, 0xfa),
+    bg_selected: Color::Rgb(0xdc, 0xe4, 0xec),
+    bg_panel: Color::Rgb(0xf3, 0xf0, 0xe6),
+    bg_bar: Color::Rgb(0xe9, 0xe4, 0xd6),
+    bg_dark: Color::Rgb(0xfb, 0xfa, 0xf5),
 
-    runtime_docker: Color::Rgb(0x1f, 0x5f, 0xbf),
-    runtime_podman: Color::Rgb(0x00, 0x6d, 0x87),
-    runtime_kubernetes: Color::Rgb(0x4b, 0x3f, 0xb3),
-    runtime_emulation: Color::Rgb(0xa8, 0x47, 0x00),
-    runtime_secure: Color::Rgb(0x1f, 0x75, 0x1f),
-    ansi_blue: Color::Rgb(0x1f, 0x5f, 0xbf),
-    ansi_magenta: Color::Rgb(0x7b, 0x2f, 0xbf),
+    chrome: Color::Rgb(0x1c, 0x3a, 0x5e),
+    chrome_text: Color::Rgb(0xf3, 0xf0, 0xe6),
+    chrome_key: Color::Rgb(0xf5, 0xcf, 0x4a),
+    shadow: Color::Rgb(0xa8, 0xa2, 0x8f),
+
+    runtime_docker: Color::Rgb(0x1f, 0x55, 0xa8),
+    runtime_podman: Color::Rgb(0x1d, 0x5e, 0x7a),
+    runtime_kubernetes: Color::Rgb(0x4e, 0x3f, 0xa8),
+    runtime_emulation: Color::Rgb(0x8a, 0x5b, 0x00),
+    runtime_secure: Color::Rgb(0x1e, 0x6b, 0x43),
+    ansi_blue: Color::Rgb(0x1f, 0x55, 0xa8),
+    ansi_magenta: Color::Rgb(0x8a, 0x2f, 0x8f),
 };
-
-// ── Symbols ────────────────────────────────────────────────────────
 
 pub use wrkflw_logging::symbols;
 
@@ -387,13 +408,16 @@ pub fn block_focused<'a>(title: &'a str) -> Block<'a> {
     panel(title, true)
 }
 
-/// The one panel style every pane shares: rounded border, a title that
-/// lights up with the accent when the pane has focus, and a cell of
-/// horizontal padding so text never touches the border.
+/// The one panel style every pane shares: a full box, as in a DOS text
+/// UI. The focused pane gets a double line in the accent and the rest a
+/// single line, so focus reads from across the room. The title sits in
+/// the top edge between tee joints, `╡ Title ╞`. Text gets a cell of
+/// padding on each side; the scrollbar draws over the right edge.
 pub fn panel<'a>(title: &'a str, focused: bool) -> Block<'a> {
-    let (border, title_style) = if focused {
+    let (edge, border_type, title_style) = if focused {
         (
             current_accent(),
+            BorderType::Double,
             Style::default()
                 .fg(current_accent())
                 .add_modifier(Modifier::BOLD),
@@ -401,20 +425,52 @@ pub fn panel<'a>(title: &'a str, focused: bool) -> Block<'a> {
     } else {
         (
             COLORS.border,
+            BorderType::Plain,
             Style::default()
-                .fg(COLORS.text_dim)
+                .fg(COLORS.text)
                 .add_modifier(Modifier::BOLD),
         )
     };
-    let mut block = Block::default()
+    let block = Block::default()
         .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(border))
+        .border_type(border_type)
+        .border_style(Style::default().fg(edge))
         .padding(Padding::horizontal(1));
-    if !title.is_empty() {
-        block = block.title(Line::from(Span::styled(format!(" {title} "), title_style)));
+    if title.is_empty() {
+        return block;
     }
-    block
+    block.title(boxed_title(title, border_type, edge, title_style))
+}
+
+/// `╡ title ╞` for a double edge, `┤ title ├` for a single one.
+fn boxed_title<'a>(title: &str, border_type: BorderType, edge: Color, style: Style) -> Line<'a> {
+    let (open, close) = match border_type {
+        BorderType::Double => ("╡", "╞"),
+        _ => ("┤", "├"),
+    };
+    Line::from(vec![
+        Span::styled(open, Style::default().fg(edge)),
+        Span::styled(format!(" {title} "), style),
+        Span::styled(close, Style::default().fg(edge)),
+    ])
+}
+
+/// A double-lined window for floating overlays (Help, Tweaks). [`modal`]
+/// gives it a drop shadow.
+pub fn modal_frame<'a>(title: &'a str) -> Block<'a> {
+    let accent = current_accent();
+    Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Double)
+        .border_style(Style::default().fg(accent))
+        .padding(Padding::horizontal(1))
+        .title(boxed_title(
+            title,
+            BorderType::Double,
+            accent,
+            Style::default().fg(accent).add_modifier(Modifier::BOLD),
+        ))
+        .title_alignment(ratatui::layout::Alignment::Center)
 }
 
 /// Adds a dim right-aligned label to a panel's top border, for counts
@@ -427,14 +483,18 @@ pub fn with_badge<'a>(block: Block<'a>, badge: impl Into<String>) -> Block<'a> {
     block.title_top(Line::from(Span::styled(format!(" {badge} "), muted_style())).right_aligned())
 }
 
-/// Small-caps style heading for a group of rows inside a panel.
+/// Heading for a group of rows inside a panel: `── LAST RUN`, a short
+/// rule leading into the title like a section mark on a form.
 pub fn section<'a>(title: impl Into<String>) -> Line<'a> {
-    Line::from(Span::styled(
-        title.into().to_uppercase(),
-        Style::default()
-            .fg(COLORS.text_muted)
-            .add_modifier(Modifier::BOLD),
-    ))
+    Line::from(vec![
+        Span::styled("── ", Style::default().fg(COLORS.border)),
+        Span::styled(
+            title.into().to_uppercase(),
+            Style::default()
+                .fg(COLORS.highlight)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ])
 }
 
 /// Builds `key desc  key desc …`, dropping whole hints from the end
@@ -463,7 +523,63 @@ pub fn hint_spans<'a>(hints: &[(&str, &str)], max_width: usize) -> Vec<Span<'a>>
     spans
 }
 
-/// Draws a slim vertical scrollbar over the right border of `area` when
+/// Two rows of raised push buttons, drawn the way text-mode OSes drew
+/// them: a solid face, then a half-block drop shadow, `▄` at the face's
+/// right end and `▀▀▀` under it, one cell to the right:
+///
+/// ```text
+///  Enter run ▄
+///   ▀▀▀▀▀▀▀▀▀▀
+/// ```
+///
+/// Each button is `(key, label, lit)`; a lit button takes the accent.
+/// Whole buttons are dropped from the end rather than cut in half when
+/// the row is too narrow. Returns the face row and the shadow row.
+pub fn raised_buttons<'a>(
+    buttons: &[(&str, &str, bool)],
+    max_width: usize,
+) -> (Vec<Span<'a>>, Vec<Span<'a>>) {
+    let shadow = Style::default().fg(COLORS.shadow);
+    let (mut faces, mut shadows) = (Vec::new(), Vec::new());
+    let mut used = 0;
+    for (key, label, lit) in buttons {
+        // A button with no label is just its key: ` 2 `.
+        let label = if label.is_empty() {
+            String::new()
+        } else {
+            format!(" {label}")
+        };
+        let face_w = crate::text::width(key) + crate::text::width(&label) + 2;
+        // The face, its shadow column and a one-cell gap.
+        if used + face_w + 2 > max_width {
+            break;
+        }
+        let (face, key_style) = if *lit {
+            let lit = Style::default()
+                .bg(current_accent())
+                .fg(COLORS.bg_dark)
+                .add_modifier(Modifier::BOLD);
+            (lit, lit)
+        } else {
+            let face = Style::default().bg(COLORS.chrome).fg(COLORS.chrome_text);
+            (
+                face,
+                face.fg(COLORS.chrome_key).add_modifier(Modifier::BOLD),
+            )
+        };
+        faces.push(Span::styled(format!(" {key}"), key_style));
+        faces.push(Span::styled(format!("{label} "), face));
+        faces.push(Span::styled("▄", shadow));
+        faces.push(Span::raw(" "));
+        shadows.push(Span::raw(" "));
+        shadows.push(Span::styled("▀".repeat(face_w), shadow));
+        shadows.push(Span::raw(" "));
+        used += face_w + 2;
+    }
+    (faces, shadows)
+}
+
+/// Draws a DOS-style scrollbar (`▲ ░░█░ ▼`) over the right border of `area` when
 /// `total` rows don't fit in `viewport`.
 pub fn scrollbar(f: &mut Frame<'_>, area: Rect, total: usize, position: usize, viewport: usize) {
     if total <= viewport || area.height < 3 {
@@ -473,10 +589,10 @@ pub fn scrollbar(f: &mut Frame<'_>, area: Rect, total: usize, position: usize, v
         .position(position.min(total.saturating_sub(viewport)))
         .viewport_content_length(viewport);
     let bar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
-        .begin_symbol(None)
-        .end_symbol(None)
-        .track_symbol(Some("│"))
-        .thumb_symbol("┃")
+        .begin_symbol(Some("▲"))
+        .end_symbol(Some("▼"))
+        .track_symbol(Some("░"))
+        .thumb_symbol("█")
         .track_style(Style::default().fg(COLORS.border))
         .thumb_style(Style::default().fg(current_accent()));
     f.render_stateful_widget(
@@ -505,9 +621,20 @@ pub fn modal(f: &mut Frame<'_>, width: u16, height: u16) -> Rect {
         ratatui::layout::Constraint::Length(width.min(screen.width)),
         ratatui::layout::Constraint::Length(height.min(screen.height)),
     );
+    // A Turbo Vision drop shadow: two cells to the right, one below.
+    let shadow = Style::default().bg(COLORS.shadow).fg(COLORS.text_muted);
+    for rect in [
+        Rect::new(area.right(), area.y + 1, 2, area.height),
+        Rect::new(area.x + 2, area.bottom(), area.width, 1),
+    ] {
+        let rect = rect.intersection(screen);
+        if !rect.is_empty() {
+            f.buffer_mut().set_style(rect, shadow);
+        }
+    }
     f.render_widget(ratatui::widgets::Clear, area);
     f.render_widget(
-        ratatui::widgets::Paragraph::new("").style(Style::default().bg(COLORS.bg_panel)),
+        ratatui::widgets::Paragraph::new("").style(Style::default().bg(COLORS.bg_bar)),
         area,
     );
     area
@@ -680,7 +807,7 @@ mod tests {
         .collect();
         for accent in [
             Accent::Cyan,
-            Accent::Amber,
+            Accent::Blueprint,
             Accent::Green,
             Accent::Violet,
             Accent::Coral,
@@ -704,6 +831,53 @@ mod tests {
             for (bg_name, bg) in backgrounds {
                 let ratio = contrast(fg, bg);
                 assert!(ratio >= 4.5, "{fg_name} on {bg_name} is only {ratio:.2}:1");
+            }
+        }
+    }
+
+    #[test]
+    fn dark_foregrounds_are_readable_on_every_dark_background() {
+        let c = &DARK;
+        let foregrounds = [
+            ("accent", c.accent),
+            ("highlight", c.highlight),
+            ("success", c.success),
+            ("error", c.error),
+            ("warning", c.warning),
+            ("info", c.info),
+            ("trigger", c.trigger),
+            ("text", c.text),
+            ("text_dim", c.text_dim),
+            ("text_muted", c.text_muted),
+            ("runtime_docker", c.runtime_docker),
+            ("runtime_podman", c.runtime_podman),
+            ("runtime_kubernetes", c.runtime_kubernetes),
+        ];
+        let backgrounds = [
+            ("bg_selected", c.bg_selected),
+            ("bg_panel", c.bg_panel),
+            ("bg_bar", c.bg_bar),
+            ("bg_dark", c.bg_dark),
+        ];
+        for (fg_name, fg) in foregrounds {
+            for (bg_name, bg) in backgrounds {
+                let ratio = contrast(fg, bg);
+                assert!(ratio >= 4.5, "{fg_name} on {bg_name} is only {ratio:.2}:1");
+            }
+        }
+    }
+
+    #[test]
+    fn menu_and_key_bars_are_readable() {
+        for c in [&DARK, &LIGHT] {
+            for (name, fg, bg) in [
+                ("bar text", c.chrome_text, c.chrome),
+                ("bar hotkey", c.chrome_key, c.chrome),
+                ("key cell", c.text, c.bg_dark),
+                ("open tab", c.accent, c.bg_panel),
+            ] {
+                let ratio = contrast(fg, bg);
+                assert!(ratio >= 4.5, "{name} is only {ratio:.2}:1");
             }
         }
     }

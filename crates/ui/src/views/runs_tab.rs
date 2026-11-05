@@ -201,10 +201,7 @@ pub fn render_runs_tab(f: &mut Frame<'_>, app: &mut App, area: Rect) {
             .split(area)
     };
 
-    let list_block = theme::with_badge(
-        theme::block_focused("Run history"),
-        app.runs.len().to_string(),
-    );
+    let list_block = theme::with_badge(theme::block_focused("Runs"), app.runs.len().to_string());
     let inner = list_block.inner(panes[0]);
     f.render_widget(list_block, panes[0]);
     if app.runs.is_empty() {

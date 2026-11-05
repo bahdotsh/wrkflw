@@ -54,6 +54,8 @@ pub struct App {
     pub workflows: Vec<Workflow>,
     pub workflow_list_state: ListState,
     pub selected_tab: usize,
+    /// The Run tab's view (jobs, graph or log) to reopen it on.
+    pub run_screen: usize,
     pub running: bool,
     pub show_help: bool,
     pub runtime_type: RuntimeType,
@@ -285,8 +287,8 @@ impl TriggerPlatform {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Accent {
     #[default]
+    Blueprint,
     Cyan,
-    Amber,
     Green,
     Violet,
     Coral,
@@ -296,23 +298,22 @@ impl Accent {
     pub fn as_str(&self) -> &'static str {
         match self {
             Accent::Cyan => "cyan",
-            Accent::Amber => "amber",
+            Accent::Blueprint => "blueprint",
             Accent::Green => "green",
             Accent::Violet => "violet",
             Accent::Coral => "coral",
         }
     }
 
-    /// Rotate through the 5-slot palette in the order shown in the
-    /// design's TweaksPanel (matches user expectation if they've seen
-    /// the mockup).
+    /// Rotate through the 5-slot palette, starting from the Blueprint
+    /// default.
     pub fn next(self) -> Self {
         match self {
-            Accent::Cyan => Accent::Amber,
-            Accent::Amber => Accent::Green,
+            Accent::Blueprint => Accent::Cyan,
+            Accent::Cyan => Accent::Green,
             Accent::Green => Accent::Violet,
             Accent::Violet => Accent::Coral,
-            Accent::Coral => Accent::Cyan,
+            Accent::Coral => Accent::Blueprint,
         }
     }
 
@@ -322,18 +323,19 @@ impl Accent {
         self.rgb_for(theme::mode())
     }
 
-    /// Dark values match the design handoff (`ACCENTS` table in wrkflw
-    /// TUI.html). Those are too pale for a light background, so the
-    /// light theme uses darker shades of the same hues.
+    /// Blueprint is the palette's own accent: drafting-pencil yellow on
+    /// the dark cyanotype, blueprint-blue ink on light paper. The other
+    /// dark values are too pale for a light background, so the light
+    /// theme uses darker shades of the same hues.
     pub fn rgb_for(self, mode: ThemeMode) -> (u8, u8, u8) {
         match (self, mode) {
             (Accent::Cyan, ThemeMode::Dark) => (0x5f, 0xd3, 0xf3),
-            (Accent::Amber, ThemeMode::Dark) => (0xf5, 0xd7, 0x6e),
+            (Accent::Blueprint, ThemeMode::Dark) => (0xf5, 0xcf, 0x4a),
             (Accent::Green, ThemeMode::Dark) => (0x8f, 0xce, 0x8f),
             (Accent::Violet, ThemeMode::Dark) => (0xd6, 0x8c, 0xff),
             (Accent::Coral, ThemeMode::Dark) => (0xff, 0x99, 0x77),
             (Accent::Cyan, ThemeMode::Light) => (0x00, 0x6d, 0x87),
-            (Accent::Amber, ThemeMode::Light) => (0x85, 0x55, 0x00),
+            (Accent::Blueprint, ThemeMode::Light) => (0x1c, 0x4f, 0xa1),
             (Accent::Green, ThemeMode::Light) => (0x1f, 0x75, 0x1f),
             (Accent::Violet, ThemeMode::Light) => (0x7b, 0x2f, 0xbf),
             (Accent::Coral, ThemeMode::Light) => (0xb0, 0x3a, 0x1a),
@@ -492,6 +494,7 @@ impl App {
             workflows: Vec::new(),
             workflow_list_state,
             selected_tab: 0,
+            run_screen: crate::views::TAB_EXECUTION,
             running: false,
             show_help: false,
             runtime_type,
@@ -1190,9 +1193,23 @@ impl App {
     // Change the tab.
     pub fn switch_tab(&mut self, tab: usize) {
         self.selected_tab = tab;
+        if crate::views::tab_of(tab) == crate::views::TAB_RUN {
+            self.run_screen = tab;
+        }
         if tab == crate::views::TAB_RUNS {
             self.refresh_runs();
         }
+    }
+
+    /// Opens visible tab `index`; the Run tab comes back on the view it
+    /// was left on.
+    pub fn open_tab(&mut self, index: usize) {
+        let screen = if index == crate::views::TAB_RUN {
+            self.run_screen
+        } else {
+            crate::views::TABS[index].1[0]
+        };
+        self.switch_tab(screen);
     }
 
     /// Reload the history. Bounded so a long history stays cheap to open.
@@ -1329,6 +1346,7 @@ impl App {
                 end_time: Some(Local::now()),
                 progress: 1.0,
                 timeline: Vec::new(),
+                live: Default::default(),
             });
         }
 
@@ -1482,6 +1500,7 @@ impl App {
             end_time: None,
             progress: 0.0, // Just started
             timeline: Vec::new(),
+            live: Default::default(),
         });
 
         Some((next, target_job))
@@ -2667,7 +2686,12 @@ impl App {
                 .get_mut(idx)
                 .and_then(|w| w.execution_details.as_mut())
             {
-                exec.timeline.push(entry);
+                match entry {
+                    crate::models::RunUpdate::Entry(entry) => exec.timeline.push(entry),
+                    crate::models::RunUpdate::Output { job, step, lines } => {
+                        exec.live.push(&job, &step, lines)
+                    }
+                }
             }
         }
     }
@@ -4168,9 +4192,10 @@ mod tests {
             job: job.into(),
             canonical_name: job.into(),
         };
-        app.timeline_tx.send((0, entry("build"))).unwrap();
+        let update = |job: &str| crate::models::RunUpdate::Entry(entry(job));
+        app.timeline_tx.send((0, update("build"))).unwrap();
         // A late event for a workflow that is no longer running.
-        app.timeline_tx.send((1, entry("stale"))).unwrap();
+        app.timeline_tx.send((1, update("stale"))).unwrap();
         app.drain_timeline();
         let timeline = &app.workflows[0]
             .execution_details
@@ -4319,13 +4344,13 @@ mod tests {
 
     #[test]
     fn accent_next_cycles_through_all_five_slots() {
-        let mut a = Accent::Cyan;
+        let mut a = Accent::Blueprint;
         let mut seen = vec![a];
         for _ in 0..5 {
             a = a.next();
             seen.push(a);
         }
-        // Five steps returns to Cyan.
+        // Five steps returns to Blueprint.
         assert_eq!(seen.first(), seen.last());
         // All five slots are visited before wrapping.
         let mut distinct = seen.clone();

@@ -37,7 +37,7 @@ pub fn render_tweaks_overlay(f: &mut Frame<'_>, app: &App, _area: Rect) {
     // lands on top of a pane's border and reads as part of that pane.
     let panel_rect = theme::modal(f, PANEL_W, PANEL_H);
 
-    let block = theme::block_focused("Tweaks");
+    let block = theme::modal_frame("Tweaks");
     let inner = block.inner(panel_rect);
     f.render_widget(block, panel_rect);
 
@@ -76,8 +76,8 @@ fn render_accent_row(f: &mut Frame<'_>, app: &App, area: Rect) {
         Style::default().fg(COLORS.text_muted),
     )];
     for c in [
+        Accent::Blueprint,
         Accent::Cyan,
-        Accent::Amber,
         Accent::Green,
         Accent::Violet,
         Accent::Coral,

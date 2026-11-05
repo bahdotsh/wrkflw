@@ -347,6 +347,11 @@ impl Recorder {
 
 impl ExecutionObserver for Recorder {
     fn on_event(&self, event: &ExecutionEvent) {
+        // Live output stays out of the record and the event stream: the
+        // step's finish event carries all of it.
+        if matches!(event, ExecutionEvent::StepOutput { .. }) {
+            return;
+        }
         self.line(event_json(event));
         let mut record = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let id = record.id.clone();
@@ -358,7 +363,7 @@ impl ExecutionObserver for Recorder {
                 Self::job_mut(&mut record, job, canonical_name);
                 self.persist(&record);
             }
-            ExecutionEvent::StepStarted { .. } => {}
+            ExecutionEvent::StepStarted { .. } | ExecutionEvent::StepOutput { .. } => {}
             ExecutionEvent::StepFinished {
                 job,
                 step,
@@ -427,6 +432,9 @@ fn event_json(event: &ExecutionEvent) -> Value {
         ExecutionEvent::StepStarted { job, step, index } => {
             json!({"type": "step_started", "job": job, "step": step, "index": index})
         }
+        ExecutionEvent::StepOutput {
+            job, step, index, ..
+        } => json!({"type": "step_output", "job": job, "step": step, "index": index}),
         ExecutionEvent::StepFinished {
             job,
             step,

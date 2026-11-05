@@ -117,6 +117,20 @@ struct Wrkflw {
     )]
     platform: Vec<Option<(String, String)>>,
 
+    /// Start every job in an empty workspace, as a hosted runner does.
+    /// By default each job keeps its workspace between runs, so files the
+    /// repository ignores (build output, dependencies) carry over and
+    /// rebuilds are incremental
+    #[arg(long, global = true, env = "WRKFLW_FRESH_WORKSPACE")]
+    fresh_workspace: bool,
+
+    /// Run every matrix leg. By default a leg that would only repeat another
+    /// (same image, and the job reads nothing else that differs, as with
+    /// `runs-on: ${{ matrix.os }}` run locally) is reported with that leg's
+    /// result instead
+    #[arg(long, global = true, env = "WRKFLW_EVERY_MATRIX_LEG")]
+    every_matrix_leg: bool,
+
     #[command(flatten)]
     kubernetes: KubernetesArgs,
 }
@@ -954,6 +968,8 @@ async fn run_cli() {
 
     let platform_overrides = collect_platform_overrides(&cli.platform);
     let kubernetes = cli.kubernetes.to_config();
+    wrkflw_executor::run_options::set_fresh_workspaces(cli.fresh_workspace);
+    wrkflw_executor::run_options::set_every_matrix_leg(cli.every_matrix_leg);
 
     match &cli.command {
         Some(Commands::Validate {

@@ -125,6 +125,53 @@ pub struct WorkflowExecution {
     pub progress: f64, // 0.0 - 1.0 for progress bar
     /// The run as it happened, from the executor's events.
     pub timeline: Vec<TimelineEntry>,
+    /// What each job's steps are printing, as they print it.
+    pub live: LiveTails,
+}
+
+/// Lines of live output kept per job.
+pub const LIVE_TAIL_LINES: usize = 500;
+
+/// The end of what each job's current step printed, keyed by the job's
+/// display name (a matrix leg has its own).
+#[derive(Debug, Default)]
+pub struct LiveTails {
+    pub jobs: std::collections::HashMap<String, LiveTail>,
+    /// Bumped on every update, so the newest tail can be found.
+    pub seq: u64,
+}
+
+#[derive(Debug, Default)]
+pub struct LiveTail {
+    pub step: String,
+    pub lines: std::collections::VecDeque<String>,
+    pub updated: u64,
+}
+
+impl LiveTails {
+    pub fn push(&mut self, job: &str, step: &str, lines: Vec<String>) {
+        self.seq += 1;
+        let tail = self.jobs.entry(job.to_string()).or_default();
+        if tail.step != step {
+            tail.step = step.to_string();
+            tail.lines.clear();
+        }
+        tail.lines.extend(lines);
+        let excess = tail.lines.len().saturating_sub(LIVE_TAIL_LINES);
+        tail.lines.drain(..excess);
+        tail.updated = self.seq;
+    }
+
+    /// The tail to show: `job`'s if it has one, else the newest.
+    pub fn pick(&self, job: Option<&str>) -> Option<(&str, &LiveTail)> {
+        if let Some((name, tail)) = job.and_then(|j| self.jobs.get_key_value(j)) {
+            return Some((name.as_str(), tail));
+        }
+        self.jobs
+            .iter()
+            .max_by_key(|(_, tail)| tail.updated)
+            .map(|(name, tail)| (name.as_str(), tail))
+    }
 }
 
 impl WorkflowExecution {
@@ -195,7 +242,7 @@ impl TimelineEntry {
                 job: job.clone(),
                 canonical_name: canonical_name.clone(),
             }),
-            E::StepStarted { .. } => None,
+            E::StepStarted { .. } | E::StepOutput { .. } => None,
             E::StepFinished {
                 job,
                 step,
@@ -256,8 +303,35 @@ fn failure_tail(output: &str) -> Vec<String> {
         .collect()
 }
 
-/// A timeline entry for the workflow at the index.
-pub type TimelineMsg = (usize, TimelineEntry);
+/// What a run reports to the TUI while it runs.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RunUpdate {
+    Entry(TimelineEntry),
+    /// Lines a running step printed.
+    Output {
+        job: String,
+        step: String,
+        lines: Vec<String>,
+    },
+}
+
+impl RunUpdate {
+    pub fn from_event(event: &wrkflw_executor::ExecutionEvent) -> Option<Self> {
+        match event {
+            wrkflw_executor::ExecutionEvent::StepOutput {
+                job, step, lines, ..
+            } => Some(RunUpdate::Output {
+                job: job.clone(),
+                step: step.clone(),
+                lines: lines.clone(),
+            }),
+            other => TimelineEntry::from_event(other).map(RunUpdate::Entry),
+        }
+    }
+}
+
+/// An update for the workflow at the index.
+pub type TimelineMsg = (usize, RunUpdate);
 
 /// Job execution details
 pub struct JobExecution {
@@ -433,6 +507,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn live_tails_keep_the_current_step_and_the_newest_job() {
+        let mut live = LiveTails::default();
+        live.push("lint", "clippy", vec!["Checking a".into()]);
+        live.push("build", "compile", vec!["Compiling a".into()]);
+        assert_eq!(live.pick(None).map(|(job, _)| job), Some("build"));
+        assert_eq!(live.pick(Some("lint")).map(|(job, _)| job), Some("lint"));
+
+        // A new step starts its tail over; the tail stays bounded.
+        live.push("build", "test", vec!["running 3 tests".into()]);
+        let lines: Vec<String> = (0..LIVE_TAIL_LINES + 10).map(|i| i.to_string()).collect();
+        live.push("build", "test", lines);
+        let tail = &live.jobs["build"];
+        assert_eq!(tail.step, "test");
+        assert_eq!(tail.lines.len(), LIVE_TAIL_LINES);
+        assert_eq!(tail.lines.back().map(String::as_str), Some("509"));
+    }
+
+    #[test]
     fn debug_lines_are_classified_by_their_level_glyph() {
         let line = format!("[12:00:00] {} Failed command: error", symbols::DEBUG);
         assert_eq!(LogBadge::classify(&line), LogBadge::Debug);
@@ -521,6 +613,7 @@ mod tests {
                 finished("build (os: a)", 900),
                 finished("build (os: b)", 2_500),
             ],
+            live: Default::default(),
         };
         assert_eq!(exec.job_durations_ms().get("build"), Some(&2_500));
     }

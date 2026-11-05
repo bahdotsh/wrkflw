@@ -1124,6 +1124,7 @@ pub struct ExecutionResult {
     pub failure_details: Option<String>,
 }
 
+#[derive(Clone)]
 pub struct JobResult {
     pub name: String,
     /// The canonical job key from the workflow definition (e.g., "build").
@@ -2208,9 +2209,13 @@ fn generate_combined_dockerfile(runtimes: &[SetupRuntime], base_image: &str) -> 
         .map(|rt| rt.install_script.as_str())
         .collect();
 
+    // `build-essential` because hosted Ubuntu runners have a C toolchain,
+    // and Rust build scripts, node-gyp, Python C extensions and cgo all
+    // expect one.
     dockerfile.push_str("RUN apt-get update && \\\n");
     dockerfile.push_str(
-        "    apt-get install -y --no-install-recommends curl bash git ca-certificates gnupg",
+        "    apt-get install -y --no-install-recommends curl bash git ca-certificates gnupg \
+         build-essential",
     );
 
     for script in &scripts {
@@ -2859,14 +2864,17 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
     // Parallel jobs must not share GITHUB_ENV, GITHUB_OUTPUT and friends.
     let _job_env_files = environment::isolate_github_environment_files(&mut job_env)?;
 
-    // Create a temporary directory for this job execution
-    let job_dir = tempfile::tempdir()
-        .map_err(|e| ExecutionError::Execution(format!("Failed to create job directory: {}", e)))?;
-
     // Get the current project directory
     let current_dir = std::env::current_dir().map_err(|e| {
         ExecutionError::Execution(format!("Failed to get current directory: {}", e))
     })?;
+
+    // The job's workspace, kept from its last run so builds are incremental.
+    let job_dir =
+        crate::workspace::JobWorkspace::acquire(&current_dir, &ctx.workflow.name, ctx.job_name)
+            .map_err(|e| {
+                ExecutionError::Execution(format!("Failed to create job directory: {}", e))
+            })?;
 
     wrkflw_logging::info(&format!("Executing job: {}", ctx.job_name));
 
@@ -2904,42 +2912,44 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
 
         let outcome = match tokio::time::timeout(
             remaining,
-            run_step_with_guards(
-                step,
-                idx,
-                &job_env,
-                ctx.workflow,
-                StepExecutionContext {
+            loop_state
+                .live_step(idx, step)
+                .run(Box::pin(run_step_with_guards(
                     step,
-                    step_idx: idx,
-                    job_env: &job_env,
-                    job_user_env: &job_user_env,
-                    working_dir: job_dir.path(),
-                    runtime: ctx.runtime,
-                    workflow: ctx.workflow,
-                    runner_image: &runner_image_value,
-                    verbose: ctx.verbose,
-                    matrix_combination: &None,
-                    container_config: job.container.as_ref(),
-                    workflow_defaults: ctx.workflow.defaults.as_ref(),
-                    job_defaults: job.defaults.as_ref(),
-                    step_outputs: &loop_state.step_outputs_map,
-                    step_statuses: &loop_state.step_status_map,
-                    job_status: &loop_state.job_status_str,
-                    services: JobServices {
-                        secret_manager: ctx.services.secret_manager,
-                        secret_masker: ctx.services.secret_masker,
-                        secrets_context: ctx.services.secrets_context,
-                        missing_secrets: ctx.services.missing_secrets,
-                        needs_context: ctx.services.needs_context,
-                        needs_results: ctx.services.needs_results,
-                        artifact_store: ctx.services.artifact_store,
-                        cache_store: ctx.services.cache_store,
-                        platform_overrides: ctx.services.platform_overrides,
+                    idx,
+                    &job_env,
+                    ctx.workflow,
+                    StepExecutionContext {
+                        step,
+                        step_idx: idx,
+                        job_env: &job_env,
+                        job_user_env: &job_user_env,
+                        working_dir: job_dir.path(),
+                        runtime: ctx.runtime,
+                        workflow: ctx.workflow,
+                        runner_image: &runner_image_value,
+                        verbose: ctx.verbose,
+                        matrix_combination: &None,
+                        container_config: job.container.as_ref(),
+                        workflow_defaults: ctx.workflow.defaults.as_ref(),
+                        job_defaults: job.defaults.as_ref(),
+                        step_outputs: &loop_state.step_outputs_map,
+                        step_statuses: &loop_state.step_status_map,
+                        job_status: &loop_state.job_status_str,
+                        services: JobServices {
+                            secret_manager: ctx.services.secret_manager,
+                            secret_masker: ctx.services.secret_masker,
+                            secrets_context: ctx.services.secrets_context,
+                            missing_secrets: ctx.services.missing_secrets,
+                            needs_context: ctx.services.needs_context,
+                            needs_results: ctx.services.needs_results,
+                            artifact_store: ctx.services.artifact_store,
+                            cache_store: ctx.services.cache_store,
+                            platform_overrides: ctx.services.platform_overrides,
+                        },
+                        pending_cache_saves: &pending_cache_saves,
                     },
-                    pending_cache_saves: &pending_cache_saves,
-                },
-            ),
+                ))),
         )
         .await
         {
@@ -3025,8 +3035,33 @@ async fn execute_matrix_combinations(
     let mut results = Vec::new();
     let mut any_failed = false;
 
+    // Legs that would only repeat another leg run once; they take the
+    // result of the leg they repeat once it is known.
+    let twins = matrix_twins(
+        ctx.job_template,
+        ctx.combinations,
+        ctx.services.platform_overrides,
+    );
+    let unique: Vec<&MatrixCombination> = ctx
+        .combinations
+        .iter()
+        .zip(&twins)
+        .filter(|(_, twin)| twin.is_none())
+        .map(|(combination, _)| combination)
+        .collect();
+    let repeats = ctx.combinations.len() - unique.len();
+    if repeats > 0 {
+        wrkflw_logging::info(&format!(
+            "Matrix job '{}': running {} of {} legs; the other {} would only repeat one of them",
+            ctx.job_name,
+            unique.len(),
+            ctx.combinations.len(),
+            repeats
+        ));
+    }
+
     // Process combinations in chunks limited by max_parallel
-    for chunk in ctx.combinations.chunks(ctx.max_parallel) {
+    for chunk in unique.chunks(ctx.max_parallel) {
         // Skip processing if fail-fast is enabled and a previous job failed
         if ctx.fail_fast && any_failed {
             // Add skipped results for remaining combinations
@@ -3096,7 +3131,269 @@ async fn execute_matrix_combinations(
         }
     }
 
-    Ok(results)
+    if repeats == 0 {
+        return Ok(results);
+    }
+    // Back in matrix order, with each repeat taking its original's result.
+    let mut by_name: HashMap<String, JobResult> = results
+        .into_iter()
+        .map(|result| (result.name.clone(), result))
+        .collect();
+    let names: Vec<String> = ctx
+        .combinations
+        .iter()
+        .map(|c| wrkflw_matrix::format_combination_name(ctx.job_name, c))
+        .collect();
+    let mut ordered = Vec::with_capacity(names.len());
+    for (i, name) in names.iter().enumerate() {
+        match twins[i] {
+            None => ordered.extend(by_name.get(name).cloned()),
+            Some(original) => {
+                if let Some(result) = by_name.get(&names[original]) {
+                    let image = get_effective_runner_image(
+                        ctx.job_template,
+                        ctx.services.platform_overrides,
+                        Some(&ctx.combinations[i].values),
+                    );
+                    let twin = repeated_leg(name, result, &image);
+                    ordered.push(twin.clone());
+                    by_name.insert(name.clone(), twin);
+                }
+            }
+        }
+    }
+    Ok(ordered)
+}
+
+/// For each matrix leg, the earlier leg it would only repeat, if any.
+///
+/// Two legs repeat each other when they run in the same image and every
+/// matrix value on which they differ only picks the runner: `runs-on` reads
+/// it and nothing else in the job does. That is the common
+/// `runs-on: ${{ matrix.os }}` case: locally every OS runs in the same Linux
+/// image, so the legs would do identical work. A key nothing reads is left
+/// alone, since a matrix like `attempt: [1, 2, 3]` exists to repeat a job.
+/// Any reference to the matrix that can't be pinned to one key counts as
+/// reading all of them, so a leg is only folded away when that is safe.
+fn matrix_twins(
+    job: &Job,
+    combinations: &[MatrixCombination],
+    platform_overrides: &HashMap<String, String>,
+) -> Vec<Option<usize>> {
+    let mut twins = vec![None; combinations.len()];
+    if combinations.len() < 2 || crate::run_options::every_matrix_leg() {
+        return twins;
+    }
+    let Some(body) = job_body_text(job) else {
+        return twins;
+    };
+    let runs_on = job
+        .runs_on
+        .iter()
+        .flatten()
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("\n");
+    let images: Vec<String> = combinations
+        .iter()
+        .map(|c| get_effective_runner_image(job, platform_overrides, Some(&c.values)))
+        .collect();
+    for leg in 1..combinations.len() {
+        twins[leg] = (0..leg).filter(|&i| twins[i].is_none()).find(|&i| {
+            let differing = differing_keys(&combinations[i].values, &combinations[leg].values);
+            images[i] == images[leg]
+                && differing
+                    .iter()
+                    .all(|key| reads_matrix_keys(&runs_on, std::slice::from_ref(key)))
+                && !reads_matrix_keys(&body, &differing)
+        });
+    }
+    twins
+}
+
+/// The job as text, minus the two places a matrix value may appear without
+/// changing what the job does: `runs-on`, and the matrix itself.
+fn job_body_text(job: &Job) -> Option<String> {
+    let mut value = serde_json::to_value(job).ok()?;
+    let map = value.as_object_mut()?;
+    map.remove("runs-on");
+    map.remove("strategy");
+    Some(value.to_string())
+}
+
+/// Matrix keys whose values differ between two legs, lowercased.
+fn differing_keys(a: &HashMap<String, Value>, b: &HashMap<String, Value>) -> Vec<String> {
+    let mut keys: Vec<String> = a
+        .keys()
+        .chain(b.keys())
+        .filter(|key| a.get(*key) != b.get(*key))
+        .map(|key| key.to_lowercase())
+        .collect();
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+/// Whether `body` may read any of `keys` from the matrix. Expressions are
+/// case-insensitive, and `MATRIX_<KEY>`/`MATRIX_CONTEXT` are the variables
+/// wrkflw sets for each leg.
+fn reads_matrix_keys(body: &str, keys: &[String]) -> bool {
+    if body.contains("MATRIX_CONTEXT")
+        || keys
+            .iter()
+            .any(|key| body.contains(&format!("MATRIX_{}", key.to_uppercase())))
+    {
+        return true;
+    }
+    let is_word = |c: char| c.is_alphanumeric() || c == '_' || c == '-';
+    let lower = body.to_lowercase();
+    for (pos, _) in lower.match_indices("matrix") {
+        if lower[..pos].chars().next_back().is_some_and(is_word) {
+            continue;
+        }
+        let rest = &lower[pos + "matrix".len()..];
+        if rest.chars().next().is_some_and(is_word) {
+            continue;
+        }
+        // `matrix[...]`, `toJSON(matrix)` or a bare mention: can't tell
+        // which key, so assume any.
+        let Some(rest) = rest.strip_prefix('.') else {
+            return true;
+        };
+        let key: String = rest.chars().take_while(|&c| is_word(c)).collect();
+        if key == "*" || keys.contains(&key) {
+            return true;
+        }
+    }
+    false
+}
+
+/// The result of a leg that wasn't run because it would only repeat
+/// `original`, reported under its own name.
+fn repeated_leg(name: &str, original: &JobResult, image: &str) -> JobResult {
+    let note = format!(
+        "Not run: it would repeat {} exactly, since both run in {} and the job reads \
+         nothing else that differs. Pass --every-matrix-leg to run it anyway.",
+        original.name, image
+    );
+    crate::events::emit(|| crate::events::ExecutionEvent::JobStarted {
+        job: name.to_string(),
+        canonical_name: original.canonical_name.clone(),
+    });
+    crate::events::emit(|| crate::events::ExecutionEvent::JobFinished {
+        job: name.to_string(),
+        status: original.status.clone(),
+        failure_allowed: original.failure_allowed,
+        duration_ms: 0,
+        logs: note.clone(),
+    });
+    wrkflw_logging::info(&format!(
+        "{} Job '{}': {}",
+        wrkflw_logging::symbols::SKIPPED,
+        name,
+        note
+    ));
+    JobResult {
+        name: name.to_string(),
+        logs: format!("{}\n\n{}", note, original.logs),
+        ..(*original).clone()
+    }
+}
+
+#[cfg(test)]
+mod matrix_twin_tests {
+    use super::*;
+
+    fn job(yaml: &str) -> Job {
+        serde_yaml::from_str(yaml).unwrap()
+    }
+
+    fn legs(key: &str, values: &[&str]) -> Vec<MatrixCombination> {
+        values
+            .iter()
+            .map(|v| {
+                MatrixCombination::new(HashMap::from([(
+                    key.to_string(),
+                    Value::String(v.to_string()),
+                )]))
+            })
+            .collect()
+    }
+
+    const OS_LEGS: &[&str] = &["ubuntu-latest", "macos-latest", "windows-latest"];
+
+    #[test]
+    fn legs_that_differ_only_in_runs_on_run_once() {
+        let job = job("runs-on: ${{ matrix.os }}\nsteps:\n  - run: make test\n");
+        let twins = matrix_twins(&job, &legs("os", OS_LEGS), &HashMap::new());
+        assert_eq!(twins, vec![None, Some(0), Some(0)]);
+    }
+
+    #[test]
+    fn a_step_reading_the_key_keeps_every_leg() {
+        for body in [
+            "steps:\n  - run: echo ${{ matrix.os }}\n",
+            "steps:\n  - run: echo ${{ Matrix.OS }}\n",
+            "steps:\n  - if: matrix.os == 'windows-latest'\n    run: dir\n",
+            "steps:\n  - run: echo $MATRIX_OS\n",
+            "steps:\n  - run: echo '${{ toJSON(matrix) }}'\n",
+            "steps:\n  - run: echo ${{ matrix['os'] }}\n",
+            "env:\n  TARGET: ${{ matrix.os }}\nsteps:\n  - run: make\n",
+        ] {
+            let job = job(&format!("runs-on: ${{{{ matrix.os }}}}\n{body}"));
+            let twins = matrix_twins(&job, &legs("os", OS_LEGS), &HashMap::new());
+            assert_eq!(twins, vec![None, None, None], "{body}");
+        }
+    }
+
+    #[test]
+    fn reading_a_key_that_is_the_same_in_both_legs_is_fine() {
+        let job = job(
+            "runs-on: ${{ matrix.os }}\nsteps:\n  - run: cargo +${{ matrix.toolchain }} test\n",
+        );
+        let combos: Vec<MatrixCombination> = OS_LEGS
+            .iter()
+            .map(|os| {
+                MatrixCombination::new(HashMap::from([
+                    ("os".to_string(), Value::String(os.to_string())),
+                    ("toolchain".to_string(), Value::String("stable".to_string())),
+                ]))
+            })
+            .collect();
+        assert_eq!(
+            matrix_twins(&job, &combos, &HashMap::new()),
+            vec![None, Some(0), Some(0)]
+        );
+    }
+
+    #[test]
+    fn legs_in_different_images_all_run() {
+        let job = job("runs-on: ${{ matrix.os }}\nsteps:\n  - run: make test\n");
+        let overrides = HashMap::from([("macos-latest".to_string(), "my/mac:1".to_string())]);
+        let twins = matrix_twins(&job, &legs("os", OS_LEGS), &overrides);
+        assert_eq!(twins, vec![None, None, Some(0)]);
+    }
+
+    #[test]
+    fn a_container_image_from_the_matrix_keeps_every_leg() {
+        let job = job("container: node:${{ matrix.node }}\nsteps:\n  - run: npm test\n");
+        let twins = matrix_twins(&job, &legs("node", &["18", "20"]), &HashMap::new());
+        assert_eq!(twins, vec![None, None]);
+    }
+
+    #[test]
+    fn a_key_nothing_reads_still_repeats_the_job() {
+        let job = job("runs-on: ubuntu-latest\nsteps:\n  - run: ./flaky-test\n");
+        let twins = matrix_twins(&job, &legs("attempt", &["1", "2", "3"]), &HashMap::new());
+        assert_eq!(twins, vec![None, None, None]);
+    }
+
+    #[test]
+    fn the_word_matrix_elsewhere_counts_as_reading_it() {
+        let job = job("runs-on: ${{ matrix.os }}\nsteps:\n  - name: test matrix\n    run: make\n");
+        let twins = matrix_twins(&job, &legs("os", OS_LEGS), &HashMap::new());
+        assert_eq!(twins, vec![None, None, None]);
+    }
 }
 
 /// Execute a single matrix job combination
@@ -3175,14 +3472,17 @@ async fn execute_matrix_job(
     // Parallel matrix legs must not share GITHUB_ENV, GITHUB_OUTPUT and friends.
     let _job_env_files = environment::isolate_github_environment_files(&mut job_env)?;
 
-    // Create a temporary directory for this job execution
-    let job_dir = tempfile::tempdir()
-        .map_err(|e| ExecutionError::Execution(format!("Failed to create job directory: {}", e)))?;
-
     // Get the current project directory
     let current_dir = std::env::current_dir().map_err(|e| {
         ExecutionError::Execution(format!("Failed to get current directory: {}", e))
     })?;
+
+    // The job's workspace, kept from its last run so builds are incremental.
+    let job_dir =
+        crate::workspace::JobWorkspace::acquire(&current_dir, &workflow.name, &matrix_job_name)
+            .map_err(|e| {
+                ExecutionError::Execution(format!("Failed to create job directory: {}", e))
+            })?;
 
     // Pre-resolve ${{ matrix.X }} in all step `with` values so that every downstream
     // consumer (detect_setup_runtimes, INPUT_* env vars, composite action inputs, etc.)
@@ -3226,42 +3526,44 @@ async fn execute_matrix_job(
 
             let outcome = match tokio::time::timeout(
                 remaining,
-                run_step_with_guards(
-                    step,
-                    idx,
-                    &job_env,
-                    workflow,
-                    StepExecutionContext {
+                loop_state
+                    .live_step(idx, step)
+                    .run(Box::pin(run_step_with_guards(
                         step,
-                        step_idx: idx,
-                        job_env: &job_env,
-                        job_user_env: &job_user_env,
-                        working_dir: job_dir.path(),
-                        runtime,
+                        idx,
+                        &job_env,
                         workflow,
-                        runner_image: &runner_image_value,
-                        verbose,
-                        matrix_combination: &Some(combination.values.clone()),
-                        container_config: job_template.container.as_ref(),
-                        workflow_defaults: workflow.defaults.as_ref(),
-                        job_defaults: job_template.defaults.as_ref(),
-                        step_outputs: &loop_state.step_outputs_map,
-                        step_statuses: &loop_state.step_status_map,
-                        job_status: &loop_state.job_status_str,
-                        services: JobServices {
-                            secret_manager: services.secret_manager,
-                            secret_masker: services.secret_masker,
-                            secrets_context: services.secrets_context,
-                            missing_secrets: services.missing_secrets,
-                            needs_context: services.needs_context,
-                            needs_results: services.needs_results,
-                            artifact_store: services.artifact_store,
-                            cache_store: services.cache_store,
-                            platform_overrides: services.platform_overrides,
+                        StepExecutionContext {
+                            step,
+                            step_idx: idx,
+                            job_env: &job_env,
+                            job_user_env: &job_user_env,
+                            working_dir: job_dir.path(),
+                            runtime,
+                            workflow,
+                            runner_image: &runner_image_value,
+                            verbose,
+                            matrix_combination: &Some(combination.values.clone()),
+                            container_config: job_template.container.as_ref(),
+                            workflow_defaults: workflow.defaults.as_ref(),
+                            job_defaults: job_template.defaults.as_ref(),
+                            step_outputs: &loop_state.step_outputs_map,
+                            step_statuses: &loop_state.step_status_map,
+                            job_status: &loop_state.job_status_str,
+                            services: JobServices {
+                                secret_manager: services.secret_manager,
+                                secret_masker: services.secret_masker,
+                                secrets_context: services.secrets_context,
+                                missing_secrets: services.missing_secrets,
+                                needs_context: services.needs_context,
+                                needs_results: services.needs_results,
+                                artifact_store: services.artifact_store,
+                                cache_store: services.cache_store,
+                                platform_overrides: services.platform_overrides,
+                            },
+                            pending_cache_saves: &pending_cache_saves,
                         },
-                        pending_cache_saves: &pending_cache_saves,
-                    },
-                ),
+                    ))),
             )
             .await
             {
@@ -3434,6 +3736,96 @@ struct StepLoopState {
     missing_secrets: HashSet<String>,
 }
 
+/// Streams one step's output to the run's observers as whole, masked
+/// lines while the step runs.
+struct LiveStep {
+    job: String,
+    step: String,
+    index: usize,
+    workspace_prefixes: Vec<String>,
+}
+
+/// Longest partial line held back waiting for its newline.
+const LIVE_LINE_LIMIT: usize = 4096;
+
+impl LiveStep {
+    /// `future` is boxed by the caller: a step's future is large, and laid
+    /// out inline in every job future it would overflow the stack once
+    /// reusable workflows nest jobs.
+    async fn run<F: std::future::Future>(self, future: std::pin::Pin<Box<F>>) -> F::Output {
+        let observers = crate::events::current_observers();
+        if observers.is_empty() {
+            return future.await;
+        }
+        let state = Arc::new(LiveLines {
+            step: self,
+            observers,
+            pending: Mutex::new(String::new()),
+        });
+        let sink = state.clone();
+        let tap = wrkflw_runtime::live_output::OutputTap::new(move |chunk| sink.push(chunk));
+        let output = wrkflw_runtime::live_output::with_output_tap(tap, future).await;
+        state.flush();
+        output
+    }
+}
+
+struct LiveLines {
+    step: LiveStep,
+    observers: Vec<Arc<dyn crate::events::ExecutionObserver>>,
+    /// Output after the last newline. Lines are held until complete so a
+    /// secret split across two chunks is still masked.
+    pending: Mutex<String>,
+}
+
+impl LiveLines {
+    fn push(&self, chunk: &str) {
+        let lines = {
+            let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+            pending.push_str(chunk);
+            let cut = match pending.rfind(['\n', '\r']) {
+                Some(at) => at + 1,
+                None if pending.len() > LIVE_LINE_LIMIT => pending.len(),
+                None => return,
+            };
+            let complete: String = pending.drain(..cut).collect();
+            complete
+        };
+        self.send(&lines);
+    }
+
+    fn flush(&self) {
+        let rest = std::mem::take(&mut *self.pending.lock().unwrap_or_else(|e| e.into_inner()));
+        self.send(&rest);
+    }
+
+    fn send(&self, text: &str) {
+        let lines: Vec<String> = text
+            .split(['\n', '\r'])
+            .filter(|line| !line.is_empty())
+            .map(|line| {
+                let line = crate::log_redaction::mask(line);
+                self.step
+                    .workspace_prefixes
+                    .iter()
+                    .fold(line, |line, prefix| line.replace(prefix, ""))
+            })
+            .collect();
+        if lines.is_empty() {
+            return;
+        }
+        let event = crate::events::ExecutionEvent::StepOutput {
+            job: self.step.job.clone(),
+            step: self.step.step.clone(),
+            index: self.step.index,
+            lines,
+        };
+        for observer in &self.observers {
+            observer.on_event(&event);
+        }
+    }
+}
+
 /// The step being executed, as its finish event reports it.
 struct InFlightStep {
     index: usize,
@@ -3491,6 +3883,16 @@ impl StepLoopState {
             command: step.run.clone(),
             uses: step.uses.clone(),
         });
+    }
+
+    /// What streams step `index`'s output to observers while it runs.
+    fn live_step(&self, index: usize, step: &workflow::Step) -> LiveStep {
+        LiveStep {
+            job: self.job_label.clone(),
+            step: step_display_name(step, index),
+            index,
+            workspace_prefixes: self.workspace_prefixes.clone(),
+        }
     }
 
     /// Report the step in flight as finished. `result.output` must already
@@ -5438,8 +5840,95 @@ fn create_gitignore_matcher(
     }
 }
 
+/// Bring `to` up to date with the source files in `from`, as a checkout does.
+///
+/// Job workspaces are kept between runs, so this syncs rather than copies:
+/// unchanged files are left alone with their timestamps, which keeps build
+/// tools from rebuilding them; changed files are copied with the source's
+/// timestamp; and source files deleted since the last run are removed. What
+/// the repository ignores (build output, dependencies) is never touched.
 fn copy_directory_contents(from: &Path, to: &Path) -> Result<(), ExecutionError> {
-    copy_directory_contents_with_gitignore(from, to, None)
+    // Syncing a directory onto itself would only risk deleting from it.
+    if let (Ok(a), Ok(b)) = (from.canonicalize(), to.canonicalize()) {
+        if a == b {
+            return Ok(());
+        }
+    }
+    copy_directory_contents_with_gitignore(from, to, None)?;
+    // A checkout is a git repository, and steps run `git describe`, `git
+    // diff` and the like. A `.git` file (a worktree or submodule) points at a
+    // host path a container can't see, so only a directory is mirrored.
+    let git_dir = from.join(".git");
+    if git_dir.is_dir() && !git_dir.is_symlink() {
+        mirror_directory(&git_dir, &to.join(".git"))?;
+    }
+    Ok(())
+}
+
+/// Make `to` an exact copy of `from`, copying only files that changed.
+fn mirror_directory(from: &Path, to: &Path) -> Result<(), ExecutionError> {
+    let io_err = |what: &str, e: std::io::Error| ExecutionError::Execution(format!("{what}: {e}"));
+    if to.exists() && !to.is_dir() {
+        std::fs::remove_file(to).map_err(|e| io_err("Failed to replace file with dir", e))?;
+    }
+    std::fs::create_dir_all(to).map_err(|e| io_err("Failed to create dir", e))?;
+
+    let mut synced: HashSet<std::ffi::OsString> = HashSet::new();
+    for entry in std::fs::read_dir(from).map_err(|e| io_err("Failed to read directory", e))? {
+        let entry = entry.map_err(|e| io_err("Failed to read entry", e))?;
+        let path = entry.path();
+        if path.is_symlink() {
+            continue;
+        }
+        let dest_path = to.join(entry.file_name());
+        if path.is_dir() {
+            mirror_directory(&path, &dest_path)?;
+        } else {
+            sync_file(&path, &dest_path)?;
+        }
+        synced.insert(entry.file_name());
+    }
+
+    for entry in std::fs::read_dir(to)
+        .map_err(|e| io_err("Failed to read directory", e))?
+        .flatten()
+    {
+        if synced.contains(&entry.file_name()) {
+            continue;
+        }
+        let path = entry.path();
+        let removed = if path.is_dir() && !path.is_symlink() {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+        removed.map_err(|e| io_err(&format!("Failed to remove {}", path.display()), e))?;
+    }
+    Ok(())
+}
+
+/// Whether a directory entry named `name` counts as a source file: not a
+/// symlink, not ignored, and not one of the hidden files a checkout skips.
+fn is_source_entry(
+    path: &Path,
+    name: &str,
+    relative: &Path,
+    gitignore: Option<&ignore::gitignore::Gitignore>,
+) -> bool {
+    if path.is_symlink() {
+        return false;
+    }
+    if let Some(gitignore) = gitignore {
+        if let Match::Ignore(_) = gitignore.matched(relative, path.is_dir()) {
+            return false;
+        }
+    }
+    // Skip most hidden files but allow important ones
+    !(name.starts_with('.')
+        && name != ".gitignore"
+        && name != ".github"
+        && name != ".gitea"
+        && !name.starts_with(".env"))
 }
 
 fn copy_directory_contents_with_gitignore(
@@ -5455,85 +5944,98 @@ fn copy_directory_contents_with_gitignore(
     } else {
         gitignore
     };
+    let io_err = |what: &str, e: std::io::Error| ExecutionError::Execution(format!("{what}: {e}"));
 
-    // Log summary of the copy operation
     wrkflw_logging::debug(&format!(
-        "Copying directory contents from {} to {}",
+        "Syncing directory contents from {} to {}",
         from.display(),
         to.display()
     ));
 
-    for entry in std::fs::read_dir(from)
-        .map_err(|e| ExecutionError::Execution(format!("Failed to read directory: {}", e)))?
-    {
-        let entry =
-            entry.map_err(|e| ExecutionError::Execution(format!("Failed to read entry: {}", e)))?;
+    let mut synced: HashSet<std::ffi::OsString> = HashSet::new();
+    for entry in std::fs::read_dir(from).map_err(|e| io_err("Failed to read directory", e))? {
+        let entry = entry.map_err(|e| io_err("Failed to read entry", e))?;
         let path = entry.path();
-
-        if path.is_symlink() {
-            wrkflw_logging::debug(&format!("Skipping symlink: {:?}", path));
+        let name = entry.file_name();
+        let relative = path.strip_prefix(from).unwrap_or(&path);
+        if !is_source_entry(&path, &name.to_string_lossy(), relative, gitignore) {
             continue;
         }
-
-        // Check if the file should be ignored according to .gitignore
-        if let Some(gitignore) = gitignore {
-            let relative_path = path.strip_prefix(from).unwrap_or(&path);
-            match gitignore.matched(relative_path, path.is_dir()) {
-                Match::Ignore(_) => {
-                    wrkflw_logging::debug(&format!("Skipping ignored file/directory: {path:?}"));
-                    continue;
-                }
-                Match::Whitelist(_) | Match::None => {
-                    // File is not ignored or explicitly whitelisted
-                }
-            }
-        }
-
-        // Log individual files only in trace mode (removed verbose per-file logging)
-
-        // Additional basic filtering for hidden files (but allow .gitignore and .github)
-        let file_name = match path.file_name() {
-            Some(name) => name.to_string_lossy(),
-            None => {
-                return Err(ExecutionError::Execution(format!(
-                    "Failed to get file name from path: {:?}",
-                    path
-                )));
-            }
-        };
-
-        // Skip most hidden files but allow important ones
-        if file_name.starts_with(".")
-            && file_name != ".gitignore"
-            && file_name != ".github"
-            && file_name != ".gitea"
-            && !file_name.starts_with(".env")
-        {
-            continue;
-        }
-
-        let dest_path = match path.file_name() {
-            Some(name) => to.join(name),
-            None => {
-                return Err(ExecutionError::Execution(format!(
-                    "Failed to get file name from path: {:?}",
-                    path
-                )));
-            }
-        };
+        synced.insert(name.clone());
+        let dest_path = to.join(&name);
 
         if path.is_dir() {
-            std::fs::create_dir_all(&dest_path)
-                .map_err(|e| ExecutionError::Execution(format!("Failed to create dir: {}", e)))?;
+            if dest_path.exists() && !dest_path.is_dir() {
+                std::fs::remove_file(&dest_path)
+                    .map_err(|e| io_err("Failed to replace file with dir", e))?;
+            }
+            std::fs::create_dir_all(&dest_path).map_err(|e| io_err("Failed to create dir", e))?;
 
             // Recursively copy subdirectories with the same gitignore
             copy_directory_contents_with_gitignore(&path, &dest_path, gitignore)?;
         } else {
-            std::fs::copy(&path, &dest_path)
-                .map_err(|e| ExecutionError::Execution(format!("Failed to copy file: {}", e)))?;
+            sync_file(&path, &dest_path)?;
         }
     }
 
+    // Remove source files deleted since the last run. Only entries that
+    // would have been synced are candidates, so ignored build output and
+    // hidden tool state stay.
+    let Ok(existing) = std::fs::read_dir(to) else {
+        return Ok(());
+    };
+    for entry in existing.flatten() {
+        let name = entry.file_name();
+        if synced.contains(&name) {
+            continue;
+        }
+        let path = entry.path();
+        if !is_source_entry(&path, &name.to_string_lossy(), Path::new(&name), gitignore) {
+            continue;
+        }
+        let removed = if path.is_dir() {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+        removed.map_err(|e| {
+            io_err(
+                &format!(
+                    "Failed to remove {} from the job's saved workspace (set {}=1 to start \
+                     from an empty one)",
+                    path.display(),
+                    crate::run_options::FRESH_WORKSPACE_ENV
+                ),
+                e,
+            )
+        })?;
+    }
+
+    Ok(())
+}
+
+/// Copy `from` to `to` unless `to` already matches it, keeping the source's
+/// modification time so build tools see the file as unchanged.
+fn sync_file(from: &Path, to: &Path) -> Result<(), ExecutionError> {
+    let source = std::fs::metadata(from)
+        .map_err(|e| ExecutionError::Execution(format!("Failed to read file: {}", e)))?;
+    if to.is_dir() {
+        std::fs::remove_dir_all(to).map_err(|e| {
+            ExecutionError::Execution(format!("Failed to replace dir with file: {}", e))
+        })?;
+    }
+    if let Ok(dest) = std::fs::metadata(to) {
+        if dest.len() == source.len() && dest.modified().ok() == source.modified().ok() {
+            return Ok(());
+        }
+    }
+    std::fs::copy(from, to)
+        .map_err(|e| ExecutionError::Execution(format!("Failed to copy file: {}", e)))?;
+    if let Ok(modified) = source.modified() {
+        if let Ok(file) = std::fs::File::options().write(true).open(to) {
+            let _ = file.set_modified(modified);
+        }
+    }
     Ok(())
 }
 
@@ -7373,6 +7875,79 @@ mod tests {
         assert_eq!(from_json_argument("fromJSON(a) || fromJSON(b)"), None);
         assert_eq!(from_json_argument("toJSON(a)"), None);
         assert_eq!(from_json_argument("github.event"), None);
+    }
+
+    #[test]
+    fn workspace_sync_keeps_build_output_and_unchanged_timestamps() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join(".gitignore"), "out/\n").unwrap();
+        std::fs::create_dir_all(src.path().join("lib")).unwrap();
+        std::fs::write(src.path().join("lib/keep.c"), "same").unwrap();
+        std::fs::write(src.path().join("lib/edit.c"), "old").unwrap();
+        std::fs::write(src.path().join("gone.c"), "deleted later").unwrap();
+        copy_directory_contents(src.path(), dst.path()).unwrap();
+
+        // The job builds, and leaves output the repository ignores.
+        std::fs::create_dir_all(dst.path().join("out")).unwrap();
+        std::fs::write(dst.path().join("out/app"), "binary").unwrap();
+        let kept_mtime = std::fs::metadata(dst.path().join("lib/keep.c"))
+            .unwrap()
+            .modified()
+            .unwrap();
+
+        // Between runs: one file edited, one deleted.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(src.path().join("lib/edit.c"), "new!").unwrap();
+        std::fs::remove_file(src.path().join("gone.c")).unwrap();
+        copy_directory_contents(src.path(), dst.path()).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(dst.path().join("lib/edit.c")).unwrap(),
+            "new!"
+        );
+        assert!(!dst.path().join("gone.c").exists());
+        assert!(dst.path().join("out/app").exists());
+        assert_eq!(
+            std::fs::metadata(dst.path().join("lib/keep.c"))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            kept_mtime
+        );
+        assert_eq!(
+            std::fs::metadata(dst.path().join("lib/edit.c"))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            std::fs::metadata(src.path().join("lib/edit.c"))
+                .unwrap()
+                .modified()
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn workspace_sync_mirrors_the_git_directory() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(src.path().join(".git/objects/pack")).unwrap();
+        std::fs::write(src.path().join(".git/HEAD"), "ref: refs/heads/main").unwrap();
+        std::fs::write(src.path().join(".git/objects/pack/old.pack"), "x").unwrap();
+        copy_directory_contents(src.path(), dst.path()).unwrap();
+        assert!(dst.path().join(".git/objects/pack/old.pack").is_file());
+
+        // `git gc` repacks between runs.
+        std::fs::remove_file(src.path().join(".git/objects/pack/old.pack")).unwrap();
+        std::fs::write(src.path().join(".git/objects/pack/new.pack"), "y").unwrap();
+        copy_directory_contents(src.path(), dst.path()).unwrap();
+
+        assert!(!dst.path().join(".git/objects/pack/old.pack").exists());
+        assert!(dst.path().join(".git/objects/pack/new.pack").is_file());
+        assert_eq!(
+            std::fs::read_to_string(dst.path().join(".git/HEAD")).unwrap(),
+            "ref: refs/heads/main"
+        );
     }
 
     #[test]

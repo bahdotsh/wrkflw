@@ -4,6 +4,7 @@ mod execution_tab;
 mod help_overlay;
 mod job_detail;
 mod logs_tab;
+mod run_header;
 mod runs_tab;
 mod secrets_tab;
 mod status_bar;
@@ -18,8 +19,8 @@ pub use job_detail::StepOutputCache;
 pub const INSPECTOR_TABS: usize = job_detail::INSPECTOR_TABS.len();
 
 pub use title_bar::{
-    TAB_COUNT, TAB_DAG, TAB_EXECUTION, TAB_HELP, TAB_LOGS, TAB_RUNS, TAB_SECRETS, TAB_TRIGGER,
-    TAB_WORKFLOWS,
+    tab_of, SCREEN_COUNT, TABS, TAB_COUNT, TAB_DAG, TAB_EXECUTION, TAB_LOGS, TAB_RUN, TAB_RUNS,
+    TAB_SECRETS, TAB_TRIGGER, TAB_WORKFLOWS,
 };
 
 use crate::app::App;
@@ -55,36 +56,57 @@ pub fn render_ui(f: &mut Frame<'_>, app: &mut App) {
     let _accent = AccentScope::install(ratatui::style::Color::Rgb(r, g, b));
 
     let size = f.area();
+    // Paint the palette's own background so the theme looks the same in
+    // every terminal instead of inheriting its colours.
+    f.render_widget(
+        ratatui::widgets::Paragraph::new("")
+            .style(ratatui::style::Style::default().bg(crate::theme::COLORS.bg_panel)),
+        size,
+    );
 
     // Create main layout
     let main_chunks = ratatui::layout::Layout::default()
         .direction(ratatui::layout::Direction::Vertical)
         .constraints([
-            ratatui::layout::Constraint::Length(1), // Title bar and tabs
+            ratatui::layout::Constraint::Length(2), // Title bar: tab buttons and their shadows
             ratatui::layout::Constraint::Min(0),    // Main content
-            ratatui::layout::Constraint::Length(1), // Status bar
+            ratatui::layout::Constraint::Length(2), // Key bar and its button shadows
         ])
         .split(size);
 
     // Render title bar with tabs
     title_bar::render_title_bar(f, app, main_chunks[0]);
 
+    // The Run tab's views share a header: the run's summary and the
+    // Jobs · Graph · Log switcher.
+    let mut content = main_chunks[1];
+    if tab_of(app.selected_tab) == TAB_RUN && !app.detailed_view {
+        let parts = ratatui::layout::Layout::default()
+            .direction(ratatui::layout::Direction::Vertical)
+            .constraints([
+                ratatui::layout::Constraint::Length(3),
+                ratatui::layout::Constraint::Min(0),
+            ])
+            .split(content);
+        run_header::render_run_header(f, app, parts[0]);
+        content = parts[1];
+    }
+
     // Render main content based on selected tab
     match app.selected_tab {
-        TAB_WORKFLOWS => workflows_tab::render_workflows_tab(f, app, main_chunks[1]),
+        TAB_WORKFLOWS => workflows_tab::render_workflows_tab(f, app, content),
         TAB_EXECUTION => {
             if app.detailed_view {
-                job_detail::render_job_detail_view(f, app, main_chunks[1])
+                job_detail::render_job_detail_view(f, app, content)
             } else {
-                execution_tab::render_execution_tab(f, app, main_chunks[1])
+                execution_tab::render_execution_tab(f, app, content)
             }
         }
-        TAB_DAG => dag_tab::render_dag_tab(f, app, main_chunks[1]),
-        TAB_LOGS => logs_tab::render_logs_tab(f, app, main_chunks[1]),
-        TAB_TRIGGER => trigger_tab::render_trigger_tab(f, app, main_chunks[1]),
-        TAB_SECRETS => secrets_tab::render_secrets_tab(f, app, main_chunks[1]),
-        TAB_RUNS => runs_tab::render_runs_tab(f, app, main_chunks[1]),
-        TAB_HELP => help_overlay::render_help_content(f, main_chunks[1], &mut app.help_scroll),
+        TAB_DAG => dag_tab::render_dag_tab(f, app, content),
+        TAB_LOGS => logs_tab::render_logs_tab(f, app, content),
+        TAB_TRIGGER => trigger_tab::render_trigger_tab(f, app, content),
+        TAB_SECRETS => secrets_tab::render_secrets_tab(f, app, content),
+        TAB_RUNS => runs_tab::render_runs_tab(f, app, content),
         _ => {}
     }
 

@@ -25,6 +25,11 @@ pub(crate) fn register(value: &str) {
     });
 }
 
+/// `text` with every registered value masked.
+pub(crate) fn mask(text: &str) -> String {
+    LOG_MASKER.mask(text)
+}
+
 /// Mask each of `values` in every log message from now on.
 pub(crate) fn register_all<'a>(values: impl IntoIterator<Item = &'a String>) {
     for value in values {

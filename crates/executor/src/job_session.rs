@@ -556,6 +556,29 @@ async fn cli_output(
     args: &[String],
     stdin: Option<&str>,
 ) -> Result<ContainerOutput, ContainerError> {
+    run_cli(cli, args, stdin, false).await
+}
+
+/// `child`'s output, passed to the live tap as it is printed when `live`.
+async fn wait_with_tap(
+    child: tokio::process::Child,
+    live: bool,
+) -> std::io::Result<std::process::Output> {
+    if live {
+        wrkflw_runtime::live_output::wait_with_live_output(child).await
+    } else {
+        child.wait_with_output().await
+    }
+}
+
+/// [`cli_output`], optionally streaming what the command prints to the live
+/// tap; only a step's own command should.
+async fn run_cli(
+    cli: &str,
+    args: &[String],
+    stdin: Option<&str>,
+    live: bool,
+) -> Result<ContainerOutput, ContainerError> {
     use tokio::io::AsyncWriteExt;
     let start_error =
         |e: std::io::Error| ContainerError::ContainerStart(format!("Failed to run {}: {}", cli, e));
@@ -579,7 +602,7 @@ async fn cli_output(
             let _ = pipe.write_all(input.as_bytes()).await;
         }
     };
-    let ((), output) = tokio::join!(write, child.wait_with_output());
+    let ((), output) = tokio::join!(write, wait_with_tap(child, live));
     let output = output.map_err(start_error)?;
     Ok(ContainerOutput {
         stdout: String::from_utf8_lossy(&output.stdout).to_string(),
@@ -865,7 +888,7 @@ impl JobSession {
         state.busy = true;
 
         let args = exec_args(&id, working_dir, cmd);
-        let output = cli_output(self.cli, &args, Some(&script)).await;
+        let output = run_cli(self.cli, &args, Some(&script), true).await;
         state.busy = false;
         output.map(Some).map_err(|e| e.to_string())
     }

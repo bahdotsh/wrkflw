@@ -1,5 +1,5 @@
-// Help — every key binding, grouped by where it applies. Rendered as a
-// tab (8) or as an overlay over the current screen (?). Two columns when
+// Help — every key binding, grouped by where it applies. Floats over
+// the current screen (? or h). Two columns when
 // there's room, one otherwise; scrolling is clamped to the content.
 use crate::text;
 use crate::theme::{self, COLORS};
@@ -21,11 +21,12 @@ fn sections() -> Vec<Section> {
             vec![
                 (k("Tab / Shift+Tab"), "next / previous tab"),
                 (format!("1–{}", super::TAB_COUNT), "jump to a tab"),
-                (k("w x l h"), "Workflows · Execution · Logs · Help"),
+                (k("w"), "Workflows"),
+                (k("x g l"), "Run: jobs · graph · log"),
                 (k("↑↓ or k j"), "move in lists"),
                 (k("Enter"), "open / run"),
                 (k("Esc"), "back"),
-                (k("?"), "this help"),
+                (k("? or h"), "this help"),
                 (k(","), "tweaks (accent colour)"),
                 (k("q or Ctrl+C"), "quit"),
             ],
@@ -40,14 +41,14 @@ fn sections() -> Vec<Section> {
                 (k("Home / End"), "first / last workflow"),
                 (k("Shift+J"), "pick one job to run"),
                 (k("Shift+R"), "reset statuses"),
-                (k("t"), "trigger on GitHub / GitLab"),
+                (k("t"), "dispatch on GitHub / GitLab"),
                 (k("e"), "cycle runtime"),
                 (k("v"), "validate instead of run"),
                 (k("d / Shift+D"), "diff filter on/off · event"),
             ],
         ),
         (
-            "Execution",
+            "Run · jobs",
             vec![
                 (k("↑↓"), "choose a job"),
                 (k("Home / End"), "first / last job"),
@@ -58,16 +59,16 @@ fn sections() -> Vec<Section> {
             ],
         ),
         (
-            "Graph",
+            "Run · graph",
             vec![
                 (k("g"), "graph ↔ list"),
                 (k("← →"), "scroll stages"),
                 (k("↑↓"), "previous / next workflow"),
-                (k("Enter"), "open the run"),
+                (k("Enter"), "back to jobs"),
             ],
         ),
         (
-            "Logs",
+            "Run · log",
             vec![
                 (k("o"), "story ↔ raw log"),
                 (k("s"), "search the raw log"),
@@ -79,7 +80,7 @@ fn sections() -> Vec<Section> {
             ],
         ),
         (
-            "Trigger",
+            "Dispatch",
             vec![
                 (k("p"), "GitHub ↔ GitLab"),
                 (k("↑↓"), "workflow"),
@@ -89,7 +90,7 @@ fn sections() -> Vec<Section> {
                 (k("Tab"), "next field, while editing"),
                 (k("Enter"), "dispatch / finish editing"),
                 (k("Esc"), "stop editing"),
-                (k("c"), "copy the curl command to Logs"),
+                (k("c"), "copy the curl command to the log"),
             ],
         ),
         (
@@ -100,7 +101,7 @@ fn sections() -> Vec<Section> {
             ],
         ),
         (
-            "Runs",
+            "History",
             vec![
                 (k("↑↓"), "choose a run"),
                 (k("Home / End"), "newest / oldest"),
@@ -140,7 +141,7 @@ fn section_lines(section: &Section, w: usize) -> Vec<Line<'static>> {
 
 /// Renders the bindings into `area`, clamping `scroll` to the content.
 pub fn render_help_content(f: &mut Frame<'_>, area: Rect, scroll: &mut usize) {
-    let block = theme::block_focused("Keys");
+    let block = theme::modal_frame("Keys");
     let inner = block.inner(area);
     let two_columns = inner.width >= 90;
     let col_w = if two_columns {

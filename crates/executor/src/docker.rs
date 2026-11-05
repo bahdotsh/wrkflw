@@ -1109,46 +1109,42 @@ impl DockerRuntime {
             }
         }
 
-        // Wait for the container to finish
-        let wait_result = self
-            .docker
-            .wait_container::<String>(&container.id, None)
-            .collect::<Vec<_>>()
-            .await;
-        let exit_code = wait_exit_code(wait_result.first());
-
-        // Get logs with a timeout
+        // Follow the logs while the container runs, so output reaches the
+        // live tap as it is printed. The stream ends when the container does.
+        let tap = wrkflw_runtime::live_output::current();
         let log_options = Some(bollard::container::LogsOptions::<String> {
             stdout: true,
             stderr: true,
+            follow: true,
             ..Default::default()
         });
-        let logs_result = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            self.docker
-                .logs(&container.id, log_options)
-                .collect::<Vec<_>>(),
-        )
-        .await;
-
         let mut stdout = String::new();
         let mut stderr = String::new();
-
-        if let Ok(logs) = logs_result {
-            for log in logs.into_iter().flatten() {
-                match log {
+        let mut logs = self.docker.logs(&container.id, log_options);
+        let follow = async {
+            while let Some(log) = logs.next().await {
+                let Ok(log) = log else { break };
+                let (text, into) = match log {
                     bollard::container::LogOutput::StdOut { message } => {
-                        stdout.push_str(&String::from_utf8_lossy(&message));
+                        (String::from_utf8_lossy(&message).into_owned(), &mut stdout)
                     }
                     bollard::container::LogOutput::StdErr { message } => {
-                        stderr.push_str(&String::from_utf8_lossy(&message));
+                        (String::from_utf8_lossy(&message).into_owned(), &mut stderr)
                     }
-                    _ => {}
+                    _ => continue,
+                };
+                if let Some(tap) = &tap {
+                    tap.send(&text);
                 }
+                into.push_str(&text);
             }
-        } else {
-            wrkflw_logging::warning("Retrieving container logs timed out");
-        }
+        };
+        let wait = self
+            .docker
+            .wait_container::<String>(&container.id, None)
+            .collect::<Vec<_>>();
+        let ((), wait_result) = tokio::join!(follow, wait);
+        let exit_code = wait_exit_code(wait_result.first());
 
         // Clean up container with a timeout, but preserve on failure if configured
         if exit_code == 0 || !self.preserve_containers_on_failure {

@@ -6,7 +6,7 @@ use crate::models::{ExecutionResultMsg, QueuedExecution, Workflow, WorkflowStatu
 use crate::selection;
 use crate::utils::load_workflows;
 use crate::views::{
-    render_ui, TAB_COUNT, TAB_DAG, TAB_EXECUTION, TAB_HELP, TAB_LOGS, TAB_RUNS, TAB_SECRETS,
+    render_ui, tab_of, TAB_COUNT, TAB_DAG, TAB_EXECUTION, TAB_LOGS, TAB_RUNS, TAB_SECRETS,
     TAB_TRIGGER, TAB_WORKFLOWS,
 };
 use crossterm::{
@@ -447,12 +447,6 @@ fn run_tui_event_loop(
                     (KeyCode::End, TAB_EXECUTION) if app.inspecting_output() => {
                         app.step_output_scroll = 0
                     }
-                    (KeyCode::PageUp, TAB_HELP) => {
-                        app.help_scroll = app.help_scroll.saturating_sub(10)
-                    }
-                    (KeyCode::PageDown, TAB_HELP) => {
-                        app.help_scroll = app.help_scroll.saturating_add(10)
-                    }
                     (KeyCode::Left, TAB_DAG) => app.dag_scroll = app.dag_scroll.saturating_sub(1),
                     (KeyCode::Right, TAB_DAG) => app.dag_scroll = app.dag_scroll.saturating_add(1),
                     _ => {}
@@ -490,7 +484,7 @@ fn run_tui_event_loop(
                             // only way out was Esc.
                             app.trigger_tab_next_field();
                         } else {
-                            app.switch_tab((app.selected_tab + 1) % TAB_COUNT);
+                            app.open_tab((tab_of(app.selected_tab) + 1) % TAB_COUNT);
                         }
                     }
                     KeyCode::BackTab => {
@@ -500,17 +494,17 @@ fn run_tui_event_loop(
                         } else if app.selected_tab == TAB_TRIGGER && app.trigger_editing() {
                             app.trigger_tab_prev_field();
                         } else {
-                            app.switch_tab((app.selected_tab + TAB_COUNT - 1) % TAB_COUNT);
+                            app.open_tab((tab_of(app.selected_tab) + TAB_COUNT - 1) % TAB_COUNT);
                         }
                     }
-                    KeyCode::Char('1') | KeyCode::Char('w') => app.switch_tab(TAB_WORKFLOWS),
-                    KeyCode::Char('2') | KeyCode::Char('x') => app.switch_tab(TAB_EXECUTION),
-                    KeyCode::Char('3') => app.switch_tab(TAB_DAG),
-                    KeyCode::Char('4') | KeyCode::Char('l') => app.switch_tab(TAB_LOGS),
-                    KeyCode::Char('5') => app.switch_tab(TAB_TRIGGER),
-                    KeyCode::Char('6') => app.switch_tab(TAB_SECRETS),
-                    KeyCode::Char('7') => app.switch_tab(TAB_RUNS),
-                    KeyCode::Char('8') | KeyCode::Char('h') => app.switch_tab(TAB_HELP),
+                    KeyCode::Char(c @ '1'..='9') if (c as usize - '1' as usize) < TAB_COUNT => {
+                        app.open_tab(c as usize - '1' as usize)
+                    }
+                    KeyCode::Char('w') => app.switch_tab(TAB_WORKFLOWS),
+                    // The Run tab's three views: jobs, graph, log.
+                    KeyCode::Char('x') => app.switch_tab(TAB_EXECUTION),
+                    KeyCode::Char('l') => app.switch_tab(TAB_LOGS),
+                    KeyCode::Char('h') => app.show_help = true,
                     KeyCode::Char(',') => {
                         // `,` toggles the Tweaks overlay anywhere (global).
                         // Chosen because it never conflicts with our single-
@@ -548,7 +542,6 @@ fn run_tui_event_loop(
                         }
                         TAB_TRIGGER => app.trigger_tab_prev_workflow(),
                         TAB_SECRETS => app.secrets_tab_prev(),
-                        TAB_HELP => app.scroll_help_up(),
                         TAB_RUNS => app.select_previous_run(),
                         _ => {}
                     },
@@ -580,7 +573,6 @@ fn run_tui_event_loop(
                         }
                         TAB_TRIGGER => app.trigger_tab_next_workflow(),
                         TAB_SECRETS => app.secrets_tab_next(),
-                        TAB_HELP => app.scroll_help_down(),
                         TAB_RUNS => app.select_next_run(),
                         _ => {}
                     },
@@ -838,11 +830,11 @@ fn run_tui_event_loop(
                     }
                     KeyCode::Char('g') => {
                         if app.selected_tab == TAB_DAG {
-                            // Toggle DAG tab between graph and list view —
-                            // matches the design's `g` shortcut on
-                            // screen 4.
+                            // A second `g` flips the graph to a list.
                             app.dag_list_view = !app.dag_list_view;
                             app.dag_scroll = 0;
+                        } else {
+                            app.switch_tab(TAB_DAG);
                         }
                     }
                     KeyCode::Char('p') => {

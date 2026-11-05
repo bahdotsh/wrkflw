@@ -292,7 +292,20 @@ impl ContainerRuntime for EmulationRuntime {
             }
         }
 
-        match cmd.output() {
+        // Output is collected as `output()` would, and also passed on as it
+        // is printed so a long step shows progress.
+        let run = cmd
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .and_then(|child| {
+                crate::live_output::blocking_wait_with_live_output(
+                    child,
+                    crate::live_output::current(),
+                )
+            });
+        match run {
             Ok(output_result) => {
                 let exit_code = output_result.status.code().unwrap_or(-1);
                 let output = String::from_utf8_lossy(&output_result.stdout).to_string();

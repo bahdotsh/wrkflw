@@ -10,7 +10,7 @@ agent answer "why did the last run fail?" with one read instead of a rerun.
 - Builds failure digests: the failed step, its script, exit code, env exported
   by earlier steps and the output tail, with identical matrix failures folded
 - Emits the NDJSON events behind `--format json` (`run_started` … `run_finished`)
-- **Used by**: `wrkflw run`, `wrkflw runs`, `wrkflw mcp serve` and the TUI's Runs tab
+- **Used by**: `wrkflw run`, `wrkflw runs`, `wrkflw mcp serve` and the TUI's History tab
 
 ### Example
 

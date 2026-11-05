@@ -163,6 +163,15 @@ export WRKFLW_PLATFORM=ubuntu-latest=catthehacker/ubuntu:act-latest
 - Runtimes from `actions/setup-*` are installed on top of your image, so the image must be Debian or Ubuntu based for those jobs.
 - `--platform` replaces `WRKFLW_PLATFORM` entirely when both are set. It has no effect in emulation mode.
 
+### Faster local reruns
+
+Two defaults make a rerun cheaper than a hosted runner's cold start. Both work the same for any language or toolchain.
+
+- **Each job keeps its workspace.** Checkout syncs the source files into it, and leaves alone anything the repository ignores, such as build output, `node_modules` or a virtualenv. The second run of a build is therefore incremental. Unchanged files keep their timestamps, and files deleted from the repository are deleted from the workspace too. Workspaces live under your cache directory in `wrkflw/workspaces` (`~/Library/Caches` on macOS, `~/.cache` on Linux), one per repository, workflow and job. Deleting that directory is always safe. `--fresh-workspace` or `WRKFLW_FRESH_WORKSPACE=1` gives every job an empty workspace, as a hosted runner does.
+- **Matrix legs that only pick a runner run once.** Locally, `runs-on: ${{ matrix.os }}` maps every OS to the same image. If a leg differs from another only in values that `runs-on` reads, and the two would run in the same image, that leg reports the other's result instead of repeating it. A leg whose steps read the value, or which runs in a different image (see `--platform`), still runs. `--every-matrix-leg` or `WRKFLW_EVERY_MATRIX_LEG=1` runs them all.
+
+While a step runs, the TUI shows what it prints: the Run tab's Output pane shows the full output, and the Log story shows its last lines.
+
 ### Trigger-aware execution
 
 Skip workflows whose `on:` block wouldn't fire for a given event/change set. Strict mode is on by default: `wrkflw run --event …` without `--diff` or `--changed-files` is rejected up front rather than silently skipping every `paths:`-gated workflow.
@@ -280,15 +289,16 @@ wrkflw tui --theme light
 
 The TUI follows your terminal's background and uses a light or dark palette to match. Set `--theme` or `WRKFLW_THEME` to `auto`, `dark` or `light` to override it. The theme is chosen at startup, so restart the TUI after switching your terminal's theme.
 
-**Tabs:** Workflows · Execution · DAG · Logs · Trigger · Setup (runtime and secret providers) · Runs · Help.
+**Tabs:** Workflows · Run (jobs, graph and log views of the current run) · History · Dispatch · Setup (runtime and secret providers). Help opens over any tab with `?`.
 
 **Controls:**
 
 | Key | Action |
 |-----|--------|
 | `Tab` / `Shift+Tab` | Switch tabs |
-| `1`–`8` | Jump to tab by number |
-| `w` / `x` / `l` / `h` | Jump to Workflows / Execution / Logs / Help |
+| `1`–`5` | Jump to tab by number |
+| `w` | Jump to Workflows |
+| `x` / `g` / `l` | Run tab: jobs / graph / log view |
 | `↑`/`↓` or `k`/`j` | Navigate / scroll |
 | `Space` | Toggle workflow selection |
 | `Enter` | Run / view details |
@@ -299,13 +309,13 @@ The TUI follows your terminal's background and uses a light or dark palette to m
 | `e` | Cycle runtime (Docker / Podman / Kubernetes / Secure Emulation / Emulation) |
 | `v` | Toggle Execution / Validation mode |
 | `d` / `D` | Toggle diff-aware filter / cycle simulated event |
-| `t` | Trigger remote workflow |
+| `t` | Dispatch the workflow on GitHub / GitLab |
 | `,` | Open Tweaks overlay |
-| `?` | Toggle help overlay |
+| `?` / `h` | Toggle help overlay |
 | `q` / `Ctrl+C` | Quit |
 | `Esc` | Back (quits from the top level) |
 
-Execution tab: `Enter` inspects a job's steps, `Tab` switches between Output and Matrix, `PgUp`/`PgDn` scroll a step's output and `End` returns to its tail. DAG tab adds `g` (graph↔list), `←`/`→` (scroll stages), `↑`/`↓` (previous/next workflow), `Enter` (open the run). Logs tab adds `s` (search), `f` (filter), `c` (clear), `n` (next match), `PgUp`/`PgDn` (page) and `Home`/`End` (first line / follow new lines). Trigger tab adds `p` (github↔gitlab), `b` (edit branch), `i` (edit inputs), `+` (add input), `c` (copy curl preview); while a field is being edited, `Tab` moves between fields and `Enter` or `Esc` stops editing.
+Run → jobs: `Enter` inspects a job's steps, `Tab` switches between Output and Matrix, `PgUp`/`PgDn` scroll a step's output and `End` returns to its tail. Run → graph adds `g` (graph↔list), `←`/`→` (scroll stages), `↑`/`↓` (previous/next workflow), `Enter` (back to jobs). Run → log adds `o` (story↔raw log), `s` (search), `f` (filter), `c` (clear), `n` (next match), `PgUp`/`PgDn` (page) and `Home`/`End` (first line / follow new lines). Dispatch tab adds `p` (github↔gitlab), `b` (edit branch), `i` (edit inputs), `+` (add input), `c` (copy curl preview); while a field is being edited, `Tab` moves between fields and `Enter` or `Esc` stops editing.
 
 The layout adapts to the terminal size: side panes drop out and tabs collapse to numbers on narrow terminals, and step output keeps the tool's own colours.
 
@@ -374,7 +384,7 @@ Without names, `install` sets up every agent whose CLI is on `PATH` or whose con
 
 Runs record which agent started them and from which session. The agent comes from `--agent` or `WRKFLW_AGENT`, or is detected from `AI_AGENT` and what Claude Code, Codex, Gemini CLI, opencode, Cursor and Augment set. Other agents, such as Kiro, Grok Build, pi and Copilot CLI, set nothing wrkflw can rely on, so set `WRKFLW_AGENT` in their environment. The session comes from `--session` or `WRKFLW_SESSION`, or from `CLAUDE_CODE_SESSION_ID` or `CODEX_THREAD_ID`. Filter on either with `wrkflw runs list --agent claude-code --session <id>`.
 
-The TUI's Runs tab shows the same history, including which agent started each run and why. See [AGENTS.md](AGENTS.md) for the output contract, and `skills/wrkflw` for a Claude Code skill.
+The TUI's History tab shows the same history, including which agent started each run and why. See [AGENTS.md](AGENTS.md) for the output contract, and `skills/wrkflw` for a Claude Code skill.
 
 ## Runtime Modes
 

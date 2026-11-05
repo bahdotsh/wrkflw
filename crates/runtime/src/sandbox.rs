@@ -372,9 +372,20 @@ impl Sandbox {
         let start_time = std::time::Instant::now();
 
         let result = tokio::time::timeout(timeout_duration, async {
-            let output = cmd.output().map_err(|e| SandboxError::ExecutionError {
-                reason: format!("Command execution failed: {}", e),
-            })?;
+            let output = cmd
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .and_then(|child| {
+                    crate::live_output::blocking_wait_with_live_output(
+                        child,
+                        crate::live_output::current(),
+                    )
+                })
+                .map_err(|e| SandboxError::ExecutionError {
+                    reason: format!("Command execution failed: {}", e),
+                })?;
 
             Ok(crate::container::ContainerOutput {
                 stdout: String::from_utf8_lossy(&output.stdout).to_string(),

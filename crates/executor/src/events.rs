@@ -23,6 +23,14 @@ pub enum ExecutionEvent {
         step: String,
         index: usize,
     },
+    /// What a running step printed since the last of these, as whole lines.
+    /// `StepFinished` still carries the step's full output.
+    StepOutput {
+        job: String,
+        step: String,
+        index: usize,
+        lines: Vec<String>,
+    },
     StepFinished {
         job: String,
         step: String,
@@ -125,6 +133,14 @@ pub(crate) fn emit(build: impl FnOnce() -> ExecutionEvent) {
             observer.on_event(&event);
         }
     });
+}
+
+/// The active observers, for code that reports from outside the run's task
+/// (a runtime reading output on its own thread). Empty outside a run.
+pub(crate) fn current_observers() -> Vec<Arc<dyn ExecutionObserver>> {
+    HOOKS
+        .try_with(|hooks| hooks.observers.clone())
+        .unwrap_or_default()
 }
 
 /// The index `--from-step` starts `job` at, or 0 when it doesn't apply.

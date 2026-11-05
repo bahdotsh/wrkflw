@@ -171,10 +171,6 @@ fn matrix_suffix(labels: &MatrixLabels, job: &str) -> String {
         .unwrap_or_default()
 }
 
-fn title(workflow: &Workflow) -> String {
-    format!("Graph · {}", text::sanitize(&workflow.name))
-}
-
 fn state_color(state: JobState) -> ratatui::style::Color {
     match state {
         JobState::Success => COLORS.success,
@@ -196,8 +192,9 @@ fn render_graph(
     levels: &[Vec<String>],
     area: Rect,
 ) -> usize {
-    let title = title(workflow);
-    let block = theme::block_focused(&title);
+    // The Run header names the workflow.
+    let title = "Graph";
+    let block = theme::block_focused(title);
     let inner = block.inner(area);
 
     if levels.is_empty() {
@@ -386,8 +383,9 @@ fn render_list(
     levels: &[Vec<String>],
     area: Rect,
 ) -> usize {
-    let title = title(workflow);
-    let block = theme::with_badge(theme::block_focused(&title), "list");
+    // The Run header names the workflow.
+    let title = "Graph";
+    let block = theme::with_badge(theme::block_focused(title), "list");
     let inner = block.inner(area);
     f.render_widget(block, area);
     let w = inner.width as usize;
@@ -475,24 +473,6 @@ fn render_legend(f: &mut Frame<'_>, app: &App, area: Rect) {
         Span::styled("┃", Style::default().fg(COLORS.text_dim)),
         Span::styled("  critical path", Style::default().fg(COLORS.text_dim)),
     ]));
-    lines.push(Line::from(""));
-    lines.push(theme::section("Keys"));
-    for (k, d) in [
-        ("g", "graph / list"),
-        ("←→", "scroll"),
-        ("↑↓", "workflow"),
-        ("Enter", "open run"),
-    ] {
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("{k:<6}"),
-                Style::default()
-                    .fg(theme::current_accent())
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(d, Style::default().fg(COLORS.text_dim)),
-        ]));
-    }
     f.render_widget(Paragraph::new(lines), inner);
 }
 

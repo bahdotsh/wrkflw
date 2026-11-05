@@ -54,7 +54,7 @@ pub fn render_logs_tab(f: &mut Frame<'_>, app: &mut App, area: Rect) {
         badge = format!("following · {badge}");
     }
     let block = theme::with_badge(
-        theme::block_focused("Logs · raw"),
+        theme::block_focused("Raw log"),
         format!("{badge} · o story"),
     );
 
@@ -191,6 +191,7 @@ fn spread(left: Vec<Span<'static>>, right: Vec<Span<'static>>, w: usize) -> Line
 /// The story lines for a run, `w` cells wide.
 pub(crate) fn story_lines(
     timeline: &[TimelineEntry],
+    live: Option<&crate::models::LiveTails>,
     w: usize,
     spinner_frame: usize,
 ) -> Vec<Line<'static>> {
@@ -283,10 +284,49 @@ pub(crate) fn story_lines(
                 ]));
             }
         }
+        // A running job shows its current step and the last lines it
+        // printed, so a long step visibly makes progress.
+        if job.finished.is_none() {
+            if let Some(tail) = live.and_then(|live| live.jobs.get(job.name)) {
+                lines.push(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(
+                        format!("{} ", theme::spinner(spinner_frame)),
+                        Style::default().fg(COLORS.info),
+                    ),
+                    Span::styled(
+                        text::sanitize(&tail.step).into_owned(),
+                        Style::default().fg(COLORS.text),
+                    ),
+                ]));
+                let room = w.saturating_sub(6);
+                for line in tail
+                    .lines
+                    .iter()
+                    .skip(tail.lines.len().saturating_sub(STORY_LIVE_LINES))
+                {
+                    let plain: String = text::ansi_line(line, Style::default())
+                        .spans
+                        .iter()
+                        .map(|span| span.content.as_ref())
+                        .collect();
+                    lines.push(Line::from(vec![
+                        Span::styled("    │ ", Style::default().fg(COLORS.info)),
+                        Span::styled(
+                            text::truncate(&text::sanitize(&plain), room).into_owned(),
+                            Style::default().fg(COLORS.text_dim),
+                        ),
+                    ]));
+                }
+            }
+        }
         lines.push(Line::from(""));
     }
     lines
 }
+
+/// Lines of a running step's output shown under it in the story.
+const STORY_LIVE_LINES: usize = 3;
 
 fn render_story(f: &mut Frame<'_>, app: &mut App, area: Rect) {
     let idx = app
@@ -295,11 +335,8 @@ fn render_story(f: &mut Frame<'_>, app: &mut App, area: Rect) {
         .filter(|&idx| idx < app.workflows.len());
     let workflow = idx.map(|i| &app.workflows[i]);
     let exec = workflow.and_then(|w| w.execution_details.as_ref());
-    let title = match workflow {
-        Some(w) => format!("Logs · {}", w.name),
-        None => "Logs".to_string(),
-    };
-    let block = theme::with_badge(theme::block_focused(&title), "story · o raw");
+    // The Run header already names the workflow.
+    let block = theme::with_badge(theme::block_focused("Story"), "o raw");
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -324,7 +361,7 @@ fn render_story(f: &mut Frame<'_>, app: &mut App, area: Rect) {
     };
 
     let w = inner.width.saturating_sub(1) as usize;
-    let mut lines = story_lines(&exec.timeline, w, app.spinner_frame);
+    let mut lines = story_lines(&exec.timeline, Some(&exec.live), w, app.spinner_frame);
     if let Some(end) = exec.end_time {
         let secs = end
             .signed_duration_since(exec.start_time)
@@ -396,7 +433,7 @@ mod tests {
                 canonical_name: "lint".into(),
             },
         ];
-        let lines = text_of(&story_lines(&timeline, 60, 0));
+        let lines = text_of(&story_lines(&timeline, None, 60, 0));
         assert!(lines[0].starts_with("✖ build") && lines[0].ends_with("37.2s"));
         assert!(lines[1].contains("cargo test") && lines[1].contains("exit 101"));
         assert!(lines[2].contains("│ test failed"));

@@ -9,7 +9,7 @@ use wrkflw_executor::{self, JobStatus, RuntimeType, StepStatus};
 use {
     crate::app::App,
     crate::models::{
-        ExecutionResultMsg, TimelineEntry, TimelineMsg, WorkflowExecution, WorkflowStatus,
+        ExecutionResultMsg, RunUpdate, TimelineMsg, WorkflowExecution, WorkflowStatus,
     },
     chrono::Local,
     std::sync::mpsc,
@@ -482,7 +482,7 @@ struct TimelineObserver {
 #[cfg(feature = "tui")]
 impl wrkflw_executor::ExecutionObserver for TimelineObserver {
     fn on_event(&self, event: &wrkflw_executor::ExecutionEvent) {
-        if let Some(entry) = TimelineEntry::from_event(event) {
+        if let Some(entry) = RunUpdate::from_event(event) {
             // The TUI may have quit; a run that outlives it has no one to
             // tell, and that is fine.
             let _ = self.tx.send((self.workflow_idx, entry));
@@ -555,6 +555,7 @@ pub fn start_next_workflow_execution(
                 end_time: None,
                 progress: 0.0,
                 timeline: Vec::new(),
+                live: Default::default(),
             });
         }
 

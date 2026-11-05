@@ -1,7 +1,7 @@
-// Status bar — left-aligned key chips, right-aligned runtime + meta.
-use super::{
-    TAB_DAG, TAB_EXECUTION, TAB_HELP, TAB_LOGS, TAB_RUNS, TAB_SECRETS, TAB_TRIGGER, TAB_WORKFLOWS,
-};
+// Status bar — two rows: the screen's keys as raised push buttons with
+// their drop shadows underneath, and the runtime and counts at the right
+// end of the top row.
+use super::{TAB_DAG, TAB_EXECUTION, TAB_LOGS, TAB_RUNS, TAB_SECRETS, TAB_TRIGGER, TAB_WORKFLOWS};
 use crate::app::App;
 use crate::models::StatusSeverity;
 use crate::text;
@@ -16,10 +16,12 @@ use ratatui::{
 use wrkflw_executor::RuntimeType;
 
 pub fn render_status_bar(f: &mut Frame<'_>, app: &App, area: Rect) {
-    f.render_widget(
-        Paragraph::new("").style(Style::default().bg(COLORS.bg_bar)),
-        area,
-    );
+    let cell = Style::default();
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Length(1)])
+        .split(area);
+    let (area, shadow_row) = (rows[0], rows[1]);
     let width = area.width as usize;
 
     // Right: mode, runtime with its availability dot, workflow count.
@@ -44,14 +46,13 @@ pub fn render_status_bar(f: &mut Frame<'_>, app: &App, area: Rect) {
         (true, false) => ("○ ", COLORS.error),
     };
     let runtime = vec![
-        Span::styled(dot, Style::default().fg(dot_color)),
+        Span::styled(" ", cell),
+        Span::styled(dot, cell.fg(dot_color)),
         Span::styled(
             app.runtime_type_name().to_string(),
-            Style::default()
-                .fg(runtime_kind.fg())
-                .add_modifier(Modifier::BOLD),
+            cell.fg(runtime_kind.fg()).add_modifier(Modifier::BOLD),
         ),
-        Span::raw(" "),
+        Span::styled(" ", cell),
     ];
     let mode = if app.validation_mode {
         vec![
@@ -61,13 +62,10 @@ pub fn render_status_bar(f: &mut Frame<'_>, app: &App, area: Rect) {
     } else {
         Vec::new()
     };
-    let count = vec![
-        Span::styled(
-            format!("{} workflows", app.workflows.len()),
-            theme::muted_style(),
-        ),
-        Span::styled("  ", theme::muted_style()),
-    ];
+    let count = vec![Span::styled(
+        format!(" {} workflows ", app.workflows.len()),
+        theme::muted_style(),
+    )];
 
     // Left: either the current toast or the mode pill and key hints.
     let mut left: Vec<Span> = Vec::new();
@@ -85,31 +83,28 @@ pub fn render_status_bar(f: &mut Frame<'_>, app: &App, area: Rect) {
                 .fg(COLORS.bg_dark)
                 .add_modifier(Modifier::BOLD),
         ));
-        left.push(Span::raw(" "));
-        let room = width.saturating_sub(5 + text::spans_width(&mode) + text::spans_width(&runtime));
-        left.push(Span::styled(
-            text::truncate(&text::sanitize(message), room).into_owned(),
-            Style::default().fg(kind.fg()).add_modifier(Modifier::BOLD),
-        ));
-    } else {
+        let room = width.saturating_sub(6 + text::spans_width(&mode) + text::spans_width(&runtime));
         left.push(Span::styled(
             format!(
                 " {} ",
-                super::title_bar::TAB_LABELS[app.selected_tab].to_uppercase()
+                text::truncate(&text::sanitize(message), room).into_owned()
             ),
-            Style::default()
-                .bg(theme::current_accent())
-                .fg(COLORS.bg_dark)
-                .add_modifier(Modifier::BOLD),
+            cell.fg(kind.fg()).add_modifier(Modifier::BOLD),
         ));
-        left.push(Span::raw("  "));
+    } else {
+        // The tab strip already names the screen; the bar only says
+        // what the keys do.
+        left.push(Span::raw(" "));
     }
 
     // Reserve room for the first two hints; they say what the screen
     // does, which matters more than the counters on the right.
-    let hints = context_hints(app);
+    let hints: Vec<(&str, &str, bool)> = context_hints(app)
+        .into_iter()
+        .map(|(key, label)| (key, label, false))
+        .collect();
     let reserved = if app.status_message.is_none() {
-        text::spans_width(&theme::hint_spans(&hints[..hints.len().min(2)], usize::MAX))
+        text::spans_width(&theme::raised_buttons(&hints[..hints.len().min(2)], usize::MAX).0)
     } else {
         0
     };
@@ -130,7 +125,11 @@ pub fn render_status_bar(f: &mut Frame<'_>, app: &App, area: Rect) {
 
     if app.status_message.is_none() {
         let room = width.saturating_sub(text::spans_width(&left) + right_w + 1);
-        left.extend(theme::hint_spans(&hints, room));
+        let (faces, shadows) = theme::raised_buttons(&hints, room);
+        left.extend(faces);
+        let mut under = vec![Span::raw(" ")];
+        under.extend(shadows);
+        f.render_widget(Paragraph::new(Line::from(under)), shadow_row);
     }
 
     let chunks = Layout::default()
@@ -149,18 +148,17 @@ fn context_hints(app: &App) -> Vec<(&'static str, &'static str)> {
         TAB_WORKFLOWS if app.job_selection_mode => {
             vec![("Enter", "run job"), ("a", "run all"), ("Esc", "back")]
         }
-        TAB_WORKFLOWS if app.running => vec![("2", "watch run"), ("4", "logs"), ("?", "help")],
+        TAB_WORKFLOWS if app.running => vec![("2", "watch run"), ("l", "log"), ("?", "keys")],
         TAB_WORKFLOWS => vec![
             ("Enter", "run"),
             ("Space", "select"),
-            ("r", "run selected"),
             ("J", "pick job"),
             (
                 "v",
                 if app.validation_mode {
-                    "execute mode"
+                    "execute"
                 } else {
-                    "validate mode"
+                    "validate"
                 },
             ),
             ("e", "runtime"),
@@ -169,11 +167,11 @@ fn context_hints(app: &App) -> Vec<(&'static str, &'static str)> {
                 if app.diff_filter_active {
                     "diff off"
                 } else {
-                    "diff filter"
+                    "diff"
                 },
             ),
-            ("t", "trigger"),
-            ("?", "help"),
+            ("t", "dispatch"),
+            ("?", "keys"),
         ],
         TAB_EXECUTION if app.detailed_view => vec![
             ("↑↓", "step"),
@@ -181,12 +179,19 @@ fn context_hints(app: &App) -> Vec<(&'static str, &'static str)> {
             ("Tab", "output/matrix"),
             ("Esc", "back"),
         ],
-        TAB_EXECUTION => vec![("↑↓", "job"), ("Enter", "inspect"), ("?", "help")],
+        TAB_EXECUTION => vec![
+            ("↑↓", "job"),
+            ("Enter", "inspect"),
+            ("g", "graph"),
+            ("l", "log"),
+            ("?", "keys"),
+        ],
         TAB_DAG => vec![
             ("g", if app.dag_list_view { "graph" } else { "list" }),
             ("←→", "scroll"),
             ("↑↓", "workflow"),
-            ("Enter", "open run"),
+            ("Enter", "jobs"),
+            ("l", "log"),
         ],
         TAB_LOGS if app.log_search_active => vec![("Enter", "keep"), ("Esc", "cancel")],
         TAB_LOGS if app.log_story => vec![
@@ -194,6 +199,7 @@ fn context_hints(app: &App) -> Vec<(&'static str, &'static str)> {
             ("↑↓", "scroll"),
             ("End", "follow"),
             ("s", "search raw"),
+            ("x", "jobs"),
         ],
         TAB_LOGS => vec![
             ("o", "story"),
@@ -215,9 +221,8 @@ fn context_hints(app: &App) -> Vec<(&'static str, &'static str)> {
             ("+", "input"),
             ("c", "copy curl"),
         ],
-        TAB_SECRETS => vec![("e", "cycle runtime"), ("↑↓", "provider"), ("?", "help")],
-        TAB_RUNS => vec![("↑↓", "select"), ("?", "help")],
-        TAB_HELP => vec![("↑↓", "scroll"), ("q", "quit")],
+        TAB_SECRETS => vec![("e", "cycle runtime"), ("↑↓", "provider"), ("?", "keys")],
+        TAB_RUNS => vec![("↑↓", "select"), ("?", "keys")],
         _ => vec![],
     }
 }

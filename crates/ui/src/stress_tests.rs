@@ -7,7 +7,7 @@ use crate::models::{
     JobExecution, StepExecution, TriggerMatchStatus, Workflow, WorkflowExecution, WorkflowStatus,
 };
 use crate::theme;
-use crate::views::{self, TAB_COUNT, TAB_EXECUTION, TAB_WORKFLOWS};
+use crate::views::{self, SCREEN_COUNT, TAB_EXECUTION, TAB_WORKFLOWS};
 use ratatui::{backend::TestBackend, text::Span, Terminal};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -105,6 +105,7 @@ fn execution(jobs: usize, steps: usize) -> WorkflowExecution {
         end_time: None,
         progress: 0.42,
         timeline: Vec::new(),
+        live: Default::default(),
     }
 }
 
@@ -247,7 +248,7 @@ fn every_screen_renders_at_every_size_without_panicking() {
             if a.current_execution.is_none() {
                 a.current_execution = Some(count.min(2) - 1);
             }
-            for tab in 0..TAB_COUNT {
+            for tab in 0..SCREEN_COUNT {
                 let views: &[(bool, usize)] = if tab == TAB_EXECUTION {
                     &[(false, 0), (true, 0), (true, 1)]
                 } else {
@@ -366,7 +367,7 @@ fn dump_screens() {
         if only.as_deref().is_some_and(|o| o != name) {
             continue;
         }
-        for tab in 0..TAB_COUNT {
+        for tab in 0..SCREEN_COUNT {
             let subs: &[(bool, usize)] = if tab == TAB_EXECUTION {
                 &[(false, 0), (true, 0), (true, 1)]
             } else {

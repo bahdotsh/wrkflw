@@ -281,6 +281,7 @@ impl Recorder {
                 duration_ms: None,
                 log: None,
                 steps: Vec::new(),
+                repeated_from: None,
             });
             record.jobs.len() - 1
         });
@@ -401,6 +402,7 @@ impl ExecutionObserver for Recorder {
                 failure_allowed,
                 duration_ms,
                 logs,
+                repeated_from,
             } => {
                 let relative = format!("logs/{}/job.log", job_dir(job));
                 let log = self.write_log(&id, &relative, logs);
@@ -409,6 +411,7 @@ impl ExecutionObserver for Recorder {
                 entry.failure_allowed = *failure_allowed;
                 entry.duration_ms = Some(*duration_ms);
                 entry.log = log;
+                entry.repeated_from = repeated_from.clone();
                 self.persist(&record);
             }
         }
@@ -467,14 +470,22 @@ fn event_json(event: &ExecutionEvent) -> Value {
             status,
             failure_allowed,
             duration_ms,
+            repeated_from,
             ..
-        } => json!({
-            "type": "job_finished",
-            "job": job,
-            "status": status.to_string(),
-            "failure_allowed": failure_allowed,
-            "duration_ms": duration_ms,
-        }),
+        } => {
+            let mut line = json!({
+                "type": "job_finished",
+                "job": job,
+                "status": status.to_string(),
+                "failure_allowed": failure_allowed,
+                "duration_ms": duration_ms,
+            });
+            // Only on legs that didn't run, so other lines keep their shape.
+            if let Some(original) = repeated_from {
+                line["repeated_from"] = json!(original);
+            }
+            line
+        }
     }
 }
 
@@ -769,11 +780,23 @@ mod tests {
             failure_allowed: false,
             duration_ms: 1,
             logs: String::new(),
+            repeated_from: None,
         };
         assert_eq!(
             keys(&event_json(&job)),
             ["duration_ms", "failure_allowed", "job", "status", "type"]
         );
+
+        let repeat = ExecutionEvent::JobFinished {
+            job: "j (os: b)".to_string(),
+            status: JobStatus::Success,
+            failure_allowed: false,
+            duration_ms: 0,
+            logs: String::new(),
+            repeated_from: Some("j (os: a)".to_string()),
+        };
+        let line = event_json(&repeat);
+        assert_eq!(line["repeated_from"], "j (os: a)");
     }
 
     #[test]

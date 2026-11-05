@@ -53,6 +53,9 @@ pub enum ExecutionEvent {
         failure_allowed: bool,
         duration_ms: u64,
         logs: String,
+        /// Set when this matrix leg did not run because it would only have
+        /// repeated the named leg; `status` is that leg's.
+        repeated_from: Option<String>,
     },
 }
 

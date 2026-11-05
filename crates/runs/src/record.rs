@@ -81,6 +81,10 @@ pub struct JobRecord {
     /// Path of the job log, relative to the run directory.
     pub log: Option<String>,
     pub steps: Vec<StepRecord>,
+    /// The matrix leg whose result this one reports, when it was not run
+    /// because it would only have repeated that leg.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repeated_from: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

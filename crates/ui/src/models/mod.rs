@@ -227,6 +227,8 @@ pub enum TimelineEntry {
         status: JobStatus,
         failure_allowed: bool,
         duration_ms: u64,
+        /// The matrix leg this one did not run in favour of.
+        repeated_from: Option<String>,
     },
 }
 
@@ -268,12 +270,14 @@ impl TimelineEntry {
                 status,
                 failure_allowed,
                 duration_ms,
+                repeated_from,
                 ..
             } => Some(TimelineEntry::JobFinished {
                 job: job.clone(),
                 status: status.clone(),
                 failure_allowed: *failure_allowed,
                 duration_ms: *duration_ms,
+                repeated_from: repeated_from.clone(),
             }),
         }
     }
@@ -601,6 +605,7 @@ mod tests {
             status: JobStatus::Success,
             failure_allowed: false,
             duration_ms: ms,
+            repeated_from: None,
         };
         let exec = WorkflowExecution {
             jobs: Vec::new(),

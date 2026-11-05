@@ -2790,6 +2790,7 @@ fn announce_reused(stored: &acceleration::StoredJob, note: &str) {
         failure_allowed: false,
         duration_ms: 0,
         logs: note.to_string(),
+        repeated_from: None,
     });
     wrkflw_logging::info(&format!(
         "{} Job '{}': {}",
@@ -3135,7 +3136,9 @@ async fn execute_matrix_combinations(
         return Ok(results);
     }
     // Back in matrix order, with each repeat taking its original's result.
-    let mut by_name: HashMap<String, JobResult> = results
+    // Every leg ran or was skipped by fail-fast, so each name has a result;
+    // one going missing is a bug to surface, not a leg to drop quietly.
+    let by_name: HashMap<String, JobResult> = results
         .into_iter()
         .map(|result| (result.name.clone(), result))
         .collect();
@@ -3144,23 +3147,27 @@ async fn execute_matrix_combinations(
         .iter()
         .map(|c| wrkflw_matrix::format_combination_name(ctx.job_name, c))
         .collect();
+    let missing = |name: &str| {
+        ExecutionError::Execution(format!(
+            "Matrix job '{}': leg '{}' finished without a result",
+            ctx.job_name, name
+        ))
+    };
     let mut ordered = Vec::with_capacity(names.len());
     for (i, name) in names.iter().enumerate() {
-        match twins[i] {
-            None => ordered.extend(by_name.get(name).cloned()),
-            Some(original) => {
-                if let Some(result) = by_name.get(&names[original]) {
-                    let image = get_effective_runner_image(
-                        ctx.job_template,
-                        ctx.services.platform_overrides,
-                        Some(&ctx.combinations[i].values),
-                    );
-                    let twin = repeated_leg(name, result, &image);
-                    ordered.push(twin.clone());
-                    by_name.insert(name.clone(), twin);
-                }
+        let source = twins[i].map_or(name, |original| &names[original]);
+        let result = by_name.get(source).ok_or_else(|| missing(source))?;
+        ordered.push(match twins[i] {
+            None => result.clone(),
+            Some(_) => {
+                let image = get_effective_runner_image(
+                    ctx.job_template,
+                    ctx.services.platform_overrides,
+                    Some(&ctx.combinations[i].values),
+                );
+                repeated_leg(name, result, &image)
             }
-        }
+        });
     }
     Ok(ordered)
 }
@@ -3286,6 +3293,7 @@ fn repeated_leg(name: &str, original: &JobResult, image: &str) -> JobResult {
         failure_allowed: original.failure_allowed,
         duration_ms: 0,
         logs: note.clone(),
+        repeated_from: Some(original.name.clone()),
     });
     wrkflw_logging::info(&format!(
         "{} Job '{}': {}",
@@ -3386,6 +3394,35 @@ mod matrix_twin_tests {
         let job = job("runs-on: ubuntu-latest\nsteps:\n  - run: ./flaky-test\n");
         let twins = matrix_twins(&job, &legs("attempt", &["1", "2", "3"]), &HashMap::new());
         assert_eq!(twins, vec![None, None, None]);
+    }
+
+    #[tokio::test]
+    async fn a_repeated_leg_says_which_leg_it_repeats() {
+        #[derive(Default)]
+        struct Finished(Mutex<Vec<Option<String>>>);
+        impl crate::events::ExecutionObserver for Finished {
+            fn on_event(&self, event: &crate::events::ExecutionEvent) {
+                if let crate::events::ExecutionEvent::JobFinished { repeated_from, .. } = event {
+                    self.0.lock().unwrap().push(repeated_from.clone());
+                }
+            }
+        }
+        let seen = Arc::new(Finished::default());
+        let original = JobResult::skipped("build (os: a)", "build", "x");
+        let hooks = crate::events::RunHooks {
+            observers: vec![seen.clone()],
+            from_step: None,
+        };
+        let twin = crate::events::with_run_hooks(hooks, async {
+            repeated_leg("build (os: b)", &original, "ubuntu")
+        })
+        .await;
+        assert_eq!(twin.name, "build (os: b)");
+        assert_eq!(twin.status, original.status);
+        assert_eq!(
+            *seen.0.lock().unwrap(),
+            vec![Some("build (os: a)".to_string())]
+        );
     }
 
     #[test]
@@ -4031,6 +4068,7 @@ impl StepLoopState {
             failure_allowed,
             duration_ms: self.job_started.elapsed().as_millis() as u64,
             logs: self.job_logs.clone(),
+            repeated_from: None,
         });
     }
 

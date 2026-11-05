@@ -203,6 +203,7 @@ pub(crate) fn story_lines(
                 status,
                 failure_allowed,
                 duration_ms,
+                repeated_from,
                 ..
             }) => {
                 let (g, st) = if *failure_allowed && *status == wrkflw_executor::JobStatus::Failure
@@ -211,8 +212,13 @@ pub(crate) fn story_lines(
                 } else {
                     theme::job_status(status)
                 };
-                let right = match status {
-                    wrkflw_executor::JobStatus::Skipped => "skipped".to_string(),
+                let right = match (status, repeated_from) {
+                    // Not run: say whose result it reports, not "0ms".
+                    (_, Some(original)) => {
+                        text::truncate(&text::sanitize(&format!("same as {original}")), w / 2)
+                            .into_owned()
+                    }
+                    (wrkflw_executor::JobStatus::Skipped, None) => "skipped".to_string(),
                     _ => format_ms(*duration_ms),
                 };
                 (g, st, right)
@@ -427,6 +433,7 @@ mod tests {
                 status: JobStatus::Failure,
                 failure_allowed: false,
                 duration_ms: 37_200,
+                repeated_from: None,
             },
             TimelineEntry::JobStarted {
                 job: "lint".into(),

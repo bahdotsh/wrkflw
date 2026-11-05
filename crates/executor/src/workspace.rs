@@ -130,6 +130,9 @@ impl JobWorkspace {
             Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
             Err(std::fs::TryLockError::Error(e)) => return Err(e),
         }
+        // `wrkflw clean` may have removed the directory between its creation
+        // above and the lock; now that this run holds the lock it can't again.
+        std::fs::create_dir_all(&dir)?;
         // Said at info level: a job that skips checkout now finds the last
         // run's files, which is worth knowing when a result surprises.
         if reused {
@@ -200,12 +203,12 @@ fn clean_under(root: &Path) -> std::io::Result<CleanReport> {
                 }
                 Err(std::fs::TryLockError::Error(e)) => return Err(e),
             }
+            // The lock file stays. A run may already have it open, waiting
+            // to lock it; removing it would let a later run create a second
+            // lock file for the same workspace, and both would get it.
             std::fs::remove_dir_all(&dir)?;
-            let _ = std::fs::remove_file(&lock_path);
             report.removed += 1;
         }
-        // Gone once every workspace in it is.
-        let _ = std::fs::remove_dir(&repo);
     }
     Ok(report)
 }
@@ -366,5 +369,26 @@ mod tests {
         );
         assert!(!free_path.exists());
         assert!(held.path().is_dir());
+
+        // The cleaned workspace comes back, empty, on the next run.
+        let again = JobWorkspace::keep(root.path(), repo.path(), Path::new(CI), "CI", "lint")
+            .unwrap()
+            .unwrap();
+        assert_eq!(again.path(), free_path);
+        assert!(again.path().is_dir());
+        assert!(!again.path().join("out.o").exists());
+    }
+
+    #[test]
+    fn a_lock_file_survives_clean_so_a_waiting_run_still_excludes_others() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let first = JobWorkspace::keep(root.path(), repo.path(), Path::new(CI), "CI", "lint")
+            .unwrap()
+            .unwrap();
+        let lock = first.path().with_extension("lock");
+        drop(first);
+        clean_under(root.path()).unwrap();
+        assert!(lock.is_file());
     }
 }

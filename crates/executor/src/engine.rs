@@ -6101,13 +6101,17 @@ fn create_gitignore_matcher(
 /// timestamp; and source files deleted since the last run are removed. What
 /// the repository ignores (build output, dependencies) is never touched.
 fn copy_directory_contents(from: &Path, to: &Path) -> Result<(), ExecutionError> {
+    // Walk the source by its real path, so the workspace can be recognised
+    // when it sits inside it.
+    let from = from.canonicalize().unwrap_or_else(|_| from.to_path_buf());
+    let from = from.as_path();
     // Syncing a directory onto itself would only risk deleting from it.
-    if let (Ok(a), Ok(b)) = (from.canonicalize(), to.canonicalize()) {
-        if a == b {
+    if let Ok(to) = to.canonicalize() {
+        if to == from {
             return Ok(());
         }
     }
-    copy_directory_contents_with_gitignore(from, to, &SyncRules::for_root(from)?)?;
+    copy_directory_contents_with_gitignore(from, to, &SyncRules::for_root(from, to)?, &[])?;
     // A checkout is a git repository, and steps run `git describe`, `git
     // diff` and the like. A `.git` file (a worktree or submodule) points at a
     // host path a container can't see, so only a directory is mirrored.
@@ -6180,7 +6184,14 @@ fn mirror_directory(
 
 /// Which entries of a source tree a checkout brings into the workspace.
 struct SyncRules {
+    /// The root's rules: its `.gitignore`, `.git/info/exclude` and the
+    /// global excludes file. Nested `.gitignore` files are read as the
+    /// walk reaches them.
     gitignore: Option<ignore::gitignore::Gitignore>,
+    /// Source directories never synced, because the workspace lives in
+    /// them: run from `$HOME`, the cache directory is inside the source,
+    /// and syncing it would copy the workspace into itself without end.
+    never: Vec<PathBuf>,
     /// The source is a git repository. Its ignore rules then decide what is
     /// a source file, hidden or not, as they do for a clone: tracked
     /// dotfiles such as `.cargo/config.toml` belong in the checkout.
@@ -6188,9 +6199,20 @@ struct SyncRules {
 }
 
 impl SyncRules {
-    fn for_root(root: &Path) -> Result<Self, ExecutionError> {
+    fn for_root(root: &Path, workspace: &Path) -> Result<Self, ExecutionError> {
+        let mut never: Vec<PathBuf> = [
+            Some(workspace.to_path_buf()),
+            crate::workspace::workspaces_root(),
+        ]
+        .into_iter()
+        .flatten()
+        .map(|dir| dir.canonicalize().unwrap_or(dir))
+        .filter(|dir| dir.starts_with(root))
+        .collect();
+        never.dedup();
         Ok(SyncRules {
             gitignore: create_gitignore_matcher(root)?,
+            never,
             git_checkout: root.join(".git").exists(),
         })
     }
@@ -6198,24 +6220,69 @@ impl SyncRules {
     /// Whether `source`, an entry named `name` in the source tree, is
     /// synced. `source` must be a path under the root, so ignore rules
     /// anchored to the root still match in subdirectories.
-    fn syncs(&self, source: &Path, name: &str, is_dir: bool) -> bool {
+    /// `nested` holds the `.gitignore` files of the directories between the
+    /// root and `source`, outermost first.
+    fn syncs(
+        &self,
+        source: &Path,
+        name: &str,
+        is_dir: bool,
+        nested: &[ignore::gitignore::Gitignore],
+    ) -> bool {
         // `.git` is mirrored separately, or not at all when it is a file.
-        if name == ".git" {
+        if name == ".git" || (is_dir && self.never.iter().any(|dir| dir == source)) {
             return false;
         }
-        if let Some(gitignore) = &self.gitignore {
-            if let Match::Ignore(_) = gitignore.matched(source, is_dir) {
-                return false;
-            }
+        if self.ignored(source, is_dir, nested) {
+            return false;
         }
         self.git_checkout || !Self::hidden(name)
+    }
+
+    /// Whether git would ignore `source`. As in git, the `.gitignore`
+    /// nearest to it has the last word, including to re-include with `!`.
+    fn ignored(
+        &self,
+        source: &Path,
+        is_dir: bool,
+        nested: &[ignore::gitignore::Gitignore],
+    ) -> bool {
+        for gitignore in nested.iter().rev().chain(self.gitignore.as_ref()) {
+            match gitignore.matched(source, is_dir) {
+                Match::Ignore(_) => return true,
+                Match::Whitelist(_) => return false,
+                Match::None => {}
+            }
+        }
+        false
     }
 
     /// Whether a workspace entry with no source counterpart may be deleted.
     /// Hidden entries never are: they may be tool state (`.pytest_cache`,
     /// `.venv`) a repository doesn't bother to ignore.
-    fn may_delete(&self, source: &Path, name: &str, is_dir: bool) -> bool {
-        !name.starts_with('.') && self.syncs(source, name, is_dir)
+    fn may_delete(
+        &self,
+        source: &Path,
+        name: &str,
+        is_dir: bool,
+        nested: &[ignore::gitignore::Gitignore],
+    ) -> bool {
+        !name.starts_with('.') && self.syncs(source, name, is_dir, nested)
+    }
+
+    /// The rules of `dir`'s own `.gitignore`, if it has one. The root's
+    /// are already in [`SyncRules::gitignore`].
+    fn nested_gitignore(dir: &Path) -> Option<ignore::gitignore::Gitignore> {
+        let path = dir.join(".gitignore");
+        if !path.is_file() {
+            return None;
+        }
+        let mut builder = GitignoreBuilder::new(dir);
+        if let Some(e) = builder.add(&path) {
+            wrkflw_logging::warning(&format!("Ignoring unreadable {}: {}", path.display(), e));
+            return None;
+        }
+        builder.build().ok()
     }
 
     /// Outside a git repository, most hidden files are editor and tool
@@ -6233,6 +6300,7 @@ fn copy_directory_contents_with_gitignore(
     from: &Path,
     to: &Path,
     rules: &SyncRules,
+    nested: &[ignore::gitignore::Gitignore],
 ) -> Result<(), ExecutionError> {
     let io_err = |what: &str, e: std::io::Error| ExecutionError::Execution(format!("{what}: {e}"));
 
@@ -6247,7 +6315,8 @@ fn copy_directory_contents_with_gitignore(
         let entry = entry.map_err(|e| io_err("Failed to read entry", e))?;
         let path = entry.path();
         let name = entry.file_name();
-        if path.is_symlink() || !rules.syncs(&path, &name.to_string_lossy(), path.is_dir()) {
+        if path.is_symlink() || !rules.syncs(&path, &name.to_string_lossy(), path.is_dir(), nested)
+        {
             continue;
         }
         synced.insert(name.clone());
@@ -6259,7 +6328,14 @@ fn copy_directory_contents_with_gitignore(
                     .map_err(|e| io_err("Failed to replace file with dir", e))?;
             }
             std::fs::create_dir_all(&dest_path).map_err(|e| io_err("Failed to create dir", e))?;
-            copy_directory_contents_with_gitignore(&path, &dest_path, rules)?;
+            match SyncRules::nested_gitignore(&path) {
+                Some(own) => {
+                    let mut inner = nested.to_vec();
+                    inner.push(own);
+                    copy_directory_contents_with_gitignore(&path, &dest_path, rules, &inner)?;
+                }
+                None => copy_directory_contents_with_gitignore(&path, &dest_path, rules, nested)?,
+            }
         } else {
             sync_file(&path, &dest_path)?;
         }
@@ -6280,7 +6356,9 @@ fn copy_directory_contents_with_gitignore(
         // Judge it by where it would be in the source, so ignore rules
         // anchored to the root apply.
         let source = from.join(&name);
-        if path.is_symlink() || !rules.may_delete(&source, &name.to_string_lossy(), path.is_dir()) {
+        if path.is_symlink()
+            || !rules.may_delete(&source, &name.to_string_lossy(), path.is_dir(), nested)
+        {
             continue;
         }
         let removed = if path.is_dir() {
@@ -8303,6 +8381,54 @@ mod tests {
         assert!(dst.path().join("web/index.ts").is_file());
         assert!(dst.path().join("web/dist/app.js").is_file());
         assert!(!dst.path().join("web/dist/host.js").exists());
+    }
+
+    #[test]
+    fn workspace_sync_follows_nested_gitignores() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(src.path().join("web/dist")).unwrap();
+        std::fs::write(
+            src.path().join("web/.gitignore"),
+            "dist/\n*.log\n!keep.log\n",
+        )
+        .unwrap();
+        std::fs::write(src.path().join("web/index.ts"), "src").unwrap();
+        std::fs::write(src.path().join("web/dist/host.js"), "host build").unwrap();
+        std::fs::write(src.path().join("web/debug.log"), "noise").unwrap();
+        std::fs::write(src.path().join("web/keep.log"), "tracked").unwrap();
+        // The rules apply only below the directory that holds them.
+        std::fs::write(src.path().join("top.log"), "tracked").unwrap();
+        // The job's own build output from its last run.
+        std::fs::create_dir_all(dst.path().join("web/dist")).unwrap();
+        std::fs::write(dst.path().join("web/dist/app.js"), "job build").unwrap();
+
+        copy_directory_contents(src.path(), dst.path()).unwrap();
+
+        assert!(dst.path().join("web/index.ts").is_file());
+        assert!(dst.path().join("web/keep.log").is_file());
+        assert!(dst.path().join("top.log").is_file());
+        assert!(!dst.path().join("web/debug.log").exists());
+        assert!(!dst.path().join("web/dist/host.js").exists());
+        assert!(
+            dst.path().join("web/dist/app.js").is_file(),
+            "build output was deleted"
+        );
+    }
+
+    #[test]
+    fn workspace_sync_skips_a_workspace_inside_the_source() {
+        let src = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("main.c"), "src").unwrap();
+        let dst = src.path().join("cache/wrkflw/workspaces/job");
+        std::fs::create_dir_all(&dst).unwrap();
+
+        copy_directory_contents(src.path(), &dst).unwrap();
+
+        assert!(dst.join("main.c").is_file());
+        assert!(!dst.join("cache/wrkflw/workspaces/job").exists());
+        // The workspace's parents are still synced, without the workspace.
+        assert!(dst.join("cache/wrkflw/workspaces").is_dir());
     }
 
     #[test]

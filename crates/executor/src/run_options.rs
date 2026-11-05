@@ -38,3 +38,17 @@ pub fn every_matrix_leg() -> bool {
 fn env_flag(name: &str) -> bool {
     std::env::var(name).is_ok_and(|v| !matches!(v.trim(), "" | "0" | "false"))
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn tests_never_keep_workspaces() {
+        // `.cargo/config.toml` sets WRKFLW_FRESH_WORKSPACE for every test,
+        // so jobs that tests run neither fill the user's cache directory nor
+        // see files an earlier test run left behind.
+        assert!(
+            super::fresh_workspaces(),
+            "set WRKFLW_FRESH_WORKSPACE=1 for tests (see .cargo/config.toml)"
+        );
+    }
+}

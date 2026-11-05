@@ -3748,6 +3748,11 @@ struct LiveStep {
 /// Longest partial line held back waiting for its newline.
 const LIVE_LINE_LIMIT: usize = 4096;
 
+/// When a partial line outgrows [`LIVE_LINE_LIMIT`], this much of its end
+/// is held back with the next chunk, so a secret straddling the cut is
+/// still whole when it is masked.
+const LIVE_LINE_OVERLAP: usize = 1024;
+
 impl LiveStep {
     /// `future` is boxed by the caller: a step's future is large, and laid
     /// out inline in every job future it would overflow the stack once
@@ -3785,7 +3790,13 @@ impl LiveLines {
             pending.push_str(chunk);
             let cut = match pending.rfind(['\n', '\r']) {
                 Some(at) => at + 1,
-                None if pending.len() > LIVE_LINE_LIMIT => pending.len(),
+                None if pending.len() > LIVE_LINE_LIMIT => {
+                    let mut at = pending.len() - LIVE_LINE_OVERLAP;
+                    while !pending.is_char_boundary(at) {
+                        at -= 1;
+                    }
+                    at
+                }
                 None => return,
             };
             let complete: String = pending.drain(..cut).collect();
@@ -3800,17 +3811,28 @@ impl LiveLines {
     }
 
     fn send(&self, text: &str) {
-        let lines: Vec<String> = text
-            .split(['\n', '\r'])
-            .filter(|line| !line.is_empty())
-            .map(|line| {
-                let line = crate::log_redaction::mask(line);
+        let mut lines: Vec<String> = Vec::new();
+        for line in text.split(['\n', '\r']).filter(|line| !line.is_empty()) {
+            // Workflow commands are instructions to the runner, not output.
+            // `::add-mask::` has to take effect here, before the lines after
+            // it are masked, not when the step ends: the value is on this
+            // very line, and the step may print it again before finishing.
+            if line.starts_with("::") {
+                for command in crate::workflow_commands::parse_workflow_commands(line) {
+                    if let crate::workflow_commands::WorkflowCommand::AddMask { value } = command {
+                        crate::log_redaction::register(&value);
+                    }
+                }
+                continue;
+            }
+            let line = crate::log_redaction::mask(line);
+            lines.push(
                 self.step
                     .workspace_prefixes
                     .iter()
-                    .fold(line, |line, prefix| line.replace(prefix, ""))
-            })
-            .collect();
+                    .fold(line, |line, prefix| line.replace(prefix, "")),
+            );
+        }
         if lines.is_empty() {
             return;
         }
@@ -3823,6 +3845,70 @@ impl LiveLines {
         for observer in &self.observers {
             observer.on_event(&event);
         }
+    }
+}
+
+#[cfg(test)]
+mod live_line_tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct Seen(Mutex<Vec<String>>);
+
+    impl crate::events::ExecutionObserver for Seen {
+        fn on_event(&self, event: &crate::events::ExecutionEvent) {
+            if let crate::events::ExecutionEvent::StepOutput { lines, .. } = event {
+                self.0.lock().unwrap().extend(lines.iter().cloned());
+            }
+        }
+    }
+
+    fn live(seen: Arc<Seen>) -> LiveLines {
+        LiveLines {
+            step: LiveStep {
+                job: "build".into(),
+                step: "print".into(),
+                index: 0,
+                workspace_prefixes: Vec::new(),
+            },
+            observers: vec![seen],
+            pending: Mutex::new(String::new()),
+        }
+    }
+
+    #[test]
+    fn add_mask_takes_effect_on_the_lines_after_it_and_is_never_shown() {
+        let seen = Arc::new(Seen::default());
+        let lines = live(seen.clone());
+        let value = "live-add-mask-sentinel-91ab";
+        lines.push(&format!("before\n::add-mask::{value}\ntoken is {value}\n"));
+        lines.push(&format!("again {value}"));
+        lines.flush();
+        let seen = seen.0.lock().unwrap();
+        assert!(
+            !seen.iter().any(|l| l.contains(value)),
+            "the value leaked: {seen:?}"
+        );
+        assert!(!seen.iter().any(|l| l.starts_with("::")), "{seen:?}");
+        assert_eq!(seen.first().map(String::as_str), Some("before"));
+        assert_eq!(seen.len(), 3);
+    }
+
+    #[test]
+    fn a_secret_across_a_forced_cut_is_still_masked() {
+        let secret = "live-overlap-sentinel-4d0e";
+        crate::log_redaction::register(secret);
+        let seen = Arc::new(Seen::default());
+        let lines = live(seen.clone());
+        // No newline, so the line is cut once it outgrows the limit, and
+        // the secret arrives in two chunks either side of that cut.
+        let (head, tail) = secret.split_at(10);
+        lines.push(&format!("{}{head}", "x".repeat(LIVE_LINE_LIMIT)));
+        lines.push(tail);
+        lines.flush();
+        let joined: String = seen.0.lock().unwrap().concat();
+        assert!(!joined.contains(head), "half the secret leaked");
+        assert!(joined.contains("***"));
     }
 }
 

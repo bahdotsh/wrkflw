@@ -188,12 +188,16 @@ fn spread(left: Vec<Span<'static>>, right: Vec<Span<'static>>, w: usize) -> Line
     Line::from(spans)
 }
 
-/// The story lines for a run, `w` cells wide.
+/// The story lines for a run, `w` cells wide. `settled` once the run has
+/// ended: a job that never reported finishing then did not finish, rather
+/// than still running (a run can end with an error before a job's finish
+/// event, as when a matrix leg's runner image can't be resolved).
 pub(crate) fn story_lines(
     timeline: &[TimelineEntry],
     live: Option<&crate::models::LiveTails>,
     w: usize,
     spinner_frame: usize,
+    settled: bool,
 ) -> Vec<Line<'static>> {
     use crate::views::execution_tab::format_ms;
     let mut lines = Vec::new();
@@ -222,6 +226,10 @@ pub(crate) fn story_lines(
                     _ => format_ms(*duration_ms),
                 };
                 (g, st, right)
+            }
+            _ if settled => {
+                let (g, st) = theme::job_status(&wrkflw_executor::JobStatus::Failure);
+                (g, st, "did not finish".to_string())
             }
             _ => (
                 theme::spinner(spinner_frame),
@@ -292,7 +300,7 @@ pub(crate) fn story_lines(
         }
         // A running job shows its current step and the last lines it
         // printed, so a long step visibly makes progress.
-        if job.finished.is_none() {
+        if job.finished.is_none() && !settled {
             if let Some(tail) = live.and_then(|live| live.jobs.get(job.name)) {
                 lines.push(Line::from(vec![
                     Span::raw("  "),
@@ -350,10 +358,10 @@ fn render_story(f: &mut Frame<'_>, app: &mut App, area: Rect) {
         theme::empty_state(
             f,
             inner,
-            if exec.is_some() {
-                "Waiting for the first job to start"
-            } else {
-                "Nothing has run yet"
+            match exec {
+                Some(exec) if exec.end_time.is_some() => "The run ended before any job started",
+                Some(_) => "Waiting for the first job to start",
+                None => "Nothing has run yet",
             },
             vec![
                 Span::styled("Run a workflow from ", theme::muted_style()),
@@ -367,7 +375,13 @@ fn render_story(f: &mut Frame<'_>, app: &mut App, area: Rect) {
     };
 
     let w = inner.width.saturating_sub(1) as usize;
-    let mut lines = story_lines(&exec.timeline, Some(&exec.live), w, app.spinner_frame);
+    let mut lines = story_lines(
+        &exec.timeline,
+        Some(&exec.live),
+        w,
+        app.spinner_frame,
+        exec.end_time.is_some(),
+    );
     if let Some(end) = exec.end_time {
         let secs = end
             .signed_duration_since(exec.start_time)
@@ -440,7 +454,7 @@ mod tests {
                 canonical_name: "lint".into(),
             },
         ];
-        let lines = text_of(&story_lines(&timeline, None, 60, 0));
+        let lines = text_of(&story_lines(&timeline, None, 60, 0, false));
         assert!(lines[0].starts_with("✖ build") && lines[0].ends_with("37.2s"));
         assert!(lines[1].contains("cargo test") && lines[1].contains("exit 101"));
         assert!(lines[2].contains("│ test failed"));
@@ -470,11 +484,36 @@ mod tests {
         live.push("build", 0, "compile", vec!["Finished dev".into()]);
         // The next step has started and printed nothing yet.
         live.push("build", 1, "test", Vec::new());
-        let lines = text_of(&story_lines(&timeline, Some(&live), 60, 0));
+        let lines = text_of(&story_lines(&timeline, Some(&live), 60, 0, false));
         assert_eq!(lines[2].trim(), format!("{} test", theme::spinner(0)));
         assert!(
             !lines.iter().any(|l| l.contains("Finished dev")),
             "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_job_that_never_finished_is_settled_once_the_run_ends() {
+        let timeline = vec![TimelineEntry::JobStarted {
+            job: "build (os: a)".into(),
+            canonical_name: "build".into(),
+        }];
+        let mut live = crate::models::LiveTails::default();
+        live.push("build (os: a)", 0, "compile", vec!["half done".into()]);
+
+        let running = text_of(&story_lines(&timeline, Some(&live), 60, 0, false));
+        assert!(running[0].ends_with("running"), "{running:?}");
+        assert!(running.iter().any(|l| l.contains("half done")));
+
+        let settled = text_of(&story_lines(&timeline, Some(&live), 60, 0, true));
+        let (failed, _) = theme::job_status(&JobStatus::Failure);
+        assert!(settled[0].starts_with(failed), "{settled:?}");
+        assert!(settled[0].ends_with("did not finish"), "{settled:?}");
+        assert!(
+            !settled
+                .iter()
+                .any(|l| l.contains("half done") || l.contains("compile")),
+            "a settled run still shows a live tail: {settled:?}"
         );
     }
 }

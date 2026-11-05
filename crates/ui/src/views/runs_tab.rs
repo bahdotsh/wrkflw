@@ -46,15 +46,10 @@ pub(crate) fn when(started_at: &str) -> String {
         .unwrap_or_default()
 }
 
+/// A recorded duration, formatted as the live views format it, so a job
+/// reads the same in History as in the Run tab.
 pub(crate) fn duration(ms: Option<u64>) -> String {
-    ms.map(|ms| {
-        if ms < 1000 {
-            format!("{ms}ms")
-        } else {
-            super::execution_tab::format_duration((ms / 1000) as i64)
-        }
-    })
-    .unwrap_or_default()
+    ms.map(super::execution_tab::format_ms).unwrap_or_default()
 }
 
 fn run_row(run: &RunRecord, w: usize, selected: bool) -> Line<'static> {

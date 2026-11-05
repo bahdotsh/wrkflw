@@ -21,10 +21,7 @@ pub const INSPECTOR_TABS: [&str; 2] = ["Output", "Matrix"];
 const MAX_OUTPUT_LINES: usize = 5000;
 
 pub fn render_job_detail_view(f: &mut Frame<'_>, app: &mut App, area: Rect) {
-    let workflow_idx = app
-        .current_execution
-        .or_else(|| app.workflow_list_state.selected())
-        .filter(|&idx| idx < app.workflows.len());
+    let workflow_idx = app.shown_workflow();
 
     let job = workflow_idx.and_then(|w| {
         let exec = app.workflows[w].execution_details.as_ref()?;

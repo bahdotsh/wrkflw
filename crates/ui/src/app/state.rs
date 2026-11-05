@@ -1039,12 +1039,19 @@ impl App {
         self.workflow_list_state.select(Some(i));
     }
 
+    /// The workflow the Run views show: the one running, else the one
+    /// highlighted in the list. `None` when that index is out of range.
+    pub fn shown_workflow(&self) -> Option<usize> {
+        self.current_execution
+            .or_else(|| self.workflow_list_state.selected())
+            .filter(|&idx| idx < self.workflows.len())
+    }
+
     /// Move the job cursor to the first job, or the last when `last`.
     pub fn jump_job(&mut self, last: bool) {
         let len = self
-            .current_execution
-            .or_else(|| self.workflow_list_state.selected())
-            .and_then(|idx| self.workflows.get(idx))
+            .shown_workflow()
+            .map(|idx| &self.workflows[idx])
             .and_then(|w| w.execution_details.as_ref())
             .map_or(0, |e| e.jobs.len());
         if len == 0 {
@@ -1060,9 +1067,8 @@ impl App {
     /// Move the step cursor to the first step, or the last when `last`.
     pub fn jump_step(&mut self, last: bool) {
         let len = self
-            .current_execution
-            .or_else(|| self.workflow_list_state.selected())
-            .and_then(|idx| self.workflows.get(idx))
+            .shown_workflow()
+            .map(|idx| &self.workflows[idx])
             .and_then(|w| w.execution_details.as_ref())
             .zip(self.job_list_state.selected())
             .and_then(|(e, job)| e.jobs.get(job))
@@ -1078,10 +1084,7 @@ impl App {
 
     // Move cursor up in the job list
     pub fn previous_job(&mut self) {
-        let current_workflow_idx = self
-            .current_execution
-            .or_else(|| self.workflow_list_state.selected())
-            .filter(|&idx| idx < self.workflows.len());
+        let current_workflow_idx = self.shown_workflow();
 
         if let Some(workflow_idx) = current_workflow_idx {
             if let Some(execution) = &self.workflows[workflow_idx].execution_details {
@@ -1105,10 +1108,7 @@ impl App {
 
     // Move cursor down in the job list
     pub fn next_job(&mut self) {
-        let current_workflow_idx = self
-            .current_execution
-            .or_else(|| self.workflow_list_state.selected())
-            .filter(|&idx| idx < self.workflows.len());
+        let current_workflow_idx = self.shown_workflow();
 
         if let Some(workflow_idx) = current_workflow_idx {
             if let Some(execution) = &self.workflows[workflow_idx].execution_details {
@@ -1132,10 +1132,7 @@ impl App {
 
     // Move cursor up in step list
     pub fn previous_step(&mut self) {
-        let current_workflow_idx = self
-            .current_execution
-            .or_else(|| self.workflow_list_state.selected())
-            .filter(|&idx| idx < self.workflows.len());
+        let current_workflow_idx = self.shown_workflow();
 
         if let Some(workflow_idx) = current_workflow_idx {
             if let Some(execution) = &self.workflows[workflow_idx].execution_details {
@@ -1162,10 +1159,7 @@ impl App {
 
     // Move cursor down in step list
     pub fn next_step(&mut self) {
-        let current_workflow_idx = self
-            .current_execution
-            .or_else(|| self.workflow_list_state.selected())
-            .filter(|&idx| idx < self.workflows.len());
+        let current_workflow_idx = self.shown_workflow();
 
         if let Some(workflow_idx) = current_workflow_idx {
             if let Some(execution) = &self.workflows[workflow_idx].execution_details {

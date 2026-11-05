@@ -19,10 +19,7 @@ use ratatui::{
 use wrkflw_executor::{JobStatus, StepStatus};
 
 pub fn render_execution_tab(f: &mut Frame<'_>, app: &mut App, area: Rect) {
-    let workflow_idx = app
-        .current_execution
-        .or_else(|| app.workflow_list_state.selected())
-        .filter(|&idx| idx < app.workflows.len());
+    let workflow_idx = app.shown_workflow();
 
     let Some(idx) = workflow_idx else {
         render_empty_state(f, area);

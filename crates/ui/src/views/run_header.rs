@@ -35,8 +35,7 @@ pub fn render_run_header(f: &mut Frame<'_>, app: &App, area: Rect) {
     let idx = if app.selected_tab == TAB_DAG {
         app.workflow_list_state.selected()
     } else {
-        app.current_execution
-            .or_else(|| app.workflow_list_state.selected())
+        app.shown_workflow()
     };
     match idx.and_then(|i| app.workflows.get(i)) {
         Some(workflow) => execution_tab::render_summary_line(f, app, workflow, rows[0]),

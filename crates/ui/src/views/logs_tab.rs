@@ -343,10 +343,7 @@ pub(crate) fn story_lines(
 const STORY_LIVE_LINES: usize = 3;
 
 fn render_story(f: &mut Frame<'_>, app: &mut App, area: Rect) {
-    let idx = app
-        .current_execution
-        .or_else(|| app.workflow_list_state.selected())
-        .filter(|&idx| idx < app.workflows.len());
+    let idx = app.shown_workflow();
     let workflow = idx.map(|i| &app.workflows[i]);
     let exec = workflow.and_then(|w| w.execution_details.as_ref());
     // The Run header already names the workflow.

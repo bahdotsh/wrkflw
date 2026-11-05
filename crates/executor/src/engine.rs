@@ -432,7 +432,10 @@ async fn execute_gitlab_pipeline(
     // `--variable` values are often credentials, and they are never stored
     // on purpose, so they can't be left to reach the step logs either.
     secret_masker.add_secrets(config.variables.values().cloned());
-    crate::log_redaction::register_all(config.variables.values());
+    // The log masker is process-wide and permanent, so it only takes the
+    // variables that look like credentials; `BRANCH=main` must not turn
+    // every later "main" in the logs into `***`.
+    crate::log_redaction::register_variables(&config.variables);
 
     // Create artifact store for this pipeline run
     let artifact_store =

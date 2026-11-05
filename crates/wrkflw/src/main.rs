@@ -121,14 +121,30 @@ struct Wrkflw {
     /// By default each job keeps its workspace between runs, so files the
     /// repository ignores (build output, dependencies) carry over and
     /// rebuilds are incremental
-    #[arg(long, global = true, env = "WRKFLW_FRESH_WORKSPACE")]
+    #[arg(
+        long,
+        global = true,
+        env = "WRKFLW_FRESH_WORKSPACE",
+        action = clap::ArgAction::SetTrue,
+        // `=1`, `=yes` and `=true` turn it on; `=0`, `=no`, `=false` and
+        // empty leave it off, as the executor reads the variable too.
+        value_parser = clap::builder::FalseyValueParser::new()
+    )]
     fresh_workspace: bool,
 
     /// Run every matrix leg. By default a leg that would only repeat another
     /// (same image, and the job reads nothing else that differs, as with
     /// `runs-on: ${{ matrix.os }}` run locally) is reported with that leg's
     /// result instead
-    #[arg(long, global = true, env = "WRKFLW_EVERY_MATRIX_LEG")]
+    #[arg(
+        long,
+        global = true,
+        env = "WRKFLW_EVERY_MATRIX_LEG",
+        action = clap::ArgAction::SetTrue,
+        // `=1`, `=yes` and `=true` turn it on; `=0`, `=no`, `=false` and
+        // empty leave it off, as the executor reads the variable too.
+        value_parser = clap::builder::FalseyValueParser::new()
+    )]
     every_matrix_leg: bool,
 
     #[command(flatten)]
@@ -1811,5 +1827,44 @@ mod tests {
     #[test]
     fn platform_flag_rejects_malformed_values() {
         assert!(Wrkflw::try_parse_from(["wrkflw", "-P", "no-equals"]).is_err());
+    }
+
+    #[test]
+    fn workspace_and_matrix_env_flags_accept_one_and_zero() {
+        // Parsing reads the process environment, so these assertions run
+        // under one test with the variables restored afterwards.
+        let saved: Vec<_> = ["WRKFLW_FRESH_WORKSPACE", "WRKFLW_EVERY_MATRIX_LEG"]
+            .into_iter()
+            .map(|name| (name, std::env::var_os(name)))
+            .collect();
+        let parse = || Wrkflw::try_parse_from(["wrkflw", "list"]).unwrap();
+        for (value, on) in [
+            ("1", true),
+            ("yes", true),
+            ("true", true),
+            ("0", false),
+            ("false", false),
+            ("", false),
+        ] {
+            std::env::set_var("WRKFLW_FRESH_WORKSPACE", value);
+            std::env::set_var("WRKFLW_EVERY_MATRIX_LEG", value);
+            let cli = parse();
+            assert_eq!(cli.fresh_workspace, on, "WRKFLW_FRESH_WORKSPACE={value:?}");
+            assert_eq!(
+                cli.every_matrix_leg, on,
+                "WRKFLW_EVERY_MATRIX_LEG={value:?}"
+            );
+        }
+        for (name, value) in saved {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+        assert!(
+            Wrkflw::try_parse_from(["wrkflw", "--fresh-workspace", "list"])
+                .unwrap()
+                .fresh_workspace
+        );
     }
 }

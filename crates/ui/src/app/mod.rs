@@ -305,8 +305,7 @@ fn run_tui_event_loop(
 
         // Non-blocking check for execution results
         if let Ok((workflow_idx, result)) = rx.try_recv() {
-            app.process_execution_result(workflow_idx, result);
-            app.current_execution = None;
+            app.finish_execution(workflow_idx, result);
             app.refresh_runs();
 
             // Get next workflow to execute using our helper function

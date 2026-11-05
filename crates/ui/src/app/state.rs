@@ -2665,12 +2665,6 @@ impl App {
         });
     }
 
-    /// Drain any completed dispatch outcomes. Each outcome is pushed
-    /// to `self.logs` so nothing is lost if two arrive in one tick,
-    /// and the status bar is updated with the most recent one (an
-    /// Err takes precedence over an Ok that preceded it in the same
-    /// drain — the user wants to know about the failure). Uses
-    /// `try_recv` so the call never blocks.
     /// Append the run events that arrived since the last call to the
     /// running workflow's timeline. Call before handling a run's result, so
     /// the events it sent before finishing are in place first.
@@ -2688,14 +2682,37 @@ impl App {
             {
                 match entry {
                     crate::models::RunUpdate::Entry(entry) => exec.timeline.push(entry),
-                    crate::models::RunUpdate::Output { job, step, lines } => {
-                        exec.live.push(&job, &step, lines)
-                    }
+                    crate::models::RunUpdate::Output {
+                        job,
+                        index,
+                        step,
+                        lines,
+                    } => exec.live.push(&job, index, &step, lines),
                 }
             }
         }
     }
 
+    /// Handle the run in flight finishing with `result`. The executor sends
+    /// a run's last events and then its result from the same thread, so
+    /// any event still queued arrived before the result: it is applied
+    /// while the run still counts as in flight, or it would be dropped.
+    pub fn finish_execution(
+        &mut self,
+        workflow_idx: usize,
+        result: Result<(Vec<wrkflw_executor::JobResult>, ()), String>,
+    ) {
+        self.drain_timeline();
+        self.process_execution_result(workflow_idx, result);
+        self.current_execution = None;
+    }
+
+    /// Drain any completed dispatch outcomes. Each outcome is pushed
+    /// to `self.logs` so nothing is lost if two arrive in one tick,
+    /// and the status bar is updated with the most recent one (an
+    /// Err takes precedence over an Ok that preceded it in the same
+    /// drain — the user wants to know about the failure). Uses
+    /// `try_recv` so the call never blocks.
     pub fn drain_trigger_outcomes(&mut self) {
         let mut last: Option<DispatchOutcome> = None;
         while let Ok(outcome) = self.trigger_outcome_rx.try_recv() {
@@ -4204,6 +4221,37 @@ mod tests {
             .timeline;
         assert_eq!(timeline, &vec![entry("build")]);
         assert!(app.workflows[1].execution_details.is_none());
+    }
+
+    #[test]
+    fn events_queued_ahead_of_the_result_still_reach_the_timeline() {
+        let mut app = make_app();
+        app.execution_queue.push(QueuedExecution {
+            workflow_idx: 0,
+            target_job: None,
+        });
+        app.get_next_workflow_to_execute();
+        app.current_execution = Some(0);
+        let finished = crate::models::TimelineEntry::JobFinished {
+            job: "build".into(),
+            status: wrkflw_executor::JobStatus::Success,
+            failure_allowed: false,
+            duration_ms: 10,
+            repeated_from: None,
+        };
+        // The executor's last event, sent just before its result and not
+        // yet drained by the event loop.
+        app.timeline_tx
+            .send((0, crate::models::RunUpdate::Entry(finished.clone())))
+            .unwrap();
+        app.finish_execution(0, Ok((Vec::new(), ())));
+        assert_eq!(app.current_execution, None);
+        let timeline = &app.workflows[0]
+            .execution_details
+            .as_ref()
+            .unwrap()
+            .timeline;
+        assert_eq!(timeline, &vec![finished]);
     }
 
     #[test]

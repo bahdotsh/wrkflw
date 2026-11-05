@@ -11,7 +11,7 @@ A command-line tool for validating and executing GitHub Actions workflows locall
 
 ## Features
 
-- **TUI interface** — interactive terminal UI with Workflows, Execution, DAG, Logs, Trigger, Setup, Runs, and Help tabs
+- **TUI interface** — interactive terminal UI with Workflows, Run (jobs, graph and log views), History, Dispatch and Setup tabs, plus a Help overlay
 - **Workflow validation** — syntax checks, structural validation, and composite action input cross-checking with CI/CD-friendly exit codes
 - **Local execution** — Docker, Podman, emulation, or sandboxed **secure emulation** (no containers)
 - **Kubernetes execution** — run each step as a pod in your own cluster, with node selectors and GPU resource requests

@@ -143,16 +143,21 @@ pub struct LiveTails {
 
 #[derive(Debug, Default)]
 pub struct LiveTail {
+    /// The step's index in its job; names can repeat, indexes can't.
+    pub index: usize,
     pub step: String,
     pub lines: std::collections::VecDeque<String>,
     pub updated: u64,
 }
 
 impl LiveTails {
-    pub fn push(&mut self, job: &str, step: &str, lines: Vec<String>) {
+    pub fn push(&mut self, job: &str, index: usize, step: &str, lines: Vec<String>) {
         self.seq += 1;
         let tail = self.jobs.entry(job.to_string()).or_default();
-        if tail.step != step {
+        // A fresh tail has an empty name, which no step has, so its first
+        // push always starts over too.
+        if tail.index != index || tail.step != step {
+            tail.index = index;
             tail.step = step.to_string();
             tail.lines.clear();
         }
@@ -314,6 +319,7 @@ pub enum RunUpdate {
     /// Lines a running step printed.
     Output {
         job: String,
+        index: usize,
         step: String,
         lines: Vec<String>,
     },
@@ -323,9 +329,13 @@ impl RunUpdate {
     pub fn from_event(event: &wrkflw_executor::ExecutionEvent) -> Option<Self> {
         match event {
             wrkflw_executor::ExecutionEvent::StepOutput {
-                job, step, lines, ..
+                job,
+                step,
+                index,
+                lines,
             } => Some(RunUpdate::Output {
                 job: job.clone(),
+                index: *index,
                 step: step.clone(),
                 lines: lines.clone(),
             }),
@@ -513,19 +523,29 @@ mod tests {
     #[test]
     fn live_tails_keep_the_current_step_and_the_newest_job() {
         let mut live = LiveTails::default();
-        live.push("lint", "clippy", vec!["Checking a".into()]);
-        live.push("build", "compile", vec!["Compiling a".into()]);
+        live.push("lint", 0, "clippy", vec!["Checking a".into()]);
+        live.push("build", 0, "compile", vec!["Compiling a".into()]);
         assert_eq!(live.pick(None).map(|(job, _)| job), Some("build"));
         assert_eq!(live.pick(Some("lint")).map(|(job, _)| job), Some("lint"));
 
         // A new step starts its tail over; the tail stays bounded.
-        live.push("build", "test", vec!["running 3 tests".into()]);
+        live.push("build", 1, "test", vec!["running 3 tests".into()]);
         let lines: Vec<String> = (0..LIVE_TAIL_LINES + 10).map(|i| i.to_string()).collect();
-        live.push("build", "test", lines);
+        live.push("build", 1, "test", lines);
         let tail = &live.jobs["build"];
         assert_eq!(tail.step, "test");
         assert_eq!(tail.lines.len(), LIVE_TAIL_LINES);
         assert_eq!(tail.lines.back().map(String::as_str), Some("509"));
+    }
+
+    #[test]
+    fn a_step_sharing_its_name_with_the_last_one_starts_its_own_tail() {
+        let mut live = LiveTails::default();
+        live.push("build", 0, "Test", vec!["unit".into()]);
+        live.push("build", 1, "Test", vec!["integration".into()]);
+        let tail = &live.jobs["build"];
+        assert_eq!(tail.index, 1);
+        assert_eq!(tail.lines, ["integration"]);
     }
 
     #[test]

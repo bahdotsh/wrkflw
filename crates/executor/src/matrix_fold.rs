@@ -6,7 +6,7 @@
 //! image, reports that leg's result instead of running.
 //! `run_options::every_matrix_leg` turns this off.
 
-use crate::engine::{get_effective_runner_image, JobResult};
+use crate::engine::{get_effective_runner_image, JobResult, JobStatus};
 use serde_yaml::Value;
 use std::collections::HashMap;
 use wrkflw_matrix::MatrixCombination;
@@ -118,11 +118,21 @@ fn reads_matrix_keys(body: &str, keys: &[String]) -> bool {
 /// The result of a leg that wasn't run because it would only repeat
 /// `original`, reported under its own name.
 pub(crate) fn repeated_leg(name: &str, original: &JobResult, image: &str) -> JobResult {
-    let note = format!(
-        "Not run: it would repeat {} exactly, since both run in {} and the job reads \
-         nothing else that differs. Pass --every-matrix-leg to run it anyway.",
-        original.name, image
+    let why = format!(
+        "since both run in {} and the job reads nothing else that differs. Pass \
+         --every-matrix-leg to run it anyway.",
+        image
     );
+    let note = match original.status {
+        JobStatus::Skipped => format!(
+            "Not run: {} was skipped, and this leg would repeat it exactly, {}",
+            original.name, why
+        ),
+        _ => format!(
+            "Not run: it would repeat {} exactly, {}",
+            original.name, why
+        ),
+    };
     crate::events::emit(|| crate::events::ExecutionEvent::JobStarted {
         job: name.to_string(),
         canonical_name: original.canonical_name.clone(),
@@ -261,6 +271,11 @@ mod tests {
         .await;
         assert_eq!(twin.name, "build (os: b)");
         assert_eq!(twin.status, original.status);
+        assert!(
+            twin.logs.starts_with("Not run: build (os: a) was skipped"),
+            "{}",
+            twin.logs
+        );
         assert_eq!(
             *seen.0.lock().unwrap(),
             vec![Some("build (os: a)".to_string())]

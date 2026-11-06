@@ -382,7 +382,7 @@ async fn execute_gitlab_pipeline(
                     .flatten()
                     .map(|job_name| {
                         let logs = format!("Skipped: workflow:rules: {}", reason);
-                        JobResult::skipped(job_name.clone(), job_name, logs)
+                        JobResult::skipped(job_name.clone(), job_name, logs).announced()
                     })
                     .collect(),
                 failure_details: None,
@@ -476,11 +476,10 @@ async fn execute_gitlab_pipeline(
                 job_name,
                 reason
             ));
-            results.push(JobResult::skipped(
-                job_name.clone(),
-                job_name,
-                format!("Skipped: {}", reason),
-            ));
+            results.push(
+                JobResult::skipped(job_name.clone(), job_name, format!("Skipped: {}", reason))
+                    .announced(),
+            );
         }
         if job_batch.is_empty() {
             continue;
@@ -1194,6 +1193,26 @@ impl JobResult {
             failure_allowed: false,
             repeated_from: None,
         }
+    }
+
+    /// `self`, a skipped job, after telling the run's observers it was
+    /// skipped. A skipped job runs no step, so without this the event
+    /// stream never mentions it, and a live view would show it as waiting
+    /// until the run's result arrives.
+    pub(crate) fn announced(self) -> Self {
+        crate::events::emit(|| crate::events::ExecutionEvent::JobStarted {
+            job: self.name.clone(),
+            canonical_name: self.canonical_name.clone(),
+        });
+        crate::events::emit(|| crate::events::ExecutionEvent::JobFinished {
+            job: self.name.clone(),
+            status: self.status.clone(),
+            failure_allowed: self.failure_allowed,
+            duration_ms: 0,
+            logs: self.logs.clone(),
+            repeated_from: self.repeated_from.clone(),
+        });
+        self
     }
 
     /// A job that failed before any of its steps ran. The reason is carried on a
@@ -2616,7 +2635,7 @@ async fn execute_job_with_matrix(
                 job_name,
                 reason
             ));
-            return Ok(vec![JobResult::skipped(job_name, job_name, "")]);
+            return Ok(vec![JobResult::skipped(job_name, job_name, "").announced()]);
         }
     }
 
@@ -2680,7 +2699,9 @@ async fn execute_job_with_matrix(
                 job_name,
                 reason
             ));
-            return Ok(vec![JobResult::skipped(job_name, job_name, reason)]);
+            return Ok(vec![
+                JobResult::skipped(job_name, job_name, reason).announced()
+            ]);
         }
         acceleration::Decision::Run { key } => key,
     };
@@ -3085,11 +3106,11 @@ async fn execute_matrix_combinations(
             for combination in chunk {
                 let combination_name =
                     wrkflw_matrix::format_combination_name(ctx.job_name, combination);
-                results.push(JobResult::skipped(
+                results.push(JobResult::announced(JobResult::skipped(
                     combination_name,
                     ctx.job_name,
                     "Job skipped due to previous matrix job failure",
-                ));
+                )));
             }
             continue;
         }
@@ -3153,36 +3174,38 @@ async fn execute_matrix_combinations(
         return Ok(results);
     }
     // Back in matrix order, with each repeat taking its original's result.
-    // Every leg ran or was skipped by fail-fast, so each name has a result;
-    // one going missing is a bug to surface, not a leg to drop quietly.
-    let by_name: HashMap<String, JobResult> = results
-        .into_iter()
-        .map(|result| (result.name.clone(), result))
-        .collect();
-    let names: Vec<String> = ctx
-        .combinations
-        .iter()
-        .map(|c| wrkflw_matrix::format_combination_name(ctx.job_name, c))
-        .collect();
-    let missing = |name: &str| {
-        ExecutionError::Execution(format!(
-            "Matrix job '{}': leg '{}' finished without a result",
-            ctx.job_name, name
-        ))
-    };
-    let mut ordered = Vec::with_capacity(names.len());
-    for (i, name) in names.iter().enumerate() {
-        let source = twins[i].map_or(name, |original| &names[original]);
-        let result = by_name.get(source).ok_or_else(|| missing(source))?;
+    // Every unique leg ran or was skipped by fail-fast, one result each in
+    // the order they were given, so results are matched by position: two
+    // legs can share a name (duplicate `include` entries), and matching by
+    // name would hand one of them the other's result.
+    if results.len() != unique.len() {
+        return Err(ExecutionError::Execution(format!(
+            "Matrix job '{}': {} legs ran but {} results came back",
+            ctx.job_name,
+            unique.len(),
+            results.len()
+        )));
+    }
+    let mut position = vec![0usize; ctx.combinations.len()];
+    let mut next = 0;
+    for (i, twin) in twins.iter().enumerate() {
+        if twin.is_none() {
+            position[i] = next;
+            next += 1;
+        }
+    }
+    let mut ordered = Vec::with_capacity(ctx.combinations.len());
+    for (i, combination) in ctx.combinations.iter().enumerate() {
         ordered.push(match twins[i] {
-            None => result.clone(),
-            Some(_) => {
+            None => results[position[i]].clone(),
+            Some(original) => {
                 let image = get_effective_runner_image(
                     ctx.job_template,
                     ctx.services.platform_overrides,
-                    Some(&ctx.combinations[i].values),
+                    Some(&combination.values),
                 );
-                repeated_leg(name, result, &image)
+                let name = wrkflw_matrix::format_combination_name(ctx.job_name, combination);
+                repeated_leg(&name, &results[position[original]], &image)
             }
         });
     }
@@ -13841,5 +13864,44 @@ job_wins:
             .unwrap();
         assert!(output.status.success());
         assert_eq!(String::from_utf8_lossy(&output.stdout), "a  b");
+    }
+
+    #[tokio::test]
+    async fn a_skipped_job_is_announced_as_started_and_finished() {
+        #[derive(Default)]
+        struct Seen(std::sync::Mutex<Vec<String>>);
+        impl crate::events::ExecutionObserver for Seen {
+            fn on_event(&self, event: &crate::events::ExecutionEvent) {
+                use crate::events::ExecutionEvent as E;
+                let line = match event {
+                    E::JobStarted {
+                        job,
+                        canonical_name,
+                    } => format!("start {job} {canonical_name}"),
+                    E::JobFinished {
+                        job,
+                        status,
+                        duration_ms,
+                        ..
+                    } => format!("finish {job} {status:?} {duration_ms}"),
+                    _ => return,
+                };
+                self.0.lock().unwrap().push(line);
+            }
+        }
+        let seen = std::sync::Arc::new(Seen::default());
+        let hooks = crate::events::RunHooks {
+            observers: vec![seen.clone()],
+            from_step: None,
+        };
+        let result = crate::events::with_run_hooks(hooks, async {
+            JobResult::skipped("deploy", "deploy", "").announced()
+        })
+        .await;
+        assert_eq!(result.status, JobStatus::Skipped);
+        assert_eq!(
+            *seen.0.lock().unwrap(),
+            vec!["start deploy deploy", "finish deploy Skipped 0"]
+        );
     }
 }

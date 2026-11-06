@@ -356,6 +356,11 @@ fn render_story(f: &mut Frame<'_>, app: &mut App, area: Rect) {
             f,
             inner,
             match exec {
+                // Validation and remote dispatch report results without
+                // events, so there is no story, only the jobs view.
+                Some(exec) if exec.end_time.is_some() && !exec.jobs.is_empty() => {
+                    "This run has no story; its results are in the jobs view (x)"
+                }
                 Some(exec) if exec.end_time.is_some() => "The run ended before any job started",
                 Some(_) => "Waiting for the first job to start",
                 None => "Nothing has run yet",

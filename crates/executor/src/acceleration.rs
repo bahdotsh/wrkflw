@@ -405,6 +405,12 @@ pub(crate) struct KeyInput<'a> {
 /// The fingerprint a stored result is filed under. `None` if the job can't be
 /// serialized, which leaves it running as normal.
 pub(crate) fn job_key(input: &KeyInput<'_>) -> Option<String> {
+    job_key_with(input, crate::run_options::every_matrix_leg())
+}
+
+/// [`job_key`], with `every_matrix_leg` saying whether matrix legs that
+/// would repeat another leg still run.
+fn job_key_with(input: &KeyInput<'_>, every_matrix_leg: bool) -> Option<String> {
     let lookup = input.lookup;
     let inputs = match input.patterns {
         None => input.tree.digest.clone(),
@@ -428,6 +434,14 @@ pub(crate) fn job_key(input: &KeyInput<'_>) -> Option<String> {
         "arch": std::env::consts::ARCH,
         "inputs": inputs,
     });
+    // A matrix result stored by default may hold legs that were folded into
+    // another leg and never ran, so it can't stand in for a run of every leg.
+    // Only that mode changes the key, so stored and shared results from a
+    // default run keep their keys.
+    let mut document = document;
+    if every_matrix_leg && lookup.job.matrix_config().is_some() {
+        document["every_matrix_leg"] = serde_json::json!(true);
+    }
     let text = serde_json::to_string(&canonical(document)).ok()?;
     Some(hex(&Sha256::digest(text.as_bytes())))
 }
@@ -868,6 +882,16 @@ mod tests {
         tree: &TreeHashes,
         paths: Option<Vec<String>>,
     ) -> String {
+        key_for_mode(job_def, wf, tree, paths, false)
+    }
+
+    fn key_for_mode(
+        job_def: &Job,
+        wf: &WorkflowDefinition,
+        tree: &TreeHashes,
+        paths: Option<Vec<String>>,
+        every_matrix_leg: bool,
+    ) -> String {
         let hints = JobHints {
             paths,
             ..Default::default()
@@ -886,12 +910,35 @@ mod tests {
             needs_results: &empty_results,
             partial: false,
         };
-        job_key(&KeyInput {
-            lookup: &lookup,
-            tree: &Tree::new(tree.clone()).unwrap(),
-            patterns: patterns.as_deref(),
-        })
+        job_key_with(
+            &KeyInput {
+                lookup: &lookup,
+                tree: &Tree::new(tree.clone()).unwrap(),
+                patterns: patterns.as_deref(),
+            },
+            every_matrix_leg,
+        )
         .unwrap()
+    }
+
+    #[test]
+    fn running_every_matrix_leg_does_not_reuse_a_folded_result() {
+        let dir = repo();
+        let wf = workflow();
+        let tree = hash_tree(dir.path()).unwrap();
+        let matrix = job(
+            "runs-on: ${{ matrix.os }}\nstrategy:\n  matrix:\n    os: [a, b]\nsteps:\n  - run: make\n",
+        );
+        assert_ne!(
+            key_for_mode(&matrix, &wf, &tree, None, false),
+            key_for_mode(&matrix, &wf, &tree, None, true)
+        );
+        // A job without a matrix has nothing to fold, so its key is shared.
+        let plain = job("steps:\n  - run: make\n");
+        assert_eq!(
+            key_for_mode(&plain, &wf, &tree, None, false),
+            key_for_mode(&plain, &wf, &tree, None, true)
+        );
     }
 
     #[test]

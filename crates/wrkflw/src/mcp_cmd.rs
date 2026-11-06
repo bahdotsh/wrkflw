@@ -15,6 +15,9 @@ use tokio::sync::Mutex;
 
 const SUPPORTED_PROTOCOLS: [&str; 3] = ["2025-06-18", "2025-03-26", "2024-11-05"];
 const DEFAULT_RUN_TIMEOUT_SECS: u64 = 1800;
+/// The gate runs every workflow one after another, so its budget covers
+/// all of them, not one run.
+const DEFAULT_GATE_TIMEOUT_SECS: u64 = 3600;
 /// Longest a read-only tool may take. These only parse files and read history.
 const QUICK_TIMEOUT_SECS: u64 = 120;
 /// How long a timed-out child gets to clean up. Longer than the 10 seconds
@@ -135,7 +138,7 @@ fn tool_command(name: &str, args: &Value) -> Result<(Vec<String>, u64), String> 
             }
             timeout = args["timeout_seconds"]
                 .as_u64()
-                .unwrap_or(DEFAULT_RUN_TIMEOUT_SECS);
+                .unwrap_or(DEFAULT_GATE_TIMEOUT_SECS);
         }
         "list_runs" => {
             cli.extend(["runs".to_string(), "list".to_string()]);
@@ -218,6 +221,10 @@ async fn call_tool(name: &str, args: &Value, agent: Option<&str>) -> Value {
         .stderr(Stdio::piped())
         .env(wrkflw_runs::env::MCP, "1")
         .kill_on_drop(true);
+    // Its own process group, so a timeout reaches the `wrkflw run` children
+    // that `gate` starts, not just `gate`.
+    #[cfg(unix)]
+    command.process_group(0);
     if let Some(cwd) = string_arg(args, "cwd") {
         command.current_dir(cwd);
     }
@@ -245,8 +252,9 @@ async fn call_tool(name: &str, args: &Value, agent: Option<&str>) -> Value {
 
 /// Wait for `child`, or stop it once `limit` has passed and return `None`.
 ///
-/// It is interrupted first, because only its signal handler removes the
-/// containers it started. A kill is the fallback: it needs `kill_on_drop`.
+/// Its process group is interrupted first, because only the signal handler
+/// of each wrkflw in it removes the containers it started. A kill of the
+/// group is the fallback, with `kill_on_drop` for the child itself.
 async fn run_with_deadline(
     child: tokio::process::Child,
     limit: Duration,
@@ -259,23 +267,42 @@ async fn run_with_deadline(
         return Some(result);
     }
     if let Some(pid) = pid {
-        interrupt(pid);
+        signal_group(pid, Stop::Interrupt);
     }
-    let _ = tokio::time::timeout(grace, &mut output).await;
+    if tokio::time::timeout(grace, &mut output).await.is_err() {
+        if let Some(pid) = pid {
+            signal_group(pid, Stop::Kill);
+        }
+    }
     None
 }
 
+#[derive(Clone, Copy)]
+enum Stop {
+    Interrupt,
+    Kill,
+}
+
+/// Signal the process group `pid` leads, as a child started with
+/// `process_group(0)` does, or `pid` alone when it leads none.
 #[cfg(unix)]
-fn interrupt(pid: u32) {
-    use nix::sys::signal::{kill, Signal};
+fn signal_group(pid: u32, stop: Stop) {
+    use nix::sys::signal::{kill, killpg, Signal};
     use nix::unistd::Pid;
-    let _ = kill(Pid::from_raw(pid as i32), Signal::SIGINT);
+    let signal = match stop {
+        Stop::Interrupt => Signal::SIGINT,
+        Stop::Kill => Signal::SIGKILL,
+    };
+    let pid = Pid::from_raw(pid as i32);
+    if killpg(pid, signal).is_err() {
+        let _ = kill(pid, signal);
+    }
 }
 
 /// Windows can't send Ctrl+C to one child, so the grace period runs out and
 /// the child is killed. Its containers outlive it there.
 #[cfg(not(unix))]
-fn interrupt(_pid: u32) {}
+fn signal_group(_pid: u32, _stop: Stop) {}
 
 fn tool(
     name: &str,
@@ -328,7 +355,7 @@ fn tools() -> Value {
         "base_branch": {"type": "string", "description": "Target branch, for pull_request."},
         "diff_base": {"type": "string", "description": "Ref the remote already has, for working out what changed."},
         "runtime": run_properties["runtime"].clone(),
-        "timeout_seconds": {"type": "integer", "description": "Stop the gate after this long. Default 1800."},
+        "timeout_seconds": {"type": "integer", "description": "Stop the whole gate, every workflow together, after this long. Default 3600."},
     });
     let mut plan_properties = event_properties();
     plan_properties["runtime"] = json!({
@@ -481,7 +508,7 @@ mod tests {
         assert!(cli.windows(2).any(|w| w == ["--runtime", "docker"]));
         assert!(cli.windows(2).any(|w| w == ["--base-branch", "main"]));
         assert_eq!(cli[cli.len() - 2..], ["--", "ci.yml"]);
-        assert_eq!(timeout, DEFAULT_RUN_TIMEOUT_SECS);
+        assert_eq!(timeout, DEFAULT_GATE_TIMEOUT_SECS);
         let (cli, _) = tool_command(
             "run_workflow",
             &json!({"path": "a.yml", "reuse_results": true}),
@@ -537,6 +564,35 @@ mod tests {
         let outcome = run_with_deadline(child, limit, Duration::from_secs(5)).await;
         assert!(outcome.is_none());
         assert!(marker.exists(), "the child never saw SIGINT");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_timeout_interrupts_the_childs_own_children() {
+        // As `gate` starts a `wrkflw run` per workflow: the grandchild must
+        // hear the interrupt too, or it outlives the tool call.
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("grandchild");
+        let inner = format!(
+            "trap 'echo yes > {}; exit 0' INT; sleep 30 > /dev/null 2>&1 & wait",
+            marker.display()
+        );
+        // A foreground child, since a non-interactive shell's background
+        // jobs ignore SIGINT. `; true` stops the shell exec-ing into it.
+        let script = format!("sh -c \"{inner}\"; true");
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", &script])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .process_group(0);
+        let child = command.spawn().unwrap();
+        let limit = Duration::from_millis(300);
+        let outcome = run_with_deadline(child, limit, Duration::from_secs(5)).await;
+        assert!(outcome.is_none());
+        assert!(marker.exists(), "the grandchild never saw SIGINT");
     }
 
     #[cfg(unix)]

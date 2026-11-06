@@ -492,3 +492,49 @@ jobs:
     assert_ok(&output);
     assert_eq!(repo.take_ran(), ["check"]);
 }
+
+/// `runner.os` in emulation: the host's OS, as GitHub spells it.
+fn host_os() -> &'static str {
+    match std::env::consts::OS {
+        "macos" => "macOS",
+        "linux" => "Linux",
+        other => panic!("no runner.os for {other}"),
+    }
+}
+
+fn json_lines(output: &Output) -> Vec<serde_json::Value> {
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap_or_else(|e| panic!("{e}: {line}")))
+        .collect()
+}
+
+const WINDOWS_JOB: &str = "name: ci\non: push\njobs:\n  win:\n    runs-on: windows-latest\n    steps:\n      - uses: actions/checkout@v4\n      - run: echo win >> LOG; test -f src/ok\n";
+
+#[test]
+fn a_run_marks_a_job_that_ran_as_another_os() {
+    let repo = Repo::new(WINDOWS_JOB, None);
+    fs::write(repo.root().join("src/ok"), "").unwrap();
+    let args = [
+        "--format",
+        "json",
+        "run",
+        ".github/workflows/ci.yml",
+        "--runtime",
+        "emulation",
+    ];
+    let output = repo.wrkflw(&args);
+    assert_ok(&output);
+    let events = json_lines(&output);
+    let finished = events
+        .iter()
+        .find(|e| e["type"] == "job_finished" && e["job"] == "win")
+        .expect("no job_finished for win");
+    assert_eq!(finished["runner"]["requested"], "windows-latest");
+    assert_eq!(finished["runner"]["ran_as"], host_os());
+    let run = events.last().unwrap();
+    assert_eq!(run["type"], "run_finished");
+    assert_eq!(run["status"], "success");
+    assert_eq!(run["unverified"][0]["job"], "win");
+    assert_eq!(run["jobs"][0]["runner"]["requested"], "windows-latest");
+}

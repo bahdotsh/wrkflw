@@ -210,6 +210,21 @@ mod tests {
     }
 
     #[test]
+    fn larger_runner_and_versioned_labels_name_their_os() {
+        for (label, os) in [
+            ("windows-latest-8-cores", "Windows"),
+            ("windows-2022", "Windows"),
+            ("macos-14-xlarge", "macOS"),
+            ("ubuntu-24.04-arm", "Linux"),
+            ("Linux", "Linux"),
+        ] {
+            assert_eq!(label_os(label), Some(os), "{label}");
+        }
+        assert_eq!(label_os("self-hosted"), None);
+        assert_eq!(label_os("gpu-linux"), None);
+    }
+
+    #[test]
     fn the_unverified_entry_names_the_job_and_why() {
         let found = RunnerSubstitution {
             requested: "macos-latest".to_string(),

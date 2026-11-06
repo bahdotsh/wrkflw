@@ -126,8 +126,8 @@ struct Wrkflw {
         global = true,
         env = "WRKFLW_FRESH_WORKSPACE",
         action = clap::ArgAction::SetTrue,
-        // `=1`, `=yes` and `=true` turn it on; `=0`, `=no`, `=false` and
-        // empty leave it off, as the executor reads the variable too.
+        // `=0`, `=no`, `=off`, `=false` and empty leave it off and anything
+        // else turns it on; the executor reads the variable the same way.
         value_parser = clap::builder::FalseyValueParser::new()
     )]
     fresh_workspace: bool,
@@ -141,8 +141,8 @@ struct Wrkflw {
         global = true,
         env = "WRKFLW_EVERY_MATRIX_LEG",
         action = clap::ArgAction::SetTrue,
-        // `=1`, `=yes` and `=true` turn it on; `=0`, `=no`, `=false` and
-        // empty leave it off, as the executor reads the variable too.
+        // `=0`, `=no`, `=off`, `=false` and empty leave it off and anything
+        // else turns it on; the executor reads the variable the same way.
         value_parser = clap::builder::FalseyValueParser::new()
     )]
     every_matrix_leg: bool,
@@ -1871,12 +1871,23 @@ mod tests {
             ("1", true),
             ("yes", true),
             ("true", true),
+            ("on", true),
             ("0", false),
             ("false", false),
+            ("no", false),
+            ("No", false),
+            ("off", false),
+            ("n", false),
             ("", false),
         ] {
             std::env::set_var("WRKFLW_FRESH_WORKSPACE", value);
             std::env::set_var("WRKFLW_EVERY_MATRIX_LEG", value);
+            // The executor reads the same variables; it must agree.
+            assert_eq!(
+                wrkflw_executor::run_options::switch_is_on(value),
+                on,
+                "the executor reads {value:?} differently"
+            );
             let cli = parse();
             assert_eq!(cli.fresh_workspace, on, "WRKFLW_FRESH_WORKSPACE={value:?}");
             assert_eq!(

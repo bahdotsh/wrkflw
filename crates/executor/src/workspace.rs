@@ -125,10 +125,8 @@ impl JobWorkspace {
             .truncate(false)
             .write(true)
             .open(dir.with_extension("lock"))?;
-        match lock.try_lock() {
-            Ok(()) => {}
-            Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
-            Err(std::fs::TryLockError::Error(e)) => return Err(e),
+        if !lock_soon(&lock)? {
+            return Ok(None);
         }
         // `wrkflw clean` may have removed the directory between its creation
         // above and the lock; now that this run holds the lock it can't again.
@@ -152,6 +150,25 @@ impl JobWorkspace {
 
 /// Env var that moves kept workspaces out of the cache directory.
 pub const WORKSPACES_DIR_ENV: &str = "WRKFLW_WORKSPACES_DIR";
+
+/// Take `lock`, waiting briefly if it is held. A lock released a moment ago
+/// can still look held: a process another thread is starting inherits the
+/// lock file's handle until it execs. Only a lock held for longer than
+/// that belongs to another run. `false` when it does.
+fn lock_soon(lock: &File) -> std::io::Result<bool> {
+    const ATTEMPTS: u32 = 10;
+    for attempt in 1..=ATTEMPTS {
+        match lock.try_lock() {
+            Ok(()) => return Ok(true),
+            Err(std::fs::TryLockError::WouldBlock) if attempt < ATTEMPTS => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(std::fs::TryLockError::WouldBlock) => return Ok(false),
+            Err(std::fs::TryLockError::Error(e)) => return Err(e),
+        }
+    }
+    Ok(false)
+}
 
 /// Where kept workspaces live: [`WORKSPACES_DIR_ENV`] if set, else
 /// `<cache dir>/wrkflw/workspaces`. Deleting it is always safe; jobs then

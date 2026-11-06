@@ -371,14 +371,14 @@ mod tests {
             root_from(Some("".into()), cache.clone()),
             Some(PathBuf::from("/cache/wrkflw/workspaces"))
         );
+        // `/big/disk` is absolute on Unix; on Windows it gains the current
+        // drive, as any path without one does.
+        let big = std::path::absolute("/big/disk").unwrap();
         assert_eq!(
             root_from(Some("/big/disk".into()), cache),
-            Some(PathBuf::from("/big/disk"))
+            Some(big.clone())
         );
-        assert_eq!(
-            root_from(Some("/big/disk".into()), None),
-            Some(PathBuf::from("/big/disk"))
-        );
+        assert_eq!(root_from(Some("/big/disk".into()), None), Some(big));
         let relative = root_from(Some("ws".into()), None).unwrap();
         assert!(relative.is_absolute());
         assert_eq!(relative, std::env::current_dir().unwrap().join("ws"));

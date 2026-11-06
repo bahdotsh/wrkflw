@@ -2927,7 +2927,7 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
         let outcome = match tokio::time::timeout(
             remaining,
             loop_state
-                .live_step(idx, step)
+                .live_step(idx, step, ctx.services.secret_masker)
                 .run(Box::pin(run_step_with_guards(
                     step,
                     idx,
@@ -3318,7 +3318,7 @@ async fn execute_matrix_job(
             let outcome = match tokio::time::timeout(
                 remaining,
                 loop_state
-                    .live_step(idx, step)
+                    .live_step(idx, step, services.secret_masker)
                     .run(Box::pin(run_step_with_guards(
                         step,
                         idx,
@@ -3587,13 +3587,20 @@ impl StepLoopState {
         });
     }
 
-    /// What streams step `index`'s output to observers while it runs.
-    fn live_step(&self, index: usize, step: &workflow::Step) -> LiveStep {
+    /// What streams step `index`'s output to observers while it runs,
+    /// masked by `masker` as the step's stored output is.
+    fn live_step<'a>(
+        &self,
+        index: usize,
+        step: &workflow::Step,
+        masker: Option<&'a SecretMasker>,
+    ) -> LiveStep<'a> {
         LiveStep {
             job: self.job_label.clone(),
             step: step_display_name(step, index),
             index,
             workspace_prefixes: self.workspace_prefixes.clone(),
+            masker,
         }
     }
 

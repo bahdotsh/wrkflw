@@ -3,14 +3,26 @@
 
 use crate::engine::format_annotation_location;
 use std::sync::{Arc, Mutex};
+use wrkflw_secrets::SecretMasker;
 
 /// Streams one step's output to the run's observers as whole, masked
 /// lines while the step runs.
-pub(crate) struct LiveStep {
+pub(crate) struct LiveStep<'a> {
     pub(crate) job: String,
     pub(crate) step: String,
     pub(crate) index: usize,
     pub(crate) workspace_prefixes: Vec<String>,
+    /// The run's masker. It holds every `--variable` value, which the
+    /// process-wide log masker only takes when it looks like a credential.
+    pub(crate) masker: Option<&'a SecretMasker>,
+}
+
+/// What [`LiveLines`] needs of the step it streams.
+struct StepLabel {
+    job: String,
+    step: String,
+    index: usize,
+    workspace_prefixes: Vec<String>,
 }
 
 /// Longest partial line held back waiting for its newline.
@@ -22,7 +34,12 @@ const LIVE_LINE_LIMIT: usize = 4096;
 /// end keeps such a secret whole until the rest of it comes.
 const LIVE_LINE_OVERLAP: usize = 1024;
 
-impl LiveStep {
+/// Longest `::add-mask::` line collected while it is dropped. A value this
+/// long is still masked once the step ends; collecting it live is only
+/// worth it for values a step may print again before then.
+const DROPPED_COMMAND_LIMIT: usize = 1 << 20;
+
+impl LiveStep<'_> {
     /// `future` is boxed by the caller: a step's future is large, and laid
     /// out inline in every job future it would overflow the stack once
     /// reusable workflows nest jobs.
@@ -34,8 +51,18 @@ impl LiveStep {
         if observers.is_empty() {
             return future.await;
         }
+        // The tap outlives this borrow, so it masks with a copy. Values
+        // added during the step come from `::add-mask::`, which the log
+        // masker below takes as the line is read.
+        let masker = self.masker.map(SecretMasker::snapshot);
         let state = Arc::new(LiveLines {
-            step: self,
+            step: StepLabel {
+                job: self.job,
+                step: self.step,
+                index: self.index,
+                workspace_prefixes: self.workspace_prefixes,
+            },
+            masker,
             observers,
             pending: Mutex::default(),
         });
@@ -48,7 +75,8 @@ impl LiveStep {
 }
 
 struct LiveLines {
-    step: LiveStep,
+    step: StepLabel,
+    masker: Option<SecretMasker>,
     observers: Vec<Arc<dyn crate::events::ExecutionObserver>>,
     pending: Mutex<PendingLine>,
 }
@@ -60,8 +88,9 @@ struct PendingLine {
     text: String,
     /// An `::add-mask::` line outgrew [`LIVE_LINE_LIMIT`] and is being
     /// dropped up to its newline. Cutting it would show the rest of the line
-    /// as output, and the rest of the line is the value it masks.
-    dropping_command: bool,
+    /// as output, and the rest of the line is the value it masks. The line
+    /// is collected here so the value is masked once the line ends.
+    dropping_command: Option<String>,
 }
 
 impl LiveLines {
@@ -69,14 +98,23 @@ impl LiveLines {
         let lines = {
             let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
             let mut chunk = chunk;
-            if pending.dropping_command {
-                match chunk.find('\n') {
-                    Some(at) => {
-                        pending.dropping_command = false;
-                        chunk = &chunk[at + 1..];
+            if pending.dropping_command.is_some() {
+                let (line_end, after) = match chunk.find('\n') {
+                    Some(at) => (&chunk[..at], Some(&chunk[at + 1..])),
+                    None => (chunk, None),
+                };
+                if let Some(command) = pending.dropping_command.as_mut() {
+                    if command.len() < DROPPED_COMMAND_LIMIT {
+                        command.push_str(line_end);
                     }
-                    None => return,
                 }
+                let Some(after) = after else {
+                    return;
+                };
+                if let Some(command) = pending.dropping_command.take() {
+                    register_dropped_command(&command);
+                }
+                chunk = after;
             }
             pending.text.push_str(chunk);
             // Only a newline ends a line. A carriage return redraws it, as
@@ -85,13 +123,12 @@ impl LiveLines {
                 Some(at) => at + 1,
                 None if pending.text.len() > LIVE_LINE_LIMIT => {
                     if pending.text.starts_with("::add-mask::") {
-                        pending.text.clear();
-                        pending.dropping_command = true;
+                        pending.dropping_command = Some(std::mem::take(&mut pending.text));
                         return;
                     }
                     // Mask the whole line before cutting it, so a secret
                     // already in it can't end up half on either side.
-                    pending.text = crate::log_redaction::mask(&pending.text);
+                    pending.text = self.mask(&pending.text);
                     let mut at = pending.text.len().saturating_sub(LIVE_LINE_OVERLAP);
                     while !pending.text.is_char_boundary(at) {
                         at -= 1;
@@ -109,10 +146,21 @@ impl LiveLines {
     fn flush(&self) {
         let rest = {
             let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-            pending.dropping_command = false;
+            if let Some(command) = pending.dropping_command.take() {
+                register_dropped_command(&command);
+            }
             std::mem::take(&mut pending.text)
         };
         self.send(&rest);
+    }
+
+    /// `text` with the run's secrets and every logged-masked value hidden.
+    fn mask(&self, text: &str) -> String {
+        let text = match &self.masker {
+            Some(masker) => masker.mask(text),
+            None => text.to_string(),
+        };
+        crate::log_redaction::mask(&text)
     }
 
     fn send(&self, text: &str) {
@@ -121,7 +169,7 @@ impl LiveLines {
             let Some(line) = visible_line(line) else {
                 continue;
             };
-            let line = crate::log_redaction::mask(&line);
+            let line = self.mask(&line);
             lines.push(
                 self.step
                     .workspace_prefixes
@@ -142,6 +190,11 @@ impl LiveLines {
             observer.on_event(&event);
         }
     }
+}
+
+/// Take effect of a dropped `::add-mask::` line. It is never shown.
+fn register_dropped_command(line: &str) {
+    let _ = visible_line(line);
 }
 
 /// What a line of live output shows, if anything.
@@ -226,12 +279,13 @@ mod tests {
 
     fn live(seen: Arc<Seen>) -> LiveLines {
         LiveLines {
-            step: LiveStep {
+            step: StepLabel {
                 job: "build".into(),
                 step: "print".into(),
                 index: 0,
                 workspace_prefixes: Vec::new(),
             },
+            masker: None,
             observers: vec![seen],
             pending: Mutex::default(),
         }
@@ -297,12 +351,34 @@ mod tests {
     fn an_add_mask_line_too_long_to_hold_is_never_shown() {
         let seen = Arc::new(Seen::default());
         let lines = live(seen.clone());
-        let value = "z".repeat(LIVE_LINE_LIMIT + 10);
-        lines.push(&format!("::add-mask::{}", &value[..LIVE_LINE_LIMIT]));
-        lines.push(&format!("{}\nafter\n", &value[LIVE_LINE_LIMIT..]));
+        // Distinct from any other test's text: the log masker is global.
+        let value = format!("long-mask-{}", "q7".repeat(LIVE_LINE_LIMIT));
+        let cut = LIVE_LINE_LIMIT;
+        lines.push(&format!("::add-mask::{}", &value[..cut]));
+        lines.push(&format!("{}\nafter\n", &value[cut..]));
+        // The value took effect although its line was too long to hold.
+        lines.push(&format!("again {value}\n"));
         lines.flush();
         let seen = seen.0.lock().unwrap();
-        assert_eq!(*seen, vec!["after".to_string()]);
+        assert_eq!(seen.first().map(String::as_str), Some("after"));
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert!(!seen[1].contains(&value), "the long masked value leaked");
+    }
+
+    #[test]
+    fn every_value_the_run_masks_is_masked_live() {
+        // A plain `--variable` value: the run masks it in stored output,
+        // but the log masker leaves it alone because it isn't a credential.
+        let masker = SecretMasker::new();
+        masker.add_secret("plainvalue-live-5c2");
+        let seen = Arc::new(Seen::default());
+        let mut lines = live(seen.clone());
+        lines.masker = Some(masker.snapshot());
+        lines.push("branch is plainvalue-live-5c2\n");
+        lines.flush();
+        let seen = seen.0.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert!(!seen[0].contains("plainvalue-live-5c2"), "{seen:?}");
     }
 
     #[test]

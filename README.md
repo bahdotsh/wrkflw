@@ -182,7 +182,7 @@ What a kept workspace means in practice:
 
 While a step runs, the TUI shows what it prints: the Run tab's Output pane shows the full output, and the Log story shows its last lines. Error, warning and notice annotations appear as `Error: …` lines, as on GitHub. Other workflow commands are hidden, and every line is masked before it is shown. A progress bar that redraws its line with carriage returns shows as one line in its latest state.
 
-wrkflw's own log, shown in the TUI and with `--verbose`, masks every secret, every `::add-mask::` value, and each `--variable` value whose name suggests a credential (`TOKEN`, `SECRET`, `PASSWORD`, `KEY` and the like) or that is 16 characters or longer. Other `--variable` values, such as `BRANCH=main`, stay readable there. Step output is masked for every `--variable` value.
+wrkflw's own log, shown in the TUI and with `--verbose`, masks every secret, every `::add-mask::` value, and each `--variable` value whose name suggests a credential (`TOKEN`, `SECRET`, `PASSWORD`, `KEY` and the like) or that is 16 characters or longer. Other `--variable` values, such as `BRANCH=main`, stay readable there. Step output, both live in the TUI and as stored, is masked for every `--variable` value.
 
 ### Trigger-aware execution
 

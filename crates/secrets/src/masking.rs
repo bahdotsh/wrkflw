@@ -267,6 +267,23 @@ impl SecretMasker {
             }
     }
 
+    /// An independent masker holding the secrets this one holds now.
+    ///
+    /// For code that must own its masker, such as a closure that outlives
+    /// the borrow. Secrets added to either masker afterwards stay in that one.
+    pub fn snapshot(&self) -> SecretMasker {
+        let data = self.data.read().unwrap_or_else(|e| e.into_inner());
+        SecretMasker {
+            data: RwLock::new(SecretData {
+                secrets: data.secrets.clone(),
+                secret_cache: data.secret_cache.clone(),
+                sorted_pairs: data.sorted_pairs.clone(),
+            }),
+            mask_char: self.mask_char,
+            min_length: self.min_length,
+        }
+    }
+
     /// Get the number of secrets being tracked
     pub fn secret_count(&self) -> usize {
         self.data
@@ -295,6 +312,20 @@ impl Default for SecretMasker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_snapshot_masks_what_the_original_held_and_stays_independent() {
+        let masker = SecretMasker::new();
+        masker.add_secret("snapshot-secret-1");
+        let snapshot = masker.snapshot();
+        masker.add_secret("added-after-snapshot");
+        assert!(!snapshot
+            .mask("x snapshot-secret-1 y")
+            .contains("snapshot-secret-1"));
+        assert!(!snapshot.has_secret("added-after-snapshot"));
+        snapshot.add_secret("only-in-snapshot");
+        assert!(!masker.has_secret("only-in-snapshot"));
+    }
 
     #[test]
     fn test_basic_masking() {

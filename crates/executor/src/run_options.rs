@@ -41,10 +41,11 @@ fn env_flag(name: &str) -> bool {
 
 /// Whether an environment switch is on, read exactly as the CLI's flags read
 /// it (clap's `FalseyValueParser`): empty, `0`, `n`, `no`, `f`, `false` and
-/// `off` in any case are off, and anything else is on. The CLI and the
-/// executor both read these variables, so they must agree.
+/// `off` in any case are off, and anything else is on, surrounding spaces
+/// included, as clap doesn't trim. The CLI and the executor both read these
+/// variables, so they must agree.
 pub fn switch_is_on(value: &str) -> bool {
-    let value = value.trim().to_ascii_lowercase();
+    let value = value.to_ascii_lowercase();
     !matches!(
         value.as_str(),
         "" | "0" | "n" | "no" | "f" | "false" | "off"
@@ -56,11 +57,11 @@ mod tests {
     #[test]
     fn switches_read_the_values_the_cli_reads() {
         for off in [
-            "", " ", "0", "n", "no", "No", "f", "false", "FALSE", "off", "Off",
+            "", "0", "n", "no", "No", "f", "false", "FALSE", "off", "Off",
         ] {
             assert!(!super::switch_is_on(off), "{off:?} turned a switch on");
         }
-        for on in ["1", "y", "yes", "true", "on", "anything"] {
+        for on in ["1", "y", "yes", "true", "on", "anything", " ", " 0", "no\n"] {
             assert!(super::switch_is_on(on), "{on:?} left a switch off");
         }
     }

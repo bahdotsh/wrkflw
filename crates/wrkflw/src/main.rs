@@ -126,8 +126,9 @@ struct Wrkflw {
         global = true,
         env = "WRKFLW_FRESH_WORKSPACE",
         action = clap::ArgAction::SetTrue,
-        // `=0`, `=no`, `=off`, `=false` and empty leave it off and anything
-        // else turns it on; the executor reads the variable the same way.
+        // `=0`, `=n`, `=no`, `=f`, `=false`, `=off` (any case) and empty
+        // leave it off and anything else turns it on, spaces included; the
+        // executor reads the variable the same way.
         value_parser = clap::builder::FalseyValueParser::new()
     )]
     fresh_workspace: bool,
@@ -141,8 +142,9 @@ struct Wrkflw {
         global = true,
         env = "WRKFLW_EVERY_MATRIX_LEG",
         action = clap::ArgAction::SetTrue,
-        // `=0`, `=no`, `=off`, `=false` and empty leave it off and anything
-        // else turns it on; the executor reads the variable the same way.
+        // `=0`, `=n`, `=no`, `=f`, `=false`, `=off` (any case) and empty
+        // leave it off and anything else turns it on, spaces included; the
+        // executor reads the variable the same way.
         value_parser = clap::builder::FalseyValueParser::new()
     )]
     every_matrix_leg: bool,
@@ -1264,9 +1266,13 @@ async fn run_cli() {
                 let failed: Vec<_> = report
                     .failed
                     .iter()
-                    .map(|(path, error)| serde_json::json!({"path": path, "error": error}))
+                    .map(|(path, error)| {
+                        serde_json::json!({"path": path.display().to_string(), "error": error})
+                    })
                     .collect();
                 wrkflw_runs::emit_line(&serde_json::json!({
+                    "schema_version": wrkflw_runs::SCHEMA_VERSION,
+                    "type": "clean",
                     "removed": report.removed,
                     "bytes": report.bytes,
                     "in_use": report.in_use,
@@ -1297,7 +1303,15 @@ async fn run_cli() {
                 }
             }
             Err(e) => {
-                eprintln!("Failed to clean job workspaces: {}", e);
+                let message = format!("Failed to clean job workspaces: {}", e);
+                if format.is_json() {
+                    wrkflw_runs::emit_line(&serde_json::json!({
+                        "schema_version": wrkflw_runs::SCHEMA_VERSION,
+                        "type": "error",
+                        "message": message,
+                    }));
+                }
+                eprintln!("{}", message);
                 std::process::exit(1);
             }
         },
@@ -1651,7 +1665,9 @@ fn human_bytes(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
     let mut value = bytes as f64;
     let mut unit = 0;
-    while value >= 1024.0 && unit < UNITS.len() - 1 {
+    // Compared as it will print, so 1023.96 KB reads 1.0 MB, not 1024.0 KB.
+    let shown = |value: f64| (value * 10.0).round() / 10.0;
+    while shown(value) >= 1024.0 && unit < UNITS.len() - 1 {
         value /= 1024.0;
         unit += 1;
     }
@@ -1871,6 +1887,8 @@ mod tests {
         assert_eq!(human_bytes(1023), "1023 B");
         assert_eq!(human_bytes(1536), "1.5 KB");
         assert_eq!(human_bytes(3 * 1024 * 1024 * 1024), "3.0 GB");
+        assert_eq!(human_bytes(1_048_575), "1.0 MB");
+        assert_eq!(human_bytes(1024 * 1024 - 60), "1023.9 KB");
     }
 
     #[test]
@@ -1893,7 +1911,13 @@ mod tests {
             ("No", false),
             ("off", false),
             ("n", false),
+            ("F", false),
             ("", false),
+            // Clap doesn't trim, so neither does the executor.
+            (" ", true),
+            (" 0", true),
+            ("TRUE", true),
+            ("maybe", true),
         ] {
             std::env::set_var("WRKFLW_FRESH_WORKSPACE", value);
             std::env::set_var("WRKFLW_EVERY_MATRIX_LEG", value);

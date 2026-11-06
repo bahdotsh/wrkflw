@@ -202,6 +202,51 @@ fn run_streams_only_json_and_reports_the_failure() {
 }
 
 #[test]
+fn stream_output_reports_lines_before_the_step_ends_and_masks_them() {
+    let sandbox = Sandbox::new();
+    let mut args = RUN_FAILING.to_vec();
+    args.insert(3, "--stream-output");
+    let events = json_lines(&sandbox.run(&args));
+    let position = |kind: &str, step: &str| {
+        events
+            .iter()
+            .position(|e| e["type"] == kind && e["step"] == step)
+            .unwrap_or_else(|| panic!("no {kind} for {step}"))
+    };
+    let output = &events[position("step_output", "boom")];
+    assert_eq!(output["job"], "build");
+    assert!(output["lines"].to_string().contains("before failing"));
+    assert!(position("step_output", "boom") < position("step_finished", "boom"));
+    let streamed: String = events
+        .iter()
+        .filter(|e| e["type"] == "step_output")
+        .map(|e| e["lines"].to_string())
+        .collect();
+    assert!(!streamed.contains("hunter2-very-secret"));
+
+    let quiet = json_lines(&sandbox.run(RUN_FAILING));
+    assert!(!quiet.iter().any(|e| e["type"] == "step_output"));
+}
+
+#[test]
+fn stream_output_without_json_is_refused() {
+    let sandbox = Sandbox::new();
+    let output = sandbox.run(&[
+        "run",
+        "--stream-output",
+        "--runtime",
+        "emulation",
+        ".github/workflows/failing.yml",
+    ]);
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--stream-output needs --format json"),
+        "{stderr}"
+    );
+}
+
+#[test]
 fn history_records_runs_and_answers_without_a_rerun() {
     let sandbox = Sandbox::new();
     sandbox
@@ -529,6 +574,34 @@ fn plan_explains_without_executing() {
 }
 
 #[test]
+fn plan_names_the_legs_that_would_run_as_another_os() {
+    let sandbox = Sandbox::new();
+    sandbox.write(
+        "os.yml",
+        "name: os\non: [push]\njobs:\n  build:\n    runs-on: ${{ matrix.os }}\n    strategy:\n      matrix:\n        os: [ubuntu-latest, windows-latest]\n    steps:\n      - run: echo hi\n",
+    );
+    let output = sandbox.run(&[
+        "--format",
+        "json",
+        "plan",
+        "--runtime",
+        "docker",
+        ".github/workflows/os.yml",
+    ]);
+    assert_eq!(output.status.code(), Some(0));
+    let plan = json_doc(&output);
+    assert_eq!(
+        plan["unverified"],
+        json!([{
+            "job": "build (os: windows-latest)",
+            "requested": "windows-latest",
+            "ran_as": "Linux",
+            "reason": "runs-on asked for windows-latest, but the job ran as Linux: steps gated on runner.os and OS-specific behaviour were not checked",
+        }])
+    );
+}
+
+#[test]
 fn validate_reports_structured_issues_and_keeps_exit_codes() {
     let sandbox = Sandbox::new();
     let path = sandbox.write("broken.yml", BROKEN);
@@ -655,8 +728,9 @@ fn mcp_server_speaks_the_protocol_and_runs_tools() {
         .iter()
         .filter_map(|t| t["name"].as_str())
         .collect();
-    assert_eq!(names.len(), 8);
+    assert_eq!(names.len(), 9);
     assert!(names.contains(&"run_workflow"));
+    assert!(names.contains(&"gate"));
 
     let (report, is_error) = mcp.tool("validate_workflows", json!({}));
     assert!(!is_error);

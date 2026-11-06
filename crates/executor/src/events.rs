@@ -47,6 +47,13 @@ pub enum ExecutionEvent {
         /// Variables this step exported through `GITHUB_ENV`.
         env_set: Vec<(String, String)>,
     },
+    /// The job asked for one OS in `runs-on` and ran as another, so a pass
+    /// says nothing about OS-specific steps. Sent after `JobStarted`.
+    RunnerSubstituted {
+        job: String,
+        requested: String,
+        ran_as: String,
+    },
     JobFinished {
         job: String,
         status: JobStatus,

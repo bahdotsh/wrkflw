@@ -13,7 +13,6 @@
 
 use crate::prefilter;
 use crate::{is_gitlab_pipeline, OutputFormat, RuntimeChoice};
-use serde_json::json;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -55,6 +54,7 @@ pub(crate) struct RunCtx {
     pub(crate) cache_push: bool,
     pub(crate) skip_exit_code: Option<i32>,
     pub(crate) gate_mode: bool,
+    pub(crate) stream_output: bool,
 }
 
 /// A credential from the environment, so it never has to be in `argv`.
@@ -77,19 +77,6 @@ fn acceleration_for(
         remote_token: secret_from_env(crate::cli_secrets::REMOTE_TOKEN),
         gate: ctx.gate_mode,
     }
-}
-
-/// Print a terminal error in the active format and exit 1.
-fn fail(format: OutputFormat, message: &str) -> ! {
-    if format.is_json() {
-        wrkflw_runs::emit_line(&json!({
-            "schema_version": wrkflw_runs::SCHEMA_VERSION,
-            "type": "error",
-            "message": message,
-        }));
-    }
-    eprintln!("Error: {}", message);
-    std::process::exit(1);
 }
 
 /// `--from-step` as the executor wants it, after checking the job and step
@@ -188,19 +175,17 @@ pub(crate) async fn run(ctx: RunCtx) {
     let format = ctx.format;
     // Checked before the run is recorded: a typo is not a run to look back
     // on, and there would be nothing to replay.
-    if !ctx.path.is_file() {
-        fail(
-            format,
-            &format!("workflow file not found: {}", ctx.path.display()),
-        );
+    if ctx.stream_output && !format.is_json() {
+        format
+            .fail("--stream-output needs --format json: it adds step_output lines to that stream.");
     }
-    let from_step = resolve_from_step(&ctx, is_gitlab).unwrap_or_else(|e| fail(format, &e));
+    if !ctx.path.is_file() {
+        format.fail(&format!("workflow file not found: {}", ctx.path.display()));
+    }
+    let from_step = resolve_from_step(&ctx, is_gitlab).unwrap_or_else(|e| format.fail(&e));
 
     if !is_gitlab && !ctx.variables.is_empty() {
-        fail(
-            format,
-            "--variable is only supported for GitLab CI pipelines.",
-        );
+        format.fail("--variable is only supported for GitLab CI pipelines.");
     }
 
     let mut variable_names: Vec<String> = ctx.variables.keys().cloned().collect();
@@ -220,14 +205,14 @@ pub(crate) async fn run(ctx: RunCtx) {
     let options = wrkflw_runs::RunOptions {
         meta,
         ndjson: format.is_json(),
+        stream_output: ctx.stream_output,
         record: !ctx.no_record,
         from_step,
         observers: Vec::new(),
     };
 
     if is_gitlab && (ctx.reuse_results || ctx.job_container || ctx.dep_cache) {
-        fail(
-            format,
+        format.fail(
             "--reuse-results, --job-container and --dep-cache are only supported for \
              GitHub Actions workflows.",
         );
@@ -239,17 +224,14 @@ pub(crate) async fn run(ctx: RunCtx) {
     // Evaluate trigger filter at the call site before executing
     if want_diff || ctx.event.is_some() || ctx.changed_files.is_some() {
         if is_gitlab {
-            fail(
-                format,
-                &format!(
-                    "--diff, --event, and --changed-files are only \
+            format.fail(&format!(
+                "--diff, --event, and --changed-files are only \
                      supported for GitHub Actions workflows.\n\
                      {} appears to be a GitLab CI pipeline — trigger \
                      filtering is GitHub Actions-specific and cannot be \
                      evaluated against GitLab `rules:`/`only:`/`except:`.",
-                    ctx.path.display()
-                ),
-            );
+                ctx.path.display()
+            ));
         }
         let decision = prefilter::run_trigger_prefilter(prefilter::PrefilterRequest {
             workflow_path: &ctx.path,
@@ -286,7 +268,7 @@ pub(crate) async fn run(ctx: RunCtx) {
                 }
                 std::process::exit(ctx.skip_exit_code.unwrap_or(0));
             }
-            Err(msg) => fail(format, &msg),
+            Err(msg) => format.fail(&msg),
         }
     }
 
@@ -294,7 +276,7 @@ pub(crate) async fn run(ctx: RunCtx) {
     // The executor checks this too. Checking here fails before the run is
     // recorded, and in the requested output format.
     if let Err(e) = wrkflw_executor::validate_remote(&acceleration) {
-        fail(format, &e);
+        format.fail(&e);
     }
 
     // Create execution configuration

@@ -492,3 +492,146 @@ jobs:
     assert_ok(&output);
     assert_eq!(repo.take_ran(), ["check"]);
 }
+
+/// `runner.os` in emulation: the host's OS, as GitHub spells it.
+fn host_os() -> &'static str {
+    match std::env::consts::OS {
+        "macos" => "macOS",
+        "linux" => "Linux",
+        other => panic!("no runner.os for {other}"),
+    }
+}
+
+fn json_lines(output: &Output) -> Vec<serde_json::Value> {
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap_or_else(|e| panic!("{e}: {line}")))
+        .collect()
+}
+
+const WINDOWS_JOB: &str = "name: ci\non: push\njobs:\n  win:\n    runs-on: windows-latest\n    steps:\n      - uses: actions/checkout@v4\n      - run: echo win >> LOG; test -f src/ok\n";
+
+#[test]
+fn a_run_marks_a_job_that_ran_as_another_os() {
+    let repo = Repo::new(WINDOWS_JOB, None);
+    fs::write(repo.root().join("src/ok"), "").unwrap();
+    let args = [
+        "--format",
+        "json",
+        "run",
+        ".github/workflows/ci.yml",
+        "--runtime",
+        "emulation",
+    ];
+    let output = repo.wrkflw(&args);
+    assert_ok(&output);
+    let events = json_lines(&output);
+    let finished = events
+        .iter()
+        .find(|e| e["type"] == "job_finished" && e["job"] == "win")
+        .expect("no job_finished for win");
+    assert_eq!(finished["runner"]["requested"], "windows-latest");
+    assert_eq!(finished["runner"]["ran_as"], host_os());
+    let run = events.last().unwrap();
+    assert_eq!(run["type"], "run_finished");
+    assert_eq!(run["status"], "success");
+    assert_eq!(run["unverified"][0]["job"], "win");
+    assert_eq!(run["jobs"][0]["runner"]["requested"], "windows-latest");
+}
+
+#[test]
+fn the_gate_prints_one_json_object_naming_the_failed_run() {
+    let repo = Repo::new(WINDOWS_JOB, None);
+    let gate = [
+        "--format",
+        "json",
+        "gate",
+        "--runtime",
+        "emulation",
+        "--diff-base",
+        "HEAD",
+    ];
+
+    let output = repo.wrkflw(&gate);
+    assert_eq!(output.status.code(), Some(1));
+    let lines = json_lines(&output);
+    assert_eq!(lines.len(), 1, "gate printed more than one object");
+    let report = &lines[0];
+    assert_eq!(report["type"], "gate");
+    assert_eq!(report["passed"], false);
+    assert_eq!(report["failed"].as_array().unwrap().len(), 1);
+    let workflow = &report["workflows"][0];
+    assert_eq!(workflow["status"], "failure");
+    assert!(workflow["run_id"].as_str().is_some_and(|id| !id.is_empty()));
+    assert!(!workflow["failure"].is_null(), "no failure digest");
+
+    // Fixed, then gated again with the pass reused: both list the job, since
+    // a reused pass ran as another OS too.
+    fs::write(repo.root().join("src/ok"), "").unwrap();
+    for _ in 0..2 {
+        let output = repo.wrkflw(&gate);
+        assert_ok(&output);
+        let report = &json_lines(&output)[0];
+        assert_eq!(report["passed"], true);
+        assert_eq!(report["ran"], 1);
+        assert_eq!(report["unverified"][0]["job"], "win");
+        assert_eq!(report["unverified"][0]["ran_as"], host_os());
+        assert_eq!(
+            report["unverified"][0]["workflow"],
+            report["workflows"][0]["path"]
+        );
+    }
+    assert_eq!(
+        repo.take_ran(),
+        ["win", "win"],
+        "the third gate didn't reuse"
+    );
+}
+
+const OS_MATRIX: &str = "name: ci\non: push\njobs:\n  build:\n    runs-on: ${{ matrix.os }}\n    strategy:\n      matrix:\n        os: [ubuntu-latest, windows-latest]\n    steps:\n      - run: echo ${{ matrix.os }} >> LOG\n";
+
+#[test]
+fn a_reused_os_matrix_leg_is_still_unverified() {
+    let repo = Repo::new(OS_MATRIX, None);
+    let gate = [
+        "--format",
+        "json",
+        "gate",
+        "--runtime",
+        "emulation",
+        "--diff-base",
+        "HEAD",
+    ];
+    // Run, then reused: the Windows leg is listed both times, by the name a
+    // run gives it, since a reused pass ran as another OS too.
+    for ran in [vec!["ubuntu-latest", "windows-latest"], vec![]] {
+        let output = repo.wrkflw(&gate);
+        assert_ok(&output);
+        let report = &json_lines(&output)[0];
+        let unverified: Vec<&str> = report["unverified"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|u| u["job"].as_str())
+            .collect();
+        assert!(
+            unverified.contains(&"build (os: windows-latest)"),
+            "{report}"
+        );
+        assert_eq!(repo.take_ran(), ran);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!stderr.contains("matches no leg"), "{stderr}");
+    }
+}
+
+#[test]
+fn the_gate_reports_an_installed_hook_as_json() {
+    let repo = Repo::new(TWO_JOBS, None);
+    let output = repo.wrkflw(&["--format", "json", "gate", "--install-hook"]);
+    assert_ok(&output);
+    let lines = json_lines(&output);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!(lines[0]["type"], "gate_hook");
+    let path = repo.root().join(lines[0]["path"].as_str().unwrap());
+    assert!(fs::read_to_string(path).unwrap().contains("wrkflw gate"));
+}

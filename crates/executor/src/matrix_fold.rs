@@ -117,7 +117,12 @@ fn reads_matrix_keys(body: &str, keys: &[String]) -> bool {
 
 /// The result of a leg that wasn't run because it would only repeat
 /// `original`, reported under its own name.
-pub(crate) fn repeated_leg(name: &str, original: &JobResult, image: &str) -> JobResult {
+pub(crate) fn repeated_leg(
+    name: &str,
+    original: &JobResult,
+    image: &str,
+    runner: Option<&crate::runner_fidelity::RunnerSubstitution>,
+) -> JobResult {
     let why = format!(
         "since both run in {} and the job reads nothing else that differs. Pass \
          --every-matrix-leg to run it anyway.",
@@ -137,6 +142,7 @@ pub(crate) fn repeated_leg(name: &str, original: &JobResult, image: &str) -> Job
         job: name.to_string(),
         canonical_name: original.canonical_name.clone(),
     });
+    crate::runner_fidelity::announce(name, runner);
     crate::events::emit(|| crate::events::ExecutionEvent::JobFinished {
         job: name.to_string(),
         status: original.status.clone(),
@@ -266,7 +272,7 @@ mod tests {
             from_step: None,
         };
         let twin = crate::events::with_run_hooks(hooks, async {
-            repeated_leg("build (os: b)", &original, "ubuntu")
+            repeated_leg("build (os: b)", &original, "ubuntu", None)
         })
         .await;
         assert_eq!(twin.name, "build (os: b)");

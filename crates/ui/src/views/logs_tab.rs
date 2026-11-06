@@ -148,6 +148,8 @@ struct JobStory<'a> {
     name: &'a str,
     steps: Vec<&'a TimelineEntry>,
     finished: Option<&'a TimelineEntry>,
+    /// The OS it asked for and the one it ran as, when they differ.
+    runner: Option<(&'a str, &'a str)>,
 }
 
 fn group_by_job(timeline: &[TimelineEntry]) -> Vec<JobStory<'_>> {
@@ -156,7 +158,8 @@ fn group_by_job(timeline: &[TimelineEntry]) -> Vec<JobStory<'_>> {
         let name = match entry {
             TimelineEntry::JobStarted { job, .. }
             | TimelineEntry::StepFinished { job, .. }
-            | TimelineEntry::JobFinished { job, .. } => job.as_str(),
+            | TimelineEntry::JobFinished { job, .. }
+            | TimelineEntry::RunnerSubstituted { job, .. } => job.as_str(),
         };
         let at = match jobs.iter().position(|j| j.name == name) {
             Some(at) => at,
@@ -165,6 +168,7 @@ fn group_by_job(timeline: &[TimelineEntry]) -> Vec<JobStory<'_>> {
                     name,
                     steps: Vec::new(),
                     finished: None,
+                    runner: None,
                 });
                 jobs.len() - 1
             }
@@ -172,6 +176,9 @@ fn group_by_job(timeline: &[TimelineEntry]) -> Vec<JobStory<'_>> {
         match entry {
             TimelineEntry::StepFinished { .. } => jobs[at].steps.push(entry),
             TimelineEntry::JobFinished { .. } => jobs[at].finished = Some(entry),
+            TimelineEntry::RunnerSubstituted {
+                requested, ran_as, ..
+            } => jobs[at].runner = Some((requested.as_str(), ran_as.as_str())),
             TimelineEntry::JobStarted { .. } => {}
         }
     }
@@ -237,16 +244,30 @@ pub(crate) fn story_lines(
                 "running".to_string(),
             ),
         };
-        lines.push(spread(
-            vec![
-                Span::styled(format!("{glyph} "), glyph_style),
-                Span::styled(
-                    text::sanitize(job.name).into_owned(),
-                    Style::default()
-                        .fg(COLORS.text)
-                        .add_modifier(Modifier::BOLD),
+        let mut left = vec![
+            Span::styled(format!("{glyph} "), glyph_style),
+            Span::styled(
+                text::sanitize(job.name).into_owned(),
+                Style::default()
+                    .fg(COLORS.text)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ];
+        // A pass here doesn't cover OS-specific steps, so say so where the
+        // job's result is shown, not only in the log.
+        if let Some((requested, ran_as)) = job.runner {
+            left.push(Span::styled(
+                format!(
+                    "  {} ran as {} ({})",
+                    theme::symbols::WARNING,
+                    text::sanitize(ran_as),
+                    text::sanitize(requested)
                 ),
-            ],
+                Style::default().fg(COLORS.warning),
+            ));
+        }
+        lines.push(spread(
+            left,
             vec![Span::styled(right, Style::default().fg(COLORS.text_dim))],
             w,
         ));
@@ -463,6 +484,37 @@ mod tests {
         for line in &lines {
             assert!(text::width(line) <= 60, "{line:?} overflows");
         }
+    }
+
+    #[test]
+    fn a_job_run_as_another_os_says_so_on_its_line() {
+        let job = "build (os: windows-latest)";
+        let timeline = vec![
+            TimelineEntry::JobStarted {
+                job: job.into(),
+                canonical_name: "build".into(),
+            },
+            TimelineEntry::RunnerSubstituted {
+                job: job.into(),
+                requested: "windows-latest".into(),
+                ran_as: "Linux".into(),
+            },
+            TimelineEntry::JobFinished {
+                job: job.into(),
+                status: JobStatus::Success,
+                failure_allowed: false,
+                duration_ms: 1_200,
+                repeated_from: None,
+            },
+        ];
+        let lines = text_of(&story_lines(&timeline, None, 80, 0, false));
+        assert!(
+            lines[0].contains("ran as Linux (windows-latest)"),
+            "{lines:?}"
+        );
+        assert!(lines[0].ends_with("1.2s"));
+        let narrow = text_of(&story_lines(&timeline, None, 30, 0, false));
+        assert!(text::width(&narrow[0]) <= 30, "{narrow:?} overflows");
     }
 
     #[test]

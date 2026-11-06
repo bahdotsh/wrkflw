@@ -325,7 +325,7 @@ impl WorkflowExecution {
                         ended_whole |= job == key;
                     }
                 }
-                TimelineEntry::StepFinished { .. } => {}
+                TimelineEntry::StepFinished { .. } | TimelineEntry::RunnerSubstituted { .. } => {}
             }
         }
         if started == 0 && ended.is_empty() {
@@ -395,7 +395,7 @@ impl WorkflowExecution {
                     let slot = out.entry(key.to_string()).or_default();
                     *slot = (*slot).max(*duration_ms);
                 }
-                TimelineEntry::StepFinished { .. } => {}
+                TimelineEntry::StepFinished { .. } | TimelineEntry::RunnerSubstituted { .. } => {}
             }
         }
         out
@@ -434,7 +434,7 @@ impl WorkflowExecution {
                     count.ended += 1;
                     count.whole |= job == key;
                 }
-                TimelineEntry::StepFinished { .. } => {}
+                TimelineEntry::StepFinished { .. } | TimelineEntry::RunnerSubstituted { .. } => {}
             }
         }
         counts
@@ -479,6 +479,13 @@ pub enum TimelineEntry {
         /// The matrix leg this one did not run in favour of.
         repeated_from: Option<String>,
     },
+    /// The job asked for one OS and ran as another, so its pass doesn't
+    /// cover OS-specific steps.
+    RunnerSubstituted {
+        job: String,
+        requested: String,
+        ran_as: String,
+    },
 }
 
 impl TimelineEntry {
@@ -494,6 +501,15 @@ impl TimelineEntry {
                 canonical_name: canonical_name.clone(),
             }),
             E::StepStarted { .. } | E::StepOutput { .. } => None,
+            E::RunnerSubstituted {
+                job,
+                requested,
+                ran_as,
+            } => Some(TimelineEntry::RunnerSubstituted {
+                job: job.clone(),
+                requested: requested.clone(),
+                ran_as: ran_as.clone(),
+            }),
             E::StepFinished {
                 job,
                 step,

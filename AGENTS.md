@@ -5,10 +5,11 @@ wrkflw validates and runs GitHub Actions and GitLab CI workflows locally. Use it
 ## Loop
 
 1. After editing YAML, run `wrkflw --format json validate`.
-2. Run `wrkflw --format json plan <file>` to see job order, matrix legs and whether a trigger fires.
+2. Run `wrkflw --format json plan <file>` to see job order, matrix legs, whether a trigger fires, and under `unverified` which jobs would run as another OS than `runs-on` asks for. Pass the `--runtime` you will run with.
 3. Run `wrkflw --format json run <file> --intent "why you are running this"`.
 4. On failure, read the `failure` object in the final `run_finished` line. Don't rerun to see the error again.
 5. For earlier runs, use `wrkflw runs list`, `runs failure <id>` and `runs logs <id> --step <name>`.
+6. Before calling a pass done, check `unverified` on `run_finished`. A job listed there asked for another OS in `runs-on` than it ran as, such as `windows-latest` run as Linux, so steps gated on `runner.os` and OS-specific behaviour were not checked. Say so instead of claiming CI will pass.
 
 Prefer the MCP server if your client supports MCP. `wrkflw mcp install` registers it with Claude Code, Codex, Cursor, Windsurf, VS Code, Gemini CLI, opencode, Claude Desktop, GitHub Copilot CLI, Grok Build, Kiro CLI, pi and Zed. Pass a name, such as `wrkflw mcp install codex`, for one agent, and `--dry-run` to see the change first. By hand:
 
@@ -18,7 +19,7 @@ Prefer the MCP server if your client supports MCP. `wrkflw mcp install` register
 
 ## Before pushing
 
-Run `wrkflw gate`. It runs what a push would run, reusing jobs that already passed on the same files, and exits 1 if anything fails. Add `--reuse-results` to `wrkflw run` to get the same reuse while iterating. A reused job reports one `Reuse result` step and an unaffected job one `Not affected` step, so their output isn't there to read. See "Spending less on CI" in the README for `.wrkflw/affected.yml`.
+Run `wrkflw --format json gate`, or the MCP `gate` tool. It runs what a push would run, reusing jobs that already passed on the same files, and exits 1 if anything fails. It prints one `gate` object: `passed`, `failed` (paths), `unverified` (with `workflow`), `uncommitted_changes`, and per workflow its `status`, `run_id`, `jobs` and `failure` digest. Add `--reuse-results` to `wrkflw run`, or `reuse_results` to the MCP `run_workflow`, to get the same reuse while iterating. A reused job reports one `Reuse result` step and an unaffected job one `Not affected` step, so their output isn't there to read. See "Spending less on CI" in the README for `.wrkflw/affected.yml`.
 
 ## Simulating events
 
@@ -33,15 +34,17 @@ Run `wrkflw gate`. It runs what a push would run, reusing jobs that already pass
 
 | Command | stdout |
 | --- | --- |
-| `run`, `watch`, `runs replay` | One object per line: `run_started`, `job_started`, `step_started`, `step_finished`, `job_finished`, `run_finished`. `watch` adds `watch_started` and `watch_cycle`. |
-| `validate`, `list`, `plan`, `runs ...`, `clean` | One object. |
+| `run`, `watch`, `runs replay` | One object per line: `run_started`, `job_started`, `step_started`, `step_output` (with `--stream-output`), `step_finished`, `job_finished`, `run_finished`. `watch` adds `watch_started` and `watch_cycle`. |
+| `validate`, `list`, `plan`, `runs ...`, `clean`, `gate` | One object. |
 | Any error | `{"type": "error", "message": "..."}`, exit 1. |
 
-`step_finished.output` holds the last 64 KiB of a step's output, delivered when the step ends. Output is not streamed while a step runs.
+`step_finished.output` holds the last 64 KiB of a step's output, delivered when the step ends. To follow a long step before it ends, add `--stream-output` to `run`: it adds `step_output` lines, `{job, step, index, lines}`, as the step prints, masked like the rest. Without it no `step_output` lines are printed.
 
 `clean` prints `{"schema_version": 1, "type": "clean", "removed": n, "bytes": n, "in_use": n, "failed": [{"path": "...", "error": "..."}]}`: workspaces removed, the bytes they held, workspaces left because a run holds them, and workspaces that could not be removed. It exits 1 when `failed` is not empty, after cleaning the rest.
 
 A job that does not run, because of its `if:`, a failed `needs` job, fail-fast, a GitLab rule or `gate: false`, still gets `job_started` and `job_finished`, with `status` `skipped` and `duration_ms` 0.
+
+`run_finished` has `unverified`, a list of `{job, requested, ran_as, reason}` for jobs that ran as another OS than `runs-on` asked for, empty when there are none. The same job's `job_finished` and its `run_finished.jobs` entry carry `runner: {requested, ran_as}`.
 
 A `job_finished` with `repeated_from` is a matrix leg that did not run, because locally it would only have repeated the named leg. Its `status` is that leg's and its `duration_ms` is 0. Pass `--every-matrix-leg` to run every leg.
 
@@ -73,7 +76,6 @@ The run also records your session, from `--session`, `WRKFLW_SESSION`, `CLAUDE_C
 
 - `--affected` trusts the paths in `.wrkflw/affected.yml`. A path left out of a job's list won't rerun that job.
 - `wrkflw gate` checks the working tree, not the commits you push, and skips jobs marked `gate: false` in `.wrkflw/affected.yml`.
-- `wrkflw gate` prints text even with `--format json`, and the MCP server has no gate tool. Use its exit code, then `wrkflw --format json runs failure latest` for the cause.
 - Parallel jobs run one after another in emulation, so `--runtime emulation` won't show a race between jobs.
 - `--from-step` needs `--job`. Earlier steps are skipped apart from `actions/checkout`, so their outputs and files are missing. Use it to iterate on a step that doesn't depend on them.
 - `runs replay` reruns against the current working tree. Compare `git_sha` and `git_dirty` on the record if the result differs.

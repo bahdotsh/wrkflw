@@ -1,8 +1,10 @@
 //! `wrkflw plan`: what a run would do, without running it.
 
-use crate::{is_gitlab_pipeline, prefilter, OutputFormat};
+use crate::{is_gitlab_pipeline, prefilter, OutputFormat, RuntimeChoice};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use wrkflw_executor::runner_fidelity::{requested_os, runner_os_for, RequestedOs};
 use wrkflw_parser::workflow::{Job, WorkflowDefinition};
 use wrkflw_runs::SCHEMA_VERSION;
 use wrkflw_secrets::{SecretError, SecretManager, SecretSubstitution};
@@ -22,6 +24,8 @@ pub(crate) struct PlanCtx {
     pub(crate) no_strict_filter: bool,
     pub(crate) verbose: bool,
     pub(crate) format: OutputFormat,
+    pub(crate) runtime: RuntimeChoice,
+    pub(crate) platform_overrides: HashMap<String, String>,
 }
 
 /// The trigger decision, or `null` when no event context was given.
@@ -122,10 +126,47 @@ fn job_json(id: &str, job: &Job) -> Value {
     })
 }
 
-fn github_plan(
-    ctx: &PlanCtx,
-    workflow: &WorkflowDefinition,
-) -> Result<(Vec<Vec<String>>, Vec<Value>), String> {
+/// The OS each of `job`'s matrix legs, or the job itself, asks for, under
+/// the name a run gives it. A leg of a matrix computed at run time can't be
+/// named yet, so it is left out.
+fn requested(
+    id: &str,
+    job: &Job,
+    overrides: &HashMap<String, String>,
+) -> Vec<(String, RequestedOs)> {
+    let Some(config) = job.matrix_config() else {
+        return requested_os(job, None, overrides)
+            .map(|os| (id.to_string(), os))
+            .into_iter()
+            .collect();
+    };
+    if config.expression.is_some() {
+        return Vec::new();
+    }
+    wrkflw_matrix::expand_matrix(config)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|leg| {
+            let os = requested_os(job, Some(&leg.values), overrides)?;
+            Some((wrkflw_matrix::format_combination_name(id, leg), os))
+        })
+        .collect()
+}
+
+/// The jobs, or matrix legs, that would run as another OS than `runs-on`
+/// asks for, in the shape `run_finished` reports them.
+fn unverified(requests: &[(String, RequestedOs)], runtime: RuntimeChoice) -> Vec<Value> {
+    let oses: Vec<&str> = requests.iter().map(|(_, request)| request.os).collect();
+    let ran_as = runner_os_for(runtime.into(), &oses);
+    requests
+        .iter()
+        .filter_map(|(name, request)| Some(request.ran_as(&ran_as)?.unverified_entry(name)))
+        .collect()
+}
+
+type GithubPlan = (Vec<Vec<String>>, Vec<Value>, Vec<Value>);
+
+fn github_plan(ctx: &PlanCtx, workflow: &WorkflowDefinition) -> Result<GithubPlan, String> {
     let mut batches = wrkflw_executor::dependency::resolve_dependencies(workflow)?;
     if let Some(target) = &ctx.job {
         batches = wrkflw_executor::dependency::filter_plan_to_job(
@@ -136,14 +177,17 @@ fn github_plan(
         )?;
     }
     let mut jobs = Vec::new();
+    let mut requests = Vec::new();
     for batch in &batches {
         for id in batch {
             if let Some(job) = workflow.jobs.get(id) {
                 jobs.push(job_json(id, job));
+                requests.extend(requested(id, job, &ctx.platform_overrides));
             }
         }
     }
-    Ok((batches, jobs))
+    let substituted = unverified(&requests, ctx.runtime.clone());
+    Ok((batches, jobs, substituted))
 }
 
 fn gitlab_plan(ctx: &PlanCtx) -> Result<(Vec<Vec<String>>, Vec<Value>), String> {
@@ -197,8 +241,9 @@ async fn build(ctx: &PlanCtx) -> Result<Value, String> {
     } else {
         missing_secrets(&ctx.path).await?
     };
-    let (name, (batches, jobs)) = if is_gitlab {
-        (None, gitlab_plan(ctx)?)
+    let (name, (batches, jobs, unverified)) = if is_gitlab {
+        let (batches, jobs) = gitlab_plan(ctx)?;
+        (None, (batches, jobs, Vec::new()))
     } else {
         let workflow = wrkflw_parser::workflow::parse_workflow(&ctx.path)?;
         let plan = github_plan(ctx, &workflow)?;
@@ -215,6 +260,7 @@ async fn build(ctx: &PlanCtx) -> Result<Value, String> {
         "batches": batches,
         "jobs": jobs,
         "missing_secrets": missing,
+        "unverified": unverified,
     }))
 }
 
@@ -248,6 +294,17 @@ fn print_text(plan: &Value) {
         .collect();
     if !missing.is_empty() {
         println!("Missing secrets, empty in a run: {}", missing.join(", "));
+    }
+    for entry in plan["unverified"].as_array().into_iter().flatten() {
+        println!(
+            "{}",
+            cli_style::warning(&format!(
+                "{} asks for {} but would run as {}: OS-specific steps won't be checked",
+                entry["job"].as_str().unwrap_or(""),
+                entry["requested"].as_str().unwrap_or(""),
+                entry["ran_as"].as_str().unwrap_or(""),
+            ))
+        );
     }
     let batches = plan["batches"].as_array().cloned().unwrap_or_default();
     for (index, batch) in batches.iter().enumerate() {

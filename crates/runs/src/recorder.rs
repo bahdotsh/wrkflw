@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use wrkflw_executor::engine::{ExecutionError, ExecutionResult};
 use wrkflw_executor::{
     with_run_hooks, ExecutionConfig, ExecutionEvent, ExecutionObserver, FromStep, JobResult,
-    RunHooks,
+    RunHooks, RunnerSubstitution,
 };
 
 /// Step output carried inline in an NDJSON event. The full text is in the log.
@@ -104,6 +104,8 @@ pub struct RunOptions {
     pub meta: RunMeta,
     /// Write NDJSON events to stdout.
     pub ndjson: bool,
+    /// With `ndjson`, also write `step_output` lines while a step runs.
+    pub stream_output: bool,
     /// Keep a history record. Also subject to `WRKFLW_NO_HISTORY`.
     pub record: bool,
     pub from_step: Option<FromStep>,
@@ -117,6 +119,7 @@ impl std::fmt::Debug for RunOptions {
         f.debug_struct("RunOptions")
             .field("meta", &self.meta)
             .field("ndjson", &self.ndjson)
+            .field("stream_output", &self.stream_output)
             .field("record", &self.record)
             .field("from_step", &self.from_step)
             .field("observers", &self.observers.len())
@@ -240,6 +243,7 @@ struct Recorder {
     _scratch: Option<tempfile::TempDir>,
     state: Mutex<RunRecord>,
     ndjson: bool,
+    stream_output: bool,
     started: Instant,
 }
 
@@ -282,6 +286,7 @@ impl Recorder {
                 log: None,
                 steps: Vec::new(),
                 repeated_from: None,
+                runner: None,
             });
             record.jobs.len() - 1
         });
@@ -347,13 +352,62 @@ impl Recorder {
 }
 
 impl ExecutionObserver for Recorder {
+    fn wants_step_output(&self) -> bool {
+        self.stream_output
+    }
+
     fn on_event(&self, event: &ExecutionEvent) {
+        // These two are not lines of the event stream in their own right.
+        match event {
+            ExecutionEvent::StepOutput {
+                job,
+                step,
+                index,
+                lines,
+            } => {
+                if self.stream_output {
+                    self.line(json!({
+                        "type": "step_output",
+                        "job": job,
+                        "step": step,
+                        "index": index,
+                        "lines": lines,
+                    }));
+                }
+                return;
+            }
+            ExecutionEvent::RunnerSubstituted {
+                job,
+                requested,
+                ran_as,
+            } => {
+                let mut record = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                Self::job_mut(&mut record, job, job).runner = Some(RunnerSubstitution {
+                    requested: requested.clone(),
+                    ran_as: ran_as.clone(),
+                });
+                self.persist(&record);
+                return;
+            }
+            _ => {}
+        }
         // Live output stays out of the record and the event stream: the
         // step's finish event carries all of it. The recorder doesn't ask
         // for it, but another observer may have.
-        let Some(line) = event_json(event) else {
+        let Some(mut line) = event_json(event) else {
             return;
         };
+        if let ExecutionEvent::JobFinished { job, .. } = event {
+            let record = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(runner) = record
+                .jobs
+                .iter()
+                .find(|j| &j.name == job)
+                .and_then(|j| j.runner.as_ref())
+            {
+                line["runner"] = json!(runner);
+            }
+        }
         self.line(line);
         let mut record = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let id = record.id.clone();
@@ -365,7 +419,9 @@ impl ExecutionObserver for Recorder {
                 Self::job_mut(&mut record, job, canonical_name);
                 self.persist(&record);
             }
-            ExecutionEvent::StepStarted { .. } | ExecutionEvent::StepOutput { .. } => {}
+            // Handled above.
+            ExecutionEvent::StepOutput { .. } | ExecutionEvent::RunnerSubstituted { .. } => {}
+            ExecutionEvent::StepStarted { .. } => {}
             ExecutionEvent::StepFinished {
                 job,
                 step,
@@ -437,7 +493,9 @@ fn event_json(event: &ExecutionEvent) -> Option<Value> {
         ExecutionEvent::StepStarted { job, step, index } => {
             json!({"type": "step_started", "job": job, "step": step, "index": index})
         }
-        ExecutionEvent::StepOutput { .. } => return None,
+        ExecutionEvent::StepOutput { .. } | ExecutionEvent::RunnerSubstituted { .. } => {
+            return None
+        }
         ExecutionEvent::StepFinished {
             job,
             step,
@@ -541,6 +599,7 @@ async fn begin(path: &Path, config: &ExecutionConfig, options: &RunOptions) -> A
         _scratch: scratch,
         state: Mutex::new(record.clone()),
         ndjson: options.ndjson,
+        stream_output: options.ndjson && options.stream_output,
         started: Instant::now(),
     });
     recorder.persist(&record);
@@ -569,20 +628,81 @@ fn run_finished_json(record: &RunRecord, digest: Option<&FailureDigest>) -> Valu
     json!({
         "type": "run_finished",
         "status": record.status.as_str(),
-        "exit_code": i32::from(matches!(record.status, RunStatus::Failure | RunStatus::Error)),
+        "exit_code": i32::from(matches!(
+            record.status,
+            RunStatus::Failure | RunStatus::Error | RunStatus::Interrupted
+        )),
         "duration_ms": record.duration_ms,
-        "jobs": record.jobs.iter().map(|job| json!({
-            "name": job.name,
-            "status": job.status,
-            "failure_allowed": job.failure_allowed,
-        })).collect::<Vec<_>>(),
+        "jobs": record.jobs.iter().map(|job| {
+            let mut entry = json!({
+                "name": job.name,
+                "status": job.status,
+                "failure_allowed": job.failure_allowed,
+            });
+            if let Some(original) = &job.repeated_from {
+                entry["repeated_from"] = json!(original);
+            }
+            if let Some(runner) = &job.runner {
+                entry["runner"] = json!(runner);
+            }
+            entry
+        }).collect::<Vec<_>>(),
+        "unverified": unverified(record),
         "error": record.error,
         "skip_reason": record.skip_reason,
         "failure": digest,
     })
 }
 
+/// Jobs whose result can't stand for GitHub's, because they ran as another
+/// OS than `runs-on` asked for. A skipped job ran nothing, so it isn't one.
+fn unverified(record: &RunRecord) -> Vec<Value> {
+    record
+        .jobs
+        .iter()
+        .filter(|job| job.status != "skipped")
+        .filter_map(|job| Some(job.runner.as_ref()?.unverified_entry(&job.name)))
+        .collect()
+}
+
 /// Execute a workflow with recording and event streaming per `options`.
+/// Set once this process has been told to stop.
+static INTERRUPTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Record this process's runs as interrupted, whatever their steps do next.
+/// Call it from the signal handler, before cleaning up.
+///
+/// Ctrl+C reaches a run's steps as well as wrkflw, since they share the
+/// terminal's process group, and so does an MCP timeout. A step killed by
+/// it fails, and the run could otherwise be recorded as a plain failure
+/// before the handler exits, depending on which gets there first.
+pub fn mark_interrupted() {
+    INTERRUPTED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+fn interrupted() -> bool {
+    INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// The status a run that returned `result` is recorded with.
+fn final_status(
+    result: &Result<ExecutionResult, ExecutionError>,
+    interrupted: bool,
+) -> (RunStatus, Option<String>, &[JobResult]) {
+    let jobs: &[JobResult] = match result {
+        Ok(run) => &run.jobs,
+        Err(_) => &[],
+    };
+    if interrupted {
+        return (RunStatus::Interrupted, None, jobs);
+    }
+    match result {
+        Ok(run) if run.failure_details.is_some() => (RunStatus::Failure, None, jobs),
+        Ok(_) => (RunStatus::Success, None, jobs),
+        Err(e) => (RunStatus::Error, Some(e.to_string()), jobs),
+    }
+}
+
 pub async fn execute_recorded(
     path: &Path,
     config: ExecutionConfig,
@@ -599,11 +719,7 @@ pub async fn execute_recorded(
         from_step: options.from_step.clone(),
     };
     let result = with_run_hooks(hooks, wrkflw_executor::execute_workflow(path, config)).await;
-    let (status, error, jobs): (_, _, &[JobResult]) = match &result {
-        Ok(run) if run.failure_details.is_some() => (RunStatus::Failure, None, &run.jobs),
-        Ok(run) => (RunStatus::Success, None, &run.jobs),
-        Err(e) => (RunStatus::Error, Some(e.to_string()), &[]),
-    };
+    let (status, error, jobs) = final_status(&result, interrupted());
     let record = recorder.finish(status, error, None, jobs);
     conclude(recorder, record, result)
 }
@@ -815,6 +931,65 @@ mod tests {
     }
 
     #[test]
+    fn a_job_run_as_another_os_is_unverified_unless_skipped() {
+        let job = |name: &str, status: &str| JobRecord {
+            name: name.to_string(),
+            canonical_name: "b".to_string(),
+            status: status.to_string(),
+            failure_allowed: false,
+            duration_ms: None,
+            log: None,
+            steps: Vec::new(),
+            repeated_from: None,
+            runner: Some(RunnerSubstitution {
+                requested: "windows-latest".to_string(),
+                ran_as: "Linux".to_string(),
+            }),
+        };
+        let mut record: RunRecord = serde_json::from_value(json!({
+            "schema_version": SCHEMA_VERSION, "id": "r", "status": "success",
+            "workflow": "ci.yml", "cwd": "/repo", "repo_root": "/repo", "git_sha": null,
+            "git_branch": null, "git_dirty": null, "runtime": "docker", "event": null,
+            "source": "cli", "agent": null, "intent": null, "session": null,
+            "replay_of": null, "argv": [], "variables": [], "pid": 1, "started_at": "",
+            "finished_at": null, "duration_ms": null, "error": null, "skip_reason": null,
+            "jobs": [],
+        }))
+        .unwrap();
+        record.jobs = vec![
+            job("b (os: windows-latest)", "success"),
+            job("c", "skipped"),
+        ];
+        record.jobs[0].repeated_from = Some("b (os: ubuntu-latest)".to_string());
+        let line = run_finished_json(&record, None);
+        assert_eq!(line["unverified"].as_array().unwrap().len(), 1);
+        assert_eq!(line["unverified"][0]["job"], "b (os: windows-latest)");
+        assert_eq!(line["unverified"][0]["ran_as"], "Linux");
+        assert_eq!(line["jobs"][0]["repeated_from"], "b (os: ubuntu-latest)");
+        assert_eq!(line["jobs"][0]["runner"]["requested"], "windows-latest");
+        assert!(line["jobs"][1].get("repeated_from").is_none());
+    }
+
+    #[test]
+    fn a_stopped_run_is_interrupted_however_its_steps_ended() {
+        let failed: Result<ExecutionResult, ExecutionError> = Ok(ExecutionResult {
+            jobs: Vec::new(),
+            failure_details: Some("step boom failed".to_string()),
+        });
+        assert_eq!(final_status(&failed, false).0, RunStatus::Failure);
+        assert_eq!(final_status(&failed, true).0, RunStatus::Interrupted);
+        let broken: Result<ExecutionResult, ExecutionError> =
+            Err(ExecutionError::Execution("boom".to_string()));
+        let (status, error, _) = final_status(&broken, true);
+        assert_eq!(status, RunStatus::Interrupted);
+        assert_eq!(error, None);
+        assert_eq!(
+            final_status(&broken, false).1.as_deref(),
+            Some("Execution error: boom")
+        );
+    }
+
+    #[test]
     fn run_finished_fields_are_pinned() {
         let record: RunRecord = serde_json::from_value(json!({
             "schema_version": SCHEMA_VERSION,
@@ -855,6 +1030,7 @@ mod tests {
                 "skip_reason",
                 "status",
                 "type",
+                "unverified",
             ]
         );
     }

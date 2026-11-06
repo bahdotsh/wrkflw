@@ -29,6 +29,20 @@ impl OutputFormat {
     pub(crate) fn is_json(self) -> bool {
         self == OutputFormat::Json
     }
+
+    /// Report a terminal error and exit 1: on stderr, and with JSON also as
+    /// one `error` object on stdout.
+    pub(crate) fn fail(self, message: &str) -> ! {
+        if self.is_json() {
+            wrkflw_runs::emit_line(&serde_json::json!({
+                "schema_version": wrkflw_runs::SCHEMA_VERSION,
+                "type": "error",
+                "message": message,
+            }));
+        }
+        eprintln!("Error: {}", message);
+        std::process::exit(1);
+    }
 }
 
 #[derive(Debug, Clone, ValueEnum)]
@@ -407,6 +421,11 @@ enum Commands {
         #[arg(long)]
         reuse_results: bool,
 
+        /// With --format json, also print `step_output` lines while a step runs,
+        /// so a long step can be followed before it ends
+        #[arg(long)]
+        stream_output: bool,
+
         /// Also skip jobs whose .wrkflw/affected.yml paths have no changed file.
         /// Needs --event. Changed files come from --changed-files, or the git diff
         #[arg(long, requires = "event")]
@@ -662,6 +681,10 @@ enum Commands {
         /// Warn about degraded filter contexts instead of rejecting them
         #[arg(long = "no-strict-filter", conflicts_with = "strict_filter")]
         no_strict_filter: bool,
+
+        /// Runtime the run would use. Decides which OS each job would run as
+        #[arg(short, long, value_enum, default_value = "auto")]
+        runtime: RuntimeChoice,
     },
 
     /// Remove the job workspaces kept between runs, except ones a run is
@@ -801,6 +824,10 @@ async fn handle_signals() {
             eprintln!("Shutting down and cleaning up...");
         }
     }
+
+    // The steps got the signal too and may fail on it before this exits.
+    // Whatever they do, the run was interrupted, not failed.
+    wrkflw_runs::mark_interrupted();
 
     // Set up a watchdog thread that will force exit if cleanup takes too long
     // This is important because Docker operations can sometimes hang indefinitely
@@ -963,14 +990,13 @@ async fn run_cli() {
 
     // stdout is a protocol in these modes, so logs must stay off it.
     let format = cli.format;
-    if format.is_json()
-        || matches!(
-            cli.command,
-            Some(Commands::Mcp {
-                command: McpCommand::Serve
-            })
-        )
-    {
+    let mcp_server = matches!(
+        cli.command,
+        Some(Commands::Mcp {
+            command: McpCommand::Serve
+        })
+    );
+    if format.is_json() || mcp_server {
         wrkflw_logging::set_console_to_stderr(true);
     }
 
@@ -985,8 +1011,12 @@ async fn run_cli() {
         wrkflw_logging::set_log_level(wrkflw_logging::LogLevel::Warning);
     }
 
-    // Setup a Ctrl+C handler that runs in the background
-    tokio::spawn(handle_signals());
+    // Setup a Ctrl+C handler that runs in the background. The MCP server
+    // starts no containers itself: it handles signals by stopping its tool
+    // calls, which this handler would race and exit before.
+    if !mcp_server {
+        tokio::spawn(handle_signals());
+    }
 
     let platform_overrides = collect_platform_overrides(&cli.platform);
     let kubernetes = cli.kubernetes.to_config();
@@ -1123,6 +1153,7 @@ async fn run_cli() {
             no_record,
             from_step,
             reuse_results,
+            stream_output,
             affected,
             job_container,
             dep_cache,
@@ -1165,6 +1196,7 @@ async fn run_cli() {
                 cache_push: *cache_push,
                 skip_exit_code: *skip_exit_code,
                 gate_mode: *gate_mode,
+                stream_output: *stream_output,
             })
             .await;
         }
@@ -1339,6 +1371,7 @@ async fn run_cli() {
                 runtime: runtime.clone(),
                 remote_cache: remote_cache.clone(),
                 install_hook: *install_hook,
+                format: cli.format,
             });
         }
         Some(Commands::Plan {
@@ -1354,6 +1387,7 @@ async fn run_cli() {
             activity_type,
             strict_filter,
             no_strict_filter,
+            runtime,
         }) => {
             plan_cmd::run(plan_cmd::PlanCtx {
                 path: path.clone(),
@@ -1370,6 +1404,8 @@ async fn run_cli() {
                 no_strict_filter: *no_strict_filter,
                 verbose,
                 format,
+                runtime: runtime.clone(),
+                platform_overrides: platform_overrides.clone(),
             })
             .await;
         }

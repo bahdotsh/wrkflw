@@ -1042,7 +1042,7 @@ impl RuntimeType {
         RuntimeType::Kubernetes,
     ];
 
-    fn runs_in_container(&self) -> bool {
+    pub(crate) fn runs_in_container(&self) -> bool {
         Self::CONTAINER_RUNTIMES.contains(self)
     }
 
@@ -2684,10 +2684,47 @@ async fn execute_job_with_matrix(
                 acceleration::mark_executed(job_name);
             }
             let (note, step) = (why.note(), why.step());
+            // A reused leg still ran as another OS when it passed, so it is
+            // reported the same way. Its matrix values come from its name.
+            let legs: Vec<MatrixCombination> = job
+                .matrix_config()
+                .and_then(|config| {
+                    resolve_matrix_expressions(
+                        config,
+                        env_context,
+                        user_env,
+                        &needs_ctx,
+                        &needs_res,
+                    )
+                    .and_then(|resolved| wrkflw_matrix::expand_matrix(&resolved))
+                    .ok()
+                })
+                .unwrap_or_default();
             return Ok(jobs
                 .into_iter()
                 .map(|stored| {
-                    announce_reused(&stored, &note);
+                    let matrix = legs
+                        .iter()
+                        .find(|leg| {
+                            wrkflw_matrix::format_combination_name(job_name, leg) == stored.name
+                        })
+                        .map(|leg| &leg.values);
+                    if matrix.is_none() && job.matrix_config().is_some() {
+                        // Without its values `runs-on: ${{ matrix.os }}` can't
+                        // be judged, and silence would read as verified.
+                        wrkflw_logging::warning(&format!(
+                            "Reused job '{}' matches no leg of the matrix, so whether it \
+                             ran as the OS runs-on asks for wasn't checked",
+                            stored.name
+                        ));
+                    }
+                    let runner = crate::runner_fidelity::substitution(
+                        job,
+                        matrix,
+                        env_context,
+                        platform_overrides,
+                    );
+                    announce_reused(&stored, &note, runner.as_ref());
                     JobResult::reused(stored, step, &note)
                 })
                 .collect());
@@ -2815,11 +2852,16 @@ async fn execute_job_with_matrix(
 }
 
 /// Report a job that won't run, the way a run job reports itself.
-fn announce_reused(stored: &acceleration::StoredJob, note: &str) {
+fn announce_reused(
+    stored: &acceleration::StoredJob,
+    note: &str,
+    runner: Option<&crate::runner_fidelity::RunnerSubstitution>,
+) {
     crate::events::emit(|| crate::events::ExecutionEvent::JobStarted {
         job: stored.name.clone(),
         canonical_name: stored.canonical_name.clone(),
     });
+    crate::runner_fidelity::announce(&stored.name, runner);
     crate::events::emit(|| crate::events::ExecutionEvent::JobFinished {
         job: stored.name.clone(),
         status: JobStatus::Success,
@@ -2934,6 +2976,11 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
 
     let mut loop_state = StepLoopState::new(ctx.job_name, ctx.job_name)
         .with_job_context(job_dir.path(), ctx.services.missing_secrets);
+    crate::runner_fidelity::announce(
+        ctx.job_name,
+        crate::runner_fidelity::substitution(job, None, &job_env, ctx.services.platform_overrides)
+            .as_ref(),
+    );
     let pending_cache_saves = std::sync::Mutex::new(Vec::<PendingCacheSave>::new());
 
     let job_deadline = tokio::time::Instant::now() + job_timeout;
@@ -3205,7 +3252,13 @@ async fn execute_matrix_combinations(
                     Some(&combination.values),
                 );
                 let name = wrkflw_matrix::format_combination_name(ctx.job_name, combination);
-                repeated_leg(&name, &results[position[original]], &image)
+                let runner = crate::runner_fidelity::substitution(
+                    ctx.job_template,
+                    Some(&combination.values),
+                    ctx.env_context,
+                    ctx.services.platform_overrides,
+                );
+                repeated_leg(&name, &results[position[original]], &image, runner.as_ref())
             }
         });
     }
@@ -3309,6 +3362,16 @@ async fn execute_matrix_job(
 
     let mut loop_state = StepLoopState::new(&matrix_job_name, job_name)
         .with_job_context(job_dir.path(), services.missing_secrets);
+    crate::runner_fidelity::announce(
+        &matrix_job_name,
+        crate::runner_fidelity::substitution(
+            job_template,
+            Some(&combination.values),
+            &job_env,
+            services.platform_overrides,
+        )
+        .as_ref(),
+    );
     let pending_cache_saves = std::sync::Mutex::new(Vec::<PendingCacheSave>::new());
     let job_success = if materialized_steps.is_empty() {
         wrkflw_logging::warning(&format!("Job '{}' has no steps", matrix_job_name));
@@ -5657,15 +5720,8 @@ fn find_platform_override(
     platform_overrides: &HashMap<String, String>,
     matrix: Option<&HashMap<String, Value>>,
 ) -> Option<String> {
-    runs_on.iter().flatten().find_map(|label| {
-        let label = match matrix {
-            Some(values) => crate::substitution::preprocess_command(label, values),
-            None => label.clone(),
-        };
-        platform_overrides
-            .get(&label.trim().to_ascii_lowercase())
-            .cloned()
-    })
+    let labels = crate::runner_fidelity::runs_on_labels(runs_on, matrix);
+    crate::runner_fidelity::mapped_image(&labels, platform_overrides).cloned()
 }
 
 /// Pick a job's base image: `container:`, then the user's overrides, then the

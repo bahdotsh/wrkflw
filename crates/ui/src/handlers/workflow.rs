@@ -638,6 +638,7 @@ pub fn start_next_workflow_execution(
                                 wrkflw_runs::RunOptions {
                                     meta: wrkflw_runs::RunMeta::new("tui"),
                                     ndjson: false,
+                                    stream_output: false,
                                     record: true,
                                     from_step: None,
                                     observers: vec![std::sync::Arc::new(TimelineObserver {

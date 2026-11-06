@@ -381,7 +381,7 @@ fn get_current_ref() -> String {
     )
 }
 
-fn get_runner_os() -> String {
+pub(crate) fn get_runner_os() -> String {
     match std::env::consts::OS {
         "macos" => "macOS".to_string(),
         "linux" => "Linux".to_string(),

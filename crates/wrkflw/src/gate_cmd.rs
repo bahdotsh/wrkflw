@@ -3,11 +3,14 @@
 //! Each workflow runs in a child `wrkflw run`, because that command owns the
 //! trigger prefilter and calls `process::exit` on every terminal outcome. The
 //! child's exit code is the whole interface: 0 passed, `SKIPPED_EXIT` didn't
-//! fire, and neither should stop the push.
+//! fire, and neither should stop the push. With `--format json` each child
+//! prints JSON too, and its `run_finished` goes into one `gate` object.
 
-use crate::{is_gitlab_pipeline, RuntimeChoice};
+use crate::{is_gitlab_pipeline, OutputFormat, RuntimeChoice};
+use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use wrkflw_runs::SCHEMA_VERSION;
 use wrkflw_ui::cli_style;
 
 /// Marks a hook as ours, so reinstalling can replace it and nothing else.
@@ -24,6 +27,7 @@ pub(crate) struct GateCtx {
     pub(crate) runtime: RuntimeChoice,
     pub(crate) remote_cache: Option<String>,
     pub(crate) install_hook: bool,
+    pub(crate) format: OutputFormat,
 }
 
 /// `value` as one word of a POSIX shell script.
@@ -281,11 +285,83 @@ fn run_args(ctx: &GateCtx, file: &Path) -> Vec<String> {
     args
 }
 
+/// One workflow's entry in the `gate` object, from the child's JSON output:
+/// its `run_finished` without `type`, or the error it printed instead. A child that died
+/// mid-run still names the run it started, so its record can be read.
+fn workflow_report(file: &Path, code: Option<i32>, stdout: &str) -> Value {
+    let lines: Vec<Value> = stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .collect();
+    let last_of = |kind: &str| lines.iter().rev().find(|line| line["type"] == kind);
+    let mut entry = if let Some(run) = last_of("run_finished") {
+        // All of it, so a field `run_finished` gains reaches the gate too.
+        let mut entry = run.clone();
+        if let Some(fields) = entry.as_object_mut() {
+            fields.remove("type");
+            fields.remove("schema_version");
+        }
+        if code != Some(0) && code != Some(SKIPPED_EXIT) && run["status"] == "success" {
+            entry["status"] = json!("error");
+            entry["error"] = json!(format!("wrkflw exited with {:?}", code));
+        }
+        entry
+    } else if let Some(error) = last_of("error") {
+        json!({"status": "error", "error": error["message"]})
+    } else {
+        json!({
+            "status": "error",
+            "error": format!("wrkflw exited with {:?} before the run finished", code),
+        })
+    };
+    if entry["run_id"].is_null() {
+        if let Some(started) = last_of("run_started") {
+            entry["run_id"] = started["run_id"].clone();
+        }
+    }
+    entry["path"] = json!(file.display().to_string());
+    entry
+}
+
+/// The `gate` object: every workflow's result, and whether the push may go.
+fn gate_report(workflows: Vec<Value>, uncommitted: &[String]) -> Value {
+    let failed: Vec<&Value> = workflows
+        .iter()
+        .filter(|w| w["status"] != "success" && w["status"] != "skipped")
+        .map(|w| &w["path"])
+        .collect();
+    let skipped = workflows
+        .iter()
+        .filter(|w| w["status"] == "skipped")
+        .count();
+    let unverified: Vec<Value> = workflows
+        .iter()
+        .flat_map(|w| {
+            w["unverified"].as_array().into_iter().flatten().map(|u| {
+                let mut u = u.clone();
+                u["workflow"] = w["path"].clone();
+                u
+            })
+        })
+        .collect();
+    json!({
+        "schema_version": SCHEMA_VERSION,
+        "type": "gate",
+        "passed": failed.is_empty(),
+        "ran": workflows.len() - skipped,
+        "skipped": skipped,
+        "failed": failed,
+        "unverified": unverified,
+        "uncommitted_changes": uncommitted,
+        "workflows": workflows,
+    })
+}
+
 /// Run the gate. Exits 1 when a workflow fails or can't be run.
 pub(crate) fn run(ctx: GateCtx) {
     let program = std::env::current_exe().unwrap_or_else(|e| {
-        eprintln!("Error: cannot find this executable: {}", e);
-        std::process::exit(1);
+        ctx.format
+            .fail(&format!("cannot find this executable: {}", e))
     });
     if ctx.install_hook {
         let script = hook_script(&program, ctx.runtime.as_flag(), ctx.remote_cache.as_deref());
@@ -294,21 +370,26 @@ pub(crate) fn run(ctx: GateCtx) {
             Ok(path)
         });
         match installed {
-            Ok(path) => println!("Installed {}", path.display()),
-            Err(e) => {
-                eprintln!("Error: {}", e);
-                std::process::exit(1);
+            Ok(path) if ctx.format == OutputFormat::Json => {
+                wrkflw_runs::emit_line(&json!({
+                    "schema_version": SCHEMA_VERSION,
+                    "type": "gate_hook",
+                    "path": path,
+                }));
             }
+            Ok(path) => println!("Installed {}", path.display()),
+            Err(e) => ctx.format.fail(&e),
         }
         return;
     }
-    let files = workflow_files(ctx.path.as_deref()).unwrap_or_else(|e| {
-        eprintln!("Error: {}", e);
-        std::process::exit(1);
-    });
+    let files = workflow_files(ctx.path.as_deref()).unwrap_or_else(|e| ctx.format.fail(&e));
     let runtime = ctx.runtime.as_flag();
-    if let Some(warning) = dirty_tree_warning(&uncommitted_changes()) {
+    let uncommitted = uncommitted_changes();
+    if let Some(warning) = dirty_tree_warning(&uncommitted) {
         eprintln!("{}", cli_style::dim(&warning));
+    }
+    if ctx.format == OutputFormat::Json {
+        run_json(&ctx, &program, &files, runtime, &uncommitted);
     }
 
     // Every workflow runs even after a failure, so one push shows all of them.
@@ -340,9 +421,126 @@ pub(crate) fn run(ctx: GateCtx) {
     std::process::exit(1);
 }
 
+/// The gate with `--format json`: one `gate` object on stdout, exit 1 unless
+/// it passed. Each child's logs still reach stderr.
+fn run_json(
+    ctx: &GateCtx,
+    program: &Path,
+    files: &[PathBuf],
+    runtime: &str,
+    uncommitted: &[String],
+) -> ! {
+    let mut workflows = Vec::new();
+    for file in files {
+        let mut child = Command::new(program);
+        child
+            .args(["--format", "json"])
+            .args(run_args(ctx, file))
+            .args(["--runtime", runtime])
+            .stdin(Stdio::null())
+            .stderr(Stdio::inherit());
+        crate::cli_secrets::pass_to(&mut child);
+        workflows.push(match child.output() {
+            Ok(output) => workflow_report(
+                file,
+                output.status.code(),
+                &String::from_utf8_lossy(&output.stdout),
+            ),
+            Err(e) => json!({
+                "path": file.display().to_string(),
+                "status": "error",
+                "error": format!("cannot run wrkflw: {}", e),
+            }),
+        });
+    }
+    let report = gate_report(workflows, uncommitted);
+    let passed = report["passed"] == true;
+    wrkflw_runs::emit_line(&report);
+    std::process::exit(i32::from(!passed));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_gate_object_fails_on_a_failed_or_broken_workflow() {
+        let passed = r#"{"type":"run_finished","status":"success","run_id":"a","jobs":[],"unverified":[{"job":"b (os: windows-latest)"}],"failure":null,"error":null,"skip_reason":null}"#;
+        let failed = r#"{"type":"run_finished","status":"failure","run_id":"b","jobs":[],"unverified":[],"failure":{"failures":[]},"error":null,"skip_reason":null}"#;
+        let skipped = r#"{"type":"run_finished","status":"skipped","run_id":"c","jobs":[],"unverified":[],"failure":null,"error":null,"skip_reason":"no match"}"#;
+        let workflows = vec![
+            workflow_report(
+                Path::new("ok.yml"),
+                Some(0),
+                &format!("{{\"type\":\"job_started\"}}\n{passed}\n"),
+            ),
+            workflow_report(Path::new("bad.yml"), Some(1), failed),
+            workflow_report(Path::new("off.yml"), Some(SKIPPED_EXIT), skipped),
+            workflow_report(Path::new("crash.yml"), None, ""),
+            workflow_report(
+                Path::new("err.yml"),
+                Some(1),
+                r#"{"type":"error","message":"boom"}"#,
+            ),
+        ];
+        let report = gate_report(workflows, &[]);
+        assert_eq!(report["passed"], false);
+        assert_eq!(report["ran"], 4);
+        assert_eq!(report["skipped"], 1);
+        assert_eq!(report["failed"], json!(["bad.yml", "crash.yml", "err.yml"]));
+        assert_eq!(report["workflows"][4]["error"], "boom");
+        assert_eq!(report["unverified"][0]["workflow"], "ok.yml");
+        assert_eq!(report["workflows"][0]["run_id"], "a");
+    }
+
+    #[test]
+    fn a_child_that_died_mid_run_still_names_its_run() {
+        let stdout = concat!(
+            r#"{"type":"run_started","run_id":"r1"}"#,
+            "\n",
+            r#"{"type":"step_finished","run_id":"r1","step":"build"}"#,
+            "\n",
+        );
+        let entry = workflow_report(Path::new("x.yml"), None, stdout);
+        assert_eq!(entry["status"], "error");
+        assert_eq!(entry["run_id"], "r1");
+        assert!(entry["error"]
+            .as_str()
+            .unwrap()
+            .contains("before the run finished"));
+    }
+
+    #[test]
+    fn the_result_is_read_from_run_finished_not_the_last_line() {
+        let stdout = concat!(
+            r#"{"type":"run_finished","status":"failure","run_id":"r2","jobs":[]}"#,
+            "\n",
+            r#"{"type":"note","message":"printed after the result"}"#,
+            "\n",
+        );
+        let entry = workflow_report(Path::new("x.yml"), Some(1), stdout);
+        assert_eq!(entry["status"], "failure");
+        assert_eq!(entry["run_id"], "r2");
+    }
+
+    #[test]
+    fn every_run_finished_field_reaches_the_gate() {
+        let run = r#"{"schema_version":1,"type":"run_finished","status":"success","run_id":"a","jobs":[],"duration_ms":5,"exit_code":0}"#;
+        let entry = workflow_report(Path::new("x.yml"), Some(0), run);
+        assert_eq!(entry["duration_ms"], 5);
+        assert_eq!(entry["exit_code"], 0);
+        assert_eq!(entry["path"], "x.yml");
+        assert!(entry.get("type").is_none());
+        assert!(entry.get("schema_version").is_none());
+    }
+
+    #[test]
+    fn a_success_with_a_failing_exit_code_is_not_a_pass() {
+        let run = r#"{"type":"run_finished","status":"success","run_id":"a","jobs":[]}"#;
+        let entry = workflow_report(Path::new("x.yml"), Some(101), run);
+        assert_eq!(entry["status"], "error");
+        assert_eq!(gate_report(vec![entry], &[])["passed"], false);
+    }
 
     fn ctx() -> GateCtx {
         GateCtx {
@@ -353,6 +551,7 @@ mod tests {
             runtime: RuntimeChoice::Auto,
             remote_cache: None,
             install_hook: false,
+            format: OutputFormat::Text,
         }
     }
 

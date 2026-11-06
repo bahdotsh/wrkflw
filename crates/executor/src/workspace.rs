@@ -165,6 +165,9 @@ pub struct CleanReport {
     pub bytes: u64,
     /// Workspaces left alone because a run holds them.
     pub in_use: usize,
+    /// Workspaces that could not be removed, with why. The rest are still
+    /// cleaned, so one stubborn directory doesn't hide what was freed.
+    pub failed: Vec<(PathBuf, String)>,
 }
 
 /// Remove every kept workspace no run is using.
@@ -185,7 +188,14 @@ fn clean_under(root: &Path) -> std::io::Result<CleanReport> {
         if !repo.is_dir() {
             continue;
         }
-        for entry in std::fs::read_dir(&repo)?.flatten() {
+        let entries = match std::fs::read_dir(&repo) {
+            Ok(entries) => entries,
+            Err(e) => {
+                report.failed.push((repo.clone(), e.to_string()));
+                continue;
+            }
+        };
+        for entry in entries.flatten() {
             let dir = entry.path();
             if !dir.is_dir() || dir.is_symlink() {
                 continue;
@@ -193,26 +203,41 @@ fn clean_under(root: &Path) -> std::io::Result<CleanReport> {
             // Take the job's lock first, as a run would: a held lock means
             // a run is using the workspace right now.
             let lock_path = dir.with_extension("lock");
-            let lock = File::options()
+            let lock = match File::options()
                 .create(true)
                 .truncate(false)
                 .write(true)
-                .open(&lock_path)?;
+                .open(&lock_path)
+            {
+                Ok(lock) => lock,
+                Err(e) => {
+                    report.failed.push((dir, e.to_string()));
+                    continue;
+                }
+            };
             match lock.try_lock() {
                 Ok(()) => {}
                 Err(std::fs::TryLockError::WouldBlock) => {
                     report.in_use += 1;
                     continue;
                 }
-                Err(std::fs::TryLockError::Error(e)) => return Err(e),
+                Err(std::fs::TryLockError::Error(e)) => {
+                    report.failed.push((dir, e.to_string()));
+                    continue;
+                }
             }
             // The lock file stays. A run may already have it open, waiting
             // to lock it; removing it would let a later run create a second
             // lock file for the same workspace, and both would get it.
             let bytes = size_of(&dir);
-            std::fs::remove_dir_all(&dir)?;
-            report.removed += 1;
-            report.bytes += bytes;
+            match std::fs::remove_dir_all(&dir) {
+                Ok(()) => {
+                    report.removed += 1;
+                    report.bytes += bytes;
+                }
+                // Part of it may be gone; what is left is counted next time.
+                Err(e) => report.failed.push((dir, e.to_string())),
+            }
         }
     }
     Ok(report)
@@ -386,7 +411,8 @@ mod tests {
             CleanReport {
                 removed: 1,
                 bytes: 5,
-                in_use: 1
+                in_use: 1,
+                failed: Vec::new(),
             }
         );
         assert!(!free_path.exists());
@@ -399,6 +425,43 @@ mod tests {
         assert_eq!(again.path(), free_path);
         assert!(again.path().is_dir());
         assert!(!again.path().join("out.o").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clean_reports_a_workspace_it_cannot_remove_and_cleans_the_rest() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let stuck = JobWorkspace::keep(root.path(), repo.path(), Path::new(CI), "CI", "a")
+            .unwrap()
+            .unwrap();
+        let stuck_path = stuck.path().to_path_buf();
+        std::fs::create_dir_all(stuck_path.join("locked")).unwrap();
+        std::fs::write(stuck_path.join("locked/file"), "x").unwrap();
+        drop(stuck);
+        let free = JobWorkspace::keep(root.path(), repo.path(), Path::new(CI), "CI", "b")
+            .unwrap()
+            .unwrap();
+        let free_path = free.path().to_path_buf();
+        drop(free);
+        // A directory whose entries can't be removed, as a container that
+        // ran as another user leaves behind.
+        let locked = stuck_path.join("locked");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let report = clean_under(root.path()).unwrap();
+
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Running as root removes it anyway; then there is nothing to report.
+        if stuck_path.exists() {
+            assert_eq!(report.failed.len(), 1, "{report:?}");
+            assert_eq!(report.failed[0].0, stuck_path);
+        }
+        assert!(
+            !free_path.exists(),
+            "a failure stopped the rest of the clean"
+        );
     }
 
     #[test]

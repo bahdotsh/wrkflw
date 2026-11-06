@@ -1261,11 +1261,20 @@ async fn run_cli() {
         }
         Some(Commands::Clean) => match wrkflw_executor::workspace::clean() {
             Ok(report) if format.is_json() => {
+                let failed: Vec<_> = report
+                    .failed
+                    .iter()
+                    .map(|(path, error)| serde_json::json!({"path": path, "error": error}))
+                    .collect();
                 wrkflw_runs::emit_line(&serde_json::json!({
                     "removed": report.removed,
                     "bytes": report.bytes,
                     "in_use": report.in_use,
+                    "failed": failed,
                 }));
+                if !report.failed.is_empty() {
+                    std::process::exit(1);
+                }
             }
             Ok(report) => {
                 println!(
@@ -1279,6 +1288,12 @@ async fn run_cli() {
                          it finishes.",
                         report.in_use
                     );
+                }
+                for (path, error) in &report.failed {
+                    eprintln!("Could not remove {}: {}", path.display(), error);
+                }
+                if !report.failed.is_empty() {
+                    std::process::exit(1);
                 }
             }
             Err(e) => {

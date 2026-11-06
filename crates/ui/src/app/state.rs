@@ -2692,8 +2692,9 @@ impl App {
         result: Result<(Vec<wrkflw_executor::JobResult>, ()), String>,
     ) {
         self.drain_timeline();
+        // Clears `current_execution` when this result is for it; a result
+        // for another workflow must not free the slot the running one holds.
         self.process_execution_result(workflow_idx, result);
-        self.current_execution = None;
     }
 
     /// Drain any completed dispatch outcomes. Each outcome is pushed

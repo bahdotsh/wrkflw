@@ -8,10 +8,7 @@ use wrkflw_executor::{self, JobStatus, RuntimeType, StepStatus};
 #[cfg(feature = "tui")]
 use {
     crate::app::App,
-    crate::models::{
-        ExecutionResultMsg, RunUpdate, TimelineMsg, WorkflowExecution, WorkflowStatus,
-    },
-    chrono::Local,
+    crate::models::{ExecutionResultMsg, RunUpdate, TimelineMsg},
     std::sync::mpsc,
     std::thread,
 };
@@ -552,20 +549,8 @@ pub fn start_next_workflow_execution(
         let kubernetes = app.kubernetes.clone();
         let show_action_messages = app.show_action_messages;
 
-        // Update workflow status and add execution details
-        app.workflows[next_idx].status = WorkflowStatus::Running;
-
-        // Initialize execution details if not already done
-        if app.workflows[next_idx].execution_details.is_none() {
-            app.workflows[next_idx].execution_details = Some(WorkflowExecution {
-                jobs: Vec::new(),
-                start_time: Local::now(),
-                end_time: None,
-                progress: 0.0,
-                timeline: Vec::new(),
-                live: Default::default(),
-            });
-        }
+        // `get_next_workflow_to_execute` marked the workflow running and
+        // gave it a fresh execution for this run.
 
         thread::spawn(move || {
             let rt = match tokio::runtime::Runtime::new() {

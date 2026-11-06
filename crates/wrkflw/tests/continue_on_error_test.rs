@@ -45,7 +45,6 @@ fn step_status(job: &JobResult, name: &str) -> StepStatus {
         .find(|step| step.name == name)
         .unwrap_or_else(|| panic!("no step named {}", name))
         .status
-        .clone()
 }
 
 #[tokio::test]

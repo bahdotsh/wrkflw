@@ -201,9 +201,14 @@ impl PodmanRuntime {
             }
         }
 
-        let output = child.wait_with_output().await.map_err(|e| {
-            ContainerError::ContainerExecution(format!("Podman command failed: {}", e))
-        })?;
+        // `podman run` is the one command that runs a step, so only its
+        // output goes to the live tap.
+        let output = if args.first() == Some(&"run") {
+            wrkflw_runtime::live_output::wait_with_live_output(child).await
+        } else {
+            child.wait_with_output().await
+        }
+        .map_err(|e| ContainerError::ContainerExecution(format!("Podman command failed: {}", e)))?;
 
         Ok(ContainerOutput {
             stdout: String::from_utf8_lossy(&output.stdout).to_string(),

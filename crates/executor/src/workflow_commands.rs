@@ -123,8 +123,9 @@ pub fn parse_workflow_commands(output: &str) -> Vec<WorkflowCommand> {
     commands
 }
 
-/// Parse a single `::command param=val,param=val::message` line.
-fn parse_command_line(line: &str) -> Option<WorkflowCommand> {
+/// Parse a single `::command param=val,param=val::message` line. `None`
+/// when the line is not a workflow command.
+pub(crate) fn parse_command_line(line: &str) -> Option<WorkflowCommand> {
     // Format: ::command param1=val1,param2=val2::message
     // The line starts with "::" — strip it.
     let rest = line.strip_prefix("::").unwrap_or(line);

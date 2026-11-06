@@ -2,6 +2,7 @@
 name = "wrkflw-watcher"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 description = "File watcher with trigger-aware workflow execution for wrkflw"
 license.workspace = true
 documentation.workspace = true

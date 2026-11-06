@@ -1,11 +1,11 @@
-// Live Run — summary strip over Jobs · Steps + Output · DAG + Results.
+// Run → Jobs view: Jobs · Steps + Output. The run's summary line lives
+// in the Run header (`views::run_header`), shared with the graph and log
+// views.
 //
-// Panes drop out from the right as the terminal narrows: the DAG and
-// results summary first, then the jobs list, so the steps and their
-// output always get a readable share of the screen.
+// The jobs list drops out first as the terminal narrows, so the steps
+// and their output always get a readable share of the screen.
 
 use crate::app::App;
-use crate::components::dag;
 use crate::models::{JobExecution, JobState, Workflow, WorkflowStatus};
 use crate::text;
 use crate::theme::{self, BadgeKind, COLORS};
@@ -19,10 +19,7 @@ use ratatui::{
 use wrkflw_executor::{JobStatus, StepStatus};
 
 pub fn render_execution_tab(f: &mut Frame<'_>, app: &mut App, area: Rect) {
-    let workflow_idx = app
-        .current_execution
-        .or_else(|| app.workflow_list_state.selected())
-        .filter(|&idx| idx < app.workflows.len());
+    let workflow_idx = app.shown_workflow();
 
     let Some(idx) = workflow_idx else {
         render_empty_state(f, area);
@@ -30,25 +27,15 @@ pub fn render_execution_tab(f: &mut Frame<'_>, app: &mut App, area: Rect) {
     };
     let workflow = &app.workflows[idx];
 
-    let outer = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(0)])
-        .split(area);
-    render_summary_strip(f, app, workflow, outer[0]);
-
-    let (jobs_w, right_w) = match area.width {
-        w if w >= 120 => (30, 38),
-        w if w >= 72 => (28, 0),
-        _ => (0, 0),
+    let jobs_w = match area.width {
+        w if w >= 120 => 34,
+        w if w >= 72 => 28,
+        _ => 0,
     };
     let main = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Length(jobs_w),
-            Constraint::Min(0),
-            Constraint::Length(right_w),
-        ])
-        .split(outer[1]);
+        .constraints([Constraint::Length(jobs_w), Constraint::Min(0)])
+        .split(area);
 
     let selected = selected_job(app, workflow);
     if jobs_w > 0 {
@@ -60,30 +47,32 @@ pub fn render_execution_tab(f: &mut Frame<'_>, app: &mut App, area: Rect) {
         .constraints([Constraint::Percentage(45), Constraint::Min(0)])
         .split(main[1]);
     render_steps_pane(f, workflow, selected, centre[0]);
-    render_output_pane(f, app, centre[1]);
+    // The Output pane follows the cursor's row even before that job has a
+    // result, so a running job's output can be pinned among parallel ones.
+    let output_job = app
+        .job_list_state
+        .selected()
+        .and_then(|row| workflow.job_row_name(row))
+        .or(selected.map(|j| j.name.as_str()));
+    render_output_pane(f, app, workflow, output_job, centre[1]);
+}
 
-    if right_w > 0 {
-        let right = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Min(0), Constraint::Length(8)])
-            .split(main[2]);
-        render_dag_pane(f, app, workflow, right[0]);
-        render_results_pane(f, workflow, right[1]);
+/// The reported job the Jobs pane cursor is on. With the cursor on a job
+/// not reported yet there is none; with no usable cursor, the most
+/// relevant reported job.
+fn selected_job<'a>(app: &App, workflow: &'a Workflow) -> Option<&'a JobExecution> {
+    let exec = workflow.execution_details.as_ref()?;
+    match app.job_list_state.selected() {
+        Some(row) if row < exec.jobs.len() => exec.jobs.get(row),
+        Some(row) if row < workflow.job_row_count() => None,
+        _ => active_job_execution(workflow),
     }
 }
 
-/// The job the Jobs pane cursor is on, or the most relevant one when
-/// the cursor hasn't moved onto a reported job.
-fn selected_job<'a>(app: &App, workflow: &'a Workflow) -> Option<&'a JobExecution> {
-    let exec = workflow.execution_details.as_ref()?;
-    app.job_list_state
-        .selected()
-        .and_then(|i| exec.jobs.get(i))
-        .or_else(|| active_job_execution(workflow))
-}
-
 // ─── Summary strip ────────────────────────────────────────────────
-fn render_summary_strip(f: &mut Frame<'_>, app: &App, workflow: &Workflow, area: Rect) {
+/// One line: status badge, workflow name, and on the right when it
+/// fits, the start time, duration and job counts.
+pub(super) fn render_summary_line(f: &mut Frame<'_>, app: &App, workflow: &Workflow, area: Rect) {
     let (badge, kind) = match workflow.status {
         WorkflowStatus::NotStarted => ("IDLE", BadgeKind::Dim),
         WorkflowStatus::Running => ("RUNNING", BadgeKind::Info),
@@ -91,13 +80,12 @@ fn render_summary_strip(f: &mut Frame<'_>, app: &App, workflow: &Workflow, area:
         WorkflowStatus::Failed => ("FAILED", BadgeKind::Error),
         WorkflowStatus::Skipped => ("SKIPPED", BadgeKind::Warning),
     };
-    let block = theme::block(if app.validation_mode {
-        "Validation"
+    let inner = area;
+    let badge = if app.validation_mode && badge == "IDLE" {
+        "VALIDATE"
     } else {
-        "Run"
-    });
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+        badge
+    };
 
     let mut right: Vec<Span> = Vec::new();
     if let Some(exec) = workflow.execution_details.as_ref() {
@@ -106,11 +94,19 @@ fn render_summary_strip(f: &mut Frame<'_>, app: &App, workflow: &Workflow, area:
             .signed_duration_since(exec.start_time)
             .num_seconds()
             .max(0);
+        right.push(Span::styled("started ", theme::muted_style()));
         right.push(Span::styled(
             exec.start_time.format("%H:%M:%S").to_string(),
+            Style::default().fg(COLORS.text_dim),
+        ));
+        right.push(Span::styled(
+            if exec.end_time.is_some() {
+                " · took "
+            } else {
+                " · running "
+            },
             theme::muted_style(),
         ));
-        right.push(Span::styled("  ", theme::muted_style()));
         right.push(Span::styled(
             format_duration(secs),
             Style::default().fg(COLORS.text_dim),
@@ -166,6 +162,17 @@ fn render_summary_strip(f: &mut Frame<'_>, app: &App, workflow: &Workflow, area:
     );
 }
 
+/// A step or job duration: milliseconds under a second, tenths under a
+/// minute, then the coarser `format_duration`.
+pub(crate) fn format_ms(ms: u64) -> String {
+    match ms {
+        ms if ms < 1000 => format!("{ms}ms"),
+        // Up to 59.9s; anything that would round to "60.0s" is a minute.
+        ms if ms < 59_950 => format!("{:.1}s", ms as f64 / 1000.0),
+        ms => format_duration((ms.max(60_000) / 1000) as i64),
+    }
+}
+
 pub(crate) fn format_duration(secs: i64) -> String {
     match secs {
         s if s < 60 => format!("{s}s"),
@@ -178,7 +185,6 @@ struct Counts {
     passed: usize,
     failed: usize,
     skipped: usize,
-    pending: usize,
 }
 
 fn job_counts(workflow: &Workflow) -> Counts {
@@ -200,7 +206,6 @@ fn job_counts(workflow: &Workflow) -> Counts {
             .iter()
             .filter(|j| j.status == JobStatus::Skipped)
             .count(),
-        pending: workflow.unreported_jobs().len(),
     }
 }
 
@@ -223,7 +228,7 @@ fn render_jobs_pane(f: &mut Frame<'_>, app: &App, workflow: &Workflow, area: Rec
     }
 
     let w = inner.width as usize;
-    let selected = app.job_list_state.selected().filter(|&i| i < jobs.len());
+    let selected = app.job_list_state.selected().filter(|&i| i < total);
     let mut lines: Vec<Line> = Vec::with_capacity(total);
     for (i, job) in jobs.iter().enumerate() {
         // A matrix leg shows its own status, not the merged one.
@@ -253,15 +258,24 @@ fn render_jobs_pane(f: &mut Frame<'_>, app: &App, workflow: &Workflow, area: Rec
             ),
         ]));
     }
-    for name in pending {
+    for (i, name) in pending.into_iter().enumerate() {
         let (sym, sym_style) = theme::job_state(workflow.job_state(name), app.spinner_frame);
+        let is_sel = selected == Some(jobs.len() + i);
+        let row = if is_sel {
+            theme::selected_style()
+        } else {
+            Style::default()
+        };
         lines.push(Line::from(vec![
-            Span::raw("  "),
-            Span::styled(sym.to_string(), sym_style),
-            Span::raw(" "),
+            Span::styled(
+                if is_sel { theme::SELECTED_MARK } else { "  " },
+                Style::default().fg(theme::current_accent()).patch(row),
+            ),
+            Span::styled(sym.to_string(), sym_style.patch(row)),
+            Span::styled(" ", row),
             Span::styled(
                 text::truncate(&text::sanitize(name), w.saturating_sub(4)).into_owned(),
-                theme::muted_style(),
+                theme::muted_style().patch(row),
             ),
         ]));
     }
@@ -345,7 +359,43 @@ pub(crate) fn step_line(i: usize, step: &crate::models::StepExecution, w: usize)
 }
 
 // ─── Output pane ──────────────────────────────────────────────────
-fn render_output_pane(f: &mut Frame<'_>, app: &App, area: Rect) {
+fn render_output_pane(
+    f: &mut Frame<'_>,
+    app: &App,
+    workflow: &Workflow,
+    selected: Option<&str>,
+    area: Rect,
+) {
+    // While steps run, show what they print: the selected job's running
+    // step, else whichever step started or printed last. Once the run ends
+    // the pane goes back to the run's log.
+    if let Some((job, tail)) = workflow
+        .execution_details
+        .as_ref()
+        .filter(|exec| exec.end_time.is_none())
+        .and_then(|exec| exec.live_tail_for(selected))
+    {
+        let title = format!(
+            "Output · {} › {}{}",
+            text::sanitize(job),
+            text::sanitize(&tail.step),
+            if tail.finished { " · finished" } else { "" }
+        );
+        let block = theme::block(&title);
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        let rows = inner.height as usize;
+        let start = tail.lines.len().saturating_sub(rows);
+        let lines: Vec<Line> = tail
+            .lines
+            .iter()
+            .skip(start)
+            .map(|line| text::ansi_line(line, Style::default().fg(COLORS.text_dim)))
+            .collect();
+        f.render_widget(Paragraph::new(lines), inner);
+        return;
+    }
+
     let block = theme::block("Output");
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -397,73 +447,6 @@ fn render_output_pane(f: &mut Frame<'_>, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(lines), inner);
 }
 
-// ─── Mini DAG pane ────────────────────────────────────────────────
-fn render_dag_pane(f: &mut Frame<'_>, app: &App, workflow: &Workflow, area: Rect) {
-    let block = theme::block("Graph");
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-    dag::render(f, inner, workflow, app.spinner_frame);
-}
-
-// ─── Results pane ─────────────────────────────────────────────────
-fn render_results_pane(f: &mut Frame<'_>, workflow: &Workflow, area: Rect) {
-    let block = theme::block("Results");
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-
-    let c = job_counts(workflow);
-    let total = c.passed + c.failed + c.skipped + c.pending;
-    if total == 0 {
-        theme::empty_state(f, inner, "No jobs", vec![]);
-        return;
-    }
-
-    // One proportional bar of the run's jobs, coloured by outcome.
-    let w = inner.width as usize;
-    let mut bar: Vec<Span> = Vec::new();
-    let mut used = 0;
-    let parts = [
-        (c.passed, COLORS.success),
-        (c.failed, COLORS.error),
-        (c.skipped, COLORS.warning),
-        (c.pending, COLORS.border),
-    ];
-    for (i, (n, color)) in parts.iter().enumerate() {
-        let cells = if i == parts.len() - 1 {
-            w - used
-        } else {
-            (n * w).div_ceil(total).min(w - used)
-        };
-        if *n > 0 && cells > 0 {
-            bar.push(Span::styled("━".repeat(cells), Style::default().fg(*color)));
-            used += cells;
-        }
-    }
-
-    let row = |label: &'static str, n: usize, color| {
-        Line::from(vec![
-            Span::styled(format!("{label:<10}"), theme::muted_style()),
-            Span::styled(
-                n.to_string(),
-                Style::default().fg(color).add_modifier(Modifier::BOLD),
-            ),
-        ])
-    };
-    let pending_label = if workflow.status == WorkflowStatus::Running {
-        "running"
-    } else {
-        "not run"
-    };
-    let lines = vec![
-        Line::from(bar),
-        row("passed", c.passed, COLORS.success),
-        row("failed", c.failed, COLORS.error),
-        row("skipped", c.skipped, COLORS.warning),
-        row(pending_label, c.pending, COLORS.text_dim),
-    ];
-    f.render_widget(Paragraph::new(lines), inner);
-}
-
 // ─── Helpers ──────────────────────────────────────────────────────
 fn active_job_execution(workflow: &Workflow) -> Option<&JobExecution> {
     let exec = workflow.execution_details.as_ref()?;
@@ -502,6 +485,14 @@ fn render_empty_state(f: &mut Frame<'_>, area: Rect) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_time_just_under_a_minute_reads_as_one() {
+        assert_eq!(super::format_ms(59_949), "59.9s");
+        assert_eq!(super::format_ms(59_950), "1m 00s");
+        assert_eq!(super::format_ms(59_999), "1m 00s");
+        assert_eq!(super::format_ms(61_000), "1m 01s");
+    }
+
     use super::format_duration;
 
     #[test]

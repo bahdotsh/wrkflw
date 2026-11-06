@@ -2,6 +2,7 @@
 name = "wrkflw-logging"
 version = "0.8.0"
 edition.workspace = true
+rust-version.workspace = true
 description = "Logging functionality for wrkflw workflow execution engine"
 license.workspace = true
 documentation.workspace = true

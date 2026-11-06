@@ -2,7 +2,7 @@
 use crate::log_processor::{LogProcessingRequest, LogProcessor, ProcessedLogEntry};
 use crate::models::{
     ExecutionResultMsg, JobExecution, LogFilterLevel, QueuedExecution, StatusSeverity,
-    StepExecution, TriggerMatchStatus, Workflow, WorkflowExecution, WorkflowStatus,
+    StepExecution, TimelineMsg, TriggerMatchStatus, Workflow, WorkflowExecution, WorkflowStatus,
 };
 use crate::theme::{self, ThemeMode};
 use chrono::Local;
@@ -54,6 +54,8 @@ pub struct App {
     pub workflows: Vec<Workflow>,
     pub workflow_list_state: ListState,
     pub selected_tab: usize,
+    /// The Run tab's view (jobs, graph or log) to reopen it on.
+    pub run_screen: usize,
     pub running: bool,
     pub show_help: bool,
     pub runtime_type: RuntimeType,
@@ -70,6 +72,14 @@ pub struct App {
     pub log_follow: bool,
     /// First visible log row, kept across frames so scrolling is smooth.
     pub log_offset: usize,
+    /// The Logs tab tells the run's story rather than showing raw lines.
+    pub log_story: bool,
+    /// First story line on screen.
+    pub story_scroll: usize,
+    /// Keep the end of the story in view as it grows.
+    pub story_follow: bool,
+    /// Show debug-level lines in the raw log (`--verbose`).
+    pub show_debug_logs: bool,
     pub job_list_state: ListState,            // For viewing job details
     pub detailed_view: bool,                  // Whether we're in detailed view mode
     pub step_list_state: ListState,           // For selecting steps in detailed view
@@ -93,6 +103,8 @@ pub struct App {
     pub help_scroll: usize, // Scrolling position for help content
     pub selection: Option<crate::selection::Selection>, // Mouse text selection
     pub runs: Vec<wrkflw_runs::RunRecord>,
+    /// Index into `runs` of each workflow's newest run, by workflow index.
+    pub last_run_for: Vec<Option<usize>>,
     pub runs_selected: usize,
 
     // Background log processing
@@ -215,6 +227,9 @@ pub struct App {
     /// bar so the user gets confirmation on the Trigger tab itself,
     /// not buried in the Logs tab.
     pub trigger_outcome_rx: mpsc::Receiver<DispatchOutcome>,
+    /// Run events from the executor thread, as timeline entries.
+    pub timeline_tx: mpsc::Sender<TimelineMsg>,
+    pub timeline_rx: mpsc::Receiver<TimelineMsg>,
 
     // ── Secrets tab ───────────────────────────────────────────────
     /// Selected row in the secrets list.
@@ -272,8 +287,8 @@ impl TriggerPlatform {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Accent {
     #[default]
+    Blueprint,
     Cyan,
-    Amber,
     Green,
     Violet,
     Coral,
@@ -283,23 +298,22 @@ impl Accent {
     pub fn as_str(&self) -> &'static str {
         match self {
             Accent::Cyan => "cyan",
-            Accent::Amber => "amber",
+            Accent::Blueprint => "blueprint",
             Accent::Green => "green",
             Accent::Violet => "violet",
             Accent::Coral => "coral",
         }
     }
 
-    /// Rotate through the 5-slot palette in the order shown in the
-    /// design's TweaksPanel (matches user expectation if they've seen
-    /// the mockup).
+    /// Rotate through the 5-slot palette, starting from the Blueprint
+    /// default.
     pub fn next(self) -> Self {
         match self {
-            Accent::Cyan => Accent::Amber,
-            Accent::Amber => Accent::Green,
+            Accent::Blueprint => Accent::Cyan,
+            Accent::Cyan => Accent::Green,
             Accent::Green => Accent::Violet,
             Accent::Violet => Accent::Coral,
-            Accent::Coral => Accent::Cyan,
+            Accent::Coral => Accent::Blueprint,
         }
     }
 
@@ -309,18 +323,19 @@ impl Accent {
         self.rgb_for(theme::mode())
     }
 
-    /// Dark values match the design handoff (`ACCENTS` table in wrkflw
-    /// TUI.html). Those are too pale for a light background, so the
-    /// light theme uses darker shades of the same hues.
+    /// Blueprint is the palette's own accent: drafting-pencil yellow on
+    /// the dark cyanotype, blueprint-blue ink on light paper. The other
+    /// dark values are too pale for a light background, so the light
+    /// theme uses darker shades of the same hues.
     pub fn rgb_for(self, mode: ThemeMode) -> (u8, u8, u8) {
         match (self, mode) {
             (Accent::Cyan, ThemeMode::Dark) => (0x5f, 0xd3, 0xf3),
-            (Accent::Amber, ThemeMode::Dark) => (0xf5, 0xd7, 0x6e),
+            (Accent::Blueprint, ThemeMode::Dark) => (0xf5, 0xcf, 0x4a),
             (Accent::Green, ThemeMode::Dark) => (0x8f, 0xce, 0x8f),
             (Accent::Violet, ThemeMode::Dark) => (0xd6, 0x8c, 0xff),
             (Accent::Coral, ThemeMode::Dark) => (0xff, 0x99, 0x77),
             (Accent::Cyan, ThemeMode::Light) => (0x00, 0x6d, 0x87),
-            (Accent::Amber, ThemeMode::Light) => (0x85, 0x55, 0x00),
+            (Accent::Blueprint, ThemeMode::Light) => (0x1c, 0x4f, 0xa1),
             (Accent::Green, ThemeMode::Light) => (0x1f, 0x75, 0x1f),
             (Accent::Violet, ThemeMode::Light) => (0x7b, 0x2f, 0xbf),
             (Accent::Coral, ThemeMode::Light) => (0xb0, 0x3a, 0x1a),
@@ -392,6 +407,7 @@ impl App {
         workflow_list_state.select(Some(0));
 
         let (trigger_outcome_tx, trigger_outcome_rx) = mpsc::channel::<DispatchOutcome>();
+        let (timeline_tx, timeline_rx) = mpsc::channel::<TimelineMsg>();
 
         let mut job_list_state = ListState::default();
         job_list_state.select(Some(0));
@@ -478,6 +494,7 @@ impl App {
             workflows: Vec::new(),
             workflow_list_state,
             selected_tab: 0,
+            run_screen: crate::views::TAB_EXECUTION,
             running: false,
             show_help: false,
             runtime_type,
@@ -492,6 +509,10 @@ impl App {
             log_scroll: 0,
             log_follow: true,
             log_offset: 0,
+            log_story: true,
+            story_scroll: 0,
+            story_follow: true,
+            show_debug_logs: false,
             job_list_state,
             detailed_view: false,
             step_list_state,
@@ -513,6 +534,7 @@ impl App {
             help_scroll: 0,
             selection: None,
             runs: Vec::new(),
+            last_run_for: Vec::new(),
             runs_selected: 0,
 
             // Background log processing
@@ -557,6 +579,8 @@ impl App {
             trigger_target_cache: None,
             trigger_outcome_tx,
             trigger_outcome_rx,
+            timeline_tx,
+            timeline_rx,
 
             secrets_list_state: {
                 let mut s = ListState::default();
@@ -987,13 +1011,7 @@ impl App {
         }
 
         let i = match self.workflow_list_state.selected() {
-            Some(i) => {
-                if i == 0 {
-                    self.workflows.len() - 1
-                } else {
-                    i - 1
-                }
-            }
+            Some(i) => i.saturating_sub(1),
             None => 0,
         };
         self.workflow_list_state.select(Some(i));
@@ -1006,90 +1024,104 @@ impl App {
         }
 
         let i = match self.workflow_list_state.selected() {
-            Some(i) => {
-                if i >= self.workflows.len() - 1 {
-                    0
-                } else {
-                    i + 1
-                }
-            }
+            Some(i) => (i + 1).min(self.workflows.len() - 1),
             None => 0,
         };
         self.workflow_list_state.select(Some(i));
     }
 
+    /// Move the workflow cursor to the first row, or the last when `last`.
+    pub fn jump_workflow(&mut self, last: bool) {
+        if self.workflows.is_empty() {
+            return;
+        }
+        let i = if last { self.workflows.len() - 1 } else { 0 };
+        self.workflow_list_state.select(Some(i));
+    }
+
+    /// The workflow the Run views show: the one running, else the one
+    /// highlighted in the list. `None` when that index is out of range.
+    pub fn shown_workflow(&self) -> Option<usize> {
+        self.current_execution
+            .or_else(|| self.workflow_list_state.selected())
+            .filter(|&idx| idx < self.workflows.len())
+    }
+
+    /// Move the job cursor to the first job, or the last when `last`.
+    pub fn jump_job(&mut self, last: bool) {
+        let len = self.job_rows();
+        if len == 0 {
+            return;
+        }
+        self.job_list_state
+            .select(Some(if last { len - 1 } else { 0 }));
+        self.step_list_state.select(Some(0));
+        self.step_table_state.select(Some(0));
+        self.step_output_scroll = 0;
+    }
+
+    /// Move the step cursor to the first step, or the last when `last`.
+    pub fn jump_step(&mut self, last: bool) {
+        let len = self
+            .shown_workflow()
+            .map(|idx| &self.workflows[idx])
+            .and_then(|w| w.execution_details.as_ref())
+            .zip(self.job_list_state.selected())
+            .and_then(|(e, job)| e.jobs.get(job))
+            .map_or(0, |j| j.steps.len());
+        if len == 0 {
+            return;
+        }
+        let i = if last { len - 1 } else { 0 };
+        self.step_list_state.select(Some(i));
+        self.step_table_state.select(Some(i));
+        self.step_output_scroll = 0;
+    }
+
+    /// Rows in the shown run's Jobs pane: reported jobs, then the ones
+    /// still running or waiting.
+    fn job_rows(&self) -> usize {
+        self.shown_workflow()
+            .map_or(0, |idx| self.workflows[idx].job_row_count())
+    }
+
     // Move cursor up in the job list
     pub fn previous_job(&mut self) {
-        let current_workflow_idx = self
-            .current_execution
-            .or_else(|| self.workflow_list_state.selected())
-            .filter(|&idx| idx < self.workflows.len());
-
-        if let Some(workflow_idx) = current_workflow_idx {
-            if let Some(execution) = &self.workflows[workflow_idx].execution_details {
-                if execution.jobs.is_empty() {
-                    return;
-                }
-
-                let i = match self.job_list_state.selected() {
-                    Some(i) => {
-                        if i == 0 {
-                            execution.jobs.len() - 1
-                        } else {
-                            i - 1
-                        }
-                    }
-                    None => 0,
-                };
-                self.job_list_state.select(Some(i));
-
-                // Reset step selection when changing jobs
-                self.step_list_state.select(Some(0));
-                self.step_table_state.select(Some(0));
-                self.step_output_scroll = 0;
-            }
+        let len = self.job_rows();
+        if len == 0 {
+            return;
         }
+        let i = match self.job_list_state.selected() {
+            Some(i) => i.min(len - 1).saturating_sub(1),
+            None => 0,
+        };
+        self.select_job_row(i);
     }
 
     // Move cursor down in the job list
     pub fn next_job(&mut self) {
-        let current_workflow_idx = self
-            .current_execution
-            .or_else(|| self.workflow_list_state.selected())
-            .filter(|&idx| idx < self.workflows.len());
-
-        if let Some(workflow_idx) = current_workflow_idx {
-            if let Some(execution) = &self.workflows[workflow_idx].execution_details {
-                if execution.jobs.is_empty() {
-                    return;
-                }
-
-                let i = match self.job_list_state.selected() {
-                    Some(i) => {
-                        if i >= execution.jobs.len() - 1 {
-                            0
-                        } else {
-                            i + 1
-                        }
-                    }
-                    None => 0,
-                };
-                self.job_list_state.select(Some(i));
-
-                // Reset step selection when changing jobs
-                self.step_list_state.select(Some(0));
-                self.step_table_state.select(Some(0));
-                self.step_output_scroll = 0;
-            }
+        let len = self.job_rows();
+        if len == 0 {
+            return;
         }
+        let i = match self.job_list_state.selected() {
+            Some(i) => (i + 1).min(len - 1),
+            None => 0,
+        };
+        self.select_job_row(i);
+    }
+
+    /// Put the job cursor on `row`, starting its steps from the top.
+    fn select_job_row(&mut self, row: usize) {
+        self.job_list_state.select(Some(row));
+        self.step_list_state.select(Some(0));
+        self.step_table_state.select(Some(0));
+        self.step_output_scroll = 0;
     }
 
     // Move cursor up in step list
     pub fn previous_step(&mut self) {
-        let current_workflow_idx = self
-            .current_execution
-            .or_else(|| self.workflow_list_state.selected())
-            .filter(|&idx| idx < self.workflows.len());
+        let current_workflow_idx = self.shown_workflow();
 
         if let Some(workflow_idx) = current_workflow_idx {
             if let Some(execution) = &self.workflows[workflow_idx].execution_details {
@@ -1101,13 +1133,7 @@ impl App {
                         }
 
                         let i = match self.step_list_state.selected() {
-                            Some(i) => {
-                                if i == 0 {
-                                    steps.len() - 1
-                                } else {
-                                    i - 1
-                                }
-                            }
+                            Some(i) => i.saturating_sub(1),
                             None => 0,
                         };
                         self.step_list_state.select(Some(i));
@@ -1122,10 +1148,7 @@ impl App {
 
     // Move cursor down in step list
     pub fn next_step(&mut self) {
-        let current_workflow_idx = self
-            .current_execution
-            .or_else(|| self.workflow_list_state.selected())
-            .filter(|&idx| idx < self.workflows.len());
+        let current_workflow_idx = self.shown_workflow();
 
         if let Some(workflow_idx) = current_workflow_idx {
             if let Some(execution) = &self.workflows[workflow_idx].execution_details {
@@ -1137,13 +1160,7 @@ impl App {
                         }
 
                         let i = match self.step_list_state.selected() {
-                            Some(i) => {
-                                if i >= steps.len() - 1 {
-                                    0
-                                } else {
-                                    i + 1
-                                }
-                            }
+                            Some(i) => (i + 1).min(steps.len() - 1),
                             None => 0,
                         };
                         self.step_list_state.select(Some(i));
@@ -1159,9 +1176,23 @@ impl App {
     // Change the tab.
     pub fn switch_tab(&mut self, tab: usize) {
         self.selected_tab = tab;
+        if crate::views::tab_of(tab) == crate::views::TAB_RUN {
+            self.run_screen = tab;
+        }
         if tab == crate::views::TAB_RUNS {
             self.refresh_runs();
         }
+    }
+
+    /// Opens visible tab `index`; the Run tab comes back on the view it
+    /// was left on.
+    pub fn open_tab(&mut self, index: usize) {
+        let screen = if index == crate::views::TAB_RUN {
+            self.run_screen
+        } else {
+            crate::views::TABS[index].1[0]
+        };
+        self.switch_tab(screen);
     }
 
     /// Reload the history. Bounded so a long history stays cheap to open.
@@ -1171,6 +1202,36 @@ impl App {
             .unwrap_or_default();
         self.runs.truncate(MAX_RUNS_SHOWN);
         self.runs_selected = self.runs_selected.min(self.runs.len().saturating_sub(1));
+        self.match_runs_to_workflows();
+    }
+
+    /// Finds each workflow's newest run. History records the path as it
+    /// was given plus the directory it was given from, so both sides are
+    /// resolved to the same file before comparing.
+    pub fn match_runs_to_workflows(&mut self) {
+        fn resolve(path: &std::path::Path) -> std::path::PathBuf {
+            path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+        }
+        let mut newest: HashMap<std::path::PathBuf, usize> = HashMap::new();
+        // Newest first, so the first run seen for a file is its latest.
+        for (i, run) in self.runs.iter().enumerate() {
+            let path = std::path::Path::new(&run.cwd).join(&run.workflow);
+            newest.entry(resolve(&path)).or_insert(i);
+        }
+        self.last_run_for = self
+            .workflows
+            .iter()
+            .map(|w| newest.get(&resolve(&w.path)).copied())
+            .collect();
+    }
+
+    /// The newest recorded run of the workflow at `idx`.
+    pub fn last_run(&self, idx: usize) -> Option<&wrkflw_runs::RunRecord> {
+        self.last_run_for
+            .get(idx)
+            .copied()
+            .flatten()
+            .and_then(|i| self.runs.get(i))
     }
 
     pub fn select_next_run(&mut self) {
@@ -1179,24 +1240,53 @@ impl App {
         }
     }
 
+    /// Select the newest run, or the oldest shown when `last`.
+    pub fn jump_run(&mut self, last: bool) {
+        self.runs_selected = if last {
+            self.runs.len().saturating_sub(1)
+        } else {
+            0
+        };
+    }
+
     pub fn select_previous_run(&mut self) {
         self.runs_selected = self.runs_selected.saturating_sub(1);
     }
 
-    // Queue selected workflows for execution
-    pub fn queue_selected_for_execution(&mut self) {
+    /// Queue the workflow at `idx` unless it is already queued.
+    fn queue_workflow(&mut self, idx: usize) {
+        if idx < self.workflows.len() && !self.execution_queue.iter().any(|e| e.workflow_idx == idx)
+        {
+            self.execution_queue.push(QueuedExecution {
+                workflow_idx: idx,
+                target_job: None,
+            });
+        }
+    }
+
+    /// Queue the workflow under the cursor. Leaves the checkboxes alone:
+    /// they are the user's selection, not a record of what ran.
+    pub fn queue_cursor_for_execution(&mut self) {
         if let Some(idx) = self.workflow_list_state.selected() {
-            if idx < self.workflows.len()
-                && !self.execution_queue.iter().any(|e| e.workflow_idx == idx)
-            {
-                self.execution_queue.push(QueuedExecution {
-                    workflow_idx: idx,
-                    target_job: None,
-                });
-                self.add_timestamped_log(&format!(
-                    "Added '{}' to execution queue. Press 'Enter' to start.",
-                    self.workflows[idx].name
-                ));
+            self.queue_workflow(idx);
+        }
+    }
+
+    /// Queue every checked workflow in list order, or the one under the
+    /// cursor when nothing is checked.
+    pub fn queue_selected_for_execution(&mut self) {
+        let checked: Vec<usize> = self
+            .workflows
+            .iter()
+            .enumerate()
+            .filter(|(_, w)| w.selected)
+            .map(|(i, _)| i)
+            .collect();
+        if checked.is_empty() {
+            self.queue_cursor_for_execution();
+        } else {
+            for idx in checked {
+                self.queue_workflow(idx);
             }
         }
     }
@@ -1238,6 +1328,8 @@ impl App {
                 start_time: Local::now(),
                 end_time: Some(Local::now()),
                 progress: 1.0,
+                timeline: Vec::new(),
+                live: Default::default(),
             });
         }
 
@@ -1390,6 +1482,8 @@ impl App {
             start_time: Local::now(),
             end_time: None,
             progress: 0.0, // Just started
+            timeline: Vec::new(),
+            live: Default::default(),
         });
 
         Some((next, target_job))
@@ -1426,18 +1520,15 @@ impl App {
     // Navigate to next job in selection list
     pub fn next_available_job(&mut self) {
         if !self.available_jobs.is_empty() {
-            self.selected_job_index = (self.selected_job_index + 1) % self.available_jobs.len();
+            self.selected_job_index =
+                (self.selected_job_index + 1).min(self.available_jobs.len() - 1);
         }
     }
 
     // Navigate to previous job in selection list
     pub fn previous_available_job(&mut self) {
         if !self.available_jobs.is_empty() {
-            if self.selected_job_index == 0 {
-                self.selected_job_index = self.available_jobs.len() - 1;
-            } else {
-                self.selected_job_index -= 1;
-            }
+            self.selected_job_index = self.selected_job_index.saturating_sub(1);
         }
     }
 
@@ -1452,7 +1543,6 @@ impl App {
 
         if let Some(idx) = self.workflow_list_state.selected() {
             if idx < self.workflows.len() {
-                self.workflows[idx].selected = true;
                 self.execution_queue.push(QueuedExecution {
                     workflow_idx: idx,
                     target_job,
@@ -1662,6 +1752,12 @@ impl App {
     /// (after search and filter). Reaching the last line resumes
     /// following new output; moving off it pauses that.
     pub fn scroll_logs_by(&mut self, delta: isize) {
+        if self.log_story {
+            // Rendering clamps the scroll and resumes following at the end.
+            self.story_scroll = self.story_scroll.saturating_add_signed(delta);
+            self.story_follow = false;
+            return;
+        }
         let total = self.processed_logs.len();
         if total == 0 {
             self.log_scroll = 0;
@@ -1685,11 +1781,20 @@ impl App {
     }
 
     pub fn scroll_logs_to_start(&mut self) {
+        if self.log_story {
+            self.story_scroll = 0;
+            self.story_follow = false;
+            return;
+        }
         self.log_scroll = 0;
         self.log_follow = self.processed_logs.len() <= 1;
     }
 
     pub fn scroll_logs_to_end(&mut self) {
+        if self.log_story {
+            self.story_follow = true;
+            return;
+        }
         self.log_scroll = self.processed_logs.len().saturating_sub(1);
         self.log_follow = true;
     }
@@ -1913,6 +2018,7 @@ impl App {
             app_logs: self.logs.clone(),
             app_logs_revision: self.logs_revision,
             system_logs_count: wrkflw_logging::get_logs().len(),
+            show_debug: self.show_debug_logs,
         };
 
         if self.log_processor.request_update(request).is_err() {
@@ -2542,6 +2648,55 @@ impl App {
         });
     }
 
+    /// Append the run events that arrived since the last call to the
+    /// running workflow's timeline. Call before handling a run's result, so
+    /// the events it sent before finishing are in place first.
+    pub fn drain_timeline(&mut self) {
+        while let Ok((idx, generation, entry)) = self.timeline_rx.try_recv() {
+            // Only the run in flight may write: anything else belongs to a
+            // run whose result has already been handled, which may have
+            // been an earlier run of the same workflow.
+            if self.current_execution != Some(idx) || generation != self.run_generation {
+                continue;
+            }
+            if let Some(exec) = self
+                .workflows
+                .get_mut(idx)
+                .and_then(|w| w.execution_details.as_mut())
+            {
+                match entry {
+                    crate::models::RunUpdate::Entry(entry) => {
+                        if let crate::models::TimelineEntry::JobFinished { job, .. } = &entry {
+                            exec.live.finish(job);
+                        }
+                        exec.timeline.push(entry);
+                    }
+                    crate::models::RunUpdate::Output {
+                        job,
+                        index,
+                        step,
+                        lines,
+                    } => exec.live.push(&job, index, &step, lines),
+                }
+            }
+        }
+    }
+
+    /// Handle the run in flight finishing with `result`. The executor sends
+    /// a run's last events and then its result from the same thread, so
+    /// any event still queued arrived before the result: it is applied
+    /// while the run still counts as in flight, or it would be dropped.
+    pub fn finish_execution(
+        &mut self,
+        workflow_idx: usize,
+        result: Result<(Vec<wrkflw_executor::JobResult>, ()), String>,
+    ) {
+        self.drain_timeline();
+        // Clears `current_execution` when this result is for it; a result
+        // for another workflow must not free the slot the running one holds.
+        self.process_execution_result(workflow_idx, result);
+    }
+
     /// Drain any completed dispatch outcomes. Each outcome is pushed
     /// to `self.logs` so nothing is lost if two arrive in one tick,
     /// and the status bar is updated with the most recent one (an
@@ -3005,6 +3160,7 @@ mod tests {
             logs: String::new(),
             outputs: HashMap::new(),
             failure_allowed: allowed,
+            repeated_from: None,
         }
     }
 
@@ -3034,6 +3190,28 @@ mod tests {
             Some(1),
             "opens on the failed job"
         );
+    }
+
+    #[test]
+    fn the_job_cursor_reaches_jobs_that_have_not_reported_yet() {
+        let mut app = make_app();
+        app.workflow_list_state.select(Some(0));
+        app.queue_workflow(0);
+        let (idx, _) = app.get_next_workflow_to_execute().unwrap();
+        let rows = app.workflows[idx].job_row_count();
+        assert!(rows >= 2, "the test workflow needs two jobs, has {rows}");
+        app.job_list_state.select(Some(0));
+
+        // Mid-run, no results yet: the cursor still moves, and stops at
+        // the last row.
+        for _ in 0..rows + 3 {
+            app.next_job();
+        }
+        assert_eq!(app.job_list_state.selected(), Some(rows - 1));
+        app.jump_job(false);
+        assert_eq!(app.job_list_state.selected(), Some(0));
+        app.jump_job(true);
+        assert_eq!(app.job_list_state.selected(), Some(rows - 1));
     }
 
     #[test]
@@ -3156,6 +3334,8 @@ mod tests {
     #[test]
     fn log_follow_resumes_at_the_last_line_and_pauses_off_it() {
         let mut app = make_app();
+        // These cover the raw log, not the story view.
+        app.log_story = false;
         app.apply_log_update(log_lines(10), vec![]);
         assert!(app.log_follow);
         assert_eq!(app.log_scroll, 9);
@@ -3350,7 +3530,7 @@ mod tests {
     }
 
     #[test]
-    fn next_available_job_wraps_around() {
+    fn next_available_job_stops_at_the_last_job() {
         let mut app = make_app();
         app.enter_job_selection_mode();
 
@@ -3358,17 +3538,19 @@ mod tests {
         assert_eq!(app.selected_job_index, 1);
         app.next_available_job(); // 1 -> 2
         assert_eq!(app.selected_job_index, 2);
-        app.next_available_job(); // 2 -> 0 (wrap)
-        assert_eq!(app.selected_job_index, 0);
+        app.next_available_job(); // stays on 2
+        assert_eq!(app.selected_job_index, 2);
     }
 
     #[test]
-    fn previous_available_job_wraps_around() {
+    fn previous_available_job_stops_at_the_first_job() {
         let mut app = make_app();
         app.enter_job_selection_mode();
 
-        app.previous_available_job(); // 0 -> 2 (wrap)
-        assert_eq!(app.selected_job_index, 2);
+        app.previous_available_job(); // stays on 0
+        assert_eq!(app.selected_job_index, 0);
+        app.next_available_job();
+        app.next_available_job(); // 0 -> 2
         app.previous_available_job(); // 2 -> 1
         assert_eq!(app.selected_job_index, 1);
         app.previous_available_job(); // 1 -> 0
@@ -3981,6 +4163,204 @@ mod tests {
         assert!(app.execution_queue.is_empty());
     }
 
+    fn queued(app: &App) -> Vec<usize> {
+        app.execution_queue.iter().map(|e| e.workflow_idx).collect()
+    }
+
+    #[test]
+    fn run_selected_queues_every_checked_workflow_in_order() {
+        let mut app = make_app();
+        app.workflows[0].selected = true;
+        app.workflows[1].selected = true;
+        app.workflow_list_state.select(Some(0));
+        app.queue_selected_for_execution();
+        assert_eq!(queued(&app), vec![0, 1]);
+    }
+
+    #[test]
+    fn run_selected_falls_back_to_cursor_when_nothing_is_checked() {
+        let mut app = make_app();
+        app.workflow_list_state.select(Some(1));
+        app.queue_selected_for_execution();
+        assert_eq!(queued(&app), vec![1]);
+    }
+
+    #[test]
+    fn running_the_cursor_row_leaves_checkboxes_alone() {
+        let mut app = make_app();
+        app.workflows[1].selected = true;
+        app.workflow_list_state.select(Some(0));
+        app.queue_cursor_for_execution();
+        assert_eq!(queued(&app), vec![0]);
+        assert!(!app.workflows[0].selected);
+        assert!(app.workflows[1].selected);
+    }
+
+    #[test]
+    fn workflow_cursor_stops_at_both_ends() {
+        let mut app = make_app();
+        app.workflow_list_state.select(Some(0));
+        app.previous_workflow();
+        assert_eq!(app.workflow_list_state.selected(), Some(0));
+        app.jump_workflow(true);
+        assert_eq!(app.workflow_list_state.selected(), Some(1));
+        app.next_workflow();
+        assert_eq!(app.workflow_list_state.selected(), Some(1));
+        app.jump_workflow(false);
+        assert_eq!(app.workflow_list_state.selected(), Some(0));
+    }
+
+    fn run_record(id: &str, cwd: &std::path::Path, workflow: &str) -> wrkflw_runs::RunRecord {
+        let record = serde_json::json!({
+            "schema_version": 1, "id": id, "status": "success", "workflow": workflow,
+            "cwd": cwd.to_string_lossy(), "repo_root": cwd.to_string_lossy(),
+            "git_sha": null, "git_branch": null, "git_dirty": null, "runtime": "emulation",
+            "event": null, "source": "cli", "agent": null, "intent": null, "replay_of": null,
+            "argv": [], "variables": [], "pid": 1, "started_at": "2026-11-05T12:00:00Z",
+            "finished_at": null, "duration_ms": null, "error": null, "skip_reason": null,
+            "jobs": []
+        });
+        serde_json::from_value(record).unwrap()
+    }
+
+    #[test]
+    fn each_workflow_finds_its_newest_recorded_run() {
+        let repo = tempfile::tempdir().unwrap();
+        let flows = repo.path().join(".github/workflows");
+        std::fs::create_dir_all(&flows).unwrap();
+        for file in ["ci.yml", "deploy.yml"] {
+            std::fs::write(flows.join(file), "on: push").unwrap();
+        }
+        let mut app = make_app();
+        app.workflows[0].path = flows.join("ci.yml");
+        app.workflows[1].path = flows.join("deploy.yml");
+        // Newest first, as history lists them. Runs record the workflow
+        // relative to where they ran, which may be a subdirectory.
+        app.runs = vec![
+            run_record("new-ci", repo.path(), ".github/workflows/ci.yml"),
+            run_record("old-ci", &flows, "ci.yml"),
+            run_record("other", repo.path(), ".github/workflows/nightly.yml"),
+        ];
+        app.match_runs_to_workflows();
+        assert_eq!(app.last_run(0).map(|r| r.id.as_str()), Some("new-ci"));
+        assert_eq!(app.last_run(1).map(|r| r.id.as_str()), None);
+        assert!(app.last_run(99).is_none());
+    }
+
+    #[test]
+    fn timeline_only_reaches_the_workflow_in_flight() {
+        let mut app = make_app();
+        app.execution_queue.push(QueuedExecution {
+            workflow_idx: 0,
+            target_job: None,
+        });
+        app.get_next_workflow_to_execute();
+        let entry = |job: &str| crate::models::TimelineEntry::JobStarted {
+            job: job.into(),
+            canonical_name: job.into(),
+        };
+        let update = |job: &str| crate::models::RunUpdate::Entry(entry(job));
+        let generation = app.run_generation;
+        app.timeline_tx
+            .send((0, generation, update("build")))
+            .unwrap();
+        // A late event for a workflow that is no longer running.
+        app.timeline_tx
+            .send((1, generation, update("stale")))
+            .unwrap();
+        // A late event from an earlier run of the workflow now running.
+        app.timeline_tx
+            .send((0, generation.wrapping_sub(1), update("earlier")))
+            .unwrap();
+        app.drain_timeline();
+        let timeline = &app.workflows[0]
+            .execution_details
+            .as_ref()
+            .unwrap()
+            .timeline;
+        assert_eq!(timeline, &vec![entry("build")]);
+        assert!(app.workflows[1].execution_details.is_none());
+    }
+
+    #[test]
+    fn live_output_reaches_its_job_and_is_marked_finished_with_it() {
+        let mut app = make_app();
+        app.execution_queue.push(QueuedExecution {
+            workflow_idx: 0,
+            target_job: None,
+        });
+        app.get_next_workflow_to_execute();
+        let generation = app.run_generation;
+        let send = |app: &App, update| app.timeline_tx.send((0, generation, update)).unwrap();
+        send(
+            &app,
+            crate::models::RunUpdate::Output {
+                job: "build".into(),
+                index: 0,
+                step: "compile".into(),
+                lines: vec!["Compiling a".into()],
+            },
+        );
+        app.drain_timeline();
+        let live = |app: &App| {
+            let exec = app.workflows[0].execution_details.as_ref().unwrap();
+            let tail = &exec.live.jobs["build"];
+            (
+                tail.lines.iter().cloned().collect::<Vec<_>>(),
+                tail.finished,
+            )
+        };
+        assert_eq!(live(&app), (vec!["Compiling a".to_string()], false));
+
+        send(
+            &app,
+            crate::models::RunUpdate::Entry(crate::models::TimelineEntry::JobFinished {
+                job: "build".into(),
+                status: wrkflw_executor::JobStatus::Success,
+                failure_allowed: false,
+                duration_ms: 10,
+                repeated_from: None,
+            }),
+        );
+        app.drain_timeline();
+        assert_eq!(live(&app), (vec!["Compiling a".to_string()], true));
+    }
+
+    #[test]
+    fn events_queued_ahead_of_the_result_still_reach_the_timeline() {
+        let mut app = make_app();
+        app.execution_queue.push(QueuedExecution {
+            workflow_idx: 0,
+            target_job: None,
+        });
+        app.get_next_workflow_to_execute();
+        app.current_execution = Some(0);
+        let finished = crate::models::TimelineEntry::JobFinished {
+            job: "build".into(),
+            status: wrkflw_executor::JobStatus::Success,
+            failure_allowed: false,
+            duration_ms: 10,
+            repeated_from: None,
+        };
+        // The executor's last event, sent just before its result and not
+        // yet drained by the event loop.
+        app.timeline_tx
+            .send((
+                0,
+                app.run_generation,
+                crate::models::RunUpdate::Entry(finished.clone()),
+            ))
+            .unwrap();
+        app.finish_execution(0, Ok((Vec::new(), ())));
+        assert_eq!(app.current_execution, None);
+        let timeline = &app.workflows[0]
+            .execution_details
+            .as_ref()
+            .unwrap()
+            .timeline;
+        assert_eq!(timeline, &vec![finished]);
+    }
+
     #[test]
     fn get_next_workflow_to_execute_returns_none_when_empty() {
         let mut app = make_app();
@@ -4119,13 +4499,13 @@ mod tests {
 
     #[test]
     fn accent_next_cycles_through_all_five_slots() {
-        let mut a = Accent::Cyan;
+        let mut a = Accent::Blueprint;
         let mut seen = vec![a];
         for _ in 0..5 {
             a = a.next();
             seen.push(a);
         }
-        // Five steps returns to Cyan.
+        // Five steps returns to Blueprint.
         assert_eq!(seen.first(), seen.last());
         // All five slots are visited before wrapping.
         let mut distinct = seen.clone();

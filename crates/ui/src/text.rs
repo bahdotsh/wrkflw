@@ -114,6 +114,29 @@ pub fn pad_left(s: &str, cells: usize) -> String {
     out
 }
 
+/// Fits a run of spans to exactly `cells`: the last span that overflows
+/// is truncated with `…` and the rest dropped, and a short run is padded.
+pub fn fit_spans(spans: Vec<Span<'static>>, cells: usize) -> Vec<Span<'static>> {
+    let mut out = Vec::with_capacity(spans.len() + 1);
+    let mut used = 0;
+    for span in spans {
+        let w = width(&span.content);
+        if used + w <= cells {
+            used += w;
+            out.push(span);
+            continue;
+        }
+        let cut = truncate(&span.content, cells - used).into_owned();
+        used += width(&cut);
+        out.push(Span::styled(cut, span.style));
+        break;
+    }
+    if used < cells {
+        out.push(Span::raw(" ".repeat(cells - used)));
+    }
+    out
+}
+
 /// Total cells of a run of spans.
 pub fn spans_width(spans: &[Span<'_>]) -> usize {
     spans.iter().map(|s| width(&s.content)).sum()
@@ -311,6 +334,37 @@ fn ansi_color(n: u16) -> Color {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fit_spans_truncates_and_pads_to_exact_width() {
+        let spans = vec![Span::raw("ab"), Span::raw("cdefgh")];
+        let fitted = fit_spans(spans.clone(), 5);
+        assert_eq!(spans_width(&fitted), 5);
+        assert_eq!(fitted[1].content, "cd…");
+        assert_eq!(spans_width(&fit_spans(spans, 12)), 12);
+    }
+
+    #[test]
+    fn status_symbols_are_one_cell_wide() {
+        use crate::theme::symbols::*;
+        for (name, glyph) in [
+            ("SUCCESS", SUCCESS),
+            ("FAILURE", FAILURE),
+            ("RUNNING", RUNNING),
+            ("SKIPPED", SKIPPED),
+            ("NOT_STARTED", NOT_STARTED),
+            ("WARNING", WARNING),
+            ("INFO", INFO),
+            ("DEBUG", DEBUG),
+            ("GEAR", GEAR),
+            ("LOCK", LOCK),
+            ("BLOCKED", BLOCKED),
+            ("ARROW", ARROW),
+            ("NESTED", NESTED),
+        ] {
+            assert_eq!(width(glyph), 1, "{name} ({glyph}) must take one cell");
+        }
+    }
 
     #[test]
     fn truncation_counts_cells_not_chars() {

@@ -1,4 +1,4 @@
-// Secrets & runtime — screen 7 from the design.
+// Setup tab: the runtime picker and the secret providers.
 //
 // Honesty note: we don't have a rich secrets metadata store (last-used
 // timestamps, length, scope etc. are not persisted anywhere). We also
@@ -35,31 +35,36 @@ use wrkflw_secrets::{SecretConfig, SecretProviderConfig};
 
 pub fn render_secrets_tab(f: &mut Frame<'_>, app: &mut App, area: Rect) {
     let rows = provider_entries();
+    // Runtime first: it is the first choice a run depends on, so it sits
+    // above the secret providers rather than beside them.
+    let body = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(RUNTIME_PANE_HEIGHT), Constraint::Min(0)])
+        .split(area);
+    render_runtime_pane(f, app, body[0]);
+
     let (left, right) = if area.width >= 90 {
-        let body = Layout::default()
+        let cols = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(45), Constraint::Min(0)])
-            .split(area);
-        (body[0], body[1])
+            .split(body[1]);
+        (cols[0], cols[1])
     } else {
-        let body = Layout::default()
+        let stack = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(rows.len() as u16 + 2),
                 Constraint::Min(0),
             ])
-            .split(area);
-        (body[0], body[1])
+            .split(body[1]);
+        (stack[0], stack[1])
     };
     render_providers_pane(f, app, &rows, left);
-
-    let right = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(5), Constraint::Min(0)])
-        .split(right);
-    render_detail_pane(f, app, &rows, right[0]);
-    render_runtime_pane(f, app, right[1]);
+    render_detail_pane(f, app, &rows, right);
 }
+
+/// Five runtimes, a blank line, two facts and the borders.
+const RUNTIME_PANE_HEIGHT: u16 = 10;
 
 fn provider_entries() -> Vec<(String, SecretProviderConfig)> {
     let cfg = SecretConfig::default();

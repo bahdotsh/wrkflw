@@ -8,8 +8,7 @@ use wrkflw_executor::{self, JobStatus, RuntimeType, StepStatus};
 #[cfg(feature = "tui")]
 use {
     crate::app::App,
-    crate::models::{ExecutionResultMsg, WorkflowExecution, WorkflowStatus},
-    chrono::Local,
+    crate::models::{ExecutionResultMsg, RunUpdate, TimelineMsg},
     std::sync::mpsc,
     std::thread,
 };
@@ -464,9 +463,35 @@ pub async fn execute_curl_trigger(
         logs: "Workflow triggered remotely on GitHub".to_string(),
         outputs: std::collections::HashMap::new(),
         failure_allowed: false,
+        repeated_from: None,
     };
 
     Ok((vec![job_result], ()))
+}
+
+/// Forwards a run's events to the TUI as timeline entries. Runs on the
+/// executor's task, so it only converts and sends.
+#[cfg(feature = "tui")]
+struct TimelineObserver {
+    workflow_idx: usize,
+    /// The TUI's `run_generation` for this run.
+    generation: u64,
+    tx: mpsc::Sender<TimelineMsg>,
+}
+
+#[cfg(feature = "tui")]
+impl wrkflw_executor::ExecutionObserver for TimelineObserver {
+    fn on_event(&self, event: &wrkflw_executor::ExecutionEvent) {
+        if let Some(entry) = RunUpdate::from_event(event) {
+            // The TUI may have quit; a run that outlives it has no one to
+            // tell, and that is fine.
+            let _ = self.tx.send((self.workflow_idx, self.generation, entry));
+        }
+    }
+
+    fn wants_step_output(&self) -> bool {
+        true
+    }
 }
 
 // Extract common workflow execution logic to avoid duplication
@@ -480,15 +505,8 @@ pub fn start_next_workflow_execution(
         app.current_execution = Some(next_idx);
         let tx_clone_inner = tx_clone.clone();
         let workflow_path = app.workflows[next_idx].path.clone();
-
-        // Log whether verbose mode is enabled
-        if verbose {
-            wrkflw_logging::info("Verbose mode: Step outputs will be displayed in full");
-        } else {
-            wrkflw_logging::info(
-                "Standard mode: Only step status will be shown (use --verbose for full output)",
-            );
-        }
+        let timeline_tx = app.timeline_tx.clone();
+        let generation = app.run_generation;
 
         // Check container runtime availability again if container runtime is selected
         let runtime_type = match app.runtime_type {
@@ -531,18 +549,8 @@ pub fn start_next_workflow_execution(
         let kubernetes = app.kubernetes.clone();
         let show_action_messages = app.show_action_messages;
 
-        // Update workflow status and add execution details
-        app.workflows[next_idx].status = WorkflowStatus::Running;
-
-        // Initialize execution details if not already done
-        if app.workflows[next_idx].execution_details.is_none() {
-            app.workflows[next_idx].execution_details = Some(WorkflowExecution {
-                jobs: Vec::new(),
-                start_time: Local::now(),
-                end_time: None,
-                progress: 0.0,
-            });
-        }
+        // `get_next_workflow_to_execute` marked the workflow running and
+        // gave it a fresh execution for this run.
 
         thread::spawn(move || {
             let rt = match tokio::runtime::Runtime::new() {
@@ -598,6 +606,7 @@ pub fn start_next_workflow_execution(
                                 ),
                                 outputs: std::collections::HashMap::new(),
                                 failure_allowed: false,
+                                repeated_from: None,
                             }];
 
                             Ok((jobs, ()))
@@ -629,6 +638,11 @@ pub fn start_next_workflow_execution(
                                     ndjson: false,
                                     record: true,
                                     from_step: None,
+                                    observers: vec![std::sync::Arc::new(TimelineObserver {
+                                        workflow_idx: next_idx,
+                                        generation,
+                                        tx: timeline_tx,
+                                    })],
                                 },
                             )
                             .await

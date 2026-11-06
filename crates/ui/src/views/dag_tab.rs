@@ -14,7 +14,7 @@ use ratatui::{
     widgets::Paragraph,
     Frame,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use wrkflw_parser::workflow::WorkflowDefinition;
 
@@ -92,15 +92,82 @@ pub fn render_dag_tab(f: &mut Frame<'_>, app: &mut App, area: Rect) {
     app.dag_scroll = scroll;
 }
 
+/// How long each finished job took, and the jobs that set the run's
+/// length: the slowest of each stage.
+struct Timing {
+    durations: HashMap<String, u64>,
+    critical: HashSet<String>,
+    /// The run has ended, so every job that will report a time has.
+    settled: bool,
+    /// Jobs with a leg still running, whose time may yet grow.
+    unfinished: HashSet<String>,
+}
+
+impl Timing {
+    fn of(workflow: &Workflow, levels: &[Vec<String>]) -> Self {
+        let exec = workflow.execution_details.as_ref();
+        let durations = exec.map(|e| e.job_durations_ms()).unwrap_or_default();
+        let settled = exec.is_some_and(|e| e.end_time.is_some());
+        let unfinished = exec.map(|e| e.unfinished_jobs()).unwrap_or_default();
+        // Mid-run, unfinished jobs would count as taking no time, and the
+        // path would move as they finish; it is only drawn once it's known.
+        let critical = if settled {
+            critical_path(levels, &durations)
+        } else {
+            HashSet::new()
+        };
+        Timing {
+            durations,
+            critical,
+            settled,
+            unfinished,
+        }
+    }
+
+    /// Wall time of a stage: its jobs run side by side, so the slowest.
+    /// While the run goes on, only once every job in the stage has finished,
+    /// every matrix leg included.
+    fn stage_ms(&self, layer: &[String]) -> Option<u64> {
+        let times: Vec<u64> = layer
+            .iter()
+            .filter_map(|j| self.durations.get(j).copied())
+            .collect();
+        let pending =
+            times.len() < layer.len() || layer.iter().any(|j| self.unfinished.contains(j));
+        if !self.settled && pending {
+            return None;
+        }
+        times.into_iter().max()
+    }
+}
+
+/// The jobs that set the run's length: the slowest of each stage. Stages
+/// run one after another and the jobs in a stage side by side, as the
+/// executor schedules them, so a run takes the sum of these jobs' times.
+/// Empty until the run has timings, and for single-stage workflows, where
+/// the slowest job is already plain to see.
+fn critical_path(levels: &[Vec<String>], durations: &HashMap<String, u64>) -> HashSet<String> {
+    if durations.is_empty() || levels.len() < 2 {
+        return HashSet::new();
+    }
+    levels
+        .iter()
+        .filter_map(|layer| {
+            layer
+                .iter()
+                .filter_map(|job| durations.get(job).map(|ms| (*ms, job)))
+                // Ties go to the first name, so the path doesn't flicker.
+                .max_by_key(|(ms, job)| (*ms, std::cmp::Reverse(job.as_str())))
+                .map(|(_, job)| job.clone())
+        })
+        .collect()
+}
+
 fn matrix_suffix(labels: &MatrixLabels, job: &str) -> String {
     labels
         .get(job)
         .map(|n| format!(" ×{n}"))
         .unwrap_or_default()
-}
-
-fn title(workflow: &Workflow) -> String {
-    format!("Graph · {}", text::sanitize(&workflow.name))
 }
 
 fn state_color(state: JobState) -> ratatui::style::Color {
@@ -124,8 +191,9 @@ fn render_graph(
     levels: &[Vec<String>],
     area: Rect,
 ) -> usize {
-    let title = title(workflow);
-    let block = theme::block_focused(&title);
+    // The Run header names the workflow.
+    let title = "Graph";
+    let block = theme::block_focused(title);
     let inner = block.inner(area);
 
     if levels.is_empty() {
@@ -158,6 +226,7 @@ fn render_graph(
     }
     f.render_widget(theme::with_badge(block, badge), area);
 
+    let timing = Timing::of(workflow, levels);
     let max_cards = (inner.height.saturating_sub(2) / CARD_H).max(1) as usize;
     for (col, (li, layer)) in levels
         .iter()
@@ -180,6 +249,13 @@ fn render_graph(
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(format!("  {}", layer.len()), theme::muted_style()),
+                Span::styled(
+                    timing
+                        .stage_ms(layer)
+                        .map(|ms| format!(" · {}", crate::views::execution_tab::format_ms(ms)))
+                        .unwrap_or_default(),
+                    Style::default().fg(COLORS.text_dim),
+                ),
             ])),
             head,
         );
@@ -196,7 +272,7 @@ fn render_graph(
                 break;
             }
             let card = Rect::new(x, y, card_w, CARD_H);
-            render_card(f, app, workflow, labels, name, card);
+            render_card(f, app, workflow, labels, &timing, name, card);
 
             let has_needs = def
                 .jobs
@@ -231,6 +307,7 @@ fn render_card(
     app: &App,
     workflow: &Workflow,
     labels: &MatrixLabels,
+    timing: &Timing,
     name: &str,
     area: Rect,
 ) {
@@ -239,15 +316,40 @@ fn render_card(
     let (glyph, glyph_style) = theme::job_state(state, app.spinner_frame);
     let matrix = matrix_suffix(labels, name);
 
+    // The critical path gets a heavy border; the colour still says how
+    // the job went.
     let block = ratatui::widgets::Block::bordered()
-        .border_type(ratatui::widgets::BorderType::Rounded)
+        .border_type(if timing.critical.contains(name) {
+            ratatui::widgets::BorderType::Thick
+        } else {
+            ratatui::widgets::BorderType::Rounded
+        })
         .border_style(Style::default().fg(if state == JobState::Pending {
             COLORS.border
         } else {
             color
         }));
     let inner = block.inner(area);
+    let took = timing
+        .durations
+        .get(name)
+        .map(|ms| crate::views::execution_tab::format_ms(*ms))
+        .unwrap_or_default();
     let room = (inner.width as usize).saturating_sub(3 + matrix.len());
+    // Show the time only when the name still has room to be read.
+    // The time keeps a cell of margin from the border, like the glyph.
+    let (room, took) = if !took.is_empty() && room >= text::width(&took) + 9 {
+        (room - text::width(&took) - 2, format!("{took} "))
+    } else {
+        (room, String::new())
+    };
+    let shown_name = text::truncate(&text::sanitize(name), room).into_owned();
+    // Right-align the time: pad what the name left of its room.
+    let pad = if took.is_empty() {
+        0
+    } else {
+        room.saturating_sub(text::width(&shown_name)) + 1
+    };
     let name_style = match state {
         JobState::Pending | JobState::Skipped => theme::muted_style(),
         _ => Style::default()
@@ -259,11 +361,10 @@ fn render_card(
             Span::raw(" "),
             Span::styled(glyph, glyph_style),
             Span::raw(" "),
-            Span::styled(
-                text::truncate(&text::sanitize(name), room).into_owned(),
-                name_style,
-            ),
+            Span::styled(shown_name.clone(), name_style),
             Span::styled(matrix, Style::default().fg(COLORS.info)),
+            Span::raw(" ".repeat(pad)),
+            Span::styled(took, theme::muted_style()),
         ]))
         .block(block),
         area,
@@ -281,8 +382,9 @@ fn render_list(
     levels: &[Vec<String>],
     area: Rect,
 ) -> usize {
-    let title = title(workflow);
-    let block = theme::with_badge(theme::block_focused(&title), "list");
+    // The Run header names the workflow.
+    let title = "Graph";
+    let block = theme::with_badge(theme::block_focused(title), "list");
     let inner = block.inner(area);
     f.render_widget(block, area);
     let w = inner.width as usize;
@@ -366,23 +468,131 @@ fn render_legend(f: &mut Frame<'_>, app: &App, area: Rect) {
         Span::styled("×6", Style::default().fg(COLORS.info)),
         Span::styled(" matrix runs", Style::default().fg(COLORS.text_dim)),
     ]));
-    lines.push(Line::from(""));
-    lines.push(theme::section("Keys"));
-    for (k, d) in [
-        ("g", "graph / list"),
-        ("←→", "scroll"),
-        ("↑↓", "workflow"),
-        ("Enter", "open run"),
-    ] {
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("{k:<6}"),
-                Style::default()
-                    .fg(theme::current_accent())
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(d, Style::default().fg(COLORS.text_dim)),
-        ]));
-    }
+    lines.push(Line::from(vec![
+        Span::styled("┃", Style::default().fg(COLORS.text_dim)),
+        Span::styled("  critical path", Style::default().fg(COLORS.text_dim)),
+    ]));
     f.render_widget(Paragraph::new(lines), inner);
+}
+
+#[cfg(test)]
+mod timing_tests {
+    use super::*;
+
+    fn def(yaml: &str) -> WorkflowDefinition {
+        serde_yaml::from_str(yaml).expect("test workflow parses")
+    }
+
+    #[test]
+    fn critical_path_follows_the_slowest_chain() {
+        let def = def(
+            "name: d\non: push\njobs:\n  checkout:\n    runs-on: x\n    steps: [{run: a}]\n  lint:\n    runs-on: x\n    needs: checkout\n    steps: [{run: a}]\n  test:\n    runs-on: x\n    needs: checkout\n    steps: [{run: a}]\n  package:\n    runs-on: x\n    needs: [lint, test]\n    steps: [{run: a}]\n",
+        );
+        let levels = dag::topo_levels(&def);
+        let durations: HashMap<String, u64> = [
+            ("checkout", 1_000),
+            ("lint", 2_000),
+            ("test", 9_000),
+            ("package", 500),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+        let path = critical_path(&levels, &durations);
+        let expected: HashSet<String> = ["checkout", "test", "package"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        assert_eq!(path, expected);
+        assert!(critical_path(&levels, &HashMap::new()).is_empty());
+    }
+
+    #[test]
+    fn critical_path_is_the_slowest_job_of_each_stage() {
+        // Stage times add up, so the run takes a (10s) + d (10s), although
+        // neither dependency chain, a → c or b → d, is longer than 11s.
+        let def = def(
+            "name: d\non: push\njobs:\n  a:\n    runs-on: x\n    steps: [{run: a}]\n  b:\n    runs-on: x\n    steps: [{run: a}]\n  c:\n    runs-on: x\n    needs: a\n    steps: [{run: a}]\n  d:\n    runs-on: x\n    needs: b\n    steps: [{run: a}]\n",
+        );
+        let levels = dag::topo_levels(&def);
+        let durations: HashMap<String, u64> =
+            [("a", 10_000), ("b", 1_000), ("c", 1_000), ("d", 10_000)]
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect();
+        let expected: HashSet<String> = ["a", "d"].into_iter().map(String::from).collect();
+        assert_eq!(critical_path(&levels, &durations), expected);
+    }
+
+    #[test]
+    fn equal_chains_pick_the_same_path_every_time() {
+        let def = def(
+            "name: d\non: push\njobs:\n  a:\n    runs-on: x\n    steps: [{run: a}]\n  b:\n    runs-on: x\n    steps: [{run: a}]\n  c:\n    runs-on: x\n    needs: a\n    steps: [{run: a}]\n  d:\n    runs-on: x\n    needs: b\n    steps: [{run: a}]\n",
+        );
+        let levels = dag::topo_levels(&def);
+        let durations: HashMap<String, u64> = ["a", "b", "c", "d"]
+            .into_iter()
+            .map(|k| (k.to_string(), 1_000))
+            .collect();
+        let expected: HashSet<String> = ["a", "c"].into_iter().map(String::from).collect();
+        for _ in 0..20 {
+            assert_eq!(critical_path(&levels, &durations), expected);
+        }
+    }
+
+    #[test]
+    fn stage_times_wait_for_the_stage_while_the_run_goes_on() {
+        let layer = vec!["lint".to_string(), "test".to_string()];
+        let mut timing = Timing {
+            durations: HashMap::from([("lint".to_string(), 2_000)]),
+            critical: HashSet::new(),
+            settled: false,
+            unfinished: HashSet::new(),
+        };
+        assert_eq!(timing.stage_ms(&layer), None);
+        timing.durations.insert("test".to_string(), 9_000);
+        assert_eq!(timing.stage_ms(&layer), Some(9_000));
+        // Once the run has ended, a job that never reported doesn't hide it.
+        timing.durations.remove("test");
+        timing.settled = true;
+        assert_eq!(timing.stage_ms(&layer), Some(2_000));
+    }
+
+    #[test]
+    fn a_matrix_stage_waits_for_its_last_leg() {
+        use crate::models::TimelineEntry as T;
+        use wrkflw_executor::JobStatus;
+        let started = |job: &str| T::JobStarted {
+            job: job.into(),
+            canonical_name: "build".into(),
+        };
+        let finished = |job: &str, ms| T::JobFinished {
+            job: job.into(),
+            status: JobStatus::Success,
+            failure_allowed: false,
+            duration_ms: ms,
+            repeated_from: None,
+        };
+        let mut exec = crate::models::WorkflowExecution {
+            jobs: Vec::new(),
+            start_time: chrono::Local::now(),
+            end_time: None,
+            progress: 0.0,
+            timeline: vec![started("build (os: a)"), started("build (os: b)")],
+            live: Default::default(),
+        };
+        let layer = vec!["build".to_string()];
+        let timing = |exec: &crate::models::WorkflowExecution| Timing {
+            durations: exec.job_durations_ms(),
+            critical: HashSet::new(),
+            settled: false,
+            unfinished: exec.unfinished_jobs(),
+        };
+
+        exec.timeline.push(finished("build (os: a)", 900));
+        assert_eq!(timing(&exec).stage_ms(&layer), None, "one leg still runs");
+
+        exec.timeline.push(finished("build (os: b)", 1_400));
+        assert_eq!(timing(&exec).stage_ms(&layer), Some(1_400));
+    }
 }

@@ -6,6 +6,7 @@ pub mod acceleration;
 pub mod action_resolver;
 pub(crate) mod artifacts;
 pub(crate) mod cache;
+pub(crate) mod checkout_sync;
 mod container_guard;
 pub mod dependency;
 pub mod docker;
@@ -16,9 +17,14 @@ pub mod expression;
 pub mod github_env_files;
 pub(crate) mod job_session;
 pub mod kubernetes;
+pub(crate) mod live_step;
+pub(crate) mod log_redaction;
+pub(crate) mod matrix_fold;
 pub mod podman;
+pub mod run_options;
 pub mod substitution;
 pub(crate) mod workflow_commands;
+pub mod workspace;
 
 // Re-export public items
 pub use acceleration::{validate_remote, Acceleration, Secret, Sidecar, SIDECAR_PATH};

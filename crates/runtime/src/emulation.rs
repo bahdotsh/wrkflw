@@ -167,9 +167,9 @@ impl ContainerRuntime for EmulationRuntime {
         }
 
         // Log more detailed debugging information
-        wrkflw_logging::info(&format!("Executing command in container: {}", command_str));
-        wrkflw_logging::info(&format!("Working directory: {}", working_dir.display()));
-        wrkflw_logging::info(&format!("Command length: {}", command.len()));
+        wrkflw_logging::debug(&format!("Executing command in container: {}", command_str));
+        wrkflw_logging::debug(&format!("Working directory: {}", working_dir.display()));
+        wrkflw_logging::debug(&format!("Command length: {}", command.len()));
 
         if command.is_empty() {
             // Empty cmd means "use the image's built-in ENTRYPOINT/CMD".
@@ -205,14 +205,14 @@ impl ContainerRuntime for EmulationRuntime {
 
         // Print each command part separately for debugging
         for (i, part) in command.iter().enumerate() {
-            wrkflw_logging::info(&format!("Command part {}: '{}'", i, part));
+            wrkflw_logging::debug(&format!("Command part {}: '{}'", i, part));
         }
 
-        // Log environment variables
-        wrkflw_logging::info("Environment variables:");
-        for (key, value) in env_vars {
-            wrkflw_logging::info(&format!("  {}={}", key, value));
-        }
+        // Name the variables but never print their values: they carry
+        // secrets, and this line reaches the console and the TUI.
+        let mut names: Vec<&str> = env_vars.iter().map(|(key, _)| key.as_ref()).collect();
+        names.sort_unstable();
+        wrkflw_logging::debug(&format!("Environment variables: {}", names.join(", ")));
 
         // Resolve the host working directory via the shared mount-semantics
         // helper. When `volumes` covers `working_dir` (the normal case for
@@ -222,7 +222,7 @@ impl ContainerRuntime for EmulationRuntime {
         // silently reintroduce #88.
         let actual_working_dir = rebase_working_dir_or_error(working_dir, volumes, "emulation")?;
 
-        wrkflw_logging::info(&format!(
+        wrkflw_logging::debug(&format!(
             "Using actual working directory: {}",
             actual_working_dir.display()
         ));
@@ -230,7 +230,7 @@ impl ContainerRuntime for EmulationRuntime {
         // Check if path contains the command (for shell script execution)
         let command_path = which::which(command[0]);
         match &command_path {
-            Ok(path) => wrkflw_logging::info(&format!("Found command at: {}", path.display())),
+            Ok(path) => wrkflw_logging::debug(&format!("Found command at: {}", path.display())),
             Err(e) => wrkflw_logging::error(&format!(
                 "Command not found in PATH: {} - Error: {}",
                 command[0], e
@@ -272,7 +272,7 @@ impl ContainerRuntime for EmulationRuntime {
 
         // Cargo/rustup commands always run in the project directory
         if matches!(cmd_basename, "cargo" | "rustup") {
-            wrkflw_logging::info(&format!(
+            wrkflw_logging::debug(&format!(
                 "Using project directory for Rust command: {}",
                 project_dir.display()
             ));
@@ -292,7 +292,20 @@ impl ContainerRuntime for EmulationRuntime {
             }
         }
 
-        match cmd.output() {
+        // Output is collected as `output()` would, and also passed on as it
+        // is printed so a long step shows progress.
+        let run = cmd
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .and_then(|child| {
+                crate::live_output::blocking_wait_with_live_output(
+                    child,
+                    crate::live_output::current(),
+                )
+            });
+        match run {
             Ok(output_result) => {
                 let exit_code = output_result.status.code().unwrap_or(-1);
                 let output = String::from_utf8_lossy(&output_result.stdout).to_string();

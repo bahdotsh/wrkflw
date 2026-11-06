@@ -1,0 +1,7 @@
+# Tests run real jobs, and jobs keep their workspace under the user's cache
+# directory by default. Tests must neither leave workspaces there nor see
+# each other's, so every job they run, in process or through the built
+# binary, starts in an empty one. An existing WRKFLW_FRESH_WORKSPACE wins,
+# so `WRKFLW_FRESH_WORKSPACE=0 cargo run -- run ...` keeps workspaces.
+[env]
+WRKFLW_FRESH_WORKSPACE = "1"

@@ -6,7 +6,7 @@ use crate::models::{ExecutionResultMsg, QueuedExecution, Workflow, WorkflowStatu
 use crate::selection;
 use crate::utils::load_workflows;
 use crate::views::{
-    render_ui, TAB_COUNT, TAB_DAG, TAB_EXECUTION, TAB_HELP, TAB_LOGS, TAB_RUNS, TAB_SECRETS,
+    render_ui, tab_of, TAB_COUNT, TAB_DAG, TAB_EXECUTION, TAB_LOGS, TAB_RUNS, TAB_SECRETS,
     TAB_TRIGGER, TAB_WORKFLOWS,
 };
 use crossterm::{
@@ -80,6 +80,7 @@ pub async fn run_wrkflw_tui(
         platform_overrides.clone(),
         kubernetes.clone(),
     );
+    app.show_debug_logs = verbose;
 
     if app.validation_mode {
         wrkflw_logging::info("Starting in validation mode");
@@ -143,6 +144,9 @@ pub async fn run_wrkflw_tui(
             .flat_map(|dir| load_workflows(dir))
             .collect();
     }
+
+    // History feeds the Workflows preview's "last run" line.
+    app.refresh_runs();
 
     // Run the main event loop
     let tx_clone = tx.clone();
@@ -296,10 +300,13 @@ fn run_tui_event_loop(
             last_tick = Instant::now();
         }
 
+        // Timeline first: a run sends its last events before its result.
+        app.drain_timeline();
+
         // Non-blocking check for execution results
         if let Ok((workflow_idx, result)) = rx.try_recv() {
-            app.process_execution_result(workflow_idx, result);
-            app.current_execution = None;
+            app.finish_execution(workflow_idx, result);
+            app.refresh_runs();
 
             // Get next workflow to execute using our helper function
             start_next_workflow_execution(app, tx_clone, verbose);
@@ -409,6 +416,22 @@ fn run_tui_event_loop(
                     (KeyCode::PageDown, TAB_LOGS) => app.scroll_logs_by(20),
                     (KeyCode::Home, TAB_LOGS) => app.scroll_logs_to_start(),
                     (KeyCode::End, TAB_LOGS) => app.scroll_logs_to_end(),
+                    (KeyCode::Home | KeyCode::End, TAB_WORKFLOWS | TAB_DAG)
+                        if !app.job_selection_mode =>
+                    {
+                        app.jump_workflow(key.code == KeyCode::End);
+                        app.dag_scroll = 0;
+                    }
+                    (KeyCode::Home | KeyCode::End, TAB_EXECUTION) if !app.inspecting_output() => {
+                        if app.detailed_view {
+                            app.jump_step(key.code == KeyCode::End);
+                        } else {
+                            app.jump_job(key.code == KeyCode::End);
+                        }
+                    }
+                    (KeyCode::Home | KeyCode::End, TAB_RUNS) => {
+                        app.jump_run(key.code == KeyCode::End)
+                    }
                     // Step output only scrolls on the inspector's Output
                     // sub-tab, where rendering clamps it to the text.
                     (KeyCode::PageUp, TAB_EXECUTION) if app.inspecting_output() => {
@@ -422,12 +445,6 @@ fn run_tui_event_loop(
                     }
                     (KeyCode::End, TAB_EXECUTION) if app.inspecting_output() => {
                         app.step_output_scroll = 0
-                    }
-                    (KeyCode::PageUp, TAB_HELP) => {
-                        app.help_scroll = app.help_scroll.saturating_sub(10)
-                    }
-                    (KeyCode::PageDown, TAB_HELP) => {
-                        app.help_scroll = app.help_scroll.saturating_add(10)
                     }
                     (KeyCode::Left, TAB_DAG) => app.dag_scroll = app.dag_scroll.saturating_sub(1),
                     (KeyCode::Right, TAB_DAG) => app.dag_scroll = app.dag_scroll.saturating_add(1),
@@ -466,7 +483,7 @@ fn run_tui_event_loop(
                             // only way out was Esc.
                             app.trigger_tab_next_field();
                         } else {
-                            app.switch_tab((app.selected_tab + 1) % TAB_COUNT);
+                            app.open_tab((tab_of(app.selected_tab) + 1) % TAB_COUNT);
                         }
                     }
                     KeyCode::BackTab => {
@@ -476,17 +493,17 @@ fn run_tui_event_loop(
                         } else if app.selected_tab == TAB_TRIGGER && app.trigger_editing() {
                             app.trigger_tab_prev_field();
                         } else {
-                            app.switch_tab((app.selected_tab + TAB_COUNT - 1) % TAB_COUNT);
+                            app.open_tab((tab_of(app.selected_tab) + TAB_COUNT - 1) % TAB_COUNT);
                         }
                     }
-                    KeyCode::Char('1') | KeyCode::Char('w') => app.switch_tab(TAB_WORKFLOWS),
-                    KeyCode::Char('2') | KeyCode::Char('x') => app.switch_tab(TAB_EXECUTION),
-                    KeyCode::Char('3') => app.switch_tab(TAB_DAG),
-                    KeyCode::Char('4') | KeyCode::Char('l') => app.switch_tab(TAB_LOGS),
-                    KeyCode::Char('5') => app.switch_tab(TAB_TRIGGER),
-                    KeyCode::Char('6') => app.switch_tab(TAB_SECRETS),
-                    KeyCode::Char('7') => app.switch_tab(TAB_RUNS),
-                    KeyCode::Char('8') | KeyCode::Char('h') => app.switch_tab(TAB_HELP),
+                    KeyCode::Char(c @ '1'..='9') if (c as usize - '1' as usize) < TAB_COUNT => {
+                        app.open_tab(c as usize - '1' as usize)
+                    }
+                    KeyCode::Char('w') => app.switch_tab(TAB_WORKFLOWS),
+                    // The Run tab's three views: jobs, graph, log.
+                    KeyCode::Char('x') => app.switch_tab(TAB_EXECUTION),
+                    KeyCode::Char('l') => app.switch_tab(TAB_LOGS),
+                    KeyCode::Char('h') => app.show_help = true,
                     KeyCode::Char(',') => {
                         // `,` toggles the Tweaks overlay anywhere (global).
                         // Chosen because it never conflicts with our single-
@@ -512,7 +529,7 @@ fn run_tui_event_loop(
                             }
                         }
                         TAB_LOGS => {
-                            if !app.log_search_matches.is_empty() {
+                            if !app.log_story && !app.log_search_matches.is_empty() {
                                 app.previous_search_match();
                             } else {
                                 app.scroll_logs_up();
@@ -524,7 +541,6 @@ fn run_tui_event_loop(
                         }
                         TAB_TRIGGER => app.trigger_tab_prev_workflow(),
                         TAB_SECRETS => app.secrets_tab_prev(),
-                        TAB_HELP => app.scroll_help_up(),
                         TAB_RUNS => app.select_previous_run(),
                         _ => {}
                     },
@@ -544,7 +560,7 @@ fn run_tui_event_loop(
                             }
                         }
                         TAB_LOGS => {
-                            if !app.log_search_matches.is_empty() {
+                            if !app.log_story && !app.log_search_matches.is_empty() {
                                 app.next_search_match();
                             } else {
                                 app.scroll_logs_down();
@@ -556,7 +572,6 @@ fn run_tui_event_loop(
                         }
                         TAB_TRIGGER => app.trigger_tab_next_workflow(),
                         TAB_SECRETS => app.secrets_tab_next(),
-                        TAB_HELP => app.scroll_help_down(),
                         TAB_RUNS => app.select_next_run(),
                         _ => {}
                     },
@@ -581,13 +596,8 @@ fn run_tui_event_loop(
                                         }
                                     } else {
                                         // Run the selected workflow directly
-                                        if let Some(idx) = app.workflow_list_state.selected() {
-                                            if idx < app.workflows.len() {
-                                                app.workflows[idx].selected = true;
-                                                app.queue_selected_for_execution();
-                                                app.start_execution();
-                                            }
-                                        }
+                                        app.queue_cursor_for_execution();
+                                        app.start_execution();
                                     }
                                 }
                             }
@@ -624,8 +634,9 @@ fn run_tui_event_loop(
                             && !app.job_selection_mode
                             && app.selected_tab == TAB_WORKFLOWS
                         {
-                            // Plain `r` queues the selected workflow
-                            // for execution — a Workflows-tab action.
+                            // Plain `r` runs every checked workflow,
+                            // or the highlighted one when none are
+                            // checked — a Workflows-tab action.
                             // Gate on the active tab so `r` typed on
                             // the DAG/Trigger/Secrets tabs doesn't
                             // silently mutate queue state behind the
@@ -690,7 +701,10 @@ fn run_tui_event_loop(
                         }
                     }
                     KeyCode::Char('n') => {
+                        // Matches are in the raw log, so `n` shows it, as
+                        // `s` and `f` do.
                         if app.selected_tab == TAB_LOGS && !app.log_search_query.is_empty() {
+                            app.log_story = false;
                             app.next_search_match();
                         } else if app.selected_tab == TAB_WORKFLOWS && !app.running {
                             // Deselect all workflows
@@ -785,12 +799,20 @@ fn run_tui_event_loop(
                     }
                     KeyCode::Char('s') => {
                         if app.selected_tab == TAB_LOGS {
+                            // Search reads the raw log.
+                            app.log_story = false;
                             app.toggle_log_search();
                         }
                     }
                     KeyCode::Char('f') => {
                         if app.selected_tab == TAB_LOGS {
+                            app.log_story = false;
                             app.toggle_log_filter();
+                        }
+                    }
+                    KeyCode::Char('o') => {
+                        if app.selected_tab == TAB_LOGS {
+                            app.log_story = !app.log_story;
                         }
                     }
                     KeyCode::Char('c') => {
@@ -804,15 +826,17 @@ fn run_tui_event_loop(
                             // terminals vary too widely; a log line is
                             // honest.
                             app.trigger_tab_copy_curl();
+                            // It lands in the raw log; show that there.
+                            app.log_story = false;
                         }
                     }
                     KeyCode::Char('g') => {
                         if app.selected_tab == TAB_DAG {
-                            // Toggle DAG tab between graph and list view —
-                            // matches the design's `g` shortcut on
-                            // screen 4.
+                            // A second `g` flips the graph to a list.
                             app.dag_list_view = !app.dag_list_view;
                             app.dag_scroll = 0;
+                        } else {
+                            app.switch_tab(TAB_DAG);
                         }
                     }
                     KeyCode::Char('p') => {

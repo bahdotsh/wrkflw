@@ -217,7 +217,7 @@ pub(crate) fn rebase_working_dir_or_error(
                     ))
                 })?;
             }
-            wrkflw_logging::info(&format!(
+            wrkflw_logging::debug(&format!(
                 "{}: rebased container path '{}' to host path '{}' via volume mount",
                 runtime_label,
                 working_dir.display(),

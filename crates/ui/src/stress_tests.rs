@@ -7,7 +7,7 @@ use crate::models::{
     JobExecution, StepExecution, TriggerMatchStatus, Workflow, WorkflowExecution, WorkflowStatus,
 };
 use crate::theme;
-use crate::views::{self, TAB_COUNT, TAB_EXECUTION, TAB_WORKFLOWS};
+use crate::views::{self, SCREEN_COUNT, TAB_EXECUTION, TAB_WORKFLOWS};
 use ratatui::{backend::TestBackend, text::Span, Terminal};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -104,7 +104,68 @@ fn execution(jobs: usize, steps: usize) -> WorkflowExecution {
         start_time: chrono::Local::now() - chrono::Duration::seconds(3725),
         end_time: None,
         progress: 0.42,
+        timeline: timeline(jobs, steps),
+        live: live_tails(jobs),
     }
+}
+
+/// A story with every kind of entry: finished, failed with a tail, folded
+/// matrix legs, and jobs still running (or, once settled, never finished).
+fn timeline(jobs: usize, steps: usize) -> Vec<crate::models::TimelineEntry> {
+    use crate::models::TimelineEntry as T;
+    let mut out = Vec::new();
+    for j in 0..jobs {
+        let job = format!("{} {j}", NASTY[j % NASTY.len()]);
+        out.push(T::JobStarted {
+            job: job.clone(),
+            canonical_name: format!("job_{j}_with_a_long_name"),
+        });
+        for s in 0..steps {
+            out.push(T::StepFinished {
+                job: job.clone(),
+                step: format!("{} step {s}", NASTY[s % NASTY.len()]),
+                status: [
+                    StepStatus::Success,
+                    StepStatus::Failure,
+                    StepStatus::Skipped,
+                ][s % 3],
+                exit_code: Some((s % 3) as i32),
+                duration_ms: (s as u64) * 1_234_567,
+                tail: (0..crate::models::TIMELINE_FAILURE_TAIL)
+                    .map(|l| format!("\x1b[31m{}\x1b[0m {l}", NASTY[l % NASTY.len()]))
+                    .collect(),
+            });
+        }
+        // Every third job is still running.
+        if j % 3 != 2 {
+            out.push(T::JobFinished {
+                job,
+                status: [JobStatus::Success, JobStatus::Failure, JobStatus::Skipped][j % 3].clone(),
+                failure_allowed: j % 4 == 0,
+                duration_ms: u64::MAX / (j as u64 + 1),
+                repeated_from: (j % 5 == 1).then(|| NASTY[j % NASTY.len()].repeat(20)),
+            });
+        }
+    }
+    out
+}
+
+fn live_tails(jobs: usize) -> crate::models::LiveTails {
+    let mut live = crate::models::LiveTails::default();
+    for j in 0..jobs {
+        live.push(
+            &format!("{} {j}", NASTY[j % NASTY.len()]),
+            j,
+            NASTY[j % NASTY.len()],
+            (0..40)
+                .map(|l| format!("live {l}\t\x1b[32m{}\x1b[0m", NASTY[l % NASTY.len()]))
+                .collect(),
+        );
+        if j % 2 == 0 {
+            live.finish(&format!("{} {j}", NASTY[j % NASTY.len()]));
+        }
+    }
+    live
 }
 
 fn app(workflows: usize, dir: &std::path::Path) -> App {
@@ -218,6 +279,19 @@ fn scenarios() -> Vec<Scenario> {
             a.dag_list_view = true;
             a.validation_mode = true;
         }),
+        ("raw log", |a| a.log_story = false),
+        ("settled run", |a| {
+            let end = chrono::Local::now();
+            for workflow in &mut a.workflows {
+                if let Some(exec) = workflow.execution_details.as_mut() {
+                    exec.end_time = Some(end);
+                }
+            }
+        }),
+        ("story scrolled far", |a| {
+            a.story_follow = false;
+            a.story_scroll = usize::MAX / 2;
+        }),
         ("no workflows", |a| {
             a.workflows.clear();
             a.processed_logs.clear();
@@ -246,7 +320,7 @@ fn every_screen_renders_at_every_size_without_panicking() {
             if a.current_execution.is_none() {
                 a.current_execution = Some(count.min(2) - 1);
             }
-            for tab in 0..TAB_COUNT {
+            for tab in 0..SCREEN_COUNT {
                 let views: &[(bool, usize)] = if tab == TAB_EXECUTION {
                     &[(false, 0), (true, 0), (true, 1)]
                 } else {
@@ -365,7 +439,7 @@ fn dump_screens() {
         if only.as_deref().is_some_and(|o| o != name) {
             continue;
         }
-        for tab in 0..TAB_COUNT {
+        for tab in 0..SCREEN_COUNT {
             let subs: &[(bool, usize)] = if tab == TAB_EXECUTION {
                 &[(false, 0), (true, 0), (true, 1)]
             } else {

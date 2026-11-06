@@ -12,7 +12,7 @@ use ratatui::{
 };
 use wrkflw_runs::{RunRecord, RunStatus};
 
-fn status_glyph(status: RunStatus) -> (&'static str, ratatui::style::Color) {
+pub(crate) fn status_glyph(status: RunStatus) -> (&'static str, ratatui::style::Color) {
     match status {
         RunStatus::Success => (theme::symbols::SUCCESS, COLORS.success),
         RunStatus::Failure => (theme::symbols::FAILURE, COLORS.error),
@@ -33,7 +33,7 @@ fn text_status(status: &str) -> (&'static str, ratatui::style::Color) {
     }
 }
 
-fn when(started_at: &str) -> String {
+pub(crate) fn when(started_at: &str) -> String {
     chrono::DateTime::parse_from_rfc3339(started_at)
         .map(|t| {
             let local = t.with_timezone(&chrono::Local);
@@ -46,15 +46,10 @@ fn when(started_at: &str) -> String {
         .unwrap_or_default()
 }
 
-fn duration(ms: Option<u64>) -> String {
-    ms.map(|ms| {
-        if ms < 1000 {
-            format!("{ms}ms")
-        } else {
-            super::execution_tab::format_duration((ms / 1000) as i64)
-        }
-    })
-    .unwrap_or_default()
+/// A recorded duration, formatted as the live views format it, so a job
+/// reads the same in History as in the Run tab.
+pub(crate) fn duration(ms: Option<u64>) -> String {
+    ms.map(super::execution_tab::format_ms).unwrap_or_default()
 }
 
 fn run_row(run: &RunRecord, w: usize, selected: bool) -> Line<'static> {
@@ -201,10 +196,7 @@ pub fn render_runs_tab(f: &mut Frame<'_>, app: &mut App, area: Rect) {
             .split(area)
     };
 
-    let list_block = theme::with_badge(
-        theme::block_focused("Run history"),
-        app.runs.len().to_string(),
-    );
+    let list_block = theme::with_badge(theme::block_focused("Runs"), app.runs.len().to_string());
     let inner = list_block.inner(panes[0]);
     f.render_widget(list_block, panes[0]);
     if app.runs.is_empty() {

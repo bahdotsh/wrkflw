@@ -1,5 +1,6 @@
-// Dashboard layout — workflows table on the left, preview / trigger filter /
-// quick actions on the right. Mirrors `DashboardScreen` from the design.
+// Workflows — the list on the left, the selected workflow's preview on
+// the right. Key hints live in the status bar, so the screen itself only
+// shows the workflows.
 use crate::app::App;
 use crate::models::TriggerMatchStatus;
 use crate::text;
@@ -66,26 +67,24 @@ fn render_workflow_list(f: &mut Frame<'_>, app: &mut App, area: Rect) {
 
     let show_trigger =
         app.diff_filter_active || app.workflows.iter().any(|w| w.trigger_match.is_some());
+    // Checkboxes only appear once something is ticked; until then they
+    // are noise beside every row.
+    let show_checkbox = selected_count > 0;
     // Fixed columns: mark(2) checkbox(3) status(1) trigger(1) jobs(6),
     // plus one cell of spacing between each.
-    let fixed = 2 + 3 + 1 + 6 + 4 + if show_trigger { 2 } else { 0 };
-    let flexible = (inner.width as usize).saturating_sub(fixed);
-    let show_path = flexible >= 40;
-    let (name_w, path_w) = if show_path {
-        let name_w = (flexible * 45 / 100).clamp(16, 48);
-        (name_w, flexible.saturating_sub(name_w + 1))
-    } else {
-        (flexible, 0)
-    };
+    let fixed =
+        2 + 1 + 6 + 2 + if show_checkbox { 4 } else { 0 } + if show_trigger { 2 } else { 0 };
+    let name_w = (inner.width as usize).saturating_sub(fixed);
 
-    let mut header_cells = vec!["", ""];
+    let mut header_cells = Vec::new();
+    if show_checkbox {
+        header_cells.push("");
+    }
+    header_cells.push("");
     if show_trigger {
         header_cells.push("");
     }
     header_cells.push("NAME");
-    if show_path {
-        header_cells.push("PATH");
-    }
     header_cells.push("  JOBS");
     let header = Row::new(
         header_cells
@@ -106,10 +105,11 @@ fn render_workflow_list(f: &mut Frame<'_>, app: &mut App, area: Rect) {
             };
             let (status_symbol, status_style) =
                 theme::workflow_status_animated(&workflow.status, spinner_frame);
-            let mut cells = vec![
-                Cell::from(checkbox).style(Style::default().fg(checkbox_color)),
-                Cell::from(status_symbol).style(status_style),
-            ];
+            let mut cells = Vec::new();
+            if show_checkbox {
+                cells.push(Cell::from(checkbox).style(Style::default().fg(checkbox_color)));
+            }
+            cells.push(Cell::from(status_symbol).style(status_style));
             if show_trigger {
                 let (sym, style) = match &workflow.trigger_match {
                     Some(TriggerMatchStatus::Matched(_)) => {
@@ -129,13 +129,6 @@ fn render_workflow_list(f: &mut Frame<'_>, app: &mut App, area: Rect) {
                 Cell::from(text::truncate(&text::sanitize(&workflow.name), name_w).into_owned())
                     .style(name_style),
             );
-            if show_path {
-                let path = workflow.path.to_string_lossy();
-                cells.push(
-                    Cell::from(text::truncate_left(&text::sanitize(&path), path_w).into_owned())
-                        .style(theme::muted_style()),
-                );
-            }
             // Unparseable files show a red ✖ instead of a misleading 0.
             let (jobs, jobs_style) = if workflow.definition.is_none() {
                 (
@@ -150,14 +143,15 @@ fn render_workflow_list(f: &mut Frame<'_>, app: &mut App, area: Rect) {
         })
         .collect();
 
-    let mut widths = vec![Constraint::Length(3), Constraint::Length(1)];
+    let mut widths = Vec::new();
+    if show_checkbox {
+        widths.push(Constraint::Length(3));
+    }
+    widths.push(Constraint::Length(1));
     if show_trigger {
         widths.push(Constraint::Length(1));
     }
     widths.push(Constraint::Length(name_w as u16));
-    if show_path {
-        widths.push(Constraint::Length(path_w as u16));
-    }
     widths.push(Constraint::Length(6));
 
     let total = rows.len();
@@ -182,20 +176,19 @@ fn render_workflow_list(f: &mut Frame<'_>, app: &mut App, area: Rect) {
 }
 
 fn render_right_column(f: &mut Frame<'_>, app: &App, area: Rect) {
-    let show_actions = area.height >= 30;
+    // The diff filter only takes room while it is on; `d` in the key bar
+    // is how it gets turned on.
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(6),
-            Constraint::Length(5),
-            Constraint::Length(if show_actions { 8 } else { 0 }),
+            Constraint::Length(if app.diff_filter_active { 4 } else { 0 }),
         ])
         .split(area);
 
     render_preview(f, app, chunks[0]);
-    render_trigger_filter(f, app, chunks[1]);
-    if show_actions {
-        render_quick_actions(f, chunks[2]);
+    if app.diff_filter_active {
+        render_trigger_filter(f, app, chunks[1]);
     }
 }
 
@@ -249,6 +242,14 @@ fn render_preview(f: &mut Frame<'_>, app: &App, area: Rect) {
                 Style::default().fg(COLORS.text_dim),
             ),
         ]));
+        let path = wf.path.to_string_lossy();
+        lines.push(Line::from(vec![
+            label("file"),
+            Span::styled(
+                text::truncate_left(&text::sanitize(&path), w.saturating_sub(6)).into_owned(),
+                theme::muted_style(),
+            ),
+        ]));
 
         let mut badges: Vec<Span> = Vec::new();
         let needs_count = def
@@ -283,6 +284,16 @@ fn render_preview(f: &mut Frame<'_>, app: &App, area: Rect) {
         }
         if !badges.is_empty() && text::spans_width(&badges) <= w {
             lines.push(Line::from(badges));
+        }
+
+        if let Some(run) = app
+            .workflow_list_state
+            .selected()
+            .and_then(|i| app.last_run(i))
+        {
+            lines.push(Line::from(""));
+            lines.push(theme::section("Last run"));
+            lines.push(last_run_line(run, w));
         }
 
         let levels = crate::components::dag::topo_levels(def);
@@ -349,7 +360,7 @@ fn render_preview(f: &mut Frame<'_>, app: &App, area: Rect) {
 }
 
 fn render_trigger_filter(f: &mut Frame<'_>, app: &App, area: Rect) {
-    let block = theme::block_focused("Trigger filter");
+    let block = theme::block_focused("Diff filter");
     let inner_area = block.inner(area);
     f.render_widget(block, area);
 
@@ -389,48 +400,7 @@ fn render_trigger_filter(f: &mut Frame<'_>, app: &App, area: Rect) {
             ]),
         ];
         f.render_widget(Paragraph::new(lines), inner_area);
-    } else {
-        let lines = vec![
-            Line::from(Span::styled(
-                "diff filter disabled",
-                Style::default().fg(COLORS.text_muted),
-            )),
-            Line::from(vec![
-                Span::styled("press ", Style::default().fg(COLORS.text_dim)),
-                theme::key_chip("d"),
-                Span::styled(" to enable", Style::default().fg(COLORS.text_dim)),
-            ]),
-        ];
-        f.render_widget(Paragraph::new(lines), inner_area);
     }
-}
-
-fn render_quick_actions(f: &mut Frame<'_>, area: Rect) {
-    let block = theme::block("Quick actions");
-    let inner_area = block.inner(area);
-    f.render_widget(block, area);
-
-    let actions = [
-        ("r", "Run selected", BadgeKind::Success),
-        ("v", "Validate only", BadgeKind::Info),
-        ("t", "Trigger remote", BadgeKind::Trigger),
-        ("e", "Cycle runtime", BadgeKind::Warning),
-        ("d", "Toggle diff filter", BadgeKind::Accent),
-        ("?", "Help", BadgeKind::Dim),
-    ];
-
-    let lines: Vec<Line> = actions
-        .iter()
-        .map(|(k, label, kind)| {
-            Line::from(vec![
-                theme::key_chip(*k),
-                Span::raw(" "),
-                Span::styled(label.to_string(), Style::default().fg(kind.fg())),
-            ])
-        })
-        .collect();
-
-    f.render_widget(Paragraph::new(lines), inner_area);
 }
 
 fn render_job_selection(f: &mut Frame<'_>, app: &mut App, area: Rect) {
@@ -474,4 +444,40 @@ fn render_job_selection(f: &mut Frame<'_>, app: &mut App, area: Rect) {
         .with_selected(Some(app.selected_job_index.min(total.saturating_sub(1))));
     f.render_stateful_widget(jobs_table, area, &mut table_state);
     theme::scrollbar(f, area, total, table_state.offset(), inner.height as usize);
+}
+
+/// One line about a recorded run: outcome, when, how long, and the first
+/// job that failed.
+fn last_run_line(run: &wrkflw_runs::RunRecord, w: usize) -> Line<'static> {
+    use crate::views::runs_tab::{duration, status_glyph, when};
+    let (glyph, color) = status_glyph(run.status);
+    let mut spans = vec![
+        Span::styled(format!("{glyph} "), Style::default().fg(color)),
+        Span::styled(
+            run.status.as_str().to_string(),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
+    ];
+    let mut facts = vec![when(&run.started_at)];
+    let took = duration(run.duration_ms);
+    if !took.is_empty() {
+        facts.push(took);
+    }
+    if let Some(job) = run
+        .jobs
+        .iter()
+        .find(|j| j.status == "failure" && !j.failure_allowed)
+    {
+        facts.push(format!("in {}", job.name));
+    }
+    for fact in facts.into_iter().filter(|f| !f.is_empty()) {
+        spans.push(Span::styled(" · ", theme::muted_style()));
+        spans.push(Span::styled(fact, Style::default().fg(COLORS.text_dim)));
+    }
+    let mut fitted = text::fit_spans(spans, w);
+    // Drop the padding: the line sits in a paragraph, not a column.
+    if fitted.last().is_some_and(|s| s.content.trim().is_empty()) {
+        fitted.pop();
+    }
+    Line::from(fitted)
 }

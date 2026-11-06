@@ -23,6 +23,14 @@ pub enum ExecutionEvent {
         step: String,
         index: usize,
     },
+    /// What a running step printed since the last of these, as whole lines.
+    /// `StepFinished` still carries the step's full output.
+    StepOutput {
+        job: String,
+        step: String,
+        index: usize,
+        lines: Vec<String>,
+    },
     StepFinished {
         job: String,
         step: String,
@@ -45,12 +53,22 @@ pub enum ExecutionEvent {
         failure_allowed: bool,
         duration_ms: u64,
         logs: String,
+        /// Set when this matrix leg did not run because it would only have
+        /// repeated the named leg; `status` is that leg's.
+        repeated_from: Option<String>,
     },
 }
 
 /// Receives events on the executor's task, so it must not block for long.
 pub trait ExecutionObserver: Send + Sync {
     fn on_event(&self, event: &ExecutionEvent);
+
+    /// Whether this observer wants [`ExecutionEvent::StepOutput`]. Live
+    /// output costs work per line, so a run only streams it when some
+    /// observer asks; `StepFinished` carries the full output either way.
+    fn wants_step_output(&self) -> bool {
+        false
+    }
 }
 
 /// How step output begins in a report: these lines separate what wrkflw
@@ -125,6 +143,22 @@ pub(crate) fn emit(build: impl FnOnce() -> ExecutionEvent) {
             observer.on_event(&event);
         }
     });
+}
+
+/// The active observers that want live step output, for code that reports
+/// from outside the run's task (a runtime reading output on its own
+/// thread). Empty outside a run.
+pub(crate) fn step_output_observers() -> Vec<Arc<dyn ExecutionObserver>> {
+    HOOKS
+        .try_with(|hooks| {
+            hooks
+                .observers
+                .iter()
+                .filter(|observer| observer.wants_step_output())
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// The index `--from-step` starts `job` at, or 0 when it doesn't apply.

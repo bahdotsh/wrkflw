@@ -99,7 +99,7 @@ fn session_from(get: impl Fn(&str) -> Option<String>) -> Option<String> {
     get(env::CLAUDE_CODE_SESSION).or_else(|| get(env::CODEX_THREAD))
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct RunOptions {
     pub meta: RunMeta,
     /// Write NDJSON events to stdout.
@@ -107,6 +107,21 @@ pub struct RunOptions {
     /// Keep a history record. Also subject to `WRKFLW_NO_HISTORY`.
     pub record: bool,
     pub from_step: Option<FromStep>,
+    /// Also receive the run's events, after the recorder. The TUI uses this
+    /// to tell the run as it happens.
+    pub observers: Vec<Arc<dyn ExecutionObserver>>,
+}
+
+impl std::fmt::Debug for RunOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RunOptions")
+            .field("meta", &self.meta)
+            .field("ndjson", &self.ndjson)
+            .field("record", &self.record)
+            .field("from_step", &self.from_step)
+            .field("observers", &self.observers.len())
+            .finish()
+    }
 }
 
 pub struct RecordedRun {
@@ -266,6 +281,7 @@ impl Recorder {
                 duration_ms: None,
                 log: None,
                 steps: Vec::new(),
+                repeated_from: None,
             });
             record.jobs.len() - 1
         });
@@ -332,7 +348,13 @@ impl Recorder {
 
 impl ExecutionObserver for Recorder {
     fn on_event(&self, event: &ExecutionEvent) {
-        self.line(event_json(event));
+        // Live output stays out of the record and the event stream: the
+        // step's finish event carries all of it. The recorder doesn't ask
+        // for it, but another observer may have.
+        let Some(line) = event_json(event) else {
+            return;
+        };
+        self.line(line);
         let mut record = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let id = record.id.clone();
         match event {
@@ -343,7 +365,7 @@ impl ExecutionObserver for Recorder {
                 Self::job_mut(&mut record, job, canonical_name);
                 self.persist(&record);
             }
-            ExecutionEvent::StepStarted { .. } => {}
+            ExecutionEvent::StepStarted { .. } | ExecutionEvent::StepOutput { .. } => {}
             ExecutionEvent::StepFinished {
                 job,
                 step,
@@ -381,6 +403,7 @@ impl ExecutionObserver for Recorder {
                 failure_allowed,
                 duration_ms,
                 logs,
+                repeated_from,
             } => {
                 let relative = format!("logs/{}/job.log", job_dir(job));
                 let log = self.write_log(&id, &relative, logs);
@@ -389,6 +412,7 @@ impl ExecutionObserver for Recorder {
                 entry.failure_allowed = *failure_allowed;
                 entry.duration_ms = Some(*duration_ms);
                 entry.log = log;
+                entry.repeated_from = repeated_from.clone();
                 self.persist(&record);
             }
         }
@@ -403,8 +427,9 @@ pub fn emit_line(value: &Value) {
     let _ = lock.flush();
 }
 
-fn event_json(event: &ExecutionEvent) -> Value {
-    match event {
+/// The NDJSON line for `event`, or `None` for events the stream leaves out.
+fn event_json(event: &ExecutionEvent) -> Option<Value> {
+    let line = match event {
         ExecutionEvent::JobStarted {
             job,
             canonical_name,
@@ -412,6 +437,7 @@ fn event_json(event: &ExecutionEvent) -> Value {
         ExecutionEvent::StepStarted { job, step, index } => {
             json!({"type": "step_started", "job": job, "step": step, "index": index})
         }
+        ExecutionEvent::StepOutput { .. } => return None,
         ExecutionEvent::StepFinished {
             job,
             step,
@@ -444,15 +470,24 @@ fn event_json(event: &ExecutionEvent) -> Value {
             status,
             failure_allowed,
             duration_ms,
+            repeated_from,
             ..
-        } => json!({
-            "type": "job_finished",
-            "job": job,
-            "status": status.to_string(),
-            "failure_allowed": failure_allowed,
-            "duration_ms": duration_ms,
-        }),
-    }
+        } => {
+            let mut line = json!({
+                "type": "job_finished",
+                "job": job,
+                "status": status.to_string(),
+                "failure_allowed": failure_allowed,
+                "duration_ms": duration_ms,
+            });
+            // Only on legs that didn't run, so other lines keep their shape.
+            if let Some(original) = repeated_from {
+                line["repeated_from"] = json!(original);
+            }
+            line
+        }
+    };
+    Some(line)
 }
 
 async fn begin(path: &Path, config: &ExecutionConfig, options: &RunOptions) -> Arc<Recorder> {
@@ -554,8 +589,10 @@ pub async fn execute_recorded(
     options: RunOptions,
 ) -> RecordedRun {
     let recorder = begin(path, &config, &options).await;
+    let mut observers: Vec<Arc<dyn ExecutionObserver>> = vec![recorder.clone()];
+    observers.extend(options.observers.iter().cloned());
     let hooks = RunHooks {
-        observers: vec![recorder.clone()],
+        observers,
         from_step: options.from_step.clone(),
     };
     let result = with_run_hooks(hooks, wrkflw_executor::execute_workflow(path, config)).await;
@@ -696,7 +733,7 @@ mod tests {
             canonical_name: "j".to_string(),
         };
         assert_eq!(
-            keys(&event_json(&started)),
+            keys(&event_json(&started).unwrap()),
             ["canonical_name", "job", "type"]
         );
 
@@ -705,7 +742,10 @@ mod tests {
             step: "s".to_string(),
             index: 0,
         };
-        assert_eq!(keys(&event_json(&step)), ["index", "job", "step", "type"]);
+        assert_eq!(
+            keys(&event_json(&step).unwrap()),
+            ["index", "job", "step", "type"]
+        );
 
         let finished = ExecutionEvent::StepFinished {
             job: "j".to_string(),
@@ -722,7 +762,7 @@ mod tests {
             env_set: Vec::new(),
         };
         assert_eq!(
-            keys(&event_json(&finished)),
+            keys(&event_json(&finished).unwrap()),
             [
                 "conclusion",
                 "duration_ms",
@@ -744,11 +784,31 @@ mod tests {
             failure_allowed: false,
             duration_ms: 1,
             logs: String::new(),
+            repeated_from: None,
         };
         assert_eq!(
-            keys(&event_json(&job)),
+            keys(&event_json(&job).unwrap()),
             ["duration_ms", "failure_allowed", "job", "status", "type"]
         );
+
+        let repeat = ExecutionEvent::JobFinished {
+            job: "j (os: b)".to_string(),
+            status: JobStatus::Success,
+            failure_allowed: false,
+            duration_ms: 0,
+            logs: String::new(),
+            repeated_from: Some("j (os: a)".to_string()),
+        };
+        let line = event_json(&repeat).unwrap();
+        assert_eq!(line["repeated_from"], "j (os: a)");
+
+        let output = ExecutionEvent::StepOutput {
+            job: "j".to_string(),
+            step: "s".to_string(),
+            index: 0,
+            lines: vec!["printed".to_string()],
+        };
+        assert!(event_json(&output).is_none(), "live output reached NDJSON");
     }
 
     #[test]

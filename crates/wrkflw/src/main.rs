@@ -117,6 +117,36 @@ struct Wrkflw {
     )]
     platform: Vec<Option<(String, String)>>,
 
+    /// Start every job in an empty workspace, as a hosted runner does.
+    /// By default each job keeps its workspace between runs, so files the
+    /// repository ignores (build output, dependencies) carry over and
+    /// rebuilds are incremental
+    #[arg(
+        long,
+        global = true,
+        env = "WRKFLW_FRESH_WORKSPACE",
+        action = clap::ArgAction::SetTrue,
+        // `=0`, `=no`, `=off`, `=false` and empty leave it off and anything
+        // else turns it on; the executor reads the variable the same way.
+        value_parser = clap::builder::FalseyValueParser::new()
+    )]
+    fresh_workspace: bool,
+
+    /// Run every matrix leg. By default a leg that would only repeat another
+    /// (same image, and the job reads nothing else that differs, as with
+    /// `runs-on: ${{ matrix.os }}` run locally) is reported with that leg's
+    /// result instead
+    #[arg(
+        long,
+        global = true,
+        env = "WRKFLW_EVERY_MATRIX_LEG",
+        action = clap::ArgAction::SetTrue,
+        // `=0`, `=no`, `=off`, `=false` and empty leave it off and anything
+        // else turns it on; the executor reads the variable the same way.
+        value_parser = clap::builder::FalseyValueParser::new()
+    )]
+    every_matrix_leg: bool,
+
     #[command(flatten)]
     kubernetes: KubernetesArgs,
 }
@@ -632,6 +662,10 @@ enum Commands {
         no_strict_filter: bool,
     },
 
+    /// Remove the job workspaces kept between runs, except ones a run is
+    /// using. Each job starts from an empty workspace once afterwards
+    Clean,
+
     /// Inspect and replay recorded runs
     Runs {
         #[command(subcommand)]
@@ -954,6 +988,8 @@ async fn run_cli() {
 
     let platform_overrides = collect_platform_overrides(&cli.platform);
     let kubernetes = cli.kubernetes.to_config();
+    wrkflw_executor::run_options::set_fresh_workspaces(cli.fresh_workspace);
+    wrkflw_executor::run_options::set_every_matrix_leg(cli.every_matrix_leg);
 
     match &cli.command {
         Some(Commands::Validate {
@@ -1223,6 +1259,48 @@ async fn run_cli() {
                 std::process::exit(1);
             }
         }
+        Some(Commands::Clean) => match wrkflw_executor::workspace::clean() {
+            Ok(report) if format.is_json() => {
+                let failed: Vec<_> = report
+                    .failed
+                    .iter()
+                    .map(|(path, error)| serde_json::json!({"path": path, "error": error}))
+                    .collect();
+                wrkflw_runs::emit_line(&serde_json::json!({
+                    "removed": report.removed,
+                    "bytes": report.bytes,
+                    "in_use": report.in_use,
+                    "failed": failed,
+                }));
+                if !report.failed.is_empty() {
+                    std::process::exit(1);
+                }
+            }
+            Ok(report) => {
+                println!(
+                    "Removed {} job workspace(s), freeing {}.",
+                    report.removed,
+                    human_bytes(report.bytes)
+                );
+                if report.in_use > 0 {
+                    println!(
+                        "Left {} in use by a running workflow; run `wrkflw clean` again once \
+                         it finishes.",
+                        report.in_use
+                    );
+                }
+                for (path, error) in &report.failed {
+                    eprintln!("Could not remove {}: {}", path.display(), error);
+                }
+                if !report.failed.is_empty() {
+                    std::process::exit(1);
+                }
+            }
+            Err(e) => {
+                eprintln!("Failed to clean job workspaces: {}", e);
+                std::process::exit(1);
+            }
+        },
         Some(Commands::List { jobs }) => {
             if format.is_json() {
                 json_output::list();
@@ -1568,6 +1646,22 @@ fn list_workflows_and_pipelines(verbose: bool, show_jobs: bool) {
     }
 }
 
+/// `bytes` in the largest unit that keeps it at or above one, e.g. "1.4 GB".
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -1769,5 +1863,63 @@ mod tests {
     #[test]
     fn platform_flag_rejects_malformed_values() {
         assert!(Wrkflw::try_parse_from(["wrkflw", "-P", "no-equals"]).is_err());
+    }
+
+    #[test]
+    fn human_bytes_picks_a_readable_unit() {
+        assert_eq!(human_bytes(0), "0 B");
+        assert_eq!(human_bytes(1023), "1023 B");
+        assert_eq!(human_bytes(1536), "1.5 KB");
+        assert_eq!(human_bytes(3 * 1024 * 1024 * 1024), "3.0 GB");
+    }
+
+    #[test]
+    fn workspace_and_matrix_env_flags_accept_one_and_zero() {
+        // Parsing reads the process environment, so these assertions run
+        // under one test with the variables restored afterwards.
+        let saved: Vec<_> = ["WRKFLW_FRESH_WORKSPACE", "WRKFLW_EVERY_MATRIX_LEG"]
+            .into_iter()
+            .map(|name| (name, std::env::var_os(name)))
+            .collect();
+        let parse = || Wrkflw::try_parse_from(["wrkflw", "list"]).unwrap();
+        for (value, on) in [
+            ("1", true),
+            ("yes", true),
+            ("true", true),
+            ("on", true),
+            ("0", false),
+            ("false", false),
+            ("no", false),
+            ("No", false),
+            ("off", false),
+            ("n", false),
+            ("", false),
+        ] {
+            std::env::set_var("WRKFLW_FRESH_WORKSPACE", value);
+            std::env::set_var("WRKFLW_EVERY_MATRIX_LEG", value);
+            // The executor reads the same variables; it must agree.
+            assert_eq!(
+                wrkflw_executor::run_options::switch_is_on(value),
+                on,
+                "the executor reads {value:?} differently"
+            );
+            let cli = parse();
+            assert_eq!(cli.fresh_workspace, on, "WRKFLW_FRESH_WORKSPACE={value:?}");
+            assert_eq!(
+                cli.every_matrix_leg, on,
+                "WRKFLW_EVERY_MATRIX_LEG={value:?}"
+            );
+        }
+        for (name, value) in saved {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+        assert!(
+            Wrkflw::try_parse_from(["wrkflw", "--fresh-workspace", "list"])
+                .unwrap()
+                .fresh_workspace
+        );
     }
 }

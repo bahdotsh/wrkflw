@@ -10,16 +10,17 @@ use std::sync::{Arc, Mutex};
 // std::process::Command replaced by tokio::process::Command for async safety
 use thiserror::Error;
 
-use ignore::{gitignore::GitignoreBuilder, Match};
-
 use crate::acceleration;
 use crate::action_resolver;
+use crate::checkout_sync::copy_directory_contents;
 use crate::dependency;
 use crate::docker;
 use crate::environment;
 use crate::events::{step_display_name, EXIT_CODE_LABEL, STDERR_HEADER, STDOUT_HEADER};
 use crate::job_session;
 use crate::kubernetes::{self, KubernetesConfig};
+use crate::live_step::LiveStep;
+use crate::matrix_fold::{matrix_twins, repeated_leg};
 use crate::podman;
 use wrkflw_logging;
 use wrkflw_matrix::MatrixCombination;
@@ -62,7 +63,10 @@ pub async fn execute_workflow(
     .map_err(ExecutionError::Execution)?;
     acceleration::with_run_state(
         std::sync::Arc::new(state),
-        execute_github_workflow(workflow_path, config.clone()),
+        crate::workspace::with_workflow_file(
+            workflow_path,
+            Box::pin(execute_github_workflow(workflow_path, config.clone())),
+        ),
     )
     .await
 }
@@ -429,6 +433,10 @@ async fn execute_gitlab_pipeline(
     // `--variable` values are often credentials, and they are never stored
     // on purpose, so they can't be left to reach the step logs either.
     secret_masker.add_secrets(config.variables.values().cloned());
+    // The log masker is process-wide and permanent, so it only takes the
+    // variables that look like credentials; `BRANCH=main` must not turn
+    // every later "main" in the logs into `***`.
+    crate::log_redaction::register_variables(&config.variables);
 
     // Create artifact store for this pipeline run
     let artifact_store =
@@ -1123,6 +1131,7 @@ pub struct ExecutionResult {
     pub failure_details: Option<String>,
 }
 
+#[derive(Clone)]
 pub struct JobResult {
     pub name: String,
     /// The canonical job key from the workflow definition (e.g., "build").
@@ -1137,6 +1146,9 @@ pub struct JobResult {
     /// `continue-on-error` applies: a failure here doesn't fail the run or
     /// block dependent jobs, though the job is still reported as failed.
     pub failure_allowed: bool,
+    /// Set on a matrix leg that was not run because it would only have
+    /// repeated the named leg; `status` is that leg's.
+    pub repeated_from: Option<String>,
 }
 
 impl JobResult {
@@ -1160,11 +1172,12 @@ impl JobResult {
             logs: note.to_string(),
             outputs: stored.outputs,
             failure_allowed: false,
+            repeated_from: None,
         }
     }
 
     /// A job (or matrix combination) that never ran.
-    fn skipped(
+    pub(crate) fn skipped(
         name: impl Into<String>,
         canonical_name: impl Into<String>,
         logs: impl Into<String>,
@@ -1177,6 +1190,7 @@ impl JobResult {
             logs: logs.into(),
             outputs: HashMap::new(),
             failure_allowed: false,
+            repeated_from: None,
         }
     }
 
@@ -1201,6 +1215,7 @@ impl JobResult {
             logs: reason,
             outputs: HashMap::new(),
             failure_allowed: false,
+            repeated_from: None,
         }
     }
 }
@@ -2207,9 +2222,13 @@ fn generate_combined_dockerfile(runtimes: &[SetupRuntime], base_image: &str) -> 
         .map(|rt| rt.install_script.as_str())
         .collect();
 
+    // `build-essential` because hosted Ubuntu runners have a C toolchain,
+    // and Rust build scripts, node-gyp, Python C extensions and cgo all
+    // expect one.
     dockerfile.push_str("RUN apt-get update && \\\n");
     dockerfile.push_str(
-        "    apt-get install -y --no-install-recommends curl bash git ca-certificates gnupg",
+        "    apt-get install -y --no-install-recommends curl bash git ca-certificates gnupg \
+         build-essential",
     );
 
     for script in &scripts {
@@ -2612,6 +2631,9 @@ async fn execute_job_with_matrix(
             masker.add_secret(value);
         }
     }
+    // Runtimes log commands and environments through the global logger,
+    // which this job's values must not reach either.
+    crate::log_redaction::register_all(secrets_context.values());
 
     if !job.services.is_empty() && job_session::wanted_for(job, runtime).is_none() {
         wrkflw_logging::warning(&format!(
@@ -2781,6 +2803,7 @@ fn announce_reused(stored: &acceleration::StoredJob, note: &str) {
         failure_allowed: false,
         duration_ms: 0,
         logs: note.to_string(),
+        repeated_from: None,
     });
     wrkflw_logging::info(&format!(
         "{} Job '{}': {}",
@@ -2855,14 +2878,17 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
     // Parallel jobs must not share GITHUB_ENV, GITHUB_OUTPUT and friends.
     let _job_env_files = environment::isolate_github_environment_files(&mut job_env)?;
 
-    // Create a temporary directory for this job execution
-    let job_dir = tempfile::tempdir()
-        .map_err(|e| ExecutionError::Execution(format!("Failed to create job directory: {}", e)))?;
-
     // Get the current project directory
     let current_dir = std::env::current_dir().map_err(|e| {
         ExecutionError::Execution(format!("Failed to get current directory: {}", e))
     })?;
+
+    // The job's workspace, kept from its last run so builds are incremental.
+    let job_dir =
+        crate::workspace::JobWorkspace::acquire(&current_dir, &ctx.workflow.name, ctx.job_name)
+            .map_err(|e| {
+                ExecutionError::Execution(format!("Failed to create job directory: {}", e))
+            })?;
 
     wrkflw_logging::info(&format!("Executing job: {}", ctx.job_name));
 
@@ -2900,42 +2926,44 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
 
         let outcome = match tokio::time::timeout(
             remaining,
-            run_step_with_guards(
-                step,
-                idx,
-                &job_env,
-                ctx.workflow,
-                StepExecutionContext {
+            loop_state
+                .live_step(idx, step, ctx.services.secret_masker)
+                .run(Box::pin(run_step_with_guards(
                     step,
-                    step_idx: idx,
-                    job_env: &job_env,
-                    job_user_env: &job_user_env,
-                    working_dir: job_dir.path(),
-                    runtime: ctx.runtime,
-                    workflow: ctx.workflow,
-                    runner_image: &runner_image_value,
-                    verbose: ctx.verbose,
-                    matrix_combination: &None,
-                    container_config: job.container.as_ref(),
-                    workflow_defaults: ctx.workflow.defaults.as_ref(),
-                    job_defaults: job.defaults.as_ref(),
-                    step_outputs: &loop_state.step_outputs_map,
-                    step_statuses: &loop_state.step_status_map,
-                    job_status: &loop_state.job_status_str,
-                    services: JobServices {
-                        secret_manager: ctx.services.secret_manager,
-                        secret_masker: ctx.services.secret_masker,
-                        secrets_context: ctx.services.secrets_context,
-                        missing_secrets: ctx.services.missing_secrets,
-                        needs_context: ctx.services.needs_context,
-                        needs_results: ctx.services.needs_results,
-                        artifact_store: ctx.services.artifact_store,
-                        cache_store: ctx.services.cache_store,
-                        platform_overrides: ctx.services.platform_overrides,
+                    idx,
+                    &job_env,
+                    ctx.workflow,
+                    StepExecutionContext {
+                        step,
+                        step_idx: idx,
+                        job_env: &job_env,
+                        job_user_env: &job_user_env,
+                        working_dir: job_dir.path(),
+                        runtime: ctx.runtime,
+                        workflow: ctx.workflow,
+                        runner_image: &runner_image_value,
+                        verbose: ctx.verbose,
+                        matrix_combination: &None,
+                        container_config: job.container.as_ref(),
+                        workflow_defaults: ctx.workflow.defaults.as_ref(),
+                        job_defaults: job.defaults.as_ref(),
+                        step_outputs: &loop_state.step_outputs_map,
+                        step_statuses: &loop_state.step_status_map,
+                        job_status: &loop_state.job_status_str,
+                        services: JobServices {
+                            secret_manager: ctx.services.secret_manager,
+                            secret_masker: ctx.services.secret_masker,
+                            secrets_context: ctx.services.secrets_context,
+                            missing_secrets: ctx.services.missing_secrets,
+                            needs_context: ctx.services.needs_context,
+                            needs_results: ctx.services.needs_results,
+                            artifact_store: ctx.services.artifact_store,
+                            cache_store: ctx.services.cache_store,
+                            platform_overrides: ctx.services.platform_overrides,
+                        },
+                        pending_cache_saves: &pending_cache_saves,
                     },
-                    pending_cache_saves: &pending_cache_saves,
-                },
-            ),
+                ))),
         )
         .await
         {
@@ -2995,6 +3023,7 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
         logs: loop_state.job_logs,
         outputs: job_outputs,
         failure_allowed,
+        repeated_from: None,
     })
 }
 
@@ -3021,8 +3050,33 @@ async fn execute_matrix_combinations(
     let mut results = Vec::new();
     let mut any_failed = false;
 
+    // Legs that would only repeat another leg run once; they take the
+    // result of the leg they repeat once it is known.
+    let twins = matrix_twins(
+        ctx.job_template,
+        ctx.combinations,
+        ctx.services.platform_overrides,
+    );
+    let unique: Vec<&MatrixCombination> = ctx
+        .combinations
+        .iter()
+        .zip(&twins)
+        .filter(|(_, twin)| twin.is_none())
+        .map(|(combination, _)| combination)
+        .collect();
+    let repeats = ctx.combinations.len() - unique.len();
+    if repeats > 0 {
+        wrkflw_logging::info(&format!(
+            "Matrix job '{}': running {} of {} legs; the other {} would only repeat one of them",
+            ctx.job_name,
+            unique.len(),
+            ctx.combinations.len(),
+            repeats
+        ));
+    }
+
     // Process combinations in chunks limited by max_parallel
-    for chunk in ctx.combinations.chunks(ctx.max_parallel) {
+    for chunk in unique.chunks(ctx.max_parallel) {
         // Skip processing if fail-fast is enabled and a previous job failed
         if ctx.fail_fast && any_failed {
             // Add skipped results for remaining combinations
@@ -3086,13 +3140,51 @@ async fn execute_matrix_combinations(
                         logs: e.to_string(),
                         outputs: HashMap::new(),
                         failure_allowed: false,
+                        repeated_from: None,
                     });
                 }
             }
         }
     }
 
-    Ok(results)
+    if repeats == 0 {
+        return Ok(results);
+    }
+    // Back in matrix order, with each repeat taking its original's result.
+    // Every leg ran or was skipped by fail-fast, so each name has a result;
+    // one going missing is a bug to surface, not a leg to drop quietly.
+    let by_name: HashMap<String, JobResult> = results
+        .into_iter()
+        .map(|result| (result.name.clone(), result))
+        .collect();
+    let names: Vec<String> = ctx
+        .combinations
+        .iter()
+        .map(|c| wrkflw_matrix::format_combination_name(ctx.job_name, c))
+        .collect();
+    let missing = |name: &str| {
+        ExecutionError::Execution(format!(
+            "Matrix job '{}': leg '{}' finished without a result",
+            ctx.job_name, name
+        ))
+    };
+    let mut ordered = Vec::with_capacity(names.len());
+    for (i, name) in names.iter().enumerate() {
+        let source = twins[i].map_or(name, |original| &names[original]);
+        let result = by_name.get(source).ok_or_else(|| missing(source))?;
+        ordered.push(match twins[i] {
+            None => result.clone(),
+            Some(_) => {
+                let image = get_effective_runner_image(
+                    ctx.job_template,
+                    ctx.services.platform_overrides,
+                    Some(&ctx.combinations[i].values),
+                );
+                repeated_leg(name, result, &image)
+            }
+        });
+    }
+    Ok(ordered)
 }
 
 /// Execute a single matrix job combination
@@ -3171,14 +3263,17 @@ async fn execute_matrix_job(
     // Parallel matrix legs must not share GITHUB_ENV, GITHUB_OUTPUT and friends.
     let _job_env_files = environment::isolate_github_environment_files(&mut job_env)?;
 
-    // Create a temporary directory for this job execution
-    let job_dir = tempfile::tempdir()
-        .map_err(|e| ExecutionError::Execution(format!("Failed to create job directory: {}", e)))?;
-
     // Get the current project directory
     let current_dir = std::env::current_dir().map_err(|e| {
         ExecutionError::Execution(format!("Failed to get current directory: {}", e))
     })?;
+
+    // The job's workspace, kept from its last run so builds are incremental.
+    let job_dir =
+        crate::workspace::JobWorkspace::acquire(&current_dir, &workflow.name, &matrix_job_name)
+            .map_err(|e| {
+                ExecutionError::Execution(format!("Failed to create job directory: {}", e))
+            })?;
 
     // Pre-resolve ${{ matrix.X }} in all step `with` values so that every downstream
     // consumer (detect_setup_runtimes, INPUT_* env vars, composite action inputs, etc.)
@@ -3222,42 +3317,44 @@ async fn execute_matrix_job(
 
             let outcome = match tokio::time::timeout(
                 remaining,
-                run_step_with_guards(
-                    step,
-                    idx,
-                    &job_env,
-                    workflow,
-                    StepExecutionContext {
+                loop_state
+                    .live_step(idx, step, services.secret_masker)
+                    .run(Box::pin(run_step_with_guards(
                         step,
-                        step_idx: idx,
-                        job_env: &job_env,
-                        job_user_env: &job_user_env,
-                        working_dir: job_dir.path(),
-                        runtime,
+                        idx,
+                        &job_env,
                         workflow,
-                        runner_image: &runner_image_value,
-                        verbose,
-                        matrix_combination: &Some(combination.values.clone()),
-                        container_config: job_template.container.as_ref(),
-                        workflow_defaults: workflow.defaults.as_ref(),
-                        job_defaults: job_template.defaults.as_ref(),
-                        step_outputs: &loop_state.step_outputs_map,
-                        step_statuses: &loop_state.step_status_map,
-                        job_status: &loop_state.job_status_str,
-                        services: JobServices {
-                            secret_manager: services.secret_manager,
-                            secret_masker: services.secret_masker,
-                            secrets_context: services.secrets_context,
-                            missing_secrets: services.missing_secrets,
-                            needs_context: services.needs_context,
-                            needs_results: services.needs_results,
-                            artifact_store: services.artifact_store,
-                            cache_store: services.cache_store,
-                            platform_overrides: services.platform_overrides,
+                        StepExecutionContext {
+                            step,
+                            step_idx: idx,
+                            job_env: &job_env,
+                            job_user_env: &job_user_env,
+                            working_dir: job_dir.path(),
+                            runtime,
+                            workflow,
+                            runner_image: &runner_image_value,
+                            verbose,
+                            matrix_combination: &Some(combination.values.clone()),
+                            container_config: job_template.container.as_ref(),
+                            workflow_defaults: workflow.defaults.as_ref(),
+                            job_defaults: job_template.defaults.as_ref(),
+                            step_outputs: &loop_state.step_outputs_map,
+                            step_statuses: &loop_state.step_status_map,
+                            job_status: &loop_state.job_status_str,
+                            services: JobServices {
+                                secret_manager: services.secret_manager,
+                                secret_masker: services.secret_masker,
+                                secrets_context: services.secrets_context,
+                                missing_secrets: services.missing_secrets,
+                                needs_context: services.needs_context,
+                                needs_results: services.needs_results,
+                                artifact_store: services.artifact_store,
+                                cache_store: services.cache_store,
+                                platform_overrides: services.platform_overrides,
+                            },
+                            pending_cache_saves: &pending_cache_saves,
                         },
-                        pending_cache_saves: &pending_cache_saves,
-                    },
-                ),
+                    ))),
             )
             .await
             {
@@ -3327,6 +3424,7 @@ async fn execute_matrix_job(
         logs: loop_state.job_logs,
         outputs: job_outputs,
         failure_allowed,
+        repeated_from: None,
     })
 }
 
@@ -3489,6 +3587,23 @@ impl StepLoopState {
         });
     }
 
+    /// What streams step `index`'s output to observers while it runs,
+    /// masked by `masker` as the step's stored output is.
+    fn live_step<'a>(
+        &self,
+        index: usize,
+        step: &workflow::Step,
+        masker: Option<&'a SecretMasker>,
+    ) -> LiveStep<'a> {
+        LiveStep {
+            job: self.job_label.clone(),
+            step: step_display_name(step, index),
+            index,
+            workspace_prefixes: self.workspace_prefixes.clone(),
+            masker,
+        }
+    }
+
     /// Report the step in flight as finished. `result.output` must already
     /// be masked, because observers persist it.
     fn emit_step_finished(&self, result: &StepResult, env_set: Vec<(String, String)>) {
@@ -3539,6 +3654,7 @@ impl StepLoopState {
             failure_allowed,
             duration_ms: self.job_started.elapsed().as_millis() as u64,
             logs: self.job_logs.clone(),
+            repeated_from: None,
         });
     }
 
@@ -3731,6 +3847,7 @@ fn process_workflow_commands(
                 wrkflw_logging::debug(&format!("[debug] {}", message));
             }
             crate::workflow_commands::WorkflowCommand::AddMask { value } => {
+                crate::log_redaction::register(&value);
                 if let Some(masker) = secret_masker {
                     masker.add_secret(value);
                 }
@@ -3742,7 +3859,11 @@ fn process_workflow_commands(
     }
 }
 
-fn format_annotation_location(file: Option<&str>, line: Option<u32>, col: Option<u32>) -> String {
+pub(crate) fn format_annotation_location(
+    file: Option<&str>,
+    line: Option<u32>,
+    col: Option<u32>,
+) -> String {
     match (file, line, col) {
         (Some(f), Some(l), Some(c)) => format!("{}:{}:{}: ", f, l, c),
         (Some(f), Some(l), None) => format!("{}:{}: ", f, l),
@@ -5404,134 +5525,6 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
     Ok(step_result)
 }
 
-/// Create a gitignore matcher for the given directory
-fn create_gitignore_matcher(
-    dir: &Path,
-) -> Result<Option<ignore::gitignore::Gitignore>, ExecutionError> {
-    let mut builder = GitignoreBuilder::new(dir);
-
-    // Try to add .gitignore file if it exists
-    let gitignore_path = dir.join(".gitignore");
-    if gitignore_path.exists() {
-        builder.add(&gitignore_path);
-    }
-
-    // Add some common ignore patterns as fallback
-    builder.add_line(None, "target/").map_err(|e| {
-        ExecutionError::Execution(format!("Failed to add default ignore pattern: {}", e))
-    })?;
-    builder.add_line(None, ".git/").map_err(|e| {
-        ExecutionError::Execution(format!("Failed to add default ignore pattern: {}", e))
-    })?;
-
-    match builder.build() {
-        Ok(gitignore) => Ok(Some(gitignore)),
-        Err(e) => {
-            wrkflw_logging::warning(&format!("Failed to build gitignore matcher: {}", e));
-            Ok(None)
-        }
-    }
-}
-
-fn copy_directory_contents(from: &Path, to: &Path) -> Result<(), ExecutionError> {
-    copy_directory_contents_with_gitignore(from, to, None)
-}
-
-fn copy_directory_contents_with_gitignore(
-    from: &Path,
-    to: &Path,
-    gitignore: Option<&ignore::gitignore::Gitignore>,
-) -> Result<(), ExecutionError> {
-    // If no gitignore provided, try to create one for the root directory
-    let root_gitignore;
-    let gitignore = if gitignore.is_none() {
-        root_gitignore = create_gitignore_matcher(from)?;
-        root_gitignore.as_ref()
-    } else {
-        gitignore
-    };
-
-    // Log summary of the copy operation
-    wrkflw_logging::debug(&format!(
-        "Copying directory contents from {} to {}",
-        from.display(),
-        to.display()
-    ));
-
-    for entry in std::fs::read_dir(from)
-        .map_err(|e| ExecutionError::Execution(format!("Failed to read directory: {}", e)))?
-    {
-        let entry =
-            entry.map_err(|e| ExecutionError::Execution(format!("Failed to read entry: {}", e)))?;
-        let path = entry.path();
-
-        if path.is_symlink() {
-            wrkflw_logging::debug(&format!("Skipping symlink: {:?}", path));
-            continue;
-        }
-
-        // Check if the file should be ignored according to .gitignore
-        if let Some(gitignore) = gitignore {
-            let relative_path = path.strip_prefix(from).unwrap_or(&path);
-            match gitignore.matched(relative_path, path.is_dir()) {
-                Match::Ignore(_) => {
-                    wrkflw_logging::debug(&format!("Skipping ignored file/directory: {path:?}"));
-                    continue;
-                }
-                Match::Whitelist(_) | Match::None => {
-                    // File is not ignored or explicitly whitelisted
-                }
-            }
-        }
-
-        // Log individual files only in trace mode (removed verbose per-file logging)
-
-        // Additional basic filtering for hidden files (but allow .gitignore and .github)
-        let file_name = match path.file_name() {
-            Some(name) => name.to_string_lossy(),
-            None => {
-                return Err(ExecutionError::Execution(format!(
-                    "Failed to get file name from path: {:?}",
-                    path
-                )));
-            }
-        };
-
-        // Skip most hidden files but allow important ones
-        if file_name.starts_with(".")
-            && file_name != ".gitignore"
-            && file_name != ".github"
-            && file_name != ".gitea"
-            && !file_name.starts_with(".env")
-        {
-            continue;
-        }
-
-        let dest_path = match path.file_name() {
-            Some(name) => to.join(name),
-            None => {
-                return Err(ExecutionError::Execution(format!(
-                    "Failed to get file name from path: {:?}",
-                    path
-                )));
-            }
-        };
-
-        if path.is_dir() {
-            std::fs::create_dir_all(&dest_path)
-                .map_err(|e| ExecutionError::Execution(format!("Failed to create dir: {}", e)))?;
-
-            // Recursively copy subdirectories with the same gitignore
-            copy_directory_contents_with_gitignore(&path, &dest_path, gitignore)?;
-        } else {
-            std::fs::copy(&path, &dest_path)
-                .map_err(|e| ExecutionError::Execution(format!("Failed to copy file: {}", e)))?;
-        }
-    }
-
-    Ok(())
-}
-
 fn get_runner_image(runs_on: &str) -> String {
     // Map GitHub runners to Docker images
     match runs_on.trim() {
@@ -5652,7 +5645,7 @@ fn find_platform_override(
 
 /// Pick a job's base image: `container:`, then the user's overrides, then the
 /// built-in `runs-on` table.
-fn get_effective_runner_image(
+pub(crate) fn get_effective_runner_image(
     job: &Job,
     platform_overrides: &HashMap<String, String>,
     matrix: Option<&HashMap<String, Value>>,
@@ -6163,6 +6156,7 @@ async fn run_called_workflow(
             ctx.user_env,
             &ctx.services,
         ),
+        repeated_from: None,
     })
 }
 
@@ -7324,6 +7318,7 @@ mod tests {
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
             failure_allowed: false,
+            repeated_from: None,
         };
         let results = vec![
             combo("build (os: a)", &[("linux", "a.tar")]),
@@ -7368,22 +7363,6 @@ mod tests {
         assert_eq!(from_json_argument("fromJSON(a) || fromJSON(b)"), None);
         assert_eq!(from_json_argument("toJSON(a)"), None);
         assert_eq!(from_json_argument("github.event"), None);
-    }
-
-    #[test]
-    fn workspace_copy_keeps_forge_dirs_and_skips_other_hidden_dirs() {
-        let src = tempfile::tempdir().unwrap();
-        let dst = tempfile::tempdir().unwrap();
-        for dir in [".gitea/workflows", ".github/workflows", ".cache"] {
-            std::fs::create_dir_all(src.path().join(dir)).unwrap();
-            std::fs::write(src.path().join(dir).join("ci.yml"), "x").unwrap();
-        }
-
-        copy_directory_contents(src.path(), dst.path()).unwrap();
-
-        assert!(dst.path().join(".gitea/workflows/ci.yml").is_file());
-        assert!(dst.path().join(".github/workflows/ci.yml").is_file());
-        assert!(!dst.path().join(".cache").exists());
     }
 
     lazy_static::lazy_static! {

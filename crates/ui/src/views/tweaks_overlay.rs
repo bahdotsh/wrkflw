@@ -1,5 +1,4 @@
-// Tweaks overlay — the design's floating `TweaksPanel`, ported to a
-// ratatui popup.
+// Tweaks overlay: the accent picker, as a centred modal.
 //
 // We wire up the knobs that actually plumb through to the theme and
 // layouts. Anything we *can't* back up end-to-end (e.g. switching
@@ -25,31 +24,20 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Clear, Paragraph},
+    widgets::Paragraph,
     Frame,
 };
 
-pub fn render_tweaks_overlay(f: &mut Frame<'_>, app: &App, area: Rect) {
-    // Anchor the panel to the bottom-right, sized like the design's
-    // 260×auto card. We use absolute dimensions rather than a fraction
-    // so the panel looks right on wide 4K terminals instead of growing
-    // into a banner.
-    let panel_w: u16 = 38;
-    let panel_h: u16 = 8;
-    let x = area.right().saturating_sub(panel_w + 2);
-    let y = area.bottom().saturating_sub(panel_h + 2);
-    let panel_rect = Rect {
-        x,
-        y,
-        width: panel_w.min(area.width),
-        height: panel_h.min(area.height),
-    };
+/// Fits the accent row: label, five swatches and the accent's name.
+const PANEL_W: u16 = 44;
+const PANEL_H: u16 = 6;
 
-    // Clear behind the panel so the underlying tab doesn't bleed
-    // through.
-    f.render_widget(Clear, panel_rect);
+pub fn render_tweaks_overlay(f: &mut Frame<'_>, app: &App, _area: Rect) {
+    // A centred modal over a muted backdrop, the same as Help, so it never
+    // lands on top of a pane's border and reads as part of that pane.
+    let panel_rect = theme::modal(f, PANEL_W, PANEL_H);
 
-    let block = theme::block_focused("Tweaks");
+    let block = theme::modal_frame("Tweaks");
     let inner = block.inner(panel_rect);
     f.render_widget(block, panel_rect);
 
@@ -88,8 +76,8 @@ fn render_accent_row(f: &mut Frame<'_>, app: &App, area: Rect) {
         Style::default().fg(COLORS.text_muted),
     )];
     for c in [
+        Accent::Blueprint,
         Accent::Cyan,
-        Accent::Amber,
         Accent::Green,
         Accent::Violet,
         Accent::Coral,

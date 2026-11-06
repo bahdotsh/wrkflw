@@ -222,6 +222,7 @@ pub(crate) async fn run(ctx: RunCtx) {
         ndjson: format.is_json(),
         record: !ctx.no_record,
         from_step,
+        observers: Vec::new(),
     };
 
     if is_gitlab && (ctx.reuse_results || ctx.job_container || ctx.dep_cache) {
@@ -394,6 +395,17 @@ pub(crate) async fn run(ctx: RunCtx) {
                 wrkflw_executor::JobStatus::Skipped => {
                     println!("  {}", cli_style::job_skipped(&job.name))
                 }
+            }
+            // A folded matrix leg reports another leg's result; say so, so
+            // its status is not read as a run of its own.
+            if let Some(original) = &job.repeated_from {
+                println!(
+                    "    {}",
+                    cli_style::dim(&format!(
+                        "not run: repeats {original} locally (--every-matrix-leg runs it)"
+                    ))
+                );
+                continue;
             }
 
             for step in job.steps {

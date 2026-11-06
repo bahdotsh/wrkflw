@@ -19,6 +19,9 @@ use wrkflw_runtime::container::{
 use wrkflw_utils;
 use wrkflw_utils::fd;
 
+/// How long a step's log stream may stay open after its container exits.
+const LOG_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
 static RUNNING_CONTAINERS: Lazy<Mutex<Vec<String>>> = Lazy::new(|| Mutex::new(Vec::new()));
 static CREATED_NETWORKS: Lazy<Mutex<Vec<String>>> = Lazy::new(|| Mutex::new(Vec::new()));
 // Map to track customized images for a job
@@ -1109,46 +1112,88 @@ impl DockerRuntime {
             }
         }
 
-        // Wait for the container to finish
-        let wait_result = self
-            .docker
-            .wait_container::<String>(&container.id, None)
-            .collect::<Vec<_>>()
-            .await;
-        let exit_code = wait_exit_code(wait_result.first());
-
-        // Get logs with a timeout
+        // Follow the logs while the container runs, so output reaches the
+        // live tap as it is printed. The stream ends when the container does.
+        let tap = wrkflw_runtime::live_output::current();
         let log_options = Some(bollard::container::LogsOptions::<String> {
             stdout: true,
             stderr: true,
+            follow: true,
             ..Default::default()
         });
-        let logs_result = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            self.docker
-                .logs(&container.id, log_options)
-                .collect::<Vec<_>>(),
-        )
-        .await;
-
         let mut stdout = String::new();
         let mut stderr = String::new();
-
-        if let Ok(logs) = logs_result {
-            for log in logs.into_iter().flatten() {
-                match log {
+        let mut logs = self.docker.logs(&container.id, log_options);
+        // Frames split output wherever the container's writes did, so a
+        // character can straddle two; each stream is decoded as a whole.
+        let mut stdout_text = wrkflw_runtime::live_output::Utf8Chunks::default();
+        let mut stderr_text = wrkflw_runtime::live_output::Utf8Chunks::default();
+        // Returns why the stream broke off, if it did.
+        let follow = async {
+            let mut problem = None;
+            while let Some(log) = logs.next().await {
+                let log = match log {
+                    Ok(log) => log,
+                    Err(e) => {
+                        problem = Some(e.to_string());
+                        break;
+                    }
+                };
+                let (text, into) = match log {
                     bollard::container::LogOutput::StdOut { message } => {
-                        stdout.push_str(&String::from_utf8_lossy(&message));
+                        (stdout_text.push(&message), &mut stdout)
                     }
                     bollard::container::LogOutput::StdErr { message } => {
-                        stderr.push_str(&String::from_utf8_lossy(&message));
+                        (stderr_text.push(&message), &mut stderr)
                     }
-                    _ => {}
+                    _ => continue,
+                };
+                if let Some(tap) = &tap {
+                    tap.send(&text);
+                }
+                into.push_str(&text);
+            }
+            for (text, into) in [
+                (stdout_text.finish(), &mut stdout),
+                (stderr_text.finish(), &mut stderr),
+            ] {
+                if let Some(tap) = &tap {
+                    tap.send(&text);
+                }
+                into.push_str(&text);
+            }
+            problem
+        };
+        let wait = self
+            .docker
+            .wait_container::<String>(&container.id, None)
+            .collect::<Vec<_>>();
+        // The log stream should end with the container, but some logging
+        // drivers keep it open. Once the container has exited, give the
+        // stream a short grace period to deliver what is left, then stop
+        // rather than hang the step until the job's timeout.
+        let (wait_result, log_problem) = {
+            tokio::pin!(follow);
+            tokio::pin!(wait);
+            tokio::select! {
+                problem = &mut follow => (wait.await, problem),
+                wait_result = &mut wait => {
+                    let problem = tokio::time::timeout(LOG_DRAIN_GRACE, &mut follow)
+                        .await
+                        .unwrap_or_else(|_| {
+                            Some(format!(
+                                "the stream was still open {}s after the container exited",
+                                LOG_DRAIN_GRACE.as_secs()
+                            ))
+                        });
+                    (wait_result, problem)
                 }
             }
-        } else {
-            wrkflw_logging::warning("Retrieving container logs timed out");
+        };
+        if let Some(problem) = log_problem {
+            wrkflw_logging::warning(&format!("Container output may be incomplete: {}", problem));
         }
+        let exit_code = wait_exit_code(wait_result.first());
 
         // Clean up container with a timeout, but preserve on failure if configured
         if exit_code == 0 || !self.preserve_containers_on_failure {

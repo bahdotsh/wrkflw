@@ -5,6 +5,8 @@ resolver = "2"
 [workspace.package]
 version = "0.8.0"
 edition = "2021"
+# `std::fs::File::try_lock` guards kept job workspaces.
+rust-version = "1.89"
 description = "A GitHub Actions workflow validator and executor"
 documentation = "https://github.com/bahdotsh/wrkflw"
 homepage = "https://github.com/bahdotsh/wrkflw"

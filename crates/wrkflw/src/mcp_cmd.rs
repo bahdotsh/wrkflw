@@ -440,7 +440,7 @@ fn tools() -> Value {
     plan_properties["runtime"] = json!({
         "type": "string",
         "enum": ["auto", "docker", "podman", "kubernetes", "emulation", "secure-emulation"],
-        "description": "Runtime a run would use. Decides which jobs `unverified` lists.",
+        "description": "Runtime a run would use. Decides which jobs `unverified` lists. `auto` may check whether Docker or Podman answers, which can take seconds; pass the runtime you will run with to skip that.",
     });
     let run_id = json!({"type": "string", "description": "Run id, unique prefix, or `latest`. Default `latest`."});
     json!([

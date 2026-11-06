@@ -45,11 +45,20 @@ impl RunnerSubstitution {
 
 /// `runner.os` as a job sees it under `runtime`: Linux in a container,
 /// the host's OS otherwise. `Auto` is resolved first, as a run does.
-pub fn runner_os_for(runtime: RuntimeType) -> String {
+///
+/// Resolving `Auto` probes Docker and Podman, which can take seconds. The
+/// answer is only needed to judge the OSes in `requested`: with none it
+/// goes unused, and on a Linux host it is Linux either way, so then nothing
+/// is probed.
+pub fn runner_os_for(runtime: RuntimeType, requested: &[&str]) -> String {
+    let host = crate::environment::get_runner_os();
+    if runtime == RuntimeType::Auto && (requested.is_empty() || host == "Linux") {
+        return host;
+    }
     if crate::engine::detect_runtime(runtime).runs_in_container() {
         "Linux".to_string()
     } else {
-        crate::environment::get_runner_os()
+        host
     }
 }
 
@@ -269,6 +278,14 @@ mod tests {
         assert_eq!(entry["requested"], "macos-latest");
         assert_eq!(entry["ran_as"], "Linux");
         assert_eq!(entry["reason"], found.reason());
+    }
+
+    #[test]
+    fn auto_answers_without_probing_when_nothing_is_judged() {
+        let host = crate::environment::get_runner_os();
+        assert_eq!(runner_os_for(RuntimeType::Auto, &[]), host);
+        assert_eq!(runner_os_for(RuntimeType::Docker, &["Windows"]), "Linux");
+        assert_eq!(runner_os_for(RuntimeType::Emulation, &["Windows"]), host);
     }
 
     #[test]

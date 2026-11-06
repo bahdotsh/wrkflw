@@ -156,7 +156,8 @@ fn requested(
 /// The jobs, or matrix legs, that would run as another OS than `runs-on`
 /// asks for, in the shape `run_finished` reports them.
 fn unverified(requests: &[(String, RequestedOs)], runtime: RuntimeChoice) -> Vec<Value> {
-    let ran_as = runner_os_for(runtime.into());
+    let oses: Vec<&str> = requests.iter().map(|(_, request)| request.os).collect();
+    let ran_as = runner_os_for(runtime.into(), &oses);
     requests
         .iter()
         .filter_map(|(name, request)| Some(request.ran_as(&ran_as)?.unverified_entry(name)))

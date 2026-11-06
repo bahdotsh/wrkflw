@@ -150,10 +150,21 @@ impl JobWorkspace {
     }
 }
 
-/// Where kept workspaces live: `<cache dir>/wrkflw/workspaces`. Deleting it
-/// is always safe; jobs then start cold once.
+/// Env var that moves kept workspaces out of the cache directory.
+pub const WORKSPACES_DIR_ENV: &str = "WRKFLW_WORKSPACES_DIR";
+
+/// Where kept workspaces live: [`WORKSPACES_DIR_ENV`] if set, else
+/// `<cache dir>/wrkflw/workspaces`. Deleting it is always safe; jobs then
+/// start cold once.
 pub fn workspaces_root() -> Option<PathBuf> {
-    Some(dirs::cache_dir()?.join("wrkflw").join("workspaces"))
+    root_from(std::env::var_os(WORKSPACES_DIR_ENV), dirs::cache_dir())
+}
+
+fn root_from(configured: Option<std::ffi::OsString>, cache: Option<PathBuf>) -> Option<PathBuf> {
+    match configured {
+        Some(dir) if !dir.is_empty() => Some(PathBuf::from(dir)),
+        _ => Some(cache?.join("wrkflw").join("workspaces")),
+    }
 }
 
 /// What [`clean`] did.
@@ -292,6 +303,27 @@ mod tests {
     use super::*;
 
     const CI: &str = ".github/workflows/ci.yml";
+
+    #[test]
+    fn the_workspace_root_can_be_moved() {
+        let cache = Some(PathBuf::from("/cache"));
+        assert_eq!(
+            root_from(None, cache.clone()),
+            Some(PathBuf::from("/cache/wrkflw/workspaces"))
+        );
+        assert_eq!(
+            root_from(Some("".into()), cache.clone()),
+            Some(PathBuf::from("/cache/wrkflw/workspaces"))
+        );
+        assert_eq!(
+            root_from(Some("/big/disk".into()), cache),
+            Some(PathBuf::from("/big/disk"))
+        );
+        assert_eq!(
+            root_from(Some("/big/disk".into()), None),
+            Some(PathBuf::from("/big/disk"))
+        );
+    }
 
     #[test]
     fn a_job_gets_the_same_workspace_on_every_run() {

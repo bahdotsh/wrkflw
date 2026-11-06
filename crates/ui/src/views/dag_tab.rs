@@ -92,8 +92,8 @@ pub fn render_dag_tab(f: &mut Frame<'_>, app: &mut App, area: Rect) {
     app.dag_scroll = scroll;
 }
 
-/// How long each finished job took, and the chain of dependent jobs that
-/// set the run's length.
+/// How long each finished job took, and the jobs that set the run's
+/// length: the slowest of each stage.
 struct Timing {
     durations: HashMap<String, u64>,
     critical: HashSet<String>,
@@ -104,7 +104,7 @@ struct Timing {
 }
 
 impl Timing {
-    fn of(workflow: &Workflow, def: &WorkflowDefinition, levels: &[Vec<String>]) -> Self {
+    fn of(workflow: &Workflow, levels: &[Vec<String>]) -> Self {
         let exec = workflow.execution_details.as_ref();
         let durations = exec.map(|e| e.job_durations_ms()).unwrap_or_default();
         let settled = exec.is_some_and(|e| e.end_time.is_some());
@@ -112,7 +112,7 @@ impl Timing {
         // Mid-run, unfinished jobs would count as taking no time, and the
         // path would move as they finish; it is only drawn once it's known.
         let critical = if settled {
-            critical_path(def, levels, &durations)
+            critical_path(levels, &durations)
         } else {
             HashSet::new()
         };
@@ -141,45 +141,26 @@ impl Timing {
     }
 }
 
-/// The longest chain through `needs`, weighted by how long each job took.
+/// The jobs that set the run's length: the slowest of each stage. Stages
+/// run one after another and the jobs in a stage side by side, as the
+/// executor schedules them, so a run takes the sum of these jobs' times.
 /// Empty until the run has timings, and for single-stage workflows, where
-/// every job is trivially on it.
-fn critical_path(
-    def: &WorkflowDefinition,
-    levels: &[Vec<String>],
-    durations: &HashMap<String, u64>,
-) -> HashSet<String> {
+/// the slowest job is already plain to see.
+fn critical_path(levels: &[Vec<String>], durations: &HashMap<String, u64>) -> HashSet<String> {
     if durations.is_empty() || levels.len() < 2 {
         return HashSet::new();
     }
-    // Levels are topological, so every job's needs are scored before it.
-    let mut best: HashMap<&str, (u64, Option<&str>)> = HashMap::new();
-    for job in levels.iter().flatten() {
-        let own = durations.get(job).copied().unwrap_or(0);
-        let before = def
-            .jobs
-            .get(job)
-            .and_then(|j| j.needs.as_ref())
-            .into_iter()
-            .flatten()
-            .filter_map(|n| best.get(n.as_str()).map(|(t, _)| (*t, n.as_str())))
-            .max_by_key(|(t, _)| *t);
-        let (t, prev) = match before {
-            Some((t, n)) => (t + own, Some(n)),
-            None => (own, None),
-        };
-        best.insert(job.as_str(), (t, prev));
-    }
-    let mut path = HashSet::new();
-    let mut at = best
+    levels
         .iter()
-        .max_by_key(|(name, (t, _))| (*t, std::cmp::Reverse(*name)))
-        .map(|(name, _)| *name);
-    while let Some(job) = at {
-        path.insert(job.to_string());
-        at = best.get(job).and_then(|(_, prev)| *prev);
-    }
-    path
+        .filter_map(|layer| {
+            layer
+                .iter()
+                .filter_map(|job| durations.get(job).map(|ms| (*ms, job)))
+                // Ties go to the first name, so the path doesn't flicker.
+                .max_by_key(|(ms, job)| (*ms, std::cmp::Reverse(job.as_str())))
+                .map(|(_, job)| job.clone())
+        })
+        .collect()
 }
 
 fn matrix_suffix(labels: &MatrixLabels, job: &str) -> String {
@@ -245,7 +226,7 @@ fn render_graph(
     }
     f.render_widget(theme::with_badge(block, badge), area);
 
-    let timing = Timing::of(workflow, def, levels);
+    let timing = Timing::of(workflow, levels);
     let max_cards = (inner.height.saturating_sub(2) / CARD_H).max(1) as usize;
     for (col, (li, layer)) in levels
         .iter()
@@ -517,13 +498,30 @@ mod timing_tests {
         .into_iter()
         .map(|(k, v)| (k.to_string(), v))
         .collect();
-        let path = critical_path(&def, &levels, &durations);
+        let path = critical_path(&levels, &durations);
         let expected: HashSet<String> = ["checkout", "test", "package"]
             .into_iter()
             .map(String::from)
             .collect();
         assert_eq!(path, expected);
-        assert!(critical_path(&def, &levels, &HashMap::new()).is_empty());
+        assert!(critical_path(&levels, &HashMap::new()).is_empty());
+    }
+
+    #[test]
+    fn critical_path_is_the_slowest_job_of_each_stage() {
+        // Stage times add up, so the run takes a (10s) + d (10s), although
+        // neither dependency chain, a → c or b → d, is longer than 11s.
+        let def = def(
+            "name: d\non: push\njobs:\n  a:\n    runs-on: x\n    steps: [{run: a}]\n  b:\n    runs-on: x\n    steps: [{run: a}]\n  c:\n    runs-on: x\n    needs: a\n    steps: [{run: a}]\n  d:\n    runs-on: x\n    needs: b\n    steps: [{run: a}]\n",
+        );
+        let levels = dag::topo_levels(&def);
+        let durations: HashMap<String, u64> =
+            [("a", 10_000), ("b", 1_000), ("c", 1_000), ("d", 10_000)]
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect();
+        let expected: HashSet<String> = ["a", "d"].into_iter().map(String::from).collect();
+        assert_eq!(critical_path(&levels, &durations), expected);
     }
 
     #[test]
@@ -538,7 +536,7 @@ mod timing_tests {
             .collect();
         let expected: HashSet<String> = ["a", "c"].into_iter().map(String::from).collect();
         for _ in 0..20 {
-            assert_eq!(critical_path(&def, &levels, &durations), expected);
+            assert_eq!(critical_path(&levels, &durations), expected);
         }
     }
 

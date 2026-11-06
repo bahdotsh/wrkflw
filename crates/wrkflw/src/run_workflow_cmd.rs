@@ -175,6 +175,10 @@ pub(crate) async fn run(ctx: RunCtx) {
     let format = ctx.format;
     // Checked before the run is recorded: a typo is not a run to look back
     // on, and there would be nothing to replay.
+    if ctx.stream_output && !format.is_json() {
+        format
+            .fail("--stream-output needs --format json: it adds step_output lines to that stream.");
+    }
     if !ctx.path.is_file() {
         format.fail(&format!("workflow file not found: {}", ctx.path.display()));
     }

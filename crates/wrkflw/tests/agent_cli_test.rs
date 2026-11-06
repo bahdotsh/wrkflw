@@ -229,6 +229,24 @@ fn stream_output_reports_lines_before_the_step_ends_and_masks_them() {
 }
 
 #[test]
+fn stream_output_without_json_is_refused() {
+    let sandbox = Sandbox::new();
+    let output = sandbox.run(&[
+        "run",
+        "--stream-output",
+        "--runtime",
+        "emulation",
+        ".github/workflows/failing.yml",
+    ]);
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--stream-output needs --format json"),
+        "{stderr}"
+    );
+}
+
+#[test]
 fn history_records_runs_and_answers_without_a_rerun() {
     let sandbox = Sandbox::new();
     sandbox

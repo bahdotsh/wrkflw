@@ -285,20 +285,6 @@ fn run_args(ctx: &GateCtx, file: &Path) -> Vec<String> {
     args
 }
 
-/// Report an error the way `format` asks, and exit 1.
-fn fail(format: OutputFormat, message: &str) -> ! {
-    if format == OutputFormat::Json {
-        wrkflw_runs::emit_line(&json!({
-            "schema_version": SCHEMA_VERSION,
-            "type": "error",
-            "message": message,
-        }));
-    } else {
-        eprintln!("Error: {}", message);
-    }
-    std::process::exit(1);
-}
-
 /// One workflow's entry in the `gate` object, from the child's JSON output:
 /// its `run_finished`, or the error it printed instead.
 fn workflow_report(file: &Path, code: Option<i32>, stdout: &str) -> Value {
@@ -371,8 +357,10 @@ fn gate_report(workflows: Vec<Value>, uncommitted: &[String]) -> Value {
 
 /// Run the gate. Exits 1 when a workflow fails or can't be run.
 pub(crate) fn run(ctx: GateCtx) {
-    let program = std::env::current_exe()
-        .unwrap_or_else(|e| fail(ctx.format, &format!("cannot find this executable: {}", e)));
+    let program = std::env::current_exe().unwrap_or_else(|e| {
+        ctx.format
+            .fail(&format!("cannot find this executable: {}", e))
+    });
     if ctx.install_hook {
         let script = hook_script(&program, ctx.runtime.as_flag(), ctx.remote_cache.as_deref());
         let installed = hook_path().and_then(|path| {
@@ -388,11 +376,11 @@ pub(crate) fn run(ctx: GateCtx) {
                 }));
             }
             Ok(path) => println!("Installed {}", path.display()),
-            Err(e) => fail(ctx.format, &e),
+            Err(e) => ctx.format.fail(&e),
         }
         return;
     }
-    let files = workflow_files(ctx.path.as_deref()).unwrap_or_else(|e| fail(ctx.format, &e));
+    let files = workflow_files(ctx.path.as_deref()).unwrap_or_else(|e| ctx.format.fail(&e));
     let runtime = ctx.runtime.as_flag();
     let uncommitted = uncommitted_changes();
     if let Some(warning) = dirty_tree_warning(&uncommitted) {

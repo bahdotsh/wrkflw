@@ -29,6 +29,20 @@ impl OutputFormat {
     pub(crate) fn is_json(self) -> bool {
         self == OutputFormat::Json
     }
+
+    /// Report a terminal error and exit 1: on stderr, and with JSON also as
+    /// one `error` object on stdout.
+    pub(crate) fn fail(self, message: &str) -> ! {
+        if self.is_json() {
+            wrkflw_runs::emit_line(&serde_json::json!({
+                "schema_version": wrkflw_runs::SCHEMA_VERSION,
+                "type": "error",
+                "message": message,
+            }));
+        }
+        eprintln!("Error: {}", message);
+        std::process::exit(1);
+    }
 }
 
 #[derive(Debug, Clone, ValueEnum)]

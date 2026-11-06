@@ -628,7 +628,10 @@ fn run_finished_json(record: &RunRecord, digest: Option<&FailureDigest>) -> Valu
     json!({
         "type": "run_finished",
         "status": record.status.as_str(),
-        "exit_code": i32::from(matches!(record.status, RunStatus::Failure | RunStatus::Error)),
+        "exit_code": i32::from(matches!(
+            record.status,
+            RunStatus::Failure | RunStatus::Error | RunStatus::Interrupted
+        )),
         "duration_ms": record.duration_ms,
         "jobs": record.jobs.iter().map(|job| {
             let mut entry = json!({
@@ -663,6 +666,43 @@ fn unverified(record: &RunRecord) -> Vec<Value> {
 }
 
 /// Execute a workflow with recording and event streaming per `options`.
+/// Set once this process has been told to stop.
+static INTERRUPTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Record this process's runs as interrupted, whatever their steps do next.
+/// Call it from the signal handler, before cleaning up.
+///
+/// Ctrl+C reaches a run's steps as well as wrkflw, since they share the
+/// terminal's process group, and so does an MCP timeout. A step killed by
+/// it fails, and the run could otherwise be recorded as a plain failure
+/// before the handler exits, depending on which gets there first.
+pub fn mark_interrupted() {
+    INTERRUPTED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+fn interrupted() -> bool {
+    INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// The status a run that returned `result` is recorded with.
+fn final_status(
+    result: &Result<ExecutionResult, ExecutionError>,
+    interrupted: bool,
+) -> (RunStatus, Option<String>, &[JobResult]) {
+    let jobs: &[JobResult] = match result {
+        Ok(run) => &run.jobs,
+        Err(_) => &[],
+    };
+    if interrupted {
+        return (RunStatus::Interrupted, None, jobs);
+    }
+    match result {
+        Ok(run) if run.failure_details.is_some() => (RunStatus::Failure, None, jobs),
+        Ok(_) => (RunStatus::Success, None, jobs),
+        Err(e) => (RunStatus::Error, Some(e.to_string()), jobs),
+    }
+}
+
 pub async fn execute_recorded(
     path: &Path,
     config: ExecutionConfig,
@@ -679,11 +719,7 @@ pub async fn execute_recorded(
         from_step: options.from_step.clone(),
     };
     let result = with_run_hooks(hooks, wrkflw_executor::execute_workflow(path, config)).await;
-    let (status, error, jobs): (_, _, &[JobResult]) = match &result {
-        Ok(run) if run.failure_details.is_some() => (RunStatus::Failure, None, &run.jobs),
-        Ok(run) => (RunStatus::Success, None, &run.jobs),
-        Err(e) => (RunStatus::Error, Some(e.to_string()), &[]),
-    };
+    let (status, error, jobs) = final_status(&result, interrupted());
     let record = recorder.finish(status, error, None, jobs);
     conclude(recorder, record, result)
 }
@@ -932,6 +968,25 @@ mod tests {
         assert_eq!(line["jobs"][0]["repeated_from"], "b (os: ubuntu-latest)");
         assert_eq!(line["jobs"][0]["runner"]["requested"], "windows-latest");
         assert!(line["jobs"][1].get("repeated_from").is_none());
+    }
+
+    #[test]
+    fn a_stopped_run_is_interrupted_however_its_steps_ended() {
+        let failed: Result<ExecutionResult, ExecutionError> = Ok(ExecutionResult {
+            jobs: Vec::new(),
+            failure_details: Some("step boom failed".to_string()),
+        });
+        assert_eq!(final_status(&failed, false).0, RunStatus::Failure);
+        assert_eq!(final_status(&failed, true).0, RunStatus::Interrupted);
+        let broken: Result<ExecutionResult, ExecutionError> =
+            Err(ExecutionError::Execution("boom".to_string()));
+        let (status, error, _) = final_status(&broken, true);
+        assert_eq!(status, RunStatus::Interrupted);
+        assert_eq!(error, None);
+        assert_eq!(
+            final_status(&broken, false).1.as_deref(),
+            Some("Execution error: boom")
+        );
     }
 
     #[test]

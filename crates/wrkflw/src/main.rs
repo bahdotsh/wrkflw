@@ -825,6 +825,10 @@ async fn handle_signals() {
         }
     }
 
+    // The steps got the signal too and may fail on it before this exits.
+    // Whatever they do, the run was interrupted, not failed.
+    wrkflw_runs::mark_interrupted();
+
     // Set up a watchdog thread that will force exit if cleanup takes too long
     // This is important because Docker operations can sometimes hang indefinitely
     let _ = std::thread::spawn(move || {

@@ -62,6 +62,13 @@ pub enum ExecutionEvent {
 /// Receives events on the executor's task, so it must not block for long.
 pub trait ExecutionObserver: Send + Sync {
     fn on_event(&self, event: &ExecutionEvent);
+
+    /// Whether this observer wants [`ExecutionEvent::StepOutput`]. Live
+    /// output costs work per line, so a run only streams it when some
+    /// observer asks; `StepFinished` carries the full output either way.
+    fn wants_step_output(&self) -> bool {
+        false
+    }
 }
 
 /// How step output begins in a report: these lines separate what wrkflw
@@ -138,11 +145,19 @@ pub(crate) fn emit(build: impl FnOnce() -> ExecutionEvent) {
     });
 }
 
-/// The active observers, for code that reports from outside the run's task
-/// (a runtime reading output on its own thread). Empty outside a run.
-pub(crate) fn current_observers() -> Vec<Arc<dyn ExecutionObserver>> {
+/// The active observers that want live step output, for code that reports
+/// from outside the run's task (a runtime reading output on its own
+/// thread). Empty outside a run.
+pub(crate) fn step_output_observers() -> Vec<Arc<dyn ExecutionObserver>> {
     HOOKS
-        .try_with(|hooks| hooks.observers.clone())
+        .try_with(|hooks| {
+            hooks
+                .observers
+                .iter()
+                .filter(|observer| observer.wants_step_output())
+                .cloned()
+                .collect()
+        })
         .unwrap_or_default()
 }
 

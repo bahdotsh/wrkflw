@@ -30,7 +30,7 @@ impl LiveStep {
         self,
         future: std::pin::Pin<Box<F>>,
     ) -> F::Output {
-        let observers = crate::events::current_observers();
+        let observers = crate::events::step_output_observers();
         if observers.is_empty() {
             return future.await;
         }

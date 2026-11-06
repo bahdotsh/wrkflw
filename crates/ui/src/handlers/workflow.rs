@@ -491,6 +491,10 @@ impl wrkflw_executor::ExecutionObserver for TimelineObserver {
             let _ = self.tx.send((self.workflow_idx, self.generation, entry));
         }
     }
+
+    fn wants_step_output(&self) -> bool {
+        true
+    }
 }
 
 // Extract common workflow execution logic to avoid duplication

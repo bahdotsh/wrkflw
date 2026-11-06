@@ -4,6 +4,7 @@ use crate::{is_gitlab_pipeline, prefilter, OutputFormat, RuntimeChoice};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use wrkflw_executor::runner_fidelity::{requested_os, runner_os_for, RequestedOs};
 use wrkflw_parser::workflow::{Job, WorkflowDefinition};
 use wrkflw_runs::SCHEMA_VERSION;
 use wrkflw_secrets::{SecretError, SecretManager, SecretSubstitution};
@@ -125,18 +126,17 @@ fn job_json(id: &str, job: &Job) -> Value {
     })
 }
 
-/// The jobs, or matrix legs, that would run as another OS than `runs-on`
-/// asks for, in the shape `run_finished` reports them. A leg of a matrix
-/// computed at run time can't be named yet, so it is left out.
-fn unverified(
+/// The OS each of `job`'s matrix legs, or the job itself, asks for, under
+/// the name a run gives it. A leg of a matrix computed at run time can't be
+/// named yet, so it is left out.
+fn requested(
     id: &str,
     job: &Job,
-    ran_as: &str,
     overrides: &HashMap<String, String>,
-) -> Vec<Value> {
+) -> Vec<(String, RequestedOs)> {
     let Some(config) = job.matrix_config() else {
-        return wrkflw_executor::runner_fidelity::substitution_as(job, None, ran_as, overrides)
-            .map(|found| found.unverified_entry(id))
+        return requested_os(job, None, overrides)
+            .map(|os| (id.to_string(), os))
             .into_iter()
             .collect();
     };
@@ -147,14 +147,19 @@ fn unverified(
         .unwrap_or_default()
         .iter()
         .filter_map(|leg| {
-            let found = wrkflw_executor::runner_fidelity::substitution_as(
-                job,
-                Some(&leg.values),
-                ran_as,
-                overrides,
-            )?;
-            Some(found.unverified_entry(&wrkflw_matrix::format_combination_name(id, leg)))
+            let os = requested_os(job, Some(&leg.values), overrides)?;
+            Some((wrkflw_matrix::format_combination_name(id, leg), os))
         })
+        .collect()
+}
+
+/// The jobs, or matrix legs, that would run as another OS than `runs-on`
+/// asks for, in the shape `run_finished` reports them.
+fn unverified(requests: &[(String, RequestedOs)], runtime: RuntimeChoice) -> Vec<Value> {
+    let ran_as = runner_os_for(runtime.into());
+    requests
+        .iter()
+        .filter_map(|(name, request)| Some(request.ran_as(&ran_as)?.unverified_entry(name)))
         .collect()
 }
 
@@ -170,17 +175,17 @@ fn github_plan(ctx: &PlanCtx, workflow: &WorkflowDefinition) -> Result<GithubPla
             "workflow",
         )?;
     }
-    let ran_as = wrkflw_executor::runner_fidelity::runner_os_for(ctx.runtime.clone().into());
     let mut jobs = Vec::new();
-    let mut substituted = Vec::new();
+    let mut requests = Vec::new();
     for batch in &batches {
         for id in batch {
             if let Some(job) = workflow.jobs.get(id) {
                 jobs.push(job_json(id, job));
-                substituted.extend(unverified(id, job, &ran_as, &ctx.platform_overrides));
+                requests.extend(requested(id, job, &ctx.platform_overrides));
             }
         }
     }
+    let substituted = unverified(&requests, ctx.runtime.clone());
     Ok((batches, jobs, substituted))
 }
 

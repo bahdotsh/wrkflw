@@ -2,6 +2,7 @@
 //! them through `--format json` and MCP. Add fields rather than rename them.
 
 use serde::{Deserialize, Serialize};
+use wrkflw_executor::RunnerSubstitution;
 
 /// Bumped only for incompatible changes to any JSON wrkflw emits.
 pub const SCHEMA_VERSION: u32 = 1;
@@ -85,17 +86,10 @@ pub struct JobRecord {
     /// because it would only have repeated that leg.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repeated_from: Option<String>,
-    /// Set when `runs-on` asked for another OS than the job ran as.
+    /// Set when `runs-on` asked for another OS than the job ran as. A pass
+    /// on such a job says nothing about its OS-specific steps.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub runner: Option<RunnerRecord>,
-}
-
-/// The OS a job asked for and the one it ran as. A pass on such a job says
-/// nothing about its OS-specific steps.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RunnerRecord {
-    pub requested: String,
-    pub ran_as: String,
+    pub runner: Option<RunnerSubstitution>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -587,3 +587,39 @@ fn the_gate_prints_one_json_object_naming_the_failed_run() {
         "the third gate didn't reuse"
     );
 }
+
+const OS_MATRIX: &str = "name: ci\non: push\njobs:\n  build:\n    runs-on: ${{ matrix.os }}\n    strategy:\n      matrix:\n        os: [ubuntu-latest, windows-latest]\n    steps:\n      - run: echo ${{ matrix.os }} >> LOG\n";
+
+#[test]
+fn a_reused_os_matrix_leg_is_still_unverified() {
+    let repo = Repo::new(OS_MATRIX, None);
+    let gate = [
+        "--format",
+        "json",
+        "gate",
+        "--runtime",
+        "emulation",
+        "--diff-base",
+        "HEAD",
+    ];
+    // Run, then reused: the Windows leg is listed both times, by the name a
+    // run gives it, since a reused pass ran as another OS too.
+    for ran in [vec!["ubuntu-latest", "windows-latest"], vec![]] {
+        let output = repo.wrkflw(&gate);
+        assert_ok(&output);
+        let report = &json_lines(&output)[0];
+        let unverified: Vec<&str> = report["unverified"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|u| u["job"].as_str())
+            .collect();
+        assert!(
+            unverified.contains(&"build (os: windows-latest)"),
+            "{report}"
+        );
+        assert_eq!(repo.take_ran(), ran);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!stderr.contains("matches no leg"), "{stderr}");
+    }
+}

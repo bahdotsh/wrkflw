@@ -2709,6 +2709,15 @@ async fn execute_job_with_matrix(
                             wrkflw_matrix::format_combination_name(job_name, leg) == stored.name
                         })
                         .map(|leg| &leg.values);
+                    if matrix.is_none() && job.matrix_config().is_some() {
+                        // Without its values `runs-on: ${{ matrix.os }}` can't
+                        // be judged, and silence would read as verified.
+                        wrkflw_logging::warning(&format!(
+                            "Reused job '{}' matches no leg of the matrix, so whether it \
+                             ran as the OS runs-on asks for wasn't checked",
+                            stored.name
+                        ));
+                    }
                     let runner = crate::runner_fidelity::substitution(
                         job,
                         matrix,
@@ -5711,15 +5720,8 @@ fn find_platform_override(
     platform_overrides: &HashMap<String, String>,
     matrix: Option<&HashMap<String, Value>>,
 ) -> Option<String> {
-    runs_on.iter().flatten().find_map(|label| {
-        let label = match matrix {
-            Some(values) => crate::substitution::preprocess_command(label, values),
-            None => label.clone(),
-        };
-        platform_overrides
-            .get(&label.trim().to_ascii_lowercase())
-            .cloned()
-    })
+    let labels = crate::runner_fidelity::runs_on_labels(runs_on, matrix);
+    crate::runner_fidelity::mapped_image(&labels, platform_overrides).cloned()
 }
 
 /// Pick a job's base image: `container:`, then the user's overrides, then the

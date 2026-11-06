@@ -2,7 +2,7 @@
 
 use crate::digest::{failure_digest, FailureDigest, DEFAULT_TAIL_LINES};
 use crate::env;
-use crate::record::{JobRecord, RunRecord, RunStatus, RunnerRecord, StepRecord, SCHEMA_VERSION};
+use crate::record::{JobRecord, RunRecord, RunStatus, StepRecord, SCHEMA_VERSION};
 use crate::store::{history_disabled, RunStore, DEFAULT_KEEP};
 use serde_json::{json, Value};
 use std::io::Write;
@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use wrkflw_executor::engine::{ExecutionError, ExecutionResult};
 use wrkflw_executor::{
     with_run_hooks, ExecutionConfig, ExecutionEvent, ExecutionObserver, FromStep, JobResult,
-    RunHooks,
+    RunHooks, RunnerSubstitution,
 };
 
 /// Step output carried inline in an NDJSON event. The full text is in the log.
@@ -357,37 +357,39 @@ impl ExecutionObserver for Recorder {
     }
 
     fn on_event(&self, event: &ExecutionEvent) {
-        if let ExecutionEvent::StepOutput {
-            job,
-            step,
-            index,
-            lines,
-        } = event
-        {
-            if self.stream_output {
-                self.line(json!({
-                    "type": "step_output",
-                    "job": job,
-                    "step": step,
-                    "index": index,
-                    "lines": lines,
-                }));
+        // These two are not lines of the event stream in their own right.
+        match event {
+            ExecutionEvent::StepOutput {
+                job,
+                step,
+                index,
+                lines,
+            } => {
+                if self.stream_output {
+                    self.line(json!({
+                        "type": "step_output",
+                        "job": job,
+                        "step": step,
+                        "index": index,
+                        "lines": lines,
+                    }));
+                }
+                return;
             }
-            return;
-        }
-        if let ExecutionEvent::RunnerSubstituted {
-            job,
-            requested,
-            ran_as,
-        } = event
-        {
-            let mut record = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            Self::job_mut(&mut record, job, job).runner = Some(RunnerRecord {
-                requested: requested.clone(),
-                ran_as: ran_as.clone(),
-            });
-            self.persist(&record);
-            return;
+            ExecutionEvent::RunnerSubstituted {
+                job,
+                requested,
+                ran_as,
+            } => {
+                let mut record = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                Self::job_mut(&mut record, job, job).runner = Some(RunnerSubstitution {
+                    requested: requested.clone(),
+                    ran_as: ran_as.clone(),
+                });
+                self.persist(&record);
+                return;
+            }
+            _ => {}
         }
         // Live output stays out of the record and the event stream: the
         // step's finish event carries all of it. The recorder doesn't ask
@@ -417,9 +419,9 @@ impl ExecutionObserver for Recorder {
                 Self::job_mut(&mut record, job, canonical_name);
                 self.persist(&record);
             }
-            ExecutionEvent::StepStarted { .. }
-            | ExecutionEvent::StepOutput { .. }
-            | ExecutionEvent::RunnerSubstituted { .. } => {}
+            // Handled above.
+            ExecutionEvent::StepOutput { .. } | ExecutionEvent::RunnerSubstituted { .. } => {}
+            ExecutionEvent::StepStarted { .. } => {}
             ExecutionEvent::StepFinished {
                 job,
                 step,
@@ -656,16 +658,7 @@ fn unverified(record: &RunRecord) -> Vec<Value> {
         .jobs
         .iter()
         .filter(|job| job.status != "skipped")
-        .filter_map(|job| {
-            let runner = job.runner.as_ref()?;
-            Some(
-                wrkflw_executor::RunnerSubstitution {
-                    requested: runner.requested.clone(),
-                    ran_as: runner.ran_as.clone(),
-                }
-                .unverified_entry(&job.name),
-            )
-        })
+        .filter_map(|job| Some(job.runner.as_ref()?.unverified_entry(&job.name)))
         .collect()
 }
 
@@ -912,7 +905,7 @@ mod tests {
             log: None,
             steps: Vec::new(),
             repeated_from: None,
-            runner: Some(RunnerRecord {
+            runner: Some(RunnerSubstitution {
                 requested: "windows-latest".to_string(),
                 ran_as: "Linux".to_string(),
             }),

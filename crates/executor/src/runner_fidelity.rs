@@ -7,12 +7,13 @@
 
 use crate::engine::RuntimeType;
 use crate::events::{emit, ExecutionEvent};
+use serde::{Deserialize, Serialize};
 use serde_yaml::Value;
 use std::collections::HashMap;
 use wrkflw_parser::workflow::Job;
 
-/// The OS a job asked for, and the one it ran as.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// The OS a job asked for, and the one it ran as. Run records store it as is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunnerSubstitution {
     /// The `runs-on` label that named the OS, with matrix values filled in.
     pub requested: String,
@@ -52,54 +53,87 @@ pub fn runner_os_for(runtime: RuntimeType) -> String {
     }
 }
 
-/// The substitution for `job`, if its `runs-on` names an OS other than the
-/// one in `env`'s `RUNNER_OS`.
-///
-/// A job with `container:` runs on Linux on GitHub too, and a label the user
-/// mapped to an image with `--platform` is taken as their choice. Labels that
-/// name no OS, such as a custom self-hosted label, can't be judged.
-pub(crate) fn substitution(
-    job: &Job,
+/// `runs-on` labels with `${{ matrix.* }}` filled in. The engine maps
+/// labels to images from these too, so the label judged here is the one
+/// that picked the job's image.
+pub(crate) fn runs_on_labels(
+    runs_on: &Option<Vec<String>>,
     matrix: Option<&HashMap<String, Value>>,
-    env: &HashMap<String, String>,
-    platform_overrides: &HashMap<String, String>,
-) -> Option<RunnerSubstitution> {
-    substitution_as(job, matrix, env.get("RUNNER_OS")?, platform_overrides)
-}
-
-/// The substitution for `job` when it runs as `ran_as`, which is what
-/// `plan` asks before anything runs.
-pub fn substitution_as(
-    job: &Job,
-    matrix: Option<&HashMap<String, Value>>,
-    ran_as: &str,
-    platform_overrides: &HashMap<String, String>,
-) -> Option<RunnerSubstitution> {
-    if job.container.as_ref().is_some_and(|c| !c.image.is_empty()) {
-        return None;
-    }
-    let labels: Vec<String> = job
-        .runs_on
+) -> Vec<String> {
+    runs_on
         .iter()
         .flatten()
         .map(|label| match matrix {
             Some(values) => crate::substitution::preprocess_command(label, values),
             None => label.clone(),
         })
-        .collect();
-    if labels
+        .collect()
+}
+
+/// The image the user mapped one of `labels` to with `--platform`, trying
+/// the labels in order.
+pub(crate) fn mapped_image<'a>(
+    labels: &[String],
+    platform_overrides: &'a HashMap<String, String>,
+) -> Option<&'a String> {
+    labels
         .iter()
-        .any(|label| platform_overrides.contains_key(&label.trim().to_ascii_lowercase()))
-    {
+        .find_map(|label| platform_overrides.get(&label.trim().to_ascii_lowercase()))
+}
+
+/// The OS a job's `runs-on` names, before knowing what it runs as.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestedOs {
+    /// The label that named it, with matrix values filled in.
+    pub label: String,
+    /// The OS, as `runner.os` spells it.
+    pub os: &'static str,
+}
+
+impl RequestedOs {
+    /// The substitution when the job runs as `ran_as`, if that's another OS.
+    pub fn ran_as(&self, ran_as: &str) -> Option<RunnerSubstitution> {
+        (!self.os.eq_ignore_ascii_case(ran_as)).then(|| RunnerSubstitution {
+            requested: self.label.clone(),
+            ran_as: ran_as.to_string(),
+        })
+    }
+}
+
+/// The OS `job` asks for, if it can be judged.
+///
+/// A job with `container:` runs on Linux on GitHub too, and a label the user
+/// mapped to an image with `--platform` is taken as their choice. Labels that
+/// name no OS, such as a custom self-hosted label, can't be judged.
+pub fn requested_os(
+    job: &Job,
+    matrix: Option<&HashMap<String, Value>>,
+    platform_overrides: &HashMap<String, String>,
+) -> Option<RequestedOs> {
+    if job.container.as_ref().is_some_and(|c| !c.image.is_empty()) {
         return None;
     }
-    let (label, os) = labels
-        .iter()
-        .find_map(|label| label_os(label).map(|os| (label, os)))?;
-    (!os.eq_ignore_ascii_case(ran_as)).then(|| RunnerSubstitution {
-        requested: label.trim().to_string(),
-        ran_as: ran_as.to_string(),
+    let labels = runs_on_labels(&job.runs_on, matrix);
+    if mapped_image(&labels, platform_overrides).is_some() {
+        return None;
+    }
+    labels.iter().find_map(|label| {
+        label_os(label).map(|os| RequestedOs {
+            label: label.trim().to_string(),
+            os,
+        })
     })
+}
+
+/// The substitution for `job`, if its `runs-on` names an OS other than the
+/// one in `env`'s `RUNNER_OS`.
+pub(crate) fn substitution(
+    job: &Job,
+    matrix: Option<&HashMap<String, Value>>,
+    env: &HashMap<String, String>,
+    platform_overrides: &HashMap<String, String>,
+) -> Option<RunnerSubstitution> {
+    requested_os(job, matrix, platform_overrides)?.ran_as(env.get("RUNNER_OS")?)
 }
 
 /// The OS a `runs-on` label names, as `runner.os` spells it.
@@ -235,6 +269,22 @@ mod tests {
         assert_eq!(entry["requested"], "macos-latest");
         assert_eq!(entry["ran_as"], "Linux");
         assert_eq!(entry["reason"], found.reason());
+    }
+
+    #[test]
+    fn the_engine_and_the_check_read_the_same_mapped_label() {
+        let job = job("runs-on: [self-hosted, \"${{ matrix.os }}\"]\nsteps: []");
+        let overrides = HashMap::from([("macos-14".to_string(), "my/mac:1".to_string())]);
+        let labels = runs_on_labels(&job.runs_on, Some(&matrix("macos-14")));
+        assert_eq!(labels, ["self-hosted", "macos-14"]);
+        assert_eq!(
+            mapped_image(&labels, &overrides).map(String::as_str),
+            Some("my/mac:1")
+        );
+        assert_eq!(
+            requested_os(&job, Some(&matrix("macos-14")), &overrides),
+            None
+        );
     }
 
     #[test]

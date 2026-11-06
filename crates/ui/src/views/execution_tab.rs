@@ -47,23 +47,26 @@ pub fn render_execution_tab(f: &mut Frame<'_>, app: &mut App, area: Rect) {
         .constraints([Constraint::Percentage(45), Constraint::Min(0)])
         .split(main[1]);
     render_steps_pane(f, workflow, selected, centre[0]);
-    render_output_pane(
-        f,
-        app,
-        workflow,
-        selected.map(|j| j.name.as_str()),
-        centre[1],
-    );
+    // The Output pane follows the cursor's row even before that job has a
+    // result, so a running job's output can be pinned among parallel ones.
+    let output_job = app
+        .job_list_state
+        .selected()
+        .and_then(|row| workflow.job_row_name(row))
+        .or(selected.map(|j| j.name.as_str()));
+    render_output_pane(f, app, workflow, output_job, centre[1]);
 }
 
-/// The job the Jobs pane cursor is on, or the most relevant one when
-/// the cursor hasn't moved onto a reported job.
+/// The reported job the Jobs pane cursor is on. With the cursor on a job
+/// not reported yet there is none; with no usable cursor, the most
+/// relevant reported job.
 fn selected_job<'a>(app: &App, workflow: &'a Workflow) -> Option<&'a JobExecution> {
     let exec = workflow.execution_details.as_ref()?;
-    app.job_list_state
-        .selected()
-        .and_then(|i| exec.jobs.get(i))
-        .or_else(|| active_job_execution(workflow))
+    match app.job_list_state.selected() {
+        Some(row) if row < exec.jobs.len() => exec.jobs.get(row),
+        Some(row) if row < workflow.job_row_count() => None,
+        _ => active_job_execution(workflow),
+    }
 }
 
 // ─── Summary strip ────────────────────────────────────────────────
@@ -224,7 +227,7 @@ fn render_jobs_pane(f: &mut Frame<'_>, app: &App, workflow: &Workflow, area: Rec
     }
 
     let w = inner.width as usize;
-    let selected = app.job_list_state.selected().filter(|&i| i < jobs.len());
+    let selected = app.job_list_state.selected().filter(|&i| i < total);
     let mut lines: Vec<Line> = Vec::with_capacity(total);
     for (i, job) in jobs.iter().enumerate() {
         // A matrix leg shows its own status, not the merged one.
@@ -254,15 +257,24 @@ fn render_jobs_pane(f: &mut Frame<'_>, app: &App, workflow: &Workflow, area: Rec
             ),
         ]));
     }
-    for name in pending {
+    for (i, name) in pending.into_iter().enumerate() {
         let (sym, sym_style) = theme::job_state(workflow.job_state(name), app.spinner_frame);
+        let is_sel = selected == Some(jobs.len() + i);
+        let row = if is_sel {
+            theme::selected_style()
+        } else {
+            Style::default()
+        };
         lines.push(Line::from(vec![
-            Span::raw("  "),
-            Span::styled(sym.to_string(), sym_style),
-            Span::raw(" "),
+            Span::styled(
+                if is_sel { theme::SELECTED_MARK } else { "  " },
+                Style::default().fg(theme::current_accent()).patch(row),
+            ),
+            Span::styled(sym.to_string(), sym_style.patch(row)),
+            Span::styled(" ", row),
             Span::styled(
                 text::truncate(&text::sanitize(name), w.saturating_sub(4)).into_owned(),
-                theme::muted_style(),
+                theme::muted_style().patch(row),
             ),
         ]));
     }
@@ -360,7 +372,7 @@ fn render_output_pane(
         .execution_details
         .as_ref()
         .filter(|exec| exec.end_time.is_none())
-        .and_then(|exec| exec.live.pick(selected))
+        .and_then(|exec| exec.live_tail_for(selected))
     {
         let title = format!(
             "Output · {} › {}{}",

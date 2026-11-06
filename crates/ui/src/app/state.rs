@@ -1049,11 +1049,7 @@ impl App {
 
     /// Move the job cursor to the first job, or the last when `last`.
     pub fn jump_job(&mut self, last: bool) {
-        let len = self
-            .shown_workflow()
-            .map(|idx| &self.workflows[idx])
-            .and_then(|w| w.execution_details.as_ref())
-            .map_or(0, |e| e.jobs.len());
+        let len = self.job_rows();
         if len == 0 {
             return;
         }
@@ -1082,52 +1078,45 @@ impl App {
         self.step_output_scroll = 0;
     }
 
+    /// Rows in the shown run's Jobs pane: reported jobs, then the ones
+    /// still running or waiting.
+    fn job_rows(&self) -> usize {
+        self.shown_workflow()
+            .map_or(0, |idx| self.workflows[idx].job_row_count())
+    }
+
     // Move cursor up in the job list
     pub fn previous_job(&mut self) {
-        let current_workflow_idx = self.shown_workflow();
-
-        if let Some(workflow_idx) = current_workflow_idx {
-            if let Some(execution) = &self.workflows[workflow_idx].execution_details {
-                if execution.jobs.is_empty() {
-                    return;
-                }
-
-                let i = match self.job_list_state.selected() {
-                    Some(i) => i.saturating_sub(1),
-                    None => 0,
-                };
-                self.job_list_state.select(Some(i));
-
-                // Reset step selection when changing jobs
-                self.step_list_state.select(Some(0));
-                self.step_table_state.select(Some(0));
-                self.step_output_scroll = 0;
-            }
+        let len = self.job_rows();
+        if len == 0 {
+            return;
         }
+        let i = match self.job_list_state.selected() {
+            Some(i) => i.min(len - 1).saturating_sub(1),
+            None => 0,
+        };
+        self.select_job_row(i);
     }
 
     // Move cursor down in the job list
     pub fn next_job(&mut self) {
-        let current_workflow_idx = self.shown_workflow();
-
-        if let Some(workflow_idx) = current_workflow_idx {
-            if let Some(execution) = &self.workflows[workflow_idx].execution_details {
-                if execution.jobs.is_empty() {
-                    return;
-                }
-
-                let i = match self.job_list_state.selected() {
-                    Some(i) => (i + 1).min(execution.jobs.len() - 1),
-                    None => 0,
-                };
-                self.job_list_state.select(Some(i));
-
-                // Reset step selection when changing jobs
-                self.step_list_state.select(Some(0));
-                self.step_table_state.select(Some(0));
-                self.step_output_scroll = 0;
-            }
+        let len = self.job_rows();
+        if len == 0 {
+            return;
         }
+        let i = match self.job_list_state.selected() {
+            Some(i) => (i + 1).min(len - 1),
+            None => 0,
+        };
+        self.select_job_row(i);
+    }
+
+    /// Put the job cursor on `row`, starting its steps from the top.
+    fn select_job_row(&mut self, row: usize) {
+        self.job_list_state.select(Some(row));
+        self.step_list_state.select(Some(0));
+        self.step_table_state.select(Some(0));
+        self.step_output_scroll = 0;
     }
 
     // Move cursor up in step list
@@ -3200,6 +3189,28 @@ mod tests {
             Some(1),
             "opens on the failed job"
         );
+    }
+
+    #[test]
+    fn the_job_cursor_reaches_jobs_that_have_not_reported_yet() {
+        let mut app = make_app();
+        app.workflow_list_state.select(Some(0));
+        app.queue_workflow(0);
+        let (idx, _) = app.get_next_workflow_to_execute().unwrap();
+        let rows = app.workflows[idx].job_row_count();
+        assert!(rows >= 2, "the test workflow needs two jobs, has {rows}");
+        app.job_list_state.select(Some(0));
+
+        // Mid-run, no results yet: the cursor still moves, and stops at
+        // the last row.
+        for _ in 0..rows + 3 {
+            app.next_job();
+        }
+        assert_eq!(app.job_list_state.selected(), Some(rows - 1));
+        app.jump_job(false);
+        assert_eq!(app.job_list_state.selected(), Some(0));
+        app.jump_job(true);
+        assert_eq!(app.job_list_state.selected(), Some(rows - 1));
     }
 
     #[test]

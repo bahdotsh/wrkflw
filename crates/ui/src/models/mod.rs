@@ -54,36 +54,71 @@ impl JobExecution {
     }
 }
 
+/// The state of a job from how its matrix legs (or the job alone) ended,
+/// each as its status and whether its failure was allowed.
+fn merged_state<'a>(legs: impl IntoIterator<Item = (&'a JobStatus, bool)> + Clone) -> JobState {
+    let failed = |allowed: bool| {
+        legs.clone()
+            .into_iter()
+            .any(|(status, a)| *status == JobStatus::Failure && a == allowed)
+    };
+    if failed(false) {
+        JobState::Failure
+    } else if failed(true) {
+        JobState::FailureAllowed
+    } else if legs
+        .clone()
+        .into_iter()
+        .all(|(status, _)| *status == JobStatus::Skipped)
+    {
+        JobState::Skipped
+    } else {
+        JobState::Success
+    }
+}
+
 impl Workflow {
-    /// State of the job keyed `key`. Results only arrive when a run
-    /// ends, so while one is in flight every unreported job counts as
-    /// running.
+    /// State of the job keyed `key`: from the run's results once it ends,
+    /// and from its events while it runs, so a job that has finished says
+    /// so before the rest of the run does.
     pub fn job_state(&self, key: &str) -> JobState {
-        let results: Vec<&JobExecution> = self
-            .execution_details
-            .as_ref()
+        let exec = self.execution_details.as_ref();
+        let results: Vec<&JobExecution> = exec
             .map(|e| e.jobs.iter().filter(|j| j.is_for(key)).collect())
             .unwrap_or_default();
-        if results.is_empty() {
-            return if self.status == WorkflowStatus::Running {
-                JobState::Running
-            } else {
-                JobState::Pending
-            };
+        if !results.is_empty() {
+            return merged_state(results.iter().map(|j| (&j.status, j.failure_allowed)));
         }
-        let failed = |allowed: bool| {
-            results
-                .iter()
-                .any(|j| j.status == JobStatus::Failure && j.failure_allowed == allowed)
-        };
-        if failed(false) {
-            JobState::Failure
-        } else if failed(true) {
-            JobState::FailureAllowed
-        } else if results.iter().all(|j| j.status == JobStatus::Skipped) {
-            JobState::Skipped
-        } else {
-            JobState::Success
+        if let Some(state) = exec.and_then(|e| e.live_job_state(key)) {
+            return state;
+        }
+        match exec {
+            // Events arrive, and none is about this job: it hasn't started.
+            Some(e) if self.status == WorkflowStatus::Running && !e.timeline.is_empty() => {
+                JobState::Pending
+            }
+            // A run that reports no events can't say which job is running.
+            Some(_) if self.status == WorkflowStatus::Running => JobState::Running,
+            _ => JobState::Pending,
+        }
+    }
+
+    /// Rows the Jobs pane lists: reported results, then the workflow keys
+    /// none of them covers yet.
+    pub fn job_row_count(&self) -> usize {
+        self.execution_details.as_ref().map_or(0, |e| e.jobs.len()) + self.unreported_jobs().len()
+    }
+
+    /// The name on Jobs pane row `row`: a reported job's own name, or the
+    /// workflow key of one not reported yet.
+    pub fn job_row_name(&self, row: usize) -> Option<&str> {
+        let jobs = self
+            .execution_details
+            .as_ref()
+            .map_or(&[][..], |e| &e.jobs[..]);
+        match jobs.get(row) {
+            Some(job) => Some(job.name.as_str()),
+            None => self.unreported_jobs().get(row - jobs.len()).copied(),
         }
     }
 
@@ -192,6 +227,81 @@ impl LiveTails {
 }
 
 impl WorkflowExecution {
+    /// The state of the job keyed `key` from the run's events, or `None`
+    /// when no leg of it has started. Once the run has ended, a leg that
+    /// never reported finishing did not finish, as the story says.
+    pub fn live_job_state(&self, key: &str) -> Option<JobState> {
+        let mut canonical: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+        let mut started = 0usize;
+        let mut ended: Vec<(&JobStatus, bool)> = Vec::new();
+        for entry in &self.timeline {
+            match entry {
+                TimelineEntry::JobStarted {
+                    job,
+                    canonical_name,
+                } => {
+                    canonical.insert(job.as_str(), canonical_name.as_str());
+                    if canonical_name == key || job == key {
+                        started += 1;
+                    }
+                }
+                TimelineEntry::JobFinished {
+                    job,
+                    status,
+                    failure_allowed,
+                    ..
+                } => {
+                    let leg_key = canonical.get(job.as_str()).copied().unwrap_or(job.as_str());
+                    if leg_key == key || job == key {
+                        ended.push((status, *failure_allowed));
+                    }
+                }
+                TimelineEntry::StepFinished { .. } => {}
+            }
+        }
+        if started == 0 && ended.is_empty() {
+            return None;
+        }
+        if ended.len() < started {
+            return Some(if self.end_time.is_some() {
+                JobState::Failure
+            } else {
+                JobState::Running
+            });
+        }
+        Some(merged_state(ended.iter().map(|(s, a)| (*s, *a))))
+    }
+
+    /// The live tail for the Jobs pane row named `name`: that job's, or for
+    /// a matrix job's key the leg that printed last. With no name, or none
+    /// that has printed, the tail [`LiveTails::pick`] chooses.
+    pub fn live_tail_for(&self, name: Option<&str>) -> Option<(&str, &LiveTail)> {
+        let Some(name) = name else {
+            return self.live.pick(None);
+        };
+        if let Some((job, tail)) = self.live.jobs.get_key_value(name) {
+            return Some((job.as_str(), tail));
+        }
+        let legs: std::collections::HashSet<&str> = self
+            .timeline
+            .iter()
+            .filter_map(|entry| match entry {
+                TimelineEntry::JobStarted {
+                    job,
+                    canonical_name,
+                } if canonical_name == name => Some(job.as_str()),
+                _ => None,
+            })
+            .collect();
+        self.live
+            .jobs
+            .iter()
+            .filter(|(job, _)| legs.contains(job.as_str()))
+            .max_by_key(|(_, tail)| (!tail.finished, tail.updated))
+            .map(|(job, tail)| (job.as_str(), tail))
+            .or_else(|| self.live.pick(None))
+    }
+
     /// Wall time of each finished job, keyed by its workflow key. A matrix
     /// job's entries ran side by side, so the key keeps the slowest.
     pub fn job_durations_ms(&self) -> std::collections::HashMap<String, u64> {
@@ -380,7 +490,9 @@ impl RunUpdate {
                 job: job.clone(),
                 index: *index,
                 step: step.clone(),
-                lines: lines.clone(),
+                // The tail keeps only this many lines, so a burst larger
+                // than that loses nothing by being cut before it is queued.
+                lines: lines[lines.len().saturating_sub(LIVE_TAIL_LINES)..].to_vec(),
             }),
             // No lines yet, but the job's tail now belongs to this step, so
             // a step that prints nothing isn't shown under the last one's name.
@@ -716,6 +828,156 @@ mod tests {
             panic!("a step event becomes a step entry");
         };
         assert!(tail.is_empty());
+    }
+
+    fn running(timeline: Vec<TimelineEntry>, jobs: &[&str]) -> Workflow {
+        Workflow {
+            name: "ci".into(),
+            path: PathBuf::from("ci.yml"),
+            selected: false,
+            status: WorkflowStatus::Running,
+            execution_details: Some(WorkflowExecution {
+                jobs: Vec::new(),
+                start_time: Local::now(),
+                end_time: None,
+                progress: 0.0,
+                timeline,
+                live: Default::default(),
+            }),
+            job_names: jobs.iter().map(|j| j.to_string()).collect(),
+            trigger_match: None,
+            definition: None,
+        }
+    }
+
+    fn started(job: &str, key: &str) -> TimelineEntry {
+        TimelineEntry::JobStarted {
+            job: job.into(),
+            canonical_name: key.into(),
+        }
+    }
+
+    fn finished(job: &str, status: JobStatus) -> TimelineEntry {
+        TimelineEntry::JobFinished {
+            job: job.into(),
+            status,
+            failure_allowed: false,
+            duration_ms: 5,
+            repeated_from: None,
+        }
+    }
+
+    #[test]
+    fn a_job_that_finished_mid_run_says_so_before_the_run_ends() {
+        let wf = running(
+            vec![
+                started("lint", "lint"),
+                started("test", "test"),
+                finished("lint", JobStatus::Success),
+            ],
+            &["lint", "test", "deploy"],
+        );
+        assert_eq!(wf.job_state("lint"), JobState::Success);
+        assert_eq!(wf.job_state("test"), JobState::Running);
+        // Not started while events arrive: it waits for an earlier stage.
+        assert_eq!(wf.job_state("deploy"), JobState::Pending);
+    }
+
+    #[test]
+    fn a_matrix_job_runs_until_its_last_leg_and_fails_with_any_leg() {
+        let mut wf = running(
+            vec![
+                started("build (os: a)", "build"),
+                started("build (os: b)", "build"),
+                finished("build (os: a)", JobStatus::Failure),
+            ],
+            &["build"],
+        );
+        assert_eq!(wf.job_state("build"), JobState::Running);
+        if let Some(exec) = wf.execution_details.as_mut() {
+            exec.timeline
+                .push(finished("build (os: b)", JobStatus::Success));
+        }
+        assert_eq!(wf.job_state("build"), JobState::Failure);
+    }
+
+    #[test]
+    fn a_job_that_never_finished_has_failed_once_the_run_ends() {
+        let mut wf = running(vec![started("test", "test")], &["test"]);
+        wf.status = WorkflowStatus::Failed;
+        if let Some(exec) = wf.execution_details.as_mut() {
+            exec.end_time = Some(Local::now());
+        }
+        assert_eq!(wf.job_state("test"), JobState::Failure);
+    }
+
+    #[test]
+    fn a_run_without_events_counts_its_jobs_as_running() {
+        // Validation reports results only at the end.
+        let wf = running(Vec::new(), &["lint"]);
+        assert_eq!(wf.job_state("lint"), JobState::Running);
+    }
+
+    #[test]
+    fn jobs_pane_rows_name_reported_jobs_then_the_rest() {
+        let mut wf = running(Vec::new(), &["lint", "test"]);
+        assert_eq!(wf.job_row_count(), 2);
+        assert_eq!(wf.job_row_name(1), Some("test"));
+        if let Some(exec) = wf.execution_details.as_mut() {
+            exec.jobs.push(JobExecution {
+                name: "test".into(),
+                canonical_name: "test".into(),
+                status: JobStatus::Success,
+                steps: Vec::new(),
+                logs: Vec::new(),
+                failure_allowed: false,
+            });
+        }
+        assert_eq!(wf.job_row_count(), 2);
+        assert_eq!(wf.job_row_name(0), Some("test"));
+        assert_eq!(wf.job_row_name(1), Some("lint"));
+        assert_eq!(wf.job_row_name(2), None);
+    }
+
+    #[test]
+    fn a_matrix_jobs_row_shows_the_leg_that_printed_last() {
+        let mut wf = running(
+            vec![
+                started("build (os: a)", "build"),
+                started("build (os: b)", "build"),
+                started("lint", "lint"),
+            ],
+            &["build", "lint"],
+        );
+        let exec = wf.execution_details.as_mut().unwrap();
+        exec.live.push("build (os: a)", 0, "make", vec!["a".into()]);
+        exec.live.push("build (os: b)", 0, "make", vec!["b".into()]);
+        exec.live.push("lint", 0, "clippy", vec!["l".into()]);
+        let pick = |name| exec.live_tail_for(name).map(|(job, _)| job.to_string());
+        // Pinned to the row, though lint printed last.
+        assert_eq!(pick(Some("build")).as_deref(), Some("build (os: b)"));
+        assert_eq!(
+            pick(Some("build (os: a)")).as_deref(),
+            Some("build (os: a)")
+        );
+        assert_eq!(pick(None).as_deref(), Some("lint"));
+        // A row with nothing printed yet falls back to the newest tail.
+        assert_eq!(pick(Some("deploy")).as_deref(), Some("lint"));
+    }
+
+    #[test]
+    fn a_big_burst_is_cut_to_the_tail_before_it_is_queued() {
+        let event = wrkflw_executor::ExecutionEvent::StepOutput {
+            job: "j".into(),
+            step: "s".into(),
+            index: 0,
+            lines: (0..LIVE_TAIL_LINES + 50).map(|i| i.to_string()).collect(),
+        };
+        let Some(RunUpdate::Output { lines, .. }) = RunUpdate::from_event(&event) else {
+            panic!("live output was not forwarded");
+        };
+        assert_eq!(lines.len(), LIVE_TAIL_LINES);
+        assert_eq!(lines.last().map(String::as_str), Some("549"));
     }
 
     #[test]

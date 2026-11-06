@@ -38,3 +38,4 @@ pub use events::{
     STDERR_HEADER, STDOUT_HEADER,
 };
 pub use kubernetes::{parse_key_value as parse_k8s_key_value, KubernetesConfig};
+pub use log_redaction::{begin_run as begin_log_scope, RunScope as LogScope};

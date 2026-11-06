@@ -220,6 +220,8 @@ pub async fn execute_workflow_cli(
         variables: Default::default(),
     };
 
+    // Held while the result is printed, so its values stay masked there.
+    let _log_scope = wrkflw_executor::begin_log_scope();
     match wrkflw_executor::execute_workflow(path, config).await {
         Ok(result) => {
             println!("{}", cli_style::section("Workflow execution results"));

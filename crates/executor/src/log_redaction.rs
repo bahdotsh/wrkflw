@@ -20,34 +20,67 @@ use once_cell::sync::Lazy;
 use std::sync::{Arc, Mutex, Once, RwLock};
 use wrkflw_secrets::SecretMasker;
 
-static LOG_MASKER: Lazy<RwLock<Arc<SecretMasker>>> =
-    Lazy::new(|| RwLock::new(Arc::new(SecretMasker::new())));
-/// How many runs are going; the masker only starts over at zero.
-static ACTIVE_RUNS: Mutex<usize> = Mutex::new(0);
+/// The values to mask, and how many runs hold them.
+struct RunMaskers {
+    masker: RwLock<Arc<SecretMasker>>,
+    /// How many runs are going; the masker only starts over at zero.
+    active: Mutex<usize>,
+}
+
+impl RunMaskers {
+    fn new() -> Self {
+        RunMaskers {
+            masker: RwLock::new(Arc::new(SecretMasker::new())),
+            active: Mutex::new(0),
+        }
+    }
+
+    fn current(&self) -> Arc<SecretMasker> {
+        self.masker
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    fn begin(&self) {
+        let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
+        if *active == 0 {
+            *self.masker.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(SecretMasker::new());
+        }
+        *active += 1;
+    }
+
+    fn end(&self) {
+        let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
+        *active = active.saturating_sub(1);
+    }
+}
+
+static LOG_MASKERS: Lazy<RunMaskers> = Lazy::new(RunMaskers::new);
 static INSTALL: Once = Once::new();
 
 fn current() -> Arc<SecretMasker> {
-    LOG_MASKER.read().unwrap_or_else(|e| e.into_inner()).clone()
+    LOG_MASKERS.current()
 }
 
 /// A run in progress, for as long as it is held. See the module docs.
+///
+/// [`crate::execute_workflow`] holds one for the run. A caller that logs
+/// about the run after it returns (its result, its error) holds one across
+/// that too, so a run starting meanwhile on another thread can't start the
+/// masker over before those lines are written.
 #[must_use = "the run's values are only kept while the scope is held"]
-pub(crate) struct RunScope(());
+pub struct RunScope(());
 
 /// Start a run: the masker starts over unless another run is going.
-pub(crate) fn begin_run() -> RunScope {
-    let mut active = ACTIVE_RUNS.lock().unwrap_or_else(|e| e.into_inner());
-    if *active == 0 {
-        *LOG_MASKER.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(SecretMasker::new());
-    }
-    *active += 1;
+pub fn begin_run() -> RunScope {
+    LOG_MASKERS.begin();
     RunScope(())
 }
 
 impl Drop for RunScope {
     fn drop(&mut self) {
-        let mut active = ACTIVE_RUNS.lock().unwrap_or_else(|e| e.into_inner());
-        *active = active.saturating_sub(1);
+        LOG_MASKERS.end();
     }
 }
 
@@ -196,25 +229,27 @@ mod tests {
 
     #[test]
     fn a_value_from_one_run_is_not_masked_in_the_next() {
-        // Other tests in this binary start runs too; while this one holds a
-        // scope, none of them can start the masker over.
-        let first = begin_run();
-        let second_overlapping = begin_run();
-        register("run-scoped-sentinel-41d");
-        drop(first);
-        assert_eq!(mask("x run-scoped-sentinel-41d"), "x ***");
-        drop(second_overlapping);
-        // Still masked after the run ends, for its summary and cleanup.
-        assert_eq!(mask("x run-scoped-sentinel-41d"), "x ***");
-        let _next = begin_run();
-        // Another test may hold a run, which keeps the value; when none
-        // does, the next run starts over.
-        if *ACTIVE_RUNS.lock().unwrap() == 1 {
-            assert_eq!(
-                mask("x run-scoped-sentinel-41d"),
-                "x run-scoped-sentinel-41d"
-            );
-        }
+        // A private instance: other tests in this binary start runs on the
+        // global one at any time.
+        let runs = RunMaskers::new();
+        runs.begin();
+        runs.begin();
+        runs.current().add_secret("run-scoped-sentinel-41d");
+        runs.end();
+        assert_eq!(runs.current().mask("x run-scoped-sentinel-41d"), "x ***");
+        // A run starting while another goes shares its values.
+        runs.begin();
+        assert_eq!(runs.current().mask("x run-scoped-sentinel-41d"), "x ***");
+        runs.end();
+        runs.end();
+        // Still masked after the last run ends, for its summary and cleanup.
+        assert_eq!(runs.current().mask("x run-scoped-sentinel-41d"), "x ***");
+        // The next run starts over.
+        runs.begin();
+        assert_eq!(
+            runs.current().mask("x run-scoped-sentinel-41d"),
+            "x run-scoped-sentinel-41d"
+        );
     }
 
     #[test]

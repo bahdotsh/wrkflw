@@ -60,6 +60,9 @@ pub enum ExecutionEvent {
 }
 
 /// Receives events on the executor's task, so it must not block for long.
+/// Live output events also arrive from the threads reading a step's pipes,
+/// under a lock that keeps lines in order: an observer that blocks there
+/// stalls both pipes, and with them the step's process.
 pub trait ExecutionObserver: Send + Sync {
     fn on_event(&self, event: &ExecutionEvent);
 

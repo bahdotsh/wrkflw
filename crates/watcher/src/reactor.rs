@@ -796,6 +796,10 @@ pub(crate) async fn evaluate_and_execute(
             let wf_path = result.workflow_path.clone();
             exec_futures.push(async move {
                 let log_path = wf_path.clone();
+                // Held across the result's log lines too: the watcher runs
+                // workflows side by side, and one starting as this one ends
+                // must not unmask its values before they are logged.
+                let _log_scope = wrkflw_executor::begin_log_scope();
                 // `AssertUnwindSafe` + `catch_unwind` contains panics
                 // from inside the executor so a single rogue workflow
                 // cannot kill the watch loop. See the type-level docs

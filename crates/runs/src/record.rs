@@ -105,3 +105,22 @@ pub struct StepRecord {
     /// Path of the step log, relative to the run directory.
     pub log: Option<String>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_job_recorded_before_repeated_from_existed_still_reads() {
+        let job: JobRecord = serde_json::from_str(
+            r#"{"name":"build","canonical_name":"build","status":"success",
+                "failure_allowed":false,"duration_ms":12,"log":null,"steps":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(job.repeated_from, None);
+        // And a job without one writes no field, as before.
+        assert!(!serde_json::to_string(&job)
+            .unwrap()
+            .contains("repeated_from"));
+    }
+}

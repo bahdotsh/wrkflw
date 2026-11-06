@@ -5,6 +5,7 @@
 //! GitHub, since steps gated on `runner.os` and anything OS-specific were
 //! never exercised. Each one is reported, so a pass isn't read as proof.
 
+use crate::engine::RuntimeType;
 use crate::events::{emit, ExecutionEvent};
 use serde_yaml::Value;
 use std::collections::HashMap;
@@ -30,6 +31,16 @@ impl RunnerSubstitution {
     }
 }
 
+/// `runner.os` as a job sees it under `runtime`: Linux in a container,
+/// the host's OS otherwise. `Auto` is resolved first, as a run does.
+pub fn runner_os_for(runtime: RuntimeType) -> String {
+    if crate::engine::detect_runtime(runtime).runs_in_container() {
+        "Linux".to_string()
+    } else {
+        crate::environment::get_runner_os()
+    }
+}
+
 /// The substitution for `job`, if its `runs-on` names an OS other than the
 /// one in `env`'s `RUNNER_OS`.
 ///
@@ -40,6 +51,17 @@ pub(crate) fn substitution(
     job: &Job,
     matrix: Option<&HashMap<String, Value>>,
     env: &HashMap<String, String>,
+    platform_overrides: &HashMap<String, String>,
+) -> Option<RunnerSubstitution> {
+    substitution_as(job, matrix, env.get("RUNNER_OS")?, platform_overrides)
+}
+
+/// The substitution for `job` when it runs as `ran_as`, which is what
+/// `plan` asks before anything runs.
+pub fn substitution_as(
+    job: &Job,
+    matrix: Option<&HashMap<String, Value>>,
+    ran_as: &str,
     platform_overrides: &HashMap<String, String>,
 ) -> Option<RunnerSubstitution> {
     if job.container.as_ref().is_some_and(|c| !c.image.is_empty()) {
@@ -60,7 +82,6 @@ pub(crate) fn substitution(
     {
         return None;
     }
-    let ran_as = env.get("RUNNER_OS")?;
     let (label, os) = labels
         .iter()
         .find_map(|label| label_os(label).map(|os| (label, os)))?;

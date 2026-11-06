@@ -96,6 +96,7 @@ fn tool_command(name: &str, args: &Value) -> Result<(Vec<String>, u64), String> 
         "plan_workflow" => {
             cli.push("plan".into());
             event_flags(&mut cli, args);
+            push_opt(&mut cli, "--runtime", string_arg(args, "runtime"));
             cli.push("--".into());
             cli.push(required_path(args)?);
         }
@@ -329,12 +330,18 @@ fn tools() -> Value {
         "runtime": run_properties["runtime"].clone(),
         "timeout_seconds": {"type": "integer", "description": "Stop the gate after this long. Default 1800."},
     });
+    let mut plan_properties = event_properties();
+    plan_properties["runtime"] = json!({
+        "type": "string",
+        "enum": ["auto", "docker", "podman", "kubernetes", "emulation", "secure-emulation"],
+        "description": "Runtime a run would use. Decides which jobs `unverified` lists.",
+    });
     let run_id = json!({"type": "string", "description": "Run id, unique prefix, or `latest`. Default `latest`."});
     json!([
         tool("validate_workflows", "Check workflow files. Returns issues with rule, YAML path, line and fix hint.", true,
             json!({"paths": {"type": "array", "items": {"type": "string"}, "description": "Files or directories. Defaults to the workflow directories."}}), &[]),
         tool("list_workflows", "List workflows and pipelines in the repository with their jobs.", true, json!({}), &[]),
-        tool("plan_workflow", "Show what a run would do without executing anything: whether the trigger fires and why, job order, matrix legs and steps.", true, event_properties(), &["path"]),
+        tool("plan_workflow", "Show what a run would do without executing anything: whether the trigger fires and why, job order, matrix legs, steps, and jobs that would run as another OS than runs-on asks for (`unverified`).", true, plan_properties, &["path"]),
         tool("run_workflow", "Execute a workflow locally. This runs the workflow's code. Returns status, job results and a failure digest. The run is recorded.", false, run_properties, &["path"]),
         tool("gate", "Run every workflow a push would trigger, reusing jobs that already passed on the same files. Returns `passed`, each workflow's status, run id and failure digest, and jobs that ran as another OS (`unverified`). Checks the working tree, not commits.", false, gate_properties, &[]),
         tool("list_runs", "List recorded runs of this repository, newest first.", true,

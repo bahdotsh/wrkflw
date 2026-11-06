@@ -1042,7 +1042,7 @@ impl RuntimeType {
         RuntimeType::Kubernetes,
     ];
 
-    fn runs_in_container(&self) -> bool {
+    pub(crate) fn runs_in_container(&self) -> bool {
         Self::CONTAINER_RUNTIMES.contains(self)
     }
 

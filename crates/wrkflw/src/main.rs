@@ -667,6 +667,10 @@ enum Commands {
         /// Warn about degraded filter contexts instead of rejecting them
         #[arg(long = "no-strict-filter", conflicts_with = "strict_filter")]
         no_strict_filter: bool,
+
+        /// Runtime the run would use. Decides which OS each job would run as
+        #[arg(short, long, value_enum, default_value = "auto")]
+        runtime: RuntimeChoice,
     },
 
     /// Remove the job workspaces kept between runs, except ones a run is
@@ -1362,6 +1366,7 @@ async fn run_cli() {
             activity_type,
             strict_filter,
             no_strict_filter,
+            runtime,
         }) => {
             plan_cmd::run(plan_cmd::PlanCtx {
                 path: path.clone(),
@@ -1378,6 +1383,8 @@ async fn run_cli() {
                 no_strict_filter: *no_strict_filter,
                 verbose,
                 format,
+                runtime: runtime.clone(),
+                platform_overrides: platform_overrides.clone(),
             })
             .await;
         }

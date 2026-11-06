@@ -556,6 +556,34 @@ fn plan_explains_without_executing() {
 }
 
 #[test]
+fn plan_names_the_legs_that_would_run_as_another_os() {
+    let sandbox = Sandbox::new();
+    sandbox.write(
+        "os.yml",
+        "name: os\non: [push]\njobs:\n  build:\n    runs-on: ${{ matrix.os }}\n    strategy:\n      matrix:\n        os: [ubuntu-latest, windows-latest]\n    steps:\n      - run: echo hi\n",
+    );
+    let output = sandbox.run(&[
+        "--format",
+        "json",
+        "plan",
+        "--runtime",
+        "docker",
+        ".github/workflows/os.yml",
+    ]);
+    assert_eq!(output.status.code(), Some(0));
+    let plan = json_doc(&output);
+    assert_eq!(
+        plan["unverified"],
+        json!([{
+            "job": "build (os: windows-latest)",
+            "requested": "windows-latest",
+            "ran_as": "Linux",
+            "reason": "runs-on asked for windows-latest, but the job ran as Linux: steps gated on runner.os and OS-specific behaviour were not checked",
+        }])
+    );
+}
+
+#[test]
 fn validate_reports_structured_issues_and_keeps_exit_codes() {
     let sandbox = Sandbox::new();
     let path = sandbox.write("broken.yml", BROKEN);

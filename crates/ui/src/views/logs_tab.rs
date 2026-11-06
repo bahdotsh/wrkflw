@@ -508,7 +508,10 @@ mod tests {
             },
         ];
         let lines = text_of(&story_lines(&timeline, None, 80, 0, false));
-        assert!(lines[0].contains("ran as Linux (windows-latest)"), "{lines:?}");
+        assert!(
+            lines[0].contains("ran as Linux (windows-latest)"),
+            "{lines:?}"
+        );
         assert!(lines[0].ends_with("1.2s"));
         let narrow = text_of(&story_lines(&timeline, None, 30, 0, false));
         assert!(text::width(&narrow[0]) <= 30, "{narrow:?} overflows");

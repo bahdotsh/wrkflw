@@ -85,6 +85,17 @@ pub struct JobRecord {
     /// because it would only have repeated that leg.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repeated_from: Option<String>,
+    /// Set when `runs-on` asked for another OS than the job ran as.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runner: Option<RunnerRecord>,
+}
+
+/// The OS a job asked for and the one it ran as. A pass on such a job says
+/// nothing about its OS-specific steps.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunnerRecord {
+    pub requested: String,
+    pub ran_as: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

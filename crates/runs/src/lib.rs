@@ -10,7 +10,7 @@ mod recorder;
 mod store;
 
 pub use digest::{failure_digest, render_digest, FailedStep, FailureDigest, DEFAULT_TAIL_LINES};
-pub use record::{JobRecord, RunRecord, RunStatus, StepRecord, SCHEMA_VERSION};
+pub use record::{JobRecord, RunRecord, RunStatus, RunnerRecord, StepRecord, SCHEMA_VERSION};
 pub use recorder::{
     detect_agent, detect_session, emit_line, execute_recorded, record_skipped, repo_root_of,
     RecordedRun, RunMeta, RunOptions,

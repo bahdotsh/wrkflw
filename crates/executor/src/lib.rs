@@ -22,6 +22,7 @@ pub(crate) mod log_redaction;
 pub(crate) mod matrix_fold;
 pub mod podman;
 pub mod run_options;
+pub mod runner_fidelity;
 pub mod substitution;
 pub(crate) mod workflow_commands;
 pub mod workspace;
@@ -39,3 +40,4 @@ pub use events::{
 };
 pub use kubernetes::{parse_key_value as parse_k8s_key_value, KubernetesConfig};
 pub use log_redaction::{begin_run as begin_log_scope, RunScope as LogScope};
+pub use runner_fidelity::RunnerSubstitution;

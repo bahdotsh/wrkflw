@@ -493,7 +493,9 @@ impl TimelineEntry {
                 job: job.clone(),
                 canonical_name: canonical_name.clone(),
             }),
-            E::StepStarted { .. } | E::StepOutput { .. } => None,
+            // The engine logs a substituted runner as a warning, which the
+            // TUI shows with the run's other logs.
+            E::StepStarted { .. } | E::StepOutput { .. } | E::RunnerSubstituted { .. } => None,
             E::StepFinished {
                 job,
                 step,

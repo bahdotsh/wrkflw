@@ -2,7 +2,7 @@
 
 use crate::digest::{failure_digest, FailureDigest, DEFAULT_TAIL_LINES};
 use crate::env;
-use crate::record::{JobRecord, RunRecord, RunStatus, StepRecord, SCHEMA_VERSION};
+use crate::record::{JobRecord, RunRecord, RunStatus, RunnerRecord, StepRecord, SCHEMA_VERSION};
 use crate::store::{history_disabled, RunStore, DEFAULT_KEEP};
 use serde_json::{json, Value};
 use std::io::Write;
@@ -282,6 +282,7 @@ impl Recorder {
                 log: None,
                 steps: Vec::new(),
                 repeated_from: None,
+                runner: None,
             });
             record.jobs.len() - 1
         });
@@ -348,12 +349,37 @@ impl Recorder {
 
 impl ExecutionObserver for Recorder {
     fn on_event(&self, event: &ExecutionEvent) {
+        if let ExecutionEvent::RunnerSubstituted {
+            job,
+            requested,
+            ran_as,
+        } = event
+        {
+            let mut record = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            Self::job_mut(&mut record, job, job).runner = Some(RunnerRecord {
+                requested: requested.clone(),
+                ran_as: ran_as.clone(),
+            });
+            self.persist(&record);
+            return;
+        }
         // Live output stays out of the record and the event stream: the
         // step's finish event carries all of it. The recorder doesn't ask
         // for it, but another observer may have.
-        let Some(line) = event_json(event) else {
+        let Some(mut line) = event_json(event) else {
             return;
         };
+        if let ExecutionEvent::JobFinished { job, .. } = event {
+            let record = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(runner) = record
+                .jobs
+                .iter()
+                .find(|j| &j.name == job)
+                .and_then(|j| j.runner.as_ref())
+            {
+                line["runner"] = json!(runner);
+            }
+        }
         self.line(line);
         let mut record = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let id = record.id.clone();
@@ -365,7 +391,9 @@ impl ExecutionObserver for Recorder {
                 Self::job_mut(&mut record, job, canonical_name);
                 self.persist(&record);
             }
-            ExecutionEvent::StepStarted { .. } | ExecutionEvent::StepOutput { .. } => {}
+            ExecutionEvent::StepStarted { .. }
+            | ExecutionEvent::StepOutput { .. }
+            | ExecutionEvent::RunnerSubstituted { .. } => {}
             ExecutionEvent::StepFinished {
                 job,
                 step,
@@ -437,7 +465,9 @@ fn event_json(event: &ExecutionEvent) -> Option<Value> {
         ExecutionEvent::StepStarted { job, step, index } => {
             json!({"type": "step_started", "job": job, "step": step, "index": index})
         }
-        ExecutionEvent::StepOutput { .. } => return None,
+        ExecutionEvent::StepOutput { .. } | ExecutionEvent::RunnerSubstituted { .. } => {
+            return None
+        }
         ExecutionEvent::StepFinished {
             job,
             step,
@@ -571,15 +601,48 @@ fn run_finished_json(record: &RunRecord, digest: Option<&FailureDigest>) -> Valu
         "status": record.status.as_str(),
         "exit_code": i32::from(matches!(record.status, RunStatus::Failure | RunStatus::Error)),
         "duration_ms": record.duration_ms,
-        "jobs": record.jobs.iter().map(|job| json!({
-            "name": job.name,
-            "status": job.status,
-            "failure_allowed": job.failure_allowed,
-        })).collect::<Vec<_>>(),
+        "jobs": record.jobs.iter().map(|job| {
+            let mut entry = json!({
+                "name": job.name,
+                "status": job.status,
+                "failure_allowed": job.failure_allowed,
+            });
+            if let Some(original) = &job.repeated_from {
+                entry["repeated_from"] = json!(original);
+            }
+            if let Some(runner) = &job.runner {
+                entry["runner"] = json!(runner);
+            }
+            entry
+        }).collect::<Vec<_>>(),
+        "unverified": unverified(record),
         "error": record.error,
         "skip_reason": record.skip_reason,
         "failure": digest,
     })
+}
+
+/// Jobs whose result can't stand for GitHub's, because they ran as another
+/// OS than `runs-on` asked for. A skipped job ran nothing, so it isn't one.
+fn unverified(record: &RunRecord) -> Vec<Value> {
+    record
+        .jobs
+        .iter()
+        .filter(|job| job.status != "skipped")
+        .filter_map(|job| {
+            let runner = job.runner.as_ref()?;
+            Some(json!({
+                "job": job.name,
+                "requested": runner.requested,
+                "ran_as": runner.ran_as,
+                "reason": wrkflw_executor::RunnerSubstitution {
+                    requested: runner.requested.clone(),
+                    ran_as: runner.ran_as.clone(),
+                }
+                .reason(),
+            }))
+        })
+        .collect()
 }
 
 /// Execute a workflow with recording and event streaming per `options`.
@@ -815,6 +878,46 @@ mod tests {
     }
 
     #[test]
+    fn a_job_run_as_another_os_is_unverified_unless_skipped() {
+        let job = |name: &str, status: &str| JobRecord {
+            name: name.to_string(),
+            canonical_name: "b".to_string(),
+            status: status.to_string(),
+            failure_allowed: false,
+            duration_ms: None,
+            log: None,
+            steps: Vec::new(),
+            repeated_from: None,
+            runner: Some(RunnerRecord {
+                requested: "windows-latest".to_string(),
+                ran_as: "Linux".to_string(),
+            }),
+        };
+        let mut record: RunRecord = serde_json::from_value(json!({
+            "schema_version": SCHEMA_VERSION, "id": "r", "status": "success",
+            "workflow": "ci.yml", "cwd": "/repo", "repo_root": "/repo", "git_sha": null,
+            "git_branch": null, "git_dirty": null, "runtime": "docker", "event": null,
+            "source": "cli", "agent": null, "intent": null, "session": null,
+            "replay_of": null, "argv": [], "variables": [], "pid": 1, "started_at": "",
+            "finished_at": null, "duration_ms": null, "error": null, "skip_reason": null,
+            "jobs": [],
+        }))
+        .unwrap();
+        record.jobs = vec![
+            job("b (os: windows-latest)", "success"),
+            job("c", "skipped"),
+        ];
+        record.jobs[0].repeated_from = Some("b (os: ubuntu-latest)".to_string());
+        let line = run_finished_json(&record, None);
+        assert_eq!(line["unverified"].as_array().unwrap().len(), 1);
+        assert_eq!(line["unverified"][0]["job"], "b (os: windows-latest)");
+        assert_eq!(line["unverified"][0]["ran_as"], "Linux");
+        assert_eq!(line["jobs"][0]["repeated_from"], "b (os: ubuntu-latest)");
+        assert_eq!(line["jobs"][0]["runner"]["requested"], "windows-latest");
+        assert!(line["jobs"][1].get("repeated_from").is_none());
+    }
+
+    #[test]
     fn run_finished_fields_are_pinned() {
         let record: RunRecord = serde_json::from_value(json!({
             "schema_version": SCHEMA_VERSION,
@@ -855,6 +958,7 @@ mod tests {
                 "skip_reason",
                 "status",
                 "type",
+                "unverified",
             ]
         );
     }

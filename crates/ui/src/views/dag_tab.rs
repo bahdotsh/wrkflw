@@ -36,10 +36,9 @@ pub fn render_dag_tab(f: &mut Frame<'_>, app: &mut App, area: Rect) {
         render_legend(f, app, body[1]);
     }
 
-    let workflow = app
-        .workflow_list_state
-        .selected()
-        .and_then(|i| app.workflows.get(i));
+    // The run's workflow while one runs, as the Jobs and Log views show;
+    // otherwise ↑↓ browse every workflow's graph.
+    let workflow = app.shown_workflow().and_then(|i| app.workflows.get(i));
     let Some(workflow) = workflow else {
         let block = theme::block_focused("Graph");
         let inner = block.inner(body[0]);
@@ -108,7 +107,9 @@ impl Timing {
         let exec = workflow.execution_details.as_ref();
         let durations = exec.map(|e| e.job_durations_ms()).unwrap_or_default();
         let settled = exec.is_some_and(|e| e.end_time.is_some());
-        let unfinished = exec.map(|e| e.unfinished_jobs()).unwrap_or_default();
+        let unfinished = exec
+            .map(|e| e.unfinished_jobs(&workflow.all_matrix_legs()))
+            .unwrap_or_default();
         // Mid-run, unfinished jobs would count as taking no time, and the
         // path would move as they finish; it is only drawn once it's known.
         let critical = if settled {
@@ -586,7 +587,7 @@ mod timing_tests {
             durations: exec.job_durations_ms(),
             critical: HashSet::new(),
             settled: false,
-            unfinished: exec.unfinished_jobs(),
+            unfinished: exec.unfinished_jobs(&HashMap::new()),
         };
 
         exec.timeline.push(finished("build (os: a)", 900));
@@ -594,5 +595,25 @@ mod timing_tests {
 
         exec.timeline.push(finished("build (os: b)", 1_400));
         assert_eq!(timing(&exec).stage_ms(&layer), Some(1_400));
+
+        // With `max-parallel: 2`, a four-leg matrix runs in two batches;
+        // between them every started leg has ended, but two haven't begun.
+        let legs = HashMap::from([("build".to_string(), 4)]);
+        let batched = Timing {
+            durations: exec.job_durations_ms(),
+            critical: HashSet::new(),
+            settled: false,
+            unfinished: exec.unfinished_jobs(&legs),
+        };
+        assert_eq!(
+            batched.stage_ms(&layer),
+            None,
+            "the next batch hasn't started"
+        );
+        for leg in ["build (os: c)", "build (os: d)"] {
+            exec.timeline.push(started(leg));
+            exec.timeline.push(finished(leg, 300));
+        }
+        assert!(exec.unfinished_jobs(&legs).is_empty());
     }
 }

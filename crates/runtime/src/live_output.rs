@@ -16,16 +16,28 @@ use tokio::io::AsyncReadExt;
 /// Receives raw output chunks, stdout and stderr alike. It may be called
 /// from any thread and must not block for long.
 #[derive(Clone)]
-pub struct OutputTap(Arc<dyn Fn(&str) + Send + Sync>);
+pub struct OutputTap(Arc<TapFn>);
+
+/// What a tap calls with each chunk of a stream.
+type TapFn = dyn Fn(Stream, &str) + Send + Sync;
+
+/// Which of a process's output streams a chunk came from. The two are
+/// written independently, so a partial line on one is no part of a line on
+/// the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stream {
+    Stdout,
+    Stderr,
+}
 
 impl OutputTap {
-    pub fn new(f: impl Fn(&str) + Send + Sync + 'static) -> Self {
+    pub fn new(f: impl Fn(Stream, &str) + Send + Sync + 'static) -> Self {
         OutputTap(Arc::new(f))
     }
 
-    pub fn send(&self, chunk: &str) {
+    pub fn send(&self, stream: Stream, chunk: &str) {
         if !chunk.is_empty() {
-            (self.0)(chunk);
+            (self.0)(stream, chunk);
         }
     }
 }
@@ -68,10 +80,17 @@ fn incomplete_tail(bytes: &[u8]) -> usize {
     while start < bytes.len() && bytes[start] & 0b1100_0000 == 0b1000_0000 {
         start += 1;
     }
-    match std::str::from_utf8(&bytes[start..]) {
-        // `error_len() == None`: the input ended inside a valid prefix.
-        Err(e) if e.error_len().is_none() => bytes.len() - start - e.valid_up_to(),
-        _ => 0,
+    loop {
+        match std::str::from_utf8(&bytes[start..]) {
+            // `error_len() == None`: the input ended inside a valid prefix.
+            Err(e) if e.error_len().is_none() => return bytes.len() - start - e.valid_up_to(),
+            // An invalid byte; a valid prefix may still follow it.
+            Err(e) => start += e.valid_up_to() + e.error_len().unwrap_or(1),
+            Ok(_) => return 0,
+        }
+        if start >= bytes.len() {
+            return 0;
+        }
     }
 }
 
@@ -89,10 +108,10 @@ pub fn current() -> Option<OutputTap> {
     TAP.try_with(|tap| tap.clone()).ok()
 }
 
-/// Send `chunk` to the active tap, if any.
-pub fn send(chunk: &str) {
+/// Send `chunk` of `stream` to the active tap, if any.
+pub fn send(stream: Stream, chunk: &str) {
     if let Some(tap) = current() {
-        tap.send(chunk);
+        tap.send(stream, chunk);
     }
 }
 
@@ -108,8 +127,8 @@ pub async fn wait_with_live_output(
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     let (stdout, stderr, status) = tokio::join!(
-        read_live(stdout, &tap),
-        read_live(stderr, &tap),
+        read_live(stdout, Stream::Stdout, &tap),
+        read_live(stderr, Stream::Stderr, &tap),
         child.wait()
     );
     Ok(std::process::Output {
@@ -121,6 +140,7 @@ pub async fn wait_with_live_output(
 
 async fn read_live<R: tokio::io::AsyncRead + Unpin>(
     pipe: Option<R>,
+    stream: Stream,
     tap: &OutputTap,
 ) -> std::io::Result<Vec<u8>> {
     let mut all = Vec::new();
@@ -132,10 +152,10 @@ async fn read_live<R: tokio::io::AsyncRead + Unpin>(
     loop {
         let n = pipe.read(&mut buf).await?;
         if n == 0 {
-            tap.send(&text.finish());
+            tap.send(stream, &text.finish());
             return Ok(all);
         }
-        tap.send(&text.push(&buf[..n]));
+        tap.send(stream, &text.push(&buf[..n]));
         all.extend_from_slice(&buf[..n]);
     }
 }
@@ -151,6 +171,7 @@ pub fn blocking_wait_with_live_output(
     };
     fn read_pipe<R: std::io::Read + Send + 'static>(
         pipe: Option<R>,
+        stream: Stream,
         tap: OutputTap,
     ) -> std::thread::JoinHandle<std::io::Result<Vec<u8>>> {
         std::thread::spawn(move || {
@@ -163,16 +184,16 @@ pub fn blocking_wait_with_live_output(
             loop {
                 let n = pipe.read(&mut buf)?;
                 if n == 0 {
-                    tap.send(&text.finish());
+                    tap.send(stream, &text.finish());
                     return Ok(all);
                 }
-                tap.send(&text.push(&buf[..n]));
+                tap.send(stream, &text.push(&buf[..n]));
                 all.extend_from_slice(&buf[..n]);
             }
         })
     }
-    let stdout = read_pipe(child.stdout.take(), tap.clone());
-    let stderr = read_pipe(child.stderr.take(), tap);
+    let stdout = read_pipe(child.stdout.take(), Stream::Stdout, tap.clone());
+    let stderr = read_pipe(child.stderr.take(), Stream::Stderr, tap);
     let status = child.wait()?;
     let joined = |handle: std::thread::JoinHandle<std::io::Result<Vec<u8>>>| {
         handle
@@ -195,7 +216,7 @@ mod tests {
         let seen = Arc::new(Mutex::new(String::new()));
         let sink = seen.clone();
         (
-            OutputTap::new(move |chunk| sink.lock().unwrap().push_str(chunk)),
+            OutputTap::new(move |_, chunk| sink.lock().unwrap().push_str(chunk)),
             seen,
         )
     }
@@ -250,6 +271,14 @@ mod tests {
         let mut chunks = Utf8Chunks::default();
         let out: String = bytes.iter().map(|b| chunks.push(&[*b])).collect();
         assert_eq!(out + &chunks.finish(), text);
+    }
+
+    #[test]
+    fn a_partial_character_after_an_invalid_byte_is_still_held() {
+        let mut text = Utf8Chunks::default();
+        // 0xFF can never start a character; "日" is E6 97 A5.
+        assert_eq!(text.push(&[b'a', 0xFF, 0xE6, 0x97]), "a\u{FFFD}");
+        assert_eq!(text.push(&[0xA5, b'b']), "日b");
     }
 
     #[test]

@@ -33,6 +33,36 @@ fn workflow_file() -> Option<PathBuf> {
     WORKFLOW_FILE.try_with(|path| path.clone()).ok()
 }
 
+tokio::task_local! {
+    /// The jobs that called the reusable workflow being run, outermost
+    /// first, so two jobs that call the same workflow with different inputs
+    /// don't share its jobs' workspaces.
+    static CALLERS: String;
+}
+
+/// Run `future` as part of the reusable workflow `job` calls.
+pub(crate) async fn with_caller_job<F: Future>(job: &str, future: F) -> F::Output {
+    let callers = match CALLERS.try_with(|outer| outer.clone()) {
+        Ok(outer) => format!("{outer}\0{job}"),
+        Err(_) => job.to_string(),
+    };
+    CALLERS.scope(callers, future).await
+}
+
+fn callers() -> Option<String> {
+    CALLERS.try_with(|callers| callers.clone()).ok()
+}
+
+/// The workflow part of a workspace key. Keys of jobs outside a reusable
+/// workflow are the workflow name alone, as before, so their saved
+/// workspaces stay valid.
+fn workflow_key(workflow: &str, callers: Option<&str>) -> String {
+    match callers {
+        Some(callers) => format!("{workflow}\0called by\0{callers}"),
+        None => workflow.to_string(),
+    }
+}
+
 pub(crate) enum JobWorkspace {
     /// Kept between runs; the lock is held for as long as the job runs.
     Kept { path: PathBuf, _lock: File },
@@ -58,12 +88,13 @@ impl JobWorkspace {
         };
         let file = workflow_file();
         let file = file.as_deref().unwrap_or(Path::new(""));
-        match Self::keep(&root, repo, file, workflow, job) {
+        let workflow = workflow_key(workflow, callers().as_deref());
+        match Self::keep(&root, repo, file, &workflow, job) {
             Ok(Some(workspace)) => Ok(workspace),
             Ok(None) => {
                 wrkflw_logging::info(&format!(
-                    "Job '{}': its saved workspace is in use by another run, so this run \
-                     starts from an empty one",
+                    "Job '{}': its saved workspace is in use by another run or by `wrkflw \
+                     clean`, so this run starts from an empty one",
                     job
                 ));
                 Self::fresh()
@@ -148,6 +179,16 @@ impl JobWorkspace {
     }
 }
 
+/// Where checkout records what git tracked at the last sync of the kept
+/// workspace `workspace`, or `None` when it isn't a kept one. The record
+/// sits beside the workspace, as its lock does, so the job can't change it.
+pub(crate) fn tracked_record(workspace: &Path) -> Option<PathBuf> {
+    workspace
+        .with_extension("lock")
+        .is_file()
+        .then(|| workspace.with_extension("tracked"))
+}
+
 /// Env var that moves kept workspaces out of the cache directory.
 pub const WORKSPACES_DIR_ENV: &str = "WRKFLW_WORKSPACES_DIR";
 
@@ -179,7 +220,12 @@ pub fn workspaces_root() -> Option<PathBuf> {
 
 fn root_from(configured: Option<std::ffi::OsString>, cache: Option<PathBuf>) -> Option<PathBuf> {
     match configured {
-        Some(dir) if !dir.is_empty() => Some(PathBuf::from(dir)),
+        // Made absolute once, so a relative value names one directory
+        // whatever the current directory, and works as a bind mount source.
+        Some(dir) if !dir.is_empty() => {
+            let dir = PathBuf::from(dir);
+            Some(std::path::absolute(&dir).unwrap_or(dir))
+        }
         _ => Some(cache?.join("wrkflw").join("workspaces")),
     }
 }
@@ -208,8 +254,11 @@ pub fn clean() -> std::io::Result<CleanReport> {
 
 fn clean_under(root: &Path) -> std::io::Result<CleanReport> {
     let mut report = CleanReport::default();
-    let Ok(repos) = std::fs::read_dir(root) else {
-        return Ok(report);
+    let repos = match std::fs::read_dir(root) {
+        Ok(repos) => repos,
+        // Nothing was ever kept.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(report),
+        Err(e) => return Err(e),
     };
     for repo in repos.flatten() {
         let repo = repo.path();
@@ -262,6 +311,9 @@ fn clean_under(root: &Path) -> std::io::Result<CleanReport> {
                 Ok(()) => {
                     report.removed += 1;
                     report.bytes += bytes;
+                    // The record describes the files just removed. Held
+                    // under the lock, so no run is about to read it.
+                    let _ = std::fs::remove_file(dir.with_extension("tracked"));
                 }
                 // Part of it may be gone; what is left is counted next time.
                 Err(e) => report.failed.push((dir, e.to_string())),
@@ -332,14 +384,68 @@ mod tests {
             root_from(Some("".into()), cache.clone()),
             Some(PathBuf::from("/cache/wrkflw/workspaces"))
         );
+        // `/big/disk` is absolute on Unix; on Windows it gains the current
+        // drive, as any path without one does.
+        let big = std::path::absolute("/big/disk").unwrap();
         assert_eq!(
             root_from(Some("/big/disk".into()), cache),
-            Some(PathBuf::from("/big/disk"))
+            Some(big.clone())
         );
+        assert_eq!(root_from(Some("/big/disk".into()), None), Some(big));
+        let relative = root_from(Some("ws".into()), None).unwrap();
+        assert!(relative.is_absolute());
+        assert_eq!(relative, std::env::current_dir().unwrap().join("ws"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clean_reports_a_root_it_cannot_read() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let locked = root.path().join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let readable = std::fs::read_dir(&locked).is_ok();
+        let result = clean_under(&locked);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Root can read anything; the check only means something otherwise.
+        if !readable {
+            assert!(result.is_err());
+        }
         assert_eq!(
-            root_from(Some("/big/disk".into()), None),
-            Some(PathBuf::from("/big/disk"))
+            clean_under(&root.path().join("missing")).unwrap(),
+            CleanReport::default()
         );
+    }
+
+    #[tokio::test]
+    async fn callers_of_one_reusable_workflow_get_their_own_workspaces() {
+        let key = |callers: Option<&str>| workflow_key("Build", callers);
+        let seen_a = with_caller_job("build-a", async { callers() }).await;
+        let seen_b = with_caller_job("build-b", async { callers() }).await;
+        let nested = with_caller_job("outer", with_caller_job("inner", async { callers() })).await;
+        assert_eq!(seen_a.as_deref(), Some("build-a"));
+        assert_eq!(nested.as_deref(), Some("outer\0inner"));
+        assert_eq!(callers(), None);
+
+        let root = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let ws = |workflow: String| {
+            JobWorkspace::keep(
+                root.path(),
+                repo.path(),
+                Path::new(CI),
+                &workflow,
+                "compile",
+            )
+            .unwrap()
+            .unwrap()
+        };
+        let a = ws(key(seen_a.as_deref()));
+        let b = ws(key(seen_b.as_deref()));
+        assert_ne!(a.path(), b.path());
+        drop((a, b));
+        assert_eq!(key(None), "Build");
     }
 
     #[test]
@@ -449,6 +555,11 @@ mod tests {
             .unwrap();
         let free_path = free.path().to_path_buf();
         std::fs::write(free_path.join("out.o"), "built").unwrap();
+        assert_eq!(
+            tracked_record(&free_path),
+            Some(free_path.with_extension("tracked"))
+        );
+        std::fs::write(free_path.with_extension("tracked"), "out.o\0").unwrap();
         drop(free);
         let held = JobWorkspace::keep(root.path(), repo.path(), Path::new(CI), "CI", "test")
             .unwrap()
@@ -465,6 +576,7 @@ mod tests {
             }
         );
         assert!(!free_path.exists());
+        assert!(!free_path.with_extension("tracked").exists());
         assert!(held.path().is_dir());
 
         // The cleaned workspace comes back, empty, on the next run.

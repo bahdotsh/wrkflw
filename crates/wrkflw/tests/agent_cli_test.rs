@@ -1104,3 +1104,52 @@ fn mcp_install_registers_once_and_leaves_other_commands_alone() {
     assert_eq!(written["mcpServers"]["wrkflw"]["env"], json!({"A": "1"}));
     assert_ne!(written["mcpServers"]["wrkflw"]["command"], "/old/wrkflw");
 }
+
+#[test]
+fn clean_reports_its_json_type_and_exits_1_when_a_workspace_stays() {
+    use std::os::unix::fs::PermissionsExt;
+    let sandbox = Sandbox::new();
+    let root = TempDir::new().unwrap();
+    let job = root.path().join("repo-0000").join("build-0000");
+    fs::create_dir_all(&job).unwrap();
+    fs::write(job.join("out.o"), "built").unwrap();
+    let clean = || {
+        sandbox
+            .command(&["--format", "json", "clean"])
+            .env("WRKFLW_WORKSPACES_DIR", root.path())
+            .output()
+            .unwrap()
+    };
+
+    let output = clean();
+    assert!(output.status.success(), "{output:?}");
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["type"], "clean");
+    assert!(report["schema_version"].is_number());
+    assert_eq!(report["removed"], 1);
+    assert_eq!(report["bytes"], 5);
+    assert_eq!(report["failed"], json!([]));
+    assert!(!job.exists());
+
+    // A workspace whose contents can't be removed fails the command after
+    // the rest is cleaned. Root removes anything, so only check otherwise.
+    let stuck = root.path().join("repo-0000").join("stuck-0000");
+    fs::create_dir_all(stuck.join("ro")).unwrap();
+    fs::write(stuck.join("ro").join("f"), "x").unwrap();
+    fs::set_permissions(stuck.join("ro"), fs::Permissions::from_mode(0o555)).unwrap();
+    let removable = fs::remove_file(stuck.join("ro").join("f")).is_ok();
+    if !removable {
+        let output = clean();
+        fs::set_permissions(stuck.join("ro"), fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["type"], "clean");
+        assert_eq!(report["failed"].as_array().unwrap().len(), 1);
+        assert!(report["failed"][0]["path"]
+            .as_str()
+            .unwrap()
+            .ends_with("stuck-0000"));
+    } else {
+        fs::set_permissions(stuck.join("ro"), fs::Permissions::from_mode(0o755)).unwrap();
+    }
+}

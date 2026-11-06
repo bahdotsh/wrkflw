@@ -203,8 +203,9 @@ pub fn render_help_overlay(f: &mut Frame<'_>, scroll: &mut usize) {
         (screen.width, screen.height)
     } else {
         (
-            (screen.width * 9 / 10).min(120),
-            (screen.height * 9 / 10).min(38),
+            // In u32: nine tenths of a very wide terminal overflows a u16.
+            (u32::from(screen.width) * 9 / 10).min(120) as u16,
+            (u32::from(screen.height) * 9 / 10).min(38) as u16,
         )
     };
     let area = theme::modal(f, width, height);

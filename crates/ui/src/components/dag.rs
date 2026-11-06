@@ -1,16 +1,6 @@
-// Job-dependency helpers: topological stages and the compact stage list
-// the Execution tab shows beside a run.
+// Job-dependency helpers: topological stages and matrix sizes, which the
+// Run tab's graph lays jobs out by.
 
-use crate::models::{JobState, Workflow};
-use crate::text;
-use crate::theme::{self, COLORS};
-use ratatui::{
-    layout::Rect,
-    style::{Modifier, Style},
-    text::{Line, Span},
-    widgets::Paragraph,
-    Frame,
-};
 use std::collections::{HashMap, HashSet};
 use wrkflw_parser::workflow::WorkflowDefinition;
 
@@ -72,49 +62,6 @@ pub fn topo_levels(def: &WorkflowDefinition) -> Vec<Vec<String>> {
         levels.push(layer);
     }
     levels
-}
-
-/// Compact stage-by-stage job list for side panes.
-pub fn render(frame: &mut Frame<'_>, area: Rect, workflow: &Workflow, spinner_frame: usize) {
-    let Some(def) = workflow.definition.as_deref() else {
-        theme::empty_state(frame, area, "Couldn't parse this workflow", vec![]);
-        return;
-    };
-    let levels = topo_levels(def);
-    if levels.is_empty() {
-        theme::empty_state(frame, area, "No jobs", vec![]);
-        return;
-    }
-
-    let w = area.width as usize;
-    let mut lines: Vec<Line> = Vec::new();
-    for (li, layer) in levels.iter().enumerate() {
-        lines.push(Line::from(Span::styled(
-            format!("Stage {}", li + 1),
-            Style::default()
-                .fg(COLORS.text_muted)
-                .add_modifier(Modifier::BOLD),
-        )));
-        for name in layer {
-            let state = workflow.job_state(name);
-            let (glyph, style) = theme::job_state(state, spinner_frame);
-            let name_style = match state {
-                JobState::Pending | JobState::Skipped => Style::default().fg(COLORS.text_muted),
-                JobState::Failure => Style::default().fg(COLORS.error),
-                _ => Style::default().fg(COLORS.text),
-            };
-            lines.push(Line::from(vec![
-                Span::styled("├ ", Style::default().fg(COLORS.border)),
-                Span::styled(glyph.to_string(), style),
-                Span::raw(" "),
-                Span::styled(
-                    text::truncate(&text::sanitize(name), w.saturating_sub(4)).into_owned(),
-                    name_style,
-                ),
-            ]));
-        }
-    }
-    frame.render_widget(Paragraph::new(lines), area);
 }
 
 /// How many runs a matrix job expands into, `?` when that is only known

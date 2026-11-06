@@ -588,6 +588,9 @@ pub async fn execute_recorded(
     config: ExecutionConfig,
     options: RunOptions,
 ) -> RecordedRun {
+    // Held until the run is recorded, so its values stay masked in what
+    // is logged about it after `execute_workflow` returns.
+    let _log_scope = wrkflw_executor::begin_log_scope();
     let recorder = begin(path, &config, &options).await;
     let mut observers: Vec<Arc<dyn ExecutionObserver>> = vec![recorder.clone()];
     observers.extend(options.observers.iter().cloned());

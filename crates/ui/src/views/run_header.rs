@@ -31,13 +31,9 @@ pub fn render_run_header(f: &mut Frame<'_>, app: &App, area: Rect) {
             vertical: 0,
         }));
 
-    // The graph follows the Workflows cursor; jobs and log follow the run.
-    let idx = if app.selected_tab == TAB_DAG {
-        app.workflow_list_state.selected()
-    } else {
-        app.shown_workflow()
-    };
-    match idx.and_then(|i| app.workflows.get(i)) {
+    // Every view of the Run tab shows the same workflow: the one running,
+    // else the one under the Workflows cursor.
+    match app.shown_workflow().and_then(|i| app.workflows.get(i)) {
         Some(workflow) => execution_tab::render_summary_line(f, app, workflow, rows[0]),
         None => f.render_widget(
             Paragraph::new(Span::styled("No workflow selected", theme::muted_style())),

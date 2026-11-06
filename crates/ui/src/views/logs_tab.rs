@@ -385,14 +385,13 @@ fn render_story(f: &mut Frame<'_>, app: &mut App, area: Rect) {
         exec.end_time.is_some(),
     );
     if let Some(end) = exec.end_time {
-        let secs = end
+        let ms = end
             .signed_duration_since(exec.start_time)
-            .num_seconds()
-            .max(0);
+            .num_milliseconds();
         lines.push(Line::from(Span::styled(
             format!(
                 "finished in {}",
-                crate::views::execution_tab::format_duration(secs)
+                crate::views::execution_tab::format_run_time(ms, true)
             ),
             theme::muted_style(),
         )));

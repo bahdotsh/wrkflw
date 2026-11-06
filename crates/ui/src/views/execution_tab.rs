@@ -167,8 +167,9 @@ pub(super) fn render_summary_line(f: &mut Frame<'_>, app: &App, workflow: &Workf
 pub(crate) fn format_ms(ms: u64) -> String {
     match ms {
         ms if ms < 1000 => format!("{ms}ms"),
-        ms if ms < 60_000 => format!("{:.1}s", ms as f64 / 1000.0),
-        ms => format_duration((ms / 1000) as i64),
+        // Up to 59.9s; anything that would round to "60.0s" is a minute.
+        ms if ms < 59_950 => format!("{:.1}s", ms as f64 / 1000.0),
+        ms => format_duration((ms.max(60_000) / 1000) as i64),
     }
 }
 
@@ -484,6 +485,14 @@ fn render_empty_state(f: &mut Frame<'_>, area: Rect) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_time_just_under_a_minute_reads_as_one() {
+        assert_eq!(super::format_ms(59_949), "59.9s");
+        assert_eq!(super::format_ms(59_950), "1m 00s");
+        assert_eq!(super::format_ms(59_999), "1m 00s");
+        assert_eq!(super::format_ms(61_000), "1m 01s");
+    }
+
     use super::format_duration;
 
     #[test]

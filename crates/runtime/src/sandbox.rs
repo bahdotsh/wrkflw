@@ -363,7 +363,10 @@ impl Sandbox {
         // Execute with timeout
         let timeout_duration = self.config.max_execution_time;
 
-        wrkflw_logging::info(&format!(
+        // Debug, as in the emulation runtime: the script carries substituted
+        // secrets, which the log redactor masks but which `--verbose`
+        // shouldn't print at all by default.
+        wrkflw_logging::debug(&format!(
             "🏃 Executing sandboxed command: {} (timeout: {}s)",
             command.join(" "),
             timeout_duration.as_secs()

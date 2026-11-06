@@ -39,6 +39,9 @@ pub async fn execute_workflow(
     workflow_path: &Path,
     config: ExecutionConfig,
 ) -> Result<ExecutionResult, ExecutionError> {
+    // Held until the run ends; values it registers stay masked in the
+    // logs until the next run starts.
+    let _log_scope = crate::log_redaction::begin_run();
     wrkflw_logging::info(&format!("Executing workflow: {}", workflow_path.display()));
     wrkflw_logging::info(&format!("Runtime: {:?}", config.runtime_type));
 
@@ -433,9 +436,8 @@ async fn execute_gitlab_pipeline(
     // `--variable` values are often credentials, and they are never stored
     // on purpose, so they can't be left to reach the step logs either.
     secret_masker.add_secrets(config.variables.values().cloned());
-    // The log masker is process-wide and permanent, so it only takes the
-    // variables that look like credentials; `BRANCH=main` must not turn
-    // every later "main" in the logs into `***`.
+    // The log masker only takes the variables that look like credentials;
+    // `BRANCH=main` must not turn every "main" in the run's logs into `***`.
     crate::log_redaction::register_variables(&config.variables);
 
     // Create artifact store for this pipeline run

@@ -761,8 +761,14 @@ impl PodmanRuntime {
         volumes: &[(&Path, &Path)],
         entrypoint: Option<&str>,
     ) -> Result<ContainerOutput, ContainerError> {
-        wrkflw_logging::debug(&format!("Running command in Podman: {:?}", cmd));
-        wrkflw_logging::debug(&format!("Environment: {:?}", env_vars));
+        wrkflw_logging::debug(&format!(
+            "Running command in Podman: {}",
+            crate::log_redaction::args_for_log(cmd)
+        ));
+        wrkflw_logging::debug(&format!(
+            "Environment variables: {}",
+            crate::log_redaction::env_names_for_log(env_vars.iter().map(|(k, _)| *k))
+        ));
         wrkflw_logging::debug(&format!("Working directory: {}", working_dir.display()));
 
         // Generate a unique container name
@@ -936,7 +942,10 @@ impl PodmanRuntime {
                         "Podman command failed with exit code: {}",
                         output.exit_code
                     ));
-                    wrkflw_logging::debug(&format!("Failed command: {:?}", cmd));
+                    wrkflw_logging::debug(&format!(
+                        "Failed command: {}",
+                        crate::log_redaction::args_for_log(cmd)
+                    ));
                     wrkflw_logging::debug(&format!("Working directory: {}", working_dir.display()));
                     wrkflw_logging::debug(&format!("STDERR: {}", output.stderr));
                 }

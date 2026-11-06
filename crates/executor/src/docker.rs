@@ -1016,8 +1016,17 @@ impl DockerRuntime {
         // Convert command vector to Vec<String>
         let cmd_vec: Vec<String> = cmd.iter().map(|&s| s.to_string()).collect();
 
-        wrkflw_logging::debug(&format!("Running command in Docker: {:?}", cmd_vec));
-        wrkflw_logging::debug(&format!("Environment: {:?}", env));
+        wrkflw_logging::debug(&format!(
+            "Running command in Docker: {}",
+            crate::log_redaction::args_for_log(&cmd_vec)
+        ));
+        wrkflw_logging::debug(&format!(
+            "Environment variables: {}",
+            crate::log_redaction::env_names_for_log(
+                env.iter()
+                    .map(|var| var.split_once('=').map_or(var.as_str(), |(k, _)| k))
+            )
+        ));
         wrkflw_logging::debug(&format!("Working directory: {}", working_dir.display()));
 
         // Determine platform-specific configurations
@@ -1139,26 +1148,35 @@ impl DockerRuntime {
                         break;
                     }
                 };
-                let (text, into) = match log {
+                use wrkflw_runtime::live_output::Stream;
+                let (stream, text, into) = match log {
                     bollard::container::LogOutput::StdOut { message } => {
-                        (stdout_text.push(&message), &mut stdout)
+                        (Stream::Stdout, stdout_text.push(&message), &mut stdout)
                     }
                     bollard::container::LogOutput::StdErr { message } => {
-                        (stderr_text.push(&message), &mut stderr)
+                        (Stream::Stderr, stderr_text.push(&message), &mut stderr)
                     }
                     _ => continue,
                 };
                 if let Some(tap) = &tap {
-                    tap.send(&text);
+                    tap.send(stream, &text);
                 }
                 into.push_str(&text);
             }
-            for (text, into) in [
-                (stdout_text.finish(), &mut stdout),
-                (stderr_text.finish(), &mut stderr),
+            for (stream, text, into) in [
+                (
+                    wrkflw_runtime::live_output::Stream::Stdout,
+                    stdout_text.finish(),
+                    &mut stdout,
+                ),
+                (
+                    wrkflw_runtime::live_output::Stream::Stderr,
+                    stderr_text.finish(),
+                    &mut stderr,
+                ),
             ] {
                 if let Some(tap) = &tap {
-                    tap.send(&text);
+                    tap.send(stream, &text);
                 }
                 into.push_str(&text);
             }
@@ -1220,7 +1238,10 @@ impl DockerRuntime {
                 "Docker command failed with exit code: {}",
                 exit_code
             ));
-            wrkflw_logging::debug(&format!("Failed command: {:?}", cmd));
+            wrkflw_logging::debug(&format!(
+                "Failed command: {}",
+                crate::log_redaction::args_for_log(cmd)
+            ));
             wrkflw_logging::debug(&format!("Working directory: {}", working_dir.display()));
             wrkflw_logging::debug(&format!("STDERR: {}", stderr));
         }

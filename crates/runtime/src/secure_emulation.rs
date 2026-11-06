@@ -69,7 +69,7 @@ impl ContainerRuntime for SecureEmulationRuntime {
             ));
         }
 
-        wrkflw_logging::info(&format!(
+        wrkflw_logging::debug(&format!(
             "{} Executing sandboxed command: {} (image: {})",
             wrkflw_logging::symbols::LOCK,
             command.join(" "),

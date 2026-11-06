@@ -932,7 +932,10 @@ impl KubernetesRuntime {
             },
         );
 
-        wrkflw_logging::debug(&format!("Command: {:?}", cmd));
+        wrkflw_logging::debug(&format!(
+            "Command: {}",
+            crate::log_redaction::args_for_log(cmd)
+        ));
         wrkflw_logging::debug(&format!("Working directory: {}", working_dir.display()));
 
         // Armed before the pod exists: cancellation can land inside `create`.

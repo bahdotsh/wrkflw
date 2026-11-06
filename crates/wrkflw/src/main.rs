@@ -986,14 +986,13 @@ async fn run_cli() {
 
     // stdout is a protocol in these modes, so logs must stay off it.
     let format = cli.format;
-    if format.is_json()
-        || matches!(
-            cli.command,
-            Some(Commands::Mcp {
-                command: McpCommand::Serve
-            })
-        )
-    {
+    let mcp_server = matches!(
+        cli.command,
+        Some(Commands::Mcp {
+            command: McpCommand::Serve
+        })
+    );
+    if format.is_json() || mcp_server {
         wrkflw_logging::set_console_to_stderr(true);
     }
 
@@ -1008,8 +1007,12 @@ async fn run_cli() {
         wrkflw_logging::set_log_level(wrkflw_logging::LogLevel::Warning);
     }
 
-    // Setup a Ctrl+C handler that runs in the background
-    tokio::spawn(handle_signals());
+    // Setup a Ctrl+C handler that runs in the background. The MCP server
+    // starts no containers itself: it handles signals by stopping its tool
+    // calls, which this handler would race and exit before.
+    if !mcp_server {
+        tokio::spawn(handle_signals());
+    }
 
     let platform_overrides = collect_platform_overrides(&cli.platform);
     let kubernetes = cli.kubernetes.to_config();

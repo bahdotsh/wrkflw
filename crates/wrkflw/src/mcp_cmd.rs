@@ -8,7 +8,7 @@
 use serde_json::{json, Value};
 use std::process::{Output, Stdio};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::Mutex;
@@ -23,6 +23,37 @@ const QUICK_TIMEOUT_SECS: u64 = 120;
 /// How long a timed-out child gets to clean up. Longer than the 10 seconds
 /// after which its own signal handler forces an exit.
 const STOP_GRACE: Duration = Duration::from_secs(15);
+
+/// Tool calls still running, by pid. Each leads its own process group,
+/// outside the terminal's, so a signal to the server reaches them only
+/// through [`stop_groups`].
+static LIVE: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+
+fn live_pids() -> Vec<u32> {
+    LIVE.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// Keeps a child's pid in [`LIVE`] until the child has been waited for.
+struct Live(Option<u32>);
+
+impl Live {
+    fn track(pid: Option<u32>) -> Self {
+        if let Some(pid) = pid {
+            LIVE.lock().unwrap_or_else(|e| e.into_inner()).push(pid);
+        }
+        Self(pid)
+    }
+}
+
+impl Drop for Live {
+    fn drop(&mut self) {
+        if let Some(pid) = self.0 {
+            LIVE.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|live| *live != pid);
+        }
+    }
+}
 
 const INSTRUCTIONS: &str =
     "wrkflw validates and runs GitHub Actions and GitLab CI workflows locally. \
@@ -261,6 +292,7 @@ async fn run_with_deadline(
     grace: Duration,
 ) -> Option<std::io::Result<Output>> {
     let pid = child.id();
+    let _live = Live::track(pid);
     let output = child.wait_with_output();
     tokio::pin!(output);
     if let Ok(result) = tokio::time::timeout(limit, &mut output).await {
@@ -275,6 +307,53 @@ async fn run_with_deadline(
         }
     }
     None
+}
+
+/// Interrupt the process groups `pids` lead, give them `grace` to remove
+/// their containers and exit, then kill what is left.
+async fn stop_groups(pids: &[u32], grace: Duration) {
+    for pid in pids {
+        signal_group(*pid, Stop::Interrupt);
+    }
+    let deadline = Instant::now() + grace;
+    let running = || {
+        let live = live_pids();
+        pids.iter()
+            .copied()
+            .filter(|pid| live.contains(pid))
+            .collect::<Vec<_>>()
+    };
+    while !running().is_empty() && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    for pid in running() {
+        signal_group(pid, Stop::Kill);
+    }
+}
+
+/// The exit code for the first of SIGINT, SIGTERM or SIGHUP the server gets.
+#[cfg(unix)]
+async fn shutdown_signal() -> i32 {
+    use tokio::signal::unix::{signal, SignalKind};
+    async fn on(kind: SignalKind) {
+        match signal(kind) {
+            Ok(mut stream) => {
+                stream.recv().await;
+            }
+            Err(_) => std::future::pending().await,
+        }
+    }
+    tokio::select! {
+        _ = on(SignalKind::interrupt()) => 130,
+        _ = on(SignalKind::terminate()) => 143,
+        _ = on(SignalKind::hangup()) => 129,
+    }
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() -> i32 {
+    let _ = tokio::signal::ctrl_c().await;
+    130
 }
 
 #[derive(Clone, Copy)]
@@ -448,7 +527,17 @@ async fn write_message(out: &Mutex<tokio::io::Stdout>, message: &Value) {
 
 /// Serve until stdin closes. Requests run concurrently, so a long
 /// `run_workflow` doesn't stall `ping`.
+///
+/// Tool calls run in their own process groups, so the terminal's Ctrl+C and
+/// hangup never reach them. On SIGINT, SIGTERM or SIGHUP the server passes
+/// the interrupt on and waits for them before it exits, or their containers
+/// would outlive it.
 pub(crate) async fn serve() {
+    tokio::spawn(async {
+        let code = shutdown_signal().await;
+        stop_groups(&live_pids(), STOP_GRACE).await;
+        std::process::exit(code);
+    });
     let client = Arc::new(Mutex::new(None));
     let out = Arc::new(Mutex::new(tokio::io::stdout()));
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
@@ -593,6 +682,51 @@ mod tests {
         let outcome = run_with_deadline(child, limit, Duration::from_secs(5)).await;
         assert!(outcome.is_none());
         assert!(marker.exists(), "the grandchild never saw SIGINT");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stopping_the_server_interrupts_a_running_tool_calls_group() {
+        // What a SIGTERM to the server does: the tool call is well inside its
+        // limit, and the grandchild must still hear the interrupt.
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("grandchild");
+        let inner = format!(
+            "trap 'echo yes > {}; exit 0' INT; sleep 30 > /dev/null 2>&1 & wait",
+            marker.display()
+        );
+        let script = format!("sh -c \"{inner}\"; true");
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", &script])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .process_group(0);
+        let child = command.spawn().unwrap();
+        let pid = child.id().unwrap();
+        let call = tokio::spawn(run_with_deadline(
+            child,
+            Duration::from_secs(60),
+            Duration::from_secs(5),
+        ));
+        while !live_pids().contains(&pid) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // Let the inner shell install its trap.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        stop_groups(&[pid], Duration::from_secs(5)).await;
+        assert!(
+            !live_pids().contains(&pid),
+            "the tool call is still running"
+        );
+        assert!(marker.exists(), "the grandchild never saw SIGINT");
+        let outcome = call.await.unwrap();
+        assert!(
+            outcome.is_some(),
+            "the call should end on its own, not time out"
+        );
     }
 
     #[cfg(unix)]

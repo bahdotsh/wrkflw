@@ -286,7 +286,7 @@ fn run_args(ctx: &GateCtx, file: &Path) -> Vec<String> {
 }
 
 /// One workflow's entry in the `gate` object, from the child's JSON output:
-/// its `run_finished`, or the error it printed instead. A child that died
+/// its `run_finished` without `type`, or the error it printed instead. A child that died
 /// mid-run still names the run it started, so its record can be read.
 fn workflow_report(file: &Path, code: Option<i32>, stdout: &str) -> Value {
     let lines: Vec<Value> = stdout
@@ -295,15 +295,12 @@ fn workflow_report(file: &Path, code: Option<i32>, stdout: &str) -> Value {
         .collect();
     let last_of = |kind: &str| lines.iter().rev().find(|line| line["type"] == kind);
     let mut entry = if let Some(run) = last_of("run_finished") {
-        let mut entry = json!({
-            "status": run["status"],
-            "run_id": run["run_id"],
-            "jobs": run["jobs"],
-            "unverified": run["unverified"],
-            "failure": run["failure"],
-            "error": run["error"],
-            "skip_reason": run["skip_reason"],
-        });
+        // All of it, so a field `run_finished` gains reaches the gate too.
+        let mut entry = run.clone();
+        if let Some(fields) = entry.as_object_mut() {
+            fields.remove("type");
+            fields.remove("schema_version");
+        }
         if code != Some(0) && code != Some(SKIPPED_EXIT) && run["status"] == "success" {
             entry["status"] = json!("error");
             entry["error"] = json!(format!("wrkflw exited with {:?}", code));
@@ -524,6 +521,17 @@ mod tests {
         let entry = workflow_report(Path::new("x.yml"), Some(1), stdout);
         assert_eq!(entry["status"], "failure");
         assert_eq!(entry["run_id"], "r2");
+    }
+
+    #[test]
+    fn every_run_finished_field_reaches_the_gate() {
+        let run = r#"{"schema_version":1,"type":"run_finished","status":"success","run_id":"a","jobs":[],"duration_ms":5,"exit_code":0}"#;
+        let entry = workflow_report(Path::new("x.yml"), Some(0), run);
+        assert_eq!(entry["duration_ms"], 5);
+        assert_eq!(entry["exit_code"], 0);
+        assert_eq!(entry["path"], "x.yml");
+        assert!(entry.get("type").is_none());
+        assert!(entry.get("schema_version").is_none());
     }
 
     #[test]

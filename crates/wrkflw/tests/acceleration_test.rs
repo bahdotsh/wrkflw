@@ -623,3 +623,15 @@ fn a_reused_os_matrix_leg_is_still_unverified() {
         assert!(!stderr.contains("matches no leg"), "{stderr}");
     }
 }
+
+#[test]
+fn the_gate_reports_an_installed_hook_as_json() {
+    let repo = Repo::new(TWO_JOBS, None);
+    let output = repo.wrkflw(&["--format", "json", "gate", "--install-hook"]);
+    assert_ok(&output);
+    let lines = json_lines(&output);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!(lines[0]["type"], "gate_hook");
+    let path = repo.root().join(lines[0]["path"].as_str().unwrap());
+    assert!(fs::read_to_string(path).unwrap().contains("wrkflw gate"));
+}

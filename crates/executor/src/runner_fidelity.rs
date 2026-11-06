@@ -29,6 +29,17 @@ impl RunnerSubstitution {
             self.requested, self.ran_as
         )
     }
+
+    /// `job`'s entry in an `unverified` list, as `run_finished`, `gate` and
+    /// `plan` all report it.
+    pub fn unverified_entry(&self, job: &str) -> serde_json::Value {
+        serde_json::json!({
+            "job": job,
+            "requested": self.requested,
+            "ran_as": self.ran_as,
+            "reason": self.reason(),
+        })
+    }
 }
 
 /// `runner.os` as a job sees it under `runtime`: Linux in a container,
@@ -196,6 +207,19 @@ mod tests {
         let mapped = job("runs-on: macos-latest\nsteps: []");
         let overrides = HashMap::from([("macos-latest".to_string(), "my/mac:1".to_string())]);
         assert_eq!(substitution(&mapped, None, &env("Linux"), &overrides), None);
+    }
+
+    #[test]
+    fn the_unverified_entry_names_the_job_and_why() {
+        let found = RunnerSubstitution {
+            requested: "macos-latest".to_string(),
+            ran_as: "Linux".to_string(),
+        };
+        let entry = found.unverified_entry("build (os: macos-latest)");
+        assert_eq!(entry["job"], "build (os: macos-latest)");
+        assert_eq!(entry["requested"], "macos-latest");
+        assert_eq!(entry["ran_as"], "Linux");
+        assert_eq!(entry["reason"], found.reason());
     }
 
     #[test]

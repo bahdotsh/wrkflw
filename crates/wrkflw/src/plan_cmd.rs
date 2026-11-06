@@ -134,17 +134,9 @@ fn unverified(
     ran_as: &str,
     overrides: &HashMap<String, String>,
 ) -> Vec<Value> {
-    let entry = |name: String, found: wrkflw_executor::RunnerSubstitution| {
-        json!({
-            "job": name,
-            "requested": found.requested,
-            "ran_as": found.ran_as,
-            "reason": found.reason(),
-        })
-    };
     let Some(config) = job.matrix_config() else {
         return wrkflw_executor::runner_fidelity::substitution_as(job, None, ran_as, overrides)
-            .map(|found| entry(id.to_string(), found))
+            .map(|found| found.unverified_entry(id))
             .into_iter()
             .collect();
     };
@@ -161,10 +153,7 @@ fn unverified(
                 ran_as,
                 overrides,
             )?;
-            Some(entry(
-                wrkflw_matrix::format_combination_name(id, leg),
-                found,
-            ))
+            Some(found.unverified_entry(&wrkflw_matrix::format_combination_name(id, leg)))
         })
         .collect()
 }

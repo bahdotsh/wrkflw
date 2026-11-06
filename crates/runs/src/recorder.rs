@@ -658,16 +658,13 @@ fn unverified(record: &RunRecord) -> Vec<Value> {
         .filter(|job| job.status != "skipped")
         .filter_map(|job| {
             let runner = job.runner.as_ref()?;
-            Some(json!({
-                "job": job.name,
-                "requested": runner.requested,
-                "ran_as": runner.ran_as,
-                "reason": wrkflw_executor::RunnerSubstitution {
+            Some(
+                wrkflw_executor::RunnerSubstitution {
                     requested: runner.requested.clone(),
                     ran_as: runner.ran_as.clone(),
                 }
-                .reason(),
-            }))
+                .unverified_entry(&job.name),
+            )
         })
         .collect()
 }

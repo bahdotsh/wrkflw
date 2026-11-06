@@ -179,6 +179,16 @@ impl JobWorkspace {
     }
 }
 
+/// Where checkout records what git tracked at the last sync of the kept
+/// workspace `workspace`, or `None` when it isn't a kept one. The record
+/// sits beside the workspace, as its lock does, so the job can't change it.
+pub(crate) fn tracked_record(workspace: &Path) -> Option<PathBuf> {
+    workspace
+        .with_extension("lock")
+        .is_file()
+        .then(|| workspace.with_extension("tracked"))
+}
+
 /// Env var that moves kept workspaces out of the cache directory.
 pub const WORKSPACES_DIR_ENV: &str = "WRKFLW_WORKSPACES_DIR";
 
@@ -301,6 +311,9 @@ fn clean_under(root: &Path) -> std::io::Result<CleanReport> {
                 Ok(()) => {
                     report.removed += 1;
                     report.bytes += bytes;
+                    // The record describes the files just removed. Held
+                    // under the lock, so no run is about to read it.
+                    let _ = std::fs::remove_file(dir.with_extension("tracked"));
                 }
                 // Part of it may be gone; what is left is counted next time.
                 Err(e) => report.failed.push((dir, e.to_string())),
@@ -542,6 +555,11 @@ mod tests {
             .unwrap();
         let free_path = free.path().to_path_buf();
         std::fs::write(free_path.join("out.o"), "built").unwrap();
+        assert_eq!(
+            tracked_record(&free_path),
+            Some(free_path.with_extension("tracked"))
+        );
+        std::fs::write(free_path.with_extension("tracked"), "out.o\0").unwrap();
         drop(free);
         let held = JobWorkspace::keep(root.path(), repo.path(), Path::new(CI), "CI", "test")
             .unwrap()
@@ -558,6 +576,7 @@ mod tests {
             }
         );
         assert!(!free_path.exists());
+        assert!(!free_path.with_extension("tracked").exists());
         assert!(held.path().is_dir());
 
         // The cleaned workspace comes back, empty, on the next run.

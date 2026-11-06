@@ -66,7 +66,8 @@ pub(crate) fn copy_directory_contents(from: &Path, to: &Path) -> Result<(), Exec
             return Ok(());
         }
     }
-    copy_directory_contents_with_gitignore(from, to, &SyncRules::for_root(from, to)?, &[], false)?;
+    let rules = SyncRules::for_root(from, to)?;
+    copy_directory_contents_with_gitignore(from, to, &rules, &[], false)?;
     // A checkout is a git repository, and steps run `git describe`, `git
     // diff` and the like. A `.git` file (a worktree or submodule) points at a
     // host path a container can't see, so only a directory is mirrored.
@@ -84,6 +85,7 @@ pub(crate) fn copy_directory_contents(from: &Path, to: &Path) -> Result<(), Exec
         mirror_directory(&git_dir, &to_git, false, &["hooks", "config"], &["objects"])?;
         write_sanitized_git_config(&git_dir.join("config"), &to_git.join("config"))?;
     }
+    rules.record_tracked();
     Ok(())
 }
 
@@ -91,37 +93,126 @@ pub(crate) fn copy_directory_contents(from: &Path, to: &Path) -> Result<(), Exec
 /// program from the developer's machine, or read a path only it has.
 const UNSAFE_GIT_CONFIG_KEYS: &[&str] = &["hookspath", "fsmonitor", "worktree"];
 
-/// Copy the git config at `from` to `to`, dropping [`UNSAFE_GIT_CONFIG_KEYS`].
-/// Keys are matched in any section and case, which only ever drops more.
+/// Sections a checkout leaves out whole: `include` and `includeIf` pull in
+/// another config file from the developer's machine, which may set any of
+/// [`UNSAFE_GIT_CONFIG_KEYS`].
+const UNSAFE_GIT_CONFIG_SECTIONS: &[&str] = &["include", "includeif"];
+
+/// Copy the git config at `from` to `to`, as [`sanitized_git_config`] keeps it.
 fn write_sanitized_git_config(from: &Path, to: &Path) -> Result<(), ExecutionError> {
     let Ok(config) = std::fs::read_to_string(from) else {
         return Ok(());
     };
-    let kept: String = config
-        .lines()
-        .filter(|line| !is_unsafe_git_config_line(line))
-        .map(|line| format!("{line}\n"))
-        .collect();
-    if std::fs::read_to_string(to).ok().as_deref() == Some(kept.as_str()) {
-        return Ok(());
-    }
+    // The mirror has removed `to` already, since it skips `config`; a step
+    // can't have put anything there since. Removed again all the same, so
+    // the write never goes through a link.
     if to.symlink_metadata().is_ok() {
         remove_entry(to).map_err(|e| {
             ExecutionError::Execution(format!("Failed to replace {}: {}", to.display(), e))
         })?;
     }
-    std::fs::write(to, kept)
+    std::fs::write(to, sanitized_git_config(&config))
         .map_err(|e| ExecutionError::Execution(format!("Failed to write git config: {}", e)))
 }
 
-fn is_unsafe_git_config_line(line: &str) -> bool {
-    let key = line
-        .trim_start()
-        .split(|c: char| c == '=' || c.is_whitespace())
+/// `config` without [`UNSAFE_GIT_CONFIG_KEYS`] in any section, and without
+/// any entry of [`UNSAFE_GIT_CONFIG_SECTIONS`]. Keys match in any case. A
+/// value continued onto the next line with a backslash is dropped or kept
+/// whole, and a section header that shares a line with a dropped entry
+/// stays.
+fn sanitized_git_config(config: &str) -> String {
+    let mut out = String::with_capacity(config.len());
+    let mut section = String::new();
+    // Set while a value continues onto the next line: whether it is being
+    // dropped, and whether the line ended inside quotes.
+    let mut continued: Option<(bool, bool)> = None;
+    for line in config.split_inclusive('\n') {
+        let body = line.trim_end_matches(['\n', '\r']);
+        if let Some((dropping, in_quote)) = continued {
+            continued = value_continues(body, in_quote).map(|q| (dropping, q));
+            if !dropping {
+                out.push_str(line);
+            }
+            continue;
+        }
+        let trimmed = body.trim_start();
+        let (header, entry) = match trimmed.strip_prefix('[').and(header_end(trimmed)) {
+            Some(end) => {
+                section = section_name(&trimmed[..end]);
+                (Some(&trimmed[..end]), trimmed[end..].trim_start())
+            }
+            None => (None, trimmed),
+        };
+        let key = entry
+            .split(|c: char| c == '=' || c.is_whitespace())
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let comment = key.is_empty() || key.starts_with(['#', ';']);
+        let drop = !comment
+            && (UNSAFE_GIT_CONFIG_KEYS.contains(&key.as_str())
+                || UNSAFE_GIT_CONFIG_SECTIONS.contains(&section.as_str()));
+        if !comment {
+            continued = value_continues(entry, false).map(|q| (drop, q));
+        }
+        match (drop, header) {
+            (false, _) => out.push_str(line),
+            (true, Some(header)) => {
+                out.push_str(header);
+                out.push('\n');
+            }
+            (true, None) => {}
+        }
+    }
+    out
+}
+
+/// The length of the section header `line` starts with, closing bracket
+/// included. A quoted subsection may hold `]`.
+fn header_end(line: &str) -> Option<usize> {
+    let mut in_quote = false;
+    let mut escaped = false;
+    for (i, c) in line.char_indices() {
+        match c {
+            _ if escaped => escaped = false,
+            '\\' => escaped = true,
+            '"' => in_quote = !in_quote,
+            ']' if !in_quote => return Some(i + 1),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The lowercased name of the section `header` opens, without its
+/// subsection: `includeif` for `[includeIf "gitdir:~/w/"]`.
+fn section_name(header: &str) -> String {
+    header
+        .trim_start_matches('[')
+        .split(|c: char| c.is_whitespace() || c == '"' || c == ']')
         .next()
         .unwrap_or("")
-        .to_ascii_lowercase();
-    UNSAFE_GIT_CONFIG_KEYS.contains(&key.as_str())
+        .to_ascii_lowercase()
+}
+
+/// Whether `text`, an entry or a line continuing one, carries on to the
+/// next line: it ends in a backslash that escapes nothing, outside a
+/// comment. `Some` with whether that line starts inside quotes.
+fn value_continues(text: &str, mut in_quote: bool) -> Option<bool> {
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                if chars.next().is_none() {
+                    return Some(in_quote);
+                }
+            }
+            '"' => in_quote = !in_quote,
+            '#' | ';' if !in_quote => return None,
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Make `dir` a real directory. Whatever else is at that path is removed
@@ -221,10 +312,13 @@ struct SyncRules {
     /// even where an ignore rule matches it. `None` outside a git
     /// repository, or where git can't be run.
     tracked: Option<Tracked>,
-    /// What git tracked when the workspace was last synced, read from the
-    /// workspace's own `.git`. A hidden entry the repository has since
-    /// deleted is only removed if it was tracked then, so tool state stays.
+    /// What git tracked when the workspace was last synced. A hidden entry
+    /// the repository has since deleted is only removed if it was tracked
+    /// then, so tool state stays.
     previously_tracked: Option<Tracked>,
+    /// Where the workspace's tracked set is recorded, and what to record
+    /// there once this sync succeeds: `git ls-files` of the source.
+    record: Option<(PathBuf, Option<String>)>,
 }
 
 /// Paths git tracks, relative to the repository root.
@@ -236,8 +330,10 @@ struct Tracked {
 }
 
 impl Tracked {
-    /// What `git ls-files` lists for the repository at `dir`.
-    fn read(dir: &Path) -> Option<Self> {
+    /// What `git ls-files -z` prints for the repository at `dir`. Only ever
+    /// run on the source: the workspace's `.git` is the job's to change, and
+    /// its config could make git run any program on this machine.
+    fn listing(dir: &Path) -> Option<String> {
         let output = std::process::Command::new("git")
             .arg("-C")
             .arg(dir)
@@ -253,7 +349,7 @@ impl Tracked {
         if !output.status.success() {
             return None;
         }
-        Some(Self::parse(&String::from_utf8_lossy(&output.stdout)))
+        Some(String::from_utf8_lossy(&output.stdout).into_owned())
     }
 
     fn parse(listing: &str) -> Self {
@@ -290,11 +386,17 @@ impl SyncRules {
         .collect();
         never.dedup();
         let git_checkout = root.join(".git").exists();
-        let tracked = git_checkout.then(|| Tracked::read(root)).flatten();
-        // Only worth reading where the source's own index could be read:
-        // otherwise nothing compares it with what is tracked now.
-        let previously_tracked = match &tracked {
-            Some(_) if workspace.join(".git").is_dir() => Tracked::read(workspace),
+        let listing = git_checkout.then(|| Tracked::listing(root)).flatten();
+        let tracked = listing.as_deref().map(Tracked::parse);
+        // Read from wrkflw's own record beside the workspace, never from the
+        // workspace's `.git`, which the job's steps can rewrite. Only worth
+        // reading where the source's own index could be read: otherwise
+        // nothing compares it with what is tracked now.
+        let record_path = crate::workspace::tracked_record(workspace);
+        let previously_tracked = match (&tracked, &record_path) {
+            (Some(_), Some(path)) => std::fs::read_to_string(path)
+                .ok()
+                .map(|listing| Tracked::parse(&listing)),
             _ => None,
         };
         Ok(SyncRules {
@@ -304,7 +406,35 @@ impl SyncRules {
             root: root.to_path_buf(),
             tracked,
             previously_tracked,
+            record: record_path.map(|path| (path, listing)),
         })
+    }
+
+    /// Record what the source tracks for the next sync of this workspace.
+    /// Without a listing the old record is removed, so a stale one is never
+    /// read later. Failing to record only costs the next sync the removal of
+    /// hidden files the repository deleted, so it is logged, not an error.
+    fn record_tracked(&self) {
+        let Some((path, listing)) = &self.record else {
+            return;
+        };
+        let written = match listing {
+            Some(listing) => {
+                let partial = path.with_extension("tracked.partial");
+                std::fs::write(&partial, listing).and_then(|()| std::fs::rename(&partial, path))
+            }
+            None => match std::fs::remove_file(path) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                other => other,
+            },
+        };
+        if let Err(e) = written {
+            wrkflw_logging::warning(&format!(
+                "Failed to record the files git tracks for {}: {}",
+                path.display(),
+                e
+            ));
+        }
     }
 
     fn relative<'a>(&self, source: &'a Path) -> Option<&'a Path> {
@@ -1020,30 +1150,98 @@ mod tests {
         assert!(dst.path().join("fixtures/out.bin").is_file());
     }
 
+    /// A workspace laid out as a kept one: a directory with its lock beside
+    /// it, which is what makes checkout record what git tracks.
+    fn kept_workspace() -> (tempfile::TempDir, PathBuf) {
+        let parent = tempfile::tempdir().unwrap();
+        let ws = parent.path().join("build-0123");
+        std::fs::create_dir(&ws).unwrap();
+        std::fs::write(ws.with_extension("lock"), "").unwrap();
+        (parent, ws)
+    }
+
     #[test]
     fn a_hidden_file_the_repository_deleted_is_removed() {
         let Some(src) = git_repo() else {
             return;
         };
-        let dst = tempfile::tempdir().unwrap();
+        let (_parent, dst) = kept_workspace();
         std::fs::create_dir_all(src.path().join(".cargo")).unwrap();
         std::fs::write(src.path().join(".cargo/config.toml"), "[build]").unwrap();
         std::fs::write(src.path().join(".npmrc"), "x").unwrap();
         std::fs::write(src.path().join("lib.rs"), "").unwrap();
         assert!(git(src.path(), &["add", "."]));
         assert!(git(src.path(), &["commit", "-qm", "one"]));
-        copy_directory_contents(src.path(), dst.path()).unwrap();
-        assert!(dst.path().join(".cargo/config.toml").is_file());
-        std::fs::create_dir_all(dst.path().join(".pytest_cache")).unwrap();
+        copy_directory_contents(src.path(), dst.as_path()).unwrap();
+        assert!(dst.as_path().join(".cargo/config.toml").is_file());
+        std::fs::create_dir_all(dst.as_path().join(".pytest_cache")).unwrap();
 
         assert!(git(src.path(), &["rm", "-rq", ".cargo", ".npmrc"]));
         assert!(git(src.path(), &["commit", "-qm", "two"]));
-        copy_directory_contents(src.path(), dst.path()).unwrap();
+        copy_directory_contents(src.path(), dst.as_path()).unwrap();
 
-        assert!(!dst.path().join(".cargo").exists());
-        assert!(!dst.path().join(".npmrc").exists());
+        assert!(!dst.as_path().join(".cargo").exists());
+        assert!(!dst.as_path().join(".npmrc").exists());
         // Tool state the repository never tracked stays.
-        assert!(dst.path().join(".pytest_cache").is_dir());
+        assert!(dst.as_path().join(".pytest_cache").is_dir());
+        // What was tracked came from wrkflw's record, not the workspace.
+        assert!(dst.with_extension("tracked").is_file());
+    }
+
+    #[test]
+    fn without_a_record_no_hidden_file_is_removed() {
+        let Some(src) = git_repo() else {
+            return;
+        };
+        // A workspace that isn't kept has no record, so a hidden file is
+        // never taken for one the repository deleted.
+        let dst = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join(".npmrc"), "x").unwrap();
+        assert!(git(src.path(), &["add", "."]));
+        assert!(git(src.path(), &["commit", "-qm", "one"]));
+        copy_directory_contents(src.path(), dst.path()).unwrap();
+        assert!(git(src.path(), &["rm", "-q", ".npmrc"]));
+        assert!(git(src.path(), &["commit", "-qm", "two"]));
+        copy_directory_contents(src.path(), dst.path()).unwrap();
+        assert!(dst.path().join(".npmrc").is_file());
+        assert!(!dst.path().with_extension("tracked").exists());
+    }
+
+    /// The workspace's `.git` is the job's: a step can set `core.fsmonitor`
+    /// there and turn on the index extension that makes git run it. The
+    /// sync must never run git in the workspace, or that program would run
+    /// on the host.
+    #[cfg(unix)]
+    #[test]
+    fn checkout_never_runs_git_in_the_workspace() {
+        use std::os::unix::fs::PermissionsExt;
+        let Some(src) = git_repo() else {
+            return;
+        };
+        let (parent, dst) = kept_workspace();
+        std::fs::write(src.path().join("lib.rs"), "").unwrap();
+        assert!(git(src.path(), &["add", "."]));
+        assert!(git(src.path(), &["commit", "-qm", "one"]));
+        copy_directory_contents(src.path(), &dst).unwrap();
+
+        // What a step could do in the workspace it is given.
+        let marker = parent.path().join("ran-on-host");
+        let hook = dst.join("hook.sh");
+        std::fs::write(&hook, format!("#!/bin/sh\ntouch '{}'\n", marker.display())).unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let config = dst.join(".git/config");
+        let mut planted = std::fs::read_to_string(&config).unwrap();
+        planted.push_str(&format!("[core]\n\tfsmonitor = {}\n", hook.display()));
+        std::fs::write(&config, planted).unwrap();
+        // Planting it runs the hook once; only what the sync does counts.
+        git(&dst, &["update-index", "--fsmonitor"]);
+        let _ = std::fs::remove_file(&marker);
+
+        copy_directory_contents(src.path(), &dst).unwrap();
+
+        assert!(!marker.exists(), "the sync ran a program the job planted");
+        let config = std::fs::read_to_string(dst.join(".git/config")).unwrap();
+        assert!(!config.contains("fsmonitor"));
     }
 
     #[test]
@@ -1077,5 +1275,32 @@ mod tests {
         assert!(tracked.contains(Path::new("a/b"), true));
         assert!(!tracked.contains(Path::new("a"), false));
         assert!(!tracked.contains(Path::new("e"), true));
+    }
+
+    #[test]
+    fn the_git_config_filter_follows_sections_and_continued_values() {
+        let config = "[core]\n\tbare = false\n\thooksPath = a\\\n b\n\tautocrlf = input\n\
+                      [core] fsmonitor = x\n\
+                      [include]\n\tpath = ~/.gitconfig-extra\n\
+                      [includeIf \"gitdir:~/w/\"]\n\tpath = ~/.w\n\
+                      [remote \"o]rigin\"]\n\turl = a#b \"x;y\" ; note \\\n\tfetch = +refs\n\
+                      [alias]\n\tst = \"status \\\n--short\"\n\tworktree = nope\n\
+                      [submodule \"m\"]\n\tpath = vendor/m\n";
+        let kept = sanitized_git_config(config);
+        assert_eq!(
+            kept,
+            "[core]\n\tbare = false\n\tautocrlf = input\n\
+             [core]\n\
+             [include]\n\
+             [includeIf \"gitdir:~/w/\"]\n\
+             [remote \"o]rigin\"]\n\turl = a#b \"x;y\" ; note \\\n\tfetch = +refs\n\
+             [alias]\n\tst = \"status \\\n--short\"\n\
+             [submodule \"m\"]\n\tpath = vendor/m\n"
+        );
+        // Comments and CRLF line ends pass through untouched.
+        assert_eq!(
+            sanitized_git_config("# hooksPath = x\r\n[core]\r\n\tHOOKSPATH=y\r\n"),
+            "# hooksPath = x\r\n[core]\r\n"
+        );
     }
 }

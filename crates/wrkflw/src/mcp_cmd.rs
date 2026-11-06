@@ -24,8 +24,12 @@ const STOP_GRACE: Duration = Duration::from_secs(15);
 const INSTRUCTIONS: &str =
     "wrkflw validates and runs GitHub Actions and GitLab CI workflows locally. \
 Call validate_workflows after editing YAML, plan_workflow to see what would run and why a trigger \
-would or would not fire, and run_workflow to execute. run_workflow returns a failure digest. Use \
-list_runs and get_run_failure before rerunning: earlier results are recorded.";
+would or would not fire, and run_workflow to execute. run_workflow returns a failure digest. Pass \
+reuse_results while iterating, so jobs that already passed on the same files aren't run again. \
+Before pushing, call gate: it runs every workflow a push would run. A job listed under \
+`unverified` ran as another OS than its runs-on asked for, so its pass doesn't cover \
+OS-specific steps. Use list_runs and get_run_failure before rerunning: earlier results are \
+recorded.";
 
 fn string_arg(args: &Value, key: &str) -> Option<String> {
     args[key]
@@ -102,6 +106,9 @@ fn tool_command(name: &str, args: &Value) -> Result<(Vec<String>, u64), String> 
             push_opt(&mut cli, "--intent", string_arg(args, "intent"));
             push_opt(&mut cli, "--session", string_arg(args, "session"));
             push_opt(&mut cli, "--from-step", string_arg(args, "from_step"));
+            if args["reuse_results"].as_bool() == Some(true) {
+                cli.push("--reuse-results".to_string());
+            }
             for (key, value) in args["variables"].as_object().into_iter().flatten() {
                 let value = value
                     .as_str()
@@ -111,6 +118,20 @@ fn tool_command(name: &str, args: &Value) -> Result<(Vec<String>, u64), String> 
             }
             cli.push("--".into());
             cli.push(required_path(args)?);
+            timeout = args["timeout_seconds"]
+                .as_u64()
+                .unwrap_or(DEFAULT_RUN_TIMEOUT_SECS);
+        }
+        "gate" => {
+            cli.push("gate".into());
+            push_opt(&mut cli, "--event", string_arg(args, "event"));
+            push_opt(&mut cli, "--base-branch", string_arg(args, "base_branch"));
+            push_opt(&mut cli, "--diff-base", string_arg(args, "diff_base"));
+            push_opt(&mut cli, "--runtime", string_arg(args, "runtime"));
+            if let Some(path) = string_arg(args, "path") {
+                cli.push("--".into());
+                cli.push(path);
+            }
             timeout = args["timeout_seconds"]
                 .as_u64()
                 .unwrap_or(DEFAULT_RUN_TIMEOUT_SECS);
@@ -297,8 +318,17 @@ fn tools() -> Value {
     run_properties["session"] = json!({"type": "string", "description": "Your session id, such as $CLAUDE_CODE_SESSION_ID or $CODEX_THREAD_ID. Stored on the run record."});
     run_properties["from_step"] = json!({"type": "string", "description": "Requires `job`. Start at this step, by name or 1-based position. Earlier steps' outputs and files are missing."});
     run_properties["variables"] = json!({"type": "object", "additionalProperties": {"type": "string"}, "description": "GitLab CI variables. Masked in output and never stored."});
+    run_properties["reuse_results"] = json!({"type": "boolean", "description": "Reuse a job's earlier pass when its files, workflow and inputs are unchanged. Use it while iterating."});
     run_properties["timeout_seconds"] =
         json!({"type": "integer", "description": "Stop the run after this long. Default 1800."});
+    let gate_properties = json!({
+        "path": {"type": "string", "description": "Workflow file or directory. Defaults to the detected workflow directories."},
+        "event": {"type": "string", "description": "Event a push would send. Default push."},
+        "base_branch": {"type": "string", "description": "Target branch, for pull_request."},
+        "diff_base": {"type": "string", "description": "Ref the remote already has, for working out what changed."},
+        "runtime": run_properties["runtime"].clone(),
+        "timeout_seconds": {"type": "integer", "description": "Stop the gate after this long. Default 1800."},
+    });
     let run_id = json!({"type": "string", "description": "Run id, unique prefix, or `latest`. Default `latest`."});
     json!([
         tool("validate_workflows", "Check workflow files. Returns issues with rule, YAML path, line and fix hint.", true,
@@ -306,6 +336,7 @@ fn tools() -> Value {
         tool("list_workflows", "List workflows and pipelines in the repository with their jobs.", true, json!({}), &[]),
         tool("plan_workflow", "Show what a run would do without executing anything: whether the trigger fires and why, job order, matrix legs and steps.", true, event_properties(), &["path"]),
         tool("run_workflow", "Execute a workflow locally. This runs the workflow's code. Returns status, job results and a failure digest. The run is recorded.", false, run_properties, &["path"]),
+        tool("gate", "Run every workflow a push would trigger, reusing jobs that already passed on the same files. Returns `passed`, each workflow's status, run id and failure digest, and jobs that ran as another OS (`unverified`). Checks the working tree, not commits.", false, gate_properties, &[]),
         tool("list_runs", "List recorded runs of this repository, newest first.", true,
             json!({"limit": {"type": "integer"}, "status": {"type": "string"}, "agent": {"type": "string"}, "session": {"type": "string"}, "workflow": {"type": "string"}}), &[]),
         tool("get_run", "Get one recorded run: jobs, steps, exit codes, timings.", true, json!({"run_id": run_id}), &[]),
@@ -430,6 +461,28 @@ mod tests {
         let separator = cli.iter().position(|a| a == "--").unwrap();
         assert_eq!(cli[separator + 1], "--evil");
         assert!(cli.iter().position(|a| a == "--format").unwrap() < separator);
+    }
+
+    #[test]
+    fn gate_and_reuse_reach_the_cli() {
+        let (cli, timeout) = tool_command(
+            "gate",
+            &json!({"runtime": "docker", "base_branch": "main", "event": "pull_request", "path": "ci.yml"}),
+        )
+        .unwrap();
+        assert_eq!(&cli[..3], ["--format", "json", "gate"]);
+        assert!(cli.windows(2).any(|w| w == ["--runtime", "docker"]));
+        assert!(cli.windows(2).any(|w| w == ["--base-branch", "main"]));
+        assert_eq!(cli[cli.len() - 2..], ["--", "ci.yml"]);
+        assert_eq!(timeout, DEFAULT_RUN_TIMEOUT_SECS);
+        let (cli, _) = tool_command(
+            "run_workflow",
+            &json!({"path": "a.yml", "reuse_results": true}),
+        )
+        .unwrap();
+        assert!(cli.contains(&"--reuse-results".to_string()));
+        let (cli, _) = tool_command("run_workflow", &json!({"path": "a.yml"})).unwrap();
+        assert!(!cli.contains(&"--reuse-results".to_string()));
     }
 
     #[test]

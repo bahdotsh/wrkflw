@@ -655,8 +655,9 @@ fn mcp_server_speaks_the_protocol_and_runs_tools() {
         .iter()
         .filter_map(|t| t["name"].as_str())
         .collect();
-    assert_eq!(names.len(), 8);
+    assert_eq!(names.len(), 9);
     assert!(names.contains(&"run_workflow"));
+    assert!(names.contains(&"gate"));
 
     let (report, is_error) = mcp.tool("validate_workflows", json!({}));
     assert!(!is_error);

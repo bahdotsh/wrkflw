@@ -19,7 +19,7 @@ Prefer the MCP server if your client supports MCP. `wrkflw mcp install` register
 
 ## Before pushing
 
-Run `wrkflw gate`. It runs what a push would run, reusing jobs that already passed on the same files, and exits 1 if anything fails. Add `--reuse-results` to `wrkflw run` to get the same reuse while iterating. A reused job reports one `Reuse result` step and an unaffected job one `Not affected` step, so their output isn't there to read. See "Spending less on CI" in the README for `.wrkflw/affected.yml`.
+Run `wrkflw --format json gate`, or the MCP `gate` tool. It runs what a push would run, reusing jobs that already passed on the same files, and exits 1 if anything fails. It prints one `gate` object: `passed`, `failed` (paths), `unverified` (with `workflow`), `uncommitted_changes`, and per workflow its `status`, `run_id`, `jobs` and `failure` digest. Add `--reuse-results` to `wrkflw run`, or `reuse_results` to the MCP `run_workflow`, to get the same reuse while iterating. A reused job reports one `Reuse result` step and an unaffected job one `Not affected` step, so their output isn't there to read. See "Spending less on CI" in the README for `.wrkflw/affected.yml`.
 
 ## Simulating events
 
@@ -35,7 +35,7 @@ Run `wrkflw gate`. It runs what a push would run, reusing jobs that already pass
 | Command | stdout |
 | --- | --- |
 | `run`, `watch`, `runs replay` | One object per line: `run_started`, `job_started`, `step_started`, `step_finished`, `job_finished`, `run_finished`. `watch` adds `watch_started` and `watch_cycle`. |
-| `validate`, `list`, `plan`, `runs ...`, `clean` | One object. |
+| `validate`, `list`, `plan`, `runs ...`, `clean`, `gate` | One object. |
 | Any error | `{"type": "error", "message": "..."}`, exit 1. |
 
 `step_finished.output` holds the last 64 KiB of a step's output, delivered when the step ends. Output is not streamed while a step runs.
@@ -76,7 +76,6 @@ The run also records your session, from `--session`, `WRKFLW_SESSION`, `CLAUDE_C
 
 - `--affected` trusts the paths in `.wrkflw/affected.yml`. A path left out of a job's list won't rerun that job.
 - `wrkflw gate` checks the working tree, not the commits you push, and skips jobs marked `gate: false` in `.wrkflw/affected.yml`.
-- `wrkflw gate` prints text even with `--format json`, and the MCP server has no gate tool. Use its exit code, then `wrkflw --format json runs failure latest` for the cause.
 - Parallel jobs run one after another in emulation, so `--runtime emulation` won't show a race between jobs.
 - `--from-step` needs `--job`. Earlier steps are skipped apart from `actions/checkout`, so their outputs and files are missing. Use it to iterate on a step that doesn't depend on them.
 - `runs replay` reruns against the current working tree. Compare `git_sha` and `git_dirty` on the record if the result differs.

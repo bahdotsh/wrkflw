@@ -1339,6 +1339,7 @@ async fn run_cli() {
                 runtime: runtime.clone(),
                 remote_cache: remote_cache.clone(),
                 install_hook: *install_hook,
+                format: cli.format,
             });
         }
         Some(Commands::Plan {

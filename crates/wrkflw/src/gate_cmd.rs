@@ -286,37 +286,42 @@ fn run_args(ctx: &GateCtx, file: &Path) -> Vec<String> {
 }
 
 /// One workflow's entry in the `gate` object, from the child's JSON output:
-/// its `run_finished`, or the error it printed instead.
+/// its `run_finished`, or the error it printed instead. A child that died
+/// mid-run still names the run it started, so its record can be read.
 fn workflow_report(file: &Path, code: Option<i32>, stdout: &str) -> Value {
-    let last = stdout
+    let lines: Vec<Value> = stdout
         .lines()
-        .rev()
-        .find_map(|line| serde_json::from_str::<Value>(line).ok());
-    let mut entry = match last {
-        Some(run) if run["type"] == "run_finished" => {
-            let mut entry = json!({
-                "status": run["status"],
-                "run_id": run["run_id"],
-                "jobs": run["jobs"],
-                "unverified": run["unverified"],
-                "failure": run["failure"],
-                "error": run["error"],
-                "skip_reason": run["skip_reason"],
-            });
-            if code != Some(0) && code != Some(SKIPPED_EXIT) && run["status"] == "success" {
-                entry["status"] = json!("error");
-                entry["error"] = json!(format!("wrkflw exited with {:?}", code));
-            }
-            entry
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .collect();
+    let last_of = |kind: &str| lines.iter().rev().find(|line| line["type"] == kind);
+    let mut entry = if let Some(run) = last_of("run_finished") {
+        let mut entry = json!({
+            "status": run["status"],
+            "run_id": run["run_id"],
+            "jobs": run["jobs"],
+            "unverified": run["unverified"],
+            "failure": run["failure"],
+            "error": run["error"],
+            "skip_reason": run["skip_reason"],
+        });
+        if code != Some(0) && code != Some(SKIPPED_EXIT) && run["status"] == "success" {
+            entry["status"] = json!("error");
+            entry["error"] = json!(format!("wrkflw exited with {:?}", code));
         }
-        Some(error) if error["type"] == "error" => {
-            json!({"status": "error", "error": error["message"]})
-        }
-        _ => json!({
+        entry
+    } else if let Some(error) = last_of("error") {
+        json!({"status": "error", "error": error["message"]})
+    } else {
+        json!({
             "status": "error",
-            "error": format!("wrkflw exited with {:?} and printed no result", code),
-        }),
+            "error": format!("wrkflw exited with {:?} before the run finished", code),
+        })
     };
+    if entry["run_id"].is_null() {
+        if let Some(started) = last_of("run_started") {
+            entry["run_id"] = started["run_id"].clone();
+        }
+    }
     entry["path"] = json!(file.display().to_string());
     entry
 }
@@ -489,6 +494,36 @@ mod tests {
         assert_eq!(report["workflows"][4]["error"], "boom");
         assert_eq!(report["unverified"][0]["workflow"], "ok.yml");
         assert_eq!(report["workflows"][0]["run_id"], "a");
+    }
+
+    #[test]
+    fn a_child_that_died_mid_run_still_names_its_run() {
+        let stdout = concat!(
+            r#"{"type":"run_started","run_id":"r1"}"#,
+            "\n",
+            r#"{"type":"step_finished","run_id":"r1","step":"build"}"#,
+            "\n",
+        );
+        let entry = workflow_report(Path::new("x.yml"), None, stdout);
+        assert_eq!(entry["status"], "error");
+        assert_eq!(entry["run_id"], "r1");
+        assert!(entry["error"]
+            .as_str()
+            .unwrap()
+            .contains("before the run finished"));
+    }
+
+    #[test]
+    fn the_result_is_read_from_run_finished_not_the_last_line() {
+        let stdout = concat!(
+            r#"{"type":"run_finished","status":"failure","run_id":"r2","jobs":[]}"#,
+            "\n",
+            r#"{"type":"note","message":"printed after the result"}"#,
+            "\n",
+        );
+        let entry = workflow_report(Path::new("x.yml"), Some(1), stdout);
+        assert_eq!(entry["status"], "failure");
+        assert_eq!(entry["run_id"], "r2");
     }
 
     #[test]

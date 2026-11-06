@@ -538,3 +538,52 @@ fn a_run_marks_a_job_that_ran_as_another_os() {
     assert_eq!(run["unverified"][0]["job"], "win");
     assert_eq!(run["jobs"][0]["runner"]["requested"], "windows-latest");
 }
+
+#[test]
+fn the_gate_prints_one_json_object_naming_the_failed_run() {
+    let repo = Repo::new(WINDOWS_JOB, None);
+    let gate = [
+        "--format",
+        "json",
+        "gate",
+        "--runtime",
+        "emulation",
+        "--diff-base",
+        "HEAD",
+    ];
+
+    let output = repo.wrkflw(&gate);
+    assert_eq!(output.status.code(), Some(1));
+    let lines = json_lines(&output);
+    assert_eq!(lines.len(), 1, "gate printed more than one object");
+    let report = &lines[0];
+    assert_eq!(report["type"], "gate");
+    assert_eq!(report["passed"], false);
+    assert_eq!(report["failed"].as_array().unwrap().len(), 1);
+    let workflow = &report["workflows"][0];
+    assert_eq!(workflow["status"], "failure");
+    assert!(workflow["run_id"].as_str().is_some_and(|id| !id.is_empty()));
+    assert!(!workflow["failure"].is_null(), "no failure digest");
+
+    // Fixed, then gated again with the pass reused: both list the job, since
+    // a reused pass ran as another OS too.
+    fs::write(repo.root().join("src/ok"), "").unwrap();
+    for _ in 0..2 {
+        let output = repo.wrkflw(&gate);
+        assert_ok(&output);
+        let report = &json_lines(&output)[0];
+        assert_eq!(report["passed"], true);
+        assert_eq!(report["ran"], 1);
+        assert_eq!(report["unverified"][0]["job"], "win");
+        assert_eq!(report["unverified"][0]["ran_as"], host_os());
+        assert_eq!(
+            report["unverified"][0]["workflow"],
+            report["workflows"][0]["path"]
+        );
+    }
+    assert_eq!(
+        repo.take_ran(),
+        ["win", "win"],
+        "the third gate didn't reuse"
+    );
+}

@@ -416,9 +416,13 @@ fn run_tui_event_loop(
                     (KeyCode::PageDown, TAB_LOGS) => app.scroll_logs_by(20),
                     (KeyCode::Home, TAB_LOGS) => app.scroll_logs_to_start(),
                     (KeyCode::End, TAB_LOGS) => app.scroll_logs_to_end(),
-                    (KeyCode::Home | KeyCode::End, TAB_WORKFLOWS | TAB_DAG)
-                        if !app.job_selection_mode =>
-                    {
+                    (KeyCode::Home | KeyCode::End, TAB_WORKFLOWS) if !app.job_selection_mode => {
+                        app.jump_workflow(key.code == KeyCode::End);
+                        app.dag_scroll = 0;
+                    }
+                    // While a run goes, the graph shows it; browsing other
+                    // workflows' graphs waits until it ends.
+                    (KeyCode::Home | KeyCode::End, TAB_DAG) if !app.running => {
                         app.jump_workflow(key.code == KeyCode::End);
                         app.dag_scroll = 0;
                     }
@@ -535,7 +539,7 @@ fn run_tui_event_loop(
                                 app.scroll_logs_up();
                             }
                         }
-                        TAB_DAG => {
+                        TAB_DAG if !app.running => {
                             app.previous_workflow();
                             app.dag_scroll = 0;
                         }
@@ -566,7 +570,7 @@ fn run_tui_event_loop(
                                 app.scroll_logs_down();
                             }
                         }
-                        TAB_DAG => {
+                        TAB_DAG if !app.running => {
                             app.next_workflow();
                             app.dag_scroll = 0;
                         }

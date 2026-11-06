@@ -2676,7 +2676,8 @@ impl App {
                         index,
                         step,
                         lines,
-                    } => exec.live.push(&job, index, &step, lines),
+                        earlier,
+                    } => exec.live.push_after(&job, index, &step, lines, earlier),
                 }
             }
         }
@@ -2692,9 +2693,27 @@ impl App {
         result: Result<(Vec<wrkflw_executor::JobResult>, ()), String>,
     ) {
         self.drain_timeline();
+        // The result reorders the Jobs pane (reported jobs come first), so
+        // the cursor follows the job it was on rather than its row number.
+        let anchor = self
+            .job_list_state
+            .selected()
+            .and_then(|row| self.workflows.get(workflow_idx)?.job_row_name(row))
+            .map(str::to_string);
         // Clears `current_execution` when this result is for it; a result
         // for another workflow must not free the slot the running one holds.
         self.process_execution_result(workflow_idx, result);
+        if self.shown_workflow() != Some(workflow_idx) {
+            return;
+        }
+        let row = anchor.and_then(|name| self.workflows[workflow_idx].job_row_of(&name));
+        if let Some(row) = row {
+            if self.job_list_state.selected() != Some(row) {
+                self.job_list_state.select(Some(row));
+                self.step_list_state.select(Some(0));
+                self.step_table_state.select(Some(0));
+            }
+        }
     }
 
     /// Drain any completed dispatch outcomes. Each outcome is pushed
@@ -4299,6 +4318,7 @@ mod tests {
                 index: 0,
                 step: "compile".into(),
                 lines: vec!["Compiling a".into()],
+                earlier: 0,
             },
         );
         app.drain_timeline();
@@ -4359,6 +4379,35 @@ mod tests {
             .unwrap()
             .timeline;
         assert_eq!(timeline, &vec![finished]);
+    }
+
+    #[test]
+    fn the_jobs_cursor_stays_on_its_job_when_the_result_arrives() {
+        use wrkflw_executor::JobStatus as S;
+        let mut app = make_app();
+        app.workflow_list_state.select(Some(0));
+        app.execution_queue.push(QueuedExecution {
+            workflow_idx: 0,
+            target_job: None,
+        });
+        app.get_next_workflow_to_execute();
+        app.current_execution = Some(0);
+        // Rows mid-run: build, lint, test. The cursor is on `test`.
+        app.job_list_state.select(Some(2));
+        assert_eq!(app.workflows[0].job_row_name(2), Some("test"));
+        let leg = |name: &str| wrkflw_executor::JobResult {
+            canonical_name: "build".to_string(),
+            ..job_result(name, S::Success, false)
+        };
+        let results = vec![
+            job_result("lint", S::Success, false),
+            leg("build (os: a)"),
+            leg("build (os: b)"),
+            job_result("test", S::Success, false),
+        ];
+        app.finish_execution(0, Ok((results, ())));
+        let row = app.job_list_state.selected().unwrap();
+        assert_eq!(app.workflows[0].job_row_name(row), Some("test"));
     }
 
     #[test]

@@ -497,32 +497,6 @@ pub fn section<'a>(title: impl Into<String>) -> Line<'a> {
     ])
 }
 
-/// Builds `key desc  key desc …`, dropping whole hints from the end
-/// rather than cutting one in half when the row is too narrow.
-pub fn hint_spans<'a>(hints: &[(&str, &str)], max_width: usize) -> Vec<Span<'a>> {
-    let mut spans: Vec<Span> = Vec::new();
-    let mut used = 0;
-    for (i, (key, desc)) in hints.iter().enumerate() {
-        let sep = if i == 0 { 0 } else { 3 };
-        let w = sep + crate::text::width(key) + 1 + crate::text::width(desc);
-        if used + w > max_width {
-            break;
-        }
-        if sep > 0 {
-            spans.push(Span::styled("   ", muted_style()));
-        }
-        spans.push(Span::styled(
-            key.to_string(),
-            Style::default()
-                .fg(current_accent())
-                .add_modifier(Modifier::BOLD),
-        ));
-        spans.push(Span::styled(format!(" {desc}"), hint_style()));
-        used += w;
-    }
-    spans
-}
-
 /// Two rows of raised push buttons, drawn the way text-mode OSes drew
 /// them: a solid face, then a half-block drop shadow, `▄` at the face's
 /// right end and `▀▀▀` under it, one cell to the right:

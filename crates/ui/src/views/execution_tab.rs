@@ -90,10 +90,9 @@ pub(super) fn render_summary_line(f: &mut Frame<'_>, app: &App, workflow: &Workf
     let mut right: Vec<Span> = Vec::new();
     if let Some(exec) = workflow.execution_details.as_ref() {
         let end = exec.end_time.unwrap_or_else(chrono::Local::now);
-        let secs = end
+        let ms = end
             .signed_duration_since(exec.start_time)
-            .num_seconds()
-            .max(0);
+            .num_milliseconds();
         right.push(Span::styled("started ", theme::muted_style()));
         right.push(Span::styled(
             exec.start_time.format("%H:%M:%S").to_string(),
@@ -108,7 +107,7 @@ pub(super) fn render_summary_line(f: &mut Frame<'_>, app: &App, workflow: &Workf
             theme::muted_style(),
         ));
         right.push(Span::styled(
-            format_duration(secs),
+            format_run_time(ms, exec.end_time.is_some()),
             Style::default().fg(COLORS.text_dim),
         ));
         let counts = job_counts(workflow);
@@ -169,15 +168,33 @@ pub(crate) fn format_ms(ms: u64) -> String {
         ms if ms < 1000 => format!("{ms}ms"),
         // Up to 59.9s; anything that would round to "60.0s" is a minute.
         ms if ms < 59_950 => format!("{:.1}s", ms as f64 / 1000.0),
-        ms => format_duration((ms.max(60_000) / 1000) as i64),
+        // Rounded to the second, as the tenths above are rounded.
+        ms => format_duration((ms.saturating_add(500) / 1000).max(60).min(i64::MAX as u64) as i64),
     }
 }
 
+/// A duration in whole seconds: seconds, then minutes and seconds, then
+/// hours and minutes, the minutes rounded so 59m 59.9s reads `1h 00m`.
 pub(crate) fn format_duration(secs: i64) -> String {
     match secs {
         s if s < 60 => format!("{s}s"),
         s if s < 3600 => format!("{}m {:02}s", s / 60, s % 60),
-        s => format!("{}h {:02}m", s / 3600, (s % 3600) / 60),
+        s => {
+            let minutes = s.saturating_add(30) / 60;
+            format!("{}h {:02}m", minutes / 60, minutes % 60)
+        }
+    }
+}
+
+/// How long a run has taken: tenths once it has finished, as its steps
+/// read in the story, and whole seconds while it runs, so the live count
+/// doesn't flicker.
+pub(crate) fn format_run_time(ms: i64, finished: bool) -> String {
+    let ms = ms.max(0) as u64;
+    if finished {
+        format_ms(ms)
+    } else {
+        format_duration((ms / 1000) as i64)
     }
 }
 
@@ -385,13 +402,26 @@ fn render_output_pane(
         let inner = block.inner(area);
         f.render_widget(block, area);
         let rows = inner.height as usize;
-        let start = tail.lines.len().saturating_sub(rows);
-        let lines: Vec<Line> = tail
-            .lines
-            .iter()
-            .skip(start)
-            .map(|line| text::ansi_line(line, Style::default().fg(COLORS.text_dim)))
-            .collect();
+        let mut start = tail.lines.len().saturating_sub(rows);
+        // Say how much is above the pane, so a window onto a long step
+        // isn't taken for all of it. The line costs one row of output.
+        let mut lines: Vec<Line> = Vec::new();
+        if (start > 0 || tail.earlier > 0) && rows > 1 {
+            start = (start + 1).min(tail.lines.len());
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "↑ {} earlier lines (all of them in the log once the step ends)",
+                    tail.earlier + start
+                ),
+                theme::muted_style(),
+            )));
+        }
+        lines.extend(
+            tail.lines
+                .iter()
+                .skip(start)
+                .map(|line| text::ansi_line(line, Style::default().fg(COLORS.text_dim))),
+        );
         f.render_widget(Paragraph::new(lines), inner);
         return;
     }
@@ -500,5 +530,25 @@ mod tests {
         assert_eq!(format_duration(7), "7s");
         assert_eq!(format_duration(65), "1m 05s");
         assert_eq!(format_duration(3725), "1h 02m");
+        assert_eq!(format_duration(3599), "59m 59s");
+        assert_eq!(format_duration(7199), "2h 00m");
+    }
+
+    #[test]
+    fn rounding_carries_across_every_unit() {
+        assert_eq!(super::format_ms(60_000), "1m 00s");
+        assert_eq!(super::format_ms(119_600), "2m 00s");
+        assert_eq!(super::format_ms(3_599_400), "59m 59s");
+        assert_eq!(super::format_ms(3_599_950), "1h 00m");
+        assert_eq!(super::format_ms(0), "0ms");
+        assert!(super::format_ms(u64::MAX).ends_with('m'));
+        assert!(format_duration(i64::MAX).ends_with('m'));
+    }
+
+    #[test]
+    fn a_finished_run_reads_like_its_steps_and_a_live_one_ticks_in_seconds() {
+        assert_eq!(super::format_run_time(3_900, true), "3.9s");
+        assert_eq!(super::format_run_time(3_900, false), "3s");
+        assert_eq!(super::format_run_time(-5, true), "0ms");
     }
 }

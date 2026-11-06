@@ -202,6 +202,33 @@ fn run_streams_only_json_and_reports_the_failure() {
 }
 
 #[test]
+fn stream_output_reports_lines_before_the_step_ends_and_masks_them() {
+    let sandbox = Sandbox::new();
+    let mut args = RUN_FAILING.to_vec();
+    args.insert(3, "--stream-output");
+    let events = json_lines(&sandbox.run(&args));
+    let position = |kind: &str, step: &str| {
+        events
+            .iter()
+            .position(|e| e["type"] == kind && e["step"] == step)
+            .unwrap_or_else(|| panic!("no {kind} for {step}"))
+    };
+    let output = &events[position("step_output", "boom")];
+    assert_eq!(output["job"], "build");
+    assert!(output["lines"].to_string().contains("before failing"));
+    assert!(position("step_output", "boom") < position("step_finished", "boom"));
+    let streamed: String = events
+        .iter()
+        .filter(|e| e["type"] == "step_output")
+        .map(|e| e["lines"].to_string())
+        .collect();
+    assert!(!streamed.contains("hunter2-very-secret"));
+
+    let quiet = json_lines(&sandbox.run(RUN_FAILING));
+    assert!(!quiet.iter().any(|e| e["type"] == "step_output"));
+}
+
+#[test]
 fn history_records_runs_and_answers_without_a_rerun() {
     let sandbox = Sandbox::new();
     sandbox

@@ -177,6 +177,7 @@ pub(crate) async fn run(ctx: WatchCtx) {
     let run_options = wrkflw_runs::RunOptions {
         meta: run_meta,
         ndjson: json_output,
+        stream_output: false,
         record: true,
         from_step: None,
         observers: Vec::new(),

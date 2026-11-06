@@ -407,6 +407,11 @@ enum Commands {
         #[arg(long)]
         reuse_results: bool,
 
+        /// With --format json, also print `step_output` lines while a step runs,
+        /// so a long step can be followed before it ends
+        #[arg(long)]
+        stream_output: bool,
+
         /// Also skip jobs whose .wrkflw/affected.yml paths have no changed file.
         /// Needs --event. Changed files come from --changed-files, or the git diff
         #[arg(long, requires = "event")]
@@ -1123,6 +1128,7 @@ async fn run_cli() {
             no_record,
             from_step,
             reuse_results,
+            stream_output,
             affected,
             job_container,
             dep_cache,
@@ -1165,6 +1171,7 @@ async fn run_cli() {
                 cache_push: *cache_push,
                 skip_exit_code: *skip_exit_code,
                 gate_mode: *gate_mode,
+                stream_output: *stream_output,
             })
             .await;
         }

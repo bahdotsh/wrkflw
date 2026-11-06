@@ -34,11 +34,11 @@ Run `wrkflw --format json gate`, or the MCP `gate` tool. It runs what a push wou
 
 | Command | stdout |
 | --- | --- |
-| `run`, `watch`, `runs replay` | One object per line: `run_started`, `job_started`, `step_started`, `step_finished`, `job_finished`, `run_finished`. `watch` adds `watch_started` and `watch_cycle`. |
+| `run`, `watch`, `runs replay` | One object per line: `run_started`, `job_started`, `step_started`, `step_output` (with `--stream-output`), `step_finished`, `job_finished`, `run_finished`. `watch` adds `watch_started` and `watch_cycle`. |
 | `validate`, `list`, `plan`, `runs ...`, `clean`, `gate` | One object. |
 | Any error | `{"type": "error", "message": "..."}`, exit 1. |
 
-`step_finished.output` holds the last 64 KiB of a step's output, delivered when the step ends. Output is not streamed while a step runs.
+`step_finished.output` holds the last 64 KiB of a step's output, delivered when the step ends. To follow a long step before it ends, add `--stream-output` to `run`: it adds `step_output` lines, `{job, step, index, lines}`, as the step prints, masked like the rest. Without it no `step_output` lines are printed.
 
 `clean` prints `{"schema_version": 1, "type": "clean", "removed": n, "bytes": n, "in_use": n, "failed": [{"path": "...", "error": "..."}]}`: workspaces removed, the bytes they held, workspaces left because a run holds them, and workspaces that could not be removed. It exits 1 when `failed` is not empty, after cleaning the rest.
 

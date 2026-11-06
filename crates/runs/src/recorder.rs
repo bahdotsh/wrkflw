@@ -104,6 +104,8 @@ pub struct RunOptions {
     pub meta: RunMeta,
     /// Write NDJSON events to stdout.
     pub ndjson: bool,
+    /// With `ndjson`, also write `step_output` lines while a step runs.
+    pub stream_output: bool,
     /// Keep a history record. Also subject to `WRKFLW_NO_HISTORY`.
     pub record: bool,
     pub from_step: Option<FromStep>,
@@ -117,6 +119,7 @@ impl std::fmt::Debug for RunOptions {
         f.debug_struct("RunOptions")
             .field("meta", &self.meta)
             .field("ndjson", &self.ndjson)
+            .field("stream_output", &self.stream_output)
             .field("record", &self.record)
             .field("from_step", &self.from_step)
             .field("observers", &self.observers.len())
@@ -240,6 +243,7 @@ struct Recorder {
     _scratch: Option<tempfile::TempDir>,
     state: Mutex<RunRecord>,
     ndjson: bool,
+    stream_output: bool,
     started: Instant,
 }
 
@@ -348,7 +352,29 @@ impl Recorder {
 }
 
 impl ExecutionObserver for Recorder {
+    fn wants_step_output(&self) -> bool {
+        self.stream_output
+    }
+
     fn on_event(&self, event: &ExecutionEvent) {
+        if let ExecutionEvent::StepOutput {
+            job,
+            step,
+            index,
+            lines,
+        } = event
+        {
+            if self.stream_output {
+                self.line(json!({
+                    "type": "step_output",
+                    "job": job,
+                    "step": step,
+                    "index": index,
+                    "lines": lines,
+                }));
+            }
+            return;
+        }
         if let ExecutionEvent::RunnerSubstituted {
             job,
             requested,
@@ -571,6 +597,7 @@ async fn begin(path: &Path, config: &ExecutionConfig, options: &RunOptions) -> A
         _scratch: scratch,
         state: Mutex::new(record.clone()),
         ndjson: options.ndjson,
+        stream_output: options.ndjson && options.stream_output,
         started: Instant::now(),
     });
     recorder.persist(&record);

@@ -55,6 +55,7 @@ pub(crate) struct RunCtx {
     pub(crate) cache_push: bool,
     pub(crate) skip_exit_code: Option<i32>,
     pub(crate) gate_mode: bool,
+    pub(crate) stream_output: bool,
 }
 
 /// A credential from the environment, so it never has to be in `argv`.
@@ -220,6 +221,7 @@ pub(crate) async fn run(ctx: RunCtx) {
     let options = wrkflw_runs::RunOptions {
         meta,
         ndjson: format.is_json(),
+        stream_output: ctx.stream_output,
         record: !ctx.no_record,
         from_step,
         observers: Vec::new(),

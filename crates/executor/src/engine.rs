@@ -6089,7 +6089,9 @@ async fn run_called_workflow(
     // for now; job-level env merges still populate it correctly downstream.
     let child_user_env: HashMap<String, String> = HashMap::new();
     for batch in plan {
-        let results = acceleration::without_run_state(execute_job_batch(
+        // The called jobs' workspaces are keyed by this caller, so two jobs
+        // calling the workflow with different inputs keep apart.
+        let batch_future = acceleration::without_run_state(execute_job_batch(
             &batch,
             called,
             ctx.runtime,
@@ -6103,8 +6105,8 @@ async fn run_called_workflow(
             ctx.services.artifact_store,
             ctx.services.cache_store,
             ctx.services.platform_overrides,
-        ))
-        .await?;
+        ));
+        let results = crate::workspace::with_caller_job(ctx.job_name, batch_future).await?;
         any_failed |= results.iter().any(JobResult::fails_run);
         record_job_results(
             &results,

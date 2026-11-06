@@ -2,6 +2,7 @@
 name = "wrkflw-runs"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 description = "Run history, failure digests and structured events for wrkflw"
 license.workspace = true
 documentation.workspace = true

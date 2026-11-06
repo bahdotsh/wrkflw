@@ -2,6 +2,7 @@
 name = "wrkflw-evaluator"
 version = "0.8.0"
 edition.workspace = true
+rust-version.workspace = true
 description = "Workflow evaluation functionality for wrkflw execution engine"
 license.workspace = true
 documentation.workspace = true

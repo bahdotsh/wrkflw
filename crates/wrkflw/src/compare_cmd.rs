@@ -314,13 +314,25 @@ fn git_line(args: &[&str]) -> Option<String> {
     (output.status.success() && !line.is_empty()).then_some(line)
 }
 
+/// The workflow file a run names, when it is one in this repository: a
+/// relative path under `.github/workflows/` with no `..`. The API's value
+/// becomes a local path and the child's argument, so nothing else passes.
+fn workflow_path(path: &str) -> Option<&Path> {
+    let path = path.split_once('@').map_or(path, |(file, _)| file);
+    let parsed = Path::new(path);
+    let inside = parsed
+        .components()
+        .all(|part| matches!(part, std::path::Component::Normal(_)));
+    (inside && path.starts_with(".github/workflows/")).then_some(parsed)
+}
+
 /// The child `wrkflw run` that checks the workflow as GitHub ran it.
-fn run_args(remote: &RemoteRun, runtime: &str) -> Vec<String> {
+fn run_args(remote: &RemoteRun, path: &Path, runtime: &str) -> Vec<String> {
     let mut args = vec![
         "--format".to_string(),
         "json".to_string(),
         "run".to_string(),
-        remote.path.clone(),
+        path.display().to_string(),
         "--event".to_string(),
         remote.event.clone(),
         "--diff".to_string(),
@@ -547,7 +559,12 @@ pub(crate) async fn run(ctx: CompareCtx) -> ! {
             )
         );
     }
-    let path = Path::new(&remote.path);
+    let path = workflow_path(&remote.path).unwrap_or_else(|| {
+        ctx.format.fail(&format!(
+            "GitHub named the workflow {:?}, which is not a file under .github/workflows/",
+            remote.path
+        ))
+    });
     let expected = expected_jobs(path).unwrap_or_else(|e| ctx.format.fail(&e));
     let program = std::env::current_exe().unwrap_or_else(|e| {
         ctx.format
@@ -555,7 +572,7 @@ pub(crate) async fn run(ctx: CompareCtx) -> ! {
     });
     let mut child = Command::new(program);
     child
-        .args(run_args(&remote, ctx.runtime.as_flag()))
+        .args(run_args(&remote, path, ctx.runtime.as_flag()))
         .stdin(Stdio::null())
         .stderr(Stdio::inherit());
     crate::cli_secrets::pass_to(&mut child);
@@ -842,6 +859,23 @@ mod tests {
     }
 
     #[test]
+    fn only_a_workflow_file_in_the_repository_is_run() {
+        assert_eq!(
+            workflow_path(".github/workflows/ci.yml"),
+            Some(Path::new(".github/workflows/ci.yml"))
+        );
+        assert_eq!(
+            workflow_path(".github/workflows/ci.yml@refs/heads/main"),
+            Some(Path::new(".github/workflows/ci.yml"))
+        );
+        assert_eq!(workflow_path("/etc/passwd"), None);
+        assert_eq!(workflow_path(".github/workflows/../../x.yml"), None);
+        assert_eq!(workflow_path("./.github/workflows/ci.yml"), None);
+        assert_eq!(workflow_path("scripts/ci.yml"), None);
+        assert_eq!(workflow_path(""), None);
+    }
+
+    #[test]
     fn a_pull_request_run_is_checked_against_its_base() {
         let run = RemoteRun {
             id: 9,
@@ -856,7 +890,7 @@ mod tests {
             base_branch: Some("main".into()),
             jobs: vec![],
         };
-        let args = run_args(&run, "docker");
+        let args = run_args(&run, Path::new(".github/workflows/ci.yml"), "docker");
         assert!(args.windows(2).any(|w| w == ["--event", "pull_request"]));
         assert!(args.windows(2).any(|w| w == ["--base-branch", "main"]));
         assert!(args.windows(2).any(|w| w == ["--diff-base", "origin/main"]));

@@ -2561,14 +2561,10 @@ async fn execute_job_batch(
     // and per-job state (needs context, secrets). JobServices is constructed
     // per-job inside execute_job_with_matrix after resolving secrets.
 
-    // In order, at most as many at once as the VM's memory allows. On a
-    // runner each job has a machine of its own; here they share one.
-    let result_arrays: Vec<_> =
-        futures::stream::StreamExt::collect(futures::stream::StreamExt::buffered(
-            futures::stream::iter(futures),
-            crate::vm_memory::parallel_jobs(),
-        ))
-        .await;
+    // All at once: each job, or each leg of a matrix job, waits for a place
+    // in `vm_memory`'s pool before its steps run, so the VM's memory limit
+    // holds across jobs and legs together.
+    let result_arrays = future::join_all(futures).await;
 
     // Flatten the results from all jobs and their matrix combinations
     let mut results = Vec::new();
@@ -2797,12 +2793,12 @@ async fn execute_job_with_matrix(
             combinations.len()
         ));
 
-        // Set maximum parallel jobs: the matrix's own limit, or the CPU
-        // count, and never more than the VM's memory allows.
+        // The matrix's own limit, or the CPU count. The VM's memory limit
+        // is applied per leg, in `execute_matrix_job`, from the pool every
+        // job of the run shares.
         let max_parallel = job
             .max_parallel()
             .unwrap_or_else(|| std::cmp::max(1, num_cpus::get()))
-            .min(crate::vm_memory::parallel_jobs())
             .max(1);
 
         let services = JobServices {
@@ -2925,6 +2921,9 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
         return execute_reusable_workflow_job(&ctx, uses, job.with.as_ref(), job.secrets.as_ref())
             .await;
     }
+    // Only after the reusable workflow check: its jobs take places of their
+    // own, and a caller holding one would deadlock a limit of one.
+    let _slot = crate::vm_memory::job_slot().await;
 
     // Clone context and add job-specific variables.
     // `job_env` is the full lookup map (runner + user union); `job_user_env`
@@ -3292,6 +3291,9 @@ async fn execute_matrix_job(
     verbose: bool,
     services: &JobServices<'_>,
 ) -> Result<JobResult, ExecutionError> {
+    // One place in the run's pool for the leg, as for any job.
+    let _slot = crate::vm_memory::job_slot().await;
+
     // Create the matrix-specific job name
     let matrix_job_name = wrkflw_matrix::format_combination_name(job_name, combination);
 

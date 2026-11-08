@@ -7,7 +7,9 @@
 //! says so up front, and runs fewer jobs at once while memory is short.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 const GIB: u64 = 1024 * 1024 * 1024;
 
@@ -26,17 +28,46 @@ pub const MAX_PARALLEL_JOBS_ENV: &str = "WRKFLW_MAX_PARALLEL_JOBS";
 /// How long `docker info` may take before it's given up on.
 const QUERY_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Jobs that may run at once, 0 for no limit.
+/// Jobs that may run at once by the VM's memory, 0 for no limit.
 static JOB_LIMIT: AtomicUsize = AtomicUsize::new(0);
 
-/// How many jobs of one batch run at once.
-pub fn parallel_jobs() -> usize {
-    if let Some(limit) = env_limit() {
-        return limit;
-    }
-    match JOB_LIMIT.load(Ordering::Relaxed) {
-        0 => usize::MAX,
-        limit => limit,
+/// The places running jobs share, and how many there are. Every job and
+/// every matrix leg that runs steps holds one, so a run never has more of
+/// them going at once than the limit, however jobs and legs are nested.
+static POOL: Mutex<Option<(usize, Arc<Semaphore>)>> = Mutex::new(None);
+
+/// How many jobs and matrix legs may run at once, or `None` for no limit:
+/// `WRKFLW_MAX_PARALLEL_JOBS`, else what the VM's memory allows.
+pub fn job_limit() -> Option<usize> {
+    env_limit().or(match JOB_LIMIT.load(Ordering::Relaxed) {
+        0 => None,
+        limit => Some(limit),
+    })
+}
+
+/// Wait for a place to run a job or matrix leg in, and hold it until the
+/// returned permit drops. `None` when nothing limits how many run at once.
+///
+/// Take it only around a job's own steps: a job that calls a reusable
+/// workflow runs that workflow's jobs, and holding a place while they wait
+/// for one would deadlock a limit of one.
+pub(crate) async fn job_slot() -> Option<OwnedSemaphorePermit> {
+    let limit = job_limit()?;
+    pool_of(&POOL, limit).acquire_owned().await.ok()
+}
+
+/// The pool in `slot` for `limit` places: the one already there when its
+/// size is right, else a new one. A run that changes the limit gets a pool
+/// of the new size; jobs still holding the old one finish in it.
+fn pool_of(slot: &Mutex<Option<(usize, Arc<Semaphore>)>>, limit: usize) -> Arc<Semaphore> {
+    let mut pool = slot.lock().unwrap_or_else(|e| e.into_inner());
+    match &*pool {
+        Some((size, semaphore)) if *size == limit => Arc::clone(semaphore),
+        _ => {
+            let semaphore = Arc::new(Semaphore::new(limit));
+            *pool = Some((limit, Arc::clone(&semaphore)));
+            semaphore
+        }
     }
 }
 
@@ -128,6 +159,22 @@ mod tests {
         assert_eq!(limit_for(2 * GIB), Some(1));
         assert_eq!(limit_for(12 * GIB), Some(3));
         assert_eq!(limit_for(GITHUB_RUNNER_BYTES), None);
+    }
+
+    #[test]
+    fn every_job_and_leg_takes_its_place_from_one_pool() {
+        let slot = Mutex::new(None);
+        let pool = pool_of(&slot, 2);
+        assert!(Arc::ptr_eq(&pool, &pool_of(&slot, 2)));
+        let _a = Arc::clone(&pool).try_acquire_owned().unwrap();
+        let _b = pool_of(&slot, 2).try_acquire_owned().unwrap();
+        assert!(
+            pool_of(&slot, 2).try_acquire_owned().is_err(),
+            "a third place was handed out with a limit of two"
+        );
+        let resized = pool_of(&slot, 3);
+        assert!(!Arc::ptr_eq(&pool, &resized));
+        assert_eq!(resized.available_permits(), 3);
     }
 
     #[test]

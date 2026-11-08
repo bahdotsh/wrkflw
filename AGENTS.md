@@ -86,7 +86,7 @@ The run also records your session, from `--session`, `WRKFLW_SESSION`, `CLAUDE_C
 
 - `--affected` trusts the paths in `.wrkflw/affected.yml`. A path left out of a job's list won't rerun that job.
 - `wrkflw gate` checks the working tree, not the commits you push, and skips jobs marked `gate: false` in `.wrkflw/affected.yml`.
-- Docker Desktop and Podman machines often have half the memory of a GitHub runner. With Docker or Podman, a run warns when the VM has less than 14 GB and runs at most one job per 4 GB at a time. Set `WRKFLW_MAX_PARALLEL_JOBS` to change that.
+- Docker Desktop and Podman machines often have half the memory of a GitHub runner. With Docker or Podman, a run warns when the VM has less than 14 GB and runs at most one job or matrix leg per 4 GB at a time, counting every job of the run together. Set `WRKFLW_MAX_PARALLEL_JOBS` to change that.
 - A checkout from a git worktree or submodule gets a real `.git` directory in the job's workspace, on the same branch, so steps that run git work as on GitHub.
 - Parallel jobs run one after another in emulation, so `--runtime emulation` won't show a race between jobs.
 - `--from-step` needs `--job`. Earlier steps are skipped apart from `actions/checkout`, so their outputs and files are missing. Use it to iterate on a step that doesn't depend on them.

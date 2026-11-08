@@ -378,7 +378,7 @@ wrkflw mcp serve
 
 Every `run_finished`, and the gate result, carries a `verdict`. `verified` means every job ran as the OS it asked for. `partial` means some jobs ran as another OS and are listed under `unverified`. `nothing_checked` means no job ran, so the pass proves nothing. A failure digest names a likely `cause` when the output shows a process killed for lack of memory.
 
-Docker Desktop and Podman machines often have half the 16 GB of a GitHub runner, and a Rust or C++ link can be killed there although it passes in CI. wrkflw warns when the VM has less than 14 GB and runs at most one job per 4 GB at a time. Set `WRKFLW_MAX_PARALLEL_JOBS` to change that.
+Docker Desktop and Podman machines often have half the 16 GB of a GitHub runner, and a Rust or C++ link can be killed there although it passes in CI. wrkflw warns when the VM has less than 14 GB and runs at most one job or matrix leg per 4 GB at a time, counting every job of the run together. Set `WRKFLW_MAX_PARALLEL_JOBS` to change that.
 
 `scripts/conformance/plan_corpus.sh` plans the last finished run of every workflow in a list of public repositories, and compares the number of jobs with what GitHub ran. It needs `gh` and `jq`, and runs nothing.
 

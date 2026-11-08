@@ -553,6 +553,40 @@ struct Launcher<'a> {
 }
 
 impl Launcher<'_> {
+    /// Run the child that checks `file` as `event`, and return its entry for
+    /// the `gate` object, with the event it was checked as. With `json`, the
+    /// child prints JSON and its `run_finished` becomes the entry; without,
+    /// its output reaches the terminal and the entry comes from its exit code.
+    fn check(&self, ctx: &GateCtx, file: &Path, event: &Event, json: bool) -> Value {
+        let mut child = self.command(ctx, file, event, json);
+        let mut entry = if json {
+            child.stdin(Stdio::null()).stderr(Stdio::inherit());
+            match child.output() {
+                Ok(output) => workflow_report(
+                    file,
+                    output.status.code(),
+                    &String::from_utf8_lossy(&output.stdout),
+                ),
+                Err(e) => json!({
+                    "path": file.display().to_string(),
+                    "status": "error",
+                    "error": format!("cannot run wrkflw: {}", e),
+                }),
+            }
+        } else {
+            println!(
+                "{}",
+                cli_style::dim(&format!("gate: {} ({})", file.display(), event.describe()))
+            );
+            text_entry(file, child.status().ok().and_then(|status| status.code()))
+        };
+        entry["event"] = json!(event.name);
+        if let Some(base) = &event.base_branch {
+            entry["base_branch"] = json!(base);
+        }
+        entry
+    }
+
     /// The child that checks `file` as `event`, printing JSON when `json`.
     fn command(&self, ctx: &GateCtx, file: &Path, event: &Event, json: bool) -> Command {
         let mut child = Command::new(self.program);
@@ -620,123 +654,95 @@ pub(crate) fn run(ctx: GateCtx) {
         runtime,
         probed: probed.as_deref(),
     };
-    if ctx.format == OutputFormat::Json {
-        run_json(
-            &ctx,
-            &launcher,
-            &files,
-            &uncommitted,
-            &first,
-            second.as_ref(),
-        );
-    }
-
+    let json_mode = ctx.format == OutputFormat::Json;
     // Every workflow runs even after a failure, so one push shows all of them.
-    let mut failed = Vec::new();
-    let mut skipped = 0;
-    let run_child = |file: &Path, event: &Event| {
-        launcher
-            .command(&ctx, file, event, false)
-            .status()
-            .ok()
-            .and_then(|status| status.code())
-    };
-    for file in &files {
-        println!(
-            "{}",
-            cli_style::dim(&format!("gate: {} ({})", file.display(), first.describe()))
-        );
-        let mut code = run_child(file, &first);
-        if let (true, Some(second)) = (ran_nothing(code), second.as_ref()) {
-            println!(
-                "{}",
-                cli_style::dim(&format!(
-                    "gate: {} runs no job for a {}, checking it as a {}",
-                    file.display(),
-                    first.describe(),
-                    second.describe()
-                ))
-            );
-            code = run_child(file, second);
-        }
-        match code {
-            Some(0) => {}
-            _ if ran_nothing(code) => skipped += 1,
-            _ => failed.push(file.display().to_string()),
-        }
-    }
-    if failed.is_empty() {
-        let ran = files.len() - skipped;
-        if ran == 0 {
-            eprintln!(
-                "{}",
-                cli_style::warning(&nothing_checked_warning(&first, second.as_ref()))
-            );
-            return;
-        }
-        println!("gate passed: {} workflow(s) ran, {} skipped", ran, skipped);
-        return;
-    }
-    eprintln!("gate failed: {}", failed.join(", "));
-    std::process::exit(1);
-}
-
-/// The gate with `--format json`: one `gate` object on stdout, exit 1 unless
-/// it passed. Each child's logs still reach stderr.
-fn run_json(
-    ctx: &GateCtx,
-    launcher: &Launcher,
-    files: &[PathBuf],
-    uncommitted: &[String],
-    first: &Event,
-    second: Option<&Event>,
-) -> ! {
-    let check = |file: &Path, event: &Event| -> Value {
-        let mut child = launcher.command(ctx, file, event, true);
-        child.stdin(Stdio::null()).stderr(Stdio::inherit());
-        let mut entry = match child.output() {
-            Ok(output) => workflow_report(
-                file,
-                output.status.code(),
-                &String::from_utf8_lossy(&output.stdout),
-            ),
-            Err(e) => json!({
-                "path": file.display().to_string(),
-                "status": "error",
-                "error": format!("cannot run wrkflw: {}", e),
-            }),
-        };
-        entry["event"] = json!(event.name);
-        if let Some(base) = &event.base_branch {
-            entry["base_branch"] = json!(base);
-        }
-        entry
-    };
-    let mut workflows = Vec::new();
-    for file in files {
-        let mut entry = check(file, first);
-        if let (true, Some(second)) = (checked_nothing(&entry), second) {
-            let first_reason = why_nothing_ran(&entry);
-            entry = check(file, second);
-            if checked_nothing(&entry) {
-                entry["skip_reason"] = json!(format!(
-                    "{}: {}; {}: {}",
-                    first.describe(),
-                    first_reason,
-                    second.describe(),
-                    why_nothing_ran(&entry),
-                ));
-            }
-        }
-        workflows.push(entry);
-    }
-    let report = gate_report(workflows, uncommitted);
+    let workflows: Vec<Value> = files
+        .iter()
+        .map(|file| {
+            check_workflow(&first, second.as_ref(), json_mode, |event| {
+                launcher.check(&ctx, file, event, json_mode)
+            })
+        })
+        .collect();
+    let report = gate_report(workflows, &uncommitted);
     let failed = report["verdict"] == "failed";
     if report["verdict"] == "nothing_checked" {
-        eprintln!("{}", nothing_checked_warning(first, second));
+        eprintln!(
+            "{}",
+            cli_style::warning(&nothing_checked_warning(&first, second.as_ref()))
+        );
     }
-    wrkflw_runs::emit_line(&report);
+    if json_mode {
+        wrkflw_runs::emit_line(&report);
+    } else if failed {
+        let paths: Vec<&str> = report["failed"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect();
+        eprintln!("gate failed: {}", paths.join(", "));
+    } else if report["verdict"] != "nothing_checked" {
+        println!(
+            "gate passed: {} workflow(s) ran, {} skipped",
+            report["ran"], report["skipped"]
+        );
+    }
     std::process::exit(i32::from(failed));
+}
+
+/// Check one workflow as `first`, and again as `second` when the first ran
+/// no job, the one place the gate decides that. Both output formats come
+/// through here, so they agree on what ran.
+///
+/// `check` runs the child and returns its entry. When both events checked
+/// nothing, the entry's `skip_reason` gives both reasons.
+fn check_workflow(
+    first: &Event,
+    second: Option<&Event>,
+    json_mode: bool,
+    mut check: impl FnMut(&Event) -> Value,
+) -> Value {
+    let entry = check(first);
+    let Some(second) = second.filter(|_| checked_nothing(&entry)) else {
+        return entry;
+    };
+    if !json_mode {
+        println!(
+            "{}",
+            cli_style::dim(&format!(
+                "gate: {} runs no job for a {}, checking it as a {}",
+                entry["path"].as_str().unwrap_or_default(),
+                first.describe(),
+                second.describe()
+            ))
+        );
+    }
+    let first_reason = why_nothing_ran(&entry);
+    let mut entry = check(second);
+    if checked_nothing(&entry) {
+        entry["skip_reason"] = json!(format!(
+            "{}: {}; {}: {}",
+            first.describe(),
+            first_reason,
+            second.describe(),
+            why_nothing_ran(&entry),
+        ));
+    }
+    entry
+}
+
+/// The entry for a child run in text mode, from its exit code alone: its
+/// output went to the terminal, so the code is all there is to read.
+fn text_entry(file: &Path, code: Option<i32>) -> Value {
+    let mut entry = match code {
+        Some(0) => json!({"status": "success"}),
+        Some(SKIPPED_EXIT) => json!({"status": "skipped"}),
+        Some(NOTHING_CHECKED_EXIT) => json!({"status": "success", "verdict": "nothing_checked"}),
+        _ => json!({"status": "failure", "error": format!("wrkflw exited with {code:?}")}),
+    };
+    entry["path"] = json!(file.display().to_string());
+    entry
 }
 
 #[cfg(test)]

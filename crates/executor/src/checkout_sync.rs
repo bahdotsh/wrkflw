@@ -140,13 +140,25 @@ fn mirror_git_dir(root: &Path, to_git: &Path) -> Result<(), ExecutionError> {
     // The config is written separately, without the settings that make git
     // run a host program (`core.hooksPath`, `core.fsmonitor`) or point
     // outside the workspace (`core.worktree`).
-    mirror_directory(
-        &dirs.common,
-        to_git,
-        false,
-        &["hooks", "config", "worktrees"],
-        &["objects"],
-    )?;
+    //
+    // For a worktree, only what git shares between worktrees comes from the
+    // common directory. The rest of it, such as `HEAD`, `index`, `ORIG_HEAD`
+    // or a `MERGE_HEAD` left by a merge in progress, is the main checkout's
+    // own state, and would make the job's checkout look mid-merge.
+    let mut skip: Vec<String> = ["hooks", "config", "worktrees"].map(String::from).to_vec();
+    if dirs.own != dirs.common {
+        let entries = std::fs::read_dir(&dirs.common).map_err(|e| {
+            ExecutionError::Execution(format!("Failed to read {}: {e}", dirs.common.display()))
+        })?;
+        skip.extend(
+            entries
+                .flatten()
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .filter(|name| !SHARED_GIT_ENTRIES.contains(&name.as_str())),
+        );
+    }
+    let skip: Vec<&str> = skip.iter().map(String::as_str).collect();
+    mirror_directory(&dirs.common, to_git, false, &skip, &["objects"])?;
     if dirs.own != dirs.common {
         // This worktree's HEAD, index and the like, over the main
         // checkout's. Only files: its directories (`logs`, and `refs` for
@@ -166,6 +178,25 @@ fn mirror_git_dir(root: &Path, to_git: &Path) -> Result<(), ExecutionError> {
     }
     write_sanitized_git_config(&dirs.common.join("config"), &to_git.join("config"))
 }
+
+/// What a worktree shares with the main checkout in the common git
+/// directory, after git's own list: objects, refs and the files beside them.
+/// Everything else there belongs to the main checkout alone. `logs` is left
+/// out with it, since its `HEAD` is the main checkout's and a clone's
+/// reflogs say nothing a step needs.
+const SHARED_GIT_ENTRIES: &[&str] = &[
+    "objects",
+    "refs",
+    "packed-refs",
+    "info",
+    "shallow",
+    "remotes",
+    "branches",
+    "description",
+    "rr-cache",
+    "modules",
+    "lfs",
+];
 
 /// Settings of `.git/config` a checkout leaves out: each makes git run a
 /// program from the developer's machine, or read a path only it has.
@@ -1428,6 +1459,13 @@ mod tests {
         assert!(git(&tree, &["add", "."]));
         assert!(git(&tree, &["commit", "-q", "-m", "two"]));
         assert!(tree.join(".git").is_file());
+        // The main checkout is mid-merge. That is its state, not the
+        // worktree's, and must not reach the job's checkout.
+        let main_head = git_out(repo.path(), &["rev-parse", "HEAD"]).unwrap();
+        let main_git = repo.path().join(".git");
+        std::fs::write(main_git.join("MERGE_HEAD"), format!("{main_head}\n")).unwrap();
+        std::fs::write(main_git.join("MERGE_MSG"), "Merge branch 'x'\n").unwrap();
+        std::fs::write(main_git.join("ORIG_HEAD"), "main checkout's\n").unwrap();
         let dst = tempfile::tempdir().unwrap();
 
         copy_directory_contents(&tree, dst.path()).unwrap();
@@ -1436,6 +1474,20 @@ mod tests {
         assert!(git_dir.is_dir());
         assert!(!git_dir.join("worktrees").exists());
         assert!(!git_dir.join("commondir").exists());
+        for state in ["MERGE_HEAD", "MERGE_MSG"] {
+            assert!(!git_dir.join(state).exists(), "{state} leaked");
+        }
+        // The worktree has an ORIG_HEAD of its own: that one, not the main
+        // checkout's, is the one the job sees.
+        let own_orig = main_git.join("worktrees/feature/ORIG_HEAD");
+        assert_eq!(
+            std::fs::read_to_string(git_dir.join("ORIG_HEAD")).ok(),
+            std::fs::read_to_string(own_orig).ok()
+        );
+        assert_eq!(
+            git_out(dst.path(), &["rev-parse", "-q", "--verify", "MERGE_HEAD"]),
+            None
+        );
         assert_eq!(
             git_out(dst.path(), &["rev-parse", "--abbrev-ref", "HEAD"]).as_deref(),
             Some("feature")

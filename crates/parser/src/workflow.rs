@@ -728,6 +728,8 @@ jobs:
     steps:
       - run: echo hi
         timeout-minutes: 5
+      - run: echo slow
+        timeout-minutes: ${{ matrix.slow && 30 || 10 }}
 "#,
         )
         .unwrap();
@@ -737,6 +739,7 @@ jobs:
         let job = &workflow.jobs["t"];
         assert_eq!(job.timeout_minutes, None);
         assert_eq!(job.steps[0].timeout_minutes, Some(5.0));
+        assert_eq!(job.steps[1].timeout_minutes, None);
     }
 
     #[test]

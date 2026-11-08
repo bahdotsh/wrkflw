@@ -1431,6 +1431,17 @@ mod tests {
             evaluate_matrix_text("plain", None).as_deref(),
             Some("plain")
         );
+        // A `}}` inside a string literal ends the match early. The cut
+        // expression doesn't tokenize, so the text is left unevaluated
+        // rather than evaluated wrongly.
+        assert_eq!(
+            evaluate_matrix_text("${{ matrix.os || '}}' }}", Some(&leg)),
+            None
+        );
+        assert_eq!(
+            evaluate_matrix_text("${{ matrix.os }}-${{ matrix.os }}", Some(&leg)).as_deref(),
+            Some("windows-latest-windows-latest")
+        );
     }
 
     #[test]

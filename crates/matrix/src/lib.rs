@@ -791,6 +791,49 @@ mod tests {
         }
     }
 
+    /// GitHub applies `exclude` before `include`, so an `include` entry can
+    /// bring back a combination `exclude` removed.
+    #[test]
+    fn include_can_restore_an_excluded_combination() {
+        let mut matrix = make_matrix(vec![
+            ("os", vec!["ubuntu", "windows"]),
+            ("python", vec!["3.8", "3.9"]),
+        ]);
+        matrix.exclude = MatrixEntries::List(vec![entry(&[("os", "windows"), ("python", "3.8")])]);
+        matrix.include = MatrixEntries::List(vec![entry(&[
+            ("os", "windows"),
+            ("python", "3.8"),
+            ("experimental", "true"),
+        ])]);
+
+        let combos = expand_matrix(&matrix).unwrap();
+
+        assert_eq!(combos.len(), 4, "{:?}", combos);
+        assert_eq!(
+            leg(
+                &combos,
+                &[
+                    ("os", "windows"),
+                    ("python", "3.8"),
+                    ("experimental", "true")
+                ]
+            )
+            .len(),
+            1,
+            "{:?}",
+            combos
+        );
+        // The entry overwrites an axis value of every other combination, so
+        // it is added to none of them.
+        assert!(
+            combos
+                .iter()
+                .filter(|c| c.values.get("experimental").is_some())
+                .count()
+                == 1
+        );
+    }
+
     /// pallets/itsdangerous: seven entries, seven jobs on GitHub. The second
     /// shares `python` with the first, which used to swallow it.
     #[test]

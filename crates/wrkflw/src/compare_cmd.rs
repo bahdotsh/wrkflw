@@ -71,15 +71,7 @@ fn value_text(value: &serde_yaml::Value) -> Option<String> {
 /// appends a leg's values to any other name, including one that only says
 /// the word, such as `Build the matrix`.
 fn reads_matrix(name: &str) -> bool {
-    name.split("${{").skip(1).any(|rest| {
-        let expr = rest.split("}}").next().unwrap_or_default();
-        expr.match_indices("matrix").any(|(at, _)| {
-            let before = expr[..at].chars().next_back();
-            let after = expr[at + "matrix".len()..].chars().next();
-            !before.is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '.')
-                && !after.is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '-')
-        })
-    })
+    wrkflw_executor::expression::text_reads_context(name, "matrix")
 }
 
 /// Every job of the workflow at `path`, with the name GitHub would give it.
@@ -108,7 +100,7 @@ fn expected_jobs(path: &Path) -> Result<Vec<ExpectedJob>, String> {
         let Some(legs) = legs else {
             let name = template
                 .as_deref()
-                .and_then(|t| wrkflw_executor::runner_fidelity::evaluate_matrix_text(t, None));
+                .and_then(|t| wrkflw_executor::expression::evaluate_matrix_text(t, None));
             expected.push(ExpectedJob {
                 local: id.clone(),
                 github_base: name.clone().unwrap_or_else(|| id.clone()),
@@ -123,7 +115,7 @@ fn expected_jobs(path: &Path) -> Result<Vec<ExpectedJob>, String> {
             let named = template
                 .as_deref()
                 .and_then(|t| {
-                    wrkflw_executor::runner_fidelity::evaluate_matrix_text(t, Some(&leg.values))
+                    wrkflw_executor::expression::evaluate_matrix_text(t, Some(&leg.values))
                 })
                 .unwrap_or_else(|| id.clone());
             let values: Option<BTreeSet<String>> =

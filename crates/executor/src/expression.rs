@@ -1269,6 +1269,88 @@ pub fn strip_expression_wrapper(expr: &str) -> &str {
     }
 }
 
+/// The contexts `expr` reads, such as `matrix` and `needs` in
+/// `matrix.os || needs.setup.outputs.os`: each name that isn't a property
+/// (after `.`), a function (before `(`) or inside a string literal. `None`
+/// when the expression doesn't tokenize.
+pub fn contexts_read(expr: &str) -> Option<Vec<String>> {
+    let tokens = Tokenizer::new(expr.trim()).tokenize().ok()?;
+    let mut found: Vec<String> = Vec::new();
+    for (i, token) in tokens.iter().enumerate() {
+        let Token::Ident(name) = token else {
+            continue;
+        };
+        let is_property = i > 0 && tokens[i - 1] == Token::Dot;
+        let is_call = tokens.get(i + 1) == Some(&Token::LParen);
+        if !is_property && !is_call && !found.contains(name) {
+            found.push(name.clone());
+        }
+    }
+    Some(found)
+}
+
+/// Whether any `${{ }}` in `text` reads `context`, such as a job `name:`
+/// that reads `matrix`.
+pub fn text_reads_context(text: &str, context: &str) -> bool {
+    text.split("${{").skip(1).any(|rest| {
+        let expr = rest.split("}}").next().unwrap_or_default();
+        contexts_read(expr).is_some_and(|found| found.iter().any(|c| c == context))
+    })
+}
+
+/// `text` with each `${{ }}` evaluated against `matrix` alone, as GitHub
+/// fills in a job's `name:` or `runs-on:` for one matrix leg. `None` when an
+/// expression reads another context, such as `needs`, or is empty.
+pub fn evaluate_matrix_text(text: &str, matrix: Option<&HashMap<String, Value>>) -> Option<String> {
+    static EXPR: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"\$\{\{(.*?)\}\}").unwrap());
+    if !text.contains("${{") {
+        return Some(text.to_string());
+    }
+    let empty = HashMap::new();
+    let combination = Some(matrix.cloned().unwrap_or_default());
+    let statuses = HashMap::new();
+    let outputs = HashMap::new();
+    let needs = HashMap::new();
+    let needs_results = HashMap::new();
+    let ctx = ExpressionContext {
+        env_context: &empty,
+        step_outputs: &outputs,
+        matrix_combination: &combination,
+        step_statuses: &statuses,
+        job_status: "success",
+        secrets_context: &empty,
+        needs_context: &needs,
+        needs_results: &needs_results,
+        user_env: &empty,
+    };
+    let mut resolved = String::new();
+    let mut last = 0;
+    for caps in EXPR.captures_iter(text) {
+        let whole = caps.get(0).expect("match");
+        let expr = &caps[1];
+        // Only `matrix` is known here. Another context, such as `needs`,
+        // has no value yet, and a fallback after `||` would be a guess.
+        if contexts_read(expr)?
+            .iter()
+            .any(|context| context != "matrix")
+        {
+            return None;
+        }
+        let value = match evaluate(expr, &ctx).ok()? {
+            ExprValue::String(s) if !s.is_empty() => s,
+            ExprValue::Number(n) => n.to_string(),
+            ExprValue::Bool(b) => b.to_string(),
+            _ => return None,
+        };
+        resolved.push_str(&text[last..whole.start()]);
+        resolved.push_str(&value);
+        last = whole.end();
+    }
+    resolved.push_str(&text[last..]);
+    Some(resolved)
+}
+
 /// Whether an expression calls one of the status functions `success()`,
 /// `failure()`, `always()` or `cancelled()`.
 ///
@@ -1301,6 +1383,55 @@ pub fn calls_status_function(expr: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn contexts_read_skips_literals_properties_and_functions() {
+        assert_eq!(
+            contexts_read("matrix.os || 'needs.x'").unwrap(),
+            vec!["matrix".to_string()]
+        );
+        assert_eq!(
+            contexts_read("inputs.os || 'ubuntu-latest'").unwrap(),
+            vec!["inputs".to_string()]
+        );
+        assert_eq!(
+            contexts_read("fromJSON(needs.a.outputs.os)").unwrap(),
+            vec!["needs".to_string()]
+        );
+        assert_eq!(
+            contexts_read("forgejo.ref == 'x'").unwrap(),
+            vec!["forgejo".to_string()]
+        );
+        assert!(text_reads_context("Build (${{ matrix.os }})", "matrix"));
+        assert!(text_reads_context("${{ matrix['os'] }}", "matrix"));
+        assert!(!text_reads_context("Build the matrix", "matrix"));
+        assert!(!text_reads_context(
+            "${{ github.workflow }} matrix",
+            "matrix"
+        ));
+        assert!(!text_reads_context("${{ inputs.matrix_name }}", "matrix"));
+    }
+
+    #[test]
+    fn matrix_text_is_evaluated_only_when_it_reads_nothing_else() {
+        let leg = HashMap::from([("os".to_string(), Value::String("windows-latest".into()))]);
+        assert_eq!(
+            evaluate_matrix_text("${{ matrix.os || 'ubuntu-latest' }}", Some(&leg)).as_deref(),
+            Some("windows-latest")
+        );
+        assert_eq!(
+            evaluate_matrix_text("${{ matrix.os || 'ubuntu-latest' }}", None).as_deref(),
+            Some("ubuntu-latest")
+        );
+        assert_eq!(
+            evaluate_matrix_text("${{ forgejo.ref || 'ubuntu-latest' }}", Some(&leg)),
+            None
+        );
+        assert_eq!(
+            evaluate_matrix_text("plain", None).as_deref(),
+            Some("plain")
+        );
+    }
 
     #[test]
     fn calls_status_function_detects_calls_only() {

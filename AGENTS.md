@@ -21,7 +21,7 @@ Prefer the MCP server if your client supports MCP. `wrkflw mcp install` register
 
 Run `wrkflw --format json gate`, or the MCP `gate` tool. It runs what CI would run for your push, reusing jobs that already passed on the same files, and exits 1 if anything fails.
 
-Without `--event`, each workflow is checked as a push. On a branch other than the default one, a workflow a push doesn't fire, such as CI that runs on pushes to `main` and on pull requests, is checked again as a pull request into the default branch (`origin/HEAD`, else `main` or `master`). Pass `--base-branch` for another target, or `--event` to check one event only.
+Without `--event`, each workflow is checked as a push. On a branch other than the default one, a workflow that runs no job for a push, because it doesn't fire or every job is skipped, such as CI that runs on pushes to `main` and on pull requests, is checked again as a pull request into the default branch (`origin/HEAD`, else `main` or `master`). Pass `--base-branch` for another target, or `--event` to check one event only.
 
 It prints one `gate` object: `verdict`, `passed`, `failed` (paths), `unverified` (with `workflow`), `uncommitted_changes`, and per workflow its `status`, `verdict`, the `event` (and `base_branch`) it was checked as, `run_id`, `jobs` and `failure` digest. `verdict` is `verified`, `partial` (passed, with jobs under `unverified`), `nothing_checked` (no job ran for any workflow) or `failed`. `passed` is true only when something ran and nothing failed. A gate that checked nothing exits 0, so a push that no CI runs for isn't blocked, and prints a warning on stderr.
 

@@ -3,7 +3,8 @@
 //! Each workflow runs in a child `wrkflw run`, because that command owns the
 //! trigger prefilter and calls `process::exit` on every terminal outcome. The
 //! child's exit code is the whole interface: 0 passed, `SKIPPED_EXIT` didn't
-//! fire, and neither should stop the push. With `--format json` each child
+//! fire, `NOTHING_CHECKED_EXIT` fired but every job was skipped, and none of
+//! them should stop the push. With `--format json` each child
 //! prints JSON too, and its `run_finished` goes into one `gate` object.
 //!
 //! Without `--event`, a workflow is checked as a push first. CI often runs on
@@ -24,6 +25,16 @@ const HOOK_MARKER: &str = "# installed by wrkflw gate";
 
 /// What the child exits with when its triggers don't match the event.
 const SKIPPED_EXIT: i32 = 78;
+
+/// What the child exits with when it passed without running a job, every
+/// one skipped by `if:`, `needs` or `gate: false`. It checked nothing, so
+/// the gate treats it as it does a skip.
+const NOTHING_CHECKED_EXIT: i32 = 79;
+
+/// Whether a child's exit code says it checked nothing.
+fn ran_nothing(code: Option<i32>) -> bool {
+    matches!(code, Some(SKIPPED_EXIT | NOTHING_CHECKED_EXIT))
+}
 
 pub(crate) struct GateCtx {
     pub(crate) path: Option<PathBuf>,
@@ -367,6 +378,8 @@ fn run_args(ctx: &GateCtx, file: &Path, event: &Event) -> Vec<String> {
         "wrkflw gate".to_string(),
         "--skip-exit-code".to_string(),
         SKIPPED_EXIT.to_string(),
+        "--nothing-checked-exit-code".to_string(),
+        NOTHING_CHECKED_EXIT.to_string(),
     ];
     if let Some(base) = &event.base_branch {
         args.extend(["--base-branch".to_string(), base.clone()]);
@@ -396,7 +409,7 @@ fn workflow_report(file: &Path, code: Option<i32>, stdout: &str) -> Value {
             fields.remove("type");
             fields.remove("schema_version");
         }
-        if code != Some(0) && code != Some(SKIPPED_EXIT) && run["status"] == "success" {
+        if code != Some(0) && !ran_nothing(code) && run["status"] == "success" {
             entry["status"] = json!("error");
             entry["error"] = json!(format!("wrkflw exited with {:?}", code));
         }
@@ -477,6 +490,21 @@ fn gate_report(workflows: Vec<Value>, uncommitted: &[String]) -> Value {
     })
 }
 
+/// Whether a workflow's entry ran no job: it didn't fire, or every job was
+/// skipped.
+fn checked_nothing(entry: &Value) -> bool {
+    entry["status"] == "skipped" || entry["verdict"] == "nothing_checked"
+}
+
+/// Why an entry [`checked_nothing`], for the combined skip reason.
+fn why_nothing_ran(entry: &Value) -> String {
+    match entry["skip_reason"].as_str() {
+        Some(reason) => reason.to_string(),
+        None if entry["verdict"] == "nothing_checked" => "every job was skipped".to_string(),
+        None => "did not fire".to_string(),
+    }
+}
+
 /// The warning for a gate that checked nothing.
 fn nothing_checked_warning(first: &Event, second: Option<&Event>) -> String {
     let events = match second {
@@ -554,11 +582,11 @@ pub(crate) fn run(ctx: GateCtx) {
             cli_style::dim(&format!("gate: {} ({})", file.display(), first.describe()))
         );
         let mut code = run_child(file, &first);
-        if let (Some(SKIPPED_EXIT), Some(second)) = (code, second.as_ref()) {
+        if let (true, Some(second)) = (ran_nothing(code), second.as_ref()) {
             println!(
                 "{}",
                 cli_style::dim(&format!(
-                    "gate: {} doesn't run for a {}, checking it as a {}",
+                    "gate: {} runs no job for a {}, checking it as a {}",
                     file.display(),
                     first.describe(),
                     second.describe()
@@ -568,7 +596,7 @@ pub(crate) fn run(ctx: GateCtx) {
         }
         match code {
             Some(0) => {}
-            Some(SKIPPED_EXIT) => skipped += 1,
+            _ if ran_nothing(code) => skipped += 1,
             _ => failed.push(file.display().to_string()),
         }
     }
@@ -629,16 +657,16 @@ fn run_json(
     let mut workflows = Vec::new();
     for file in files {
         let mut entry = check(file, first);
-        if let (true, Some(second)) = (entry["status"] == "skipped", second) {
-            let first_reason = entry["skip_reason"].clone();
+        if let (true, Some(second)) = (checked_nothing(&entry), second) {
+            let first_reason = why_nothing_ran(&entry);
             entry = check(file, second);
-            if entry["status"] == "skipped" {
+            if checked_nothing(&entry) {
                 entry["skip_reason"] = json!(format!(
                     "{}: {}; {}: {}",
                     first.describe(),
-                    first_reason.as_str().unwrap_or("did not fire"),
+                    first_reason,
                     second.describe(),
-                    entry["skip_reason"].as_str().unwrap_or("did not fire"),
+                    why_nothing_ran(&entry),
                 ));
             }
         }

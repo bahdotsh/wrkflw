@@ -53,6 +53,7 @@ pub(crate) struct RunCtx {
     pub(crate) remote_cache: Option<String>,
     pub(crate) cache_push: bool,
     pub(crate) skip_exit_code: Option<i32>,
+    pub(crate) nothing_checked_exit_code: Option<i32>,
     pub(crate) gate_mode: bool,
     pub(crate) stream_output: bool,
 }
@@ -317,9 +318,17 @@ pub(crate) async fn run(ctx: RunCtx) {
         }
     };
 
+    // A pass that ran no job, for a caller that tells it from a pass.
+    let nothing_checked_exit = ctx
+        .nothing_checked_exit_code
+        .filter(|_| result.failure_details.is_none() && verdict == "nothing_checked");
+
     if format.is_json() {
         if result.failure_details.is_some() {
             std::process::exit(1);
+        }
+        if let Some(code) = nothing_checked_exit {
+            std::process::exit(code);
         }
         return;
     }
@@ -461,6 +470,10 @@ pub(crate) async fn run(ctx: RunCtx) {
                 }
             }
         }
+    }
+
+    if let Some(code) = nothing_checked_exit {
+        std::process::exit(code);
     }
 
     // Cleanup is handled automatically via the signal handler

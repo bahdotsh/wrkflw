@@ -308,6 +308,34 @@ fn the_gate_skips_a_workflow_the_event_does_not_trigger() {
 }
 
 #[test]
+fn a_workflow_whose_jobs_are_all_skipped_checks_nothing_in_either_format() {
+    let workflow = "name: ci\non: push\njobs:\n  check:\n    if: false\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo check >> LOG\n";
+    let repo = Repo::new(workflow, None);
+    let gate = ["gate", "--runtime", "emulation", "--diff-base", "HEAD"];
+
+    let text = repo.wrkflw(&gate);
+    assert_ok(&text);
+    assert!(
+        !String::from_utf8_lossy(&text.stdout).contains("gate passed"),
+        "{}",
+        String::from_utf8_lossy(&text.stdout)
+    );
+    assert!(String::from_utf8_lossy(&text.stderr).contains("the gate checked nothing"));
+
+    let json = repo.wrkflw(&[&["--format", "json"][..], &gate[..]].concat());
+    assert_ok(&json);
+    let stdout = String::from_utf8_lossy(&json.stdout);
+    let report: serde_json::Value = stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|line| line["type"] == "gate")
+        .unwrap_or_else(|| panic!("no gate object in {stdout}"));
+    assert_eq!(report["verdict"], "nothing_checked", "{report}");
+    assert_eq!(report["passed"], false, "{report}");
+    assert!(repo.take_ran().is_empty());
+}
+
+#[test]
 fn the_gate_counts_a_passing_workflow_as_run() {
     let repo = Repo::new(TWO_JOBS, None);
     let output = repo.wrkflw(&["gate", "--runtime", "emulation", "--diff-base", "HEAD"]);

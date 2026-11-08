@@ -339,8 +339,19 @@ fn run_args(remote: &RemoteRun, path: &Path, runtime: &str) -> Vec<String> {
     if let Some(base) = &remote.base_branch {
         args.extend(["--base-branch".to_string(), base.clone()]);
         args.extend(["--diff-base".to_string(), format!("origin/{base}")]);
+    } else if let Some(before) = remote.before.as_deref().filter(|sha| is_pushed_over(sha)) {
+        // A push changes what lies between the commit the branch was at and
+        // the one pushed. Without this, `--diff` on the default branch diffs
+        // it against itself, and every `paths:` filter skips the workflow.
+        args.extend(["--diff-base".to_string(), before.to_string()]);
     }
     args
+}
+
+/// Whether a push's `before` names a commit the branch was at. A push that
+/// created the branch has forty zeros there, and nothing to diff against.
+fn is_pushed_over(before: &str) -> bool {
+    !before.is_empty() && before.bytes().any(|b| b != b'0')
 }
 
 /// What the comparison rests on, and what stops it.
@@ -520,9 +531,25 @@ pub(crate) async fn run(ctx: CompareCtx) -> ! {
             ctx.run
         ))
     });
-    let remote = wrkflw_github::fetch_run(&reference)
+    let mut remote = wrkflw_github::fetch_run(&reference)
         .await
         .unwrap_or_else(|e| ctx.format.fail(&format!("cannot fetch the run: {e}")));
+    if let Some(before) = remote.before.take().filter(|sha| is_pushed_over(sha)) {
+        // `git diff` needs the commit here. A shallow or stale clone may not
+        // have it, and then `--diff` is the closest there is.
+        let commit = format!("{before}^{{commit}}");
+        if git_line(&["rev-parse", "--verify", "-q", &commit]).is_some() {
+            remote.before = Some(before);
+        } else {
+            eprintln!(
+                "{}",
+                cli_style::dim(&format!(
+                    "Note: the push went over {before}, which this clone doesn't have, so the \
+                     changed files are guessed. Fetch it for `paths:` filters to match GitHub's"
+                ))
+            );
+        }
+    }
     if remote.conclusion.is_none() {
         ctx.format
             .fail("the run hasn't finished on GitHub yet, so there's nothing to compare with");
@@ -687,6 +714,7 @@ mod tests {
                 html_url: String::new(),
                 head_sha: "abc".into(),
                 head_branch: Some("main".into()),
+                before: None,
                 event: "push".into(),
                 path: ".github/workflows/ci.yml".into(),
                 conclusion: Some("failure".into()),
@@ -708,6 +736,7 @@ mod tests {
             html_url: String::new(),
             head_sha: "abc".into(),
             head_branch: Some("main".into()),
+            before: None,
             event: "push".into(),
             path: ".github/workflows/ci.yml".into(),
             conclusion: Some(conclusion.into()),
@@ -872,6 +901,21 @@ mod tests {
     }
 
     #[test]
+    fn a_push_run_diffs_against_the_commit_it_pushed_over() {
+        let mut run = github_run("success", vec![]);
+        run.before = Some("1111111111111111111111111111111111111111".into());
+        let args = run_args(&run, Path::new(".github/workflows/ci.yml"), "docker");
+        assert!(args
+            .windows(2)
+            .any(|w| w == ["--diff-base", "1111111111111111111111111111111111111111"]));
+
+        // A push that created the branch has no earlier commit.
+        run.before = Some("0".repeat(40));
+        let args = run_args(&run, Path::new(".github/workflows/ci.yml"), "docker");
+        assert!(!args.iter().any(|arg| arg == "--diff-base"), "{args:?}");
+    }
+
+    #[test]
     fn only_a_workflow_file_in_the_repository_is_run() {
         assert_eq!(
             workflow_path(".github/workflows/ci.yml"),
@@ -897,6 +941,7 @@ mod tests {
             html_url: String::new(),
             head_sha: "abc".into(),
             head_branch: Some("feat".into()),
+            before: None,
             event: "pull_request".into(),
             path: ".github/workflows/ci.yml".into(),
             conclusion: Some("success".into()),

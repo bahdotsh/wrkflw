@@ -383,6 +383,9 @@ pub struct RemoteRun {
     pub html_url: String,
     pub head_sha: String,
     pub head_branch: Option<String>,
+    /// For a push, the commit the branch was at before it: forty zeros when
+    /// the push created the branch.
+    pub before: Option<String>,
     pub event: String,
     /// The workflow file, such as `.github/workflows/ci.yml`.
     pub path: String,
@@ -526,6 +529,19 @@ pub async fn fetch_run(reference: &RunReference) -> Result<RemoteRun, GithubErro
         }
         None => None,
     };
+    // A run doesn't say what a push pushed over, but its check suite does.
+    // Best effort: without it, `compare` diffs as `--diff` would.
+    let before = match (text("event").as_deref(), run["check_suite_id"].as_u64()) {
+        (Some("push"), Some(suite)) => api_get(
+            &client,
+            &format!("/repos/{owner}/{repo}/check-suites/{suite}"),
+            token.as_deref(),
+        )
+        .await
+        .ok()
+        .and_then(|suite| suite["before"].as_str().map(str::to_string)),
+        _ => None,
+    };
     Ok(RemoteRun {
         id: reference.id,
         owner,
@@ -533,6 +549,7 @@ pub async fn fetch_run(reference: &RunReference) -> Result<RemoteRun, GithubErro
         html_url: text("html_url").unwrap_or_default(),
         head_sha: text("head_sha").unwrap_or_default(),
         head_branch: text("head_branch"),
+        before,
         event: text("event").unwrap_or_default(),
         path: text("path").unwrap_or_default(),
         conclusion: text("conclusion"),

@@ -27,7 +27,8 @@ command -v jq >/dev/null || { echo "jq is required" >&2; exit 2; }
 mismatches=0
 printf 'repo\tworkflow\tgithub_jobs\tplanned_jobs\tresult\n'
 
-while read -r repo; do
+# The list is read on fd 3, so gh or wrkflw reading stdin can't eat lines of it.
+while read -r repo <&3; do
   [[ -z "$repo" || "$repo" == \#* ]] && continue
   # The latest push or pull_request run of each workflow that passed or failed.
   runs=$(gh api "repos/$repo/actions/runs?per_page=50&status=completed" \
@@ -35,7 +36,7 @@ while read -r repo; do
                                          and (.conclusion=="success" or .conclusion=="failure"))]
             | unique_by(.path) | .[] | [.id, .path, .head_sha] | @tsv' 2>/dev/null) || {
     printf '%s\t-\t-\t-\tn/a: cannot list runs\n' "$repo"; continue; }
-  while IFS=$'\t' read -r id path sha; do
+  while IFS=$'\t' read -r id path sha <&4; do
     [[ -z "$id" ]] && continue
     path="${path%%@*}"
     # The path comes from the API and becomes a file under $WORK, so only a
@@ -68,7 +69,7 @@ while read -r repo; do
     elif (( planned == github )); then result="match"
     else result="mismatch"; mismatches=$((mismatches + 1)); fi
     printf '%s\t%s\t%s\t%s\t%s\n' "$repo" "$path" "$github" "$planned" "$result"
-  done <<<"$runs"
-done < "$REPOS"
+  done 4<<<"$runs"
+done 3< "$REPOS"
 
 (( mismatches == 0 ))

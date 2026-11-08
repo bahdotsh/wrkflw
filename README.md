@@ -376,7 +376,7 @@ wrkflw compare https://github.com/OWNER/REPO/actions/runs/123456789
 wrkflw mcp serve
 ```
 
-Every `run_finished`, and the gate result, carries a `verdict`. `verified` means every job ran as the OS it asked for. `partial` means some jobs ran as another OS and are listed under `unverified`. `nothing_checked` means no job ran, so the pass proves nothing. A failure digest names a likely `cause` when the output shows a process killed for lack of memory.
+Every `run_finished`, and the gate result, carries a `verdict`. `verified` means every job ran as the OS it asked for. `partial` means some jobs ran as another OS and are listed under `unverified`. `nothing_checked` means no job ran, so the pass proves nothing. A failure digest names a likely `cause`: `out_of_memory` when the output says memory ran out, or `killed` when a process got SIGKILL without a stated reason.
 
 Docker Desktop and Podman machines often have half the 16 GB of a GitHub runner, and a Rust or C++ link can be killed there although it passes in CI. wrkflw warns when the VM has less than 14 GB and runs at most one job or matrix leg per 4 GB at a time, counting every job of the run together. Set `WRKFLW_MAX_PARALLEL_JOBS` to change that.
 

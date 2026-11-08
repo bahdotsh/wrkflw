@@ -30,13 +30,23 @@ static ANSI: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         .unwrap()
 });
 
-/// Output that says a process was killed for memory, not that code failed.
+/// Output that says memory ran out, not that code failed.
 static OUT_OF_MEMORY: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
     regex::Regex::new(
-        r"(?i)signal 9\b|\bSIGKILL\b|\bout of memory\b|\boom-?kill|cannot allocate memory|memory allocation of \d+ bytes failed|^\s*Killed\s*$",
+        r"(?i)\bout of memory\b|\boom-?kill|cannot allocate memory|memory allocation of \d+ bytes failed",
     )
     .unwrap()
 });
+
+/// Output that says a process got SIGKILL, without saying why. In a small
+/// container VM that is usually the kernel reclaiming memory, but a step, a
+/// test harness or a stopped container sends the same signal.
+static KILLED: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"(?i)signal 9\b|\bSIGKILL\b|^\s*Killed\s*$").unwrap()
+});
+
+/// The exit status of a process ended by SIGKILL: 128 + 9.
+const SIGKILL_EXIT: i32 = 137;
 
 /// `line` without terminal escape sequences.
 pub fn strip_ansi(line: &str) -> String {
@@ -92,7 +102,8 @@ pub struct FailedStep {
 /// A cause read from a failed step's output.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct FailureCause {
-    /// `out_of_memory`.
+    /// `out_of_memory` when the output says memory ran out, `killed` when a
+    /// process got SIGKILL and the output doesn't say why.
     pub kind: &'static str,
     /// The line that shows it.
     pub evidence: String,
@@ -100,20 +111,40 @@ pub struct FailureCause {
     pub hint: String,
 }
 
-/// The cause `text` and `exit_code` point to, if it isn't the code.
+/// The cause `text` and `exit_code` point to, if it may not be the code.
+///
+/// Only output that names memory makes it `out_of_memory`. A SIGKILL alone,
+/// from `signal 9`, `Killed` or exit code 137, is `killed`: memory is the
+/// likely reason in a container VM, but not the only one, so the hint says
+/// what to rule out before blaming the machine.
 fn failure_cause(text: &str, exit_code: Option<i32>) -> Option<FailureCause> {
-    let evidence = text
-        .lines()
-        .map(strip_ansi)
-        .find(|line| OUT_OF_MEMORY.is_match(line))
-        .or_else(|| (exit_code == Some(137)).then(|| "exit code 137 (killed)".to_string()))?;
+    let lines: Vec<String> = text.lines().map(strip_ansi).collect();
+    if let Some(line) = lines.iter().find(|line| OUT_OF_MEMORY.is_match(line)) {
+        return Some(FailureCause {
+            kind: "out_of_memory",
+            evidence: line.trim().to_string(),
+            hint: "The output says memory ran out. This is the machine running the job, not \
+                   a bug in the code: GitHub's runners have more memory than a default Docker \
+                   or Podman VM. Give the VM more memory, or run fewer jobs at once, such as \
+                   one with --job, then run it again"
+                .to_string(),
+        });
+    }
+    let evidence = lines
+        .iter()
+        .find(|line| KILLED.is_match(line))
+        .map(|line| line.trim().to_string())
+        .or_else(|| {
+            (exit_code == Some(SIGKILL_EXIT)).then(|| format!("exit code {SIGKILL_EXIT}"))
+        })?;
     Some(FailureCause {
-        kind: "out_of_memory",
-        evidence: evidence.trim().to_string(),
-        hint: "A process was killed, most likely for lack of memory. This is the machine \
-               running the job, not a bug in the code: GitHub's runners have more memory \
-               than a default Docker or Podman VM. Give the VM more memory, or run fewer \
-               jobs at once, such as one with --job, then run it again"
+        kind: "killed",
+        evidence,
+        hint: "A process was killed with SIGKILL, and the output doesn't say why. In a Docker \
+               or Podman VM with less memory than GitHub's runners, that is usually the \
+               kernel reclaiming memory, as when a linker runs out. If no step kills \
+               processes or stops containers, give the VM more memory or run fewer jobs at \
+               once, such as one with --job, before changing code"
             .to_string(),
     })
 }
@@ -541,17 +572,37 @@ mod tests {
         let text = "Standard Error:\n  = note: collect2: fatal error: ld terminated with signal 9 [Killed]\n\
                     error: could not compile `wrkflw`\n";
         let cause = failure_cause(text, Some(101)).unwrap();
-        assert_eq!(cause.kind, "out_of_memory");
+        assert_eq!(cause.kind, "killed");
         assert!(cause.evidence.contains("signal 9"), "{}", cause.evidence);
+        assert!(cause.hint.contains("memory"), "{}", cause.hint);
         assert_eq!(
             failure_cause("Killed\n", Some(137)).unwrap().evidence,
             "Killed"
         );
-        assert_eq!(failure_cause("", Some(137)).unwrap().kind, "out_of_memory");
+        let oom = failure_cause(
+            "memory allocation of 1048576 bytes failed\nKilled\n",
+            Some(137),
+        )
+        .unwrap();
+        assert_eq!(oom.kind, "out_of_memory");
+        assert_eq!(oom.evidence, "memory allocation of 1048576 bytes failed");
         assert_eq!(
             failure_cause("test killed_by_timeout ... FAILED\n", Some(101)),
             None
         );
+    }
+
+    #[test]
+    fn a_bare_exit_137_is_a_kill_not_a_memory_diagnosis() {
+        let cause = failure_cause("Standard Output:\nrunning\n", Some(137)).unwrap();
+        assert_eq!(cause.kind, "killed");
+        assert_eq!(cause.evidence, "exit code 137");
+        assert!(
+            cause.hint.contains("If no step kills processes"),
+            "{}",
+            cause.hint
+        );
+        assert_eq!(failure_cause("", Some(1)), None);
     }
 
     fn job_json(name: &str, repeated_from: Option<&str>) -> serde_json::Value {

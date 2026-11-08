@@ -10,7 +10,7 @@ The gate's JSON gains `verdict`, and each workflow gains the `event` and `base_b
 
 `run_finished` gains `verdict`: `verified`, `partial`, `nothing_checked`, `failed`, `error`, `skipped` or `interrupted`. `status` is unchanged. In text mode, a pass with jobs that ran as another OS, or with no job run, no longer prints the plain success line.
 
-A job that didn't run because an earlier result stands has `reused` on `job_finished` and in `run_finished.jobs`, `stored` or `unaffected`. Failure digests gain an optional `cause`, and a matrix leg that repeated a failed leg is listed under the original's `also_failed_in` instead of as a failure of its own. `error_lines` and `output_tail` no longer hold terminal colour codes, and `error_lines` only keeps lines with a whole error word that isn't a count of zero.
+A job that didn't run because an earlier result stands has `reused` on `job_finished` and in `run_finished.jobs`, `stored` or `unaffected`. Failure digests gain an optional `cause`, `out_of_memory` when the output says memory ran out or `killed` for a SIGKILL without a stated reason, and a matrix leg that repeated a failed leg is listed under the original's `also_failed_in` instead of as a failure of its own. `error_lines` and `output_tail` no longer hold terminal colour codes, and `error_lines` only keeps lines with a whole error word that isn't a count of zero.
 
 The canned "Common causes for cargo command failures" text is gone from failed cargo steps. It blamed the code for failures that came from the machine.
 

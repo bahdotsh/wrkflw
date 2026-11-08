@@ -193,8 +193,12 @@ fn note_for(local: &Value, failures: &[Value]) -> Option<String> {
                 .is_some_and(|legs| legs.iter().any(|leg| leg == name));
         here.then(|| failure["cause"]["kind"].as_str()).flatten()
     });
-    if cause == Some("out_of_memory") {
-        notes.push("killed for lack of memory locally".to_string());
+    match cause {
+        Some("out_of_memory") => notes.push("ran out of memory locally".to_string()),
+        Some("killed") => notes.push(
+            "a process was killed (SIGKILL) locally, most likely for lack of memory".to_string(),
+        ),
+        _ => {}
     }
     (!notes.is_empty()).then(|| notes.join("; "))
 }
@@ -735,7 +739,11 @@ mod tests {
             &failures,
         )
         .unwrap();
-        assert!(note.contains("memory"), "{note}");
+        assert!(note.contains("ran out of memory"), "{note}");
+
+        let killed = vec![json!({"job": "build", "cause": {"kind": "killed"}})];
+        let note = note_for(&json!({"name": "build", "status": "failure"}), &killed).unwrap();
+        assert!(note.contains("SIGKILL"), "{note}");
     }
 
     #[test]

@@ -26,6 +26,29 @@ pub enum GithubError {
 
     #[error("API error: {status} - {message}")]
     ApiError { status: u16, message: String },
+
+    #[error("Unexpected API response: {0}")]
+    UnexpectedResponse(String),
+}
+
+/// How long one request to GitHub may take, connecting included, before it
+/// fails instead of hanging the command.
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The client every request to GitHub goes through, with a timeout.
+fn http_client() -> Result<reqwest::Client, GithubError> {
+    Ok(reqwest::Client::builder()
+        .timeout(REQUEST_TIMEOUT)
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .build()?)
+}
+
+/// `text` when it is a full commit id: 40 hex digits for SHA-1, 64 for
+/// SHA-256. Ids from the API become arguments to git and to a child run, so
+/// nothing else passes.
+fn commit_id(text: &str) -> Option<String> {
+    (matches!(text.len(), 40 | 64) && text.bytes().all(|b| b.is_ascii_hexdigit()))
+        .then(|| text.to_ascii_lowercase())
 }
 
 /// Information about a GitHub repository
@@ -231,7 +254,7 @@ pub async fn trigger_workflow(
     wrkflw_logging::info(&format!("Triggering workflow at URL: {}", url));
 
     // Create a reqwest client
-    let client = reqwest::Client::new();
+    let client = http_client()?;
 
     // Send the request using reqwest
     let response = client
@@ -330,7 +353,7 @@ async fn list_recent_workflow_runs(
         repo_info.owner, repo_info.repo, workflow_segment
     );
 
-    let client = reqwest::Client::new();
+    let client = http_client()?;
     let response = client
         .get(&url)
         .header(header::AUTHORIZATION, format!("Bearer {}", token))
@@ -492,7 +515,7 @@ pub async fn fetch_run(reference: &RunReference) -> Result<RemoteRun, GithubErro
     // Read before the first request, on a blocking thread: `gh auth token`
     // is a subprocess. One client serves every request of the fetch.
     let token = tokio::task::spawn_blocking(api_token).await.ok().flatten();
-    let client = reqwest::Client::new();
+    let client = http_client()?;
     let base = format!("/repos/{owner}/{repo}/actions/runs/{}", reference.id);
     let run = api_get(&client, &base, token.as_deref()).await?;
     let mut jobs = Vec::new();
@@ -539,15 +562,24 @@ pub async fn fetch_run(reference: &RunReference) -> Result<RemoteRun, GithubErro
         )
         .await
         .ok()
-        .and_then(|suite| suite["before"].as_str().map(str::to_string)),
+        .and_then(|suite| suite["before"].as_str().and_then(commit_id)),
         _ => None,
     };
+    let head_sha = text("head_sha")
+        .as_deref()
+        .and_then(commit_id)
+        .ok_or_else(|| {
+            GithubError::UnexpectedResponse(format!(
+                "run {} has no valid head_sha: {}",
+                reference.id, run["head_sha"]
+            ))
+        })?;
     Ok(RemoteRun {
         id: reference.id,
         owner,
         repo,
         html_url: text("html_url").unwrap_or_default(),
-        head_sha: text("head_sha").unwrap_or_default(),
+        head_sha,
         head_branch: text("head_branch"),
         before,
         event: text("event").unwrap_or_default(),
@@ -561,6 +593,21 @@ pub async fn fetch_run(reference: &RunReference) -> Result<RemoteRun, GithubErro
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_full_hex_commit_id_is_taken_from_the_api() {
+        let sha1 = "0123456789abcdef0123456789ABCDEF01234567";
+        assert_eq!(commit_id(sha1), Some(sha1.to_ascii_lowercase()));
+        assert!(commit_id(&"a".repeat(64)).is_some());
+        assert_eq!(commit_id(&"0".repeat(40)), Some("0".repeat(40)));
+        assert_eq!(commit_id("abc123"), None);
+        assert_eq!(
+            commit_id("--upload-pack=x0000000000000000000000000000"),
+            None
+        );
+        assert_eq!(commit_id(&format!("{}g", "a".repeat(39))), None);
+        assert_eq!(commit_id(""), None);
+    }
 
     #[test]
     fn a_run_is_named_by_id_or_url() {

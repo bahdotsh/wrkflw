@@ -6,8 +6,7 @@
 //! killed here for lack of memory and look like a broken build. So the run
 //! says so up front, and runs fewer jobs at once while memory is short.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
@@ -28,47 +27,35 @@ pub const MAX_PARALLEL_JOBS_ENV: &str = "WRKFLW_MAX_PARALLEL_JOBS";
 /// How long `docker info` may take before it's given up on.
 const QUERY_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Jobs that may run at once by the VM's memory, 0 for no limit.
-static JOB_LIMIT: AtomicUsize = AtomicUsize::new(0);
+/// One run's places to run jobs in: set once by [`check`] when the run
+/// knows its runtime, `None` inside it for no limit.
+type RunPool = Arc<OnceLock<Option<Arc<Semaphore>>>>;
 
-/// The places running jobs share, and how many there are. Every job and
-/// every matrix leg that runs steps holds one, so a run never has more of
-/// them going at once than the limit, however jobs and legs are nested.
-static POOL: Mutex<Option<(usize, Arc<Semaphore>)>> = Mutex::new(None);
+tokio::task_local! {
+    /// The pool of the run being executed. Every job and every matrix leg
+    /// that runs steps holds a place from it, so a run never has more of
+    /// them going at once than the limit, however jobs and legs are nested.
+    /// It is the run's own: two runs in one process, as in the MCP server,
+    /// never share or resize each other's.
+    static POOL: RunPool;
+}
 
-/// How many jobs and matrix legs may run at once, or `None` for no limit:
-/// `WRKFLW_MAX_PARALLEL_JOBS`, else what the VM's memory allows.
-pub fn job_limit() -> Option<usize> {
-    env_limit().or(match JOB_LIMIT.load(Ordering::Relaxed) {
-        0 => None,
-        limit => Some(limit),
-    })
+/// Run `future` as one run, with a job pool of its own for [`check`] to
+/// size.
+pub(crate) async fn with_run_pool<F: std::future::Future>(future: F) -> F::Output {
+    POOL.scope(Arc::new(OnceLock::new()), future).await
 }
 
 /// Wait for a place to run a job or matrix leg in, and hold it until the
-/// returned permit drops. `None` when nothing limits how many run at once.
+/// returned permit drops. `None` when nothing limits how many run at once,
+/// or outside a run.
 ///
 /// Take it only around a job's own steps: a job that calls a reusable
 /// workflow runs that workflow's jobs, and holding a place while they wait
 /// for one would deadlock a limit of one.
 pub(crate) async fn job_slot() -> Option<OwnedSemaphorePermit> {
-    let limit = job_limit()?;
-    pool_of(&POOL, limit).acquire_owned().await.ok()
-}
-
-/// The pool in `slot` for `limit` places: the one already there when its
-/// size is right, else a new one. A run that changes the limit gets a pool
-/// of the new size; jobs still holding the old one finish in it.
-fn pool_of(slot: &Mutex<Option<(usize, Arc<Semaphore>)>>, limit: usize) -> Arc<Semaphore> {
-    let mut pool = slot.lock().unwrap_or_else(|e| e.into_inner());
-    match &*pool {
-        Some((size, semaphore)) if *size == limit => Arc::clone(semaphore),
-        _ => {
-            let semaphore = Arc::new(Semaphore::new(limit));
-            *pool = Some((limit, Arc::clone(&semaphore)));
-            semaphore
-        }
-    }
+    let pool = POOL.try_with(|pool| pool.get().cloned().flatten()).ok()??;
+    pool.acquire_owned().await.ok()
 }
 
 fn env_limit() -> Option<usize> {
@@ -248,24 +235,41 @@ pub fn probe(cli: &str) -> Option<Memory> {
     parse_info(cli, &info(cli, format)?, cfg!(target_os = "linux"))
 }
 
+/// The memory a parent's [`PROBED_ENV`] gives for `cli`: `None` when the
+/// parent found nothing (`none`) or probed another runtime, as when it
+/// resolved `auto` to Docker and this run uses Podman.
+fn parent_probe(value: &str, cli: &str) -> Option<Memory> {
+    Memory::from_env(value).filter(|memory| memory.cli == cli)
+}
+
 /// Set this run's job limit from the memory of the runtime it uses: `cli`
-/// for Docker or Podman, `None` for a runtime without a VM to fill. Every
-/// run sets it, so a limit never carries over from an earlier run in the
-/// same process, such as the MCP server.
+/// for Docker or Podman, `None` for a runtime without a VM to fill.
+/// [`MAX_PARALLEL_JOBS_ENV`] overrides it for any runtime. The limit is
+/// this run's alone, in the pool [`with_run_pool`] gave it.
 ///
 /// The probe runs on a blocking thread, so a slow `docker info` doesn't
 /// stall the async runtime. A probe a parent already made, passed in
 /// [`PROBED_ENV`], is used instead, and its warning isn't shown again.
 pub(crate) async fn check(cli: Option<&str>) {
-    let Some(cli) = cli else {
-        JOB_LIMIT.store(0, Ordering::Relaxed);
-        return;
+    let limit = match cli {
+        Some(cli) => limit_from_memory(cli).await,
+        None => None,
     };
+    set_limit(env_limit().or(limit));
+}
+
+/// Size this run's pool for `limit` jobs at once, `None` for no limit. Only
+/// the first call of a run counts: it checks its runtime once, before any
+/// job runs.
+fn set_limit(limit: Option<usize>) {
+    let _ = POOL.try_with(|pool| pool.set(limit.map(|limit| Arc::new(Semaphore::new(limit)))));
+}
+
+/// The job limit the memory of `cli`'s runtime allows, warning when it is
+/// short.
+async fn limit_from_memory(cli: &str) -> Option<usize> {
     let (memory, warn) = match std::env::var(PROBED_ENV) {
-        Ok(value) => (
-            Memory::from_env(&value).filter(|memory| memory.cli == cli),
-            false,
-        ),
+        Ok(value) => (parent_probe(&value, cli), false),
         Err(_) => {
             let owned = cli.to_string();
             let memory = tokio::task::spawn_blocking(move || probe(&owned))
@@ -275,11 +279,10 @@ pub(crate) async fn check(cli: Option<&str>) {
             (memory, true)
         }
     };
-    let limit = memory.as_ref().and_then(Memory::limit);
-    JOB_LIMIT.store(limit.unwrap_or(0), Ordering::Relaxed);
     if let (true, Some(text)) = (warn, memory.as_ref().and_then(Memory::warning)) {
         wrkflw_logging::warning(&text);
     }
+    memory.as_ref().and_then(Memory::limit)
 }
 
 #[cfg(test)]
@@ -298,26 +301,54 @@ mod tests {
     fn a_huge_limit_is_clamped_to_what_a_pool_can_hold() {
         let huge = parse_limit(&usize::MAX.to_string()).unwrap();
         assert_eq!(huge, Semaphore::MAX_PERMITS);
-        assert_eq!(pool_of(&Mutex::new(None), huge).available_permits(), huge);
+        assert_eq!(Semaphore::new(huge).available_permits(), huge);
         assert_eq!(parse_limit(" 3 "), Some(3));
         assert_eq!(parse_limit("0"), None);
         assert_eq!(parse_limit("many"), None);
     }
 
-    #[test]
-    fn every_job_and_leg_takes_its_place_from_one_pool() {
-        let slot = Mutex::new(None);
-        let pool = pool_of(&slot, 2);
-        assert!(Arc::ptr_eq(&pool, &pool_of(&slot, 2)));
-        let _a = Arc::clone(&pool).try_acquire_owned().unwrap();
-        let _b = pool_of(&slot, 2).try_acquire_owned().unwrap();
-        assert!(
-            pool_of(&slot, 2).try_acquire_owned().is_err(),
-            "a third place was handed out with a limit of two"
-        );
-        let resized = pool_of(&slot, 3);
-        assert!(!Arc::ptr_eq(&pool, &resized));
-        assert_eq!(resized.available_permits(), 3);
+    #[tokio::test]
+    async fn every_job_and_leg_takes_its_place_from_the_runs_pool() {
+        with_run_pool(async {
+            set_limit(Some(2));
+            let _a = job_slot().await.unwrap();
+            let _b = job_slot().await.unwrap();
+            let third = tokio::time::timeout(Duration::from_millis(50), job_slot()).await;
+            assert!(
+                third.is_err(),
+                "a third place was handed out with a limit of two"
+            );
+            // A second check in the same run doesn't resize its pool.
+            set_limit(Some(3));
+            let again = tokio::time::timeout(Duration::from_millis(50), job_slot()).await;
+            assert!(again.is_err(), "the run's pool was resized");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn runs_never_share_or_resize_each_others_pool() {
+        // One run with a limit of one holds its only place while another
+        // run, in the same process, sets no limit and runs freely.
+        with_run_pool(async {
+            set_limit(Some(1));
+            let _held = job_slot().await.unwrap();
+            with_run_pool(async {
+                set_limit(None);
+                assert!(job_slot().await.is_none());
+            })
+            .await;
+            let blocked = tokio::time::timeout(Duration::from_millis(50), job_slot()).await;
+            assert!(blocked.is_err(), "the other run changed this run's limit");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn outside_a_run_nothing_is_limited() {
+        set_limit(Some(1));
+        assert!(job_slot().await.is_none());
+        assert!(job_slot().await.is_none());
     }
 
     fn memory(bytes: u64, in_vm: bool) -> Memory {
@@ -362,6 +393,18 @@ mod tests {
         assert_eq!(memory(8_217_751_552, true).limit(), Some(1));
         assert!(memory(8_217_751_552, false).warning().is_some());
         assert_eq!(memory(GITHUB_RUNNER_BYTES, false).warning(), None);
+    }
+
+    #[test]
+    fn a_parent_probe_counts_only_for_the_runtime_it_probed() {
+        let docker = memory(8_217_751_552, true).to_env();
+        assert_eq!(
+            parent_probe(&docker, "docker"),
+            Some(memory(8_217_751_552, true))
+        );
+        assert_eq!(parent_probe(&docker, "podman"), None);
+        assert_eq!(parent_probe("none", "docker"), None);
+        assert_eq!(parent_probe("docker:lots:vm", "docker"), None);
     }
 
     #[test]

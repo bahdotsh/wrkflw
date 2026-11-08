@@ -49,9 +49,8 @@ pub async fn execute_workflow(
     let is_gitlab = is_gitlab_pipeline(workflow_path);
 
     if is_gitlab {
-        return acceleration::without_run_state(execute_gitlab_pipeline(
-            workflow_path,
-            config.clone(),
+        return crate::vm_memory::with_run_pool(acceleration::without_run_state(
+            execute_gitlab_pipeline(workflow_path, config.clone()),
         ))
         .await;
     }
@@ -64,13 +63,14 @@ pub async fn execute_workflow(
         root,
     )
     .map_err(ExecutionError::Execution)?;
-    acceleration::with_run_state(
+    // Each run gets its own job pool, sized once its runtime is known.
+    crate::vm_memory::with_run_pool(acceleration::with_run_state(
         std::sync::Arc::new(state),
         crate::workspace::with_workflow_file(
             workflow_path,
             Box::pin(execute_github_workflow(workflow_path, config.clone())),
         ),
-    )
+    ))
     .await
 }
 

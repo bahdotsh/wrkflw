@@ -397,11 +397,7 @@ fn outcome(remote: &RemoteRun, local: &Value, rows: &[Row]) -> Outcome {
         }
     }
     if compared > 0 {
-        return Outcome {
-            disagreements: job_disagreements,
-            basis: "jobs",
-            problem: None,
-        };
+        return paired_outcome(remote, status, rows, job_disagreements);
     }
     if local["verdict"] == "nothing_checked" {
         return disagree("no job ran locally, so there is nothing to compare".to_string());
@@ -425,6 +421,85 @@ fn outcome(remote: &RemoteRun, local: &Value, rows: &[Row]) -> Outcome {
                 remote.conclusion.as_deref().unwrap_or("unknown")
             )),
         },
+    }
+}
+
+/// A row with a result on one side only: a GitHub job no local job was
+/// paired with, or a local job GitHub has no job for.
+fn is_unpaired(row: &Row) -> bool {
+    row.github_name.is_none() != row.local_name.is_none()
+}
+
+/// The result of an unpaired row's one side, when it is a pass or a failure.
+fn unpaired_result(row: &Row) -> Option<&str> {
+    let result = if row.github_name.is_some() {
+        row.github.as_deref()
+    } else {
+        row.local.as_deref()
+    }?;
+    matches!(result, "success" | "failure").then_some(result)
+}
+
+/// The outcome once some jobs were paired. Paired jobs are compared one by
+/// one, but a job only one side has a result for can't be, so it isn't
+/// left out of the judgement:
+///
+/// - a failure on one side only is a disagreement, since a failure the
+///   other side has no counterpart for is what a comparison is for;
+/// - and with anything unpaired, the runs' own results are compared too,
+///   so a run GitHub failed in a job wrkflw couldn't pair never agrees
+///   with a local pass.
+fn paired_outcome(
+    remote: &RemoteRun,
+    status: &str,
+    rows: &[Row],
+    job_disagreements: usize,
+) -> Outcome {
+    let unpaired: Vec<&Row> = rows
+        .iter()
+        .filter(|r| is_unpaired(r) && unpaired_result(r).is_some())
+        .collect();
+    if unpaired.is_empty() {
+        return Outcome {
+            disagreements: job_disagreements,
+            basis: "jobs",
+            problem: None,
+        };
+    }
+    let one_sided_failures = unpaired
+        .iter()
+        .filter(|r| unpaired_result(r) == Some("failure"))
+        .count();
+    let mut disagreements = job_disagreements + one_sided_failures;
+    let runs_differ = agree(remote.conclusion.as_deref(), Some(status)) == Some(false);
+    if disagreements == 0 && runs_differ {
+        disagreements = 1;
+    }
+    let names: Vec<String> = unpaired
+        .iter()
+        .map(|r| match &r.github_name {
+            Some(name) => format!("{name} (GitHub only)"),
+            None => format!(
+                "{} (local only)",
+                r.local_name.as_deref().unwrap_or_default()
+            ),
+        })
+        .collect();
+    let mut problem = format!(
+        "{} job(s) with a result could not be paired: {}",
+        unpaired.len(),
+        names.join(", ")
+    );
+    if runs_differ {
+        problem.push_str(&format!(
+            ". The runs' results differ: GitHub {}, local {status}",
+            remote.conclusion.as_deref().unwrap_or("unknown")
+        ));
+    }
+    Outcome {
+        disagreements,
+        basis: "jobs",
+        problem: Some(problem),
     }
 }
 
@@ -898,6 +973,83 @@ mod tests {
             expected[0].matches("build (ubuntu, ubuntu)"),
             "{expected:?}"
         );
+    }
+
+    fn paired_row(name: &str, github: &str, local: &str) -> Row {
+        Row {
+            github_name: Some(name.to_string()),
+            local_name: Some(name.to_string()),
+            github: Some(github.to_string()),
+            local: Some(local.to_string()),
+            agree: agree(Some(github), Some(local)),
+            note: None,
+        }
+    }
+
+    #[test]
+    fn a_github_failure_in_an_unpaired_job_is_never_agreement() {
+        // GitHub failed in a called workflow's job wrkflw can't name. Every
+        // paired job agrees, but the run did not.
+        let github = github_run("failure", vec![]);
+        let local = json!({"status": "success", "verdict": "verified"});
+        let mut rows = vec![paired_row("build", "success", "success")];
+        rows.push(Row {
+            github_name: Some("deploy / publish".into()),
+            local_name: None,
+            github: Some("failure".into()),
+            local: None,
+            agree: None,
+            note: None,
+        });
+        let report = report(&github, &local, &rows);
+        assert_eq!(report["agree"], false, "{report}");
+        assert_eq!(report["disagreements"], 1, "{report}");
+        let problem = report["problem"].as_str().unwrap();
+        assert!(
+            problem.contains("deploy / publish (GitHub only)"),
+            "{problem}"
+        );
+
+        // An unpaired pass while the runs agree is noted, not a disagreement.
+        rows[1].github = Some("success".into());
+        let report = super::report(&github_run("success", vec![]), &local, &rows);
+        assert_eq!(report["agree"], true, "{report}");
+        assert!(report["problem"]
+            .as_str()
+            .unwrap()
+            .contains("could not be paired"));
+
+        // An unpaired pass while the runs differ is still a disagreement.
+        let report = super::report(&github_run("failure", vec![]), &local, &rows);
+        assert_eq!(report["agree"], false, "{report}");
+        assert!(report["problem"]
+            .as_str()
+            .unwrap()
+            .contains("results differ"));
+    }
+
+    #[test]
+    fn a_local_failure_github_has_no_job_for_disagrees() {
+        let github = github_run("success", vec![]);
+        let local = json!({"status": "failure", "verdict": "failed"});
+        let rows = vec![
+            paired_row("build", "success", "success"),
+            Row {
+                github_name: None,
+                local_name: Some("tests (python: 3.14)".into()),
+                github: None,
+                local: Some("failure".into()),
+                agree: None,
+                note: None,
+            },
+        ];
+        let report = report(&github, &local, &rows);
+        assert_eq!(report["agree"], false, "{report}");
+        assert_eq!(report["disagreements"], 1, "{report}");
+        assert!(report["problem"]
+            .as_str()
+            .unwrap()
+            .contains("tests (python: 3.14) (local only)"));
     }
 
     #[test]

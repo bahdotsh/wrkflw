@@ -452,8 +452,11 @@ fn api_token() -> Option<String> {
     (output.status.success() && !token.is_empty()).then_some(token)
 }
 
-async fn api_get(path: &str, token: Option<&str>) -> Result<serde_json::Value, GithubError> {
-    let client = reqwest::Client::new();
+async fn api_get(
+    client: &reqwest::Client,
+    path: &str,
+    token: Option<&str>,
+) -> Result<serde_json::Value, GithubError> {
     let mut request = client
         .get(format!("https://api.github.com{path}"))
         .header(header::ACCEPT, "application/vnd.github+json")
@@ -483,13 +486,17 @@ pub async fn fetch_run(reference: &RunReference) -> Result<RemoteRun, GithubErro
             (info.owner, info.repo)
         }
     };
-    let token = api_token();
+    // Read before the first request, on a blocking thread: `gh auth token`
+    // is a subprocess. One client serves every request of the fetch.
+    let token = tokio::task::spawn_blocking(api_token).await.ok().flatten();
+    let client = reqwest::Client::new();
     let base = format!("/repos/{owner}/{repo}/actions/runs/{}", reference.id);
-    let run = api_get(&base, token.as_deref()).await?;
+    let run = api_get(&client, &base, token.as_deref()).await?;
     let mut jobs = Vec::new();
     let mut page = 1;
     loop {
         let listed = api_get(
+            &client,
             &format!("{base}/jobs?per_page=100&page={page}"),
             token.as_deref(),
         )
@@ -512,7 +519,7 @@ pub async fn fetch_run(reference: &RunReference) -> Result<RemoteRun, GithubErro
     let base_branch = match run["pull_requests"][0]["base"]["ref"].as_str() {
         Some(base) => Some(base.to_string()),
         None if text("event").is_some_and(|e| e.starts_with("pull_request")) => {
-            api_get(&format!("/repos/{owner}/{repo}"), token.as_deref())
+            api_get(&client, &format!("/repos/{owner}/{repo}"), token.as_deref())
                 .await
                 .ok()
                 .and_then(|r| r["default_branch"].as_str().map(str::to_string))

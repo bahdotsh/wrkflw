@@ -72,10 +72,18 @@ fn pool_of(slot: &Mutex<Option<(usize, Arc<Semaphore>)>>, limit: usize) -> Arc<S
 }
 
 fn env_limit() -> Option<usize> {
-    std::env::var(MAX_PARALLEL_JOBS_ENV)
+    parse_limit(&std::env::var(MAX_PARALLEL_JOBS_ENV).ok()?)
+}
+
+/// A job limit as [`MAX_PARALLEL_JOBS_ENV`] gives it: a positive number,
+/// clamped to what a semaphore can hold, since asking for more panics.
+fn parse_limit(value: &str) -> Option<usize> {
+    value
+        .trim()
+        .parse::<usize>()
         .ok()
-        .and_then(|value| value.trim().parse::<usize>().ok())
         .filter(|limit| *limit > 0)
+        .map(|limit| limit.min(Semaphore::MAX_PERMITS))
 }
 
 /// The job limit for a VM with `bytes` of memory, or `None` when it has
@@ -263,6 +271,16 @@ mod tests {
         assert_eq!(limit_for(2 * GIB), Some(1));
         assert_eq!(limit_for(12 * GIB), Some(3));
         assert_eq!(limit_for(GITHUB_RUNNER_BYTES), None);
+    }
+
+    #[test]
+    fn a_huge_limit_is_clamped_to_what_a_pool_can_hold() {
+        let huge = parse_limit(&usize::MAX.to_string()).unwrap();
+        assert_eq!(huge, Semaphore::MAX_PERMITS);
+        assert_eq!(pool_of(&Mutex::new(None), huge).available_permits(), huge);
+        assert_eq!(parse_limit(" 3 "), Some(3));
+        assert_eq!(parse_limit("0"), None);
+        assert_eq!(parse_limit("many"), None);
     }
 
     #[test]

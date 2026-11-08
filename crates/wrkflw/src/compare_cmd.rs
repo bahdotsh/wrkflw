@@ -11,7 +11,6 @@
 use crate::git::line as git_line;
 use crate::{OutputFormat, RuntimeChoice};
 use serde_json::{json, Value};
-use std::collections::BTreeSet;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use wrkflw_github::{RemoteJob, RemoteRun};
@@ -32,9 +31,10 @@ struct ExpectedJob {
     /// The name GitHub shows, when it can be worked out exactly.
     github: Option<String>,
     /// For a matrix leg whose name GitHub builds by appending its values:
-    /// the name before them, and the values.
+    /// the name before them, and the values. A list, not a set: two keys
+    /// can hold the same value, and GitHub prints it twice.
     github_base: String,
-    matrix_values: Option<BTreeSet<String>>,
+    matrix_values: Option<Vec<String>>,
 }
 
 impl ExpectedJob {
@@ -145,7 +145,7 @@ fn expected_jobs(path: &Path) -> Result<Vec<ExpectedJob>, String> {
                     wrkflw_executor::expression::evaluate_matrix_text(t, Some(&leg.values))
                 })
                 .unwrap_or_else(|| id.clone());
-            let values: Option<BTreeSet<String>> =
+            let values: Option<Vec<String>> =
                 leg.values.values().map(value_text).collect::<Option<_>>();
             expected.push(if uses_matrix {
                 ExpectedJob {
@@ -851,6 +851,24 @@ mod tests {
         let killed = vec![json!({"job": "build", "cause": {"kind": "killed"}})];
         let note = note_for(&json!({"name": "build", "status": "failure"}), &killed).unwrap();
         assert!(note.contains("SIGKILL"), "{note}");
+    }
+
+    #[test]
+    fn a_value_two_keys_share_is_matched_twice() {
+        assert!(is_joined_in_some_order(
+            "ubuntu, ubuntu",
+            &["ubuntu", "ubuntu"]
+        ));
+        assert!(!is_joined_in_some_order("ubuntu", &["ubuntu", "ubuntu"]));
+
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: CI\non: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    strategy:\n      matrix:\n        os: [ubuntu]\n        image: [ubuntu]\n    steps:\n      - run: make\n";
+        let expected = expected_jobs(&write(dir.path(), yaml)).unwrap();
+        assert_eq!(expected.len(), 1);
+        assert!(
+            expected[0].matches("build (ubuntu, ubuntu)"),
+            "{expected:?}"
+        );
     }
 
     #[test]

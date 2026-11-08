@@ -38,6 +38,11 @@ while read -r repo; do
   while IFS=$'\t' read -r id path sha; do
     [[ -z "$id" ]] && continue
     path="${path%%@*}"
+    # The path comes from the API and becomes a file under $WORK, so only a
+    # workflow file inside the repository is written.
+    if [[ "$path" == /* || "$path" == *..* ]]; then
+      printf '%s\t%s\t-\t-\tn/a: unexpected workflow path\n' "$repo" "$path"; continue
+    fi
     jobs=$(gh api "repos/$repo/actions/runs/$id/jobs?per_page=100" 2>/dev/null) || {
       printf '%s\t%s\t-\t-\tn/a: cannot list jobs\n' "$repo" "$path"; continue; }
     github=$(jq '.total_count' <<<"$jobs")

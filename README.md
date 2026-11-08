@@ -213,7 +213,10 @@ See [BREAKING_CHANGES.md](BREAKING_CHANGES.md) for full migration notes.
 All of this is opt-in. Without these flags a run behaves as it always has.
 
 ```bash
-# Check everything a push would run, reusing what already passed
+# Check everything CI would run for this push, reusing what already passed.
+# On a feature branch, a workflow a push doesn't fire is checked as a pull
+# request into the default branch. The result says how much the pass proves:
+# verified, partial (some jobs ran as another OS) or nothing_checked.
 wrkflw gate
 
 # Run it on every push (an existing hook is left alone). The hook keeps the
@@ -365,9 +368,19 @@ wrkflw runs replay latest
 # Resume a job at a step
 wrkflw run .github/workflows/ci.yml --job test --from-step "Run tests"
 
+# Run a workflow as a finished GitHub run did, and list where the results differ.
+# Check out the commit that run tested first.
+wrkflw compare https://github.com/OWNER/REPO/actions/runs/123456789
+
 # Serve all of this over the Model Context Protocol
 wrkflw mcp serve
 ```
+
+Every `run_finished`, and the gate result, carries a `verdict`. `verified` means every job ran as the OS it asked for. `partial` means some jobs ran as another OS and are listed under `unverified`. `nothing_checked` means no job ran, so the pass proves nothing. A failure digest names a likely `cause` when the output shows a process killed for lack of memory.
+
+Docker Desktop and Podman machines often have half the 16 GB of a GitHub runner, and a Rust or C++ link can be killed there although it passes in CI. wrkflw warns when the VM has less than 14 GB and runs at most one job per 4 GB at a time. Set `WRKFLW_MAX_PARALLEL_JOBS` to change that.
+
+`scripts/conformance/plan_corpus.sh` plans the last finished run of every workflow in a list of public repositories, and compares the number of jobs with what GitHub ran. It needs `gh` and `jq`, and runs nothing.
 
 Register the MCP server with every coding agent installed on this machine, or name the ones you want. Running it again changes nothing, and an entry that launches a different command is left alone unless you pass `--force`.
 

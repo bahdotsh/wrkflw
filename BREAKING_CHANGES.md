@@ -1,5 +1,31 @@
 # Breaking Changes
 
+## `wrkflw gate` checks pull request workflows, and fails when it checked nothing (unreleased)
+
+Without `--event`, the gate used to check every workflow as a push. On a feature branch, CI that only runs on pushes to `main` and on pull requests was skipped, and the gate passed with nothing run. Now a workflow a push doesn't fire is checked again as a pull request into the default branch, or into `--base-branch`. Pass `--event push` for the old behaviour.
+
+The gate's JSON gains `verdict`, and each workflow gains the `event` and `base_branch` it was checked as. `passed` is false when no job ran for any workflow, with `verdict: "nothing_checked"`. The exit code is still 0 then, so a push no CI runs for isn't blocked. A script that read `passed: true` as "safe to push" now sees `false` in that case.
+
+## `run_finished` says how much a pass proves (unreleased)
+
+`run_finished` gains `verdict`: `verified`, `partial`, `nothing_checked`, `failed`, `error`, `skipped` or `interrupted`. `status` is unchanged. In text mode, a pass with jobs that ran as another OS, or with no job run, no longer prints the plain success line.
+
+A job that didn't run because an earlier result stands has `reused` on `job_finished` and in `run_finished.jobs`, `stored` or `unaffected`. Failure digests gain an optional `cause`, and a matrix leg that repeated a failed leg is listed under the original's `also_failed_in` instead of as a failure of its own. `error_lines` and `output_tail` no longer hold terminal colour codes, and `error_lines` only keeps lines with a whole error word that isn't a count of zero.
+
+The canned "Common causes for cargo command failures" text is gone from failed cargo steps. It blamed the code for failures that came from the machine.
+
+## Matrix `include` follows GitHub's rules (unreleased)
+
+An `include` entry is now added to every original combination whose matrix values it doesn't overwrite, and becomes a combination of its own only when it fits none. Entries are never merged into combinations an earlier `include` created. An entry with only new keys used to become a combination of its own, and now adds its keys to every combination. A workflow planned with fewer or different legs than GitHub runs now gets the same ones.
+
+## Docker and Podman runs limit parallel jobs on a small VM (unreleased)
+
+When the VM has less than 14 GB of memory, a run warns and runs at most one job per 4 GB at a time. Runs can take longer there. Set `WRKFLW_MAX_PARALLEL_JOBS` to choose the limit.
+
+## Smaller schema changes (unreleased)
+
+A workflow without `name:` is named by its path, such as `.github/workflows/ci.yml`. It used to fail to parse. `strategy:` no longer needs a `matrix`. A top-level `cache-mode`, `deployment` on an `environment`, the `code-quality` permission, an empty env value and an expression in `timeout-minutes` are accepted. An expression timeout runs under the default timeout.
+
 ## An explicit `--runtime docker` or `--runtime podman` no longer falls back to the host (unreleased)
 
 If Docker or Podman didn't answer within about a second, for example while Docker Desktop woke from Resource Saver, an explicit `--runtime docker` or `--runtime podman` ran every step on this machine and reported success. The TUI did the same after its runtime probe. Now the availability check waits longer, and a runtime you named that doesn't answer fails the run with a message saying what to start.

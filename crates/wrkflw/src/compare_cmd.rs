@@ -67,6 +67,21 @@ fn value_text(value: &serde_yaml::Value) -> Option<String> {
     }
 }
 
+/// Whether a job's `name:` has an expression that reads `matrix`. GitHub
+/// appends a leg's values to any other name, including one that only says
+/// the word, such as `Build the matrix`.
+fn reads_matrix(name: &str) -> bool {
+    name.split("${{").skip(1).any(|rest| {
+        let expr = rest.split("}}").next().unwrap_or_default();
+        expr.match_indices("matrix").any(|(at, _)| {
+            let before = expr[..at].chars().next_back();
+            let after = expr[at + "matrix".len()..].chars().next();
+            !before.is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '.')
+                && !after.is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '-')
+        })
+    })
+}
+
 /// Every job of the workflow at `path`, with the name GitHub would give it.
 ///
 /// GitHub shows a job's `name:`, or its id, with expressions filled in for
@@ -104,7 +119,7 @@ fn expected_jobs(path: &Path) -> Result<Vec<ExpectedJob>, String> {
         };
         for leg in legs {
             let local = wrkflw_matrix::format_combination_name(id, &leg);
-            let uses_matrix = template.as_deref().is_some_and(|t| t.contains("matrix"));
+            let uses_matrix = template.as_deref().is_some_and(reads_matrix);
             let named = template
                 .as_deref()
                 .and_then(|t| {
@@ -234,7 +249,8 @@ fn rows(
                 local: None,
                 agree: None,
                 note: Some(
-                    "no local job matches this name, such as a job of a called workflow"
+                    "no local job has this name: a job of a called workflow, or a `name:` \
+                     wrkflw couldn't work out, such as one that reads `github`"
                         .to_string(),
                 ),
             });
@@ -271,16 +287,91 @@ fn run_args(remote: &RemoteRun, runtime: &str) -> Vec<String> {
     args
 }
 
-/// The `compare` object.
+/// What the comparison rests on, and what stops it.
+#[derive(Debug, PartialEq)]
+struct Outcome {
+    /// How many results differ: jobs, or the whole run when no job pairs.
+    disagreements: usize,
+    /// `jobs` when jobs were paired and compared, `run` when only the run's
+    /// result could be, `none` when nothing could.
+    basis: &'static str,
+    /// Why the comparison says less than a per-job one would.
+    problem: Option<String>,
+}
+
+/// Judge `rows` and the local run `local` against GitHub's `remote` run.
+///
+/// Agreement needs something compared. A local run that didn't finish
+/// disagrees whatever its jobs say, and a run with no job paired by name
+/// falls back to the run's own result, which counts only when a local job
+/// ran.
+fn outcome(remote: &RemoteRun, local: &Value, rows: &[Row]) -> Outcome {
+    let compared = rows.iter().filter(|r| r.agree.is_some()).count();
+    let job_disagreements = rows.iter().filter(|r| r.agree == Some(false)).count();
+    let status = local["status"].as_str().unwrap_or("unknown");
+    let disagree = |problem: String| Outcome {
+        disagreements: job_disagreements + 1,
+        basis: if compared > 0 { "jobs" } else { "run" },
+        problem: Some(problem),
+    };
+    match status {
+        "skipped" => {
+            return disagree(format!(
+                "GitHub ran this workflow, but wrkflw's trigger filter skipped it: {}",
+                local["skip_reason"].as_str().unwrap_or("no reason given")
+            ))
+        }
+        "success" | "failure" => {}
+        _ => {
+            return disagree(format!(
+                "the local run ended with {status}, so its jobs say nothing: {}",
+                local["error"].as_str().unwrap_or("no error given")
+            ))
+        }
+    }
+    if compared > 0 {
+        return Outcome {
+            disagreements: job_disagreements,
+            basis: "jobs",
+            problem: None,
+        };
+    }
+    if local["verdict"] == "nothing_checked" {
+        return disagree("no job ran locally, so there is nothing to compare".to_string());
+    }
+    let unpaired = "no job could be paired with GitHub's by name";
+    match agree(remote.conclusion.as_deref(), Some(status)) {
+        Some(true) => Outcome {
+            disagreements: 0,
+            basis: "run",
+            problem: Some(format!("{unpaired}, so only the run's result was compared")),
+        },
+        Some(false) => disagree(format!(
+            "{unpaired}, and the run's result differs: GitHub {}, local {status}",
+            remote.conclusion.as_deref().unwrap_or("unknown")
+        )),
+        None => Outcome {
+            disagreements: 0,
+            basis: "none",
+            problem: Some(format!(
+                "{unpaired}, and GitHub's run {} has no result to compare",
+                remote.conclusion.as_deref().unwrap_or("unknown")
+            )),
+        },
+    }
+}
+
+/// The `compare` object. `agree` is true only when something was compared
+/// and nothing differed.
 fn report(remote: &RemoteRun, local: &Value, rows: &[Row]) -> Value {
-    let skipped_locally = local["status"] == "skipped";
-    let disagreements =
-        rows.iter().filter(|r| r.agree == Some(false)).count() + usize::from(skipped_locally);
+    let outcome = outcome(remote, local, rows);
     json!({
         "schema_version": SCHEMA_VERSION,
         "type": "compare",
-        "agree": disagreements == 0,
-        "disagreements": disagreements,
+        "agree": outcome.disagreements == 0 && outcome.basis != "none",
+        "disagreements": outcome.disagreements,
+        "basis": outcome.basis,
+        "problem": outcome.problem,
         "github": {
             "run_id": remote.id,
             "url": remote.html_url,
@@ -319,15 +410,13 @@ fn print_text(report: &Value) {
             github["conclusion"].as_str().unwrap_or("unknown")
         ))
     );
-    let local = &report["local"];
-    if local["status"] == "skipped" {
-        println!(
-            "{}",
-            cli_style::error(&format!(
-                "GitHub ran this workflow, but wrkflw's trigger filter skipped it: {}",
-                local["skip_reason"].as_str().unwrap_or_default()
-            ))
-        );
+    if let Some(problem) = report["problem"].as_str() {
+        let line = if report["agree"] == true {
+            cli_style::warning(problem)
+        } else {
+            cli_style::error(problem)
+        };
+        println!("{line}");
     }
     for job in report["jobs"].as_array().into_iter().flatten() {
         let name = job["github_name"]
@@ -349,13 +438,21 @@ fn print_text(report: &Value) {
             println!("    {}", cli_style::dim(note));
         }
     }
-    match report["disagreements"].as_u64() {
-        Some(0) => println!("{}", cli_style::success("wrkflw agrees with GitHub")),
-        Some(n) => println!(
+    let disagreements = report["disagreements"].as_u64().unwrap_or(0);
+    if report["agree"] == true {
+        println!("{}", cli_style::success("wrkflw agrees with GitHub"));
+    } else if disagreements > 0 {
+        println!(
             "{}",
-            cli_style::error(&format!("wrkflw disagrees with GitHub on {n} job(s)"))
-        ),
-        None => {}
+            cli_style::error(&format!(
+                "wrkflw disagrees with GitHub: {disagreements} result(s) differ"
+            ))
+        );
+    } else {
+        println!(
+            "{}",
+            cli_style::error("nothing could be compared, so wrkflw can't say it agrees")
+        );
     }
 }
 
@@ -389,6 +486,15 @@ pub(crate) async fn run(ctx: CompareCtx) -> ! {
             "{}",
             cli_style::dim(
                 "Warning: the working tree has uncommitted changes, which GitHub's run didn't have"
+            )
+        );
+    }
+    if remote.event.starts_with("pull_request") {
+        eprintln!(
+            "{}",
+            cli_style::dim(
+                "Note: for a pull request GitHub tested this commit merged into its base branch. \
+                 Here it runs as committed, so a change on the base branch can make them differ"
             )
         );
     }
@@ -531,6 +637,98 @@ mod tests {
         );
         assert_eq!(report["agree"], false);
         assert_eq!(report["disagreements"], 1);
+    }
+
+    fn github_run(conclusion: &str, jobs: Vec<RemoteJob>) -> RemoteRun {
+        RemoteRun {
+            id: 1,
+            owner: "o".into(),
+            repo: "r".into(),
+            html_url: String::new(),
+            head_sha: "abc".into(),
+            head_branch: Some("main".into()),
+            event: "push".into(),
+            path: ".github/workflows/ci.yml".into(),
+            conclusion: Some(conclusion.into()),
+            base_branch: None,
+            jobs,
+        }
+    }
+
+    #[test]
+    fn a_local_run_that_errored_never_agrees() {
+        let github = github_run("failure", vec![remote("Format", "failure")]);
+        let local =
+            json!({"status": "error", "verdict": "error", "error": "no docker", "jobs": []});
+        let unpaired = rows(&[], &github.jobs, &[], &[]);
+        let report = report(&github, &local, &unpaired);
+        assert_eq!(report["agree"], false, "{report}");
+        assert_eq!(report["disagreements"], 1);
+        assert!(report["problem"].as_str().unwrap().contains("no docker"));
+    }
+
+    #[test]
+    fn with_no_job_paired_only_the_runs_result_is_compared() {
+        let local_pass = json!({"status": "success", "verdict": "verified"});
+        let github_jobs = vec![remote("Build on ubuntu", "failure")];
+        let none_paired = rows(&[], &github_jobs, &[], &[]);
+        assert!(none_paired.iter().all(|r| r.agree.is_none()));
+
+        let failed = report(
+            &github_run("failure", github_jobs.clone()),
+            &local_pass,
+            &none_paired,
+        );
+        assert_eq!(failed["agree"], false, "{failed}");
+        assert_eq!(failed["basis"], "run");
+        assert_eq!(failed["disagreements"], 1);
+
+        let passed = report(
+            &github_run("success", github_jobs.clone()),
+            &local_pass,
+            &none_paired,
+        );
+        assert_eq!(passed["agree"], true, "{passed}");
+        assert_eq!(passed["basis"], "run");
+        assert!(passed["problem"]
+            .as_str()
+            .unwrap()
+            .contains("only the run's result"));
+
+        let nothing_ran = json!({"status": "success", "verdict": "nothing_checked"});
+        let idle = report(
+            &github_run("success", github_jobs.clone()),
+            &nothing_ran,
+            &none_paired,
+        );
+        assert_eq!(idle["agree"], false, "{idle}");
+
+        let cancelled = report(
+            &github_run("cancelled", github_jobs),
+            &local_pass,
+            &none_paired,
+        );
+        assert_eq!(cancelled["agree"], false, "{cancelled}");
+        assert_eq!(cancelled["basis"], "none");
+        assert_eq!(cancelled["disagreements"], 0);
+    }
+
+    #[test]
+    fn only_a_matrix_expression_keeps_github_from_appending_values() {
+        assert!(reads_matrix("Build (${{ matrix.os }})"));
+        assert!(reads_matrix("${{ matrix['os'] }}"));
+        assert!(!reads_matrix("Build the matrix"));
+        assert!(!reads_matrix("${{ github.workflow }} matrix"));
+        assert!(!reads_matrix("${{ inputs.matrix_name }}"));
+
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: CI\non: push\njobs:\n  build:\n    name: Build the matrix\n    runs-on: ubuntu-latest\n    strategy:\n      matrix:\n        os: [a, b]\n    steps:\n      - run: make\n";
+        let expected = expected_jobs(&write(dir.path(), yaml)).unwrap();
+        let leg = expected
+            .iter()
+            .find(|e| e.local == "build (os: b)")
+            .unwrap();
+        assert!(leg.matches("Build the matrix (b)"));
     }
 
     #[test]

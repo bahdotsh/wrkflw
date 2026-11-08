@@ -416,12 +416,24 @@ pub fn parse_run_reference(text: &str) -> Option<RunReference> {
         .or_else(|| text.strip_prefix("http://github.com/"))
         .or_else(|| text.strip_prefix("github.com/"))?;
     let parts: Vec<&str> = rest.split('/').collect();
+    // Owner and repository go into the API path, so only names GitHub
+    // allows get there.
+    let is_name = |part: &str| {
+        !part.is_empty()
+            && part != "."
+            && part != ".."
+            && part
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    };
     match parts.as_slice() {
-        [owner, repo, "actions", "runs", id, ..] => Some(RunReference {
-            owner: Some(owner.to_string()),
-            repo: Some(repo.to_string()),
-            id: id.parse().ok()?,
-        }),
+        [owner, repo, "actions", "runs", id, ..] if is_name(owner) && is_name(repo) => {
+            Some(RunReference {
+                owner: Some(owner.to_string()),
+                repo: Some(repo.to_string()),
+                id: id.parse().ok()?,
+            })
+        }
         _ => None,
     }
 }
@@ -517,9 +529,6 @@ pub async fn fetch_run(reference: &RunReference) -> Result<RemoteRun, GithubErro
         event: text("event").unwrap_or_default(),
         path: text("path").unwrap_or_default(),
         conclusion: text("conclusion"),
-        // GitHub empties `pull_requests` once the pull request is merged or
-        // closed. Most pull requests go into the default branch, so fall back
-        // to it rather than leave the event unrunnable.
         base_branch,
         jobs,
     })
@@ -549,6 +558,14 @@ mod tests {
         );
         assert_eq!(parse_run_reference("https://github.com/o/r/pull/7"), None);
         assert_eq!(parse_run_reference("nope"), None);
+        assert_eq!(
+            parse_run_reference("https://github.com/o/r?x=1/actions/runs/7"),
+            None
+        );
+        assert_eq!(
+            parse_run_reference("https://github.com/../r/actions/runs/7"),
+            None
+        );
     }
 
     #[test]

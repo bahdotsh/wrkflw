@@ -681,7 +681,16 @@ fn check_workflow(
         );
     }
     let first_reason = why_nothing_ran(&entry);
+    // The push's run stays findable: its record is what says why it fired
+    // nothing.
+    let fell_back_from = json!({
+        "event": entry["event"],
+        "base_branch": entry["base_branch"],
+        "run_id": entry["run_id"],
+        "skip_reason": first_reason,
+    });
     let mut entry = check(second);
+    entry["fell_back_from"] = fell_back_from;
     if checked_nothing(&entry) {
         entry["skip_reason"] = json!(format!(
             "{}: {}; {}: {}",
@@ -1058,6 +1067,40 @@ mod tests {
         };
         let (_, second) = events(&into_develop, Some("feat/x"), Some("main"));
         assert_eq!(second.unwrap().base_branch.as_deref(), Some("develop"));
+    }
+
+    #[test]
+    fn a_fallback_keeps_the_first_events_run() {
+        let push = Event {
+            name: "push".to_string(),
+            base_branch: None,
+        };
+        let pull_request = Event {
+            name: "pull_request".to_string(),
+            base_branch: Some("main".to_string()),
+        };
+        let entry = check_workflow(&push, Some(&pull_request), true, |event| {
+            if event.name == "push" {
+                json!({"path": "ci.yml", "status": "skipped", "run_id": "first",
+                       "event": "push", "skip_reason": "branch not matched"})
+            } else {
+                json!({"path": "ci.yml", "status": "success", "verdict": "verified",
+                       "run_id": "second", "event": "pull_request", "base_branch": "main"})
+            }
+        });
+        assert_eq!(entry["run_id"], "second");
+        assert_eq!(entry["fell_back_from"]["run_id"], "first");
+        assert_eq!(entry["fell_back_from"]["event"], "push");
+        assert_eq!(entry["fell_back_from"]["skip_reason"], "branch not matched");
+
+        // No fallback, no field.
+        let ran = check_workflow(
+            &push,
+            Some(&pull_request),
+            true,
+            |_| json!({"path": "ci.yml", "status": "success", "verdict": "verified"}),
+        );
+        assert!(ran.get("fell_back_from").is_none());
     }
 
     #[test]

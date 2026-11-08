@@ -8,6 +8,7 @@
 //! Each disagreement is listed, with what wrkflw knows about why: a job run
 //! as another OS than `runs-on` asked for, or one killed for lack of memory.
 
+use crate::gate_cmd::git_line;
 use crate::{OutputFormat, RuntimeChoice};
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
@@ -306,12 +307,6 @@ fn join_notes(first: Option<String>, second: Option<String>) -> Option<String> {
         (Some(a), Some(b)) => Some(format!("{a}; {b}")),
         (a, b) => a.or(b),
     }
-}
-
-fn git_line(args: &[&str]) -> Option<String> {
-    let output = Command::new("git").args(args).output().ok()?;
-    let line = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    (output.status.success() && !line.is_empty()).then_some(line)
 }
 
 /// The workflow file a run names, when it is one in this repository: a

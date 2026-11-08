@@ -296,7 +296,7 @@ impl Event {
 }
 
 /// One line of `git` output, or `None` when git fails or prints nothing.
-fn git_line(args: &[&str]) -> Option<String> {
+pub(crate) fn git_line(args: &[&str]) -> Option<String> {
     let output = Command::new("git").args(args).output().ok()?;
     let line = String::from_utf8_lossy(&output.stdout).trim().to_string();
     (output.status.success() && !line.is_empty()).then_some(line)

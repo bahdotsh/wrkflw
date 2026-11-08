@@ -5,6 +5,7 @@ use std::path::Path;
 use std::path::PathBuf;
 
 mod cli_secrets;
+mod compare_cmd;
 mod gate_cmd;
 mod json_output;
 mod mcp_cmd;
@@ -457,19 +458,23 @@ enum Commands {
         gate_mode: bool,
     },
 
-    /// Run what a push would run, and fail if any of it fails.
+    /// Run what CI would run for a push, and fail if any of it fails.
     ///
     /// Each workflow that fires for the event runs with result reuse, a job
     /// container and dependency caches. Use it before pushing, or as a hook.
+    /// Without --event, a workflow a push doesn't fire is checked again as a
+    /// pull request into the default branch, unless this is that branch.
     Gate {
         /// Directory or file of workflows (defaults to the detected directory)
         path: Option<PathBuf>,
 
-        /// Event to simulate
-        #[arg(long, default_value = "push")]
-        event: String,
+        /// Event to simulate (default: push, then pull_request for workflows
+        /// a push doesn't fire)
+        #[arg(long)]
+        event: Option<String>,
 
-        /// Target branch, for a pull_request event
+        /// Target branch, for a pull_request event (default: origin/HEAD's
+        /// branch, else main or master)
         #[arg(long)]
         base_branch: Option<String>,
 
@@ -488,6 +493,20 @@ enum Commands {
         /// Install this as the repository's pre-push hook, then exit
         #[arg(long)]
         install_hook: bool,
+    },
+
+    /// Run a workflow as a GitHub Actions run did, and report where they disagree.
+    ///
+    /// Takes a finished run's id or URL. The working tree must be the commit
+    /// the run tested: check it out first, in a worktree if you like. Exits 0
+    /// when every job wrkflw ran agrees with GitHub, 1 otherwise.
+    Compare {
+        /// Run id, or https://github.com/<owner>/<repo>/actions/runs/<id>
+        run: String,
+
+        /// Container runtime to use
+        #[arg(short, long, value_enum, default_value = "auto")]
+        runtime: RuntimeChoice,
     },
 
     /// Watch for file changes and re-run affected workflows.
@@ -1373,6 +1392,14 @@ async fn run_cli() {
                 install_hook: *install_hook,
                 format: cli.format,
             });
+        }
+        Some(Commands::Compare { run, runtime }) => {
+            compare_cmd::run(compare_cmd::CompareCtx {
+                run: run.clone(),
+                runtime: runtime.clone(),
+                format: cli.format,
+            })
+            .await;
         }
         Some(Commands::Plan {
             path,

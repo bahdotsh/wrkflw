@@ -150,6 +150,7 @@ pub(crate) fn repeated_leg(
         duration_ms: 0,
         logs: note.clone(),
         repeated_from: Some(original.name.clone()),
+        reused: None,
     });
     wrkflw_logging::info(&format!(
         "{} Job '{}': {}",

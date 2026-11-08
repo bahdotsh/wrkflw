@@ -638,6 +638,14 @@ pub(crate) enum Reused {
 }
 
 impl Reused {
+    /// How reports name the reason: `stored` or `unaffected`.
+    pub(crate) fn kind(&self) -> &'static str {
+        match self {
+            Reused::Unaffected => "unaffected",
+            Reused::Stored { .. } => "stored",
+        }
+    }
+
     /// The one step reports show for the job.
     pub(crate) fn step(&self) -> &'static str {
         match self {

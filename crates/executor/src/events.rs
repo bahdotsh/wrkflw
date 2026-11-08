@@ -63,6 +63,10 @@ pub enum ExecutionEvent {
         /// Set when this matrix leg did not run because it would only have
         /// repeated the named leg; `status` is that leg's.
         repeated_from: Option<String>,
+        /// Set when the job did not run because an earlier result stands:
+        /// `stored` for a pass reused with `--reuse-results`, `unaffected`
+        /// for a job `--affected` found no change for.
+        reused: Option<String>,
     },
 }
 

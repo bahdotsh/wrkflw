@@ -4551,6 +4551,7 @@ dependencies = [
  "chrono",
  "dirs",
  "nix 0.27.1",
+ "regex",
  "serde",
  "serde_json",
  "tempfile",

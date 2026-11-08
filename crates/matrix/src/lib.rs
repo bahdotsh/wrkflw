@@ -373,34 +373,26 @@ pub fn expand_matrix(matrix: &MatrixConfig) -> Result<Vec<MatrixCombination>, Ma
     let filtered_combinations = apply_exclude_filters(param_combinations, exclude);
     combinations.extend(filtered_combinations);
 
-    // Step 3: Process include entries per GitHub Actions semantics:
-    // If an include entry matches all shared keys of an existing combination,
-    // merge extra keys into it. Otherwise, add as a new standalone combination.
+    // Step 3: Process include entries as GitHub does. An entry is added to
+    // every combination of the axes whose axis values it doesn't overwrite.
+    // Only the axes' own values are protected: a value an earlier entry
+    // added may be overwritten. An entry that fits no combination becomes
+    // one of its own, and later entries never merge into it, so
+    // `include: [{python: '3.13'}, {python: '3.13', os: windows-latest}]`
+    // is two legs, as on GitHub, not one.
+    let axes: Vec<&String> = matrix.parameters.keys().collect();
+    let base_count = combinations.len();
     for include_item in include {
         let mut merged = false;
-        for combo in &mut combinations {
-            let all_shared_keys_match = include_item.iter().all(|(key, value)| {
-                match combo.values.get(key) {
-                    Some(existing_value) => existing_value == value,
-                    None => true, // Key not in base combo = no conflict, it's a new key to add
-                }
+        for combo in combinations.iter_mut().take(base_count) {
+            let keeps_axes = include_item.iter().all(|(key, value)| {
+                !axes.contains(&key) || combo.values.get(key).is_none_or(|v| v == value)
             });
-            // Only merge if there's at least one matching key (not purely new keys)
-            let has_matching_key = include_item
-                .keys()
-                .any(|key| combo.values.contains_key(key));
-            if all_shared_keys_match && has_matching_key {
-                // Merge extra keys into the existing combination.
-                // or_insert_with is intentional: per GitHub Actions semantics, include
-                // entries add new keys but do NOT override existing matrix values.
+            if keeps_axes {
                 for (key, value) in include_item {
-                    combo
-                        .values
-                        .entry(key.clone())
-                        .or_insert_with(|| value.clone());
+                    combo.values.insert(key.clone(), value.clone());
                 }
                 merged = true;
-                // Don't break — merge into ALL matching combinations per GitHub Actions semantics
             }
         }
         if !merged {
@@ -727,17 +719,107 @@ mod tests {
     }
 
     #[test]
-    fn include_with_only_new_keys_adds_standalone() {
-        let mut matrix = make_matrix(vec![("os", vec!["ubuntu"])]);
-        // Include entry with only keys that don't exist in base combos
+    fn include_with_only_new_keys_is_added_to_every_combination() {
+        let mut matrix = make_matrix(vec![("os", vec!["ubuntu", "windows"])]);
         let mut include_entry = HashMap::new();
         include_entry.insert("arch".to_string(), val("arm64"));
         matrix.include = MatrixEntries::List(vec![include_entry]);
 
         let combos = expand_matrix(&matrix).unwrap();
 
-        // Should have 2: the base ubuntu + standalone arm64
+        // GitHub adds an entry that overwrites no axis value to every combination.
         assert_eq!(combos.len(), 2);
+        assert!(combos
+            .iter()
+            .all(|c| c.values.get("arch") == Some(&val("arm64"))));
+    }
+
+    fn entry(pairs: &[(&str, &str)]) -> HashMap<String, Value> {
+        pairs.iter().map(|(k, v)| (k.to_string(), val(v))).collect()
+    }
+
+    fn leg<'a>(
+        combos: &'a [MatrixCombination],
+        pairs: &[(&str, &str)],
+    ) -> Vec<&'a MatrixCombination> {
+        combos.iter().filter(|c| c.values == entry(pairs)).collect()
+    }
+
+    /// The example from GitHub's documentation of `include`.
+    #[test]
+    fn include_follows_githubs_documented_example() {
+        let mut matrix = make_matrix(vec![
+            ("fruit", vec!["apple", "pear"]),
+            ("animal", vec!["cat", "dog"]),
+        ]);
+        matrix.include = MatrixEntries::List(vec![
+            entry(&[("color", "green")]),
+            entry(&[("color", "pink"), ("animal", "cat")]),
+            entry(&[("fruit", "apple"), ("shape", "circle")]),
+            entry(&[("fruit", "banana")]),
+            entry(&[("fruit", "banana"), ("animal", "cat")]),
+        ]);
+
+        let combos = expand_matrix(&matrix).unwrap();
+
+        assert_eq!(combos.len(), 6, "{:?}", combos);
+        for expected in [
+            &[
+                ("fruit", "apple"),
+                ("animal", "cat"),
+                ("color", "pink"),
+                ("shape", "circle"),
+            ][..],
+            &[
+                ("fruit", "apple"),
+                ("animal", "dog"),
+                ("color", "green"),
+                ("shape", "circle"),
+            ],
+            &[("fruit", "pear"), ("animal", "cat"), ("color", "pink")],
+            &[("fruit", "pear"), ("animal", "dog"), ("color", "green")],
+            &[("fruit", "banana")],
+            &[("fruit", "banana"), ("animal", "cat")],
+        ] {
+            assert_eq!(
+                leg(&combos, expected).len(),
+                1,
+                "{:?} in {:?}",
+                expected,
+                combos
+            );
+        }
+    }
+
+    /// pallets/itsdangerous: seven entries, seven jobs on GitHub. The second
+    /// shares `python` with the first, which used to swallow it.
+    #[test]
+    fn include_only_entries_never_merge_into_each_other() {
+        let matrix = MatrixConfig {
+            include: MatrixEntries::List(vec![
+                entry(&[("python", "3.13")]),
+                entry(&[
+                    ("name", "Windows"),
+                    ("python", "3.13"),
+                    ("os", "windows-latest"),
+                ]),
+                entry(&[("name", "Mac"), ("python", "3.13"), ("os", "macos-latest")]),
+                entry(&[("python", "3.12")]),
+                entry(&[("python", "3.11")]),
+                entry(&[("python", "3.10")]),
+                entry(&[
+                    ("name", "PyPy"),
+                    ("python", "pypy-3.11"),
+                    ("tox", "pypy311"),
+                ]),
+            ]),
+            ..MatrixConfig::default()
+        };
+
+        let combos = expand_matrix(&matrix).unwrap();
+
+        assert_eq!(combos.len(), 7, "{:?}", combos);
+        assert_eq!(leg(&combos, &[("python", "3.13")]).len(), 1);
     }
 
     #[test]

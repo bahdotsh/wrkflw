@@ -24,6 +24,7 @@ pub mod podman;
 pub mod run_options;
 pub mod runner_fidelity;
 pub mod substitution;
+pub mod vm_memory;
 pub(crate) mod workflow_commands;
 pub mod workspace;
 

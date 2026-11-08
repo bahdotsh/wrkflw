@@ -10,7 +10,45 @@ pub const DEFAULT_TAIL_LINES: usize = 40;
 
 /// Lines from above the tail that look like the cause.
 const MAX_ERROR_LINES: usize = 10;
-const ERROR_WORDS: [&str; 5] = ["error", "fatal", "panic", "traceback", "failed"];
+
+/// Words that mark a line as an error, matched as whole words so a crate
+/// called `thiserror` or a flag like `-Werror` isn't one.
+static ERROR_WORD: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"(?i)\b(error|errors|fatal|panic|panicked|traceback|failed|failures?)\b")
+        .unwrap()
+});
+
+/// A count of zero in front of an error word, as in `0 failed` or
+/// `no errors`: a summary saying nothing went wrong.
+static ZERO_COUNT: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)\b(0|no)\s*$").unwrap());
+
+/// Terminal escape sequences: colours, cursor moves, and the OSC 8
+/// hyperlinks cargo prints. An agent reads the digest as text.
+static ANSI: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]")
+        .unwrap()
+});
+
+/// Output that says a process was killed for memory, not that code failed.
+static OUT_OF_MEMORY: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(
+        r"(?i)signal 9\b|\bSIGKILL\b|\bout of memory\b|\boom-?kill|cannot allocate memory|memory allocation of \d+ bytes failed|^\s*Killed\s*$",
+    )
+    .unwrap()
+});
+
+/// `line` without terminal escape sequences.
+pub fn strip_ansi(line: &str) -> String {
+    ANSI.replace_all(line, "").into_owned()
+}
+
+/// Whether `line` reports an error, rather than mentioning one in passing.
+fn is_error_line(line: &str) -> bool {
+    ERROR_WORD
+        .find_iter(line)
+        .any(|word| !ZERO_COUNT.is_match(&line[..word.start()]))
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct FailureDigest {
@@ -46,13 +84,45 @@ pub struct FailedStep {
     pub env_from_earlier_steps: Vec<(String, String)>,
     /// Absolute path of the full log.
     pub log_path: Option<String>,
+    /// What the output says about the cause, when it points away from the
+    /// code, as a process killed for lack of memory does.
+    pub cause: Option<FailureCause>,
+}
+
+/// A cause read from a failed step's output.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct FailureCause {
+    /// `out_of_memory`.
+    pub kind: &'static str,
+    /// The line that shows it.
+    pub evidence: String,
+    /// What to do about it.
+    pub hint: String,
+}
+
+/// The cause `text` and `exit_code` point to, if it isn't the code.
+fn failure_cause(text: &str, exit_code: Option<i32>) -> Option<FailureCause> {
+    let evidence = text
+        .lines()
+        .map(strip_ansi)
+        .find(|line| OUT_OF_MEMORY.is_match(line))
+        .or_else(|| (exit_code == Some(137)).then(|| "exit code 137 (killed)".to_string()))?;
+    Some(FailureCause {
+        kind: "out_of_memory",
+        evidence: evidence.trim().to_string(),
+        hint: "A process was killed, most likely for lack of memory. This is the machine \
+               running the job, not a bug in the code: GitHub's runners have more memory \
+               than a default Docker or Podman VM. Give the VM more memory, or run fewer \
+               jobs at once, such as one with --job, then run it again"
+            .to_string(),
+    })
 }
 
 fn tail(text: &str, lines: usize) -> (Vec<String>, usize) {
     let all: Vec<&str> = text.lines().collect();
     let kept = all[all.len().saturating_sub(lines)..]
         .iter()
-        .map(|line| line.to_string())
+        .map(|line| strip_ansi(line))
         .collect();
     (kept, all.len())
 }
@@ -84,17 +154,12 @@ fn error_lines(text: &str, tail_lines: usize) -> Vec<String> {
     let all: Vec<&str> = text.lines().collect();
     let tail_start = all.len().saturating_sub(tail_lines);
     let above_tail = all.get(output_start(&all)..tail_start).unwrap_or(&[]);
-    let found: Vec<&&str> = above_tail
+    let found: Vec<String> = above_tail
         .iter()
-        .filter(|line| {
-            let lower = line.to_lowercase();
-            !is_output_header(line) && ERROR_WORDS.iter().any(|word| lower.contains(word))
-        })
+        .map(|line| strip_ansi(line))
+        .filter(|line| !is_output_header(line) && is_error_line(line))
         .collect();
-    found[found.len().saturating_sub(MAX_ERROR_LINES)..]
-        .iter()
-        .map(|line| line.to_string())
-        .collect()
+    found[found.len().saturating_sub(MAX_ERROR_LINES)..].to_vec()
 }
 
 /// `line` with durations blanked. Two legs rarely take equally long, and
@@ -139,11 +204,17 @@ fn same_failure(a: &FailedStep, b: &FailedStep) -> bool {
 /// until the digest is no longer compact.
 fn failed_steps(store: &RunStore, run: &RunRecord, tail_lines: usize) -> Vec<FailedStep> {
     let mut failures: Vec<(&str, FailedStep)> = Vec::new();
-    let failed_jobs = run
+    let failed_jobs: Vec<&JobRecord> = run
         .jobs
         .iter()
-        .filter(|job| job.status == "failure" && !job.failure_allowed);
-    for job in failed_jobs {
+        .filter(|job| job.status == "failure" && !job.failure_allowed)
+        .collect();
+    // A leg that only repeated another ran nothing of its own, so it has no
+    // output to read. It is named on the leg it repeated.
+    let (folded, ran): (Vec<&JobRecord>, Vec<&JobRecord>) = failed_jobs
+        .into_iter()
+        .partition(|job| job.repeated_from.is_some());
+    for job in ran {
         let failure = failed_step(store, run, job, tail_lines);
         let repeat_of = failures.iter_mut().find(|(canonical, earlier)| {
             *canonical == job.canonical_name && same_failure(earlier, &failure)
@@ -151,6 +222,20 @@ fn failed_steps(store: &RunStore, run: &RunRecord, tail_lines: usize) -> Vec<Fai
         match repeat_of {
             Some((_, earlier)) => earlier.also_failed_in.push(failure.job),
             None => failures.push((&job.canonical_name, failure)),
+        }
+    }
+    for job in folded {
+        let original = job.repeated_from.as_deref().unwrap_or_default();
+        let owner = failures.iter_mut().find(|(_, failure)| {
+            failure.job == original || failure.also_failed_in.iter().any(|leg| leg == original)
+        });
+        match owner {
+            Some((_, failure)) => failure.also_failed_in.push(job.name.clone()),
+            // The leg it repeated isn't a failure here, so say what we know.
+            None => failures.push((
+                &job.canonical_name,
+                failed_step(store, run, job, tail_lines),
+            )),
         }
     }
     failures.into_iter().map(|(_, failure)| failure).collect()
@@ -223,6 +308,7 @@ fn failed_step(
             output_lines,
             env_from_earlier_steps: Vec::new(),
             log_path: job.log.as_deref().map(log_path),
+            cause: failure_cause(&text, None),
         };
     };
     let text = read(&step.log);
@@ -247,6 +333,7 @@ fn failed_step(
         output_lines,
         env_from_earlier_steps: env,
         log_path: step.log.as_deref().map(log_path),
+        cause: failure_cause(&text, step.exit_code),
     }
 }
 
@@ -275,6 +362,12 @@ pub fn render_digest(digest: &FailureDigest) -> String {
             out.push_str(&format!(
                 "Also failed in: {}\n",
                 failure.also_failed_in.join(", ")
+            ));
+        }
+        if let Some(cause) = &failure.cause {
+            out.push_str(&format!(
+                "Likely cause: {} ({})\n  {}\n",
+                cause.kind, cause.evidence, cause.hint
             ));
         }
         if let Some(uses) = &failure.uses {
@@ -336,6 +429,7 @@ mod tests {
             output_lines: output.len(),
             env_from_earlier_steps: Vec::new(),
             log_path: None,
+            cause: None,
         }
     }
 
@@ -417,5 +511,102 @@ mod tests {
         let found = error_lines(&text.join("\n"), 1);
         assert_eq!(found.len(), MAX_ERROR_LINES);
         assert_eq!(found.last().unwrap(), "error 28");
+    }
+
+    #[test]
+    fn error_words_count_only_as_whole_words() {
+        let text =
+            "Standard Output:\n   Compiling thiserror v1.0.69\n  Downloaded thiserror-impl\n\
+                    cc -Werror x.c\nerror[E0308]: mismatched types\ntail\n";
+        assert_eq!(error_lines(text, 1), ["error[E0308]: mismatched types"]);
+    }
+
+    #[test]
+    fn a_summary_of_zero_failures_is_not_an_error_line() {
+        let text = "Standard Output:\ntest result: ok. 28 passed; 0 failed; 0 ignored\n\
+                    no errors found: 0 errors\ntest a ... FAILED\ntail\n";
+        assert_eq!(error_lines(text, 1), ["test a ... FAILED"]);
+    }
+
+    #[test]
+    fn colours_and_links_are_stripped() {
+        let text = "Standard Output:\n\x1b[1m\x1b[91merror\x1b[0m: boom\n\
+                    \x1b]8;;https://doc.rust-lang.org\x1b\\docs\x1b]8;;\x1b\\ here\n";
+        assert_eq!(error_lines(text, 1), ["error: boom"]);
+        assert_eq!(tail(text, 1).0, ["docs here"]);
+    }
+
+    #[test]
+    fn a_linker_killed_for_memory_is_named_as_the_cause() {
+        let text = "Standard Error:\n  = note: collect2: fatal error: ld terminated with signal 9 [Killed]\n\
+                    error: could not compile `wrkflw`\n";
+        let cause = failure_cause(text, Some(101)).unwrap();
+        assert_eq!(cause.kind, "out_of_memory");
+        assert!(cause.evidence.contains("signal 9"), "{}", cause.evidence);
+        assert_eq!(
+            failure_cause("Killed\n", Some(137)).unwrap().evidence,
+            "Killed"
+        );
+        assert_eq!(failure_cause("", Some(137)).unwrap().kind, "out_of_memory");
+        assert_eq!(
+            failure_cause("test killed_by_timeout ... FAILED\n", Some(101)),
+            None
+        );
+    }
+
+    fn job_json(name: &str, repeated_from: Option<&str>) -> serde_json::Value {
+        serde_json::json!({
+            "name": name,
+            "canonical_name": "build",
+            "status": "failure",
+            "failure_allowed": false,
+            "duration_ms": 1,
+            "log": null,
+            "repeated_from": repeated_from,
+            "steps": [{
+                "index": 0, "name": "test", "status": "failure", "outcome": "failure",
+                "conclusion": "failure", "exit_code": 101, "duration_ms": 1,
+                "command": "cargo test", "uses": null, "env_set": [],
+                "log": format!("{name}.log"),
+            }],
+        })
+    }
+
+    #[test]
+    fn a_folded_leg_is_named_on_the_leg_it_repeated() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = RunStore::at(dir.path());
+        let run: RunRecord = serde_json::from_value(serde_json::json!({
+            "schema_version": SCHEMA_VERSION, "id": "r", "status": "failure",
+            "workflow": "ci.yml", "cwd": "/repo", "repo_root": "/repo", "git_sha": null,
+            "git_branch": null, "git_dirty": null, "runtime": "docker", "event": null,
+            "source": "cli", "agent": null, "intent": null, "session": null,
+            "replay_of": null, "argv": [], "variables": [], "pid": 1, "started_at": "",
+            "finished_at": null, "duration_ms": null, "error": null, "skip_reason": null,
+            "jobs": [
+                job_json("build (os: macos-latest)", Some("build (os: ubuntu-latest)")),
+                job_json("build (os: ubuntu-latest)", None),
+                job_json("build (os: windows-latest)", Some("build (os: ubuntu-latest)")),
+            ],
+        }))
+        .unwrap();
+        for leg in ["ubuntu", "macos", "windows"] {
+            store
+                .write_log(
+                    "r",
+                    &format!("build (os: {leg}-latest).log"),
+                    "Standard Output:\nboom\n",
+                )
+                .unwrap();
+        }
+
+        let digest = failure_digest(&store, &run, 10).unwrap();
+
+        assert_eq!(digest.failures.len(), 1, "{:?}", digest.failures);
+        assert_eq!(digest.failures[0].job, "build (os: ubuntu-latest)");
+        assert_eq!(
+            digest.failures[0].also_failed_in,
+            ["build (os: macos-latest)", "build (os: windows-latest)"]
+        );
     }
 }

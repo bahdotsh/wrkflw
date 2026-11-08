@@ -62,9 +62,14 @@ pub fn runner_os_for(runtime: RuntimeType, requested: &[&str]) -> String {
     }
 }
 
-/// `runs-on` labels with `${{ matrix.* }}` filled in. The engine maps
+/// `runs-on` labels with their matrix expressions evaluated. The engine maps
 /// labels to images from these too, so the label judged here is the one
 /// that picked the job's image.
+///
+/// A label is evaluated when its expressions read nothing but `matrix` and
+/// literals, so `${{ matrix.os || 'ubuntu-latest' }}` resolves per leg. One
+/// that reads another context, such as `needs`, is kept as written: its
+/// value isn't known here, and a fallback after `||` would be a guess.
 pub(crate) fn runs_on_labels(
     runs_on: &Option<Vec<String>>,
     matrix: Option<&HashMap<String, Value>>,
@@ -72,11 +77,96 @@ pub(crate) fn runs_on_labels(
     runs_on
         .iter()
         .flatten()
-        .map(|label| match matrix {
-            Some(values) => crate::substitution::preprocess_command(label, values),
-            None => label.clone(),
-        })
+        .map(|label| matrix_label(label, matrix))
         .collect()
+}
+
+/// Contexts other than `matrix` whose values a label can't be judged without.
+const OTHER_CONTEXTS: &[&str] = &[
+    "needs", "inputs", "vars", "github", "env", "steps", "secrets", "job", "runner", "strategy",
+    "jobs", "gitea",
+];
+
+/// Whether `expr` reads a context other than `matrix`.
+fn reads_another_context(expr: &str) -> bool {
+    static WORD: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"[A-Za-z_][A-Za-z0-9_-]*").unwrap());
+    // Text inside quotes is a literal, not a context.
+    let unquoted: String = expr
+        .split('\'')
+        .enumerate()
+        .filter(|(i, _)| i % 2 == 0)
+        .map(|(_, part)| part)
+        .collect::<Vec<_>>()
+        .join(" ");
+    WORD.find_iter(&unquoted).any(|word| {
+        let after = &unquoted[word.end()..];
+        OTHER_CONTEXTS.contains(&word.as_str())
+            && (after.starts_with('.') || after.starts_with('[') || after.trim().is_empty())
+    })
+}
+
+/// `label` with each `${{ }}` evaluated against `matrix`, or as written when
+/// any of them can't be.
+fn matrix_label(label: &str, matrix: Option<&HashMap<String, Value>>) -> String {
+    evaluate_matrix_text(label, matrix).unwrap_or_else(|| fallback_label(label, matrix))
+}
+
+/// `text` with each `${{ }}` evaluated against `matrix` alone, as GitHub
+/// fills in a job's `name:` or `runs-on:` for one matrix leg. `None` when an
+/// expression reads another context, such as `needs`, or is empty.
+pub fn evaluate_matrix_text(text: &str, matrix: Option<&HashMap<String, Value>>) -> Option<String> {
+    static EXPR: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"\$\{\{(.*?)\}\}").unwrap());
+    if !text.contains("${{") {
+        return Some(text.to_string());
+    }
+    let empty = HashMap::new();
+    let combination = Some(matrix.cloned().unwrap_or_default());
+    let statuses = HashMap::new();
+    let outputs = HashMap::new();
+    let needs = HashMap::new();
+    let needs_results = HashMap::new();
+    let ctx = crate::expression::ExpressionContext {
+        env_context: &empty,
+        step_outputs: &outputs,
+        matrix_combination: &combination,
+        step_statuses: &statuses,
+        job_status: "success",
+        secrets_context: &empty,
+        needs_context: &needs,
+        needs_results: &needs_results,
+        user_env: &empty,
+    };
+    let mut resolved = String::new();
+    let mut last = 0;
+    for caps in EXPR.captures_iter(text) {
+        let whole = caps.get(0).expect("match");
+        let expr = &caps[1];
+        if reads_another_context(expr) {
+            return None;
+        }
+        let value = match crate::expression::evaluate(expr, &ctx).ok()? {
+            crate::expression::ExprValue::String(s) if !s.is_empty() => s,
+            crate::expression::ExprValue::Number(n) => n.to_string(),
+            crate::expression::ExprValue::Bool(b) => b.to_string(),
+            _ => return None,
+        };
+        resolved.push_str(&text[last..whole.start()]);
+        resolved.push_str(&value);
+        last = whole.end();
+    }
+    resolved.push_str(&text[last..]);
+    Some(resolved)
+}
+
+/// What a label became before expressions were evaluated: plain
+/// `${{ matrix.x }}` references filled in, the rest left alone.
+fn fallback_label(label: &str, matrix: Option<&HashMap<String, Value>>) -> String {
+    match matrix {
+        Some(values) => crate::substitution::preprocess_command(label, values),
+        None => label.to_string(),
+    }
 }
 
 /// The image the user mapped one of `labels` to with `--platform`, trying
@@ -302,6 +392,37 @@ mod tests {
             requested_os(&job, Some(&matrix("macos-14")), &overrides),
             None
         );
+    }
+
+    #[test]
+    fn a_matrix_label_with_a_fallback_is_judged_per_leg() {
+        let job = job("runs-on: ${{ matrix.os || 'ubuntu-latest' }}\nsteps: []");
+        let windows = substitution(
+            &job,
+            Some(&matrix("windows-latest")),
+            &env("Linux"),
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(windows.requested, "windows-latest");
+        let no_os = HashMap::from([("python".to_string(), Value::String("3.13".into()))]);
+        assert_eq!(
+            substitution(&job, Some(&no_os), &env("Linux"), &HashMap::new()),
+            None
+        );
+        let on_mac = substitution(&job, Some(&no_os), &env("macOS"), &HashMap::new()).unwrap();
+        assert_eq!(on_mac.requested, "ubuntu-latest");
+    }
+
+    #[test]
+    fn a_fallback_after_another_context_is_not_guessed() {
+        let job = job("runs-on: ${{ needs.setup.outputs.os || 'ubuntu-latest' }}\nsteps: []");
+        assert_eq!(
+            substitution(&job, None, &env("macOS"), &HashMap::new()),
+            None
+        );
+        assert!(!reads_another_context("matrix.os || 'needs.x'"));
+        assert!(reads_another_context("inputs.os || 'ubuntu-latest'"));
     }
 
     #[test]

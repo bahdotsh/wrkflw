@@ -301,7 +301,10 @@ fn the_gate_skips_a_workflow_the_event_does_not_trigger() {
     let output = repo.wrkflw(&["gate", "--runtime", "emulation", "--diff-base", "HEAD"]);
     assert_ok(&output);
     assert!(repo.take_ran().is_empty());
-    assert!(String::from_utf8_lossy(&output.stdout).contains("0 workflow(s) ran, 1 skipped"));
+    // Nothing ran, so the gate doesn't claim a pass: it exits 0, so the push
+    // isn't blocked, and warns that the push is unverified.
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("gate passed"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("the gate checked nothing"));
 }
 
 #[test]

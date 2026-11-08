@@ -69,24 +69,102 @@ pub(crate) fn copy_directory_contents(from: &Path, to: &Path) -> Result<(), Exec
     let rules = SyncRules::for_root(from, to)?;
     copy_directory_contents_with_gitignore(from, to, &rules, &[], false)?;
     // A checkout is a git repository, and steps run `git describe`, `git
-    // diff` and the like. A `.git` file (a worktree or submodule) points at a
-    // host path a container can't see, so only a directory is mirrored.
-    let git_dir = from.join(".git");
-    if git_dir.is_dir() && !git_dir.is_symlink() {
-        // Hooks stay out: a clone has none, and a step that commits must
-        // not run the developer's. Objects are never changed once written,
-        // so they are hard-linked where the filesystem allows instead of
-        // copied into every job's workspace.
-        //
-        // The config is written separately, without the settings that make
-        // git run a host program (`core.hooksPath`, `core.fsmonitor`) or
-        // point outside the workspace (`core.worktree`).
-        let to_git = to.join(".git");
-        mirror_directory(&git_dir, &to_git, false, &["hooks", "config"], &["objects"])?;
-        write_sanitized_git_config(&git_dir.join("config"), &to_git.join("config"))?;
-    }
+    // diff` and the like. Without one they fail here and pass on GitHub, and
+    // a test runner that stops at the first failure hides every real one.
+    mirror_git_dir(from, &to.join(".git"))?;
     rules.record_tracked();
     Ok(())
+}
+
+/// Where the repository at `root` keeps its git data: the directory that
+/// holds this checkout's own HEAD and index, and the one that holds the
+/// objects and refs. They are the same for a plain clone.
+///
+/// A `.git` file says where the data is, as in a worktree (`git worktree
+/// add`), which agents use to work on several branches at once, or in a
+/// submodule. A worktree's own directory names the shared one in its
+/// `commondir` file.
+#[derive(Debug, PartialEq)]
+struct GitDirs {
+    own: PathBuf,
+    common: PathBuf,
+}
+
+fn git_dirs(root: &Path) -> Option<GitDirs> {
+    let dot_git = root.join(".git");
+    let meta = dot_git.symlink_metadata().ok()?;
+    if meta.is_dir() {
+        return Some(GitDirs {
+            own: dot_git.clone(),
+            common: dot_git,
+        });
+    }
+    if !meta.is_file() {
+        return None;
+    }
+    let text = std::fs::read_to_string(&dot_git).ok()?;
+    let pointer = text
+        .lines()
+        .find_map(|line| line.strip_prefix("gitdir:"))?
+        .trim();
+    let own = root.join(pointer);
+    let own = own.canonicalize().ok().filter(|dir| dir.is_dir())?;
+    let common = match std::fs::read_to_string(own.join("commondir")) {
+        Ok(relative) => own.join(relative.trim()).canonicalize().ok()?,
+        Err(_) => own.clone(),
+    };
+    Some(GitDirs { own, common })
+}
+
+/// Bring `to_git` up to date with the git data of the repository at `root`,
+/// as a real directory a container can see, whether `root` has a `.git`
+/// directory or a `.git` file pointing elsewhere.
+fn mirror_git_dir(root: &Path, to_git: &Path) -> Result<(), ExecutionError> {
+    let dot_git = root.join(".git");
+    if dot_git.is_symlink() || !dot_git.exists() {
+        return Ok(());
+    }
+    let Some(dirs) = git_dirs(root) else {
+        wrkflw_logging::warning(&format!(
+            "{} doesn't point at git data wrkflw can read, so the job's workspace is not \
+             a git repository: steps that run git will fail here though they pass on GitHub",
+            dot_git.display()
+        ));
+        return Ok(());
+    };
+    // Hooks stay out: a clone has none, and a step that commits must not
+    // run the developer's. Objects are never changed once written, so they
+    // are hard-linked where the filesystem allows instead of copied into
+    // every job's workspace. Other worktrees' state stays out too.
+    //
+    // The config is written separately, without the settings that make git
+    // run a host program (`core.hooksPath`, `core.fsmonitor`) or point
+    // outside the workspace (`core.worktree`).
+    mirror_directory(
+        &dirs.common,
+        to_git,
+        false,
+        &["hooks", "config", "worktrees"],
+        &["objects"],
+    )?;
+    if dirs.own != dirs.common {
+        // This worktree's HEAD, index and the like, over the main
+        // checkout's. Only files: its directories (`logs`, and `refs` for
+        // per-worktree refs) would replace the shared ones.
+        const POINTERS: &[&str] = &["commondir", "gitdir", "locked"];
+        let entries = std::fs::read_dir(&dirs.own).map_err(|e| {
+            ExecutionError::Execution(format!("Failed to read {}: {e}", dirs.own.display()))
+        })?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name();
+            let is_file = entry.file_type().is_ok_and(|kind| kind.is_file());
+            if is_file && !POINTERS.contains(&name.to_string_lossy().as_ref()) {
+                sync_file(&path, &to_git.join(&name))?;
+            }
+        }
+    }
+    write_sanitized_git_config(&dirs.common.join("config"), &to_git.join("config"))
 }
 
 /// Settings of `.git/config` a checkout leaves out: each makes git run a
@@ -1302,5 +1380,97 @@ mod tests {
             sanitized_git_config("# hooksPath = x\r\n[core]\r\n\tHOOKSPATH=y\r\n"),
             "# hooksPath = x\r\n[core]\r\n"
         );
+    }
+
+    /// Run git in `dir` and return what it printed.
+    fn git_out(dir: &Path, args: &[&str]) -> Option<String> {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env(
+                "GIT_CONFIG_GLOBAL",
+                if cfg!(windows) { "NUL" } else { "/dev/null" },
+            )
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .output()
+            .ok()?;
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
+    #[test]
+    fn a_worktree_checkout_is_a_git_repository_on_its_branch() {
+        let Some(repo) = git_repo() else { return };
+        std::fs::write(repo.path().join("a.txt"), "a").unwrap();
+        assert!(git(repo.path(), &["add", "."]));
+        assert!(git(repo.path(), &["commit", "-q", "-m", "one"]));
+        assert!(git(repo.path(), &["tag", "v1"]));
+        let worktrees = tempfile::tempdir().unwrap();
+        let tree = worktrees.path().join("feature");
+        assert!(git(
+            repo.path(),
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feature",
+                tree.to_str().unwrap()
+            ]
+        ));
+        std::fs::write(tree.join("b.txt"), "b").unwrap();
+        assert!(git(&tree, &["add", "."]));
+        assert!(git(&tree, &["commit", "-q", "-m", "two"]));
+        assert!(tree.join(".git").is_file());
+        let dst = tempfile::tempdir().unwrap();
+
+        copy_directory_contents(&tree, dst.path()).unwrap();
+
+        let git_dir = dst.path().join(".git");
+        assert!(git_dir.is_dir());
+        assert!(!git_dir.join("worktrees").exists());
+        assert!(!git_dir.join("commondir").exists());
+        assert_eq!(
+            git_out(dst.path(), &["rev-parse", "--abbrev-ref", "HEAD"]).as_deref(),
+            Some("feature")
+        );
+        assert_eq!(
+            git_out(dst.path(), &["describe", "--tags"])
+                .unwrap()
+                .split('-')
+                .next(),
+            Some("v1")
+        );
+        assert_eq!(
+            git_out(dst.path(), &["status", "--porcelain"]).as_deref(),
+            Some("")
+        );
+
+        // A second sync keeps it a repository on the worktree's branch.
+        copy_directory_contents(&tree, dst.path()).unwrap();
+        assert_eq!(
+            git_out(dst.path(), &["rev-parse", "--abbrev-ref", "HEAD"]).as_deref(),
+            Some("feature")
+        );
+    }
+
+    #[test]
+    fn a_git_file_pointing_nowhere_leaves_no_repository() {
+        let src = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join(".git"), "gitdir: /does/not/exist\n").unwrap();
+        std::fs::write(src.path().join("a.txt"), "a").unwrap();
+        let dst = tempfile::tempdir().unwrap();
+
+        copy_directory_contents(src.path(), dst.path()).unwrap();
+
+        assert!(dst.path().join("a.txt").is_file());
+        assert!(!dst.path().join(".git").exists());
+        assert_eq!(git_dirs(src.path()), None);
     }
 }

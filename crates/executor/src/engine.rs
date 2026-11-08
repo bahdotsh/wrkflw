@@ -977,6 +977,7 @@ fn initialize_runtime(
                 ));
             }
             docker::forget_pulled_images();
+            crate::vm_memory::check("docker");
             match docker::DockerRuntime::new_with_config(preserve_containers_on_failure) {
                 Ok(docker_runtime) => Ok((Box::new(docker_runtime), RuntimeType::Docker)),
                 Err(e) => Err(ExecutionError::Runtime(format!(
@@ -993,6 +994,7 @@ fn initialize_runtime(
                         .to_string(),
                 ));
             }
+            crate::vm_memory::check("podman");
             Ok((
                 Box::new(podman::PodmanRuntime::new_unchecked(
                     preserve_containers_on_failure,
@@ -1211,6 +1213,7 @@ impl JobResult {
             duration_ms: 0,
             logs: self.logs.clone(),
             repeated_from: self.repeated_from.clone(),
+            reused: None,
         });
         self
     }
@@ -2558,7 +2561,14 @@ async fn execute_job_batch(
     // and per-job state (needs context, secrets). JobServices is constructed
     // per-job inside execute_job_with_matrix after resolving secrets.
 
-    let result_arrays = future::join_all(futures).await;
+    // In order, at most as many at once as the VM's memory allows. On a
+    // runner each job has a machine of its own; here they share one.
+    let result_arrays: Vec<_> =
+        futures::stream::StreamExt::collect(futures::stream::StreamExt::buffered(
+            futures::stream::iter(futures),
+            crate::vm_memory::parallel_jobs(),
+        ))
+        .await;
 
     // Flatten the results from all jobs and their matrix combinations
     let mut results = Vec::new();
@@ -2683,7 +2693,7 @@ async fn execute_job_with_matrix(
             if matches!(why, acceleration::Reused::Stored { .. }) {
                 acceleration::mark_executed(job_name);
             }
-            let (note, step) = (why.note(), why.step());
+            let (note, step, kind) = (why.note(), why.step(), why.kind());
             // A reused leg still ran as another OS when it passed, so it is
             // reported the same way. Its matrix values come from its name.
             let legs: Vec<MatrixCombination> = job
@@ -2724,7 +2734,7 @@ async fn execute_job_with_matrix(
                         env_context,
                         platform_overrides,
                     );
-                    announce_reused(&stored, &note, runner.as_ref());
+                    announce_reused(&stored, &note, kind, runner.as_ref());
                     JobResult::reused(stored, step, &note)
                 })
                 .collect());
@@ -2787,11 +2797,13 @@ async fn execute_job_with_matrix(
             combinations.len()
         ));
 
-        // Set maximum parallel jobs
-        let max_parallel = job.max_parallel().unwrap_or_else(|| {
-            // If not specified, use a reasonable default based on CPU cores
-            std::cmp::max(1, num_cpus::get())
-        });
+        // Set maximum parallel jobs: the matrix's own limit, or the CPU
+        // count, and never more than the VM's memory allows.
+        let max_parallel = job
+            .max_parallel()
+            .unwrap_or_else(|| std::cmp::max(1, num_cpus::get()))
+            .min(crate::vm_memory::parallel_jobs())
+            .max(1);
 
         let services = JobServices {
             secret_manager,
@@ -2855,6 +2867,7 @@ async fn execute_job_with_matrix(
 fn announce_reused(
     stored: &acceleration::StoredJob,
     note: &str,
+    kind: &str,
     runner: Option<&crate::runner_fidelity::RunnerSubstitution>,
 ) {
     crate::events::emit(|| crate::events::ExecutionEvent::JobStarted {
@@ -2869,6 +2882,7 @@ fn announce_reused(
         duration_ms: 0,
         logs: note.to_string(),
         repeated_from: None,
+        reused: Some(kind.to_string()),
     });
     wrkflw_logging::info(&format!(
         "{} Job '{}': {}",
@@ -3743,6 +3757,7 @@ impl StepLoopState {
             duration_ms: self.job_started.elapsed().as_millis() as u64,
             logs: self.job_logs.clone(),
             repeated_from: None,
+            reused: None,
         });
     }
 
@@ -5326,7 +5341,6 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
         let mut output = String::new();
         let mut exit_code = None;
         let mut status = StepStatus::Success;
-        let mut error_details = None;
 
         // Perform secret substitution if secret manager is available
         let resolved_run = if let Some(secret_manager) = ctx.services.secret_manager {
@@ -5361,9 +5375,6 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                 ));
             }
         };
-
-        // Check if this is a cargo command
-        let is_cargo_cmd = resolved_run.trim().starts_with("cargo");
 
         // Resolve effective shell: step > job defaults > workflow defaults > "bash"
         let effective_shell = ctx
@@ -5556,45 +5567,17 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                     output.push('\n');
                 }
 
+                // A failed step's own output is the evidence. A canned guess
+                // at the cause, such as "test failures" for any failed
+                // `cargo test`, would sit in the digest's tail and mislead.
                 if container_output.exit_code != 0 {
                     status = StepStatus::Failure;
-
-                    // For cargo commands, add more detailed error information
-                    if is_cargo_cmd {
-                        let mut error_msg = String::new();
-                        error_msg.push_str(&format!(
-                            "\nCargo command failed with exit code {}\n",
-                            container_output.exit_code
-                        ));
-                        error_msg.push_str("Common causes for cargo command failures:\n");
-
-                        if run.contains("fmt") {
-                            error_msg.push_str(
-                                "- Code formatting issues. Run 'cargo fmt' locally to fix.\n",
-                            );
-                        } else if run.contains("clippy") {
-                            error_msg.push_str("- Linter warnings treated as errors. Run 'cargo clippy' locally to see details.\n");
-                        } else if run.contains("test") {
-                            error_msg.push_str("- Test failures. Run 'cargo test' locally to see which tests failed.\n");
-                        } else if run.contains("build") {
-                            error_msg.push_str(
-                                "- Compilation errors. Check the error messages above.\n",
-                            );
-                        }
-
-                        error_details = Some(error_msg);
-                    }
                 }
             }
             Err(e) => {
                 status = StepStatus::Failure;
                 output.push_str(&format!("Error executing command: {}\n", e));
             }
-        }
-
-        // If there are error details, append them to the output
-        if let Some(details) = error_details {
-            output.push_str(&details);
         }
 
         let result = StepResult::new(step_name, status, output);

@@ -7,6 +7,7 @@ use std::path::PathBuf;
 mod cli_secrets;
 mod compare_cmd;
 mod gate_cmd;
+mod git;
 mod json_output;
 mod mcp_cmd;
 mod mcp_install;

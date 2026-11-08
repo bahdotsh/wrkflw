@@ -8,7 +8,7 @@
 //! Each disagreement is listed, with what wrkflw knows about why: a job run
 //! as another OS than `runs-on` asked for, or one killed for lack of memory.
 
-use crate::gate_cmd::git_line;
+use crate::git::line as git_line;
 use crate::{OutputFormat, RuntimeChoice};
 use serde_json::{json, Value};
 use std::collections::BTreeSet;

@@ -295,44 +295,6 @@ impl Event {
     }
 }
 
-/// One line of `git` output, or `None` when git fails or prints nothing.
-pub(crate) fn git_line(args: &[&str]) -> Option<String> {
-    let output = Command::new("git").args(args).output().ok()?;
-    let line = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    (output.status.success() && !line.is_empty()).then_some(line)
-}
-
-/// The branch checked out, or `None` on a detached HEAD.
-fn current_branch() -> Option<String> {
-    git_line(&["symbolic-ref", "--short", "-q", "HEAD"])
-}
-
-/// The branch pull requests go into: what `origin/HEAD` points at, else
-/// `main` or `master` if one exists here or on `origin`.
-fn default_branch() -> Option<String> {
-    if let Some(remote_head) =
-        git_line(&["symbolic-ref", "--short", "-q", "refs/remotes/origin/HEAD"])
-    {
-        return Some(
-            remote_head
-                .strip_prefix("origin/")
-                .unwrap_or(&remote_head)
-                .to_string(),
-        );
-    }
-    ["main", "master"]
-        .into_iter()
-        .map(str::to_string)
-        .find(|name| {
-            [
-                format!("refs/heads/{name}"),
-                format!("refs/remotes/origin/{name}"),
-            ]
-            .iter()
-            .any(|reference| git_line(&["rev-parse", "--verify", "-q", reference]).is_some())
-        })
-}
-
 /// What each workflow is checked as: the first event, then the second for a
 /// workflow the first doesn't fire.
 ///
@@ -638,8 +600,8 @@ pub(crate) fn run(ctx: GateCtx) {
     }
     let (first, second) = events(
         &ctx,
-        current_branch().as_deref(),
-        default_branch().as_deref(),
+        crate::git::current_branch().as_deref(),
+        crate::git::default_branch().as_deref(),
     );
     // Every workflow, and on a feature branch every workflow twice, runs in
     // a child. Ask the runtime about memory once here and warn once, rather

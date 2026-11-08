@@ -54,6 +54,7 @@ pub(crate) struct RunCtx {
     pub(crate) cache_push: bool,
     pub(crate) skip_exit_code: Option<i32>,
     pub(crate) nothing_checked_exit_code: Option<i32>,
+    pub(crate) partial_exit_code: Option<i32>,
     pub(crate) gate_mode: bool,
     pub(crate) stream_output: bool,
 }
@@ -318,16 +319,20 @@ pub(crate) async fn run(ctx: RunCtx) {
         }
     };
 
-    // A pass that ran no job, for a caller that tells it from a pass.
-    let nothing_checked_exit = ctx
-        .nothing_checked_exit_code
-        .filter(|_| result.failure_details.is_none() && verdict == "nothing_checked");
+    // A pass that ran no job, or ran some as another OS, for a caller that
+    // reads only the exit code and tells those from a full pass.
+    let verdict_exit = match verdict {
+        "nothing_checked" => ctx.nothing_checked_exit_code,
+        "partial" => ctx.partial_exit_code,
+        _ => None,
+    }
+    .filter(|_| result.failure_details.is_none());
 
     if format.is_json() {
         if result.failure_details.is_some() {
             std::process::exit(1);
         }
-        if let Some(code) = nothing_checked_exit {
+        if let Some(code) = verdict_exit {
             std::process::exit(code);
         }
         return;
@@ -472,7 +477,7 @@ pub(crate) async fn run(ctx: RunCtx) {
         }
     }
 
-    if let Some(code) = nothing_checked_exit {
+    if let Some(code) = verdict_exit {
         std::process::exit(code);
     }
 

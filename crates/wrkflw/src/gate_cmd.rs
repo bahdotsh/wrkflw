@@ -37,6 +37,16 @@ fn ran_nothing(code: Option<i32>) -> bool {
     matches!(code, Some(SKIPPED_EXIT | NOTHING_CHECKED_EXIT))
 }
 
+/// What the child exits with when it passed, but some job ran as another OS
+/// than `runs-on` asked for. A pass, but `partial`, as in JSON mode, where
+/// the verdict comes from `run_finished` instead.
+const PARTIAL_EXIT: i32 = 80;
+
+/// Whether a child's exit code says it passed, fully or not.
+fn passed(code: Option<i32>) -> bool {
+    matches!(code, Some(0 | PARTIAL_EXIT))
+}
+
 pub(crate) struct GateCtx {
     pub(crate) path: Option<PathBuf>,
     /// The event to check as, or `None` for a push with the pull request
@@ -343,6 +353,8 @@ fn run_args(ctx: &GateCtx, file: &Path, event: &Event) -> Vec<String> {
         SKIPPED_EXIT.to_string(),
         "--nothing-checked-exit-code".to_string(),
         NOTHING_CHECKED_EXIT.to_string(),
+        "--partial-exit-code".to_string(),
+        PARTIAL_EXIT.to_string(),
     ];
     if let Some(base) = &event.base_branch {
         args.extend(["--base-branch".to_string(), base.clone()]);
@@ -372,7 +384,7 @@ fn workflow_report(file: &Path, code: Option<i32>, stdout: &str) -> Value {
             fields.remove("type");
             fields.remove("schema_version");
         }
-        if code != Some(0) && !ran_nothing(code) && run["status"] == "success" {
+        if !passed(code) && !ran_nothing(code) && run["status"] == "success" {
             entry["status"] = json!("error");
             entry["error"] = json!(format!("wrkflw exited with {:?}", code));
         }
@@ -644,6 +656,16 @@ pub(crate) fn run(ctx: GateCtx) {
             .filter_map(Value::as_str)
             .collect();
         eprintln!("gate failed: {}", paths.join(", "));
+    } else if report["verdict"] == "partial" {
+        println!(
+            "{}",
+            cli_style::warning(&format!(
+                "gate passed, partially verified: {} workflow(s) ran, {} skipped. Some jobs \
+                 ran as another OS than runs-on asked for, so their OS-specific steps were \
+                 not checked",
+                report["ran"], report["skipped"]
+            ))
+        );
     } else if report["verdict"] != "nothing_checked" {
         println!(
             "gate passed: {} workflow(s) ran, {} skipped",
@@ -710,6 +732,7 @@ fn text_entry(file: &Path, code: Option<i32>) -> Value {
         Some(0) => json!({"status": "success"}),
         Some(SKIPPED_EXIT) => json!({"status": "skipped"}),
         Some(NOTHING_CHECKED_EXIT) => json!({"status": "success", "verdict": "nothing_checked"}),
+        Some(PARTIAL_EXIT) => json!({"status": "success", "verdict": "partial"}),
         _ => json!({"status": "failure", "error": format!("wrkflw exited with {code:?}")}),
     };
     entry["path"] = json!(file.display().to_string());
@@ -1121,6 +1144,43 @@ mod tests {
         );
         assert_eq!(probed_env("auto", None).as_deref(), Some("none"));
         assert_eq!(probed_env("emulation", Some(&memory)), None);
+    }
+
+    #[test]
+    fn text_mode_reaches_the_same_verdict_as_json() {
+        // Text mode reads only exit codes, so each verdict needs its own.
+        let args = run_args(&ctx(), Path::new("ci.yml"), &events(&ctx(), None, None).0);
+        assert!(args
+            .windows(2)
+            .any(|w| w == ["--partial-exit-code", PARTIAL_EXIT.to_string().as_str()]));
+
+        let partial = text_entry(Path::new("ci.yml"), Some(PARTIAL_EXIT));
+        let report = gate_report(vec![partial], &[]);
+        assert_eq!(report["verdict"], "partial", "{report}");
+        assert_eq!(report["passed"], true, "{report}");
+        assert_eq!(report["ran"], 1, "{report}");
+
+        let full = text_entry(Path::new("ci.yml"), Some(0));
+        assert_eq!(gate_report(vec![full], &[])["verdict"], "verified");
+        let idle = text_entry(Path::new("ci.yml"), Some(NOTHING_CHECKED_EXIT));
+        assert_eq!(gate_report(vec![idle], &[])["verdict"], "nothing_checked");
+        let broken = text_entry(Path::new("ci.yml"), Some(1));
+        assert_eq!(gate_report(vec![broken], &[])["verdict"], "failed");
+    }
+
+    #[test]
+    fn a_partial_exit_in_json_mode_is_a_pass_not_an_error() {
+        let entry = workflow_report(
+            Path::new("ci.yml"),
+            Some(PARTIAL_EXIT),
+            &finished(
+                "success",
+                "partial",
+                r#"[{"job":"b (os: windows-latest)"}]"#,
+            ),
+        );
+        assert_eq!(entry["status"], "success", "{entry}");
+        assert!(entry.get("error").is_none(), "{entry}");
     }
 
     #[test]

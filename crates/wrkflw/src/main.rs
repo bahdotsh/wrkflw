@@ -459,6 +459,12 @@ enum Commands {
         #[arg(long, hide = true, value_name = "CODE")]
         nothing_checked_exit_code: Option<i32>,
 
+        /// Exit with this code when the workflow passed but some job ran as
+        /// another OS than `runs-on` asked for, so `gate` can tell that from
+        /// a full pass
+        #[arg(long, hide = true, value_name = "CODE")]
+        partial_exit_code: Option<i32>,
+
         /// Run as `gate` does: skip jobs .wrkflw/affected.yml marks `gate: false`
         #[arg(long, hide = true)]
         gate_mode: bool,
@@ -1186,6 +1192,7 @@ async fn run_cli() {
             cache_push,
             skip_exit_code,
             nothing_checked_exit_code,
+            partial_exit_code,
             gate_mode,
         }) => {
             run_workflow_cmd::run(run_workflow_cmd::RunCtx {
@@ -1222,6 +1229,7 @@ async fn run_cli() {
                 cache_push: *cache_push,
                 skip_exit_code: *skip_exit_code,
                 nothing_checked_exit_code: *nothing_checked_exit_code,
+                partial_exit_code: *partial_exit_code,
                 gate_mode: *gate_mode,
                 stream_output: *stream_output,
             })

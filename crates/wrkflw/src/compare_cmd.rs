@@ -48,13 +48,39 @@ impl ExpectedJob {
             .and_then(|rest| rest.strip_prefix(" ("))
             .and_then(|rest| rest.strip_suffix(')'))
             .is_some_and(|inner| {
-                inner
-                    .split(", ")
-                    .map(str::to_string)
-                    .collect::<BTreeSet<_>>()
-                    == *values
+                let values: Vec<&str> = values.iter().map(String::as_str).collect();
+                is_joined_in_some_order(inner, &values)
             })
     }
+}
+
+/// Whether `text` is every one of `values` joined by `, `, in any order.
+///
+/// GitHub lists a leg's values in the matrix's own key order, which the
+/// parsed matrix doesn't keep, so every order is tried. Splitting `text` on
+/// `, ` instead would break on a value that itself holds one, such as
+/// `features: "serde, std"`.
+fn is_joined_in_some_order(text: &str, values: &[&str]) -> bool {
+    if values.is_empty() {
+        return text.is_empty();
+    }
+    values.iter().enumerate().any(|(i, value)| {
+        let Some(rest) = text.strip_prefix(value) else {
+            return false;
+        };
+        let others: Vec<&str> = values
+            .iter()
+            .enumerate()
+            .filter(|(j, _)| *j != i)
+            .map(|(_, other)| *other)
+            .collect();
+        if others.is_empty() {
+            rest.is_empty()
+        } else {
+            rest.strip_prefix(", ")
+                .is_some_and(|rest| is_joined_in_some_order(rest, &others))
+        }
+    })
 }
 
 /// A matrix value as GitHub prints it in a job name.
@@ -211,6 +237,12 @@ fn rows(
     failures: &[Value],
 ) -> Vec<Row> {
     let mut used = vec![false; remote.len()];
+    // How many expected jobs each GitHub name fits. Above one, pairing is by
+    // order alone, and results may belong to another leg.
+    let fits: Vec<usize> = remote
+        .iter()
+        .map(|r| expected.iter().filter(|job| job.matches(&r.name)).count())
+        .collect();
     let mut rows = Vec::new();
     for job in expected {
         let local_job = local.iter().find(|l| l["name"] == job.local.as_str());
@@ -233,7 +265,12 @@ fn rows(
             github: github_conclusion.map(str::to_string),
             local: local_status.map(str::to_string),
             agree: agree(github_conclusion, local_status),
-            note: local_job.and_then(|l| note_for(l, failures)),
+            note: join_notes(
+                found
+                    .filter(|(i, _)| fits[*i] > 1)
+                    .map(|(i, r)| ambiguous_note(&r.name, fits[i])),
+                local_job.and_then(|l| note_for(l, failures)),
+            ),
         });
     }
     for (i, remote_job) in remote.iter().enumerate() {
@@ -253,6 +290,22 @@ fn rows(
         }
     }
     rows
+}
+
+/// The note for a pairing made by order, because `count` local jobs fit
+/// the same GitHub name.
+fn ambiguous_note(name: &str, count: usize) -> String {
+    format!(
+        "{count} local jobs fit the GitHub name \"{name}\", so they were paired in order \
+         and this result may belong to another of them"
+    )
+}
+
+fn join_notes(first: Option<String>, second: Option<String>) -> Option<String> {
+    match (first, second) {
+        (Some(a), Some(b)) => Some(format!("{a}; {b}")),
+        (a, b) => a.or(b),
+    }
 }
 
 fn git_line(args: &[&str]) -> Option<String> {
@@ -725,6 +778,48 @@ mod tests {
             .find(|e| e.local == "build (os: b)")
             .unwrap();
         assert!(leg.matches("Build the matrix (b)"));
+    }
+
+    #[test]
+    fn appended_values_match_in_any_order_even_with_commas_inside() {
+        assert!(is_joined_in_some_order("a, b", &["b", "a"]));
+        assert!(is_joined_in_some_order(
+            "serde, std, linux",
+            &["linux", "serde, std"]
+        ));
+        assert!(!is_joined_in_some_order("serde, std", &["serde", "linux"]));
+        assert!(!is_joined_in_some_order("a, b, c", &["a", "b"]));
+        assert!(is_joined_in_some_order("", &[]));
+
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: CI\non: push\njobs:\n  test:\n    runs-on: ubuntu-latest\n    strategy:\n      matrix:\n        features: ['serde, std', none]\n    steps:\n      - run: make\n";
+        let expected = expected_jobs(&write(dir.path(), yaml)).unwrap();
+        let leg = expected
+            .iter()
+            .find(|e| e.local == "test (features: serde, std)")
+            .unwrap();
+        assert!(leg.matches("test (serde, std)"));
+    }
+
+    #[test]
+    fn a_name_two_legs_share_is_paired_with_a_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: CI\non: push\njobs:\n  build:\n    name: Build ${{ matrix.os }}\n    runs-on: ubuntu-latest\n    strategy:\n      matrix:\n        os: [linux]\n        rust: [stable, beta]\n    steps:\n      - run: make\n";
+        let expected = expected_jobs(&write(dir.path(), yaml)).unwrap();
+        let github = vec![
+            remote("Build linux", "success"),
+            remote("Build linux", "failure"),
+        ];
+        let local = vec![
+            json!({"name": "build (os: linux, rust: beta)", "status": "success"}),
+            json!({"name": "build (os: linux, rust: stable)", "status": "success"}),
+        ];
+        let rows = rows(&expected, &github, &local, &[]);
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        for row in &rows {
+            let note = row.note.as_deref().unwrap_or_default();
+            assert!(note.contains("paired in order"), "{row:?}");
+        }
     }
 
     #[test]

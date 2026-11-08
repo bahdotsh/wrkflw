@@ -111,14 +111,26 @@ pub struct Memory {
 
 impl Memory {
     /// Jobs that may run at once, or `None` for no limit.
+    ///
+    /// Only a VM is limited. Its memory is a hard cap without swap, so a
+    /// linker that outgrows it is killed. A Linux host's own memory usually
+    /// has swap and other tenants, and `bytes / 4 GB` would serialise an
+    /// 8 GB machine's runs for a risk it may not have. It is warned about,
+    /// and [`MAX_PARALLEL_JOBS_ENV`] limits it on request.
     pub fn limit(&self) -> Option<usize> {
-        limit_for(self.bytes)
+        if self.in_vm {
+            limit_for(self.bytes)
+        } else {
+            None
+        }
     }
 
     /// The warning for a runtime short of a runner's memory, or `None`.
     pub fn warning(&self) -> Option<String> {
-        let own = self.limit()?;
-        Some(warning(self, env_limit().unwrap_or(own)))
+        if self.bytes >= WARN_BELOW_BYTES {
+            return None;
+        }
+        Some(warning(self, env_limit().or(self.limit())))
     }
 
     /// As [`PROBED_ENV`] carries it: `docker:8217751552:vm`.
@@ -141,8 +153,9 @@ impl Memory {
 /// asking the runtime again. `none` when the probe found nothing.
 pub const PROBED_ENV: &str = "WRKFLW_PROBED_MEMORY";
 
-/// The warning for `memory`, running `limit` jobs at once.
-fn warning(memory: &Memory, limit: usize) -> String {
+/// The warning for `memory`, running at most `limit` jobs at once, or as
+/// many as the run has when `None`.
+fn warning(memory: &Memory, limit: Option<usize>) -> String {
     let runtime = if memory.cli == "podman" {
         "Podman"
     } else {
@@ -159,10 +172,18 @@ fn warning(memory: &Memory, limit: usize) -> String {
             "Free memory, or run on a machine with more".to_string(),
         )
     };
+    let running = match limit {
+        Some(limit) => format!(
+            "Running at most {limit} job(s) at a time. {way_out}, or set {MAX_PARALLEL_JOBS_ENV}"
+        ),
+        None => format!(
+            "Jobs run side by side as on GitHub. {way_out}, or set {MAX_PARALLEL_JOBS_ENV} to \
+             run fewer at once"
+        ),
+    };
     format!(
         "{subject} has {} of memory, and GitHub's Linux runners have {}. A job that needs more, \
-         such as linking large test binaries, can be killed here and pass on GitHub. Running at \
-         most {limit} job(s) at a time. {way_out}, or set {MAX_PARALLEL_JOBS_ENV}",
+         such as linking large test binaries, can be killed here and pass on GitHub. {running}",
         gigabytes(memory.bytes),
         gigabytes(GITHUB_RUNNER_BYTES),
     )
@@ -309,7 +330,7 @@ mod tests {
 
     #[test]
     fn the_warning_names_both_sizes_and_the_way_out() {
-        let text = warning(&memory(8_217_751_552, true), 1);
+        let text = warning(&memory(8_217_751_552, true), Some(1));
         assert!(text.contains("7.7 GB"), "{text}");
         assert!(text.contains("16.0 GB"), "{text}");
         assert!(text.contains("Give the Docker VM more memory"), "{text}");
@@ -320,9 +341,10 @@ mod tests {
     fn native_linux_is_not_told_to_resize_a_vm() {
         let native = parse_info("docker", "8217751552|Ubuntu 24.04 LTS", true).unwrap();
         assert!(!native.in_vm);
-        let text = warning(&native, 1);
+        let text = warning(&native, None);
         assert!(text.starts_with("This machine has"), "{text}");
         assert!(!text.contains("VM"), "{text}");
+        assert!(text.contains("side by side"), "{text}");
 
         let desktop = parse_info("docker", "8217751552|Docker Desktop", true).unwrap();
         assert!(desktop.in_vm);
@@ -330,6 +352,16 @@ mod tests {
         assert!(mac.in_vm);
         assert_eq!(parse_info("docker", "|Docker Desktop", false), None);
         assert_eq!(parse_info("docker", "0|x", false), None);
+    }
+
+    #[test]
+    fn only_a_vm_is_limited_but_both_are_warned_about() {
+        // Native Linux keeps swap and shares memory with nothing else that
+        // GitHub's runner lacks, so its runs keep their parallelism.
+        assert_eq!(memory(8_217_751_552, false).limit(), None);
+        assert_eq!(memory(8_217_751_552, true).limit(), Some(1));
+        assert!(memory(8_217_751_552, false).warning().is_some());
+        assert_eq!(memory(GITHUB_RUNNER_BYTES, false).warning(), None);
     }
 
     #[test]

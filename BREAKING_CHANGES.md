@@ -20,7 +20,7 @@ An `include` entry is now added to every original combination whose matrix value
 
 ## Docker and Podman runs limit parallel jobs on a small VM (unreleased)
 
-When the VM has less than 14 GB of memory, a run warns and runs at most one job or matrix leg per 4 GB at a time, counting every job of the run together. Runs can take longer there. Set `WRKFLW_MAX_PARALLEL_JOBS` to choose the limit.
+When the Docker Desktop or Podman VM has less than 14 GB of memory, a run warns and runs at most one job or matrix leg per 4 GB at a time, counting every job of the run together. Runs can take longer there. A Docker or Podman daemon on Linux without a VM is warned about but keeps its parallelism. Set `WRKFLW_MAX_PARALLEL_JOBS` to choose the limit on either.
 
 ## Smaller schema changes (unreleased)
 

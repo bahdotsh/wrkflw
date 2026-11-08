@@ -1104,6 +1104,26 @@ mod tests {
     }
 
     #[test]
+    fn the_probe_reaches_children_once() {
+        // A parent's probe (or `none`) is what each child reads. A runtime
+        // without a VM leaves the variable unset.
+        if std::env::var_os(vm_memory::PROBED_ENV).is_some() {
+            return;
+        }
+        let memory = vm_memory::Memory {
+            cli: "docker".to_string(),
+            bytes: 8_217_751_552,
+            in_vm: true,
+        };
+        assert_eq!(
+            probed_env("docker", Some(&memory)).as_deref(),
+            Some("docker:8217751552:vm")
+        );
+        assert_eq!(probed_env("auto", None).as_deref(), Some("none"));
+        assert_eq!(probed_env("emulation", Some(&memory)), None);
+    }
+
+    #[test]
     fn an_explicit_event_is_the_only_one_checked() {
         let explicit = GateCtx {
             event: Some("pull_request".to_string()),

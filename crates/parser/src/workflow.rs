@@ -740,6 +740,28 @@ jobs:
     }
 
     #[test]
+    fn a_timeout_is_a_number_or_an_expression_and_nothing_else() {
+        // GitHub's schema takes a number or a `${{ }}` string. A quoted
+        // number or plain text fails validation, as it does on GitHub.
+        let temp_dir = tempdir().unwrap();
+        let workflow_path = temp_dir.path().join("w.yml");
+        let yaml = |timeout: &str| {
+            format!(
+                "name: t\non: push\njobs:\n  t:\n    runs-on: ubuntu-latest\n    timeout-minutes: {timeout}\n    steps:\n      - run: echo hi\n"
+            )
+        };
+        std::fs::write(&workflow_path, yaml("30")).unwrap();
+        let workflow = parse_workflow(&workflow_path).unwrap();
+        assert_eq!(workflow.jobs["t"].timeout_minutes, Some(30.0));
+
+        std::fs::write(&workflow_path, yaml("\"30\"")).unwrap();
+        assert!(parse_workflow(&workflow_path).is_err());
+
+        std::fs::write(&workflow_path, yaml("soon")).unwrap();
+        assert!(parse_workflow(&workflow_path).is_err());
+    }
+
+    #[test]
     fn a_workflow_without_a_name_is_named_by_its_path() {
         let temp_dir = tempdir().unwrap();
         let dir = temp_dir.path().join(".github/workflows");

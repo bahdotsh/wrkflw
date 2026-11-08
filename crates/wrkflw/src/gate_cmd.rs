@@ -17,6 +17,7 @@ use crate::{is_gitlab_pipeline, OutputFormat, RuntimeChoice};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use wrkflw_executor::vm_memory;
 use wrkflw_runs::SCHEMA_VERSION;
 use wrkflw_ui::cli_style;
 
@@ -517,6 +518,60 @@ fn nothing_checked_warning(first: &Event, second: Option<&Event>) -> String {
     )
 }
 
+/// The memory of the runtime the children will use: `runtime` as passed to
+/// them, with `auto` resolved as a run resolves it, Docker before Podman.
+/// `None` for a runtime without a container VM, or one that didn't answer.
+fn probe_memory(runtime: &str) -> Option<vm_memory::Memory> {
+    if std::env::var_os(vm_memory::PROBED_ENV).is_some() {
+        return None;
+    }
+    match runtime {
+        "docker" | "podman" => vm_memory::probe(runtime),
+        "auto" => vm_memory::probe("docker").or_else(|| vm_memory::probe("podman")),
+        _ => None,
+    }
+}
+
+/// What children get in [`vm_memory::PROBED_ENV`]: the probe, or `none`
+/// when it found nothing. `None` leaves the variable alone: a runtime
+/// without a VM never reads it, and a parent's value is passed on as is.
+fn probed_env(runtime: &str, memory: Option<&vm_memory::Memory>) -> Option<String> {
+    if std::env::var_os(vm_memory::PROBED_ENV).is_some()
+        || !matches!(runtime, "docker" | "podman" | "auto")
+    {
+        return None;
+    }
+    Some(memory.map_or_else(|| "none".to_string(), vm_memory::Memory::to_env))
+}
+
+/// How the gate starts each child `wrkflw run`.
+struct Launcher<'a> {
+    program: &'a Path,
+    runtime: &'a str,
+    /// The runtime's memory, probed once by the gate, for
+    /// [`vm_memory::PROBED_ENV`].
+    probed: Option<&'a str>,
+}
+
+impl Launcher<'_> {
+    /// The child that checks `file` as `event`, printing JSON when `json`.
+    fn command(&self, ctx: &GateCtx, file: &Path, event: &Event, json: bool) -> Command {
+        let mut child = Command::new(self.program);
+        if json {
+            child.args(["--format", "json"]);
+        }
+        child
+            .args(run_args(ctx, file, event))
+            .args(["--runtime", self.runtime]);
+        crate::cli_secrets::pass_to(&mut child);
+        if let Some(value) = self.probed {
+            // Used instead of probing the runtime again.
+            child.env(vm_memory::PROBED_ENV, value);
+        }
+        child
+    }
+}
+
 /// Run the gate. Exits 1 when a workflow fails or can't be run.
 pub(crate) fn run(ctx: GateCtx) {
     let program = std::env::current_exe().unwrap_or_else(|e| {
@@ -553,12 +608,24 @@ pub(crate) fn run(ctx: GateCtx) {
         current_branch().as_deref(),
         default_branch().as_deref(),
     );
+    // Every workflow, and on a feature branch every workflow twice, runs in
+    // a child. Ask the runtime about memory once here and warn once, rather
+    // than in each child.
+    let memory = probe_memory(runtime);
+    if let Some(warning) = memory.as_ref().and_then(vm_memory::Memory::warning) {
+        eprintln!("{}", cli_style::warning(&warning));
+    }
+    let probed = probed_env(runtime, memory.as_ref());
+    let launcher = Launcher {
+        program: &program,
+        runtime,
+        probed: probed.as_deref(),
+    };
     if ctx.format == OutputFormat::Json {
         run_json(
             &ctx,
-            &program,
+            &launcher,
             &files,
-            runtime,
             &uncommitted,
             &first,
             second.as_ref(),
@@ -569,12 +636,11 @@ pub(crate) fn run(ctx: GateCtx) {
     let mut failed = Vec::new();
     let mut skipped = 0;
     let run_child = |file: &Path, event: &Event| {
-        let mut child = Command::new(&program);
-        child
-            .args(run_args(&ctx, file, event))
-            .args(["--runtime", runtime]);
-        crate::cli_secrets::pass_to(&mut child);
-        child.status().ok().and_then(|status| status.code())
+        launcher
+            .command(&ctx, file, event, false)
+            .status()
+            .ok()
+            .and_then(|status| status.code())
     };
     for file in &files {
         println!(
@@ -620,22 +686,15 @@ pub(crate) fn run(ctx: GateCtx) {
 /// it passed. Each child's logs still reach stderr.
 fn run_json(
     ctx: &GateCtx,
-    program: &Path,
+    launcher: &Launcher,
     files: &[PathBuf],
-    runtime: &str,
     uncommitted: &[String],
     first: &Event,
     second: Option<&Event>,
 ) -> ! {
     let check = |file: &Path, event: &Event| -> Value {
-        let mut child = Command::new(program);
-        child
-            .args(["--format", "json"])
-            .args(run_args(ctx, file, event))
-            .args(["--runtime", runtime])
-            .stdin(Stdio::null())
-            .stderr(Stdio::inherit());
-        crate::cli_secrets::pass_to(&mut child);
+        let mut child = launcher.command(ctx, file, event, true);
+        child.stdin(Stdio::null()).stderr(Stdio::inherit());
         let mut entry = match child.output() {
             Ok(output) => workflow_report(
                 file,

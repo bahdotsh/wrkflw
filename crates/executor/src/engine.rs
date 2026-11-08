@@ -130,6 +130,7 @@ async fn execute_github_workflow(
         &config.kubernetes,
     )?;
     config.runtime_type = effective_runtime;
+    crate::vm_memory::check(vm_cli(&config.runtime_type)).await;
     warn_if_overrides_unused(&config);
 
     // Create a temporary workspace directory
@@ -397,6 +398,7 @@ async fn execute_gitlab_pipeline(
         &config.kubernetes,
     )?;
     config.runtime_type = effective_runtime;
+    crate::vm_memory::check(vm_cli(&config.runtime_type)).await;
     warn_if_overrides_unused(&config);
 
     // Create a temporary workspace directory
@@ -953,6 +955,15 @@ fn emulation_runtime() -> (Box<dyn ContainerRuntime>, RuntimeType) {
     )
 }
 
+/// The CLI whose VM a run's jobs share memory in, for [`crate::vm_memory`].
+fn vm_cli(runtime: &RuntimeType) -> Option<&'static str> {
+    match runtime {
+        RuntimeType::Docker => Some("docker"),
+        RuntimeType::Podman => Some("podman"),
+        _ => None,
+    }
+}
+
 /// Set up the runtime to run on. `Auto` falls back to emulation when no
 /// container runtime answers. An explicit Docker or Podman request never
 /// does: emulation runs steps on this machine, which is not what someone who
@@ -977,7 +988,6 @@ fn initialize_runtime(
                 ));
             }
             docker::forget_pulled_images();
-            crate::vm_memory::check("docker");
             match docker::DockerRuntime::new_with_config(preserve_containers_on_failure) {
                 Ok(docker_runtime) => Ok((Box::new(docker_runtime), RuntimeType::Docker)),
                 Err(e) => Err(ExecutionError::Runtime(format!(
@@ -994,7 +1004,6 @@ fn initialize_runtime(
                         .to_string(),
                 ));
             }
-            crate::vm_memory::check("podman");
             Ok((
                 Box::new(podman::PodmanRuntime::new_unchecked(
                     preserve_containers_on_failure,

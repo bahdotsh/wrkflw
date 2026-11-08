@@ -679,11 +679,13 @@ fn run_finished_json(record: &RunRecord, digest: Option<&FailureDigest>) -> Valu
 /// - `nothing_checked`: it passed because no job ran, all skipped by `if:`,
 ///   `needs` or `gate: false`.
 ///
+/// A job that failed under `continue-on-error` ran, so it counts as checked.
+///
 /// Anything else is the status: `failed`, `error`, `skipped`, `interrupted`.
 pub fn verdict(record: &RunRecord) -> &'static str {
     match record.status {
         RunStatus::Success => {
-            if !record.jobs.iter().any(|job| job.status == "success") {
+            if !record.jobs.iter().any(job_ran) {
                 "nothing_checked"
             } else if !unverified(record).is_empty() {
                 "partial"
@@ -696,6 +698,12 @@ pub fn verdict(record: &RunRecord) -> &'static str {
         RunStatus::Interrupted => "interrupted",
         RunStatus::Error | RunStatus::Running => "error",
     }
+}
+
+/// Whether `job` ran steps of its own: it passed, or failed under
+/// `continue-on-error`. A skipped job ran nothing.
+fn job_ran(job: &JobRecord) -> bool {
+    job.status == "success" || (job.status == "failure" && job.failure_allowed)
 }
 
 /// Jobs whose result can't stand for GitHub's, because they ran as another
@@ -1139,5 +1147,14 @@ mod tests {
         assert_eq!(verdict(&record), "partial");
         record.status = RunStatus::Failure;
         assert_eq!(verdict(&record), "failed");
+
+        // A job that failed under continue-on-error ran, though the run passed.
+        record.status = RunStatus::Success;
+        let mut allowed = job("failure", None);
+        allowed.failure_allowed = true;
+        record.jobs = vec![job("skipped", None), allowed];
+        assert_eq!(verdict(&record), "verified");
+        record.jobs[1].failure_allowed = false;
+        assert_eq!(verdict(&record), "nothing_checked");
     }
 }

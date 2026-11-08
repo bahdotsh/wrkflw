@@ -111,14 +111,41 @@ pub struct FailureCause {
     pub hint: String,
 }
 
+/// A line that reports something passing, such as `test oom_is_handled ...
+/// ok`: a word like `out of memory` in it names a test, not a failure.
+static PASSING: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"(?i)\.\.\.\s*ok\s*$|\bPASS(ED)?\b|^\s*(ok|✓|✔)\b").unwrap()
+});
+
+/// The lines a cause may be read from: what the step printed, in the last
+/// `tail_lines` or among the error lines above them, without lines that
+/// report a pass. These are the lines the digest shows as the failure, so a
+/// test named after memory that passed earlier in the log isn't evidence.
+fn cause_lines(text: &str, tail_lines: usize) -> Vec<String> {
+    let all: Vec<&str> = text.lines().collect();
+    let start = output_start(&all);
+    let tail_start = all.len().saturating_sub(tail_lines).max(start);
+    all[start..]
+        .iter()
+        .enumerate()
+        .map(|(i, line)| (start + i, strip_ansi(line)))
+        .filter(|(at, line)| {
+            !is_output_header(line)
+                && !PASSING.is_match(line)
+                && (*at >= tail_start || is_error_line(line))
+        })
+        .map(|(_, line)| line)
+        .collect()
+}
+
 /// The cause `text` and `exit_code` point to, if it may not be the code.
 ///
 /// Only output that names memory makes it `out_of_memory`. A SIGKILL alone,
 /// from `signal 9`, `Killed` or exit code 137, is `killed`: memory is the
 /// likely reason in a container VM, but not the only one, so the hint says
-/// what to rule out before blaming the machine.
-fn failure_cause(text: &str, exit_code: Option<i32>) -> Option<FailureCause> {
-    let lines: Vec<String> = text.lines().map(strip_ansi).collect();
+/// what to rule out before blaming the machine. Only [`cause_lines`] count.
+fn failure_cause(text: &str, exit_code: Option<i32>, tail_lines: usize) -> Option<FailureCause> {
+    let lines = cause_lines(text, tail_lines);
     if let Some(line) = lines.iter().find(|line| OUT_OF_MEMORY.is_match(line)) {
         return Some(FailureCause {
             kind: "out_of_memory",
@@ -339,7 +366,7 @@ fn failed_step(
             output_lines,
             env_from_earlier_steps: Vec::new(),
             log_path: job.log.as_deref().map(log_path),
-            cause: failure_cause(&text, None),
+            cause: failure_cause(&text, None, tail_lines),
         };
     };
     let text = read(&step.log);
@@ -364,7 +391,7 @@ fn failed_step(
         output_lines,
         env_from_earlier_steps: env,
         log_path: step.log.as_deref().map(log_path),
-        cause: failure_cause(&text, step.exit_code),
+        cause: failure_cause(&text, step.exit_code, tail_lines),
     }
 }
 
@@ -571,30 +598,58 @@ mod tests {
     fn a_linker_killed_for_memory_is_named_as_the_cause() {
         let text = "Standard Error:\n  = note: collect2: fatal error: ld terminated with signal 9 [Killed]\n\
                     error: could not compile `wrkflw`\n";
-        let cause = failure_cause(text, Some(101)).unwrap();
+        let cause = failure_cause(text, Some(101), 40).unwrap();
         assert_eq!(cause.kind, "killed");
         assert!(cause.evidence.contains("signal 9"), "{}", cause.evidence);
         assert!(cause.hint.contains("memory"), "{}", cause.hint);
         assert_eq!(
-            failure_cause("Killed\n", Some(137)).unwrap().evidence,
+            failure_cause("Killed\n", Some(137), 40).unwrap().evidence,
             "Killed"
         );
         let oom = failure_cause(
             "memory allocation of 1048576 bytes failed\nKilled\n",
             Some(137),
+            40,
         )
         .unwrap();
         assert_eq!(oom.kind, "out_of_memory");
         assert_eq!(oom.evidence, "memory allocation of 1048576 bytes failed");
         assert_eq!(
-            failure_cause("test killed_by_timeout ... FAILED\n", Some(101)),
+            failure_cause("test killed_by_timeout ... FAILED\n", Some(101), 40),
             None
         );
     }
 
     #[test]
+    fn a_passing_test_named_after_memory_is_not_the_cause() {
+        // The memory test passed long before the real failure, and a
+        // passing line in the tail isn't evidence either.
+        let mut text = String::from("Standard Output:\n");
+        text.push_str("test alloc::handles_out_of_memory ... ok\n");
+        text.push_str("test sigkill_child_is_reaped ... ok\n");
+        for i in 0..50 {
+            text.push_str(&format!("test case_{i} ... ok\n"));
+        }
+        text.push_str("test parse::rejects_bad_input ... FAILED\n");
+        text.push_str("test oom_guard ... ok\n");
+        text.push_str("error: test failed, to rerun pass `--lib`\n");
+        assert_eq!(failure_cause(&text, Some(101), 40), None);
+
+        // Evidence above the tail still counts when it is an error line.
+        let mut linker = String::from("Standard Error:\n");
+        linker.push_str("collect2: fatal error: ld terminated with signal 9 [Killed]\n");
+        for i in 0..50 {
+            linker.push_str(&format!("note: line {i}\n"));
+        }
+        assert_eq!(
+            failure_cause(&linker, Some(101), 40).map(|c| c.kind),
+            Some("killed")
+        );
+    }
+
+    #[test]
     fn a_bare_exit_137_is_a_kill_not_a_memory_diagnosis() {
-        let cause = failure_cause("Standard Output:\nrunning\n", Some(137)).unwrap();
+        let cause = failure_cause("Standard Output:\nrunning\n", Some(137), 40).unwrap();
         assert_eq!(cause.kind, "killed");
         assert_eq!(cause.evidence, "exit code 137");
         assert!(
@@ -602,7 +657,7 @@ mod tests {
             "{}",
             cause.hint
         );
-        assert_eq!(failure_cause("", Some(1)), None);
+        assert_eq!(failure_cause("", Some(1), 40), None);
     }
 
     fn job_json(name: &str, repeated_from: Option<&str>) -> serde_json::Value {

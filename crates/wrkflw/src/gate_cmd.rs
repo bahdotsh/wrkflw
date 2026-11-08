@@ -462,10 +462,9 @@ fn gate_report(workflows: Vec<Value>, uncommitted: &[String]) -> Value {
         .filter(|w| w["status"] != "success" && w["status"] != "skipped")
         .map(|w| &w["path"])
         .collect();
-    let skipped = workflows
-        .iter()
-        .filter(|w| w["status"] == "skipped")
-        .count();
+    // As in text mode: a workflow that ran no job, because it didn't fire
+    // or every job was skipped, counts as skipped, not as ran.
+    let skipped = workflows.iter().filter(|w| checked_nothing(w)).count();
     let unverified: Vec<Value> = workflows
         .iter()
         .flat_map(|w| {
@@ -1037,6 +1036,8 @@ mod tests {
         let report = gate_report(vec![all_jobs_skipped], &[]);
         assert_eq!(report["verdict"], "nothing_checked");
         assert_eq!(report["passed"], false);
+        assert_eq!(report["ran"], 0, "{report}");
+        assert_eq!(report["skipped"], 1, "{report}");
     }
 
     #[test]

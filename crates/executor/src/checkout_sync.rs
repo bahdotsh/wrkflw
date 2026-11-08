@@ -1460,6 +1460,47 @@ mod tests {
         );
     }
 
+    /// A submodule, or `git init --separate-git-dir`, has a `.git` file
+    /// pointing at git data with no `commondir`: its own data is all of it.
+    #[test]
+    fn a_git_file_without_a_commondir_is_mirrored_as_the_repository() {
+        let src = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let separate = data.path().join("modules/sub");
+        if !git(
+            src.path(),
+            &[
+                "init",
+                "-q",
+                "--separate-git-dir",
+                separate.to_str().unwrap(),
+            ],
+        ) {
+            return;
+        }
+        std::fs::write(src.path().join("a.txt"), "a").unwrap();
+        assert!(git(src.path(), &["add", "."]));
+        assert!(git(src.path(), &["commit", "-q", "-m", "one"]));
+        assert!(git(src.path(), &["checkout", "-q", "-b", "topic"]));
+        assert!(src.path().join(".git").is_file());
+        assert!(!separate.join("commondir").exists());
+        let dirs = git_dirs(src.path()).unwrap();
+        assert_eq!(dirs.own, dirs.common);
+        let dst = tempfile::tempdir().unwrap();
+
+        copy_directory_contents(src.path(), dst.path()).unwrap();
+
+        assert!(dst.path().join(".git").is_dir());
+        assert_eq!(
+            git_out(dst.path(), &["rev-parse", "--abbrev-ref", "HEAD"]).as_deref(),
+            Some("topic")
+        );
+        assert_eq!(
+            git_out(dst.path(), &["status", "--porcelain"]).as_deref(),
+            Some("")
+        );
+    }
+
     #[test]
     fn a_git_file_pointing_nowhere_leaves_no_repository() {
         let src = tempfile::tempdir().unwrap();

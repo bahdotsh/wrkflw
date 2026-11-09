@@ -138,6 +138,9 @@ pub struct Defaults {
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct WorkflowDefinition {
+    /// The workflow's `name:`, or its path when it has none, as GitHub
+    /// shows it and sets `github.workflow`.
+    #[serde(default)]
     pub name: String,
     #[serde(skip, default)] // Skip deserialization of the 'on' field directly
     pub on: Vec<String>,
@@ -198,6 +201,30 @@ where
     }
 }
 
+/// `timeout-minutes` is a number, or an expression such as
+/// `${{ github.repository == 'o/r' && 40 || 240 }}`. An expression needs the
+/// run's context to evaluate, so it parses as no timeout, which runs under the
+/// default one, rather than failing the whole workflow.
+fn deserialize_timeout_minutes<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    match Option::<serde_yaml::Value>::deserialize(deserializer)? {
+        None => Ok(None),
+        Some(serde_yaml::Value::Number(n)) => Ok(n.as_f64()),
+        Some(serde_yaml::Value::String(text)) => match text.trim().parse::<f64>() {
+            Ok(minutes) => Ok(Some(minutes)),
+            Err(_) if text.contains("${{") => Ok(None),
+            Err(_) => Err(serde::de::Error::custom(format!(
+                "expected a number of minutes or an expression, got {text:?}"
+            ))),
+        },
+        Some(other) => Err(serde::de::Error::custom(format!(
+            "expected a number of minutes or an expression, got {other:?}"
+        ))),
+    }
+}
+
 /// The inverse of [`deserialize_bool_or_expression`]: `true` and `false` are
 /// written as booleans, since GitHub rejects a quoted `"true"` here.
 fn serialize_bool_or_expression<S>(value: &Option<String>, serializer: S) -> Result<S::Ok, S::Error>
@@ -254,7 +281,11 @@ pub struct Job {
     pub with: Option<HashMap<String, String>>,
     #[serde(default)]
     pub secrets: Option<serde_yaml::Value>,
-    #[serde(default, rename = "timeout-minutes")]
+    #[serde(
+        default,
+        rename = "timeout-minutes",
+        deserialize_with = "deserialize_timeout_minutes"
+    )]
     pub timeout_minutes: Option<f64>,
     #[serde(default)]
     pub defaults: Option<Defaults>,
@@ -334,7 +365,11 @@ pub struct Step {
     pub working_directory: Option<String>,
     #[serde(default)]
     pub shell: Option<String>,
-    #[serde(default, rename = "timeout-minutes")]
+    #[serde(
+        default,
+        rename = "timeout-minutes",
+        deserialize_with = "deserialize_timeout_minutes"
+    )]
     pub timeout_minutes: Option<f64>,
 }
 
@@ -444,8 +479,28 @@ pub fn parse_workflow(path: &Path) -> Result<WorkflowDefinition, String> {
 
     // Normalize the trigger events
     workflow.on = normalize_triggers(&workflow.on_raw)?;
+    if workflow.name.trim().is_empty() {
+        workflow.name = name_from_path(path);
+    }
 
     Ok(workflow)
+}
+
+/// What GitHub calls a workflow without `name:`: its path in the repository,
+/// such as `.github/workflows/ci.yml`. A path outside a workflows directory
+/// is kept as given.
+fn name_from_path(path: &Path) -> String {
+    let text = path.to_string_lossy().replace('\\', "/");
+    for dir in [
+        ".github/workflows/",
+        ".gitea/workflows/",
+        ".forgejo/workflows/",
+    ] {
+        if let Some(at) = text.rfind(dir) {
+            return text[at..].to_string();
+        }
+    }
+    text
 }
 
 fn normalize_triggers(on_value: &serde_yaml::Value) -> Result<Vec<String>, String> {
@@ -628,6 +683,106 @@ mod tests {
         assert_eq!(info.repository, "github/codeql-action");
         assert_eq!(info.version, "v3");
         assert_eq!(info.sub_path.as_deref(), Some("init"));
+    }
+
+    #[test]
+    fn a_strategy_without_a_matrix_is_valid() {
+        // psf/requests runs jobs like this on GitHub.
+        let temp_dir = tempdir().unwrap();
+        let workflow_path = temp_dir.path().join("w.yml");
+        std::fs::write(
+            &workflow_path,
+            "name: t\non: push\njobs:\n  t:\n    runs-on: ubuntu-latest\n    strategy:\n      fail-fast: false\n    steps:\n      - run: echo hi\n",
+        )
+        .unwrap();
+
+        let workflow = parse_workflow(&workflow_path).unwrap();
+
+        assert!(workflow.jobs["t"].matrix_config().is_none());
+    }
+
+    #[test]
+    fn newer_github_syntax_seen_in_public_repositories_parses() {
+        // Each line comes from a workflow GitHub ran that wrkflw rejected:
+        // ruff's top-level `cache-mode`, `environment.deployment` and
+        // expression `timeout-minutes`, clap's `code-quality` permission and
+        // ripgrep's empty env value.
+        let temp_dir = tempdir().unwrap();
+        let workflow_path = temp_dir.path().join("w.yml");
+        std::fs::write(
+            &workflow_path,
+            r#"name: t
+on: push
+cache-mode: read
+env:
+  TARGET_FLAGS:
+jobs:
+  t:
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ github.repository == 'o/r' && 40 || 240 }}
+    permissions:
+      code-quality: write
+    environment:
+      name: release-gate
+      deployment: false
+    steps:
+      - run: echo hi
+        timeout-minutes: 5
+      - run: echo slow
+        timeout-minutes: ${{ matrix.slow && 30 || 10 }}
+"#,
+        )
+        .unwrap();
+
+        let workflow = parse_workflow(&workflow_path).unwrap();
+
+        let job = &workflow.jobs["t"];
+        assert_eq!(job.timeout_minutes, None);
+        assert_eq!(job.steps[0].timeout_minutes, Some(5.0));
+        assert_eq!(job.steps[1].timeout_minutes, None);
+    }
+
+    #[test]
+    fn a_timeout_is_a_number_or_an_expression_and_nothing_else() {
+        // GitHub's schema takes a number or a `${{ }}` string. A quoted
+        // number or plain text fails validation, as it does on GitHub.
+        let temp_dir = tempdir().unwrap();
+        let workflow_path = temp_dir.path().join("w.yml");
+        let yaml = |timeout: &str| {
+            format!(
+                "name: t\non: push\njobs:\n  t:\n    runs-on: ubuntu-latest\n    timeout-minutes: {timeout}\n    steps:\n      - run: echo hi\n"
+            )
+        };
+        std::fs::write(&workflow_path, yaml("30")).unwrap();
+        let workflow = parse_workflow(&workflow_path).unwrap();
+        assert_eq!(workflow.jobs["t"].timeout_minutes, Some(30.0));
+
+        std::fs::write(&workflow_path, yaml("\"30\"")).unwrap();
+        assert!(parse_workflow(&workflow_path).is_err());
+
+        std::fs::write(&workflow_path, yaml("soon")).unwrap();
+        assert!(parse_workflow(&workflow_path).is_err());
+    }
+
+    #[test]
+    fn a_workflow_without_a_name_is_named_by_its_path() {
+        let temp_dir = tempdir().unwrap();
+        let dir = temp_dir.path().join(".github/workflows");
+        std::fs::create_dir_all(&dir).unwrap();
+        let workflow_path = dir.join("ci.yml");
+        std::fs::write(
+            &workflow_path,
+            "on: push\njobs:\n  t:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+        )
+        .unwrap();
+
+        let workflow = parse_workflow(&workflow_path).unwrap();
+
+        assert_eq!(workflow.name, ".github/workflows/ci.yml");
+        assert_eq!(
+            name_from_path(Path::new("elsewhere/x.yml")),
+            "elsewhere/x.yml"
+        );
     }
 
     #[test]

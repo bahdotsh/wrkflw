@@ -60,10 +60,13 @@ const INSTRUCTIONS: &str =
 Call validate_workflows after editing YAML, plan_workflow to see what would run and why a trigger \
 would or would not fire, and run_workflow to execute. run_workflow returns a failure digest. Pass \
 reuse_results while iterating, so jobs that already passed on the same files aren't run again. \
-Before pushing, call gate: it runs every workflow a push would run. A job listed under \
-`unverified` ran as another OS than its runs-on asked for, so its pass doesn't cover \
-OS-specific steps. Use list_runs and get_run_failure before rerunning: earlier results are \
-recorded.";
+Before pushing, call gate: it runs what CI would run for the push, and on a feature branch \
+checks workflows a push doesn't fire as a pull request into the default branch. Read \
+`verdict`, not only `passed`: `verified` means everything ran as asked, `partial` means some \
+jobs ran as another OS than their runs-on asked for (listed under `unverified`, so their \
+OS-specific steps weren't checked), and `nothing_checked` means no job ran at all. Say which \
+before claiming CI will pass. A job with `reused` didn't run: an earlier result stands. Use \
+list_runs and get_run_failure before rerunning: earlier results are recorded.";
 
 fn string_arg(args: &Value, key: &str) -> Option<String> {
     args[key]
@@ -430,8 +433,8 @@ fn tools() -> Value {
         json!({"type": "integer", "description": "Stop the run after this long. Default 1800."});
     let gate_properties = json!({
         "path": {"type": "string", "description": "Workflow file or directory. Defaults to the detected workflow directories."},
-        "event": {"type": "string", "description": "Event a push would send. Default push."},
-        "base_branch": {"type": "string", "description": "Target branch, for pull_request."},
+        "event": {"type": "string", "description": "Event to check as. Default: push, then pull_request into the default branch for workflows a push doesn't fire."},
+        "base_branch": {"type": "string", "description": "Target branch, for pull_request. Default: origin/HEAD's branch."},
         "diff_base": {"type": "string", "description": "Ref the remote already has, for working out what changed."},
         "runtime": run_properties["runtime"].clone(),
         "timeout_seconds": {"type": "integer", "description": "Stop the whole gate, every workflow together, after this long. Default 3600."},
@@ -449,7 +452,7 @@ fn tools() -> Value {
         tool("list_workflows", "List workflows and pipelines in the repository with their jobs.", true, json!({}), &[]),
         tool("plan_workflow", "Show what a run would do without executing anything: whether the trigger fires and why, job order, matrix legs, steps, and jobs that would run as another OS than runs-on asks for (`unverified`).", true, plan_properties, &["path"]),
         tool("run_workflow", "Execute a workflow locally. This runs the workflow's code. Returns status, job results and a failure digest. The run is recorded.", false, run_properties, &["path"]),
-        tool("gate", "Run every workflow a push would trigger, reusing jobs that already passed on the same files. Returns `passed`, each workflow's status, run id and failure digest, and jobs that ran as another OS (`unverified`). Checks the working tree, not commits.", false, gate_properties, &[]),
+        tool("gate", "Run every workflow a push would trigger, reusing jobs that already passed on the same files. Returns `verdict` (verified, partial, nothing_checked or failed), `passed`, each workflow's status, the event it was checked as, run id and failure digest, and jobs that ran as another OS (`unverified`). Checks the working tree, not commits.", false, gate_properties, &[]),
         tool("list_runs", "List recorded runs of this repository, newest first.", true,
             json!({"limit": {"type": "integer"}, "status": {"type": "string"}, "agent": {"type": "string"}, "session": {"type": "string"}, "workflow": {"type": "string"}}), &[]),
         tool("get_run", "Get one recorded run: jobs, steps, exit codes, timings.", true, json!({"run_id": run_id}), &[]),

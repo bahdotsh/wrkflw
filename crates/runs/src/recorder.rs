@@ -129,6 +129,10 @@ impl std::fmt::Debug for RunOptions {
 
 pub struct RecordedRun {
     pub result: Result<ExecutionResult, ExecutionError>,
+    /// How much the result proves, as `run_finished.verdict` says it.
+    pub verdict: &'static str,
+    /// Jobs whose pass doesn't stand for GitHub's, as in `run_finished`.
+    pub unverified: Vec<Value>,
     /// `None` when history was off or the store could not be written.
     pub record: Option<RunRecord>,
     pub digest: Option<FailureDigest>,
@@ -286,6 +290,7 @@ impl Recorder {
                 log: None,
                 steps: Vec::new(),
                 repeated_from: None,
+                reused: None,
                 runner: None,
             });
             record.jobs.len() - 1
@@ -460,6 +465,7 @@ impl ExecutionObserver for Recorder {
                 duration_ms,
                 logs,
                 repeated_from,
+                reused,
             } => {
                 let relative = format!("logs/{}/job.log", job_dir(job));
                 let log = self.write_log(&id, &relative, logs);
@@ -469,6 +475,7 @@ impl ExecutionObserver for Recorder {
                 entry.duration_ms = Some(*duration_ms);
                 entry.log = log;
                 entry.repeated_from = repeated_from.clone();
+                entry.reused = reused.clone();
                 self.persist(&record);
             }
         }
@@ -529,6 +536,7 @@ fn event_json(event: &ExecutionEvent) -> Option<Value> {
             failure_allowed,
             duration_ms,
             repeated_from,
+            reused,
             ..
         } => {
             let mut line = json!({
@@ -541,6 +549,10 @@ fn event_json(event: &ExecutionEvent) -> Option<Value> {
             // Only on legs that didn't run, so other lines keep their shape.
             if let Some(original) = repeated_from {
                 line["repeated_from"] = json!(original);
+            }
+            // Only on jobs that didn't run, as with `repeated_from`.
+            if let Some(reason) = reused {
+                line["reused"] = json!(reason);
             }
             line
         }
@@ -642,16 +654,56 @@ fn run_finished_json(record: &RunRecord, digest: Option<&FailureDigest>) -> Valu
             if let Some(original) = &job.repeated_from {
                 entry["repeated_from"] = json!(original);
             }
+            if let Some(reason) = &job.reused {
+                entry["reused"] = json!(reason);
+            }
             if let Some(runner) = &job.runner {
                 entry["runner"] = json!(runner);
             }
             entry
         }).collect::<Vec<_>>(),
         "unverified": unverified(record),
+        "verdict": verdict(record),
         "error": record.error,
         "skip_reason": record.skip_reason,
         "failure": digest,
     })
+}
+
+/// How much a run's result proves. A pass splits three ways, so a reader of
+/// one word can't take a partial check for a full one:
+///
+/// - `verified`: something ran, and every job that ran did so as the OS its
+///   `runs-on` asked for.
+/// - `partial`: it passed, but some jobs ran as another OS (`unverified`).
+/// - `nothing_checked`: it passed because no job ran, all skipped by `if:`,
+///   `needs` or `gate: false`.
+///
+/// A job that failed under `continue-on-error` ran, so it counts as checked.
+///
+/// Anything else is the status: `failed`, `error`, `skipped`, `interrupted`.
+pub fn verdict(record: &RunRecord) -> &'static str {
+    match record.status {
+        RunStatus::Success => {
+            if !record.jobs.iter().any(job_ran) {
+                "nothing_checked"
+            } else if !unverified(record).is_empty() {
+                "partial"
+            } else {
+                "verified"
+            }
+        }
+        RunStatus::Failure => "failed",
+        RunStatus::Skipped => "skipped",
+        RunStatus::Interrupted => "interrupted",
+        RunStatus::Error | RunStatus::Running => "error",
+    }
+}
+
+/// Whether `job` ran steps of its own: it passed, or failed under
+/// `continue-on-error`. A skipped job ran nothing.
+fn job_ran(job: &JobRecord) -> bool {
+    job.status == "success" || (job.status == "failure" && job.failure_allowed)
 }
 
 /// Jobs whose result can't stand for GitHub's, because they ran as another
@@ -741,6 +793,8 @@ fn conclude(
     recorder.line(run_finished_json(&record, digest.as_ref()));
     RecordedRun {
         result,
+        verdict: verdict(&record),
+        unverified: unverified(&record),
         record: recorder.persistent.then_some(record),
         digest,
     }
@@ -904,6 +958,7 @@ mod tests {
             duration_ms: 1,
             logs: String::new(),
             repeated_from: None,
+            reused: None,
         };
         assert_eq!(
             keys(&event_json(&job).unwrap()),
@@ -917,9 +972,22 @@ mod tests {
             duration_ms: 0,
             logs: String::new(),
             repeated_from: Some("j (os: a)".to_string()),
+            reused: None,
         };
         let line = event_json(&repeat).unwrap();
         assert_eq!(line["repeated_from"], "j (os: a)");
+        assert!(line.get("reused").is_none());
+
+        let reused = ExecutionEvent::JobFinished {
+            job: "j".to_string(),
+            status: JobStatus::Success,
+            failure_allowed: false,
+            duration_ms: 0,
+            logs: String::new(),
+            repeated_from: None,
+            reused: Some("stored".to_string()),
+        };
+        assert_eq!(event_json(&reused).unwrap()["reused"], "stored");
 
         let output = ExecutionEvent::StepOutput {
             job: "j".to_string(),
@@ -941,6 +1009,7 @@ mod tests {
             log: None,
             steps: Vec::new(),
             repeated_from: None,
+            reused: None,
             runner: Some(RunnerSubstitution {
                 requested: "windows-latest".to_string(),
                 ran_as: "Linux".to_string(),
@@ -961,7 +1030,10 @@ mod tests {
             job("c", "skipped"),
         ];
         record.jobs[0].repeated_from = Some("b (os: ubuntu-latest)".to_string());
+        record.jobs[0].reused = Some("stored".to_string());
         let line = run_finished_json(&record, None);
+        assert_eq!(line["verdict"], "partial");
+        assert_eq!(line["jobs"][0]["reused"], "stored");
         assert_eq!(line["unverified"].as_array().unwrap().len(), 1);
         assert_eq!(line["unverified"][0]["job"], "b (os: windows-latest)");
         assert_eq!(line["unverified"][0]["ran_as"], "Linux");
@@ -1031,7 +1103,58 @@ mod tests {
                 "status",
                 "type",
                 "unverified",
+                "verdict",
             ]
         );
+    }
+
+    #[test]
+    fn a_pass_says_how_much_it_proves() {
+        let job = |status: &str, runner: Option<RunnerSubstitution>| JobRecord {
+            name: "j".to_string(),
+            canonical_name: "j".to_string(),
+            status: status.to_string(),
+            failure_allowed: false,
+            duration_ms: None,
+            log: None,
+            steps: Vec::new(),
+            repeated_from: None,
+            reused: None,
+            runner,
+        };
+        let mut record: RunRecord = serde_json::from_value(json!({
+            "schema_version": SCHEMA_VERSION, "id": "r", "status": "success",
+            "workflow": "ci.yml", "cwd": "/repo", "repo_root": "/repo", "git_sha": null,
+            "git_branch": null, "git_dirty": null, "runtime": "docker", "event": null,
+            "source": "cli", "agent": null, "intent": null, "session": null,
+            "replay_of": null, "argv": [], "variables": [], "pid": 1, "started_at": "",
+            "finished_at": null, "duration_ms": null, "error": null, "skip_reason": null,
+            "jobs": [],
+        }))
+        .unwrap();
+        assert_eq!(verdict(&record), "nothing_checked");
+        record.jobs = vec![job("skipped", None)];
+        assert_eq!(verdict(&record), "nothing_checked");
+        record.jobs.push(job("success", None));
+        assert_eq!(verdict(&record), "verified");
+        record.jobs.push(job(
+            "success",
+            Some(RunnerSubstitution {
+                requested: "windows-latest".to_string(),
+                ran_as: "Linux".to_string(),
+            }),
+        ));
+        assert_eq!(verdict(&record), "partial");
+        record.status = RunStatus::Failure;
+        assert_eq!(verdict(&record), "failed");
+
+        // A job that failed under continue-on-error ran, though the run passed.
+        record.status = RunStatus::Success;
+        let mut allowed = job("failure", None);
+        allowed.failure_allowed = true;
+        record.jobs = vec![job("skipped", None), allowed];
+        assert_eq!(verdict(&record), "verified");
+        record.jobs[1].failure_allowed = false;
+        assert_eq!(verdict(&record), "nothing_checked");
     }
 }

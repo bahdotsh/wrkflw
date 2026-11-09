@@ -49,9 +49,8 @@ pub async fn execute_workflow(
     let is_gitlab = is_gitlab_pipeline(workflow_path);
 
     if is_gitlab {
-        return acceleration::without_run_state(execute_gitlab_pipeline(
-            workflow_path,
-            config.clone(),
+        return crate::vm_memory::with_run_pool(acceleration::without_run_state(
+            execute_gitlab_pipeline(workflow_path, config.clone()),
         ))
         .await;
     }
@@ -64,13 +63,14 @@ pub async fn execute_workflow(
         root,
     )
     .map_err(ExecutionError::Execution)?;
-    acceleration::with_run_state(
+    // Each run gets its own job pool, sized once its runtime is known.
+    crate::vm_memory::with_run_pool(acceleration::with_run_state(
         std::sync::Arc::new(state),
         crate::workspace::with_workflow_file(
             workflow_path,
             Box::pin(execute_github_workflow(workflow_path, config.clone())),
         ),
-    )
+    ))
     .await
 }
 
@@ -130,6 +130,7 @@ async fn execute_github_workflow(
         &config.kubernetes,
     )?;
     config.runtime_type = effective_runtime;
+    crate::vm_memory::check(vm_cli(&config.runtime_type)).await;
     warn_if_overrides_unused(&config);
 
     // Create a temporary workspace directory
@@ -397,6 +398,7 @@ async fn execute_gitlab_pipeline(
         &config.kubernetes,
     )?;
     config.runtime_type = effective_runtime;
+    crate::vm_memory::check(vm_cli(&config.runtime_type)).await;
     warn_if_overrides_unused(&config);
 
     // Create a temporary workspace directory
@@ -953,6 +955,15 @@ fn emulation_runtime() -> (Box<dyn ContainerRuntime>, RuntimeType) {
     )
 }
 
+/// The CLI whose VM a run's jobs share memory in, for [`crate::vm_memory`].
+fn vm_cli(runtime: &RuntimeType) -> Option<&'static str> {
+    match runtime {
+        RuntimeType::Docker => Some("docker"),
+        RuntimeType::Podman => Some("podman"),
+        _ => None,
+    }
+}
+
 /// Set up the runtime to run on. `Auto` falls back to emulation when no
 /// container runtime answers. An explicit Docker or Podman request never
 /// does: emulation runs steps on this machine, which is not what someone who
@@ -1211,6 +1222,7 @@ impl JobResult {
             duration_ms: 0,
             logs: self.logs.clone(),
             repeated_from: self.repeated_from.clone(),
+            reused: None,
         });
         self
     }
@@ -2558,6 +2570,9 @@ async fn execute_job_batch(
     // and per-job state (needs context, secrets). JobServices is constructed
     // per-job inside execute_job_with_matrix after resolving secrets.
 
+    // All at once: each job, or each leg of a matrix job, waits for a place
+    // in `vm_memory`'s pool before its steps run, so the VM's memory limit
+    // holds across jobs and legs together.
     let result_arrays = future::join_all(futures).await;
 
     // Flatten the results from all jobs and their matrix combinations
@@ -2683,7 +2698,7 @@ async fn execute_job_with_matrix(
             if matches!(why, acceleration::Reused::Stored { .. }) {
                 acceleration::mark_executed(job_name);
             }
-            let (note, step) = (why.note(), why.step());
+            let (note, step, kind) = (why.note(), why.step(), why.kind());
             // A reused leg still ran as another OS when it passed, so it is
             // reported the same way. Its matrix values come from its name.
             let legs: Vec<MatrixCombination> = job
@@ -2724,7 +2739,7 @@ async fn execute_job_with_matrix(
                         env_context,
                         platform_overrides,
                     );
-                    announce_reused(&stored, &note, runner.as_ref());
+                    announce_reused(&stored, &note, kind, runner.as_ref());
                     JobResult::reused(stored, step, &note)
                 })
                 .collect());
@@ -2787,11 +2802,13 @@ async fn execute_job_with_matrix(
             combinations.len()
         ));
 
-        // Set maximum parallel jobs
-        let max_parallel = job.max_parallel().unwrap_or_else(|| {
-            // If not specified, use a reasonable default based on CPU cores
-            std::cmp::max(1, num_cpus::get())
-        });
+        // The matrix's own limit, or the CPU count. The VM's memory limit
+        // is applied per leg, in `execute_matrix_job`, from the pool every
+        // job of the run shares.
+        let max_parallel = job
+            .max_parallel()
+            .unwrap_or_else(|| std::cmp::max(1, num_cpus::get()))
+            .max(1);
 
         let services = JobServices {
             secret_manager,
@@ -2855,6 +2872,7 @@ async fn execute_job_with_matrix(
 fn announce_reused(
     stored: &acceleration::StoredJob,
     note: &str,
+    kind: &str,
     runner: Option<&crate::runner_fidelity::RunnerSubstitution>,
 ) {
     crate::events::emit(|| crate::events::ExecutionEvent::JobStarted {
@@ -2869,6 +2887,7 @@ fn announce_reused(
         duration_ms: 0,
         logs: note.to_string(),
         repeated_from: None,
+        reused: Some(kind.to_string()),
     });
     wrkflw_logging::info(&format!(
         "{} Job '{}': {}",
@@ -2911,6 +2930,9 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
         return execute_reusable_workflow_job(&ctx, uses, job.with.as_ref(), job.secrets.as_ref())
             .await;
     }
+    // Only after the reusable workflow check: its jobs take places of their
+    // own, and a caller holding one would deadlock a limit of one.
+    let _slot = crate::vm_memory::job_slot().await;
 
     // Clone context and add job-specific variables.
     // `job_env` is the full lookup map (runner + user union); `job_user_env`
@@ -3278,6 +3300,9 @@ async fn execute_matrix_job(
     verbose: bool,
     services: &JobServices<'_>,
 ) -> Result<JobResult, ExecutionError> {
+    // One place in the run's pool for the leg, as for any job.
+    let _slot = crate::vm_memory::job_slot().await;
+
     // Create the matrix-specific job name
     let matrix_job_name = wrkflw_matrix::format_combination_name(job_name, combination);
 
@@ -3743,6 +3768,7 @@ impl StepLoopState {
             duration_ms: self.job_started.elapsed().as_millis() as u64,
             logs: self.job_logs.clone(),
             repeated_from: None,
+            reused: None,
         });
     }
 
@@ -5326,7 +5352,6 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
         let mut output = String::new();
         let mut exit_code = None;
         let mut status = StepStatus::Success;
-        let mut error_details = None;
 
         // Perform secret substitution if secret manager is available
         let resolved_run = if let Some(secret_manager) = ctx.services.secret_manager {
@@ -5361,9 +5386,6 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                 ));
             }
         };
-
-        // Check if this is a cargo command
-        let is_cargo_cmd = resolved_run.trim().starts_with("cargo");
 
         // Resolve effective shell: step > job defaults > workflow defaults > "bash"
         let effective_shell = ctx
@@ -5556,45 +5578,17 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                     output.push('\n');
                 }
 
+                // A failed step's own output is the evidence. A canned guess
+                // at the cause, such as "test failures" for any failed
+                // `cargo test`, would sit in the digest's tail and mislead.
                 if container_output.exit_code != 0 {
                     status = StepStatus::Failure;
-
-                    // For cargo commands, add more detailed error information
-                    if is_cargo_cmd {
-                        let mut error_msg = String::new();
-                        error_msg.push_str(&format!(
-                            "\nCargo command failed with exit code {}\n",
-                            container_output.exit_code
-                        ));
-                        error_msg.push_str("Common causes for cargo command failures:\n");
-
-                        if run.contains("fmt") {
-                            error_msg.push_str(
-                                "- Code formatting issues. Run 'cargo fmt' locally to fix.\n",
-                            );
-                        } else if run.contains("clippy") {
-                            error_msg.push_str("- Linter warnings treated as errors. Run 'cargo clippy' locally to see details.\n");
-                        } else if run.contains("test") {
-                            error_msg.push_str("- Test failures. Run 'cargo test' locally to see which tests failed.\n");
-                        } else if run.contains("build") {
-                            error_msg.push_str(
-                                "- Compilation errors. Check the error messages above.\n",
-                            );
-                        }
-
-                        error_details = Some(error_msg);
-                    }
                 }
             }
             Err(e) => {
                 status = StepStatus::Failure;
                 output.push_str(&format!("Error executing command: {}\n", e));
             }
-        }
-
-        // If there are error details, append them to the output
-        if let Some(details) = error_details {
-            output.push_str(&details);
         }
 
         let result = StepResult::new(step_name, status, output);

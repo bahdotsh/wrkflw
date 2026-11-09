@@ -301,7 +301,92 @@ fn the_gate_skips_a_workflow_the_event_does_not_trigger() {
     let output = repo.wrkflw(&["gate", "--runtime", "emulation", "--diff-base", "HEAD"]);
     assert_ok(&output);
     assert!(repo.take_ran().is_empty());
-    assert!(String::from_utf8_lossy(&output.stdout).contains("0 workflow(s) ran, 1 skipped"));
+    // Nothing ran, so the gate doesn't claim a pass: it exits 0, so the push
+    // isn't blocked, and warns that the push is unverified.
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("gate passed"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("the gate checked nothing"));
+}
+
+#[test]
+fn on_a_feature_branch_the_gate_checks_pull_request_ci_as_a_pull_request() {
+    // CI as most repositories write it: pushes to main, and pull requests
+    // into it. A push from a feature branch fires nothing.
+    let workflow = "name: ci\non:\n  push:\n    branches: [main]\n  pull_request:\n    branches: [main]\njobs:\n  check:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo check >> LOG\n";
+    let repo = Repo::new(workflow, None);
+    repo.git(&["branch", "-M", "main"]);
+    repo.git(&["checkout", "-q", "-b", "feat/x"]);
+
+    let output = repo.wrkflw(&[
+        "--format",
+        "json",
+        "gate",
+        "--runtime",
+        "emulation",
+        "--diff-base",
+        "HEAD",
+    ]);
+    assert_ok(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let report: serde_json::Value = stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|line| line["type"] == "gate")
+        .unwrap_or_else(|| panic!("no gate object in {stdout}"));
+    // `partial` off Linux, where emulation runs an ubuntu job as the host OS.
+    let expected = if cfg!(target_os = "linux") {
+        "verified"
+    } else {
+        "partial"
+    };
+    assert_eq!(report["verdict"], expected, "{report}");
+    assert_eq!(report["passed"], true, "{report}");
+    assert_eq!(report["ran"], 1, "{report}");
+    let workflow = &report["workflows"][0];
+    assert_eq!(workflow["event"], "pull_request", "{report}");
+    assert_eq!(workflow["base_branch"], "main", "{report}");
+    assert_eq!(repo.take_ran(), ["check"]);
+
+    // With --event push only the push is checked, and it fires nothing.
+    let pushed = repo.wrkflw(&[
+        "gate",
+        "--runtime",
+        "emulation",
+        "--diff-base",
+        "HEAD",
+        "--event",
+        "push",
+    ]);
+    assert_ok(&pushed);
+    assert!(repo.take_ran().is_empty());
+    assert!(String::from_utf8_lossy(&pushed.stderr).contains("the gate checked nothing"));
+}
+
+#[test]
+fn a_workflow_whose_jobs_are_all_skipped_checks_nothing_in_either_format() {
+    let workflow = "name: ci\non: push\njobs:\n  check:\n    if: false\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo check >> LOG\n";
+    let repo = Repo::new(workflow, None);
+    let gate = ["gate", "--runtime", "emulation", "--diff-base", "HEAD"];
+
+    let text = repo.wrkflw(&gate);
+    assert_ok(&text);
+    assert!(
+        !String::from_utf8_lossy(&text.stdout).contains("gate passed"),
+        "{}",
+        String::from_utf8_lossy(&text.stdout)
+    );
+    assert!(String::from_utf8_lossy(&text.stderr).contains("the gate checked nothing"));
+
+    let json = repo.wrkflw(&[&["--format", "json"][..], &gate[..]].concat());
+    assert_ok(&json);
+    let stdout = String::from_utf8_lossy(&json.stdout);
+    let report: serde_json::Value = stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|line| line["type"] == "gate")
+        .unwrap_or_else(|| panic!("no gate object in {stdout}"));
+    assert_eq!(report["verdict"], "nothing_checked", "{report}");
+    assert_eq!(report["passed"], false, "{report}");
+    assert!(repo.take_ran().is_empty());
 }
 
 #[test]

@@ -24,3 +24,4 @@ reqwest.workspace = true
 thiserror.workspace = true
 lazy_static.workspace = true
 regex.workspace = true
+tokio.workspace = true

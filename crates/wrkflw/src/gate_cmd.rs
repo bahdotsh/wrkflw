@@ -1,15 +1,23 @@
-//! `wrkflw gate`: run what a push would run, before pushing it.
+//! `wrkflw gate`: run what CI would run for a push, before pushing it.
 //!
 //! Each workflow runs in a child `wrkflw run`, because that command owns the
 //! trigger prefilter and calls `process::exit` on every terminal outcome. The
 //! child's exit code is the whole interface: 0 passed, `SKIPPED_EXIT` didn't
-//! fire, and neither should stop the push. With `--format json` each child
+//! fire, `NOTHING_CHECKED_EXIT` fired but every job was skipped, and none of
+//! them should stop the push. With `--format json` each child
 //! prints JSON too, and its `run_finished` goes into one `gate` object.
+//!
+//! Without `--event`, a workflow is checked as a push first. CI often runs on
+//! pushes to the default branch only, and on pull requests into it, so on any
+//! other branch a workflow a push doesn't fire is checked again as a pull
+//! request into the default branch. Otherwise the gate would pass a feature
+//! branch having checked nothing at all.
 
 use crate::{is_gitlab_pipeline, OutputFormat, RuntimeChoice};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use wrkflw_executor::vm_memory;
 use wrkflw_runs::SCHEMA_VERSION;
 use wrkflw_ui::cli_style;
 
@@ -19,9 +27,31 @@ const HOOK_MARKER: &str = "# installed by wrkflw gate";
 /// What the child exits with when its triggers don't match the event.
 const SKIPPED_EXIT: i32 = 78;
 
+/// What the child exits with when it passed without running a job, every
+/// one skipped by `if:`, `needs` or `gate: false`. It checked nothing, so
+/// the gate treats it as it does a skip.
+const NOTHING_CHECKED_EXIT: i32 = 79;
+
+/// Whether a child's exit code says it checked nothing.
+fn ran_nothing(code: Option<i32>) -> bool {
+    matches!(code, Some(SKIPPED_EXIT | NOTHING_CHECKED_EXIT))
+}
+
+/// What the child exits with when it passed, but some job ran as another OS
+/// than `runs-on` asked for. A pass, but `partial`, as in JSON mode, where
+/// the verdict comes from `run_finished` instead.
+const PARTIAL_EXIT: i32 = 80;
+
+/// Whether a child's exit code says it passed, fully or not.
+fn passed(code: Option<i32>) -> bool {
+    matches!(code, Some(0 | PARTIAL_EXIT))
+}
+
 pub(crate) struct GateCtx {
     pub(crate) path: Option<PathBuf>,
-    pub(crate) event: String,
+    /// The event to check as, or `None` for a push with the pull request
+    /// fallback.
+    pub(crate) event: Option<String>,
     pub(crate) base_branch: Option<String>,
     pub(crate) diff_base: Option<String>,
     pub(crate) runtime: RuntimeChoice,
@@ -256,13 +286,62 @@ fn workflow_files(path: Option<&Path>) -> Result<Vec<PathBuf>, String> {
     Ok(files)
 }
 
+/// The event a workflow is checked as.
+#[derive(Debug, Clone, PartialEq)]
+struct Event {
+    name: String,
+    base_branch: Option<String>,
+}
+
+impl Event {
+    /// How reports name it: `push`, or `pull_request into main`.
+    fn describe(&self) -> String {
+        match &self.base_branch {
+            Some(base) if self.name == "pull_request" || self.name == "pull_request_target" => {
+                format!("{} into {}", self.name, base)
+            }
+            _ => self.name.clone(),
+        }
+    }
+}
+
+/// What each workflow is checked as: the first event, then the second for a
+/// workflow the first doesn't fire.
+///
+/// With `--event`, only that. Without it, a push, then a pull request into
+/// the default branch (or `--base-branch`), unless this is the default
+/// branch, where a push is what CI sees.
+fn events(ctx: &GateCtx, branch: Option<&str>, default: Option<&str>) -> (Event, Option<Event>) {
+    if let Some(name) = &ctx.event {
+        return (
+            Event {
+                name: name.clone(),
+                base_branch: ctx.base_branch.clone(),
+            },
+            None,
+        );
+    }
+    let push = Event {
+        name: "push".to_string(),
+        base_branch: None,
+    };
+    let target = ctx.base_branch.as_deref().or(default);
+    let pull_request = target
+        .filter(|target| branch != Some(*target))
+        .map(|target| Event {
+            name: "pull_request".to_string(),
+            base_branch: Some(target.to_string()),
+        });
+    (push, pull_request)
+}
+
 /// The child's arguments, apart from the runtime.
-fn run_args(ctx: &GateCtx, file: &Path) -> Vec<String> {
+fn run_args(ctx: &GateCtx, file: &Path, event: &Event) -> Vec<String> {
     let mut args = vec![
         "run".to_string(),
         file.display().to_string(),
         "--event".to_string(),
-        ctx.event.clone(),
+        event.name.clone(),
         "--affected".to_string(),
         "--reuse-results".to_string(),
         "--job-container".to_string(),
@@ -272,8 +351,12 @@ fn run_args(ctx: &GateCtx, file: &Path) -> Vec<String> {
         "wrkflw gate".to_string(),
         "--skip-exit-code".to_string(),
         SKIPPED_EXIT.to_string(),
+        "--nothing-checked-exit-code".to_string(),
+        NOTHING_CHECKED_EXIT.to_string(),
+        "--partial-exit-code".to_string(),
+        PARTIAL_EXIT.to_string(),
     ];
-    if let Some(base) = &ctx.base_branch {
+    if let Some(base) = &event.base_branch {
         args.extend(["--base-branch".to_string(), base.clone()]);
     }
     if let Some(base) = &ctx.diff_base {
@@ -301,7 +384,7 @@ fn workflow_report(file: &Path, code: Option<i32>, stdout: &str) -> Value {
             fields.remove("type");
             fields.remove("schema_version");
         }
-        if code != Some(0) && code != Some(SKIPPED_EXIT) && run["status"] == "success" {
+        if !passed(code) && !ran_nothing(code) && run["status"] == "success" {
             entry["status"] = json!("error");
             entry["error"] = json!(format!("wrkflw exited with {:?}", code));
         }
@@ -323,17 +406,39 @@ fn workflow_report(file: &Path, code: Option<i32>, stdout: &str) -> Value {
     entry
 }
 
+/// The gate's verdict, as a run's: `failed` when a workflow failed or
+/// couldn't run, `nothing_checked` when no job ran anywhere, `partial` when
+/// it passed but some job ran as another OS than `runs-on` asked for, and
+/// `verified` otherwise.
+fn gate_verdict(workflows: &[Value], failed: usize, unverified: usize) -> &'static str {
+    let checked = workflows
+        .iter()
+        .any(|w| w["status"] == "success" && w["verdict"] != "nothing_checked");
+    if failed > 0 {
+        "failed"
+    } else if !checked {
+        "nothing_checked"
+    } else if unverified > 0 || workflows.iter().any(|w| w["verdict"] == "partial") {
+        "partial"
+    } else {
+        "verified"
+    }
+}
+
 /// The `gate` object: every workflow's result, and whether the push may go.
+///
+/// `passed` is true only when something ran and nothing failed. A gate that
+/// checked nothing still exits 0, since a push no CI runs for is no error,
+/// but it doesn't say it passed.
 fn gate_report(workflows: Vec<Value>, uncommitted: &[String]) -> Value {
     let failed: Vec<&Value> = workflows
         .iter()
         .filter(|w| w["status"] != "success" && w["status"] != "skipped")
         .map(|w| &w["path"])
         .collect();
-    let skipped = workflows
-        .iter()
-        .filter(|w| w["status"] == "skipped")
-        .count();
+    // As in text mode: a workflow that ran no job, because it didn't fire
+    // or every job was skipped, counts as skipped, not as ran.
+    let skipped = workflows.iter().filter(|w| checked_nothing(w)).count();
     let unverified: Vec<Value> = workflows
         .iter()
         .flat_map(|w| {
@@ -344,10 +449,12 @@ fn gate_report(workflows: Vec<Value>, uncommitted: &[String]) -> Value {
             })
         })
         .collect();
+    let verdict = gate_verdict(&workflows, failed.len(), unverified.len());
     json!({
         "schema_version": SCHEMA_VERSION,
         "type": "gate",
-        "passed": failed.is_empty(),
+        "passed": failed.is_empty() && verdict != "nothing_checked",
+        "verdict": verdict,
         "ran": workflows.len() - skipped,
         "skipped": skipped,
         "failed": failed,
@@ -355,6 +462,121 @@ fn gate_report(workflows: Vec<Value>, uncommitted: &[String]) -> Value {
         "uncommitted_changes": uncommitted,
         "workflows": workflows,
     })
+}
+
+/// Whether a workflow's entry ran no job: it didn't fire, or every job was
+/// skipped.
+fn checked_nothing(entry: &Value) -> bool {
+    entry["status"] == "skipped" || entry["verdict"] == "nothing_checked"
+}
+
+/// Why an entry [`checked_nothing`], for the combined skip reason.
+fn why_nothing_ran(entry: &Value) -> String {
+    match entry["skip_reason"].as_str() {
+        Some(reason) => reason.to_string(),
+        None if entry["verdict"] == "nothing_checked" => "every job was skipped".to_string(),
+        None => "did not fire".to_string(),
+    }
+}
+
+/// The warning for a gate that checked nothing.
+fn nothing_checked_warning(first: &Event, second: Option<&Event>) -> String {
+    let events = match second {
+        Some(second) => format!("a {} or a {}", first.describe(), second.describe()),
+        None => format!("a {}", first.describe()),
+    };
+    format!(
+        "Warning: the gate checked nothing. No workflow runs a job for {events}, so this \
+         push is unverified. Pass --event and --base-branch to check it as CI will see it"
+    )
+}
+
+/// The memory of the runtime the children will use: `runtime` as passed to
+/// them, with `auto` resolved as a run resolves it, Docker before Podman.
+/// `None` for a runtime without a container VM, or one that didn't answer.
+fn probe_memory(runtime: &str) -> Option<vm_memory::Memory> {
+    if std::env::var_os(vm_memory::PROBED_ENV).is_some() {
+        return None;
+    }
+    match runtime {
+        "docker" | "podman" => vm_memory::probe(runtime),
+        "auto" => vm_memory::probe("docker").or_else(|| vm_memory::probe("podman")),
+        _ => None,
+    }
+}
+
+/// What children get in [`vm_memory::PROBED_ENV`]: the probe, or `none`
+/// when it found nothing. `None` leaves the variable alone: a runtime
+/// without a VM never reads it, and a parent's value is passed on as is.
+fn probed_env(runtime: &str, memory: Option<&vm_memory::Memory>) -> Option<String> {
+    if std::env::var_os(vm_memory::PROBED_ENV).is_some()
+        || !matches!(runtime, "docker" | "podman" | "auto")
+    {
+        return None;
+    }
+    Some(memory.map_or_else(|| "none".to_string(), vm_memory::Memory::to_env))
+}
+
+/// How the gate starts each child `wrkflw run`.
+struct Launcher<'a> {
+    program: &'a Path,
+    runtime: &'a str,
+    /// The runtime's memory, probed once by the gate, for
+    /// [`vm_memory::PROBED_ENV`].
+    probed: Option<&'a str>,
+}
+
+impl Launcher<'_> {
+    /// Run the child that checks `file` as `event`, and return its entry for
+    /// the `gate` object, with the event it was checked as. With `json`, the
+    /// child prints JSON and its `run_finished` becomes the entry; without,
+    /// its output reaches the terminal and the entry comes from its exit code.
+    fn check(&self, ctx: &GateCtx, file: &Path, event: &Event, json: bool) -> Value {
+        let mut child = self.command(ctx, file, event, json);
+        let mut entry = if json {
+            child.stdin(Stdio::null()).stderr(Stdio::inherit());
+            match child.output() {
+                Ok(output) => workflow_report(
+                    file,
+                    output.status.code(),
+                    &String::from_utf8_lossy(&output.stdout),
+                ),
+                Err(e) => json!({
+                    "path": file.display().to_string(),
+                    "status": "error",
+                    "error": format!("cannot run wrkflw: {}", e),
+                }),
+            }
+        } else {
+            println!(
+                "{}",
+                cli_style::dim(&format!("gate: {} ({})", file.display(), event.describe()))
+            );
+            text_entry(file, child.status().ok().and_then(|status| status.code()))
+        };
+        entry["event"] = json!(event.name);
+        if let Some(base) = &event.base_branch {
+            entry["base_branch"] = json!(base);
+        }
+        entry
+    }
+
+    /// The child that checks `file` as `event`, printing JSON when `json`.
+    fn command(&self, ctx: &GateCtx, file: &Path, event: &Event, json: bool) -> Command {
+        let mut child = Command::new(self.program);
+        if json {
+            child.args(["--format", "json"]);
+        }
+        child
+            .args(run_args(ctx, file, event))
+            .args(["--runtime", self.runtime]);
+        crate::cli_secrets::pass_to(&mut child);
+        if let Some(value) = self.probed {
+            // Used instead of probing the runtime again.
+            child.env(vm_memory::PROBED_ENV, value);
+        }
+        child
+    }
 }
 
 /// Run the gate. Exits 1 when a workflow fails or can't be run.
@@ -388,75 +610,133 @@ pub(crate) fn run(ctx: GateCtx) {
     if let Some(warning) = dirty_tree_warning(&uncommitted) {
         eprintln!("{}", cli_style::dim(&warning));
     }
-    if ctx.format == OutputFormat::Json {
-        run_json(&ctx, &program, &files, runtime, &uncommitted);
+    let (first, second) = events(
+        &ctx,
+        crate::git::current_branch().as_deref(),
+        crate::git::default_branch().as_deref(),
+    );
+    // Every workflow, and on a feature branch every workflow twice, runs in
+    // a child. Ask the runtime about memory once here and warn once, rather
+    // than in each child.
+    let memory = probe_memory(runtime);
+    if let Some(warning) = memory.as_ref().and_then(vm_memory::Memory::warning) {
+        eprintln!("{}", cli_style::warning(&warning));
     }
-
+    let probed = probed_env(runtime, memory.as_ref());
+    let launcher = Launcher {
+        program: &program,
+        runtime,
+        probed: probed.as_deref(),
+    };
+    let json_mode = ctx.format == OutputFormat::Json;
     // Every workflow runs even after a failure, so one push shows all of them.
-    let mut failed = Vec::new();
-    let mut skipped = 0;
-    for file in &files {
-        println!("{}", cli_style::dim(&format!("gate: {}", file.display())));
-        let mut child = Command::new(&program);
-        child
-            .args(run_args(&ctx, file))
-            .args(["--runtime", runtime]);
-        crate::cli_secrets::pass_to(&mut child);
-        let status = child.status();
-        match status.map(|status| status.code()) {
-            Ok(Some(0)) => {}
-            Ok(Some(SKIPPED_EXIT)) => skipped += 1,
-            _ => failed.push(file.display().to_string()),
-        }
+    let workflows: Vec<Value> = files
+        .iter()
+        .map(|file| {
+            check_workflow(&first, second.as_ref(), json_mode, |event| {
+                launcher.check(&ctx, file, event, json_mode)
+            })
+        })
+        .collect();
+    let report = gate_report(workflows, &uncommitted);
+    let failed = report["verdict"] == "failed";
+    if report["verdict"] == "nothing_checked" {
+        eprintln!(
+            "{}",
+            cli_style::warning(&nothing_checked_warning(&first, second.as_ref()))
+        );
     }
-    if failed.is_empty() {
+    if json_mode {
+        wrkflw_runs::emit_line(&report);
+    } else if failed {
+        let paths: Vec<&str> = report["failed"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect();
+        eprintln!("gate failed: {}", paths.join(", "));
+    } else if report["verdict"] == "partial" {
+        println!(
+            "{}",
+            cli_style::warning(&format!(
+                "gate passed, partially verified: {} workflow(s) ran, {} skipped. Some jobs \
+                 ran as another OS than runs-on asked for, so their OS-specific steps were \
+                 not checked",
+                report["ran"], report["skipped"]
+            ))
+        );
+    } else if report["verdict"] != "nothing_checked" {
         println!(
             "gate passed: {} workflow(s) ran, {} skipped",
-            files.len() - skipped,
-            skipped
+            report["ran"], report["skipped"]
         );
-        return;
     }
-    eprintln!("gate failed: {}", failed.join(", "));
-    std::process::exit(1);
+    std::process::exit(i32::from(failed));
 }
 
-/// The gate with `--format json`: one `gate` object on stdout, exit 1 unless
-/// it passed. Each child's logs still reach stderr.
-fn run_json(
-    ctx: &GateCtx,
-    program: &Path,
-    files: &[PathBuf],
-    runtime: &str,
-    uncommitted: &[String],
-) -> ! {
-    let mut workflows = Vec::new();
-    for file in files {
-        let mut child = Command::new(program);
-        child
-            .args(["--format", "json"])
-            .args(run_args(ctx, file))
-            .args(["--runtime", runtime])
-            .stdin(Stdio::null())
-            .stderr(Stdio::inherit());
-        crate::cli_secrets::pass_to(&mut child);
-        workflows.push(match child.output() {
-            Ok(output) => workflow_report(
-                file,
-                output.status.code(),
-                &String::from_utf8_lossy(&output.stdout),
-            ),
-            Err(e) => json!({
-                "path": file.display().to_string(),
-                "status": "error",
-                "error": format!("cannot run wrkflw: {}", e),
-            }),
-        });
+/// Check one workflow as `first`, and again as `second` when the first ran
+/// no job, the one place the gate decides that. Both output formats come
+/// through here, so they agree on what ran.
+///
+/// `check` runs the child and returns its entry. When both events checked
+/// nothing, the entry's `skip_reason` gives both reasons.
+fn check_workflow(
+    first: &Event,
+    second: Option<&Event>,
+    json_mode: bool,
+    mut check: impl FnMut(&Event) -> Value,
+) -> Value {
+    let entry = check(first);
+    let Some(second) = second.filter(|_| checked_nothing(&entry)) else {
+        return entry;
+    };
+    if !json_mode {
+        println!(
+            "{}",
+            cli_style::dim(&format!(
+                "gate: {} runs no job for a {}, checking it as a {}",
+                entry["path"].as_str().unwrap_or_default(),
+                first.describe(),
+                second.describe()
+            ))
+        );
     }
-    let report = gate_report(workflows, uncommitted);
-    let passed = report["passed"] == true;
-    wrkflw_runs::emit_line(&report);
-    std::process::exit(i32::from(!passed));
+    let first_reason = why_nothing_ran(&entry);
+    // The push's run stays findable: its record is what says why it fired
+    // nothing.
+    let fell_back_from = json!({
+        "event": entry["event"],
+        "base_branch": entry["base_branch"],
+        "run_id": entry["run_id"],
+        "skip_reason": first_reason,
+    });
+    let mut entry = check(second);
+    entry["fell_back_from"] = fell_back_from;
+    if checked_nothing(&entry) {
+        entry["skip_reason"] = json!(format!(
+            "{}: {}; {}: {}",
+            first.describe(),
+            first_reason,
+            second.describe(),
+            why_nothing_ran(&entry),
+        ));
+    }
+    entry
+}
+
+/// The entry for a child run in text mode, from its exit code alone: its
+/// output went to the terminal, so the code is all there is to read.
+fn text_entry(file: &Path, code: Option<i32>) -> Value {
+    let mut entry = match code {
+        Some(0) => json!({"status": "success"}),
+        Some(SKIPPED_EXIT) => json!({"status": "skipped"}),
+        Some(NOTHING_CHECKED_EXIT) => json!({"status": "success", "verdict": "nothing_checked"}),
+        Some(PARTIAL_EXIT) => json!({"status": "success", "verdict": "partial"}),
+        _ => json!({"status": "failure", "error": format!("wrkflw exited with {code:?}")}),
+    };
+    entry["path"] = json!(file.display().to_string());
+    entry
 }
 
 #[cfg(test)]
@@ -485,6 +765,7 @@ mod tests {
         ];
         let report = gate_report(workflows, &[]);
         assert_eq!(report["passed"], false);
+        assert_eq!(report["verdict"], "failed");
         assert_eq!(report["ran"], 4);
         assert_eq!(report["skipped"], 1);
         assert_eq!(report["failed"], json!(["bad.yml", "crash.yml", "err.yml"]));
@@ -545,7 +826,7 @@ mod tests {
     fn ctx() -> GateCtx {
         GateCtx {
             path: None,
-            event: "push".to_string(),
+            event: None,
             base_branch: None,
             diff_base: None,
             runtime: RuntimeChoice::Auto,
@@ -688,13 +969,11 @@ mod tests {
 
     #[test]
     fn the_child_gets_the_event_and_every_shortcut() {
-        let args = run_args(
-            &GateCtx {
-                base_branch: Some("main".to_string()),
-                ..ctx()
-            },
-            Path::new("ci.yml"),
-        );
+        let event = Event {
+            name: "pull_request".to_string(),
+            base_branch: Some("main".to_string()),
+        };
+        let args = run_args(&ctx(), Path::new("ci.yml"), &event);
         for flag in [
             "--affected",
             "--reuse-results",
@@ -705,6 +984,7 @@ mod tests {
             assert!(args.iter().any(|arg| arg == flag), "{}", flag);
         }
         assert!(args.windows(2).any(|w| w == ["--base-branch", "main"]));
+        assert!(args.windows(2).any(|w| w == ["--event", "pull_request"]));
         assert!(args
             .windows(2)
             .any(|w| w == ["--skip-exit-code", SKIPPED_EXIT.to_string().as_str()]));
@@ -728,5 +1008,191 @@ mod tests {
         std::fs::write(dir.path().join("notes.md"), "x").unwrap();
         let files = workflow_files(Some(dir.path())).unwrap();
         assert_eq!(files, vec![dir.path().join("a.yml")]);
+    }
+
+    fn finished(status: &str, verdict: &str, unverified: &str) -> String {
+        format!(
+            r#"{{"type":"run_finished","status":"{status}","verdict":"{verdict}","run_id":"a","jobs":[],"unverified":{unverified}}}"#
+        )
+    }
+
+    #[test]
+    fn a_gate_that_ran_nothing_does_not_pass() {
+        let skipped = workflow_report(
+            Path::new("ci.yml"),
+            Some(SKIPPED_EXIT),
+            &finished("skipped", "skipped", "[]"),
+        );
+        let report = gate_report(vec![skipped], &[]);
+        assert_eq!(report["verdict"], "nothing_checked");
+        assert_eq!(report["passed"], false);
+        assert_eq!(report["ran"], 0);
+
+        let all_jobs_skipped = workflow_report(
+            Path::new("ci.yml"),
+            Some(0),
+            &finished("success", "nothing_checked", "[]"),
+        );
+        let report = gate_report(vec![all_jobs_skipped], &[]);
+        assert_eq!(report["verdict"], "nothing_checked");
+        assert_eq!(report["passed"], false);
+        assert_eq!(report["ran"], 0, "{report}");
+        assert_eq!(report["skipped"], 1, "{report}");
+    }
+
+    #[test]
+    fn a_pass_with_jobs_run_as_another_os_is_partial() {
+        let partial = workflow_report(
+            Path::new("ci.yml"),
+            Some(0),
+            &finished(
+                "success",
+                "partial",
+                r#"[{"job":"b (os: windows-latest)"}]"#,
+            ),
+        );
+        let report = gate_report(vec![partial], &[]);
+        assert_eq!(report["verdict"], "partial");
+        assert_eq!(report["passed"], true);
+
+        let verified = workflow_report(
+            Path::new("ci.yml"),
+            Some(0),
+            &finished("success", "verified", "[]"),
+        );
+        assert_eq!(gate_report(vec![verified], &[])["verdict"], "verified");
+    }
+
+    #[test]
+    fn a_feature_branch_falls_back_to_a_pull_request_into_the_default_branch() {
+        let (first, second) = events(&ctx(), Some("feat/x"), Some("main"));
+        assert_eq!(first.name, "push");
+        let second = second.unwrap();
+        assert_eq!(second.name, "pull_request");
+        assert_eq!(second.base_branch.as_deref(), Some("main"));
+        assert_eq!(second.describe(), "pull_request into main");
+
+        let (_, detached) = events(&ctx(), None, Some("main"));
+        assert!(
+            detached.is_some(),
+            "a detached HEAD is not the default branch"
+        );
+
+        let (_, on_default) = events(&ctx(), Some("main"), Some("main"));
+        assert_eq!(on_default, None);
+
+        let (_, unknown) = events(&ctx(), Some("feat/x"), None);
+        assert_eq!(unknown, None);
+
+        let into_develop = GateCtx {
+            base_branch: Some("develop".to_string()),
+            ..ctx()
+        };
+        let (_, second) = events(&into_develop, Some("feat/x"), Some("main"));
+        assert_eq!(second.unwrap().base_branch.as_deref(), Some("develop"));
+    }
+
+    #[test]
+    fn a_fallback_keeps_the_first_events_run() {
+        let push = Event {
+            name: "push".to_string(),
+            base_branch: None,
+        };
+        let pull_request = Event {
+            name: "pull_request".to_string(),
+            base_branch: Some("main".to_string()),
+        };
+        let entry = check_workflow(&push, Some(&pull_request), true, |event| {
+            if event.name == "push" {
+                json!({"path": "ci.yml", "status": "skipped", "run_id": "first",
+                       "event": "push", "skip_reason": "branch not matched"})
+            } else {
+                json!({"path": "ci.yml", "status": "success", "verdict": "verified",
+                       "run_id": "second", "event": "pull_request", "base_branch": "main"})
+            }
+        });
+        assert_eq!(entry["run_id"], "second");
+        assert_eq!(entry["fell_back_from"]["run_id"], "first");
+        assert_eq!(entry["fell_back_from"]["event"], "push");
+        assert_eq!(entry["fell_back_from"]["skip_reason"], "branch not matched");
+
+        // No fallback, no field.
+        let ran = check_workflow(
+            &push,
+            Some(&pull_request),
+            true,
+            |_| json!({"path": "ci.yml", "status": "success", "verdict": "verified"}),
+        );
+        assert!(ran.get("fell_back_from").is_none());
+    }
+
+    #[test]
+    fn the_probe_reaches_children_once() {
+        // A parent's probe (or `none`) is what each child reads. A runtime
+        // without a VM leaves the variable unset.
+        if std::env::var_os(vm_memory::PROBED_ENV).is_some() {
+            return;
+        }
+        let memory = vm_memory::Memory {
+            cli: "docker".to_string(),
+            bytes: 8_217_751_552,
+            in_vm: true,
+        };
+        assert_eq!(
+            probed_env("docker", Some(&memory)).as_deref(),
+            Some("docker:8217751552:vm")
+        );
+        assert_eq!(probed_env("auto", None).as_deref(), Some("none"));
+        assert_eq!(probed_env("emulation", Some(&memory)), None);
+    }
+
+    #[test]
+    fn text_mode_reaches_the_same_verdict_as_json() {
+        // Text mode reads only exit codes, so each verdict needs its own.
+        let args = run_args(&ctx(), Path::new("ci.yml"), &events(&ctx(), None, None).0);
+        assert!(args
+            .windows(2)
+            .any(|w| w == ["--partial-exit-code", PARTIAL_EXIT.to_string().as_str()]));
+
+        let partial = text_entry(Path::new("ci.yml"), Some(PARTIAL_EXIT));
+        let report = gate_report(vec![partial], &[]);
+        assert_eq!(report["verdict"], "partial", "{report}");
+        assert_eq!(report["passed"], true, "{report}");
+        assert_eq!(report["ran"], 1, "{report}");
+
+        let full = text_entry(Path::new("ci.yml"), Some(0));
+        assert_eq!(gate_report(vec![full], &[])["verdict"], "verified");
+        let idle = text_entry(Path::new("ci.yml"), Some(NOTHING_CHECKED_EXIT));
+        assert_eq!(gate_report(vec![idle], &[])["verdict"], "nothing_checked");
+        let broken = text_entry(Path::new("ci.yml"), Some(1));
+        assert_eq!(gate_report(vec![broken], &[])["verdict"], "failed");
+    }
+
+    #[test]
+    fn a_partial_exit_in_json_mode_is_a_pass_not_an_error() {
+        let entry = workflow_report(
+            Path::new("ci.yml"),
+            Some(PARTIAL_EXIT),
+            &finished(
+                "success",
+                "partial",
+                r#"[{"job":"b (os: windows-latest)"}]"#,
+            ),
+        );
+        assert_eq!(entry["status"], "success", "{entry}");
+        assert!(entry.get("error").is_none(), "{entry}");
+    }
+
+    #[test]
+    fn an_explicit_event_is_the_only_one_checked() {
+        let explicit = GateCtx {
+            event: Some("pull_request".to_string()),
+            base_branch: Some("main".to_string()),
+            ..ctx()
+        };
+        let (first, second) = events(&explicit, Some("feat/x"), Some("main"));
+        assert_eq!(first.name, "pull_request");
+        assert_eq!(first.base_branch.as_deref(), Some("main"));
+        assert_eq!(second, None);
     }
 }

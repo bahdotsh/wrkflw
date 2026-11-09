@@ -53,6 +53,8 @@ pub(crate) struct RunCtx {
     pub(crate) remote_cache: Option<String>,
     pub(crate) cache_push: bool,
     pub(crate) skip_exit_code: Option<i32>,
+    pub(crate) nothing_checked_exit_code: Option<i32>,
+    pub(crate) partial_exit_code: Option<i32>,
     pub(crate) gate_mode: bool,
     pub(crate) stream_output: bool,
 }
@@ -307,6 +309,7 @@ pub(crate) async fn run(ctx: RunCtx) {
     // Execute the workflow
     let recorded = wrkflw_runs::execute_recorded(&ctx.path, config, options).await;
     let digest = recorded.digest;
+    let (verdict, unverified) = (recorded.verdict, recorded.unverified);
     let result = match recorded.result {
         Ok(result) => result,
         // In JSON mode `run_finished` has already carried the error too.
@@ -316,9 +319,21 @@ pub(crate) async fn run(ctx: RunCtx) {
         }
     };
 
+    // A pass that ran no job, or ran some as another OS, for a caller that
+    // reads only the exit code and tells those from a full pass.
+    let verdict_exit = match verdict {
+        "nothing_checked" => ctx.nothing_checked_exit_code,
+        "partial" => ctx.partial_exit_code,
+        _ => None,
+    }
+    .filter(|_| result.failure_details.is_none());
+
     if format.is_json() {
         if result.failure_details.is_some() {
             std::process::exit(1);
+        }
+        if let Some(code) = verdict_exit {
+            std::process::exit(code);
         }
         return;
     }
@@ -357,10 +372,39 @@ pub(crate) async fn run(ctx: RunCtx) {
         }
         std::process::exit(1);
     } else {
-        println!(
-            "{}",
-            cli_style::success("Workflow execution completed successfully!")
-        );
+        match verdict {
+            "partial" => {
+                println!(
+                    "{}",
+                    cli_style::warning(&format!(
+                        "Workflow passed, but {} job(s) ran as another OS than runs-on asked for, \
+                         so their OS-specific steps were not checked:",
+                        unverified.len()
+                    ))
+                );
+                for entry in &unverified {
+                    println!(
+                        "  {}",
+                        cli_style::dim(&format!(
+                            "{}: asked for {}, ran as {}",
+                            entry["job"].as_str().unwrap_or_default(),
+                            entry["requested"].as_str().unwrap_or_default(),
+                            entry["ran_as"].as_str().unwrap_or_default()
+                        ))
+                    );
+                }
+            }
+            "nothing_checked" => println!(
+                "{}",
+                cli_style::warning(
+                    "Workflow passed without running anything: every job was skipped"
+                )
+            ),
+            _ => println!(
+                "{}",
+                cli_style::success("Workflow execution completed successfully!")
+            ),
+        }
 
         println!("{}", cli_style::section("Job summary"));
         for job in result.jobs {
@@ -431,6 +475,10 @@ pub(crate) async fn run(ctx: RunCtx) {
                 }
             }
         }
+    }
+
+    if let Some(code) = verdict_exit {
+        std::process::exit(code);
     }
 
     // Cleanup is handled automatically via the signal handler

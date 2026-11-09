@@ -26,6 +26,29 @@ pub enum GithubError {
 
     #[error("API error: {status} - {message}")]
     ApiError { status: u16, message: String },
+
+    #[error("Unexpected API response: {0}")]
+    UnexpectedResponse(String),
+}
+
+/// How long one request to GitHub may take, connecting included, before it
+/// fails instead of hanging the command.
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The client every request to GitHub goes through, with a timeout.
+fn http_client() -> Result<reqwest::Client, GithubError> {
+    Ok(reqwest::Client::builder()
+        .timeout(REQUEST_TIMEOUT)
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .build()?)
+}
+
+/// `text` when it is a full commit id: 40 hex digits for SHA-1, 64 for
+/// SHA-256. Ids from the API become arguments to git and to a child run, so
+/// nothing else passes.
+fn commit_id(text: &str) -> Option<String> {
+    (matches!(text.len(), 40 | 64) && text.bytes().all(|b| b.is_ascii_hexdigit()))
+        .then(|| text.to_ascii_lowercase())
 }
 
 /// Information about a GitHub repository
@@ -231,7 +254,7 @@ pub async fn trigger_workflow(
     wrkflw_logging::info(&format!("Triggering workflow at URL: {}", url));
 
     // Create a reqwest client
-    let client = reqwest::Client::new();
+    let client = http_client()?;
 
     // Send the request using reqwest
     let response = client
@@ -330,7 +353,7 @@ async fn list_recent_workflow_runs(
         repo_info.owner, repo_info.repo, workflow_segment
     );
 
-    let client = reqwest::Client::new();
+    let client = http_client()?;
     let response = client
         .get(&url)
         .header(header::AUTHORIZATION, format!("Bearer {}", token))
@@ -365,9 +388,256 @@ async fn list_recent_workflow_runs(
     }
 }
 
+/// One job of a run on GitHub.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct RemoteJob {
+    /// As GitHub shows it: the job's `name:`, or its id, with matrix values.
+    pub name: String,
+    /// `success`, `failure`, `cancelled`, `skipped`, or `None` while running.
+    pub conclusion: Option<String>,
+}
+
+/// A workflow run on GitHub, as `wrkflw compare` needs it.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RemoteRun {
+    pub id: u64,
+    pub owner: String,
+    pub repo: String,
+    pub html_url: String,
+    pub head_sha: String,
+    pub head_branch: Option<String>,
+    /// For a push, the commit the branch was at before it: forty zeros when
+    /// the push created the branch.
+    pub before: Option<String>,
+    pub event: String,
+    /// The workflow file, such as `.github/workflows/ci.yml`.
+    pub path: String,
+    pub conclusion: Option<String>,
+    /// For a pull request, the branch it goes into. Once the pull request is
+    /// closed GitHub no longer says, and this is the default branch.
+    pub base_branch: Option<String>,
+    pub jobs: Vec<RemoteJob>,
+}
+
+/// A run named by its id, or by its URL, which also names the repository.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RunReference {
+    pub owner: Option<String>,
+    pub repo: Option<String>,
+    pub id: u64,
+}
+
+/// Read `123`, or `https://github.com/o/r/actions/runs/123` with anything after.
+pub fn parse_run_reference(text: &str) -> Option<RunReference> {
+    let text = text.trim();
+    if let Ok(id) = text.parse::<u64>() {
+        return Some(RunReference {
+            owner: None,
+            repo: None,
+            id,
+        });
+    }
+    let rest = text
+        .strip_prefix("https://github.com/")
+        .or_else(|| text.strip_prefix("http://github.com/"))
+        .or_else(|| text.strip_prefix("github.com/"))?;
+    let parts: Vec<&str> = rest.split('/').collect();
+    // Owner and repository go into the API path, so only names GitHub
+    // allows get there.
+    let is_name = |part: &str| {
+        !part.is_empty()
+            && part != "."
+            && part != ".."
+            && part
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    };
+    match parts.as_slice() {
+        [owner, repo, "actions", "runs", id, ..] if is_name(owner) && is_name(repo) => {
+            Some(RunReference {
+                owner: Some(owner.to_string()),
+                repo: Some(repo.to_string()),
+                id: id.parse().ok()?,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// A token for the API: `GITHUB_TOKEN`, else what `gh auth token` prints.
+/// `None` is fine for a public repository.
+fn api_token() -> Option<String> {
+    if let Ok(token) = std::env::var("GITHUB_TOKEN") {
+        let token = token.trim().to_string();
+        if !token.is_empty() {
+            return Some(token);
+        }
+    }
+    let output = Command::new("gh").args(["auth", "token"]).output().ok()?;
+    let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (output.status.success() && !token.is_empty()).then_some(token)
+}
+
+async fn api_get(
+    client: &reqwest::Client,
+    path: &str,
+    token: Option<&str>,
+) -> Result<serde_json::Value, GithubError> {
+    let mut request = client
+        .get(format!("https://api.github.com{path}"))
+        .header(header::ACCEPT, "application/vnd.github+json")
+        .header(header::USER_AGENT, "wrkflw-cli");
+    if let Some(token) = token {
+        request = request.header(header::AUTHORIZATION, format!("Bearer {token}"));
+    }
+    let response = request.send().await?;
+    if !response.status().is_success() {
+        let status = response.status().as_u16();
+        let message = response
+            .text()
+            .await
+            .unwrap_or_else(|_| format!("HTTP {status}"));
+        return Err(GithubError::ApiError { status, message });
+    }
+    Ok(response.json().await?)
+}
+
+/// Fetch run `reference` and its jobs. The repository is the one the URL
+/// names, else this checkout's `origin`.
+pub async fn fetch_run(reference: &RunReference) -> Result<RemoteRun, GithubError> {
+    let (owner, repo) = match (&reference.owner, &reference.repo) {
+        (Some(owner), Some(repo)) => (owner.clone(), repo.clone()),
+        _ => {
+            let info = get_repo_info()?;
+            (info.owner, info.repo)
+        }
+    };
+    // Read before the first request, on a blocking thread: `gh auth token`
+    // is a subprocess. One client serves every request of the fetch.
+    let token = tokio::task::spawn_blocking(api_token).await.ok().flatten();
+    let client = http_client()?;
+    let base = format!("/repos/{owner}/{repo}/actions/runs/{}", reference.id);
+    let run = api_get(&client, &base, token.as_deref()).await?;
+    let mut jobs = Vec::new();
+    let mut page = 1;
+    loop {
+        let listed = api_get(
+            &client,
+            &format!("{base}/jobs?per_page=100&page={page}"),
+            token.as_deref(),
+        )
+        .await?;
+        let batch = listed["jobs"].as_array().cloned().unwrap_or_default();
+        jobs.extend(batch.iter().map(|job| RemoteJob {
+            name: job["name"].as_str().unwrap_or_default().to_string(),
+            conclusion: job["conclusion"].as_str().map(str::to_string),
+        }));
+        let total = listed["total_count"].as_u64().unwrap_or(0) as usize;
+        if batch.is_empty() || jobs.len() >= total {
+            break;
+        }
+        page += 1;
+    }
+    let text = |key: &str| run[key].as_str().map(str::to_string);
+    // GitHub empties `pull_requests` once the pull request is merged or
+    // closed. Most pull requests go into the default branch, so fall back to
+    // it rather than leave the event unrunnable.
+    let base_branch = match run["pull_requests"][0]["base"]["ref"].as_str() {
+        Some(base) => Some(base.to_string()),
+        None if text("event").is_some_and(|e| e.starts_with("pull_request")) => {
+            api_get(&client, &format!("/repos/{owner}/{repo}"), token.as_deref())
+                .await
+                .ok()
+                .and_then(|r| r["default_branch"].as_str().map(str::to_string))
+        }
+        None => None,
+    };
+    // A run doesn't say what a push pushed over, but its check suite does.
+    // Best effort: without it, `compare` diffs as `--diff` would.
+    let before = match (text("event").as_deref(), run["check_suite_id"].as_u64()) {
+        (Some("push"), Some(suite)) => api_get(
+            &client,
+            &format!("/repos/{owner}/{repo}/check-suites/{suite}"),
+            token.as_deref(),
+        )
+        .await
+        .ok()
+        .and_then(|suite| suite["before"].as_str().and_then(commit_id)),
+        _ => None,
+    };
+    let head_sha = text("head_sha")
+        .as_deref()
+        .and_then(commit_id)
+        .ok_or_else(|| {
+            GithubError::UnexpectedResponse(format!(
+                "run {} has no valid head_sha: {}",
+                reference.id, run["head_sha"]
+            ))
+        })?;
+    Ok(RemoteRun {
+        id: reference.id,
+        owner,
+        repo,
+        html_url: text("html_url").unwrap_or_default(),
+        head_sha,
+        head_branch: text("head_branch"),
+        before,
+        event: text("event").unwrap_or_default(),
+        path: text("path").unwrap_or_default(),
+        conclusion: text("conclusion"),
+        base_branch,
+        jobs,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_full_hex_commit_id_is_taken_from_the_api() {
+        let sha1 = "0123456789abcdef0123456789ABCDEF01234567";
+        assert_eq!(commit_id(sha1), Some(sha1.to_ascii_lowercase()));
+        assert!(commit_id(&"a".repeat(64)).is_some());
+        assert_eq!(commit_id(&"0".repeat(40)), Some("0".repeat(40)));
+        assert_eq!(commit_id("abc123"), None);
+        assert_eq!(
+            commit_id("--upload-pack=x0000000000000000000000000000"),
+            None
+        );
+        assert_eq!(commit_id(&format!("{}g", "a".repeat(39))), None);
+        assert_eq!(commit_id(""), None);
+    }
+
+    #[test]
+    fn a_run_is_named_by_id_or_url() {
+        assert_eq!(
+            parse_run_reference("42"),
+            Some(RunReference {
+                owner: None,
+                repo: None,
+                id: 42
+            })
+        );
+        assert_eq!(
+            parse_run_reference("https://github.com/o/r/actions/runs/7/job/9"),
+            Some(RunReference {
+                owner: Some("o".into()),
+                repo: Some("r".into()),
+                id: 7
+            })
+        );
+        assert_eq!(parse_run_reference("https://github.com/o/r/pull/7"), None);
+        assert_eq!(parse_run_reference("nope"), None);
+        assert_eq!(
+            parse_run_reference("https://github.com/o/r?x=1/actions/runs/7"),
+            None
+        );
+        assert_eq!(
+            parse_run_reference("https://github.com/../r/actions/runs/7"),
+            None
+        );
+    }
 
     #[test]
     fn workflow_dispatch_path_segment_keeps_yml_extension() {

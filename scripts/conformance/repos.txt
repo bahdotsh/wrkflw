@@ -1,0 +1,22 @@
+# Repositories plan_corpus.sh checks: owner/repo, one per line.
+# Picked for variety: matrices with include/exclude, OS matrices, many jobs.
+pallets/itsdangerous
+pallets/markupsafe
+pallets/click
+psf/requests
+sharkdp/hyperfine
+sharkdp/bat
+sharkdp/fd
+BurntSushi/ripgrep
+astral-sh/ruff
+tokio-rs/tokio
+serde-rs/serde
+clap-rs/clap
+expressjs/express
+vitejs/vite
+prettier/prettier
+golang/go
+cli/cli
+nektos/act
+denoland/deno
+rust-lang/rustlings

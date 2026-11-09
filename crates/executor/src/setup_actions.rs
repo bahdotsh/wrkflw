@@ -702,9 +702,10 @@ fn go_release(version: &str) -> String {
         return format!("go{}", version);
     }
     // The two supported lines, newest first, are all go.dev lists without
-    // `include=all`: `oldstable` is the second.
+    // `include=all`: `oldstable` is the second. Each release repeats its
+    // version in every file it lists, so repeats are dropped first.
     if version == "oldstable" {
-        return r#""$(curl -fsSL 'https://go.dev/dl/?mode=json' | grep -oE '"version": *"go[0-9.]+"' | sed -n 2p | grep -oE 'go[0-9.]+')""#.to_string();
+        return r#""$(curl -fsSL 'https://go.dev/dl/?mode=json' | grep -oE '"version": *"go[0-9.]+"' | uniq | sed -n 2p | grep -oE 'go[0-9.]+')""#.to_string();
     }
     // Releases are listed newest first; a line's release candidates, such
     // as `go1.22rc1`, don't match.

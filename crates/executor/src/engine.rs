@@ -10522,7 +10522,34 @@ runs:
         assert!(get_install_script("go", "1.22rc1").contains("GO=go1.22rc1 "));
         assert!(get_install_script("go", "1.22.0-rc.1").contains("GO=go1.22rc1 "));
         assert!(get_install_script("go", "1.23beta2").contains("GO=go1.23beta2 "));
-        assert!(get_install_script("go", "oldstable").contains("sed -n 2p"));
+        #[cfg(unix)]
+        {
+            // go.dev repeats a release's version in each of its files, so
+            // the second match is still the newest release.
+            let listing = r#"[
+ {"version": "go1.27.3", "stable": true, "files": [
+  {"filename": "a", "version": "go1.27.3"},
+  {"filename": "b", "version": "go1.27.3"}]},
+ {"version": "go1.26.10", "stable": true, "files": [
+  {"filename": "c", "version": "go1.26.10"}]}
+]"#;
+            let dir = tempfile::tempdir().unwrap();
+            let json = dir.path().join("dl.json");
+            std::fs::write(&json, listing).unwrap();
+            let script = get_install_script("go", "oldstable");
+            let start = script.find("\"$(curl").unwrap();
+            let end = start + script[start..].find(")\"").unwrap() + 2;
+            let lookup = script[start..end].replace(
+                "curl -fsSL 'https://go.dev/dl/?mode=json'",
+                &format!("cat '{}'", json.display()),
+            );
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!("printf %s {}", lookup))
+                .output()
+                .unwrap();
+            assert_eq!(String::from_utf8_lossy(&out.stdout), "go1.26.10");
+        }
         // What go.dev can't name is refused before the build, not by it.
         let dir = tempfile::tempdir().unwrap();
         for unknown in ["latest", "1.22.x.y", "tip"] {

@@ -103,7 +103,8 @@ pub struct FailedStep {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct FailureCause {
     /// `out_of_memory` when the output says memory ran out, `killed` when a
-    /// process got SIGKILL and the output doesn't say why.
+    /// process got SIGKILL and the output doesn't say why, `setup_failed`
+    /// when the job failed before any step ran.
     pub kind: &'static str,
     /// The line that shows it.
     pub evidence: String,
@@ -172,6 +173,30 @@ fn failure_cause(text: &str, exit_code: Option<i32>, tail_lines: usize) -> Optio
                kernel reclaiming memory, as when a linker runs out. If no step kills \
                processes or stops containers, give the VM more memory or run fewer jobs at \
                once, such as one with --job, before changing code"
+            .to_string(),
+    })
+}
+
+/// The longest `evidence` a setup failure quotes. Its first line can hold
+/// a whole Dockerfile command.
+const SETUP_EVIDENCE_CHARS: usize = 240;
+
+/// The cause of a job that failed before any step ran: wrkflw couldn't set
+/// it up, as when its image doesn't build or pull. `text` is the job's
+/// log, whose first line is the error.
+fn setup_failure(text: &str) -> Option<FailureCause> {
+    let first = text.lines().map(str::trim).find(|line| !line.is_empty())?;
+    let evidence = match first.char_indices().nth(SETUP_EVIDENCE_CHARS) {
+        Some((cut, _)) => format!("{}…", &first[..cut]),
+        None => first.to_string(),
+    };
+    Some(FailureCause {
+        kind: "setup_failed",
+        evidence,
+        hint: "The job failed before any step ran, while wrkflw set it up: building or \
+               pulling its image, or starting its services. No code under test ran, so this \
+               says nothing about it. The job log has the full error. Pass --platform with \
+               an image that has what the job needs, or fix what the log names"
             .to_string(),
     })
 }
@@ -367,7 +392,11 @@ fn failed_step(
             output_lines,
             env_from_earlier_steps: Vec::new(),
             log_path: job.log.as_deref().map(log_path),
-            cause: failure_cause(&text, None, tail_lines),
+            cause: if job.steps.is_empty() {
+                setup_failure(&text)
+            } else {
+                failure_cause(&text, None, tail_lines)
+            },
         };
     };
     let text = read(&step.log);
@@ -634,6 +663,22 @@ mod tests {
             failure_cause("test killed_by_timeout ... FAILED\n", Some(101), 40),
             None
         );
+    }
+
+    #[test]
+    fn a_job_that_failed_before_its_steps_names_its_setup() {
+        let text = format!(
+            "Runtime error: Failed to build combined runtime image: {}\nLast build output:\n\
+             error: externally-managed-environment\n",
+            "x".repeat(400)
+        );
+        let cause = setup_failure(&text).unwrap();
+        assert_eq!(cause.kind, "setup_failed");
+        assert!(cause.evidence.starts_with("Runtime error: Failed to build"));
+        assert!(cause.evidence.ends_with('…'));
+        assert_eq!(cause.evidence.chars().count(), SETUP_EVIDENCE_CHARS + 1);
+        assert!(cause.hint.contains("before any step ran"));
+        assert_eq!(setup_failure("\n  \n"), None);
     }
 
     #[test]

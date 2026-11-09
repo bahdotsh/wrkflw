@@ -2431,20 +2431,25 @@ fn get_install_script(language: &str, version: &str) -> String {
         }
         // uv installs any CPython, free-threaded or PyPy build the hosted
         // runner offers, from python-build-standalone, without a distro
-        // package for it or a `pip` that PEP 668 refuses to run. The
-        // interpreter is linked where every image finds it, and `pip`
-        // becomes a wrapper so `pip install` works as on the hosted runner.
+        // package for it. The interpreter is linked where every image finds
+        // it, and `pip` becomes a wrapper so `pip install` works as on the
+        // hosted runner. uv marks its interpreters EXTERNALLY-MANAGED, so
+        // PEP 668 makes pip refuse to install anything, and PyPy, which
+        // ships without pip, can't even bootstrap it. setup-python's
+        // interpreters carry no such marker, so it goes.
         "python" => {
             format!(
                 "{install_uv} && \
                  uv python install '{req}' && \
                  p=\"$(uv python find '{req}')\" && \
                  ln -sf \"$p\" /usr/local/bin/python && ln -sf \"$p\" /usr/local/bin/python3 && \
+                 \"$p\" -c '{drop_marker}' && \
                  (\"$p\" -m pip --version >/dev/null 2>&1 || \"$p\" -m ensurepip --upgrade) && \
                  printf '#!/bin/sh\\nexec /usr/local/bin/python -m pip \"$@\"\\n' > /usr/local/bin/pip && \
                  chmod +x /usr/local/bin/pip && ln -sf /usr/local/bin/pip /usr/local/bin/pip3",
                 install_uv = uv_install_unless_present(),
-                req = uv_python_request(version)
+                req = uv_python_request(version),
+                drop_marker = DROP_EXTERNALLY_MANAGED,
             )
         }
         "uv" => uv_install_command(version),
@@ -2496,6 +2501,12 @@ fn get_install_script(language: &str, version: &str) -> String {
     }
 }
 
+/// Python run by the install script: deletes the PEP 668 marker of the
+/// interpreter running it. Single-quoted in the shell, so it holds none.
+const DROP_EXTERNALLY_MANAGED: &str = "import os, sysconfig; \
+     f = os.path.join(sysconfig.get_path(\"stdlib\"), \"EXTERNALLY-MANAGED\"); \
+     os.path.exists(f) and os.remove(f)";
+
 /// The command that installs uv `version` (`latest` or a release such as
 /// `0.9.30`) into `/usr/local/bin`, keeping one already there.
 fn uv_install_command(version: &str) -> String {
@@ -2535,6 +2546,17 @@ fn uv_python_request(version: &str) -> String {
     version.to_string()
 }
 
+/// The Node.js an Ubuntu hosted runner has before any setup step: the
+/// current LTS major, unless the base image already has one.
+const RUNNER_NODE_MAJOR: &str = "22";
+
+fn runner_node_install() -> String {
+    format!(
+        "(command -v node >/dev/null 2>&1 || ({}))",
+        get_install_script("node", RUNNER_NODE_MAJOR)
+    )
+}
+
 /// Generate a Dockerfile that installs multiple language runtimes on an Ubuntu base.
 ///
 /// `base_id` is the base image's local content ID, when known. It goes into
@@ -2564,12 +2586,21 @@ fn generate_combined_dockerfile(
 
     // `build-essential` because hosted Ubuntu runners have a C toolchain,
     // and Rust build scripts, node-gyp, Python C extensions and cgo all
-    // expect one.
+    // expect one. `less` because they have a pager, which tests of CLI
+    // tools run.
     dockerfile.push_str("RUN apt-get update && \\\n");
     dockerfile.push_str(
         "    apt-get install -y --no-install-recommends curl bash git ca-certificates gnupg \
-         build-essential",
+         build-essential less",
     );
+
+    // Hosted runners also have Node.js whatever the job sets up, and tools
+    // such as pyright install their own copy unless one is on PATH. A
+    // base image that has one keeps it, and setup-node replaces it.
+    if !runtimes.iter().any(|rt| rt.language == "node") {
+        dockerfile.push_str(" && \\\n");
+        dockerfile.push_str(&format!("    {}", runner_node_install()));
+    }
 
     for script in &scripts {
         dockerfile.push_str(" && \\\n");
@@ -10605,6 +10636,44 @@ runs:
         let with = HashMap::from([("go-version".to_string(), ">=1.21".to_string())]);
         let steps = vec![make_step_uses("actions/setup-go@v5", Some(with))];
         assert!(detect_setup_runtimes(&steps).is_empty());
+    }
+
+    #[test]
+    fn the_python_install_lets_pip_install_packages() {
+        let script = get_install_script("python", "pypy-3.11");
+        // uv's interpreters carry a PEP 668 marker that makes pip refuse.
+        assert!(script.contains("EXTERNALLY-MANAGED"), "{script}");
+        // The Python that removes it is single-quoted in the shell.
+        assert!(!DROP_EXTERNALLY_MANAGED.contains('\''));
+        let removal = script.find("EXTERNALLY-MANAGED").unwrap();
+        assert!(removal < script.find("ensurepip").unwrap(), "{script}");
+    }
+
+    #[test]
+    fn a_combined_image_has_the_runner_tools_jobs_expect() {
+        let python = vec![SetupRuntime {
+            language: "python".to_string(),
+            version: "3.12".to_string(),
+            install_script: get_install_script("python", "3.12"),
+        }];
+        let df = generate_combined_dockerfile(&python, "ubuntu:latest", None);
+        assert!(df.contains("build-essential less"), "{df}");
+        assert!(df.contains("command -v node"), "{df}");
+        assert!(
+            df.contains(&format!("setup_{}.x", RUNNER_NODE_MAJOR)),
+            "{df}"
+        );
+        assert_eq!(df.matches("RUN ").count(), 1);
+
+        // setup-node's own version is the only Node then.
+        let node = vec![SetupRuntime {
+            language: "node".to_string(),
+            version: "18".to_string(),
+            install_script: get_install_script("node", "18"),
+        }];
+        let df = generate_combined_dockerfile(&node, "ubuntu:latest", None);
+        assert!(!df.contains("command -v node"), "{df}");
+        assert_eq!(df.matches("nodesource").count(), 1, "{df}");
     }
 
     #[test]

@@ -4,7 +4,11 @@
 
 A `uses:` step whose action wrkflw didn't run now makes a passing run's `verdict` `partial` instead of `verified`, with an entry `{job, step, uses, reason}` under `unverified`. That covers a JavaScript action wrkflw has no implementation of, such as `codecov/codecov-action` or `actions/github-script`, and a setup action whose runtime isn't in the job's image: one in a job with `container:`, one inside a composite action, and every setup action under emulation. Workflows that use such actions and used to report `verified` now report `partial`, and `wrkflw gate` prints its partial warning for them. Its exit code is unchanged.
 
-`actions/setup-python` installs Python with uv instead of the deadsnakes PPA, and a `python-version-file` pointing at `pyproject.toml` installs the newest release `requires-python` allows, as the hosted action does. Combined runtime images get new tags, so the first run after upgrading builds them again.
+`actions/setup-python` installs Python with uv instead of the deadsnakes PPA, and a `python-version-file` pointing at `pyproject.toml` installs the newest release `requires-python` allows, as the hosted action does. `pip install` works in it, as on GitHub. The image built for a job with setup actions also gets `less` and, unless the job sets up Node or the base image has it, Node.js 22, as GitHub's Ubuntu runners have. Combined runtime images get new tags, so the first run after upgrading builds them again, and that build takes a little longer.
+
+`wrkflw compare` and `wrkflw gate` pass `--platform` on to the runs they start, and the pre-push hook `gate --install-hook` writes keeps it. Both used to accept the flag and ignore it, so their runs used the built-in images.
+
+A job that fails before any step runs, because its image can't be built or pulled, gets `cause: {kind: "setup_failed"}` in the failure digest, and `compare` says so in its note instead of reporting a plain failure.
 
 For crates that use wrkflw as a library:
 

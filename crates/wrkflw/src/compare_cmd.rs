@@ -11,6 +11,7 @@
 use crate::git::line as git_line;
 use crate::{OutputFormat, RuntimeChoice};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use wrkflw_github::{RemoteJob, RemoteRun};
@@ -20,6 +21,8 @@ use wrkflw_ui::cli_style;
 pub(crate) struct CompareCtx {
     pub(crate) run: String,
     pub(crate) runtime: RuntimeChoice,
+    /// `--platform` overrides, passed on to the local run.
+    pub(crate) platform_overrides: HashMap<String, String>,
     pub(crate) format: OutputFormat,
 }
 
@@ -224,13 +227,20 @@ fn note_for(local: &Value, failures: &[Value]) -> Option<String> {
             || failure["also_failed_in"]
                 .as_array()
                 .is_some_and(|legs| legs.iter().any(|leg| leg == name));
-        here.then(|| failure["cause"]["kind"].as_str()).flatten()
+        here.then(|| &failure["cause"])
+            .filter(|cause| cause.is_object())
     });
-    match cause {
+    match cause.and_then(|cause| cause["kind"].as_str()) {
         Some("out_of_memory") => notes.push("ran out of memory locally".to_string()),
         Some("killed") => notes.push(
             "a process was killed (SIGKILL) locally, most likely for lack of memory".to_string(),
         ),
+        Some("setup_failed") => notes.push(format!(
+            "wrkflw couldn't set the job up locally, so none of its steps ran: {}",
+            cause
+                .and_then(|cause| cause["evidence"].as_str())
+                .unwrap_or("see the job log")
+        )),
         _ => {}
     }
     (!notes.is_empty()).then(|| notes.join("; "))
@@ -328,7 +338,12 @@ fn workflow_path(path: &str) -> Option<&Path> {
 }
 
 /// The child `wrkflw run` that checks the workflow as GitHub ran it.
-fn run_args(remote: &RemoteRun, path: &Path, runtime: &str) -> Vec<String> {
+fn run_args(
+    remote: &RemoteRun,
+    path: &Path,
+    runtime: &str,
+    platform_overrides: &HashMap<String, String>,
+) -> Vec<String> {
     let mut args = vec![
         "--format".to_string(),
         "json".to_string(),
@@ -356,6 +371,8 @@ fn run_args(remote: &RemoteRun, path: &Path, runtime: &str) -> Vec<String> {
         // it against itself, and every `paths:` filter skips the workflow.
         args.extend(["--diff-base".to_string(), before.to_string()]);
     }
+    // `-P` given to compare names the images this machine stands in with.
+    args.extend(crate::platform_args(platform_overrides));
     args
 }
 
@@ -680,7 +697,12 @@ pub(crate) async fn run(ctx: CompareCtx) -> ! {
     });
     let mut child = Command::new(program);
     child
-        .args(run_args(&remote, path, ctx.runtime.as_flag()))
+        .args(run_args(
+            &remote,
+            path,
+            ctx.runtime.as_flag(),
+            &ctx.platform_overrides,
+        ))
         .stdin(Stdio::null())
         .stderr(Stdio::inherit());
     crate::cli_secrets::pass_to(&mut child);
@@ -969,6 +991,28 @@ mod tests {
     }
 
     #[test]
+    fn a_job_wrkflw_could_not_set_up_says_so_instead_of_blaming_the_code() {
+        let failures = vec![json!({
+            "job": "tests (python: pypy-3.11)",
+            "step": null,
+            "cause": {
+                "kind": "setup_failed",
+                "evidence": "Runtime error: Failed to build combined runtime image",
+            },
+        })];
+        let note = note_for(
+            &json!({"name": "tests (python: pypy-3.11)", "status": "failure"}),
+            &failures,
+        )
+        .unwrap();
+        assert!(note.contains("none of its steps ran"), "{note}");
+        assert!(
+            note.contains("Failed to build combined runtime image"),
+            "{note}"
+        );
+    }
+
+    #[test]
     fn a_value_two_keys_share_is_matched_twice() {
         assert!(is_joined_in_some_order(
             "ubuntu, ubuntu",
@@ -1067,14 +1111,24 @@ mod tests {
     fn a_push_run_diffs_against_the_commit_it_pushed_over() {
         let mut run = github_run("success", vec![]);
         run.before = Some("1111111111111111111111111111111111111111".into());
-        let args = run_args(&run, Path::new(".github/workflows/ci.yml"), "docker");
+        let args = run_args(
+            &run,
+            Path::new(".github/workflows/ci.yml"),
+            "docker",
+            &HashMap::new(),
+        );
         assert!(args
             .windows(2)
             .any(|w| w == ["--diff-base", "1111111111111111111111111111111111111111"]));
 
         // A push that created the branch has no earlier commit.
         run.before = Some("0".repeat(40));
-        let args = run_args(&run, Path::new(".github/workflows/ci.yml"), "docker");
+        let args = run_args(
+            &run,
+            Path::new(".github/workflows/ci.yml"),
+            "docker",
+            &HashMap::new(),
+        );
         assert!(!args.iter().any(|arg| arg == "--diff-base"), "{args:?}");
     }
 
@@ -1111,8 +1165,18 @@ mod tests {
             base_branch: Some("main".into()),
             jobs: vec![],
         };
-        let args = run_args(&run, Path::new(".github/workflows/ci.yml"), "docker");
+        let platform = HashMap::from([("ubuntu-latest".to_string(), "my/runner:1".to_string())]);
+        let args = run_args(
+            &run,
+            Path::new(".github/workflows/ci.yml"),
+            "docker",
+            &platform,
+        );
         assert!(args.windows(2).any(|w| w == ["--event", "pull_request"]));
+        // -P reaches the local run, so it runs in the image asked for.
+        assert!(args
+            .windows(2)
+            .any(|w| w == ["--platform", "ubuntu-latest=my/runner:1"]));
         assert!(args.windows(2).any(|w| w == ["--branch", "feat"]));
         assert!(args.windows(2).any(|w| w == ["--base-branch", "main"]));
         assert!(args.windows(2).any(|w| w == ["--diff-base", "origin/main"]));

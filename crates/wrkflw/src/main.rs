@@ -787,6 +787,18 @@ fn collect_platform_overrides(entries: &[Option<(String, String)>]) -> HashMap<S
     entries.iter().flatten().cloned().collect()
 }
 
+/// `overrides` as the `--platform` flags of a child `wrkflw run`, sorted by
+/// label so the command line is the same every time. Commands that start
+/// runs pass them on, as a run started by hand would get them.
+pub(crate) fn platform_args(overrides: &HashMap<String, String>) -> Vec<String> {
+    let mut entries: Vec<(&String, &String)> = overrides.iter().collect();
+    entries.sort();
+    entries
+        .into_iter()
+        .flat_map(|(label, image)| ["--platform".to_string(), format!("{label}={image}")])
+        .collect()
+}
+
 // Parser function for key-value pairs
 fn parse_key_val(s: &str) -> Result<(String, String), String> {
     let pos = s
@@ -1418,6 +1430,7 @@ async fn run_cli() {
                 runtime: runtime.clone(),
                 remote_cache: remote_cache.clone(),
                 install_hook: *install_hook,
+                platform_overrides,
                 format: cli.format,
             });
         }
@@ -1425,6 +1438,7 @@ async fn run_cli() {
             compare_cmd::run(compare_cmd::CompareCtx {
                 run: run.clone(),
                 runtime: runtime.clone(),
+                platform_overrides,
                 format: cli.format,
             })
             .await;
@@ -1913,6 +1927,25 @@ mod tests {
             }
             other => panic!("unexpected command: {:?}", other),
         }
+    }
+
+    #[test]
+    fn platform_args_round_trip_through_the_flag() {
+        let overrides =
+            platform_overrides_from(&["wrkflw", "-P", "windows-latest=w:1,ubuntu-latest=u:1"]);
+        let args = platform_args(&overrides);
+        assert_eq!(
+            args,
+            [
+                "--platform",
+                "ubuntu-latest=u:1",
+                "--platform",
+                "windows-latest=w:1"
+            ]
+        );
+        let mut argv = vec!["wrkflw", "run", "ci.yml"];
+        argv.extend(args.iter().map(String::as_str));
+        assert_eq!(platform_overrides_from(&argv), overrides);
     }
 
     #[test]

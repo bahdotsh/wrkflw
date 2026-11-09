@@ -136,6 +136,15 @@ pub(crate) async fn job_slot(job: Option<&str>) -> Option<OwnedSemaphorePermit> 
     pool.places.clone().acquire_many_owned(weight).await.ok()
 }
 
+/// Whether this run sizes jobs by the memory they were measured to use, so
+/// what they use now is worth keeping for the next run.
+pub(crate) fn sizes_by_memory() -> bool {
+    POOL.try_with(|pool| pool.get().cloned().flatten())
+        .ok()
+        .flatten()
+        .is_some_and(|pool| matches!(pool.limit, Limit::Memory { .. }))
+}
+
 fn env_limit() -> Option<usize> {
     parse_limit(&std::env::var(MAX_PARALLEL_JOBS_ENV).ok()?)
 }

@@ -198,7 +198,8 @@ impl Drop for Active {
 }
 
 /// Run `future`, one job or matrix leg, with a meter of its own, and keep
-/// what it measured if the job named itself with [`measure_as`].
+/// what it measured if the job named itself with [`measure_as`] and the run
+/// sizes jobs by memory: a run that doesn't would never read it back.
 /// `succeeded` says whether the output is a job that passed. A future that
 /// is dropped before it finishes keeps nothing.
 pub(crate) async fn metered<F: std::future::Future>(
@@ -210,7 +211,7 @@ pub(crate) async fn metered<F: std::future::Future>(
     let output = METER.scope(meter.clone(), future).await;
     drop(active);
     let id = meter.id.lock().unwrap_or_else(|e| e.into_inner()).take();
-    if let Some(id) = id {
+    if let Some(id) = id.filter(|_| crate::vm_memory::sizes_by_memory()) {
         let passed = succeeded(&output);
         // The store is a file under a lock: not for the async runtime.
         let _ = tokio::task::spawn_blocking(move || record(&id, &meter, passed)).await;

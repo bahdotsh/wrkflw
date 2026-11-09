@@ -3,6 +3,7 @@
 use crate::record::{JobRecord, RunRecord, RunStatus, StepRecord, SCHEMA_VERSION};
 use crate::store::RunStore;
 use serde::Serialize;
+use std::collections::BTreeSet;
 use wrkflw_executor::{EXIT_CODE_LABEL, STDERR_HEADER, STDOUT_HEADER};
 
 /// Lines of output kept per failed step.
@@ -77,7 +78,8 @@ pub struct FailureDigest {
 #[derive(Debug, Clone, Serialize)]
 pub struct FailedStep {
     pub job: String,
-    /// Other legs of a matrix job that failed in exactly the same way.
+    /// Other legs of a matrix job whose same step failed with the same exit
+    /// code and printed the same thing, or named the same failed tests.
     pub also_failed_in: Vec<String>,
     /// `None` when the job failed outside any step, such as a timeout.
     pub step: Option<String>,
@@ -97,6 +99,10 @@ pub struct FailedStep {
     /// What the output says about the cause, when it points away from the
     /// code, as a process killed for lack of memory does.
     pub cause: Option<FailureCause>,
+    /// The failure lines that name what failed, read from the whole output,
+    /// to tell legs that failed the same tests apart from ones that didn't.
+    #[serde(skip)]
+    signature: BTreeSet<String>,
 }
 
 /// A cause read from a failed step's output.
@@ -295,9 +301,38 @@ fn without_durations(line: &str) -> String {
     words.join(" ")
 }
 
+/// A pytest-style progress marker, such as `[ 76%]`.
+static PROGRESS: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(r"\[\s*\d+%\]").unwrap());
+
+/// Whether `line` names where a failure is: a path or a test id, such as
+/// `tests/test_x.py::test_y` or `src/lib.rs:12`. Lines without one, such as
+/// `py3.12: FAIL code 1`, are a tool's own chatter and often name the leg.
+fn names_a_location(line: &str) -> bool {
+    line.split_whitespace().any(|word| {
+        word.contains("::") || (word.contains('/') && !word.starts_with("http") && word.len() > 1)
+    })
+}
+
+/// The failure lines of everything a step printed that name what failed,
+/// with durations and progress markers blanked. Legs of a matrix that failed
+/// the same tests have the same signature, though they print different
+/// interpreter paths, environment names and process ids around them.
+fn failure_signature(text: &str) -> BTreeSet<String> {
+    let lines: Vec<&str> = text.lines().collect();
+    lines[output_start(&lines)..]
+        .iter()
+        .map(|line| strip_ansi(line))
+        .filter(|line| is_error_line(line) && !reports_pass(line) && names_a_location(line))
+        .map(|line| without_durations(&PROGRESS.replace_all(&line, "")))
+        .collect()
+}
+
 /// Whether two failures of one job are one leg's failure repeated by another.
 /// Scripts and step names are left out: they often differ by nothing but the
 /// matrix value, and the same step printing the same thing is the same bug.
+/// So is the same step naming the same failed tests, whatever else the
+/// legs printed around them.
 fn same_failure(a: &FailedStep, b: &FailedStep) -> bool {
     let printed = |failure: &FailedStep| -> Vec<String> {
         let lines = &failure.output_tail;
@@ -306,7 +341,9 @@ fn same_failure(a: &FailedStep, b: &FailedStep) -> bool {
             .map(|line| without_durations(line))
             .collect()
     };
-    (a.step_index, a.exit_code) == (b.step_index, b.exit_code) && printed(a) == printed(b)
+    let same_tests = !a.signature.is_empty() && a.signature == b.signature;
+    (a.step_index, a.exit_code) == (b.step_index, b.exit_code)
+        && (same_tests || printed(a) == printed(b))
 }
 
 /// The failures of `run`, with the legs of a matrix job that failed the same
@@ -425,6 +462,7 @@ fn failed_step(
             } else {
                 failure_cause(&text, None, tail_lines)
             },
+            signature: failure_signature(&text),
         };
     };
     let text = read(&step.log);
@@ -450,6 +488,7 @@ fn failed_step(
         env_from_earlier_steps: env,
         log_path: step.log.as_deref().map(log_path),
         cause: failure_cause(&text, step.exit_code, tail_lines),
+        signature: failure_signature(&text),
     }
 }
 
@@ -546,6 +585,7 @@ mod tests {
             env_from_earlier_steps: Vec::new(),
             log_path: None,
             cause: None,
+            signature: BTreeSet::new(),
         }
     }
 
@@ -860,6 +900,94 @@ mod tests {
         };
         assert_eq!(cause("image"), Some("setup_failed"));
         assert_eq!(cause("expression"), None);
+    }
+
+    /// Matrix legs that fail the same tests are one failure, though each
+    /// prints its own interpreter path, tox environment and process id.
+    #[test]
+    fn legs_that_fail_the_same_tests_fold_into_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = RunStore::at(dir.path());
+        let leg = |python: &str, failed: &[&str]| {
+            let mut text = String::from(
+                "Exit code: 1\nCommand: tox\n\nStandard Output:\n\
+                 tests/test_a.py::test_ok PASSED [ 10%]\n",
+            );
+            for test in failed {
+                text.push_str(&format!("tests/test_a.py::{test} FAILED [ 76%]\n"));
+            }
+            text.push_str(&format!(
+                "/root/.local/share/uv/python/cpython-{python}/lib/x.py:1: in touch\n\
+                 =========================== short test summary info ===\n"
+            ));
+            for test in failed {
+                text.push_str(&format!("FAILED tests/test_a.py::{test} - OSError\n"));
+            }
+            text.push_str(&format!(
+                "=== {} failed, 2604 passed in 3.{}s ===\n\
+                 py{python}: exit 1 (4.1 seconds) pid=4{}\n  py{python}: FAIL code 1\n",
+                failed.len(),
+                python.len(),
+                python.len()
+            ));
+            text
+        };
+        let job = |name: &str| {
+            serde_json::json!({
+                "name": name, "canonical_name": "tests", "status": "failure",
+                "failure_allowed": false, "duration_ms": 1, "log": null,
+                "steps": [{
+                    "index": 3, "name": "tox", "status": "failure", "outcome": "failure",
+                    "conclusion": "failure", "exit_code": 1, "duration_ms": 1,
+                    "command": "tox", "uses": null, "env_set": [],
+                    "log": format!("{name}.log"),
+                }],
+            })
+        };
+        let run: RunRecord = serde_json::from_value(serde_json::json!({
+            "schema_version": SCHEMA_VERSION, "id": "r", "status": "failure",
+            "workflow": "ci.yml", "cwd": "/repo", "repo_root": "/repo", "git_sha": null,
+            "git_branch": null, "git_dirty": null, "runtime": "docker", "event": null,
+            "source": "cli", "agent": null, "intent": null, "session": null,
+            "replay_of": null, "argv": [], "variables": [], "pid": 1, "started_at": "",
+            "finished_at": null, "duration_ms": null, "error": null, "skip_reason": null,
+            "jobs": [job("3.15"), job("3.10"), job("pypy3.11")],
+        }))
+        .unwrap();
+        store
+            .write_log("r", "3.15.log", &leg("3.15", &["test_surrogates"]))
+            .unwrap();
+        store
+            .write_log("r", "3.10.log", &leg("3.10", &["test_surrogates"]))
+            .unwrap();
+        // Another test failing is another failure.
+        store
+            .write_log("r", "pypy3.11.log", &leg("pypy3.11", &["test_other"]))
+            .unwrap();
+
+        let digest = failure_digest(&store, &run, 6).unwrap();
+        assert_eq!(digest.failures.len(), 2, "{:#?}", digest.failures);
+        assert_eq!(digest.failures[0].job, "3.15");
+        assert_eq!(digest.failures[0].also_failed_in, ["3.10"]);
+        assert_eq!(digest.failures[1].job, "pypy3.11");
+    }
+
+    #[test]
+    fn a_failure_signature_keeps_only_lines_that_name_what_failed() {
+        let text = "Standard Output:\n\
+                    tests/t.py::a FAILED [ 50%]\n\
+                    tests/t.py::b PASSED [100%]\n\
+                    py3.12: FAIL code 1 (4.2 seconds)\n\
+                    error: could not compile `x`\n\
+                    src/lib.rs:3: error: mismatched types in 0.2s\n";
+        let signature: Vec<String> = failure_signature(text).into_iter().collect();
+        assert_eq!(
+            signature,
+            [
+                "src/lib.rs:3: error: mismatched types in <duration>",
+                "tests/t.py::a FAILED"
+            ]
+        );
     }
 
     #[test]

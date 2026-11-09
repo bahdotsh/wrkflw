@@ -588,6 +588,25 @@ mod tests {
     }
 
     #[test]
+    fn an_entry_from_before_unrun_actions_were_kept_is_a_miss() {
+        // Schema 1 didn't record the actions a pass skipped, so reusing it
+        // could turn a partial pass into a verified one.
+        let old: Entry = serde_json::from_value(serde_json::json!({
+            "schema": 1,
+            "key": "k",
+            "created_at": 100,
+            "jobs": [{"name": "a", "canonical_name": "a", "outputs": {}}],
+        }))
+        .unwrap();
+        assert!(!old.is_usable("k", 100));
+        let current = Entry {
+            schema: ENTRY_SCHEMA,
+            ..old
+        };
+        assert!(current.is_usable("k", 100));
+    }
+
+    #[test]
     fn the_ttl_comes_from_the_environment_or_the_default() {
         assert_eq!(parse_ttl(None), DEFAULT_TTL_SECS);
         assert_eq!(parse_ttl(Some("60")), 60);

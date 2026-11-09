@@ -7,11 +7,20 @@
 //! jobs measured as light run together, and a job never measured still gets
 //! the room it always got.
 //!
-//! A step that ran out of memory forgets the job's measurements, so its
-//! next run is given the old room again. That is a step container the
-//! engine reports as OOM-killed, one that exited with SIGKILL's code, or
-//! one whose output reports a process killed by SIGKILL, as cargo and
-//! compilers do for the `rustc` or `ld` the kernel picked.
+//! A step that ran out of memory forgets the measurements of every job
+//! running at the time, so their next runs are given the old room again.
+//! Step containers have no memory limit of their own, so the kernel picks
+//! a process anywhere in the VM, and the job it kills need not be the one
+//! that outgrew its estimate. A killed step is one the engine reports as
+//! OOM-killed, one that exited with SIGKILL's code, or one whose output
+//! reports a process killed by SIGKILL, as cargo and compilers do for the
+//! `rustc` or `ld` the kernel picked, and a shell does as `Killed`.
+//!
+//! Only a job that ran to the end and passed records a peak: one that
+//! failed or was cancelled part way used less than a whole run does. A job
+//! whose containers couldn't all be measured, as with a job container or
+//! Podman, forgets what an earlier run measured, which no longer says what
+//! it needs.
 //!
 //! Only step containers are measured. Building the job's image and the
 //! helper that copies its workspace run outside any job's measurement, so
@@ -57,6 +66,17 @@ const KILLED_CHILD_SIGNS: &[&str] = &[
     "Killed signal terminated program",
 ];
 
+/// Whether `text` holds a shell's report of a process it started being
+/// killed by SIGKILL: `Killed` alone, or bash's `line 3:  412 Killed  cmd`.
+fn shell_reports_kill(text: &str) -> bool {
+    text.lines().map(str::trim).any(|line| {
+        line == "Killed"
+            || line
+                .split_once(": line ")
+                .is_some_and(|(_, rest)| rest.split_whitespace().nth(2) == Some("Killed"))
+    })
+}
+
 /// Whether a step container ended as the out-of-memory killer ends one:
 /// the engine says so, it exited as SIGKILL leaves a shell, or a tool in it
 /// reports a child killed that way.
@@ -64,9 +84,10 @@ pub(crate) fn ran_out_of_memory(exit_code: i32, oom_killed: bool, output: &[&str
     exit_code == SIGKILL_EXIT
         || oom_killed
         || (exit_code != 0
-            && output
-                .iter()
-                .any(|text| KILLED_CHILD_SIGNS.iter().any(|sign| text.contains(sign))))
+            && output.iter().any(|text| {
+                KILLED_CHILD_SIGNS.iter().any(|sign| text.contains(sign))
+                    || shell_reports_kill(text)
+            }))
 }
 
 /// What a job's containers used while it ran.
@@ -82,6 +103,10 @@ pub(crate) struct JobMeter {
     incomplete: AtomicBool,
     /// A container was killed as if out of memory.
     killed: AtomicBool,
+    /// A container of another job was killed while this one ran.
+    neighbour_killed: AtomicBool,
+    /// What the job's measurements are kept under, once it says.
+    id: Mutex<Option<String>>,
 }
 
 impl JobMeter {
@@ -107,9 +132,15 @@ impl JobMeter {
         self.incomplete.store(true, Ordering::Relaxed);
     }
 
-    /// A container ended as the out-of-memory killer ends one.
+    /// A container ended as the out-of-memory killer ends one. Every job
+    /// running beside it may be the one that used the memory.
     pub(crate) fn killed(&self) {
         self.killed.store(true, Ordering::Relaxed);
+        for meter in ACTIVE.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+            if let Some(meter) = meter.upgrade() {
+                meter.neighbour_killed.store(true, Ordering::Relaxed);
+            }
+        }
     }
 
     #[cfg(test)]
@@ -118,7 +149,7 @@ impl JobMeter {
     }
 
     fn outcome(&self) -> Outcome {
-        if self.killed.load(Ordering::Relaxed) {
+        if self.killed.load(Ordering::Relaxed) || self.neighbour_killed.load(Ordering::Relaxed) {
             Outcome::Killed
         } else if self.incomplete.load(Ordering::Relaxed) || !self.sampled.load(Ordering::Relaxed) {
             Outcome::Unknown
@@ -139,9 +170,60 @@ tokio::task_local! {
     static METER: Arc<JobMeter>;
 }
 
-/// Run `future`, one job or matrix leg, with a meter of its own.
-pub(crate) async fn metered<F: std::future::Future>(future: F) -> F::Output {
-    METER.scope(Arc::new(JobMeter::default()), future).await
+/// The meters of the jobs running now, in every run of this process: they
+/// share one VM.
+static ACTIVE: Mutex<Vec<std::sync::Weak<JobMeter>>> = Mutex::new(Vec::new());
+
+/// Keeps a meter in [`ACTIVE`] while its job runs.
+struct Active(Arc<JobMeter>);
+
+impl Active {
+    fn register(meter: &Arc<JobMeter>) -> Active {
+        ACTIVE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(Arc::downgrade(meter));
+        Active(meter.clone())
+    }
+}
+
+impl Drop for Active {
+    fn drop(&mut self) {
+        let mine = Arc::as_ptr(&self.0);
+        ACTIVE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|meter| meter.strong_count() > 0 && meter.as_ptr() != mine);
+    }
+}
+
+/// Run `future`, one job or matrix leg, with a meter of its own, and keep
+/// what it measured if the job named itself with [`measure_as`].
+/// `succeeded` says whether the output is a job that passed. A future that
+/// is dropped before it finishes keeps nothing.
+pub(crate) async fn metered<F: std::future::Future>(
+    future: F,
+    succeeded: impl FnOnce(&F::Output) -> bool,
+) -> F::Output {
+    let meter = Arc::new(JobMeter::default());
+    let active = Active::register(&meter);
+    let output = METER.scope(meter.clone(), future).await;
+    drop(active);
+    let id = meter.id.lock().unwrap_or_else(|e| e.into_inner()).take();
+    if let Some(id) = id {
+        let passed = succeeded(&output);
+        // The store is a file under a lock: not for the async runtime.
+        let _ = tokio::task::spawn_blocking(move || record(&id, &meter, passed)).await;
+    }
+    output
+}
+
+/// Name the current job's measurements, so [`metered`] keeps them under
+/// `id` when the job is over.
+pub(crate) fn measure_as(id: &str) {
+    if let Some(meter) = meter() {
+        *meter.id.lock().unwrap_or_else(|e| e.into_inner()) = Some(id.to_string());
+    }
 }
 
 /// The meter of the job being run, if any.
@@ -157,26 +239,6 @@ pub(crate) fn unmeasured() {
     }
 }
 
-/// Keeps what the current job's meter saw once the job is over.
-pub(crate) struct Recorder {
-    id: String,
-    meter: Option<Arc<JobMeter>>,
-}
-
-impl Recorder {
-    pub(crate) fn new(id: String) -> Recorder {
-        Recorder { id, meter: meter() }
-    }
-}
-
-impl Drop for Recorder {
-    fn drop(&mut self) {
-        if let Some(meter) = &self.meter {
-            record(&self.id, meter);
-        }
-    }
-}
-
 /// What identifies a job across runs, without saying which repository it is.
 pub(crate) fn job_id(identity: &str) -> String {
     let digest = Sha256::digest(identity.as_bytes());
@@ -187,7 +249,11 @@ pub(crate) fn job_id(identity: &str) -> String {
 /// `None` when it has none.
 fn reserve_for(peaks: &[u64]) -> Option<u64> {
     let peak = peaks.iter().copied().max()?;
-    Some((peak + peak / 2 + HEADROOM_BYTES).max(MIN_RESERVED_BYTES))
+    Some(
+        peak.saturating_add(peak / 2)
+            .saturating_add(HEADROOM_BYTES)
+            .max(MIN_RESERVED_BYTES),
+    )
 }
 
 /// The store's format. A file in any other is read as empty.
@@ -267,20 +333,30 @@ pub(crate) fn reserve(id: &str) -> Option<u64> {
     reserve_for(&load(&path).jobs.get(id)?.peaks)
 }
 
-/// Keep what `meter` saw of the job `id`.
-pub(crate) fn record(id: &str, meter: &JobMeter) {
+/// Keep what `meter` saw of the job `id`, which ran to its end and
+/// `passed` or not.
+fn record(id: &str, meter: &JobMeter, passed: bool) {
     let Some(path) = store_path() else {
         return;
     };
-    let outcome = meter.outcome();
-    if outcome == Outcome::Unknown {
+    let Some(outcome) = to_keep(meter.outcome(), passed) else {
         return;
-    }
+    };
     let _guard = STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // Held from load to write, so another process's update isn't lost,
     // least of all one that forgets a job that ran out of memory.
-    let _file = lock_file(&path, true);
+    let Some(_file) = lock_file(&path, true) else {
+        wrkflw_logging::debug(&format!(
+            "Could not lock {}, so this job's memory isn't kept",
+            path.display()
+        ));
+        return;
+    };
     let mut store = load(&path);
+    if !matches!(outcome, Outcome::Peak(_)) && !store.jobs.contains_key(id) {
+        // Nothing to forget.
+        return;
+    }
     apply(&mut store, id, outcome, chrono::Utc::now().timestamp());
     let written = (|| -> std::io::Result<()> {
         let dir = path.parent().unwrap_or(std::path::Path::new("."));
@@ -299,6 +375,15 @@ pub(crate) fn record(id: &str, meter: &JobMeter) {
     }
 }
 
+/// What to keep of a finished job's `outcome`. A failed job may have
+/// stopped before its heaviest step, so its peak says nothing.
+fn to_keep(outcome: Outcome, passed: bool) -> Option<Outcome> {
+    match outcome {
+        Outcome::Peak(_) if !passed => None,
+        outcome => Some(outcome),
+    }
+}
+
 fn apply(store: &mut Store, id: &str, outcome: Outcome, now: i64) {
     match outcome {
         Outcome::Peak(bytes) => {
@@ -308,14 +393,14 @@ fn apply(store: &mut Store, id: &str, outcome: Outcome, now: i64) {
             measured.peaks.drain(..excess);
             measured.at = now;
         }
-        Outcome::Killed => {
+        // What was measured no longer says what the job needs.
+        Outcome::Killed | Outcome::Unknown => {
             store.jobs.remove(id);
         }
-        Outcome::Unknown => {}
     }
     store
         .jobs
-        .retain(|_, measured| now - measured.at < FORGET_AFTER_SECS);
+        .retain(|_, measured| now.saturating_sub(measured.at) < FORGET_AFTER_SECS);
 }
 
 #[cfg(test)]
@@ -333,7 +418,7 @@ mod tests {
     }
 
     #[test]
-    fn the_estimate_follows_the_latest_runs_and_a_kill_forgets_it() {
+    fn the_estimate_follows_the_latest_runs_and_a_kill_or_a_gap_forgets_it() {
         let mut store = Store::default();
         for peak in [900, 100, 200, 300] {
             apply(&mut store, "job", Outcome::Peak(peak * MIB), 1000);
@@ -342,10 +427,17 @@ mod tests {
             store.jobs["job"].peaks,
             vec![100 * MIB, 200 * MIB, 300 * MIB]
         );
-        apply(&mut store, "job", Outcome::Unknown, 1000);
-        assert_eq!(store.jobs["job"].peaks.len(), 3);
         apply(&mut store, "job", Outcome::Killed, 1000);
         assert!(!store.jobs.contains_key("job"));
+        // A run that couldn't be measured, as with a job container added
+        // since, leaves the old numbers no longer saying what it needs.
+        apply(&mut store, "job", Outcome::Peak(MIB), 1000);
+        apply(&mut store, "job", Outcome::Unknown, 1000);
+        assert!(!store.jobs.contains_key("job"));
+        // Only a job that passed keeps its peak.
+        assert_eq!(to_keep(Outcome::Peak(MIB), false), None);
+        assert_eq!(to_keep(Outcome::Peak(MIB), true), Some(Outcome::Peak(MIB)));
+        assert_eq!(to_keep(Outcome::Killed, false), Some(Outcome::Killed));
     }
 
     #[test]
@@ -384,6 +476,15 @@ mod tests {
         let gcc = "collect2: fatal error: ld terminated with signal 9 [Killed]";
         assert!(ran_out_of_memory(1, false, &[gcc]));
         assert!(!ran_out_of_memory(1, false, &["test failed"]));
+        // A shell reports the child the kernel killed.
+        assert!(ran_out_of_memory(1, false, &["Killed\n"]));
+        let bash = "bash: line 3:   412 Killed                  pytest -n 4";
+        assert!(ran_out_of_memory(1, false, &[bash]));
+        assert!(!ran_out_of_memory(
+            1,
+            false,
+            &["test_kill_switch Killed it: FAILED"]
+        ));
         // A step that passed wasn't killed, whatever it printed.
         assert!(!ran_out_of_memory(0, false, &[cargo]));
     }
@@ -409,11 +510,42 @@ mod tests {
         assert!(meter().is_none());
         // Both meters are held to the end, so neither address can be reused.
         let (a, b) = tokio::join!(
-            metered(async { meter().unwrap() }),
-            metered(async { meter().unwrap() })
+            metered(async { meter().unwrap() }, |_| true),
+            metered(async { meter().unwrap() }, |_| true)
         );
         assert!(!Arc::ptr_eq(&a, &b));
         a.sample("step", 1);
-        assert_eq!(b.outcome(), Outcome::Unknown);
+        assert_ne!(b.outcome(), Outcome::Peak(1));
+    }
+
+    #[tokio::test]
+    async fn a_kill_in_one_job_forgets_every_job_running_beside_it() {
+        let (killer_done, killer_go) = tokio::sync::oneshot::channel::<()>();
+        let (neighbour, finished) = tokio::join!(
+            metered(
+                async {
+                    let mine = meter().unwrap();
+                    mine.sample("light", 1);
+                    // Still running when the other job's step is killed.
+                    let _ = killer_go.await;
+                    mine
+                },
+                |_| true
+            ),
+            metered(
+                async {
+                    meter().unwrap().killed();
+                    let _ = killer_done.send(());
+                    meter().unwrap()
+                },
+                |_| true
+            )
+        );
+        assert_eq!(finished.outcome(), Outcome::Killed);
+        assert_eq!(neighbour.outcome(), Outcome::Killed);
+        // A job that starts afterwards is not affected.
+        let later = metered(async { meter().unwrap() }, |_| true).await;
+        later.sample("step", 1);
+        assert_eq!(later.outcome(), Outcome::Peak(1));
     }
 }

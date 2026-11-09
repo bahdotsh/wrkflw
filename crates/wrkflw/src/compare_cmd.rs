@@ -353,9 +353,11 @@ const TAG_EVENTS: &[&str] = &[
 ///
 /// GitHub gives a run triggered by a tag push the tag's name there, with
 /// nothing else in the run to say it is one. It is a tag when a tag of
-/// that name points at the run's commit here, or, when this clone knows
-/// neither a tag nor an `origin` branch of that name, as in a shallow
-/// clone, when `origin` has such a tag. Only [`TAG_EVENTS`] are checked.
+/// that name points at the run's commit here. A tag of that name at
+/// another commit, one moved since this clone fetched it, still makes it a
+/// tag unless `origin` has a branch of that name too. When this clone knows
+/// neither, as in a shallow clone, it is a tag when `origin` has one. Only
+/// [`TAG_EVENTS`] are checked.
 fn head_is_tag(remote: &RemoteRun) -> bool {
     head_is_tag_with(remote, git_line)
 }
@@ -375,8 +377,8 @@ fn head_is_tag_with(remote: &RemoteRun, git: impl Fn(&[&str]) -> Option<String>)
         "--verify",
         &format!("refs/tags/{name}^{{commit}}"),
     ]);
-    if let Some(commit) = tagged {
-        return commit == remote.head_sha;
+    if tagged.as_deref() == Some(remote.head_sha.as_str()) {
+        return true;
     }
     let branch_known = git(&[
         "rev-parse",
@@ -385,6 +387,9 @@ fn head_is_tag_with(remote: &RemoteRun, git: impl Fn(&[&str]) -> Option<String>)
         &format!("refs/remotes/origin/{name}"),
     ])
     .is_some();
+    if tagged.is_some() {
+        return !branch_known;
+    }
     !branch_known
         && git(&[
             "ls-remote",
@@ -1298,8 +1303,17 @@ mod tests {
         assert!(head_is_tag_with(&run, fake_git(&refs, &asked)));
         assert_eq!(asked.borrow().len(), 1);
 
-        // A local tag of that name elsewhere: the run was for a branch.
+        // A local tag of that name elsewhere, as when it was moved since
+        // this clone fetched it, is still the tag, without the network.
+        let asked = std::cell::RefCell::new(Vec::new());
         let refs = [("refs/tags/v1.0^{commit}", "def")];
+        assert!(head_is_tag_with(&run, fake_git(&refs, &asked)));
+        assert!(!asked.borrow().iter().any(|a| a.starts_with("ls-remote")));
+        // Unless `origin` has a branch of that name: the run was for it.
+        let refs = [
+            ("refs/tags/v1.0^{commit}", "def"),
+            ("refs/remotes/origin/v1.0", "abc"),
+        ];
         assert!(!head_is_tag_with(&run, fake_git(&refs, &asked)));
 
         // A known `origin` branch settles it without the network.

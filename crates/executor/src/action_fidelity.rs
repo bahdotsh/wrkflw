@@ -37,6 +37,7 @@ impl UnexecutedAction {
     /// report it, next to the entries for jobs run as another OS.
     pub fn unverified_entry(&self, job: &str) -> serde_json::Value {
         serde_json::json!({
+            "kind": "action_not_run",
             "job": job,
             "step": self.step,
             "uses": self.uses,

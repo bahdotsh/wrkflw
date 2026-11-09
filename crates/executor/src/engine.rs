@@ -2020,6 +2020,10 @@ fn determine_action_image(repository: &str) -> String {
 
 /// When `cause` says `uses` did not run, warn so and return it for the
 /// step's [`StepResult::actions_not_run`].
+/// Why an `actions-rs/cargo` step that ran its `command` doesn't count as
+/// run in a container runtime.
+const CARGO_RAN_ON_HOST: &str = "its cargo command ran on this machine, not in the job's image";
+
 fn report_action_not_run(uses: &str, cause: Option<&str>) -> Option<String> {
     let cause = cause?;
     wrkflw_logging::warning(&format!(
@@ -2809,11 +2813,10 @@ async fn execute_job_with_matrix(
             verbose,
             services,
         };
-        let result = crate::job_memory::metered(job_session::with_job_session(
-            job,
-            runtime,
-            execute_job(ctx),
-        ))
+        let result = crate::job_memory::metered(
+            job_session::with_job_session(job, runtime, execute_job(ctx)),
+            job_passed,
+        )
         .await?;
         let results = vec![result];
         store_passing_result(result_key.as_deref(), &results, env_context).await;
@@ -2911,7 +2914,9 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
     // own, and a caller holding one would deadlock a limit of one.
     let memory_id = job_memory_id(&ctx.workflow.name, ctx.job_name);
     let _slot = crate::vm_memory::job_slot(memory_id.as_deref()).await;
-    let _recorder = memory_id.map(crate::job_memory::Recorder::new);
+    if let Some(id) = &memory_id {
+        crate::job_memory::measure_as(id);
+    }
 
     // Clone context and add job-specific variables.
     // `job_env` is the full lookup map (runner + user union); `job_user_env`
@@ -3166,21 +3171,24 @@ async fn execute_matrix_combinations(
 
         // Process this chunk of combinations in parallel
         let chunk_futures = chunk.iter().map(|combination| {
-            crate::job_memory::metered(job_session::with_job_session(
-                ctx.job_template,
-                ctx.runtime,
-                execute_matrix_job(
-                    ctx.job_name,
+            crate::job_memory::metered(
+                job_session::with_job_session(
                     ctx.job_template,
-                    combination,
-                    ctx.workflow,
                     ctx.runtime,
-                    ctx.env_context,
-                    ctx.user_env,
-                    ctx.verbose,
-                    &ctx.services,
+                    execute_matrix_job(
+                        ctx.job_name,
+                        ctx.job_template,
+                        combination,
+                        ctx.workflow,
+                        ctx.runtime,
+                        ctx.env_context,
+                        ctx.user_env,
+                        ctx.verbose,
+                        &ctx.services,
+                    ),
                 ),
-            ))
+                job_passed,
+            )
         });
 
         let chunk_results = future::join_all(chunk_futures).await;
@@ -3286,7 +3294,9 @@ async fn execute_matrix_job(
     // One place in the run's pool for the leg, as for any job.
     let memory_id = job_memory_id(&workflow.name, &matrix_job_name);
     let _slot = crate::vm_memory::job_slot(memory_id.as_deref()).await;
-    let _recorder = memory_id.map(crate::job_memory::Recorder::new);
+    if let Some(id) = &memory_id {
+        crate::job_memory::measure_as(id);
+    }
 
     wrkflw_logging::info(&format!("Executing matrix job: {}", matrix_job_name));
 
@@ -3573,6 +3583,14 @@ pub(crate) struct JobServices<'a> {
 /// Flush pending cache saves. Called at end-of-job only when the job succeeded,
 /// matching GitHub Actions' behavior where `actions/cache` saves in a post-step
 /// hook that only runs after all steps complete and the job succeeds.
+/// Whether `result` is a job that ran and passed, so what it used stands
+/// for a whole run of it.
+fn job_passed(result: &Result<JobResult, ExecutionError>) -> bool {
+    result
+        .as_ref()
+        .is_ok_and(|job| job.status == JobStatus::Success && job.repeated_from.is_none())
+}
+
 /// The id a job's memory measurements are kept under.
 fn job_memory_id(workflow: &str, job: &str) -> Option<String> {
     let repo = std::env::current_dir().ok()?;
@@ -4944,7 +4962,14 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                                     }))
                                     .await?;
                                     result.name = step_name;
-                                    return Ok(result);
+                                    // Only the extras ran. The toolchain the
+                                    // step asked for is installed only when
+                                    // the job's image was built with it.
+                                    let not_run = report_action_not_run(
+                                        uses,
+                                        ctx.unrun_action_cause(&action_info.repository),
+                                    );
+                                    return Ok(result.without_running(not_run));
                                 } else if !baked {
                                     wrkflw_logging::warning(&format!(
                                         "{}: components and targets can't be added for later \
@@ -5046,6 +5071,13 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                                         cmd.env(key, value);
                                     }
 
+                                    // In a container runtime this ran on
+                                    // this machine, not in the job's image.
+                                    let not_run = if uses_container_runtime(ctx.job_env) {
+                                        report_action_not_run(uses, Some(CARGO_RAN_ON_HOST))
+                                    } else {
+                                        None
+                                    };
                                     match cmd.output().await {
                                         Ok(output) => {
                                             let exit_code = output.status.code().unwrap_or(-1);
@@ -5062,7 +5094,8 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                                                     StepStatus::Failure
                                                 },
                                                 format!("{}\n{}", stdout, stderr),
-                                            ));
+                                            )
+                                            .without_running(not_run));
                                         }
                                         Err(e) => {
                                             return Ok(StepResult::new(
@@ -5078,12 +5111,9 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                     }
 
                     let mut action_not_run: Option<String> = None;
-                    if action_info.is_docker {
-                        // Docker actions just run the container
-                        cmd.push("sh");
-                        cmd.push("-c");
-                        cmd.push("echo 'Executing Docker action'");
-                    } else if action_info.is_local {
+                    // A `docker://` action ran natively above, so none
+                    // reaches here.
+                    if action_info.is_local {
                         // A local Docker action ran natively and a local
                         // composite action step by step, both above. What
                         // reaches here is a local JavaScript action, which
@@ -9844,7 +9874,8 @@ runs:
         let runtimes = detect_setup_runtimes(&steps);
         assert_eq!(runtimes.len(), 1);
         assert_eq!(runtimes[0].language, "node");
-        assert_eq!(runtimes[0].version, "20");
+        // No version: the runner's own Node, as setup-node keeps it.
+        assert_eq!(runtimes[0].version, RUNNER_NODE_MAJOR);
         assert!(!runtimes[0].install_script.is_empty());
     }
 
@@ -10415,6 +10446,115 @@ runs:
             detect_setup_runtimes(&[make_step_uses("actions/setup-node@v4", Some(with))]);
         assert_eq!(detected[0].version, "20");
         assert!(detected[0].install_script.contains("setup_20.x"));
+    }
+
+    fn setup_version(uses: &str, with: &[(&str, &str)], root: &Path) -> Option<String> {
+        let with: HashMap<String, String> = with
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let steps = vec![make_step_uses(uses, Some(with))];
+        detect_setup_in(&steps, root)
+            .runtimes
+            .into_iter()
+            .next()
+            .map(|rt| rt.version)
+    }
+
+    #[test]
+    fn an_empty_version_input_reads_the_version_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".nvmrc"), "18.20.4\n").unwrap();
+        let version = setup_version(
+            "actions/setup-node@v4",
+            &[("node-version", " "), ("node-version-file", ".nvmrc")],
+            dir.path(),
+        );
+        assert_eq!(version.as_deref(), Some("18.20.4"));
+    }
+
+    #[test]
+    fn setup_python_with_no_version_reads_dot_python_version() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            setup_version("actions/setup-python@v5", &[], dir.path()).as_deref(),
+            Some("3.11")
+        );
+        std::fs::write(dir.path().join(".python-version"), "3.13\n").unwrap();
+        assert_eq!(
+            setup_version("actions/setup-python@v5", &[], dir.path()).as_deref(),
+            Some("3.13")
+        );
+        // A specifier written with spaces, as setup-python takes it.
+        assert_eq!(
+            setup_version(
+                "actions/setup-python@v5",
+                &[("python-version", ">= 3.10")],
+                dir.path()
+            )
+            .as_deref(),
+            Some(">=3.10")
+        );
+    }
+
+    #[test]
+    fn setup_node_with_no_version_keeps_the_runners_node() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            setup_version("actions/setup-node@v4", &[], dir.path()).as_deref(),
+            Some(RUNNER_NODE_MAJOR)
+        );
+    }
+
+    #[test]
+    fn a_pinned_node_release_is_installed_exactly() {
+        let exact = get_install_script("node", "20.11.0");
+        assert!(
+            exact.contains("nodejs.org/dist/v20.11.0/node-v20.11.0-linux-"),
+            "{exact}"
+        );
+        assert!(!exact.contains("nodesource"));
+        assert!(get_install_script("node", "20").contains("setup_20.x"));
+    }
+
+    #[test]
+    fn go_pre_releases_and_oldstable_are_named_as_go_dev_names_them() {
+        assert!(get_install_script("go", "1.22rc1").contains("GO=go1.22rc1 "));
+        assert!(get_install_script("go", "1.22.0-rc.1").contains("GO=go1.22rc1 "));
+        assert!(get_install_script("go", "1.23beta2").contains("GO=go1.23beta2 "));
+        assert!(get_install_script("go", "oldstable").contains("sed -n 2p"));
+        // What go.dev can't name is refused before the build, not by it.
+        let dir = tempfile::tempdir().unwrap();
+        for unknown in ["latest", "1.22.x.y", "tip"] {
+            let steps = vec![make_step_uses(
+                "actions/setup-go@v5",
+                Some(HashMap::from([(
+                    "go-version".to_string(),
+                    unknown.to_string(),
+                )])),
+            )];
+            let detection = detect_setup_in(&steps, dir.path());
+            assert!(detection.runtimes.is_empty(), "{unknown}");
+            assert_eq!(detection.refused, ["go"], "{unknown}");
+        }
+    }
+
+    #[test]
+    fn python_pre_releases_reach_uv_in_its_spelling() {
+        assert_eq!(uv_python_request("3.14.0-alpha.1"), "3.14.0a1");
+        assert_eq!(uv_python_request("3.14.0-beta.2"), "3.14.0b2");
+        assert_eq!(uv_python_request("3.14.0-rc.1"), "3.14.0rc1");
+        assert_eq!(uv_python_request("pypy-3.11"), "pypy@3.11");
+    }
+
+    #[test]
+    fn a_longer_key_is_not_requires_python() {
+        let text = "[project]\nrequires-python-extra = \"x\"\nrequires-python = \">=3.9\"\n";
+        assert_eq!(
+            crate::setup_actions::requires_python(text).as_deref(),
+            Some(">=3.9")
+        );
+        assert!(!is_safe_version("3.1\u{0663}"));
     }
 
     #[test]

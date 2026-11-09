@@ -335,6 +335,20 @@ impl Recorder {
             let existing = Self::job_mut(record, &job.name, &job.canonical_name);
             existing.steps = steps;
             existing.log = existing.log.take().or(log);
+            // The events that would have named them were lost with the rest,
+            // and a pass that skipped an action must not read as verified.
+            if existing.actions_not_run.is_empty() {
+                existing.actions_not_run = job
+                    .steps
+                    .iter()
+                    .flat_map(|step| {
+                        step.actions_not_run.iter().map(|uses| UnexecutedAction {
+                            step: step.name.clone(),
+                            uses: uses.clone(),
+                        })
+                    })
+                    .collect();
+            }
         }
     }
 
@@ -1067,6 +1081,58 @@ mod tests {
         assert_eq!(line["jobs"][0]["repeated_from"], "b (os: ubuntu-latest)");
         assert_eq!(line["jobs"][0]["runner"]["requested"], "windows-latest");
         assert!(line["jobs"][1].get("repeated_from").is_none());
+    }
+
+    #[test]
+    fn a_job_whose_events_were_lost_keeps_the_actions_it_did_not_run() {
+        use wrkflw_executor::engine::{JobResult, JobStatus, StepResult, StepStatus};
+        let scratch = tempfile::tempdir().unwrap();
+        let record: RunRecord = serde_json::from_value(json!({
+            "schema_version": SCHEMA_VERSION, "id": "r", "status": "success",
+            "workflow": "ci.yml", "cwd": "/repo", "repo_root": "/repo", "git_sha": null,
+            "git_branch": null, "git_dirty": null, "runtime": "docker", "event": null,
+            "source": "cli", "agent": null, "intent": null, "session": null,
+            "replay_of": null, "argv": [], "variables": [], "pid": 1, "started_at": "",
+            "finished_at": null, "duration_ms": null, "error": null, "skip_reason": null,
+            "jobs": [],
+        }))
+        .unwrap();
+        let recorder = Recorder {
+            store: RunStore::at(scratch.path()),
+            persistent: false,
+            _scratch: None,
+            state: Mutex::new(record),
+            ndjson: false,
+            stream_output: false,
+            started: Instant::now(),
+        };
+        let step = StepResult {
+            name: "Upload coverage".to_string(),
+            status: StepStatus::Success,
+            output: String::new(),
+            outcome: StepStatus::Success,
+            conclusion: StepStatus::Success,
+            exit_code: None,
+            actions_not_run: vec!["codecov/codecov-action@v5".to_string()],
+        };
+        // No event reached the recorder: the result is all it has.
+        let job = JobResult {
+            name: "tests".to_string(),
+            canonical_name: "tests".to_string(),
+            status: JobStatus::Success,
+            steps: vec![step],
+            logs: String::new(),
+            outputs: Default::default(),
+            failure_allowed: false,
+            repeated_from: None,
+        };
+        let record = recorder.finish(RunStatus::Success, None, None, &[job]);
+        assert_eq!(record.jobs[0].actions_not_run.len(), 1);
+        assert_eq!(record.jobs[0].actions_not_run[0].step, "Upload coverage");
+        let line = run_finished_json(&record, None);
+        assert_eq!(line["verdict"], "partial");
+        assert_eq!(line["unverified"][0]["uses"], "codecov/codecov-action@v5");
+        assert_eq!(line["unverified"][0]["kind"], "action_not_run");
     }
 
     #[test]

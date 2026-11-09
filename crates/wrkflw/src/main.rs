@@ -401,12 +401,12 @@ enum Commands {
         /// The branch the event is for: `github.ref_name`, and what a
         /// `branches:` filter on push sees. Defaults to the checked-out
         /// branch, which a detached HEAD doesn't have.
-        #[arg(long, conflicts_with = "tag")]
+        #[arg(long, conflicts_with = "tag", value_parser = parse_branch)]
         branch: Option<String>,
 
         /// The tag a push is for instead of a branch: `github.ref_name`,
         /// `GITHUB_REF_TYPE=tag`, and what a `tags:` filter sees.
-        #[arg(long)]
+        #[arg(long, value_parser = parse_tag)]
         tag: Option<String>,
 
         /// Activity type for events that support it (e.g. `opened`,
@@ -742,11 +742,11 @@ enum Commands {
         base_branch: Option<String>,
 
         /// The branch the event is for (default: the checked-out branch)
-        #[arg(long, conflicts_with = "tag")]
+        #[arg(long, conflicts_with = "tag", value_parser = parse_branch)]
         branch: Option<String>,
 
         /// The tag a push is for, instead of a branch
-        #[arg(long)]
+        #[arg(long, value_parser = parse_tag)]
         tag: Option<String>,
 
         /// Activity type for `types:` filters (e.g. opened)
@@ -846,6 +846,42 @@ fn global_child_args(cli: &Wrkflw, platform_overrides: &HashMap<String, String>)
     args
 }
 
+/// A `--branch` value as GitHub names the branch, without `refs/heads/`.
+fn parse_branch(value: &str) -> Result<String, String> {
+    ref_name(value, "refs/heads/")
+}
+
+/// A `--tag` value as GitHub names the tag, without `refs/tags/`.
+fn parse_tag(value: &str) -> Result<String, String> {
+    ref_name(value, "refs/tags/")
+}
+
+/// `value` without `prefix`, if it is a name git allows for a ref, as
+/// `git check-ref-format` decides. Anything else would only make a
+/// `branches:` or `tags:` filter quietly miss.
+fn ref_name(value: &str, prefix: &str) -> Result<String, String> {
+    let name = value.strip_prefix(prefix).unwrap_or(value);
+    let refused = name.is_empty()
+        || name == "@"
+        || name.starts_with(['-', '/'])
+        || name.ends_with(['/', '.'])
+        || name.ends_with(".lock")
+        || name.contains("..")
+        || name.contains("//")
+        || name.contains("@{")
+        || name.split('/').any(|part| part.starts_with('.'))
+        || name
+            .chars()
+            .any(|c| c.is_control() || c.is_whitespace() || "~^:?*[\\".contains(c));
+    if refused {
+        Err(format!(
+            "`{value}` isn't a name git allows for a branch or tag"
+        ))
+    } else {
+        Ok(name.to_string())
+    }
+}
+
 /// `--tag` names what a push or release is for. A pull request is always
 /// for a branch, so the two together say nothing GitHub would run.
 fn check_tag_event(event: Option<&str>, tag: Option<&str>) -> Result<(), String> {
@@ -914,6 +950,20 @@ async fn cleanup_on_exit() {
     match kubernetes_result {
         Ok(_) => wrkflw_logging::debug("Kubernetes cleanup completed successfully"),
         Err(_) => wrkflw_logging::warning("Kubernetes cleanup timed out, continuing with shutdown"),
+    }
+
+    // With the job containers gone, the fresh workspaces of interrupted jobs
+    // and their volumes can go too: exiting skips their own cleanup.
+    let fresh = tokio::task::spawn_blocking(
+        wrkflw_executor::workspace::remove_interrupted_fresh_workspaces,
+    );
+    if tokio::time::timeout(std::time::Duration::from_secs(3), fresh)
+        .await
+        .is_err()
+    {
+        wrkflw_logging::warning(
+            "Removing the interrupted jobs' workspaces timed out; `wrkflw clean` removes the rest",
+        );
     }
 
     // Always clean up emulation resources
@@ -2057,6 +2107,88 @@ mod tests {
         assert_eq!(collect_platform_overrides(&parsed.platform), overrides);
         assert_eq!(parsed.kubernetes.to_config(), cli.kubernetes.to_config());
         assert!(!again.iter().any(|a| a == "--format"));
+    }
+
+    #[test]
+    fn every_global_flag_is_passed_on_or_named_as_not() {
+        use clap::CommandFactory;
+        // A child run reports in its own format, and only the TUI has a theme.
+        const NOT_PASSED_ON: [&str; 4] = ["format", "theme", "help", "version"];
+        let command = Wrkflw::command();
+        let mut given = vec!["wrkflw".to_string()];
+        let mut ids = Vec::new();
+        for arg in command.get_arguments().filter(|arg| arg.is_global_set()) {
+            let id = arg.get_id().as_str().to_string();
+            if NOT_PASSED_ON.contains(&id.as_str()) {
+                continue;
+            }
+            let flag = format!(
+                "--{}",
+                arg.get_long().expect("a global flag has a long form")
+            );
+            if arg.get_action().takes_values() {
+                // The first sample this flag's parser takes.
+                let sample = ["x=1", "60", "x"]
+                    .into_iter()
+                    .find(|sample| {
+                        Wrkflw::command()
+                            .try_get_matches_from(["wrkflw", flag.as_str(), sample, "list"])
+                            .is_ok()
+                    })
+                    .unwrap_or_else(|| panic!("no sample value parses for {flag}"));
+                given.extend([flag, sample.to_string()]);
+            } else {
+                given.push(flag);
+            }
+            ids.push(id);
+        }
+        given.push("list".to_string());
+        let original = Wrkflw::command().try_get_matches_from(&given).unwrap();
+        let cli = Wrkflw::try_parse_from(&given).unwrap();
+        let mut again = vec!["wrkflw".to_string()];
+        again.extend(global_child_args(
+            &cli,
+            &collect_platform_overrides(&cli.platform),
+        ));
+        again.push("list".to_string());
+        let child = Wrkflw::command().try_get_matches_from(&again).unwrap();
+        let raw = |matches: &clap::ArgMatches, id: &str| -> Vec<String> {
+            matches
+                .get_raw(id)
+                .into_iter()
+                .flatten()
+                .map(|v| v.to_string_lossy().into_owned())
+                .collect()
+        };
+        for id in ids {
+            assert_eq!(
+                child.value_source(&id),
+                Some(clap::parser::ValueSource::CommandLine),
+                "--{id} isn't passed on to a child run; add it to global_child_args, \
+                 or to NOT_PASSED_ON with the reason"
+            );
+            assert_eq!(
+                raw(&child, &id),
+                raw(&original, &id),
+                "--{id} changed on the way"
+            );
+        }
+    }
+
+    #[test]
+    fn a_branch_or_tag_is_named_as_github_names_it() {
+        assert_eq!(parse_branch("refs/heads/main").unwrap(), "main");
+        assert_eq!(parse_branch("release/2.0").unwrap(), "release/2.0");
+        assert_eq!(parse_tag("refs/tags/v1.0").unwrap(), "v1.0");
+        for refused in [
+            "", "-x", "a..b", "a b", "a/", ".hidden", "x.lock", "a~1", "a:b",
+        ] {
+            assert!(parse_branch(refused).is_err(), "{refused:?}");
+        }
+        let cli =
+            Wrkflw::try_parse_from(["wrkflw", "run", "ci.yml", "--branch", "refs/heads/main"]);
+        assert!(cli.is_ok());
+        assert!(Wrkflw::try_parse_from(["wrkflw", "run", "ci.yml", "--tag", "a b"]).is_err());
     }
 
     #[test]

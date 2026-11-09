@@ -149,6 +149,16 @@ pub(crate) fn repeated_leg(
         canonical_name: original.canonical_name.clone(),
     });
     crate::runner_fidelity::announce(name, runner);
+    // This leg's result is the original's, and so is what that left unrun.
+    for step in &original.steps {
+        for uses in &step.actions_not_run {
+            crate::events::emit(|| crate::events::ExecutionEvent::ActionNotRun {
+                job: name.to_string(),
+                step: step.name.clone(),
+                uses: uses.clone(),
+            });
+        }
+    }
     crate::events::emit(|| crate::events::ExecutionEvent::JobFinished {
         job: name.to_string(),
         status: original.status.clone(),
@@ -336,6 +346,46 @@ mod tests {
         assert_eq!(
             *seen.0.lock().unwrap(),
             vec![Some("build (os: a)".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_repeated_leg_reports_the_actions_its_original_did_not_run() {
+        #[derive(Default)]
+        struct NotRun(Mutex<Vec<(String, String)>>);
+        impl crate::events::ExecutionObserver for NotRun {
+            fn on_event(&self, event: &crate::events::ExecutionEvent) {
+                if let crate::events::ExecutionEvent::ActionNotRun { job, uses, .. } = event {
+                    self.0.lock().unwrap().push((job.clone(), uses.clone()));
+                }
+            }
+        }
+        let seen = Arc::new(NotRun::default());
+        let mut original = JobResult::skipped("test (os: a)", "test", "x");
+        original.status = crate::engine::JobStatus::Success;
+        original.steps = vec![crate::engine::StepResult {
+            name: "Upload".to_string(),
+            status: crate::engine::StepStatus::Success,
+            output: String::new(),
+            outcome: crate::engine::StepStatus::Success,
+            conclusion: crate::engine::StepStatus::Success,
+            exit_code: None,
+            actions_not_run: vec!["codecov/codecov-action@v5".to_string()],
+        }];
+        let hooks = crate::events::RunHooks {
+            observers: vec![seen.clone()],
+            from_step: None,
+        };
+        crate::events::with_run_hooks(hooks, async {
+            repeated_leg("test (os: b)", &original, "ubuntu", None)
+        })
+        .await;
+        assert_eq!(
+            *seen.0.lock().unwrap(),
+            vec![(
+                "test (os: b)".to_string(),
+                "codecov/codecov-action@v5".to_string()
+            )]
         );
     }
 

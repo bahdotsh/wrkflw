@@ -134,9 +134,15 @@ static PASSING: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| 
 static FAILING: std::sync::LazyLock<regex::Regex> =
     std::sync::LazyLock::new(|| regex::Regex::new(r"\b(FAIL(ED|URE)?|ERROR|Failed)\b").unwrap());
 
-/// Whether `line` reports a pass and no failure.
+/// A bracketed part of a line, such as a test's parameters in
+/// `test_x[Failed]` or a duration in `[12 ms]`.
+static BRACKETED: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(r"\[[^\]]*\]").unwrap());
+
+/// Whether `line` reports a pass and no failure. A failure word inside a
+/// test's parameters, as in `test_x[Failed] PASSED`, names the test.
 fn reports_pass(line: &str) -> bool {
-    PASSING.is_match(line) && !FAILING.is_match(line)
+    PASSING.is_match(line) && !FAILING.is_match(&BRACKETED.replace_all(line, ""))
 }
 
 /// The lines a cause may be read from: what the step printed, in the last
@@ -215,13 +221,13 @@ static SETUP_ERROR: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new
 
 /// The cause of a job that failed before any step ran because wrkflw
 /// couldn't set it up, as when its image doesn't build or pull. `text` is
-/// the job's log, whose first line is the error. `None` when that error
-/// isn't one of setting the job up.
+/// the job's log; the error is its first line that names a setup failure,
+/// wherever warnings printed before it put it. `None` when no line does.
 fn setup_failure(text: &str) -> Option<FailureCause> {
-    let first = text.lines().map(str::trim).find(|line| !line.is_empty())?;
-    if !SETUP_ERROR.is_match(first) {
-        return None;
-    }
+    let first = text
+        .lines()
+        .map(str::trim)
+        .find(|line| SETUP_ERROR.is_match(line))?;
     let evidence = match first.char_indices().nth(SETUP_EVIDENCE_CHARS) {
         Some((cut, _)) => format!("{}…", &first[..cut]),
         None => first.to_string(),
@@ -309,12 +315,29 @@ fn without_durations(line: &str) -> String {
 static PROGRESS: std::sync::LazyLock<regex::Regex> =
     std::sync::LazyLock::new(|| regex::Regex::new(r"\[\s*\d+%\]").unwrap());
 
-/// Whether `line` names where a failure is: a path or a test id, such as
-/// `tests/test_x.py::test_y` or `src/lib.rs:12`. Lines without one, such as
-/// `py3.12: FAIL code 1`, are a tool's own chatter and often name the leg.
+/// Whether `line` names where a failure is: a test id, or a path to a file,
+/// such as `tests/test_x.py::test_y` or `src/lib.rs:12`. Lines without one,
+/// such as `py3.12: FAIL code 1`, are a tool's own chatter and often name
+/// the leg. So are counts and dates such as `2/10` or `2024/01/02`, and a
+/// rule such as `tests/Makefile:12`, which every leg's failure would share.
 fn names_a_location(line: &str) -> bool {
     line.split_whitespace().any(|word| {
-        word.contains("::") || (word.contains('/') && !word.starts_with("http") && word.len() > 1)
+        let word = word.trim_matches(|c: char| "[](){}<>'\",;".contains(c));
+        if word.contains("::") {
+            return true;
+        }
+        if word.starts_with("http") || !word.contains(['/', '\\']) {
+            return false;
+        }
+        // `path/file.ext`, followed by any `:line:column`.
+        let path = word.trim_end_matches(|c: char| c.is_ascii_digit() || c == ':');
+        let file = path.rsplit(['/', '\\']).next().unwrap_or_default();
+        file.rsplit_once('.').is_some_and(|(stem, ext)| {
+            !stem.is_empty()
+                && (1..=8).contains(&ext.len())
+                && ext.starts_with(|c: char| c.is_ascii_alphabetic())
+                && ext.chars().all(|c| c.is_ascii_alphanumeric())
+        })
     })
 }
 
@@ -581,6 +604,9 @@ mod tests {
             "Failed!  - Failed: 1, Passed: 41, Skipped: 0"
         ));
         assert!(!reports_pass("  Failed ErrorHandling.Tests.Parses [12 ms]"));
+        // A failure word in a test's parameters names the test.
+        assert!(reports_pass("tests/x.py::test_y[FAILED] PASSED [ 50%]"));
+        assert!(!reports_pass("tests/x.py::test_y[PASSED] FAILED [ 50%]"));
         // A lower-case word in prose or a path is not a runner's verdict.
         assert!(!reports_pass(
             "error: tests/passed/fixture.rs: no such file"
@@ -615,6 +641,26 @@ mod tests {
         // A step's own failure is not one of setting the job up.
         let step = ContainerError::ContainerExecution("exit 1".into()).to_string();
         assert!(setup_failure(&step).is_none(), "{}", step);
+    }
+
+    #[test]
+    fn only_paths_to_files_and_test_ids_name_a_location() {
+        for located in [
+            "FAILED tests/test_x.py::test_y[3.12] - AssertionError",
+            "error[E0308]: mismatched types --> src/lib.rs:12:5",
+            "ERROR: (src/app.ts:4) failed",
+        ] {
+            assert!(names_a_location(located), "{located}");
+        }
+        for chatter in [
+            "Error: 2/10 tests failed",
+            "make: *** [tests/Makefile:12: test] Error 1",
+            "ERROR 2024/01/02 something failed",
+            "Error: N/A",
+            "failed, see https://example.com/a.html",
+        ] {
+            assert!(!names_a_location(chatter), "{chatter}");
+        }
     }
 
     fn failure(output: &[&str]) -> FailedStep {
@@ -808,6 +854,12 @@ mod tests {
         assert_eq!(cause.evidence.chars().count(), SETUP_EVIDENCE_CHARS + 1);
         assert!(cause.hint.contains("before any step ran"));
         assert_eq!(setup_failure("\n  \n"), None);
+        // A warning printed before the error doesn't hide it.
+        let warned = format!(
+            "Steps see the workspace through the docker file share, because ...\n{}",
+            text
+        );
+        assert_eq!(setup_failure(&warned).unwrap().kind, "setup_failed");
 
         // Each way the engine says it couldn't set a job up.
         for error in [

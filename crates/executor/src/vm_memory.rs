@@ -36,9 +36,22 @@ const MIB: u64 = 1024 * 1024;
 pub(crate) enum Limit {
     /// At most this many, as [`MAX_PARALLEL_JOBS_ENV`] asks.
     Jobs(usize),
-    /// Jobs share `bytes` by what each was measured to use. A job never
-    /// measured gets `bytes / slots`, the room every job used to get.
+    /// Jobs share `bytes`, less what the VM keeps for itself, by what each
+    /// was measured to use. A job never measured gets an equal share of
+    /// that among `slots`, so as many run at once as always did.
     Memory { bytes: u64, slots: usize },
+}
+
+/// What a VM of `bytes` keeps for itself: the engine, its file share, the
+/// workspace helper and image builds, which no job's measurement counts.
+/// A tenth of it, and at least 1 GiB.
+fn vm_reserved(bytes: u64) -> u64 {
+    (bytes / 10).max(1024 * MIB).min(bytes / 2)
+}
+
+/// The memory jobs share on a VM of `bytes`.
+fn shared(bytes: u64) -> u64 {
+    bytes - vm_reserved(bytes)
 }
 
 /// One run's pool: places for [`Limit::Jobs`], MiB for [`Limit::Memory`].
@@ -51,7 +64,7 @@ impl Pool {
     fn new(limit: Limit) -> Pool {
         let places = match limit {
             Limit::Jobs(jobs) => jobs,
-            Limit::Memory { bytes, .. } => mib(bytes),
+            Limit::Memory { bytes, .. } => mib(shared(bytes)),
         };
         Pool {
             places: Arc::new(Semaphore::new(places.clamp(1, Semaphore::MAX_PERMITS))),
@@ -64,8 +77,9 @@ impl Pool {
         let (total, wanted) = match self.limit {
             Limit::Jobs(_) => return 1,
             Limit::Memory { bytes, slots } => {
-                let unknown = bytes / slots.max(1) as u64;
-                (mib(bytes), mib(measured.unwrap_or(unknown)))
+                let shared = shared(bytes);
+                let unknown = shared / slots.max(1) as u64;
+                (mib(shared), mib(measured.unwrap_or(unknown)))
             }
         };
         u32::try_from(wanted.clamp(1, total.max(1))).unwrap_or(u32::MAX)
@@ -107,9 +121,16 @@ pub(crate) async fn with_run_pool<F: std::future::Future>(future: F) -> F::Outpu
 /// size its place when jobs share memory.
 pub(crate) async fn job_slot(job: Option<&str>) -> Option<OwnedSemaphorePermit> {
     let pool = POOL.try_with(|pool| pool.get().cloned().flatten()).ok()??;
-    let measured = match pool.limit {
-        Limit::Memory { .. } => job.and_then(crate::job_memory::reserve),
-        Limit::Jobs(_) => None,
+    let measured = match (pool.limit, job) {
+        // The store is a file under a lock: not for the async runtime.
+        (Limit::Memory { .. }, Some(job)) => {
+            let job = job.to_string();
+            tokio::task::spawn_blocking(move || crate::job_memory::reserve(&job))
+                .await
+                .ok()
+                .flatten()
+        }
+        _ => None,
     };
     let weight = pool.weight(measured);
     pool.places.clone().acquire_many_owned(weight).await.ok()
@@ -419,30 +440,34 @@ mod tests {
             bytes: 8 * GIB,
             slots: 1,
         });
-        assert_eq!(pool.weight(None), 8 * 1024, "an unmeasured job runs alone");
+        // 1 GiB of it stays with the VM.
+        assert_eq!(pool.weight(None), 7 * 1024, "an unmeasured job runs alone");
         assert_eq!(pool.weight(Some(GIB)), 1024);
         assert_eq!(
             pool.weight(Some(64 * GIB)),
-            8 * 1024,
-            "never more than the VM"
+            7 * 1024,
+            "never more than the VM shares"
         );
-        // A 12 GB VM gave each of three jobs 4 GB.
+        // A 12 GB VM ran three jobs at once, and still does.
         let pool = Pool::new(Limit::Memory {
             bytes: 12 * GIB,
             slots: 3,
         });
-        assert_eq!(pool.weight(None), 4 * 1024);
+        let unmeasured = pool.weight(None) as usize;
+        assert_eq!(pool.places.available_permits() / unmeasured, 3);
+        assert_eq!(vm_reserved(12 * GIB), 12 * GIB / 10);
+        assert_eq!(vm_reserved(GIB), GIB / 2, "a tiny VM still shares half");
         assert_eq!(Pool::new(Limit::Jobs(2)).weight(Some(GIB)), 1);
 
-        // Eight jobs measured at 1 GB fit together where one unmeasured
-        // job would have run alone.
+        // Seven jobs measured at 1 GB fit together, with 1 GiB left to the
+        // VM, where one unmeasured job would have run alone.
         with_run_pool(async {
             set_limit(Some(Limit::Memory {
                 bytes: 8 * GIB,
                 slots: 1,
             }));
             let pool = POOL.with(|pool| pool.get().cloned().flatten()).unwrap();
-            let held: Vec<_> = (0..8)
+            let held: Vec<_> = (0..7)
                 .map(|_| {
                     pool.places
                         .clone()

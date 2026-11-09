@@ -6,5 +6,8 @@
 [env]
 WRKFLW_FRESH_WORKSPACE = "1"
 # Likewise for the memory each job was measured to use: tests keep none, so
-# they never change how a real run on this machine schedules its jobs.
+# they never change how a real run on this machine schedules its jobs. This
+# applies to `cargo run` too, which then schedules every job as unmeasured.
+# An existing value wins, so name a file to measure, as in
+# `WRKFLW_JOB_MEMORY_FILE=/tmp/job-memory.json cargo run -- run ...`.
 WRKFLW_JOB_MEMORY_FILE = ""

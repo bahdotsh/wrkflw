@@ -86,11 +86,33 @@ pub(crate) enum JobWorkspace {
     Fresh(tempfile::TempDir),
 }
 
+/// Fresh workspaces in use, so an interrupted run can remove what the
+/// workspaces' own drop never gets to: the process exits without it.
+static FRESH: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
 impl Drop for JobWorkspace {
     fn drop(&mut self) {
         // Before the directory goes: a fresh workspace's volume goes with it.
         let kept = matches!(self, JobWorkspace::Kept { .. });
         crate::vm_workspace::release(self.path(), kept);
+        if !kept {
+            let path = self.path().to_path_buf();
+            FRESH
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|fresh| *fresh != path);
+        }
+    }
+}
+
+/// Remove the fresh workspaces of jobs still running, with their volumes,
+/// as a run interrupted with Ctrl-C exits. Call it after the job containers
+/// are gone, as a volume in use can't be removed.
+pub fn remove_interrupted_fresh_workspaces() {
+    let fresh = std::mem::take(&mut *FRESH.lock().unwrap_or_else(|e| e.into_inner()));
+    for path in fresh {
+        crate::vm_workspace::remove_now(&path);
+        let _ = std::fs::remove_dir_all(&path);
     }
 }
 
@@ -137,7 +159,12 @@ impl JobWorkspace {
     }
 
     fn fresh() -> std::io::Result<Self> {
-        Ok(JobWorkspace::Fresh(tempfile::tempdir()?))
+        let dir = tempfile::tempdir()?;
+        FRESH
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(dir.path().to_path_buf());
+        Ok(JobWorkspace::Fresh(dir))
     }
 
     /// `None` when another run holds the workspace. `file` is the workflow

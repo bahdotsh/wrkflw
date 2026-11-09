@@ -75,7 +75,8 @@ pub(crate) const SETUP_ACTIONS: &[SetupActionDef] = &[
     SetupActionDef {
         repos: &["actions/setup-node"],
         with_key: "node-version",
-        default_version: "20",
+        // With no version setup-node keeps the runner's own Node.
+        default_version: RUNNER_NODE_MAJOR,
         language: "node",
         version_from_ref: false,
         version_file_key: Some("node-version-file"),
@@ -318,7 +319,7 @@ fn contained_path(root: &Path, file: &str) -> Option<PathBuf> {
 
 /// The `requires-python` of `pyproject.toml`'s `[project]` table, without
 /// quotes, spaces or a trailing comment.
-fn requires_python(text: &str) -> Option<String> {
+pub(crate) fn requires_python(text: &str) -> Option<String> {
     let mut in_project = false;
     for line in text.lines().map(str::trim) {
         if line.starts_with('[') {
@@ -331,7 +332,11 @@ fn requires_python(text: &str) -> Option<String> {
         if !in_project {
             continue;
         }
-        let value = rest.trim_start().strip_prefix('=')?.trim_start();
+        // A longer key, such as `requires-python-extra`, isn't this one.
+        let Some(value) = rest.trim_start().strip_prefix('=') else {
+            continue;
+        };
+        let value = value.trim_start();
         let quote = value.chars().next().filter(|c| matches!(c, '"' | '\''))?;
         let inner = &value[1..];
         let spec: String = inner[..inner.find(quote)?]
@@ -352,7 +357,7 @@ pub(crate) fn is_safe_version(version: &str) -> bool {
         && !version.contains("..")
         && version
             .chars()
-            .all(|c| c.is_alphanumeric() || c == '.' || c == '-' || c == '_')
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
 }
 
 /// Whether `spec` is a PEP 440 version specifier such as `>=3.10,<4` or
@@ -408,11 +413,16 @@ pub(crate) fn detect_setup_in(steps: &[Step], root: &Path) -> SetupDetection {
         };
 
         let with = step.with.as_ref();
-        let ver = with
-            .and_then(|w| w.get(def.with_key))
+        // An empty input, as an unset workflow input leaves it, is no input:
+        // the hosted actions then read the version file.
+        let input = |key: &str| {
+            with.and_then(|w| w.get(key))
+                .filter(|value| !value.trim().is_empty())
+        };
+        let ver = input(def.with_key)
             .cloned()
             .or_else(|| {
-                let file = with?.get(def.version_file_key?)?;
+                let file = input(def.version_file_key?)?;
                 let found = version_from_file(root, file);
                 if found.is_none() {
                     wrkflw_logging::warning(&format!(
@@ -431,7 +441,20 @@ pub(crate) fn detect_setup_in(steps: &[Step], root: &Path) -> SetupDetection {
                     None
                 }
             })
+            .or_else(|| {
+                // setup-python given no version reads `.python-version`.
+                (def.language == "python")
+                    .then(|| version_from_file(root, ".python-version"))
+                    .flatten()
+            })
             .unwrap_or_else(|| def.default_version.to_string());
+        let ver = ver.trim().to_string();
+        // setup-python takes `>= 3.10` with spaces; the check below doesn't.
+        let ver = if def.language == "python" && ver.starts_with(['<', '>', '=', '!', '~']) {
+            ver.chars().filter(|c| !c.is_whitespace()).collect()
+        } else {
+            ver
+        };
 
         // Normalize trailing ".x" suffix (e.g., "16.x" -> "16") so it doesn't
         // leak into install scripts for languages that don't expect it.
@@ -458,7 +481,9 @@ pub(crate) fn detect_setup_in(steps: &[Step], root: &Path) -> SetupDetection {
         } else {
             ver
         };
-        let safe = is_safe_version(&ver) || (def.language == "python" && is_safe_python_spec(&ver));
+        let safe = (is_safe_version(&ver)
+            || (def.language == "python" && is_safe_python_spec(&ver)))
+            && (def.language != "go" || go_release_known(&ver));
         if !safe {
             wrkflw_logging::warning(&format!(
                 "Ignoring {} with invalid version: {:?}",
@@ -563,6 +588,17 @@ pub(crate) fn node_alias(version: &str) -> Option<String> {
 /// Return shell commands that install a language runtime on an Ubuntu base image.
 pub(crate) fn get_install_script(language: &str, version: &str) -> String {
     match language {
+        // A full release, as `.nvmrc` often pins one, is that release, as
+        // setup-node installs it. nodesource only has each major's newest.
+        "node" if is_full_release(version) => {
+            format!(
+                "ARCH=$(dpkg --print-architecture || echo amd64) && \
+                 case \"$ARCH\" in amd64) ARCH=x64 ;; armhf) ARCH=armv7l ;; esac && \
+                 curl -fsSL https://nodejs.org/dist/v{v}/node-v{v}-linux-$ARCH.tar.gz | \
+                 tar -xz -C /usr/local --strip-components=1 --exclude='*.md' --exclude=LICENSE",
+                v = version
+            )
+        }
         "node" => {
             // Strip .x suffix for nodesource URL (e.g., "16.x" -> "16")
             let major = version.split('.').next().unwrap_or(version);
@@ -659,8 +695,16 @@ pub(crate) fn get_install_script(language: &str, version: &str) -> String {
 /// release, and `stable` the newest of all. go.dev names releases with a
 /// patch number, so those are looked up when the image is built.
 fn go_release(version: &str) -> String {
-    if version.split('.').count() >= 3 {
+    if let Some(pre) = go_prerelease(version) {
+        return pre;
+    }
+    if is_full_release(version) {
         return format!("go{}", version);
+    }
+    // The two supported lines, newest first, are all go.dev lists without
+    // `include=all`: `oldstable` is the second.
+    if version == "oldstable" {
+        return r#""$(curl -fsSL 'https://go.dev/dl/?mode=json' | grep -oE '"version": *"go[0-9.]+"' | sed -n 2p | grep -oE 'go[0-9.]+')""#.to_string();
     }
     // Releases are listed newest first; a line's release candidates, such
     // as `go1.22rc1`, don't match.
@@ -675,6 +719,46 @@ fn go_release(version: &str) -> String {
     )
 }
 
+/// Whether `version` is three dot-separated numbers, such as `20.11.0`.
+fn is_full_release(version: &str) -> bool {
+    let parts: Vec<&str> = version.split('.').collect();
+    parts.len() == 3
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+}
+
+/// go.dev's name for a Go pre-release setup-go accepts, such as
+/// `1.22rc1`, `1.22.0-rc.1` or `1.23beta2`.
+fn go_prerelease(version: &str) -> Option<String> {
+    let (line, pre) = version
+        .find(['r', 'b', '-'])
+        .map(|at| version.split_at(at))?;
+    let line = line
+        .strip_suffix(".0")
+        .filter(|l| l.contains('.'))
+        .unwrap_or(line);
+    let pre = pre.trim_start_matches('-');
+    let (kind, number) = ["rc", "beta"]
+        .into_iter()
+        .find_map(|kind| Some((kind, pre.strip_prefix(kind)?.trim_start_matches('.'))))?;
+    let numeric = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit());
+    (line.split('.').count() == 2 && line.split('.').all(numeric) && numeric(number))
+        .then(|| format!("go{}{}{}", line, kind, number))
+}
+
+/// Whether [`go_release`] can name the release `version` asks for. Anything
+/// else is refused before the image build, where it would fail the job.
+fn go_release_known(version: &str) -> bool {
+    matches!(version, "stable" | "oldstable")
+        || go_prerelease(version).is_some()
+        || (!version.is_empty()
+            && version.split('.').count() <= 3
+            && version
+                .split('.')
+                .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit())))
+}
+
 /// Where the image keeps the interpreters uv installs for setup-python:
 /// outside any home directory, so every user and every `HOME` finds them.
 pub(crate) const UV_PYTHON_DIR: &str = "/opt/uv/python";
@@ -686,7 +770,7 @@ pub(crate) const DROP_EXTERNALLY_MANAGED: &str = "import os, sysconfig; \
      os.path.exists(f) and os.remove(f)";
 
 /// The command that installs uv `version` (`latest` or a release such as
-/// `0.9.30`) into `/usr/local/bin`, keeping one already there.
+/// `0.9.30`) into `/usr/local/bin`, replacing one already there.
 pub(crate) fn uv_install_command(version: &str) -> String {
     let url = if version == "latest" {
         "https://astral.sh/uv/install.sh".to_string()
@@ -710,9 +794,20 @@ pub(crate) fn uv_install_unless_present() -> String {
 
 /// `version`, as `actions/setup-python` takes it, in the form `uv python
 /// install` takes: `pypy-3.11` becomes `pypy@3.11`, `3.14-dev` `3.14`,
-/// `3.x` `3`; `3.13t` and `3.12.4` stay as they are.
+/// `3.x` `3`, `3.14.0-alpha.1` `3.14.0a1`; `3.13t` and `3.12.4` stay as
+/// they are.
 pub(crate) fn uv_python_request(version: &str) -> String {
     let version = version.trim_end_matches(".x").trim_end_matches("-dev");
+    // setup-python's semver pre-releases, in PEP 440's spelling.
+    if let Some((release, pre)) = version.split_once('-') {
+        for (word, short) in [("alpha", "a"), ("beta", "b"), ("rc", "rc")] {
+            if let Some(number) = pre.strip_prefix(word).map(|n| n.trim_start_matches('.')) {
+                if !number.is_empty() && number.chars().all(|c| c.is_ascii_digit()) {
+                    return format!("{}{}{}", release, short, number);
+                }
+            }
+        }
+    }
     for implementation in ["pypy", "graalpy"] {
         if let Some(rest) = version.strip_prefix(implementation) {
             let rest = rest.trim_start_matches('-');

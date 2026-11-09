@@ -156,6 +156,9 @@ struct JobStory<'a> {
     /// An action-not-run report arrived; it belongs to the next step to
     /// finish, as the executor sends it just before that step's result.
     not_run_pending: bool,
+    /// The job finished with such a report and no step after it, as a job
+    /// reused from a stored pass does: it has no steps to mark.
+    not_run_unattached: bool,
 }
 
 fn group_by_job(timeline: &[TimelineEntry]) -> Vec<JobStory<'_>> {
@@ -178,6 +181,7 @@ fn group_by_job(timeline: &[TimelineEntry]) -> Vec<JobStory<'_>> {
                     runner: None,
                     not_run: Vec::new(),
                     not_run_pending: false,
+                    not_run_unattached: false,
                 });
                 jobs.len() - 1
             }
@@ -190,7 +194,11 @@ fn group_by_job(timeline: &[TimelineEntry]) -> Vec<JobStory<'_>> {
                 }
                 job.steps.push(entry);
             }
-            TimelineEntry::JobFinished { .. } => jobs[at].finished = Some(entry),
+            TimelineEntry::JobFinished { .. } => {
+                let job = &mut jobs[at];
+                job.not_run_unattached = std::mem::take(&mut job.not_run_pending);
+                job.finished = Some(entry);
+            }
             TimelineEntry::RunnerSubstituted {
                 requested, ran_as, ..
             } => jobs[at].runner = Some((requested.as_str(), ran_as.as_str())),
@@ -279,6 +287,12 @@ pub(crate) fn story_lines(
                     text::sanitize(ran_as),
                     text::sanitize(requested)
                 ),
+                Style::default().fg(COLORS.warning),
+            ));
+        }
+        if job.not_run_unattached {
+            left.push(Span::styled(
+                format!("  {} action not run", theme::symbols::WARNING),
                 Style::default().fg(COLORS.warning),
             ));
         }
@@ -570,6 +584,31 @@ mod tests {
         let lines = text_of(&story_lines(&timeline, None, 80, 0, false));
         assert!(!lines[1].contains("action not run"), "{lines:?}");
         assert!(lines[2].contains("action not run"), "{lines:?}");
+    }
+
+    #[test]
+    fn a_reused_job_that_skipped_an_action_says_so_on_its_line() {
+        // A reused pass reports its unrun actions, then finishes: no step.
+        let timeline = vec![
+            TimelineEntry::JobStarted {
+                job: "tests".into(),
+                canonical_name: "tests".into(),
+            },
+            TimelineEntry::ActionNotRun {
+                job: "tests".into(),
+                step: "Upload coverage".into(),
+                uses: "codecov/codecov-action@v5".into(),
+            },
+            TimelineEntry::JobFinished {
+                job: "tests".into(),
+                status: JobStatus::Success,
+                failure_allowed: false,
+                duration_ms: 0,
+                repeated_from: None,
+            },
+        ];
+        let lines = text_of(&story_lines(&timeline, None, 80, 0, false));
+        assert!(lines[0].contains("action not run"), "{lines:?}");
     }
 
     #[test]

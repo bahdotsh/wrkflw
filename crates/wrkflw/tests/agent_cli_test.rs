@@ -593,6 +593,7 @@ fn plan_names_the_legs_that_would_run_as_another_os() {
     assert_eq!(
         plan["unverified"],
         json!([{
+            "kind": "runner",
             "job": "build (os: windows-latest)",
             "requested": "windows-latest",
             "ran_as": "Linux",

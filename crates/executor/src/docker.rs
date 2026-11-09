@@ -470,6 +470,8 @@ struct MemoryWatch {
     task: tokio::task::JoinHandle<()>,
     /// Set by `stop`: whether the container ran out of memory.
     ended: Option<bool>,
+    /// Set by `stop`: how long the container ran, when the engine said.
+    ran_for: Option<std::time::Duration>,
 }
 
 /// A container that ran this long and sent no sample went unmeasured.
@@ -514,13 +516,16 @@ impl MemoryWatch {
             started: std::time::Instant::now(),
             task,
             ended: None,
+            ran_for: None,
         }
     }
 
     /// The container ended; `out_of_memory` when the kernel killed it, or
-    /// a process in it, for memory.
-    fn stop(mut self, out_of_memory: bool) {
+    /// a process in it, for memory. `ran_for` is how long it ran, from its
+    /// start to its exit, which waiting for its logs doesn't stretch.
+    fn stop(mut self, out_of_memory: bool, ran_for: Option<std::time::Duration>) {
         self.ended = Some(out_of_memory);
+        self.ran_for = ran_for;
     }
 }
 
@@ -534,7 +539,8 @@ impl Drop for MemoryWatch {
             Some(false)
                 if self.broken.load(Ordering::Relaxed)
                     || (!self.sampled.load(Ordering::Relaxed)
-                        && self.started.elapsed() >= UNSAMPLED_AFTER) =>
+                        && self.ran_for.unwrap_or_else(|| self.started.elapsed())
+                            >= UNSAMPLED_AFTER) =>
             {
                 self.meter.unmeasured()
             }
@@ -543,6 +549,13 @@ impl Drop for MemoryWatch {
             None => self.meter.unmeasured(),
         }
     }
+}
+
+/// The time between a container's `StartedAt` and `FinishedAt`.
+fn run_time(started: &str, finished: &str) -> Option<std::time::Duration> {
+    let started = chrono::DateTime::parse_from_rfc3339(started).ok()?;
+    let finished = chrono::DateTime::parse_from_rfc3339(finished).ok()?;
+    (finished - started).to_std().ok()
 }
 
 /// Memory a container holds, as `docker stats` counts it: usage less the
@@ -1331,22 +1344,25 @@ impl DockerRuntime {
         let exit_code = wait_exit_code(wait_result.first());
         if let Some(watch) = memory_watch {
             // The engine knows when the kernel killed a process for memory;
-            // the exit code alone doesn't say when it wasn't the shell.
-            let oom_killed = exit_code != 0
-                && tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
-                    self.docker.inspect_container(&container.id, None),
-                )
-                .await
-                .ok()
-                .and_then(Result::ok)
-                .and_then(|inspect| inspect.state?.oom_killed)
-                .unwrap_or(false);
-            watch.stop(crate::job_memory::ran_out_of_memory(
-                exit_code,
-                oom_killed,
-                &[&stdout, &stderr],
-            ));
+            // the exit code alone doesn't say when it wasn't the shell. It
+            // also knows how long the container ran.
+            let state = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                self.docker.inspect_container(&container.id, None),
+            )
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .and_then(|inspect| inspect.state);
+            let oom_killed =
+                exit_code != 0 && state.as_ref().and_then(|s| s.oom_killed).unwrap_or(false);
+            let ran_for = state
+                .as_ref()
+                .and_then(|s| run_time(s.started_at.as_deref()?, s.finished_at.as_deref()?));
+            watch.stop(
+                crate::job_memory::ran_out_of_memory(exit_code, oom_killed, &[&stdout, &stderr]),
+                ran_for,
+            );
         }
 
         // Clean up container with a timeout, but preserve on failure if configured
@@ -1625,8 +1641,22 @@ mod tests {
         while !watch.task.is_finished() && std::time::Instant::now() < deadline {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
-        watch.stop(false);
+        watch.stop(false, None);
         assert!(meter.is_incomplete());
+    }
+
+    #[test]
+    fn a_containers_run_time_is_from_its_start_to_its_exit() {
+        let ran = run_time(
+            "2026-11-09T10:00:00.250000000Z",
+            "2026-11-09T10:00:01.750000000Z",
+        );
+        assert_eq!(ran, Some(std::time::Duration::from_millis(1500)));
+        // Docker's zero time for a container that never finished.
+        assert_eq!(
+            run_time("2026-11-09T10:00:00Z", "0001-01-01T00:00:00Z"),
+            None
+        );
     }
 
     #[test]

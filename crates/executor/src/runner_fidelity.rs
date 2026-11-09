@@ -35,6 +35,7 @@ impl RunnerSubstitution {
     /// `plan` all report it.
     pub fn unverified_entry(&self, job: &str) -> serde_json::Value {
         serde_json::json!({
+            "kind": "runner",
             "job": job,
             "requested": self.requested,
             "ran_as": self.ran_as,
@@ -295,6 +296,7 @@ mod tests {
         assert_eq!(entry["job"], "build (os: macos-latest)");
         assert_eq!(entry["requested"], "macos-latest");
         assert_eq!(entry["ran_as"], "Linux");
+        assert_eq!(entry["kind"], "runner");
         assert_eq!(entry["reason"], found.reason());
     }
 

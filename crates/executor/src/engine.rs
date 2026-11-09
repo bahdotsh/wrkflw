@@ -2196,14 +2196,63 @@ async fn build_combined_runtime_image(
             .join(", ")
     ));
 
-    runtime
-        .build_image(&dockerfile_path, &tag, temp_dir.path())
+    build_image_checked(runtime, &dockerfile_path, &tag, temp_dir.path())
         .await
         .map_err(|e| {
             ExecutionError::Runtime(format!("Failed to build combined runtime image: {}", e))
         })?;
 
     Ok(tag)
+}
+
+/// Whether a build error is the connection to the engine failing rather
+/// than the build: the stream of build output ended early or was cut. The
+/// same build may well work on a second try.
+fn is_transport_error(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    [
+        "bytes remaining on stream",
+        "connection reset",
+        "connection closed",
+        "broken pipe",
+        "unexpected eof",
+        "error reading a body",
+        "incomplete message",
+    ]
+    .iter()
+    .any(|sign| message.contains(sign))
+}
+
+/// Build `tag`, telling a build that failed from one whose report of
+/// success was lost. A tag is only applied when a build succeeds, and
+/// callers build only a tag that doesn't exist yet, so finding it after an
+/// error means it built. An error in the connection to the engine is tried
+/// once more; any other is the build's own and is returned.
+async fn build_image_checked(
+    runtime: &dyn ContainerRuntime,
+    dockerfile: &Path,
+    tag: &str,
+    context_dir: &Path,
+) -> Result<(), wrkflw_runtime::container::ContainerError> {
+    let first = match runtime.build_image(dockerfile, tag, context_dir).await {
+        Ok(()) => return Ok(()),
+        Err(e) => e,
+    };
+    if runtime.image_exists(tag).await.unwrap_or(false) {
+        wrkflw_logging::warning(&format!(
+            "Building {} reported an error, but the image was built, so it is used: {}",
+            tag, first
+        ));
+        return Ok(());
+    }
+    if !is_transport_error(&first.to_string()) {
+        return Err(first);
+    }
+    wrkflw_logging::warning(&format!(
+        "Building {} lost its connection to the container engine ({}); trying once more",
+        tag, first
+    ));
+    runtime.build_image(dockerfile, tag, context_dir).await
 }
 
 /// Hash everything a Dockerfile action's image is built from, so the same
@@ -2315,7 +2364,7 @@ async fn ensure_action_image(
     };
     let _build_guard = tag_lock.lock().await;
     if !runtime.image_exists(&tag).await? {
-        runtime.build_image(dockerfile, &tag, context_dir).await?;
+        build_image_checked(runtime, dockerfile, &tag, context_dir).await?;
     }
     Ok(tag)
 }
@@ -7600,6 +7649,99 @@ mod tests {
         fn identifies_images(&self) -> bool {
             self.identifies
         }
+    }
+
+    /// A runtime whose builds fail as `errors` says, in turn, and whose
+    /// image exists after the build numbered `exists_after` (counting from 1).
+    struct FlakyBuildRuntime {
+        errors: Vec<Option<&'static str>>,
+        exists_after: Option<usize>,
+        builds: Mutex<usize>,
+    }
+
+    #[async_trait::async_trait]
+    impl ContainerRuntime for FlakyBuildRuntime {
+        async fn run_container(
+            &self,
+            _: &str,
+            _: &[&str],
+            _: &[(&str, &str)],
+            _: &Path,
+            _: &[(&Path, &Path)],
+            _: Option<&str>,
+        ) -> Result<ContainerOutput, ContainerError> {
+            unreachable!("no step runs")
+        }
+        async fn pull_image(&self, _: &str) -> Result<(), ContainerError> {
+            Ok(())
+        }
+        async fn build_image(&self, _: &Path, _: &str, _: &Path) -> Result<(), ContainerError> {
+            let mut builds = self.builds.lock().unwrap();
+            *builds += 1;
+            match self.errors.get(*builds - 1).copied().flatten() {
+                Some(error) => Err(ContainerError::ImageBuild(error.to_string())),
+                None => Ok(()),
+            }
+        }
+        async fn prepare_language_environment(
+            &self,
+            _: &str,
+            _: Option<&str>,
+            _: Option<Vec<String>>,
+        ) -> Result<String, ContainerError> {
+            Ok(String::new())
+        }
+        async fn image_exists(&self, _: &str) -> Result<bool, ContainerError> {
+            let builds = *self.builds.lock().unwrap();
+            Ok(self.exists_after.is_some_and(|after| builds >= after))
+        }
+    }
+
+    fn flaky(errors: Vec<Option<&'static str>>, exists_after: Option<usize>) -> FlakyBuildRuntime {
+        FlakyBuildRuntime {
+            errors,
+            exists_after,
+            builds: Mutex::new(0),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_build_whose_success_report_was_lost_is_used() {
+        // As seen with Docker Desktop: "Successfully tagged", then the
+        // output stream broke.
+        let runtime = flaky(vec![Some("bytes remaining on stream")], Some(1));
+        build_image_checked(&runtime, Path::new("D"), "t", Path::new("."))
+            .await
+            .unwrap();
+        assert_eq!(*runtime.builds.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_build_cut_off_by_the_engine_is_tried_once_more() {
+        let runtime = flaky(vec![Some("connection reset by peer"), None], Some(2));
+        build_image_checked(&runtime, Path::new("D"), "t", Path::new("."))
+            .await
+            .unwrap();
+        assert_eq!(*runtime.builds.lock().unwrap(), 2);
+
+        // A second transport error is reported, not retried for ever.
+        let runtime = flaky(vec![Some("broken pipe"), Some("broken pipe")], None);
+        assert!(
+            build_image_checked(&runtime, Path::new("D"), "t", Path::new("."))
+                .await
+                .is_err()
+        );
+        assert_eq!(*runtime.builds.lock().unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_build_that_failed_on_its_own_is_not_retried() {
+        let runtime = flaky(vec![Some("RUN apt-get install: exit code 100")], None);
+        let err = build_image_checked(&runtime, Path::new("D"), "t", Path::new("."))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("exit code 100"));
+        assert_eq!(*runtime.builds.lock().unwrap(), 1);
     }
 
     #[tokio::test]

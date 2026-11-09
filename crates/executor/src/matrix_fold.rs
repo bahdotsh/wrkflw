@@ -63,7 +63,9 @@ pub(crate) fn matrix_twins(
 
 /// The job as text, minus the two places a matrix value may appear without
 /// changing what the job does: `runs-on`, and the matrix itself. The job's
-/// display name isn't parsed, so it is never here.
+/// display name isn't parsed, so it is never here. Step names are, so a
+/// step named after a matrix value keeps its leg, although the name changes
+/// nothing that runs: the fold errs toward running a leg.
 fn job_body_text(job: &Job) -> Option<String> {
     let mut value = serde_json::to_value(job).ok()?;
     let map = value.as_object_mut()?;
@@ -210,6 +212,9 @@ mod tests {
             "steps:\n  - run: echo '${{ toJSON(matrix) }}'\n",
             "steps:\n  - run: echo ${{ matrix['os'] }}\n",
             "env:\n  TARGET: ${{ matrix.os }}\nsteps:\n  - run: make\n",
+            // What other jobs see of this one, and how runs of it queue.
+            "outputs:\n  os: ${{ matrix.os }}\nsteps:\n  - run: make\n",
+            "concurrency: build-${{ matrix.os }}\nsteps:\n  - run: make\n",
         ] {
             let job = job(&format!("runs-on: ${{{{ matrix.os }}}}\n{body}"));
             let twins = matrix_twins(&job, &legs("os", OS_LEGS), &HashMap::new());

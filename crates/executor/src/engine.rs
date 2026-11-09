@@ -24,7 +24,7 @@ use crate::matrix_fold::{matrix_twins, repeated_leg};
 use crate::podman;
 use crate::setup_actions::{
     detect_setup, runner_node_install, rust_toolchain_extras, static_input, unrun_action_cause,
-    BuiltRuntimes, SetupDetection, SetupRuntime, NO_IMPLEMENTATION, SETUP_ACTIONS,
+    BuiltRuntimes, SetupDetection, SetupRuntime, NO_IMPLEMENTATION, SETUP_ACTIONS, UV_PYTHON_DIR,
 };
 use wrkflw_logging;
 use wrkflw_matrix::MatrixCombination;
@@ -53,10 +53,12 @@ pub async fn execute_workflow(
     let is_gitlab = is_gitlab_pipeline(workflow_path);
 
     if is_gitlab {
-        return crate::vm_memory::with_run_pool(acceleration::without_run_state(
+        let result = crate::vm_memory::with_run_pool(acceleration::without_run_state(
             execute_gitlab_pipeline(workflow_path, config.clone()),
         ))
         .await;
+        crate::vm_workspace::wait_for_released_volumes().await;
+        return result;
     }
     let root = std::env::current_dir().map_err(|e| {
         ExecutionError::Execution(format!("Failed to get current directory: {}", e))
@@ -68,14 +70,18 @@ pub async fn execute_workflow(
     )
     .map_err(ExecutionError::Execution)?;
     // Each run gets its own job pool, sized once its runtime is known.
-    crate::vm_memory::with_run_pool(acceleration::with_run_state(
+    let result = crate::vm_memory::with_run_pool(acceleration::with_run_state(
         std::sync::Arc::new(state),
         crate::workspace::with_workflow_file(
             workflow_path,
             Box::pin(execute_github_workflow(workflow_path, config.clone())),
         ),
     ))
-    .await
+    .await;
+    // A fresh workspace's volume goes once its job container does; a run
+    // that ends here would otherwise leave the last ones behind.
+    crate::vm_workspace::wait_for_released_volumes().await;
+    result
 }
 
 /// Determine if a file is a GitLab CI/CD pipeline
@@ -1199,11 +1205,10 @@ impl JobResult {
             name: stored.name,
             canonical_name: stored.canonical_name,
             status: JobStatus::Success,
-            steps: vec![StepResult::new(
-                step.to_string(),
-                StepStatus::Success,
-                note.to_string(),
-            )],
+            steps: vec![
+                StepResult::new(step.to_string(), StepStatus::Success, note.to_string())
+                    .without_running(stored.actions_not_run.into_iter().map(|a| a.uses)),
+            ],
             logs: note.to_string(),
             outputs: stored.outputs,
             failure_allowed: false,
@@ -1409,6 +1414,10 @@ enum PreparedAction {
     /// bash wrapper. If you need the image's native ENTRYPOINT/CMD,
     /// use `NativeDocker` instead.
     Image(String),
+    /// An action whose `action.yml` couldn't be fetched, so how it runs is
+    /// unknown. Run like `Image`, but a step that then runs nothing says the
+    /// fetch failed rather than that wrkflw has no implementation.
+    Unresolved { image: String, fetch_error: String },
     /// A composite action that needs special step-based execution.
     Composite,
 }
@@ -1492,6 +1501,7 @@ async fn prepare_action(
     }
 
     // GitHub action: try to fetch action.yml from the remote repository
+    let mut fetch_error: Option<String> = None;
     if !action.repository.is_empty() && !action.version.is_empty() {
         match action_resolver::resolve_remote_action(
             &action.repository,
@@ -1659,13 +1669,17 @@ async fn prepare_action(
                     "Could not fetch action.yml for {}@{}: {}. Falling back to built-in mapping.",
                     action.repository, action.version, e
                 ));
+                fetch_error = Some(e.to_string());
             }
         }
     }
 
     // Fallback: determine appropriate image based on hardcoded action type mapping
     let image = determine_action_image(&action.repository);
-    Ok(PreparedAction::Image(image))
+    Ok(match fetch_error {
+        Some(fetch_error) => PreparedAction::Unresolved { image, fetch_error },
+        None => PreparedAction::Image(image),
+    })
 }
 
 /// Execute a `NativeDocker` action step.
@@ -2047,6 +2061,12 @@ fn generate_combined_dockerfile(
     // and Rust build scripts, node-gyp, Python C extensions and cgo all
     // expect one. `less` because they have a pager, which tests of CLI
     // tools run.
+    // uv keeps the interpreters it installs under `$HOME`, which is root's
+    // and closed to a step that runs as another user, and which a job that
+    // sets `HOME` moves. Somewhere fixed and readable serves every step.
+    if runtimes.iter().any(|rt| rt.language == "python") {
+        dockerfile.push_str(&format!("ENV UV_PYTHON_INSTALL_DIR={}\n", UV_PYTHON_DIR));
+    }
     dockerfile.push_str("RUN apt-get update && \\\n");
     dockerfile.push_str(
         "    apt-get install -y --no-install-recommends curl bash git ca-certificates gnupg \
@@ -2161,7 +2181,11 @@ async fn build_combined_runtime_image(
 
     // Fast path: image already exists, no locking needed.
     let exists = runtime.image_exists(&tag).await.map_err(|e| {
-        ExecutionError::Runtime(format!("Failed to check for existing image: {}", e))
+        ExecutionError::Runtime(format!(
+            "{}: {}",
+            crate::setup_errors::EXISTING_IMAGE_CHECK,
+            e
+        ))
     })?;
     if exists {
         wrkflw_logging::info(&format!("Reusing existing combined runtime image: {}", tag));
@@ -2181,7 +2205,11 @@ async fn build_combined_runtime_image(
 
     // Re-check after acquiring the lock: a concurrent job may have built it.
     let exists = runtime.image_exists(&tag).await.map_err(|e| {
-        ExecutionError::Runtime(format!("Failed to check for existing image: {}", e))
+        ExecutionError::Runtime(format!(
+            "{}: {}",
+            crate::setup_errors::EXISTING_IMAGE_CHECK,
+            e
+        ))
     })?;
     if exists {
         wrkflw_logging::info(&format!("Reusing existing combined runtime image: {}", tag));
@@ -2208,7 +2236,11 @@ async fn build_combined_runtime_image(
     build_image_checked(runtime, &dockerfile_path, &tag, temp_dir.path())
         .await
         .map_err(|e| {
-            ExecutionError::Runtime(format!("Failed to build combined runtime image: {}", e))
+            ExecutionError::Runtime(format!(
+                "{}: {}",
+                crate::setup_errors::COMBINED_IMAGE_BUILD,
+                e
+            ))
         })?;
 
     Ok(tag)
@@ -2217,8 +2249,16 @@ async fn build_combined_runtime_image(
 /// Whether a build error is the connection to the engine failing rather
 /// than the build: the stream of build output ended early or was cut. The
 /// same build may well work on a second try.
+///
+/// Only the error's first line counts. What follows it is the build's own
+/// output, where a failing `RUN` may well print "connection reset", and
+/// that build would fail the same way again.
 fn is_transport_error(message: &str) -> bool {
-    let message = message.to_ascii_lowercase();
+    let message = message
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
     [
         "bytes remaining on stream",
         "connection reset",
@@ -2793,6 +2833,13 @@ fn announce_reused(
         canonical_name: stored.canonical_name.clone(),
     });
     crate::runner_fidelity::announce(&stored.name, runner);
+    for skipped in &stored.actions_not_run {
+        crate::events::emit(|| crate::events::ExecutionEvent::ActionNotRun {
+            job: stored.name.clone(),
+            step: skipped.step.clone(),
+            uses: skipped.uses.clone(),
+        });
+    }
     crate::events::emit(|| crate::events::ExecutionEvent::JobFinished {
         job: stored.name.clone(),
         status: JobStatus::Success,
@@ -2820,15 +2867,32 @@ async fn store_passing_result(
     if results.is_empty() || results.iter().any(|r| r.status != JobStatus::Success) {
         return;
     }
-    let jobs = results
+    acceleration::store(key, stored_jobs(results), env_context).await;
+}
+
+/// What a passing run keeps for reuse: names, outputs, and the steps that
+/// passed without running their action, so a reused pass is no less partial.
+fn stored_jobs(results: &[JobResult]) -> Vec<acceleration::StoredJob> {
+    results
         .iter()
         .map(|result| acceleration::StoredJob {
             name: result.name.clone(),
             canonical_name: result.canonical_name.clone(),
             outputs: result.outputs.clone(),
+            actions_not_run: result
+                .steps
+                .iter()
+                .flat_map(|step| {
+                    step.actions_not_run.iter().map(|uses| {
+                        crate::action_fidelity::UnexecutedAction {
+                            step: step.name.clone(),
+                            uses: uses.clone(),
+                        }
+                    })
+                })
+                .collect(),
         })
-        .collect();
-    acceleration::store(key, jobs, env_context).await;
+        .collect()
 }
 
 #[allow(unused_variables, unused_assignments)]
@@ -4727,6 +4791,12 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
         } else {
             // Get action info
             let prepared = prepare_action(&action_info, ctx.runtime).await?;
+            // An action whose metadata couldn't be fetched runs like any
+            // other image action; only the reason it ran nothing differs.
+            let fetch_error = match &prepared {
+                PreparedAction::Unresolved { fetch_error, .. } => Some(fetch_error.clone()),
+                _ => None,
+            };
 
             match prepared {
                 PreparedAction::Composite => {
@@ -4823,7 +4893,7 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                     )
                     .await?
                 }
-                PreparedAction::Image(image) => {
+                PreparedAction::Image(image) | PreparedAction::Unresolved { image, .. } => {
                     // Build command for Docker action
                     let mut cmd = Vec::new();
                     let mut owned_strings: Vec<String> = Vec::new(); // Keep strings alive until after we use cmd
@@ -5055,7 +5125,15 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                         // and composite actions are run above. A new built-in
                         // handler must stay ahead of this branch, or its
                         // steps are reported as not run.
-                        let not_run_cause = ctx.unrun_action_cause(&action_info.repository);
+                        let not_run_cause: Option<String> =
+                            match ctx.unrun_action_cause(&action_info.repository) {
+                                Some(NO_IMPLEMENTATION) if fetch_error.is_some() => Some(format!(
+                                    "its action.yml couldn't be fetched ({}), so how to run it \
+                                     is unknown",
+                                    fetch_error.as_deref().unwrap_or_default()
+                                )),
+                                cause => cause.map(str::to_string),
+                            };
 
                         // Only log a message to the console if we're showing action messages
                         if !hide_messages && not_run_cause.is_none() {
@@ -5143,6 +5221,18 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                             cmd.push("-c");
                             owned_strings.push(command_str);
                             cmd.push(owned_strings.last().unwrap());
+
+                            // The step runs a command built from its inputs,
+                            // not the action, so its pass isn't the action's.
+                            action_not_run = report_action_not_run(
+                                uses,
+                                not_run_cause
+                                    .as_deref()
+                                    .map(|cause| {
+                                        format!("{}; its `command` input ran in its place", cause)
+                                    })
+                                    .as_deref(),
+                            );
                         } else {
                             // Fall back to emulation for actions we don't know how to execute
                             cmd.clear();
@@ -5157,7 +5247,7 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
 
                             // The step passes, but nothing the action does
                             // happens. Say so here, and in the run's verdict.
-                            action_not_run = report_action_not_run(uses, not_run_cause);
+                            action_not_run = report_action_not_run(uses, not_run_cause.as_deref());
                         }
                     }
 
@@ -7778,6 +7868,17 @@ mod tests {
         assert_eq!(*runtime.builds.lock().unwrap(), 2);
     }
 
+    #[test]
+    fn a_failing_run_that_printed_a_network_error_is_not_a_transport_error() {
+        assert!(is_transport_error(
+            "Image build failed: connection reset by peer"
+        ));
+        let own_failure = "The command '/bin/sh -c pip install -r req.txt' returned a \
+                           non-zero code: 1 (image t)\nLast build output:\n\
+                           ConnectionResetError: [Errno 104] Connection reset by peer";
+        assert!(!is_transport_error(own_failure));
+    }
+
     #[tokio::test]
     async fn a_build_that_failed_on_its_own_is_not_retried() {
         let runtime = flaky(vec![Some("RUN apt-get install: exit code 100")], None);
@@ -9162,6 +9263,15 @@ runs:
     /// a container runtime unless `emulation`, with `installed` built into
     /// the job's image.
     async fn run_uses_step(uses: &str, installed: &[String], emulation: bool) -> StepResult {
+        run_uses_step_with(uses, None, installed, emulation).await
+    }
+
+    async fn run_uses_step_with(
+        uses: &str,
+        with: Option<HashMap<String, String>>,
+        installed: &[String],
+        emulation: bool,
+    ) -> StepResult {
         // An unpinned `uses:` resolves at `main`; its metadata is seeded so
         // nothing is fetched.
         action_resolver::seed_cache_for_test(
@@ -9180,7 +9290,7 @@ runs:
             );
         }
         let working_dir = std::env::current_dir().unwrap();
-        let step = make_step("the step", uses, None, HashMap::new());
+        let step = make_step("the step", uses, with, HashMap::new());
         let ctx = StepExecutionContext {
             step: &step,
             step_idx: 0,
@@ -9213,6 +9323,49 @@ runs:
         let result = run_uses_step("wrkflw-test/no-such-action", &[], false).await;
         assert_eq!(result.status, StepStatus::Success);
         assert_eq!(result.actions_not_run, ["wrkflw-test/no-such-action"]);
+    }
+
+    #[tokio::test]
+    async fn an_action_whose_command_input_ran_in_its_place_is_reported() {
+        let with = HashMap::from([("command".to_string(), "true".to_string())]);
+        let result = run_uses_step_with("wrkflw-test/command-action", Some(with), &[], false).await;
+        assert_eq!(result.status, StepStatus::Success);
+        assert_eq!(result.actions_not_run, ["wrkflw-test/command-action"]);
+    }
+
+    #[test]
+    fn a_reused_pass_keeps_the_actions_it_did_not_run() {
+        let mut result = JobResult::reused(
+            acceleration::StoredJob {
+                name: "test".to_string(),
+                canonical_name: "test".to_string(),
+                outputs: HashMap::new(),
+                actions_not_run: Vec::new(),
+            },
+            "reused",
+            "reused",
+        );
+        result.steps = vec![StepResult::new(
+            "Upload coverage".to_string(),
+            StepStatus::Success,
+            String::new(),
+        )
+        .without_running(["codecov/codecov-action@v4".to_string()])];
+
+        let stored = stored_jobs(&[result]);
+        assert_eq!(
+            stored[0].actions_not_run,
+            [crate::action_fidelity::UnexecutedAction {
+                step: "Upload coverage".to_string(),
+                uses: "codecov/codecov-action@v4".to_string(),
+            }]
+        );
+        // Reusing it again reports the action as not run, not a clean pass.
+        let reused = JobResult::reused(stored[0].clone(), "reused", "reused");
+        assert_eq!(
+            reused.steps[0].actions_not_run,
+            ["codecov/codecov-action@v4"]
+        );
     }
 
     #[tokio::test]
@@ -10210,6 +10363,78 @@ runs:
     }
 
     #[test]
+    fn a_version_file_must_stay_inside_the_repository() {
+        let outer = tempfile::tempdir().unwrap();
+        let root = outer.path().join("repo");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(outer.path().join("secret"), "3.12\n").unwrap();
+        std::fs::write(root.join(".python-version"), "3.11\n").unwrap();
+        assert_eq!(
+            version_from_file(&root, "./.python-version").as_deref(),
+            Some("3.11")
+        );
+        assert_eq!(version_from_file(&root, "../secret"), None);
+        let absolute = outer.path().join("secret");
+        assert_eq!(version_from_file(&root, absolute.to_str().unwrap()), None);
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&absolute, root.join("linked")).unwrap();
+            assert_eq!(version_from_file(&root, "linked"), None);
+        }
+    }
+
+    #[test]
+    fn requires_python_is_read_from_the_project_table_without_its_comment() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("pyproject.toml"),
+            "[tool.other]\nrequires-python = \"==2.7\"\n\n[project]\n\
+             requires-python = '>=3.10'  # oldest we test\n",
+        )
+        .unwrap();
+        assert_eq!(
+            version_from_file(dir.path(), "pyproject.toml").as_deref(),
+            Some(">=3.10")
+        );
+    }
+
+    #[test]
+    fn a_version_that_reads_as_an_option_or_a_parent_is_refused() {
+        assert!(is_safe_version("1.22.3"));
+        assert!(is_safe_version("nightly-2024-01-01"));
+        assert!(!is_safe_version("--help"));
+        assert!(!is_safe_version("-1"));
+        assert!(!is_safe_version(".."));
+        assert!(!is_safe_version("1..2"));
+    }
+
+    #[test]
+    fn node_version_takes_a_leading_v() {
+        let with = HashMap::from([("node-version".to_string(), "v20".to_string())]);
+        let detected =
+            detect_setup_runtimes(&[make_step_uses("actions/setup-node@v4", Some(with))]);
+        assert_eq!(detected[0].version, "20");
+        assert!(detected[0].install_script.contains("setup_20.x"));
+    }
+
+    #[test]
+    fn a_go_line_installs_its_newest_release() {
+        // A full release is fetched by name.
+        let full = get_install_script("go", "1.22.3");
+        assert!(full.contains("GO=go1.22.3 "));
+        // `go 1.22` in go.mod names a line; go.dev has no `go1.22` file.
+        let line = get_install_script("go", "1.22");
+        assert!(
+            line.contains(r#"grep -oE '"go1\.22(\.[0-9]+)*"'"#),
+            "{}",
+            line
+        );
+        assert!(line.contains("test -n \"$GO\""));
+        let stable = get_install_script("go", "stable");
+        assert!(stable.contains(r#"'"go[0-9]+(\.[0-9]+)*"'"#), "{}", stable);
+    }
+
+    #[test]
     fn a_node_range_resolves_to_the_major_setup_node_would_pick() {
         assert_eq!(node_major_for_range(">=18.17 <21").as_deref(), Some("20"));
         assert_eq!(node_major_for_range(">=18 <21.2").as_deref(), Some("21"));
@@ -10231,7 +10456,8 @@ runs:
         assert_eq!(node_alias("lts/*").as_deref(), Some("lts"));
         assert_eq!(node_alias("lts/iron").as_deref(), Some("20"));
         assert_eq!(node_alias("lts/Hydrogen").as_deref(), Some("18"));
-        assert_eq!(node_alias("lts/someday").as_deref(), Some("lts"));
+        // setup-node refuses a codename it doesn't know.
+        assert_eq!(node_alias("lts/someday"), None);
         assert_eq!(node_alias("node").as_deref(), Some("current"));
         assert_eq!(node_alias("latest").as_deref(), Some("current"));
         assert_eq!(node_alias("20"), None);

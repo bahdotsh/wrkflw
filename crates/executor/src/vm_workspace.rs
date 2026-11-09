@@ -13,8 +13,15 @@
 //!
 //! Both directions compare listings (type, size, whole-second mtime, mode, link
 //! target), so a step that changes little costs little. An entry the host
-//! cannot hold, such as a name that is not UTF-8, stays in the volume and is
-//! never deleted from it for being absent on the host.
+//! cannot hold, such as a name that is not UTF-8, stays in the volume with
+//! everything inside it, and is never deleted from it for being absent on
+//! the host. A host directory that can't be read is left alone both ways.
+//!
+//! Two limits follow from the listings. A file rewritten on the host in the
+//! same second as a step wrote it, at the same size and mode, looks
+//! unchanged, as it does to rsync's quick check. And on a host that folds
+//! case, a step that creates `Foo/` beside a file `foo` replaces the host's
+//! `foo`, so host-side work no longer sees it, although the volume keeps it.
 //!
 //! `WRKFLW_WORKSPACE_MOUNT=bind` turns this off; `=volume` turns it on on
 //! Linux too.
@@ -106,6 +113,50 @@ struct State {
     /// Set when the volume couldn't be set up before any step used it: the
     /// job then mounts the host directory as before.
     unusable: bool,
+    /// Set once a step has seen the volume. From then on the volume holds
+    /// what steps wrote, so a failed sync fails the step instead of falling
+    /// back to the host copy, which lacks it.
+    used: bool,
+}
+
+impl State {
+    fn new() -> Self {
+        State {
+            helper: None,
+            volume: None,
+            kept: HashSet::new(),
+            unusable: false,
+            used: false,
+        }
+    }
+}
+
+/// Whether `path` is a kept entry or inside one. A directory the host
+/// refused keeps everything in it in the volume too.
+fn is_kept(kept: &HashSet<PathBuf>, path: &Path) -> bool {
+    path.ancestors().any(|ancestor| kept.contains(ancestor))
+}
+
+/// Whether `path` is one of `sorted`, a sorted list where no entry is
+/// inside another, or inside one.
+fn under_any(sorted: &[PathBuf], path: &Path) -> bool {
+    // Paths order component by component, so the only candidate is the
+    // greatest entry not after `path`.
+    let at = sorted.partition_point(|p| p.as_path() <= path);
+    at > 0 && path.starts_with(&sorted[at - 1])
+}
+
+/// The outermost of `sorted` paths: those not inside another one.
+fn outermost(sorted: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    for path in sorted {
+        // A path's descendants sort right after it, so only the last kept
+        // path can contain this one.
+        if !out.last().is_some_and(|last| path.starts_with(last)) {
+            out.push(path);
+        }
+    }
+    out
 }
 
 pub(crate) struct VmWorkspace {
@@ -145,12 +196,7 @@ pub(crate) async fn before_step(
                     host: host.to_path_buf(),
                     volume_path: PathBuf::from(&volume),
                     volume,
-                    state: Mutex::new(State {
-                        helper: None,
-                        volume: None,
-                        kept: HashSet::new(),
-                        unusable: false,
-                    }),
+                    state: Mutex::new(State::new()),
                 })
             })
             .clone()
@@ -190,10 +236,9 @@ impl VmWorkspace {
         if state.unusable {
             return Ok(false);
         }
-        let first = state.volume.is_none();
         let result = self.sync_in_locked(&mut state);
         match result {
-            Err(e) if first => {
+            Err(e) if !state.used => {
                 wrkflw_logging::warning(&format!(
                     "Steps see the workspace through the {} file share, because a volume for \
                      it couldn't be set up: {}. Linux-only file names and case-sensitive paths \
@@ -210,7 +255,10 @@ impl VmWorkspace {
                 "copying the workspace into the {} volume failed: {}",
                 self.cli, e
             )),
-            Ok(()) => Ok(true),
+            Ok(()) => {
+                state.used = true;
+                Ok(true)
+            }
         }
     }
 
@@ -220,10 +268,13 @@ impl VmWorkspace {
             Some(listing) => listing,
             None => self.list_volume(&helper)?,
         };
-        let host = walk(&self.host)?;
-        let plan = plan_sync_in(&host, &volume, &state.kept, |rel| {
-            std::fs::symlink_metadata(self.host.join(rel)).is_ok()
-        });
+        let (host, unreadable) = walk(&self.host)?;
+        let plan = plan_sync_in(
+            &host,
+            &without_unreadable(&volume, &unreadable),
+            &state.kept,
+            |rel| std::fs::symlink_metadata(self.host.join(rel)).is_ok(),
+        );
         if !plan.delete.is_empty() {
             exec(
                 self.cli,
@@ -233,7 +284,7 @@ impl VmWorkspace {
             )?;
         }
         if !plan.send.is_empty() {
-            self.send(&helper, &plan.send)?;
+            self.send(&helper, &plan.send, &volume)?;
         }
         let mut volume = volume;
         for gone in &plan.delete {
@@ -263,22 +314,16 @@ impl VmWorkspace {
     fn sync_out_locked(&self, state: &mut State) -> io::Result<()> {
         let helper = self.helper(state)?;
         let volume = self.list_volume(&helper)?;
-        let host = walk(&self.host)?;
-        let plan = plan_sync_out(&host, &volume, &state.kept);
+        let (host, unreadable) = walk(&self.host)?;
+        let plan = plan_sync_out(
+            &host,
+            &without_unreadable(&volume, &unreadable),
+            &state.kept,
+        );
         for path in &plan.delete {
-            let target = self.host.join(path);
-            let removed = match std::fs::symlink_metadata(&target) {
-                Ok(meta) if meta.is_dir() => std::fs::remove_dir_all(&target),
-                Ok(_) => std::fs::remove_file(&target),
-                Err(_) => Ok(()),
-            };
-            if let Err(e) = removed {
-                wrkflw_logging::warning(&format!(
-                    "Could not remove {} from the workspace: {}",
-                    target.display(),
-                    e
-                ));
-            }
+            // Left on the host, the next sync would copy it back into the
+            // volume as if the step had never removed it.
+            remove_host_entry(&self.host.join(path))?;
         }
         if !plan.fetch.is_empty() {
             let refused = self.fetch(&helper, &plan.fetch, &volume)?;
@@ -387,7 +432,7 @@ impl VmWorkspace {
     }
 
     /// Stream `paths` from the host into the volume.
-    fn send(&self, helper: &str, paths: &[PathBuf]) -> io::Result<()> {
+    fn send(&self, helper: &str, paths: &[PathBuf], volume: &Listing) -> io::Result<()> {
         let mut child = Command::new(self.cli)
             .args([
                 "exec",
@@ -410,17 +455,18 @@ impl VmWorkspace {
             let mut builder = tar::Builder::new(io::BufWriter::new(stdin));
             builder.follow_symlinks(false);
             for path in paths {
-                builder.append_path_with_name(self.host.join(path), path)?;
+                append_host_entry(&mut builder, &self.host.join(path), path, volume.get(path))?;
             }
             builder.into_inner()?.flush()
         })();
         let status = child.wait()?;
         let stderr = stderr.join().unwrap_or_default();
-        written?;
+        // When tar dies first, writing fails with a broken pipe, which says
+        // nothing; tar's own message says why.
         if !status.success() {
             return Err(io::Error::other(format!("tar failed: {}", stderr.trim())));
         }
-        Ok(())
+        written
     }
 
     /// Stream `paths` from the volume onto the host. Returns the entries the
@@ -487,21 +533,16 @@ fn plan_sync_in(
             Some(theirs) => !theirs.kind.same_type(&entry.kind),
             // Absent from the listing but present on disk means the host
             // folds case and holds this name under another spelling.
-            None => !kept.contains(*path) && !on_host(path),
+            None => !is_kept(kept, path) && !on_host(path),
         })
         .map(|(path, _)| path.clone())
         .collect();
     delete.sort();
-    let mut outermost: Vec<PathBuf> = Vec::new();
-    for path in delete {
-        if !outermost.iter().any(|done| path.starts_with(done)) {
-            outermost.push(path);
-        }
-    }
+    let outermost = outermost(delete);
     let mut send: Vec<PathBuf> = host
         .iter()
         .filter(|(path, entry)| {
-            let replaced = outermost.iter().any(|gone| path.starts_with(gone));
+            let replaced = under_any(&outermost, path);
             replaced
                 || volume
                     .get(*path)
@@ -532,16 +573,11 @@ fn plan_sync_out(host: &Listing, volume: &Listing, kept: &HashSet<PathBuf>) -> S
         .cloned()
         .collect();
     delete.sort();
-    let mut outermost: Vec<PathBuf> = Vec::new();
-    for path in delete {
-        if !outermost.iter().any(|done| path.starts_with(done)) {
-            outermost.push(path);
-        }
-    }
+    let outermost = outermost(delete);
     let mut fetch: Vec<PathBuf> = volume
         .iter()
         .filter(|(path, entry)| {
-            !kept.contains(*path) && host.get(*path).is_none_or(|ours| !ours.matches(entry))
+            !is_kept(kept, path) && host.get(*path).is_none_or(|ours| !ours.matches(entry))
         })
         .map(|(path, _)| path.clone())
         .collect();
@@ -668,13 +704,32 @@ fn host_mode(_meta: &std::fs::Metadata) -> Option<u32> {
     None
 }
 
-/// Everything under `root`, without following links.
-fn walk(root: &Path) -> io::Result<Listing> {
+/// Everything under `root`, without following links, and the directories
+/// below it that couldn't be read. Those are listed but not their contents.
+fn walk(root: &Path) -> io::Result<(Listing, Vec<PathBuf>)> {
     let mut listing = Listing::new();
+    let mut unreadable = Vec::new();
     let mut pending = vec![PathBuf::new()];
     while let Some(rel) = pending.pop() {
-        for entry in std::fs::read_dir(root.join(&rel))? {
-            let entry = entry?;
+        let entries = match std::fs::read_dir(root.join(&rel)) {
+            Ok(entries) => entries,
+            // The workspace itself must be readable; a directory in it a
+            // step made unreadable is left alone rather than failing the job.
+            Err(e) if !rel.as_os_str().is_empty() => {
+                wrkflw_logging::debug(&format!(
+                    "Workspace directory {} can't be read, so it isn't synced: {}",
+                    rel.to_string_lossy(),
+                    e
+                ));
+                unreadable.push(rel);
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+        for entry in entries {
+            let Ok(entry) = entry else {
+                continue;
+            };
             let child = rel.join(entry.file_name());
             let path = entry.path();
             let Ok(meta) = std::fs::symlink_metadata(&path) else {
@@ -689,7 +744,102 @@ fn walk(root: &Path) -> io::Result<Listing> {
             listing.insert(child, found);
         }
     }
-    Ok(listing)
+    Ok((listing, unreadable))
+}
+
+/// `volume` without what is inside a host directory that couldn't be read.
+/// The host's side of those is unknown, so neither direction touches them.
+fn without_unreadable(volume: &Listing, unreadable: &[PathBuf]) -> Listing {
+    if unreadable.is_empty() {
+        return volume.clone();
+    }
+    volume
+        .iter()
+        .filter(|(path, _)| {
+            !unreadable
+                .iter()
+                .any(|dir| path.starts_with(dir) && path.as_path() != dir.as_path())
+        })
+        .map(|(path, entry)| (path.clone(), entry.clone()))
+        .collect()
+}
+
+/// Remove `target` from the host, making read-only directories in it
+/// writable first if that is what stops it.
+fn remove_host_entry(target: &Path) -> io::Result<()> {
+    let remove = || match std::fs::symlink_metadata(target) {
+        Ok(meta) if meta.is_dir() => std::fs::remove_dir_all(target),
+        Ok(_) => std::fs::remove_file(target),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    };
+    match remove() {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+            make_writable(target);
+            remove().map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!("could not remove {}: {}", target.display(), e),
+                )
+            })
+        }
+        Err(e) => Err(io::Error::new(
+            e.kind(),
+            format!("could not remove {}: {}", target.display(), e),
+        )),
+    }
+}
+
+/// Let the owner change `path` and, for a directory, everything in it.
+/// Links are not followed.
+fn make_writable(path: &Path) {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return;
+    };
+    if meta.file_type().is_symlink() {
+        return;
+    }
+    let mut permissions = meta.permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let extra = if meta.is_dir() { 0o700 } else { 0o200 };
+        permissions.set_mode(permissions.mode() | extra);
+    }
+    #[cfg(not(unix))]
+    #[allow(clippy::permissions_set_readonly_false)]
+    permissions.set_readonly(false);
+    let _ = std::fs::set_permissions(path, permissions);
+    if meta.is_dir() {
+        if let Ok(entries) = std::fs::read_dir(path) {
+            for entry in entries.flatten() {
+                make_writable(&entry.path());
+            }
+        }
+    }
+}
+
+/// Add the host entry at `full` to `builder` as `rel`. A host without
+/// permission bits gives a file the mode it has in the volume, or 0755 for
+/// a new one, as the file share it replaces showed every file executable.
+fn append_host_entry<W: Write>(
+    builder: &mut tar::Builder<W>,
+    full: &Path,
+    rel: &Path,
+    _in_volume: Option<&Entry>,
+) -> io::Result<()> {
+    #[cfg(not(unix))]
+    {
+        let meta = std::fs::symlink_metadata(full)?;
+        if meta.is_file() {
+            let mut header = tar::Header::new_gnu();
+            header.set_metadata(&meta);
+            header.set_mode(_in_volume.and_then(|e| e.mode).unwrap_or(0o755));
+            return builder.append_data(&mut header, rel, std::fs::File::open(full)?);
+        }
+    }
+    builder.append_path_with_name(full, rel)
 }
 
 /// Write the archive onto `host`, skipping entries it refuses. Nothing here
@@ -708,13 +858,15 @@ fn unpack<R: Read>(reader: R, host: &Path, volume: &Listing) -> io::Result<Vec<P
             continue;
         }
         let is_dir = entry.header().entry_type().is_dir();
-        let written = clear_type_conflict(host, &rel, is_dir).and_then(|()| {
-            if is_dir {
-                std::fs::create_dir_all(host.join(&rel))
-            } else {
-                entry.unpack_in(host).map(|_| ())
-            }
-        });
+        let written = refuse_link_parents(host, &rel)
+            .and_then(|()| clear_type_conflict(host, &rel, is_dir))
+            .and_then(|()| {
+                if is_dir {
+                    std::fs::create_dir_all(host.join(&rel))
+                } else {
+                    entry.unpack_in(host).map(|_| ())
+                }
+            });
         match written {
             Ok(()) if is_dir => directories.push((rel, entry.header().mode().ok())),
             Ok(()) => {}
@@ -737,10 +889,33 @@ fn unpack<R: Read>(reader: R, host: &Path, volume: &Listing) -> io::Result<Vec<P
     Ok(refused)
 }
 
+/// Refuse to write `rel` when a directory above it on the host is a link,
+/// so nothing the volume holds lands outside the workspace.
+fn refuse_link_parents(host: &Path, rel: &Path) -> io::Result<()> {
+    let mut dir = host.to_path_buf();
+    let parents = rel.parent().into_iter().flat_map(|p| p.components());
+    for component in parents {
+        dir.push(component);
+        match std::fs::symlink_metadata(&dir) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(io::Error::other(format!(
+                    "{} is a link on the host",
+                    dir.display()
+                )))
+            }
+            Ok(_) => {}
+            // Missing parents are created as directories.
+            Err(_) => return Ok(()),
+        }
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 fn set_dir_mode(dir: &Path, mode: Option<u32>, _entry: Option<&Entry>) {
     use std::os::unix::fs::PermissionsExt;
-    if let Some(mode) = mode {
+    let is_dir = std::fs::symlink_metadata(dir).is_ok_and(|meta| meta.is_dir());
+    if let (Some(mode), true) = (mode, is_dir) {
         let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode & 0o777));
     }
 }
@@ -838,16 +1013,18 @@ pub(crate) fn release(host: &Path, kept: bool) {
         return;
     };
     let helper = workspace.lock().helper.take();
-    if let Some(helper) = helper {
-        remove_container(workspace.cli, &helper);
-    }
-    if kept {
-        return;
-    }
     let (cli, volume) = (workspace.cli, workspace.volume.clone());
-    // The job container is removed on a thread of its own, so the volume
-    // may still be in use for a moment. `wrkflw clean` gets any it misses.
-    std::thread::spawn(move || {
+    // This runs as a job ends, on the async runtime, so the engine calls
+    // that block go to a thread. The job container is removed on a thread
+    // of its own too, so the volume may still be in use for a moment. The
+    // run waits for this before it ends; `wrkflw clean` gets any it misses.
+    let removal = std::thread::spawn(move || {
+        if let Some(helper) = helper {
+            remove_container(cli, &helper);
+        }
+        if kept {
+            return;
+        }
         for _ in 0..40 {
             let removed = Command::new(cli)
                 .args(["volume", "rm", "-f", &volume])
@@ -862,6 +1039,27 @@ pub(crate) fn release(host: &Path, kept: bool) {
             std::thread::sleep(std::time::Duration::from_millis(250));
         }
     });
+    PENDING_REMOVALS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(removal);
+}
+
+static PENDING_REMOVALS: Mutex<Vec<std::thread::JoinHandle<()>>> = Mutex::new(Vec::new());
+
+/// Wait for the volumes released so far to be removed, so a run that ends
+/// right after its last job doesn't leave that job's volume behind.
+pub(crate) async fn wait_for_released_volumes() {
+    let pending = std::mem::take(&mut *PENDING_REMOVALS.lock().unwrap_or_else(|e| e.into_inner()));
+    if pending.is_empty() {
+        return;
+    }
+    let _ = tokio::task::spawn_blocking(move || {
+        for removal in pending {
+            let _ = removal.join();
+        }
+    })
+    .await;
 }
 
 /// Remove workspace volumes whose host directory is gone. Returns how many.
@@ -1032,6 +1230,123 @@ mod tests {
     }
 
     #[test]
+    fn what_is_inside_a_directory_the_host_refused_stays_in_the_volume() {
+        // The host couldn't hold `bad`, so it never saw what is in it.
+        let host = listing(&[("src", dir())]);
+        let volume = listing(&[
+            ("src", dir()),
+            ("src/bad", dir()),
+            ("src/bad/out.txt", file(1, 10)),
+            ("src/bad/deep", dir()),
+            ("src/bad/deep/more", file(1, 10)),
+        ]);
+        let kept = HashSet::from([PathBuf::from("src/bad")]);
+        let plan = plan_sync_in(&host, &volume, &kept, |_| false);
+        assert_eq!(plan, SyncIn::default());
+        // Nor is any of it fetched again, to be refused again.
+        let plan = plan_sync_out(&host, &volume, &kept);
+        assert_eq!(plan, SyncOut::default());
+    }
+
+    #[test]
+    fn nested_paths_collapse_to_the_outermost() {
+        let sorted = paths(&["a", "a/b", "a/b/c", "ab", "b/c", "b/c/d"]);
+        let out = outermost(sorted);
+        assert_eq!(out, paths(&["a", "ab", "b/c"]));
+        assert!(under_any(&out, Path::new("a/x")));
+        assert!(under_any(&out, Path::new("ab")));
+        assert!(under_any(&out, Path::new("b/c/e")));
+        assert!(!under_any(&out, Path::new("b")));
+        assert!(!under_any(&out, Path::new("abc")));
+        assert!(!under_any(&out, Path::new("0")));
+    }
+
+    #[test]
+    fn a_directory_the_host_cant_read_is_left_alone_both_ways() {
+        let volume = listing(&[
+            ("locked", dir()),
+            ("locked/inside", file(1, 10)),
+            ("open", file(1, 10)),
+        ]);
+        let visible = without_unreadable(&volume, &paths(&["locked"]));
+        assert_eq!(
+            visible,
+            listing(&[("locked", dir()), ("open", file(1, 10))])
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn walking_skips_unreadable_directories_and_removal_gets_past_read_only_ones() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let locked = root.path().join("locked");
+        std::fs::create_dir_all(locked.join("sub")).unwrap();
+        std::fs::write(locked.join("sub/file"), "x").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let readable = std::fs::read_dir(&locked).is_ok();
+        let (listing, unreadable) = walk(root.path()).unwrap();
+        assert!(listing.contains_key(Path::new("locked")));
+        if !readable {
+            // Root reads anything, so this only holds for other users.
+            assert_eq!(unreadable, paths(&["locked"]));
+        }
+
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
+        std::fs::set_permissions(locked.join("sub"), std::fs::Permissions::from_mode(0o555))
+            .unwrap();
+        remove_host_entry(&locked).unwrap();
+        assert!(!locked.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unpacking_never_writes_through_a_linked_directory() {
+        let host = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), host.path().join("link")).unwrap();
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_size(2);
+        header.set_mode(0o644);
+        header.set_entry_type(tar::EntryType::Regular);
+        builder
+            .append_data(&mut header, "link/escaped", &b"hi"[..])
+            .unwrap();
+        let archive = builder.into_inner().unwrap();
+        let refused = unpack(&archive[..], host.path(), &Listing::new()).unwrap();
+        assert_eq!(refused, paths(&["link/escaped"]));
+        assert!(!outside.path().join("escaped").exists());
+    }
+
+    /// A workspace whose container engine always fails.
+    fn broken_workspace(used: bool) -> VmWorkspace {
+        let dir = std::env::temp_dir();
+        let mut state = State::new();
+        state.used = used;
+        VmWorkspace {
+            cli: "wrkflw-test-no-such-engine",
+            host: dir.clone(),
+            volume: volume_name(&dir),
+            volume_path: PathBuf::from(volume_name(&dir)),
+            state: Mutex::new(state),
+        }
+    }
+
+    #[test]
+    fn a_volume_falls_back_to_the_host_only_before_a_step_used_it() {
+        // Before any step: the job mounts the host directory instead.
+        let fresh = broken_workspace(false);
+        assert!(!fresh.sync_in().unwrap());
+        assert!(fresh.lock().unusable);
+        // After one: the volume holds what steps wrote, so the step fails,
+        // even when a failed copy out forgot the volume's listing.
+        let used = broken_workspace(true);
+        assert!(used.sync_in().is_err());
+        assert!(!used.lock().unusable);
+    }
+
+    #[test]
     fn copying_in_replaces_an_entry_that_changed_type() {
         let host = listing(&[("x", file(1, 1))]);
         let volume = listing(&[("x", dir()), ("x/inner", file(1, 1))]);
@@ -1084,20 +1399,31 @@ mod tests {
         assert_eq!(refused, paths(&["blocker/child"]));
         assert_eq!(std::fs::read(host.path().join("fine")).unwrap(), b"ok");
         let meta = std::fs::metadata(host.path().join("fine")).unwrap();
+        let found = host_entry(&meta, &host.path().join("fine")).unwrap();
         assert_eq!(
-            host_entry(&meta, &host.path().join("fine")).unwrap(),
-            file(2, 1_700_000_000)
+            found.kind,
+            Kind::File {
+                size: 2,
+                mtime: 1_700_000_000
+            }
         );
+        // A host without permission bits has none to report.
+        assert_eq!(found.mode, host_mode(&meta));
+        #[cfg(unix)]
+        assert_eq!(found.mode, Some(0o644));
     }
 
+    /// A Docker daemon that runs Linux containers, as the helper needs. A
+    /// Windows daemon answers `docker info` but can't start it.
     fn docker_ready() -> bool {
         std::env::var("WRKFLW_TEST_SKIP_DOCKER").is_err()
             && Command::new("docker")
-                .args(["info"])
-                .stdout(Stdio::null())
+                .args(["info", "--format", "{{.OSType}}"])
                 .stderr(Stdio::null())
-                .status()
-                .is_ok_and(|s| s.success())
+                .output()
+                .is_ok_and(|out| {
+                    out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == "linux"
+                })
     }
 
     /// A step in the volume can do what a Linux filesystem allows and the
@@ -1118,12 +1444,7 @@ mod tests {
             host: host.clone(),
             volume: volume_name(&host),
             volume_path: PathBuf::from(volume_name(&host)),
-            state: Mutex::new(State {
-                helper: None,
-                volume: None,
-                kept: HashSet::new(),
-                unusable: false,
-            }),
+            state: Mutex::new(State::new()),
         });
         WORKSPACES
             .lock()

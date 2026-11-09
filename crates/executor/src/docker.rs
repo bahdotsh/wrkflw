@@ -457,14 +457,19 @@ pub fn is_available() -> bool {
     false
 }
 
-/// The exit code of a finished container, or -1 if it can't be determined.
-/// Samples one step container's memory into its job's meter.
+/// Samples one step container's memory into its job's meter. Dropped
+/// without [`MemoryWatch::stop`], as when the step is cancelled, it leaves
+/// the job unmeasured.
 struct MemoryWatch {
     id: String,
     meter: std::sync::Arc<crate::job_memory::JobMeter>,
     sampled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// The stats stream failed before the container ended.
+    broken: std::sync::Arc<std::sync::atomic::AtomicBool>,
     started: std::time::Instant,
     task: tokio::task::JoinHandle<()>,
+    /// Set by `stop`: whether the container ran out of memory.
+    ended: Option<bool>,
 }
 
 /// A container that ran this long and sent no sample went unmeasured.
@@ -472,19 +477,31 @@ const UNSAMPLED_AFTER: std::time::Duration = std::time::Duration::from_secs(3);
 
 impl MemoryWatch {
     fn start(docker: Docker, id: &str, meter: std::sync::Arc<crate::job_memory::JobMeter>) -> Self {
-        let sampled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let sampled = std::sync::Arc::new(AtomicBool::new(false));
+        let broken = std::sync::Arc::new(AtomicBool::new(false));
         let task = {
-            let (id, meter, sampled) = (id.to_string(), meter.clone(), sampled.clone());
+            let (id, meter, sampled, broken) = (
+                id.to_string(),
+                meter.clone(),
+                sampled.clone(),
+                broken.clone(),
+            );
             tokio::spawn(async move {
                 let options = bollard::container::StatsOptions {
                     stream: true,
                     one_shot: false,
                 };
                 let mut stats = docker.stats(&id, Some(options));
-                while let Some(Ok(sample)) = stats.next().await {
+                while let Some(sample) = stats.next().await {
+                    let Ok(sample) = sample else {
+                        // What the container used from here on is unseen.
+                        broken.store(true, Ordering::Relaxed);
+                        break;
+                    };
                     if let Some(bytes) = working_set(&sample.memory_stats) {
                         meter.sample(&id, bytes);
-                        sampled.store(true, std::sync::atomic::Ordering::Relaxed);
+                        sampled.store(true, Ordering::Relaxed);
                     }
                 }
             })
@@ -493,20 +510,37 @@ impl MemoryWatch {
             id: id.to_string(),
             meter,
             sampled,
+            broken,
             started: std::time::Instant::now(),
             task,
+            ended: None,
         }
     }
 
-    fn stop(self, exit_code: i32) {
+    /// The container ended; `out_of_memory` when the kernel killed it, or
+    /// a process in it, for memory.
+    fn stop(mut self, out_of_memory: bool) {
+        self.ended = Some(out_of_memory);
+    }
+}
+
+impl Drop for MemoryWatch {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
         self.task.abort();
         self.meter.stopped(&self.id);
-        if exit_code == crate::job_memory::SIGKILL_EXIT {
-            self.meter.killed();
-        } else if !self.sampled.load(std::sync::atomic::Ordering::Relaxed)
-            && self.started.elapsed() >= UNSAMPLED_AFTER
-        {
-            self.meter.unmeasured();
+        match self.ended {
+            Some(true) => self.meter.killed(),
+            Some(false)
+                if self.broken.load(Ordering::Relaxed)
+                    || (!self.sampled.load(Ordering::Relaxed)
+                        && self.started.elapsed() >= UNSAMPLED_AFTER) =>
+            {
+                self.meter.unmeasured()
+            }
+            Some(false) => {}
+            // Cancelled mid-step: how much it would have used is unknown.
+            None => self.meter.unmeasured(),
         }
     }
 }
@@ -524,6 +558,7 @@ fn working_set(stats: &bollard::container::MemoryStats) -> Option<u64> {
     Some(usage.saturating_sub(inactive))
 }
 
+/// The exit code of a finished container, or -1 if it can't be determined.
 fn wait_exit_code(
     wait_result: Option<&Result<ContainerWaitResponse, bollard::errors::Error>>,
 ) -> i32 {
@@ -1295,7 +1330,23 @@ impl DockerRuntime {
         }
         let exit_code = wait_exit_code(wait_result.first());
         if let Some(watch) = memory_watch {
-            watch.stop(exit_code);
+            // The engine knows when the kernel killed a process for memory;
+            // the exit code alone doesn't say when it wasn't the shell.
+            let oom_killed = exit_code != 0
+                && tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    self.docker.inspect_container(&container.id, None),
+                )
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .and_then(|inspect| inspect.state?.oom_killed)
+                .unwrap_or(false);
+            watch.stop(crate::job_memory::ran_out_of_memory(
+                exit_code,
+                oom_killed,
+                &[&stdout, &stderr],
+            ));
         }
 
         // Clean up container with a timeout, but preserve on failure if configured
@@ -1551,6 +1602,32 @@ mod tests {
     use super::wait_exit_code;
     use bollard::errors::Error;
     use bollard::models::ContainerWaitResponse;
+
+    #[tokio::test]
+    async fn a_step_watch_dropped_or_cut_off_leaves_its_job_unmeasured() {
+        let Ok(docker) = Docker::connect_with_local_defaults() else {
+            return;
+        };
+        // Cancelled mid-step: dropped without being stopped.
+        let meter = std::sync::Arc::new(crate::job_memory::JobMeter::default());
+        meter.sample("earlier", 1);
+        drop(MemoryWatch::start(
+            docker.clone(),
+            "wrkflw-test-no-such-container",
+            meter.clone(),
+        ));
+        assert!(meter.is_incomplete());
+
+        // A stats stream that fails, as one for a missing container does.
+        let meter = std::sync::Arc::new(crate::job_memory::JobMeter::default());
+        let watch = MemoryWatch::start(docker, "wrkflw-test-no-such-container", meter.clone());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !watch.task.is_finished() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        watch.stop(false);
+        assert!(meter.is_incomplete());
+    }
 
     #[test]
     fn wait_exit_code_keeps_a_zero_exit() {

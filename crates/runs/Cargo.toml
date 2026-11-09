@@ -23,6 +23,9 @@ tempfile.workspace = true
 tokio.workspace = true
 uuid.workspace = true
 
+[dev-dependencies]
+wrkflw-runtime.workspace = true
+
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true, features = ["signal", "process"] }
 

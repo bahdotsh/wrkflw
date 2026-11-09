@@ -32,6 +32,15 @@ pub(crate) mod vm_workspace;
 pub(crate) mod workflow_commands;
 pub mod workspace;
 
+/// How the errors that stop a job before its first step begin, because its
+/// image, job container or network couldn't be set up. The failure digest
+/// tells these from the workflow's own errors by them.
+pub mod setup_errors {
+    pub const COMBINED_IMAGE_BUILD: &str = "Failed to build combined runtime image";
+    pub const EXISTING_IMAGE_CHECK: &str = "Failed to check for existing image";
+    pub const JOB_CONTAINER: &str = "job container didn't start";
+}
+
 // Re-export public items
 pub use acceleration::{validate_remote, Acceleration, Secret, Sidecar, SIDECAR_PATH};
 pub use action_fidelity::UnexecutedAction;

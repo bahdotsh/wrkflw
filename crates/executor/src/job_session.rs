@@ -732,7 +732,8 @@ impl JobSession {
             .map_err(|e| e.to_string())?;
         if output.exit_code != 0 {
             return Err(format!(
-                "job container didn't start: {}",
+                "{}: {}",
+                crate::setup_errors::JOB_CONTAINER,
                 output.stderr.trim()
             ));
         }

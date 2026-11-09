@@ -267,6 +267,35 @@ struct KubernetesArgs {
 }
 
 impl KubernetesArgs {
+    /// These settings as the flags of a child `wrkflw run`.
+    fn child_args(&self) -> Vec<String> {
+        let mut args = Vec::new();
+        let mut one = |flag: &str, value: Option<String>| {
+            if let Some(value) = value {
+                args.extend([flag.to_string(), value]);
+            }
+        };
+        one("--k8s-context", self.k8s_context.clone());
+        one("--k8s-namespace", self.k8s_namespace.clone());
+        one("--k8s-registry", self.k8s_registry.clone());
+        one("--k8s-helper-image", self.k8s_helper_image.clone());
+        one("--k8s-timeout", self.k8s_timeout.map(|s| s.to_string()));
+        one(
+            "--k8s-schedule-timeout",
+            self.k8s_schedule_timeout.map(|s| s.to_string()),
+        );
+        for (key, value) in self.k8s_node_selector.iter().flatten() {
+            args.extend(["--k8s-node-selector".to_string(), format!("{key}={value}")]);
+        }
+        for (name, quantity) in self.k8s_resource.iter().flatten() {
+            args.extend(["--k8s-resource".to_string(), format!("{name}={quantity}")]);
+        }
+        for secret in &self.k8s_image_pull_secret {
+            args.extend(["--k8s-image-pull-secret".to_string(), secret.clone()]);
+        }
+        args
+    }
+
     fn to_config(&self) -> wrkflw_executor::KubernetesConfig {
         wrkflw_executor::KubernetesConfig {
             context: self.k8s_context.clone(),
@@ -796,9 +825,41 @@ fn collect_platform_overrides(entries: &[Option<(String, String)>]) -> HashMap<S
     entries.iter().flatten().cloned().collect()
 }
 
+/// The global flags this invocation was given, as the flags of a child
+/// `wrkflw run`. Commands that start runs, such as `compare` and `gate`,
+/// pass them on, so each run gets what a run started by hand with them
+/// would. `--format` is the parent's to choose and stays behind.
+fn global_child_args(cli: &Wrkflw, platform_overrides: &HashMap<String, String>) -> Vec<String> {
+    let mut args = Vec::new();
+    for (given, flag) in [
+        (cli.verbose, "--verbose"),
+        (cli.debug, "--debug"),
+        (cli.fresh_workspace, "--fresh-workspace"),
+        (cli.every_matrix_leg, "--every-matrix-leg"),
+    ] {
+        if given {
+            args.push(flag.to_string());
+        }
+    }
+    args.extend(platform_args(platform_overrides));
+    args.extend(cli.kubernetes.child_args());
+    args
+}
+
+/// `--tag` names what a push or release is for. A pull request is always
+/// for a branch, so the two together say nothing GitHub would run.
+fn check_tag_event(event: Option<&str>, tag: Option<&str>) -> Result<(), String> {
+    match (event, tag) {
+        (Some(event), Some(tag)) if event.starts_with("pull_request") => Err(format!(
+            "--tag {tag} can't go with --event {event}: a pull request is for a branch, \
+             so pass --branch with its head branch instead"
+        )),
+        _ => Ok(()),
+    }
+}
+
 /// `overrides` as the `--platform` flags of a child `wrkflw run`, sorted by
-/// label so the command line is the same every time. Commands that start
-/// runs pass them on, as a run started by hand would get them.
+/// label so the command line is the same every time.
 pub(crate) fn platform_args(overrides: &HashMap<String, String>) -> Vec<String> {
     let mut entries: Vec<(&String, &String)> = overrides.iter().collect();
     entries.sort();
@@ -1228,6 +1289,9 @@ async fn run_cli() {
             partial_exit_code,
             gate_mode,
         }) => {
+            if let Err(e) = check_tag_event(event.as_deref(), tag.as_deref()) {
+                cli.format.fail(&e);
+            }
             run_workflow_cmd::run(run_workflow_cmd::RunCtx {
                 path: path.clone(),
                 runtime: runtime.clone(),
@@ -1378,6 +1442,7 @@ async fn run_cli() {
                     "removed": report.removed,
                     "bytes": report.bytes,
                     "in_use": report.in_use,
+                    "volumes": report.volumes,
                     "failed": failed,
                 }));
                 if !report.failed.is_empty() {
@@ -1390,6 +1455,12 @@ async fn run_cli() {
                     report.removed,
                     human_bytes(report.bytes)
                 );
+                if report.volumes > 0 {
+                    println!(
+                        "Removed {} container volume(s) whose workspace was gone.",
+                        report.volumes
+                    );
+                }
                 if report.in_use > 0 {
                     println!(
                         "Left {} in use by a running workflow; run `wrkflw clean` again once \
@@ -1441,7 +1512,7 @@ async fn run_cli() {
                 runtime: runtime.clone(),
                 remote_cache: remote_cache.clone(),
                 install_hook: *install_hook,
-                platform_overrides,
+                child_args: global_child_args(&cli, &platform_overrides),
                 format: cli.format,
             });
         }
@@ -1449,7 +1520,7 @@ async fn run_cli() {
             compare_cmd::run(compare_cmd::CompareCtx {
                 run: run.clone(),
                 runtime: runtime.clone(),
-                platform_overrides,
+                child_args: global_child_args(&cli, &platform_overrides),
                 format: cli.format,
             })
             .await;
@@ -1471,6 +1542,9 @@ async fn run_cli() {
             no_strict_filter,
             runtime,
         }) => {
+            if let Err(e) = check_tag_event(event.as_deref(), tag.as_deref()) {
+                cli.format.fail(&e);
+            }
             plan_cmd::run(plan_cmd::PlanCtx {
                 path: path.clone(),
                 gitlab: *gitlab,
@@ -1940,6 +2014,49 @@ mod tests {
             }
             other => panic!("unexpected command: {:?}", other),
         }
+    }
+
+    #[test]
+    fn a_tag_is_refused_for_a_pull_request() {
+        assert!(check_tag_event(Some("pull_request"), Some("v1")).is_err());
+        assert!(check_tag_event(Some("pull_request_target"), Some("v1")).is_err());
+        assert!(check_tag_event(Some("push"), Some("v1")).is_ok());
+        assert!(check_tag_event(None, Some("v1")).is_ok());
+        assert!(check_tag_event(Some("pull_request"), None).is_ok());
+    }
+
+    #[test]
+    fn every_global_flag_reaches_a_child_run_and_parses_back() {
+        let given = [
+            "wrkflw",
+            "--verbose",
+            "--fresh-workspace",
+            "--every-matrix-leg",
+            "-P",
+            "ubuntu-latest=my/img:1",
+            "--k8s-namespace",
+            "ci",
+            "--k8s-resource",
+            "nvidia.com/gpu=1",
+            "--k8s-timeout",
+            "60",
+            "compare",
+            "123",
+        ];
+        let cli = Wrkflw::try_parse_from(given).unwrap();
+        let overrides = collect_platform_overrides(&cli.platform);
+        let child = global_child_args(&cli, &overrides);
+        for flag in ["--verbose", "--fresh-workspace", "--every-matrix-leg"] {
+            assert!(child.iter().any(|a| a == flag), "{flag} missing: {child:?}");
+        }
+        let mut again = vec!["wrkflw".to_string()];
+        again.extend(child);
+        again.extend(["list".to_string()]);
+        let parsed = Wrkflw::try_parse_from(&again).unwrap();
+        assert!(parsed.verbose && parsed.fresh_workspace && parsed.every_matrix_leg);
+        assert_eq!(collect_platform_overrides(&parsed.platform), overrides);
+        assert_eq!(parsed.kubernetes.to_config(), cli.kubernetes.to_config());
+        assert!(!again.iter().any(|a| a == "--format"));
     }
 
     #[test]

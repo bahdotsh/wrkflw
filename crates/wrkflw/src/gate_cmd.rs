@@ -15,7 +15,6 @@
 
 use crate::{is_gitlab_pipeline, OutputFormat, RuntimeChoice};
 use serde_json::{json, Value};
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use wrkflw_executor::vm_memory;
@@ -59,8 +58,9 @@ pub(crate) struct GateCtx {
     pub(crate) runtime: RuntimeChoice,
     pub(crate) remote_cache: Option<String>,
     pub(crate) install_hook: bool,
-    /// `--platform` overrides, passed on to each run and to the hook.
-    pub(crate) platform_overrides: HashMap<String, String>,
+    /// Global flags such as `--platform`, passed on to each run and kept
+    /// by the hook.
+    pub(crate) child_args: Vec<String>,
     pub(crate) format: OutputFormat,
 }
 
@@ -89,7 +89,7 @@ fn hook_script(
     program: &Path,
     runtime: &str,
     remote_cache: Option<&str>,
-    platform_overrides: &HashMap<String, String>,
+    child_args: &[String],
 ) -> String {
     let mut gate = format!("set -- gate --runtime {}\n", shell_quote(runtime));
     if let Some(remote) = remote_cache {
@@ -98,9 +98,8 @@ fn hook_script(
             shell_quote(remote)
         ));
     }
-    let platform = crate::platform_args(platform_overrides);
-    if !platform.is_empty() {
-        let words: Vec<String> = platform.iter().map(|arg| shell_quote(arg)).collect();
+    if !child_args.is_empty() {
+        let words: Vec<String> = child_args.iter().map(|arg| shell_quote(arg)).collect();
         gate.push_str(&format!("set -- \"$@\" {}\n", words.join(" ")));
     }
     format!(
@@ -380,7 +379,7 @@ fn run_args(ctx: &GateCtx, file: &Path, event: &Event) -> Vec<String> {
     if let Some(remote) = &ctx.remote_cache {
         args.extend(["--remote-cache".to_string(), remote.clone()]);
     }
-    args.extend(crate::platform_args(&ctx.platform_overrides));
+    args.extend(ctx.child_args.iter().cloned());
     args
 }
 
@@ -607,7 +606,7 @@ pub(crate) fn run(ctx: GateCtx) {
             &program,
             ctx.runtime.as_flag(),
             ctx.remote_cache.as_deref(),
-            &ctx.platform_overrides,
+            &ctx.child_args,
         );
         let installed = hook_path().and_then(|path| {
             install_hook_at(&path, &script)?;
@@ -854,18 +853,19 @@ mod tests {
             runtime: RuntimeChoice::Auto,
             remote_cache: None,
             install_hook: false,
-            platform_overrides: HashMap::new(),
+            child_args: Vec::new(),
             format: OutputFormat::Text,
         }
     }
 
     #[test]
-    fn platform_overrides_reach_each_run_and_the_hook() {
+    fn global_flags_reach_each_run_and_the_hook() {
         let ctx = GateCtx {
-            platform_overrides: HashMap::from([(
-                "ubuntu-latest".to_string(),
-                "my/runner:1".to_string(),
-            )]),
+            child_args: vec![
+                "--platform".to_string(),
+                "ubuntu-latest=my/runner:1".to_string(),
+                "--fresh-workspace".to_string(),
+            ],
             ..ctx()
         };
         let event = Event {
@@ -876,21 +876,22 @@ mod tests {
         assert!(args
             .windows(2)
             .any(|w| w == ["--platform", "ubuntu-latest=my/runner:1"]));
-        let script = hook_script(Path::new("/w"), "docker", None, &ctx.platform_overrides);
+        assert!(args.iter().any(|a| a == "--fresh-workspace"));
+        let script = hook_script(Path::new("/w"), "docker", None, &ctx.child_args);
         assert!(
-            script.contains("set -- \"$@\" '--platform' 'ubuntu-latest=my/runner:1'"),
+            script.contains(
+                "set -- \"$@\" '--platform' 'ubuntu-latest=my/runner:1' '--fresh-workspace'"
+            ),
             "{script}"
         );
-        assert!(
-            !hook_script(Path::new("/w"), "docker", None, &HashMap::new()).contains("--platform")
-        );
+        assert!(!hook_script(Path::new("/w"), "docker", None, &[]).contains("--platform"));
     }
 
     #[test]
     fn the_hook_installs_and_reinstalls() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("hooks/pre-push");
-        let script = hook_script(Path::new("/opt/wrkflw"), "auto", None, &HashMap::new());
+        let script = hook_script(Path::new("/opt/wrkflw"), "auto", None, &[]);
         install_hook_at(&path, &script).unwrap();
         assert!(std::fs::read_to_string(&path)
             .unwrap()
@@ -900,27 +901,17 @@ mod tests {
 
     #[test]
     fn the_hook_names_this_binary_and_quotes_it() {
-        let script = hook_script(
-            Path::new("/opt/it's here/wrkflw"),
-            "auto",
-            None,
-            &HashMap::new(),
-        );
+        let script = hook_script(Path::new("/opt/it's here/wrkflw"), "auto", None, &[]);
         assert!(script.contains(r#"wrkflw='/opt/it'\''s here/wrkflw'"#));
         assert!(script.contains("exec \"$wrkflw\" \"$@\""));
     }
 
     #[test]
     fn the_hook_keeps_the_runtime_and_remote_it_was_installed_with() {
-        let script = hook_script(
-            Path::new("/w"),
-            "podman",
-            Some("https://c/x y"),
-            &HashMap::new(),
-        );
+        let script = hook_script(Path::new("/w"), "podman", Some("https://c/x y"), &[]);
         assert!(script.contains("set -- gate --runtime 'podman'"));
         assert!(script.contains("--remote-cache 'https://c/x y'"));
-        let plain = hook_script(Path::new("/w"), "auto", None, &HashMap::new());
+        let plain = hook_script(Path::new("/w"), "auto", None, &[]);
         assert!(!plain.contains("--remote-cache"));
     }
 
@@ -950,7 +941,7 @@ mod tests {
         std::fs::write(&fake, "#!/bin/sh\necho \"$@\"\n").unwrap();
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
         let hook = dir.path().join("hook");
-        std::fs::write(&hook, hook_script(&fake, "docker", None, &HashMap::new())).unwrap();
+        std::fs::write(&hook, hook_script(&fake, "docker", None, &[])).unwrap();
         let mut child = Command::new("sh")
             .arg(&hook)
             .current_dir(dir.path())
@@ -1019,7 +1010,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("pre-push");
         std::fs::write(&path, "#!/bin/sh\nmake lint\n").unwrap();
-        let script = hook_script(Path::new("/opt/wrkflw"), "auto", None, &HashMap::new());
+        let script = hook_script(Path::new("/opt/wrkflw"), "auto", None, &[]);
         assert!(install_hook_at(&path, &script).is_err());
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),

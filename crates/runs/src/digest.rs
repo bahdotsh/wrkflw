@@ -79,7 +79,10 @@ pub struct FailureDigest {
 pub struct FailedStep {
     pub job: String,
     /// Other legs of a matrix job whose same step failed with the same exit
-    /// code and printed the same thing, or named the same failed tests.
+    /// code and printed the same thing, or named the same failed tests. Legs
+    /// are folded by which tests failed, not by why: the same test may fail
+    /// for another reason in another leg, so check a leg's own log before
+    /// taking its cause from this one.
     pub also_failed_in: Vec<String>,
     /// `None` when the job failed outside any step, such as a timeout.
     pub step: Option<String>,
@@ -120,15 +123,16 @@ pub struct FailureCause {
 
 /// A line that reports something passing, such as `test oom_is_handled ...
 /// ok`: a word like `out of memory` in it names a test, not a failure.
-/// Test runners print `PASS` and `PASSED` in capitals, so a lower-case
-/// `pass` in a path such as `tests/pass/` isn't one.
+/// Test runners print `PASS` and `PASSED` in capitals, or `Passed` as
+/// `dotnet test` does, so a lower-case `pass` in a path such as
+/// `tests/pass/` isn't one.
 static PASSING: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-    regex::Regex::new(r"\.\.\.\s*ok\s*$|\bPASS(ED)?\b|^\s*(ok|✓|✔)\b").unwrap()
+    regex::Regex::new(r"\.\.\.\s*ok\s*$|\bPASS(ED)?\b|\bPassed\b|^\s*(ok|✓|✔)\b").unwrap()
 });
 
 /// A runner's own word for a failure, which no passing line holds.
 static FAILING: std::sync::LazyLock<regex::Regex> =
-    std::sync::LazyLock::new(|| regex::Regex::new(r"\b(FAIL(ED|URE)?|ERROR)\b").unwrap());
+    std::sync::LazyLock::new(|| regex::Regex::new(r"\b(FAIL(ED|URE)?|ERROR|Failed)\b").unwrap());
 
 /// Whether `line` reports a pass and no failure.
 fn reports_pass(line: &str) -> bool {
@@ -569,6 +573,49 @@ pub fn render_digest(digest: &FailureDigest) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dotnet_passing_lines_are_passes_and_its_failures_are_not() {
+        assert!(reports_pass("  Passed ErrorHandling.Tests.Parses [12 ms]"));
+        assert!(!reports_pass(
+            "Failed!  - Failed: 1, Passed: 41, Skipped: 0"
+        ));
+        assert!(!reports_pass("  Failed ErrorHandling.Tests.Parses [12 ms]"));
+        // A lower-case word in prose or a path is not a runner's verdict.
+        assert!(!reports_pass(
+            "error: tests/passed/fixture.rs: no such file"
+        ));
+    }
+
+    #[test]
+    fn every_setup_error_the_engine_reports_is_recognised() {
+        use wrkflw_executor::setup_errors;
+        use wrkflw_runtime::container::ContainerError;
+        let engine = [
+            setup_errors::COMBINED_IMAGE_BUILD,
+            setup_errors::EXISTING_IMAGE_CHECK,
+            setup_errors::JOB_CONTAINER,
+        ]
+        .map(|prefix| format!("{}: boom", prefix));
+        let runtime = [
+            ContainerError::ImagePull("boom".into()),
+            ContainerError::ImageBuild("boom".into()),
+            ContainerError::ContainerStart("boom".into()),
+            ContainerError::NetworkCreation("boom".into()),
+            ContainerError::NetworkOperation("boom".into()),
+        ]
+        .map(|e| e.to_string());
+        for message in engine.iter().chain(&runtime) {
+            assert!(
+                setup_failure(message).is_some(),
+                "not recognised: {}",
+                message
+            );
+        }
+        // A step's own failure is not one of setting the job up.
+        let step = ContainerError::ContainerExecution("exit 1".into()).to_string();
+        assert!(setup_failure(&step).is_none(), "{}", step);
+    }
 
     fn failure(output: &[&str]) -> FailedStep {
         FailedStep {

@@ -11,7 +11,6 @@
 use crate::git::line as git_line;
 use crate::{OutputFormat, RuntimeChoice};
 use serde_json::{json, Value};
-use std::collections::HashMap;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use wrkflw_github::{RemoteJob, RemoteRun};
@@ -21,8 +20,9 @@ use wrkflw_ui::cli_style;
 pub(crate) struct CompareCtx {
     pub(crate) run: String,
     pub(crate) runtime: RuntimeChoice,
-    /// `--platform` overrides, passed on to the local run.
-    pub(crate) platform_overrides: HashMap<String, String>,
+    /// Global flags such as `--platform` and `--every-matrix-leg`, passed
+    /// on to the local run.
+    pub(crate) child_args: Vec<String>,
     pub(crate) format: OutputFormat,
 }
 
@@ -401,7 +401,7 @@ fn run_args(
     remote: &RemoteRun,
     path: &Path,
     runtime: &str,
-    platform_overrides: &HashMap<String, String>,
+    child_args: &[String],
     head_is_tag: bool,
 ) -> Vec<String> {
     let mut args = vec![
@@ -432,8 +432,9 @@ fn run_args(
         // it against itself, and every `paths:` filter skips the workflow.
         args.extend(["--diff-base".to_string(), before.to_string()]);
     }
-    // `-P` given to compare names the images this machine stands in with.
-    args.extend(crate::platform_args(platform_overrides));
+    // Global flags given to compare, such as `-P` naming the images this
+    // machine stands in with, or `--every-matrix-leg`, apply to its run.
+    args.extend(child_args.iter().cloned());
     args
 }
 
@@ -762,7 +763,7 @@ pub(crate) async fn run(ctx: CompareCtx) -> ! {
             &remote,
             path,
             ctx.runtime.as_flag(),
-            &ctx.platform_overrides,
+            &ctx.child_args,
             head_is_tag(&remote),
         ))
         .stdin(Stdio::null())
@@ -1177,7 +1178,7 @@ mod tests {
             &run,
             Path::new(".github/workflows/ci.yml"),
             "docker",
-            &HashMap::new(),
+            &[],
             false,
         );
         assert!(args
@@ -1190,7 +1191,7 @@ mod tests {
             &run,
             Path::new(".github/workflows/ci.yml"),
             "docker",
-            &HashMap::new(),
+            &[],
             false,
         );
         assert!(!args.iter().any(|arg| arg == "--diff-base"), "{args:?}");
@@ -1229,19 +1230,25 @@ mod tests {
             base_branch: Some("main".into()),
             jobs: vec![],
         };
-        let platform = HashMap::from([("ubuntu-latest".to_string(), "my/runner:1".to_string())]);
+        let globals = [
+            "--platform".to_string(),
+            "ubuntu-latest=my/runner:1".to_string(),
+            "--every-matrix-leg".to_string(),
+        ];
         let args = run_args(
             &run,
             Path::new(".github/workflows/ci.yml"),
             "docker",
-            &platform,
+            &globals,
             false,
         );
         assert!(args.windows(2).any(|w| w == ["--event", "pull_request"]));
-        // -P reaches the local run, so it runs in the image asked for.
+        // -P reaches the local run, so it runs in the image asked for, and
+        // so does every other global flag compare was given.
         assert!(args
             .windows(2)
             .any(|w| w == ["--platform", "ubuntu-latest=my/runner:1"]));
+        assert!(args.iter().any(|a| a == "--every-matrix-leg"));
         assert!(args.windows(2).any(|w| w == ["--branch", "feat"]));
         assert!(args.windows(2).any(|w| w == ["--base-branch", "main"]));
         assert!(args.windows(2).any(|w| w == ["--diff-base", "origin/main"]));
@@ -1315,7 +1322,7 @@ mod tests {
             &run,
             Path::new(".github/workflows/release.yml"),
             "docker",
-            &HashMap::new(),
+            &[],
             true,
         );
         assert!(

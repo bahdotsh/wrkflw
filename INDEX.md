@@ -1,6 +1,6 @@
 # Codebase Index: wrkflw
 
-> Generated: 2026-11-09 14:01:07 UTC | Files: 259 | Lines: 111618
+> Generated: 2026-11-09 15:33:44 UTC | Files: 259 | Lines: 112665
 > Languages: JSON (4), Markdown (26), Rust (166), Shell (6), TOML (19), YAML (38)
 
 ## Directory Structure
@@ -590,6 +590,7 @@ wrkflw/
 - `pub mod substitution`
 - `pub mod vm_memory`
 - `pub mod workspace`
+- `pub mod setup_errors`
 
 **crates/executor/src/log_redaction.rs**
 - `pub struct RunScope(())`
@@ -832,6 +833,7 @@ wrkflw/
 **crates/runs/Cargo.toml**
 - `[package]`
 - `[dependencies]`
+- `[dev-dependencies]`
 - `[target.'cfg(unix)'.dependencies]`
 - `[target.'cfg(windows)'.dependencies]`
 
@@ -1750,7 +1752,7 @@ wrkflw/
 
 ## AGENTS.md
 
-**Language:** Markdown | **Size:** 13.6 KB | **Lines:** 96
+**Language:** Markdown | **Size:** 13.9 KB | **Lines:** 96
 
 **Declarations:**
 
@@ -1758,7 +1760,7 @@ wrkflw/
 
 ## BREAKING_CHANGES.md
 
-**Language:** Markdown | **Size:** 25.2 KB | **Lines:** 373
+**Language:** Markdown | **Size:** 26.7 KB | **Lines:** 378
 
 **Declarations:**
 
@@ -1782,7 +1784,7 @@ wrkflw/
 
 ## INDEX.md
 
-**Language:** Markdown | **Size:** 261.7 KB | **Lines:** 9744
+**Language:** Markdown | **Size:** 266.7 KB | **Lines:** 9938
 
 **Declarations:**
 
@@ -1920,7 +1922,7 @@ wrkflw/
 
 ## crates/executor/src/acceleration/store.rs
 
-**Language:** Rust | **Size:** 21.0 KB | **Lines:** 591
+**Language:** Rust | **Size:** 21.5 KB | **Lines:** 598
 
 **Imports:**
 - `super::{hex, Acceleration, Secret}`
@@ -1933,14 +1935,14 @@ wrkflw/
 
 **Declarations:**
 
-`const ENTRY_SCHEMA: u32 = 1`
+`const ENTRY_SCHEMA: u32 = 2`
 
 `const DEFAULT_TTL_SECS: i64 = 7 * 24 * 60 * 60`
 
 `const REMOTE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10)`
 
 `pub(crate) struct StoredJob`
-> Fields: `name: String`, `canonical_name: String`, `outputs: HashMap<String, String>`
+> Fields: `name: String`, `canonical_name: String`, `outputs: HashMap<String, String>`, `actions_not_run: Vec<crate::action_fidelity::UnexecutedAction>`
 
 `pub(crate) struct Entry`
 > Fields: `schema: u32`, `key: String`, `created_at: i64`, `jobs: Vec<StoredJob>`
@@ -2053,7 +2055,7 @@ wrkflw/
 
 ## crates/executor/src/acceleration.rs
 
-**Language:** Rust | **Size:** 56.2 KB | **Lines:** 1602
+**Language:** Rust | **Size:** 56.3 KB | **Lines:** 1603
 
 **Imports:**
 - `pub(crate) use concurrency::acquire_concurrency`
@@ -2553,7 +2555,7 @@ wrkflw/
 
 ## crates/executor/src/docker.rs
 
-**Language:** Rust | **Size:** 60.6 KB | **Lines:** 1634
+**Language:** Rust | **Size:** 63.7 KB | **Lines:** 1711
 
 **Imports:**
 - `crate::container_guard::ContainerGuard`
@@ -2617,14 +2619,18 @@ wrkflw/
 `const PROBE_OVERALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15)`
 
 `struct MemoryWatch`
-> Fields: `id: String`, `meter: std::sync::Arc<crate::job_memory::JobMeter>`, `sampled: std::sync::Arc<std::sync::atomic::AtomicBool>`, `started: std::time::Instant`, `task: tokio::task::JoinHandle<()>`
+> Fields: `id: String`, `meter: std::sync::Arc<crate::job_memory::JobMeter>`, `sampled: std::sync::Arc<std::sync::atomic::AtomicBool>`, `broken: std::sync::Arc<std::sync::atomic::AtomicBool>`, `started: std::time::Instant`, `task: tokio::task::JoinHandle<()>`, `ended: Option<bool>`
 
 `const UNSAMPLED_AFTER: std::time::Duration = std::time::Duration::from_secs(3)`
 
 **`impl MemoryWatch`**
   `fn start(docker: Docker, id: &str, meter: std::sync::Arc<crate::job_memory::JobMeter>) -> Self`
 
-  `fn stop(self, exit_code: i32)`
+  `fn stop(mut self, out_of_memory: bool)`
+
+
+**`impl Drop for MemoryWatch`**
+  `fn drop(&mut self)`
 
 
 `fn working_set(stats: &bollard::container::MemoryStats) -> Option<u64>`
@@ -2898,7 +2904,7 @@ wrkflw/
 
 ## crates/executor/src/job_memory.rs
 
-**Language:** Rust | **Size:** 9.0 KB | **Lines:** 287
+**Language:** Rust | **Size:** 14.1 KB | **Lines:** 419
 
 **Imports:**
 - `std::collections::HashMap`
@@ -2920,6 +2926,10 @@ wrkflw/
 
 `pub(crate) const SIGKILL_EXIT: i32 = 137`
 
+`const KILLED_CHILD_SIGNS: &[&str] = &[ // cargo, for rustc or a build script "(signal: 9, SIGKILL", // gcc and collect2, for ld or cc1 "terminated with signal 9", "Killed signal terminated program", ]`
+
+`pub(crate) fn ran_out_of_memory(exit_code: i32, oom_killed: bool, output: &[&str]) -> bool`
+
 `pub(crate) struct JobMeter`
 > Fields: `current: Mutex<HashMap<String, u64>>`, `peak: AtomicU64`, `sampled: AtomicBool`, `incomplete: AtomicBool`, `killed: AtomicBool`
 
@@ -2931,6 +2941,8 @@ wrkflw/
   `pub(crate) fn unmeasured(&self)`
 
   `pub(crate) fn killed(&self)`
+
+  `pub(crate) fn is_incomplete(&self) -> bool`
 
   `fn outcome(&self) -> Outcome`
 
@@ -2959,10 +2971,23 @@ wrkflw/
 
 `fn reserve_for(peaks: &[u64]) -> Option<u64>`
 
+`const STORE_VERSION: u32 = 1`
+
+`const FORGET_AFTER_SECS: i64 = 90 * 24 * 60 * 60`
+
 `struct Store`
-> Fields: `jobs: HashMap<String, Vec<u64>>`
+> Fields: `version: u32`, `jobs: HashMap<String, Measured>`
+
+**`impl Default for Store`**
+  `fn default() -> Self`
+
+
+`struct Measured`
+> Fields: `peaks: Vec<u64>`, `at: i64`
 
 `static STORE_LOCK: Mutex<()> = Mutex::new(())`
+
+`fn lock_file(path: &std::path::Path, exclusive: bool) -> Option<std::fs::File>`
 
 `fn store_path() -> Option<PathBuf>`
 
@@ -2972,7 +2997,7 @@ wrkflw/
 
 `pub(crate) fn record(id: &str, meter: &JobMeter)`
 
-`fn apply(store: &mut Store, id: &str, outcome: Outcome)`
+`fn apply(store: &mut Store, id: &str, outcome: Outcome, now: i64)`
 
 `mod tests`
 
@@ -2980,7 +3005,7 @@ wrkflw/
 
 ## crates/executor/src/job_session.rs
 
-**Language:** Rust | **Size:** 51.3 KB | **Lines:** 1438
+**Language:** Rust | **Size:** 51.3 KB | **Lines:** 1439
 
 **Imports:**
 - `crate::acceleration`
@@ -3373,7 +3398,7 @@ wrkflw/
 
 ## crates/executor/src/lib.rs
 
-**Language:** Rust | **Size:** 1.4 KB | **Lines:** 49
+**Language:** Rust | **Size:** 1.9 KB | **Lines:** 58
 
 **Imports:**
 - `pub use acceleration::{validate_remote, Acceleration, Secret, Sidecar, SIDECAR_PATH}`
@@ -3547,7 +3572,7 @@ wrkflw/
 
 ## crates/executor/src/matrix_fold.rs
 
-**Language:** Rust | **Size:** 12.5 KB | **Lines:** 343
+**Language:** Rust | **Size:** 12.9 KB | **Lines:** 348
 
 **Imports:**
 - `crate::engine::{get_effective_runner_image, JobResult, JobStatus}`
@@ -3716,7 +3741,7 @@ wrkflw/
 
 ## crates/executor/src/setup_actions.rs
 
-**Language:** Rust | **Size:** 27.6 KB | **Lines:** 701
+**Language:** Rust | **Size:** 30.8 KB | **Lines:** 784
 
 **Imports:**
 - `std::collections::HashMap`
@@ -3752,6 +3777,10 @@ wrkflw/
 
 `pub(crate) fn unrun_action_cause( repository: &str, built: &BuiltRuntimes, container_runtime: bool, ) -> Option<&'static str>`
 
+`fn contained_path(root: &Path, file: &str) -> Option<PathBuf>`
+
+`fn requires_python(text: &str) -> Option<String>`
+
 `pub(crate) fn is_safe_version(version: &str) -> bool`
 
 `pub(crate) fn is_safe_python_spec(spec: &str) -> bool`
@@ -3767,6 +3796,10 @@ wrkflw/
 `pub(crate) fn node_alias(version: &str) -> Option<String>`
 
 `pub(crate) fn get_install_script(language: &str, version: &str) -> String`
+
+`fn go_release(version: &str) -> String`
+
+`pub(crate) const UV_PYTHON_DIR: &str = "/opt/uv/python"`
 
 `pub(crate) const DROP_EXTERNALLY_MANAGED: &str = "import os, sysconfig`
 
@@ -3894,7 +3927,7 @@ wrkflw/
 
 ## crates/executor/src/vm_workspace.rs
 
-**Language:** Rust | **Size:** 38.0 KB | **Lines:** 1160
+**Language:** Rust | **Size:** 50.3 KB | **Lines:** 1481
 
 **Imports:**
 - `std::collections::{HashMap, HashSet}`
@@ -3941,7 +3974,17 @@ wrkflw/
 `fn volume_name(host: &Path) -> String`
 
 `struct State`
-> Fields: `helper: Option<String>`, `volume: Option<Listing>`, `kept: HashSet<PathBuf>`, `unusable: bool`
+> Fields: `helper: Option<String>`, `volume: Option<Listing>`, `kept: HashSet<PathBuf>`, `unusable: bool`, `used: bool`
+
+**`impl State`**
+  `fn new() -> Self`
+
+
+`fn is_kept(kept: &HashSet<PathBuf>, path: &Path) -> bool`
+
+`fn under_any(sorted: &[PathBuf], path: &Path) -> bool`
+
+`fn outermost(sorted: Vec<PathBuf>) -> Vec<PathBuf>`
 
 `pub(crate) struct VmWorkspace`
 > Fields: `cli: &'static str`, `host: PathBuf`, `volume: String`, `volume_path: PathBuf`, `state: Mutex<State>`
@@ -3969,7 +4012,7 @@ wrkflw/
 
   `fn list_volume(&self, helper: &str) -> io::Result<Listing>`
 
-  `fn send(&self, helper: &str, paths: &[PathBuf]) -> io::Result<()>`
+  `fn send(&self, helper: &str, paths: &[PathBuf], volume: &Listing) -> io::Result<()>`
 
   `fn fetch(&self, helper: &str, paths: &[PathBuf], volume: &Listing) -> io::Result<Vec<PathBuf>>`
 
@@ -4006,9 +4049,19 @@ wrkflw/
 
 `fn host_mode(_meta: &std::fs::Metadata) -> Option<u32>`
 
-`fn walk(root: &Path) -> io::Result<Listing>`
+`fn walk(root: &Path) -> io::Result<(Listing, Vec<PathBuf>)>`
+
+`fn without_unreadable(volume: &Listing, unreadable: &[PathBuf]) -> Listing`
+
+`fn remove_host_entry(target: &Path) -> io::Result<()>`
+
+`fn make_writable(path: &Path)`
+
+`fn append_host_entry<W: Write>( builder: &mut tar::Builder<W>, full: &Path, rel: &Path, _in_volume: Option<&Entry>, ) -> io::Result<()>`
 
 `fn unpack<R: Read>(reader: R, host: &Path, volume: &Listing) -> io::Result<Vec<PathBuf>>`
+
+`fn refuse_link_parents(host: &Path, rel: &Path) -> io::Result<()>`
 
 `fn set_dir_mode(dir: &Path, mode: Option<u32>, _entry: Option<&Entry>)`
 
@@ -4025,6 +4078,10 @@ wrkflw/
 `fn remove_container(cli: &str, id: &str)`
 
 `pub(crate) fn release(host: &Path, kept: bool)`
+
+`static PENDING_REMOVALS: Mutex<Vec<std::thread::JoinHandle<()>>> = Mutex::new(Vec::new())`
+
+`pub(crate) async fn wait_for_released_volumes()`
 
 `pub(crate) fn remove_orphaned_volumes() -> usize`
 
@@ -4050,7 +4107,7 @@ wrkflw/
 
 ## crates/executor/src/workspace.rs
 
-**Language:** Rust | **Size:** 23.2 KB | **Lines:** 667
+**Language:** Rust | **Size:** 23.3 KB | **Lines:** 670
 
 **Imports:**
 - `std::fs::File`
@@ -4727,7 +4784,7 @@ wrkflw/
 
 ## crates/runs/Cargo.toml
 
-**Language:** TOML | **Size:** 853 B | **Lines:** 30
+**Language:** TOML | **Size:** 905 B | **Lines:** 33
 
 **Declarations:**
 
@@ -4743,7 +4800,7 @@ wrkflw/
 
 ## crates/runs/src/digest.rs
 
-**Language:** Rust | **Size:** 40.3 KB | **Lines:** 1030
+**Language:** Rust | **Size:** 42.2 KB | **Lines:** 1077
 
 **Imports:**
 - `crate::record::{JobRecord, RunRecord, RunStatus, StepRecord, SCHEMA_VERSION}`
@@ -4772,7 +4829,7 @@ wrkflw/
 
 `static PASSING: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(||`
 
-`static FAILING: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"\b(FAIL(ED|URE)?|ERROR)\b").unwrap())`
+`static FAILING: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"\b(FAIL(ED|URE)?|ERROR|Failed)\b").unwrap())`
 
 `fn reports_pass(line: &str) -> bool`
 
@@ -7146,7 +7203,7 @@ wrkflw/
 
 ## crates/ui/src/views/logs_tab.rs
 
-**Language:** Rust | **Size:** 22.2 KB | **Lines:** 621
+**Language:** Rust | **Size:** 23.6 KB | **Lines:** 658
 
 **Imports:**
 - `crate::app::App`
@@ -7166,7 +7223,7 @@ wrkflw/
 `fn render_search_bar(f: &mut Frame<'_>, app: &App, area: Rect)`
 
 `struct JobStory<'a>`
-> Fields: `name: &'a str`, `steps: Vec<&'a TimelineEntry>`, `finished: Option<&'a TimelineEntry>`, `runner: Option<(&'a str, &'a str)>`, `not_run: Vec<(&'a str, &'a str)>`
+> Fields: `name: &'a str`, `steps: Vec<&'a TimelineEntry>`, `finished: Option<&'a TimelineEntry>`, `runner: Option<(&'a str, &'a str)>`, `not_run: Vec<usize>`, `not_run_pending: bool`
 
 `fn group_by_job(timeline: &[TimelineEntry]) -> Vec<JobStory<'_>>`
 
@@ -8105,13 +8162,12 @@ wrkflw/
 
 ## crates/wrkflw/src/compare_cmd.rs
 
-**Language:** Rust | **Size:** 49.7 KB | **Lines:** 1327
+**Language:** Rust | **Size:** 49.9 KB | **Lines:** 1334
 
 **Imports:**
 - `crate::git::line as git_line`
 - `crate::{OutputFormat, RuntimeChoice}`
 - `serde_json::{json, Value}`
-- `std::collections::HashMap`
 - `std::path::Path`
 - `std::process::{Command, Stdio}`
 - `wrkflw_github::{RemoteJob, RemoteRun}`
@@ -8121,7 +8177,7 @@ wrkflw/
 **Declarations:**
 
 `pub(crate) struct CompareCtx`
-> Fields: `run: String`, `runtime: RuntimeChoice`, `platform_overrides: HashMap<String, String>`, `format: OutputFormat`
+> Fields: `run: String`, `runtime: RuntimeChoice`, `child_args: Vec<String>`, `format: OutputFormat`
 
 `struct ExpectedJob`
 > Fields: `local: String`, `github: Option<String>`, `github_base: String`, `matrix_values: Option<Vec<String>>`
@@ -8159,7 +8215,7 @@ wrkflw/
 
 `fn head_is_tag_with(remote: &RemoteRun, git: impl Fn(&[&str]) -> Option<String>) -> bool`
 
-`fn run_args( remote: &RemoteRun, path: &Path, runtime: &str, platform_overrides: &HashMap<String, String>, head_is_tag: bool, ) -> Vec<String>`
+`fn run_args( remote: &RemoteRun, path: &Path, runtime: &str, child_args: &[String], head_is_tag: bool, ) -> Vec<String>`
 
 `fn is_pushed_over(before: &str) -> bool`
 
@@ -8186,12 +8242,11 @@ wrkflw/
 
 ## crates/wrkflw/src/gate_cmd.rs
 
-**Language:** Rust | **Size:** 46.4 KB | **Lines:** 1258
+**Language:** Rust | **Size:** 46.2 KB | **Lines:** 1249
 
 **Imports:**
 - `crate::{is_gitlab_pipeline, OutputFormat, RuntimeChoice}`
 - `serde_json::{json, Value}`
-- `std::collections::HashMap`
 - `std::path::{Path, PathBuf}`
 - `std::process::{Command, Stdio}`
 - `wrkflw_executor::vm_memory`
@@ -8213,11 +8268,11 @@ wrkflw/
 `fn passed(code: Option<i32>) -> bool`
 
 `pub(crate) struct GateCtx`
-> Fields: `path: Option<PathBuf>`, `event: Option<String>`, `base_branch: Option<String>`, `diff_base: Option<String>`, `runtime: RuntimeChoice`, `remote_cache: Option<String>`, `install_hook: bool`, `platform_overrides: HashMap<String, String>`, `format: OutputFormat`
+> Fields: `path: Option<PathBuf>`, `event: Option<String>`, `base_branch: Option<String>`, `diff_base: Option<String>`, `runtime: RuntimeChoice`, `remote_cache: Option<String>`, `install_hook: bool`, `child_args: Vec<String>`, `format: OutputFormat`
 
 `fn shell_quote(value: &str) -> String`
 
-`fn hook_script( program: &Path, runtime: &str, remote_cache: Option<&str>, platform_overrides: &HashMap<String, String>, ) -> String`
+`fn hook_script( program: &Path, runtime: &str, remote_cache: Option<&str>, child_args: &[String], ) -> String`
 
 `fn git_path_query(args: &[&str]) -> Option<PathBuf>`
 
@@ -8283,7 +8338,7 @@ wrkflw/
 
 ## crates/wrkflw/src/git.rs
 
-**Language:** Rust | **Size:** 1.4 KB | **Lines:** 41
+**Language:** Rust | **Size:** 1.7 KB | **Lines:** 48
 
 **Imports:**
 - `std::process::Command`
@@ -8350,7 +8405,7 @@ wrkflw/
 
 ## crates/wrkflw/src/main.rs
 
-**Language:** Rust | **Size:** 75.4 KB | **Lines:** 2088
+**Language:** Rust | **Size:** 80.2 KB | **Lines:** 2205
 
 **Imports:**
 - `bollard::Docker`
@@ -8412,6 +8467,8 @@ wrkflw/
 > Fields: `k8s_context: Option<String>`, `k8s_namespace: Option<String>`, `k8s_node_selector: Vec<Option<(String, String)>>`, `k8s_resource: Vec<Option<(String, String)>>`, `k8s_image_pull_secret: Vec<String>`, `k8s_registry: Option<String>`, `k8s_helper_image: Option<String>`, `k8s_timeout: Option<u64>`, `k8s_schedule_timeout: Option<u64>`
 
 **`impl KubernetesArgs`**
+  `fn child_args(&self) -> Vec<String>`
+
   `fn to_config(&self) -> wrkflw_executor::KubernetesConfig`
 
 
@@ -8426,6 +8483,10 @@ wrkflw/
 `fn parse_k8s_key_val(s: &str) -> Result<Option<(String, String)>, String>`
 
 `fn collect_platform_overrides(entries: &[Option<(String, String)>]) -> HashMap<String, String>`
+
+`fn global_child_args(cli: &Wrkflw, platform_overrides: &HashMap<String, String>) -> Vec<String>`
+
+`fn check_tag_event(event: Option<&str>, tag: Option<&str>) -> Result<(), String>`
 
 `pub(crate) fn platform_args(overrides: &HashMap<String, String>) -> Vec<String>`
 

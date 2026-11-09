@@ -5,7 +5,14 @@ use std::process::Command;
 
 /// One line of `git` output, or `None` when git fails or prints nothing.
 pub(crate) fn line(args: &[&str]) -> Option<String> {
-    let output = Command::new("git").args(args).output().ok()?;
+    // Some of these ask a remote. One that wants credentials fails instead
+    // of stopping the command at a password prompt nobody may be watching.
+    let output = Command::new("git")
+        .args(args)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()?;
     let line = String::from_utf8_lossy(&output.stdout).trim().to_string();
     (output.status.success() && !line.is_empty()).then_some(line)
 }

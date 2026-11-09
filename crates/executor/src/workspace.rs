@@ -266,17 +266,19 @@ pub struct CleanReport {
     /// Workspaces that could not be removed, with why. The rest are still
     /// cleaned, so one stubborn directory doesn't hide what was freed.
     pub failed: Vec<(PathBuf, String)>,
+    /// Container volumes removed because their workspace directory is gone.
+    pub volumes: usize,
 }
 
 /// Remove every kept workspace no run is using.
 pub fn clean() -> std::io::Result<CleanReport> {
-    let report = match workspaces_root() {
-        Some(root) => clean_under(&root),
-        None => Ok(CleanReport::default()),
+    let mut report = match workspaces_root() {
+        Some(root) => clean_under(&root)?,
+        None => CleanReport::default(),
     };
     // A workspace's container volume is no use once its directory is gone.
-    crate::vm_workspace::remove_orphaned_volumes();
-    report
+    report.volumes = crate::vm_workspace::remove_orphaned_volumes();
+    Ok(report)
 }
 
 fn clean_under(root: &Path) -> std::io::Result<CleanReport> {
@@ -600,6 +602,7 @@ mod tests {
                 bytes: 5,
                 in_use: 1,
                 failed: Vec::new(),
+                volumes: 0,
             }
         );
         assert!(!free_path.exists());

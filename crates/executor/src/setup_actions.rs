@@ -212,9 +212,10 @@ pub(crate) fn node_major_for_range(range: &str) -> Option<String> {
 /// (`.python-version`, `.nvmrc`, `.node-version`, `.go-version`) its first
 /// line that isn't blank or a comment, without a leading `v`. The hosted
 /// setup actions read the same files. `None` when the file can't be read or
-/// holds no version.
+/// holds no version, or lies outside `root`: the workflow may come from a
+/// repository `compare` checked out, and must not read the machine's files.
 pub(crate) fn version_from_file(root: &Path, file: &str) -> Option<String> {
-    let text = std::fs::read_to_string(root.join(file)).ok()?;
+    let text = std::fs::read_to_string(contained_path(root, file)?).ok()?;
     let name = Path::new(file)
         .file_name()
         .and_then(|n| n.to_str())
@@ -230,18 +231,7 @@ pub(crate) fn version_from_file(root: &Path, file: &str) -> Option<String> {
     let version = match name {
         // The whole specifier: uv resolves `>=3.10` to the newest release
         // that matches, as setup-python does, not to 3.10 itself.
-        "pyproject.toml" => text
-            .lines()
-            .find(|l| l.trim_start().starts_with("requires-python"))
-            .and_then(|l| {
-                let spec: String = l
-                    .split_once('=')?
-                    .1
-                    .chars()
-                    .filter(|c| !c.is_whitespace() && *c != '"' && *c != '\'')
-                    .collect();
-                (!spec.is_empty()).then_some(spec)
-            }),
+        "pyproject.toml" => requires_python(&text),
         "package.json" => {
             let json: serde_json::Value = serde_json::from_str(&text).ok()?;
             let range = json
@@ -297,9 +287,69 @@ pub(crate) fn unrun_action_cause(
     )
 }
 
-/// Check that a version string contains only safe characters (alphanumeric, dots, hyphens, underscores).
+/// `file` under `root`, if it stays there once links are followed.
+fn contained_path(root: &Path, file: &str) -> Option<PathBuf> {
+    let relative = Path::new(file);
+    if relative.is_absolute()
+        || relative.components().any(|c| {
+            !matches!(
+                c,
+                std::path::Component::Normal(_) | std::path::Component::CurDir
+            )
+        })
+    {
+        wrkflw_logging::warning(&format!(
+            "Not reading version file {:?}: it must be a path inside the repository",
+            file
+        ));
+        return None;
+    }
+    let root = root.canonicalize().ok()?;
+    let path = root.join(relative).canonicalize().ok()?;
+    if !path.starts_with(&root) {
+        wrkflw_logging::warning(&format!(
+            "Not reading version file {:?}: it links outside the repository",
+            file
+        ));
+        return None;
+    }
+    Some(path)
+}
+
+/// The `requires-python` of `pyproject.toml`'s `[project]` table, without
+/// quotes, spaces or a trailing comment.
+fn requires_python(text: &str) -> Option<String> {
+    let mut in_project = false;
+    for line in text.lines().map(str::trim) {
+        if line.starts_with('[') {
+            in_project = line == "[project]";
+            continue;
+        }
+        let Some(rest) = line.strip_prefix("requires-python") else {
+            continue;
+        };
+        if !in_project {
+            continue;
+        }
+        let value = rest.trim_start().strip_prefix('=')?.trim_start();
+        let quote = value.chars().next().filter(|c| matches!(c, '"' | '\''))?;
+        let inner = &value[1..];
+        let spec: String = inner[..inner.find(quote)?]
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        return (!spec.is_empty()).then_some(spec);
+    }
+    None
+}
+
+/// Check that a version string contains only safe characters (alphanumeric,
+/// dots, hyphens, underscores), and can't read as a command-line option or
+/// a parent directory where it lands in a command or a URL.
 pub(crate) fn is_safe_version(version: &str) -> bool {
     !version.is_empty()
+        && !version.starts_with('-')
+        && !version.contains("..")
         && version
             .chars()
             .all(|c| c.is_alphanumeric() || c == '.' || c == '-' || c == '_')
@@ -392,8 +442,12 @@ pub(crate) fn detect_setup_in(steps: &[Step], root: &Path) -> SetupDetection {
         };
 
         // setup-node takes an alias such as `lts/*`, and a semver range,
-        // in `node-version` and its version files.
+        // in `node-version` and its version files, and `v20` for 20.
         let ver = if def.language == "node" {
+            let ver = match ver.strip_prefix('v') {
+                Some(rest) if rest.starts_with(|c: char| c.is_ascii_digit()) => rest.to_string(),
+                _ => ver,
+            };
             node_alias(&ver)
                 .or_else(|| {
                     (!is_safe_version(&ver))
@@ -486,8 +540,9 @@ pub(crate) fn node_alias(version: &str) -> Option<String> {
         return Some("current".to_string());
     }
     let codename = version.strip_prefix("lts/")?;
-    // Codenames name one LTS major each; an unknown or `*` one means the
-    // newest LTS, which nodesource serves as `lts`.
+    // Codenames name one LTS major each; `*` means the newest LTS, which
+    // nodesource serves as `lts`. An unknown one is refused, as setup-node
+    // refuses it, rather than read as the newest.
     let major = match codename.to_ascii_lowercase().as_str() {
         "argon" => "4",
         "boron" => "6",
@@ -499,7 +554,8 @@ pub(crate) fn node_alias(version: &str) -> Option<String> {
         "hydrogen" => "18",
         "iron" => "20",
         "jod" => "22",
-        _ => "lts",
+        "*" | "latest" => "lts",
+        _ => return None,
     };
     Some(major.to_string())
 }
@@ -551,9 +607,10 @@ pub(crate) fn get_install_script(language: &str, version: &str) -> String {
         "go" => {
             format!(
                 "ARCH=$(dpkg --print-architecture || echo amd64) && \
-                 curl -fsSL https://go.dev/dl/go{}.linux-${{ARCH}}.tar.gz | tar -C /usr/local -xz && \
+                 GO={} && test -n \"$GO\" && \
+                 curl -fsSL https://go.dev/dl/${{GO}}.linux-${{ARCH}}.tar.gz | tar -C /usr/local -xz && \
                  ln -s /usr/local/go/bin/go /usr/bin/go",
-                version
+                go_release(version)
             )
         }
         "java" => {
@@ -595,6 +652,32 @@ pub(crate) fn get_install_script(language: &str, version: &str) -> String {
         _ => String::new(),
     }
 }
+
+/// The shell word for the Go release `version` names, as `actions/setup-go`
+/// resolves it. A full release such as `1.22.3` is used as is. A line such
+/// as `1.22`, which is what a `go.mod` says, or `1` means its newest
+/// release, and `stable` the newest of all. go.dev names releases with a
+/// patch number, so those are looked up when the image is built.
+fn go_release(version: &str) -> String {
+    if version.split('.').count() >= 3 {
+        return format!("go{}", version);
+    }
+    // Releases are listed newest first; a line's release candidates, such
+    // as `go1.22rc1`, don't match.
+    let pattern = if version == "stable" {
+        r#""go[0-9]+(\.[0-9]+)*""#.to_string()
+    } else {
+        format!(r#""go{}(\.[0-9]+)*""#, version.replace('.', r"\."))
+    };
+    format!(
+        r#""$(curl -fsSL 'https://go.dev/dl/?mode=json&include=all' | grep -oE '{}' | head -n 1 | tr -d '"')""#,
+        pattern
+    )
+}
+
+/// Where the image keeps the interpreters uv installs for setup-python:
+/// outside any home directory, so every user and every `HOME` finds them.
+pub(crate) const UV_PYTHON_DIR: &str = "/opt/uv/python";
 
 /// Python run by the install script: deletes the PEP 668 marker of the
 /// interpreter running it. Single-quoted in the shell, so it holds none.

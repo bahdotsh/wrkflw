@@ -9,7 +9,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-const ENTRY_SCHEMA: u32 = 1;
+/// 2: jobs carry the actions they passed without running. Entries from 1
+/// can't say, so they are not reused.
+const ENTRY_SCHEMA: u32 = 2;
 /// Images and floating action tags aren't in the key, so a hit must not live
 /// forever. A week bounds that drift.
 const DEFAULT_TTL_SECS: i64 = 7 * 24 * 60 * 60;
@@ -21,6 +23,10 @@ pub(crate) struct StoredJob {
     pub name: String,
     pub canonical_name: String,
     pub outputs: HashMap<String, String>,
+    /// Steps that passed without running their action. A reused job reports
+    /// them again, so reuse never turns a partial pass into a verified one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub actions_not_run: Vec<crate::action_fidelity::UnexecutedAction>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -363,6 +369,7 @@ mod tests {
             name: "build".to_string(),
             canonical_name: "build".to_string(),
             outputs: HashMap::from([("v".to_string(), "1".to_string())]),
+            actions_not_run: Vec::new(),
         }]
     }
 

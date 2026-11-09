@@ -150,8 +150,12 @@ struct JobStory<'a> {
     finished: Option<&'a TimelineEntry>,
     /// The OS it asked for and the one it ran as, when they differ.
     runner: Option<(&'a str, &'a str)>,
-    /// Steps that passed without running their action: step name and `uses`.
-    not_run: Vec<(&'a str, &'a str)>,
+    /// Positions in `steps` of those that passed without running their
+    /// action. Two steps may share a name, so they're told apart by place.
+    not_run: Vec<usize>,
+    /// An action-not-run report arrived; it belongs to the next step to
+    /// finish, as the executor sends it just before that step's result.
+    not_run_pending: bool,
 }
 
 fn group_by_job(timeline: &[TimelineEntry]) -> Vec<JobStory<'_>> {
@@ -173,19 +177,24 @@ fn group_by_job(timeline: &[TimelineEntry]) -> Vec<JobStory<'_>> {
                     finished: None,
                     runner: None,
                     not_run: Vec::new(),
+                    not_run_pending: false,
                 });
                 jobs.len() - 1
             }
         };
         match entry {
-            TimelineEntry::StepFinished { .. } => jobs[at].steps.push(entry),
+            TimelineEntry::StepFinished { .. } => {
+                let job = &mut jobs[at];
+                if std::mem::take(&mut job.not_run_pending) {
+                    job.not_run.push(job.steps.len());
+                }
+                job.steps.push(entry);
+            }
             TimelineEntry::JobFinished { .. } => jobs[at].finished = Some(entry),
             TimelineEntry::RunnerSubstituted {
                 requested, ran_as, ..
             } => jobs[at].runner = Some((requested.as_str(), ran_as.as_str())),
-            TimelineEntry::ActionNotRun { step, uses, .. } => {
-                jobs[at].not_run.push((step.as_str(), uses.as_str()))
-            }
+            TimelineEntry::ActionNotRun { .. } => jobs[at].not_run_pending = true,
             TimelineEntry::JobStarted { .. } => {}
         }
     }
@@ -278,7 +287,7 @@ pub(crate) fn story_lines(
             vec![Span::styled(right, Style::default().fg(COLORS.text_dim))],
             w,
         ));
-        for step in &job.steps {
+        for (position, step) in job.steps.iter().enumerate() {
             let TimelineEntry::StepFinished {
                 step,
                 status,
@@ -294,7 +303,7 @@ pub(crate) fn story_lines(
             let mut right = Vec::new();
             // The step passed, but its action never ran: a pass that proves
             // nothing is shown as such next to the step.
-            if job.not_run.iter().any(|(name, _)| name == step) {
+            if job.not_run.contains(&position) {
                 right.push(Span::styled(
                     format!("{} action not run  ", theme::symbols::WARNING),
                     Style::default().fg(COLORS.warning),
@@ -533,6 +542,34 @@ mod tests {
         let lines = text_of(&story_lines(&timeline, None, 80, 0, false));
         assert!(lines[1].contains("action not run"), "{lines:?}");
         assert!(!lines[2].contains("action not run"), "{lines:?}");
+    }
+
+    #[test]
+    fn only_the_step_whose_action_did_not_run_is_marked_among_namesakes() {
+        let finished = |step: &str| TimelineEntry::StepFinished {
+            job: "tests".into(),
+            step: step.into(),
+            status: StepStatus::Success,
+            exit_code: Some(0),
+            duration_ms: 10,
+            tail: Vec::new(),
+        };
+        let timeline = vec![
+            TimelineEntry::JobStarted {
+                job: "tests".into(),
+                canonical_name: "tests".into(),
+            },
+            finished("Run script"),
+            TimelineEntry::ActionNotRun {
+                job: "tests".into(),
+                step: "Run script".into(),
+                uses: "actions/github-script@v7".into(),
+            },
+            finished("Run script"),
+        ];
+        let lines = text_of(&story_lines(&timeline, None, 80, 0, false));
+        assert!(!lines[1].contains("action not run"), "{lines:?}");
+        assert!(lines[2].contains("action not run"), "{lines:?}");
     }
 
     #[test]

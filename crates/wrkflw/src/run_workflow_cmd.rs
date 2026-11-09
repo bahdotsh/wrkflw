@@ -297,6 +297,7 @@ pub(crate) async fn run(ctx: RunCtx) {
         variables: ctx.variables,
         event_name: ctx.event.clone(),
         branch: ctx.branch.clone(),
+        base_branch: ctx.base_branch.clone(),
     };
     let workflow_type = if is_gitlab {
         "GitLab CI pipeline"
@@ -390,23 +391,17 @@ pub(crate) async fn run(ctx: RunCtx) {
                         }
                     ))
                 );
+                // Each entry carries the reason its own type wrote, so
+                // every kind of entry reads the same here as in JSON.
                 for entry in &unverified {
-                    let job = entry["job"].as_str().unwrap_or_default();
-                    let line = match (entry["uses"].as_str(), entry["requested"].as_str()) {
-                        (Some(uses), _) => format!(
-                            "{job}: {uses} was not run (no implementation in wrkflw), so the \
-                             step passed without doing anything"
-                        ),
-                        (None, Some(requested)) => format!(
-                            "{job}: asked for {requested}, ran as {}, so OS-specific steps were \
-                             not checked",
-                            entry["ran_as"].as_str().unwrap_or_default()
-                        ),
-                        (None, None) => {
-                            format!("{job}: {}", entry["reason"].as_str().unwrap_or_default())
-                        }
-                    };
-                    println!("  {}", cli_style::dim(&line));
+                    println!(
+                        "  {}",
+                        cli_style::dim(&format!(
+                            "{}: {}",
+                            entry["job"].as_str().unwrap_or_default(),
+                            entry["reason"].as_str().unwrap_or_default()
+                        ))
+                    );
                 }
             }
             "nothing_checked" => println!(

@@ -935,6 +935,10 @@ impl ContainerRuntime for DockerRuntime {
             .id
             .filter(|id| !id.is_empty())
     }
+
+    fn identifies_images(&self) -> bool {
+        true
+    }
 }
 
 // Move the actual implementation to internal methods

@@ -220,6 +220,7 @@ pub async fn execute_workflow_cli(
         variables: Default::default(),
         event_name: None,
         branch: None,
+        base_branch: None,
     };
 
     // Held while the result is printed, so its values stay masked there.
@@ -634,6 +635,7 @@ pub fn start_next_workflow_execution(
                         variables: Default::default(),
                         event_name: None,
                         branch: None,
+                        base_branch: None,
                     };
 
                     let execution_result = wrkflw_utils::fd::with_stderr_to_null(|| {

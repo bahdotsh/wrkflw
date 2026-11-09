@@ -3,10 +3,13 @@
 //! wrkflw implements some actions itself, such as `actions/checkout`,
 //! `actions/cache` and the setup actions that install a language runtime
 //! into the job's image. A JavaScript action outside that set has no
-//! implementation here: the step prints that it would have run the action,
-//! reports success, and does nothing. The next steps then run without
-//! whatever the action would have installed, configured or checked. Such a
-//! step is reported, so a pass isn't read as proof of what GitHub would do.
+//! implementation here, and a setup action does nothing when its runtime
+//! isn't in the job's image: in a job `container:`, inside a composite
+//! action, or under emulation. Either way the step prints that it would
+//! have run the action, reports success, and does nothing. The next steps
+//! then run without whatever the action would have installed, configured
+//! or checked. Such a step is reported, so a pass isn't read as proof of
+//! what GitHub would do.
 
 use serde::{Deserialize, Serialize};
 
@@ -24,8 +27,8 @@ impl UnexecutedAction {
     /// Why a pass of a job with this step doesn't stand for GitHub's.
     pub fn reason(&self) -> String {
         format!(
-            "{} has no implementation in wrkflw, so the step ran nothing and passed: \
-             anything it would have installed, configured or checked was not",
+            "{} did not run here, so the step ran nothing and passed: anything it \
+             would have installed, configured or checked was not",
             self.uses
         )
     }

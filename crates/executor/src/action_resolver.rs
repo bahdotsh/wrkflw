@@ -202,6 +202,17 @@ async fn resolve_with(
     result
 }
 
+/// Put `action_yaml` in the in-memory cache as the metadata of `repo` at
+/// `version`, so a test can resolve it without the network.
+#[cfg(test)]
+pub(crate) async fn seed_cache_for_test(repo: &str, version: &str, action_yaml: &str) {
+    let resolved = parse_action_definition(action_yaml).expect("valid action.yml");
+    ACTION_CACHE
+        .write()
+        .await
+        .insert(format!("{}@{}", repo, version), resolved);
+}
+
 /// Fetch the raw text of `action.yml`, falling back to `action.yaml` only when
 /// the server says `action.yml` does not exist.
 async fn fetch_action_yaml(

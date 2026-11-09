@@ -719,6 +719,10 @@ impl ContainerRuntime for PodmanRuntime {
         let id = String::from_utf8_lossy(&output.stdout).trim().to_string();
         (!id.is_empty()).then_some(id)
     }
+
+    fn identifies_images(&self) -> bool {
+        true
+    }
 }
 
 /// The PATH `image` sets in its config, pulling the image first if it isn't

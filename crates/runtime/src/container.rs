@@ -57,6 +57,13 @@ pub trait ContainerRuntime: Sync {
         None
     }
 
+    /// True when [`image_id`](Self::image_id) can name a local image, so a
+    /// pull before asking is worth it. False keeps callers from pulling an
+    /// image only to be told nothing.
+    fn identifies_images(&self) -> bool {
+        false
+    }
+
     /// True when `run_container` copies volumes to the step and back instead
     /// of sharing them with the host, so a volume's contents end up on the
     /// host whether or not the step meant them to.
@@ -464,5 +471,6 @@ mod tests {
     async fn image_id_defaults_to_none() {
         let runtime = crate::emulation::EmulationRuntime::new();
         assert_eq!(runtime.image_id("alpine:3.19").await, None);
+        assert!(!runtime.identifies_images());
     }
 }

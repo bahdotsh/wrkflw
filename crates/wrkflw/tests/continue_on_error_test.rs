@@ -16,6 +16,7 @@ async fn run(yaml: &str) -> ExecutionResult {
         acceleration: Default::default(),
         event_name: None,
         branch: None,
+        base_branch: None,
         runtime_type: RuntimeType::Emulation,
         verbose: false,
         preserve_containers_on_failure: false,

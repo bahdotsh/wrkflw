@@ -54,7 +54,8 @@ pub enum ExecutionEvent {
         requested: String,
         ran_as: String,
     },
-    /// A `uses:` step whose action wrkflw has no implementation of. The
+    /// A `uses:` step whose action did not run: wrkflw has no implementation
+    /// of it, or it is a setup action whose runtime isn't in the job's image. The
     /// step ran nothing and passed, so whatever the action would have
     /// installed, configured or checked is missing from the job. Sent
     /// before the step's `StepFinished`.

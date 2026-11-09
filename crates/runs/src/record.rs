@@ -95,7 +95,8 @@ pub struct JobRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runner: Option<RunnerSubstitution>,
     /// `uses:` steps that passed without running their action, because
-    /// wrkflw has no implementation of it. A pass on such a job says
+    /// wrkflw has no implementation of it or its runtime isn't in the
+    /// job's image. A pass on such a job says
     /// nothing about what the action would have done.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub actions_not_run: Vec<UnexecutedAction>,

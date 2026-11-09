@@ -109,6 +109,7 @@ pub(crate) async fn run(ctx: WatchCtx) {
         variables: Default::default(),
         event_name: None,
         branch: None,
+        base_branch: None,
     };
 
     use wrkflw_ui::cli_style;

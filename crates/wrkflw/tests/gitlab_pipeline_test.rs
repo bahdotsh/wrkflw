@@ -25,6 +25,7 @@ async fn run_in(
         acceleration: Default::default(),
         event_name: None,
         branch: None,
+        base_branch: None,
         runtime_type,
         verbose: false,
         preserve_containers_on_failure: false,

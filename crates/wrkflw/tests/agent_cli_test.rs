@@ -1227,3 +1227,74 @@ fn clean_reports_its_json_type_and_exits_1_when_a_workspace_stays() {
         fs::set_permissions(stuck.join("ro"), fs::Permissions::from_mode(0o755)).unwrap();
     }
 }
+
+const REFS: &str = r#"
+name: refs
+on:
+  push:
+    branches: ['release/**']
+  pull_request:
+    branches: [main]
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: refs
+        run: |
+          echo "event=$GITHUB_EVENT_NAME ref=$GITHUB_REF head=$GITHUB_HEAD_REF base=$GITHUB_BASE_REF"
+          test "$GITHUB_EVENT_NAME" = "${{ github.event_name }}"
+          case "$GITHUB_EVENT_NAME" in
+            push)
+              test "$GITHUB_REF" = refs/heads/release/2.0
+              test "${{ github.ref_name }}" = release/2.0
+              test -z "$GITHUB_HEAD_REF" ;;
+            pull_request)
+              test "$GITHUB_HEAD_REF" = feat
+              test "$GITHUB_BASE_REF" = main ;;
+            *) exit 1 ;;
+          esac
+"#;
+
+#[test]
+fn branch_and_event_reach_filters_and_steps_on_a_detached_head() {
+    let sandbox = Sandbox::new();
+    sandbox.write("refs.yml", REFS);
+    Command::new("git")
+        .args(["checkout", "-q", "--detach"])
+        .current_dir(sandbox.repo.path())
+        .output()
+        .unwrap();
+    let finished = |args: &[&str]| -> Value {
+        let mut all = vec!["--format", "json", "run", "--runtime", "emulation"];
+        all.extend_from_slice(args);
+        all.push(".github/workflows/refs.yml");
+        let output = sandbox.run(&all);
+        json_lines(&output)
+            .into_iter()
+            .rev()
+            .find(|line| line["type"] == "run_finished")
+            .unwrap_or_else(|| panic!("no run_finished: {}", stdout(&output)))
+    };
+
+    // A detached HEAD has no branch for `branches:` to match.
+    let detached = finished(&["--event", "push"]);
+    assert_eq!(detached["status"], "skipped", "{detached}");
+
+    let push = finished(&["--event", "push", "--branch", "release/2.0"]);
+    assert_eq!(push["status"], "success", "{push}");
+    // The step checks the branch it was given, so another one fails it.
+    let other = finished(&["--event", "push", "--branch", "release/3.0"]);
+    assert_eq!(other["status"], "failure", "{other}");
+
+    let pull_request = finished(&[
+        "--event",
+        "pull_request",
+        "--activity-type",
+        "opened",
+        "--branch",
+        "feat",
+        "--base-branch",
+        "main",
+    ]);
+    assert_eq!(pull_request["status"], "success", "{pull_request}");
+}

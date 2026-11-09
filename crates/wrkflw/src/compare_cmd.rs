@@ -205,7 +205,7 @@ fn note_for(local: &Value, failures: &[Value]) -> Option<String> {
     }
     for action in local["actions_not_run"].as_array().into_iter().flatten() {
         notes.push(format!(
-            "{} was not run locally (no implementation in wrkflw), GitHub ran it",
+            "{} did not run locally, GitHub ran it",
             action["uses"].as_str().unwrap_or("an action")
         ));
     }

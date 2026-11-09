@@ -1,5 +1,17 @@
 # Breaking Changes
 
+## A pass that skipped an action is `partial`, and library API changes (unreleased)
+
+A `uses:` step whose action wrkflw didn't run now makes a passing run's `verdict` `partial` instead of `verified`, with an entry `{job, step, uses, reason}` under `unverified`. That covers a JavaScript action wrkflw has no implementation of, such as `codecov/codecov-action` or `actions/github-script`, and a setup action whose runtime isn't in the job's image: one in a job with `container:`, one inside a composite action, and every setup action under emulation. Workflows that use such actions and used to report `verified` now report `partial`, and `wrkflw gate` prints its partial warning for them. Its exit code is unchanged.
+
+`actions/setup-python` installs Python with uv instead of the deadsnakes PPA, and a `python-version-file` pointing at `pyproject.toml` installs the newest release `requires-python` allows, as the hosted action does. Combined runtime images get new tags, so the first run after upgrading builds them again.
+
+For crates that use wrkflw as a library:
+
+- `wrkflw_runtime::container::ContainerRuntime` requires `Sync`, and gains `image_id` and `identifies_images`, both with defaults. An implementation that isn't `Sync` no longer compiles.
+- `wrkflw_executor::ExecutionConfig` gains `event_name` and `branch`, and `StepResult` gains `action_not_run`. Struct literals need the new fields.
+- `ExecutionEvent` gains `ActionNotRun`. An exhaustive `match` on it needs an arm.
+
 ## `wrkflw gate` checks pull request workflows, and fails when it checked nothing (unreleased)
 
 Without `--event`, the gate used to check every workflow as a push. On a feature branch, CI that only runs on pushes to `main` and on pull requests was skipped, and the gate passed with nothing run. Now a workflow that runs no job for a push, because it doesn't fire or every job is skipped by `if:`, is checked again as a pull request into the default branch, or into `--base-branch`. Pass `--event push` for the old behaviour.

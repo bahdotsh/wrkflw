@@ -4,11 +4,39 @@
 //! the job's combined image. A setup action has no step of its own to run:
 //! its runtime is built into the image before the job starts.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use wrkflw_parser::workflow::Step;
 
-use crate::engine::{is_git_sha, rust_toolchain_extras, static_input};
+use crate::action_resolver::is_git_sha;
+
+/// The cause reported for an action wrkflw has no implementation of.
+pub(crate) const NO_IMPLEMENTATION: &str = "no implementation in wrkflw";
+
+/// What the job's image was built with, by setup action language.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct BuiltRuntimes {
+    /// The `language` of each setup action whose runtime the image holds.
+    pub(crate) installed: Vec<String>,
+    /// Languages a setup step asked for with a version wrkflw can't
+    /// install, such as an unknown alias, so none was built in.
+    pub(crate) refused: Vec<String>,
+}
+
+impl BuiltRuntimes {
+    fn has(&self, language: &str) -> bool {
+        self.installed.iter().any(|l| l == language)
+    }
+}
+
+/// The runtimes a job's setup steps ask for, and the languages whose
+/// version couldn't be used.
+pub(crate) struct SetupDetection {
+    pub(crate) runtimes: Vec<SetupRuntime>,
+    /// Languages asked for only with versions that were refused.
+    pub(crate) refused: Vec<String>,
+}
 
 /// A runtime detected from a setup action step (e.g., `actions/setup-node@v3`).
 #[derive(Clone)]
@@ -239,28 +267,34 @@ pub(crate) fn version_from_file(root: &Path, file: &str) -> Option<String> {
 /// `None` when it did its work some other way: a setup action whose runtime
 /// was built into the job's image.
 ///
-/// `installed` holds the languages of the runtimes the image was built
-/// with. A job `container:` is used as is and a setup step inside a
-/// composite action isn't seen when the image is built, so neither gets
-/// one. Emulation builds no image at all: the host's tools stand in.
+/// `built` says what the image was built with. A job `container:` is used
+/// as is and a setup step inside a composite action isn't seen when the
+/// image is built, so neither gets one, and a version wrkflw can't install
+/// is left out. Emulation builds no image at all: the host's tools stand in.
 pub(crate) fn unrun_action_cause(
     repository: &str,
-    installed: &[String],
+    built: &BuiltRuntimes,
     container_runtime: bool,
 ) -> Option<&'static str> {
     let Some(def) = SETUP_ACTIONS.iter().find(|d| d.repos.contains(&repository)) else {
-        return Some("no implementation in wrkflw");
+        return Some(NO_IMPLEMENTATION);
     };
     if !container_runtime {
         return Some("emulation installs no runtime, so the host's tools stand in for it");
     }
-    if !installed.iter().any(|language| language == def.language) {
+    if built.has(def.language) {
+        return None;
+    }
+    if built.refused.iter().any(|l| l == def.language) {
         return Some(
-            "its runtime is not in the job's image, as a job container is used as is \
-             and a setup step inside a composite action isn't built into it",
+            "the version it asks for isn't one wrkflw can install, so its runtime \
+             was left out of the job's image",
         );
     }
-    None
+    Some(
+        "its runtime is not in the job's image, as a job container is used as is \
+         and a setup step inside a composite action isn't built into it",
+    )
 }
 
 /// Check that a version string contains only safe characters (alphanumeric, dots, hyphens, underscores).
@@ -284,14 +318,27 @@ pub(crate) fn is_safe_python_spec(spec: &str) -> bool {
 ///
 /// If the same language appears multiple times, only the last occurrence is kept
 /// (matching GitHub Actions behavior where later setup steps override earlier ones).
+#[cfg(test)]
 pub(crate) fn detect_setup_runtimes(steps: &[Step]) -> Vec<SetupRuntime> {
+    detect_setup(steps).runtimes
+}
+
+/// [`detect_setup_runtimes`], with the languages whose version was refused.
+pub(crate) fn detect_setup(steps: &[Step]) -> SetupDetection {
     let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    detect_setup_runtimes_in(steps, &root)
+    detect_setup_in(steps, &root)
 }
 
 /// [`detect_setup_runtimes`] with `*-version-file` inputs read under `root`.
+#[cfg(test)]
 pub(crate) fn detect_setup_runtimes_in(steps: &[Step], root: &Path) -> Vec<SetupRuntime> {
+    detect_setup_in(steps, root).runtimes
+}
+
+/// [`detect_setup`] with `*-version-file` inputs read under `root`.
+pub(crate) fn detect_setup_in(steps: &[Step], root: &Path) -> SetupDetection {
     let mut runtimes: Vec<SetupRuntime> = Vec::new();
+    let mut refused: Vec<String> = Vec::new();
 
     for step in steps {
         let uses = match &step.uses {
@@ -344,9 +391,16 @@ pub(crate) fn detect_setup_runtimes_in(steps: &[Step], root: &Path) -> Vec<Setup
             ver
         };
 
-        // setup-node takes a semver range in `node-version` too.
-        let ver = if def.language == "node" && !is_safe_version(&ver) {
-            node_major_for_range(&ver).unwrap_or(ver)
+        // setup-node takes an alias such as `lts/*`, and a semver range,
+        // in `node-version` and its version files.
+        let ver = if def.language == "node" {
+            node_alias(&ver)
+                .or_else(|| {
+                    (!is_safe_version(&ver))
+                        .then(|| node_major_for_range(&ver))
+                        .flatten()
+                })
+                .unwrap_or(ver)
         } else {
             ver
         };
@@ -356,6 +410,9 @@ pub(crate) fn detect_setup_runtimes_in(steps: &[Step], root: &Path) -> Vec<Setup
                 "Ignoring {} with invalid version: {:?}",
                 def.language, ver
             ));
+            if !refused.iter().any(|l| l == def.language) {
+                refused.push(def.language.to_string());
+            }
             continue;
         }
 
@@ -415,7 +472,36 @@ pub(crate) fn detect_setup_runtimes_in(steps: &[Step], root: &Path) -> Vec<Setup
         }
     }
 
-    runtimes
+    // A language a later step set up anyway was installed after all.
+    refused.retain(|language| !runtimes.iter().any(|rt| &rt.language == language));
+    SetupDetection { runtimes, refused }
+}
+
+/// The nodesource channel for a `node-version` alias `actions/setup-node`
+/// accepts: `lts/*` and `lts/<codename>` for an LTS line, and `node`,
+/// `latest` or `current` for the newest release. `None` for anything else.
+pub(crate) fn node_alias(version: &str) -> Option<String> {
+    let version = version.trim();
+    if matches!(version, "node" | "latest" | "current") {
+        return Some("current".to_string());
+    }
+    let codename = version.strip_prefix("lts/")?;
+    // Codenames name one LTS major each; an unknown or `*` one means the
+    // newest LTS, which nodesource serves as `lts`.
+    let major = match codename.to_ascii_lowercase().as_str() {
+        "argon" => "4",
+        "boron" => "6",
+        "carbon" => "8",
+        "dubnium" => "10",
+        "erbium" => "12",
+        "fermium" => "14",
+        "gallium" => "16",
+        "hydrogen" => "18",
+        "iron" => "20",
+        "jod" => "22",
+        _ => "lts",
+    };
+    Some(major.to_string())
 }
 
 /// Return shell commands that install a language runtime on an Ubuntu base image.
@@ -564,4 +650,52 @@ pub(crate) fn runner_node_install() -> String {
         "(command -v node >/dev/null 2>&1 || ({}))",
         get_install_script("node", RUNNER_NODE_MAJOR)
     )
+}
+
+/// The `rustup` commands that add what a Rust toolchain step's `components`
+/// and `targets` (or `target`) inputs ask for, empty if it asks for none.
+/// Names are split on commas and whitespace, as `dtolnay/rust-toolchain`
+/// does. `resolve` gives an input's final value, or `None` when it can't be
+/// known yet, which leaves that input out.
+pub(crate) fn rust_toolchain_extras(
+    with: &HashMap<String, String>,
+    resolve: impl Fn(&str) -> Option<String>,
+) -> Vec<String> {
+    let names = |keys: &[&str]| -> Vec<String> {
+        keys.iter()
+            .filter_map(|key| with.get(*key))
+            .filter_map(|value| resolve(value))
+            .flat_map(|value| {
+                value
+                    .split(|c: char| c == ',' || c.is_whitespace())
+                    .filter(|name| !name.is_empty())
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            // Names reach a shell, so anything but a plain rustup name is
+            // refused, as is one rustup would read as an option.
+            .filter(|name| {
+                !name.starts_with('-')
+                    && name
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+            })
+            .collect()
+    };
+    let components = names(&["components"]);
+    let targets = names(&["targets", "target"]);
+    let mut commands = Vec::new();
+    if !components.is_empty() {
+        commands.push(format!("rustup component add {}", components.join(" ")));
+    }
+    if !targets.is_empty() {
+        commands.push(format!("rustup target add {}", targets.join(" ")));
+    }
+    commands
+}
+
+/// An input's value when it holds no expression, so it is known before the
+/// job runs and can go into the runner image.
+pub(crate) fn static_input(value: &str) -> Option<String> {
+    (!value.contains("${{")).then(|| value.to_string())
 }

@@ -192,11 +192,26 @@ fn failure_cause(text: &str, exit_code: Option<i32>, tail_lines: usize) -> Optio
 /// a whole Dockerfile command.
 const SETUP_EVIDENCE_CHARS: usize = 240;
 
-/// The cause of a job that failed before any step ran: wrkflw couldn't set
-/// it up, as when its image doesn't build or pull. `text` is the job's
-/// log, whose first line is the error.
+/// The errors wrkflw reports when it can't set a job up: its image doesn't
+/// build or pull, or its job container or network doesn't start. Another
+/// error before the first step, such as a bad expression, is the
+/// workflow's, not the machine's.
+static SETUP_ERROR: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(
+        r"(?i)failed to (build|pull)\b[^:]*\bimage|failed to check for existing image|failed to start container|job container didn't start|failed to create docker network|network operation failed",
+    )
+    .unwrap()
+});
+
+/// The cause of a job that failed before any step ran because wrkflw
+/// couldn't set it up, as when its image doesn't build or pull. `text` is
+/// the job's log, whose first line is the error. `None` when that error
+/// isn't one of setting the job up.
 fn setup_failure(text: &str) -> Option<FailureCause> {
     let first = text.lines().map(str::trim).find(|line| !line.is_empty())?;
+    if !SETUP_ERROR.is_match(first) {
+        return None;
+    }
     let evidence = match first.char_indices().nth(SETUP_EVIDENCE_CHARS) {
         Some((cut, _)) => format!("{}…", &first[..cut]),
         None => first.to_string(),
@@ -205,7 +220,7 @@ fn setup_failure(text: &str) -> Option<FailureCause> {
         kind: "setup_failed",
         evidence,
         hint: "The job failed before any step ran, while wrkflw set it up: building or \
-               pulling its image, or starting its services. No code under test ran, so this \
+               pulling its image, or starting its container or network. No code under test ran, so this \
                says nothing about it. The job log has the full error. Pass --platform with \
                an image that has what the job needs, or fix what the log names"
             .to_string(),
@@ -403,8 +418,10 @@ fn failed_step(
             output_lines,
             env_from_earlier_steps: Vec::new(),
             log_path: job.log.as_deref().map(log_path),
+            // A job with no step ran nothing: its failure is in setting it
+            // up, when the log says so, or in the workflow itself.
             cause: if job.steps.is_empty() {
-                setup_failure(&text)
+                setup_failure(&text).or_else(|| failure_cause(&text, None, tail_lines))
             } else {
                 failure_cause(&text, None, tail_lines)
             },
@@ -704,6 +721,34 @@ mod tests {
         assert_eq!(cause.evidence.chars().count(), SETUP_EVIDENCE_CHARS + 1);
         assert!(cause.hint.contains("before any step ran"));
         assert_eq!(setup_failure("\n  \n"), None);
+
+        // Each way the engine says it couldn't set a job up.
+        for error in [
+            "Runtime error: Failed to pull Docker image: manifest unknown",
+            "Runtime error: Failed to build image: exit 1",
+            "Runtime error: Failed to check for existing image: daemon down",
+            "job container didn't start: port in use",
+            "Failed to create Docker network: exists",
+        ] {
+            assert_eq!(
+                setup_failure(error).unwrap().kind,
+                "setup_failed",
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_job_that_failed_before_its_steps_for_another_reason_is_not_a_setup_failure() {
+        // The workflow's own mistake: no image was involved.
+        assert_eq!(
+            setup_failure("Execution error: Failed to evaluate if: unknown function foo()"),
+            None
+        );
+        assert_eq!(
+            setup_failure("Execution error: Failed to create job directory: disk full"),
+            None
+        );
     }
 
     #[test]
@@ -762,6 +807,59 @@ mod tests {
                 "log": format!("{name}.log"),
             }],
         })
+    }
+
+    /// A job that failed before its first step gets `setup_failed` only
+    /// when its log says wrkflw couldn't set it up.
+    #[test]
+    fn a_job_without_steps_is_a_setup_failure_only_when_its_log_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = RunStore::at(dir.path());
+        let stepless = |name: &str| {
+            serde_json::json!({
+                "name": name, "canonical_name": name, "status": "failure",
+                "failure_allowed": false, "duration_ms": 1,
+                "log": format!("{name}.log"), "steps": [],
+            })
+        };
+        let run: RunRecord = serde_json::from_value(serde_json::json!({
+            "schema_version": SCHEMA_VERSION, "id": "r", "status": "failure",
+            "workflow": "ci.yml", "cwd": "/repo", "repo_root": "/repo", "git_sha": null,
+            "git_branch": null, "git_dirty": null, "runtime": "docker", "event": null,
+            "source": "cli", "agent": null, "intent": null, "session": null,
+            "replay_of": null, "argv": [], "variables": [], "pid": 1, "started_at": "",
+            "finished_at": null, "duration_ms": null, "error": null, "skip_reason": null,
+            "jobs": [stepless("image"), stepless("expression")],
+        }))
+        .unwrap();
+        store
+            .write_log(
+                "r",
+                "image.log",
+                "Runtime error: Failed to build combined runtime image: exit 100\n",
+            )
+            .unwrap();
+        store
+            .write_log(
+                "r",
+                "expression.log",
+                "Execution error: Failed to evaluate if: unknown function foo()\n",
+            )
+            .unwrap();
+
+        let digest = failure_digest(&store, &run, 10).unwrap();
+        let cause = |job: &str| {
+            digest
+                .failures
+                .iter()
+                .find(|f| f.job == job)
+                .unwrap()
+                .cause
+                .as_ref()
+                .map(|c| c.kind)
+        };
+        assert_eq!(cause("image"), Some("setup_failed"));
+        assert_eq!(cause("expression"), None);
     }
 
     #[test]

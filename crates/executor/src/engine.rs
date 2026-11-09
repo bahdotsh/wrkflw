@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use thiserror::Error;
 
 use crate::acceleration;
-use crate::action_resolver;
+use crate::action_resolver::{self, is_git_sha};
 use crate::checkout_sync::copy_directory_contents;
 use crate::dependency;
 use crate::docker;
@@ -22,7 +22,10 @@ use crate::kubernetes::{self, KubernetesConfig};
 use crate::live_step::LiveStep;
 use crate::matrix_fold::{matrix_twins, repeated_leg};
 use crate::podman;
-use crate::setup_actions::*;
+use crate::setup_actions::{
+    detect_setup, runner_node_install, rust_toolchain_extras, static_input, unrun_action_cause,
+    BuiltRuntimes, SetupDetection, SetupRuntime, NO_IMPLEMENTATION, SETUP_ACTIONS,
+};
 use wrkflw_logging;
 use wrkflw_matrix::MatrixCombination;
 use wrkflw_models::gitlab::Pipeline;
@@ -1962,14 +1965,6 @@ async fn shallow_clone(
     Ok(())
 }
 
-/// Returns `true` if `git_ref` looks like a full SHA-1 hex hash (40 hex chars).
-///
-/// NOTE: This only detects SHA-1 (40 hex chars). Git's SHA-256 transition uses
-/// 64-char hashes — update this check if/when GitHub adopts SHA-256 refs.
-pub(crate) fn is_git_sha(git_ref: &str) -> bool {
-    git_ref.len() == 40 && git_ref.chars().all(|c| c.is_ascii_hexdigit())
-}
-
 /// Determine the appropriate Docker image for a GitHub action.
 ///
 /// Setup actions (from the `SETUP_ACTIONS` table) use the act runner base image
@@ -2345,16 +2340,25 @@ async fn resolve_runner_image(
         return Ok(RunnerImage::plain(base_image));
     }
 
-    let setup_runtimes = detect_setup_runtimes(steps);
-    if setup_runtimes.is_empty() {
-        Ok(RunnerImage::plain(base_image))
+    let SetupDetection { runtimes, refused } = detect_setup(steps);
+    if runtimes.is_empty() {
+        Ok(RunnerImage {
+            built: BuiltRuntimes {
+                installed: Vec::new(),
+                refused,
+            },
+            ..RunnerImage::plain(base_image)
+        })
     } else {
         // Always build a combined image on the runner base so that essential
         // tools (git, curl, etc.) remain available for actions like checkout.
-        let image = build_combined_runtime_image(&setup_runtimes, &base_image, runtime).await?;
+        let image = build_combined_runtime_image(&runtimes, &base_image, runtime).await?;
         Ok(RunnerImage {
             image,
-            installed: setup_runtimes.into_iter().map(|rt| rt.language).collect(),
+            built: BuiltRuntimes {
+                installed: runtimes.into_iter().map(|rt| rt.language).collect(),
+                refused,
+            },
         })
     }
 }
@@ -2363,16 +2367,16 @@ async fn resolve_runner_image(
 #[derive(Debug, Clone, PartialEq)]
 struct RunnerImage {
     image: String,
-    /// The `language` of each setup action whose runtime the image holds.
-    /// Empty for a job container or an image used as is.
-    installed: Vec<String>,
+    /// The setup runtimes the image holds, and those left out. Empty for a
+    /// job container or an image used as is.
+    built: BuiltRuntimes,
 }
 
 impl RunnerImage {
     fn plain(image: String) -> Self {
         Self {
             image,
-            installed: Vec::new(),
+            built: BuiltRuntimes::default(),
         }
     }
 }
@@ -2880,7 +2884,7 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
                         runtime: ctx.runtime,
                         workflow: ctx.workflow,
                         runner_image: &runner_image_value.image,
-                        installed_runtimes: &runner_image_value.installed,
+                        installed_runtimes: &runner_image_value.built,
                         verbose: ctx.verbose,
                         matrix_combination: &None,
                         container_config: job.container.as_ref(),
@@ -3293,7 +3297,7 @@ async fn execute_matrix_job(
                             runtime,
                             workflow,
                             runner_image: &runner_image_value.image,
-                            installed_runtimes: &runner_image_value.installed,
+                            installed_runtimes: &runner_image_value.built,
                             verbose,
                             matrix_combination: &Some(combination.values.clone()),
                             container_config: job_template.container.as_ref(),
@@ -4070,7 +4074,7 @@ struct StepExecutionContext<'a> {
     runner_image: &'a str,
     /// The setup runtimes `runner_image` was built with, by language. A
     /// setup action whose language is missing here did not run.
-    installed_runtimes: &'a [String],
+    installed_runtimes: &'a BuiltRuntimes,
     verbose: bool,
     #[allow(dead_code)]
     matrix_combination: &'a Option<HashMap<String, Value>>,
@@ -4177,54 +4181,6 @@ fn relative_to_workspace(path: &str, workspace: &str) -> String {
         Ok(relative) => relative.to_string_lossy().into_owned(),
         Err(_) => path.to_string(),
     }
-}
-
-/// The `rustup` commands that add what a Rust toolchain step's `components`
-/// and `targets` (or `target`) inputs ask for, empty if it asks for none.
-/// Names are split on commas and whitespace, as `dtolnay/rust-toolchain`
-/// does. `resolve` gives an input's final value, or `None` when it can't be
-/// known yet, which leaves that input out.
-pub(crate) fn rust_toolchain_extras(
-    with: &HashMap<String, String>,
-    resolve: impl Fn(&str) -> Option<String>,
-) -> Vec<String> {
-    let names = |keys: &[&str]| -> Vec<String> {
-        keys.iter()
-            .filter_map(|key| with.get(*key))
-            .filter_map(|value| resolve(value))
-            .flat_map(|value| {
-                value
-                    .split(|c: char| c == ',' || c.is_whitespace())
-                    .filter(|name| !name.is_empty())
-                    .map(str::to_string)
-                    .collect::<Vec<_>>()
-            })
-            // Names reach a shell, so anything but a plain rustup name is
-            // refused, as is one rustup would read as an option.
-            .filter(|name| {
-                !name.starts_with('-')
-                    && name
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
-            })
-            .collect()
-    };
-    let components = names(&["components"]);
-    let targets = names(&["targets", "target"]);
-    let mut commands = Vec::new();
-    if !components.is_empty() {
-        commands.push(format!("rustup component add {}", components.join(" ")));
-    }
-    if !targets.is_empty() {
-        commands.push(format!("rustup target add {}", targets.join(" ")));
-    }
-    commands
-}
-
-/// An input's value when it holds no expression, so it is known before the
-/// job runs and can go into the runner image.
-pub(crate) fn static_input(value: &str) -> Option<String> {
-    (!value.contains("${{")).then(|| value.to_string())
 }
 
 /// Resolve `${{ }}` expressions in an action `with` parameter value.
@@ -4984,11 +4940,14 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                         cmd.push("-c");
                         cmd.push("echo 'Executing Docker action'");
                     } else if action_info.is_local {
-                        // Local actions: run a placeholder since full local action
-                        // execution is handled by the Composite branch above
+                        // A local Docker action ran natively and a local
+                        // composite action step by step, both above. What
+                        // reaches here is a local JavaScript action, which
+                        // wrkflw can't run: the step passes without it.
                         cmd.push("sh");
                         cmd.push("-c");
-                        cmd.push("echo 'Local action executed'");
+                        cmd.push("echo 'Local action not run'");
+                        action_not_run = report_action_not_run(uses, Some(NO_IMPLEMENTATION));
                     } else {
                         // For GitHub actions, check if we have special handling
                         if let Err(e) = emulation::handle_special_action(uses).await {
@@ -5016,7 +4975,12 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                         // A setup action's work was done when the job's image
                         // was built, if it was built with its runtime. Any
                         // other action that reaches the fallback below is
-                        // one wrkflw can't run at all.
+                        // one wrkflw can't run at all: the actions wrkflw
+                        // implements (checkout, cache, the artifact actions)
+                        // are dispatched before `prepare_action`, and Docker
+                        // and composite actions are run above. A new built-in
+                        // handler must stay ahead of this branch, or its
+                        // steps are reported as not run.
                         let not_run_cause = ctx.unrun_action_cause(&action_info.repository);
 
                         // Only log a message to the console if we're showing action messages
@@ -6301,7 +6265,7 @@ async fn execute_composite_action(
     working_dir: &Path,
     runtime: &dyn ContainerRuntime,
     runner_image: &str,
-    installed_runtimes: &[String],
+    installed_runtimes: &BuiltRuntimes,
     verbose: bool,
     services: &JobServices<'_>,
     pending_cache_saves: &std::sync::Mutex<Vec<PendingCacheSave>>,
@@ -7284,6 +7248,8 @@ async fn resolve_secrets_for_context(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The setup action helpers these tests exercise directly.
+    use crate::setup_actions::*;
 
     #[test]
     fn matrix_outputs_merge_per_key() {
@@ -7590,7 +7556,7 @@ mod tests {
             resolved.image,
             combined_image_tag(&detect_setup_runtimes(&steps), &dockerfile)
         );
-        assert_eq!(resolved.installed, ["node"]);
+        assert_eq!(resolved.built.installed, ["node"]);
     }
 
     /// Counts pulls, and names images only when `identifies` is set.
@@ -7675,7 +7641,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resolved.image, "python:3.12");
-        assert!(resolved.installed.is_empty());
+        assert_eq!(resolved.built, BuiltRuntimes::default());
     }
 
     // --- get_effective_runner_image tests ---
@@ -9038,7 +9004,10 @@ runs:
             runtime: &runtime,
             workflow: &workflow,
             runner_image: "ubuntu:latest",
-            installed_runtimes: installed,
+            installed_runtimes: &BuiltRuntimes {
+                installed: installed.to_vec(),
+                refused: Vec::new(),
+            },
             verbose: false,
             matrix_combination: &None,
             container_config: None,
@@ -9107,7 +9076,7 @@ runs:
             runtime: &runtime,
             workflow: &workflow,
             runner_image: "ubuntu:latest",
-            installed_runtimes: &[],
+            installed_runtimes: &BuiltRuntimes::default(),
             verbose: false,
             matrix_combination: &None,
             container_config: None,
@@ -9160,7 +9129,7 @@ runs:
             runtime: &runtime,
             workflow: &workflow,
             runner_image: "ubuntu:latest",
-            installed_runtimes: &[],
+            installed_runtimes: &BuiltRuntimes::default(),
             verbose: false,
             matrix_combination: &None,
             container_config: None,
@@ -9218,7 +9187,7 @@ runs:
             runtime: &runtime,
             workflow: &workflow,
             runner_image: "ubuntu:latest",
-            installed_runtimes: &[],
+            installed_runtimes: &BuiltRuntimes::default(),
             verbose: false,
             matrix_combination: &None,
             container_config: None,
@@ -9269,7 +9238,7 @@ runs:
             runtime: &runtime,
             workflow: &workflow,
             runner_image: "ubuntu:latest",
-            installed_runtimes: &[],
+            installed_runtimes: &BuiltRuntimes::default(),
             verbose: false,
             matrix_combination: &None,
             container_config: None,
@@ -9321,7 +9290,7 @@ runs:
             runtime: &runtime,
             workflow: &workflow,
             runner_image: "ubuntu:latest",
-            installed_runtimes: &[],
+            installed_runtimes: &BuiltRuntimes::default(),
             verbose: false,
             matrix_combination: &None,
             container_config: None,
@@ -9372,7 +9341,7 @@ runs:
             runtime: &runtime,
             workflow: &workflow,
             runner_image: "ubuntu:latest",
-            installed_runtimes: &[],
+            installed_runtimes: &BuiltRuntimes::default(),
             verbose: false,
             matrix_combination: &None,
             container_config: None,
@@ -9421,7 +9390,7 @@ runs:
             runtime: &runtime,
             workflow: &workflow,
             runner_image: "ubuntu:latest",
-            installed_runtimes: &[],
+            installed_runtimes: &BuiltRuntimes::default(),
             verbose: false,
             matrix_combination: &None,
             container_config: None,
@@ -10072,6 +10041,43 @@ runs:
     }
 
     #[test]
+    fn node_aliases_resolve_to_a_nodesource_channel() {
+        assert_eq!(node_alias("lts/*").as_deref(), Some("lts"));
+        assert_eq!(node_alias("lts/iron").as_deref(), Some("20"));
+        assert_eq!(node_alias("lts/Hydrogen").as_deref(), Some("18"));
+        assert_eq!(node_alias("lts/someday").as_deref(), Some("lts"));
+        assert_eq!(node_alias("node").as_deref(), Some("current"));
+        assert_eq!(node_alias("latest").as_deref(), Some("current"));
+        assert_eq!(node_alias("20"), None);
+        assert!(get_install_script("node", "lts").contains("setup_lts.x"));
+
+        // `.nvmrc` holding `lts/*`, the most common content, installs Node.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".nvmrc"), "lts/*\n").unwrap();
+        let with = HashMap::from([("node-version-file".to_string(), ".nvmrc".to_string())]);
+        let steps = vec![make_step_uses("actions/setup-node@v4", Some(with))];
+        let detected = detect_setup_in(&steps, dir.path());
+        assert_eq!(detected.runtimes[0].version, "lts");
+        assert!(detected.refused.is_empty());
+    }
+
+    #[test]
+    fn a_refused_version_is_named_unless_a_later_step_installs_the_runtime() {
+        let bad = HashMap::from([("node-version".to_string(), "20; rm -rf /".to_string())]);
+        let good = HashMap::from([("node-version".to_string(), "22".to_string())]);
+        let refused = detect_setup(&[make_step_uses("actions/setup-node@v4", Some(bad.clone()))]);
+        assert!(refused.runtimes.is_empty());
+        assert_eq!(refused.refused, ["node"]);
+
+        let later = detect_setup(&[
+            make_step_uses("actions/setup-node@v4", Some(bad)),
+            make_step_uses("actions/setup-node@v4", Some(good)),
+        ]);
+        assert_eq!(later.runtimes[0].version, "22");
+        assert!(later.refused.is_empty());
+    }
+
+    #[test]
     fn a_requires_python_specifier_reaches_uv_whole() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -10179,7 +10185,10 @@ runs:
 
     #[test]
     fn a_setup_action_runs_only_when_its_runtime_is_in_the_image() {
-        let node = vec!["node".to_string()];
+        let node = BuiltRuntimes {
+            installed: vec!["node".to_string()],
+            refused: Vec::new(),
+        };
         assert_eq!(unrun_action_cause("actions/setup-node", &node, true), None);
         assert!(unrun_action_cause("actions/setup-python", &node, true)
             .unwrap()
@@ -10191,6 +10200,15 @@ runs:
             unrun_action_cause("codecov/codecov-action", &node, true),
             Some("no implementation in wrkflw")
         );
+        // A version wrkflw couldn't install is named as the reason, not a
+        // job container or a composite action.
+        let refused = BuiltRuntimes {
+            installed: Vec::new(),
+            refused: vec!["node".to_string()],
+        };
+        assert!(unrun_action_cause("actions/setup-node", &refused, true)
+            .unwrap()
+            .contains("version it asks for"));
     }
 
     #[test]
@@ -10325,7 +10343,7 @@ runs:
             runtime: &runtime,
             workflow: &workflow,
             runner_image: "ubuntu:latest",
-            installed_runtimes: &[],
+            installed_runtimes: &BuiltRuntimes::default(),
             verbose: false,
             matrix_combination: &None,
             container_config: None,
@@ -10374,7 +10392,7 @@ runs:
             runtime: &runtime,
             workflow: &workflow,
             runner_image: "ubuntu:latest",
-            installed_runtimes: &[],
+            installed_runtimes: &BuiltRuntimes::default(),
             verbose: false,
             matrix_combination: &None,
             container_config: None,
@@ -10615,7 +10633,7 @@ runs:
             runtime: &runtime,
             workflow: &workflow,
             runner_image: "ubuntu:latest",
-            installed_runtimes: &[],
+            installed_runtimes: &BuiltRuntimes::default(),
             verbose: false,
             matrix_combination: &None,
             container_config: None,
@@ -10689,7 +10707,7 @@ runs:
             runtime: &runtime,
             workflow: &workflow,
             runner_image: "ubuntu:latest",
-            installed_runtimes: &[],
+            installed_runtimes: &BuiltRuntimes::default(),
             verbose: false,
             matrix_combination: &None,
             container_config: None,
@@ -10731,7 +10749,7 @@ runs:
             runtime: &runtime,
             workflow: &workflow,
             runner_image: "ubuntu:latest",
-            installed_runtimes: &[],
+            installed_runtimes: &BuiltRuntimes::default(),
             verbose: false,
             matrix_combination: &None,
             container_config: None,
@@ -10775,7 +10793,7 @@ runs:
             runtime: &runtime,
             workflow: &workflow,
             runner_image: "ubuntu:latest",
-            installed_runtimes: &[],
+            installed_runtimes: &BuiltRuntimes::default(),
             verbose: false,
             matrix_combination: &None,
             container_config: None,
@@ -10823,7 +10841,7 @@ runs:
             runtime: &runtime,
             workflow: &workflow,
             runner_image: "ubuntu:latest",
-            installed_runtimes: &[],
+            installed_runtimes: &BuiltRuntimes::default(),
             verbose: false,
             matrix_combination: &None,
             container_config: None,
@@ -10860,7 +10878,7 @@ runs:
             runtime: &runtime,
             workflow: &workflow,
             runner_image: "ubuntu:latest",
-            installed_runtimes: &[],
+            installed_runtimes: &BuiltRuntimes::default(),
             verbose: false,
             matrix_combination: &None,
             container_config: None,
@@ -11118,7 +11136,7 @@ runs:
             runtime,
             workflow: &workflow,
             runner_image: "ubuntu:latest",
-            installed_runtimes: &[],
+            installed_runtimes: &BuiltRuntimes::default(),
             verbose: false,
             matrix_combination: &None,
             container_config: None,
@@ -11355,7 +11373,7 @@ runs:
             runtime: &runtime,
             workflow: &workflow,
             runner_image: "ubuntu:latest",
-            installed_runtimes: &[],
+            installed_runtimes: &BuiltRuntimes::default(),
             verbose: false,
             matrix_combination: &None,
             container_config: None,
@@ -11405,7 +11423,7 @@ runs:
             runtime: &runtime,
             workflow: &workflow,
             runner_image: "ubuntu:latest",
-            installed_runtimes: &[],
+            installed_runtimes: &BuiltRuntimes::default(),
             verbose: false,
             matrix_combination: &None,
             container_config: None,
@@ -11453,7 +11471,7 @@ runs:
             runtime: &runtime,
             workflow: &workflow,
             runner_image: "ubuntu:latest",
-            installed_runtimes: &[],
+            installed_runtimes: &BuiltRuntimes::default(),
             verbose: false,
             matrix_combination: &None,
             container_config: None,
@@ -11501,7 +11519,7 @@ runs:
             runtime: &runtime,
             workflow: &workflow,
             runner_image: "ubuntu:latest",
-            installed_runtimes: &[],
+            installed_runtimes: &BuiltRuntimes::default(),
             verbose: false,
             matrix_combination: &None,
             container_config: None,
@@ -11547,7 +11565,7 @@ runs:
                 runtime: &runtime,
                 workflow: &workflow,
                 runner_image: "ubuntu:latest",
-                installed_runtimes: &[],
+                installed_runtimes: &BuiltRuntimes::default(),
                 verbose: false,
                 matrix_combination: &None,
                 container_config: None,
@@ -11963,7 +11981,10 @@ runs:
                     working_dir.path(),
                     runtime,
                     "ubuntu:latest",
-                    &installed,
+                    &BuiltRuntimes {
+                        installed,
+                        refused: Vec::new(),
+                    },
                     false,
                     services,
                     pending,
@@ -12024,7 +12045,7 @@ runs:
             working_dir.path(),
             &runtime,
             "ubuntu:latest",
-            &[],
+            &BuiltRuntimes::default(),
             false,
             &services,
             &pending,
@@ -12113,7 +12134,7 @@ runs:
             runtime: &runtime,
             workflow: &workflow,
             runner_image: "ubuntu:latest",
-            installed_runtimes: &[],
+            installed_runtimes: &BuiltRuntimes::default(),
             verbose: false,
             matrix_combination: &None,
             container_config: None,
@@ -12320,7 +12341,7 @@ runs:
             runtime: &runtime,
             workflow: &workflow,
             runner_image: "ubuntu:latest",
-            installed_runtimes: &[],
+            installed_runtimes: &BuiltRuntimes::default(),
             verbose: false,
             matrix_combination: &None,
             container_config: None,
@@ -12457,7 +12478,7 @@ runs:
             runtime: &runtime,
             workflow: &workflow,
             runner_image: "ubuntu:latest",
-            installed_runtimes: &[],
+            installed_runtimes: &BuiltRuntimes::default(),
             verbose: false,
             matrix_combination: &None,
             container_config: None,
@@ -12507,7 +12528,7 @@ runs:
             runtime: &runtime,
             workflow: &workflow,
             runner_image: "ubuntu:latest",
-            installed_runtimes: &[],
+            installed_runtimes: &BuiltRuntimes::default(),
             verbose: false,
             matrix_combination: &None,
             container_config: None,
@@ -12586,7 +12607,7 @@ runs:
             runtime: &runtime,
             workflow: &workflow,
             runner_image: "ubuntu:latest",
-            installed_runtimes: &[],
+            installed_runtimes: &BuiltRuntimes::default(),
             verbose: false,
             matrix_combination: &None,
             container_config: None,
@@ -12635,7 +12656,7 @@ runs:
             runtime: &runtime,
             workflow: &workflow,
             runner_image: "ubuntu:latest",
-            installed_runtimes: &[],
+            installed_runtimes: &BuiltRuntimes::default(),
             verbose: false,
             matrix_combination: &None,
             container_config: None,
@@ -12690,7 +12711,7 @@ runs:
             runtime: &runtime,
             workflow: &workflow,
             runner_image: "ubuntu:latest",
-            installed_runtimes: &[],
+            installed_runtimes: &BuiltRuntimes::default(),
             verbose: false,
             matrix_combination: &None,
             container_config: None,
@@ -12758,7 +12779,7 @@ runs:
             runtime: &runtime,
             workflow: &workflow,
             runner_image: "ubuntu:latest",
-            installed_runtimes: &[],
+            installed_runtimes: &BuiltRuntimes::default(),
             verbose: false,
             matrix_combination: &None,
             container_config: None,
@@ -12970,7 +12991,7 @@ runs:
             runtime: &runtime,
             workflow: &workflow,
             runner_image: "ubuntu:latest",
-            installed_runtimes: &[],
+            installed_runtimes: &BuiltRuntimes::default(),
             verbose: false,
             matrix_combination: &None,
             container_config: None,
@@ -13044,7 +13065,7 @@ runs:
             runtime: &runtime,
             workflow: &workflow,
             runner_image: "ubuntu:latest",
-            installed_runtimes: &[],
+            installed_runtimes: &BuiltRuntimes::default(),
             verbose: false,
             matrix_combination: &None,
             container_config: None,
@@ -13103,7 +13124,7 @@ runs:
             runtime: &runtime,
             workflow: &workflow,
             runner_image: "ubuntu:latest",
-            installed_runtimes: &[],
+            installed_runtimes: &BuiltRuntimes::default(),
             verbose: false,
             matrix_combination: &None,
             container_config: None,
@@ -13159,7 +13180,7 @@ runs:
             runtime: &runtime,
             workflow: &workflow,
             runner_image: "ubuntu:latest",
-            installed_runtimes: &[],
+            installed_runtimes: &BuiltRuntimes::default(),
             verbose: false,
             matrix_combination: &None,
             container_config: None,
@@ -13221,7 +13242,7 @@ runs:
             runtime: &runtime,
             workflow: &workflow,
             runner_image: "ubuntu:latest",
-            installed_runtimes: &[],
+            installed_runtimes: &BuiltRuntimes::default(),
             verbose: false,
             matrix_combination: &None,
             container_config: None,
@@ -13369,7 +13390,7 @@ runs:
             runtime: &runtime,
             workflow: &workflow,
             runner_image: "ubuntu:latest",
-            installed_runtimes: &[],
+            installed_runtimes: &BuiltRuntimes::default(),
             verbose: false,
             matrix_combination: &None,
             container_config: None,
@@ -13452,7 +13473,7 @@ runs:
             working_dir.path(),
             &runtime,
             "ubuntu:latest",
-            &[],
+            &BuiltRuntimes::default(),
             false,
             &services,
             &pending,
@@ -13506,7 +13527,7 @@ runs:
             working_dir.path(),
             &runtime,
             "ubuntu:latest",
-            &[],
+            &BuiltRuntimes::default(),
             false,
             &services,
             &pending,
@@ -13570,7 +13591,7 @@ runs:
             working_dir.path(),
             &runtime,
             "ubuntu:latest",
-            &[],
+            &BuiltRuntimes::default(),
             false,
             &services,
             &pending,
@@ -13609,7 +13630,7 @@ runs:
             working_dir.path(),
             &runtime,
             "ubuntu:latest",
-            &[],
+            &BuiltRuntimes::default(),
             false,
             &services,
             &pending,
@@ -13650,7 +13671,7 @@ runs:
             working_dir.path(),
             &runtime,
             "ubuntu:latest",
-            &[],
+            &BuiltRuntimes::default(),
             false,
             &services,
             &pending,
@@ -13688,7 +13709,7 @@ runs:
             working_dir.path(),
             &runtime,
             "ubuntu:latest",
-            &[],
+            &BuiltRuntimes::default(),
             false,
             &services,
             &pending,

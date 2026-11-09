@@ -2,15 +2,15 @@
 
 ## A pass that skipped an action is `partial`, and library API changes (unreleased)
 
-A `uses:` step whose action wrkflw didn't run now makes a passing run's `verdict` `partial` instead of `verified`, with an entry `{job, step, uses, reason}` under `unverified`. That covers a JavaScript action wrkflw has no implementation of, such as `codecov/codecov-action` or `actions/github-script`, and a setup action whose runtime isn't in the job's image: one in a job with `container:`, one inside a composite action whose runtime the job's own steps didn't set up, and every setup action under emulation. An action inside a composite action is reported on the step that calls the composite action. Workflows that use such actions and used to report `verified` now report `partial`, and `wrkflw gate` prints its partial warning for them. Its exit code is unchanged.
+A `uses:` step whose action wrkflw didn't run now makes a passing run's `verdict` `partial` instead of `verified`, with an entry `{job, step, uses, reason}` under `unverified`. That covers a JavaScript action wrkflw has no implementation of, such as `codecov/codecov-action`, `actions/github-script` or a local `./` action whose `action.yml` runs on Node, and a setup action whose runtime isn't in the job's image: one in a job with `container:`, one inside a composite action whose runtime the job's own steps didn't set up, one whose version wrkflw can't install, and every setup action under emulation. `node-version` and `.nvmrc` aliases such as `lts/*`, `lts/iron` and `node` are now installed rather than ignored. An action inside a composite action is reported on the step that calls the composite action. Workflows that use such actions and used to report `verified` now report `partial`, and `wrkflw gate` prints its partial warning for them. Its exit code is unchanged.
 
 `actions/setup-python` installs Python with uv instead of the deadsnakes PPA, and a `python-version-file` pointing at `pyproject.toml` installs the newest release `requires-python` allows, as the hosted action does. `pip install` works in it, as on GitHub. The image built for a job with setup actions also gets `less` and, unless the job sets up Node or the base image has it, Node.js 22, as GitHub's Ubuntu runners have. Combined runtime images get new tags, so the first run after upgrading builds them again, and that build takes a little longer.
 
-`wrkflw run` and `wrkflw plan` take `--branch` and `--tag`, the branch or tag the event is for. `wrkflw compare` passes the run's branch, or its tag for a run a tag push started, so a detached checkout of the run's commit fires the same `branches:` and `tags:` filters.
+`wrkflw run` and `wrkflw plan` take `--branch` and `--tag`, the branch or tag the event is for, and the MCP `run_workflow` and `plan_workflow` tools take `branch` and `tag`. `wrkflw compare` passes the run's branch, or its tag for a run a tag push started, so a detached checkout of the run's commit fires the same `branches:` and `tags:` filters.
 
 `wrkflw compare` and `wrkflw gate` pass `--platform` on to the runs they start, and the pre-push hook `gate --install-hook` writes keeps it. Both used to accept the flag and ignore it, so their runs used the built-in images.
 
-A job that fails before any step runs, because its image can't be built or pulled, gets `cause: {kind: "setup_failed"}` in the failure digest, and `compare` says so in its note instead of reporting a plain failure.
+A job that fails before any step runs, because its image can't be built or pulled or its job container or network doesn't start, gets `cause: {kind: "setup_failed"}` in the failure digest, and `compare` says so in its note instead of reporting a plain failure.
 
 For crates that use wrkflw as a library:
 

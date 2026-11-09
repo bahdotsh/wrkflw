@@ -337,18 +337,39 @@ fn workflow_path(path: &str) -> Option<&Path> {
     (inside && path.starts_with(".github/workflows/")).then_some(parsed)
 }
 
+/// Events whose run can be for a tag: a tag push, a tag's creation, a
+/// release, and a dispatch or `workflow_run` started on a tag. Any other
+/// event, such as a pull request or a schedule, runs on a branch, so its
+/// `head_branch` is one without asking git, or the network.
+const TAG_EVENTS: &[&str] = &[
+    "push",
+    "create",
+    "release",
+    "workflow_dispatch",
+    "workflow_run",
+];
+
 /// Whether the run's `head_branch` names a tag rather than a branch.
 ///
 /// GitHub gives a run triggered by a tag push the tag's name there, with
 /// nothing else in the run to say it is one. It is a tag when a tag of
 /// that name points at the run's commit here, or, when this clone knows
 /// neither a tag nor an `origin` branch of that name, as in a shallow
-/// clone, when `origin` has such a tag.
+/// clone, when `origin` has such a tag. Only [`TAG_EVENTS`] are checked.
 fn head_is_tag(remote: &RemoteRun) -> bool {
+    head_is_tag_with(remote, git_line)
+}
+
+/// [`head_is_tag`] with `git` running a git command and returning its
+/// first line of output, so tests can answer for it.
+fn head_is_tag_with(remote: &RemoteRun, git: impl Fn(&[&str]) -> Option<String>) -> bool {
+    if !TAG_EVENTS.contains(&remote.event.as_str()) {
+        return false;
+    }
     let Some(name) = remote.head_branch.as_deref() else {
         return false;
     };
-    let tagged = git_line(&[
+    let tagged = git(&[
         "rev-parse",
         "-q",
         "--verify",
@@ -357,7 +378,7 @@ fn head_is_tag(remote: &RemoteRun) -> bool {
     if let Some(commit) = tagged {
         return commit == remote.head_sha;
     }
-    let branch_known = git_line(&[
+    let branch_known = git(&[
         "rev-parse",
         "-q",
         "--verify",
@@ -365,7 +386,7 @@ fn head_is_tag(remote: &RemoteRun) -> bool {
     ])
     .is_some();
     !branch_known
-        && git_line(&[
+        && git(&[
             "ls-remote",
             "--tags",
             "origin",
@@ -1224,6 +1245,66 @@ mod tests {
         assert!(args.windows(2).any(|w| w == ["--branch", "feat"]));
         assert!(args.windows(2).any(|w| w == ["--base-branch", "main"]));
         assert!(args.windows(2).any(|w| w == ["--diff-base", "origin/main"]));
+    }
+
+    /// Answers git as `refs` say: each key is a ref (or `ls-remote`), each
+    /// value what git prints. Records every command asked.
+    fn fake_git<'a>(
+        refs: &'a [(&'a str, &'a str)],
+        asked: &'a std::cell::RefCell<Vec<String>>,
+    ) -> impl Fn(&[&str]) -> Option<String> + 'a {
+        move |args: &[&str]| {
+            asked.borrow_mut().push(args.join(" "));
+            let key = if args[0] == "ls-remote" {
+                "ls-remote"
+            } else {
+                args[3]
+            };
+            refs.iter()
+                .find(|(r, _)| *r == key)
+                .map(|(_, out)| out.to_string())
+        }
+    }
+
+    #[test]
+    fn only_a_run_an_event_can_start_on_a_tag_asks_git_about_one() {
+        let asked = std::cell::RefCell::new(Vec::new());
+        let mut run = github_run("success", vec![]);
+        run.event = "pull_request".into();
+        run.head_branch = Some("feat".into());
+        // Even with `origin` answering yes, a pull request is on a branch.
+        let refs = [("ls-remote", "x\trefs/tags/feat")];
+        assert!(!head_is_tag_with(&run, fake_git(&refs, &asked)));
+        assert!(asked.borrow().is_empty(), "{:?}", asked.borrow());
+    }
+
+    #[test]
+    fn a_tag_is_recognised_locally_before_the_network_is_asked() {
+        let mut run = github_run("success", vec![]);
+        run.event = "push".into();
+        run.head_branch = Some("v1.0".into());
+        run.head_sha = "abc".into();
+
+        // A local tag at the run's commit.
+        let asked = std::cell::RefCell::new(Vec::new());
+        let refs = [("refs/tags/v1.0^{commit}", "abc")];
+        assert!(head_is_tag_with(&run, fake_git(&refs, &asked)));
+        assert_eq!(asked.borrow().len(), 1);
+
+        // A local tag of that name elsewhere: the run was for a branch.
+        let refs = [("refs/tags/v1.0^{commit}", "def")];
+        assert!(!head_is_tag_with(&run, fake_git(&refs, &asked)));
+
+        // A known `origin` branch settles it without the network.
+        let asked = std::cell::RefCell::new(Vec::new());
+        let refs = [("refs/remotes/origin/v1.0", "abc"), ("ls-remote", "x")];
+        assert!(!head_is_tag_with(&run, fake_git(&refs, &asked)));
+        assert!(!asked.borrow().iter().any(|a| a.starts_with("ls-remote")));
+
+        // A shallow clone that knows neither asks `origin`.
+        let refs = [("ls-remote", "x\trefs/tags/v1.0")];
+        assert!(head_is_tag_with(&run, fake_git(&refs, &asked)));
+        assert!(!head_is_tag_with(&run, fake_git(&[], &asked)));
     }
 
     #[test]

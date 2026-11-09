@@ -175,7 +175,7 @@ async fn resolve_with(
 
     // Only immutable refs are persisted: a SHA names one action.yml forever.
     let disk_cache_file = disk_cache_dir
-        .filter(|_| is_full_sha(version))
+        .filter(|_| is_git_sha(version))
         .map(|dir| dir.join(disk_cache_file_name(repo, sub_path, version)));
 
     let result = match disk_cache_file
@@ -352,8 +352,12 @@ async fn fetch_action_file(
 }
 
 /// Whether `version` is a full 40-hex commit SHA, the only kind of ref whose
-/// `action.yml` can never change.
-fn is_full_sha(version: &str) -> bool {
+/// `action.yml` can never change, and one that pins an action rather than
+/// naming a toolchain.
+///
+/// NOTE: This only detects SHA-1 (40 hex chars). Git's SHA-256 transition uses
+/// 64-char hashes — update this check if/when GitHub adopts SHA-256 refs.
+pub(crate) fn is_git_sha(version: &str) -> bool {
     version.len() == 40 && version.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
@@ -765,14 +769,14 @@ runs:
     }
 
     #[test]
-    fn full_sha_is_detected() {
-        assert!(is_full_sha("11bd71901bbe5b1630ceea73d27597364c9af683"));
-        assert!(is_full_sha("11BD71901BBE5B1630CEEA73D27597364C9AF683"));
-        assert!(!is_full_sha("v4"));
-        assert!(!is_full_sha("main"));
-        assert!(!is_full_sha("11bd719"));
-        assert!(!is_full_sha("11bd71901bbe5b1630ceea73d27597364c9af68g"));
-        assert!(!is_full_sha("11bd71901bbe5b1630ceea73d27597364c9af6833"));
+    fn git_sha_is_detected() {
+        assert!(is_git_sha("11bd71901bbe5b1630ceea73d27597364c9af683"));
+        assert!(is_git_sha("11BD71901BBE5B1630CEEA73D27597364C9AF683"));
+        assert!(!is_git_sha("v4"));
+        assert!(!is_git_sha("main"));
+        assert!(!is_git_sha("11bd719"));
+        assert!(!is_git_sha("11bd71901bbe5b1630ceea73d27597364c9af68g"));
+        assert!(!is_git_sha("11bd71901bbe5b1630ceea73d27597364c9af6833"));
     }
 
     #[test]

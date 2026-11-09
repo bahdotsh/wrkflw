@@ -5,7 +5,7 @@ wrkflw validates and runs GitHub Actions and GitLab CI workflows locally. Use it
 ## Loop
 
 1. After editing YAML, run `wrkflw --format json validate`.
-2. Run `wrkflw --format json plan <file>` to see job order, matrix legs, whether a trigger fires, and under `unverified` which jobs would run as another OS than `runs-on` asks for. Pass the `--runtime` you will run with, and `--branch` when the checkout is detached or the push is to another branch, or `--tag` for a tag push.
+2. Run `wrkflw --format json plan <file>` to see job order, matrix legs, whether a trigger fires, and under `unverified` which jobs would run as another OS than `runs-on` asks for. Pass the `--runtime` you will run with, and `--branch` when the checkout is detached or the push is to another branch, or `--tag` for a tag push. The MCP `run_workflow` and `plan_workflow` tools take the same as `branch` and `tag`.
 3. Run `wrkflw --format json run <file> --intent "why you are running this"`.
 4. On failure, read the `failure` object in the final `run_finished` line. Don't rerun to see the error again.
 5. For earlier runs, use `wrkflw runs list`, `runs failure <id>` and `runs logs <id> --step <name>`.

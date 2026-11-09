@@ -1361,3 +1361,53 @@ fn a_step_whose_action_did_not_run_makes_a_pass_partial() {
         "{job_finished}"
     );
 }
+
+/// A local JavaScript action can't run here, so its step passes but is
+/// listed under `unverified`, as a remote one is. A local composite action
+/// runs step by step and isn't.
+#[test]
+fn a_local_javascript_action_is_reported_as_not_run() {
+    let sandbox = Sandbox::new();
+    let actions = sandbox.repo.path().join(".github/actions");
+    fs::create_dir_all(actions.join("js")).unwrap();
+    fs::write(
+        actions.join("js/action.yml"),
+        "name: js\nruns:\n  using: node20\n  main: index.js\n",
+    )
+    .unwrap();
+    fs::create_dir_all(actions.join("composite")).unwrap();
+    fs::write(
+        actions.join("composite/action.yml"),
+        "name: composite\nruns:\n  using: composite\n  steps:\n    - run: echo inside\n      shell: bash\n",
+    )
+    .unwrap();
+    sandbox.write(
+        "local.yml",
+        "name: local\non: [push]\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      \
+         - name: JS\n        uses: ./.github/actions/js\n      \
+         - name: Composite\n        uses: ./.github/actions/composite\n",
+    );
+    let output = sandbox.run(&[
+        "--format",
+        "json",
+        "run",
+        "--runtime",
+        "emulation",
+        ".github/workflows/local.yml",
+    ]);
+    let finished = json_lines(&output)
+        .into_iter()
+        .find(|line| line["type"] == "run_finished")
+        .unwrap_or_else(|| panic!("no run_finished: {}", stdout(&output)));
+    assert_eq!(finished["status"], "success", "{finished}");
+    assert_eq!(finished["verdict"], "partial", "{finished}");
+    let steps: Vec<&Value> = finished["unverified"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|entry| entry.get("step").is_some())
+        .collect();
+    assert_eq!(steps.len(), 1, "{finished}");
+    assert_eq!(steps[0]["step"], "JS");
+    assert_eq!(steps[0]["uses"], "./.github/actions/js");
+}

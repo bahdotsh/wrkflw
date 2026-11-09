@@ -37,6 +37,10 @@ The canned "Common causes for cargo command failures" text is gone from failed c
 
 An `include` entry is now added to every original combination whose matrix values it doesn't overwrite, and becomes a combination of its own only when it fits none. Entries are never merged into combinations an earlier `include` created. An entry with only new keys used to become a combination of its own, and now adds its keys to every combination. A workflow planned with fewer or different legs than GitHub runs now gets the same ones.
 
+## Matrix legs that only differ in runner and an unread label run once (unreleased)
+
+A leg that differs from another in a value `runs-on` reads and in values nothing in the job reads, such as a `name` used only by the job's display name, now reports that leg's result instead of running. Such legs used to run. `--every-matrix-leg` runs them all.
+
 ## Off Linux, steps see the workspace in a container volume (unreleased)
 
 On macOS and Windows, Docker and Podman steps no longer bind-mount the job's workspace directory. They see a container volume that wrkflw copies changes into before each step and back out after it, so file names that aren't UTF-8 and names that differ only in case work as on GitHub. Each step starts and ends a little later, by the time the copies take. The copies need the image `ubuntu:latest`, or the one `WRKFLW_WORKSPACE_HELPER_IMAGE` names. If the volume can't be set up, the job mounts the directory as before and says so. Files in the volume belong to root, so a step image that runs as another user can't change them, as on GitHub when the user's ID differs from the runner's. Set `WRKFLW_WORKSPACE_MOUNT=bind` to keep the old behaviour.

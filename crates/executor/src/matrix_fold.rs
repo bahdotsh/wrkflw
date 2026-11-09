@@ -15,11 +15,14 @@ use wrkflw_parser::workflow::Job;
 /// For each matrix leg, the earlier leg it would only repeat, if any.
 ///
 /// Two legs repeat each other when they run in the same image and every
-/// matrix value on which they differ only picks the runner: `runs-on` reads
-/// it and nothing else in the job does. That is the common
+/// matrix value on which they differ is read by nothing but `runs-on`, and
+/// at least one of them picks the runner. That is the common
 /// `runs-on: ${{ matrix.os }}` case: locally every OS runs in the same Linux
-/// image, so the legs would do identical work. A key nothing reads is left
-/// alone, since a matrix like `attempt: [1, 2, 3]` exists to repeat a job.
+/// image, so the legs would do identical work. A key that only labels a leg,
+/// such as one the job's display name uses, changes nothing that runs. Legs
+/// on the same runner are left alone even when nothing reads the key that
+/// tells them apart, since a matrix like `attempt: [1, 2, 3]` exists to
+/// repeat a job.
 /// Any reference to the matrix that can't be pinned to one key counts as
 /// reading all of them, so a leg is only folded away when that is safe.
 pub(crate) fn matrix_twins(
@@ -48,10 +51,10 @@ pub(crate) fn matrix_twins(
     for leg in 1..combinations.len() {
         twins[leg] = (0..leg).filter(|&i| twins[i].is_none()).find(|&i| {
             let differing = differing_keys(&combinations[i].values, &combinations[leg].values);
+            let picks_runner =
+                |key: &String| reads_matrix_keys(&runs_on, std::slice::from_ref(key));
             images[i] == images[leg]
-                && differing
-                    .iter()
-                    .all(|key| reads_matrix_keys(&runs_on, std::slice::from_ref(key)))
+                && differing.iter().any(picks_runner)
                 && !reads_matrix_keys(&body, &differing)
         });
     }
@@ -59,7 +62,8 @@ pub(crate) fn matrix_twins(
 }
 
 /// The job as text, minus the two places a matrix value may appear without
-/// changing what the job does: `runs-on`, and the matrix itself.
+/// changing what the job does: `runs-on`, and the matrix itself. The job's
+/// display name isn't parsed, so it is never here.
 fn job_body_text(job: &Job) -> Option<String> {
     let mut value = serde_json::to_value(job).ok()?;
     let map = value.as_object_mut()?;
@@ -253,6 +257,47 @@ mod tests {
         let job = job("runs-on: ubuntu-latest\nsteps:\n  - run: ./flaky-test\n");
         let twins = matrix_twins(&job, &legs("attempt", &["1", "2", "3"]), &HashMap::new());
         assert_eq!(twins, vec![None, None, None]);
+    }
+
+    /// pallets/click: two legs add an OS and a display name to a leg that
+    /// already runs that Python on Linux.
+    #[test]
+    fn legs_that_differ_in_runner_and_display_name_run_once() {
+        let job = job("name: ${{ matrix.name || matrix.python }}\n\
+             runs-on: ${{ matrix.os || 'ubuntu-latest' }}\n\
+             steps:\n  - run: tox -e py${{ matrix.python }}\n");
+        let leg = |pairs: &[(&str, &str)]| {
+            MatrixCombination::new(
+                pairs
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), Value::String(v.to_string())))
+                    .collect(),
+            )
+        };
+        let combos = vec![
+            leg(&[("python", "3.15")]),
+            leg(&[
+                ("name", "Windows"),
+                ("python", "3.15"),
+                ("os", "windows-latest"),
+            ]),
+            leg(&[("name", "Mac"), ("python", "3.15"), ("os", "macos-latest")]),
+            leg(&[("python", "3.14")]),
+            leg(&[("name", "PyPy"), ("python", "pypy-3.11")]),
+        ];
+        assert_eq!(
+            matrix_twins(&job, &combos, &HashMap::new()),
+            vec![None, Some(0), Some(0), None, None]
+        );
+    }
+
+    #[test]
+    fn a_name_alone_never_folds_legs_on_the_same_runner() {
+        let job = job(
+            "name: try ${{ matrix.attempt }}\nruns-on: ubuntu-latest\nsteps:\n  - run: ./flaky\n",
+        );
+        let twins = matrix_twins(&job, &legs("attempt", &["1", "2"]), &HashMap::new());
+        assert_eq!(twins, vec![None, None]);
     }
 
     #[tokio::test]

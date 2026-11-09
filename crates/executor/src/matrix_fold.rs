@@ -233,6 +233,62 @@ mod tests {
     }
 
     #[test]
+    fn a_matrix_value_in_any_job_key_keeps_every_leg() {
+        for body in [
+            "if: matrix.os != 'macos-latest'\n",
+            "container: node:${{ matrix.os }}\n",
+            "services:\n  db:\n    image: postgres:${{ matrix.os }}\n",
+            "defaults:\n  run:\n    shell: ${{ matrix.os }}\n",
+            "continue-on-error: ${{ matrix.os == 'windows-latest' }}\n",
+            "uses: ./.github/workflows/build.yml\nwith:\n  os: ${{ matrix.os }}\n",
+            "uses: ./.github/workflows/build.yml\nsecrets:\n  OS: ${{ matrix.os }}\n",
+        ] {
+            let job = job(&format!(
+                "runs-on: ${{{{ matrix.os }}}}\n{body}steps:\n  - run: make\n"
+            ));
+            let twins = matrix_twins(&job, &legs("os", OS_LEGS), &HashMap::new());
+            assert_eq!(twins, vec![None, None, None], "{body}");
+        }
+    }
+
+    /// The fold reads the job through its parsed fields, so a key the parser
+    /// drops is one it can't see. A new field must be checked against the
+    /// fold (and added to the test above) before it is added here.
+    #[test]
+    fn the_fold_sees_every_job_field() {
+        let value = serde_json::to_value(job("steps: []\n")).unwrap();
+        let mut fields: Vec<&str> = value
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        fields.sort_unstable();
+        assert_eq!(
+            fields,
+            [
+                "concurrency",
+                "container",
+                "continue-on-error",
+                "defaults",
+                "env",
+                "if",
+                "needs",
+                "outputs",
+                "permissions",
+                "runs-on",
+                "secrets",
+                "services",
+                "steps",
+                "strategy",
+                "timeout-minutes",
+                "uses",
+                "with",
+            ]
+        );
+    }
+
+    #[test]
     fn reading_a_key_that_is_the_same_in_both_legs_is_fine() {
         let job = job(
             "runs-on: ${{ matrix.os }}\nsteps:\n  - run: cargo +${{ matrix.toolchain }} test\n",

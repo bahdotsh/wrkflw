@@ -780,6 +780,9 @@ impl PodmanRuntime {
         volumes: &[(&Path, &Path)],
         entrypoint: Option<&str>,
     ) -> Result<ContainerOutput, ContainerError> {
+        // Podman's containers aren't sampled, so the job keeps the room an
+        // unmeasured job gets.
+        crate::job_memory::unmeasured();
         wrkflw_logging::debug(&format!(
             "Running command in Podman: {}",
             crate::log_redaction::args_for_log(cmd)

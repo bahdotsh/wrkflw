@@ -47,7 +47,7 @@ On macOS and Windows, Docker and Podman steps no longer bind-mount the job's wor
 
 ## Docker and Podman runs limit parallel jobs on a small VM (unreleased)
 
-When the Docker Desktop or Podman VM has less than 14 GB of memory, a run warns and runs at most one job or matrix leg per 4 GB at a time, counting every job of the run together. Runs can take longer there. A Docker or Podman daemon on Linux without a VM is warned about but keeps its parallelism. Set `WRKFLW_MAX_PARALLEL_JOBS` to choose the limit on either.
+When the Docker Desktop or Podman VM has less than 14 GB of memory, a run warns and sets aside the VM's memory divided by the number of whole 4 GB in it for each job, counting every job of the run together. A job measured on an earlier run sets aside half again its peak plus 256 MB instead, so light jobs run side by side from their second run. Measurements are kept in `job-memory.json` in the cache directory. Runs can take longer there. A Docker or Podman daemon on Linux without a VM is warned about but keeps its parallelism. Set `WRKFLW_MAX_PARALLEL_JOBS` to choose the limit on either.
 
 ## Smaller schema changes (unreleased)
 

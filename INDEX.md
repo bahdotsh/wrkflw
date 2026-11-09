@@ -1,7 +1,7 @@
 # Codebase Index: wrkflw
 
-> Generated: 2026-11-09 13:02:19 UTC | Files: 258 | Lines: 110914
-> Languages: JSON (4), Markdown (26), Rust (165), Shell (6), TOML (19), YAML (38)
+> Generated: 2026-11-09 14:01:07 UTC | Files: 259 | Lines: 111618
+> Languages: JSON (4), Markdown (26), Rust (166), Shell (6), TOML (19), YAML (38)
 
 ## Directory Structure
 
@@ -44,6 +44,7 @@ wrkflw/
         events.rs
         expression.rs
         github_env_files.rs
+        job_memory.rs
         job_session.rs
         kubernetes/
           manifest.rs
@@ -534,6 +535,9 @@ wrkflw/
 - `pub fn read_step_environment_updates(job_env: &HashMap<String, String>) -> StepEnvironmentUpdates`
 - `pub fn apply_step_environment_updates( job_env: &mut HashMap<String, String>, job_user_env: &mut HashMap<String, String>, step_outputs_map: &mut HashMap<String, HashMap<String, String>>, step_id: Option<&str>, )`
 - `pub fn clear_step_files(job_env: &HashMap<String, String>)`
+
+**crates/executor/src/job_memory.rs**
+- `pub const JOB_MEMORY_FILE_ENV: &str = "WRKFLW_JOB_MEMORY_FILE"`
 
 **crates/executor/src/kubernetes/manifest.rs**
 - `pub(super) struct Mount`
@@ -1746,7 +1750,7 @@ wrkflw/
 
 ## AGENTS.md
 
-**Language:** Markdown | **Size:** 13.5 KB | **Lines:** 96
+**Language:** Markdown | **Size:** 13.6 KB | **Lines:** 96
 
 **Declarations:**
 
@@ -1754,7 +1758,7 @@ wrkflw/
 
 ## BREAKING_CHANGES.md
 
-**Language:** Markdown | **Size:** 24.5 KB | **Lines:** 369
+**Language:** Markdown | **Size:** 25.2 KB | **Lines:** 373
 
 **Declarations:**
 
@@ -1778,7 +1782,7 @@ wrkflw/
 
 ## INDEX.md
 
-**Language:** Markdown | **Size:** 257.3 KB | **Lines:** 9588
+**Language:** Markdown | **Size:** 261.7 KB | **Lines:** 9744
 
 **Declarations:**
 
@@ -1786,7 +1790,7 @@ wrkflw/
 
 ## README.md
 
-**Language:** Markdown | **Size:** 41.9 KB | **Lines:** 563
+**Language:** Markdown | **Size:** 42.7 KB | **Lines:** 563
 
 **Declarations:**
 
@@ -2549,7 +2553,7 @@ wrkflw/
 
 ## crates/executor/src/docker.rs
 
-**Language:** Rust | **Size:** 58.1 KB | **Lines:** 1562
+**Language:** Rust | **Size:** 60.6 KB | **Lines:** 1634
 
 **Imports:**
 - `crate::container_guard::ContainerGuard`
@@ -2611,6 +2615,19 @@ wrkflw/
 `const PROBE_DAEMON_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5)`
 
 `const PROBE_OVERALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15)`
+
+`struct MemoryWatch`
+> Fields: `id: String`, `meter: std::sync::Arc<crate::job_memory::JobMeter>`, `sampled: std::sync::Arc<std::sync::atomic::AtomicBool>`, `started: std::time::Instant`, `task: tokio::task::JoinHandle<()>`
+
+`const UNSAMPLED_AFTER: std::time::Duration = std::time::Duration::from_secs(3)`
+
+**`impl MemoryWatch`**
+  `fn start(docker: Docker, id: &str, meter: std::sync::Arc<crate::job_memory::JobMeter>) -> Self`
+
+  `fn stop(self, exit_code: i32)`
+
+
+`fn working_set(stats: &bollard::container::MemoryStats) -> Option<u64>`
 
 `fn wait_exit_code( wait_result: Option<&Result<ContainerWaitResponse, bollard::errors::Error>>, ) -> i32`
 
@@ -2879,9 +2896,91 @@ wrkflw/
 
 ---
 
+## crates/executor/src/job_memory.rs
+
+**Language:** Rust | **Size:** 9.0 KB | **Lines:** 287
+
+**Imports:**
+- `std::collections::HashMap`
+- `std::path::PathBuf`
+- `std::sync::atomic::{AtomicBool, AtomicU64, Ordering}`
+- `std::sync::{Arc, Mutex}`
+- `serde::{Deserialize, Serialize}`
+- `sha2::{Digest, Sha256}`
+
+**Declarations:**
+
+`const MIB: u64 = 1024 * 1024`
+
+`const RUNS_KEPT: usize = 3`
+
+`const MIN_RESERVED_BYTES: u64 = 512 * MIB`
+
+`const HEADROOM_BYTES: u64 = 256 * MIB`
+
+`pub(crate) const SIGKILL_EXIT: i32 = 137`
+
+`pub(crate) struct JobMeter`
+> Fields: `current: Mutex<HashMap<String, u64>>`, `peak: AtomicU64`, `sampled: AtomicBool`, `incomplete: AtomicBool`, `killed: AtomicBool`
+
+**`impl JobMeter`**
+  `pub(crate) fn sample(&self, container: &str, bytes: u64)`
+
+  `pub(crate) fn stopped(&self, container: &str)`
+
+  `pub(crate) fn unmeasured(&self)`
+
+  `pub(crate) fn killed(&self)`
+
+  `fn outcome(&self) -> Outcome`
+
+
+`enum Outcome`
+> Variants: `Peak`, `Killed`, `Unknown`
+
+`pub(crate) async fn metered<F: std::future::Future>(future: F) -> F::Output`
+
+`pub(crate) fn meter() -> Option<Arc<JobMeter>>`
+
+`pub(crate) fn unmeasured()`
+
+`pub(crate) struct Recorder`
+> Fields: `id: String`, `meter: Option<Arc<JobMeter>>`
+
+**`impl Recorder`**
+  `pub(crate) fn new(id: String) -> Recorder`
+
+
+**`impl Drop for Recorder`**
+  `fn drop(&mut self)`
+
+
+`pub(crate) fn job_id(identity: &str) -> String`
+
+`fn reserve_for(peaks: &[u64]) -> Option<u64>`
+
+`struct Store`
+> Fields: `jobs: HashMap<String, Vec<u64>>`
+
+`static STORE_LOCK: Mutex<()> = Mutex::new(())`
+
+`fn store_path() -> Option<PathBuf>`
+
+`fn load(path: &std::path::Path) -> Store`
+
+`pub(crate) fn reserve(id: &str) -> Option<u64>`
+
+`pub(crate) fn record(id: &str, meter: &JobMeter)`
+
+`fn apply(store: &mut Store, id: &str, outcome: Outcome)`
+
+`mod tests`
+
+---
+
 ## crates/executor/src/job_session.rs
 
-**Language:** Rust | **Size:** 51.1 KB | **Lines:** 1435
+**Language:** Rust | **Size:** 51.3 KB | **Lines:** 1438
 
 **Imports:**
 - `crate::acceleration`
@@ -3274,7 +3373,7 @@ wrkflw/
 
 ## crates/executor/src/lib.rs
 
-**Language:** Rust | **Size:** 1.4 KB | **Lines:** 48
+**Language:** Rust | **Size:** 1.4 KB | **Lines:** 49
 
 **Imports:**
 - `pub use acceleration::{validate_remote, Acceleration, Secret, Sidecar, SIDECAR_PATH}`
@@ -3301,6 +3400,8 @@ wrkflw/
 `pub(crate) mod checkout_sync`
 
 `mod container_guard`
+
+`pub(crate) mod job_memory`
 
 `pub(crate) mod job_session`
 
@@ -3446,7 +3547,7 @@ wrkflw/
 
 ## crates/executor/src/matrix_fold.rs
 
-**Language:** Rust | **Size:** 10.7 KB | **Lines:** 298
+**Language:** Rust | **Size:** 12.5 KB | **Lines:** 343
 
 **Imports:**
 - `crate::engine::{get_effective_runner_image, JobResult, JobStatus}`
@@ -3473,7 +3574,7 @@ wrkflw/
 
 ## crates/executor/src/podman.rs
 
-**Language:** Rust | **Size:** 38.0 KB | **Lines:** 1025
+**Language:** Rust | **Size:** 38.1 KB | **Lines:** 1028
 
 **Imports:**
 - `crate::container_guard::ContainerGuard`
@@ -3714,7 +3815,7 @@ wrkflw/
 
 ## crates/executor/src/vm_memory.rs
 
-**Language:** Rust | **Size:** 15.4 KB | **Lines:** 417
+**Language:** Rust | **Size:** 19.4 KB | **Lines:** 534
 
 **Imports:**
 - `std::sync::{Arc, OnceLock}`
@@ -3731,11 +3832,27 @@ wrkflw/
 
 `const QUERY_TIMEOUT: Duration = Duration::from_secs(10)`
 
-`type RunPool = Arc<OnceLock<Option<Arc<Semaphore>>>>`
+`const MIB: u64 = 1024 * 1024`
+
+`pub(crate) enum Limit`
+> Variants: `Jobs`, `Memory`
+
+`struct Pool`
+> Fields: `places: Arc<Semaphore>`, `limit: Limit`
+
+**`impl Pool`**
+  `fn new(limit: Limit) -> Pool`
+
+  `fn weight(&self, measured: Option<u64>) -> u32`
+
+
+`fn mib(bytes: u64) -> usize`
+
+`type RunPool = Arc<OnceLock<Option<Arc<Pool>>>>`
 
 `pub(crate) async fn with_run_pool<F: std::future::Future>(future: F) -> F::Output`
 
-`pub(crate) async fn job_slot() -> Option<OwnedSemaphorePermit>`
+`pub(crate) async fn job_slot(job: Option<&str>) -> Option<OwnedSemaphorePermit>`
 
 `fn env_limit() -> Option<usize>`
 
@@ -3747,6 +3864,8 @@ wrkflw/
 
 **`impl Memory`**
   `pub fn limit(&self) -> Option<usize>`
+
+  `fn pool_limit(&self) -> Option<Limit>`
 
   `pub fn warning(&self) -> Option<String>`
 
@@ -3765,9 +3884,9 @@ wrkflw/
 
 `pub(crate) async fn check(cli: Option<&str>)`
 
-`fn set_limit(limit: Option<usize>)`
+`fn set_limit(limit: Option<Limit>)`
 
-`async fn limit_from_memory(cli: &str) -> Option<usize>`
+`async fn limit_from_memory(cli: &str) -> Option<Limit>`
 
 `mod tests`
 
@@ -3931,7 +4050,7 @@ wrkflw/
 
 ## crates/executor/src/workspace.rs
 
-**Language:** Rust | **Size:** 22.6 KB | **Lines:** 651
+**Language:** Rust | **Size:** 23.2 KB | **Lines:** 667
 
 **Imports:**
 - `std::fs::File`
@@ -3947,6 +4066,8 @@ wrkflw/
 `pub(crate) async fn with_caller_job<F: Future>(job: &str, future: F) -> F::Output`
 
 `fn callers() -> Option<String>`
+
+`pub(crate) fn job_identity(repo: &Path, workflow: &str, job: &str) -> String`
 
 `fn workflow_key(workflow: &str, callers: Option<&str>) -> String`
 

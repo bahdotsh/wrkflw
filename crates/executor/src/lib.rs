@@ -16,6 +16,7 @@ pub mod environment;
 pub mod events;
 pub mod expression;
 pub mod github_env_files;
+pub(crate) mod job_memory;
 pub(crate) mod job_session;
 pub mod kubernetes;
 pub(crate) mod live_step;

@@ -2769,7 +2769,12 @@ async fn execute_job_with_matrix(
             verbose,
             services,
         };
-        let result = job_session::with_job_session(job, runtime, execute_job(ctx)).await?;
+        let result = crate::job_memory::metered(job_session::with_job_session(
+            job,
+            runtime,
+            execute_job(ctx),
+        ))
+        .await?;
         let results = vec![result];
         store_passing_result(result_key.as_deref(), &results, env_context).await;
         Ok(results)
@@ -2840,7 +2845,9 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
     }
     // Only after the reusable workflow check: its jobs take places of their
     // own, and a caller holding one would deadlock a limit of one.
-    let _slot = crate::vm_memory::job_slot().await;
+    let memory_id = job_memory_id(&ctx.workflow.name, ctx.job_name);
+    let _slot = crate::vm_memory::job_slot(memory_id.as_deref()).await;
+    let _recorder = memory_id.map(crate::job_memory::Recorder::new);
 
     // Clone context and add job-specific variables.
     // `job_env` is the full lookup map (runner + user union); `job_user_env`
@@ -3095,7 +3102,7 @@ async fn execute_matrix_combinations(
 
         // Process this chunk of combinations in parallel
         let chunk_futures = chunk.iter().map(|combination| {
-            job_session::with_job_session(
+            crate::job_memory::metered(job_session::with_job_session(
                 ctx.job_template,
                 ctx.runtime,
                 execute_matrix_job(
@@ -3109,7 +3116,7 @@ async fn execute_matrix_combinations(
                     ctx.verbose,
                     &ctx.services,
                 ),
-            )
+            ))
         });
 
         let chunk_results = future::join_all(chunk_futures).await;
@@ -3209,11 +3216,13 @@ async fn execute_matrix_job(
     verbose: bool,
     services: &JobServices<'_>,
 ) -> Result<JobResult, ExecutionError> {
-    // One place in the run's pool for the leg, as for any job.
-    let _slot = crate::vm_memory::job_slot().await;
-
     // Create the matrix-specific job name
     let matrix_job_name = wrkflw_matrix::format_combination_name(job_name, combination);
+
+    // One place in the run's pool for the leg, as for any job.
+    let memory_id = job_memory_id(&workflow.name, &matrix_job_name);
+    let _slot = crate::vm_memory::job_slot(memory_id.as_deref()).await;
+    let _recorder = memory_id.map(crate::job_memory::Recorder::new);
 
     wrkflw_logging::info(&format!("Executing matrix job: {}", matrix_job_name));
 
@@ -3500,6 +3509,13 @@ pub(crate) struct JobServices<'a> {
 /// Flush pending cache saves. Called at end-of-job only when the job succeeded,
 /// matching GitHub Actions' behavior where `actions/cache` saves in a post-step
 /// hook that only runs after all steps complete and the job succeeds.
+/// The id a job's memory measurements are kept under.
+fn job_memory_id(workflow: &str, job: &str) -> Option<String> {
+    let repo = std::env::current_dir().ok()?;
+    let identity = crate::workspace::job_identity(&repo, workflow, job);
+    Some(crate::job_memory::job_id(&identity))
+}
+
 async fn flush_pending_cache_saves(
     pending: &std::sync::Mutex<Vec<PendingCacheSave>>,
     cache_store: &crate::cache::CacheStore,

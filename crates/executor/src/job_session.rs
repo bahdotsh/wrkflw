@@ -721,6 +721,9 @@ impl JobSession {
         volumes: &[(PathBuf, PathBuf)],
         resolve: &dyn Fn(&str) -> String,
     ) -> Result<Live, String> {
+        // The job container and services aren't sampled, so the job keeps
+        // the room an unmeasured job gets.
+        crate::job_memory::unmeasured();
         let name = format!("wrkflw-job-{}", uuid::Uuid::new_v4());
         let service_names: Vec<&str> = self.services.iter().map(|s| s.name.as_str()).collect();
         let args = start_args(&name, image, volumes, &service_names);

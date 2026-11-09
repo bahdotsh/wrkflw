@@ -53,6 +53,22 @@ fn callers() -> Option<String> {
     CALLERS.try_with(|callers| callers.clone()).ok()
 }
 
+/// What names `job` of `workflow`, run from `repo`, across runs: the same
+/// parts a kept workspace is keyed by.
+pub(crate) fn job_identity(repo: &Path, workflow: &str, job: &str) -> String {
+    let repo = repo.canonicalize().unwrap_or_else(|_| repo.to_path_buf());
+    let file = workflow_file();
+    let file = file.as_deref().unwrap_or(Path::new(""));
+    let file = file.strip_prefix(&repo).unwrap_or(file);
+    format!(
+        "{}\0{}\0{}\0{}",
+        repo.display(),
+        file.display(),
+        workflow_key(workflow, callers().as_deref()),
+        job
+    )
+}
+
 /// The workflow part of a workspace key. Keys of jobs outside a reusable
 /// workflow are the workflow name alone, as before, so their saved
 /// workspaces stay valid.

@@ -458,6 +458,72 @@ pub fn is_available() -> bool {
 }
 
 /// The exit code of a finished container, or -1 if it can't be determined.
+/// Samples one step container's memory into its job's meter.
+struct MemoryWatch {
+    id: String,
+    meter: std::sync::Arc<crate::job_memory::JobMeter>,
+    sampled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    started: std::time::Instant,
+    task: tokio::task::JoinHandle<()>,
+}
+
+/// A container that ran this long and sent no sample went unmeasured.
+const UNSAMPLED_AFTER: std::time::Duration = std::time::Duration::from_secs(3);
+
+impl MemoryWatch {
+    fn start(docker: Docker, id: &str, meter: std::sync::Arc<crate::job_memory::JobMeter>) -> Self {
+        let sampled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task = {
+            let (id, meter, sampled) = (id.to_string(), meter.clone(), sampled.clone());
+            tokio::spawn(async move {
+                let options = bollard::container::StatsOptions {
+                    stream: true,
+                    one_shot: false,
+                };
+                let mut stats = docker.stats(&id, Some(options));
+                while let Some(Ok(sample)) = stats.next().await {
+                    if let Some(bytes) = working_set(&sample.memory_stats) {
+                        meter.sample(&id, bytes);
+                        sampled.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            })
+        };
+        MemoryWatch {
+            id: id.to_string(),
+            meter,
+            sampled,
+            started: std::time::Instant::now(),
+            task,
+        }
+    }
+
+    fn stop(self, exit_code: i32) {
+        self.task.abort();
+        self.meter.stopped(&self.id);
+        if exit_code == crate::job_memory::SIGKILL_EXIT {
+            self.meter.killed();
+        } else if !self.sampled.load(std::sync::atomic::Ordering::Relaxed)
+            && self.started.elapsed() >= UNSAMPLED_AFTER
+        {
+            self.meter.unmeasured();
+        }
+    }
+}
+
+/// Memory a container holds, as `docker stats` counts it: usage less the
+/// page cache the kernel can drop.
+fn working_set(stats: &bollard::container::MemoryStats) -> Option<u64> {
+    use bollard::container::MemoryStatsStats;
+    let usage = stats.usage?;
+    let inactive = match &stats.stats {
+        Some(MemoryStatsStats::V1(v1)) => v1.total_inactive_file,
+        Some(MemoryStatsStats::V2(v2)) => v2.inactive_file,
+        None => 0,
+    };
+    Some(usage.saturating_sub(inactive))
+}
+
 fn wait_exit_code(
     wait_result: Option<&Result<ContainerWaitResponse, bollard::errors::Error>>,
 ) -> i32 {
@@ -1134,6 +1200,9 @@ impl DockerRuntime {
             }
         }
 
+        let memory_watch = crate::job_memory::meter()
+            .map(|meter| MemoryWatch::start(self.docker.clone(), &container.id, meter));
+
         // Follow the logs while the container runs, so output reaches the
         // live tap as it is printed. The stream ends when the container does.
         let tap = wrkflw_runtime::live_output::current();
@@ -1225,6 +1294,9 @@ impl DockerRuntime {
             wrkflw_logging::warning(&format!("Container output may be incomplete: {}", problem));
         }
         let exit_code = wait_exit_code(wait_result.first());
+        if let Some(watch) = memory_watch {
+            watch.stop(exit_code);
+        }
 
         // Clean up container with a timeout, but preserve on failure if configured
         if exit_code == 0 || !self.preserve_containers_on_failure {

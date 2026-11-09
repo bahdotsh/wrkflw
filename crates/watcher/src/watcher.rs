@@ -353,7 +353,7 @@ mod tests {
             wrkflw_executor::ExecutionConfig {
                 acceleration: Default::default(),
                 event_name: None,
-                branch: None,
+                git_ref: None,
                 base_branch: None,
                 runtime_type: wrkflw_executor::RuntimeType::Emulation,
                 verbose: false,
@@ -645,7 +645,7 @@ mod tests {
             wrkflw_executor::ExecutionConfig {
                 acceleration: Default::default(),
                 event_name: None,
-                branch: None,
+                git_ref: None,
                 base_branch: None,
                 runtime_type: wrkflw_executor::RuntimeType::Emulation,
                 verbose: false,
@@ -795,7 +795,7 @@ mod tests {
             wrkflw_executor::ExecutionConfig {
                 acceleration: Default::default(),
                 event_name: None,
-                branch: None,
+                git_ref: None,
                 base_branch: None,
                 runtime_type: wrkflw_executor::RuntimeType::Emulation,
                 verbose: false,
@@ -919,7 +919,7 @@ mod tests {
             wrkflw_executor::ExecutionConfig {
                 acceleration: Default::default(),
                 event_name: None,
-                branch: None,
+                git_ref: None,
                 base_branch: None,
                 runtime_type: wrkflw_executor::RuntimeType::Emulation,
                 verbose: false,
@@ -1080,7 +1080,7 @@ mod tests {
             wrkflw_executor::ExecutionConfig {
                 acceleration: Default::default(),
                 event_name: None,
-                branch: None,
+                git_ref: None,
                 base_branch: None,
                 runtime_type: wrkflw_executor::RuntimeType::Emulation,
                 verbose: false,

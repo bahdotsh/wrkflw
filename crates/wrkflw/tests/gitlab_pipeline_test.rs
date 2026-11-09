@@ -24,7 +24,7 @@ async fn run_in(
     let cfg = ExecutionConfig {
         acceleration: Default::default(),
         event_name: None,
-        branch: None,
+        git_ref: None,
         base_branch: None,
         runtime_type,
         verbose: false,

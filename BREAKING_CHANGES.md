@@ -2,9 +2,11 @@
 
 ## A pass that skipped an action is `partial`, and library API changes (unreleased)
 
-A `uses:` step whose action wrkflw didn't run now makes a passing run's `verdict` `partial` instead of `verified`, with an entry `{job, step, uses, reason}` under `unverified`. That covers a JavaScript action wrkflw has no implementation of, such as `codecov/codecov-action` or `actions/github-script`, and a setup action whose runtime isn't in the job's image: one in a job with `container:`, one inside a composite action, and every setup action under emulation. Workflows that use such actions and used to report `verified` now report `partial`, and `wrkflw gate` prints its partial warning for them. Its exit code is unchanged.
+A `uses:` step whose action wrkflw didn't run now makes a passing run's `verdict` `partial` instead of `verified`, with an entry `{job, step, uses, reason}` under `unverified`. That covers a JavaScript action wrkflw has no implementation of, such as `codecov/codecov-action` or `actions/github-script`, and a setup action whose runtime isn't in the job's image: one in a job with `container:`, one inside a composite action whose runtime the job's own steps didn't set up, and every setup action under emulation. An action inside a composite action is reported on the step that calls the composite action. Workflows that use such actions and used to report `verified` now report `partial`, and `wrkflw gate` prints its partial warning for them. Its exit code is unchanged.
 
 `actions/setup-python` installs Python with uv instead of the deadsnakes PPA, and a `python-version-file` pointing at `pyproject.toml` installs the newest release `requires-python` allows, as the hosted action does. `pip install` works in it, as on GitHub. The image built for a job with setup actions also gets `less` and, unless the job sets up Node or the base image has it, Node.js 22, as GitHub's Ubuntu runners have. Combined runtime images get new tags, so the first run after upgrading builds them again, and that build takes a little longer.
+
+`wrkflw run` and `wrkflw plan` take `--branch` and `--tag`, the branch or tag the event is for. `wrkflw compare` passes the run's branch, or its tag for a run a tag push started, so a detached checkout of the run's commit fires the same `branches:` and `tags:` filters.
 
 `wrkflw compare` and `wrkflw gate` pass `--platform` on to the runs they start, and the pre-push hook `gate --install-hook` writes keeps it. Both used to accept the flag and ignore it, so their runs used the built-in images.
 
@@ -13,7 +15,8 @@ A job that fails before any step runs, because its image can't be built or pulle
 For crates that use wrkflw as a library:
 
 - `wrkflw_runtime::container::ContainerRuntime` requires `Sync`, and gains `image_id` and `identifies_images`, both with defaults. An implementation that isn't `Sync` no longer compiles.
-- `wrkflw_executor::ExecutionConfig` gains `event_name` and `branch`, and `StepResult` gains `action_not_run`. Struct literals need the new fields.
+- `wrkflw_executor::ExecutionConfig` gains `event_name`, `git_ref` (a full ref such as `refs/heads/main` or `refs/tags/v1.0`) and `base_branch`, and `StepResult` gains `actions_not_run`. Struct literals need the new fields.
+- `wrkflw_executor::environment::create_github_context` takes a `RunRef`. Without `--event`, a workflow whose first trigger is a pull request now gets `GITHUB_HEAD_REF` and `GITHUB_BASE_REF` like one run with `--event pull_request`.
 - `ExecutionEvent` gains `ActionNotRun`. An exhaustive `match` on it needs an arm.
 
 ## `wrkflw gate` checks pull request workflows, and fails when it checked nothing (unreleased)

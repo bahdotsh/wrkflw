@@ -15,7 +15,7 @@ async fn run(yaml: &str) -> ExecutionResult {
     let cfg = ExecutionConfig {
         acceleration: Default::default(),
         event_name: None,
-        branch: None,
+        git_ref: None,
         base_branch: None,
         runtime_type: RuntimeType::Emulation,
         verbose: false,

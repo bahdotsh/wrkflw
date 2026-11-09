@@ -1233,6 +1233,7 @@ name: refs
 on:
   push:
     branches: ['release/**']
+    tags: ['v*']
   pull_request:
     branches: [main]
 jobs:
@@ -1245,8 +1246,13 @@ jobs:
           test "$GITHUB_EVENT_NAME" = "${{ github.event_name }}"
           case "$GITHUB_EVENT_NAME" in
             push)
-              test "$GITHUB_REF" = refs/heads/release/2.0
-              test "${{ github.ref_name }}" = release/2.0
+              if [ "$GITHUB_REF_TYPE" = tag ]; then
+                test "$GITHUB_REF" = refs/tags/v1.0
+                test "${{ github.ref_name }}" = v1.0
+              else
+                test "$GITHUB_REF" = refs/heads/release/2.0
+                test "${{ github.ref_name }}" = release/2.0
+              fi
               test -z "$GITHUB_HEAD_REF" ;;
             pull_request)
               test "$GITHUB_HEAD_REF" = feat
@@ -1286,6 +1292,12 @@ fn branch_and_event_reach_filters_and_steps_on_a_detached_head() {
     let other = finished(&["--event", "push", "--branch", "release/3.0"]);
     assert_eq!(other["status"], "failure", "{other}");
 
+    // A tag push matches `tags:` and is a tag to its steps.
+    let tag = finished(&["--event", "push", "--tag", "v1.0"]);
+    assert_eq!(tag["status"], "success", "{tag}");
+    let not_matched = finished(&["--event", "push", "--tag", "nightly"]);
+    assert_eq!(not_matched["status"], "skipped", "{not_matched}");
+
     let pull_request = finished(&[
         "--event",
         "pull_request",
@@ -1297,4 +1309,55 @@ fn branch_and_event_reach_filters_and_steps_on_a_detached_head() {
         "main",
     ]);
     assert_eq!(pull_request["status"], "success", "{pull_request}");
+}
+
+/// A step whose action wrkflw doesn't run passes, but the run says so: the
+/// verdict is `partial`, `unverified` names the step and the action, and the
+/// job's `job_finished` and `run_finished` entries list it. Under emulation a
+/// setup action installs nothing, so it is one.
+#[test]
+fn a_step_whose_action_did_not_run_makes_a_pass_partial() {
+    let sandbox = Sandbox::new();
+    sandbox.write(
+        "setup.yml",
+        "name: setup\non: [push]\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      \
+         - name: Set up Node\n        uses: actions/setup-node@v4\n      - run: echo ok\n",
+    );
+    let output = sandbox.run(&[
+        "--format",
+        "json",
+        "run",
+        "--runtime",
+        "emulation",
+        ".github/workflows/setup.yml",
+    ]);
+    let lines = json_lines(&output);
+    let finished = lines
+        .iter()
+        .find(|line| line["type"] == "run_finished")
+        .unwrap_or_else(|| panic!("no run_finished: {}", stdout(&output)));
+    assert_eq!(finished["status"], "success", "{finished}");
+    assert_eq!(finished["verdict"], "partial", "{finished}");
+    let not_run: Vec<&Value> = finished["unverified"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|entry| entry.get("step").is_some())
+        .collect();
+    assert_eq!(not_run.len(), 1, "{finished}");
+    assert_eq!(not_run[0]["job"], "a");
+    assert_eq!(not_run[0]["step"], "Set up Node");
+    assert_eq!(not_run[0]["uses"], "actions/setup-node@v4");
+    assert_eq!(
+        finished["jobs"][0]["actions_not_run"][0]["uses"],
+        "actions/setup-node@v4"
+    );
+    let job_finished = lines
+        .iter()
+        .find(|line| line["type"] == "job_finished")
+        .unwrap();
+    assert_eq!(
+        job_finished["actions_not_run"][0]["step"], "Set up Node",
+        "{job_finished}"
+    );
 }

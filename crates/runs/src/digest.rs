@@ -114,9 +114,20 @@ pub struct FailureCause {
 
 /// A line that reports something passing, such as `test oom_is_handled ...
 /// ok`: a word like `out of memory` in it names a test, not a failure.
+/// Test runners print `PASS` and `PASSED` in capitals, so a lower-case
+/// `pass` in a path such as `tests/pass/` isn't one.
 static PASSING: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-    regex::Regex::new(r"(?i)\.\.\.\s*ok\s*$|\bPASS(ED)?\b|^\s*(ok|✓|✔)\b").unwrap()
+    regex::Regex::new(r"\.\.\.\s*ok\s*$|\bPASS(ED)?\b|^\s*(ok|✓|✔)\b").unwrap()
 });
+
+/// A runner's own word for a failure, which no passing line holds.
+static FAILING: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(r"\b(FAIL(ED|URE)?|ERROR)\b").unwrap());
+
+/// Whether `line` reports a pass and no failure.
+fn reports_pass(line: &str) -> bool {
+    PASSING.is_match(line) && !FAILING.is_match(line)
+}
 
 /// The lines a cause may be read from: what the step printed, in the last
 /// `tail_lines` or among the error lines above them, without lines that
@@ -132,7 +143,7 @@ fn cause_lines(text: &str, tail_lines: usize) -> Vec<String> {
         .map(|(i, line)| (start + i, strip_ansi(line)))
         .filter(|(at, line)| {
             !is_output_header(line)
-                && !PASSING.is_match(line)
+                && !reports_pass(line)
                 && (*at >= tail_start || is_error_line(line))
         })
         .map(|(_, line)| line)
@@ -241,7 +252,7 @@ fn error_lines(text: &str, tail_lines: usize) -> Vec<String> {
     let found: Vec<String> = above_tail
         .iter()
         .map(|line| strip_ansi(line))
-        .filter(|line| !is_output_header(line) && is_error_line(line) && !PASSING.is_match(line))
+        .filter(|line| !is_output_header(line) && is_error_line(line) && !reports_pass(line))
         .collect();
     found[found.len().saturating_sub(MAX_ERROR_LINES)..].to_vec()
 }
@@ -576,6 +587,20 @@ mod tests {
         let text = "Exit code: 1\nCommand: x\n\nStandard Output:\nout\n\
                     Standard Error:\nerror: the cause\nnoise\nmore\n";
         assert_eq!(error_lines(text, 2), ["error: the cause"]);
+    }
+
+    #[test]
+    fn a_failure_under_a_path_named_pass_is_still_an_error_line() {
+        let text = "Exit code: 1\nCommand: pytest\n\nStandard Output:\n\
+                    tests/pass/test_x.py::test_y FAILED [ 50%]\n\
+                    PASSED and FAILED: one line names both\nnoise\nmore\n";
+        assert_eq!(
+            error_lines(text, 2),
+            [
+                "tests/pass/test_x.py::test_y FAILED [ 50%]",
+                "PASSED and FAILED: one line names both"
+            ]
+        );
     }
 
     #[test]

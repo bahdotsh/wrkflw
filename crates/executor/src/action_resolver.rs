@@ -185,11 +185,14 @@ async fn resolve_with(
     {
         Some(resolved) => Ok(resolved),
         None => {
-            let fetched = fetch_action_yaml(base_url, repo, version, sub_path, token).await;
-            if let (Ok(body), Some(path)) = (&fetched, disk_cache_file.as_deref()) {
-                write_disk_cache(path, body);
+            let body = fetch_action_yaml(base_url, repo, version, sub_path, token).await?;
+            let resolved = parse_action_definition(&body);
+            // Only a body that parses is kept: a proxy's error page served
+            // with 200 would otherwise be read back, and fetched, every run.
+            if let (Ok(_), Some(path)) = (&resolved, disk_cache_file.as_deref()) {
+                write_disk_cache(path, &body);
             }
-            fetched.and_then(|body| parse_action_definition(&body))
+            resolved
         }
     };
 
@@ -1233,6 +1236,31 @@ runs:
                 ACTION_YML_BODY,
                 "the corrupt entry is replaced by the fetched body"
             );
+        }
+
+        #[tokio::test]
+        async fn resolve_does_not_persist_a_body_that_does_not_parse() {
+            let server = MockServer::start().await;
+            let dir = tempfile::tempdir().unwrap();
+
+            Mock::given(method("GET"))
+                .and(path(format!("/disk/unparsable/{SHA}/action.yml")))
+                .respond_with(ResponseTemplate::new(200).set_body_string("<html>proxy</html>"))
+                .mount(&server)
+                .await;
+
+            let result = resolve_with(
+                &server.uri(),
+                Some(dir.path()),
+                "disk/unparsable",
+                SHA,
+                None,
+                None,
+            )
+            .await;
+
+            assert!(result.is_err());
+            assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
         }
 
         #[tokio::test]

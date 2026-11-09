@@ -24,6 +24,7 @@ pub(crate) mod matrix_fold;
 pub mod podman;
 pub mod run_options;
 pub mod runner_fidelity;
+pub(crate) mod setup_actions;
 pub mod substitution;
 pub mod vm_memory;
 pub(crate) mod workflow_commands;

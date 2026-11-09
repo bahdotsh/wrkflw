@@ -108,7 +108,7 @@ pub(crate) async fn run(ctx: WatchCtx) {
         kubernetes: ctx.kubernetes,
         variables: Default::default(),
         event_name: None,
-        branch: None,
+        git_ref: None,
         base_branch: None,
     };
 

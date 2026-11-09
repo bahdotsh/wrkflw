@@ -219,7 +219,7 @@ pub async fn execute_workflow_cli(
         kubernetes,
         variables: Default::default(),
         event_name: None,
-        branch: None,
+        git_ref: None,
         base_branch: None,
     };
 
@@ -464,7 +464,7 @@ pub async fn execute_curl_trigger(
             outcome: wrkflw_executor::StepStatus::Success,
             conclusion: wrkflw_executor::StepStatus::Success,
             exit_code: None,
-            action_not_run: None,
+            actions_not_run: Vec::new(),
         }],
         logs: "Workflow triggered remotely on GitHub".to_string(),
         outputs: std::collections::HashMap::new(),
@@ -600,7 +600,7 @@ pub fn start_next_workflow_execution(
                                         status: step_status,
                                         output: validation_result.issues.join("\n"),
                                         exit_code: None,
-                                        action_not_run: None,
+                                        actions_not_run: Vec::new(),
                                     }
                                 }],
                                 logs: format!(
@@ -634,7 +634,7 @@ pub fn start_next_workflow_execution(
                         kubernetes,
                         variables: Default::default(),
                         event_name: None,
-                        branch: None,
+                        git_ref: None,
                         base_branch: None,
                     };
 

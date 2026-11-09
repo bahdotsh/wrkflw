@@ -337,12 +337,51 @@ fn workflow_path(path: &str) -> Option<&Path> {
     (inside && path.starts_with(".github/workflows/")).then_some(parsed)
 }
 
+/// Whether the run's `head_branch` names a tag rather than a branch.
+///
+/// GitHub gives a run triggered by a tag push the tag's name there, with
+/// nothing else in the run to say it is one. It is a tag when a tag of
+/// that name points at the run's commit here, or, when this clone knows
+/// neither a tag nor an `origin` branch of that name, as in a shallow
+/// clone, when `origin` has such a tag.
+fn head_is_tag(remote: &RemoteRun) -> bool {
+    let Some(name) = remote.head_branch.as_deref() else {
+        return false;
+    };
+    let tagged = git_line(&[
+        "rev-parse",
+        "-q",
+        "--verify",
+        &format!("refs/tags/{name}^{{commit}}"),
+    ]);
+    if let Some(commit) = tagged {
+        return commit == remote.head_sha;
+    }
+    let branch_known = git_line(&[
+        "rev-parse",
+        "-q",
+        "--verify",
+        &format!("refs/remotes/origin/{name}"),
+    ])
+    .is_some();
+    !branch_known
+        && git_line(&[
+            "ls-remote",
+            "--tags",
+            "origin",
+            &format!("refs/tags/{name}"),
+        ])
+        .is_some()
+}
+
 /// The child `wrkflw run` that checks the workflow as GitHub ran it.
+/// `head_is_tag` says the run's `head_branch` is a tag, see [`head_is_tag`].
 fn run_args(
     remote: &RemoteRun,
     path: &Path,
     runtime: &str,
     platform_overrides: &HashMap<String, String>,
+    head_is_tag: bool,
 ) -> Vec<String> {
     let mut args = vec![
         "--format".to_string(),
@@ -357,10 +396,11 @@ fn run_args(
         "--intent".to_string(),
         format!("wrkflw compare with GitHub run {}", remote.id),
     ];
-    // The run's branch, so a detached checkout of its commit still fires
-    // `branches:` filters and sees the same `github.ref_name`.
-    if let Some(branch) = &remote.head_branch {
-        args.extend(["--branch".to_string(), branch.clone()]);
+    // The run's branch or tag, so a detached checkout of its commit still
+    // fires `branches:` and `tags:` filters and sees the same `github.ref`.
+    if let Some(name) = &remote.head_branch {
+        let flag = if head_is_tag { "--tag" } else { "--branch" };
+        args.extend([flag.to_string(), name.clone()]);
     }
     if let Some(base) = &remote.base_branch {
         args.extend(["--base-branch".to_string(), base.clone()]);
@@ -702,6 +742,7 @@ pub(crate) async fn run(ctx: CompareCtx) -> ! {
             path,
             ctx.runtime.as_flag(),
             &ctx.platform_overrides,
+            head_is_tag(&remote),
         ))
         .stdin(Stdio::null())
         .stderr(Stdio::inherit());
@@ -1116,6 +1157,7 @@ mod tests {
             Path::new(".github/workflows/ci.yml"),
             "docker",
             &HashMap::new(),
+            false,
         );
         assert!(args
             .windows(2)
@@ -1128,6 +1170,7 @@ mod tests {
             Path::new(".github/workflows/ci.yml"),
             "docker",
             &HashMap::new(),
+            false,
         );
         assert!(!args.iter().any(|arg| arg == "--diff-base"), "{args:?}");
     }
@@ -1171,6 +1214,7 @@ mod tests {
             Path::new(".github/workflows/ci.yml"),
             "docker",
             &platform,
+            false,
         );
         assert!(args.windows(2).any(|w| w == ["--event", "pull_request"]));
         // -P reaches the local run, so it runs in the image asked for.
@@ -1180,5 +1224,23 @@ mod tests {
         assert!(args.windows(2).any(|w| w == ["--branch", "feat"]));
         assert!(args.windows(2).any(|w| w == ["--base-branch", "main"]));
         assert!(args.windows(2).any(|w| w == ["--diff-base", "origin/main"]));
+    }
+
+    #[test]
+    fn a_tag_push_run_is_run_for_its_tag_not_a_branch() {
+        let mut run = github_run("success", vec![]);
+        run.head_branch = Some("v1.2.3".into());
+        let args = run_args(
+            &run,
+            Path::new(".github/workflows/release.yml"),
+            "docker",
+            &HashMap::new(),
+            true,
+        );
+        assert!(
+            args.windows(2).any(|w| w == ["--tag", "v1.2.3"]),
+            "{args:?}"
+        );
+        assert!(!args.iter().any(|arg| arg == "--branch"), "{args:?}");
     }
 }

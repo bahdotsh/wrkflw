@@ -372,8 +372,13 @@ enum Commands {
         /// The branch the event is for: `github.ref_name`, and what a
         /// `branches:` filter on push sees. Defaults to the checked-out
         /// branch, which a detached HEAD doesn't have.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "tag")]
         branch: Option<String>,
+
+        /// The tag a push is for instead of a branch: `github.ref_name`,
+        /// `GITHUB_REF_TYPE=tag`, and what a `tags:` filter sees.
+        #[arg(long)]
+        tag: Option<String>,
 
         /// Activity type for events that support it (e.g. `opened`,
         /// `synchronize` for pull_request). Required when simulating an
@@ -708,8 +713,12 @@ enum Commands {
         base_branch: Option<String>,
 
         /// The branch the event is for (default: the checked-out branch)
-        #[arg(long)]
+        #[arg(long, conflicts_with = "tag")]
         branch: Option<String>,
+
+        /// The tag a push is for, instead of a branch
+        #[arg(long)]
+        tag: Option<String>,
 
         /// Activity type for `types:` filters (e.g. opened)
         #[arg(long)]
@@ -1198,6 +1207,7 @@ async fn run_cli() {
             diff_head,
             base_branch,
             branch,
+            tag,
             activity_type,
             strict_filter,
             no_strict_filter,
@@ -1233,6 +1243,7 @@ async fn run_cli() {
                 diff_head: diff_head.clone(),
                 base_branch: base_branch.clone(),
                 branch: branch.clone(),
+                tag: tag.clone(),
                 activity_type: activity_type.clone(),
                 strict_filter: *strict_filter,
                 no_strict_filter: *no_strict_filter,
@@ -1454,6 +1465,7 @@ async fn run_cli() {
             diff_head,
             base_branch,
             branch,
+            tag,
             activity_type,
             strict_filter,
             no_strict_filter,
@@ -1470,6 +1482,7 @@ async fn run_cli() {
                 diff_head: diff_head.clone(),
                 base_branch: base_branch.clone(),
                 branch: branch.clone(),
+                tag: tag.clone(),
                 activity_type: activity_type.clone(),
                 strict_filter: *strict_filter,
                 no_strict_filter: *no_strict_filter,

@@ -35,6 +35,7 @@ pub(crate) struct RunCtx {
     pub(crate) diff_head: Option<String>,
     pub(crate) base_branch: Option<String>,
     pub(crate) branch: Option<String>,
+    pub(crate) tag: Option<String>,
     pub(crate) activity_type: Option<String>,
     pub(crate) strict_filter: bool,
     pub(crate) no_strict_filter: bool,
@@ -245,6 +246,7 @@ pub(crate) async fn run(ctx: RunCtx) {
             diff_head: ctx.diff_head.as_ref(),
             base_branch: ctx.base_branch.as_ref(),
             branch: ctx.branch.as_ref(),
+            tag: ctx.tag.as_ref(),
             activity_type: ctx.activity_type.as_ref(),
             verbose: ctx.verbose,
             strict_filter,
@@ -296,7 +298,11 @@ pub(crate) async fn run(ctx: RunCtx) {
         kubernetes: ctx.kubernetes,
         variables: ctx.variables,
         event_name: ctx.event.clone(),
-        branch: ctx.branch.clone(),
+        git_ref: match (&ctx.branch, &ctx.tag) {
+            (Some(branch), _) => Some(format!("refs/heads/{branch}")),
+            (None, Some(tag)) => Some(format!("refs/tags/{tag}")),
+            (None, None) => None,
+        },
         base_branch: ctx.base_branch.clone(),
     };
     let workflow_type = if is_gitlab {

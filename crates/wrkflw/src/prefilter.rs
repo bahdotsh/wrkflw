@@ -133,6 +133,8 @@ pub(crate) struct PrefilterRequest<'a> {
     pub(crate) base_branch: Option<&'a String>,
     /// The branch the event is for, instead of the checked-out one.
     pub(crate) branch: Option<&'a String>,
+    /// The tag a push is for, instead of a branch.
+    pub(crate) tag: Option<&'a String>,
     pub(crate) activity_type: Option<&'a String>,
     pub(crate) verbose: bool,
     /// When true, known-incomplete filter contexts (missing changed
@@ -248,8 +250,15 @@ pub(crate) async fn run_trigger_prefilter(
     // `--branch` names the branch the event is for, which git can't say on
     // a detached HEAD, and which differs from HEAD when checking what a run
     // elsewhere did.
+    // `--tag` likewise names a tag push, which has no branch. Each one
+    // replaces what git found, so a branch push isn't also a push of a tag
+    // that happens to point at HEAD.
     if let Some(branch) = req.branch {
         event_context.branch = Some(branch.clone());
+        event_context.tag = None;
+    } else if let Some(tag) = req.tag {
+        event_context.tag = Some(tag.clone());
+        event_context.branch = None;
     }
     apply_base_branch(
         &mut event_context,
@@ -450,6 +459,7 @@ mod prefilter_tests {
             diff_head: None,
             base_branch: None,
             branch: None,
+            tag: None,
             activity_type: None,
             verbose: false,
             strict_filter: false,
@@ -483,6 +493,7 @@ mod prefilter_tests {
             diff_head: None,
             base_branch: None,
             branch: None,
+            tag: None,
             activity_type: None,
             verbose: false,
             strict_filter: false,
@@ -608,6 +619,7 @@ mod prefilter_tests {
             diff_head: Some(&head),
             base_branch: None,
             branch: None,
+            tag: None,
             activity_type: None,
             verbose: false,
             strict_filter: false,
@@ -672,6 +684,7 @@ mod prefilter_tests {
             diff_head: None,
             base_branch: None,
             branch: None,
+            tag: None,
             activity_type: None,
             verbose: false,
             strict_filter: false,
@@ -717,6 +730,7 @@ mod prefilter_tests {
             diff_head: None,
             base_branch: None,
             branch: None,
+            tag: None,
             activity_type: None,
             verbose: false,
             strict_filter: true,
@@ -761,6 +775,7 @@ mod prefilter_tests {
             diff_head: None,
             base_branch: None,
             branch: None,
+            tag: None,
             activity_type: None,
             verbose: false,
             strict_filter: true,
@@ -809,6 +824,7 @@ mod prefilter_tests {
             diff_head: None,
             base_branch: None,
             branch: None,
+            tag: None,
             activity_type: None,
             verbose: false,
             strict_filter: false,
@@ -871,6 +887,7 @@ mod prefilter_tests {
             diff_head: None,
             base_branch: None,
             branch: None,
+            tag: None,
             activity_type: None,
             verbose: false,
             strict_filter: true,

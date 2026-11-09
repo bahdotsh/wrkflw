@@ -70,6 +70,14 @@ pub(crate) enum JobWorkspace {
     Fresh(tempfile::TempDir),
 }
 
+impl Drop for JobWorkspace {
+    fn drop(&mut self) {
+        // Before the directory goes: a fresh workspace's volume goes with it.
+        let kept = matches!(self, JobWorkspace::Kept { .. });
+        crate::vm_workspace::release(self.path(), kept);
+    }
+}
+
 impl JobWorkspace {
     pub(crate) fn path(&self) -> &Path {
         match self {
@@ -246,10 +254,13 @@ pub struct CleanReport {
 
 /// Remove every kept workspace no run is using.
 pub fn clean() -> std::io::Result<CleanReport> {
-    match workspaces_root() {
+    let report = match workspaces_root() {
         Some(root) => clean_under(&root),
         None => Ok(CleanReport::default()),
-    }
+    };
+    // A workspace's container volume is no use once its directory is gone.
+    crate::vm_workspace::remove_orphaned_volumes();
+    report
 }
 
 fn clean_under(root: &Path) -> std::io::Result<CleanReport> {

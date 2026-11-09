@@ -28,7 +28,7 @@ use wrkflw_runtime::container::{
 
 const SERVICE_READY_TIMEOUT: Duration = Duration::from_secs(180);
 const SERVICE_POLL: Duration = Duration::from_millis(500);
-const KEEP_ALIVE: &str = "trap 'exit 0' TERM; while :; do sleep 3600 & wait $!; done";
+pub(crate) const KEEP_ALIVE: &str = "trap 'exit 0' TERM; while :; do sleep 3600 & wait $!; done";
 
 /// A service as declared, before expressions are resolved.
 #[derive(Clone)]

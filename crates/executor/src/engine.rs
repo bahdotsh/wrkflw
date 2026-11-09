@@ -1710,7 +1710,13 @@ async fn execute_native_docker_step(
         ctx.container_config,
         ctx.runtime.mounts_are_copies(),
     );
-    let volumes = mount_ctx.build_volumes(ctx.working_dir, container_workspace);
+    let vm_workspace = crate::vm_workspace::before_step(ctx.runtime, ctx.working_dir)
+        .await
+        .map_err(ExecutionError::Runtime)?;
+    let mut volumes = mount_ctx.build_volumes(ctx.working_dir, container_workspace);
+    if let Some(vm) = &vm_workspace {
+        vm.mount_in(&mut volumes);
+    }
     let env_vars: Vec<(&str, &str)> = step_env
         .iter()
         .map(|(k, v)| (k.as_str(), v.as_str()))
@@ -1746,8 +1752,11 @@ async fn execute_native_docker_step(
             &volumes,
             entrypoint.as_deref(),
         )
-        .await
-        .map_err(|e| ExecutionError::Runtime(format!("{}", e)))?;
+        .await;
+    if let Some(vm) = &vm_workspace {
+        vm.after_step().await.map_err(ExecutionError::Runtime)?;
+    }
+    let output = output.map_err(|e| ExecutionError::Runtime(format!("{}", e)))?;
 
     Ok(StepResult::new(
         step_name,
@@ -5150,7 +5159,14 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                         ctx.container_config,
                         ctx.runtime.mounts_are_copies(),
                     );
-                    let volumes = mount_ctx.build_volumes(ctx.working_dir, container_workspace);
+                    let vm_workspace =
+                        crate::vm_workspace::before_step(ctx.runtime, ctx.working_dir)
+                            .await
+                            .map_err(ExecutionError::Runtime)?;
+                    let mut volumes = mount_ctx.build_volumes(ctx.working_dir, container_workspace);
+                    if let Some(vm) = &vm_workspace {
+                        vm.mount_in(&mut volumes);
+                    }
                     let env_vars: Vec<(&str, &str)> = step_env
                         .iter()
                         .map(|(k, v)| (k.as_str(), v.as_str()))
@@ -5166,8 +5182,11 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                             &volumes,
                             None,
                         )
-                        .await
-                        .map_err(|e| ExecutionError::Runtime(format!("{}", e)))?;
+                        .await;
+                    if let Some(vm) = &vm_workspace {
+                        vm.after_step().await.map_err(ExecutionError::Runtime)?;
+                    }
+                    let output = output.map_err(|e| ExecutionError::Runtime(format!("{}", e)))?;
 
                     // Build verbose output for GitHub actions when applicable
                     let output_text = if ctx.verbose
@@ -5411,7 +5430,13 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
         let cmd_refs: Vec<&str> = cmd_parts.iter().map(String::as_str).collect();
 
         let dep_mounts = acceleration::dep_cache_mounts(ctx.runtime.mounts_are_copies());
+        let vm_workspace = crate::vm_workspace::before_step(ctx.runtime, ctx.working_dir)
+            .await
+            .map_err(ExecutionError::Runtime)?;
         let mut volumes = mount_ctx.build_volumes(ctx.working_dir, container_workspace);
+        if let Some(vm) = &vm_workspace {
+            vm.mount_in(&mut volumes);
+        }
         volumes.extend(
             dep_mounts
                 .iter()
@@ -5457,6 +5482,9 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                 message,
             )),
         };
+        if let Some(vm) = &vm_workspace {
+            vm.after_step().await.map_err(ExecutionError::Runtime)?;
+        }
 
         drop(custom_shell_script);
 

@@ -232,7 +232,7 @@ pub(super) fn prune_to_archive(
 }
 
 /// `path` without `.` components, or `None` if it could leave its root.
-pub(super) fn safe_relative_path(path: &Path) -> Option<PathBuf> {
+pub(crate) fn safe_relative_path(path: &Path) -> Option<PathBuf> {
     let mut clean = PathBuf::new();
     for component in path.components() {
         match component {
@@ -247,7 +247,7 @@ pub(super) fn safe_relative_path(path: &Path) -> Option<PathBuf> {
 /// Remove what is at `host/rel` when it is the wrong kind for the incoming
 /// entry, because a step replaced a directory with a file or the reverse.
 /// Does nothing if any parent is a symlink, which could point outside `host`.
-pub(super) fn clear_type_conflict(
+pub(crate) fn clear_type_conflict(
     host: &Path,
     rel: &Path,
     incoming_is_dir: bool,

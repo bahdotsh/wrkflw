@@ -1,7 +1,7 @@
 # Codebase Index: wrkflw
 
-> Generated: 2026-11-09 11:48:01 UTC | Files: 257 | Lines: 109619
-> Languages: JSON (4), Markdown (26), Rust (164), Shell (6), TOML (19), YAML (38)
+> Generated: 2026-11-09 13:02:19 UTC | Files: 258 | Lines: 110914
+> Languages: JSON (4), Markdown (26), Rust (165), Shell (6), TOML (19), YAML (38)
 
 ## Directory Structure
 
@@ -59,6 +59,7 @@ wrkflw/
         setup_actions.rs
         substitution.rs
         vm_memory.rs
+        vm_workspace.rs
         workflow_commands.rs
         workspace.rs
     github/
@@ -563,8 +564,6 @@ wrkflw/
 - `pub(super) fn stream_dir_into( mut command: std::process::Command, mount: &Mount, ) -> Result<(), ContainerError>`
 - `pub(super) fn unpack_archive<R: io::Read>( reader: R, host: &Path, cancelled: &AtomicBool, ) -> io::Result<HashSet<PathBuf>>`
 - `pub(super) fn prune_to_archive( host: &Path, seen: &HashSet<PathBuf>, keep: &[String], ) -> io::Result<()>`
-- `pub(super) fn safe_relative_path(path: &Path) -> Option<PathBuf>`
-- `pub(super) fn clear_type_conflict( host: &Path, rel: &Path, incoming_is_dir: bool, ) -> io::Result<()>`
 - `pub(super) fn prune_unlisted( host: &Path, rel: &Path, seen: &HashSet<PathBuf>, keep: &[PathBuf], ) -> io::Result<()>`
 - `pub(super) fn copy_dir_out_of_pod( kubectl: &OsStr, kubectl_args: &[String], pod: &str, mount: &Mount, excludes: &[String], cancelled: &AtomicBool, ) -> Result<(), ContainerError>`
 - `pub(super) fn sync_from( mut command: std::process::Command, src: &str, host: &Path, excludes: &[String], prune: bool, cancelled: &AtomicBool, ) -> Result<(), ContainerError>`
@@ -1747,7 +1746,7 @@ wrkflw/
 
 ## AGENTS.md
 
-**Language:** Markdown | **Size:** 13.1 KB | **Lines:** 95
+**Language:** Markdown | **Size:** 13.5 KB | **Lines:** 96
 
 **Declarations:**
 
@@ -1755,7 +1754,7 @@ wrkflw/
 
 ## BREAKING_CHANGES.md
 
-**Language:** Markdown | **Size:** 23.8 KB | **Lines:** 365
+**Language:** Markdown | **Size:** 24.5 KB | **Lines:** 369
 
 **Declarations:**
 
@@ -1779,7 +1778,7 @@ wrkflw/
 
 ## INDEX.md
 
-**Language:** Markdown | **Size:** 257.5 KB | **Lines:** 9600
+**Language:** Markdown | **Size:** 257.3 KB | **Lines:** 9588
 
 **Declarations:**
 
@@ -1787,7 +1786,7 @@ wrkflw/
 
 ## README.md
 
-**Language:** Markdown | **Size:** 41.0 KB | **Lines:** 561
+**Language:** Markdown | **Size:** 41.9 KB | **Lines:** 563
 
 **Declarations:**
 
@@ -2904,7 +2903,7 @@ wrkflw/
 
 `const SERVICE_POLL: Duration = Duration::from_millis(500)`
 
-`const KEEP_ALIVE: &str = "trap 'exit 0' TERM`
+`pub(crate) const KEEP_ALIVE: &str = "trap 'exit 0' TERM`
 
 `struct ServiceSpec`
 > Fields: `name: String`, `image: String`, `env: HashMap<String, String>`, `volumes: Vec<String>`, `options: Option<String>`, `ports: Vec<String>`
@@ -3058,7 +3057,7 @@ wrkflw/
 
 `mod manifest`
 
-`mod sync`
+`pub(crate) mod sync`
 
 `const DEADLINE_MARGIN_SECS: u64 = 30`
 
@@ -3265,13 +3264,17 @@ wrkflw/
 
 `fn append_tree<W: io::Write>(builder: &mut tar::Builder<W>, root: &Path) -> io::Result<()>`
 
+`pub(crate) fn safe_relative_path(path: &Path) -> Option<PathBuf>`
+
+`pub(crate) fn clear_type_conflict( host: &Path, rel: &Path, incoming_is_dir: bool, ) -> io::Result<()>`
+
 `mod tests`
 
 ---
 
 ## crates/executor/src/lib.rs
 
-**Language:** Rust | **Size:** 1.4 KB | **Lines:** 47
+**Language:** Rust | **Size:** 1.4 KB | **Lines:** 48
 
 **Imports:**
 - `pub use acceleration::{validate_remote, Acceleration, Secret, Sidecar, SIDECAR_PATH}`
@@ -3308,6 +3311,8 @@ wrkflw/
 `pub(crate) mod matrix_fold`
 
 `pub(crate) mod setup_actions`
+
+`pub(crate) mod vm_workspace`
 
 `pub(crate) mod workflow_commands`
 
@@ -3768,6 +3773,146 @@ wrkflw/
 
 ---
 
+## crates/executor/src/vm_workspace.rs
+
+**Language:** Rust | **Size:** 38.0 KB | **Lines:** 1160
+
+**Imports:**
+- `std::collections::{HashMap, HashSet}`
+- `std::io::{self, Read, Write}`
+- `std::path::{Path, PathBuf}`
+- `std::process::{Command, Stdio}`
+- `std::sync::{Arc, LazyLock, Mutex}`
+- `sha2::{Digest, Sha256}`
+- `wrkflw_runtime::container::ContainerRuntime`
+- `crate::kubernetes::sync::{clear_type_conflict, safe_relative_path}`
+
+**Declarations:**
+
+`pub(crate) const MOUNT_ENV: &str = "WRKFLW_WORKSPACE_MOUNT"`
+
+`const HELPER_IMAGE_ENV: &str = "WRKFLW_WORKSPACE_HELPER_IMAGE"`
+
+`const DEFAULT_HELPER_IMAGE: &str = "ubuntu:latest"`
+
+`const LABEL: &str = "wrkflw.workspace"`
+
+`const VOLUME_PREFIX: &str = "wrkflw-ws-"`
+
+`const ROOT: &str = "/ws"`
+
+`enum Kind`
+> Variants: `File`, `Dir`, `Link`
+
+**`impl Kind`**
+  `fn same_type(&self, other: &Kind) -> bool`
+
+
+`struct Entry`
+> Fields: `kind: Kind`, `mode: Option<u32>`
+
+**`impl Entry`**
+  `fn matches(&self, other: &Entry) -> bool`
+
+
+`type Listing = HashMap<PathBuf, Entry>`
+
+`fn wanted(host_is_linux: bool, setting: Option<&str>) -> bool`
+
+`fn volume_name(host: &Path) -> String`
+
+`struct State`
+> Fields: `helper: Option<String>`, `volume: Option<Listing>`, `kept: HashSet<PathBuf>`, `unusable: bool`
+
+`pub(crate) struct VmWorkspace`
+> Fields: `cli: &'static str`, `host: PathBuf`, `volume: String`, `volume_path: PathBuf`, `state: Mutex<State>`
+
+`static WORKSPACES: LazyLock<Mutex<HashMap<PathBuf, Arc<VmWorkspace>>>> = LazyLock::new(|| Mutex::new(HashMap::new()))`
+
+`pub(crate) async fn before_step( runtime: &dyn ContainerRuntime, host: &Path, ) -> Result<Option<Arc<VmWorkspace>>, String>`
+
+**`impl VmWorkspace`**
+  `pub(crate) fn mount_in<'a>(&'a self, volumes: &mut [(&'a Path, &'a Path)])`
+
+  `pub(crate) async fn after_step(self: &Arc<Self>) -> Result<(), String>`
+
+  `fn lock(&self) -> std::sync::MutexGuard<'_, State>`
+
+  `fn sync_in(&self) -> Result<bool, String>`
+
+  `fn sync_in_locked(&self, state: &mut State) -> io::Result<()>`
+
+  `fn sync_out(&self) -> Result<(), String>`
+
+  `fn sync_out_locked(&self, state: &mut State) -> io::Result<()>`
+
+  `fn helper(&self, state: &mut State) -> io::Result<String>`
+
+  `fn list_volume(&self, helper: &str) -> io::Result<Listing>`
+
+  `fn send(&self, helper: &str, paths: &[PathBuf]) -> io::Result<()>`
+
+  `fn fetch(&self, helper: &str, paths: &[PathBuf], volume: &Listing) -> io::Result<Vec<PathBuf>>`
+
+
+`struct SyncIn`
+> Fields: `delete: Vec<PathBuf>`, `send: Vec<PathBuf>`
+
+`fn plan_sync_in( host: &Listing, volume: &Listing, kept: &HashSet<PathBuf>, on_host: impl Fn(&Path) -> bool, ) -> SyncIn`
+
+`struct SyncOut`
+> Fields: `delete: Vec<PathBuf>`, `fetch: Vec<PathBuf>`
+
+`fn plan_sync_out(host: &Listing, volume: &Listing, kept: &HashSet<PathBuf>) -> SyncOut`
+
+`fn parse_listing(out: &[u8]) -> Listing`
+
+`fn path_from_bytes(bytes: &[u8]) -> PathBuf`
+
+`fn path_from_bytes(bytes: &[u8]) -> PathBuf`
+
+`fn path_bytes(path: &Path) -> Vec<u8>`
+
+`fn path_bytes(path: &Path) -> Vec<u8>`
+
+`fn nul_list(paths: &[PathBuf]) -> Vec<u8>`
+
+`fn host_entry(meta: &std::fs::Metadata, path: &Path) -> Option<Entry>`
+
+`fn mtime_secs(meta: &std::fs::Metadata) -> i64`
+
+`fn mtime_secs(meta: &std::fs::Metadata) -> i64`
+
+`fn host_mode(meta: &std::fs::Metadata) -> Option<u32>`
+
+`fn host_mode(_meta: &std::fs::Metadata) -> Option<u32>`
+
+`fn walk(root: &Path) -> io::Result<Listing>`
+
+`fn unpack<R: Read>(reader: R, host: &Path, volume: &Listing) -> io::Result<Vec<PathBuf>>`
+
+`fn set_dir_mode(dir: &Path, mode: Option<u32>, _entry: Option<&Entry>)`
+
+`fn set_dir_mode(_dir: &Path, _mode: Option<u32>, _entry: Option<&Entry>)`
+
+`fn drain(stderr: Option<std::process::ChildStderr>) -> std::thread::JoinHandle<String>`
+
+`fn exec(cli: &str, helper: &str, cmd: &[&str], stdin: Option<Vec<u8>>) -> io::Result<Vec<u8>>`
+
+`fn exec_allowing( cli: &str, helper: &str, cmd: &[&str], stdin: Option<Vec<u8>>, allowed: i32, ) -> io::Result<Vec<u8>>`
+
+`fn track(cli: &str, id: &str)`
+
+`fn remove_container(cli: &str, id: &str)`
+
+`pub(crate) fn release(host: &Path, kept: bool)`
+
+`pub(crate) fn remove_orphaned_volumes() -> usize`
+
+`mod tests`
+
+---
+
 ## crates/executor/src/workflow_commands.rs
 
 **Language:** Rust | **Size:** 16.2 KB | **Lines:** 516
@@ -3786,7 +3931,7 @@ wrkflw/
 
 ## crates/executor/src/workspace.rs
 
-**Language:** Rust | **Size:** 22.2 KB | **Lines:** 640
+**Language:** Rust | **Size:** 22.6 KB | **Lines:** 651
 
 **Imports:**
 - `std::fs::File`
@@ -3807,6 +3952,10 @@ wrkflw/
 
 `pub(crate) enum JobWorkspace`
 > Variants: `Kept`, `Fresh`
+
+**`impl Drop for JobWorkspace`**
+  `fn drop(&mut self)`
+
 
 **`impl JobWorkspace`**
   `pub(crate) fn path(&self) -> &Path`
@@ -4473,12 +4622,13 @@ wrkflw/
 
 ## crates/runs/src/digest.rs
 
-**Language:** Rust | **Size:** 34.5 KB | **Lines:** 902
+**Language:** Rust | **Size:** 40.3 KB | **Lines:** 1030
 
 **Imports:**
 - `crate::record::{JobRecord, RunRecord, RunStatus, StepRecord, SCHEMA_VERSION}`
 - `crate::store::RunStore`
 - `serde::Serialize`
+- `std::collections::BTreeSet`
 - `wrkflw_executor::{EXIT_CODE_LABEL, STDERR_HEADER, STDOUT_HEADER}`
 
 **Declarations:**
@@ -4524,6 +4674,12 @@ wrkflw/
 `fn error_lines(text: &str, tail_lines: usize) -> Vec<String>`
 
 `fn without_durations(line: &str) -> String`
+
+`static PROGRESS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"\[\s*\d+%\]").unwrap())`
+
+`fn names_a_location(line: &str) -> bool`
+
+`fn failure_signature(text: &str) -> BTreeSet<String>`
 
 `fn same_failure(a: &FailedStep, b: &FailedStep) -> bool`
 

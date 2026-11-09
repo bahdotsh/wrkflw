@@ -27,6 +27,7 @@ pub mod runner_fidelity;
 pub(crate) mod setup_actions;
 pub mod substitution;
 pub mod vm_memory;
+pub(crate) mod vm_workspace;
 pub(crate) mod workflow_commands;
 pub mod workspace;
 

@@ -138,8 +138,13 @@ async fn execute_github_workflow(
         .map_err(|e| ExecutionError::Execution(format!("Failed to create workspace: {}", e)))?;
 
     // 4. Set up GitHub-like environment
-    let (mut env_context, user_env) =
-        github_run_env(&workflow, workspace_dir.path(), &config.runtime_type)?;
+    let (mut env_context, user_env) = github_run_env(
+        &workflow,
+        workspace_dir.path(),
+        &config.runtime_type,
+        config.event_name.as_deref(),
+        config.branch.as_deref(),
+    )?;
 
     // show=true means hide=false (inverted for the env var)
     env_context.insert(
@@ -867,8 +872,11 @@ fn github_run_env(
     workflow: &WorkflowDefinition,
     workspace_dir: &Path,
     runtime: &RuntimeType,
+    event_name: Option<&str>,
+    branch: Option<&str>,
 ) -> Result<(EnvMap, EnvMap), ExecutionError> {
-    let mut env_context = environment::create_github_context(workflow, workspace_dir);
+    let mut env_context =
+        environment::create_github_context(workflow, workspace_dir, event_name, branch);
     // Before the workflow env below, whose expressions must see what steps see.
     seed_runtime_context(&mut env_context, runtime, CiPlatform::GitHub);
 
@@ -1090,6 +1098,12 @@ pub struct ExecutionConfig {
     pub variables: HashMap<String, String>,
     /// What this run may do to avoid work. GitHub workflows only.
     pub acceleration: acceleration::Acceleration,
+    /// The event the run simulates, as `github.event_name`. Defaults to the
+    /// workflow's first trigger.
+    pub event_name: Option<String>,
+    /// The branch the run is for, as `github.ref_name` and `GITHUB_REF`.
+    /// Defaults to the checked-out branch, which a detached HEAD lacks.
+    pub branch: Option<String>,
 }
 
 /// Parse a `LABEL=IMAGE` runner override, as given to `--platform`.
@@ -1294,6 +1308,9 @@ pub struct StepResult {
     pub conclusion: StepStatus,
     /// The process exit code, when the step ran a process.
     pub exit_code: Option<i32>,
+    /// The `uses:` reference of an action wrkflw has no implementation of,
+    /// when the step passed without running it. Reported under `unverified`.
+    pub action_not_run: Option<String>,
 }
 
 impl StepResult {
@@ -1306,11 +1323,18 @@ impl StepResult {
             status,
             output,
             exit_code: None,
+            action_not_run: None,
         }
     }
 
     fn with_exit_code(mut self, exit_code: i32) -> Self {
         self.exit_code = Some(exit_code);
+        self
+    }
+
+    /// Mark the step as one that passed without running `uses`.
+    fn without_running(mut self, uses: Option<String>) -> Self {
+        self.action_not_run = uses;
         self
     }
 }
@@ -1996,6 +2020,9 @@ struct SetupActionDef {
     /// If true, fall back to the @ref from the `uses:` field when no `with:` key is set.
     /// Used by `dtolnay/rust-toolchain` which encodes the toolchain in the ref.
     version_from_ref: bool,
+    /// The `with:` key naming a file in the repository that holds the
+    /// version, such as `python-version-file`, read when `with_key` is absent.
+    version_file_key: Option<&'static str>,
 }
 
 const SETUP_ACTIONS: &[SetupActionDef] = &[
@@ -2005,6 +2032,7 @@ const SETUP_ACTIONS: &[SetupActionDef] = &[
         default_version: "20",
         language: "node",
         version_from_ref: false,
+        version_file_key: Some("node-version-file"),
     },
     SetupActionDef {
         repos: &["shivammathur/setup-php"],
@@ -2012,6 +2040,7 @@ const SETUP_ACTIONS: &[SetupActionDef] = &[
         default_version: "8.2",
         language: "php",
         version_from_ref: false,
+        version_file_key: None,
     },
     SetupActionDef {
         repos: &["actions/setup-python"],
@@ -2019,6 +2048,7 @@ const SETUP_ACTIONS: &[SetupActionDef] = &[
         default_version: "3.11",
         language: "python",
         version_from_ref: false,
+        version_file_key: Some("python-version-file"),
     },
     SetupActionDef {
         repos: &["actions/setup-go"],
@@ -2026,6 +2056,7 @@ const SETUP_ACTIONS: &[SetupActionDef] = &[
         default_version: "1.21",
         language: "go",
         version_from_ref: false,
+        version_file_key: Some("go-version-file"),
     },
     SetupActionDef {
         repos: &["actions/setup-java"],
@@ -2033,6 +2064,7 @@ const SETUP_ACTIONS: &[SetupActionDef] = &[
         default_version: "17",
         language: "java",
         version_from_ref: false,
+        version_file_key: None,
     },
     SetupActionDef {
         repos: &["actions/setup-dotnet"],
@@ -2040,6 +2072,7 @@ const SETUP_ACTIONS: &[SetupActionDef] = &[
         default_version: "7.0",
         language: "dotnet",
         version_from_ref: false,
+        version_file_key: None,
     },
     SetupActionDef {
         repos: &["actions-rs/toolchain", "dtolnay/rust-toolchain"],
@@ -2047,8 +2080,64 @@ const SETUP_ACTIONS: &[SetupActionDef] = &[
         default_version: "stable",
         language: "rust",
         version_from_ref: true,
+        version_file_key: None,
+    },
+    SetupActionDef {
+        repos: &["astral-sh/setup-uv"],
+        with_key: "version",
+        default_version: "latest",
+        language: "uv",
+        version_from_ref: false,
+        version_file_key: None,
     },
 ];
+
+/// The version a `*-version-file` input names, read from `file` under `root`.
+///
+/// `pyproject.toml` gives the lower bound of `requires-python`, `package.json`
+/// that of `engines.node`, `go.mod` its `go` directive, and any other file
+/// (`.python-version`, `.nvmrc`, `.node-version`, `.go-version`) its first
+/// line that isn't blank or a comment, without a leading `v`. The hosted
+/// setup actions read the same files. `None` when the file can't be read or
+/// holds no version.
+fn version_from_file(root: &Path, file: &str) -> Option<String> {
+    let text = std::fs::read_to_string(root.join(file)).ok()?;
+    let name = Path::new(file)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(file);
+    let first_number = |line: &str| -> Option<String> {
+        let start = line.find(|c: char| c.is_ascii_digit())?;
+        let number: String = line[start..]
+            .chars()
+            .take_while(|c| c.is_ascii_digit() || *c == '.')
+            .collect();
+        (!number.is_empty()).then_some(number.trim_end_matches('.').to_string())
+    };
+    let version = match name {
+        "pyproject.toml" => text
+            .lines()
+            .find(|l| l.trim_start().starts_with("requires-python"))
+            .and_then(|l| first_number(l.split_once('=')?.1)),
+        "package.json" => {
+            let json: serde_json::Value = serde_json::from_str(&text).ok()?;
+            json.get("engines")?
+                .get("node")?
+                .as_str()
+                .and_then(first_number)
+        }
+        "go.mod" => text
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("go "))
+            .and_then(first_number),
+        _ => text
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty() && !l.starts_with('#'))
+            .map(|l| l.trim_start_matches('v').to_string()),
+    }?;
+    (!version.is_empty()).then_some(version)
+}
 
 /// Check that a version string contains only safe characters (alphanumeric, dots, hyphens, underscores).
 fn is_safe_version(version: &str) -> bool {
@@ -2063,6 +2152,12 @@ fn is_safe_version(version: &str) -> bool {
 /// If the same language appears multiple times, only the last occurrence is kept
 /// (matching GitHub Actions behavior where later setup steps override earlier ones).
 fn detect_setup_runtimes(steps: &[Step]) -> Vec<SetupRuntime> {
+    let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    detect_setup_runtimes_in(steps, &root)
+}
+
+/// [`detect_setup_runtimes`] with `*-version-file` inputs read under `root`.
+fn detect_setup_runtimes_in(steps: &[Step], root: &Path) -> Vec<SetupRuntime> {
     let mut runtimes: Vec<SetupRuntime> = Vec::new();
 
     for step in steps {
@@ -2086,6 +2181,17 @@ fn detect_setup_runtimes(steps: &[Step]) -> Vec<SetupRuntime> {
         let ver = with
             .and_then(|w| w.get(def.with_key))
             .cloned()
+            .or_else(|| {
+                let file = with?.get(def.version_file_key?)?;
+                let found = version_from_file(root, file);
+                if found.is_none() {
+                    wrkflw_logging::warning(&format!(
+                        "{}: no {} version found in {}; using {}",
+                        uses, def.language, file, def.default_version
+                    ));
+                }
+                found
+            })
             .or_else(|| {
                 // Some actions encode the version in the @ref (e.g., dtolnay/rust-toolchain@nightly).
                 // Skip bare git SHAs — they pin the action version, not the toolchain.
@@ -2181,17 +2287,25 @@ fn get_install_script(language: &str, version: &str) -> String {
                 ver = version
             )
         }
+        // uv installs any CPython, free-threaded or PyPy build the hosted
+        // runner offers, from python-build-standalone, without a distro
+        // package for it or a `pip` that PEP 668 refuses to run. The
+        // interpreter is linked where every image finds it, and `pip`
+        // becomes a wrapper so `pip install` works as on the hosted runner.
         "python" => {
             format!(
-                "apt-get install -y software-properties-common && \
-                 add-apt-repository -y ppa:deadsnakes/ppa && apt-get update && \
-                 apt-get install -y python{ver} python{ver}-venv && \
-                 ln -sf /usr/bin/python{ver} /usr/bin/python && \
-                 ln -sf /usr/bin/python{ver} /usr/bin/python3 && \
-                 curl -sS https://bootstrap.pypa.io/get-pip.py | python{ver}",
-                ver = version
+                "{install_uv} && \
+                 uv python install {req} && \
+                 p=\"$(uv python find {req})\" && \
+                 ln -sf \"$p\" /usr/local/bin/python && ln -sf \"$p\" /usr/local/bin/python3 && \
+                 (\"$p\" -m pip --version >/dev/null 2>&1 || \"$p\" -m ensurepip --upgrade) && \
+                 printf '#!/bin/sh\\nexec /usr/local/bin/python -m pip \"$@\"\\n' > /usr/local/bin/pip && \
+                 chmod +x /usr/local/bin/pip && ln -sf /usr/local/bin/pip /usr/local/bin/pip3",
+                install_uv = uv_install_command("latest"),
+                req = uv_python_request(version)
             )
         }
+        "uv" => uv_install_command(version),
         "go" => {
             format!(
                 "ARCH=$(dpkg --print-architecture || echo amd64) && \
@@ -2240,11 +2354,54 @@ fn get_install_script(language: &str, version: &str) -> String {
     }
 }
 
+/// The command that installs uv `version` (`latest` or a release such as
+/// `0.9.30`) into `/usr/local/bin`, keeping one already there.
+fn uv_install_command(version: &str) -> String {
+    let url = if version == "latest" {
+        "https://astral.sh/uv/install.sh".to_string()
+    } else {
+        format!("https://astral.sh/uv/{}/install.sh", version)
+    };
+    format!(
+        "(command -v uv >/dev/null 2>&1 || curl -LsSf {} | \
+         env UV_INSTALL_DIR=/usr/local/bin UV_NO_MODIFY_PATH=1 sh)",
+        url
+    )
+}
+
+/// `version`, as `actions/setup-python` takes it, in the form `uv python
+/// install` takes: `pypy-3.11` becomes `pypy@3.11`, `3.14-dev` `3.14`,
+/// `3.x` `3`; `3.13t` and `3.12.4` stay as they are.
+fn uv_python_request(version: &str) -> String {
+    let version = version.trim_end_matches(".x").trim_end_matches("-dev");
+    for implementation in ["pypy", "graalpy"] {
+        if let Some(rest) = version.strip_prefix(implementation) {
+            let rest = rest.trim_start_matches('-');
+            // `pypy-3.11-v7.3.17` names the PyPy release too; uv picks it.
+            let rest = rest.split('-').next().unwrap_or(rest);
+            return format!("{}@{}", implementation, rest);
+        }
+    }
+    version.to_string()
+}
+
 /// Generate a Dockerfile that installs multiple language runtimes on an Ubuntu base.
 ///
+/// `base_id` is the base image's local content ID, when known. It goes into
+/// the Dockerfile as a comment, so the image tag, a hash of this text,
+/// changes when the base image changes under the same name. Without it a
+/// re-pulled or rebuilt base would keep serving the old combined image.
+///
 /// Extracted as a pure function so the output can be unit-tested without Docker.
-fn generate_combined_dockerfile(runtimes: &[SetupRuntime], base_image: &str) -> String {
+fn generate_combined_dockerfile(
+    runtimes: &[SetupRuntime],
+    base_image: &str,
+    base_id: Option<&str>,
+) -> String {
     let mut dockerfile = format!("FROM {}\n", base_image);
+    if let Some(id) = base_id {
+        dockerfile.push_str(&format!("# base image id: {}\n", id));
+    }
 
     // Combine base packages and all runtime install scripts into a single
     // RUN directive so there is only one `apt-get update` call and the Docker
@@ -2329,7 +2486,22 @@ async fn build_combined_runtime_image(
     base_image: &str,
     runtime: &dyn ContainerRuntime,
 ) -> Result<String, ExecutionError> {
-    let dockerfile = generate_combined_dockerfile(runtimes, base_image);
+    // The base image's identity, so a changed base gets a new combined image.
+    // An image not yet present is pulled first: the build would pull it
+    // anyway, and knowing its ID now saves a rebuild on the next run.
+    let base_id = match runtime.image_id(base_image).await {
+        Some(id) => Some(id),
+        None => {
+            if let Err(e) = runtime.pull_image(base_image).await {
+                wrkflw_logging::debug(&format!(
+                    "Could not pull {} before building on it: {}",
+                    base_image, e
+                ));
+            }
+            runtime.image_id(base_image).await
+        }
+    };
+    let dockerfile = generate_combined_dockerfile(runtimes, base_image, base_id.as_deref());
     let tag = combined_image_tag(runtimes, &dockerfile);
 
     // Fast path: image already exists, no locking needed.
@@ -3723,6 +3895,13 @@ impl StepLoopState {
         let Some(current) = &self.current_step else {
             return;
         };
+        if let Some(uses) = &result.action_not_run {
+            crate::events::emit(|| crate::events::ExecutionEvent::ActionNotRun {
+                job: self.job_label.clone(),
+                step: result.name.clone(),
+                uses: uses.clone(),
+            });
+        }
         crate::events::emit(|| crate::events::ExecutionEvent::StepFinished {
             job: self.job_label.clone(),
             step: result.name.clone(),
@@ -4085,6 +4264,7 @@ async fn run_step_with_guards(
                     outcome: StepStatus::Failure,
                     conclusion,
                     exit_code: None,
+                    action_not_run: None,
                 },
                 abort_job,
             })
@@ -5097,6 +5277,7 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                         }
                     }
 
+                    let mut action_not_run: Option<String> = None;
                     if action_info.is_docker {
                         // Docker actions just run the container
                         cmd.push("sh");
@@ -5132,8 +5313,16 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                         let hide_messages = hide_action_value == "true";
                         wrkflw_logging::debug(&format!("Should hide messages: {}", hide_messages));
 
+                        // A setup action's work was done when the job's image
+                        // was built, so its step has nothing left to run.
+                        // Any other action that reaches the fallback below
+                        // is one wrkflw can't run at all.
+                        let is_setup_action = SETUP_ACTIONS
+                            .iter()
+                            .any(|d| d.repos.contains(&action_info.repository.as_str()));
+
                         // Only log a message to the console if we're showing action messages
-                        if !hide_messages {
+                        if !hide_messages && is_setup_action {
                             wrkflw_logging::info(&format!("Would execute GitHub action: {}", uses));
                         }
 
@@ -5229,6 +5418,19 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                                 format!("echo 'Would execute GitHub action: {}'", escaped_uses);
                             owned_strings.push(echo_msg);
                             cmd.push(owned_strings.last().unwrap());
+
+                            if !is_setup_action {
+                                // The step passes, but nothing the action
+                                // does happens. Say so here, and in the
+                                // run's verdict.
+                                action_not_run = Some(uses.clone());
+                                wrkflw_logging::warning(&format!(
+                                    "{}: no implementation in wrkflw, so the step passes \
+                                     without running it. Anything it would install, \
+                                     configure or check is missing from this job",
+                                    uses
+                                ));
+                            }
                         }
                     }
 
@@ -5344,6 +5546,7 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                         ),
                     )
                     .with_exit_code(output.exit_code)
+                    .without_running(action_not_run)
                 }
             }
         }
@@ -7680,7 +7883,8 @@ mod tests {
             .await
             .unwrap();
 
-        let dockerfile = generate_combined_dockerfile(&detect_setup_runtimes(&steps), "my/image:1");
+        let dockerfile =
+            generate_combined_dockerfile(&detect_setup_runtimes(&steps), "my/image:1", None);
         assert!(dockerfile.starts_with("FROM my/image:1\n"));
         assert_eq!(
             image,
@@ -9643,7 +9847,9 @@ runs:
 
     #[test]
     fn get_install_script_returns_nonempty_for_known_languages() {
-        for lang in &["node", "php", "python", "go", "java", "dotnet", "rust"] {
+        for lang in &[
+            "node", "php", "python", "go", "java", "dotnet", "rust", "uv",
+        ] {
             let script = get_install_script(lang, "latest");
             assert!(
                 !script.is_empty(),
@@ -9835,7 +10041,7 @@ runs:
             version: "20".to_string(),
             install_script: get_install_script("node", "20"),
         }];
-        let df = generate_combined_dockerfile(&runtimes, "ubuntu:latest");
+        let df = generate_combined_dockerfile(&runtimes, "ubuntu:latest", None);
         assert!(df.starts_with("FROM ubuntu:latest\n"));
         assert!(df.contains("nodesource"));
         // Everything in a single RUN layer
@@ -9849,7 +10055,7 @@ runs:
             version: "20".to_string(),
             install_script: get_install_script("node", "20"),
         }];
-        let df = generate_combined_dockerfile(&runtimes, "catthehacker/ubuntu:act-latest");
+        let df = generate_combined_dockerfile(&runtimes, "catthehacker/ubuntu:act-latest", None);
         assert!(df.ends_with("ENV PATH=/usr/local/bin:/usr/bin:$PATH\n"));
     }
 
@@ -9867,11 +10073,125 @@ runs:
                 install_script: get_install_script("python", "3.12"),
             },
         ];
-        let df = generate_combined_dockerfile(&runtimes, "ubuntu:latest");
+        let df = generate_combined_dockerfile(&runtimes, "ubuntu:latest", None);
         // Everything in a single RUN layer
         assert_eq!(df.matches("RUN ").count(), 1);
         assert!(df.contains("nodesource"));
-        assert!(df.contains("deadsnakes"));
+        assert!(df.contains("uv python install 3.12"));
+    }
+
+    #[test]
+    fn python_versions_are_asked_of_uv_as_setup_python_spells_them() {
+        assert_eq!(uv_python_request("3.12"), "3.12");
+        assert_eq!(uv_python_request("3.13t"), "3.13t");
+        assert_eq!(uv_python_request("3.12.4"), "3.12.4");
+        assert_eq!(uv_python_request("3.x"), "3");
+        assert_eq!(uv_python_request("3.14-dev"), "3.14");
+        assert_eq!(uv_python_request("pypy-3.11"), "pypy@3.11");
+        assert_eq!(uv_python_request("pypy3.10"), "pypy@3.10");
+        assert_eq!(uv_python_request("pypy-3.11-v7.3.17"), "pypy@3.11");
+        assert_eq!(uv_python_request("graalpy-24.1"), "graalpy@24.1");
+    }
+
+    #[test]
+    fn the_python_install_links_the_interpreter_and_pip_where_steps_find_them() {
+        let script = get_install_script("python", "pypy-3.11");
+        assert!(script.contains("astral.sh/uv/install.sh"));
+        assert!(script.contains("uv python install pypy@3.11"));
+        assert!(script.contains("/usr/local/bin/python3"));
+        assert!(script.contains("/usr/local/bin/pip"));
+        assert!(!script.contains("deadsnakes"));
+        assert!(!script.contains("get-pip"));
+    }
+
+    #[test]
+    fn setup_uv_installs_the_requested_release() {
+        let with = HashMap::from([("version".to_string(), "0.9.30".to_string())]);
+        let steps = vec![make_step_uses("astral-sh/setup-uv@v9", Some(with))];
+        let runtimes = detect_setup_runtimes(&steps);
+        assert_eq!(runtimes.len(), 1);
+        assert_eq!(runtimes[0].language, "uv");
+        assert!(runtimes[0]
+            .install_script
+            .contains("https://astral.sh/uv/0.9.30/install.sh"));
+        let latest = detect_setup_runtimes(&[make_step_uses("astral-sh/setup-uv@v9", None)]);
+        assert!(latest[0]
+            .install_script
+            .contains("https://astral.sh/uv/install.sh"));
+    }
+
+    #[test]
+    fn version_files_are_read_as_the_hosted_setup_actions_read_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("pyproject.toml"),
+            "[project]\nname = \"x\"\nrequires-python = \">=3.10\"\n",
+        )
+        .unwrap();
+        std::fs::write(root.join(".python-version"), "# pinned\n3.12.4\n").unwrap();
+        std::fs::write(root.join(".nvmrc"), "v20.11.0\n").unwrap();
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"engines": {"node": ">=18.17 <21"}}"#,
+        )
+        .unwrap();
+        std::fs::write(root.join("go.mod"), "module m\n\ngo 1.22.3\n").unwrap();
+        assert_eq!(
+            version_from_file(root, "pyproject.toml").as_deref(),
+            Some("3.10")
+        );
+        assert_eq!(
+            version_from_file(root, ".python-version").as_deref(),
+            Some("3.12.4")
+        );
+        assert_eq!(
+            version_from_file(root, ".nvmrc").as_deref(),
+            Some("20.11.0")
+        );
+        assert_eq!(
+            version_from_file(root, "package.json").as_deref(),
+            Some("18.17")
+        );
+        assert_eq!(version_from_file(root, "go.mod").as_deref(), Some("1.22.3"));
+        assert_eq!(version_from_file(root, "missing.txt"), None);
+
+        let with = HashMap::from([(
+            "python-version-file".to_string(),
+            "pyproject.toml".to_string(),
+        )]);
+        let steps = vec![make_step_uses("actions/setup-python@v5", Some(with))];
+        let runtimes = detect_setup_runtimes_in(&steps, root);
+        assert_eq!(runtimes[0].version, "3.10");
+
+        // An explicit version wins over the file.
+        let with = HashMap::from([
+            ("python-version".to_string(), "3.13".to_string()),
+            (
+                "python-version-file".to_string(),
+                "pyproject.toml".to_string(),
+            ),
+        ]);
+        let steps = vec![make_step_uses("actions/setup-python@v5", Some(with))];
+        assert_eq!(detect_setup_runtimes_in(&steps, root)[0].version, "3.13");
+    }
+
+    #[test]
+    fn combined_image_tag_changes_with_the_base_image_id() {
+        let runtimes = vec![SetupRuntime {
+            language: "node".to_string(),
+            version: "20".to_string(),
+            install_script: get_install_script("node", "20"),
+        }];
+        let before = generate_combined_dockerfile(&runtimes, "ubuntu:latest", Some("sha256:aaa"));
+        let after = generate_combined_dockerfile(&runtimes, "ubuntu:latest", Some("sha256:bbb"));
+        assert!(before.contains("# base image id: sha256:aaa"));
+        assert_ne!(
+            combined_image_tag(&runtimes, &before),
+            combined_image_tag(&runtimes, &after)
+        );
+        // A comment doesn't change what gets built.
+        assert_eq!(before.matches("RUN ").count(), 1);
     }
 
     #[test]
@@ -9881,7 +10201,7 @@ runs:
             version: "1.0".to_string(),
             install_script: String::new(),
         }];
-        let df = generate_combined_dockerfile(&runtimes, "ubuntu:latest");
+        let df = generate_combined_dockerfile(&runtimes, "ubuntu:latest", None);
         // Single RUN layer with just the base packages
         assert_eq!(df.matches("RUN ").count(), 1);
     }
@@ -10625,12 +10945,14 @@ runs:
         }
         let workspace = Path::new("/host/workspace");
 
-        let (env, user_env) = github_run_env(&workflow, workspace, &RuntimeType::Docker).unwrap();
+        let (env, user_env) =
+            github_run_env(&workflow, workspace, &RuntimeType::Docker, None, None).unwrap();
         assert_eq!(env["BUILD_DIR"], "/github/workspace/build");
         assert_eq!(env["TARGET_OS"], "Linux");
         assert_eq!(user_env["BUILD_DIR"], "/github/workspace/build");
 
-        let (env, _) = github_run_env(&workflow, workspace, &RuntimeType::Emulation).unwrap();
+        let (env, _) =
+            github_run_env(&workflow, workspace, &RuntimeType::Emulation, None, None).unwrap();
         assert_eq!(
             env["BUILD_DIR"],
             format!("{}/build", env["GITHUB_WORKSPACE"])
@@ -11261,6 +11583,7 @@ runs:
             outcome: StepStatus::Failure,
             conclusion: StepStatus::Success, // continue-on-error
             exit_code: None,
+            action_not_run: None,
         };
         record_step_status(Some("build"), &result, &mut map, &mut status);
 
@@ -12359,6 +12682,7 @@ runs:
             outcome: StepStatus::Failure,
             conclusion: StepStatus::Success,
             exit_code: None,
+            action_not_run: None,
         };
         record_step_status(Some("lint"), &result, &mut step_statuses, &mut job_status);
 

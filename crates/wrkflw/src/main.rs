@@ -369,6 +369,12 @@ enum Commands {
         #[arg(long)]
         base_branch: Option<String>,
 
+        /// The branch the event is for: `github.ref_name`, and what a
+        /// `branches:` filter on push sees. Defaults to the checked-out
+        /// branch, which a detached HEAD doesn't have.
+        #[arg(long)]
+        branch: Option<String>,
+
         /// Activity type for events that support it (e.g. `opened`,
         /// `synchronize` for pull_request). Required when simulating an
         /// event whose workflows use `types:` filters — without it, every
@@ -700,6 +706,10 @@ enum Commands {
         /// Target branch for pull_request events
         #[arg(long)]
         base_branch: Option<String>,
+
+        /// The branch the event is for (default: the checked-out branch)
+        #[arg(long)]
+        branch: Option<String>,
 
         /// Activity type for `types:` filters (e.g. opened)
         #[arg(long)]
@@ -1175,6 +1185,7 @@ async fn run_cli() {
             diff_base,
             diff_head,
             base_branch,
+            branch,
             activity_type,
             strict_filter,
             no_strict_filter,
@@ -1209,6 +1220,7 @@ async fn run_cli() {
                 diff_base: diff_base.clone(),
                 diff_head: diff_head.clone(),
                 base_branch: base_branch.clone(),
+                branch: branch.clone(),
                 activity_type: activity_type.clone(),
                 strict_filter: *strict_filter,
                 no_strict_filter: *no_strict_filter,
@@ -1427,6 +1439,7 @@ async fn run_cli() {
             diff_base,
             diff_head,
             base_branch,
+            branch,
             activity_type,
             strict_filter,
             no_strict_filter,
@@ -1442,6 +1455,7 @@ async fn run_cli() {
                 diff_base: diff_base.clone(),
                 diff_head: diff_head.clone(),
                 base_branch: base_branch.clone(),
+                branch: branch.clone(),
                 activity_type: activity_type.clone(),
                 strict_filter: *strict_filter,
                 no_strict_filter: *no_strict_filter,

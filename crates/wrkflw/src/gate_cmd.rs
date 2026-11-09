@@ -37,9 +37,10 @@ fn ran_nothing(code: Option<i32>) -> bool {
     matches!(code, Some(SKIPPED_EXIT | NOTHING_CHECKED_EXIT))
 }
 
-/// What the child exits with when it passed, but some job ran as another OS
-/// than `runs-on` asked for. A pass, but `partial`, as in JSON mode, where
-/// the verdict comes from `run_finished` instead.
+/// What the child exits with when it passed, but part of it could not be
+/// checked here: a job ran as another OS than `runs-on` asked for, or a step
+/// passed without running its action. A pass, but `partial`, as in JSON
+/// mode, where the verdict comes from `run_finished` instead.
 const PARTIAL_EXIT: i32 = 80;
 
 /// Whether a child's exit code says it passed, fully or not.
@@ -408,8 +409,9 @@ fn workflow_report(file: &Path, code: Option<i32>, stdout: &str) -> Value {
 
 /// The gate's verdict, as a run's: `failed` when a workflow failed or
 /// couldn't run, `nothing_checked` when no job ran anywhere, `partial` when
-/// it passed but some job ran as another OS than `runs-on` asked for, and
-/// `verified` otherwise.
+/// it passed but part of it could not be checked here (a job ran as another
+/// OS than `runs-on` asked for, or a step passed without running its action),
+/// and `verified` otherwise.
 fn gate_verdict(workflows: &[Value], failed: usize, unverified: usize) -> &'static str {
     let checked = workflows
         .iter()
@@ -661,8 +663,8 @@ pub(crate) fn run(ctx: GateCtx) {
             "{}",
             cli_style::warning(&format!(
                 "gate passed, partially verified: {} workflow(s) ran, {} skipped. Some jobs \
-                 ran as another OS than runs-on asked for, so their OS-specific steps were \
-                 not checked",
+                 ran as another OS than runs-on asked for, or passed a step whose action \
+                 wrkflw can't run, so the pass doesn't stand for GitHub's",
                 report["ran"], report["skipped"]
             ))
         );

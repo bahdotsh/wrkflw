@@ -20,7 +20,7 @@ A command-line tool for validating and executing GitHub Actions workflows locall
 - **Job selection** — run individual jobs with `--job` or via TUI job selection mode
 - **Job dependency resolution** — automatic ordering based on `needs` with parallel execution of independent jobs
 - **Expression evaluator** — evaluates `${{ ... }}` expressions including `toJSON`, `fromJSON`, `contains`, `startsWith`, etc.
-- **Action support** — Docker container actions, JavaScript actions, composite actions (with output propagation), and local actions
+- **Action support** — Docker container actions, composite actions (with output propagation), local actions, and built-in versions of `actions/checkout`, `actions/cache`, the artifact actions and the common setup actions (`setup-node`, `setup-python`, `setup-go`, `setup-java`, `setup-dotnet`, `setup-php`, `rust-toolchain`, `setup-uv`), which install the runtime into the job's image, honouring `*-version-file` inputs. Any other JavaScript action is not run: its step passes and is reported under `unverified`
 - **Reusable workflows** — execute caller jobs via `jobs.<id>.uses` (local or `owner/repo/path@ref`) with output propagation
 - **Artifacts, cache, and inter-job outputs** — `actions/upload-artifact`, `actions/download-artifact`, `actions/cache`, and `needs.<id>.outputs.*`
 - **GitHub context emulation** — environment variables, `GITHUB_OUTPUT`, `GITHUB_ENV`, `GITHUB_PATH`, `GITHUB_STEP_SUMMARY`
@@ -37,6 +37,7 @@ A command-line tool for validating and executing GitHub Actions workflows locall
 
 - GitHub encrypted secrets and fine-grained permissions
 - Event triggers other than `workflow_dispatch` for the remote `trigger` command
+- JavaScript actions outside the built-in set — a step such as `uses: some-org/setup-tool@v1` whose action runs on Node is not executed. The step passes, prints that it would have run the action, and is listed under `unverified` in `run_finished`, the `gate` result and `compare`, with a warning in the log and a mark on the step in the TUI, so the run's verdict is `partial` rather than `verified`. Whatever the action would have installed or checked is missing from the job, so later steps may fail with `command not found`. Pass `--platform ubuntu-latest=IMAGE` with an image that has the tool, or install it in a `run:` step
 - Absolute-URL actions such as `uses: https://gitea.com/actions/checkout@v4` — they pass validation, but at run time the URL is not resolved and the step falls back to built-in handling
 - Private repos for remote `uses:` — reusable workflows clone over unauthenticated HTTPS
 - `cancel-in-progress` and workflow-level `concurrency:` — job-level groups are enforced within a run, but a local run has nothing earlier to cancel
@@ -216,7 +217,8 @@ All of this is opt-in. Without these flags a run behaves as it always has.
 # Check everything CI would run for this push, reusing what already passed.
 # On a feature branch, a workflow a push doesn't fire is checked as a pull
 # request into the default branch. The result says how much the pass proves:
-# verified, partial (some jobs ran as another OS) or nothing_checked.
+# verified, partial (some jobs ran as another OS, or passed a step whose
+# action wrkflw can't run) or nothing_checked.
 wrkflw gate
 
 # Run it on every push (an existing hook is left alone). The hook keeps the
@@ -369,14 +371,18 @@ wrkflw runs replay latest
 wrkflw run .github/workflows/ci.yml --job test --from-step "Run tests"
 
 # Run a workflow as a finished GitHub run did, and list where the results differ.
-# Check out the commit that run tested first.
+# Check out the commit that run tested first; a detached HEAD is fine, the
+# run's branch is used.
 wrkflw compare https://github.com/OWNER/REPO/actions/runs/123456789
+
+# Check a push to another branch than the one checked out, or on a detached HEAD
+wrkflw run --event push --branch release/2.0 --diff .github/workflows/ci.yml
 
 # Serve all of this over the Model Context Protocol
 wrkflw mcp serve
 ```
 
-Every `run_finished`, and the gate result, carries a `verdict`. `verified` means every job ran as the OS it asked for. `partial` means some jobs ran as another OS and are listed under `unverified`. `nothing_checked` means no job ran, so the pass proves nothing. A failure digest names a likely `cause`: `out_of_memory` when the output says memory ran out, or `killed` when a process got SIGKILL without a stated reason.
+Every `run_finished`, and the gate result, carries a `verdict`. `verified` means every job ran as the OS it asked for and every `uses:` step ran its action. `partial` means some jobs ran as another OS, or passed a step whose action wrkflw has no implementation of; both are listed under `unverified`. `nothing_checked` means no job ran, so the pass proves nothing. A failure digest names a likely `cause`: `out_of_memory` when the output says memory ran out, or `killed` when a process got SIGKILL without a stated reason.
 
 Docker Desktop and Podman machines often have half the 16 GB of a GitHub runner, and a Rust or C++ link can be killed there although it passes in CI. wrkflw warns when the VM has less than 14 GB and runs at most one job or matrix leg per 4 GB at a time, counting every job of the run together. On Linux without a VM it only warns. Set `WRKFLW_MAX_PARALLEL_JOBS` to choose the limit.
 

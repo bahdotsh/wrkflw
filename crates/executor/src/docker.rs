@@ -926,6 +926,15 @@ impl ContainerRuntime for DockerRuntime {
             ))),
         }
     }
+
+    async fn image_id(&self, image: &str) -> Option<String> {
+        self.docker
+            .inspect_image(image)
+            .await
+            .ok()?
+            .id
+            .filter(|id| !id.is_empty())
+    }
 }
 
 // Move the actual implementation to internal methods

@@ -54,6 +54,15 @@ pub enum ExecutionEvent {
         requested: String,
         ran_as: String,
     },
+    /// A `uses:` step whose action wrkflw has no implementation of. The
+    /// step ran nothing and passed, so whatever the action would have
+    /// installed, configured or checked is missing from the job. Sent
+    /// before the step's `StepFinished`.
+    ActionNotRun {
+        job: String,
+        step: String,
+        uses: String,
+    },
     JobFinished {
         job: String,
         status: JobStatus,

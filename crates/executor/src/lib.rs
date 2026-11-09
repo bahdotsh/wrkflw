@@ -3,6 +3,7 @@
 #![allow(unused_variables, unused_assignments)]
 
 pub mod acceleration;
+pub mod action_fidelity;
 pub mod action_resolver;
 pub(crate) mod artifacts;
 pub(crate) mod cache;
@@ -30,6 +31,7 @@ pub mod workspace;
 
 // Re-export public items
 pub use acceleration::{validate_remote, Acceleration, Secret, Sidecar, SIDECAR_PATH};
+pub use action_fidelity::UnexecutedAction;
 pub use docker::cleanup_resources;
 pub use engine::{
     detect_runtime, execute_workflow, parse_platform_override, ExecutionConfig, JobResult,

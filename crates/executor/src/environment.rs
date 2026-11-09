@@ -102,9 +102,16 @@ pub fn apply_gitlab_container_context(env: &mut HashMap<String, String>) {
     }
 }
 
+/// The runner-seeded `GITHUB_*` variables of a run.
+///
+/// `event_name` is the event the run simulates; without it the workflow's
+/// first trigger stands in. `branch` is the branch the run is for; without
+/// it the checked-out branch does, and a detached HEAD counts as `main`.
 pub fn create_github_context(
     workflow: &WorkflowDefinition,
     workspace_dir: &Path,
+    event_name: Option<&str>,
+    branch: Option<&str>,
 ) -> HashMap<String, String> {
     let mut env = HashMap::new();
 
@@ -112,10 +119,21 @@ pub fn create_github_context(
     env.insert("GITHUB_WORKFLOW".to_string(), workflow.name.clone());
     env.insert("GITHUB_ACTION".to_string(), "run".to_string());
     env.insert("GITHUB_REPOSITORY".to_string(), get_repo_name());
-    env.insert("GITHUB_EVENT_NAME".to_string(), get_event_name(workflow));
+    env.insert(
+        "GITHUB_EVENT_NAME".to_string(),
+        event_name
+            .map(str::to_string)
+            .unwrap_or_else(|| get_event_name(workflow)),
+    );
     env.insert("GITHUB_WORKSPACE".to_string(), get_workspace_path());
     env.insert("GITHUB_SHA".to_string(), get_current_sha());
-    env.insert("GITHUB_REF".to_string(), get_current_ref());
+    env.insert(
+        "GITHUB_REF".to_string(),
+        match branch {
+            Some(branch) => format!("refs/heads/{}", branch),
+            None => get_current_ref(),
+        },
+    );
 
     // File paths for GitHub Actions
     env.insert(

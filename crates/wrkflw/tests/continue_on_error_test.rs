@@ -14,6 +14,8 @@ async fn run(yaml: &str) -> ExecutionResult {
     fs::write(&path, yaml).unwrap();
     let cfg = ExecutionConfig {
         acceleration: Default::default(),
+        event_name: None,
+        branch: None,
         runtime_type: RuntimeType::Emulation,
         verbose: false,
         preserve_containers_on_failure: false,

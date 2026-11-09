@@ -12,6 +12,8 @@ use wrkflw_lib::executor::engine::{
 fn emulation_cfg() -> ExecutionConfig {
     ExecutionConfig {
         acceleration: Default::default(),
+        event_name: None,
+        branch: None,
         runtime_type: RuntimeType::Emulation,
         verbose: false,
         preserve_containers_on_failure: false,

@@ -828,7 +828,7 @@ mod tests {
         assert!(
             combos
                 .iter()
-                .filter(|c| c.values.get("experimental").is_some())
+                .filter(|c| c.values.contains_key("experimental"))
                 .count()
                 == 1
         );

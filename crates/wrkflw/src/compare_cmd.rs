@@ -203,6 +203,12 @@ fn note_for(local: &Value, failures: &[Value]) -> Option<String> {
             runner["requested"].as_str().unwrap_or("?")
         ));
     }
+    for action in local["actions_not_run"].as_array().into_iter().flatten() {
+        notes.push(format!(
+            "{} was not run locally (no implementation in wrkflw), GitHub ran it",
+            action["uses"].as_str().unwrap_or("an action")
+        ));
+    }
     if let Some(original) = local["repeated_from"].as_str() {
         notes.push(format!(
             "not run locally: repeats {original} (pass --every-matrix-leg to run it)"
@@ -336,6 +342,11 @@ fn run_args(remote: &RemoteRun, path: &Path, runtime: &str) -> Vec<String> {
         "--intent".to_string(),
         format!("wrkflw compare with GitHub run {}", remote.id),
     ];
+    // The run's branch, so a detached checkout of its commit still fires
+    // `branches:` filters and sees the same `github.ref_name`.
+    if let Some(branch) = &remote.head_branch {
+        args.extend(["--branch".to_string(), branch.clone()]);
+    }
     if let Some(base) = &remote.base_branch {
         args.extend(["--base-branch".to_string(), base.clone()]);
         args.extend(["--diff-base".to_string(), format!("origin/{base}")]);
@@ -1102,6 +1113,7 @@ mod tests {
         };
         let args = run_args(&run, Path::new(".github/workflows/ci.yml"), "docker");
         assert!(args.windows(2).any(|w| w == ["--event", "pull_request"]));
+        assert!(args.windows(2).any(|w| w == ["--branch", "feat"]));
         assert!(args.windows(2).any(|w| w == ["--base-branch", "main"]));
         assert!(args.windows(2).any(|w| w == ["--diff-base", "origin/main"]));
     }

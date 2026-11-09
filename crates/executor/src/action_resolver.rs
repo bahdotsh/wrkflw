@@ -1,5 +1,7 @@
 use once_cell::sync::Lazy;
 use std::collections::{HashMap, VecDeque};
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 use tokio::sync::RwLock;
 
 /// Maximum number of entries in the action resolution cache.
@@ -100,11 +102,33 @@ static NO_REDIRECT_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
 
 const GITHUB_RAW_BASE_URL: &str = "https://raw.githubusercontent.com";
 
+/// Disables the on-disk action metadata cache when set to anything but `0`
+/// or the empty string.
+const NO_ACTION_CACHE_ENV: &str = "WRKFLW_NO_ACTION_CACHE";
+
+/// Overrides the directory the on-disk action metadata cache lives in.
+const ACTION_CACHE_DIR_ENV: &str = "WRKFLW_ACTION_CACHE_DIR";
+
 /// Fetch and parse `action.yml` (or `action.yaml`) from a remote GitHub repository.
 ///
 /// `sub_path` is the optional path within the repo (e.g., for `owner/repo/path@ref`,
 /// `sub_path` is `Some("path")`). When present, the action metadata is fetched from
 /// `{repo}/{version}/{sub_path}/action.yml` instead of `{repo}/{version}/action.yml`.
+///
+/// `action.yaml` is only tried when the server answered `404` for `action.yml`.
+/// A timeout, connection error or any other HTTP error is returned as is, so a
+/// slow network costs one timeout per action rather than two.
+///
+/// Successful resolutions are kept in memory for the life of the process. When
+/// `version` is a full 40-hex commit SHA — and therefore immutable — the raw
+/// action YAML is also persisted to disk and read back on later runs before
+/// anything is fetched. Floating refs such as `v4` or `main` are never written
+/// to disk because they move. The disk cache lives in
+/// `$WRKFLW_ACTION_CACHE_DIR`, or `<cache dir>/wrkflw/action-metadata/` where
+/// `<cache dir>` is `$XDG_CACHE_HOME` (or `~/.cache`) on Linux and
+/// `~/Library/Caches` on macOS. Set `WRKFLW_NO_ACTION_CACHE=1` to disable it.
+/// A missing, unreadable or corrupt cache file is ignored and the action is
+/// fetched again; the disk cache never fails a resolution.
 ///
 /// Returns `Ok(ResolvedAction)` on success, or `Err` if the action metadata cannot be
 /// fetched or parsed. Callers should fall back to hardcoded image mappings on error.
@@ -112,6 +136,29 @@ pub async fn resolve_remote_action(
     repo: &str,
     version: &str,
     sub_path: Option<&str>,
+) -> Result<ResolvedAction, String> {
+    let token = std::env::var("GITHUB_TOKEN").ok();
+    let disk_cache_dir = action_cache_dir();
+    resolve_with(
+        GITHUB_RAW_BASE_URL,
+        disk_cache_dir.as_deref(),
+        repo,
+        version,
+        sub_path,
+        token.as_deref(),
+    )
+    .await
+}
+
+/// [`resolve_remote_action`] with its environment made explicit, so tests can
+/// point it at a local server and a temporary cache directory.
+async fn resolve_with(
+    base_url: &str,
+    disk_cache_dir: Option<&Path>,
+    repo: &str,
+    version: &str,
+    sub_path: Option<&str>,
+    token: Option<&str>,
 ) -> Result<ResolvedAction, String> {
     let cache_key = match sub_path {
         Some(p) => format!("{}/{}@{}", repo, p, version),
@@ -126,35 +173,24 @@ pub async fn resolve_remote_action(
         }
     }
 
-    let token = std::env::var("GITHUB_TOKEN").ok();
+    // Only immutable refs are persisted: a SHA names one action.yml forever.
+    let disk_cache_file = disk_cache_dir
+        .filter(|_| is_full_sha(version))
+        .map(|dir| dir.join(disk_cache_file_name(repo, sub_path, version)));
 
-    // Try action.yml first, then action.yaml
-    let result = match fetch_and_parse(
-        GITHUB_RAW_BASE_URL,
-        repo,
-        version,
-        sub_path,
-        "action.yml",
-        token.as_deref(),
-    )
-    .await
+    let result = match disk_cache_file
+        .as_deref()
+        .and_then(read_disk_cache)
+        .and_then(|body| parse_action_definition(&body).ok())
     {
-        Ok(resolved) => Ok(resolved),
-        Err(yml_err) => fetch_and_parse(
-            GITHUB_RAW_BASE_URL,
-            repo,
-            version,
-            sub_path,
-            "action.yaml",
-            token.as_deref(),
-        )
-        .await
-        .map_err(|yaml_err| {
-            format!(
-                "Neither action.yml ({}) nor action.yaml ({}) could be resolved",
-                yml_err, yaml_err
-            )
-        }),
+        Some(resolved) => Ok(resolved),
+        None => {
+            let fetched = fetch_action_yaml(base_url, repo, version, sub_path, token).await;
+            if let (Ok(body), Some(path)) = (&fetched, disk_cache_file.as_deref()) {
+                write_disk_cache(path, body);
+            }
+            fetched.and_then(|body| parse_action_definition(&body))
+        }
     };
 
     // Only cache successful resolutions — transient failures should be retryable
@@ -166,14 +202,67 @@ pub async fn resolve_remote_action(
     result
 }
 
-async fn fetch_and_parse(
+/// Fetch the raw text of `action.yml`, falling back to `action.yaml` only when
+/// the server says `action.yml` does not exist.
+async fn fetch_action_yaml(
+    base_url: &str,
+    repo: &str,
+    version: &str,
+    sub_path: Option<&str>,
+    token: Option<&str>,
+) -> Result<String, String> {
+    match fetch_action_file(base_url, repo, version, sub_path, "action.yml", token).await {
+        Ok(body) => Ok(body),
+        Err(yml_err) if should_try_action_yaml(&yml_err) => {
+            fetch_action_file(base_url, repo, version, sub_path, "action.yaml", token)
+                .await
+                .map_err(|yaml_err| {
+                    format!(
+                        "Neither action.yml ({}) nor action.yaml ({}) could be resolved",
+                        yml_err, yaml_err
+                    )
+                })
+        }
+        Err(yml_err) => Err(yml_err.to_string()),
+    }
+}
+
+/// Why fetching one action metadata file failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FetchError {
+    /// The server answered `404`: the file does not exist at that path.
+    NotFound(String),
+    /// Anything else: timeout, connection error, non-404 HTTP status, unreadable body.
+    Other(String),
+}
+
+impl std::fmt::Display for FetchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FetchError::NotFound(msg) | FetchError::Other(msg) => f.write_str(msg),
+        }
+    }
+}
+
+/// Whether a failure on `action.yml` justifies asking for `action.yaml`.
+///
+/// Only a `404` does: the repository may simply use the other spelling. After
+/// a timeout or connection error the second request would most likely fail the
+/// same way and double the wait; after a `500` or `403` the spelling is not the
+/// problem.
+fn should_try_action_yaml(err: &FetchError) -> bool {
+    matches!(err, FetchError::NotFound(_))
+}
+
+/// Fetch the raw text of one action metadata file.
+async fn fetch_action_file(
     base_url: &str,
     repo: &str,
     version: &str,
     sub_path: Option<&str>,
     filename: &str,
     token: Option<&str>,
-) -> Result<ResolvedAction, String> {
+) -> Result<String, FetchError> {
     let url = match sub_path {
         Some(p) => format!("{}/{}/{}/{}/{}", base_url, repo, version, p, filename),
         None => format!("{}/{}/{}/{}", base_url, repo, version, filename),
@@ -184,58 +273,166 @@ async fn fetch_and_parse(
         .get(&url)
         .send()
         .await
-        .map_err(|e| format!("Failed to fetch {}: {}", url, e))?;
+        .map_err(|e| FetchError::Other(format!("Failed to fetch {}: {}", url, e)))?;
 
-    let response =
-        if response.status() == reqwest::StatusCode::NOT_FOUND {
-            // Retry with auth if token is available — the repo may be private.
-            // NO_REDIRECT_CLIENT prevents leaking the token to a non-GitHub host.
-            if let Some(token) = token {
-                let auth_response = NO_REDIRECT_CLIENT
-                    .get(&url)
-                    .header("Authorization", format!("token {}", token))
-                    .send()
-                    .await
-                    .map_err(|e| format!("Failed to fetch {}: {}", url, e))?;
+    let response = if response.status() == reqwest::StatusCode::NOT_FOUND {
+        // Retry with auth if token is available — the repo may be private.
+        // NO_REDIRECT_CLIENT prevents leaking the token to a non-GitHub host.
+        if let Some(token) = token {
+            let auth_response = NO_REDIRECT_CLIENT
+                .get(&url)
+                .header("Authorization", format!("token {}", token))
+                .send()
+                .await
+                .map_err(|e| FetchError::Other(format!("Failed to fetch {}: {}", url, e)))?;
 
-                // The no-redirect policy prevents token leakage, but the server may
-                // legitimately redirect (CDN routing). If we get a 3xx, follow it
-                // without the auth header to avoid leaking the token.
-                if auth_response.status().is_redirection() {
-                    if let Some(location) = auth_response.headers().get(reqwest::header::LOCATION) {
-                        let redirect_url = location
-                            .to_str()
-                            .map_err(|_| "Invalid redirect URL encoding".to_string())?;
-                        HTTP_CLIENT.get(redirect_url).send().await.map_err(|e| {
-                            format!("Failed to follow redirect {}: {}", redirect_url, e)
-                        })?
-                    } else {
-                        return Err(format!(
-                            "HTTP {} (redirect with no Location header) fetching {}",
-                            auth_response.status(),
-                            url
-                        ));
-                    }
+            // The no-redirect policy prevents token leakage, but the server may
+            // legitimately redirect (CDN routing). If we get a 3xx, follow it
+            // without the auth header to avoid leaking the token.
+            if auth_response.status().is_redirection() {
+                if let Some(location) = auth_response.headers().get(reqwest::header::LOCATION) {
+                    let redirect_url = location.to_str().map_err(|_| {
+                        FetchError::Other("Invalid redirect URL encoding".to_string())
+                    })?;
+                    HTTP_CLIENT.get(redirect_url).send().await.map_err(|e| {
+                        FetchError::Other(format!(
+                            "Failed to follow redirect {}: {}",
+                            redirect_url, e
+                        ))
+                    })?
                 } else {
-                    auth_response
+                    return Err(FetchError::Other(format!(
+                        "HTTP {} (redirect with no Location header) fetching {}",
+                        auth_response.status(),
+                        url
+                    )));
                 }
             } else {
-                response
+                auth_response
             }
         } else {
             response
-        };
+        }
+    } else {
+        response
+    };
 
-    if !response.status().is_success() {
-        return Err(format!("HTTP {} fetching {}", response.status(), url));
+    let status = response.status();
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return Err(FetchError::NotFound(format!(
+            "HTTP {} fetching {}",
+            status, url
+        )));
+    }
+    if !status.is_success() {
+        return Err(FetchError::Other(format!(
+            "HTTP {} fetching {}",
+            status, url
+        )));
     }
 
-    let body = response
+    response
         .text()
         .await
-        .map_err(|e| format!("Failed to read response body: {}", e))?;
+        .map_err(|e| FetchError::Other(format!("Failed to read response body: {}", e)))
+}
 
-    parse_action_definition(&body)
+/// Whether `version` is a full 40-hex commit SHA, the only kind of ref whose
+/// `action.yml` can never change.
+fn is_full_sha(version: &str) -> bool {
+    version.len() == 40 && version.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// The directory the on-disk action metadata cache lives in, or `None` when
+/// it is disabled or no cache directory can be found.
+fn action_cache_dir() -> Option<PathBuf> {
+    action_cache_dir_from(
+        std::env::var_os(NO_ACTION_CACHE_ENV),
+        std::env::var_os(ACTION_CACHE_DIR_ENV),
+        dirs::cache_dir(),
+    )
+}
+
+/// [`action_cache_dir`] on explicit inputs: the value of `WRKFLW_NO_ACTION_CACHE`,
+/// the value of `WRKFLW_ACTION_CACHE_DIR`, and the platform cache directory.
+fn action_cache_dir_from(
+    no_cache: Option<OsString>,
+    override_dir: Option<OsString>,
+    platform_cache_dir: Option<PathBuf>,
+) -> Option<PathBuf> {
+    if no_cache.is_some_and(|v| !v.is_empty() && v != "0") {
+        return None;
+    }
+    if let Some(dir) = override_dir.filter(|d| !d.is_empty()) {
+        return Some(PathBuf::from(dir));
+    }
+    platform_cache_dir.map(|d| d.join("wrkflw").join("action-metadata"))
+}
+
+/// The cache file name for one action at one commit.
+///
+/// A readable, sanitized prefix is kept for debugging; uniqueness comes from the
+/// SHA-256 of the three parts, so no input can escape the cache directory or
+/// collide with another action.
+fn disk_cache_file_name(repo: &str, sub_path: Option<&str>, version: &str) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(repo.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(sub_path.unwrap_or("").as_bytes());
+    hasher.update(b"\n");
+    hasher.update(version.as_bytes());
+    let digest: String = hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect();
+
+    let readable: String = repo
+        .chars()
+        .chain(
+            sub_path
+                .into_iter()
+                .flat_map(|p| "/".chars().chain(p.chars())),
+        )
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(64)
+        .collect();
+
+    format!("{}-{}.yml", readable, digest)
+}
+
+/// The cached action YAML at `path`, or `None` if there is none or it cannot be read.
+fn read_disk_cache(path: &Path) -> Option<String> {
+    std::fs::read_to_string(path)
+        .ok()
+        .filter(|body| !body.trim().is_empty())
+}
+
+/// Persist `body` at `path`. Written to a temporary file in the same directory
+/// and renamed into place, so a concurrent reader never sees a partial file.
+/// Failures are ignored: the cache is an optimization, not a requirement.
+fn write_disk_cache(path: &Path, body: &str) {
+    let Some(dir) = path.parent() else {
+        return;
+    };
+    if std::fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    let Ok(mut file) = tempfile::NamedTempFile::new_in(dir) else {
+        return;
+    };
+    if std::io::Write::write_all(&mut file, body.as_bytes()).is_err() {
+        return;
+    }
+    let _ = file.persist(path);
 }
 
 /// Parse an action.yml body and extract the action type from the `runs` section.
@@ -553,9 +750,138 @@ runs:
         }
     }
 
-    /// Tests for `fetch_and_parse` HTTP behavior using wiremock.
+    #[test]
+    fn full_sha_is_detected() {
+        assert!(is_full_sha("11bd71901bbe5b1630ceea73d27597364c9af683"));
+        assert!(is_full_sha("11BD71901BBE5B1630CEEA73D27597364C9AF683"));
+        assert!(!is_full_sha("v4"));
+        assert!(!is_full_sha("main"));
+        assert!(!is_full_sha("11bd719"));
+        assert!(!is_full_sha("11bd71901bbe5b1630ceea73d27597364c9af68g"));
+        assert!(!is_full_sha("11bd71901bbe5b1630ceea73d27597364c9af6833"));
+    }
+
+    #[test]
+    fn disk_cache_file_name_is_a_single_safe_component() {
+        let name = disk_cache_file_name(
+            "actions/checkout",
+            Some("../../etc"),
+            "11bd71901bbe5b1630ceea73d27597364c9af683",
+        );
+        assert!(!name.contains('/'), "{name}");
+        assert!(!name.contains('\\'), "{name}");
+        assert!(!name.contains(".."), "{name}");
+        assert!(name.starts_with("actions_checkout_______etc-"), "{name}");
+        assert!(name.ends_with(".yml"), "{name}");
+        assert!(name.len() < 200, "{name}");
+    }
+
+    #[test]
+    fn disk_cache_file_name_distinguishes_every_part() {
+        let sha_a = "11bd71901bbe5b1630ceea73d27597364c9af683";
+        let sha_b = "0000000000000000000000000000000000000000";
+        let base = disk_cache_file_name("owner/repo", None, sha_a);
+        assert_eq!(base, disk_cache_file_name("owner/repo", None, sha_a));
+        assert_ne!(base, disk_cache_file_name("owner/repo", Some("sub"), sha_a));
+        assert_ne!(base, disk_cache_file_name("owner/repo", None, sha_b));
+        assert_ne!(base, disk_cache_file_name("owner/other", None, sha_a));
+        // Sanitization must not make distinct inputs collide.
+        assert_ne!(
+            disk_cache_file_name("owner/repo", Some("a/b"), sha_a),
+            disk_cache_file_name("owner/repo", Some("a_b"), sha_a)
+        );
+    }
+
+    #[test]
+    fn disk_cache_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("entry.yml");
+
+        assert_eq!(read_disk_cache(&path), None);
+
+        write_disk_cache(&path, "name: x\nruns:\n  using: node20\n");
+        assert_eq!(
+            read_disk_cache(&path).as_deref(),
+            Some("name: x\nruns:\n  using: node20\n")
+        );
+
+        // No stray temporary files are left next to the entry.
+        let entries: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, vec![std::ffi::OsString::from("entry.yml")]);
+    }
+
+    #[test]
+    fn disk_cache_ignores_empty_and_unreadable_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let empty = dir.path().join("empty.yml");
+        std::fs::write(&empty, "   \n").unwrap();
+        assert_eq!(read_disk_cache(&empty), None);
+
+        // A directory where a file is expected cannot be read.
+        let as_dir = dir.path().join("dir.yml");
+        std::fs::create_dir(&as_dir).unwrap();
+        assert_eq!(read_disk_cache(&as_dir), None);
+
+        // Writing into an unwritable location does not panic.
+        write_disk_cache(&as_dir.join("x").join("y.yml"), "body");
+        write_disk_cache(Path::new(""), "body");
+    }
+
+    #[test]
+    fn action_cache_dir_resolution() {
+        let platform = Some(PathBuf::from("/cache"));
+        let expected = PathBuf::from("/cache/wrkflw/action-metadata");
+
+        assert_eq!(
+            action_cache_dir_from(None, None, platform.clone()),
+            Some(expected.clone())
+        );
+        assert_eq!(
+            action_cache_dir_from(Some("".into()), None, platform.clone()),
+            Some(expected.clone())
+        );
+        assert_eq!(
+            action_cache_dir_from(Some("0".into()), None, platform.clone()),
+            Some(expected)
+        );
+        assert_eq!(
+            action_cache_dir_from(Some("1".into()), None, platform.clone()),
+            None
+        );
+        assert_eq!(
+            action_cache_dir_from(Some("true".into()), Some("/x".into()), platform.clone()),
+            None
+        );
+        assert_eq!(
+            action_cache_dir_from(None, Some("/custom".into()), platform.clone()),
+            Some(PathBuf::from("/custom"))
+        );
+        assert_eq!(action_cache_dir_from(None, None, None), None);
+    }
+
+    #[test]
+    fn only_not_found_falls_back_to_action_yaml() {
+        assert!(should_try_action_yaml(&FetchError::NotFound(
+            "HTTP 404 Not Found fetching x".into()
+        )));
+        assert!(!should_try_action_yaml(&FetchError::Other(
+            "Failed to fetch x: operation timed out".into()
+        )));
+        assert!(!should_try_action_yaml(&FetchError::Other(
+            "HTTP 500 Internal Server Error fetching x".into()
+        )));
+        assert!(!should_try_action_yaml(&FetchError::Other(
+            "HTTP 403 Forbidden fetching x".into()
+        )));
+    }
+
+    /// Tests for `fetch_action_file` and `resolve_with` HTTP behavior using wiremock.
     ///
-    /// Token is passed as a parameter to `fetch_and_parse`, so no env mutation is needed.
+    /// Token is passed as a parameter, so no env mutation is needed. Each test
+    /// uses its own repository name because the in-memory cache is process-wide.
     mod fetch_tests {
         use super::super::*;
         use wiremock::matchers::{header_exists, method, path};
@@ -563,6 +889,18 @@ runs:
 
         const ACTION_YML_BODY: &str =
             "name: Test Action\nruns:\n  using: 'node20'\n  main: 'index.js'\n";
+        const COMPOSITE_BODY: &str = "name: Composite\nruns:\n  using: 'composite'\n  steps: []\n";
+        const SHA: &str = "11bd71901bbe5b1630ceea73d27597364c9af683";
+
+        async fn requests_to(server: &MockServer, request_path: &str) -> usize {
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|r| r.url.path() == request_path)
+                .count()
+        }
 
         #[tokio::test]
         async fn fetch_success_parses_action_yml() {
@@ -574,10 +912,12 @@ runs:
                 .mount(&server)
                 .await;
 
-            let result =
-                fetch_and_parse(&server.uri(), "owner/repo", "v1", None, "action.yml", None).await;
+            let body =
+                fetch_action_file(&server.uri(), "owner/repo", "v1", None, "action.yml", None)
+                    .await
+                    .unwrap();
 
-            let resolved = result.unwrap();
+            let resolved = parse_action_definition(&body).unwrap();
             match resolved.action_type {
                 ActionType::Node { version } => assert_eq!(version, 20),
                 other => panic!("Expected Node action, got {:?}", other),
@@ -594,7 +934,7 @@ runs:
                 .mount(&server)
                 .await;
 
-            let result = fetch_and_parse(
+            let body = fetch_action_file(
                 &server.uri(),
                 "owner/repo",
                 "v1",
@@ -602,17 +942,14 @@ runs:
                 "action.yml",
                 None,
             )
-            .await;
+            .await
+            .unwrap();
 
-            let resolved = result.unwrap();
-            assert!(matches!(
-                resolved.action_type,
-                ActionType::Node { version: 20 }
-            ));
+            assert_eq!(body, ACTION_YML_BODY);
         }
 
         #[tokio::test]
-        async fn fetch_404_without_token_returns_error() {
+        async fn fetch_404_without_token_is_not_found() {
             let server = MockServer::start().await;
 
             Mock::given(method("GET"))
@@ -621,15 +958,289 @@ runs:
                 .mount(&server)
                 .await;
 
-            let result =
-                fetch_and_parse(&server.uri(), "owner/repo", "v1", None, "action.yml", None).await;
+            let err =
+                fetch_action_file(&server.uri(), "owner/repo", "v1", None, "action.yml", None)
+                    .await
+                    .unwrap_err();
 
-            assert!(result.is_err());
-            assert!(
-                result.as_ref().unwrap_err().contains("404"),
-                "Expected 404 in error, got: {}",
-                result.unwrap_err()
+            assert!(matches!(err, FetchError::NotFound(_)), "{err:?}");
+            assert!(err.to_string().contains("404"), "{err}");
+        }
+
+        #[tokio::test]
+        async fn fetch_500_is_other() {
+            let server = MockServer::start().await;
+
+            Mock::given(method("GET"))
+                .and(path("/owner/repo/v1/action.yml"))
+                .respond_with(ResponseTemplate::new(500))
+                .mount(&server)
+                .await;
+
+            let err =
+                fetch_action_file(&server.uri(), "owner/repo", "v1", None, "action.yml", None)
+                    .await
+                    .unwrap_err();
+
+            assert!(matches!(err, FetchError::Other(_)), "{err:?}");
+            assert!(err.to_string().contains("500"), "{err}");
+        }
+
+        #[tokio::test]
+        async fn fetch_connection_error_is_other() {
+            // Bind and immediately drop a listener so the port refuses connections.
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            drop(listener);
+
+            let err = fetch_action_file(
+                &format!("http://{}", addr),
+                "owner/repo",
+                "v1",
+                None,
+                "action.yml",
+                None,
+            )
+            .await
+            .unwrap_err();
+
+            assert!(matches!(err, FetchError::Other(_)), "{err:?}");
+            assert!(!should_try_action_yaml(&err));
+        }
+
+        #[tokio::test]
+        async fn resolve_falls_back_to_action_yaml_on_404() {
+            let server = MockServer::start().await;
+
+            Mock::given(method("GET"))
+                .and(path("/fallback/yaml/v1/action.yml"))
+                .respond_with(ResponseTemplate::new(404))
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/fallback/yaml/v1/action.yaml"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(COMPOSITE_BODY))
+                .mount(&server)
+                .await;
+
+            let resolved = resolve_with(&server.uri(), None, "fallback/yaml", "v1", None, None)
+                .await
+                .unwrap();
+
+            assert!(matches!(resolved.action_type, ActionType::Composite));
+            assert_eq!(
+                requests_to(&server, "/fallback/yaml/v1/action.yml").await,
+                1
             );
+            assert_eq!(
+                requests_to(&server, "/fallback/yaml/v1/action.yaml").await,
+                1
+            );
+        }
+
+        #[tokio::test]
+        async fn resolve_does_not_try_action_yaml_after_server_error() {
+            let server = MockServer::start().await;
+
+            Mock::given(method("GET"))
+                .and(path("/fallback/error/v1/action.yml"))
+                .respond_with(ResponseTemplate::new(500))
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/fallback/error/v1/action.yaml"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(COMPOSITE_BODY))
+                .mount(&server)
+                .await;
+
+            let err = resolve_with(&server.uri(), None, "fallback/error", "v1", None, None)
+                .await
+                .unwrap_err();
+
+            assert!(err.contains("500"), "{err}");
+            assert!(!err.contains("action.yaml"), "{err}");
+            assert_eq!(
+                requests_to(&server, "/fallback/error/v1/action.yml").await,
+                1
+            );
+            assert_eq!(
+                requests_to(&server, "/fallback/error/v1/action.yaml").await,
+                0
+            );
+        }
+
+        #[tokio::test]
+        async fn resolve_reports_both_when_neither_spelling_exists() {
+            let server = MockServer::start().await;
+
+            Mock::given(method("GET"))
+                .respond_with(ResponseTemplate::new(404))
+                .mount(&server)
+                .await;
+
+            let err = resolve_with(&server.uri(), None, "fallback/none", "v1", None, None)
+                .await
+                .unwrap_err();
+
+            assert!(err.contains("Neither action.yml"), "{err}");
+            assert!(err.contains("action.yaml"), "{err}");
+        }
+
+        #[tokio::test]
+        async fn resolve_persists_sha_pinned_action_to_disk() {
+            let server = MockServer::start().await;
+            let dir = tempfile::tempdir().unwrap();
+
+            Mock::given(method("GET"))
+                .and(path(format!("/disk/persist/{SHA}/action.yml")))
+                .respond_with(ResponseTemplate::new(200).set_body_string(ACTION_YML_BODY))
+                .mount(&server)
+                .await;
+
+            let resolved = resolve_with(
+                &server.uri(),
+                Some(dir.path()),
+                "disk/persist",
+                SHA,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            assert!(matches!(
+                resolved.action_type,
+                ActionType::Node { version: 20 }
+            ));
+
+            let file = dir
+                .path()
+                .join(disk_cache_file_name("disk/persist", None, SHA));
+            assert_eq!(
+                std::fs::read_to_string(&file).unwrap(),
+                ACTION_YML_BODY,
+                "raw body is stored verbatim"
+            );
+        }
+
+        #[tokio::test]
+        async fn resolve_does_not_persist_floating_refs() {
+            let server = MockServer::start().await;
+            let dir = tempfile::tempdir().unwrap();
+
+            Mock::given(method("GET"))
+                .and(path("/disk/floating/v4/action.yml"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(ACTION_YML_BODY))
+                .mount(&server)
+                .await;
+
+            resolve_with(
+                &server.uri(),
+                Some(dir.path()),
+                "disk/floating",
+                "v4",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(
+                std::fs::read_dir(dir.path()).unwrap().count(),
+                0,
+                "floating refs must not be written to disk"
+            );
+        }
+
+        #[tokio::test]
+        async fn resolve_reads_sha_pinned_action_from_disk_without_fetching() {
+            let server = MockServer::start().await;
+            let dir = tempfile::tempdir().unwrap();
+
+            // The server would answer, but it must never be asked.
+            Mock::given(method("GET"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(ACTION_YML_BODY))
+                .mount(&server)
+                .await;
+
+            let file = dir
+                .path()
+                .join(disk_cache_file_name("disk/hit", Some("sub"), SHA));
+            std::fs::write(&file, COMPOSITE_BODY).unwrap();
+
+            let resolved = resolve_with(
+                &server.uri(),
+                Some(dir.path()),
+                "disk/hit",
+                SHA,
+                Some("sub"),
+                None,
+            )
+            .await
+            .unwrap();
+
+            assert!(matches!(resolved.action_type, ActionType::Composite));
+            assert_eq!(server.received_requests().await.unwrap().len(), 0);
+        }
+
+        #[tokio::test]
+        async fn resolve_ignores_corrupt_disk_cache_and_refetches() {
+            let server = MockServer::start().await;
+            let dir = tempfile::tempdir().unwrap();
+
+            Mock::given(method("GET"))
+                .and(path(format!("/disk/corrupt/{SHA}/action.yml")))
+                .respond_with(ResponseTemplate::new(200).set_body_string(ACTION_YML_BODY))
+                .mount(&server)
+                .await;
+
+            let file = dir
+                .path()
+                .join(disk_cache_file_name("disk/corrupt", None, SHA));
+            std::fs::write(&file, "runs: [not: valid").unwrap();
+
+            let resolved = resolve_with(
+                &server.uri(),
+                Some(dir.path()),
+                "disk/corrupt",
+                SHA,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+            assert!(matches!(
+                resolved.action_type,
+                ActionType::Node { version: 20 }
+            ));
+            assert_eq!(
+                requests_to(&server, &format!("/disk/corrupt/{SHA}/action.yml")).await,
+                1
+            );
+            assert_eq!(
+                std::fs::read_to_string(&file).unwrap(),
+                ACTION_YML_BODY,
+                "the corrupt entry is replaced by the fetched body"
+            );
+        }
+
+        #[tokio::test]
+        async fn resolve_without_disk_cache_dir_only_fetches() {
+            let server = MockServer::start().await;
+
+            Mock::given(method("GET"))
+                .and(path(format!("/disk/disabled/{SHA}/action.yml")))
+                .respond_with(ResponseTemplate::new(200).set_body_string(ACTION_YML_BODY))
+                .mount(&server)
+                .await;
+
+            let resolved = resolve_with(&server.uri(), None, "disk/disabled", SHA, None, None)
+                .await
+                .unwrap();
+            assert!(matches!(
+                resolved.action_type,
+                ActionType::Node { version: 20 }
+            ));
         }
 
         /// Verifies the security-critical property: when the auth request gets a
@@ -667,7 +1278,7 @@ runs:
                 .mount(&server)
                 .await;
 
-            let result = fetch_and_parse(
+            let body = fetch_action_file(
                 &server.uri(),
                 "owner/repo",
                 "v1",
@@ -675,14 +1286,11 @@ runs:
                 "action.yml",
                 Some("ghp_test_token_for_redirect_test"),
             )
-            .await;
+            .await
+            .unwrap();
 
             // The resolution should succeed via the redirect path
-            let resolved = result.unwrap();
-            assert!(matches!(
-                resolved.action_type,
-                ActionType::Node { version: 20 }
-            ));
+            assert_eq!(body, ACTION_YML_BODY);
 
             // Verify the redirect request did NOT include the Authorization header.
             // This is the core security invariant: tokens must not leak to redirect targets.
@@ -721,7 +1329,7 @@ runs:
                 .mount(&server)
                 .await;
 
-            let result = fetch_and_parse(
+            let body = fetch_action_file(
                 &server.uri(),
                 "owner/repo",
                 "v1",
@@ -729,13 +1337,35 @@ runs:
                 "action.yml",
                 Some("ghp_test_token_for_auth_test"),
             )
-            .await;
+            .await
+            .unwrap();
 
-            let resolved = result.unwrap();
-            assert!(matches!(
-                resolved.action_type,
-                ActionType::Node { version: 20 }
-            ));
+            assert_eq!(body, ACTION_YML_BODY);
+        }
+
+        #[tokio::test]
+        async fn auth_retry_404_is_still_not_found() {
+            let server = MockServer::start().await;
+
+            Mock::given(method("GET"))
+                .and(path("/owner/repo/v1/action.yml"))
+                .respond_with(ResponseTemplate::new(404))
+                .mount(&server)
+                .await;
+
+            let err = fetch_action_file(
+                &server.uri(),
+                "owner/repo",
+                "v1",
+                None,
+                "action.yml",
+                Some("ghp_test_token_for_404_test"),
+            )
+            .await
+            .unwrap_err();
+
+            assert!(matches!(err, FetchError::NotFound(_)), "{err:?}");
+            assert_eq!(requests_to(&server, "/owner/repo/v1/action.yml").await, 2);
         }
     }
 }

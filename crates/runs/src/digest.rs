@@ -207,7 +207,8 @@ fn output_start<S: AsRef<str>>(lines: &[S]) -> usize {
 
 /// Up to [`MAX_ERROR_LINES`] of the lines above the last `tail_lines` that
 /// mention an error. A word in the script is not evidence, so only what the
-/// step printed counts.
+/// step printed counts, and a line that reports a pass, such as a test whose
+/// name says `Error:`, isn't one either.
 fn error_lines(text: &str, tail_lines: usize) -> Vec<String> {
     let all: Vec<&str> = text.lines().collect();
     let tail_start = all.len().saturating_sub(tail_lines);
@@ -215,7 +216,7 @@ fn error_lines(text: &str, tail_lines: usize) -> Vec<String> {
     let found: Vec<String> = above_tail
         .iter()
         .map(|line| strip_ansi(line))
-        .filter(|line| !is_output_header(line) && is_error_line(line))
+        .filter(|line| !is_output_header(line) && is_error_line(line) && !PASSING.is_match(line))
         .collect();
     found[found.len().saturating_sub(MAX_ERROR_LINES)..].to_vec()
 }
@@ -546,6 +547,21 @@ mod tests {
         let text = "Exit code: 1\nCommand: x\n\nStandard Output:\nout\n\
                     Standard Error:\nerror: the cause\nnoise\nmore\n";
         assert_eq!(error_lines(text, 2), ["error: the cause"]);
+    }
+
+    #[test]
+    fn a_passing_test_named_after_an_error_is_not_an_error_line() {
+        let text = "Exit code: 1\nCommand: pytest\n\nStandard Output:\n\
+                    tests/test_options.py::test_bad[Error: Invalid value] PASSED [ 35%]\n\
+                    tests/test_echo.py::test_pager FAILED [ 80%]\n\
+                    FAILED tests/test_echo.py::test_pager - AssertionError\nnoise\nmore\n";
+        assert_eq!(
+            error_lines(text, 2),
+            [
+                "tests/test_echo.py::test_pager FAILED [ 80%]",
+                "FAILED tests/test_echo.py::test_pager - AssertionError"
+            ]
+        );
     }
 
     #[test]

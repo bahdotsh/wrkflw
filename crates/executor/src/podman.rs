@@ -704,6 +704,21 @@ impl ContainerRuntime for PodmanRuntime {
             })?;
         Ok(output.success())
     }
+
+    async fn image_id(&self, image: &str) -> Option<String> {
+        let output = Command::new("podman")
+            .args(["image", "inspect", "--format", "{{.Id}}", image])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .await
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        (!id.is_empty()).then_some(id)
+    }
 }
 
 /// The PATH `image` sets in its config, pulling the image first if it isn't

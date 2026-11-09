@@ -150,6 +150,8 @@ struct JobStory<'a> {
     finished: Option<&'a TimelineEntry>,
     /// The OS it asked for and the one it ran as, when they differ.
     runner: Option<(&'a str, &'a str)>,
+    /// Steps that passed without running their action: step name and `uses`.
+    not_run: Vec<(&'a str, &'a str)>,
 }
 
 fn group_by_job(timeline: &[TimelineEntry]) -> Vec<JobStory<'_>> {
@@ -159,7 +161,8 @@ fn group_by_job(timeline: &[TimelineEntry]) -> Vec<JobStory<'_>> {
             TimelineEntry::JobStarted { job, .. }
             | TimelineEntry::StepFinished { job, .. }
             | TimelineEntry::JobFinished { job, .. }
-            | TimelineEntry::RunnerSubstituted { job, .. } => job.as_str(),
+            | TimelineEntry::RunnerSubstituted { job, .. }
+            | TimelineEntry::ActionNotRun { job, .. } => job.as_str(),
         };
         let at = match jobs.iter().position(|j| j.name == name) {
             Some(at) => at,
@@ -169,6 +172,7 @@ fn group_by_job(timeline: &[TimelineEntry]) -> Vec<JobStory<'_>> {
                     steps: Vec::new(),
                     finished: None,
                     runner: None,
+                    not_run: Vec::new(),
                 });
                 jobs.len() - 1
             }
@@ -179,6 +183,9 @@ fn group_by_job(timeline: &[TimelineEntry]) -> Vec<JobStory<'_>> {
             TimelineEntry::RunnerSubstituted {
                 requested, ran_as, ..
             } => jobs[at].runner = Some((requested.as_str(), ran_as.as_str())),
+            TimelineEntry::ActionNotRun { step, uses, .. } => {
+                jobs[at].not_run.push((step.as_str(), uses.as_str()))
+            }
             TimelineEntry::JobStarted { .. } => {}
         }
     }
@@ -285,6 +292,14 @@ pub(crate) fn story_lines(
             };
             let (g, st) = theme::step_status(status);
             let mut right = Vec::new();
+            // The step passed, but its action never ran: a pass that proves
+            // nothing is shown as such next to the step.
+            if job.not_run.iter().any(|(name, _)| name == step) {
+                right.push(Span::styled(
+                    format!("{} action not run  ", theme::symbols::WARNING),
+                    Style::default().fg(COLORS.warning),
+                ));
+            }
             if let Some(code) = exit_code.filter(|c| *c != 0) {
                 right.push(Span::styled(
                     format!("exit {code}  "),
@@ -484,6 +499,40 @@ mod tests {
         for line in &lines {
             assert!(text::width(line) <= 60, "{line:?} overflows");
         }
+    }
+
+    #[test]
+    fn a_step_whose_action_did_not_run_says_so_on_its_line() {
+        let timeline = vec![
+            TimelineEntry::JobStarted {
+                job: "tests".into(),
+                canonical_name: "tests".into(),
+            },
+            TimelineEntry::ActionNotRun {
+                job: "tests".into(),
+                step: "astral-sh/setup-uv@v9".into(),
+                uses: "astral-sh/setup-uv@v9".into(),
+            },
+            TimelineEntry::StepFinished {
+                job: "tests".into(),
+                step: "astral-sh/setup-uv@v9".into(),
+                status: StepStatus::Success,
+                exit_code: Some(0),
+                duration_ms: 10,
+                tail: Vec::new(),
+            },
+            TimelineEntry::StepFinished {
+                job: "tests".into(),
+                step: "pytest".into(),
+                status: StepStatus::Success,
+                exit_code: Some(0),
+                duration_ms: 10,
+                tail: Vec::new(),
+            },
+        ];
+        let lines = text_of(&story_lines(&timeline, None, 80, 0, false));
+        assert!(lines[1].contains("action not run"), "{lines:?}");
+        assert!(!lines[2].contains("action not run"), "{lines:?}");
     }
 
     #[test]

@@ -1187,7 +1187,10 @@ fn save_kept(file: Option<&Path>, kept: &HashSet<PathBuf>) {
 }
 
 /// Refuse to write `rel` when a directory above it on the host is a link,
-/// so nothing the volume holds lands outside the workspace.
+/// so nothing the volume holds lands outside the workspace, or is a file,
+/// which no later step makes room for. The OS error for a file parent isn't
+/// the same everywhere (Windows says the path wasn't found), so it is
+/// decided here rather than from the failed write.
 fn refuse_link_parents(host: &Path, rel: &Path) -> io::Result<()> {
     let mut dir = host.to_path_buf();
     let parents = rel.parent().into_iter().flat_map(|p| p.components());
@@ -1197,6 +1200,12 @@ fn refuse_link_parents(host: &Path, rel: &Path) -> io::Result<()> {
             Ok(meta) if meta.file_type().is_symlink() => {
                 return Err(io::Error::other(format!(
                     "{} is a link on the host",
+                    dir.display()
+                )))
+            }
+            Ok(meta) if !meta.is_dir() => {
+                return Err(io::Error::other(format!(
+                    "{} is a file on the host",
                     dir.display()
                 )))
             }

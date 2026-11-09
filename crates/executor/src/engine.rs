@@ -1767,9 +1767,7 @@ async fn execute_native_docker_step(
             entrypoint.as_deref(),
         )
         .await;
-    if let Some(vm) = &vm_workspace {
-        vm.after_step().await.map_err(ExecutionError::Runtime)?;
-    }
+    sync_workspace_back(vm_workspace.as_ref(), &output).await?;
     let output = output.map_err(|e| ExecutionError::Runtime(format!("{}", e)))?;
 
     Ok(StepResult::new(
@@ -1785,6 +1783,34 @@ async fn execute_native_docker_step(
         ),
     )
     .with_exit_code(output.exit_code))
+}
+
+/// Copy the workspace back after a step. A failed copy fails the step only
+/// when the step passed: a failed step's own exit code and output are what
+/// the user needs, so the copy's failure is a warning beside them.
+async fn sync_workspace_back(
+    vm: Option<&Arc<crate::vm_workspace::VmWorkspace>>,
+    ran: &Result<
+        wrkflw_runtime::container::ContainerOutput,
+        wrkflw_runtime::container::ContainerError,
+    >,
+) -> Result<(), ExecutionError> {
+    let Some(vm) = vm else {
+        return Ok(());
+    };
+    match vm.after_step().await {
+        Err(e) if matches!(ran, Ok(output) if output.exit_code == 0) => {
+            Err(ExecutionError::Runtime(e))
+        }
+        Err(e) => {
+            wrkflw_logging::warning(&format!(
+                "The step failed, and copying the workspace back after it failed too: {}",
+                e
+            ));
+            Ok(())
+        }
+        Ok(()) => Ok(()),
+    }
 }
 
 /// Sanitize a sub-path component from an action reference (e.g. `owner/repo/sub/path`).
@@ -5319,9 +5345,7 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                             None,
                         )
                         .await;
-                    if let Some(vm) = &vm_workspace {
-                        vm.after_step().await.map_err(ExecutionError::Runtime)?;
-                    }
+                    sync_workspace_back(vm_workspace.as_ref(), &output).await?;
                     let output = output.map_err(|e| ExecutionError::Runtime(format!("{}", e)))?;
 
                     // Build verbose output for GitHub actions when applicable
@@ -5618,9 +5642,7 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                 message,
             )),
         };
-        if let Some(vm) = &vm_workspace {
-            vm.after_step().await.map_err(ExecutionError::Runtime)?;
-        }
+        sync_workspace_back(vm_workspace.as_ref(), &run_result).await?;
 
         drop(custom_shell_script);
 

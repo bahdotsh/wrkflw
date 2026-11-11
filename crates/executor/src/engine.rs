@@ -1256,6 +1256,31 @@ impl JobResult {
         self
     }
 
+    /// A job wrkflw couldn't set up, as when its image doesn't build: it
+    /// fails with no step, and `error` as its log, after telling the run's
+    /// observers so. The run's record then holds a failed job whose log
+    /// names the setup error, which the failure digest reports as
+    /// `setup_failed`, instead of a run that stopped with no job to show.
+    fn setup_failed(
+        name: impl Into<String>,
+        canonical_name: impl Into<String>,
+        error: &ExecutionError,
+    ) -> Self {
+        let logs = error.to_string();
+        wrkflw_logging::error(&logs);
+        JobResult {
+            name: name.into(),
+            canonical_name: canonical_name.into(),
+            status: JobStatus::Failure,
+            steps: Vec::new(),
+            logs,
+            outputs: HashMap::new(),
+            failure_allowed: false,
+            repeated_from: None,
+        }
+        .announced()
+    }
+
     /// A job that failed before any of its steps ran. The reason is carried on a
     /// failed step because failure summaries are built from failed steps.
     fn failed_before_steps(
@@ -3069,14 +3094,18 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
 
     // Execute job steps
     // Determine runner image: prefer job container, then detect setup actions, fall back to runs-on
-    let runner_image_value = resolve_runner_image(
+    let runner_image_value = match resolve_runner_image(
         job,
         &job.steps,
         ctx.runtime,
         ctx.services.platform_overrides,
         None,
     )
-    .await?;
+    .await
+    {
+        Ok(image) => image,
+        Err(e) => return Ok(JobResult::setup_failed(ctx.job_name, ctx.job_name, &e)),
+    };
 
     // GHA default job timeout is 360 minutes; sanitize to avoid panic on negative/NaN
     let timeout_mins = sanitize_timeout_minutes(job.timeout_minutes, 360.0);
@@ -3499,14 +3528,18 @@ async fn execute_matrix_job(
     } else {
         // Execute each step
         // Determine runner image: prefer job container, then detect setup actions, fall back to runs-on
-        let runner_image_value = resolve_runner_image(
+        let runner_image_value = match resolve_runner_image(
             job_template,
             &materialized_steps,
             runtime,
             services.platform_overrides,
             Some(&combination.values),
         )
-        .await?;
+        .await
+        {
+            Ok(image) => image,
+            Err(e) => return Ok(JobResult::setup_failed(&matrix_job_name, job_name, &e)),
+        };
 
         let mut all_steps_ok = true;
         let timeout_mins = sanitize_timeout_minutes(job_template.timeout_minutes, 360.0);
@@ -9079,6 +9112,8 @@ runs:
     #[derive(Clone, Default)]
     struct MockContainerRuntime {
         run_calls: Arc<Mutex<Vec<RunContainerCall>>>,
+        /// Every image build fails, as one out of disk space does.
+        fail_builds: bool,
     }
 
     #[derive(Debug, Clone)]
@@ -9150,6 +9185,9 @@ runs:
             _tag: &str,
             _context_dir: &Path,
         ) -> Result<(), ContainerError> {
+            if self.fail_builds {
+                return Err(ContainerError::ImageBuild("no space left on device".into()));
+            }
             Ok(())
         }
 
@@ -9164,6 +9202,63 @@ runs:
 
         async fn image_exists(&self, _tag: &str) -> Result<bool, ContainerError> {
             Ok(false)
+        }
+    }
+
+    /// A job whose image can't be built fails with no step and the build
+    /// error as its log, in a matrix leg with the default fail-fast too,
+    /// rather than stopping the run with no job to report.
+    #[tokio::test]
+    async fn a_job_whose_image_fails_to_build_is_a_failed_job() {
+        let run_dir = tempfile::tempdir().unwrap();
+        let path = run_dir.path().join("ci.yml");
+        fs::write(
+            &path,
+            "name: ci\non: push\njobs:\n  plain:\n    runs-on: ubuntu-latest\n    steps:\n      \
+             - uses: actions/setup-node@v4\n        with:\n          node-version: 20\n  \
+             legs:\n    runs-on: ubuntu-latest\n    strategy:\n      matrix:\n        \
+             node: [18, 20]\n    steps:\n      - uses: actions/setup-node@v4\n        \
+             with:\n          node-version: ${{ matrix.node }}\n",
+        )
+        .unwrap();
+        let workflow = parse_workflow(&path).unwrap();
+        environment::setup_github_environment_files(run_dir.path()).unwrap();
+        let env_context =
+            HashMap::from([("WRKFLW_RUNTIME_MODE".to_string(), "docker".to_string())]);
+        let runtime = MockContainerRuntime {
+            fail_builds: true,
+            ..MockContainerRuntime::default()
+        };
+        for job in ["plain", "legs"] {
+            let results = execute_job_batch(
+                &[job.to_string()],
+                &workflow,
+                &runtime,
+                &env_context,
+                &HashMap::new(),
+                false,
+                None,
+                None,
+                &HashMap::new(),
+                &HashMap::new(),
+                &crate::artifacts::ArtifactStore::new(run_dir.path()).unwrap(),
+                &crate::cache::CacheStore::new().unwrap(),
+                &HashMap::new(),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{job}: the run stopped: {e}"));
+            let failed = results
+                .iter()
+                .find(|result| result.status == JobStatus::Failure)
+                .unwrap_or_else(|| panic!("{job}: no failed job"));
+            assert!(failed.steps.is_empty(), "{job}: {}", failed.logs);
+            assert!(
+                failed
+                    .logs
+                    .contains(crate::setup_errors::COMBINED_IMAGE_BUILD),
+                "{job}: {}",
+                failed.logs
+            );
         }
     }
 

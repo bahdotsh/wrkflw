@@ -1,6 +1,6 @@
 # Codebase Index: wrkflw
 
-> Generated: 2026-11-11 10:03:40 UTC | Files: 260 | Lines: 115230
+> Generated: 2026-11-11 11:07:47 UTC | Files: 260 | Lines: 116241
 > Languages: JSON (4), Markdown (26), Rust (167), Shell (6), TOML (19), YAML (38)
 
 ## Directory Structure
@@ -1762,7 +1762,7 @@ wrkflw/
 
 ## BREAKING_CHANGES.md
 
-**Language:** Markdown | **Size:** 29.9 KB | **Lines:** 382
+**Language:** Markdown | **Size:** 31.3 KB | **Lines:** 384
 
 **Declarations:**
 
@@ -1786,7 +1786,7 @@ wrkflw/
 
 ## INDEX.md
 
-**Language:** Markdown | **Size:** 268.9 KB | **Lines:** 9997
+**Language:** Markdown | **Size:** 273.8 KB | **Lines:** 10156
 
 **Declarations:**
 
@@ -2908,7 +2908,7 @@ wrkflw/
 
 ## crates/executor/src/job_memory.rs
 
-**Language:** Rust | **Size:** 21.3 KB | **Lines:** 588
+**Language:** Rust | **Size:** 22.5 KB | **Lines:** 621
 
 **Imports:**
 - `std::collections::HashMap`
@@ -3763,7 +3763,7 @@ wrkflw/
 
 ## crates/executor/src/setup_actions.rs
 
-**Language:** Rust | **Size:** 38.5 KB | **Lines:** 962
+**Language:** Rust | **Size:** 46.8 KB | **Lines:** 1149
 
 **Imports:**
 - `std::collections::HashMap`
@@ -3776,7 +3776,7 @@ wrkflw/
 `pub(crate) const NO_IMPLEMENTATION: &str = "no implementation in wrkflw"`
 
 `pub(crate) struct BuiltRuntimes`
-> Fields: `installed: Vec<String>`, `not_built: Vec<(usize, NotBuilt)>`
+> Fields: `installed: Vec<String>`, `not_built: Vec<(usize, NotBuilt)>`, `runtimes: Vec<SetupRuntime>`, `in_composite: bool`
 
 `pub(crate) enum NotBuilt`
 > Variants: `Refused`, `Superseded`
@@ -3791,7 +3791,9 @@ wrkflw/
 > Fields: `runtimes: Vec<SetupRuntime>`, `not_built: Vec<(usize, NotBuilt)>`
 
 `pub(crate) struct SetupRuntime`
-> Fields: `language: String`, `version: String`, `install_script: String`
+> Fields: `language: String`, `version: String`, `install_script: String`, `floating: bool`, `env: Vec<(String, String)>`
+
+`pub(crate) fn is_floating_version(language: &str, version: &str) -> bool`
 
 `pub(crate) struct SetupActionDef`
 > Fields: `repos: &'static [&'static str]`, `with_key: &'static str`, `default_version: &'static str`, `language: &'static str`, `version_from_ref: bool`, `version_file_key: Option<&'static str>`
@@ -3802,7 +3804,13 @@ wrkflw/
 
 `pub(crate) fn version_from_file(root: &Path, file: &str) -> Option<String>`
 
-`pub(crate) fn unrun_action_cause( repository: &str, built: &BuiltRuntimes, container_runtime: bool, step_idx: usize, ) -> Option<&'static str>`
+`pub(crate) fn unrun_action_cause( repository: &str, built: &BuiltRuntimes, container_runtime: bool, step_idx: usize, step: Option<&Step>, ) -> Option<&'static str>`
+
+`fn composite_setup_cause( def: &SetupActionDef, built: &BuiltRuntimes, step: Option<&Step>, ) -> Option<&'static str>`
+
+`fn uv_python<'a>(input: impl Fn(&str) -> Option<&'a String>) -> Result<Option<String>, String>`
+
+`fn go_version(text: &str) -> Option<String>`
 
 `fn contained_path(root: &Path, file: &str) -> Option<PathBuf>`
 
@@ -3970,7 +3978,7 @@ wrkflw/
 
 ## crates/executor/src/vm_workspace.rs
 
-**Language:** Rust | **Size:** 91.4 KB | **Lines:** 2536
+**Language:** Rust | **Size:** 104.3 KB | **Lines:** 2873
 
 **Imports:**
 - `std::collections::{HashMap, HashSet}`
@@ -4106,7 +4114,11 @@ wrkflw/
 
 `fn without_unreadable(volume: &Listing, unreadable: &[PathBuf]) -> Listing`
 
-`fn remove_host_entry(target: &Path) -> io::Result<()>`
+`fn remove_host_entry(target: &Path, parent_read_only: bool) -> io::Result<()>`
+
+`fn read_only_in(volume: &Listing, dir: &Path) -> bool`
+
+`fn with_writable_dir<T>(dir: &Path, op: impl FnOnce() -> io::Result<T>) -> io::Result<T>`
 
 `fn make_writable(path: &Path)`
 
@@ -4122,6 +4134,8 @@ wrkflw/
 `fn os_error(e: &io::Error) -> Option<i32>`
 
 `fn spelled_otherwise_on_host( host: &Path, rel: &Path, names: &mut HashMap<PathBuf, Option<HashSet<std::ffi::OsString>>>, ) -> bool`
+
+`fn release_kept(host: &Path, kept: &mut HashSet<PathBuf>) -> Vec<PathBuf>`
 
 `fn unpack<R: Read>(reader: R, host: &Path, volume: &Listing) -> io::Result<Unpacked>`
 
@@ -4194,13 +4208,23 @@ wrkflw/
 
 `pub(crate) fn release(host: &Path, kept: bool)`
 
+`fn held_by_stopped_containers(cli: &str, volume: &str) -> bool`
+
+`fn stopped_state(state: &str) -> bool`
+
 `const VOLUME_REMOVAL_TRIES: usize = 120`
+
+`const HELD_TRIES: usize = 20`
 
 `static PENDING_REMOVALS: Mutex<Vec<std::thread::JoinHandle<()>>> = Mutex::new(Vec::new())`
 
 `pub(crate) fn remove_now(host: &Path)`
 
 `pub(crate) async fn wait_for_released_volumes()`
+
+`fn labelled_volumes(cli: &str) -> Vec<String>`
+
+`fn inspect_format() -> String`
 
 `pub(crate) fn remove_orphaned_volumes() -> usize`
 
@@ -4921,7 +4945,7 @@ wrkflw/
 
 ## crates/runs/src/digest.rs
 
-**Language:** Rust | **Size:** 47.9 KB | **Lines:** 1218
+**Language:** Rust | **Size:** 48.9 KB | **Lines:** 1234
 
 **Imports:**
 - `crate::record::{JobRecord, RunRecord, RunStatus, StepRecord, SCHEMA_VERSION}`
@@ -4949,6 +4973,8 @@ wrkflw/
 `fn is_error_line(line: &str) -> bool`
 
 `static PASSING: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(||`
+
+`static ERROR_PREFIX: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(||`
 
 `static FAILING: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"\b(FAIL(ED|URE)?|ERROR|Failed)\b").unwrap())`
 
@@ -8467,7 +8493,7 @@ wrkflw/
 
 ## crates/wrkflw/src/git.rs
 
-**Language:** Rust | **Size:** 4.5 KB | **Lines:** 132
+**Language:** Rust | **Size:** 6.7 KB | **Lines:** 182
 
 **Imports:**
 - `std::process::Command`
@@ -8477,6 +8503,10 @@ wrkflw/
 `pub(crate) fn line(args: &[&str]) -> Option<String>`
 
 `pub(crate) fn remote_has(remote: &str, reference: &str) -> Result<bool, String>`
+
+`const REMOTE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30)`
+
+`fn output_within( command: &mut Command, deadline: std::time::Duration, ) -> Result<std::process::Output, String>`
 
 `fn command(args: &[&str]) -> Command`
 
@@ -8544,7 +8574,7 @@ wrkflw/
 
 ## crates/wrkflw/src/main.rs
 
-**Language:** Rust | **Size:** 85.4 KB | **Lines:** 2337
+**Language:** Rust | **Size:** 92.1 KB | **Lines:** 2507
 
 **Imports:**
 - `bollard::Docker`
@@ -8625,11 +8655,17 @@ wrkflw/
 
 `fn global_child_args(cli: &Wrkflw, platform_overrides: &HashMap<String, String>) -> Vec<String>`
 
+`fn hook_child_args( cli: &Wrkflw, matches: &clap::ArgMatches, platform_overrides: &HashMap<String, String>, ) -> Vec<String>`
+
+`fn given_or_empty<T: Clone>(values: &[T], given: bool) -> Vec<T>`
+
 `fn parse_branch(value: &str) -> Result<String, String>`
 
 `fn parse_tag(value: &str) -> Result<String, String>`
 
 `fn ref_name(value: &str, prefix: &str) -> Result<String, String>`
+
+`fn event_for(event: Option<&str>, branch: Option<&str>, tag: Option<&str>) -> Option<String>`
 
 `fn check_tag_event(event: Option<&str>, tag: Option<&str>) -> Result<(), String>`
 
@@ -8671,7 +8707,7 @@ wrkflw/
 
 ## crates/wrkflw/src/mcp_cmd.rs
 
-**Language:** Rust | **Size:** 33.4 KB | **Lines:** 812
+**Language:** Rust | **Size:** 33.7 KB | **Lines:** 814
 
 **Imports:**
 - `serde_json::{json, Value}`
@@ -8708,7 +8744,7 @@ wrkflw/
   `fn drop(&mut self)`
 
 
-`const INSTRUCTIONS: &str = "wrkflw validates and runs GitHub Actions and GitLab CI workflows locally. \ Call validate_workflows after editing YAML, plan_workflow to see what would run and why a trigger \ would or would not fire, and run_workflow to execute. run_workflow returns a failure digest. Pass \ reuse_results while iterating, so jobs that already passed on the same files aren't run again. \ Before pushing, call gate: it runs what CI would run for the push, and on a feature branch \ checks workflows a push doesn't fire as a pull request into the default branch. Read \ `verdict`, not only `passed`: `verified` means everything ran as asked, `partial` means some \ jobs ran as another OS than their runs-on asked for (listed under `unverified`, so their \ OS-specific steps weren't checked), and `nothing_checked` means no job ran at all. Say which \ before claiming CI will pass. A job with `reused` didn't run: an earlier result stands. Use \ list_runs and get_run_failure before rerunning: earlier results are recorded."`
+`const INSTRUCTIONS: &str = "wrkflw validates and runs GitHub Actions and GitLab CI workflows locally. \ Call validate_workflows after editing YAML, plan_workflow to see what would run and why a trigger \ would or would not fire, and run_workflow to execute. run_workflow returns a failure digest. Pass \ reuse_results while iterating, so jobs that already passed on the same files aren't run again. \ Before pushing, call gate: it runs what CI would run for the push, and on a feature branch \ checks workflows a push doesn't fire as a pull request into the default branch. Read \ `verdict`, not only `passed`: `verified` means everything ran as asked, `partial` means the \ pass left something unchecked, and `nothing_checked` means no job ran at all. Each `unverified` \ entry has a `kind` and a `reason`: `runner` is a job that ran as another OS than its runs-on asked \ for, so its OS-specific steps weren't checked`
 
 `fn string_arg(args: &Value, key: &str) -> Option<String>`
 
@@ -8893,7 +8929,7 @@ wrkflw/
 
 ## crates/wrkflw/src/plan_cmd.rs
 
-**Language:** Rust | **Size:** 12.5 KB | **Lines:** 361
+**Language:** Rust | **Size:** 12.5 KB | **Lines:** 362
 
 **Imports:**
 - `crate::{is_gitlab_pipeline, prefilter, OutputFormat, RuntimeChoice}`
@@ -8967,7 +9003,7 @@ wrkflw/
 
 ## crates/wrkflw/src/run_workflow_cmd.rs
 
-**Language:** Rust | **Size:** 20.5 KB | **Lines:** 544
+**Language:** Rust | **Size:** 20.8 KB | **Lines:** 549
 
 **Imports:**
 - `crate::prefilter`
@@ -9177,7 +9213,7 @@ wrkflw/
 
 ## crates/wrkflw/tests/agent_cli_test.rs
 
-**Language:** Rust | **Size:** 46.1 KB | **Lines:** 1414
+**Language:** Rust | **Size:** 48.1 KB | **Lines:** 1463
 
 **Imports:**
 - `serde_json::{json, Value}`
@@ -9312,6 +9348,8 @@ wrkflw/
 `const REFS: &str = r#" name: refs on: push: branches: ['release/**'] tags: ['v*'] pull_request: branches: [main] jobs: check: runs-on: ubuntu-latest steps: - name: refs run: | echo "event=$GITHUB_EVENT_NAME ref=$GITHUB_REF head=$GITHUB_HEAD_REF base=$GITHUB_BASE_REF" test "$GITHUB_EVENT_NAME" = "$`
 
 `fn branch_and_event_reach_filters_and_steps_on_a_detached_head()`
+
+`fn a_branch_or_tag_alone_is_a_push_to_filters_and_steps()`
 
 `fn a_step_whose_action_did_not_run_makes_a_pass_partial()`
 

@@ -2149,6 +2149,37 @@ fn generate_combined_dockerfile(
     dockerfile
 }
 
+/// Whether `version` names a channel or a range rather than a release, so
+/// what it installs changes as releases come out: `latest`, `stable`,
+/// `oldstable`, `lts/*`, `3.x`, `>=3.10`, `^18 || >=20`. A partial release
+/// such as `3.12` drifts only by patch releases and counts as fixed.
+fn is_floating_version(version: &str) -> bool {
+    let version = version.trim().to_ascii_lowercase();
+    let channel = version.chars().any(|c| c.is_ascii_alphabetic())
+        && !version.chars().next().is_some_and(|c| c.is_ascii_digit());
+    channel
+        || version.contains(['x', '*', '>', '<', '^', '~', '|', ' '])
+        || version.ends_with("-dev")
+}
+
+/// The ISO week `now` falls in, as `2026-W46`, when any of `runtimes`
+/// floats: images built for it are rebuilt once a week, so a floating
+/// version keeps up with releases, as the hosted actions resolve it on
+/// every run.
+fn floating_versions_week(
+    runtimes: &[SetupRuntime],
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<String> {
+    use chrono::Datelike;
+    runtimes
+        .iter()
+        .any(|rt| is_floating_version(&rt.version))
+        .then(|| {
+            let week = now.iso_week();
+            format!("{}-W{:02}", week.year(), week.week())
+        })
+}
+
 /// FNV-1a hash — deterministic across Rust toolchain versions, unlike `DefaultHasher`.
 fn fnv1a_hash(data: &[u8]) -> u64 {
     const FNV_OFFSET_BASIS: u64 = 14695981039346656037;
@@ -2229,7 +2260,12 @@ async fn build_combined_runtime_image(
             runtime.image_id(base_image).await
         }
     };
-    let dockerfile = generate_combined_dockerfile(runtimes, base_image, base_id.as_deref());
+    let mut dockerfile = generate_combined_dockerfile(runtimes, base_image, base_id.as_deref());
+    // A version such as `oldstable` or `3.x` names a different release as
+    // time goes on, and the tag would otherwise keep the first build's.
+    if let Some(week) = floating_versions_week(runtimes, chrono::Utc::now()) {
+        dockerfile.push_str(&format!("# floating versions resolved in {}\n", week));
+    }
     let tag = combined_image_tag(runtimes, &dockerfile);
 
     // Fast path: image already exists, no locking needed.
@@ -10793,6 +10829,57 @@ runs:
         let df = generate_combined_dockerfile(&node, "ubuntu:latest", None);
         assert!(!df.contains("command -v node"), "{df}");
         assert_eq!(df.matches("nodesource").count(), 1, "{df}");
+    }
+
+    #[test]
+    fn images_for_floating_versions_are_rebuilt_weekly() {
+        let rt = |language: &str, version: &str| SetupRuntime {
+            language: language.to_string(),
+            version: version.to_string(),
+            install_script: String::new(),
+        };
+        for version in [
+            "latest",
+            "stable",
+            "oldstable",
+            "lts/*",
+            "3.x",
+            ">=3.10",
+            "^18 || >=20",
+            "nightly",
+            "3.14-dev",
+            "pypy-3.11",
+            "current",
+        ] {
+            assert!(is_floating_version(version), "{version}");
+        }
+        for version in [
+            "3.12", "3.12.4", "20", "1.22.3", "0.9.30", "3.13t", "1.80.0",
+        ] {
+            assert!(!is_floating_version(version), "{version}");
+        }
+        let monday = chrono::DateTime::parse_from_rfc3339("2026-11-09T10:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let sunday = monday + chrono::Duration::days(6);
+        let next = monday + chrono::Duration::days(7);
+        let floating = [rt("go", "oldstable"), rt("python", "3.12")];
+        assert_eq!(
+            floating_versions_week(&floating, monday).as_deref(),
+            Some("2026-W46")
+        );
+        assert_eq!(
+            floating_versions_week(&floating, sunday),
+            floating_versions_week(&floating, monday)
+        );
+        assert_ne!(
+            floating_versions_week(&floating, next),
+            floating_versions_week(&floating, monday)
+        );
+        assert_eq!(
+            floating_versions_week(&[rt("python", "3.12")], monday),
+            None
+        );
     }
 
     #[test]

@@ -1419,8 +1419,9 @@ impl<W: Write> Write for Counted<W> {
 }
 
 /// Wait for `child` on a thread of its own, killing it once `progress`
-/// hasn't moved for `idle`. Killing it closes its pipes, which frees the
-/// threads that read or write them. `what` names the call in the error.
+/// hasn't moved for `idle`. Killing it closes its own ends of its pipes; a
+/// process it started may still hold them, so a caller must not wait on
+/// them after a stall. `what` names the call in the error.
 fn bound(
     mut child: std::process::Child,
     what: String,
@@ -1509,13 +1510,17 @@ fn output_within(
     let stdout = drain(child.stdout.take(), progress.clone());
     let stderr = drain(child.stderr.take(), progress.clone());
     let status = finish(bound(child, what.to_string(), idle, progress));
+    // A stalled call's pipes may outlive it: a process it started can hold
+    // them open after it is killed. Its output isn't wanted then, so the
+    // threads reading and writing them are left to end when the pipes do.
+    let status = status?;
     if let Some(feeder) = feeder {
         let _ = feeder.join();
     }
     let stdout = stdout.join().unwrap_or_default();
     let stderr = stderr.join().unwrap_or_default();
     Ok(std::process::Output {
-        status: status?,
+        status,
         stdout,
         stderr,
     })
@@ -2266,9 +2271,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_call_that_stops_moving_is_killed_and_a_slow_one_is_not() {
+        // The command after `sleep` makes every shell fork it, so the
+        // `sleep` outlives the shell that is killed and holds its pipes.
         let started = Instant::now();
         let stuck = output_within(
-            Command::new("sh").args(["-c", "sleep 30"]),
+            Command::new("sh").args(["-c", "sleep 30; true"]),
             None,
             "`sleep`",
             Duration::from_millis(200),

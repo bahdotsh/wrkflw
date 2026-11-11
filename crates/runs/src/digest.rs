@@ -106,6 +106,11 @@ pub struct FailedStep {
     /// to tell legs that failed the same tests apart from ones that didn't.
     #[serde(skip)]
     signature: BTreeSet<String>,
+    /// The other failure lines, such as `error: could not compile` or a
+    /// fatal interpreter error, with paths and numbers blanked: a leg that
+    /// printed one more of these failed in another way too.
+    #[serde(skip)]
+    context: BTreeSet<String>,
 }
 
 /// A cause read from a failed step's output.
@@ -125,24 +130,31 @@ pub struct FailureCause {
 /// ok`: a word like `out of memory` in it names a test, not a failure.
 /// Test runners print `PASS` and `PASSED` in capitals, or `Passed` as
 /// `dotnet test` does, so a lower-case `pass` in a path such as
-/// `tests/pass/` isn't one.
+/// `tests/pass/` isn't one. The word must be where a runner puts its
+/// verdict, first or last on the line, once bracketed and parenthesised
+/// parts such as parameters, progress and durations are left out: in
+/// `error TS2339: Property 'Passed' does not exist` it is a name.
 static PASSING: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-    regex::Regex::new(r"\.\.\.\s*ok\s*$|\bPASS(ED)?\b|\bPassed\b|^\s*(ok|✓|✔)\b").unwrap()
+    regex::Regex::new(
+        r"\.\.\.\s*ok\s*$|\b(PASS(ED)?|Passed)\s*$|^[\s\-*>:]*(PASS(ED)?|Passed|ok|✓|✔)(\b|:|\s|$)",
+    )
+    .unwrap()
 });
 
 /// A runner's own word for a failure, which no passing line holds.
 static FAILING: std::sync::LazyLock<regex::Regex> =
     std::sync::LazyLock::new(|| regex::Regex::new(r"\b(FAIL(ED|URE)?|ERROR|Failed)\b").unwrap());
 
-/// A bracketed part of a line, such as a test's parameters in
-/// `test_x[Failed]` or a duration in `[12 ms]`.
+/// A bracketed or parenthesised part of a line, such as a test's
+/// parameters in `test_x[Failed]` or a duration in `[12 ms]` or `(0.01s)`.
 static BRACKETED: std::sync::LazyLock<regex::Regex> =
-    std::sync::LazyLock::new(|| regex::Regex::new(r"\[[^\]]*\]").unwrap());
+    std::sync::LazyLock::new(|| regex::Regex::new(r"\[[^\]]*\]|\([^)]*\)").unwrap());
 
 /// Whether `line` reports a pass and no failure. A failure word inside a
 /// test's parameters, as in `test_x[Failed] PASSED`, names the test.
 fn reports_pass(line: &str) -> bool {
-    PASSING.is_match(line) && !FAILING.is_match(&BRACKETED.replace_all(line, ""))
+    let bare = BRACKETED.replace_all(line, "");
+    PASSING.is_match(&bare) && !FAILING.is_match(&bare)
 }
 
 /// The lines a cause may be read from: what the step printed, in the last
@@ -346,12 +358,46 @@ fn names_a_location(line: &str) -> bool {
 /// the same tests have the same signature, though they print different
 /// interpreter paths, environment names and process ids around them.
 fn failure_signature(text: &str) -> BTreeSet<String> {
+    failure_lines(text)
+        .into_iter()
+        .filter(|line| names_a_location(line))
+        .map(|line| without_durations(&PROGRESS.replace_all(&line, "")))
+        .collect()
+}
+
+/// The failure lines of everything a step printed that name no location,
+/// with paths and numbers blanked, as legs print other interpreter paths,
+/// versions, counts and times in them.
+fn failure_context(text: &str) -> BTreeSet<String> {
+    failure_lines(text)
+        .into_iter()
+        .filter(|line| !names_a_location(line))
+        .map(|line| {
+            let words: Vec<&str> = line
+                .split_whitespace()
+                .map(|word| {
+                    if word.contains(['/', '\\']) {
+                        "<path>"
+                    } else {
+                        word
+                    }
+                })
+                .collect();
+            DIGITS.replace_all(&words.join(" "), "#").into_owned()
+        })
+        .collect()
+}
+
+static DIGITS: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(r"\d+").unwrap());
+
+/// The lines of what a step printed that report a failure.
+fn failure_lines(text: &str) -> Vec<String> {
     let lines: Vec<&str> = text.lines().collect();
     lines[output_start(&lines)..]
         .iter()
         .map(|line| strip_ansi(line))
-        .filter(|line| is_error_line(line) && !reports_pass(line) && names_a_location(line))
-        .map(|line| without_durations(&PROGRESS.replace_all(&line, "")))
+        .filter(|line| is_error_line(line) && !reports_pass(line))
         .collect()
 }
 
@@ -368,7 +414,10 @@ fn same_failure(a: &FailedStep, b: &FailedStep) -> bool {
             .map(|line| without_durations(line))
             .collect()
     };
-    let same_tests = !a.signature.is_empty() && a.signature == b.signature;
+    // Named failures alone could hide a leg that also failed to compile or
+    // crashed, so the rest of what both printed as failures must agree too.
+    let same_tests =
+        !a.signature.is_empty() && a.signature == b.signature && a.context == b.context;
     (a.step_index, a.exit_code) == (b.step_index, b.exit_code)
         && (same_tests || printed(a) == printed(b))
 }
@@ -490,6 +539,7 @@ fn failed_step(
                 failure_cause(&text, None, tail_lines)
             },
             signature: failure_signature(&text),
+            context: failure_context(&text),
         };
     };
     let text = read(&step.log);
@@ -516,6 +566,7 @@ fn failed_step(
         log_path: step.log.as_deref().map(log_path),
         cause: failure_cause(&text, step.exit_code, tail_lines),
         signature: failure_signature(&text),
+        context: failure_context(&text),
     }
 }
 
@@ -614,6 +665,31 @@ mod tests {
     }
 
     #[test]
+    fn a_pass_word_that_is_not_a_verdict_keeps_an_error_line() {
+        for line in [
+            "src/x.ts(3,5): error TS2339: Property 'Passed' does not exist on type 'S'.",
+            "error[E0599]: no variant named `Passed` found for enum `Outcome`",
+            "error: environment variable PASS is required",
+            "E   assert 'failed' == 'PASSED'",
+        ] {
+            assert!(!reports_pass(line), "{line}");
+            assert!(cause_lines(&format!("{line}\nx\n"), 1).contains(&line.to_string()));
+        }
+        // What runners print for a pass still is one.
+        for line in [
+            "test parses_error_output ... ok",
+            "tests/test_err.py::test_raises[Error: x] PASSED [ 50%]",
+            "--- PASS: TestErrorPath (0.00s)",
+            "PASS src/errors.test.ts (5.1 s)",
+            "  ✓ reports the error (3 ms)",
+            "  Passed ErrorHandling.Tests.Parses [12 ms]",
+            "ok  \tgithub.com/x/errors\t0.01s",
+        ] {
+            assert!(reports_pass(line), "{line}");
+        }
+    }
+
+    #[test]
     fn every_setup_error_the_engine_reports_is_recognised() {
         use wrkflw_executor::setup_errors;
         use wrkflw_runtime::container::ContainerError;
@@ -679,6 +755,7 @@ mod tests {
             log_path: None,
             cause: None,
             signature: BTreeSet::new(),
+            context: BTreeSet::new(),
         }
     }
 
@@ -1050,7 +1127,7 @@ mod tests {
             "source": "cli", "agent": null, "intent": null, "session": null,
             "replay_of": null, "argv": [], "variables": [], "pid": 1, "started_at": "",
             "finished_at": null, "duration_ms": null, "error": null, "skip_reason": null,
-            "jobs": [job("3.15"), job("3.10"), job("pypy3.11")],
+            "jobs": [job("3.15"), job("3.10"), job("pypy3.11"), job("3.12")],
         }))
         .unwrap();
         store
@@ -1063,12 +1140,24 @@ mod tests {
         store
             .write_log("r", "pypy3.11.log", &leg("pypy3.11", &["test_other"]))
             .unwrap();
+        // So is the same test failing beside a crash the others didn't have.
+        store
+            .write_log(
+                "r",
+                "3.12.log",
+                &format!(
+                    "{}Fatal Python error: Segmentation fault\n",
+                    leg("3.12", &["test_surrogates"])
+                ),
+            )
+            .unwrap();
 
         let digest = failure_digest(&store, &run, 6).unwrap();
-        assert_eq!(digest.failures.len(), 2, "{:#?}", digest.failures);
+        assert_eq!(digest.failures.len(), 3, "{:#?}", digest.failures);
         assert_eq!(digest.failures[0].job, "3.15");
         assert_eq!(digest.failures[0].also_failed_in, ["3.10"]);
         assert_eq!(digest.failures[1].job, "pypy3.11");
+        assert_eq!(digest.failures[2].job, "3.12");
     }
 
     #[test]

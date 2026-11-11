@@ -368,9 +368,11 @@ struct Measured {
     /// or since it last ran out of memory, which forgets it all.
     #[serde(default)]
     highest: u64,
-    /// For a matrix: a leg ran out of memory, so what one leg needs doesn't
-    /// say what the others do. Its legs never measured run alone, each
-    /// measuring itself, and no peak is kept for the matrix again.
+    /// For a matrix: a process was killed for lack of memory while a leg
+    /// ran, whether in that leg or in a job beside it, so what one leg
+    /// needs no longer says what the others do. Its legs never measured
+    /// run alone, each measuring itself, and no peak is kept for the
+    /// matrix again.
     #[serde(default)]
     uneven: bool,
     /// When the last of them was taken, in seconds since the epoch.

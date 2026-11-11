@@ -160,6 +160,11 @@ pub(crate) async fn job_slot(
         tokio::select! {
             // A place freed by the leg that was just measured comes with
             // its measurement: read it before taking the place.
+            //
+            // Each look starts a new wait at the back of the pool's queue,
+            // after jobs that asked since. It is the price of asking for
+            // less: a run is finite, and the measurement it waits for lets
+            // more of the run go at once than the place it gives up.
             biased;
             _ = &mut changed => {}
             place = place => return place.ok(),

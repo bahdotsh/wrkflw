@@ -2084,10 +2084,15 @@ fn report_action_not_run(uses: &str, cause: Option<&str>) -> Option<String> {
 /// re-pulled or rebuilt base would keep serving the old combined image.
 ///
 /// Extracted as a pure function so the output can be unit-tested without Docker.
+/// `week` names the week floating versions are resolved in, when any is;
+/// it goes into the one `RUN` instruction, so a new week misses the build
+/// cache and installs the releases out then. A comment would change the
+/// image's tag but not its layers, which the builder would reuse.
 fn generate_combined_dockerfile(
     runtimes: &[SetupRuntime],
     base_image: &str,
     base_id: Option<&str>,
+    week: Option<&str>,
 ) -> String {
     let mut dockerfile = format!("FROM {}\n", base_image);
     if let Some(id) = base_id {
@@ -2113,7 +2118,14 @@ fn generate_combined_dockerfile(
     if runtimes.iter().any(|rt| rt.language == "python") {
         dockerfile.push_str(&format!("ENV UV_PYTHON_INSTALL_DIR={}\n", UV_PYTHON_DIR));
     }
-    dockerfile.push_str("RUN apt-get update && \\\n");
+    dockerfile.push_str("RUN ");
+    if let Some(week) = week {
+        dockerfile.push_str(&format!(
+            ": floating versions resolved in {} && \\\n    ",
+            week
+        ));
+    }
+    dockerfile.push_str("apt-get update && \\\n");
     dockerfile.push_str(
         "    apt-get install -y --no-install-recommends curl bash git ca-certificates gnupg \
          build-essential less",
@@ -2151,19 +2163,6 @@ fn generate_combined_dockerfile(
     dockerfile
 }
 
-/// Whether `version` names a channel or a range rather than a release, so
-/// what it installs changes as releases come out: `latest`, `stable`,
-/// `oldstable`, `lts/*`, `3.x`, `>=3.10`, `^18 || >=20`. A partial release
-/// such as `3.12` drifts only by patch releases and counts as fixed.
-fn is_floating_version(version: &str) -> bool {
-    let version = version.trim().to_ascii_lowercase();
-    let channel = version.chars().any(|c| c.is_ascii_alphabetic())
-        && !version.chars().next().is_some_and(|c| c.is_ascii_digit());
-    channel
-        || version.contains(['x', '*', '>', '<', '^', '~', '|', ' '])
-        || version.ends_with("-dev")
-}
-
 /// The ISO week `now` falls in, as `2026-W46`, when any of `runtimes`
 /// floats: images built for it are rebuilt once a week, so a floating
 /// version keeps up with releases, as the hosted actions resolve it on
@@ -2173,13 +2172,10 @@ fn floating_versions_week(
     now: chrono::DateTime<chrono::Utc>,
 ) -> Option<String> {
     use chrono::Datelike;
-    runtimes
-        .iter()
-        .any(|rt| is_floating_version(&rt.version))
-        .then(|| {
-            let week = now.iso_week();
-            format!("{}-W{:02}", week.year(), week.week())
-        })
+    runtimes.iter().any(|rt| rt.floating).then(|| {
+        let week = now.iso_week();
+        format!("{}-W{:02}", week.year(), week.week())
+    })
 }
 
 /// FNV-1a hash — deterministic across Rust toolchain versions, unlike `DefaultHasher`.
@@ -2262,12 +2258,11 @@ async fn build_combined_runtime_image(
             runtime.image_id(base_image).await
         }
     };
-    let mut dockerfile = generate_combined_dockerfile(runtimes, base_image, base_id.as_deref());
     // A version such as `oldstable` or `3.x` names a different release as
-    // time goes on, and the tag would otherwise keep the first build's.
-    if let Some(week) = floating_versions_week(runtimes, chrono::Utc::now()) {
-        dockerfile.push_str(&format!("# floating versions resolved in {}\n", week));
-    }
+    // time goes on, and the image would otherwise keep the first build's.
+    let week = floating_versions_week(runtimes, chrono::Utc::now());
+    let dockerfile =
+        generate_combined_dockerfile(runtimes, base_image, base_id.as_deref(), week.as_deref());
     let tag = combined_image_tag(runtimes, &dockerfile);
 
     // Fast path: image already exists, no locking needed.
@@ -7860,7 +7855,7 @@ mod tests {
             .unwrap();
 
         let dockerfile =
-            generate_combined_dockerfile(&detect_setup_runtimes(&steps), "my/image:1", None);
+            generate_combined_dockerfile(&detect_setup_runtimes(&steps), "my/image:1", None, None);
         assert!(dockerfile.starts_with("FROM my/image:1\n"));
         assert_eq!(
             resolved.image,
@@ -10369,8 +10364,9 @@ runs:
             language: "node".to_string(),
             version: "20".to_string(),
             install_script: get_install_script("node", "20"),
+            floating: false,
         }];
-        let df = generate_combined_dockerfile(&runtimes, "ubuntu:latest", None);
+        let df = generate_combined_dockerfile(&runtimes, "ubuntu:latest", None, None);
         assert!(df.starts_with("FROM ubuntu:latest\n"));
         assert!(df.contains("nodesource"));
         // Everything in a single RUN layer
@@ -10383,8 +10379,10 @@ runs:
             language: "node".to_string(),
             version: "20".to_string(),
             install_script: get_install_script("node", "20"),
+            floating: false,
         }];
-        let df = generate_combined_dockerfile(&runtimes, "catthehacker/ubuntu:act-latest", None);
+        let df =
+            generate_combined_dockerfile(&runtimes, "catthehacker/ubuntu:act-latest", None, None);
         assert!(df.ends_with("ENV PATH=/usr/local/bin:/usr/bin:$PATH\n"));
     }
 
@@ -10395,14 +10393,16 @@ runs:
                 language: "node".to_string(),
                 version: "20".to_string(),
                 install_script: get_install_script("node", "20"),
+                floating: false,
             },
             SetupRuntime {
                 language: "python".to_string(),
                 version: "3.12".to_string(),
                 install_script: get_install_script("python", "3.12"),
+                floating: false,
             },
         ];
-        let df = generate_combined_dockerfile(&runtimes, "ubuntu:latest", None);
+        let df = generate_combined_dockerfile(&runtimes, "ubuntu:latest", None, None);
         // Everything in a single RUN layer
         assert_eq!(df.matches("RUN ").count(), 1);
         assert!(df.contains("nodesource"));
@@ -10893,8 +10893,9 @@ runs:
             language: "python".to_string(),
             version: "3.12".to_string(),
             install_script: get_install_script("python", "3.12"),
+            floating: false,
         }];
-        let df = generate_combined_dockerfile(&python, "ubuntu:latest", None);
+        let df = generate_combined_dockerfile(&python, "ubuntu:latest", None, None);
         assert!(df.contains("build-essential less"), "{df}");
         assert!(df.contains("command -v node"), "{df}");
         assert!(
@@ -10908,45 +10909,73 @@ runs:
             language: "node".to_string(),
             version: "18".to_string(),
             install_script: get_install_script("node", "18"),
+            floating: false,
         }];
-        let df = generate_combined_dockerfile(&node, "ubuntu:latest", None);
+        let df = generate_combined_dockerfile(&node, "ubuntu:latest", None, None);
         assert!(!df.contains("command -v node"), "{df}");
         assert_eq!(df.matches("nodesource").count(), 1, "{df}");
     }
 
     #[test]
     fn images_for_floating_versions_are_rebuilt_weekly() {
-        let rt = |language: &str, version: &str| SetupRuntime {
-            language: language.to_string(),
-            version: version.to_string(),
-            install_script: String::new(),
+        for (language, version) in [
+            ("node", "latest"),
+            ("rust", "stable"),
+            ("go", "oldstable"),
+            ("node", "lts/*"),
+            ("python", "3.x"),
+            ("go", "1.x"),
+            ("python", "3"),
+            ("go", "1"),
+            ("python", ">=3.10"),
+            ("node", "^18 || >=20"),
+            ("rust", "nightly"),
+            ("python", "3.14-dev"),
+            ("python", "pypy-3.11"),
+            ("node", "current"),
+        ] {
+            assert!(
+                is_floating_version(language, version),
+                "{language} {version}"
+            );
+        }
+        for (language, version) in [
+            ("python", "3.12"),
+            ("python", "3.12.4"),
+            ("node", "20"),
+            ("go", "1.22.3"),
+            ("uv", "0.9.30"),
+            ("python", "3.13t"),
+            ("rust", "1.80.0"),
+        ] {
+            assert!(
+                !is_floating_version(language, version),
+                "{language} {version}"
+            );
+        }
+
+        // Judged on what the step wrote, before `3.x` becomes `3` and a
+        // Node range becomes the major it picks.
+        let detected = |uses: &str, key: &str, version: &str| {
+            let with = HashMap::from([(key.to_string(), version.to_string())]);
+            detect_setup_runtimes(&[make_step_uses(uses, Some(with))])
         };
-        for version in [
-            "latest",
-            "stable",
-            "oldstable",
-            "lts/*",
-            "3.x",
-            ">=3.10",
-            "^18 || >=20",
-            "nightly",
-            "3.14-dev",
-            "pypy-3.11",
-            "current",
+        for (uses, key, version) in [
+            ("actions/setup-python@v5", "python-version", "3.x"),
+            ("actions/setup-go@v5", "go-version", "1.x"),
+            ("actions/setup-node@v4", "node-version", ">=18"),
         ] {
-            assert!(is_floating_version(version), "{version}");
+            let runtimes = detected(uses, key, version);
+            assert!(runtimes[0].floating, "{uses} {version}");
         }
-        for version in [
-            "3.12", "3.12.4", "20", "1.22.3", "0.9.30", "3.13t", "1.80.0",
-        ] {
-            assert!(!is_floating_version(version), "{version}");
-        }
+        assert!(!detected("actions/setup-python@v5", "python-version", "3.12")[0].floating);
+
         let monday = chrono::DateTime::parse_from_rfc3339("2026-11-09T10:00:00Z")
             .unwrap()
             .with_timezone(&chrono::Utc);
         let sunday = monday + chrono::Duration::days(6);
         let next = monday + chrono::Duration::days(7);
-        let floating = [rt("go", "oldstable"), rt("python", "3.12")];
+        let floating = detected("actions/setup-python@v5", "python-version", "3.x");
         assert_eq!(
             floating_versions_week(&floating, monday).as_deref(),
             Some("2026-W46")
@@ -10959,10 +10988,21 @@ runs:
             floating_versions_week(&floating, next),
             floating_versions_week(&floating, monday)
         );
-        assert_eq!(
-            floating_versions_week(&[rt("python", "3.12")], monday),
-            None
-        );
+        let fixed = detected("actions/setup-python@v5", "python-version", "3.12");
+        assert_eq!(floating_versions_week(&fixed, monday), None);
+
+        // The week is part of the one RUN instruction, the builder's cache
+        // key, not a comment beside it that the cache ignores.
+        let week = floating_versions_week(&floating, monday);
+        let dockerfile =
+            generate_combined_dockerfile(&floating, "ubuntu:latest", None, week.as_deref());
+        let run = dockerfile
+            .lines()
+            .find(|line| line.starts_with("RUN "))
+            .unwrap();
+        assert!(run.contains("2026-W46"), "{dockerfile}");
+        assert!(!dockerfile.contains("# floating"), "{dockerfile}");
+        assert_eq!(dockerfile.matches("RUN ").count(), 1);
     }
 
     #[test]
@@ -10971,8 +11011,9 @@ runs:
             language: "python".to_string(),
             version: "3.12".to_string(),
             install_script: get_install_script("python", "3.12"),
+            floating: false,
         }];
-        let df = generate_combined_dockerfile(&python, "ubuntu:latest", None);
+        let df = generate_combined_dockerfile(&python, "ubuntu:latest", None, None);
         assert!(
             df.contains(&format!("ENV PATH={}:", PYTHON_SCRIPTS_DIR)),
             "{df}"
@@ -11013,7 +11054,7 @@ runs:
         let runtimes = detect_setup_runtimes(&steps);
         let order: Vec<&str> = runtimes.iter().map(|r| r.language.as_str()).collect();
         assert_eq!(order, ["uv", "python"]);
-        let df = generate_combined_dockerfile(&runtimes, "ubuntu:latest", None);
+        let df = generate_combined_dockerfile(&runtimes, "ubuntu:latest", None, None);
         let pinned = df.find("astral.sh/uv/0.9.30/install.sh").unwrap();
         let python_install = df.find("uv python install").unwrap();
         assert!(pinned < python_install, "{df}");
@@ -11029,6 +11070,7 @@ runs:
             language: "python".to_string(),
             version: ">=3.9,<4".to_string(),
             install_script: String::new(),
+            floating: false,
         }];
         let tag = combined_image_tag(&runtimes, "FROM x\n");
         let name = tag.strip_prefix(COMBINED_IMAGE_PREFIX).unwrap();
@@ -11076,9 +11118,12 @@ runs:
             language: "node".to_string(),
             version: "20".to_string(),
             install_script: get_install_script("node", "20"),
+            floating: false,
         }];
-        let before = generate_combined_dockerfile(&runtimes, "ubuntu:latest", Some("sha256:aaa"));
-        let after = generate_combined_dockerfile(&runtimes, "ubuntu:latest", Some("sha256:bbb"));
+        let before =
+            generate_combined_dockerfile(&runtimes, "ubuntu:latest", Some("sha256:aaa"), None);
+        let after =
+            generate_combined_dockerfile(&runtimes, "ubuntu:latest", Some("sha256:bbb"), None);
         assert!(before.contains("# base image id: sha256:aaa"));
         assert_ne!(
             combined_image_tag(&runtimes, &before),
@@ -11094,8 +11139,9 @@ runs:
             language: "unknown".to_string(),
             version: "1.0".to_string(),
             install_script: String::new(),
+            floating: false,
         }];
-        let df = generate_combined_dockerfile(&runtimes, "ubuntu:latest", None);
+        let df = generate_combined_dockerfile(&runtimes, "ubuntu:latest", None, None);
         // Single RUN layer with just the base packages
         assert_eq!(df.matches("RUN ").count(), 1);
     }
@@ -11107,11 +11153,13 @@ runs:
                 language: "node".to_string(),
                 version: "20".to_string(),
                 install_script: "install node".to_string(),
+                floating: false,
             },
             SetupRuntime {
                 language: "python".to_string(),
                 version: "3.12".to_string(),
                 install_script: "install python".to_string(),
+                floating: false,
             },
         ];
         let df = "FROM base\nRUN install stuff\n";
@@ -11127,6 +11175,7 @@ runs:
             language: "node".to_string(),
             version: "20".to_string(),
             install_script: "install node v1".to_string(),
+            floating: false,
         }];
         let tag1 = combined_image_tag(&runtimes, "FROM base\nRUN v1\n");
         let tag2 = combined_image_tag(&runtimes, "FROM base\nRUN v2\n");
@@ -11140,11 +11189,13 @@ runs:
                 language: "a".to_string(),
                 version: "1".to_string(),
                 install_script: String::new(),
+                floating: false,
             },
             SetupRuntime {
                 language: "b".to_string(),
                 version: "2".to_string(),
                 install_script: String::new(),
+                floating: false,
             },
         ];
         let runtimes_ba = vec![
@@ -11152,11 +11203,13 @@ runs:
                 language: "b".to_string(),
                 version: "2".to_string(),
                 install_script: String::new(),
+                floating: false,
             },
             SetupRuntime {
                 language: "a".to_string(),
                 version: "1".to_string(),
                 install_script: String::new(),
+                floating: false,
             },
         ];
         let df = "same";
@@ -14996,6 +15049,7 @@ runs:
             language: "rust".to_string(),
             version: "1.78".to_string(),
             install_script: "curl https://sh.rustup.rs -sSf | sh -s -- -y".to_string(),
+            floating: false,
         }];
 
         let rt = &runtime as &dyn ContainerRuntime;

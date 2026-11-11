@@ -68,6 +68,29 @@ pub(crate) struct SetupRuntime {
     pub(crate) version: String,
     /// Shell commands to install this runtime on an Ubuntu base image
     pub(crate) install_script: String,
+    /// The step asked for a channel or a range, so what it installs changes
+    /// as releases come out. Judged on the version as the step wrote it:
+    /// `version` may have lost what made it float, as `3.x` becomes `3`.
+    pub(crate) floating: bool,
+}
+
+/// Whether `version`, as a `language` setup step wrote it, names a channel
+/// or a range rather than a release, so what it installs changes as
+/// releases come out: `latest`, `stable`, `oldstable`, `lts/*`, `3.x`,
+/// `>=3.10`, `^18 || >=20`. A partial release such as `3.12` drifts only
+/// by patch releases and counts as fixed, as does Node's `20`, a release
+/// line of its own; Python's and Go's `3` and `1` take every minor release.
+pub(crate) fn is_floating_version(language: &str, version: &str) -> bool {
+    let version = version.trim().to_ascii_lowercase();
+    let channel = version.chars().any(|c| c.is_ascii_alphabetic())
+        && !version.chars().next().is_some_and(|c| c.is_ascii_digit());
+    let major_only = matches!(language, "python" | "go")
+        && !version.is_empty()
+        && version.chars().all(|c| c.is_ascii_digit());
+    channel
+        || major_only
+        || version.contains(['x', '*', '>', '<', '^', '~', '|', ' '])
+        || version.ends_with("-dev")
 }
 
 /// Definition of a known setup action for runtime detection.
@@ -497,6 +520,7 @@ pub(crate) fn detect_setup_in(steps: &[Step], root: &Path) -> SetupDetection {
             })
             .unwrap_or_else(|| def.default_version.to_string());
         let ver = ver.trim().to_string();
+        let floating = is_floating_version(def.language, &ver);
         // setup-python takes `>= 3.10` with spaces; the check below doesn't.
         let ver = if def.language == "python" && ver.starts_with(['<', '>', '=', '!', '~']) {
             ver.chars().filter(|c| !c.is_whitespace()).collect()
@@ -545,6 +569,7 @@ pub(crate) fn detect_setup_in(steps: &[Step], root: &Path) -> SetupDetection {
             language: def.language.to_string(),
             version: ver.clone(),
             install_script: get_install_script(def.language, &ver),
+            floating,
         };
 
         // Deduplicate: later setup steps override earlier ones for the same

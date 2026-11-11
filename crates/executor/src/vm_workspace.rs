@@ -1,5 +1,5 @@
 //! The job workspace as a container volume, on hosts whose filesystem is not
-//! Linux's.
+//! Linux's: by default on macOS, and on request anywhere.
 //!
 //! Docker Desktop and Podman machine share a macOS directory with their Linux
 //! VM through a file share that does not behave like a Linux filesystem: it
@@ -31,7 +31,9 @@
 //! as artifact uploads, doesn't see it.
 //!
 //! `WRKFLW_WORKSPACE_MOUNT=bind` turns this off; `=volume` turns it on on
-//! Linux too.
+//! Linux and Windows too. Windows has it on request only until its sync,
+//! which has no permission bits to compare and other path separators, has
+//! run against a Windows engine as the macOS one has.
 
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Write};
@@ -95,11 +97,11 @@ impl Entry {
 type Listing = HashMap<PathBuf, Entry>;
 
 /// True when steps should get a volume instead of the host directory.
-fn wanted(host_is_linux: bool, setting: Option<&str>) -> bool {
+fn wanted(on_by_default: bool, setting: Option<&str>) -> bool {
     match setting.map(str::trim) {
         Some("bind") => false,
         Some("volume") => true,
-        _ => !host_is_linux,
+        _ => on_by_default,
     }
 }
 
@@ -210,7 +212,7 @@ pub(crate) async fn before_step(
         return Ok(None);
     };
     let setting = std::env::var(MOUNT_ENV).ok();
-    if !wanted(cfg!(target_os = "linux"), setting.as_deref()) || !host.is_dir() {
+    if !wanted(cfg!(target_os = "macos"), setting.as_deref()) || !host.is_dir() {
         return Ok(None);
     }
     let workspace = {
@@ -1483,12 +1485,15 @@ mod tests {
     }
 
     #[test]
-    fn the_volume_is_used_off_linux_unless_bind_is_asked_for() {
-        assert!(wanted(false, None));
-        assert!(!wanted(true, None));
-        assert!(!wanted(false, Some("bind")));
-        assert!(wanted(true, Some("volume")));
-        assert!(wanted(false, Some("anything else")));
+    fn the_volume_is_the_default_only_where_it_is_proven_and_bind_turns_it_off() {
+        // Where it is the default, as on macOS.
+        assert!(wanted(true, None));
+        assert!(!wanted(true, Some("bind")));
+        assert!(wanted(true, Some("anything else")));
+        // Where it isn't, as on Linux and Windows, only on request.
+        assert!(!wanted(false, None));
+        assert!(wanted(false, Some("volume")));
+        assert!(!wanted(false, Some("anything else")));
     }
 
     #[test]

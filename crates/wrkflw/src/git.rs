@@ -5,6 +5,47 @@ use std::process::Command;
 
 /// One line of `git` output, or `None` when git fails or prints nothing.
 pub(crate) fn line(args: &[&str]) -> Option<String> {
+    let output = command(args).output().ok()?;
+    let line = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (output.status.success() && !line.is_empty()).then_some(line)
+}
+
+/// Whether `remote` has `reference`, or why that couldn't be found out,
+/// as when the network or the credentials fail. Not having it and not
+/// being able to ask are different answers.
+pub(crate) fn remote_has(remote: &str, reference: &str) -> Result<bool, String> {
+    // A remote that doesn't answer isn't waited for: ssh gives up on
+    // connecting, and HTTPS on a transfer that stalls.
+    let output = command(&[
+        "-c",
+        "http.lowSpeedLimit=1",
+        "-c",
+        "http.lowSpeedTime=20",
+        "ls-remote",
+        "--exit-code",
+        remote,
+        reference,
+    ])
+    .output()
+    .map_err(|e| format!("cannot run git: {e}"))?;
+    match output.status.code() {
+        Some(0) => Ok(true),
+        // `--exit-code`: the remote answered and has no such ref.
+        Some(2) => Ok(false),
+        _ => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let why = stderr
+                .lines()
+                .map(str::trim)
+                .rfind(|line| !line.is_empty())
+                .unwrap_or("git ls-remote failed");
+            Err(format!("couldn't ask {remote} about {reference}: {why}"))
+        }
+    }
+}
+
+/// `git args`, set up never to wait for a person or a silent remote.
+fn command(args: &[&str]) -> Command {
     // Some of these ask a remote. One that wants credentials fails instead
     // of stopping the command at a password prompt nobody may be watching.
     let mut command = Command::new("git");
@@ -19,11 +60,12 @@ pub(crate) fn line(args: &[&str]) -> Option<String> {
         |name| std::env::var_os(name).is_some(),
         ssh_command_configured,
     ) {
-        command.env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes");
+        command.env(
+            "GIT_SSH_COMMAND",
+            "ssh -o BatchMode=yes -o ConnectTimeout=20",
+        );
     }
-    let output = command.output().ok()?;
-    let line = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    (output.status.success() && !line.is_empty()).then_some(line)
+    command
 }
 
 /// Whether git should be given an ssh that never prompts: only when neither

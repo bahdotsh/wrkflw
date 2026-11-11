@@ -1,7 +1,7 @@
 # Codebase Index: wrkflw
 
-> Generated: 2026-11-11 08:20:57 UTC | Files: 259 | Lines: 114233
-> Languages: JSON (4), Markdown (26), Rust (166), Shell (6), TOML (19), YAML (38)
+> Generated: 2026-11-11 10:03:40 UTC | Files: 260 | Lines: 115230
+> Languages: JSON (4), Markdown (26), Rust (167), Shell (6), TOML (19), YAML (38)
 
 ## Directory Structure
 
@@ -256,6 +256,7 @@ wrkflw/
         continue_on_error_test.rs
         dynamic_matrix_test.rs
         gitlab_pipeline_test.rs
+        matrix_fold_test.rs
         needs_failure_propagation_test.rs
         reusable_inputs_outputs_test.rs
         startup_test.rs
@@ -1753,7 +1754,7 @@ wrkflw/
 
 ## AGENTS.md
 
-**Language:** Markdown | **Size:** 14.0 KB | **Lines:** 96
+**Language:** Markdown | **Size:** 14.1 KB | **Lines:** 96
 
 **Declarations:**
 
@@ -1761,7 +1762,7 @@ wrkflw/
 
 ## BREAKING_CHANGES.md
 
-**Language:** Markdown | **Size:** 28.1 KB | **Lines:** 380
+**Language:** Markdown | **Size:** 29.9 KB | **Lines:** 382
 
 **Declarations:**
 
@@ -1785,7 +1786,7 @@ wrkflw/
 
 ## INDEX.md
 
-**Language:** Markdown | **Size:** 269.1 KB | **Lines:** 10009
+**Language:** Markdown | **Size:** 268.9 KB | **Lines:** 9997
 
 **Declarations:**
 
@@ -1793,7 +1794,7 @@ wrkflw/
 
 ## README.md
 
-**Language:** Markdown | **Size:** 43.7 KB | **Lines:** 563
+**Language:** Markdown | **Size:** 43.8 KB | **Lines:** 563
 
 **Declarations:**
 
@@ -1923,7 +1924,7 @@ wrkflw/
 
 ## crates/executor/src/acceleration/store.rs
 
-**Language:** Rust | **Size:** 22.1 KB | **Lines:** 617
+**Language:** Rust | **Size:** 22.4 KB | **Lines:** 623
 
 **Imports:**
 - `super::{hex, Acceleration, Secret}`
@@ -1943,7 +1944,7 @@ wrkflw/
 `const REMOTE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10)`
 
 `pub(crate) struct StoredJob`
-> Fields: `name: String`, `canonical_name: String`, `outputs: HashMap<String, String>`, `actions_not_run: Vec<crate::action_fidelity::UnexecutedAction>`
+> Fields: `name: String`, `canonical_name: String`, `outputs: HashMap<String, String>`, `actions_not_run: Vec<crate::action_fidelity::UnexecutedAction>`, `repeated_from: Option<String>`
 
 `pub(crate) struct Entry`
 > Fields: `schema: u32`, `key: String`, `created_at: i64`, `jobs: Vec<StoredJob>`
@@ -2056,7 +2057,7 @@ wrkflw/
 
 ## crates/executor/src/acceleration.rs
 
-**Language:** Rust | **Size:** 56.3 KB | **Lines:** 1603
+**Language:** Rust | **Size:** 56.3 KB | **Lines:** 1604
 
 **Imports:**
 - `pub(crate) use concurrency::acquire_concurrency`
@@ -2907,7 +2908,7 @@ wrkflw/
 
 ## crates/executor/src/job_memory.rs
 
-**Language:** Rust | **Size:** 19.8 KB | **Lines:** 552
+**Language:** Rust | **Size:** 21.3 KB | **Lines:** 588
 
 **Imports:**
 - `std::collections::HashMap`
@@ -2977,7 +2978,7 @@ wrkflw/
 
 `pub(crate) fn job_id(identity: &str) -> String`
 
-`fn reserve_for(peaks: &[u64]) -> Option<u64>`
+`fn reserve_for(peaks: &[u64], highest: u64) -> Option<u64>`
 
 `const STORE_VERSION: u32 = 1`
 
@@ -2991,7 +2992,7 @@ wrkflw/
 
 
 `struct Measured`
-> Fields: `peaks: Vec<u64>`, `at: i64`
+> Fields: `peaks: Vec<u64>`, `highest: u64`, `at: i64`
 
 `static STORE_LOCK: Mutex<()> = Mutex::new(())`
 
@@ -3582,7 +3583,7 @@ wrkflw/
 
 ## crates/executor/src/matrix_fold.rs
 
-**Language:** Rust | **Size:** 16.7 KB | **Lines:** 454
+**Language:** Rust | **Size:** 22.5 KB | **Lines:** 606
 
 **Imports:**
 - `crate::engine::{get_effective_runner_image, JobResult, JobStatus}`
@@ -3597,7 +3598,18 @@ wrkflw/
 
 `fn job_body_text(job: &Job) -> Option<String>`
 
+`fn collect_strings(value: &serde_json::Value, text: &mut String)`
+
 `fn differing_keys(a: &HashMap<String, Value>, b: &HashMap<String, Value>) -> Vec<String>`
+
+`enum Reads`
+> Variants: `Keys`, `Any`
+
+`fn matrix_reads(text: &str) -> Reads`
+
+`fn is_word(c: char) -> bool`
+
+`fn mentions<'a>(lower: &'a str, name: &'a str) -> impl Iterator<Item = &'a str> + 'a`
 
 `fn reads_matrix_keys(body: &str, keys: &[String]) -> bool`
 
@@ -3751,7 +3763,7 @@ wrkflw/
 
 ## crates/executor/src/setup_actions.rs
 
-**Language:** Rust | **Size:** 35.1 KB | **Lines:** 880
+**Language:** Rust | **Size:** 38.5 KB | **Lines:** 962
 
 **Imports:**
 - `std::collections::HashMap`
@@ -3764,14 +3776,19 @@ wrkflw/
 `pub(crate) const NO_IMPLEMENTATION: &str = "no implementation in wrkflw"`
 
 `pub(crate) struct BuiltRuntimes`
-> Fields: `installed: Vec<String>`, `refused: Vec<String>`
+> Fields: `installed: Vec<String>`, `not_built: Vec<(usize, NotBuilt)>`
+
+`pub(crate) enum NotBuilt`
+> Variants: `Refused`, `Superseded`
 
 **`impl BuiltRuntimes`**
   `fn has(&self, language: &str) -> bool`
 
+  `pub(crate) fn for_composite(&self) -> Self`
+
 
 `pub(crate) struct SetupDetection`
-> Fields: `runtimes: Vec<SetupRuntime>`, `refused: Vec<String>`
+> Fields: `runtimes: Vec<SetupRuntime>`, `not_built: Vec<(usize, NotBuilt)>`
 
 `pub(crate) struct SetupRuntime`
 > Fields: `language: String`, `version: String`, `install_script: String`
@@ -3785,7 +3802,7 @@ wrkflw/
 
 `pub(crate) fn version_from_file(root: &Path, file: &str) -> Option<String>`
 
-`pub(crate) fn unrun_action_cause( repository: &str, built: &BuiltRuntimes, container_runtime: bool, ) -> Option<&'static str>`
+`pub(crate) fn unrun_action_cause( repository: &str, built: &BuiltRuntimes, container_runtime: bool, step_idx: usize, ) -> Option<&'static str>`
 
 `fn contained_path(root: &Path, file: &str) -> Option<PathBuf>`
 
@@ -3816,6 +3833,10 @@ wrkflw/
 `fn go_release_known(version: &str) -> bool`
 
 `pub(crate) const UV_PYTHON_DIR: &str = "/opt/uv/python"`
+
+`pub(crate) const PYTHON_SCRIPTS_DIR: &str = "/opt/uv/python-bin"`
+
+`const PRINT_SCRIPTS_DIR: &str = "import sysconfig`
 
 `pub(crate) const DROP_EXTERNALLY_MANAGED: &str = "import os, sysconfig`
 
@@ -3949,14 +3970,16 @@ wrkflw/
 
 ## crates/executor/src/vm_workspace.rs
 
-**Language:** Rust | **Size:** 76.2 KB | **Lines:** 2123
+**Language:** Rust | **Size:** 91.4 KB | **Lines:** 2536
 
 **Imports:**
 - `std::collections::{HashMap, HashSet}`
 - `std::io::{self, Read, Write}`
 - `std::path::{Path, PathBuf}`
 - `std::process::{Command, Stdio}`
+- `std::sync::atomic::{AtomicU64, Ordering}`
 - `std::sync::{Arc, LazyLock, Mutex}`
+- `std::time::{Duration, Instant}`
 - `sha2::{Digest, Sha256}`
 - `wrkflw_runtime::container::ContainerRuntime`
 - `crate::kubernetes::sync::{clear_type_conflict, safe_relative_path}`
@@ -3996,10 +4019,12 @@ wrkflw/
 `fn volume_name(host: &Path) -> String`
 
 `struct State`
-> Fields: `helper: Option<String>`, `volume: Option<Listing>`, `host: Option<Listing>`, `kept: HashSet<PathBuf>`, `pending: HashSet<PathBuf>`, `unlisted: HashSet<PathBuf>`, `unusable: bool`, `used: bool`
+> Fields: `helper: Option<String>`, `volume: Option<Listing>`, `host: Option<Listing>`, `kept: HashSet<PathBuf>`, `pending: HashSet<PathBuf>`, `unlisted: HashSet<PathBuf>`, `unusable: bool`, `used: bool`, `stalled: Option<String>`, `step_in_volume: bool`
 
 **`impl State`**
   `fn new() -> Self`
+
+  `fn for_volume(volume: &str) -> Self`
 
 
 `fn is_kept(kept: &HashSet<PathBuf>, path: &Path) -> bool`
@@ -4104,9 +4129,13 @@ wrkflw/
 
 `fn kept_file(volume: &str) -> Option<PathBuf>`
 
-`fn load_kept(file: Option<&Path>) -> HashSet<PathBuf>`
+`fn pending_file(volume: &str) -> Option<PathBuf>`
 
-`fn save_kept(file: Option<&Path>, kept: &HashSet<PathBuf>)`
+`fn forget_saved(volume: &str)`
+
+`fn load_paths(file: Option<&Path>) -> HashSet<PathBuf>`
+
+`fn save_paths(file: Option<&Path>, kept: &HashSet<PathBuf>)`
 
 `fn refuse_link_parents(host: &Path, rel: &Path) -> io::Result<()>`
 
@@ -4114,7 +4143,44 @@ wrkflw/
 
 `fn set_dir_mode(_dir: &Path, _mode: Option<u32>, _entry: Option<&Entry>)`
 
-`fn drain(stderr: Option<std::process::ChildStderr>) -> std::thread::JoinHandle<String>`
+`const ENGINE_IDLE_LIMIT: Duration = Duration::from_secs(10 * 60)`
+
+`const CLEANUP_IDLE_LIMIT: Duration = Duration::from_secs(60)`
+
+`struct Progress(Arc<AtomicU64>)`
+
+**`impl Progress`**
+  `fn add(&self, bytes: usize)`
+
+  `fn get(&self) -> u64`
+
+
+`struct Counted<T>`
+> Fields: `inner: T`, `progress: Progress`
+
+**`impl<T> Counted<T>`**
+  `fn new(inner: T, progress: Progress) -> Self`
+
+
+**`impl<R: Read> Read for Counted<R>`**
+  `fn read(&mut self, buf: &mut [u8]) -> io::Result<usize>`
+
+
+**`impl<W: Write> Write for Counted<W>`**
+  `fn write(&mut self, buf: &[u8]) -> io::Result<usize>`
+
+  `fn flush(&mut self) -> io::Result<()>`
+
+
+`fn bound( mut child: std::process::Child, what: String, idle: Duration, progress: Progress, ) -> std::thread::JoinHandle<io::Result<std::process::ExitStatus>>`
+
+`fn finish( watcher: std::thread::JoinHandle<io::Result<std::process::ExitStatus>>, ) -> io::Result<std::process::ExitStatus>`
+
+`fn drain<R: Read + Send + 'static>( pipe: Option<R>, progress: Progress, ) -> std::thread::JoinHandle<Vec<u8>>`
+
+`fn output_within( command: &mut Command, stdin: Option<Vec<u8>>, what: &str, idle: Duration, ) -> io::Result<std::process::Output>`
+
+`fn only_vanished(stderr: &str) -> bool`
 
 `fn exec(cli: &str, helper: &str, cmd: &[&str], stdin: Option<Vec<u8>>) -> io::Result<Vec<u8>>`
 
@@ -4855,7 +4921,7 @@ wrkflw/
 
 ## crates/runs/src/digest.rs
 
-**Language:** Rust | **Size:** 44.5 KB | **Lines:** 1129
+**Language:** Rust | **Size:** 47.9 KB | **Lines:** 1218
 
 **Imports:**
 - `crate::record::{JobRecord, RunRecord, RunStatus, StepRecord, SCHEMA_VERSION}`
@@ -4886,7 +4952,7 @@ wrkflw/
 
 `static FAILING: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"\b(FAIL(ED|URE)?|ERROR|Failed)\b").unwrap())`
 
-`static BRACKETED: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"\[[^\]]*\]").unwrap())`
+`static BRACKETED: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"\[[^\]]*\]|\([^)]*\)").unwrap())`
 
 `fn reports_pass(line: &str) -> bool`
 
@@ -4915,6 +4981,12 @@ wrkflw/
 `fn names_a_location(line: &str) -> bool`
 
 `fn failure_signature(text: &str) -> BTreeSet<String>`
+
+`fn failure_context(text: &str) -> BTreeSet<String>`
+
+`static DIGITS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"\d+").unwrap())`
+
+`fn failure_lines(text: &str) -> Vec<String>`
 
 `fn same_failure(a: &FailedStep, b: &FailedStep) -> bool`
 
@@ -8219,7 +8291,7 @@ wrkflw/
 
 ## crates/wrkflw/src/compare_cmd.rs
 
-**Language:** Rust | **Size:** 50.6 KB | **Lines:** 1348
+**Language:** Rust | **Size:** 53.1 KB | **Lines:** 1411
 
 **Imports:**
 - `crate::git::line as git_line`
@@ -8268,9 +8340,9 @@ wrkflw/
 
 `const TAG_EVENTS: &[&str] = &[ "push", "create", "release", "workflow_dispatch", "workflow_run", ]`
 
-`fn head_is_tag(remote: &RemoteRun) -> bool`
+`fn head_is_tag(remote: &RemoteRun) -> Result<bool, String>`
 
-`fn head_is_tag_with(remote: &RemoteRun, git: impl Fn(&[&str]) -> Option<String>) -> bool`
+`fn head_is_tag_with( remote: &RemoteRun, git: impl Fn(&[&str]) -> Option<String>, origin_has: impl Fn(&str) -> Result<bool, String>, ) -> Result<bool, String>`
 
 `fn run_args( remote: &RemoteRun, path: &Path, runtime: &str, child_args: &[String], head_is_tag: bool, ) -> Vec<String>`
 
@@ -8395,7 +8467,7 @@ wrkflw/
 
 ## crates/wrkflw/src/git.rs
 
-**Language:** Rust | **Size:** 3.2 KB | **Lines:** 90
+**Language:** Rust | **Size:** 4.5 KB | **Lines:** 132
 
 **Imports:**
 - `std::process::Command`
@@ -8403,6 +8475,10 @@ wrkflw/
 **Declarations:**
 
 `pub(crate) fn line(args: &[&str]) -> Option<String>`
+
+`pub(crate) fn remote_has(remote: &str, reference: &str) -> Result<bool, String>`
+
+`fn command(args: &[&str]) -> Command`
 
 `fn batch_ssh_wanted(env_set: impl Fn(&str) -> bool, configured: impl Fn() -> bool) -> bool`
 
@@ -9415,6 +9491,39 @@ wrkflw/
 `async fn a_rule_that_forbids_failure_stops_later_stages()`
 
 `async fn naming_a_matrix_job_runs_past_its_matrix_condition()`
+
+---
+
+## crates/wrkflw/tests/matrix_fold_test.rs
+
+**Language:** Rust | **Size:** 4.6 KB | **Lines:** 123
+
+**Imports:**
+- `std::fs`
+- `tempfile::tempdir`
+- `wrkflw_lib::executor::engine::{
+    execute_workflow, ExecutionConfig, ExecutionResult, JobStatus, RuntimeType,
+}`
+
+**Declarations:**
+
+`fn emulation_cfg() -> ExecutionConfig`
+
+`async fn run(yaml: &str) -> ExecutionResult`
+
+`fn legs(result: &ExecutionResult) -> Vec<(String, JobStatus, Option<String>)>`
+
+`fn workflow(strategy: &str, steps: &str) -> String`
+
+`const OS: &str = " matrix:\n os: [ubuntu-latest, macos-latest, windows-latest]"`
+
+`async fn legs_that_only_change_the_runner_run_once_in_matrix_order()`
+
+`async fn a_leg_repeating_a_failed_leg_fails_and_says_whose_failure_it_is()`
+
+`async fn a_leg_whose_original_fail_fast_skipped_is_skipped_too()`
+
+`async fn a_condition_reading_the_runner_over_several_lines_runs_every_leg()`
 
 ---
 

@@ -10813,6 +10813,25 @@ runs:
         }
     }
 
+    /// Piped into a shell, a download that fails is an empty script that
+    /// succeeds. Every installer is saved first, so the build fails instead.
+    #[test]
+    fn no_installer_is_piped_into_a_shell() {
+        for script in [
+            get_install_script("node", "20"),
+            get_install_script("php", "8.3"),
+            get_install_script("python", "3.12"),
+            uv_install_command("0.9.30"),
+            runner_node_install(),
+        ] {
+            for shell in ["| sh", "| bash", "| php"] {
+                assert!(!script.contains(shell), "{script}");
+            }
+        }
+        assert!(uv_install_command("latest").contains("/usr/local/bin/uv --version"));
+        assert!(get_install_script("node", "20").contains("node --version"));
+    }
+
     #[test]
     fn setup_uv_is_installed_before_python_at_its_own_version() {
         let python = HashMap::from([("python-version".to_string(), "3.12".to_string())]);

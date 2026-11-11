@@ -599,11 +599,16 @@ pub(crate) fn get_install_script(language: &str, version: &str) -> String {
                 v = version
             )
         }
+        // The setup script is saved before it runs: piped into a shell, a
+        // failed download is an empty script that succeeds, and apt then
+        // installs the distribution's own, older Node.js without a word.
         "node" => {
             // Strip .x suffix for nodesource URL (e.g., "16.x" -> "16")
             let major = version.split('.').next().unwrap_or(version);
             format!(
-                "curl -fsSL https://deb.nodesource.com/setup_{}.x | bash - && apt-get install -y nodejs",
+                "curl -fsSL https://deb.nodesource.com/setup_{}.x -o /tmp/node-setup.sh && \
+                 bash /tmp/node-setup.sh && rm -f /tmp/node-setup.sh && \
+                 apt-get install -y nodejs && node --version",
                 major
             )
         }
@@ -612,7 +617,9 @@ pub(crate) fn get_install_script(language: &str, version: &str) -> String {
                 "apt-get install -y software-properties-common && \
                  add-apt-repository -y ppa:ondrej/php && apt-get update && \
                  apt-get install -y php{ver}-cli php{ver}-mbstring php{ver}-xml php{ver}-curl unzip && \
-                 curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer",
+                 curl -fsSL https://getcomposer.org/installer -o /tmp/composer-setup.php && \
+                 php /tmp/composer-setup.php --install-dir=/usr/local/bin --filename=composer && \
+                 rm -f /tmp/composer-setup.php",
                 ver = version
             )
         }
@@ -787,6 +794,10 @@ pub(crate) const DROP_EXTERNALLY_MANAGED: &str = "import os, sysconfig; \
 
 /// The command that installs uv `version` (`latest` or a release such as
 /// `0.9.30`) into `/usr/local/bin`, replacing one already there.
+///
+/// The installer is saved before it runs, and the build checks uv is there
+/// after: piped into `sh`, a failed download is an empty script that
+/// succeeds, and the image would be kept, without uv, under its tag.
 pub(crate) fn uv_install_command(version: &str) -> String {
     let url = if version == "latest" {
         "https://astral.sh/uv/install.sh".to_string()
@@ -794,7 +805,9 @@ pub(crate) fn uv_install_command(version: &str) -> String {
         format!("https://astral.sh/uv/{}/install.sh", version)
     };
     format!(
-        "(curl -LsSf {} | env UV_INSTALL_DIR=/usr/local/bin UV_NO_MODIFY_PATH=1 sh)",
+        "(curl -LsSf {} -o /tmp/uv-install.sh && \
+          env UV_INSTALL_DIR=/usr/local/bin UV_NO_MODIFY_PATH=1 sh /tmp/uv-install.sh && \
+          rm -f /tmp/uv-install.sh && /usr/local/bin/uv --version)",
         url
     )
 }

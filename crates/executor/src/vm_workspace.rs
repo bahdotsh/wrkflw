@@ -609,6 +609,9 @@ impl VmWorkspace {
             .args([
                 "exec",
                 "-i",
+                // tar's messages in English, which `only_vanished` reads.
+                "-e",
+                "LC_ALL=C",
                 helper,
                 "tar",
                 "-C",
@@ -637,8 +640,11 @@ impl VmWorkspace {
         let stderr = stderr.join().unwrap_or_default();
         let unpacked = unpacked?;
         // GNU tar exits 1 when a file changed while it was read, as one a
-        // background process still writes may.
-        if !status.success() && status.code() != Some(1) {
+        // background process still writes may, and 2 when a name it was
+        // given is gone, as one that process deleted after the listing is.
+        // The next copy back lists the volume again and settles both.
+        let vanished = status.code() == Some(2) && only_vanished(&stderr);
+        if !status.success() && status.code() != Some(1) && !vanished {
             return Err(io::Error::other(format!("tar failed: {}", stderr.trim())));
         }
         Ok(unpacked)
@@ -1292,6 +1298,31 @@ fn drain(stderr: Option<std::process::ChildStderr>) -> std::thread::JoinHandle<S
         }
         text
     })
+}
+
+/// Whether GNU tar's `stderr` reports only names that were gone when it
+/// came to read them, besides its closing summary.
+fn only_vanished(stderr: &str) -> bool {
+    const GONE: [&str; 3] = [
+        ": Cannot stat: No such file or directory",
+        ": File removed before we read it",
+        ": file changed as we read it",
+    ];
+    let mut vanished = false;
+    for line in stderr
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        if line == "tar: Exiting with failure status due to previous errors" {
+            continue;
+        }
+        if !(line.starts_with("tar: ") && GONE.iter().any(|end| line.ends_with(end))) {
+            return false;
+        }
+        vanished = true;
+    }
+    vanished
 }
 
 /// Run `cmd` in the helper; it must succeed.
@@ -2006,6 +2037,24 @@ mod tests {
         assert!(unpacked.failed.is_empty());
     }
 
+    #[test]
+    fn only_names_gone_before_tar_read_them_are_tolerated() {
+        let gone = "tar: src/x.tmp: Cannot stat: No such file or directory\n\
+                    tar: src/y: File removed before we read it\n\
+                    tar: Exiting with failure status due to previous errors\n";
+        assert!(only_vanished(gone));
+        assert!(!only_vanished(
+            "tar: src/x: Cannot open: Permission denied\n\
+             tar: Exiting with failure status due to previous errors\n"
+        ));
+        assert!(!only_vanished(&format!("{gone}tar: write error\n")));
+        // A failure that names nothing isn't one of these.
+        assert!(!only_vanished(""));
+        assert!(!only_vanished(
+            "tar: Exiting with failure status due to previous errors\n"
+        ));
+    }
+
     /// A Docker daemon that runs Linux containers, as the helper needs. A
     /// Windows daemon answers `docker info` but can't start it.
     fn docker_ready() -> bool {
@@ -2116,6 +2165,29 @@ mod tests {
         let check = "cd /ws && test \"$(cat src/keep.txt)\" = edited \
                      && test -e \"$(printf 'src/bad\\377')\" && test -e src/Case && test -e src/case";
         exec(workspace.cli, &helper, &["sh", "-c", check], None).unwrap();
+
+        // A name a step's background process removed after the listing is
+        // gone when tar reads it; what is still there comes back.
+        let listed = workspace.lock().volume.clone().unwrap();
+        exec(
+            workspace.cli,
+            &helper,
+            &["sh", "-c", "echo late > /ws/src/late.txt"],
+            None,
+        )
+        .unwrap();
+        let unpacked = workspace
+            .fetch(
+                &helper,
+                &paths(&["src/late.txt", "src/vanished.tmp"]),
+                &listed,
+            )
+            .unwrap();
+        assert!(unpacked.failed.is_empty() && unpacked.refused.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(host.join("src/late.txt")).unwrap(),
+            "late\n"
+        );
 
         release(&host, false);
         drop(dir);

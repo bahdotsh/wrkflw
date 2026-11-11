@@ -228,6 +228,9 @@ pub(crate) async fn metered<F: std::future::Future>(
     succeeded: impl FnOnce(&F::Output) -> bool,
 ) -> F::Output {
     let meter = Arc::new(JobMeter::default());
+    // Gives the place up even when this future is dropped part way, not
+    // when the last of the meter's holders lets go of it.
+    let release = Release(meter.clone());
     let active = Active::register(&meter);
     let output = METER.scope(meter.clone(), future).await;
     drop(active);
@@ -248,8 +251,17 @@ pub(crate) async fn metered<F: std::future::Future>(
         // must see what this one measured, not take the place unmeasured.
         crate::vm_memory::measurements_changed();
     }
-    drop(meter.slot.lock().unwrap_or_else(|e| e.into_inner()).take());
+    drop(release);
     output
+}
+
+/// Gives up the place a job [`hold`]s when dropped.
+struct Release(Arc<JobMeter>);
+
+impl Drop for Release {
+    fn drop(&mut self) {
+        drop(self.0.slot.lock().unwrap_or_else(|e| e.into_inner()).take());
+    }
 }
 
 /// Name the current job's measurements, so [`metered`] keeps them under

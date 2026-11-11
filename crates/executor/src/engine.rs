@@ -1257,14 +1257,17 @@ impl JobResult {
     }
 
     /// A job wrkflw couldn't set up, as when its image doesn't build: it
-    /// fails with no step, and `error` as its log, after telling the run's
-    /// observers so. The run's record then holds a failed job whose log
-    /// names the setup error, which the failure digest reports as
-    /// `setup_failed`, instead of a run that stopped with no job to show.
+    /// fails with no step, and `error` as its log. The run's record then
+    /// holds a failed job whose log names the setup error, which the
+    /// failure digest reports as `setup_failed`, instead of a run that
+    /// stopped with no job to show. `failure_allowed` is the job's
+    /// `continue-on-error`, as for any other failure of it. The caller
+    /// tells the run's observers, once each, that it started and ended.
     fn setup_failed(
         name: impl Into<String>,
         canonical_name: impl Into<String>,
         error: &ExecutionError,
+        failure_allowed: bool,
     ) -> Self {
         let logs = error.to_string();
         wrkflw_logging::error(&logs);
@@ -1275,10 +1278,9 @@ impl JobResult {
             steps: Vec::new(),
             logs,
             outputs: HashMap::new(),
-            failure_allowed: false,
+            failure_allowed,
             repeated_from: None,
         }
-        .announced()
     }
 
     /// A job that failed before any of its steps ran. The reason is carried on a
@@ -3104,7 +3106,15 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
     .await
     {
         Ok(image) => image,
-        Err(e) => return Ok(JobResult::setup_failed(ctx.job_name, ctx.job_name, &e)),
+        Err(e) => {
+            let failure_allowed =
+                job_failure_allowed(job, &None, &job_env, &job_user_env, &ctx.services);
+            // No step loop has announced this job yet.
+            return Ok(
+                JobResult::setup_failed(ctx.job_name, ctx.job_name, &e, failure_allowed)
+                    .announced(),
+            );
+        }
     };
 
     // GHA default job timeout is 360 minutes; sanitize to avoid panic on negative/NaN
@@ -3538,7 +3548,22 @@ async fn execute_matrix_job(
         .await
         {
             Ok(image) => image,
-            Err(e) => return Ok(JobResult::setup_failed(&matrix_job_name, job_name, &e)),
+            Err(e) => {
+                let failure_allowed = job_failure_allowed(
+                    job_template,
+                    &Some(combination.values.clone()),
+                    &job_env,
+                    &job_user_env,
+                    services,
+                );
+                let result =
+                    JobResult::setup_failed(&matrix_job_name, job_name, &e, failure_allowed);
+                // The leg's start was announced as its step loop was set up,
+                // so only its end is left to tell.
+                loop_state.job_logs = result.logs.clone();
+                loop_state.emit_job_finished(false, failure_allowed);
+                return Ok(result);
+            }
         };
 
         let mut all_steps_ok = true;
@@ -9207,9 +9232,24 @@ runs:
 
     /// A job whose image can't be built fails with no step and the build
     /// error as its log, in a matrix leg with the default fail-fast too,
-    /// rather than stopping the run with no job to report.
+    /// rather than stopping the run with no job to report. Each job is
+    /// announced as started and finished once, and `continue-on-error`
+    /// still allows its failure.
     #[tokio::test]
     async fn a_job_whose_image_fails_to_build_is_a_failed_job() {
+        #[derive(Default)]
+        struct Seen(std::sync::Mutex<Vec<String>>);
+        impl crate::events::ExecutionObserver for Seen {
+            fn on_event(&self, event: &crate::events::ExecutionEvent) {
+                use crate::events::ExecutionEvent as E;
+                let line = match event {
+                    E::JobStarted { job, .. } => format!("start {job}"),
+                    E::JobFinished { job, .. } => format!("finish {job}"),
+                    _ => return,
+                };
+                self.0.lock().unwrap().push(line);
+            }
+        }
         let run_dir = tempfile::tempdir().unwrap();
         let path = run_dir.path().join("ci.yml");
         fs::write(
@@ -9218,7 +9258,10 @@ runs:
              - uses: actions/setup-node@v4\n        with:\n          node-version: 20\n  \
              legs:\n    runs-on: ubuntu-latest\n    strategy:\n      matrix:\n        \
              node: [18, 20]\n    steps:\n      - uses: actions/setup-node@v4\n        \
-             with:\n          node-version: ${{ matrix.node }}\n",
+             with:\n          node-version: ${{ matrix.node }}\n  \
+             allowed:\n    runs-on: ubuntu-latest\n    continue-on-error: true\n    \
+             steps:\n      - uses: actions/setup-node@v4\n        with:\n          \
+             node-version: 20\n",
         )
         .unwrap();
         let workflow = parse_workflow(&path).unwrap();
@@ -9229,21 +9272,29 @@ runs:
             fail_builds: true,
             ..MockContainerRuntime::default()
         };
-        for job in ["plain", "legs"] {
-            let results = execute_job_batch(
-                &[job.to_string()],
-                &workflow,
-                &runtime,
-                &env_context,
-                &HashMap::new(),
-                false,
-                None,
-                None,
-                &HashMap::new(),
-                &HashMap::new(),
-                &crate::artifacts::ArtifactStore::new(run_dir.path()).unwrap(),
-                &crate::cache::CacheStore::new().unwrap(),
-                &HashMap::new(),
+        for job in ["plain", "legs", "allowed"] {
+            let seen = std::sync::Arc::new(Seen::default());
+            let hooks = crate::events::RunHooks {
+                observers: vec![seen.clone()],
+                from_step: None,
+            };
+            let results = crate::events::with_run_hooks(
+                hooks,
+                execute_job_batch(
+                    &[job.to_string()],
+                    &workflow,
+                    &runtime,
+                    &env_context,
+                    &HashMap::new(),
+                    false,
+                    None,
+                    None,
+                    &HashMap::new(),
+                    &HashMap::new(),
+                    &crate::artifacts::ArtifactStore::new(run_dir.path()).unwrap(),
+                    &crate::cache::CacheStore::new().unwrap(),
+                    &HashMap::new(),
+                ),
             )
             .await
             .unwrap_or_else(|e| panic!("{job}: the run stopped: {e}"));
@@ -9259,6 +9310,16 @@ runs:
                 "{job}: {}",
                 failed.logs
             );
+            assert_eq!(failed.failure_allowed, job == "allowed", "{job}");
+
+            let seen = seen.0.lock().unwrap().clone();
+            for result in &results {
+                for event in ["start", "finish"] {
+                    let line = format!("{event} {}", result.name);
+                    let times = seen.iter().filter(|l| **l == line).count();
+                    assert_eq!(times, 1, "{job}: {line} in {seen:?}");
+                }
+            }
         }
     }
 

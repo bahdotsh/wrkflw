@@ -1,6 +1,6 @@
 # Codebase Index: wrkflw
 
-> Generated: 2026-11-11 15:56:07 UTC | Files: 260 | Lines: 116917
+> Generated: 2026-11-11 17:02:11 UTC | Files: 260 | Lines: 117213
 > Languages: JSON (4), Markdown (26), Rust (167), Shell (6), TOML (19), YAML (38)
 
 ## Directory Structure
@@ -1786,7 +1786,7 @@ wrkflw/
 
 ## INDEX.md
 
-**Language:** Markdown | **Size:** 273.6 KB | **Lines:** 10144
+**Language:** Markdown | **Size:** 275.9 KB | **Lines:** 10209
 
 **Declarations:**
 
@@ -2908,7 +2908,7 @@ wrkflw/
 
 ## crates/executor/src/job_memory.rs
 
-**Language:** Rust | **Size:** 34.6 KB | **Lines:** 933
+**Language:** Rust | **Size:** 38.4 KB | **Lines:** 1015
 
 **Imports:**
 - `std::collections::HashMap`
@@ -2930,6 +2930,8 @@ wrkflw/
 
 `const FLOOR_MARGIN_DIVISOR: u64 = 8`
 
+`const FLOOR_MIN_MARGIN_BYTES: u64 = 128 * MIB`
+
 `pub(crate) const SIGKILL_EXIT: i32 = 137`
 
 `const KILLED_CHILD_SIGNS: &[&str] = &[ // cargo, for rustc or a build script "(signal: 9, SIGKILL", // gcc and collect2, for ld or cc1 "terminated with signal 9", "Killed signal terminated program", ]`
@@ -2949,6 +2951,8 @@ wrkflw/
   `pub(crate) fn unmeasured(&self)`
 
   `pub(crate) fn killed(&self)`
+
+  `pub(crate) fn killed_alone(&self)`
 
   `pub(crate) fn is_incomplete(&self) -> bool`
 
@@ -2983,11 +2987,13 @@ wrkflw/
 
 `pub(crate) fn measure_as(id: &str)`
 
-`pub(crate) fn in_family(family: &str, name: &str)`
+`pub(crate) async fn leg_place( id: Option<&str>, family: Option<&str>, name: &str, ) -> Option<tokio::sync::OwnedSemaphorePermit>`
+
+`fn in_family(family: &str, name: &str)`
 
 `pub(crate) fn sized_by_matrix(bytes: u64)`
 
-`pub(crate) fn hold( slot: Option<tokio::sync::OwnedSemaphorePermit>, ) -> Option<tokio::sync::OwnedSemaphorePermit>`
+`fn hold( slot: Option<tokio::sync::OwnedSemaphorePermit>, ) -> Option<tokio::sync::OwnedSemaphorePermit>`
 
 `pub(crate) fn meter() -> Option<Arc<JobMeter>>`
 
@@ -3030,9 +3036,9 @@ wrkflw/
 
 `fn reserve_in(store: &Store, id: &str, family: Option<&str>) -> Option<Reserve>`
 
-`fn keep(store: &mut Store, id: &str, family: Option<&str>, outcome: Outcome, now: i64) -> bool`
+`fn keep( store: &mut Store, id: &str, family: Option<&str>, outcome: Outcome, sized_by_matrix: bool, now: i64, ) -> bool`
 
-`fn record(id: &str, family: Option<&str>, meter: &JobMeter, passed: bool)`
+`fn record(id: &str, family: Option<&str>, meter: &JobMeter, passed: bool) -> bool`
 
 `fn to_keep(outcome: Outcome, passed: bool) -> Option<Outcome>`
 
@@ -3921,12 +3927,13 @@ wrkflw/
 
 ## crates/executor/src/vm_memory.rs
 
-**Language:** Rust | **Size:** 28.9 KB | **Lines:** 762
+**Language:** Rust | **Size:** 34.1 KB | **Lines:** 911
 
 **Imports:**
-- `std::sync::{Arc, OnceLock}`
+- `std::collections::HashMap`
+- `std::sync::{Arc, Mutex, OnceLock}`
 - `std::time::{Duration, Instant}`
-- `tokio::sync::{OwnedSemaphorePermit, Semaphore}`
+- `tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore}`
 
 **Declarations:**
 
@@ -3948,10 +3955,14 @@ wrkflw/
 `fn shared(bytes: u64) -> u64`
 
 `struct Pool`
-> Fields: `places: Arc<Semaphore>`, `limit: Limit`, `measured: tokio::sync::Notify`
+> Fields: `places: Arc<Semaphore>`, `limit: Limit`, `measured: Mutex<HashMap<String, Arc<Notify>>>`
 
 **`impl Pool`**
   `fn new(limit: Limit) -> Pool`
+
+  `fn measured(&self, family: &str) -> Arc<Notify>`
+
+  `async fn place(&self, measured: Option<u64>) -> Option<OwnedSemaphorePermit>`
 
   `fn weight(&self, measured: Option<u64>) -> u32`
 
@@ -3964,7 +3975,11 @@ wrkflw/
 
 `pub(crate) async fn job_slot( job: Option<&str>, family: Option<&str>, ) -> Option<OwnedSemaphorePermit>`
 
-`pub(crate) fn measurements_changed()`
+`async fn leg_slot(pool: &Pool, job: &str, family: &str) -> Option<OwnedSemaphorePermit>`
+
+`async fn reserve(job: &str, family: Option<&str>) -> Option<crate::job_memory::Reserve>`
+
+`pub(crate) fn measurements_changed(family: &str)`
 
 `pub(crate) fn sizes_by_memory() -> bool`
 

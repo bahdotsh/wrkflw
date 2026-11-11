@@ -2527,12 +2527,15 @@ async fn resolve_runner_image(
         return Ok(RunnerImage::plain(base_image));
     }
 
-    let SetupDetection { runtimes, refused } = detect_setup(steps);
+    let SetupDetection {
+        runtimes,
+        not_built,
+    } = detect_setup(steps);
     if runtimes.is_empty() {
         Ok(RunnerImage {
             built: BuiltRuntimes {
                 installed: Vec::new(),
-                refused,
+                not_built,
             },
             ..RunnerImage::plain(base_image)
         })
@@ -2544,7 +2547,7 @@ async fn resolve_runner_image(
             image,
             built: BuiltRuntimes {
                 installed: runtimes.into_iter().map(|rt| rt.language).collect(),
-                refused,
+                not_built,
             },
         })
     }
@@ -4345,6 +4348,7 @@ impl StepExecutionContext<'_> {
             repository,
             self.installed_runtimes,
             uses_container_runtime(self.job_env),
+            self.step_idx,
         )
     }
 }
@@ -6571,6 +6575,9 @@ async fn execute_composite_action(
     services: &JobServices<'_>,
     pending_cache_saves: &std::sync::Mutex<Vec<PendingCacheSave>>,
 ) -> Result<StepResult, ExecutionError> {
+    // The job's step indices don't name the composite's own steps.
+    let composite_built = installed_runtimes.for_composite();
+    let installed_runtimes = &composite_built;
     // Find the action definition file
     let action_yaml = action_path.join("action.yml");
     let action_yaml_alt = action_path.join("action.yaml");
@@ -9420,7 +9427,7 @@ runs:
             runner_image: "ubuntu:latest",
             installed_runtimes: &BuiltRuntimes {
                 installed: installed.to_vec(),
-                refused: Vec::new(),
+                not_built: Vec::new(),
             },
             verbose: false,
             matrix_combination: &None,
@@ -10668,7 +10675,7 @@ runs:
             )];
             let detection = detect_setup_in(&steps, dir.path());
             assert!(detection.runtimes.is_empty(), "{unknown}");
-            assert_eq!(detection.refused, ["go"], "{unknown}");
+            assert_eq!(detection.not_built, [(0, NotBuilt::Refused)], "{unknown}");
         }
     }
 
@@ -10743,23 +10750,97 @@ runs:
         let steps = vec![make_step_uses("actions/setup-node@v4", Some(with))];
         let detected = detect_setup_in(&steps, dir.path());
         assert_eq!(detected.runtimes[0].version, "lts");
-        assert!(detected.refused.is_empty());
+        assert!(detected.not_built.is_empty());
     }
 
     #[test]
-    fn a_refused_version_is_named_unless_a_later_step_installs_the_runtime() {
+    fn a_setup_step_counts_as_run_only_when_the_image_holds_its_version() {
         let bad = HashMap::from([("node-version".to_string(), "20; rm -rf /".to_string())]);
         let good = HashMap::from([("node-version".to_string(), "22".to_string())]);
+        let older = HashMap::from([("node-version".to_string(), "18".to_string())]);
         let refused = detect_setup(&[make_step_uses("actions/setup-node@v4", Some(bad.clone()))]);
         assert!(refused.runtimes.is_empty());
-        assert_eq!(refused.refused, ["node"]);
+        assert_eq!(refused.not_built, [(0, NotBuilt::Refused)]);
 
-        let later = detect_setup(&[
-            make_step_uses("actions/setup-node@v4", Some(bad)),
+        // Whichever comes first, the refused step is the one not run: a
+        // good step doesn't vouch for another step's version.
+        for steps in [
+            vec![
+                make_step_uses("actions/setup-node@v4", Some(bad.clone())),
+                make_step_uses("actions/setup-node@v4", Some(good.clone())),
+            ],
+            vec![
+                make_step_uses("actions/setup-node@v4", Some(good.clone())),
+                make_step_uses("actions/setup-node@v4", Some(bad.clone())),
+            ],
+        ] {
+            let detected = detect_setup(&steps);
+            assert_eq!(detected.runtimes[0].version, "22");
+            let bad_idx = steps
+                .iter()
+                .position(|s| s.with.as_ref() == Some(&bad))
+                .unwrap();
+            assert_eq!(detected.not_built, [(bad_idx, NotBuilt::Refused)]);
+        }
+
+        // The image holds the last version, so an earlier one never ran.
+        let detected = detect_setup(&[
+            make_step_uses("actions/setup-node@v4", Some(older)),
+            make_step_uses("actions/setup-node@v4", Some(good.clone())),
             make_step_uses("actions/setup-node@v4", Some(good)),
         ]);
-        assert_eq!(later.runtimes[0].version, "22");
-        assert!(later.refused.is_empty());
+        assert_eq!(detected.runtimes[0].version, "22");
+        assert_eq!(detected.not_built, [(0, NotBuilt::Superseded)]);
+        let built = BuiltRuntimes {
+            installed: vec!["node".to_string()],
+            not_built: detected.not_built,
+        };
+        assert!(unrun_action_cause("actions/setup-node", &built, true, 0)
+            .unwrap()
+            .contains("another setup step"));
+        assert_eq!(
+            unrun_action_cause("actions/setup-node", &built, true, 1),
+            None
+        );
+        // A composite's steps are not the job's.
+        assert_eq!(
+            unrun_action_cause("actions/setup-node", &built.for_composite(), true, 0),
+            None
+        );
+    }
+
+    #[test]
+    fn a_version_file_without_a_version_is_refused_not_defaulted() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("pyproject.toml"),
+            "[tool.poetry.dependencies]\npython = \"^3.9\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("go.mod"), "module m\n").unwrap();
+        for (uses, key, file) in [
+            (
+                "actions/setup-python@v5",
+                "python-version-file",
+                "pyproject.toml",
+            ),
+            (
+                "actions/setup-python@v5",
+                "python-version-file",
+                "missing.txt",
+            ),
+            ("actions/setup-go@v5", "go-version-file", "go.mod"),
+            ("actions/setup-node@v4", "node-version-file", ".nvmrc"),
+        ] {
+            let with = HashMap::from([(key.to_string(), file.to_string())]);
+            let detected = detect_setup_in(&[make_step_uses(uses, Some(with))], dir.path());
+            assert!(detected.runtimes.is_empty(), "{uses} {file}");
+            assert_eq!(
+                detected.not_built,
+                [(0, NotBuilt::Refused)],
+                "{uses} {file}"
+            );
+        }
     }
 
     #[test]
@@ -10960,26 +11041,29 @@ runs:
     fn a_setup_action_runs_only_when_its_runtime_is_in_the_image() {
         let node = BuiltRuntimes {
             installed: vec!["node".to_string()],
-            refused: Vec::new(),
+            not_built: Vec::new(),
         };
-        assert_eq!(unrun_action_cause("actions/setup-node", &node, true), None);
-        assert!(unrun_action_cause("actions/setup-python", &node, true)
+        assert_eq!(
+            unrun_action_cause("actions/setup-node", &node, true, 0),
+            None
+        );
+        assert!(unrun_action_cause("actions/setup-python", &node, true, 0)
             .unwrap()
             .contains("not in the job's image"));
-        assert!(unrun_action_cause("actions/setup-node", &node, false)
+        assert!(unrun_action_cause("actions/setup-node", &node, false, 0)
             .unwrap()
             .contains("emulation"));
         assert_eq!(
-            unrun_action_cause("codecov/codecov-action", &node, true),
+            unrun_action_cause("codecov/codecov-action", &node, true, 0),
             Some("no implementation in wrkflw")
         );
         // A version wrkflw couldn't install is named as the reason, not a
         // job container or a composite action.
         let refused = BuiltRuntimes {
             installed: Vec::new(),
-            refused: vec!["node".to_string()],
+            not_built: vec![(0, NotBuilt::Refused)],
         };
-        assert!(unrun_action_cause("actions/setup-node", &refused, true)
+        assert!(unrun_action_cause("actions/setup-node", &refused, true, 0)
             .unwrap()
             .contains("version it asks for"));
     }
@@ -12756,7 +12840,7 @@ runs:
                     "ubuntu:latest",
                     &BuiltRuntimes {
                         installed,
-                        refused: Vec::new(),
+                        not_built: Vec::new(),
                     },
                     false,
                     services,

@@ -19,14 +19,35 @@ pub(crate) const NO_IMPLEMENTATION: &str = "no implementation in wrkflw";
 pub(crate) struct BuiltRuntimes {
     /// The `language` of each setup action whose runtime the image holds.
     pub(crate) installed: Vec<String>,
-    /// Languages a setup step asked for with a version wrkflw can't
-    /// install, such as an unknown alias, so none was built in.
-    pub(crate) refused: Vec<String>,
+    /// The job's setup steps, by index, whose version is not what the image
+    /// holds, and why. Empty inside a composite action, whose steps these
+    /// indices don't name.
+    pub(crate) not_built: Vec<(usize, NotBuilt)>,
+}
+
+/// Why a setup step's version is not in the job's image.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum NotBuilt {
+    /// It isn't one wrkflw can install, such as an unknown alias, an
+    /// expression it can't resolve, or a version file with none in it.
+    Refused,
+    /// Another setup step of the same language set the version the image
+    /// holds: an image has one version of each, the job's last.
+    Superseded,
 }
 
 impl BuiltRuntimes {
     fn has(&self, language: &str) -> bool {
         self.installed.iter().any(|l| l == language)
+    }
+
+    /// What steps of a composite action see: the image, but not the
+    /// job's step indices.
+    pub(crate) fn for_composite(&self) -> Self {
+        BuiltRuntimes {
+            installed: self.installed.clone(),
+            not_built: Vec::new(),
+        }
     }
 }
 
@@ -34,8 +55,8 @@ impl BuiltRuntimes {
 /// version couldn't be used.
 pub(crate) struct SetupDetection {
     pub(crate) runtimes: Vec<SetupRuntime>,
-    /// Languages asked for only with versions that were refused.
-    pub(crate) refused: Vec<String>,
+    /// The setup steps, by index, whose version the image won't hold.
+    pub(crate) not_built: Vec<(usize, NotBuilt)>,
 }
 
 /// A runtime detected from a setup action step (e.g., `actions/setup-node@v3`).
@@ -262,10 +283,14 @@ pub(crate) fn version_from_file(root: &Path, file: &str) -> Option<String> {
 /// as is and a setup step inside a composite action isn't seen when the
 /// image is built, so neither gets one, and a version wrkflw can't install
 /// is left out. Emulation builds no image at all: the host's tools stand in.
+///
+/// `step_idx` is the step's index among the job's steps, which says whether
+/// the image holds this step's own version.
 pub(crate) fn unrun_action_cause(
     repository: &str,
     built: &BuiltRuntimes,
     container_runtime: bool,
+    step_idx: usize,
 ) -> Option<&'static str> {
     let Some(def) = SETUP_ACTIONS.iter().find(|d| d.repos.contains(&repository)) else {
         return Some(NO_IMPLEMENTATION);
@@ -273,14 +298,28 @@ pub(crate) fn unrun_action_cause(
     if !container_runtime {
         return Some("emulation installs no runtime, so the host's tools stand in for it");
     }
+    match built
+        .not_built
+        .iter()
+        .find(|(idx, _)| *idx == step_idx)
+        .map(|(_, why)| why)
+    {
+        Some(NotBuilt::Refused) => {
+            return Some(
+                "the version it asks for isn't one wrkflw can install, so it was left \
+                 out of the job's image",
+            )
+        }
+        Some(NotBuilt::Superseded) => {
+            return Some(
+                "the job's image holds the version another setup step of the same \
+                 language asks for, as wrkflw builds one version of each into it",
+            )
+        }
+        None => {}
+    }
     if built.has(def.language) {
         return None;
-    }
-    if built.refused.iter().any(|l| l == def.language) {
-        return Some(
-            "the version it asks for isn't one wrkflw can install, so its runtime \
-             was left out of the job's image",
-        );
     }
     Some(
         "its runtime is not in the job's image, as a job container is used as is \
@@ -393,9 +432,11 @@ pub(crate) fn detect_setup_runtimes_in(steps: &[Step], root: &Path) -> Vec<Setup
 /// [`detect_setup`] with `*-version-file` inputs read under `root`.
 pub(crate) fn detect_setup_in(steps: &[Step], root: &Path) -> SetupDetection {
     let mut runtimes: Vec<SetupRuntime> = Vec::new();
-    let mut refused: Vec<String> = Vec::new();
+    // Each runtime's step index, kept beside it.
+    let mut sources: Vec<usize> = Vec::new();
+    let mut not_built: Vec<(usize, NotBuilt)> = Vec::new();
 
-    for step in steps {
+    for (step_idx, step) in steps.iter().enumerate() {
         let uses = match &step.uses {
             Some(u) => u,
             None => continue,
@@ -419,19 +460,26 @@ pub(crate) fn detect_setup_in(steps: &[Step], root: &Path) -> SetupDetection {
             with.and_then(|w| w.get(key))
                 .filter(|value| !value.trim().is_empty())
         };
+        // A version file with no version in it fails the hosted action, so
+        // the step is refused rather than given the default.
+        let file = def.version_file_key.and_then(input);
+        let from_file = match (input(def.with_key), file) {
+            (None, Some(file)) => match version_from_file(root, file) {
+                Some(found) => Some(found),
+                None => {
+                    wrkflw_logging::warning(&format!(
+                        "{}: no {} version found in {}, so the step is not run",
+                        uses, def.language, file
+                    ));
+                    not_built.push((step_idx, NotBuilt::Refused));
+                    continue;
+                }
+            },
+            _ => None,
+        };
         let ver = input(def.with_key)
             .cloned()
-            .or_else(|| {
-                let file = input(def.version_file_key?)?;
-                let found = version_from_file(root, file);
-                if found.is_none() {
-                    wrkflw_logging::warning(&format!(
-                        "{}: no {} version found in {}; using {}",
-                        uses, def.language, file, def.default_version
-                    ));
-                }
-                found
-            })
+            .or(from_file)
             .or_else(|| {
                 // Some actions encode the version in the @ref (e.g., dtolnay/rust-toolchain@nightly).
                 // Skip bare git SHAs — they pin the action version, not the toolchain.
@@ -489,9 +537,7 @@ pub(crate) fn detect_setup_in(steps: &[Step], root: &Path) -> SetupDetection {
                 "Ignoring {} with invalid version: {:?}",
                 def.language, ver
             ));
-            if !refused.iter().any(|l| l == def.language) {
-                refused.push(def.language.to_string());
-            }
+            not_built.push((step_idx, NotBuilt::Refused));
             continue;
         }
 
@@ -501,12 +547,18 @@ pub(crate) fn detect_setup_in(steps: &[Step], root: &Path) -> SetupDetection {
             install_script: get_install_script(def.language, &ver),
         };
 
-        // Deduplicate: later setup steps override earlier ones for the same language
+        // Deduplicate: later setup steps override earlier ones for the same
+        // language, and the earlier step's version is then not built in.
         let existing_idx = runtimes.iter().position(|r| r.language == rt.language);
         if let Some(idx) = existing_idx {
+            if runtimes[idx].version != rt.version {
+                not_built.push((sources[idx], NotBuilt::Superseded));
+            }
             runtimes[idx] = rt;
+            sources[idx] = step_idx;
         } else {
             runtimes.push(rt);
+            sources.push(step_idx);
         }
     }
 
@@ -551,9 +603,11 @@ pub(crate) fn detect_setup_in(steps: &[Step], root: &Path) -> SetupDetection {
         }
     }
 
-    // A language a later step set up anyway was installed after all.
-    refused.retain(|language| !runtimes.iter().any(|rt| &rt.language == language));
-    SetupDetection { runtimes, refused }
+    not_built.sort_by_key(|(idx, _)| *idx);
+    SetupDetection {
+        runtimes,
+        not_built,
+    }
 }
 
 /// The nodesource channel for a `node-version` alias `actions/setup-node`

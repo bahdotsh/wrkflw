@@ -133,12 +133,21 @@ pub struct FailureCause {
 /// `tests/pass/` isn't one. The word must be where a runner puts its
 /// verdict, first or last on the line, once bracketed and parenthesised
 /// parts such as parameters, progress and durations are left out: in
-/// `error TS2339: Property 'Passed' does not exist` it is a name.
+/// `error TS2339: Property 'Passed' does not exist` it is a name. A
+/// duration the runner prints after the verdict, unbracketed, as CTest's
+/// `Passed    0.01 sec` and Bazel's `PASSED in 0.3s` do, may follow it.
 static PASSING: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
     regex::Regex::new(
-        r"\.\.\.\s*ok\s*$|\b(PASS(ED)?|Passed)\s*$|^[\s\-*>:]*(PASS(ED)?|Passed|ok|✓|✔)(\b|:|\s|$)",
+        r"\.\.\.\s*ok\s*$|\b(PASS(ED)?|Passed)(\s+(in\s+)?[\d.]+\s*(s|sec|secs|seconds|ms|m))?\s*$|^[\s\-*>:]*(PASS(ED)?|Passed|ok|✓|✔)(\b|:|\s|$)",
     )
     .unwrap()
+});
+
+/// A line that starts as a compiler's or a tool's error does, such as
+/// `error: expected status to be PASSED` or `fatal: ...`: whatever word it
+/// ends with, it reports a failure.
+static ERROR_PREFIX: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"(?i)^\s*(error|fatal|panic)(\[[^\]]*\])?\s*:").unwrap()
 });
 
 /// A runner's own word for a failure, which no passing line holds.
@@ -154,7 +163,7 @@ static BRACKETED: std::sync::LazyLock<regex::Regex> =
 /// test's parameters, as in `test_x[Failed] PASSED`, names the test.
 fn reports_pass(line: &str) -> bool {
     let bare = BRACKETED.replace_all(line, "");
-    PASSING.is_match(&bare) && !FAILING.is_match(&bare)
+    PASSING.is_match(&bare) && !FAILING.is_match(&bare) && !ERROR_PREFIX.is_match(line)
 }
 
 /// The lines a cause may be read from: what the step printed, in the last
@@ -671,6 +680,10 @@ mod tests {
             "error[E0599]: no variant named `Passed` found for enum `Outcome`",
             "error: environment variable PASS is required",
             "E   assert 'failed' == 'PASSED'",
+            "error: expected job status to be PASSED",
+            "error: build failed for target PASS",
+            "error[E0308]: mismatched types: expected Passed",
+            "fatal: the gate reported PASSED",
         ] {
             assert!(!reports_pass(line), "{line}");
             assert!(cause_lines(&format!("{line}\nx\n"), 1).contains(&line.to_string()));
@@ -684,6 +697,9 @@ mod tests {
             "  ✓ reports the error (3 ms)",
             "  Passed ErrorHandling.Tests.Parses [12 ms]",
             "ok  \tgithub.com/x/errors\t0.01s",
+            // A duration after the verdict, as CTest and Bazel print it.
+            " 3/10 Test  #3: parse-error ......   Passed    0.01 sec",
+            "//pkg:error_test                     PASSED in 0.3s",
         ] {
             assert!(reports_pass(line), "{line}");
         }

@@ -3042,7 +3042,7 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
     // Only after the reusable workflow check: its jobs take places of their
     // own, and a caller holding one would deadlock a limit of one.
     let memory_id = job_memory_id(&ctx.workflow.name, ctx.job_name);
-    let _slot = crate::vm_memory::job_slot(memory_id.as_deref()).await;
+    let _slot = crate::vm_memory::job_slot(memory_id.as_deref(), None).await;
     if let Some(id) = &memory_id {
         crate::job_memory::measure_as(id);
     }
@@ -3434,11 +3434,17 @@ async fn execute_matrix_job(
     let matrix_job_name = wrkflw_matrix::format_combination_name(job_name, combination);
 
     // One place in the run's pool for the leg, as for any job.
+    // A leg never measured is sized by the legs of its matrix that were.
     let memory_id = job_memory_id(&workflow.name, &matrix_job_name);
-    let _slot = crate::vm_memory::job_slot(memory_id.as_deref()).await;
+    let family = job_memory_id(&workflow.name, &format!("{job_name}\0legs"));
+    let slot = crate::vm_memory::job_slot(memory_id.as_deref(), family.as_deref()).await;
     if let Some(id) = &memory_id {
         crate::job_memory::measure_as(id);
     }
+    if let Some(family) = &family {
+        crate::job_memory::in_family(family);
+    }
+    let _slot = crate::job_memory::hold(slot);
 
     wrkflw_logging::info(&format!("Executing matrix job: {}", matrix_job_name));
 

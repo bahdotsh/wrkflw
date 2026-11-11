@@ -58,6 +58,8 @@ fn shared(bytes: u64) -> u64 {
 struct Pool {
     places: Arc<Semaphore>,
     limit: Limit,
+    /// Told when a job of the run has kept its measurements.
+    measured: tokio::sync::Notify,
 }
 
 impl Pool {
@@ -69,6 +71,7 @@ impl Pool {
         Pool {
             places: Arc::new(Semaphore::new(places.clamp(1, Semaphore::MAX_PERMITS))),
             limit,
+            measured: tokio::sync::Notify::new(),
         }
     }
 
@@ -118,22 +121,58 @@ pub(crate) async fn with_run_pool<F: std::future::Future>(future: F) -> F::Outpu
 /// for one would deadlock a limit of one.
 ///
 /// `job` is the job's [`crate::job_memory::job_id`], whose measurements
-/// size its place when jobs share memory.
-pub(crate) async fn job_slot(job: Option<&str>) -> Option<OwnedSemaphorePermit> {
+/// size its place when jobs share memory. `family` is the id the legs of
+/// its matrix share, for a leg: one never measured takes what another leg
+/// was, and while it waits for a place it looks again whenever a job of
+/// the run keeps its measurements, so only the first leg of a new matrix
+/// runs alone.
+pub(crate) async fn job_slot(
+    job: Option<&str>,
+    family: Option<&str>,
+) -> Option<OwnedSemaphorePermit> {
     let pool = POOL.try_with(|pool| pool.get().cloned().flatten()).ok()??;
-    let measured = match (pool.limit, job) {
-        // The store is a file under a lock: not for the async runtime.
-        (Limit::Memory { .. }, Some(job)) => {
+    let (Limit::Memory { .. }, Some(job)) = (pool.limit, job) else {
+        let weight = pool.weight(None);
+        return pool.places.clone().acquire_many_owned(weight).await.ok();
+    };
+    loop {
+        // Listening before the store is read, so a measurement kept in
+        // between isn't missed.
+        let changed = pool.measured.notified();
+        tokio::pin!(changed);
+        changed.as_mut().enable();
+        let measured = {
             let job = job.to_string();
-            tokio::task::spawn_blocking(move || crate::job_memory::reserve(&job))
+            let family = family.map(str::to_string);
+            // The store is a file under a lock: not for the async runtime.
+            tokio::task::spawn_blocking(move || crate::job_memory::reserve(&job, family.as_deref()))
                 .await
                 .ok()
                 .flatten()
+        };
+        let place = pool
+            .places
+            .clone()
+            .acquire_many_owned(pool.weight(measured));
+        if measured.is_some() || family.is_none() {
+            return place.await.ok();
         }
-        _ => None,
-    };
-    let weight = pool.weight(measured);
-    pool.places.clone().acquire_many_owned(weight).await.ok()
+        tokio::select! {
+            // A place freed by the leg that was just measured comes with
+            // its measurement: read it before taking the place.
+            biased;
+            _ = &mut changed => {}
+            place = place => return place.ok(),
+        }
+    }
+}
+
+/// A job of this run kept its measurements: legs waiting unmeasured look
+/// again.
+pub(crate) fn measurements_changed() {
+    if let Ok(Some(pool)) = POOL.try_with(|pool| pool.get().cloned().flatten()) {
+        pool.measured.notify_waiters();
+    }
 }
 
 /// Whether this run sizes jobs by the memory they were measured to use, so
@@ -408,16 +447,16 @@ mod tests {
     async fn every_job_and_leg_takes_its_place_from_the_runs_pool() {
         with_run_pool(async {
             set_limit(Some(Limit::Jobs(2)));
-            let _a = job_slot(None).await.unwrap();
-            let _b = job_slot(None).await.unwrap();
-            let third = tokio::time::timeout(Duration::from_millis(50), job_slot(None)).await;
+            let _a = job_slot(None, None).await.unwrap();
+            let _b = job_slot(None, None).await.unwrap();
+            let third = tokio::time::timeout(Duration::from_millis(50), job_slot(None, None)).await;
             assert!(
                 third.is_err(),
                 "a third place was handed out with a limit of two"
             );
             // A second check in the same run doesn't resize its pool.
             set_limit(Some(Limit::Jobs(3)));
-            let again = tokio::time::timeout(Duration::from_millis(50), job_slot(None)).await;
+            let again = tokio::time::timeout(Duration::from_millis(50), job_slot(None, None)).await;
             assert!(again.is_err(), "the run's pool was resized");
         })
         .await;
@@ -429,13 +468,14 @@ mod tests {
         // run, in the same process, sets no limit and runs freely.
         with_run_pool(async {
             set_limit(Some(Limit::Jobs(1)));
-            let _held = job_slot(None).await.unwrap();
+            let _held = job_slot(None, None).await.unwrap();
             with_run_pool(async {
                 set_limit(None);
-                assert!(job_slot(None).await.is_none());
+                assert!(job_slot(None, None).await.is_none());
             })
             .await;
-            let blocked = tokio::time::timeout(Duration::from_millis(50), job_slot(None)).await;
+            let blocked =
+                tokio::time::timeout(Duration::from_millis(50), job_slot(None, None)).await;
             assert!(blocked.is_err(), "the other run changed this run's limit");
         })
         .await;
@@ -498,8 +538,8 @@ mod tests {
     #[tokio::test]
     async fn outside_a_run_nothing_is_limited() {
         set_limit(Some(Limit::Jobs(1)));
-        assert!(job_slot(None).await.is_none());
-        assert!(job_slot(None).await.is_none());
+        assert!(job_slot(None, None).await.is_none());
+        assert!(job_slot(None, None).await.is_none());
     }
 
     fn memory(bytes: u64, in_vm: bool) -> Memory {

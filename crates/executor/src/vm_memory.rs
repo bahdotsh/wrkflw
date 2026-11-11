@@ -542,6 +542,72 @@ mod tests {
         assert!(job_slot(None, None).await.is_none());
     }
 
+    /// Run a first leg of a new matrix that peaks at 600 MiB and passes or
+    /// not, with a second leg waiting for it, and give the room the second
+    /// was given and the room the run has.
+    async fn second_leg_after(first_passes: bool, first: &str, second: &str) -> (usize, usize) {
+        use crate::job_memory;
+        // The test process's store is shared: each test a matrix of its own.
+        let family = format!("{first}-legs");
+        let family = family.as_str();
+        job_memory::use_test_store();
+        with_run_pool(async {
+            set_limit(Some(Limit::Memory {
+                bytes: 8 * GIB,
+                slots: 1,
+            }));
+            let pool = POOL.with(|pool| pool.get().cloned().flatten()).unwrap();
+            let total = pool.places.available_permits();
+            let (finish, finished) = tokio::sync::oneshot::channel::<()>();
+            let first_leg = job_memory::metered(
+                async {
+                    let slot = job_slot(Some(first), Some(family)).await;
+                    job_memory::measure_as(first);
+                    job_memory::in_family(family);
+                    assert!(job_memory::hold(slot).is_none(), "the meter holds it");
+                    job_memory::meter().unwrap().sample("step", 600 * MIB);
+                    finished.await.unwrap();
+                },
+                |_| first_passes,
+            );
+            tokio::pin!(first_leg);
+            let wait = Duration::from_millis(200);
+            assert!(tokio::time::timeout(wait, &mut first_leg).await.is_err());
+            assert_eq!(
+                pool.places.available_permits(),
+                0,
+                "a leg of a matrix never measured takes the whole VM"
+            );
+            let second_leg = job_slot(Some(second), Some(family));
+            tokio::pin!(second_leg);
+            assert!(
+                tokio::time::timeout(wait, &mut second_leg).await.is_err(),
+                "the second leg waits while the first holds the VM"
+            );
+            finish.send(()).unwrap();
+            // Polled in turn: had the first leg given its place up before
+            // keeping its measurement, the second would take it unmeasured
+            // while the first waits on the store.
+            let ((), place) = tokio::join!(first_leg, second_leg);
+            (place.unwrap().num_permits(), total)
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_leg_waiting_for_the_vm_takes_what_its_first_sibling_measured() {
+        let (given, total) = second_leg_after(true, "wake-first-passes", "wake-second").await;
+        // 600 MiB, half again, and 256 MiB of headroom.
+        assert_eq!(given, 600 + 300 + 256);
+        assert!(given < total);
+    }
+
+    #[tokio::test]
+    async fn a_leg_whose_first_sibling_failed_still_runs_alone() {
+        let (given, total) = second_leg_after(false, "wake-first-fails", "wake-alone").await;
+        assert_eq!(given, total, "a failed leg's peak sizes nothing");
+    }
+
     fn memory(bytes: u64, in_vm: bool) -> Memory {
         Memory {
             cli: "docker".to_string(),

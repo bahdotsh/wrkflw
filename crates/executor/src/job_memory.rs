@@ -399,7 +399,26 @@ fn lock_file(path: &std::path::Path, exclusive: bool) -> Option<std::fs::File> {
     locked.ok().map(|()| file)
 }
 
+/// A store of the test process's own, so tests that keep measurements
+/// never touch the user's, and need no env var set while threads run.
+#[cfg(test)]
+static TEST_STORE: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+
+/// Keep this test process's measurements in a temporary store. Tests that
+/// share it keep under ids of their own.
+#[cfg(test)]
+pub(crate) fn use_test_store() {
+    TEST_STORE.get_or_init(|| {
+        let dir = tempfile::tempdir().ok()?.keep();
+        Some(dir.join("job-memory.json"))
+    });
+}
+
 fn store_path() -> Option<PathBuf> {
+    #[cfg(test)]
+    if let Some(path) = TEST_STORE.get() {
+        return path.clone();
+    }
     match std::env::var_os(JOB_MEMORY_FILE_ENV) {
         Some(path) if path.is_empty() => None,
         Some(path) => Some(PathBuf::from(path)),

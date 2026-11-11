@@ -62,10 +62,12 @@ would or would not fire, and run_workflow to execute. run_workflow returns a fai
 reuse_results while iterating, so jobs that already passed on the same files aren't run again. \
 Before pushing, call gate: it runs what CI would run for the push, and on a feature branch \
 checks workflows a push doesn't fire as a pull request into the default branch. Read \
-`verdict`, not only `passed`: `verified` means everything ran as asked, `partial` means some \
-jobs ran as another OS than their runs-on asked for (listed under `unverified`, so their \
-OS-specific steps weren't checked), and `nothing_checked` means no job ran at all. Say which \
-before claiming CI will pass. A job with `reused` didn't run: an earlier result stands. Use \
+`verdict`, not only `passed`: `verified` means everything ran as asked, `partial` means the \
+pass left something unchecked, and `nothing_checked` means no job ran at all. Each `unverified` \
+entry has a `kind` and a `reason`: `runner` is a job that ran as another OS than its runs-on asked \
+for, so its OS-specific steps weren't checked; `action_not_run` is a step whose action wrkflw \
+didn't run, such as one it has no implementation of, so what that action does didn't happen. \
+Say which before claiming CI will pass. A job with `reused` didn't run: an earlier result stands. Use \
 list_runs and get_run_failure before rerunning: earlier results are recorded.";
 
 fn string_arg(args: &Value, key: &str) -> Option<String> {
@@ -454,7 +456,7 @@ fn tools() -> Value {
         tool("validate_workflows", "Check workflow files. Returns issues with rule, YAML path, line and fix hint.", true,
             json!({"paths": {"type": "array", "items": {"type": "string"}, "description": "Files or directories. Defaults to the workflow directories."}}), &[]),
         tool("list_workflows", "List workflows and pipelines in the repository with their jobs.", true, json!({}), &[]),
-        tool("plan_workflow", "Show what a run would do without executing anything: whether the trigger fires and why, job order, matrix legs, steps, and jobs that would run as another OS than runs-on asks for (`unverified`).", true, plan_properties, &["path"]),
+        tool("plan_workflow", "Show what a run would do without executing anything: whether the trigger fires and why, job order, matrix legs, steps, and jobs that would run as another OS than runs-on asks for (`unverified`). Whether each step's action runs is only known when it runs: a run's `unverified` also lists steps whose action didn't.", true, plan_properties, &["path"]),
         tool("run_workflow", "Execute a workflow locally. This runs the workflow's code. Returns status, job results and a failure digest. The run is recorded.", false, run_properties, &["path"]),
         tool("gate", "Run every workflow a push would trigger, reusing jobs that already passed on the same files. Returns `verdict` (verified, partial, nothing_checked or failed), `passed`, each workflow's status, the event it was checked as, run id and failure digest, and what the pass didn't check (`unverified`): jobs that ran as another OS, and steps whose action didn't run. Checks the working tree, not commits.", false, gate_properties, &[]),
         tool("list_runs", "List recorded runs of this repository, newest first.", true,

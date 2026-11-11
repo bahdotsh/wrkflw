@@ -846,6 +846,68 @@ fn global_child_args(cli: &Wrkflw, platform_overrides: &HashMap<String, String>)
     args
 }
 
+/// [`global_child_args`] for a hook that runs later, in another shell:
+/// only what was given on the command line. A value read from a `WRKFLW_*`
+/// variable is left for the hook's own environment to set, or a later
+/// change to the variable would be overridden by the frozen flag.
+fn hook_child_args(
+    cli: &Wrkflw,
+    matches: &clap::ArgMatches,
+    platform_overrides: &HashMap<String, String>,
+) -> Vec<String> {
+    let given = |id: &str| matches.value_source(id) == Some(clap::parser::ValueSource::CommandLine);
+    let mut args = Vec::new();
+    for (on, id, flag) in [
+        (cli.verbose, "verbose", "--verbose"),
+        (cli.debug, "debug", "--debug"),
+        (cli.fresh_workspace, "fresh_workspace", "--fresh-workspace"),
+        (
+            cli.every_matrix_leg,
+            "every_matrix_leg",
+            "--every-matrix-leg",
+        ),
+    ] {
+        if on && given(id) {
+            args.push(flag.to_string());
+        }
+    }
+    if given("platform") {
+        args.extend(platform_args(platform_overrides));
+    }
+    let k8s = &cli.kubernetes;
+    let keep = |id: &str| given(id);
+    let given_k8s = KubernetesArgs {
+        k8s_context: k8s.k8s_context.clone().filter(|_| keep("k8s_context")),
+        k8s_namespace: k8s.k8s_namespace.clone().filter(|_| keep("k8s_namespace")),
+        k8s_node_selector: given_or_empty(&k8s.k8s_node_selector, keep("k8s_node_selector")),
+        k8s_resource: given_or_empty(&k8s.k8s_resource, keep("k8s_resource")),
+        k8s_image_pull_secret: given_or_empty(
+            &k8s.k8s_image_pull_secret,
+            keep("k8s_image_pull_secret"),
+        ),
+        k8s_registry: k8s.k8s_registry.clone().filter(|_| keep("k8s_registry")),
+        k8s_helper_image: k8s
+            .k8s_helper_image
+            .clone()
+            .filter(|_| keep("k8s_helper_image")),
+        k8s_timeout: k8s.k8s_timeout.filter(|_| keep("k8s_timeout")),
+        k8s_schedule_timeout: k8s
+            .k8s_schedule_timeout
+            .filter(|_| keep("k8s_schedule_timeout")),
+    };
+    args.extend(given_k8s.child_args());
+    args
+}
+
+/// `values` when they were given, else none.
+fn given_or_empty<T: Clone>(values: &[T], given: bool) -> Vec<T> {
+    if given {
+        values.to_vec()
+    } else {
+        Vec::new()
+    }
+}
+
 /// A `--branch` value as GitHub names the branch, without `refs/heads/`.
 fn parse_branch(value: &str) -> Result<String, String> {
     ref_name(value, "refs/heads/")
@@ -1168,7 +1230,18 @@ async fn run_cli() {
         default_panic_hook(info);
     }));
 
-    let cli = Wrkflw::try_parse().unwrap_or_else(|e| exit_on_parse_error(e));
+    // The matches are kept to tell a value given on the command line from
+    // one read from a `WRKFLW_*` variable, which a hook must not freeze.
+    let matches = {
+        use clap::CommandFactory;
+        Wrkflw::command()
+            .try_get_matches()
+            .unwrap_or_else(|e| exit_on_parse_error(e))
+    };
+    let cli = {
+        use clap::FromArgMatches;
+        Wrkflw::from_arg_matches(&matches).unwrap_or_else(|e| exit_on_parse_error(e))
+    };
     let verbose = cli.verbose;
     let debug = cli.debug;
 
@@ -1566,15 +1639,29 @@ async fn run_cli() {
             remote_cache,
             install_hook,
         }) => {
+            // A hook runs later, in its own environment: it gets only what
+            // was given here, not what `WRKFLW_*` variables set now.
+            let remote_cache_given = matches
+                .subcommand_matches("gate")
+                .and_then(|gate| gate.value_source("remote_cache"))
+                == Some(clap::parser::ValueSource::CommandLine);
             gate_cmd::run(gate_cmd::GateCtx {
                 path: path.clone(),
                 event: event.clone(),
                 base_branch: base_branch.clone(),
                 diff_base: diff_base.clone(),
                 runtime: runtime.clone(),
-                remote_cache: remote_cache.clone(),
+                remote_cache: if *install_hook {
+                    remote_cache.clone().filter(|_| remote_cache_given)
+                } else {
+                    remote_cache.clone()
+                },
                 install_hook: *install_hook,
-                child_args: global_child_args(&cli, &platform_overrides),
+                child_args: if *install_hook {
+                    hook_child_args(&cli, &matches, &platform_overrides)
+                } else {
+                    global_child_args(&cli, &platform_overrides)
+                },
                 format: cli.format,
             });
         }
@@ -2097,6 +2184,65 @@ mod tests {
             event_for(Some("pull_request"), Some("feature"), None).as_deref(),
             Some("pull_request")
         );
+    }
+
+    #[test]
+    fn a_hook_gets_only_the_flags_given_on_the_command_line() {
+        use clap::{CommandFactory, FromArgMatches};
+        // The variables these flags read, under names no other test uses,
+        // so setting them races with nothing.
+        let suffix = uuid::Uuid::new_v4().simple().to_string().to_uppercase();
+        let platform_var = format!("WRKFLW_TEST_PLATFORM_{suffix}");
+        let namespace_var = format!("WRKFLW_TEST_K8S_NAMESPACE_{suffix}");
+        std::env::set_var(&platform_var, "ubuntu-latest=from/env:1");
+        std::env::set_var(&namespace_var, "from-env");
+        // clap takes a variable's name as a `&'static str`.
+        let leak = |name: &str| -> &'static str { Box::leak(name.to_string().into_boxed_str()) };
+        let (platform_name, namespace_name) = (leak(&platform_var), leak(&namespace_var));
+        let command = Wrkflw::command()
+            .mut_arg("platform", |arg| arg.env(platform_name))
+            .mut_arg("k8s_namespace", |arg| arg.env(namespace_name));
+        let parse = |args: &[&str]| {
+            let matches = command.clone().try_get_matches_from(args).unwrap();
+            let cli = Wrkflw::from_arg_matches(&matches).unwrap();
+            let overrides = collect_platform_overrides(&cli.platform);
+            (
+                hook_child_args(&cli, &matches, &overrides),
+                global_child_args(&cli, &overrides),
+            )
+        };
+
+        // From the environment: a child run now gets them, a hook doesn't.
+        let (hook, now) = parse(&["wrkflw", "gate"]);
+        assert!(
+            now.contains(&"ubuntu-latest=from/env:1".to_string()),
+            "{now:?}"
+        );
+        assert!(now.contains(&"from-env".to_string()), "{now:?}");
+        assert!(hook.is_empty(), "{hook:?}");
+
+        // Given on the command line, both get them.
+        let (hook, _) = parse(&[
+            "wrkflw",
+            "--verbose",
+            "-P",
+            "ubuntu-latest=given/img:1",
+            "--k8s-namespace",
+            "given",
+            "gate",
+        ]);
+        assert_eq!(
+            hook,
+            [
+                "--verbose",
+                "--platform",
+                "ubuntu-latest=given/img:1",
+                "--k8s-namespace",
+                "given"
+            ]
+        );
+        std::env::remove_var(&platform_var);
+        std::env::remove_var(&namespace_var);
     }
 
     #[test]

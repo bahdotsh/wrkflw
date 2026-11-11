@@ -623,13 +623,17 @@ pub(crate) fn get_install_script(language: &str, version: &str) -> String {
         // hosted runner. uv marks its interpreters EXTERNALLY-MANAGED, so
         // PEP 668 makes pip refuse to install anything, and PyPy, which
         // ships without pip, can't even bootstrap it. setup-python's
-        // interpreters carry no such marker, so it goes.
+        // interpreters carry no such marker, so it goes. The directory pip
+        // installs commands into, such as `pytest` or `tox`, is linked to
+        // [`PYTHON_SCRIPTS_DIR`], which the image puts first on `PATH`, as
+        // setup-python does with its own.
         "python" => {
             format!(
                 "{install_uv} && \
                  uv python install '{req}' && \
                  p=\"$(uv python find '{req}')\" && \
                  ln -sf \"$p\" /usr/local/bin/python && ln -sf \"$p\" /usr/local/bin/python3 && \
+                 ln -sfn \"$(\"$p\" -c '{scripts}')\" {scripts_dir} && \
                  \"$p\" -c '{drop_marker}' && \
                  (\"$p\" -m pip --version >/dev/null 2>&1 || \"$p\" -m ensurepip --upgrade) && \
                  printf '#!/bin/sh\\nexec /usr/local/bin/python -m pip \"$@\"\\n' > /usr/local/bin/pip && \
@@ -637,6 +641,8 @@ pub(crate) fn get_install_script(language: &str, version: &str) -> String {
                 install_uv = uv_install_unless_present(),
                 req = uv_python_request(version),
                 drop_marker = DROP_EXTERNALLY_MANAGED,
+                scripts = PRINT_SCRIPTS_DIR,
+                scripts_dir = PYTHON_SCRIPTS_DIR,
             )
         }
         "uv" => uv_install_command(version),
@@ -763,6 +769,15 @@ fn go_release_known(version: &str) -> bool {
 /// Where the image keeps the interpreters uv installs for setup-python:
 /// outside any home directory, so every user and every `HOME` finds them.
 pub(crate) const UV_PYTHON_DIR: &str = "/opt/uv/python";
+
+/// A link to the directory of the setup-python interpreter's scripts, where
+/// `pip install` puts commands. Outside [`UV_PYTHON_DIR`], which uv reads
+/// as its own.
+pub(crate) const PYTHON_SCRIPTS_DIR: &str = "/opt/uv/python-bin";
+
+/// Python that prints the scripts directory of the interpreter running it.
+/// Single-quoted in the shell, so it holds none.
+const PRINT_SCRIPTS_DIR: &str = "import sysconfig; print(sysconfig.get_path(\"scripts\"))";
 
 /// Python run by the install script: deletes the PEP 668 marker of the
 /// interpreter running it. Single-quoted in the shell, so it holds none.

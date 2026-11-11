@@ -24,7 +24,8 @@ use crate::matrix_fold::{matrix_twins, repeated_leg};
 use crate::podman;
 use crate::setup_actions::{
     detect_setup, runner_node_install, rust_toolchain_extras, static_input, unrun_action_cause,
-    BuiltRuntimes, SetupDetection, SetupRuntime, NO_IMPLEMENTATION, SETUP_ACTIONS, UV_PYTHON_DIR,
+    BuiltRuntimes, SetupDetection, SetupRuntime, NO_IMPLEMENTATION, PYTHON_SCRIPTS_DIR,
+    SETUP_ACTIONS, UV_PYTHON_DIR,
 };
 use wrkflw_logging;
 use wrkflw_matrix::MatrixCombination;
@@ -2134,7 +2135,16 @@ fn generate_combined_dockerfile(
     // Base images can bundle tools ahead of the system directories. The act
     // images do this with Node, which would shadow the version a setup action
     // just installed. Every install script lands in one of these directories.
-    dockerfile.push_str("ENV PATH=/usr/local/bin:/usr/bin:$PATH\n");
+    // setup-python puts its interpreter's scripts first, so what `pip
+    // install` adds runs by name.
+    if runtimes.iter().any(|rt| rt.language == "python") {
+        dockerfile.push_str(&format!(
+            "ENV PATH={}:/usr/local/bin:/usr/bin:$PATH\n",
+            PYTHON_SCRIPTS_DIR
+        ));
+    } else {
+        dockerfile.push_str("ENV PATH=/usr/local/bin:/usr/bin:$PATH\n");
+    }
 
     dockerfile
 }
@@ -10783,6 +10793,24 @@ runs:
         let df = generate_combined_dockerfile(&node, "ubuntu:latest", None);
         assert!(!df.contains("command -v node"), "{df}");
         assert_eq!(df.matches("nodesource").count(), 1, "{df}");
+    }
+
+    #[test]
+    fn what_pip_installs_runs_by_name() {
+        let python = vec![SetupRuntime {
+            language: "python".to_string(),
+            version: "3.12".to_string(),
+            install_script: get_install_script("python", "3.12"),
+        }];
+        let df = generate_combined_dockerfile(&python, "ubuntu:latest", None);
+        assert!(
+            df.contains(&format!("ENV PATH={}:", PYTHON_SCRIPTS_DIR)),
+            "{df}"
+        );
+        assert!(df.contains(&format!("\" {}", PYTHON_SCRIPTS_DIR)), "{df}");
+        if std::env::var_os("WRKFLW_PRINT_DOCKERFILE").is_some() {
+            println!("{df}");
+        }
     }
 
     #[test]

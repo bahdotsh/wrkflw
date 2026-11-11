@@ -43,7 +43,9 @@ use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 use wrkflw_runtime::container::ContainerRuntime;
@@ -139,6 +141,9 @@ struct State {
     /// what steps wrote, so a failed sync fails the step instead of falling
     /// back to the host copy, which lacks it.
     used: bool,
+    /// Why a call to the engine got no answer, once one hasn't. Every later
+    /// sync fails at once instead of waiting as long again.
+    stalled: Option<String>,
 }
 
 impl State {
@@ -152,8 +157,10 @@ impl State {
             unlisted: HashSet::new(),
             unusable: false,
             used: false,
+            stalled: None,
         }
     }
+
     /// The state a run starts the workspace volume `volume` with: what an
     /// earlier run of a kept workspace left in it that the host lacks.
     fn for_volume(volume: &str) -> Self {
@@ -307,6 +314,13 @@ impl VmWorkspace {
         if state.unusable {
             return Ok(false);
         }
+        if let Some(why) = &state.stalled {
+            return Err(format!(
+                "copying the workspace into the {} volume wasn't tried, as an earlier copy got \
+                 no answer: {}",
+                self.cli, why
+            ));
+        }
         let result = self.sync_in_locked(&mut state);
         match result {
             Err(e) if !state.used => {
@@ -322,10 +336,15 @@ impl VmWorkspace {
                 }
                 Ok(false)
             }
-            Err(e) => Err(format!(
-                "copying the workspace into the {} volume failed: {}",
-                self.cli, e
-            )),
+            Err(e) => {
+                if e.kind() == io::ErrorKind::TimedOut {
+                    state.stalled = Some(e.to_string());
+                }
+                Err(format!(
+                    "copying the workspace into the {} volume failed: {}",
+                    self.cli, e
+                ))
+            }
             Ok(()) => {
                 state.used = true;
                 Ok(true)
@@ -388,7 +407,17 @@ impl VmWorkspace {
 
     fn sync_out(&self) -> Result<(), String> {
         let mut state = self.lock();
+        if let Some(why) = &state.stalled {
+            return Err(format!(
+                "copying the workspace back from the {} volume wasn't tried, as an earlier copy \
+                 got no answer: {}",
+                self.cli, why
+            ));
+        }
         self.sync_out_locked(&mut state).map_err(|e| {
+            if e.kind() == io::ErrorKind::TimedOut {
+                state.stalled = Some(e.to_string());
+            }
             // The next step must list the volume again. What the copy got
             // onto the host before it failed is not a change the host made,
             // so the next copy in must not send it back.
@@ -491,10 +520,12 @@ impl VmWorkspace {
             return Ok(id.clone());
         }
         let label = format!("{}={}", LABEL, self.host.display());
-        let create = Command::new(self.cli)
-            .args(["volume", "create", "--label", &label, &self.volume])
-            .stdin(Stdio::null())
-            .output()?;
+        let create = output_within(
+            Command::new(self.cli).args(["volume", "create", "--label", &label, &self.volume]),
+            None,
+            &format!("`{} volume create`", self.cli),
+            ENGINE_IDLE_LIMIT,
+        )?;
         if !create.status.success() {
             let stderr = String::from_utf8_lossy(&create.stderr);
             // Podman refuses to create a volume that exists; Docker doesn't.
@@ -512,8 +543,8 @@ impl VmWorkspace {
             .unwrap_or_else(|| DEFAULT_HELPER_IMAGE.to_string());
         let name = format!("wrkflw-ws-sync-{}", uuid::Uuid::new_v4());
         let mount = format!("{}:{}", self.volume, ROOT);
-        let started = Command::new(self.cli)
-            .args([
+        let started = output_within(
+            Command::new(self.cli).args([
                 "run",
                 "-d",
                 "--name",
@@ -525,9 +556,11 @@ impl VmWorkspace {
                 &image,
                 "-c",
                 crate::job_session::KEEP_ALIVE,
-            ])
-            .stdin(Stdio::null())
-            .output()?;
+            ]),
+            None,
+            &format!("`{} run` of the sync container", self.cli),
+            ENGINE_IDLE_LIMIT,
+        )?;
         if !started.status.success() {
             return Err(io::Error::other(format!(
                 "the sync container ({}) didn't start: {}",
@@ -593,8 +626,15 @@ impl VmWorkspace {
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()?;
-        let stderr = drain(child.stderr.take());
-        let stdin = child.stdin.take().expect("piped stdin");
+        let progress = Progress::default();
+        let stderr = drain(child.stderr.take(), progress.clone());
+        let stdin = Counted::new(child.stdin.take().expect("piped stdin"), progress.clone());
+        let watcher = bound(
+            child,
+            format!("copying the workspace into the {} volume", self.cli),
+            ENGINE_IDLE_LIMIT,
+            progress,
+        );
         let written = (|| {
             let mut builder = tar::Builder::new(io::BufWriter::new(stdin));
             builder.follow_symlinks(false);
@@ -603,8 +643,8 @@ impl VmWorkspace {
             }
             builder.into_inner()?.flush()
         })();
-        let status = child.wait()?;
-        let stderr = stderr.join().unwrap_or_default();
+        let status = finish(watcher)?;
+        let stderr = String::from_utf8_lossy(&stderr.join().unwrap_or_default()).into_owned();
         // When tar dies first, writing fails with a broken pipe, which says
         // nothing; tar's own message says why.
         if !status.success() {
@@ -638,17 +678,26 @@ impl VmWorkspace {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()?;
-        let stderr = drain(child.stderr.take());
+        let progress = Progress::default();
+        let stderr = drain(child.stderr.take(), progress.clone());
         let mut stdin = child.stdin.take().expect("piped stdin");
         let names = nul_list(paths);
         // Written alongside the read: tar starts writing before it has read
         // every name, and both pipes are bounded.
         let feeder = std::thread::spawn(move || stdin.write_all(&names));
-        let stdout = child.stdout.take().expect("piped stdout");
+        let stdout = Counted::new(child.stdout.take().expect("piped stdout"), progress.clone());
+        let watcher = bound(
+            child,
+            format!("copying the workspace back from the {} volume", self.cli),
+            ENGINE_IDLE_LIMIT,
+            progress,
+        );
+        // Dropped when it returns, even early, so tar can't block on a pipe
+        // nobody reads.
         let unpacked = unpack(stdout, &self.host, volume);
         let _ = feeder.join();
-        let status = child.wait()?;
-        let stderr = stderr.join().unwrap_or_default();
+        let status = finish(watcher)?;
+        let stderr = String::from_utf8_lossy(&stderr.join().unwrap_or_default()).into_owned();
         let unpacked = unpacked?;
         // GNU tar exits 1 when a file changed while it was read, as one a
         // background process still writes may, and 2 when a name it was
@@ -1313,13 +1362,162 @@ fn set_dir_mode(dir: &Path, mode: Option<u32>, _entry: Option<&Entry>) {
 #[cfg(not(unix))]
 fn set_dir_mode(_dir: &Path, _mode: Option<u32>, _entry: Option<&Entry>) {}
 
-fn drain(stderr: Option<std::process::ChildStderr>) -> std::thread::JoinHandle<String> {
+/// How long a call to the engine may move no bytes before it is taken to
+/// have stopped answering and is killed. A slow call that keeps moving,
+/// such as a large copy or an image pull, isn't one: only a stall is.
+const ENGINE_IDLE_LIMIT: Duration = Duration::from_secs(10 * 60);
+
+/// [`ENGINE_IDLE_LIMIT`] for removing a container or a volume, which moves
+/// almost nothing and should be quick.
+const CLEANUP_IDLE_LIMIT: Duration = Duration::from_secs(60);
+
+/// Bytes a call to the engine has moved, so its watcher can tell a slow
+/// call from one that stopped.
+#[derive(Clone, Default)]
+struct Progress(Arc<AtomicU64>);
+
+impl Progress {
+    fn add(&self, bytes: usize) {
+        self.0.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    fn get(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
+/// A pipe that counts what passes through it in a [`Progress`].
+struct Counted<T> {
+    inner: T,
+    progress: Progress,
+}
+
+impl<T> Counted<T> {
+    fn new(inner: T, progress: Progress) -> Self {
+        Counted { inner, progress }
+    }
+}
+
+impl<R: Read> Read for Counted<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let read = self.inner.read(buf)?;
+        self.progress.add(read);
+        Ok(read)
+    }
+}
+
+impl<W: Write> Write for Counted<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let written = self.inner.write(buf)?;
+        self.progress.add(written);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Wait for `child` on a thread of its own, killing it once `progress`
+/// hasn't moved for `idle`. Killing it closes its pipes, which frees the
+/// threads that read or write them. `what` names the call in the error.
+fn bound(
+    mut child: std::process::Child,
+    what: String,
+    idle: Duration,
+    progress: Progress,
+) -> std::thread::JoinHandle<io::Result<std::process::ExitStatus>> {
     std::thread::spawn(move || {
-        let mut text = String::new();
-        if let Some(mut stderr) = stderr {
-            let _ = stderr.read_to_string(&mut text);
+        let mut seen = progress.get();
+        let mut since = Instant::now();
+        let mut pause = Duration::from_millis(1);
+        loop {
+            if let Some(status) = child.try_wait()? {
+                return Ok(status);
+            }
+            let now = progress.get();
+            if now != seen {
+                seen = now;
+                since = Instant::now();
+            } else if since.elapsed() >= idle {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "{} made no progress for {} s and was stopped; the container engine \
+                         may have stopped answering",
+                        what,
+                        idle.as_secs()
+                    ),
+                ));
+            }
+            std::thread::sleep(pause);
+            pause = (pause * 2).min(Duration::from_millis(50));
         }
-        text
+    })
+}
+
+/// The exit status [`bound`] waited for.
+fn finish(
+    watcher: std::thread::JoinHandle<io::Result<std::process::ExitStatus>>,
+) -> io::Result<std::process::ExitStatus> {
+    watcher
+        .join()
+        .unwrap_or_else(|_| Err(io::Error::other("waiting for the container engine failed")))
+}
+
+/// Read all of `pipe` on a thread of its own, counting it in `progress`.
+fn drain<R: Read + Send + 'static>(
+    pipe: Option<R>,
+    progress: Progress,
+) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        if let Some(pipe) = pipe {
+            let _ = Counted::new(pipe, progress).read_to_end(&mut bytes);
+        }
+        bytes
+    })
+}
+
+/// Run `command` to its end with `stdin`, as [`Command::output`] does, but
+/// kill it once it has moved nothing for `idle`.
+fn output_within(
+    command: &mut Command,
+    stdin: Option<Vec<u8>>,
+    what: &str,
+    idle: Duration,
+) -> io::Result<std::process::Output> {
+    let mut child = command
+        .stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let progress = Progress::default();
+    let feeder = match (stdin, child.stdin.take()) {
+        (Some(bytes), Some(pipe)) => {
+            let mut pipe = Counted::new(pipe, progress.clone());
+            Some(std::thread::spawn(move || pipe.write_all(&bytes)))
+        }
+        _ => None,
+    };
+    let stdout = drain(child.stdout.take(), progress.clone());
+    let stderr = drain(child.stderr.take(), progress.clone());
+    let status = finish(bound(child, what.to_string(), idle, progress));
+    if let Some(feeder) = feeder {
+        let _ = feeder.join();
+    }
+    let stdout = stdout.join().unwrap_or_default();
+    let stderr = stderr.join().unwrap_or_default();
+    Ok(std::process::Output {
+        status: status?,
+        stdout,
+        stderr,
     })
 }
 
@@ -1379,25 +1577,12 @@ fn exec_output(
     }
     args.push(helper);
     args.extend_from_slice(cmd);
-    let mut child = Command::new(cli)
-        .args(&args)
-        .stdin(if stdin.is_some() {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    let feeder = match (stdin, child.stdin.take()) {
-        (Some(bytes), Some(mut pipe)) => Some(std::thread::spawn(move || pipe.write_all(&bytes))),
-        _ => None,
-    };
-    let output = child.wait_with_output()?;
-    if let Some(feeder) = feeder {
-        let _ = feeder.join();
-    }
-    Ok(output)
+    output_within(
+        Command::new(cli).args(&args),
+        stdin,
+        &format!("`{} exec {}`", cli, cmd.join(" ")),
+        ENGINE_IDLE_LIMIT,
+    )
 }
 
 fn track(cli: &str, id: &str) {
@@ -1409,12 +1594,12 @@ fn track(cli: &str, id: &str) {
 }
 
 fn remove_container(cli: &str, id: &str) {
-    let _ = Command::new(cli)
-        .args(["rm", "-f", id])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+    let _ = output_within(
+        Command::new(cli).args(["rm", "-f", id]),
+        None,
+        &format!("`{} rm`", cli),
+        CLEANUP_IDLE_LIMIT,
+    );
     if cli == "podman" {
         crate::podman::untrack_container(id);
     } else {
@@ -1450,13 +1635,13 @@ pub(crate) fn release(host: &Path, kept: bool) {
         }
         forget_saved(&volume);
         for _ in 0..VOLUME_REMOVAL_TRIES {
-            let removed = Command::new(cli)
-                .args(["volume", "rm", "-f", &volume])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .is_ok_and(|status| status.success());
+            let removed = output_within(
+                Command::new(cli).args(["volume", "rm", "-f", &volume]),
+                None,
+                &format!("`{} volume rm`", cli),
+                CLEANUP_IDLE_LIMIT,
+            )
+            .is_ok_and(|out| out.status.success());
             if removed {
                 return;
             }
@@ -1493,12 +1678,12 @@ pub(crate) fn remove_now(host: &Path) {
             remove_container(workspace.cli, &helper);
         }
     }
-    let _ = Command::new(workspace.cli)
-        .args(["volume", "rm", "-f", &workspace.volume])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+    let _ = output_within(
+        Command::new(workspace.cli).args(["volume", "rm", "-f", &workspace.volume]),
+        None,
+        &format!("`{} volume rm`", workspace.cli),
+        CLEANUP_IDLE_LIMIT,
+    );
     forget_saved(&workspace.volume);
 }
 
@@ -1521,19 +1706,19 @@ pub(crate) async fn wait_for_released_volumes() {
 pub(crate) fn remove_orphaned_volumes() -> usize {
     let mut removed = 0;
     for cli in ["docker", "podman"] {
-        let Ok(listed) = Command::new(cli)
-            .args([
+        let Ok(listed) = output_within(
+            Command::new(cli).args([
                 "volume",
                 "ls",
                 "--filter",
                 &format!("label={}", LABEL),
                 "--format",
                 &format!("{{{{.Name}}}}\t{{{{index .Labels \"{}\"}}}}", LABEL),
-            ])
-            .stdin(Stdio::null())
-            .stderr(Stdio::null())
-            .output()
-        else {
+            ]),
+            None,
+            &format!("`{} volume ls`", cli),
+            CLEANUP_IDLE_LIMIT,
+        ) else {
             continue;
         };
         if !listed.status.success() {
@@ -1546,13 +1731,13 @@ pub(crate) fn remove_orphaned_volumes() -> usize {
             if !name.starts_with(VOLUME_PREFIX) || Path::new(host).is_dir() {
                 continue;
             }
-            let gone = Command::new(cli)
-                .args(["volume", "rm", name])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .is_ok_and(|status| status.success());
+            let gone = output_within(
+                Command::new(cli).args(["volume", "rm", name]),
+                None,
+                &format!("`{} volume rm`", cli),
+                CLEANUP_IDLE_LIMIT,
+            )
+            .is_ok_and(|out| out.status.success());
             if gone {
                 forget_saved(name);
             }
@@ -2076,6 +2261,56 @@ mod tests {
         assert!(!only_vanished(
             "tar: Exiting with failure status due to previous errors\n"
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_call_that_stops_moving_is_killed_and_a_slow_one_is_not() {
+        let started = Instant::now();
+        let stuck = output_within(
+            Command::new("sh").args(["-c", "sleep 30"]),
+            None,
+            "`sleep`",
+            Duration::from_millis(200),
+        )
+        .unwrap_err();
+        assert_eq!(stuck.kind(), io::ErrorKind::TimedOut);
+        assert!(stuck.to_string().contains("`sleep`"), "{stuck}");
+        assert!(started.elapsed() < Duration::from_secs(10));
+
+        // Longer than the limit in all, but never idle that long.
+        let slow = output_within(
+            Command::new("sh").args(["-c", "for i in 1 2 3 4 5 6; do echo $i; sleep 0.1; done"]),
+            None,
+            "`slow`",
+            Duration::from_millis(400),
+        )
+        .unwrap();
+        assert!(slow.status.success());
+        assert_eq!(slow.stdout, b"1\n2\n3\n4\n5\n6\n");
+
+        // Input reaches the command.
+        let echoed = output_within(
+            Command::new("cat").arg("-"),
+            Some(b"in".to_vec()),
+            "`cat`",
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(echoed.stdout, b"in");
+    }
+
+    #[test]
+    fn a_stalled_engine_fails_later_syncs_at_once() {
+        let workspace = broken_workspace(true);
+        workspace.lock().stalled = Some("`docker exec find` made no progress".to_string());
+        let into = workspace.sync_in().unwrap_err();
+        assert!(
+            into.contains("wasn't tried") && into.contains("no progress"),
+            "{into}"
+        );
+        let back = workspace.sync_out().unwrap_err();
+        assert!(back.contains("wasn't tried"), "{back}");
     }
 
     /// A Docker daemon that runs Linux containers, as the helper needs. A

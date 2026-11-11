@@ -690,6 +690,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_leg_its_siblings_sized_says_so_and_its_kill_marks_the_matrix() {
+        use crate::job_memory;
+        job_memory::use_test_store();
+        let family = "told-legs";
+        with_run_pool(async {
+            set_limit(Some(Limit::Memory {
+                bytes: 8 * GIB,
+                slots: 1,
+            }));
+            // The first leg runs alone and is measured.
+            job_memory::metered(
+                async {
+                    let _ = job_memory::leg_place(Some("told-1"), Some(family), "told (1)").await;
+                    job_memory::meter().unwrap().sample("step", 600 * MIB);
+                },
+                |_| true,
+            )
+            .await;
+            // The second is sized by it, and is killed.
+            job_memory::metered(
+                async {
+                    let _ = job_memory::leg_place(Some("told-2"), Some(family), "told (2)").await;
+                    let meter = job_memory::meter().unwrap();
+                    meter.sample("step", 600 * MIB);
+                    meter.killed_alone();
+                },
+                |_| false,
+            )
+            .await;
+        })
+        .await;
+        let logs = wrkflw_logging::get_logs();
+        let said = |text: &str| logs.iter().any(|line| line.contains(text));
+        assert!(
+            !said("Matrix job told (1) hasn't been measured"),
+            "the first leg ran alone"
+        );
+        assert!(said(&format!(
+            "Matrix job told (2) hasn't been measured yet; it sets aside {SIBLING_MIB} MiB"
+        )));
+        assert!(said("Matrix job told (2) had never been measured"));
+        assert_eq!(
+            job_memory::reserve("told-3", Some(family)),
+            None,
+            "the matrix sizes no leg once one it sized was killed"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_leg_killed_on_its_own_measurement_leaves_its_matrix_sizing_legs() {
+        use crate::job_memory;
+        job_memory::use_test_store();
+        let family = "own-legs";
+        let leg = |peak: u64, killed: bool| {
+            job_memory::metered(
+                async move {
+                    let _ = job_memory::leg_place(Some("own-1"), Some(family), "own (1)").await;
+                    let meter = job_memory::meter().unwrap();
+                    meter.sample("step", peak);
+                    if killed {
+                        meter.killed_alone();
+                    }
+                },
+                move |_| !killed,
+            )
+        };
+        with_run_pool(async {
+            set_limit(Some(Limit::Memory {
+                bytes: 8 * GIB,
+                slots: 1,
+            }));
+            leg(600 * MIB, false).await;
+            // On the next run it is given its own room, and is killed.
+            leg(900 * MIB, true).await;
+        })
+        .await;
+        assert!(
+            !wrkflw_logging::get_logs()
+                .iter()
+                .any(|line| line.contains("Matrix job own (1)")),
+            "nothing to say of a leg given its own room"
+        );
+        assert_eq!(
+            job_memory::reserve("own-1", Some(family)).map(|r| r.by_matrix),
+            Some(true)
+        );
+    }
+
+    #[tokio::test]
     async fn legs_with_room_for_two_unmeasured_run_together_as_before() {
         crate::job_memory::use_test_store();
         with_run_pool(async {

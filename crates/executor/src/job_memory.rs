@@ -166,6 +166,13 @@ impl JobMeter {
         }
     }
 
+    /// A container of this job was killed, told to no job beside it, so
+    /// tests running at the same time aren't killed with it.
+    #[cfg(test)]
+    pub(crate) fn killed_alone(&self) {
+        self.killed.store(true, Ordering::Relaxed);
+    }
+
     #[cfg(test)]
     pub(crate) fn is_incomplete(&self) -> bool {
         self.incomplete.load(Ordering::Relaxed)
@@ -436,10 +443,15 @@ struct Measured {
     #[serde(default)]
     highest: u64,
     /// For a matrix: a process was killed for lack of memory while a leg
-    /// ran, whether in that leg or in a job beside it, so what one leg
-    /// needs no longer says what the others do. Its legs never measured
-    /// run alone, each measuring itself, and no peak is kept for the
-    /// matrix again.
+    /// ran on what its siblings were measured at, so what one leg needs
+    /// doesn't say what the others do. Its legs never measured run alone,
+    /// each measuring itself, and no peak is kept for the matrix again.
+    ///
+    /// The mark is not lifted while the matrix runs: lifted, a light leg
+    /// would size the heavy legs again and get them killed every few runs.
+    /// A kill while no leg ran on its siblings' measurement doesn't set it,
+    /// since a leg given its own room, or running alone, that ran out of
+    /// memory says nothing about its siblings.
     #[serde(default)]
     uneven: bool,
     /// When the last of them was taken, in seconds since the epoch.
@@ -536,33 +548,51 @@ fn reserve_in(store: &Store, id: &str, family: Option<&str>) -> Option<Reserve> 
 }
 
 /// Keep `outcome` for the job `id`, and for its matrix `family` what says
-/// something about every leg: a peak, or a kill. A leg that couldn't be
-/// measured says nothing about the others. `false` when nothing changed.
+/// something about every leg. `sized_by_matrix` says the leg ran on what
+/// its siblings were measured at. `false` when nothing changed.
 ///
-/// A kill marks the matrix uneven rather than forgetting it. Forgotten, the
-/// first leg to pass would measure it again, and if that leg is a light
-/// one, the heavy legs it sizes would start together and be killed on every
-/// run, never measuring themselves.
-fn keep(store: &mut Store, id: &str, family: Option<&str>, outcome: Outcome, now: i64) -> bool {
-    let family = family.filter(|_| !matches!(outcome, Outcome::Unknown));
-    if !matches!(outcome, Outcome::Peak(_)) && !store.jobs.contains_key(id) && family.is_none() {
-        // Nothing to forget.
-        return false;
-    }
-    match (family, outcome) {
-        (Some(family), Outcome::Killed) => {
-            let matrix = Measured {
-                uneven: true,
-                at: now,
-                ..Measured::default()
-            };
-            store.jobs.insert(family.to_string(), matrix);
+/// What the matrix keeps of a leg's outcome:
+/// - a peak, which sizes legs never measured;
+/// - a kill of a leg sized by its siblings, which marks the matrix
+///   [`Measured::uneven`]. Forgetting it instead would let the first leg to
+///   pass measure it again, and if that leg is a light one, the heavy legs
+///   it sizes would start together and be killed on every run;
+/// - nothing of a kill of a leg on its own measurement or running alone,
+///   which needed more than it was given, nor of a leg that couldn't be
+///   measured.
+fn keep(
+    store: &mut Store,
+    id: &str,
+    family: Option<&str>,
+    outcome: Outcome,
+    sized_by_matrix: bool,
+    now: i64,
+) -> bool {
+    let mut changed = false;
+    if let Some(family) = family {
+        match outcome {
+            Outcome::Peak(_) => {
+                apply(store, family, outcome, now);
+                changed = true;
+            }
+            Outcome::Killed if sized_by_matrix => {
+                let matrix = Measured {
+                    uneven: true,
+                    at: now,
+                    ..Measured::default()
+                };
+                store.jobs.insert(family.to_string(), matrix);
+                changed = true;
+            }
+            Outcome::Killed | Outcome::Unknown => {}
         }
-        (Some(family), outcome) => apply(store, family, outcome, now),
-        (None, _) => {}
     }
-    apply(store, id, outcome, now);
-    true
+    // A job never measured that has nothing to keep has nothing to forget.
+    if matches!(outcome, Outcome::Peak(_)) || store.jobs.contains_key(id) {
+        apply(store, id, outcome, now);
+        changed = true;
+    }
+    changed
 }
 
 /// Keep what `meter` saw of the job `id`, a leg of the matrix `family` if
@@ -590,6 +620,7 @@ fn record(id: &str, family: Option<&str>, meter: &JobMeter, passed: bool) {
         id,
         family,
         outcome,
+        meter.sized_by_matrix.load(Ordering::Relaxed),
         chrono::Utc::now().timestamp(),
     ) {
         return;
@@ -691,37 +722,31 @@ mod tests {
         assert_eq!(store.jobs["job"].highest, 600 * MIB);
     }
 
+    /// Keep `outcome` for the leg `id` of the matrix `legs`, which ran on its
+    /// own measurement or alone.
+    fn leg(store: &mut Store, id: &str, outcome: Outcome) -> bool {
+        keep(store, id, Some("legs"), outcome, false, 1000)
+    }
+
+    /// Keep `outcome` for the leg `id` of the matrix `legs`, which ran on
+    /// what its siblings were measured at.
+    fn sized_leg(store: &mut Store, id: &str, outcome: Outcome) -> bool {
+        keep(store, id, Some("legs"), outcome, true, 1000)
+    }
+
     #[test]
     fn an_unmeasured_leg_takes_what_the_legs_of_its_matrix_were_measured_at() {
         let mut store = Store::default();
         assert_eq!(room(&store, "3.13", Some("legs")), None);
         // The first leg of a new matrix ran alone.
-        assert!(keep(
-            &mut store,
-            "3.12",
-            Some("legs"),
-            Outcome::Peak(600 * MIB),
-            1000
-        ));
+        assert!(leg(&mut store, "3.12", Outcome::Peak(600 * MIB)));
         let sibling = room(&store, "3.13", Some("legs"));
         assert_eq!(sibling, Some(900 * MIB + HEADROOM_BYTES));
         assert_eq!(room(&store, "3.13", None), None, "not a leg");
         // A heavier leg raises what a new leg gets; a leg's own
         // measurement, once it has one, wins.
-        assert!(keep(
-            &mut store,
-            "pypy",
-            Some("legs"),
-            Outcome::Peak(1000 * MIB),
-            1000
-        ));
-        assert!(keep(
-            &mut store,
-            "3.13",
-            Some("legs"),
-            Outcome::Peak(300 * MIB),
-            1000
-        ));
+        assert!(leg(&mut store, "pypy", Outcome::Peak(1000 * MIB)));
+        assert!(sized_leg(&mut store, "3.13", Outcome::Peak(300 * MIB)));
         assert_eq!(
             room(&store, "3.14", Some("legs")),
             Some(1500 * MIB + HEADROOM_BYTES)
@@ -733,65 +758,67 @@ mod tests {
         // Which of the two it was is said, so a kill it causes can be.
         assert!(reserve_in(&store, "3.14", Some("legs")).unwrap().by_matrix);
         assert!(!reserve_in(&store, "3.13", Some("legs")).unwrap().by_matrix);
-        // A leg that couldn't be measured says nothing about the others.
-        assert!(keep(
-            &mut store,
-            "3.13",
-            Some("legs"),
-            Outcome::Unknown,
-            1000
-        ));
-        assert!(store.jobs.contains_key("legs"));
-        assert!(!keep(
-            &mut store,
-            "3.13",
-            Some("legs"),
-            Outcome::Unknown,
-            1000
-        ));
-        // One that ran out of memory leaves the matrix's measurement sizing
-        // no leg.
-        assert!(keep(
-            &mut store,
-            "3.15",
-            Some("legs"),
-            Outcome::Killed,
-            1000
-        ));
+        // A leg that couldn't be measured says nothing about the others,
+        // and forgets its own measurement: next time its siblings' size it.
+        assert!(leg(&mut store, "3.13", Outcome::Unknown));
+        assert_eq!(
+            reserve_in(&store, "3.13", Some("legs")),
+            Some(Reserve {
+                bytes: 1500 * MIB + HEADROOM_BYTES,
+                by_matrix: true
+            })
+        );
+        assert!(!leg(&mut store, "3.13", Outcome::Unknown));
+        // One its siblings sized that ran out of memory leaves the matrix's
+        // measurement sizing no leg.
+        assert!(sized_leg(&mut store, "3.15", Outcome::Killed));
         assert!(store.jobs["legs"].uneven);
         assert_eq!(room(&store, "3.14", Some("legs")), None);
     }
 
     #[test]
+    fn a_leg_killed_on_its_own_room_or_alone_leaves_its_matrix_alone() {
+        let mut store = Store::default();
+        leg(&mut store, "lint", Outcome::Peak(300 * MIB));
+        leg(&mut store, "build", Outcome::Peak(300 * MIB));
+        // A kill elsewhere in the VM while the leg ran on its own
+        // measurement forgets that measurement, and says nothing of how
+        // alike the legs are.
+        assert!(leg(&mut store, "build", Outcome::Killed));
+        assert!(!store.jobs.contains_key("build"));
+        assert!(!store.jobs["legs"].uneven);
+        assert!(room(&store, "new", Some("legs")).is_some());
+        // Nor does the first leg of a new matrix, killed running alone:
+        // there is nothing to keep.
+        let mut fresh = Store::default();
+        assert!(!leg(&mut fresh, "a", Outcome::Killed));
+        assert!(fresh.jobs.is_empty());
+    }
+
+    #[test]
     fn a_light_first_leg_never_again_sizes_heavy_legs_that_were_killed() {
         let mut store = Store::default();
-        let run =
-            |store: &mut Store, leg: &str, outcome| keep(store, leg, Some("legs"), outcome, 1);
         // The light leg ran alone and sized the rest, which ran together
         // and were killed.
-        run(&mut store, "lint", Outcome::Peak(300 * MIB));
+        leg(&mut store, "lint", Outcome::Peak(300 * MIB));
         assert!(room(&store, "build", Some("legs")).is_some());
-        run(&mut store, "build", Outcome::Killed);
-        run(&mut store, "test", Outcome::Killed);
+        sized_leg(&mut store, "build", Outcome::Killed);
+        sized_leg(&mut store, "test", Outcome::Killed);
         // The next run: the light leg passes first, as it did before. Its
         // peak sizes the heavy legs no longer, so they run alone, each
         // measuring itself, as before any matrix was measured.
-        run(&mut store, "lint", Outcome::Peak(300 * MIB));
+        leg(&mut store, "lint", Outcome::Peak(300 * MIB));
         assert_eq!(room(&store, "build", Some("legs")), None);
         assert_eq!(room(&store, "test", Some("legs")), None);
-        run(&mut store, "build", Outcome::Peak(5000 * MIB));
+        leg(&mut store, "build", Outcome::Peak(5000 * MIB));
         assert_eq!(room(&store, "new", Some("legs")), None);
         assert!(room(&store, "build", Some("legs")).is_some());
-        // A kill with no measurement of the matrix yet marks it too.
-        let mut fresh = Store::default();
-        assert!(keep(&mut fresh, "a", Some("legs"), Outcome::Killed, 1));
-        assert!(fresh.jobs["legs"].uneven);
         // The mark lasts as long as the matrix runs, and goes with it.
         apply(
             &mut store,
             "other",
             Outcome::Peak(MIB),
-            1 + FORGET_AFTER_SECS,
+            1000 + FORGET_AFTER_SECS,
         );
         assert!(!store.jobs.contains_key("legs"));
     }

@@ -23,6 +23,12 @@ pub(crate) struct BuiltRuntimes {
     /// holds, and why. Empty inside a composite action, whose steps these
     /// indices don't name.
     pub(crate) not_built: Vec<(usize, NotBuilt)>,
+    /// The runtimes the image holds, with the version and settings of each,
+    /// so a setup step inside a composite action can be judged on them.
+    pub(crate) runtimes: Vec<SetupRuntime>,
+    /// Set for the steps of a composite action: the image was built from
+    /// the job's own setup steps, which aren't these.
+    pub(crate) in_composite: bool,
 }
 
 /// Why a setup step's version is not in the job's image.
@@ -47,6 +53,8 @@ impl BuiltRuntimes {
         BuiltRuntimes {
             installed: self.installed.clone(),
             not_built: Vec::new(),
+            runtimes: self.runtimes.clone(),
+            in_composite: true,
         }
     }
 }
@@ -60,7 +68,7 @@ pub(crate) struct SetupDetection {
 }
 
 /// A runtime detected from a setup action step (e.g., `actions/setup-node@v3`).
-#[derive(Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct SetupRuntime {
     /// Language identifier (e.g., "node", "php", "python")
     pub(crate) language: String,
@@ -72,6 +80,9 @@ pub(crate) struct SetupRuntime {
     /// as releases come out. Judged on the version as the step wrote it:
     /// `version` may have lost what made it float, as `3.x` becomes `3`.
     pub(crate) floating: bool,
+    /// Variables the image sets for every step, as the action sets them for
+    /// the rest of the job: `UV_PYTHON` for setup-uv's `python-version`.
+    pub(crate) env: Vec<(String, String)>,
 }
 
 /// Whether `version`, as a `language` setup step wrote it, names a channel
@@ -283,12 +294,29 @@ pub(crate) fn version_from_file(root: &Path, file: &str) -> Option<String> {
                 .get("volta")
                 .and_then(|v| v.get("node"))
                 .or_else(|| json.get("engines").and_then(|e| e.get("node")))?;
-            node_major_for_range(range.as_str()?)
+            let range = range.as_str()?.trim();
+            // A full release, as `volta.node` pins one, is installed as is,
+            // like the same pin in `.nvmrc`.
+            let release = range.trim_start_matches('v');
+            if release.split('.').count() == 3 && is_safe_version(release) {
+                Some(release.to_string())
+            } else {
+                node_major_for_range(range)
+            }
         }
-        "go.mod" => text
-            .lines()
-            .find_map(|l| l.trim().strip_prefix("go "))
-            .and_then(first_number),
+        // setup-go prefers the `toolchain` line, which names the release
+        // the module is built with, to the `go` line's minimum. A go.work
+        // file has the same two lines.
+        "go.mod" | "go.work" => {
+            let directive = |name: &str| {
+                text.lines()
+                    .find_map(|l| l.trim().strip_prefix(name))
+                    .map(str::trim)
+            };
+            directive("toolchain go")
+                .or_else(|| directive("go "))
+                .and_then(go_version)
+        }
         _ => text
             .lines()
             .map(str::trim)
@@ -308,18 +336,24 @@ pub(crate) fn version_from_file(root: &Path, file: &str) -> Option<String> {
 /// is left out. Emulation builds no image at all: the host's tools stand in.
 ///
 /// `step_idx` is the step's index among the job's steps, which says whether
-/// the image holds this step's own version.
+/// the image holds this step's own version. Inside a composite action it
+/// names none of them, and `step` itself is judged: it ran only when the
+/// image holds just the runtime it asks for.
 pub(crate) fn unrun_action_cause(
     repository: &str,
     built: &BuiltRuntimes,
     container_runtime: bool,
     step_idx: usize,
+    step: Option<&Step>,
 ) -> Option<&'static str> {
     let Some(def) = SETUP_ACTIONS.iter().find(|d| d.repos.contains(&repository)) else {
         return Some(NO_IMPLEMENTATION);
     };
     if !container_runtime {
         return Some("emulation installs no runtime, so the host's tools stand in for it");
+    }
+    if built.in_composite {
+        return composite_setup_cause(def, built, step);
     }
     match built
         .not_built
@@ -348,6 +382,85 @@ pub(crate) fn unrun_action_cause(
         "its runtime is not in the job's image, as a job container is used as is \
          and a setup step inside a composite action isn't built into it",
     )
+}
+
+/// Why a setup step inside a composite action did not run, or `None` when
+/// the job's image holds just what it asks for. The image was built from
+/// the job's own setup steps, so a composite step that asks for another
+/// version, or for one set by an input not known until it runs, didn't
+/// get it.
+fn composite_setup_cause(
+    def: &SetupActionDef,
+    built: &BuiltRuntimes,
+    step: Option<&Step>,
+) -> Option<&'static str> {
+    const NOT_IN_IMAGE: &str = "its runtime is not in the job's image, as a setup step inside a \
+                                composite action isn't built into it";
+    let (Some(built_rt), Some(step)) = (
+        built.runtimes.iter().find(|rt| rt.language == def.language),
+        step,
+    ) else {
+        return Some(NOT_IN_IMAGE);
+    };
+    let asked = detect_setup(std::slice::from_ref(step));
+    match asked.runtimes.iter().find(|rt| rt.language == def.language) {
+        Some(rt) if rt.version == built_rt.version && rt.env == built_rt.env => None,
+        Some(_) => Some(
+            "it asks for another version than the job's image holds, which was built from \
+             the job's own setup steps",
+        ),
+        None => Some(
+            "the version it asks for isn't one wrkflw can install, or isn't known before \
+             the job runs, so the job's image doesn't hold it",
+        ),
+    }
+}
+
+/// The Python an `astral-sh/setup-uv` step asks for with `python-version`,
+/// `None` when it asks for none, or why the step can't be done as asked:
+/// inputs that change what later steps run with and that wrkflw doesn't
+/// carry out leave the step not run.
+fn uv_python<'a>(input: impl Fn(&str) -> Option<&'a String>) -> Result<Option<String>, String> {
+    if input("activate-environment").is_some_and(|value| value.trim() == "true") {
+        return Err("its `activate-environment` input isn't carried out by wrkflw".to_string());
+    }
+    for key in ["version-file", "pyproject-file", "uv-file"] {
+        if input(key).is_some() && input("version").is_none() {
+            return Err(format!(
+                "its `{}` input, which sets uv's version, isn't read by wrkflw",
+                key
+            ));
+        }
+    }
+    let Some(python) = input("python-version") else {
+        return Ok(None);
+    };
+    let python = python.trim();
+    let python: String = if python.starts_with(['<', '>', '=', '!', '~']) {
+        python.chars().filter(|c| !c.is_whitespace()).collect()
+    } else {
+        python.to_string()
+    };
+    if is_safe_version(&python) || is_safe_python_spec(&python) {
+        Ok(Some(python))
+    } else {
+        Err(format!(
+            "its `python-version` {:?} isn't one wrkflw can install",
+            python
+        ))
+    }
+}
+
+/// The Go release a go.mod line names: `1.22.3`, or `1.23rc1` for a
+/// pre-release, without a trailing comment.
+fn go_version(text: &str) -> Option<String> {
+    let version: String = text
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '.')
+        .collect();
+    let version = version.trim_end_matches('.');
+    (version.starts_with(|c: char| c.is_ascii_digit()) && is_safe_version(version))
+        .then(|| version.to_string())
 }
 
 /// `file` under `root`, if it stays there once links are followed.
@@ -553,9 +666,16 @@ pub(crate) fn detect_setup_in(steps: &[Step], root: &Path) -> SetupDetection {
         } else {
             ver
         };
+        // setup-python's `graalpy-24.1` names a GraalPy release, which uv
+        // can't install by: it asks for GraalPy by the Python it implements.
+        let graalpy_release = def.language == "python"
+            && ver
+                .strip_prefix("graalpy")
+                .is_some_and(|rest| !rest.trim_start_matches('-').is_empty());
         let safe = (is_safe_version(&ver)
             || (def.language == "python" && is_safe_python_spec(&ver)))
-            && (def.language != "go" || go_release_known(&ver));
+            && (def.language != "go" || go_release_known(&ver))
+            && !graalpy_release;
         if !safe {
             wrkflw_logging::warning(&format!(
                 "Ignoring {} with invalid version: {:?}",
@@ -565,16 +685,58 @@ pub(crate) fn detect_setup_in(steps: &[Step], root: &Path) -> SetupDetection {
             continue;
         }
 
-        let rt = SetupRuntime {
+        let mut rt = SetupRuntime {
             language: def.language.to_string(),
             version: ver.clone(),
             install_script: get_install_script(def.language, &ver),
             floating,
+            env: Vec::new(),
         };
+        if def.language == "uv" {
+            match uv_python(input) {
+                Ok(None) => {}
+                Ok(Some(python)) => {
+                    // setup-uv sets `UV_PYTHON` for the rest of the job, so
+                    // `uv run` and `uv venv` use this Python, whatever
+                    // `.python-version` says.
+                    rt.install_script.push_str(&format!(
+                        " && uv python install '{}'",
+                        uv_python_request(&python)
+                    ));
+                    rt.floating |= is_floating_version("python", &python);
+                    rt.env = vec![
+                        ("UV_PYTHON".to_string(), uv_python_request(&python)),
+                        (
+                            "UV_PYTHON_INSTALL_DIR".to_string(),
+                            UV_PYTHON_DIR.to_string(),
+                        ),
+                    ];
+                }
+                Err(why) => {
+                    wrkflw_logging::warning(&format!("{}: {}, so the step is not run", uses, why));
+                    not_built.push((step_idx, NotBuilt::Refused));
+                    continue;
+                }
+            }
+        }
 
         // Deduplicate: later setup steps override earlier ones for the same
         // language, and the earlier step's version is then not built in.
         let existing_idx = runtimes.iter().position(|r| r.language == rt.language);
+        // A later step that may not run doesn't decide the image: on a run
+        // where its condition is false, the job would get its version
+        // instead of the earlier step's.
+        if existing_idx.is_some_and(|idx| runtimes[idx].version != rt.version)
+            && step.if_condition.is_some()
+        {
+            wrkflw_logging::warning(&format!(
+                "{}: a {} setup step with an `if:` can't change the version an earlier step \
+                 set up, so the step is not run",
+                uses, def.language
+            ));
+            not_built.push((step_idx, NotBuilt::Refused));
+            continue;
+        }
         if let Some(idx) = existing_idx {
             if runtimes[idx].version != rt.version {
                 not_built.push((sources[idx], NotBuilt::Superseded));

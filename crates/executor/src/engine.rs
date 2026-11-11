@@ -2115,8 +2115,22 @@ fn generate_combined_dockerfile(
     // uv keeps the interpreters it installs under `$HOME`, which is root's
     // and closed to a step that runs as another user, and which a job that
     // sets `HOME` moves. Somewhere fixed and readable serves every step.
+    let mut env: Vec<(String, String)> = Vec::new();
     if runtimes.iter().any(|rt| rt.language == "python") {
-        dockerfile.push_str(&format!("ENV UV_PYTHON_INSTALL_DIR={}\n", UV_PYTHON_DIR));
+        env.push((
+            "UV_PYTHON_INSTALL_DIR".to_string(),
+            UV_PYTHON_DIR.to_string(),
+        ));
+    }
+    // What a setup action sets for the rest of the job, such as setup-uv's
+    // `UV_PYTHON`. Values were checked to be plain versions and paths.
+    for pair in runtimes.iter().flat_map(|rt| &rt.env) {
+        if !env.iter().any(|(name, _)| *name == pair.0) {
+            env.push(pair.clone());
+        }
+    }
+    for (name, value) in &env {
+        dockerfile.push_str(&format!("ENV {}={}\n", name, value));
     }
     dockerfile.push_str("RUN ");
     if let Some(week) = week {
@@ -2531,8 +2545,8 @@ async fn resolve_runner_image(
     if runtimes.is_empty() {
         Ok(RunnerImage {
             built: BuiltRuntimes {
-                installed: Vec::new(),
                 not_built,
+                ..BuiltRuntimes::default()
             },
             ..RunnerImage::plain(base_image)
         })
@@ -2543,8 +2557,10 @@ async fn resolve_runner_image(
         Ok(RunnerImage {
             image,
             built: BuiltRuntimes {
-                installed: runtimes.into_iter().map(|rt| rt.language).collect(),
+                installed: runtimes.iter().map(|rt| rt.language.clone()).collect(),
                 not_built,
+                runtimes,
+                in_composite: false,
             },
         })
     }
@@ -4346,6 +4362,7 @@ impl StepExecutionContext<'_> {
             self.installed_runtimes,
             uses_container_runtime(self.job_env),
             self.step_idx,
+            Some(self.step),
         )
     }
 }
@@ -9425,6 +9442,7 @@ runs:
             installed_runtimes: &BuiltRuntimes {
                 installed: installed.to_vec(),
                 not_built: Vec::new(),
+                ..BuiltRuntimes::default()
             },
             verbose: false,
             matrix_combination: &None,
@@ -10365,6 +10383,7 @@ runs:
             version: "20".to_string(),
             install_script: get_install_script("node", "20"),
             floating: false,
+            env: Vec::new(),
         }];
         let df = generate_combined_dockerfile(&runtimes, "ubuntu:latest", None, None);
         assert!(df.starts_with("FROM ubuntu:latest\n"));
@@ -10380,6 +10399,7 @@ runs:
             version: "20".to_string(),
             install_script: get_install_script("node", "20"),
             floating: false,
+            env: Vec::new(),
         }];
         let df =
             generate_combined_dockerfile(&runtimes, "catthehacker/ubuntu:act-latest", None, None);
@@ -10394,12 +10414,14 @@ runs:
                 version: "20".to_string(),
                 install_script: get_install_script("node", "20"),
                 floating: false,
+                env: Vec::new(),
             },
             SetupRuntime {
                 language: "python".to_string(),
                 version: "3.12".to_string(),
                 install_script: get_install_script("python", "3.12"),
                 floating: false,
+                env: Vec::new(),
             },
         ];
         let df = generate_combined_dockerfile(&runtimes, "ubuntu:latest", None, None);
@@ -10574,6 +10596,149 @@ runs:
             .into_iter()
             .next()
             .map(|rt| rt.version)
+    }
+
+    #[test]
+    fn version_files_are_read_as_the_hosted_actions_read_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |name: &str, text: &str| std::fs::write(dir.path().join(name), text).unwrap();
+        let go = |file: &str| {
+            setup_version(
+                "actions/setup-go@v5",
+                &[("go-version-file", file)],
+                dir.path(),
+            )
+        };
+        // The toolchain line names the release the module is built with.
+        write("go.mod", "module x\n\ngo 1.22\n\ntoolchain go1.22.3\n");
+        assert_eq!(go("go.mod").as_deref(), Some("1.22.3"));
+        write("go.mod", "module x\n\ngo 1.22.1 // minimum\n");
+        assert_eq!(go("go.mod").as_deref(), Some("1.22.1"));
+        // A go.work file has the same lines.
+        write("go.work", "go 1.23.2\n\nuse ./a\n");
+        assert_eq!(go("go.work").as_deref(), Some("1.23.2"));
+
+        // A full release pinned in package.json is installed as is.
+        write("package.json", r#"{"volta": {"node": "20.11.0"}}"#);
+        let node = setup_version(
+            "actions/setup-node@v4",
+            &[("node-version-file", "package.json")],
+            dir.path(),
+        );
+        assert_eq!(node.as_deref(), Some("20.11.0"));
+        write("package.json", r#"{"engines": {"node": ">=18 <21"}}"#);
+        let node = setup_version(
+            "actions/setup-node@v4",
+            &[("node-version-file", "package.json")],
+            dir.path(),
+        );
+        assert_eq!(node.as_deref(), Some("20"));
+    }
+
+    #[test]
+    fn setup_uv_sets_the_python_it_is_asked_for() {
+        let with = |pairs: &[(&str, &str)]| -> HashMap<String, String> {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        let detection = detect_setup(&[make_step_uses(
+            "astral-sh/setup-uv@v6",
+            Some(with(&[("python-version", "3.12")])),
+        )]);
+        let uv = &detection.runtimes[0];
+        assert!(uv.install_script.contains("uv python install '3.12'"));
+        let dockerfile =
+            generate_combined_dockerfile(&detection.runtimes, "ubuntu:latest", None, None);
+        assert!(dockerfile.contains("ENV UV_PYTHON=3.12\n"), "{dockerfile}");
+        assert!(dockerfile.contains(&format!("ENV UV_PYTHON_INSTALL_DIR={}\n", UV_PYTHON_DIR)));
+        // Set once even beside setup-python, which sets the directory too.
+        let both = detect_setup(&[
+            make_step_uses(
+                "actions/setup-python@v5",
+                Some(with(&[("python-version", "3.12")])),
+            ),
+            make_step_uses(
+                "astral-sh/setup-uv@v6",
+                Some(with(&[("python-version", "3.12")])),
+            ),
+        ]);
+        let dockerfile = generate_combined_dockerfile(&both.runtimes, "ubuntu:latest", None, None);
+        assert_eq!(dockerfile.matches("ENV UV_PYTHON_INSTALL_DIR=").count(), 1);
+
+        // What wrkflw doesn't carry out leaves the step not run.
+        for refused in [
+            with(&[("activate-environment", "true")]),
+            with(&[("python-version", "3.12; rm -rf /")]),
+            with(&[("version-file", "pyproject.toml")]),
+        ] {
+            let detection = detect_setup(&[make_step_uses(
+                "astral-sh/setup-uv@v6",
+                Some(refused.clone()),
+            )]);
+            assert!(detection.runtimes.is_empty(), "{refused:?}");
+            assert_eq!(detection.not_built, [(0, NotBuilt::Refused)], "{refused:?}");
+        }
+    }
+
+    #[test]
+    fn a_graalpy_release_and_a_conditional_override_are_refused() {
+        let python = |version: &str| {
+            make_step_uses(
+                "actions/setup-python@v5",
+                Some(HashMap::from([(
+                    "python-version".to_string(),
+                    version.to_string(),
+                )])),
+            )
+        };
+        let graalpy = detect_setup(&[python("graalpy-24.1")]);
+        assert!(graalpy.runtimes.is_empty());
+        assert_eq!(graalpy.not_built, [(0, NotBuilt::Refused)]);
+        assert_eq!(detect_setup(&[python("graalpy")]).runtimes.len(), 1);
+
+        // A later step that may be skipped doesn't change what the image
+        // holds; the earlier step's version stays, and it is the one left
+        // out if it runs.
+        let mut nightly = python("3.14-dev");
+        nightly.if_condition = Some("github.event_name == 'schedule'".to_string());
+        let detection = detect_setup(&[python("3.12"), nightly.clone()]);
+        assert_eq!(detection.runtimes[0].version, "3.12");
+        assert_eq!(detection.not_built, [(1, NotBuilt::Refused)]);
+        // Alone, it decides the image as before.
+        let alone = detect_setup(&[nightly]);
+        assert_eq!(alone.runtimes[0].version, "3.14-dev");
+    }
+
+    #[test]
+    fn a_setup_step_in_a_composite_action_ran_only_if_the_image_holds_its_version() {
+        let node = |version: &str| {
+            make_step_uses(
+                "actions/setup-node@v4",
+                Some(HashMap::from([(
+                    "node-version".to_string(),
+                    version.to_string(),
+                )])),
+            )
+        };
+        let job = detect_setup(&[node("20")]);
+        let built = BuiltRuntimes {
+            installed: vec!["node".to_string()],
+            runtimes: job.runtimes,
+            ..BuiltRuntimes::default()
+        }
+        .for_composite();
+        let cause =
+            |step: &Step| unrun_action_cause("actions/setup-node", &built, true, 0, Some(step));
+        assert_eq!(cause(&node("20")), None);
+        assert!(cause(&node("18")).is_some_and(|c| c.contains("another version")));
+        assert!(cause(&node("${{ inputs.node }}")).is_some());
+        let python = make_step_uses("actions/setup-python@v5", None);
+        assert!(
+            unrun_action_cause("actions/setup-python", &built, true, 0, Some(&python))
+                .is_some_and(|c| c.contains("not in the job's image"))
+        );
     }
 
     #[test]
@@ -10796,18 +10961,37 @@ runs:
         let built = BuiltRuntimes {
             installed: vec!["node".to_string()],
             not_built: detected.not_built,
+            runtimes: detected.runtimes,
+            ..BuiltRuntimes::default()
         };
-        assert!(unrun_action_cause("actions/setup-node", &built, true, 0)
-            .unwrap()
-            .contains("another setup step"));
+        assert!(
+            unrun_action_cause("actions/setup-node", &built, true, 0, None)
+                .unwrap()
+                .contains("another setup step")
+        );
         assert_eq!(
-            unrun_action_cause("actions/setup-node", &built, true, 1),
+            unrun_action_cause("actions/setup-node", &built, true, 1, None),
             None
         );
-        // A composite's steps are not the job's.
+        // A composite's steps are not the job's: its step is judged on the
+        // version it asks for.
+        let asks = |version: &str| {
+            make_step_uses(
+                "actions/setup-node@v4",
+                Some(HashMap::from([(
+                    "node-version".to_string(),
+                    version.to_string(),
+                )])),
+            )
+        };
+        let composite = built.for_composite();
         assert_eq!(
-            unrun_action_cause("actions/setup-node", &built.for_composite(), true, 0),
+            unrun_action_cause("actions/setup-node", &composite, true, 0, Some(&asks("22"))),
             None
+        );
+        assert!(
+            unrun_action_cause("actions/setup-node", &composite, true, 0, Some(&asks("20")))
+                .is_some()
         );
     }
 
@@ -10894,6 +11078,7 @@ runs:
             version: "3.12".to_string(),
             install_script: get_install_script("python", "3.12"),
             floating: false,
+            env: Vec::new(),
         }];
         let df = generate_combined_dockerfile(&python, "ubuntu:latest", None, None);
         assert!(df.contains("build-essential less"), "{df}");
@@ -10910,6 +11095,7 @@ runs:
             version: "18".to_string(),
             install_script: get_install_script("node", "18"),
             floating: false,
+            env: Vec::new(),
         }];
         let df = generate_combined_dockerfile(&node, "ubuntu:latest", None, None);
         assert!(!df.contains("command -v node"), "{df}");
@@ -11012,6 +11198,7 @@ runs:
             version: "3.12".to_string(),
             install_script: get_install_script("python", "3.12"),
             floating: false,
+            env: Vec::new(),
         }];
         let df = generate_combined_dockerfile(&python, "ubuntu:latest", None, None);
         assert!(
@@ -11071,6 +11258,7 @@ runs:
             version: ">=3.9,<4".to_string(),
             install_script: String::new(),
             floating: false,
+            env: Vec::new(),
         }];
         let tag = combined_image_tag(&runtimes, "FROM x\n");
         let name = tag.strip_prefix(COMBINED_IMAGE_PREFIX).unwrap();
@@ -11086,19 +11274,24 @@ runs:
         let node = BuiltRuntimes {
             installed: vec!["node".to_string()],
             not_built: Vec::new(),
+            ..BuiltRuntimes::default()
         };
         assert_eq!(
-            unrun_action_cause("actions/setup-node", &node, true, 0),
+            unrun_action_cause("actions/setup-node", &node, true, 0, None),
             None
         );
-        assert!(unrun_action_cause("actions/setup-python", &node, true, 0)
-            .unwrap()
-            .contains("not in the job's image"));
-        assert!(unrun_action_cause("actions/setup-node", &node, false, 0)
-            .unwrap()
-            .contains("emulation"));
+        assert!(
+            unrun_action_cause("actions/setup-python", &node, true, 0, None)
+                .unwrap()
+                .contains("not in the job's image")
+        );
+        assert!(
+            unrun_action_cause("actions/setup-node", &node, false, 0, None)
+                .unwrap()
+                .contains("emulation")
+        );
         assert_eq!(
-            unrun_action_cause("codecov/codecov-action", &node, true, 0),
+            unrun_action_cause("codecov/codecov-action", &node, true, 0, None),
             Some("no implementation in wrkflw")
         );
         // A version wrkflw couldn't install is named as the reason, not a
@@ -11106,10 +11299,13 @@ runs:
         let refused = BuiltRuntimes {
             installed: Vec::new(),
             not_built: vec![(0, NotBuilt::Refused)],
+            ..BuiltRuntimes::default()
         };
-        assert!(unrun_action_cause("actions/setup-node", &refused, true, 0)
-            .unwrap()
-            .contains("version it asks for"));
+        assert!(
+            unrun_action_cause("actions/setup-node", &refused, true, 0, None)
+                .unwrap()
+                .contains("version it asks for")
+        );
     }
 
     #[test]
@@ -11119,6 +11315,7 @@ runs:
             version: "20".to_string(),
             install_script: get_install_script("node", "20"),
             floating: false,
+            env: Vec::new(),
         }];
         let before =
             generate_combined_dockerfile(&runtimes, "ubuntu:latest", Some("sha256:aaa"), None);
@@ -11140,6 +11337,7 @@ runs:
             version: "1.0".to_string(),
             install_script: String::new(),
             floating: false,
+            env: Vec::new(),
         }];
         let df = generate_combined_dockerfile(&runtimes, "ubuntu:latest", None, None);
         // Single RUN layer with just the base packages
@@ -11154,12 +11352,14 @@ runs:
                 version: "20".to_string(),
                 install_script: "install node".to_string(),
                 floating: false,
+                env: Vec::new(),
             },
             SetupRuntime {
                 language: "python".to_string(),
                 version: "3.12".to_string(),
                 install_script: "install python".to_string(),
                 floating: false,
+                env: Vec::new(),
             },
         ];
         let df = "FROM base\nRUN install stuff\n";
@@ -11176,6 +11376,7 @@ runs:
             version: "20".to_string(),
             install_script: "install node v1".to_string(),
             floating: false,
+            env: Vec::new(),
         }];
         let tag1 = combined_image_tag(&runtimes, "FROM base\nRUN v1\n");
         let tag2 = combined_image_tag(&runtimes, "FROM base\nRUN v2\n");
@@ -11190,12 +11391,14 @@ runs:
                 version: "1".to_string(),
                 install_script: String::new(),
                 floating: false,
+                env: Vec::new(),
             },
             SetupRuntime {
                 language: "b".to_string(),
                 version: "2".to_string(),
                 install_script: String::new(),
                 floating: false,
+                env: Vec::new(),
             },
         ];
         let runtimes_ba = vec![
@@ -11204,12 +11407,14 @@ runs:
                 version: "2".to_string(),
                 install_script: String::new(),
                 floating: false,
+                env: Vec::new(),
             },
             SetupRuntime {
                 language: "a".to_string(),
                 version: "1".to_string(),
                 install_script: String::new(),
                 floating: false,
+                env: Vec::new(),
             },
         ];
         let df = "same";
@@ -12874,7 +13079,7 @@ runs:
         let step = make_run_step("noop");
         let services = test_services();
         let pending = std::sync::Mutex::new(Vec::<PendingCacheSave>::new());
-        let run = |installed: Vec<String>| {
+        let run = |runtimes: Vec<SetupRuntime>| {
             let (step, job_env, runtime, services, pending, action_dir, working_dir) = (
                 &step,
                 &job_env,
@@ -12894,8 +13099,9 @@ runs:
                     runtime,
                     "ubuntu:latest",
                     &BuiltRuntimes {
-                        installed,
-                        not_built: Vec::new(),
+                        installed: runtimes.iter().map(|rt| rt.language.clone()).collect(),
+                        runtimes,
+                        ..BuiltRuntimes::default()
                     },
                     false,
                     services,
@@ -12906,9 +13112,21 @@ runs:
             }
         };
 
-        let with_node = run(vec!["node".to_string()]).await;
+        // The job set up the Node the composite's step asks for, its default.
+        let node = |version: &str| {
+            let with = HashMap::from([("node-version".to_string(), version.to_string())]);
+            detect_setup_runtimes(&[make_step_uses("actions/setup-node@v4", Some(with))])
+        };
+        let with_node = run(node(RUNNER_NODE_MAJOR)).await;
         assert_eq!(with_node.status, StepStatus::Success);
         assert_eq!(with_node.actions_not_run, ["wrkflw-test/composite-inner"]);
+
+        // Another version than the composite's step asks for didn't run it.
+        let other = run(node("18")).await;
+        assert_eq!(
+            other.actions_not_run,
+            ["actions/setup-node", "wrkflw-test/composite-inner"]
+        );
 
         let without = run(Vec::new()).await;
         assert_eq!(
@@ -15050,6 +15268,7 @@ runs:
             version: "1.78".to_string(),
             install_script: "curl https://sh.rustup.rs -sSf | sh -s -- -y".to_string(),
             floating: false,
+            env: Vec::new(),
         }];
 
         let rt = &runtime as &dyn ContainerRuntime;

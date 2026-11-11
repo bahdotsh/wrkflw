@@ -1361,6 +1361,34 @@ fn a_branch_or_tag_alone_is_a_push_to_filters_and_steps() {
     assert_eq!(plan["trigger"]["matches"], false, "{plan}");
 }
 
+/// A workflow with no `push` trigger still runs with `--branch` or `--tag`
+/// alone: the ref only says what it runs for, as before.
+#[test]
+fn a_branch_alone_still_runs_a_workflow_that_takes_no_pushes() {
+    let sandbox = Sandbox::new();
+    sandbox.write(
+        "manual.yml",
+        "name: manual\non:\n  workflow_dispatch:\njobs:\n  a:\n    runs-on: ubuntu-latest\n    \
+         steps:\n      - run: test \"$GITHUB_REF\" = refs/heads/main\n",
+    );
+    let output = sandbox.run(&[
+        "--format",
+        "json",
+        "run",
+        "--runtime",
+        "emulation",
+        "--branch",
+        "main",
+        ".github/workflows/manual.yml",
+    ]);
+    let finished = json_lines(&output)
+        .into_iter()
+        .rev()
+        .find(|line| line["type"] == "run_finished")
+        .unwrap_or_else(|| panic!("no run_finished: {}", stdout(&output)));
+    assert_eq!(finished["status"], "success", "{finished}");
+}
+
 /// A step whose action wrkflw doesn't run passes, but the run says so: the
 /// verdict is `partial`, `unverified` names the step and the action, and the
 /// job's `job_finished` and `run_finished` entries list it. Under emulation a

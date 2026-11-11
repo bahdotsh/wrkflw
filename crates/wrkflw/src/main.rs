@@ -945,14 +945,33 @@ fn ref_name(value: &str, prefix: &str) -> Result<String, String> {
 }
 
 /// The event a run or plan is for: `--event`, or `push` when only
-/// `--branch` or `--tag` says what it is for. Without an event the filters
-/// wouldn't be checked against that branch or tag at all, and steps would
-/// see the workflow's first trigger beside it, such as a pull request with
-/// a tag's ref.
-fn event_for(event: Option<&str>, branch: Option<&str>, tag: Option<&str>) -> Option<String> {
-    event
-        .map(str::to_string)
-        .or_else(|| (branch.is_some() || tag.is_some()).then(|| "push".to_string()))
+/// `--branch` or `--tag` says what it is for and the workflow listens to
+/// pushes. Without an event the filters wouldn't be checked against that
+/// branch or tag at all, and steps would see the workflow's first trigger
+/// beside it, such as a pull request with a tag's ref. A workflow that
+/// doesn't listen to pushes, such as one run by `workflow_dispatch`, is
+/// run as before: a push would only skip it.
+fn event_for(
+    event: Option<&str>,
+    branch: Option<&str>,
+    tag: Option<&str>,
+    listens_to_push: impl FnOnce() -> bool,
+) -> Option<String> {
+    if let Some(event) = event {
+        return Some(event.to_string());
+    }
+    ((branch.is_some() || tag.is_some()) && listens_to_push()).then(|| "push".to_string())
+}
+
+/// Whether the GitHub Actions workflow at `path` has a `push` trigger.
+/// False for anything else, such as a GitLab pipeline or a directory.
+fn workflow_listens_to_push(path: &Path) -> bool {
+    path.is_file()
+        && wrkflw_trigger_filter::load_trigger_config(path).is_ok_and(|mut config| {
+            // Reported when the run's own filter check reads the file.
+            let _ = config.warnings.take();
+            config.events.iter().any(|e| e.event_name == "push")
+        })
 }
 
 /// `--tag` names what a push or release is for. A pull request is always
@@ -1423,7 +1442,9 @@ async fn run_cli() {
             partial_exit_code,
             gate_mode,
         }) => {
-            let event = &event_for(event.as_deref(), branch.as_deref(), tag.as_deref());
+            let event = &event_for(event.as_deref(), branch.as_deref(), tag.as_deref(), || {
+                workflow_listens_to_push(path)
+            });
             if let Err(e) = check_tag_event(event.as_deref(), tag.as_deref()) {
                 cli.format.fail(&e);
             }
@@ -1691,7 +1712,9 @@ async fn run_cli() {
             no_strict_filter,
             runtime,
         }) => {
-            let event = &event_for(event.as_deref(), branch.as_deref(), tag.as_deref());
+            let event = &event_for(event.as_deref(), branch.as_deref(), tag.as_deref(), || {
+                workflow_listens_to_push(path)
+            });
             if let Err(e) = check_tag_event(event.as_deref(), tag.as_deref()) {
                 cli.format.fail(&e);
             }
@@ -2177,13 +2200,50 @@ mod tests {
 
     #[test]
     fn a_branch_or_tag_alone_is_for_a_push() {
-        assert_eq!(event_for(None, None, Some("v1")).as_deref(), Some("push"));
-        assert_eq!(event_for(None, Some("main"), None).as_deref(), Some("push"));
-        assert_eq!(event_for(None, None, None), None);
+        let push = || true;
         assert_eq!(
-            event_for(Some("pull_request"), Some("feature"), None).as_deref(),
+            event_for(None, None, Some("v1"), push).as_deref(),
+            Some("push")
+        );
+        assert_eq!(
+            event_for(None, Some("main"), None, push).as_deref(),
+            Some("push")
+        );
+        assert_eq!(event_for(None, None, None, push), None);
+        assert_eq!(
+            event_for(Some("pull_request"), Some("feature"), None, push).as_deref(),
             Some("pull_request")
         );
+        // A workflow that doesn't listen to pushes is run as before.
+        assert_eq!(event_for(None, Some("main"), None, || false), None);
+        assert_eq!(
+            event_for(Some("pull_request"), Some("main"), None, || false).as_deref(),
+            Some("pull_request")
+        );
+    }
+
+    #[test]
+    fn only_a_workflow_with_a_push_trigger_listens_to_pushes() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |name: &str, on: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(
+                &path,
+                format!("name: x\non:\n{on}\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n"),
+            )
+            .unwrap();
+            path
+        };
+        assert!(workflow_listens_to_push(&write(
+            "push.yml",
+            "  push:\n    tags: ['v*']"
+        )));
+        assert!(!workflow_listens_to_push(&write(
+            "manual.yml",
+            "  workflow_dispatch:"
+        )));
+        assert!(!workflow_listens_to_push(dir.path()));
+        assert!(!workflow_listens_to_push(&dir.path().join("missing.yml")));
     }
 
     #[test]

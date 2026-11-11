@@ -1212,7 +1212,7 @@ impl JobResult {
             logs: note.to_string(),
             outputs: stored.outputs,
             failure_allowed: false,
-            repeated_from: None,
+            repeated_from: stored.repeated_from,
         }
     }
 
@@ -2888,7 +2888,7 @@ fn announce_reused(
         failure_allowed: false,
         duration_ms: 0,
         logs: note.to_string(),
-        repeated_from: None,
+        repeated_from: stored.repeated_from.clone(),
         reused: Some(kind.to_string()),
     });
     wrkflw_logging::info(&format!(
@@ -2921,6 +2921,7 @@ fn stored_jobs(results: &[JobResult]) -> Vec<acceleration::StoredJob> {
             name: result.name.clone(),
             canonical_name: result.canonical_name.clone(),
             outputs: result.outputs.clone(),
+            repeated_from: result.repeated_from.clone(),
             actions_not_run: result
                 .steps
                 .iter()
@@ -9412,6 +9413,7 @@ runs:
                 canonical_name: "test".to_string(),
                 outputs: HashMap::new(),
                 actions_not_run: Vec::new(),
+                repeated_from: None,
             },
             "reused",
             "reused",
@@ -9436,6 +9438,23 @@ runs:
         assert_eq!(
             reused.steps[0].actions_not_run,
             ["codecov/codecov-action@v4"]
+        );
+    }
+
+    #[test]
+    fn a_reused_fold_still_says_which_leg_it_repeated() {
+        let mut leg = JobResult::skipped("b (os: windows-latest)", "b", "");
+        leg.status = JobStatus::Success;
+        leg.repeated_from = Some("b (os: ubuntu-latest)".to_string());
+        let stored = stored_jobs(&[leg]);
+        assert_eq!(
+            stored[0].repeated_from.as_deref(),
+            Some("b (os: ubuntu-latest)")
+        );
+        let reused = JobResult::reused(stored[0].clone(), "reused", "reused");
+        assert_eq!(
+            reused.repeated_from.as_deref(),
+            Some("b (os: ubuntu-latest)")
         );
     }
 

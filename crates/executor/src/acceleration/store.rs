@@ -9,8 +9,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// 2: jobs carry the actions they passed without running. Entries from 1
-/// can't say, so they are not reused.
+/// 2: jobs carry the actions they passed without running, and the leg a
+/// folded matrix leg repeated. Entries from 1 can't say, so they are not
+/// reused.
 const ENTRY_SCHEMA: u32 = 2;
 /// Images and floating action tags aren't in the key, so a hit must not live
 /// forever. A week bounds that drift.
@@ -27,6 +28,10 @@ pub(crate) struct StoredJob {
     /// them again, so reuse never turns a partial pass into a verified one.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub actions_not_run: Vec<crate::action_fidelity::UnexecutedAction>,
+    /// The leg this matrix leg only repeated when the result was stored. A
+    /// reused fold still never ran, and says so.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repeated_from: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -370,6 +375,7 @@ mod tests {
             canonical_name: "build".to_string(),
             outputs: HashMap::from([("v".to_string(), "1".to_string())]),
             actions_not_run: Vec::new(),
+            repeated_from: None,
         }]
     }
 

@@ -133,11 +133,16 @@ impl JobMeter {
     }
 
     /// A container ended as the out-of-memory killer ends one. Every job
-    /// running beside it may be the one that used the memory.
+    /// running beside it may be the one that used the memory. A job still
+    /// waiting for its slot has used none: it names itself with
+    /// [`measure_as`] only once it holds one, so it is left alone.
     pub(crate) fn killed(&self) {
         self.killed.store(true, Ordering::Relaxed);
         for meter in ACTIVE.lock().unwrap_or_else(|e| e.into_inner()).iter() {
-            if let Some(meter) = meter.upgrade() {
+            let Some(meter) = meter.upgrade() else {
+                continue;
+            };
+            if meter.id.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
                 meter.neighbour_killed.store(true, Ordering::Relaxed);
             }
         }
@@ -561,6 +566,7 @@ mod tests {
         let (neighbour, finished) = tokio::join!(
             metered(
                 async {
+                    measure_as("light");
                     let mine = meter().unwrap();
                     mine.sample("light", 1);
                     // Still running when the other job's step is killed.
@@ -584,5 +590,32 @@ mod tests {
         let later = metered(async { meter().unwrap() }, |_| true).await;
         later.sample("step", 1);
         assert_eq!(later.outcome(), Outcome::Peak(1));
+    }
+
+    #[tokio::test]
+    async fn a_kill_spares_a_job_still_waiting_for_its_slot() {
+        let (killed_tx, killed_rx) = tokio::sync::oneshot::channel::<()>();
+        let (waiting, _) = tokio::join!(
+            metered(
+                async {
+                    // Queued: no slot yet, so not named.
+                    let _ = killed_rx.await;
+                    measure_as("queued");
+                    let mine = meter().unwrap();
+                    mine.sample("step", 1);
+                    mine
+                },
+                |_| true
+            ),
+            metered(
+                async {
+                    measure_as("killer");
+                    meter().unwrap().killed();
+                    let _ = killed_tx.send(());
+                },
+                |_| true
+            )
+        );
+        assert_eq!(waiting.outcome(), Outcome::Peak(1));
     }
 }

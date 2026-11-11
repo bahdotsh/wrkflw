@@ -846,6 +846,68 @@ fn global_child_args(cli: &Wrkflw, platform_overrides: &HashMap<String, String>)
     args
 }
 
+/// [`global_child_args`] for a hook that runs later, in another shell:
+/// only what was given on the command line. A value read from a `WRKFLW_*`
+/// variable is left for the hook's own environment to set, or a later
+/// change to the variable would be overridden by the frozen flag.
+fn hook_child_args(
+    cli: &Wrkflw,
+    matches: &clap::ArgMatches,
+    platform_overrides: &HashMap<String, String>,
+) -> Vec<String> {
+    let given = |id: &str| matches.value_source(id) == Some(clap::parser::ValueSource::CommandLine);
+    let mut args = Vec::new();
+    for (on, id, flag) in [
+        (cli.verbose, "verbose", "--verbose"),
+        (cli.debug, "debug", "--debug"),
+        (cli.fresh_workspace, "fresh_workspace", "--fresh-workspace"),
+        (
+            cli.every_matrix_leg,
+            "every_matrix_leg",
+            "--every-matrix-leg",
+        ),
+    ] {
+        if on && given(id) {
+            args.push(flag.to_string());
+        }
+    }
+    if given("platform") {
+        args.extend(platform_args(platform_overrides));
+    }
+    let k8s = &cli.kubernetes;
+    let keep = |id: &str| given(id);
+    let given_k8s = KubernetesArgs {
+        k8s_context: k8s.k8s_context.clone().filter(|_| keep("k8s_context")),
+        k8s_namespace: k8s.k8s_namespace.clone().filter(|_| keep("k8s_namespace")),
+        k8s_node_selector: given_or_empty(&k8s.k8s_node_selector, keep("k8s_node_selector")),
+        k8s_resource: given_or_empty(&k8s.k8s_resource, keep("k8s_resource")),
+        k8s_image_pull_secret: given_or_empty(
+            &k8s.k8s_image_pull_secret,
+            keep("k8s_image_pull_secret"),
+        ),
+        k8s_registry: k8s.k8s_registry.clone().filter(|_| keep("k8s_registry")),
+        k8s_helper_image: k8s
+            .k8s_helper_image
+            .clone()
+            .filter(|_| keep("k8s_helper_image")),
+        k8s_timeout: k8s.k8s_timeout.filter(|_| keep("k8s_timeout")),
+        k8s_schedule_timeout: k8s
+            .k8s_schedule_timeout
+            .filter(|_| keep("k8s_schedule_timeout")),
+    };
+    args.extend(given_k8s.child_args());
+    args
+}
+
+/// `values` when they were given, else none.
+fn given_or_empty<T: Clone>(values: &[T], given: bool) -> Vec<T> {
+    if given {
+        values.to_vec()
+    } else {
+        Vec::new()
+    }
+}
+
 /// A `--branch` value as GitHub names the branch, without `refs/heads/`.
 fn parse_branch(value: &str) -> Result<String, String> {
     ref_name(value, "refs/heads/")
@@ -880,6 +942,36 @@ fn ref_name(value: &str, prefix: &str) -> Result<String, String> {
     } else {
         Ok(name.to_string())
     }
+}
+
+/// The event a run or plan is for: `--event`, or `push` when only
+/// `--branch` or `--tag` says what it is for and the workflow listens to
+/// pushes. Without an event the filters wouldn't be checked against that
+/// branch or tag at all, and steps would see the workflow's first trigger
+/// beside it, such as a pull request with a tag's ref. A workflow that
+/// doesn't listen to pushes, such as one run by `workflow_dispatch`, is
+/// run as before: a push would only skip it.
+fn event_for(
+    event: Option<&str>,
+    branch: Option<&str>,
+    tag: Option<&str>,
+    listens_to_push: impl FnOnce() -> bool,
+) -> Option<String> {
+    if let Some(event) = event {
+        return Some(event.to_string());
+    }
+    ((branch.is_some() || tag.is_some()) && listens_to_push()).then(|| "push".to_string())
+}
+
+/// Whether the GitHub Actions workflow at `path` has a `push` trigger.
+/// False for anything else, such as a GitLab pipeline or a directory.
+fn workflow_listens_to_push(path: &Path) -> bool {
+    path.is_file()
+        && wrkflw_trigger_filter::load_trigger_config(path).is_ok_and(|mut config| {
+            // Reported when the run's own filter check reads the file.
+            let _ = config.warnings.take();
+            config.events.iter().any(|e| e.event_name == "push")
+        })
 }
 
 /// `--tag` names what a push or release is for. A pull request is always
@@ -1157,7 +1249,18 @@ async fn run_cli() {
         default_panic_hook(info);
     }));
 
-    let cli = Wrkflw::try_parse().unwrap_or_else(|e| exit_on_parse_error(e));
+    // The matches are kept to tell a value given on the command line from
+    // one read from a `WRKFLW_*` variable, which a hook must not freeze.
+    let matches = {
+        use clap::CommandFactory;
+        Wrkflw::command()
+            .try_get_matches()
+            .unwrap_or_else(|e| exit_on_parse_error(e))
+    };
+    let cli = {
+        use clap::FromArgMatches;
+        Wrkflw::from_arg_matches(&matches).unwrap_or_else(|e| exit_on_parse_error(e))
+    };
     let verbose = cli.verbose;
     let debug = cli.debug;
 
@@ -1339,6 +1442,9 @@ async fn run_cli() {
             partial_exit_code,
             gate_mode,
         }) => {
+            let event = &event_for(event.as_deref(), branch.as_deref(), tag.as_deref(), || {
+                workflow_listens_to_push(path)
+            });
             if let Err(e) = check_tag_event(event.as_deref(), tag.as_deref()) {
                 cli.format.fail(&e);
             }
@@ -1554,15 +1660,29 @@ async fn run_cli() {
             remote_cache,
             install_hook,
         }) => {
+            // A hook runs later, in its own environment: it gets only what
+            // was given here, not what `WRKFLW_*` variables set now.
+            let remote_cache_given = matches
+                .subcommand_matches("gate")
+                .and_then(|gate| gate.value_source("remote_cache"))
+                == Some(clap::parser::ValueSource::CommandLine);
             gate_cmd::run(gate_cmd::GateCtx {
                 path: path.clone(),
                 event: event.clone(),
                 base_branch: base_branch.clone(),
                 diff_base: diff_base.clone(),
                 runtime: runtime.clone(),
-                remote_cache: remote_cache.clone(),
+                remote_cache: if *install_hook {
+                    remote_cache.clone().filter(|_| remote_cache_given)
+                } else {
+                    remote_cache.clone()
+                },
                 install_hook: *install_hook,
-                child_args: global_child_args(&cli, &platform_overrides),
+                child_args: if *install_hook {
+                    hook_child_args(&cli, &matches, &platform_overrides)
+                } else {
+                    global_child_args(&cli, &platform_overrides)
+                },
                 format: cli.format,
             });
         }
@@ -1592,6 +1712,9 @@ async fn run_cli() {
             no_strict_filter,
             runtime,
         }) => {
+            let event = &event_for(event.as_deref(), branch.as_deref(), tag.as_deref(), || {
+                workflow_listens_to_push(path)
+            });
             if let Err(e) = check_tag_event(event.as_deref(), tag.as_deref()) {
                 cli.format.fail(&e);
             }
@@ -2073,6 +2196,113 @@ mod tests {
         assert!(check_tag_event(Some("push"), Some("v1")).is_ok());
         assert!(check_tag_event(None, Some("v1")).is_ok());
         assert!(check_tag_event(Some("pull_request"), None).is_ok());
+    }
+
+    #[test]
+    fn a_branch_or_tag_alone_is_for_a_push() {
+        let push = || true;
+        assert_eq!(
+            event_for(None, None, Some("v1"), push).as_deref(),
+            Some("push")
+        );
+        assert_eq!(
+            event_for(None, Some("main"), None, push).as_deref(),
+            Some("push")
+        );
+        assert_eq!(event_for(None, None, None, push), None);
+        assert_eq!(
+            event_for(Some("pull_request"), Some("feature"), None, push).as_deref(),
+            Some("pull_request")
+        );
+        // A workflow that doesn't listen to pushes is run as before.
+        assert_eq!(event_for(None, Some("main"), None, || false), None);
+        assert_eq!(
+            event_for(Some("pull_request"), Some("main"), None, || false).as_deref(),
+            Some("pull_request")
+        );
+    }
+
+    #[test]
+    fn only_a_workflow_with_a_push_trigger_listens_to_pushes() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |name: &str, on: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(
+                &path,
+                format!("name: x\non:\n{on}\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n"),
+            )
+            .unwrap();
+            path
+        };
+        assert!(workflow_listens_to_push(&write(
+            "push.yml",
+            "  push:\n    tags: ['v*']"
+        )));
+        assert!(!workflow_listens_to_push(&write(
+            "manual.yml",
+            "  workflow_dispatch:"
+        )));
+        assert!(!workflow_listens_to_push(dir.path()));
+        assert!(!workflow_listens_to_push(&dir.path().join("missing.yml")));
+    }
+
+    #[test]
+    fn a_hook_gets_only_the_flags_given_on_the_command_line() {
+        use clap::{CommandFactory, FromArgMatches};
+        // The variables these flags read, under names no other test uses,
+        // so setting them races with nothing.
+        let suffix = uuid::Uuid::new_v4().simple().to_string().to_uppercase();
+        let platform_var = format!("WRKFLW_TEST_PLATFORM_{suffix}");
+        let namespace_var = format!("WRKFLW_TEST_K8S_NAMESPACE_{suffix}");
+        std::env::set_var(&platform_var, "ubuntu-latest=from/env:1");
+        std::env::set_var(&namespace_var, "from-env");
+        // clap takes a variable's name as a `&'static str`.
+        let leak = |name: &str| -> &'static str { Box::leak(name.to_string().into_boxed_str()) };
+        let (platform_name, namespace_name) = (leak(&platform_var), leak(&namespace_var));
+        let command = Wrkflw::command()
+            .mut_arg("platform", |arg| arg.env(platform_name))
+            .mut_arg("k8s_namespace", |arg| arg.env(namespace_name));
+        let parse = |args: &[&str]| {
+            let matches = command.clone().try_get_matches_from(args).unwrap();
+            let cli = Wrkflw::from_arg_matches(&matches).unwrap();
+            let overrides = collect_platform_overrides(&cli.platform);
+            (
+                hook_child_args(&cli, &matches, &overrides),
+                global_child_args(&cli, &overrides),
+            )
+        };
+
+        // From the environment: a child run now gets them, a hook doesn't.
+        let (hook, now) = parse(&["wrkflw", "gate"]);
+        assert!(
+            now.contains(&"ubuntu-latest=from/env:1".to_string()),
+            "{now:?}"
+        );
+        assert!(now.contains(&"from-env".to_string()), "{now:?}");
+        assert!(hook.is_empty(), "{hook:?}");
+
+        // Given on the command line, both get them.
+        let (hook, _) = parse(&[
+            "wrkflw",
+            "--verbose",
+            "-P",
+            "ubuntu-latest=given/img:1",
+            "--k8s-namespace",
+            "given",
+            "gate",
+        ]);
+        assert_eq!(
+            hook,
+            [
+                "--verbose",
+                "--platform",
+                "ubuntu-latest=given/img:1",
+                "--k8s-namespace",
+                "given"
+            ]
+        );
+        std::env::remove_var(&platform_var);
+        std::env::remove_var(&namespace_var);
     }
 
     #[test]

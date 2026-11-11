@@ -229,7 +229,7 @@ pub(crate) async fn run(ctx: RunCtx) {
     if want_diff || ctx.event.is_some() || ctx.changed_files.is_some() {
         if is_gitlab {
             format.fail(&format!(
-                "--diff, --event, and --changed-files are only \
+                "--diff, --event, --branch, --tag and --changed-files are only \
                      supported for GitHub Actions workflows.\n\
                      {} appears to be a GitLab CI pipeline — trigger \
                      filtering is GitHub Actions-specific and cannot be \
@@ -297,7 +297,12 @@ pub(crate) async fn run(ctx: RunCtx) {
         platform_overrides: ctx.platform_overrides,
         kubernetes: ctx.kubernetes,
         variables: ctx.variables,
-        event_name: ctx.event.clone(),
+        // The event the trigger filters were checked for: `--diff` alone
+        // checks them for a push, so steps see one too.
+        event_name: ctx
+            .event
+            .clone()
+            .or_else(|| want_diff.then(|| "push".to_string())),
         git_ref: match (&ctx.branch, &ctx.tag) {
             (Some(branch), _) => Some(format!("refs/heads/{branch}")),
             (None, Some(tag)) => Some(format!("refs/tags/{tag}")),

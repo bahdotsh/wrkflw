@@ -1312,6 +1312,83 @@ fn branch_and_event_reach_filters_and_steps_on_a_detached_head() {
     assert_eq!(pull_request["status"], "success", "{pull_request}");
 }
 
+/// `--branch` or `--tag` alone is for a push: the filters see it, and steps
+/// see a push, even when the workflow's first trigger is a pull request.
+#[test]
+fn a_branch_or_tag_alone_is_a_push_to_filters_and_steps() {
+    let sandbox = Sandbox::new();
+    // The same triggers, the pull request first.
+    let pull_request_first = REFS.replace(
+        "on:\n  push:\n    branches: ['release/**']\n    tags: ['v*']\n  pull_request:\n    branches: [main]\n",
+        "on:\n  pull_request:\n    branches: [main]\n  push:\n    branches: ['release/**']\n    tags: ['v*']\n",
+    );
+    assert_ne!(pull_request_first, REFS);
+    sandbox.write("refs.yml", &pull_request_first);
+    let finished = |args: &[&str]| -> Value {
+        let mut all = vec!["--format", "json", "run", "--runtime", "emulation"];
+        all.extend_from_slice(args);
+        all.push(".github/workflows/refs.yml");
+        let output = sandbox.run(&all);
+        json_lines(&output)
+            .into_iter()
+            .rev()
+            .find(|line| line["type"] == "run_finished")
+            .unwrap_or_else(|| panic!("no run_finished: {}", stdout(&output)))
+    };
+    let tag = finished(&["--tag", "v1.0"]);
+    assert_eq!(tag["status"], "success", "{tag}");
+    let not_matched = finished(&["--tag", "nightly"]);
+    assert_eq!(not_matched["status"], "skipped", "{not_matched}");
+    let branch = finished(&["--branch", "release/2.0"]);
+    assert_eq!(branch["status"], "success", "{branch}");
+    let other = finished(&["--branch", "feature/x"]);
+    assert_eq!(other["status"], "skipped", "{other}");
+
+    // `plan` checks the filters too.
+    let output = sandbox.run(&[
+        "--format",
+        "json",
+        "plan",
+        "--tag",
+        "nightly",
+        ".github/workflows/refs.yml",
+    ]);
+    let plan: Value = json_lines(&output)
+        .into_iter()
+        .last()
+        .unwrap_or_else(|| panic!("no plan: {}", stdout(&output)));
+    assert_eq!(plan["trigger"]["event"], "push", "{plan}");
+    assert_eq!(plan["trigger"]["matches"], false, "{plan}");
+}
+
+/// A workflow with no `push` trigger still runs with `--branch` or `--tag`
+/// alone: the ref only says what it runs for, as before.
+#[test]
+fn a_branch_alone_still_runs_a_workflow_that_takes_no_pushes() {
+    let sandbox = Sandbox::new();
+    sandbox.write(
+        "manual.yml",
+        "name: manual\non:\n  workflow_dispatch:\njobs:\n  a:\n    runs-on: ubuntu-latest\n    \
+         steps:\n      - run: test \"$GITHUB_REF\" = refs/heads/main\n",
+    );
+    let output = sandbox.run(&[
+        "--format",
+        "json",
+        "run",
+        "--runtime",
+        "emulation",
+        "--branch",
+        "main",
+        ".github/workflows/manual.yml",
+    ]);
+    let finished = json_lines(&output)
+        .into_iter()
+        .rev()
+        .find(|line| line["type"] == "run_finished")
+        .unwrap_or_else(|| panic!("no run_finished: {}", stdout(&output)));
+    assert_eq!(finished["status"], "success", "{finished}");
+}
+
 /// A step whose action wrkflw doesn't run passes, but the run says so: the
 /// verdict is `partial`, `unverified` names the step and the action, and the
 /// job's `job_finished` and `run_finished` entries list it. Under emulation a

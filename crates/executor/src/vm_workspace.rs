@@ -128,6 +128,10 @@ struct State {
     host: Option<Listing>,
     /// Volume entries the host could not hold.
     kept: HashSet<PathBuf>,
+    /// Those of `kept` the host couldn't hold only because it held the
+    /// name in another case. Once nothing on the host goes by it, they are
+    /// fetched again; the others never fit.
+    kept_for_case: HashSet<PathBuf>,
     /// Volume entries the host refused for a reason that may pass. The next
     /// copy in leaves them alone, and the next copy out tries them again.
     pending: HashSet<PathBuf>,
@@ -160,6 +164,7 @@ impl State {
             volume: None,
             host: None,
             kept: HashSet::new(),
+            kept_for_case: HashSet::new(),
             pending: HashSet::new(),
             unlisted: HashSet::new(),
             unusable: false,
@@ -174,6 +179,10 @@ impl State {
     fn for_volume(volume: &str) -> Self {
         let mut state = State::new();
         state.kept = load_paths(kept_file(volume).as_deref());
+        state.kept_for_case = load_paths(case_file(volume).as_deref())
+            .into_iter()
+            .filter(|path| state.kept.contains(path))
+            .collect();
         state.pending = load_paths(pending_file(volume).as_deref());
         state
     }
@@ -458,12 +467,32 @@ impl VmWorkspace {
         for path in &plan.delete {
             // Left on the host, the next sync would copy it back into the
             // volume as if the step had never removed it.
-            remove_host_entry(&self.host.join(path))?;
+            let parent_read_only = path.parent().is_some_and(|p| read_only_in(&volume, p));
+            remove_host_entry(&self.host.join(path), parent_read_only)?;
         }
         let kept_before = state.kept.clone();
+        let for_case_before = state.kept_for_case.clone();
+        // After the deletes: a name kept for the case of another one fits
+        // once a step has removed that other one.
+        let released = release_kept(&self.host, &mut state.kept, &mut state.kept_for_case);
+        let mut fetch = plan.fetch;
+        if !released.is_empty() {
+            fetch.extend(
+                volume
+                    .keys()
+                    .filter(|path| under_any(&released, path))
+                    .cloned(),
+            );
+            fetch.sort();
+            fetch.dedup();
+        }
         let mut pending = HashSet::new();
-        if !plan.fetch.is_empty() {
-            let Unpacked { refused, failed } = self.fetch(&helper, &plan.fetch, &volume)?;
+        if !fetch.is_empty() {
+            let Unpacked {
+                refused,
+                refused_for_case,
+                failed,
+            } = self.fetch(&helper, &fetch, &volume)?;
             if !failed.is_empty() {
                 let mut names: Vec<String> = failed
                     .iter()
@@ -506,6 +535,7 @@ impl VmWorkspace {
                     names.join(", ")
                 ));
                 state.kept.extend(refused);
+                state.kept_for_case.extend(refused_for_case);
             }
         }
         if state.pending != pending {
@@ -515,8 +545,13 @@ impl VmWorkspace {
         }
         state.pending = pending;
         state.kept.retain(|path| volume.contains_key(path));
+        let kept = &state.kept;
+        state.kept_for_case.retain(|path| kept.contains(path));
         if state.kept != kept_before {
             save_paths(kept_file(&self.volume).as_deref(), &state.kept);
+        }
+        if state.kept_for_case != for_case_before {
+            save_paths(case_file(&self.volume).as_deref(), &state.kept_for_case);
         }
         state.volume = Some(volume);
         // The host as this copy left it. An entry that differs from the
@@ -681,6 +716,9 @@ impl VmWorkspace {
                 ROOT,
                 "--null",
                 "--no-recursion",
+                // Each name as its own file: a hard link to a name sent
+                // earlier can't be unpacked over a file the host has.
+                "--hard-dereference",
                 "-T",
                 "-",
                 "-cf",
@@ -1008,7 +1046,12 @@ fn without_unreadable(volume: &Listing, unreadable: &[PathBuf]) -> Listing {
 
 /// Remove `target` from the host, making read-only directories in it
 /// writable first if that is what stops it.
-fn remove_host_entry(target: &Path) -> io::Result<()> {
+///
+/// `parent_read_only` says the volume holds the directory `target` is in
+/// read-only too, as a step left it: the host only mirrors that mode, so
+/// it is opened for the removal and closed again. A directory read-only on
+/// the host alone is the host's to keep.
+fn remove_host_entry(target: &Path, parent_read_only: bool) -> io::Result<()> {
     let remove = || match std::fs::symlink_metadata(target) {
         Ok(meta) if meta.is_dir() => std::fs::remove_dir_all(target),
         Ok(_) => std::fs::remove_file(target),
@@ -1019,7 +1062,15 @@ fn remove_host_entry(target: &Path) -> io::Result<()> {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
             make_writable(target);
-            remove().map_err(|e| {
+            // Unlinking needs write permission on the directory it is in,
+            // which a step may have left read-only and kept.
+            let parent = target.parent().unwrap_or(Path::new("."));
+            let removed = if parent_read_only {
+                with_writable_dir(parent, remove)
+            } else {
+                remove()
+            };
+            removed.map_err(|e| {
                 io::Error::new(
                     e.kind(),
                     format!("could not remove {}: {}", target.display(), e),
@@ -1030,6 +1081,41 @@ fn remove_host_entry(target: &Path) -> io::Result<()> {
             e.kind(),
             format!("could not remove {}: {}", target.display(), e),
         )),
+    }
+}
+
+/// Whether `volume` holds the directory `dir` without write permission for
+/// its owner. The workspace root is never read-only.
+fn read_only_in(volume: &Listing, dir: &Path) -> bool {
+    !dir.as_os_str().is_empty()
+        && volume.get(dir).is_some_and(|entry| {
+            matches!(entry.kind, Kind::Dir) && entry.mode.is_some_and(|m| m & 0o200 == 0)
+        })
+}
+
+/// Run `op` with the owner allowed to write to `dir`, then give `dir` its
+/// mode back: a step may leave a directory read-only, and what it then
+/// changes inside must still reach the host.
+fn with_writable_dir<T>(dir: &Path, op: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let Ok(meta) = std::fs::symlink_metadata(dir) else {
+            return op();
+        };
+        let mode = meta.permissions().mode();
+        if !meta.is_dir() || mode & 0o200 != 0 {
+            return op();
+        }
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode | 0o700));
+        let result = op();
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode));
+        result
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        op()
     }
 }
 
@@ -1089,6 +1175,9 @@ fn append_host_entry<W: Write>(
 struct Unpacked {
     /// Entries the host can't hold, such as a name that isn't valid there.
     refused: Vec<PathBuf>,
+    /// Those of `refused` the host can't hold because it holds the name in
+    /// another case, which a later step may change.
+    refused_for_case: Vec<PathBuf>,
     /// Entries the host refused for a reason that may pass, with the error.
     failed: Vec<(PathBuf, io::Error)>,
 }
@@ -1166,6 +1255,33 @@ fn spelled_otherwise_on_host(
     listed.as_ref().is_some_and(|listed| !listed.contains(name))
 }
 
+/// Take out of `kept` the entries the host may now hold, and return them,
+/// sorted and outermost only: a name in `for_case`, kept because the host
+/// held it in another case, once nothing on the host goes by it under any
+/// spelling. A name the host can't hold for another reason, such as one
+/// that isn't valid there, stays kept, so it isn't fetched again each time.
+fn release_kept(
+    host: &Path,
+    kept: &mut HashSet<PathBuf>,
+    for_case: &mut HashSet<PathBuf>,
+) -> Vec<PathBuf> {
+    let mut released: Vec<PathBuf> = for_case
+        .iter()
+        .filter(|rel| {
+            rel.to_str().is_some()
+                && refuse_link_parents(host, rel).is_ok()
+                && std::fs::symlink_metadata(host.join(rel)).is_err()
+        })
+        .cloned()
+        .collect();
+    for rel in &released {
+        kept.remove(rel);
+        for_case.remove(rel);
+    }
+    released.sort();
+    outermost(released)
+}
+
 /// Write the archive onto `host`, skipping entries it refuses. Nothing here
 /// follows a symlink or leaves `host`: the volume is the workflow's to fill.
 fn unpack<R: Read>(reader: R, host: &Path, volume: &Listing) -> io::Result<Unpacked> {
@@ -1185,24 +1301,39 @@ fn unpack<R: Read>(reader: R, host: &Path, volume: &Listing) -> io::Result<Unpac
             continue;
         }
         let is_dir = entry.header().entry_type().is_dir();
+        let mut for_case = false;
         let written = if let Err(e) = refuse_link_parents(host, &rel) {
             Err((e, true))
         } else if spelled_otherwise_on_host(host, &rel, &mut names) {
+            for_case = true;
             let e = io::Error::other("the host holds this name in another case");
             Err((e, true))
         } else {
-            clear_type_conflict(host, &rel, is_dir)
-                .and_then(|()| {
+            let mut write = || {
+                clear_type_conflict(host, &rel, is_dir).and_then(|()| {
                     if is_dir {
                         std::fs::create_dir_all(host.join(&rel))
                     } else {
                         entry.unpack_in(host).map(|_| ())
                     }
                 })
-                .map_err(|e| {
-                    let permanent = cannot_hold(&e);
-                    (e, permanent)
-                })
+            };
+            match write() {
+                // A directory a step left read-only, in the volume and so on
+                // the host, still takes what the step then put in it.
+                Err(e)
+                    if e.kind() == io::ErrorKind::PermissionDenied
+                        && rel.parent().is_some_and(|p| read_only_in(volume, p)) =>
+                {
+                    let parent = host.join(rel.parent().unwrap_or(Path::new("")));
+                    with_writable_dir(&parent, write)
+                }
+                written => written,
+            }
+            .map_err(|e| {
+                let permanent = cannot_hold(&e);
+                (e, permanent)
+            })
         };
         match written {
             Ok(()) => {
@@ -1221,6 +1352,9 @@ fn unpack<R: Read>(reader: R, host: &Path, volume: &Listing) -> io::Result<Unpac
                     rel.to_string_lossy(),
                     e
                 ));
+                if for_case {
+                    unpacked.refused_for_case.push(rel.clone());
+                }
                 unpacked.refused.push(rel);
             }
             Err((e, false)) => unpacked.failed.push((rel, e)),
@@ -1290,10 +1424,17 @@ fn pending_file(volume: &str) -> Option<PathBuf> {
     kept_file(volume).map(|file| file.with_extension("pending"))
 }
 
+/// Where the entries kept in `volume` for a name the host holds in another
+/// case are remembered, for the same reason as [`kept_file`].
+fn case_file(volume: &str) -> Option<PathBuf> {
+    kept_file(volume).map(|file| file.with_extension("case"))
+}
+
 /// Forget what was remembered of `volume`, as it goes.
 fn forget_saved(volume: &str) {
     save_paths(kept_file(volume).as_deref(), &HashSet::new());
     save_paths(pending_file(volume).as_deref(), &HashSet::new());
+    save_paths(case_file(volume).as_deref(), &HashSet::new());
 }
 
 fn load_paths(file: Option<&Path>) -> HashSet<PathBuf> {
@@ -1662,13 +1803,83 @@ pub(crate) fn release(host: &Path, kept: bool) {
             if removed {
                 return;
             }
+            // A container kept after a failed step, as
+            // `preserve_containers_on_failure` keeps it, holds the volume
+            // for good: waiting for it would only stall the end of the run.
+            if held_by_preserved_container(cli, &volume) {
+                wrkflw_logging::info(&format!(
+                    "The workspace volume {} stays, as a container kept for inspection still \
+                     mounts it; remove the container, then run `wrkflw clean`",
+                    volume
+                ));
+                return;
+            }
             std::thread::sleep(std::time::Duration::from_millis(250));
         }
+        wrkflw_logging::debug(&format!(
+            "The workspace volume {} couldn't be removed; `wrkflw clean` removes it",
+            volume
+        ));
     });
     PENDING_REMOVALS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .push(removal);
+}
+
+/// Containers a runtime kept after a failed step for inspection, by the ID
+/// or name it knows them by.
+static PRESERVED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// A runtime kept `container` after its step failed, so the user can look
+/// inside: a workspace volume it mounts is not waited for.
+pub(crate) fn note_preserved(container: &str) {
+    PRESERVED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(container.to_string());
+}
+
+/// Whether a container wrkflw kept for inspection mounts `volume`.
+fn held_by_preserved_container(cli: &str, volume: &str) -> bool {
+    let preserved = PRESERVED.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if preserved.is_empty() {
+        return false;
+    }
+    let Ok(listed) = output_within(
+        Command::new(cli).args([
+            "ps",
+            "-a",
+            "--filter",
+            &format!("volume={}", volume),
+            "--format",
+            "{{.ID}}\t{{.Names}}",
+        ]),
+        None,
+        &format!("`{} ps`", cli),
+        CLEANUP_IDLE_LIMIT,
+    ) else {
+        return false;
+    };
+    listed.status.success()
+        && mounts_preserved(&String::from_utf8_lossy(&listed.stdout), &preserved)
+}
+
+/// Whether a line of `ID\tNAMES`, as `ps` prints the containers that mount
+/// a volume, names one of `preserved`. `ps` shortens an ID that a runtime
+/// knows in full.
+fn mounts_preserved(listed: &str, preserved: &[String]) -> bool {
+    listed.lines().any(|line| {
+        let mut fields = line.trim().split('\t');
+        let id = fields.next().unwrap_or("").trim();
+        let names: Vec<&str> = fields
+            .flat_map(|names| names.split(','))
+            .map(str::trim)
+            .collect();
+        preserved.iter().any(|kept| {
+            (id.len() >= 12 && kept.starts_with(id)) || names.iter().any(|name| name == kept)
+        })
+    })
 }
 
 /// Tries to remove a fresh workspace's volume, 250 ms apart: the job's own
@@ -1719,29 +1930,82 @@ pub(crate) async fn wait_for_released_volumes() {
     .await;
 }
 
+/// The `NAME\tHOST` lines of `cli`'s workspace volumes, empty when there is
+/// no such engine or it can't list them.
+///
+/// The label is read with `volume inspect`, where `.Labels` is a map in
+/// both Docker and Podman: `docker volume ls --format` gives `.Labels` as
+/// one string, which `index` can't read.
+fn labelled_volumes(cli: &str) -> Vec<String> {
+    let listed = match output_within(
+        Command::new(cli).args([
+            "volume",
+            "ls",
+            "-q",
+            "--filter",
+            &format!("label={}", LABEL),
+        ]),
+        None,
+        &format!("`{} volume ls`", cli),
+        CLEANUP_IDLE_LIMIT,
+    ) {
+        Ok(listed) => listed,
+        // No such engine on this machine.
+        Err(_) => return Vec::new(),
+    };
+    if !listed.status.success() {
+        wrkflw_logging::debug(&format!(
+            "`{} volume ls` failed, so its workspace volumes aren't cleaned: {}",
+            cli,
+            String::from_utf8_lossy(&listed.stderr).trim()
+        ));
+        return Vec::new();
+    }
+    let names: Vec<String> = String::from_utf8_lossy(&listed.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|name| name.starts_with(VOLUME_PREFIX))
+        .map(str::to_string)
+        .collect();
+    if names.is_empty() {
+        return Vec::new();
+    }
+    let format = inspect_format();
+    let mut command = Command::new(cli);
+    command.args(["volume", "inspect", "--format", &format]);
+    command.args(&names);
+    match output_within(
+        &mut command,
+        None,
+        &format!("`{} volume inspect`", cli),
+        CLEANUP_IDLE_LIMIT,
+    ) {
+        // A volume removed since the listing fails the command but leaves
+        // the others' lines, so the output is read whatever the status.
+        Ok(inspected) => String::from_utf8_lossy(&inspected.stdout)
+            .lines()
+            .map(str::to_string)
+            .collect(),
+        Err(e) => {
+            wrkflw_logging::debug(&format!(
+                "`{} volume inspect` failed, so its workspace volumes aren't cleaned: {}",
+                cli, e
+            ));
+            Vec::new()
+        }
+    }
+}
+
+/// The `volume inspect` template that prints `NAME\tHOST`.
+fn inspect_format() -> String {
+    format!("{{{{.Name}}}}\t{{{{index .Labels \"{}\"}}}}", LABEL)
+}
+
 /// Remove workspace volumes whose host directory is gone. Returns how many.
 pub(crate) fn remove_orphaned_volumes() -> usize {
     let mut removed = 0;
     for cli in ["docker", "podman"] {
-        let Ok(listed) = output_within(
-            Command::new(cli).args([
-                "volume",
-                "ls",
-                "--filter",
-                &format!("label={}", LABEL),
-                "--format",
-                &format!("{{{{.Name}}}}\t{{{{index .Labels \"{}\"}}}}", LABEL),
-            ]),
-            None,
-            &format!("`{} volume ls`", cli),
-            CLEANUP_IDLE_LIMIT,
-        ) else {
-            continue;
-        };
-        if !listed.status.success() {
-            continue;
-        }
-        for line in String::from_utf8_lossy(&listed.stdout).lines() {
+        for line in labelled_volumes(cli) {
             let Some((name, host)) = line.split_once('\t') else {
                 continue;
             };
@@ -2057,7 +2321,7 @@ mod tests {
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
         std::fs::set_permissions(locked.join("sub"), std::fs::Permissions::from_mode(0o555))
             .unwrap();
-        remove_host_entry(&locked).unwrap();
+        remove_host_entry(&locked, false).unwrap();
         assert!(!locked.exists());
     }
 
@@ -2245,6 +2509,119 @@ mod tests {
     }
 
     #[test]
+    fn a_kept_name_comes_back_once_nothing_on_the_host_goes_by_it() {
+        let host = tempfile::tempdir().unwrap();
+        std::fs::write(host.path().join("Makefile"), "x").unwrap();
+        let folds = host.path().join("makefile").exists();
+        let mut kept: HashSet<PathBuf> =
+            paths(&["makefile", "dir", "invalid"]).into_iter().collect();
+        let mut for_case: HashSet<PathBuf> = paths(&["makefile", "dir"]).into_iter().collect();
+        std::fs::create_dir(host.path().join("dir")).unwrap();
+        let released = release_kept(host.path(), &mut kept, &mut for_case);
+        if folds {
+            // `Makefile` still answers to `makefile` on this host.
+            assert!(released.is_empty());
+            assert!(kept.contains(Path::new("makefile")));
+            std::fs::remove_file(host.path().join("Makefile")).unwrap();
+            assert_eq!(
+                release_kept(host.path(), &mut kept, &mut for_case),
+                paths(&["makefile"])
+            );
+        } else {
+            assert_eq!(released, paths(&["makefile"]));
+        }
+        assert!(!kept.contains(Path::new("makefile")));
+        assert!(!for_case.contains(Path::new("makefile")));
+        // Something the host has under that very name is not released.
+        assert!(kept.contains(Path::new("dir")));
+        // Nor is a name kept for another reason, though the host lacks it:
+        // it would only be refused again.
+        assert!(kept.contains(Path::new("invalid")));
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let bad = PathBuf::from(std::ffi::OsStr::from_bytes(b"bad\xff"));
+            let mut kept: HashSet<PathBuf> = [bad.clone()].into_iter().collect();
+            let mut for_case = kept.clone();
+            assert!(release_kept(host.path(), &mut kept, &mut for_case).is_empty());
+            assert!(kept.contains(&bad));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_a_step_left_read_only_still_takes_its_changes() {
+        use std::os::unix::fs::PermissionsExt;
+        let host = tempfile::tempdir().unwrap();
+        let locked = host.path().join("d");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::write(locked.join("old"), "x").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
+        // Root writes anyway, so this only shows anything for other users.
+        let refuses = std::fs::write(locked.join(".probe"), "").is_err();
+        let _ = std::fs::remove_file(locked.join(".probe"));
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+
+        // Read-only on the host alone: the host's to keep.
+        if refuses {
+            assert!(remove_host_entry(&locked.join("old"), false).is_err());
+            let unpacked = unpack(
+                &one_entry_archive(&[("d/new", false)])[..],
+                host.path(),
+                &Listing::new(),
+            )
+            .unwrap();
+            assert_eq!(unpacked.failed.len(), 1);
+        }
+
+        // Read-only in the volume too: the step's changes land, and the
+        // directory keeps its mode.
+        let volume = listing(&[(
+            "d",
+            Entry {
+                kind: Kind::Dir,
+                mode: Some(0o555),
+            },
+        )]);
+        remove_host_entry(&locked.join("old"), true).unwrap();
+        assert!(!locked.join("old").exists());
+        let unpacked = unpack(
+            &one_entry_archive(&[("d/new", false)])[..],
+            host.path(),
+            &volume,
+        )
+        .unwrap();
+        assert!(unpacked.failed.is_empty() && unpacked.refused.is_empty());
+        assert!(locked.join("new").exists());
+        assert_eq!(mode(&locked), 0o555);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn only_a_container_kept_for_inspection_holds_a_volume_for_good() {
+        let docker_id =
+            "3f4e5d6c7b8a9f0e1d2c3b4a5f6e7d8c9b0a1f2e3d4c5b6a7f8e9d0c1b2a3f4e".to_string();
+        let preserved = [docker_id, "wrkflw-step-12".to_string()];
+        // Docker lists the short ID, Podman the name it was run under.
+        assert!(mounts_preserved("3f4e5d6c7b8a\tbusy_turing\n", &preserved));
+        assert!(mounts_preserved(
+            "aaaaaaaaaaaa\twrkflw-step-12\n",
+            &preserved
+        ));
+        assert!(mounts_preserved(
+            "aaaaaaaaaaaa\tother,wrkflw-step-12\n",
+            &preserved
+        ));
+        // The job's own container, on its way out, isn't one of them.
+        assert!(!mounts_preserved(
+            "bbbbbbbbbbbb\twrkflw-step-1\n",
+            &preserved
+        ));
+        assert!(!mounts_preserved("", &preserved));
+        assert!(!mounts_preserved("3f4e\tx\n", &preserved));
+    }
+
+    #[test]
     fn a_name_the_host_holds_in_another_case_stays_in_the_volume() {
         let host = tempfile::tempdir().unwrap();
         std::fs::write(host.path().join("foo"), "x").unwrap();
@@ -2374,9 +2751,34 @@ mod tests {
         let step = "cd /ws && test \"$(cat src/keep.txt)\" = kept \
                     && rm src/remove.txt && echo new > src/new.txt \
                     && touch \"$(printf 'src/bad\\377')\" && touch src/Case src/case \
-                    && ln -s keep.txt src/link";
+                    && ln -s keep.txt src/link \
+                    && echo one > src/built && ln src/built src/built-link";
         exec(workspace.cli, &helper, &["sh", "-c", step], None).unwrap();
         workspace.sync_out().unwrap();
+
+        // The volume is listed under the host directory it belongs to.
+        let line = format!("{}\t{}", workspace.volume, host.display());
+        assert!(labelled_volumes("docker").contains(&line));
+
+        // Hard links come back as the files they name, and keep coming back
+        // when a later step rewrites both names.
+        assert_eq!(
+            std::fs::read_to_string(host.join("src/built-link")).unwrap(),
+            "one\n"
+        );
+        assert!(workspace.sync_in().unwrap());
+        let rebuild = "cd /ws && rm src/built src/built-link \
+                       && echo second > src/built && ln src/built src/built-link";
+        exec(workspace.cli, &helper, &["sh", "-c", rebuild], None).unwrap();
+        workspace.sync_out().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(host.join("src/built")).unwrap(),
+            "second\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(host.join("src/built-link")).unwrap(),
+            "second\n"
+        );
 
         assert!(!host.join("src/remove.txt").exists());
         assert_eq!(

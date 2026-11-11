@@ -15,8 +15,10 @@ pub(crate) fn line(args: &[&str]) -> Option<String> {
 /// being able to ask are different answers.
 pub(crate) fn remote_has(remote: &str, reference: &str) -> Result<bool, String> {
     // A remote that doesn't answer isn't waited for: ssh gives up on
-    // connecting, and HTTPS on a transfer that stalls.
-    let output = command(&[
+    // connecting, and HTTPS on a transfer that stalls. Neither covers a
+    // name lookup or a connection that hangs, nor ssh run as the user set
+    // it up, so the whole call has a deadline too.
+    let mut ask = command(&[
         "-c",
         "http.lowSpeedLimit=1",
         "-c",
@@ -25,9 +27,9 @@ pub(crate) fn remote_has(remote: &str, reference: &str) -> Result<bool, String> 
         "--exit-code",
         remote,
         reference,
-    ])
-    .output()
-    .map_err(|e| format!("cannot run git: {e}"))?;
+    ]);
+    let output = output_within(&mut ask, REMOTE_DEADLINE)
+        .map_err(|e| format!("couldn't ask {remote} about {reference}: {e}"))?;
     match output.status.code() {
         Some(0) => Ok(true),
         // `--exit-code`: the remote answered and has no such ref.
@@ -40,6 +42,36 @@ pub(crate) fn remote_has(remote: &str, reference: &str) -> Result<bool, String> 
                 .rfind(|line| !line.is_empty())
                 .unwrap_or("git ls-remote failed");
             Err(format!("couldn't ask {remote} about {reference}: {why}"))
+        }
+    }
+}
+
+/// How long a question to a remote may take in all.
+const REMOTE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Run `command` to its end, or kill it once `deadline` has passed. Its
+/// output is a ref or two and an error line, which a pipe holds while it
+/// runs.
+fn output_within(
+    command: &mut Command,
+    deadline: std::time::Duration,
+) -> Result<std::process::Output, String> {
+    let mut child = command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("cannot run git: {e}"))?;
+    let started = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return child.wait_with_output().map_err(|e| e.to_string()),
+            Ok(None) if started.elapsed() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("no answer within {} s", deadline.as_secs()));
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
+            Err(e) => return Err(e.to_string()),
         }
     }
 }
@@ -128,5 +160,23 @@ mod tests {
         ));
         assert!(!batch_ssh_wanted(|name| name == "GIT_SSH", || false));
         assert!(!batch_ssh_wanted(|_| false, || true));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_command_that_does_not_answer_is_given_up_on() {
+        let started = std::time::Instant::now();
+        let mut slow = Command::new("sleep");
+        slow.arg("10");
+        let err = output_within(&mut slow, std::time::Duration::from_millis(300)).unwrap_err();
+        assert!(err.contains("no answer"), "{err}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+
+        let mut quick = Command::new("sh");
+        quick.args(["-c", "echo out; echo err >&2; exit 2"]);
+        let output = output_within(&mut quick, std::time::Duration::from_secs(10)).unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "out\n");
+        assert_eq!(String::from_utf8_lossy(&output.stderr), "err\n");
     }
 }

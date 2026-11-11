@@ -1381,6 +1381,7 @@ impl DockerRuntime {
             ));
             // Still untrack it from the automatic cleanup system to prevent it from being cleaned up later
             untrack_container(&container.id);
+            crate::vm_workspace::note_preserved(&container.id);
         }
         guard.disarm();
 

@@ -919,6 +919,7 @@ impl PodmanRuntime {
                             container_name, output.exit_code, container_name
                         ));
                         untrack_container(&container_name);
+                        crate::vm_workspace::note_preserved(&container_name);
                     } else {
                         // Failed but we don't want to preserve - container was auto-removed with --rm
                         untrack_container(&container_name);

@@ -1752,7 +1752,6 @@ pub(crate) fn release(host: &Path, kept: bool) {
             return;
         }
         forget_saved(&volume);
-        let mut held = 0;
         for _ in 0..VOLUME_REMOVAL_TRIES {
             let removed = output_within(
                 Command::new(cli).args(["volume", "rm", "-f", &volume]),
@@ -1767,16 +1766,10 @@ pub(crate) fn release(host: &Path, kept: bool) {
             // A container kept after a failed step, as
             // `preserve_containers_on_failure` keeps it, holds the volume
             // for good: waiting for it would only stall the end of the run.
-            // The job's own container is stopped too until its removal,
-            // which is under way, takes it, so only a hold that lasts counts.
-            held = if held_by_stopped_containers(cli, &volume) {
-                held + 1
-            } else {
-                0
-            };
-            if held >= HELD_TRIES {
+            if held_by_preserved_container(cli, &volume) {
                 wrkflw_logging::info(&format!(
-                    "The workspace volume {} stays, as a container kept for inspection still                      mounts it; remove the container, then run `wrkflw clean`",
+                    "The workspace volume {} stays, as a container kept for inspection still \
+                     mounts it; remove the container, then run `wrkflw clean`",
                     volume
                 ));
                 return;
@@ -1794,9 +1787,25 @@ pub(crate) fn release(host: &Path, kept: bool) {
         .push(removal);
 }
 
-/// True when every container that mounts `volume` has stopped, and there
-/// is one: nothing is about to let go of it.
-fn held_by_stopped_containers(cli: &str, volume: &str) -> bool {
+/// Containers a runtime kept after a failed step for inspection, by the ID
+/// or name it knows them by.
+static PRESERVED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// A runtime kept `container` after its step failed, so the user can look
+/// inside: a workspace volume it mounts is not waited for.
+pub(crate) fn note_preserved(container: &str) {
+    PRESERVED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(container.to_string());
+}
+
+/// Whether a container wrkflw kept for inspection mounts `volume`.
+fn held_by_preserved_container(cli: &str, volume: &str) -> bool {
+    let preserved = PRESERVED.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if preserved.is_empty() {
+        return false;
+    }
     let Ok(listed) = output_within(
         Command::new(cli).args([
             "ps",
@@ -1804,7 +1813,7 @@ fn held_by_stopped_containers(cli: &str, volume: &str) -> bool {
             "--filter",
             &format!("volume={}", volume),
             "--format",
-            "{{.State}}",
+            "{{.ID}}\t{{.Names}}",
         ]),
         None,
         &format!("`{} ps`", cli),
@@ -1812,32 +1821,31 @@ fn held_by_stopped_containers(cli: &str, volume: &str) -> bool {
     ) else {
         return false;
     };
-    let text = String::from_utf8_lossy(&listed.stdout);
-    let states: Vec<&str> = text
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .collect();
-    listed.status.success() && !states.is_empty() && states.iter().all(|s| stopped_state(s))
+    listed.status.success()
+        && mounts_preserved(&String::from_utf8_lossy(&listed.stdout), &preserved)
 }
 
-/// Whether a container in `state`, as `ps --format {{.State}}` prints it,
-/// has stopped and won't be removed by wrkflw.
-fn stopped_state(state: &str) -> bool {
-    matches!(
-        state.to_ascii_lowercase().as_str(),
-        "exited" | "created" | "dead" | "stopped" | "configured"
-    )
+/// Whether a line of `ID\tNAMES`, as `ps` prints the containers that mount
+/// a volume, names one of `preserved`. `ps` shortens an ID that a runtime
+/// knows in full.
+fn mounts_preserved(listed: &str, preserved: &[String]) -> bool {
+    listed.lines().any(|line| {
+        let mut fields = line.trim().split('\t');
+        let id = fields.next().unwrap_or("").trim();
+        let names: Vec<&str> = fields
+            .flat_map(|names| names.split(','))
+            .map(str::trim)
+            .collect();
+        preserved.iter().any(|kept| {
+            (id.len() >= 12 && kept.starts_with(id)) || names.iter().any(|name| name == kept)
+        })
+    })
 }
 
 /// Tries to remove a fresh workspace's volume, 250 ms apart: the job's own
 /// container, and its services, are removed alongside, which can take a
 /// Podman machine a while.
 const VOLUME_REMOVAL_TRIES: usize = 120;
-
-/// Tries in a row a volume may be held by stopped containers alone before
-/// they are taken for ones kept for inspection: 5 s.
-const HELD_TRIES: usize = 20;
 
 static PENDING_REMOVALS: Mutex<Vec<std::thread::JoinHandle<()>>> = Mutex::new(Vec::new());
 
@@ -2540,20 +2548,27 @@ mod tests {
     }
 
     #[test]
-    fn only_stopped_containers_hold_a_volume_for_good() {
-        for state in [
-            "exited",
-            "Exited",
-            "created",
-            "dead",
-            "stopped",
-            "configured",
-        ] {
-            assert!(stopped_state(state), "{state}");
-        }
-        for state in ["running", "removing", "restarting", "paused", ""] {
-            assert!(!stopped_state(state), "{state}");
-        }
+    fn only_a_container_kept_for_inspection_holds_a_volume_for_good() {
+        let docker_id =
+            "3f4e5d6c7b8a9f0e1d2c3b4a5f6e7d8c9b0a1f2e3d4c5b6a7f8e9d0c1b2a3f4e".to_string();
+        let preserved = [docker_id, "wrkflw-step-12".to_string()];
+        // Docker lists the short ID, Podman the name it was run under.
+        assert!(mounts_preserved("3f4e5d6c7b8a\tbusy_turing\n", &preserved));
+        assert!(mounts_preserved(
+            "aaaaaaaaaaaa\twrkflw-step-12\n",
+            &preserved
+        ));
+        assert!(mounts_preserved(
+            "aaaaaaaaaaaa\tother,wrkflw-step-12\n",
+            &preserved
+        ));
+        // The job's own container, on its way out, isn't one of them.
+        assert!(!mounts_preserved(
+            "bbbbbbbbbbbb\twrkflw-step-1\n",
+            &preserved
+        ));
+        assert!(!mounts_preserved("", &preserved));
+        assert!(!mounts_preserved("3f4e\tx\n", &preserved));
     }
 
     #[test]

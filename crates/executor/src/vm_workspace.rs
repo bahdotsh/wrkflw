@@ -128,6 +128,10 @@ struct State {
     host: Option<Listing>,
     /// Volume entries the host could not hold.
     kept: HashSet<PathBuf>,
+    /// Those of `kept` the host couldn't hold only because it held the
+    /// name in another case. Once nothing on the host goes by it, they are
+    /// fetched again; the others never fit.
+    kept_for_case: HashSet<PathBuf>,
     /// Volume entries the host refused for a reason that may pass. The next
     /// copy in leaves them alone, and the next copy out tries them again.
     pending: HashSet<PathBuf>,
@@ -160,6 +164,7 @@ impl State {
             volume: None,
             host: None,
             kept: HashSet::new(),
+            kept_for_case: HashSet::new(),
             pending: HashSet::new(),
             unlisted: HashSet::new(),
             unusable: false,
@@ -174,6 +179,10 @@ impl State {
     fn for_volume(volume: &str) -> Self {
         let mut state = State::new();
         state.kept = load_paths(kept_file(volume).as_deref());
+        state.kept_for_case = load_paths(case_file(volume).as_deref())
+            .into_iter()
+            .filter(|path| state.kept.contains(path))
+            .collect();
         state.pending = load_paths(pending_file(volume).as_deref());
         state
     }
@@ -462,9 +471,10 @@ impl VmWorkspace {
             remove_host_entry(&self.host.join(path), parent_read_only)?;
         }
         let kept_before = state.kept.clone();
+        let for_case_before = state.kept_for_case.clone();
         // After the deletes: a name kept for the case of another one fits
         // once a step has removed that other one.
-        let released = release_kept(&self.host, &mut state.kept);
+        let released = release_kept(&self.host, &mut state.kept, &mut state.kept_for_case);
         let mut fetch = plan.fetch;
         if !released.is_empty() {
             fetch.extend(
@@ -478,7 +488,11 @@ impl VmWorkspace {
         }
         let mut pending = HashSet::new();
         if !fetch.is_empty() {
-            let Unpacked { refused, failed } = self.fetch(&helper, &fetch, &volume)?;
+            let Unpacked {
+                refused,
+                refused_for_case,
+                failed,
+            } = self.fetch(&helper, &fetch, &volume)?;
             if !failed.is_empty() {
                 let mut names: Vec<String> = failed
                     .iter()
@@ -521,6 +535,7 @@ impl VmWorkspace {
                     names.join(", ")
                 ));
                 state.kept.extend(refused);
+                state.kept_for_case.extend(refused_for_case);
             }
         }
         if state.pending != pending {
@@ -530,8 +545,13 @@ impl VmWorkspace {
         }
         state.pending = pending;
         state.kept.retain(|path| volume.contains_key(path));
+        let kept = &state.kept;
+        state.kept_for_case.retain(|path| kept.contains(path));
         if state.kept != kept_before {
             save_paths(kept_file(&self.volume).as_deref(), &state.kept);
+        }
+        if state.kept_for_case != for_case_before {
+            save_paths(case_file(&self.volume).as_deref(), &state.kept_for_case);
         }
         state.volume = Some(volume);
         // The host as this copy left it. An entry that differs from the
@@ -1155,6 +1175,9 @@ fn append_host_entry<W: Write>(
 struct Unpacked {
     /// Entries the host can't hold, such as a name that isn't valid there.
     refused: Vec<PathBuf>,
+    /// Those of `refused` the host can't hold because it holds the name in
+    /// another case, which a later step may change.
+    refused_for_case: Vec<PathBuf>,
     /// Entries the host refused for a reason that may pass, with the error.
     failed: Vec<(PathBuf, io::Error)>,
 }
@@ -1233,12 +1256,16 @@ fn spelled_otherwise_on_host(
 }
 
 /// Take out of `kept` the entries the host may now hold, and return them,
-/// sorted and outermost only: a name kept because the host held it in
-/// another case, once nothing on the host goes by it under any spelling.
-/// A name the host can't hold for another reason is refused again on its
-/// way back, and kept again; one that isn't UTF-8 is never tried.
-fn release_kept(host: &Path, kept: &mut HashSet<PathBuf>) -> Vec<PathBuf> {
-    let mut released: Vec<PathBuf> = kept
+/// sorted and outermost only: a name in `for_case`, kept because the host
+/// held it in another case, once nothing on the host goes by it under any
+/// spelling. A name the host can't hold for another reason, such as one
+/// that isn't valid there, stays kept, so it isn't fetched again each time.
+fn release_kept(
+    host: &Path,
+    kept: &mut HashSet<PathBuf>,
+    for_case: &mut HashSet<PathBuf>,
+) -> Vec<PathBuf> {
+    let mut released: Vec<PathBuf> = for_case
         .iter()
         .filter(|rel| {
             rel.to_str().is_some()
@@ -1249,6 +1276,7 @@ fn release_kept(host: &Path, kept: &mut HashSet<PathBuf>) -> Vec<PathBuf> {
         .collect();
     for rel in &released {
         kept.remove(rel);
+        for_case.remove(rel);
     }
     released.sort();
     outermost(released)
@@ -1273,9 +1301,11 @@ fn unpack<R: Read>(reader: R, host: &Path, volume: &Listing) -> io::Result<Unpac
             continue;
         }
         let is_dir = entry.header().entry_type().is_dir();
+        let mut for_case = false;
         let written = if let Err(e) = refuse_link_parents(host, &rel) {
             Err((e, true))
         } else if spelled_otherwise_on_host(host, &rel, &mut names) {
+            for_case = true;
             let e = io::Error::other("the host holds this name in another case");
             Err((e, true))
         } else {
@@ -1322,6 +1352,9 @@ fn unpack<R: Read>(reader: R, host: &Path, volume: &Listing) -> io::Result<Unpac
                     rel.to_string_lossy(),
                     e
                 ));
+                if for_case {
+                    unpacked.refused_for_case.push(rel.clone());
+                }
                 unpacked.refused.push(rel);
             }
             Err((e, false)) => unpacked.failed.push((rel, e)),
@@ -1391,10 +1424,17 @@ fn pending_file(volume: &str) -> Option<PathBuf> {
     kept_file(volume).map(|file| file.with_extension("pending"))
 }
 
+/// Where the entries kept in `volume` for a name the host holds in another
+/// case are remembered, for the same reason as [`kept_file`].
+fn case_file(volume: &str) -> Option<PathBuf> {
+    kept_file(volume).map(|file| file.with_extension("case"))
+}
+
 /// Forget what was remembered of `volume`, as it goes.
 fn forget_saved(volume: &str) {
     save_paths(kept_file(volume).as_deref(), &HashSet::new());
     save_paths(pending_file(volume).as_deref(), &HashSet::new());
+    save_paths(case_file(volume).as_deref(), &HashSet::new());
 }
 
 fn load_paths(file: Option<&Path>) -> HashSet<PathBuf> {
@@ -2473,27 +2513,37 @@ mod tests {
         let host = tempfile::tempdir().unwrap();
         std::fs::write(host.path().join("Makefile"), "x").unwrap();
         let folds = host.path().join("makefile").exists();
-        let mut kept: HashSet<PathBuf> = paths(&["makefile", "dir"]).into_iter().collect();
+        let mut kept: HashSet<PathBuf> =
+            paths(&["makefile", "dir", "invalid"]).into_iter().collect();
+        let mut for_case: HashSet<PathBuf> = paths(&["makefile", "dir"]).into_iter().collect();
         std::fs::create_dir(host.path().join("dir")).unwrap();
-        let released = release_kept(host.path(), &mut kept);
+        let released = release_kept(host.path(), &mut kept, &mut for_case);
         if folds {
             // `Makefile` still answers to `makefile` on this host.
             assert!(released.is_empty());
             assert!(kept.contains(Path::new("makefile")));
             std::fs::remove_file(host.path().join("Makefile")).unwrap();
-            assert_eq!(release_kept(host.path(), &mut kept), paths(&["makefile"]));
+            assert_eq!(
+                release_kept(host.path(), &mut kept, &mut for_case),
+                paths(&["makefile"])
+            );
         } else {
             assert_eq!(released, paths(&["makefile"]));
         }
         assert!(!kept.contains(Path::new("makefile")));
+        assert!(!for_case.contains(Path::new("makefile")));
         // Something the host has under that very name is not released.
         assert!(kept.contains(Path::new("dir")));
+        // Nor is a name kept for another reason, though the host lacks it:
+        // it would only be refused again.
+        assert!(kept.contains(Path::new("invalid")));
         #[cfg(unix)]
         {
             use std::os::unix::ffi::OsStrExt;
             let bad = PathBuf::from(std::ffi::OsStr::from_bytes(b"bad\xff"));
             let mut kept: HashSet<PathBuf> = [bad.clone()].into_iter().collect();
-            assert!(release_kept(host.path(), &mut kept).is_empty());
+            let mut for_case = kept.clone();
+            assert!(release_kept(host.path(), &mut kept, &mut for_case).is_empty());
             assert!(kept.contains(&bad));
         }
     }

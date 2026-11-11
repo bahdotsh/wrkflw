@@ -24,7 +24,9 @@ use wrkflw_parser::workflow::Job;
 /// tells them apart, since a matrix like `attempt: [1, 2, 3]` exists to
 /// repeat a job.
 /// Any reference to the matrix that can't be pinned to one key counts as
-/// reading all of them, so a leg is only folded away when that is safe.
+/// reading all of them, so a leg is only folded away when that is safe. In
+/// `runs-on` such a reference picks the runner from keys nobody can name,
+/// so nothing is folded.
 pub(crate) fn matrix_twins(
     job: &Job,
     combinations: &[MatrixCombination],
@@ -44,11 +46,15 @@ pub(crate) fn matrix_twins(
         .cloned()
         .collect::<Vec<_>>()
         .join("\n");
+    let runner_keys = match matrix_reads(&runs_on) {
+        Reads::Keys(keys) => keys,
+        Reads::Any => return twins,
+    };
     let images: Vec<String> = combinations
         .iter()
         .map(|c| get_effective_runner_image(job, platform_overrides, Some(&c.values)))
         .collect();
-    let picks_runner = |key: &String| reads_matrix_keys(&runs_on, std::slice::from_ref(key));
+    let picks_runner = |key: &String| runner_keys.contains(key);
     for leg in 1..combinations.len() {
         // The legs this one would repeat, and whether each differs from it
         // in nothing but the runner.
@@ -72,17 +78,46 @@ pub(crate) fn matrix_twins(
     twins
 }
 
-/// The job as text, minus the two places a matrix value may appear without
+/// The job's text, minus the two places a matrix value may appear without
 /// changing what the job does: `runs-on`, and the matrix itself. The job's
 /// display name isn't parsed, so it is never here. Step names are, so a
 /// step named after a matrix value keeps its leg, although the name changes
 /// nothing that runs: the fold errs toward running a leg.
+///
+/// Every string in the job, and every key, one per line as written: not
+/// the job serialised, where a newline in an `if: |` block is the letters
+/// `\n` and would hide the `matrix` that starts the next line.
 fn job_body_text(job: &Job) -> Option<String> {
     let mut value = serde_json::to_value(job).ok()?;
     let map = value.as_object_mut()?;
     map.remove("runs-on");
     map.remove("strategy");
-    Some(value.to_string())
+    let mut text = String::new();
+    collect_strings(&value, &mut text);
+    Some(text)
+}
+
+fn collect_strings(value: &serde_json::Value, text: &mut String) {
+    match value {
+        serde_json::Value::String(s) => {
+            text.push_str(s);
+            text.push('\n');
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_strings(item, text);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for (key, item) in map {
+                text.push_str(key);
+                text.push('\n');
+                collect_strings(item, text);
+            }
+        }
+        // Numbers, booleans and null hold no expression.
+        _ => {}
+    }
 }
 
 /// Matrix keys whose values differ between two legs, lowercased.
@@ -98,9 +133,66 @@ fn differing_keys(a: &HashMap<String, Value>, b: &HashMap<String, Value>) -> Vec
     keys
 }
 
-/// Whether `body` may read any of `keys` from the matrix. Expressions are
-/// case-insensitive, and `MATRIX_<KEY>`/`MATRIX_CONTEXT` are the variables
-/// wrkflw sets for each leg.
+/// What a piece of workflow text reads from the matrix.
+#[derive(Debug, PartialEq)]
+enum Reads {
+    /// These keys, lowercased, and no others.
+    Keys(Vec<String>),
+    /// Something that can't be pinned to keys: `matrix[...]`,
+    /// `toJSON(matrix)`, `matrix.*`, a bare `matrix`, or the `strategy`
+    /// context, whose `job-index` differs in every leg.
+    Any,
+}
+
+/// The matrix keys `text` reads. Expressions are case-insensitive, and may
+/// put spaces around the `.`.
+fn matrix_reads(text: &str) -> Reads {
+    let lower = text.to_lowercase();
+    // `strategy.job-index` and `job-total` tell every leg apart.
+    if mentions(&lower, "strategy").any(|rest| {
+        let rest = rest.trim_start();
+        rest.starts_with('.') || rest.starts_with('[')
+    }) {
+        return Reads::Any;
+    }
+    let mut keys = Vec::new();
+    for rest in mentions(&lower, "matrix") {
+        let Some(rest) = rest.trim_start().strip_prefix('.') else {
+            return Reads::Any;
+        };
+        let key: String = rest
+            .trim_start()
+            .chars()
+            .take_while(|&c| is_word(c))
+            .collect();
+        if key.is_empty() {
+            // `matrix.*` or something unreadable.
+            return Reads::Any;
+        }
+        if !keys.contains(&key) {
+            keys.push(key);
+        }
+    }
+    Reads::Keys(keys)
+}
+
+fn is_word(c: char) -> bool {
+    c.is_alphanumeric() || c == '_' || c == '-'
+}
+
+/// What follows each mention of the context `name` in `lower` as a whole
+/// word: not `my_matrix` or `matrix_os`.
+fn mentions<'a>(lower: &'a str, name: &'a str) -> impl Iterator<Item = &'a str> + 'a {
+    lower.match_indices(name).filter_map(move |(pos, _)| {
+        let before = lower[..pos].chars().next_back();
+        let rest = &lower[pos + name.len()..];
+        (!before.is_some_and(is_word) && !rest.chars().next().is_some_and(is_word)).then_some(rest)
+    })
+}
+
+/// Whether `body` may read any of `keys` from the matrix, through an
+/// expression or `MATRIX_<KEY>`/`MATRIX_CONTEXT`, the variables wrkflw
+/// sets for each leg.
 fn reads_matrix_keys(body: &str, keys: &[String]) -> bool {
     if body.contains("MATRIX_CONTEXT")
         || keys
@@ -109,27 +201,10 @@ fn reads_matrix_keys(body: &str, keys: &[String]) -> bool {
     {
         return true;
     }
-    let is_word = |c: char| c.is_alphanumeric() || c == '_' || c == '-';
-    let lower = body.to_lowercase();
-    for (pos, _) in lower.match_indices("matrix") {
-        if lower[..pos].chars().next_back().is_some_and(is_word) {
-            continue;
-        }
-        let rest = &lower[pos + "matrix".len()..];
-        if rest.chars().next().is_some_and(is_word) {
-            continue;
-        }
-        // `matrix[...]`, `toJSON(matrix)` or a bare mention: can't tell
-        // which key, so assume any.
-        let Some(rest) = rest.strip_prefix('.') else {
-            return true;
-        };
-        let key: String = rest.chars().take_while(|&c| is_word(c)).collect();
-        if key == "*" || keys.contains(&key) {
-            return true;
-        }
+    match matrix_reads(body) {
+        Reads::Any => true,
+        Reads::Keys(read) => keys.iter().any(|key| read.contains(key)),
     }
-    false
 }
 
 /// The result of a leg that wasn't run because it would only repeat
@@ -236,6 +311,15 @@ mod tests {
             // What other jobs see of this one, and how runs of it queue.
             "outputs:\n  os: ${{ matrix.os }}\nsteps:\n  - run: make\n",
             "concurrency: build-${{ matrix.os }}\nsteps:\n  - run: make\n",
+            // A read that starts a line of a block, or follows a tab.
+            "steps:\n  - if: |\n      github.event_name == 'push' ||\n      matrix.os == 'windows-latest'\n    run: dir\n",
+            "steps:\n  - run: |\n      echo ${{\n      matrix.os }}\n",
+            "steps:\n  - run: \"echo\\tmatrix.os\"\n",
+            "steps:\n  - run: echo ${{ matrix. os }}\n",
+            "steps:\n  - run: echo ${{ matrix .os }}\n",
+            // Every leg has its own index.
+            "steps:\n  - run: ./test --shard ${{ strategy.job-index }}\n",
+            "steps:\n  - run: echo ${{ strategy['job-total'] }}\n",
         ] {
             let job = job(&format!("runs-on: ${{{{ matrix.os }}}}\n{body}"));
             let twins = matrix_twins(&job, &legs("os", OS_LEGS), &HashMap::new());
@@ -340,6 +424,40 @@ mod tests {
             matrix_twins(&job, &combos, &HashMap::new()),
             vec![None, None, Some(0), Some(1)]
         );
+    }
+
+    #[test]
+    fn a_runner_picked_by_index_folds_nothing() {
+        // `matrix['os']` can't be pinned to `os`, so `attempt` might pick
+        // the runner too: each attempt must still run.
+        let job = job("runs-on: ${{ matrix['os'] }}\nsteps:\n  - run: ./flaky\n");
+        let leg = |os: &str, attempt: &str| {
+            MatrixCombination::new(HashMap::from([
+                ("os".to_string(), Value::String(os.to_string())),
+                ("attempt".to_string(), Value::String(attempt.to_string())),
+            ]))
+        };
+        let combos = vec![
+            leg("ubuntu-latest", "1"),
+            leg("ubuntu-latest", "2"),
+            leg("windows-latest", "1"),
+        ];
+        assert_eq!(
+            matrix_twins(&job, &combos, &HashMap::new()),
+            vec![None, None, None]
+        );
+    }
+
+    #[test]
+    fn matrix_reads_name_their_keys() {
+        assert_eq!(
+            matrix_reads("${{ matrix.os || 'x' }} ${{ Matrix . Python }}"),
+            Reads::Keys(vec!["os".to_string(), "python".to_string()])
+        );
+        assert_eq!(matrix_reads("my_matrix.os matrix_os"), Reads::Keys(vec![]));
+        assert_eq!(matrix_reads("${{ matrix.* }}"), Reads::Any);
+        assert_eq!(matrix_reads("${{ strategy.job-index }}"), Reads::Any);
+        assert_eq!(matrix_reads("a strategy for us"), Reads::Keys(vec![]));
     }
 
     #[test]

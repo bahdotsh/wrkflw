@@ -235,7 +235,8 @@ async fn build(ctx: &PlanCtx) -> Result<Value, String> {
     let is_gitlab = ctx.gitlab || is_gitlab_pipeline(&ctx.path);
     if is_gitlab && (ctx.diff || ctx.event.is_some() || ctx.changed_files.is_some()) {
         return Err(
-            "--diff, --event and --changed-files only apply to GitHub Actions workflows"
+            "--diff, --event, --branch, --tag and --changed-files only apply to GitHub \
+             Actions workflows"
                 .to_string(),
         );
     }

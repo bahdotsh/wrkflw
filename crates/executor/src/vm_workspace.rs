@@ -144,6 +144,13 @@ struct State {
     /// Why a call to the engine got no answer, once one hasn't. Every later
     /// sync fails at once instead of waiting as long again.
     stalled: Option<String>,
+    /// Set by a copy in and cleared by the copy back after it: a step may
+    /// be writing to the volume. Only then does a cancelled step have
+    /// anything of its own to copy back. A step that ran on the host, after
+    /// the last container step's copy back, wrote to the host copy, and a
+    /// copy back then would delete what it wrote for being absent from the
+    /// volume.
+    step_in_volume: bool,
 }
 
 impl State {
@@ -158,6 +165,7 @@ impl State {
             unusable: false,
             used: false,
             stalled: None,
+            step_in_volume: false,
         }
     }
 
@@ -263,8 +271,9 @@ pub(crate) async fn before_step(
 /// After a step that was cancelled, as one that ran out of time is: copy
 /// back what it wrote before it was stopped, which its own copy back never
 /// got to. Host-side steps that follow, such as an artifact upload of its
-/// logs, would otherwise not see it. Does nothing when no step of the
-/// workspace at `host` has used a volume.
+/// logs, would otherwise not see it. Does nothing unless the cancelled step
+/// was a container step that got as far as its copy in: a step that ran on
+/// the host wrote to the host copy, which a copy back would undo.
 pub(crate) async fn after_cancelled_step(host: &Path) -> Result<(), String> {
     let workspace = WORKSPACES
         .lock()
@@ -275,8 +284,8 @@ pub(crate) async fn after_cancelled_step(host: &Path) -> Result<(), String> {
         return Ok(());
     };
     tokio::task::spawn_blocking(move || {
-        let used = workspace.lock().used;
-        if used {
+        let in_volume = workspace.lock().step_in_volume;
+        if in_volume {
             workspace.sync_out()
         } else {
             Ok(())
@@ -347,6 +356,7 @@ impl VmWorkspace {
             }
             Ok(()) => {
                 state.used = true;
+                state.step_in_volume = true;
                 Ok(true)
             }
         }
@@ -407,6 +417,8 @@ impl VmWorkspace {
 
     fn sync_out(&self) -> Result<(), String> {
         let mut state = self.lock();
+        // Whatever this copy does, the step it follows is over.
+        state.step_in_volume = false;
         if let Some(why) = &state.stalled {
             return Err(format!(
                 "copying the workspace back from the {} volume wasn't tried, as an earlier copy \
@@ -2375,8 +2387,22 @@ mod tests {
             std::fs::read_link(host.join("src/link")).unwrap(),
             PathBuf::from("keep.txt")
         );
-        // A step that is cancelled, as one out of time is, never copies
-        // back; what it wrote comes back on request.
+        // A step that ran on the host after that copy back, and was then
+        // cancelled, wrote to the host copy: nothing is copied back over
+        // it, so what it wrote stays.
+        std::fs::write(host.join("src/downloaded.txt"), "artifact").unwrap();
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(after_cancelled_step(&host))
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(host.join("src/downloaded.txt")).unwrap(),
+            "artifact"
+        );
+
+        // A container step that is cancelled, as one out of time is, never
+        // copies back; what it wrote comes back on request.
+        assert!(workspace.sync_in().unwrap());
         exec(
             workspace.cli,
             &helper,
@@ -2392,6 +2418,7 @@ mod tests {
             std::fs::read_to_string(host.join("src/timed-out.log")).unwrap(),
             "partial\n"
         );
+        assert!(host.join("src/downloaded.txt").exists());
 
         // A file that grew in the volume after it was copied back differs
         // from the host's copy, which didn't change: the copy in must not

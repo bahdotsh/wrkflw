@@ -350,6 +350,11 @@ struct Measured {
     /// or since it last ran out of memory, which forgets it all.
     #[serde(default)]
     highest: u64,
+    /// For a matrix: a leg ran out of memory, so what one leg needs doesn't
+    /// say what the others do. Its legs never measured run alone, each
+    /// measuring itself, and no peak is kept for the matrix again.
+    #[serde(default)]
+    uneven: bool,
     /// When the last of them was taken, in seconds since the epoch.
     at: i64,
 }
@@ -404,25 +409,38 @@ pub(crate) fn reserve(id: &str, family: Option<&str>) -> Option<u64> {
 }
 
 fn reserve_in(store: &Store, id: &str, family: Option<&str>) -> Option<u64> {
-    let measured = store.jobs.get(id).or_else(|| store.jobs.get(family?))?;
+    let measured = store
+        .jobs
+        .get(id)
+        .or_else(|| store.jobs.get(family?).filter(|matrix| !matrix.uneven))?;
     reserve_for(&measured.peaks, measured.highest)
 }
 
 /// Keep `outcome` for the job `id`, and for its matrix `family` what says
 /// something about every leg: a peak, or a kill. A leg that couldn't be
 /// measured says nothing about the others. `false` when nothing changed.
+///
+/// A kill marks the matrix uneven rather than forgetting it. Forgotten, the
+/// first leg to pass would measure it again, and if that leg is a light
+/// one, the heavy legs it sizes would start together and be killed on every
+/// run, never measuring themselves.
 fn keep(store: &mut Store, id: &str, family: Option<&str>, outcome: Outcome, now: i64) -> bool {
-    let family = family.filter(|family| match outcome {
-        Outcome::Peak(_) => true,
-        Outcome::Killed => store.jobs.contains_key(*family),
-        Outcome::Unknown => false,
-    });
+    let family = family.filter(|_| !matches!(outcome, Outcome::Unknown));
     if !matches!(outcome, Outcome::Peak(_)) && !store.jobs.contains_key(id) && family.is_none() {
         // Nothing to forget.
         return false;
     }
-    if let Some(family) = family {
-        apply(store, family, outcome, now);
+    match (family, outcome) {
+        (Some(family), Outcome::Killed) => {
+            let matrix = Measured {
+                uneven: true,
+                at: now,
+                ..Measured::default()
+            };
+            store.jobs.insert(family.to_string(), matrix);
+        }
+        (Some(family), outcome) => apply(store, family, outcome, now),
+        (None, _) => {}
     }
     apply(store, id, outcome, now);
     true
@@ -487,10 +505,14 @@ fn apply(store: &mut Store, id: &str, outcome: Outcome, now: i64) {
     match outcome {
         Outcome::Peak(bytes) => {
             let measured = store.jobs.entry(id.to_string()).or_default();
-            measured.peaks.push(bytes);
-            measured.highest = measured.highest.max(bytes);
-            let excess = measured.peaks.len().saturating_sub(RUNS_KEPT);
-            measured.peaks.drain(..excess);
+            // An uneven matrix is still run, so not forgotten, but its
+            // legs' peaks size no leg.
+            if !measured.uneven {
+                measured.peaks.push(bytes);
+                measured.highest = measured.highest.max(bytes);
+                let excess = measured.peaks.len().saturating_sub(RUNS_KEPT);
+                measured.peaks.drain(..excess);
+            }
             measured.at = now;
         }
         // What was measured no longer says what the job needs.
@@ -600,7 +622,8 @@ mod tests {
             Outcome::Unknown,
             1000
         ));
-        // One that ran out of memory forgets the matrix's measurement too.
+        // One that ran out of memory leaves the matrix's measurement sizing
+        // no leg.
         assert!(keep(
             &mut store,
             "3.15",
@@ -608,8 +631,42 @@ mod tests {
             Outcome::Killed,
             1000
         ));
-        assert!(!store.jobs.contains_key("legs"));
+        assert!(store.jobs["legs"].uneven);
         assert_eq!(reserve_in(&store, "3.14", Some("legs")), None);
+    }
+
+    #[test]
+    fn a_light_first_leg_never_again_sizes_heavy_legs_that_were_killed() {
+        let mut store = Store::default();
+        let run =
+            |store: &mut Store, leg: &str, outcome| keep(store, leg, Some("legs"), outcome, 1);
+        // The light leg ran alone and sized the rest, which ran together
+        // and were killed.
+        run(&mut store, "lint", Outcome::Peak(300 * MIB));
+        assert!(reserve_in(&store, "build", Some("legs")).is_some());
+        run(&mut store, "build", Outcome::Killed);
+        run(&mut store, "test", Outcome::Killed);
+        // The next run: the light leg passes first, as it did before. Its
+        // peak sizes the heavy legs no longer, so they run alone, each
+        // measuring itself, as before any matrix was measured.
+        run(&mut store, "lint", Outcome::Peak(300 * MIB));
+        assert_eq!(reserve_in(&store, "build", Some("legs")), None);
+        assert_eq!(reserve_in(&store, "test", Some("legs")), None);
+        run(&mut store, "build", Outcome::Peak(5000 * MIB));
+        assert_eq!(reserve_in(&store, "new", Some("legs")), None);
+        assert!(reserve_in(&store, "build", Some("legs")).is_some());
+        // A kill with no measurement of the matrix yet marks it too.
+        let mut fresh = Store::default();
+        assert!(keep(&mut fresh, "a", Some("legs"), Outcome::Killed, 1));
+        assert!(fresh.jobs["legs"].uneven);
+        // The mark lasts as long as the matrix runs, and goes with it.
+        apply(
+            &mut store,
+            "other",
+            Outcome::Peak(MIB),
+            1 + FORGET_AFTER_SECS,
+        );
+        assert!(!store.jobs.contains_key("legs"));
     }
 
     #[test]

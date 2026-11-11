@@ -8,9 +8,10 @@
 //! each job sets aside what it used on its last runs (see
 //! [`crate::job_memory`]), or, never measured, a share of 4 GB or more.
 
-use std::sync::{Arc, OnceLock};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 
 const GIB: u64 = 1024 * 1024 * 1024;
 
@@ -58,6 +59,9 @@ fn shared(bytes: u64) -> u64 {
 struct Pool {
     places: Arc<Semaphore>,
     limit: Limit,
+    /// For each matrix with a leg waiting unmeasured: told when one of its
+    /// legs has kept its measurements.
+    measured: Mutex<HashMap<String, Arc<Notify>>>,
 }
 
 impl Pool {
@@ -69,7 +73,26 @@ impl Pool {
         Pool {
             places: Arc::new(Semaphore::new(places.clamp(1, Semaphore::MAX_PERMITS))),
             limit,
+            measured: Mutex::default(),
         }
+    }
+
+    /// What the legs of the matrix `family` are told on when one of them has
+    /// kept its measurements.
+    fn measured(&self, family: &str) -> Arc<Notify> {
+        self.measured
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(family.to_string())
+            .or_default()
+            .clone()
+    }
+
+    /// Wait for the places a job takes, given the room it was measured to
+    /// need. Queued only once polled.
+    async fn place(&self, measured: Option<u64>) -> Option<OwnedSemaphorePermit> {
+        let weight = self.weight(measured);
+        self.places.clone().acquire_many_owned(weight).await.ok()
     }
 
     /// The places a job takes, given the room it was measured to need.
@@ -118,22 +141,87 @@ pub(crate) async fn with_run_pool<F: std::future::Future>(future: F) -> F::Outpu
 /// for one would deadlock a limit of one.
 ///
 /// `job` is the job's [`crate::job_memory::job_id`], whose measurements
-/// size its place when jobs share memory.
-pub(crate) async fn job_slot(job: Option<&str>) -> Option<OwnedSemaphorePermit> {
+/// size its place when jobs share memory. `family` is the id the legs of
+/// its matrix share, for a leg: one never measured takes what another leg
+/// was, and while it waits for a place it looks again whenever a sibling
+/// keeps its measurements, so only the first leg of a new matrix runs
+/// alone.
+pub(crate) async fn job_slot(
+    job: Option<&str>,
+    family: Option<&str>,
+) -> Option<OwnedSemaphorePermit> {
     let pool = POOL.try_with(|pool| pool.get().cloned().flatten()).ok()??;
-    let measured = match (pool.limit, job) {
-        // The store is a file under a lock: not for the async runtime.
-        (Limit::Memory { .. }, Some(job)) => {
-            let job = job.to_string();
-            tokio::task::spawn_blocking(move || crate::job_memory::reserve(&job))
-                .await
-                .ok()
-                .flatten()
-        }
-        _ => None,
+    let (Limit::Memory { .. }, Some(job)) = (pool.limit, job) else {
+        return pool.place(None).await;
     };
-    let weight = pool.weight(measured);
-    pool.places.clone().acquire_many_owned(weight).await.ok()
+    match family {
+        Some(family) => leg_slot(&pool, job, family).await,
+        None => {
+            let reserve = reserve(job, None).await;
+            pool.place(reserve.map(|reserve| reserve.bytes)).await
+        }
+    }
+}
+
+/// The place of the leg `job` of the matrix `family`: by its own
+/// measurements, or, never measured, by its siblings'. With neither it waits
+/// as a job never measured, and looks again each time a sibling keeps its
+/// measurements.
+async fn leg_slot(pool: &Pool, job: &str, family: &str) -> Option<OwnedSemaphorePermit> {
+    let measured = pool.measured(family);
+    loop {
+        // Listening before the store is read, so a measurement kept in
+        // between isn't missed.
+        let changed = measured.notified();
+        tokio::pin!(changed);
+        changed.as_mut().enable();
+        let reserve = reserve(job, Some(family)).await;
+        let place = pool.place(reserve.map(|reserve| reserve.bytes));
+        if let Some(reserve) = reserve {
+            let place = place.await;
+            if reserve.by_matrix && place.is_some() {
+                crate::job_memory::sized_by_matrix(reserve.bytes);
+            }
+            return place;
+        }
+        tokio::select! {
+            // A place freed by the leg that was just measured comes with
+            // its measurement: read it before taking the place.
+            //
+            // Each look starts a new wait at the back of the pool's queue,
+            // after jobs that asked since. It is the price of asking for
+            // less: a run is finite, and the measurement it waits for lets
+            // more of the run go at once than the place it gives up.
+            biased;
+            _ = &mut changed => {}
+            place = place => return place,
+        }
+    }
+}
+
+/// The room to set aside for `job`, a leg of `family` if any, from the
+/// store.
+async fn reserve(job: &str, family: Option<&str>) -> Option<crate::job_memory::Reserve> {
+    let job = job.to_string();
+    let family = family.map(str::to_string);
+    // The store is a file under a lock: not for the async runtime.
+    tokio::task::spawn_blocking(move || crate::job_memory::reserve(&job, family.as_deref()))
+        .await
+        .ok()
+        .flatten()
+}
+
+/// A leg of the matrix `family` kept its measurements: its siblings waiting
+/// unmeasured look again.
+pub(crate) fn measurements_changed(family: &str) {
+    let Ok(Some(pool)) = POOL.try_with(|pool| pool.get().cloned().flatten()) else {
+        return;
+    };
+    // No entry, no sibling has waited.
+    let measured = pool.measured.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(measured) = measured.get(family) {
+        measured.notify_waiters();
+    }
 }
 
 /// Whether this run sizes jobs by the memory they were measured to use, so
@@ -257,8 +345,9 @@ fn warning(memory: &Memory, limit: Option<usize>) -> String {
     let running = match limit {
         Some(limit) => format!(
             "Jobs not measured yet run at most {limit} at a time; a job measured on an \
-             earlier run sets aside what it used then, so light jobs run side by side. \
-             {way_out}, or set {MAX_PARALLEL_JOBS_ENV}"
+             earlier run sets aside what it used then, so light jobs run side by side, \
+             and a matrix leg not measured yet sets aside what its matrix's other legs \
+             used. {way_out}, or set {MAX_PARALLEL_JOBS_ENV}"
         ),
         None => format!(
             "Jobs run side by side as on GitHub. {way_out}, or set {MAX_PARALLEL_JOBS_ENV} to \
@@ -408,16 +497,16 @@ mod tests {
     async fn every_job_and_leg_takes_its_place_from_the_runs_pool() {
         with_run_pool(async {
             set_limit(Some(Limit::Jobs(2)));
-            let _a = job_slot(None).await.unwrap();
-            let _b = job_slot(None).await.unwrap();
-            let third = tokio::time::timeout(Duration::from_millis(50), job_slot(None)).await;
+            let _a = job_slot(None, None).await.unwrap();
+            let _b = job_slot(None, None).await.unwrap();
+            let third = tokio::time::timeout(Duration::from_millis(50), job_slot(None, None)).await;
             assert!(
                 third.is_err(),
                 "a third place was handed out with a limit of two"
             );
             // A second check in the same run doesn't resize its pool.
             set_limit(Some(Limit::Jobs(3)));
-            let again = tokio::time::timeout(Duration::from_millis(50), job_slot(None)).await;
+            let again = tokio::time::timeout(Duration::from_millis(50), job_slot(None, None)).await;
             assert!(again.is_err(), "the run's pool was resized");
         })
         .await;
@@ -429,13 +518,14 @@ mod tests {
         // run, in the same process, sets no limit and runs freely.
         with_run_pool(async {
             set_limit(Some(Limit::Jobs(1)));
-            let _held = job_slot(None).await.unwrap();
+            let _held = job_slot(None, None).await.unwrap();
             with_run_pool(async {
                 set_limit(None);
-                assert!(job_slot(None).await.is_none());
+                assert!(job_slot(None, None).await.is_none());
             })
             .await;
-            let blocked = tokio::time::timeout(Duration::from_millis(50), job_slot(None)).await;
+            let blocked =
+                tokio::time::timeout(Duration::from_millis(50), job_slot(None, None)).await;
             assert!(blocked.is_err(), "the other run changed this run's limit");
         })
         .await;
@@ -498,8 +588,261 @@ mod tests {
     #[tokio::test]
     async fn outside_a_run_nothing_is_limited() {
         set_limit(Some(Limit::Jobs(1)));
-        assert!(job_slot(None).await.is_none());
-        assert!(job_slot(None).await.is_none());
+        assert!(job_slot(None, None).await.is_none());
+        assert!(job_slot(None, None).await.is_none());
+    }
+
+    /// How the first leg of a new matrix ends, in [`legs_after`].
+    #[derive(Clone, Copy, PartialEq)]
+    enum FirstLeg {
+        Passes,
+        Fails,
+        IsCancelled,
+    }
+
+    /// Run a first leg of a new matrix that peaks at 600 MiB and ends as
+    /// `ends`, with its siblings `waiting` and the legs `strangers` of
+    /// another matrix waiting for it, and give the room each of those was
+    /// given, in that order, and the room the run has.
+    async fn legs_after(
+        ends: FirstLeg,
+        first: &str,
+        waiting: &[&str],
+        strangers: &[&str],
+    ) -> (Vec<usize>, usize) {
+        use crate::job_memory;
+        // The test process's store is shared: each test a matrix of its own.
+        let family = format!("{first}-legs");
+        let family = family.as_str();
+        let other = format!("{first}-other-legs");
+        let other = other.as_str();
+        job_memory::use_test_store();
+        with_run_pool(async {
+            set_limit(Some(Limit::Memory {
+                bytes: 8 * GIB,
+                slots: 1,
+            }));
+            let pool = POOL.with(|pool| pool.get().cloned().flatten()).unwrap();
+            let total = pool.places.available_permits();
+            let (held, holding) = tokio::sync::oneshot::channel::<()>();
+            let (finish, finished) = tokio::sync::oneshot::channel::<()>();
+            let mut first_leg = Box::pin(job_memory::metered(
+                async {
+                    let slot = job_memory::leg_place(Some(first), Some(family), first).await;
+                    assert!(slot.is_none(), "the meter holds it");
+                    job_memory::meter().unwrap().sample("step", 600 * MIB);
+                    held.send(()).unwrap();
+                    finished.await.unwrap();
+                },
+                |_| ends == FirstLeg::Passes,
+            ));
+            // Until it holds its place, however long the store takes to read.
+            tokio::select! {
+                _ = &mut first_leg => unreachable!("the first leg waits to be told to end"),
+                held = holding => held.unwrap(),
+            }
+            assert_eq!(
+                pool.places.available_permits(),
+                0,
+                "a leg of a matrix never measured takes the whole VM"
+            );
+            let rest = futures::future::join_all(
+                waiting
+                    .iter()
+                    .map(|leg| job_slot(Some(leg), Some(family)))
+                    .chain(strangers.iter().map(|leg| job_slot(Some(leg), Some(other)))),
+            );
+            tokio::pin!(rest);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(200), &mut rest)
+                    .await
+                    .is_err(),
+                "the other legs wait while the first holds the VM"
+            );
+            let ended = async {
+                if ends == FirstLeg::IsCancelled {
+                    drop(first_leg);
+                    rest.await
+                } else {
+                    finish.send(()).unwrap();
+                    // Polled in turn: had the first leg given its place up
+                    // before keeping its measurement, the others would take
+                    // it unmeasured while the first waits on the store.
+                    let ((), places) = tokio::join!(first_leg, rest);
+                    places
+                }
+            };
+            // Long enough for any runner. A leg that took the whole VM
+            // unmeasured holds it here for good, so the rest never start:
+            // fail on that rather than hang.
+            let places = tokio::time::timeout(Duration::from_secs(30), ended)
+                .await
+                .expect("a waiting leg took the whole VM, so the others never got a place");
+            let given = places
+                .into_iter()
+                .map(|place| place.unwrap().num_permits())
+                .collect();
+            (given, total)
+        })
+        .await
+    }
+
+    /// 600 MiB, half again, and 256 MiB of headroom.
+    const SIBLING_MIB: usize = 600 + 300 + 256;
+
+    #[tokio::test]
+    async fn a_leg_waiting_for_the_vm_takes_what_its_first_sibling_measured() {
+        let (given, total) =
+            legs_after(FirstLeg::Passes, "wake-first-passes", &["wake-2"], &[]).await;
+        assert_eq!(given, vec![SIBLING_MIB]);
+        assert!(SIBLING_MIB < total);
+    }
+
+    #[tokio::test]
+    async fn every_leg_waiting_for_the_vm_takes_what_its_first_sibling_measured() {
+        // The first to wait is handed the whole VM as the first leg gives
+        // it up, and must hand it back for the others to share.
+        let waiting = ["wake-many-2", "wake-many-3", "wake-many-4"];
+        let (given, _) = legs_after(FirstLeg::Passes, "wake-many", &waiting, &[]).await;
+        assert_eq!(given, vec![SIBLING_MIB; 3]);
+    }
+
+    #[tokio::test]
+    async fn a_leg_whose_first_sibling_failed_still_runs_alone() {
+        let (given, total) =
+            legs_after(FirstLeg::Fails, "wake-first-fails", &["wake-alone"], &[]).await;
+        assert_eq!(given, vec![total], "a failed leg's peak sizes nothing");
+    }
+
+    #[tokio::test]
+    async fn a_leg_whose_first_sibling_was_cancelled_still_runs_alone() {
+        let (given, total) = legs_after(
+            FirstLeg::IsCancelled,
+            "wake-cancelled",
+            &["wake-after"],
+            &[],
+        )
+        .await;
+        assert_eq!(given, vec![total], "a cancelled leg measured nothing");
+    }
+
+    #[tokio::test]
+    async fn a_leg_of_another_matrix_is_not_sized_by_this_ones_measurement() {
+        let (given, total) =
+            legs_after(FirstLeg::Passes, "wake-stranger", &[], &["wake-stranger-2"]).await;
+        assert_eq!(given, vec![total], "its own matrix was never measured");
+    }
+
+    #[tokio::test]
+    async fn a_leg_its_siblings_sized_says_so_and_its_kill_marks_the_matrix() {
+        use crate::job_memory;
+        job_memory::use_test_store();
+        let family = "told-legs";
+        with_run_pool(async {
+            set_limit(Some(Limit::Memory {
+                bytes: 8 * GIB,
+                slots: 1,
+            }));
+            // The first leg runs alone and is measured.
+            job_memory::metered(
+                async {
+                    let _ = job_memory::leg_place(Some("told-1"), Some(family), "told (1)").await;
+                    job_memory::meter().unwrap().sample("step", 600 * MIB);
+                },
+                |_| true,
+            )
+            .await;
+            // The second is sized by it, and is killed.
+            job_memory::metered(
+                async {
+                    let _ = job_memory::leg_place(Some("told-2"), Some(family), "told (2)").await;
+                    let meter = job_memory::meter().unwrap();
+                    meter.sample("step", 600 * MIB);
+                    meter.killed_alone();
+                },
+                |_| false,
+            )
+            .await;
+        })
+        .await;
+        let logs = wrkflw_logging::get_logs();
+        let said = |text: &str| logs.iter().any(|line| line.contains(text));
+        assert!(
+            !said("Matrix job told (1) hasn't been measured"),
+            "the first leg ran alone"
+        );
+        assert!(said(&format!(
+            "Matrix job told (2) hasn't been measured yet; it sets aside {SIBLING_MIB} MiB"
+        )));
+        assert!(said("Matrix job told (2) had never been measured"));
+        assert_eq!(
+            job_memory::reserve("told-3", Some(family)),
+            None,
+            "the matrix sizes no leg once one it sized was killed"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_leg_killed_on_its_own_measurement_leaves_its_matrix_sizing_legs() {
+        use crate::job_memory;
+        job_memory::use_test_store();
+        let family = "own-legs";
+        let leg = |peak: u64, killed: bool| {
+            job_memory::metered(
+                async move {
+                    let _ = job_memory::leg_place(Some("own-1"), Some(family), "own (1)").await;
+                    let meter = job_memory::meter().unwrap();
+                    meter.sample("step", peak);
+                    if killed {
+                        meter.killed_alone();
+                    }
+                },
+                move |_| !killed,
+            )
+        };
+        with_run_pool(async {
+            set_limit(Some(Limit::Memory {
+                bytes: 8 * GIB,
+                slots: 1,
+            }));
+            leg(600 * MIB, false).await;
+            // On the next run it is given its own room, and is killed.
+            leg(900 * MIB, true).await;
+        })
+        .await;
+        assert!(
+            !wrkflw_logging::get_logs()
+                .iter()
+                .any(|line| line.contains("Matrix job own (1)")),
+            "nothing to say of a leg given its own room"
+        );
+        assert_eq!(
+            job_memory::reserve("own-1", Some(family)).map(|r| r.by_matrix),
+            Some(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn legs_with_room_for_two_unmeasured_run_together_as_before() {
+        crate::job_memory::use_test_store();
+        with_run_pool(async {
+            set_limit(Some(Limit::Memory {
+                bytes: 12 * GIB,
+                slots: 2,
+            }));
+            let first = job_slot(Some("two-1"), Some("two-legs")).await.unwrap();
+            // Long enough for any runner: a second leg must not wait for
+            // the first's measurement when it fits beside it unmeasured.
+            let second = tokio::time::timeout(
+                Duration::from_secs(30),
+                job_slot(Some("two-2"), Some("two-legs")),
+            )
+            .await
+            .expect("the second leg waited for the first")
+            .unwrap();
+            assert_eq!(first.num_permits(), second.num_permits());
+        })
+        .await;
     }
 
     fn memory(bytes: u64, in_vm: bool) -> Memory {

@@ -1,6 +1,6 @@
 # Codebase Index: wrkflw
 
-> Generated: 2026-11-11 11:07:47 UTC | Files: 260 | Lines: 116241
+> Generated: 2026-11-11 17:02:11 UTC | Files: 260 | Lines: 117213
 > Languages: JSON (4), Markdown (26), Rust (167), Shell (6), TOML (19), YAML (38)
 
 ## Directory Structure
@@ -1762,7 +1762,7 @@ wrkflw/
 
 ## BREAKING_CHANGES.md
 
-**Language:** Markdown | **Size:** 31.3 KB | **Lines:** 384
+**Language:** Markdown | **Size:** 31.5 KB | **Lines:** 384
 
 **Declarations:**
 
@@ -1786,7 +1786,7 @@ wrkflw/
 
 ## INDEX.md
 
-**Language:** Markdown | **Size:** 273.8 KB | **Lines:** 10156
+**Language:** Markdown | **Size:** 275.9 KB | **Lines:** 10209
 
 **Declarations:**
 
@@ -2557,7 +2557,7 @@ wrkflw/
 
 ## crates/executor/src/docker.rs
 
-**Language:** Rust | **Size:** 65.1 KB | **Lines:** 1741
+**Language:** Rust | **Size:** 65.1 KB | **Lines:** 1742
 
 **Imports:**
 - `crate::container_guard::ContainerGuard`
@@ -2908,7 +2908,7 @@ wrkflw/
 
 ## crates/executor/src/job_memory.rs
 
-**Language:** Rust | **Size:** 22.5 KB | **Lines:** 621
+**Language:** Rust | **Size:** 38.4 KB | **Lines:** 1015
 
 **Imports:**
 - `std::collections::HashMap`
@@ -2928,6 +2928,10 @@ wrkflw/
 
 `const HEADROOM_BYTES: u64 = 256 * MIB`
 
+`const FLOOR_MARGIN_DIVISOR: u64 = 8`
+
+`const FLOOR_MIN_MARGIN_BYTES: u64 = 128 * MIB`
+
 `pub(crate) const SIGKILL_EXIT: i32 = 137`
 
 `const KILLED_CHILD_SIGNS: &[&str] = &[ // cargo, for rustc or a build script "(signal: 9, SIGKILL", // gcc and collect2, for ld or cc1 "terminated with signal 9", "Killed signal terminated program", ]`
@@ -2937,7 +2941,7 @@ wrkflw/
 `pub(crate) fn ran_out_of_memory(exit_code: i32, oom_killed: bool, output: &[&str]) -> bool`
 
 `pub(crate) struct JobMeter`
-> Fields: `current: Mutex<HashMap<String, u64>>`, `peak: AtomicU64`, `sampled: AtomicBool`, `incomplete: AtomicBool`, `killed: AtomicBool`, `neighbour_killed: AtomicBool`, `id: Mutex<Option<String>>`
+> Fields: `current: Mutex<HashMap<String, u64>>`, `peak: AtomicU64`, `sampled: AtomicBool`, `incomplete: AtomicBool`, `killed: AtomicBool`, `neighbour_killed: AtomicBool`, `id: Mutex<Option<String>>`, `leg: Mutex<Option<Leg>>`, `sized_by_matrix: AtomicBool`, `slot: Mutex<Option<tokio::sync::OwnedSemaphorePermit>>`
 
 **`impl JobMeter`**
   `pub(crate) fn sample(&self, container: &str, bytes: u64)`
@@ -2948,10 +2952,15 @@ wrkflw/
 
   `pub(crate) fn killed(&self)`
 
+  `pub(crate) fn killed_alone(&self)`
+
   `pub(crate) fn is_incomplete(&self) -> bool`
 
   `fn outcome(&self) -> Outcome`
 
+
+`struct Leg`
+> Fields: `family: String`, `name: String`
 
 `enum Outcome`
 > Variants: `Peak`, `Killed`, `Unknown`
@@ -2970,7 +2979,21 @@ wrkflw/
 
 `pub(crate) async fn metered<F: std::future::Future>( future: F, succeeded: impl FnOnce(&F::Output) -> bool, ) -> F::Output`
 
+`struct Release(Arc<JobMeter>)`
+
+**`impl Drop for Release`**
+  `fn drop(&mut self)`
+
+
 `pub(crate) fn measure_as(id: &str)`
+
+`pub(crate) async fn leg_place( id: Option<&str>, family: Option<&str>, name: &str, ) -> Option<tokio::sync::OwnedSemaphorePermit>`
+
+`fn in_family(family: &str, name: &str)`
+
+`pub(crate) fn sized_by_matrix(bytes: u64)`
+
+`fn hold( slot: Option<tokio::sync::OwnedSemaphorePermit>, ) -> Option<tokio::sync::OwnedSemaphorePermit>`
 
 `pub(crate) fn meter() -> Option<Arc<JobMeter>>`
 
@@ -2992,19 +3015,30 @@ wrkflw/
 
 
 `struct Measured`
-> Fields: `peaks: Vec<u64>`, `highest: u64`, `at: i64`
+> Fields: `peaks: Vec<u64>`, `highest: u64`, `uneven: bool`, `at: i64`
 
 `static STORE_LOCK: Mutex<()> = Mutex::new(())`
 
 `fn lock_file(path: &std::path::Path, exclusive: bool) -> Option<std::fs::File>`
 
+`static TEST_STORE: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new()`
+
+`pub(crate) fn use_test_store()`
+
 `fn store_path() -> Option<PathBuf>`
 
 `fn load(path: &std::path::Path) -> Store`
 
-`pub(crate) fn reserve(id: &str) -> Option<u64>`
+`pub(crate) fn reserve(id: &str, family: Option<&str>) -> Option<Reserve>`
 
-`fn record(id: &str, meter: &JobMeter, passed: bool)`
+`pub(crate) struct Reserve`
+> Fields: `bytes: u64`, `by_matrix: bool`
+
+`fn reserve_in(store: &Store, id: &str, family: Option<&str>) -> Option<Reserve>`
+
+`fn keep( store: &mut Store, id: &str, family: Option<&str>, outcome: Outcome, sized_by_matrix: bool, now: i64, ) -> bool`
+
+`fn record(id: &str, family: Option<&str>, meter: &JobMeter, passed: bool) -> bool`
 
 `fn to_keep(outcome: Outcome, passed: bool) -> Option<Outcome>`
 
@@ -3621,7 +3655,7 @@ wrkflw/
 
 ## crates/executor/src/podman.rs
 
-**Language:** Rust | **Size:** 38.1 KB | **Lines:** 1028
+**Language:** Rust | **Size:** 38.2 KB | **Lines:** 1029
 
 **Imports:**
 - `crate::container_guard::ContainerGuard`
@@ -3763,7 +3797,7 @@ wrkflw/
 
 ## crates/executor/src/setup_actions.rs
 
-**Language:** Rust | **Size:** 46.8 KB | **Lines:** 1149
+**Language:** Rust | **Size:** 47.8 KB | **Lines:** 1176
 
 **Imports:**
 - `std::collections::HashMap`
@@ -3779,7 +3813,7 @@ wrkflw/
 > Fields: `installed: Vec<String>`, `not_built: Vec<(usize, NotBuilt)>`, `runtimes: Vec<SetupRuntime>`, `in_composite: bool`
 
 `pub(crate) enum NotBuilt`
-> Variants: `Refused`, `Superseded`
+> Variants: `Refused`, `Superseded`, `Conditional`, `UnsupportedInput`
 
 **`impl BuiltRuntimes`**
   `fn has(&self, language: &str) -> bool`
@@ -3808,7 +3842,7 @@ wrkflw/
 
 `fn composite_setup_cause( def: &SetupActionDef, built: &BuiltRuntimes, step: Option<&Step>, ) -> Option<&'static str>`
 
-`fn uv_python<'a>(input: impl Fn(&str) -> Option<&'a String>) -> Result<Option<String>, String>`
+`fn uv_python<'a>( input: impl Fn(&str) -> Option<&'a String>, ) -> Result<Option<String>, (NotBuilt, String)>`
 
 `fn go_version(text: &str) -> Option<String>`
 
@@ -3893,12 +3927,13 @@ wrkflw/
 
 ## crates/executor/src/vm_memory.rs
 
-**Language:** Rust | **Size:** 20.8 KB | **Lines:** 568
+**Language:** Rust | **Size:** 34.1 KB | **Lines:** 911
 
 **Imports:**
-- `std::sync::{Arc, OnceLock}`
+- `std::collections::HashMap`
+- `std::sync::{Arc, Mutex, OnceLock}`
 - `std::time::{Duration, Instant}`
-- `tokio::sync::{OwnedSemaphorePermit, Semaphore}`
+- `tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore}`
 
 **Declarations:**
 
@@ -3920,10 +3955,14 @@ wrkflw/
 `fn shared(bytes: u64) -> u64`
 
 `struct Pool`
-> Fields: `places: Arc<Semaphore>`, `limit: Limit`
+> Fields: `places: Arc<Semaphore>`, `limit: Limit`, `measured: Mutex<HashMap<String, Arc<Notify>>>`
 
 **`impl Pool`**
   `fn new(limit: Limit) -> Pool`
+
+  `fn measured(&self, family: &str) -> Arc<Notify>`
+
+  `async fn place(&self, measured: Option<u64>) -> Option<OwnedSemaphorePermit>`
 
   `fn weight(&self, measured: Option<u64>) -> u32`
 
@@ -3934,7 +3973,13 @@ wrkflw/
 
 `pub(crate) async fn with_run_pool<F: std::future::Future>(future: F) -> F::Output`
 
-`pub(crate) async fn job_slot(job: Option<&str>) -> Option<OwnedSemaphorePermit>`
+`pub(crate) async fn job_slot( job: Option<&str>, family: Option<&str>, ) -> Option<OwnedSemaphorePermit>`
+
+`async fn leg_slot(pool: &Pool, job: &str, family: &str) -> Option<OwnedSemaphorePermit>`
+
+`async fn reserve(job: &str, family: Option<&str>) -> Option<crate::job_memory::Reserve>`
+
+`pub(crate) fn measurements_changed(family: &str)`
 
 `pub(crate) fn sizes_by_memory() -> bool`
 
@@ -3978,7 +4023,7 @@ wrkflw/
 
 ## crates/executor/src/vm_workspace.rs
 
-**Language:** Rust | **Size:** 104.3 KB | **Lines:** 2873
+**Language:** Rust | **Size:** 107.2 KB | **Lines:** 2938
 
 **Imports:**
 - `std::collections::{HashMap, HashSet}`
@@ -4027,7 +4072,7 @@ wrkflw/
 `fn volume_name(host: &Path) -> String`
 
 `struct State`
-> Fields: `helper: Option<String>`, `volume: Option<Listing>`, `host: Option<Listing>`, `kept: HashSet<PathBuf>`, `pending: HashSet<PathBuf>`, `unlisted: HashSet<PathBuf>`, `unusable: bool`, `used: bool`, `stalled: Option<String>`, `step_in_volume: bool`
+> Fields: `helper: Option<String>`, `volume: Option<Listing>`, `host: Option<Listing>`, `kept: HashSet<PathBuf>`, `kept_for_case: HashSet<PathBuf>`, `pending: HashSet<PathBuf>`, `unlisted: HashSet<PathBuf>`, `unusable: bool`, `used: bool`, `stalled: Option<String>`, `step_in_volume: bool`
 
 **`impl State`**
   `fn new() -> Self`
@@ -4125,7 +4170,7 @@ wrkflw/
 `fn append_host_entry<W: Write>( builder: &mut tar::Builder<W>, full: &Path, rel: &Path, _in_volume: Option<&Entry>, ) -> io::Result<()>`
 
 `struct Unpacked`
-> Fields: `refused: Vec<PathBuf>`, `failed: Vec<(PathBuf, io::Error)>`
+> Fields: `refused: Vec<PathBuf>`, `refused_for_case: Vec<PathBuf>`, `failed: Vec<(PathBuf, io::Error)>`
 
 `fn cannot_hold(e: &io::Error) -> bool`
 
@@ -4135,7 +4180,7 @@ wrkflw/
 
 `fn spelled_otherwise_on_host( host: &Path, rel: &Path, names: &mut HashMap<PathBuf, Option<HashSet<std::ffi::OsString>>>, ) -> bool`
 
-`fn release_kept(host: &Path, kept: &mut HashSet<PathBuf>) -> Vec<PathBuf>`
+`fn release_kept( host: &Path, kept: &mut HashSet<PathBuf>, for_case: &mut HashSet<PathBuf>, ) -> Vec<PathBuf>`
 
 `fn unpack<R: Read>(reader: R, host: &Path, volume: &Listing) -> io::Result<Unpacked>`
 
@@ -4144,6 +4189,8 @@ wrkflw/
 `fn kept_file(volume: &str) -> Option<PathBuf>`
 
 `fn pending_file(volume: &str) -> Option<PathBuf>`
+
+`fn case_file(volume: &str) -> Option<PathBuf>`
 
 `fn forget_saved(volume: &str)`
 
@@ -4208,13 +4255,15 @@ wrkflw/
 
 `pub(crate) fn release(host: &Path, kept: bool)`
 
-`fn held_by_stopped_containers(cli: &str, volume: &str) -> bool`
+`static PRESERVED: Mutex<Vec<String>> = Mutex::new(Vec::new())`
 
-`fn stopped_state(state: &str) -> bool`
+`pub(crate) fn note_preserved(container: &str)`
+
+`fn held_by_preserved_container(cli: &str, volume: &str) -> bool`
+
+`fn mounts_preserved(listed: &str, preserved: &[String]) -> bool`
 
 `const VOLUME_REMOVAL_TRIES: usize = 120`
-
-`const HELD_TRIES: usize = 20`
 
 `static PENDING_REMOVALS: Mutex<Vec<std::thread::JoinHandle<()>>> = Mutex::new(Vec::new())`
 
@@ -8574,7 +8623,7 @@ wrkflw/
 
 ## crates/wrkflw/src/main.rs
 
-**Language:** Rust | **Size:** 92.1 KB | **Lines:** 2507
+**Language:** Rust | **Size:** 94.2 KB | **Lines:** 2567
 
 **Imports:**
 - `bollard::Docker`
@@ -8665,7 +8714,9 @@ wrkflw/
 
 `fn ref_name(value: &str, prefix: &str) -> Result<String, String>`
 
-`fn event_for(event: Option<&str>, branch: Option<&str>, tag: Option<&str>) -> Option<String>`
+`fn event_for( event: Option<&str>, branch: Option<&str>, tag: Option<&str>, listens_to_push: impl FnOnce() -> bool, ) -> Option<String>`
+
+`fn workflow_listens_to_push(path: &Path) -> bool`
 
 `fn check_tag_event(event: Option<&str>, tag: Option<&str>) -> Result<(), String>`
 
@@ -9213,7 +9264,7 @@ wrkflw/
 
 ## crates/wrkflw/tests/agent_cli_test.rs
 
-**Language:** Rust | **Size:** 48.1 KB | **Lines:** 1463
+**Language:** Rust | **Size:** 49.0 KB | **Lines:** 1491
 
 **Imports:**
 - `serde_json::{json, Value}`
@@ -9350,6 +9401,8 @@ wrkflw/
 `fn branch_and_event_reach_filters_and_steps_on_a_detached_head()`
 
 `fn a_branch_or_tag_alone_is_a_push_to_filters_and_steps()`
+
+`fn a_branch_alone_still_runs_a_workflow_that_takes_no_pushes()`
 
 `fn a_step_whose_action_did_not_run_makes_a_pass_partial()`
 

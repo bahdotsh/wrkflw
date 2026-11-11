@@ -3042,7 +3042,7 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
     // Only after the reusable workflow check: its jobs take places of their
     // own, and a caller holding one would deadlock a limit of one.
     let memory_id = job_memory_id(&ctx.workflow.name, ctx.job_name);
-    let _slot = crate::vm_memory::job_slot(memory_id.as_deref()).await;
+    let _slot = crate::vm_memory::job_slot(memory_id.as_deref(), None).await;
     if let Some(id) = &memory_id {
         crate::job_memory::measure_as(id);
     }
@@ -3433,12 +3433,13 @@ async fn execute_matrix_job(
     // Create the matrix-specific job name
     let matrix_job_name = wrkflw_matrix::format_combination_name(job_name, combination);
 
-    // One place in the run's pool for the leg, as for any job.
+    // One place in the run's pool for the leg, as for any job. A leg never
+    // measured is sized by the legs of its matrix that were.
     let memory_id = job_memory_id(&workflow.name, &matrix_job_name);
-    let _slot = crate::vm_memory::job_slot(memory_id.as_deref()).await;
-    if let Some(id) = &memory_id {
-        crate::job_memory::measure_as(id);
-    }
+    let family = leg_family_memory_id(&workflow.name, job_name);
+    let _slot =
+        crate::job_memory::leg_place(memory_id.as_deref(), family.as_deref(), &matrix_job_name)
+            .await;
 
     wrkflw_logging::info(&format!("Executing matrix job: {}", matrix_job_name));
 
@@ -3758,6 +3759,12 @@ fn job_memory_id(workflow: &str, job: &str) -> Option<String> {
     let repo = std::env::current_dir().ok()?;
     let identity = crate::workspace::job_identity(&repo, workflow, job);
     Some(crate::job_memory::job_id(&identity))
+}
+
+/// The id the legs of the matrix job `job` share their measurements under.
+/// A NUL can't appear in a job's name, so it is no job's own id.
+fn leg_family_memory_id(workflow: &str, job: &str) -> Option<String> {
+    job_memory_id(workflow, &format!("{job}\0legs"))
 }
 
 async fn flush_pending_cache_saves(

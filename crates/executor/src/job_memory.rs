@@ -22,6 +22,12 @@
 //! Podman, forgets what an earlier run measured, which no longer says what
 //! it needs.
 //!
+//! The legs of a matrix run the same steps, so each leg's peak is also kept
+//! for the matrix as a whole, and a leg never measured itself is given the
+//! room its siblings needed. The first leg of a new matrix, or of a fresh
+//! clone, runs alone; the rest wait for its measurement and then share the
+//! VM, where every leg used to run alone in turn.
+//!
 //! Only step containers are measured. Building the job's image and the
 //! helper that copies its workspace run outside any job's measurement, so
 //! the first run after image caches are cleared can need more than
@@ -51,6 +57,14 @@ const MIN_RESERVED_BYTES: u64 = 512 * MIB;
 
 /// Added to a measured peak, on top of half of it again.
 const HEADROOM_BYTES: u64 = 256 * MIB;
+
+/// Added to a job's highest peak when it is the floor under the estimate:
+/// an eighth of it, for a spike between samples taken a second apart.
+const FLOOR_MARGIN_DIVISOR: u64 = 8;
+
+/// The least added to a job's highest peak as the floor's margin: an eighth
+/// of a small job's peak is less than a spike of a second can be.
+const FLOOR_MIN_MARGIN_BYTES: u64 = 128 * MIB;
 
 /// Exit code of a process killed by SIGKILL, as the kernel's out-of-memory
 /// killer does.
@@ -107,6 +121,14 @@ pub(crate) struct JobMeter {
     neighbour_killed: AtomicBool,
     /// What the job's measurements are kept under, once it says.
     id: Mutex<Option<String>>,
+    /// For a leg: which matrix it is a leg of, and its name.
+    leg: Mutex<Option<Leg>>,
+    /// The leg was given the room its matrix's other legs were measured
+    /// at, never having been measured itself.
+    sized_by_matrix: AtomicBool,
+    /// The job's place in the run's pool, held until its measurements are
+    /// kept.
+    slot: Mutex<Option<tokio::sync::OwnedSemaphorePermit>>,
 }
 
 impl JobMeter {
@@ -148,6 +170,13 @@ impl JobMeter {
         }
     }
 
+    /// A container of this job was killed, told to no job beside it, so
+    /// tests running at the same time aren't killed with it.
+    #[cfg(test)]
+    pub(crate) fn killed_alone(&self) {
+        self.killed.store(true, Ordering::Relaxed);
+    }
+
     #[cfg(test)]
     pub(crate) fn is_incomplete(&self) -> bool {
         self.incomplete.load(Ordering::Relaxed)
@@ -164,7 +193,15 @@ impl JobMeter {
     }
 }
 
-#[derive(Debug, PartialEq)]
+/// A matrix leg, as its meter knows it.
+struct Leg {
+    /// What the legs of its matrix share measurements under.
+    family: String,
+    /// The leg's name, for what the run reports about it.
+    name: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
 enum Outcome {
     Peak(u64),
     Killed,
@@ -212,16 +249,53 @@ pub(crate) async fn metered<F: std::future::Future>(
     succeeded: impl FnOnce(&F::Output) -> bool,
 ) -> F::Output {
     let meter = Arc::new(JobMeter::default());
+    // Gives the place up even when this future is dropped part way, not
+    // when the last of the meter's holders lets go of it.
+    let release = Release(meter.clone());
     let active = Active::register(&meter);
     let output = METER.scope(meter.clone(), future).await;
     drop(active);
     let id = meter.id.lock().unwrap_or_else(|e| e.into_inner()).take();
+    let leg = meter.leg.lock().unwrap_or_else(|e| e.into_inner()).take();
     if let Some(id) = id.filter(|_| crate::vm_memory::sizes_by_memory()) {
         let passed = succeeded(&output);
+        // A leg its siblings sized that was killed is a failure a run on
+        // GitHub wouldn't have: say why, and that the next run won't.
+        let misjudged =
+            meter.sized_by_matrix.load(Ordering::Relaxed) && meter.outcome() == Outcome::Killed;
+        let measured = meter.clone();
+        let family = leg.as_ref().map(|leg| leg.family.clone());
         // The store is a file under a lock: not for the async runtime.
-        let _ = tokio::task::spawn_blocking(move || record(&id, &meter, passed)).await;
+        let changed =
+            tokio::task::spawn_blocking(move || record(&id, family.as_deref(), &measured, passed))
+                .await
+                .unwrap_or(false);
+        // Before the place is given up: a sibling waiting for the whole VM
+        // must see what this leg measured, not take the place unmeasured.
+        if let (true, Some(leg)) = (changed, &leg) {
+            crate::vm_memory::measurements_changed(&leg.family);
+        }
+        if let (true, Some(leg)) = (misjudged, &leg) {
+            wrkflw_logging::warning(&format!(
+                "Matrix job {} had never been measured, so it ran with the memory the \
+                 other legs of its matrix were measured to use, and a process was killed \
+                 for lack of memory while it ran. From the next run, the legs of this \
+                 matrix not measured yet run alone, each measuring itself.",
+                leg.name
+            ));
+        }
     }
+    drop(release);
     output
+}
+
+/// Gives up the place a job [`hold`]s when dropped.
+struct Release(Arc<JobMeter>);
+
+impl Drop for Release {
+    fn drop(&mut self) {
+        drop(self.0.slot.lock().unwrap_or_else(|e| e.into_inner()).take());
+    }
 }
 
 /// Name the current job's measurements, so [`metered`] keeps them under
@@ -229,6 +303,76 @@ pub(crate) async fn metered<F: std::future::Future>(
 pub(crate) fn measure_as(id: &str) {
     if let Some(meter) = meter() {
         *meter.id.lock().unwrap_or_else(|e| e.into_inner()) = Some(id.to_string());
+    }
+}
+
+/// Take a place in the run's pool for the leg `name` of a matrix, and keep
+/// it until [`metered`] has kept what the leg measured, so a sibling
+/// waiting for that place reads the measurement first.
+///
+/// The leg is sized by its own measurements under `id`, or, never measured,
+/// by those its matrix's legs keep under `family`. The place is returned
+/// only outside a metered job, for the caller to hold.
+pub(crate) async fn leg_place(
+    id: Option<&str>,
+    family: Option<&str>,
+    name: &str,
+) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    // Named first, so the run can say which leg its siblings sized.
+    if let Some(family) = family {
+        in_family(family, name);
+    }
+    let place = crate::vm_memory::job_slot(id, family).await;
+    // Only once it holds a place: a leg still waiting used no memory, so a
+    // kill meanwhile isn't its own.
+    if let Some(id) = id {
+        measure_as(id);
+    }
+    hold(place)
+}
+
+/// Say the current job is the leg `name` of the matrix `family`, so what it
+/// measures also sizes legs of that matrix never measured themselves.
+fn in_family(family: &str, name: &str) {
+    if let Some(meter) = meter() {
+        *meter.leg.lock().unwrap_or_else(|e| e.into_inner()) = Some(Leg {
+            family: family.to_string(),
+            name: name.to_string(),
+        });
+    }
+}
+
+/// The current leg, never measured itself, was given `bytes`, what the
+/// other legs of its matrix were measured to use. Said in the run's log,
+/// and again if the leg is killed for it.
+pub(crate) fn sized_by_matrix(bytes: u64) {
+    let Some(meter) = meter() else {
+        return;
+    };
+    meter.sized_by_matrix.store(true, Ordering::Relaxed);
+    let leg = meter.leg.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(leg) = leg.as_ref() {
+        wrkflw_logging::info(&format!(
+            "Matrix job {} hasn't been measured yet; it sets aside {} MiB, as the other \
+             legs of its matrix were measured to need",
+            leg.name,
+            bytes / MIB
+        ));
+    }
+}
+
+/// Keep the current job's place in the run's pool until [`metered`] has
+/// kept its measurements, so a job waiting for that place reads them
+/// first. Outside a metered job the place is handed back to hold.
+fn hold(
+    slot: Option<tokio::sync::OwnedSemaphorePermit>,
+) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    match meter() {
+        Some(meter) => {
+            *meter.slot.lock().unwrap_or_else(|e| e.into_inner()) = slot;
+            None
+        }
+        None => slot,
     }
 }
 
@@ -259,12 +403,20 @@ pub(crate) fn job_id(identity: &str) -> String {
 /// floor under it: runs with warm caches can measure far less than the
 /// cold build a changed dependency brings back, and three of them in a row
 /// would otherwise let that build run beside others it no longer fits with.
+///
+/// The floor gets a smaller margin than recent runs do. Theirs is for what
+/// the job may do next; the floor's is only for a spike sampling missed,
+/// and the full headroom on a cold peak kept light jobs from running
+/// together.
 fn reserve_for(peaks: &[u64], highest: u64) -> Option<u64> {
     let peak = peaks.iter().copied().max()?;
     Some(
         peak.saturating_add(peak / 2)
-            .max(highest)
             .saturating_add(HEADROOM_BYTES)
+            .max(
+                highest
+                    .saturating_add((highest / FLOOR_MARGIN_DIVISOR).max(FLOOR_MIN_MARGIN_BYTES)),
+            )
             .max(MIN_RESERVED_BYTES),
     )
 }
@@ -300,6 +452,18 @@ struct Measured {
     /// or since it last ran out of memory, which forgets it all.
     #[serde(default)]
     highest: u64,
+    /// For a matrix: a process was killed for lack of memory while a leg
+    /// ran on what its siblings were measured at, so what one leg needs
+    /// doesn't say what the others do. Its legs never measured run alone,
+    /// each measuring itself, and no peak is kept for the matrix again.
+    ///
+    /// The mark is not lifted while the matrix runs: lifted, a light leg
+    /// would size the heavy legs again and get them killed every few runs.
+    /// A kill while no leg ran on its siblings' measurement doesn't set it,
+    /// since a leg given its own room, or running alone, that ran out of
+    /// memory says nothing about its siblings.
+    #[serde(default)]
+    uneven: bool,
     /// When the last of them was taken, in seconds since the epoch.
     at: i64,
 }
@@ -326,7 +490,26 @@ fn lock_file(path: &std::path::Path, exclusive: bool) -> Option<std::fs::File> {
     locked.ok().map(|()| file)
 }
 
+/// A store of the test process's own, so tests that keep measurements
+/// never touch the user's, and need no env var set while threads run.
+#[cfg(test)]
+static TEST_STORE: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+
+/// Keep this test process's measurements in a temporary store. Tests that
+/// share it keep under ids of their own.
+#[cfg(test)]
+pub(crate) fn use_test_store() {
+    TEST_STORE.get_or_init(|| {
+        let dir = tempfile::tempdir().ok()?.keep();
+        Some(dir.join("job-memory.json"))
+    });
+}
+
 fn store_path() -> Option<PathBuf> {
+    #[cfg(test)]
+    if let Some(path) = TEST_STORE.get() {
+        return path.clone();
+    }
     match std::env::var_os(JOB_MEMORY_FILE_ENV) {
         Some(path) if path.is_empty() => None,
         Some(path) => Some(PathBuf::from(path)),
@@ -342,24 +525,95 @@ fn load(path: &std::path::Path) -> Store {
         .unwrap_or_default()
 }
 
-/// The room to set aside for the job `id`, if it was measured before.
-pub(crate) fn reserve(id: &str) -> Option<u64> {
+/// The room to set aside for the job `id`, if it was measured before. A leg
+/// never measured takes what the legs of its matrix `family` were: they run
+/// the same steps, so the first leg of a new matrix runs alone and the
+/// rest share the VM by what it used.
+pub(crate) fn reserve(id: &str, family: Option<&str>) -> Option<Reserve> {
     let path = store_path()?;
     let _guard = STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _file = lock_file(&path, false);
-    let store = load(&path);
-    let measured = store.jobs.get(id)?;
-    reserve_for(&measured.peaks, measured.highest)
+    reserve_in(&load(&path), id, family)
 }
 
-/// Keep what `meter` saw of the job `id`, which ran to its end and
-/// `passed` or not.
-fn record(id: &str, meter: &JobMeter, passed: bool) {
+/// The room set aside for a job, and whose measurement says so.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Reserve {
+    pub(crate) bytes: u64,
+    /// What the other legs of its matrix were measured at: the job, a
+    /// leg, was never measured itself.
+    pub(crate) by_matrix: bool,
+}
+
+fn reserve_in(store: &Store, id: &str, family: Option<&str>) -> Option<Reserve> {
+    let (measured, by_matrix) = match store.jobs.get(id) {
+        Some(own) => (own, false),
+        None => (
+            store.jobs.get(family?).filter(|matrix| !matrix.uneven)?,
+            true,
+        ),
+    };
+    let bytes = reserve_for(&measured.peaks, measured.highest)?;
+    Some(Reserve { bytes, by_matrix })
+}
+
+/// Keep `outcome` for the job `id`, and for its matrix `family` what says
+/// something about every leg. `sized_by_matrix` says the leg ran on what
+/// its siblings were measured at. `false` when nothing changed.
+///
+/// What the matrix keeps of a leg's outcome:
+/// - a peak, which sizes legs never measured;
+/// - a kill of a leg sized by its siblings, which marks the matrix
+///   [`Measured::uneven`]. Forgetting it instead would let the first leg to
+///   pass measure it again, and if that leg is a light one, the heavy legs
+///   it sizes would start together and be killed on every run;
+/// - nothing of a kill of a leg on its own measurement or running alone,
+///   which needed more than it was given, nor of a leg that couldn't be
+///   measured.
+fn keep(
+    store: &mut Store,
+    id: &str,
+    family: Option<&str>,
+    outcome: Outcome,
+    sized_by_matrix: bool,
+    now: i64,
+) -> bool {
+    let mut changed = false;
+    if let Some(family) = family {
+        match outcome {
+            Outcome::Peak(_) => {
+                apply(store, family, outcome, now);
+                changed = true;
+            }
+            Outcome::Killed if sized_by_matrix => {
+                let matrix = Measured {
+                    uneven: true,
+                    at: now,
+                    ..Measured::default()
+                };
+                store.jobs.insert(family.to_string(), matrix);
+                changed = true;
+            }
+            Outcome::Killed | Outcome::Unknown => {}
+        }
+    }
+    // A job never measured that has nothing to keep has nothing to forget.
+    if matches!(outcome, Outcome::Peak(_)) || store.jobs.contains_key(id) {
+        apply(store, id, outcome, now);
+        changed = true;
+    }
+    changed
+}
+
+/// Keep what `meter` saw of the job `id`, a leg of the matrix `family` if
+/// any, which ran to its end and `passed` or not. `true` when the store
+/// was changed.
+fn record(id: &str, family: Option<&str>, meter: &JobMeter, passed: bool) -> bool {
     let Some(path) = store_path() else {
-        return;
+        return false;
     };
     let Some(outcome) = to_keep(meter.outcome(), passed) else {
-        return;
+        return false;
     };
     let _guard = STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // Held from load to write, so another process's update isn't lost,
@@ -369,14 +623,19 @@ fn record(id: &str, meter: &JobMeter, passed: bool) {
             "Could not lock {}, so this job's memory isn't kept",
             path.display()
         ));
-        return;
+        return false;
     };
     let mut store = load(&path);
-    if !matches!(outcome, Outcome::Peak(_)) && !store.jobs.contains_key(id) {
-        // Nothing to forget.
-        return;
+    if !keep(
+        &mut store,
+        id,
+        family,
+        outcome,
+        meter.sized_by_matrix.load(Ordering::Relaxed),
+        chrono::Utc::now().timestamp(),
+    ) {
+        return false;
     }
-    apply(&mut store, id, outcome, chrono::Utc::now().timestamp());
     let written = (|| -> std::io::Result<()> {
         let dir = path.parent().unwrap_or(std::path::Path::new("."));
         std::fs::create_dir_all(dir)?;
@@ -385,13 +644,14 @@ fn record(id: &str, meter: &JobMeter, passed: bool) {
         temp.persist(&path).map_err(|e| e.error)?;
         Ok(())
     })();
-    if let Err(e) = written {
+    if let Err(e) = &written {
         wrkflw_logging::debug(&format!(
             "Could not keep job memory in {}: {}",
             path.display(),
             e
         ));
     }
+    written.is_ok()
 }
 
 /// What to keep of a finished job's `outcome`. A failed job may have
@@ -407,10 +667,14 @@ fn apply(store: &mut Store, id: &str, outcome: Outcome, now: i64) {
     match outcome {
         Outcome::Peak(bytes) => {
             let measured = store.jobs.entry(id.to_string()).or_default();
-            measured.peaks.push(bytes);
-            measured.highest = measured.highest.max(bytes);
-            let excess = measured.peaks.len().saturating_sub(RUNS_KEPT);
-            measured.peaks.drain(..excess);
+            // An uneven matrix is still run, so not forgotten, but its
+            // legs' peaks size no leg.
+            if !measured.uneven {
+                measured.peaks.push(bytes);
+                measured.highest = measured.highest.max(bytes);
+                let excess = measured.peaks.len().saturating_sub(RUNS_KEPT);
+                measured.peaks.drain(..excess);
+            }
             measured.at = now;
         }
         // What was measured no longer says what the job needs.
@@ -426,6 +690,11 @@ fn apply(store: &mut Store, id: &str, outcome: Outcome, now: i64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The room set aside for `id`, whoever was measured for it.
+    fn room(store: &Store, id: &str, family: Option<&str>) -> Option<u64> {
+        reserve_in(store, id, family).map(|reserve| reserve.bytes)
+    }
 
     #[test]
     fn a_job_gets_its_peak_with_headroom_and_never_less_than_the_floor() {
@@ -451,12 +720,137 @@ mod tests {
         assert_eq!(measured.peaks, vec![600 * MIB; 3]);
         assert_eq!(
             reserve_for(&measured.peaks, measured.highest),
-            Some(4096 * MIB + HEADROOM_BYTES)
+            Some(4096 * MIB + 512 * MIB),
+            "the floor is the cold peak and an eighth, not the full headroom"
+        );
+        // A floor the recent runs are close to doesn't replace their room.
+        assert_eq!(
+            reserve_for(&[600 * MIB], 700 * MIB),
+            Some(900 * MIB + HEADROOM_BYTES)
         );
         // Running out of memory forgets it all, the floor too.
         apply(&mut store, "job", Outcome::Killed, 1000);
         apply(&mut store, "job", Outcome::Peak(600 * MIB), 1000);
         assert_eq!(store.jobs["job"].highest, 600 * MIB);
+    }
+
+    #[test]
+    fn a_small_jobs_floor_keeps_a_margin_a_spike_could_need() {
+        // An eighth of 600 MiB is 75 MiB, less than a second's spike.
+        assert_eq!(
+            reserve_for(&[300 * MIB], 600 * MIB),
+            Some(600 * MIB + FLOOR_MIN_MARGIN_BYTES)
+        );
+        assert_eq!(
+            reserve_for(&[100 * MIB], 1024 * MIB),
+            Some(1024 * MIB + FLOOR_MIN_MARGIN_BYTES)
+        );
+        // From 1 GiB up an eighth is the larger.
+        assert_eq!(
+            reserve_for(&[100 * MIB], 2048 * MIB),
+            Some(2048 * MIB + 256 * MIB)
+        );
+    }
+
+    /// Keep `outcome` for the leg `id` of the matrix `legs`, which ran on its
+    /// own measurement or alone.
+    fn leg(store: &mut Store, id: &str, outcome: Outcome) -> bool {
+        keep(store, id, Some("legs"), outcome, false, 1000)
+    }
+
+    /// Keep `outcome` for the leg `id` of the matrix `legs`, which ran on
+    /// what its siblings were measured at.
+    fn sized_leg(store: &mut Store, id: &str, outcome: Outcome) -> bool {
+        keep(store, id, Some("legs"), outcome, true, 1000)
+    }
+
+    #[test]
+    fn an_unmeasured_leg_takes_what_the_legs_of_its_matrix_were_measured_at() {
+        let mut store = Store::default();
+        assert_eq!(room(&store, "3.13", Some("legs")), None);
+        // The first leg of a new matrix ran alone.
+        assert!(leg(&mut store, "3.12", Outcome::Peak(600 * MIB)));
+        let sibling = room(&store, "3.13", Some("legs"));
+        assert_eq!(sibling, Some(900 * MIB + HEADROOM_BYTES));
+        assert_eq!(room(&store, "3.13", None), None, "not a leg");
+        // A heavier leg raises what a new leg gets; a leg's own
+        // measurement, once it has one, wins.
+        assert!(leg(&mut store, "pypy", Outcome::Peak(1000 * MIB)));
+        assert!(sized_leg(&mut store, "3.13", Outcome::Peak(300 * MIB)));
+        assert_eq!(
+            room(&store, "3.14", Some("legs")),
+            Some(1500 * MIB + HEADROOM_BYTES)
+        );
+        assert_eq!(
+            room(&store, "3.13", Some("legs")),
+            Some(450 * MIB + HEADROOM_BYTES)
+        );
+        // Which of the two it was is said, so a kill it causes can be.
+        assert!(reserve_in(&store, "3.14", Some("legs")).unwrap().by_matrix);
+        assert!(!reserve_in(&store, "3.13", Some("legs")).unwrap().by_matrix);
+        // A leg that couldn't be measured says nothing about the others,
+        // and forgets its own measurement: next time its siblings' size it.
+        assert!(leg(&mut store, "3.13", Outcome::Unknown));
+        assert_eq!(
+            reserve_in(&store, "3.13", Some("legs")),
+            Some(Reserve {
+                bytes: 1500 * MIB + HEADROOM_BYTES,
+                by_matrix: true
+            })
+        );
+        assert!(!leg(&mut store, "3.13", Outcome::Unknown));
+        // One its siblings sized that ran out of memory leaves the matrix's
+        // measurement sizing no leg.
+        assert!(sized_leg(&mut store, "3.15", Outcome::Killed));
+        assert!(store.jobs["legs"].uneven);
+        assert_eq!(room(&store, "3.14", Some("legs")), None);
+    }
+
+    #[test]
+    fn a_leg_killed_on_its_own_room_or_alone_leaves_its_matrix_alone() {
+        let mut store = Store::default();
+        leg(&mut store, "lint", Outcome::Peak(300 * MIB));
+        leg(&mut store, "build", Outcome::Peak(300 * MIB));
+        // A kill elsewhere in the VM while the leg ran on its own
+        // measurement forgets that measurement, and says nothing of how
+        // alike the legs are.
+        assert!(leg(&mut store, "build", Outcome::Killed));
+        assert!(!store.jobs.contains_key("build"));
+        assert!(!store.jobs["legs"].uneven);
+        assert!(room(&store, "new", Some("legs")).is_some());
+        // Nor does the first leg of a new matrix, killed running alone:
+        // there is nothing to keep.
+        let mut fresh = Store::default();
+        assert!(!leg(&mut fresh, "a", Outcome::Killed));
+        assert!(fresh.jobs.is_empty());
+    }
+
+    #[test]
+    fn a_light_first_leg_never_again_sizes_heavy_legs_that_were_killed() {
+        let mut store = Store::default();
+        // The light leg ran alone and sized the rest, which ran together
+        // and were killed.
+        leg(&mut store, "lint", Outcome::Peak(300 * MIB));
+        assert!(room(&store, "build", Some("legs")).is_some());
+        sized_leg(&mut store, "build", Outcome::Killed);
+        sized_leg(&mut store, "test", Outcome::Killed);
+        // The next run: the light leg passes first, as it did before. Its
+        // peak sizes the heavy legs no longer, so they run alone, each
+        // measuring itself, as before any matrix was measured.
+        leg(&mut store, "lint", Outcome::Peak(300 * MIB));
+        assert_eq!(room(&store, "build", Some("legs")), None);
+        assert_eq!(room(&store, "test", Some("legs")), None);
+        leg(&mut store, "build", Outcome::Peak(5000 * MIB));
+        assert_eq!(room(&store, "new", Some("legs")), None);
+        assert!(room(&store, "build", Some("legs")).is_some());
+        // The mark lasts as long as the matrix runs, and goes with it.
+        apply(
+            &mut store,
+            "other",
+            Outcome::Peak(MIB),
+            1000 + FORGET_AFTER_SECS,
+        );
+        assert!(!store.jobs.contains_key("legs"));
     }
 
     #[test]

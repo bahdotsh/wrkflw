@@ -37,9 +37,10 @@ fn ran_nothing(code: Option<i32>) -> bool {
     matches!(code, Some(SKIPPED_EXIT | NOTHING_CHECKED_EXIT))
 }
 
-/// What the child exits with when it passed, but some job ran as another OS
-/// than `runs-on` asked for. A pass, but `partial`, as in JSON mode, where
-/// the verdict comes from `run_finished` instead.
+/// What the child exits with when it passed, but part of it could not be
+/// checked here: a job ran as another OS than `runs-on` asked for, or a step
+/// passed without running its action. A pass, but `partial`, as in JSON
+/// mode, where the verdict comes from `run_finished` instead.
 const PARTIAL_EXIT: i32 = 80;
 
 /// Whether a child's exit code says it passed, fully or not.
@@ -57,6 +58,9 @@ pub(crate) struct GateCtx {
     pub(crate) runtime: RuntimeChoice,
     pub(crate) remote_cache: Option<String>,
     pub(crate) install_hook: bool,
+    /// Global flags such as `--platform`, passed on to each run and kept
+    /// by the hook.
+    pub(crate) child_args: Vec<String>,
     pub(crate) format: OutputFormat,
 }
 
@@ -69,7 +73,8 @@ fn shell_quote(value: &str) -> String {
 ///
 /// It runs this binary if it's still there and `wrkflw` from `PATH` if not,
 /// as GUI git clients often run hooks with a shorter `PATH` than a terminal.
-/// It keeps the `--runtime` and `--remote-cache` given at install time.
+/// It keeps the `--runtime`, `--remote-cache` and `--platform` given at
+/// install time.
 ///
 /// It checks the working tree, not the commits being pushed: uncommitted
 /// edits and untracked files are part of what it runs. `gate` warns when the
@@ -80,13 +85,22 @@ fn shell_quote(value: &str) -> String {
 /// remote already has, so it's the base for `--affected`. A new branch has
 /// none and falls back to the usual detection. A push that only deletes refs
 /// has nothing to check.
-fn hook_script(program: &Path, runtime: &str, remote_cache: Option<&str>) -> String {
+fn hook_script(
+    program: &Path,
+    runtime: &str,
+    remote_cache: Option<&str>,
+    child_args: &[String],
+) -> String {
     let mut gate = format!("set -- gate --runtime {}\n", shell_quote(runtime));
     if let Some(remote) = remote_cache {
         gate.push_str(&format!(
             "set -- \"$@\" --remote-cache {}\n",
             shell_quote(remote)
         ));
+    }
+    if !child_args.is_empty() {
+        let words: Vec<String> = child_args.iter().map(|arg| shell_quote(arg)).collect();
+        gate.push_str(&format!("set -- \"$@\" {}\n", words.join(" ")));
     }
     format!(
         r#"#!/bin/sh
@@ -365,6 +379,7 @@ fn run_args(ctx: &GateCtx, file: &Path, event: &Event) -> Vec<String> {
     if let Some(remote) = &ctx.remote_cache {
         args.extend(["--remote-cache".to_string(), remote.clone()]);
     }
+    args.extend(ctx.child_args.iter().cloned());
     args
 }
 
@@ -408,8 +423,9 @@ fn workflow_report(file: &Path, code: Option<i32>, stdout: &str) -> Value {
 
 /// The gate's verdict, as a run's: `failed` when a workflow failed or
 /// couldn't run, `nothing_checked` when no job ran anywhere, `partial` when
-/// it passed but some job ran as another OS than `runs-on` asked for, and
-/// `verified` otherwise.
+/// it passed but part of it could not be checked here (a job ran as another
+/// OS than `runs-on` asked for, or a step passed without running its action),
+/// and `verified` otherwise.
 fn gate_verdict(workflows: &[Value], failed: usize, unverified: usize) -> &'static str {
     let checked = workflows
         .iter()
@@ -586,7 +602,12 @@ pub(crate) fn run(ctx: GateCtx) {
             .fail(&format!("cannot find this executable: {}", e))
     });
     if ctx.install_hook {
-        let script = hook_script(&program, ctx.runtime.as_flag(), ctx.remote_cache.as_deref());
+        let script = hook_script(
+            &program,
+            ctx.runtime.as_flag(),
+            ctx.remote_cache.as_deref(),
+            &ctx.child_args,
+        );
         let installed = hook_path().and_then(|path| {
             install_hook_at(&path, &script)?;
             Ok(path)
@@ -661,8 +682,8 @@ pub(crate) fn run(ctx: GateCtx) {
             "{}",
             cli_style::warning(&format!(
                 "gate passed, partially verified: {} workflow(s) ran, {} skipped. Some jobs \
-                 ran as another OS than runs-on asked for, so their OS-specific steps were \
-                 not checked",
+                 ran as another OS than runs-on asked for, or passed a step whose action \
+                 wrkflw can't run, so the pass doesn't stand for GitHub's",
                 report["ran"], report["skipped"]
             ))
         );
@@ -832,15 +853,45 @@ mod tests {
             runtime: RuntimeChoice::Auto,
             remote_cache: None,
             install_hook: false,
+            child_args: Vec::new(),
             format: OutputFormat::Text,
         }
+    }
+
+    #[test]
+    fn global_flags_reach_each_run_and_the_hook() {
+        let ctx = GateCtx {
+            child_args: vec![
+                "--platform".to_string(),
+                "ubuntu-latest=my/runner:1".to_string(),
+                "--fresh-workspace".to_string(),
+            ],
+            ..ctx()
+        };
+        let event = Event {
+            name: "push".to_string(),
+            base_branch: None,
+        };
+        let args = run_args(&ctx, Path::new("ci.yml"), &event);
+        assert!(args
+            .windows(2)
+            .any(|w| w == ["--platform", "ubuntu-latest=my/runner:1"]));
+        assert!(args.iter().any(|a| a == "--fresh-workspace"));
+        let script = hook_script(Path::new("/w"), "docker", None, &ctx.child_args);
+        assert!(
+            script.contains(
+                "set -- \"$@\" '--platform' 'ubuntu-latest=my/runner:1' '--fresh-workspace'"
+            ),
+            "{script}"
+        );
+        assert!(!hook_script(Path::new("/w"), "docker", None, &[]).contains("--platform"));
     }
 
     #[test]
     fn the_hook_installs_and_reinstalls() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("hooks/pre-push");
-        let script = hook_script(Path::new("/opt/wrkflw"), "auto", None);
+        let script = hook_script(Path::new("/opt/wrkflw"), "auto", None, &[]);
         install_hook_at(&path, &script).unwrap();
         assert!(std::fs::read_to_string(&path)
             .unwrap()
@@ -850,17 +901,17 @@ mod tests {
 
     #[test]
     fn the_hook_names_this_binary_and_quotes_it() {
-        let script = hook_script(Path::new("/opt/it's here/wrkflw"), "auto", None);
+        let script = hook_script(Path::new("/opt/it's here/wrkflw"), "auto", None, &[]);
         assert!(script.contains(r#"wrkflw='/opt/it'\''s here/wrkflw'"#));
         assert!(script.contains("exec \"$wrkflw\" \"$@\""));
     }
 
     #[test]
     fn the_hook_keeps_the_runtime_and_remote_it_was_installed_with() {
-        let script = hook_script(Path::new("/w"), "podman", Some("https://c/x y"));
+        let script = hook_script(Path::new("/w"), "podman", Some("https://c/x y"), &[]);
         assert!(script.contains("set -- gate --runtime 'podman'"));
         assert!(script.contains("--remote-cache 'https://c/x y'"));
-        let plain = hook_script(Path::new("/w"), "auto", None);
+        let plain = hook_script(Path::new("/w"), "auto", None, &[]);
         assert!(!plain.contains("--remote-cache"));
     }
 
@@ -890,7 +941,7 @@ mod tests {
         std::fs::write(&fake, "#!/bin/sh\necho \"$@\"\n").unwrap();
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
         let hook = dir.path().join("hook");
-        std::fs::write(&hook, hook_script(&fake, "docker", None)).unwrap();
+        std::fs::write(&hook, hook_script(&fake, "docker", None, &[])).unwrap();
         let mut child = Command::new("sh")
             .arg(&hook)
             .current_dir(dir.path())
@@ -959,7 +1010,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("pre-push");
         std::fs::write(&path, "#!/bin/sh\nmake lint\n").unwrap();
-        let script = hook_script(Path::new("/opt/wrkflw"), "auto", None);
+        let script = hook_script(Path::new("/opt/wrkflw"), "auto", None, &[]);
         assert!(install_hook_at(&path, &script).is_err());
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),

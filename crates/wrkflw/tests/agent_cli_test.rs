@@ -593,6 +593,7 @@ fn plan_names_the_legs_that_would_run_as_another_os() {
     assert_eq!(
         plan["unverified"],
         json!([{
+            "kind": "runner",
             "job": "build (os: windows-latest)",
             "requested": "windows-latest",
             "ran_as": "Linux",
@@ -1226,4 +1227,188 @@ fn clean_reports_its_json_type_and_exits_1_when_a_workspace_stays() {
     } else {
         fs::set_permissions(stuck.join("ro"), fs::Permissions::from_mode(0o755)).unwrap();
     }
+}
+
+const REFS: &str = r#"
+name: refs
+on:
+  push:
+    branches: ['release/**']
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: refs
+        run: |
+          echo "event=$GITHUB_EVENT_NAME ref=$GITHUB_REF head=$GITHUB_HEAD_REF base=$GITHUB_BASE_REF"
+          test "$GITHUB_EVENT_NAME" = "${{ github.event_name }}"
+          case "$GITHUB_EVENT_NAME" in
+            push)
+              if [ "$GITHUB_REF_TYPE" = tag ]; then
+                test "$GITHUB_REF" = refs/tags/v1.0
+                test "${{ github.ref_name }}" = v1.0
+              else
+                test "$GITHUB_REF" = refs/heads/release/2.0
+                test "${{ github.ref_name }}" = release/2.0
+              fi
+              test -z "$GITHUB_HEAD_REF" ;;
+            pull_request)
+              test "$GITHUB_HEAD_REF" = feat
+              test "$GITHUB_BASE_REF" = main ;;
+            *) exit 1 ;;
+          esac
+"#;
+
+#[test]
+fn branch_and_event_reach_filters_and_steps_on_a_detached_head() {
+    let sandbox = Sandbox::new();
+    sandbox.write("refs.yml", REFS);
+    Command::new("git")
+        .args(["checkout", "-q", "--detach"])
+        .current_dir(sandbox.repo.path())
+        .output()
+        .unwrap();
+    let finished = |args: &[&str]| -> Value {
+        let mut all = vec!["--format", "json", "run", "--runtime", "emulation"];
+        all.extend_from_slice(args);
+        all.push(".github/workflows/refs.yml");
+        let output = sandbox.run(&all);
+        json_lines(&output)
+            .into_iter()
+            .rev()
+            .find(|line| line["type"] == "run_finished")
+            .unwrap_or_else(|| panic!("no run_finished: {}", stdout(&output)))
+    };
+
+    // A detached HEAD has no branch for `branches:` to match.
+    let detached = finished(&["--event", "push"]);
+    assert_eq!(detached["status"], "skipped", "{detached}");
+
+    let push = finished(&["--event", "push", "--branch", "release/2.0"]);
+    assert_eq!(push["status"], "success", "{push}");
+    // The step checks the branch it was given, so another one fails it.
+    let other = finished(&["--event", "push", "--branch", "release/3.0"]);
+    assert_eq!(other["status"], "failure", "{other}");
+
+    // A tag push matches `tags:` and is a tag to its steps.
+    let tag = finished(&["--event", "push", "--tag", "v1.0"]);
+    assert_eq!(tag["status"], "success", "{tag}");
+    let not_matched = finished(&["--event", "push", "--tag", "nightly"]);
+    assert_eq!(not_matched["status"], "skipped", "{not_matched}");
+
+    let pull_request = finished(&[
+        "--event",
+        "pull_request",
+        "--activity-type",
+        "opened",
+        "--branch",
+        "feat",
+        "--base-branch",
+        "main",
+    ]);
+    assert_eq!(pull_request["status"], "success", "{pull_request}");
+}
+
+/// A step whose action wrkflw doesn't run passes, but the run says so: the
+/// verdict is `partial`, `unverified` names the step and the action, and the
+/// job's `job_finished` and `run_finished` entries list it. Under emulation a
+/// setup action installs nothing, so it is one.
+#[test]
+fn a_step_whose_action_did_not_run_makes_a_pass_partial() {
+    let sandbox = Sandbox::new();
+    sandbox.write(
+        "setup.yml",
+        "name: setup\non: [push]\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      \
+         - name: Set up Node\n        uses: actions/setup-node@v4\n      - run: echo ok\n",
+    );
+    let output = sandbox.run(&[
+        "--format",
+        "json",
+        "run",
+        "--runtime",
+        "emulation",
+        ".github/workflows/setup.yml",
+    ]);
+    let lines = json_lines(&output);
+    let finished = lines
+        .iter()
+        .find(|line| line["type"] == "run_finished")
+        .unwrap_or_else(|| panic!("no run_finished: {}", stdout(&output)));
+    assert_eq!(finished["status"], "success", "{finished}");
+    assert_eq!(finished["verdict"], "partial", "{finished}");
+    let not_run: Vec<&Value> = finished["unverified"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|entry| entry.get("step").is_some())
+        .collect();
+    assert_eq!(not_run.len(), 1, "{finished}");
+    assert_eq!(not_run[0]["job"], "a");
+    assert_eq!(not_run[0]["step"], "Set up Node");
+    assert_eq!(not_run[0]["uses"], "actions/setup-node@v4");
+    assert_eq!(
+        finished["jobs"][0]["actions_not_run"][0]["uses"],
+        "actions/setup-node@v4"
+    );
+    let job_finished = lines
+        .iter()
+        .find(|line| line["type"] == "job_finished")
+        .unwrap();
+    assert_eq!(
+        job_finished["actions_not_run"][0]["step"], "Set up Node",
+        "{job_finished}"
+    );
+}
+
+/// A local JavaScript action can't run here, so its step passes but is
+/// listed under `unverified`, as a remote one is. A local composite action
+/// runs step by step and isn't.
+#[test]
+fn a_local_javascript_action_is_reported_as_not_run() {
+    let sandbox = Sandbox::new();
+    let actions = sandbox.repo.path().join(".github/actions");
+    fs::create_dir_all(actions.join("js")).unwrap();
+    fs::write(
+        actions.join("js/action.yml"),
+        "name: js\nruns:\n  using: node20\n  main: index.js\n",
+    )
+    .unwrap();
+    fs::create_dir_all(actions.join("composite")).unwrap();
+    fs::write(
+        actions.join("composite/action.yml"),
+        "name: composite\nruns:\n  using: composite\n  steps:\n    - run: echo inside\n      shell: bash\n",
+    )
+    .unwrap();
+    sandbox.write(
+        "local.yml",
+        "name: local\non: [push]\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      \
+         - name: JS\n        uses: ./.github/actions/js\n      \
+         - name: Composite\n        uses: ./.github/actions/composite\n",
+    );
+    let output = sandbox.run(&[
+        "--format",
+        "json",
+        "run",
+        "--runtime",
+        "emulation",
+        ".github/workflows/local.yml",
+    ]);
+    let finished = json_lines(&output)
+        .into_iter()
+        .find(|line| line["type"] == "run_finished")
+        .unwrap_or_else(|| panic!("no run_finished: {}", stdout(&output)));
+    assert_eq!(finished["status"], "success", "{finished}");
+    assert_eq!(finished["verdict"], "partial", "{finished}");
+    let steps: Vec<&Value> = finished["unverified"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|entry| entry.get("step").is_some())
+        .collect();
+    assert_eq!(steps.len(), 1, "{finished}");
+    assert_eq!(steps[0]["step"], "JS");
+    assert_eq!(steps[0]["uses"], "./.github/actions/js");
 }

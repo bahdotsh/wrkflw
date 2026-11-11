@@ -1,7 +1,7 @@
 # Codebase Index: wrkflw
 
-> Generated: 2026-11-04 18:23:15 UTC | Files: 244 | Lines: 108476
-> Languages: JSON (4), Markdown (27), Rust (151), Shell (5), TOML (19), YAML (38)
+> Generated: 2026-11-11 10:03:40 UTC | Files: 260 | Lines: 115230
+> Languages: JSON (4), Markdown (26), Rust (167), Shell (6), TOML (19), YAML (38)
 
 ## Directory Structure
 
@@ -13,7 +13,6 @@ wrkflw/
   Cargo.toml
   INDEX.md
   README.md
-  RELEASE_POST.md
   cliff.toml
   crates/
     README.md
@@ -32,27 +31,38 @@ wrkflw/
           store.rs
           tree.rs
         acceleration.rs
+        action_fidelity.rs
         action_resolver.rs
         artifacts.rs
         cache.rs
+        checkout_sync.rs
         container_guard.rs
         dependency.rs
         docker.rs
         docker_test.rs
-        engine.rs
         environment.rs
         events.rs
         expression.rs
         github_env_files.rs
+        job_memory.rs
         job_session.rs
         kubernetes/
           manifest.rs
           mod.rs
           sync.rs
         lib.rs
+        live_step.rs
+        log_redaction.rs
+        matrix_fold.rs
         podman.rs
+        run_options.rs
+        runner_fidelity.rs
+        setup_actions.rs
         substitution.rs
+        vm_memory.rs
+        vm_workspace.rs
         workflow_commands.rs
+        workspace.rs
     github/
       Cargo.toml
       README.md
@@ -108,6 +118,7 @@ wrkflw/
         emulation.rs
         emulation_test.rs
         lib.rs
+        live_output.rs
         sandbox.rs
         secure_emulation.rs
     secrets/
@@ -179,6 +190,7 @@ wrkflw/
           job_detail.rs
           logs_tab.rs
           mod.rs
+          run_header.rs
           runs_tab.rs
           secrets_tab.rs
           status_bar.rs
@@ -224,7 +236,9 @@ wrkflw/
       README.md
       src/
         cli_secrets.rs
+        compare_cmd.rs
         gate_cmd.rs
+        git.rs
         json_output.rs
         lib.rs
         main.rs
@@ -242,6 +256,7 @@ wrkflw/
         continue_on_error_test.rs
         dynamic_matrix_test.rs
         gitlab_pipeline_test.rs
+        matrix_fold_test.rs
         needs_failure_propagation_test.rs
         reusable_inputs_outputs_test.rs
         startup_test.rs
@@ -265,6 +280,8 @@ wrkflw/
     gitlab-ci.json
   scripts/
     bump-crate.sh
+    conformance/
+      plan_corpus.sh
   skills/
     wrkflw/
       SKILL.md
@@ -363,7 +380,11 @@ wrkflw/
 - `# Supply changed files explicitly (e.g. from a CI wrapper)`
 - `# Simulate a pull_request — `--base-branch` is required under strict mode`
 - `# Opt out of strict rejection (legacy warn-and-proceed)`
-- `# Check everything a push would run, reusing what already passed`
+- `# Check everything CI would run for this push, reusing what already passed.`
+- `# On a feature branch, a workflow a push doesn't fire is checked as a pull`
+- `# request into the default branch. The result says how much the pass proves:`
+- `# verified, partial (some jobs ran as another OS, or passed a step whose`
+- `# action wrkflw can't run) or nothing_checked.`
 - `# Run it on every push (an existing hook is left alone). The hook keeps the`
 - `# --runtime and --remote-cache given here, and compares against what the`
 - `# remote already has for the pushed branch. It refuses a core.hooksPath`
@@ -384,6 +405,11 @@ wrkflw/
 - `# See what would run, and why a trigger fires, without running anything`
 - `# Every run is recorded`
 - `# Resume a job at a step`
+- `# Run a workflow as a finished GitHub run did, and list where the results differ.`
+- `# Check out the commit that run tested first; a detached HEAD is fine, the`
+- `# run's branch is used.`
+- `# Check a push to another branch than the one checked out, or on a detached HEAD`
+- `# Check a tag push`
 - `# Serve all of this over the Model Context Protocol`
 - `# Pick the cluster and namespace, then run as usual`
 - `# Land on GPU nodes and request an accelerator for every step`
@@ -392,9 +418,6 @@ wrkflw/
 - `# Environment variables (simplest)`
 - `# File-based secrets (JSON, YAML, or .env format)`
 - `# On Linux, put them in ~/.config/wrkflw/secrets/ (read by the `file` provider)`
-
-**RELEASE_POST.md**
-- `# wrkflw v0.8.0 — run GitHub Actions locally, now with a real `${{ ... }}` evaluator`
 
 **cliff.toml**
 - `[changelog]`
@@ -437,6 +460,9 @@ wrkflw/
 - `pub struct Acceleration`
 - `pub fn validate_remote(accel: &Acceleration) -> Result<(), String>`
 
+**crates/executor/src/action_fidelity.rs**
+- `pub struct UnexecutedAction`
+
 **crates/executor/src/action_resolver.rs**
 - `pub enum ActionType`
 - `pub struct ResolvedAction`
@@ -470,19 +496,6 @@ wrkflw/
 - `pub fn get_tracked_containers() -> Vec<String>`
 - `pub fn get_tracked_networks() -> Vec<String>`
 
-**crates/executor/src/engine.rs**
-- `pub async fn execute_workflow( workflow_path: &Path, config: ExecutionConfig, ) -> Result<ExecutionResult, ExecutionError>`
-- `pub fn detect_runtime(runtime_type: RuntimeType) -> RuntimeType`
-- `pub enum RuntimeType`
-- `pub struct ExecutionConfig`
-- `pub fn parse_platform_override(s: &str) -> Result<(String, String), String>`
-- `pub struct ExecutionResult`
-- `pub struct JobResult`
-- `pub enum JobStatus`
-- `pub struct StepResult`
-- `pub enum StepStatus`
-- `pub enum ExecutionError`
-
 **crates/executor/src/environment.rs**
 - `pub fn setup_github_environment_files(workspace_dir: &Path) -> io::Result<()>`
 - `pub fn isolate_github_environment_files( job_env: &mut HashMap<String, String>, ) -> io::Result<tempfile::TempDir>`
@@ -490,7 +503,8 @@ wrkflw/
 - `pub const CONTAINER_GITHUB_DIR: &str = "/github/workflow"`
 - `pub fn apply_github_container_context(env: &mut HashMap<String, String>)`
 - `pub fn apply_gitlab_container_context(env: &mut HashMap<String, String>)`
-- `pub fn create_github_context( workflow: &WorkflowDefinition, workspace_dir: &Path, ) -> HashMap<String, String>`
+- `pub struct RunRef<'a>`
+- `pub fn create_github_context( workflow: &WorkflowDefinition, workspace_dir: &Path, run_ref: &RunRef<'_>, ) -> HashMap<String, String>`
 - `pub fn add_job_context(env: &mut HashMap<String, String>, job_name: &str)`
 - `pub fn add_matrix_context( env: &mut HashMap<String, String>, matrix_combination: &MatrixCombination, )`
 
@@ -510,6 +524,9 @@ wrkflw/
 - `pub fn evaluate(expr: &str, ctx: &ExpressionContext) -> Result<ExprValue, String>`
 - `pub fn evaluate_as_bool(expr: &str, ctx: &ExpressionContext) -> Result<bool, String>`
 - `pub fn strip_expression_wrapper(expr: &str) -> &str`
+- `pub fn contexts_read(expr: &str) -> Option<Vec<String>>`
+- `pub fn text_reads_context(text: &str, context: &str) -> bool`
+- `pub fn evaluate_matrix_text(text: &str, matrix: Option<&HashMap<String, Value>>) -> Option<String>`
 - `pub fn calls_status_function(expr: &str) -> bool`
 
 **crates/executor/src/github_env_files.rs**
@@ -519,6 +536,9 @@ wrkflw/
 - `pub fn read_step_environment_updates(job_env: &HashMap<String, String>) -> StepEnvironmentUpdates`
 - `pub fn apply_step_environment_updates( job_env: &mut HashMap<String, String>, job_user_env: &mut HashMap<String, String>, step_outputs_map: &mut HashMap<String, HashMap<String, String>>, step_id: Option<&str>, )`
 - `pub fn clear_step_files(job_env: &HashMap<String, String>)`
+
+**crates/executor/src/job_memory.rs**
+- `pub const JOB_MEMORY_FILE_ENV: &str = "WRKFLW_JOB_MEMORY_FILE"`
 
 **crates/executor/src/kubernetes/manifest.rs**
 - `pub(super) struct Mount`
@@ -549,14 +569,13 @@ wrkflw/
 - `pub(super) fn stream_dir_into( mut command: std::process::Command, mount: &Mount, ) -> Result<(), ContainerError>`
 - `pub(super) fn unpack_archive<R: io::Read>( reader: R, host: &Path, cancelled: &AtomicBool, ) -> io::Result<HashSet<PathBuf>>`
 - `pub(super) fn prune_to_archive( host: &Path, seen: &HashSet<PathBuf>, keep: &[String], ) -> io::Result<()>`
-- `pub(super) fn safe_relative_path(path: &Path) -> Option<PathBuf>`
-- `pub(super) fn clear_type_conflict( host: &Path, rel: &Path, incoming_is_dir: bool, ) -> io::Result<()>`
 - `pub(super) fn prune_unlisted( host: &Path, rel: &Path, seen: &HashSet<PathBuf>, keep: &[PathBuf], ) -> io::Result<()>`
 - `pub(super) fn copy_dir_out_of_pod( kubectl: &OsStr, kubectl_args: &[String], pod: &str, mount: &Mount, excludes: &[String], cancelled: &AtomicBool, ) -> Result<(), ContainerError>`
 - `pub(super) fn sync_from( mut command: std::process::Command, src: &str, host: &Path, excludes: &[String], prune: bool, cancelled: &AtomicBool, ) -> Result<(), ContainerError>`
 
 **crates/executor/src/lib.rs**
 - `pub mod acceleration`
+- `pub mod action_fidelity`
 - `pub mod action_resolver`
 - `pub mod dependency`
 - `pub mod docker`
@@ -567,7 +586,16 @@ wrkflw/
 - `pub mod github_env_files`
 - `pub mod kubernetes`
 - `pub mod podman`
+- `pub mod run_options`
+- `pub mod runner_fidelity`
 - `pub mod substitution`
+- `pub mod vm_memory`
+- `pub mod workspace`
+- `pub mod setup_errors`
+
+**crates/executor/src/log_redaction.rs**
+- `pub struct RunScope(())`
+- `pub fn begin_run() -> RunScope`
 
 **crates/executor/src/podman.rs**
 - `pub struct PodmanRuntime`
@@ -578,6 +606,21 @@ wrkflw/
 - `pub async fn cleanup_containers() -> Result<(), String>`
 - `pub fn get_tracked_containers() -> Vec<String>`
 
+**crates/executor/src/run_options.rs**
+- `pub const FRESH_WORKSPACE_ENV: &str = "WRKFLW_FRESH_WORKSPACE"`
+- `pub const EVERY_MATRIX_LEG_ENV: &str = "WRKFLW_EVERY_MATRIX_LEG"`
+- `pub fn set_fresh_workspaces(on: bool)`
+- `pub fn fresh_workspaces() -> bool`
+- `pub fn set_every_matrix_leg(on: bool)`
+- `pub fn every_matrix_leg() -> bool`
+- `pub fn switch_is_on(value: &str) -> bool`
+
+**crates/executor/src/runner_fidelity.rs**
+- `pub struct RunnerSubstitution`
+- `pub fn runner_os_for(runtime: RuntimeType, requested: &[&str]) -> String`
+- `pub struct RequestedOs`
+- `pub fn requested_os( job: &Job, matrix: Option<&HashMap<String, Value>>, platform_overrides: &HashMap<String, String>, ) -> Option<RequestedOs>`
+
 **crates/executor/src/substitution.rs**
 - `pub fn preprocess_command(command: &str, matrix_values: &HashMap<String, Value>) -> String`
 - `pub fn process_step_run(run: &str, matrix_combination: &Option<HashMap<String, Value>>) -> String`
@@ -587,9 +630,23 @@ wrkflw/
 - `pub fn preprocess_expressions( text: &str, workspace: &Path, ctx: &crate::expression::ExpressionContext<'_>, ) -> Result<String, String>`
 - `pub fn preprocess_expressions_strict( text: &str, workspace: &Path, ctx: &crate::expression::ExpressionContext<'_>, ) -> Result<String, String>`
 
+**crates/executor/src/vm_memory.rs**
+- `pub const GITHUB_RUNNER_BYTES: u64 = 16 * GIB`
+- `pub const MAX_PARALLEL_JOBS_ENV: &str = "WRKFLW_MAX_PARALLEL_JOBS"`
+- `pub struct Memory`
+- `pub const PROBED_ENV: &str = "WRKFLW_PROBED_MEMORY"`
+- `pub fn probe(cli: &str) -> Option<Memory>`
+
 **crates/executor/src/workflow_commands.rs**
 - `pub enum WorkflowCommand`
 - `pub fn parse_workflow_commands(output: &str) -> Vec<WorkflowCommand>`
+
+**crates/executor/src/workspace.rs**
+- `pub fn remove_interrupted_fresh_workspaces()`
+- `pub const WORKSPACES_DIR_ENV: &str = "WRKFLW_WORKSPACES_DIR"`
+- `pub fn workspaces_root() -> Option<PathBuf>`
+- `pub struct CleanReport`
+- `pub fn clean() -> std::io::Result<CleanReport>`
 
 **crates/github/Cargo.toml**
 - `[package]`
@@ -608,6 +665,11 @@ wrkflw/
 - `pub fn workflow_dispatch_path_segment(name: &str) -> Option<String>`
 - `pub async fn list_workflows(_repo_info: &RepoInfo) -> Result<Vec<String>, GithubError>`
 - `pub async fn trigger_workflow( workflow_name: &str, branch: Option<&str>, inputs: Option<HashMap<String, String>>, ) -> Result<(), GithubError>`
+- `pub struct RemoteJob`
+- `pub struct RemoteRun`
+- `pub struct RunReference`
+- `pub fn parse_run_reference(text: &str) -> Option<RunReference>`
+- `pub async fn fetch_run(reference: &RunReference) -> Result<RemoteRun, GithubError>`
 
 **crates/gitlab/Cargo.toml**
 - `[package]`
@@ -636,6 +698,7 @@ wrkflw/
 **crates/logging/src/lib.rs**
 - `pub mod symbols`
 - `pub fn set_console_to_stderr(enabled: bool)`
+- `pub fn set_redactor(redactor: impl Fn(&str) -> String + Send + Sync + 'static) -> bool`
 - `pub enum LogLevel`
 - `pub fn set_log_level(level: LogLevel)`
 - `pub fn set_quiet_mode(quiet: bool)`
@@ -772,6 +835,7 @@ wrkflw/
 **crates/runs/Cargo.toml**
 - `[package]`
 - `[dependencies]`
+- `[dev-dependencies]`
 - `[target.'cfg(unix)'.dependencies]`
 - `[target.'cfg(windows)'.dependencies]`
 
@@ -780,8 +844,10 @@ wrkflw/
 
 **crates/runs/src/digest.rs**
 - `pub const DEFAULT_TAIL_LINES: usize = 40`
+- `pub fn strip_ansi(line: &str) -> String`
 - `pub struct FailureDigest`
 - `pub struct FailedStep`
+- `pub struct FailureCause`
 - `pub fn failure_digest( store: &RunStore, run: &RunRecord, tail_lines: usize, ) -> Option<FailureDigest>`
 - `pub fn render_digest(digest: &FailureDigest) -> String`
 
@@ -824,6 +890,8 @@ wrkflw/
 - `pub struct RecordedRun`
 - `pub async fn repo_root_of(cwd: &Path) -> String`
 - `pub fn emit_line(value: &Value)`
+- `pub fn verdict(record: &RunRecord) -> &'static str`
+- `pub fn mark_interrupted()`
 - `pub async fn execute_recorded( path: &Path, config: ExecutionConfig, options: RunOptions, ) -> RecordedRun`
 - `pub async fn record_skipped( path: &Path, config: &ExecutionConfig, options: &RunOptions, reason: &str, )`
 
@@ -843,7 +911,7 @@ wrkflw/
 **crates/runtime/src/container.rs**
 - `pub const LOCAL_IMAGE_PREFIX: &str = "wrkflw-"`
 - `pub const COMBINED_IMAGE_PREFIX: &str = "wrkflw-combined:"`
-- `pub trait ContainerRuntime`
+- `pub trait ContainerRuntime: Sync`
 - `pub const PATH_ADDITIONS_ENV: &str = "WRKFLW_PATH_ADDITIONS"`
 - `pub const DEFAULT_CONTAINER_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"`
 - `pub fn container_path(env_vars: &[(&str, &str)], image_path: Option<&str>) -> Option<String>`
@@ -866,8 +934,19 @@ wrkflw/
 **crates/runtime/src/lib.rs**
 - `pub mod container`
 - `pub mod emulation`
+- `pub mod live_output`
 - `pub mod sandbox`
 - `pub mod secure_emulation`
+
+**crates/runtime/src/live_output.rs**
+- `pub struct OutputTap(Arc<TapFn>)`
+- `pub enum Stream`
+- `pub struct Utf8Chunks`
+- `pub async fn with_output_tap<F: Future>(tap: OutputTap, future: F) -> F::Output`
+- `pub fn current() -> Option<OutputTap>`
+- `pub fn send(stream: Stream, chunk: &str)`
+- `pub async fn wait_with_live_output( mut child: tokio::process::Child, ) -> std::io::Result<std::process::Output>`
+- `pub fn blocking_wait_with_live_output( mut child: std::process::Child, tap: Option<OutputTap>, ) -> std::io::Result<std::process::Output>`
 
 **crates/runtime/src/sandbox.rs**
 - `pub struct SandboxConfig`
@@ -1026,6 +1105,7 @@ wrkflw/
 - `[package]`
 - `[features]`
 - `[dependencies]`
+- `[dev-dependencies]`
 
 **crates/ui/README.md**
 - `## wrkflw-ui`
@@ -1076,7 +1156,6 @@ wrkflw/
 
 **crates/ui/src/components/dag.rs**
 - `pub fn topo_levels(def: &WorkflowDefinition) -> Vec<Vec<String>>`
-- `pub fn render(frame: &mut Frame<'_>, area: Rect, workflow: &Workflow, spinner_frame: usize)`
 - `pub fn matrix_size_label(matrix: &wrkflw_matrix::MatrixConfig) -> Option<String>`
 
 **crates/ui/src/components/mod.rs**
@@ -1127,6 +1206,14 @@ wrkflw/
 - `pub struct QueuedExecution`
 - `pub enum WorkflowStatus`
 - `pub struct WorkflowExecution`
+- `pub const LIVE_TAIL_LINES: usize = 500`
+- `pub struct LiveTails`
+- `pub struct LiveTail`
+- `pub const TIMELINE_FAILURE_TAIL: usize = 6`
+- `pub enum TimelineEntry`
+- `pub const TIMELINE_LINE_LIMIT: usize = 4096`
+- `pub enum RunUpdate`
+- `pub type TimelineMsg = (usize, u64, RunUpdate)`
 - `pub struct JobExecution`
 - `pub struct StepExecution`
 - `pub enum StatusSeverity`
@@ -1147,6 +1234,7 @@ wrkflw/
 - `pub fn truncate_left(s: &str, max: usize) -> Cow<'_, str>`
 - `pub fn fit(s: &str, cells: usize) -> String`
 - `pub fn pad_left(s: &str, cells: usize) -> String`
+- `pub fn fit_spans(spans: Vec<Span<'static>>, cells: usize) -> Vec<Span<'static>>`
 - `pub fn spans_width(spans: &[Span<'_>]) -> usize`
 - `pub fn ansi_line(raw: &str, base: Style) -> Line<'static>`
 
@@ -1179,10 +1267,12 @@ wrkflw/
 - `pub fn block<'a>(title: &'a str) -> Block<'a>`
 - `pub fn block_focused<'a>(title: &'a str) -> Block<'a>`
 - `pub fn panel<'a>(title: &'a str, focused: bool) -> Block<'a>`
+- `pub fn modal_frame<'a>(title: &'a str) -> Block<'a>`
 - `pub fn with_badge<'a>(block: Block<'a>, badge: impl Into<String>) -> Block<'a>`
 - `pub fn section<'a>(title: impl Into<String>) -> Line<'a>`
-- `pub fn hint_spans<'a>(hints: &[(&str, &str)], max_width: usize) -> Vec<Span<'a>>`
+- `pub fn raised_buttons<'a>( buttons: &[(&str, &str, bool)], max_width: usize, ) -> (Vec<Span<'a>>, Vec<Span<'a>>)`
 - `pub fn scrollbar(f: &mut Frame<'_>, area: Rect, total: usize, position: usize, viewport: usize)`
+- `pub fn modal(f: &mut Frame<'_>, width: u16, height: u16) -> Rect`
 - `pub fn empty_state(f: &mut Frame<'_>, area: Rect, title: &str, hint: Vec<Span<'_>>)`
 - `pub enum BadgeKind`
 - `pub fn badge_outline<'a>(text: impl Into<String>, kind: BadgeKind) -> Span<'a>`
@@ -1201,6 +1291,7 @@ wrkflw/
 
 **crates/ui/src/views/execution_tab.rs**
 - `pub fn render_execution_tab(f: &mut Frame<'_>, app: &mut App, area: Rect)`
+- `pub(super) fn render_summary_line(f: &mut Frame<'_>, app: &App, workflow: &Workflow, area: Rect)`
 
 **crates/ui/src/views/help_overlay.rs**
 - `pub fn render_help_content(f: &mut Frame<'_>, area: Rect, scroll: &mut usize)`
@@ -1218,6 +1309,9 @@ wrkflw/
 - `pub const INSPECTOR_TABS: usize = job_detail::INSPECTOR_TABS.len()`
 - `pub fn render_ui(f: &mut Frame<'_>, app: &mut App)`
 
+**crates/ui/src/views/run_header.rs**
+- `pub fn render_run_header(f: &mut Frame<'_>, app: &App, area: Rect)`
+
 **crates/ui/src/views/runs_tab.rs**
 - `pub fn render_runs_tab(f: &mut Frame<'_>, app: &mut App, area: Rect)`
 
@@ -1228,8 +1322,6 @@ wrkflw/
 - `pub fn render_status_bar(f: &mut Frame<'_>, app: &App, area: Rect)`
 
 **crates/ui/src/views/title_bar.rs**
-- `pub const TAB_LABELS: [&str`
-- `pub const TAB_COUNT: usize = TAB_LABELS.len()`
 - `pub const TAB_WORKFLOWS: usize = 0`
 - `pub const TAB_EXECUTION: usize = 1`
 - `pub const TAB_DAG: usize = 2`
@@ -1237,14 +1329,18 @@ wrkflw/
 - `pub const TAB_TRIGGER: usize = 4`
 - `pub const TAB_SECRETS: usize = 5`
 - `pub const TAB_RUNS: usize = 6`
-- `pub const TAB_HELP: usize = 7`
+- `pub const SCREEN_COUNT: usize = 7`
+- `pub const TABS: [(&str, &[usize])`
+- `pub const TAB_COUNT: usize = TABS.len()`
+- `pub const TAB_RUN: usize = 1`
+- `pub fn tab_of(screen: usize) -> usize`
 - `pub fn render_title_bar(f: &mut Frame<'_>, app: &App, area: Rect)`
 
 **crates/ui/src/views/trigger_tab.rs**
 - `pub fn render_trigger_tab(f: &mut Frame<'_>, app: &mut App, area: Rect)`
 
 **crates/ui/src/views/tweaks_overlay.rs**
-- `pub fn render_tweaks_overlay(f: &mut Frame<'_>, app: &App, area: Rect)`
+- `pub fn render_tweaks_overlay(f: &mut Frame<'_>, app: &App, _area: Rect)`
 
 **crates/ui/src/views/workflows_tab.rs**
 - `pub fn render_workflows_tab(f: &mut Frame<'_>, app: &mut App, area: Rect)`
@@ -1658,7 +1754,7 @@ wrkflw/
 
 ## AGENTS.md
 
-**Language:** Markdown | **Size:** 6.0 KB | **Lines:** 75
+**Language:** Markdown | **Size:** 14.1 KB | **Lines:** 96
 
 **Declarations:**
 
@@ -1666,7 +1762,7 @@ wrkflw/
 
 ## BREAKING_CHANGES.md
 
-**Language:** Markdown | **Size:** 17.3 KB | **Lines:** 320
+**Language:** Markdown | **Size:** 29.9 KB | **Lines:** 382
 
 **Declarations:**
 
@@ -1682,7 +1778,7 @@ wrkflw/
 
 ## Cargo.toml
 
-**Language:** TOML | **Size:** 2.7 KB | **Lines:** 83
+**Language:** TOML | **Size:** 2.8 KB | **Lines:** 85
 
 **Declarations:**
 
@@ -1690,7 +1786,7 @@ wrkflw/
 
 ## INDEX.md
 
-**Language:** Markdown | **Size:** 242.4 KB | **Lines:** 8835
+**Language:** Markdown | **Size:** 268.9 KB | **Lines:** 9997
 
 **Declarations:**
 
@@ -1698,15 +1794,7 @@ wrkflw/
 
 ## README.md
 
-**Language:** Markdown | **Size:** 31.9 KB | **Lines:** 516
-
-**Declarations:**
-
----
-
-## RELEASE_POST.md
-
-**Language:** Markdown | **Size:** 3.8 KB | **Lines:** 59
+**Language:** Markdown | **Size:** 43.8 KB | **Lines:** 563
 
 **Declarations:**
 
@@ -1730,7 +1818,7 @@ wrkflw/
 
 ## crates/evaluator/Cargo.toml
 
-**Language:** TOML | **Size:** 499 B | **Lines:** 20
+**Language:** TOML | **Size:** 529 B | **Lines:** 21
 
 **Declarations:**
 
@@ -1766,7 +1854,7 @@ wrkflw/
 
 ## crates/executor/Cargo.toml
 
-**Language:** TOML | **Size:** 1.2 KB | **Lines:** 51
+**Language:** TOML | **Size:** 1.2 KB | **Lines:** 52
 
 **Imports:**
 - `ignore`
@@ -1836,7 +1924,7 @@ wrkflw/
 
 ## crates/executor/src/acceleration/store.rs
 
-**Language:** Rust | **Size:** 21.0 KB | **Lines:** 591
+**Language:** Rust | **Size:** 22.4 KB | **Lines:** 623
 
 **Imports:**
 - `super::{hex, Acceleration, Secret}`
@@ -1849,14 +1937,14 @@ wrkflw/
 
 **Declarations:**
 
-`const ENTRY_SCHEMA: u32 = 1`
+`const ENTRY_SCHEMA: u32 = 2`
 
 `const DEFAULT_TTL_SECS: i64 = 7 * 24 * 60 * 60`
 
 `const REMOTE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10)`
 
 `pub(crate) struct StoredJob`
-> Fields: `name: String`, `canonical_name: String`, `outputs: HashMap<String, String>`
+> Fields: `name: String`, `canonical_name: String`, `outputs: HashMap<String, String>`, `actions_not_run: Vec<crate::action_fidelity::UnexecutedAction>`, `repeated_from: Option<String>`
 
 `pub(crate) struct Entry`
 > Fields: `schema: u32`, `key: String`, `created_at: i64`, `jobs: Vec<StoredJob>`
@@ -1969,7 +2057,7 @@ wrkflw/
 
 ## crates/executor/src/acceleration.rs
 
-**Language:** Rust | **Size:** 54.2 KB | **Lines:** 1547
+**Language:** Rust | **Size:** 56.3 KB | **Lines:** 1604
 
 **Imports:**
 - `pub(crate) use concurrency::acquire_concurrency`
@@ -2047,6 +2135,8 @@ wrkflw/
 
 `pub(crate) fn job_key(input: &KeyInput<'_>) -> Option<String>`
 
+`fn job_key_with(input: &KeyInput<'_>, every_matrix_leg: bool) -> Option<String>`
+
 `pub(crate) struct RunState`
 > Fields: `accel: Acceleration`, `preserve_containers: bool`, `root: PathBuf`, `sidecar: Option<Sidecar>`, `store: Option<ResultStore>`, `tree: OnceCell<Option<Arc<Tree>>>`, `executed: Mutex<HashSet<String>>`, `groups: Mutex<HashMap<String, Arc<Semaphore>>>`, `dep_mounts: OnceLock<Vec<(PathBuf, PathBuf)>>`, `warned_on_host_push: AtomicBool`
 
@@ -2083,6 +2173,8 @@ wrkflw/
 > Variants: `Unaffected`, `Stored`
 
 **`impl Reused`**
+  `pub(crate) fn kind(&self) -> &'static str`
+
   `pub(crate) fn step(&self) -> &'static str`
 
   `pub(crate) fn note(&self) -> String`
@@ -2103,13 +2195,34 @@ wrkflw/
 
 ---
 
+## crates/executor/src/action_fidelity.rs
+
+**Language:** Rust | **Size:** 2.5 KB | **Lines:** 67
+
+**Imports:**
+- `serde::{Deserialize, Serialize}`
+
+**Declarations:**
+
+**`impl UnexecutedAction`**
+  `pub fn reason(&self) -> String`
+
+  `pub fn unverified_entry(&self, job: &str) -> serde_json::Value`
+
+
+`mod tests`
+
+---
+
 ## crates/executor/src/action_resolver.rs
 
-**Language:** Rust | **Size:** 23.6 KB | **Lines:** 741
+**Language:** Rust | **Size:** 47.4 KB | **Lines:** 1414
 
 **Imports:**
 - `once_cell::sync::Lazy`
 - `std::collections::{HashMap, VecDeque}`
+- `std::ffi::OsString`
+- `std::path::{Path, PathBuf}`
 - `tokio::sync::RwLock`
 
 **Declarations:**
@@ -2137,7 +2250,38 @@ wrkflw/
 
 `const GITHUB_RAW_BASE_URL: &str = "https://raw.githubusercontent.com"`
 
-`async fn fetch_and_parse( base_url: &str, repo: &str, version: &str, sub_path: Option<&str>, filename: &str, token: Option<&str>, ) -> Result<ResolvedAction, String>`
+`const NO_ACTION_CACHE_ENV: &str = "WRKFLW_NO_ACTION_CACHE"`
+
+`const ACTION_CACHE_DIR_ENV: &str = "WRKFLW_ACTION_CACHE_DIR"`
+
+`async fn resolve_with( base_url: &str, disk_cache_dir: Option<&Path>, repo: &str, version: &str, sub_path: Option<&str>, token: Option<&str>, ) -> Result<ResolvedAction, String>`
+
+`pub(crate) async fn seed_cache_for_test(repo: &str, version: &str, action_yaml: &str)`
+
+`async fn fetch_action_yaml( base_url: &str, repo: &str, version: &str, sub_path: Option<&str>, token: Option<&str>, ) -> Result<String, String>`
+
+`enum FetchError`
+> Variants: `NotFound`, `Other`
+
+**`impl std::fmt::Display for FetchError`**
+  `fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result`
+
+
+`fn should_try_action_yaml(err: &FetchError) -> bool`
+
+`async fn fetch_action_file( base_url: &str, repo: &str, version: &str, sub_path: Option<&str>, filename: &str, token: Option<&str>, ) -> Result<String, FetchError>`
+
+`pub(crate) fn is_git_sha(version: &str) -> bool`
+
+`fn action_cache_dir() -> Option<PathBuf>`
+
+`fn action_cache_dir_from( no_cache: Option<OsString>, override_dir: Option<OsString>, platform_cache_dir: Option<PathBuf>, ) -> Option<PathBuf>`
+
+`fn disk_cache_file_name(repo: &str, sub_path: Option<&str>, version: &str) -> String`
+
+`fn read_disk_cache(path: &Path) -> Option<String>`
+
+`fn write_disk_cache(path: &Path, body: &str)`
 
 `fn parse_action_definition(content: &str) -> Result<ResolvedAction, String>`
 
@@ -2272,6 +2416,103 @@ wrkflw/
 
 ---
 
+## crates/executor/src/checkout_sync.rs
+
+**Language:** Rust | **Size:** 62.5 KB | **Lines:** 1569
+
+**Imports:**
+- `crate::engine::ExecutionError`
+- `ignore::{gitignore::GitignoreBuilder, Match}`
+- `std::collections::HashSet`
+- `std::path::{Path, PathBuf}`
+
+**Declarations:**
+
+`fn create_gitignore_matcher( dir: &Path, ) -> Result<Option<ignore::gitignore::Gitignore>, ExecutionError>`
+
+`pub(crate) fn copy_directory_contents(from: &Path, to: &Path) -> Result<(), ExecutionError>`
+
+`struct GitDirs`
+> Fields: `own: PathBuf`, `common: PathBuf`
+
+`fn git_dirs(root: &Path) -> Option<GitDirs>`
+
+`fn mirror_git_dir(root: &Path, to_git: &Path) -> Result<(), ExecutionError>`
+
+`const SHARED_GIT_ENTRIES: &[&str] = &[ "objects", "refs", "packed-refs", "info", "shallow", "remotes", "branches", "description", "rr-cache", "modules", "lfs", ]`
+
+`const UNSAFE_GIT_CONFIG_KEYS: &[&str] = &["hookspath", "fsmonitor", "worktree"]`
+
+`const UNSAFE_GIT_CONFIG_SECTIONS: &[&str] = &["include", "includeif"]`
+
+`fn write_sanitized_git_config(from: &Path, to: &Path) -> Result<(), ExecutionError>`
+
+`fn sanitized_git_config(config: &str) -> String`
+
+`fn header_end(line: &str) -> Option<usize>`
+
+`fn section_name(header: &str) -> String`
+
+`fn value_continues(text: &str, mut in_quote: bool) -> Option<bool>`
+
+`fn ensure_real_dir(dir: &Path) -> std::io::Result<()>`
+
+`fn remove_entry(path: &Path) -> std::io::Result<()>`
+
+`fn mirror_directory( from: &Path, to: &Path, link: bool, skip: &[&str], link_dirs: &[&str], ) -> Result<(), ExecutionError>`
+
+`struct SyncRules`
+> Fields: `gitignore: Option<ignore::gitignore::Gitignore>`, `never: Vec<PathBuf>`, `git_checkout: bool`, `root: PathBuf`, `tracked: Option<Tracked>`, `previously_tracked: Option<Tracked>`, `record: Option<(PathBuf, Option<String>)>`
+
+`struct Tracked`
+> Fields: `files: HashSet<PathBuf>`, `dirs: HashSet<PathBuf>`
+
+**`impl Tracked`**
+  `fn listing(dir: &Path) -> Option<String>`
+
+  `fn parse(listing: &str) -> Self`
+
+  `fn contains(&self, path: &Path, is_dir: bool) -> bool`
+
+
+**`impl SyncRules`**
+  `fn for_root(root: &Path, workspace: &Path) -> Result<Self, ExecutionError>`
+
+  `fn record_tracked(&self)`
+
+  `fn relative<'a>(&self, source: &'a Path) -> Option<&'a Path>`
+
+  `fn is_tracked(&self, source: &Path, is_dir: bool) -> bool`
+
+  `fn was_tracked(&self, source: &Path, is_dir: bool) -> bool`
+
+  `fn syncs( &self, source: &Path, name: &str, is_dir: bool, nested: &[ignore::gitignore::Gitignore], only_tracked: bool, ) -> bool`
+
+  `fn ignored( &self, source: &Path, is_dir: bool, nested: &[ignore::gitignore::Gitignore], ) -> bool`
+
+  `fn may_delete( &self, source: &Path, name: &str, is_dir: bool, nested: &[ignore::gitignore::Gitignore], only_tracked: bool, ) -> bool`
+
+  `fn nested_gitignore(dir: &Path) -> Option<ignore::gitignore::Gitignore>`
+
+  `fn hidden(name: &str) -> bool`
+
+
+`fn copy_directory_contents_with_gitignore( from: &Path, to: &Path, rules: &SyncRules, nested: &[ignore::gitignore::Gitignore], only_tracked: bool, ) -> Result<(), ExecutionError>`
+
+`fn link_file(from: &Path, to: &Path) -> Result<(), ExecutionError>`
+
+`fn unchanged_copy(from: &Path, to: &Path) -> bool`
+
+`fn sync_file(from: &Path, to: &Path) -> Result<(), ExecutionError>`
+
+`fn set_modified(path: &Path, time: std::time::SystemTime) -> std::io::Result<()>`
+
+`fn remove_file_even_read_only(path: &Path) -> std::io::Result<()>`
+
+`mod tests`
+
+---
+
 ## crates/executor/src/container_guard.rs
 
 **Language:** Rust | **Size:** 5.8 KB | **Lines:** 176
@@ -2316,7 +2557,7 @@ wrkflw/
 
 ## crates/executor/src/docker.rs
 
-**Language:** Rust | **Size:** 54.8 KB | **Lines:** 1483
+**Language:** Rust | **Size:** 65.1 KB | **Lines:** 1741
 
 **Imports:**
 - `crate::container_guard::ContainerGuard`
@@ -2340,6 +2581,8 @@ wrkflw/
 - *... and 2 more imports*
 
 **Declarations:**
+
+`const LOG_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(10)`
 
 `static RUNNING_CONTAINERS: Lazy<Mutex<Vec<String>>> = Lazy::new(|| Mutex::new(Vec::new()))`
 
@@ -2377,6 +2620,25 @@ wrkflw/
 
 `const PROBE_OVERALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15)`
 
+`struct MemoryWatch`
+> Fields: `id: String`, `meter: std::sync::Arc<crate::job_memory::JobMeter>`, `sampled: std::sync::Arc<std::sync::atomic::AtomicBool>`, `broken: std::sync::Arc<std::sync::atomic::AtomicBool>`, `started: std::time::Instant`, `task: tokio::task::JoinHandle<()>`, `ended: Option<bool>`, `ran_for: Option<std::time::Duration>`
+
+`const UNSAMPLED_AFTER: std::time::Duration = std::time::Duration::from_secs(3)`
+
+**`impl MemoryWatch`**
+  `fn start(docker: Docker, id: &str, meter: std::sync::Arc<crate::job_memory::JobMeter>) -> Self`
+
+  `fn stop(mut self, out_of_memory: bool, ran_for: Option<std::time::Duration>)`
+
+
+**`impl Drop for MemoryWatch`**
+  `fn drop(&mut self)`
+
+
+`fn run_time(started: &str, finished: &str) -> Option<std::time::Duration>`
+
+`fn working_set(stats: &bollard::container::MemoryStats) -> Option<u64>`
+
 `fn wait_exit_code( wait_result: Option<&Result<ContainerWaitResponse, bollard::errors::Error>>, ) -> i32`
 
 `pub(crate) fn tracked_containers() -> Vec<String>`
@@ -2393,6 +2655,10 @@ wrkflw/
   `async fn prepare_language_environment( &self, language: &str, version: Option<&str>, additional_packages: Option<Vec<String>>, ) -> Result<String, ContainerError>`
 
   `async fn image_exists(&self, tag: &str) -> Result<bool, ContainerError>`
+
+  `async fn image_id(&self, image: &str) -> Option<String>`
+
+  `fn identifies_images(&self) -> bool`
 
 
 `fn build_container_config( image: &str, cmd: Vec<String>, env: Vec<String>, working_dir: &Path, host_config: HostConfig, is_windows_image: bool, entrypoint: Option<&str>, ) -> Config<String>`
@@ -2430,378 +2696,9 @@ wrkflw/
 
 ---
 
-## crates/executor/src/engine.rs
-
-**Language:** Rust | **Size:** 508.6 KB | **Lines:** 13862
-
-**Imports:**
-- `bollard::Docker`
-- `futures::future`
-- `once_cell::sync::Lazy`
-- `serde_yaml::Value`
-- `std::collections::{HashMap, HashSet}`
-- `std::fs`
-- `std::path::{Path, PathBuf}`
-- `std::sync::{Arc, Mutex}`
-- `thiserror::Error`
-- `ignore::{gitignore::GitignoreBuilder, Match}`
-- *... and 17 more imports*
-
-**Declarations:**
-
-`fn is_gitlab_pipeline(path: &Path) -> bool`
-
-`async fn execute_github_workflow( workflow_path: &Path, mut config: ExecutionConfig, ) -> Result<ExecutionResult, ExecutionError>`
-
-`fn record_job_results( job_results: &[JobResult], all_job_outputs: &mut HashMap<String, HashMap<String, String>>, all_job_results: &mut HashMap<String, String>, )`
-
-`async fn execute_gitlab_pipeline( pipeline_path: &Path, mut config: ExecutionConfig, ) -> Result<ExecutionResult, ExecutionError>`
-
-`fn apply_gitlab_variable_overrides(pipeline: &mut Pipeline, overrides: &HashMap<String, String>)`
-
-`fn force_target_job(conditions: &mut HashMap<String, gitlab::JobWhen>, target_job: &str)`
-
-`fn select_stage_jobs( stage: Vec<String>, conditions: &HashMap<String, gitlab::JobWhen>, earlier_failure: bool, blocked: bool, ) -> (Vec<String>, Vec<(String, &'static str)>)`
-
-`fn gitlab_predefined_variables( pipeline_path: &Path, overrides: &HashMap<String, String>, ) -> HashMap<String, String>`
-
-`fn gitlab_predefined_variables_for( pipeline_path: &Path, branch: Option<String>, tag: Option<String>, default_branch: String, overrides: &HashMap<String, String>, ) -> HashMap<String, String>`
-
-`fn seed_gitlab_predefined_variables(pipeline: &mut Pipeline, predefined: &HashMap<String, String>)`
-
-`fn apply_rule_allow_failure( workflow: &mut WorkflowDefinition, decisions: &HashMap<String, gitlab::JobDecision>, )`
-
-`fn create_gitlab_context(pipeline: &Pipeline, workspace_dir: &Path) -> HashMap<String, String>`
-
-`fn gitlab_job_decisions(pipeline: &Pipeline) -> HashMap<String, gitlab::JobDecision>`
-
-`fn resolve_gitlab_dependencies( pipeline: &Pipeline, workflow: &WorkflowDefinition, ) -> Result<Vec<Vec<String>>, ExecutionError>`
-
-`type EnvMap = HashMap<String, String>`
-
-`fn github_run_env( workflow: &WorkflowDefinition, workspace_dir: &Path, runtime: &RuntimeType, ) -> Result<(EnvMap, EnvMap), ExecutionError>`
-
-`enum CiPlatform`
-> Variants: `GitHub`, `GitLab`
-
-`fn seed_runtime_context( env: &mut HashMap<String, String>, runtime: &RuntimeType, platform: CiPlatform, )`
-
-`fn emulation_runtime() -> (Box<dyn ContainerRuntime>, RuntimeType)`
-
-`fn initialize_runtime( runtime_type: RuntimeType, preserve_containers_on_failure: bool, kubernetes: &KubernetesConfig, ) -> Result<(Box<dyn ContainerRuntime>, RuntimeType), ExecutionError>`
-
-**`impl RuntimeType`**
-  `fn runs_in_container(&self) -> bool`
-
-  `pub fn mode_name(&self) -> &'static str`
-
-
-`fn warn_if_overrides_unused(config: &ExecutionConfig)`
-
-`fn overrides_unused( platform_overrides: &HashMap<String, String>, runtime_type: &RuntimeType, ) -> bool`
-
-**`impl JobResult`**
-  `fn fails_run(&self) -> bool`
-
-  `fn reused(stored: acceleration::StoredJob, step: &str, note: &str) -> Self`
-
-  `fn skipped( name: impl Into<String>, canonical_name: impl Into<String>, logs: impl Into<String>, ) -> Self`
-
-  `fn failed_before_steps( name: impl Into<String>, step_name: impl Into<String>, reason: impl Into<String>, ) -> Self`
-
-
-**`impl JobStatus`**
-  `fn aggregate_rank(&self) -> u8`
-
-
-**`impl std::fmt::Display for JobStatus`**
-  `fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result`
-
-
-**`impl StepResult`**
-  `fn new(name: String, status: StepStatus, output: String) -> Self`
-
-  `fn with_exit_code(mut self, exit_code: i32) -> Self`
-
-
-**`impl std::fmt::Display for StepStatus`**
-  `fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result`
-
-
-**`impl From<String> for ExecutionError`**
-  `fn from(err: String) -> Self`
-
-
-`enum PreparedAction`
-> Variants: `NativeDocker`, `Image`, `Composite`
-
-`async fn prepare_action( action: &ActionInfo, runtime: &dyn ContainerRuntime, ) -> Result<PreparedAction, ExecutionError>`
-
-`async fn execute_native_docker_step( ctx: &StepExecutionContext<'_>, step_env: &mut HashMap<String, String>, step_name: String, uses: &str, image: String, entrypoint: Option<String>, args: Vec<String>, ) -> Result<StepResult, ExecutionError>`
-
-`fn sanitize_sub_path(raw: &str) -> Result<(), String>`
-
-`fn sanitize_dockerfile_rel(raw: &str) -> Result<String, String>`
-
-`fn extract_docker_runs_config( definition: Option<&serde_yaml::Value>, ) -> Result<(Option<String>, Vec<String>), String>`
-
-`async fn shallow_clone( repo_url: &str, git_ref: &str, target_dir: &Path, ) -> Result<(), ExecutionError>`
-
-`fn is_git_sha(git_ref: &str) -> bool`
-
-`fn determine_action_image(repository: &str) -> String`
-
-`struct SetupRuntime`
-> Fields: `language: String`, `version: String`, `install_script: String`
-
-`struct SetupActionDef`
-> Fields: `repos: &'static [&'static str]`, `with_key: &'static str`, `default_version: &'static str`, `language: &'static str`, `version_from_ref: bool`
-
-`const SETUP_ACTIONS: &[SetupActionDef] = &[ SetupActionDef`
-
-`fn is_safe_version(version: &str) -> bool`
-
-`fn detect_setup_runtimes(steps: &[Step]) -> Vec<SetupRuntime>`
-
-`fn get_install_script(language: &str, version: &str) -> String`
-
-`fn generate_combined_dockerfile(runtimes: &[SetupRuntime], base_image: &str) -> String`
-
-`fn fnv1a_hash(data: &[u8]) -> u64`
-
-`fn combined_image_tag(runtimes: &[SetupRuntime], dockerfile: &str) -> String`
-
-`static IMAGE_BUILD_LOCKS: Lazy<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> = Lazy::new(|| Mutex::new(HashMap::new()))`
-
-`async fn build_combined_runtime_image( runtimes: &[SetupRuntime], base_image: &str, runtime: &dyn ContainerRuntime, ) -> Result<String, ExecutionError>`
-
-`fn action_context_hash(dockerfile: &Path, context_dir: &Path) -> std::io::Result<String>`
-
-`async fn ensure_action_image( runtime: &dyn ContainerRuntime, tag_prefix: &str, dockerfile: &Path, context_dir: &Path, ) -> Result<String, wrkflw_runtime::container::ContainerError>`
-
-`async fn resolve_runner_image( job: &Job, steps: &[Step], runtime: &dyn ContainerRuntime, platform_overrides: &HashMap<String, String>, matrix: Option<&HashMap<String, Value>>, ) -> Result<String, ExecutionError>`
-
-`async fn execute_job_batch( jobs: &[String], workflow: &WorkflowDefinition, runtime: &dyn ContainerRuntime, env_context: &HashMap<String, String>, user_env: &HashMap<String, String>, verbose: bool, secret_manager: Option<&SecretManager>, secret_masker: Option<&SecretMasker>, all_job_outputs: &HashMap<String, HashMap<String, String>>, all_job_results: &HashMap<String, String>, artifact_store: &crate::artifacts::ArtifactStore, cache_store: &crate::cache::CacheStore, platform_overrides: &HashMap<String, String>, ) -> Result<Vec<JobResult>, ExecutionError>`
-
-`struct JobExecutionContext<'a>`
-> Fields: `job_name: &'a str`, `workflow: &'a WorkflowDefinition`, `runtime: &'a dyn ContainerRuntime`, `env_context: &'a HashMap<String, String>`, `user_env: &'a HashMap<String, String>`, `verbose: bool`, `services: JobServices<'a>`
-
-`async fn execute_job_with_matrix( job_name: &str, workflow: &WorkflowDefinition, runtime: &dyn ContainerRuntime, env_context: &HashMap<String, String>, user_env: &HashMap<String, String>, verbose: bool, secret_manager: Option<&SecretManager>, secret_masker: Option<&SecretMasker>, all_job_outputs: &HashMap<String, HashMap<String, String>>, all_job_results: &HashMap<String, String>, artifact_store: &crate::artifacts::ArtifactStore, cache_store: &crate::cache::CacheStore, platform_overrides: &HashMap<String, String>, ) -> Result<Vec<JobResult>, ExecutionError>`
-
-`fn announce_reused(stored: &acceleration::StoredJob, note: &str)`
-
-`async fn store_passing_result( key: Option<&str>, results: &[JobResult], env_context: &HashMap<String, String>, )`
-
-`async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, ExecutionError>`
-
-`struct MatrixExecutionContext<'a>`
-> Fields: `job_name: &'a str`, `job_template: &'a Job`, `combinations: &'a [MatrixCombination]`, `max_parallel: usize`, `fail_fast: bool`, `workflow: &'a WorkflowDefinition`, `runtime: &'a dyn ContainerRuntime`, `env_context: &'a HashMap<String, String>`, `user_env: &'a HashMap<String, String>`, `verbose: bool`, `services: JobServices<'a>`
-
-`async fn execute_matrix_combinations( ctx: MatrixExecutionContext<'_>, ) -> Result<Vec<JobResult>, ExecutionError>`
-
-`async fn execute_matrix_job( job_name: &str, job_template: &Job, combination: &MatrixCombination, workflow: &WorkflowDefinition, runtime: &dyn ContainerRuntime, base_env_context: &HashMap<String, String>, base_user_env: &HashMap<String, String>, verbose: bool, services: &JobServices<'_>, ) -> Result<JobResult, ExecutionError>`
-
-`enum StepOutcome`
-> Variants: `Completed`, `Skipped`
-
-`struct PendingCacheSave`
-> Fields: `key: String`, `path: String`, `workspace: std::path::PathBuf`
-
-`pub(crate) struct JobServices<'a>`
-> Fields: `secret_manager: Option<&'a SecretManager>`, `secret_masker: Option<&'a SecretMasker>`, `secrets_context: &'a HashMap<String, String>`, `missing_secrets: &'a HashSet<String>`, `needs_context: &'a HashMap<String, HashMap<String, String>>`, `needs_results: &'a HashMap<String, String>`, `artifact_store: &'a crate::artifacts::ArtifactStore`, `cache_store: &'a crate::cache::CacheStore`, `platform_overrides: &'a HashMap<String, String>`
-
-`async fn flush_pending_cache_saves( pending: &std::sync::Mutex<Vec<PendingCacheSave>>, cache_store: &crate::cache::CacheStore, )`
-
-`struct StepLoopState`
-> Fields: `step_results: Vec<StepResult>`, `job_logs: String`, `step_outputs_map: HashMap<String, HashMap<String, String>>`, `step_status_map: HashMap<String, (String, String)>`, `job_status_str: String`, `job_label: String`, `job_started: std::time::Instant`, `step_started: std::time::Instant`, `current_step: Option<InFlightStep>`, `workspace_prefixes: Vec<String>`, `missing_secrets: HashSet<String>`
-
-`struct InFlightStep`
-> Fields: `index: usize`, `command: Option<String>`, `uses: Option<String>`
-
-**`impl StepLoopState`**
-  `fn new(job_label: &str, canonical_name: &str) -> Self`
-
-  `fn with_job_context(mut self, workspace: &Path, missing_secrets: &HashSet<String>) -> Self`
-
-  `fn relative_to_workspace(&self, output: &str) -> String`
-
-  `fn begin_step(&mut self, index: usize, step: &workflow::Step)`
-
-  `fn emit_step_finished(&self, result: &StepResult, env_set: Vec<(String, String)>)`
-
-  `fn fail_step_on_timeout(&mut self, step: &workflow::Step, index: usize, message: String)`
-
-  `fn emit_job_finished(&self, success: bool, failure_allowed: bool)`
-
-  `fn skip_step(&mut self, index: usize, step: &workflow::Step)`
-
-  `fn process_outcome( &mut self, outcome: StepOutcome, step: &workflow::Step, verbose: bool, job_env: &mut HashMap<String, String>, job_user_env: &mut HashMap<String, String>, secret_masker: Option<&SecretMasker>, ) -> bool`
-
-
-`fn changed_env( before: &HashMap<String, String>, after: &HashMap<String, String>, masker: Option<&SecretMasker>, ) -> Vec<(String, String)>`
-
-`fn record_step_status( step_id: Option<&str>, result: &StepResult, step_status_map: &mut HashMap<String, (String, String)>, job_status_str: &mut String, )`
-
-`fn process_workflow_commands( output: &str, step_id: Option<&str>, step_outputs_map: &mut HashMap<String, HashMap<String, String>>, secret_masker: Option<&SecretMasker>, )`
-
-`fn format_annotation_location(file: Option<&str>, line: Option<u32>, col: Option<u32>) -> String`
-
-`async fn run_step_with_guards( step: &Step, step_idx: usize, job_env: &HashMap<String, String>, workflow: &WorkflowDefinition, step_exec_ctx: StepExecutionContext<'_>, ) -> Result<StepOutcome, ExecutionError>`
-
-`fn workspace_prefixes(workspace: &Path) -> Vec<String>`
-
-`fn step_texts(step: &Step) -> impl Iterator<Item = &String>`
-
-`fn missing_secrets_note(step: &Step, missing: &HashSet<String>) -> Option<String>`
-
-`fn continues_on_error(value: Option<&str>, ctx: &crate::expression::ExpressionContext<'_>) -> bool`
-
-`fn job_failure_allowed( job: &Job, matrix_combination: &Option<HashMap<String, serde_yaml::Value>>, env_context: &HashMap<String, String>, user_env: &HashMap<String, String>, services: &JobServices<'_>, ) -> bool`
-
-`fn sanitize_timeout_minutes(raw: Option<f64>, default: f64) -> f64`
-
-`struct StepExecutionContext<'a>`
-> Fields: `step: &'a workflow::Step`, `step_idx: usize`, `job_env: &'a HashMap<String, String>`, `job_user_env: &'a HashMap<String, String>`, `working_dir: &'a Path`, `runtime: &'a dyn ContainerRuntime`, `workflow: &'a WorkflowDefinition`, `runner_image: &'a str`, `verbose: bool`, `matrix_combination: &'a Option<HashMap<String, Value>>`, `container_config: Option<&'a JobContainer>`, `workflow_defaults: Option<&'a workflow::Defaults>`, `job_defaults: Option<&'a workflow::Defaults>`, `step_outputs: &'a HashMap<String, HashMap<String, String>>`, `step_statuses: &'a HashMap<String, (String, String)>`, `job_status: &'a str`, `services: JobServices<'a>`, `pending_cache_saves: &'a std::sync::Mutex<Vec<PendingCacheSave>>`
-
-**`impl<'a> StepExecutionContext<'a>`**
-  `fn expr_context(&self) -> crate::expression::ExpressionContext<'_>`
-
-  `fn expr_context_with_env<'e>( &self, env: &'e HashMap<String, String>, user_env: &'e HashMap<String, String>, ) -> crate::expression::ExpressionContext<'e> where 'a: 'e,`
-
-
-`fn resolve_working_directory( wd: &str, ctx: &StepExecutionContext<'_>, step_env: &HashMap<String, String>, step_user_env: &HashMap<String, String>, ) -> Result<String, String>`
-
-`fn workspace_relative_input(path: &str, job_env: &HashMap<String, String>) -> String`
-
-`fn relative_to_workspace(path: &str, workspace: &str) -> String`
-
-`fn rust_toolchain_extras( with: &HashMap<String, String>, resolve: impl Fn(&str) -> Option<String>, ) -> Vec<String>`
-
-`fn static_input(value: &str) -> Option<String>`
-
-`fn preprocess_with_value(value: &str, ctx: &StepExecutionContext<'_>) -> String`
-
-`enum IfNoFilesFound`
-> Variants: `Warn`, `Error`, `Ignore`
-
-**`impl IfNoFilesFound`**
-  `fn parse(value: &str) -> Option<Self>`
-
-
-`fn parse_boolean_input(value: &str) -> Option<bool>`
-
-`async fn handle_upload_artifact( step_name: &str, ctx: &StepExecutionContext<'_>, ) -> Result<StepResult, ExecutionError>`
-
-`async fn handle_download_artifact( step_name: &str, ctx: &StepExecutionContext<'_>, ) -> Result<StepResult, ExecutionError>`
-
-`async fn handle_cache_action( step_name: &str, ctx: &StepExecutionContext<'_>, ) -> Result<StepResult, ExecutionError>`
-
-`async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, ExecutionError>`
-
-`fn create_gitignore_matcher( dir: &Path, ) -> Result<Option<ignore::gitignore::Gitignore>, ExecutionError>`
-
-`fn copy_directory_contents(from: &Path, to: &Path) -> Result<(), ExecutionError>`
-
-`fn copy_directory_contents_with_gitignore( from: &Path, to: &Path, gitignore: Option<&ignore::gitignore::Gitignore>, ) -> Result<(), ExecutionError>`
-
-`fn get_runner_image(runs_on: &str) -> String`
-
-`fn get_runner_image_from_opt(runs_on: &Option<Vec<String>>) -> String`
-
-`fn find_platform_override( runs_on: &Option<Vec<String>>, platform_overrides: &HashMap<String, String>, matrix: Option<&HashMap<String, Value>>, ) -> Option<String>`
-
-`fn get_effective_runner_image( job: &Job, platform_overrides: &HashMap<String, String>, matrix: Option<&HashMap<String, Value>>, ) -> String`
-
-`struct StepContainerContext`
-> Fields: `owned_volume_paths: Vec<VolumePathPair>`, `github_mount: Option<VolumePathPair>`, `is_container_runtime: bool`
-
-**`impl StepContainerContext`**
-  `fn build_volumes<'a>( &'a self, working_dir: &'a Path, container_workspace: &'a Path, ) -> Vec<(&'a Path, &'a Path)>`
-
-
-`fn prepare_step_container_context( step_env: &mut HashMap<String, String>, job_env: &HashMap<String, String>, container_config: Option<&JobContainer>, mounts_are_copies: bool, ) -> StepContainerContext`
-
-`type VolumePathPair = (PathBuf, PathBuf)`
-
-`fn uses_container_runtime(step_env: &HashMap<String, String>) -> bool`
-
-`fn prepare_container_mounts( step_env: &mut HashMap<String, String>, job_env: &HashMap<String, String>, container_config: Option<&JobContainer>, mounts_are_copies: bool, ) -> (Vec<VolumePathPair>, Option<VolumePathPair>)`
-
-`fn warn_unsupported_container_fields(container: &JobContainer)`
-
-`async fn execute_reusable_workflow_job( ctx: &JobExecutionContext<'_>, uses: &str, with: Option<&HashMap<String, String>>, secrets: Option<&serde_yaml::Value>, ) -> Result<JobResult, ExecutionError>`
-
-`async fn run_called_workflow( ctx: &JobExecutionContext<'_>, called: &WorkflowDefinition, uses: &str, with: Option<&HashMap<String, String>>, secrets: Option<&serde_yaml::Value>, workflow_path: &Path, ) -> Result<JobResult, ExecutionError>`
-
-`fn declared_reusable_workflow_outputs( called: &WorkflowDefinition, job_outputs: &HashMap<String, HashMap<String, String>>, env_context: &HashMap<String, String>, ) -> Option<HashMap<String, String>>`
-
-`fn aggregate_reusable_workflow_outputs( job_outputs: &HashMap<String, HashMap<String, String>>, ) -> HashMap<String, String>`
-
-`async fn prepare_runner_image( image: &str, runtime: &dyn ContainerRuntime, verbose: bool, ) -> Result<(), ExecutionError>`
-
-`fn extract_language_info(image: &str) -> Option<(&'static str, Option<&str>)>`
-
-`fn input_env_key(name: &str) -> String`
-
-`fn yaml_scalar_to_string(value: &serde_yaml::Value) -> Option<String>`
-
-`fn composite_call_step( ctx: &StepExecutionContext<'_>, step_env: &HashMap<String, String>, step_user_env: &HashMap<String, String>, ) -> workflow::Step`
-
-`async fn execute_composite_action( step: &workflow::Step, action_path: &Path, job_env: &HashMap<String, String>, job_user_env: &HashMap<String, String>, working_dir: &Path, runtime: &dyn ContainerRuntime, runner_image: &str, verbose: bool, services: &JobServices<'_>, pending_cache_saves: &std::sync::Mutex<Vec<PendingCacheSave>>, ) -> Result<StepResult, ExecutionError>`
-
-`fn propagate_composite_outputs( action_def: &serde_yaml::Value, composite_step_outputs: &HashMap<String, HashMap<String, String>>, action_env: &HashMap<String, String>, action_user_env: &HashMap<String, String>, caller_job_env: &HashMap<String, String>, working_dir: &Path, job_status: &str, )`
-
-`fn bash_or_sh_command(script: &str) -> Vec<String>`
-
-`struct CustomShellScript`
-> Fields: `host_path: PathBuf`
-
-**`impl Drop for CustomShellScript`**
-  `fn drop(&mut self)`
-
-
-`fn prepare_custom_shell( shell: &str, script: &str, mount_ctx: &StepContainerContext, working_dir: &Path, ) -> Result<(Vec<String>, CustomShellScript), String>`
-
-`fn parse_custom_shell(shell: &str) -> Result<Vec<String>, String>`
-
-`fn substitute_script_path(tokens: Vec<String>, script_path: &str) -> Vec<String>`
-
-`fn generate_heredoc_delimiter(value: &str) -> String`
-
-`fn convert_yaml_to_step(step_yaml: &serde_yaml::Value) -> Result<workflow::Step, String>`
-
-`struct NeedsState<'a>`
-> Fields: `status: &'static str`, `outputs: &'a HashMap<String, HashMap<String, String>>`, `results: &'a HashMap<String, String>`
-
-`fn upstream_status( job_name: &str, job: &Job, jobs: &HashMap<String, Job>, all_job_results: &HashMap<String, String>, ) -> &'static str`
-
-`fn needs_skip_reason(job: &Job, needs_results: &HashMap<String, String>) -> String`
-
-`fn evaluate_job_condition( condition: &str, env_context: &HashMap<String, String>, user_env: &HashMap<String, String>, needs: &NeedsState<'_>, ) -> bool`
-
-`fn resolve_matrix_expressions( matrix: &wrkflw_matrix::MatrixConfig, env_context: &HashMap<String, String>, user_env: &HashMap<String, String>, needs_context: &HashMap<String, HashMap<String, String>>, needs_results: &HashMap<String, String>, ) -> Result<wrkflw_matrix::MatrixConfig, wrkflw_matrix::MatrixError>`
-
-`fn matrix_expression_json( expr: &str, ctx: &crate::expression::ExpressionContext<'_>, ) -> Result<String, String>`
-
-`fn from_json_argument(expr: &str) -> Option<&str>`
-
-`fn evaluate_step_condition( condition: &str, working_dir: &Path, ctx: &crate::expression::ExpressionContext<'_>, ) -> bool`
-
-`fn evaluate_condition_with_context( condition: &str, ctx: &crate::expression::ExpressionContext<'_>, ) -> bool`
-
-`fn build_needs_context( job: &Job, all_outputs: &HashMap<String, HashMap<String, String>>, all_results: &HashMap<String, String>, ) -> ( HashMap<String, HashMap<String, String>>, HashMap<String, String>, )`
-
-`fn resolve_job_outputs( job: &Job, step_outputs_map: &HashMap<String, HashMap<String, String>>, step_status_map: &HashMap<String, (String, String)>, env_context: &HashMap<String, String>, user_env: &HashMap<String, String>, job_status: &str, working_dir: &Path, ) -> HashMap<String, String>`
-
-`async fn resolve_secrets_for_context( secret_manager: &SecretManager, job: &Job, ) -> (HashMap<String, String>, HashSet<String>)`
-
-`mod tests`
-
----
-
 ## crates/executor/src/environment.rs
 
-**Language:** Rust | **Size:** 18.9 KB | **Lines:** 598
+**Language:** Rust | **Size:** 20.5 KB | **Lines:** 640
 
 **Imports:**
 - `chrono::Utc`
@@ -2841,7 +2738,7 @@ wrkflw/
 
 `fn get_current_ref() -> String`
 
-`fn get_runner_os() -> String`
+`pub(crate) fn get_runner_os() -> String`
 
 `fn get_runner_arch() -> String`
 
@@ -2863,7 +2760,7 @@ wrkflw/
 
 ## crates/executor/src/events.rs
 
-**Language:** Rust | **Size:** 6.2 KB | **Lines:** 202
+**Language:** Rust | **Size:** 8.5 KB | **Lines:** 260
 
 **Imports:**
 - `crate::engine::{JobStatus, StepStatus}`
@@ -2881,6 +2778,8 @@ wrkflw/
 
 `pub(crate) fn emit(build: impl FnOnce() -> ExecutionEvent)`
 
+`pub(crate) fn step_output_observers() -> Vec<Arc<dyn ExecutionObserver>>`
+
 `pub(crate) fn first_step_for(job: &str, steps: &[Step]) -> usize`
 
 `pub(crate) fn skipped_by_from_step(index: usize, first_step: usize, step: &Step) -> bool`
@@ -2891,7 +2790,7 @@ wrkflw/
 
 ## crates/executor/src/expression.rs
 
-**Language:** Rust | **Size:** 125.4 KB | **Lines:** 3130
+**Language:** Rust | **Size:** 130.7 KB | **Lines:** 3272
 
 **Imports:**
 - `serde_yaml::Value`
@@ -3007,9 +2906,117 @@ wrkflw/
 
 ---
 
+## crates/executor/src/job_memory.rs
+
+**Language:** Rust | **Size:** 21.3 KB | **Lines:** 588
+
+**Imports:**
+- `std::collections::HashMap`
+- `std::path::PathBuf`
+- `std::sync::atomic::{AtomicBool, AtomicU64, Ordering}`
+- `std::sync::{Arc, Mutex}`
+- `serde::{Deserialize, Serialize}`
+- `sha2::{Digest, Sha256}`
+
+**Declarations:**
+
+`const MIB: u64 = 1024 * 1024`
+
+`const RUNS_KEPT: usize = 3`
+
+`const MIN_RESERVED_BYTES: u64 = 512 * MIB`
+
+`const HEADROOM_BYTES: u64 = 256 * MIB`
+
+`pub(crate) const SIGKILL_EXIT: i32 = 137`
+
+`const KILLED_CHILD_SIGNS: &[&str] = &[ // cargo, for rustc or a build script "(signal: 9, SIGKILL", // gcc and collect2, for ld or cc1 "terminated with signal 9", "Killed signal terminated program", ]`
+
+`fn shell_reports_kill(text: &str) -> bool`
+
+`pub(crate) fn ran_out_of_memory(exit_code: i32, oom_killed: bool, output: &[&str]) -> bool`
+
+`pub(crate) struct JobMeter`
+> Fields: `current: Mutex<HashMap<String, u64>>`, `peak: AtomicU64`, `sampled: AtomicBool`, `incomplete: AtomicBool`, `killed: AtomicBool`, `neighbour_killed: AtomicBool`, `id: Mutex<Option<String>>`
+
+**`impl JobMeter`**
+  `pub(crate) fn sample(&self, container: &str, bytes: u64)`
+
+  `pub(crate) fn stopped(&self, container: &str)`
+
+  `pub(crate) fn unmeasured(&self)`
+
+  `pub(crate) fn killed(&self)`
+
+  `pub(crate) fn is_incomplete(&self) -> bool`
+
+  `fn outcome(&self) -> Outcome`
+
+
+`enum Outcome`
+> Variants: `Peak`, `Killed`, `Unknown`
+
+`static ACTIVE: Mutex<Vec<std::sync::Weak<JobMeter>>> = Mutex::new(Vec::new())`
+
+`struct Active(Arc<JobMeter>)`
+
+**`impl Active`**
+  `fn register(meter: &Arc<JobMeter>) -> Active`
+
+
+**`impl Drop for Active`**
+  `fn drop(&mut self)`
+
+
+`pub(crate) async fn metered<F: std::future::Future>( future: F, succeeded: impl FnOnce(&F::Output) -> bool, ) -> F::Output`
+
+`pub(crate) fn measure_as(id: &str)`
+
+`pub(crate) fn meter() -> Option<Arc<JobMeter>>`
+
+`pub(crate) fn unmeasured()`
+
+`pub(crate) fn job_id(identity: &str) -> String`
+
+`fn reserve_for(peaks: &[u64], highest: u64) -> Option<u64>`
+
+`const STORE_VERSION: u32 = 1`
+
+`const FORGET_AFTER_SECS: i64 = 90 * 24 * 60 * 60`
+
+`struct Store`
+> Fields: `version: u32`, `jobs: HashMap<String, Measured>`
+
+**`impl Default for Store`**
+  `fn default() -> Self`
+
+
+`struct Measured`
+> Fields: `peaks: Vec<u64>`, `highest: u64`, `at: i64`
+
+`static STORE_LOCK: Mutex<()> = Mutex::new(())`
+
+`fn lock_file(path: &std::path::Path, exclusive: bool) -> Option<std::fs::File>`
+
+`fn store_path() -> Option<PathBuf>`
+
+`fn load(path: &std::path::Path) -> Store`
+
+`pub(crate) fn reserve(id: &str) -> Option<u64>`
+
+`fn record(id: &str, meter: &JobMeter, passed: bool)`
+
+`fn to_keep(outcome: Outcome, passed: bool) -> Option<Outcome>`
+
+`fn apply(store: &mut Store, id: &str, outcome: Outcome, now: i64)`
+
+`mod tests`
+
+---
+
 ## crates/executor/src/job_session.rs
 
-**Language:** Rust | **Size:** 50.4 KB | **Lines:** 1412
+**Language:** Rust | **Size:** 51.3 KB | **Lines:** 1439
 
 **Imports:**
 - `crate::acceleration`
@@ -3031,7 +3038,7 @@ wrkflw/
 
 `const SERVICE_POLL: Duration = Duration::from_millis(500)`
 
-`const KEEP_ALIVE: &str = "trap 'exit 0' TERM`
+`pub(crate) const KEEP_ALIVE: &str = "trap 'exit 0' TERM`
 
 `struct ServiceSpec`
 > Fields: `name: String`, `image: String`, `env: HashMap<String, String>`, `volumes: Vec<String>`, `options: Option<String>`, `ports: Vec<String>`
@@ -3106,6 +3113,10 @@ wrkflw/
 
 `async fn cli_output( cli: &str, args: &[String], stdin: Option<&str>, ) -> Result<ContainerOutput, ContainerError>`
 
+`async fn wait_with_tap( child: tokio::process::Child, live: bool, ) -> std::io::Result<std::process::Output>`
+
+`async fn run_cli( cli: &str, args: &[String], stdin: Option<&str>, live: bool, ) -> Result<ContainerOutput, ContainerError>`
+
 `fn last_chars(text: &str, count: usize) -> String`
 
 `enum Readiness`
@@ -3162,7 +3173,7 @@ wrkflw/
 
 ## crates/executor/src/kubernetes/mod.rs
 
-**Language:** Rust | **Size:** 70.7 KB | **Lines:** 2033
+**Language:** Rust | **Size:** 70.7 KB | **Lines:** 2036
 
 **Imports:**
 - `async_trait::async_trait`
@@ -3181,7 +3192,7 @@ wrkflw/
 
 `mod manifest`
 
-`mod sync`
+`pub(crate) mod sync`
 
 `const DEADLINE_MARGIN_SECS: u64 = 30`
 
@@ -3388,16 +3399,21 @@ wrkflw/
 
 `fn append_tree<W: io::Write>(builder: &mut tar::Builder<W>, root: &Path) -> io::Result<()>`
 
+`pub(crate) fn safe_relative_path(path: &Path) -> Option<PathBuf>`
+
+`pub(crate) fn clear_type_conflict( host: &Path, rel: &Path, incoming_is_dir: bool, ) -> io::Result<()>`
+
 `mod tests`
 
 ---
 
 ## crates/executor/src/lib.rs
 
-**Language:** Rust | **Size:** 978 B | **Lines:** 34
+**Language:** Rust | **Size:** 1.9 KB | **Lines:** 58
 
 **Imports:**
 - `pub use acceleration::{validate_remote, Acceleration, Secret, Sidecar, SIDECAR_PATH}`
+- `pub use action_fidelity::UnexecutedAction`
 - `pub use docker::cleanup_resources`
 - `pub use engine::{
     detect_runtime, execute_workflow, parse_platform_override, ExecutionConfig, JobResult,
@@ -3408,6 +3424,8 @@ wrkflw/
     STDERR_HEADER, STDOUT_HEADER,
 }`
 - `pub use kubernetes::{parse_key_value as parse_k8s_key_value, KubernetesConfig}`
+- `pub use log_redaction::{begin_run as begin_log_scope, RunScope as LogScope}`
+- `pub use runner_fidelity::RunnerSubstitution`
 
 **Declarations:**
 
@@ -3415,17 +3433,195 @@ wrkflw/
 
 `pub(crate) mod cache`
 
+`pub(crate) mod checkout_sync`
+
 `mod container_guard`
 
+`pub(crate) mod job_memory`
+
 `pub(crate) mod job_session`
+
+`pub(crate) mod live_step`
+
+`pub(crate) mod log_redaction`
+
+`pub(crate) mod matrix_fold`
+
+`pub(crate) mod setup_actions`
+
+`pub(crate) mod vm_workspace`
 
 `pub(crate) mod workflow_commands`
 
 ---
 
+## crates/executor/src/live_step.rs
+
+**Language:** Rust | **Size:** 23.0 KB | **Lines:** 638
+
+**Imports:**
+- `crate::engine::format_annotation_location`
+- `std::sync::{Arc, Mutex}`
+- `wrkflw_secrets::SecretMasker`
+- `wrkflw_runtime::live_output::Stream`
+
+**Declarations:**
+
+`pub(crate) struct LiveStep<'a>`
+> Fields: `job: String`, `step: String`, `index: usize`, `workspace_prefixes: Vec<String>`, `masker: Option<&'a SecretMasker>`
+
+`struct StepLabel`
+> Fields: `job: String`, `step: String`, `index: usize`, `workspace_prefixes: Vec<String>`
+
+`const LIVE_LINE_LIMIT: usize = 4096`
+
+`const LIVE_LINE_OVERLAP: usize = 1024`
+
+`const DROPPED_COMMAND_LIMIT: usize = 1 << 20`
+
+**`impl LiveStep<'_>`**
+  `pub(crate) async fn run<F: std::future::Future>( self, future: std::pin::Pin<Box<F>>, ) -> F::Output`
+
+
+`struct LiveLines`
+> Fields: `step: StepLabel`, `masker: Option<SecretMasker>`, `observers: Vec<Arc<dyn crate::events::ExecutionObserver>>`, `pending: Mutex<Pending>`
+
+`struct Pending`
+> Fields: `stdout: PendingLine`, `stderr: PendingLine`
+
+**`impl Pending`**
+  `fn of(&mut self, stream: Stream) -> &mut PendingLine`
+
+
+`struct PendingLine`
+> Fields: `text: String`, `held_command: Option<HeldCommand>`
+
+`struct HeldCommand`
+> Fields: `text: String`, `truncated: bool`
+
+**`impl HeldCommand`**
+  `fn push(&mut self, text: &str)`
+
+  `fn into_line(self) -> Option<String>`
+
+
+**`impl LiveLines`**
+  `fn push(&self, stream: Stream, chunk: &str)`
+
+  `fn complete_lines(&self, line: &mut PendingLine, mut chunk: &str) -> Vec<String>`
+
+  `fn flush(&self)`
+
+  `fn mask(&self, text: &str) -> String`
+
+  `fn send(&self, text: &str)`
+
+
+`fn visible_line(line: &str) -> Option<String>`
+
+`fn live_annotation(command: crate::workflow_commands::WorkflowCommand) -> Option<String>`
+
+`mod tests`
+
+---
+
+## crates/executor/src/log_redaction.rs
+
+**Language:** Rust | **Size:** 9.6 KB | **Lines:** 268
+
+**Imports:**
+- `once_cell::sync::Lazy`
+- `std::sync::{Arc, Mutex, Once, RwLock}`
+- `wrkflw_secrets::SecretMasker`
+
+**Declarations:**
+
+`struct RunMaskers`
+> Fields: `masker: RwLock<Arc<SecretMasker>>`, `active: Mutex<usize>`
+
+**`impl RunMaskers`**
+  `fn new() -> Self`
+
+  `fn current(&self) -> Arc<SecretMasker>`
+
+  `fn begin(&self)`
+
+  `fn end(&self)`
+
+
+`static LOG_MASKERS: Lazy<RunMaskers> = Lazy::new(RunMaskers::new)`
+
+`static INSTALL: Once = Once::new()`
+
+`fn current() -> Arc<SecretMasker>`
+
+**`impl Drop for RunScope`**
+  `fn drop(&mut self)`
+
+
+`pub(crate) fn register(value: &str)`
+
+`pub(crate) fn mask(text: &str) -> String`
+
+`pub(crate) fn args_for_log<S: AsRef<str>>(args: &[S]) -> String`
+
+`pub(crate) fn env_names_for_log<'a>(names: impl IntoIterator<Item = &'a str>) -> String`
+
+`pub(crate) fn register_all<'a>(values: impl IntoIterator<Item = &'a String>)`
+
+`const UNNAMED_CREDENTIAL_MIN_LEN: usize = 16`
+
+`const CREDENTIAL_NAME_PARTS: &[&str] = &[ "TOKEN", "SECRET", "PASSWORD", "PASSWD", "PASS", "PWD", "KEY", "AUTH", "CREDENTIAL", "PRIVATE", "CERT", "COOKIE", "SESSION", "SIGNATURE", "DSN", ]`
+
+`pub(crate) fn register_variables<'a>( variables: impl IntoIterator<Item = (&'a String, &'a String)>, )`
+
+`fn looks_like_credential(name: &str, value: &str) -> bool`
+
+`mod tests`
+
+---
+
+## crates/executor/src/matrix_fold.rs
+
+**Language:** Rust | **Size:** 22.5 KB | **Lines:** 606
+
+**Imports:**
+- `crate::engine::{get_effective_runner_image, JobResult, JobStatus}`
+- `serde_yaml::Value`
+- `std::collections::HashMap`
+- `wrkflw_matrix::MatrixCombination`
+- `wrkflw_parser::workflow::Job`
+
+**Declarations:**
+
+`pub(crate) fn matrix_twins( job: &Job, combinations: &[MatrixCombination], platform_overrides: &HashMap<String, String>, ) -> Vec<Option<usize>>`
+
+`fn job_body_text(job: &Job) -> Option<String>`
+
+`fn collect_strings(value: &serde_json::Value, text: &mut String)`
+
+`fn differing_keys(a: &HashMap<String, Value>, b: &HashMap<String, Value>) -> Vec<String>`
+
+`enum Reads`
+> Variants: `Keys`, `Any`
+
+`fn matrix_reads(text: &str) -> Reads`
+
+`fn is_word(c: char) -> bool`
+
+`fn mentions<'a>(lower: &'a str, name: &'a str) -> impl Iterator<Item = &'a str> + 'a`
+
+`fn reads_matrix_keys(body: &str, keys: &[String]) -> bool`
+
+`pub(crate) fn repeated_leg( name: &str, original: &JobResult, image: &str, runner: Option<&crate::runner_fidelity::RunnerSubstitution>, ) -> JobResult`
+
+`mod tests`
+
+---
+
 ## crates/executor/src/podman.rs
 
-**Language:** Rust | **Size:** 36.9 KB | **Lines:** 992
+**Language:** Rust | **Size:** 38.1 KB | **Lines:** 1028
 
 **Imports:**
 - `crate::container_guard::ContainerGuard`
@@ -3487,6 +3683,10 @@ wrkflw/
 
   `async fn image_exists(&self, tag: &str) -> Result<bool, ContainerError>`
 
+  `async fn image_id(&self, image: &str) -> Option<String>`
+
+  `fn identifies_images(&self) -> bool`
+
 
 `async fn image_path(image: &str) -> Option<String>`
 
@@ -3497,6 +3697,162 @@ wrkflw/
 
   `async fn build_image_inner( &self, dockerfile: &Path, tag: &str, context_dir: &Path, ) -> Result<(), ContainerError>`
 
+
+---
+
+## crates/executor/src/run_options.rs
+
+**Language:** Rust | **Size:** 2.9 KB | **Lines:** 79
+
+**Imports:**
+- `std::sync::atomic::{AtomicBool, Ordering}`
+
+**Declarations:**
+
+`static FRESH_WORKSPACES: AtomicBool = AtomicBool::new(false)`
+
+`static EVERY_MATRIX_LEG: AtomicBool = AtomicBool::new(false)`
+
+`fn env_flag(name: &str) -> bool`
+
+`mod tests`
+
+---
+
+## crates/executor/src/runner_fidelity.rs
+
+**Language:** Rust | **Size:** 12.6 KB | **Lines:** 364
+
+**Imports:**
+- `crate::engine::RuntimeType`
+- `crate::events::{emit, ExecutionEvent}`
+- `serde::{Deserialize, Serialize}`
+- `serde_yaml::Value`
+- `std::collections::HashMap`
+- `wrkflw_parser::workflow::Job`
+
+**Declarations:**
+
+**`impl RunnerSubstitution`**
+  `pub fn reason(&self) -> String`
+
+  `pub fn unverified_entry(&self, job: &str) -> serde_json::Value`
+
+
+`pub(crate) fn runs_on_labels( runs_on: &Option<Vec<String>>, matrix: Option<&HashMap<String, Value>>, ) -> Vec<String>`
+
+`fn matrix_label(label: &str, matrix: Option<&HashMap<String, Value>>) -> String`
+
+`fn fallback_label(label: &str, matrix: Option<&HashMap<String, Value>>) -> String`
+
+`pub(crate) fn mapped_image<'a>( labels: &[String], platform_overrides: &'a HashMap<String, String>, ) -> Option<&'a String>`
+
+**`impl RequestedOs`**
+  `pub fn ran_as(&self, ran_as: &str) -> Option<RunnerSubstitution>`
+
+
+`pub(crate) fn substitution( job: &Job, matrix: Option<&HashMap<String, Value>>, env: &HashMap<String, String>, platform_overrides: &HashMap<String, String>, ) -> Option<RunnerSubstitution>`
+
+`fn label_os(label: &str) -> Option<&'static str>`
+
+`pub(crate) fn announce(job: &str, substitution: Option<&RunnerSubstitution>)`
+
+`mod tests`
+
+---
+
+## crates/executor/src/setup_actions.rs
+
+**Language:** Rust | **Size:** 38.5 KB | **Lines:** 962
+
+**Imports:**
+- `std::collections::HashMap`
+- `std::path::{Path, PathBuf}`
+- `wrkflw_parser::workflow::Step`
+- `crate::action_resolver::is_git_sha`
+
+**Declarations:**
+
+`pub(crate) const NO_IMPLEMENTATION: &str = "no implementation in wrkflw"`
+
+`pub(crate) struct BuiltRuntimes`
+> Fields: `installed: Vec<String>`, `not_built: Vec<(usize, NotBuilt)>`
+
+`pub(crate) enum NotBuilt`
+> Variants: `Refused`, `Superseded`
+
+**`impl BuiltRuntimes`**
+  `fn has(&self, language: &str) -> bool`
+
+  `pub(crate) fn for_composite(&self) -> Self`
+
+
+`pub(crate) struct SetupDetection`
+> Fields: `runtimes: Vec<SetupRuntime>`, `not_built: Vec<(usize, NotBuilt)>`
+
+`pub(crate) struct SetupRuntime`
+> Fields: `language: String`, `version: String`, `install_script: String`
+
+`pub(crate) struct SetupActionDef`
+> Fields: `repos: &'static [&'static str]`, `with_key: &'static str`, `default_version: &'static str`, `language: &'static str`, `version_from_ref: bool`, `version_file_key: Option<&'static str>`
+
+`pub(crate) const SETUP_ACTIONS: &[SetupActionDef] = &[ SetupActionDef`
+
+`pub(crate) fn node_major_for_range(range: &str) -> Option<String>`
+
+`pub(crate) fn version_from_file(root: &Path, file: &str) -> Option<String>`
+
+`pub(crate) fn unrun_action_cause( repository: &str, built: &BuiltRuntimes, container_runtime: bool, step_idx: usize, ) -> Option<&'static str>`
+
+`fn contained_path(root: &Path, file: &str) -> Option<PathBuf>`
+
+`pub(crate) fn requires_python(text: &str) -> Option<String>`
+
+`pub(crate) fn is_safe_version(version: &str) -> bool`
+
+`pub(crate) fn is_safe_python_spec(spec: &str) -> bool`
+
+`pub(crate) fn detect_setup_runtimes(steps: &[Step]) -> Vec<SetupRuntime>`
+
+`pub(crate) fn detect_setup(steps: &[Step]) -> SetupDetection`
+
+`pub(crate) fn detect_setup_runtimes_in(steps: &[Step], root: &Path) -> Vec<SetupRuntime>`
+
+`pub(crate) fn detect_setup_in(steps: &[Step], root: &Path) -> SetupDetection`
+
+`pub(crate) fn node_alias(version: &str) -> Option<String>`
+
+`pub(crate) fn get_install_script(language: &str, version: &str) -> String`
+
+`fn go_release(version: &str) -> String`
+
+`fn is_full_release(version: &str) -> bool`
+
+`fn go_prerelease(version: &str) -> Option<String>`
+
+`fn go_release_known(version: &str) -> bool`
+
+`pub(crate) const UV_PYTHON_DIR: &str = "/opt/uv/python"`
+
+`pub(crate) const PYTHON_SCRIPTS_DIR: &str = "/opt/uv/python-bin"`
+
+`const PRINT_SCRIPTS_DIR: &str = "import sysconfig`
+
+`pub(crate) const DROP_EXTERNALLY_MANAGED: &str = "import os, sysconfig`
+
+`pub(crate) fn uv_install_command(version: &str) -> String`
+
+`pub(crate) fn uv_install_unless_present() -> String`
+
+`pub(crate) fn uv_python_request(version: &str) -> String`
+
+`pub(crate) const RUNNER_NODE_MAJOR: &str = "22"`
+
+`pub(crate) fn runner_node_install() -> String`
+
+`pub(crate) fn rust_toolchain_extras( with: &HashMap<String, String>, resolve: impl Fn(&str) -> Option<String>, ) -> Vec<String>`
+
+`pub(crate) fn static_input(value: &str) -> Option<String>`
 
 ---
 
@@ -3527,15 +3883,340 @@ wrkflw/
 
 ---
 
+## crates/executor/src/vm_memory.rs
+
+**Language:** Rust | **Size:** 20.8 KB | **Lines:** 568
+
+**Imports:**
+- `std::sync::{Arc, OnceLock}`
+- `std::time::{Duration, Instant}`
+- `tokio::sync::{OwnedSemaphorePermit, Semaphore}`
+
+**Declarations:**
+
+`const GIB: u64 = 1024 * 1024 * 1024`
+
+`const WARN_BELOW_BYTES: u64 = 14 * GIB`
+
+`const BYTES_PER_JOB: u64 = 4 * GIB`
+
+`const QUERY_TIMEOUT: Duration = Duration::from_secs(10)`
+
+`const MIB: u64 = 1024 * 1024`
+
+`pub(crate) enum Limit`
+> Variants: `Jobs`, `Memory`
+
+`fn vm_reserved(bytes: u64) -> u64`
+
+`fn shared(bytes: u64) -> u64`
+
+`struct Pool`
+> Fields: `places: Arc<Semaphore>`, `limit: Limit`
+
+**`impl Pool`**
+  `fn new(limit: Limit) -> Pool`
+
+  `fn weight(&self, measured: Option<u64>) -> u32`
+
+
+`fn mib(bytes: u64) -> usize`
+
+`type RunPool = Arc<OnceLock<Option<Arc<Pool>>>>`
+
+`pub(crate) async fn with_run_pool<F: std::future::Future>(future: F) -> F::Output`
+
+`pub(crate) async fn job_slot(job: Option<&str>) -> Option<OwnedSemaphorePermit>`
+
+`pub(crate) fn sizes_by_memory() -> bool`
+
+`fn env_limit() -> Option<usize>`
+
+`fn parse_limit(value: &str) -> Option<usize>`
+
+`fn limit_for(bytes: u64) -> Option<usize>`
+
+`fn gigabytes(bytes: u64) -> String`
+
+**`impl Memory`**
+  `pub fn limit(&self) -> Option<usize>`
+
+  `fn pool_limit(&self) -> Option<Limit>`
+
+  `pub fn warning(&self) -> Option<String>`
+
+  `pub fn to_env(&self) -> String`
+
+  `fn from_env(value: &str) -> Option<Memory>`
+
+
+`fn warning(memory: &Memory, limit: Option<usize>) -> String`
+
+`fn info(cli: &str, format: &str) -> Option<String>`
+
+`fn parse_info(cli: &str, text: &str, host_is_linux: bool) -> Option<Memory>`
+
+`fn parent_probe(value: &str, cli: &str) -> Option<Memory>`
+
+`pub(crate) async fn check(cli: Option<&str>)`
+
+`fn set_limit(limit: Option<Limit>)`
+
+`async fn limit_from_memory(cli: &str) -> Option<Limit>`
+
+`mod tests`
+
+---
+
+## crates/executor/src/vm_workspace.rs
+
+**Language:** Rust | **Size:** 91.4 KB | **Lines:** 2536
+
+**Imports:**
+- `std::collections::{HashMap, HashSet}`
+- `std::io::{self, Read, Write}`
+- `std::path::{Path, PathBuf}`
+- `std::process::{Command, Stdio}`
+- `std::sync::atomic::{AtomicU64, Ordering}`
+- `std::sync::{Arc, LazyLock, Mutex}`
+- `std::time::{Duration, Instant}`
+- `sha2::{Digest, Sha256}`
+- `wrkflw_runtime::container::ContainerRuntime`
+- `crate::kubernetes::sync::{clear_type_conflict, safe_relative_path}`
+
+**Declarations:**
+
+`pub(crate) const MOUNT_ENV: &str = "WRKFLW_WORKSPACE_MOUNT"`
+
+`const HELPER_IMAGE_ENV: &str = "WRKFLW_WORKSPACE_HELPER_IMAGE"`
+
+`const DEFAULT_HELPER_IMAGE: &str = "ubuntu:latest"`
+
+`const LABEL: &str = "wrkflw.workspace"`
+
+`const VOLUME_PREFIX: &str = "wrkflw-ws-"`
+
+`const ROOT: &str = "/ws"`
+
+`enum Kind`
+> Variants: `File`, `Dir`, `Link`
+
+**`impl Kind`**
+  `fn same_type(&self, other: &Kind) -> bool`
+
+
+`struct Entry`
+> Fields: `kind: Kind`, `mode: Option<u32>`
+
+**`impl Entry`**
+  `fn matches(&self, other: &Entry) -> bool`
+
+
+`type Listing = HashMap<PathBuf, Entry>`
+
+`fn wanted(on_by_default: bool, setting: Option<&str>) -> bool`
+
+`fn volume_name(host: &Path) -> String`
+
+`struct State`
+> Fields: `helper: Option<String>`, `volume: Option<Listing>`, `host: Option<Listing>`, `kept: HashSet<PathBuf>`, `pending: HashSet<PathBuf>`, `unlisted: HashSet<PathBuf>`, `unusable: bool`, `used: bool`, `stalled: Option<String>`, `step_in_volume: bool`
+
+**`impl State`**
+  `fn new() -> Self`
+
+  `fn for_volume(volume: &str) -> Self`
+
+
+`fn is_kept(kept: &HashSet<PathBuf>, path: &Path) -> bool`
+
+`fn outside(listing: &Listing, set: &HashSet<PathBuf>) -> Listing`
+
+`fn under_any(sorted: &[PathBuf], path: &Path) -> bool`
+
+`fn outermost(sorted: Vec<PathBuf>) -> Vec<PathBuf>`
+
+`pub(crate) struct VmWorkspace`
+> Fields: `cli: &'static str`, `host: PathBuf`, `volume: String`, `volume_path: PathBuf`, `state: Mutex<State>`
+
+`static WORKSPACES: LazyLock<Mutex<HashMap<PathBuf, Arc<VmWorkspace>>>> = LazyLock::new(|| Mutex::new(HashMap::new()))`
+
+`pub(crate) async fn before_step( runtime: &dyn ContainerRuntime, host: &Path, ) -> Result<Option<Arc<VmWorkspace>>, String>`
+
+`pub(crate) async fn after_cancelled_step(host: &Path) -> Result<(), String>`
+
+**`impl VmWorkspace`**
+  `pub(crate) fn mount_in<'a>(&'a self, volumes: &mut [(&'a Path, &'a Path)])`
+
+  `pub(crate) async fn after_step(self: &Arc<Self>) -> Result<(), String>`
+
+  `fn lock(&self) -> std::sync::MutexGuard<'_, State>`
+
+  `fn sync_in(&self) -> Result<bool, String>`
+
+  `fn sync_in_locked(&self, state: &mut State) -> io::Result<()>`
+
+  `fn sync_out(&self) -> Result<(), String>`
+
+  `fn sync_out_locked(&self, state: &mut State) -> io::Result<()>`
+
+  `fn helper(&self, state: &mut State) -> io::Result<String>`
+
+  `fn list_volume(&self, helper: &str) -> io::Result<(Listing, HashSet<PathBuf>)>`
+
+  `fn send(&self, helper: &str, paths: &[PathBuf], volume: &Listing) -> io::Result<()>`
+
+  `fn fetch(&self, helper: &str, paths: &[PathBuf], volume: &Listing) -> io::Result<Unpacked>`
+
+
+`struct SyncIn`
+> Fields: `delete: Vec<PathBuf>`, `send: Vec<PathBuf>`
+
+`fn plan_sync_in( host: &Listing, volume: &Listing, before: Option<&Listing>, kept: &HashSet<PathBuf>, on_host: impl Fn(&Path) -> bool, ) -> SyncIn`
+
+`struct SyncOut`
+> Fields: `delete: Vec<PathBuf>`, `fetch: Vec<PathBuf>`
+
+`fn plan_sync_out(host: &Listing, volume: &Listing, kept: &HashSet<PathBuf>) -> SyncOut`
+
+`fn parse_listing(out: &[u8]) -> Listing`
+
+`fn path_from_bytes(bytes: &[u8]) -> PathBuf`
+
+`fn path_from_bytes(bytes: &[u8]) -> PathBuf`
+
+`fn path_bytes(path: &Path) -> Vec<u8>`
+
+`fn path_bytes(path: &Path) -> Vec<u8>`
+
+`fn nul_list(paths: &[PathBuf]) -> Vec<u8>`
+
+`fn host_entry(meta: &std::fs::Metadata, path: &Path) -> Option<Entry>`
+
+`fn link_target(target: PathBuf) -> PathBuf`
+
+`fn mtime_secs(meta: &std::fs::Metadata) -> i64`
+
+`fn mtime_secs(meta: &std::fs::Metadata) -> i64`
+
+`fn host_mode(meta: &std::fs::Metadata) -> Option<u32>`
+
+`fn host_mode(_meta: &std::fs::Metadata) -> Option<u32>`
+
+`fn walk(root: &Path) -> io::Result<(Listing, Vec<PathBuf>)>`
+
+`fn without_unreadable(volume: &Listing, unreadable: &[PathBuf]) -> Listing`
+
+`fn remove_host_entry(target: &Path) -> io::Result<()>`
+
+`fn make_writable(path: &Path)`
+
+`fn append_host_entry<W: Write>( builder: &mut tar::Builder<W>, full: &Path, rel: &Path, _in_volume: Option<&Entry>, ) -> io::Result<()>`
+
+`struct Unpacked`
+> Fields: `refused: Vec<PathBuf>`, `failed: Vec<(PathBuf, io::Error)>`
+
+`fn cannot_hold(e: &io::Error) -> bool`
+
+`fn illegal_name_code() -> Option<i32>`
+
+`fn os_error(e: &io::Error) -> Option<i32>`
+
+`fn spelled_otherwise_on_host( host: &Path, rel: &Path, names: &mut HashMap<PathBuf, Option<HashSet<std::ffi::OsString>>>, ) -> bool`
+
+`fn unpack<R: Read>(reader: R, host: &Path, volume: &Listing) -> io::Result<Unpacked>`
+
+`fn unlisted_entries(stderr: &[u8]) -> Result<HashSet<PathBuf>, String>`
+
+`fn kept_file(volume: &str) -> Option<PathBuf>`
+
+`fn pending_file(volume: &str) -> Option<PathBuf>`
+
+`fn forget_saved(volume: &str)`
+
+`fn load_paths(file: Option<&Path>) -> HashSet<PathBuf>`
+
+`fn save_paths(file: Option<&Path>, kept: &HashSet<PathBuf>)`
+
+`fn refuse_link_parents(host: &Path, rel: &Path) -> io::Result<()>`
+
+`fn set_dir_mode(dir: &Path, mode: Option<u32>, _entry: Option<&Entry>)`
+
+`fn set_dir_mode(_dir: &Path, _mode: Option<u32>, _entry: Option<&Entry>)`
+
+`const ENGINE_IDLE_LIMIT: Duration = Duration::from_secs(10 * 60)`
+
+`const CLEANUP_IDLE_LIMIT: Duration = Duration::from_secs(60)`
+
+`struct Progress(Arc<AtomicU64>)`
+
+**`impl Progress`**
+  `fn add(&self, bytes: usize)`
+
+  `fn get(&self) -> u64`
+
+
+`struct Counted<T>`
+> Fields: `inner: T`, `progress: Progress`
+
+**`impl<T> Counted<T>`**
+  `fn new(inner: T, progress: Progress) -> Self`
+
+
+**`impl<R: Read> Read for Counted<R>`**
+  `fn read(&mut self, buf: &mut [u8]) -> io::Result<usize>`
+
+
+**`impl<W: Write> Write for Counted<W>`**
+  `fn write(&mut self, buf: &[u8]) -> io::Result<usize>`
+
+  `fn flush(&mut self) -> io::Result<()>`
+
+
+`fn bound( mut child: std::process::Child, what: String, idle: Duration, progress: Progress, ) -> std::thread::JoinHandle<io::Result<std::process::ExitStatus>>`
+
+`fn finish( watcher: std::thread::JoinHandle<io::Result<std::process::ExitStatus>>, ) -> io::Result<std::process::ExitStatus>`
+
+`fn drain<R: Read + Send + 'static>( pipe: Option<R>, progress: Progress, ) -> std::thread::JoinHandle<Vec<u8>>`
+
+`fn output_within( command: &mut Command, stdin: Option<Vec<u8>>, what: &str, idle: Duration, ) -> io::Result<std::process::Output>`
+
+`fn only_vanished(stderr: &str) -> bool`
+
+`fn exec(cli: &str, helper: &str, cmd: &[&str], stdin: Option<Vec<u8>>) -> io::Result<Vec<u8>>`
+
+`fn command_failed(cmd: &[&str], stderr: &[u8]) -> io::Error`
+
+`fn exec_output( cli: &str, helper: &str, cmd: &[&str], stdin: Option<Vec<u8>>, ) -> io::Result<std::process::Output>`
+
+`fn track(cli: &str, id: &str)`
+
+`fn remove_container(cli: &str, id: &str)`
+
+`pub(crate) fn release(host: &Path, kept: bool)`
+
+`const VOLUME_REMOVAL_TRIES: usize = 120`
+
+`static PENDING_REMOVALS: Mutex<Vec<std::thread::JoinHandle<()>>> = Mutex::new(Vec::new())`
+
+`pub(crate) fn remove_now(host: &Path)`
+
+`pub(crate) async fn wait_for_released_volumes()`
+
+`pub(crate) fn remove_orphaned_volumes() -> usize`
+
+`mod tests`
+
+---
+
 ## crates/executor/src/workflow_commands.rs
 
-**Language:** Rust | **Size:** 16.1 KB | **Lines:** 515
+**Language:** Rust | **Size:** 16.2 KB | **Lines:** 516
 
 **Declarations:**
 
 `fn decode_value(s: &str) -> String`
 
-`fn parse_command_line(line: &str) -> Option<WorkflowCommand>`
+`pub(crate) fn parse_command_line(line: &str) -> Option<WorkflowCommand>`
 
 `fn parse_params(s: &str) -> std::collections::HashMap<String, String>`
 
@@ -3543,9 +4224,69 @@ wrkflw/
 
 ---
 
+## crates/executor/src/workspace.rs
+
+**Language:** Rust | **Size:** 24.3 KB | **Lines:** 697
+
+**Imports:**
+- `std::fs::File`
+- `std::future::Future`
+- `std::path::{Path, PathBuf}`
+
+**Declarations:**
+
+`pub(crate) async fn with_workflow_file<F: Future>(path: &Path, future: F) -> F::Output`
+
+`fn workflow_file() -> Option<PathBuf>`
+
+`pub(crate) async fn with_caller_job<F: Future>(job: &str, future: F) -> F::Output`
+
+`fn callers() -> Option<String>`
+
+`pub(crate) fn job_identity(repo: &Path, workflow: &str, job: &str) -> String`
+
+`fn workflow_key(workflow: &str, callers: Option<&str>) -> String`
+
+`pub(crate) enum JobWorkspace`
+> Variants: `Kept`, `Fresh`
+
+`static FRESH: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new())`
+
+**`impl Drop for JobWorkspace`**
+  `fn drop(&mut self)`
+
+
+**`impl JobWorkspace`**
+  `pub(crate) fn path(&self) -> &Path`
+
+  `pub(crate) fn acquire(repo: &Path, workflow: &str, job: &str) -> std::io::Result<Self>`
+
+  `fn fresh() -> std::io::Result<Self>`
+
+  `fn keep( root: &Path, repo: &Path, file: &Path, workflow: &str, job: &str, ) -> std::io::Result<Option<Self>>`
+
+
+`pub(crate) fn tracked_record(workspace: &Path) -> Option<PathBuf>`
+
+`fn lock_soon(lock: &File) -> std::io::Result<bool>`
+
+`fn root_from(configured: Option<std::ffi::OsString>, cache: Option<PathBuf>) -> Option<PathBuf>`
+
+`fn clean_under(root: &Path) -> std::io::Result<CleanReport>`
+
+`fn size_of(dir: &Path) -> u64`
+
+`fn slug(text: &str) -> String`
+
+`fn short_hash(text: &str) -> u64`
+
+`mod tests`
+
+---
+
 ## crates/github/Cargo.toml
 
-**Language:** TOML | **Size:** 636 B | **Lines:** 25
+**Language:** TOML | **Size:** 689 B | **Lines:** 27
 
 **Declarations:**
 
@@ -3561,7 +4302,7 @@ wrkflw/
 
 ## crates/github/src/lib.rs
 
-**Language:** Rust | **Size:** 15.6 KB | **Lines:** 452
+**Language:** Rust | **Size:** 25.2 KB | **Lines:** 722
 
 **Imports:**
 - `lazy_static::lazy_static`
@@ -3576,7 +4317,17 @@ wrkflw/
 
 **Declarations:**
 
+`const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30)`
+
+`fn http_client() -> Result<reqwest::Client, GithubError>`
+
+`fn commit_id(text: &str) -> Option<String>`
+
 `async fn list_recent_workflow_runs( repo_info: &RepoInfo, workflow_segment: &str, token: &str, ) -> Result<Vec<serde_json::Value>, GithubError>`
+
+`fn api_token() -> Option<String>`
+
+`async fn api_get( client: &reqwest::Client, path: &str, token: Option<&str>, ) -> Result<serde_json::Value, GithubError>`
 
 `mod tests`
 
@@ -3584,7 +4335,7 @@ wrkflw/
 
 ## crates/gitlab/Cargo.toml
 
-**Language:** TOML | **Size:** 650 B | **Lines:** 26
+**Language:** TOML | **Size:** 680 B | **Lines:** 27
 
 **Declarations:**
 
@@ -3619,7 +4370,7 @@ wrkflw/
 
 ## crates/logging/Cargo.toml
 
-**Language:** TOML | **Size:** 508 B | **Lines:** 21
+**Language:** TOML | **Size:** 538 B | **Lines:** 22
 
 **Declarations:**
 
@@ -3635,13 +4386,13 @@ wrkflw/
 
 ## crates/logging/src/lib.rs
 
-**Language:** Rust | **Size:** 3.9 KB | **Lines:** 141
+**Language:** Rust | **Size:** 5.3 KB | **Lines:** 179
 
 **Imports:**
 - `chrono::Local`
 - `once_cell::sync::Lazy`
 - `std::sync::atomic::{AtomicBool, Ordering}`
-- `std::sync::{Arc, Mutex}`
+- `std::sync::{Arc, Mutex, OnceLock}`
 
 **Declarations:**
 
@@ -3653,15 +4404,23 @@ wrkflw/
 
 `static CONSOLE_TO_STDERR: AtomicBool = AtomicBool::new(false)`
 
+`type Redactor = Box<dyn Fn(&str) -> String + Send + Sync>`
+
+`static REDACTOR: OnceLock<Redactor> = OnceLock::new()`
+
+`fn redact(message: &str) -> std::borrow::Cow<'_, str>`
+
 **`impl LogLevel`**
   `fn prefix(&self) -> &'static str`
 
+
+`mod tests`
 
 ---
 
 ## crates/logging/src/symbols.rs
 
-**Language:** Rust | **Size:** 2.0 KB | **Lines:** 42
+**Language:** Rust | **Size:** 2.1 KB | **Lines:** 43
 
 **Declarations:**
 
@@ -3669,7 +4428,7 @@ wrkflw/
 
 ## crates/matrix/Cargo.toml
 
-**Language:** TOML | **Size:** 542 B | **Lines:** 22
+**Language:** TOML | **Size:** 572 B | **Lines:** 23
 
 **Declarations:**
 
@@ -3685,7 +4444,7 @@ wrkflw/
 
 ## crates/matrix/src/lib.rs
 
-**Language:** Rust | **Size:** 36.2 KB | **Lines:** 1055
+**Language:** Rust | **Size:** 40.1 KB | **Lines:** 1180
 
 **Imports:**
 - `indexmap::IndexMap`
@@ -3754,7 +4513,7 @@ wrkflw/
 
 ## crates/models/Cargo.toml
 
-**Language:** TOML | **Size:** 442 B | **Lines:** 17
+**Language:** TOML | **Size:** 472 B | **Lines:** 18
 
 **Declarations:**
 
@@ -3823,7 +4582,7 @@ wrkflw/
 
 ## crates/parser/Cargo.toml
 
-**Language:** TOML | **Size:** 684 B | **Lines:** 29
+**Language:** TOML | **Size:** 714 B | **Lines:** 30
 
 **Imports:**
 - `tempfile`
@@ -3842,7 +4601,7 @@ wrkflw/
 
 ## crates/parser/src/github-workflow.json
 
-**Language:** JSON | **Size:** 90.1 KB | **Lines:** 1719
+**Language:** JSON | **Size:** 91.0 KB | **Lines:** 1740
 
 **Declarations:**
 
@@ -4084,7 +4843,7 @@ wrkflw/
 
 ## crates/parser/src/workflow.rs
 
-**Language:** Rust | **Size:** 33.3 KB | **Lines:** 1068
+**Language:** Rust | **Size:** 38.7 KB | **Lines:** 1223
 
 **Imports:**
 - `serde::{Deserialize, Deserializer, Serialize, Serializer}`
@@ -4116,6 +4875,8 @@ wrkflw/
 
 `fn deserialize_bool_or_expression<'de, D>(deserializer: D) -> Result<Option<String>, D::Error> where D: Deserializer<'de>,`
 
+`fn deserialize_timeout_minutes<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error> where D: Deserializer<'de>,`
+
 `fn serialize_bool_or_expression<S>(value: &Option<String>, serializer: S) -> Result<S::Ok, S::Error> where S: Serializer,`
 
 **`impl Job`**
@@ -4134,6 +4895,8 @@ wrkflw/
   `pub fn resolve_action(&self, action_ref: &str) -> ActionInfo`
 
 
+`fn name_from_path(path: &Path) -> String`
+
 `fn normalize_triggers(on_value: &serde_yaml::Value) -> Result<Vec<String>, String>`
 
 `mod tests`
@@ -4142,7 +4905,7 @@ wrkflw/
 
 ## crates/runs/Cargo.toml
 
-**Language:** TOML | **Size:** 800 B | **Lines:** 28
+**Language:** TOML | **Size:** 905 B | **Lines:** 33
 
 **Declarations:**
 
@@ -4158,19 +4921,50 @@ wrkflw/
 
 ## crates/runs/src/digest.rs
 
-**Language:** Rust | **Size:** 14.3 KB | **Lines:** 421
+**Language:** Rust | **Size:** 47.9 KB | **Lines:** 1218
 
 **Imports:**
 - `crate::record::{JobRecord, RunRecord, RunStatus, StepRecord, SCHEMA_VERSION}`
 - `crate::store::RunStore`
 - `serde::Serialize`
+- `std::collections::BTreeSet`
 - `wrkflw_executor::{EXIT_CODE_LABEL, STDERR_HEADER, STDOUT_HEADER}`
 
 **Declarations:**
 
 `const MAX_ERROR_LINES: usize = 10`
 
-`const ERROR_WORDS: [&str`
+`static ERROR_WORD: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(||`
+
+`static ZERO_COUNT: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)\b(0|no)\s*$").unwrap())`
+
+`static ANSI: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(||`
+
+`static OUT_OF_MEMORY: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(||`
+
+`static KILLED: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(||`
+
+`const SIGKILL_EXIT: i32 = 137`
+
+`fn is_error_line(line: &str) -> bool`
+
+`static PASSING: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(||`
+
+`static FAILING: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"\b(FAIL(ED|URE)?|ERROR|Failed)\b").unwrap())`
+
+`static BRACKETED: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"\[[^\]]*\]|\([^)]*\)").unwrap())`
+
+`fn reports_pass(line: &str) -> bool`
+
+`fn cause_lines(text: &str, tail_lines: usize) -> Vec<String>`
+
+`fn failure_cause(text: &str, exit_code: Option<i32>, tail_lines: usize) -> Option<FailureCause>`
+
+`const SETUP_EVIDENCE_CHARS: usize = 240`
+
+`static SETUP_ERROR: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(||`
+
+`fn setup_failure(text: &str) -> Option<FailureCause>`
 
 `fn tail(text: &str, lines: usize) -> (Vec<String>, usize)`
 
@@ -4181,6 +4975,18 @@ wrkflw/
 `fn error_lines(text: &str, tail_lines: usize) -> Vec<String>`
 
 `fn without_durations(line: &str) -> String`
+
+`static PROGRESS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"\[\s*\d+%\]").unwrap())`
+
+`fn names_a_location(line: &str) -> bool`
+
+`fn failure_signature(text: &str) -> BTreeSet<String>`
+
+`fn failure_context(text: &str) -> BTreeSet<String>`
+
+`static DIGITS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"\d+").unwrap())`
+
+`fn failure_lines(text: &str) -> Vec<String>`
 
 `fn same_failure(a: &FailedStep, b: &FailedStep) -> bool`
 
@@ -4202,14 +5008,14 @@ wrkflw/
 
 ## crates/runs/src/lib.rs
 
-**Language:** Rust | **Size:** 671 B | **Lines:** 18
+**Language:** Rust | **Size:** 689 B | **Lines:** 18
 
 **Imports:**
 - `pub use digest::{failure_digest, render_digest, FailedStep, FailureDigest, DEFAULT_TAIL_LINES}`
 - `pub use record::{JobRecord, RunRecord, RunStatus, StepRecord, SCHEMA_VERSION}`
 - `pub use recorder::{
-    detect_agent, detect_session, emit_line, execute_recorded, record_skipped, repo_root_of,
-    RecordedRun, RunMeta, RunOptions,
+    detect_agent, detect_session, emit_line, execute_recorded, mark_interrupted, record_skipped,
+    repo_root_of, RecordedRun, RunMeta, RunOptions,
 }`
 - `pub use store::{history_disabled, home_dir, RunStore, DEFAULT_KEEP}`
 
@@ -4227,10 +5033,11 @@ wrkflw/
 
 ## crates/runs/src/record.rs
 
-**Language:** Rust | **Size:** 3.2 KB | **Lines:** 103
+**Language:** Rust | **Size:** 4.9 KB | **Lines:** 141
 
 **Imports:**
 - `serde::{Deserialize, Serialize}`
+- `wrkflw_executor::{RunnerSubstitution, UnexecutedAction}`
 
 **Declarations:**
 
@@ -4238,11 +5045,13 @@ wrkflw/
   `pub fn as_str(self) -> &'static str`
 
 
+`mod tests`
+
 ---
 
 ## crates/runs/src/recorder.rs
 
-**Language:** Rust | **Size:** 25.6 KB | **Lines:** 798
+**Language:** Rust | **Size:** 45.8 KB | **Lines:** 1290
 
 **Imports:**
 - `crate::digest::{failure_digest, FailureDigest, DEFAULT_TAIL_LINES}`
@@ -4271,6 +5080,10 @@ wrkflw/
 
 `fn session_from(get: impl Fn(&str) -> Option<String>) -> Option<String>`
 
+**`impl std::fmt::Debug for RunOptions`**
+  `fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result`
+
+
 `struct GitInfo`
 > Fields: `root: Option<String>`, `sha: Option<String>`, `branch: Option<String>`, `dirty: Option<bool>`
 
@@ -4287,7 +5100,7 @@ wrkflw/
 `fn tail_bytes(text: &str, max: usize) -> (&str, bool)`
 
 `struct Recorder`
-> Fields: `store: RunStore`, `persistent: bool`, `_scratch: Option<tempfile::TempDir>`, `state: Mutex<RunRecord>`, `ndjson: bool`, `started: Instant`
+> Fields: `store: RunStore`, `persistent: bool`, `_scratch: Option<tempfile::TempDir>`, `state: Mutex<RunRecord>`, `ndjson: bool`, `stream_output: bool`, `started: Instant`
 
 **`impl Recorder`**
   `fn persist(&self, record: &RunRecord)`
@@ -4304,16 +5117,28 @@ wrkflw/
 
 
 **`impl ExecutionObserver for Recorder`**
+  `fn wants_step_output(&self) -> bool`
+
   `fn on_event(&self, event: &ExecutionEvent)`
 
 
-`fn event_json(event: &ExecutionEvent) -> Value`
+`fn event_json(event: &ExecutionEvent) -> Option<Value>`
 
 `async fn begin(path: &Path, config: &ExecutionConfig, options: &RunOptions) -> Arc<Recorder>`
 
 `fn keep_limit() -> usize`
 
 `fn run_finished_json(record: &RunRecord, digest: Option<&FailureDigest>) -> Value`
+
+`fn job_ran(job: &JobRecord) -> bool`
+
+`fn unverified(record: &RunRecord) -> Vec<Value>`
+
+`static INTERRUPTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false)`
+
+`fn interrupted() -> bool`
+
+`fn final_status( result: &Result<ExecutionResult, ExecutionError>, interrupted: bool, ) -> (RunStatus, Option<String>, &[JobResult])`
 
 `fn conclude( recorder: Arc<Recorder>, record: RunRecord, result: Result<ExecutionResult, ExecutionError>, ) -> RecordedRun`
 
@@ -4378,7 +5203,7 @@ wrkflw/
 
 ## crates/runtime/Cargo.toml
 
-**Language:** TOML | **Size:** 735 B | **Lines:** 30
+**Language:** TOML | **Size:** 765 B | **Lines:** 31
 
 **Imports:**
 - `ignore`
@@ -4397,7 +5222,7 @@ wrkflw/
 
 ## crates/runtime/src/container.rs
 
-**Language:** Rust | **Size:** 17.0 KB | **Lines:** 452
+**Language:** Rust | **Size:** 18.0 KB | **Lines:** 476
 
 **Imports:**
 - `async_trait::async_trait`
@@ -4422,7 +5247,7 @@ wrkflw/
 
 ## crates/runtime/src/emulation.rs
 
-**Language:** Rust | **Size:** 32.6 KB | **Lines:** 887
+**Language:** Rust | **Size:** 33.2 KB | **Lines:** 900
 
 **Imports:**
 - `crate::container::{
@@ -4508,15 +5333,48 @@ wrkflw/
 
 ## crates/runtime/src/lib.rs
 
-**Language:** Rust | **Size:** 99 B | **Lines:** 6
+**Language:** Rust | **Size:** 120 B | **Lines:** 7
 
 **Declarations:**
 
 ---
 
+## crates/runtime/src/live_output.rs
+
+**Language:** Rust | **Size:** 10.1 KB | **Lines:** 299
+
+**Imports:**
+- `std::future::Future`
+- `std::sync::Arc`
+- `tokio::io::AsyncReadExt`
+
+**Declarations:**
+
+`type TapFn = dyn Fn(Stream, &str) + Send + Sync`
+
+**`impl OutputTap`**
+  `pub fn new(f: impl Fn(Stream, &str) + Send + Sync + 'static) -> Self`
+
+  `pub fn send(&self, stream: Stream, chunk: &str)`
+
+
+**`impl Utf8Chunks`**
+  `pub fn push(&mut self, bytes: &[u8]) -> String`
+
+  `pub fn finish(&mut self) -> String`
+
+
+`fn incomplete_tail(bytes: &[u8]) -> usize`
+
+`async fn read_live<R: tokio::io::AsyncRead + Unpin>( pipe: Option<R>, stream: Stream, tap: &OutputTap, ) -> std::io::Result<Vec<u8>>`
+
+`mod tests`
+
+---
+
 ## crates/runtime/src/sandbox.rs
 
-**Language:** Rust | **Size:** 19.5 KB | **Lines:** 534
+**Language:** Rust | **Size:** 20.1 KB | **Lines:** 548
 
 **Imports:**
 - `regex::Regex`
@@ -4601,7 +5459,7 @@ wrkflw/
 
 ## crates/secrets/Cargo.toml
 
-**Language:** TOML | **Size:** 1.7 KB | **Lines:** 61
+**Language:** TOML | **Size:** 1.7 KB | **Lines:** 62
 
 **Imports:**
 - `chrono`
@@ -4772,7 +5630,7 @@ wrkflw/
 
 ## crates/secrets/src/masking.rs
 
-**Language:** Rust | **Size:** 13.6 KB | **Lines:** 417
+**Language:** Rust | **Size:** 14.8 KB | **Lines:** 448
 
 **Imports:**
 - `regex::Regex`
@@ -4815,6 +5673,8 @@ wrkflw/
   `pub fn contains_secrets(&self, text: &str) -> bool`
 
   `fn has_secret_patterns(&self, text: &str) -> bool`
+
+  `pub fn snapshot(&self) -> SecretMasker`
 
   `pub fn secret_count(&self) -> usize`
 
@@ -5136,7 +5996,7 @@ wrkflw/
 
 ## crates/trigger-filter/Cargo.toml
 
-**Language:** TOML | **Size:** 553 B | **Lines:** 22
+**Language:** TOML | **Size:** 583 B | **Lines:** 23
 
 **Declarations:**
 
@@ -5400,7 +6260,7 @@ wrkflw/
 
 ## crates/ui/Cargo.toml
 
-**Language:** TOML | **Size:** 1.4 KB | **Lines:** 53
+**Language:** TOML | **Size:** 1.5 KB | **Lines:** 57
 
 **Imports:**
 - `base64`
@@ -5416,7 +6276,7 @@ wrkflw/
 
 ## crates/ui/README.md
 
-**Language:** Markdown | **Size:** 1.7 KB | **Lines:** 42
+**Language:** Markdown | **Size:** 2.1 KB | **Lines:** 43
 
 **Declarations:**
 
@@ -5424,7 +6284,7 @@ wrkflw/
 
 ## crates/ui/src/app/mod.rs
 
-**Language:** Rust | **Size:** 39.0 KB | **Lines:** 859
+**Language:** Rust | **Size:** 40.2 KB | **Lines:** 887
 
 **Imports:**
 - `crate::handlers::workflow::start_next_workflow_execution`
@@ -5432,7 +6292,7 @@ wrkflw/
 - `crate::selection`
 - `crate::utils::load_workflows`
 - `crate::views::{
-    render_ui, TAB_COUNT, TAB_DAG, TAB_EXECUTION, TAB_HELP, TAB_LOGS, TAB_RUNS, TAB_SECRETS,
+    render_ui, tab_of, TAB_COUNT, TAB_DAG, TAB_EXECUTION, TAB_LOGS, TAB_RUNS, TAB_SECRETS,
     TAB_TRIGGER, TAB_WORKFLOWS,
 }`
 - `crossterm::{
@@ -5467,13 +6327,13 @@ wrkflw/
 
 ## crates/ui/src/app/state.rs
 
-**Language:** Rust | **Size:** 192.2 KB | **Lines:** 4798
+**Language:** Rust | **Size:** 208.4 KB | **Lines:** 5227
 
 **Imports:**
 - `crate::log_processor::{LogProcessingRequest, LogProcessor, ProcessedLogEntry}`
 - `crate::models::{
     ExecutionResultMsg, JobExecution, LogFilterLevel, QueuedExecution, StatusSeverity,
-    StepExecution, TriggerMatchStatus, Workflow, WorkflowExecution, WorkflowStatus,
+    StepExecution, TimelineMsg, TriggerMatchStatus, Workflow, WorkflowExecution, WorkflowStatus,
 }`
 - `crate::theme::{self, ThemeMode}`
 - `chrono::Local`
@@ -5536,9 +6396,21 @@ wrkflw/
 
   `pub fn next_workflow(&mut self)`
 
+  `pub fn jump_workflow(&mut self, last: bool)`
+
+  `pub fn shown_workflow(&self) -> Option<usize>`
+
+  `pub fn jump_job(&mut self, last: bool)`
+
+  `pub fn jump_step(&mut self, last: bool)`
+
+  `fn job_rows(&self) -> usize`
+
   `pub fn previous_job(&mut self)`
 
   `pub fn next_job(&mut self)`
+
+  `fn select_job_row(&mut self, row: usize)`
 
   `pub fn previous_step(&mut self)`
 
@@ -5546,11 +6418,23 @@ wrkflw/
 
   `pub fn switch_tab(&mut self, tab: usize)`
 
+  `pub fn open_tab(&mut self, index: usize)`
+
   `pub fn refresh_runs(&mut self)`
+
+  `pub fn match_runs_to_workflows(&mut self)`
+
+  `pub fn last_run(&self, idx: usize) -> Option<&wrkflw_runs::RunRecord>`
 
   `pub fn select_next_run(&mut self)`
 
+  `pub fn jump_run(&mut self, last: bool)`
+
   `pub fn select_previous_run(&mut self)`
+
+  `fn queue_workflow(&mut self, idx: usize)`
+
+  `pub fn queue_cursor_for_execution(&mut self)`
 
   `pub fn queue_selected_for_execution(&mut self)`
 
@@ -5672,6 +6556,10 @@ wrkflw/
 
   `pub fn trigger_dispatch(&mut self)`
 
+  `pub fn drain_timeline(&mut self)`
+
+  `pub fn finish_execution( &mut self, workflow_idx: usize, result: Result<(Vec<wrkflw_executor::JobResult>, ()), String>, )`
+
   `pub fn drain_trigger_outcomes(&mut self)`
 
   `pub fn secrets_tab_next(&mut self)`
@@ -5774,19 +6662,9 @@ wrkflw/
 
 ## crates/ui/src/components/dag.rs
 
-**Language:** Rust | **Size:** 4.5 KB | **Lines:** 133
+**Language:** Rust | **Size:** 2.6 KB | **Lines:** 80
 
 **Imports:**
-- `crate::models::{JobState, Workflow}`
-- `crate::text`
-- `crate::theme::{self, COLORS}`
-- `ratatui::{
-    layout::Rect,
-    style::{Modifier, Style},
-    text::{Line, Span},
-    widgets::Paragraph,
-    Frame,
-}`
 - `std::collections::{HashMap, HashSet}`
 - `wrkflw_parser::workflow::WorkflowDefinition`
 
@@ -5876,7 +6754,7 @@ wrkflw/
 
 ## crates/ui/src/handlers/workflow.rs
 
-**Language:** Rust | **Size:** 25.5 KB | **Lines:** 659
+**Language:** Rust | **Size:** 26.5 KB | **Lines:** 684
 
 **Imports:**
 - `crate::cli_style`
@@ -5887,13 +6765,21 @@ wrkflw/
 - `wrkflw_executor::{self, JobStatus, RuntimeType, StepStatus}`
 - `{
     crate::app::App,
-    crate::models::{ExecutionResultMsg, WorkflowExecution, WorkflowStatus},
-    chrono::Local,
+    crate::models::{ExecutionResultMsg, RunUpdate, TimelineMsg},
     std::sync::mpsc,
     std::thread,
 }`
 
 **Declarations:**
+
+`struct TimelineObserver`
+> Fields: `workflow_idx: usize`, `generation: u64`, `tx: mpsc::Sender<TimelineMsg>`
+
+**`impl wrkflw_executor::ExecutionObserver for TimelineObserver`**
+  `fn on_event(&self, event: &wrkflw_executor::ExecutionEvent)`
+
+  `fn wants_step_output(&self) -> bool`
+
 
 ---
 
@@ -5914,7 +6800,7 @@ wrkflw/
 
 ## crates/ui/src/log_processor.rs
 
-**Language:** Rust | **Size:** 11.7 KB | **Lines:** 345
+**Language:** Rust | **Size:** 11.9 KB | **Lines:** 350
 
 **Imports:**
 - `crate::models::{LogBadge, LogFilterLevel}`
@@ -5964,7 +6850,7 @@ wrkflw/
 
 ## crates/ui/src/models/mod.rs
 
-**Language:** Rust | **Size:** 13.2 KB | **Lines:** 387
+**Language:** Rust | **Size:** 48.7 KB | **Lines:** 1339
 
 **Imports:**
 - `chrono::Local`
@@ -5980,10 +6866,54 @@ wrkflw/
   `pub fn is_for(&self, key: &str) -> bool`
 
 
+`fn merged_state<'a>(legs: impl IntoIterator<Item = (&'a JobStatus, bool)> + Clone) -> JobState`
+
 **`impl Workflow`**
   `pub fn job_state(&self, key: &str) -> JobState`
 
+  `pub fn matrix_legs(&self, key: &str) -> Option<usize>`
+
+  `pub fn all_matrix_legs(&self) -> std::collections::HashMap<String, usize>`
+
+  `pub fn job_row_count(&self) -> usize`
+
+  `pub fn job_row_name(&self, row: usize) -> Option<&str>`
+
+  `pub fn job_row_of(&self, name: &str) -> Option<usize>`
+
   `pub fn unreported_jobs(&self) -> Vec<&str>`
+
+
+**`impl LiveTails`**
+  `pub fn push(&mut self, job: &str, index: usize, step: &str, lines: Vec<String>)`
+
+  `pub fn push_after( &mut self, job: &str, index: usize, step: &str, lines: Vec<String>, earlier: usize, )`
+
+  `pub fn finish(&mut self, job: &str)`
+
+  `pub fn pick(&self, job: Option<&str>) -> Option<(&str, &LiveTail)>`
+
+
+**`impl WorkflowExecution`**
+  `pub fn live_job_state(&self, key: &str, legs: Option<usize>) -> Option<JobState>`
+
+  `pub fn live_tail_for(&self, name: Option<&str>) -> Option<(&str, &LiveTail)>`
+
+  `pub fn job_durations_ms(&self) -> std::collections::HashMap<String, u64>`
+
+  `pub fn unfinished_jobs( &self, legs: &std::collections::HashMap<String, usize>, ) -> std::collections::HashSet<String>`
+
+
+**`impl TimelineEntry`**
+  `pub fn from_event(event: &wrkflw_executor::ExecutionEvent) -> Option<Self>`
+
+
+`fn failure_tail(output: &str) -> Vec<String>`
+
+`fn cap_line(line: &str) -> String`
+
+**`impl RunUpdate`**
+  `pub fn from_event(event: &wrkflw_executor::ExecutionEvent) -> Option<Self>`
 
 
 **`impl LogBadge`**
@@ -6054,7 +6984,7 @@ wrkflw/
 
 ## crates/ui/src/stress_tests.rs
 
-**Language:** Rust | **Size:** 14.1 KB | **Lines:** 404
+**Language:** Rust | **Size:** 16.8 KB | **Lines:** 478
 
 **Imports:**
 - `crate::app::App`
@@ -6063,7 +6993,7 @@ wrkflw/
     JobExecution, StepExecution, TriggerMatchStatus, Workflow, WorkflowExecution, WorkflowStatus,
 }`
 - `crate::theme`
-- `crate::views::{self, TAB_COUNT, TAB_EXECUTION, TAB_WORKFLOWS}`
+- `crate::views::{self, SCREEN_COUNT, TAB_EXECUTION, TAB_WORKFLOWS}`
 - `ratatui::{backend::TestBackend, text::Span, Terminal}`
 - `std::collections::HashMap`
 - `std::path::PathBuf`
@@ -6081,6 +7011,10 @@ wrkflw/
 `fn parse_big( dir: &std::path::Path, jobs: usize, ) -> Arc<wrkflw_parser::workflow::WorkflowDefinition>`
 
 `fn execution(jobs: usize, steps: usize) -> WorkflowExecution`
+
+`fn timeline(jobs: usize, steps: usize) -> Vec<crate::models::TimelineEntry>`
+
+`fn live_tails(jobs: usize) -> crate::models::LiveTails`
 
 `fn app(workflows: usize, dir: &std::path::Path) -> App`
 
@@ -6102,7 +7036,7 @@ wrkflw/
 
 ## crates/ui/src/text.rs
 
-**Language:** Rust | **Size:** 13.2 KB | **Lines:** 380
+**Language:** Rust | **Size:** 14.9 KB | **Lines:** 434
 
 **Imports:**
 - `crate::theme::COLORS`
@@ -6137,7 +7071,7 @@ wrkflw/
 
 ## crates/ui/src/theme.rs
 
-**Language:** Rust | **Size:** 23.3 KB | **Lines:** 717
+**Language:** Rust | **Size:** 29.6 KB | **Lines:** 891
 
 **Imports:**
 - `ratatui::{
@@ -6183,6 +7117,8 @@ wrkflw/
 
 `static LIGHT: Colors = Colors`
 
+`fn boxed_title<'a>(title: &str, border_type: BorderType, edge: Color, style: Style) -> Line<'a>`
+
 **`impl BadgeKind`**
   `pub fn fg(self) -> Color`
 
@@ -6210,7 +7146,7 @@ wrkflw/
 
 ## crates/ui/src/views/dag_tab.rs
 
-**Language:** Rust | **Size:** 12.4 KB | **Lines:** 388
+**Language:** Rust | **Size:** 21.8 KB | **Lines:** 619
 
 **Imports:**
 - `crate::app::App`
@@ -6225,7 +7161,7 @@ wrkflw/
     widgets::Paragraph,
     Frame,
 }`
-- `std::collections::HashMap`
+- `std::collections::{HashMap, HashSet}`
 - `std::sync::Arc`
 - `wrkflw_parser::workflow::WorkflowDefinition`
 
@@ -6241,29 +7177,39 @@ wrkflw/
 
 `const CARD_H: u16 = 3`
 
-`fn matrix_suffix(labels: &MatrixLabels, job: &str) -> String`
+`struct Timing`
+> Fields: `durations: HashMap<String, u64>`, `critical: HashSet<String>`, `settled: bool`, `unfinished: HashSet<String>`
 
-`fn title(workflow: &Workflow) -> String`
+**`impl Timing`**
+  `fn of(workflow: &Workflow, levels: &[Vec<String>]) -> Self`
+
+  `fn stage_ms(&self, layer: &[String]) -> Option<u64>`
+
+
+`fn critical_path(levels: &[Vec<String>], durations: &HashMap<String, u64>) -> HashSet<String>`
+
+`fn matrix_suffix(labels: &MatrixLabels, job: &str) -> String`
 
 `fn state_color(state: JobState) -> ratatui::style::Color`
 
 `fn render_graph( f: &mut Frame<'_>, app: &App, workflow: &Workflow, def: &WorkflowDefinition, labels: &MatrixLabels, levels: &[Vec<String>], area: Rect, ) -> usize`
 
-`fn render_card( f: &mut Frame<'_>, app: &App, workflow: &Workflow, labels: &MatrixLabels, name: &str, area: Rect, )`
+`fn render_card( f: &mut Frame<'_>, app: &App, workflow: &Workflow, labels: &MatrixLabels, timing: &Timing, name: &str, area: Rect, )`
 
 `fn render_list( f: &mut Frame<'_>, app: &App, workflow: &Workflow, def: &WorkflowDefinition, labels: &MatrixLabels, levels: &[Vec<String>], area: Rect, ) -> usize`
 
 `fn render_legend(f: &mut Frame<'_>, app: &App, area: Rect)`
 
+`mod timing_tests`
+
 ---
 
 ## crates/ui/src/views/execution_tab.rs
 
-**Language:** Rust | **Size:** 17.9 KB | **Lines:** 513
+**Language:** Rust | **Size:** 19.8 KB | **Lines:** 554
 
 **Imports:**
 - `crate::app::App`
-- `crate::components::dag`
 - `crate::models::{JobExecution, JobState, Workflow, WorkflowStatus}`
 - `crate::text`
 - `crate::theme::{self, BadgeKind, COLORS}`
@@ -6280,12 +7226,14 @@ wrkflw/
 
 `fn selected_job<'a>(app: &App, workflow: &'a Workflow) -> Option<&'a JobExecution>`
 
-`fn render_summary_strip(f: &mut Frame<'_>, app: &App, workflow: &Workflow, area: Rect)`
+`pub(crate) fn format_ms(ms: u64) -> String`
 
 `pub(crate) fn format_duration(secs: i64) -> String`
 
+`pub(crate) fn format_run_time(ms: i64, finished: bool) -> String`
+
 `struct Counts`
-> Fields: `passed: usize`, `failed: usize`, `skipped: usize`, `pending: usize`
+> Fields: `passed: usize`, `failed: usize`, `skipped: usize`
 
 `fn job_counts(workflow: &Workflow) -> Counts`
 
@@ -6295,11 +7243,7 @@ wrkflw/
 
 `pub(crate) fn step_line(i: usize, step: &crate::models::StepExecution, w: usize) -> Line<'static>`
 
-`fn render_output_pane(f: &mut Frame<'_>, app: &App, area: Rect)`
-
-`fn render_dag_pane(f: &mut Frame<'_>, app: &App, workflow: &Workflow, area: Rect)`
-
-`fn render_results_pane(f: &mut Frame<'_>, workflow: &Workflow, area: Rect)`
+`fn render_output_pane( f: &mut Frame<'_>, app: &App, workflow: &Workflow, selected: Option<&str>, area: Rect, )`
 
 `fn active_job_execution(workflow: &Workflow) -> Option<&JobExecution>`
 
@@ -6311,7 +7255,7 @@ wrkflw/
 
 ## crates/ui/src/views/help_overlay.rs
 
-**Language:** Rust | **Size:** 7.0 KB | **Lines:** 211
+**Language:** Rust | **Size:** 7.4 KB | **Lines:** 222
 
 **Imports:**
 - `crate::text`
@@ -6320,7 +7264,7 @@ wrkflw/
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Clear, Paragraph},
+    widgets::Paragraph,
     Frame,
 }`
 
@@ -6338,7 +7282,7 @@ wrkflw/
 
 ## crates/ui/src/views/job_detail.rs
 
-**Language:** Rust | **Size:** 20.3 KB | **Lines:** 576
+**Language:** Rust | **Size:** 20.1 KB | **Lines:** 573
 
 **Imports:**
 - `crate::app::App`
@@ -6388,11 +7332,11 @@ wrkflw/
 
 ## crates/ui/src/views/logs_tab.rs
 
-**Language:** Rust | **Size:** 4.2 KB | **Lines:** 135
+**Language:** Rust | **Size:** 25.1 KB | **Lines:** 697
 
 **Imports:**
 - `crate::app::App`
-- `crate::models::LogFilterLevel`
+- `crate::models::{LogFilterLevel, TimelineEntry}`
 - `crate::text`
 - `crate::theme::{self, COLORS}`
 - `ratatui::{
@@ -6407,17 +7351,32 @@ wrkflw/
 
 `fn render_search_bar(f: &mut Frame<'_>, app: &App, area: Rect)`
 
+`struct JobStory<'a>`
+> Fields: `name: &'a str`, `steps: Vec<&'a TimelineEntry>`, `finished: Option<&'a TimelineEntry>`, `runner: Option<(&'a str, &'a str)>`, `not_run: Vec<usize>`, `not_run_pending: bool`, `not_run_unattached: bool`
+
+`fn group_by_job(timeline: &[TimelineEntry]) -> Vec<JobStory<'_>>`
+
+`fn spread(left: Vec<Span<'static>>, right: Vec<Span<'static>>, w: usize) -> Line<'static>`
+
+`pub(crate) fn story_lines( timeline: &[TimelineEntry], live: Option<&crate::models::LiveTails>, w: usize, spinner_frame: usize, settled: bool, ) -> Vec<Line<'static>>`
+
+`const STORY_LIVE_LINES: usize = 3`
+
+`fn render_story(f: &mut Frame<'_>, app: &mut App, area: Rect)`
+
+`mod tests`
+
 ---
 
 ## crates/ui/src/views/mod.rs
 
-**Language:** Rust | **Size:** 4.4 KB | **Lines:** 128
+**Language:** Rust | **Size:** 5.2 KB | **Lines:** 150
 
 **Imports:**
 - `pub use job_detail::StepOutputCache`
 - `pub use title_bar::{
-    TAB_COUNT, TAB_DAG, TAB_EXECUTION, TAB_HELP, TAB_LOGS, TAB_RUNS, TAB_SECRETS, TAB_TRIGGER,
-    TAB_WORKFLOWS,
+    tab_of, SCREEN_COUNT, TABS, TAB_COUNT, TAB_DAG, TAB_EXECUTION, TAB_LOGS, TAB_RUN, TAB_RUNS,
+    TAB_SECRETS, TAB_TRIGGER, TAB_WORKFLOWS,
 }`
 - `crate::app::App`
 - `ratatui::Frame`
@@ -6433,6 +7392,8 @@ wrkflw/
 `mod job_detail`
 
 `mod logs_tab`
+
+`mod run_header`
 
 `mod runs_tab`
 
@@ -6462,9 +7423,30 @@ wrkflw/
 
 ---
 
+## crates/ui/src/views/run_header.rs
+
+**Language:** Rust | **Size:** 1.8 KB | **Lines:** 53
+
+**Imports:**
+- `crate::app::App`
+- `crate::theme`
+- `ratatui::{
+    layout::{Constraint, Direction, Layout, Rect},
+    text::{Line, Span},
+    widgets::Paragraph,
+    Frame,
+}`
+- `super::{execution_tab, TAB_DAG, TAB_EXECUTION, TAB_LOGS}`
+
+**Declarations:**
+
+`const VIEWS: [(usize, &str, &str)`
+
+---
+
 ## crates/ui/src/views/runs_tab.rs
 
-**Language:** Rust | **Size:** 9.2 KB | **Lines:** 266
+**Language:** Rust | **Size:** 9.2 KB | **Lines:** 258
 
 **Imports:**
 - `crate::app::App`
@@ -6481,13 +7463,13 @@ wrkflw/
 
 **Declarations:**
 
-`fn status_glyph(status: RunStatus) -> (&'static str, ratatui::style::Color)`
+`pub(crate) fn status_glyph(status: RunStatus) -> (&'static str, ratatui::style::Color)`
 
 `fn text_status(status: &str) -> (&'static str, ratatui::style::Color)`
 
-`fn when(started_at: &str) -> String`
+`pub(crate) fn when(started_at: &str) -> String`
 
-`fn duration(ms: Option<u64>) -> String`
+`pub(crate) fn duration(ms: Option<u64>) -> String`
 
 `fn run_row(run: &RunRecord, w: usize, selected: bool) -> Line<'static>`
 
@@ -6499,7 +7481,7 @@ wrkflw/
 
 ## crates/ui/src/views/secrets_tab.rs
 
-**Language:** Rust | **Size:** 8.0 KB | **Lines:** 230
+**Language:** Rust | **Size:** 8.2 KB | **Lines:** 235
 
 **Imports:**
 - `crate::app::App`
@@ -6517,6 +7499,8 @@ wrkflw/
 
 **Declarations:**
 
+`const RUNTIME_PANE_HEIGHT: u16 = 10`
+
 `fn provider_entries() -> Vec<(String, SecretProviderConfig)>`
 
 `fn render_providers_pane( f: &mut Frame<'_>, app: &mut App, rows: &[(String, SecretProviderConfig)], area: Rect, )`
@@ -6531,12 +7515,10 @@ wrkflw/
 
 ## crates/ui/src/views/status_bar.rs
 
-**Language:** Rust | **Size:** 7.5 KB | **Lines:** 216
+**Language:** Rust | **Size:** 8.0 KB | **Lines:** 228
 
 **Imports:**
-- `super::{
-    TAB_DAG, TAB_EXECUTION, TAB_HELP, TAB_LOGS, TAB_RUNS, TAB_SECRETS, TAB_TRIGGER, TAB_WORKFLOWS,
-}`
+- `super::{TAB_DAG, TAB_EXECUTION, TAB_LOGS, TAB_RUNS, TAB_SECRETS, TAB_TRIGGER, TAB_WORKFLOWS}`
 - `crate::app::App`
 - `crate::models::StatusSeverity`
 - `crate::text`
@@ -6558,7 +7540,7 @@ wrkflw/
 
 ## crates/ui/src/views/title_bar.rs
 
-**Language:** Rust | **Size:** 5.3 KB | **Lines:** 168
+**Language:** Rust | **Size:** 6.0 KB | **Lines:** 172
 
 **Imports:**
 - `crate::app::App`
@@ -6575,12 +7557,12 @@ wrkflw/
 
 **Declarations:**
 
-`fn fit_tabs(selected: usize, budget: usize) -> Vec<Span<'static>>`
+`fn fit_tabs(selected: usize, budget: usize) -> (Vec<Span<'static>>, Vec<Span<'static>>)`
 
 `enum TabStyle`
 > Variants: `Full`, `Compact`, `ActiveOnly`
 
-`fn tab_spans(selected: usize, style: TabStyle) -> Vec<Span<'static>>`
+`fn tab_buttons(selected: usize, style: TabStyle) -> (Vec<Span<'static>>, Vec<Span<'static>>)`
 
 `fn live_elapsed(app: &App) -> Option<String>`
 
@@ -6622,7 +7604,7 @@ wrkflw/
 
 ## crates/ui/src/views/tweaks_overlay.rs
 
-**Language:** Rust | **Size:** 3.8 KB | **Lines:** 118
+**Language:** Rust | **Size:** 3.5 KB | **Lines:** 106
 
 **Imports:**
 - `crate::app::{Accent, App}`
@@ -6631,11 +7613,15 @@ wrkflw/
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Clear, Paragraph},
+    widgets::Paragraph,
     Frame,
 }`
 
 **Declarations:**
+
+`const PANEL_W: u16 = 44`
+
+`const PANEL_H: u16 = 6`
 
 `fn render_accent_row(f: &mut Frame<'_>, app: &App, area: Rect)`
 
@@ -6645,7 +7631,7 @@ wrkflw/
 
 ## crates/ui/src/views/workflows_tab.rs
 
-**Language:** Rust | **Size:** 16.7 KB | **Lines:** 477
+**Language:** Rust | **Size:** 16.9 KB | **Lines:** 483
 
 **Imports:**
 - `crate::app::App`
@@ -6670,15 +7656,15 @@ wrkflw/
 
 `fn render_trigger_filter(f: &mut Frame<'_>, app: &App, area: Rect)`
 
-`fn render_quick_actions(f: &mut Frame<'_>, area: Rect)`
-
 `fn render_job_selection(f: &mut Frame<'_>, app: &mut App, area: Rect)`
+
+`fn last_run_line(run: &wrkflw_runs::RunRecord, w: usize) -> Line<'static>`
 
 ---
 
 ## crates/utils/Cargo.toml
 
-**Language:** TOML | **Size:** 507 B | **Lines:** 22
+**Language:** TOML | **Size:** 537 B | **Lines:** 23
 
 **Declarations:**
 
@@ -6707,7 +7693,7 @@ wrkflw/
 
 ## crates/validators/Cargo.toml
 
-**Language:** TOML | **Size:** 540 B | **Lines:** 23
+**Language:** TOML | **Size:** 570 B | **Lines:** 24
 
 **Declarations:**
 
@@ -6928,7 +7914,7 @@ wrkflw/
 
 ## crates/watcher/Cargo.toml
 
-**Language:** TOML | **Size:** 651 B | **Lines:** 25
+**Language:** TOML | **Size:** 681 B | **Lines:** 26
 
 **Declarations:**
 
@@ -7097,7 +8083,7 @@ wrkflw/
 
 ## crates/watcher/src/reactor.rs
 
-**Language:** Rust | **Size:** 42.4 KB | **Lines:** 894
+**Language:** Rust | **Size:** 42.6 KB | **Lines:** 898
 
 **Imports:**
 - `crate::debouncer::Debouncer`
@@ -7203,7 +8189,7 @@ wrkflw/
 
 ## crates/watcher/src/watcher.rs
 
-**Language:** Rust | **Size:** 52.9 KB | **Lines:** 1218
+**Language:** Rust | **Size:** 53.4 KB | **Lines:** 1233
 
 **Imports:**
 - `crate::error::WatchError`
@@ -7258,7 +8244,7 @@ wrkflw/
 
 ## crates/wrkflw/Cargo.toml
 
-**Language:** TOML | **Size:** 1.8 KB | **Lines:** 77
+**Language:** TOML | **Size:** 1.8 KB | **Lines:** 78
 
 **Imports:**
 - `nix`
@@ -7303,14 +8289,97 @@ wrkflw/
 
 ---
 
-## crates/wrkflw/src/gate_cmd.rs
+## crates/wrkflw/src/compare_cmd.rs
 
-**Language:** Rust | **Size:** 18.8 KB | **Lines:** 533
+**Language:** Rust | **Size:** 53.1 KB | **Lines:** 1411
 
 **Imports:**
-- `crate::{is_gitlab_pipeline, RuntimeChoice}`
+- `crate::git::line as git_line`
+- `crate::{OutputFormat, RuntimeChoice}`
+- `serde_json::{json, Value}`
+- `std::path::Path`
+- `std::process::{Command, Stdio}`
+- `wrkflw_github::{RemoteJob, RemoteRun}`
+- `wrkflw_runs::SCHEMA_VERSION`
+- `wrkflw_ui::cli_style`
+
+**Declarations:**
+
+`pub(crate) struct CompareCtx`
+> Fields: `run: String`, `runtime: RuntimeChoice`, `child_args: Vec<String>`, `format: OutputFormat`
+
+`struct ExpectedJob`
+> Fields: `local: String`, `github: Option<String>`, `github_base: String`, `matrix_values: Option<Vec<String>>`
+
+**`impl ExpectedJob`**
+  `fn matches(&self, name: &str) -> bool`
+
+
+`fn is_joined_in_some_order(text: &str, values: &[&str]) -> bool`
+
+`fn value_text(value: &serde_yaml::Value) -> Option<String>`
+
+`fn reads_matrix(name: &str) -> bool`
+
+`fn expected_jobs(path: &Path) -> Result<Vec<ExpectedJob>, String>`
+
+`struct Row`
+> Fields: `github_name: Option<String>`, `local_name: Option<String>`, `github: Option<String>`, `local: Option<String>`, `agree: Option<bool>`, `note: Option<String>`
+
+`fn agree(conclusion: Option<&str>, status: Option<&str>) -> Option<bool>`
+
+`fn note_for(local: &Value, failures: &[Value]) -> Option<String>`
+
+`fn rows( expected: &[ExpectedJob], remote: &[RemoteJob], local: &[Value], failures: &[Value], ) -> Vec<Row>`
+
+`fn ambiguous_note(name: &str, count: usize) -> String`
+
+`fn join_notes(first: Option<String>, second: Option<String>) -> Option<String>`
+
+`fn workflow_path(path: &str) -> Option<&Path>`
+
+`const TAG_EVENTS: &[&str] = &[ "push", "create", "release", "workflow_dispatch", "workflow_run", ]`
+
+`fn head_is_tag(remote: &RemoteRun) -> Result<bool, String>`
+
+`fn head_is_tag_with( remote: &RemoteRun, git: impl Fn(&[&str]) -> Option<String>, origin_has: impl Fn(&str) -> Result<bool, String>, ) -> Result<bool, String>`
+
+`fn run_args( remote: &RemoteRun, path: &Path, runtime: &str, child_args: &[String], head_is_tag: bool, ) -> Vec<String>`
+
+`fn is_pushed_over(before: &str) -> bool`
+
+`struct Outcome`
+> Fields: `disagreements: usize`, `basis: &'static str`, `problem: Option<String>`
+
+`fn outcome(remote: &RemoteRun, local: &Value, rows: &[Row]) -> Outcome`
+
+`fn is_unpaired(row: &Row) -> bool`
+
+`fn unpaired_result(row: &Row) -> Option<&str>`
+
+`fn paired_outcome( remote: &RemoteRun, status: &str, rows: &[Row], job_disagreements: usize, ) -> Outcome`
+
+`fn report(remote: &RemoteRun, local: &Value, rows: &[Row]) -> Value`
+
+`fn print_text(report: &Value)`
+
+`pub(crate) async fn run(ctx: CompareCtx) -> !`
+
+`mod tests`
+
+---
+
+## crates/wrkflw/src/gate_cmd.rs
+
+**Language:** Rust | **Size:** 46.2 KB | **Lines:** 1249
+
+**Imports:**
+- `crate::{is_gitlab_pipeline, OutputFormat, RuntimeChoice}`
+- `serde_json::{json, Value}`
 - `std::path::{Path, PathBuf}`
-- `std::process::Command`
+- `std::process::{Command, Stdio}`
+- `wrkflw_executor::vm_memory`
+- `wrkflw_runs::SCHEMA_VERSION`
 - `wrkflw_ui::cli_style`
 
 **Declarations:**
@@ -7319,12 +8388,20 @@ wrkflw/
 
 `const SKIPPED_EXIT: i32 = 78`
 
+`const NOTHING_CHECKED_EXIT: i32 = 79`
+
+`fn ran_nothing(code: Option<i32>) -> bool`
+
+`const PARTIAL_EXIT: i32 = 80`
+
+`fn passed(code: Option<i32>) -> bool`
+
 `pub(crate) struct GateCtx`
-> Fields: `path: Option<PathBuf>`, `event: String`, `base_branch: Option<String>`, `diff_base: Option<String>`, `runtime: RuntimeChoice`, `remote_cache: Option<String>`, `install_hook: bool`
+> Fields: `path: Option<PathBuf>`, `event: Option<String>`, `base_branch: Option<String>`, `diff_base: Option<String>`, `runtime: RuntimeChoice`, `remote_cache: Option<String>`, `install_hook: bool`, `child_args: Vec<String>`, `format: OutputFormat`
 
 `fn shell_quote(value: &str) -> String`
 
-`fn hook_script(program: &Path, runtime: &str, remote_cache: Option<&str>) -> String`
+`fn hook_script( program: &Path, runtime: &str, remote_cache: Option<&str>, child_args: &[String], ) -> String`
 
 `fn git_path_query(args: &[&str]) -> Option<PathBuf>`
 
@@ -7342,9 +8419,74 @@ wrkflw/
 
 `fn workflow_files(path: Option<&Path>) -> Result<Vec<PathBuf>, String>`
 
-`fn run_args(ctx: &GateCtx, file: &Path) -> Vec<String>`
+`struct Event`
+> Fields: `name: String`, `base_branch: Option<String>`
+
+**`impl Event`**
+  `fn describe(&self) -> String`
+
+
+`fn events(ctx: &GateCtx, branch: Option<&str>, default: Option<&str>) -> (Event, Option<Event>)`
+
+`fn run_args(ctx: &GateCtx, file: &Path, event: &Event) -> Vec<String>`
+
+`fn workflow_report(file: &Path, code: Option<i32>, stdout: &str) -> Value`
+
+`fn gate_verdict(workflows: &[Value], failed: usize, unverified: usize) -> &'static str`
+
+`fn gate_report(workflows: Vec<Value>, uncommitted: &[String]) -> Value`
+
+`fn checked_nothing(entry: &Value) -> bool`
+
+`fn why_nothing_ran(entry: &Value) -> String`
+
+`fn nothing_checked_warning(first: &Event, second: Option<&Event>) -> String`
+
+`fn probe_memory(runtime: &str) -> Option<vm_memory::Memory>`
+
+`fn probed_env(runtime: &str, memory: Option<&vm_memory::Memory>) -> Option<String>`
+
+`struct Launcher<'a>`
+> Fields: `program: &'a Path`, `runtime: &'a str`, `probed: Option<&'a str>`
+
+**`impl Launcher<'_>`**
+  `fn check(&self, ctx: &GateCtx, file: &Path, event: &Event, json: bool) -> Value`
+
+  `fn command(&self, ctx: &GateCtx, file: &Path, event: &Event, json: bool) -> Command`
+
 
 `pub(crate) fn run(ctx: GateCtx)`
+
+`fn check_workflow( first: &Event, second: Option<&Event>, json_mode: bool, mut check: impl FnMut(&Event) -> Value, ) -> Value`
+
+`fn text_entry(file: &Path, code: Option<i32>) -> Value`
+
+`mod tests`
+
+---
+
+## crates/wrkflw/src/git.rs
+
+**Language:** Rust | **Size:** 4.5 KB | **Lines:** 132
+
+**Imports:**
+- `std::process::Command`
+
+**Declarations:**
+
+`pub(crate) fn line(args: &[&str]) -> Option<String>`
+
+`pub(crate) fn remote_has(remote: &str, reference: &str) -> Result<bool, String>`
+
+`fn command(args: &[&str]) -> Command`
+
+`fn batch_ssh_wanted(env_set: impl Fn(&str) -> bool, configured: impl Fn() -> bool) -> bool`
+
+`fn ssh_command_configured() -> bool`
+
+`pub(crate) fn current_branch() -> Option<String>`
+
+`pub(crate) fn default_branch() -> Option<String>`
 
 `mod tests`
 
@@ -7402,7 +8544,7 @@ wrkflw/
 
 ## crates/wrkflw/src/main.rs
 
-**Language:** Rust | **Size:** 63.3 KB | **Lines:** 1773
+**Language:** Rust | **Size:** 85.4 KB | **Lines:** 2337
 
 **Imports:**
 - `bollard::Docker`
@@ -7415,7 +8557,11 @@ wrkflw/
 
 `mod cli_secrets`
 
+`mod compare_cmd`
+
 `mod gate_cmd`
+
+`mod git`
 
 `mod json_output`
 
@@ -7439,6 +8585,8 @@ wrkflw/
 **`impl OutputFormat`**
   `pub(crate) fn is_json(self) -> bool`
 
+  `pub(crate) fn fail(self, message: &str) -> !`
+
 
 `pub(crate) enum RuntimeChoice`
 > Variants: `Auto`, `Docker`, `Podman`, `Kubernetes`, `Emulation`, `SecureEmulation`
@@ -7452,17 +8600,19 @@ wrkflw/
 
 
 `struct Wrkflw`
-> Fields: `command: Option<Commands>`, `verbose: bool`, `debug: bool`, `format: OutputFormat`, `theme: Option<wrkflw_ui::theme::ThemePreference>`, `platform: Vec<Option<(String, String)>>`, `kubernetes: KubernetesArgs`
+> Fields: `command: Option<Commands>`, `verbose: bool`, `debug: bool`, `format: OutputFormat`, `theme: Option<wrkflw_ui::theme::ThemePreference>`, `platform: Vec<Option<(String, String)>>`, `fresh_workspace: bool`, `every_matrix_leg: bool`, `kubernetes: KubernetesArgs`
 
 `struct KubernetesArgs`
 > Fields: `k8s_context: Option<String>`, `k8s_namespace: Option<String>`, `k8s_node_selector: Vec<Option<(String, String)>>`, `k8s_resource: Vec<Option<(String, String)>>`, `k8s_image_pull_secret: Vec<String>`, `k8s_registry: Option<String>`, `k8s_helper_image: Option<String>`, `k8s_timeout: Option<u64>`, `k8s_schedule_timeout: Option<u64>`
 
 **`impl KubernetesArgs`**
+  `fn child_args(&self) -> Vec<String>`
+
   `fn to_config(&self) -> wrkflw_executor::KubernetesConfig`
 
 
 `enum Commands`
-> Variants: `Validate`, `Run`, `Gate`, `Watch`, `Tui`, `Trigger`, `TriggerGitlab`, `List`, `Plan`, `Runs`, `Mcp`
+> Variants: `Validate`, `Run`, `Gate`, `Compare`, `Watch`, `Tui`, `Trigger`, `TriggerGitlab`, `List`, `Plan`, `Clean`, `Runs`, `Mcp`
 
 `enum McpCommand`
 > Variants: `Serve`, `Install`
@@ -7472,6 +8622,18 @@ wrkflw/
 `fn parse_k8s_key_val(s: &str) -> Result<Option<(String, String)>, String>`
 
 `fn collect_platform_overrides(entries: &[Option<(String, String)>]) -> HashMap<String, String>`
+
+`fn global_child_args(cli: &Wrkflw, platform_overrides: &HashMap<String, String>) -> Vec<String>`
+
+`fn parse_branch(value: &str) -> Result<String, String>`
+
+`fn parse_tag(value: &str) -> Result<String, String>`
+
+`fn ref_name(value: &str, prefix: &str) -> Result<String, String>`
+
+`fn check_tag_event(event: Option<&str>, tag: Option<&str>) -> Result<(), String>`
+
+`pub(crate) fn platform_args(overrides: &HashMap<String, String>) -> Vec<String>`
 
 `fn parse_key_val(s: &str) -> Result<(String, String), String>`
 
@@ -7501,19 +8663,21 @@ wrkflw/
 
 `fn list_workflows_and_pipelines(verbose: bool, show_jobs: bool)`
 
+`fn human_bytes(bytes: u64) -> String`
+
 `mod tests`
 
 ---
 
 ## crates/wrkflw/src/mcp_cmd.rs
 
-**Language:** Rust | **Size:** 21.2 KB | **Lines:** 521
+**Language:** Rust | **Size:** 33.4 KB | **Lines:** 812
 
 **Imports:**
 - `serde_json::{json, Value}`
 - `std::process::{Output, Stdio}`
 - `std::sync::Arc`
-- `std::time::Duration`
+- `std::time::{Duration, Instant}`
 - `tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader}`
 - `tokio::process::Command`
 - `tokio::sync::Mutex`
@@ -7524,11 +8688,27 @@ wrkflw/
 
 `const DEFAULT_RUN_TIMEOUT_SECS: u64 = 1800`
 
+`const DEFAULT_GATE_TIMEOUT_SECS: u64 = 3600`
+
 `const QUICK_TIMEOUT_SECS: u64 = 120`
 
 `const STOP_GRACE: Duration = Duration::from_secs(15)`
 
-`const INSTRUCTIONS: &str = "wrkflw validates and runs GitHub Actions and GitLab CI workflows locally. \ Call validate_workflows after editing YAML, plan_workflow to see what would run and why a trigger \ would or would not fire, and run_workflow to execute. run_workflow returns a failure digest. Use \ list_runs and get_run_failure before rerunning: earlier results are recorded."`
+`static LIVE: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new())`
+
+`fn live_pids() -> Vec<u32>`
+
+`struct Live(Option<u32>)`
+
+**`impl Live`**
+  `fn track(pid: Option<u32>) -> Self`
+
+
+**`impl Drop for Live`**
+  `fn drop(&mut self)`
+
+
+`const INSTRUCTIONS: &str = "wrkflw validates and runs GitHub Actions and GitLab CI workflows locally. \ Call validate_workflows after editing YAML, plan_workflow to see what would run and why a trigger \ would or would not fire, and run_workflow to execute. run_workflow returns a failure digest. Pass \ reuse_results while iterating, so jobs that already passed on the same files aren't run again. \ Before pushing, call gate: it runs what CI would run for the push, and on a feature branch \ checks workflows a push doesn't fire as a pull request into the default branch. Read \ `verdict`, not only `passed`: `verified` means everything ran as asked, `partial` means some \ jobs ran as another OS than their runs-on asked for (listed under `unverified`, so their \ OS-specific steps weren't checked), and `nothing_checked` means no job ran at all. Say which \ before claiming CI will pass. A job with `reused` didn't run: an earlier result stands. Use \ list_runs and get_run_failure before rerunning: earlier results are recorded."`
 
 `fn string_arg(args: &Value, key: &str) -> Option<String>`
 
@@ -7552,9 +8732,18 @@ wrkflw/
 
 `async fn run_with_deadline( child: tokio::process::Child, limit: Duration, grace: Duration, ) -> Option<std::io::Result<Output>>`
 
-`fn interrupt(pid: u32)`
+`async fn stop_groups(pids: &[u32], grace: Duration)`
 
-`fn interrupt(_pid: u32)`
+`async fn shutdown_signal() -> i32`
+
+`async fn shutdown_signal() -> i32`
+
+`enum Stop`
+> Variants: `Interrupt`, `Kill`
+
+`fn signal_group(pid: u32, stop: Stop)`
+
+`fn signal_group(_pid: u32, _stop: Stop)`
 
 `fn tool( name: &str, description: &str, read_only: bool, properties: Value, required: &[&str], ) -> Value`
 
@@ -7704,12 +8893,14 @@ wrkflw/
 
 ## crates/wrkflw/src/plan_cmd.rs
 
-**Language:** Rust | **Size:** 10.0 KB | **Lines:** 300
+**Language:** Rust | **Size:** 12.5 KB | **Lines:** 361
 
 **Imports:**
-- `crate::{is_gitlab_pipeline, prefilter, OutputFormat}`
+- `crate::{is_gitlab_pipeline, prefilter, OutputFormat, RuntimeChoice}`
 - `serde_json::{json, Value}`
+- `std::collections::HashMap`
 - `std::path::{Path, PathBuf}`
+- `wrkflw_executor::runner_fidelity::{requested_os, runner_os_for, RequestedOs}`
 - `wrkflw_parser::workflow::{Job, WorkflowDefinition}`
 - `wrkflw_runs::SCHEMA_VERSION`
 - `wrkflw_secrets::{SecretError, SecretManager, SecretSubstitution}`
@@ -7717,7 +8908,7 @@ wrkflw/
 **Declarations:**
 
 `pub(crate) struct PlanCtx`
-> Fields: `path: PathBuf`, `gitlab: bool`, `job: Option<String>`, `event: Option<String>`, `diff: bool`, `changed_files: Option<Vec<String>>`, `diff_base: Option<String>`, `diff_head: Option<String>`, `base_branch: Option<String>`, `activity_type: Option<String>`, `strict_filter: bool`, `no_strict_filter: bool`, `verbose: bool`, `format: OutputFormat`
+> Fields: `path: PathBuf`, `gitlab: bool`, `job: Option<String>`, `event: Option<String>`, `diff: bool`, `changed_files: Option<Vec<String>>`, `diff_base: Option<String>`, `diff_head: Option<String>`, `base_branch: Option<String>`, `branch: Option<String>`, `tag: Option<String>`, `activity_type: Option<String>`, `strict_filter: bool`, `no_strict_filter: bool`, `verbose: bool`, `format: OutputFormat`, `runtime: RuntimeChoice`, `platform_overrides: HashMap<String, String>`
 
 `async fn trigger(ctx: &PlanCtx) -> Result<Value, String>`
 
@@ -7727,7 +8918,13 @@ wrkflw/
 
 `fn job_json(id: &str, job: &Job) -> Value`
 
-`fn github_plan( ctx: &PlanCtx, workflow: &WorkflowDefinition, ) -> Result<(Vec<Vec<String>>, Vec<Value>), String>`
+`fn requested( id: &str, job: &Job, overrides: &HashMap<String, String>, ) -> Vec<(String, RequestedOs)>`
+
+`fn unverified(requests: &[(String, RequestedOs)], runtime: RuntimeChoice) -> Vec<Value>`
+
+`type GithubPlan = (Vec<Vec<String>>, Vec<Value>, Vec<Value>)`
+
+`fn github_plan(ctx: &PlanCtx, workflow: &WorkflowDefinition) -> Result<GithubPlan, String>`
 
 `fn gitlab_plan(ctx: &PlanCtx) -> Result<(Vec<Vec<String>>, Vec<Value>), String>`
 
@@ -7741,7 +8938,7 @@ wrkflw/
 
 ## crates/wrkflw/src/prefilter.rs
 
-**Language:** Rust | **Size:** 39.8 KB | **Lines:** 951
+**Language:** Rust | **Size:** 40.9 KB | **Lines:** 984
 
 **Imports:**
 - `std::path::{Path, PathBuf}`
@@ -7756,7 +8953,7 @@ wrkflw/
 `pub(crate) fn validate_event_requires_base_branch( event_name: &str, strict_filter: bool, ) -> Result<(), String>`
 
 `pub(crate) struct PrefilterRequest<'a>`
-> Fields: `workflow_path: &'a Path`, `event: Option<&'a String>`, `diff: bool`, `changed_files: Option<&'a Vec<String>>`, `diff_base: Option<&'a str>`, `diff_head: Option<&'a String>`, `base_branch: Option<&'a String>`, `activity_type: Option<&'a String>`, `verbose: bool`, `strict_filter: bool`
+> Fields: `workflow_path: &'a Path`, `event: Option<&'a String>`, `diff: bool`, `changed_files: Option<&'a Vec<String>>`, `diff_base: Option<&'a str>`, `diff_head: Option<&'a String>`, `base_branch: Option<&'a String>`, `branch: Option<&'a String>`, `tag: Option<&'a String>`, `activity_type: Option<&'a String>`, `verbose: bool`, `strict_filter: bool`
 
 `pub(crate) async fn run_trigger_prefilter( req: PrefilterRequest<'_>, ) -> Result<PrefilterDecision, String>`
 
@@ -7770,25 +8967,22 @@ wrkflw/
 
 ## crates/wrkflw/src/run_workflow_cmd.rs
 
-**Language:** Rust | **Size:** 17.8 KB | **Lines:** 486
+**Language:** Rust | **Size:** 20.5 KB | **Lines:** 544
 
 **Imports:**
 - `crate::prefilter`
 - `crate::{is_gitlab_pipeline, OutputFormat, RuntimeChoice}`
-- `serde_json::json`
 - `std::collections::HashMap`
 - `std::path::PathBuf`
 
 **Declarations:**
 
 `pub(crate) struct RunCtx`
-> Fields: `path: PathBuf`, `runtime: RuntimeChoice`, `show_action_messages: bool`, `preserve_containers_on_failure: bool`, `gitlab: bool`, `job: Option<String>`, `variables: HashMap<String, String>`, `event: Option<String>`, `diff: bool`, `changed_files: Option<Vec<String>>`, `diff_base: Option<String>`, `diff_head: Option<String>`, `base_branch: Option<String>`, `activity_type: Option<String>`, `strict_filter: bool`, `no_strict_filter: bool`, `verbose: bool`, `platform_overrides: HashMap<String, String>`, `kubernetes: wrkflw_executor::KubernetesConfig`, `format: OutputFormat`, `intent: Option<String>`, `agent: Option<String>`, `session: Option<String>`, `no_record: bool`, `from_step: Option<String>`, `reuse_results: bool`, `affected: bool`, `job_container: bool`, `dep_cache: bool`, `remote_cache: Option<String>`, `cache_push: bool`, `skip_exit_code: Option<i32>`, `gate_mode: bool`
+> Fields: `path: PathBuf`, `runtime: RuntimeChoice`, `show_action_messages: bool`, `preserve_containers_on_failure: bool`, `gitlab: bool`, `job: Option<String>`, `variables: HashMap<String, String>`, `event: Option<String>`, `diff: bool`, `changed_files: Option<Vec<String>>`, `diff_base: Option<String>`, `diff_head: Option<String>`, `base_branch: Option<String>`, `branch: Option<String>`, `tag: Option<String>`, `activity_type: Option<String>`, `strict_filter: bool`, `no_strict_filter: bool`, `verbose: bool`, `platform_overrides: HashMap<String, String>`, `kubernetes: wrkflw_executor::KubernetesConfig`, `format: OutputFormat`, `intent: Option<String>`, `agent: Option<String>`, `session: Option<String>`, `no_record: bool`, `from_step: Option<String>`, `reuse_results: bool`, `affected: bool`, `job_container: bool`, `dep_cache: bool`, `remote_cache: Option<String>`, `cache_push: bool`, `skip_exit_code: Option<i32>`, `nothing_checked_exit_code: Option<i32>`, `partial_exit_code: Option<i32>`, `gate_mode: bool`, `stream_output: bool`
 
 `fn secret_from_env(name: &str) -> Option<wrkflw_executor::Secret>`
 
 `fn acceleration_for( ctx: &RunCtx, changed_files: Option<Vec<String>>, ) -> wrkflw_executor::Acceleration`
-
-`fn fail(format: OutputFormat, message: &str) -> !`
 
 `fn resolve_from_step( ctx: &RunCtx, is_gitlab: bool, ) -> Result<Option<wrkflw_executor::FromStep>, String>`
 
@@ -7852,7 +9046,7 @@ wrkflw/
 
 ## crates/wrkflw/src/watch_cmd.rs
 
-**Language:** Rust | **Size:** 12.2 KB | **Lines:** 297
+**Language:** Rust | **Size:** 12.3 KB | **Lines:** 302
 
 **Imports:**
 - `crate::prefilter`
@@ -7872,7 +9066,7 @@ wrkflw/
 
 ## crates/wrkflw/tests/acceleration_test.rs
 
-**Language:** Rust | **Size:** 15.6 KB | **Lines:** 494
+**Language:** Rust | **Size:** 25.8 KB | **Lines:** 781
 
 **Imports:**
 - `std::fs`
@@ -7937,6 +9131,10 @@ wrkflw/
 
 `fn the_gate_skips_a_workflow_the_event_does_not_trigger()`
 
+`fn on_a_feature_branch_the_gate_checks_pull_request_ci_as_a_pull_request()`
+
+`fn a_workflow_whose_jobs_are_all_skipped_checks_nothing_in_either_format()`
+
 `fn the_gate_counts_a_passing_workflow_as_run()`
 
 `fn an_emulated_result_is_not_pushed()`
@@ -7957,11 +9155,29 @@ wrkflw/
 
 `fn the_gate_skips_the_jobs_that_need_a_job_left_to_ci()`
 
+`fn host_os() -> &'static str`
+
+`fn json_lines(output: &Output) -> Vec<serde_json::Value>`
+
+`const WINDOWS_JOB: &str = "name: ci\non: push\njobs:\n win:\n runs-on: windows-latest\n steps:\n - uses: actions/checkout@v4\n - run: echo win >> LOG`
+
+`fn a_run_marks_a_job_that_ran_as_another_os()`
+
+`fn the_gate_prints_one_json_object_naming_the_failed_run()`
+
+`const OS_MATRIX: &str = "name: ci\non: push\njobs:\n build:\n runs-on: $`
+
+`fn a_reused_os_matrix_leg_is_still_unverified()`
+
+`fn the_gate_reports_an_installed_hook_as_json()`
+
+`fn a_reused_partial_pass_stays_partial()`
+
 ---
 
 ## crates/wrkflw/tests/agent_cli_test.rs
 
-**Language:** Rust | **Size:** 35.2 KB | **Lines:** 1106
+**Language:** Rust | **Size:** 46.1 KB | **Lines:** 1414
 
 **Imports:**
 - `serde_json::{json, Value}`
@@ -8006,6 +9222,10 @@ wrkflw/
 
 `fn run_streams_only_json_and_reports_the_failure()`
 
+`fn stream_output_reports_lines_before_the_step_ends_and_masks_them()`
+
+`fn stream_output_without_json_is_refused()`
+
 `fn history_records_runs_and_answers_without_a_rerun()`
 
 `fn listings_are_scoped_to_the_repository()`
@@ -8029,6 +9249,8 @@ wrkflw/
 `fn from_step_starts_at_the_named_step()`
 
 `fn plan_explains_without_executing()`
+
+`fn plan_names_the_legs_that_would_run_as_another_os()`
 
 `fn validate_reports_structured_issues_and_keeps_exit_codes()`
 
@@ -8085,6 +9307,16 @@ wrkflw/
 
 `fn mcp_install_registers_once_and_leaves_other_commands_alone()`
 
+`fn clean_reports_its_json_type_and_exits_1_when_a_workspace_stays()`
+
+`const REFS: &str = r#" name: refs on: push: branches: ['release/**'] tags: ['v*'] pull_request: branches: [main] jobs: check: runs-on: ubuntu-latest steps: - name: refs run: | echo "event=$GITHUB_EVENT_NAME ref=$GITHUB_REF head=$GITHUB_HEAD_REF base=$GITHUB_BASE_REF" test "$GITHUB_EVENT_NAME" = "$`
+
+`fn branch_and_event_reach_filters_and_steps_on_a_detached_head()`
+
+`fn a_step_whose_action_did_not_run_makes_a_pass_partial()`
+
+`fn a_local_javascript_action_is_reported_as_not_run()`
+
 ---
 
 ## crates/wrkflw/tests/container_fidelity_test.rs
@@ -8119,7 +9351,7 @@ wrkflw/
 
 ## crates/wrkflw/tests/continue_on_error_test.rs
 
-**Language:** Rust | **Size:** 5.4 KB | **Lines:** 237
+**Language:** Rust | **Size:** 5.5 KB | **Lines:** 239
 
 **Imports:**
 - `std::fs`
@@ -8159,7 +9391,7 @@ wrkflw/
 
 ## crates/wrkflw/tests/dynamic_matrix_test.rs
 
-**Language:** Rust | **Size:** 6.7 KB | **Lines:** 243
+**Language:** Rust | **Size:** 6.7 KB | **Lines:** 246
 
 **Imports:**
 - `std::fs`
@@ -8202,7 +9434,7 @@ wrkflw/
 
 ## crates/wrkflw/tests/gitlab_pipeline_test.rs
 
-**Language:** Rust | **Size:** 9.8 KB | **Lines:** 409
+**Language:** Rust | **Size:** 9.9 KB | **Lines:** 412
 
 **Imports:**
 - `std::collections::HashMap`
@@ -8262,9 +9494,42 @@ wrkflw/
 
 ---
 
+## crates/wrkflw/tests/matrix_fold_test.rs
+
+**Language:** Rust | **Size:** 4.6 KB | **Lines:** 123
+
+**Imports:**
+- `std::fs`
+- `tempfile::tempdir`
+- `wrkflw_lib::executor::engine::{
+    execute_workflow, ExecutionConfig, ExecutionResult, JobStatus, RuntimeType,
+}`
+
+**Declarations:**
+
+`fn emulation_cfg() -> ExecutionConfig`
+
+`async fn run(yaml: &str) -> ExecutionResult`
+
+`fn legs(result: &ExecutionResult) -> Vec<(String, JobStatus, Option<String>)>`
+
+`fn workflow(strategy: &str, steps: &str) -> String`
+
+`const OS: &str = " matrix:\n os: [ubuntu-latest, macos-latest, windows-latest]"`
+
+`async fn legs_that_only_change_the_runner_run_once_in_matrix_order()`
+
+`async fn a_leg_repeating_a_failed_leg_fails_and_says_whose_failure_it_is()`
+
+`async fn a_leg_whose_original_fail_fast_skipped_is_skipped_too()`
+
+`async fn a_condition_reading_the_runner_over_several_lines_runs_every_leg()`
+
+---
+
 ## crates/wrkflw/tests/needs_failure_propagation_test.rs
 
-**Language:** Rust | **Size:** 13.4 KB | **Lines:** 584
+**Language:** Rust | **Size:** 13.5 KB | **Lines:** 587
 
 **Imports:**
 - `std::fs`
@@ -8317,7 +9582,7 @@ wrkflw/
 
 ## crates/wrkflw/tests/reusable_inputs_outputs_test.rs
 
-**Language:** Rust | **Size:** 3.0 KB | **Lines:** 109
+**Language:** Rust | **Size:** 3.0 KB | **Lines:** 112
 
 **Imports:**
 - `std::fs`
@@ -8347,7 +9612,7 @@ wrkflw/
 
 ## crates/wrkflw/tests/target_job_test.rs
 
-**Language:** Rust | **Size:** 4.1 KB | **Lines:** 153
+**Language:** Rust | **Size:** 4.3 KB | **Lines:** 162
 
 **Imports:**
 - `std::fs`
@@ -8456,7 +9721,7 @@ wrkflw/
 
 ## schemas/github-workflow.json
 
-**Language:** JSON | **Size:** 89.9 KB | **Lines:** 1711
+**Language:** JSON | **Size:** 90.8 KB | **Lines:** 1732
 
 **Declarations:**
 
@@ -8476,9 +9741,15 @@ wrkflw/
 
 ---
 
+## scripts/conformance/plan_corpus.sh
+
+**Language:** Shell | **Size:** 3.8 KB | **Lines:** 75
+
+---
+
 ## skills/wrkflw/SKILL.md
 
-**Language:** Markdown | **Size:** 2.0 KB | **Lines:** 23
+**Language:** Markdown | **Size:** 3.2 KB | **Lines:** 25
 
 **Declarations:**
 

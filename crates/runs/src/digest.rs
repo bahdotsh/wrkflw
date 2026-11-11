@@ -3,6 +3,7 @@
 use crate::record::{JobRecord, RunRecord, RunStatus, StepRecord, SCHEMA_VERSION};
 use crate::store::RunStore;
 use serde::Serialize;
+use std::collections::BTreeSet;
 use wrkflw_executor::{EXIT_CODE_LABEL, STDERR_HEADER, STDOUT_HEADER};
 
 /// Lines of output kept per failed step.
@@ -77,7 +78,11 @@ pub struct FailureDigest {
 #[derive(Debug, Clone, Serialize)]
 pub struct FailedStep {
     pub job: String,
-    /// Other legs of a matrix job that failed in exactly the same way.
+    /// Other legs of a matrix job whose same step failed with the same exit
+    /// code and printed the same thing, or named the same failed tests. Legs
+    /// are folded by which tests failed, not by why: the same test may fail
+    /// for another reason in another leg, so check a leg's own log before
+    /// taking its cause from this one.
     pub also_failed_in: Vec<String>,
     /// `None` when the job failed outside any step, such as a timeout.
     pub step: Option<String>,
@@ -97,13 +102,23 @@ pub struct FailedStep {
     /// What the output says about the cause, when it points away from the
     /// code, as a process killed for lack of memory does.
     pub cause: Option<FailureCause>,
+    /// The failure lines that name what failed, read from the whole output,
+    /// to tell legs that failed the same tests apart from ones that didn't.
+    #[serde(skip)]
+    signature: BTreeSet<String>,
+    /// The other failure lines, such as `error: could not compile` or a
+    /// fatal interpreter error, with paths and numbers blanked: a leg that
+    /// printed one more of these failed in another way too.
+    #[serde(skip)]
+    context: BTreeSet<String>,
 }
 
 /// A cause read from a failed step's output.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct FailureCause {
     /// `out_of_memory` when the output says memory ran out, `killed` when a
-    /// process got SIGKILL and the output doesn't say why.
+    /// process got SIGKILL and the output doesn't say why, `setup_failed`
+    /// when the job failed before any step ran.
     pub kind: &'static str,
     /// The line that shows it.
     pub evidence: String,
@@ -113,9 +128,34 @@ pub struct FailureCause {
 
 /// A line that reports something passing, such as `test oom_is_handled ...
 /// ok`: a word like `out of memory` in it names a test, not a failure.
+/// Test runners print `PASS` and `PASSED` in capitals, or `Passed` as
+/// `dotnet test` does, so a lower-case `pass` in a path such as
+/// `tests/pass/` isn't one. The word must be where a runner puts its
+/// verdict, first or last on the line, once bracketed and parenthesised
+/// parts such as parameters, progress and durations are left out: in
+/// `error TS2339: Property 'Passed' does not exist` it is a name.
 static PASSING: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-    regex::Regex::new(r"(?i)\.\.\.\s*ok\s*$|\bPASS(ED)?\b|^\s*(ok|✓|✔)\b").unwrap()
+    regex::Regex::new(
+        r"\.\.\.\s*ok\s*$|\b(PASS(ED)?|Passed)\s*$|^[\s\-*>:]*(PASS(ED)?|Passed|ok|✓|✔)(\b|:|\s|$)",
+    )
+    .unwrap()
 });
+
+/// A runner's own word for a failure, which no passing line holds.
+static FAILING: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(r"\b(FAIL(ED|URE)?|ERROR|Failed)\b").unwrap());
+
+/// A bracketed or parenthesised part of a line, such as a test's
+/// parameters in `test_x[Failed]` or a duration in `[12 ms]` or `(0.01s)`.
+static BRACKETED: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(r"\[[^\]]*\]|\([^)]*\)").unwrap());
+
+/// Whether `line` reports a pass and no failure. A failure word inside a
+/// test's parameters, as in `test_x[Failed] PASSED`, names the test.
+fn reports_pass(line: &str) -> bool {
+    let bare = BRACKETED.replace_all(line, "");
+    PASSING.is_match(&bare) && !FAILING.is_match(&bare)
+}
 
 /// The lines a cause may be read from: what the step printed, in the last
 /// `tail_lines` or among the error lines above them, without lines that
@@ -131,7 +171,7 @@ fn cause_lines(text: &str, tail_lines: usize) -> Vec<String> {
         .map(|(i, line)| (start + i, strip_ansi(line)))
         .filter(|(at, line)| {
             !is_output_header(line)
-                && !PASSING.is_match(line)
+                && !reports_pass(line)
                 && (*at >= tail_start || is_error_line(line))
         })
         .map(|(_, line)| line)
@@ -176,6 +216,45 @@ fn failure_cause(text: &str, exit_code: Option<i32>, tail_lines: usize) -> Optio
     })
 }
 
+/// The longest `evidence` a setup failure quotes. Its first line can hold
+/// a whole Dockerfile command.
+const SETUP_EVIDENCE_CHARS: usize = 240;
+
+/// The errors wrkflw reports when it can't set a job up: its image doesn't
+/// build or pull, or its job container or network doesn't start. Another
+/// error before the first step, such as a bad expression, is the
+/// workflow's, not the machine's.
+static SETUP_ERROR: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(
+        r"(?i)failed to (build|pull)\b[^:]*\bimage|failed to check for existing image|failed to start container|job container didn't start|failed to create docker network|network operation failed",
+    )
+    .unwrap()
+});
+
+/// The cause of a job that failed before any step ran because wrkflw
+/// couldn't set it up, as when its image doesn't build or pull. `text` is
+/// the job's log; the error is its first line that names a setup failure,
+/// wherever warnings printed before it put it. `None` when no line does.
+fn setup_failure(text: &str) -> Option<FailureCause> {
+    let first = text
+        .lines()
+        .map(str::trim)
+        .find(|line| SETUP_ERROR.is_match(line))?;
+    let evidence = match first.char_indices().nth(SETUP_EVIDENCE_CHARS) {
+        Some((cut, _)) => format!("{}…", &first[..cut]),
+        None => first.to_string(),
+    };
+    Some(FailureCause {
+        kind: "setup_failed",
+        evidence,
+        hint: "The job failed before any step ran, while wrkflw set it up: building or \
+               pulling its image, or starting its container or network. No code under test ran, so this \
+               says nothing about it. The job log has the full error. Pass --platform with \
+               an image that has what the job needs, or fix what the log names"
+            .to_string(),
+    })
+}
+
 fn tail(text: &str, lines: usize) -> (Vec<String>, usize) {
     let all: Vec<&str> = text.lines().collect();
     let kept = all[all.len().saturating_sub(lines)..]
@@ -207,7 +286,8 @@ fn output_start<S: AsRef<str>>(lines: &[S]) -> usize {
 
 /// Up to [`MAX_ERROR_LINES`] of the lines above the last `tail_lines` that
 /// mention an error. A word in the script is not evidence, so only what the
-/// step printed counts.
+/// step printed counts, and a line that reports a pass, such as a test whose
+/// name says `Error:`, isn't one either.
 fn error_lines(text: &str, tail_lines: usize) -> Vec<String> {
     let all: Vec<&str> = text.lines().collect();
     let tail_start = all.len().saturating_sub(tail_lines);
@@ -215,7 +295,7 @@ fn error_lines(text: &str, tail_lines: usize) -> Vec<String> {
     let found: Vec<String> = above_tail
         .iter()
         .map(|line| strip_ansi(line))
-        .filter(|line| !is_output_header(line) && is_error_line(line))
+        .filter(|line| !is_output_header(line) && is_error_line(line) && !reports_pass(line))
         .collect();
     found[found.len().saturating_sub(MAX_ERROR_LINES)..].to_vec()
 }
@@ -243,9 +323,89 @@ fn without_durations(line: &str) -> String {
     words.join(" ")
 }
 
+/// A pytest-style progress marker, such as `[ 76%]`.
+static PROGRESS: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(r"\[\s*\d+%\]").unwrap());
+
+/// Whether `line` names where a failure is: a test id, or a path to a file,
+/// such as `tests/test_x.py::test_y` or `src/lib.rs:12`. Lines without one,
+/// such as `py3.12: FAIL code 1`, are a tool's own chatter and often name
+/// the leg. So are counts and dates such as `2/10` or `2024/01/02`, and a
+/// rule such as `tests/Makefile:12`, which every leg's failure would share.
+fn names_a_location(line: &str) -> bool {
+    line.split_whitespace().any(|word| {
+        let word = word.trim_matches(|c: char| "[](){}<>'\",;".contains(c));
+        if word.contains("::") {
+            return true;
+        }
+        if word.starts_with("http") || !word.contains(['/', '\\']) {
+            return false;
+        }
+        // `path/file.ext`, followed by any `:line:column`.
+        let path = word.trim_end_matches(|c: char| c.is_ascii_digit() || c == ':');
+        let file = path.rsplit(['/', '\\']).next().unwrap_or_default();
+        file.rsplit_once('.').is_some_and(|(stem, ext)| {
+            !stem.is_empty()
+                && (1..=8).contains(&ext.len())
+                && ext.starts_with(|c: char| c.is_ascii_alphabetic())
+                && ext.chars().all(|c| c.is_ascii_alphanumeric())
+        })
+    })
+}
+
+/// The failure lines of everything a step printed that name what failed,
+/// with durations and progress markers blanked. Legs of a matrix that failed
+/// the same tests have the same signature, though they print different
+/// interpreter paths, environment names and process ids around them.
+fn failure_signature(text: &str) -> BTreeSet<String> {
+    failure_lines(text)
+        .into_iter()
+        .filter(|line| names_a_location(line))
+        .map(|line| without_durations(&PROGRESS.replace_all(&line, "")))
+        .collect()
+}
+
+/// The failure lines of everything a step printed that name no location,
+/// with paths and numbers blanked, as legs print other interpreter paths,
+/// versions, counts and times in them.
+fn failure_context(text: &str) -> BTreeSet<String> {
+    failure_lines(text)
+        .into_iter()
+        .filter(|line| !names_a_location(line))
+        .map(|line| {
+            let words: Vec<&str> = line
+                .split_whitespace()
+                .map(|word| {
+                    if word.contains(['/', '\\']) {
+                        "<path>"
+                    } else {
+                        word
+                    }
+                })
+                .collect();
+            DIGITS.replace_all(&words.join(" "), "#").into_owned()
+        })
+        .collect()
+}
+
+static DIGITS: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(r"\d+").unwrap());
+
+/// The lines of what a step printed that report a failure.
+fn failure_lines(text: &str) -> Vec<String> {
+    let lines: Vec<&str> = text.lines().collect();
+    lines[output_start(&lines)..]
+        .iter()
+        .map(|line| strip_ansi(line))
+        .filter(|line| is_error_line(line) && !reports_pass(line))
+        .collect()
+}
+
 /// Whether two failures of one job are one leg's failure repeated by another.
 /// Scripts and step names are left out: they often differ by nothing but the
 /// matrix value, and the same step printing the same thing is the same bug.
+/// So is the same step naming the same failed tests, whatever else the
+/// legs printed around them.
 fn same_failure(a: &FailedStep, b: &FailedStep) -> bool {
     let printed = |failure: &FailedStep| -> Vec<String> {
         let lines = &failure.output_tail;
@@ -254,7 +414,12 @@ fn same_failure(a: &FailedStep, b: &FailedStep) -> bool {
             .map(|line| without_durations(line))
             .collect()
     };
-    (a.step_index, a.exit_code) == (b.step_index, b.exit_code) && printed(a) == printed(b)
+    // Named failures alone could hide a leg that also failed to compile or
+    // crashed, so the rest of what both printed as failures must agree too.
+    let same_tests =
+        !a.signature.is_empty() && a.signature == b.signature && a.context == b.context;
+    (a.step_index, a.exit_code) == (b.step_index, b.exit_code)
+        && (same_tests || printed(a) == printed(b))
 }
 
 /// The failures of `run`, with the legs of a matrix job that failed the same
@@ -366,7 +531,15 @@ fn failed_step(
             output_lines,
             env_from_earlier_steps: Vec::new(),
             log_path: job.log.as_deref().map(log_path),
-            cause: failure_cause(&text, None, tail_lines),
+            // A job with no step ran nothing: its failure is in setting it
+            // up, when the log says so, or in the workflow itself.
+            cause: if job.steps.is_empty() {
+                setup_failure(&text).or_else(|| failure_cause(&text, None, tail_lines))
+            } else {
+                failure_cause(&text, None, tail_lines)
+            },
+            signature: failure_signature(&text),
+            context: failure_context(&text),
         };
     };
     let text = read(&step.log);
@@ -392,6 +565,8 @@ fn failed_step(
         env_from_earlier_steps: env,
         log_path: step.log.as_deref().map(log_path),
         cause: failure_cause(&text, step.exit_code, tail_lines),
+        signature: failure_signature(&text),
+        context: failure_context(&text),
     }
 }
 
@@ -473,6 +648,97 @@ pub fn render_digest(digest: &FailureDigest) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn dotnet_passing_lines_are_passes_and_its_failures_are_not() {
+        assert!(reports_pass("  Passed ErrorHandling.Tests.Parses [12 ms]"));
+        assert!(!reports_pass(
+            "Failed!  - Failed: 1, Passed: 41, Skipped: 0"
+        ));
+        assert!(!reports_pass("  Failed ErrorHandling.Tests.Parses [12 ms]"));
+        // A failure word in a test's parameters names the test.
+        assert!(reports_pass("tests/x.py::test_y[FAILED] PASSED [ 50%]"));
+        assert!(!reports_pass("tests/x.py::test_y[PASSED] FAILED [ 50%]"));
+        // A lower-case word in prose or a path is not a runner's verdict.
+        assert!(!reports_pass(
+            "error: tests/passed/fixture.rs: no such file"
+        ));
+    }
+
+    #[test]
+    fn a_pass_word_that_is_not_a_verdict_keeps_an_error_line() {
+        for line in [
+            "src/x.ts(3,5): error TS2339: Property 'Passed' does not exist on type 'S'.",
+            "error[E0599]: no variant named `Passed` found for enum `Outcome`",
+            "error: environment variable PASS is required",
+            "E   assert 'failed' == 'PASSED'",
+        ] {
+            assert!(!reports_pass(line), "{line}");
+            assert!(cause_lines(&format!("{line}\nx\n"), 1).contains(&line.to_string()));
+        }
+        // What runners print for a pass still is one.
+        for line in [
+            "test parses_error_output ... ok",
+            "tests/test_err.py::test_raises[Error: x] PASSED [ 50%]",
+            "--- PASS: TestErrorPath (0.00s)",
+            "PASS src/errors.test.ts (5.1 s)",
+            "  ✓ reports the error (3 ms)",
+            "  Passed ErrorHandling.Tests.Parses [12 ms]",
+            "ok  \tgithub.com/x/errors\t0.01s",
+        ] {
+            assert!(reports_pass(line), "{line}");
+        }
+    }
+
+    #[test]
+    fn every_setup_error_the_engine_reports_is_recognised() {
+        use wrkflw_executor::setup_errors;
+        use wrkflw_runtime::container::ContainerError;
+        let engine = [
+            setup_errors::COMBINED_IMAGE_BUILD,
+            setup_errors::EXISTING_IMAGE_CHECK,
+            setup_errors::JOB_CONTAINER,
+        ]
+        .map(|prefix| format!("{}: boom", prefix));
+        let runtime = [
+            ContainerError::ImagePull("boom".into()),
+            ContainerError::ImageBuild("boom".into()),
+            ContainerError::ContainerStart("boom".into()),
+            ContainerError::NetworkCreation("boom".into()),
+            ContainerError::NetworkOperation("boom".into()),
+        ]
+        .map(|e| e.to_string());
+        for message in engine.iter().chain(&runtime) {
+            assert!(
+                setup_failure(message).is_some(),
+                "not recognised: {}",
+                message
+            );
+        }
+        // A step's own failure is not one of setting the job up.
+        let step = ContainerError::ContainerExecution("exit 1".into()).to_string();
+        assert!(setup_failure(&step).is_none(), "{}", step);
+    }
+
+    #[test]
+    fn only_paths_to_files_and_test_ids_name_a_location() {
+        for located in [
+            "FAILED tests/test_x.py::test_y[3.12] - AssertionError",
+            "error[E0308]: mismatched types --> src/lib.rs:12:5",
+            "ERROR: (src/app.ts:4) failed",
+        ] {
+            assert!(names_a_location(located), "{located}");
+        }
+        for chatter in [
+            "Error: 2/10 tests failed",
+            "make: *** [tests/Makefile:12: test] Error 1",
+            "ERROR 2024/01/02 something failed",
+            "Error: N/A",
+            "failed, see https://example.com/a.html",
+        ] {
+            assert!(!names_a_location(chatter), "{chatter}");
+        }
+    }
+
     fn failure(output: &[&str]) -> FailedStep {
         FailedStep {
             job: "test (n: 1)".to_string(),
@@ -488,6 +754,8 @@ mod tests {
             env_from_earlier_steps: Vec::new(),
             log_path: None,
             cause: None,
+            signature: BTreeSet::new(),
+            context: BTreeSet::new(),
         }
     }
 
@@ -546,6 +814,35 @@ mod tests {
         let text = "Exit code: 1\nCommand: x\n\nStandard Output:\nout\n\
                     Standard Error:\nerror: the cause\nnoise\nmore\n";
         assert_eq!(error_lines(text, 2), ["error: the cause"]);
+    }
+
+    #[test]
+    fn a_failure_under_a_path_named_pass_is_still_an_error_line() {
+        let text = "Exit code: 1\nCommand: pytest\n\nStandard Output:\n\
+                    tests/pass/test_x.py::test_y FAILED [ 50%]\n\
+                    PASSED and FAILED: one line names both\nnoise\nmore\n";
+        assert_eq!(
+            error_lines(text, 2),
+            [
+                "tests/pass/test_x.py::test_y FAILED [ 50%]",
+                "PASSED and FAILED: one line names both"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_passing_test_named_after_an_error_is_not_an_error_line() {
+        let text = "Exit code: 1\nCommand: pytest\n\nStandard Output:\n\
+                    tests/test_options.py::test_bad[Error: Invalid value] PASSED [ 35%]\n\
+                    tests/test_echo.py::test_pager FAILED [ 80%]\n\
+                    FAILED tests/test_echo.py::test_pager - AssertionError\nnoise\nmore\n";
+        assert_eq!(
+            error_lines(text, 2),
+            [
+                "tests/test_echo.py::test_pager FAILED [ 80%]",
+                "FAILED tests/test_echo.py::test_pager - AssertionError"
+            ]
+        );
     }
 
     #[test]
@@ -621,6 +918,56 @@ mod tests {
     }
 
     #[test]
+    fn a_job_that_failed_before_its_steps_names_its_setup() {
+        let text = format!(
+            "Runtime error: Failed to build combined runtime image: {}\nLast build output:\n\
+             error: externally-managed-environment\n",
+            "x".repeat(400)
+        );
+        let cause = setup_failure(&text).unwrap();
+        assert_eq!(cause.kind, "setup_failed");
+        assert!(cause.evidence.starts_with("Runtime error: Failed to build"));
+        assert!(cause.evidence.ends_with('…'));
+        assert_eq!(cause.evidence.chars().count(), SETUP_EVIDENCE_CHARS + 1);
+        assert!(cause.hint.contains("before any step ran"));
+        assert_eq!(setup_failure("\n  \n"), None);
+        // A warning printed before the error doesn't hide it.
+        let warned = format!(
+            "Steps see the workspace through the docker file share, because ...\n{}",
+            text
+        );
+        assert_eq!(setup_failure(&warned).unwrap().kind, "setup_failed");
+
+        // Each way the engine says it couldn't set a job up.
+        for error in [
+            "Runtime error: Failed to pull Docker image: manifest unknown",
+            "Runtime error: Failed to build image: exit 1",
+            "Runtime error: Failed to check for existing image: daemon down",
+            "job container didn't start: port in use",
+            "Failed to create Docker network: exists",
+        ] {
+            assert_eq!(
+                setup_failure(error).unwrap().kind,
+                "setup_failed",
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_job_that_failed_before_its_steps_for_another_reason_is_not_a_setup_failure() {
+        // The workflow's own mistake: no image was involved.
+        assert_eq!(
+            setup_failure("Execution error: Failed to evaluate if: unknown function foo()"),
+            None
+        );
+        assert_eq!(
+            setup_failure("Execution error: Failed to create job directory: disk full"),
+            None
+        );
+    }
+
+    #[test]
     fn a_passing_test_named_after_memory_is_not_the_cause() {
         // The memory test passed long before the real failure, and a
         // passing line in the tail isn't evidence either.
@@ -676,6 +1023,159 @@ mod tests {
                 "log": format!("{name}.log"),
             }],
         })
+    }
+
+    /// A job that failed before its first step gets `setup_failed` only
+    /// when its log says wrkflw couldn't set it up.
+    #[test]
+    fn a_job_without_steps_is_a_setup_failure_only_when_its_log_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = RunStore::at(dir.path());
+        let stepless = |name: &str| {
+            serde_json::json!({
+                "name": name, "canonical_name": name, "status": "failure",
+                "failure_allowed": false, "duration_ms": 1,
+                "log": format!("{name}.log"), "steps": [],
+            })
+        };
+        let run: RunRecord = serde_json::from_value(serde_json::json!({
+            "schema_version": SCHEMA_VERSION, "id": "r", "status": "failure",
+            "workflow": "ci.yml", "cwd": "/repo", "repo_root": "/repo", "git_sha": null,
+            "git_branch": null, "git_dirty": null, "runtime": "docker", "event": null,
+            "source": "cli", "agent": null, "intent": null, "session": null,
+            "replay_of": null, "argv": [], "variables": [], "pid": 1, "started_at": "",
+            "finished_at": null, "duration_ms": null, "error": null, "skip_reason": null,
+            "jobs": [stepless("image"), stepless("expression")],
+        }))
+        .unwrap();
+        store
+            .write_log(
+                "r",
+                "image.log",
+                "Runtime error: Failed to build combined runtime image: exit 100\n",
+            )
+            .unwrap();
+        store
+            .write_log(
+                "r",
+                "expression.log",
+                "Execution error: Failed to evaluate if: unknown function foo()\n",
+            )
+            .unwrap();
+
+        let digest = failure_digest(&store, &run, 10).unwrap();
+        let cause = |job: &str| {
+            digest
+                .failures
+                .iter()
+                .find(|f| f.job == job)
+                .unwrap()
+                .cause
+                .as_ref()
+                .map(|c| c.kind)
+        };
+        assert_eq!(cause("image"), Some("setup_failed"));
+        assert_eq!(cause("expression"), None);
+    }
+
+    /// Matrix legs that fail the same tests are one failure, though each
+    /// prints its own interpreter path, tox environment and process id.
+    #[test]
+    fn legs_that_fail_the_same_tests_fold_into_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = RunStore::at(dir.path());
+        let leg = |python: &str, failed: &[&str]| {
+            let mut text = String::from(
+                "Exit code: 1\nCommand: tox\n\nStandard Output:\n\
+                 tests/test_a.py::test_ok PASSED [ 10%]\n",
+            );
+            for test in failed {
+                text.push_str(&format!("tests/test_a.py::{test} FAILED [ 76%]\n"));
+            }
+            text.push_str(&format!(
+                "/root/.local/share/uv/python/cpython-{python}/lib/x.py:1: in touch\n\
+                 =========================== short test summary info ===\n"
+            ));
+            for test in failed {
+                text.push_str(&format!("FAILED tests/test_a.py::{test} - OSError\n"));
+            }
+            text.push_str(&format!(
+                "=== {} failed, 2604 passed in 3.{}s ===\n\
+                 py{python}: exit 1 (4.1 seconds) pid=4{}\n  py{python}: FAIL code 1\n",
+                failed.len(),
+                python.len(),
+                python.len()
+            ));
+            text
+        };
+        let job = |name: &str| {
+            serde_json::json!({
+                "name": name, "canonical_name": "tests", "status": "failure",
+                "failure_allowed": false, "duration_ms": 1, "log": null,
+                "steps": [{
+                    "index": 3, "name": "tox", "status": "failure", "outcome": "failure",
+                    "conclusion": "failure", "exit_code": 1, "duration_ms": 1,
+                    "command": "tox", "uses": null, "env_set": [],
+                    "log": format!("{name}.log"),
+                }],
+            })
+        };
+        let run: RunRecord = serde_json::from_value(serde_json::json!({
+            "schema_version": SCHEMA_VERSION, "id": "r", "status": "failure",
+            "workflow": "ci.yml", "cwd": "/repo", "repo_root": "/repo", "git_sha": null,
+            "git_branch": null, "git_dirty": null, "runtime": "docker", "event": null,
+            "source": "cli", "agent": null, "intent": null, "session": null,
+            "replay_of": null, "argv": [], "variables": [], "pid": 1, "started_at": "",
+            "finished_at": null, "duration_ms": null, "error": null, "skip_reason": null,
+            "jobs": [job("3.15"), job("3.10"), job("pypy3.11"), job("3.12")],
+        }))
+        .unwrap();
+        store
+            .write_log("r", "3.15.log", &leg("3.15", &["test_surrogates"]))
+            .unwrap();
+        store
+            .write_log("r", "3.10.log", &leg("3.10", &["test_surrogates"]))
+            .unwrap();
+        // Another test failing is another failure.
+        store
+            .write_log("r", "pypy3.11.log", &leg("pypy3.11", &["test_other"]))
+            .unwrap();
+        // So is the same test failing beside a crash the others didn't have.
+        store
+            .write_log(
+                "r",
+                "3.12.log",
+                &format!(
+                    "{}Fatal Python error: Segmentation fault\n",
+                    leg("3.12", &["test_surrogates"])
+                ),
+            )
+            .unwrap();
+
+        let digest = failure_digest(&store, &run, 6).unwrap();
+        assert_eq!(digest.failures.len(), 3, "{:#?}", digest.failures);
+        assert_eq!(digest.failures[0].job, "3.15");
+        assert_eq!(digest.failures[0].also_failed_in, ["3.10"]);
+        assert_eq!(digest.failures[1].job, "pypy3.11");
+        assert_eq!(digest.failures[2].job, "3.12");
+    }
+
+    #[test]
+    fn a_failure_signature_keeps_only_lines_that_name_what_failed() {
+        let text = "Standard Output:\n\
+                    tests/t.py::a FAILED [ 50%]\n\
+                    tests/t.py::b PASSED [100%]\n\
+                    py3.12: FAIL code 1 (4.2 seconds)\n\
+                    error: could not compile `x`\n\
+                    src/lib.rs:3: error: mismatched types in 0.2s\n";
+        let signature: Vec<String> = failure_signature(text).into_iter().collect();
+        assert_eq!(
+            signature,
+            [
+                "src/lib.rs:3: error: mismatched types in <duration>",
+                "tests/t.py::a FAILED"
+            ]
+        );
     }
 
     #[test]

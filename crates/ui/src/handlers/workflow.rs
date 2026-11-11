@@ -218,6 +218,9 @@ pub async fn execute_workflow_cli(
         platform_overrides,
         kubernetes,
         variables: Default::default(),
+        event_name: None,
+        git_ref: None,
+        base_branch: None,
     };
 
     // Held while the result is printed, so its values stay masked there.
@@ -461,6 +464,7 @@ pub async fn execute_curl_trigger(
             outcome: wrkflw_executor::StepStatus::Success,
             conclusion: wrkflw_executor::StepStatus::Success,
             exit_code: None,
+            actions_not_run: Vec::new(),
         }],
         logs: "Workflow triggered remotely on GitHub".to_string(),
         outputs: std::collections::HashMap::new(),
@@ -596,6 +600,7 @@ pub fn start_next_workflow_execution(
                                         status: step_status,
                                         output: validation_result.issues.join("\n"),
                                         exit_code: None,
+                                        actions_not_run: Vec::new(),
                                     }
                                 }],
                                 logs: format!(
@@ -628,6 +633,9 @@ pub fn start_next_workflow_execution(
                         platform_overrides,
                         kubernetes,
                         variables: Default::default(),
+                        event_name: None,
+                        git_ref: None,
+                        base_branch: None,
                     };
 
                     let execution_result = wrkflw_utils::fd::with_stderr_to_null(|| {

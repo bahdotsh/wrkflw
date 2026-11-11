@@ -34,6 +34,8 @@ pub(crate) struct RunCtx {
     pub(crate) diff_base: Option<String>,
     pub(crate) diff_head: Option<String>,
     pub(crate) base_branch: Option<String>,
+    pub(crate) branch: Option<String>,
+    pub(crate) tag: Option<String>,
     pub(crate) activity_type: Option<String>,
     pub(crate) strict_filter: bool,
     pub(crate) no_strict_filter: bool,
@@ -243,6 +245,8 @@ pub(crate) async fn run(ctx: RunCtx) {
             diff_base: ctx.diff_base.as_deref(),
             diff_head: ctx.diff_head.as_ref(),
             base_branch: ctx.base_branch.as_ref(),
+            branch: ctx.branch.as_ref(),
+            tag: ctx.tag.as_ref(),
             activity_type: ctx.activity_type.as_ref(),
             verbose: ctx.verbose,
             strict_filter,
@@ -293,6 +297,13 @@ pub(crate) async fn run(ctx: RunCtx) {
         platform_overrides: ctx.platform_overrides,
         kubernetes: ctx.kubernetes,
         variables: ctx.variables,
+        event_name: ctx.event.clone(),
+        git_ref: match (&ctx.branch, &ctx.tag) {
+            (Some(branch), _) => Some(format!("refs/heads/{branch}")),
+            (None, Some(tag)) => Some(format!("refs/tags/{tag}")),
+            (None, None) => None,
+        },
+        base_branch: ctx.base_branch.clone(),
     };
     let workflow_type = if is_gitlab {
         "GitLab CI pipeline"
@@ -377,19 +388,24 @@ pub(crate) async fn run(ctx: RunCtx) {
                 println!(
                     "{}",
                     cli_style::warning(&format!(
-                        "Workflow passed, but {} job(s) ran as another OS than runs-on asked for, \
-                         so their OS-specific steps were not checked:",
-                        unverified.len()
+                        "Workflow passed, but {} of it could not be checked here, so the pass \
+                         doesn't stand for GitHub's:",
+                        if unverified.len() == 1 {
+                            "one part".to_string()
+                        } else {
+                            format!("{} parts", unverified.len())
+                        }
                     ))
                 );
+                // Each entry carries the reason its own type wrote, so
+                // every kind of entry reads the same here as in JSON.
                 for entry in &unverified {
                     println!(
                         "  {}",
                         cli_style::dim(&format!(
-                            "{}: asked for {}, ran as {}",
+                            "{}: {}",
                             entry["job"].as_str().unwrap_or_default(),
-                            entry["requested"].as_str().unwrap_or_default(),
-                            entry["ran_as"].as_str().unwrap_or_default()
+                            entry["reason"].as_str().unwrap_or_default()
                         ))
                     );
                 }

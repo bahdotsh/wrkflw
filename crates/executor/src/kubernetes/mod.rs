@@ -21,7 +21,7 @@
 //! `--k8s-registry`.
 
 mod manifest;
-mod sync;
+pub(crate) mod sync;
 
 use async_trait::async_trait;
 use manifest::{build_pod_manifest, is_nested, nested_excludes, plan_mounts, Mount, PodInput};

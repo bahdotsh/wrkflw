@@ -107,6 +107,9 @@ pub(crate) async fn run(ctx: WatchCtx) {
         platform_overrides: ctx.platform_overrides,
         kubernetes: ctx.kubernetes,
         variables: Default::default(),
+        event_name: None,
+        git_ref: None,
+        base_branch: None,
     };
 
     use wrkflw_ui::cli_style;

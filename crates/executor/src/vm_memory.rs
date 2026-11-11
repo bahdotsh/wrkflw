@@ -4,7 +4,9 @@
 //! machine start with half that or less, and every job of a run shares it.
 //! A job that fits on GitHub, such as cargo linking test binaries, can be
 //! killed here for lack of memory and look like a broken build. So the run
-//! says so up front, and runs fewer jobs at once while memory is short.
+//! says so up front, and runs fewer jobs at once while memory is short:
+//! each job sets aside what it used on its last runs (see
+//! [`crate::job_memory`]), or, never measured, a share of 4 GB or more.
 
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -27,9 +29,70 @@ pub const MAX_PARALLEL_JOBS_ENV: &str = "WRKFLW_MAX_PARALLEL_JOBS";
 /// How long `docker info` may take before it's given up on.
 const QUERY_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// One run's places to run jobs in: set once by [`check`] when the run
-/// knows its runtime, `None` inside it for no limit.
-type RunPool = Arc<OnceLock<Option<Arc<Semaphore>>>>;
+const MIB: u64 = 1024 * 1024;
+
+/// How a run limits the jobs it runs at once.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum Limit {
+    /// At most this many, as [`MAX_PARALLEL_JOBS_ENV`] asks.
+    Jobs(usize),
+    /// Jobs share `bytes`, less what the VM keeps for itself, by what each
+    /// was measured to use. A job never measured gets an equal share of
+    /// that among `slots`, so as many run at once as always did.
+    Memory { bytes: u64, slots: usize },
+}
+
+/// What a VM of `bytes` keeps for itself: the engine, its file share, the
+/// workspace helper and image builds, which no job's measurement counts.
+/// A tenth of it, and at least 1 GiB.
+fn vm_reserved(bytes: u64) -> u64 {
+    (bytes / 10).max(1024 * MIB).min(bytes / 2)
+}
+
+/// The memory jobs share on a VM of `bytes`.
+fn shared(bytes: u64) -> u64 {
+    bytes - vm_reserved(bytes)
+}
+
+/// One run's pool: places for [`Limit::Jobs`], MiB for [`Limit::Memory`].
+struct Pool {
+    places: Arc<Semaphore>,
+    limit: Limit,
+}
+
+impl Pool {
+    fn new(limit: Limit) -> Pool {
+        let places = match limit {
+            Limit::Jobs(jobs) => jobs,
+            Limit::Memory { bytes, .. } => mib(shared(bytes)),
+        };
+        Pool {
+            places: Arc::new(Semaphore::new(places.clamp(1, Semaphore::MAX_PERMITS))),
+            limit,
+        }
+    }
+
+    /// The places a job takes, given the room it was measured to need.
+    fn weight(&self, measured: Option<u64>) -> u32 {
+        let (total, wanted) = match self.limit {
+            Limit::Jobs(_) => return 1,
+            Limit::Memory { bytes, slots } => {
+                let shared = shared(bytes);
+                let unknown = shared / slots.max(1) as u64;
+                (mib(shared), mib(measured.unwrap_or(unknown)))
+            }
+        };
+        u32::try_from(wanted.clamp(1, total.max(1))).unwrap_or(u32::MAX)
+    }
+}
+
+fn mib(bytes: u64) -> usize {
+    usize::try_from(bytes / MIB).unwrap_or(usize::MAX)
+}
+
+/// One run's pool: set once by [`check`] when the run knows its runtime,
+/// `None` inside it for no limit.
+type RunPool = Arc<OnceLock<Option<Arc<Pool>>>>;
 
 tokio::task_local! {
     /// The pool of the run being executed. Every job and every matrix leg
@@ -53,9 +116,33 @@ pub(crate) async fn with_run_pool<F: std::future::Future>(future: F) -> F::Outpu
 /// Take it only around a job's own steps: a job that calls a reusable
 /// workflow runs that workflow's jobs, and holding a place while they wait
 /// for one would deadlock a limit of one.
-pub(crate) async fn job_slot() -> Option<OwnedSemaphorePermit> {
+///
+/// `job` is the job's [`crate::job_memory::job_id`], whose measurements
+/// size its place when jobs share memory.
+pub(crate) async fn job_slot(job: Option<&str>) -> Option<OwnedSemaphorePermit> {
     let pool = POOL.try_with(|pool| pool.get().cloned().flatten()).ok()??;
-    pool.acquire_owned().await.ok()
+    let measured = match (pool.limit, job) {
+        // The store is a file under a lock: not for the async runtime.
+        (Limit::Memory { .. }, Some(job)) => {
+            let job = job.to_string();
+            tokio::task::spawn_blocking(move || crate::job_memory::reserve(&job))
+                .await
+                .ok()
+                .flatten()
+        }
+        _ => None,
+    };
+    let weight = pool.weight(measured);
+    pool.places.clone().acquire_many_owned(weight).await.ok()
+}
+
+/// Whether this run sizes jobs by the memory they were measured to use, so
+/// what they use now is worth keeping for the next run.
+pub(crate) fn sizes_by_memory() -> bool {
+    POOL.try_with(|pool| pool.get().cloned().flatten())
+        .ok()
+        .flatten()
+        .is_some_and(|pool| matches!(pool.limit, Limit::Memory { .. }))
 }
 
 fn env_limit() -> Option<usize> {
@@ -112,6 +199,14 @@ impl Memory {
         }
     }
 
+    /// How a run on this runtime shares its memory, or `None` for no limit.
+    fn pool_limit(&self) -> Option<Limit> {
+        self.limit().map(|slots| Limit::Memory {
+            bytes: self.bytes,
+            slots,
+        })
+    }
+
     /// The warning for a runtime short of a runner's memory, or `None`.
     pub fn warning(&self) -> Option<String> {
         if self.bytes >= WARN_BELOW_BYTES {
@@ -161,7 +256,9 @@ fn warning(memory: &Memory, limit: Option<usize>) -> String {
     };
     let running = match limit {
         Some(limit) => format!(
-            "Running at most {limit} job(s) at a time. {way_out}, or set {MAX_PARALLEL_JOBS_ENV}"
+            "Jobs not measured yet run at most {limit} at a time; a job measured on an \
+             earlier run sets aside what it used then, so light jobs run side by side. \
+             {way_out}, or set {MAX_PARALLEL_JOBS_ENV}"
         ),
         None => format!(
             "Jobs run side by side as on GitHub. {way_out}, or set {MAX_PARALLEL_JOBS_ENV} to \
@@ -255,19 +352,19 @@ pub(crate) async fn check(cli: Option<&str>) {
         Some(cli) => limit_from_memory(cli).await,
         None => None,
     };
-    set_limit(env_limit().or(limit));
+    set_limit(env_limit().map(Limit::Jobs).or(limit));
 }
 
 /// Size this run's pool for `limit` jobs at once, `None` for no limit. Only
 /// the first call of a run counts: it checks its runtime once, before any
 /// job runs.
-fn set_limit(limit: Option<usize>) {
-    let _ = POOL.try_with(|pool| pool.set(limit.map(|limit| Arc::new(Semaphore::new(limit)))));
+fn set_limit(limit: Option<Limit>) {
+    let _ = POOL.try_with(|pool| pool.set(limit.map(|limit| Arc::new(Pool::new(limit)))));
 }
 
 /// The job limit the memory of `cli`'s runtime allows, warning when it is
 /// short.
-async fn limit_from_memory(cli: &str) -> Option<usize> {
+async fn limit_from_memory(cli: &str) -> Option<Limit> {
     let (memory, warn) = match std::env::var(PROBED_ENV) {
         Ok(value) => (parent_probe(&value, cli), false),
         Err(_) => {
@@ -282,7 +379,7 @@ async fn limit_from_memory(cli: &str) -> Option<usize> {
     if let (true, Some(text)) = (warn, memory.as_ref().and_then(Memory::warning)) {
         wrkflw_logging::warning(&text);
     }
-    memory.as_ref().and_then(Memory::limit)
+    memory.as_ref().and_then(Memory::pool_limit)
 }
 
 #[cfg(test)]
@@ -310,17 +407,17 @@ mod tests {
     #[tokio::test]
     async fn every_job_and_leg_takes_its_place_from_the_runs_pool() {
         with_run_pool(async {
-            set_limit(Some(2));
-            let _a = job_slot().await.unwrap();
-            let _b = job_slot().await.unwrap();
-            let third = tokio::time::timeout(Duration::from_millis(50), job_slot()).await;
+            set_limit(Some(Limit::Jobs(2)));
+            let _a = job_slot(None).await.unwrap();
+            let _b = job_slot(None).await.unwrap();
+            let third = tokio::time::timeout(Duration::from_millis(50), job_slot(None)).await;
             assert!(
                 third.is_err(),
                 "a third place was handed out with a limit of two"
             );
             // A second check in the same run doesn't resize its pool.
-            set_limit(Some(3));
-            let again = tokio::time::timeout(Duration::from_millis(50), job_slot()).await;
+            set_limit(Some(Limit::Jobs(3)));
+            let again = tokio::time::timeout(Duration::from_millis(50), job_slot(None)).await;
             assert!(again.is_err(), "the run's pool was resized");
         })
         .await;
@@ -331,24 +428,78 @@ mod tests {
         // One run with a limit of one holds its only place while another
         // run, in the same process, sets no limit and runs freely.
         with_run_pool(async {
-            set_limit(Some(1));
-            let _held = job_slot().await.unwrap();
+            set_limit(Some(Limit::Jobs(1)));
+            let _held = job_slot(None).await.unwrap();
             with_run_pool(async {
                 set_limit(None);
-                assert!(job_slot().await.is_none());
+                assert!(job_slot(None).await.is_none());
             })
             .await;
-            let blocked = tokio::time::timeout(Duration::from_millis(50), job_slot()).await;
+            let blocked = tokio::time::timeout(Duration::from_millis(50), job_slot(None)).await;
             assert!(blocked.is_err(), "the other run changed this run's limit");
         })
         .await;
     }
 
     #[tokio::test]
+    async fn measured_jobs_share_the_vm_and_unmeasured_ones_keep_their_room() {
+        const GIB: u64 = 1024 * MIB;
+        // An 8 GB VM used to run one job at a time.
+        let pool = Pool::new(Limit::Memory {
+            bytes: 8 * GIB,
+            slots: 1,
+        });
+        // 1 GiB of it stays with the VM.
+        assert_eq!(pool.weight(None), 7 * 1024, "an unmeasured job runs alone");
+        assert_eq!(pool.weight(Some(GIB)), 1024);
+        assert_eq!(
+            pool.weight(Some(64 * GIB)),
+            7 * 1024,
+            "never more than the VM shares"
+        );
+        // A 12 GB VM ran three jobs at once, and still does.
+        let pool = Pool::new(Limit::Memory {
+            bytes: 12 * GIB,
+            slots: 3,
+        });
+        let unmeasured = pool.weight(None) as usize;
+        assert_eq!(pool.places.available_permits() / unmeasured, 3);
+        assert_eq!(vm_reserved(12 * GIB), 12 * GIB / 10);
+        assert_eq!(vm_reserved(GIB), GIB / 2, "a tiny VM still shares half");
+        assert_eq!(Pool::new(Limit::Jobs(2)).weight(Some(GIB)), 1);
+
+        // Seven jobs measured at 1 GB fit together, with 1 GiB left to the
+        // VM, where one unmeasured job would have run alone.
+        with_run_pool(async {
+            set_limit(Some(Limit::Memory {
+                bytes: 8 * GIB,
+                slots: 1,
+            }));
+            let pool = POOL.with(|pool| pool.get().cloned().flatten()).unwrap();
+            let held: Vec<_> = (0..7)
+                .map(|_| {
+                    pool.places
+                        .clone()
+                        .try_acquire_many_owned(pool.weight(Some(GIB)))
+                        .unwrap()
+                })
+                .collect();
+            assert!(pool.places.clone().try_acquire_many_owned(1).is_err());
+            drop(held);
+            let alone = pool
+                .places
+                .clone()
+                .try_acquire_many_owned(pool.weight(None));
+            assert!(alone.is_ok());
+        })
+        .await;
+    }
+
+    #[tokio::test]
     async fn outside_a_run_nothing_is_limited() {
-        set_limit(Some(1));
-        assert!(job_slot().await.is_none());
-        assert!(job_slot().await.is_none());
+        set_limit(Some(Limit::Jobs(1)));
+        assert!(job_slot(None).await.is_none());
+        assert!(job_slot(None).await.is_none());
     }
 
     fn memory(bytes: u64, in_vm: bool) -> Memory {

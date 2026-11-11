@@ -10,7 +10,7 @@ pub const LOCAL_IMAGE_PREFIX: &str = "wrkflw-";
 pub const COMBINED_IMAGE_PREFIX: &str = "wrkflw-combined:";
 
 #[async_trait]
-pub trait ContainerRuntime {
+pub trait ContainerRuntime: Sync {
     /// Run a command inside a container.
     ///
     /// If `cmd` is empty (`&[]`), the container runs with the image's built-in
@@ -48,6 +48,21 @@ pub trait ContainerRuntime {
     /// Check whether a Docker/OCI image is usable by this runtime without
     /// building it. A cheap, read-only check; callers may repeat it.
     async fn image_exists(&self, tag: &str) -> Result<bool, ContainerError>;
+
+    /// The local identity of `image` (its content-addressed ID, such as
+    /// `sha256:…`), when the runtime has it. `None` when the image isn't
+    /// present locally or the runtime can't say. A cheap, read-only check.
+    async fn image_id(&self, image: &str) -> Option<String> {
+        let _ = image;
+        None
+    }
+
+    /// True when [`image_id`](Self::image_id) can name a local image, so a
+    /// pull before asking is worth it. False keeps callers from pulling an
+    /// image only to be told nothing.
+    fn identifies_images(&self) -> bool {
+        false
+    }
 
     /// True when `run_container` copies volumes to the step and back instead
     /// of sharing them with the host, so a volume's contents end up on the
@@ -448,5 +463,14 @@ mod tests {
             Some("/usr/local/cargo/bin:/usr/bin")
         );
         assert_eq!(path_from_image_env(&["HOME=/root"]), None);
+    }
+
+    /// A runtime that doesn't override `image_id` says it can't identify
+    /// any image, rather than guessing.
+    #[tokio::test]
+    async fn image_id_defaults_to_none() {
+        let runtime = crate::emulation::EmulationRuntime::new();
+        assert_eq!(runtime.image_id("alpine:3.19").await, None);
+        assert!(!runtime.identifies_images());
     }
 }

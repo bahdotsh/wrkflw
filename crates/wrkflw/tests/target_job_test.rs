@@ -36,6 +36,9 @@ jobs:
     // but NOT "deploy".
     let cfg = ExecutionConfig {
         acceleration: Default::default(),
+        event_name: None,
+        git_ref: None,
+        base_branch: None,
         runtime_type: RuntimeType::Emulation,
         verbose: false,
         preserve_containers_on_failure: false,
@@ -81,6 +84,9 @@ jobs:
 
     let cfg = ExecutionConfig {
         acceleration: Default::default(),
+        event_name: None,
+        git_ref: None,
+        base_branch: None,
         runtime_type: RuntimeType::Emulation,
         verbose: false,
         preserve_containers_on_failure: false,
@@ -133,6 +139,9 @@ jobs:
     // Target "lint" which has no dependencies — only lint should run
     let cfg = ExecutionConfig {
         acceleration: Default::default(),
+        event_name: None,
+        git_ref: None,
+        base_branch: None,
         runtime_type: RuntimeType::Emulation,
         verbose: false,
         preserve_containers_on_failure: false,

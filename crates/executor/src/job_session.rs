@@ -28,7 +28,7 @@ use wrkflw_runtime::container::{
 
 const SERVICE_READY_TIMEOUT: Duration = Duration::from_secs(180);
 const SERVICE_POLL: Duration = Duration::from_millis(500);
-const KEEP_ALIVE: &str = "trap 'exit 0' TERM; while :; do sleep 3600 & wait $!; done";
+pub(crate) const KEEP_ALIVE: &str = "trap 'exit 0' TERM; while :; do sleep 3600 & wait $!; done";
 
 /// A service as declared, before expressions are resolved.
 #[derive(Clone)]
@@ -721,6 +721,9 @@ impl JobSession {
         volumes: &[(PathBuf, PathBuf)],
         resolve: &dyn Fn(&str) -> String,
     ) -> Result<Live, String> {
+        // The job container and services aren't sampled, so the job keeps
+        // the room an unmeasured job gets.
+        crate::job_memory::unmeasured();
         let name = format!("wrkflw-job-{}", uuid::Uuid::new_v4());
         let service_names: Vec<&str> = self.services.iter().map(|s| s.name.as_str()).collect();
         let args = start_args(&name, image, volumes, &service_names);
@@ -729,7 +732,8 @@ impl JobSession {
             .map_err(|e| e.to_string())?;
         if output.exit_code != 0 {
             return Err(format!(
-                "job container didn't start: {}",
+                "{}: {}",
+                crate::setup_errors::JOB_CONTAINER,
                 output.stderr.trim()
             ));
         }

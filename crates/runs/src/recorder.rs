@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use wrkflw_executor::engine::{ExecutionError, ExecutionResult};
 use wrkflw_executor::{
     with_run_hooks, ExecutionConfig, ExecutionEvent, ExecutionObserver, FromStep, JobResult,
-    RunHooks, RunnerSubstitution,
+    RunHooks, RunnerSubstitution, UnexecutedAction,
 };
 
 /// Step output carried inline in an NDJSON event. The full text is in the log.
@@ -292,6 +292,7 @@ impl Recorder {
                 repeated_from: None,
                 reused: None,
                 runner: None,
+                actions_not_run: Vec::new(),
             });
             record.jobs.len() - 1
         });
@@ -334,6 +335,20 @@ impl Recorder {
             let existing = Self::job_mut(record, &job.name, &job.canonical_name);
             existing.steps = steps;
             existing.log = existing.log.take().or(log);
+            // The events that would have named them were lost with the rest,
+            // and a pass that skipped an action must not read as verified.
+            if existing.actions_not_run.is_empty() {
+                existing.actions_not_run = job
+                    .steps
+                    .iter()
+                    .flat_map(|step| {
+                        step.actions_not_run.iter().map(|uses| UnexecutedAction {
+                            step: step.name.clone(),
+                            uses: uses.clone(),
+                        })
+                    })
+                    .collect();
+            }
         }
     }
 
@@ -394,6 +409,17 @@ impl ExecutionObserver for Recorder {
                 self.persist(&record);
                 return;
             }
+            ExecutionEvent::ActionNotRun { job, step, uses } => {
+                let mut record = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                Self::job_mut(&mut record, job, job)
+                    .actions_not_run
+                    .push(UnexecutedAction {
+                        step: step.clone(),
+                        uses: uses.clone(),
+                    });
+                self.persist(&record);
+                return;
+            }
             _ => {}
         }
         // Live output stays out of the record and the event stream: the
@@ -404,13 +430,13 @@ impl ExecutionObserver for Recorder {
         };
         if let ExecutionEvent::JobFinished { job, .. } = event {
             let record = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(runner) = record
-                .jobs
-                .iter()
-                .find(|j| &j.name == job)
-                .and_then(|j| j.runner.as_ref())
-            {
-                line["runner"] = json!(runner);
+            if let Some(finished) = record.jobs.iter().find(|j| &j.name == job) {
+                if let Some(runner) = &finished.runner {
+                    line["runner"] = json!(runner);
+                }
+                if !finished.actions_not_run.is_empty() {
+                    line["actions_not_run"] = json!(finished.actions_not_run);
+                }
             }
         }
         self.line(line);
@@ -425,7 +451,9 @@ impl ExecutionObserver for Recorder {
                 self.persist(&record);
             }
             // Handled above.
-            ExecutionEvent::StepOutput { .. } | ExecutionEvent::RunnerSubstituted { .. } => {}
+            ExecutionEvent::StepOutput { .. }
+            | ExecutionEvent::RunnerSubstituted { .. }
+            | ExecutionEvent::ActionNotRun { .. } => {}
             ExecutionEvent::StepStarted { .. } => {}
             ExecutionEvent::StepFinished {
                 job,
@@ -500,9 +528,9 @@ fn event_json(event: &ExecutionEvent) -> Option<Value> {
         ExecutionEvent::StepStarted { job, step, index } => {
             json!({"type": "step_started", "job": job, "step": step, "index": index})
         }
-        ExecutionEvent::StepOutput { .. } | ExecutionEvent::RunnerSubstituted { .. } => {
-            return None
-        }
+        ExecutionEvent::StepOutput { .. }
+        | ExecutionEvent::RunnerSubstituted { .. }
+        | ExecutionEvent::ActionNotRun { .. } => return None,
         ExecutionEvent::StepFinished {
             job,
             step,
@@ -660,6 +688,9 @@ fn run_finished_json(record: &RunRecord, digest: Option<&FailureDigest>) -> Valu
             if let Some(runner) = &job.runner {
                 entry["runner"] = json!(runner);
             }
+            if !job.actions_not_run.is_empty() {
+                entry["actions_not_run"] = json!(job.actions_not_run);
+            }
             entry
         }).collect::<Vec<_>>(),
         "unverified": unverified(record),
@@ -673,9 +704,10 @@ fn run_finished_json(record: &RunRecord, digest: Option<&FailureDigest>) -> Valu
 /// How much a run's result proves. A pass splits three ways, so a reader of
 /// one word can't take a partial check for a full one:
 ///
-/// - `verified`: something ran, and every job that ran did so as the OS its
-///   `runs-on` asked for.
-/// - `partial`: it passed, but some jobs ran as another OS (`unverified`).
+/// - `verified`: something ran, every job that ran did so as the OS its
+///   `runs-on` asked for, and every `uses:` step ran its action.
+/// - `partial`: it passed, but some jobs ran as another OS or passed a step
+///   without running its action (`unverified`).
 /// - `nothing_checked`: it passed because no job ran, all skipped by `if:`,
 ///   `needs` or `gate: false`.
 ///
@@ -707,13 +739,21 @@ fn job_ran(job: &JobRecord) -> bool {
 }
 
 /// Jobs whose result can't stand for GitHub's, because they ran as another
-/// OS than `runs-on` asked for. A skipped job ran nothing, so it isn't one.
+/// OS than `runs-on` asked for, or passed a `uses:` step without running its
+/// action. A skipped job ran nothing, so it isn't one.
 fn unverified(record: &RunRecord) -> Vec<Value> {
     record
         .jobs
         .iter()
         .filter(|job| job.status != "skipped")
-        .filter_map(|job| Some(job.runner.as_ref()?.unverified_entry(&job.name)))
+        .flat_map(|job| {
+            let runner = job.runner.as_ref().map(|r| r.unverified_entry(&job.name));
+            let actions = job
+                .actions_not_run
+                .iter()
+                .map(|action| action.unverified_entry(&job.name));
+            runner.into_iter().chain(actions)
+        })
         .collect()
 }
 
@@ -1014,6 +1054,7 @@ mod tests {
                 requested: "windows-latest".to_string(),
                 ran_as: "Linux".to_string(),
             }),
+            actions_not_run: Vec::new(),
         };
         let mut record: RunRecord = serde_json::from_value(json!({
             "schema_version": SCHEMA_VERSION, "id": "r", "status": "success",
@@ -1040,6 +1081,94 @@ mod tests {
         assert_eq!(line["jobs"][0]["repeated_from"], "b (os: ubuntu-latest)");
         assert_eq!(line["jobs"][0]["runner"]["requested"], "windows-latest");
         assert!(line["jobs"][1].get("repeated_from").is_none());
+    }
+
+    #[test]
+    fn a_job_whose_events_were_lost_keeps_the_actions_it_did_not_run() {
+        use wrkflw_executor::engine::{JobResult, JobStatus, StepResult, StepStatus};
+        let scratch = tempfile::tempdir().unwrap();
+        let record: RunRecord = serde_json::from_value(json!({
+            "schema_version": SCHEMA_VERSION, "id": "r", "status": "success",
+            "workflow": "ci.yml", "cwd": "/repo", "repo_root": "/repo", "git_sha": null,
+            "git_branch": null, "git_dirty": null, "runtime": "docker", "event": null,
+            "source": "cli", "agent": null, "intent": null, "session": null,
+            "replay_of": null, "argv": [], "variables": [], "pid": 1, "started_at": "",
+            "finished_at": null, "duration_ms": null, "error": null, "skip_reason": null,
+            "jobs": [],
+        }))
+        .unwrap();
+        let recorder = Recorder {
+            store: RunStore::at(scratch.path()),
+            persistent: false,
+            _scratch: None,
+            state: Mutex::new(record),
+            ndjson: false,
+            stream_output: false,
+            started: Instant::now(),
+        };
+        let step = StepResult {
+            name: "Upload coverage".to_string(),
+            status: StepStatus::Success,
+            output: String::new(),
+            outcome: StepStatus::Success,
+            conclusion: StepStatus::Success,
+            exit_code: None,
+            actions_not_run: vec!["codecov/codecov-action@v5".to_string()],
+        };
+        // No event reached the recorder: the result is all it has.
+        let job = JobResult {
+            name: "tests".to_string(),
+            canonical_name: "tests".to_string(),
+            status: JobStatus::Success,
+            steps: vec![step],
+            logs: String::new(),
+            outputs: Default::default(),
+            failure_allowed: false,
+            repeated_from: None,
+        };
+        let record = recorder.finish(RunStatus::Success, None, None, &[job]);
+        assert_eq!(record.jobs[0].actions_not_run.len(), 1);
+        assert_eq!(record.jobs[0].actions_not_run[0].step, "Upload coverage");
+        let line = run_finished_json(&record, None);
+        assert_eq!(line["verdict"], "partial");
+        assert_eq!(line["unverified"][0]["uses"], "codecov/codecov-action@v5");
+        assert_eq!(line["unverified"][0]["kind"], "action_not_run");
+    }
+
+    #[test]
+    fn a_job_that_passed_a_step_without_running_its_action_is_unverified() {
+        let mut record: RunRecord = serde_json::from_value(json!({
+            "schema_version": SCHEMA_VERSION, "id": "r", "status": "success",
+            "workflow": "ci.yml", "cwd": "/repo", "repo_root": "/repo", "git_sha": null,
+            "git_branch": null, "git_dirty": null, "runtime": "docker", "event": null,
+            "source": "cli", "agent": null, "intent": null, "session": null,
+            "replay_of": null, "argv": [], "variables": [], "pid": 1, "started_at": "",
+            "finished_at": null, "duration_ms": null, "error": null, "skip_reason": null,
+            "jobs": [
+                {"name": "tests", "canonical_name": "tests", "status": "success",
+                 "failure_allowed": false, "duration_ms": 1, "log": null, "steps": []},
+                {"name": "lint", "canonical_name": "lint", "status": "success",
+                 "failure_allowed": false, "duration_ms": 1, "log": null, "steps": []},
+            ],
+        }))
+        .unwrap();
+        // An old record without the field reads as a job that ran everything.
+        assert!(record.jobs[0].actions_not_run.is_empty());
+        record.jobs[0].actions_not_run.push(UnexecutedAction {
+            step: "Install uv".to_string(),
+            uses: "astral-sh/setup-uv@v9".to_string(),
+        });
+        let line = run_finished_json(&record, None);
+        assert_eq!(line["verdict"], "partial");
+        assert_eq!(line["unverified"].as_array().unwrap().len(), 1);
+        assert_eq!(line["unverified"][0]["job"], "tests");
+        assert_eq!(line["unverified"][0]["step"], "Install uv");
+        assert_eq!(line["unverified"][0]["uses"], "astral-sh/setup-uv@v9");
+        assert_eq!(
+            line["jobs"][0]["actions_not_run"][0]["uses"],
+            "astral-sh/setup-uv@v9"
+        );
+        assert!(line["jobs"][1].get("actions_not_run").is_none());
     }
 
     #[test]
@@ -1121,6 +1250,7 @@ mod tests {
             repeated_from: None,
             reused: None,
             runner,
+            actions_not_run: Vec::new(),
         };
         let mut record: RunRecord = serde_json::from_value(json!({
             "schema_version": SCHEMA_VERSION, "id": "r", "status": "success",

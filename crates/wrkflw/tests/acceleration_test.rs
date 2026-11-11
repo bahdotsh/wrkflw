@@ -720,3 +720,62 @@ fn the_gate_reports_an_installed_hook_as_json() {
     let path = repo.root().join(lines[0]["path"].as_str().unwrap());
     assert!(fs::read_to_string(path).unwrap().contains("wrkflw gate"));
 }
+
+/// A pass that skipped an action is reused as the partial pass it was: the
+/// second run's verdict and `unverified` say so, though no step runs.
+#[test]
+fn a_reused_partial_pass_stays_partial() {
+    const SETUP: &str = r#"
+name: ci
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up Node
+        uses: actions/setup-node@v4
+      - run: echo build >> LOG
+"#;
+    let repo = Repo::new(SETUP, None);
+    let verdict = |output: &Output| -> serde_json::Value {
+        assert_ok(output);
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|line| line["type"] == "run_finished")
+            .unwrap_or_else(|| {
+                panic!(
+                    "no run_finished: {}",
+                    String::from_utf8_lossy(&output.stdout)
+                )
+            })
+    };
+    let json_run = |repo: &Repo| {
+        repo.wrkflw(&[
+            "--format",
+            "json",
+            "run",
+            ".github/workflows/ci.yml",
+            "--runtime",
+            "emulation",
+            "--reuse-results",
+        ])
+    };
+    let first = verdict(&json_run(&repo));
+    assert_eq!(first["verdict"], "partial", "{first}");
+    assert_eq!(repo.take_ran(), ["build"]);
+
+    let second = verdict(&json_run(&repo));
+    assert!(repo.take_ran().is_empty(), "the job ran again");
+    assert!(second["jobs"][0]["reused"].is_string(), "{second}");
+    assert_eq!(second["verdict"], "partial", "{second}");
+    // Off Linux, emulation also reports the job as run on another OS.
+    let not_run: Vec<&serde_json::Value> = second["unverified"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|entry| entry["kind"] == "action_not_run")
+        .collect();
+    assert_eq!(not_run.len(), 1, "{second}");
+    assert_eq!(not_run[0]["uses"], "actions/setup-node@v4", "{second}");
+}

@@ -102,20 +102,54 @@ pub fn apply_gitlab_container_context(env: &mut HashMap<String, String>) {
     }
 }
 
+/// The event a run simulates and the ref it is for. Each part left out is
+/// worked out from the workflow and the checkout.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RunRef<'a> {
+    /// `github.event_name`; without it the workflow's first trigger.
+    pub event_name: Option<&'a str>,
+    /// The full ref the event is for, such as `refs/heads/main` for a push
+    /// or a pull request's head, or `refs/tags/v1.0` for a tag push.
+    /// Without it the checked-out branch, and `main` on a detached HEAD.
+    pub git_ref: Option<&'a str>,
+    /// A pull request's target branch, as `github.base_ref`.
+    pub base_branch: Option<&'a str>,
+}
+
+/// The runner-seeded `GITHUB_*` variables of a run for `run_ref`.
+///
+/// For a pull request `GITHUB_HEAD_REF` and `GITHUB_BASE_REF` name its
+/// branches, as on GitHub. `GITHUB_REF` stays the head branch: GitHub's
+/// `refs/pull/<number>/merge` needs a pull request number a local run
+/// doesn't have.
 pub fn create_github_context(
     workflow: &WorkflowDefinition,
     workspace_dir: &Path,
+    run_ref: &RunRef<'_>,
 ) -> HashMap<String, String> {
+    // Resolved once, so the pull request variables below follow the event
+    // the job sees, whether it was passed or taken from the workflow.
+    let event_name = run_ref
+        .event_name
+        .map(str::to_string)
+        .unwrap_or_else(|| get_event_name(workflow));
+    let is_pull_request = event_name.starts_with("pull_request");
     let mut env = HashMap::new();
 
     // Basic GitHub environment variables
     env.insert("GITHUB_WORKFLOW".to_string(), workflow.name.clone());
     env.insert("GITHUB_ACTION".to_string(), "run".to_string());
     env.insert("GITHUB_REPOSITORY".to_string(), get_repo_name());
-    env.insert("GITHUB_EVENT_NAME".to_string(), get_event_name(workflow));
+    env.insert("GITHUB_EVENT_NAME".to_string(), event_name);
     env.insert("GITHUB_WORKSPACE".to_string(), get_workspace_path());
     env.insert("GITHUB_SHA".to_string(), get_current_sha());
-    env.insert("GITHUB_REF".to_string(), get_current_ref());
+    env.insert(
+        "GITHUB_REF".to_string(),
+        run_ref
+            .git_ref
+            .map(str::to_string)
+            .unwrap_or_else(get_current_ref),
+    );
 
     // File paths for GitHub Actions
     env.insert(
@@ -180,9 +214,17 @@ pub fn create_github_context(
     env.insert("GITHUB_REF_NAME".to_string(), get_ref_name(&full_ref));
     env.insert("GITHUB_REF_TYPE".to_string(), get_ref_type(&full_ref));
 
-    // PR-related variables (empty for local runs)
-    env.insert("GITHUB_HEAD_REF".to_string(), String::new());
-    env.insert("GITHUB_BASE_REF".to_string(), String::new());
+    // A pull request's branches, empty for any other event as on GitHub.
+    let (head_ref, base_ref) = if is_pull_request {
+        (
+            env.get("GITHUB_REF_NAME").cloned().unwrap_or_default(),
+            run_ref.base_branch.unwrap_or_default().to_string(),
+        )
+    } else {
+        (String::new(), String::new())
+    };
+    env.insert("GITHUB_HEAD_REF".to_string(), head_ref);
+    env.insert("GITHUB_BASE_REF".to_string(), base_ref);
 
     // Actor-related variables
     let actor = get_actor();

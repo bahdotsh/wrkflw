@@ -2,7 +2,7 @@
 //! them through `--format json` and MCP. Add fields rather than rename them.
 
 use serde::{Deserialize, Serialize};
-use wrkflw_executor::RunnerSubstitution;
+use wrkflw_executor::{RunnerSubstitution, UnexecutedAction};
 
 /// Bumped only for incompatible changes to any JSON wrkflw emits.
 pub const SCHEMA_VERSION: u32 = 1;
@@ -94,6 +94,12 @@ pub struct JobRecord {
     /// on such a job says nothing about its OS-specific steps.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runner: Option<RunnerSubstitution>,
+    /// `uses:` steps that passed without running their action, because
+    /// wrkflw has no implementation of it or its runtime isn't in the
+    /// job's image. A pass on such a job says
+    /// nothing about what the action would have done.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub actions_not_run: Vec<UnexecutedAction>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

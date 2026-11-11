@@ -20,6 +20,9 @@ use wrkflw_ui::cli_style;
 pub(crate) struct CompareCtx {
     pub(crate) run: String,
     pub(crate) runtime: RuntimeChoice,
+    /// Global flags such as `--platform` and `--every-matrix-leg`, passed
+    /// on to the local run.
+    pub(crate) child_args: Vec<String>,
     pub(crate) format: OutputFormat,
 }
 
@@ -203,6 +206,12 @@ fn note_for(local: &Value, failures: &[Value]) -> Option<String> {
             runner["requested"].as_str().unwrap_or("?")
         ));
     }
+    for action in local["actions_not_run"].as_array().into_iter().flatten() {
+        notes.push(format!(
+            "{} did not run locally, GitHub ran it",
+            action["uses"].as_str().unwrap_or("an action")
+        ));
+    }
     if let Some(original) = local["repeated_from"].as_str() {
         notes.push(format!(
             "not run locally: repeats {original} (pass --every-matrix-leg to run it)"
@@ -218,13 +227,20 @@ fn note_for(local: &Value, failures: &[Value]) -> Option<String> {
             || failure["also_failed_in"]
                 .as_array()
                 .is_some_and(|legs| legs.iter().any(|leg| leg == name));
-        here.then(|| failure["cause"]["kind"].as_str()).flatten()
+        here.then(|| &failure["cause"])
+            .filter(|cause| cause.is_object())
     });
-    match cause {
+    match cause.and_then(|cause| cause["kind"].as_str()) {
         Some("out_of_memory") => notes.push("ran out of memory locally".to_string()),
         Some("killed") => notes.push(
             "a process was killed (SIGKILL) locally, most likely for lack of memory".to_string(),
         ),
+        Some("setup_failed") => notes.push(format!(
+            "wrkflw couldn't set the job up locally, so none of its steps ran: {}",
+            cause
+                .and_then(|cause| cause["evidence"].as_str())
+                .unwrap_or("see the job log")
+        )),
         _ => {}
     }
     (!notes.is_empty()).then(|| notes.join("; "))
@@ -321,8 +337,81 @@ fn workflow_path(path: &str) -> Option<&Path> {
     (inside && path.starts_with(".github/workflows/")).then_some(parsed)
 }
 
+/// Events whose run can be for a tag: a tag push, a tag's creation, a
+/// release, and a dispatch or `workflow_run` started on a tag. Any other
+/// event, such as a pull request or a schedule, runs on a branch, so its
+/// `head_branch` is one without asking git, or the network.
+const TAG_EVENTS: &[&str] = &[
+    "push",
+    "create",
+    "release",
+    "workflow_dispatch",
+    "workflow_run",
+];
+
+/// Whether the run's `head_branch` names a tag rather than a branch.
+///
+/// GitHub gives a run triggered by a tag push the tag's name there, with
+/// nothing else in the run to say it is one. It is a tag when a tag of
+/// that name points at the run's commit here. A tag of that name at
+/// another commit, one moved since this clone fetched it, still makes it a
+/// tag unless `origin` has a branch of that name too. When this clone knows
+/// neither, as in a shallow clone, it is a tag when `origin` has one. Only
+/// [`TAG_EVENTS`] are checked.
+///
+/// `Err` says why it couldn't be told: `origin` had to be asked and didn't
+/// answer.
+fn head_is_tag(remote: &RemoteRun) -> Result<bool, String> {
+    head_is_tag_with(remote, git_line, |reference| {
+        crate::git::remote_has("origin", reference)
+    })
+}
+
+/// [`head_is_tag`] with `git` running a git command and returning its
+/// first line of output, and `origin_has` asking `origin` for a ref, so
+/// tests can answer for them.
+fn head_is_tag_with(
+    remote: &RemoteRun,
+    git: impl Fn(&[&str]) -> Option<String>,
+    origin_has: impl Fn(&str) -> Result<bool, String>,
+) -> Result<bool, String> {
+    if !TAG_EVENTS.contains(&remote.event.as_str()) {
+        return Ok(false);
+    }
+    let Some(name) = remote.head_branch.as_deref() else {
+        return Ok(false);
+    };
+    let tagged = git(&[
+        "rev-parse",
+        "-q",
+        "--verify",
+        &format!("refs/tags/{name}^{{commit}}"),
+    ]);
+    if tagged.as_deref() == Some(remote.head_sha.as_str()) {
+        return Ok(true);
+    }
+    let branch_known = git(&[
+        "rev-parse",
+        "-q",
+        "--verify",
+        &format!("refs/remotes/origin/{name}"),
+    ])
+    .is_some();
+    if tagged.is_some() || branch_known {
+        return Ok(!branch_known);
+    }
+    origin_has(&format!("refs/tags/{name}"))
+}
+
 /// The child `wrkflw run` that checks the workflow as GitHub ran it.
-fn run_args(remote: &RemoteRun, path: &Path, runtime: &str) -> Vec<String> {
+/// `head_is_tag` says the run's `head_branch` is a tag, see [`head_is_tag`].
+fn run_args(
+    remote: &RemoteRun,
+    path: &Path,
+    runtime: &str,
+    child_args: &[String],
+    head_is_tag: bool,
+) -> Vec<String> {
     let mut args = vec![
         "--format".to_string(),
         "json".to_string(),
@@ -336,6 +425,12 @@ fn run_args(remote: &RemoteRun, path: &Path, runtime: &str) -> Vec<String> {
         "--intent".to_string(),
         format!("wrkflw compare with GitHub run {}", remote.id),
     ];
+    // The run's branch or tag, so a detached checkout of its commit still
+    // fires `branches:` and `tags:` filters and sees the same `github.ref`.
+    if let Some(name) = &remote.head_branch {
+        let flag = if head_is_tag { "--tag" } else { "--branch" };
+        args.extend([flag.to_string(), name.clone()]);
+    }
     if let Some(base) = &remote.base_branch {
         args.extend(["--base-branch".to_string(), base.clone()]);
         args.extend(["--diff-base".to_string(), format!("origin/{base}")]);
@@ -345,6 +440,9 @@ fn run_args(remote: &RemoteRun, path: &Path, runtime: &str) -> Vec<String> {
         // it against itself, and every `paths:` filter skips the workflow.
         args.extend(["--diff-base".to_string(), before.to_string()]);
     }
+    // Global flags given to compare, such as `-P` naming the images this
+    // machine stands in with, or `--every-matrix-leg`, apply to its run.
+    args.extend(child_args.iter().cloned());
     args
 }
 
@@ -667,9 +765,29 @@ pub(crate) async fn run(ctx: CompareCtx) -> ! {
         ctx.format
             .fail(&format!("cannot find this executable: {e}"))
     });
+    // Not knowing whether the run was for a tag is said, not guessed
+    // silently: run as a branch, a workflow that only runs on tags skips.
+    let (is_tag, ref_unsure) = match head_is_tag(&remote) {
+        Ok(is_tag) => (is_tag, None),
+        Err(why) => {
+            let name = remote.head_branch.as_deref().unwrap_or_default();
+            let note = format!(
+                "{why}, so {name} is taken for a branch; fetch the tags (git fetch --tags) \
+                 if GitHub ran it for a tag"
+            );
+            eprintln!("{}", cli_style::warning(&format!("Warning: {note}")));
+            (false, Some(note))
+        }
+    };
     let mut child = Command::new(program);
     child
-        .args(run_args(&remote, path, ctx.runtime.as_flag()))
+        .args(run_args(
+            &remote,
+            path,
+            ctx.runtime.as_flag(),
+            &ctx.child_args,
+            is_tag,
+        ))
         .stdin(Stdio::null())
         .stderr(Stdio::inherit());
     crate::cli_secrets::pass_to(&mut child);
@@ -702,7 +820,10 @@ pub(crate) async fn run(ctx: CompareCtx) -> ! {
         .cloned()
         .unwrap_or_default();
     let rows = rows(&expected, &remote.jobs, &local_jobs, &failures);
-    let report = report(&remote, &local, &rows);
+    let mut report = report(&remote, &local, &rows);
+    if let Some(note) = ref_unsure {
+        report["ref_unsure"] = json!(note);
+    }
     let agrees = report["agree"] == true;
     if ctx.format.is_json() {
         wrkflw_runs::emit_line(&report);
@@ -958,6 +1079,28 @@ mod tests {
     }
 
     #[test]
+    fn a_job_wrkflw_could_not_set_up_says_so_instead_of_blaming_the_code() {
+        let failures = vec![json!({
+            "job": "tests (python: pypy-3.11)",
+            "step": null,
+            "cause": {
+                "kind": "setup_failed",
+                "evidence": "Runtime error: Failed to build combined runtime image",
+            },
+        })];
+        let note = note_for(
+            &json!({"name": "tests (python: pypy-3.11)", "status": "failure"}),
+            &failures,
+        )
+        .unwrap();
+        assert!(note.contains("none of its steps ran"), "{note}");
+        assert!(
+            note.contains("Failed to build combined runtime image"),
+            "{note}"
+        );
+    }
+
+    #[test]
     fn a_value_two_keys_share_is_matched_twice() {
         assert!(is_joined_in_some_order(
             "ubuntu, ubuntu",
@@ -1056,14 +1199,26 @@ mod tests {
     fn a_push_run_diffs_against_the_commit_it_pushed_over() {
         let mut run = github_run("success", vec![]);
         run.before = Some("1111111111111111111111111111111111111111".into());
-        let args = run_args(&run, Path::new(".github/workflows/ci.yml"), "docker");
+        let args = run_args(
+            &run,
+            Path::new(".github/workflows/ci.yml"),
+            "docker",
+            &[],
+            false,
+        );
         assert!(args
             .windows(2)
             .any(|w| w == ["--diff-base", "1111111111111111111111111111111111111111"]));
 
         // A push that created the branch has no earlier commit.
         run.before = Some("0".repeat(40));
-        let args = run_args(&run, Path::new(".github/workflows/ci.yml"), "docker");
+        let args = run_args(
+            &run,
+            Path::new(".github/workflows/ci.yml"),
+            "docker",
+            &[],
+            false,
+        );
         assert!(!args.iter().any(|arg| arg == "--diff-base"), "{args:?}");
     }
 
@@ -1100,9 +1255,157 @@ mod tests {
             base_branch: Some("main".into()),
             jobs: vec![],
         };
-        let args = run_args(&run, Path::new(".github/workflows/ci.yml"), "docker");
+        let globals = [
+            "--platform".to_string(),
+            "ubuntu-latest=my/runner:1".to_string(),
+            "--every-matrix-leg".to_string(),
+        ];
+        let args = run_args(
+            &run,
+            Path::new(".github/workflows/ci.yml"),
+            "docker",
+            &globals,
+            false,
+        );
         assert!(args.windows(2).any(|w| w == ["--event", "pull_request"]));
+        // -P reaches the local run, so it runs in the image asked for, and
+        // so does every other global flag compare was given.
+        assert!(args
+            .windows(2)
+            .any(|w| w == ["--platform", "ubuntu-latest=my/runner:1"]));
+        assert!(args.iter().any(|a| a == "--every-matrix-leg"));
+        assert!(args.windows(2).any(|w| w == ["--branch", "feat"]));
         assert!(args.windows(2).any(|w| w == ["--base-branch", "main"]));
         assert!(args.windows(2).any(|w| w == ["--diff-base", "origin/main"]));
+    }
+
+    /// Answers git as `refs` say: each key is a ref (or `ls-remote`), each
+    /// value what git prints. Records every command asked.
+    fn fake_git<'a>(
+        refs: &'a [(&'a str, &'a str)],
+        asked: &'a std::cell::RefCell<Vec<String>>,
+    ) -> impl Fn(&[&str]) -> Option<String> + 'a {
+        move |args: &[&str]| {
+            asked.borrow_mut().push(args.join(" "));
+            let key = if args[0] == "ls-remote" {
+                "ls-remote"
+            } else {
+                args[3]
+            };
+            refs.iter()
+                .find(|(r, _)| *r == key)
+                .map(|(_, out)| out.to_string())
+        }
+    }
+
+    /// `origin`, answering that it has a tag when `refs` has `ls-remote`.
+    fn fake_origin<'a>(
+        refs: &'a [(&'a str, &'a str)],
+        asked: &'a std::cell::RefCell<Vec<String>>,
+    ) -> impl Fn(&str) -> Result<bool, String> + 'a {
+        move |reference: &str| {
+            asked.borrow_mut().push(format!("ls-remote {reference}"));
+            Ok(refs.iter().any(|(r, _)| *r == "ls-remote"))
+        }
+    }
+
+    #[test]
+    fn origin_not_answering_is_not_taken_for_no_tag() {
+        let mut run = github_run("success", vec![]);
+        run.event = "push".into();
+        run.head_branch = Some("v1.0".into());
+        let asked = std::cell::RefCell::new(Vec::new());
+        let unsure = head_is_tag_with(&run, fake_git(&[], &asked), |_| {
+            Err("couldn't ask origin: Permission denied (publickey)".to_string())
+        });
+        assert!(unsure.unwrap_err().contains("Permission denied"));
+        // A local answer needs no network, so its failure doesn't matter.
+        let refs = [("refs/remotes/origin/v1.0", "abc")];
+        let known = head_is_tag_with(
+            &run,
+            fake_git(&refs, &asked),
+            |_| Err("offline".to_string()),
+        );
+        assert_eq!(known, Ok(false));
+    }
+
+    #[test]
+    fn only_a_run_an_event_can_start_on_a_tag_asks_git_about_one() {
+        let asked = std::cell::RefCell::new(Vec::new());
+        let mut run = github_run("success", vec![]);
+        run.event = "pull_request".into();
+        run.head_branch = Some("feat".into());
+        // Even with `origin` answering yes, a pull request is on a branch.
+        let refs = [("ls-remote", "x\trefs/tags/feat")];
+        assert!(
+            !head_is_tag_with(&run, fake_git(&refs, &asked), fake_origin(&refs, &asked)).unwrap()
+        );
+        assert!(asked.borrow().is_empty(), "{:?}", asked.borrow());
+    }
+
+    #[test]
+    fn a_tag_is_recognised_locally_before_the_network_is_asked() {
+        let mut run = github_run("success", vec![]);
+        run.event = "push".into();
+        run.head_branch = Some("v1.0".into());
+        run.head_sha = "abc".into();
+
+        // A local tag at the run's commit.
+        let asked = std::cell::RefCell::new(Vec::new());
+        let refs = [("refs/tags/v1.0^{commit}", "abc")];
+        assert!(
+            head_is_tag_with(&run, fake_git(&refs, &asked), fake_origin(&refs, &asked)).unwrap()
+        );
+        assert_eq!(asked.borrow().len(), 1);
+
+        // A local tag of that name elsewhere, as when it was moved since
+        // this clone fetched it, is still the tag, without the network.
+        let asked = std::cell::RefCell::new(Vec::new());
+        let refs = [("refs/tags/v1.0^{commit}", "def")];
+        assert!(
+            head_is_tag_with(&run, fake_git(&refs, &asked), fake_origin(&refs, &asked)).unwrap()
+        );
+        assert!(!asked.borrow().iter().any(|a| a.starts_with("ls-remote")));
+        // Unless `origin` has a branch of that name: the run was for it.
+        let refs = [
+            ("refs/tags/v1.0^{commit}", "def"),
+            ("refs/remotes/origin/v1.0", "abc"),
+        ];
+        assert!(
+            !head_is_tag_with(&run, fake_git(&refs, &asked), fake_origin(&refs, &asked)).unwrap()
+        );
+
+        // A known `origin` branch settles it without the network.
+        let asked = std::cell::RefCell::new(Vec::new());
+        let refs = [("refs/remotes/origin/v1.0", "abc"), ("ls-remote", "x")];
+        assert!(
+            !head_is_tag_with(&run, fake_git(&refs, &asked), fake_origin(&refs, &asked)).unwrap()
+        );
+        assert!(!asked.borrow().iter().any(|a| a.starts_with("ls-remote")));
+
+        // A shallow clone that knows neither asks `origin`.
+        let refs = [("ls-remote", "x\trefs/tags/v1.0")];
+        assert!(
+            head_is_tag_with(&run, fake_git(&refs, &asked), fake_origin(&refs, &asked)).unwrap()
+        );
+        assert!(!head_is_tag_with(&run, fake_git(&[], &asked), fake_origin(&[], &asked)).unwrap());
+    }
+
+    #[test]
+    fn a_tag_push_run_is_run_for_its_tag_not_a_branch() {
+        let mut run = github_run("success", vec![]);
+        run.head_branch = Some("v1.2.3".into());
+        let args = run_args(
+            &run,
+            Path::new(".github/workflows/release.yml"),
+            "docker",
+            &[],
+            true,
+        );
+        assert!(
+            args.windows(2).any(|w| w == ["--tag", "v1.2.3"]),
+            "{args:?}"
+        );
+        assert!(!args.iter().any(|arg| arg == "--branch"), "{args:?}");
     }
 }

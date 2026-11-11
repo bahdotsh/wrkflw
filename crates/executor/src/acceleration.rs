@@ -790,6 +790,8 @@ pub(crate) async fn decide(lookup: Lookup<'_>) -> Decision {
                     name: lookup.job_name.to_string(),
                     canonical_name: lookup.job_name.to_string(),
                     outputs: HashMap::new(),
+                    actions_not_run: Vec::new(),
+                    repeated_from: None,
                 }],
                 why: Reused::Unaffected,
             };

@@ -267,6 +267,35 @@ struct KubernetesArgs {
 }
 
 impl KubernetesArgs {
+    /// These settings as the flags of a child `wrkflw run`.
+    fn child_args(&self) -> Vec<String> {
+        let mut args = Vec::new();
+        let mut one = |flag: &str, value: Option<String>| {
+            if let Some(value) = value {
+                args.extend([flag.to_string(), value]);
+            }
+        };
+        one("--k8s-context", self.k8s_context.clone());
+        one("--k8s-namespace", self.k8s_namespace.clone());
+        one("--k8s-registry", self.k8s_registry.clone());
+        one("--k8s-helper-image", self.k8s_helper_image.clone());
+        one("--k8s-timeout", self.k8s_timeout.map(|s| s.to_string()));
+        one(
+            "--k8s-schedule-timeout",
+            self.k8s_schedule_timeout.map(|s| s.to_string()),
+        );
+        for (key, value) in self.k8s_node_selector.iter().flatten() {
+            args.extend(["--k8s-node-selector".to_string(), format!("{key}={value}")]);
+        }
+        for (name, quantity) in self.k8s_resource.iter().flatten() {
+            args.extend(["--k8s-resource".to_string(), format!("{name}={quantity}")]);
+        }
+        for secret in &self.k8s_image_pull_secret {
+            args.extend(["--k8s-image-pull-secret".to_string(), secret.clone()]);
+        }
+        args
+    }
+
     fn to_config(&self) -> wrkflw_executor::KubernetesConfig {
         wrkflw_executor::KubernetesConfig {
             context: self.k8s_context.clone(),
@@ -368,6 +397,17 @@ enum Commands {
         /// against the base branch — set this to simulate a PR locally.
         #[arg(long)]
         base_branch: Option<String>,
+
+        /// The branch the event is for: `github.ref_name`, and what a
+        /// `branches:` filter on push sees. Defaults to the checked-out
+        /// branch, which a detached HEAD doesn't have.
+        #[arg(long, conflicts_with = "tag", value_parser = parse_branch)]
+        branch: Option<String>,
+
+        /// The tag a push is for instead of a branch: `github.ref_name`,
+        /// `GITHUB_REF_TYPE=tag`, and what a `tags:` filter sees.
+        #[arg(long, value_parser = parse_tag)]
+        tag: Option<String>,
 
         /// Activity type for events that support it (e.g. `opened`,
         /// `synchronize` for pull_request). Required when simulating an
@@ -701,6 +741,14 @@ enum Commands {
         #[arg(long)]
         base_branch: Option<String>,
 
+        /// The branch the event is for (default: the checked-out branch)
+        #[arg(long, conflicts_with = "tag", value_parser = parse_branch)]
+        branch: Option<String>,
+
+        /// The tag a push is for, instead of a branch
+        #[arg(long, value_parser = parse_tag)]
+        tag: Option<String>,
+
         /// Activity type for `types:` filters (e.g. opened)
         #[arg(long)]
         activity_type: Option<String>,
@@ -777,6 +825,86 @@ fn collect_platform_overrides(entries: &[Option<(String, String)>]) -> HashMap<S
     entries.iter().flatten().cloned().collect()
 }
 
+/// The global flags this invocation was given, as the flags of a child
+/// `wrkflw run`. Commands that start runs, such as `compare` and `gate`,
+/// pass them on, so each run gets what a run started by hand with them
+/// would. `--format` is the parent's to choose and stays behind.
+fn global_child_args(cli: &Wrkflw, platform_overrides: &HashMap<String, String>) -> Vec<String> {
+    let mut args = Vec::new();
+    for (given, flag) in [
+        (cli.verbose, "--verbose"),
+        (cli.debug, "--debug"),
+        (cli.fresh_workspace, "--fresh-workspace"),
+        (cli.every_matrix_leg, "--every-matrix-leg"),
+    ] {
+        if given {
+            args.push(flag.to_string());
+        }
+    }
+    args.extend(platform_args(platform_overrides));
+    args.extend(cli.kubernetes.child_args());
+    args
+}
+
+/// A `--branch` value as GitHub names the branch, without `refs/heads/`.
+fn parse_branch(value: &str) -> Result<String, String> {
+    ref_name(value, "refs/heads/")
+}
+
+/// A `--tag` value as GitHub names the tag, without `refs/tags/`.
+fn parse_tag(value: &str) -> Result<String, String> {
+    ref_name(value, "refs/tags/")
+}
+
+/// `value` without `prefix`, if it is a name git allows for a ref, as
+/// `git check-ref-format` decides. Anything else would only make a
+/// `branches:` or `tags:` filter quietly miss.
+fn ref_name(value: &str, prefix: &str) -> Result<String, String> {
+    let name = value.strip_prefix(prefix).unwrap_or(value);
+    let refused = name.is_empty()
+        || name == "@"
+        || name.starts_with(['-', '/'])
+        || name.ends_with(['/', '.'])
+        || name.ends_with(".lock")
+        || name.contains("..")
+        || name.contains("//")
+        || name.contains("@{")
+        || name.split('/').any(|part| part.starts_with('.'))
+        || name
+            .chars()
+            .any(|c| c.is_control() || c.is_whitespace() || "~^:?*[\\".contains(c));
+    if refused {
+        Err(format!(
+            "`{value}` isn't a name git allows for a branch or tag"
+        ))
+    } else {
+        Ok(name.to_string())
+    }
+}
+
+/// `--tag` names what a push or release is for. A pull request is always
+/// for a branch, so the two together say nothing GitHub would run.
+fn check_tag_event(event: Option<&str>, tag: Option<&str>) -> Result<(), String> {
+    match (event, tag) {
+        (Some(event), Some(tag)) if event.starts_with("pull_request") => Err(format!(
+            "--tag {tag} can't go with --event {event}: a pull request is for a branch, \
+             so pass --branch with its head branch instead"
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// `overrides` as the `--platform` flags of a child `wrkflw run`, sorted by
+/// label so the command line is the same every time.
+pub(crate) fn platform_args(overrides: &HashMap<String, String>) -> Vec<String> {
+    let mut entries: Vec<(&String, &String)> = overrides.iter().collect();
+    entries.sort();
+    entries
+        .into_iter()
+        .flat_map(|(label, image)| ["--platform".to_string(), format!("{label}={image}")])
+        .collect()
+}
+
 // Parser function for key-value pairs
 fn parse_key_val(s: &str) -> Result<(String, String), String> {
     let pos = s
@@ -822,6 +950,20 @@ async fn cleanup_on_exit() {
     match kubernetes_result {
         Ok(_) => wrkflw_logging::debug("Kubernetes cleanup completed successfully"),
         Err(_) => wrkflw_logging::warning("Kubernetes cleanup timed out, continuing with shutdown"),
+    }
+
+    // With the job containers gone, the fresh workspaces of interrupted jobs
+    // and their volumes can go too: exiting skips their own cleanup.
+    let fresh = tokio::task::spawn_blocking(
+        wrkflw_executor::workspace::remove_interrupted_fresh_workspaces,
+    );
+    if tokio::time::timeout(std::time::Duration::from_secs(3), fresh)
+        .await
+        .is_err()
+    {
+        wrkflw_logging::warning(
+            "Removing the interrupted jobs' workspaces timed out; `wrkflw clean` removes the rest",
+        );
     }
 
     // Always clean up emulation resources
@@ -1175,6 +1317,8 @@ async fn run_cli() {
             diff_base,
             diff_head,
             base_branch,
+            branch,
+            tag,
             activity_type,
             strict_filter,
             no_strict_filter,
@@ -1195,6 +1339,9 @@ async fn run_cli() {
             partial_exit_code,
             gate_mode,
         }) => {
+            if let Err(e) = check_tag_event(event.as_deref(), tag.as_deref()) {
+                cli.format.fail(&e);
+            }
             run_workflow_cmd::run(run_workflow_cmd::RunCtx {
                 path: path.clone(),
                 runtime: runtime.clone(),
@@ -1209,6 +1356,8 @@ async fn run_cli() {
                 diff_base: diff_base.clone(),
                 diff_head: diff_head.clone(),
                 base_branch: base_branch.clone(),
+                branch: branch.clone(),
+                tag: tag.clone(),
                 activity_type: activity_type.clone(),
                 strict_filter: *strict_filter,
                 no_strict_filter: *no_strict_filter,
@@ -1343,6 +1492,7 @@ async fn run_cli() {
                     "removed": report.removed,
                     "bytes": report.bytes,
                     "in_use": report.in_use,
+                    "volumes": report.volumes,
                     "failed": failed,
                 }));
                 if !report.failed.is_empty() {
@@ -1355,6 +1505,12 @@ async fn run_cli() {
                     report.removed,
                     human_bytes(report.bytes)
                 );
+                if report.volumes > 0 {
+                    println!(
+                        "Removed {} container volume(s) whose workspace was gone.",
+                        report.volumes
+                    );
+                }
                 if report.in_use > 0 {
                     println!(
                         "Left {} in use by a running workflow; run `wrkflw clean` again once \
@@ -1406,6 +1562,7 @@ async fn run_cli() {
                 runtime: runtime.clone(),
                 remote_cache: remote_cache.clone(),
                 install_hook: *install_hook,
+                child_args: global_child_args(&cli, &platform_overrides),
                 format: cli.format,
             });
         }
@@ -1413,6 +1570,7 @@ async fn run_cli() {
             compare_cmd::run(compare_cmd::CompareCtx {
                 run: run.clone(),
                 runtime: runtime.clone(),
+                child_args: global_child_args(&cli, &platform_overrides),
                 format: cli.format,
             })
             .await;
@@ -1427,11 +1585,16 @@ async fn run_cli() {
             diff_base,
             diff_head,
             base_branch,
+            branch,
+            tag,
             activity_type,
             strict_filter,
             no_strict_filter,
             runtime,
         }) => {
+            if let Err(e) = check_tag_event(event.as_deref(), tag.as_deref()) {
+                cli.format.fail(&e);
+            }
             plan_cmd::run(plan_cmd::PlanCtx {
                 path: path.clone(),
                 gitlab: *gitlab,
@@ -1442,6 +1605,8 @@ async fn run_cli() {
                 diff_base: diff_base.clone(),
                 diff_head: diff_head.clone(),
                 base_branch: base_branch.clone(),
+                branch: branch.clone(),
+                tag: tag.clone(),
                 activity_type: activity_type.clone(),
                 strict_filter: *strict_filter,
                 no_strict_filter: *no_strict_filter,
@@ -1899,6 +2064,150 @@ mod tests {
             }
             other => panic!("unexpected command: {:?}", other),
         }
+    }
+
+    #[test]
+    fn a_tag_is_refused_for_a_pull_request() {
+        assert!(check_tag_event(Some("pull_request"), Some("v1")).is_err());
+        assert!(check_tag_event(Some("pull_request_target"), Some("v1")).is_err());
+        assert!(check_tag_event(Some("push"), Some("v1")).is_ok());
+        assert!(check_tag_event(None, Some("v1")).is_ok());
+        assert!(check_tag_event(Some("pull_request"), None).is_ok());
+    }
+
+    #[test]
+    fn every_global_flag_reaches_a_child_run_and_parses_back() {
+        let given = [
+            "wrkflw",
+            "--verbose",
+            "--fresh-workspace",
+            "--every-matrix-leg",
+            "-P",
+            "ubuntu-latest=my/img:1",
+            "--k8s-namespace",
+            "ci",
+            "--k8s-resource",
+            "nvidia.com/gpu=1",
+            "--k8s-timeout",
+            "60",
+            "compare",
+            "123",
+        ];
+        let cli = Wrkflw::try_parse_from(given).unwrap();
+        let overrides = collect_platform_overrides(&cli.platform);
+        let child = global_child_args(&cli, &overrides);
+        for flag in ["--verbose", "--fresh-workspace", "--every-matrix-leg"] {
+            assert!(child.iter().any(|a| a == flag), "{flag} missing: {child:?}");
+        }
+        let mut again = vec!["wrkflw".to_string()];
+        again.extend(child);
+        again.extend(["list".to_string()]);
+        let parsed = Wrkflw::try_parse_from(&again).unwrap();
+        assert!(parsed.verbose && parsed.fresh_workspace && parsed.every_matrix_leg);
+        assert_eq!(collect_platform_overrides(&parsed.platform), overrides);
+        assert_eq!(parsed.kubernetes.to_config(), cli.kubernetes.to_config());
+        assert!(!again.iter().any(|a| a == "--format"));
+    }
+
+    #[test]
+    fn every_global_flag_is_passed_on_or_named_as_not() {
+        use clap::CommandFactory;
+        // A child run reports in its own format, and only the TUI has a theme.
+        const NOT_PASSED_ON: [&str; 4] = ["format", "theme", "help", "version"];
+        let command = Wrkflw::command();
+        let mut given = vec!["wrkflw".to_string()];
+        let mut ids = Vec::new();
+        for arg in command.get_arguments().filter(|arg| arg.is_global_set()) {
+            let id = arg.get_id().as_str().to_string();
+            if NOT_PASSED_ON.contains(&id.as_str()) {
+                continue;
+            }
+            let flag = format!(
+                "--{}",
+                arg.get_long().expect("a global flag has a long form")
+            );
+            if arg.get_action().takes_values() {
+                // The first sample this flag's parser takes.
+                let sample = ["x=1", "60", "x"]
+                    .into_iter()
+                    .find(|sample| {
+                        Wrkflw::command()
+                            .try_get_matches_from(["wrkflw", flag.as_str(), sample, "list"])
+                            .is_ok()
+                    })
+                    .unwrap_or_else(|| panic!("no sample value parses for {flag}"));
+                given.extend([flag, sample.to_string()]);
+            } else {
+                given.push(flag);
+            }
+            ids.push(id);
+        }
+        given.push("list".to_string());
+        let original = Wrkflw::command().try_get_matches_from(&given).unwrap();
+        let cli = Wrkflw::try_parse_from(&given).unwrap();
+        let mut again = vec!["wrkflw".to_string()];
+        again.extend(global_child_args(
+            &cli,
+            &collect_platform_overrides(&cli.platform),
+        ));
+        again.push("list".to_string());
+        let child = Wrkflw::command().try_get_matches_from(&again).unwrap();
+        let raw = |matches: &clap::ArgMatches, id: &str| -> Vec<String> {
+            matches
+                .get_raw(id)
+                .into_iter()
+                .flatten()
+                .map(|v| v.to_string_lossy().into_owned())
+                .collect()
+        };
+        for id in ids {
+            assert_eq!(
+                child.value_source(&id),
+                Some(clap::parser::ValueSource::CommandLine),
+                "--{id} isn't passed on to a child run; add it to global_child_args, \
+                 or to NOT_PASSED_ON with the reason"
+            );
+            assert_eq!(
+                raw(&child, &id),
+                raw(&original, &id),
+                "--{id} changed on the way"
+            );
+        }
+    }
+
+    #[test]
+    fn a_branch_or_tag_is_named_as_github_names_it() {
+        assert_eq!(parse_branch("refs/heads/main").unwrap(), "main");
+        assert_eq!(parse_branch("release/2.0").unwrap(), "release/2.0");
+        assert_eq!(parse_tag("refs/tags/v1.0").unwrap(), "v1.0");
+        for refused in [
+            "", "-x", "a..b", "a b", "a/", ".hidden", "x.lock", "a~1", "a:b",
+        ] {
+            assert!(parse_branch(refused).is_err(), "{refused:?}");
+        }
+        let cli =
+            Wrkflw::try_parse_from(["wrkflw", "run", "ci.yml", "--branch", "refs/heads/main"]);
+        assert!(cli.is_ok());
+        assert!(Wrkflw::try_parse_from(["wrkflw", "run", "ci.yml", "--tag", "a b"]).is_err());
+    }
+
+    #[test]
+    fn platform_args_round_trip_through_the_flag() {
+        let overrides =
+            platform_overrides_from(&["wrkflw", "-P", "windows-latest=w:1,ubuntu-latest=u:1"]);
+        let args = platform_args(&overrides);
+        assert_eq!(
+            args,
+            [
+                "--platform",
+                "ubuntu-latest=u:1",
+                "--platform",
+                "windows-latest=w:1"
+            ]
+        );
+        let mut argv = vec!["wrkflw", "run", "ci.yml"];
+        argv.extend(args.iter().map(String::as_str));
+        assert_eq!(platform_overrides_from(&argv), overrides);
     }
 
     #[test]

@@ -352,6 +352,9 @@ mod tests {
             repo.to_path_buf(),
             wrkflw_executor::ExecutionConfig {
                 acceleration: Default::default(),
+                event_name: None,
+                git_ref: None,
+                base_branch: None,
                 runtime_type: wrkflw_executor::RuntimeType::Emulation,
                 verbose: false,
                 preserve_containers_on_failure: false,
@@ -641,6 +644,9 @@ mod tests {
             repo_canonical.clone(),
             wrkflw_executor::ExecutionConfig {
                 acceleration: Default::default(),
+                event_name: None,
+                git_ref: None,
+                base_branch: None,
                 runtime_type: wrkflw_executor::RuntimeType::Emulation,
                 verbose: false,
                 preserve_containers_on_failure: false,
@@ -788,6 +794,9 @@ mod tests {
             repo_canonical,
             wrkflw_executor::ExecutionConfig {
                 acceleration: Default::default(),
+                event_name: None,
+                git_ref: None,
+                base_branch: None,
                 runtime_type: wrkflw_executor::RuntimeType::Emulation,
                 verbose: false,
                 preserve_containers_on_failure: false,
@@ -909,6 +918,9 @@ mod tests {
             repo_canonical.clone(),
             wrkflw_executor::ExecutionConfig {
                 acceleration: Default::default(),
+                event_name: None,
+                git_ref: None,
+                base_branch: None,
                 runtime_type: wrkflw_executor::RuntimeType::Emulation,
                 verbose: false,
                 preserve_containers_on_failure: false,
@@ -1067,6 +1079,9 @@ mod tests {
             repo_canonical.clone(),
             wrkflw_executor::ExecutionConfig {
                 acceleration: Default::default(),
+                event_name: None,
+                git_ref: None,
+                base_branch: None,
                 runtime_type: wrkflw_executor::RuntimeType::Emulation,
                 verbose: false,
                 preserve_containers_on_failure: false,

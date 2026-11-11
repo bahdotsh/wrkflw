@@ -9,7 +9,10 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-const ENTRY_SCHEMA: u32 = 1;
+/// 2: jobs carry the actions they passed without running, and the leg a
+/// folded matrix leg repeated. Entries from 1 can't say, so they are not
+/// reused.
+const ENTRY_SCHEMA: u32 = 2;
 /// Images and floating action tags aren't in the key, so a hit must not live
 /// forever. A week bounds that drift.
 const DEFAULT_TTL_SECS: i64 = 7 * 24 * 60 * 60;
@@ -21,6 +24,14 @@ pub(crate) struct StoredJob {
     pub name: String,
     pub canonical_name: String,
     pub outputs: HashMap<String, String>,
+    /// Steps that passed without running their action. A reused job reports
+    /// them again, so reuse never turns a partial pass into a verified one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub actions_not_run: Vec<crate::action_fidelity::UnexecutedAction>,
+    /// The leg this matrix leg only repeated when the result was stored. A
+    /// reused fold still never ran, and says so.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repeated_from: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -363,6 +374,8 @@ mod tests {
             name: "build".to_string(),
             canonical_name: "build".to_string(),
             outputs: HashMap::from([("v".to_string(), "1".to_string())]),
+            actions_not_run: Vec::new(),
+            repeated_from: None,
         }]
     }
 
@@ -578,6 +591,25 @@ mod tests {
         assert!(!old.exists());
         assert!(!crashed.exists());
         assert!(unrelated.exists());
+    }
+
+    #[test]
+    fn an_entry_from_before_unrun_actions_were_kept_is_a_miss() {
+        // Schema 1 didn't record the actions a pass skipped, so reusing it
+        // could turn a partial pass into a verified one.
+        let old: Entry = serde_json::from_value(serde_json::json!({
+            "schema": 1,
+            "key": "k",
+            "created_at": 100,
+            "jobs": [{"name": "a", "canonical_name": "a", "outputs": {}}],
+        }))
+        .unwrap();
+        assert!(!old.is_usable("k", 100));
+        let current = Entry {
+            schema: ENTRY_SCHEMA,
+            ..old
+        };
+        assert!(current.is_usable("k", 100));
     }
 
     #[test]

@@ -325,7 +325,9 @@ impl WorkflowExecution {
                         ended_whole |= job == key;
                     }
                 }
-                TimelineEntry::StepFinished { .. } | TimelineEntry::RunnerSubstituted { .. } => {}
+                TimelineEntry::StepFinished { .. }
+                | TimelineEntry::RunnerSubstituted { .. }
+                | TimelineEntry::ActionNotRun { .. } => {}
             }
         }
         if started == 0 && ended.is_empty() {
@@ -395,7 +397,9 @@ impl WorkflowExecution {
                     let slot = out.entry(key.to_string()).or_default();
                     *slot = (*slot).max(*duration_ms);
                 }
-                TimelineEntry::StepFinished { .. } | TimelineEntry::RunnerSubstituted { .. } => {}
+                TimelineEntry::StepFinished { .. }
+                | TimelineEntry::RunnerSubstituted { .. }
+                | TimelineEntry::ActionNotRun { .. } => {}
             }
         }
         out
@@ -434,7 +438,9 @@ impl WorkflowExecution {
                     count.ended += 1;
                     count.whole |= job == key;
                 }
-                TimelineEntry::StepFinished { .. } | TimelineEntry::RunnerSubstituted { .. } => {}
+                TimelineEntry::StepFinished { .. }
+                | TimelineEntry::RunnerSubstituted { .. }
+                | TimelineEntry::ActionNotRun { .. } => {}
             }
         }
         counts
@@ -486,6 +492,13 @@ pub enum TimelineEntry {
         requested: String,
         ran_as: String,
     },
+    /// A step passed without running its action, which wrkflw has no
+    /// implementation of, so the job's pass doesn't cover what it does.
+    ActionNotRun {
+        job: String,
+        step: String,
+        uses: String,
+    },
 }
 
 impl TimelineEntry {
@@ -509,6 +522,11 @@ impl TimelineEntry {
                 job: job.clone(),
                 requested: requested.clone(),
                 ran_as: ran_as.clone(),
+            }),
+            E::ActionNotRun { job, step, uses } => Some(TimelineEntry::ActionNotRun {
+                job: job.clone(),
+                step: step.clone(),
+                uses: uses.clone(),
             }),
             E::StepFinished {
                 job,

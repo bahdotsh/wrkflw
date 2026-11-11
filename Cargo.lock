@@ -4561,6 +4561,7 @@ dependencies = [
  "windows-sys 0.59.0",
  "wrkflw-executor",
  "wrkflw-logging",
+ "wrkflw-runtime",
 ]
 
 [[package]]

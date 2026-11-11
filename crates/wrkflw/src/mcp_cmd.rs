@@ -95,6 +95,8 @@ fn event_flags(cli: &mut Vec<String>, args: &Value) {
     push_opt(cli, "--job", string_arg(args, "job"));
     push_opt(cli, "--event", string_arg(args, "event"));
     push_opt(cli, "--base-branch", string_arg(args, "base_branch"));
+    push_opt(cli, "--branch", string_arg(args, "branch"));
+    push_opt(cli, "--tag", string_arg(args, "tag"));
     push_opt(cli, "--activity-type", string_arg(args, "activity_type"));
     push_opt(cli, "--changed-files", changed_files(args));
     if args["diff"].as_bool() == Some(true) {
@@ -410,6 +412,8 @@ fn event_properties() -> Value {
         "job": {"type": "string", "description": "Only this job and what it needs."},
         "event": {"type": "string", "description": "Event to simulate, e.g. push or pull_request."},
         "base_branch": {"type": "string", "description": "Target branch. Required with pull_request."},
+        "branch": {"type": "string", "description": "Branch the event is for: github.ref_name and what `branches:` filters see. Default: the checked-out branch. Pass it on a detached HEAD."},
+        "tag": {"type": "string", "description": "Tag a push is for, instead of a branch. Not with `branch`."},
         "activity_type": {"type": "string", "description": "Activity type, e.g. opened, for `types:` filters."},
         "changed_files": {"type": "array", "items": {"type": "string"}, "description": "Repo-relative changed files."},
         "diff": {"type": "boolean", "description": "Take changed files from git diff."},
@@ -452,7 +456,7 @@ fn tools() -> Value {
         tool("list_workflows", "List workflows and pipelines in the repository with their jobs.", true, json!({}), &[]),
         tool("plan_workflow", "Show what a run would do without executing anything: whether the trigger fires and why, job order, matrix legs, steps, and jobs that would run as another OS than runs-on asks for (`unverified`).", true, plan_properties, &["path"]),
         tool("run_workflow", "Execute a workflow locally. This runs the workflow's code. Returns status, job results and a failure digest. The run is recorded.", false, run_properties, &["path"]),
-        tool("gate", "Run every workflow a push would trigger, reusing jobs that already passed on the same files. Returns `verdict` (verified, partial, nothing_checked or failed), `passed`, each workflow's status, the event it was checked as, run id and failure digest, and jobs that ran as another OS (`unverified`). Checks the working tree, not commits.", false, gate_properties, &[]),
+        tool("gate", "Run every workflow a push would trigger, reusing jobs that already passed on the same files. Returns `verdict` (verified, partial, nothing_checked or failed), `passed`, each workflow's status, the event it was checked as, run id and failure digest, and what the pass didn't check (`unverified`): jobs that ran as another OS, and steps whose action didn't run. Checks the working tree, not commits.", false, gate_properties, &[]),
         tool("list_runs", "List recorded runs of this repository, newest first.", true,
             json!({"limit": {"type": "integer"}, "status": {"type": "string"}, "agent": {"type": "string"}, "session": {"type": "string"}, "workflow": {"type": "string"}}), &[]),
         tool("get_run", "Get one recorded run: jobs, steps, exit codes, timings.", true, json!({"run_id": run_id}), &[]),
@@ -587,6 +591,40 @@ mod tests {
         let separator = cli.iter().position(|a| a == "--").unwrap();
         assert_eq!(cli[separator + 1], "--evil");
         assert!(cli.iter().position(|a| a == "--format").unwrap() < separator);
+    }
+
+    #[test]
+    fn branch_and_tag_reach_run_and_plan() {
+        for tool in ["run_workflow", "plan_workflow"] {
+            let (cli, _) = tool_command(
+                tool,
+                &json!({"path": "ci.yml", "event": "push", "branch": "release/2.0"}),
+            )
+            .unwrap();
+            assert!(
+                cli.windows(2).any(|w| w == ["--branch", "release/2.0"]),
+                "{cli:?}"
+            );
+            let (cli, _) = tool_command(tool, &json!({"path": "ci.yml", "tag": "v1.0"})).unwrap();
+            assert!(cli.windows(2).any(|w| w == ["--tag", "v1.0"]), "{cli:?}");
+        }
+        let schema = tools();
+        for name in ["run_workflow", "plan_workflow"] {
+            let tool = schema
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["name"] == name)
+                .unwrap();
+            assert!(
+                tool["inputSchema"]["properties"]["branch"].is_object(),
+                "{name}"
+            );
+            assert!(
+                tool["inputSchema"]["properties"]["tag"].is_object(),
+                "{name}"
+            );
+        }
     }
 
     #[test]

@@ -20,7 +20,7 @@ A command-line tool for validating and executing GitHub Actions workflows locall
 - **Job selection** — run individual jobs with `--job` or via TUI job selection mode
 - **Job dependency resolution** — automatic ordering based on `needs` with parallel execution of independent jobs
 - **Expression evaluator** — evaluates `${{ ... }}` expressions including `toJSON`, `fromJSON`, `contains`, `startsWith`, etc.
-- **Action support** — Docker container actions, JavaScript actions, composite actions (with output propagation), and local actions
+- **Action support** — Docker container actions, composite actions (with output propagation), local actions, and built-in versions of `actions/checkout`, `actions/cache`, the artifact actions and the common setup actions (`setup-node`, `setup-python`, `setup-go`, `setup-java`, `setup-dotnet`, `setup-php`, `rust-toolchain`, `setup-uv`), which install the runtime into the job's image, honouring `*-version-file` inputs. Any other JavaScript action is not run: its step passes and is reported under `unverified`
 - **Reusable workflows** — execute caller jobs via `jobs.<id>.uses` (local or `owner/repo/path@ref`) with output propagation
 - **Artifacts, cache, and inter-job outputs** — `actions/upload-artifact`, `actions/download-artifact`, `actions/cache`, and `needs.<id>.outputs.*`
 - **GitHub context emulation** — environment variables, `GITHUB_OUTPUT`, `GITHUB_ENV`, `GITHUB_PATH`, `GITHUB_STEP_SUMMARY`
@@ -37,6 +37,7 @@ A command-line tool for validating and executing GitHub Actions workflows locall
 
 - GitHub encrypted secrets and fine-grained permissions
 - Event triggers other than `workflow_dispatch` for the remote `trigger` command
+- JavaScript actions outside the built-in set — a step such as `uses: some-org/setup-tool@v1`, or a local `uses: ./my-action`, whose action runs on Node is not executed. The step passes, prints that it would have run the action, and is listed under `unverified` in `run_finished`, the `gate` result and `compare`, with a warning in the log and a mark on the step in the TUI, so the run's verdict is `partial` rather than `verified`. Whatever the action would have installed or checked is missing from the job, so later steps may fail with `command not found`. Pass `--platform ubuntu-latest=IMAGE` with an image that has the tool, or install it in a `run:` step
 - Absolute-URL actions such as `uses: https://gitea.com/actions/checkout@v4` — they pass validation, but at run time the URL is not resolved and the step falls back to built-in handling
 - Private repos for remote `uses:` — reusable workflows clone over unauthenticated HTTPS
 - `cancel-in-progress` and workflow-level `concurrency:` — job-level groups are enforced within a run, but a local run has nothing earlier to cancel
@@ -168,7 +169,7 @@ export WRKFLW_PLATFORM=ubuntu-latest=catthehacker/ubuntu:act-latest
 Two defaults make a rerun cheaper than a hosted runner's cold start. Both work the same for any language or toolchain.
 
 - **Each GitHub Actions job keeps its workspace.** GitLab pipelines still start each run in an empty workspace. Checkout syncs the source files into it, and leaves alone anything the repository ignores, such as build output, `node_modules` or a virtualenv. The second run of a build is therefore incremental. Unchanged files keep their timestamps, and files deleted from the repository are deleted from the workspace too. Workspaces live under your cache directory in `wrkflw/workspaces` (`~/Library/Caches` on macOS, `~/.cache` on Linux), one per repository, workflow file and job. Set `WRKFLW_WORKSPACES_DIR` to keep them somewhere else, such as a larger disk. `--fresh-workspace` or `WRKFLW_FRESH_WORKSPACE=1` gives every job an empty workspace, as a hosted runner does.
-- **Matrix legs that only pick a runner run once.** Locally, `runs-on: ${{ matrix.os }}` maps every OS to the same image. If a leg differs from another only in values that `runs-on` reads, and the two would run in the same image, that leg reports the other's result instead of repeating it. Its history record and its `job_finished` event carry `repeated_from` with the leg it repeats. A leg whose workflow reads the value, or which runs in a different image (see `--platform`), still runs. Only the workflow file is read: a script that reads `$MATRIX_OS` from a file of its own isn't seen, so pass `--every-matrix-leg` for such a job. `--every-matrix-leg` or `WRKFLW_EVERY_MATRIX_LEG=1` runs them all.
+- **Matrix legs that only pick a runner run once.** Locally, `runs-on: ${{ matrix.os }}` maps every OS to the same image. If a leg differs from another only in values that `runs-on` reads, or that nothing in the job reads, such as a `name` the job's display name uses, and at least one of them picks the runner, and the two would run in the same image, that leg reports the other's result instead of repeating it. Legs on the same runner always run, so `attempt: [1, 2, 3]` still repeats a job. Its history record and its `job_finished` event carry `repeated_from` with the leg it repeats. A leg whose workflow reads the value, or `strategy.job-index`, or which runs in a different image (see `--platform`), still runs, as do all legs of a `runs-on` that reads the matrix by index (`matrix['os']`). Only the workflow file is read: a script that reads `$MATRIX_OS` from a file of its own isn't seen, so pass `--every-matrix-leg` for such a job. `--every-matrix-leg` or `WRKFLW_EVERY_MATRIX_LEG=1` runs them all.
 
 What a kept workspace means in practice:
 
@@ -216,7 +217,8 @@ All of this is opt-in. Without these flags a run behaves as it always has.
 # Check everything CI would run for this push, reusing what already passed.
 # On a feature branch, a workflow a push doesn't fire is checked as a pull
 # request into the default branch. The result says how much the pass proves:
-# verified, partial (some jobs ran as another OS) or nothing_checked.
+# verified, partial (some jobs ran as another OS, or passed a step whose
+# action wrkflw can't run) or nothing_checked.
 wrkflw gate
 
 # Run it on every push (an existing hook is left alone). The hook keeps the
@@ -369,16 +371,25 @@ wrkflw runs replay latest
 wrkflw run .github/workflows/ci.yml --job test --from-step "Run tests"
 
 # Run a workflow as a finished GitHub run did, and list where the results differ.
-# Check out the commit that run tested first.
+# Check out the commit that run tested first; a detached HEAD is fine, the
+# run's branch is used.
 wrkflw compare https://github.com/OWNER/REPO/actions/runs/123456789
+
+# Check a push to another branch than the one checked out, or on a detached HEAD
+wrkflw run --event push --branch release/2.0 --diff .github/workflows/ci.yml
+
+# Check a tag push
+wrkflw run --event push --tag v1.2.0 .github/workflows/release.yml
 
 # Serve all of this over the Model Context Protocol
 wrkflw mcp serve
 ```
 
-Every `run_finished`, and the gate result, carries a `verdict`. `verified` means every job ran as the OS it asked for. `partial` means some jobs ran as another OS and are listed under `unverified`. `nothing_checked` means no job ran, so the pass proves nothing. A failure digest names a likely `cause`: `out_of_memory` when the output says memory ran out, or `killed` when a process got SIGKILL without a stated reason.
+Every `run_finished`, and the gate result, carries a `verdict`. `verified` means every job ran as the OS it asked for and every `uses:` step ran its action. `partial` means some jobs ran as another OS, or passed a step whose action didn't run, because wrkflw has no implementation of it or, for a setup action, because a job `container:`, a composite action whose runtime the job didn't set up itself, or emulation kept its runtime out of the job; both are listed under `unverified`, told apart by `kind` (`runner` or `action_not_run`). An `actions-rs/cargo` step that runs its `command` on your machine in a container runtime counts as not run too. `nothing_checked` means no job ran, so the pass proves nothing. A failure digest names a likely `cause`: `out_of_memory` when the output says memory ran out, `killed` when a process got SIGKILL without a stated reason, or `setup_failed` when the job failed before any step ran because its image couldn't be built or pulled.
 
-Docker Desktop and Podman machines often have half the 16 GB of a GitHub runner, and a Rust or C++ link can be killed there although it passes in CI. wrkflw warns when the VM has less than 14 GB and runs at most one job or matrix leg per 4 GB at a time, counting every job of the run together. On Linux without a VM it only warns. Set `WRKFLW_MAX_PARALLEL_JOBS` to choose the limit.
+On macOS and Windows, Docker Desktop and Podman machines see your files through a share that refuses file names that aren't UTF-8 and ignores case, so a test that relies on either fails there and passes on GitHub. So on macOS, steps see the job's workspace in a container volume inside the VM, a Linux filesystem; on Windows they do when `WRKFLW_WORKSPACE_MOUNT=volume` asks for it. wrkflw copies what changed on your machine into the volume before each step, and what the step changed back after it, also when the step ran out of time. The host copy is what checkout, caches, artifacts and `hashFiles` use, and what stays between runs. A file your filesystem can't hold, such as a name that isn't UTF-8 or one that differs only in case from one already there, stays in the volume only, also between runs of a kept workspace. A file your machine refuses for now, such as one in a directory a step made read-only, is tried again after the next step, with a warning until it is copied. The copies use `ubuntu:latest` for `find` and GNU `tar`; set `WRKFLW_WORKSPACE_HELPER_IMAGE` to another image that has both, with GNU tar 1.32 or later. A run interrupted with Ctrl-C removes its fresh workspaces and their volumes as it exits. Set `WRKFLW_WORKSPACE_MOUNT=bind` to mount the workspace directory as before, or `WRKFLW_WORKSPACE_MOUNT=volume` to use a volume on Linux or Windows too. `wrkflw clean` removes the volumes of workspaces that are gone.
+
+Docker Desktop and Podman machines often have half the 16 GB of a GitHub runner, and a Rust or C++ link can be killed there although it passes in CI. wrkflw warns when the VM has less than 14 GB. Each job's step containers are sampled while they run, and the job's peak is kept in `job-memory.json` under your cache directory. On the next run, a job sets aside half again its highest peak of its last three runs, plus 256 MB and at least 512 MB, and jobs start while what they set aside fits in the VM. A job never measured sets aside what every job used to: the VM's memory divided by the number of whole 4 GB in it, so on an 8 GB VM it runs alone. So a matrix of light test jobs runs side by side after its first run. Jobs share the VM's memory less a tenth of it, at least 1 GiB, which the engine, image builds and the workspace copies use. Only a job that passed keeps its peak. A step killed by SIGKILL, as the out-of-memory killer does, forgets the measurements of every job running at the time, since the kernel picks its victim anywhere in the VM. Jobs with a job container or services, and every Podman job, aren't measured, and forget what an earlier run measured. On Linux without a VM it only warns. Set `WRKFLW_JOB_MEMORY_FILE` to keep the measurements elsewhere, or to an empty value to keep none. Set `WRKFLW_MAX_PARALLEL_JOBS` to choose the limit.
 
 `scripts/conformance/plan_corpus.sh` plans the last finished run of every workflow in a list of public repositories, and compares the number of jobs with what GitHub ran. It needs `gh` and `jq`, and runs nothing.
 

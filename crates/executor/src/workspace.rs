@@ -53,6 +53,22 @@ fn callers() -> Option<String> {
     CALLERS.try_with(|callers| callers.clone()).ok()
 }
 
+/// What names `job` of `workflow`, run from `repo`, across runs: the same
+/// parts a kept workspace is keyed by.
+pub(crate) fn job_identity(repo: &Path, workflow: &str, job: &str) -> String {
+    let repo = repo.canonicalize().unwrap_or_else(|_| repo.to_path_buf());
+    let file = workflow_file();
+    let file = file.as_deref().unwrap_or(Path::new(""));
+    let file = file.strip_prefix(&repo).unwrap_or(file);
+    format!(
+        "{}\0{}\0{}\0{}",
+        repo.display(),
+        file.display(),
+        workflow_key(workflow, callers().as_deref()),
+        job
+    )
+}
+
 /// The workflow part of a workspace key. Keys of jobs outside a reusable
 /// workflow are the workflow name alone, as before, so their saved
 /// workspaces stay valid.
@@ -68,6 +84,36 @@ pub(crate) enum JobWorkspace {
     Kept { path: PathBuf, _lock: File },
     /// Deleted when the job ends.
     Fresh(tempfile::TempDir),
+}
+
+/// Fresh workspaces in use, so an interrupted run can remove what the
+/// workspaces' own drop never gets to: the process exits without it.
+static FRESH: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+impl Drop for JobWorkspace {
+    fn drop(&mut self) {
+        // Before the directory goes: a fresh workspace's volume goes with it.
+        let kept = matches!(self, JobWorkspace::Kept { .. });
+        crate::vm_workspace::release(self.path(), kept);
+        if !kept {
+            let path = self.path().to_path_buf();
+            FRESH
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|fresh| *fresh != path);
+        }
+    }
+}
+
+/// Remove the fresh workspaces of jobs still running, with their volumes,
+/// as a run interrupted with Ctrl-C exits. Call it after the job containers
+/// are gone, as a volume in use can't be removed.
+pub fn remove_interrupted_fresh_workspaces() {
+    let fresh = std::mem::take(&mut *FRESH.lock().unwrap_or_else(|e| e.into_inner()));
+    for path in fresh {
+        crate::vm_workspace::remove_now(&path);
+        let _ = std::fs::remove_dir_all(&path);
+    }
 }
 
 impl JobWorkspace {
@@ -113,7 +159,12 @@ impl JobWorkspace {
     }
 
     fn fresh() -> std::io::Result<Self> {
-        Ok(JobWorkspace::Fresh(tempfile::tempdir()?))
+        let dir = tempfile::tempdir()?;
+        FRESH
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(dir.path().to_path_buf());
+        Ok(JobWorkspace::Fresh(dir))
     }
 
     /// `None` when another run holds the workspace. `file` is the workflow
@@ -242,14 +293,19 @@ pub struct CleanReport {
     /// Workspaces that could not be removed, with why. The rest are still
     /// cleaned, so one stubborn directory doesn't hide what was freed.
     pub failed: Vec<(PathBuf, String)>,
+    /// Container volumes removed because their workspace directory is gone.
+    pub volumes: usize,
 }
 
 /// Remove every kept workspace no run is using.
 pub fn clean() -> std::io::Result<CleanReport> {
-    match workspaces_root() {
-        Some(root) => clean_under(&root),
-        None => Ok(CleanReport::default()),
-    }
+    let mut report = match workspaces_root() {
+        Some(root) => clean_under(&root)?,
+        None => CleanReport::default(),
+    };
+    // A workspace's container volume is no use once its directory is gone.
+    report.volumes = crate::vm_workspace::remove_orphaned_volumes();
+    Ok(report)
 }
 
 fn clean_under(root: &Path) -> std::io::Result<CleanReport> {
@@ -573,6 +629,7 @@ mod tests {
                 bytes: 5,
                 in_use: 1,
                 failed: Vec::new(),
+                volumes: 0,
             }
         );
         assert!(!free_path.exists());

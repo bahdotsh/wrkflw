@@ -246,12 +246,19 @@ pub(crate) fn job_id(identity: &str) -> String {
     digest[..12].iter().map(|b| format!("{:02x}", b)).collect()
 }
 
-/// The room to set aside for a job whose recent peaks are `peaks`, or
-/// `None` when it has none.
-fn reserve_for(peaks: &[u64]) -> Option<u64> {
+/// The room to set aside for a job whose recent peaks are `peaks`, and
+/// whose highest peak since it was first measured is `highest`, or `None`
+/// when it has none.
+///
+/// Recent runs set the estimate, with room to spare. The highest peak is a
+/// floor under it: runs with warm caches can measure far less than the
+/// cold build a changed dependency brings back, and three of them in a row
+/// would otherwise let that build run beside others it no longer fits with.
+fn reserve_for(peaks: &[u64], highest: u64) -> Option<u64> {
     let peak = peaks.iter().copied().max()?;
     Some(
         peak.saturating_add(peak / 2)
+            .max(highest)
             .saturating_add(HEADROOM_BYTES)
             .max(MIN_RESERVED_BYTES),
     )
@@ -284,6 +291,10 @@ impl Default for Store {
 struct Measured {
     /// Latest peaks, newest last.
     peaks: Vec<u64>,
+    /// The highest peak of any passing run since the job was first measured,
+    /// or since it last ran out of memory, which forgets it all.
+    #[serde(default)]
+    highest: u64,
     /// When the last of them was taken, in seconds since the epoch.
     at: i64,
 }
@@ -331,7 +342,9 @@ pub(crate) fn reserve(id: &str) -> Option<u64> {
     let path = store_path()?;
     let _guard = STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _file = lock_file(&path, false);
-    reserve_for(&load(&path).jobs.get(id)?.peaks)
+    let store = load(&path);
+    let measured = store.jobs.get(id)?;
+    reserve_for(&measured.peaks, measured.highest)
 }
 
 /// Keep what `meter` saw of the job `id`, which ran to its end and
@@ -390,6 +403,7 @@ fn apply(store: &mut Store, id: &str, outcome: Outcome, now: i64) {
         Outcome::Peak(bytes) => {
             let measured = store.jobs.entry(id.to_string()).or_default();
             measured.peaks.push(bytes);
+            measured.highest = measured.highest.max(bytes);
             let excess = measured.peaks.len().saturating_sub(RUNS_KEPT);
             measured.peaks.drain(..excess);
             measured.at = now;
@@ -410,12 +424,34 @@ mod tests {
 
     #[test]
     fn a_job_gets_its_peak_with_headroom_and_never_less_than_the_floor() {
-        assert_eq!(reserve_for(&[]), None);
-        assert_eq!(reserve_for(&[100 * MIB]), Some(MIN_RESERVED_BYTES));
+        assert_eq!(reserve_for(&[], 0), None);
         assert_eq!(
-            reserve_for(&[2048 * MIB, 1024 * MIB]),
+            reserve_for(&[100 * MIB], 100 * MIB),
+            Some(MIN_RESERVED_BYTES)
+        );
+        assert_eq!(
+            reserve_for(&[2048 * MIB, 1024 * MIB], 2048 * MIB),
             Some(3072 * MIB + HEADROOM_BYTES)
         );
+    }
+
+    #[test]
+    fn warm_runs_never_shrink_a_job_below_its_coldest_run() {
+        let mut store = Store::default();
+        // One cold build, then three with warm caches.
+        for peak in [4096, 600, 600, 600] {
+            apply(&mut store, "job", Outcome::Peak(peak * MIB), 1000);
+        }
+        let measured = &store.jobs["job"];
+        assert_eq!(measured.peaks, vec![600 * MIB; 3]);
+        assert_eq!(
+            reserve_for(&measured.peaks, measured.highest),
+            Some(4096 * MIB + HEADROOM_BYTES)
+        );
+        // Running out of memory forgets it all, the floor too.
+        apply(&mut store, "job", Outcome::Killed, 1000);
+        apply(&mut store, "job", Outcome::Peak(600 * MIB), 1000);
+        assert_eq!(store.jobs["job"].highest, 600 * MIB);
     }
 
     #[test]

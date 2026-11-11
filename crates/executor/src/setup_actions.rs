@@ -40,6 +40,13 @@ pub(crate) enum NotBuilt {
     /// Another setup step of the same language set the version the image
     /// holds: an image has one version of each, the job's last.
     Superseded,
+    /// It has an `if:` and would replace the version an earlier setup step
+    /// of the same language put in the image, which can't depend on
+    /// whether it runs.
+    Conditional,
+    /// It asks for something besides a version that wrkflw doesn't carry
+    /// out, such as setup-uv's `activate-environment`.
+    UnsupportedInput,
 }
 
 impl BuiltRuntimes {
@@ -373,6 +380,15 @@ pub(crate) fn unrun_action_cause(
                  language asks for, as wrkflw builds one version of each into it",
             )
         }
+        Some(NotBuilt::Conditional) => {
+            return Some(
+                "it has an `if:` and would replace the version an earlier setup step put \
+                 in the job's image, which wrkflw builds before it knows whether the step runs",
+            )
+        }
+        Some(NotBuilt::UnsupportedInput) => {
+            return Some("it asks for something besides a version that wrkflw doesn't carry out")
+        }
         None => {}
     }
     if built.has(def.language) {
@@ -420,15 +436,23 @@ fn composite_setup_cause(
 /// `None` when it asks for none, or why the step can't be done as asked:
 /// inputs that change what later steps run with and that wrkflw doesn't
 /// carry out leave the step not run.
-fn uv_python<'a>(input: impl Fn(&str) -> Option<&'a String>) -> Result<Option<String>, String> {
+fn uv_python<'a>(
+    input: impl Fn(&str) -> Option<&'a String>,
+) -> Result<Option<String>, (NotBuilt, String)> {
     if input("activate-environment").is_some_and(|value| value.trim() == "true") {
-        return Err("its `activate-environment` input isn't carried out by wrkflw".to_string());
+        return Err((
+            NotBuilt::UnsupportedInput,
+            "its `activate-environment` input isn't carried out by wrkflw".to_string(),
+        ));
     }
     for key in ["version-file", "pyproject-file", "uv-file"] {
         if input(key).is_some() && input("version").is_none() {
-            return Err(format!(
-                "its `{}` input, which sets uv's version, isn't read by wrkflw",
-                key
+            return Err((
+                NotBuilt::UnsupportedInput,
+                format!(
+                    "its `{}` input, which sets uv's version, isn't read by wrkflw",
+                    key
+                ),
             ));
         }
     }
@@ -444,9 +468,12 @@ fn uv_python<'a>(input: impl Fn(&str) -> Option<&'a String>) -> Result<Option<St
     if is_safe_version(&python) || is_safe_python_spec(&python) {
         Ok(Some(python))
     } else {
-        Err(format!(
-            "its `python-version` {:?} isn't one wrkflw can install",
-            python
+        Err((
+            NotBuilt::Refused,
+            format!(
+                "its `python-version` {:?} isn't one wrkflw can install",
+                python
+            ),
         ))
     }
 }
@@ -712,9 +739,9 @@ pub(crate) fn detect_setup_in(steps: &[Step], root: &Path) -> SetupDetection {
                         ),
                     ];
                 }
-                Err(why) => {
+                Err((reason, why)) => {
                     wrkflw_logging::warning(&format!("{}: {}, so the step is not run", uses, why));
-                    not_built.push((step_idx, NotBuilt::Refused));
+                    not_built.push((step_idx, reason));
                     continue;
                 }
             }
@@ -734,7 +761,7 @@ pub(crate) fn detect_setup_in(steps: &[Step], root: &Path) -> SetupDetection {
                  set up, so the step is not run",
                 uses, def.language
             ));
-            not_built.push((step_idx, NotBuilt::Refused));
+            not_built.push((step_idx, NotBuilt::Conditional));
             continue;
         }
         if let Some(idx) = existing_idx {

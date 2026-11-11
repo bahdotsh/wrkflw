@@ -10823,19 +10823,37 @@ runs:
         let dockerfile = generate_combined_dockerfile(&both.runtimes, "ubuntu:latest", None, None);
         assert_eq!(dockerfile.matches("ENV UV_PYTHON_INSTALL_DIR=").count(), 1);
 
-        // What wrkflw doesn't carry out leaves the step not run.
-        for refused in [
-            with(&[("activate-environment", "true")]),
-            with(&[("python-version", "3.12; rm -rf /")]),
-            with(&[("version-file", "pyproject.toml")]),
+        // What wrkflw doesn't carry out leaves the step not run, and says
+        // why.
+        for (refused, why) in [
+            (
+                with(&[("activate-environment", "true")]),
+                NotBuilt::UnsupportedInput,
+            ),
+            (
+                with(&[("python-version", "3.12; rm -rf /")]),
+                NotBuilt::Refused,
+            ),
+            (
+                with(&[("version-file", "pyproject.toml")]),
+                NotBuilt::UnsupportedInput,
+            ),
         ] {
             let detection = detect_setup(&[make_step_uses(
                 "astral-sh/setup-uv@v6",
                 Some(refused.clone()),
             )]);
             assert!(detection.runtimes.is_empty(), "{refused:?}");
-            assert_eq!(detection.not_built, [(0, NotBuilt::Refused)], "{refused:?}");
+            assert_eq!(detection.not_built, [(0, why)], "{refused:?}");
         }
+        let built = BuiltRuntimes {
+            not_built: vec![(0, NotBuilt::UnsupportedInput)],
+            ..BuiltRuntimes::default()
+        };
+        assert!(
+            unrun_action_cause("astral-sh/setup-uv", &built, true, 0, None)
+                .is_some_and(|c| c.contains("doesn't carry out") && !c.contains("install"))
+        );
     }
 
     #[test]
@@ -10861,7 +10879,17 @@ runs:
         nightly.if_condition = Some("github.event_name == 'schedule'".to_string());
         let detection = detect_setup(&[python("3.12"), nightly.clone()]);
         assert_eq!(detection.runtimes[0].version, "3.12");
-        assert_eq!(detection.not_built, [(1, NotBuilt::Refused)]);
+        assert_eq!(detection.not_built, [(1, NotBuilt::Conditional)]);
+        let built = BuiltRuntimes {
+            installed: vec!["python".to_string()],
+            not_built: detection.not_built.clone(),
+            runtimes: detection.runtimes.clone(),
+            ..BuiltRuntimes::default()
+        };
+        assert!(
+            unrun_action_cause("actions/setup-python", &built, true, 1, None)
+                .is_some_and(|c| c.contains("`if:`"))
+        );
         // Alone, it decides the image as before.
         let alone = detect_setup(&[nightly]);
         assert_eq!(alone.runtimes[0].version, "3.14-dev");

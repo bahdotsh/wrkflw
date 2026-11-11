@@ -48,15 +48,26 @@ pub(crate) fn matrix_twins(
         .iter()
         .map(|c| get_effective_runner_image(job, platform_overrides, Some(&c.values)))
         .collect();
+    let picks_runner = |key: &String| reads_matrix_keys(&runs_on, std::slice::from_ref(key));
     for leg in 1..combinations.len() {
-        twins[leg] = (0..leg).filter(|&i| twins[i].is_none()).find(|&i| {
-            let differing = differing_keys(&combinations[i].values, &combinations[leg].values);
-            let picks_runner =
-                |key: &String| reads_matrix_keys(&runs_on, std::slice::from_ref(key));
-            images[i] == images[leg]
-                && differing.iter().any(picks_runner)
-                && !reads_matrix_keys(&body, &differing)
-        });
+        // The legs this one would repeat, and whether each differs from it
+        // in nothing but the runner.
+        let candidates: Vec<(usize, bool)> = (0..leg)
+            .filter(|&i| twins[i].is_none() && images[i] == images[leg])
+            .filter_map(|i| {
+                let differing = differing_keys(&combinations[i].values, &combinations[leg].values);
+                (differing.iter().any(picks_runner) && !reads_matrix_keys(&body, &differing))
+                    .then(|| (i, differing.iter().all(picks_runner)))
+            })
+            .collect();
+        // A leg that differs only in the runner is this leg's exact twin.
+        // One that also differs in an unread label stands in only when there
+        // is none, so each leg of `os` x `attempt` reports its own attempt.
+        twins[leg] = candidates
+            .iter()
+            .find(|(_, exact)| *exact)
+            .or(candidates.first())
+            .map(|(i, _)| *i);
     }
     twins
 }
@@ -305,6 +316,29 @@ mod tests {
         assert_eq!(
             matrix_twins(&job, &combos, &HashMap::new()),
             vec![None, Some(0), Some(0)]
+        );
+    }
+
+    #[test]
+    fn a_leg_reports_the_twin_that_differs_from_it_only_in_runner() {
+        let job = job("runs-on: ${{ matrix.os }}\nsteps:\n  - run: ./flaky\n");
+        let leg = |os: &str, attempt: &str| {
+            MatrixCombination::new(HashMap::from([
+                ("os".to_string(), Value::String(os.to_string())),
+                ("attempt".to_string(), Value::String(attempt.to_string())),
+            ]))
+        };
+        let combos = vec![
+            leg("ubuntu-latest", "1"),
+            leg("ubuntu-latest", "2"),
+            leg("windows-latest", "1"),
+            leg("windows-latest", "2"),
+        ];
+        // Both attempts run; each Windows attempt repeats its own Ubuntu one,
+        // not the first leg it could stand for.
+        assert_eq!(
+            matrix_twins(&job, &combos, &HashMap::new()),
+            vec![None, None, Some(0), Some(1)]
         );
     }
 

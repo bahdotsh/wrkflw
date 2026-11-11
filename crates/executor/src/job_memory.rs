@@ -262,12 +262,15 @@ pub(crate) async fn metered<F: std::future::Future>(
         let measured = meter.clone();
         let family = leg.as_ref().map(|leg| leg.family.clone());
         // The store is a file under a lock: not for the async runtime.
-        let _ =
+        let changed =
             tokio::task::spawn_blocking(move || record(&id, family.as_deref(), &measured, passed))
-                .await;
-        // Before the place is given up: a leg waiting for the whole VM
-        // must see what this one measured, not take the place unmeasured.
-        crate::vm_memory::measurements_changed();
+                .await
+                .unwrap_or(false);
+        // Before the place is given up: a sibling waiting for the whole VM
+        // must see what this leg measured, not take the place unmeasured.
+        if let (true, Some(leg)) = (changed, &leg) {
+            crate::vm_memory::measurements_changed(&leg.family);
+        }
         if let (true, Some(leg)) = (misjudged, &leg) {
             wrkflw_logging::warning(&format!(
                 "Matrix job {} had never been measured, so it ran with the memory the \
@@ -596,13 +599,14 @@ fn keep(
 }
 
 /// Keep what `meter` saw of the job `id`, a leg of the matrix `family` if
-/// any, which ran to its end and `passed` or not.
-fn record(id: &str, family: Option<&str>, meter: &JobMeter, passed: bool) {
+/// any, which ran to its end and `passed` or not. `true` when the store
+/// was changed.
+fn record(id: &str, family: Option<&str>, meter: &JobMeter, passed: bool) -> bool {
     let Some(path) = store_path() else {
-        return;
+        return false;
     };
     let Some(outcome) = to_keep(meter.outcome(), passed) else {
-        return;
+        return false;
     };
     let _guard = STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // Held from load to write, so another process's update isn't lost,
@@ -612,7 +616,7 @@ fn record(id: &str, family: Option<&str>, meter: &JobMeter, passed: bool) {
             "Could not lock {}, so this job's memory isn't kept",
             path.display()
         ));
-        return;
+        return false;
     };
     let mut store = load(&path);
     if !keep(
@@ -623,7 +627,7 @@ fn record(id: &str, family: Option<&str>, meter: &JobMeter, passed: bool) {
         meter.sized_by_matrix.load(Ordering::Relaxed),
         chrono::Utc::now().timestamp(),
     ) {
-        return;
+        return false;
     }
     let written = (|| -> std::io::Result<()> {
         let dir = path.parent().unwrap_or(std::path::Path::new("."));
@@ -633,13 +637,14 @@ fn record(id: &str, family: Option<&str>, meter: &JobMeter, passed: bool) {
         temp.persist(&path).map_err(|e| e.error)?;
         Ok(())
     })();
-    if let Err(e) = written {
+    if let Err(e) = &written {
         wrkflw_logging::debug(&format!(
             "Could not keep job memory in {}: {}",
             path.display(),
             e
         ));
     }
+    written.is_ok()
 }
 
 /// What to keep of a finished job's `outcome`. A failed job may have

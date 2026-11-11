@@ -12,7 +12,11 @@
 //! host copy unchanged.
 //!
 //! Both directions compare listings (type, size, whole-second mtime, mode, link
-//! target), so a step that changes little costs little. An entry the host
+//! target), so a step that changes little costs little. The copy in sends
+//! only what changed on the host since the last copy either way: where the
+//! host and the volume differ and the host didn't change, the volume's side
+//! is the newer one, as for a file a background process was still writing
+//! while it was copied back, and the next copy back brings it. An entry the host
 //! cannot hold, such as a name that is not UTF-8, stays in the volume with
 //! everything inside it, and is never deleted from it for being absent on
 //! the host. A host directory that can't be read is left alone both ways.
@@ -117,6 +121,9 @@ struct State {
     helper: Option<String>,
     /// The volume as of the end of the last sync; `None` before the first.
     volume: Option<Listing>,
+    /// The host copy as of the end of the last sync; `None` before the
+    /// first, when everything on the host is the host's to send.
+    host: Option<Listing>,
     /// Volume entries the host could not hold.
     kept: HashSet<PathBuf>,
     /// Volume entries the host refused for a reason that may pass. The next
@@ -139,6 +146,7 @@ impl State {
         State {
             helper: None,
             volume: None,
+            host: None,
             kept: HashSet::new(),
             pending: HashSet::new(),
             unlisted: HashSet::new(),
@@ -311,6 +319,7 @@ impl VmWorkspace {
         let plan = plan_sync_in(
             &outside(&host, &hidden),
             &outside(&without_unreadable(&volume, &unreadable), &hidden),
+            state.host.as_ref(),
             &state.kept,
             |rel| std::fs::symlink_metadata(self.host.join(rel)).is_ok(),
         );
@@ -341,14 +350,20 @@ impl VmWorkspace {
             }
         }
         state.volume = Some(volume);
+        state.host = Some(host);
         Ok(())
     }
 
     fn sync_out(&self) -> Result<(), String> {
         let mut state = self.lock();
         self.sync_out_locked(&mut state).map_err(|e| {
-            // The next step must list the volume again.
+            // The next step must list the volume again. What the copy got
+            // onto the host before it failed is not a change the host made,
+            // so the next copy in must not send it back.
             state.volume = None;
+            if let Ok((host, _)) = walk(&self.host) {
+                state.host = Some(host);
+            }
             format!(
                 "copying the workspace back from the {} volume failed: {}",
                 self.cli, e
@@ -426,6 +441,10 @@ impl VmWorkspace {
             save_kept(kept_file(&self.volume).as_deref(), &state.kept);
         }
         state.volume = Some(volume);
+        // The host as this copy left it. An entry that differs from the
+        // volume's here, such as a file that grew while it was copied, is
+        // not a host change for the next copy in to send.
+        state.host = Some(walk(&self.host)?.0);
         Ok(())
     }
 
@@ -609,12 +628,18 @@ struct SyncIn {
     send: Vec<PathBuf>,
 }
 
+/// `before` is the host as the last sync left it, `None` before the first.
+/// Only what the host changed since then is sent or deleted: an entry that
+/// differs from the volume's while the host's side stayed the same was
+/// changed in the volume, and is the next copy back's to fetch.
 fn plan_sync_in(
     host: &Listing,
     volume: &Listing,
+    before: Option<&Listing>,
     kept: &HashSet<PathBuf>,
     on_host: impl Fn(&Path) -> bool,
 ) -> SyncIn {
+    let host_changed = |path: &Path| before.is_none_or(|before| before.get(path) != host.get(path));
     // Absent from the listing but present on disk means the host folds case
     // and holds this name, or a directory above it, under another spelling.
     // What is inside such a directory is the volume's, not deleted.
@@ -631,10 +656,11 @@ fn plan_sync_in(
     };
     let mut delete: Vec<PathBuf> = Vec::new();
     for (path, entry) in volume {
-        let gone = match host.get(path) {
-            Some(theirs) => !theirs.kind.same_type(&entry.kind),
-            None => !is_kept(kept, path) && !held_elsewhere(path),
-        };
+        let gone = host_changed(path)
+            && match host.get(path) {
+                Some(theirs) => !theirs.kind.same_type(&entry.kind),
+                None => !is_kept(kept, path) && !held_elsewhere(path),
+            };
         if gone {
             delete.push(path.clone());
         }
@@ -646,9 +672,10 @@ fn plan_sync_in(
         .filter(|(path, entry)| {
             let replaced = under_any(&outermost, path);
             replaced
-                || volume
-                    .get(*path)
-                    .is_none_or(|theirs| !entry.matches(theirs))
+                || (host_changed(path)
+                    && volume
+                        .get(*path)
+                        .is_none_or(|theirs| !entry.matches(theirs)))
         })
         .map(|(path, _)| path.clone())
         .collect();
@@ -1564,7 +1591,7 @@ mod tests {
             ("old", dir()),
             ("old/inner", file(1, 1)),
         ]);
-        let plan = plan_sync_in(&host, &volume, &HashSet::new(), |_| false);
+        let plan = plan_sync_in(&host, &volume, None, &HashSet::new(), |_| false);
         assert_eq!(plan.delete, paths(&["old"]));
         assert_eq!(plan.send, paths(&["src/edited", "src/new"]));
     }
@@ -1579,7 +1606,9 @@ mod tests {
         ]);
         let kept: HashSet<PathBuf> = paths(&["src/unrepresentable"]).into_iter().collect();
         // The host folds case: it holds `src/Readme` as `src/README`.
-        let plan = plan_sync_in(&host, &volume, &kept, |p| p == Path::new("src/Readme"));
+        let plan = plan_sync_in(&host, &volume, None, &kept, |p| {
+            p == Path::new("src/Readme")
+        });
         assert_eq!(plan, SyncIn::default());
     }
 
@@ -1595,7 +1624,7 @@ mod tests {
             ("src/bad/deep/more", file(1, 10)),
         ]);
         let kept = HashSet::from([PathBuf::from("src/bad")]);
-        let plan = plan_sync_in(&host, &volume, &kept, |_| false);
+        let plan = plan_sync_in(&host, &volume, None, &kept, |_| false);
         assert_eq!(plan, SyncIn::default());
         // Nor is any of it fetched again, to be refused again.
         let plan = plan_sync_out(&host, &volume, &kept);
@@ -1610,12 +1639,12 @@ mod tests {
         let volume = listing(&[("Foo", dir()), ("Foo/x", file(1, 1)), ("foo", file(1, 1))]);
         let kept = HashSet::new();
         // `Foo` folds onto `foo`; `Foo/x` is `foo/x`, below a file.
-        let plan = plan_sync_in(&host, &volume, &kept, |p| p == Path::new("Foo"));
+        let plan = plan_sync_in(&host, &volume, None, &kept, |p| p == Path::new("Foo"));
         assert_eq!(plan, SyncIn::default());
         // A directory the host deleted still goes, with what was in it.
         let host = listing(&[]);
         let volume = listing(&[("gone", dir()), ("gone/x", file(1, 1))]);
-        let plan = plan_sync_in(&host, &volume, &kept, |_| false);
+        let plan = plan_sync_in(&host, &volume, None, &kept, |_| false);
         assert_eq!(plan.delete, paths(&["gone"]));
     }
 
@@ -1798,10 +1827,37 @@ mod tests {
     }
 
     #[test]
+    fn copying_in_leaves_what_only_the_volume_changed() {
+        // `log` grew in the volume while it was copied back, so the host
+        // got more of it than the listing says. `late` was written to the
+        // volume after it was listed. The host changed neither, so neither
+        // is the host's to send or delete; `edited` it did change.
+        let before = listing(&[
+            ("log", file(1100, 2)),
+            ("edited", file(1, 1)),
+            ("removed", file(1, 1)),
+        ]);
+        let host = listing(&[("log", file(1100, 2)), ("edited", file(2, 3))]);
+        let volume = listing(&[
+            ("log", file(1000, 1)),
+            ("edited", file(1, 1)),
+            ("removed", file(1, 1)),
+            ("late", file(1, 1)),
+        ]);
+        let plan = plan_sync_in(&host, &volume, Some(&before), &HashSet::new(), |_| false);
+        assert_eq!(plan.delete, paths(&["removed"]));
+        assert_eq!(plan.send, paths(&["edited"]));
+        // Before the first sync everything on the host is the host's.
+        let plan = plan_sync_in(&host, &volume, None, &HashSet::new(), |_| false);
+        assert_eq!(plan.delete, paths(&["late", "removed"]));
+        assert_eq!(plan.send, paths(&["edited", "log"]));
+    }
+
+    #[test]
     fn copying_in_replaces_an_entry_that_changed_type() {
         let host = listing(&[("x", file(1, 1))]);
         let volume = listing(&[("x", dir()), ("x/inner", file(1, 1))]);
-        let plan = plan_sync_in(&host, &volume, &HashSet::new(), |_| false);
+        let plan = plan_sync_in(&host, &volume, None, &HashSet::new(), |_| false);
         assert_eq!(plan.delete, paths(&["x"]));
         assert_eq!(plan.send, paths(&["x"]));
     }
@@ -1979,6 +2035,37 @@ mod tests {
             std::fs::read_link(host.join("src/link")).unwrap(),
             PathBuf::from("keep.txt")
         );
+        // A file that grew in the volume after it was copied back differs
+        // from the host's copy, which didn't change: the copy in must not
+        // put the host's stale one over it.
+        std::fs::write(host.join("src/stale.log"), "old").unwrap();
+        workspace.lock().host = Some(walk(&host).unwrap().0);
+        exec(
+            workspace.cli,
+            &helper,
+            &["sh", "-c", "echo much newer > /ws/src/stale.log"],
+            None,
+        )
+        .unwrap();
+        workspace.lock().volume = None;
+        assert!(workspace.sync_in().unwrap());
+        exec(
+            workspace.cli,
+            &helper,
+            &[
+                "sh",
+                "-c",
+                "test \"$(cat /ws/src/stale.log)\" = 'much newer'",
+            ],
+            None,
+        )
+        .unwrap();
+        workspace.sync_out().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(host.join("src/stale.log")).unwrap(),
+            "much newer\n"
+        );
+
         // A host edit goes back in, and nothing the host lacks is lost.
         std::fs::write(host.join("src/keep.txt"), "edited").unwrap();
         assert!(workspace.sync_in().unwrap());

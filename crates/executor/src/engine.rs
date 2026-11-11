@@ -1718,6 +1718,23 @@ async fn execute_native_docker_step(
         }
     }
 
+    // Before the copy in: nothing may fail between it and the copy back,
+    // or a later timeout would copy back a volume no step wrote to.
+    // Determine container CMD: workflow `with.args` overrides action.yml `runs.args`.
+    // If neither is specified, the image's built-in CMD takes effect.
+    let effective_args: Vec<String> = if let Some(ref wa) = with_args_override {
+        shlex::split(wa).ok_or_else(|| {
+            ExecutionError::Execution(format!(
+                "Failed to parse 'with.args' for action '{}': \
+                 unmatched quote in {:?}",
+                uses, wa
+            ))
+        })?
+    } else {
+        args
+    };
+    let args_refs: Vec<&str> = effective_args.iter().map(|s| s.as_str()).collect();
+
     let container_workspace = Path::new(environment::CONTAINER_WORKSPACE);
     let mount_ctx = prepare_step_container_context(
         step_env,
@@ -1741,21 +1758,6 @@ async fn execute_native_docker_step(
         "Running Docker action '{}' with image '{}'",
         uses, image
     ));
-
-    // Determine container CMD: workflow `with.args` overrides action.yml `runs.args`.
-    // If neither is specified, the image's built-in CMD takes effect.
-    let effective_args: Vec<String> = if let Some(ref wa) = with_args_override {
-        shlex::split(wa).ok_or_else(|| {
-            ExecutionError::Execution(format!(
-                "Failed to parse 'with.args' for action '{}': \
-                 unmatched quote in {:?}",
-                uses, wa
-            ))
-        })?
-    } else {
-        args
-    };
-    let args_refs: Vec<&str> = effective_args.iter().map(|s| s.as_str()).collect();
 
     let output = ctx
         .runtime

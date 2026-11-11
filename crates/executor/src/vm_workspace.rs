@@ -154,6 +154,14 @@ impl State {
             used: false,
         }
     }
+    /// The state a run starts the workspace volume `volume` with: what an
+    /// earlier run of a kept workspace left in it that the host lacks.
+    fn for_volume(volume: &str) -> Self {
+        let mut state = State::new();
+        state.kept = load_paths(kept_file(volume).as_deref());
+        state.pending = load_paths(pending_file(volume).as_deref());
+        state
+    }
 }
 
 /// Whether `path` is a kept entry or inside one. A directory the host
@@ -228,14 +236,12 @@ pub(crate) async fn before_step(
         all.entry(host.to_path_buf())
             .or_insert_with(|| {
                 let volume = volume_name(host);
-                let mut state = State::new();
-                state.kept = load_kept(kept_file(&volume).as_deref());
                 Arc::new(VmWorkspace {
                     cli,
                     host: host.to_path_buf(),
                     volume_path: PathBuf::from(&volume),
+                    state: Mutex::new(State::for_volume(&volume)),
                     volume,
-                    state: Mutex::new(state),
                 })
             })
             .clone()
@@ -461,10 +467,15 @@ impl VmWorkspace {
                 state.kept.extend(refused);
             }
         }
+        if state.pending != pending {
+            // A kept workspace's next run must not take these for entries
+            // the host deleted, and delete them from the volume.
+            save_paths(pending_file(&self.volume).as_deref(), &pending);
+        }
         state.pending = pending;
         state.kept.retain(|path| volume.contains_key(path));
         if state.kept != kept_before {
-            save_kept(kept_file(&self.volume).as_deref(), &state.kept);
+            save_paths(kept_file(&self.volume).as_deref(), &state.kept);
         }
         state.volume = Some(volume);
         // The host as this copy left it. An entry that differs from the
@@ -1212,7 +1223,19 @@ fn kept_file(volume: &str) -> Option<PathBuf> {
     )
 }
 
-fn load_kept(file: Option<&Path>) -> HashSet<PathBuf> {
+/// Where the entries the host refused for now, in `volume`, are remembered,
+/// for the same reason as [`kept_file`].
+fn pending_file(volume: &str) -> Option<PathBuf> {
+    kept_file(volume).map(|file| file.with_extension("pending"))
+}
+
+/// Forget what was remembered of `volume`, as it goes.
+fn forget_saved(volume: &str) {
+    save_paths(kept_file(volume).as_deref(), &HashSet::new());
+    save_paths(pending_file(volume).as_deref(), &HashSet::new());
+}
+
+fn load_paths(file: Option<&Path>) -> HashSet<PathBuf> {
     let Some(bytes) = file.and_then(|file| std::fs::read(file).ok()) else {
         return HashSet::new();
     };
@@ -1225,7 +1248,7 @@ fn load_kept(file: Option<&Path>) -> HashSet<PathBuf> {
         .collect()
 }
 
-fn save_kept(file: Option<&Path>, kept: &HashSet<PathBuf>) {
+fn save_paths(file: Option<&Path>, kept: &HashSet<PathBuf>) {
     let Some(file) = file else {
         return;
     };
@@ -1425,7 +1448,7 @@ pub(crate) fn release(host: &Path, kept: bool) {
         if kept {
             return;
         }
-        save_kept(kept_file(&volume).as_deref(), &HashSet::new());
+        forget_saved(&volume);
         for _ in 0..VOLUME_REMOVAL_TRIES {
             let removed = Command::new(cli)
                 .args(["volume", "rm", "-f", &volume])
@@ -1476,7 +1499,7 @@ pub(crate) fn remove_now(host: &Path) {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
-    save_kept(kept_file(&workspace.volume).as_deref(), &HashSet::new());
+    forget_saved(&workspace.volume);
 }
 
 /// Wait for the volumes released so far to be removed, so a run that ends
@@ -1531,7 +1554,7 @@ pub(crate) fn remove_orphaned_volumes() -> usize {
                 .status()
                 .is_ok_and(|status| status.success());
             if gone {
-                save_kept(kept_file(name).as_deref(), &HashSet::new());
+                forget_saved(name);
             }
             removed += usize::from(gone);
         }
@@ -1776,13 +1799,13 @@ mod tests {
             use std::os::unix::ffi::OsStrExt;
             kept.insert(PathBuf::from(std::ffi::OsStr::from_bytes(b"src/n\xff")));
         }
-        save_kept(Some(&file), &kept);
-        assert_eq!(load_kept(Some(&file)), kept);
+        save_paths(Some(&file), &kept);
+        assert_eq!(load_paths(Some(&file)), kept);
         // Nothing kept leaves nothing behind.
-        save_kept(Some(&file), &HashSet::new());
+        save_paths(Some(&file), &HashSet::new());
         assert!(!file.exists());
-        assert!(load_kept(Some(&file)).is_empty());
-        assert!(load_kept(None).is_empty());
+        assert!(load_paths(Some(&file)).is_empty());
+        assert!(load_paths(None).is_empty());
     }
 
     #[test]
@@ -2188,6 +2211,55 @@ mod tests {
             std::fs::read_to_string(host.join("src/late.txt")).unwrap(),
             "late\n"
         );
+
+        // A write the host refuses for now is remembered for the
+        // workspace's next run, whose first copy in must not delete it from
+        // the volume for being absent on the host.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let locked = host.join("locked");
+            std::fs::create_dir(&locked).unwrap();
+            assert!(workspace.sync_in().unwrap());
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
+            // Root writes anyway, so there is nothing to refuse.
+            let refuses = std::fs::write(locked.join(".probe"), "").is_err();
+            let _ = std::fs::remove_file(locked.join(".probe"));
+            if refuses {
+                exec(
+                    workspace.cli,
+                    &helper,
+                    &["sh", "-c", "echo out > /ws/locked/out.txt"],
+                    None,
+                )
+                .unwrap();
+                workspace.sync_out().unwrap();
+                assert!(!locked.join("out.txt").exists());
+                let pending = || load_paths(pending_file(&workspace.volume).as_deref());
+                assert!(pending().contains(Path::new("locked/out.txt")));
+
+                // The next run starts from what was saved.
+                *workspace.lock() = State {
+                    helper: Some(helper.clone()),
+                    ..State::for_volume(&workspace.volume)
+                };
+                std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+                assert!(workspace.sync_in().unwrap());
+                exec(
+                    workspace.cli,
+                    &helper,
+                    &["sh", "-c", "test -e /ws/locked/out.txt"],
+                    None,
+                )
+                .unwrap();
+                workspace.sync_out().unwrap();
+                assert_eq!(
+                    std::fs::read_to_string(locked.join("out.txt")).unwrap(),
+                    "out\n"
+                );
+                assert!(pending().is_empty());
+            }
+        }
 
         release(&host, false);
         drop(dir);

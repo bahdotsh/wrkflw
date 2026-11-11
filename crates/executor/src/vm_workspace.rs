@@ -247,6 +247,32 @@ pub(crate) async fn before_step(
     Ok(used.then_some(workspace))
 }
 
+/// After a step that was cancelled, as one that ran out of time is: copy
+/// back what it wrote before it was stopped, which its own copy back never
+/// got to. Host-side steps that follow, such as an artifact upload of its
+/// logs, would otherwise not see it. Does nothing when no step of the
+/// workspace at `host` has used a volume.
+pub(crate) async fn after_cancelled_step(host: &Path) -> Result<(), String> {
+    let workspace = WORKSPACES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(host)
+        .cloned();
+    let Some(workspace) = workspace else {
+        return Ok(());
+    };
+    tokio::task::spawn_blocking(move || {
+        let used = workspace.lock().used;
+        if used {
+            workspace.sync_out()
+        } else {
+            Ok(())
+        }
+    })
+    .await
+    .map_err(|e| format!("the workspace sync stopped: {}", e))?
+}
+
 impl VmWorkspace {
     /// Point the workspace mount in `volumes` at the volume.
     pub(crate) fn mount_in<'a>(&'a self, volumes: &mut [(&'a Path, &'a Path)]) {
@@ -2035,6 +2061,24 @@ mod tests {
             std::fs::read_link(host.join("src/link")).unwrap(),
             PathBuf::from("keep.txt")
         );
+        // A step that is cancelled, as one out of time is, never copies
+        // back; what it wrote comes back on request.
+        exec(
+            workspace.cli,
+            &helper,
+            &["sh", "-c", "echo partial > /ws/src/timed-out.log"],
+            None,
+        )
+        .unwrap();
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(after_cancelled_step(&host))
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(host.join("src/timed-out.log")).unwrap(),
+            "partial\n"
+        );
+
         // A file that grew in the volume after it was copied back differs
         // from the host's copy, which didn't change: the copy in must not
         // put the host's stale one over it.

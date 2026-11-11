@@ -1,6 +1,6 @@
 # Codebase Index: wrkflw
 
-> Generated: 2026-11-09 17:48:21 UTC | Files: 259 | Lines: 113938
+> Generated: 2026-11-11 08:20:57 UTC | Files: 259 | Lines: 114233
 > Languages: JSON (4), Markdown (26), Rust (166), Shell (6), TOML (19), YAML (38)
 
 ## Directory Structure
@@ -1753,7 +1753,7 @@ wrkflw/
 
 ## AGENTS.md
 
-**Language:** Markdown | **Size:** 13.9 KB | **Lines:** 96
+**Language:** Markdown | **Size:** 14.0 KB | **Lines:** 96
 
 **Declarations:**
 
@@ -1785,7 +1785,7 @@ wrkflw/
 
 ## INDEX.md
 
-**Language:** Markdown | **Size:** 266.5 KB | **Lines:** 9926
+**Language:** Markdown | **Size:** 269.1 KB | **Lines:** 10009
 
 **Declarations:**
 
@@ -1793,7 +1793,7 @@ wrkflw/
 
 ## README.md
 
-**Language:** Markdown | **Size:** 43.6 KB | **Lines:** 563
+**Language:** Markdown | **Size:** 43.7 KB | **Lines:** 563
 
 **Declarations:**
 
@@ -2907,7 +2907,7 @@ wrkflw/
 
 ## crates/executor/src/job_memory.rs
 
-**Language:** Rust | **Size:** 19.7 KB | **Lines:** 551
+**Language:** Rust | **Size:** 19.8 KB | **Lines:** 552
 
 **Imports:**
 - `std::collections::HashMap`
@@ -3582,7 +3582,7 @@ wrkflw/
 
 ## crates/executor/src/matrix_fold.rs
 
-**Language:** Rust | **Size:** 14.8 KB | **Lines:** 398
+**Language:** Rust | **Size:** 16.7 KB | **Lines:** 454
 
 **Imports:**
 - `crate::engine::{get_effective_runner_image, JobResult, JobStatus}`
@@ -3751,7 +3751,7 @@ wrkflw/
 
 ## crates/executor/src/setup_actions.rs
 
-**Language:** Rust | **Size:** 35.0 KB | **Lines:** 879
+**Language:** Rust | **Size:** 35.1 KB | **Lines:** 880
 
 **Imports:**
 - `std::collections::HashMap`
@@ -3864,7 +3864,7 @@ wrkflw/
 
 ## crates/executor/src/vm_memory.rs
 
-**Language:** Rust | **Size:** 20.4 KB | **Lines:** 559
+**Language:** Rust | **Size:** 20.8 KB | **Lines:** 568
 
 **Imports:**
 - `std::sync::{Arc, OnceLock}`
@@ -3907,6 +3907,8 @@ wrkflw/
 
 `pub(crate) async fn job_slot(job: Option<&str>) -> Option<OwnedSemaphorePermit>`
 
+`pub(crate) fn sizes_by_memory() -> bool`
+
 `fn env_limit() -> Option<usize>`
 
 `fn parse_limit(value: &str) -> Option<usize>`
@@ -3947,7 +3949,7 @@ wrkflw/
 
 ## crates/executor/src/vm_workspace.rs
 
-**Language:** Rust | **Size:** 70.1 KB | **Lines:** 1978
+**Language:** Rust | **Size:** 76.2 KB | **Lines:** 2123
 
 **Imports:**
 - `std::collections::{HashMap, HashSet}`
@@ -3989,12 +3991,12 @@ wrkflw/
 
 `type Listing = HashMap<PathBuf, Entry>`
 
-`fn wanted(host_is_linux: bool, setting: Option<&str>) -> bool`
+`fn wanted(on_by_default: bool, setting: Option<&str>) -> bool`
 
 `fn volume_name(host: &Path) -> String`
 
 `struct State`
-> Fields: `helper: Option<String>`, `volume: Option<Listing>`, `kept: HashSet<PathBuf>`, `pending: HashSet<PathBuf>`, `unlisted: HashSet<PathBuf>`, `unusable: bool`, `used: bool`
+> Fields: `helper: Option<String>`, `volume: Option<Listing>`, `host: Option<Listing>`, `kept: HashSet<PathBuf>`, `pending: HashSet<PathBuf>`, `unlisted: HashSet<PathBuf>`, `unusable: bool`, `used: bool`
 
 **`impl State`**
   `fn new() -> Self`
@@ -4014,6 +4016,8 @@ wrkflw/
 `static WORKSPACES: LazyLock<Mutex<HashMap<PathBuf, Arc<VmWorkspace>>>> = LazyLock::new(|| Mutex::new(HashMap::new()))`
 
 `pub(crate) async fn before_step( runtime: &dyn ContainerRuntime, host: &Path, ) -> Result<Option<Arc<VmWorkspace>>, String>`
+
+`pub(crate) async fn after_cancelled_step(host: &Path) -> Result<(), String>`
 
 **`impl VmWorkspace`**
   `pub(crate) fn mount_in<'a>(&'a self, volumes: &mut [(&'a Path, &'a Path)])`
@@ -4042,7 +4046,7 @@ wrkflw/
 `struct SyncIn`
 > Fields: `delete: Vec<PathBuf>`, `send: Vec<PathBuf>`
 
-`fn plan_sync_in( host: &Listing, volume: &Listing, kept: &HashSet<PathBuf>, on_host: impl Fn(&Path) -> bool, ) -> SyncIn`
+`fn plan_sync_in( host: &Listing, volume: &Listing, before: Option<&Listing>, kept: &HashSet<PathBuf>, on_host: impl Fn(&Path) -> bool, ) -> SyncIn`
 
 `struct SyncOut`
 > Fields: `delete: Vec<PathBuf>`, `fetch: Vec<PathBuf>`

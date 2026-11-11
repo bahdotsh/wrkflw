@@ -1785,6 +1785,19 @@ async fn execute_native_docker_step(
     .with_exit_code(output.exit_code))
 }
 
+/// Copy back what a step that ran out of time wrote to the workspace
+/// volume. Its own copy back was cancelled with it, and the host-side work
+/// that follows, such as an artifact upload or a cache save, reads the host
+/// copy. The step has failed already, so a failed copy is a warning.
+async fn copy_back_after_timeout(working_dir: &Path) {
+    if let Err(e) = crate::vm_workspace::after_cancelled_step(working_dir).await {
+        wrkflw_logging::warning(&format!(
+            "The step ran out of time, and copying the workspace back after it failed: {}",
+            e
+        ));
+    }
+}
+
 /// Copy the workspace back after a step. A failed copy fails the step only
 /// when the step passed: a failed step's own exit code and output are what
 /// the user needs, so the copy's failure is a warning beside them.
@@ -3076,6 +3089,7 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
                     "Job '{}' exceeded timeout of {} minutes",
                     ctx.job_name, timeout_mins
                 );
+                copy_back_after_timeout(job_dir.path()).await;
                 loop_state.fail_step_on_timeout(step, idx, msg);
                 job_success = false;
                 break;
@@ -3496,6 +3510,7 @@ async fn execute_matrix_job(
                         "Job '{}' exceeded timeout of {} minutes",
                         matrix_job_name, timeout_mins
                     );
+                    copy_back_after_timeout(job_dir.path()).await;
                     loop_state.fail_step_on_timeout(step, idx, msg);
                     all_steps_ok = false;
                     break;
@@ -4068,9 +4083,13 @@ async fn run_step_with_guards(
     let step_result = if let Some(minutes) = step.timeout_minutes {
         let safe_mins = sanitize_timeout_minutes(Some(minutes), 360.0);
         let dur = std::time::Duration::from_secs_f64(safe_mins * 60.0);
+        let working_dir = step_exec_ctx.working_dir;
         match tokio::time::timeout(dur, execute_step(step_exec_ctx)).await {
             Ok(result) => result,
             Err(_) => {
+                // Later steps, such as an upload of this one's logs, read
+                // the workspace on this machine.
+                copy_back_after_timeout(working_dir).await;
                 wrkflw_logging::error(&format!(
                     "  Step '{}' exceeded timeout of {} minutes",
                     step_name, minutes

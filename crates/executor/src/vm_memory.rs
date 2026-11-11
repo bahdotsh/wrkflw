@@ -141,7 +141,7 @@ pub(crate) async fn job_slot(
         let changed = pool.measured.notified();
         tokio::pin!(changed);
         changed.as_mut().enable();
-        let measured = {
+        let reserve = {
             let job = job.to_string();
             let family = family.map(str::to_string);
             // The store is a file under a lock: not for the async runtime.
@@ -153,8 +153,15 @@ pub(crate) async fn job_slot(
         let place = pool
             .places
             .clone()
-            .acquire_many_owned(pool.weight(measured));
-        if measured.is_some() || family.is_none() {
+            .acquire_many_owned(pool.weight(reserve.map(|reserve| reserve.bytes)));
+        if let Some(reserve) = reserve {
+            let place = place.await.ok();
+            if reserve.by_matrix && place.is_some() {
+                crate::job_memory::sized_by_matrix(reserve.bytes);
+            }
+            return place;
+        }
+        if family.is_none() {
             return place.await.ok();
         }
         tokio::select! {
@@ -301,8 +308,9 @@ fn warning(memory: &Memory, limit: Option<usize>) -> String {
     let running = match limit {
         Some(limit) => format!(
             "Jobs not measured yet run at most {limit} at a time; a job measured on an \
-             earlier run sets aside what it used then, so light jobs run side by side. \
-             {way_out}, or set {MAX_PARALLEL_JOBS_ENV}"
+             earlier run sets aside what it used then, so light jobs run side by side, \
+             and a matrix leg not measured yet sets aside what its matrix's other legs \
+             used. {way_out}, or set {MAX_PARALLEL_JOBS_ENV}"
         ),
         None => format!(
             "Jobs run side by side as on GitHub. {way_out}, or set {MAX_PARALLEL_JOBS_ENV} to \
@@ -568,7 +576,7 @@ mod tests {
                 async {
                     let slot = job_slot(Some(first), Some(family)).await;
                     job_memory::measure_as(first);
-                    job_memory::in_family(family);
+                    job_memory::in_family(family, first);
                     assert!(job_memory::hold(slot).is_none(), "the meter holds it");
                     job_memory::meter().unwrap().sample("step", 600 * MIB);
                     finished.await.unwrap();

@@ -292,9 +292,34 @@ pub(crate) fn measure_as(id: &str) {
     }
 }
 
+/// Take a place in the run's pool for the leg `name` of a matrix, and keep
+/// it until [`metered`] has kept what the leg measured, so a sibling
+/// waiting for that place reads the measurement first.
+///
+/// The leg is sized by its own measurements under `id`, or, never measured,
+/// by those its matrix's legs keep under `family`. The place is returned
+/// only outside a metered job, for the caller to hold.
+pub(crate) async fn leg_place(
+    id: Option<&str>,
+    family: Option<&str>,
+    name: &str,
+) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    // Named first, so the run can say which leg its siblings sized.
+    if let Some(family) = family {
+        in_family(family, name);
+    }
+    let place = crate::vm_memory::job_slot(id, family).await;
+    // Only once it holds a place: a leg still waiting used no memory, so a
+    // kill meanwhile isn't its own.
+    if let Some(id) = id {
+        measure_as(id);
+    }
+    hold(place)
+}
+
 /// Say the current job is the leg `name` of the matrix `family`, so what it
 /// measures also sizes legs of that matrix never measured themselves.
-pub(crate) fn in_family(family: &str, name: &str) {
+fn in_family(family: &str, name: &str) {
     if let Some(meter) = meter() {
         *meter.leg.lock().unwrap_or_else(|e| e.into_inner()) = Some(Leg {
             family: family.to_string(),
@@ -325,7 +350,7 @@ pub(crate) fn sized_by_matrix(bytes: u64) {
 /// Keep the current job's place in the run's pool until [`metered`] has
 /// kept its measurements, so a job waiting for that place reads them
 /// first. Outside a metered job the place is handed back to hold.
-pub(crate) fn hold(
+fn hold(
     slot: Option<tokio::sync::OwnedSemaphorePermit>,
 ) -> Option<tokio::sync::OwnedSemaphorePermit> {
     match meter() {

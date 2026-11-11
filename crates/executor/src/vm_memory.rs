@@ -75,6 +75,13 @@ impl Pool {
         }
     }
 
+    /// Wait for the places a job takes, given the room it was measured to
+    /// need. Queued only once polled.
+    async fn place(&self, measured: Option<u64>) -> Option<OwnedSemaphorePermit> {
+        let weight = self.weight(measured);
+        self.places.clone().acquire_many_owned(weight).await.ok()
+    }
+
     /// The places a job takes, given the room it was measured to need.
     fn weight(&self, measured: Option<u64>) -> u32 {
         let (total, wanted) = match self.limit {
@@ -132,37 +139,36 @@ pub(crate) async fn job_slot(
 ) -> Option<OwnedSemaphorePermit> {
     let pool = POOL.try_with(|pool| pool.get().cloned().flatten()).ok()??;
     let (Limit::Memory { .. }, Some(job)) = (pool.limit, job) else {
-        let weight = pool.weight(None);
-        return pool.places.clone().acquire_many_owned(weight).await.ok();
+        return pool.place(None).await;
     };
+    match family {
+        Some(family) => leg_slot(&pool, job, family).await,
+        None => {
+            let reserve = reserve(job, None).await;
+            pool.place(reserve.map(|reserve| reserve.bytes)).await
+        }
+    }
+}
+
+/// The place of the leg `job` of the matrix `family`: by its own
+/// measurements, or, never measured, by its siblings'. With neither it waits
+/// as a job never measured, and looks again each time a sibling keeps its
+/// measurements.
+async fn leg_slot(pool: &Pool, job: &str, family: &str) -> Option<OwnedSemaphorePermit> {
     loop {
         // Listening before the store is read, so a measurement kept in
         // between isn't missed.
         let changed = pool.measured.notified();
         tokio::pin!(changed);
         changed.as_mut().enable();
-        let reserve = {
-            let job = job.to_string();
-            let family = family.map(str::to_string);
-            // The store is a file under a lock: not for the async runtime.
-            tokio::task::spawn_blocking(move || crate::job_memory::reserve(&job, family.as_deref()))
-                .await
-                .ok()
-                .flatten()
-        };
-        let place = pool
-            .places
-            .clone()
-            .acquire_many_owned(pool.weight(reserve.map(|reserve| reserve.bytes)));
+        let reserve = reserve(job, Some(family)).await;
+        let place = pool.place(reserve.map(|reserve| reserve.bytes));
         if let Some(reserve) = reserve {
-            let place = place.await.ok();
+            let place = place.await;
             if reserve.by_matrix && place.is_some() {
                 crate::job_memory::sized_by_matrix(reserve.bytes);
             }
             return place;
-        }
-        if family.is_none() {
-            return place.await.ok();
         }
         tokio::select! {
             // A place freed by the leg that was just measured comes with
@@ -174,9 +180,21 @@ pub(crate) async fn job_slot(
             // more of the run go at once than the place it gives up.
             biased;
             _ = &mut changed => {}
-            place = place => return place.ok(),
+            place = place => return place,
         }
     }
+}
+
+/// The room to set aside for `job`, a leg of `family` if any, from the
+/// store.
+async fn reserve(job: &str, family: Option<&str>) -> Option<crate::job_memory::Reserve> {
+    let job = job.to_string();
+    let family = family.map(str::to_string);
+    // The store is a file under a lock: not for the async runtime.
+    tokio::task::spawn_blocking(move || crate::job_memory::reserve(&job, family.as_deref()))
+        .await
+        .ok()
+        .flatten()
 }
 
 /// A job of this run kept its measurements: legs waiting unmeasured look
@@ -583,10 +601,8 @@ mod tests {
             let (finish, finished) = tokio::sync::oneshot::channel::<()>();
             let mut first_leg = Box::pin(job_memory::metered(
                 async {
-                    job_memory::in_family(family, first);
-                    let slot = job_slot(Some(first), Some(family)).await;
-                    job_memory::measure_as(first);
-                    assert!(job_memory::hold(slot).is_none(), "the meter holds it");
+                    let slot = job_memory::leg_place(Some(first), Some(family), first).await;
+                    assert!(slot.is_none(), "the meter holds it");
                     job_memory::meter().unwrap().sample("step", 600 * MIB);
                     held.send(()).unwrap();
                     finished.await.unwrap();

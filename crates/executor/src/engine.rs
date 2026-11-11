@@ -3433,19 +3433,13 @@ async fn execute_matrix_job(
     // Create the matrix-specific job name
     let matrix_job_name = wrkflw_matrix::format_combination_name(job_name, combination);
 
-    // One place in the run's pool for the leg, as for any job.
-    // A leg never measured is sized by the legs of its matrix that were,
-    // and named first, so the run can say which leg that is.
+    // One place in the run's pool for the leg, as for any job. A leg never
+    // measured is sized by the legs of its matrix that were.
     let memory_id = job_memory_id(&workflow.name, &matrix_job_name);
     let family = leg_family_memory_id(&workflow.name, job_name);
-    if let Some(family) = &family {
-        crate::job_memory::in_family(family, &matrix_job_name);
-    }
-    let slot = crate::vm_memory::job_slot(memory_id.as_deref(), family.as_deref()).await;
-    if let Some(id) = &memory_id {
-        crate::job_memory::measure_as(id);
-    }
-    let _slot = crate::job_memory::hold(slot);
+    let _slot =
+        crate::job_memory::leg_place(memory_id.as_deref(), family.as_deref(), &matrix_job_name)
+            .await;
 
     wrkflw_logging::info(&format!("Executing matrix job: {}", matrix_job_name));
 

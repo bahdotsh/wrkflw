@@ -58,6 +58,10 @@ const MIN_RESERVED_BYTES: u64 = 512 * MIB;
 /// Added to a measured peak, on top of half of it again.
 const HEADROOM_BYTES: u64 = 256 * MIB;
 
+/// Added to a job's highest peak when it is the floor under the estimate:
+/// an eighth of it, for a spike between samples taken a second apart.
+const FLOOR_MARGIN_DIVISOR: u64 = 8;
+
 /// Exit code of a process killed by SIGKILL, as the kernel's out-of-memory
 /// killer does.
 pub(crate) const SIGKILL_EXIT: i32 = 137;
@@ -306,15 +310,17 @@ pub(crate) fn job_id(identity: &str) -> String {
 /// floor under it: runs with warm caches can measure far less than the
 /// cold build a changed dependency brings back, and three of them in a row
 /// would otherwise let that build run beside others it no longer fits with.
-/// The floor is the peak as measured: the room to spare is for what recent
-/// runs may do next, and on top of a peak they are far below it only kept
-/// light jobs from running together.
+///
+/// The floor gets a smaller margin than recent runs do. Theirs is for what
+/// the job may do next; the floor's is only for a spike sampling missed,
+/// and the full headroom on a cold peak kept light jobs from running
+/// together.
 fn reserve_for(peaks: &[u64], highest: u64) -> Option<u64> {
     let peak = peaks.iter().copied().max()?;
     Some(
         peak.saturating_add(peak / 2)
             .saturating_add(HEADROOM_BYTES)
-            .max(highest)
+            .max(highest.saturating_add(highest / FLOOR_MARGIN_DIVISOR))
             .max(MIN_RESERVED_BYTES),
     )
 }
@@ -553,8 +559,8 @@ mod tests {
         assert_eq!(measured.peaks, vec![600 * MIB; 3]);
         assert_eq!(
             reserve_for(&measured.peaks, measured.highest),
-            Some(4096 * MIB),
-            "the floor is the cold peak itself"
+            Some(4096 * MIB + 512 * MIB),
+            "the floor is the cold peak and an eighth, not the full headroom"
         );
         // A floor the recent runs are close to doesn't replace their room.
         assert_eq!(

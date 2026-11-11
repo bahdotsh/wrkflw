@@ -62,6 +62,10 @@ const HEADROOM_BYTES: u64 = 256 * MIB;
 /// an eighth of it, for a spike between samples taken a second apart.
 const FLOOR_MARGIN_DIVISOR: u64 = 8;
 
+/// The least added to a job's highest peak as the floor's margin: an eighth
+/// of a small job's peak is less than a spike of a second can be.
+const FLOOR_MIN_MARGIN_BYTES: u64 = 128 * MIB;
+
 /// Exit code of a process killed by SIGKILL, as the kernel's out-of-memory
 /// killer does.
 pub(crate) const SIGKILL_EXIT: i32 = 137;
@@ -409,7 +413,10 @@ fn reserve_for(peaks: &[u64], highest: u64) -> Option<u64> {
     Some(
         peak.saturating_add(peak / 2)
             .saturating_add(HEADROOM_BYTES)
-            .max(highest.saturating_add(highest / FLOOR_MARGIN_DIVISOR))
+            .max(
+                highest
+                    .saturating_add((highest / FLOOR_MARGIN_DIVISOR).max(FLOOR_MIN_MARGIN_BYTES)),
+            )
             .max(MIN_RESERVED_BYTES),
     )
 }
@@ -725,6 +732,24 @@ mod tests {
         apply(&mut store, "job", Outcome::Killed, 1000);
         apply(&mut store, "job", Outcome::Peak(600 * MIB), 1000);
         assert_eq!(store.jobs["job"].highest, 600 * MIB);
+    }
+
+    #[test]
+    fn a_small_jobs_floor_keeps_a_margin_a_spike_could_need() {
+        // An eighth of 600 MiB is 75 MiB, less than a second's spike.
+        assert_eq!(
+            reserve_for(&[300 * MIB], 600 * MIB),
+            Some(600 * MIB + FLOOR_MIN_MARGIN_BYTES)
+        );
+        assert_eq!(
+            reserve_for(&[100 * MIB], 1024 * MIB),
+            Some(1024 * MIB + FLOOR_MIN_MARGIN_BYTES)
+        );
+        // From 1 GiB up an eighth is the larger.
+        assert_eq!(
+            reserve_for(&[100 * MIB], 2048 * MIB),
+            Some(2048 * MIB + 256 * MIB)
+        );
     }
 
     /// Keep `outcome` for the leg `id` of the matrix `legs`, which ran on its

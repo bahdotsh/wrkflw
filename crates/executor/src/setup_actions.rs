@@ -1120,10 +1120,23 @@ pub(crate) fn uv_python_request(version: &str) -> String {
 /// current LTS major, unless the base image already has one.
 pub(crate) const RUNNER_NODE_MAJOR: &str = "22";
 
+///
+/// Taken from nodejs.org's own build of the major's newest release, checked
+/// against its published checksum, and unpacked under `/usr/local`. The
+/// distribution's package took a second `apt-get update` and four times as
+/// long, on every first build of a job's image.
 pub(crate) fn runner_node_install() -> String {
+    let dist = format!("https://nodejs.org/dist/latest-v{}.x", RUNNER_NODE_MAJOR);
     format!(
-        "(command -v node >/dev/null 2>&1 || ({}))",
-        get_install_script("node", RUNNER_NODE_MAJOR)
+        "(command -v node >/dev/null 2>&1 || (\
+         arch=$(uname -m | sed 's/x86_64/x64/;s/aarch64/arm64/') && \
+         cd /tmp && curl -fsSLO {dist}/SHASUMS256.txt && \
+         file=$(grep -o \"node-v[0-9.]*-linux-$arch\\.tar\\.gz\" SHASUMS256.txt | head -n 1) && \
+         curl -fsSLO {dist}/$file && \
+         grep \" $file\\$\" SHASUMS256.txt > node.sum && sha256sum -c node.sum >/dev/null && \
+         tar -xzf $file -C /usr/local --strip-components=1 --no-same-owner \
+         --exclude='*/CHANGELOG.md' --exclude='*/LICENSE' --exclude='*/README.md' && \
+         rm -f $file SHASUMS256.txt node.sum && cd /))"
     )
 }
 

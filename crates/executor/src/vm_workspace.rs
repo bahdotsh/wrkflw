@@ -372,6 +372,7 @@ impl VmWorkspace {
     }
 
     fn sync_in_locked(&self, state: &mut State) -> io::Result<()> {
+        let started = Instant::now();
         let helper = self.helper(state)?;
         let volume = match state.volume.take() {
             Some(listing) => listing,
@@ -404,6 +405,13 @@ impl VmWorkspace {
         if !plan.send.is_empty() {
             self.send(&helper, &plan.send, &volume)?;
         }
+        wrkflw_logging::debug(&format!(
+            "Workspace copy in to {}: {} sent, {} deleted, {:.1}s",
+            self.volume,
+            plan.send.len(),
+            plan.delete.len(),
+            started.elapsed().as_secs_f64()
+        ));
         let mut volume = volume;
         for gone in &plan.delete {
             volume.retain(|path, _| !path.starts_with(gone));
@@ -454,6 +462,7 @@ impl VmWorkspace {
     }
 
     fn sync_out_locked(&self, state: &mut State) -> io::Result<()> {
+        let started = Instant::now();
         let helper = self.helper(state)?;
         let (volume, unlisted) = self.list_volume(&helper)?;
         state.unlisted = unlisted;
@@ -553,6 +562,13 @@ impl VmWorkspace {
         if state.kept_for_case != for_case_before {
             save_paths(case_file(&self.volume).as_deref(), &state.kept_for_case);
         }
+        wrkflw_logging::debug(&format!(
+            "Workspace copy back from {}: {} fetched, {} deleted, {:.1}s",
+            self.volume,
+            fetch.len(),
+            plan.delete.len(),
+            started.elapsed().as_secs_f64()
+        ));
         state.volume = Some(volume);
         // The host as this copy left it. An entry that differs from the
         // volume's here, such as a file that grew while it was copied, is

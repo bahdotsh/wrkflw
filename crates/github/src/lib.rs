@@ -517,16 +517,19 @@ pub async fn fetch_run(reference: &RunReference) -> Result<RemoteRun, GithubErro
     let token = tokio::task::spawn_blocking(api_token).await.ok().flatten();
     let client = http_client()?;
     let base = format!("/repos/{owner}/{repo}/actions/runs/{}", reference.id);
-    let run = api_get(&client, &base, token.as_deref()).await?;
+    let jobs_page = |page: usize| {
+        let path = format!("{base}/jobs?per_page=100&page={page}");
+        let (client, token) = (&client, token.as_deref());
+        async move { api_get(client, &path, token).await }
+    };
+    // The run and its first page of jobs together: neither needs the other,
+    // and the local run waits for both.
+    let (run, first_jobs) = tokio::join!(api_get(&client, &base, token.as_deref()), jobs_page(1));
+    let run = run?;
+    let mut listed = first_jobs?;
     let mut jobs = Vec::new();
     let mut page = 1;
     loop {
-        let listed = api_get(
-            &client,
-            &format!("{base}/jobs?per_page=100&page={page}"),
-            token.as_deref(),
-        )
-        .await?;
         let batch = listed["jobs"].as_array().cloned().unwrap_or_default();
         jobs.extend(batch.iter().map(|job| RemoteJob {
             name: job["name"].as_str().unwrap_or_default().to_string(),
@@ -537,6 +540,7 @@ pub async fn fetch_run(reference: &RunReference) -> Result<RemoteRun, GithubErro
             break;
         }
         page += 1;
+        listed = jobs_page(page).await?;
     }
     let text = |key: &str| run[key].as_str().map(str::to_string);
     // GitHub empties `pull_requests` once the pull request is merged or

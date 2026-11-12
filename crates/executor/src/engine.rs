@@ -2112,9 +2112,17 @@ fn report_action_not_run(uses: &str, cause: Option<&str>) -> Option<String> {
 ///
 /// Extracted as a pure function so the output can be unit-tested without Docker.
 /// `week` names the week floating versions are resolved in, when any is;
-/// it goes into the one `RUN` instruction, so a new week misses the build
-/// cache and installs the releases out then. A comment would change the
-/// image's tag but not its layers, which the builder would reuse.
+/// it goes into the first `RUN` instruction, so a new week misses the build
+/// cache there and in every layer after it, and installs the releases out
+/// then. A comment would change the image's tag but not its layers, which
+/// the builder would reuse.
+///
+/// The packages every image gets come first, in a `RUN` of their own, and
+/// each runtime follows in its own. The builder reuses a layer whose
+/// instruction and parent it has built before, so the legs of a matrix
+/// over Python versions install the packages, Node.js and uv once between
+/// them and differ only in the interpreter. In one `RUN`, each of nine
+/// legs spent a minute and 800 MB on the same packages.
 fn generate_combined_dockerfile(
     runtimes: &[SetupRuntime],
     base_image: &str,
@@ -2126,9 +2134,6 @@ fn generate_combined_dockerfile(
         dockerfile.push_str(&format!("# base image id: {}\n", id));
     }
 
-    // Combine base packages and all runtime install scripts into a single
-    // RUN directive so there is only one `apt-get update` call and the Docker
-    // layer cache works as a single unit.
     let scripts: Vec<&str> = runtimes
         .iter()
         .filter(|rt| !rt.install_script.is_empty())
@@ -2139,26 +2144,6 @@ fn generate_combined_dockerfile(
     // and Rust build scripts, node-gyp, Python C extensions and cgo all
     // expect one. `less` because they have a pager, which tests of CLI
     // tools run.
-    // uv keeps the interpreters it installs under `$HOME`, which is root's
-    // and closed to a step that runs as another user, and which a job that
-    // sets `HOME` moves. Somewhere fixed and readable serves every step.
-    let mut env: Vec<(String, String)> = Vec::new();
-    if runtimes.iter().any(|rt| rt.language == "python") {
-        env.push((
-            "UV_PYTHON_INSTALL_DIR".to_string(),
-            UV_PYTHON_DIR.to_string(),
-        ));
-    }
-    // What a setup action sets for the rest of the job, such as setup-uv's
-    // `UV_PYTHON`. Values were checked to be plain versions and paths.
-    for pair in runtimes.iter().flat_map(|rt| &rt.env) {
-        if !env.iter().any(|(name, _)| *name == pair.0) {
-            env.push(pair.clone());
-        }
-    }
-    for (name, value) in &env {
-        dockerfile.push_str(&format!("ENV {}={}\n", name, value));
-    }
     dockerfile.push_str("RUN ");
     if let Some(week) = week {
         dockerfile.push_str(&format!(
@@ -2179,13 +2164,38 @@ fn generate_combined_dockerfile(
         dockerfile.push_str(" && \\\n");
         dockerfile.push_str(&format!("    {}", runner_node_install()));
     }
+    dockerfile.push('\n');
 
-    for script in &scripts {
-        dockerfile.push_str(" && \\\n");
-        dockerfile.push_str(&format!("    {}", script));
+    // After the shared packages, so a variable that differs between the
+    // legs of a matrix, such as `UV_PYTHON`, doesn't give each leg packages
+    // of its own, and before the runtimes, whose installs read them.
+    // uv keeps the interpreters it installs under `$HOME`, which is root's
+    // and closed to a step that runs as another user, and which a job that
+    // sets `HOME` moves. Somewhere fixed and readable serves every step.
+    let mut env: Vec<(String, String)> = Vec::new();
+    if runtimes.iter().any(|rt| rt.language == "python") {
+        env.push((
+            "UV_PYTHON_INSTALL_DIR".to_string(),
+            UV_PYTHON_DIR.to_string(),
+        ));
+    }
+    // What a setup action sets for the rest of the job, such as setup-uv's
+    // `UV_PYTHON`. Values were checked to be plain versions and paths.
+    for pair in runtimes.iter().flat_map(|rt| &rt.env) {
+        if !env.iter().any(|(name, _)| *name == pair.0) {
+            env.push(pair.clone());
+        }
+    }
+    for (name, value) in &env {
+        dockerfile.push_str(&format!("ENV {}={}\n", name, value));
     }
 
-    dockerfile.push_str(" && \\\n    rm -rf /var/lib/apt/lists/*\n");
+    // The package lists stay until every runtime is in: several installs
+    // take packages of their own.
+    for script in &scripts {
+        dockerfile.push_str(&format!("RUN {}\n", script));
+    }
+    dockerfile.push_str("RUN rm -rf /var/lib/apt/lists/*\n");
 
     // Base images can bundle tools ahead of the system directories. The act
     // images do this with Node, which would shadow the version a setup action
@@ -2273,6 +2283,11 @@ fn combined_image_tag(runtimes: &[SetupRuntime], dockerfile: &str) -> String {
 static IMAGE_BUILD_LOCKS: Lazy<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
+/// Whether an image with these shared layers has been built in this run,
+/// by the text of the layers. See `shared_layers`.
+static SHARED_LAYER_BUILDS: Lazy<Mutex<HashMap<String, Arc<tokio::sync::Mutex<bool>>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
 ///
 /// Skips the build when an image with the same tag already exists locally,
 /// avoiding redundant work on repeated runs. When multiple parallel jobs need
@@ -2343,6 +2358,20 @@ async fn build_combined_runtime_image(
         return Ok(tag);
     }
 
+    // Images that start with the same packages build them once: the first
+    // build goes alone, and the others start when its layers are there to
+    // reuse. Started together, five BuildKit builds took 67 s to give the
+    // first image where one alone took 43 s.
+    let shared_lock = {
+        let mut locks = SHARED_LAYER_BUILDS.lock().unwrap();
+        locks
+            .entry(shared_layers(&dockerfile).to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(false)))
+            .clone()
+    };
+    let shared_built = shared_lock.lock().await;
+    let mut first_build = (!*shared_built).then_some(shared_built);
+
     let temp_dir = tempfile::tempdir().map_err(|e| {
         ExecutionError::Execution(format!("Failed to create temp directory: {}", e))
     })?;
@@ -2369,9 +2398,48 @@ async fn build_combined_runtime_image(
                 e
             ))
         })?;
+    if let Some(shared_built) = first_build.as_mut() {
+        **shared_built = true;
+    }
 
     Ok(tag)
 }
+
+/// The start of a combined image's Dockerfile, through its first `RUN`:
+/// the packages every image on the same base installs.
+fn shared_layers(dockerfile: &str) -> &str {
+    let Some(run) = dockerfile.find("\nRUN ") else {
+        return dockerfile;
+    };
+    let mut end = run + 1;
+    for line in dockerfile[end..].split_inclusive('\n') {
+        end += line.len();
+        if !line.trim_end().ends_with('\\') {
+            break;
+        }
+    }
+    &dockerfile[..end]
+}
+
+/// Builds images for jobs that haven't reached their turn while `work`
+/// runs, and stops when `work` is over. A job waits for room in the VM
+/// before its steps run, and used to start building its image only then:
+/// the build is done by the time its turn comes instead.
+async fn with_images_built_ahead<T>(
+    ahead: impl std::future::Future<Output = ()>,
+    work: impl std::future::Future<Output = T>,
+) -> T {
+    tokio::pin!(ahead);
+    tokio::pin!(work);
+    match future::select(work, ahead).await {
+        future::Either::Left((out, _)) => out,
+        future::Either::Right(((), work)) => work.await,
+    }
+}
+
+/// How many images are built ahead at once. A job whose turn has come
+/// builds its own whatever this is.
+const IMAGES_BUILT_AHEAD: usize = 4;
 
 /// Whether a build error is the connection to the engine failing rather
 /// than the build: the stream of build output ended early or was cut. The
@@ -2941,9 +3009,20 @@ async fn execute_job_with_matrix(
             verbose,
             services,
         };
-        let result = crate::job_memory::metered(
-            job_session::with_job_session(job, runtime, execute_job(ctx)),
-            job_passed,
+        // The job's image, built while it waits for room in the VM. The
+        // job reports the image's failure itself when its turn comes.
+        let image_ahead = async {
+            if job.uses.is_none() {
+                let _ =
+                    resolve_runner_image(job, &job.steps, runtime, platform_overrides, None).await;
+            }
+        };
+        let result = with_images_built_ahead(
+            image_ahead,
+            crate::job_memory::metered(
+                job_session::with_job_session(job, runtime, execute_job(ctx)),
+                job_passed,
+            ),
         )
         .await?;
         let results = vec![result];
@@ -3294,80 +3373,106 @@ async fn execute_matrix_combinations(
         ));
     }
 
-    // Process combinations in chunks limited by max_parallel
-    for chunk in unique.chunks(ctx.max_parallel) {
-        // Skip processing if fail-fast is enabled and a previous job failed
-        if ctx.fail_fast && any_failed {
-            // Add skipped results for remaining combinations
-            for combination in chunk {
-                let combination_name =
-                    wrkflw_matrix::format_combination_name(ctx.job_name, combination);
-                results.push(JobResult::announced(JobResult::skipped(
-                    combination_name,
-                    ctx.job_name,
-                    "Job skipped due to previous matrix job failure",
-                )));
-            }
-            continue;
-        }
-
-        // Process this chunk of combinations in parallel
-        let chunk_futures = chunk.iter().map(|combination| {
-            crate::job_memory::metered(
-                job_session::with_job_session(
-                    ctx.job_template,
-                    ctx.runtime,
-                    execute_matrix_job(
-                        ctx.job_name,
-                        ctx.job_template,
-                        combination,
-                        ctx.workflow,
-                        ctx.runtime,
-                        ctx.env_context,
-                        ctx.user_env,
-                        ctx.verbose,
-                        &ctx.services,
-                    ),
-                ),
-                job_passed,
+    // Each leg's image, built while earlier legs hold the VM.
+    let images_ahead = async {
+        use futures::StreamExt;
+        futures::stream::iter(unique.iter().map(|combination| async move {
+            let steps = crate::substitution::apply_matrix_to_steps(
+                &ctx.job_template.steps,
+                &combination.values,
+            );
+            // A leg reports its own image's failure when its turn comes.
+            let _ = resolve_runner_image(
+                ctx.job_template,
+                &steps,
+                ctx.runtime,
+                ctx.services.platform_overrides,
+                Some(&combination.values),
             )
-        });
-
-        let chunk_results = future::join_all(chunk_futures).await;
-
-        // Process results from this chunk
-        for (combination, result) in chunk.iter().zip(chunk_results) {
-            match result {
-                Ok(job_result) => {
-                    if job_result.fails_run() {
-                        any_failed = true;
-                    }
-                    results.push(job_result);
+            .await;
+        }))
+        .buffer_unordered(IMAGES_BUILT_AHEAD)
+        .collect::<()>()
+        .await
+    };
+    let legs = async {
+        // Process combinations in chunks limited by max_parallel
+        for chunk in unique.chunks(ctx.max_parallel) {
+            // Skip processing if fail-fast is enabled and a previous job failed
+            if ctx.fail_fast && any_failed {
+                // Add skipped results for remaining combinations
+                for combination in chunk {
+                    let combination_name =
+                        wrkflw_matrix::format_combination_name(ctx.job_name, combination);
+                    results.push(JobResult::announced(JobResult::skipped(
+                        combination_name,
+                        ctx.job_name,
+                        "Job skipped due to previous matrix job failure",
+                    )));
                 }
-                Err(e) => {
-                    // On error, mark as failed and continue if not fail-fast
-                    any_failed = true;
-                    wrkflw_logging::error(&format!("Matrix job failed: {}", e));
+                continue;
+            }
 
-                    if ctx.fail_fast {
-                        return Err(e);
+            // Process this chunk of combinations in parallel
+            let chunk_futures = chunk.iter().map(|combination| {
+                crate::job_memory::metered(
+                    job_session::with_job_session(
+                        ctx.job_template,
+                        ctx.runtime,
+                        execute_matrix_job(
+                            ctx.job_name,
+                            ctx.job_template,
+                            combination,
+                            ctx.workflow,
+                            ctx.runtime,
+                            ctx.env_context,
+                            ctx.user_env,
+                            ctx.verbose,
+                            &ctx.services,
+                        ),
+                    ),
+                    job_passed,
+                )
+            });
+
+            let chunk_results = future::join_all(chunk_futures).await;
+
+            // Process results from this chunk
+            for (combination, result) in chunk.iter().zip(chunk_results) {
+                match result {
+                    Ok(job_result) => {
+                        if job_result.fails_run() {
+                            any_failed = true;
+                        }
+                        results.push(job_result);
                     }
-                    // Record the combination as failed so the job's aggregate
-                    // `needs.<id>.result` reflects it.
-                    results.push(JobResult {
-                        name: wrkflw_matrix::format_combination_name(ctx.job_name, combination),
-                        canonical_name: ctx.job_name.to_string(),
-                        status: JobStatus::Failure,
-                        steps: Vec::new(),
-                        logs: e.to_string(),
-                        outputs: HashMap::new(),
-                        failure_allowed: false,
-                        repeated_from: None,
-                    });
+                    Err(e) => {
+                        // On error, mark as failed and continue if not fail-fast
+                        any_failed = true;
+                        wrkflw_logging::error(&format!("Matrix job failed: {}", e));
+
+                        if ctx.fail_fast {
+                            return Err(e);
+                        }
+                        // Record the combination as failed so the job's aggregate
+                        // `needs.<id>.result` reflects it.
+                        results.push(JobResult {
+                            name: wrkflw_matrix::format_combination_name(ctx.job_name, combination),
+                            canonical_name: ctx.job_name.to_string(),
+                            status: JobStatus::Failure,
+                            steps: Vec::new(),
+                            logs: e.to_string(),
+                            outputs: HashMap::new(),
+                            failure_allowed: false,
+                            repeated_from: None,
+                        });
+                    }
                 }
             }
         }
-    }
+        Ok(())
+    };
+    with_images_built_ahead(images_ahead, legs).await?;
 
     if repeats == 0 {
         return Ok(results);
@@ -5286,6 +5391,9 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                     }
 
                     let mut action_not_run: Option<String> = None;
+                    // Set when the step only prints a line: no container
+                    // is started for that.
+                    let mut printed_only: Option<String> = None;
                     // A `docker://` action ran natively above, so none
                     // reaches here.
                     if action_info.is_local {
@@ -5296,6 +5404,7 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                         cmd.push("sh");
                         cmd.push("-c");
                         cmd.push("echo 'Local action not run'");
+                        printed_only = Some("Local action not run".to_string());
                         action_not_run = report_action_not_run(uses, Some(NO_IMPLEMENTATION));
                     } else {
                         // For GitHub actions, check if we have special handling
@@ -5449,6 +5558,7 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                                 format!("echo 'Would execute GitHub action: {}'", escaped_uses);
                             owned_strings.push(echo_msg);
                             cmd.push(owned_strings.last().unwrap());
+                            printed_only = Some(format!("Would execute GitHub action: {}", uses));
 
                             // The step passes, but nothing the action does
                             // happens. Say so here, and in the run's verdict.
@@ -5463,39 +5573,52 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                         }
                     }
 
-                    let container_workspace = Path::new(environment::CONTAINER_WORKSPACE);
-                    let mount_ctx = prepare_step_container_context(
-                        &mut step_env,
-                        ctx.job_env,
-                        ctx.container_config,
-                        ctx.runtime.mounts_are_copies(),
-                    );
-                    let vm_workspace =
-                        crate::vm_workspace::before_step(ctx.runtime, ctx.working_dir)
-                            .await
-                            .map_err(ExecutionError::Runtime)?;
-                    let mut volumes = mount_ctx.build_volumes(ctx.working_dir, container_workspace);
-                    if let Some(vm) = &vm_workspace {
-                        vm.mount_in(&mut volumes);
-                    }
-                    let env_vars: Vec<(&str, &str)> = step_env
-                        .iter()
-                        .map(|(k, v)| (k.as_str(), v.as_str()))
-                        .collect();
+                    // A step that only prints a line, as a setup action
+                    // whose work was done when the job's image was built
+                    // does, needs no container: starting one, and copying
+                    // the workspace to it and back, took seconds per step.
+                    let output = if let Some(line) = printed_only {
+                        wrkflw_runtime::container::ContainerOutput {
+                            stdout: format!("{}\n", line),
+                            stderr: String::new(),
+                            exit_code: 0,
+                        }
+                    } else {
+                        let container_workspace = Path::new(environment::CONTAINER_WORKSPACE);
+                        let mount_ctx = prepare_step_container_context(
+                            &mut step_env,
+                            ctx.job_env,
+                            ctx.container_config,
+                            ctx.runtime.mounts_are_copies(),
+                        );
+                        let vm_workspace =
+                            crate::vm_workspace::before_step(ctx.runtime, ctx.working_dir)
+                                .await
+                                .map_err(ExecutionError::Runtime)?;
+                        let mut volumes =
+                            mount_ctx.build_volumes(ctx.working_dir, container_workspace);
+                        if let Some(vm) = &vm_workspace {
+                            vm.mount_in(&mut volumes);
+                        }
+                        let env_vars: Vec<(&str, &str)> = step_env
+                            .iter()
+                            .map(|(k, v)| (k.as_str(), v.as_str()))
+                            .collect();
 
-                    let output = ctx
-                        .runtime
-                        .run_container(
-                            &image,
-                            &cmd.to_vec(),
-                            &env_vars,
-                            container_workspace,
-                            &volumes,
-                            None,
-                        )
-                        .await;
-                    sync_workspace_back(vm_workspace.as_ref(), &output).await?;
-                    let output = output.map_err(|e| ExecutionError::Runtime(format!("{}", e)))?;
+                        let output = ctx
+                            .runtime
+                            .run_container(
+                                &image,
+                                &cmd.to_vec(),
+                                &env_vars,
+                                container_workspace,
+                                &volumes,
+                                None,
+                            )
+                            .await;
+                        sync_workspace_back(vm_workspace.as_ref(), &output).await?;
+                        output.map_err(|e| ExecutionError::Runtime(format!("{}", e)))?
+                    };
 
                     // Build verbose output for GitHub actions when applicable
                     let output_text = if ctx.verbose
@@ -9715,6 +9838,100 @@ runs:
         assert_eq!(result.actions_not_run, ["actions/setup-node"]);
     }
 
+    /// A setup action whose runtime is in the job's image has nothing left
+    /// to do, so its step starts no container: each one cost seconds, and a
+    /// copy of the workspace both ways.
+    #[tokio::test]
+    async fn a_step_that_only_prints_a_line_starts_no_container() {
+        action_resolver::seed_cache_for_test(
+            "actions/setup-node",
+            "main",
+            "name: x\nruns:\n  using: node20\n  main: index.js\n",
+        )
+        .await;
+        let runtime = MockContainerRuntime::default();
+        let workflow = minimal_workflow();
+        let mut job_env = HashMap::new();
+        job_env.insert(
+            "WRKFLW_RUNTIME_MODE".to_string(),
+            RuntimeType::Docker.mode_name().to_string(),
+        );
+        let working_dir = std::env::current_dir().unwrap();
+        let step = make_step("the step", "actions/setup-node", None, HashMap::new());
+        let ctx = StepExecutionContext {
+            step: &step,
+            step_idx: 0,
+            job_env: &job_env,
+            job_user_env: &job_env,
+            working_dir: &working_dir,
+            runtime: &runtime,
+            workflow: &workflow,
+            runner_image: "ubuntu:latest",
+            installed_runtimes: &BuiltRuntimes {
+                installed: vec!["node".to_string()],
+                not_built: Vec::new(),
+                ..BuiltRuntimes::default()
+            },
+            verbose: false,
+            matrix_combination: &None,
+            container_config: None,
+            workflow_defaults: None,
+            job_defaults: None,
+            step_outputs: &HashMap::new(),
+            step_statuses: &HashMap::new(),
+            job_status: "success",
+            services: test_services(),
+            pending_cache_saves: &TEST_PENDING_CACHE_SAVES,
+        };
+
+        let result = execute_step(ctx).await.unwrap();
+        assert_eq!(result.status, StepStatus::Success);
+        assert!(result.actions_not_run.is_empty(), "{result:?}");
+        assert!(
+            result
+                .output
+                .contains("Would execute GitHub action: actions/setup-node"),
+            "{}",
+            result.output
+        );
+        assert!(runtime.run_calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_shared_layers_end_with_the_first_run() {
+        let python = |version: &str| {
+            let runtimes = vec![SetupRuntime {
+                language: "python".to_string(),
+                version: version.to_string(),
+                install_script: get_install_script("python", version),
+                floating: false,
+                env: Vec::new(),
+            }];
+            generate_combined_dockerfile(&runtimes, "ubuntu:latest", Some("sha256:abc"), None)
+        };
+        let (one, other) = (python("3.12"), python("3.13"));
+        let shared = shared_layers(&one);
+        assert_eq!(shared, shared_layers(&other));
+        assert!(shared.starts_with("FROM ubuntu:latest\n"), "{shared}");
+        // The whole instruction, continuation lines included, and no more.
+        assert_eq!(shared.matches("RUN ").count(), 1, "{shared}");
+        assert!(shared.contains("build-essential"), "{shared}");
+        assert!(shared.ends_with("cd /))\n"), "{shared}");
+        assert!(!shared.contains("uv python install"), "{shared}");
+        // Without a `RUN`, everything is shared.
+        assert_eq!(shared_layers("FROM scratch\n"), "FROM scratch\n");
+    }
+
+    #[test]
+    fn the_runners_node_is_checked_against_its_published_checksum() {
+        let install = runner_node_install();
+        assert!(install.starts_with("(command -v node >/dev/null 2>&1 || ("));
+        assert!(install.contains("https://nodejs.org/dist/latest-v22.x/SHASUMS256.txt"));
+        assert!(install.contains("sha256sum -c node.sum"), "{install}");
+        // One line: it is appended to the shared packages' `RUN`.
+        assert!(!install.contains('\n'), "{install}");
+    }
+
     // --- NativeDocker execute_step integration tests ---
 
     #[tokio::test]
@@ -10551,8 +10768,8 @@ runs:
         let df = generate_combined_dockerfile(&runtimes, "ubuntu:latest", None, None);
         assert!(df.starts_with("FROM ubuntu:latest\n"));
         assert!(df.contains("nodesource"));
-        // Everything in a single RUN layer
-        assert_eq!(df.matches("RUN ").count(), 1);
+        // The shared packages, the runtime, and the package lists' removal.
+        assert_eq!(df.matches("RUN ").count(), 3);
     }
 
     #[test]
@@ -10570,7 +10787,7 @@ runs:
     }
 
     #[test]
-    fn generate_combined_dockerfile_multi_runtime_single_run() {
+    fn generate_combined_dockerfile_gives_each_runtime_a_layer() {
         let runtimes = vec![
             SetupRuntime {
                 language: "node".to_string(),
@@ -10588,10 +10805,47 @@ runs:
             },
         ];
         let df = generate_combined_dockerfile(&runtimes, "ubuntu:latest", None, None);
-        // Everything in a single RUN layer
-        assert_eq!(df.matches("RUN ").count(), 1);
+        assert_eq!(df.matches("RUN ").count(), 4);
         assert!(df.contains("nodesource"));
         assert!(df.contains("uv python install '3.12'"));
+        // Lists are removed last: both installs take packages of their own.
+        assert!(df.contains("\nRUN rm -rf /var/lib/apt/lists/*\nENV PATH="));
+    }
+
+    #[test]
+    fn legs_of_a_python_matrix_share_every_layer_but_the_interpreter() {
+        let leg = |python: &str| {
+            let uv = make_step_uses("astral-sh/setup-uv@v9", None);
+            let with = HashMap::from([("python-version".to_string(), python.to_string())]);
+            let python = make_step_uses("actions/setup-python@v5", Some(with));
+            generate_combined_dockerfile(
+                &detect_setup_runtimes(&[uv, python]),
+                "ubuntu:latest",
+                Some("sha256:aaa"),
+                Some("2026-W46"),
+            )
+        };
+        let (one, other) = (leg("3.12"), leg("3.13"));
+        let (one, other): (Vec<&str>, Vec<&str>) = (one.lines().collect(), other.lines().collect());
+        let differ = one.iter().zip(&other).position(|(a, b)| a != b).unwrap();
+        // The builder reuses a layer only under the same parent, so what
+        // differs has to come after everything the legs have in common.
+        assert!(one[differ].contains("uv python install '3.12'"), "{one:?}");
+        let shared = one[..differ].join("\n");
+        for expected in [
+            "build-essential",
+            "nodejs.org/dist/latest-v22.x",
+            "astral.sh/uv/install.sh",
+        ] {
+            assert!(shared.contains(expected), "{shared}");
+        }
+        assert!(
+            one[..differ]
+                .iter()
+                .filter(|l| l.starts_with("RUN "))
+                .count()
+                >= 2
+        );
     }
 
     #[test]
@@ -11275,10 +11529,10 @@ runs:
         assert!(df.contains("build-essential less"), "{df}");
         assert!(df.contains("command -v node"), "{df}");
         assert!(
-            df.contains(&format!("setup_{}.x", RUNNER_NODE_MAJOR)),
+            df.contains(&format!("nodejs.org/dist/latest-v{}.x", RUNNER_NODE_MAJOR)),
             "{df}"
         );
-        assert_eq!(df.matches("RUN ").count(), 1);
+        assert_eq!(df.matches("RUN ").count(), 3);
 
         // setup-node's own version is the only Node then.
         let node = vec![SetupRuntime {
@@ -11368,8 +11622,9 @@ runs:
         let fixed = detected("actions/setup-python@v5", "python-version", "3.12");
         assert_eq!(floating_versions_week(&fixed, monday), None);
 
-        // The week is part of the one RUN instruction, the builder's cache
-        // key, not a comment beside it that the cache ignores.
+        // The week is part of the first RUN instruction, the builder's
+        // cache key for it and for every layer built on it, not a comment
+        // beside it that the cache ignores.
         let week = floating_versions_week(&floating, monday);
         let dockerfile =
             generate_combined_dockerfile(&floating, "ubuntu:latest", None, week.as_deref());
@@ -11379,7 +11634,7 @@ runs:
             .unwrap();
         assert!(run.contains("2026-W46"), "{dockerfile}");
         assert!(!dockerfile.contains("# floating"), "{dockerfile}");
-        assert_eq!(dockerfile.matches("RUN ").count(), 1);
+        assert_eq!(dockerfile.matches("2026-W46").count(), 1);
     }
 
     #[test]
@@ -11518,7 +11773,7 @@ runs:
             combined_image_tag(&runtimes, &after)
         );
         // A comment doesn't change what gets built.
-        assert_eq!(before.matches("RUN ").count(), 1);
+        assert_eq!(before.matches("RUN ").count(), 3);
     }
 
     #[test]
@@ -11531,8 +11786,8 @@ runs:
             env: Vec::new(),
         }];
         let df = generate_combined_dockerfile(&runtimes, "ubuntu:latest", None, None);
-        // Single RUN layer with just the base packages
-        assert_eq!(df.matches("RUN ").count(), 1);
+        // The base packages, and the package lists' removal.
+        assert_eq!(df.matches("RUN ").count(), 2);
     }
 
     #[test]

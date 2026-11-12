@@ -1456,6 +1456,24 @@ impl DockerRuntime {
             )));
         }
 
+        // A job's runtime image is built by BuildKit where the `docker`
+        // CLI has it. If that doesn't produce the image, for whatever
+        // reason, the build below runs and reports as it always did.
+        if tag.starts_with(COMBINED_IMAGE_PREFIX) && builds_with_buildkit().await {
+            match build_with_buildkit(dockerfile, tag, context_dir).await {
+                Ok(()) if self.image_exists(tag).await.unwrap_or(false) => return Ok(()),
+                Ok(()) => wrkflw_logging::debug(&format!(
+                    "BuildKit built {} somewhere this engine can't see; building it again \
+                     through the engine",
+                    tag
+                )),
+                Err(e) => wrkflw_logging::debug(&format!(
+                    "BuildKit couldn't build {}, so the engine's own builder is tried: {}",
+                    tag, e
+                )),
+            }
+        }
+
         // Determine the Dockerfile path relative to the context directory.
         let dockerfile_name = dockerfile
             .strip_prefix(context_dir)
@@ -1595,6 +1613,83 @@ impl DockerRuntime {
     }
 }
 
+/// Chooses the builder for a job's runtime image: `classic` keeps to the
+/// engine's own builder.
+const IMAGE_BUILDER_ENV: &str = "WRKFLW_IMAGE_BUILDER";
+
+fn buildkit_wanted(setting: Option<&str>) -> bool {
+    setting.map(str::trim) != Some("classic")
+}
+
+/// Whether a job's runtime image is built with BuildKit.
+async fn builds_with_buildkit() -> bool {
+    buildkit_wanted(std::env::var(IMAGE_BUILDER_ENV).ok().as_deref()) && buildkit_available().await
+}
+
+/// Whether the `docker` CLI can build with BuildKit, asked once a run.
+async fn buildkit_available() -> bool {
+    static AVAILABLE: tokio::sync::OnceCell<bool> = tokio::sync::OnceCell::const_new();
+    *AVAILABLE
+        .get_or_init(|| async {
+            tokio::process::Command::new("docker")
+                .args(["buildx", "version"])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .await
+                .map(|status| status.success())
+                .unwrap_or(false)
+        })
+        .await
+}
+
+/// Build `tag` with BuildKit through the `docker` CLI.
+///
+/// The engine's own builder, which the API reaches, saves a layer after
+/// every instruction: on a runtime image that took about as long as the
+/// installs themselves, and ten seconds for an image that only adds an
+/// interpreter to layers it already had. BuildKit saves once, at the end,
+/// and builds that share a step run it once between them.
+async fn build_with_buildkit(
+    dockerfile: &Path,
+    tag: &str,
+    context_dir: &Path,
+) -> Result<(), String> {
+    let output = tokio::process::Command::new("docker")
+        .args([
+            "buildx",
+            "build",
+            "--progress=plain",
+            "--provenance=false",
+            "--load",
+            "-t",
+            tag,
+            "-f",
+        ])
+        .arg(dockerfile)
+        .arg(context_dir)
+        .stdin(std::process::Stdio::null())
+        // The build is given up with its future, as on a timeout.
+        .kill_on_drop(true)
+        .output()
+        .await
+        .map_err(|e| format!("`docker buildx build` didn't start: {}", e))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let lines: Vec<&str> = stderr
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    let tail = lines[lines.len().saturating_sub(20)..].join("\n");
+    Err(format!(
+        "`docker buildx build` failed ({}):\n{}",
+        output.status, tail
+    ))
+}
+
 // Public accessor functions for testing
 #[cfg(test)]
 pub fn get_tracked_containers() -> Vec<String> {
@@ -1617,6 +1712,13 @@ pub fn get_tracked_networks() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::wait_exit_code;
+
+    #[test]
+    fn the_engines_builder_can_be_asked_for() {
+        assert!(super::buildkit_wanted(None));
+        assert!(super::buildkit_wanted(Some("buildkit")));
+        assert!(!super::buildkit_wanted(Some(" classic ")));
+    }
     use bollard::errors::Error;
     use bollard::models::ContainerWaitResponse;
 

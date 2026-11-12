@@ -1162,8 +1162,9 @@ impl DockerRuntime {
             || image.contains("nanoserver");
 
         // Create appropriate container options based on platform
+        let container_name = format!("wrkflw-{}", uuid::Uuid::new_v4());
         let options = Some(CreateContainerOptions {
-            name: format!("wrkflw-{}", uuid::Uuid::new_v4()),
+            name: container_name.clone(),
             platform: if is_windows_image {
                 Some("windows".to_string())
             } else {
@@ -1195,9 +1196,8 @@ impl DockerRuntime {
             entrypoint,
         );
 
-        // Create container with a shorter timeout
         let create_result = tokio::time::timeout(
-            std::time::Duration::from_secs(15),
+            ENGINE_ANSWER_LIMIT,
             self.docker.create_container(options, config),
         )
         .await;
@@ -1206,9 +1206,20 @@ impl DockerRuntime {
             Ok(Ok(container)) => container,
             Ok(Err(e)) => return Err(ContainerError::ContainerStart(e.to_string())),
             Err(_) => {
+                // The engine may still create it after this gives up, and
+                // nothing else knows its name to remove it.
+                let docker = self.docker.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(ENGINE_ANSWER_LIMIT).await;
+                    let force = bollard::container::RemoveContainerOptions {
+                        force: true,
+                        ..Default::default()
+                    };
+                    let _ = docker.remove_container(&container_name, Some(force)).await;
+                });
                 return Err(ContainerError::ContainerStart(
                     "Container creation timed out".to_string(),
-                ))
+                ));
             }
         };
 
@@ -1223,7 +1234,7 @@ impl DockerRuntime {
 
         // Start container with a timeout
         let start_result = tokio::time::timeout(
-            std::time::Duration::from_secs(15),
+            ENGINE_ANSWER_LIMIT,
             self.docker.start_container::<String>(&container.id, None),
         )
         .await;
@@ -1612,6 +1623,13 @@ impl DockerRuntime {
         Ok(())
     }
 }
+
+/// How long the engine gets to create or start a step's container. It
+/// answers in well under a second when idle, but an engine that is saving
+/// freshly built images took more than 15 seconds to create one, and the
+/// step failed for it. Slow is not stuck: the step's own time limit still
+/// holds.
+const ENGINE_ANSWER_LIMIT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// Chooses the builder for a job's runtime image: `classic` keeps to the
 /// engine's own builder.

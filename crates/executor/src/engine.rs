@@ -2437,9 +2437,28 @@ async fn with_images_built_ahead<T>(
     }
 }
 
-/// How many images are built ahead at once. A job whose turn has come
-/// builds its own whatever this is.
+/// How many images are built ahead at once, across every job of the run:
+/// a workflow of twenty jobs would otherwise start twenty builds, and an
+/// engine that busy is slow to start the steps of the jobs running. A job
+/// whose turn has come builds its own whatever this is.
 const IMAGES_BUILT_AHEAD: usize = 4;
+
+static AHEAD_BUILDS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(IMAGES_BUILT_AHEAD);
+
+/// Build the image of a job that waits for its turn. The job reports its
+/// image's failure itself when its turn comes, so the result is dropped.
+async fn build_image_ahead(
+    job: &Job,
+    steps: &[Step],
+    runtime: &dyn ContainerRuntime,
+    platform_overrides: &HashMap<String, String>,
+    matrix: Option<&HashMap<String, Value>>,
+) {
+    let Ok(_permit) = AHEAD_BUILDS.acquire().await else {
+        return;
+    };
+    let _ = resolve_runner_image(job, steps, runtime, platform_overrides, matrix).await;
+}
 
 /// Whether a build error is the connection to the engine failing rather
 /// than the build: the stream of build output ended early or was cut. The
@@ -3009,12 +3028,10 @@ async fn execute_job_with_matrix(
             verbose,
             services,
         };
-        // The job's image, built while it waits for room in the VM. The
-        // job reports the image's failure itself when its turn comes.
+        // The job's image, built while it waits for room in the VM.
         let image_ahead = async {
             if job.uses.is_none() {
-                let _ =
-                    resolve_runner_image(job, &job.steps, runtime, platform_overrides, None).await;
+                build_image_ahead(job, &job.steps, runtime, platform_overrides, None).await;
             }
         };
         let result = with_images_built_ahead(
@@ -3381,8 +3398,7 @@ async fn execute_matrix_combinations(
                 &ctx.job_template.steps,
                 &combination.values,
             );
-            // A leg reports its own image's failure when its turn comes.
-            let _ = resolve_runner_image(
+            build_image_ahead(
                 ctx.job_template,
                 &steps,
                 ctx.runtime,

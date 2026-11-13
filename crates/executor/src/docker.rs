@@ -1206,8 +1206,12 @@ impl DockerRuntime {
             Ok(Ok(container)) => container,
             Ok(Err(e)) => return Err(ContainerError::ContainerStart(e.to_string())),
             Err(_) => {
-                // The engine may still create it after this gives up, and
-                // nothing else knows its name to remove it.
+                // The engine may still create it after this gives up. It is
+                // tracked by name, which the engine takes where it takes an
+                // id, so the cleanup at the end of the run removes it; a
+                // process that lives on removes it once the engine has had
+                // time to finish creating it.
+                track_container(&container_name);
                 let docker = self.docker.clone();
                 tokio::spawn(async move {
                     tokio::time::sleep(ENGINE_ANSWER_LIMIT).await;
@@ -1215,7 +1219,15 @@ impl DockerRuntime {
                         force: true,
                         ..Default::default()
                     };
-                    let _ = docker.remove_container(&container_name, Some(force)).await;
+                    // Removed, or never created: nothing is left to clean up.
+                    match docker.remove_container(&container_name, Some(force)).await {
+                        Ok(())
+                        | Err(bollard::errors::Error::DockerResponseServerError {
+                            status_code: 404,
+                            ..
+                        }) => untrack_container(&container_name),
+                        Err(_) => {}
+                    }
                 });
                 return Err(ContainerError::ContainerStart(
                     "Container creation timed out".to_string(),
@@ -1473,11 +1485,21 @@ impl DockerRuntime {
         if tag.starts_with(COMBINED_IMAGE_PREFIX) && builds_with_buildkit().await {
             match build_with_buildkit(dockerfile, tag, context_dir).await {
                 Ok(()) if self.image_exists(tag).await.unwrap_or(false) => return Ok(()),
-                Ok(()) => wrkflw_logging::debug(&format!(
-                    "BuildKit built {} somewhere this engine can't see; building it again \
-                     through the engine",
-                    tag
-                )),
+                Ok(()) => {
+                    // The `docker` CLI talks to another engine than this
+                    // one, as with a context that isn't the default socket.
+                    // Every BuildKit build would be done twice, so the rest
+                    // go to the engine's own builder.
+                    if !BUILDKIT_IMAGES_UNSEEN.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        wrkflw_logging::warning(&format!(
+                            "BuildKit built {} where this engine can't see it, as when the \
+                             `docker` CLI uses another context; job images are built by the \
+                             engine's own builder from now on, which is slower. Point the \
+                             CLI at the same engine, or set {}=classic to skip BuildKit",
+                            tag, IMAGE_BUILDER_ENV
+                        ));
+                    }
+                }
                 Err(e) => wrkflw_logging::debug(&format!(
                     "BuildKit couldn't build {}, so the engine's own builder is tried: {}",
                     tag, e
@@ -1639,9 +1661,16 @@ fn buildkit_wanted(setting: Option<&str>) -> bool {
     setting.map(str::trim) != Some("classic")
 }
 
+/// Set once BuildKit built an image this engine couldn't find: the `docker`
+/// CLI uses another engine, and BuildKit isn't used again in this process.
+static BUILDKIT_IMAGES_UNSEEN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Whether a job's runtime image is built with BuildKit.
 async fn builds_with_buildkit() -> bool {
-    buildkit_wanted(std::env::var(IMAGE_BUILDER_ENV).ok().as_deref()) && buildkit_available().await
+    buildkit_wanted(std::env::var(IMAGE_BUILDER_ENV).ok().as_deref())
+        && !BUILDKIT_IMAGES_UNSEEN.load(std::sync::atomic::Ordering::Relaxed)
+        && buildkit_available().await
 }
 
 /// Whether the `docker` CLI can build with BuildKit, asked once a run.
@@ -1730,6 +1759,8 @@ pub fn get_tracked_networks() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::wait_exit_code;
+    use bollard::errors::Error;
+    use bollard::models::ContainerWaitResponse;
 
     #[test]
     fn the_engines_builder_can_be_asked_for() {
@@ -1737,8 +1768,6 @@ mod tests {
         assert!(super::buildkit_wanted(Some("buildkit")));
         assert!(!super::buildkit_wanted(Some(" classic ")));
     }
-    use bollard::errors::Error;
-    use bollard::models::ContainerWaitResponse;
 
     #[tokio::test]
     async fn a_step_watch_dropped_or_cut_off_leaves_its_job_unmeasured() {

@@ -75,7 +75,10 @@ pub async fn execute_workflow(
         std::sync::Arc::new(state),
         crate::workspace::with_workflow_file(
             workflow_path,
-            Box::pin(execute_github_workflow(workflow_path, config.clone())),
+            Box::pin(with_run_image_builds(execute_github_workflow(
+                workflow_path,
+                config.clone(),
+            ))),
         ),
     ))
     .await;
@@ -2190,12 +2193,13 @@ fn generate_combined_dockerfile(
         dockerfile.push_str(&format!("ENV {}={}\n", name, value));
     }
 
-    // The package lists stay until every runtime is in: several installs
-    // take packages of their own.
+    // The package lists stay: several installs take packages of their own,
+    // and the shared layer keeps them whatever a later layer removes, so
+    // removing them would add a layer and save nothing. A step's own
+    // `apt-get install` finds them, as on GitHub's runners.
     for script in &scripts {
         dockerfile.push_str(&format!("RUN {}\n", script));
     }
-    dockerfile.push_str("RUN rm -rf /var/lib/apt/lists/*\n");
 
     // Base images can bundle tools ahead of the system directories. The act
     // images do this with Node, which would shadow the version a setup action
@@ -2288,6 +2292,45 @@ static IMAGE_BUILD_LOCKS: Lazy<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>
 static SHARED_LAYER_BUILDS: Lazy<Mutex<HashMap<String, Arc<tokio::sync::Mutex<bool>>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
+tokio::task_local! {
+    /// The combined images whose build failed in this run, by tag, with
+    /// the error. A job's image is built ahead while it waits, and again
+    /// at its turn if that didn't produce it: a build that fails on its
+    /// own would fail the same way, and take as long, so the job is given
+    /// the first failure instead. The next run tries again.
+    static FAILED_IMAGE_BUILDS: Mutex<HashMap<String, String>>;
+}
+
+/// Run `future` as one run, with no image build failed yet.
+async fn with_run_image_builds<F: std::future::Future>(future: F) -> F::Output {
+    FAILED_IMAGE_BUILDS
+        .scope(Mutex::new(HashMap::new()), future)
+        .await
+}
+
+/// Why `tag` failed to build earlier in this run, if it did.
+fn failed_image_build(tag: &str) -> Option<String> {
+    FAILED_IMAGE_BUILDS
+        .try_with(|failed| failed.lock().unwrap().get(tag).cloned())
+        .ok()
+        .flatten()
+}
+
+/// Remember for the rest of the run that `tag` failed to build. A lost
+/// connection to the engine isn't the build's fault, and is left for the
+/// next build to try again.
+fn remember_failed_image_build(tag: &str, error: &str) {
+    if is_transport_error(error) {
+        return;
+    }
+    let _ = FAILED_IMAGE_BUILDS.try_with(|failed| {
+        failed
+            .lock()
+            .unwrap()
+            .insert(tag.to_string(), error.to_string())
+    });
+}
+
 ///
 /// Skips the build when an image with the same tag already exists locally,
 /// avoiding redundant work on repeated runs. When multiple parallel jobs need
@@ -2357,6 +2400,17 @@ async fn build_combined_runtime_image(
         wrkflw_logging::info(&format!("Reusing existing combined runtime image: {}", tag));
         return Ok(tag);
     }
+    if let Some(error) = failed_image_build(&tag) {
+        wrkflw_logging::debug(&format!(
+            "{} failed to build earlier in this run, so it isn't built again",
+            tag
+        ));
+        return Err(ExecutionError::Runtime(format!(
+            "{}: {}",
+            crate::setup_errors::COMBINED_IMAGE_BUILD,
+            error
+        )));
+    }
 
     // Images that start with the same packages build them once: the first
     // build goes alone, and the others start when its layers are there to
@@ -2392,10 +2446,12 @@ async fn build_combined_runtime_image(
     build_image_checked(runtime, &dockerfile_path, &tag, temp_dir.path())
         .await
         .map_err(|e| {
+            let error = e.to_string();
+            remember_failed_image_build(&tag, &error);
             ExecutionError::Runtime(format!(
                 "{}: {}",
                 crate::setup_errors::COMBINED_IMAGE_BUILD,
-                e
+                error
             ))
         })?;
     if let Some(shared_built) = first_build.as_mut() {
@@ -2437,16 +2493,17 @@ async fn with_images_built_ahead<T>(
     }
 }
 
-/// How many images are built ahead at once, across every job of the run:
-/// a workflow of twenty jobs would otherwise start twenty builds, and an
-/// engine that busy is slow to start the steps of the jobs running. A job
-/// whose turn has come builds its own whatever this is.
+/// How many images are built ahead at once, across every job of every run
+/// in this process: a workflow of twenty jobs would otherwise start twenty
+/// builds, and an engine that busy is slow to start the steps of the jobs
+/// running. A job whose turn has come builds its own whatever this is.
 const IMAGES_BUILT_AHEAD: usize = 4;
 
 static AHEAD_BUILDS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(IMAGES_BUILT_AHEAD);
 
 /// Build the image of a job that waits for its turn. The job reports its
-/// image's failure itself when its turn comes, so the result is dropped.
+/// image's failure itself when its turn comes, from what the build
+/// remembered, so the result is dropped.
 async fn build_image_ahead(
     job: &Job,
     steps: &[Step],
@@ -8232,6 +8289,54 @@ mod tests {
         assert_eq!(*runtime.builds.lock().unwrap(), 1);
     }
 
+    /// A job's image built ahead failed: the job is given that failure at
+    /// its turn instead of building it again.
+    #[tokio::test]
+    async fn an_image_that_failed_to_build_is_not_built_again_in_the_run() {
+        let runtimes = detect_setup_runtimes(&[make_step_uses("actions/setup-java@v4", None)]);
+        let runtime = flaky(vec![Some("RUN apt-get install: exit code 100")], None);
+        with_run_image_builds(async {
+            for _ in 0..2 {
+                let err = build_combined_runtime_image(&runtimes, "ubuntu:latest", &runtime)
+                    .await
+                    .unwrap_err();
+                assert!(err.to_string().contains("exit code 100"), "{err}");
+            }
+        })
+        .await;
+        assert_eq!(*runtime.builds.lock().unwrap(), 1);
+
+        // The next run tries again.
+        with_run_image_builds(build_combined_runtime_image(
+            &runtimes,
+            "ubuntu:latest",
+            &runtime,
+        ))
+        .await
+        .unwrap();
+        assert_eq!(*runtime.builds.lock().unwrap(), 2);
+    }
+
+    /// A build that lost its connection to the engine may well work on a
+    /// later try, so the job at its turn builds it again.
+    #[tokio::test]
+    async fn an_image_whose_build_lost_the_engine_is_built_again() {
+        let runtimes = detect_setup_runtimes(&[make_step_uses("actions/setup-go@v5", None)]);
+        let runtime = flaky(vec![Some("broken pipe"), Some("broken pipe")], None);
+        with_run_image_builds(async {
+            assert!(
+                build_combined_runtime_image(&runtimes, "ubuntu:latest", &runtime)
+                    .await
+                    .is_err()
+            );
+            build_combined_runtime_image(&runtimes, "ubuntu:latest", &runtime)
+                .await
+                .unwrap();
+        })
+        .await;
+        assert_eq!(*runtime.builds.lock().unwrap(), 3);
+    }
+
     #[tokio::test]
     async fn the_base_image_is_pulled_first_only_where_its_id_can_be_read() {
         let runtimes = detect_setup_runtimes(&[make_step_uses("actions/setup-node@v4", None)]);
@@ -9913,6 +10018,33 @@ runs:
         assert!(runtime.run_calls.lock().unwrap().is_empty());
     }
 
+    /// The builds ahead stop when the jobs are done, and the jobs go on
+    /// when the builds ahead are done first.
+    #[tokio::test]
+    async fn images_are_built_ahead_only_while_the_jobs_run() {
+        let ahead_dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        struct OnDrop(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for OnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let guard = OnDrop(ahead_dropped.clone());
+        let ahead = async move {
+            let _guard = guard;
+            std::future::pending::<()>().await
+        };
+        assert_eq!(with_images_built_ahead(ahead, async { 7 }).await, 7);
+        assert!(ahead_dropped.load(std::sync::atomic::Ordering::SeqCst));
+
+        let (done, wait) = tokio::sync::oneshot::channel::<u8>();
+        let work = async { wait.await.unwrap() };
+        let ahead = async move {
+            done.send(9).unwrap();
+        };
+        assert_eq!(with_images_built_ahead(ahead, work).await, 9);
+    }
+
     #[test]
     fn the_shared_layers_end_with_the_first_run() {
         let python = |version: &str| {
@@ -10784,8 +10916,8 @@ runs:
         let df = generate_combined_dockerfile(&runtimes, "ubuntu:latest", None, None);
         assert!(df.starts_with("FROM ubuntu:latest\n"));
         assert!(df.contains("nodesource"));
-        // The shared packages, the runtime, and the package lists' removal.
-        assert_eq!(df.matches("RUN ").count(), 3);
+        // The shared packages, and the runtime.
+        assert_eq!(df.matches("RUN ").count(), 2);
     }
 
     #[test]
@@ -10821,11 +10953,11 @@ runs:
             },
         ];
         let df = generate_combined_dockerfile(&runtimes, "ubuntu:latest", None, None);
-        assert_eq!(df.matches("RUN ").count(), 4);
+        assert_eq!(df.matches("RUN ").count(), 3);
         assert!(df.contains("nodesource"));
         assert!(df.contains("uv python install '3.12'"));
-        // Lists are removed last: both installs take packages of their own.
-        assert!(df.contains("\nRUN rm -rf /var/lib/apt/lists/*\nENV PATH="));
+        // Both installs take packages of their own, so the lists stay.
+        assert!(!df.contains("apt/lists"), "{df}");
     }
 
     #[test]
@@ -11548,7 +11680,7 @@ runs:
             df.contains(&format!("nodejs.org/dist/latest-v{}.x", RUNNER_NODE_MAJOR)),
             "{df}"
         );
-        assert_eq!(df.matches("RUN ").count(), 3);
+        assert_eq!(df.matches("RUN ").count(), 2);
 
         // setup-node's own version is the only Node then.
         let node = vec![SetupRuntime {
@@ -11789,7 +11921,7 @@ runs:
             combined_image_tag(&runtimes, &after)
         );
         // A comment doesn't change what gets built.
-        assert_eq!(before.matches("RUN ").count(), 3);
+        assert_eq!(before.matches("RUN ").count(), 2);
     }
 
     #[test]
@@ -11802,8 +11934,8 @@ runs:
             env: Vec::new(),
         }];
         let df = generate_combined_dockerfile(&runtimes, "ubuntu:latest", None, None);
-        // The base packages, and the package lists' removal.
-        assert_eq!(df.matches("RUN ").count(), 2);
+        // The base packages alone.
+        assert_eq!(df.matches("RUN ").count(), 1);
     }
 
     #[test]

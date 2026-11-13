@@ -1,3 +1,4 @@
+use crate::buildkit;
 use crate::container_guard::ContainerGuard;
 use async_trait::async_trait;
 use bollard::{
@@ -654,6 +655,17 @@ pub async fn cleanup_resources(docker: &Docker) {
     }
 }
 
+/// Whether the engine answered that the container doesn't exist.
+fn is_not_found(error: &bollard::errors::Error) -> bool {
+    matches!(
+        error,
+        bollard::errors::Error::DockerResponseServerError {
+            status_code: 404,
+            ..
+        }
+    )
+}
+
 // Clean up all tracked containers, in the order they are tracked. Job sessions
 // rely on that order: `job_session::Containers::add` keeps a job container
 // behind its services, which Podman won't let go of it before.
@@ -697,6 +709,13 @@ pub async fn cleanup_containers(docker: &Docker) -> Result<(), String> {
         .await
         {
             Ok(Ok(_)) => wrkflw_logging::debug(&format!("Stopped container: {}", container_id)),
+            // Never created, as a container whose creation timed out may
+            // be, or already gone: there is nothing to remove.
+            Ok(Err(e)) if is_not_found(&e) => {
+                wrkflw_logging::debug(&format!("No container to clean up: {}", container_id));
+                untrack_container(&container_id);
+                continue;
+            }
             Ok(Err(e)) => wrkflw_logging::warning(&format!(
                 "Error stopping container {}: {}",
                 container_id, e
@@ -706,14 +725,21 @@ pub async fn cleanup_containers(docker: &Docker) -> Result<(), String> {
             }
         }
 
-        // Then try to remove it
+        // Then remove it, by force where it didn't stop in time.
+        let force = bollard::container::RemoveContainerOptions {
+            force: true,
+            ..Default::default()
+        };
         match tokio::time::timeout(
             std::time::Duration::from_millis(1000),
-            docker.remove_container(&container_id, None),
+            docker.remove_container(&container_id, Some(force)),
         )
         .await
         {
             Ok(Ok(_)) => wrkflw_logging::debug(&format!("Removed container: {}", container_id)),
+            Ok(Err(e)) if is_not_found(&e) => {
+                wrkflw_logging::debug(&format!("Container already gone: {}", container_id))
+            }
             Ok(Err(e)) => wrkflw_logging::warning(&format!(
                 "Error removing container {}: {}",
                 container_id, e
@@ -886,7 +912,7 @@ impl ContainerRuntime for DockerRuntime {
                     tag,
                     timeout_duration.as_secs()
                 ));
-                Err(ContainerError::ImageBuild(
+                Err(ContainerError::ImageBuildTimeout(
                     "Operation timed out".to_string(),
                 ))
             }
@@ -1053,6 +1079,10 @@ impl ContainerRuntime for DockerRuntime {
     fn identifies_images(&self) -> bool {
         true
     }
+
+    fn reuses_build_layers(&self) -> bool {
+        true
+    }
 }
 
 // Move the actual implementation to internal methods
@@ -1162,8 +1192,9 @@ impl DockerRuntime {
             || image.contains("nanoserver");
 
         // Create appropriate container options based on platform
+        let container_name = format!("wrkflw-{}", uuid::Uuid::new_v4());
         let options = Some(CreateContainerOptions {
-            name: format!("wrkflw-{}", uuid::Uuid::new_v4()),
+            name: container_name.clone(),
             platform: if is_windows_image {
                 Some("windows".to_string())
             } else {
@@ -1195,9 +1226,8 @@ impl DockerRuntime {
             entrypoint,
         );
 
-        // Create container with a shorter timeout
         let create_result = tokio::time::timeout(
-            std::time::Duration::from_secs(15),
+            ENGINE_ANSWER_LIMIT,
             self.docker.create_container(options, config),
         )
         .await;
@@ -1206,9 +1236,23 @@ impl DockerRuntime {
             Ok(Ok(container)) => container,
             Ok(Err(e)) => return Err(ContainerError::ContainerStart(e.to_string())),
             Err(_) => {
+                // The engine may still create it after this gives up. It is
+                // tracked by name, which the engine takes where it takes an
+                // id, so the cleanup at the end of the run removes it if it
+                // is there by then, and passes over it quietly if not; a
+                // process that lives on removes it once the engine has had
+                // time to finish creating it. One the engine creates after
+                // the process has exited is left behind, with its
+                // `wrkflw-` name to find it by.
+                track_container(&container_name);
+                tokio::spawn(remove_once_created(
+                    self.docker.clone(),
+                    container_name,
+                    ENGINE_ANSWER_LIMIT,
+                ));
                 return Err(ContainerError::ContainerStart(
                     "Container creation timed out".to_string(),
-                ))
+                ));
             }
         };
 
@@ -1223,7 +1267,7 @@ impl DockerRuntime {
 
         // Start container with a timeout
         let start_result = tokio::time::timeout(
-            std::time::Duration::from_secs(15),
+            ENGINE_ANSWER_LIMIT,
             self.docker.start_container::<String>(&container.id, None),
         )
         .await;
@@ -1456,6 +1500,17 @@ impl DockerRuntime {
             )));
         }
 
+        // A job's runtime image is built by BuildKit where the `docker`
+        // CLI has it, and by the engine's own builder, below, where
+        // BuildKit couldn't build it or built it somewhere else.
+        if tag.starts_with(COMBINED_IMAGE_PREFIX) && buildkit::builds_here(&self.docker).await {
+            match buildkit::build(dockerfile, tag, context_dir, self.image_exists(tag)).await {
+                buildkit::Next::Built => return Ok(()),
+                buildkit::Next::Failed(e) => return Err(e),
+                buildkit::Next::EngineBuilds => {}
+            }
+        }
+
         // Determine the Dockerfile path relative to the context directory.
         let dockerfile_name = dockerfile
             .strip_prefix(context_dir)
@@ -1595,6 +1650,33 @@ impl DockerRuntime {
     }
 }
 
+/// Remove the container `name`, whose creation was given up on, once the
+/// engine has had `after` to finish creating it. Removed, or never created,
+/// it is no longer tracked; any other error leaves it to the cleanup at the
+/// end of the run.
+async fn remove_once_created(docker: Docker, name: String, after: std::time::Duration) {
+    tokio::time::sleep(after).await;
+    let force = bollard::container::RemoveContainerOptions {
+        force: true,
+        ..Default::default()
+    };
+    match docker.remove_container(&name, Some(force)).await {
+        Ok(()) => untrack_container(&name),
+        Err(e) if is_not_found(&e) => untrack_container(&name),
+        Err(e) => wrkflw_logging::debug(&format!(
+            "Could not remove {} after its creation timed out: {}",
+            name, e
+        )),
+    }
+}
+
+/// How long the engine gets to create or start a step's container. It
+/// answers in well under a second when idle, but an engine that is saving
+/// freshly built images took more than 15 seconds to create one, and the
+/// step failed for it. Slow is not stuck: the step's own time limit still
+/// holds.
+const ENGINE_ANSWER_LIMIT: std::time::Duration = std::time::Duration::from_secs(120);
+
 // Public accessor functions for testing
 #[cfg(test)]
 pub fn get_tracked_containers() -> Vec<String> {
@@ -1619,6 +1701,36 @@ mod tests {
     use super::wait_exit_code;
     use bollard::errors::Error;
     use bollard::models::ContainerWaitResponse;
+
+    /// Only the engine's answer that there is no such container counts as
+    /// one that is gone; a container in the way of its removal is still
+    /// there to warn about.
+    #[test]
+    fn only_a_404_says_the_container_is_not_there() {
+        let answered = |status_code| Error::DockerResponseServerError {
+            status_code,
+            message: "No such container: wrkflw-x".to_string(),
+        };
+        assert!(super::is_not_found(&answered(404)));
+        assert!(!super::is_not_found(&answered(409)));
+        assert!(!super::is_not_found(&answered(500)));
+    }
+
+    /// A container whose creation timed out is tracked by name. One the
+    /// engine never created is let go of by the removal that waits for it.
+    #[tokio::test]
+    async fn a_container_never_created_is_let_go_of_quietly() {
+        let Ok(docker) = Docker::connect_with_local_defaults() else {
+            return;
+        };
+        if docker.ping().await.is_err() {
+            return;
+        }
+        let name = format!("wrkflw-never-created-{}", uuid::Uuid::new_v4());
+        track_container(&name);
+        super::remove_once_created(docker.clone(), name.clone(), std::time::Duration::ZERO).await;
+        assert!(!get_tracked_containers().contains(&name));
+    }
 
     #[tokio::test]
     async fn a_step_watch_dropped_or_cut_off_leaves_its_job_unmeasured() {

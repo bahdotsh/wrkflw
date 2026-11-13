@@ -233,6 +233,17 @@ pub(crate) fn sizes_by_memory() -> bool {
         .is_some_and(|pool| matches!(pool.limit, Limit::Memory { .. }))
 }
 
+/// Whether this run limits the jobs it runs at once, by memory or by
+/// [`MAX_PARALLEL_JOBS_ENV`]: work outside the jobs' places, such as
+/// building a waiting job's image ahead, should keep within the room the
+/// VM keeps for itself then.
+pub(crate) fn limits_jobs() -> bool {
+    POOL.try_with(|pool| pool.get().cloned().flatten())
+        .ok()
+        .flatten()
+        .is_some()
+}
+
 fn env_limit() -> Option<usize> {
     parse_limit(&std::env::var(MAX_PARALLEL_JOBS_ENV).ok()?)
 }
@@ -474,6 +485,22 @@ async fn limit_from_memory(cli: &str) -> Option<Limit> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_run_with_a_pool_limits_its_jobs() {
+        assert!(!limits_jobs());
+        with_run_pool(async {
+            assert!(!limits_jobs(), "not sized yet");
+            set_limit(None);
+            assert!(!limits_jobs(), "enough memory");
+        })
+        .await;
+        with_run_pool(async {
+            set_limit(Some(Limit::Jobs(2)));
+            assert!(limits_jobs());
+        })
+        .await;
+    }
 
     #[test]
     fn a_small_vm_runs_fewer_jobs_at_once() {

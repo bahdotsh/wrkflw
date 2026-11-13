@@ -880,9 +880,13 @@ pub(crate) fn get_install_script(language: &str, version: &str) -> String {
                 major
             )
         }
+        // A runtime's install is a layer of its own, on top of the shared
+        // packages' layer, which the builder may have cached weeks ago: an
+        // install that takes packages refreshes the lists first, or a
+        // superseded package is no longer there to fetch.
         "php" => {
             format!(
-                "apt-get install -y software-properties-common && \
+                "apt-get update && apt-get install -y software-properties-common && \
                  add-apt-repository -y ppa:ondrej/php && apt-get update && \
                  apt-get install -y php{ver}-cli php{ver}-mbstring php{ver}-xml php{ver}-curl unzip && \
                  curl -fsSL https://getcomposer.org/installer -o /tmp/composer-setup.php && \
@@ -932,7 +936,7 @@ pub(crate) fn get_install_script(language: &str, version: &str) -> String {
         }
         "java" => {
             format!(
-                "apt-get install -y wget apt-transport-https gpg && \
+                "apt-get update && apt-get install -y wget apt-transport-https gpg && \
                  wget -qO - https://packages.adoptium.net/artifactory/api/gpg/key/public | gpg --dearmor -o /usr/share/keyrings/adoptium.gpg && \
                  echo 'deb [signed-by=/usr/share/keyrings/adoptium.gpg] https://packages.adoptium.net/artifactory/deb $(cat /etc/os-release | grep UBUNTU_CODENAME | cut -d= -f2) main' > /etc/apt/sources.list.d/adoptium.list && \
                  apt-get update && apt-get install -y temurin-{}-jdk",
@@ -941,7 +945,7 @@ pub(crate) fn get_install_script(language: &str, version: &str) -> String {
         }
         "dotnet" => {
             format!(
-                "apt-get install -y wget && \
+                "apt-get update && apt-get install -y wget && \
                  wget https://dot.net/v1/dotnet-install.sh -O /tmp/dotnet-install.sh && \
                  chmod +x /tmp/dotnet-install.sh && \
                  /tmp/dotnet-install.sh --channel {} --install-dir /usr/share/dotnet && \
@@ -1120,10 +1124,39 @@ pub(crate) fn uv_python_request(version: &str) -> String {
 /// current LTS major, unless the base image already has one.
 pub(crate) const RUNNER_NODE_MAJOR: &str = "22";
 
+/// Install the runner's Node.js, unless the image already has one.
+///
+/// Taken from nodejs.org's own build of the major's newest release, checked
+/// against its published checksum, unpacked in a directory of its own and
+/// only then copied under `/usr/local`, so a download or unpack that fails
+/// leaves nothing to shadow the distribution's package, and no download
+/// stays in the image. The
+/// distribution's package took a second `apt-get update` and four times as
+/// long, on every first build of a job's image. A machine nodejs.org builds
+/// nothing for, such as riscv64, gets the distribution's package as before.
+///
+/// The checksum comes from nodejs.org too, over the same TLS, so it catches
+/// a download that was cut short or damaged, not a release someone put
+/// there: its signature isn't checked. nodejs.org is trusted as far as the
+/// other installs trust where they fetch from, which run a script from
+/// astral.sh, sh.rustup.rs or deb.nodesource.com as root.
 pub(crate) fn runner_node_install() -> String {
+    let dist = format!("https://nodejs.org/dist/latest-v{}.x", RUNNER_NODE_MAJOR);
     format!(
-        "(command -v node >/dev/null 2>&1 || ({}))",
-        get_install_script("node", RUNNER_NODE_MAJOR)
+        "(command -v node >/dev/null 2>&1 || (\
+         dir=$(mktemp -d) && (\
+         cd \"$dir\" && \
+         arch=$(uname -m | sed 's/x86_64/x64/;s/aarch64/arm64/') && \
+         curl -fsSLO {dist}/SHASUMS256.txt && \
+         file=$(grep -o \"node-v[0-9.]*-linux-$arch\\.tar\\.gz\" SHASUMS256.txt | head -n 1) && \
+         test -n \"$file\" && \
+         curl -fsSLO {dist}/$file && \
+         grep \" $file\\$\" SHASUMS256.txt > node.sum && sha256sum -c node.sum >/dev/null && \
+         mkdir node && tar -xzf \"$file\" -C node --strip-components=1 --no-same-owner \
+         --exclude='*/CHANGELOG.md' --exclude='*/LICENSE' --exclude='*/README.md' && \
+         cp -a node/. /usr/local/); \
+         status=$?; [ -z \"$dir\" ] || rm -rf \"$dir\"; exit $status) || ({distribution}))",
+        distribution = get_install_script("node", RUNNER_NODE_MAJOR),
     )
 }
 

@@ -1,7 +1,7 @@
 # Codebase Index: wrkflw
 
-> Generated: 2026-11-11 17:02:11 UTC | Files: 260 | Lines: 117213
-> Languages: JSON (4), Markdown (26), Rust (167), Shell (6), TOML (19), YAML (38)
+> Generated: 2026-11-13 12:17:35 UTC | Files: 262 | Lines: 118189
+> Languages: JSON (4), Markdown (26), Rust (169), Shell (6), TOML (19), YAML (38)
 
 ## Directory Structure
 
@@ -34,6 +34,7 @@ wrkflw/
         action_fidelity.rs
         action_resolver.rs
         artifacts.rs
+        buildkit.rs
         cache.rs
         checkout_sync.rs
         container_guard.rs
@@ -44,6 +45,7 @@ wrkflw/
         events.rs
         expression.rs
         github_env_files.rs
+        image_build.rs
         job_memory.rs
         job_session.rs
         kubernetes/
@@ -1786,7 +1788,7 @@ wrkflw/
 
 ## INDEX.md
 
-**Language:** Markdown | **Size:** 275.9 KB | **Lines:** 10209
+**Language:** Markdown | **Size:** 275.7 KB | **Lines:** 10197
 
 **Declarations:**
 
@@ -2366,6 +2368,59 @@ wrkflw/
 
 ---
 
+## crates/executor/src/buildkit.rs
+
+**Language:** Rust | **Size:** 16.9 KB | **Lines:** 427
+
+**Imports:**
+- `bollard::Docker`
+- `std::path::Path`
+- `wrkflw_runtime::container::ContainerError`
+
+**Declarations:**
+
+`const IMAGE_BUILDER_ENV: &str = "WRKFLW_IMAGE_BUILDER"`
+
+`fn buildkit_wanted(setting: Option<&str>) -> bool`
+
+`static BUILDKIT_IMAGES_UNSEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false)`
+
+`pub(crate) async fn builds_here(docker: &Docker) -> bool`
+
+`async fn buildkit_available(docker: &Docker) -> bool`
+
+`async fn buildkit_builds_here(docker: &Docker) -> bool`
+
+`fn warn_buildkit_elsewhere(why: &str)`
+
+`async fn docker_cli(args: &[&str]) -> Option<String>`
+
+`fn buildx_driver(inspect: &str) -> Option<&str>`
+
+`fn same_engine(cli: Option<&str>, api: Option<&str>) -> Option<bool>`
+
+`pub(crate) enum Next`
+> Variants: `Built`, `EngineBuilds`, `Failed`
+
+`pub(crate) async fn build( dockerfile: &Path, tag: &str, context_dir: &Path, image_exists: impl std::future::Future<Output = Result<bool, ContainerError>>, ) -> Next`
+
+`fn after_build( tag: &str, engine_has_it: Result<bool, ContainerError>, unseen: &std::sync::atomic::AtomicBool, ) -> Next`
+
+`fn after_failure(tag: &str, error: BuildKitError) -> Next`
+
+`async fn build_with_buildkit( dockerfile: &Path, tag: &str, context_dir: &Path, ) -> Result<(), BuildKitError>`
+
+`fn failed_instruction_output(stderr: &str) -> Option<String>`
+
+`enum BuildKitError`
+> Variants: `StepFailed`, `NotBuilt`
+
+`fn an_instruction_failed(stderr: &str) -> bool`
+
+`mod tests`
+
+---
+
 ## crates/executor/src/cache.rs
 
 **Language:** Rust | **Size:** 24.6 KB | **Lines:** 670
@@ -2557,9 +2612,10 @@ wrkflw/
 
 ## crates/executor/src/docker.rs
 
-**Language:** Rust | **Size:** 65.1 KB | **Lines:** 1742
+**Language:** Rust | **Size:** 69.9 KB | **Lines:** 1854
 
 **Imports:**
+- `crate::buildkit`
 - `crate::container_guard::ContainerGuard`
 - `async_trait::async_trait`
 - `bollard::{
@@ -2574,11 +2630,7 @@ wrkflw/
 - `std::path::Path`
 - `std::sync::Mutex`
 - `wrkflw_logging`
-- `wrkflw_runtime::container::{
-    container_env, container_path, path_from_image_env, ContainerError, ContainerOutput,
-    ContainerRuntime, COMBINED_IMAGE_PREFIX, LOCAL_IMAGE_PREFIX,
-}`
-- *... and 2 more imports*
+- *... and 3 more imports*
 
 **Declarations:**
 
@@ -2643,6 +2695,8 @@ wrkflw/
 
 `pub(crate) fn tracked_containers() -> Vec<String>`
 
+`fn is_not_found(error: &bollard::errors::Error) -> bool`
+
 **`impl ContainerRuntime for DockerRuntime`**
   `fn session_cli(&self) -> Option<&'static str>`
 
@@ -2660,6 +2714,8 @@ wrkflw/
 
   `fn identifies_images(&self) -> bool`
 
+  `fn reuses_build_layers(&self) -> bool`
+
 
 `fn build_container_config( image: &str, cmd: Vec<String>, env: Vec<String>, working_dir: &Path, host_config: HostConfig, is_windows_image: bool, entrypoint: Option<&str>, ) -> Config<String>`
 
@@ -2672,6 +2728,10 @@ wrkflw/
 
   `async fn build_image_inner( &self, dockerfile: &Path, tag: &str, context_dir: &Path, ) -> Result<(), ContainerError>`
 
+
+`async fn remove_once_created(docker: Docker, name: String, after: std::time::Duration)`
+
+`const ENGINE_ANSWER_LIMIT: std::time::Duration = std::time::Duration::from_secs(120)`
 
 `mod tests`
 
@@ -2903,6 +2963,51 @@ wrkflw/
 `fn is_valid_identifier(s: &str) -> bool`
 
 `mod tests`
+
+---
+
+## crates/executor/src/image_build.rs
+
+**Language:** Rust | **Size:** 9.3 KB | **Lines:** 246
+
+**Imports:**
+- `futures::future`
+- `once_cell::sync::Lazy`
+- `std::collections::HashMap`
+- `std::path::Path`
+- `std::sync::{Arc, Mutex}`
+- `wrkflw_runtime::container::{ContainerError, ContainerRuntime, COMBINED_IMAGE_PREFIX}`
+- `crate::engine::fnv1a_hash`
+
+**Declarations:**
+
+`static SHARED_LAYER_BUILDS: Lazy<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> = Lazy::new(|| Mutex::new(HashMap::new()))`
+
+`pub(crate) async fn with_run_image_builds<F: std::future::Future>(future: F) -> F::Output`
+
+`pub(crate) fn failed_image_build(tag: &str) -> Option<String>`
+
+`pub(crate) fn remember_failed_image_build(tag: &str, error: &ContainerError)`
+
+`fn may_build_on_another_try(error: &ContainerError) -> bool`
+
+`pub(crate) async fn ensure_shared_layers( dockerfile: &str, runtime: &dyn ContainerRuntime, ) -> Result<(), String>`
+
+`pub(crate) fn shared_layers_tag(shared: &str) -> String`
+
+`pub(crate) fn shared_layers(dockerfile: &str) -> &str`
+
+`pub(crate) async fn with_images_built_ahead<T>( ahead: impl std::future::Future<Output = ()>, work: impl std::future::Future<Output = T>, ) -> T`
+
+`pub(crate) const IMAGES_BUILT_AHEAD: usize = 4`
+
+`pub(crate) static AHEAD_BUILDS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(IMAGES_BUILT_AHEAD)`
+
+`pub(crate) fn ahead_build_permits(jobs_limited: bool) -> u32`
+
+`pub(crate) fn is_transport_error(message: &str) -> bool`
+
+`pub(crate) async fn build_image_checked( runtime: &dyn ContainerRuntime, dockerfile: &Path, tag: &str, context_dir: &Path, ) -> Result<(), wrkflw_runtime::container::ContainerError>`
 
 ---
 
@@ -3207,7 +3312,7 @@ wrkflw/
 
 ## crates/executor/src/kubernetes/mod.rs
 
-**Language:** Rust | **Size:** 70.7 KB | **Lines:** 2036
+**Language:** Rust | **Size:** 71.1 KB | **Lines:** 2044
 
 **Imports:**
 - `async_trait::async_trait`
@@ -3443,7 +3548,7 @@ wrkflw/
 
 ## crates/executor/src/lib.rs
 
-**Language:** Rust | **Size:** 1.9 KB | **Lines:** 58
+**Language:** Rust | **Size:** 1.9 KB | **Lines:** 60
 
 **Imports:**
 - `pub use acceleration::{validate_remote, Acceleration, Secret, Sidecar, SIDECAR_PATH}`
@@ -3465,11 +3570,15 @@ wrkflw/
 
 `pub(crate) mod artifacts`
 
+`pub(crate) mod buildkit`
+
 `pub(crate) mod cache`
 
 `pub(crate) mod checkout_sync`
 
 `mod container_guard`
+
+`pub(crate) mod image_build`
 
 `pub(crate) mod job_memory`
 
@@ -3655,7 +3764,7 @@ wrkflw/
 
 ## crates/executor/src/podman.rs
 
-**Language:** Rust | **Size:** 38.2 KB | **Lines:** 1029
+**Language:** Rust | **Size:** 38.3 KB | **Lines:** 1033
 
 **Imports:**
 - `crate::container_guard::ContainerGuard`
@@ -3720,6 +3829,8 @@ wrkflw/
   `async fn image_id(&self, image: &str) -> Option<String>`
 
   `fn identifies_images(&self) -> bool`
+
+  `fn reuses_build_layers(&self) -> bool`
 
 
 `async fn image_path(image: &str) -> Option<String>`
@@ -3797,7 +3908,7 @@ wrkflw/
 
 ## crates/executor/src/setup_actions.rs
 
-**Language:** Rust | **Size:** 47.8 KB | **Lines:** 1176
+**Language:** Rust | **Size:** 50.0 KB | **Lines:** 1209
 
 **Imports:**
 - `std::collections::HashMap`
@@ -3900,7 +4011,7 @@ wrkflw/
 
 ## crates/executor/src/substitution.rs
 
-**Language:** Rust | **Size:** 37.7 KB | **Lines:** 1028
+**Language:** Rust | **Size:** 39.1 KB | **Lines:** 1068
 
 **Imports:**
 - `lazy_static::lazy_static`
@@ -3927,7 +4038,7 @@ wrkflw/
 
 ## crates/executor/src/vm_memory.rs
 
-**Language:** Rust | **Size:** 34.1 KB | **Lines:** 911
+**Language:** Rust | **Size:** 34.9 KB | **Lines:** 938
 
 **Imports:**
 - `std::collections::HashMap`
@@ -3983,6 +4094,8 @@ wrkflw/
 
 `pub(crate) fn sizes_by_memory() -> bool`
 
+`pub(crate) fn limits_jobs() -> bool`
+
 `fn env_limit() -> Option<usize>`
 
 `fn parse_limit(value: &str) -> Option<usize>`
@@ -4023,7 +4136,7 @@ wrkflw/
 
 ## crates/executor/src/vm_workspace.rs
 
-**Language:** Rust | **Size:** 107.2 KB | **Lines:** 2938
+**Language:** Rust | **Size:** 107.7 KB | **Lines:** 2954
 
 **Imports:**
 - `std::collections::{HashMap, HashSet}`
@@ -4375,7 +4488,7 @@ wrkflw/
 
 ## crates/github/src/lib.rs
 
-**Language:** Rust | **Size:** 25.2 KB | **Lines:** 722
+**Language:** Rust | **Size:** 26.8 KB | **Lines:** 760
 
 **Imports:**
 - `lazy_static::lazy_static`
@@ -4389,6 +4502,10 @@ wrkflw/
 - `thiserror::Error`
 
 **Declarations:**
+
+`fn is_pull_request_run(run: &serde_json::Value) -> bool`
+
+`fn listed_base_branch(run: &serde_json::Value) -> Option<String>`
 
 `const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30)`
 
@@ -5297,7 +5414,7 @@ wrkflw/
 
 ## crates/runtime/src/container.rs
 
-**Language:** Rust | **Size:** 18.0 KB | **Lines:** 476
+**Language:** Rust | **Size:** 18.7 KB | **Lines:** 491
 
 **Imports:**
 - `async_trait::async_trait`
@@ -6275,7 +6392,7 @@ wrkflw/
 
 ## crates/trigger-filter/src/parser.rs
 
-**Language:** Rust | **Size:** 34.6 KB | **Lines:** 969
+**Language:** Rust | **Size:** 35.4 KB | **Lines:** 989
 
 **Imports:**
 - `crate::error::TriggerFilterError`

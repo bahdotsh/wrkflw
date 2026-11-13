@@ -77,6 +77,16 @@ pub trait ContainerRuntime: Sync {
         None
     }
 
+    /// True when a build reuses the layers an earlier build of the same
+    /// instructions left in this runtime's own image store, so building the
+    /// layers several images share once, as an image of their own, saves
+    /// each of them that work. False where a built image is only shipped
+    /// somewhere else, as to a registry: an image no step runs in would be
+    /// built and shipped for nothing.
+    fn reuses_build_layers(&self) -> bool {
+        false
+    }
+
     /// True when `run_container` joins `cmd` into one string for a shell, so
     /// an argument holding a multi-line script doesn't survive as one argument.
     fn flattens_commands(&self) -> bool {
@@ -148,6 +158,9 @@ use std::fmt;
 pub enum ContainerError {
     ImagePull(String),
     ImageBuild(String),
+    /// The build was given up on when its time ran out. It says nothing of
+    /// the image: the same build may well finish on an engine less busy.
+    ImageBuildTimeout(String),
     ContainerStart(String),
     ContainerExecution(String),
     NetworkCreation(String),
@@ -254,7 +267,9 @@ impl fmt::Display for ContainerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ContainerError::ImagePull(msg) => write!(f, "Failed to pull image: {}", msg),
-            ContainerError::ImageBuild(msg) => write!(f, "Failed to build image: {}", msg),
+            ContainerError::ImageBuild(msg) | ContainerError::ImageBuildTimeout(msg) => {
+                write!(f, "Failed to build image: {}", msg)
+            }
             ContainerError::ContainerStart(msg) => {
                 write!(f, "Failed to start container: {}", msg)
             }

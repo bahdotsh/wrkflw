@@ -654,6 +654,17 @@ pub async fn cleanup_resources(docker: &Docker) {
     }
 }
 
+/// Whether the engine answered that the container doesn't exist.
+fn is_not_found(error: &bollard::errors::Error) -> bool {
+    matches!(
+        error,
+        bollard::errors::Error::DockerResponseServerError {
+            status_code: 404,
+            ..
+        }
+    )
+}
+
 // Clean up all tracked containers, in the order they are tracked. Job sessions
 // rely on that order: `job_session::Containers::add` keeps a job container
 // behind its services, which Podman won't let go of it before.
@@ -697,6 +708,13 @@ pub async fn cleanup_containers(docker: &Docker) -> Result<(), String> {
         .await
         {
             Ok(Ok(_)) => wrkflw_logging::debug(&format!("Stopped container: {}", container_id)),
+            // Never created, as a container whose creation timed out may
+            // be, or already gone: there is nothing to remove.
+            Ok(Err(e)) if is_not_found(&e) => {
+                wrkflw_logging::debug(&format!("No container to clean up: {}", container_id));
+                untrack_container(&container_id);
+                continue;
+            }
             Ok(Err(e)) => wrkflw_logging::warning(&format!(
                 "Error stopping container {}: {}",
                 container_id, e
@@ -706,14 +724,21 @@ pub async fn cleanup_containers(docker: &Docker) -> Result<(), String> {
             }
         }
 
-        // Then try to remove it
+        // Then remove it, by force where it didn't stop in time.
+        let force = bollard::container::RemoveContainerOptions {
+            force: true,
+            ..Default::default()
+        };
         match tokio::time::timeout(
             std::time::Duration::from_millis(1000),
-            docker.remove_container(&container_id, None),
+            docker.remove_container(&container_id, Some(force)),
         )
         .await
         {
             Ok(Ok(_)) => wrkflw_logging::debug(&format!("Removed container: {}", container_id)),
+            Ok(Err(e)) if is_not_found(&e) => {
+                wrkflw_logging::debug(&format!("Container already gone: {}", container_id))
+            }
             Ok(Err(e)) => wrkflw_logging::warning(&format!(
                 "Error removing container {}: {}",
                 container_id, e
@@ -1208,9 +1233,12 @@ impl DockerRuntime {
             Err(_) => {
                 // The engine may still create it after this gives up. It is
                 // tracked by name, which the engine takes where it takes an
-                // id, so the cleanup at the end of the run removes it; a
+                // id, so the cleanup at the end of the run removes it if it
+                // is there by then, and passes over it quietly if not; a
                 // process that lives on removes it once the engine has had
-                // time to finish creating it.
+                // time to finish creating it. One the engine creates after
+                // the process has exited is left behind, with its
+                // `wrkflw-` name to find it by.
                 track_container(&container_name);
                 let docker = self.docker.clone();
                 tokio::spawn(async move {
@@ -1221,11 +1249,8 @@ impl DockerRuntime {
                     };
                     // Removed, or never created: nothing is left to clean up.
                     match docker.remove_container(&container_name, Some(force)).await {
-                        Ok(())
-                        | Err(bollard::errors::Error::DockerResponseServerError {
-                            status_code: 404,
-                            ..
-                        }) => untrack_container(&container_name),
+                        Ok(()) => untrack_container(&container_name),
+                        Err(e) if is_not_found(&e) => untrack_container(&container_name),
                         Err(_) => {}
                     }
                 });

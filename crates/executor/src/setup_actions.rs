@@ -1124,11 +1124,13 @@ pub(crate) fn uv_python_request(version: &str) -> String {
 /// current LTS major, unless the base image already has one.
 pub(crate) const RUNNER_NODE_MAJOR: &str = "22";
 
+/// Install the runner's Node.js, unless the image already has one.
 ///
 /// Taken from nodejs.org's own build of the major's newest release, checked
 /// against its published checksum, and unpacked under `/usr/local`. The
 /// distribution's package took a second `apt-get update` and four times as
-/// long, on every first build of a job's image.
+/// long, on every first build of a job's image. A machine nodejs.org builds
+/// nothing for, such as riscv64, gets the distribution's package as before.
 pub(crate) fn runner_node_install() -> String {
     let dist = format!("https://nodejs.org/dist/latest-v{}.x", RUNNER_NODE_MAJOR);
     format!(
@@ -1136,11 +1138,13 @@ pub(crate) fn runner_node_install() -> String {
          arch=$(uname -m | sed 's/x86_64/x64/;s/aarch64/arm64/') && \
          cd /tmp && curl -fsSLO {dist}/SHASUMS256.txt && \
          file=$(grep -o \"node-v[0-9.]*-linux-$arch\\.tar\\.gz\" SHASUMS256.txt | head -n 1) && \
+         test -n \"$file\" && \
          curl -fsSLO {dist}/$file && \
          grep \" $file\\$\" SHASUMS256.txt > node.sum && sha256sum -c node.sum >/dev/null && \
          tar -xzf $file -C /usr/local --strip-components=1 --no-same-owner \
          --exclude='*/CHANGELOG.md' --exclude='*/LICENSE' --exclude='*/README.md' && \
-         rm -f $file SHASUMS256.txt node.sum && cd /))"
+         rm -f $file SHASUMS256.txt node.sum && cd /) || ({distribution}))",
+        distribution = get_install_script("node", RUNNER_NODE_MAJOR),
     )
 }
 

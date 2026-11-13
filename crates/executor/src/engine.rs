@@ -10064,7 +10064,10 @@ runs:
         // The whole instruction, continuation lines included, and no more.
         assert_eq!(shared.matches("RUN ").count(), 1, "{shared}");
         assert!(shared.contains("build-essential"), "{shared}");
-        assert!(shared.ends_with("cd /))\n"), "{shared}");
+        assert!(
+            shared.ends_with(&format!("{}\n", runner_node_install())),
+            "{shared}"
+        );
         assert!(!shared.contains("uv python install"), "{shared}");
         // Without a `RUN`, everything is shared.
         assert_eq!(shared_layers("FROM scratch\n"), "FROM scratch\n");
@@ -10076,6 +10079,15 @@ runs:
         assert!(install.starts_with("(command -v node >/dev/null 2>&1 || ("));
         assert!(install.contains("https://nodejs.org/dist/latest-v22.x/SHASUMS256.txt"));
         assert!(install.contains("sha256sum -c node.sum"), "{install}");
+        // A machine nodejs.org builds nothing for gets the distribution's.
+        assert!(install.contains("test -n \"$file\""), "{install}");
+        assert!(
+            install.ends_with(&format!(
+                "|| ({}))",
+                get_install_script("node", RUNNER_NODE_MAJOR)
+            )),
+            "{install}"
+        );
         // One line: it is appended to the shared packages' `RUN`.
         assert!(!install.contains('\n'), "{install}");
     }

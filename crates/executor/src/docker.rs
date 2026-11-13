@@ -1240,20 +1240,11 @@ impl DockerRuntime {
                 // the process has exited is left behind, with its
                 // `wrkflw-` name to find it by.
                 track_container(&container_name);
-                let docker = self.docker.clone();
-                tokio::spawn(async move {
-                    tokio::time::sleep(ENGINE_ANSWER_LIMIT).await;
-                    let force = bollard::container::RemoveContainerOptions {
-                        force: true,
-                        ..Default::default()
-                    };
-                    // Removed, or never created: nothing is left to clean up.
-                    match docker.remove_container(&container_name, Some(force)).await {
-                        Ok(()) => untrack_container(&container_name),
-                        Err(e) if is_not_found(&e) => untrack_container(&container_name),
-                        Err(_) => {}
-                    }
-                });
+                tokio::spawn(remove_once_created(
+                    self.docker.clone(),
+                    container_name,
+                    ENGINE_ANSWER_LIMIT,
+                ));
                 return Err(ContainerError::ContainerStart(
                     "Container creation timed out".to_string(),
                 ));
@@ -1509,24 +1500,33 @@ impl DockerRuntime {
         // it is: the engine's builder would fail the same way, and take as
         // long. If BuildKit doesn't produce the image for any other reason,
         // the build below runs and reports as it always did.
-        if tag.starts_with(COMBINED_IMAGE_PREFIX) && builds_with_buildkit().await {
+        if tag.starts_with(COMBINED_IMAGE_PREFIX) && builds_with_buildkit(&self.docker).await {
             match build_with_buildkit(dockerfile, tag, context_dir).await {
-                Ok(()) if self.image_exists(tag).await.unwrap_or(false) => return Ok(()),
-                Ok(()) => {
+                Ok(()) => match self.image_exists(tag).await {
+                    Ok(true) => return Ok(()),
                     // The `docker` CLI talks to another engine than this
-                    // one, as with a context that isn't the default socket.
-                    // Every BuildKit build would be done twice, so the rest
-                    // go to the engine's own builder.
-                    if !BUILDKIT_IMAGES_UNSEEN.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                        wrkflw_logging::warning(&format!(
-                            "BuildKit built {} where this engine can't see it, as when the \
-                             `docker` CLI uses another context; job images are built by the \
-                             engine's own builder from now on, which is slower. Point the \
-                             CLI at the same engine, or set {}=classic to skip BuildKit",
-                            tag, IMAGE_BUILDER_ENV
-                        ));
+                    // one, though the check before the first build couldn't
+                    // tell. Every BuildKit build would be done twice, so
+                    // this one and the rest go to the engine's own builder.
+                    Ok(false) => {
+                        if !BUILDKIT_IMAGES_UNSEEN.swap(true, std::sync::atomic::Ordering::Relaxed)
+                        {
+                            warn_buildkit_elsewhere(&format!(
+                                "BuildKit built {} where this engine can't see it",
+                                tag
+                            ));
+                        }
                     }
-                }
+                    // The engine didn't answer; it says nothing of where the
+                    // image went. The caller looks for it again before it
+                    // takes this for a failed build.
+                    Err(e) => {
+                        return Err(ContainerError::ImageBuild(format!(
+                            "BuildKit built {}, but the engine couldn't be asked for it: {}",
+                            tag, e
+                        )))
+                    }
+                },
                 Err(BuildKitError::StepFailed(e)) => return Err(ContainerError::ImageBuild(e)),
                 Err(BuildKitError::NotBuilt(e)) => wrkflw_logging::debug(&format!(
                     "BuildKit couldn't build {}, so the engine's own builder is tried: {}",
@@ -1674,6 +1674,26 @@ impl DockerRuntime {
     }
 }
 
+/// Remove the container `name`, whose creation was given up on, once the
+/// engine has had `after` to finish creating it. Removed, or never created,
+/// it is no longer tracked; any other error leaves it to the cleanup at the
+/// end of the run.
+async fn remove_once_created(docker: Docker, name: String, after: std::time::Duration) {
+    tokio::time::sleep(after).await;
+    let force = bollard::container::RemoveContainerOptions {
+        force: true,
+        ..Default::default()
+    };
+    match docker.remove_container(&name, Some(force)).await {
+        Ok(()) => untrack_container(&name),
+        Err(e) if is_not_found(&e) => untrack_container(&name),
+        Err(e) => wrkflw_logging::debug(&format!(
+            "Could not remove {} after its creation timed out: {}",
+            name, e
+        )),
+    }
+}
+
 /// How long the engine gets to create or start a step's container. It
 /// answers in well under a second when idle, but an engine that is saving
 /// freshly built images took more than 15 seconds to create one, and the
@@ -1695,28 +1715,94 @@ static BUILDKIT_IMAGES_UNSEEN: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 /// Whether a job's runtime image is built with BuildKit.
-async fn builds_with_buildkit() -> bool {
+async fn builds_with_buildkit(docker: &Docker) -> bool {
     buildkit_wanted(std::env::var(IMAGE_BUILDER_ENV).ok().as_deref())
         && !BUILDKIT_IMAGES_UNSEEN.load(std::sync::atomic::Ordering::Relaxed)
-        && buildkit_available().await
+        && buildkit_available(docker).await
 }
 
-/// Whether the `docker` CLI can build with BuildKit, asked once a run.
-async fn buildkit_available() -> bool {
+/// Whether the `docker` CLI builds with BuildKit into this engine, asked
+/// once a process.
+async fn buildkit_available(docker: &Docker) -> bool {
     static AVAILABLE: tokio::sync::OnceCell<bool> = tokio::sync::OnceCell::const_new();
-    *AVAILABLE
-        .get_or_init(|| async {
-            tokio::process::Command::new("docker")
-                .args(["buildx", "version"])
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .await
-                .map(|status| status.success())
-                .unwrap_or(false)
-        })
-        .await
+    *AVAILABLE.get_or_init(|| buildkit_builds_here(docker)).await
+}
+
+/// Whether the `docker` CLI's builder builds into this engine's own images.
+///
+/// Its driver must be `docker`: another, such as `docker-container`, keeps
+/// its own cache and takes a base image from the registry rather than the
+/// one this engine has, which the image's tag names. And the CLI must talk
+/// to this engine, or each image would be built in the other and then again
+/// here. Where the engines can't be told apart, BuildKit is used, and the
+/// check after the first build still catches an image built elsewhere.
+async fn buildkit_builds_here(docker: &Docker) -> bool {
+    let Some(inspect) = docker_cli(&["buildx", "inspect"]).await else {
+        return false;
+    };
+    let driver = buildx_driver(&inspect);
+    if driver != Some("docker") {
+        wrkflw_logging::debug(&format!(
+            "The `docker` CLI's builder uses the {} driver, not docker, so job images are \
+             built by the engine's own builder",
+            driver.unwrap_or("unknown")
+        ));
+        return false;
+    }
+    let cli_engine = docker_cli(&["info", "--format", "{{.ID}}"]).await;
+    let api_engine = docker.info().await.ok().and_then(|info| info.id);
+    if same_engine(cli_engine.as_deref(), api_engine.as_deref()) == Some(false) {
+        warn_buildkit_elsewhere("The `docker` CLI talks to another engine than wrkflw does");
+        return false;
+    }
+    true
+}
+
+/// Say once why BuildKit isn't used, and what to do about it.
+fn warn_buildkit_elsewhere(why: &str) {
+    wrkflw_logging::warning(&format!(
+        "{}, as when it uses another context; job images are built by the engine's own \
+         builder, which is slower. Point the CLI at the same engine, or set {}=classic to \
+         skip BuildKit",
+        why, IMAGE_BUILDER_ENV
+    ));
+}
+
+/// What `docker <args>` printed, when it ran in time and succeeded.
+async fn docker_cli(args: &[&str]) -> Option<String> {
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        tokio::process::Command::new("docker")
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// The driver `docker buildx inspect` names for the builder in use.
+fn buildx_driver(inspect: &str) -> Option<&str> {
+    inspect
+        .lines()
+        .find_map(|line| line.strip_prefix("Driver:"))
+        .map(str::trim)
+        .filter(|driver| !driver.is_empty())
+}
+
+/// Whether the CLI's engine and the API's are one, by their IDs. `None`
+/// when either didn't give one.
+fn same_engine(cli: Option<&str>, api: Option<&str>) -> Option<bool> {
+    let cli = cli.map(str::trim).filter(|id| !id.is_empty())?;
+    let api = api.map(str::trim).filter(|id| !id.is_empty())?;
+    Some(cli == api)
 }
 
 /// Build `tag` with BuildKit through the `docker` CLI.
@@ -1906,6 +1992,55 @@ mod tests {
             ),
             None
         );
+    }
+
+    /// Only a builder of the `docker` driver builds into the engine's own
+    /// images, from the base image the engine has.
+    #[test]
+    fn the_builders_driver_is_read_from_buildx_inspect() {
+        let inspect = "Name:          desktop-linux\n\
+                       Driver:        docker\n\
+                       Last Activity: 2026-11-13 09:12:38 +0000 UTC\n\
+                       \n\
+                       Nodes:\n\
+                       Name:             desktop-linux\n";
+        assert_eq!(super::buildx_driver(inspect), Some("docker"));
+        assert_eq!(
+            super::buildx_driver("Name: x\nDriver: docker-container\n"),
+            Some("docker-container")
+        );
+        assert_eq!(super::buildx_driver("Name: x\nDriver:\n"), None);
+        assert_eq!(super::buildx_driver(""), None);
+    }
+
+    /// The CLI and the API reach one engine when they give the same ID; an
+    /// ID missing on either side tells nothing.
+    #[test]
+    fn engines_are_told_apart_by_their_ids() {
+        let id = "d154b3c8-fd5c-48fb-b028-ee89de535bd5";
+        assert_eq!(
+            super::same_engine(Some(&format!("{id}\n")), Some(id)),
+            Some(true)
+        );
+        assert_eq!(super::same_engine(Some("other"), Some(id)), Some(false));
+        assert_eq!(super::same_engine(None, Some(id)), None);
+        assert_eq!(super::same_engine(Some(id), Some("")), None);
+    }
+
+    /// A container whose creation timed out is tracked by name. One the
+    /// engine never created is let go of by the removal that waits for it.
+    #[tokio::test]
+    async fn a_container_never_created_is_let_go_of_quietly() {
+        let Ok(docker) = Docker::connect_with_local_defaults() else {
+            return;
+        };
+        if docker.ping().await.is_err() {
+            return;
+        }
+        let name = format!("wrkflw-never-created-{}", uuid::Uuid::new_v4());
+        track_container(&name);
+        super::remove_once_created(docker.clone(), name.clone(), std::time::Duration::ZERO).await;
+        assert!(!get_tracked_containers().contains(&name));
     }
 
     #[test]

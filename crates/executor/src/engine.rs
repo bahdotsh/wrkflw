@@ -2287,9 +2287,9 @@ fn combined_image_tag(runtimes: &[SetupRuntime], dockerfile: &str) -> String {
 static IMAGE_BUILD_LOCKS: Lazy<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
-/// Whether an image with these shared layers has had its first build in
-/// this process, by the text of the layers. See `shared_layers`.
-static SHARED_LAYER_BUILDS: Lazy<Mutex<HashMap<String, Arc<tokio::sync::Mutex<bool>>>>> =
+/// One lock per image of shared layers, by its tag: the first build of
+/// those layers goes alone. See `ensure_shared_layers`.
+static SHARED_LAYER_BUILDS: Lazy<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
 tokio::task_local! {
@@ -2412,21 +2412,15 @@ async fn build_combined_runtime_image(
         )));
     }
 
-    // Images that start with the same packages build them once: the first
-    // build goes alone, and the others start when its layers are there to
-    // reuse. Started together, five BuildKit builds took 67 s to give the
-    // first image where one alone took 43 s. Once the first is over, built
-    // or failed, the others go together: one after another, each would
-    // fail in turn on shared layers that don't build.
-    let shared_lock = {
-        let mut locks = SHARED_LAYER_BUILDS.lock().unwrap();
-        locks
-            .entry(shared_layers(&dockerfile).to_string())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(false)))
-            .clone()
-    };
-    let shared_built = shared_lock.lock().await;
-    let mut first_build = (!*shared_built).then_some(shared_built);
+    ensure_shared_layers(&dockerfile, runtime)
+        .await
+        .map_err(|error| {
+            ExecutionError::Runtime(format!(
+                "{}: {}",
+                crate::setup_errors::COMBINED_IMAGE_BUILD,
+                error
+            ))
+        })?;
 
     let temp_dir = tempfile::tempdir().map_err(|e| {
         ExecutionError::Execution(format!("Failed to create temp directory: {}", e))
@@ -2445,21 +2439,81 @@ async fn build_combined_runtime_image(
             .join(", ")
     ));
 
-    let built = build_image_checked(runtime, &dockerfile_path, &tag, temp_dir.path()).await;
-    if let Some(shared_built) = first_build.as_mut() {
-        **shared_built = true;
-    }
-    built.map_err(|e| {
-        let error = e.to_string();
-        remember_failed_image_build(&tag, &error);
-        ExecutionError::Runtime(format!(
-            "{}: {}",
-            crate::setup_errors::COMBINED_IMAGE_BUILD,
-            error
-        ))
-    })?;
+    build_image_checked(runtime, &dockerfile_path, &tag, temp_dir.path())
+        .await
+        .map_err(|e| {
+            let error = e.to_string();
+            remember_failed_image_build(&tag, &error);
+            ExecutionError::Runtime(format!(
+                "{}: {}",
+                crate::setup_errors::COMBINED_IMAGE_BUILD,
+                error
+            ))
+        })?;
 
     Ok(tag)
+}
+
+/// Build the layers a combined image shares with every image on the same
+/// base, as an image of their own, unless the engine has it already.
+///
+/// Images that start with the same packages build them once: the first
+/// build of those layers goes alone, and the builds waiting on it go on to
+/// their own runtimes as soon as it is over, built or failed. Started
+/// together, five BuildKit builds took 67 s to give the first image where
+/// one alone took 43 s. Only the shared layers are waited for, not another
+/// job's runtimes, and an engine that has the shared image from an earlier
+/// run waits for nothing.
+async fn ensure_shared_layers(
+    dockerfile: &str,
+    runtime: &dyn ContainerRuntime,
+) -> Result<(), String> {
+    let shared = shared_layers(dockerfile);
+    if shared.len() == dockerfile.len() {
+        return Ok(());
+    }
+    let tag = shared_layers_tag(shared);
+    if runtime.image_exists(&tag).await.unwrap_or(false) {
+        return Ok(());
+    }
+    let lock = {
+        let mut locks = SHARED_LAYER_BUILDS.lock().unwrap();
+        locks
+            .entry(tag.clone())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    };
+    let _first = lock.lock().await;
+    // Whoever held the lock before built these layers, or failed to: the
+    // same build would fail the same way.
+    if let Some(error) = failed_image_build(&tag) {
+        return Err(error);
+    }
+    if runtime.image_exists(&tag).await.unwrap_or(false) {
+        return Ok(());
+    }
+    let temp_dir =
+        tempfile::tempdir().map_err(|e| format!("Failed to create temp directory: {}", e))?;
+    let dockerfile_path = temp_dir.path().join("Dockerfile");
+    std::fs::write(&dockerfile_path, shared)
+        .map_err(|e| format!("Failed to write Dockerfile: {}", e))?;
+    build_image_checked(runtime, &dockerfile_path, &tag, temp_dir.path())
+        .await
+        .map_err(|e| {
+            let error = e.to_string();
+            remember_failed_image_build(&tag, &error);
+            error
+        })
+}
+
+/// The tag of the image of `shared` layers, by their text: the same layers
+/// always get the same tag.
+fn shared_layers_tag(shared: &str) -> String {
+    format!(
+        "{}shared-{:x}",
+        COMBINED_IMAGE_PREFIX,
+        fnv1a_hash(shared.as_bytes())
+    )
 }
 
 /// The start of a combined image's Dockerfile, through its first `RUN`:
@@ -2502,6 +2556,19 @@ const IMAGES_BUILT_AHEAD: usize = 4;
 
 static AHEAD_BUILDS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(IMAGES_BUILT_AHEAD);
 
+/// The share of [`AHEAD_BUILDS`] one build ahead takes. A job's image used
+/// to be built only once the job had its place in the VM's memory pool; a
+/// build ahead has none. Where the run limits its jobs, memory is short and
+/// the room the VM keeps for itself, which builds are counted in, holds one
+/// build: a build ahead then takes every permit and goes alone.
+fn ahead_build_permits(jobs_limited: bool) -> u32 {
+    if jobs_limited {
+        IMAGES_BUILT_AHEAD as u32
+    } else {
+        1
+    }
+}
+
 /// Build the image of a job that waits for its turn. The job reports its
 /// image's failure itself when its turn comes, from what the build
 /// remembered, so the result is dropped.
@@ -2512,7 +2579,8 @@ async fn build_image_ahead(
     platform_overrides: &HashMap<String, String>,
     matrix: Option<&HashMap<String, Value>>,
 ) {
-    let Ok(_permit) = AHEAD_BUILDS.acquire().await else {
+    let permits = ahead_build_permits(crate::vm_memory::limits_jobs());
+    let Ok(_permit) = AHEAD_BUILDS.acquire_many(permits).await else {
         return;
     };
     let _ = resolve_runner_image(job, steps, runtime, platform_overrides, matrix).await;
@@ -5475,9 +5543,6 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                         // composite action step by step, both above. What
                         // reaches here is a local JavaScript action, which
                         // wrkflw can't run: the step passes without it.
-                        cmd.push("sh");
-                        cmd.push("-c");
-                        cmd.push("echo 'Local action not run'");
                         printed_only = Some("Local action not run".to_string());
                         action_not_run = report_action_not_run(uses, Some(NO_IMPLEMENTATION));
                     } else {
@@ -5622,16 +5687,9 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                                     .as_deref(),
                             );
                         } else {
-                            // Fall back to emulation for actions we don't know how to execute
+                            // Fall back to emulation for actions we don't know how
+                            // to execute: the step only says what it would run.
                             cmd.clear();
-                            cmd.push("sh");
-                            cmd.push("-c");
-
-                            let escaped_uses = uses.replace('\'', "'\\''");
-                            let echo_msg =
-                                format!("echo 'Would execute GitHub action: {}'", escaped_uses);
-                            owned_strings.push(echo_msg);
-                            cmd.push(owned_strings.last().unwrap());
                             printed_only = Some(format!("Would execute GitHub action: {}", uses));
 
                             // The step passes, but nothing the action does
@@ -8315,7 +8373,8 @@ mod tests {
         ))
         .await
         .unwrap();
-        assert_eq!(*runtime.builds.lock().unwrap(), 2);
+        // Its shared layers, then the image.
+        assert_eq!(*runtime.builds.lock().unwrap(), 3);
     }
 
     /// A build that lost its connection to the engine may well work on a
@@ -8335,7 +8394,9 @@ mod tests {
                 .unwrap();
         })
         .await;
-        assert_eq!(*runtime.builds.lock().unwrap(), 3);
+        // The shared layers twice, cut off; then the shared layers and the
+        // image.
+        assert_eq!(*runtime.builds.lock().unwrap(), 4);
     }
 
     #[tokio::test]
@@ -10046,6 +10107,18 @@ runs:
         assert_eq!(with_images_built_ahead(ahead, work).await, 9);
     }
 
+    /// Builds ahead hold no place in the VM's memory pool, so where the run
+    /// limits its jobs they go one at a time, in the room the VM keeps.
+    #[test]
+    fn builds_ahead_go_alone_where_the_run_limits_its_jobs() {
+        assert_eq!(ahead_build_permits(false), 1);
+        assert_eq!(ahead_build_permits(true) as usize, IMAGES_BUILT_AHEAD);
+        assert!(
+            !crate::vm_memory::limits_jobs(),
+            "outside a run nothing limits"
+        );
+    }
+
     #[test]
     fn the_shared_layers_end_with_the_first_run() {
         let python = |version: &str| {
@@ -10082,6 +10155,15 @@ runs:
         assert!(install.contains("sha256sum -c node.sum"), "{install}");
         // A machine nodejs.org builds nothing for gets the distribution's.
         assert!(install.contains("test -n \"$file\""), "{install}");
+        // Unpacked aside and copied in only once all of it is there; the
+        // downloads go whether it worked or not.
+        assert!(install.contains("-C node "), "{install}");
+        assert!(!install.contains("-C /usr/local"), "{install}");
+        assert!(install.contains("cp -a node/. /usr/local/)"), "{install}");
+        assert!(
+            install.contains("rm -rf \"$dir\"; exit $status"),
+            "{install}"
+        );
         assert!(
             install.ends_with(&format!(
                 "|| ({}))",
@@ -10122,28 +10204,122 @@ runs:
         }
     }
 
-    /// The first build of a set of shared layers going alone is over when
-    /// it fails too: the builds waiting on it go together then, not each
-    /// alone in turn.
+    /// A runtime that remembers the tags it built, and has those and any
+    /// it starts with. A build of a tag in `failing` fails on its own.
+    #[derive(Default)]
+    struct TagBuildRuntime {
+        existing: Mutex<std::collections::HashSet<String>>,
+        built: Mutex<Vec<String>>,
+        failing: Option<&'static str>,
+    }
+
+    #[async_trait::async_trait]
+    impl ContainerRuntime for TagBuildRuntime {
+        async fn run_container(
+            &self,
+            _: &str,
+            _: &[&str],
+            _: &[(&str, &str)],
+            _: &Path,
+            _: &[(&Path, &Path)],
+            _: Option<&str>,
+        ) -> Result<ContainerOutput, ContainerError> {
+            unreachable!("no step runs")
+        }
+        async fn pull_image(&self, _: &str) -> Result<(), ContainerError> {
+            Ok(())
+        }
+        async fn build_image(&self, _: &Path, tag: &str, _: &Path) -> Result<(), ContainerError> {
+            self.built.lock().unwrap().push(tag.to_string());
+            if let Some(prefix) = self.failing.filter(|prefix| tag.starts_with(prefix)) {
+                return Err(ContainerError::ImageBuild(format!(
+                    "RUN apt-get update: exit code 100 ({})",
+                    prefix
+                )));
+            }
+            self.existing.lock().unwrap().insert(tag.to_string());
+            Ok(())
+        }
+        async fn prepare_language_environment(
+            &self,
+            _: &str,
+            _: Option<&str>,
+            _: Option<Vec<String>>,
+        ) -> Result<String, ContainerError> {
+            Ok(String::new())
+        }
+        async fn image_exists(&self, tag: &str) -> Result<bool, ContainerError> {
+            Ok(self.existing.lock().unwrap().contains(tag))
+        }
+    }
+
+    /// Images on the same base share the layers of their packages: the
+    /// first image builds them as an image of their own, and the next only
+    /// its runtime, without waiting on another build's.
     #[tokio::test]
-    async fn a_failed_first_build_of_shared_layers_lets_the_others_go() {
-        let base = "wrkflw-test/first-shared-build-fails:1";
-        let runtimes = detect_setup_runtimes(&[make_step_uses("actions/setup-java@v4", None)]);
-        let runtime = flaky(vec![Some("RUN apt-get update: exit code 100")], None);
-        with_run_image_builds(async {
-            assert!(build_combined_runtime_image(&runtimes, base, &runtime)
-                .await
-                .is_err());
+    async fn images_on_one_base_build_their_shared_layers_once() {
+        let base = "wrkflw-test/shared-once:1";
+        let go = detect_setup_runtimes(&[make_step_uses("actions/setup-go@v5", None)]);
+        let java = detect_setup_runtimes(&[make_step_uses("actions/setup-java@v4", None)]);
+        let runtime = TagBuildRuntime::default();
+        let (go_tag, java_tag) = with_run_image_builds(async {
+            (
+                build_combined_runtime_image(&go, base, &runtime)
+                    .await
+                    .unwrap(),
+                build_combined_runtime_image(&java, base, &runtime)
+                    .await
+                    .unwrap(),
+            )
         })
         .await;
-        let first_over = SHARED_LAYER_BUILDS
-            .lock()
-            .unwrap()
-            .iter()
-            .find(|(layers, _)| layers.starts_with(&format!("FROM {}\n", base)))
-            .map(|(_, over)| over.clone())
-            .expect("the shared layers were built first");
-        assert!(*first_over.try_lock().unwrap());
+        let built = runtime.built.lock().unwrap().clone();
+        assert_eq!(built.len(), 3, "{built:?}");
+        assert!(built[0].starts_with(&format!("{}shared-", COMBINED_IMAGE_PREFIX)));
+        assert_eq!(built[1..], [go_tag, java_tag]);
+    }
+
+    /// The engine kept the shared layers from an earlier run: nothing is
+    /// waited for, and only the image itself is built.
+    #[tokio::test]
+    async fn shared_layers_the_engine_has_are_not_built_again() {
+        let base = "wrkflw-test/shared-kept:1";
+        let go = detect_setup_runtimes(&[make_step_uses("actions/setup-go@v5", None)]);
+        let first = TagBuildRuntime::default();
+        with_run_image_builds(build_combined_runtime_image(&go, base, &first))
+            .await
+            .unwrap();
+        let shared = first.built.lock().unwrap()[0].clone();
+
+        let java = detect_setup_runtimes(&[make_step_uses("actions/setup-java@v4", None)]);
+        let later = TagBuildRuntime::default();
+        later.existing.lock().unwrap().insert(shared);
+        let tag = with_run_image_builds(build_combined_runtime_image(&java, base, &later))
+            .await
+            .unwrap();
+        assert_eq!(*later.built.lock().unwrap(), [tag]);
+    }
+
+    /// Shared layers that fail to build fail every image on them, and are
+    /// built once in the run, not once for each image.
+    #[tokio::test]
+    async fn shared_layers_that_failed_fail_every_image_on_them_at_once() {
+        let base = "wrkflw-test/shared-fails:1";
+        let runtime = TagBuildRuntime {
+            failing: Some("wrkflw-combined:shared-"),
+            ..TagBuildRuntime::default()
+        };
+        with_run_image_builds(async {
+            for action in ["actions/setup-go@v5", "actions/setup-java@v4"] {
+                let runtimes = detect_setup_runtimes(&[make_step_uses(action, None)]);
+                let err = build_combined_runtime_image(&runtimes, base, &runtime)
+                    .await
+                    .unwrap_err();
+                assert!(err.to_string().contains("exit code 100"), "{err}");
+            }
+        })
+        .await;
+        assert_eq!(runtime.built.lock().unwrap().len(), 1);
     }
 
     // --- NativeDocker execute_step integration tests ---
@@ -15865,12 +16041,9 @@ runs:
 
     #[tokio::test]
     async fn build_combined_runtime_image_deduplicates_concurrent_builds() {
-        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-
-        #[derive(Clone)]
+        #[derive(Clone, Default)]
         struct CountingRuntime {
-            build_count: Arc<AtomicUsize>,
-            built: Arc<AtomicBool>,
+            builds: Arc<Mutex<Vec<String>>>,
         }
 
         #[async_trait::async_trait]
@@ -15894,13 +16067,12 @@ runs:
             async fn build_image(
                 &self,
                 _dockerfile: &Path,
-                _tag: &str,
+                tag: &str,
                 _context_dir: &Path,
             ) -> Result<(), ContainerError> {
-                self.build_count.fetch_add(1, Ordering::SeqCst);
                 // Yield so other spawned tasks get scheduled and attempt concurrent builds.
                 tokio::task::yield_now().await;
-                self.built.store(true, Ordering::SeqCst);
+                self.builds.lock().unwrap().push(tag.to_string());
                 Ok(())
             }
 
@@ -15913,15 +16085,12 @@ runs:
                 Ok("mock:latest".to_string())
             }
 
-            async fn image_exists(&self, _tag: &str) -> Result<bool, ContainerError> {
-                Ok(self.built.load(Ordering::SeqCst))
+            async fn image_exists(&self, tag: &str) -> Result<bool, ContainerError> {
+                Ok(self.builds.lock().unwrap().iter().any(|built| built == tag))
             }
         }
 
-        let runtime = CountingRuntime {
-            build_count: Arc::new(AtomicUsize::new(0)),
-            built: Arc::new(AtomicBool::new(false)),
-        };
+        let runtime = CountingRuntime::default();
 
         let runtimes = vec![SetupRuntime {
             language: "rust".to_string(),
@@ -15940,11 +16109,11 @@ runs:
             result.expect("build_combined_runtime_image failed");
         }
 
-        assert_eq!(
-            runtime.build_count.load(Ordering::SeqCst),
-            1,
-            "build_image should be called exactly once despite concurrent jobs"
-        );
+        // The shared layers, then the image: each once despite concurrent jobs.
+        let builds = runtime.builds.lock().unwrap().clone();
+        assert_eq!(builds.len(), 2, "{builds:?}");
+        assert!(builds[0].starts_with(&format!("{}shared-", COMBINED_IMAGE_PREFIX)));
+        assert!(builds[1].starts_with(&format!("{}rust1.78-", COMBINED_IMAGE_PREFIX)));
     }
 
     // --- RuntimeType::Auto tests ---

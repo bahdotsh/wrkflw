@@ -10080,6 +10080,34 @@ runs:
         assert!(!install.contains('\n'), "{install}");
     }
 
+    /// A runtime's install is a layer of its own, on shared layers that may
+    /// have been cached weeks ago, so one that takes packages refreshes the
+    /// lists before it installs any: nodesource's setup script does that.
+    #[test]
+    fn every_install_that_takes_packages_refreshes_the_lists_first() {
+        let scripts = [
+            "node", "php", "python", "uv", "go", "java", "dotnet", "rust",
+        ]
+        .map(|language| (language, get_install_script(language, "8")));
+        let runner_node = runner_node_install();
+        for (what, script) in scripts
+            .iter()
+            .map(|(language, script)| (*language, script.as_str()))
+            .chain([("runner node", runner_node.as_str())])
+        {
+            let Some(install) = script.find("apt-get install") else {
+                continue;
+            };
+            let refresh = ["apt-get update", "node-setup.sh"]
+                .iter()
+                .filter_map(|refresh| script.find(refresh))
+                .min();
+            assert!(
+                refresh.is_some_and(|refresh| refresh < install),
+                "{what}: {script}"
+            );
+        }
+    }
     // --- NativeDocker execute_step integration tests ---
 
     #[tokio::test]

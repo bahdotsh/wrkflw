@@ -880,9 +880,13 @@ pub(crate) fn get_install_script(language: &str, version: &str) -> String {
                 major
             )
         }
+        // A runtime's install is a layer of its own, on top of the shared
+        // packages' layer, which the builder may have cached weeks ago: an
+        // install that takes packages refreshes the lists first, or a
+        // superseded package is no longer there to fetch.
         "php" => {
             format!(
-                "apt-get install -y software-properties-common && \
+                "apt-get update && apt-get install -y software-properties-common && \
                  add-apt-repository -y ppa:ondrej/php && apt-get update && \
                  apt-get install -y php{ver}-cli php{ver}-mbstring php{ver}-xml php{ver}-curl unzip && \
                  curl -fsSL https://getcomposer.org/installer -o /tmp/composer-setup.php && \
@@ -932,7 +936,7 @@ pub(crate) fn get_install_script(language: &str, version: &str) -> String {
         }
         "java" => {
             format!(
-                "apt-get install -y wget apt-transport-https gpg && \
+                "apt-get update && apt-get install -y wget apt-transport-https gpg && \
                  wget -qO - https://packages.adoptium.net/artifactory/api/gpg/key/public | gpg --dearmor -o /usr/share/keyrings/adoptium.gpg && \
                  echo 'deb [signed-by=/usr/share/keyrings/adoptium.gpg] https://packages.adoptium.net/artifactory/deb $(cat /etc/os-release | grep UBUNTU_CODENAME | cut -d= -f2) main' > /etc/apt/sources.list.d/adoptium.list && \
                  apt-get update && apt-get install -y temurin-{}-jdk",
@@ -941,7 +945,7 @@ pub(crate) fn get_install_script(language: &str, version: &str) -> String {
         }
         "dotnet" => {
             format!(
-                "apt-get install -y wget && \
+                "apt-get update && apt-get install -y wget && \
                  wget https://dot.net/v1/dotnet-install.sh -O /tmp/dotnet-install.sh && \
                  chmod +x /tmp/dotnet-install.sh && \
                  /tmp/dotnet-install.sh --channel {} --install-dir /usr/share/dotnet && \

@@ -1480,8 +1480,10 @@ impl DockerRuntime {
         }
 
         // A job's runtime image is built by BuildKit where the `docker`
-        // CLI has it. If that doesn't produce the image, for whatever
-        // reason, the build below runs and reports as it always did.
+        // CLI has it. A build whose own instruction failed is reported as
+        // it is: the engine's builder would fail the same way, and take as
+        // long. If BuildKit doesn't produce the image for any other reason,
+        // the build below runs and reports as it always did.
         if tag.starts_with(COMBINED_IMAGE_PREFIX) && builds_with_buildkit().await {
             match build_with_buildkit(dockerfile, tag, context_dir).await {
                 Ok(()) if self.image_exists(tag).await.unwrap_or(false) => return Ok(()),
@@ -1500,7 +1502,8 @@ impl DockerRuntime {
                         ));
                     }
                 }
-                Err(e) => wrkflw_logging::debug(&format!(
+                Err(BuildKitError::StepFailed(e)) => return Err(ContainerError::ImageBuild(e)),
+                Err(BuildKitError::NotBuilt(e)) => wrkflw_logging::debug(&format!(
                     "BuildKit couldn't build {}, so the engine's own builder is tried: {}",
                     tag, e
                 )),
@@ -1702,7 +1705,7 @@ async fn build_with_buildkit(
     dockerfile: &Path,
     tag: &str,
     context_dir: &Path,
-) -> Result<(), String> {
+) -> Result<(), BuildKitError> {
     let output = tokio::process::Command::new("docker")
         .args([
             "buildx",
@@ -1721,7 +1724,9 @@ async fn build_with_buildkit(
         .kill_on_drop(true)
         .output()
         .await
-        .map_err(|e| format!("`docker buildx build` didn't start: {}", e))?;
+        .map_err(|e| {
+            BuildKitError::NotBuilt(format!("`docker buildx build` didn't start: {}", e))
+        })?;
     if output.status.success() {
         return Ok(());
     }
@@ -1730,11 +1735,71 @@ async fn build_with_buildkit(
         .lines()
         .filter(|line| !line.trim().is_empty())
         .collect();
-    let tail = lines[lines.len().saturating_sub(20)..].join("\n");
-    Err(format!(
-        "`docker buildx build` failed ({}):\n{}",
-        output.status, tail
-    ))
+    let report = |what: &str| {
+        format!(
+            "`docker buildx build` failed ({}):\n{}",
+            output.status, what
+        )
+    };
+    if an_instruction_failed(&stderr) {
+        // What the failed instruction printed last, where the cause is,
+        // rather than the end of the output, which is the Dockerfile.
+        let what = failed_instruction_output(&stderr)
+            .unwrap_or_else(|| lines[lines.len().saturating_sub(20)..].join("\n"));
+        Err(BuildKitError::StepFailed(report(&what)))
+    } else {
+        Err(BuildKitError::NotBuilt(report(
+            &lines[lines.len().saturating_sub(20)..].join("\n"),
+        )))
+    }
+}
+
+/// The last lines the failed instruction printed, then its error, from
+/// BuildKit's plain progress, where each of a step's lines starts with the
+/// step's number: `#6 0.195 E: ...`, then `#6 ERROR: process ...`.
+fn failed_instruction_output(stderr: &str) -> Option<String> {
+    let (step, error) = stderr.lines().find_map(|line| {
+        let (step, rest) = line.split_once(' ')?;
+        let error = rest.strip_prefix("ERROR: ")?;
+        (step.starts_with('#') && an_instruction_failed(line)).then_some((step, error))
+    })?;
+    let printed: Vec<&str> = stderr
+        .lines()
+        .filter_map(|line| {
+            let (number, rest) = line.split_once(' ')?;
+            let (time, text) = rest.split_once(' ').unwrap_or((rest, ""));
+            (number == step && time.parse::<f64>().is_ok()).then_some(text)
+        })
+        .collect();
+    let mut report = printed[printed.len().saturating_sub(20)..].join("\n");
+    if !report.is_empty() {
+        report.push('\n');
+    }
+    report.push_str(error);
+    Some(report)
+}
+
+/// Why BuildKit didn't give a job's runtime image.
+#[derive(Debug)]
+enum BuildKitError {
+    /// An instruction of the Dockerfile failed, such as an install that
+    /// exited non-zero. The engine's own builder would fail the same way.
+    StepFailed(String),
+    /// BuildKit itself couldn't build, as when the CLI has no builder or
+    /// can't reach one; the engine's own builder may well.
+    NotBuilt(String),
+}
+
+/// Whether BuildKit's output says an instruction of the Dockerfile failed,
+/// rather than BuildKit itself: `process "/bin/sh -c ..." did not complete
+/// successfully`, or `executor failed running [...]` from older releases.
+/// Only an error line counts, not what the instruction itself printed.
+fn an_instruction_failed(stderr: &str) -> bool {
+    stderr.lines().any(|line| {
+        line.to_ascii_lowercase().contains("error")
+            && ((line.contains("process \"") && line.contains("did not complete successfully"))
+                || line.contains("executor failed running ["))
+    })
 }
 
 // Public accessor functions for testing
@@ -1761,6 +1826,62 @@ mod tests {
     use super::wait_exit_code;
     use bollard::errors::Error;
     use bollard::models::ContainerWaitResponse;
+
+    /// A failed instruction is the build's own failure, which the engine's
+    /// builder would repeat; anything else may be BuildKit's alone.
+    #[test]
+    fn a_failed_instruction_is_told_from_buildkit_failing() {
+        for failed in [
+            "#7 ERROR: process \"/bin/sh -c apt-get install -y wget\" did not complete successfully: exit code: 100",
+            "ERROR: failed to build: failed to solve: process \"/bin/sh -c false\" did not complete successfully: exit code: 1",
+            "error: failed to solve: executor failed running [/bin/sh -c false]: exit code: 1",
+        ] {
+            assert!(super::an_instruction_failed(failed), "{failed}");
+        }
+        for not_the_build in [
+            "ERROR: no builder \"wrkflw\" found",
+            "ERROR: failed to solve: ubuntu:latest: failed to resolve source metadata",
+            "error: unknown flag: --provenance",
+            // What an instruction printed is not an error line of BuildKit's.
+            "#7 0.312 process \"x\" did not complete successfully",
+        ] {
+            assert!(
+                !super::an_instruction_failed(not_the_build),
+                "{not_the_build}"
+            );
+        }
+    }
+
+    /// The cause is in what the instruction printed last; the end of
+    /// BuildKit's output is the Dockerfile, which says nothing of it.
+    #[test]
+    fn a_failed_instruction_is_reported_by_what_it_printed() {
+        let stderr = "#5 [2/3] RUN echo one\n\
+                      #5 0.170 one\n\
+                      #5 DONE 0.2s\n\
+                      \n\
+                      #6 [3/3] RUN apt-get install -y wget\n\
+                      #6 0.195 Reading package lists...\n\
+                      #6 0.201 E: Unable to locate package wget\n\
+                      #6 ERROR: process \"/bin/sh -c apt-get install -y wget\" did not complete successfully: exit code: 100\n\
+                      ------\n\
+                      Dockerfile:3\n\
+                      \x20  3 | >>> RUN apt-get install -y wget\n\
+                      ERROR: failed to build: failed to solve: process \"/bin/sh -c apt-get install -y wget\" did not complete successfully: exit code: 100\n";
+        assert_eq!(
+            super::failed_instruction_output(stderr).unwrap(),
+            "Reading package lists...\n\
+             E: Unable to locate package wget\n\
+             process \"/bin/sh -c apt-get install -y wget\" did not complete successfully: exit code: 100"
+        );
+        // Without step numbers there is nothing to pick out.
+        assert_eq!(
+            super::failed_instruction_output(
+                "error: failed to solve: executor failed running [/bin/sh -c false]: exit code: 1"
+            ),
+            None
+        );
+    }
 
     #[test]
     fn the_engines_builder_can_be_asked_for() {

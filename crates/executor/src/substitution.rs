@@ -8,7 +8,7 @@ use wrkflw_parser::workflow::Step;
 
 lazy_static! {
     static ref MATRIX_PATTERN: Regex =
-        Regex::new(r"\$\{\{\s*matrix\.([a-zA-Z0-9_]+)\s*\}\}").unwrap();
+        Regex::new(r"\$\{\{\s*matrix\.([a-zA-Z_][a-zA-Z0-9_-]*)\s*\}\}").unwrap();
     static ref HASH_FILES_PATTERN: Regex =
         Regex::new(r"\$\{\{\s*hashFiles\(([^)]+)\)\s*\}\}").unwrap();
     static ref HASH_FILES_CALL: Regex = Regex::new(r"(?i)\bhashFiles\(([^)]*)\)").unwrap();
@@ -424,6 +424,16 @@ mod tests {
         assert_eq!(
             processed,
             "echo \"Starting job\" && echo \"OS: ubuntu-latest\" && echo \"Done!\""
+        );
+    }
+
+    #[test]
+    fn a_matrix_key_may_have_a_hyphen() {
+        let mut matrix = HashMap::new();
+        matrix.insert("node-version".to_string(), Value::Number(22.into()));
+        assert_eq!(
+            preprocess_command("${{ matrix.node-version }}", &matrix),
+            "22"
         );
     }
 
@@ -900,6 +910,36 @@ mod tests {
                 .get("java-version")
                 .unwrap(),
             "17"
+        );
+    }
+
+    /// `python-version: ${{ matrix.python-version }}` is how most matrices
+    /// over versions are written, and the image is built from the result.
+    #[test]
+    fn apply_matrix_to_steps_resolves_a_hyphenated_key() {
+        let combination = HashMap::from([(
+            "python-version".to_string(),
+            Value::String("3.13".to_string()),
+        )]);
+        let steps = vec![make_uses_step(
+            "actions/setup-python@v5",
+            HashMap::from([(
+                "python-version".to_string(),
+                "${{ matrix.python-version }}".to_string(),
+            )]),
+        )];
+        let result = apply_matrix_to_steps(&steps, &combination);
+        assert_eq!(result[0].with.as_ref().unwrap()["python-version"], "3.13");
+    }
+
+    /// GitHub's property names start with a letter or `_`, so `matrix.1x`
+    /// isn't a matrix value and is left as written.
+    #[test]
+    fn a_matrix_reference_must_start_with_a_letter() {
+        let matrix = HashMap::from([("1x".to_string(), Value::Number(1.into()))]);
+        assert_eq!(
+            preprocess_command("${{ matrix.1x }}", &matrix),
+            "${{ matrix.1x }}"
         );
     }
 

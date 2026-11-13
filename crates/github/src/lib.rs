@@ -31,6 +31,27 @@ pub enum GithubError {
     UnexpectedResponse(String),
 }
 
+/// Whether a pull request event started `run`.
+fn is_pull_request_run(run: &serde_json::Value) -> bool {
+    run["event"]
+        .as_str()
+        .is_some_and(|event| event.starts_with("pull_request"))
+}
+
+/// The branch the pull request behind `run` goes into, as the run lists it.
+///
+/// Only a pull request's run has one. A push lists every open pull request
+/// whose head is the pushed commit, a fork's included, and it ran on the
+/// branch, not on a merge into that pull request's base.
+fn listed_base_branch(run: &serde_json::Value) -> Option<String> {
+    if !is_pull_request_run(run) {
+        return None;
+    }
+    run["pull_requests"][0]["base"]["ref"]
+        .as_str()
+        .map(str::to_string)
+}
+
 /// How long one request to GitHub may take, connecting included, before it
 /// fails instead of hanging the command.
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -546,9 +567,9 @@ pub async fn fetch_run(reference: &RunReference) -> Result<RemoteRun, GithubErro
     // GitHub empties `pull_requests` once the pull request is merged or
     // closed. Most pull requests go into the default branch, so fall back to
     // it rather than leave the event unrunnable.
-    let base_branch = match run["pull_requests"][0]["base"]["ref"].as_str() {
-        Some(base) => Some(base.to_string()),
-        None if text("event").is_some_and(|e| e.starts_with("pull_request")) => {
+    let base_branch = match listed_base_branch(&run) {
+        Some(base) => Some(base),
+        None if is_pull_request_run(&run) => {
             api_get(&client, &format!("/repos/{owner}/{repo}"), token.as_deref())
                 .await
                 .ok()
@@ -597,6 +618,19 @@ pub async fn fetch_run(reference: &RunReference) -> Result<RemoteRun, GithubErro
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_pull_request_run_takes_a_base_branch_from_its_pull_requests() {
+        let listed = serde_json::json!([{"base": {"ref": "main"}}]);
+        let pull_request = serde_json::json!({"event": "pull_request", "pull_requests": listed});
+        assert_eq!(listed_base_branch(&pull_request), Some("main".to_string()));
+        // A push lists a fork's pull request whose head is the pushed commit.
+        let push = serde_json::json!({"event": "push", "pull_requests": listed});
+        assert_eq!(listed_base_branch(&push), None);
+        let merged = serde_json::json!({"event": "pull_request_target", "pull_requests": []});
+        assert_eq!(listed_base_branch(&merged), None);
+        assert!(is_pull_request_run(&merged));
+    }
 
     #[test]
     fn only_a_full_hex_commit_id_is_taken_from_the_api() {

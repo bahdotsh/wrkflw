@@ -215,6 +215,15 @@ fn parse_event_config(
         });
     }
 
+    // `schedule` takes a list of `cron` entries, which say when it fires
+    // and filter nothing.
+    if event_name == "schedule" && value.is_sequence() {
+        return Ok(EventFilter {
+            event_name: event_name.to_string(),
+            ..Default::default()
+        });
+    }
+
     // A non-null value for an event MUST be a mapping of filter keys
     // (branches/tags/paths/types/...). Previously this path silently
     // returned a default (unfiltered) EventFilter for anything else, so
@@ -432,6 +441,17 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_name, "push");
         assert!(events[0].paths.is_empty());
+    }
+
+    #[test]
+    fn a_schedule_lists_its_cron_entries() {
+        let raw = make_on_raw("{push: null, schedule: [{cron: '40 1 * * *'}]}");
+        let events = parse_events(&raw).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1].event_name, "schedule");
+        // Any other event given a list is still a mistake.
+        let raw = make_on_raw("{push: [main]}");
+        assert!(parse_events(&raw).is_err());
     }
 
     #[test]

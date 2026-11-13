@@ -2287,8 +2287,8 @@ fn combined_image_tag(runtimes: &[SetupRuntime], dockerfile: &str) -> String {
 static IMAGE_BUILD_LOCKS: Lazy<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
-/// Whether an image with these shared layers has been built in this run,
-/// by the text of the layers. See `shared_layers`.
+/// Whether an image with these shared layers has had its first build in
+/// this process, by the text of the layers. See `shared_layers`.
 static SHARED_LAYER_BUILDS: Lazy<Mutex<HashMap<String, Arc<tokio::sync::Mutex<bool>>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
@@ -2415,7 +2415,9 @@ async fn build_combined_runtime_image(
     // Images that start with the same packages build them once: the first
     // build goes alone, and the others start when its layers are there to
     // reuse. Started together, five BuildKit builds took 67 s to give the
-    // first image where one alone took 43 s.
+    // first image where one alone took 43 s. Once the first is over, built
+    // or failed, the others go together: one after another, each would
+    // fail in turn on shared layers that don't build.
     let shared_lock = {
         let mut locks = SHARED_LAYER_BUILDS.lock().unwrap();
         locks
@@ -2443,20 +2445,19 @@ async fn build_combined_runtime_image(
             .join(", ")
     ));
 
-    build_image_checked(runtime, &dockerfile_path, &tag, temp_dir.path())
-        .await
-        .map_err(|e| {
-            let error = e.to_string();
-            remember_failed_image_build(&tag, &error);
-            ExecutionError::Runtime(format!(
-                "{}: {}",
-                crate::setup_errors::COMBINED_IMAGE_BUILD,
-                error
-            ))
-        })?;
+    let built = build_image_checked(runtime, &dockerfile_path, &tag, temp_dir.path()).await;
     if let Some(shared_built) = first_build.as_mut() {
         **shared_built = true;
     }
+    built.map_err(|e| {
+        let error = e.to_string();
+        remember_failed_image_build(&tag, &error);
+        ExecutionError::Runtime(format!(
+            "{}: {}",
+            crate::setup_errors::COMBINED_IMAGE_BUILD,
+            error
+        ))
+    })?;
 
     Ok(tag)
 }
@@ -10120,6 +10121,31 @@ runs:
             );
         }
     }
+
+    /// The first build of a set of shared layers going alone is over when
+    /// it fails too: the builds waiting on it go together then, not each
+    /// alone in turn.
+    #[tokio::test]
+    async fn a_failed_first_build_of_shared_layers_lets_the_others_go() {
+        let base = "wrkflw-test/first-shared-build-fails:1";
+        let runtimes = detect_setup_runtimes(&[make_step_uses("actions/setup-java@v4", None)]);
+        let runtime = flaky(vec![Some("RUN apt-get update: exit code 100")], None);
+        with_run_image_builds(async {
+            assert!(build_combined_runtime_image(&runtimes, base, &runtime)
+                .await
+                .is_err());
+        })
+        .await;
+        let first_over = SHARED_LAYER_BUILDS
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(layers, _)| layers.starts_with(&format!("FROM {}\n", base)))
+            .map(|(_, over)| over.clone())
+            .expect("the shared layers were built first");
+        assert!(*first_over.try_lock().unwrap());
+    }
+
     // --- NativeDocker execute_step integration tests ---
 
     #[tokio::test]

@@ -912,7 +912,7 @@ impl ContainerRuntime for DockerRuntime {
                     tag,
                     timeout_duration.as_secs()
                 ));
-                Err(ContainerError::ImageBuild(
+                Err(ContainerError::ImageBuildTimeout(
                     "Operation timed out".to_string(),
                 ))
             }
@@ -1077,6 +1077,10 @@ impl ContainerRuntime for DockerRuntime {
     }
 
     fn identifies_images(&self) -> bool {
+        true
+    }
+
+    fn reuses_build_layers(&self) -> bool {
         true
     }
 }
@@ -1697,6 +1701,20 @@ mod tests {
     use super::wait_exit_code;
     use bollard::errors::Error;
     use bollard::models::ContainerWaitResponse;
+
+    /// Only the engine's answer that there is no such container counts as
+    /// one that is gone; a container in the way of its removal is still
+    /// there to warn about.
+    #[test]
+    fn only_a_404_says_the_container_is_not_there() {
+        let answered = |status_code| Error::DockerResponseServerError {
+            status_code,
+            message: "No such container: wrkflw-x".to_string(),
+        };
+        assert!(super::is_not_found(&answered(404)));
+        assert!(!super::is_not_found(&answered(409)));
+        assert!(!super::is_not_found(&answered(500)));
+    }
 
     /// A container whose creation timed out is tracked by name. One the
     /// engine never created is let go of by the removal that waits for it.

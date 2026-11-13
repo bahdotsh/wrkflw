@@ -2111,6 +2111,9 @@ fn report_action_not_run(uses: &str, cause: Option<&str>) -> Option<String> {
     Some(uses.to_string())
 }
 
+/// Ends a `RUN` that fetched the package lists by removing them.
+const REMOVE_PACKAGE_LISTS: &str = " && \\\n    rm -rf /var/lib/apt/lists/*";
+
 /// Generate a Dockerfile that installs multiple language runtimes on an Ubuntu base.
 ///
 /// `base_id` is the base image's local content ID, when known. It goes into
@@ -2172,6 +2175,7 @@ fn generate_combined_dockerfile(
         dockerfile.push_str(" && \\\n");
         dockerfile.push_str(&format!("    {}", runner_node_install()));
     }
+    dockerfile.push_str(REMOVE_PACKAGE_LISTS);
     dockerfile.push('\n');
 
     // After the shared packages, so a variable that differs between the
@@ -2198,12 +2202,17 @@ fn generate_combined_dockerfile(
         dockerfile.push_str(&format!("ENV {}={}\n", name, value));
     }
 
-    // The package lists stay: several installs take packages of their own,
-    // and the shared layer keeps them whatever a later layer removes, so
-    // removing them would add a layer and save nothing. A step's own
-    // `apt-get install` finds them, as on GitHub's runners.
+    // Each layer that fetched the package lists removes them again, in the
+    // same instruction, so none are in the image. Lists kept from a build
+    // weeks ago name packages the mirrors have since replaced, and a
+    // step's `apt-get install` would fail on some of them and not others;
+    // without lists it says at once that it wants an `apt-get update`.
     for script in &scripts {
-        dockerfile.push_str(&format!("RUN {}\n", script));
+        dockerfile.push_str(&format!("RUN {}", script));
+        if script.contains("apt-get") {
+            dockerfile.push_str(REMOVE_PACKAGE_LISTS);
+        }
+        dockerfile.push('\n');
     }
 
     // Base images can bundle tools ahead of the system directories. The act
@@ -2403,12 +2412,11 @@ async fn build_combined_runtime_image(
     build_image_checked(runtime, &dockerfile_path, &tag, temp_dir.path())
         .await
         .map_err(|e| {
-            let error = e.to_string();
-            remember_failed_image_build(&tag, &error);
+            remember_failed_image_build(&tag, &e);
             ExecutionError::Runtime(format!(
                 "{}: {}",
                 crate::setup_errors::COMBINED_IMAGE_BUILD,
-                error
+                e
             ))
         })?;
 
@@ -8033,6 +8041,9 @@ mod tests {
         }
     }
 
+    /// What a build of [`FlakyBuildRuntime`] that runs out of time fails with.
+    const TIMED_OUT: &str = "Operation timed out";
+
     /// A runtime whose builds fail as `errors` says, in turn, and whose
     /// image exists after the build numbered `exists_after` (counting from 1).
     struct FlakyBuildRuntime {
@@ -8061,9 +8072,13 @@ mod tests {
             let mut builds = self.builds.lock().unwrap();
             *builds += 1;
             match self.errors.get(*builds - 1).copied().flatten() {
+                Some(TIMED_OUT) => Err(ContainerError::ImageBuildTimeout(TIMED_OUT.to_string())),
                 Some(error) => Err(ContainerError::ImageBuild(error.to_string())),
                 None => Ok(()),
             }
+        }
+        fn reuses_build_layers(&self) -> bool {
+            true
         }
         async fn prepare_language_environment(
             &self,
@@ -8186,6 +8201,29 @@ mod tests {
         // The shared layers twice, cut off; then the shared layers and the
         // image.
         assert_eq!(*runtime.builds.lock().unwrap(), 4);
+    }
+
+    /// A build ahead shares the engine with the jobs running. One that ran
+    /// out of time there says nothing of the image, so it isn't remembered
+    /// as failed, and the job builds it at its turn.
+    #[tokio::test]
+    async fn an_image_whose_build_ran_out_of_time_is_built_again() {
+        let runtimes = detect_setup_runtimes(&[make_step_uses("actions/setup-go@v5", None)]);
+        let runtime = flaky(vec![Some(TIMED_OUT)], None);
+        with_run_image_builds(async {
+            let err = build_combined_runtime_image(&runtimes, "ubuntu:latest", &runtime)
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains(TIMED_OUT), "{err}");
+            // Given up on once, not tried again there and then.
+            assert_eq!(*runtime.builds.lock().unwrap(), 1);
+            build_combined_runtime_image(&runtimes, "ubuntu:latest", &runtime)
+                .await
+                .unwrap();
+        })
+        .await;
+        // The shared layers, out of time; then the shared layers and the image.
+        assert_eq!(*runtime.builds.lock().unwrap(), 3);
     }
 
     #[tokio::test]
@@ -9928,7 +9966,11 @@ runs:
         assert_eq!(shared.matches("RUN ").count(), 1, "{shared}");
         assert!(shared.contains("build-essential"), "{shared}");
         assert!(
-            shared.ends_with(&format!("{}\n", runner_node_install())),
+            shared.ends_with(&format!(
+                "{}{}\n",
+                runner_node_install(),
+                REMOVE_PACKAGE_LISTS
+            )),
             "{shared}"
         );
         assert!(!shared.contains("uv python install"), "{shared}");
@@ -9994,12 +10036,14 @@ runs:
     }
 
     /// A runtime that remembers the tags it built, and has those and any
-    /// it starts with. A build of a tag in `failing` fails on its own.
+    /// it starts with. A build of a tag in `failing` fails on its own. One
+    /// that `ships_images` keeps no layers for a later build to reuse.
     #[derive(Default)]
     struct TagBuildRuntime {
         existing: Mutex<std::collections::HashSet<String>>,
         built: Mutex<Vec<String>>,
         failing: Option<&'static str>,
+        ships_images: bool,
     }
 
     #[async_trait::async_trait]
@@ -10040,6 +10084,69 @@ runs:
         async fn image_exists(&self, tag: &str) -> Result<bool, ContainerError> {
             Ok(self.existing.lock().unwrap().contains(tag))
         }
+        fn reuses_build_layers(&self) -> bool {
+            !self.ships_images
+        }
+    }
+
+    /// No step runs in the image of shared layers. A runtime that ships
+    /// each image it builds, as Kubernetes does to its registry, would
+    /// build and ship that one on every run for nothing.
+    #[tokio::test]
+    async fn a_runtime_that_ships_its_images_builds_no_shared_layers() {
+        let go = detect_setup_runtimes(&[make_step_uses("actions/setup-go@v5", None)]);
+        let runtime = TagBuildRuntime {
+            ships_images: true,
+            ..TagBuildRuntime::default()
+        };
+        let tag = with_run_image_builds(build_combined_runtime_image(
+            &go,
+            "wrkflw-test/shipped:1",
+            &runtime,
+        ))
+        .await
+        .unwrap();
+        assert_eq!(*runtime.built.lock().unwrap(), [tag]);
+    }
+
+    /// The image is built while the job waits, and the job is told at its
+    /// turn why that failed, without building it a second time.
+    #[tokio::test]
+    async fn a_job_is_given_the_failure_of_its_image_built_ahead() {
+        let job = make_job(None, Some(vec!["ubuntu-latest".into()]));
+        let steps = [make_step_uses("actions/setup-go@v5", None)];
+        let runtime = TagBuildRuntime {
+            failing: Some(COMBINED_IMAGE_PREFIX),
+            ..TagBuildRuntime::default()
+        };
+        with_run_image_builds(async {
+            build_image_ahead(&job, &steps, &runtime, &HashMap::new(), None).await;
+            assert_eq!(runtime.built.lock().unwrap().len(), 1);
+            let err = resolve_runner_image(&job, &steps, &runtime, &HashMap::new(), None)
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("exit code 100"), "{err}");
+        })
+        .await;
+        assert_eq!(runtime.built.lock().unwrap().len(), 1);
+    }
+
+    /// The image built ahead is the one the job finds at its turn.
+    #[tokio::test]
+    async fn a_job_finds_the_image_built_ahead_at_its_turn() {
+        let job = make_job(None, Some(vec!["ubuntu-latest".into()]));
+        let steps = [make_step_uses("actions/setup-go@v5", None)];
+        let runtime = TagBuildRuntime::default();
+        with_run_image_builds(async {
+            build_image_ahead(&job, &steps, &runtime, &HashMap::new(), None).await;
+            let built = runtime.built.lock().unwrap().clone();
+            let resolved = resolve_runner_image(&job, &steps, &runtime, &HashMap::new(), None)
+                .await
+                .unwrap();
+            assert_eq!(built.last(), Some(&resolved.image));
+            assert_eq!(*runtime.built.lock().unwrap(), built);
+        })
+        .await;
     }
 
     /// Images on the same base share the layers of their packages: the
@@ -10987,8 +11094,41 @@ runs:
         assert_eq!(df.matches("RUN ").count(), 3);
         assert!(df.contains("nodesource"));
         assert!(df.contains("uv python install '3.12'"));
-        // Both installs take packages of their own, so the lists stay.
-        assert!(!df.contains("apt/lists"), "{df}");
+    }
+
+    /// Package lists kept from a build weeks ago name packages the mirrors
+    /// no longer have, so a step's `apt-get install` would work for some
+    /// packages and not others. Every layer that fetched them removes them
+    /// in the same instruction, and a step is told to update first.
+    #[test]
+    fn no_layer_leaves_package_lists_in_the_image() {
+        let runtimes: Vec<SetupRuntime> = ["node", "python", "java"]
+            .iter()
+            .map(|language| SetupRuntime {
+                language: language.to_string(),
+                version: "21".to_string(),
+                install_script: get_install_script(language, "21"),
+                floating: false,
+                env: Vec::new(),
+            })
+            .collect();
+        let df = generate_combined_dockerfile(&runtimes, "ubuntu:latest", None, None);
+        let runs: Vec<&str> = df
+            .split("\nRUN ")
+            .skip(1)
+            .map(|run| run.split("\nENV ").next().unwrap().trim_end())
+            .collect();
+        assert_eq!(runs.len(), 4, "{df}");
+        for run in &runs {
+            assert_eq!(
+                run.contains("apt-get"),
+                run.ends_with("rm -rf /var/lib/apt/lists/*"),
+                "{run}"
+            );
+        }
+        // The shared packages, Node.js and Java take packages; uv's
+        // Python doesn't.
+        assert_eq!(df.matches("apt/lists").count(), 3, "{df}");
     }
 
     #[test]
@@ -15876,6 +16016,10 @@ runs:
 
             async fn image_exists(&self, tag: &str) -> Result<bool, ContainerError> {
                 Ok(self.builds.lock().unwrap().iter().any(|built| built == tag))
+            }
+
+            fn reuses_build_layers(&self) -> bool {
+                true
             }
         }
 

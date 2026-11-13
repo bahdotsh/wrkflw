@@ -8,7 +8,7 @@ use once_cell::sync::Lazy;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use wrkflw_runtime::container::{ContainerRuntime, COMBINED_IMAGE_PREFIX};
+use wrkflw_runtime::container::{ContainerError, ContainerRuntime, COMBINED_IMAGE_PREFIX};
 
 use crate::engine::fnv1a_hash;
 
@@ -41,11 +41,10 @@ pub(crate) fn failed_image_build(tag: &str) -> Option<String> {
         .flatten()
 }
 
-/// Remember for the rest of the run that `tag` failed to build. A lost
-/// connection to the engine isn't the build's fault, and is left for the
-/// next build to try again.
-pub(crate) fn remember_failed_image_build(tag: &str, error: &str) {
-    if is_transport_error(error) {
+/// Remember for the rest of the run that `tag` failed to build, unless
+/// the same build [may work on another try](may_build_on_another_try).
+pub(crate) fn remember_failed_image_build(tag: &str, error: &ContainerError) {
+    if may_build_on_another_try(error) {
         return;
     }
     let _ = FAILED_IMAGE_BUILDS.try_with(|failed| {
@@ -54,6 +53,15 @@ pub(crate) fn remember_failed_image_build(tag: &str, error: &str) {
             .unwrap()
             .insert(tag.to_string(), error.to_string())
     });
+}
+
+/// Whether `error` says nothing of the build itself, so the same build may
+/// well work when it is tried again: the connection to the engine was
+/// lost, or the build ran out of time. A build ahead shares the engine
+/// with the jobs running and with other builds, and one that ran out of
+/// time there is built again by its job, at its turn.
+fn may_build_on_another_try(error: &ContainerError) -> bool {
+    matches!(error, ContainerError::ImageBuildTimeout(_)) || is_transport_error(&error.to_string())
 }
 
 /// Build the layers a combined image shares with every image on the same
@@ -66,10 +74,18 @@ pub(crate) fn remember_failed_image_build(tag: &str, error: &str) {
 /// one alone took 43 s. Only the shared layers are waited for, not another
 /// job's runtimes, and an engine that has the shared image from an earlier
 /// run waits for nothing.
+///
+/// Only where a build [reuses the layers](ContainerRuntime::reuses_build_layers)
+/// an earlier one left: no step runs in the shared image, so a runtime
+/// that ships every image it builds to a registry, as Kubernetes does,
+/// would build and ship it on every run for nothing.
 pub(crate) async fn ensure_shared_layers(
     dockerfile: &str,
     runtime: &dyn ContainerRuntime,
 ) -> Result<(), String> {
+    if !runtime.reuses_build_layers() {
+        return Ok(());
+    }
     let shared = shared_layers(dockerfile);
     if shared.len() == dockerfile.len() {
         return Ok(());
@@ -102,9 +118,8 @@ pub(crate) async fn ensure_shared_layers(
     build_image_checked(runtime, &dockerfile_path, &tag, temp_dir.path())
         .await
         .map_err(|e| {
-            let error = e.to_string();
-            remember_failed_image_build(&tag, &error);
-            error
+            remember_failed_image_build(&tag, &e);
+            e.to_string()
         })
 }
 

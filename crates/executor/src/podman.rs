@@ -550,7 +550,7 @@ impl ContainerRuntime for PodmanRuntime {
                     "Building image {} timed out after 120 seconds",
                     tag
                 ));
-                Err(ContainerError::ImageBuild(
+                Err(ContainerError::ImageBuildTimeout(
                     "Operation timed out".to_string(),
                 ))
             }
@@ -721,6 +721,10 @@ impl ContainerRuntime for PodmanRuntime {
     }
 
     fn identifies_images(&self) -> bool {
+        true
+    }
+
+    fn reuses_build_layers(&self) -> bool {
         true
     }
 }

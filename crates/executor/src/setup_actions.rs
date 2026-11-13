@@ -1134,6 +1134,12 @@ pub(crate) const RUNNER_NODE_MAJOR: &str = "22";
 /// distribution's package took a second `apt-get update` and four times as
 /// long, on every first build of a job's image. A machine nodejs.org builds
 /// nothing for, such as riscv64, gets the distribution's package as before.
+///
+/// The checksum comes from nodejs.org too, over the same TLS, so it catches
+/// a download that was cut short or damaged, not a release someone put
+/// there: its signature isn't checked. nodejs.org is trusted as far as the
+/// other installs trust where they fetch from, which run a script from
+/// astral.sh, sh.rustup.rs or deb.nodesource.com as root.
 pub(crate) fn runner_node_install() -> String {
     let dist = format!("https://nodejs.org/dist/latest-v{}.x", RUNNER_NODE_MAJOR);
     format!(

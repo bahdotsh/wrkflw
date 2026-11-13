@@ -1125,7 +1125,7 @@ impl KubernetesRuntime {
         )
         .await
         .map_err(|_| {
-            ContainerError::ImageBuild(format!(
+            ContainerError::ImageBuildTimeout(format!(
                 "{} timed out after {} seconds",
                 what,
                 timeout.as_secs()
@@ -1584,6 +1584,14 @@ mod tests {
         assert!(rt.image_exists("python:3.11").await.unwrap());
         assert!(!rt.image_exists("wrkflw-combined:abc").await.unwrap());
         assert!(!rt.image_exists("wrkflw-python-3.11").await.unwrap());
+    }
+
+    /// Every image built is pushed to the registry, and a later build's
+    /// cache is the local builder's business: nothing is gained by building
+    /// shared layers as an image of their own, which would be pushed too.
+    #[test]
+    fn a_built_image_is_shipped_so_no_layers_are_built_to_share() {
+        assert!(!KubernetesRuntime::new(cfg(), false).reuses_build_layers());
     }
 
     #[tokio::test]

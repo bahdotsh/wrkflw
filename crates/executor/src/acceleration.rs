@@ -142,8 +142,12 @@ pub struct Acceleration {
     pub reuse_results: bool,
     /// Files changed since the base. `Some` turns on `--affected`.
     pub changed_files: Option<Vec<String>>,
-    /// Run a job's `run:` steps in one container instead of one per step.
-    pub job_container: bool,
+    /// Run each `run:` step in a container of its own instead of the job's
+    /// one, so what a step leaves outside the workspace is gone in the next.
+    pub step_containers: bool,
+    /// Start a Docker engine inside the container of a job whose steps run
+    /// `docker`. That container runs privileged.
+    pub docker_in_jobs: bool,
     /// Mount package manager caches from the host.
     pub dep_cache: bool,
     /// Directory, `file://` or `https://` base for shared results.
@@ -463,11 +467,28 @@ pub(crate) struct RunState {
     dep_mounts: OnceLock<Vec<(PathBuf, PathBuf)>>,
     /// Set once the run has said it won't push an emulated result.
     warned_on_host_push: AtomicBool,
+    /// Set once the run has said its steps run `docker` with no engine.
+    warned_of_missing_docker: AtomicBool,
 }
 
 tokio::task_local! {
     /// `None` inside a called workflow, whose inputs aren't in any fingerprint.
     static RUN: Option<Arc<RunState>>;
+    /// Set with [`RUN`], and kept inside a called workflow.
+    static CONTAINERS: ContainerPolicy;
+}
+
+/// How the jobs of a run use containers. Unlike the rest of the run's
+/// state it reaches the jobs of a called workflow, whose steps share a
+/// machine on GitHub as any job's do.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub(crate) struct ContainerPolicy {
+    /// One container per step, not one per job.
+    pub step_containers: bool,
+    /// Keep a failed step's container, which takes one per step.
+    pub preserve_containers: bool,
+    /// Start a Docker engine in the container of a job that runs `docker`.
+    pub docker_in_jobs: bool,
 }
 
 /// The directory results are kept in.
@@ -533,6 +554,7 @@ impl RunState {
             groups: Mutex::new(HashMap::new()),
             dep_mounts: OnceLock::new(),
             warned_on_host_push: AtomicBool::new(false),
+            warned_of_missing_docker: AtomicBool::new(false),
         })
     }
 
@@ -564,7 +586,14 @@ impl RunState {
 
 /// Run `future` with this run's state available to the jobs it executes.
 pub(crate) async fn with_run_state<F: Future>(state: Arc<RunState>, future: F) -> F::Output {
-    RUN.scope(Some(state), future).await
+    let policy = ContainerPolicy {
+        step_containers: state.accel.step_containers,
+        preserve_containers: state.preserve_containers,
+        docker_in_jobs: state.accel.docker_in_jobs,
+    };
+    CONTAINERS
+        .scope(policy, RUN.scope(Some(state), future))
+        .await
 }
 
 /// Run a called workflow's jobs with none of this applied.
@@ -574,6 +603,19 @@ pub(crate) async fn without_run_state<F: Future>(future: F) -> F::Output {
 
 pub(crate) fn current() -> Option<Arc<RunState>> {
     RUN.try_with(|run| run.clone()).ok().flatten()
+}
+
+/// True the first time a run asks, so it says only once that steps run
+/// `docker` with no engine there. Always true in a called workflow, which
+/// has no run state to remember in.
+pub(crate) fn first_missing_docker_warning() -> bool {
+    current().is_none_or(|run| !run.warned_of_missing_docker.swap(true, Ordering::Relaxed))
+}
+
+/// How this run's jobs use containers, or `None` outside a run that has a
+/// say in it, as a GitLab pipeline's.
+pub(crate) fn container_policy() -> Option<ContainerPolicy> {
+    CONTAINERS.try_with(|policy| *policy).ok()
 }
 
 /// Host and container paths of the `--dep-cache` mounts.

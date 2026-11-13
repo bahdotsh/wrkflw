@@ -473,9 +473,20 @@ enum Commands {
         #[arg(long, requires = "event")]
         affected: bool,
 
-        /// Run a job's steps in one container instead of one per step
-        #[arg(long)]
+        /// Run each step in a container of its own instead of one per job.
+        /// What a step installs outside the workspace is then gone in the next
+        #[arg(long, env = "WRKFLW_STEP_CONTAINERS")]
+        step_containers: bool,
+
+        /// One container per job is the default now; accepted so older
+        /// scripts keep working
+        #[arg(long, hide = true, conflicts_with = "step_containers")]
         job_container: bool,
+
+        /// Start a Docker engine inside the container of a job whose steps
+        /// run `docker`. That container runs privileged
+        #[arg(long, env = "WRKFLW_DOCKER_IN_JOBS")]
+        docker_in_jobs: bool,
 
         /// Mount cargo, npm, pip and Go caches from the host into containers
         #[arg(long)]
@@ -1433,7 +1444,9 @@ async fn run_cli() {
             reuse_results,
             stream_output,
             affected,
-            job_container,
+            step_containers,
+            job_container: _,
+            docker_in_jobs,
             dep_cache,
             remote_cache,
             cache_push,
@@ -1478,7 +1491,8 @@ async fn run_cli() {
                 from_step: from_step.clone(),
                 reuse_results: *reuse_results,
                 affected: *affected,
-                job_container: *job_container,
+                step_containers: *step_containers,
+                docker_in_jobs: *docker_in_jobs,
                 dep_cache: *dep_cache,
                 remote_cache: remote_cache.clone(),
                 cache_push: *cache_push,

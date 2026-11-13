@@ -12,7 +12,7 @@ The execution engine that runs GitHub Actions, Gitea and GitLab CI workflows loc
 - Job-level `continue-on-error` (also as an expression) and job-level `concurrency:` groups within a run
 - Matrices computed by expressions, including from an earlier job's outputs
 - Result reuse (`acceleration.reuse_results`): a job whose fingerprint matches a passing run is skipped, with its outputs replayed, from a local store or a signed remote cache
-- Affected-job skipping from `.wrkflw/affected.yml`, one container per job (`acceleration.job_container`) and shared dependency caches (`acceleration.dep_cache`)
+- Affected-job skipping from `.wrkflw/affected.yml`, shared dependency caches (`acceleration.dep_cache`), and the opt-outs and opt-ins of one container per job (`acceleration.step_containers`, `acceleration.docker_in_jobs`)
 - Kubernetes execution: each step runs as a pod in the cluster `kubectl` points at, with the workspace synced in and out
 - GitLab CI pipelines, including `parallel`, `parallel:matrix`, `rules`, `when` and stages
 - Local `actions/upload-artifact`, `actions/download-artifact`, and `actions/cache` via shared artifact and cache stores

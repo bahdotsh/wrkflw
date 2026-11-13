@@ -571,6 +571,87 @@ pub(crate) fn is_safe_python_spec(spec: &str) -> bool {
         })
 }
 
+/// Words that come before the command they run, or before a command in a
+/// compound one.
+const COMMAND_PREFIXES: &[&str] = &[
+    "sudo", "env", "time", "exec", "command", "nohup", "then", "do", "else", "elif", "if", "while",
+    "until", "!",
+];
+
+/// `NAME=value`, as a shell takes ahead of a command.
+fn is_assignment(word: &str) -> bool {
+    word.split_once('=').is_some_and(|(name, _)| {
+        !name.is_empty()
+            && !name.starts_with(|c: char| c.is_ascii_digit())
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    })
+}
+
+/// Whether `script` runs one of `commands`, by name or by path, as far as
+/// its text says: `sudo docker run`, `FOO=1 cargo test`, `$(rustc -V)`.
+/// A command named only in an argument, as in `echo cargo`, isn't run.
+fn script_runs(script: &str, commands: &[&str]) -> bool {
+    script
+        .lines()
+        .map(str::trim_start)
+        .filter(|line| !line.starts_with('#'))
+        .flat_map(|line| line.split([';', '|', '&', '(', ')', '`', '{', '}']))
+        .any(|command| {
+            command
+                .split_whitespace()
+                .find(|word| {
+                    !(is_assignment(word)
+                        || word.starts_with('-')
+                        || COMMAND_PREFIXES.contains(word))
+                })
+                .is_some_and(|word| {
+                    let name = word.rsplit('/').next().unwrap_or(word);
+                    commands.contains(&name)
+                })
+        })
+}
+
+/// Whether a `run:` step of `steps` runs one of `commands`.
+pub(crate) fn steps_run(steps: &[Step], commands: &[&str]) -> bool {
+    steps
+        .iter()
+        .filter_map(|step| step.run.as_deref())
+        .any(|script| script_runs(script, commands))
+}
+
+/// The commands of the Rust toolchain a hosted runner comes with.
+const RUNNER_RUST_COMMANDS: &[&str] = &["cargo", "rustup", "rustc", "rustfmt"];
+
+/// The Rust toolchain hosted runners come with, when `steps` use it and no
+/// setup action among `runtimes` installs one: rustup with `stable`, which
+/// a `rustup toolchain add` or a plain `cargo test` step counts on.
+pub(crate) fn runner_rust(steps: &[Step], runtimes: &[SetupRuntime]) -> Option<SetupRuntime> {
+    (!runtimes.iter().any(|rt| rt.language == "rust") && steps_run(steps, RUNNER_RUST_COMMANDS))
+        .then(|| SetupRuntime {
+            language: "rust".to_string(),
+            version: "stable".to_string(),
+            install_script: get_install_script("rust", "stable"),
+            floating: true,
+            env: Vec::new(),
+        })
+}
+
+/// A Docker engine and its CLI, for a job that runs its own.
+/// `docker-buildx` and `docker-compose-v2` are packages only newer
+/// releases have, so a base without them still gets the engine.
+pub(crate) fn docker_engine() -> SetupRuntime {
+    SetupRuntime {
+        language: "docker".to_string(),
+        version: "engine".to_string(),
+        install_script: "apt-get update && \
+             apt-get install -y --no-install-recommends docker.io iptables && \
+             (apt-get install -y --no-install-recommends docker-buildx docker-compose-v2 || true)"
+            .to_string(),
+        floating: false,
+        env: Vec::new(),
+    }
+}
+
 /// Scan job steps for known setup actions and return the runtimes they configure.
 ///
 /// If the same language appears multiple times, only the last occurrence is kept
@@ -1206,4 +1287,89 @@ pub(crate) fn rust_toolchain_extras(
 /// job runs and can go into the runner image.
 pub(crate) fn static_input(value: &str) -> Option<String> {
     (!value.contains("${{")).then(|| value.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run_step(run: &str) -> Step {
+        Step::with_run("step", run)
+    }
+
+    #[test]
+    fn a_command_is_found_where_a_shell_would_run_it() {
+        for script in [
+            "docker run alpine true",
+            "  sudo -E docker build .",
+            "FOO=1 BAR=2 docker compose up -d",
+            "echo start && docker ps",
+            "id=$(docker create alpine)",
+            "if ! docker info; then exit 1; fi",
+            "/usr/bin/docker version",
+            "make build\ndocker push example/image",
+        ] {
+            assert!(script_runs(script, &["docker"]), "{script}");
+        }
+    }
+
+    #[test]
+    fn a_command_only_named_is_not_run() {
+        for script in [
+            "echo docker",
+            "apt-get install -y docker",
+            "# docker run alpine true",
+            "./docker.sh",
+            "docker-compose up",
+            "DOCKER=1 make docker",
+            "",
+        ] {
+            assert!(!script_runs(script, &["docker"]), "{script}");
+        }
+    }
+
+    #[test]
+    fn steps_that_use_the_runners_rust_get_it() {
+        let steps = [
+            run_step("rustup toolchain add nightly && rustup default nightly"),
+            run_step("cargo build --verbose"),
+        ];
+        let rust = runner_rust(&steps, &[]).expect("the steps run rustup and cargo");
+        assert_eq!(
+            (rust.language.as_str(), rust.version.as_str()),
+            ("rust", "stable")
+        );
+        // `stable` moves, so the image is rebuilt as releases come out.
+        assert!(rust.floating);
+        assert!(
+            rust.install_script.contains("sh.rustup.rs"),
+            "{}",
+            rust.install_script
+        );
+    }
+
+    #[test]
+    fn a_setup_actions_rust_is_the_only_one() {
+        let steps = [run_step("cargo test")];
+        let nightly = SetupRuntime {
+            language: "rust".to_string(),
+            version: "nightly".to_string(),
+            install_script: String::new(),
+            floating: true,
+            env: Vec::new(),
+        };
+        assert_eq!(runner_rust(&steps, &[nightly]), None);
+        assert_eq!(runner_rust(&[run_step("echo cargo")], &[]), None);
+    }
+
+    #[test]
+    fn the_docker_engine_installs_from_fresh_package_lists() {
+        let script = docker_engine().install_script;
+        let refresh = script.find("apt-get update").expect("refreshes the lists");
+        assert!(
+            refresh < script.find("apt-get install").unwrap(),
+            "{script}"
+        );
+        assert!(script.contains("docker.io"), "{script}");
+    }
 }

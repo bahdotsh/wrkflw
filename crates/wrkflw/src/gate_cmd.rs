@@ -358,7 +358,6 @@ fn run_args(ctx: &GateCtx, file: &Path, event: &Event) -> Vec<String> {
         event.name.clone(),
         "--affected".to_string(),
         "--reuse-results".to_string(),
-        "--job-container".to_string(),
         "--dep-cache".to_string(),
         "--gate-mode".to_string(),
         "--intent".to_string(),
@@ -1028,7 +1027,6 @@ mod tests {
         for flag in [
             "--affected",
             "--reuse-results",
-            "--job-container",
             "--dep-cache",
             "--gate-mode",
         ] {

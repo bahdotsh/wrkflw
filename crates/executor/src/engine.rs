@@ -2575,10 +2575,20 @@ async fn resolve_runner_image(
     }
 
     let SetupDetection {
-        runtimes,
+        mut runtimes,
         not_built,
     } = detect_setup(steps);
-    if runtimes.is_empty() {
+    // What a hosted runner has before any step runs, when the steps use it.
+    runtimes.extend(crate::setup_actions::runner_rust(steps, &runtimes));
+    // The job's own Docker engine goes into the image, but is no setup
+    // action's runtime.
+    let mut image_runtimes = runtimes.clone();
+    if job_session::docker_engine_for(job, steps, runtime) {
+        image_runtimes.push(crate::setup_actions::docker_engine());
+    } else {
+        warn_of_missing_docker(job, steps, runtime);
+    }
+    if image_runtimes.is_empty() {
         Ok(RunnerImage {
             built: BuiltRuntimes {
                 not_built,
@@ -2589,7 +2599,7 @@ async fn resolve_runner_image(
     } else {
         // Always build a combined image on the runner base so that essential
         // tools (git, curl, etc.) remain available for actions like checkout.
-        let image = build_combined_runtime_image(&runtimes, &base_image, runtime).await?;
+        let image = build_combined_runtime_image(&image_runtimes, &base_image, runtime).await?;
         Ok(RunnerImage {
             image,
             built: BuiltRuntimes {
@@ -2600,6 +2610,33 @@ async fn resolve_runner_image(
             },
         })
     }
+}
+
+/// Say once per run that steps run `docker` and no engine is there for
+/// them, and how to get one. Not for a job with a `container:`, whose image
+/// is its own business, or a runtime without containers.
+fn warn_of_missing_docker(job: &Job, steps: &[Step], runtime: &dyn ContainerRuntime) {
+    if job.container.is_some()
+        || runtime.session_cli().is_none()
+        || !crate::setup_actions::steps_run(steps, &["docker"])
+    {
+        return;
+    }
+    let Some(policy) = acceleration::container_policy() else {
+        return;
+    };
+    if !acceleration::first_missing_docker_warning() {
+        return;
+    }
+    wrkflw_logging::warning(if policy.docker_in_jobs {
+        "A job's steps run `docker`, but --docker-in-jobs needs one container per job, \
+         which --step-containers and --preserve-containers-on-failure turn off: \
+         those steps will fail"
+    } else {
+        "A job's steps run `docker`, which hosted runners have and a job's container \
+         doesn't: those steps will fail. Pass --docker-in-jobs to start a Docker engine \
+         inside the container of each such job, which then runs privileged"
+    });
 }
 
 /// The image a job's steps run in, and the setup runtimes built into it.
@@ -2762,8 +2799,8 @@ async fn execute_job_with_matrix(
 
     if !job.services.is_empty() && job_session::wanted_for(job, runtime).is_none() {
         wrkflw_logging::warning(&format!(
-            "Job '{}' declares services, which need Docker or Podman and aren't started \
-             in a called workflow: its steps can't reach them",
+            "Job '{}' declares services, which need Docker or Podman and aren't started: \
+             its steps can't reach them",
             job_name
         ));
     }
@@ -5192,8 +5229,9 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                                     wrkflw_logging::warning(&format!(
                                         "{}: components and targets can't be added for later \
                                          steps, as each step runs in a container of its own \
-                                         from {}. Pass --job-container, or add them in a run \
-                                         step of the steps that need them",
+                                         from {}. Drop --step-containers and \
+                                         --preserve-containers-on-failure, or add them in a \
+                                         run step of the steps that need them",
                                         uses, ctx.runner_image
                                     ));
                                 }
@@ -7996,6 +8034,29 @@ mod tests {
             combined_image_tag(&detect_setup_runtimes(&steps), &dockerfile)
         );
         assert_eq!(resolved.built.installed, ["node"]);
+    }
+
+    #[tokio::test]
+    async fn resolve_runner_image_gives_run_steps_the_runners_rust() {
+        let job = make_job(None, labels(&["ubuntu-latest"]));
+        let runtime = MockContainerRuntime::default();
+        let steps = vec![
+            make_step_run("rustup toolchain add nightly && rustup default nightly"),
+            make_step_run("cargo build --verbose"),
+        ];
+        let resolved = resolve_runner_image(&job, &steps, &runtime, &HashMap::new(), None)
+            .await
+            .unwrap();
+        assert!(resolved.image.starts_with(COMBINED_IMAGE_PREFIX));
+        assert_eq!(resolved.built.installed, ["rust"]);
+        assert_eq!(resolved.built.runtimes[0].version, "stable");
+
+        // Steps that don't use it run in the runner's image as it is.
+        let steps = vec![make_step_run("echo cargo")];
+        let resolved = resolve_runner_image(&job, &steps, &runtime, &HashMap::new(), None)
+            .await
+            .unwrap();
+        assert_eq!(resolved, RunnerImage::plain("ubuntu:latest".to_string()));
     }
 
     /// Counts pulls, and names images only when `identifies` is set.

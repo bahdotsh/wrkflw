@@ -97,7 +97,7 @@ jobs:
     );
     let dir = repo(&[(".github/workflows/ci.yml", &workflow)]);
     assert_ok(&run(dir.path(), &[]));
-    assert_ok(&run(dir.path(), &["--job-container"]));
+    assert_ok(&run(dir.path(), &["--step-containers"]));
 }
 
 /// A composite action's steps run in the job container, so what they leave
@@ -141,5 +141,44 @@ jobs:
             "#!/bin/sh\necho tool-ok\n",
         ),
     ]);
+    assert_ok(&run(dir.path(), &[]));
+}
+
+/// What a step installs outside the workspace is there for the next step,
+/// as on GitHub, where a job's steps share a machine. With a container per
+/// step it is gone, which is what `--step-containers` asks for.
+#[test]
+fn what_a_step_installs_is_there_for_the_next() {
+    if !docker_answers() {
+        eprintln!("skipped: Docker isn't available");
+        return;
+    }
+    let workflow = r#"
+name: ci
+on: push
+jobs:
+  tool:
+    runs-on: ubuntu-latest
+    container: alpine:3.20
+    steps:
+      - shell: sh
+        run: |
+          printf '#!/bin/sh\necho tool-ok\n' > /usr/local/bin/mytool
+          chmod +x /usr/local/bin/mytool
+          echo kept > "$HOME/kept"
+      - shell: sh
+        run: |
+          test "$(mytool)" = tool-ok
+          test "$(cat "$HOME/kept")" = kept
+"#;
+    let dir = repo(&[(".github/workflows/ci.yml", workflow)]);
+    assert_ok(&run(dir.path(), &[]));
+    // Still accepted, now that it is the default.
     assert_ok(&run(dir.path(), &["--job-container"]));
+    let apart = run(dir.path(), &["--step-containers"]);
+    assert!(
+        !apart.status.success(),
+        "a step in a container of its own found the last step's files:\n{}",
+        String::from_utf8_lossy(&apart.stdout)
+    );
 }

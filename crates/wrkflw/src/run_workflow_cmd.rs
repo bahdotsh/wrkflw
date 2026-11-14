@@ -50,7 +50,8 @@ pub(crate) struct RunCtx {
     pub(crate) from_step: Option<String>,
     pub(crate) reuse_results: bool,
     pub(crate) affected: bool,
-    pub(crate) job_container: bool,
+    pub(crate) step_containers: bool,
+    pub(crate) docker_in_jobs: bool,
     pub(crate) dep_cache: bool,
     pub(crate) remote_cache: Option<String>,
     pub(crate) cache_push: bool,
@@ -73,7 +74,8 @@ fn acceleration_for(
     wrkflw_executor::Acceleration {
         reuse_results: ctx.reuse_results,
         changed_files,
-        job_container: ctx.job_container,
+        step_containers: ctx.step_containers,
+        docker_in_jobs: ctx.docker_in_jobs,
         dep_cache: ctx.dep_cache,
         remote_cache: ctx.remote_cache.clone(),
         push_results: ctx.cache_push,
@@ -215,10 +217,9 @@ pub(crate) async fn run(ctx: RunCtx) {
         observers: Vec::new(),
     };
 
-    if is_gitlab && (ctx.reuse_results || ctx.job_container || ctx.dep_cache) {
+    if is_gitlab && (ctx.reuse_results || ctx.dep_cache) {
         format.fail(
-            "--reuse-results, --job-container and --dep-cache are only supported for \
-             GitHub Actions workflows.",
+            "--reuse-results and --dep-cache are only supported for GitHub Actions workflows.",
         );
     }
     let mut affected_files = None;

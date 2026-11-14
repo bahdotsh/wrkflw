@@ -15,6 +15,12 @@ static EVERY_MATRIX_LEG: AtomicBool = AtomicBool::new(false);
 pub const FRESH_WORKSPACE_ENV: &str = "WRKFLW_FRESH_WORKSPACE";
 /// Env var that runs matrix legs even when they would repeat another leg.
 pub const EVERY_MATRIX_LEG_ENV: &str = "WRKFLW_EVERY_MATRIX_LEG";
+/// Env var that gives each `run:` step a container of its own instead of
+/// the job's one.
+pub const STEP_CONTAINERS_ENV: &str = "WRKFLW_STEP_CONTAINERS";
+/// Env var that starts a Docker engine in the container of a job whose
+/// steps run `docker`, which then runs privileged.
+pub const DOCKER_IN_JOBS_ENV: &str = "WRKFLW_DOCKER_IN_JOBS";
 
 /// Give every job a new, empty workspace instead of the one it kept from
 /// its last run.
@@ -35,7 +41,9 @@ pub fn every_matrix_leg() -> bool {
     EVERY_MATRIX_LEG.load(Ordering::Relaxed) || env_flag(EVERY_MATRIX_LEG_ENV)
 }
 
-fn env_flag(name: &str) -> bool {
+/// Whether the switch in environment variable `name` is on, read as the
+/// CLI reads it.
+pub(crate) fn env_flag(name: &str) -> bool {
     std::env::var(name).is_ok_and(|v| switch_is_on(&v))
 }
 

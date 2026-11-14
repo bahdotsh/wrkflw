@@ -473,9 +473,33 @@ enum Commands {
         #[arg(long, requires = "event")]
         affected: bool,
 
-        /// Run a job's steps in one container instead of one per step
-        #[arg(long)]
+        /// Run each step in a container of its own instead of one per job.
+        /// What a step installs outside the workspace is then gone in the next
+        #[arg(
+            long,
+            env = "WRKFLW_STEP_CONTAINERS",
+            action = clap::ArgAction::SetTrue,
+            // Read as WRKFLW_FRESH_WORKSPACE is: `=1` on, `=0` off. The
+            // executor reads the variable the same way.
+            value_parser = clap::builder::FalseyValueParser::new()
+        )]
+        step_containers: bool,
+
+        /// One container per job is the default now; accepted so older
+        /// scripts keep working. It does nothing, so it gives way to
+        /// --step-containers rather than refusing to run beside it
+        #[arg(long, hide = true)]
         job_container: bool,
+
+        /// Start a Docker engine inside the container of a job whose steps
+        /// run `docker`. That container runs privileged
+        #[arg(
+            long,
+            env = "WRKFLW_DOCKER_IN_JOBS",
+            action = clap::ArgAction::SetTrue,
+            value_parser = clap::builder::FalseyValueParser::new()
+        )]
+        docker_in_jobs: bool,
 
         /// Mount cargo, npm, pip and Go caches from the host into containers
         #[arg(long)]
@@ -1433,7 +1457,9 @@ async fn run_cli() {
             reuse_results,
             stream_output,
             affected,
-            job_container,
+            step_containers,
+            job_container: _,
+            docker_in_jobs,
             dep_cache,
             remote_cache,
             cache_push,
@@ -1478,7 +1504,8 @@ async fn run_cli() {
                 from_step: from_step.clone(),
                 reuse_results: *reuse_results,
                 affected: *affected,
-                job_container: *job_container,
+                step_containers: *step_containers,
+                docker_in_jobs: *docker_in_jobs,
                 dep_cache: *dep_cache,
                 remote_cache: remote_cache.clone(),
                 cache_push: *cache_push,
@@ -2510,14 +2537,30 @@ mod tests {
     }
 
     #[test]
-    fn workspace_and_matrix_env_flags_accept_one_and_zero() {
+    fn env_switches_accept_one_and_zero() {
         // Parsing reads the process environment, so these assertions run
         // under one test with the variables restored afterwards.
-        let saved: Vec<_> = ["WRKFLW_FRESH_WORKSPACE", "WRKFLW_EVERY_MATRIX_LEG"]
-            .into_iter()
-            .map(|name| (name, std::env::var_os(name)))
-            .collect();
+        let saved: Vec<_> = [
+            "WRKFLW_FRESH_WORKSPACE",
+            "WRKFLW_EVERY_MATRIX_LEG",
+            "WRKFLW_STEP_CONTAINERS",
+            "WRKFLW_DOCKER_IN_JOBS",
+        ]
+        .into_iter()
+        .map(|name| (name, std::env::var_os(name)))
+        .collect();
         let parse = || Wrkflw::try_parse_from(["wrkflw", "list"]).unwrap();
+        let run_flags = || match Wrkflw::try_parse_from(["wrkflw", "run", "ci.yml"])
+            .unwrap()
+            .command
+        {
+            Some(Commands::Run {
+                step_containers,
+                docker_in_jobs,
+                ..
+            }) => (step_containers, docker_in_jobs),
+            _ => unreachable!("parsed as `run`"),
+        };
         for (value, on) in [
             ("1", true),
             ("yes", true),
@@ -2539,6 +2582,8 @@ mod tests {
         ] {
             std::env::set_var("WRKFLW_FRESH_WORKSPACE", value);
             std::env::set_var("WRKFLW_EVERY_MATRIX_LEG", value);
+            std::env::set_var("WRKFLW_STEP_CONTAINERS", value);
+            std::env::set_var("WRKFLW_DOCKER_IN_JOBS", value);
             // The executor reads the same variables; it must agree.
             assert_eq!(
                 wrkflw_executor::run_options::switch_is_on(value),
@@ -2551,7 +2596,19 @@ mod tests {
                 cli.every_matrix_leg, on,
                 "WRKFLW_EVERY_MATRIX_LEG={value:?}"
             );
+            assert_eq!(
+                run_flags(),
+                (on, on),
+                "WRKFLW_STEP_CONTAINERS and WRKFLW_DOCKER_IN_JOBS={value:?}"
+            );
         }
+        // `--job-container` does nothing, so it runs beside the variable that
+        // says the opposite instead of failing an older script.
+        std::env::set_var("WRKFLW_STEP_CONTAINERS", "1");
+        assert!(
+            Wrkflw::try_parse_from(["wrkflw", "run", "--job-container", "ci.yml"]).is_ok(),
+            "--job-container refused beside WRKFLW_STEP_CONTAINERS=1"
+        );
         for (name, value) in saved {
             match value {
                 Some(value) => std::env::set_var(name, value),

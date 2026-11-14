@@ -18,9 +18,8 @@
 //!
 //! Only a job that ran to the end and passed records a peak: one that
 //! failed or was cancelled part way used less than a whole run does. A job
-//! whose containers couldn't all be measured, as with a job container or
-//! Podman, forgets what an earlier run measured, which no longer says what
-//! it needs.
+//! whose containers couldn't all be measured, as with Podman, forgets what
+//! an earlier run measured, which no longer says what it needs.
 //!
 //! The legs of a matrix run the same steps, so each leg's peak is also kept
 //! for the matrix as a whole, and a leg never measured itself is given the
@@ -28,7 +27,8 @@
 //! clone, runs alone; the rest wait for its measurement and then share the
 //! VM, where every leg used to run alone in turn.
 //!
-//! Only step containers are measured. Building the job's image and the
+//! A job's own container, its services and any step that runs in a
+//! container of its own are measured. Building the job's image and the
 //! helper that copies its workspace run outside any job's measurement, so
 //! the first run after image caches are cleared can need more than
 //! measured. Containers sampled never, which most that finish within a

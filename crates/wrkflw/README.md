@@ -77,7 +77,8 @@ wrkflw tui --runtime podman
   - Runtimes: `auto` (default), `docker`, `podman`, `kubernetes`, `emulation`, `secure-emulation`. Only `auto` falls back; an explicit runtime that doesn't answer fails the run
   - Flags: `--runtime`, `--job`, `--from-step`, `--variable`, `--preserve-containers-on-failure`, `--show-action-messages`, `--gitlab`, `--verbose`
   - Trigger filter flags: `--event`, `--diff`, `--changed-files`, `--diff-base`, `--diff-head`, `--base-branch`, `--activity-type`, `--strict-filter` (default on), `--no-strict-filter`
-  - CI-saving flags: `--reuse-results`, `--affected`, `--job-container`, `--dep-cache`, `--remote-cache`, `--cache-push`
+  - CI-saving flags: `--reuse-results`, `--affected`, `--dep-cache`, `--remote-cache`, `--cache-push`
+  - Container flags: `--step-containers` (one container per step instead of per job), `--docker-in-jobs` (a Docker engine inside jobs that run `docker`; privileged)
   - History flags: `--intent`, `--agent`, `--session`, `--no-record`
   - Kubernetes flags: `--k8s-context`, `--k8s-namespace`, `--k8s-node-selector`, `--k8s-resource`, `--k8s-image-pull-secret`, `--k8s-registry`, `--k8s-helper-image`, `--k8s-timeout`, `--k8s-schedule-timeout`
 

@@ -571,6 +571,84 @@ pub(crate) fn is_safe_python_spec(spec: &str) -> bool {
         })
 }
 
+/// The commands of the Rust toolchain a hosted runner comes with.
+const RUNNER_RUST_COMMANDS: &[&str] = &["cargo", "rustup", "rustc", "rustfmt"];
+
+/// The Rust toolchain hosted runners come with, when `steps` use it and no
+/// setup action among `runtimes` installs one: rustup with `stable`, which
+/// a `rustup toolchain add` or a plain `cargo test` step counts on.
+///
+/// A `base_image` that comes with Rust, as the `rust` images do, keeps its
+/// own: the steps were written against what the image has.
+pub(crate) fn runner_rust(
+    steps: &[Step],
+    runtimes: &[SetupRuntime],
+    base_image: &str,
+) -> Option<SetupRuntime> {
+    let has_rust = base_image
+        .rsplit('/')
+        .next()
+        .is_some_and(|name| name == "rust" || name.starts_with("rust:"));
+    (!has_rust
+        && !runtimes.iter().any(|rt| rt.language == "rust")
+        && crate::script_commands::steps_run(steps, RUNNER_RUST_COMMANDS))
+    .then(|| SetupRuntime {
+        language: "rust".to_string(),
+        version: "stable".to_string(),
+        // A base that has rustup keeps its default toolchain.
+        install_script: rustup_install("stable", false),
+        floating: true,
+        env: Vec::new(),
+    })
+}
+
+/// Puts rustup on PATH, installing it with `toolchain` as its default when
+/// the image has none, and with `make_default` also making `toolchain` the
+/// default of a rustup the image already has.
+///
+/// Images such as `rust:1` already have rustup, under a `CARGO_HOME` other
+/// than `~/.cargo`, so the one there is used. The installer is downloaded
+/// to a file rather than piped, so a failed download fails the build, and
+/// `rustup` is asked for its version before anything is linked: an image
+/// built without it would be kept and reused. Its directory is linked into
+/// /usr/local/bin unless it is already a system directory on PATH: linking
+/// all of /usr/bin would be wrong, and linking /usr/local/bin into itself
+/// fails and would stop the build.
+fn rustup_install(toolchain: &str, make_default: bool) -> String {
+    let make_default = if make_default {
+        format!("rustup default {toolchain} && ")
+    } else {
+        String::new()
+    };
+    format!(
+        "export PATH=\"${{CARGO_HOME:-$HOME/.cargo}}/bin:$PATH\" && \
+         (command -v rustup >/dev/null 2>&1 || \
+          (curl --proto '=https' --tlsv1.2 -sSf -o /tmp/rustup-init.sh https://sh.rustup.rs && \
+           sh /tmp/rustup-init.sh -y --no-modify-path --default-toolchain {toolchain} && \
+           rm -f /tmp/rustup-init.sh)) && \
+         rustup --version >/dev/null 2>&1 && \
+         {make_default}\
+         d=\"$(dirname \"$(command -v rustup)\")\" && \
+         case \"$d\" in /usr/local/bin|/usr/bin|/bin) ;; *) ln -sf \"$d\"/* /usr/local/bin/ ;; esac"
+    )
+}
+
+/// A Docker engine and its CLI, for a job that runs its own.
+/// `docker-buildx` and `docker-compose-v2` are packages only newer
+/// releases have, so a base without them still gets the engine.
+pub(crate) fn docker_engine() -> SetupRuntime {
+    SetupRuntime {
+        language: "docker".to_string(),
+        version: "engine".to_string(),
+        install_script: "apt-get update && \
+             apt-get install -y --no-install-recommends docker.io iptables && \
+             (apt-get install -y --no-install-recommends docker-buildx docker-compose-v2 || true)"
+            .to_string(),
+        floating: false,
+        env: Vec::new(),
+    }
+}
+
 /// Scan job steps for known setup actions and return the runtimes they configure.
 ///
 /// If the same language appears multiple times, only the last occurrence is kept
@@ -953,23 +1031,7 @@ pub(crate) fn get_install_script(language: &str, version: &str) -> String {
                 version
             )
         }
-        // Images such as `rust:1` already have rustup, under a `CARGO_HOME`
-        // other than `~/.cargo`, so use the one there and only install it
-        // when it's missing. Its directory is linked into /usr/local/bin
-        // unless it is already a system directory on PATH: linking all of
-        // /usr/bin would be wrong, and linking /usr/local/bin into itself
-        // fails and would stop the build.
-        "rust" => {
-            format!(
-                "export PATH=\"${{CARGO_HOME:-$HOME/.cargo}}/bin:$PATH\" && \
-                 (command -v rustup >/dev/null 2>&1 || \
-                  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --default-toolchain {v}) && \
-                 rustup default {v} && \
-                 d=\"$(dirname \"$(command -v rustup)\")\" && \
-                 case \"$d\" in /usr/local/bin|/usr/bin|/bin) ;; *) ln -sf \"$d\"/* /usr/local/bin/ ;; esac",
-                v = version
-            )
-        }
+        "rust" => rustup_install(version, true),
         _ => String::new(),
     }
 }
@@ -1206,4 +1268,86 @@ pub(crate) fn rust_toolchain_extras(
 /// job runs and can go into the runner image.
 pub(crate) fn static_input(value: &str) -> Option<String> {
     (!value.contains("${{")).then(|| value.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run_step(run: &str) -> Step {
+        Step::with_run("step", run)
+    }
+
+    #[test]
+    fn steps_that_use_the_runners_rust_get_it() {
+        let steps = [
+            run_step("rustup toolchain add nightly && rustup default nightly"),
+            run_step("cargo build --verbose"),
+        ];
+        let rust =
+            runner_rust(&steps, &[], "ubuntu:latest").expect("the steps run rustup and cargo");
+        assert_eq!(
+            (rust.language.as_str(), rust.version.as_str()),
+            ("rust", "stable")
+        );
+        // `stable` moves, so the image is rebuilt as releases come out.
+        assert!(rust.floating);
+        assert!(
+            rust.install_script.contains("sh.rustup.rs"),
+            "{}",
+            rust.install_script
+        );
+    }
+
+    #[test]
+    fn a_rust_install_that_failed_fails_the_build() {
+        for script in [
+            rustup_install("stable", false),
+            get_install_script("rust", "1.80"),
+        ] {
+            // A pipe into `sh` would hide a failed download.
+            assert!(!script.contains("| sh"), "{script}");
+            assert!(script.contains("-o /tmp/rustup-init.sh"), "{script}");
+            // Nothing is linked unless rustup is there to link.
+            let check = script.find("rustup --version").expect("checks rustup");
+            assert!(check < script.find("ln -sf").unwrap(), "{script}");
+        }
+        assert!(get_install_script("rust", "1.80").contains("rustup default 1.80"));
+        // The runner's Rust leaves an image's own default toolchain alone.
+        assert!(!rustup_install("stable", false).contains("rustup default"));
+    }
+
+    #[test]
+    fn a_setup_actions_rust_is_the_only_one() {
+        let steps = [run_step("cargo test")];
+        let nightly = SetupRuntime {
+            language: "rust".to_string(),
+            version: "nightly".to_string(),
+            install_script: String::new(),
+            floating: true,
+            env: Vec::new(),
+        };
+        assert_eq!(runner_rust(&steps, &[nightly], "ubuntu:latest"), None);
+        assert_eq!(
+            runner_rust(&[run_step("echo cargo")], &[], "ubuntu:latest"),
+            None
+        );
+        // An image that comes with Rust keeps its own.
+        assert_eq!(runner_rust(&steps, &[], "rust:1.80"), None);
+        assert_eq!(
+            runner_rust(&steps, &[], "docker.io/library/rust:latest"),
+            None
+        );
+    }
+
+    #[test]
+    fn the_docker_engine_installs_from_fresh_package_lists() {
+        let script = docker_engine().install_script;
+        let refresh = script.find("apt-get update").expect("refreshes the lists");
+        assert!(
+            refresh < script.find("apt-get install").unwrap(),
+            "{script}"
+        );
+        assert!(script.contains("docker.io"), "{script}");
+    }
 }

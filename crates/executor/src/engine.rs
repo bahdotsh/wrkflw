@@ -2575,10 +2575,29 @@ async fn resolve_runner_image(
     }
 
     let SetupDetection {
-        runtimes,
+        mut runtimes,
         not_built,
     } = detect_setup(steps);
-    if runtimes.is_empty() {
+    // What a hosted runner has before any step runs, when the steps use it.
+    // An image the user mapped with `-P` is theirs, as a `container:` is:
+    // it may have its own toolchain, or no apt to install one with.
+    let mapped = image_is_mapped(job, platform_overrides, matrix);
+    if !mapped {
+        runtimes.extend(crate::setup_actions::runner_rust(
+            steps,
+            &runtimes,
+            &base_image,
+        ));
+    }
+    // The job's own Docker engine goes into the image, but is no setup
+    // action's runtime.
+    let mut image_runtimes = runtimes.clone();
+    if job_session::docker_engine_for(job, runtime, mapped) {
+        image_runtimes.push(crate::setup_actions::docker_engine());
+    } else {
+        warn_of_missing_docker(job, runtime, mapped);
+    }
+    if image_runtimes.is_empty() {
         Ok(RunnerImage {
             built: BuiltRuntimes {
                 not_built,
@@ -2589,7 +2608,7 @@ async fn resolve_runner_image(
     } else {
         // Always build a combined image on the runner base so that essential
         // tools (git, curl, etc.) remain available for actions like checkout.
-        let image = build_combined_runtime_image(&runtimes, &base_image, runtime).await?;
+        let image = build_combined_runtime_image(&image_runtimes, &base_image, runtime).await?;
         Ok(RunnerImage {
             image,
             built: BuiltRuntimes {
@@ -2600,6 +2619,57 @@ async fn resolve_runner_image(
             },
         })
     }
+}
+
+/// True when the user mapped `job`'s `runs-on` to an image of their own
+/// with `-P`, which wrkflw adds no runner tool to.
+fn image_is_mapped(
+    job: &Job,
+    platform_overrides: &HashMap<String, String>,
+    matrix: Option<&HashMap<String, Value>>,
+) -> bool {
+    job.container.is_none()
+        && find_platform_override(&job.runs_on, platform_overrides, matrix).is_some()
+}
+
+/// Say once per run that steps run `docker` and no engine is there for
+/// them, and how to get one. Not for a job with a `container:`, whose image
+/// is its own business, or a runtime without containers. An image mapped
+/// with `-P` (`mapped_image`) only gets the warning under
+/// `--docker-in-jobs`, which it is out of reach of: without the flag such
+/// an image may well bring its own way to run `docker`.
+fn warn_of_missing_docker(job: &Job, runtime: &dyn ContainerRuntime, mapped_image: bool) {
+    if job.container.is_some()
+        || runtime.session_cli().is_none()
+        || !crate::script_commands::steps_run(&job.steps, &["docker"])
+    {
+        return;
+    }
+    let Some(policy) = acceleration::container_policy() else {
+        return;
+    };
+    if mapped_image && !policy.docker_in_jobs {
+        return;
+    }
+    if !acceleration::first_missing_docker_warning() {
+        return;
+    }
+    wrkflw_logging::warning(if policy.docker_in_jobs && mapped_image {
+        "A job's steps run `docker`, but --docker-in-jobs doesn't add an engine to an \
+         image mapped with -P, which is yours as it is: those steps need the image to \
+         bring its own"
+    } else if policy.docker_in_jobs && runtime.session_cli() != Some("docker") {
+        "A job's steps run `docker`, but --docker-in-jobs only starts an engine on \
+         Docker, not Podman: those steps will fail"
+    } else if policy.docker_in_jobs {
+        "A job's steps run `docker`, but --docker-in-jobs needs one container per job, \
+         which --step-containers and --preserve-containers-on-failure turn off: \
+         those steps will fail"
+    } else {
+        "A job's steps run `docker`, which hosted runners have and a job's container \
+         doesn't: those steps will fail. Pass --docker-in-jobs to start a Docker engine \
+         inside the container of each such job, which then runs privileged"
+    });
 }
 
 /// The image a job's steps run in, and the setup runtimes built into it.
@@ -2762,8 +2832,8 @@ async fn execute_job_with_matrix(
 
     if !job.services.is_empty() && job_session::wanted_for(job, runtime).is_none() {
         wrkflw_logging::warning(&format!(
-            "Job '{}' declares services, which need Docker or Podman and aren't started \
-             in a called workflow: its steps can't reach them",
+            "Job '{}' declares services, which need Docker or Podman and aren't started: \
+             its steps can't reach them",
             job_name
         ));
     }
@@ -2956,10 +3026,11 @@ async fn execute_job_with_matrix(
                 build_image_ahead(job, &job.steps, runtime, platform_overrides, None).await;
             }
         };
+        let mapped = image_is_mapped(job, platform_overrides, None);
         let result = with_images_built_ahead(
             image_ahead,
             crate::job_memory::metered(
-                job_session::with_job_session(job, runtime, execute_job(ctx)),
+                job_session::with_job_session(job, runtime, mapped, execute_job(ctx)),
                 job_passed,
             ),
         )
@@ -3357,6 +3428,11 @@ async fn execute_matrix_combinations(
                     job_session::with_job_session(
                         ctx.job_template,
                         ctx.runtime,
+                        image_is_mapped(
+                            ctx.job_template,
+                            ctx.services.platform_overrides,
+                            Some(&combination.values),
+                        ),
                         execute_matrix_job(
                             ctx.job_name,
                             ctx.job_template,
@@ -5192,8 +5268,9 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                                     wrkflw_logging::warning(&format!(
                                         "{}: components and targets can't be added for later \
                                          steps, as each step runs in a container of its own \
-                                         from {}. Pass --job-container, or add them in a run \
-                                         step of the steps that need them",
+                                         from {}. Drop --step-containers and \
+                                         --preserve-containers-on-failure, or add them in a \
+                                         run step of the steps that need them",
                                         uses, ctx.runner_image
                                     ));
                                 }
@@ -7998,6 +8075,78 @@ mod tests {
         assert_eq!(resolved.built.installed, ["node"]);
     }
 
+    #[tokio::test]
+    async fn resolve_runner_image_gives_run_steps_the_runners_rust() {
+        let job = make_job(None, labels(&["ubuntu-latest"]));
+        let runtime = MockContainerRuntime::default();
+        let steps = vec![
+            make_step_run("rustup toolchain add nightly && rustup default nightly"),
+            make_step_run("cargo build --verbose"),
+        ];
+        let resolved = resolve_runner_image(&job, &steps, &runtime, &HashMap::new(), None)
+            .await
+            .unwrap();
+        assert!(resolved.image.starts_with(COMBINED_IMAGE_PREFIX));
+        assert_eq!(resolved.built.installed, ["rust"]);
+        assert_eq!(resolved.built.runtimes[0].version, "stable");
+
+        // An image mapped with `-P` is the user's, and keeps its own Rust.
+        let overrides = HashMap::from([(
+            "ubuntu-latest".to_string(),
+            "example/rust-runner:1".to_string(),
+        )]);
+        let resolved = resolve_runner_image(&job, &steps, &runtime, &overrides, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            resolved,
+            RunnerImage::plain("example/rust-runner:1".to_string())
+        );
+
+        // Steps that don't use it run in the runner's image as it is.
+        let steps = vec![make_step_run("echo cargo")];
+        let resolved = resolve_runner_image(&job, &steps, &runtime, &HashMap::new(), None)
+            .await
+            .unwrap();
+        assert_eq!(resolved, RunnerImage::plain("ubuntu:latest".to_string()));
+    }
+
+    #[tokio::test]
+    async fn only_a_built_image_gets_the_jobs_own_docker_engine() {
+        let steps = vec![make_step_run("docker build .")];
+        let mut job = make_job(None, labels(&["ubuntu-latest"]));
+        // The engine is decided from the job's own steps.
+        job.steps = steps.clone();
+        let runtime = MockContainerRuntime {
+            session_cli: Some("docker"),
+            ..Default::default()
+        };
+        let accel = acceleration::Acceleration {
+            docker_in_jobs: true,
+            ..Default::default()
+        };
+        let resolve = |overrides: HashMap<String, String>| {
+            let state =
+                acceleration::RunState::new(accel.clone(), false, PathBuf::from(".")).unwrap();
+            let (job, steps, runtime) = (&job, &steps, &runtime);
+            acceleration::with_run_state(Arc::new(state), async move {
+                resolve_runner_image(job, steps, runtime, &overrides, None)
+                    .await
+                    .unwrap()
+            })
+        };
+        let built = resolve(HashMap::new()).await;
+        assert!(built.image.starts_with(COMBINED_IMAGE_PREFIX), "{built:?}");
+
+        // An image mapped with `-P` is the user's, and gets no engine added.
+        let mapped = resolve(HashMap::from([(
+            "ubuntu-latest".to_string(),
+            "example/runner:1".to_string(),
+        )]))
+        .await;
+        assert_eq!(mapped, RunnerImage::plain("example/runner:1".to_string()));
+    }
+
     /// Counts pulls, and names images only when `identifies` is set.
     #[derive(Default)]
     struct PullCountingRuntime {
@@ -9279,6 +9428,8 @@ runs:
         run_calls: Arc<Mutex<Vec<RunContainerCall>>>,
         /// Every image build fails, as one out of disk space does.
         fail_builds: bool,
+        /// The CLI a job session would use, as Docker's or Podman's.
+        session_cli: Option<&'static str>,
     }
 
     #[derive(Debug, Clone)]
@@ -9367,6 +9518,9 @@ runs:
 
         async fn image_exists(&self, _tag: &str) -> Result<bool, ContainerError> {
             Ok(false)
+        }
+        fn session_cli(&self) -> Option<&'static str> {
+            self.session_cli
         }
     }
 

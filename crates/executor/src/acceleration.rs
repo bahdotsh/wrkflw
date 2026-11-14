@@ -467,15 +467,21 @@ pub(crate) struct RunState {
     dep_mounts: OnceLock<Vec<(PathBuf, PathBuf)>>,
     /// Set once the run has said it won't push an emulated result.
     warned_on_host_push: AtomicBool,
-    /// Set once the run has said its steps run `docker` with no engine.
-    warned_of_missing_docker: AtomicBool,
 }
 
 tokio::task_local! {
     /// `None` inside a called workflow, whose inputs aren't in any fingerprint.
     static RUN: Option<Arc<RunState>>;
     /// Set with [`RUN`], and kept inside a called workflow.
-    static CONTAINERS: ContainerPolicy;
+    static CONTAINERS: Arc<ContainerScope>;
+}
+
+/// What the jobs of a run, called workflows' included, share about
+/// containers.
+struct ContainerScope {
+    policy: ContainerPolicy,
+    /// Set once the run has said its steps run `docker` with no engine.
+    warned_of_missing_docker: AtomicBool,
 }
 
 /// How the jobs of a run use containers. Unlike the rest of the run's
@@ -554,7 +560,6 @@ impl RunState {
             groups: Mutex::new(HashMap::new()),
             dep_mounts: OnceLock::new(),
             warned_on_host_push: AtomicBool::new(false),
-            warned_of_missing_docker: AtomicBool::new(false),
         })
     }
 
@@ -586,13 +591,21 @@ impl RunState {
 
 /// Run `future` with this run's state available to the jobs it executes.
 pub(crate) async fn with_run_state<F: Future>(state: Arc<RunState>, future: F) -> F::Output {
+    // The variables reach a run started from the TUI or `watch` too, which
+    // have no flags for these.
     let policy = ContainerPolicy {
-        step_containers: state.accel.step_containers,
+        step_containers: state.accel.step_containers
+            || crate::run_options::env_flag(crate::run_options::STEP_CONTAINERS_ENV),
         preserve_containers: state.preserve_containers,
-        docker_in_jobs: state.accel.docker_in_jobs,
+        docker_in_jobs: state.accel.docker_in_jobs
+            || crate::run_options::env_flag(crate::run_options::DOCKER_IN_JOBS_ENV),
     };
+    let scope = Arc::new(ContainerScope {
+        policy,
+        warned_of_missing_docker: AtomicBool::new(false),
+    });
     CONTAINERS
-        .scope(policy, RUN.scope(Some(state), future))
+        .scope(scope, RUN.scope(Some(state), future))
         .await
 }
 
@@ -605,17 +618,18 @@ pub(crate) fn current() -> Option<Arc<RunState>> {
     RUN.try_with(|run| run.clone()).ok().flatten()
 }
 
-/// True the first time a run asks, so it says only once that steps run
-/// `docker` with no engine there. Always true in a called workflow, which
-/// has no run state to remember in.
+/// True the first time a run asks, called workflows included, so it says
+/// only once that steps run `docker` with no engine there.
 pub(crate) fn first_missing_docker_warning() -> bool {
-    current().is_none_or(|run| !run.warned_of_missing_docker.swap(true, Ordering::Relaxed))
+    CONTAINERS
+        .try_with(|scope| !scope.warned_of_missing_docker.swap(true, Ordering::Relaxed))
+        .unwrap_or(true)
 }
 
 /// How this run's jobs use containers, or `None` outside a run that has a
 /// say in it, as a GitLab pipeline's.
 pub(crate) fn container_policy() -> Option<ContainerPolicy> {
-    CONTAINERS.try_with(|policy| *policy).ok()
+    CONTAINERS.try_with(|scope| scope.policy).ok()
 }
 
 /// Host and container paths of the `--dep-cache` mounts.

@@ -2583,10 +2583,10 @@ async fn resolve_runner_image(
     // The job's own Docker engine goes into the image, but is no setup
     // action's runtime.
     let mut image_runtimes = runtimes.clone();
-    if job_session::docker_engine_for(job, steps, runtime) {
+    if job_session::docker_engine_for(job, runtime) {
         image_runtimes.push(crate::setup_actions::docker_engine());
     } else {
-        warn_of_missing_docker(job, steps, runtime);
+        warn_of_missing_docker(job, runtime);
     }
     if image_runtimes.is_empty() {
         Ok(RunnerImage {
@@ -2615,10 +2615,10 @@ async fn resolve_runner_image(
 /// Say once per run that steps run `docker` and no engine is there for
 /// them, and how to get one. Not for a job with a `container:`, whose image
 /// is its own business, or a runtime without containers.
-fn warn_of_missing_docker(job: &Job, steps: &[Step], runtime: &dyn ContainerRuntime) {
+fn warn_of_missing_docker(job: &Job, runtime: &dyn ContainerRuntime) {
     if job.container.is_some()
         || runtime.session_cli().is_none()
-        || !crate::setup_actions::steps_run(steps, &["docker"])
+        || !crate::setup_actions::steps_run(&job.steps, &["docker"])
     {
         return;
     }

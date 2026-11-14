@@ -1,6 +1,6 @@
 # Codebase Index: wrkflw
 
-> Generated: 2026-11-13 18:26:19 UTC | Files: 262 | Lines: 119097
+> Generated: 2026-11-14 03:19:09 UTC | Files: 262 | Lines: 119395
 > Languages: JSON (4), Markdown (26), Rust (169), Shell (6), TOML (19), YAML (38)
 
 ## Directory Structure
@@ -611,6 +611,8 @@ wrkflw/
 **crates/executor/src/run_options.rs**
 - `pub const FRESH_WORKSPACE_ENV: &str = "WRKFLW_FRESH_WORKSPACE"`
 - `pub const EVERY_MATRIX_LEG_ENV: &str = "WRKFLW_EVERY_MATRIX_LEG"`
+- `pub const STEP_CONTAINERS_ENV: &str = "WRKFLW_STEP_CONTAINERS"`
+- `pub const DOCKER_IN_JOBS_ENV: &str = "WRKFLW_DOCKER_IN_JOBS"`
 - `pub fn set_fresh_workspaces(on: bool)`
 - `pub fn fresh_workspaces() -> bool`
 - `pub fn set_every_matrix_leg(on: bool)`
@@ -1764,7 +1766,7 @@ wrkflw/
 
 ## BREAKING_CHANGES.md
 
-**Language:** Markdown | **Size:** 33.3 KB | **Lines:** 396
+**Language:** Markdown | **Size:** 33.9 KB | **Lines:** 396
 
 **Declarations:**
 
@@ -1788,7 +1790,7 @@ wrkflw/
 
 ## INDEX.md
 
-**Language:** Markdown | **Size:** 281.7 KB | **Lines:** 10394
+**Language:** Markdown | **Size:** 282.1 KB | **Lines:** 10410
 
 **Declarations:**
 
@@ -1796,7 +1798,7 @@ wrkflw/
 
 ## README.md
 
-**Language:** Markdown | **Size:** 44.5 KB | **Lines:** 564
+**Language:** Markdown | **Size:** 45.1 KB | **Lines:** 564
 
 **Declarations:**
 
@@ -2059,7 +2061,7 @@ wrkflw/
 
 ## crates/executor/src/acceleration.rs
 
-**Language:** Rust | **Size:** 58.1 KB | **Lines:** 1646
+**Language:** Rust | **Size:** 58.6 KB | **Lines:** 1660
 
 **Imports:**
 - `pub(crate) use concurrency::acquire_concurrency`
@@ -2140,7 +2142,10 @@ wrkflw/
 `fn job_key_with(input: &KeyInput<'_>, every_matrix_leg: bool) -> Option<String>`
 
 `pub(crate) struct RunState`
-> Fields: `accel: Acceleration`, `preserve_containers: bool`, `root: PathBuf`, `sidecar: Option<Sidecar>`, `store: Option<ResultStore>`, `tree: OnceCell<Option<Arc<Tree>>>`, `executed: Mutex<HashSet<String>>`, `groups: Mutex<HashMap<String, Arc<Semaphore>>>`, `dep_mounts: OnceLock<Vec<(PathBuf, PathBuf)>>`, `warned_on_host_push: AtomicBool`, `warned_of_missing_docker: AtomicBool`
+> Fields: `accel: Acceleration`, `preserve_containers: bool`, `root: PathBuf`, `sidecar: Option<Sidecar>`, `store: Option<ResultStore>`, `tree: OnceCell<Option<Arc<Tree>>>`, `executed: Mutex<HashSet<String>>`, `groups: Mutex<HashMap<String, Arc<Semaphore>>>`, `dep_mounts: OnceLock<Vec<(PathBuf, PathBuf)>>`, `warned_on_host_push: AtomicBool`
+
+`struct ContainerScope`
+> Fields: `policy: ContainerPolicy`, `warned_of_missing_docker: AtomicBool`
 
 `pub(crate) struct ContainerPolicy`
 > Fields: `step_containers: bool`, `preserve_containers: bool`, `docker_in_jobs: bool`
@@ -3162,7 +3167,7 @@ wrkflw/
 
 ## crates/executor/src/job_session.rs
 
-**Language:** Rust | **Size:** 67.8 KB | **Lines:** 1876
+**Language:** Rust | **Size:** 69.1 KB | **Lines:** 1912
 
 **Imports:**
 - `crate::acceleration`
@@ -3173,7 +3178,7 @@ wrkflw/
 - `std::sync::Arc`
 - `std::time::Duration`
 - `tokio::process::Command`
-- `wrkflw_parser::workflow::{Job, Service, Step}`
+- `wrkflw_parser::workflow::{Job, Service}`
 - `wrkflw_runtime::container::{
     ContainerError, ContainerOutput, ContainerRuntime, PATH_ADDITIONS_ENV,
 }`
@@ -3282,7 +3287,7 @@ wrkflw/
 
 `const DOCKER_ENGINE_TIMEOUT: Duration = Duration::from_secs(60)`
 
-`const DOCKER_ENGINE_START: &str = "if [ -f /sys/fs/cgroup/cgroup.controllers ]`
+`fn docker_engine_start() -> String`
 
 `fn start_args( name: &str, image: &str, volumes: &[(PathBuf, PathBuf)], service_names: &[&str], docker_engine: bool, ) -> Vec<String>`
 
@@ -3327,7 +3332,7 @@ wrkflw/
 
 `pub(crate) fn wanted_for(job: &Job, runtime: &dyn ContainerRuntime) -> Option<&'static str>`
 
-`pub(crate) fn docker_engine_for(job: &Job, steps: &[Step], runtime: &dyn ContainerRuntime) -> bool`
+`pub(crate) fn docker_engine_for(job: &Job, runtime: &dyn ContainerRuntime) -> bool`
 
 `pub(crate) async fn with_job_session<F: Future>( job: &Job, runtime: &dyn ContainerRuntime, future: F, ) -> F::Output`
 
@@ -3897,7 +3902,7 @@ wrkflw/
 
 ## crates/executor/src/run_options.rs
 
-**Language:** Rust | **Size:** 2.9 KB | **Lines:** 79
+**Language:** Rust | **Size:** 3.3 KB | **Lines:** 87
 
 **Imports:**
 - `std::sync::atomic::{AtomicBool, Ordering}`
@@ -3908,7 +3913,7 @@ wrkflw/
 
 `static EVERY_MATRIX_LEG: AtomicBool = AtomicBool::new(false)`
 
-`fn env_flag(name: &str) -> bool`
+`pub(crate) fn env_flag(name: &str) -> bool`
 
 `mod tests`
 
@@ -3958,7 +3963,7 @@ wrkflw/
 
 ## crates/executor/src/setup_actions.rs
 
-**Language:** Rust | **Size:** 55.7 KB | **Lines:** 1375
+**Language:** Rust | **Size:** 59.7 KB | **Lines:** 1514
 
 **Imports:**
 - `std::collections::HashMap`
@@ -4015,9 +4020,18 @@ wrkflw/
 
 `pub(crate) fn is_safe_python_spec(spec: &str) -> bool`
 
-`const COMMAND_PREFIXES: &[&str] = &[ "sudo", "env", "time", "exec", "command", "nohup", "then", "do", "else", "elif", "if", "while", "until", "!", ]`
+`const SHELL_KEYWORDS: &[&str] = &[ "then", "do", "else", "elif", "if", "while", "until", "!", "time", ]`
+
+`struct Wrapper`
+> Fields: `name: &'static str`, `options_with_value: &'static [&'static str]`, `operands: usize`
+
+`const WRAPPERS: &[Wrapper] = &[ Wrapper`
 
 `fn is_assignment(word: &str) -> bool`
+
+`fn simple_commands(line: &str) -> Vec<String>`
+
+`fn command_name(command: &str) -> Option<&str>`
 
 `fn script_runs(script: &str, commands: &[&str]) -> bool`
 
@@ -8806,7 +8820,7 @@ wrkflw/
 
 ## crates/wrkflw/src/main.rs
 
-**Language:** Rust | **Size:** 94.8 KB | **Lines:** 2581
+**Language:** Rust | **Size:** 96.4 KB | **Lines:** 2624
 
 **Imports:**
 - `bollard::Docker`
@@ -9595,7 +9609,7 @@ wrkflw/
 
 ## crates/wrkflw/tests/container_fidelity_test.rs
 
-**Language:** Rust | **Size:** 5.2 KB | **Lines:** 184
+**Language:** Rust | **Size:** 6.6 KB | **Lines:** 226
 
 **Imports:**
 - `std::fs`
@@ -9622,6 +9636,8 @@ wrkflw/
 `fn a_composite_actions_changes_stay_in_the_job_container()`
 
 `fn what_a_step_installs_is_there_for_the_next()`
+
+`fn a_job_that_runs_docker_gets_an_engine_of_its_own_when_asked()`
 
 ---
 

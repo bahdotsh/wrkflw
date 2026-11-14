@@ -571,11 +571,68 @@ pub(crate) fn is_safe_python_spec(spec: &str) -> bool {
         })
 }
 
-/// Words that come before the command they run, or before a command in a
-/// compound one.
-const COMMAND_PREFIXES: &[&str] = &[
-    "sudo", "env", "time", "exec", "command", "nohup", "then", "do", "else", "elif", "if", "while",
-    "until", "!",
+/// Shell words that come before a command in a compound one.
+const SHELL_KEYWORDS: &[&str] = &[
+    "then", "do", "else", "elif", "if", "while", "until", "!", "time",
+];
+
+/// A command that runs the command after it: its options that take a value
+/// as the next word, and how many words it takes before that command.
+struct Wrapper {
+    name: &'static str,
+    options_with_value: &'static [&'static str],
+    operands: usize,
+}
+
+const WRAPPERS: &[Wrapper] = &[
+    Wrapper {
+        name: "sudo",
+        options_with_value: &[
+            "-u", "-g", "-C", "-D", "-h", "-p", "-r", "-t", "-U", "-R", "-T",
+        ],
+        operands: 0,
+    },
+    Wrapper {
+        name: "env",
+        options_with_value: &["-u", "-C", "-S"],
+        operands: 0,
+    },
+    Wrapper {
+        name: "timeout",
+        options_with_value: &["-s", "-k"],
+        // The duration.
+        operands: 1,
+    },
+    Wrapper {
+        name: "nice",
+        options_with_value: &["-n"],
+        operands: 0,
+    },
+    Wrapper {
+        name: "stdbuf",
+        options_with_value: &["-i", "-o", "-e"],
+        operands: 0,
+    },
+    Wrapper {
+        name: "xargs",
+        options_with_value: &["-a", "-d", "-E", "-I", "-L", "-n", "-P", "-s"],
+        operands: 0,
+    },
+    Wrapper {
+        name: "exec",
+        options_with_value: &["-a"],
+        operands: 0,
+    },
+    Wrapper {
+        name: "nohup",
+        options_with_value: &[],
+        operands: 0,
+    },
+    Wrapper {
+        name: "command",
+        options_with_value: &[],
+        operands: 0,
+    },
 ];
 
 /// `NAME=value`, as a shell takes ahead of a command.
@@ -587,27 +644,96 @@ fn is_assignment(word: &str) -> bool {
     })
 }
 
+/// The simple commands of one line of `script`, as a shell would split
+/// them: at `;`, `|`, `&`, parentheses, braces and backquotes outside
+/// quotes, and at the `$(` and backquotes of a command substitution inside
+/// double quotes. Single-quoted text is never split.
+fn simple_commands(line: &str) -> Vec<String> {
+    let mut commands = Vec::new();
+    let mut current = String::new();
+    let (mut single, mut double) = (false, false);
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        let split = match c {
+            '\'' if !double => {
+                single = !single;
+                false
+            }
+            '"' if !single => {
+                double = !double;
+                false
+            }
+            _ if single => false,
+            '`' => true,
+            '$' if double && chars.peek() == Some(&'(') => {
+                chars.next();
+                true
+            }
+            ';' | '|' | '&' | '(' | ')' | '{' | '}' => !double,
+            _ => false,
+        };
+        if split {
+            commands.push(std::mem::take(&mut current));
+        } else {
+            current.push(c);
+        }
+    }
+    commands.push(current);
+    commands
+}
+
+/// The word of `command` that names what it runs, past assignments,
+/// keywords, options and wrappers such as `sudo -u root` or `timeout 60`.
+fn command_name(command: &str) -> Option<&str> {
+    let mut words = command
+        .split_whitespace()
+        .map(|word| word.trim_matches(|c| c == '"' || c == '\''));
+    let mut wrapper: Option<&Wrapper> = None;
+    let mut operands = 0;
+    while let Some(word) = words.next() {
+        if word.is_empty() || is_assignment(word) || SHELL_KEYWORDS.contains(&word) {
+            continue;
+        }
+        if word.starts_with('-') {
+            if wrapper.is_some_and(|w| w.options_with_value.contains(&word)) {
+                words.next();
+            }
+            continue;
+        }
+        if let Some(found) = WRAPPERS.iter().find(|w| w.name == word) {
+            wrapper = Some(found);
+            operands = found.operands;
+            continue;
+        }
+        if operands > 0 {
+            operands -= 1;
+            continue;
+        }
+        return Some(word);
+    }
+    None
+}
+
 /// Whether `script` runs one of `commands`, by name or by path, as far as
-/// its text says: `sudo docker run`, `FOO=1 cargo test`, `$(rustc -V)`.
-/// A command named only in an argument, as in `echo cargo`, isn't run.
+/// its text says: `sudo -u root docker run`, `FOO=1 cargo test`,
+/// `timeout 60 docker ps`, `$(rustc -V)`. A command named only in an
+/// argument, as in `echo cargo` or `echo "a; docker b"`, isn't run.
+///
+/// This reads text, not what a shell would do with it: a command run by
+/// `make`, by a script the step calls, through an alias or a variable, as
+/// in `$DOCKER ps`, or in a heredoc isn't seen. Such a job gets neither the
+/// tool nor the warning that it is missing.
 fn script_runs(script: &str, commands: &[&str]) -> bool {
     script
         .lines()
         .map(str::trim_start)
         .filter(|line| !line.starts_with('#'))
-        .flat_map(|line| line.split([';', '|', '&', '(', ')', '`', '{', '}']))
+        .flat_map(simple_commands)
         .any(|command| {
-            command
-                .split_whitespace()
-                .find(|word| {
-                    !(is_assignment(word)
-                        || word.starts_with('-')
-                        || COMMAND_PREFIXES.contains(word))
-                })
-                .is_some_and(|word| {
-                    let name = word.rsplit('/').next().unwrap_or(word);
-                    commands.contains(&name)
-                })
+            command_name(&command).is_some_and(|word| {
+                let name = word.rsplit('/').next().unwrap_or(word);
+                commands.contains(&name)
+            })
         })
 }
 
@@ -1308,6 +1434,15 @@ mod tests {
             "if ! docker info; then exit 1; fi",
             "/usr/bin/docker version",
             "make build\ndocker push example/image",
+            "sudo -u root docker ps",
+            "sudo -E -u root docker ps",
+            "timeout 60 docker run alpine true",
+            "timeout -s KILL 5m docker ps",
+            "nice -n 10 docker build .",
+            "env -u HOME docker info",
+            "echo \"$(docker version)\"",
+            "echo \"id: `docker create alpine`\"",
+            "\"docker\" ps",
         ] {
             assert!(script_runs(script, &["docker"]), "{script}");
         }
@@ -1322,6 +1457,10 @@ mod tests {
             "./docker.sh",
             "docker-compose up",
             "DOCKER=1 make docker",
+            "echo \"done; docker next\"",
+            "echo 'a | docker b'",
+            "echo \"(docker)\"",
+            "timeout 60",
             "",
         ] {
             assert!(!script_runs(script, &["docker"]), "{script}");

@@ -31,7 +31,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::process::Command;
-use wrkflw_parser::workflow::{Job, Service, Step};
+use wrkflw_parser::workflow::{Job, Service};
 use wrkflw_runtime::container::{
     ContainerError, ContainerOutput, ContainerRuntime, PATH_ADDITIONS_ENV,
 };
@@ -631,19 +631,24 @@ const DOCKER_ENGINE_LOG: &str = "/var/log/wrkflw-dockerd.log";
 /// How long the job's own Docker engine gets to answer.
 const DOCKER_ENGINE_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Starts the job's own Docker engine ahead of [`KEEP_ALIVE`].
+/// Starts the job's own Docker engine ahead of [`KEEP_ALIVE`], logging to
+/// [`DOCKER_ENGINE_LOG`].
 ///
 /// On cgroup v2 the engine can only give its containers controllers once
 /// no process sits in the job container's own group, so the shell moves
 /// there itself first, as the `docker:dind` image does. `exec` puts a
 /// step beside the container's first process, which is that shell.
-const DOCKER_ENGINE_START: &str = "if [ -f /sys/fs/cgroup/cgroup.controllers ]; then \
-     mkdir -p /sys/fs/cgroup/init && \
-     xargs -rn1 < /sys/fs/cgroup/cgroup.procs > /sys/fs/cgroup/init/cgroup.procs 2>/dev/null; \
-     sed -e 's/ / +/g' -e 's/^/+/' < /sys/fs/cgroup/cgroup.controllers \
-       > /sys/fs/cgroup/cgroup.subtree_control 2>/dev/null; \
-   fi; \
-   dockerd > /var/log/wrkflw-dockerd.log 2>&1 & ";
+fn docker_engine_start() -> String {
+    format!(
+        "if [ -f /sys/fs/cgroup/cgroup.controllers ]; then \
+           mkdir -p /sys/fs/cgroup/init && \
+           xargs -rn1 < /sys/fs/cgroup/cgroup.procs > /sys/fs/cgroup/init/cgroup.procs 2>/dev/null; \
+           sed -e 's/ / +/g' -e 's/^/+/' < /sys/fs/cgroup/cgroup.controllers \
+             > /sys/fs/cgroup/cgroup.subtree_control 2>/dev/null; \
+         fi; \
+         dockerd > {DOCKER_ENGINE_LOG} 2>&1 & "
+    )
+}
 
 fn start_args(
     name: &str,
@@ -676,7 +681,7 @@ fn start_args(
     args.push(image.to_string());
     args.push("-c".to_string());
     if docker_engine {
-        args.push(format!("{}{}", DOCKER_ENGINE_START, KEEP_ALIVE));
+        args.push(format!("{}{}", docker_engine_start(), KEEP_ALIVE));
     } else {
         args.push(KEEP_ALIVE.to_string());
     }
@@ -939,6 +944,15 @@ impl JobSession {
         resolve: &dyn Fn(&str) -> String,
     ) -> Result<Live, String> {
         let name = format!("wrkflw-job-{}", uuid::Uuid::new_v4());
+        if self.docker_engine {
+            // Said for each job, as the switch may come from the environment
+            // and a run shouldn't grant this unseen.
+            wrkflw_logging::warning(&format!(
+                "Starting job container {} privileged, with a Docker engine of its own \
+                 (--docker-in-jobs)",
+                name
+            ));
+        }
         let service_names: Vec<&str> = self.services.iter().map(|s| s.name.as_str()).collect();
         let args = start_args(&name, image, volumes, &service_names, self.docker_engine);
         let output = cli_output(self.cli, &args, None)
@@ -1173,14 +1187,19 @@ pub(crate) fn wanted_for(job: &Job, runtime: &dyn ContainerRuntime) -> Option<&'
     (shared || !job.services.is_empty()).then_some(cli)
 }
 
-/// True when `job`, whose steps are `steps`, gets a Docker engine of its
-/// own: its steps run `docker`, the run allows it, and the job has a
-/// container on an image wrkflw builds, which the engine is installed in.
-pub(crate) fn docker_engine_for(job: &Job, steps: &[Step], runtime: &dyn ContainerRuntime) -> bool {
+/// True when `job` gets a Docker engine of its own: its steps run
+/// `docker`, the run allows it, and the job has a container on an image
+/// wrkflw builds, which the engine is installed in.
+///
+/// Both the image and the session ask this, so it reads the job alone: a
+/// matrix leg's steps differ from the job's only in `with:`, which says
+/// nothing about running `docker`, and asking of the same steps keeps the
+/// image and the session from ever disagreeing.
+pub(crate) fn docker_engine_for(job: &Job, runtime: &dyn ContainerRuntime) -> bool {
     job.container.is_none()
         && acceleration::container_policy().is_some_and(|policy| policy.docker_in_jobs)
         && wanted_for(job, runtime).is_some()
-        && crate::setup_actions::steps_run(steps, &["docker"])
+        && crate::setup_actions::steps_run(&job.steps, &["docker"])
 }
 
 /// Run `future`, one job's steps, with a session if `job` calls for one. The
@@ -1208,7 +1227,7 @@ pub(crate) async fn with_job_session<F: Future>(
         Arc::new(JobSession {
             cli,
             services,
-            docker_engine: docker_engine_for(job, &job.steps, runtime),
+            docker_engine: docker_engine_for(job, runtime),
             state: tokio::sync::Mutex::new(State::default()),
         })
     });
@@ -1769,6 +1788,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_run_says_once_that_steps_lack_docker_called_workflows_included() {
+        let state =
+            acceleration::RunState::new(Default::default(), false, PathBuf::from(".")).unwrap();
+        let (caller, called) = acceleration::with_run_state(Arc::new(state), async {
+            let caller = acceleration::first_missing_docker_warning();
+            let called = acceleration::without_run_state(async {
+                acceleration::first_missing_docker_warning()
+            })
+            .await;
+            (caller, called)
+        })
+        .await;
+        assert!(caller);
+        assert!(!called, "a called workflow said it again");
+    }
+
+    #[tokio::test]
     async fn only_a_run_that_allows_it_gives_a_job_a_docker_engine() {
         let docker = job_running("docker run alpine true");
         let plain = job_running("echo docker");
@@ -1776,7 +1812,7 @@ mod tests {
             docker_in_jobs: true,
             ..Default::default()
         };
-        let engine = |job: &Job| docker_engine_for(job, &job.steps, &SessionRuntime);
+        let engine = |job: &Job| docker_engine_for(job, &SessionRuntime);
         assert!(in_run(allowed(), false, || engine(&docker)).await);
         assert!(!in_run(allowed(), false, || engine(&plain)).await);
         assert!(!in_run(Default::default(), false, || engine(&docker)).await);

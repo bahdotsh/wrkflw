@@ -182,3 +182,45 @@ jobs:
         String::from_utf8_lossy(&apart.stdout)
     );
 }
+
+/// With `--docker-in-jobs` a step's `docker` reaches an engine inside the
+/// job's container, so `-v $(pwd):/wrk` names the job's workspace, not a
+/// path on this machine. Without it the run says why those steps fail.
+#[test]
+fn a_job_that_runs_docker_gets_an_engine_of_its_own_when_asked() {
+    if !docker_answers() {
+        eprintln!("skipped: Docker isn't available");
+        return;
+    }
+    let workflow = r#"
+name: ci
+on: push
+jobs:
+  engine:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo marker-ok > marker.txt
+      - run: test "$(docker run --rm -v "$(pwd):/wrk" alpine:3.20 cat /wrk/marker.txt)" = marker-ok
+"#;
+    let dir = repo(&[(".github/workflows/ci.yml", workflow)]);
+    let with_engine = run(dir.path(), &["--docker-in-jobs"]);
+    assert_ok(&with_engine);
+    let said = String::from_utf8_lossy(&with_engine.stdout).to_string()
+        + &String::from_utf8_lossy(&with_engine.stderr);
+    assert!(
+        said.contains("privileged"),
+        "no word of a privileged container:\n{said}"
+    );
+
+    let without = run(dir.path(), &[]);
+    assert!(
+        !without.status.success(),
+        "a step ran `docker` with no engine"
+    );
+    let said = String::from_utf8_lossy(&without.stdout).to_string()
+        + &String::from_utf8_lossy(&without.stderr);
+    assert!(
+        said.contains("--docker-in-jobs"),
+        "no word of the flag:\n{said}"
+    );
+}

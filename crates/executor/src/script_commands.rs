@@ -140,26 +140,128 @@ struct Heredoc {
     is_script: bool,
 }
 
+/// What ended a piece of a script, which tells a `case` pattern from a
+/// command.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Ending {
+    /// `)`, which ends a `case` pattern as well as a subshell.
+    Close,
+    /// `;;`, `;&` or `;;&`, which end a `case` item.
+    CaseItem,
+    /// Anything else.
+    Other,
+}
+
+/// A piece of a script, split as [`simple_commands`] describes.
+enum Piece {
+    /// Text up to a split, and what ended it.
+    Text(String, Ending),
+    /// A command of a heredoc a shell reads, already split on its own.
+    Inner(String),
+}
+
 /// The simple commands of `script`, as a shell would split them: at new
 /// lines, `;`, `|`, `&`, parentheses, braces and backquotes outside quotes,
 /// and at the `$(` and backquotes of a command substitution inside double
 /// quotes. Single-quoted text is never split, a backslash escapes the
 /// character after it and joins a line to the next, and a comment runs
-/// from a `#` that starts a word to the end of its line. A heredoc's body
-/// is left out, unless a shell reads it, whose commands it then holds.
+/// from a `#` that starts a word to the end of its line. Arithmetic, as in
+/// `$((1 << 4))`, is one word. A heredoc's body is left out, unless a shell
+/// reads it, whose commands it then holds, and so are the patterns of a
+/// `case`.
 fn simple_commands(script: &str) -> Vec<String> {
+    without_case_patterns(pieces(script))
+}
+
+/// Where a `case` is, in the pieces that follow it.
+#[derive(Clone, Copy, PartialEq)]
+enum Case {
+    /// Before the `)` that ends an item's pattern.
+    Pattern,
+    /// In an item's commands, up to its `;;`.
+    Commands,
+}
+
+/// The commands among `pieces`, without the `case`, `in` and patterns of a
+/// `case`, which a shell matches and doesn't run: `docker)` in
+/// `case "$x" in docker) ...` names no command.
+fn without_case_patterns(pieces: Vec<Piece>) -> Vec<String> {
+    let mut cases: Vec<Case> = Vec::new();
     let mut commands = Vec::new();
+    for piece in pieces {
+        let (text, ending) = match piece {
+            Piece::Inner(text) => {
+                commands.push(text);
+                continue;
+            }
+            Piece::Text(text, ending) => (text, ending),
+        };
+        let words = words(&text);
+        let first = words.first().map(String::as_str);
+        if first == Some("esac") && !cases.is_empty() {
+            cases.pop();
+            continue;
+        }
+        if cases.last() == Some(&Case::Pattern) {
+            if ending == Ending::Close {
+                *cases.last_mut().expect("in a case") = Case::Commands;
+            }
+            continue;
+        }
+        if first == Some("case") {
+            // `case WORD in`, and on the same line perhaps the first
+            // pattern, up to its `)`.
+            let at_pattern = ending == Ending::Close && words.len() > 3;
+            cases.push(if at_pattern {
+                Case::Commands
+            } else {
+                Case::Pattern
+            });
+            continue;
+        }
+        commands.push(text);
+        if ending == Ending::CaseItem {
+            if let Some(case) = cases.last_mut() {
+                *case = Case::Pattern;
+            }
+        }
+    }
+    commands
+}
+
+/// `script` split into the pieces [`simple_commands`] reads.
+fn pieces(script: &str) -> Vec<Piece> {
+    let mut pieces = Vec::new();
     let mut current = String::new();
     let (mut single, mut double) = (false, false);
     let mut word_start = true;
     // Inside `${...}`, whose braces and `#` aren't the shell's own.
     let mut parameter_depth = 0usize;
+    // Inside `$((...))` or `((...))`: the parentheses still open.
+    let mut arithmetic_depth = 0usize;
     let mut heredocs: Vec<Heredoc> = Vec::new();
     let mut chars = script.chars().peekable();
+    let split = |pieces: &mut Vec<Piece>, current: &mut String, ending: Ending| {
+        pieces.push(Piece::Text(std::mem::take(current), ending));
+    };
+    let opens_arithmetic = |chars: &std::iter::Peekable<std::str::Chars<'_>>| {
+        let mut ahead = chars.clone();
+        ahead.next() == Some('(') && ahead.next() == Some('(')
+    };
     while let Some(c) = chars.next() {
         if single {
             single = c != '\'';
             current.push(c);
+            continue;
+        }
+        if arithmetic_depth > 0 {
+            match c {
+                '(' => arithmetic_depth += 1,
+                ')' => arithmetic_depth -= 1,
+                _ => {}
+            }
+            current.push(c);
+            word_start = false;
             continue;
         }
         if c == '\\' {
@@ -175,8 +277,16 @@ fn simple_commands(script: &str) -> Vec<String> {
             word_start = false;
             continue;
         }
+        if c == '$' && opens_arithmetic(&chars) {
+            chars.next();
+            chars.next();
+            arithmetic_depth = 2;
+            current.push_str("$((");
+            word_start = false;
+            continue;
+        }
         if double {
-            let split = match c {
+            let splits = match c {
                 '"' => {
                     double = false;
                     false
@@ -188,8 +298,8 @@ fn simple_commands(script: &str) -> Vec<String> {
                 }
                 _ => false,
             };
-            if split {
-                commands.push(std::mem::take(&mut current));
+            if splits {
+                split(&mut pieces, &mut current, Ending::Other);
             } else {
                 current.push(c);
             }
@@ -220,6 +330,14 @@ fn simple_commands(script: &str) -> Vec<String> {
                     chars.next();
                 }
             }
+            // An arithmetic command, `(( i << 2 ))`, which runs nothing.
+            '(' if word_start && chars.peek() == Some(&'(') => {
+                chars.next();
+                arithmetic_depth = 2;
+                current.push_str("((");
+                word_start = false;
+                continue;
+            }
             '<' if chars.peek() == Some(&'<') => {
                 chars.next();
                 if chars.peek() == Some(&'<') {
@@ -244,23 +362,37 @@ fn simple_commands(script: &str) -> Vec<String> {
                 }
             }
             '\n' => {
-                commands.push(std::mem::take(&mut current));
+                split(&mut pieces, &mut current, Ending::Other);
                 for heredoc in std::mem::take(&mut heredocs) {
                     let body = heredoc_body(&mut chars, &heredoc.delimiter);
                     if heredoc.is_script {
-                        commands.extend(simple_commands(&body));
+                        pieces.extend(simple_commands(&body).into_iter().map(Piece::Inner));
                     }
                 }
             }
-            ';' | '|' | '&' | '(' | ')' | '{' | '}' | '`' => {
-                commands.push(std::mem::take(&mut current));
+            ';' => {
+                // `;;`, `;&` and `;;&` end a `case` item.
+                let mut ending = Ending::Other;
+                if chars.peek() == Some(&';') {
+                    chars.next();
+                    ending = Ending::CaseItem;
+                }
+                if chars.peek() == Some(&'&') {
+                    chars.next();
+                    ending = Ending::CaseItem;
+                }
+                split(&mut pieces, &mut current, ending);
+            }
+            ')' => split(&mut pieces, &mut current, Ending::Close),
+            '|' | '&' | '(' | '{' | '}' | '`' => {
+                split(&mut pieces, &mut current, Ending::Other);
             }
             _ => current.push(c),
         }
         word_start = c.is_whitespace() || ";|&(){}`".contains(c);
     }
-    commands.push(current);
-    commands
+    split(&mut pieces, &mut current, Ending::Other);
+    pieces
 }
 
 /// The word after a `<<`, without the quotes that keep its body from being
@@ -440,6 +572,15 @@ mod tests {
             "echo ok # done\ndocker ps",
             "n=${#items}; docker ps",
             "echo \"${HOME}\" && docker ps",
+            "case \"$1\" in\n  build) docker build . ;;\n  *) echo no ;;\nesac",
+            "case $x in a|b) echo a ;; push) docker push x ;; esac",
+            "case $x in (a) echo a ;;\nesac\ndocker ps",
+            "case $x in\n  a)\n    case $y in b) echo b ;; esac\n    docker ps\n    ;;\nesac",
+            "echo $((1 << 4))\ndocker ps",
+            "echo \"$(( (1 + 2) << 4 ))\"; docker ps",
+            "(( n <<= 1 )) && docker ps",
+            "(docker ps)",
+            "id=$(docker create alpine) && echo $id",
         ] {
             assert!(script_runs(script, &["docker"]), "{script:?}");
         }
@@ -470,6 +611,11 @@ mod tests {
             "bash -c 'echo docker'",
             "bash script.sh",
             "grep docker <<< \"$text\"",
+            "case \"$1\" in\n  docker) echo yes ;;\nesac",
+            "case $1 in docker|podman) echo engine ;; esac",
+            "case $1 in (docker) echo yes ;;& *) echo any ;; esac",
+            "case $1 in\n  a) echo a\n  ;;\n  docker)\n    echo d\nesac",
+            "echo $((1 << 4))\necho docker",
         ] {
             assert!(!script_runs(script, &["docker"]), "{script:?}");
         }

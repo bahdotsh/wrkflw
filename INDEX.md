@@ -1,6 +1,6 @@
 # Codebase Index: wrkflw
 
-> Generated: 2026-11-14 11:25:55 UTC | Files: 264 | Lines: 119803
+> Generated: 2026-11-14 13:25:31 UTC | Files: 264 | Lines: 120068
 > Languages: JSON (4), Markdown (27), Rust (170), Shell (6), TOML (19), YAML (38)
 
 ## Directory Structure
@@ -1771,7 +1771,7 @@ wrkflw/
 
 ## BREAKING_CHANGES.md
 
-**Language:** Markdown | **Size:** 34.5 KB | **Lines:** 398
+**Language:** Markdown | **Size:** 34.6 KB | **Lines:** 398
 
 **Declarations:**
 
@@ -1795,7 +1795,7 @@ wrkflw/
 
 ## INDEX.md
 
-**Language:** Markdown | **Size:** 281.9 KB | **Lines:** 10398
+**Language:** Markdown | **Size:** 283.0 KB | **Lines:** 10447
 
 **Declarations:**
 
@@ -1803,7 +1803,7 @@ wrkflw/
 
 ## README.md
 
-**Language:** Markdown | **Size:** 45.5 KB | **Lines:** 564
+**Language:** Markdown | **Size:** 45.6 KB | **Lines:** 564
 
 **Declarations:**
 
@@ -3184,7 +3184,7 @@ wrkflw/
 
 ## crates/executor/src/job_session.rs
 
-**Language:** Rust | **Size:** 69.5 KB | **Lines:** 1915
+**Language:** Rust | **Size:** 71.4 KB | **Lines:** 1963
 
 **Imports:**
 - `crate::acceleration`
@@ -3225,7 +3225,7 @@ wrkflw/
 `const STATS_FORMAT: &str = "`
 
 `struct MemoryWatch`
-> Fields: `ids: Vec<String>`, `meter: Arc<crate::job_memory::JobMeter>`, `sampled: Arc<std::sync::atomic::AtomicBool>`, `broken: Arc<std::sync::atomic::AtomicBool>`, `started: std::time::Instant`, `task: tokio::task::JoinHandle<()>`
+> Fields: `ids: Vec<String>`, `meter: Arc<crate::job_memory::JobMeter>`, `sampled: Arc<std::sync::atomic::AtomicBool>`, `broken: Arc<std::sync::atomic::AtomicBool>`, `ended: Arc<std::sync::Mutex<bool>>`, `started: std::time::Instant`, `task: tokio::task::JoinHandle<()>`
 
 **`impl MemoryWatch`**
   `fn start(cli: &'static str, ids: Vec<String>, meter: Arc<crate::job_memory::JobMeter>) -> Self`
@@ -3349,9 +3349,9 @@ wrkflw/
 
 `pub(crate) fn wanted_for(job: &Job, runtime: &dyn ContainerRuntime) -> Option<&'static str>`
 
-`pub(crate) fn docker_engine_for(job: &Job, runtime: &dyn ContainerRuntime) -> bool`
+`pub(crate) fn docker_engine_for( job: &Job, runtime: &dyn ContainerRuntime, mapped_image: bool, ) -> bool`
 
-`pub(crate) async fn with_job_session<F: Future>( job: &Job, runtime: &dyn ContainerRuntime, future: F, ) -> F::Output`
+`pub(crate) async fn with_job_session<F: Future>( job: &Job, runtime: &dyn ContainerRuntime, mapped_image: bool, future: F, ) -> F::Output`
 
 `mod tests`
 
@@ -3982,7 +3982,7 @@ wrkflw/
 
 ## crates/executor/src/script_commands.rs
 
-**Language:** Rust | **Size:** 16.0 KB | **Lines:** 495
+**Language:** Rust | **Size:** 21.2 KB | **Lines:** 641
 
 **Imports:**
 - `wrkflw_parser::workflow::Step`
@@ -4009,7 +4009,20 @@ wrkflw/
 `struct Heredoc`
 > Fields: `delimiter: String`, `is_script: bool`
 
+`enum Ending`
+> Variants: `Close`, `CaseItem`, `Other`
+
+`enum Piece`
+> Variants: `Text`, `Inner`
+
 `fn simple_commands(script: &str) -> Vec<String>`
+
+`enum Case`
+> Variants: `Pattern`, `Commands`
+
+`fn without_case_patterns(pieces: Vec<Piece>) -> Vec<String>`
+
+`fn pieces(script: &str) -> Vec<Piece>`
 
 `fn heredoc_delimiter(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> String`
 
@@ -4027,7 +4040,7 @@ wrkflw/
 
 ## crates/executor/src/setup_actions.rs
 
-**Language:** Rust | **Size:** 54.3 KB | **Lines:** 1331
+**Language:** Rust | **Size:** 55.2 KB | **Lines:** 1353
 
 **Imports:**
 - `std::collections::HashMap`
@@ -4088,7 +4101,7 @@ wrkflw/
 
 `pub(crate) fn runner_rust( steps: &[Step], runtimes: &[SetupRuntime], base_image: &str, ) -> Option<SetupRuntime>`
 
-`fn runner_rust_install() -> String`
+`fn rustup_install(toolchain: &str, make_default: bool) -> String`
 
 `pub(crate) fn docker_engine() -> SetupRuntime`
 

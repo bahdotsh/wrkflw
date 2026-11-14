@@ -97,6 +97,10 @@ struct MemoryWatch {
     sampled: Arc<std::sync::atomic::AtomicBool>,
     /// `stats` ended while the containers were still there.
     broken: Arc<std::sync::atomic::AtomicBool>,
+    /// Set when the watch ends. Samples are taken under this lock, so none
+    /// lands after the containers were taken off the meter: aborting the
+    /// task doesn't stop one it is already taking.
+    ended: Arc<std::sync::Mutex<bool>>,
     started: std::time::Instant,
     task: tokio::task::JoinHandle<()>,
 }
@@ -107,9 +111,15 @@ impl MemoryWatch {
         use tokio::io::AsyncBufReadExt;
         let sampled = Arc::new(AtomicBool::new(false));
         let broken = Arc::new(AtomicBool::new(false));
+        let ended = Arc::new(std::sync::Mutex::new(false));
         let task = {
-            let (ids, meter, sampled, broken) =
-                (ids.clone(), meter.clone(), sampled.clone(), broken.clone());
+            let (ids, meter, sampled, broken, ended) = (
+                ids.clone(),
+                meter.clone(),
+                sampled.clone(),
+                broken.clone(),
+                ended.clone(),
+            );
             tokio::spawn(async move {
                 let child = Command::new(cli)
                     .args(["stats", "--no-trunc", "--format", STATS_FORMAT])
@@ -127,6 +137,10 @@ impl MemoryWatch {
                     let mut lines = tokio::io::BufReader::new(stdout).lines();
                     while let Ok(Some(line)) = lines.next_line().await {
                         if let Some((id, bytes)) = stats_sample(&line, &ids) {
+                            let ended = ended.lock().unwrap_or_else(|e| e.into_inner());
+                            if *ended {
+                                return;
+                            }
                             meter.sample(id, bytes);
                             sampled.store(true, Ordering::Relaxed);
                         }
@@ -142,6 +156,7 @@ impl MemoryWatch {
             meter,
             sampled,
             broken,
+            ended,
             started: std::time::Instant::now(),
             task,
         }
@@ -152,6 +167,7 @@ impl Drop for MemoryWatch {
     fn drop(&mut self) {
         use std::sync::atomic::Ordering;
         self.task.abort();
+        *self.ended.lock().unwrap_or_else(|e| e.into_inner()) = true;
         for id in &self.ids {
             self.meter.stopped(id);
         }
@@ -1188,15 +1204,23 @@ pub(crate) fn wanted_for(job: &Job, runtime: &dyn ContainerRuntime) -> Option<&'
 
 /// True when `job` gets a Docker engine of its own: its steps run
 /// `docker`, the run allows it, and the job has a container on an image
-/// wrkflw builds, which the engine is installed in. Only on Docker: a
-/// rootless Podman container can't run an engine even when privileged.
+/// wrkflw builds, which the engine is installed in. Not when the image is
+/// one the user mapped with `-P` (`mapped_image`): that image is theirs, as
+/// a `container:` is, and may have no apt to install the engine with. Only
+/// on Docker: a rootless Podman container can't run an engine even when
+/// privileged.
 ///
 /// Both the image and the session ask this, so it reads the job alone: a
 /// matrix leg's steps differ from the job's only in `with:`, which says
 /// nothing about running `docker`, and asking of the same steps keeps the
 /// image and the session from ever disagreeing.
-pub(crate) fn docker_engine_for(job: &Job, runtime: &dyn ContainerRuntime) -> bool {
-    job.container.is_none()
+pub(crate) fn docker_engine_for(
+    job: &Job,
+    runtime: &dyn ContainerRuntime,
+    mapped_image: bool,
+) -> bool {
+    !mapped_image
+        && job.container.is_none()
         && acceleration::container_policy().is_some_and(|policy| policy.docker_in_jobs)
         && wanted_for(job, runtime) == Some("docker")
         && crate::script_commands::steps_run(&job.steps, &["docker"])
@@ -1207,6 +1231,7 @@ pub(crate) fn docker_engine_for(job: &Job, runtime: &dyn ContainerRuntime) -> bo
 pub(crate) async fn with_job_session<F: Future>(
     job: &Job,
     runtime: &dyn ContainerRuntime,
+    mapped_image: bool,
     future: F,
 ) -> F::Output {
     let session = wanted_for(job, runtime).map(|cli| {
@@ -1227,7 +1252,7 @@ pub(crate) async fn with_job_session<F: Future>(
         Arc::new(JobSession {
             cli,
             services,
-            docker_engine: docker_engine_for(job, runtime),
+            docker_engine: docker_engine_for(job, runtime, mapped_image),
             state: tokio::sync::Mutex::new(State::default()),
         })
     });
@@ -1681,6 +1706,26 @@ mod tests {
         assert_eq!(stats_sample("", &ids), None);
     }
 
+    #[tokio::test]
+    async fn a_job_whose_memory_couldnt_be_watched_is_unmeasured() {
+        let meter = Arc::new(crate::job_memory::JobMeter::default());
+        let watch = MemoryWatch::start(
+            "wrkflw-test-no-such-cli",
+            vec!["aaaa1111".to_string()],
+            meter.clone(),
+        );
+        // Let the watch find out that `stats` can't run.
+        for _ in 0..100 {
+            if watch.broken.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!meter.is_incomplete(), "unmeasured before the job ended");
+        drop(watch);
+        assert!(meter.is_incomplete());
+    }
+
     #[test]
     fn a_step_cancelled_part_way_leaves_the_job_unmeasured() {
         let meter = Arc::new(crate::job_memory::JobMeter::default());
@@ -1812,8 +1857,11 @@ mod tests {
             docker_in_jobs: true,
             ..Default::default()
         };
-        let engine = |job: &Job| docker_engine_for(job, &SessionRuntime("docker"));
+        let engine = |job: &Job| docker_engine_for(job, &SessionRuntime("docker"), false);
         assert!(in_run(allowed(), false, || engine(&docker)).await);
+        // An image mapped with `-P` is the user's, and gets no engine added.
+        let mapped = |job: &Job| docker_engine_for(job, &SessionRuntime("docker"), true);
+        assert!(!in_run(allowed(), false, || mapped(&docker)).await);
         assert!(!in_run(allowed(), false, || engine(&plain)).await);
         assert!(!in_run(Default::default(), false, || engine(&docker)).await);
         // The engine lives in the job's one container.
@@ -1823,7 +1871,7 @@ mod tests {
         };
         assert!(!in_run(step_containers, false, || engine(&docker)).await);
         // Rootless Podman can't run an engine inside a container.
-        let on_podman = |job: &Job| docker_engine_for(job, &SessionRuntime("podman"));
+        let on_podman = |job: &Job| docker_engine_for(job, &SessionRuntime("podman"), false);
         assert!(!in_run(allowed(), false, || on_podman(&docker)).await);
     }
 

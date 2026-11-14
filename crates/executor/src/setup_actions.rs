@@ -595,22 +595,42 @@ pub(crate) fn runner_rust(
     .then(|| SetupRuntime {
         language: "rust".to_string(),
         version: "stable".to_string(),
-        install_script: runner_rust_install(),
+        // A base that has rustup keeps its default toolchain.
+        install_script: rustup_install("stable", false),
         floating: true,
         env: Vec::new(),
     })
 }
 
-/// Installs rustup with `stable` as the default, unless rustup is there
-/// already, whose default toolchain is then left as it is.
-fn runner_rust_install() -> String {
-    "export PATH=\"${CARGO_HOME:-$HOME/.cargo}/bin:$PATH\" && \
-     if ! command -v rustup >/dev/null 2>&1; then \
-       curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --default-toolchain stable && \
-       d=\"$(dirname \"$(command -v rustup)\")\" && \
-       case \"$d\" in /usr/local/bin|/usr/bin|/bin) ;; *) ln -sf \"$d\"/* /usr/local/bin/ ;; esac; \
-     fi"
-        .to_string()
+/// Puts rustup on PATH, installing it with `toolchain` as its default when
+/// the image has none, and with `make_default` also making `toolchain` the
+/// default of a rustup the image already has.
+///
+/// Images such as `rust:1` already have rustup, under a `CARGO_HOME` other
+/// than `~/.cargo`, so the one there is used. The installer is downloaded
+/// to a file rather than piped, so a failed download fails the build, and
+/// `rustup` is asked for its version before anything is linked: an image
+/// built without it would be kept and reused. Its directory is linked into
+/// /usr/local/bin unless it is already a system directory on PATH: linking
+/// all of /usr/bin would be wrong, and linking /usr/local/bin into itself
+/// fails and would stop the build.
+fn rustup_install(toolchain: &str, make_default: bool) -> String {
+    let make_default = if make_default {
+        format!("rustup default {toolchain} && ")
+    } else {
+        String::new()
+    };
+    format!(
+        "export PATH=\"${{CARGO_HOME:-$HOME/.cargo}}/bin:$PATH\" && \
+         (command -v rustup >/dev/null 2>&1 || \
+          (curl --proto '=https' --tlsv1.2 -sSf -o /tmp/rustup-init.sh https://sh.rustup.rs && \
+           sh /tmp/rustup-init.sh -y --no-modify-path --default-toolchain {toolchain} && \
+           rm -f /tmp/rustup-init.sh)) && \
+         rustup --version >/dev/null 2>&1 && \
+         {make_default}\
+         d=\"$(dirname \"$(command -v rustup)\")\" && \
+         case \"$d\" in /usr/local/bin|/usr/bin|/bin) ;; *) ln -sf \"$d\"/* /usr/local/bin/ ;; esac"
+    )
 }
 
 /// A Docker engine and its CLI, for a job that runs its own.
@@ -1011,23 +1031,7 @@ pub(crate) fn get_install_script(language: &str, version: &str) -> String {
                 version
             )
         }
-        // Images such as `rust:1` already have rustup, under a `CARGO_HOME`
-        // other than `~/.cargo`, so use the one there and only install it
-        // when it's missing. Its directory is linked into /usr/local/bin
-        // unless it is already a system directory on PATH: linking all of
-        // /usr/bin would be wrong, and linking /usr/local/bin into itself
-        // fails and would stop the build.
-        "rust" => {
-            format!(
-                "export PATH=\"${{CARGO_HOME:-$HOME/.cargo}}/bin:$PATH\" && \
-                 (command -v rustup >/dev/null 2>&1 || \
-                  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --default-toolchain {v}) && \
-                 rustup default {v} && \
-                 d=\"$(dirname \"$(command -v rustup)\")\" && \
-                 case \"$d\" in /usr/local/bin|/usr/bin|/bin) ;; *) ln -sf \"$d\"/* /usr/local/bin/ ;; esac",
-                v = version
-            )
-        }
+        "rust" => rustup_install(version, true),
         _ => String::new(),
     }
 }
@@ -1293,6 +1297,24 @@ mod tests {
             "{}",
             rust.install_script
         );
+    }
+
+    #[test]
+    fn a_rust_install_that_failed_fails_the_build() {
+        for script in [
+            rustup_install("stable", false),
+            get_install_script("rust", "1.80"),
+        ] {
+            // A pipe into `sh` would hide a failed download.
+            assert!(!script.contains("| sh"), "{script}");
+            assert!(script.contains("-o /tmp/rustup-init.sh"), "{script}");
+            // Nothing is linked unless rustup is there to link.
+            let check = script.find("rustup --version").expect("checks rustup");
+            assert!(check < script.find("ln -sf").unwrap(), "{script}");
+        }
+        assert!(get_install_script("rust", "1.80").contains("rustup default 1.80"));
+        // The runner's Rust leaves an image's own default toolchain alone.
+        assert!(!rustup_install("stable", false).contains("rustup default"));
     }
 
     #[test]

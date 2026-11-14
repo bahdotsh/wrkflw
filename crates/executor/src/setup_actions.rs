@@ -571,195 +571,46 @@ pub(crate) fn is_safe_python_spec(spec: &str) -> bool {
         })
 }
 
-/// Shell words that come before a command in a compound one.
-const SHELL_KEYWORDS: &[&str] = &[
-    "then", "do", "else", "elif", "if", "while", "until", "!", "time",
-];
-
-/// A command that runs the command after it: its options that take a value
-/// as the next word, and how many words it takes before that command.
-struct Wrapper {
-    name: &'static str,
-    options_with_value: &'static [&'static str],
-    operands: usize,
-}
-
-const WRAPPERS: &[Wrapper] = &[
-    Wrapper {
-        name: "sudo",
-        options_with_value: &[
-            "-u", "-g", "-C", "-D", "-h", "-p", "-r", "-t", "-U", "-R", "-T",
-        ],
-        operands: 0,
-    },
-    Wrapper {
-        name: "env",
-        options_with_value: &["-u", "-C", "-S"],
-        operands: 0,
-    },
-    Wrapper {
-        name: "timeout",
-        options_with_value: &["-s", "-k"],
-        // The duration.
-        operands: 1,
-    },
-    Wrapper {
-        name: "nice",
-        options_with_value: &["-n"],
-        operands: 0,
-    },
-    Wrapper {
-        name: "stdbuf",
-        options_with_value: &["-i", "-o", "-e"],
-        operands: 0,
-    },
-    Wrapper {
-        name: "xargs",
-        options_with_value: &["-a", "-d", "-E", "-I", "-L", "-n", "-P", "-s"],
-        operands: 0,
-    },
-    Wrapper {
-        name: "exec",
-        options_with_value: &["-a"],
-        operands: 0,
-    },
-    Wrapper {
-        name: "nohup",
-        options_with_value: &[],
-        operands: 0,
-    },
-    Wrapper {
-        name: "command",
-        options_with_value: &[],
-        operands: 0,
-    },
-];
-
-/// `NAME=value`, as a shell takes ahead of a command.
-fn is_assignment(word: &str) -> bool {
-    word.split_once('=').is_some_and(|(name, _)| {
-        !name.is_empty()
-            && !name.starts_with(|c: char| c.is_ascii_digit())
-            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-    })
-}
-
-/// The simple commands of one line of `script`, as a shell would split
-/// them: at `;`, `|`, `&`, parentheses, braces and backquotes outside
-/// quotes, and at the `$(` and backquotes of a command substitution inside
-/// double quotes. Single-quoted text is never split.
-fn simple_commands(line: &str) -> Vec<String> {
-    let mut commands = Vec::new();
-    let mut current = String::new();
-    let (mut single, mut double) = (false, false);
-    let mut chars = line.chars().peekable();
-    while let Some(c) = chars.next() {
-        let split = match c {
-            '\'' if !double => {
-                single = !single;
-                false
-            }
-            '"' if !single => {
-                double = !double;
-                false
-            }
-            _ if single => false,
-            '`' => true,
-            '$' if double && chars.peek() == Some(&'(') => {
-                chars.next();
-                true
-            }
-            ';' | '|' | '&' | '(' | ')' | '{' | '}' => !double,
-            _ => false,
-        };
-        if split {
-            commands.push(std::mem::take(&mut current));
-        } else {
-            current.push(c);
-        }
-    }
-    commands.push(current);
-    commands
-}
-
-/// The word of `command` that names what it runs, past assignments,
-/// keywords, options and wrappers such as `sudo -u root` or `timeout 60`.
-fn command_name(command: &str) -> Option<&str> {
-    let mut words = command
-        .split_whitespace()
-        .map(|word| word.trim_matches(|c| c == '"' || c == '\''));
-    let mut wrapper: Option<&Wrapper> = None;
-    let mut operands = 0;
-    while let Some(word) = words.next() {
-        if word.is_empty() || is_assignment(word) || SHELL_KEYWORDS.contains(&word) {
-            continue;
-        }
-        if word.starts_with('-') {
-            if wrapper.is_some_and(|w| w.options_with_value.contains(&word)) {
-                words.next();
-            }
-            continue;
-        }
-        if let Some(found) = WRAPPERS.iter().find(|w| w.name == word) {
-            wrapper = Some(found);
-            operands = found.operands;
-            continue;
-        }
-        if operands > 0 {
-            operands -= 1;
-            continue;
-        }
-        return Some(word);
-    }
-    None
-}
-
-/// Whether `script` runs one of `commands`, by name or by path, as far as
-/// its text says: `sudo -u root docker run`, `FOO=1 cargo test`,
-/// `timeout 60 docker ps`, `$(rustc -V)`. A command named only in an
-/// argument, as in `echo cargo` or `echo "a; docker b"`, isn't run.
-///
-/// This reads text, not what a shell would do with it: a command run by
-/// `make`, by a script the step calls, through an alias or a variable, as
-/// in `$DOCKER ps`, or in a heredoc isn't seen. Such a job gets neither the
-/// tool nor the warning that it is missing.
-fn script_runs(script: &str, commands: &[&str]) -> bool {
-    script
-        .lines()
-        .map(str::trim_start)
-        .filter(|line| !line.starts_with('#'))
-        .flat_map(simple_commands)
-        .any(|command| {
-            command_name(&command).is_some_and(|word| {
-                let name = word.rsplit('/').next().unwrap_or(word);
-                commands.contains(&name)
-            })
-        })
-}
-
-/// Whether a `run:` step of `steps` runs one of `commands`.
-pub(crate) fn steps_run(steps: &[Step], commands: &[&str]) -> bool {
-    steps
-        .iter()
-        .filter_map(|step| step.run.as_deref())
-        .any(|script| script_runs(script, commands))
-}
-
 /// The commands of the Rust toolchain a hosted runner comes with.
 const RUNNER_RUST_COMMANDS: &[&str] = &["cargo", "rustup", "rustc", "rustfmt"];
 
 /// The Rust toolchain hosted runners come with, when `steps` use it and no
 /// setup action among `runtimes` installs one: rustup with `stable`, which
 /// a `rustup toolchain add` or a plain `cargo test` step counts on.
-pub(crate) fn runner_rust(steps: &[Step], runtimes: &[SetupRuntime]) -> Option<SetupRuntime> {
-    (!runtimes.iter().any(|rt| rt.language == "rust") && steps_run(steps, RUNNER_RUST_COMMANDS))
-        .then(|| SetupRuntime {
-            language: "rust".to_string(),
-            version: "stable".to_string(),
-            install_script: get_install_script("rust", "stable"),
-            floating: true,
-            env: Vec::new(),
-        })
+///
+/// A `base_image` that comes with Rust, as the `rust` images do, keeps its
+/// own: the steps were written against what the image has.
+pub(crate) fn runner_rust(
+    steps: &[Step],
+    runtimes: &[SetupRuntime],
+    base_image: &str,
+) -> Option<SetupRuntime> {
+    let has_rust = base_image
+        .rsplit('/')
+        .next()
+        .is_some_and(|name| name == "rust" || name.starts_with("rust:"));
+    (!has_rust
+        && !runtimes.iter().any(|rt| rt.language == "rust")
+        && crate::script_commands::steps_run(steps, RUNNER_RUST_COMMANDS))
+    .then(|| SetupRuntime {
+        language: "rust".to_string(),
+        version: "stable".to_string(),
+        install_script: runner_rust_install(),
+        floating: true,
+        env: Vec::new(),
+    })
+}
+
+/// Installs rustup with `stable` as the default, unless rustup is there
+/// already, whose default toolchain is then left as it is.
+fn runner_rust_install() -> String {
+    "export PATH=\"${CARGO_HOME:-$HOME/.cargo}/bin:$PATH\" && \
+     if ! command -v rustup >/dev/null 2>&1; then \
+       curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --default-toolchain stable && \
+       d=\"$(dirname \"$(command -v rustup)\")\" && \
+       case \"$d\" in /usr/local/bin|/usr/bin|/bin) ;; *) ln -sf \"$d\"/* /usr/local/bin/ ;; esac; \
+     fi"
+        .to_string()
 }
 
 /// A Docker engine and its CLI, for a job that runs its own.
@@ -1424,56 +1275,13 @@ mod tests {
     }
 
     #[test]
-    fn a_command_is_found_where_a_shell_would_run_it() {
-        for script in [
-            "docker run alpine true",
-            "  sudo -E docker build .",
-            "FOO=1 BAR=2 docker compose up -d",
-            "echo start && docker ps",
-            "id=$(docker create alpine)",
-            "if ! docker info; then exit 1; fi",
-            "/usr/bin/docker version",
-            "make build\ndocker push example/image",
-            "sudo -u root docker ps",
-            "sudo -E -u root docker ps",
-            "timeout 60 docker run alpine true",
-            "timeout -s KILL 5m docker ps",
-            "nice -n 10 docker build .",
-            "env -u HOME docker info",
-            "echo \"$(docker version)\"",
-            "echo \"id: `docker create alpine`\"",
-            "\"docker\" ps",
-        ] {
-            assert!(script_runs(script, &["docker"]), "{script}");
-        }
-    }
-
-    #[test]
-    fn a_command_only_named_is_not_run() {
-        for script in [
-            "echo docker",
-            "apt-get install -y docker",
-            "# docker run alpine true",
-            "./docker.sh",
-            "docker-compose up",
-            "DOCKER=1 make docker",
-            "echo \"done; docker next\"",
-            "echo 'a | docker b'",
-            "echo \"(docker)\"",
-            "timeout 60",
-            "",
-        ] {
-            assert!(!script_runs(script, &["docker"]), "{script}");
-        }
-    }
-
-    #[test]
     fn steps_that_use_the_runners_rust_get_it() {
         let steps = [
             run_step("rustup toolchain add nightly && rustup default nightly"),
             run_step("cargo build --verbose"),
         ];
-        let rust = runner_rust(&steps, &[]).expect("the steps run rustup and cargo");
+        let rust =
+            runner_rust(&steps, &[], "ubuntu:latest").expect("the steps run rustup and cargo");
         assert_eq!(
             (rust.language.as_str(), rust.version.as_str()),
             ("rust", "stable")
@@ -1497,8 +1305,17 @@ mod tests {
             floating: true,
             env: Vec::new(),
         };
-        assert_eq!(runner_rust(&steps, &[nightly]), None);
-        assert_eq!(runner_rust(&[run_step("echo cargo")], &[]), None);
+        assert_eq!(runner_rust(&steps, &[nightly], "ubuntu:latest"), None);
+        assert_eq!(
+            runner_rust(&[run_step("echo cargo")], &[], "ubuntu:latest"),
+            None
+        );
+        // An image that comes with Rust keeps its own.
+        assert_eq!(runner_rust(&steps, &[], "rust:1.80"), None);
+        assert_eq!(
+            runner_rust(&steps, &[], "docker.io/library/rust:latest"),
+            None
+        );
     }
 
     #[test]

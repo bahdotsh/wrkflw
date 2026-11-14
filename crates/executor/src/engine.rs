@@ -2579,7 +2579,15 @@ async fn resolve_runner_image(
         not_built,
     } = detect_setup(steps);
     // What a hosted runner has before any step runs, when the steps use it.
-    runtimes.extend(crate::setup_actions::runner_rust(steps, &runtimes));
+    // An image the user mapped with `-P` is theirs, as a `container:` is:
+    // it may have its own toolchain, or no apt to install one with.
+    if find_platform_override(&job.runs_on, platform_overrides, matrix).is_none() {
+        runtimes.extend(crate::setup_actions::runner_rust(
+            steps,
+            &runtimes,
+            &base_image,
+        ));
+    }
     // The job's own Docker engine goes into the image, but is no setup
     // action's runtime.
     let mut image_runtimes = runtimes.clone();
@@ -2618,7 +2626,7 @@ async fn resolve_runner_image(
 fn warn_of_missing_docker(job: &Job, runtime: &dyn ContainerRuntime) {
     if job.container.is_some()
         || runtime.session_cli().is_none()
-        || !crate::setup_actions::steps_run(&job.steps, &["docker"])
+        || !crate::script_commands::steps_run(&job.steps, &["docker"])
     {
         return;
     }
@@ -2628,15 +2636,20 @@ fn warn_of_missing_docker(job: &Job, runtime: &dyn ContainerRuntime) {
     if !acceleration::first_missing_docker_warning() {
         return;
     }
-    wrkflw_logging::warning(if policy.docker_in_jobs {
-        "A job's steps run `docker`, but --docker-in-jobs needs one container per job, \
+    wrkflw_logging::warning(
+        if policy.docker_in_jobs && runtime.session_cli() != Some("docker") {
+            "A job's steps run `docker`, but --docker-in-jobs only starts an engine on \
+         Docker, not Podman: those steps will fail"
+        } else if policy.docker_in_jobs {
+            "A job's steps run `docker`, but --docker-in-jobs needs one container per job, \
          which --step-containers and --preserve-containers-on-failure turn off: \
          those steps will fail"
-    } else {
-        "A job's steps run `docker`, which hosted runners have and a job's container \
+        } else {
+            "A job's steps run `docker`, which hosted runners have and a job's container \
          doesn't: those steps will fail. Pass --docker-in-jobs to start a Docker engine \
          inside the container of each such job, which then runs privileged"
-    });
+        },
+    );
 }
 
 /// The image a job's steps run in, and the setup runtimes built into it.
@@ -8050,6 +8063,19 @@ mod tests {
         assert!(resolved.image.starts_with(COMBINED_IMAGE_PREFIX));
         assert_eq!(resolved.built.installed, ["rust"]);
         assert_eq!(resolved.built.runtimes[0].version, "stable");
+
+        // An image mapped with `-P` is the user's, and keeps its own Rust.
+        let overrides = HashMap::from([(
+            "ubuntu-latest".to_string(),
+            "example/rust-runner:1".to_string(),
+        )]);
+        let resolved = resolve_runner_image(&job, &steps, &runtime, &overrides, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            resolved,
+            RunnerImage::plain("example/rust-runner:1".to_string())
+        );
 
         // Steps that don't use it run in the runner's image as it is.
         let steps = vec![make_step_run("echo cargo")];

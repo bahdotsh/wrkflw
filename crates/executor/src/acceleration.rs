@@ -37,7 +37,7 @@ use wrkflw_parser::workflow::{Job, WorkflowDefinition};
 pub const SIDECAR_PATH: &str = ".wrkflw/affected.yml";
 
 /// Bump when the fingerprint's inputs change, so old entries stop matching.
-const KEY_VERSION: u32 = 3;
+const KEY_VERSION: u32 = 4;
 
 /// Host directories mounted into containers under `--dep-cache`.
 const DEP_CACHE_DIRS: &[(&str, &str)] = &[
@@ -446,6 +446,12 @@ fn job_key_with(input: &KeyInput<'_>, every_matrix_leg: bool) -> Option<String> 
     if every_matrix_leg && lookup.job.matrix_config().is_some() {
         document["every_matrix_leg"] = serde_json::json!(true);
     }
+    // A pass with a container per step can rest on each step starting from
+    // a clean image, so it can't stand in for a run whose steps share one,
+    // or the other way round. Version 3 keys were all of the former.
+    if container_policy().is_some_and(|policy| policy.one_container_per_step()) {
+        document["step_containers"] = serde_json::json!(true);
+    }
     let text = serde_json::to_string(&canonical(document)).ok()?;
     Some(hex(&Sha256::digest(text.as_bytes())))
 }
@@ -495,6 +501,14 @@ pub(crate) struct ContainerPolicy {
     pub preserve_containers: bool,
     /// Start a Docker engine in the container of a job that runs `docker`.
     pub docker_in_jobs: bool,
+}
+
+impl ContainerPolicy {
+    /// Each `run:` step gets a container of its own, which a kept-for-
+    /// debugging container also takes.
+    pub(crate) fn one_container_per_step(&self) -> bool {
+        self.step_containers || self.preserve_containers
+    }
 }
 
 /// The directory results are kept in.
@@ -1005,6 +1019,35 @@ mod tests {
             key_for_mode(&plain, &wf, &tree, None, false),
             key_for_mode(&plain, &wf, &tree, None, true)
         );
+    }
+
+    #[tokio::test]
+    async fn a_pass_with_a_container_per_step_is_kept_apart() {
+        let dir = repo();
+        let wf = workflow();
+        let tree = hash_tree(dir.path()).unwrap();
+        let definition = job("steps:\n  - run: make\n");
+        let key_in = |accel: Acceleration, preserve_containers: bool| {
+            let state =
+                RunState::new(accel, preserve_containers, dir.path().to_path_buf()).unwrap();
+            let (definition, wf, tree) = (&definition, &wf, &tree);
+            with_run_state(Arc::new(state), async move {
+                key_for(definition, wf, tree, None)
+            })
+        };
+        let shared = key_in(Acceleration::default(), false).await;
+        let per_step = key_in(
+            Acceleration {
+                step_containers: true,
+                ..Default::default()
+            },
+            false,
+        )
+        .await;
+        let kept = key_in(Acceleration::default(), true).await;
+        assert_ne!(shared, per_step);
+        // A kept-for-debugging container is one per step too.
+        assert_eq!(per_step, kept);
     }
 
     #[test]

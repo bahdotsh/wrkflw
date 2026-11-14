@@ -1183,13 +1183,13 @@ pub(crate) fn wanted_for(job: &Job, runtime: &dyn ContainerRuntime) -> Option<&'
     let policy = acceleration::container_policy()?;
     // A kept-for-debugging container is one per failed step, which a shared
     // container can't provide, so that flag wins.
-    let shared = !policy.step_containers && !policy.preserve_containers;
-    (shared || !job.services.is_empty()).then_some(cli)
+    (!policy.one_container_per_step() || !job.services.is_empty()).then_some(cli)
 }
 
 /// True when `job` gets a Docker engine of its own: its steps run
 /// `docker`, the run allows it, and the job has a container on an image
-/// wrkflw builds, which the engine is installed in.
+/// wrkflw builds, which the engine is installed in. Only on Docker: a
+/// rootless Podman container can't run an engine even when privileged.
 ///
 /// Both the image and the session ask this, so it reads the job alone: a
 /// matrix leg's steps differ from the job's only in `with:`, which says
@@ -1198,8 +1198,8 @@ pub(crate) fn wanted_for(job: &Job, runtime: &dyn ContainerRuntime) -> Option<&'
 pub(crate) fn docker_engine_for(job: &Job, runtime: &dyn ContainerRuntime) -> bool {
     job.container.is_none()
         && acceleration::container_policy().is_some_and(|policy| policy.docker_in_jobs)
-        && wanted_for(job, runtime).is_some()
-        && crate::setup_actions::steps_run(&job.steps, &["docker"])
+        && wanted_for(job, runtime) == Some("docker")
+        && crate::script_commands::steps_run(&job.steps, &["docker"])
 }
 
 /// Run `future`, one job's steps, with a session if `job` calls for one. The
@@ -1696,7 +1696,7 @@ mod tests {
     }
 
     /// A runtime that can keep a container running, and nothing else.
-    struct SessionRuntime;
+    struct SessionRuntime(&'static str);
 
     #[async_trait::async_trait]
     impl ContainerRuntime for SessionRuntime {
@@ -1734,7 +1734,7 @@ mod tests {
             Ok(true)
         }
         fn session_cli(&self) -> Option<&'static str> {
-            Some("docker")
+            Some(self.0)
         }
     }
 
@@ -1755,7 +1755,7 @@ mod tests {
     #[tokio::test]
     async fn a_jobs_steps_share_a_container_unless_the_run_says_otherwise() {
         let job = job_running("echo hello");
-        let wanted = || wanted_for(&job, &SessionRuntime);
+        let wanted = || wanted_for(&job, &SessionRuntime("docker"));
         assert_eq!(
             in_run(acceleration::Acceleration::default(), false, wanted).await,
             Some("docker")
@@ -1781,7 +1781,7 @@ mod tests {
             acceleration::RunState::new(Default::default(), false, PathBuf::from(".")).unwrap();
         let wanted = acceleration::with_run_state(
             Arc::new(state),
-            acceleration::without_run_state(async { wanted_for(&job, &SessionRuntime) }),
+            acceleration::without_run_state(async { wanted_for(&job, &SessionRuntime("docker")) }),
         )
         .await;
         assert_eq!(wanted, Some("docker"));
@@ -1812,7 +1812,7 @@ mod tests {
             docker_in_jobs: true,
             ..Default::default()
         };
-        let engine = |job: &Job| docker_engine_for(job, &SessionRuntime);
+        let engine = |job: &Job| docker_engine_for(job, &SessionRuntime("docker"));
         assert!(in_run(allowed(), false, || engine(&docker)).await);
         assert!(!in_run(allowed(), false, || engine(&plain)).await);
         assert!(!in_run(Default::default(), false, || engine(&docker)).await);
@@ -1822,6 +1822,9 @@ mod tests {
             ..allowed()
         };
         assert!(!in_run(step_containers, false, || engine(&docker)).await);
+        // Rootless Podman can't run an engine inside a container.
+        let on_podman = |job: &Job| docker_engine_for(job, &SessionRuntime("podman"));
+        assert!(!in_run(allowed(), false, || on_podman(&docker)).await);
     }
 
     #[test]

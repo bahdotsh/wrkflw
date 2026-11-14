@@ -1,7 +1,7 @@
 # Codebase Index: wrkflw
 
-> Generated: 2026-11-14 03:19:09 UTC | Files: 262 | Lines: 119395
-> Languages: JSON (4), Markdown (26), Rust (169), Shell (6), TOML (19), YAML (38)
+> Generated: 2026-11-14 11:25:55 UTC | Files: 264 | Lines: 119803
+> Languages: JSON (4), Markdown (27), Rust (170), Shell (6), TOML (19), YAML (38)
 
 ## Directory Structure
 
@@ -13,6 +13,7 @@ wrkflw/
   Cargo.toml
   INDEX.md
   README.md
+  RELEASE_POST.md
   cliff.toml
   crates/
     README.md
@@ -59,6 +60,7 @@ wrkflw/
         podman.rs
         run_options.rs
         runner_fidelity.rs
+        script_commands.rs
         setup_actions.rs
         substitution.rs
         vm_memory.rs
@@ -420,6 +422,9 @@ wrkflw/
 - `# Environment variables (simplest)`
 - `# File-based secrets (JSON, YAML, or .env format)`
 - `# On Linux, put them in ~/.config/wrkflw/secrets/ (read by the `file` provider)`
+
+**RELEASE_POST.md**
+- `# wrkflw v0.8.0 — run GitHub Actions locally, now with a real `${{ ... }}` evaluator`
 
 **cliff.toml**
 - `[changelog]`
@@ -1766,7 +1771,7 @@ wrkflw/
 
 ## BREAKING_CHANGES.md
 
-**Language:** Markdown | **Size:** 33.9 KB | **Lines:** 396
+**Language:** Markdown | **Size:** 34.5 KB | **Lines:** 398
 
 **Declarations:**
 
@@ -1790,7 +1795,7 @@ wrkflw/
 
 ## INDEX.md
 
-**Language:** Markdown | **Size:** 282.1 KB | **Lines:** 10410
+**Language:** Markdown | **Size:** 281.9 KB | **Lines:** 10398
 
 **Declarations:**
 
@@ -1798,7 +1803,15 @@ wrkflw/
 
 ## README.md
 
-**Language:** Markdown | **Size:** 45.1 KB | **Lines:** 564
+**Language:** Markdown | **Size:** 45.5 KB | **Lines:** 564
+
+**Declarations:**
+
+---
+
+## RELEASE_POST.md
+
+**Language:** Markdown | **Size:** 3.8 KB | **Lines:** 59
 
 **Declarations:**
 
@@ -2061,7 +2074,7 @@ wrkflw/
 
 ## crates/executor/src/acceleration.rs
 
-**Language:** Rust | **Size:** 58.6 KB | **Lines:** 1660
+**Language:** Rust | **Size:** 60.3 KB | **Lines:** 1703
 
 **Imports:**
 - `pub(crate) use concurrency::acquire_concurrency`
@@ -2086,7 +2099,7 @@ wrkflw/
 
 `mod tree`
 
-`const KEY_VERSION: u32 = 3`
+`const KEY_VERSION: u32 = 4`
 
 `const DEP_CACHE_DIRS: &[(&str, &str)] = &[ ("cargo-registry", "/root/.cargo/registry"), ("cargo-git", "/root/.cargo/git"), ("npm", "/root/.npm"), ("pip", "/root/.cache/pip"), ("go-mod", "/root/go/pkg/mod"), ]`
 
@@ -2149,6 +2162,10 @@ wrkflw/
 
 `pub(crate) struct ContainerPolicy`
 > Fields: `step_containers: bool`, `preserve_containers: bool`, `docker_in_jobs: bool`
+
+**`impl ContainerPolicy`**
+  `pub(crate) fn one_container_per_step(&self) -> bool`
+
 
 `fn results_dir() -> Option<PathBuf>`
 
@@ -3167,7 +3184,7 @@ wrkflw/
 
 ## crates/executor/src/job_session.rs
 
-**Language:** Rust | **Size:** 69.1 KB | **Lines:** 1912
+**Language:** Rust | **Size:** 69.5 KB | **Lines:** 1915
 
 **Imports:**
 - `crate::acceleration`
@@ -3603,7 +3620,7 @@ wrkflw/
 
 ## crates/executor/src/lib.rs
 
-**Language:** Rust | **Size:** 1.9 KB | **Lines:** 60
+**Language:** Rust | **Size:** 2.0 KB | **Lines:** 61
 
 **Imports:**
 - `pub use acceleration::{validate_remote, Acceleration, Secret, Sidecar, SIDECAR_PATH}`
@@ -3644,6 +3661,8 @@ wrkflw/
 `pub(crate) mod log_redaction`
 
 `pub(crate) mod matrix_fold`
+
+`pub(crate) mod script_commands`
 
 `pub(crate) mod setup_actions`
 
@@ -3961,9 +3980,54 @@ wrkflw/
 
 ---
 
+## crates/executor/src/script_commands.rs
+
+**Language:** Rust | **Size:** 16.0 KB | **Lines:** 495
+
+**Imports:**
+- `wrkflw_parser::workflow::Step`
+
+**Declarations:**
+
+`pub(crate) fn steps_run(steps: &[Step], commands: &[&str]) -> bool`
+
+`fn script_runs(script: &str, commands: &[&str]) -> bool`
+
+`const SHELLS: &[&str] = &["sh", "bash", "dash", "zsh", "ksh"]`
+
+`const SHELL_KEYWORDS: &[&str] = &[ "then", "do", "else", "elif", "if", "while", "until", "!", "time", ]`
+
+`struct Wrapper`
+> Fields: `name: &'static str`, `options_with_value: &'static [&'static str]`, `operands: usize`, `options_that_only_look: &'static [&'static str]`
+
+`const WRAPPERS: &[Wrapper] = &[ Wrapper`
+
+`fn is_assignment(word: &str) -> bool`
+
+`fn basename(path: &str) -> &str`
+
+`struct Heredoc`
+> Fields: `delimiter: String`, `is_script: bool`
+
+`fn simple_commands(script: &str) -> Vec<String>`
+
+`fn heredoc_delimiter(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> String`
+
+`fn heredoc_body(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, delimiter: &str) -> String`
+
+`fn words(command: &str) -> Vec<String>`
+
+`fn command_word(words: &[String]) -> Option<usize>`
+
+`fn shell_script(args: &[String]) -> Option<&str>`
+
+`mod tests`
+
+---
+
 ## crates/executor/src/setup_actions.rs
 
-**Language:** Rust | **Size:** 59.7 KB | **Lines:** 1514
+**Language:** Rust | **Size:** 54.3 KB | **Lines:** 1331
 
 **Imports:**
 - `std::collections::HashMap`
@@ -4020,26 +4084,11 @@ wrkflw/
 
 `pub(crate) fn is_safe_python_spec(spec: &str) -> bool`
 
-`const SHELL_KEYWORDS: &[&str] = &[ "then", "do", "else", "elif", "if", "while", "until", "!", "time", ]`
-
-`struct Wrapper`
-> Fields: `name: &'static str`, `options_with_value: &'static [&'static str]`, `operands: usize`
-
-`const WRAPPERS: &[Wrapper] = &[ Wrapper`
-
-`fn is_assignment(word: &str) -> bool`
-
-`fn simple_commands(line: &str) -> Vec<String>`
-
-`fn command_name(command: &str) -> Option<&str>`
-
-`fn script_runs(script: &str, commands: &[&str]) -> bool`
-
-`pub(crate) fn steps_run(steps: &[Step], commands: &[&str]) -> bool`
-
 `const RUNNER_RUST_COMMANDS: &[&str] = &["cargo", "rustup", "rustc", "rustfmt"]`
 
-`pub(crate) fn runner_rust(steps: &[Step], runtimes: &[SetupRuntime]) -> Option<SetupRuntime>`
+`pub(crate) fn runner_rust( steps: &[Step], runtimes: &[SetupRuntime], base_image: &str, ) -> Option<SetupRuntime>`
+
+`fn runner_rust_install() -> String`
 
 `pub(crate) fn docker_engine() -> SetupRuntime`
 

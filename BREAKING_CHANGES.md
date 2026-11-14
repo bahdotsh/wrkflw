@@ -6,9 +6,11 @@ On Docker and Podman a job's `run:` steps now run in one container, started once
 
 The job's container and its services are sampled into the job's memory measurement, so a job with services is measured and a matrix of light jobs still runs side by side.
 
-A job whose `run:` steps call `cargo`, `rustup`, `rustc` or `rustfmt` without a Rust setup action gets rustup and the `stable` toolchain in its image, as hosted runners have. Such a job used to run in the bare runner image and fail with `command not found`; its first run now builds an image.
+A job whose `run:` steps call `cargo`, `rustup`, `rustc` or `rustfmt` without a Rust setup action gets rustup and the `stable` toolchain in its image, as hosted runners have. Such a job used to run in the bare runner image and fail with `command not found`; its first run now builds an image. An image mapped with `-P`, and a `rust` image, keep their own toolchain and get nothing added, and a base that already has rustup keeps its default toolchain.
 
-`--docker-in-jobs`, or `WRKFLW_DOCKER_IN_JOBS=1`, starts a Docker engine inside the container of a job whose steps run `docker`. The container runs privileged, so it is opt-in, and each such job says when its container starts privileged. Without it the run warns once, called workflows included, that those steps will fail. Which jobs run `docker`, or `cargo` for the runner's Rust, is read from the text of their `run:` steps: a command behind `make`, a script or a variable isn't seen.
+Stored results, local and remote, are keyed on whether a job's steps share a container, and the key's version is bumped, so `--reuse-results` reruns every job once: a pass from a run with a container per step can't stand in for one whose steps share one.
+
+`--docker-in-jobs`, or `WRKFLW_DOCKER_IN_JOBS=1`, starts a Docker engine inside the container of a job whose steps run `docker`. The container runs privileged, so it is opt-in, and each such job says when its container starts privileged. It works on Docker only; on Podman the run says those steps will fail. Without it the run warns once, called workflows included, that those steps will fail. Which jobs run `docker`, or `cargo` for the runner's Rust, is read from the text of their `run:` steps as a shell splits it, `bash -c` and heredocs a shell reads included: a command behind `make`, a script or a variable isn't seen, and `command -v docker` doesn't count.
 
 For crates that use wrkflw as a library: `wrkflw_executor::Acceleration::job_container` is gone. `step_containers` is its opposite and defaults to `false`, so `Acceleration::default()` now runs one container per job, and `docker_in_jobs` is new. Struct literals that name `job_container` need changing.
 

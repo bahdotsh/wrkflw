@@ -1203,14 +1203,19 @@ fn append_host_entry<W: Write>(
     // Not this machine's owner, which means nothing in the volume.
     header.set_uid(OWNER.into());
     header.set_gid(OWNER.into());
-    if meta.is_file() {
+    let file_type = meta.file_type();
+    if file_type.is_file() {
         #[cfg(not(unix))]
         header.set_mode(_in_volume.and_then(|e| e.mode).unwrap_or(0o755));
         builder.append_data(&mut header, rel, std::fs::File::open(full)?)
-    } else if meta.file_type().is_symlink() {
+    } else if file_type.is_symlink() {
         builder.append_link(&mut header, rel, std::fs::read_link(full)?)
-    } else {
+    } else if file_type.is_dir() {
         builder.append_data(&mut header, rel, io::empty())
+    } else {
+        // A socket, pipe or device, which the listing leaves out too: an
+        // empty file in its place would be something the host doesn't have.
+        Ok(())
     }
 }
 
@@ -2075,6 +2080,72 @@ pub(crate) fn remove_orphaned_volumes() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What goes into the volume is the runner user's, whatever its kind,
+    /// and keeps its kind: a directory, a link and a file with a name too
+    /// long for a plain tar header. A socket, which the listing leaves out,
+    /// adds nothing.
+    #[cfg(unix)]
+    #[test]
+    fn host_entries_go_to_the_volume_as_the_runner_users() {
+        let host = tempfile::tempdir().unwrap();
+        let long = "d".repeat(120);
+        std::fs::create_dir_all(host.path().join(&long)).unwrap();
+        let file = Path::new(&long).join("f".repeat(120));
+        std::fs::write(host.path().join(&file), "hi").unwrap();
+        std::os::unix::fs::symlink("target", host.path().join("link")).unwrap();
+        let socket = host.path().join("sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+
+        let mut builder = tar::Builder::new(Vec::new());
+        builder.follow_symlinks(false);
+        for rel in [
+            Path::new(&long),
+            &file,
+            Path::new("link"),
+            Path::new("sock"),
+        ] {
+            append_host_entry(&mut builder, &host.path().join(rel), rel, None).unwrap();
+        }
+        let archive = builder.into_inner().unwrap();
+        let mut archive = tar::Archive::new(archive.as_slice());
+        let entries: Vec<(PathBuf, tar::EntryType, u64, u64, Option<PathBuf>)> = archive
+            .entries()
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                let header = entry.header();
+                (
+                    entry.path().unwrap().into_owned(),
+                    header.entry_type(),
+                    header.uid().unwrap(),
+                    header.gid().unwrap(),
+                    entry.link_name().unwrap().map(|l| l.into_owned()),
+                )
+            })
+            .collect();
+        let owner = u64::from(OWNER);
+        assert_eq!(
+            entries,
+            [
+                (
+                    PathBuf::from(&long),
+                    tar::EntryType::Directory,
+                    owner,
+                    owner,
+                    None
+                ),
+                (file.clone(), tar::EntryType::Regular, owner, owner, None),
+                (
+                    PathBuf::from("link"),
+                    tar::EntryType::Symlink,
+                    owner,
+                    owner,
+                    Some(PathBuf::from("target"))
+                ),
+            ]
+        );
+    }
 
     fn file(size: u64, mtime: i64) -> Entry {
         Entry {

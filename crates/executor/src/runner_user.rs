@@ -38,11 +38,18 @@ pub(crate) fn uid() -> u32 {
     uid_for(host_uid(), crate::vm_workspace::volume_mode())
 }
 
+/// The uids Debian and Ubuntu give people's accounts. Below them are root
+/// and system accounts, and above them `nobody`: the image's user with the
+/// uid is removed to make way for the runner user, so only a uid of this
+/// range is taken.
+const USER_UIDS: std::ops::Range<u32> = 1000..60000;
+
 fn uid_for(host_uid: Option<u32>, workspace_in_volume: bool) -> u32 {
     match host_uid {
-        // Root's files are root's: no other user can write them, and the
-        // session finds that out and runs the steps as root.
-        Some(uid) if uid != 0 && !workspace_in_volume => uid,
+        // Root's files are root's, and a system account's are its own: the
+        // user gets GitHub's uid, can't write them, and the session finds
+        // that out and runs the steps as root.
+        Some(uid) if USER_UIDS.contains(&uid) && !workspace_in_volume => uid,
         _ => HOSTED_UID,
     }
 }
@@ -143,6 +150,12 @@ mod tests {
         // Root's files can't be another user's: the hosted uid, and the
         // session falls back to root.
         assert_eq!(uid_for(Some(0), false), HOSTED_UID);
+        // Nor is a system account's uid taken, or `nobody`'s, whose
+        // accounts the image has and would lose.
+        assert_eq!(uid_for(Some(42), false), HOSTED_UID);
+        assert_eq!(uid_for(Some(999), false), HOSTED_UID);
+        assert_eq!(uid_for(Some(65534), false), HOSTED_UID);
+        assert_eq!(uid_for(Some(59999), false), 59999);
         // A volume holds what wrkflw copies in.
         assert_eq!(uid_for(Some(1000), true), HOSTED_UID);
         // macOS and Windows: the VM maps the owner.

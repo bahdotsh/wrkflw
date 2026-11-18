@@ -39,14 +39,21 @@ pub const SIDECAR_PATH: &str = ".wrkflw/affected.yml";
 /// Bump when the fingerprint's inputs change, so old entries stop matching.
 const KEY_VERSION: u32 = 4;
 
-/// Host directories mounted into containers under `--dep-cache`.
+/// Host directories mounted into containers under `--dep-cache`, and where
+/// in a user's home directory each tool keeps that cache.
 const DEP_CACHE_DIRS: &[(&str, &str)] = &[
-    ("cargo-registry", "/root/.cargo/registry"),
-    ("cargo-git", "/root/.cargo/git"),
-    ("npm", "/root/.npm"),
-    ("pip", "/root/.cache/pip"),
-    ("go-mod", "/root/go/pkg/mod"),
+    ("cargo-registry", ".cargo/registry"),
+    ("cargo-git", ".cargo/git"),
+    ("npm", ".npm"),
+    ("pip", ".cache/pip"),
+    ("go-mod", "go/pkg/mod"),
 ];
+
+/// The home directories a step may have: the runner user's, in the image
+/// wrkflw builds, and root's, in any other and wherever steps can't run as
+/// that user. Which it is isn't known until the job's container is up,
+/// after its mounts are fixed, so each cache is mounted in both.
+const DEP_CACHE_HOMES: &[&str] = &["/root", crate::runner_user::HOME];
 
 /// Files that always count as input, because steps load them without naming
 /// them. Path hints would otherwise let a composite action change go unseen.
@@ -681,10 +688,15 @@ fn dep_cache_dirs_in(base: &Path, repo: &Path) -> Vec<(PathBuf, PathBuf)> {
     let root = base.join(repo_cache_id(repo));
     DEP_CACHE_DIRS
         .iter()
-        .filter_map(|(name, container)| {
+        .filter_map(|(name, in_home)| {
             let host = root.join(name);
             std::fs::create_dir_all(&host).ok()?;
-            Some((host, PathBuf::from(container)))
+            Some((host, in_home))
+        })
+        .flat_map(|(host, in_home)| {
+            DEP_CACHE_HOMES
+                .iter()
+                .map(move |home| (host.clone(), Path::new(home).join(in_home)))
         })
         .collect()
 }
@@ -1678,13 +1690,29 @@ jobs:
         let first = TempDir::new().unwrap();
         let second = TempDir::new().unwrap();
         let hosts = |repo: &Path| -> Vec<PathBuf> {
-            dep_cache_dirs_in(base.path(), repo)
+            let mut hosts: Vec<PathBuf> = dep_cache_dirs_in(base.path(), repo)
                 .into_iter()
                 .map(|(host, _)| host)
-                .collect()
+                .collect();
+            hosts.dedup();
+            hosts
         };
         let mine = hosts(first.path());
         assert_eq!(mine.len(), DEP_CACHE_DIRS.len());
+        // Each is mounted where root keeps it and where the runner user
+        // does: a step runs as one or the other.
+        let cargo: Vec<PathBuf> = dep_cache_dirs_in(base.path(), first.path())
+            .into_iter()
+            .filter(|(host, _)| host.ends_with("cargo-registry"))
+            .map(|(_, container)| container)
+            .collect();
+        assert_eq!(
+            cargo,
+            [
+                PathBuf::from("/root/.cargo/registry"),
+                PathBuf::from("/home/runner/.cargo/registry")
+            ]
+        );
         assert!(mine.iter().all(|dir| dir.is_dir()));
         let theirs = hosts(second.path());
         assert!(mine.iter().all(|dir| !theirs.contains(dir)));

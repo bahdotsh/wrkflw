@@ -62,6 +62,11 @@ const LABEL: &str = "wrkflw.workspace";
 const VOLUME_PREFIX: &str = "wrkflw-ws-";
 /// Where the helper container mounts the volume.
 const ROOT: &str = "/ws";
+/// The uid and gid that own what is copied into the volume: the [runner
+/// user](crate::runner_user)'s, which a job's steps run as in the image
+/// wrkflw builds, so they can change the files they are given. A step that
+/// runs as root can change them whoever owns them.
+const OWNER: u32 = crate::runner_user::HOSTED_UID;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Kind {
@@ -109,6 +114,13 @@ fn wanted(on_by_default: bool, setting: Option<&str>) -> bool {
         Some("volume") => true,
         _ => on_by_default,
     }
+}
+
+/// True when this run gives steps the workspace in a volume: by default on
+/// macOS, and wherever [`MOUNT_ENV`] asks for it.
+pub(crate) fn volume_mode() -> bool {
+    let setting = std::env::var(MOUNT_ENV).ok();
+    wanted(cfg!(target_os = "macos"), setting.as_deref())
 }
 
 /// The volume that holds the workspace at `host`.
@@ -251,8 +263,7 @@ pub(crate) async fn before_step(
     let Some(cli) = runtime.session_cli() else {
         return Ok(None);
     };
-    let setting = std::env::var(MOUNT_ENV).ok();
-    if !wanted(cfg!(target_os = "macos"), setting.as_deref()) || !host.is_dir() {
+    if !volume_mode() || !host.is_dir() {
         return Ok(None);
     }
     let workspace = {
@@ -633,6 +644,15 @@ impl VmWorkspace {
         }
         let id = String::from_utf8_lossy(&started.stdout).trim().to_string();
         track(self.cli, &id);
+        // The volume's own directory is root's when the engine makes it,
+        // and a workspace kept by a wrkflw from before steps had a user
+        // holds root's files throughout. Once: afterwards it is [`OWNER`]'s.
+        let own =
+            format!("[ \"$(stat -c %u {ROOT})\" = {OWNER} ] || chown -R {OWNER}:{OWNER} {ROOT}");
+        let owned = exec_output(self.cli, &id, &["sh", "-c", &own], None)?;
+        if !owned.status.success() {
+            return Err(command_failed(&["chown", ROOT], &owned.stderr));
+        }
         state.helper = Some(id.clone());
         Ok(id)
     }
@@ -681,7 +701,9 @@ impl VmWorkspace {
                 "tar",
                 "-C",
                 ROOT,
-                "--no-same-owner",
+                // Each entry names its owner by number: see [`OWNER`].
+                "--same-owner",
+                "--numeric-owner",
                 "-xf",
                 "-",
             ])
@@ -1173,17 +1195,21 @@ fn append_host_entry<W: Write>(
     rel: &Path,
     _in_volume: Option<&Entry>,
 ) -> io::Result<()> {
-    #[cfg(not(unix))]
-    {
-        let meta = std::fs::symlink_metadata(full)?;
-        if meta.is_file() {
-            let mut header = tar::Header::new_gnu();
-            header.set_metadata(&meta);
-            header.set_mode(_in_volume.and_then(|e| e.mode).unwrap_or(0o755));
-            return builder.append_data(&mut header, rel, std::fs::File::open(full)?);
-        }
+    let meta = std::fs::symlink_metadata(full)?;
+    let mut header = tar::Header::new_gnu();
+    header.set_metadata(&meta);
+    // Not this machine's owner, which means nothing in the volume.
+    header.set_uid(OWNER.into());
+    header.set_gid(OWNER.into());
+    if meta.is_file() {
+        #[cfg(not(unix))]
+        header.set_mode(_in_volume.and_then(|e| e.mode).unwrap_or(0o755));
+        builder.append_data(&mut header, rel, std::fs::File::open(full)?)
+    } else if meta.file_type().is_symlink() {
+        builder.append_link(&mut header, rel, std::fs::read_link(full)?)
+    } else {
+        builder.append_data(&mut header, rel, io::empty())
     }
-    builder.append_path_with_name(full, rel)
 }
 
 /// What copying entries back to the host did not write.

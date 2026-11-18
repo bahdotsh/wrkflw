@@ -74,6 +74,10 @@ struct Live {
     id: String,
     /// The action directory last copied to [`CONTAINER_ACTION_DIR`].
     action_dir: Option<PathBuf>,
+    /// The user steps `exec` as, or `None` for the container's own: the
+    /// [runner user](crate::runner_user), where the image has it and it
+    /// can write the job's mounts.
+    user: Option<&'static str>,
     /// Samples the containers' memory. Before `_cleanup`, so it stops
     /// before the containers go and their going isn't taken for a failure.
     _memory: Option<MemoryWatch>,
@@ -377,6 +381,10 @@ pub(crate) struct JobSession {
     /// Start a Docker engine in the job container, for steps that run
     /// `docker`.
     docker_engine: bool,
+    /// Run steps as the [runner user](crate::runner_user) where the job's
+    /// container allows it: the job runs in the image wrkflw builds, which
+    /// has that user, and the run didn't ask for root.
+    runner_user: bool,
     state: tokio::sync::Mutex<State>,
 }
 
@@ -412,6 +420,12 @@ fn track(cli: &str, id: &str) {
 /// and Ubuntu images, drops names that aren't identifiers. So a `shell: sh`
 /// step there can't pass `INPUT_MY-INPUT` on to its children, as on GitHub.
 const ENV_LOADER: &str = "eval \"$(cat)\" && exec env \"$@\"";
+
+/// Fails, naming the first of the directories given as arguments that the
+/// user running it can't write. A path that isn't a directory, such as a
+/// mounted file, is passed over.
+const CAN_WRITE: &str =
+    "for dir in \"$@\"; do [ ! -d \"$dir\" ] || [ -w \"$dir\" ] || { echo \"$dir\"; exit 1; }; done";
 
 /// `value` as one word of a POSIX shell script.
 fn shell_quote(value: &str) -> String {
@@ -473,12 +487,25 @@ fn env_script<'a>(env: impl Iterator<Item = (&'a str, &'a str)>) -> Result<Strin
     Ok(script)
 }
 
-fn exec_args(id: &str, working_dir: &Path, cmd: &[&str]) -> Vec<String> {
+/// `user` is who the step runs as, or `None` for the container's own user.
+/// The engine sets `HOME` from that user's entry in the image, as a login
+/// would, but not `USER` and `LOGNAME`, which the hosted runner's steps
+/// have and tools read to name the user. The step's own environment,
+/// loaded afterwards, wins over them.
+fn exec_args(id: &str, working_dir: &Path, cmd: &[&str], user: Option<&str>) -> Vec<String> {
     let mut args: Vec<String> = ["exec", "-i", "-w"]
         .iter()
         .map(|part| part.to_string())
         .collect();
     args.push(working_dir.display().to_string());
+    if let Some(user) = user {
+        args.push("--user".to_string());
+        args.push(user.to_string());
+        for name in ["USER", "LOGNAME"] {
+            args.push("--env".to_string());
+            args.push(format!("{}={}", name, user));
+        }
+    }
     args.push(id.to_string());
     args.extend(["sh", "-c", ENV_LOADER, "wrkflw-env"].map(str::to_string));
     args.extend(cmd.iter().map(|part| part.to_string()));
@@ -987,6 +1014,11 @@ impl JobSession {
             ids: Vec::new(),
         };
         containers.add(&id);
+        let user = if self.runner_user {
+            self.step_user(&id, volumes).await
+        } else {
+            None
+        };
         self.start_services(&id, &mut containers, resolve).await?;
         if self.docker_engine {
             self.wait_for_docker_engine(&id).await?;
@@ -1006,9 +1038,63 @@ impl JobSession {
             volumes: volumes.to_vec(),
             id,
             action_dir: None,
+            user,
             _memory: memory,
             _cleanup: containers,
         })
+    }
+
+    /// The user steps run as in job container `id`: the runner user, when
+    /// the image has it and it can write every directory mounted into the
+    /// container, such as the workspace. `None` leaves steps to the
+    /// container's own user, root, as before there was a runner user.
+    ///
+    /// It can't write them under a rootless engine, where this machine's
+    /// files are root's inside the container, or when wrkflw itself runs as
+    /// root. The image has no such user when the runner's tools couldn't
+    /// be built and the job runs on its bare base image.
+    async fn step_user(&self, id: &str, volumes: &[(PathBuf, PathBuf)]) -> Option<&'static str> {
+        let user = crate::runner_user::NAME;
+        let exists: Vec<String> = ["exec", id, "id", "-u", user].map(str::to_string).to_vec();
+        if !cli_output(self.cli, &exists, None)
+            .await
+            .is_ok_and(|output| output.exit_code == 0)
+        {
+            wrkflw_logging::debug(&format!(
+                "The job's image has no {} user, so its steps run as the image's own",
+                user
+            ));
+            return None;
+        }
+        let mut writable: Vec<String> = ["exec", "--user", user, id, "sh", "-c", CAN_WRITE, "sh"]
+            .map(str::to_string)
+            .to_vec();
+        writable.extend(
+            volumes
+                .iter()
+                .map(|(_, container)| container.display().to_string()),
+        );
+        match cli_output(self.cli, &writable, None).await {
+            Ok(output) if output.exit_code == 0 => Some(user),
+            Ok(output) => {
+                wrkflw_logging::warning(&format!(
+                    "This job's steps run as root, not as the {} user GitHub's run as: that \
+                     user can't write {} in the job's container, as under a rootless engine \
+                     or when wrkflw runs as root",
+                    user,
+                    output.stdout.trim()
+                ));
+                None
+            }
+            Err(e) => {
+                wrkflw_logging::warning(&format!(
+                    "This job's steps run as root: couldn't tell whether the {} user can \
+                     write the job's files: {}",
+                    user, e
+                ));
+                None
+            }
+        }
     }
 
     /// Wait until the Docker engine started in job container `id` answers.
@@ -1041,8 +1127,15 @@ impl JobSession {
         }
     }
 
-    /// Replace [`CONTAINER_ACTION_DIR`] in container `id` with a copy of `dir`.
-    async fn copy_action_dir(&self, id: &str, dir: &Path) -> Result<(), String> {
+    /// Replace [`CONTAINER_ACTION_DIR`] in container `id` with a copy of
+    /// `dir`, owned by `user` when steps run as one: the copy arrives as
+    /// root's, and an action may write beside its own files.
+    async fn copy_action_dir(
+        &self,
+        id: &str,
+        dir: &Path,
+        user: Option<&str>,
+    ) -> Result<(), String> {
         let clear: Vec<String> = ["exec", id, "rm", "-rf", CONTAINER_ACTION_DIR]
             .map(str::to_string)
             .to_vec();
@@ -1051,7 +1144,15 @@ impl JobSession {
             dir.display().to_string(),
             format!("{}:{}", id, CONTAINER_ACTION_DIR),
         ];
-        for args in [clear, copy] {
+        let mut commands = vec![clear, copy];
+        if let Some(user) = user {
+            commands.push(
+                ["exec", id, "chown", "-R", user, CONTAINER_ACTION_DIR]
+                    .map(str::to_string)
+                    .to_vec(),
+            );
+        }
+        for args in commands {
             let output = cli_output(self.cli, &args, None)
                 .await
                 .map_err(|e| e.to_string())?;
@@ -1154,9 +1255,10 @@ impl JobSession {
             return Ok(None);
         }
         let id = live.id.clone();
+        let user = live.user;
         if let Some(dir) = action_dir {
             if live.action_dir.as_ref() != Some(&dir) {
-                if let Err(e) = self.copy_action_dir(&id, &dir).await {
+                if let Err(e) = self.copy_action_dir(&id, &dir, user).await {
                     if !self.services.is_empty() {
                         return Err(format!(
                             "this step's action directory couldn't be copied to the job \
@@ -1179,7 +1281,7 @@ impl JobSession {
         let script = env_script(env.iter().copied())?;
         state.busy = true;
 
-        let args = exec_args(&id, working_dir, cmd);
+        let args = exec_args(&id, working_dir, cmd, user);
         let watch = StepWatch(crate::job_memory::meter());
         let output = run_cli(self.cli, &args, Some(&script), true).await;
         watch.ended(output.as_ref().ok());
@@ -1253,6 +1355,7 @@ pub(crate) async fn with_job_session<F: Future>(
             cli,
             services,
             docker_engine: docker_engine_for(job, runtime, mapped_image),
+            runner_user: crate::runner_user::allowed() && !mapped_image && job.container.is_none(),
             state: tokio::sync::Mutex::new(State::default()),
         })
     });
@@ -1263,9 +1366,68 @@ pub(crate) async fn with_job_session<F: Future>(
 mod tests {
     use super::*;
 
+    /// The check that decides whether steps can run as the runner user
+    /// names the first directory that user can't write, and passes over
+    /// what isn't a directory.
+    #[cfg(unix)]
+    #[test]
+    fn the_write_check_names_the_first_directory_that_cant_be_written() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let open = dir.path().join("open");
+        let closed = dir.path().join("closed");
+        let file = dir.path().join("file");
+        std::fs::create_dir(&open).unwrap();
+        std::fs::create_dir(&closed).unwrap();
+        std::fs::write(&file, "").unwrap();
+        std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let check = |paths: &[&Path]| {
+            std::process::Command::new("sh")
+                .args(["-c", CAN_WRITE, "sh"])
+                .args(paths)
+                .output()
+                .unwrap()
+        };
+
+        let fine = check(&[&open, &file, &dir.path().join("missing")]);
+        assert!(fine.status.success());
+        // Root may write anywhere, so there the check has nothing to name.
+        let is_root = std::process::Command::new("id")
+            .arg("-u")
+            .output()
+            .is_ok_and(|out| out.stdout == b"0\n");
+        if !is_root {
+            let refused = check(&[&open, &closed]);
+            assert!(!refused.status.success());
+            assert_eq!(
+                String::from_utf8_lossy(&refused.stdout).trim(),
+                closed.display().to_string()
+            );
+        }
+    }
+
+    /// A step runs as the user the session settled on, named before the
+    /// container, where the CLI reads its own options.
+    #[test]
+    fn a_step_execs_as_the_sessions_user() {
+        let as_runner = exec_args("id", Path::new("/w"), &["true"], Some("runner"));
+        let user = as_runner.iter().position(|arg| arg == "--user").unwrap();
+        assert_eq!(as_runner[user + 1], "runner");
+        let container = as_runner.iter().position(|arg| arg == "id").unwrap();
+        assert!(user < container);
+        for named in ["USER=runner", "LOGNAME=runner"] {
+            let at = as_runner.iter().position(|arg| arg == named).unwrap();
+            assert_eq!(as_runner[at - 1], "--env");
+            assert!(at < container);
+        }
+
+        let as_image = exec_args("id", Path::new("/w"), &["true"], None);
+        assert!(!as_image.contains(&"--user".to_string()), "{as_image:?}");
+    }
+
     #[test]
     fn exec_puts_no_variable_in_argv() {
-        let args = exec_args("id", Path::new("/w"), &["true"]);
+        let args = exec_args("id", Path::new("/w"), &["true"], None);
         assert!(args.contains(&"-i".to_string()));
         assert!(args.windows(2).any(|w| w == ["-c", ENV_LOADER]));
         assert!(!args.iter().any(|arg| arg == "-e"));
@@ -1468,6 +1630,7 @@ mod tests {
             cli,
             services,
             docker_engine: false,
+            runner_user: false,
             state: tokio::sync::Mutex::new(State::default()),
         }
     }
@@ -1633,6 +1796,7 @@ mod tests {
             "id",
             Path::new("/github/workspace/sub"),
             &["bash", "-c", "echo one\necho two"],
+            None,
         );
         assert_eq!(
             args,

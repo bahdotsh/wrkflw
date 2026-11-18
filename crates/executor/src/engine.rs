@@ -2111,9 +2111,16 @@ fn report_action_not_run(uses: &str, cause: Option<&str>) -> Option<String> {
     Some(uses.to_string())
 }
 
-/// Where `cargo install` puts commands for the user steps run as. Steps run
-/// as root for now; running them as GitHub's `runner` user moves this.
-const CARGO_BIN_DIR: &str = "/root/.cargo/bin";
+/// Where `cargo install` puts commands in an image mapped with `-P`, whose
+/// steps run as its own user, taken to be root. In the built-in image it
+/// is the runner user's: see [`runner_cargo_home`].
+const ROOT_CARGO_BIN_DIR: &str = "/root/.cargo/bin";
+
+/// `CARGO_HOME` in the built-in image: the runner user's `~/.cargo`, where
+/// the hosted runner has it and where workflows cache it.
+fn runner_cargo_home() -> String {
+    format!("{}/.cargo", crate::runner_user::HOME)
+}
 
 /// Tools the hosted Ubuntu runner has that a job's steps run without
 /// installing them first, so their absence fails a step that passes on
@@ -2158,7 +2165,8 @@ https://cli.github.com/packages stable main\" > /etc/apt/sources.list.d/github-c
 /// runtimes need.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RunnerTools {
-    /// [`RUNNER_TOOLS`] and the GitHub CLI, for the built-in images.
+    /// [`RUNNER_TOOLS`], the GitHub CLI and the [runner
+    /// user](crate::runner_user), for the built-in images.
     Install,
     /// Neither: an image mapped with `-P` is the user's, and gets only what
     /// its setup actions need.
@@ -2200,12 +2208,6 @@ fn generate_combined_dockerfile(
         dockerfile.push_str(&format!("# base image id: {}\n", id));
     }
 
-    let scripts: Vec<&str> = runtimes
-        .iter()
-        .filter(|rt| !rt.install_script.is_empty())
-        .map(|rt| rt.install_script.as_str())
-        .collect();
-
     // `build-essential` because hosted Ubuntu runners have a C toolchain,
     // and Rust build scripts, node-gyp, Python C extensions and cgo all
     // expect one. `less` because they have a pager, which tests of CLI
@@ -2226,6 +2228,12 @@ fn generate_combined_dockerfile(
     if tools == RunnerTools::Install {
         dockerfile.push(' ');
         dockerfile.push_str(&RUNNER_TOOLS.join(" "));
+        // The user steps run as, once `sudo` is there for it.
+        dockerfile.push_str(" && \\\n");
+        dockerfile.push_str(&format!(
+            "    {}",
+            crate::runner_user::create_script(crate::runner_user::uid())
+        ));
     }
 
     // Hosted runners also have Node.js whatever the job sets up, and tools
@@ -2234,6 +2242,9 @@ fn generate_combined_dockerfile(
     if !runtimes.iter().any(|rt| rt.language == "node") {
         dockerfile.push_str(" && \\\n");
         dockerfile.push_str(&format!("    {}", runner_node_install()));
+        if let Some(own) = owned_by_runner(tools, "node") {
+            dockerfile.push_str(&format!(" && \\\n    {}", own));
+        }
     }
     dockerfile.push_str(REMOVE_PACKAGE_LISTS);
     dockerfile.push('\n');
@@ -2245,6 +2256,17 @@ fn generate_combined_dockerfile(
     // and closed to a step that runs as another user, and which a job that
     // sets `HOME` moves. Somewhere fixed and readable serves every step.
     let mut env: Vec<(String, String)> = Vec::new();
+    // rustup and cargo go in the runner user's home, where the hosted
+    // runner has them. Set for every step, so one that runs as root after
+    // all, or with another `HOME`, still finds the toolchain.
+    let has_rust = runtimes.iter().any(|rt| rt.language == "rust");
+    if has_rust && tools == RunnerTools::Install {
+        env.push(("CARGO_HOME".to_string(), runner_cargo_home()));
+        env.push((
+            "RUSTUP_HOME".to_string(),
+            format!("{}/.rustup", crate::runner_user::HOME),
+        ));
+    }
     if runtimes.iter().any(|rt| rt.language == "python") {
         env.push((
             "UV_PYTHON_INSTALL_DIR".to_string(),
@@ -2267,8 +2289,14 @@ fn generate_combined_dockerfile(
     // weeks ago name packages the mirrors have since replaced, and a
     // step's `apt-get install` would fail on some of them and not others;
     // without lists it says at once that it wants an `apt-get update`.
-    for script in &scripts {
+    for runtime in runtimes.iter().filter(|rt| !rt.install_script.is_empty()) {
+        let script = &runtime.install_script;
         dockerfile.push_str(&format!("RUN {}", script));
+        // In the same instruction as the install: a later layer that
+        // changed the files' owner would hold a second copy of them.
+        if let Some(own) = owned_by_runner(tools, &runtime.language) {
+            dockerfile.push_str(&format!(" && \\\n    {}", own));
+        }
         if script.contains("apt-get") {
             dockerfile.push_str(REMOVE_PACKAGE_LISTS);
         }
@@ -2282,17 +2310,28 @@ fn generate_combined_dockerfile(
     // install` adds runs by name.
     // What `cargo install` installs goes on PATH, as `~/.cargo/bin` is on
     // the hosted runner's.
-    let mut path: Vec<&str> = Vec::new();
+    let mut path: Vec<String> = Vec::new();
     if runtimes.iter().any(|rt| rt.language == "python") {
-        path.push(PYTHON_SCRIPTS_DIR);
+        path.push(PYTHON_SCRIPTS_DIR.to_string());
     }
-    if runtimes.iter().any(|rt| rt.language == "rust") {
-        path.push(CARGO_BIN_DIR);
+    if has_rust {
+        path.push(match tools {
+            RunnerTools::Install => format!("{}/bin", runner_cargo_home()),
+            RunnerTools::Omit => ROOT_CARGO_BIN_DIR.to_string(),
+        });
     }
-    path.extend(["/usr/local/bin", "/usr/bin", "$PATH"]);
+    path.extend(["/usr/local/bin", "/usr/bin", "$PATH"].map(str::to_string));
     dockerfile.push_str(&format!("ENV PATH={}\n", path.join(":")));
 
     dockerfile
+}
+
+/// What hands the runner user the files `language`'s install just wrote,
+/// in an image that has that user.
+fn owned_by_runner(tools: RunnerTools, language: &str) -> Option<String> {
+    (tools == RunnerTools::Install)
+        .then(|| crate::runner_user::own_script(language))
+        .flatten()
 }
 
 /// The ISO week `now` falls in, as `2026-W46`, when any of `runtimes`
@@ -10398,6 +10437,62 @@ runs:
         );
     }
 
+    /// The built-in image has the runner user, with rustup and cargo in
+    /// its home and each runtime's files handed to it where they are
+    /// installed. A `-P` image keeps its own user and root's paths.
+    #[test]
+    fn the_built_in_image_has_the_runner_user_and_a_mapped_one_does_not() {
+        let runtimes: Vec<SetupRuntime> = ["rust", "python"]
+            .iter()
+            .map(|language| SetupRuntime {
+                language: language.to_string(),
+                version: "stable".to_string(),
+                install_script: format!("install-{}", language),
+                floating: false,
+                env: Vec::new(),
+            })
+            .collect();
+        let dockerfile =
+            |tools| generate_combined_dockerfile(&runtimes, "ubuntu:latest", None, None, tools);
+
+        let built_in = dockerfile(RunnerTools::Install);
+        assert!(built_in.contains("useradd --create-home"), "{built_in}");
+        assert!(
+            built_in.contains("ENV CARGO_HOME=/home/runner/.cargo\n"),
+            "{built_in}"
+        );
+        assert!(
+            built_in.contains("ENV RUSTUP_HOME=/home/runner/.rustup\n"),
+            "{built_in}"
+        );
+        // Before the install that reads them.
+        assert!(
+            built_in.find("ENV CARGO_HOME").unwrap() < built_in.find("RUN install-rust").unwrap(),
+            "{built_in}"
+        );
+        // Owned in the instruction that installed them.
+        assert!(
+            built_in.contains(&format!(
+                "RUN install-rust && \\\n    {}\n",
+                crate::runner_user::own_script("rust").unwrap()
+            )),
+            "{built_in}"
+        );
+        assert!(
+            built_in.contains(":/home/runner/.cargo/bin:/usr/local/bin:"),
+            "{built_in}"
+        );
+
+        let mapped = dockerfile(RunnerTools::Omit);
+        assert!(!mapped.contains("runner"), "{mapped}");
+        assert!(!mapped.contains("CARGO_HOME"), "{mapped}");
+        assert!(mapped.contains("RUN install-rust\n"), "{mapped}");
+        assert!(
+            mapped.contains(":/root/.cargo/bin:/usr/local/bin:"),
+            "{mapped}"
+        );
+    }
+
     #[test]
     fn the_shared_layers_end_with_the_first_run() {
         let python = |version: &str| {
@@ -10425,12 +10520,15 @@ runs:
         assert!(shared.contains("build-essential"), "{shared}");
         assert!(
             shared.ends_with(&format!(
-                "{}{}\n",
+                "{} && \\\n    {}{}\n",
                 runner_node_install(),
+                crate::runner_user::own_script("node").unwrap(),
                 REMOVE_PACKAGE_LISTS
             )),
             "{shared}"
         );
+        // The user steps run as is every leg's, with the packages.
+        assert!(shared.contains("useradd --create-home"), "{shared}");
         assert!(!shared.contains("uv python install"), "{shared}");
         // Without a `RUN`, everything is shared.
         assert_eq!(shared_layers("FROM scratch\n"), "FROM scratch\n");

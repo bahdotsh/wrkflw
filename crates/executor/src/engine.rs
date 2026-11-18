@@ -2813,6 +2813,7 @@ async fn resolve_runner_image(
                 not_built,
                 runtimes,
                 in_composite: false,
+                runner_user: tools == RunnerTools::Install,
             },
         })
     }
@@ -3011,21 +3012,26 @@ async fn execute_job_with_matrix(
     }
 
     // Pre-resolve secrets once for this job (shared across matrix combinations and non-matrix path)
-    let (mut secrets_context, mut missing_secrets) = if let Some(secret_mgr) = secret_manager {
-        resolve_secrets_for_context(secret_mgr, job).await
-    } else {
-        (HashMap::new(), HashSet::new())
-    };
+    let (mut secrets_context, mut missing_secrets, secret_providers) =
+        if let Some(secret_mgr) = secret_manager {
+            resolve_secrets_for_context(secret_mgr, job).await
+        } else {
+            (HashMap::new(), HashSet::new(), HashMap::new())
+        };
     // The run's own token, which GitHub makes for every job. Here it is
     // only given when asked for: a provider's, else this machine's.
     if crate::run_options::job_github_token_wanted() {
-        fill_job_token(
+        let source = fill_job_token(
             secret_manager,
             &mut secrets_context,
             &mut missing_secrets,
+            secret_providers.get("GITHUB_TOKEN").map(String::as_str),
             crate::run_options::job_github_token,
         )
         .await;
+        if source.is_some_and(|source| source.is_this_machines(secret_manager)) {
+            crate::run_options::warn_of_own_token();
+        }
     }
     // Output is masked before it is shown or persisted, so the masker has to
     // know every value this job can read.
@@ -3046,6 +3052,12 @@ async fn execute_job_with_matrix(
         ));
     }
 
+    // Whether this run's steps can run as the runner user decides the reuse
+    // key, so it is settled before the key is made. Only a runtime with
+    // containers has that user to ask about.
+    if let Some(cli) = runtime.session_cli() {
+        crate::runner_user::settle_for_run(Some(cli)).await;
+    }
     let decision = acceleration::decide(acceleration::Lookup {
         job_name,
         job,
@@ -6086,11 +6098,19 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
         let cmd_refs: Vec<&str> = cmd_parts.iter().map(String::as_str).collect();
 
         let session = job_session::current();
-        let runner_home = session
+        let runner_user = session
             .as_ref()
             .is_some_and(|session| session.may_run_as_runner_user());
-        let dep_mounts =
-            acceleration::dep_cache_mounts(ctx.runtime.mounts_are_copies(), runner_home);
+        // Root's caches go in the runner user's home too, in an image that
+        // has it: `CARGO_HOME` is that user's there, whoever runs cargo.
+        let caches_for = |runner_user: bool| acceleration::DepCacheFor {
+            runner_user,
+            runner_home: ctx.installed_runtimes.runner_user,
+        };
+        let dep_mounts = acceleration::dep_cache_mounts(
+            ctx.runtime.mounts_are_copies(),
+            caches_for(runner_user),
+        );
         let vm_workspace = crate::vm_workspace::before_step(ctx.runtime, ctx.working_dir)
             .await
             .map_err(ExecutionError::Runtime)?;
@@ -6130,10 +6150,12 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                 // user's steps share, and the job's pass isn't stored as
                 // one whose steps all ran as that user.
                 let (root_mounts, root_volumes);
-                let own_container_volumes: &[(&Path, &Path)] = if runner_home {
+                let own_container_volumes: &[(&Path, &Path)] = if runner_user {
                     job_session::note_root_fallback();
-                    root_mounts =
-                        acceleration::dep_cache_mounts(ctx.runtime.mounts_are_copies(), false);
+                    root_mounts = acceleration::dep_cache_mounts(
+                        ctx.runtime.mounts_are_copies(),
+                        caches_for(false),
+                    );
                     root_volumes = with_dep_mounts(&step_volumes, &root_mounts);
                     &root_volumes
                 } else {
@@ -7924,36 +7946,70 @@ fn resolve_job_outputs(
     resolved
 }
 
+/// Where a job's `secrets.GITHUB_TOKEN` came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum JobTokenSource {
+    /// The run's secret provider of this name, before or by
+    /// [`fill_job_token`].
+    Provider(String),
+    /// This machine: its environment or `gh`, found by [`fill_job_token`].
+    Machine,
+}
+
+impl JobTokenSource {
+    /// Whether the token is this machine's, the user's own: found here, or
+    /// read from this machine's environment by a provider that reads every
+    /// variable, as the default one does, unlike one with a prefix.
+    fn is_this_machines(&self, secret_manager: Option<&SecretManager>) -> bool {
+        match self {
+            JobTokenSource::Machine => true,
+            JobTokenSource::Provider(name) => secret_manager.is_some_and(|manager| {
+                matches!(
+                    manager.config().providers.get(name),
+                    Some(wrkflw_secrets::SecretProviderConfig::Environment { prefix: None })
+                )
+            }),
+        }
+    }
+}
+
 /// Give the job a `secrets.GITHUB_TOKEN` where it has none: its secret
-/// provider's, else what `machine` finds on this machine.
+/// provider's, else what `machine` finds on this machine. Says where the
+/// job's token came from, or `None` when it has none.
 ///
 /// A job's secrets only hold the ones its own text names, so a job that
 /// reads `github.token` alone, or through an action's default, has none
 /// from its provider yet. The provider is asked first, so its token,
 /// perhaps a narrower one than this machine's, wins. `machine` is only
-/// called when no provider had one, so the warning that jobs get this
-/// machine's token is only given when they do.
+/// called when no provider had one. `given_by` names the provider of a
+/// token the job's own text already had resolved.
 async fn fill_job_token<F>(
     secret_manager: Option<&SecretManager>,
     secrets: &mut HashMap<String, String>,
     missing: &mut HashSet<String>,
+    given_by: Option<&str>,
     machine: impl FnOnce() -> F,
-) where
+) -> Option<JobTokenSource>
+where
     F: std::future::Future<Output = Option<String>>,
 {
+    let default_provider =
+        || secret_manager.map(|manager| manager.config().default_provider.clone());
     if has_job_token(secrets) {
-        return;
+        let provider = given_by.map(str::to_string).or_else(default_provider);
+        return provider.map(JobTokenSource::Provider);
     }
     if let Some(secret_mgr) = secret_manager {
         if let Ok(value) = secret_mgr.get_secret("GITHUB_TOKEN").await {
             give_job_token(secrets, missing, value.value().to_string());
         }
     }
-    if !has_job_token(secrets) {
-        if let Some(token) = machine().await {
-            give_job_token(secrets, missing, token);
-        }
+    if has_job_token(secrets) {
+        return default_provider().map(JobTokenSource::Provider);
     }
+    let token = machine().await?;
+    give_job_token(secrets, missing, token);
+    has_job_token(secrets).then_some(JobTokenSource::Machine)
 }
 
 /// Whether the job has a `secrets.GITHUB_TOKEN` that isn't empty.
@@ -7997,10 +8053,16 @@ fn give_job_token(
 async fn resolve_secrets_for_context(
     secret_manager: &SecretManager,
     job: &Job,
-) -> (HashMap<String, String>, HashSet<String>) {
+) -> (
+    HashMap<String, String>,
+    HashSet<String>,
+    HashMap<String, String>,
+) {
     use wrkflw_secrets::{SecretError, SecretSubstitution};
 
     let mut secrets = HashMap::new();
+    // The provider each value came from, as `secrets.file:NAME` names one.
+    let mut providers = HashMap::new();
     let mut missing = HashSet::new();
     let mut all_text = String::new();
 
@@ -8038,9 +8100,16 @@ async fn resolve_secrets_for_context(
         }
         match secret_ref.lookup(secret_manager).await {
             Ok(value) => {
-                secrets
-                    .entry(secret_ref.name)
-                    .or_insert_with(|| value.value().to_string());
+                if let std::collections::hash_map::Entry::Vacant(entry) =
+                    secrets.entry(secret_ref.name.clone())
+                {
+                    entry.insert(value.value().to_string());
+                    let provider = secret_ref
+                        .provider
+                        .clone()
+                        .unwrap_or_else(|| secret_manager.config().default_provider.clone());
+                    providers.insert(secret_ref.name, provider);
+                }
             }
             Err(SecretError::NotFound { .. }) => {
                 // Leave it out so the expression resolves to Null.
@@ -8053,7 +8122,7 @@ async fn resolve_secrets_for_context(
         }
     }
 
-    (secrets, missing)
+    (secrets, missing, providers)
 }
 
 #[cfg(test)]
@@ -8429,6 +8498,43 @@ mod tests {
         assert_eq!(secrets["GITHUB_TOKEN"], "provided");
     }
 
+    /// The default provider reads every variable of this machine's
+    /// environment, so the token it gives is the user's own, as one found
+    /// with `gh` is, and is warned of.
+    #[tokio::test]
+    async fn a_token_from_the_default_provider_is_this_machines() {
+        let default = SecretManager::new(SecretConfig::default()).await.unwrap();
+        let provider = |name: &str| JobTokenSource::Provider(name.to_string());
+        assert!(provider("env").is_this_machines(Some(&default)));
+        // Judged by the provider that gave it, as `secrets.file:NAME` names
+        // one other than the default.
+        assert!(!provider("file").is_this_machines(Some(&default)));
+        assert!(JobTokenSource::Machine.is_this_machines(Some(&default)));
+        assert!(JobTokenSource::Machine.is_this_machines(None));
+        assert!(!provider("env").is_this_machines(None));
+
+        // A token the job's text resolved keeps the provider it came from.
+        let mut secrets = HashMap::from([("GITHUB_TOKEN".to_string(), "t".to_string())]);
+        let source = fill_job_token(
+            Some(&default),
+            &mut secrets,
+            &mut HashSet::new(),
+            Some("file"),
+            || async { None },
+        )
+        .await;
+        assert_eq!(source, Some(provider("file")));
+        let source = fill_job_token(
+            Some(&default),
+            &mut secrets,
+            &mut HashSet::new(),
+            None,
+            || async { None },
+        )
+        .await;
+        assert_eq!(source, Some(provider("env")));
+    }
+
     /// A job whose text never names `secrets.GITHUB_TOKEN`, as one that
     /// reads `github.token` or an action's default, still gets its
     /// provider's token before this machine's, which isn't even looked for.
@@ -8450,33 +8556,47 @@ mod tests {
             let mut secrets = HashMap::new();
             let mut missing = HashSet::from(["GITHUB_TOKEN".to_string()]);
             let asked = std::sync::atomic::AtomicBool::new(false);
-            fill_job_token(manager.as_ref(), &mut secrets, &mut missing, || async {
-                asked.store(true, std::sync::atomic::Ordering::Relaxed);
-                machine.map(str::to_string)
-            })
+            let source = fill_job_token(
+                manager.as_ref(),
+                &mut secrets,
+                &mut missing,
+                None,
+                || async {
+                    asked.store(true, std::sync::atomic::Ordering::Relaxed);
+                    machine.map(str::to_string)
+                },
+            )
             .await;
             (
                 secrets.get("GITHUB_TOKEN").cloned(),
                 missing.contains("GITHUB_TOKEN"),
                 asked.load(std::sync::atomic::Ordering::Relaxed),
+                source.map(|source| source.is_this_machines(manager.as_ref())),
             )
         };
 
+        // A provider with a prefix: its own token, not this machine's.
         std::env::set_var(format!("{prefix}GITHUB_TOKEN"), "ghs_provider");
         let provided = fill(Some(manager(prefix).await.unwrap()), Some("gho_mine")).await;
         std::env::remove_var(format!("{prefix}GITHUB_TOKEN"));
-        assert_eq!(provided, (Some("ghs_provider".to_string()), false, false));
+        assert_eq!(
+            provided,
+            (Some("ghs_provider".to_string()), false, false, Some(false))
+        );
 
         // No provider has one: this machine's.
         let unset = "WRKFLW_TEST_JOB_TOKEN_NO_PROVIDER_";
         let mine = fill(Some(manager(unset).await.unwrap()), Some("gho_mine")).await;
-        assert_eq!(mine, (Some("gho_mine".to_string()), false, true));
+        assert_eq!(
+            mine,
+            (Some("gho_mine".to_string()), false, true, Some(true))
+        );
         assert_eq!(
             fill(None, Some("gho_mine")).await,
-            (Some("gho_mine".to_string()), false, true)
+            (Some("gho_mine".to_string()), false, true, Some(true))
         );
         // Neither: still missing.
-        assert_eq!(fill(None, None).await, (None, true, true));
+        assert_eq!(fill(None, None).await, (None, true, true, None));
     }
 
     /// A job that sets nothing up still runs with the runner's tools, such
@@ -16523,7 +16643,6 @@ runs:
             ..Default::default()
         };
         let caches = dir.path().join("deps");
-        std::env::set_var("WRKFLW_DEP_CACHE_DIR", &caches);
         let state = acceleration::RunState::new(
             acceleration::Acceleration {
                 dep_cache: true,
@@ -16532,7 +16651,8 @@ runs:
             false,
             dir.path().to_path_buf(),
         )
-        .unwrap();
+        .unwrap()
+        .with_dep_caches_in(&caches);
         let job = make_job(None, labels(&["ubuntu-latest"]));
         let step = make_run_step("echo hi");
         let working_dir = tempfile::tempdir().unwrap();
@@ -16547,14 +16667,15 @@ runs:
             test_services(),
             &pending,
         ));
-        let (_, fell_back) = Box::pin(acceleration::with_run_state(
-            Arc::new(state),
+        let (_, fell_back) = Box::pin(acceleration::with_run_state(Arc::new(state), async {
+            // This run may have the runner user, whoever runs the test.
+            acceleration::settle_runner_user(|| async { None }).await;
             job_session::noting_root_fallback(job_session::with_job_session(
                 &job, &runtime, false, step_run,
-            )),
-        ))
+            ))
+            .await
+        }))
         .await;
-        std::env::remove_var("WRKFLW_DEP_CACHE_DIR");
 
         assert!(fell_back);
         let calls = runtime.run_calls.lock().unwrap();

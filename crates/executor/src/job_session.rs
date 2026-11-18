@@ -1179,8 +1179,10 @@ impl JobSession {
         let mounted = walked_mounts(volumes);
         let as_root = |reason: String| {
             wrkflw_logging::warning(&format!(
-                "This job's steps run as root, not as the {} user GitHub's run as: {}",
-                user, reason
+                "This job's steps run as root, not as the {user} user GitHub's run as: \
+                 {reason}. Its result isn't kept for reuse, as its key says that user; \
+                 set {}=1 to run steps as root and keep their results",
+                crate::runner_user::STEPS_AS_ROOT_ENV
             ));
             None
         };
@@ -1473,7 +1475,15 @@ pub(crate) async fn with_job_session<F: Future>(
     mapped_image: bool,
     future: F,
 ) -> F::Output {
-    let session = wanted_for(job, runtime).map(|cli| {
+    let cli = wanted_for(job, runtime);
+    if cli.is_some() {
+        crate::runner_user::settle_for_run(cli).await;
+    }
+    let builtin_image = !mapped_image && job.container.is_none();
+    if cli.is_some() && builtin_image {
+        crate::runner_user::warn_if_ruled_out();
+    }
+    let session = cli.map(|cli| {
         let mut services: Vec<ServiceSpec> = job
             .services
             .iter()
@@ -1492,7 +1502,7 @@ pub(crate) async fn with_job_session<F: Future>(
             cli,
             services,
             docker_engine: docker_engine_for(job, runtime, mapped_image),
-            runner_user: crate::runner_user::allowed() && !mapped_image && job.container.is_none(),
+            runner_user: crate::runner_user::for_run() && builtin_image,
             state: tokio::sync::Mutex::new(State::default()),
         })
     });

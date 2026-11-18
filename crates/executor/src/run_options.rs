@@ -32,7 +32,8 @@ pub const JOB_GITHUB_TOKEN_ENV: &str = "WRKFLW_JOB_GITHUB_TOKEN";
 /// switch is off or there is no token to give.
 ///
 /// Off by default, as this is the user's own token, which reaches further
-/// than the one GitHub makes for a run and hands to its steps.
+/// than the one GitHub makes for a run and hands to its steps: the job
+/// warns of it when it gets it (see [`warn_of_own_token`]).
 pub(crate) async fn job_github_token() -> Option<String> {
     if !job_github_token_wanted() {
         return None;
@@ -44,20 +45,26 @@ pub(crate) async fn job_github_token() -> Option<String> {
             let from_gh = gh_auth_token().await;
             token = job_github_token_from(|_| None, || from_gh);
         }
-        match &token {
-            Some(_) => wrkflw_logging::warning(
-                "Jobs get this machine's GitHub token as github.token and \
-                     secrets.GITHUB_TOKEN (WRKFLW_JOB_GITHUB_TOKEN). It is your own token: \
-                     it can do what you can, not just what a run's token can",
-            ),
-            None => wrkflw_logging::warning(
+        if token.is_none() {
+            wrkflw_logging::warning(
                 "WRKFLW_JOB_GITHUB_TOKEN is set, but there is no token to give jobs: \
-                     set GITHUB_TOKEN, or sign in with `gh auth login`",
-            ),
+                 set GITHUB_TOKEN, or sign in with `gh auth login`",
+            );
         }
         token
     })
     .await
+}
+
+/// Say, once per run, that its jobs get the user's own GitHub token.
+pub(crate) fn warn_of_own_token() {
+    if crate::acceleration::first_own_token_warning() {
+        wrkflw_logging::warning(
+            "Jobs get your own GitHub token, from this machine's environment or `gh`, as \
+             github.token and secrets.GITHUB_TOKEN (WRKFLW_JOB_GITHUB_TOKEN): it can do \
+             what you can, not just what a run's token can",
+        );
+    }
 }
 
 /// Whether the run asked for jobs to get a GitHub token, from a secret

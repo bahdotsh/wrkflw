@@ -49,9 +49,22 @@ while read -r repo run extra <&3; do
   git -C "$dir" checkout -q --detach "$sha" || {
     printf '%s\t%s\tn/a: cannot check out %s\t-\t-\t-\t-\n' "$repo" "$run" "$sha"; continue; }
 
-  # Variables listed after the run id, such as WRKFLW_DOCKER_IN_JOBS=1.
+  # Variables listed after the run id, such as WRKFLW_DOCKER_IN_JOBS=1. A
+  # word that isn't NAME=value would be run by `env` as a command.
   env_args=()
-  for pair in $extra; do env_args+=("$pair"); done
+  bad=""
+  for pair in $extra; do
+    if [[ "$pair" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; then
+      env_args+=("$pair")
+    else
+      bad="$pair"
+    fi
+  done
+  if [[ -n "$bad" ]]; then
+    printf '%s\t%s\tn/a: not NAME=value: %s\t-\t-\t-\t-\n' "$repo" "$run" "$bad"
+    disagreed=1
+    continue
+  fi
 
   start=$(date +%s)
   (cd "$dir" && env ${env_args[@]+"${env_args[@]}"} WRKFLW_NO_HISTORY=1 \

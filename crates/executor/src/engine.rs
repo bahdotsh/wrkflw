@@ -2111,6 +2111,60 @@ fn report_action_not_run(uses: &str, cause: Option<&str>) -> Option<String> {
     Some(uses.to_string())
 }
 
+/// Where `cargo install` puts commands for the user steps run as. Steps run
+/// as root for now; running them as GitHub's `runner` user moves this.
+const CARGO_BIN_DIR: &str = "/root/.cargo/bin";
+
+/// Tools the hosted Ubuntu runner has that a job's steps run without
+/// installing them first, so their absence fails a step that passes on
+/// GitHub. Package names are the same on Debian, which some mapped and
+/// `macos-*` images are based on.
+const RUNNER_TOOLS: &[&str] = &[
+    "sudo",
+    "jq",
+    "unzip",
+    "zip",
+    "wget",
+    "xz-utils",
+    "zstd",
+    "file",
+    "openssh-client",
+    "rsync",
+    "git-lfs",
+    "python3",
+    "python3-pip",
+    "python3-venv",
+];
+
+/// Installs the GitHub CLI from GitHub's own apt repository, the way the
+/// hosted runner has it, unless the image has one. It fails when
+/// cli.github.com can't be reached, so no image is kept without it: see
+/// [`with_github_cli`]. Only that repository's package list is fetched, as
+/// the earlier layers removed the others and `gh` needs nothing from them.
+const GH_CLI_INSTALL: &str = "command -v gh >/dev/null 2>&1 || (\
+     mkdir -p -m 755 /etc/apt/keyrings && \
+     curl -fsSL --connect-timeout 10 --max-time 120 \
+       https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+       -o /etc/apt/keyrings/githubcli-archive-keyring.gpg && \
+     chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg && \
+     echo \"deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] \
+https://cli.github.com/packages stable main\" > /etc/apt/sources.list.d/github-cli.list && \
+     apt-get update -o Dir::Etc::sourcelist=sources.list.d/github-cli.list \
+       -o Dir::Etc::sourceparts=- -o APT::Get::List-Cleanup=0 && \
+     apt-get install -y --no-install-recommends gh && \
+     rm -rf /var/lib/apt/lists/*)";
+
+/// Whether a built image gets the hosted runner's tools on top of what its
+/// runtimes need.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunnerTools {
+    /// [`RUNNER_TOOLS`] and the GitHub CLI, for the built-in images.
+    Install,
+    /// Neither: an image mapped with `-P` is the user's, and gets only what
+    /// its setup actions need.
+    Omit,
+}
+
 /// Ends a `RUN` that fetched the package lists by removing them.
 const REMOVE_PACKAGE_LISTS: &str = " && \\\n    rm -rf /var/lib/apt/lists/*";
 
@@ -2139,6 +2193,7 @@ fn generate_combined_dockerfile(
     base_image: &str,
     base_id: Option<&str>,
     week: Option<&str>,
+    tools: RunnerTools,
 ) -> String {
     let mut dockerfile = format!("FROM {}\n", base_image);
     if let Some(id) = base_id {
@@ -2154,7 +2209,8 @@ fn generate_combined_dockerfile(
     // `build-essential` because hosted Ubuntu runners have a C toolchain,
     // and Rust build scripts, node-gyp, Python C extensions and cgo all
     // expect one. `less` because they have a pager, which tests of CLI
-    // tools run.
+    // tools run. The rest are tools of the hosted runner's that steps call
+    // without installing them: see [`RUNNER_TOOLS`].
     dockerfile.push_str("RUN ");
     if let Some(week) = week {
         dockerfile.push_str(&format!(
@@ -2167,6 +2223,10 @@ fn generate_combined_dockerfile(
         "    apt-get install -y --no-install-recommends curl bash git ca-certificates gnupg \
          build-essential less",
     );
+    if tools == RunnerTools::Install {
+        dockerfile.push(' ');
+        dockerfile.push_str(&RUNNER_TOOLS.join(" "));
+    }
 
     // Hosted runners also have Node.js whatever the job sets up, and tools
     // such as pyright install their own copy unless one is on PATH. A
@@ -2220,14 +2280,17 @@ fn generate_combined_dockerfile(
     // just installed. Every install script lands in one of these directories.
     // setup-python puts its interpreter's scripts first, so what `pip
     // install` adds runs by name.
+    // What `cargo install` installs goes on PATH, as `~/.cargo/bin` is on
+    // the hosted runner's.
+    let mut path: Vec<&str> = Vec::new();
     if runtimes.iter().any(|rt| rt.language == "python") {
-        dockerfile.push_str(&format!(
-            "ENV PATH={}:/usr/local/bin:/usr/bin:$PATH\n",
-            PYTHON_SCRIPTS_DIR
-        ));
-    } else {
-        dockerfile.push_str("ENV PATH=/usr/local/bin:/usr/bin:$PATH\n");
+        path.push(PYTHON_SCRIPTS_DIR);
     }
+    if runtimes.iter().any(|rt| rt.language == "rust") {
+        path.push(CARGO_BIN_DIR);
+    }
+    path.extend(["/usr/local/bin", "/usr/bin", "$PATH"]);
+    dockerfile.push_str(&format!("ENV PATH={}\n", path.join(":")));
 
     dockerfile
 }
@@ -2284,6 +2347,10 @@ fn combined_image_tag(runtimes: &[SetupRuntime], dockerfile: &str) -> String {
         })
         .collect();
     tag_parts.sort();
+    // An image with the runner's tools alone: a tag can't start with `-`.
+    if tag_parts.is_empty() {
+        tag_parts.push("runner".to_string());
+    }
 
     let hash = fnv1a_hash(dockerfile.as_bytes());
 
@@ -2295,20 +2362,21 @@ fn combined_image_tag(runtimes: &[SetupRuntime], dockerfile: &str) -> String {
     )
 }
 
-/// Build a Docker image that combines multiple language runtimes on an Ubuntu base.
 // Per-tag mutex map so parallel jobs building the same runtime image serialize
 // rather than all racing to build it simultaneously.
 static IMAGE_BUILD_LOCKS: Lazy<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
+/// Build a Docker image that combines multiple language runtimes on an Ubuntu base.
 ///
 /// Skips the build when an image with the same tag already exists locally,
-/// avoiding redundant work on repeated runs. When multiple parallel jobs need
-/// the same image, only the first build runs; the others wait and then reuse it.
+/// avoiding redundant work on repeated runs. With [`RunnerTools::Install`]
+/// the image returned has the GitHub CLI on top when it could be added.
 async fn build_combined_runtime_image(
     runtimes: &[SetupRuntime],
     base_image: &str,
     runtime: &dyn ContainerRuntime,
+    tools: RunnerTools,
 ) -> Result<String, ExecutionError> {
     // The base image's identity, so a changed base gets a new combined image.
     // An image not yet present is pulled first: the build would pull it
@@ -2330,12 +2398,78 @@ async fn build_combined_runtime_image(
     // A version such as `oldstable` or `3.x` names a different release as
     // time goes on, and the image would otherwise keep the first build's.
     let week = floating_versions_week(runtimes, chrono::Utc::now());
-    let dockerfile =
-        generate_combined_dockerfile(runtimes, base_image, base_id.as_deref(), week.as_deref());
+    let dockerfile = generate_combined_dockerfile(
+        runtimes,
+        base_image,
+        base_id.as_deref(),
+        week.as_deref(),
+        tools,
+    );
     let tag = combined_image_tag(runtimes, &dockerfile);
 
+    let with_gh = github_cli_tag(&tag);
+    if tools == RunnerTools::Install && runtime.image_exists(&with_gh).await.unwrap_or(false) {
+        wrkflw_logging::info(&format!(
+            "Reusing existing combined runtime image: {}",
+            with_gh
+        ));
+        return Ok(with_gh);
+    }
+
+    let languages = runtimes
+        .iter()
+        .map(|r| r.language.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let what = if languages.is_empty() {
+        "the runner's tools".to_string()
+    } else {
+        languages
+    };
+    build_image_once(&dockerfile, &tag, &what, runtime).await?;
+    match tools {
+        RunnerTools::Install => Ok(with_github_cli(&tag, runtime).await),
+        RunnerTools::Omit => Ok(tag),
+    }
+}
+
+/// The tag of `tag` with the GitHub CLI on top.
+fn github_cli_tag(tag: &str) -> String {
+    format!("{}-gh", tag)
+}
+
+/// The image `tag` with the GitHub CLI added in an image of its own, or
+/// `tag` itself, with a warning, when the CLI can't be installed. Kept
+/// apart so an image that couldn't get it is never stored as one that has
+/// it: the next run tries again, and only this small layer is rebuilt.
+async fn with_github_cli(tag: &str, runtime: &dyn ContainerRuntime) -> String {
+    let dockerfile = format!("FROM {}\nRUN {}\n", tag, GH_CLI_INSTALL);
+    let with_gh = github_cli_tag(tag);
+    match build_image_once(&dockerfile, &with_gh, "the GitHub CLI", runtime).await {
+        Ok(()) => with_gh,
+        Err(e) => {
+            wrkflw_logging::warning(&format!(
+                "The GitHub CLI could not be installed in the job's image, so steps that run \
+                 `gh` will fail; the next run tries again: {}",
+                e
+            ));
+            tag.to_string()
+        }
+    }
+}
+
+/// Build `dockerfile` as `tag`, unless the engine has it already or it
+/// failed to build earlier in this run. When several jobs need the same
+/// image, only the first builds it; the others wait and then reuse it.
+/// `what` names what the image adds, for the log.
+async fn build_image_once(
+    dockerfile: &str,
+    tag: &str,
+    what: &str,
+    runtime: &dyn ContainerRuntime,
+) -> Result<(), ExecutionError> {
     // Fast path: image already exists, no locking needed.
-    let exists = runtime.image_exists(&tag).await.map_err(|e| {
+    let exists = runtime.image_exists(tag).await.map_err(|e| {
         ExecutionError::Runtime(format!(
             "{}: {}",
             crate::setup_errors::EXISTING_IMAGE_CHECK,
@@ -2344,7 +2478,7 @@ async fn build_combined_runtime_image(
     })?;
     if exists {
         wrkflw_logging::info(&format!("Reusing existing combined runtime image: {}", tag));
-        return Ok(tag);
+        return Ok(());
     }
 
     // Acquire the per-tag build lock so concurrent jobs building the same image
@@ -2352,14 +2486,14 @@ async fn build_combined_runtime_image(
     let tag_lock = {
         let mut locks = IMAGE_BUILD_LOCKS.lock().unwrap();
         locks
-            .entry(tag.clone())
+            .entry(tag.to_string())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()
     };
     let _build_guard = tag_lock.lock().await;
 
     // Re-check after acquiring the lock: a concurrent job may have built it.
-    let exists = runtime.image_exists(&tag).await.map_err(|e| {
+    let exists = runtime.image_exists(tag).await.map_err(|e| {
         ExecutionError::Runtime(format!(
             "{}: {}",
             crate::setup_errors::EXISTING_IMAGE_CHECK,
@@ -2368,9 +2502,9 @@ async fn build_combined_runtime_image(
     })?;
     if exists {
         wrkflw_logging::info(&format!("Reusing existing combined runtime image: {}", tag));
-        return Ok(tag);
+        return Ok(());
     }
-    if let Some(error) = failed_image_build(&tag) {
+    if let Some(error) = failed_image_build(tag) {
         wrkflw_logging::debug(&format!(
             "{} failed to build earlier in this run, so it isn't built again",
             tag
@@ -2382,7 +2516,7 @@ async fn build_combined_runtime_image(
         )));
     }
 
-    ensure_shared_layers(&dockerfile, runtime)
+    ensure_shared_layers(dockerfile, runtime)
         .await
         .map_err(|error| {
             ExecutionError::Runtime(format!(
@@ -2397,30 +2531,21 @@ async fn build_combined_runtime_image(
     })?;
 
     let dockerfile_path = temp_dir.path().join("Dockerfile");
-    std::fs::write(&dockerfile_path, &dockerfile)
+    std::fs::write(&dockerfile_path, dockerfile)
         .map_err(|e| ExecutionError::Execution(format!("Failed to write Dockerfile: {}", e)))?;
 
-    wrkflw_logging::info(&format!(
-        "Building combined runtime image with: {}",
-        runtimes
-            .iter()
-            .map(|r| r.language.as_str())
-            .collect::<Vec<_>>()
-            .join(", ")
-    ));
+    wrkflw_logging::info(&format!("Building combined runtime image with: {}", what));
 
-    build_image_checked(runtime, &dockerfile_path, &tag, temp_dir.path())
+    build_image_checked(runtime, &dockerfile_path, tag, temp_dir.path())
         .await
         .map_err(|e| {
-            remember_failed_image_build(&tag, &e);
+            remember_failed_image_build(tag, &e);
             ExecutionError::Runtime(format!(
                 "{}: {}",
                 crate::setup_errors::COMBINED_IMAGE_BUILD,
                 e
             ))
-        })?;
-
-    Ok(tag)
+        })
 }
 
 /// Build the image of a job that waits for its turn. The job reports its
@@ -2597,18 +2722,45 @@ async fn resolve_runner_image(
     } else {
         warn_of_missing_docker(job, runtime, mapped);
     }
-    if image_runtimes.is_empty() {
-        Ok(RunnerImage {
-            built: BuiltRuntimes {
-                not_built,
-                ..BuiltRuntimes::default()
-            },
-            ..RunnerImage::plain(base_image)
-        })
+    // A job with nothing to install still gets the runner's tools, which
+    // the bare base image lacks, in a container runtime that builds images.
+    // An image mapped with `-P` is the user's: it is used as it is, and a
+    // setup action's runtime goes on it without the runner's tools.
+    let as_it_is = || RunnerImage {
+        built: BuiltRuntimes {
+            not_built: not_built.clone(),
+            ..BuiltRuntimes::default()
+        },
+        ..RunnerImage::plain(base_image.clone())
+    };
+    if image_runtimes.is_empty() && (mapped || runtime.session_cli().is_none()) {
+        Ok(as_it_is())
     } else {
         // Always build a combined image on the runner base so that essential
         // tools (git, curl, etc.) remain available for actions like checkout.
-        let image = build_combined_runtime_image(&image_runtimes, &base_image, runtime).await?;
+        let tools = if mapped {
+            RunnerTools::Omit
+        } else {
+            RunnerTools::Install
+        };
+        let image = match build_combined_runtime_image(&image_runtimes, &base_image, runtime, tools)
+            .await
+        {
+            Ok(image) => image,
+            // The runner's tools are a convenience: without them the
+            // job runs on its base image, as it did before they were
+            // added, say on a machine that can't reach the package
+            // mirrors. A setup action's runtime is not.
+            Err(e) if image_runtimes.is_empty() => {
+                wrkflw_logging::warning(&format!(
+                    "Couldn't add the hosted runner's tools to {}, so the job runs on it \
+                         as it is, and steps that call tools such as jq or gh may fail: {}",
+                    base_image, e
+                ));
+                return Ok(as_it_is());
+            }
+            Err(e) => return Err(e),
+        };
         Ok(RunnerImage {
             image,
             built: BuiltRuntimes {
@@ -5229,7 +5381,10 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                             // a step adds, so they are added there too, which
                             // costs nothing when the image has them. A step's
                             // own container would lose them when it ends.
-                            let with = ctx.step.with.clone().unwrap_or_default();
+                            let with = crate::setup_actions::with_ref_defaults(
+                                uses,
+                                ctx.step.with.clone().unwrap_or_default(),
+                            );
                             let wanted = rust_toolchain_extras(&with, |value| {
                                 Some(preprocess_with_value(value, &ctx))
                             });
@@ -5996,16 +6151,13 @@ fn get_runner_image(runs_on: &str) -> String {
         "ubuntu-20.04-large" => "catthehacker/ubuntu:full-20.04",
         "ubuntu-18.04-large" => "catthehacker/ubuntu:full-18.04",
 
-        // macOS runners - use a standard Rust image for compatibility
-        "macos-latest" => "rust:latest",
-        "macos-12" => "rust:latest",    // Monterey equivalent
-        "macos-11" => "rust:latest",    // Big Sur equivalent
-        "macos-10.15" => "rust:latest", // Catalina equivalent
-
-        // Windows runners - using servercore-based images
-        "windows-latest" => "mcr.microsoft.com/windows/servercore:ltsc2022",
-        "windows-2022" => "mcr.microsoft.com/windows/servercore:ltsc2022",
-        "windows-2019" => "mcr.microsoft.com/windows/servercore:ltsc2019",
+        // macOS and Windows runners run as Linux, in the Ubuntu image, as
+        // the legs of a matrix over `os` always have: a Linux engine can't
+        // start a Windows image, and there is no macOS image. The run says
+        // so for each such job. An image of one's own can be mapped to the
+        // label with `-P`, such as a Windows one on a Windows engine.
+        "macos-latest" | "macos-12" | "macos-11" | "macos-10.15" => "ubuntu:latest",
+        "windows-latest" | "windows-2022" | "windows-2019" => "ubuntu:latest",
 
         // Language-specific runners
         "python-latest" => "python:3.11-slim",
@@ -6038,10 +6190,8 @@ fn get_runner_image(runs_on: &str) -> String {
         _ => {
             // Check for platform prefixes and provide appropriate images
             let runs_on_lower = runs_on.trim().to_lowercase();
-            if runs_on_lower.starts_with("macos") {
-                "rust:latest" // Use Rust image for macOS runners
-            } else if runs_on_lower.starts_with("windows") {
-                "mcr.microsoft.com/windows/servercore:ltsc2022" // Default Windows image
+            if runs_on_lower.starts_with("macos") || runs_on_lower.starts_with("windows") {
+                "ubuntu:latest" // As above: run as Linux
             } else if runs_on_lower.starts_with("python") {
                 "python:3.11-slim" // Default Python image
             } else if runs_on_lower.starts_with("node") {
@@ -6074,9 +6224,8 @@ fn get_runner_image_from_opt(runs_on: &Option<Vec<String>>) -> String {
 /// `runs-on: [self-hosted, linux]` can be mapped by either label.
 ///
 /// `runs-on: ${{ matrix.os }}` has to be expanded here because nothing upstream
-/// resolves it. The built-in table deliberately keeps seeing the raw label:
-/// resolving it there too would send `windows-latest` matrix legs to a Windows
-/// image.
+/// resolves it. The built-in table keeps seeing the raw label, which it maps
+/// to the Ubuntu image, as it does every OS's label.
 fn find_platform_override(
     runs_on: &Option<Vec<String>>,
     platform_overrides: &HashMap<String, String>,
@@ -6826,6 +6975,9 @@ async fn execute_composite_action(
             // go into action_env only, not action_user_env.
             let mut action_env = job_env.clone();
             let mut action_user_env = job_user_env.clone();
+            // What the composite's steps write to $GITHUB_ENV and
+            // $GITHUB_PATH, handed on to the job when the composite ends.
+            let mut composite_applied = crate::github_env_files::AppliedEnvironment::default();
 
             // GITHUB_ACTION_PATH: the composite action's own directory, so its
             // steps can reference their sibling files (e.g. `"$GITHUB_ACTION_PATH/main.sh"`).
@@ -6994,15 +7146,16 @@ async fn execute_composite_action(
                 // and see environment changes from prior steps. $GITHUB_ENV
                 // writes mirror into action_user_env so composite toJSON(env)
                 // sees them.
-                crate::github_env_files::apply_step_environment_updates(
+                composite_applied.then(crate::github_env_files::apply_step_environment_updates(
                     &mut action_env,
                     &mut action_user_env,
                     &mut composite_step_outputs,
                     composite_step.id.as_deref(),
-                );
+                ));
 
                 // Short-circuit on failure if needed
                 if step_result.status == StepStatus::Failure {
+                    hand_on_composite_environment(&composite_applied, job_env);
                     // Still propagate whatever outputs were collected before the failure
                     propagate_composite_outputs(
                         &action_def,
@@ -7023,6 +7176,8 @@ async fn execute_composite_action(
                     .without_running(actions_not_run));
                 }
             }
+
+            hand_on_composite_environment(&composite_applied, job_env);
 
             // Propagate composite action outputs to the caller's GITHUB_OUTPUT
             propagate_composite_outputs(
@@ -7088,6 +7243,21 @@ async fn execute_composite_action(
     }
 }
 
+/// Write what a composite action's steps put in `$GITHUB_ENV` and
+/// `$GITHUB_PATH` to the calling step's files: on GitHub those changes
+/// outlive the composite and apply to the rest of the job.
+fn hand_on_composite_environment(
+    applied: &crate::github_env_files::AppliedEnvironment,
+    caller_job_env: &HashMap<String, String>,
+) {
+    if let Err(e) = applied.write_to(caller_job_env) {
+        wrkflw_logging::warning(&format!(
+            "Couldn't pass a composite action's environment changes on to the job: {}",
+            e
+        ));
+    }
+}
+
 /// Evaluate a composite action's `outputs:` section and write the resolved values
 /// to the caller's GITHUB_OUTPUT file so `${{ steps.<id>.outputs.<key> }}` works.
 fn propagate_composite_outputs(
@@ -7150,7 +7320,6 @@ fn propagate_composite_outputs(
 
     // Append to the caller's GITHUB_OUTPUT file
     if let Some(output_path) = caller_job_env.get("GITHUB_OUTPUT") {
-        use std::io::Write;
         match std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -7158,22 +7327,7 @@ fn propagate_composite_outputs(
         {
             Ok(mut f) => {
                 for (key, value) in &resolved {
-                    let res = if value.contains('\n') {
-                        // Use a unique delimiter to avoid collisions with value content
-                        let delim = generate_heredoc_delimiter(value);
-                        writeln!(f, "{}<<{}", key, delim)
-                            .and_then(|_| write!(f, "{}", value))
-                            .and_then(|_| {
-                                if !value.ends_with('\n') {
-                                    writeln!(f)
-                                } else {
-                                    Ok(())
-                                }
-                            })
-                            .and_then(|_| writeln!(f, "{}", delim))
-                    } else {
-                        writeln!(f, "{}={}", key, value)
-                    };
+                    let res = crate::github_env_files::write_kv_entry(&mut f, key, value);
                     if let Err(e) = res {
                         wrkflw_logging::debug(&format!(
                             "Failed to write composite output '{}' to GITHUB_OUTPUT: {}",
@@ -7309,20 +7463,6 @@ fn substitute_script_path(tokens: Vec<String>, script_path: &str) -> Vec<String>
         .into_iter()
         .map(|t| t.replace("{0}", script_path))
         .collect()
-}
-
-/// Generate a heredoc delimiter that does not appear as a standalone line in `value`.
-/// Starts with `ghadelimiter_` and appends a numeric suffix until unique.
-fn generate_heredoc_delimiter(value: &str) -> String {
-    let base = "ghadelimiter";
-    let mut candidate = base.to_string();
-    let mut counter: u64 = 0;
-    // Check if the candidate appears as a complete line in the value
-    while value.lines().any(|line| line == candidate) {
-        counter += 1;
-        candidate = format!("{}_{}", base, counter);
-    }
-    candidate
 }
 
 // Helper function to convert YAML step to our Step struct
@@ -8065,9 +8205,16 @@ mod tests {
             .await
             .unwrap();
 
-        let dockerfile =
-            generate_combined_dockerfile(&detect_setup_runtimes(&steps), "my/image:1", None, None);
+        // The user's image gets the runtime, not the runner's tools.
+        let dockerfile = generate_combined_dockerfile(
+            &detect_setup_runtimes(&steps),
+            "my/image:1",
+            None,
+            None,
+            RunnerTools::Omit,
+        );
         assert!(dockerfile.starts_with("FROM my/image:1\n"));
+        assert!(!dockerfile.contains("git-lfs"), "{dockerfile}");
         assert_eq!(
             resolved.image,
             combined_image_tag(&detect_setup_runtimes(&steps), &dockerfile)
@@ -8109,6 +8256,92 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resolved, RunnerImage::plain("ubuntu:latest".to_string()));
+    }
+
+    /// A job that sets nothing up still runs with the runner's tools, such
+    /// as `sudo`, `jq` and `gh`, in a runtime that builds images; never in
+    /// an image mapped with `-P`.
+    #[tokio::test]
+    async fn a_job_with_nothing_to_set_up_still_gets_the_runners_tools() {
+        let job = make_job(None, labels(&["ubuntu-latest"]));
+        let runtime = MockContainerRuntime {
+            session_cli: Some("docker"),
+            ..Default::default()
+        };
+        let steps = vec![make_step_run("jq --version && sudo true")];
+        let resolved = resolve_runner_image(&job, &steps, &runtime, &HashMap::new(), None)
+            .await
+            .unwrap();
+        assert!(
+            resolved.image.starts_with(COMBINED_IMAGE_PREFIX),
+            "{resolved:?}"
+        );
+        // With the GitHub CLI on top.
+        assert!(resolved.image.ends_with("-gh"), "{resolved:?}");
+        assert!(resolved.built.installed.is_empty());
+        let df =
+            generate_combined_dockerfile(&[], "ubuntu:latest", None, None, RunnerTools::Install);
+        for tool in ["sudo", "jq", "unzip", "python3", "git-lfs"] {
+            assert!(df.contains(tool), "{tool} missing:\n{df}");
+        }
+
+        let mapped = overrides(&[("ubuntu-latest", "my/image:1")]);
+        let resolved = resolve_runner_image(&job, &steps, &runtime, &mapped, None)
+            .await
+            .unwrap();
+        assert_eq!(resolved, RunnerImage::plain("my/image:1".to_string()));
+    }
+
+    /// The runner's tools are a convenience: when they can't be built, say
+    /// with no package mirror in reach, a job with nothing else to install
+    /// runs on its base image, as before. A setup action's runtime still
+    /// fails the job.
+    #[tokio::test]
+    async fn a_job_runs_on_its_base_image_when_the_runners_tools_cant_be_built() {
+        let job = make_job(None, labels(&["ubuntu-latest"]));
+        let runtime = MockContainerRuntime {
+            session_cli: Some("docker"),
+            fail_builds: true,
+            ..Default::default()
+        };
+        let steps = vec![make_step_run("echo hi")];
+        let resolved = with_run_image_builds(resolve_runner_image(
+            &job,
+            &steps,
+            &runtime,
+            &HashMap::new(),
+            None,
+        ))
+        .await
+        .unwrap();
+        assert_eq!(resolved, RunnerImage::plain("ubuntu:latest".to_string()));
+
+        let steps = vec![make_step_uses("actions/setup-node@v4", None)];
+        let err = with_run_image_builds(resolve_runner_image(
+            &job,
+            &steps,
+            &runtime,
+            &HashMap::new(),
+            None,
+        ))
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("no space left"), "{err}");
+    }
+
+    /// macOS and Windows labels run as Linux, in the Ubuntu image: a Linux
+    /// engine can't start a Windows image.
+    #[test]
+    fn macos_and_windows_labels_run_in_the_ubuntu_image() {
+        for label in [
+            "windows-latest",
+            "windows-2022",
+            "windows-11-arm",
+            "macos-latest",
+            "macos-15",
+        ] {
+            assert_eq!(get_runner_image(label), "ubuntu:latest", "{label}");
+        }
     }
 
     #[tokio::test]
@@ -8309,9 +8542,14 @@ mod tests {
         let runtime = flaky(vec![Some("RUN apt-get install: exit code 100")], None);
         with_run_image_builds(async {
             for _ in 0..2 {
-                let err = build_combined_runtime_image(&runtimes, "ubuntu:latest", &runtime)
-                    .await
-                    .unwrap_err();
+                let err = build_combined_runtime_image(
+                    &runtimes,
+                    "ubuntu:latest",
+                    &runtime,
+                    RunnerTools::Omit,
+                )
+                .await
+                .unwrap_err();
                 assert!(err.to_string().contains("exit code 100"), "{err}");
             }
         })
@@ -8323,6 +8561,7 @@ mod tests {
             &runtimes,
             "ubuntu:latest",
             &runtime,
+            RunnerTools::Omit,
         ))
         .await
         .unwrap();
@@ -8337,12 +8576,15 @@ mod tests {
         let runtimes = detect_setup_runtimes(&[make_step_uses("actions/setup-go@v5", None)]);
         let runtime = flaky(vec![Some("broken pipe"), Some("broken pipe")], None);
         with_run_image_builds(async {
-            assert!(
-                build_combined_runtime_image(&runtimes, "ubuntu:latest", &runtime)
-                    .await
-                    .is_err()
-            );
-            build_combined_runtime_image(&runtimes, "ubuntu:latest", &runtime)
+            assert!(build_combined_runtime_image(
+                &runtimes,
+                "ubuntu:latest",
+                &runtime,
+                RunnerTools::Omit
+            )
+            .await
+            .is_err());
+            build_combined_runtime_image(&runtimes, "ubuntu:latest", &runtime, RunnerTools::Omit)
                 .await
                 .unwrap();
         })
@@ -8360,13 +8602,18 @@ mod tests {
         let runtimes = detect_setup_runtimes(&[make_step_uses("actions/setup-go@v5", None)]);
         let runtime = flaky(vec![Some(TIMED_OUT)], None);
         with_run_image_builds(async {
-            let err = build_combined_runtime_image(&runtimes, "ubuntu:latest", &runtime)
-                .await
-                .unwrap_err();
+            let err = build_combined_runtime_image(
+                &runtimes,
+                "ubuntu:latest",
+                &runtime,
+                RunnerTools::Omit,
+            )
+            .await
+            .unwrap_err();
             assert!(err.to_string().contains(TIMED_OUT), "{err}");
             // Given up on once, not tried again there and then.
             assert_eq!(*runtime.builds.lock().unwrap(), 1);
-            build_combined_runtime_image(&runtimes, "ubuntu:latest", &runtime)
+            build_combined_runtime_image(&runtimes, "ubuntu:latest", &runtime, RunnerTools::Omit)
                 .await
                 .unwrap();
         })
@@ -8379,7 +8626,7 @@ mod tests {
     async fn the_base_image_is_pulled_first_only_where_its_id_can_be_read() {
         let runtimes = detect_setup_runtimes(&[make_step_uses("actions/setup-node@v4", None)]);
         let blind = PullCountingRuntime::default();
-        build_combined_runtime_image(&runtimes, "ubuntu:latest", &blind)
+        build_combined_runtime_image(&runtimes, "ubuntu:latest", &blind, RunnerTools::Omit)
             .await
             .unwrap();
         assert_eq!(*blind.pulls.lock().unwrap(), 0);
@@ -8388,7 +8635,7 @@ mod tests {
             identifies: true,
             ..Default::default()
         };
-        build_combined_runtime_image(&runtimes, "ubuntu:latest", &sighted)
+        build_combined_runtime_image(&runtimes, "ubuntu:latest", &sighted, RunnerTools::Omit)
             .await
             .unwrap();
         assert_eq!(*sighted.pulls.lock().unwrap(), 1);
@@ -10110,7 +10357,13 @@ runs:
                 floating: false,
                 env: Vec::new(),
             }];
-            generate_combined_dockerfile(&runtimes, "ubuntu:latest", Some("sha256:abc"), None)
+            generate_combined_dockerfile(
+                &runtimes,
+                "ubuntu:latest",
+                Some("sha256:abc"),
+                None,
+                RunnerTools::Install,
+            )
         };
         let (one, other) = (python("3.12"), python("3.13"));
         let shared = shared_layers(&one);
@@ -10190,7 +10443,8 @@ runs:
     }
 
     /// A runtime that remembers the tags it built, and has those and any
-    /// it starts with. A build of a tag in `failing` fails on its own. One
+    /// it starts with. A build of a tag containing `failing` fails on its
+    /// own. One
     /// that `ships_images` keeps no layers for a later build to reuse.
     #[derive(Default)]
     struct TagBuildRuntime {
@@ -10218,7 +10472,7 @@ runs:
         }
         async fn build_image(&self, _: &Path, tag: &str, _: &Path) -> Result<(), ContainerError> {
             self.built.lock().unwrap().push(tag.to_string());
-            if let Some(prefix) = self.failing.filter(|prefix| tag.starts_with(prefix)) {
+            if let Some(prefix) = self.failing.filter(|part| tag.contains(part)) {
                 return Err(ContainerError::ImageBuild(format!(
                     "RUN apt-get update: exit code 100 ({})",
                     prefix
@@ -10243,6 +10497,74 @@ runs:
         }
     }
 
+    /// The GitHub CLI goes on in an image of its own, on top of the job's,
+    /// and an image that has both is reused as it is.
+    #[tokio::test]
+    async fn the_github_cli_goes_on_top_of_the_jobs_image() {
+        let runtimes = detect_setup_runtimes(&[make_step_uses("actions/setup-go@v5", None)]);
+        let runtime = TagBuildRuntime::default();
+        let image = with_run_image_builds(build_combined_runtime_image(
+            &runtimes,
+            "ubuntu:latest",
+            &runtime,
+            RunnerTools::Install,
+        ))
+        .await
+        .unwrap();
+        let built = runtime.built.lock().unwrap().clone();
+        assert_eq!(built.len(), 3, "{built:?}");
+        assert_eq!(image, github_cli_tag(&built[1]));
+        assert_eq!(built[2], image);
+
+        let again = with_run_image_builds(build_combined_runtime_image(
+            &runtimes,
+            "ubuntu:latest",
+            &runtime,
+            RunnerTools::Install,
+        ))
+        .await
+        .unwrap();
+        assert_eq!(again, image);
+        assert_eq!(runtime.built.lock().unwrap().len(), 3);
+    }
+
+    /// When the GitHub CLI can't be installed the job runs without it, and
+    /// no image is kept as though it had it: the next run tries the CLI's
+    /// layer again, and only that.
+    #[tokio::test]
+    async fn an_image_that_couldnt_get_the_github_cli_is_not_kept_as_having_it() {
+        let runtimes = detect_setup_runtimes(&[make_step_uses("actions/setup-go@v5", None)]);
+        let runtime = TagBuildRuntime {
+            failing: Some("-gh"),
+            ..Default::default()
+        };
+        let image = with_run_image_builds(build_combined_runtime_image(
+            &runtimes,
+            "ubuntu:latest",
+            &runtime,
+            RunnerTools::Install,
+        ))
+        .await
+        .unwrap();
+        let built = runtime.built.lock().unwrap().clone();
+        assert_eq!(built.len(), 3, "{built:?}");
+        assert_eq!(image, built[1]);
+        assert!(!runtime.existing.lock().unwrap().contains(&built[2]));
+
+        let next = with_run_image_builds(build_combined_runtime_image(
+            &runtimes,
+            "ubuntu:latest",
+            &runtime,
+            RunnerTools::Install,
+        ))
+        .await
+        .unwrap();
+        assert_eq!(next, image);
+        let built = runtime.built.lock().unwrap().clone();
+        assert_eq!(built.len(), 4, "{built:?}");
+        assert_eq!(built[3], github_cli_tag(&image));
+    }
+
     /// No step runs in the image of shared layers. A runtime that ships
     /// each image it builds, as Kubernetes does to its registry, would
     /// build and ship that one on every run for nothing.
@@ -10257,6 +10579,7 @@ runs:
             &go,
             "wrkflw-test/shipped:1",
             &runtime,
+            RunnerTools::Omit,
         ))
         .await
         .unwrap();
@@ -10314,10 +10637,10 @@ runs:
         let runtime = TagBuildRuntime::default();
         let (go_tag, java_tag) = with_run_image_builds(async {
             (
-                build_combined_runtime_image(&go, base, &runtime)
+                build_combined_runtime_image(&go, base, &runtime, RunnerTools::Omit)
                     .await
                     .unwrap(),
-                build_combined_runtime_image(&java, base, &runtime)
+                build_combined_runtime_image(&java, base, &runtime, RunnerTools::Omit)
                     .await
                     .unwrap(),
             )
@@ -10336,17 +10659,27 @@ runs:
         let base = "wrkflw-test/shared-kept:1";
         let go = detect_setup_runtimes(&[make_step_uses("actions/setup-go@v5", None)]);
         let first = TagBuildRuntime::default();
-        with_run_image_builds(build_combined_runtime_image(&go, base, &first))
-            .await
-            .unwrap();
+        with_run_image_builds(build_combined_runtime_image(
+            &go,
+            base,
+            &first,
+            RunnerTools::Omit,
+        ))
+        .await
+        .unwrap();
         let shared = first.built.lock().unwrap()[0].clone();
 
         let java = detect_setup_runtimes(&[make_step_uses("actions/setup-java@v4", None)]);
         let later = TagBuildRuntime::default();
         later.existing.lock().unwrap().insert(shared);
-        let tag = with_run_image_builds(build_combined_runtime_image(&java, base, &later))
-            .await
-            .unwrap();
+        let tag = with_run_image_builds(build_combined_runtime_image(
+            &java,
+            base,
+            &later,
+            RunnerTools::Omit,
+        ))
+        .await
+        .unwrap();
         assert_eq!(*later.built.lock().unwrap(), [tag]);
     }
 
@@ -10362,9 +10695,10 @@ runs:
         with_run_image_builds(async {
             for action in ["actions/setup-go@v5", "actions/setup-java@v4"] {
                 let runtimes = detect_setup_runtimes(&[make_step_uses(action, None)]);
-                let err = build_combined_runtime_image(&runtimes, base, &runtime)
-                    .await
-                    .unwrap_err();
+                let err =
+                    build_combined_runtime_image(&runtimes, base, &runtime, RunnerTools::Omit)
+                        .await
+                        .unwrap_err();
                 assert!(err.to_string().contains("exit code 100"), "{err}");
             }
         })
@@ -10977,6 +11311,63 @@ runs:
         assert_eq!(runtimes[0].version, "stable");
     }
 
+    /// `dtolnay/rust-toolchain@clippy` and `@miri` are nightly with those
+    /// components, not toolchains called `clippy` and `miri`.
+    #[test]
+    fn detect_setup_runtimes_rust_clippy_and_miri_refs_are_nightly_with_components() {
+        let steps = vec![make_step_uses("dtolnay/rust-toolchain@clippy", None)];
+        let runtimes = detect_setup_runtimes(&steps);
+        assert_eq!(runtimes[0].version, "nightly");
+        assert!(
+            runtimes[0]
+                .install_script
+                .ends_with("rustup component add clippy"),
+            "{}",
+            runtimes[0].install_script
+        );
+
+        let steps = vec![make_step_uses("dtolnay/rust-toolchain@miri", None)];
+        let runtimes = detect_setup_runtimes(&steps);
+        assert_eq!(runtimes[0].version, "nightly");
+        assert!(
+            runtimes[0]
+                .install_script
+                .ends_with("rustup component add miri rust-src"),
+            "{}",
+            runtimes[0].install_script
+        );
+
+        // The step's own inputs win over the branch's defaults.
+        let with = HashMap::from([
+            ("toolchain".to_string(), "beta".to_string()),
+            ("components".to_string(), "rustfmt".to_string()),
+        ]);
+        let steps = vec![make_step_uses("dtolnay/rust-toolchain@clippy", Some(with))];
+        let runtimes = detect_setup_runtimes(&steps);
+        assert_eq!(runtimes[0].version, "beta");
+        assert!(runtimes[0]
+            .install_script
+            .ends_with("rustup component add rustfmt"));
+    }
+
+    /// A ref that pins the action rather than naming a toolchain gets the
+    /// default toolchain.
+    #[test]
+    fn detect_setup_runtimes_rust_action_version_refs_are_not_toolchains() {
+        for uses in [
+            "dtolnay/rust-toolchain@master",
+            "dtolnay/rust-toolchain@v1",
+            "actions-rs/toolchain@v1",
+            "actions-rs/toolchain@v1.0.6",
+        ] {
+            let runtimes = detect_setup_runtimes(&[make_step_uses(uses, None)]);
+            assert_eq!(runtimes[0].version, "stable", "{}", uses);
+        }
+        let runtimes =
+            detect_setup_runtimes(&[make_step_uses("dtolnay/rust-toolchain@1.85.0", None)]);
+        assert_eq!(runtimes[0].version, "1.85.0");
+    }
+
     #[test]
     fn detect_setup_runtimes_normalizes_dot_x_suffix() {
         // "16.x" should be normalized to "16"
@@ -11205,7 +11596,13 @@ runs:
             floating: false,
             env: Vec::new(),
         }];
-        let df = generate_combined_dockerfile(&runtimes, "ubuntu:latest", None, None);
+        let df = generate_combined_dockerfile(
+            &runtimes,
+            "ubuntu:latest",
+            None,
+            None,
+            RunnerTools::Install,
+        );
         assert!(df.starts_with("FROM ubuntu:latest\n"));
         assert!(df.contains("nodesource"));
         // The shared packages, and the runtime.
@@ -11221,8 +11618,13 @@ runs:
             floating: false,
             env: Vec::new(),
         }];
-        let df =
-            generate_combined_dockerfile(&runtimes, "catthehacker/ubuntu:act-latest", None, None);
+        let df = generate_combined_dockerfile(
+            &runtimes,
+            "catthehacker/ubuntu:act-latest",
+            None,
+            None,
+            RunnerTools::Install,
+        );
         assert!(df.ends_with("ENV PATH=/usr/local/bin:/usr/bin:$PATH\n"));
     }
 
@@ -11244,7 +11646,13 @@ runs:
                 env: Vec::new(),
             },
         ];
-        let df = generate_combined_dockerfile(&runtimes, "ubuntu:latest", None, None);
+        let df = generate_combined_dockerfile(
+            &runtimes,
+            "ubuntu:latest",
+            None,
+            None,
+            RunnerTools::Install,
+        );
         assert_eq!(df.matches("RUN ").count(), 3);
         assert!(df.contains("nodesource"));
         assert!(df.contains("uv python install '3.12'"));
@@ -11266,7 +11674,13 @@ runs:
                 env: Vec::new(),
             })
             .collect();
-        let df = generate_combined_dockerfile(&runtimes, "ubuntu:latest", None, None);
+        let df = generate_combined_dockerfile(
+            &runtimes,
+            "ubuntu:latest",
+            None,
+            None,
+            RunnerTools::Install,
+        );
         let runs: Vec<&str> = df
             .split("\nRUN ")
             .skip(1)
@@ -11296,6 +11710,7 @@ runs:
                 "ubuntu:latest",
                 Some("sha256:aaa"),
                 Some("2026-W46"),
+                RunnerTools::Install,
             )
         };
         let (one, other) = (leg("3.12"), leg("3.13"));
@@ -11539,8 +11954,13 @@ runs:
         )]);
         let uv = &detection.runtimes[0];
         assert!(uv.install_script.contains("uv python install '3.12'"));
-        let dockerfile =
-            generate_combined_dockerfile(&detection.runtimes, "ubuntu:latest", None, None);
+        let dockerfile = generate_combined_dockerfile(
+            &detection.runtimes,
+            "ubuntu:latest",
+            None,
+            None,
+            RunnerTools::Install,
+        );
         assert!(dockerfile.contains("ENV UV_PYTHON=3.12\n"), "{dockerfile}");
         assert!(dockerfile.contains(&format!("ENV UV_PYTHON_INSTALL_DIR={}\n", UV_PYTHON_DIR)));
         // Set once even beside setup-python, which sets the directory too.
@@ -11554,7 +11974,13 @@ runs:
                 Some(with(&[("python-version", "3.12")])),
             ),
         ]);
-        let dockerfile = generate_combined_dockerfile(&both.runtimes, "ubuntu:latest", None, None);
+        let dockerfile = generate_combined_dockerfile(
+            &both.runtimes,
+            "ubuntu:latest",
+            None,
+            None,
+            RunnerTools::Install,
+        );
         assert_eq!(dockerfile.matches("ENV UV_PYTHON_INSTALL_DIR=").count(), 1);
 
         // What wrkflw doesn't carry out leaves the step not run, and says
@@ -11972,8 +12398,9 @@ runs:
         let with = HashMap::from([("node-version".to_string(), ">=18 <21".to_string())]);
         let steps = vec![make_step_uses("actions/setup-node@v4", Some(with))];
         assert_eq!(detect_setup_runtimes(&steps)[0].version, "20");
-        // Only Python passes a specifier on to its installer.
-        let with = HashMap::from([("go-version".to_string(), ">=1.21".to_string())]);
+        // Only Python passes a specifier on to its installer. Go takes a
+        // range with no upper bound, as its newest release is in it.
+        let with = HashMap::from([("go-version".to_string(), ">=1.21 <1.23".to_string())]);
         let steps = vec![make_step_uses("actions/setup-go@v5", Some(with))];
         assert!(detect_setup_runtimes(&steps).is_empty());
     }
@@ -11998,7 +12425,13 @@ runs:
             floating: false,
             env: Vec::new(),
         }];
-        let df = generate_combined_dockerfile(&python, "ubuntu:latest", None, None);
+        let df = generate_combined_dockerfile(
+            &python,
+            "ubuntu:latest",
+            None,
+            None,
+            RunnerTools::Install,
+        );
         assert!(df.contains("build-essential less"), "{df}");
         assert!(df.contains("command -v node"), "{df}");
         assert!(
@@ -12015,7 +12448,8 @@ runs:
             floating: false,
             env: Vec::new(),
         }];
-        let df = generate_combined_dockerfile(&node, "ubuntu:latest", None, None);
+        let df =
+            generate_combined_dockerfile(&node, "ubuntu:latest", None, None, RunnerTools::Install);
         assert!(!df.contains("command -v node"), "{df}");
         assert_eq!(df.matches("nodesource").count(), 1, "{df}");
     }
@@ -12099,8 +12533,13 @@ runs:
         // cache key for it and for every layer built on it, not a comment
         // beside it that the cache ignores.
         let week = floating_versions_week(&floating, monday);
-        let dockerfile =
-            generate_combined_dockerfile(&floating, "ubuntu:latest", None, week.as_deref());
+        let dockerfile = generate_combined_dockerfile(
+            &floating,
+            "ubuntu:latest",
+            None,
+            week.as_deref(),
+            RunnerTools::Install,
+        );
         let run = dockerfile
             .lines()
             .find(|line| line.starts_with("RUN "))
@@ -12119,7 +12558,13 @@ runs:
             floating: false,
             env: Vec::new(),
         }];
-        let df = generate_combined_dockerfile(&python, "ubuntu:latest", None, None);
+        let df = generate_combined_dockerfile(
+            &python,
+            "ubuntu:latest",
+            None,
+            None,
+            RunnerTools::Install,
+        );
         assert!(
             df.contains(&format!("ENV PATH={}:", PYTHON_SCRIPTS_DIR)),
             "{df}"
@@ -12160,7 +12605,13 @@ runs:
         let runtimes = detect_setup_runtimes(&steps);
         let order: Vec<&str> = runtimes.iter().map(|r| r.language.as_str()).collect();
         assert_eq!(order, ["uv", "python"]);
-        let df = generate_combined_dockerfile(&runtimes, "ubuntu:latest", None, None);
+        let df = generate_combined_dockerfile(
+            &runtimes,
+            "ubuntu:latest",
+            None,
+            None,
+            RunnerTools::Install,
+        );
         let pinned = df.find("astral.sh/uv/0.9.30/install.sh").unwrap();
         let python_install = df.find("uv python install").unwrap();
         assert!(pinned < python_install, "{df}");
@@ -12236,10 +12687,20 @@ runs:
             floating: false,
             env: Vec::new(),
         }];
-        let before =
-            generate_combined_dockerfile(&runtimes, "ubuntu:latest", Some("sha256:aaa"), None);
-        let after =
-            generate_combined_dockerfile(&runtimes, "ubuntu:latest", Some("sha256:bbb"), None);
+        let before = generate_combined_dockerfile(
+            &runtimes,
+            "ubuntu:latest",
+            Some("sha256:aaa"),
+            None,
+            RunnerTools::Install,
+        );
+        let after = generate_combined_dockerfile(
+            &runtimes,
+            "ubuntu:latest",
+            Some("sha256:bbb"),
+            None,
+            RunnerTools::Install,
+        );
         assert!(before.contains("# base image id: sha256:aaa"));
         assert_ne!(
             combined_image_tag(&runtimes, &before),
@@ -12258,7 +12719,13 @@ runs:
             floating: false,
             env: Vec::new(),
         }];
-        let df = generate_combined_dockerfile(&runtimes, "ubuntu:latest", None, None);
+        let df = generate_combined_dockerfile(
+            &runtimes,
+            "ubuntu:latest",
+            None,
+            None,
+            RunnerTools::Install,
+        );
         // The base packages alone.
         assert_eq!(df.matches("RUN ").count(), 1);
     }
@@ -12286,6 +12753,13 @@ runs:
         let tag2 = combined_image_tag(&runtimes, df);
         assert_eq!(tag1, tag2);
         assert!(tag1.starts_with(COMBINED_IMAGE_PREFIX));
+    }
+
+    #[test]
+    fn an_image_with_no_runtime_has_a_valid_tag() {
+        let tag = combined_image_tag(&[], "FROM ubuntu:latest\n");
+        let name = tag.strip_prefix(COMBINED_IMAGE_PREFIX).unwrap();
+        assert!(name.starts_with("runner-"), "{tag}");
     }
 
     #[test]
@@ -16108,15 +16582,16 @@ runs:
     #[test]
     fn generate_heredoc_delimiter_avoids_collisions() {
         // Base case: no collision
-        let delim = generate_heredoc_delimiter("hello\nworld");
+        let delim = crate::github_env_files::heredoc_delimiter("hello\nworld");
         assert_eq!(delim, "ghadelimiter");
 
         // Value contains the base delimiter as a line
-        let delim = generate_heredoc_delimiter("line1\nghadelimiter\nline2");
+        let delim = crate::github_env_files::heredoc_delimiter("line1\nghadelimiter\nline2");
         assert_eq!(delim, "ghadelimiter_1");
 
         // Value contains both base and _1
-        let delim = generate_heredoc_delimiter("ghadelimiter\nghadelimiter_1\nother");
+        let delim =
+            crate::github_env_files::heredoc_delimiter("ghadelimiter\nghadelimiter_1\nother");
         assert_eq!(delim, "ghadelimiter_2");
     }
 
@@ -16189,7 +16664,7 @@ runs:
 
         let rt = &runtime as &dyn ContainerRuntime;
         let tasks: Vec<_> = (0..5)
-            .map(|_| build_combined_runtime_image(&runtimes, "ubuntu:22.04", rt))
+            .map(|_| build_combined_runtime_image(&runtimes, "ubuntu:22.04", rt, RunnerTools::Omit))
             .collect();
 
         for result in futures::future::join_all(tasks).await {

@@ -143,13 +143,21 @@ pub fn read_step_environment_updates(job_env: &HashMap<String, String>) -> StepE
 /// - Merges GITHUB_ENV entries into `job_env`
 /// - Prepends GITHUB_PATH entries to the PATH in `job_env`
 /// - Clears per-step files so the next step starts fresh
+///
+/// Returns the `$GITHUB_ENV` and `$GITHUB_PATH` entries it applied, so a
+/// composite action can hand them on to the job that called it.
 pub fn apply_step_environment_updates(
     job_env: &mut HashMap<String, String>,
     job_user_env: &mut HashMap<String, String>,
     step_outputs_map: &mut HashMap<String, HashMap<String, String>>,
     step_id: Option<&str>,
-) {
+) -> AppliedEnvironment {
     let updates = read_step_environment_updates(job_env);
+    let mut applied = AppliedEnvironment {
+        env_vars: updates.env_vars.clone().into_iter().collect(),
+        path_entries: updates.path_entries.clone(),
+    };
+    applied.env_vars.sort();
 
     // Store step outputs keyed by step ID for ${{ steps.<id>.outputs.<key> }}
     if let Some(id) = step_id {
@@ -194,6 +202,89 @@ pub fn apply_step_environment_updates(
 
     // Clear files so the next step doesn't re-process these entries
     clear_step_files(job_env);
+    applied
+}
+
+/// The `$GITHUB_ENV` and `$GITHUB_PATH` entries one or more steps wrote.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct AppliedEnvironment {
+    /// `$GITHUB_ENV` entries, in the order a later one overrides an earlier one.
+    pub env_vars: Vec<(String, String)>,
+    /// `$GITHUB_PATH` entries, in the order they end up on `PATH`.
+    pub path_entries: Vec<String>,
+}
+
+impl AppliedEnvironment {
+    /// Add what a later step applied: its variables override, and its
+    /// directories go in front, as they do on `PATH`.
+    pub fn then(&mut self, later: AppliedEnvironment) {
+        self.env_vars.extend(later.env_vars);
+        let mut path_entries = later.path_entries;
+        path_entries.append(&mut self.path_entries);
+        self.path_entries = path_entries;
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.env_vars.is_empty() && self.path_entries.is_empty()
+    }
+
+    /// Append these entries to the `$GITHUB_ENV` and `$GITHUB_PATH` files
+    /// named in `caller_env`, so they apply when the calling step finishes,
+    /// as a composite action's do on GitHub.
+    pub fn write_to(&self, caller_env: &HashMap<String, String>) -> std::io::Result<()> {
+        use std::io::Write;
+        if !self.env_vars.is_empty() {
+            if let Some(path) = caller_env.get("GITHUB_ENV") {
+                let mut f = fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)?;
+                for (key, value) in &self.env_vars {
+                    write_kv_entry(&mut f, key, value)?;
+                }
+            }
+        }
+        if !self.path_entries.is_empty() {
+            if let Some(path) = caller_env.get("GITHUB_PATH") {
+                let mut f = fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)?;
+                for entry in &self.path_entries {
+                    writeln!(f, "{}", entry)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Write `key=value` in the `$GITHUB_OUTPUT`/`$GITHUB_ENV` format, as a
+/// heredoc when the value has more than one line.
+pub fn write_kv_entry(f: &mut impl std::io::Write, key: &str, value: &str) -> std::io::Result<()> {
+    if value.contains('\n') {
+        let delim = heredoc_delimiter(value);
+        writeln!(f, "{}<<{}", key, delim)?;
+        write!(f, "{}", value)?;
+        if !value.ends_with('\n') {
+            writeln!(f)?;
+        }
+        writeln!(f, "{}", delim)
+    } else {
+        writeln!(f, "{}={}", key, value)
+    }
+}
+
+/// A heredoc delimiter that isn't a line of `value`.
+pub fn heredoc_delimiter(value: &str) -> String {
+    let base = "ghadelimiter";
+    let mut candidate = base.to_string();
+    let mut counter: u64 = 0;
+    while value.lines().any(|line| line == candidate) {
+        counter += 1;
+        candidate = format!("{}_{}", base, counter);
+    }
+    candidate
 }
 
 /// Truncate environment files between steps.
@@ -216,6 +307,85 @@ pub fn clear_step_files(job_env: &HashMap<String, String>) {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    /// A job's environment whose `$GITHUB_ENV` and `$GITHUB_PATH` are files
+    /// in `dir`, with `PATH` set to `/usr/bin`.
+    fn job_env_in(dir: &Path) -> HashMap<String, String> {
+        let mut env = HashMap::new();
+        for name in ["GITHUB_ENV", "GITHUB_PATH", "GITHUB_OUTPUT"] {
+            let file = dir.join(name.to_ascii_lowercase());
+            fs::write(&file, "").unwrap();
+            env.insert(name.to_string(), file.display().to_string());
+        }
+        env.insert("PATH".to_string(), "/usr/bin".to_string());
+        env
+    }
+
+    /// Run one step's writes through `apply_step_environment_updates`, as
+    /// the engine does after each step.
+    fn step(
+        env: &mut HashMap<String, String>,
+        env_lines: &str,
+        path_lines: &str,
+    ) -> AppliedEnvironment {
+        fs::write(&env["GITHUB_ENV"], env_lines).unwrap();
+        fs::write(&env["GITHUB_PATH"], path_lines).unwrap();
+        apply_step_environment_updates(env, &mut HashMap::new(), &mut HashMap::new(), None)
+    }
+
+    /// What a composite action's steps write reaches the job as it would
+    /// have had the job run those steps itself: the later value of a
+    /// variable wins, the later directory goes first, and a value of
+    /// several lines keeps them.
+    #[test]
+    fn a_composites_environment_reaches_the_job_as_its_steps_left_it() {
+        let dir = tempdir().unwrap();
+        let mut job = job_env_in(dir.path());
+        // The composite's steps write to the same files as the job's step.
+        let mut action = job.clone();
+        let mut applied = AppliedEnvironment::default();
+        applied.then(step(&mut action, "TOOL=one\nKEEP=yes\n", "/opt/a\n"));
+        applied.then(step(
+            &mut action,
+            "TOOL=two\nNOTES<<EOF\nline one\nghadelimiter\nEOF\n",
+            "/opt/b\n",
+        ));
+        assert_eq!(applied.path_entries, ["/opt/b", "/opt/a"]);
+
+        applied.write_to(&job).unwrap();
+        step_after_handing_on(&mut job);
+        assert_eq!(job["TOOL"], "two");
+        assert_eq!(job["KEEP"], "yes");
+        assert_eq!(job["NOTES"], "line one\nghadelimiter");
+        assert_eq!(job["PATH"], action["PATH"]);
+        assert_eq!(job["PATH"], "/opt/b:/opt/a:/usr/bin");
+    }
+
+    /// The engine applies the calling step's files once the composite ends.
+    fn step_after_handing_on(job: &mut HashMap<String, String>) {
+        apply_step_environment_updates(job, &mut HashMap::new(), &mut HashMap::new(), None);
+    }
+
+    /// The calling step's own writes, made before the composite hands its
+    /// entries on, are kept, and nothing is written for nothing applied.
+    #[test]
+    fn handing_on_appends_to_what_the_calling_step_wrote() {
+        let dir = tempdir().unwrap();
+        let mut job = job_env_in(dir.path());
+        fs::write(&job["GITHUB_ENV"], "OWN=1\n").unwrap();
+        AppliedEnvironment::default().write_to(&job).unwrap();
+        assert_eq!(fs::read_to_string(&job["GITHUB_PATH"]).unwrap(), "");
+
+        let applied = AppliedEnvironment {
+            env_vars: vec![("FROM_COMPOSITE".to_string(), "2".to_string())],
+            path_entries: Vec::new(),
+        };
+        applied.write_to(&job).unwrap();
+        step_after_handing_on(&mut job);
+        assert_eq!(job["OWN"], "1");
+        assert_eq!(job["FROM_COMPOSITE"], "2");
+        assert_eq!(job["PATH"], "/usr/bin");
+    }
 
     #[test]
     fn parse_simple_kv() {

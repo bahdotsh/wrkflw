@@ -1,0 +1,12 @@
+# Finished GitHub runs `compare_sweep.sh` reruns locally, one per line:
+#   owner/repo  run_id  [VAR=value ...]
+# Variables after the run id are set for that run only.
+pallets/click        42384079679
+chalk/chalk          39857044981
+sindresorhus/ky      37893818274
+rust-lang/log        41132244035
+dtolnay/itoa         42546989194
+tj/commander.js      42330604270
+spf13/cobra          29133202016  WRKFLW_DOCKER_IN_JOBS=1
+fatih/color          29997796830
+pallets/flask        41077465744

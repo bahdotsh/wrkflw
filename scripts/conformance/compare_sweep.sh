@@ -17,7 +17,8 @@
 # `change` compares the run with its line in compare_expected.tsv, beside
 # the list of runs (or $WRKFLW_SWEEP_EXPECTED): `same`, `better`, `WORSE`
 # when fewer jobs agree or more differ, or `new` for a run not listed
-# there. Some runs are known to differ, so the sweep exits 1 only when a
+# there; more `unverified` than recorded counts as WORSE too, where the
+# line records it. Some runs are known to differ, so the sweep exits 1 only when a
 # run is WORSE or gives no report, not whenever one disagrees. With
 # WRKFLW_SWEEP_RECORD=1 the results are written to that file instead, as
 # the new expectation: do that after a change that is meant to move them.
@@ -49,10 +50,12 @@ job_images() {
   [[ -n "$engine" ]] && "$engine" images -q --filter 'reference=wrkflw-combined' 2>/dev/null | sort -u | wc -l | tr -d ' '
 }
 
-# What compare_expected.tsv says of a run: "agreed differed", or nothing.
+# What compare_expected.tsv says of a run: "agreed differed unverified",
+# with "-" for unverified on a line recorded before it was, or nothing.
 expected_for() {
   [[ -f "$EXPECTED" ]] || return 0
-  awk -F'\t' -v repo="$1" -v run="$2" '$1 == repo && $2 == run { print $3, $4 }' "$EXPECTED"
+  awk -F'\t' -v repo="$1" -v run="$2" \
+    '$1 == repo && $2 == run { print $3, $4, ($6 == "" ? "-" : $6) }' "$EXPECTED"
 }
 
 # One compare, with its report in $log.json. A GitHub API error (5xx, or a
@@ -140,18 +143,24 @@ while read -r repo run extra <&3; do
       (.unverified_agreements // 0)] | @tsv' <<<"$report")
 
   change="new"
-  read -r want_agreed want_differed < <(expected_for "$repo" "$run")
+  want_agreed="" want_differed="" want_unverified=""
+  read -r want_agreed want_differed want_unverified < <(expected_for "$repo" "$run")
   if [[ -n "${want_agreed:-}" && -n "${want_differed:-}" ]]; then
-    if (( agreed < want_agreed || differed > want_differed )); then
+    more_unverified=0 fewer_unverified=0
+    if [[ "${want_unverified:--}" != "-" ]]; then
+      (( unverified > want_unverified )) && more_unverified=1
+      (( unverified < want_unverified )) && fewer_unverified=1
+    fi
+    if (( agreed < want_agreed || differed > want_differed || more_unverified )); then
       change="WORSE"
       failed=1
-    elif (( agreed > want_agreed || differed < want_differed )); then
+    elif (( agreed > want_agreed || differed < want_differed || fewer_unverified )); then
       change="better"
     else
       change="same"
     fi
   fi
-  recorded+="$repo"$'\t'"$run"$'\t'"$agreed"$'\t'"$differed"$'\t'"$unknown"$'\n'
+  recorded+="$repo"$'\t'"$run"$'\t'"$agreed"$'\t'"$differed"$'\t'"$unknown"$'\t'"$unverified"$'\n'
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "$repo" "$run" "$agree" "$agreed" "$differed" "$unknown" "$unverified" "$built" "$seconds" "$change"
 done 3<"$RUNS"
@@ -162,10 +171,10 @@ if [[ -n "$RECORD" && "$RECORD" != 0 ]]; then
     echo "not recorded: a run gave no report" >&2
   else
     {
-      printf '# What compare_sweep.sh expects of each run: fewer agreeing or more\n'
-      printf '# differing jobs than this is a regression. Written by\n'
+      printf '# What compare_sweep.sh expects of each run: fewer agreeing, or more\n'
+      printf '# differing or unverified jobs, than this is a regression. Written by\n'
       printf '# WRKFLW_SWEEP_RECORD=1; say in the commit why a line changed.\n'
-      printf '# repo\trun\tagreed\tdiffered\tnot_compared\n'
+      printf '# repo\trun\tagreed\tdiffered\tnot_compared\tunverified\n'
       printf '%s' "$recorded"
     } >"$EXPECTED" || { echo "cannot write $EXPECTED" >&2; exit 2; }
     echo "recorded $EXPECTED" >&2

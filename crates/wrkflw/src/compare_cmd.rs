@@ -294,24 +294,27 @@ fn failed_step_note(failures: &[Value], name: &str) -> Option<String> {
     if let Some(code) = failure["exit_code"].as_i64() {
         note.push_str(&format!(" (exit {code})"));
     }
-    // An error line if the digest found one, else the last thing printed.
-    let line = failure["error_lines"]
-        .as_array()
-        .and_then(|lines| {
-            lines
-                .iter()
-                .filter_map(Value::as_str)
-                .find(|l| !l.trim().is_empty())
-        })
-        .or_else(|| {
-            failure["output_tail"].as_array().and_then(|lines| {
-                lines
-                    .iter()
-                    .rev()
-                    .filter_map(Value::as_str)
-                    .find(|l| !l.trim().is_empty())
-            })
-        });
+    // Of the digest's error lines, one that opens with `error`, as
+    // compilers and most tools report one: the lines only mention the
+    // word, and a compiler's own command line does too. Else the first of
+    // them, else the last thing printed.
+    let lines = |key: &str| {
+        failure[key]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .filter(|l| !l.trim().is_empty())
+    };
+    let opens_with_error = |l: &&str| {
+        l.trim_start()
+            .get(..5)
+            .is_some_and(|start| start.eq_ignore_ascii_case("error"))
+    };
+    let line = lines("error_lines")
+        .find(opens_with_error)
+        .or_else(|| lines("error_lines").next())
+        .or_else(|| lines("output_tail").next_back());
     if let Some(line) = line {
         let line = line.trim();
         let quoted: String = line.chars().take(QUOTED_LINE_CHARS).collect();
@@ -1366,6 +1369,43 @@ mod tests {
     /// A local failure GitHub doesn't share says where it failed and quotes
     /// the line that says why: an error line when the digest found one, and
     /// for a leg folded into another's failure, that one's.
+    /// The line quoted is the one that reports the error, not the first
+    /// that mentions the word, as a compiler's command line does.
+    #[test]
+    fn the_quoted_line_is_the_one_that_reports_the_error() {
+        let failures = vec![json!({
+            "job": "doc",
+            "step": "Run rustdoc",
+            "exit_code": 101,
+            "error_lines": [
+                "Running `rustc --crate-name log --error-format=json`",
+                "error: redundant explicit link target"
+            ],
+            "output_tail": ["error: could not document `log`", "Caused by:"]
+        })];
+        assert_eq!(
+            failed_step_note(&failures, "doc").as_deref(),
+            Some(
+                "failed locally in step \"Run rustdoc\" (exit 101): \
+                 error: redundant explicit link target"
+            )
+        );
+        // None opens with it: the first that mentions it, then the tail.
+        let mentions = vec![json!({
+            "job": "doc", "step": "s",
+            "error_lines": ["3 errors found"], "output_tail": ["bye"]
+        })];
+        assert!(failed_step_note(&mentions, "doc")
+            .unwrap()
+            .ends_with(": 3 errors found"));
+        let tail_only = vec![json!({
+            "job": "doc", "step": "s", "error_lines": [], "output_tail": ["one", "bye", ""]
+        })];
+        assert!(failed_step_note(&tail_only, "doc")
+            .unwrap()
+            .ends_with(": bye"));
+    }
+
     #[test]
     fn a_disagreeing_failure_says_where_it_failed() {
         let dir = tempfile::tempdir().unwrap();

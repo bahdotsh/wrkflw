@@ -207,6 +207,12 @@ struct Row {
     /// has no result to compare, such as a job GitHub cancelled.
     agree: Option<bool>,
     note: Option<String>,
+    /// The local job ran as Linux for a Windows one, so its result isn't
+    /// compared, and doesn't count in the runs' own results either.
+    stand_in: bool,
+    /// The local job passed without running an action GitHub ran, so the
+    /// two agree on less than the job's name says.
+    unverified: bool,
 }
 
 /// Whether GitHub's `conclusion` and wrkflw's `status` say the same.
@@ -240,10 +246,84 @@ fn stood_in_for_windows(local: &Value) -> bool {
         .is_some_and(|os| os.to_ascii_lowercase().starts_with("windows"))
 }
 
+/// What a job without a Docker engine prints when a step runs `docker`:
+/// the shell finds no such command, or the CLI no engine to talk to.
+const NO_DOCKER_ENGINE: &[&str] = &[
+    "docker: command not found",
+    "docker: not found",
+    "docker: No such file or directory",
+    "Cannot connect to the Docker daemon",
+];
+
+/// The failed steps of the local job `name` in the run's failure digest,
+/// its own or those of a matrix leg it was folded into.
+fn failures_of<'a>(failures: &'a [Value], name: &'a str) -> impl Iterator<Item = &'a Value> {
+    failures.iter().filter(move |failure| {
+        failure["job"] == name
+            || failure["also_failed_in"]
+                .as_array()
+                .is_some_and(|legs| legs.iter().any(|leg| leg == name))
+    })
+}
+
+/// The lines the digest kept of a failed step's output.
+fn failure_lines(failure: &Value) -> impl Iterator<Item = &str> {
+    ["error_lines", "output_tail"]
+        .into_iter()
+        .flat_map(|key| failure[key].as_array().into_iter().flatten())
+        .filter_map(Value::as_str)
+}
+
+/// Whether a failed step's output shows that `docker` had no engine.
+fn lacked_docker(failure: &Value) -> bool {
+    failure_lines(failure).any(|line| NO_DOCKER_ENGINE.iter().any(|sign| line.contains(sign)))
+}
+
+/// The most a note quotes of a line of a step's output.
+const QUOTED_LINE_CHARS: usize = 200;
+
+/// Where the local job `name` failed and the line that says why, from the
+/// run's failure digest: a report that only says `failure` sends its reader
+/// to the log for what the digest already knows.
+fn failed_step_note(failures: &[Value], name: &str) -> Option<String> {
+    let failure = failures_of(failures, name).next()?;
+    let mut note = match failure["step"].as_str() {
+        Some(step) => format!("failed locally in step \"{step}\""),
+        None => "failed locally outside any step".to_string(),
+    };
+    if let Some(code) = failure["exit_code"].as_i64() {
+        note.push_str(&format!(" (exit {code})"));
+    }
+    // An error line if the digest found one, else the last thing printed.
+    let line = failure["error_lines"]
+        .as_array()
+        .and_then(|lines| {
+            lines
+                .iter()
+                .filter_map(Value::as_str)
+                .find(|l| !l.trim().is_empty())
+        })
+        .or_else(|| {
+            failure["output_tail"].as_array().and_then(|lines| {
+                lines
+                    .iter()
+                    .rev()
+                    .filter_map(Value::as_str)
+                    .find(|l| !l.trim().is_empty())
+            })
+        });
+    if let Some(line) = line {
+        let line = line.trim();
+        let quoted: String = line.chars().take(QUOTED_LINE_CHARS).collect();
+        let cut = if quoted.len() < line.len() { "…" } else { "" };
+        note.push_str(&format!(": {quoted}{cut}"));
+    }
+    Some(note)
+}
+
 /// Why a local job may differ from GitHub's, from the run's own report.
-/// `needs_docker` says its steps run `docker` and the run gave them no
-/// engine.
-fn note_for(local: &Value, failures: &[Value], needs_docker: bool) -> Option<String> {
+/// `runs_docker` says its steps run `docker`.
+fn note_for(local: &Value, failures: &[Value], runs_docker: bool) -> Option<String> {
     let name = local["name"].as_str().unwrap_or_default();
     let mut notes = Vec::new();
     if let Some(runner) = local.get("runner") {
@@ -258,10 +338,13 @@ fn note_for(local: &Value, failures: &[Value], needs_docker: bool) -> Option<Str
             runner["requested"].as_str().unwrap_or("?")
         ));
     }
-    if needs_docker && local["status"] == "failure" {
+    // Said only when the output shows it: a job that had an engine, from
+    // the flag, the variable or `.wrkflw` configuration, failed on its own.
+    if runs_docker && local["status"] == "failure" && failures_of(failures, name).any(lacked_docker)
+    {
         notes.push(
-            "its steps run docker: a job only has an engine for them with \
-             WRKFLW_DOCKER_IN_JOBS=1 (run --docker-in-jobs)"
+            "its steps run docker and found no engine: a job only has one with \
+             WRKFLW_DOCKER_IN_JOBS=1 (run --docker-in-jobs), on Docker"
                 .to_string(),
         );
     }
@@ -281,14 +364,9 @@ fn note_for(local: &Value, failures: &[Value], needs_docker: bool) -> Option<Str
             "not run locally: an earlier result was reused ({reason})"
         ));
     }
-    let cause = failures.iter().find_map(|failure| {
-        let here = failure["job"] == name
-            || failure["also_failed_in"]
-                .as_array()
-                .is_some_and(|legs| legs.iter().any(|leg| leg == name));
-        here.then(|| &failure["cause"])
-            .filter(|cause| cause.is_object())
-    });
+    let cause = failures_of(failures, name)
+        .map(|failure| &failure["cause"])
+        .find(|cause| cause.is_object());
     match cause.and_then(|cause| cause["kind"].as_str()) {
         Some("out_of_memory") => notes.push("ran out of memory locally".to_string()),
         Some("killed") => notes.push(
@@ -306,15 +384,12 @@ fn note_for(local: &Value, failures: &[Value], needs_docker: bool) -> Option<Str
 }
 
 /// Match `remote` jobs to `local` results through `expected` names.
-///
-/// `docker_in_jobs` says the local run started an engine for steps that
-/// run `docker`, so a failure of theirs isn't put down to its absence.
+/// `failures` are the failed steps of the local run's failure digest.
 fn rows(
     expected: &[ExpectedJob],
     remote: &[RemoteJob],
     local: &[Value],
     failures: &[Value],
-    docker_in_jobs: bool,
 ) -> Vec<Row> {
     let mut used = vec![false; remote.len()];
     // How many expected jobs each GitHub name fits. Above one, pairing is by
@@ -361,19 +436,37 @@ fn rows(
         if github_name.is_none() && local_job.is_none() {
             continue;
         }
-        let compared = !local_job.is_some_and(stood_in_for_windows);
+        let stand_in = local_job.is_some_and(stood_in_for_windows);
+        let agree = agree(github_conclusion.as_deref(), local_status).filter(|_| !stand_in);
+        // A pass GitHub agrees with, of a job that skipped one of its actions.
+        let unverified = agree == Some(true)
+            && local_status == Some("success")
+            && local_job.is_some_and(|l| {
+                l["actions_not_run"]
+                    .as_array()
+                    .is_some_and(|actions| !actions.is_empty())
+            });
+        // Where a local failure GitHub doesn't share came from.
+        let why_failed = (agree == Some(false) && local_status == Some("failure"))
+            .then(|| failed_step_note(failures, &job.local))
+            .flatten();
         rows.push(Row {
             github_name,
             local_name: Some(job.local.clone()),
             github: github_conclusion.clone(),
             local: local_status.map(str::to_string),
-            agree: agree(github_conclusion.as_deref(), local_status).filter(|_| compared),
+            agree,
             note: join_notes(
-                found
-                    .filter(|(i, _)| fits[*i] > 1)
-                    .map(|(i, r)| ambiguous_note(&r.name, fits[i])),
-                local_job.and_then(|l| note_for(l, failures, job.runs_docker && !docker_in_jobs)),
+                join_notes(
+                    found
+                        .filter(|(i, _)| fits[*i] > 1)
+                        .map(|(i, r)| ambiguous_note(&r.name, fits[i])),
+                    local_job.and_then(|l| note_for(l, failures, job.runs_docker)),
+                ),
+                why_failed,
             ),
+            stand_in,
+            unverified,
         });
     }
     for (i, remote_job) in remote.iter().enumerate() {
@@ -389,6 +482,8 @@ fn rows(
                      wrkflw couldn't work out, such as one that reads `github`"
                         .to_string(),
                 ),
+                stand_in: false,
+                unverified: false,
             });
         }
     }
@@ -605,19 +700,13 @@ fn outcome(remote: &RemoteRun, local: &Value, rows: &[Row]) -> Outcome {
         }
     }
     if compared > 0 {
-        return paired_outcome(
-            remote,
-            status,
-            rows,
-            job_disagreements,
-            windows_stand_ins(local),
-        );
+        return paired_outcome(remote, status, rows, job_disagreements);
     }
     // Every paired job ran as Linux for a Windows one: nothing was compared,
     // though a job only one side has a result for may still disagree.
     let stand_ins = windows_stand_ins(local);
     if stand_ins > 0 {
-        let mut outcome = paired_outcome(remote, status, rows, job_disagreements, stand_ins);
+        let mut outcome = paired_outcome(remote, status, rows, job_disagreements);
         if outcome.disagreements == 0 {
             outcome.basis = "none";
             let not_compared = format!(
@@ -682,14 +771,13 @@ fn unpaired_result(row: &Row) -> Option<&str> {
 ///   so a run GitHub failed in a job wrkflw couldn't pair never agrees
 ///   with a local pass.
 ///
-/// `stand_ins` jobs ran as Linux for Windows ones, so the runs' own results
-/// may differ for them alone, and aren't compared.
+/// A job that ran as Linux for a Windows one is left out of the runs' own
+/// results too: see [`runs_differ`].
 fn paired_outcome(
     remote: &RemoteRun,
     status: &str,
     rows: &[Row],
     job_disagreements: usize,
-    stand_ins: usize,
 ) -> Outcome {
     let unpaired: Vec<&Row> = rows
         .iter()
@@ -707,8 +795,7 @@ fn paired_outcome(
         .filter(|r| unpaired_result(r) == Some("failure"))
         .count();
     let mut disagreements = job_disagreements + one_sided_failures;
-    let runs_differ =
-        stand_ins == 0 && agree(remote.conclusion.as_deref(), Some(status)) == Some(false);
+    let runs_differ = runs_differ(remote, status, rows);
     if disagreements == 0 && runs_differ {
         disagreements = 1;
     }
@@ -740,6 +827,35 @@ fn paired_outcome(
     }
 }
 
+/// Whether GitHub's run and the local one, `status`, ended differently,
+/// leaving out the jobs that ran as Linux for Windows ones.
+///
+/// Such a job's result isn't compared, so a run that failed in those jobs
+/// alone counts as one that passed, on either side. A failure anywhere
+/// else still counts: one Windows leg doesn't excuse the rest of the run.
+fn runs_differ(remote: &RemoteRun, status: &str, rows: &[Row]) -> bool {
+    let failed = |result: &Option<String>| result.as_deref() == Some("failure");
+    // A run's failure is the stand-ins' alone when one of them failed and
+    // no other job did.
+    let only_stand_ins_failed = |side: fn(&Row) -> &Option<String>| {
+        rows.iter().any(|r| r.stand_in && failed(side(r)))
+            && !rows.iter().any(|r| !r.stand_in && failed(side(r)))
+    };
+    let without_stand_ins = |result: &str, side: fn(&Row) -> &Option<String>| {
+        if result == "failure" && only_stand_ins_failed(side) {
+            "success".to_string()
+        } else {
+            result.to_string()
+        }
+    };
+    let github = remote
+        .conclusion
+        .as_deref()
+        .map(|conclusion| without_stand_ins(conclusion, |r| &r.github));
+    let local = without_stand_ins(status, |r| &r.local);
+    agree(github.as_deref(), Some(&local)) == Some(false)
+}
+
 /// The `compare` object. `agree` is true only when something was compared
 /// and nothing differed.
 fn report(remote: &RemoteRun, local: &Value, rows: &[Row]) -> Value {
@@ -751,6 +867,7 @@ fn report(remote: &RemoteRun, local: &Value, rows: &[Row]) -> Value {
         "disagreements": outcome.disagreements,
         "basis": outcome.basis,
         "problem": outcome.problem,
+        "unverified_agreements": rows.iter().filter(|r| r.unverified).count(),
         "github": {
             "run_id": remote.id,
             "url": remote.html_url,
@@ -772,6 +889,7 @@ fn report(remote: &RemoteRun, local: &Value, rows: &[Row]) -> Value {
             "github": r.github,
             "local": r.local,
             "agree": r.agree,
+            "unverified": r.unverified,
             "note": r.note,
         })).collect::<Vec<_>>(),
     })
@@ -818,6 +936,16 @@ fn print_text(report: &Value) {
         }
     }
     let disagreements = report["disagreements"].as_u64().unwrap_or(0);
+    let unverified = report["unverified_agreements"].as_u64().unwrap_or(0);
+    if unverified > 0 {
+        println!(
+            "{}",
+            cli_style::warning(&format!(
+                "{unverified} job(s) agree on a pass that skipped an action GitHub ran, \
+                 so they agree on less than the rest"
+            ))
+        );
+    }
     if report["agree"] == true {
         println!("{}", cli_style::success("wrkflw agrees with GitHub"));
     } else if disagreements > 0 {
@@ -958,16 +1086,7 @@ pub(crate) async fn run(ctx: CompareCtx) -> ! {
         .as_array()
         .cloned()
         .unwrap_or_default();
-    // The local run reads the same variable, through `run`'s flag.
-    let docker_in_jobs = std::env::var(wrkflw_executor::run_options::DOCKER_IN_JOBS_ENV)
-        .is_ok_and(|value| wrkflw_executor::run_options::switch_is_on(&value));
-    let rows = rows(
-        &expected,
-        &remote.jobs,
-        &local_jobs,
-        &failures,
-        docker_in_jobs,
-    );
+    let rows = rows(&expected, &remote.jobs, &local_jobs, &failures);
     let mut report = report(&remote, &local, &rows);
     if let Some(note) = ref_unsure {
         report["ref_unsure"] = json!(note);
@@ -1033,7 +1152,7 @@ mod tests {
                    "repeated_from": "build (os: ubuntu-latest)"}),
             json!({"name": "lint", "status": "failure"}),
         ];
-        let rows = rows(&expected, &github, &local, &[], false);
+        let rows = rows(&expected, &github, &local, &[]);
         let row = |name: &str| {
             rows.iter()
                 .find(|r| r.github_name.as_deref() == Some(name))
@@ -1072,8 +1191,57 @@ mod tests {
             &json!({"status": "success", "verdict": "partial"}),
             &rows,
         );
-        assert_eq!(report["agree"], false);
-        assert_eq!(report["disagreements"], 1);
+        // GitHub's run failed in its Windows job alone, which isn't
+        // compared, so the runs' own results don't differ either.
+        assert_eq!(report["agree"], true, "{report}");
+        assert_eq!(report["disagreements"], 0);
+    }
+
+    /// A Windows leg is left out of the runs' own results, but doesn't
+    /// excuse the rest of the run: GitHub's run failed in a job that timed
+    /// out, which no row can show, and the local run passed everywhere else.
+    #[test]
+    fn a_windows_leg_doesnt_hide_a_run_that_ended_differently() {
+        let dir = tempfile::tempdir().unwrap();
+        let expected = expected_jobs(&write(dir.path(), CI)).unwrap();
+        let jobs = |lint: &str| {
+            vec![
+                remote("Format", "success"),
+                remote("Build (ubuntu-latest)", "success"),
+                remote("Build (windows-latest)", "success"),
+                remote("lint", lint),
+                remote("deploy / publish", "success"),
+            ]
+        };
+        let local = vec![
+            json!({"name": "fmt", "status": "success"}),
+            json!({"name": "build (os: ubuntu-latest)", "status": "success"}),
+            json!({"name": "build (os: windows-latest)", "status": "failure",
+                   "runner": {"requested": "windows-latest", "ran_as": "Linux"}}),
+            json!({"name": "lint", "status": "success"}),
+        ];
+        let local_run = json!({"status": "failure", "verdict": "partial", "jobs": local});
+        let compare = |conclusion: &str, lint: &str| {
+            let github = jobs(lint);
+            let rows = rows(&expected, &github, &local, &[]);
+            report(&github_run(conclusion, github), &local_run, &rows)
+        };
+
+        // The local run failed in its Windows stand-in alone: as good as a
+        // pass, which is what GitHub's run was.
+        let same = compare("success", "success");
+        assert_eq!(same["agree"], true, "{same}");
+
+        // GitHub's run failed where the local one, stand-in aside, passed.
+        let differs = compare("failure", "timed_out");
+        assert_eq!(differs["agree"], false, "{differs}");
+        assert_eq!(differs["disagreements"], 1, "{differs}");
+        assert!(
+            differs["problem"]
+                .as_str()
+                .is_some_and(|p| p.contains("The runs' results differ")),
+            "{differs}"
+        );
     }
 
     /// GitHub shows a called workflow's jobs as `<caller> / <job>`; wrkflw
@@ -1094,7 +1262,12 @@ mod tests {
             json!({"name": "checks", "status": "failure"}),
             json!({"name": "lint", "status": "failure"}),
         ];
-        let rows = rows(&expected, &github, &local, &[], false);
+        let failures = [
+            json!({"job": "lint", "step": "Run docker run --rm hadolint/hadolint",
+            "exit_code": 127, "error_lines": [],
+            "output_tail": ["sh: 1: docker: not found"]}),
+        ];
+        let rows = rows(&expected, &github, &local, &failures);
         let row = |local: &str| {
             rows.iter()
                 .find(|r| r.local_name.as_deref() == Some(local))
@@ -1133,7 +1306,7 @@ mod tests {
             json!({"name": "checks (rust: stable)", "status": "success"}),
             json!({"name": "checks (rust: beta)", "status": "failure"}),
         ];
-        let rows = rows(&expected, &github, &local, &[], false);
+        let rows = rows(&expected, &github, &local, &[]);
         assert_eq!(rows.len(), 2, "{rows:?}");
         let row = |local: &str| {
             rows.iter()
@@ -1151,22 +1324,121 @@ mod tests {
         assert_eq!(beta.agree, Some(true));
     }
 
-    /// The note that a job needs an engine for `docker` is left out when
-    /// the run gave it one: its failure is its own.
+    /// A job is told it needs an engine for `docker` only when its output
+    /// shows there was none: with one, from the flag, the variable or
+    /// `.wrkflw` configuration, its failure is its own, and the note says
+    /// where it failed instead.
     #[test]
-    fn a_docker_jobs_failure_is_not_put_down_to_a_missing_engine_it_had() {
+    fn a_docker_jobs_failure_is_put_down_to_a_missing_engine_only_when_it_shows() {
         let dir = tempfile::tempdir().unwrap();
         let yaml = "name: CI\non: push\njobs:\n  lint:\n    runs-on: ubuntu-latest\n    steps:\n      - run: docker run --rm hadolint/hadolint\n";
         let expected = expected_jobs(&write(dir.path(), yaml)).unwrap();
         let github = vec![remote("lint", "success")];
         let local = vec![json!({"name": "lint", "status": "failure"})];
-        let without = rows(&expected, &github, &local, &[], false);
-        assert!(without[0]
-            .note
-            .as_deref()
-            .is_some_and(|note| note.contains("WRKFLW_DOCKER_IN_JOBS=1")));
-        let with = rows(&expected, &github, &local, &[], true);
-        assert_eq!(with[0].note, None);
+        let failed_with = |line: &str| {
+            let failures = [
+                json!({"job": "lint", "step": "Run docker run", "exit_code": 1,
+                "error_lines": [], "output_tail": [line]}),
+            ];
+            rows(&expected, &github, &local, &failures)[0]
+                .note
+                .clone()
+                .unwrap()
+        };
+        for line in [
+            "/bin/bash: line 1: docker: command not found",
+            "Cannot connect to the Docker daemon at unix:///var/run/docker.sock.",
+        ] {
+            let note = failed_with(line);
+            assert!(note.contains("WRKFLW_DOCKER_IN_JOBS=1"), "{note}");
+        }
+        let own = failed_with("Dockerfile:3 DL3008 warning: Pin versions in apt get install");
+        assert!(!own.contains("WRKFLW_DOCKER_IN_JOBS"), "{own}");
+        assert_eq!(
+            own,
+            "failed locally in step \"Run docker run\" (exit 1): \
+             Dockerfile:3 DL3008 warning: Pin versions in apt get install"
+        );
+        // With nothing in the digest for the job, nothing is guessed.
+        assert_eq!(rows(&expected, &github, &local, &[])[0].note, None);
+    }
+
+    /// A local failure GitHub doesn't share says where it failed and quotes
+    /// the line that says why: an error line when the digest found one, and
+    /// for a leg folded into another's failure, that one's.
+    #[test]
+    fn a_disagreeing_failure_says_where_it_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: CI\non: push\njobs:\n  doc:\n    runs-on: ubuntu-latest\n    steps:\n      - run: gh attestation verify x\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: make test\n";
+        let expected = expected_jobs(&write(dir.path(), yaml)).unwrap();
+        let long = "x".repeat(QUOTED_LINE_CHARS + 50);
+        let failures = [
+            json!({"job": "other", "also_failed_in": ["doc"], "step": "Install tool",
+                "exit_code": 1, "error_lines": ["HTTP 401: Bad credentials"],
+                "output_tail": ["Error: Process completed with exit code 1."]}),
+            json!({"job": "test", "step": null, "exit_code": null,
+                "error_lines": [], "output_tail": ["", long]}),
+        ];
+        let local = vec![
+            json!({"name": "doc", "status": "failure"}),
+            json!({"name": "test", "status": "failure"}),
+        ];
+        // GitHub passed `doc` and failed `test` too.
+        let github = vec![remote("doc", "success"), remote("test", "failure")];
+        let rows_ = rows(&expected, &github, &local, &failures);
+        assert_eq!(
+            rows_[0].note.as_deref(),
+            Some("failed locally in step \"Install tool\" (exit 1): HTTP 401: Bad credentials")
+        );
+        // A failure both sides share needs no explaining.
+        assert_eq!(rows_[1].agree, Some(true));
+        assert_eq!(rows_[1].note, None);
+
+        // A failure outside any step, and a line too long to quote whole.
+        let github = vec![remote("doc", "success"), remote("test", "success")];
+        let rows_ = rows(&expected, &github, &local, &failures);
+        let note = rows_[1].note.as_deref().unwrap();
+        assert!(
+            note.starts_with("failed locally outside any step: xxx"),
+            "{note}"
+        );
+        assert!(note.ends_with('…'), "{note}");
+        assert!(note.chars().count() < QUOTED_LINE_CHARS + 60, "{note}");
+    }
+
+    /// A pass both sides share, of a job whose action didn't run locally,
+    /// still agrees, but is marked and counted apart.
+    #[test]
+    fn an_agreeing_pass_that_skipped_an_action_is_marked_unverified() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: CI\non: push\njobs:\n  lint:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: golangci/golangci-lint-action@v8\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: make test\n";
+        let expected = expected_jobs(&write(dir.path(), yaml)).unwrap();
+        let skipped = json!([{"step": "lint", "uses": "golangci/golangci-lint-action@v8"}]);
+        let github = vec![remote("lint", "success"), remote("test", "success")];
+        let local = |lint: &str| {
+            vec![
+                json!({"name": "lint", "status": lint, "actions_not_run": skipped}),
+                json!({"name": "test", "status": "success"}),
+            ]
+        };
+        let passed = rows(&expected, &github, &local("success"), &[]);
+        assert_eq!(passed[0].agree, Some(true));
+        assert!(passed[0].unverified);
+        assert!(!passed[1].unverified);
+        let report = report(
+            &github_run("success", github.clone()),
+            &json!({"status": "success", "verdict": "partial"}),
+            &passed,
+        );
+        assert_eq!(report["agree"], true, "{report}");
+        assert_eq!(report["unverified_agreements"], 1, "{report}");
+        assert_eq!(report["jobs"][0]["unverified"], true, "{report}");
+        assert_eq!(report["jobs"][1]["unverified"], false, "{report}");
+
+        // A failure GitHub doesn't share is a disagreement, not a weak pass.
+        let failed = rows(&expected, &github, &local("failure"), &[]);
+        assert_eq!(failed[0].agree, Some(false));
+        assert!(!failed[0].unverified);
     }
 
     /// A run whose paired jobs all stood in for Windows ones compared
@@ -1179,7 +1451,7 @@ mod tests {
         let github = vec![remote("test", "success")];
         let job = json!({"name": "test", "status": "failure",
                          "runner": {"requested": "windows-latest", "ran_as": "Linux"}});
-        let rows = rows(&expected, &github, std::slice::from_ref(&job), &[], false);
+        let rows = rows(&expected, &github, std::slice::from_ref(&job), &[]);
         let report = report(
             &github_run("success", github),
             &json!({"status": "failure", "verdict": "partial", "jobs": [job]}),
@@ -1239,7 +1511,7 @@ mod tests {
         let github = github_run("failure", vec![remote("Format", "failure")]);
         let local =
             json!({"status": "error", "verdict": "error", "error": "no docker", "jobs": []});
-        let unpaired = rows(&[], &github.jobs, &[], &[], false);
+        let unpaired = rows(&[], &github.jobs, &[], &[]);
         let report = report(&github, &local, &unpaired);
         assert_eq!(report["agree"], false, "{report}");
         assert_eq!(report["disagreements"], 1);
@@ -1250,7 +1522,7 @@ mod tests {
     fn with_no_job_paired_only_the_runs_result_is_compared() {
         let local_pass = json!({"status": "success", "verdict": "verified"});
         let github_jobs = vec![remote("Build on ubuntu", "failure")];
-        let none_paired = rows(&[], &github_jobs, &[], &[], false);
+        let none_paired = rows(&[], &github_jobs, &[], &[]);
         assert!(none_paired.iter().all(|r| r.agree.is_none()));
 
         let failed = report(
@@ -1344,7 +1616,7 @@ mod tests {
             json!({"name": "build (os: linux, rust: beta)", "status": "success"}),
             json!({"name": "build (os: linux, rust: stable)", "status": "success"}),
         ];
-        let rows = rows(&expected, &github, &local, &[], false);
+        let rows = rows(&expected, &github, &local, &[]);
         assert_eq!(rows.len(), 2, "{rows:?}");
         for row in &rows {
             let note = row.note.as_deref().unwrap_or_default();
@@ -1426,6 +1698,8 @@ mod tests {
             local: Some(local.to_string()),
             agree: agree(Some(github), Some(local)),
             note: None,
+            stand_in: false,
+            unverified: false,
         }
     }
 
@@ -1443,6 +1717,8 @@ mod tests {
             local: None,
             agree: None,
             note: None,
+            stand_in: false,
+            unverified: false,
         });
         let report = report(&github, &local, &rows);
         assert_eq!(report["agree"], false, "{report}");
@@ -1484,6 +1760,8 @@ mod tests {
                 local: Some("failure".into()),
                 agree: None,
                 note: None,
+                stand_in: false,
+                unverified: false,
             },
         ];
         let report = report(&github, &local, &rows);

@@ -16369,6 +16369,50 @@ runs:
         assert!(calls[0].cmd.iter().any(|c| c.contains("linux step ran")));
     }
 
+    /// A step that couldn't run at all ends the composite with an error, and
+    /// what its earlier steps wrote to `$GITHUB_ENV` still reaches the job,
+    /// as it does when a step fails.
+    #[tokio::test]
+    async fn a_composite_that_errors_still_hands_on_its_environment() {
+        let action_dir = tempfile::tempdir().unwrap();
+        write_composite_action(
+            action_dir.path(),
+            "    - run: echo FOO=bar >> \"$GITHUB_ENV\"\n      shell: bash\n    - uses: ./no-such-action",
+        );
+        let files = tempfile::tempdir().unwrap();
+        let github_env = files.path().join("env");
+        // The mock runs nothing: the first step's write is already there.
+        fs::write(&github_env, "FOO=bar\n").unwrap();
+        let job_env = HashMap::from([
+            ("GITHUB_ENV".to_string(), github_env.display().to_string()),
+            ("RUNNER_OS".to_string(), "Linux".to_string()),
+        ]);
+
+        let runtime = MockContainerRuntime::default();
+        let working_dir = tempfile::tempdir().unwrap();
+        let step = make_run_step("noop");
+        let services = test_services();
+        let pending = std::sync::Mutex::new(Vec::<PendingCacheSave>::new());
+        let result = execute_composite_action(
+            &step,
+            action_dir.path(),
+            &job_env,
+            &job_env,
+            working_dir.path(),
+            &runtime,
+            "ubuntu:latest",
+            &BuiltRuntimes::default(),
+            false,
+            &services,
+            &pending,
+        )
+        .await;
+        assert!(result.is_err(), "{result:?}");
+        let handed_on = fs::read_to_string(&github_env).unwrap();
+        assert!(handed_on.contains("FOO"), "{handed_on:?}");
+        assert!(handed_on.contains("bar"), "{handed_on:?}");
+    }
+
     #[tokio::test]
     async fn composite_skipped_step_records_skipped_outcome() {
         let action_dir = tempfile::tempdir().unwrap();

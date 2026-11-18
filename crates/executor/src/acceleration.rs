@@ -37,7 +37,9 @@ use wrkflw_parser::workflow::{Job, WorkflowDefinition};
 pub const SIDECAR_PATH: &str = ".wrkflw/affected.yml";
 
 /// Bump when the fingerprint's inputs change, so old entries stop matching.
-const KEY_VERSION: u32 = 4;
+/// Version 5: steps of the built-in image run as the runner user, so a pass
+/// stored when they ran as root says nothing of a run as that user.
+const KEY_VERSION: u32 = 5;
 
 /// Host directories mounted into containers under `--dep-cache`, and where
 /// in a user's home directory each tool keeps that cache.
@@ -418,12 +420,21 @@ pub(crate) struct KeyInput<'a> {
 /// The fingerprint a stored result is filed under. `None` if the job can't be
 /// serialized, which leaves it running as normal.
 pub(crate) fn job_key(input: &KeyInput<'_>) -> Option<String> {
-    job_key_with(input, crate::run_options::every_matrix_leg())
+    job_key_with(
+        input,
+        crate::run_options::every_matrix_leg(),
+        !crate::runner_user::allowed(),
+    )
 }
 
 /// [`job_key`], with `every_matrix_leg` saying whether matrix legs that
-/// would repeat another leg still run.
-fn job_key_with(input: &KeyInput<'_>, every_matrix_leg: bool) -> Option<String> {
+/// would repeat another leg still run, and `steps_as_root` whether the run
+/// keeps steps as root where they would run as the runner user.
+fn job_key_with(
+    input: &KeyInput<'_>,
+    every_matrix_leg: bool,
+    steps_as_root: bool,
+) -> Option<String> {
     let lookup = input.lookup;
     let inputs = match input.patterns {
         None => input.tree.digest.clone(),
@@ -460,6 +471,11 @@ fn job_key_with(input: &KeyInput<'_>, every_matrix_leg: bool) -> Option<String> 
     // or the other way round. Version 3 keys were all of the former.
     if container_policy().is_some_and(|policy| policy.one_container_per_step()) {
         document["step_containers"] = serde_json::json!(true);
+    }
+    // A pass as root, which may write what the runner user can't, can't
+    // stand in for one as that user, or the other way round.
+    if steps_as_root {
+        document["steps_as_root"] = serde_json::json!(true);
     }
     let text = serde_json::to_string(&canonical(document)).ok()?;
     Some(hex(&Sha256::digest(text.as_bytes())))
@@ -1016,6 +1032,17 @@ mod tests {
         paths: Option<Vec<String>>,
         every_matrix_leg: bool,
     ) -> String {
+        key_for_user(job_def, wf, tree, paths, every_matrix_leg, false)
+    }
+
+    fn key_for_user(
+        job_def: &Job,
+        wf: &WorkflowDefinition,
+        tree: &TreeHashes,
+        paths: Option<Vec<String>>,
+        every_matrix_leg: bool,
+        steps_as_root: bool,
+    ) -> String {
         let hints = JobHints {
             paths,
             ..Default::default()
@@ -1041,8 +1068,23 @@ mod tests {
                 patterns: patterns.as_deref(),
             },
             every_matrix_leg,
+            steps_as_root,
         )
         .unwrap()
+    }
+
+    /// A pass with steps kept as root isn't reused for a run whose steps
+    /// run as the runner user, or the other way round.
+    #[test]
+    fn a_pass_as_root_is_kept_apart_from_one_as_the_runner_user() {
+        let dir = repo();
+        let wf = workflow();
+        let tree = hash_tree(dir.path()).unwrap();
+        let plain = job("steps:\n  - run: make\n");
+        assert_ne!(
+            key_for_user(&plain, &wf, &tree, None, false, false),
+            key_for_user(&plain, &wf, &tree, None, false, true)
+        );
     }
 
     #[test]

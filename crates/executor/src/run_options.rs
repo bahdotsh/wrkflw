@@ -22,6 +22,70 @@ pub const STEP_CONTAINERS_ENV: &str = "WRKFLW_STEP_CONTAINERS";
 /// steps run `docker`, which then runs privileged.
 pub const DOCKER_IN_JOBS_ENV: &str = "WRKFLW_DOCKER_IN_JOBS";
 
+/// Env var that gives jobs this machine's GitHub token as `github.token`
+/// and `secrets.GITHUB_TOKEN`, where no secret provider has one.
+pub const JOB_GITHUB_TOKEN_ENV: &str = "WRKFLW_JOB_GITHUB_TOKEN";
+
+/// The token jobs get as `github.token` and `secrets.GITHUB_TOKEN` when
+/// [`JOB_GITHUB_TOKEN_ENV`] asks for it: `GITHUB_TOKEN` or `GH_TOKEN` from
+/// the environment, else what `gh auth token` prints. `None` when the
+/// switch is off or there is no token to give.
+///
+/// Off by default, as this is the user's own token, which reaches further
+/// than the one GitHub makes for a run and hands to its steps.
+pub(crate) fn job_github_token() -> Option<String> {
+    static TOKEN: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    if !env_flag(JOB_GITHUB_TOKEN_ENV) {
+        return None;
+    }
+    TOKEN
+        .get_or_init(|| {
+            let token = job_github_token_from(
+                |name| std::env::var(name).ok(),
+                || {
+                    let output = std::process::Command::new("gh")
+                        .args(["auth", "token"])
+                        .stdin(std::process::Stdio::null())
+                        .output()
+                        .ok()?;
+                    output
+                        .status
+                        .success()
+                        .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+                },
+            );
+            match &token {
+                Some(_) => wrkflw_logging::warning(
+                    "Jobs get this machine's GitHub token as github.token and \
+                     secrets.GITHUB_TOKEN (WRKFLW_JOB_GITHUB_TOKEN). It is your own token: \
+                     it can do what you can, not just what a run's token can",
+                ),
+                None => wrkflw_logging::warning(
+                    "WRKFLW_JOB_GITHUB_TOKEN is set, but there is no token to give jobs: \
+                     set GITHUB_TOKEN, or sign in with `gh auth login`",
+                ),
+            }
+            token
+        })
+        .clone()
+}
+
+/// [`job_github_token`] with `var` reading an environment variable and
+/// `gh` asking the GitHub CLI for its token.
+fn job_github_token_from(
+    var: impl Fn(&str) -> Option<String>,
+    gh: impl FnOnce() -> Option<String>,
+) -> Option<String> {
+    let usable = |token: String| {
+        let token = token.trim().to_string();
+        (!token.is_empty()).then_some(token)
+    };
+    ["GITHUB_TOKEN", "GH_TOKEN"]
+        .into_iter()
+        .find_map(|name| var(name).and_then(usable))
+        .or_else(|| gh().and_then(usable))
+}
+
 /// Give every job a new, empty workspace instead of the one it kept from
 /// its last run.
 pub fn set_fresh_workspaces(on: bool) {
@@ -62,6 +126,33 @@ pub fn switch_is_on(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// The job token is the environment's, `GITHUB_TOKEN` before `GH_TOKEN`,
+    /// and the GitHub CLI's only when neither holds one.
+    #[test]
+    fn the_job_token_comes_from_the_environment_before_the_github_cli() {
+        use super::job_github_token_from as token;
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                pairs
+                    .iter()
+                    .find(|(n, _)| *n == name)
+                    .map(|(_, v)| v.to_string())
+            }
+        };
+        let gh = || Some("from-gh\n".to_string());
+        assert_eq!(
+            token(env(&[("GITHUB_TOKEN", " a "), ("GH_TOKEN", "b")]), gh).as_deref(),
+            Some("a")
+        );
+        assert_eq!(
+            token(env(&[("GITHUB_TOKEN", "  "), ("GH_TOKEN", "b")]), gh).as_deref(),
+            Some("b")
+        );
+        assert_eq!(token(env(&[]), gh).as_deref(), Some("from-gh"));
+        assert_eq!(token(env(&[]), || None), None);
+        assert_eq!(token(env(&[]), || Some(" \n".to_string())), None);
+    }
+
     #[test]
     fn switches_read_the_values_the_cli_reads() {
         for off in [

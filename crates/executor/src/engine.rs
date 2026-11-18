@@ -2972,11 +2972,16 @@ async fn execute_job_with_matrix(
     }
 
     // Pre-resolve secrets once for this job (shared across matrix combinations and non-matrix path)
-    let (secrets_context, missing_secrets) = if let Some(secret_mgr) = secret_manager {
+    let (mut secrets_context, mut missing_secrets) = if let Some(secret_mgr) = secret_manager {
         resolve_secrets_for_context(secret_mgr, job).await
     } else {
         (HashMap::new(), HashSet::new())
     };
+    // The run's own token, which GitHub makes for every job. Here it is
+    // this machine's, and only given when asked for; a provider's wins.
+    if let Some(token) = crate::run_options::job_github_token() {
+        give_job_token(&mut secrets_context, &mut missing_secrets, token);
+    }
     // Output is masked before it is shown or persisted, so the masker has to
     // know every value this job can read.
     if let Some(masker) = secret_masker {
@@ -7853,6 +7858,22 @@ fn resolve_job_outputs(
 /// Pre-resolve secrets referenced in the job into a HashMap for expression evaluation.
 /// Scans job steps, conditions, env, and outputs for `${{ secrets.NAME }}` patterns
 /// and resolves each unique name.
+/// Make `token` the job's `secrets.GITHUB_TOKEN`, which `github.token`
+/// reads too, unless a secret provider already gave the job one.
+fn give_job_token(
+    secrets: &mut HashMap<String, String>,
+    missing: &mut HashSet<String>,
+    token: String,
+) {
+    let has_one = secrets
+        .get("GITHUB_TOKEN")
+        .is_some_and(|value| !value.is_empty());
+    if !has_one {
+        secrets.insert("GITHUB_TOKEN".to_string(), token);
+        missing.remove("GITHUB_TOKEN");
+    }
+}
+
 async fn resolve_secrets_for_context(
     secret_manager: &SecretManager,
     job: &Job,
@@ -8271,6 +8292,21 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resolved, RunnerImage::plain("ubuntu:latest".to_string()));
+    }
+
+    /// The job token fills in for a `secrets.GITHUB_TOKEN` no provider has,
+    /// and never replaces one a provider gave.
+    #[test]
+    fn the_job_token_fills_in_only_where_no_provider_gave_one() {
+        let mut secrets = HashMap::from([("GITHUB_TOKEN".to_string(), String::new())]);
+        let mut missing = HashSet::from(["GITHUB_TOKEN".to_string(), "NPM_TOKEN".to_string()]);
+        give_job_token(&mut secrets, &mut missing, "from-gh".to_string());
+        assert_eq!(secrets["GITHUB_TOKEN"], "from-gh");
+        assert_eq!(missing, HashSet::from(["NPM_TOKEN".to_string()]));
+
+        let mut secrets = HashMap::from([("GITHUB_TOKEN".to_string(), "provided".to_string())]);
+        give_job_token(&mut secrets, &mut HashSet::new(), "from-gh".to_string());
+        assert_eq!(secrets["GITHUB_TOKEN"], "provided");
     }
 
     /// A job that sets nothing up still runs with the runner's tools, such

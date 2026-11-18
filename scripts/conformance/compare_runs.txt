@@ -1,6 +1,11 @@
 # Finished GitHub runs `compare_sweep.sh` reruns locally, one per line:
 #   owner/repo  run_id  [VAR=value ...]
 # Variables after the run id are set for that run only.
+#
+# dtolnay/itoa's Documentation, Fuzz and Outdated jobs verify an attestation
+# with the job's GitHub token, and differ without one. Adding
+# WRKFLW_JOB_GITHUB_TOKEN=1 to its line gives them yours: your own token,
+# read by an action that floats on a branch, so it is left for you to add.
 pallets/click        42384079679
 chalk/chalk          39857044981
 sindresorhus/ky      37893818274

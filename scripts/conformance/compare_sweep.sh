@@ -7,16 +7,28 @@
 # Usage: scripts/conformance/compare_sweep.sh [compare_runs.txt] [wrkflw binary]
 # Needs: git, gh (signed in), jq, and Docker or Podman. Prints one
 # tab-separated line per run:
-#   repo  run  agree  agreed  differed  not_compared  seconds
-# from compare's own JSON report, never from the jobs' output. Exits 1 if
-# any run disagrees. Each run's full report and log go to
-# $WRKFLW_SWEEP_DIR/logs.
+#   repo  run  agree  agreed  differed  not_compared  unverified  built  seconds  change
+# from compare's own JSON report, never from the jobs' output. `unverified`
+# counts agreeing jobs that skipped an action GitHub ran. `built` counts the
+# job images built during the run: 0 means its time is a warm one, so only
+# compare times of runs with the same `built`. Each run's full report and
+# log go to $WRKFLW_SWEEP_DIR/logs.
+#
+# `change` compares the run with its line in compare_expected.tsv, beside
+# the list of runs (or $WRKFLW_SWEEP_EXPECTED): `same`, `better`, `WORSE`
+# when fewer jobs agree or more differ, or `new` for a run not listed
+# there. Some runs are known to differ, so the sweep exits 1 only when a
+# run is WORSE or gives no report, not whenever one disagrees. With
+# WRKFLW_SWEEP_RECORD=1 the results are written to that file instead, as
+# the new expectation: do that after a change that is meant to move them.
 #
 # This runs the repositories' CI on this machine: only list ones you trust.
 
 set -uo pipefail
 
 RUNS="${1:-$(dirname "$0")/compare_runs.txt}"
+EXPECTED="${WRKFLW_SWEEP_EXPECTED:-$(dirname "$RUNS")/compare_expected.tsv}"
+RECORD="${WRKFLW_SWEEP_RECORD:-}"
 WRKFLW="${2:-wrkflw}"
 if [[ "$WRKFLW" == */* ]]; then
   WRKFLW="$(cd "$(dirname "$WRKFLW")" && pwd)/$(basename "$WRKFLW")"
@@ -28,8 +40,42 @@ for tool in git gh jq; do
   command -v "$tool" >/dev/null || { echo "$tool is required" >&2; exit 2; }
 done
 
-disagreed=0
-printf 'repo\trun\tagree\tagreed\tdiffered\tnot_compared\tseconds\n'
+# How many job images the engine holds, or nothing without an engine CLI.
+engine=""
+for cli in docker podman; do
+  if command -v "$cli" >/dev/null && "$cli" info >/dev/null 2>&1; then engine="$cli"; break; fi
+done
+job_images() {
+  [[ -n "$engine" ]] && "$engine" images -q --filter 'reference=wrkflw-combined' 2>/dev/null | sort -u | wc -l | tr -d ' '
+}
+
+# What compare_expected.tsv says of a run: "agreed differed", or nothing.
+expected_for() {
+  [[ -f "$EXPECTED" ]] || return 0
+  awk -F'\t' -v repo="$1" -v run="$2" '$1 == repo && $2 == run { print $3, $4 }' "$EXPECTED"
+}
+
+# One compare, with its report in $log.json. A GitHub API error (5xx, or a
+# rate limit that passes) is tried again: it says nothing about the run.
+compare_once() {
+  (cd "$dir" && env ${env_args[@]+"${env_args[@]}"} WRKFLW_NO_HISTORY=1 \
+      "$WRKFLW" compare "https://github.com/$repo/actions/runs/$run" --format json \
+      >"$log.json" 2>"$log.log") </dev/null
+}
+fetch_failed() {
+  jq -e 'select(.type == "error") | .message | test("cannot fetch the run")' \
+    "$log.json" >/dev/null 2>&1
+}
+
+failed=0
+missing=0
+recorded=""
+printf 'repo\trun\tagree\tagreed\tdiffered\tnot_compared\tunverified\tbuilt\tseconds\tchange\n'
+no_result() {  # repo run reason [seconds]
+  printf '%s\t%s\tn/a: %s\t-\t-\t-\t-\t-\t%s\t-\n' "$1" "$2" "$3" "${4:--}"
+  failed=1
+  missing=1
+}
 
 # The list is read on fd 3, so a command reading stdin can't eat lines of it.
 while read -r repo run extra <&3; do
@@ -37,17 +83,22 @@ while read -r repo run extra <&3; do
   name="${repo//\//_}"
   dir="$SWEEP_DIR/repos/$name"
   log="$SWEEP_DIR/logs/$name-$run"
-  sha=$(gh api "repos/$repo/actions/runs/$run" --jq .head_sha 2>/dev/null) || {
-    printf '%s\t%s\tn/a: cannot read the run\t-\t-\t-\t-\n' "$repo" "$run"; continue; }
+  sha=""
+  for attempt in 1 2 3; do
+    sha=$(gh api "repos/$repo/actions/runs/$run" --jq .head_sha 2>/dev/null) && break
+    sha=""
+    sleep $((attempt * 5))
+  done
+  [[ -n "$sha" ]] || { no_result "$repo" "$run" "cannot read the run"; continue; }
   if [[ ! -d "$dir/.git" ]]; then
     git clone -q "https://github.com/$repo.git" "$dir" || {
-      printf '%s\t%s\tn/a: cannot clone\t-\t-\t-\t-\n' "$repo" "$run"; continue; }
+      no_result "$repo" "$run" "cannot clone"; continue; }
   fi
   if ! git -C "$dir" cat-file -e "$sha^{commit}" 2>/dev/null; then
     git -C "$dir" fetch -q origin "$sha" 2>/dev/null || git -C "$dir" fetch -q origin
   fi
   git -C "$dir" checkout -q --detach "$sha" || {
-    printf '%s\t%s\tn/a: cannot check out %s\t-\t-\t-\t-\n' "$repo" "$run" "$sha"; continue; }
+    no_result "$repo" "$run" "cannot check out $sha"; continue; }
 
   # Variables listed after the run id, such as WRKFLW_DOCKER_IN_JOBS=1. A
   # word that isn't NAME=value would be run by `env` as a command.
@@ -61,30 +112,65 @@ while read -r repo run extra <&3; do
     fi
   done
   if [[ -n "$bad" ]]; then
-    printf '%s\t%s\tn/a: not NAME=value: %s\t-\t-\t-\t-\n' "$repo" "$run" "$bad"
-    disagreed=1
+    no_result "$repo" "$run" "not NAME=value: $bad"
     continue
   fi
 
+  images_before=$(job_images)
   start=$(date +%s)
-  (cd "$dir" && env ${env_args[@]+"${env_args[@]}"} WRKFLW_NO_HISTORY=1 \
-      "$WRKFLW" compare "https://github.com/$repo/actions/runs/$run" --format json \
-      >"$log.json" 2>"$log.log") </dev/null
+  for attempt in 1 2 3; do
+    compare_once
+    fetch_failed || break
+    sleep $((attempt * 10))
+  done
   seconds=$(( $(date +%s) - start ))
+  images_after=$(job_images)
+  built="-"
+  [[ -n "$images_before" && -n "$images_after" ]] && built=$(( images_after - images_before ))
 
   report=$(jq -c 'select(.type == "compare")' "$log.json" 2>/dev/null | tail -n 1)
   if [[ -z "$report" ]]; then
-    printf '%s\t%s\tn/a: no report (see %s.log)\t-\t-\t-\t%s\n' "$repo" "$run" "$log" "$seconds"
-    disagreed=1
+    no_result "$repo" "$run" "no report (see $log.log)" "$seconds"
     continue
   fi
-  read -r agree agreed differed unknown < <(jq -r '[.agree,
+  read -r agree agreed differed unknown unverified < <(jq -r '[.agree,
       ([.jobs[] | select(.agree == true)] | length),
       ([.jobs[] | select(.agree == false)] | length),
-      ([.jobs[] | select(.agree == null)] | length)] | @tsv' <<<"$report")
-  [[ "$agree" == "true" ]] || disagreed=1
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-    "$repo" "$run" "$agree" "$agreed" "$differed" "$unknown" "$seconds"
+      ([.jobs[] | select(.agree == null)] | length),
+      (.unverified_agreements // 0)] | @tsv' <<<"$report")
+
+  change="new"
+  read -r want_agreed want_differed < <(expected_for "$repo" "$run")
+  if [[ -n "${want_agreed:-}" && -n "${want_differed:-}" ]]; then
+    if (( agreed < want_agreed || differed > want_differed )); then
+      change="WORSE"
+      failed=1
+    elif (( agreed > want_agreed || differed < want_differed )); then
+      change="better"
+    else
+      change="same"
+    fi
+  fi
+  recorded+="$repo"$'\t'"$run"$'\t'"$agreed"$'\t'"$differed"$'\t'"$unknown"$'\n'
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$repo" "$run" "$agree" "$agreed" "$differed" "$unknown" "$unverified" "$built" "$seconds" "$change"
 done 3<"$RUNS"
 
-exit "$disagreed"
+if [[ -n "$RECORD" && "$RECORD" != 0 ]]; then
+  # A run with no report has nothing to record, and would drop its line.
+  if (( missing )); then
+    echo "not recorded: a run gave no report" >&2
+  else
+    {
+      printf '# What compare_sweep.sh expects of each run: fewer agreeing or more\n'
+      printf '# differing jobs than this is a regression. Written by\n'
+      printf '# WRKFLW_SWEEP_RECORD=1; say in the commit why a line changed.\n'
+      printf '# repo\trun\tagreed\tdiffered\tnot_compared\n'
+      printf '%s' "$recorded"
+    } >"$EXPECTED" || { echo "cannot write $EXPECTED" >&2; exit 2; }
+    echo "recorded $EXPECTED" >&2
+    exit 0
+  fi
+fi
+
+exit "$failed"

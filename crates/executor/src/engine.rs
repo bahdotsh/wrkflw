@@ -2433,9 +2433,15 @@ async fn build_combined_runtime_image(
     }
 }
 
-/// The tag of `tag` with the GitHub CLI on top.
+/// The tag of `tag` with the GitHub CLI on top. It names how the CLI is
+/// installed too, so a changed [`GH_CLI_INSTALL`] gets a new image, not
+/// the one an earlier version of it built.
 fn github_cli_tag(tag: &str) -> String {
-    format!("{}-gh", tag)
+    format!(
+        "{}-gh-{:x}",
+        tag,
+        fnv1a_hash(GH_CLI_INSTALL.as_bytes()) as u32
+    )
 }
 
 /// The image `tag` with the GitHub CLI added in an image of its own, or
@@ -7116,8 +7122,17 @@ async fn execute_composite_action(
                     continue;
                 }
 
-                // Execute the step - using Box::pin to handle async recursion
-                let step_result = Box::pin(execute_step(step_ctx)).await?;
+                // Execute the step - using Box::pin to handle async recursion.
+                // A step that couldn't run at all ends the composite, which
+                // still hands on what its earlier steps wrote, as a step
+                // that failed does.
+                let step_result = match Box::pin(execute_step(step_ctx)).await {
+                    Ok(result) => result,
+                    Err(e) => {
+                        hand_on_composite_environment(&composite_applied, job_env);
+                        return Err(e);
+                    }
+                };
                 // An action inside that didn't run is reported on the step
                 // that called the composite action, the one the job shows.
                 actions_not_run.extend(step_result.actions_not_run.iter().cloned());
@@ -8277,7 +8292,7 @@ mod tests {
             "{resolved:?}"
         );
         // With the GitHub CLI on top.
-        assert!(resolved.image.ends_with("-gh"), "{resolved:?}");
+        assert!(resolved.image.contains("-gh-"), "{resolved:?}");
         assert!(resolved.built.installed.is_empty());
         let df =
             generate_combined_dockerfile(&[], "ubuntu:latest", None, None, RunnerTools::Install);

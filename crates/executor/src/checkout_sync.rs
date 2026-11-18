@@ -806,10 +806,6 @@ fn unchanged_copy(from: &Path, to: &Path) -> bool {
     }
 }
 
-/// Copy `from` to `to` unless `to` already matches it, keeping the source's
-/// modification time so build tools see the file as unchanged. Read-only
-/// files, such as generated code or git objects, are replaced and keep
-/// their time too.
 /// Make `to` a symlink with the same target as the symlink `from`. Neither
 /// link is followed; whatever is at `to` is replaced, not written through.
 fn sync_symlink(from: &Path, to: &Path) -> Result<(), ExecutionError> {
@@ -850,6 +846,10 @@ fn sync_symlink(from: &Path, to: &Path) -> Result<(), ExecutionError> {
     }
 }
 
+/// Copy `from` to `to` unless `to` already matches it, keeping the source's
+/// modification time so build tools see the file as unchanged. Read-only
+/// files, such as generated code or git objects, are replaced and keep
+/// their time too.
 fn sync_file(from: &Path, to: &Path) -> Result<(), ExecutionError> {
     let source = std::fs::metadata(from)
         .map_err(|e| ExecutionError::Execution(format!("Failed to read file: {}", e)))?;

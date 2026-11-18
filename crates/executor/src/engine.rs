@@ -7367,13 +7367,6 @@ fn substitute_script_path(tokens: Vec<String>, script_path: &str) -> Vec<String>
         .collect()
 }
 
-/// Generate a heredoc delimiter that does not appear as a standalone line in `value`.
-/// Starts with `ghadelimiter_` and appends a numeric suffix until unique.
-#[cfg(test)]
-fn generate_heredoc_delimiter(value: &str) -> String {
-    crate::github_env_files::heredoc_delimiter(value)
-}
-
 // Helper function to convert YAML step to our Step struct
 fn convert_yaml_to_step(step_yaml: &serde_yaml::Value) -> Result<workflow::Step, String> {
     // Extract step properties
@@ -16276,15 +16269,16 @@ runs:
     #[test]
     fn generate_heredoc_delimiter_avoids_collisions() {
         // Base case: no collision
-        let delim = generate_heredoc_delimiter("hello\nworld");
+        let delim = crate::github_env_files::heredoc_delimiter("hello\nworld");
         assert_eq!(delim, "ghadelimiter");
 
         // Value contains the base delimiter as a line
-        let delim = generate_heredoc_delimiter("line1\nghadelimiter\nline2");
+        let delim = crate::github_env_files::heredoc_delimiter("line1\nghadelimiter\nline2");
         assert_eq!(delim, "ghadelimiter_1");
 
         // Value contains both base and _1
-        let delim = generate_heredoc_delimiter("ghadelimiter\nghadelimiter_1\nother");
+        let delim =
+            crate::github_env_files::heredoc_delimiter("ghadelimiter\nghadelimiter_1\nother");
         assert_eq!(delim, "ghadelimiter_2");
     }
 

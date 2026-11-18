@@ -1269,18 +1269,29 @@ pub(crate) fn runner_node_install() -> String {
     )
 }
 
+/// The branches of `dtolnay/rust-toolchain` named for a tool rather than a
+/// toolchain: each installs nightly with these components, unless the step
+/// names its own.
+const RUST_TOOLCHAIN_TOOL_BRANCHES: &[(&str, &str)] =
+    &[("clippy", "clippy"), ("miri", "miri, rust-src")];
+
 /// The toolchain a Rust toolchain action's `@ref` names, if it names one.
 /// `dtolnay/rust-toolchain` has a branch per toolchain (`stable`, `1.85`,
-/// `nightly-2025-01-01`), and `clippy` and `miri` branches that install
-/// nightly with those components. Its `master` and a SHA pin the action, not
-/// a toolchain, as every `actions-rs/toolchain` ref does.
+/// `nightly-2025-01-01`), and [branches per tool](RUST_TOOLCHAIN_TOOL_BRANCHES)
+/// that install nightly. Its `master` and a SHA pin the action, not a
+/// toolchain, as every `actions-rs/toolchain` ref does.
 pub(crate) fn toolchain_from_ref(repo: &str, git_ref: &str) -> Option<String> {
     if repo != "dtolnay/rust-toolchain" || is_git_sha(git_ref) {
         return None;
     }
+    if RUST_TOOLCHAIN_TOOL_BRANCHES
+        .iter()
+        .any(|(branch, _)| *branch == git_ref)
+    {
+        return Some("nightly".to_string());
+    }
     match git_ref {
         "master" | "main" | "comment" => None,
-        "clippy" | "miri" => Some("nightly".to_string()),
         // A tag such as `v1` is the action's own version.
         r if r.strip_prefix('v').is_some_and(|rest| {
             !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit() || c == '.')
@@ -1292,20 +1303,23 @@ pub(crate) fn toolchain_from_ref(repo: &str, git_ref: &str) -> Option<String> {
     }
 }
 
-/// A Rust toolchain step's `with:` with the defaults its `@ref` gives: the
-/// `clippy` branch of `dtolnay/rust-toolchain` adds `clippy` and the `miri`
-/// branch `miri, rust-src`, unless the step names its own `components`.
+/// A Rust toolchain step's `with:` with the `components` its `@ref` gives,
+/// as a [branch per tool](RUST_TOOLCHAIN_TOOL_BRANCHES) of
+/// `dtolnay/rust-toolchain` does, unless the step names its own.
 pub(crate) fn with_ref_defaults(
     uses: &str,
     mut with: HashMap<String, String>,
 ) -> HashMap<String, String> {
-    let default_components = match uses.split_once('@') {
-        Some(("dtolnay/rust-toolchain", "clippy")) => "clippy",
-        Some(("dtolnay/rust-toolchain", "miri")) => "miri, rust-src",
-        _ => return with,
+    let Some(("dtolnay/rust-toolchain", git_ref)) = uses.split_once('@') else {
+        return with;
     };
-    with.entry("components".to_string())
-        .or_insert_with(|| default_components.to_string());
+    if let Some((_, components)) = RUST_TOOLCHAIN_TOOL_BRANCHES
+        .iter()
+        .find(|(branch, _)| *branch == git_ref)
+    {
+        with.entry("components".to_string())
+            .or_insert_with(|| components.to_string());
+    }
     with
 }
 

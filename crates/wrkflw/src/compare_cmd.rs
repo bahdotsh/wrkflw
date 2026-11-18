@@ -700,13 +700,13 @@ fn outcome(remote: &RemoteRun, local: &Value, rows: &[Row]) -> Outcome {
         }
     }
     if compared > 0 {
-        return paired_outcome(remote, status, rows, job_disagreements);
+        return paired_outcome(remote, local, rows, job_disagreements);
     }
     // Every paired job ran as Linux for a Windows one: nothing was compared,
     // though a job only one side has a result for may still disagree.
     let stand_ins = windows_stand_ins(local);
     if stand_ins > 0 {
-        let mut outcome = paired_outcome(remote, status, rows, job_disagreements);
+        let mut outcome = paired_outcome(remote, local, rows, job_disagreements);
         if outcome.disagreements == 0 {
             outcome.basis = "none";
             let not_compared = format!(
@@ -775,10 +775,11 @@ fn unpaired_result(row: &Row) -> Option<&str> {
 /// results too: see [`runs_differ`].
 fn paired_outcome(
     remote: &RemoteRun,
-    status: &str,
+    local: &Value,
     rows: &[Row],
     job_disagreements: usize,
 ) -> Outcome {
+    let status = local["status"].as_str().unwrap_or("unknown");
     let unpaired: Vec<&Row> = rows
         .iter()
         .filter(|r| is_unpaired(r) && unpaired_result(r).is_some())
@@ -795,7 +796,7 @@ fn paired_outcome(
         .filter(|r| unpaired_result(r) == Some("failure"))
         .count();
     let mut disagreements = job_disagreements + one_sided_failures;
-    let runs_differ = runs_differ(remote, status, rows);
+    let runs_differ = runs_differ(remote, local, rows);
     if disagreements == 0 && runs_differ {
         disagreements = 1;
     }
@@ -827,8 +828,8 @@ fn paired_outcome(
     }
 }
 
-/// Whether GitHub's run and the local one, `status`, ended differently,
-/// leaving out the jobs that ran as Linux for Windows ones.
+/// Whether GitHub's run and the `local` one ended differently, leaving out
+/// the jobs that ran as Linux for Windows ones.
 ///
 /// Such a job's result isn't compared, so a run that failed in those jobs
 /// alone counts as one that passed, on either side. A failure anywhere
@@ -836,32 +837,49 @@ fn paired_outcome(
 /// A job that timed out or never started failed too, though no row
 /// compares it; one cancelled did not, as fail-fast cancels the legs
 /// beside a failed one.
-fn runs_differ(remote: &RemoteRun, status: &str, rows: &[Row]) -> bool {
-    let failed = |result: &Option<String>| {
-        matches!(
-            result.as_deref(),
-            Some("failure" | "timed_out" | "startup_failure")
-        )
+///
+/// GitHub's side is read from the rows, which hold every job GitHub ran.
+/// The local side is read from the local run's own jobs, not the rows: a
+/// local job no row pairs, or one that failed though `continue-on-error`
+/// let the run pass, would otherwise go unseen, and a local run that
+/// failed in such a job, or outside any job, would pass for one whose
+/// Windows leg alone failed.
+fn runs_differ(remote: &RemoteRun, local: &Value, rows: &[Row]) -> bool {
+    let failed =
+        |result: Option<&str>| matches!(result, Some("failure" | "timed_out" | "startup_failure"));
+    let github_only_stand_ins = rows
+        .iter()
+        .any(|r| r.stand_in && failed(r.github.as_deref()))
+        && !rows
+            .iter()
+            .any(|r| !r.stand_in && failed(r.github.as_deref()));
+    let local_jobs = local["jobs"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+    // Failed so as to fail the run: `continue-on-error` let it pass.
+    let fails_run = |job: &&Value| {
+        failed(job["status"].as_str()) && job["failure_allowed"] != Value::Bool(true)
     };
-    // A run's failure is the stand-ins' alone when one of them failed and
-    // no other job did.
-    let only_stand_ins_failed = |side: fn(&Row) -> &Option<String>| {
-        rows.iter().any(|r| r.stand_in && failed(side(r)))
-            && !rows.iter().any(|r| !r.stand_in && failed(side(r)))
-    };
-    let without_stand_ins = |result: &str, side: fn(&Row) -> &Option<String>| {
-        if result == "failure" && only_stand_ins_failed(side) {
-            "success".to_string()
+    let local_only_stand_ins = local_jobs
+        .iter()
+        .filter(fails_run)
+        .any(stood_in_for_windows)
+        && local_jobs
+            .iter()
+            .filter(fails_run)
+            .all(stood_in_for_windows);
+    fn without_stand_ins(result: &str, only_stand_ins: bool) -> &str {
+        if result == "failure" && only_stand_ins {
+            "success"
         } else {
-            result.to_string()
+            result
         }
-    };
+    }
     let github = remote
         .conclusion
         .as_deref()
-        .map(|conclusion| without_stand_ins(conclusion, |r| &r.github));
-    let local = without_stand_ins(status, |r| &r.local);
-    agree(github.as_deref(), Some(&local)) == Some(false)
+        .map(|conclusion| without_stand_ins(conclusion, github_only_stand_ins));
+    let status = local["status"].as_str().unwrap_or("unknown");
+    let local = without_stand_ins(status, local_only_stand_ins);
+    agree(github, Some(local)) == Some(false)
 }
 
 /// The `compare` object. `agree` is true only when something was compared
@@ -982,9 +1000,11 @@ pub(crate) async fn run(ctx: CompareCtx) -> ! {
     let mut remote = wrkflw_github::fetch_run(&reference)
         .await
         .unwrap_or_else(|e| {
-            // `fetch_failed`: the sweep tries such a compare again.
+            // `fetch_failed` for an error that passes, which the sweep tries
+            // again; a run that isn't there gets no kind, and isn't.
+            let kind = e.is_transient().then_some("fetch_failed");
             ctx.format
-                .fail_as(Some("fetch_failed"), &format!("cannot fetch the run: {e}"))
+                .fail_as(kind, &format!("cannot fetch the run: {e}"))
         });
     if let Some(before) = remote.before.take().filter(|sha| is_pushed_over(sha)) {
         // `git diff` needs the commit here. A shallow or stale clone may not
@@ -1264,6 +1284,30 @@ mod tests {
         // fail on its own: the run failed in the leg alone.
         let cancelled = compare("failure", "failure", "cancelled");
         assert_eq!(cancelled["agree"], true, "{cancelled}");
+
+        // The local side is read from the local run's own jobs: one no row
+        // pairs failed beside the stand-in, so the local run's failure isn't
+        // the stand-in's alone. One that `continue-on-error` let fail
+        // doesn't fail the run, and excuses nothing.
+        let github = jobs("success", "success");
+        let with_local = |extra: Value| {
+            let mut jobs = local.clone();
+            jobs.push(extra);
+            let local_run = json!({"status": "failure", "verdict": "partial", "jobs": jobs});
+            let rows = rows(&expected, &github, &jobs, &[]);
+            report(&github_run("success", github.clone()), &local_run, &rows)
+        };
+        let unpaired = with_local(json!({"name": "extra", "status": "failure"}));
+        assert_eq!(unpaired["agree"], false, "{unpaired}");
+        assert!(
+            unpaired["problem"]
+                .as_str()
+                .is_some_and(|p| p.contains("The runs' results differ")),
+            "{unpaired}"
+        );
+        let allowed =
+            with_local(json!({"name": "extra", "status": "failure", "failure_allowed": true}));
+        assert_eq!(allowed["agree"], true, "{allowed}");
     }
 
     /// GitHub shows a called workflow's jobs as `<caller> / <job>`; wrkflw

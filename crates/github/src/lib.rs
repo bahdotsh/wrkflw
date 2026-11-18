@@ -31,6 +31,24 @@ pub enum GithubError {
     UnexpectedResponse(String),
 }
 
+impl GithubError {
+    /// Whether the same request may well succeed if tried again: the
+    /// network failed, GitHub had an error of its own, or a rate limit
+    /// stopped it, which passes. Not a run that doesn't exist, or a token
+    /// that can't read it.
+    pub fn is_transient(&self) -> bool {
+        match self {
+            GithubError::RequestError(_) => true,
+            GithubError::ApiError { status, message } => {
+                *status >= 500
+                    || *status == 429
+                    || (*status == 403 && message.to_ascii_lowercase().contains("rate limit"))
+            }
+            _ => false,
+        }
+    }
+}
+
 /// Whether a pull request event started `run`.
 fn is_pull_request_run(run: &serde_json::Value) -> bool {
     run["event"]
@@ -617,6 +635,28 @@ pub async fn fetch_run(reference: &RunReference) -> Result<RemoteRun, GithubErro
 
 #[cfg(test)]
 mod tests {
+    /// A server error or a rate limit is worth trying again; a run that
+    /// isn't there, or a token that can't read it, is not.
+    #[test]
+    fn only_errors_that_pass_are_transient() {
+        let api = |status: u16, message: &str| GithubError::ApiError {
+            status,
+            message: message.to_string(),
+        };
+        assert!(api(502, "Bad Gateway").is_transient());
+        assert!(api(429, "Too Many Requests").is_transient());
+        assert!(api(403, r#"{"message":"API rate limit exceeded for 1.2.3.4."}"#).is_transient());
+        assert!(!api(
+            403,
+            r#"{"message":"Resource not accessible by integration"}"#
+        )
+        .is_transient());
+        assert!(!api(404, "Not Found").is_transient());
+        assert!(!api(401, "Bad credentials").is_transient());
+        assert!(!GithubError::TokenNotFound.is_transient());
+        assert!(!GithubError::UnexpectedResponse("no jobs".to_string()).is_transient());
+    }
+
     use super::*;
 
     #[test]

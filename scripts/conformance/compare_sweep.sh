@@ -92,7 +92,7 @@ while read -r repo run extra <&3; do
   for attempt in 1 2 3; do
     sha=$(gh api "repos/$repo/actions/runs/$run" --jq .head_sha 2>/dev/null) && break
     sha=""
-    sleep $((attempt * 5))
+    (( attempt < 3 )) && sleep $((attempt * 5))
   done
   [[ -n "$sha" ]] || { no_result "$repo" "$run" "cannot read the run"; continue; }
   if [[ ! -d "$dir/.git" ]]; then
@@ -126,7 +126,7 @@ while read -r repo run extra <&3; do
   for attempt in 1 2 3; do
     compare_once
     fetch_failed || break
-    sleep $((attempt * 10))
+    (( attempt < 3 )) && sleep $((attempt * 10))
   done
   seconds=$(( $(date +%s) - start ))
   images_after=$(job_images)

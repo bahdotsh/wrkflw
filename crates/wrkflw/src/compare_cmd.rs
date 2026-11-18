@@ -459,15 +459,13 @@ fn rows(
             github: github_conclusion.clone(),
             local: local_status.map(str::to_string),
             agree,
-            note: join_notes(
-                join_notes(
-                    found
-                        .filter(|(i, _)| fits[*i] > 1)
-                        .map(|(i, r)| ambiguous_note(&r.name, fits[i])),
-                    local_job.and_then(|l| note_for(l, failures, job.runs_docker)),
-                ),
+            note: join_notes([
+                found
+                    .filter(|(i, _)| fits[*i] > 1)
+                    .map(|(i, r)| ambiguous_note(&r.name, fits[i])),
+                local_job.and_then(|l| note_for(l, failures, job.runs_docker)),
                 why_failed,
-            ),
+            ]),
             stand_in,
             unverified,
         });
@@ -526,11 +524,10 @@ fn ambiguous_note(name: &str, count: usize) -> String {
     )
 }
 
-fn join_notes(first: Option<String>, second: Option<String>) -> Option<String> {
-    match (first, second) {
-        (Some(a), Some(b)) => Some(format!("{a}; {b}")),
-        (a, b) => a.or(b),
-    }
+/// The notes that are there, in order, in one.
+fn join_notes(notes: impl IntoIterator<Item = Option<String>>) -> Option<String> {
+    let notes: Vec<String> = notes.into_iter().flatten().collect();
+    (!notes.is_empty()).then(|| notes.join("; "))
 }
 
 /// The workflow file a run names, when it is one in this repository: a

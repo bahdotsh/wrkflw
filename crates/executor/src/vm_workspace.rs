@@ -644,17 +644,25 @@ impl VmWorkspace {
         }
         let id = String::from_utf8_lossy(&started.stdout).trim().to_string();
         track(self.cli, &id);
+        state.helper = Some(id.clone());
         // The volume's own directory is root's when the engine makes it.
         // A workspace kept by a wrkflw from before steps had a user holds
         // root's files throughout, and a step that ran as root since, as in
         // a run with `WRKFLW_STEPS_AS_ROOT`, leaves some: each such entry,
-        // and only those, is handed to [`OWNER`].
-        let own = format!("find {ROOT} ! -user {OWNER} -exec chown -h {OWNER}:{OWNER} {{}} +");
+        // and only those, is handed to [`OWNER`]. As far as it can: an entry
+        // a running step removes mid-walk fails it, and the job's session
+        // checks again before its first step and runs it as root if the
+        // user still can't have everything.
+        let own = format!(
+            "find {ROOT} ! -user {OWNER} -exec chown -h {OWNER}:{OWNER} {{}} + 2>/dev/null; true"
+        );
         let owned = exec_output(self.cli, &id, &["sh", "-c", &own], None)?;
         if !owned.status.success() {
-            return Err(command_failed(&["chown", ROOT], &owned.stderr));
+            wrkflw_logging::debug(&format!(
+                "The workspace volume's files couldn't all be handed to uid {OWNER}: {}",
+                String::from_utf8_lossy(&owned.stderr).trim()
+            ));
         }
-        state.helper = Some(id.clone());
         Ok(id)
     }
 
@@ -696,17 +704,10 @@ impl VmWorkspace {
     fn send(&self, helper: &str, paths: &[PathBuf], volume: &Listing) -> io::Result<()> {
         let mut child = Command::new(self.cli)
             .args([
-                "exec",
-                "-i",
-                helper,
-                "tar",
-                "-C",
-                ROOT,
-                // Each entry names its owner by number: see [`OWNER`].
-                "--same-owner",
-                "--numeric-owner",
-                "-xf",
-                "-",
+                "exec", "-i", helper, "tar", "-C", ROOT,
+                // Run as root, `tar` gives each entry the owner its header
+                // names, by number as the headers name none: see [`OWNER`].
+                "-xf", "-",
             ])
             .stdin(Stdio::piped())
             .stdout(Stdio::null())

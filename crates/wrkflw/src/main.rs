@@ -35,12 +35,22 @@ impl OutputFormat {
     /// Report a terminal error and exit 1: on stderr, and with JSON also as
     /// one `error` object on stdout.
     pub(crate) fn fail(self, message: &str) -> ! {
+        self.fail_as(None, message)
+    }
+
+    /// [`fail`](Self::fail), with the JSON error naming `kind`, a stable
+    /// word a script can match where the message may be reworded.
+    pub(crate) fn fail_as(self, kind: Option<&str>, message: &str) -> ! {
         if self.is_json() {
-            wrkflw_runs::emit_line(&serde_json::json!({
+            let mut error = serde_json::json!({
                 "schema_version": wrkflw_runs::SCHEMA_VERSION,
                 "type": "error",
                 "message": message,
-            }));
+            });
+            if let Some(kind) = kind {
+                error["kind"] = serde_json::json!(kind);
+            }
+            wrkflw_runs::emit_line(&error);
         }
         eprintln!("Error: {}", message);
         std::process::exit(1);

@@ -981,7 +981,11 @@ pub(crate) async fn run(ctx: CompareCtx) -> ! {
     });
     let mut remote = wrkflw_github::fetch_run(&reference)
         .await
-        .unwrap_or_else(|e| ctx.format.fail(&format!("cannot fetch the run: {e}")));
+        .unwrap_or_else(|e| {
+            // `fetch_failed`: the sweep tries such a compare again.
+            ctx.format
+                .fail_as(Some("fetch_failed"), &format!("cannot fetch the run: {e}"))
+        });
     if let Some(before) = remote.before.take().filter(|sha| is_pushed_over(sha)) {
         // `git diff` needs the commit here. A shallow or stale clone may not
         // have it, and then `--diff` is the closest there is.

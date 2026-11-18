@@ -42,12 +42,15 @@ for tool in git gh jq; do
 done
 
 # How many job images the engine holds, or nothing without an engine CLI.
+# The GitHub CLI's layer on a job image is an image of its own, tagged
+# `<tag>-gh-<hash>`: it counts with the image it is on, not as a second.
 engine=""
 for cli in docker podman; do
   if command -v "$cli" >/dev/null && "$cli" info >/dev/null 2>&1; then engine="$cli"; break; fi
 done
 job_images() {
-  [[ -n "$engine" ]] && "$engine" images -q --filter 'reference=wrkflw-combined' 2>/dev/null | sort -u | wc -l | tr -d ' '
+  [[ -n "$engine" ]] && "$engine" images --format '{{.Tag}}' --filter 'reference=wrkflw-combined' 2>/dev/null |
+    sed 's/-gh-[0-9a-f]*$//' | sort -u | wc -l | tr -d ' '
 }
 
 # What compare_expected.tsv says of a run: "agreed differed unverified",
@@ -66,8 +69,7 @@ compare_once() {
       >"$log.json" 2>"$log.log") </dev/null
 }
 fetch_failed() {
-  jq -e 'select(.type == "error") | .message | test("cannot fetch the run")' \
-    "$log.json" >/dev/null 2>&1
+  jq -e 'select(.type == "error" and .kind == "fetch_failed")' "$log.json" >/dev/null 2>&1
 }
 
 failed=0

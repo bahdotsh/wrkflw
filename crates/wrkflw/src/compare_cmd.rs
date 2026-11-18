@@ -836,8 +836,16 @@ fn paired_outcome(
 /// Such a job's result isn't compared, so a run that failed in those jobs
 /// alone counts as one that passed, on either side. A failure anywhere
 /// else still counts: one Windows leg doesn't excuse the rest of the run.
+/// A job that timed out or never started failed too, though no row
+/// compares it; one cancelled did not, as fail-fast cancels the legs
+/// beside a failed one.
 fn runs_differ(remote: &RemoteRun, status: &str, rows: &[Row]) -> bool {
-    let failed = |result: &Option<String>| result.as_deref() == Some("failure");
+    let failed = |result: &Option<String>| {
+        matches!(
+            result.as_deref(),
+            Some("failure" | "timed_out" | "startup_failure")
+        )
+    };
     // A run's failure is the stand-ins' alone when one of them failed and
     // no other job did.
     let only_stand_ins_failed = |side: fn(&Row) -> &Option<String>| {
@@ -1207,11 +1215,11 @@ mod tests {
     fn a_windows_leg_doesnt_hide_a_run_that_ended_differently() {
         let dir = tempfile::tempdir().unwrap();
         let expected = expected_jobs(&write(dir.path(), CI)).unwrap();
-        let jobs = |lint: &str| {
+        let jobs = |windows: &str, lint: &str| {
             vec![
                 remote("Format", "success"),
                 remote("Build (ubuntu-latest)", "success"),
-                remote("Build (windows-latest)", "success"),
+                remote("Build (windows-latest)", windows),
                 remote("lint", lint),
                 remote("deploy / publish", "success"),
             ]
@@ -1224,19 +1232,19 @@ mod tests {
             json!({"name": "lint", "status": "success"}),
         ];
         let local_run = json!({"status": "failure", "verdict": "partial", "jobs": local});
-        let compare = |conclusion: &str, lint: &str| {
-            let github = jobs(lint);
+        let compare = |conclusion: &str, windows: &str, lint: &str| {
+            let github = jobs(windows, lint);
             let rows = rows(&expected, &github, &local, &[]);
             report(&github_run(conclusion, github), &local_run, &rows)
         };
 
         // The local run failed in its Windows stand-in alone: as good as a
         // pass, which is what GitHub's run was.
-        let same = compare("success", "success");
+        let same = compare("success", "success", "success");
         assert_eq!(same["agree"], true, "{same}");
 
         // GitHub's run failed where the local one, stand-in aside, passed.
-        let differs = compare("failure", "timed_out");
+        let differs = compare("failure", "success", "timed_out");
         assert_eq!(differs["agree"], false, "{differs}");
         assert_eq!(differs["disagreements"], 1, "{differs}");
         assert!(
@@ -1245,6 +1253,16 @@ mod tests {
                 .is_some_and(|p| p.contains("The runs' results differ")),
             "{differs}"
         );
+
+        // A job that timed out failed GitHub's run as much as its Windows
+        // leg did, so the leg doesn't excuse it.
+        let both = compare("failure", "failure", "timed_out");
+        assert_eq!(both["agree"], false, "{both}");
+
+        // A job fail-fast cancelled beside the failed Windows leg did not
+        // fail on its own: the run failed in the leg alone.
+        let cancelled = compare("failure", "failure", "cancelled");
+        assert_eq!(cancelled["agree"], true, "{cancelled}");
     }
 
     /// GitHub shows a called workflow's jobs as `<caller> / <job>`; wrkflw

@@ -644,11 +644,12 @@ impl VmWorkspace {
         }
         let id = String::from_utf8_lossy(&started.stdout).trim().to_string();
         track(self.cli, &id);
-        // The volume's own directory is root's when the engine makes it,
-        // and a workspace kept by a wrkflw from before steps had a user
-        // holds root's files throughout. Once: afterwards it is [`OWNER`]'s.
-        let own =
-            format!("[ \"$(stat -c %u {ROOT})\" = {OWNER} ] || chown -R {OWNER}:{OWNER} {ROOT}");
+        // The volume's own directory is root's when the engine makes it.
+        // A workspace kept by a wrkflw from before steps had a user holds
+        // root's files throughout, and a step that ran as root since, as in
+        // a run with `WRKFLW_STEPS_AS_ROOT`, leaves some: each such entry,
+        // and only those, is handed to [`OWNER`].
+        let own = format!("find {ROOT} ! -user {OWNER} -exec chown -h {OWNER}:{OWNER} {{}} +");
         let owned = exec_output(self.cli, &id, &["sh", "-c", &own], None)?;
         if !owned.status.success() {
             return Err(command_failed(&["chown", ROOT], &owned.stderr));

@@ -427,6 +427,19 @@ const ENV_LOADER: &str = "eval \"$(cat)\" && exec env \"$@\"";
 const CAN_WRITE: &str =
     "for dir in \"$@\"; do [ ! -d \"$dir\" ] || [ -w \"$dir\" ] || { echo \"$dir\"; exit 1; }; done";
 
+/// Run as root, hands to the user named first every entry under the
+/// directories that follow that isn't that user's already, or fails naming
+/// the first directory it couldn't. A path that isn't a directory is passed
+/// over.
+///
+/// What a job's steps wrote as root, before steps had a user or in a run
+/// that kept them as root, stays root's in a kept workspace or cache, and
+/// the user could no longer change it. Only what isn't the user's is
+/// touched, so a workspace already the user's costs one walk.
+const HAND_OVER: &str = "user=\"$1\"; shift; for dir in \"$@\"; do [ ! -d \"$dir\" ] || \
+     find \"$dir\" ! -user \"$user\" -exec chown -h \"$user:$user\" {} + || \
+     { echo \"$dir\"; exit 1; }; done";
+
 /// `value` as one word of a POSIX shell script.
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
@@ -897,6 +910,14 @@ fn readiness(status: &str) -> Readiness {
 }
 
 impl JobSession {
+    /// Whether this job's steps may run as the [runner
+    /// user](crate::runner_user): its container is the image wrkflw builds,
+    /// and the run didn't ask for root. Whether they do is only settled once
+    /// the container is up.
+    pub(crate) fn may_run_as_runner_user(&self) -> bool {
+        self.runner_user
+    }
+
     /// Wait for a service's health check, or for it to run if it has none.
     async fn wait_until_ready(&self, name: &str, label: &str) -> Result<(), String> {
         let format = "{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}";
@@ -1053,6 +1074,12 @@ impl JobSession {
     /// files are root's inside the container, or when wrkflw itself runs as
     /// root. The image has no such user when the runner's tools couldn't
     /// be built and the job runs on its bare base image.
+    ///
+    /// Once it can write the mounts themselves, what is in them that isn't
+    /// its own is handed to it: every mount is wrkflw's own directory (a
+    /// job `container:`, whose `volumes:` may not be, never gets the user).
+    /// That only happens after the check, so under a rootless engine,
+    /// where the user's uid isn't this machine's, nothing is handed over.
     async fn step_user(&self, id: &str, volumes: &[(PathBuf, PathBuf)]) -> Option<&'static str> {
         let user = crate::runner_user::NAME;
         let exists: Vec<String> = ["exec", id, "id", "-u", user].map(str::to_string).to_vec();
@@ -1066,34 +1093,54 @@ impl JobSession {
             ));
             return None;
         }
+        let mounted = || {
+            volumes
+                .iter()
+                .map(|(_, container)| container.display().to_string())
+        };
+        let as_root = |reason: String| {
+            wrkflw_logging::warning(&format!(
+                "This job's steps run as root, not as the {} user GitHub's run as: {}",
+                user, reason
+            ));
+            None
+        };
         let mut writable: Vec<String> = ["exec", "--user", user, id, "sh", "-c", CAN_WRITE, "sh"]
             .map(str::to_string)
             .to_vec();
-        writable.extend(
-            volumes
-                .iter()
-                .map(|(_, container)| container.display().to_string()),
-        );
+        writable.extend(mounted());
         match cli_output(self.cli, &writable, None).await {
-            Ok(output) if output.exit_code == 0 => Some(user),
+            Ok(output) if output.exit_code == 0 => {}
             Ok(output) => {
-                wrkflw_logging::warning(&format!(
-                    "This job's steps run as root, not as the {} user GitHub's run as: that \
-                     user can't write {} in the job's container, as under a rootless engine \
-                     or when wrkflw runs as root",
-                    user,
+                return as_root(format!(
+                    "that user can't write {} in the job's container, which happens under a \
+                     rootless engine or when wrkflw runs as root",
                     output.stdout.trim()
-                ));
-                None
+                ))
             }
             Err(e) => {
-                wrkflw_logging::warning(&format!(
-                    "This job's steps run as root: couldn't tell whether the {} user can \
-                     write the job's files: {}",
-                    user, e
-                ));
-                None
+                return as_root(format!(
+                    "couldn't tell whether that user can write the job's files: {}",
+                    e
+                ))
             }
+        }
+        let mut hand_over: Vec<String> = ["exec", id, "sh", "-c", HAND_OVER, "sh", user]
+            .map(str::to_string)
+            .to_vec();
+        hand_over.extend(mounted());
+        match cli_output(self.cli, &hand_over, None).await {
+            Ok(output) if output.exit_code == 0 => Some(user),
+            Ok(output) => as_root(format!(
+                "{} holds files an earlier run left as root's, which couldn't be handed to \
+                 that user: {}",
+                output.stdout.trim(),
+                output.stderr.trim()
+            )),
+            Err(e) => as_root(format!(
+                "couldn't hand that user the files an earlier run left as root's: {}",
+                e
+            )),
         }
     }
 
@@ -1391,6 +1438,26 @@ mod tests {
 
         let fine = check(&[&open, &file, &dir.path().join("missing")]);
         assert!(fine.status.success());
+        // Handing over what is this user's already changes nothing, and
+        // passes over what isn't a directory.
+        let me = String::from_utf8(
+            std::process::Command::new("id")
+                .arg("-un")
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
+        let handed = std::process::Command::new("sh")
+            .args(["-c", HAND_OVER, "sh", me.trim()])
+            .args([&open, &file, &dir.path().join("missing")])
+            .output()
+            .unwrap();
+        assert!(
+            handed.status.success(),
+            "{}",
+            String::from_utf8_lossy(&handed.stderr)
+        );
         // Root may write anywhere, so there the check has nothing to name.
         let is_root = std::process::Command::new("id")
             .arg("-u")
@@ -1663,6 +1730,47 @@ mod tests {
             .lines()
             .filter(|line| line.starts_with(&format!("{} ", verb)))
             .count()
+    }
+
+    /// Steps run as the runner user once it can write the job's mounts and
+    /// has been handed what an earlier run left in them as root's. Where it
+    /// can't write them, as under a rootless engine, nothing is handed over,
+    /// as its uid there isn't this machine's.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn steps_run_as_the_runner_user_once_it_is_handed_the_mounts() {
+        let volumes = &[(PathBuf::from("/h/ws"), PathBuf::from("/github/workspace"))];
+        let user_for = |fails: &'static str| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let (cli, log) = fake_cli(dir.path(), fails);
+            let user = session(cli, Vec::new()).step_user("job", volumes).await;
+            let calls = std::fs::read_to_string(&log).unwrap_or_default();
+            (user, calls)
+        };
+
+        let (user, calls) = user_for("nothing-fails").await;
+        assert_eq!(user, Some("runner"));
+        let lines: Vec<&str> = calls.lines().collect();
+        assert_eq!(lines.len(), 3, "{calls}");
+        assert!(lines[1].contains("exec --user runner job"), "{calls}");
+        // Handed over as root, after the check, for every mount.
+        assert!(lines[2].starts_with("exec exec job sh -c"), "{calls}");
+        assert!(lines[2].contains("chown -h"), "{calls}");
+        assert!(lines[2].ends_with("runner /github/workspace"), "{calls}");
+
+        // The user can't write the mounts: root, and nothing changes hands.
+        let (user, calls) = user_for("exec --user*").await;
+        assert_eq!(user, None);
+        assert!(!calls.contains("chown"), "{calls}");
+
+        // What an earlier run left couldn't be handed over: root.
+        let (user, _) = user_for("*chown*").await;
+        assert_eq!(user, None);
+
+        // No such user in the image.
+        let (user, calls) = user_for("exec job id -u runner").await;
+        assert_eq!(user, None);
+        assert_eq!(calls.lines().count(), 1, "{calls}");
     }
 
     #[cfg(unix)]

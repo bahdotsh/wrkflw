@@ -89,7 +89,7 @@ pub(crate) fn create_script(uid: u32) -> String {
         "(other=\"$(getent passwd {uid} | cut -d: -f1)\"; \
           [ -z \"$other\" ] || [ \"$other\" = {NAME} ] || userdel -r \"$other\" 2>/dev/null || true) && \
          (id -u {NAME} >/dev/null 2>&1 || \
-          useradd --create-home --home-dir {HOME} --uid {uid} --user-group --shell /bin/bash {NAME}) && \
+          useradd --no-log-init --create-home --home-dir {HOME} --uid {uid} --user-group --shell /bin/bash {NAME}) && \
          echo '{NAME} ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/{NAME} && \
          chmod 0440 /etc/sudoers.d/{NAME} && \
          mkdir -p {home_dirs} /opt/hostedtoolcache && \
@@ -155,6 +155,8 @@ mod tests {
         let script = create_script(1000);
         assert!(script.contains("getent passwd 1000"), "{script}");
         assert!(script.contains("--uid 1000 --user-group"), "{script}");
+        // A large uid would otherwise grow a sparse lastlog in the layer.
+        assert!(script.contains("useradd --no-log-init"), "{script}");
         assert!(script.contains("runner ALL=(ALL) NOPASSWD:ALL"), "{script}");
         assert!(
             script.contains("chown -R runner:runner /home/runner"),

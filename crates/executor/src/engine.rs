@@ -6071,7 +6071,13 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
         };
         let cmd_refs: Vec<&str> = cmd_parts.iter().map(String::as_str).collect();
 
-        let dep_mounts = acceleration::dep_cache_mounts(ctx.runtime.mounts_are_copies());
+        let session = job_session::current();
+        let dep_mounts = acceleration::dep_cache_mounts(
+            ctx.runtime.mounts_are_copies(),
+            session
+                .as_ref()
+                .is_some_and(|session| session.may_run_as_runner_user()),
+        );
         let vm_workspace = crate::vm_workspace::before_step(ctx.runtime, ctx.working_dir)
             .await
             .map_err(ExecutionError::Runtime)?;
@@ -6090,7 +6096,7 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
             .collect();
 
         // Execute the command, in the job's container if it has one
-        let session_result = match job_session::current() {
+        let session_result = match session {
             Some(session) => {
                 let resolve = |value: &str| preprocess_with_value(value, &ctx);
                 session
@@ -10456,7 +10462,10 @@ runs:
             |tools| generate_combined_dockerfile(&runtimes, "ubuntu:latest", None, None, tools);
 
         let built_in = dockerfile(RunnerTools::Install);
-        assert!(built_in.contains("useradd --create-home"), "{built_in}");
+        assert!(
+            built_in.contains("useradd --no-log-init --create-home"),
+            "{built_in}"
+        );
         assert!(
             built_in.contains("ENV CARGO_HOME=/home/runner/.cargo\n"),
             "{built_in}"
@@ -10528,7 +10537,10 @@ runs:
             "{shared}"
         );
         // The user steps run as is every leg's, with the packages.
-        assert!(shared.contains("useradd --create-home"), "{shared}");
+        assert!(
+            shared.contains("useradd --no-log-init --create-home"),
+            "{shared}"
+        );
         assert!(!shared.contains("uv python install"), "{shared}");
         // Without a `RUN`, everything is shared.
         assert_eq!(shared_layers("FROM scratch\n"), "FROM scratch\n");

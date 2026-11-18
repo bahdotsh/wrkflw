@@ -52,7 +52,9 @@ const DEP_CACHE_DIRS: &[(&str, &str)] = &[
 /// The home directories a step may have: the runner user's, in the image
 /// wrkflw builds, and root's, in any other and wherever steps can't run as
 /// that user. Which it is isn't known until the job's container is up,
-/// after its mounts are fixed, so each cache is mounted in both.
+/// after its mounts are fixed, so in the image wrkflw builds each cache is
+/// mounted in both. Any other image only gets root's: its own user's home,
+/// even one named `runner`, isn't wrkflw's to mount over.
 const DEP_CACHE_HOMES: &[&str] = &["/root", crate::runner_user::HOME];
 
 /// Files that always count as input, because steps load them without naming
@@ -495,6 +497,8 @@ struct ContainerScope {
     policy: ContainerPolicy,
     /// Set once the run has said its steps run `docker` with no engine.
     warned_of_missing_docker: AtomicBool,
+    /// The GitHub token this run gives its jobs, once a job asked for it.
+    job_token: std::sync::OnceLock<Option<String>>,
 }
 
 /// How the jobs of a run use containers. Unlike the rest of the run's
@@ -624,6 +628,7 @@ pub(crate) async fn with_run_state<F: Future>(state: Arc<RunState>, future: F) -
     let scope = Arc::new(ContainerScope {
         policy,
         warned_of_missing_docker: AtomicBool::new(false),
+        job_token: std::sync::OnceLock::new(),
     });
     CONTAINERS
         .scope(scope, RUN.scope(Some(state), future))
@@ -647,20 +652,47 @@ pub(crate) fn first_missing_docker_warning() -> bool {
         .unwrap_or(true)
 }
 
+/// What `find` gives for this run, the first time a job of it asks:
+/// each run, from the TUI or `watch` too, reads a token that may have
+/// changed since the last and says once that it hands it out. Outside a
+/// run, each call finds it anew.
+pub(crate) fn run_job_token(find: impl FnOnce() -> Option<String>) -> Option<String> {
+    match CONTAINERS.try_with(Arc::clone) {
+        Ok(scope) => scope.job_token.get_or_init(find).clone(),
+        Err(_) => find(),
+    }
+}
+
 /// How this run's jobs use containers, or `None` outside a run that has a
 /// say in it, as a GitLab pipeline's.
 pub(crate) fn container_policy() -> Option<ContainerPolicy> {
     CONTAINERS.try_with(|scope| scope.policy).ok()
 }
 
-/// Host and container paths of the `--dep-cache` mounts.
-pub(crate) fn dep_cache_mounts(mounts_are_copies: bool) -> Vec<(PathBuf, PathBuf)> {
+/// Host and container paths of the `--dep-cache` mounts. `runner_home`
+/// says the step may run as the [runner user](crate::runner_user), so its
+/// home gets the caches too.
+pub(crate) fn dep_cache_mounts(
+    mounts_are_copies: bool,
+    runner_home: bool,
+) -> Vec<(PathBuf, PathBuf)> {
     let Some(run) = current().filter(|run| run.accel.dep_cache && !mounts_are_copies) else {
         return Vec::new();
     };
-    run.dep_mounts
-        .get_or_init(|| create_dep_cache_dirs(&run.root))
-        .clone()
+    in_homes(
+        run.dep_mounts
+            .get_or_init(|| create_dep_cache_dirs(&run.root)),
+        runner_home,
+    )
+}
+
+/// `mounts` less those in the runner user's home, unless `runner_home`.
+fn in_homes(mounts: &[(PathBuf, PathBuf)], runner_home: bool) -> Vec<(PathBuf, PathBuf)> {
+    mounts
+        .iter()
+        .filter(|(_, container)| runner_home || !container.starts_with(crate::runner_user::HOME))
+        .cloned()
+        .collect()
 }
 
 /// The host side of the mounts for the repository at `repo`, under
@@ -1713,6 +1745,15 @@ jobs:
                 PathBuf::from("/home/runner/.cargo/registry")
             ]
         );
+        // An image of the user's own only gets root's.
+        let all = dep_cache_dirs_in(base.path(), first.path());
+        let roots = in_homes(&all, false);
+        assert_eq!(roots.len(), DEP_CACHE_DIRS.len());
+        assert!(
+            roots.iter().all(|(_, c)| c.starts_with("/root")),
+            "{roots:?}"
+        );
+        assert_eq!(in_homes(&all, true), all);
         assert!(mine.iter().all(|dir| dir.is_dir()));
         let theirs = hosts(second.path());
         assert!(mine.iter().all(|dir| !theirs.contains(dir)));

@@ -34,40 +34,37 @@ pub const JOB_GITHUB_TOKEN_ENV: &str = "WRKFLW_JOB_GITHUB_TOKEN";
 /// Off by default, as this is the user's own token, which reaches further
 /// than the one GitHub makes for a run and hands to its steps.
 pub(crate) fn job_github_token() -> Option<String> {
-    static TOKEN: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     if !env_flag(JOB_GITHUB_TOKEN_ENV) {
         return None;
     }
-    TOKEN
-        .get_or_init(|| {
-            let token = job_github_token_from(
-                |name| std::env::var(name).ok(),
-                || {
-                    let output = std::process::Command::new("gh")
-                        .args(["auth", "token"])
-                        .stdin(std::process::Stdio::null())
-                        .output()
-                        .ok()?;
-                    output
-                        .status
-                        .success()
-                        .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
-                },
-            );
-            match &token {
-                Some(_) => wrkflw_logging::warning(
-                    "Jobs get this machine's GitHub token as github.token and \
+    crate::acceleration::run_job_token(|| {
+        let token = job_github_token_from(
+            |name| std::env::var(name).ok(),
+            || {
+                let output = std::process::Command::new("gh")
+                    .args(["auth", "token"])
+                    .stdin(std::process::Stdio::null())
+                    .output()
+                    .ok()?;
+                output
+                    .status
+                    .success()
+                    .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+            },
+        );
+        match &token {
+            Some(_) => wrkflw_logging::warning(
+                "Jobs get this machine's GitHub token as github.token and \
                      secrets.GITHUB_TOKEN (WRKFLW_JOB_GITHUB_TOKEN). It is your own token: \
                      it can do what you can, not just what a run's token can",
-                ),
-                None => wrkflw_logging::warning(
-                    "WRKFLW_JOB_GITHUB_TOKEN is set, but there is no token to give jobs: \
+            ),
+            None => wrkflw_logging::warning(
+                "WRKFLW_JOB_GITHUB_TOKEN is set, but there is no token to give jobs: \
                      set GITHUB_TOKEN, or sign in with `gh auth login`",
-                ),
-            }
-            token
-        })
-        .clone()
+            ),
+        }
+        token
+    })
 }
 
 /// [`job_github_token`] with `var` reading an environment variable and

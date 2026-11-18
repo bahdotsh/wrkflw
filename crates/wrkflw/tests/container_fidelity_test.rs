@@ -192,6 +192,50 @@ jobs:
     assert_ok(&run(dir.path(), &[]));
 }
 
+/// A composite action that fails still hands on what its earlier steps
+/// wrote to `$GITHUB_PATH`, as on GitHub, where each of its steps' writes
+/// apply to the job as soon as that step ends.
+#[test]
+fn a_failed_composite_actions_path_still_reaches_the_job() {
+    if !docker_answers() {
+        eprintln!("skipped: Docker isn't available");
+        return;
+    }
+    let action = r#"
+name: install then fail
+runs:
+  using: composite
+  steps:
+    - shell: sh
+      run: |
+        mkdir -p /opt/tool/bin
+        printf '#!/bin/sh\necho tool-ok\n' > /opt/tool/bin/mytool
+        chmod +x /opt/tool/bin/mytool
+        echo /opt/tool/bin >> "$GITHUB_PATH"
+    - shell: sh
+      run: exit 1
+"#;
+    let workflow = r#"
+name: ci
+on: push
+jobs:
+  tool:
+    runs-on: ubuntu-latest
+    container: alpine:3.20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/install
+        continue-on-error: true
+      - shell: sh
+        run: test "$(mytool)" = tool-ok
+"#;
+    let dir = repo(&[
+        (".github/workflows/ci.yml", workflow),
+        (".github/actions/install/action.yml", action),
+    ]);
+    assert_ok(&run(dir.path(), &[]));
+}
+
 /// What a step installs outside the workspace is there for the next step,
 /// as on GitHub, where a job's steps share a machine. With a container per
 /// step it is gone, which is what `--step-containers` asks for.

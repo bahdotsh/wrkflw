@@ -308,6 +308,85 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    /// A job's environment whose `$GITHUB_ENV` and `$GITHUB_PATH` are files
+    /// in `dir`, with `PATH` set to `/usr/bin`.
+    fn job_env_in(dir: &Path) -> HashMap<String, String> {
+        let mut env = HashMap::new();
+        for name in ["GITHUB_ENV", "GITHUB_PATH", "GITHUB_OUTPUT"] {
+            let file = dir.join(name.to_ascii_lowercase());
+            fs::write(&file, "").unwrap();
+            env.insert(name.to_string(), file.display().to_string());
+        }
+        env.insert("PATH".to_string(), "/usr/bin".to_string());
+        env
+    }
+
+    /// Run one step's writes through `apply_step_environment_updates`, as
+    /// the engine does after each step.
+    fn step(
+        env: &mut HashMap<String, String>,
+        env_lines: &str,
+        path_lines: &str,
+    ) -> AppliedEnvironment {
+        fs::write(&env["GITHUB_ENV"], env_lines).unwrap();
+        fs::write(&env["GITHUB_PATH"], path_lines).unwrap();
+        apply_step_environment_updates(env, &mut HashMap::new(), &mut HashMap::new(), None)
+    }
+
+    /// What a composite action's steps write reaches the job as it would
+    /// have had the job run those steps itself: the later value of a
+    /// variable wins, the later directory goes first, and a value of
+    /// several lines keeps them.
+    #[test]
+    fn a_composites_environment_reaches_the_job_as_its_steps_left_it() {
+        let dir = tempdir().unwrap();
+        let mut job = job_env_in(dir.path());
+        // The composite's steps write to the same files as the job's step.
+        let mut action = job.clone();
+        let mut applied = AppliedEnvironment::default();
+        applied.then(step(&mut action, "TOOL=one\nKEEP=yes\n", "/opt/a\n"));
+        applied.then(step(
+            &mut action,
+            "TOOL=two\nNOTES<<EOF\nline one\nghadelimiter\nEOF\n",
+            "/opt/b\n",
+        ));
+        assert_eq!(applied.path_entries, ["/opt/b", "/opt/a"]);
+
+        applied.write_to(&job).unwrap();
+        step_after_handing_on(&mut job);
+        assert_eq!(job["TOOL"], "two");
+        assert_eq!(job["KEEP"], "yes");
+        assert_eq!(job["NOTES"], "line one\nghadelimiter");
+        assert_eq!(job["PATH"], action["PATH"]);
+        assert_eq!(job["PATH"], "/opt/b:/opt/a:/usr/bin");
+    }
+
+    /// The engine applies the calling step's files once the composite ends.
+    fn step_after_handing_on(job: &mut HashMap<String, String>) {
+        apply_step_environment_updates(job, &mut HashMap::new(), &mut HashMap::new(), None);
+    }
+
+    /// The calling step's own writes, made before the composite hands its
+    /// entries on, are kept, and nothing is written for nothing applied.
+    #[test]
+    fn handing_on_appends_to_what_the_calling_step_wrote() {
+        let dir = tempdir().unwrap();
+        let mut job = job_env_in(dir.path());
+        fs::write(&job["GITHUB_ENV"], "OWN=1\n").unwrap();
+        AppliedEnvironment::default().write_to(&job).unwrap();
+        assert_eq!(fs::read_to_string(&job["GITHUB_PATH"]).unwrap(), "");
+
+        let applied = AppliedEnvironment {
+            env_vars: vec![("FROM_COMPOSITE".to_string(), "2".to_string())],
+            path_entries: Vec::new(),
+        };
+        applied.write_to(&job).unwrap();
+        step_after_handing_on(&mut job);
+        assert_eq!(job["OWN"], "1");
+        assert_eq!(job["FROM_COMPOSITE"], "2");
+        assert_eq!(job["PATH"], "/usr/bin");
+    }
+
     #[test]
     fn parse_simple_kv() {
         let content = "key=value\nother=thing";

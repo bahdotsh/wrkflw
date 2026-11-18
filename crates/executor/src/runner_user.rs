@@ -28,14 +28,17 @@ pub const STEPS_AS_ROOT_ENV: &str = "WRKFLW_STEPS_AS_ROOT";
 
 /// The uid the user gets in images built on this machine.
 ///
-/// A workspace that is this machine's directory, bind-mounted, holds files
-/// owned by whoever runs wrkflw, and a container user with another uid
-/// could neither change them nor leave files this user can remove. So the
-/// user takes that uid. A workspace in a volume holds files wrkflw copies
-/// in, which it gives to [`HOSTED_UID`], as it does where the engine's VM
-/// maps a bind mount's owner to whoever reads it, on macOS and Windows.
+/// On Linux a bind mount keeps this machine's owners, and the job's
+/// workspace, its `$GITHUB_ENV` files and the `--dep-cache` directories are
+/// all bind-mounted, holding files owned by whoever runs wrkflw: a container
+/// user with another uid could neither change them nor leave files this
+/// user can remove. So the user takes that uid, also when the workspace is
+/// in a volume, whose files wrkflw gives to this same uid (see
+/// `vm_workspace`). Elsewhere, on macOS and Windows, the engine's VM maps a
+/// bind mount's owner to whoever reads it, and the user gets
+/// [`HOSTED_UID`], as on GitHub.
 pub(crate) fn uid() -> u32 {
-    uid_for(host_uid(), crate::vm_workspace::volume_mode())
+    uid_for(host_uid())
 }
 
 /// The uids Debian and Ubuntu give people's accounts. Below them are root
@@ -44,12 +47,12 @@ pub(crate) fn uid() -> u32 {
 /// range is taken.
 const USER_UIDS: std::ops::Range<u32> = 1000..60000;
 
-fn uid_for(host_uid: Option<u32>, workspace_in_volume: bool) -> u32 {
+fn uid_for(host_uid: Option<u32>) -> u32 {
     match host_uid {
         // Root's files are root's, and a system account's are its own: the
         // user gets GitHub's uid, can't write them, and the session finds
         // that out and runs the steps as root.
-        Some(uid) if USER_UIDS.contains(&uid) && !workspace_in_volume => uid,
+        Some(uid) if USER_UIDS.contains(&uid) => uid,
         _ => HOSTED_UID,
     }
 }
@@ -140,27 +143,25 @@ pub(crate) fn own_script(language: &str) -> Option<String> {
 mod tests {
     use super::*;
 
-    /// The user takes the uid of whoever owns a bind-mounted workspace's
-    /// files, and GitHub's own everywhere else.
+    /// The user takes the uid of whoever owns the job's bind-mounted
+    /// files on Linux, workspace in a volume or not, and GitHub's own where
+    /// the VM maps the owner.
     #[test]
-    fn the_user_takes_the_uid_that_owns_the_workspace() {
-        // Linux, the directory bind-mounted: this user's files.
-        assert_eq!(uid_for(Some(1000), false), 1000);
-        assert_eq!(uid_for(Some(1001), false), HOSTED_UID);
+    fn the_user_takes_the_uid_that_owns_the_jobs_files() {
+        // Linux: this user's files.
+        assert_eq!(uid_for(Some(1000)), 1000);
+        assert_eq!(uid_for(Some(1001)), HOSTED_UID);
         // Root's files can't be another user's: the hosted uid, and the
         // session falls back to root.
-        assert_eq!(uid_for(Some(0), false), HOSTED_UID);
+        assert_eq!(uid_for(Some(0)), HOSTED_UID);
         // Nor is a system account's uid taken, or `nobody`'s, whose
         // accounts the image has and would lose.
-        assert_eq!(uid_for(Some(42), false), HOSTED_UID);
-        assert_eq!(uid_for(Some(999), false), HOSTED_UID);
-        assert_eq!(uid_for(Some(65534), false), HOSTED_UID);
-        assert_eq!(uid_for(Some(59999), false), 59999);
-        // A volume holds what wrkflw copies in.
-        assert_eq!(uid_for(Some(1000), true), HOSTED_UID);
+        assert_eq!(uid_for(Some(42)), HOSTED_UID);
+        assert_eq!(uid_for(Some(999)), HOSTED_UID);
+        assert_eq!(uid_for(Some(65534)), HOSTED_UID);
+        assert_eq!(uid_for(Some(59999)), 59999);
         // macOS and Windows: the VM maps the owner.
-        assert_eq!(uid_for(None, false), HOSTED_UID);
-        assert_eq!(uid_for(None, true), HOSTED_UID);
+        assert_eq!(uid_for(None), HOSTED_UID);
     }
 
     #[test]

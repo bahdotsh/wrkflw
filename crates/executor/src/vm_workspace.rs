@@ -64,9 +64,14 @@ const VOLUME_PREFIX: &str = "wrkflw-ws-";
 const ROOT: &str = "/ws";
 /// The uid and gid that own what is copied into the volume: the [runner
 /// user](crate::runner_user)'s, which a job's steps run as in the image
-/// wrkflw builds, so they can change the files they are given. A step that
-/// runs as root can change them whoever owns them.
-const OWNER: u32 = crate::runner_user::HOSTED_UID;
+/// wrkflw builds, so they can change the files they are given. It is the
+/// one the user has in the image, so on Linux, where that is this machine's
+/// uid, the volume agrees with the job's bind mounts, such as its
+/// `$GITHUB_ENV` files and dependency caches. A step that runs as root can
+/// change them whoever owns them.
+fn owner() -> u32 {
+    crate::runner_user::uid()
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Kind {
@@ -118,7 +123,7 @@ fn wanted(on_by_default: bool, setting: Option<&str>) -> bool {
 
 /// True when this run gives steps the workspace in a volume: by default on
 /// macOS, and wherever [`MOUNT_ENV`] asks for it.
-pub(crate) fn volume_mode() -> bool {
+fn volume_mode() -> bool {
     let setting = std::env::var(MOUNT_ENV).ok();
     wanted(cfg!(target_os = "macos"), setting.as_deref())
 }
@@ -649,17 +654,18 @@ impl VmWorkspace {
         // A workspace kept by a wrkflw from before steps had a user holds
         // root's files throughout, and a step that ran as root since, as in
         // a run with `WRKFLW_STEPS_AS_ROOT`, leaves some: each such entry,
-        // and only those, is handed to [`OWNER`]. As far as it can: an entry
+        // and only those, is handed to [`owner`]. As far as it can: an entry
         // a running step removes mid-walk fails it, and the job's session
         // checks again before its first step and runs it as root if the
         // user still can't have everything.
+        let owner = owner();
         let own = format!(
-            "find {ROOT} ! -user {OWNER} -exec chown -h {OWNER}:{OWNER} {{}} + 2>/dev/null; true"
+            "find {ROOT} ! -user {owner} -exec chown -h {owner}:{owner} {{}} + 2>/dev/null; true"
         );
         let owned = exec_output(self.cli, &id, &["sh", "-c", &own], None)?;
         if !owned.status.success() {
             wrkflw_logging::debug(&format!(
-                "The workspace volume's files couldn't all be handed to uid {OWNER}: {}",
+                "The workspace volume's files couldn't all be handed to uid {owner}: {}",
                 String::from_utf8_lossy(&owned.stderr).trim()
             ));
         }
@@ -706,7 +712,7 @@ impl VmWorkspace {
             .args([
                 "exec", "-i", helper, "tar", "-C", ROOT,
                 // Run as root, `tar` gives each entry the owner its header
-                // names, by number as the headers name none: see [`OWNER`].
+                // names, by number as the headers name none: see [`owner`].
                 "-xf", "-",
             ])
             .stdin(Stdio::piped())
@@ -1200,9 +1206,11 @@ fn append_host_entry<W: Write>(
     let meta = std::fs::symlink_metadata(full)?;
     let mut header = tar::Header::new_gnu();
     header.set_metadata(&meta);
-    // Not this machine's owner, which means nothing in the volume.
-    header.set_uid(OWNER.into());
-    header.set_gid(OWNER.into());
+    // The runner user's, not the file's here: off Linux this machine's
+    // owner means nothing in the volume.
+    let owner = owner();
+    header.set_uid(owner.into());
+    header.set_gid(owner.into());
     let file_type = meta.file_type();
     if file_type.is_file() {
         #[cfg(not(unix))]
@@ -2124,7 +2132,7 @@ mod tests {
                 )
             })
             .collect();
-        let owner = u64::from(OWNER);
+        let owner = u64::from(owner());
         assert_eq!(
             entries,
             [

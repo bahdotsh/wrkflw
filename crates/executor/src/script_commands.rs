@@ -16,7 +16,7 @@
 use wrkflw_parser::workflow::Step;
 
 /// Whether a `run:` step of `steps` runs one of `commands`.
-pub(crate) fn steps_run(steps: &[Step], commands: &[&str]) -> bool {
+pub fn steps_run(steps: &[Step], commands: &[&str]) -> bool {
     steps
         .iter()
         .filter_map(|step| step.run.as_deref())

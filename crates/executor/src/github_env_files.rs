@@ -143,13 +143,21 @@ pub fn read_step_environment_updates(job_env: &HashMap<String, String>) -> StepE
 /// - Merges GITHUB_ENV entries into `job_env`
 /// - Prepends GITHUB_PATH entries to the PATH in `job_env`
 /// - Clears per-step files so the next step starts fresh
+///
+/// Returns the `$GITHUB_ENV` and `$GITHUB_PATH` entries it applied, so a
+/// composite action can hand them on to the job that called it.
 pub fn apply_step_environment_updates(
     job_env: &mut HashMap<String, String>,
     job_user_env: &mut HashMap<String, String>,
     step_outputs_map: &mut HashMap<String, HashMap<String, String>>,
     step_id: Option<&str>,
-) {
+) -> AppliedEnvironment {
     let updates = read_step_environment_updates(job_env);
+    let mut applied = AppliedEnvironment {
+        env_vars: updates.env_vars.clone().into_iter().collect(),
+        path_entries: updates.path_entries.clone(),
+    };
+    applied.env_vars.sort();
 
     // Store step outputs keyed by step ID for ${{ steps.<id>.outputs.<key> }}
     if let Some(id) = step_id {
@@ -194,6 +202,89 @@ pub fn apply_step_environment_updates(
 
     // Clear files so the next step doesn't re-process these entries
     clear_step_files(job_env);
+    applied
+}
+
+/// The `$GITHUB_ENV` and `$GITHUB_PATH` entries one or more steps wrote.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct AppliedEnvironment {
+    /// `$GITHUB_ENV` entries, in the order a later one overrides an earlier one.
+    pub env_vars: Vec<(String, String)>,
+    /// `$GITHUB_PATH` entries, in the order they end up on `PATH`.
+    pub path_entries: Vec<String>,
+}
+
+impl AppliedEnvironment {
+    /// Add what a later step applied: its variables override, and its
+    /// directories go in front, as they do on `PATH`.
+    pub fn then(&mut self, later: AppliedEnvironment) {
+        self.env_vars.extend(later.env_vars);
+        let mut path_entries = later.path_entries;
+        path_entries.append(&mut self.path_entries);
+        self.path_entries = path_entries;
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.env_vars.is_empty() && self.path_entries.is_empty()
+    }
+
+    /// Append these entries to the `$GITHUB_ENV` and `$GITHUB_PATH` files
+    /// named in `caller_env`, so they apply when the calling step finishes,
+    /// as a composite action's do on GitHub.
+    pub fn write_to(&self, caller_env: &HashMap<String, String>) -> std::io::Result<()> {
+        use std::io::Write;
+        if !self.env_vars.is_empty() {
+            if let Some(path) = caller_env.get("GITHUB_ENV") {
+                let mut f = fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)?;
+                for (key, value) in &self.env_vars {
+                    write_kv_entry(&mut f, key, value)?;
+                }
+            }
+        }
+        if !self.path_entries.is_empty() {
+            if let Some(path) = caller_env.get("GITHUB_PATH") {
+                let mut f = fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)?;
+                for entry in &self.path_entries {
+                    writeln!(f, "{}", entry)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Write `key=value` in the `$GITHUB_OUTPUT`/`$GITHUB_ENV` format, as a
+/// heredoc when the value has more than one line.
+pub fn write_kv_entry(f: &mut impl std::io::Write, key: &str, value: &str) -> std::io::Result<()> {
+    if value.contains('\n') {
+        let delim = heredoc_delimiter(value);
+        writeln!(f, "{}<<{}", key, delim)?;
+        write!(f, "{}", value)?;
+        if !value.ends_with('\n') {
+            writeln!(f)?;
+        }
+        writeln!(f, "{}", delim)
+    } else {
+        writeln!(f, "{}={}", key, value)
+    }
+}
+
+/// A heredoc delimiter that isn't a line of `value`.
+pub fn heredoc_delimiter(value: &str) -> String {
+    let base = "ghadelimiter";
+    let mut candidate = base.to_string();
+    let mut counter: u64 = 0;
+    while value.lines().any(|line| line == candidate) {
+        counter += 1;
+        candidate = format!("{}_{}", base, counter);
+    }
+    candidate
 }
 
 /// Truncate environment files between steps.

@@ -674,16 +674,19 @@ fn copy_directory_contents_with_gitignore(
         let entry = entry.map_err(|e| io_err("Failed to read entry", e))?;
         let path = entry.path();
         let name = entry.file_name();
-        let is_dir = path.is_dir();
-        if path.is_symlink()
-            || !rules.syncs(&path, &name.to_string_lossy(), is_dir, nested, only_tracked)
-        {
+        // A symlink is copied as a link, as git checks one out, and never
+        // followed: where it points is the job's business, not this sync's.
+        let is_link = entry.file_type().is_ok_and(|t| t.is_symlink());
+        let is_dir = !is_link && path.is_dir();
+        if !rules.syncs(&path, &name.to_string_lossy(), is_dir, nested, only_tracked) {
             continue;
         }
         synced.insert(name.clone());
         let dest_path = to.join(&name);
 
-        if is_dir {
+        if is_link {
+            sync_symlink(&path, &dest_path)?;
+        } else if is_dir {
             ensure_real_dir(&dest_path).map_err(|e| io_err("Failed to create dir", e))?;
             // An ignored directory is only entered for what git tracks in it.
             let inner_only_tracked = only_tracked || rules.ignored(&path, true, nested);
@@ -807,6 +810,46 @@ fn unchanged_copy(from: &Path, to: &Path) -> bool {
 /// modification time so build tools see the file as unchanged. Read-only
 /// files, such as generated code or git objects, are replaced and keep
 /// their time too.
+/// Make `to` a symlink with the same target as the symlink `from`. Neither
+/// link is followed; whatever is at `to` is replaced, not written through.
+fn sync_symlink(from: &Path, to: &Path) -> Result<(), ExecutionError> {
+    let err = |what: &str, e: std::io::Error| {
+        ExecutionError::Execution(format!("{what} {}: {e}", to.display()))
+    };
+    let target = std::fs::read_link(from).map_err(|e| err("Failed to read the link for", e))?;
+    if let Ok(current) = std::fs::read_link(to) {
+        if current == target {
+            return Ok(());
+        }
+    }
+    if to.symlink_metadata().is_ok() {
+        remove_entry(to).map_err(|e| err("Failed to replace", e))?;
+    }
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(&target, to).map_err(|e| err("Failed to create link", e))
+    }
+    #[cfg(windows)]
+    {
+        // Windows needs to know what kind of link to make, and to be
+        // allowed to make one; a link that can't be made is left out, as
+        // before.
+        let points_at_dir = from
+            .parent()
+            .map(|p| p.join(&target))
+            .is_some_and(|t| t.is_dir());
+        let made = if points_at_dir {
+            std::os::windows::fs::symlink_dir(&target, to)
+        } else {
+            std::os::windows::fs::symlink_file(&target, to)
+        };
+        if let Err(e) = made {
+            wrkflw_logging::debug(&format!("Leaving out the link {}: {}", to.display(), e));
+        }
+        Ok(())
+    }
+}
+
 fn sync_file(from: &Path, to: &Path) -> Result<(), ExecutionError> {
     let source = std::fs::metadata(from)
         .map_err(|e| ExecutionError::Execution(format!("Failed to read file: {}", e)))?;
@@ -1227,6 +1270,70 @@ mod tests {
             std::fs::read_to_string(dst.path().join("main.c")).unwrap(),
             "source"
         );
+    }
+
+    /// A repository's symlinks are part of its checkout, as links: test
+    /// fixtures such as commander.js's `tests/fixtures/pmlink` rely on them.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_in_the_source_is_checked_out_as_a_link() {
+        use std::os::unix::fs::symlink;
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(src.path().join("fixtures")).unwrap();
+        std::fs::write(src.path().join("fixtures/real.js"), "real").unwrap();
+        symlink("real.js", src.path().join("fixtures/link.js")).unwrap();
+        symlink("link.js", src.path().join("fixtures/chained.js")).unwrap();
+        symlink("fixtures", src.path().join("dirlink")).unwrap();
+        symlink("missing.js", src.path().join("fixtures/dangling.js")).unwrap();
+        // A link out of the repository is copied as it is, not followed.
+        std::fs::write(outside.path().join("secret"), "outside").unwrap();
+        symlink(outside.path().join("secret"), src.path().join("abs")).unwrap();
+
+        copy_directory_contents(src.path(), dst.path()).unwrap();
+        // A second sync keeps the links as they are.
+        copy_directory_contents(src.path(), dst.path()).unwrap();
+
+        let link = |rel: &str| std::fs::read_link(dst.path().join(rel)).unwrap();
+        assert_eq!(link("fixtures/link.js"), Path::new("real.js"));
+        assert_eq!(link("fixtures/chained.js"), Path::new("link.js"));
+        assert_eq!(link("fixtures/dangling.js"), Path::new("missing.js"));
+        assert_eq!(link("dirlink"), Path::new("fixtures"));
+        assert_eq!(link("abs"), outside.path().join("secret"));
+        assert_eq!(
+            std::fs::read_to_string(dst.path().join("fixtures/chained.js")).unwrap(),
+            "real"
+        );
+        // The directory a link points to wasn't copied a second time.
+        assert!(dst.path().join("fixtures/real.js").is_file());
+    }
+
+    /// A link the repository changes or removes is changed or removed in
+    /// the workspace, and a step's own link where a file belongs goes.
+    #[cfg(unix)]
+    #[test]
+    fn a_changed_symlink_is_updated_and_a_removed_one_goes() {
+        use std::os::unix::fs::symlink;
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("a"), "a").unwrap();
+        std::fs::write(src.path().join("b"), "b").unwrap();
+        symlink("a", src.path().join("current")).unwrap();
+        symlink("a", src.path().join("old")).unwrap();
+        copy_directory_contents(src.path(), dst.path()).unwrap();
+
+        std::fs::remove_file(src.path().join("current")).unwrap();
+        symlink("b", src.path().join("current")).unwrap();
+        std::fs::remove_file(src.path().join("old")).unwrap();
+        copy_directory_contents(src.path(), dst.path()).unwrap();
+
+        assert_eq!(
+            std::fs::read_link(dst.path().join("current")).unwrap(),
+            Path::new("b")
+        );
+        assert!(dst.path().join("old").symlink_metadata().is_err());
+        assert_eq!(std::fs::read_to_string(dst.path().join("a")).unwrap(), "a");
     }
 
     #[test]

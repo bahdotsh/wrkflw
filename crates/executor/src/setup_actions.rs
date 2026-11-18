@@ -725,7 +725,7 @@ pub(crate) fn detect_setup_in(steps: &[Step], root: &Path) -> SetupDetection {
                 // Some actions encode the version in the @ref (e.g., dtolnay/rust-toolchain@nightly).
                 // Skip bare git SHAs — they pin the action version, not the toolchain.
                 if def.version_from_ref {
-                    git_ref.filter(|r| !is_git_sha(r)).map(|r| r.to_string())
+                    git_ref.and_then(|r| toolchain_from_ref(repo, r))
                 } else {
                     None
                 }
@@ -768,6 +768,13 @@ pub(crate) fn detect_setup_in(steps: &[Step], root: &Path) -> SetupDetection {
                         .flatten()
                 })
                 .unwrap_or(ver)
+        } else {
+            ver
+        };
+        // setup-go takes a semver range, such as `^1.22`, and installs the
+        // newest release in it.
+        let ver = if def.language == "go" {
+            go_line_for_range(&ver).unwrap_or(ver)
         } else {
             ver
         };
@@ -881,11 +888,10 @@ pub(crate) fn detect_setup_in(steps: &[Step], root: &Path) -> SetupDetection {
             if !repos.contains(&repo) {
                 continue;
             }
-            if let Some(with) = &step.with {
-                for command in rust_toolchain_extras(with, static_input) {
-                    if !extras.contains(&command) {
-                        extras.push(command);
-                    }
+            let with = with_ref_defaults(uses, step.with.clone().unwrap_or_default());
+            for command in rust_toolchain_extras(&with, static_input) {
+                if !extras.contains(&command) {
+                    extras.push(command);
                 }
             }
         }
@@ -1095,6 +1101,47 @@ fn go_prerelease(version: &str) -> Option<String> {
         .then(|| format!("go{}{}{}", line, kind, number))
 }
 
+/// The Go version whose newest release is the newest one the semver range
+/// `range` allows, as setup-go picks it: `^1.22` and `>=1.22` allow any
+/// later 1.x, so `1`; `~1.22.3` allows 1.22.x, so `1.22`. `None` for a
+/// version that isn't such a range, or one bounded from above, which this
+/// can't honour.
+fn go_line_for_range(range: &str) -> Option<String> {
+    let numeric = |v: &str| {
+        let parts: Vec<&str> = v.split('.').collect();
+        (1..=3).contains(&parts.len())
+            && parts
+                .iter()
+                .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+    };
+    let range = range.trim();
+    if let Some(v) = range
+        .strip_prefix('^')
+        .map(str::trim)
+        .filter(|v| numeric(v))
+    {
+        let major = v.split('.').next()?;
+        // `^0.x` allows the minor alone, as semver reads a 0 major.
+        return Some(if major == "0" {
+            v.split('.').take(2).collect::<Vec<_>>().join(".")
+        } else {
+            major.to_string()
+        });
+    }
+    if let Some(v) = range
+        .strip_prefix('~')
+        .map(str::trim)
+        .filter(|v| numeric(v))
+    {
+        return Some(v.split('.').take(2).collect::<Vec<_>>().join("."));
+    }
+    range
+        .strip_prefix(">=")
+        .map(str::trim)
+        .is_some_and(numeric)
+        .then(|| "stable".to_string())
+}
+
 /// Whether [`go_release`] can name the release `version` asks for. Anything
 /// else is refused before the image build, where it would fail the job.
 fn go_release_known(version: &str) -> bool {
@@ -1222,6 +1269,46 @@ pub(crate) fn runner_node_install() -> String {
     )
 }
 
+/// The toolchain a Rust toolchain action's `@ref` names, if it names one.
+/// `dtolnay/rust-toolchain` has a branch per toolchain (`stable`, `1.85`,
+/// `nightly-2025-01-01`), and `clippy` and `miri` branches that install
+/// nightly with those components. Its `master` and a SHA pin the action, not
+/// a toolchain, as every `actions-rs/toolchain` ref does.
+pub(crate) fn toolchain_from_ref(repo: &str, git_ref: &str) -> Option<String> {
+    if repo != "dtolnay/rust-toolchain" || is_git_sha(git_ref) {
+        return None;
+    }
+    match git_ref {
+        "master" | "main" | "comment" => None,
+        "clippy" | "miri" => Some("nightly".to_string()),
+        // A tag such as `v1` is the action's own version.
+        r if r.strip_prefix('v').is_some_and(|rest| {
+            !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit() || c == '.')
+        }) =>
+        {
+            None
+        }
+        r => Some(r.to_string()),
+    }
+}
+
+/// A Rust toolchain step's `with:` with the defaults its `@ref` gives: the
+/// `clippy` branch of `dtolnay/rust-toolchain` adds `clippy` and the `miri`
+/// branch `miri, rust-src`, unless the step names its own `components`.
+pub(crate) fn with_ref_defaults(
+    uses: &str,
+    mut with: HashMap<String, String>,
+) -> HashMap<String, String> {
+    let default_components = match uses.split_once('@') {
+        Some(("dtolnay/rust-toolchain", "clippy")) => "clippy",
+        Some(("dtolnay/rust-toolchain", "miri")) => "miri, rust-src",
+        _ => return with,
+    };
+    with.entry("components".to_string())
+        .or_insert_with(|| default_components.to_string());
+    with
+}
+
 /// The `rustup` commands that add what a Rust toolchain step's `components`
 /// and `targets` (or `target`) inputs ask for, empty if it asks for none.
 /// Names are split on commas and whitespace, as `dtolnay/rust-toolchain`
@@ -1273,6 +1360,29 @@ pub(crate) fn static_input(value: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// setup-go takes a semver range and installs the newest release in it.
+    #[test]
+    fn a_go_range_installs_the_newest_release_it_allows() {
+        assert_eq!(go_line_for_range("^1.22").as_deref(), Some("1"));
+        assert_eq!(go_line_for_range("^1.22.3").as_deref(), Some("1"));
+        assert_eq!(go_line_for_range("^0.9").as_deref(), Some("0.9"));
+        assert_eq!(go_line_for_range("~1.22.3").as_deref(), Some("1.22"));
+        assert_eq!(go_line_for_range(">=1.22").as_deref(), Some("stable"));
+        assert_eq!(go_line_for_range(">=1.22 <1.24"), None);
+        assert_eq!(go_line_for_range("1.22"), None);
+        assert_eq!(go_line_for_range("^$(id)"), None);
+
+        let with = HashMap::from([("go-version".to_string(), "^1.22".to_string())]);
+        let mut step = Step::with_run("setup-go", "");
+        step.run = None;
+        step.uses = Some("actions/setup-go@v5".to_string());
+        step.with = Some(with);
+        let runtimes = detect_setup_runtimes(&[step]);
+        assert_eq!(runtimes.len(), 1, "the range was refused");
+        assert_eq!(runtimes[0].version, "1");
+        assert!(runtimes[0].floating);
+    }
 
     fn run_step(run: &str) -> Step {
         Step::with_run("step", run)

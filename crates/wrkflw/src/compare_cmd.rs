@@ -38,9 +38,25 @@ struct ExpectedJob {
     /// can hold the same value, and GitHub prints it twice.
     github_base: String,
     matrix_values: Option<Vec<String>>,
+    /// The job calls a reusable workflow: GitHub shows each of that
+    /// workflow's jobs as `<this job's name> / <its name>`, and wrkflw
+    /// reports one result for them all.
+    called: bool,
+    /// The job's steps run `docker`, which needs `--docker-in-jobs` locally.
+    runs_docker: bool,
 }
 
 impl ExpectedJob {
+    /// Whether `name` is one of the jobs of the workflow this job calls.
+    fn calls(&self, name: &str) -> bool {
+        self.called
+            && self
+                .github
+                .as_deref()
+                .and_then(|caller| name.strip_prefix(caller))
+                .is_some_and(|rest| rest.starts_with(" / "))
+    }
+
     fn matches(&self, name: &str) -> bool {
         if self.github.as_deref() == Some(name) {
             return true;
@@ -121,6 +137,8 @@ fn expected_jobs(path: &Path) -> Result<Vec<ExpectedJob>, String> {
     let mut expected = Vec::new();
     for id in ids {
         let job = &workflow.jobs[id];
+        let called = job.uses.is_some();
+        let runs_docker = wrkflw_executor::script_commands::steps_run(&job.steps, &["docker"]);
         let template = raw["jobs"][id.as_str()]["name"]
             .as_str()
             .map(str::to_string);
@@ -136,6 +154,8 @@ fn expected_jobs(path: &Path) -> Result<Vec<ExpectedJob>, String> {
                 github_base: name.clone().unwrap_or_else(|| id.clone()),
                 github: Some(name.unwrap_or_else(|| id.clone())),
                 matrix_values: None,
+                called,
+                runs_docker,
             });
             continue;
         };
@@ -156,6 +176,8 @@ fn expected_jobs(path: &Path) -> Result<Vec<ExpectedJob>, String> {
                     github: Some(named.clone()),
                     github_base: named,
                     matrix_values: None,
+                    called,
+                    runs_docker,
                 }
             } else {
                 ExpectedJob {
@@ -163,6 +185,8 @@ fn expected_jobs(path: &Path) -> Result<Vec<ExpectedJob>, String> {
                     github: None,
                     github_base: named,
                     matrix_values: values,
+                    called,
+                    runs_docker,
                 }
             });
         }
@@ -195,16 +219,37 @@ fn agree(conclusion: Option<&str>, status: Option<&str>) -> Option<bool> {
     }
 }
 
+/// Whether a local job stood in for a Windows one. Its result is not
+/// compared: a Windows job's steps call Windows tools, which a Linux
+/// container doesn't have, so its failure says nothing about wrkflw.
+fn stood_in_for_windows(local: &Value) -> bool {
+    local["runner"]["requested"]
+        .as_str()
+        .is_some_and(|os| os.to_ascii_lowercase().starts_with("windows"))
+}
+
 /// Why a local job may differ from GitHub's, from the run's own report.
-fn note_for(local: &Value, failures: &[Value]) -> Option<String> {
+fn note_for(local: &Value, failures: &[Value], runs_docker: bool) -> Option<String> {
     let name = local["name"].as_str().unwrap_or_default();
     let mut notes = Vec::new();
     if let Some(runner) = local.get("runner") {
+        let not_compared = if stood_in_for_windows(local) {
+            "not compared: "
+        } else {
+            ""
+        };
         notes.push(format!(
-            "ran as {} locally, GitHub ran {}",
+            "{not_compared}ran as {} locally, GitHub ran {}",
             runner["ran_as"].as_str().unwrap_or("?"),
             runner["requested"].as_str().unwrap_or("?")
         ));
+    }
+    if runs_docker && local["status"] == "failure" {
+        notes.push(
+            "its steps run docker: a job only has an engine for them with \
+             WRKFLW_DOCKER_IN_JOBS=1 (run --docker-in-jobs)"
+                .to_string(),
+        );
     }
     for action in local["actions_not_run"].as_array().into_iter().flatten() {
         notes.push(format!(
@@ -270,23 +315,45 @@ fn rows(
         if let Some((i, _)) = found {
             used[i] = true;
         }
-        let github = found.map(|(_, r)| r);
+        let mut github_name = found.map(|(_, r)| r.name.clone());
+        let mut github_conclusion = found.and_then(|(_, r)| r.conclusion.clone());
+        // A called workflow's jobs, as one result.
+        if found.is_none() {
+            let parts: Vec<usize> = (0..remote.len())
+                .filter(|i| !used[*i] && job.calls(&remote[*i].name))
+                .collect();
+            if !parts.is_empty() {
+                for i in &parts {
+                    used[*i] = true;
+                }
+                github_name = Some(match parts.as_slice() {
+                    [one] => remote[*one].name.clone(),
+                    _ => format!(
+                        "{} / ({} jobs)",
+                        job.github.as_deref().unwrap_or_default(),
+                        parts.len()
+                    ),
+                });
+                github_conclusion =
+                    combined_conclusion(parts.iter().map(|i| remote[*i].conclusion.as_deref()));
+            }
+        }
         let local_status = local_job.and_then(|l| l["status"].as_str());
-        let github_conclusion = github.and_then(|r| r.conclusion.as_deref());
-        if github.is_none() && local_job.is_none() {
+        if github_name.is_none() && local_job.is_none() {
             continue;
         }
+        let compared = !local_job.is_some_and(stood_in_for_windows);
         rows.push(Row {
-            github_name: github.map(|r| r.name.clone()),
+            github_name,
             local_name: Some(job.local.clone()),
-            github: github_conclusion.map(str::to_string),
+            github: github_conclusion.clone(),
             local: local_status.map(str::to_string),
-            agree: agree(github_conclusion, local_status),
+            agree: agree(github_conclusion.as_deref(), local_status).filter(|_| compared),
             note: join_notes(
                 found
                     .filter(|(i, _)| fits[*i] > 1)
                     .map(|(i, r)| ambiguous_note(&r.name, fits[i])),
-                local_job.and_then(|l| note_for(l, failures)),
+                local_job.and_then(|l| note_for(l, failures, job.runs_docker)),
             ),
         });
     }
@@ -307,6 +374,30 @@ fn rows(
         }
     }
     rows
+}
+
+/// One conclusion for a called workflow's jobs, as its caller's: a failure
+/// if any failed, skipped if all were, a success if every one passed or was
+/// skipped, and no result while any has none or was cancelled.
+fn combined_conclusion<'a>(conclusions: impl Iterator<Item = Option<&'a str>>) -> Option<String> {
+    let conclusions: Vec<Option<&str>> = conclusions.collect();
+    if conclusions.contains(&Some("failure")) {
+        return Some("failure".to_string());
+    }
+    if conclusions.iter().all(|c| *c == Some("skipped")) {
+        return Some("skipped".to_string());
+    }
+    if conclusions
+        .iter()
+        .all(|c| matches!(c, Some("success") | Some("skipped")))
+    {
+        return Some("success".to_string());
+    }
+    conclusions
+        .iter()
+        .flatten()
+        .find(|c| !matches!(**c, "success" | "skipped"))
+        .map(|c| c.to_string())
 }
 
 /// The note for a pairing made by order, because `count` local jobs fit
@@ -893,9 +984,13 @@ mod tests {
         };
         assert_eq!(row("Format").agree, Some(true));
         let windows = row("Build (windows-latest)");
-        assert_eq!(windows.agree, Some(false));
+        // A Windows job run as Linux isn't compared.
+        assert_eq!(windows.agree, None);
         let note = windows.note.as_deref().unwrap();
-        assert!(note.contains("ran as Linux locally"), "{note}");
+        assert!(
+            note.contains("not compared: ran as Linux locally"),
+            "{note}"
+        );
         assert!(note.contains("repeats build (os: ubuntu-latest)"), "{note}");
         assert_eq!(row("lint").agree, None);
         let called = row("deploy / publish");
@@ -922,6 +1017,68 @@ mod tests {
         );
         assert_eq!(report["agree"], false);
         assert_eq!(report["disagreements"], 1);
+    }
+
+    /// GitHub shows a called workflow's jobs as `<caller> / <job>`; wrkflw
+    /// has one result for the caller, which stands for them all.
+    #[test]
+    fn a_called_workflows_jobs_pair_with_their_caller() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: CI\non: push\njobs:\n  pre_ci:\n    uses: o/r/.github/workflows/pre.yml@main\n  checks:\n    name: Checks\n    uses: ./.github/workflows/checks.yml\n  lint:\n    runs-on: ubuntu-latest\n    steps:\n      - run: docker run --rm hadolint/hadolint\n";
+        let expected = expected_jobs(&write(dir.path(), yaml)).unwrap();
+        let github = vec![
+            remote("pre_ci / pre_ci", "success"),
+            remote("Checks / fmt", "success"),
+            remote("Checks / clippy", "failure"),
+            remote("lint", "success"),
+        ];
+        let local = vec![
+            json!({"name": "pre_ci", "status": "success"}),
+            json!({"name": "checks", "status": "failure"}),
+            json!({"name": "lint", "status": "failure"}),
+        ];
+        let rows = rows(&expected, &github, &local, &[]);
+        let row = |local: &str| {
+            rows.iter()
+                .find(|r| r.local_name.as_deref() == Some(local))
+                .unwrap()
+        };
+        assert_eq!(
+            row("pre_ci").github_name.as_deref(),
+            Some("pre_ci / pre_ci")
+        );
+        assert_eq!(row("pre_ci").agree, Some(true));
+        assert_eq!(
+            row("checks").github_name.as_deref(),
+            Some("Checks / (2 jobs)")
+        );
+        assert_eq!(row("checks").github.as_deref(), Some("failure"));
+        assert_eq!(row("checks").agree, Some(true));
+        assert!(rows.iter().all(|r| r.local_name.is_some()), "{rows:?}");
+        let note = row("lint").note.as_deref().unwrap();
+        assert!(note.contains("WRKFLW_DOCKER_IN_JOBS=1"), "{note}");
+    }
+
+    #[test]
+    fn a_called_workflows_conclusion_is_its_jobs_together() {
+        let combined = |c: &[Option<&str>]| combined_conclusion(c.iter().copied());
+        assert_eq!(
+            combined(&[Some("success"), Some("skipped")]).as_deref(),
+            Some("success")
+        );
+        assert_eq!(
+            combined(&[Some("success"), Some("failure")]).as_deref(),
+            Some("failure")
+        );
+        assert_eq!(
+            combined(&[Some("skipped"), Some("skipped")]).as_deref(),
+            Some("skipped")
+        );
+        assert_eq!(
+            combined(&[Some("success"), Some("cancelled")]).as_deref(),
+            Some("cancelled")
+        );
+        assert_eq!(combined(&[Some("success"), None]), None);
     }
 
     fn github_run(conclusion: &str, jobs: Vec<RemoteJob>) -> RemoteRun {
@@ -1069,12 +1226,18 @@ mod tests {
         let note = note_for(
             &json!({"name": "build (os: macos-latest)", "status": "failure"}),
             &failures,
+            false,
         )
         .unwrap();
         assert!(note.contains("ran out of memory"), "{note}");
 
         let killed = vec![json!({"job": "build", "cause": {"kind": "killed"}})];
-        let note = note_for(&json!({"name": "build", "status": "failure"}), &killed).unwrap();
+        let note = note_for(
+            &json!({"name": "build", "status": "failure"}),
+            &killed,
+            false,
+        )
+        .unwrap();
         assert!(note.contains("SIGKILL"), "{note}");
     }
 
@@ -1091,6 +1254,7 @@ mod tests {
         let note = note_for(
             &json!({"name": "tests (python: pypy-3.11)", "status": "failure"}),
             &failures,
+            false,
         )
         .unwrap();
         assert!(note.contains("none of its steps ran"), "{note}");

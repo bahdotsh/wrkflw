@@ -34,7 +34,7 @@ pub const JOB_GITHUB_TOKEN_ENV: &str = "WRKFLW_JOB_GITHUB_TOKEN";
 /// Off by default, as this is the user's own token, which reaches further
 /// than the one GitHub makes for a run and hands to its steps.
 pub(crate) async fn job_github_token() -> Option<String> {
-    if !env_flag(JOB_GITHUB_TOKEN_ENV) {
+    if !job_github_token_wanted() {
         return None;
     }
     crate::acceleration::run_job_token(|| async {
@@ -58,6 +58,12 @@ pub(crate) async fn job_github_token() -> Option<String> {
         token
     })
     .await
+}
+
+/// Whether the run asked for jobs to get a GitHub token, from a secret
+/// provider or, failing that, this machine: see [`job_github_token`].
+pub(crate) fn job_github_token_wanted() -> bool {
+    env_flag(JOB_GITHUB_TOKEN_ENV)
 }
 
 /// How long `gh auth token` may take: it reads a file or the keychain,

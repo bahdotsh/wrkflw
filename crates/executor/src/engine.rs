@@ -3017,9 +3017,15 @@ async fn execute_job_with_matrix(
         (HashMap::new(), HashSet::new())
     };
     // The run's own token, which GitHub makes for every job. Here it is
-    // this machine's, and only given when asked for; a provider's wins.
-    if let Some(token) = crate::run_options::job_github_token().await {
-        give_job_token(&mut secrets_context, &mut missing_secrets, token);
+    // only given when asked for: a provider's, else this machine's.
+    if crate::run_options::job_github_token_wanted() {
+        fill_job_token(
+            secret_manager,
+            &mut secrets_context,
+            &mut missing_secrets,
+            crate::run_options::job_github_token,
+        )
+        .await;
     }
     // Output is masked before it is shown or persisted, so the masker has to
     // know every value this job can read.
@@ -6080,24 +6086,19 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
         let cmd_refs: Vec<&str> = cmd_parts.iter().map(String::as_str).collect();
 
         let session = job_session::current();
-        let dep_mounts = acceleration::dep_cache_mounts(
-            ctx.runtime.mounts_are_copies(),
-            session
-                .as_ref()
-                .is_some_and(|session| session.may_run_as_runner_user()),
-        );
+        let runner_home = session
+            .as_ref()
+            .is_some_and(|session| session.may_run_as_runner_user());
+        let dep_mounts =
+            acceleration::dep_cache_mounts(ctx.runtime.mounts_are_copies(), runner_home);
         let vm_workspace = crate::vm_workspace::before_step(ctx.runtime, ctx.working_dir)
             .await
             .map_err(ExecutionError::Runtime)?;
-        let mut volumes = mount_ctx.build_volumes(ctx.working_dir, container_workspace);
+        let mut step_volumes = mount_ctx.build_volumes(ctx.working_dir, container_workspace);
         if let Some(vm) = &vm_workspace {
-            vm.mount_in(&mut volumes);
+            vm.mount_in(&mut step_volumes);
         }
-        volumes.extend(
-            dep_mounts
-                .iter()
-                .map(|(host, container)| (host.as_path(), container.as_path())),
-        );
+        let volumes = with_dep_mounts(&step_volumes, &dep_mounts);
         let env_vars: Vec<(&str, &str)> = step_env
             .iter()
             .map(|(k, v)| (k.as_str(), v.as_str()))
@@ -6123,13 +6124,28 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
         let run_result = match session_result {
             Ok(Some(output)) => Ok(output),
             Ok(None) => {
+                // Outside the job's container the step runs as its image's
+                // user, root, also where the job's steps were to run as the
+                // runner user: it gets root's caches, not the ones that
+                // user's steps share, and the job's pass isn't stored as
+                // one whose steps all ran as that user.
+                let (root_mounts, root_volumes);
+                let own_container_volumes: &[(&Path, &Path)] = if runner_home {
+                    job_session::note_root_fallback();
+                    root_mounts =
+                        acceleration::dep_cache_mounts(ctx.runtime.mounts_are_copies(), false);
+                    root_volumes = with_dep_mounts(&step_volumes, &root_mounts);
+                    &root_volumes
+                } else {
+                    &volumes
+                };
                 ctx.runtime
                     .run_container(
                         ctx.runner_image,
                         &cmd_refs,
                         &env_vars,
                         &final_workspace,
-                        &volumes,
+                        own_container_volumes,
                         None,
                     )
                     .await
@@ -7908,17 +7924,68 @@ fn resolve_job_outputs(
     resolved
 }
 
+/// Give the job a `secrets.GITHUB_TOKEN` where it has none: its secret
+/// provider's, else what `machine` finds on this machine.
+///
+/// A job's secrets only hold the ones its own text names, so a job that
+/// reads `github.token` alone, or through an action's default, has none
+/// from its provider yet. The provider is asked first, so its token,
+/// perhaps a narrower one than this machine's, wins. `machine` is only
+/// called when no provider had one, so the warning that jobs get this
+/// machine's token is only given when they do.
+async fn fill_job_token<F>(
+    secret_manager: Option<&SecretManager>,
+    secrets: &mut HashMap<String, String>,
+    missing: &mut HashSet<String>,
+    machine: impl FnOnce() -> F,
+) where
+    F: std::future::Future<Output = Option<String>>,
+{
+    if has_job_token(secrets) {
+        return;
+    }
+    if let Some(secret_mgr) = secret_manager {
+        if let Ok(value) = secret_mgr.get_secret("GITHUB_TOKEN").await {
+            give_job_token(secrets, missing, value.value().to_string());
+        }
+    }
+    if !has_job_token(secrets) {
+        if let Some(token) = machine().await {
+            give_job_token(secrets, missing, token);
+        }
+    }
+}
+
+/// Whether the job has a `secrets.GITHUB_TOKEN` that isn't empty.
+fn has_job_token(secrets: &HashMap<String, String>) -> bool {
+    secrets
+        .get("GITHUB_TOKEN")
+        .is_some_and(|value| !value.is_empty())
+}
+
+/// A step's own mounts, `volumes`, followed by the dependency caches
+/// `dep_mounts`.
+fn with_dep_mounts<'a>(
+    volumes: &[(&'a Path, &'a Path)],
+    dep_mounts: &'a [(PathBuf, PathBuf)],
+) -> Vec<(&'a Path, &'a Path)> {
+    let mut all = volumes.to_vec();
+    all.extend(
+        dep_mounts
+            .iter()
+            .map(|(host, container)| (host.as_path(), container.as_path())),
+    );
+    all
+}
+
 /// Make `token` the job's `secrets.GITHUB_TOKEN`, which `github.token`
-/// reads too, unless a secret provider already gave the job one.
+/// reads too, unless the job has one already. An empty `token` gives none.
 fn give_job_token(
     secrets: &mut HashMap<String, String>,
     missing: &mut HashSet<String>,
     token: String,
 ) {
-    let has_one = secrets
-        .get("GITHUB_TOKEN")
-        .is_some_and(|value| !value.is_empty());
-    if !has_one {
+    if !has_job_token(secrets) && !token.is_empty() {
         secrets.insert("GITHUB_TOKEN".to_string(), token);
         missing.remove("GITHUB_TOKEN");
     }
@@ -8360,6 +8427,56 @@ mod tests {
         let mut secrets = HashMap::from([("GITHUB_TOKEN".to_string(), "provided".to_string())]);
         give_job_token(&mut secrets, &mut HashSet::new(), "from-gh".to_string());
         assert_eq!(secrets["GITHUB_TOKEN"], "provided");
+    }
+
+    /// A job whose text never names `secrets.GITHUB_TOKEN`, as one that
+    /// reads `github.token` or an action's default, still gets its
+    /// provider's token before this machine's, which isn't even looked for.
+    #[tokio::test]
+    async fn the_job_token_is_the_providers_before_this_machines() {
+        let prefix = "WRKFLW_TEST_JOB_TOKEN_PROVIDER_";
+        let manager = |prefix: &str| {
+            let mut config = SecretConfig::default();
+            config.providers.insert(
+                "env".to_string(),
+                wrkflw_secrets::SecretProviderConfig::Environment {
+                    prefix: Some(prefix.to_string()),
+                },
+            );
+            config.enable_caching = false;
+            SecretManager::new(config)
+        };
+        let fill = |manager: Option<SecretManager>, machine: Option<&'static str>| async move {
+            let mut secrets = HashMap::new();
+            let mut missing = HashSet::from(["GITHUB_TOKEN".to_string()]);
+            let asked = std::sync::atomic::AtomicBool::new(false);
+            fill_job_token(manager.as_ref(), &mut secrets, &mut missing, || async {
+                asked.store(true, std::sync::atomic::Ordering::Relaxed);
+                machine.map(str::to_string)
+            })
+            .await;
+            (
+                secrets.get("GITHUB_TOKEN").cloned(),
+                missing.contains("GITHUB_TOKEN"),
+                asked.load(std::sync::atomic::Ordering::Relaxed),
+            )
+        };
+
+        std::env::set_var(format!("{prefix}GITHUB_TOKEN"), "ghs_provider");
+        let provided = fill(Some(manager(prefix).await.unwrap()), Some("gho_mine")).await;
+        std::env::remove_var(format!("{prefix}GITHUB_TOKEN"));
+        assert_eq!(provided, (Some("ghs_provider".to_string()), false, false));
+
+        // No provider has one: this machine's.
+        let unset = "WRKFLW_TEST_JOB_TOKEN_NO_PROVIDER_";
+        let mine = fill(Some(manager(unset).await.unwrap()), Some("gho_mine")).await;
+        assert_eq!(mine, (Some("gho_mine".to_string()), false, true));
+        assert_eq!(
+            fill(None, Some("gho_mine")).await,
+            (Some("gho_mine".to_string()), false, true)
+        );
+        // Neither: still missing.
+        assert_eq!(fill(None, None).await, (None, true, true));
     }
 
     /// A job that sets nothing up still runs with the runner's tools, such
@@ -16375,6 +16492,86 @@ runs:
         let calls = runtime.run_calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
         assert!(calls[0].cmd.iter().any(|c| c.contains("linux step ran")));
+    }
+
+    /// A step that can't run in the job's container runs in one of its own,
+    /// as root: it gets root's dependency caches, not the ones the runner
+    /// user's steps share, and the job notes that its steps fell back to
+    /// root, so its pass isn't stored as one that ran as that user.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_step_outside_the_jobs_container_runs_as_root_with_roots_caches() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        // An engine CLI that fails everything: the job's container never
+        // starts, and its steps fall back to one container each.
+        let cli = dir.path().join("cli");
+        fs::write(&cli, "#!/bin/sh\nexit 1\n").unwrap();
+        fs::set_permissions(&cli, fs::Permissions::from_mode(0o755)).unwrap();
+        // Wait out ETXTBSY from a process another test forked meanwhile.
+        for _ in 0..100 {
+            match std::process::Command::new(&cli).output() {
+                Err(e) if e.raw_os_error() == Some(26) => {
+                    std::thread::sleep(std::time::Duration::from_millis(10))
+                }
+                _ => break,
+            }
+        }
+        let cli: &'static str = Box::leak(cli.display().to_string().into_boxed_str());
+        let runtime = MockContainerRuntime {
+            session_cli: Some(cli),
+            ..Default::default()
+        };
+        let caches = dir.path().join("deps");
+        std::env::set_var("WRKFLW_DEP_CACHE_DIR", &caches);
+        let state = acceleration::RunState::new(
+            acceleration::Acceleration {
+                dep_cache: true,
+                ..Default::default()
+            },
+            false,
+            dir.path().to_path_buf(),
+        )
+        .unwrap();
+        let job = make_job(None, labels(&["ubuntu-latest"]));
+        let step = make_run_step("echo hi");
+        let working_dir = tempfile::tempdir().unwrap();
+        let job_env = HashMap::from([("RUNNER_OS".to_string(), "Linux".to_string())]);
+        let pending = std::sync::Mutex::new(Vec::<PendingCacheSave>::new());
+        // Boxed: the step's future is too large for a test thread's stack.
+        let step_run = Box::pin(run_step_with(
+            &step,
+            &job_env,
+            working_dir.path(),
+            &runtime,
+            test_services(),
+            &pending,
+        ));
+        let (_, fell_back) = Box::pin(acceleration::with_run_state(
+            Arc::new(state),
+            job_session::noting_root_fallback(job_session::with_job_session(
+                &job, &runtime, false, step_run,
+            )),
+        ))
+        .await;
+        std::env::remove_var("WRKFLW_DEP_CACHE_DIR");
+
+        assert!(fell_back);
+        let calls = runtime.run_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        let mounted: Vec<&(PathBuf, PathBuf)> = calls[0]
+            .volumes
+            .iter()
+            .filter(|(host, _)| host.starts_with(&caches))
+            .collect();
+        assert!(!mounted.is_empty(), "{calls:?}");
+        assert!(
+            mounted.iter().all(|(host, container)| {
+                host.components().any(|part| part.as_os_str() == "as-root")
+                    && container.starts_with("/root")
+            }),
+            "{mounted:?}"
+        );
     }
 
     /// A step that couldn't run at all ends the composite with an error, and

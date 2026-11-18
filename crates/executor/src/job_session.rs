@@ -407,7 +407,10 @@ pub(crate) async fn noting_root_fallback<F: Future>(future: F) -> (F::Output, bo
     (output, fell_back.load(std::sync::atomic::Ordering::Relaxed))
 }
 
-fn note_root_fallback() {
+/// Note that steps meant for the runner user ran as root, for
+/// [`noting_root_fallback`]: those of a container whose user can't write
+/// the job's mounts, and any step that runs outside the job's container.
+pub(crate) fn note_root_fallback() {
     let _ = ROOT_FALLBACK.try_with(|flag| flag.store(true, std::sync::atomic::Ordering::Relaxed));
 }
 

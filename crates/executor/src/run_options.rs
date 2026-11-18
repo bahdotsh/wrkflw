@@ -33,25 +33,17 @@ pub const JOB_GITHUB_TOKEN_ENV: &str = "WRKFLW_JOB_GITHUB_TOKEN";
 ///
 /// Off by default, as this is the user's own token, which reaches further
 /// than the one GitHub makes for a run and hands to its steps.
-pub(crate) fn job_github_token() -> Option<String> {
+pub(crate) async fn job_github_token() -> Option<String> {
     if !env_flag(JOB_GITHUB_TOKEN_ENV) {
         return None;
     }
-    crate::acceleration::run_job_token(|| {
-        let token = job_github_token_from(
-            |name| std::env::var(name).ok(),
-            || {
-                let output = std::process::Command::new("gh")
-                    .args(["auth", "token"])
-                    .stdin(std::process::Stdio::null())
-                    .output()
-                    .ok()?;
-                output
-                    .status
-                    .success()
-                    .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
-            },
-        );
+    crate::acceleration::run_job_token(|| async {
+        // `gh` only runs when the environment has no token.
+        let mut token = job_github_token_from(|name| std::env::var(name).ok(), || None);
+        if token.is_none() {
+            let from_gh = gh_auth_token().await;
+            token = job_github_token_from(|_| None, || from_gh);
+        }
         match &token {
             Some(_) => wrkflw_logging::warning(
                 "Jobs get this machine's GitHub token as github.token and \
@@ -65,6 +57,30 @@ pub(crate) fn job_github_token() -> Option<String> {
         }
         token
     })
+    .await
+}
+
+/// How long `gh auth token` may take: it reads a file or the keychain,
+/// and one waiting on a locked keychain mustn't hold up the run.
+const GH_AUTH_TOKEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// What `gh auth token` prints, or `None` when it fails, isn't installed or
+/// takes longer than [`GH_AUTH_TOKEN_TIMEOUT`].
+async fn gh_auth_token() -> Option<String> {
+    let output = tokio::process::Command::new("gh")
+        .args(["auth", "token"])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .output();
+    let output = tokio::time::timeout(GH_AUTH_TOKEN_TIMEOUT, output)
+        .await
+        .ok()?
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 /// [`job_github_token`] with `var` reading an environment variable and

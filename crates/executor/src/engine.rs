@@ -3018,7 +3018,7 @@ async fn execute_job_with_matrix(
     };
     // The run's own token, which GitHub makes for every job. Here it is
     // this machine's, and only given when asked for; a provider's wins.
-    if let Some(token) = crate::run_options::job_github_token() {
+    if let Some(token) = crate::run_options::job_github_token().await {
         give_job_token(&mut secrets_context, &mut missing_secrets, token);
     }
     // Output is masked before it is shown or persisted, so the masker has to
@@ -3184,21 +3184,25 @@ async fn execute_job_with_matrix(
         };
 
         // Execute matrix combinations
-        let results = execute_matrix_combinations(MatrixExecutionContext {
-            job_name,
-            job_template: job,
-            combinations: &combinations,
-            max_parallel,
-            fail_fast: job.fail_fast(),
-            workflow,
-            runtime,
-            env_context,
-            user_env,
-            verbose,
-            services,
-        })
-        .await?;
-        store_passing_result(result_key.as_deref(), &results, env_context).await;
+        let (results, fell_back_to_root) = job_session::noting_root_fallback(
+            execute_matrix_combinations(MatrixExecutionContext {
+                job_name,
+                job_template: job,
+                combinations: &combinations,
+                max_parallel,
+                fail_fast: job.fail_fast(),
+                workflow,
+                runtime,
+                env_context,
+                user_env,
+                verbose,
+                services,
+            }),
+        )
+        .await;
+        let results = results?;
+        let key = result_key.as_deref().filter(|_| !fell_back_to_root);
+        store_passing_result(key, &results, env_context).await;
         Ok(results)
     } else {
         // Regular job, no matrix
@@ -3229,16 +3233,20 @@ async fn execute_job_with_matrix(
             }
         };
         let mapped = image_is_mapped(job, platform_overrides, None);
-        let result = with_images_built_ahead(
-            image_ahead,
-            crate::job_memory::metered(
-                job_session::with_job_session(job, runtime, mapped, execute_job(ctx)),
-                job_passed,
-            ),
-        )
-        .await?;
-        let results = vec![result];
-        store_passing_result(result_key.as_deref(), &results, env_context).await;
+        let (result, fell_back_to_root) =
+            job_session::noting_root_fallback(with_images_built_ahead(
+                image_ahead,
+                crate::job_memory::metered(
+                    job_session::with_job_session(job, runtime, mapped, execute_job(ctx)),
+                    job_passed,
+                ),
+            ))
+            .await;
+        let results = vec![result?];
+        // A pass whose steps ran as root where they were to run as the
+        // runner user isn't what its key says: see `noting_root_fallback`.
+        let key = result_key.as_deref().filter(|_| !fell_back_to_root);
+        store_passing_result(key, &results, env_context).await;
         Ok(results)
     }
 }
@@ -7900,9 +7908,6 @@ fn resolve_job_outputs(
     resolved
 }
 
-/// Pre-resolve secrets referenced in the job into a HashMap for expression evaluation.
-/// Scans job steps, conditions, env, and outputs for `${{ secrets.NAME }}` patterns
-/// and resolves each unique name.
 /// Make `token` the job's `secrets.GITHUB_TOKEN`, which `github.token`
 /// reads too, unless a secret provider already gave the job one.
 fn give_job_token(
@@ -7919,6 +7924,9 @@ fn give_job_token(
     }
 }
 
+/// Pre-resolve secrets referenced in the job into a HashMap for expression evaluation.
+/// Scans job steps, conditions, env, and outputs for `${{ secrets.NAME }}` patterns
+/// and resolves each unique name.
 async fn resolve_secrets_for_context(
     secret_manager: &SecretManager,
     job: &Job,

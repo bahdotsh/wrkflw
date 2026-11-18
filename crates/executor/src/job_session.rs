@@ -390,6 +390,25 @@ pub(crate) struct JobSession {
 
 tokio::task_local! {
     static SESSION: Option<Arc<JobSession>>;
+    /// Set when a session whose steps were to run as the runner user ran
+    /// them as root after all, for [`noting_root_fallback`].
+    static ROOT_FALLBACK: Arc<std::sync::atomic::AtomicBool>;
+}
+
+/// Run `future`, a job and its matrix legs, and say whether any of its
+/// sessions ran as root steps that were to run as the runner user.
+///
+/// The reuse key only knows whether the run asked for root, not what each
+/// job's container then allowed, so such a pass can't be stored under it:
+/// it would stand in for one as that user.
+pub(crate) async fn noting_root_fallback<F: Future>(future: F) -> (F::Output, bool) {
+    let fell_back = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let output = ROOT_FALLBACK.scope(fell_back.clone(), future).await;
+    (output, fell_back.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+fn note_root_fallback() {
+    let _ = ROOT_FALLBACK.try_with(|flag| flag.store(true, std::sync::atomic::Ordering::Relaxed));
 }
 
 fn untrack_for(cli: &str) -> fn(&str) {
@@ -448,11 +467,12 @@ const HAND_OVER: &str = "me=\"$(id -u)\"; group=\"$(id -g)\"; \
        sudo -n find \"$dir\" ! -user \"$me\" -exec chown -h \"$me:$group\" {} + 2>/dev/null; \
        [ -z \"$(stray \"$dir\")\" ] || { echo \"$dir\"; exit 1; }; }; done";
 
-/// The container paths of `volumes` to check and hand over, one per host
-/// directory: the dependency caches are mounted in both root's home and
-/// the user's, and one walk of each is enough. A path in root's home,
-/// which the user can't enter, is only taken when it is the sole one.
-fn walked_mounts(volumes: &[(PathBuf, PathBuf)]) -> Vec<String> {
+/// The mounts of `volumes` to check and hand over, as host and container
+/// paths, one per host directory: the dependency caches are mounted in both
+/// root's home and the user's, and one walk of each is enough. A path in
+/// root's home, which the user can't enter, is only taken when it is the
+/// sole one.
+fn walked_mounts(volumes: &[(PathBuf, PathBuf)]) -> Vec<(PathBuf, String)> {
     let in_root_home = |container: &Path| container.starts_with("/root");
     let mut seen = std::collections::HashSet::new();
     volumes
@@ -464,8 +484,23 @@ fn walked_mounts(volumes: &[(PathBuf, PathBuf)]) -> Vec<String> {
                 .filter(|(_, container)| in_root_home(container)),
         )
         .filter(|(host, _)| seen.insert(host.clone()))
-        .map(|(_, container)| container.display().to_string())
+        .map(|(host, container)| (host.clone(), container.display().to_string()))
         .collect()
+}
+
+/// `docker exec` arguments that run `script` in container `id` as `user`,
+/// with `paths` for its arguments.
+fn exec_as<'a>(
+    id: &str,
+    user: &str,
+    script: &str,
+    paths: impl IntoIterator<Item = &'a String>,
+) -> Vec<String> {
+    let mut args: Vec<String> = ["exec", "--user", user, id, "sh", "-c", script, "sh"]
+        .map(str::to_string)
+        .to_vec();
+    args.extend(paths.into_iter().cloned());
+    args
 }
 
 /// `value` as one word of a POSIX shell script.
@@ -1108,8 +1143,24 @@ impl JobSession {
     /// own directory (a job `container:`, whose `volumes:` may not be, never
     /// gets the user). That only happens after the check, so under a
     /// rootless engine, where the user's uid isn't this machine's, nothing
-    /// is handed over.
+    /// is handed over. A directory this run handed over already, such as a
+    /// dependency cache another job shares, isn't walked again: steps that
+    /// run as root have caches of their own.
+    ///
+    /// Steps that end up as root are noted for [`noting_root_fallback`].
     async fn step_user(&self, id: &str, volumes: &[(PathBuf, PathBuf)]) -> Option<&'static str> {
+        let user = self.settle_step_user(id, volumes).await;
+        if user.is_none() {
+            note_root_fallback();
+        }
+        user
+    }
+
+    async fn settle_step_user(
+        &self,
+        id: &str,
+        volumes: &[(PathBuf, PathBuf)],
+    ) -> Option<&'static str> {
         let user = crate::runner_user::NAME;
         let exists: Vec<String> = ["exec", id, "id", "-u", user].map(str::to_string).to_vec();
         if !cli_output(self.cli, &exists, None)
@@ -1130,10 +1181,8 @@ impl JobSession {
             ));
             None
         };
-        let mut writable: Vec<String> = ["exec", "--user", user, id, "sh", "-c", CAN_WRITE, "sh"]
-            .map(str::to_string)
-            .to_vec();
-        writable.extend(mounted.iter().cloned());
+        let containers = mounted.iter().map(|(_, container)| container);
+        let writable = exec_as(id, user, CAN_WRITE, containers);
         match cli_output(self.cli, &writable, None).await {
             Ok(output) if output.exit_code == 0 => {}
             Ok(output) => {
@@ -1150,12 +1199,26 @@ impl JobSession {
                 ))
             }
         }
-        let mut hand_over: Vec<String> = ["exec", "--user", user, id, "sh", "-c", HAND_OVER, "sh"]
-            .map(str::to_string)
-            .to_vec();
-        hand_over.extend(mounted);
+        let fresh =
+            acceleration::not_handed_over(mounted.iter().map(|(host, _)| host.clone()).collect());
+        let to_walk: Vec<&(PathBuf, String)> = mounted
+            .iter()
+            .filter(|(host, _)| fresh.contains(host))
+            .collect();
+        if to_walk.is_empty() {
+            return Some(user);
+        }
+        let hand_over = exec_as(
+            id,
+            user,
+            HAND_OVER,
+            to_walk.iter().map(|(_, container)| container),
+        );
         match cli_output(self.cli, &hand_over, None).await {
-            Ok(output) if output.exit_code == 0 => Some(user),
+            Ok(output) if output.exit_code == 0 => {
+                acceleration::mark_handed_over(to_walk.into_iter().map(|(host, _)| host.clone()));
+                Some(user)
+            }
             Ok(output) => as_root(format!(
                 "{} holds files of another user, such as those an earlier run left as \
                  root's, which couldn't be handed to that user",
@@ -1846,6 +1909,49 @@ mod tests {
         let (user, calls) = user_for("exec job id -u runner").await;
         assert_eq!(user, None);
         assert_eq!(calls.lines().count(), 1, "{calls}");
+    }
+
+    /// Within a run, a directory handed to the runner user once isn't
+    /// walked again by the next job's container, and a session that ran
+    /// its steps as root after all says so, so its pass isn't stored.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_run_hands_each_directory_over_once_and_notes_a_fall_back_to_root() {
+        let volumes = &[
+            (PathBuf::from("/h/ws"), PathBuf::from("/github/workspace")),
+            (PathBuf::from("/h/npm"), PathBuf::from("/home/runner/.npm")),
+        ];
+        let state = acceleration::RunState::new(
+            acceleration::Acceleration::default(),
+            false,
+            PathBuf::from("."),
+        )
+        .unwrap();
+        acceleration::with_run_state(Arc::new(state), async {
+            let dir = tempfile::tempdir().unwrap();
+            let (cli, log) = fake_cli(dir.path(), "nothing-fails");
+            let runner = session(cli, Vec::new());
+            let ((first, second), fell_back) = noting_root_fallback(async {
+                let first = runner.step_user("job", volumes).await;
+                let second = runner.step_user("job", volumes).await;
+                (first, second)
+            })
+            .await;
+            assert_eq!((first, second), (Some("runner"), Some("runner")));
+            assert!(!fell_back);
+            let calls = std::fs::read_to_string(&log).unwrap();
+            // The second container checks it can write, and walks nothing.
+            assert_eq!(calls.matches("chown -h").count(), 1, "{calls}");
+            assert_eq!(calls.lines().count(), 5, "{calls}");
+
+            let dir = tempfile::tempdir().unwrap();
+            let (cli, _) = fake_cli(dir.path(), "exec --user*");
+            let (user, fell_back) =
+                noting_root_fallback(session(cli, Vec::new()).step_user("job", volumes)).await;
+            assert_eq!(user, None);
+            assert!(fell_back);
+        })
+        .await;
     }
 
     #[cfg(unix)]

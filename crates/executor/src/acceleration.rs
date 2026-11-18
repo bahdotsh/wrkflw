@@ -59,6 +59,24 @@ const DEP_CACHE_DIRS: &[(&str, &str)] = &[
 /// even one named `runner`, isn't wrkflw's to mount over.
 const DEP_CACHE_HOMES: &[&str] = &["/root", crate::runner_user::HOME];
 
+/// The directory, beside a repository's caches, that holds a second set for
+/// steps that always run as root: a job `container:`, an image mapped with
+/// `-P`, a step in a container of its own, or a run with
+/// `WRKFLW_STEPS_AS_ROOT`. Sharing one set with steps that run as the
+/// runner user would leave that user files it can't write, from a root job
+/// running beside it.
+const ROOT_DEP_CACHE_DIR: &str = "as-root";
+
+/// The `--dep-cache` mounts of a run: host and container paths, one set for
+/// steps that may run as the runner user and one for steps that run as root.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct DepCacheMounts {
+    /// Mounted in both root's home and the runner user's.
+    runner: Vec<(PathBuf, PathBuf)>,
+    /// Host directories of their own, mounted in root's home only.
+    root: Vec<(PathBuf, PathBuf)>,
+}
+
 /// Files that always count as input, because steps load them without naming
 /// them. Path hints would otherwise let a composite action change go unseen.
 const ALWAYS_INPUT: &[&str] = &[".github/actions/**", ".gitea/actions/**", SIDECAR_PATH];
@@ -495,7 +513,10 @@ pub(crate) struct RunState {
     /// unaffected when something it consumes has just changed.
     executed: Mutex<HashSet<String>>,
     groups: Mutex<HashMap<String, Arc<Semaphore>>>,
-    dep_mounts: OnceLock<Vec<(PathBuf, PathBuf)>>,
+    dep_mounts: OnceLock<DepCacheMounts>,
+    /// Host directories whose files this run has already handed to the
+    /// runner user, so each shared cache is walked once, not per job.
+    handed_over: Mutex<HashSet<PathBuf>>,
     /// Set once the run has said it won't push an emulated result.
     warned_on_host_push: AtomicBool,
 }
@@ -514,7 +535,7 @@ struct ContainerScope {
     /// Set once the run has said its steps run `docker` with no engine.
     warned_of_missing_docker: AtomicBool,
     /// The GitHub token this run gives its jobs, once a job asked for it.
-    job_token: std::sync::OnceLock<Option<String>>,
+    job_token: tokio::sync::OnceCell<Option<String>>,
 }
 
 /// How the jobs of a run use containers. Unlike the rest of the run's
@@ -600,6 +621,7 @@ impl RunState {
             executed: Mutex::new(HashSet::new()),
             groups: Mutex::new(HashMap::new()),
             dep_mounts: OnceLock::new(),
+            handed_over: Mutex::new(HashSet::new()),
             warned_on_host_push: AtomicBool::new(false),
         })
     }
@@ -644,7 +666,7 @@ pub(crate) async fn with_run_state<F: Future>(state: Arc<RunState>, future: F) -
     let scope = Arc::new(ContainerScope {
         policy,
         warned_of_missing_docker: AtomicBool::new(false),
-        job_token: std::sync::OnceLock::new(),
+        job_token: tokio::sync::OnceCell::new(),
     });
     CONTAINERS
         .scope(scope, RUN.scope(Some(state), future))
@@ -672,10 +694,13 @@ pub(crate) fn first_missing_docker_warning() -> bool {
 /// each run, from the TUI or `watch` too, reads a token that may have
 /// changed since the last and says once that it hands it out. Outside a
 /// run, each call finds it anew.
-pub(crate) fn run_job_token(find: impl FnOnce() -> Option<String>) -> Option<String> {
+pub(crate) async fn run_job_token<F>(find: impl FnOnce() -> F) -> Option<String>
+where
+    F: Future<Output = Option<String>>,
+{
     match CONTAINERS.try_with(Arc::clone) {
-        Ok(scope) => scope.job_token.get_or_init(find).clone(),
-        Err(_) => find(),
+        Ok(scope) => scope.job_token.get_or_init(find).await.clone(),
+        Err(_) => find().await,
     }
 }
 
@@ -686,8 +711,9 @@ pub(crate) fn container_policy() -> Option<ContainerPolicy> {
 }
 
 /// Host and container paths of the `--dep-cache` mounts. `runner_home`
-/// says the step may run as the [runner user](crate::runner_user), so its
-/// home gets the caches too.
+/// says the step may run as the [runner user](crate::runner_user): it gets
+/// the caches in that user's home and root's. A step that runs as root
+/// gets a set of its own, in root's home only.
 pub(crate) fn dep_cache_mounts(
     mounts_are_copies: bool,
     runner_home: bool,
@@ -695,31 +721,56 @@ pub(crate) fn dep_cache_mounts(
     let Some(run) = current().filter(|run| run.accel.dep_cache && !mounts_are_copies) else {
         return Vec::new();
     };
-    in_homes(
-        run.dep_mounts
-            .get_or_init(|| create_dep_cache_dirs(&run.root)),
-        runner_home,
-    )
+    run.dep_mounts
+        .get_or_init(|| create_dep_cache_dirs(&run.root))
+        .for_steps(runner_home)
+        .to_vec()
 }
 
-/// `mounts` less those in the runner user's home, unless `runner_home`.
-fn in_homes(mounts: &[(PathBuf, PathBuf)], runner_home: bool) -> Vec<(PathBuf, PathBuf)> {
-    mounts
-        .iter()
-        .filter(|(_, container)| runner_home || !container.starts_with(crate::runner_user::HOME))
-        .cloned()
-        .collect()
+impl DepCacheMounts {
+    fn for_steps(&self, runner_home: bool) -> &[(PathBuf, PathBuf)] {
+        if runner_home {
+            &self.runner
+        } else {
+            &self.root
+        }
+    }
+}
+
+/// Of `hosts`, those this run hasn't handed to the runner user yet. Outside
+/// a run, every one.
+pub(crate) fn not_handed_over(hosts: Vec<PathBuf>) -> Vec<PathBuf> {
+    match current() {
+        Some(run) => {
+            let done = run.handed_over.lock().unwrap_or_else(|e| e.into_inner());
+            hosts
+                .into_iter()
+                .filter(|host| !done.contains(host))
+                .collect()
+        }
+        None => hosts,
+    }
+}
+
+/// Note that `hosts` hold nothing but the runner user's files now.
+pub(crate) fn mark_handed_over(hosts: impl IntoIterator<Item = PathBuf>) {
+    if let Some(run) = current() {
+        run.handed_over
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .extend(hosts);
+    }
 }
 
 /// The host side of the mounts for the repository at `repo`, under
 /// `WRKFLW_DEP_CACHE_DIR` or the cache directory.
-fn create_dep_cache_dirs(repo: &Path) -> Vec<(PathBuf, PathBuf)> {
+fn create_dep_cache_dirs(repo: &Path) -> DepCacheMounts {
     let base = std::env::var_os("WRKFLW_DEP_CACHE_DIR")
         .map(PathBuf::from)
         .or_else(|| dirs::cache_dir().map(|d| d.join("wrkflw").join("deps")));
     match base {
         Some(base) => dep_cache_dirs_in(&base, repo),
-        None => Vec::new(),
+        None => DepCacheMounts::default(),
     }
 }
 
@@ -732,21 +783,32 @@ fn repo_cache_id(repo: &Path) -> String {
 /// Each repository gets caches of its own under `base`. Steps can write to
 /// them, so a job in one repository must not leave packages that another
 /// repository's jobs then install.
-fn dep_cache_dirs_in(base: &Path, repo: &Path) -> Vec<(PathBuf, PathBuf)> {
-    let root = base.join(repo_cache_id(repo));
-    DEP_CACHE_DIRS
-        .iter()
-        .filter_map(|(name, in_home)| {
-            let host = root.join(name);
-            std::fs::create_dir_all(&host).ok()?;
-            Some((host, in_home))
-        })
-        .flat_map(|(host, in_home)| {
-            DEP_CACHE_HOMES
-                .iter()
-                .map(move |home| (host.clone(), Path::new(home).join(in_home)))
-        })
-        .collect()
+fn dep_cache_dirs_in(base: &Path, repo: &Path) -> DepCacheMounts {
+    let repo_dir = base.join(repo_cache_id(repo));
+    let created = |dir: &Path| {
+        DEP_CACHE_DIRS
+            .iter()
+            .filter_map(|(name, in_home)| {
+                let host = dir.join(name);
+                std::fs::create_dir_all(&host).ok()?;
+                Some((host, Path::new(in_home)))
+            })
+            .collect::<Vec<_>>()
+    };
+    DepCacheMounts {
+        runner: created(&repo_dir)
+            .into_iter()
+            .flat_map(|(host, in_home)| {
+                DEP_CACHE_HOMES
+                    .iter()
+                    .map(move |home| (host.clone(), Path::new(home).join(in_home)))
+            })
+            .collect(),
+        root: created(&repo_dir.join(ROOT_DEP_CACHE_DIR))
+            .into_iter()
+            .map(|(host, in_home)| (host, Path::new("/root").join(in_home)))
+            .collect(),
+    }
 }
 
 /// What to do with a job before running it.
@@ -1764,21 +1826,27 @@ jobs:
         let first = TempDir::new().unwrap();
         let second = TempDir::new().unwrap();
         let hosts = |repo: &Path| -> Vec<PathBuf> {
-            let mut hosts: Vec<PathBuf> = dep_cache_dirs_in(base.path(), repo)
-                .into_iter()
-                .map(|(host, _)| host)
+            let mounts = dep_cache_dirs_in(base.path(), repo);
+            let mut hosts: Vec<PathBuf> = mounts
+                .runner
+                .iter()
+                .chain(&mounts.root)
+                .map(|(host, _)| host.clone())
                 .collect();
             hosts.dedup();
             hosts
         };
         let mine = hosts(first.path());
-        assert_eq!(mine.len(), DEP_CACHE_DIRS.len());
-        // Each is mounted where root keeps it and where the runner user
-        // does: a step runs as one or the other.
-        let cargo: Vec<PathBuf> = dep_cache_dirs_in(base.path(), first.path())
-            .into_iter()
+        // One set for steps that may run as the runner user, one for root.
+        assert_eq!(mine.len(), 2 * DEP_CACHE_DIRS.len());
+        let mounts = dep_cache_dirs_in(base.path(), first.path());
+        // The runner's set is mounted where root keeps it and where the
+        // runner user does: a step runs as one or the other.
+        let cargo: Vec<PathBuf> = mounts
+            .for_steps(true)
+            .iter()
             .filter(|(host, _)| host.ends_with("cargo-registry"))
-            .map(|(_, container)| container)
+            .map(|(_, container)| container.clone())
             .collect();
         assert_eq!(
             cargo,
@@ -1787,15 +1855,20 @@ jobs:
                 PathBuf::from("/home/runner/.cargo/registry")
             ]
         );
-        // An image of the user's own only gets root's.
-        let all = dep_cache_dirs_in(base.path(), first.path());
-        let roots = in_homes(&all, false);
+        // Steps that run as root get root's home only, from host
+        // directories no runner-user step writes.
+        let roots = mounts.for_steps(false);
         assert_eq!(roots.len(), DEP_CACHE_DIRS.len());
         assert!(
             roots.iter().all(|(_, c)| c.starts_with("/root")),
             "{roots:?}"
         );
-        assert_eq!(in_homes(&all, true), all);
+        assert!(
+            roots
+                .iter()
+                .all(|(host, _)| mounts.runner.iter().all(|(theirs, _)| theirs != host)),
+            "{mounts:?}"
+        );
         assert!(mine.iter().all(|dir| dir.is_dir()));
         let theirs = hosts(second.path());
         assert!(mine.iter().all(|dir| !theirs.contains(dir)));

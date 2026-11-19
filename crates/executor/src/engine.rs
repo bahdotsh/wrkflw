@@ -1611,16 +1611,9 @@ async fn prepare_action(
                         action.repository
                     ));
 
-                    // Clone the repository.
-                    // `tempdir` is only needed through `build_image` — after the
-                    // image is built all files are baked into the Docker image
-                    // and the temp directory can be dropped safely.
-                    let tempdir = tempfile::tempdir().map_err(|e| {
-                        ExecutionError::Execution(format!("Failed to create temp dir: {}", e))
-                    })?;
-                    let repo_url = format!("https://github.com/{}.git", action.repository);
-                    let repo_dir = tempdir.path().join("action");
-                    shallow_clone(&repo_url, &action.version, &repo_dir, provider_token).await?;
+                    // This run's clone of the repository, made once.
+                    let clone = cloned_action(action, provider_token).await?;
+                    let repo_dir = clone.path().join("action");
 
                     // Resolve the action directory (respecting sub_path)
                     let action_dir = match &action.sub_path {
@@ -1999,7 +1992,7 @@ async fn shallow_clone(
         Ok(()) => return Ok(()),
         Err(e) => e,
     };
-    if !repo_url.starts_with(GITHUB_CLONE_PREFIX) {
+    if !repo_url.starts_with(GITHUB_CLONE_PREFIX) || !needs_credentials(&anonymous.to_string()) {
         return Err(anonymous);
     }
     let Some(token) = crate::run_options::remote_clone_token(provider_token).await else {
@@ -2018,6 +2011,43 @@ async fn shallow_clone(
                 anonymous, with_token
             ))
         })
+}
+
+/// This run's clone of the remote action `action`'s repository, under
+/// `action` in the directory returned: made the first time a step of the
+/// run asks for that `repo@ref`, and kept until the run ends, so every
+/// step and matrix leg that uses it shares one.
+async fn cloned_action(
+    action: &ActionInfo,
+    provider_token: Option<&str>,
+) -> Result<Arc<tempfile::TempDir>, ExecutionError> {
+    let key = format!("{}@{}", action.repository, action.version);
+    let url = format!("{}{}.git", GITHUB_CLONE_PREFIX, action.repository);
+    let version = action.version.clone();
+    let token = provider_token.map(str::to_string);
+    acceleration::run_action_clone(&key, |dir| async move {
+        shallow_clone(&url, &version, &dir, token.as_deref())
+            .await
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(ExecutionError::Execution)
+}
+
+/// Whether a failed anonymous clone's error says GitHub wanted credentials,
+/// as it does for a private repository (which it reports as not found), and
+/// not that the ref or the network was at fault, which a token won't fix.
+fn needs_credentials(error: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        "could not read Username",
+        "terminal prompts disabled",
+        "Authentication failed",
+        "Repository not found",
+        "requested URL returned error: 401",
+        "requested URL returned error: 403",
+        "requested URL returned error: 404",
+    ];
+    MARKERS.iter().any(|marker| error.contains(marker))
 }
 
 /// Where every clone of a GitHub repository starts.
@@ -4407,6 +4437,14 @@ pub(crate) struct JobServices<'a> {
     pub platform_overrides: &'a HashMap<String, String>,
 }
 
+impl JobServices<'_> {
+    /// The `GITHUB_TOKEN` a secret provider gave the job, which a clone of
+    /// a private repository tries first.
+    fn clone_token(&self) -> Option<&str> {
+        self.secrets_context.get("GITHUB_TOKEN").map(String::as_str)
+    }
+}
+
 /// Flush pending cache saves. Called at end-of-job only when the job succeeded,
 /// matching GitHub Actions' behavior where `actions/cache` saves in a post-step
 /// hook that only runs after all steps complete and the job succeeds.
@@ -5664,15 +5702,8 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
             handle_cache_action(&step_name, &ctx).await?
         } else {
             // Get action info
-            let prepared = prepare_action(
-                &action_info,
-                ctx.runtime,
-                ctx.services
-                    .secrets_context
-                    .get("GITHUB_TOKEN")
-                    .map(String::as_str),
-            )
-            .await?;
+            let prepared =
+                prepare_action(&action_info, ctx.runtime, ctx.services.clone_token()).await?;
             // An action whose metadata couldn't be fetched runs like any
             // other image action; only the reason it ran nothing differs.
             let fetch_error = match &prepared {
@@ -5734,22 +5765,10 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                         )
                         .await?
                     } else {
-                        // Handle remote composite action: clone the repo and execute
-                        let tempdir = tempfile::tempdir().map_err(|e| {
-                            ExecutionError::Execution(format!("Failed to create temp dir: {}", e))
-                        })?;
-                        let repo_url = format!("https://github.com/{}.git", action_info.repository);
-                        let repo_dir = tempdir.path().join("action");
-                        shallow_clone(
-                            &repo_url,
-                            &action_info.version,
-                            &repo_dir,
-                            ctx.services
-                                .secrets_context
-                                .get("GITHUB_TOKEN")
-                                .map(String::as_str),
-                        )
-                        .await?;
+                        // Handle remote composite action: this run's clone
+                        // of its repository, made once, then its steps.
+                        let clone = cloned_action(&action_info, ctx.services.clone_token()).await?;
+                        let repo_dir = clone.path().join("action");
                         // If the action has a sub-path, the action.yml is inside that directory
                         let action_dir = match &action_info.sub_path {
                             Some(p) => {
@@ -7064,16 +7083,7 @@ async fn execute_reusable_workflow_job(
             // Clone into a subdirectory within tempdir to get clean structure
             let repo_dir = tempdir.path().join("cloned_repo");
 
-            shallow_clone(
-                &repo_url,
-                &r#ref,
-                &repo_dir,
-                ctx.services
-                    .secrets_context
-                    .get("GITHUB_TOKEN")
-                    .map(String::as_str),
-            )
-            .await?;
+            shallow_clone(&repo_url, &r#ref, &repo_dir, ctx.services.clone_token()).await?;
             let joined = repo_dir.join(path);
 
             if !joined.exists() {
@@ -7950,17 +7960,7 @@ async fn execute_node_action(
             None,
         )
     } else {
-        let key = format!("{}@{}", action_info.repository, action_info.version);
-        let url = format!("{}{}.git", GITHUB_CLONE_PREFIX, action_info.repository);
-        let version = action_info.version.clone();
-        let token = ctx.services.secrets_context.get("GITHUB_TOKEN").cloned();
-        let clone = acceleration::run_action_clone(&key, |dir| async move {
-            shallow_clone(&url, &version, &dir, token.as_deref())
-                .await
-                .map_err(|e| e.to_string())
-        })
-        .await
-        .map_err(ExecutionError::Execution)?;
+        let clone = cloned_action(action_info, ctx.services.clone_token()).await?;
         let dir = js::action_dir_in(clone.path(), action_info.sub_path.as_deref())
             .map_err(ExecutionError::Execution)?;
         (dir, Some(clone))
@@ -9051,6 +9051,22 @@ mod tests {
             )
         );
         assert!(!header.contains("ghp_secret"));
+    }
+
+    #[test]
+    fn only_a_clone_github_refused_is_retried_with_a_token() {
+        assert!(needs_credentials(
+            "Failed to clone: fatal: could not read Username for 'https://github.com': terminal prompts disabled"
+        ));
+        assert!(needs_credentials(
+            "remote: Repository not found.\nfatal: repository 'https://github.com/o/r.git/' not found"
+        ));
+        assert!(!needs_credentials(
+            "warning: Could not find remote branch v9 to clone.\nfatal: Remote branch v9 not found in upstream origin"
+        ));
+        assert!(!needs_credentials(
+            "fatal: unable to access 'https://github.com/o/r.git/': Could not resolve host: github.com"
+        ));
     }
 
     #[tokio::test]

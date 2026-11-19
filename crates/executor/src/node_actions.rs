@@ -255,14 +255,19 @@ pub(crate) fn post_as_step(post: &PostStep) -> wrkflw_parser::workflow::Step {
 
 /// Repositories of actions cloned this run, by `repo@ref`, so a matrix's
 /// legs and repeated steps clone each once. Kept until the run ends.
+/// Each key has its own cell, so a slow clone holds up only the steps
+/// waiting for that same action.
 #[derive(Default)]
 pub(crate) struct ActionClones {
-    clones: tokio::sync::Mutex<HashMap<String, Arc<tempfile::TempDir>>>,
+    clones: Mutex<HashMap<String, Arc<CloneCell>>>,
 }
+
+type CloneCell = tokio::sync::OnceCell<Arc<tempfile::TempDir>>;
 
 impl ActionClones {
     /// The clone of `key`, made with `clone` into the directory it is
-    /// given the first time it's asked for.
+    /// given the first time it's asked for. A failed clone isn't kept, so
+    /// the next step that asks tries again.
     pub(crate) async fn get_or_clone<F, Fut>(
         &self,
         key: &str,
@@ -272,15 +277,21 @@ impl ActionClones {
         F: FnOnce(PathBuf) -> Fut,
         Fut: std::future::Future<Output = Result<(), String>>,
     {
-        let mut clones = self.clones.lock().await;
-        if let Some(dir) = clones.get(key) {
-            return Ok(dir.clone());
-        }
-        let dir = tempfile::tempdir().map_err(|e| format!("Failed to create temp dir: {}", e))?;
-        clone(dir.path().join("action")).await?;
-        let dir = Arc::new(dir);
-        clones.insert(key.to_string(), dir.clone());
-        Ok(dir)
+        let cell = self
+            .clones
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(key.to_string())
+            .or_default()
+            .clone();
+        cell.get_or_try_init(|| async {
+            let dir =
+                tempfile::tempdir().map_err(|e| format!("Failed to create temp dir: {}", e))?;
+            clone(dir.path().join("action")).await?;
+            Ok(Arc::new(dir))
+        })
+        .await
+        .cloned()
     }
 }
 
@@ -407,6 +418,50 @@ mod tests {
         let names: Vec<_> = take_posts(&posts).into_iter().map(|p| p.name).collect();
         assert_eq!(names, ["second", "first"]);
         assert!(take_posts(&posts).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_slow_clone_holds_up_only_its_own_action() {
+        let clones = Arc::new(ActionClones::default());
+        let (release, wait) = tokio::sync::oneshot::channel::<()>();
+        let slow = {
+            let clones = clones.clone();
+            tokio::spawn(async move {
+                clones
+                    .get_or_clone("slow/r@v1", |dir| async move {
+                        let _ = wait.await;
+                        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())
+                    })
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        let fast = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            clones.get_or_clone("fast/r@v1", |dir| async move {
+                std::fs::create_dir_all(&dir).map_err(|e| e.to_string())
+            }),
+        )
+        .await
+        .expect("another action's clone waited on the slow one");
+        assert!(fast.is_ok());
+        release.send(()).unwrap();
+        assert!(slow.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_failed_clone_is_tried_again() {
+        let clones = ActionClones::default();
+        let first = clones
+            .get_or_clone("o/r@v1", |_| async { Err("offline".to_string()) })
+            .await;
+        assert!(first.is_err());
+        let second = clones
+            .get_or_clone("o/r@v1", |dir| async move {
+                std::fs::create_dir_all(&dir).map_err(|e| e.to_string())
+            })
+            .await;
+        assert!(second.is_ok());
     }
 
     #[tokio::test]

@@ -6962,25 +6962,50 @@ fn prepare_container_mounts(
         }
     }
 
-    // Composite actions seed GITHUB_ACTION_PATH with the host action directory
-    // (see `execute_composite_action`). Under docker/podman that host path is
-    // invisible inside the container, so mount it and remap the env var to the
-    // container-side path, mirroring the GITHUB_ENV remap above.
+    // Composite and JavaScript actions seed GITHUB_ACTION_PATH with the host
+    // action directory (see `execute_composite_action`). Under docker/podman
+    // that host path is invisible inside the container, so mount it and remap
+    // the env var to the container-side path, mirroring the GITHUB_ENV remap
+    // above. A JavaScript action also names its repository's root, which its
+    // scripts may reach out of its own directory into (`main: ../dist/x.js`):
+    // then the whole repository is mounted, and the action path points into it.
+    let action_root = step_env.remove(ACTION_ROOT_ENV);
     if is_container_runtime {
         if let Some(action_path) = job_env.get("GITHUB_ACTION_PATH") {
-            let container_action_dir = Path::new(crate::job_session::CONTAINER_ACTION_DIR);
+            let (host, container) = action_mount(Path::new(action_path), action_root.as_deref());
             step_env.insert(
                 "GITHUB_ACTION_PATH".to_string(),
-                container_action_dir.to_string_lossy().to_string(),
+                container.to_string_lossy().to_string(),
             );
             owned_volume_paths.push((
-                PathBuf::from(action_path),
-                container_action_dir.to_path_buf(),
+                host,
+                Path::new(crate::job_session::CONTAINER_ACTION_DIR).to_path_buf(),
             ));
         }
     }
 
     (owned_volume_paths, github_mount)
+}
+
+/// Env var naming the root of the repository a JavaScript action came
+/// from, so a container mounts all of it: see [`action_mount`]. wrkflw's
+/// own; taken out of the step's env before the step runs.
+const ACTION_ROOT_ENV: &str = "WRKFLW_ACTION_ROOT";
+
+/// What to mount at [`crate::job_session::CONTAINER_ACTION_DIR`] for the
+/// action at `action_path`, and where the action is in the container: its
+/// repository's `root` when the action is inside it, else its own directory.
+fn action_mount(action_path: &Path, root: Option<&str>) -> (PathBuf, PathBuf) {
+    let container_dir = Path::new(crate::job_session::CONTAINER_ACTION_DIR);
+    match root.and_then(|root| {
+        action_path
+            .strip_prefix(root)
+            .ok()
+            .map(|inside| (root, inside))
+    }) {
+        Some((root, inside)) => (PathBuf::from(root), container_dir.join(inside)),
+        None => (action_path.to_path_buf(), container_dir.to_path_buf()),
+    }
 }
 
 /// Log warnings for container fields that are parsed but not yet supported.
@@ -7969,17 +7994,20 @@ async fn execute_node_action(
 ) -> Result<StepResult, ExecutionError> {
     use crate::node_actions as js;
 
-    let (action_dir, clone) = if action_info.is_local {
+    // The action's directory, and for a remote one the root of its
+    // repository, which is all there on GitHub.
+    let (action_dir, repo_root, clone) = if action_info.is_local {
         let dir = Path::new(&action_info.repository);
         (
             dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf()),
             None,
+            None,
         )
     } else {
         let clone = cloned_action(action_info, ctx.services.clone_token()).await?;
-        let dir = js::action_dir_in(clone.path(), action_info.sub_path.as_deref())
+        let (dir, root) = js::action_dir_in(clone.path(), action_info.sub_path.as_deref())
             .map_err(ExecutionError::Execution)?;
-        (dir, Some(clone))
+        (dir, Some(root), Some(clone))
     };
 
     // Inputs: `with` evaluated in the caller's scope, then each default.
@@ -7996,6 +8024,12 @@ async fn execute_node_action(
         "GITHUB_ACTION_PATH".to_string(),
         action_dir.to_string_lossy().to_string(),
     );
+    if let Some(root) = &repo_root {
+        env.insert(
+            ACTION_ROOT_ENV.to_string(),
+            root.to_string_lossy().to_string(),
+        );
+    }
     let (repository, git_ref) = if action_info.is_local {
         (String::new(), String::new())
     } else {
@@ -10129,6 +10163,43 @@ mod tests {
         // :rw should be stripped
         assert_eq!(volumes[1].0, PathBuf::from("/src"));
         assert_eq!(volumes[1].1, PathBuf::from("/dest"));
+    }
+
+    /// A JavaScript action in a subdirectory of its repository has the
+    /// whole repository mounted, so a `main: ../dist/x.js` is there, and its
+    /// action path points into it. wrkflw's root var never reaches the step.
+    #[test]
+    fn container_mounts_a_sub_path_actions_whole_repository() {
+        let job_env = HashMap::from([
+            ("WRKFLW_RUNTIME_MODE".to_string(), "docker".to_string()),
+            (
+                "GITHUB_ACTION_PATH".to_string(),
+                "/c/action/init".to_string(),
+            ),
+            (ACTION_ROOT_ENV.to_string(), "/c/action".to_string()),
+        ]);
+        let mut step_env = job_env.clone();
+        let (volumes, _) = prepare_container_mounts(&mut step_env, &job_env, None, false);
+        assert_eq!(
+            volumes,
+            vec![(PathBuf::from("/c/action"), PathBuf::from("/github/action"))]
+        );
+        assert_eq!(step_env["GITHUB_ACTION_PATH"], "/github/action/init");
+        assert!(!step_env.contains_key(ACTION_ROOT_ENV));
+
+        // Without a root, or on the host, as before.
+        assert_eq!(
+            action_mount(Path::new("/l/act"), None),
+            (PathBuf::from("/l/act"), PathBuf::from("/github/action"))
+        );
+        assert_eq!(
+            action_mount(Path::new("/l/act"), Some("/elsewhere")),
+            (PathBuf::from("/l/act"), PathBuf::from("/github/action"))
+        );
+        let mut host_env = HashMap::from([(ACTION_ROOT_ENV.to_string(), "/c".to_string())]);
+        let (volumes, _) = prepare_container_mounts(&mut host_env, &job_env, None, false);
+        assert!(volumes.is_empty());
+        assert!(!host_env.contains_key(ACTION_ROOT_ENV));
     }
 
     #[test]

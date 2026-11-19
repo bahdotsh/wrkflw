@@ -298,24 +298,28 @@ impl ActionClones {
     }
 }
 
-/// The directory of a cloned action: its repository's root, or the
-/// subdirectory `sub_path` names, which must stay inside it.
-pub(crate) fn action_dir_in(clone: &Path, sub_path: Option<&str>) -> Result<PathBuf, String> {
+/// The directory of a cloned action, its repository's root or the
+/// subdirectory `sub_path` names, which must stay inside it; and that
+/// root. Both resolved, so the directory is a path inside the root.
+pub(crate) fn action_dir_in(
+    clone: &Path,
+    sub_path: Option<&str>,
+) -> Result<(PathBuf, PathBuf), String> {
     let root = clone.join("action");
-    let Some(sub) = sub_path.filter(|s| !s.is_empty()) else {
-        return Ok(root);
-    };
-    let joined = root.join(sub);
     let canonical_root = root
         .canonicalize()
         .map_err(|e| format!("Failed to resolve {}: {}", root.display(), e))?;
-    let canonical = joined
+    let Some(sub) = sub_path.filter(|s| !s.is_empty()) else {
+        return Ok((canonical_root.clone(), canonical_root));
+    };
+    let canonical = root
+        .join(sub)
         .canonicalize()
         .map_err(|e| format!("The action's path '{}' doesn't exist: {}", sub, e))?;
     if !canonical.starts_with(&canonical_root) {
         return Err(format!("The action's path '{}' leaves its repository", sub));
     }
-    Ok(canonical)
+    Ok((canonical, canonical_root))
 }
 
 #[cfg(test)]
@@ -487,11 +491,15 @@ mod tests {
     fn a_sub_path_must_stay_in_the_repository() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("action/sub")).unwrap();
-        assert!(action_dir_in(dir.path(), Some("sub")).is_ok());
+        let root = dir.path().join("action").canonicalize().unwrap();
+        assert_eq!(
+            action_dir_in(dir.path(), Some("sub")).unwrap(),
+            (root.join("sub"), root.clone())
+        );
         assert!(action_dir_in(dir.path(), Some("../..")).is_err());
         assert_eq!(
             action_dir_in(dir.path(), None).unwrap(),
-            dir.path().join("action")
+            (root.clone(), root)
         );
     }
 }

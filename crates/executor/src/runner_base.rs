@@ -36,7 +36,9 @@ pub fn published_image(dockerfile: &str) -> String {
 /// The runner base image to start job images from, or `None` when
 /// [`PREBUILT_IMAGES_ENV`] turns it off or it couldn't be pulled lately.
 pub(crate) fn image() -> Option<String> {
-    if !enabled() {
+    // Unit tests build with mock runtimes and mustn't pull, or leave the
+    // unavailable marker in the user's cache.
+    if cfg!(test) || !enabled() {
         return None;
     }
     let image = std::env::var(RUNNER_IMAGE_ENV)

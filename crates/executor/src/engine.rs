@@ -2112,15 +2112,19 @@ fn clone_auth_env(token: &str, count: Option<&str>) -> Vec<(String, String)> {
 
 /// A `git` command for a clone: hooks off, as cloned repositories are
 /// untrusted and could carry post-checkout hooks; never asking for a
-/// password, which would hang a run; in English, which [`needs_credentials`]
-/// reads; and with `auth` in its environment.
+/// password, at the terminal or in Git Credential Manager's window, which
+/// would hang a run (a credential helper that answers on its own still
+/// does); in English, which [`needs_credentials`] reads; killed with the
+/// step that waits on it; and with `auth` in its environment.
 fn clone_git(auth: &[(String, String)]) -> tokio::process::Command {
     let mut git = tokio::process::Command::new("git");
     git.args(["-c", "core.hooksPath=/dev/null"])
         .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GCM_INTERACTIVE", "never")
         .env("LC_ALL", "C")
         .envs(auth.iter().map(|(k, v)| (k, v)))
-        .stdin(std::process::Stdio::null());
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true);
     git
 }
 

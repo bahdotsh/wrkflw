@@ -66,10 +66,15 @@ pub(crate) fn pull_refused(image: &str, error: &str) -> bool {
     // A missing tag is "<image>: not found" or "manifest unknown"; a
     // "not found" naming anything else is a missing `docker`, shell or file.
     let missing_tag = format!("{}: not found", image.to_ascii_lowercase());
+    // A registry's "denied" is always about access to the image; a bare
+    // "denied" would also match the engine's own "permission denied", such
+    // as on its socket, which says nothing about the image.
     error.contains(&missing_tag)
         || [
             "manifest unknown",
-            "denied",
+            "pull access denied",
+            "requested access to the resource is denied",
+            "error from registry: denied",
             "unauthorized",
             "403 forbidden",
         ]
@@ -157,6 +162,17 @@ mod tests {
         assert!(!refused("no space left on device"));
         assert!(!refused("docker not found in PATH"));
         assert!(!refused("sh: 1: docker: not found"));
+        assert!(refused(
+            "pull access denied for ghcr.io/bahdotsh/wrkflw-runner, repository does not exist"
+        ));
+        assert!(refused("error from registry: denied\ndenied"));
+        assert!(!refused(
+            "permission denied while trying to connect to the Docker daemon socket at \
+             unix:///var/run/docker.sock"
+        ));
+        assert!(!refused(
+            "open /root/.docker/config.json: permission denied"
+        ));
     }
 
     #[test]

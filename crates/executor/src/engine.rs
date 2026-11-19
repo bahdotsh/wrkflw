@@ -2509,19 +2509,11 @@ pub fn runner_base_dockerfile() -> String {
     dockerfile
 }
 
-/// A job image's Dockerfile on the runner base image `base`: the runner
-/// user given `uid` when it isn't GitHub's, a `RUN` naming `week` for
+/// A job image's Dockerfile on the runner base image `base` (whose runner
+/// user already has this machine's uid): a `RUN` naming `week` for
 /// floating versions, and then what [`combined_dockerfile_tail`] adds.
-fn dockerfile_on_runner_base(
-    runtimes: &[SetupRuntime],
-    base: &str,
-    week: Option<&str>,
-    uid: u32,
-) -> String {
+fn dockerfile_on_runner_base(runtimes: &[SetupRuntime], base: &str, week: Option<&str>) -> String {
     let mut dockerfile = format!("FROM {}\n", base);
-    if uid != crate::runner_user::HOSTED_UID {
-        dockerfile.push_str(&format!("RUN {}\n", crate::runner_user::remap_script(uid)));
-    }
     if let Some(week) = week {
         dockerfile.push_str(&format!("RUN : floating versions resolved in {}\n", week));
     }
@@ -2532,10 +2524,11 @@ fn dockerfile_on_runner_base(
 /// The job image for `runtimes` built on the published runner base image,
 /// when it applies: a built-in image on `ubuntu:latest` with no Node.js of
 /// its own to install, on an engine that keeps what it builds. `None`
-/// when it doesn't apply, or the base image couldn't be pulled, which is
-/// remembered for a day: the caller then builds the image here from the
-/// start. `Some(Err)` when the base was there but the runtimes failed to
-/// build on it, as they would here.
+/// when it doesn't apply, when the base image couldn't be pulled (a
+/// registry's refusal is remembered for a day), or when its runner user
+/// couldn't be given this machine's uid: the caller then builds the image
+/// here from the start. `Some(Err)` when the base was there but the
+/// runtimes failed to build on it, as they would here.
 async fn build_on_runner_base(
     runtimes: &[SetupRuntime],
     base_image: &str,
@@ -2551,6 +2544,28 @@ async fn build_on_runner_base(
         return None;
     }
     let base = crate::runner_base::image()?;
+    let week = floating_versions_week(runtimes, chrono::Utc::now());
+    build_on_base(
+        runtimes,
+        &base,
+        runtime,
+        what,
+        crate::runner_user::uid(),
+        week.as_deref(),
+    )
+    .await
+}
+
+/// [`build_on_runner_base`] on the base image `base`, for the runner user's
+/// `uid` and the floating-versions `week`.
+async fn build_on_base(
+    runtimes: &[SetupRuntime],
+    base: &str,
+    runtime: &dyn ContainerRuntime,
+    what: &str,
+    uid: u32,
+    week: Option<&str>,
+) -> Option<Result<String, ExecutionError>> {
     // A build of nothing but `FROM` pulls the base, with a build's time
     // limit, which a large image needs, rather than a pull's.
     let probe = format!(
@@ -2569,8 +2584,8 @@ async fn build_on_runner_base(
         // Only a registry's refusal is remembered: a network that's down
         // or a full disk says nothing about the image, so the next run
         // tries it again.
-        let when = if crate::runner_base::pull_refused(&base, &e.to_string()) {
-            crate::runner_base::mark_unavailable(&base);
+        let when = if crate::runner_base::pull_refused(base, &e.to_string()) {
+            crate::runner_base::mark_unavailable(base);
             "tried again tomorrow"
         } else {
             "tried again next run"
@@ -2585,9 +2600,29 @@ async fn build_on_runner_base(
         ));
         return None;
     }
-    let week = floating_versions_week(runtimes, chrono::Utc::now());
-    let dockerfile =
-        dockerfile_on_runner_base(runtimes, &probe, week.as_deref(), crate::runner_user::uid());
+    // The runner user given this machine's uid in an image of its own: a
+    // failure there says nothing about the job, so its image is then built
+    // here, where the user gets the uid from the start.
+    let start = if uid == crate::runner_user::HOSTED_UID {
+        probe
+    } else {
+        let remapped = format!("{}-uid{}", probe, uid);
+        let remap = format!(
+            "FROM {}\nRUN {}\n",
+            probe,
+            crate::runner_user::remap_script(uid)
+        );
+        if let Err(e) = build_image_once(&remap, &remapped, "the runner user", runtime).await {
+            wrkflw_logging::info(&format!(
+                "The runner user couldn't be given uid {} on the runner base image, so the \
+                 job's image is built here: {}",
+                uid, e
+            ));
+            return None;
+        }
+        remapped
+    };
+    let dockerfile = dockerfile_on_runner_base(runtimes, &start, week);
     let tag = combined_image_tag(runtimes, &dockerfile);
     Some(
         build_image_once(&dockerfile, &tag, what, runtime)
@@ -9007,19 +9042,53 @@ mod tests {
             floating: false,
             env: Vec::new(),
         }];
-        let df = dockerfile_on_runner_base(&python, "base:x", None, crate::runner_user::HOSTED_UID);
+        let df = dockerfile_on_runner_base(&python, "base:x", None);
         assert!(df.starts_with("FROM base:x\n"), "{df}");
         assert!(df.contains("RUN install-python"), "{df}");
         assert!(!df.contains("build-essential"), "{df}");
         assert!(!df.contains("usermod"), "{df}");
         assert!(!df.contains("floating versions"), "{df}");
 
-        let linux = dockerfile_on_runner_base(&python, "base:x", Some("2026-W47"), 1000);
-        assert!(linux.contains("usermod --non-unique --uid 1000"), "{linux}");
+        let weekly = dockerfile_on_runner_base(&python, "base:x", Some("2026-W47"));
         assert!(
-            linux.contains("floating versions resolved in 2026-W47"),
-            "{linux}"
+            weekly.contains("floating versions resolved in 2026-W47"),
+            "{weekly}"
         );
+    }
+
+    /// A runner user that can't be given this machine's uid on the base
+    /// image says nothing about the job: its image is built here instead.
+    #[tokio::test]
+    async fn a_failed_uid_remap_builds_the_job_image_here() {
+        let failed = flaky(vec![None, Some("usermod: user runner is busy")], None);
+        assert!(
+            build_on_base(&[], "remap-fails:1", &failed, "x", 1000, None)
+                .await
+                .is_none()
+        );
+
+        let built = flaky(Vec::new(), None);
+        let tag = build_on_base(&[], "remap-works:1", &built, "x", 1000, None)
+            .await
+            .expect("the base was there")
+            .unwrap();
+        assert!(tag.starts_with(COMBINED_IMAGE_PREFIX), "{tag}");
+        assert_eq!(*built.builds.lock().unwrap(), 3, "probe, remap, job image");
+
+        // With GitHub's uid there is nothing to remap.
+        let hosted = flaky(Vec::new(), None);
+        build_on_base(
+            &[],
+            "hosted:1",
+            &hosted,
+            "x",
+            crate::runner_user::HOSTED_UID,
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(*hosted.builds.lock().unwrap(), 2, "probe, job image");
     }
 
     #[test]

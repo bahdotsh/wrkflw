@@ -39,12 +39,41 @@ jobs:
     name: Build (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
+      # One OS failing says nothing about the others: let them finish.
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # The Docker tests start their jobs from the runner base image, built
+      # here once from the committed Dockerfile and cached by its text, as
+      # a release publishes it. Built inside each test instead, its 120 MB
+      # from Ubuntu's archive sometimes outlast the 10-minute build limit.
+      # Its apt uses Azure's Ubuntu mirror, as the runner itself does, so
+      # what the tests install on it (docker.io) doesn't wait on
+      # archive.ubuntu.com either.
+      - name: Restore the runner base image
+        if: runner.os == 'Linux'
+        id: runner-image
+        uses: actions/cache@v4
+        with:
+          path: ~/runner-image.tar
+          key: runner-image-azure-${{ hashFiles('docker/runner.Dockerfile') }}
+      - name: Build the runner base image
+        if: runner.os == 'Linux' && steps.runner-image.outputs.cache-hit != 'true'
+        run: |
+          mirror='RUN sed -i -E "s#http://(archive|security)\.ubuntu\.com#http://azure.archive.ubuntu.com#g" /etc/apt/sources.list.d/ubuntu.sources'
+          { head -n 1 docker/runner.Dockerfile; echo "$mirror"; tail -n +2 docker/runner.Dockerfile; } \
+            > "$RUNNER_TEMP/runner.Dockerfile"
+          docker build -f "$RUNNER_TEMP/runner.Dockerfile" -t wrkflw-runner:ci docker
+          docker save wrkflw-runner:ci -o ~/runner-image.tar
+      - name: Load the runner base image
+        if: runner.os == 'Linux' && steps.runner-image.outputs.cache-hit == 'true'
+        run: docker load -i ~/runner-image.tar
       - run: cargo build --workspace --all-features
       - run: cargo check --no-default-features --workspace
       - run: cargo test --workspace --all-features
+        env:
+          WRKFLW_RUNNER_IMAGE: ${{ runner.os == 'Linux' && 'wrkflw-runner:ci' || '' }}

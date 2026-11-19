@@ -137,17 +137,67 @@ pub async fn resolve_remote_action(
     version: &str,
     sub_path: Option<&str>,
 ) -> Result<ResolvedAction, String> {
-    let token = std::env::var("GITHUB_TOKEN").ok();
     let disk_cache_dir = action_cache_dir();
-    resolve_with(
+    resolve_with_token(
         GITHUB_RAW_BASE_URL,
         disk_cache_dir.as_deref(),
         repo,
         version,
         sub_path,
-        token.as_deref(),
+        ["GITHUB_TOKEN", "GH_TOKEN"]
+            .into_iter()
+            .find_map(|name| std::env::var(name).ok().filter(|t| !t.trim().is_empty())),
+        || crate::run_options::remote_clone_token(None),
     )
     .await
+}
+
+/// [`resolve_with`] with `token`, else, when the action wasn't found
+/// without one, again with what `later_token` finds (`gh auth token`):
+/// a private action needs the same token a clone of it would, and asking
+/// `gh` for one only when it does keeps public actions from waiting on it.
+#[allow(clippy::too_many_arguments)]
+async fn resolve_with_token<F, Fut>(
+    base_url: &str,
+    disk_cache_dir: Option<&Path>,
+    repo: &str,
+    version: &str,
+    sub_path: Option<&str>,
+    token: Option<String>,
+    later_token: F,
+) -> Result<ResolvedAction, String>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Option<String>>,
+{
+    let first = resolve_with(
+        base_url,
+        disk_cache_dir,
+        repo,
+        version,
+        sub_path,
+        token.as_deref(),
+    )
+    .await;
+    match first {
+        // Both spellings of a missing file read "HTTP 404 ..." as
+        // `fetch_action_file` words them.
+        Err(e) if token.is_none() && e.contains("HTTP 404") => match later_token().await {
+            Some(token) => {
+                resolve_with(
+                    base_url,
+                    disk_cache_dir,
+                    repo,
+                    version,
+                    sub_path,
+                    Some(&token),
+                )
+                .await
+            }
+            None => Err(e),
+        },
+        other => other,
+    }
 }
 
 /// [`resolve_remote_action`] with its environment made explicit, so tests can
@@ -1350,6 +1400,57 @@ runs:
                 !has_auth,
                 "GITHUB_TOKEN leaked to redirect target! Authorization header found on redirect request."
             );
+        }
+
+        #[tokio::test]
+        async fn a_private_action_is_resolved_with_a_token_found_later() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/later/private/v1/action.yml"))
+                .and(header_exists("Authorization"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(ACTION_YML_BODY))
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .respond_with(ResponseTemplate::new(404))
+                .with_priority(10)
+                .mount(&server)
+                .await;
+
+            let resolved = resolve_with_token(
+                &server.uri(),
+                None,
+                "later/private",
+                "v1",
+                None,
+                None,
+                || async { Some("gho_from_gh".to_string()) },
+            )
+            .await;
+            assert!(resolved.is_ok(), "{resolved:?}");
+
+            // A public action never asks for one.
+            Mock::given(method("GET"))
+                .and(path("/later/public/v1/action.yml"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(ACTION_YML_BODY))
+                .mount(&server)
+                .await;
+            let asked = std::sync::atomic::AtomicBool::new(false);
+            resolve_with_token(
+                &server.uri(),
+                None,
+                "later/public",
+                "v1",
+                None,
+                None,
+                || async {
+                    asked.store(true, std::sync::atomic::Ordering::SeqCst);
+                    None
+                },
+            )
+            .await
+            .unwrap();
+            assert!(!asked.load(std::sync::atomic::Ordering::SeqCst));
         }
 
         #[tokio::test]

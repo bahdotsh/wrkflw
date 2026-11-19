@@ -83,3 +83,4 @@ jobs:
       - run: cargo test --workspace --all-features
         env:
           WRKFLW_RUNNER_IMAGE: ${{ runner.os == 'Linux' && 'wrkflw-runner:ci' || '' }}
+          WRKFLW_PREBUILT_IMAGES: ${{ runner.os == 'Linux' && '1' || '0' }}

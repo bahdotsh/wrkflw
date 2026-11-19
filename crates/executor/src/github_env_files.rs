@@ -143,11 +143,21 @@ pub fn read_step_environment_updates(job_env: &HashMap<String, String>) -> StepE
 /// directory a container mounts, so a step that sets it could have any
 /// directory mounted for a later one.
 const RESERVED_ENV: &[&str] = &[
-    "GITHUB_ACTION_PATH",
     "WRKFLW_RUNTIME_MODE",
     PATH_ADDITIONS_ENV,
     wrkflw_runtime::ENV_REMOVE,
 ];
+
+/// Prefixes of the names GitHub's runner sets and won't let `$GITHUB_ENV`
+/// overwrite. wrkflw reads several of them back as host paths
+/// (`GITHUB_ENV`'s directory is what a container mounts at `/github`, and
+/// `GITHUB_OUTPUT` is truncated before each step), so a step that set one
+/// could have any directory mounted or any file emptied.
+const RESERVED_PREFIXES: &[&str] = &["GITHUB_", "RUNNER_"];
+
+fn reserved(name: &str) -> bool {
+    RESERVED_ENV.contains(&name) || RESERVED_PREFIXES.iter().any(|p| name.starts_with(p))
+}
 
 /// Apply environment updates from a completed step to the job state.
 ///
@@ -166,7 +176,7 @@ pub fn apply_step_environment_updates(
 ) -> AppliedEnvironment {
     let mut updates = read_step_environment_updates(job_env);
     updates.env_vars.retain(|name, _| {
-        let reserved = RESERVED_ENV.contains(&name.as_str());
+        let reserved = reserved(name);
         if reserved {
             wrkflw_logging::warning(&format!(
                 "A step wrote {} to $GITHUB_ENV, which wrkflw sets itself: ignored",
@@ -364,7 +374,8 @@ mod tests {
         let mut job = job_env_in(dir.path());
         let applied = step(
             &mut job,
-            "GITHUB_ACTION_PATH=/\nWRKFLW_RUNTIME_MODE=docker\nWRKFLW_ENV_REMOVE=PATH\nKEPT=1\n",
+            "GITHUB_ACTION_PATH=/\nWRKFLW_RUNTIME_MODE=docker\nWRKFLW_ENV_REMOVE=PATH\n\
+             GITHUB_OUTPUT=/etc/hosts\nRUNNER_TEMP=/\nKEPT=1\n",
             "",
         );
         assert_eq!(job.get("KEPT").map(String::as_str), Some("1"));
@@ -372,9 +383,14 @@ mod tests {
             "GITHUB_ACTION_PATH",
             "WRKFLW_RUNTIME_MODE",
             "WRKFLW_ENV_REMOVE",
+            "RUNNER_TEMP",
         ] {
             assert!(!job.contains_key(name), "{name}");
         }
+        assert_ne!(
+            job.get("GITHUB_OUTPUT").map(String::as_str),
+            Some("/etc/hosts")
+        );
         assert_eq!(
             applied.env_vars,
             vec![("KEPT".to_string(), "1".to_string())]

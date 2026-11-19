@@ -11,3 +11,8 @@ WRKFLW_FRESH_WORKSPACE = "1"
 # An existing value wins, so name a file to measure, as in
 # `WRKFLW_JOB_MEMORY_FILE=/tmp/job-memory.json cargo run -- run ...`.
 WRKFLW_JOB_MEMORY_FILE = ""
+# And for the runner base image: a test run on a commit whose base isn't
+# published would remember it as unavailable in the user's cache, and real
+# runs would then skip it for a day. CI names its own base with
+# WRKFLW_RUNNER_IMAGE and sets this to 1.
+WRKFLW_PREBUILT_IMAGES = "0"

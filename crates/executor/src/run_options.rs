@@ -191,6 +191,7 @@ fn skip_list_key(list: &str) -> Vec<String> {
             Some((name, git_ref)) => {
                 format!("{}@{}", name.trim_end_matches('/').to_lowercase(), git_ref)
             }
+            None if entry.starts_with('.') => entry.trim_end_matches('/').to_string(),
             None => entry.trim_end_matches('/').to_lowercase(),
         })
         .collect();
@@ -218,12 +219,17 @@ fn skip_list_has(list: &str, uses: &str) -> bool {
                 None => (entry, None),
             };
             let name = name.trim_end_matches('/');
-            let named = action.eq_ignore_ascii_case(name)
-                || (!name.starts_with('.')
-                    && action.len() > name.len()
-                    && action.is_char_boundary(name.len())
-                    && action[..name.len()].eq_ignore_ascii_case(name)
-                    && action[name.len()..].starts_with('/'));
+            // A local path names a directory, which a case-sensitive
+            // filesystem tells apart from one spelt otherwise.
+            let named = if name.starts_with('.') {
+                action == name
+            } else {
+                action.eq_ignore_ascii_case(name)
+            } || (!name.starts_with('.')
+                && action.len() > name.len()
+                && action.is_char_boundary(name.len())
+                && action[..name.len()].eq_ignore_ascii_case(name)
+                && action[name.len()..].starts_with('/'));
             named
                 && match wanted_ref {
                     Some(wanted) => git_ref == Some(wanted),
@@ -328,6 +334,7 @@ mod tests {
         assert!(skip_list_has("org/deploy@v2", "org/deploy@v2"));
         assert!(!skip_list_has("org/deploy@v2", "org/deploy@v1"));
         assert!(skip_list_has("org/deploy@v2", "org/deploy/sub@v2"));
+        assert!(!skip_list_has("./Notify", "./notify"));
     }
 
     #[test]

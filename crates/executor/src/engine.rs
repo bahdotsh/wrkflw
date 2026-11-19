@@ -8086,14 +8086,15 @@ async fn run_node_script(
 }
 
 /// The root of the repository the local action at `dir` is in: the job's
-/// workspace it was read from, else the directory wrkflw runs in (see
-/// [`local_action_path`]). `None` when it is in neither.
+/// workspace it was read from. `None` when it was read from the directory
+/// wrkflw runs in (see [`local_action_path`]), so a container mounts the
+/// action's own directory and not the user's repository, `.git` and all,
+/// read-write.
 fn local_action_root(dir: &Path, workspace: &Path) -> Option<PathBuf> {
-    [Some(workspace.to_path_buf()), std::env::current_dir().ok()]
-        .into_iter()
-        .flatten()
-        .filter_map(|base| base.canonicalize().ok())
-        .find(|base| dir.starts_with(base))
+    workspace
+        .canonicalize()
+        .ok()
+        .filter(|base| dir.starts_with(base))
 }
 
 /// Whether the step whose env is `env` runs on this machine: under

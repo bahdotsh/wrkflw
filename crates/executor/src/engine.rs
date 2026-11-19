@@ -10630,6 +10630,27 @@ mod tests {
         assert_eq!(job_env.get("JOB_ONLY").unwrap(), "job-value");
     }
 
+    /// Every `GITHUB_*` and `RUNNER_*` variable wrkflw sets for a job is one
+    /// a step can't overwrite through `$GITHUB_ENV`, so the reserved list
+    /// can't fall behind the context wrkflw builds.
+    #[test]
+    fn every_variable_wrkflw_sets_is_reserved_from_github_env() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut env = environment::create_github_context(
+            &empty_workflow(),
+            dir.path(),
+            &environment::RunRef::default(),
+        );
+        environment::add_job_context(&mut env, "build");
+        environment::apply_github_container_context(&mut env);
+        let missing: Vec<_> = env
+            .keys()
+            .filter(|name| name.starts_with("GITHUB_") || name.starts_with("RUNNER_"))
+            .filter(|name| !crate::github_env_files::reserved(name))
+            .collect();
+        assert!(missing.is_empty(), "not reserved: {missing:?}");
+    }
+
     // --- workflow-level env tests ---
 
     #[test]

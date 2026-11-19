@@ -84,6 +84,10 @@ pub(crate) fn state_env_name(name: &str) -> String {
 /// declares, from `with` or else its `default`, and anything else `with`
 /// passes, as the runner passes it too. `evaluate` resolves `${{ }}` in a
 /// default, such as `${{ github.token }}`; `with` arrives evaluated.
+///
+/// Input names are matched without regard to case, as on GitHub: `with:
+/// Token:` gives the declared `token`, and each `INPUT_` variable is set
+/// once.
 pub(crate) fn input_env(
     definition: &serde_yaml::Value,
     with: Option<&HashMap<String, String>>,
@@ -91,11 +95,28 @@ pub(crate) fn input_env(
 ) -> Vec<(String, String)> {
     let mut env: Vec<(String, String)> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // `with` by the variable each entry sets. Two keys that differ only in
+    // case set the same one; the key that sorts last wins, so the choice
+    // doesn't depend on the map's order.
+    let mut given: Vec<(String, &String, &String)> = with
+        .into_iter()
+        .flatten()
+        .map(|(name, value)| (input_env_name(name), name, value))
+        .collect();
+    given.sort();
+    let given: HashMap<String, &String> = given
+        .into_iter()
+        .map(|(var, _, value)| (var, value))
+        .collect();
     if let Some(inputs) = definition.get("inputs").and_then(|v| v.as_mapping()) {
         for (name, spec) in inputs {
             let Some(name) = name.as_str() else { continue };
-            let value = match with.and_then(|w| w.get(name)) {
-                Some(given) => given.clone(),
+            let var = input_env_name(name);
+            if !seen.insert(var.clone()) {
+                continue;
+            }
+            let value = match given.get(&var) {
+                Some(given) => (*given).clone(),
                 None => match spec.get("default") {
                     Some(serde_yaml::Value::String(s)) => evaluate(s),
                     Some(serde_yaml::Value::Number(n)) => n.to_string(),
@@ -103,16 +124,16 @@ pub(crate) fn input_env(
                     _ => String::new(),
                 },
             };
-            seen.insert(name.to_string());
-            env.push((input_env_name(name), value));
+            env.push((var, value));
         }
     }
-    if let Some(with) = with {
-        let mut extra: Vec<_> = with.iter().filter(|(k, _)| !seen.contains(*k)).collect();
-        extra.sort();
-        for (name, value) in extra {
-            env.push((input_env_name(name), value.clone()));
-        }
+    let mut extra: Vec<_> = given
+        .into_iter()
+        .filter(|(var, _)| !seen.contains(var))
+        .collect();
+    extra.sort();
+    for (var, value) in extra {
+        env.push((var, value.clone()));
     }
     env
 }
@@ -126,12 +147,18 @@ pub(crate) fn input_env(
 pub(crate) fn node_command(script: &str, major: u32) -> String {
     let script = script.trim_start_matches("./").replace('\'', r"'\''");
     format!(
-        "v=$(node -p 'process.versions.node.split(\".\")[0]' 2>/dev/null) && [ \"$v\" -lt {major} ] && \
+        "command -v node >/dev/null 2>&1 || {{ echo '{NODE_MISSING}' >&2; exit 127; }}; \
+         v=$(node -p 'process.versions.node.split(\".\")[0]' 2>/dev/null) && [ \"$v\" -lt {major} ] && \
          echo \"::warning::This action asks for node{major}, and the job's image has Node $v: \
          a failure may come from the older Node\"; \
          node \"$GITHUB_ACTION_PATH\"/'{script}'"
     )
 }
+
+/// What [`node_command`] prints when there is no `node` to run, so a
+/// missing `node` is told from a script that fails, in any locale: bash's
+/// own "command not found" is translated.
+const NODE_MISSING: &str = "wrkflw: no node on PATH to run this JavaScript action";
 
 /// Why a JavaScript action didn't run when the image had no `bash` to
 /// start `node` with.
@@ -150,11 +177,7 @@ pub(crate) fn missing_program(exit_code: Option<i32>, output: &str) -> Option<&'
     {
         return Some(NO_BASH);
     }
-    (exit_code == Some(127)
-        && (output.contains("node: command not found")
-            || output.contains("node: not found")
-            || output.contains("\"node\": executable file not found")))
-    .then_some(NO_NODE)
+    (exit_code == Some(127) && output.contains(NODE_MISSING)).then_some(NO_NODE)
 }
 
 /// What an action saved for its `post`: `$GITHUB_STATE`'s entries, then
@@ -197,23 +220,66 @@ pub(crate) struct PostStep {
     pub withdrawn: bool,
 }
 
-/// The posts of the job running, in the order their actions ran.
-pub(crate) type JobPosts = Arc<Mutex<Vec<PostStep>>>;
+/// What a job keeps of the actions its steps run: their posts, in the
+/// order their actions ran, and the job's copy of each cloned action.
+#[derive(Default)]
+pub(crate) struct JobActions {
+    posts: Mutex<Vec<PostStep>>,
+    /// By `repo@ref`. As on GitHub's runner, which downloads an action
+    /// once per job, the job's steps share one copy, and what a step
+    /// writes beside the action (`npm ci` in its directory) the job's
+    /// later steps see; other jobs and matrix legs have copies of their
+    /// own.
+    copies: Mutex<HashMap<String, Arc<tempfile::TempDir>>>,
+}
+
+/// The [`JobActions`] of a job, shared by its steps.
+pub(crate) type JobScope = Arc<JobActions>;
 
 tokio::task_local! {
     /// Set around each step of a job by its step loop.
-    static JOB_POSTS: JobPosts;
+    static JOB_ACTIONS: JobScope;
 }
 
-/// Run `future`, a step of a job, so the posts of its actions go on `posts`.
+/// Run `future`, a step of a job, so what its actions leave for the job
+/// (posts, copies) goes in `job`.
 ///
 /// A plain `fn` returning the scope's future: an `async fn` would hold
 /// `future` and the scope that wraps it, twice the size of a step.
-pub(crate) fn collecting_posts<F: std::future::Future>(
-    posts: &JobPosts,
+pub(crate) fn within_job<F: std::future::Future>(
+    job: &JobScope,
     future: F,
-) -> tokio::task::futures::TaskLocalFuture<JobPosts, F> {
-    JOB_POSTS.scope(posts.clone(), future)
+) -> tokio::task::futures::TaskLocalFuture<JobScope, F> {
+    JOB_ACTIONS.scope(job.clone(), future)
+}
+
+/// The job's copy of the action `key` names, if a step of the job made one.
+pub(crate) fn job_copy(key: &str) -> Option<Arc<tempfile::TempDir>> {
+    JOB_ACTIONS
+        .try_with(|job| {
+            job.copies
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(key)
+                .cloned()
+        })
+        .ok()
+        .flatten()
+}
+
+/// Keep `copy` as the job's copy of the action `key` names, and return the
+/// job's copy: `copy`, or one kept first. Outside a job, `copy` itself.
+pub(crate) fn keep_job_copy(key: &str, copy: Arc<tempfile::TempDir>) -> Arc<tempfile::TempDir> {
+    JOB_ACTIONS
+        .try_with(|job| {
+            job.copies
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .entry(key.to_string())
+                .or_insert_with(|| copy.clone())
+                .clone()
+        })
+        .unwrap_or(copy)
 }
 
 /// Queue `post` for the end of the job, and return where it is in the
@@ -223,8 +289,8 @@ pub(crate) fn collecting_posts<F: std::future::Future>(
 /// test calling a step on its own, there is no end of job to run it at: it
 /// is dropped with a warning.
 pub(crate) fn queue_post(post: PostStep) -> Option<usize> {
-    let queued = JOB_POSTS.try_with(|posts| {
-        let mut posts = posts.lock().unwrap_or_else(|e| e.into_inner());
+    let queued = JOB_ACTIONS.try_with(|job| {
+        let mut posts = job.posts.lock().unwrap_or_else(|e| e.into_inner());
         posts.push(post.clone());
         posts.len() - 1
     });
@@ -241,8 +307,9 @@ pub(crate) fn queue_post(post: PostStep) -> Option<usize> {
 /// what `main` saved for it, or that it is withdrawn.
 pub(crate) fn update_post(index: Option<usize>, change: impl FnOnce(&mut PostStep)) {
     let Some(index) = index else { return };
-    let _ = JOB_POSTS.try_with(|posts| {
-        if let Some(post) = posts
+    let _ = JOB_ACTIONS.try_with(|job| {
+        if let Some(post) = job
+            .posts
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get_mut(index)
@@ -254,8 +321,8 @@ pub(crate) fn update_post(index: Option<usize>, change: impl FnOnce(&mut PostSte
 
 /// The posts queued so far and not withdrawn, last first, as GitHub runs
 /// them.
-pub(crate) fn take_posts(posts: &JobPosts) -> Vec<PostStep> {
-    let mut taken = std::mem::take(&mut *posts.lock().unwrap_or_else(|e| e.into_inner()));
+pub(crate) fn take_posts(job: &JobScope) -> Vec<PostStep> {
+    let mut taken = std::mem::take(&mut *job.posts.lock().unwrap_or_else(|e| e.into_inner()));
     taken.retain(|post| !post.withdrawn);
     taken.reverse();
     taken
@@ -345,7 +412,7 @@ pub(crate) fn action_dir_in(
     Ok((canonical, canonical_root))
 }
 
-/// A copy of the action cloned in `clone` for one step to run, so steps
+/// A copy of the action cloned in `clone` for one job to run, so jobs
 /// that run at once never share it: an action may write beside its own
 /// files (`npm ci` in its directory), and under emulation or a mounted
 /// directory two matrix legs would then write into one clone. The copy
@@ -436,6 +503,25 @@ mod tests {
     }
 
     #[test]
+    fn inputs_are_matched_without_regard_to_case() {
+        let def = yaml("inputs:\n  token:\n    default: d\n");
+        let with = HashMap::from([
+            ("Token".to_string(), "given".to_string()),
+            ("Extra".to_string(), "a".to_string()),
+            ("EXTRA".to_string(), "b".to_string()),
+        ]);
+        let env = input_env(&def, Some(&with), str::to_string);
+        assert_eq!(
+            env,
+            vec![
+                ("INPUT_TOKEN".to_string(), "given".to_string()),
+                ("INPUT_EXTRA".to_string(), "a".to_string()),
+            ],
+            "each variable once, the declared input from `with`"
+        );
+    }
+
+    #[test]
     fn state_comes_from_the_file_and_save_state_lines() {
         let state = saved_state(
             "a=1\nb=2\n",
@@ -453,13 +539,12 @@ mod tests {
 
     #[test]
     fn a_missing_node_or_bash_is_told_from_a_failing_script() {
+        assert_eq!(missing_program(Some(127), NODE_MISSING), Some(NO_NODE));
+        assert_eq!(missing_program(Some(1), NODE_MISSING), None);
         assert_eq!(
-            missing_program(Some(127), "bash: line 1: node: command not found"),
-            Some(NO_NODE)
-        );
-        assert_eq!(
-            missing_program(Some(1), "bash: line 1: node: command not found"),
-            None
+            missing_program(Some(127), "bash: node: Befehl nicht gefunden"),
+            None,
+            "only wrkflw's own probe says node is missing"
         );
         assert_eq!(
             missing_program(Some(127), "Error: Cannot find module"),
@@ -519,11 +604,28 @@ mod tests {
             "{newer}"
         );
         assert!(newer.ends_with("ran\n"), "{newer}");
+
+        // By its path: the child's PATH, which has no `node`, has no
+        // `bash` either.
+        let no_node = std::process::Command::new("/bin/bash")
+            .arg("-c")
+            .arg(node_command("index.js", 20))
+            .env("GITHUB_ACTION_PATH", dir.path())
+            .env("PATH", "/nonexistent")
+            .env("LANG", "de_DE.UTF-8")
+            .output()
+            .unwrap();
+        let printed = String::from_utf8_lossy(&no_node.stderr).into_owned();
+        assert_eq!(
+            missing_program(no_node.status.code(), &printed),
+            Some(NO_NODE),
+            "{printed}"
+        );
     }
 
     #[test]
     fn a_withdrawn_post_does_not_run() {
-        let posts: JobPosts = Arc::default();
+        let posts: JobScope = Arc::default();
         let post = |name: &str| PostStep {
             name: name.to_string(),
             command: String::new(),
@@ -552,13 +654,13 @@ mod tests {
     }
 
     /// Run `f` as a step of a job whose posts go on `posts`.
-    fn tokio_test_scope<T>(posts: &JobPosts, f: impl FnOnce() -> T) -> T {
-        JOB_POSTS.sync_scope(posts.clone(), f)
+    fn tokio_test_scope<T>(posts: &JobScope, f: impl FnOnce() -> T) -> T {
+        JOB_ACTIONS.sync_scope(posts.clone(), f)
     }
 
     #[test]
     fn posts_run_last_first() {
-        let posts: JobPosts = Arc::default();
+        let posts: JobScope = Arc::default();
         let post = |name: &str| PostStep {
             name: name.to_string(),
             command: String::new(),
@@ -567,8 +669,8 @@ mod tests {
             keep_action: None,
             withdrawn: false,
         };
-        posts.lock().unwrap().push(post("first"));
-        posts.lock().unwrap().push(post("second"));
+        posts.posts.lock().unwrap().push(post("first"));
+        posts.posts.lock().unwrap().push(post("second"));
         let names: Vec<_> = take_posts(&posts).into_iter().map(|p| p.name).collect();
         assert_eq!(names, ["second", "first"]);
         assert!(take_posts(&posts).is_empty());
@@ -651,7 +753,33 @@ mod tests {
     }
 
     #[test]
-    fn each_step_gets_its_own_copy_without_git() {
+    fn a_jobs_steps_share_one_copy_and_other_jobs_have_their_own() {
+        let dir = |name: &str| {
+            let d = tempfile::tempdir().unwrap();
+            std::fs::write(d.path().join("from"), name).unwrap();
+            Arc::new(d)
+        };
+        let job: JobScope = Arc::default();
+        let (first, second, other_key) = tokio_test_scope(&job, || {
+            assert!(job_copy("o/a@v1").is_none());
+            let first = keep_job_copy("o/a@v1", dir("first"));
+            let second = keep_job_copy("o/a@v1", dir("second"));
+            assert!(Arc::ptr_eq(&job_copy("o/a@v1").unwrap(), &first));
+            (first, second, keep_job_copy("o/b@v1", dir("b")))
+        });
+        assert!(Arc::ptr_eq(&first, &second), "the copy kept first wins");
+        assert!(!Arc::ptr_eq(&first, &other_key));
+
+        let other_job: JobScope = Arc::default();
+        tokio_test_scope(&other_job, || assert!(job_copy("o/a@v1").is_none()));
+        assert!(
+            job_copy("o/a@v1").is_none(),
+            "outside a job nothing is kept"
+        );
+    }
+
+    #[test]
+    fn each_job_gets_its_own_copy_without_git() {
         let clone = tempfile::tempdir().unwrap();
         let root = clone.path().join("action");
         std::fs::create_dir_all(root.join(".git")).unwrap();
@@ -673,7 +801,7 @@ mod tests {
         #[cfg(unix)]
         assert!(copied.join("index.js").is_symlink());
 
-        // What one step writes there, the other doesn't see.
+        // What one job writes there, the other doesn't see.
         std::fs::write(copied.join("node_modules"), "x").unwrap();
         assert!(!b.path().join("action/node_modules").exists());
     }

@@ -156,6 +156,39 @@ pub fn every_matrix_leg() -> bool {
     EVERY_MATRIX_LEG.load(Ordering::Relaxed) || env_flag(EVERY_MATRIX_LEG_ENV)
 }
 
+/// Env var listing, comma-separated, actions that pass without running,
+/// such as one that deploys: `owner/repo` for each of its actions and
+/// refs, `owner/repo/path` for one action in it, or `./path` for a local
+/// one. Each is reported as not run, so the run is `partial`.
+pub const SKIP_ACTIONS_ENV: &str = "WRKFLW_SKIP_ACTIONS";
+
+/// Why an action [`SKIP_ACTIONS_ENV`] lists didn't run.
+pub(crate) const SKIPPED_ACTION: &str = "the action is listed in WRKFLW_SKIP_ACTIONS";
+
+/// Whether [`SKIP_ACTIONS_ENV`] lists the action `uses` names.
+pub(crate) fn skipped_action(uses: &str) -> bool {
+    std::env::var(SKIP_ACTIONS_ENV).is_ok_and(|list| skip_list_has(&list, uses))
+}
+
+/// Whether the [`SKIP_ACTIONS_ENV`] value `list` names the action `uses`:
+/// an entry is the action without its `@ref`, or a repository whose
+/// action it is, ignoring case, as GitHub does for repositories.
+fn skip_list_has(list: &str, uses: &str) -> bool {
+    let action = uses.split('@').next().unwrap_or(uses).trim_end_matches('/');
+    list.split(',')
+        .map(|entry| entry.trim().trim_end_matches('/'))
+        .filter(|entry| !entry.is_empty())
+        .any(|entry| {
+            let entry = entry.split('@').next().unwrap_or(entry);
+            action.eq_ignore_ascii_case(entry)
+                || (!entry.starts_with('.')
+                    && action.len() > entry.len()
+                    && action.is_char_boundary(entry.len())
+                    && action[..entry.len()].eq_ignore_ascii_case(entry)
+                    && action[entry.len()..].starts_with('/'))
+        })
+}
+
 /// Whether the switch in environment variable `name` is on, read as the
 /// CLI reads it.
 pub(crate) fn env_flag(name: &str) -> bool {
@@ -232,5 +265,23 @@ mod tests {
             super::fresh_workspaces(),
             "set WRKFLW_FRESH_WORKSPACE=1 for tests (see .cargo/config.toml)"
         );
+    }
+
+    #[test]
+    fn the_skip_list_names_an_action_or_its_repository() {
+        use super::skip_list_has;
+        let list =
+            " Org/Deploy , aws-actions/configure-aws-credentials/,./.github/actions/notify@x";
+        assert!(skip_list_has(list, "org/deploy@v1"));
+        assert!(skip_list_has(list, "org/deploy/sub@v1"));
+        assert!(skip_list_has(
+            list,
+            "aws-actions/configure-aws-credentials@v4"
+        ));
+        assert!(skip_list_has(list, "./.github/actions/notify"));
+        assert!(!skip_list_has(list, "org/deploy-preview@v1"));
+        assert!(!skip_list_has(list, "./.github/actions/notify/inner"));
+        assert!(!skip_list_has(list, "actions/github-script@v7"));
+        assert!(!skip_list_has("", "org/deploy@v1"));
     }
 }

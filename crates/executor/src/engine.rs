@@ -2036,17 +2036,23 @@ async fn cloned_action(
     .map_err(ExecutionError::Execution)
 }
 
-/// [`cloned_action`] copied for one step to run from, as each step gets
-/// its own: see [`crate::node_actions::private_copy`].
+/// The job's copy of [`cloned_action`] for a step to run from: made the
+/// first time a step of the job uses the action, and shared by the job's
+/// later steps, as on GitHub; see [`crate::node_actions::JobActions`].
 async fn action_for_step(
     action: &ActionInfo,
     provider_token: Option<&str>,
 ) -> Result<Arc<tempfile::TempDir>, ExecutionError> {
+    let key = format!("{}@{}", action.repository, action.version);
+    if let Some(copy) = crate::node_actions::job_copy(&key) {
+        return Ok(copy);
+    }
     let clone = cloned_action(action, provider_token).await?;
-    tokio::task::spawn_blocking(move || crate::node_actions::private_copy(clone.path()))
+    let copy = tokio::task::spawn_blocking(move || crate::node_actions::private_copy(clone.path()))
         .await
         .map_err(|e| ExecutionError::Execution(format!("Copying the action failed: {}", e)))?
-        .map_err(ExecutionError::Execution)
+        .map_err(ExecutionError::Execution)?;
+    Ok(crate::node_actions::keep_job_copy(&key, copy))
 }
 
 /// Whether a failed anonymous clone's error says GitHub wanted credentials,
@@ -2073,7 +2079,9 @@ const GITHUB_CLONE_PREFIX: &str = "https://github.com/";
 /// header is added after the `count` entries the user's own environment
 /// may already give git (`GIT_CONFIG_COUNT`), so those still apply.
 fn clone_auth_env(token: &str, count: Option<&str>) -> Vec<(String, String)> {
-    let credentials = base64_encode(format!("x-access-token:{}", token).as_bytes());
+    use base64::Engine as _;
+    let credentials = base64::engine::general_purpose::STANDARD
+        .encode(format!("x-access-token:{}", token).as_bytes());
     let index = count
         .and_then(|count| count.trim().parse::<usize>().ok())
         .unwrap_or(0);
@@ -2088,25 +2096,6 @@ fn clone_auth_env(token: &str, count: Option<&str>) -> Vec<(String, String)> {
             format!("AUTHORIZATION: basic {}", credentials),
         ),
     ]
-}
-
-/// Standard base64 with padding.
-fn base64_encode(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let n = (chunk[0] as u32) << 16
-            | (*chunk.get(1).unwrap_or(&0) as u32) << 8
-            | *chunk.get(2).unwrap_or(&0) as u32;
-        for i in 0..4 {
-            if i <= chunk.len() {
-                out.push(ALPHABET[(n >> (18 - 6 * i) & 63) as usize] as char);
-            } else {
-                out.push('=');
-            }
-        }
-    }
-    out
 }
 
 /// A `git` command for a clone: hooks off, as cloned repositories are
@@ -3781,7 +3770,8 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
             .as_ref(),
     );
     let pending_cache_saves = std::sync::Mutex::new(Vec::<PendingCacheSave>::new());
-    let posts = crate::node_actions::JobPosts::default();
+    let posts = crate::node_actions::JobScope::default();
+    let mut step_error: Option<ExecutionError> = None;
 
     let job_deadline = tokio::time::Instant::now() + job_timeout;
     let first_step = crate::events::first_step_for(ctx.job_name, &job.steps);
@@ -3798,7 +3788,7 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
             remaining,
             loop_state
                 .live_step(idx, step, ctx.services.secret_masker)
-                .run(Box::pin(crate::node_actions::collecting_posts(
+                .run(Box::pin(crate::node_actions::within_job(
                     &posts,
                     Box::pin(run_step_with_guards(
                         step,
@@ -3831,14 +3821,20 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
         )
         .await
         {
-            Ok(result) => result?,
+            Ok(Ok(outcome)) => outcome,
+            // The job ends with this error, once its posts have run.
+            Ok(Err(e)) => {
+                step_error = Some(e);
+                job_success = false;
+                break;
+            }
             Err(_) => {
                 let msg = format!(
                     "Job '{}' exceeded timeout of {} minutes",
                     ctx.job_name, timeout_mins
                 );
                 copy_back_after_timeout(job_dir.path()).await;
-                loop_state.fail_step_on_timeout(step, idx, msg);
+                loop_state.fail_step(step, idx, msg);
                 job_success = false;
                 break;
             }
@@ -3880,9 +3876,12 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
             pending_cache_saves: &pending_cache_saves,
         },
     ))
-    .await?
+    .await
     {
         job_success = false;
+    }
+    if let Some(e) = step_error {
+        return Err(e);
     }
 
     // Flush deferred cache saves only on success (matches GHA post-step semantics)
@@ -4277,7 +4276,8 @@ async fn execute_matrix_job(
         let job_deadline = tokio::time::Instant::now() + job_timeout;
 
         let first_step = crate::events::first_step_for(job_name, &materialized_steps);
-        let posts = crate::node_actions::JobPosts::default();
+        let posts = crate::node_actions::JobScope::default();
+        let mut step_error: Option<ExecutionError> = None;
 
         for (idx, step) in materialized_steps.iter().enumerate() {
             if crate::events::skipped_by_from_step(idx, first_step, step) {
@@ -4291,7 +4291,7 @@ async fn execute_matrix_job(
                 remaining,
                 loop_state
                     .live_step(idx, step, services.secret_masker)
-                    .run(Box::pin(crate::node_actions::collecting_posts(
+                    .run(Box::pin(crate::node_actions::within_job(
                         &posts,
                         Box::pin(run_step_with_guards(
                             step,
@@ -4324,14 +4324,20 @@ async fn execute_matrix_job(
             )
             .await
             {
-                Ok(result) => result?,
+                Ok(Ok(outcome)) => outcome,
+                // The job ends with this error, once its posts have run.
+                Ok(Err(e)) => {
+                    step_error = Some(e);
+                    all_steps_ok = false;
+                    break;
+                }
                 Err(_) => {
                     let msg = format!(
                         "Job '{}' exceeded timeout of {} minutes",
                         matrix_job_name, timeout_mins
                     );
                     copy_back_after_timeout(job_dir.path()).await;
-                    loop_state.fail_step_on_timeout(step, idx, msg);
+                    loop_state.fail_step(step, idx, msg);
                     all_steps_ok = false;
                     break;
                 }
@@ -4374,9 +4380,12 @@ async fn execute_matrix_job(
                 pending_cache_saves: &pending_cache_saves,
             },
         ))
-        .await?
+        .await
         {
             all_steps_ok = false;
+        }
+        if let Some(e) = step_error {
+            return Err(e);
         }
 
         all_steps_ok
@@ -4658,9 +4667,10 @@ impl StepLoopState {
         });
     }
 
-    /// Fail the step in flight because the job ran out of time. The step's
-    /// future was dropped, so it has no outcome of its own to process.
-    fn fail_step_on_timeout(&mut self, step: &workflow::Step, index: usize, message: String) {
+    /// Fail the step in flight with `message`, when it has no outcome of
+    /// its own to process: it ran out of the job's time, and its future was
+    /// dropped, or it couldn't run at all.
+    fn fail_step(&mut self, step: &workflow::Step, index: usize, message: String) {
         wrkflw_logging::error(&message);
         self.job_logs.push_str(&format!("\n{}\n", message));
         let result = StepResult::new(step_display_name(step, index), StepStatus::Failure, message);
@@ -5683,6 +5693,18 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
         let mut action_info = ctx.workflow.resolve_action(uses);
         if action_info.is_local {
             action_info.repository = local_action_path(&action_info.repository, ctx.working_dir);
+        }
+
+        // An action the user asked to skip, such as one that deploys, is
+        // neither fetched nor run.
+        if crate::run_options::skipped_action(uses) {
+            let cause = crate::run_options::SKIPPED_ACTION;
+            return Ok(StepResult::new(
+                step_name,
+                StepStatus::Success,
+                format!("Action not run: {}", cause),
+            )
+            .without_running(report_action_not_run(uses, Some(cause))));
         }
 
         // Check if this is the checkout action
@@ -7851,8 +7873,9 @@ fn posts_deadline(
 /// job's step numbering, each with the job's env as it is then and what
 /// its action's step had over it. They must be done by `deadline`, which
 /// [`posts_deadline`] gives: a post still running then fails, and the
-/// posts after it don't run. True when one failed or ran out of time,
-/// which fails the job.
+/// posts after it don't run. A post that fails, or can't run at all,
+/// doesn't stop the posts after it. True when one failed or ran out of
+/// time, which fails the job.
 #[allow(clippy::too_many_arguments)]
 async fn run_job_posts(
     posts: Vec<crate::node_actions::PostStep>,
@@ -7862,9 +7885,9 @@ async fn run_job_posts(
     job_env: &mut HashMap<String, String>,
     job_user_env: &mut HashMap<String, String>,
     pc: PostContext<'_>,
-) -> Result<bool, ExecutionError> {
+) -> bool {
     if posts.is_empty() {
-        return Ok(false);
+        return false;
     }
     let mut failed = false;
     for (k, post) in posts.iter().enumerate() {
@@ -7918,10 +7941,17 @@ async fn run_job_posts(
         )
         .await;
         let outcome = match ran {
-            Ok(outcome) => outcome?,
+            Ok(Ok(outcome)) => outcome,
+            // A post that couldn't run fails as a step would, and the posts
+            // after it, which clean up after other actions, still run.
+            Ok(Err(e)) => {
+                loop_state.fail_step(&post_step, idx, format!("'{}' failed: {}", post.name, e));
+                failed = true;
+                continue;
+            }
             Err(_) => {
                 copy_back_after_timeout(pc.working_dir).await;
-                loop_state.fail_step_on_timeout(
+                loop_state.fail_step(
                     &post_step,
                     idx,
                     format!("'{}' ran out of the job's time", post.name),
@@ -7941,7 +7971,7 @@ async fn run_job_posts(
             failed = true;
         }
     }
-    Ok(failed)
+    failed
 }
 
 /// Whether `repository` is a Rust action wrkflw stands in for with the
@@ -8012,6 +8042,38 @@ async fn run_node_script(
     Box::pin(execute_step(ctx.with_step(&step, env, user_env))).await
 }
 
+/// The root of the repository the local action at `dir` is in: the job's
+/// workspace it was read from, else the directory wrkflw runs in (see
+/// [`local_action_path`]). `None` when it is in neither.
+fn local_action_root(dir: &Path, workspace: &Path) -> Option<PathBuf> {
+    [Some(workspace.to_path_buf()), std::env::current_dir().ok()]
+        .into_iter()
+        .flatten()
+        .filter_map(|base| base.canonicalize().ok())
+        .find(|base| dir.starts_with(base))
+}
+
+/// The variables of this machine's environment `host` a remote action run
+/// here is kept from: those named as credentials (`GH_TOKEN`,
+/// `AWS_SECRET_ACCESS_KEY`, `SSH_AUTH_SOCK`) that the step's `env` doesn't
+/// set itself. Sorted.
+fn host_credentials_kept_from(
+    env: &HashMap<String, String>,
+    host: impl IntoIterator<Item = (String, String)>,
+) -> Vec<String> {
+    let mut names: Vec<String> = host
+        .into_iter()
+        .map(|(name, _)| name)
+        .filter(|name| {
+            crate::log_redaction::names_credential(name)
+                && !matches!(name.as_str(), "PWD" | "OLDPWD")
+                && !env.contains_key(name)
+        })
+        .collect();
+    names.sort();
+    names
+}
+
 /// Run a JavaScript action as GitHub's runner does: `pre` if it has one
 /// and `pre-if` holds, then `main`, each with `node` from the action's
 /// directory and its inputs as `INPUT_<NAME>`, and its `post` queued for
@@ -8032,32 +8094,34 @@ async fn execute_node_action(
 ) -> Result<StepResult, ExecutionError> {
     use crate::node_actions as js;
 
-    // The action's directory, and for a remote one the root of its
-    // repository, which is all there on GitHub.
+    // The action's directory and the root of the repository it is in,
+    // which is all there on GitHub, so a script may reach out of the
+    // action's own directory (`main: ../dist/x.js`).
     let (action_dir, repo_root, clone) = if action_info.is_local {
         let dir = Path::new(&action_info.repository);
-        (
-            dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf()),
-            None,
-            None,
-        )
+        let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+        let root = local_action_root(&dir, ctx.working_dir);
+        (dir, root, None)
     } else {
         let clone = action_for_step(action_info, ctx.services.clone_token()).await?;
         let (dir, root) = js::action_dir_in(clone.path(), action_info.sub_path.as_deref())
             .map_err(ExecutionError::Execution)?;
         (dir, Some(root), Some(clone))
     };
-    if !action_info.is_local
-        && step_env.get("WRKFLW_RUNTIME_MODE").map(String::as_str)
-            == Some(RuntimeType::Emulation.mode_name())
-        && acceleration::first_host_action_warning()
-    {
+    let on_host = matches!(
+        step_env.get("WRKFLW_RUNTIME_MODE").map(String::as_str),
+        Some(mode) if mode == RuntimeType::Emulation.mode_name()
+            || mode == RuntimeType::SecureEmulation.mode_name()
+    );
+    if !action_info.is_local && on_host && acceleration::first_host_action_warning() {
         wrkflw_logging::warning(&format!(
-            "{} and the run's other remote JavaScript actions run on this machine as you \
-             under emulation, with your access, as their repository has them at their ref: \
-             use a container runtime to keep them apart, or {}=0 to skip them",
+            "{} and the run's other remote JavaScript actions run on this machine as you, \
+             as their repository has them at their ref. wrkflw keeps your environment's \
+             credentials (such as GH_TOKEN) from them, but they can read your files: use a \
+             container runtime to keep them apart, or {}=0 or {} to skip them",
             uses,
-            js::JS_ACTIONS_ENV
+            js::JS_ACTIONS_ENV,
+            crate::run_options::SKIP_ACTIONS_ENV
         ));
     }
 
@@ -8088,6 +8152,15 @@ async fn execute_node_action(
     };
     env.insert("GITHUB_ACTION_REPOSITORY".to_string(), repository);
     env.insert("GITHUB_ACTION_REF".to_string(), git_ref);
+    // On this machine a step inherits the user's whole environment, which
+    // a third party's action mustn't: on GitHub it gets only what the job
+    // gives it. What the job sets itself, a token included, still reaches it.
+    if !action_info.is_local && on_host {
+        let removed = host_credentials_kept_from(&env, std::env::vars());
+        if !removed.is_empty() {
+            env.insert(wrkflw_runtime::ENV_REMOVE.to_string(), removed.join(","));
+        }
+    }
 
     // `$GITHUB_STATE` sits beside the job's other `GITHUB_*` files, so it
     // is mounted where they are.
@@ -8124,43 +8197,14 @@ async fn execute_node_action(
             .collect()
     };
 
-    let mut output = String::new();
-    if let Some(pre) = &runs.pre {
-        let condition = runs.pre_if.as_deref().unwrap_or("always()");
-        if evaluate_step_condition(condition, ctx.working_dir, &expr_ctx) {
-            clear_state();
-            let result = run_node_script(
-                ctx,
-                &env,
-                step_user_env,
-                format!("Pre {}", step_name),
-                pre,
-                runs.node_major,
-            )
-            .await?;
-            if let Some(cause) = js::missing_program(result.exit_code, &result.output) {
-                return Ok(not_run(result.output, cause));
-            }
-            output.push_str(&result.output);
-            // As on GitHub, what `pre` saved is there for `main` and `post`.
-            env.extend(saved_by(&result.output));
-            if result.status == StepStatus::Failure {
-                let failed = StepResult::new(step_name.to_string(), StepStatus::Failure, output);
-                return Ok(match result.exit_code {
-                    Some(code) => failed.with_exit_code(code),
-                    None => failed,
-                });
-            }
-        }
-    }
-
-    // As on GitHub's runner, the post is queued before `main` runs, so it
-    // runs at the end of the job also when `main` fails or runs out of
+    // As on GitHub's runner, where the action's first script to run
+    // registers it, the post is queued before `pre` or `main` runs, so it
+    // runs at the end of the job also when either fails or runs out of
     // time. It gets what the step has beyond the job's env: its own
-    // `env:`, the action's inputs and paths, and what `pre` saved; what
-    // `main` saves is added once it is done. The post runs with these over
-    // the job's env as it is at the end of the job.
-    let post = runs.post.as_ref().map(|post| {
+    // `env:`, the action's inputs and paths; what `pre` and `main` save is
+    // added as each is done. The post runs with these over the job's env
+    // as it is at the end of the job.
+    let post = runs.post.as_ref().and_then(|post| {
         let own_env: HashMap<String, String> = env
             .iter()
             .filter(|(k, v)| ctx.job_env.get(*k) != Some(*v))
@@ -8179,6 +8223,39 @@ async fn execute_node_action(
         })
     });
 
+    let mut output = String::new();
+    if let Some(pre) = &runs.pre {
+        let condition = runs.pre_if.as_deref().unwrap_or("always()");
+        if evaluate_step_condition(condition, ctx.working_dir, &expr_ctx) {
+            clear_state();
+            let result = run_node_script(
+                ctx,
+                &env,
+                step_user_env,
+                format!("Pre {}", step_name),
+                pre,
+                runs.node_major,
+            )
+            .await?;
+            if let Some(cause) = js::missing_program(result.exit_code, &result.output) {
+                js::update_post(post, |queued| queued.withdrawn = true);
+                return Ok(not_run(result.output, cause));
+            }
+            output.push_str(&result.output);
+            // As on GitHub, what `pre` saved is there for `main` and `post`.
+            let saved = saved_by(&result.output);
+            env.extend(saved.iter().cloned());
+            js::update_post(post, |queued| queued.own_env.extend(saved));
+            if result.status == StepStatus::Failure {
+                let failed = StepResult::new(step_name.to_string(), StepStatus::Failure, output);
+                return Ok(match result.exit_code {
+                    Some(code) => failed.with_exit_code(code),
+                    None => failed,
+                });
+            }
+        }
+    }
+
     clear_state();
     let main = run_node_script(
         ctx,
@@ -8191,11 +8268,11 @@ async fn execute_node_action(
     .await?;
     if let Some(cause) = js::missing_program(main.exit_code, &main.output) {
         // An action that never ran has nothing to clean up.
-        js::update_post(post.flatten(), |queued| queued.withdrawn = true);
+        js::update_post(post, |queued| queued.withdrawn = true);
         return Ok(not_run(main.output, cause));
     }
     let saved = saved_by(&main.output);
-    js::update_post(post.flatten(), |queued| queued.own_env.extend(saved));
+    js::update_post(post, |queued| queued.own_env.extend(saved));
     clear_state();
 
     output.push_str(&main.output);
@@ -9181,15 +9258,38 @@ mod tests {
     }
 
     #[test]
-    fn base64_matches_the_standard_encoding() {
-        assert_eq!(base64_encode(b""), "");
-        assert_eq!(base64_encode(b"f"), "Zg==");
-        assert_eq!(base64_encode(b"fo"), "Zm8=");
-        assert_eq!(base64_encode(b"foo"), "Zm9v");
-        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+    fn a_remote_action_on_this_machine_is_kept_from_its_credentials() {
+        let host = [
+            ("GH_TOKEN", "t"),
+            ("AWS_SECRET_ACCESS_KEY", "k"),
+            ("SSH_AUTH_SOCK", "/s"),
+            ("GITHUB_TOKEN", "job's"),
+            ("PATH", "/a-long-path-that-is-not-a-credential"),
+            ("PWD", "/x"),
+        ]
+        .map(|(k, v)| (k.to_string(), v.to_string()));
+        let env = HashMap::from([("GITHUB_TOKEN".to_string(), "job's".to_string())]);
         assert_eq!(
-            base64_encode(b"x-access-token:ghp_abc"),
-            "eC1hY2Nlc3MtdG9rZW46Z2hwX2FiYw=="
+            host_credentials_kept_from(&env, host),
+            ["AWS_SECRET_ACCESS_KEY", "GH_TOKEN", "SSH_AUTH_SOCK"],
+            "the job's own GITHUB_TOKEN still reaches the action"
+        );
+    }
+
+    #[test]
+    fn a_local_actions_root_is_the_workspace_it_was_read_from() {
+        let workspace = tempfile::tempdir().unwrap();
+        let action = workspace.path().join(".github/actions/js");
+        std::fs::create_dir_all(&action).unwrap();
+        let action = action.canonicalize().unwrap();
+        assert_eq!(
+            local_action_root(&action, workspace.path()),
+            Some(workspace.path().canonicalize().unwrap())
+        );
+        let elsewhere = tempfile::tempdir().unwrap();
+        assert_eq!(
+            local_action_root(&elsewhere.path().canonicalize().unwrap(), workspace.path()),
+            None
         );
     }
 
@@ -9207,7 +9307,7 @@ mod tests {
             header,
             format!(
                 "AUTHORIZATION: basic {}",
-                base64_encode(b"x-access-token:ghp_secret")
+                "eC1hY2Nlc3MtdG9rZW46Z2hwX3NlY3JldA=="
             )
         );
         assert!(!header.contains("ghp_secret"));
@@ -11640,8 +11740,7 @@ runs:
                 pending_cache_saves: &TEST_PENDING_CACHE_SAVES,
             },
         )
-        .await
-        .unwrap();
+        .await;
         (failed, loop_state)
     }
 
@@ -11736,8 +11835,8 @@ runs:
             services: test_services(),
             pending_cache_saves: &TEST_PENDING_CACHE_SAVES,
         };
-        let posts = crate::node_actions::JobPosts::default();
-        let timed_out = crate::node_actions::collecting_posts(
+        let posts = crate::node_actions::JobScope::default();
+        let timed_out = crate::node_actions::within_job(
             &posts,
             tokio::time::timeout(
                 std::time::Duration::from_millis(500),
@@ -15870,7 +15969,7 @@ runs:
         let mut state = StepLoopState::new("job", "job");
         state.begin_step(0, &step);
 
-        state.fail_step_on_timeout(&step, 0, "out of time".to_string());
+        state.fail_step(&step, 0, "out of time".to_string());
 
         assert_eq!(state.step_results.len(), 1);
         let result = &state.step_results[0];

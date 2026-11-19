@@ -284,7 +284,15 @@ impl ContainerRuntime for EmulationRuntime {
         // Add environment variables, interpolating ${CI_PROJECT_DIR} in values
         // (e.g. CARGO_HOME="${CI_PROJECT_DIR}/.cargo" in GitLab CI configs).
         let project_dir_str = project_dir.to_string_lossy();
+        // Host variables the step mustn't inherit go first, so a value the
+        // step sets itself still wins.
+        for name in crate::env_removals(env_vars) {
+            cmd.env_remove(name);
+        }
         for (key, value) in env_vars {
+            if *key == crate::ENV_REMOVE {
+                continue;
+            }
             if value.contains("${CI_PROJECT_DIR}") {
                 cmd.env(key, value.replace("${CI_PROJECT_DIR}", &project_dir_str));
             } else {
@@ -896,5 +904,29 @@ mod tests {
             output.stdout, "$WRKFLW_LITERAL",
             "an absolute argv[0] must be exec'd directly, not re-joined and re-parsed by an outer shell"
         );
+    }
+
+    /// A host variable named in `WRKFLW_ENV_REMOVE` doesn't reach the step,
+    /// one the step sets itself does, and the list itself never does.
+    #[cfg(not(target_os = "windows"))]
+    #[tokio::test]
+    async fn emulation_keeps_named_host_variables_from_the_step() {
+        let runtime = EmulationRuntime::new();
+        let output = runtime
+            .run_container(
+                "alpine:latest",
+                &[
+                    "bash",
+                    "-c",
+                    "printf '[%s][%s][%s]' \"${HOME-unset}\" \"$KEPT\" \"${WRKFLW_ENV_REMOVE-unset}\"",
+                ],
+                &[(crate::ENV_REMOVE, "HOME,KEPT"), ("KEPT", "mine")],
+                Path::new("."),
+                &[(Path::new("."), Path::new("/github/workspace"))],
+                None,
+            )
+            .await
+            .expect("the step runs");
+        assert_eq!(output.stdout, "[unset][mine][unset]");
     }
 }

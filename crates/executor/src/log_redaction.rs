@@ -168,20 +168,39 @@ pub(crate) fn register_variables<'a>(
 }
 
 fn looks_like_credential(name: &str, value: &str) -> bool {
+    names_credential(name) || value.chars().count() >= UNNAMED_CREDENTIAL_MIN_LEN
+}
+
+/// Whether the variable's name alone says it holds a credential, such as
+/// `GH_TOKEN`, `AWS_SECRET_ACCESS_KEY` or `SSH_AUTH_SOCK`.
+pub(crate) fn names_credential(name: &str) -> bool {
     let name = name.to_ascii_uppercase();
     // A part names a credential when it is one of the words, or ends with
     // one (`APIKEY`, `GHTOKEN`), plural or not. Matching anywhere in the
     // part would take `AUTHOR` or `KEYBOARD` for credentials too.
     let names_one = |part: &str| CREDENTIAL_NAME_PARTS.iter().any(|p| part.ends_with(p));
-    let named = name
-        .split(|c: char| !c.is_ascii_alphanumeric())
-        .any(|part| names_one(part) || part.strip_suffix('S').is_some_and(names_one));
-    named || value.chars().count() >= UNNAMED_CREDENTIAL_MIN_LEN
+    name.split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|part| names_one(part) || part.strip_suffix('S').is_some_and(names_one))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_credential_is_told_by_its_name_alone() {
+        for name in [
+            "GH_TOKEN",
+            "AWS_SECRET_ACCESS_KEY",
+            "SSH_AUTH_SOCK",
+            "NPM_AUTH_TOKENS",
+        ] {
+            assert!(names_credential(name), "{name}");
+        }
+        for name in ["PATH", "HOME", "AUTHOR", "KEYBOARD_LAYOUT", "LANG"] {
+            assert!(!names_credential(name), "{name}");
+        }
+    }
 
     #[test]
     fn registered_values_are_masked_in_logs() {

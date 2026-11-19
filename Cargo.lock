@@ -4429,6 +4429,7 @@ name = "wrkflw-executor"
 version = "0.8.0"
 dependencies = [
  "async-trait",
+ "base64 0.21.7",
  "bollard",
  "chrono",
  "dirs",

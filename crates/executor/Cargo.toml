@@ -12,6 +12,7 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
+base64 = "0.21"
 # Internal crates
 wrkflw-models.workspace = true
 wrkflw-parser.workspace = true

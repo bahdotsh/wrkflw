@@ -1724,6 +1724,150 @@ fn a_failing_post_fails_the_job() {
     assert_eq!(post["status"], "failure", "{post}");
 }
 
+/// As on GitHub, where an action's `pre` registers its post, a `pre` that
+/// fails still has its post clean up at the end of the job, and `main`
+/// doesn't run.
+#[test]
+fn a_failing_pre_still_runs_its_post() {
+    if !has_node() {
+        return;
+    }
+    let sandbox = Sandbox::new();
+    js_action(
+        &sandbox,
+        "prefails",
+        "name: p\nruns:\n  using: node20\n  pre: pre.js\n  main: main.js\n  post: post.js\n",
+        &[
+            ("pre.js", r#"console.error("pre failed"); process.exit(2);"#),
+            ("main.js", r#"console.log("main ran");"#),
+            ("post.js", r#"console.log("post ran");"#),
+        ],
+    );
+    sandbox.write(
+        "pre.yml",
+        "name: p\non: [push]\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      \
+         - name: JS\n        uses: ./.github/actions/prefails\n",
+    );
+    let output = sandbox.run(&[
+        "--format",
+        "json",
+        "run",
+        "--runtime",
+        "emulation",
+        ".github/workflows/pre.yml",
+    ]);
+    let lines = json_lines(&output);
+    let js = finished_step(&lines, "JS", &output);
+    assert_eq!(js["status"], "failure", "{js}");
+    assert!(!stdout(&output).contains("main ran"), "{}", stdout(&output));
+    let post = finished_step(&lines, "Post JS", &output);
+    assert_eq!(post["status"], "success", "{post}");
+}
+
+/// A step that can't run at all, such as one naming a local action that
+/// isn't there, ends the job with an error; the posts of the actions that
+/// ran before it still clean up first.
+#[test]
+fn a_post_runs_when_a_later_step_cannot_run() {
+    if !has_node() {
+        return;
+    }
+    let sandbox = Sandbox::new();
+    js_action(
+        &sandbox,
+        "cleans",
+        "name: c\nruns:\n  using: node20\n  main: main.js\n  post: post.js\n",
+        &[
+            ("main.js", r#"console.log("main ok");"#),
+            (
+                "post.js",
+                r#"require("fs").writeFileSync(process.env.MARKER, "post ran");"#,
+            ),
+        ],
+    );
+    let marker = sandbox.repo.path().join("post-marker");
+    sandbox.write(
+        "post.yml",
+        &format!(
+            "name: p\non: [push]\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      \
+             - name: JS\n        uses: ./.github/actions/cleans\n        env:\n          \
+             MARKER: {}\n      - name: Missing\n        uses: ./.github/actions/missing\n",
+            marker.display()
+        ),
+    );
+    let output = sandbox.run(&[
+        "run",
+        "--runtime",
+        "emulation",
+        ".github/workflows/post.yml",
+    ]);
+    assert!(!output.status.success(), "{}", stdout(&output));
+    assert_eq!(
+        fs::read_to_string(&marker).ok().as_deref(),
+        Some("post ran"),
+        "{}\n{}",
+        stdout(&output),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// With `WRKFLW_SKIP_ACTIONS` naming an action, that action doesn't run and
+/// the run is partial, while the job's other actions still run.
+#[test]
+fn an_action_the_user_skips_is_reported_as_not_run() {
+    if !has_node() {
+        return;
+    }
+    let sandbox = Sandbox::new();
+    js_action(
+        &sandbox,
+        "deploy",
+        "name: d\nruns:\n  using: node20\n  main: main.js\n",
+        &[("main.js", r#"console.log("deployed"); process.exit(1);"#)],
+    );
+    js_action(
+        &sandbox,
+        "check",
+        "name: c\nruns:\n  using: node20\n  main: main.js\n",
+        &[("main.js", r#"console.log("checked");"#)],
+    );
+    sandbox.write(
+        "skip.yml",
+        "name: s\non: [push]\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      \
+         - name: Deploy\n        uses: ./.github/actions/deploy\n      \
+         - name: Check\n        uses: ./.github/actions/check\n",
+    );
+    let output = sandbox
+        .command(&[
+            "--format",
+            "json",
+            "run",
+            "--runtime",
+            "emulation",
+            ".github/workflows/skip.yml",
+        ])
+        .env("WRKFLW_SKIP_ACTIONS", "./.github/actions/deploy")
+        .output()
+        .unwrap();
+    let lines = json_lines(&output);
+    let finished = lines
+        .iter()
+        .find(|line| line["type"] == "run_finished")
+        .unwrap_or_else(|| panic!("no run_finished: {}", stdout(&output)));
+    assert_eq!(finished["status"], "success", "{finished}");
+    assert_eq!(finished["verdict"], "partial", "{finished}");
+    let not_run: Vec<&Value> = finished["unverified"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|entry| entry.get("step").is_some())
+        .collect();
+    assert_eq!(not_run.len(), 1, "{finished}");
+    assert_eq!(not_run[0]["step"], "Deploy");
+    assert_eq!(not_run[0]["uses"], "./.github/actions/deploy");
+    assert_eq!(finished_step(&lines, "Check", &output)["status"], "success");
+}
+
 /// With `WRKFLW_JS_ACTIONS=0` a JavaScript action doesn't run: the step
 /// passes and the run is partial. A composite action is still run.
 #[test]

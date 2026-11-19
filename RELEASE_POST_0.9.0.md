@@ -14,7 +14,7 @@ On pallets/click, a warm local run takes 36 to 38 seconds against GitHub's 65, a
 
 ### JavaScript actions run
 
-Actions such as `actions/github-script`, `codecov/codecov-action` or your own `./.github/actions/*` with `runs.using: node20` now run with Node in the job's container, with their inputs, `pre`, `post` and `$GITHUB_STATE`, as GitHub's runner runs them. Before, they passed without running and the run was marked `partial`. `WRKFLW_JS_ACTIONS=0` brings back the old behaviour.
+Actions such as `actions/github-script`, `codecov/codecov-action` or your own `./.github/actions/*` with `runs.using: node20` now run with Node in the job's container, with their inputs, `pre`, `post` and `$GITHUB_STATE`, as GitHub's runner runs them. Before, they passed without running and the run was marked `partial`. `WRKFLW_JS_ACTIONS=0` brings back the old behaviour, and `WRKFLW_SKIP_ACTIONS` leaves only the actions it lists unrun, such as one that deploys.
 
 ### Private repositories
 

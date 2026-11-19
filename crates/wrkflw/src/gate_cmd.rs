@@ -575,11 +575,17 @@ impl Launcher<'_> {
             if let Some(path) = &unverified_file {
                 child.env(UNVERIFIED_FILE_ENV, path.path());
             }
-            let mut entry = text_entry(file, child.status().ok().and_then(|status| status.code()));
+            let (pid, code) = match child.spawn() {
+                Ok(mut running) => (
+                    Some(running.id()),
+                    running.wait().ok().and_then(|status| status.code()),
+                ),
+                Err(_) => (None, None),
+            };
+            let mut entry = text_entry(file, code);
             if let Some(unverified) = unverified_file
                 .and_then(|f| std::fs::read_to_string(f.path()).ok())
-                .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-                .filter(Value::is_array)
+                .and_then(|text| written_by(&text, pid?))
             {
                 entry["unverified"] = unverified;
             }
@@ -777,6 +783,17 @@ fn check_workflow(
     entry
 }
 
+/// What a child run wrote to [`UNVERIFIED_FILE_ENV`]'s file, when that
+/// child, process `pid`, wrote it: under emulation a step inherits the
+/// variable, and a `wrkflw run` inside a step (as in wrkflw's own tests)
+/// writes the same file with what *it* didn't check.
+fn written_by(text: &str, pid: u32) -> Option<Value> {
+    let written: Value = serde_json::from_str(text).ok()?;
+    (written["pid"] == pid)
+        .then(|| written["unverified"].clone())
+        .filter(Value::is_array)
+}
+
 /// Whether this is a Mac running jobs in containers, where a `macos-*` job
 /// runs as Linux but `--runtime emulation` would run it on the Mac itself.
 pub(crate) fn mac_with_containers(runtime_flag: &str) -> bool {
@@ -855,6 +872,15 @@ fn text_entry(file: &Path, code: Option<i32>) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_gates_own_child_is_read() {
+        let text = r#"{"pid":42,"unverified":[{"kind":"runner"}]}"#;
+        assert_eq!(written_by(text, 42), Some(json!([{"kind": "runner"}])));
+        assert_eq!(written_by(text, 43), None, "a nested run's file");
+        assert_eq!(written_by("[]", 42), None);
+        assert_eq!(written_by("garbage", 42), None);
+    }
 
     #[test]
     fn a_partial_gate_names_each_cause_apart() {

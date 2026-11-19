@@ -339,11 +339,16 @@ pub(crate) async fn run(ctx: RunCtx) {
 
     // A pass that ran no job, or ran some as another OS, for a caller that
     // reads only the exit code and tells those from a full pass.
-    // A gate in text mode reads what wasn't checked from here.
+    // A gate in text mode reads what wasn't checked from here, by this
+    // process's id, so a nested run's write isn't taken for this one's.
     if let Ok(path) = std::env::var(crate::gate_cmd::UNVERIFIED_FILE_ENV) {
         let _ = std::fs::write(
             path,
-            serde_json::Value::Array(unverified.clone()).to_string(),
+            serde_json::json!({
+                "pid": std::process::id(),
+                "unverified": unverified.clone(),
+            })
+            .to_string(),
         );
     }
 

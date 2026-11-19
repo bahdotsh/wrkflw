@@ -3526,7 +3526,7 @@ async fn execute_job_with_matrix(
             job_session::noting_root_fallback(with_images_built_ahead(
                 image_ahead,
                 crate::job_memory::metered(
-                    job_session::with_job_session(job, runtime, mapped, execute_job(ctx)),
+                    job_session::with_job_session(job, runtime, mapped, Box::pin(execute_job(ctx))),
                     job_passed,
                 ),
             ))
@@ -3624,8 +3624,15 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
 
     // Handle reusable workflow jobs (job-level 'uses')
     if let Some(uses) = &job.uses {
-        return execute_reusable_workflow_job(&ctx, uses, job.with.as_ref(), job.secrets.as_ref())
-            .await;
+        // Boxed: a called workflow runs jobs of its own through this same
+        // function, so its future would otherwise nest in every caller's.
+        return Box::pin(execute_reusable_workflow_job(
+            &ctx,
+            uses,
+            job.with.as_ref(),
+            job.secrets.as_ref(),
+        ))
+        .await;
     }
     // Only after the reusable workflow check: its jobs take places of their
     // own, and a caller holding one would deadlock a limit of one.
@@ -3736,7 +3743,7 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
                 .live_step(idx, step, ctx.services.secret_masker)
                 .run(Box::pin(crate::node_actions::collecting_posts(
                     &posts,
-                    run_step_with_guards(
+                    Box::pin(run_step_with_guards(
                         step,
                         idx,
                         &job_env,
@@ -3772,7 +3779,7 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
                             },
                             pending_cache_saves: &pending_cache_saves,
                         },
-                    ),
+                    )),
                 ))),
         )
         .await
@@ -4249,7 +4256,7 @@ async fn execute_matrix_job(
                     .live_step(idx, step, services.secret_masker)
                     .run(Box::pin(crate::node_actions::collecting_posts(
                         &posts,
-                        run_step_with_guards(
+                        Box::pin(run_step_with_guards(
                             step,
                             idx,
                             &job_env,
@@ -4285,7 +4292,7 @@ async fn execute_matrix_job(
                                 },
                                 pending_cache_saves: &pending_cache_saves,
                             },
-                        ),
+                        )),
                     ))),
             )
             .await

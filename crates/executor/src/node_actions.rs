@@ -201,11 +201,14 @@ tokio::task_local! {
 }
 
 /// Run `future`, a step of a job, so the posts of its actions go on `posts`.
-pub(crate) async fn collecting_posts<F: std::future::Future>(
+///
+/// A plain `fn` returning the scope's future: an `async fn` would hold
+/// `future` and the scope that wraps it, twice the size of a step.
+pub(crate) fn collecting_posts<F: std::future::Future>(
     posts: &JobPosts,
     future: F,
-) -> F::Output {
-    JOB_POSTS.scope(posts.clone(), future).await
+) -> tokio::task::futures::TaskLocalFuture<JobPosts, F> {
+    JOB_POSTS.scope(posts.clone(), future)
 }
 
 /// Queue `post` for the end of the job. Outside a step loop, as in a test

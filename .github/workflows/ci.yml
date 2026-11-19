@@ -54,13 +54,19 @@ jobs:
       # Its apt uses Azure's Ubuntu mirror, as the runner itself does, so
       # what the tests install on it (docker.io) doesn't wait on
       # archive.ubuntu.com either.
+      # Rebuilt each week too, as the published image is, so the tests run
+      # on current packages rather than the ones of the first cached build.
+      - name: Name the week
+        if: runner.os == 'Linux'
+        id: week
+        run: echo "week=$(date -u +%G-W%V)" >> "$GITHUB_OUTPUT"
       - name: Restore the runner base image
         if: runner.os == 'Linux'
         id: runner-image
         uses: actions/cache@v4
         with:
           path: ~/runner-image.tar
-          key: runner-image-azure-${{ hashFiles('docker/runner.Dockerfile') }}
+          key: runner-image-azure-${{ steps.week.outputs.week }}-${{ hashFiles('docker/runner.Dockerfile') }}
       - name: Build the runner base image
         if: runner.os == 'Linux' && steps.runner-image.outputs.cache-hit != 'true'
         run: |

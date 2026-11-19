@@ -158,8 +158,10 @@ pub fn every_matrix_leg() -> bool {
 
 /// Env var listing, comma-separated, actions that pass without running,
 /// such as one that deploys: `owner/repo` for each of its actions and
-/// refs, `owner/repo/path` for one action in it, or `./path` for a local
-/// one. Each is reported as not run, so the run is `partial`.
+/// refs, `owner/repo/path` for one action in it, either with `@ref` for
+/// that ref only, or `./path` for a local one. Step `uses:` only, not a
+/// job's reusable workflow. Each is reported as not run, so the run is
+/// `partial`.
 pub const SKIP_ACTIONS_ENV: &str = "WRKFLW_SKIP_ACTIONS";
 
 /// Why an action [`SKIP_ACTIONS_ENV`] lists didn't run.
@@ -170,22 +172,63 @@ pub(crate) fn skipped_action(uses: &str) -> bool {
     std::env::var(SKIP_ACTIONS_ENV).is_ok_and(|list| skip_list_has(&list, uses))
 }
 
+/// The actions [`SKIP_ACTIONS_ENV`] lists, as a stored result's key holds
+/// them: each entry once, its name in lower case (its ref as given), in
+/// order. `None` when it lists none.
+pub(crate) fn skipped_actions_key() -> Option<Vec<String>> {
+    std::env::var(SKIP_ACTIONS_ENV)
+        .ok()
+        .map(|list| skip_list_key(&list))
+        .filter(|entries| !entries.is_empty())
+}
+
+fn skip_list_key(list: &str) -> Vec<String> {
+    let mut entries: Vec<String> = list
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| match entry.split_once('@') {
+            Some((name, git_ref)) => {
+                format!("{}@{}", name.trim_end_matches('/').to_lowercase(), git_ref)
+            }
+            None => entry.trim_end_matches('/').to_lowercase(),
+        })
+        .collect();
+    entries.sort();
+    entries.dedup();
+    entries
+}
+
 /// Whether the [`SKIP_ACTIONS_ENV`] value `list` names the action `uses`:
-/// an entry is the action without its `@ref`, or a repository whose
-/// action it is, ignoring case, as GitHub does for repositories.
+/// an entry is the action, or a repository whose action it is, ignoring
+/// case as GitHub does for repositories; with an `@ref` it names that ref
+/// alone.
 fn skip_list_has(list: &str, uses: &str) -> bool {
-    let action = uses.split('@').next().unwrap_or(uses).trim_end_matches('/');
+    let (action, git_ref) = match uses.split_once('@') {
+        Some((action, git_ref)) => (action, Some(git_ref)),
+        None => (uses, None),
+    };
+    let action = action.trim_end_matches('/');
     list.split(',')
-        .map(|entry| entry.trim().trim_end_matches('/'))
+        .map(str::trim)
         .filter(|entry| !entry.is_empty())
         .any(|entry| {
-            let entry = entry.split('@').next().unwrap_or(entry);
-            action.eq_ignore_ascii_case(entry)
-                || (!entry.starts_with('.')
-                    && action.len() > entry.len()
-                    && action.is_char_boundary(entry.len())
-                    && action[..entry.len()].eq_ignore_ascii_case(entry)
-                    && action[entry.len()..].starts_with('/'))
+            let (name, wanted_ref) = match entry.split_once('@') {
+                Some((name, wanted)) => (name, Some(wanted)),
+                None => (entry, None),
+            };
+            let name = name.trim_end_matches('/');
+            let named = action.eq_ignore_ascii_case(name)
+                || (!name.starts_with('.')
+                    && action.len() > name.len()
+                    && action.is_char_boundary(name.len())
+                    && action[..name.len()].eq_ignore_ascii_case(name)
+                    && action[name.len()..].starts_with('/'));
+            named
+                && match wanted_ref {
+                    Some(wanted) => git_ref == Some(wanted),
+                    None => true,
+                }
         })
 }
 
@@ -270,8 +313,7 @@ mod tests {
     #[test]
     fn the_skip_list_names_an_action_or_its_repository() {
         use super::skip_list_has;
-        let list =
-            " Org/Deploy , aws-actions/configure-aws-credentials/,./.github/actions/notify@x";
+        let list = " Org/Deploy , aws-actions/configure-aws-credentials/,./.github/actions/notify";
         assert!(skip_list_has(list, "org/deploy@v1"));
         assert!(skip_list_has(list, "org/deploy/sub@v1"));
         assert!(skip_list_has(
@@ -283,5 +325,18 @@ mod tests {
         assert!(!skip_list_has(list, "./.github/actions/notify/inner"));
         assert!(!skip_list_has(list, "actions/github-script@v7"));
         assert!(!skip_list_has("", "org/deploy@v1"));
+        assert!(skip_list_has("org/deploy@v2", "org/deploy@v2"));
+        assert!(!skip_list_has("org/deploy@v2", "org/deploy@v1"));
+        assert!(skip_list_has("org/deploy@v2", "org/deploy/sub@v2"));
+    }
+
+    #[test]
+    fn the_skip_list_keys_a_result_the_same_however_it_is_written() {
+        use super::skip_list_key;
+        assert_eq!(
+            skip_list_key(" Org/Deploy/ ,b/c@V1,org/deploy,"),
+            ["b/c@V1", "org/deploy"]
+        );
+        assert!(skip_list_key(" , ").is_empty());
     }
 }

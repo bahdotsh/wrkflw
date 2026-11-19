@@ -21,8 +21,14 @@ pub const PREBUILT_IMAGES_ENV: &str = "WRKFLW_PREBUILT_IMAGES";
 /// built locally from `docker/runner.Dockerfile` for a test.
 pub const RUNNER_IMAGE_ENV: &str = "WRKFLW_RUNNER_IMAGE";
 
-/// How long a runner base image that couldn't be pulled isn't tried again.
-const UNAVAILABLE_FOR: Duration = Duration::from_secs(24 * 60 * 60);
+/// How long a runner base image the registry refused isn't tried again.
+pub(crate) const REFUSED_FOR: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// How long a runner base image that couldn't be reached (no network, a
+/// firewall in front of the registry) isn't tried again: long enough that
+/// a machine offline for the day doesn't wait on the pull every run, short
+/// enough that it soon has the image once it's back.
+pub(crate) const UNREACHABLE_FOR: Duration = Duration::from_secs(60 * 60);
 
 /// The published name of the runner base image built from `dockerfile`.
 pub fn published_image(dockerfile: &str) -> String {
@@ -82,9 +88,9 @@ pub(crate) fn pull_refused(image: &str, error: &str) -> bool {
         .any(|marker| error.contains(marker))
 }
 
-/// Remember that `image` couldn't be pulled, so runs in the next day build
+/// Remember that `image` couldn't be pulled, so runs within `period` build
 /// their images here without trying it first.
-pub(crate) fn mark_unavailable(image: &str) {
+pub(crate) fn mark_unavailable(image: &str, period: Duration) {
     let Some(path) = marker_path() else { return };
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -93,7 +99,7 @@ pub(crate) fn mark_unavailable(image: &str) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let _ = std::fs::write(path, format!("{}\n{}\n", image, now));
+    let _ = std::fs::write(path, format!("{}\n{}\n{}\n", image, now, period.as_secs()));
 }
 
 fn recently_unavailable(image: &str, now: SystemTime) -> bool {
@@ -103,8 +109,9 @@ fn recently_unavailable(image: &str, now: SystemTime) -> bool {
     unavailable_in(&text, image, now)
 }
 
-/// Whether the marker `text` says `image` couldn't be pulled within
-/// [`UNAVAILABLE_FOR`] of `now`.
+/// Whether the marker `text` says `image` couldn't be pulled within the
+/// period it names (a marker from before periods were named: a day) of
+/// `now`.
 fn unavailable_in(text: &str, image: &str, now: SystemTime) -> bool {
     let mut lines = text.lines();
     if lines.next() != Some(image) {
@@ -113,11 +120,15 @@ fn unavailable_in(text: &str, image: &str, now: SystemTime) -> bool {
     let Some(when) = lines.next().and_then(|l| l.trim().parse::<u64>().ok()) else {
         return false;
     };
+    let period = lines
+        .next()
+        .and_then(|l| l.trim().parse::<u64>().ok())
+        .unwrap_or(REFUSED_FOR.as_secs());
     let now = now
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or_default();
-    now.saturating_sub(when) < UNAVAILABLE_FOR.as_secs()
+    now.saturating_sub(when) < period
 }
 
 #[cfg(test)]
@@ -183,5 +194,9 @@ mod tests {
         assert!(!unavailable_in(marker, "img:1", at(1000 + 25 * 3600)));
         assert!(!unavailable_in(marker, "img:2", at(1000 + 60)));
         assert!(!unavailable_in("garbage", "img:1", at(1000)));
+
+        let unreachable = "img:1\n1000\n3600\n";
+        assert!(unavailable_in(unreachable, "img:1", at(1000 + 60)));
+        assert!(!unavailable_in(unreachable, "img:1", at(1000 + 3601)));
     }
 }

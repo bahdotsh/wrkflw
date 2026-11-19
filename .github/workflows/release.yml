@@ -65,6 +65,8 @@ jobs:
   runner-image:
     name: Publish the runner base image
     runs-on: ubuntu-latest
+    # Not before the tag is checked: this job pushes packages.
+    needs: changelog
     permissions:
       contents: read
       packages: write
@@ -98,13 +100,33 @@ jobs:
             exit 0
           fi
           # Provenance names the commit and workflow that built it, so a user can
-          # check where a pulled base image came from.
+          # check where a pulled base image came from. The source label links
+          # the package to this repository.
           docker buildx build \
             --platform linux/amd64,linux/arm64 \
             --provenance=mode=max \
+            --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
             -f docker/runner.Dockerfile \
             -t "$IMAGE" \
             --push .
+      # GHCR makes a new package private. wrkflw pulls the base without
+      # credentials and builds the whole image itself when it can't, so a
+      # private package fails nothing; it only takes away the faster first
+      # run. Say so, rather than fail the release.
+      - name: Check the image can be pulled anonymously
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
+        run: |
+          ref="${IMAGE#ghcr.io/}"
+          name="${ref%%:*}"
+          tag="${ref##*:}"
+          token=$(curl -fsS "https://ghcr.io/token?scope=repository:${name}:pull" | jq -r .token)
+          if ! curl -fsS -o /dev/null \
+              -H "Authorization: Bearer ${token}" \
+              -H "Accept: application/vnd.oci.image.index.v1+json" \
+              "https://ghcr.io/v2/${name}/manifests/${tag}"; then
+            echo "::warning::${IMAGE} can't be pulled anonymously: make the package public in its settings, or wrkflw builds the image on each machine"
+          fi
 
   build:
     name: Build (${{ matrix.target }})

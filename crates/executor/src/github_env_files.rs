@@ -137,6 +137,18 @@ pub fn read_step_environment_updates(job_env: &HashMap<String, String>) -> StepE
     updates
 }
 
+/// Variables a step can't set for later steps through `$GITHUB_ENV`:
+/// wrkflw sets them for each step itself. GitHub's runner sets
+/// `GITHUB_ACTION_PATH` for each step too. Here it also names the host
+/// directory a container mounts, so a step that sets it could have any
+/// directory mounted for a later one.
+const RESERVED_ENV: &[&str] = &[
+    "GITHUB_ACTION_PATH",
+    "WRKFLW_RUNTIME_MODE",
+    PATH_ADDITIONS_ENV,
+    wrkflw_runtime::ENV_REMOVE,
+];
+
 /// Apply environment updates from a completed step to the job state.
 ///
 /// - Stores step outputs keyed by step ID (for `${{ steps.<id>.outputs.<key> }}`)
@@ -152,7 +164,17 @@ pub fn apply_step_environment_updates(
     step_outputs_map: &mut HashMap<String, HashMap<String, String>>,
     step_id: Option<&str>,
 ) -> AppliedEnvironment {
-    let updates = read_step_environment_updates(job_env);
+    let mut updates = read_step_environment_updates(job_env);
+    updates.env_vars.retain(|name, _| {
+        let reserved = RESERVED_ENV.contains(&name.as_str());
+        if reserved {
+            wrkflw_logging::warning(&format!(
+                "A step wrote {} to $GITHUB_ENV, which wrkflw sets itself: ignored",
+                name
+            ));
+        }
+        !reserved
+    });
     let mut applied = AppliedEnvironment {
         env_vars: updates.env_vars.clone().into_iter().collect(),
         path_entries: updates.path_entries.clone(),
@@ -331,6 +353,32 @@ mod tests {
         fs::write(&env["GITHUB_ENV"], env_lines).unwrap();
         fs::write(&env["GITHUB_PATH"], path_lines).unwrap();
         apply_step_environment_updates(env, &mut HashMap::new(), &mut HashMap::new(), None)
+    }
+
+    /// A step can't set, for later steps, what wrkflw sets for each step:
+    /// a forged `GITHUB_ACTION_PATH` would choose the host directory a
+    /// container mounts.
+    #[test]
+    fn a_step_cannot_set_what_wrkflw_sets_for_each_step() {
+        let dir = tempdir().unwrap();
+        let mut job = job_env_in(dir.path());
+        let applied = step(
+            &mut job,
+            "GITHUB_ACTION_PATH=/\nWRKFLW_RUNTIME_MODE=docker\nWRKFLW_ENV_REMOVE=PATH\nKEPT=1\n",
+            "",
+        );
+        assert_eq!(job.get("KEPT").map(String::as_str), Some("1"));
+        for name in [
+            "GITHUB_ACTION_PATH",
+            "WRKFLW_RUNTIME_MODE",
+            "WRKFLW_ENV_REMOVE",
+        ] {
+            assert!(!job.contains_key(name), "{name}");
+        }
+        assert_eq!(
+            applied.env_vars,
+            vec![("KEPT".to_string(), "1".to_string())]
+        );
     }
 
     /// What a composite action's steps write reaches the job as it would

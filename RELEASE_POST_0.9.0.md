@@ -6,7 +6,7 @@ v0.9.0 is out. Since v0.8.0 the goal has been one thing: when `wrkflw` says a wo
 
 ## How close it gets
 
-We rerun finished GitHub runs from nine open-source repositories (click, flask, cobra, chalk, ky, commander.js, rust-lang/log, itoa, fatih/color) with `wrkflw compare`, which runs the workflow locally for the same commit and event and compares each job's result with GitHub's. On the last sweep 70 jobs agreed and 4 differed. Seven repositories agree on every job compared. Of the four that differ, one fails on a Rust release that came out after its GitHub run, and three need a GitHub token to verify an attestation.
+We rerun finished GitHub runs from nine open-source repositories (click, flask, cobra, chalk, ky, commander.js, rust-lang/log, itoa, fatih/color) with `wrkflw compare`, which runs the workflow locally for the same commit and event and compares each job's result with GitHub's. On the last sweep 70 jobs agreed and 4 differed. 18 of the 70 are `macos-*` jobs run as Linux, which agree unverified: they say the job's steps pass, not that they pass on macOS. Seven repositories agree on every job compared. Of the four that differ, one fails on a Rust release that came out after its GitHub run, and three need a GitHub token to verify an attestation.
 
 On pallets/click, a warm local run takes 36 to 38 seconds against GitHub's 65, and a regression injected into `click.echo` was caught in 51.
 
@@ -22,7 +22,7 @@ A called workflow or action in a private repository now clones, with the `GITHUB
 
 ### A faster first run
 
-Every built-in job image starts from a runner base image published with the release, holding the packages, the runner's tools, Node.js, the GitHub CLI and the `runner` user, so a first run pulls it instead of installing it. Matrix legs run together, light jobs fit side by side by their measured memory, and images build with BuildKit.
+On Docker and Podman, a built-in job image on `ubuntu:latest` that doesn't set up Node.js starts from a runner base image published with the release, holding the packages, the runner's tools, Node.js, the GitHub CLI and the `runner` user, so a first run pulls it instead of installing it. Matrix legs run together, light jobs fit side by side by their measured memory, and images build with BuildKit.
 
 ### Jobs look like GitHub's runner
 

@@ -211,6 +211,9 @@ pub(crate) struct PostStep {
     /// `main` saved. The post runs with these over the job's env as it is
     /// at the end of the job, as on GitHub.
     pub own_env: HashMap<String, String>,
+    /// The root of the action's repository, mounted in a container: see
+    /// [`with_action_root`].
+    pub action_root: Option<PathBuf>,
     /// Holds a cloned action's directory, so it outlives the step that
     /// cloned it until its post has run. Held, never read.
     #[allow(dead_code)]
@@ -218,6 +221,36 @@ pub(crate) struct PostStep {
     /// Set when the action turned out not to run at all, so neither does
     /// its post.
     pub withdrawn: bool,
+}
+
+tokio::task_local! {
+    /// The root of the repository of the JavaScript action whose script is
+    /// running, set by wrkflw around that script alone.
+    static ACTION_ROOT: Option<PathBuf>;
+}
+
+/// Run `future`, one of a JavaScript action's scripts, so a container
+/// mounts the whole repository at `root` (which holds the action) and a
+/// script can reach out of the action's own directory (`main:
+/// ../dist/x.js`). Carried beside the step rather than in its env, which
+/// the action's `env:` and `$GITHUB_ENV` can write: an action naming its
+/// own root could have any host directory mounted.
+pub(crate) fn with_action_root<F: std::future::Future>(
+    root: Option<PathBuf>,
+    future: F,
+) -> tokio::task::futures::TaskLocalFuture<Option<PathBuf>, F> {
+    ACTION_ROOT.scope(root, future)
+}
+
+/// [`with_action_root`] for synchronous code, in tests.
+#[cfg(test)]
+pub(crate) fn sync_with_action_root<T>(root: Option<PathBuf>, f: impl FnOnce() -> T) -> T {
+    ACTION_ROOT.sync_scope(root, f)
+}
+
+/// The root [`with_action_root`] set for the script running, if any.
+pub(crate) fn action_root() -> Option<PathBuf> {
+    ACTION_ROOT.try_with(Clone::clone).ok().flatten()
 }
 
 /// What a job keeps of the actions its steps run: their posts, in the
@@ -419,14 +452,19 @@ pub(crate) fn action_dir_in(
 /// leaves out `.git`, as GitHub's runner gets an action as a tarball.
 pub(crate) fn private_copy(clone: &Path) -> Result<Arc<tempfile::TempDir>, String> {
     let dir = tempfile::tempdir().map_err(|e| format!("Failed to create temp dir: {}", e))?;
-    copy_tree(&clone.join("action"), &dir.path().join("action"), true)
+    let from = clone.join("action");
+    let root = from
+        .canonicalize()
+        .map_err(|e| format!("Failed to resolve {}: {}", from.display(), e))?;
+    copy_tree(&from, &dir.path().join("action"), &root, true)
         .map_err(|e| format!("Failed to copy the action for its step: {}", e))?;
     Ok(Arc::new(dir))
 }
 
 /// Copy the directory `from` to `to`, symlinks as symlinks, without the
-/// top-level `.git` when `top`.
-fn copy_tree(from: &Path, to: &Path, top: bool) -> std::io::Result<()> {
+/// top-level `.git` when `top`. `root` is the canonical directory being
+/// copied, which a symlink copied as its target must stay inside.
+fn copy_tree(from: &Path, to: &Path, root: &Path, top: bool) -> std::io::Result<()> {
     std::fs::create_dir_all(to)?;
     for entry in std::fs::read_dir(from)? {
         let entry = entry?;
@@ -440,13 +478,17 @@ fn copy_tree(from: &Path, to: &Path, top: bool) -> std::io::Result<()> {
             #[cfg(unix)]
             std::os::unix::fs::symlink(std::fs::read_link(&source)?, &target)?;
             // Windows needs a privilege to make symlinks: a link to a file
-            // is copied as that file, and any other is left out.
+            // in the repository is copied as that file, and any other is
+            // left out. A link the repository holds to a file elsewhere on
+            // this machine, such as a key, is never followed.
             #[cfg(not(unix))]
-            if std::fs::metadata(&source).is_ok_and(|m| m.is_file()) {
+            if link_stays_in(&source, root) {
                 std::fs::copy(&source, &target)?;
             }
+            #[cfg(unix)]
+            let _ = root;
         } else if kind.is_dir() {
-            copy_tree(&source, &target, false)?;
+            copy_tree(&source, &target, root, false)?;
         } else {
             std::fs::copy(&source, &target)?;
         }
@@ -454,9 +496,33 @@ fn copy_tree(from: &Path, to: &Path, top: bool) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Whether the symlink `link` points at a file inside `root`, which is
+/// canonical.
+#[cfg_attr(unix, allow(dead_code))]
+fn link_stays_in(link: &Path, root: &Path) -> bool {
+    link.canonicalize()
+        .is_ok_and(|target| target.starts_with(root) && target.is_file())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_out_of_the_repository_is_not_followed() {
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("id_rsa"), "key").unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path().canonicalize().unwrap();
+        std::fs::write(root.join("index.js"), "main").unwrap();
+        std::os::unix::fs::symlink(root.join("index.js"), root.join("inside")).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("id_rsa"), root.join("outside")).unwrap();
+        std::os::unix::fs::symlink(root.join("missing"), root.join("dangling")).unwrap();
+        assert!(link_stays_in(&root.join("inside"), &root));
+        assert!(!link_stays_in(&root.join("outside"), &root));
+        assert!(!link_stays_in(&root.join("dangling"), &root));
+    }
 
     fn yaml(text: &str) -> serde_yaml::Value {
         serde_yaml::from_str(text).unwrap()
@@ -631,6 +697,7 @@ mod tests {
             command: String::new(),
             condition: "always()".to_string(),
             own_env: HashMap::new(),
+            action_root: None,
             keep_action: None,
             withdrawn: false,
         };
@@ -666,6 +733,7 @@ mod tests {
             command: String::new(),
             condition: "always()".to_string(),
             own_env: HashMap::new(),
+            action_root: None,
             keep_action: None,
             withdrawn: false,
         };

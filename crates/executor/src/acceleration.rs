@@ -39,7 +39,9 @@ pub const SIDECAR_PATH: &str = ".wrkflw/affected.yml";
 /// Bump when the fingerprint's inputs change, so old entries stop matching.
 /// Version 5: steps of the built-in image run as the runner user, so a pass
 /// stored when they ran as root says nothing of a run as that user.
-const KEY_VERSION: u32 = 5;
+/// Version 6: JavaScript actions run, so a pass stored when they passed
+/// without running says nothing of a run of them.
+const KEY_VERSION: u32 = 6;
 
 /// Host directories mounted into containers under `--dep-cache`, and where
 /// in a user's home directory each tool keeps that cache.
@@ -507,6 +509,14 @@ fn job_key_with(
     // stand in for one as that user, or the other way round.
     if steps_as_root {
         document["steps_as_root"] = serde_json::json!(true);
+    }
+    // A pass whose actions were left unrun, all JavaScript ones or those
+    // the user listed, can't stand in for a run of them.
+    if !crate::node_actions::enabled() {
+        document["js_actions"] = serde_json::json!(false);
+    }
+    if let Some(skipped) = crate::run_options::skipped_actions_key() {
+        document["skipped_actions"] = serde_json::json!(skipped);
     }
     let text = serde_json::to_string(&canonical(document)).ok()?;
     Some(hex(&Sha256::digest(text.as_bytes())))

@@ -1445,7 +1445,11 @@ fn a_step_whose_action_did_not_run_makes_a_pass_partial() {
 /// a post that reads what it saved, at the end of the job.
 #[test]
 fn a_local_javascript_action_runs_with_its_inputs_state_and_post() {
-    if std::process::Command::new("node").arg("--version").output().is_err() {
+    if std::process::Command::new("node")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
         eprintln!("skipped: no node on this machine");
         return;
     }
@@ -1507,7 +1511,10 @@ fs.appendFileSync(process.env.GITHUB_STATE, `saved=from-main\n`);
         .unwrap_or_else(|| panic!("no post step: {}", stdout(&output)));
     assert_eq!(post["status"], "success", "{post}");
     assert!(
-        post["output"].as_str().unwrap().contains("post sees from-main"),
+        post["output"]
+            .as_str()
+            .unwrap()
+            .contains("post sees from-main"),
         "{post}"
     );
 }

@@ -490,10 +490,13 @@ mod tests {
         let command = node_command("index.js", 24);
         assert!(command.contains(r#"[ "$v" -lt 24 ]"#), "{command}");
         assert!(command.contains("::warning::This action asks for node24"));
-        if std::process::Command::new("node")
-            .arg("--version")
-            .output()
-            .is_err()
+        // The command runs in a Linux container or on a Unix host; Git
+        // Bash on Windows can't take a Windows path in GITHUB_ACTION_PATH.
+        if cfg!(windows)
+            || std::process::Command::new("node")
+                .arg("--version")
+                .output()
+                .is_err()
         {
             return;
         }

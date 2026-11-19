@@ -10718,9 +10718,11 @@ mod tests {
         assert_eq!(job_env.get("JOB_ONLY").unwrap(), "job-value");
     }
 
-    /// Every `GITHUB_*` and `RUNNER_*` variable wrkflw sets for a job is one
-    /// a step can't overwrite through `$GITHUB_ENV`, so the reserved list
-    /// can't fall behind the context wrkflw builds.
+    /// Every `GITHUB_*` and `RUNNER_*` variable of the job context wrkflw
+    /// builds is one a step can't overwrite through `$GITHUB_ENV`. The
+    /// per-step names (`GITHUB_ACTION_PATH`, `GITHUB_STATE` and the other
+    /// action ones) are set where an action runs, not here: keep them in
+    /// `RESERVED_ENV` by hand when adding one.
     #[test]
     fn every_variable_wrkflw_sets_is_reserved_from_github_env() {
         let dir = tempfile::tempdir().unwrap();

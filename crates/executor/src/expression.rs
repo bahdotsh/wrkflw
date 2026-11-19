@@ -463,8 +463,18 @@ impl<'a> ExpressionContext<'a> {
                 // `github.ref_name`) but will return Null for deeply-nested event
                 // properties that don't have a corresponding env var.
                 let env_key = format!("GITHUB_{}", parts[1..].join("_").to_uppercase());
+                // `github.token` is the same token as `secrets.GITHUB_TOKEN`
+                // on GitHub, and not a variable of the job's: an action
+                // reads it as its `default: ${{ github.token }}` input.
+                let job_token = || {
+                    (env_key == "GITHUB_TOKEN")
+                        .then(|| self.secrets_context.get("GITHUB_TOKEN"))
+                        .flatten()
+                        .filter(|token| !token.is_empty())
+                };
                 self.env_context
                     .get(&env_key)
+                    .or_else(job_token)
                     .map(|v| ExprValue::String(v.clone()))
                     .unwrap_or(ExprValue::Null)
             }
@@ -2977,6 +2987,31 @@ mod tests {
         let ctx = make_secrets_ctx(&secrets);
         let result = evaluate("secrets.NPM_TOKEN", &ctx).unwrap();
         assert_eq!(result, ExprValue::String("abc".to_string()));
+    }
+
+    /// `github.token` is `secrets.GITHUB_TOKEN`, as on GitHub, unless the
+    /// job set a `GITHUB_TOKEN` variable of its own; with neither it is
+    /// null, not an empty secret.
+    #[test]
+    fn github_token_is_the_jobs_github_token_secret() {
+        let mut secrets = HashMap::new();
+        assert_eq!(
+            evaluate("github.token", &make_secrets_ctx(&secrets)).unwrap(),
+            ExprValue::Null
+        );
+        secrets.insert("GITHUB_TOKEN".to_string(), String::new());
+        assert_eq!(
+            evaluate("github.token", &make_secrets_ctx(&secrets)).unwrap(),
+            ExprValue::Null
+        );
+        secrets.insert("GITHUB_TOKEN".to_string(), "ghs_job".to_string());
+        let ctx = make_secrets_ctx(&secrets);
+        assert_eq!(
+            evaluate("github.token", &ctx).unwrap(),
+            ExprValue::String("ghs_job".to_string())
+        );
+        // No other `github` property reads a secret.
+        assert_eq!(evaluate("github.actor", &ctx).unwrap(), ExprValue::Null);
     }
 
     #[test]

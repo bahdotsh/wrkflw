@@ -2111,9 +2111,16 @@ fn report_action_not_run(uses: &str, cause: Option<&str>) -> Option<String> {
     Some(uses.to_string())
 }
 
-/// Where `cargo install` puts commands for the user steps run as. Steps run
-/// as root for now; running them as GitHub's `runner` user moves this.
-const CARGO_BIN_DIR: &str = "/root/.cargo/bin";
+/// Where `cargo install` puts commands in an image mapped with `-P`, whose
+/// steps run as its own user, taken to be root. In the built-in image it
+/// is the runner user's: see [`runner_cargo_home`].
+const ROOT_CARGO_BIN_DIR: &str = "/root/.cargo/bin";
+
+/// `CARGO_HOME` in the built-in image: the runner user's `~/.cargo`, where
+/// the hosted runner has it and where workflows cache it.
+fn runner_cargo_home() -> String {
+    format!("{}/.cargo", crate::runner_user::HOME)
+}
 
 /// Tools the hosted Ubuntu runner has that a job's steps run without
 /// installing them first, so their absence fails a step that passes on
@@ -2158,7 +2165,8 @@ https://cli.github.com/packages stable main\" > /etc/apt/sources.list.d/github-c
 /// runtimes need.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RunnerTools {
-    /// [`RUNNER_TOOLS`] and the GitHub CLI, for the built-in images.
+    /// [`RUNNER_TOOLS`], the GitHub CLI and the [runner
+    /// user](crate::runner_user), for the built-in images.
     Install,
     /// Neither: an image mapped with `-P` is the user's, and gets only what
     /// its setup actions need.
@@ -2200,12 +2208,6 @@ fn generate_combined_dockerfile(
         dockerfile.push_str(&format!("# base image id: {}\n", id));
     }
 
-    let scripts: Vec<&str> = runtimes
-        .iter()
-        .filter(|rt| !rt.install_script.is_empty())
-        .map(|rt| rt.install_script.as_str())
-        .collect();
-
     // `build-essential` because hosted Ubuntu runners have a C toolchain,
     // and Rust build scripts, node-gyp, Python C extensions and cgo all
     // expect one. `less` because they have a pager, which tests of CLI
@@ -2226,6 +2228,12 @@ fn generate_combined_dockerfile(
     if tools == RunnerTools::Install {
         dockerfile.push(' ');
         dockerfile.push_str(&RUNNER_TOOLS.join(" "));
+        // The user steps run as, once `sudo` is there for it.
+        dockerfile.push_str(" && \\\n");
+        dockerfile.push_str(&format!(
+            "    {}",
+            crate::runner_user::create_script(crate::runner_user::uid())
+        ));
     }
 
     // Hosted runners also have Node.js whatever the job sets up, and tools
@@ -2234,6 +2242,9 @@ fn generate_combined_dockerfile(
     if !runtimes.iter().any(|rt| rt.language == "node") {
         dockerfile.push_str(" && \\\n");
         dockerfile.push_str(&format!("    {}", runner_node_install()));
+        if let Some(own) = owned_by_runner(tools, "node") {
+            dockerfile.push_str(&format!(" && \\\n    {}", own));
+        }
     }
     dockerfile.push_str(REMOVE_PACKAGE_LISTS);
     dockerfile.push('\n');
@@ -2245,6 +2256,17 @@ fn generate_combined_dockerfile(
     // and closed to a step that runs as another user, and which a job that
     // sets `HOME` moves. Somewhere fixed and readable serves every step.
     let mut env: Vec<(String, String)> = Vec::new();
+    // rustup and cargo go in the runner user's home, where the hosted
+    // runner has them. Set for every step, so one that runs as root after
+    // all, or with another `HOME`, still finds the toolchain.
+    let has_rust = runtimes.iter().any(|rt| rt.language == "rust");
+    if has_rust && tools == RunnerTools::Install {
+        env.push(("CARGO_HOME".to_string(), runner_cargo_home()));
+        env.push((
+            "RUSTUP_HOME".to_string(),
+            format!("{}/.rustup", crate::runner_user::HOME),
+        ));
+    }
     if runtimes.iter().any(|rt| rt.language == "python") {
         env.push((
             "UV_PYTHON_INSTALL_DIR".to_string(),
@@ -2267,8 +2289,14 @@ fn generate_combined_dockerfile(
     // weeks ago name packages the mirrors have since replaced, and a
     // step's `apt-get install` would fail on some of them and not others;
     // without lists it says at once that it wants an `apt-get update`.
-    for script in &scripts {
+    for runtime in runtimes.iter().filter(|rt| !rt.install_script.is_empty()) {
+        let script = &runtime.install_script;
         dockerfile.push_str(&format!("RUN {}", script));
+        // In the same instruction as the install: a later layer that
+        // changed the files' owner would hold a second copy of them.
+        if let Some(own) = owned_by_runner(tools, &runtime.language) {
+            dockerfile.push_str(&format!(" && \\\n    {}", own));
+        }
         if script.contains("apt-get") {
             dockerfile.push_str(REMOVE_PACKAGE_LISTS);
         }
@@ -2282,17 +2310,28 @@ fn generate_combined_dockerfile(
     // install` adds runs by name.
     // What `cargo install` installs goes on PATH, as `~/.cargo/bin` is on
     // the hosted runner's.
-    let mut path: Vec<&str> = Vec::new();
+    let mut path: Vec<String> = Vec::new();
     if runtimes.iter().any(|rt| rt.language == "python") {
-        path.push(PYTHON_SCRIPTS_DIR);
+        path.push(PYTHON_SCRIPTS_DIR.to_string());
     }
-    if runtimes.iter().any(|rt| rt.language == "rust") {
-        path.push(CARGO_BIN_DIR);
+    if has_rust {
+        path.push(match tools {
+            RunnerTools::Install => format!("{}/bin", runner_cargo_home()),
+            RunnerTools::Omit => ROOT_CARGO_BIN_DIR.to_string(),
+        });
     }
-    path.extend(["/usr/local/bin", "/usr/bin", "$PATH"]);
+    path.extend(["/usr/local/bin", "/usr/bin", "$PATH"].map(str::to_string));
     dockerfile.push_str(&format!("ENV PATH={}\n", path.join(":")));
 
     dockerfile
+}
+
+/// What hands the runner user the files `language`'s install just wrote,
+/// in an image that has that user.
+fn owned_by_runner(tools: RunnerTools, language: &str) -> Option<String> {
+    (tools == RunnerTools::Install)
+        .then(|| crate::runner_user::own_script(language))
+        .flatten()
 }
 
 /// The ISO week `now` falls in, as `2026-W46`, when any of `runtimes`
@@ -2433,9 +2472,15 @@ async fn build_combined_runtime_image(
     }
 }
 
-/// The tag of `tag` with the GitHub CLI on top.
+/// The tag of `tag` with the GitHub CLI on top. It names how the CLI is
+/// installed too, so a changed [`GH_CLI_INSTALL`] gets a new image, not
+/// the one an earlier version of it built.
 fn github_cli_tag(tag: &str) -> String {
-    format!("{}-gh", tag)
+    format!(
+        "{}-gh-{:x}",
+        tag,
+        fnv1a_hash(GH_CLI_INSTALL.as_bytes()) as u32
+    )
 }
 
 /// The image `tag` with the GitHub CLI added in an image of its own, or
@@ -2768,6 +2813,7 @@ async fn resolve_runner_image(
                 not_built,
                 runtimes,
                 in_composite: false,
+                runner_user: tools == RunnerTools::Install,
             },
         })
     }
@@ -2966,11 +3012,27 @@ async fn execute_job_with_matrix(
     }
 
     // Pre-resolve secrets once for this job (shared across matrix combinations and non-matrix path)
-    let (secrets_context, missing_secrets) = if let Some(secret_mgr) = secret_manager {
-        resolve_secrets_for_context(secret_mgr, job).await
-    } else {
-        (HashMap::new(), HashSet::new())
-    };
+    let (mut secrets_context, mut missing_secrets, secret_providers) =
+        if let Some(secret_mgr) = secret_manager {
+            resolve_secrets_for_context(secret_mgr, job).await
+        } else {
+            (HashMap::new(), HashSet::new(), HashMap::new())
+        };
+    // The run's own token, which GitHub makes for every job. Here it is
+    // only given when asked for: a provider's, else this machine's.
+    if crate::run_options::job_github_token_wanted() {
+        let source = fill_job_token(
+            secret_manager,
+            &mut secrets_context,
+            &mut missing_secrets,
+            secret_providers.get("GITHUB_TOKEN").map(String::as_str),
+            crate::run_options::job_github_token,
+        )
+        .await;
+        if source.is_some_and(|source| source.is_this_machines(secret_manager)) {
+            crate::run_options::warn_of_own_token();
+        }
+    }
     // Output is masked before it is shown or persisted, so the masker has to
     // know every value this job can read.
     if let Some(masker) = secret_masker {
@@ -2990,6 +3052,12 @@ async fn execute_job_with_matrix(
         ));
     }
 
+    // Whether this run's steps can run as the runner user decides the reuse
+    // key, so it is settled before the key is made. Only a runtime with
+    // containers has that user to ask about.
+    if let Some(cli) = runtime.session_cli() {
+        crate::runner_user::settle_for_run(Some(cli)).await;
+    }
     let decision = acceleration::decide(acceleration::Lookup {
         job_name,
         job,
@@ -3134,21 +3202,25 @@ async fn execute_job_with_matrix(
         };
 
         // Execute matrix combinations
-        let results = execute_matrix_combinations(MatrixExecutionContext {
-            job_name,
-            job_template: job,
-            combinations: &combinations,
-            max_parallel,
-            fail_fast: job.fail_fast(),
-            workflow,
-            runtime,
-            env_context,
-            user_env,
-            verbose,
-            services,
-        })
-        .await?;
-        store_passing_result(result_key.as_deref(), &results, env_context).await;
+        let (results, fell_back_to_root) = job_session::noting_root_fallback(
+            execute_matrix_combinations(MatrixExecutionContext {
+                job_name,
+                job_template: job,
+                combinations: &combinations,
+                max_parallel,
+                fail_fast: job.fail_fast(),
+                workflow,
+                runtime,
+                env_context,
+                user_env,
+                verbose,
+                services,
+            }),
+        )
+        .await;
+        let results = results?;
+        let key = result_key.as_deref().filter(|_| !fell_back_to_root);
+        store_passing_result(key, &results, env_context).await;
         Ok(results)
     } else {
         // Regular job, no matrix
@@ -3179,16 +3251,20 @@ async fn execute_job_with_matrix(
             }
         };
         let mapped = image_is_mapped(job, platform_overrides, None);
-        let result = with_images_built_ahead(
-            image_ahead,
-            crate::job_memory::metered(
-                job_session::with_job_session(job, runtime, mapped, execute_job(ctx)),
-                job_passed,
-            ),
-        )
-        .await?;
-        let results = vec![result];
-        store_passing_result(result_key.as_deref(), &results, env_context).await;
+        let (result, fell_back_to_root) =
+            job_session::noting_root_fallback(with_images_built_ahead(
+                image_ahead,
+                crate::job_memory::metered(
+                    job_session::with_job_session(job, runtime, mapped, execute_job(ctx)),
+                    job_passed,
+                ),
+            ))
+            .await;
+        let results = vec![result?];
+        // A pass whose steps ran as root where they were to run as the
+        // runner user isn't what its key says: see `noting_root_fallback`.
+        let key = result_key.as_deref().filter(|_| !fell_back_to_root);
+        store_passing_result(key, &results, env_context).await;
         Ok(results)
     }
 }
@@ -6021,26 +6097,35 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
         };
         let cmd_refs: Vec<&str> = cmd_parts.iter().map(String::as_str).collect();
 
-        let dep_mounts = acceleration::dep_cache_mounts(ctx.runtime.mounts_are_copies());
+        let session = job_session::current();
+        let runner_user = session
+            .as_ref()
+            .is_some_and(|session| session.may_run_as_runner_user());
+        // Root's caches go in the runner user's home too, in an image that
+        // has it: `CARGO_HOME` is that user's there, whoever runs cargo.
+        let caches_for = |runner_user: bool| acceleration::DepCacheFor {
+            runner_user,
+            runner_home: ctx.installed_runtimes.runner_user,
+        };
+        let dep_mounts = acceleration::dep_cache_mounts(
+            ctx.runtime.mounts_are_copies(),
+            caches_for(runner_user),
+        );
         let vm_workspace = crate::vm_workspace::before_step(ctx.runtime, ctx.working_dir)
             .await
             .map_err(ExecutionError::Runtime)?;
-        let mut volumes = mount_ctx.build_volumes(ctx.working_dir, container_workspace);
+        let mut step_volumes = mount_ctx.build_volumes(ctx.working_dir, container_workspace);
         if let Some(vm) = &vm_workspace {
-            vm.mount_in(&mut volumes);
+            vm.mount_in(&mut step_volumes);
         }
-        volumes.extend(
-            dep_mounts
-                .iter()
-                .map(|(host, container)| (host.as_path(), container.as_path())),
-        );
+        let volumes = with_dep_mounts(&step_volumes, &dep_mounts);
         let env_vars: Vec<(&str, &str)> = step_env
             .iter()
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
 
         // Execute the command, in the job's container if it has one
-        let session_result = match job_session::current() {
+        let session_result = match session {
             Some(session) => {
                 let resolve = |value: &str| preprocess_with_value(value, &ctx);
                 session
@@ -6059,13 +6144,30 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
         let run_result = match session_result {
             Ok(Some(output)) => Ok(output),
             Ok(None) => {
+                // Outside the job's container the step runs as its image's
+                // user, root, also where the job's steps were to run as the
+                // runner user: it gets root's caches, not the ones that
+                // user's steps share, and the job's pass isn't stored as
+                // one whose steps all ran as that user.
+                let (root_mounts, root_volumes);
+                let own_container_volumes: &[(&Path, &Path)] = if runner_user {
+                    job_session::note_root_fallback();
+                    root_mounts = acceleration::dep_cache_mounts(
+                        ctx.runtime.mounts_are_copies(),
+                        caches_for(false),
+                    );
+                    root_volumes = with_dep_mounts(&step_volumes, &root_mounts);
+                    &root_volumes
+                } else {
+                    &volumes
+                };
                 ctx.runtime
                     .run_container(
                         ctx.runner_image,
                         &cmd_refs,
                         &env_vars,
                         &final_workspace,
-                        &volumes,
+                        own_container_volumes,
                         None,
                     )
                     .await
@@ -7116,8 +7218,17 @@ async fn execute_composite_action(
                     continue;
                 }
 
-                // Execute the step - using Box::pin to handle async recursion
-                let step_result = Box::pin(execute_step(step_ctx)).await?;
+                // Execute the step - using Box::pin to handle async recursion.
+                // A step that couldn't run at all ends the composite, which
+                // still hands on what its earlier steps wrote, as a step
+                // that failed does.
+                let step_result = match Box::pin(execute_step(step_ctx)).await {
+                    Ok(result) => result,
+                    Err(e) => {
+                        hand_on_composite_environment(&composite_applied, job_env);
+                        return Err(e);
+                    }
+                };
                 // An action inside that didn't run is reported on the step
                 // that called the composite action, the one the job shows.
                 actions_not_run.extend(step_result.actions_not_run.iter().cloned());
@@ -7835,16 +7946,123 @@ fn resolve_job_outputs(
     resolved
 }
 
+/// Where a job's `secrets.GITHUB_TOKEN` came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum JobTokenSource {
+    /// The run's secret provider of this name, before or by
+    /// [`fill_job_token`].
+    Provider(String),
+    /// This machine: its environment or `gh`, found by [`fill_job_token`].
+    Machine,
+}
+
+impl JobTokenSource {
+    /// Whether the token is this machine's, the user's own: found here, or
+    /// read from this machine's environment by a provider that reads every
+    /// variable, as the default one does, unlike one with a prefix.
+    fn is_this_machines(&self, secret_manager: Option<&SecretManager>) -> bool {
+        match self {
+            JobTokenSource::Machine => true,
+            JobTokenSource::Provider(name) => secret_manager.is_some_and(|manager| {
+                matches!(
+                    manager.config().providers.get(name),
+                    Some(wrkflw_secrets::SecretProviderConfig::Environment { prefix: None })
+                )
+            }),
+        }
+    }
+}
+
+/// Give the job a `secrets.GITHUB_TOKEN` where it has none: its secret
+/// provider's, else what `machine` finds on this machine. Says where the
+/// job's token came from, or `None` when it has none.
+///
+/// A job's secrets only hold the ones its own text names, so a job that
+/// reads `github.token` alone, or through an action's default, has none
+/// from its provider yet. The provider is asked first, so its token,
+/// perhaps a narrower one than this machine's, wins. `machine` is only
+/// called when no provider had one. `given_by` names the provider of a
+/// token the job's own text already had resolved.
+async fn fill_job_token<F>(
+    secret_manager: Option<&SecretManager>,
+    secrets: &mut HashMap<String, String>,
+    missing: &mut HashSet<String>,
+    given_by: Option<&str>,
+    machine: impl FnOnce() -> F,
+) -> Option<JobTokenSource>
+where
+    F: std::future::Future<Output = Option<String>>,
+{
+    let default_provider =
+        || secret_manager.map(|manager| manager.config().default_provider.clone());
+    if has_job_token(secrets) {
+        let provider = given_by.map(str::to_string).or_else(default_provider);
+        return provider.map(JobTokenSource::Provider);
+    }
+    if let Some(secret_mgr) = secret_manager {
+        if let Ok(value) = secret_mgr.get_secret("GITHUB_TOKEN").await {
+            give_job_token(secrets, missing, value.value().to_string());
+        }
+    }
+    if has_job_token(secrets) {
+        return default_provider().map(JobTokenSource::Provider);
+    }
+    let token = machine().await?;
+    give_job_token(secrets, missing, token);
+    has_job_token(secrets).then_some(JobTokenSource::Machine)
+}
+
+/// Whether the job has a `secrets.GITHUB_TOKEN` that isn't empty.
+fn has_job_token(secrets: &HashMap<String, String>) -> bool {
+    secrets
+        .get("GITHUB_TOKEN")
+        .is_some_and(|value| !value.is_empty())
+}
+
+/// A step's own mounts, `volumes`, followed by the dependency caches
+/// `dep_mounts`.
+fn with_dep_mounts<'a>(
+    volumes: &[(&'a Path, &'a Path)],
+    dep_mounts: &'a [(PathBuf, PathBuf)],
+) -> Vec<(&'a Path, &'a Path)> {
+    let mut all = volumes.to_vec();
+    all.extend(
+        dep_mounts
+            .iter()
+            .map(|(host, container)| (host.as_path(), container.as_path())),
+    );
+    all
+}
+
+/// Make `token` the job's `secrets.GITHUB_TOKEN`, which `github.token`
+/// reads too, unless the job has one already. An empty `token` gives none.
+fn give_job_token(
+    secrets: &mut HashMap<String, String>,
+    missing: &mut HashSet<String>,
+    token: String,
+) {
+    if !has_job_token(secrets) && !token.is_empty() {
+        secrets.insert("GITHUB_TOKEN".to_string(), token);
+        missing.remove("GITHUB_TOKEN");
+    }
+}
+
 /// Pre-resolve secrets referenced in the job into a HashMap for expression evaluation.
 /// Scans job steps, conditions, env, and outputs for `${{ secrets.NAME }}` patterns
 /// and resolves each unique name.
 async fn resolve_secrets_for_context(
     secret_manager: &SecretManager,
     job: &Job,
-) -> (HashMap<String, String>, HashSet<String>) {
+) -> (
+    HashMap<String, String>,
+    HashSet<String>,
+    HashMap<String, String>,
+) {
     use wrkflw_secrets::{SecretError, SecretSubstitution};
 
     let mut secrets = HashMap::new();
+    // The provider each value came from, as `secrets.file:NAME` names one.
+    let mut providers = HashMap::new();
     let mut missing = HashSet::new();
     let mut all_text = String::new();
 
@@ -7882,9 +8100,16 @@ async fn resolve_secrets_for_context(
         }
         match secret_ref.lookup(secret_manager).await {
             Ok(value) => {
-                secrets
-                    .entry(secret_ref.name)
-                    .or_insert_with(|| value.value().to_string());
+                if let std::collections::hash_map::Entry::Vacant(entry) =
+                    secrets.entry(secret_ref.name.clone())
+                {
+                    entry.insert(value.value().to_string());
+                    let provider = secret_ref
+                        .provider
+                        .clone()
+                        .unwrap_or_else(|| secret_manager.config().default_provider.clone());
+                    providers.insert(secret_ref.name, provider);
+                }
             }
             Err(SecretError::NotFound { .. }) => {
                 // Leave it out so the expression resolves to Null.
@@ -7897,7 +8122,7 @@ async fn resolve_secrets_for_context(
         }
     }
 
-    (secrets, missing)
+    (secrets, missing, providers)
 }
 
 #[cfg(test)]
@@ -8258,6 +8483,122 @@ mod tests {
         assert_eq!(resolved, RunnerImage::plain("ubuntu:latest".to_string()));
     }
 
+    /// The job token fills in for a `secrets.GITHUB_TOKEN` no provider has,
+    /// and never replaces one a provider gave.
+    #[test]
+    fn the_job_token_fills_in_only_where_no_provider_gave_one() {
+        let mut secrets = HashMap::from([("GITHUB_TOKEN".to_string(), String::new())]);
+        let mut missing = HashSet::from(["GITHUB_TOKEN".to_string(), "NPM_TOKEN".to_string()]);
+        give_job_token(&mut secrets, &mut missing, "from-gh".to_string());
+        assert_eq!(secrets["GITHUB_TOKEN"], "from-gh");
+        assert_eq!(missing, HashSet::from(["NPM_TOKEN".to_string()]));
+
+        let mut secrets = HashMap::from([("GITHUB_TOKEN".to_string(), "provided".to_string())]);
+        give_job_token(&mut secrets, &mut HashSet::new(), "from-gh".to_string());
+        assert_eq!(secrets["GITHUB_TOKEN"], "provided");
+    }
+
+    /// The default provider reads every variable of this machine's
+    /// environment, so the token it gives is the user's own, as one found
+    /// with `gh` is, and is warned of.
+    #[tokio::test]
+    async fn a_token_from_the_default_provider_is_this_machines() {
+        let default = SecretManager::new(SecretConfig::default()).await.unwrap();
+        let provider = |name: &str| JobTokenSource::Provider(name.to_string());
+        assert!(provider("env").is_this_machines(Some(&default)));
+        // Judged by the provider that gave it, as `secrets.file:NAME` names
+        // one other than the default.
+        assert!(!provider("file").is_this_machines(Some(&default)));
+        assert!(JobTokenSource::Machine.is_this_machines(Some(&default)));
+        assert!(JobTokenSource::Machine.is_this_machines(None));
+        assert!(!provider("env").is_this_machines(None));
+
+        // A token the job's text resolved keeps the provider it came from.
+        let mut secrets = HashMap::from([("GITHUB_TOKEN".to_string(), "t".to_string())]);
+        let source = fill_job_token(
+            Some(&default),
+            &mut secrets,
+            &mut HashSet::new(),
+            Some("file"),
+            || async { None },
+        )
+        .await;
+        assert_eq!(source, Some(provider("file")));
+        let source = fill_job_token(
+            Some(&default),
+            &mut secrets,
+            &mut HashSet::new(),
+            None,
+            || async { None },
+        )
+        .await;
+        assert_eq!(source, Some(provider("env")));
+    }
+
+    /// A job whose text never names `secrets.GITHUB_TOKEN`, as one that
+    /// reads `github.token` or an action's default, still gets its
+    /// provider's token before this machine's, which isn't even looked for.
+    #[tokio::test]
+    async fn the_job_token_is_the_providers_before_this_machines() {
+        let prefix = "WRKFLW_TEST_JOB_TOKEN_PROVIDER_";
+        let manager = |prefix: &str| {
+            let mut config = SecretConfig::default();
+            config.providers.insert(
+                "env".to_string(),
+                wrkflw_secrets::SecretProviderConfig::Environment {
+                    prefix: Some(prefix.to_string()),
+                },
+            );
+            config.enable_caching = false;
+            SecretManager::new(config)
+        };
+        let fill = |manager: Option<SecretManager>, machine: Option<&'static str>| async move {
+            let mut secrets = HashMap::new();
+            let mut missing = HashSet::from(["GITHUB_TOKEN".to_string()]);
+            let asked = std::sync::atomic::AtomicBool::new(false);
+            let source = fill_job_token(
+                manager.as_ref(),
+                &mut secrets,
+                &mut missing,
+                None,
+                || async {
+                    asked.store(true, std::sync::atomic::Ordering::Relaxed);
+                    machine.map(str::to_string)
+                },
+            )
+            .await;
+            (
+                secrets.get("GITHUB_TOKEN").cloned(),
+                missing.contains("GITHUB_TOKEN"),
+                asked.load(std::sync::atomic::Ordering::Relaxed),
+                source.map(|source| source.is_this_machines(manager.as_ref())),
+            )
+        };
+
+        // A provider with a prefix: its own token, not this machine's.
+        std::env::set_var(format!("{prefix}GITHUB_TOKEN"), "ghs_provider");
+        let provided = fill(Some(manager(prefix).await.unwrap()), Some("gho_mine")).await;
+        std::env::remove_var(format!("{prefix}GITHUB_TOKEN"));
+        assert_eq!(
+            provided,
+            (Some("ghs_provider".to_string()), false, false, Some(false))
+        );
+
+        // No provider has one: this machine's.
+        let unset = "WRKFLW_TEST_JOB_TOKEN_NO_PROVIDER_";
+        let mine = fill(Some(manager(unset).await.unwrap()), Some("gho_mine")).await;
+        assert_eq!(
+            mine,
+            (Some("gho_mine".to_string()), false, true, Some(true))
+        );
+        assert_eq!(
+            fill(None, Some("gho_mine")).await,
+            (Some("gho_mine".to_string()), false, true, Some(true))
+        );
+        // Neither: still missing.
+        assert_eq!(fill(None, None).await, (None, true, true, None));
+    }
+
     /// A job that sets nothing up still runs with the runner's tools, such
     /// as `sudo`, `jq` and `gh`, in a runtime that builds images; never in
     /// an image mapped with `-P`.
@@ -8277,7 +8618,7 @@ mod tests {
             "{resolved:?}"
         );
         // With the GitHub CLI on top.
-        assert!(resolved.image.ends_with("-gh"), "{resolved:?}");
+        assert!(resolved.image.contains("-gh-"), "{resolved:?}");
         assert!(resolved.built.installed.is_empty());
         let df =
             generate_combined_dockerfile(&[], "ubuntu:latest", None, None, RunnerTools::Install);
@@ -10347,6 +10688,65 @@ runs:
         );
     }
 
+    /// The built-in image has the runner user, with rustup and cargo in
+    /// its home and each runtime's files handed to it where they are
+    /// installed. A `-P` image keeps its own user and root's paths.
+    #[test]
+    fn the_built_in_image_has_the_runner_user_and_a_mapped_one_does_not() {
+        let runtimes: Vec<SetupRuntime> = ["rust", "python"]
+            .iter()
+            .map(|language| SetupRuntime {
+                language: language.to_string(),
+                version: "stable".to_string(),
+                install_script: format!("install-{}", language),
+                floating: false,
+                env: Vec::new(),
+            })
+            .collect();
+        let dockerfile =
+            |tools| generate_combined_dockerfile(&runtimes, "ubuntu:latest", None, None, tools);
+
+        let built_in = dockerfile(RunnerTools::Install);
+        assert!(
+            built_in.contains("useradd --no-log-init --create-home"),
+            "{built_in}"
+        );
+        assert!(
+            built_in.contains("ENV CARGO_HOME=/home/runner/.cargo\n"),
+            "{built_in}"
+        );
+        assert!(
+            built_in.contains("ENV RUSTUP_HOME=/home/runner/.rustup\n"),
+            "{built_in}"
+        );
+        // Before the install that reads them.
+        assert!(
+            built_in.find("ENV CARGO_HOME").unwrap() < built_in.find("RUN install-rust").unwrap(),
+            "{built_in}"
+        );
+        // Owned in the instruction that installed them.
+        assert!(
+            built_in.contains(&format!(
+                "RUN install-rust && \\\n    {}\n",
+                crate::runner_user::own_script("rust").unwrap()
+            )),
+            "{built_in}"
+        );
+        assert!(
+            built_in.contains(":/home/runner/.cargo/bin:/usr/local/bin:"),
+            "{built_in}"
+        );
+
+        let mapped = dockerfile(RunnerTools::Omit);
+        assert!(!mapped.contains("runner"), "{mapped}");
+        assert!(!mapped.contains("CARGO_HOME"), "{mapped}");
+        assert!(mapped.contains("RUN install-rust\n"), "{mapped}");
+        assert!(
+            mapped.contains(":/root/.cargo/bin:/usr/local/bin:"),
+            "{mapped}"
+        );
+    }
+
     #[test]
     fn the_shared_layers_end_with_the_first_run() {
         let python = |version: &str| {
@@ -10374,10 +10774,16 @@ runs:
         assert!(shared.contains("build-essential"), "{shared}");
         assert!(
             shared.ends_with(&format!(
-                "{}{}\n",
+                "{} && \\\n    {}{}\n",
                 runner_node_install(),
+                crate::runner_user::own_script("node").unwrap(),
                 REMOVE_PACKAGE_LISTS
             )),
+            "{shared}"
+        );
+        // The user steps run as is every leg's, with the packages.
+        assert!(
+            shared.contains("useradd --no-log-init --create-home"),
             "{shared}"
         );
         assert!(!shared.contains("uv python install"), "{shared}");
@@ -16206,6 +16612,131 @@ runs:
         let calls = runtime.run_calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
         assert!(calls[0].cmd.iter().any(|c| c.contains("linux step ran")));
+    }
+
+    /// A step that can't run in the job's container runs in one of its own,
+    /// as root: it gets root's dependency caches, not the ones the runner
+    /// user's steps share, and the job notes that its steps fell back to
+    /// root, so its pass isn't stored as one that ran as that user.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_step_outside_the_jobs_container_runs_as_root_with_roots_caches() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        // An engine CLI that fails everything: the job's container never
+        // starts, and its steps fall back to one container each.
+        let cli = dir.path().join("cli");
+        fs::write(&cli, "#!/bin/sh\nexit 1\n").unwrap();
+        fs::set_permissions(&cli, fs::Permissions::from_mode(0o755)).unwrap();
+        // Wait out ETXTBSY from a process another test forked meanwhile.
+        for _ in 0..100 {
+            match std::process::Command::new(&cli).output() {
+                Err(e) if e.raw_os_error() == Some(26) => {
+                    std::thread::sleep(std::time::Duration::from_millis(10))
+                }
+                _ => break,
+            }
+        }
+        let cli: &'static str = Box::leak(cli.display().to_string().into_boxed_str());
+        let runtime = MockContainerRuntime {
+            session_cli: Some(cli),
+            ..Default::default()
+        };
+        let caches = dir.path().join("deps");
+        let state = acceleration::RunState::new(
+            acceleration::Acceleration {
+                dep_cache: true,
+                ..Default::default()
+            },
+            false,
+            dir.path().to_path_buf(),
+        )
+        .unwrap()
+        .with_dep_caches_in(&caches);
+        let job = make_job(None, labels(&["ubuntu-latest"]));
+        let step = make_run_step("echo hi");
+        let working_dir = tempfile::tempdir().unwrap();
+        let job_env = HashMap::from([("RUNNER_OS".to_string(), "Linux".to_string())]);
+        let pending = std::sync::Mutex::new(Vec::<PendingCacheSave>::new());
+        // Boxed: the step's future is too large for a test thread's stack.
+        let step_run = Box::pin(run_step_with(
+            &step,
+            &job_env,
+            working_dir.path(),
+            &runtime,
+            test_services(),
+            &pending,
+        ));
+        let (_, fell_back) = Box::pin(acceleration::with_run_state(Arc::new(state), async {
+            // This run may have the runner user, whoever runs the test.
+            acceleration::settle_runner_user(|| async { None }).await;
+            job_session::noting_root_fallback(job_session::with_job_session(
+                &job, &runtime, false, step_run,
+            ))
+            .await
+        }))
+        .await;
+
+        assert!(fell_back);
+        let calls = runtime.run_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        let mounted: Vec<&(PathBuf, PathBuf)> = calls[0]
+            .volumes
+            .iter()
+            .filter(|(host, _)| host.starts_with(&caches))
+            .collect();
+        assert!(!mounted.is_empty(), "{calls:?}");
+        assert!(
+            mounted.iter().all(|(host, container)| {
+                host.components().any(|part| part.as_os_str() == "as-root")
+                    && container.starts_with("/root")
+            }),
+            "{mounted:?}"
+        );
+    }
+
+    /// A step that couldn't run at all ends the composite with an error, and
+    /// what its earlier steps wrote to `$GITHUB_ENV` still reaches the job,
+    /// as it does when a step fails.
+    #[tokio::test]
+    async fn a_composite_that_errors_still_hands_on_its_environment() {
+        let action_dir = tempfile::tempdir().unwrap();
+        write_composite_action(
+            action_dir.path(),
+            "    - run: echo FOO=bar >> \"$GITHUB_ENV\"\n      shell: bash\n    - uses: ./no-such-action",
+        );
+        let files = tempfile::tempdir().unwrap();
+        let github_env = files.path().join("env");
+        // The mock runs nothing: the first step's write is already there.
+        fs::write(&github_env, "FOO=bar\n").unwrap();
+        let job_env = HashMap::from([
+            ("GITHUB_ENV".to_string(), github_env.display().to_string()),
+            ("RUNNER_OS".to_string(), "Linux".to_string()),
+        ]);
+
+        let runtime = MockContainerRuntime::default();
+        let working_dir = tempfile::tempdir().unwrap();
+        let step = make_run_step("noop");
+        let services = test_services();
+        let pending = std::sync::Mutex::new(Vec::<PendingCacheSave>::new());
+        let result = execute_composite_action(
+            &step,
+            action_dir.path(),
+            &job_env,
+            &job_env,
+            working_dir.path(),
+            &runtime,
+            "ubuntu:latest",
+            &BuiltRuntimes::default(),
+            false,
+            &services,
+            &pending,
+        )
+        .await;
+        assert!(result.is_err(), "{result:?}");
+        let handed_on = fs::read_to_string(&github_env).unwrap();
+        assert!(handed_on.contains("FOO"), "{handed_on:?}");
+        assert!(handed_on.contains("bar"), "{handed_on:?}");
     }
 
     #[tokio::test]

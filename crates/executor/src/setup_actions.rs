@@ -29,6 +29,10 @@ pub(crate) struct BuiltRuntimes {
     /// Set for the steps of a composite action: the image was built from
     /// the job's own setup steps, which aren't these.
     pub(crate) in_composite: bool,
+    /// The image is one wrkflw built with the [runner
+    /// user](crate::runner_user), whose home and `CARGO_HOME` are that
+    /// user's: not a bare base image, nor one mapped with `-P`.
+    pub(crate) runner_user: bool,
 }
 
 /// Why a setup step's version is not in the job's image.
@@ -62,6 +66,7 @@ impl BuiltRuntimes {
             not_built: Vec::new(),
             runtimes: self.runtimes.clone(),
             in_composite: true,
+            runner_user: self.runner_user,
         }
     }
 }

@@ -102,11 +102,13 @@ pub(crate) fn job_github_token_wanted() -> bool {
 /// and one waiting on a locked keychain mustn't hold up the run.
 const GH_AUTH_TOKEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// What `gh auth token` prints, or `None` when it fails, isn't installed or
-/// takes longer than [`GH_AUTH_TOKEN_TIMEOUT`].
+/// What `gh auth token` prints for github.com, or `None` when it fails,
+/// isn't installed or takes longer than [`GH_AUTH_TOKEN_TIMEOUT`]. The host
+/// is named: with `GH_HOST` set to an Enterprise server, `gh` would hand
+/// back that server's token, which then goes to github.com.
 async fn gh_auth_token() -> Option<String> {
     let output = tokio::process::Command::new("gh")
-        .args(["auth", "token"])
+        .args(["auth", "token", "--hostname", "github.com"])
         .stdin(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .kill_on_drop(true)

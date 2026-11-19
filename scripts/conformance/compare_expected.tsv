@@ -1,14 +1,13 @@
 # What compare_sweep.sh expects of each run: fewer agreeing, or more
 # differing or unverified jobs, than this is a regression. Written by
-# WRKFLW_SWEEP_RECORD=1; say in the commit why a line changed. A line
-# without `unverified` predates it, and its next recording adds it.
+# WRKFLW_SWEEP_RECORD=1; say in the commit why a line changed.
 # repo	run	agreed	differed	not_compared	unverified
-pallets/click	42384079679	10	0	1
-chalk/chalk	39857044981	2	0	0
-sindresorhus/ky	37893818274	4	0	0
-rust-lang/log	41132244035	10	1	2
-dtolnay/itoa	42546989194	8	3	0
-tj/commander.js	42330604270	6	0	3
-spf13/cobra	29133202016	18	0	1
-fatih/color	29997796830	1	0	0
-pallets/flask	41077465744	11	0	1
+pallets/click	42384079679	10	0	1	1
+chalk/chalk	39857044981	2	0	0	0
+sindresorhus/ky	37893818274	4	0	0	4
+rust-lang/log	41132244035	10	1	2	1
+dtolnay/itoa	42546989194	8	3	0	0
+tj/commander.js	42330604270	6	0	3	3
+spf13/cobra	29133202016	18	0	1	8
+fatih/color	29997796830	1	0	0	0
+pallets/flask	41077465744	11	0	1	1

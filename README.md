@@ -400,19 +400,19 @@ Docker Desktop and Podman machines often have half the 16 GB of a GitHub runner,
 
 #### How close to GitHub
 
-The last sweep, with `wrkflw compare` against each repository's finished GitHub run. A job agrees when both sides passed or both failed; not compared are the Windows jobs, which run on a Linux stand-in. Local times are warm (`built` 0), on a Mac with a 7.7 GB Docker VM.
+The last sweep (2026-11-19, on the 0.9.0 code), with `wrkflw compare` against each repository's finished GitHub run. A job agrees when both sides passed or both failed; not compared are the Windows jobs, which run on a Linux stand-in. Jobs agreed include `macos-*` jobs run as Linux, which `compare` counts as agreeing unverified (`compare_expected.tsv` records how many). Local times are warm (`built` 0), on a Mac with a 7.7 GB Docker VM.
 
 | Repository | Jobs agreed | Differed | Not compared | Local | GitHub |
 |---|---|---|---|---|---|
-| pallets/click | 10 | 0 | 1 | pending | pending |
-| chalk/chalk | 2 | 0 | 0 | pending | pending |
-| sindresorhus/ky | 4 | 0 | 0 | pending | pending |
-| rust-lang/log | 10 | 1 | 2 | pending | pending |
-| dtolnay/itoa | 8 | 3 | 0 | pending | pending |
-| tj/commander.js | 6 | 0 | 3 | pending | pending |
-| spf13/cobra | 18 | 0 | 1 | pending | pending |
-| fatih/color | 1 | 0 | 0 | pending | pending |
-| pallets/flask | 11 | 0 | 1 | pending | pending |
+| pallets/click | 10 | 0 | 1 | 38 s | 65 s |
+| chalk/chalk | 2 | 0 | 0 | 13 s | 39 s |
+| sindresorhus/ky | 4 | 0 | 0 | 130 s | 187 s |
+| rust-lang/log | 10 | 1 | 2 | 362 s | 527 s |
+| dtolnay/itoa | 8 | 3 | 0 | 101 s | 346 s |
+| tj/commander.js | 6 | 0 | 3 | 67 s | 99 s |
+| spf13/cobra | 18 | 0 | 1 | 134 s | 99 s |
+| fatih/color | 1 | 0 | 0 | 25 s | 57 s |
+| pallets/flask | 11 | 0 | 1 | 32 s | 44 s |
 
 rust-lang/log's one difference is its documentation job, which fails on Rust 1.100, released after its GitHub run, as `stable` floats. itoa's three verify an attestation with the job's GitHub token, which a local job doesn't get unless `WRKFLW_JOB_GITHUB_TOKEN=1` gives it yours.
 

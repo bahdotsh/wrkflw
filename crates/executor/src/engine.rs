@@ -2003,11 +2003,13 @@ async fn shallow_clone(
     if target_dir.exists() {
         let _ = std::fs::remove_dir_all(target_dir);
     }
-    clone_attempt(repo_url, git_ref, target_dir, &clone_auth_env(&token))
+    let auth = clone_auth_env(&token, std::env::var("GIT_CONFIG_COUNT").ok().as_deref());
+    clone_attempt(repo_url, git_ref, target_dir, &auth)
         .await
         .map_err(|with_token| {
             ExecutionError::Execution(format!(
-                "{} (also failed with your GitHub token: {}; check that the token can read the repository)",
+                "{} (also failed with your GitHub token: {}; check that the repository and \
+                 ref exist, and that the token can read the repository)",
                 anonymous, with_token
             ))
         })
@@ -2034,6 +2036,19 @@ async fn cloned_action(
     .map_err(ExecutionError::Execution)
 }
 
+/// [`cloned_action`] copied for one step to run from, as each step gets
+/// its own: see [`crate::node_actions::private_copy`].
+async fn action_for_step(
+    action: &ActionInfo,
+    provider_token: Option<&str>,
+) -> Result<Arc<tempfile::TempDir>, ExecutionError> {
+    let clone = cloned_action(action, provider_token).await?;
+    tokio::task::spawn_blocking(move || crate::node_actions::private_copy(clone.path()))
+        .await
+        .map_err(|e| ExecutionError::Execution(format!("Copying the action failed: {}", e)))?
+        .map_err(ExecutionError::Execution)
+}
+
 /// Whether a failed anonymous clone's error says GitHub wanted credentials,
 /// as it does for a private repository (which it reports as not found), and
 /// not that the ref or the network was at fault, which a token won't fix.
@@ -2054,17 +2069,22 @@ fn needs_credentials(error: &str) -> bool {
 const GITHUB_CLONE_PREFIX: &str = "https://github.com/";
 
 /// Environment that has git send `token` to github.com as basic auth, as
-/// `actions/checkout` does, without it showing in a command line.
-fn clone_auth_env(token: &str) -> Vec<(String, String)> {
+/// `actions/checkout` does, without it showing in a command line. The
+/// header is added after the `count` entries the user's own environment
+/// may already give git (`GIT_CONFIG_COUNT`), so those still apply.
+fn clone_auth_env(token: &str, count: Option<&str>) -> Vec<(String, String)> {
     let credentials = base64_encode(format!("x-access-token:{}", token).as_bytes());
+    let index = count
+        .and_then(|count| count.trim().parse::<usize>().ok())
+        .unwrap_or(0);
     vec![
-        ("GIT_CONFIG_COUNT".to_string(), "1".to_string()),
+        ("GIT_CONFIG_COUNT".to_string(), (index + 1).to_string()),
         (
-            "GIT_CONFIG_KEY_0".to_string(),
+            format!("GIT_CONFIG_KEY_{}", index),
             format!("http.{}.extraheader", GITHUB_CLONE_PREFIX),
         ),
         (
-            "GIT_CONFIG_VALUE_0".to_string(),
+            format!("GIT_CONFIG_VALUE_{}", index),
             format!("AUTHORIZATION: basic {}", credentials),
         ),
     ]
@@ -5778,9 +5798,10 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                         )
                         .await?
                     } else {
-                        // Handle remote composite action: this run's clone
-                        // of its repository, made once, then its steps.
-                        let clone = cloned_action(&action_info, ctx.services.clone_token()).await?;
+                        // Handle remote composite action: this step's copy
+                        // of the run's one clone of its repository.
+                        let clone =
+                            action_for_step(&action_info, ctx.services.clone_token()).await?;
                         let repo_dir = clone.path().join("action");
                         // If the action has a sub-path, the action.yml is inside that directory
                         let action_dir = match &action_info.sub_path {
@@ -8017,7 +8038,7 @@ async fn execute_node_action(
             None,
         )
     } else {
-        let clone = cloned_action(action_info, ctx.services.clone_token()).await?;
+        let clone = action_for_step(action_info, ctx.services.clone_token()).await?;
         let (dir, root) = js::action_dir_in(clone.path(), action_info.sub_path.as_deref())
             .map_err(ExecutionError::Execution)?;
         (dir, Some(root), Some(clone))
@@ -9154,7 +9175,7 @@ mod tests {
 
     #[test]
     fn a_clone_token_goes_in_a_github_header_not_the_url() {
-        let env = clone_auth_env("ghp_secret");
+        let env = clone_auth_env("ghp_secret", None);
         let get = |k: &str| env.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
         assert_eq!(get("GIT_CONFIG_COUNT"), Some("1"));
         assert_eq!(
@@ -9170,6 +9191,16 @@ mod tests {
             )
         );
         assert!(!header.contains("ghp_secret"));
+
+        // Config the user passes git through its environment still applies.
+        let after = clone_auth_env("ghp_secret", Some("2"));
+        let get = |k: &str| after.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+        assert_eq!(get("GIT_CONFIG_COUNT"), Some("3"));
+        assert_eq!(
+            get("GIT_CONFIG_KEY_2"),
+            Some("http.https://github.com/.extraheader")
+        );
+        assert_eq!(get("GIT_CONFIG_KEY_0"), None);
     }
 
     #[test]

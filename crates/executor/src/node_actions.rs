@@ -316,6 +316,48 @@ pub(crate) fn action_dir_in(
     Ok((canonical, canonical_root))
 }
 
+/// A copy of the action cloned in `clone` for one step to run, so steps
+/// that run at once never share it: an action may write beside its own
+/// files (`npm ci` in its directory), and under emulation or a mounted
+/// directory two matrix legs would then write into one clone. The copy
+/// leaves out `.git`, as GitHub's runner gets an action as a tarball.
+pub(crate) fn private_copy(clone: &Path) -> Result<Arc<tempfile::TempDir>, String> {
+    let dir = tempfile::tempdir().map_err(|e| format!("Failed to create temp dir: {}", e))?;
+    copy_tree(&clone.join("action"), &dir.path().join("action"), true)
+        .map_err(|e| format!("Failed to copy the action for its step: {}", e))?;
+    Ok(Arc::new(dir))
+}
+
+/// Copy the directory `from` to `to`, symlinks as symlinks, without the
+/// top-level `.git` when `top`.
+fn copy_tree(from: &Path, to: &Path, top: bool) -> std::io::Result<()> {
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if top && name == ".git" {
+            continue;
+        }
+        let (source, target) = (entry.path(), to.join(&name));
+        let kind = entry.file_type()?;
+        if kind.is_symlink() {
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(std::fs::read_link(&source)?, &target)?;
+            // Windows needs a privilege to make symlinks: a link to a file
+            // is copied as that file, and any other is left out.
+            #[cfg(not(unix))]
+            if std::fs::metadata(&source).is_ok_and(|m| m.is_file()) {
+                std::fs::copy(&source, &target)?;
+            }
+        } else if kind.is_dir() {
+            copy_tree(&source, &target, false)?;
+        } else {
+            std::fs::copy(&source, &target)?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -507,5 +549,33 @@ mod tests {
             action_dir_in(dir.path(), None).unwrap(),
             (root.clone(), root)
         );
+    }
+
+    #[test]
+    fn each_step_gets_its_own_copy_without_git() {
+        let clone = tempfile::tempdir().unwrap();
+        let root = clone.path().join("action");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::create_dir_all(root.join("dist")).unwrap();
+        std::fs::write(root.join(".git/HEAD"), "ref").unwrap();
+        std::fs::write(root.join("dist/index.js"), "main").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("dist/index.js", root.join("index.js")).unwrap();
+
+        let a = private_copy(clone.path()).unwrap();
+        let b = private_copy(clone.path()).unwrap();
+        assert_ne!(a.path(), b.path());
+        let copied = a.path().join("action");
+        assert_eq!(
+            std::fs::read_to_string(copied.join("dist/index.js")).unwrap(),
+            "main"
+        );
+        assert!(!copied.join(".git").exists());
+        #[cfg(unix)]
+        assert!(copied.join("index.js").is_symlink());
+
+        // What one step writes there, the other doesn't see.
+        std::fs::write(copied.join("node_modules"), "x").unwrap();
+        assert!(!b.path().join("action/node_modules").exists());
     }
 }

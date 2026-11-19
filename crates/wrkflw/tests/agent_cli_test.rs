@@ -1514,6 +1514,62 @@ fs.appendFileSync(process.env.GITHUB_STATE, `saved=from-main\n`);
     );
 }
 
+/// A JavaScript action inside a composite action queues its post for the
+/// end of the calling job, as on GitHub.
+#[test]
+fn a_javascript_action_in_a_composite_action_runs_its_post() {
+    if !has_node() {
+        return;
+    }
+    let sandbox = Sandbox::new();
+    js_action(
+        &sandbox,
+        "js",
+        "name: js\nruns:\n  using: node20\n  main: main.js\n  post: post.js\n",
+        &[
+            (
+                "main.js",
+                r#"require("fs").appendFileSync(process.env.GITHUB_STATE, "from=inner\n");"#,
+            ),
+            (
+                "post.js",
+                r#"console.log("inner post sees " + process.env.STATE_from);"#,
+            ),
+        ],
+    );
+    let wrapper = sandbox.repo.path().join(".github/actions/wrapper");
+    fs::create_dir_all(&wrapper).unwrap();
+    fs::write(
+        wrapper.join("action.yml"),
+        "name: wrapper\nruns:\n  using: composite\n  steps:\n    \
+         - name: Inner JS\n      uses: ./.github/actions/js\n",
+    )
+    .unwrap();
+    sandbox.write(
+        "wrapped.yml",
+        "name: wrapped\non: [push]\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      \
+         - name: Wrapper\n        uses: ./.github/actions/wrapper\n",
+    );
+    let output = sandbox.run(&[
+        "--format",
+        "json",
+        "run",
+        "--runtime",
+        "emulation",
+        ".github/workflows/wrapped.yml",
+    ]);
+    let lines = json_lines(&output);
+    let post = finished_step(&lines, "Post Inner JS", &output);
+    assert_eq!(post["status"], "success", "{post}");
+    assert!(
+        post["output"]
+            .as_str()
+            .unwrap()
+            .contains("inner post sees inner"),
+        "{post}"
+    );
+}
+
 /// Whether this machine has `node`, which the emulation tests of
 /// JavaScript actions run them with.
 fn has_node() -> bool {

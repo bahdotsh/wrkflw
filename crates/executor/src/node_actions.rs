@@ -117,12 +117,20 @@ pub(crate) fn input_env(
     env
 }
 
-/// The `bash` command that runs `script` from the action's directory. The
-/// script's path is quoted, so whatever its name holds reaches `node` as
-/// written.
-pub(crate) fn node_command(script: &str) -> String {
+/// The `bash` command that runs `script` from the action's directory, for
+/// an action that asks for Node `major`. The script's path is quoted, so
+/// whatever its name holds reaches `node` as written. When the image's
+/// Node is older than the action asks for, the step warns first, as a
+/// failure may then come from the older Node: a newer one is fine, as
+/// GitHub's runner too runs older actions on a newer Node.
+pub(crate) fn node_command(script: &str, major: u32) -> String {
     let script = script.trim_start_matches("./").replace('\'', r"'\''");
-    format!("node \"$GITHUB_ACTION_PATH\"/'{}'", script)
+    format!(
+        "v=$(node -p 'process.versions.node.split(\".\")[0]' 2>/dev/null) && [ \"$v\" -lt {major} ] && \
+         echo \"::warning::This action asks for node{major}, and the job's image has Node $v: \
+         a failure may come from the older Node\"; \
+         node \"$GITHUB_ACTION_PATH\"/'{script}'"
+    )
 }
 
 /// Why a JavaScript action didn't run when the image had no `bash` to
@@ -184,6 +192,9 @@ pub(crate) struct PostStep {
     /// cloned it until its post has run. Held, never read.
     #[allow(dead_code)]
     pub keep_action: Option<Arc<tempfile::TempDir>>,
+    /// Set when the action turned out not to run at all, so neither does
+    /// its post.
+    pub withdrawn: bool,
 }
 
 /// The posts of the job running, in the order their actions ran.
@@ -205,29 +216,47 @@ pub(crate) fn collecting_posts<F: std::future::Future>(
     JOB_POSTS.scope(posts.clone(), future)
 }
 
-/// Queue `post` for the end of the job. Outside a step loop, as in a test
-/// calling a step on its own, there is no end of job to run it at: it is
-/// dropped with a warning.
-pub(crate) fn queue_post(post: PostStep) {
-    if JOB_POSTS
-        .try_with(|posts| {
-            posts
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .push(post.clone())
-        })
-        .is_err()
-    {
+/// Queue `post` for the end of the job, and return where it is in the
+/// queue for [`update_post`]. As on GitHub's runner, a post is queued
+/// before its action's `main` runs, so it runs at the end of the job also
+/// when `main` failed or ran out of time. Outside a step loop, as in a
+/// test calling a step on its own, there is no end of job to run it at: it
+/// is dropped with a warning.
+pub(crate) fn queue_post(post: PostStep) -> Option<usize> {
+    let queued = JOB_POSTS.try_with(|posts| {
+        let mut posts = posts.lock().unwrap_or_else(|e| e.into_inner());
+        posts.push(post.clone());
+        posts.len() - 1
+    });
+    if queued.is_err() {
         wrkflw_logging::warning(&format!(
             "'{}' has nowhere to run: it isn't part of a job",
             post.name
         ));
     }
+    queued.ok()
 }
 
-/// The posts queued so far, last first, as GitHub runs them.
+/// Change the post [`queue_post`] put at `index`, once its `main` is done:
+/// what `main` saved for it, or that it is withdrawn.
+pub(crate) fn update_post(index: Option<usize>, change: impl FnOnce(&mut PostStep)) {
+    let Some(index) = index else { return };
+    let _ = JOB_POSTS.try_with(|posts| {
+        if let Some(post) = posts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(index)
+        {
+            change(post);
+        }
+    });
+}
+
+/// The posts queued so far and not withdrawn, last first, as GitHub runs
+/// them.
 pub(crate) fn take_posts(posts: &JobPosts) -> Vec<PostStep> {
     let mut taken = std::mem::take(&mut *posts.lock().unwrap_or_else(|e| e.into_inner()));
+    taken.retain(|post| !post.withdrawn);
     taken.reverse();
     taken
 }
@@ -448,14 +477,80 @@ mod tests {
 
     #[test]
     fn a_scripts_path_reaches_node_as_written() {
-        assert_eq!(
-            node_command("./dist/index.js"),
-            r#"node "$GITHUB_ACTION_PATH"/'dist/index.js'"#
+        assert!(node_command("./dist/index.js", 20)
+            .ends_with(r#"node "$GITHUB_ACTION_PATH"/'dist/index.js'"#));
+        assert!(node_command("../lib/$x \"a'b\".js", 20)
+            .ends_with(r#"node "$GITHUB_ACTION_PATH"/'../lib/$x "a'\''b".js'"#));
+    }
+
+    /// Only a Node older than the action asks for warns, as GitHub's runner
+    /// also runs older actions on a newer Node.
+    #[test]
+    fn an_older_node_than_the_action_asks_for_warns() {
+        let command = node_command("index.js", 24);
+        assert!(command.contains(r#"[ "$v" -lt 24 ]"#), "{command}");
+        assert!(command.contains("::warning::This action asks for node24"));
+        if std::process::Command::new("node")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("index.js"), "console.log('ran')").unwrap();
+        let run = |major: u32| {
+            let out = std::process::Command::new("bash")
+                .arg("-c")
+                .arg(node_command("index.js", major))
+                .env("GITHUB_ACTION_PATH", dir.path())
+                .output()
+                .unwrap();
+            assert!(out.status.success());
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        assert_eq!(run(1), "ran\n");
+        let newer = run(999);
+        assert!(
+            newer.starts_with("::warning::This action asks for node999"),
+            "{newer}"
         );
+        assert!(newer.ends_with("ran\n"), "{newer}");
+    }
+
+    #[test]
+    fn a_withdrawn_post_does_not_run() {
+        let posts: JobPosts = Arc::default();
+        let post = |name: &str| PostStep {
+            name: name.to_string(),
+            command: String::new(),
+            condition: "always()".to_string(),
+            own_env: HashMap::new(),
+            keep_action: None,
+            withdrawn: false,
+        };
+        let (kept, dropped) = tokio_test_scope(&posts, || {
+            let kept = queue_post(post("kept"));
+            let dropped = queue_post(post("dropped"));
+            update_post(dropped, |p| p.withdrawn = true);
+            update_post(kept, |p| {
+                p.own_env.insert("STATE_x".to_string(), "1".to_string());
+            });
+            (kept, dropped)
+        });
+        assert_eq!((kept, dropped), (Some(0), Some(1)));
+        let taken = take_posts(&posts);
+        assert_eq!(taken.len(), 1);
+        assert_eq!(taken[0].name, "kept");
         assert_eq!(
-            node_command("../lib/$x \"a'b\".js"),
-            r#"node "$GITHUB_ACTION_PATH"/'../lib/$x "a'\''b".js'"#
+            taken[0].own_env.get("STATE_x").map(String::as_str),
+            Some("1")
         );
+    }
+
+    /// Run `f` as a step of a job whose posts go on `posts`.
+    fn tokio_test_scope<T>(posts: &JobPosts, f: impl FnOnce() -> T) -> T {
+        JOB_POSTS.sync_scope(posts.clone(), f)
     }
 
     #[test]
@@ -467,6 +562,7 @@ mod tests {
             condition: "always()".to_string(),
             own_env: HashMap::new(),
             keep_action: None,
+            withdrawn: false,
         };
         posts.lock().unwrap().push(post("first"));
         posts.lock().unwrap().push(post("second"));

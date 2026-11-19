@@ -8003,8 +8003,12 @@ async fn run_node_script(
     user_env: &HashMap<String, String>,
     name: String,
     script: &str,
+    node_major: u32,
 ) -> Result<StepResult, ExecutionError> {
-    let step = crate::node_actions::script_step(name, crate::node_actions::node_command(script));
+    let step = crate::node_actions::script_step(
+        name,
+        crate::node_actions::node_command(script, node_major),
+    );
     Box::pin(execute_step(ctx.with_step(&step, env, user_env))).await
 }
 
@@ -8125,9 +8129,15 @@ async fn execute_node_action(
         let condition = runs.pre_if.as_deref().unwrap_or("always()");
         if evaluate_step_condition(condition, ctx.working_dir, &expr_ctx) {
             clear_state();
-            let result =
-                run_node_script(ctx, &env, step_user_env, format!("Pre {}", step_name), pre)
-                    .await?;
+            let result = run_node_script(
+                ctx,
+                &env,
+                step_user_env,
+                format!("Pre {}", step_name),
+                pre,
+                runs.node_major,
+            )
+            .await?;
             if let Some(cause) = js::missing_program(result.exit_code, &result.output) {
                 return Ok(not_run(result.output, cause));
             }
@@ -8144,38 +8154,48 @@ async fn execute_node_action(
         }
     }
 
-    clear_state();
-    let main = run_node_script(ctx, &env, step_user_env, step_name.to_string(), &runs.main).await?;
-    if let Some(cause) = js::missing_program(main.exit_code, &main.output) {
-        return Ok(not_run(main.output, cause));
-    }
-    wrkflw_logging::debug(&format!(
-        "{} asks for node{}; it ran with the job image's node",
-        uses, runs.node_major
-    ));
-
-    if let Some(post) = &runs.post {
-        // What the step has beyond the job's env: its own `env:`, the
-        // action's inputs and paths, and what `pre` and then `main` saved.
-        // The post runs with these over the job's env as it is at the end
-        // of the job.
-        let mut own_env: HashMap<String, String> = env
+    // As on GitHub's runner, the post is queued before `main` runs, so it
+    // runs at the end of the job also when `main` fails or runs out of
+    // time. It gets what the step has beyond the job's env: its own
+    // `env:`, the action's inputs and paths, and what `pre` saved; what
+    // `main` saves is added once it is done. The post runs with these over
+    // the job's env as it is at the end of the job.
+    let post = runs.post.as_ref().map(|post| {
+        let own_env: HashMap<String, String> = env
             .iter()
             .filter(|(k, v)| ctx.job_env.get(*k) != Some(*v))
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
-        own_env.extend(saved_by(&main.output));
         js::queue_post(js::PostStep {
             name: format!("Post {}", step_name),
-            command: js::node_command(post),
+            command: js::node_command(post, runs.node_major),
             condition: runs
                 .post_if
                 .clone()
                 .unwrap_or_else(|| "always()".to_string()),
             own_env,
             keep_action: clone.clone(),
-        });
+            withdrawn: false,
+        })
+    });
+
+    clear_state();
+    let main = run_node_script(
+        ctx,
+        &env,
+        step_user_env,
+        step_name.to_string(),
+        &runs.main,
+        runs.node_major,
+    )
+    .await?;
+    if let Some(cause) = js::missing_program(main.exit_code, &main.output) {
+        // An action that never ran has nothing to clean up.
+        js::update_post(post.flatten(), |queued| queued.withdrawn = true);
+        return Ok(not_run(main.output, cause));
     }
+    let saved = saved_by(&main.output);
+    js::update_post(post.flatten(), |queued| queued.own_env.extend(saved));
     clear_state();
 
     output.push_str(&main.output);
@@ -11635,6 +11655,7 @@ runs:
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
             keep_action: None,
+            withdrawn: false,
         }
     }
 
@@ -11669,6 +11690,70 @@ runs:
         assert!(started.elapsed() < std::time::Duration::from_secs(10));
         assert_eq!(loop_state.step_results.len(), 1, "Post B ran");
         assert_eq!(loop_state.step_results[0].status, StepStatus::Failure);
+    }
+
+    /// A post is queued before its action's `main` runs, as GitHub's runner
+    /// queues it, so a `main` that runs out of time still has its post run
+    /// at the end of the job.
+    #[tokio::test]
+    async fn a_main_that_runs_out_of_time_keeps_its_post() {
+        let workspace = tempfile::tempdir().unwrap();
+        let action = workspace.path().join("act");
+        std::fs::create_dir_all(&action).unwrap();
+        std::fs::write(
+            action.join("action.yml"),
+            "name: x\nruns:\n  using: node20\n  main: main.js\n  post: post.js\n",
+        )
+        .unwrap();
+        let runtime = MockContainerRuntime {
+            delay: Some(std::time::Duration::from_secs(30)),
+            ..MockContainerRuntime::default()
+        };
+        let workflow = minimal_workflow();
+        let job_env = HashMap::from([(
+            "WRKFLW_RUNTIME_MODE".to_string(),
+            RuntimeType::Docker.mode_name().to_string(),
+        )]);
+        let step = make_step("Slow", "./act", None, HashMap::new());
+        let ctx = StepExecutionContext {
+            step: &step,
+            step_idx: 0,
+            job_env: &job_env,
+            job_user_env: &job_env,
+            working_dir: workspace.path(),
+            runtime: &runtime,
+            workflow: &workflow,
+            runner_image: "ubuntu:latest",
+            installed_runtimes: &BuiltRuntimes::default(),
+            verbose: false,
+            matrix_combination: &None,
+            container_config: None,
+            workflow_defaults: None,
+            job_defaults: None,
+            step_outputs: &HashMap::new(),
+            step_statuses: &HashMap::new(),
+            job_status: "success",
+            services: test_services(),
+            pending_cache_saves: &TEST_PENDING_CACHE_SAVES,
+        };
+        let posts = crate::node_actions::JobPosts::default();
+        let timed_out = crate::node_actions::collecting_posts(
+            &posts,
+            tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                Box::pin(execute_step(ctx)),
+            ),
+        )
+        .await;
+        assert!(timed_out.is_err(), "main finished in time");
+        let queued = crate::node_actions::take_posts(&posts);
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].name, "Post Slow");
+        assert!(
+            queued[0].command.ends_with("'post.js'"),
+            "{}",
+            queued[0].command
+        );
     }
 
     /// A post runs with the job's env as it is at the end of the job, with

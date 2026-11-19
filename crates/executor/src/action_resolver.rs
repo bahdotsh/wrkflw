@@ -130,12 +130,18 @@ const ACTION_CACHE_DIR_ENV: &str = "WRKFLW_ACTION_CACHE_DIR";
 /// A missing, unreadable or corrupt cache file is ignored and the action is
 /// fetched again; the disk cache never fails a resolution.
 ///
+/// A private action is read with the token a clone of it would use:
+/// `provider_token`, the `GITHUB_TOKEN` a secret provider gave the job,
+/// else `GITHUB_TOKEN` or `GH_TOKEN` from the environment, else, only once
+/// the action wasn't found without one, what `gh auth token` prints.
+///
 /// Returns `Ok(ResolvedAction)` on success, or `Err` if the action metadata cannot be
 /// fetched or parsed. Callers should fall back to hardcoded image mappings on error.
 pub async fn resolve_remote_action(
     repo: &str,
     version: &str,
     sub_path: Option<&str>,
+    provider_token: Option<&str>,
 ) -> Result<ResolvedAction, String> {
     let disk_cache_dir = action_cache_dir();
     resolve_with_token(
@@ -144,12 +150,24 @@ pub async fn resolve_remote_action(
         repo,
         version,
         sub_path,
-        ["GITHUB_TOKEN", "GH_TOKEN"]
-            .into_iter()
-            .find_map(|name| std::env::var(name).ok().filter(|t| !t.trim().is_empty())),
-        || crate::run_options::remote_clone_token(None),
+        first_token(provider_token, |name| std::env::var(name).ok()),
+        || crate::run_options::remote_clone_token(provider_token),
     )
     .await
+}
+
+/// The token an action's metadata is first fetched with: the secret
+/// provider's, else `GITHUB_TOKEN` or `GH_TOKEN` as `env` gives them.
+fn first_token(provider: Option<&str>, env: impl Fn(&str) -> Option<String>) -> Option<String> {
+    provider
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            ["GITHUB_TOKEN", "GH_TOKEN"]
+                .into_iter()
+                .find_map(|name| env(name).filter(|t| !t.trim().is_empty()))
+        })
 }
 
 /// [`resolve_with`] with `token`, else, when the action wasn't found
@@ -1400,6 +1418,20 @@ runs:
                 !has_auth,
                 "GITHUB_TOKEN leaked to redirect target! Authorization header found on redirect request."
             );
+        }
+
+        /// A job's secret-provider token reads a private action, as it
+        /// would clone one; without it the environment's token does.
+        #[test]
+        fn the_providers_token_comes_first() {
+            let env = |name: &str| (name == "GH_TOKEN").then(|| "from_env".to_string());
+            assert_eq!(
+                first_token(Some("from_provider"), env).as_deref(),
+                Some("from_provider")
+            );
+            assert_eq!(first_token(Some("  "), env).as_deref(), Some("from_env"));
+            assert_eq!(first_token(None, env).as_deref(), Some("from_env"));
+            assert_eq!(first_token(None, |_| None), None);
         }
 
         #[tokio::test]

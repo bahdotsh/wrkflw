@@ -1558,6 +1558,7 @@ async fn prepare_action(
             &action.repository,
             &action.version,
             action.sub_path.as_deref(),
+            provider_token,
         )
         .await
         {

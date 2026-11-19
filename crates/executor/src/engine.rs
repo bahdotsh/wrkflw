@@ -3764,71 +3764,42 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
         }
     }
 
-    // JavaScript actions' posts, last first, whatever became of the job,
-    // unless it ran out of time.
-    let job_posts = crate::node_actions::take_posts(&posts);
-    if !job_posts.is_empty() && tokio::time::Instant::now() >= job_deadline {
-        wrkflw_logging::warning(&format!(
-            "{} post step(s) didn't run: the job ran out of time",
-            job_posts.len()
-        ));
-    } else {
-        for (k, post) in job_posts.iter().enumerate() {
-            let post_step = crate::node_actions::post_as_step(post);
-            let idx = job.steps.len() + k;
-            loop_state.begin_step(idx, &post_step);
-            let post_user_env = job_user_env.clone();
-            let outcome = loop_state
-                .live_step(idx, &post_step, ctx.services.secret_masker)
-                .run(Box::pin(run_step_with_guards(
-                    &post_step,
-                    idx,
-                    &post.env,
-                    ctx.workflow,
-                    StepExecutionContext {
-                        step: &post_step,
-                        step_idx: idx,
-                        job_env: &post.env,
-                        job_user_env: &post_user_env,
-                        working_dir: job_dir.path(),
-                        runtime: ctx.runtime,
-                        workflow: ctx.workflow,
-                        runner_image: &runner_image_value.image,
-                        installed_runtimes: &runner_image_value.built,
-                        verbose: ctx.verbose,
-                        matrix_combination: &None,
-                        container_config: job.container.as_ref(),
-                        workflow_defaults: ctx.workflow.defaults.as_ref(),
-                        job_defaults: job.defaults.as_ref(),
-                        services: JobServices {
-                            secret_manager: ctx.services.secret_manager,
-                            secret_masker: ctx.services.secret_masker,
-                            secrets_context: ctx.services.secrets_context,
-                            missing_secrets: ctx.services.missing_secrets,
-                            needs_context: ctx.services.needs_context,
-                            needs_results: ctx.services.needs_results,
-                            artifact_store: ctx.services.artifact_store,
-                            cache_store: ctx.services.cache_store,
-                            platform_overrides: ctx.services.platform_overrides,
-                        },
-                        step_outputs: &loop_state.step_outputs_map,
-                        step_statuses: &loop_state.step_status_map,
-                        job_status: &loop_state.job_status_str,
-                        pending_cache_saves: &pending_cache_saves,
-                    },
-                )))
-                .await?;
-            if loop_state.process_outcome(
-                outcome,
-                &post_step,
-                ctx.verbose,
-                &mut job_env,
-                &mut job_user_env,
-                ctx.services.secret_masker,
-            ) {
-                job_success = false;
-            }
-        }
+    // JavaScript actions' posts, last first, whatever became of the job.
+    if Box::pin(run_job_posts(
+        crate::node_actions::take_posts(&posts),
+        job_deadline,
+        job.steps.len(),
+        &mut loop_state,
+        &mut job_env,
+        &mut job_user_env,
+        PostContext {
+            working_dir: job_dir.path(),
+            runtime: ctx.runtime,
+            workflow: ctx.workflow,
+            runner_image: &runner_image_value.image,
+            installed_runtimes: &runner_image_value.built,
+            verbose: ctx.verbose,
+            matrix_combination: &None,
+            container_config: job.container.as_ref(),
+            workflow_defaults: ctx.workflow.defaults.as_ref(),
+            job_defaults: job.defaults.as_ref(),
+            services: JobServices {
+                secret_manager: ctx.services.secret_manager,
+                secret_masker: ctx.services.secret_masker,
+                secrets_context: ctx.services.secrets_context,
+                missing_secrets: ctx.services.missing_secrets,
+                needs_context: ctx.services.needs_context,
+                needs_results: ctx.services.needs_results,
+                artifact_store: ctx.services.artifact_store,
+                cache_store: ctx.services.cache_store,
+                platform_overrides: ctx.services.platform_overrides,
+            },
+            pending_cache_saves: &pending_cache_saves,
+        },
+    ))
+    .await?
+    {
+        job_success = false;
     }
 
     // Flush deferred cache saves only on success (matches GHA post-step semantics)
@@ -4306,71 +4277,43 @@ async fn execute_matrix_job(
             }
         }
 
-        // JavaScript actions' posts, last first, whatever became of the job,
-        // unless it ran out of time.
-        let job_posts = crate::node_actions::take_posts(&posts);
-        if !job_posts.is_empty() && tokio::time::Instant::now() >= job_deadline {
-            wrkflw_logging::warning(&format!(
-                "{} post step(s) didn't run: the job ran out of time",
-                job_posts.len()
-            ));
-        } else {
-            for (k, post) in job_posts.iter().enumerate() {
-                let post_step = crate::node_actions::post_as_step(post);
-                let idx = materialized_steps.len() + k;
-                loop_state.begin_step(idx, &post_step);
-                let post_user_env = job_user_env.clone();
-                let outcome = loop_state
-                    .live_step(idx, &post_step, services.secret_masker)
-                    .run(Box::pin(run_step_with_guards(
-                        &post_step,
-                        idx,
-                        &post.env,
-                        workflow,
-                        StepExecutionContext {
-                            step: &post_step,
-                            step_idx: idx,
-                            job_env: &post.env,
-                            job_user_env: &post_user_env,
-                            working_dir: job_dir.path(),
-                            runtime,
-                            workflow,
-                            runner_image: &runner_image_value.image,
-                            installed_runtimes: &runner_image_value.built,
-                            verbose,
-                            matrix_combination: &Some(combination.values.clone()),
-                            container_config: job_template.container.as_ref(),
-                            workflow_defaults: workflow.defaults.as_ref(),
-                            job_defaults: job_template.defaults.as_ref(),
-                            services: JobServices {
-                                secret_manager: services.secret_manager,
-                                secret_masker: services.secret_masker,
-                                secrets_context: services.secrets_context,
-                                missing_secrets: services.missing_secrets,
-                                needs_context: services.needs_context,
-                                needs_results: services.needs_results,
-                                artifact_store: services.artifact_store,
-                                cache_store: services.cache_store,
-                                platform_overrides: services.platform_overrides,
-                            },
-                            step_outputs: &loop_state.step_outputs_map,
-                            step_statuses: &loop_state.step_status_map,
-                            job_status: &loop_state.job_status_str,
-                            pending_cache_saves: &pending_cache_saves,
-                        },
-                    )))
-                    .await?;
-                if loop_state.process_outcome(
-                    outcome,
-                    &post_step,
-                    verbose,
-                    &mut job_env,
-                    &mut job_user_env,
-                    services.secret_masker,
-                ) {
-                    all_steps_ok = false;
-                }
-            }
+        // JavaScript actions' posts, last first, whatever became of the job.
+        let matrix_values = Some(combination.values.clone());
+        if Box::pin(run_job_posts(
+            crate::node_actions::take_posts(&posts),
+            job_deadline,
+            materialized_steps.len(),
+            &mut loop_state,
+            &mut job_env,
+            &mut job_user_env,
+            PostContext {
+                working_dir: job_dir.path(),
+                runtime,
+                workflow,
+                runner_image: &runner_image_value.image,
+                installed_runtimes: &runner_image_value.built,
+                verbose,
+                matrix_combination: &matrix_values,
+                container_config: job_template.container.as_ref(),
+                workflow_defaults: workflow.defaults.as_ref(),
+                job_defaults: job_template.defaults.as_ref(),
+                services: JobServices {
+                    secret_manager: services.secret_manager,
+                    secret_masker: services.secret_masker,
+                    secrets_context: services.secrets_context,
+                    missing_secrets: services.missing_secrets,
+                    needs_context: services.needs_context,
+                    needs_results: services.needs_results,
+                    artifact_store: services.artifact_store,
+                    cache_store: services.cache_store,
+                    platform_overrides: services.platform_overrides,
+                },
+                pending_cache_saves: &pending_cache_saves,
+            },
+        ))
+        .await?
+        {
+            all_steps_ok = false;
         }
 
         all_steps_ok
@@ -5740,7 +5683,9 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
 
             match prepared {
                 PreparedAction::Node { runs, definition } => {
-                    execute_node_action(
+                    // Boxed: inlined, its state would grow every step's
+                    // future, and called workflows nest those deeply.
+                    Box::pin(execute_node_action(
                         &ctx,
                         &step_env,
                         &step_user_env,
@@ -5749,7 +5694,7 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                         uses,
                         runs,
                         &definition,
-                    )
+                    ))
                     .await?
                 }
                 PreparedAction::Composite => {
@@ -7784,6 +7729,95 @@ async fn execute_composite_action(
             "Action is not a composite action or has invalid format".to_string(),
         )),
     }
+}
+
+/// What a job's post steps run with, besides the step and its env.
+struct PostContext<'a> {
+    working_dir: &'a Path,
+    runtime: &'a dyn ContainerRuntime,
+    workflow: &'a WorkflowDefinition,
+    runner_image: &'a str,
+    installed_runtimes: &'a BuiltRuntimes,
+    verbose: bool,
+    matrix_combination: &'a Option<HashMap<String, Value>>,
+    container_config: Option<&'a JobContainer>,
+    workflow_defaults: Option<&'a workflow::Defaults>,
+    job_defaults: Option<&'a workflow::Defaults>,
+    services: JobServices<'a>,
+    pending_cache_saves: &'a std::sync::Mutex<Vec<PendingCacheSave>>,
+}
+
+/// Run the posts of a job's JavaScript actions, `first_index` on in the
+/// job's step numbering, unless the job ran out of time by `deadline`.
+/// True when one failed, which fails the job.
+#[allow(clippy::too_many_arguments)]
+async fn run_job_posts(
+    posts: Vec<crate::node_actions::PostStep>,
+    deadline: tokio::time::Instant,
+    first_index: usize,
+    loop_state: &mut StepLoopState,
+    job_env: &mut HashMap<String, String>,
+    job_user_env: &mut HashMap<String, String>,
+    pc: PostContext<'_>,
+) -> Result<bool, ExecutionError> {
+    if posts.is_empty() {
+        return Ok(false);
+    }
+    if tokio::time::Instant::now() >= deadline {
+        wrkflw_logging::warning(&format!(
+            "{} post step(s) didn't run: the job ran out of time",
+            posts.len()
+        ));
+        return Ok(false);
+    }
+    let mut failed = false;
+    for (k, post) in posts.iter().enumerate() {
+        let post_step = crate::node_actions::post_as_step(post);
+        let idx = first_index + k;
+        loop_state.begin_step(idx, &post_step);
+        let post_user_env = job_user_env.clone();
+        let outcome = loop_state
+            .live_step(idx, &post_step, pc.services.secret_masker)
+            .run(Box::pin(run_step_with_guards(
+                &post_step,
+                idx,
+                &post.env,
+                pc.workflow,
+                StepExecutionContext {
+                    step: &post_step,
+                    step_idx: idx,
+                    job_env: &post.env,
+                    job_user_env: &post_user_env,
+                    working_dir: pc.working_dir,
+                    runtime: pc.runtime,
+                    workflow: pc.workflow,
+                    runner_image: pc.runner_image,
+                    installed_runtimes: pc.installed_runtimes,
+                    verbose: pc.verbose,
+                    matrix_combination: pc.matrix_combination,
+                    container_config: pc.container_config,
+                    workflow_defaults: pc.workflow_defaults,
+                    job_defaults: pc.job_defaults,
+                    step_outputs: &loop_state.step_outputs_map,
+                    step_statuses: &loop_state.step_status_map,
+                    job_status: &loop_state.job_status_str,
+                    services: pc.services,
+                    pending_cache_saves: pc.pending_cache_saves,
+                },
+            )))
+            .await?;
+        if loop_state.process_outcome(
+            outcome,
+            &post_step,
+            pc.verbose,
+            job_env,
+            job_user_env,
+            pc.services.secret_masker,
+        ) {
+            failed = true;
+        }
+    }
+    Ok(failed)
 }
 
 /// Whether wrkflw runs something of its own for the JavaScript action from

@@ -50,13 +50,7 @@ pub(crate) fn image() -> Option<String> {
 }
 
 fn enabled() -> bool {
-    match std::env::var(PREBUILT_IMAGES_ENV) {
-        Ok(value) => !matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "0" | "false" | "no" | "off"
-        ),
-        Err(_) => true,
-    }
+    crate::run_options::env_switch(PREBUILT_IMAGES_ENV, true)
 }
 
 fn marker_path() -> Option<PathBuf> {

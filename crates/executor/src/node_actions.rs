@@ -26,13 +26,7 @@ pub(crate) const JS_ACTIONS_OFF: &str = "JavaScript actions are turned off (WRKF
 /// Whether JavaScript actions run: on unless [`JS_ACTIONS_ENV`] turns them
 /// off.
 pub(crate) fn enabled() -> bool {
-    match std::env::var(JS_ACTIONS_ENV) {
-        Ok(value) => !matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "0" | "false" | "no" | "off"
-        ),
-        Err(_) => true,
-    }
+    crate::run_options::env_switch(JS_ACTIONS_ENV, true)
 }
 
 /// What `runs:` says about a JavaScript action.

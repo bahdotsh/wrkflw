@@ -162,6 +162,13 @@ pub(crate) fn env_flag(name: &str) -> bool {
     std::env::var(name).is_ok_and(|v| switch_is_on(&v))
 }
 
+/// Whether the switch in environment variable `name` is on, `default` when
+/// it isn't set: for a switch that is on until a user turns it off, read
+/// as [`switch_is_on`] reads it.
+pub(crate) fn env_switch(name: &str, default: bool) -> bool {
+    std::env::var(name).map_or(default, |v| switch_is_on(&v))
+}
+
 /// Whether an environment switch is on, read exactly as the CLI's flags read
 /// it (clap's `FalseyValueParser`): empty, `0`, `n`, `no`, `f`, `false` and
 /// `off` in any case are off, and anything else is on, surrounding spaces

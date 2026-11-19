@@ -13,7 +13,8 @@
 # counts agreeing jobs that skipped an action GitHub ran or ran as Linux for
 # a macOS job. `seconds` is the whole compare, fetching the run included;
 # `local_s` the local run alone and `github_s` the GitHub run, from its
-# start to its last update (a re-run counts from its first attempt). `built` counts the
+# start to its last update (a re-run counts from the start of its latest
+# attempt, as GitHub resets `run_started_at`). `built` counts the
 # job images built during the run: 0 means its time is a warm one, so only
 # compare times of runs with the same `built`. Each run's full report and
 # log go to $WRKFLW_SWEEP_DIR/logs.

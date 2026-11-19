@@ -63,6 +63,22 @@ fn marker_path() -> Option<PathBuf> {
     dirs::cache_dir().map(|dir| dir.join("wrkflw").join("runner-base-unavailable"))
 }
 
+/// Whether a failed pull of the base image says the registry has no such
+/// image for us (not published yet, or still private), rather than that
+/// the network or the machine failed, which says nothing about tomorrow.
+pub(crate) fn pull_refused(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    [
+        "manifest unknown",
+        "not found",
+        "denied",
+        "unauthorized",
+        "403 forbidden",
+    ]
+    .iter()
+    .any(|marker| error.contains(marker))
+}
+
 /// Remember that `image` couldn't be pulled, so runs in the next day build
 /// their images here without trying it first.
 pub(crate) fn mark_unavailable(image: &str) {
@@ -126,6 +142,19 @@ mod tests {
         let a = published_image("FROM a\n");
         assert!(a.starts_with("ghcr.io/bahdotsh/wrkflw-runner:"));
         assert_ne!(a, published_image("FROM b\n"));
+    }
+
+    #[test]
+    fn only_a_registry_refusal_is_remembered() {
+        assert!(pull_refused(
+            "ERROR: failed to solve: ghcr.io/bahdotsh/wrkflw-runner:abc: not found"
+        ));
+        assert!(pull_refused(
+            "failed to authorize: failed to fetch anonymous token: 403 Forbidden"
+        ));
+        assert!(pull_refused("manifest unknown"));
+        assert!(!pull_refused("dial tcp: lookup ghcr.io: no such host"));
+        assert!(!pull_refused("no space left on device"));
     }
 
     #[test]

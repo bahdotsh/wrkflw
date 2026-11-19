@@ -2564,11 +2564,20 @@ async fn build_on_runner_base(
     )
     .await
     {
-        crate::runner_base::mark_unavailable(&base);
+        // Only a registry's refusal is remembered: a network that's down
+        // or a full disk says nothing about the image, so the next run
+        // tries it again.
+        let when = if crate::runner_base::pull_refused(&e.to_string()) {
+            crate::runner_base::mark_unavailable(&base);
+            "tried again tomorrow"
+        } else {
+            "tried again next run"
+        };
         wrkflw_logging::info(&format!(
             "The runner base image {} isn't available, so the job's image is built here \
-             (tried again tomorrow; {}=0 stops trying): {}",
+             ({}; {}=0 stops trying): {}",
             base,
+            when,
             crate::runner_base::PREBUILT_IMAGES_ENV,
             e
         ));

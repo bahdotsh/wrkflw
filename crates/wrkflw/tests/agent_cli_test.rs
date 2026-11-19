@@ -1545,8 +1545,9 @@ fn finished_step<'a>(lines: &'a [Value], name: &str, output: &Output) -> &'a Val
 
 /// A JavaScript action starts in the workspace whatever
 /// `defaults.run.working-directory` says, runs as an earlier step built it
-/// in the workspace, runs its `pre` first, and its post sees the job's env
-/// as it is at the end of the job with the step's own `env:`.
+/// in the workspace, runs its `pre` first, whose state `main` and `post`
+/// read, and its post sees the job's env as it is at the end of the job
+/// with the step's own `env:`.
 #[test]
 fn a_javascript_action_runs_as_built_in_the_workspace_with_the_end_of_job_env() {
     if !has_node() {
@@ -1560,7 +1561,11 @@ fn a_javascript_action_runs_as_built_in_the_workspace_with_the_end_of_job_env() 
         "js",
         "name: js\nruns:\n  using: node20\n  pre: pre.js\n  main: main.js\n  post: post.js\n",
         &[
-            ("pre.js", r#"console.log("pre ran");"#),
+            (
+                "pre.js",
+                r#"require("fs").appendFileSync(process.env.GITHUB_STATE, "early=from-pre\n");
+console.log("pre ran");"#,
+            ),
             (
                 "main.js",
                 r#"console.error("the checked-in main.js ran, not the one built"); process.exit(1);"#,
@@ -1570,6 +1575,7 @@ fn a_javascript_action_runs_as_built_in_the_workspace_with_the_end_of_job_env() 
                 r#"const fs = require("fs");
 // The workspace's root has sub/; `defaults.run` would have started it in sub.
 if (!fs.existsSync("sub/.keep")) { console.error(`started in ${process.cwd()}`); process.exit(1); }
+if (process.env.STATE_early !== "from-pre") { console.error(`STATE_early=${process.env.STATE_early}`); process.exit(1); }
 fs.appendFileSync(process.env.GITHUB_STATE, "saved=from-main\n");
 console.log("built main ran");
 "#,
@@ -1577,8 +1583,8 @@ console.log("built main ran");
             (
                 "post.js",
                 r#"const e = process.env;
-if (e.LATE !== "yes" || e.FROM_STEP !== "s" || e.STATE_saved !== "from-main") {
-  console.error(`post env: LATE=${e.LATE} FROM_STEP=${e.FROM_STEP} STATE_saved=${e.STATE_saved}`);
+if (e.LATE !== "yes" || e.FROM_STEP !== "s" || e.STATE_saved !== "from-main" || e.STATE_early !== "from-pre") {
+  console.error(`post env: LATE=${e.LATE} FROM_STEP=${e.FROM_STEP} STATE_saved=${e.STATE_saved} STATE_early=${e.STATE_early}`);
   process.exit(1);
 }
 console.log("post ok");

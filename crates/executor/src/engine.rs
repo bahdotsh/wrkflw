@@ -8060,6 +8060,18 @@ async fn execute_node_action(
         StepResult::new(step_name.to_string(), StepStatus::Success, output)
             .without_running(report_action_not_run(uses, Some(cause)))
     };
+    // What a script just saved, through `$GITHUB_STATE` or `::save-state`
+    // in its `output`, as the `STATE_<name>` the action's later scripts get.
+    let saved_by = |output: &str| -> Vec<(String, String)> {
+        let file = state_file
+            .as_ref()
+            .and_then(|path| fs::read_to_string(path).ok())
+            .unwrap_or_default();
+        js::saved_state(&file, output)
+            .into_iter()
+            .map(|(name, value)| (js::state_env_name(&name), value))
+            .collect()
+    };
 
     let mut output = String::new();
     if let Some(pre) = &runs.pre {
@@ -8073,6 +8085,8 @@ async fn execute_node_action(
                 return Ok(not_run(result.output, cause));
             }
             output.push_str(&result.output);
+            // As on GitHub, what `pre` saved is there for `main` and `post`.
+            env.extend(saved_by(&result.output));
             if result.status == StepStatus::Failure {
                 let failed = StepResult::new(step_name.to_string(), StepStatus::Failure, output);
                 return Ok(match result.exit_code {
@@ -8094,21 +8108,16 @@ async fn execute_node_action(
     ));
 
     if let Some(post) = &runs.post {
-        let saved = state_file
-            .as_ref()
-            .and_then(|path| fs::read_to_string(path).ok())
-            .unwrap_or_default();
         // What the step has beyond the job's env: its own `env:`, the
-        // action's inputs and paths, and what `main` saved. The post runs
-        // with these over the job's env as it is at the end of the job.
+        // action's inputs and paths, and what `pre` and then `main` saved.
+        // The post runs with these over the job's env as it is at the end
+        // of the job.
         let mut own_env: HashMap<String, String> = env
             .iter()
             .filter(|(k, v)| ctx.job_env.get(*k) != Some(*v))
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
-        for (name, value) in js::saved_state(&saved, &main.output) {
-            own_env.insert(js::state_env_name(&name), value);
-        }
+        own_env.extend(saved_by(&main.output));
         js::queue_post(js::PostStep {
             name: format!("Post {}", step_name),
             command: js::node_command(post),

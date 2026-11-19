@@ -68,9 +68,11 @@ fn marker_path() -> Option<PathBuf> {
 /// the network or the machine failed, which says nothing about tomorrow.
 pub(crate) fn pull_refused(error: &str) -> bool {
     let error = error.to_ascii_lowercase();
+    // A missing tag is "<image>: not found" or "manifest unknown"; a bare
+    // "not found" would also match a missing `docker` or file.
     [
         "manifest unknown",
-        "not found",
+        ": not found",
         "denied",
         "unauthorized",
         "403 forbidden",
@@ -155,6 +157,7 @@ mod tests {
         assert!(pull_refused("manifest unknown"));
         assert!(!pull_refused("dial tcp: lookup ghcr.io: no such host"));
         assert!(!pull_refused("no space left on device"));
+        assert!(!pull_refused("docker not found in PATH"));
     }
 
     #[test]

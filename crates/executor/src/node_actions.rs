@@ -123,12 +123,12 @@ pub(crate) fn input_env(
     env
 }
 
-/// The `bash` command that runs `script` from the action's directory.
+/// The `bash` command that runs `script` from the action's directory. The
+/// script's path is quoted, so whatever its name holds reaches `node` as
+/// written.
 pub(crate) fn node_command(script: &str) -> String {
-    format!(
-        "node \"$GITHUB_ACTION_PATH/{}\"",
-        script.trim_start_matches("./")
-    )
+    let script = script.trim_start_matches("./").replace('\'', r"'\''");
+    format!("node \"$GITHUB_ACTION_PATH\"/'{}'", script)
 }
 
 /// Why a JavaScript action didn't run when the image had no `bash` to
@@ -407,6 +407,18 @@ mod tests {
                  exec: \"bash\": executable file not found in $PATH"
             ),
             Some(NO_BASH)
+        );
+    }
+
+    #[test]
+    fn a_scripts_path_reaches_node_as_written() {
+        assert_eq!(
+            node_command("./dist/index.js"),
+            r#"node "$GITHUB_ACTION_PATH"/'dist/index.js'"#
+        );
+        assert_eq!(
+            node_command("../lib/$x \"a'b\".js"),
+            r#"node "$GITHUB_ACTION_PATH"/'../lib/$x "a'\''b".js'"#
         );
     }
 

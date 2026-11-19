@@ -819,11 +819,15 @@ fn partial_lines(unverified: &[Value], mac_hint: bool) -> Vec<String> {
         .filter(|u| u["kind"] == "action_not_run")
         .collect();
     if !actions.is_empty() {
-        let mut steps: Vec<String> = actions
-            .iter()
-            .map(|u| format!("{} in {}", text(&u["uses"]), text(&u["job"])))
-            .collect();
-        steps.dedup();
+        // Each action once per job, in the order they ran; the count is of
+        // steps, which may use one action more than once.
+        let mut steps: Vec<String> = Vec::new();
+        for u in &actions {
+            let step = format!("{} in {}", text(&u["uses"]), text(&u["job"]));
+            if !steps.contains(&step) {
+                steps.push(step);
+            }
+        }
         lines.push(format!(
             "{} step(s) passed without running their action, so what it installs or checks \
              wasn't: {}",
@@ -872,6 +876,20 @@ mod tests {
         assert!(lines[1].contains("--runtime emulation"), "{lines:?}");
         assert!(lines[2].starts_with("1 step(s) passed without running their action"));
         assert!(lines[2].contains("org/act@v1 in lint"), "{lines:?}");
+
+        let repeated = vec![
+            json!({"kind": "action_not_run", "job": "a", "uses": "o/x@v1"}),
+            json!({"kind": "action_not_run", "job": "b", "uses": "o/y@v1"}),
+            json!({"kind": "action_not_run", "job": "a", "uses": "o/x@v1"}),
+        ];
+        assert_eq!(
+            partial_lines(&repeated, false),
+            [
+                "3 step(s) passed without running their action, so what it installs or checks \
+              wasn't: o/x@v1 in a, o/y@v1 in b"
+            ],
+            "an action repeated apart is named once"
+        );
 
         let no_hint = partial_lines(&unverified[..1], true);
         assert_eq!(

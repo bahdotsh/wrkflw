@@ -2091,11 +2091,13 @@ fn base64_encode(bytes: &[u8]) -> String {
 
 /// A `git` command for a clone: hooks off, as cloned repositories are
 /// untrusted and could carry post-checkout hooks; never asking for a
-/// password, which would hang a run; and with `auth` in its environment.
+/// password, which would hang a run; in English, which [`needs_credentials`]
+/// reads; and with `auth` in its environment.
 fn clone_git(auth: &[(String, String)]) -> tokio::process::Command {
     let mut git = tokio::process::Command::new("git");
     git.args(["-c", "core.hooksPath=/dev/null"])
         .env("GIT_TERMINAL_PROMPT", "0")
+        .env("LC_ALL", "C")
         .envs(auth.iter().map(|(k, v)| (k, v)))
         .stdin(std::process::Stdio::null());
     git

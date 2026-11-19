@@ -3,8 +3,10 @@ name: Refresh runner image
 # The runner base image's tag names the text of docker/runner.Dockerfile,
 # not what it installs: `ubuntu:latest`, its packages and Node.js 22 move
 # on while the tag stays. The release workflow pushes a tag once; this
-# rebuilds the latest release's tag each week, so a first run pulls
-# current packages and security fixes. wrkflw's own job images build on it
+# rebuilds the latest release's tag each week, so a machine pulling it for
+# the first time gets current packages and security fixes. A machine that
+# pulled it already keeps its copy, as it keeps an image it built, until the
+# image is removed (see the README). wrkflw's own job images build on it
 # with the same tag, so nothing else changes.
 on:
   schedule:
@@ -38,14 +40,18 @@ jobs:
             TAG=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-      - uses: actions/checkout@v4
+      # Pinned by commit: this job can write packages.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ steps.release.outputs.tag }}
       - name: Read the image name
         id: image
+        # The tag through the environment, never spliced into the script.
+        env:
+          TAG: ${{ steps.release.outputs.tag }}
         run: |
           if [ ! -f docker/runner-image.txt ]; then
-            echo "${{ steps.release.outputs.tag }} publishes no runner image"
+            echo "$TAG publishes no runner image"
             exit 0
           fi
           echo "name=$(tr -d '[:space:]' < docker/runner-image.txt)" >> "$GITHUB_OUTPUT"

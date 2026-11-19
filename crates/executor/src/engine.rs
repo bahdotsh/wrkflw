@@ -2313,6 +2313,25 @@ fn generate_combined_dockerfile(
     week: Option<&str>,
     tools: RunnerTools,
 ) -> String {
+    combined_dockerfile_for_uid(
+        runtimes,
+        base_image,
+        base_id,
+        week,
+        tools,
+        crate::runner_user::uid(),
+    )
+}
+
+/// [`generate_combined_dockerfile`] with the runner user's uid given.
+fn combined_dockerfile_for_uid(
+    runtimes: &[SetupRuntime],
+    base_image: &str,
+    base_id: Option<&str>,
+    week: Option<&str>,
+    tools: RunnerTools,
+    uid: u32,
+) -> String {
     let mut dockerfile = format!("FROM {}\n", base_image);
     if let Some(id) = base_id {
         dockerfile.push_str(&format!("# base image id: {}\n", id));
@@ -2340,10 +2359,7 @@ fn generate_combined_dockerfile(
         dockerfile.push_str(&RUNNER_TOOLS.join(" "));
         // The user steps run as, once `sudo` is there for it.
         dockerfile.push_str(" && \\\n");
-        dockerfile.push_str(&format!(
-            "    {}",
-            crate::runner_user::create_script(crate::runner_user::uid())
-        ));
+        dockerfile.push_str(&format!("    {}", crate::runner_user::create_script(uid)));
     }
 
     // Hosted runners also have Node.js whatever the job sets up, and tools
@@ -2359,6 +2375,14 @@ fn generate_combined_dockerfile(
     dockerfile.push_str(REMOVE_PACKAGE_LISTS);
     dockerfile.push('\n');
 
+    dockerfile.push_str(&combined_dockerfile_tail(runtimes, tools));
+    dockerfile
+}
+
+/// What a combined image's Dockerfile has after its shared packages: the
+/// runtimes' environment, one `RUN` per runtime, and `PATH`.
+fn combined_dockerfile_tail(runtimes: &[SetupRuntime], tools: RunnerTools) -> String {
+    let mut dockerfile = String::new();
     // After the shared packages, so a variable that differs between the
     // legs of a matrix, such as `UV_PYTHON`, doesn't give each leg packages
     // of its own, and before the runtimes, whose installs read them.
@@ -2436,6 +2460,101 @@ fn generate_combined_dockerfile(
     dockerfile
 }
 
+/// The Dockerfile of the runner base image published with each release:
+/// what every built-in job image on `ubuntu:latest` starts with, the
+/// packages, the runner's tools, Node.js, the runner user with GitHub's
+/// uid and the GitHub CLI. See [`crate::runner_base`].
+pub fn runner_base_dockerfile() -> String {
+    let mut dockerfile = combined_dockerfile_for_uid(
+        &[],
+        "ubuntu:latest",
+        None,
+        None,
+        RunnerTools::Install,
+        crate::runner_user::HOSTED_UID,
+    );
+    dockerfile.push_str(&format!("RUN {}\n", GH_CLI_INSTALL));
+    dockerfile
+}
+
+/// A job image's Dockerfile on the runner base image `base`: the runner
+/// user given `uid` when it isn't GitHub's, a `RUN` naming `week` for
+/// floating versions, and then what [`combined_dockerfile_tail`] adds.
+fn dockerfile_on_runner_base(
+    runtimes: &[SetupRuntime],
+    base: &str,
+    week: Option<&str>,
+    uid: u32,
+) -> String {
+    let mut dockerfile = format!("FROM {}\n", base);
+    if uid != crate::runner_user::HOSTED_UID {
+        dockerfile.push_str(&format!("RUN {}\n", crate::runner_user::remap_script(uid)));
+    }
+    if let Some(week) = week {
+        dockerfile.push_str(&format!("RUN : floating versions resolved in {}\n", week));
+    }
+    dockerfile.push_str(&combined_dockerfile_tail(runtimes, RunnerTools::Install));
+    dockerfile
+}
+
+/// The job image for `runtimes` built on the published runner base image,
+/// when it applies: a built-in image on `ubuntu:latest` with no Node.js of
+/// its own to install, on an engine that keeps what it builds. `None`
+/// when it doesn't apply, or the base image couldn't be pulled, which is
+/// remembered for a day: the caller then builds the image here from the
+/// start. `Some(Err)` when the base was there but the runtimes failed to
+/// build on it, as they would here.
+async fn build_on_runner_base(
+    runtimes: &[SetupRuntime],
+    base_image: &str,
+    runtime: &dyn ContainerRuntime,
+    tools: RunnerTools,
+    what: &str,
+) -> Option<Result<String, ExecutionError>> {
+    if tools != RunnerTools::Install
+        || base_image != "ubuntu:latest"
+        || runtimes.iter().any(|rt| rt.language == "node")
+        || !runtime.reuses_build_layers()
+    {
+        return None;
+    }
+    let base = crate::runner_base::image()?;
+    // A build of nothing but `FROM` pulls the base, with a build's time
+    // limit, which a large image needs, rather than a pull's.
+    let probe = format!(
+        "{}base-{:x}",
+        COMBINED_IMAGE_PREFIX,
+        fnv1a_hash(base.as_bytes())
+    );
+    if let Err(e) = build_image_once(
+        &format!("FROM {}\n", base),
+        &probe,
+        "the runner base image",
+        runtime,
+    )
+    .await
+    {
+        crate::runner_base::mark_unavailable(&base);
+        wrkflw_logging::info(&format!(
+            "The runner base image {} isn't available, so the job's image is built here \
+             (tried again tomorrow; {}=0 stops trying): {}",
+            base,
+            crate::runner_base::PREBUILT_IMAGES_ENV,
+            e
+        ));
+        return None;
+    }
+    let week = floating_versions_week(runtimes, chrono::Utc::now());
+    let dockerfile =
+        dockerfile_on_runner_base(runtimes, &probe, week.as_deref(), crate::runner_user::uid());
+    let tag = combined_image_tag(runtimes, &dockerfile);
+    Some(
+        build_image_once(&dockerfile, &tag, what, runtime)
+            .await
+            .map(|()| tag),
+    )
+}
+
 /// What hands the runner user the files `language`'s install just wrote,
 /// in an image that has that user.
 fn owned_by_runner(tools: RunnerTools, language: &str) -> Option<String> {
@@ -2460,7 +2579,7 @@ fn floating_versions_week(
 }
 
 /// FNV-1a hash — deterministic across Rust toolchain versions, unlike `DefaultHasher`.
-pub(crate) fn fnv1a_hash(data: &[u8]) -> u64 {
+pub fn fnv1a_hash(data: &[u8]) -> u64 {
     const FNV_OFFSET_BASIS: u64 = 14695981039346656037;
     const FNV_PRIME: u64 = 1099511628211;
     let mut hash = FNV_OFFSET_BASIS;
@@ -2527,6 +2646,19 @@ async fn build_combined_runtime_image(
     runtime: &dyn ContainerRuntime,
     tools: RunnerTools,
 ) -> Result<String, ExecutionError> {
+    let languages = runtimes
+        .iter()
+        .map(|r| r.language.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let what = if languages.is_empty() {
+        "the runner's tools".to_string()
+    } else {
+        languages
+    };
+    if let Some(built) = build_on_runner_base(runtimes, base_image, runtime, tools, &what).await {
+        return built;
+    }
     // The base image's identity, so a changed base gets a new combined image.
     // An image not yet present is pulled first: the build would pull it
     // anyway, and knowing its ID now saves a rebuild on the next run. A
@@ -2565,16 +2697,6 @@ async fn build_combined_runtime_image(
         return Ok(with_gh);
     }
 
-    let languages = runtimes
-        .iter()
-        .map(|r| r.language.as_str())
-        .collect::<Vec<_>>()
-        .join(", ");
-    let what = if languages.is_empty() {
-        "the runner's tools".to_string()
-    } else {
-        languages
-    };
     build_image_once(&dockerfile, &tag, &what, runtime).await?;
     match tools {
         RunnerTools::Install => Ok(with_github_cli(&tag, runtime).await),
@@ -8743,6 +8865,45 @@ mod tests {
             cache_store: &TEST_CACHE_STORE,
             platform_overrides: &EMPTY_PLATFORM_OVERRIDES,
         }
+    }
+
+    #[test]
+    fn a_job_image_on_the_runner_base_adds_only_its_runtimes() {
+        let python = vec![SetupRuntime {
+            language: "python".to_string(),
+            version: "3.13".to_string(),
+            install_script: "install-python".to_string(),
+            floating: false,
+            env: Vec::new(),
+        }];
+        let df = dockerfile_on_runner_base(&python, "base:x", None, crate::runner_user::HOSTED_UID);
+        assert!(df.starts_with("FROM base:x\n"), "{df}");
+        assert!(df.contains("RUN install-python"), "{df}");
+        assert!(!df.contains("build-essential"), "{df}");
+        assert!(!df.contains("usermod"), "{df}");
+        assert!(!df.contains("floating versions"), "{df}");
+
+        let linux = dockerfile_on_runner_base(&python, "base:x", Some("2026-W47"), 1000);
+        assert!(linux.contains("usermod --non-unique --uid 1000"), "{linux}");
+        assert!(
+            linux.contains("floating versions resolved in 2026-W47"),
+            "{linux}"
+        );
+    }
+
+    #[test]
+    fn the_runner_base_is_the_shared_layers_of_a_job_with_no_runtimes() {
+        let base = runner_base_dockerfile();
+        let local = combined_dockerfile_for_uid(
+            &[],
+            "ubuntu:latest",
+            None,
+            None,
+            RunnerTools::Install,
+            crate::runner_user::HOSTED_UID,
+        );
+        assert!(base.starts_with(&local), "{base}");
+        assert!(base.ends_with(&format!("RUN {}\n", GH_CLI_INSTALL)));
     }
 
     #[test]

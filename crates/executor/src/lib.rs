@@ -27,6 +27,7 @@ pub(crate) mod matrix_fold;
 pub mod node_actions;
 pub mod podman;
 pub mod run_options;
+pub mod runner_base;
 pub mod runner_fidelity;
 pub mod runner_user;
 pub mod script_commands;

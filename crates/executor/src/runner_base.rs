@@ -1,0 +1,135 @@
+//! The runner base image published with each release: the packages, tools,
+//! Node.js, GitHub CLI and runner user every built-in job image starts
+//! with, so a first run pulls them instead of installing them.
+//!
+//! The image is named by a hash of its Dockerfile, which
+//! [`crate::engine::runner_base_dockerfile`] writes, so a wrkflw asks only
+//! for an image built from the same text it would build itself. The
+//! release workflow builds `docker/runner.Dockerfile` and pushes it as
+//! the tag in `docker/runner-image.txt`; a test keeps both current.
+
+use std::path::PathBuf;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// Where the runner base images are published.
+pub const REPOSITORY: &str = "ghcr.io/bahdotsh/wrkflw-runner";
+
+/// Env var that, set to `0`, builds every job image here, as before.
+pub const PREBUILT_IMAGES_ENV: &str = "WRKFLW_PREBUILT_IMAGES";
+
+/// Env var naming another runner base image to start from, such as one
+/// built locally from `docker/runner.Dockerfile` for a test.
+pub const RUNNER_IMAGE_ENV: &str = "WRKFLW_RUNNER_IMAGE";
+
+/// How long a runner base image that couldn't be pulled isn't tried again.
+const UNAVAILABLE_FOR: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// The published name of the runner base image built from `dockerfile`.
+pub fn published_image(dockerfile: &str) -> String {
+    format!(
+        "{}:{:016x}",
+        REPOSITORY,
+        crate::engine::fnv1a_hash(dockerfile.as_bytes())
+    )
+}
+
+/// The runner base image to start job images from, or `None` when
+/// [`PREBUILT_IMAGES_ENV`] turns it off or it couldn't be pulled lately.
+pub(crate) fn image() -> Option<String> {
+    if !enabled() {
+        return None;
+    }
+    let image = std::env::var(RUNNER_IMAGE_ENV)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| published_image(&crate::engine::runner_base_dockerfile()));
+    (!recently_unavailable(&image, SystemTime::now())).then_some(image)
+}
+
+fn enabled() -> bool {
+    match std::env::var(PREBUILT_IMAGES_ENV) {
+        Ok(value) => !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        ),
+        Err(_) => true,
+    }
+}
+
+fn marker_path() -> Option<PathBuf> {
+    dirs::cache_dir().map(|dir| dir.join("wrkflw").join("runner-base-unavailable"))
+}
+
+/// Remember that `image` couldn't be pulled, so runs in the next day build
+/// their images here without trying it first.
+pub(crate) fn mark_unavailable(image: &str) {
+    let Some(path) = marker_path() else { return };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, format!("{}\n{}\n", image, now));
+}
+
+fn recently_unavailable(image: &str, now: SystemTime) -> bool {
+    let Some(text) = marker_path().and_then(|p| std::fs::read_to_string(p).ok()) else {
+        return false;
+    };
+    unavailable_in(&text, image, now)
+}
+
+/// Whether the marker `text` says `image` couldn't be pulled within
+/// [`UNAVAILABLE_FOR`] of `now`.
+fn unavailable_in(text: &str, image: &str, now: SystemTime) -> bool {
+    let mut lines = text.lines();
+    if lines.next() != Some(image) {
+        return false;
+    }
+    let Some(when) = lines.next().and_then(|l| l.trim().parse::<u64>().ok()) else {
+        return false;
+    };
+    let now = now
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default();
+    now.saturating_sub(when) < UNAVAILABLE_FOR.as_secs()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_published_dockerfile_and_tag_are_current() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let dockerfile = crate::engine::runner_base_dockerfile();
+        let committed = std::fs::read_to_string(root.join("docker/runner.Dockerfile")).unwrap();
+        let tag = std::fs::read_to_string(root.join("docker/runner-image.txt")).unwrap();
+        assert!(
+            committed == dockerfile && tag.trim() == published_image(&dockerfile),
+            "docker/runner.Dockerfile or docker/runner-image.txt is out of date: run \
+             `cargo run -p wrkflw-executor --example runner_dockerfile` to rewrite them"
+        );
+    }
+
+    #[test]
+    fn the_image_names_its_dockerfile() {
+        let a = published_image("FROM a\n");
+        assert!(a.starts_with("ghcr.io/bahdotsh/wrkflw-runner:"));
+        assert_ne!(a, published_image("FROM b\n"));
+    }
+
+    #[test]
+    fn an_unavailable_image_is_skipped_for_a_day() {
+        let at = |secs: u64| UNIX_EPOCH + Duration::from_secs(secs);
+        let marker = "img:1\n1000\n";
+        assert!(unavailable_in(marker, "img:1", at(1000 + 60)));
+        assert!(!unavailable_in(marker, "img:1", at(1000 + 25 * 3600)));
+        assert!(!unavailable_in(marker, "img:2", at(1000 + 60)));
+        assert!(!unavailable_in("garbage", "img:1", at(1000)));
+    }
+}

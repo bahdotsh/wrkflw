@@ -911,6 +911,7 @@ fn report(remote: &RemoteRun, local: &Value, rows: &[Row]) -> Value {
             "verdict": local["verdict"],
             "skip_reason": local["skip_reason"],
             "error": local["error"],
+            "duration_ms": local["duration_ms"],
         },
         "jobs": rows.iter().map(|r| json!({
             "github_name": r.github_name,

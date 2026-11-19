@@ -7,9 +7,13 @@
 # Usage: scripts/conformance/compare_sweep.sh [compare_runs.txt] [wrkflw binary]
 # Needs: git, gh (signed in), jq, and Docker or Podman. Prints one
 # tab-separated line per run:
-#   repo  run  agree  agreed  differed  not_compared  unverified  built  seconds  change
+#   repo  run  agree  agreed  differed  not_compared  unverified  built  seconds
+#   local_s  github_s  change
 # from compare's own JSON report, never from the jobs' output. `unverified`
-# counts agreeing jobs that skipped an action GitHub ran. `built` counts the
+# counts agreeing jobs that skipped an action GitHub ran or ran as Linux for
+# a macOS job. `seconds` is the whole compare, fetching the run included;
+# `local_s` the local run alone and `github_s` the GitHub run, from its
+# start to its last update (a re-run counts from its first attempt). `built` counts the
 # job images built during the run: 0 means its time is a warm one, so only
 # compare times of runs with the same `built`. Each run's full report and
 # log go to $WRKFLW_SWEEP_DIR/logs.
@@ -75,9 +79,9 @@ fetch_failed() {
 failed=0
 missing=0
 recorded=""
-printf 'repo\trun\tagree\tagreed\tdiffered\tnot_compared\tunverified\tbuilt\tseconds\tchange\n'
+printf 'repo\trun\tagree\tagreed\tdiffered\tnot_compared\tunverified\tbuilt\tseconds\tlocal_s\tgithub_s\tchange\n'
 no_result() {  # repo run reason [seconds]
-  printf '%s\t%s\tn/a: %s\t-\t-\t-\t-\t-\t%s\t-\n' "$1" "$2" "$3" "${4:--}"
+  printf '%s\t%s\tn/a: %s\t-\t-\t-\t-\t-\t%s\t-\t-\t-\n' "$1" "$2" "$3" "${4:--}"
   failed=1
   missing=1
 }
@@ -88,9 +92,16 @@ while read -r repo run extra <&3; do
   name="${repo//\//_}"
   dir="$SWEEP_DIR/repos/$name"
   log="$SWEEP_DIR/logs/$name-$run"
-  sha=""
+  sha="" github_s="-"
   for attempt in 1 2 3; do
-    sha=$(gh api "repos/$repo/actions/runs/$run" --jq .head_sha 2>/dev/null) && break
+    # The commit, and how long the run took on GitHub, from its first
+    # attempt's start to its last update.
+    if run_info=$(gh api "repos/$repo/actions/runs/$run" \
+        --jq '[.head_sha, ((.updated_at | fromdate) - (.run_started_at | fromdate))] | @tsv' \
+        2>/dev/null); then
+      read -r sha github_s <<<"$run_info"
+      break
+    fi
     sha=""
     (( attempt < 3 )) && sleep $((attempt * 5))
   done
@@ -138,11 +149,12 @@ while read -r repo run extra <&3; do
     no_result "$repo" "$run" "no report (see $log.log)" "$seconds"
     continue
   fi
-  read -r agree agreed differed unknown unverified < <(jq -r '[.agree,
+  read -r agree agreed differed unknown unverified local_s < <(jq -r '[.agree,
       ([.jobs[] | select(.agree == true)] | length),
       ([.jobs[] | select(.agree == false)] | length),
       ([.jobs[] | select(.agree == null)] | length),
-      (.unverified_agreements // 0)] | @tsv' <<<"$report")
+      (.unverified_agreements // 0),
+      (if .local.duration_ms then (.local.duration_ms / 1000 | round) else "-" end)] | @tsv' <<<"$report")
 
   change="new"
   want_agreed="" want_differed="" want_unverified=""
@@ -163,8 +175,9 @@ while read -r repo run extra <&3; do
     fi
   fi
   recorded+="$repo"$'\t'"$run"$'\t'"$agreed"$'\t'"$differed"$'\t'"$unknown"$'\t'"$unverified"$'\n'
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-    "$repo" "$run" "$agree" "$agreed" "$differed" "$unknown" "$unverified" "$built" "$seconds" "$change"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$repo" "$run" "$agree" "$agreed" "$differed" "$unknown" "$unverified" "$built" "$seconds" \
+    "$local_s" "$github_s" "$change"
 done 3<"$RUNS"
 
 if [[ -n "$RECORD" && "$RECORD" != 0 ]]; then

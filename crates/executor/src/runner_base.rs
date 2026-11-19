@@ -63,22 +63,24 @@ fn marker_path() -> Option<PathBuf> {
     dirs::cache_dir().map(|dir| dir.join("wrkflw").join("runner-base-unavailable"))
 }
 
-/// Whether a failed pull of the base image says the registry has no such
-/// image for us (not published yet, or still private), rather than that
-/// the network or the machine failed, which says nothing about tomorrow.
-pub(crate) fn pull_refused(error: &str) -> bool {
+/// Whether a failed pull of the base image `image` says the registry has
+/// no such image for us (not published yet, or still private), rather than
+/// that the network or the machine failed, which says nothing about
+/// tomorrow.
+pub(crate) fn pull_refused(image: &str, error: &str) -> bool {
     let error = error.to_ascii_lowercase();
-    // A missing tag is "<image>: not found" or "manifest unknown"; a bare
-    // "not found" would also match a missing `docker` or file.
-    [
-        "manifest unknown",
-        ": not found",
-        "denied",
-        "unauthorized",
-        "403 forbidden",
-    ]
-    .iter()
-    .any(|marker| error.contains(marker))
+    // A missing tag is "<image>: not found" or "manifest unknown"; a
+    // "not found" naming anything else is a missing `docker`, shell or file.
+    let missing_tag = format!("{}: not found", image.to_ascii_lowercase());
+    error.contains(&missing_tag)
+        || [
+            "manifest unknown",
+            "denied",
+            "unauthorized",
+            "403 forbidden",
+        ]
+        .iter()
+        .any(|marker| error.contains(marker))
 }
 
 /// Remember that `image` couldn't be pulled, so runs in the next day build
@@ -148,16 +150,19 @@ mod tests {
 
     #[test]
     fn only_a_registry_refusal_is_remembered() {
-        assert!(pull_refused(
+        let image = "ghcr.io/bahdotsh/wrkflw-runner:abc";
+        let refused = |error: &str| pull_refused(image, error);
+        assert!(refused(
             "ERROR: failed to solve: ghcr.io/bahdotsh/wrkflw-runner:abc: not found"
         ));
-        assert!(pull_refused(
+        assert!(refused(
             "failed to authorize: failed to fetch anonymous token: 403 Forbidden"
         ));
-        assert!(pull_refused("manifest unknown"));
-        assert!(!pull_refused("dial tcp: lookup ghcr.io: no such host"));
-        assert!(!pull_refused("no space left on device"));
-        assert!(!pull_refused("docker not found in PATH"));
+        assert!(refused("manifest unknown"));
+        assert!(!refused("dial tcp: lookup ghcr.io: no such host"));
+        assert!(!refused("no space left on device"));
+        assert!(!refused("docker not found in PATH"));
+        assert!(!refused("sh: 1: docker: not found"));
     }
 
     #[test]

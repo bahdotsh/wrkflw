@@ -556,6 +556,9 @@ struct ContainerScope {
     action_clones: crate::node_actions::ActionClones,
     /// Set once the run has said its jobs get the user's own token.
     warned_of_own_token: AtomicBool,
+    /// Set once the run has said a remote JavaScript action runs on this
+    /// machine as the user.
+    warned_of_host_actions: AtomicBool,
     /// Why this run's steps can't run as the runner user, once settled:
     /// `None` when they may.
     runner_user: tokio::sync::OnceCell<Option<crate::runner_user::Ruled>>,
@@ -705,6 +708,7 @@ pub(crate) async fn with_run_state<F: Future>(state: Arc<RunState>, future: F) -
         clone_token: tokio::sync::OnceCell::new(),
         action_clones: crate::node_actions::ActionClones::default(),
         warned_of_own_token: AtomicBool::new(false),
+        warned_of_host_actions: AtomicBool::new(false),
         runner_user: tokio::sync::OnceCell::new(),
         warned_of_root_steps: AtomicBool::new(false),
     });
@@ -735,6 +739,14 @@ pub(crate) fn first_missing_docker_warning() -> bool {
 pub(crate) fn first_own_token_warning() -> bool {
     CONTAINERS
         .try_with(|scope| !scope.warned_of_own_token.swap(true, Ordering::Relaxed))
+        .unwrap_or(true)
+}
+
+/// True the first time a run asks, called workflows included, so it says
+/// only once that remote JavaScript actions run on this machine.
+pub(crate) fn first_host_action_warning() -> bool {
+    CONTAINERS
+        .try_with(|scope| !scope.warned_of_host_actions.swap(true, Ordering::Relaxed))
         .unwrap_or(true)
 }
 

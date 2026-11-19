@@ -2569,7 +2569,7 @@ async fn build_on_runner_base(
         // Only a registry's refusal is remembered: a network that's down
         // or a full disk says nothing about the image, so the next run
         // tries it again.
-        let when = if crate::runner_base::pull_refused(&e.to_string()) {
+        let when = if crate::runner_base::pull_refused(&base, &e.to_string()) {
             crate::runner_base::mark_unavailable(&base);
             "tried again tomorrow"
         } else {
@@ -3815,7 +3815,7 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
     // JavaScript actions' posts, last first, whatever became of the job.
     if Box::pin(run_job_posts(
         crate::node_actions::take_posts(&posts),
-        job_deadline,
+        posts_deadline(job_deadline, tokio::time::Instant::now()),
         job.steps.len(),
         &mut loop_state,
         &mut job_env,
@@ -4329,7 +4329,7 @@ async fn execute_matrix_job(
         let matrix_values = Some(combination.values.clone());
         if Box::pin(run_job_posts(
             crate::node_actions::take_posts(&posts),
-            job_deadline,
+            posts_deadline(job_deadline, tokio::time::Instant::now()),
             materialized_steps.len(),
             &mut loop_state,
             &mut job_env,
@@ -7005,7 +7005,18 @@ fn action_mount(action_path: &Path, root: Option<&str>) -> (PathBuf, PathBuf) {
             .ok()
             .map(|inside| (root, inside))
     }) {
-        Some((root, inside)) => (PathBuf::from(root), container_dir.join(inside)),
+        // Joined with `/` whatever the host: the path is the container's,
+        // and on Windows `Path::join` would put a backslash in it.
+        Some((root, inside)) => {
+            let mut container = crate::job_session::CONTAINER_ACTION_DIR.to_string();
+            for part in inside.components() {
+                if let std::path::Component::Normal(part) = part {
+                    container.push('/');
+                    container.push_str(&part.to_string_lossy());
+                }
+            }
+            (PathBuf::from(root), PathBuf::from(container))
+        }
         None => (action_path.to_path_buf(), container_dir.to_path_buf()),
     }
 }
@@ -7816,11 +7827,26 @@ struct PostContext<'a> {
     pending_cache_saves: &'a std::sync::Mutex<Vec<PendingCacheSave>>,
 }
 
+/// How long a job's posts may still run once the job's own time is up:
+/// GitHub's runner runs a cancelled job's posts too, as they clean up
+/// after their actions, and only a post that hangs is cut off.
+const POST_GRACE: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// When a job's posts must be done by: the job's own deadline, or
+/// [`POST_GRACE`] from `now` when that leaves them less.
+fn posts_deadline(
+    job_deadline: tokio::time::Instant,
+    now: tokio::time::Instant,
+) -> tokio::time::Instant {
+    job_deadline.max(now + POST_GRACE)
+}
+
 /// Run the posts of a job's JavaScript actions, `first_index` on in the
 /// job's step numbering, each with the job's env as it is then and what
-/// its action's step had over it. They share the job's time: a post still
-/// running at `deadline` fails, and the posts after it don't run. True
-/// when one failed or ran out of time, which fails the job.
+/// its action's step had over it. They must be done by `deadline`, which
+/// [`posts_deadline`] gives: a post still running then fails, and the
+/// posts after it don't run. True when one failed or ran out of time,
+/// which fails the job.
 #[allow(clippy::too_many_arguments)]
 async fn run_job_posts(
     posts: Vec<crate::node_actions::PostStep>,
@@ -8011,6 +8037,19 @@ async fn execute_node_action(
             .map_err(ExecutionError::Execution)?;
         (dir, Some(root), Some(clone))
     };
+    if !action_info.is_local
+        && step_env.get("WRKFLW_RUNTIME_MODE").map(String::as_str)
+            == Some(RuntimeType::Emulation.mode_name())
+        && acceleration::first_host_action_warning()
+    {
+        wrkflw_logging::warning(&format!(
+            "{} and the run's other remote JavaScript actions run on this machine as you \
+             under emulation, with your access, as their repository has them at their ref: \
+             use a container runtime to keep them apart, or {}=0 to skip them",
+            uses,
+            js::JS_ACTIONS_ENV
+        ));
+    }
 
     // Inputs: `with` evaluated in the caller's scope, then each default.
     let call = composite_call_step(ctx, step_env, step_user_env);
@@ -11547,6 +11586,17 @@ runs:
                 .collect(),
             keep_action: None,
         }
+    }
+
+    /// A job out of time, or nearly, still gives its posts time to clean
+    /// up; a job with time left keeps its own deadline.
+    #[test]
+    fn posts_get_time_of_their_own_past_the_jobs_deadline() {
+        let now = tokio::time::Instant::now();
+        let past = now - std::time::Duration::from_secs(1);
+        assert_eq!(posts_deadline(past, now), now + POST_GRACE);
+        let later = now + POST_GRACE + std::time::Duration::from_secs(60);
+        assert_eq!(posts_deadline(later, now), later);
     }
 
     /// A post still running when the job's time is up fails the job, and

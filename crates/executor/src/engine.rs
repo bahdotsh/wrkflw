@@ -3858,6 +3858,8 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
             Ok(Ok(outcome)) => outcome,
             // The job ends with this error, once its posts have run.
             Ok(Err(e)) => {
+                // Recorded, so the posts below see a failed job.
+                loop_state.fail_step(step, idx, e.to_string());
                 step_error = Some(e);
                 job_success = false;
                 break;
@@ -4361,6 +4363,8 @@ async fn execute_matrix_job(
                 Ok(Ok(outcome)) => outcome,
                 // The job ends with this error, once its posts have run.
                 Ok(Err(e)) => {
+                    // Recorded, so the posts below see a failed job.
+                    loop_state.fail_step(step, idx, e.to_string());
                     step_error = Some(e);
                     all_steps_ok = false;
                     break;

@@ -56,6 +56,31 @@ pub(crate) async fn job_github_token() -> Option<String> {
     .await
 }
 
+/// The token a clone of a private repository is retried with: the
+/// `GITHUB_TOKEN` a secret provider gave the job (`provider`), else
+/// `GITHUB_TOKEN` or `GH_TOKEN` from the environment, else what
+/// `gh auth token` prints; found once per run.
+///
+/// Unlike [`job_github_token`] this needs no switch: the token goes to
+/// `git` on this machine only, to read what the user can already read,
+/// and never into a job.
+pub(crate) async fn remote_clone_token(provider: Option<&str>) -> Option<String> {
+    if let Some(token) = provider.map(str::trim).filter(|t| !t.is_empty()) {
+        return Some(token.to_string());
+    }
+    crate::acceleration::run_clone_token(|| async {
+        let token = job_github_token_from(|name| std::env::var(name).ok(), || None);
+        match token {
+            Some(token) => Some(token),
+            None => {
+                let from_gh = gh_auth_token().await;
+                job_github_token_from(|_| None, || from_gh)
+            }
+        }
+    })
+    .await
+}
+
 /// Say, once per run, that its jobs get the user's own GitHub token.
 pub(crate) fn warn_of_own_token() {
     if crate::acceleration::first_own_token_warning() {

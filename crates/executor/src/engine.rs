@@ -1462,6 +1462,7 @@ enum PreparedAction {
 async fn prepare_action(
     action: &ActionInfo,
     runtime: &dyn ContainerRuntime,
+    provider_token: Option<&str>,
 ) -> Result<PreparedAction, ExecutionError> {
     if action.is_docker {
         // Docker action: pull the image and run with its native entrypoint
@@ -1595,7 +1596,7 @@ async fn prepare_action(
                     })?;
                     let repo_url = format!("https://github.com/{}.git", action.repository);
                     let repo_dir = tempdir.path().join("action");
-                    shallow_clone(&repo_url, &action.version, &repo_dir).await?;
+                    shallow_clone(&repo_url, &action.version, &repo_dir, provider_token).await?;
 
                     // Resolve the action directory (respecting sub_path)
                     let action_dir = match &action.sub_path {
@@ -1954,22 +1955,111 @@ fn extract_docker_runs_config(
 /// For branch/tag refs, uses `git clone --depth 1 --branch <ref>`.
 /// For SHA refs (40 hex chars), uses `git init` + `git fetch --depth 1` + `git checkout`.
 ///
+/// The clone is tried without credentials first. When that fails for a
+/// github.com URL and a token is at hand (`provider_token`, the
+/// `GITHUB_TOKEN` a secret provider gave the job, else the one
+/// [`crate::run_options::remote_clone_token`] finds on this machine), it is
+/// tried again with the token, so a private repository the user can read
+/// clones too. The token reaches git through its environment, as an extra
+/// HTTP header: never the URL, the command line or the clone's
+/// `.git/config`.
+///
 /// Uses `tokio::process::Command` to avoid blocking the async runtime.
 async fn shallow_clone(
     repo_url: &str,
     git_ref: &str,
     target_dir: &Path,
+    provider_token: Option<&str>,
+) -> Result<(), ExecutionError> {
+    let anonymous = match clone_attempt(repo_url, git_ref, target_dir, &[]).await {
+        Ok(()) => return Ok(()),
+        Err(e) => e,
+    };
+    if !repo_url.starts_with(GITHUB_CLONE_PREFIX) {
+        return Err(anonymous);
+    }
+    let Some(token) = crate::run_options::remote_clone_token(provider_token).await else {
+        return Err(anonymous);
+    };
+    crate::log_redaction::register_all(std::iter::once(&token));
+    // The failed attempt may have left a partial clone behind.
+    if target_dir.exists() {
+        let _ = std::fs::remove_dir_all(target_dir);
+    }
+    clone_attempt(repo_url, git_ref, target_dir, &clone_auth_env(&token))
+        .await
+        .map_err(|with_token| {
+            ExecutionError::Execution(format!(
+                "{} (also failed with your GitHub token: {}; check that the token can read the repository)",
+                anonymous, with_token
+            ))
+        })
+}
+
+/// Where every clone of a GitHub repository starts.
+const GITHUB_CLONE_PREFIX: &str = "https://github.com/";
+
+/// Environment that has git send `token` to github.com as basic auth, as
+/// `actions/checkout` does, without it showing in a command line.
+fn clone_auth_env(token: &str) -> Vec<(String, String)> {
+    let credentials = base64_encode(format!("x-access-token:{}", token).as_bytes());
+    vec![
+        ("GIT_CONFIG_COUNT".to_string(), "1".to_string()),
+        (
+            "GIT_CONFIG_KEY_0".to_string(),
+            format!("http.{}.extraheader", GITHUB_CLONE_PREFIX),
+        ),
+        (
+            "GIT_CONFIG_VALUE_0".to_string(),
+            format!("AUTHORIZATION: basic {}", credentials),
+        ),
+    ]
+}
+
+/// Standard base64 with padding.
+fn base64_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let n = (chunk[0] as u32) << 16
+            | (*chunk.get(1).unwrap_or(&0) as u32) << 8
+            | *chunk.get(2).unwrap_or(&0) as u32;
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(ALPHABET[(n >> (18 - 6 * i) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+/// A `git` command for a clone: hooks off, as cloned repositories are
+/// untrusted and could carry post-checkout hooks; never asking for a
+/// password, which would hang a run; and with `auth` in its environment.
+fn clone_git(auth: &[(String, String)]) -> tokio::process::Command {
+    let mut git = tokio::process::Command::new("git");
+    git.args(["-c", "core.hooksPath=/dev/null"])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .envs(auth.iter().map(|(k, v)| (k, v)))
+        .stdin(std::process::Stdio::null());
+    git
+}
+
+/// One try of [`shallow_clone`], with `auth` in git's environment.
+async fn clone_attempt(
+    repo_url: &str,
+    git_ref: &str,
+    target_dir: &Path,
+    auth: &[(String, String)],
 ) -> Result<(), ExecutionError> {
     let is_sha = is_git_sha(git_ref);
 
-    // Disable git hooks for all operations — cloned repos are untrusted and
-    // could contain malicious post-checkout / post-merge hooks.
-    let no_hooks = ["-c", "core.hooksPath=/dev/null"];
-
     if is_sha {
         // SHA refs can't use --branch; use init + fetch + checkout instead
-        let init = tokio::process::Command::new("git")
-            .args(no_hooks)
+        let init = clone_git(auth)
             .arg("init")
             .arg(target_dir)
             .stdout(std::process::Stdio::null())
@@ -1984,8 +2074,7 @@ async fn shallow_clone(
             )));
         }
 
-        let fetch = tokio::process::Command::new("git")
-            .args(no_hooks)
+        let fetch = clone_git(auth)
             .arg("-C")
             .arg(target_dir)
             .arg("fetch")
@@ -2011,8 +2100,7 @@ async fn shallow_clone(
             )));
         }
 
-        let checkout = tokio::process::Command::new("git")
-            .args(no_hooks)
+        let checkout = clone_git(auth)
             .arg("-C")
             .arg(target_dir)
             .arg("checkout")
@@ -2035,8 +2123,7 @@ async fn shallow_clone(
         }
     } else {
         // Branch/tag refs: standard shallow clone
-        let output = tokio::process::Command::new("git")
-            .args(no_hooks)
+        let output = clone_git(auth)
             .arg("clone")
             .arg("--depth")
             .arg("1")
@@ -5330,7 +5417,12 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
             handle_cache_action(&step_name, &ctx).await?
         } else {
             // Get action info
-            let prepared = prepare_action(&action_info, ctx.runtime).await?;
+            let prepared = prepare_action(
+                &action_info,
+                ctx.runtime,
+                ctx.services.secrets_context.get("GITHUB_TOKEN").map(String::as_str),
+            )
+            .await?;
             // An action whose metadata couldn't be fetched runs like any
             // other image action; only the reason it ran nothing differs.
             let fetch_error = match &prepared {
@@ -5365,7 +5457,13 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                         })?;
                         let repo_url = format!("https://github.com/{}.git", action_info.repository);
                         let repo_dir = tempdir.path().join("action");
-                        shallow_clone(&repo_url, &action_info.version, &repo_dir).await?;
+                        shallow_clone(
+                            &repo_url,
+                            &action_info.version,
+                            &repo_dir,
+                            ctx.services.secrets_context.get("GITHUB_TOKEN").map(String::as_str),
+                        )
+                        .await?;
                         // If the action has a sub-path, the action.yml is inside that directory
                         let action_dir = match &action_info.sub_path {
                             Some(p) => {
@@ -6680,7 +6778,13 @@ async fn execute_reusable_workflow_job(
             // Clone into a subdirectory within tempdir to get clean structure
             let repo_dir = tempdir.path().join("cloned_repo");
 
-            shallow_clone(&repo_url, &r#ref, &repo_dir).await?;
+            shallow_clone(
+                &repo_url,
+                &r#ref,
+                &repo_dir,
+                ctx.services.secrets_context.get("GITHUB_TOKEN").map(String::as_str),
+            )
+            .await?;
             let joined = repo_dir.join(path);
 
             if !joined.exists() {
@@ -8220,6 +8324,77 @@ mod tests {
             cache_store: &TEST_CACHE_STORE,
             platform_overrides: &EMPTY_PLATFORM_OVERRIDES,
         }
+    }
+
+    #[test]
+    fn base64_matches_the_standard_encoding() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+        assert_eq!(
+            base64_encode(b"x-access-token:ghp_abc"),
+            "eC1hY2Nlc3MtdG9rZW46Z2hwX2FiYw=="
+        );
+    }
+
+    #[test]
+    fn a_clone_token_goes_in_a_github_header_not_the_url() {
+        let env = clone_auth_env("ghp_secret");
+        let get = |k: &str| env.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+        assert_eq!(get("GIT_CONFIG_COUNT"), Some("1"));
+        assert_eq!(
+            get("GIT_CONFIG_KEY_0"),
+            Some("http.https://github.com/.extraheader")
+        );
+        let header = get("GIT_CONFIG_VALUE_0").unwrap();
+        assert_eq!(
+            header,
+            format!("AUTHORIZATION: basic {}", base64_encode(b"x-access-token:ghp_secret"))
+        );
+        assert!(!header.contains("ghp_secret"));
+    }
+
+    #[tokio::test]
+    async fn a_failed_clone_of_another_host_is_not_retried_with_a_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = shallow_clone(
+            "file:///nonexistent/wrkflw-no-such-repo",
+            "main",
+            &dir.path().join("repo"),
+            Some("ghp_never_used"),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(!err.contains("also failed with your GitHub token"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_local_repository_clones_without_a_token() {
+        let src = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "init.defaultBranch=main"])
+                .args(args)
+                .current_dir(src.path())
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(src.path().join("action.yml"), "name: x\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "init"]);
+        let dest = tempfile::tempdir().unwrap();
+        let url = format!("file://{}", src.path().display());
+        shallow_clone(&url, "main", &dest.path().join("repo"), None)
+            .await
+            .unwrap();
+        assert!(dest.path().join("repo/action.yml").exists());
     }
 
     #[test]

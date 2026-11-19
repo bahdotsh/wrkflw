@@ -39,7 +39,6 @@ A command-line tool for validating and executing GitHub Actions workflows locall
 - Event triggers other than `workflow_dispatch` for the remote `trigger` command
 - JavaScript actions outside the built-in set — a step such as `uses: some-org/setup-tool@v1`, or a local `uses: ./my-action`, whose action runs on Node is not executed. The step passes, prints that it would have run the action, and is listed under `unverified` in `run_finished`, the `gate` result and `compare`, with a warning in the log and a mark on the step in the TUI, so the run's verdict is `partial` rather than `verified`. Whatever the action would have installed or checked is missing from the job, so later steps may fail with `command not found`. Pass `--platform ubuntu-latest=IMAGE` with an image that has the tool, or install it in a `run:` step
 - Absolute-URL actions such as `uses: https://gitea.com/actions/checkout@v4` — they pass validation, but at run time the URL is not resolved and the step falls back to built-in handling
-- Private repos for remote `uses:` — reusable workflows clone over unauthenticated HTTPS
 - `cancel-in-progress` and workflow-level `concurrency:` — job-level groups are enforced within a run, but a local run has nothing earlier to cancel
 - Service containers outside Docker and Podman — emulation, secure emulation, Kubernetes and jobs inside a called workflow don't start `services:`
 - Service settings that reach the host — a service's `volumes:` can only name a volume, not a host path, and its `options:` only take flags that shape the service container itself, such as `--health-cmd`, `--user`, `--tmpfs` and `-e NAME=value`. Anything else, such as `--privileged` or `-v`, fails the job.
@@ -523,7 +522,9 @@ jobs:
 - `with:` entries become `INPUT_<KEY>` env vars; `secrets:` become `SECRET_<KEY>`
 - Outputs from called jobs are merged back into `needs.<id>.outputs.*`
 
-**Limitations:** private repos for remote `uses:` are not yet supported (the clone is unauthenticated). A called workflow that declares no `on.workflow_call.outputs` exposes all of its job outputs.
+**Private repositories:** a remote `uses:` (a called workflow, or a Docker, composite or JavaScript action) is cloned without credentials first. If that fails, it is cloned again with a GitHub token: the `GITHUB_TOKEN` a secret provider gives the job, else `GITHUB_TOKEN` or `GH_TOKEN` from the environment, else what `gh auth token` prints. The token goes to `git` on this machine only, as an HTTP header: not into the URL, the clone's `.git/config` or the job.
+
+**Limitations:** a called workflow that declares no `on.workflow_call.outputs` exposes all of its job outputs.
 
 ## Secrets Management
 

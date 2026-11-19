@@ -549,6 +549,9 @@ struct ContainerScope {
     warned_of_missing_docker: AtomicBool,
     /// The GitHub token this run gives its jobs, once a job asked for it.
     job_token: tokio::sync::OnceCell<Option<String>>,
+    /// This machine's GitHub token for cloning private repositories, once
+    /// a clone needed it.
+    clone_token: tokio::sync::OnceCell<Option<String>>,
     /// Set once the run has said its jobs get the user's own token.
     warned_of_own_token: AtomicBool,
     /// Why this run's steps can't run as the runner user, once settled:
@@ -697,6 +700,7 @@ pub(crate) async fn with_run_state<F: Future>(state: Arc<RunState>, future: F) -
         policy,
         warned_of_missing_docker: AtomicBool::new(false),
         job_token: tokio::sync::OnceCell::new(),
+        clone_token: tokio::sync::OnceCell::new(),
         warned_of_own_token: AtomicBool::new(false),
         runner_user: tokio::sync::OnceCell::new(),
         warned_of_root_steps: AtomicBool::new(false),
@@ -770,6 +774,19 @@ where
 {
     match CONTAINERS.try_with(Arc::clone) {
         Ok(scope) => scope.job_token.get_or_init(find).await.clone(),
+        Err(_) => find().await,
+    }
+}
+
+/// What `find` gives for this run, the first time a clone of it needs a
+/// token: see [`crate::run_options::remote_clone_token`]. Outside a run,
+/// each call finds it anew.
+pub(crate) async fn run_clone_token<F>(find: impl FnOnce() -> F) -> Option<String>
+where
+    F: Future<Output = Option<String>>,
+{
+    match CONTAINERS.try_with(Arc::clone) {
+        Ok(scope) => scope.clone_token.get_or_init(find).await.clone(),
         Err(_) => find().await,
     }
 }

@@ -1420,6 +1420,51 @@ runs:
             );
         }
 
+        /// A token GitHub refuses, which it answers with a 404 even for a
+        /// public file, doesn't stop a public action resolving: the file is
+        /// fetched without the token first (`fetch_action_file`), which
+        /// matters now that a job's secret-provider token comes here.
+        #[tokio::test]
+        async fn a_bad_token_does_not_hide_a_public_action() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(header_exists("Authorization"))
+                .respond_with(ResponseTemplate::new(404))
+                .with_priority(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/bad-token/public/v1/action.yml"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(ACTION_YML_BODY))
+                .with_priority(5)
+                .mount(&server)
+                .await;
+            let resolved = resolve_with_token(
+                &server.uri(),
+                None,
+                "bad-token/public",
+                "v1",
+                None,
+                Some("stale_placeholder".to_string()),
+                || async { None },
+            )
+            .await;
+            assert!(resolved.is_ok(), "{resolved:?}");
+
+            // Not there at all: the error is still the first one's.
+            let missing = resolve_with_token(
+                &server.uri(),
+                None,
+                "bad-token/missing",
+                "v1",
+                None,
+                Some("stale_placeholder".to_string()),
+                || async { None },
+            )
+            .await;
+            assert!(missing.unwrap_err().contains("HTTP 404"));
+        }
+
         /// A job's secret-provider token reads a private action, as it
         /// would clone one; without it the environment's token does.
         #[test]

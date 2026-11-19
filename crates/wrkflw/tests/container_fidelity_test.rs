@@ -49,7 +49,14 @@ fn repo(files: &[(&str, &str)]) -> TempDir {
     dir
 }
 
+/// One wrkflw run at a time: on a cold runner, two processes building the
+/// same job image at once both ran into the 10-minute build limit.
+static ONE_RUN_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn run(root: &Path, flags: &[&str]) -> Output {
+    let _turn = ONE_RUN_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     Command::new(env!("CARGO_BIN_EXE_wrkflw"))
         .current_dir(root)
         .env("GIT_CONFIG_GLOBAL", NO_GIT_CONFIG)

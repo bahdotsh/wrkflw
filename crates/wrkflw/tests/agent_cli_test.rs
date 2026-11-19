@@ -1766,6 +1766,104 @@ fn what_pre_exports_reaches_main_and_later_steps() {
     assert_eq!(finished_step(&lines, "Later", &output)["status"], "success");
 }
 
+/// A post's `post-if` reads the job's status at the end of the job: a
+/// `success()` post is skipped once a later step failed, and an
+/// `always()` one still runs.
+#[test]
+fn a_success_only_post_is_skipped_after_a_failed_step() {
+    if !has_node() {
+        return;
+    }
+    let sandbox = Sandbox::new();
+    js_action(
+        &sandbox,
+        "on-success",
+        "name: s\nruns:\n  using: node20\n  main: main.js\n  post: post.js\n  post-if: success()\n",
+        &[
+            ("main.js", r#"console.log("main ok");"#),
+            ("post.js", r#"console.log("success post ran");"#),
+        ],
+    );
+    js_action(
+        &sandbox,
+        "always",
+        "name: a\nruns:\n  using: node20\n  main: main.js\n  post: post.js\n",
+        &[
+            ("main.js", r#"console.log("main ok");"#),
+            ("post.js", r#"console.log("always post ran");"#),
+        ],
+    );
+    sandbox.write(
+        "post_if.yml",
+        "name: p\non: [push]\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      \
+         - name: OnSuccess\n        uses: ./.github/actions/on-success\n      \
+         - name: Always\n        uses: ./.github/actions/always\n      \
+         - name: Break\n        run: exit 1\n",
+    );
+    let output = sandbox.run(&[
+        "--format",
+        "json",
+        "run",
+        "--runtime",
+        "emulation",
+        ".github/workflows/post_if.yml",
+    ]);
+    let lines = json_lines(&output);
+    assert_eq!(
+        finished_step(&lines, "Post OnSuccess", &output)["status"],
+        "skipped"
+    );
+    assert_eq!(
+        finished_step(&lines, "Post Always", &output)["status"],
+        "success"
+    );
+    assert!(!stdout(&output).contains("success post ran"));
+}
+
+/// Each leg of a matrix runs its JavaScript action's post: the matrix
+/// runs its steps through a loop of its own.
+#[test]
+fn each_matrix_leg_runs_its_actions_post() {
+    if !has_node() {
+        return;
+    }
+    let sandbox = Sandbox::new();
+    js_action(
+        &sandbox,
+        "cleanup",
+        "name: c\nruns:\n  using: node20\n  main: main.js\n  post: post.js\n",
+        &[
+            ("main.js", r#"console.log("main ok");"#),
+            ("post.js", r#"console.log("post ran");"#),
+        ],
+    );
+    sandbox.write(
+        "matrix_post.yml",
+        "name: m\non: [push]\njobs:\n  a:\n    runs-on: ubuntu-latest\n    strategy:\n      \
+         matrix:\n        leg: [one, two]\n    steps:\n      \
+         - name: JS\n        uses: ./.github/actions/cleanup\n",
+    );
+    let output = sandbox.run(&[
+        "--format",
+        "json",
+        "--every-matrix-leg",
+        "run",
+        "--runtime",
+        "emulation",
+        ".github/workflows/matrix_post.yml",
+    ]);
+    let lines = json_lines(&output);
+    let posts: Vec<&Value> = lines
+        .iter()
+        .filter(|line| line["type"] == "step_finished" && line["step"] == "Post JS")
+        .collect();
+    assert_eq!(posts.len(), 2, "{}", stdout(&output));
+    assert!(
+        posts.iter().all(|post| post["status"] == "success"),
+        "{posts:?}"
+    );
+}
+
 /// As on GitHub, where an action's `pre` registers its post, a `pre` that
 /// fails still has its post clean up at the end of the job, and `main`
 /// doesn't run.

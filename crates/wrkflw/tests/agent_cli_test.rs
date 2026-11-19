@@ -1724,6 +1724,48 @@ fn a_failing_post_fails_the_job() {
     assert_eq!(post["status"], "failure", "{post}");
 }
 
+/// What `pre` writes to `$GITHUB_ENV` reaches `main`, as `pre` is a step
+/// of its own on GitHub, and the job's later steps.
+#[test]
+fn what_pre_exports_reaches_main_and_later_steps() {
+    if !has_node() {
+        return;
+    }
+    let sandbox = Sandbox::new();
+    js_action(
+        &sandbox,
+        "exports",
+        "name: e\nruns:\n  using: node20\n  pre: pre.js\n  main: main.js\n",
+        &[
+            (
+                "pre.js",
+                r#"require("fs").appendFileSync(process.env.GITHUB_ENV, "FROM_PRE=yes\n");"#,
+            ),
+            (
+                "main.js",
+                r#"if (process.env.FROM_PRE !== "yes") { console.error("main saw no FROM_PRE"); process.exit(1); }"#,
+            ),
+        ],
+    );
+    sandbox.write(
+        "pre_env.yml",
+        "name: p\non: [push]\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      \
+         - name: JS\n        uses: ./.github/actions/exports\n      \
+         - name: Later\n        run: test \"$FROM_PRE\" = yes\n",
+    );
+    let output = sandbox.run(&[
+        "--format",
+        "json",
+        "run",
+        "--runtime",
+        "emulation",
+        ".github/workflows/pre_env.yml",
+    ]);
+    let lines = json_lines(&output);
+    assert_eq!(finished_step(&lines, "JS", &output)["status"], "success");
+    assert_eq!(finished_step(&lines, "Later", &output)["status"], "success");
+}
+
 /// As on GitHub, where an action's `pre` registers its post, a `pre` that
 /// fails still has its post clean up at the end of the job, and `main`
 /// doesn't run.

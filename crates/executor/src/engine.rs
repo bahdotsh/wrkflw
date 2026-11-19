@@ -8333,6 +8333,24 @@ async fn execute_node_action(
                 return Ok(not_run(result.output, cause));
             }
             output.push_str(&result.output);
+            // On GitHub `pre` is a step of its own, so what it writes to
+            // `$GITHUB_ENV` and `$GITHUB_PATH` reaches `main`. Applied to
+            // `main`'s env here, then written back, so the job also gets it
+            // when the step ends. Its outputs and summary go, as a `pre`
+            // has no step id to give outputs under.
+            let applied = crate::github_env_files::apply_step_environment_updates(
+                &mut env,
+                &mut HashMap::new(),
+                &mut HashMap::new(),
+                None,
+            );
+            if let Err(e) = applied.write_to(&env) {
+                wrkflw_logging::warning(&format!(
+                    "What 'Pre {}' wrote to $GITHUB_ENV or $GITHUB_PATH may not reach later \
+                     steps: {}",
+                    step_name, e
+                ));
+            }
             // As on GitHub, what `pre` saved is there for `main` and `post`.
             let saved = saved_by(&result.output);
             env.extend(saved.iter().cloned());

@@ -24,6 +24,7 @@ pub mod kubernetes;
 pub(crate) mod live_step;
 pub(crate) mod log_redaction;
 pub(crate) mod matrix_fold;
+pub mod node_actions;
 pub mod podman;
 pub mod run_options;
 pub mod runner_fidelity;

@@ -316,3 +316,56 @@ jobs:
         "no word of the flag:\n{said}"
     );
 }
+
+/// A JavaScript action runs with the job image's node, as the runner user,
+/// in the job's container: what it writes to `$GITHUB_ENV` reaches the next
+/// step, and its post reads what it saved with `$GITHUB_STATE`.
+#[test]
+fn a_javascript_action_runs_in_the_job_container_with_its_post() {
+    if !docker_answers() {
+        eprintln!("skipped: Docker isn't available");
+        return;
+    }
+    let action = r#"
+name: js
+inputs:
+  file-name:
+    default: made-by-js
+runs:
+  using: node20
+  main: main.js
+  post: post.js
+"#;
+    let main = r#"const fs = require("fs");
+fs.writeFileSync(process.env.GITHUB_WORKSPACE + "/" + process.env["INPUT_FILE-NAME"], require("os").userInfo().username);
+fs.appendFileSync(process.env.GITHUB_ENV, "FROM_JS=yes\n");
+fs.appendFileSync(process.env.GITHUB_STATE, "saved=from-main\n");
+"#;
+    let post = r#"if (process.env.STATE_saved !== "from-main") { console.error("no state"); process.exit(1); }
+console.log("post ok");
+"#;
+    let workflow = r#"
+name: ci
+on: push
+jobs:
+  js:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/js
+      - run: |
+          test "$FROM_JS" = yes
+          test "$(cat made-by-js)" = runner
+"#;
+    let dir = repo(&[
+        (".github/workflows/ci.yml", workflow),
+        (".github/actions/js/action.yml", action),
+        (".github/actions/js/main.js", main),
+        (".github/actions/js/post.js", post),
+    ]);
+    let output = run(dir.path(), &[]);
+    assert_ok(&output);
+    let text = String::from_utf8_lossy(&output.stdout).to_string()
+        + &String::from_utf8_lossy(&output.stderr);
+    assert!(text.contains("Post "), "{text}");
+}

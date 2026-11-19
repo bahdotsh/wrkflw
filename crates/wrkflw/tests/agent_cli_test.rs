@@ -1440,11 +1440,82 @@ fn a_step_whose_action_did_not_run_makes_a_pass_partial() {
     );
 }
 
-/// A local JavaScript action can't run here, so its step passes but is
-/// listed under `unverified`, as a remote one is. A local composite action
-/// runs step by step and isn't.
+/// A local JavaScript action runs with node: its inputs, with defaults and
+/// hyphens kept, what it writes to `$GITHUB_OUTPUT` and `$GITHUB_ENV`, and
+/// a post that reads what it saved, at the end of the job.
 #[test]
-fn a_local_javascript_action_is_reported_as_not_run() {
+fn a_local_javascript_action_runs_with_its_inputs_state_and_post() {
+    if std::process::Command::new("node").arg("--version").output().is_err() {
+        eprintln!("skipped: no node on this machine");
+        return;
+    }
+    let sandbox = Sandbox::new();
+    let js = sandbox.repo.path().join(".github/actions/js");
+    fs::create_dir_all(&js).unwrap();
+    fs::write(
+        js.join("action.yml"),
+        "name: js\ninputs:\n  who-to:\n    default: world\n  greeting:\n    required: true\n\
+         runs:\n  using: node20\n  main: main.js\n  post: post.js\n",
+    )
+    .unwrap();
+    fs::write(
+        js.join("main.js"),
+        r#"const fs = require("fs");
+const greeting = process.env["INPUT_GREETING"] + " " + process.env["INPUT_WHO-TO"];
+console.log(greeting);
+fs.appendFileSync(process.env.GITHUB_OUTPUT, `said=${greeting}\n`);
+fs.appendFileSync(process.env.GITHUB_ENV, `FROM_JS=yes\n`);
+fs.appendFileSync(process.env.GITHUB_STATE, `saved=from-main\n`);
+"#,
+    )
+    .unwrap();
+    fs::write(
+        js.join("post.js"),
+        r#"console.log("post sees " + process.env.STATE_saved);"#,
+    )
+    .unwrap();
+    sandbox.write(
+        "local.yml",
+        "name: local\non: [push]\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      \
+         - name: JS\n        id: js\n        uses: ./.github/actions/js\n        with:\n          greeting: hello\n      \
+         - name: Check\n        run: |\n          test \"${{ steps.js.outputs.said }}\" = \"hello world\"\n          test \"$FROM_JS\" = yes\n",
+    );
+    let output = sandbox.run(&[
+        "--format",
+        "json",
+        "run",
+        "--runtime",
+        "emulation",
+        ".github/workflows/local.yml",
+    ]);
+    let lines = json_lines(&output);
+    let finished = lines
+        .iter()
+        .find(|line| line["type"] == "run_finished")
+        .unwrap_or_else(|| panic!("no run_finished: {}", stdout(&output)));
+    assert_eq!(finished["status"], "success", "{finished}");
+    let unverified_steps: Vec<&Value> = finished["unverified"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|entry| entry.get("step").is_some())
+        .collect();
+    assert!(unverified_steps.is_empty(), "{finished}");
+    let post = lines
+        .iter()
+        .find(|line| line["type"] == "step_finished" && line["step"] == "Post JS")
+        .unwrap_or_else(|| panic!("no post step: {}", stdout(&output)));
+    assert_eq!(post["status"], "success", "{post}");
+    assert!(
+        post["output"].as_str().unwrap().contains("post sees from-main"),
+        "{post}"
+    );
+}
+
+/// With `WRKFLW_JS_ACTIONS=0` a JavaScript action doesn't run: the step
+/// passes and the run is partial. A composite action is still run.
+#[test]
+fn a_javascript_action_turned_off_is_reported_as_not_run() {
     let sandbox = Sandbox::new();
     let actions = sandbox.repo.path().join(".github/actions");
     fs::create_dir_all(actions.join("js")).unwrap();
@@ -1465,14 +1536,18 @@ fn a_local_javascript_action_is_reported_as_not_run() {
          - name: JS\n        uses: ./.github/actions/js\n      \
          - name: Composite\n        uses: ./.github/actions/composite\n",
     );
-    let output = sandbox.run(&[
-        "--format",
-        "json",
-        "run",
-        "--runtime",
-        "emulation",
-        ".github/workflows/local.yml",
-    ]);
+    let output = sandbox
+        .command(&[
+            "--format",
+            "json",
+            "run",
+            "--runtime",
+            "emulation",
+            ".github/workflows/local.yml",
+        ])
+        .env("WRKFLW_JS_ACTIONS", "0")
+        .output()
+        .unwrap();
     let finished = json_lines(&output)
         .into_iter()
         .find(|line| line["type"] == "run_finished")

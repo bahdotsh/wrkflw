@@ -1,5 +1,13 @@
 # Breaking Changes
 
+## JavaScript actions run (unreleased)
+
+A `uses:` step whose action runs on Node, such as `actions/github-script`, `codecov/codecov-action` or a local `./` action whose `action.yml` says `runs.using: node20`, used to pass without running and was reported as not run, which made the run `partial`. Such an action now runs with node in the job's container, with its `pre` and `post`, so it can fail where it used to pass, and the run is `verified` when nothing else was left out. An action that needs GitHub's run services (`ACTIONS_RUNTIME_TOKEN`) fails locally. A remote action is cloned from GitHub, with your GitHub token if the anonymous clone fails. `WRKFLW_JS_ACTIONS=0` brings back the old behaviour. The setup actions and the Rust toolchain actions are unchanged.
+
+## Steps run as the `runner` user (unreleased)
+
+In the image wrkflw builds for a job, its steps now run as `runner`, a user with a home directory and sudo without a password, as on GitHub's hosted runner, where they used to run as root. A step that wrote where only root may, or relied on being root, can now fail: run it with `sudo`, as on GitHub, or set `WRKFLW_STEPS_AS_ROOT=1` to keep root everywhere. On Linux the user takes the uid of whoever runs wrkflw, so a bind-mounted workspace stays theirs. Under a rootless engine, or where the user can't write the job's mounts, steps run as root with a warning. A job `container:`, an image mapped with `-P` and Kubernetes are unchanged. Stored results are keyed on it and the key's version goes to 5, so `--reuse-results` reruns every job once.
+
 ## A job's steps share one container (unreleased)
 
 On Docker and Podman a job's `run:` steps now run in one container, started once and kept for the job, where each step used to get a container of its own. What a step leaves outside the workspace is there for the next one, as on GitHub: `go install`, `apt-get install`, `rustup toolchain add`, `pip install`, a file under `$HOME` or `/tmp`, a process left running. A workflow that only passed locally because a step started from a clean image now behaves as it does on GitHub. `--step-containers`, or `WRKFLW_STEP_CONTAINERS=1`, brings the old behaviour back, and `--preserve-containers-on-failure` still implies it. `--job-container` is accepted and does nothing, even beside `--step-containers`. Both variables also apply to runs started from the TUI and `wrkflw watch`. The jobs of a called workflow share a container too, and their services now start. A step that is cancelled or times out may still be running in the job's container, so the steps after it, `if: always()` ones included, get a fresh container without what earlier steps installed, and the job's services restart with it.

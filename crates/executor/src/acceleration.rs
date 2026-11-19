@@ -552,6 +552,8 @@ struct ContainerScope {
     /// This machine's GitHub token for cloning private repositories, once
     /// a clone needed it.
     clone_token: tokio::sync::OnceCell<Option<String>>,
+    /// JavaScript actions cloned this run.
+    action_clones: crate::node_actions::ActionClones,
     /// Set once the run has said its jobs get the user's own token.
     warned_of_own_token: AtomicBool,
     /// Why this run's steps can't run as the runner user, once settled:
@@ -701,6 +703,7 @@ pub(crate) async fn with_run_state<F: Future>(state: Arc<RunState>, future: F) -
         warned_of_missing_docker: AtomicBool::new(false),
         job_token: tokio::sync::OnceCell::new(),
         clone_token: tokio::sync::OnceCell::new(),
+        action_clones: crate::node_actions::ActionClones::default(),
         warned_of_own_token: AtomicBool::new(false),
         runner_user: tokio::sync::OnceCell::new(),
         warned_of_root_steps: AtomicBool::new(false),
@@ -788,6 +791,26 @@ where
     match CONTAINERS.try_with(Arc::clone) {
         Ok(scope) => scope.clone_token.get_or_init(find).await.clone(),
         Err(_) => find().await,
+    }
+}
+
+/// This run's clone of the action `key` names, made with `clone` the first
+/// time a job asks for it. Outside a run each call clones anew.
+pub(crate) async fn run_action_clone<F, Fut>(
+    key: &str,
+    clone: F,
+) -> Result<Arc<tempfile::TempDir>, String>
+where
+    F: FnOnce(PathBuf) -> Fut,
+    Fut: Future<Output = Result<(), String>>,
+{
+    match CONTAINERS.try_with(Arc::clone) {
+        Ok(scope) => scope.action_clones.get_or_clone(key, clone).await,
+        Err(_) => {
+            crate::node_actions::ActionClones::default()
+                .get_or_clone(key, clone)
+                .await
+        }
     }
 }
 

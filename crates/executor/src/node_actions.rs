@@ -1,0 +1,396 @@
+//! JavaScript actions (`runs.using: node<N>`), run as GitHub's runner runs
+//! them: `node <main>` in the job's container, from the action's own
+//! directory, with its inputs as `INPUT_<NAME>`, its `pre` before and its
+//! `post` at the end of the job, which reads what `main` saved with
+//! `$GITHUB_STATE` or `::save-state` as `STATE_<name>`.
+//!
+//! The engine glue is in `engine.rs` (`execute_node_action` and the post
+//! loops); this module holds what that needs and can be tested alone.
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
+/// Env var that, set to `0`, leaves JavaScript actions unrun: the step
+/// passes and the action is reported as not run, as before wrkflw ran them.
+pub const JS_ACTIONS_ENV: &str = "WRKFLW_JS_ACTIONS";
+
+/// Why a JavaScript action didn't run when `node` wasn't there to run it.
+pub(crate) const NO_NODE: &str =
+    "the job's image has no `node` to run this JavaScript action (use a runner image with Node, or -P)";
+
+/// Why a JavaScript action didn't run when [`JS_ACTIONS_ENV`] is `0`.
+pub(crate) const JS_ACTIONS_OFF: &str = "JavaScript actions are turned off (WRKFLW_JS_ACTIONS=0)";
+
+/// Whether JavaScript actions run: on unless [`JS_ACTIONS_ENV`] turns them
+/// off.
+pub(crate) fn enabled() -> bool {
+    match std::env::var(JS_ACTIONS_ENV) {
+        Ok(value) => !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        ),
+        Err(_) => true,
+    }
+}
+
+/// What `runs:` says about a JavaScript action.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NodeRuns {
+    /// The Node major version `runs.using` names: 20 for `node20`.
+    pub node_major: u32,
+    /// The script `main` names, relative to the action's directory.
+    pub main: String,
+    pub pre: Option<String>,
+    /// `pre-if`, which defaults to `always()` on GitHub.
+    pub pre_if: Option<String>,
+    pub post: Option<String>,
+    /// `post-if`, which defaults to `always()` on GitHub.
+    pub post_if: Option<String>,
+}
+
+impl NodeRuns {
+    /// The `runs:` of a JavaScript action's `action.yml`, or `None` when
+    /// it isn't one or names no `main`.
+    pub(crate) fn from_definition(definition: &serde_yaml::Value) -> Option<Self> {
+        let runs = definition.get("runs")?;
+        let using = runs.get("using")?.as_str()?;
+        let node_major = using.strip_prefix("node")?.parse().ok()?;
+        let text = |key: &str| {
+            runs.get(key)
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        };
+        Some(Self {
+            node_major,
+            main: text("main")?,
+            pre: text("pre"),
+            pre_if: text("pre-if"),
+            post: text("post"),
+            post_if: text("post-if"),
+        })
+    }
+}
+
+/// The env var `core.getInput(name)` reads: upper case, spaces as `_`,
+/// hyphens kept.
+pub(crate) fn input_env_name(name: &str) -> String {
+    format!("INPUT_{}", name.replace(' ', "_").to_uppercase())
+}
+
+/// The env var `core.getState(name)` reads in `post`.
+pub(crate) fn state_env_name(name: &str) -> String {
+    format!("STATE_{}", name)
+}
+
+/// The inputs a JavaScript action gets, by env var: each input the action
+/// declares, from `with` or else its `default`, and anything else `with`
+/// passes, as the runner passes it too. `evaluate` resolves `${{ }}` in a
+/// default, such as `${{ github.token }}`; `with` arrives evaluated.
+pub(crate) fn input_env(
+    definition: &serde_yaml::Value,
+    with: Option<&HashMap<String, String>>,
+    evaluate: impl Fn(&str) -> String,
+) -> Vec<(String, String)> {
+    let mut env: Vec<(String, String)> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if let Some(inputs) = definition.get("inputs").and_then(|v| v.as_mapping()) {
+        for (name, spec) in inputs {
+            let Some(name) = name.as_str() else { continue };
+            let value = match with.and_then(|w| w.get(name)) {
+                Some(given) => given.clone(),
+                None => match spec.get("default") {
+                    Some(serde_yaml::Value::String(s)) => evaluate(s),
+                    Some(serde_yaml::Value::Number(n)) => n.to_string(),
+                    Some(serde_yaml::Value::Bool(b)) => b.to_string(),
+                    _ => String::new(),
+                },
+            };
+            seen.insert(name.to_string());
+            env.push((input_env_name(name), value));
+        }
+    }
+    if let Some(with) = with {
+        let mut extra: Vec<_> = with.iter().filter(|(k, _)| !seen.contains(*k)).collect();
+        extra.sort();
+        for (name, value) in extra {
+            env.push((input_env_name(name), value.clone()));
+        }
+    }
+    env
+}
+
+/// The `bash` command that runs `script` from the action's directory.
+pub(crate) fn node_command(script: &str) -> String {
+    format!(
+        "node \"$GITHUB_ACTION_PATH/{}\"",
+        script.trim_start_matches("./")
+    )
+}
+
+/// Whether a phase's exit code says there was no `node` to run it.
+pub(crate) fn node_was_missing(exit_code: Option<i32>, output: &str) -> bool {
+    exit_code == Some(127)
+        && (output.contains("node: command not found")
+            || output.contains("node: not found")
+            || output.contains("\"node\": executable file not found"))
+}
+
+/// What an action saved for its `post`: `$GITHUB_STATE`'s entries, then
+/// `::save-state` lines in its output, a later one winning.
+pub(crate) fn saved_state(state_file: &str, output: &str) -> Vec<(String, String)> {
+    let mut state: Vec<(String, String)> =
+        crate::github_env_files::parse_github_kv_file(state_file)
+            .into_iter()
+            .collect();
+    state.sort();
+    for command in crate::workflow_commands::parse_workflow_commands(output) {
+        if let crate::workflow_commands::WorkflowCommand::SaveState { name, value } = command {
+            state.retain(|(k, _)| *k != name);
+            state.push((name, value));
+        }
+    }
+    state
+}
+
+/// A JavaScript action's `post`, run at the end of the job.
+#[derive(Clone)]
+pub(crate) struct PostStep {
+    /// The step's name, as GitHub shows it: `Post <step>`.
+    pub name: String,
+    /// The `bash` command that runs it.
+    pub command: String,
+    /// `post-if`, `always()` when the action gives none.
+    pub condition: String,
+    /// What the step had for `main`, with its `STATE_*`.
+    pub env: HashMap<String, String>,
+    /// Keeps a cloned action's directory until its post has run.
+    pub _action_dir: Option<Arc<tempfile::TempDir>>,
+}
+
+/// The posts of the job running, in the order their actions ran.
+pub(crate) type JobPosts = Arc<Mutex<Vec<PostStep>>>;
+
+tokio::task_local! {
+    /// Set around each step of a job by its step loop.
+    static JOB_POSTS: JobPosts;
+}
+
+/// Run `future`, a step of a job, so the posts of its actions go on `posts`.
+pub(crate) async fn collecting_posts<F: std::future::Future>(
+    posts: &JobPosts,
+    future: F,
+) -> F::Output {
+    JOB_POSTS.scope(posts.clone(), future).await
+}
+
+/// Queue `post` for the end of the job. Outside a step loop, as in a test
+/// calling a step on its own, there is no end of job to run it at: it is
+/// dropped with a warning.
+pub(crate) fn queue_post(post: PostStep) {
+    if JOB_POSTS
+        .try_with(|posts| {
+            posts
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(post.clone())
+        })
+        .is_err()
+    {
+        wrkflw_logging::warning(&format!(
+            "'{}' has nowhere to run: it isn't part of a job",
+            post.name
+        ));
+    }
+}
+
+/// The posts queued so far, last first, as GitHub runs them.
+pub(crate) fn take_posts(posts: &JobPosts) -> Vec<PostStep> {
+    let mut taken = std::mem::take(&mut *posts.lock().unwrap_or_else(|e| e.into_inner()));
+    taken.reverse();
+    taken
+}
+
+/// The posts of a job as a `workflow::Step` and the env it runs with.
+pub(crate) fn post_as_step(post: &PostStep) -> wrkflw_parser::workflow::Step {
+    let mut step = wrkflw_parser::workflow::Step::with_run(post.name.clone(), post.command.clone());
+    step.shell = Some("bash".to_string());
+    step.if_condition = Some(post.condition.clone());
+    step
+}
+
+/// Repositories of actions cloned this run, by `repo@ref`, so a matrix's
+/// legs and repeated steps clone each once. Kept until the run ends.
+#[derive(Default)]
+pub(crate) struct ActionClones {
+    clones: tokio::sync::Mutex<HashMap<String, Arc<tempfile::TempDir>>>,
+}
+
+impl ActionClones {
+    /// The clone of `key`, made with `clone` into the directory it is
+    /// given the first time it's asked for.
+    pub(crate) async fn get_or_clone<F, Fut>(
+        &self,
+        key: &str,
+        clone: F,
+    ) -> Result<Arc<tempfile::TempDir>, String>
+    where
+        F: FnOnce(PathBuf) -> Fut,
+        Fut: std::future::Future<Output = Result<(), String>>,
+    {
+        let mut clones = self.clones.lock().await;
+        if let Some(dir) = clones.get(key) {
+            return Ok(dir.clone());
+        }
+        let dir = tempfile::tempdir().map_err(|e| format!("Failed to create temp dir: {}", e))?;
+        clone(dir.path().join("action")).await?;
+        let dir = Arc::new(dir);
+        clones.insert(key.to_string(), dir.clone());
+        Ok(dir)
+    }
+}
+
+/// The directory of a cloned action: its repository's root, or the
+/// subdirectory `sub_path` names, which must stay inside it.
+pub(crate) fn action_dir_in(clone: &Path, sub_path: Option<&str>) -> Result<PathBuf, String> {
+    let root = clone.join("action");
+    let Some(sub) = sub_path.filter(|s| !s.is_empty()) else {
+        return Ok(root);
+    };
+    let joined = root.join(sub);
+    let canonical_root = root
+        .canonicalize()
+        .map_err(|e| format!("Failed to resolve {}: {}", root.display(), e))?;
+    let canonical = joined
+        .canonicalize()
+        .map_err(|e| format!("The action's path '{}' doesn't exist: {}", sub, e))?;
+    if !canonical.starts_with(&canonical_root) {
+        return Err(format!("The action's path '{}' leaves its repository", sub));
+    }
+    Ok(canonical)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn yaml(text: &str) -> serde_yaml::Value {
+        serde_yaml::from_str(text).unwrap()
+    }
+
+    #[test]
+    fn runs_names_the_node_version_and_its_scripts() {
+        let runs = NodeRuns::from_definition(&yaml(
+            "runs:\n  using: node20\n  main: dist/index.js\n  post: dist/post.js\n  post-if: success()\n",
+        ))
+        .unwrap();
+        assert_eq!(runs.node_major, 20);
+        assert_eq!(runs.main, "dist/index.js");
+        assert_eq!(runs.post.as_deref(), Some("dist/post.js"));
+        assert_eq!(runs.post_if.as_deref(), Some("success()"));
+        assert_eq!(runs.pre, None);
+    }
+
+    #[test]
+    fn a_composite_or_docker_action_has_no_node_runs() {
+        assert!(NodeRuns::from_definition(&yaml("runs:\n  using: composite\n")).is_none());
+        assert!(NodeRuns::from_definition(&yaml("runs:\n  using: docker\n  image: x\n")).is_none());
+        assert!(NodeRuns::from_definition(&yaml("runs:\n  using: node20\n")).is_none());
+    }
+
+    #[test]
+    fn inputs_keep_hyphens_and_take_defaults() {
+        let def = yaml(
+            "inputs:\n  my-input:\n    default: d\n  token:\n    default: ${{ github.token }}\n  count:\n    default: 3\n  given:\n    default: no\n",
+        );
+        let with = HashMap::from([
+            ("given".to_string(), "yes".to_string()),
+            ("extra value".to_string(), "e".to_string()),
+        ]);
+        let env = input_env(&def, Some(&with), |s| {
+            s.replace("${{ github.token }}", "tok")
+        });
+        let get = |k: &str| env.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+        assert_eq!(get("INPUT_MY-INPUT"), Some("d"));
+        assert_eq!(get("INPUT_TOKEN"), Some("tok"));
+        assert_eq!(get("INPUT_COUNT"), Some("3"));
+        assert_eq!(get("INPUT_GIVEN"), Some("yes"));
+        assert_eq!(get("INPUT_EXTRA_VALUE"), Some("e"));
+    }
+
+    #[test]
+    fn state_comes_from_the_file_and_save_state_lines() {
+        let state = saved_state(
+            "a=1\nb=2\n",
+            "hello\n::save-state name=b::3\n::save-state name=c::4\n",
+        );
+        assert_eq!(
+            state,
+            vec![
+                ("a".to_string(), "1".to_string()),
+                ("b".to_string(), "3".to_string()),
+                ("c".to_string(), "4".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn a_missing_node_is_told_from_a_failing_script() {
+        assert!(node_was_missing(
+            Some(127),
+            "bash: line 1: node: command not found"
+        ));
+        assert!(!node_was_missing(
+            Some(1),
+            "bash: line 1: node: command not found"
+        ));
+        assert!(!node_was_missing(Some(127), "Error: Cannot find module"));
+    }
+
+    #[test]
+    fn posts_run_last_first() {
+        let posts: JobPosts = Arc::default();
+        let post = |name: &str| PostStep {
+            name: name.to_string(),
+            command: String::new(),
+            condition: "always()".to_string(),
+            env: HashMap::new(),
+            _action_dir: None,
+        };
+        posts.lock().unwrap().push(post("first"));
+        posts.lock().unwrap().push(post("second"));
+        let names: Vec<_> = take_posts(&posts).into_iter().map(|p| p.name).collect();
+        assert_eq!(names, ["second", "first"]);
+        assert!(take_posts(&posts).is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_action_is_cloned_once_per_key() {
+        let clones = ActionClones::default();
+        let count = std::sync::atomic::AtomicUsize::new(0);
+        for _ in 0..3 {
+            clones
+                .get_or_clone("o/r@v1", |dir| {
+                    count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    async move { std::fs::create_dir_all(&dir).map_err(|e| e.to_string()) }
+                })
+                .await
+                .unwrap();
+        }
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_sub_path_must_stay_in_the_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("action/sub")).unwrap();
+        assert!(action_dir_in(dir.path(), Some("sub")).is_ok());
+        assert!(action_dir_in(dir.path(), Some("../..")).is_err());
+        assert_eq!(
+            action_dir_in(dir.path(), None).unwrap(),
+            dir.path().join("action")
+        );
+    }
+}

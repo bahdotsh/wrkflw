@@ -1,0 +1,2 @@
+docker/runner.Dockerfile text eol=lf
+docker/runner-image.txt text eol=lf

@@ -109,7 +109,10 @@ mod tests {
     fn the_published_dockerfile_and_tag_are_current() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let dockerfile = crate::engine::runner_base_dockerfile();
-        let committed = std::fs::read_to_string(root.join("docker/runner.Dockerfile")).unwrap();
+        // A Windows checkout may still turn line endings into CRLF.
+        let committed = std::fs::read_to_string(root.join("docker/runner.Dockerfile"))
+            .unwrap()
+            .replace("\r\n", "\n");
         let tag = std::fs::read_to_string(root.join("docker/runner-image.txt")).unwrap();
         assert!(
             committed == dockerfile && tag.trim() == published_image(&dockerfile),

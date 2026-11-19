@@ -211,9 +211,8 @@ pub(crate) struct PostStep {
     /// `main` saved. The post runs with these over the job's env as it is
     /// at the end of the job, as on GitHub.
     pub own_env: HashMap<String, String>,
-    /// The root of the action's repository, mounted in a container: see
-    /// [`with_action_root`].
-    pub action_root: Option<PathBuf>,
+    /// Where the action's repository is: see [`with_action_root`].
+    pub action_root: Option<ActionRoot>,
     /// Holds a cloned action's directory, so it outlives the step that
     /// cloned it until its post has run. Held, never read.
     #[allow(dead_code)]
@@ -223,33 +222,44 @@ pub(crate) struct PostStep {
     pub withdrawn: bool,
 }
 
-tokio::task_local! {
-    /// The root of the repository of the JavaScript action whose script is
-    /// running, set by wrkflw around that script alone.
-    static ACTION_ROOT: Option<PathBuf>;
+/// Where the repository of a JavaScript action is, so a container can see
+/// all of it and a script can reach out of the action's own directory
+/// (`main: ../dist/x.js`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ActionRoot {
+    /// A remote action's clone, whose root a container mounts.
+    Repository(PathBuf),
+    /// The job's workspace, canonical, which holds a local action: a
+    /// container sees it at its workspace path already, so nothing is
+    /// mounted or copied, and a later step's changes there are seen.
+    Workspace(PathBuf),
 }
 
-/// Run `future`, one of a JavaScript action's scripts, so a container
-/// mounts the whole repository at `root` (which holds the action) and a
-/// script can reach out of the action's own directory (`main:
-/// ../dist/x.js`). Carried beside the step rather than in its env, which
-/// the action's `env:` and `$GITHUB_ENV` can write: an action naming its
-/// own root could have any host directory mounted.
+tokio::task_local! {
+    /// Where the repository of the JavaScript action whose script is
+    /// running is, set by wrkflw around that script alone.
+    static ACTION_ROOT: Option<ActionRoot>;
+}
+
+/// Run `future`, one of a JavaScript action's scripts, so a container sees
+/// the whole repository at `root`. Carried beside the step rather than in
+/// its env, which the action's `env:` and `$GITHUB_ENV` can write: an
+/// action naming its own root could have any host directory mounted.
 pub(crate) fn with_action_root<F: std::future::Future>(
-    root: Option<PathBuf>,
+    root: Option<ActionRoot>,
     future: F,
-) -> tokio::task::futures::TaskLocalFuture<Option<PathBuf>, F> {
+) -> tokio::task::futures::TaskLocalFuture<Option<ActionRoot>, F> {
     ACTION_ROOT.scope(root, future)
 }
 
 /// [`with_action_root`] for synchronous code, in tests.
 #[cfg(test)]
-pub(crate) fn sync_with_action_root<T>(root: Option<PathBuf>, f: impl FnOnce() -> T) -> T {
+pub(crate) fn sync_with_action_root<T>(root: Option<ActionRoot>, f: impl FnOnce() -> T) -> T {
     ACTION_ROOT.sync_scope(root, f)
 }
 
 /// The root [`with_action_root`] set for the script running, if any.
-pub(crate) fn action_root() -> Option<PathBuf> {
+pub(crate) fn action_root() -> Option<ActionRoot> {
     ACTION_ROOT.try_with(Clone::clone).ok().flatten()
 }
 

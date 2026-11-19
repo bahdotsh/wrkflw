@@ -7051,20 +7051,23 @@ fn prepare_container_mounts(
     // above. A JavaScript action's script also has its repository's root,
     // which it may reach out of its own directory into (`main:
     // ../dist/x.js`): then the whole repository is mounted, and the action
-    // path points into it. The root comes from wrkflw alone, never from the
-    // env (see `node_actions::with_action_root`).
+    // path points into it. A local action in the job's workspace is already
+    // in the container with it, so nothing is mounted. The root comes from
+    // wrkflw alone, never from the env (see `node_actions::with_action_root`).
     if is_container_runtime {
         if let Some(action_path) = job_env.get("GITHUB_ACTION_PATH") {
             let root = crate::node_actions::action_root();
-            let (host, container) = action_mount(Path::new(action_path), root.as_deref());
+            let (host, container) = action_mount(Path::new(action_path), root.as_ref());
             step_env.insert(
                 "GITHUB_ACTION_PATH".to_string(),
                 container.to_string_lossy().to_string(),
             );
-            owned_volume_paths.push((
-                host,
-                Path::new(crate::job_session::CONTAINER_ACTION_DIR).to_path_buf(),
-            ));
+            if let Some(host) = host {
+                owned_volume_paths.push((
+                    host,
+                    Path::new(crate::job_session::CONTAINER_ACTION_DIR).to_path_buf(),
+                ));
+            }
         }
     }
 
@@ -7072,30 +7075,47 @@ fn prepare_container_mounts(
 }
 
 /// What to mount at [`crate::job_session::CONTAINER_ACTION_DIR`] for the
-/// action at `action_path`, and where the action is in the container: its
-/// repository's `root` when the action is inside it, else its own directory.
-fn action_mount(action_path: &Path, root: Option<&Path>) -> (PathBuf, PathBuf) {
-    let container_dir = Path::new(crate::job_session::CONTAINER_ACTION_DIR);
-    match root.and_then(|root| {
-        action_path
-            .strip_prefix(root)
-            .ok()
-            .map(|inside| (root, inside))
-    }) {
-        // Joined with `/` whatever the host: the path is the container's,
-        // and on Windows `Path::join` would put a backslash in it.
-        Some((root, inside)) => {
-            let mut container = crate::job_session::CONTAINER_ACTION_DIR.to_string();
-            for part in inside.components() {
-                if let std::path::Component::Normal(part) = part {
-                    container.push('/');
-                    container.push_str(&part.to_string_lossy());
-                }
+/// action at `action_path`, if anything, and where the action is in the
+/// container: under the job's workspace for an action in it, with nothing
+/// mounted; inside its repository's root when the action is in that clone;
+/// else its own directory.
+fn action_mount(
+    action_path: &Path,
+    root: Option<&crate::node_actions::ActionRoot>,
+) -> (Option<PathBuf>, PathBuf) {
+    use crate::node_actions::ActionRoot;
+    // Joined with `/` whatever the host: the path is the container's, and
+    // on Windows `Path::join` would put a backslash in it.
+    let inside = |base: &str, inside: &Path| {
+        let mut container = base.to_string();
+        for part in inside.components() {
+            if let std::path::Component::Normal(part) = part {
+                container.push('/');
+                container.push_str(&part.to_string_lossy());
             }
-            (root.to_path_buf(), PathBuf::from(container))
         }
-        None => (action_path.to_path_buf(), container_dir.to_path_buf()),
+        PathBuf::from(container)
+    };
+    match root {
+        Some(ActionRoot::Workspace(workspace)) => {
+            if let Ok(rel) = action_path.strip_prefix(workspace) {
+                return (None, inside(environment::CONTAINER_WORKSPACE, rel));
+            }
+        }
+        Some(ActionRoot::Repository(root)) => {
+            if let Ok(rel) = action_path.strip_prefix(root) {
+                return (
+                    Some(root.clone()),
+                    inside(crate::job_session::CONTAINER_ACTION_DIR, rel),
+                );
+            }
+        }
+        None => {}
     }
+    (
+        Some(action_path.to_path_buf()),
+        PathBuf::from(crate::job_session::CONTAINER_ACTION_DIR),
+    )
 }
 
 /// Log warnings for container fields that are parsed but not yet supported.
@@ -8076,29 +8096,30 @@ async fn run_node_script(
     name: String,
     script: &str,
     node_major: u32,
-    root: Option<&Path>,
+    root: Option<&crate::node_actions::ActionRoot>,
 ) -> Result<StepResult, ExecutionError> {
     let step = crate::node_actions::script_step(
         name,
         crate::node_actions::node_command(script, node_major),
     );
     Box::pin(crate::node_actions::with_action_root(
-        root.map(Path::to_path_buf),
+        root.cloned(),
         execute_step(ctx.with_step(&step, env, user_env)),
     ))
     .await
 }
 
 /// The root of the repository the local action at `dir` is in: the job's
-/// workspace it was read from. `None` when it was read from the directory
-/// wrkflw runs in (see [`local_action_path`]), so a container mounts the
-/// action's own directory and not the user's repository, `.git` and all,
-/// read-write.
-fn local_action_root(dir: &Path, workspace: &Path) -> Option<PathBuf> {
+/// workspace it was read from, which a container already has. `None` when
+/// it was read from the directory wrkflw runs in (see
+/// [`local_action_path`]), so a container mounts the action's own
+/// directory and not the user's repository, `.git` and all, read-write.
+fn local_action_root(dir: &Path, workspace: &Path) -> Option<crate::node_actions::ActionRoot> {
     workspace
         .canonicalize()
         .ok()
         .filter(|base| dir.starts_with(base))
+        .map(crate::node_actions::ActionRoot::Workspace)
 }
 
 /// Whether the step whose env is `env` runs on this machine: under
@@ -8180,7 +8201,11 @@ async fn execute_node_action(
         let clone = action_for_step(action_info, ctx.services.clone_token()).await?;
         let (dir, root) = js::action_dir_in(clone.path(), action_info.sub_path.as_deref())
             .map_err(ExecutionError::Execution)?;
-        (dir, Some(root), Some(clone))
+        (
+            dir,
+            Some(crate::node_actions::ActionRoot::Repository(root)),
+            Some(clone),
+        )
     };
     if !action_info.is_local && runs_on_host(step_env) && acceleration::first_host_action_warning()
     {
@@ -8295,7 +8320,7 @@ async fn execute_node_action(
                 format!("Pre {}", step_name),
                 pre,
                 runs.node_major,
-                repo_root.as_deref(),
+                repo_root.as_ref(),
             )
             .await?;
             if let Some(cause) = js::missing_program(result.exit_code, &result.output) {
@@ -8325,7 +8350,7 @@ async fn execute_node_action(
         step_name.to_string(),
         &runs.main,
         runs.node_major,
-        repo_root.as_deref(),
+        repo_root.as_ref(),
     )
     .await?;
     if let Some(cause) = js::missing_program(main.exit_code, &main.output) {
@@ -9358,7 +9383,9 @@ mod tests {
         let action = action.canonicalize().unwrap();
         assert_eq!(
             local_action_root(&action, workspace.path()),
-            Some(workspace.path().canonicalize().unwrap())
+            Some(crate::node_actions::ActionRoot::Workspace(
+                workspace.path().canonicalize().unwrap()
+            ))
         );
         let elsewhere = tempfile::tempdir().unwrap();
         assert_eq!(
@@ -10498,11 +10525,18 @@ mod tests {
         // Without a root, or on the host, as before.
         assert_eq!(
             action_mount(Path::new("/l/act"), None),
-            (PathBuf::from("/l/act"), PathBuf::from("/github/action"))
+            (
+                Some(PathBuf::from("/l/act")),
+                PathBuf::from("/github/action")
+            )
         );
+        let elsewhere = crate::node_actions::ActionRoot::Repository("/elsewhere".into());
         assert_eq!(
-            action_mount(Path::new("/l/act"), Some(Path::new("/elsewhere"))),
-            (PathBuf::from("/l/act"), PathBuf::from("/github/action"))
+            action_mount(Path::new("/l/act"), Some(&elsewhere)),
+            (
+                Some(PathBuf::from("/l/act")),
+                PathBuf::from("/github/action")
+            )
         );
         let mut host_env = HashMap::new();
         assert!(mounts(Some("/c"), &mut host_env).is_empty());
@@ -10510,7 +10544,34 @@ mod tests {
 
     /// Run `f` as a JavaScript action's script whose repository is `root`.
     fn tokio_test_root<T>(root: Option<&str>, f: impl FnOnce() -> T) -> T {
-        crate::node_actions::sync_with_action_root(root.map(PathBuf::from), f)
+        crate::node_actions::sync_with_action_root(
+            root.map(|r| crate::node_actions::ActionRoot::Repository(PathBuf::from(r))),
+            f,
+        )
+    }
+
+    /// A local action in the job's workspace is addressed where the
+    /// container already has the workspace: nothing is mounted or copied,
+    /// so a step that rebuilt it is seen by the next use of it.
+    #[test]
+    fn a_workspace_action_is_found_in_the_containers_workspace() {
+        let job_env = HashMap::from([
+            ("WRKFLW_RUNTIME_MODE".to_string(), "docker".to_string()),
+            (
+                "GITHUB_ACTION_PATH".to_string(),
+                "/w/ws/.github/actions/js".to_string(),
+            ),
+        ]);
+        let mut step_env = job_env.clone();
+        let mounts = crate::node_actions::sync_with_action_root(
+            Some(crate::node_actions::ActionRoot::Workspace("/w/ws".into())),
+            || prepare_container_mounts(&mut step_env, &job_env, None, false).0,
+        );
+        assert!(mounts.is_empty(), "{mounts:?}");
+        assert_eq!(
+            step_env["GITHUB_ACTION_PATH"],
+            format!("{}/.github/actions/js", environment::CONTAINER_WORKSPACE)
+        );
     }
 
     #[test]

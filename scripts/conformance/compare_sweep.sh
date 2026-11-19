@@ -95,8 +95,8 @@ while read -r repo run extra <&3; do
   log="$SWEEP_DIR/logs/$name-$run"
   sha="" github_s="-"
   for attempt in 1 2 3; do
-    # The commit, and how long the run took on GitHub, from its first
-    # attempt's start to its last update.
+    # The commit, and how long the run took on GitHub, from the start of
+    # its latest attempt to its last update.
     if run_info=$(gh api "repos/$repo/actions/runs/$run" \
         --jq '[.head_sha, ((.updated_at | fromdate) - (.run_started_at | fromdate))] | @tsv' \
         2>/dev/null); then

@@ -5152,6 +5152,20 @@ fn resolve_working_directory(
     Ok(workspace_relative_input(&resolved, ctx.job_env))
 }
 
+/// Where the local action `reference` (`./path`) is. As on GitHub, that is
+/// the job's workspace, where an earlier step may have built the action, as
+/// an action's own repository does with `npm run build` before `uses: ./`.
+/// A job that put no action there, such as one with no checkout, gets the
+/// repository wrkflw runs from.
+fn local_action_path(reference: &str, working_dir: &Path) -> String {
+    let in_workspace = working_dir.join(reference);
+    if in_workspace.join("action.yml").is_file() || in_workspace.join("action.yaml").is_file() {
+        in_workspace.to_string_lossy().into_owned()
+    } else {
+        reference.to_string()
+    }
+}
+
 /// Make a path input relative to the workspace, so it means the same place
 /// wherever it is used. Steps and the actions wrkflw handles itself both work
 /// in the job directory, while `github.workspace` is `/github/workspace` under
@@ -5595,7 +5609,10 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
     // Execute the step based on its type
     let step_result = if let Some(uses) = &ctx.step.uses {
         // Action step
-        let action_info = ctx.workflow.resolve_action(uses);
+        let mut action_info = ctx.workflow.resolve_action(uses);
+        if action_info.is_local {
+            action_info.repository = local_action_path(&action_info.repository, ctx.working_dir);
+        }
 
         // Check if this is the checkout action
         if uses.starts_with("actions/checkout") {
@@ -5806,8 +5823,7 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                     let mut owned_strings: Vec<String> = Vec::new(); // Keep strings alive until after we use cmd
 
                     // Special handling for Rust actions
-                    if uses.starts_with("actions-rs/") || uses.starts_with("dtolnay/rust-toolchain")
-                    {
+                    if is_rust_action(&action_info.repository) {
                         wrkflw_logging::info(
                             "🔄 Detected Rust action - using system Rust installation",
                         );
@@ -7748,8 +7764,10 @@ struct PostContext<'a> {
 }
 
 /// Run the posts of a job's JavaScript actions, `first_index` on in the
-/// job's step numbering, unless the job ran out of time by `deadline`.
-/// True when one failed, which fails the job.
+/// job's step numbering, each with the job's env as it is then and what
+/// its action's step had over it. They share the job's time: a post still
+/// running at `deadline` fails, and the posts after it don't run. True
+/// when one failed or ran out of time, which fails the job.
 #[allow(clippy::too_many_arguments)]
 async fn run_job_posts(
     posts: Vec<crate::node_actions::PostStep>,
@@ -7763,49 +7781,70 @@ async fn run_job_posts(
     if posts.is_empty() {
         return Ok(false);
     }
-    if tokio::time::Instant::now() >= deadline {
-        wrkflw_logging::warning(&format!(
-            "{} post step(s) didn't run: the job ran out of time",
-            posts.len()
-        ));
-        return Ok(false);
-    }
     let mut failed = false;
     for (k, post) in posts.iter().enumerate() {
         let post_step = crate::node_actions::post_as_step(post);
         let idx = first_index + k;
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            wrkflw_logging::warning(&format!(
+                "{} post step(s) didn't run: the job ran out of time",
+                posts.len() - k
+            ));
+            failed = true;
+            break;
+        }
         loop_state.begin_step(idx, &post_step);
+        // The job's env as it is now, with what the action's step had.
+        let mut post_env = job_env.clone();
+        post_env.extend(post.own_env.iter().map(|(k, v)| (k.clone(), v.clone())));
         let post_user_env = job_user_env.clone();
-        let outcome = loop_state
-            .live_step(idx, &post_step, pc.services.secret_masker)
-            .run(Box::pin(run_step_with_guards(
-                &post_step,
-                idx,
-                &post.env,
-                pc.workflow,
-                StepExecutionContext {
-                    step: &post_step,
-                    step_idx: idx,
-                    job_env: &post.env,
-                    job_user_env: &post_user_env,
-                    working_dir: pc.working_dir,
-                    runtime: pc.runtime,
-                    workflow: pc.workflow,
-                    runner_image: pc.runner_image,
-                    installed_runtimes: pc.installed_runtimes,
-                    verbose: pc.verbose,
-                    matrix_combination: pc.matrix_combination,
-                    container_config: pc.container_config,
-                    workflow_defaults: pc.workflow_defaults,
-                    job_defaults: pc.job_defaults,
-                    step_outputs: &loop_state.step_outputs_map,
-                    step_statuses: &loop_state.step_status_map,
-                    job_status: &loop_state.job_status_str,
-                    services: pc.services,
-                    pending_cache_saves: pc.pending_cache_saves,
-                },
-            )))
-            .await?;
+        let ran = tokio::time::timeout(
+            remaining,
+            loop_state
+                .live_step(idx, &post_step, pc.services.secret_masker)
+                .run(Box::pin(run_step_with_guards(
+                    &post_step,
+                    idx,
+                    &post_env,
+                    pc.workflow,
+                    StepExecutionContext {
+                        step: &post_step,
+                        step_idx: idx,
+                        job_env: &post_env,
+                        job_user_env: &post_user_env,
+                        working_dir: pc.working_dir,
+                        runtime: pc.runtime,
+                        workflow: pc.workflow,
+                        runner_image: pc.runner_image,
+                        installed_runtimes: pc.installed_runtimes,
+                        verbose: pc.verbose,
+                        matrix_combination: pc.matrix_combination,
+                        container_config: pc.container_config,
+                        workflow_defaults: pc.workflow_defaults,
+                        job_defaults: pc.job_defaults,
+                        step_outputs: &loop_state.step_outputs_map,
+                        step_statuses: &loop_state.step_status_map,
+                        job_status: &loop_state.job_status_str,
+                        services: pc.services,
+                        pending_cache_saves: pc.pending_cache_saves,
+                    },
+                ))),
+        )
+        .await;
+        let outcome = match ran {
+            Ok(outcome) => outcome?,
+            Err(_) => {
+                copy_back_after_timeout(pc.working_dir).await;
+                loop_state.fail_step_on_timeout(
+                    &post_step,
+                    idx,
+                    format!("'{}' ran out of the job's time", post.name),
+                );
+                failed = true;
+                break;
+            }
+        };
         if loop_state.process_outcome(
             outcome,
             &post_step,
@@ -7820,16 +7859,20 @@ async fn run_job_posts(
     Ok(failed)
 }
 
+/// Whether `repository` is a Rust action wrkflw stands in for with the
+/// image's Rust: `dtolnay/rust-toolchain` and every `actions-rs/` action.
+fn is_rust_action(repository: &str) -> bool {
+    repository.starts_with("actions-rs/") || repository == "dtolnay/rust-toolchain"
+}
+
 /// Whether wrkflw runs something of its own for the JavaScript action from
 /// `repository`, so the action itself mustn't run: a setup action, whose
-/// runtime goes in the job's image, and the Rust toolchain actions, which
-/// use the image's Rust.
+/// runtime goes in the job's image, and the Rust actions.
 fn has_stand_in(repository: &str) -> bool {
-    crate::setup_actions::SETUP_ACTIONS
+    SETUP_ACTIONS
         .iter()
         .any(|def| def.repos.contains(&repository))
-        || repository.starts_with("actions-rs/")
-        || repository.starts_with("dtolnay/rust-toolchain")
+        || is_rust_action(repository)
 }
 
 impl<'a> StepExecutionContext<'a> {
@@ -7876,8 +7919,7 @@ async fn run_node_script(
     name: String,
     script: &str,
 ) -> Result<StepResult, ExecutionError> {
-    let mut step = workflow::Step::with_run(name, crate::node_actions::node_command(script));
-    step.shell = Some("bash".to_string());
+    let step = crate::node_actions::script_step(name, crate::node_actions::node_command(script));
     Box::pin(execute_step(ctx.with_step(&step, env, user_env))).await
 }
 
@@ -7964,9 +8006,9 @@ async fn execute_node_action(
         );
     }
 
-    let not_run = |output: String| {
+    let not_run = |output: String, cause: &str| {
         StepResult::new(step_name.to_string(), StepStatus::Success, output)
-            .without_running(report_action_not_run(uses, Some(js::NO_NODE)))
+            .without_running(report_action_not_run(uses, Some(cause)))
     };
 
     let mut output = String::new();
@@ -7977,8 +8019,8 @@ async fn execute_node_action(
             let result =
                 run_node_script(ctx, &env, step_user_env, format!("Pre {}", step_name), pre)
                     .await?;
-            if js::node_was_missing(result.exit_code, &result.output) {
-                return Ok(not_run(result.output));
+            if let Some(cause) = js::missing_program(result.exit_code, &result.output) {
+                return Ok(not_run(result.output, cause));
             }
             output.push_str(&result.output);
             if result.status == StepStatus::Failure {
@@ -7993,24 +8035,29 @@ async fn execute_node_action(
 
     clear_state();
     let main = run_node_script(ctx, &env, step_user_env, step_name.to_string(), &runs.main).await?;
-    if js::node_was_missing(main.exit_code, &main.output) {
-        return Ok(not_run(main.output));
+    if let Some(cause) = js::missing_program(main.exit_code, &main.output) {
+        return Ok(not_run(main.output, cause));
     }
-    if runs.node_major > 22 {
-        wrkflw_logging::debug(&format!(
-            "{} asks for node{}; it ran with the job's node",
-            uses, runs.node_major
-        ));
-    }
+    wrkflw_logging::debug(&format!(
+        "{} asks for node{}; it ran with the job image's node",
+        uses, runs.node_major
+    ));
 
     if let Some(post) = &runs.post {
         let saved = state_file
             .as_ref()
             .and_then(|path| fs::read_to_string(path).ok())
             .unwrap_or_default();
-        let mut post_env = env.clone();
+        // What the step has beyond the job's env: its own `env:`, the
+        // action's inputs and paths, and what `main` saved. The post runs
+        // with these over the job's env as it is at the end of the job.
+        let mut own_env: HashMap<String, String> = env
+            .iter()
+            .filter(|(k, v)| ctx.job_env.get(*k) != Some(*v))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
         for (name, value) in js::saved_state(&saved, &main.output) {
-            post_env.insert(js::state_env_name(&name), value);
+            own_env.insert(js::state_env_name(&name), value);
         }
         js::queue_post(js::PostStep {
             name: format!("Post {}", step_name),
@@ -8019,8 +8066,8 @@ async fn execute_node_action(
                 .post_if
                 .clone()
                 .unwrap_or_else(|| "always()".to_string()),
-            env: post_env,
-            _action_dir: clone.clone(),
+            own_env,
+            keep_action: clone.clone(),
         });
     }
     clear_state();
@@ -8938,6 +8985,39 @@ mod tests {
         );
         assert!(base.starts_with(&local), "{base}");
         assert!(base.ends_with(&format!("RUN {}\n", GH_CLI_INSTALL)));
+    }
+
+    #[test]
+    fn a_local_action_is_read_from_the_workspace_when_it_is_there() {
+        let workspace = tempfile::tempdir().unwrap();
+        let in_workspace = workspace.path().join("./.github/actions/js");
+        assert_eq!(
+            local_action_path("./.github/actions/js", workspace.path()),
+            "./.github/actions/js",
+            "no action in the workspace: the repository's"
+        );
+        std::fs::create_dir_all(&in_workspace).unwrap();
+        std::fs::write(in_workspace.join("action.yaml"), "name: x\n").unwrap();
+        assert_eq!(
+            local_action_path("./.github/actions/js", workspace.path()),
+            in_workspace.to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn the_rust_actions_and_setup_actions_have_stand_ins() {
+        assert!(has_stand_in("actions/setup-node"));
+        assert!(has_stand_in("dtolnay/rust-toolchain"));
+        assert!(has_stand_in("actions-rs/cargo"));
+        assert!(!has_stand_in("dtolnay/rust-toolchain-fork"));
+        assert!(!has_stand_in("actions/github-script"));
+    }
+
+    #[test]
+    fn a_javascript_action_starts_in_the_workspace() {
+        let step = crate::node_actions::script_step("JS".into(), "node x".into());
+        assert_eq!(step.working_directory.as_deref(), Some("."));
+        assert_eq!(step.shell.as_deref(), Some("bash"));
     }
 
     #[test]
@@ -10817,6 +10897,8 @@ runs:
         fail_builds: bool,
         /// The CLI a job session would use, as Docker's or Podman's.
         session_cli: Option<&'static str>,
+        /// How long each container takes to run, as a slow step's does.
+        delay: Option<std::time::Duration>,
     }
 
     #[derive(Debug, Clone)]
@@ -10871,6 +10953,9 @@ runs:
                 working_dir: working_dir.to_path_buf(),
                 script,
             });
+            if let Some(delay) = self.delay {
+                tokio::time::sleep(delay).await;
+            }
             Ok(ContainerOutput {
                 stdout: "mock ok".to_string(),
                 stderr: String::new(),
@@ -11292,6 +11377,112 @@ runs:
             pending_cache_saves: &TEST_PENDING_CACHE_SAVES,
         };
         execute_step(ctx).await.unwrap()
+    }
+
+    /// Run `posts` through [`run_job_posts`] on `runtime` with `deadline`,
+    /// as the end of a job on a container runtime whose env is `job_env`.
+    async fn run_posts_on(
+        runtime: &MockContainerRuntime,
+        posts: Vec<crate::node_actions::PostStep>,
+        deadline: tokio::time::Instant,
+        job_env: &mut HashMap<String, String>,
+    ) -> (bool, StepLoopState) {
+        let workflow = minimal_workflow();
+        job_env.insert(
+            "WRKFLW_RUNTIME_MODE".to_string(),
+            RuntimeType::Docker.mode_name().to_string(),
+        );
+        let mut job_user_env = HashMap::new();
+        let working_dir = tempfile::tempdir().unwrap();
+        let mut loop_state = StepLoopState::new("job", "job");
+        let failed = run_job_posts(
+            posts,
+            deadline,
+            1,
+            &mut loop_state,
+            job_env,
+            &mut job_user_env,
+            PostContext {
+                working_dir: working_dir.path(),
+                runtime,
+                workflow: &workflow,
+                runner_image: "ubuntu:latest",
+                installed_runtimes: &BuiltRuntimes::default(),
+                verbose: false,
+                matrix_combination: &None,
+                container_config: None,
+                workflow_defaults: None,
+                job_defaults: None,
+                services: test_services(),
+                pending_cache_saves: &TEST_PENDING_CACHE_SAVES,
+            },
+        )
+        .await
+        .unwrap();
+        (failed, loop_state)
+    }
+
+    fn test_post(name: &str, own_env: &[(&str, &str)]) -> crate::node_actions::PostStep {
+        crate::node_actions::PostStep {
+            name: name.to_string(),
+            command: "node post.js".to_string(),
+            condition: "always()".to_string(),
+            own_env: own_env
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            keep_action: None,
+        }
+    }
+
+    /// A post still running when the job's time is up fails the job, and
+    /// the run doesn't wait for it, nor run the posts after it.
+    #[tokio::test]
+    async fn a_post_past_the_jobs_deadline_fails_without_waiting_for_it() {
+        let runtime = MockContainerRuntime {
+            delay: Some(std::time::Duration::from_secs(30)),
+            ..MockContainerRuntime::default()
+        };
+        let started = std::time::Instant::now();
+        let (failed, loop_state) = run_posts_on(
+            &runtime,
+            vec![test_post("Post A", &[]), test_post("Post B", &[])],
+            tokio::time::Instant::now() + std::time::Duration::from_millis(300),
+            &mut HashMap::new(),
+        )
+        .await;
+        assert!(failed);
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        assert_eq!(loop_state.step_results.len(), 1, "Post B ran");
+        assert_eq!(loop_state.step_results[0].status, StepStatus::Failure);
+    }
+
+    /// A post runs with the job's env as it is at the end of the job, with
+    /// what its action's step had over it.
+    #[tokio::test]
+    async fn a_post_sees_the_end_of_job_env_under_its_steps_own() {
+        let runtime = MockContainerRuntime::default();
+        let mut job_env = HashMap::from([
+            ("LATE".to_string(), "yes".to_string()),
+            ("SHARED".to_string(), "job".to_string()),
+        ]);
+        let (failed, _) = run_posts_on(
+            &runtime,
+            vec![test_post(
+                "Post A",
+                &[("SHARED", "step"), ("STATE_saved", "from-main")],
+            )],
+            tokio::time::Instant::now() + std::time::Duration::from_secs(60),
+            &mut job_env,
+        )
+        .await;
+        assert!(!failed);
+        let calls = runtime.run_calls.lock().unwrap();
+        let env = &calls.last().expect("the post didn't run").env_vars;
+        let get = |k: &str| env.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+        assert_eq!(get("LATE"), Some("yes"));
+        assert_eq!(get("SHARED"), Some("step"));
+        assert_eq!(get("STATE_saved"), Some("from-main"));
     }
 
     #[tokio::test]

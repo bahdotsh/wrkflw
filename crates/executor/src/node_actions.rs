@@ -1,8 +1,9 @@
 //! JavaScript actions (`runs.using: node<N>`), run as GitHub's runner runs
 //! them: `node <main>` in the job's container, from the action's own
-//! directory, with its inputs as `INPUT_<NAME>`, its `pre` before and its
-//! `post` at the end of the job, which reads what `main` saved with
-//! `$GITHUB_STATE` or `::save-state` as `STATE_<name>`.
+//! directory, with its inputs as `INPUT_<NAME>`, its `pre` right before
+//! `main` (GitHub runs it at the start of the job) and its `post` at the
+//! end of the job, which reads what `main` saved with `$GITHUB_STATE` or
+//! `::save-state` as `STATE_<name>`.
 //!
 //! The engine glue is in `engine.rs` (`execute_node_action` and the post
 //! loops); this module holds what that needs and can be tested alone.
@@ -130,12 +131,28 @@ pub(crate) fn node_command(script: &str) -> String {
     )
 }
 
-/// Whether a phase's exit code says there was no `node` to run it.
-pub(crate) fn node_was_missing(exit_code: Option<i32>, output: &str) -> bool {
-    exit_code == Some(127)
+/// Why a JavaScript action didn't run when the image had no `bash` to
+/// start `node` with.
+pub(crate) const NO_BASH: &str =
+    "the job's image has no `bash` to start this JavaScript action's `node` with";
+
+/// Why a phase that exited with `exit_code` and printed `output` couldn't
+/// start: no `node`, or no `bash` to run it with. `None` when it ran.
+pub(crate) fn missing_program(exit_code: Option<i32>, output: &str) -> Option<&'static str> {
+    if !matches!(exit_code, Some(126 | 127)) {
+        return None;
+    }
+    if output.contains("\"bash\": executable file not found")
+        || output.contains("exec: bash: not found")
+        || output.contains("bash: no such file or directory")
+    {
+        return Some(NO_BASH);
+    }
+    (exit_code == Some(127)
         && (output.contains("node: command not found")
             || output.contains("node: not found")
-            || output.contains("\"node\": executable file not found"))
+            || output.contains("\"node\": executable file not found")))
+    .then_some(NO_NODE)
 }
 
 /// What an action saved for its `post`: `$GITHUB_STATE`'s entries, then
@@ -164,10 +181,15 @@ pub(crate) struct PostStep {
     pub command: String,
     /// `post-if`, `always()` when the action gives none.
     pub condition: String,
-    /// What the step had for `main`, with its `STATE_*`.
-    pub env: HashMap<String, String>,
-    /// Keeps a cloned action's directory until its post has run.
-    pub _action_dir: Option<Arc<tempfile::TempDir>>,
+    /// What the action's step had beyond the job's env when `main` ran
+    /// (its `env:`, the action's inputs and paths) and the `STATE_*` that
+    /// `main` saved. The post runs with these over the job's env as it is
+    /// at the end of the job, as on GitHub.
+    pub own_env: HashMap<String, String>,
+    /// Holds a cloned action's directory, so it outlives the step that
+    /// cloned it until its post has run. Held, never read.
+    #[allow(dead_code)]
+    pub keep_action: Option<Arc<tempfile::TempDir>>,
 }
 
 /// The posts of the job running, in the order their actions ran.
@@ -213,10 +235,20 @@ pub(crate) fn take_posts(posts: &JobPosts) -> Vec<PostStep> {
     taken
 }
 
-/// The posts of a job as a `workflow::Step` and the env it runs with.
-pub(crate) fn post_as_step(post: &PostStep) -> wrkflw_parser::workflow::Step {
-    let mut step = wrkflw_parser::workflow::Step::with_run(post.name.clone(), post.command.clone());
+/// The `run:` step that runs one of an action's scripts. It names the
+/// workspace as its working directory, so a `defaults.run.working-directory`
+/// doesn't move it: on GitHub those defaults are for `run:` steps, and an
+/// action starts in `$GITHUB_WORKSPACE`.
+pub(crate) fn script_step(name: String, command: String) -> wrkflw_parser::workflow::Step {
+    let mut step = wrkflw_parser::workflow::Step::with_run(name, command);
     step.shell = Some("bash".to_string());
+    step.working_directory = Some(".".to_string());
+    step
+}
+
+/// A post as the `workflow::Step` that runs it.
+pub(crate) fn post_as_step(post: &PostStep) -> wrkflw_parser::workflow::Step {
+    let mut step = script_step(post.name.clone(), post.command.clone());
     step.if_condition = Some(post.condition.clone());
     step
 }
@@ -337,16 +369,27 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_node_is_told_from_a_failing_script() {
-        assert!(node_was_missing(
-            Some(127),
-            "bash: line 1: node: command not found"
-        ));
-        assert!(!node_was_missing(
-            Some(1),
-            "bash: line 1: node: command not found"
-        ));
-        assert!(!node_was_missing(Some(127), "Error: Cannot find module"));
+    fn a_missing_node_or_bash_is_told_from_a_failing_script() {
+        assert_eq!(
+            missing_program(Some(127), "bash: line 1: node: command not found"),
+            Some(NO_NODE)
+        );
+        assert_eq!(
+            missing_program(Some(1), "bash: line 1: node: command not found"),
+            None
+        );
+        assert_eq!(
+            missing_program(Some(127), "Error: Cannot find module"),
+            None
+        );
+        assert_eq!(
+            missing_program(
+                Some(127),
+                "OCI runtime exec failed: exec failed: unable to start container process: \
+                 exec: \"bash\": executable file not found in $PATH"
+            ),
+            Some(NO_BASH)
+        );
     }
 
     #[test]
@@ -356,8 +399,8 @@ mod tests {
             name: name.to_string(),
             command: String::new(),
             condition: "always()".to_string(),
-            env: HashMap::new(),
-            _action_dir: None,
+            own_env: HashMap::new(),
+            keep_action: None,
         };
         posts.lock().unwrap().push(post("first"));
         posts.lock().unwrap().push(post("second"));

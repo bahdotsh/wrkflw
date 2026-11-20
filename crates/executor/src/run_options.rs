@@ -127,8 +127,6 @@ async fn gh_auth_token() -> Option<String> {
         .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-/// [`job_github_token`] with `var` reading an environment variable and
-/// `gh` asking the GitHub CLI for its token.
 /// Where a run would find this machine's GitHub token, for `wrkflw doctor`:
 /// `GITHUB_TOKEN`, `GH_TOKEN` or `gh auth token`. Never the token itself.
 pub async fn github_token_source() -> Option<&'static str> {
@@ -143,6 +141,8 @@ pub async fn github_token_source() -> Option<&'static str> {
         .map(|_| "gh auth token")
 }
 
+/// [`job_github_token`] with `var` reading an environment variable and
+/// `gh` asking the GitHub CLI for its token.
 fn job_github_token_from(
     var: impl Fn(&str) -> Option<String>,
     gh: impl FnOnce() -> Option<String>,

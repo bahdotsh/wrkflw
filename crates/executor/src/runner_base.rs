@@ -47,11 +47,7 @@ pub(crate) fn image() -> Option<String> {
     if cfg!(test) || !enabled() {
         return None;
     }
-    let image = std::env::var(RUNNER_IMAGE_ENV)
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| published_image(&crate::engine::runner_base_dockerfile()));
+    let image = configured_image();
     (!recently_unavailable(&image, SystemTime::now())).then_some(image)
 }
 
@@ -71,16 +67,21 @@ pub fn status() -> BaseImage {
     if !enabled() {
         return BaseImage::Disabled;
     }
-    let image = std::env::var(RUNNER_IMAGE_ENV)
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| published_image(&crate::engine::runner_base_dockerfile()));
+    let image = configured_image();
     if recently_unavailable(&image, SystemTime::now()) {
         BaseImage::RecentlyUnavailable(image)
     } else {
         BaseImage::Used(image)
     }
+}
+
+/// The base named with [`RUNNER_IMAGE_ENV`], else the published one.
+fn configured_image() -> String {
+    std::env::var(RUNNER_IMAGE_ENV)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| published_image(&crate::engine::runner_base_dockerfile()))
 }
 
 fn enabled() -> bool {

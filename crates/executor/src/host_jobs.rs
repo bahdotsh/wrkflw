@@ -78,6 +78,15 @@ pub(crate) async fn scope<F: Future>(host: Option<Arc<HostJobs>>, future: F) -> 
     }
 }
 
+/// Whether some leg of `job` may run on the host: it has a matrix and this
+/// run runs `macos-*` jobs there. Its result then can't stand in for, or
+/// be stood in for by, a run with every leg in a container. Judged before
+/// the legs are known, so a matrix with no macOS leg counts too; that
+/// costs only reuse, and only under `--macos-on-host`.
+pub(crate) fn legs_may_run_on_host(job: &Job) -> bool {
+    job.matrix_config().is_some() && HOST_JOBS.try_with(|_| ()).is_ok()
+}
+
 /// What `job`, or its leg with `matrix`, runs with when it runs on the
 /// host: when this run asked for that and the job asks for macOS. A job
 /// with `container:` or a label mapped with `--platform` keeps the run's
@@ -171,6 +180,18 @@ mod tests {
             assert!(for_job(&boxed, None, &none).is_none());
             let mapped = HashMap::from([("macos-latest".to_string(), "img".to_string())]);
             assert!(for_job(&mac, None, &mapped).is_none());
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn only_a_matrix_job_under_the_flag_may_have_legs_on_the_host() {
+        let matrix = job("runs-on: ${{ matrix.os }}\nstrategy:\n  matrix:\n    os: [ubuntu-latest, macos-15]\nsteps: []\n");
+        let plain = job("runs-on: macos-latest\nsteps: []\n");
+        assert!(!legs_may_run_on_host(&matrix), "not asked for");
+        scope(Some(Arc::new(host())), async {
+            assert!(legs_may_run_on_host(&matrix));
+            assert!(!legs_may_run_on_host(&plain), "judged by its own env");
         })
         .await;
     }

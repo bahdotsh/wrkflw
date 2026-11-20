@@ -3629,7 +3629,8 @@ async fn execute_job_with_matrix(
         .await;
         let results = results?;
         let key = result_key.as_deref().filter(|_| !fell_back_to_root);
-        store_passing_result(key, &results, env_context).await;
+        let on_host = runs_on_host(env_context) || crate::host_jobs::legs_may_run_on_host(job);
+        store_passing_result(key, &results, on_host).await;
         Ok(results)
     } else {
         // Regular job, no matrix
@@ -3673,7 +3674,7 @@ async fn execute_job_with_matrix(
         // A pass whose steps ran as root where they were to run as the
         // runner user isn't what its key says: see `noting_root_fallback`.
         let key = result_key.as_deref().filter(|_| !fell_back_to_root);
-        store_passing_result(key, &results, env_context).await;
+        store_passing_result(key, &results, runs_on_host(env_context)).await;
         Ok(results)
     }
 }
@@ -3715,16 +3716,12 @@ fn announce_reused(
 }
 
 /// File `results` under `key` if every job and matrix leg passed.
-async fn store_passing_result(
-    key: Option<&str>,
-    results: &[JobResult],
-    env_context: &HashMap<String, String>,
-) {
+async fn store_passing_result(key: Option<&str>, results: &[JobResult], on_host: bool) {
     let Some(key) = key else { return };
     if results.is_empty() || results.iter().any(|r| r.status != JobStatus::Success) {
         return;
     }
-    acceleration::store(key, stored_jobs(results), env_context).await;
+    acceleration::store(key, stored_jobs(results), on_host).await;
 }
 
 /// What a passing run keeps for reuse: names, outputs, and the steps that

@@ -499,6 +499,12 @@ fn job_key_with(
     if every_matrix_leg && lookup.job.matrix_config().is_some() {
         document["every_matrix_leg"] = serde_json::json!(true);
     }
+    // A matrix whose macOS legs run on this Mac (`--macos-on-host`) passed
+    // on other ground than one whose legs all ran in containers. Only that
+    // mode changes the key. A job without a matrix differs by `runtime`.
+    if crate::host_jobs::legs_may_run_on_host(lookup.job) {
+        document["macos_on_host"] = serde_json::json!(true);
+    }
     // A pass with a container per step can rest on each step starting from
     // a clean image, so it can't stand in for a run whose steps share one,
     // or the other way round. Version 3 keys were all of the former.
@@ -1158,13 +1164,11 @@ pub(crate) fn mark_executed(job_name: &str) {
 }
 
 /// Store a passing result under the key `decide` returned. A job that ran on
-/// the host passed with that host's tools, so its result stays on this machine.
-pub(crate) async fn store(key: &str, jobs: Vec<StoredJob>, env: &HashMap<String, String>) {
+/// the host (`on_host`), or any leg of it did, passed with that host's
+/// tools, so its result stays on this machine.
+pub(crate) async fn store(key: &str, jobs: Vec<StoredJob>, on_host: bool) {
     let Some(run) = current() else { return };
     let Some(store) = &run.store else { return };
-    let on_host = env
-        .get("WRKFLW_RUNTIME_MODE")
-        .is_some_and(|mode| mode.contains("emulation"));
     if on_host && run.accel.push_results && !run.warned_on_host_push.swap(true, Ordering::Relaxed) {
         wrkflw_logging::warning(
             "Not pushing results from this run: emulation depends on this machine's tools",
@@ -1280,6 +1284,30 @@ mod tests {
             key_for_user(&plain, &wf, &tree, None, false, false),
             key_for_user(&plain, &wf, &tree, None, false, true)
         );
+    }
+
+    /// A matrix whose macOS legs run on this Mac isn't reused for a run with
+    /// every leg in a container, or the other way round: the hint to rerun
+    /// with `--macos-on-host` must actually run them.
+    #[tokio::test]
+    async fn a_matrix_run_with_legs_on_the_host_is_kept_apart() {
+        let dir = repo();
+        let wf = workflow();
+        let tree = hash_tree(dir.path()).unwrap();
+        let matrix = job(
+            "runs-on: ${{ matrix.os }}\nstrategy:\n  matrix:\n    os: [ubuntu-latest, macos-15]\nsteps:\n  - run: make\n",
+        );
+        let in_containers = key_for_mode(&matrix, &wf, &tree, None, false);
+        let host = crate::host_jobs::HostJobs::new(
+            Box::new(wrkflw_runtime::emulation::EmulationRuntime::new()),
+            &HashMap::new(),
+            HashMap::new(),
+        );
+        let on_host = crate::host_jobs::scope(Some(std::sync::Arc::new(host)), async {
+            key_for_mode(&matrix, &wf, &tree, None, false)
+        })
+        .await;
+        assert_ne!(in_containers, on_host);
     }
 
     #[test]

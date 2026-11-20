@@ -29,7 +29,26 @@ We rerun finished GitHub runs of open-source repositories with `wrkflw compare`.
 
 rust-lang/log's one difference is its documentation job, which fails on Rust 1.100, released after its GitHub run, as `stable` floats. itoa's three verify an attestation with the job's GitHub token, which a local job doesn't get unless `WRKFLW_JOB_GITHUB_TOKEN=1` gives it yours. spf13/cobra is the one run slower here than on GitHub: its 19 jobs each get a machine of their own there, and share one 7.7 GB VM here.
 
-These nine repositories are the ones wrkflw has been fixed against. [`held_out_runs.txt`](scripts/conformance/held_out_runs.txt) lists fourteen more it has never been tuned for, with services, wide OS matrices and a known failure, to measure how it does on a repository it hasn't seen. See [Conformance](docs/matching-github.md#conformance) to run either sweep yourself.
+These nine repositories are the ones wrkflw has been fixed against. To see how it does on a repository it hasn't seen, [`held_out_runs.txt`](scripts/conformance/held_out_runs.txt) lists fourteen it has never been tuned for, with services, wide OS matrices and a known failure. Their first sweep (2026-11-20, same machine) agreed on 62 jobs and differed on 53:
+
+| Repository | Jobs agreed | Differed | Not compared | Local | GitHub |
+|---|---|---|---|---|---|
+| pallets/markupsafe | 9 | 0 | 1 | 44 s | 38 s |
+| psf/requests | 12 | 6 | 7 | 211 s | 279 s |
+| encode/httpx | 4 | 1 | 0 | 116 s | 56 s |
+| sharkdp/hyperfine | 4 | 10 | 3 | 369 s | 183 s |
+| sharkdp/fd | 5 | 10 | 5 | 486 s | 384 s |
+| expressjs/express | 9 | 2 | 9 | 188 s | 125 s |
+| sindresorhus/execa | 0 | 6 | 3 | 3562 s | 1149 s |
+| urfave/cli | 3 | 1 | 2 | 249 s | 128 s |
+| BurntSushi/memchr | 6 | 9 | 2 | 790 s | 608 s |
+| go-sql-driver/mysql | 1 | 3 | 24 | 127 s | 671 s |
+| jazzband/django-redis | 0 | 3 | 22 | 64 s | 291 s |
+| dtolnay/anyhow | 9 | 2 | 1 | 620 s | 449 s |
+| go-chi/chi | – | – | – | refused | |
+| lib/pq | – | – | – | refused | |
+
+The largest causes: cross-compiling with `cross` on an Apple Silicon Mac, which runs x86_64 tools that fail under Rosetta (hyperfine, fd, memchr); `codecov/codecov-action` stopping at its `github-token` input, which defaults to the token every GitHub job has and is empty in a local job unless `WRKFLW_JOB_GITHUB_TOKEN=1` (execa, urfave/cli); trigger filters wrkflw refuses although GitHub accepts them, `branches: "**"` given as a string and the glob `**.go` (chi, lib/pq, which therefore have no result); a matrix computed by a job that failed locally, which leaves GitHub's matrix legs with nothing to pair with (mysql); and job names written as a folded `>` string that `compare` can't pair (django-redis). Results are kept in [`held_out_expected.tsv`](scripts/conformance/held_out_expected.tsv). See [Conformance](docs/matching-github.md#conformance) to run either sweep yourself.
 
 ## Quick Start
 

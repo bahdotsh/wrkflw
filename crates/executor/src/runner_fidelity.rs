@@ -112,7 +112,10 @@ pub(crate) fn mapped_image<'a>(
 /// Whether a run on `runtime` runs its `macos-*` jobs on this Mac, under
 /// emulation (`--macos-on-host`), so their OS is the one they ask for.
 pub fn macos_jobs_on_host(runtime: RuntimeType) -> bool {
-    crate::host_jobs::wanted(&crate::engine::detect_runtime(runtime))
+    // Before `detect_runtime`, which probes the engines.
+    cfg!(target_os = "macos")
+        && crate::run_options::macos_on_host()
+        && crate::host_jobs::wanted(&crate::engine::detect_runtime(runtime))
 }
 
 /// The OS a job's `runs-on` names, before knowing what it runs as.

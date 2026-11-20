@@ -256,12 +256,13 @@ const NO_DOCKER_ENGINE: &[&str] = &[
 ];
 
 /// Lines that show a step needed a GitHub token it wasn't given: what `gh`
-/// prints without one, in a workflow and outside, and the API's refusal.
+/// prints without one, in a workflow and outside, and the GitHub API's
+/// refusal. A bare 401 is left out: a registry or upload service gives one
+/// for its own credentials, which GitHub's token wouldn't have fixed.
 const NO_GITHUB_TOKEN: &[&str] = &[
     "set the GH_TOKEN environment variable",
     "gh auth login",
     "Bad credentials",
-    "HTTP 401",
 ];
 
 /// Whether a failed step's output shows it had no GitHub token.
@@ -2165,7 +2166,12 @@ mod tests {
             let note = note_after(line);
             assert!(note.contains("WRKFLW_JOB_GITHUB_TOKEN=1"), "{note}");
         }
-        let own = note_after("error: attestation does not match");
-        assert!(!own.contains("WRKFLW_JOB_GITHUB_TOKEN"), "{own}");
+        for own in [
+            "error: attestation does not match",
+            "npm error code E401: HTTP 401 Unauthorized",
+        ] {
+            let note = note_after(own);
+            assert!(!note.contains("WRKFLW_JOB_GITHUB_TOKEN"), "{note}");
+        }
     }
 }

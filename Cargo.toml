@@ -3,7 +3,7 @@ members = ["crates/*"]
 resolver = "2"
 
 [workspace.package]
-version = "0.8.0"
+version = "0.9.0"
 edition = "2021"
 # `std::fs::File::try_lock` guards kept job workspaces.
 rust-version = "1.89"
@@ -17,22 +17,22 @@ license = "MIT"
 
 [workspace.dependencies]
 # Internal crate dependencies
-wrkflw-models = { path = "crates/models", version = "0.8.0" }
-wrkflw-evaluator = { path = "crates/evaluator", version = "0.8.0" }
-wrkflw-executor = { path = "crates/executor", version = "0.8.0" }
-wrkflw-github = { path = "crates/github", version = "0.8.0" }
-wrkflw-gitlab = { path = "crates/gitlab", version = "0.8.0" }
-wrkflw-logging = { path = "crates/logging", version = "0.8.0" }
-wrkflw-matrix = { path = "crates/matrix", version = "0.8.0" }
-wrkflw-parser = { path = "crates/parser", version = "0.8.0" }
-wrkflw-runs = { path = "crates/runs", version = "0.8.0" }
-wrkflw-runtime = { path = "crates/runtime", version = "0.8.0" }
-wrkflw-secrets = { path = "crates/secrets", version = "0.8.0" }
-wrkflw-ui = { path = "crates/ui", version = "0.8.0" }
-wrkflw-utils = { path = "crates/utils", version = "0.8.0" }
-wrkflw-trigger-filter = { path = "crates/trigger-filter", version = "0.8.0" }
-wrkflw-watcher = { path = "crates/watcher", version = "0.8.0" }
-wrkflw-validators = { path = "crates/validators", version = "0.8.0" }
+wrkflw-models = { path = "crates/models", version = "0.9.0" }
+wrkflw-evaluator = { path = "crates/evaluator", version = "0.9.0" }
+wrkflw-executor = { path = "crates/executor", version = "0.9.0" }
+wrkflw-github = { path = "crates/github", version = "0.9.0" }
+wrkflw-gitlab = { path = "crates/gitlab", version = "0.9.0" }
+wrkflw-logging = { path = "crates/logging", version = "0.9.0" }
+wrkflw-matrix = { path = "crates/matrix", version = "0.9.0" }
+wrkflw-parser = { path = "crates/parser", version = "0.9.0" }
+wrkflw-runs = { path = "crates/runs", version = "0.9.0" }
+wrkflw-runtime = { path = "crates/runtime", version = "0.9.0" }
+wrkflw-secrets = { path = "crates/secrets", version = "0.9.0" }
+wrkflw-ui = { path = "crates/ui", version = "0.9.0" }
+wrkflw-utils = { path = "crates/utils", version = "0.9.0" }
+wrkflw-trigger-filter = { path = "crates/trigger-filter", version = "0.9.0" }
+wrkflw-watcher = { path = "crates/watcher", version = "0.9.0" }
+wrkflw-validators = { path = "crates/validators", version = "0.9.0" }
 
 # External dependencies
 clap = { version = "4.3", features = ["derive", "env"] }

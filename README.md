@@ -27,9 +27,28 @@ We rerun finished GitHub runs of open-source repositories with `wrkflw compare`.
 | fatih/color | 1 | 0 | 0 | 25 s | 57 s |
 | pallets/flask | 11 | 0 | 1 | 32 s | 44 s |
 
-rust-lang/log's one difference is its documentation job, which fails on Rust 1.100, released after its GitHub run, as `stable` floats. itoa's three verify an attestation with the job's GitHub token, which a local job doesn't get unless `WRKFLW_JOB_GITHUB_TOKEN=1` gives it yours.
+rust-lang/log's one difference is its documentation job, which fails on Rust 1.100, released after its GitHub run, as `stable` floats. itoa's three verify an attestation with the job's GitHub token, which a local job doesn't get unless `WRKFLW_JOB_GITHUB_TOKEN=1` gives it yours. spf13/cobra is the one run slower here than on GitHub: its 19 jobs each get a machine of their own there, and share one 7.7 GB VM here.
 
-These nine repositories are the ones wrkflw has been fixed against. [`held_out_runs.txt`](scripts/conformance/held_out_runs.txt) lists fourteen more it has never been tuned for, with services, wide OS matrices and a known failure, to measure how it does on a repository it hasn't seen. See [Conformance](#conformance) to run either sweep yourself.
+These nine repositories are the ones wrkflw has been fixed against. To see how it does on a repository it hasn't seen, [`held_out_runs.txt`](scripts/conformance/held_out_runs.txt) lists fourteen it has never been tuned for, with services, wide OS matrices and a known failure. Their first sweep (2026-11-20, same machine) agreed on 62 jobs and differed on 53:
+
+| Repository | Jobs agreed | Differed | Not compared | Local | GitHub |
+|---|---|---|---|---|---|
+| pallets/markupsafe | 9 | 0 | 1 | 44 s | 38 s |
+| psf/requests | 12 | 6 | 7 | 211 s | 279 s |
+| encode/httpx | 4 | 1 | 0 | 116 s | 56 s |
+| sharkdp/hyperfine | 4 | 10 | 3 | 369 s | 183 s |
+| sharkdp/fd | 5 | 10 | 5 | 486 s | 384 s |
+| expressjs/express | 9 | 2 | 9 | 188 s | 125 s |
+| sindresorhus/execa | 0 | 6 | 3 | 3562 s | 1149 s |
+| urfave/cli | 3 | 1 | 2 | 249 s | 128 s |
+| BurntSushi/memchr | 6 | 9 | 2 | 790 s | 608 s |
+| go-sql-driver/mysql | 1 | 3 | 24 | 127 s | 671 s |
+| jazzband/django-redis | 0 | 3 | 22 | 64 s | 291 s |
+| dtolnay/anyhow | 9 | 2 | 1 | 620 s | 449 s |
+| go-chi/chi | – | – | – | refused | |
+| lib/pq | – | – | – | refused | |
+
+The largest causes: cross-compiling with `cross` on an Apple Silicon Mac, which runs x86_64 tools that fail under Rosetta (hyperfine, fd, memchr); `codecov/codecov-action` stopping at its `github-token` input, which defaults to the token every GitHub job has and is empty in a local job unless `WRKFLW_JOB_GITHUB_TOKEN=1` (execa, urfave/cli); trigger filters wrkflw refuses although GitHub accepts them, `branches: "**"` given as a string and the glob `**.go` (chi, lib/pq, which therefore have no result); a matrix computed by a job that failed locally, which leaves GitHub's matrix legs with nothing to pair with (mysql); and job names written as a folded `>` string that `compare` can't pair (django-redis). Results are kept in [`held_out_expected.tsv`](scripts/conformance/held_out_expected.tsv). See [Conformance](docs/matching-github.md#conformance) to run either sweep yourself.
 
 ## Quick Start
 
@@ -62,7 +81,7 @@ jobs:
     gate: false
 ```
 
-A push the gate fails is stopped with the job, step and error lines that failed. `git push --no-verify` skips it once. A `partial` pass says on one line each what it didn't check, such as a `macos-*` job run as Linux or an action that didn't run. The hook keeps the `--runtime` and `--remote-cache` you install it with, so jobs that already passed in CI can be [reused](#sharing-results-across-machines) instead of rerun. See [Spending less on CI](#spending-less-on-ci) for everything it does.
+A push the gate fails is stopped with the job, step and error lines that failed. `git push --no-verify` skips it once. A `partial` pass says on one line each what it didn't check, such as a `macos-*` job run as Linux or an action that didn't run. The hook keeps the `--runtime` and `--remote-cache` you install it with, so jobs that already passed in CI can be [reused](docs/usage.md#sharing-results-across-machines) instead of rerun. See [Spending less on CI](docs/usage.md#spending-less-on-ci) for everything it does.
 
 ## Features
 
@@ -83,7 +102,7 @@ A push the gate fails is stopped with the job, step and error lines that failed.
 - **Secrets management** — multiple providers (env, file, Vault, AWS, Azure, GCP) with masking and AES-256-GCM encrypted storage
 - **Remote triggering** — trigger `workflow_dispatch` runs on GitHub or GitLab pipelines
 - **GitLab support** — validate, run and trigger GitLab CI pipelines, including `parallel`, `parallel:matrix`, `rules`, `when` and stages
-- **Faster reruns** — reuse passing job results, skip jobs a change can't affect, run a job in one container, share dependency caches, and gate pushes (see [Spending less on CI](#spending-less-on-ci))
+- **Faster reruns** — reuse passing job results, skip jobs a change can't affect, run a job in one container, share dependency caches, and gate pushes (see [Spending less on CI](docs/usage.md#spending-less-on-ci))
 - **Service containers** — `services:` start next to the job on Docker and Podman, with health checks
 - **Agent support** — `--format json` on every command, recorded run history with failure digests, `wrkflw plan`, and an MCP server (see [AGENTS.md](AGENTS.md))
 - **Gitea support** — discover, validate, and run workflows from `.gitea/workflows`, including the `gitea` expression context
@@ -98,7 +117,11 @@ A push the gate fails is stopped with the job, step and error lines that failed.
 - Service settings that reach the host — a service's `volumes:` can only name a volume, not a host path, and its `options:` only take flags that shape the service container itself, such as `--health-cmd`, `--user`, `--tmpfs` and `-e NAME=value`. Anything else, such as `--privileged` or `-v`, fails the job.
 - Services that listen on the same port — services share the job container's network, as they do on a GitHub runner, so two Postgres services can't both have 5432. wrkflw refuses two services whose `ports:` name the same container port, and warns about two services of one image.
 - A job with `services:` runs its steps in one container with them, which needs `sh` and `env` in the job's image. Files a step leaves outside the workspace are there for the next step, and `--preserve-containers-on-failure` doesn't keep that container.
-- Windows and macOS runners — `runs-on: windows-*` / `macos-*` runs as Linux, in the same Ubuntu image as `ubuntu-latest`, as a Linux Docker engine can't start a Windows image. Map the label to an image of your own with `-P`, such as a Windows image on a Windows engine. On a Mac, `--macos-on-host` (or `WRKFLW_MACOS_ON_HOST=1`) runs `macos-*` jobs on the Mac itself, under emulation, while the other jobs keep their containers: their pass then checks macOS, but their steps run with no container around them, so a `brew install` in one changes your machine. They have no terminal to ask for input at, so a step that does, such as `sudo` asking for a password, fails at once instead of waiting: GitHub's macOS runners have passwordless `sudo`, this Mac usually hasn't. The check is of the OS, not the version or architecture: on an Apple Silicon Mac a `macos-13` job, an Intel runner on GitHub, runs on Apple Silicon. In container runtimes `${{ runner.os }}` is `Linux` and `runner.temp` and the other runner paths are Linux paths, even for a Windows image, so a job on a Windows container sees the wrong values. `wrkflw compare` leaves a Windows job's result out of its agreement, as its steps call Windows tools; a macOS job's result is compared. In emulation `runner.os` is the host OS. Every job whose `runs-on` names another OS than it ran as is listed under `unverified` in `run_finished` and in the `gate` result, logged as a warning, and marked on the job's line in the TUI, because its pass says nothing about OS-specific steps. `wrkflw plan` lists the same jobs before a run.
+- Windows and macOS runners — `runs-on: windows-*` / `macos-*` runs as Linux, in the same Ubuntu image as `ubuntu-latest`, as a Linux Docker engine can't start a Windows image.
+  - **What you are told.** Every job whose `runs-on` names another OS than it ran as is listed under `unverified` in `run_finished` and in the `gate` result, logged as a warning, and marked on the job's line in the TUI, because its pass says nothing about OS-specific steps. `wrkflw plan` lists the same jobs before a run.
+  - **Windows jobs.** A Windows job's steps that call Windows tools fail on the Linux stand-in, so `wrkflw compare` leaves its result out of the agreement; a job whose steps are portable passes, unverified. To run one for real, map the label to an image of your own with `-P`, such as a Windows image on a Windows engine.
+  - **macOS jobs on a Mac.** `--macos-on-host` (or `WRKFLW_MACOS_ON_HOST=1`) runs `macos-*` jobs on the Mac itself, under emulation, while the other jobs keep their containers. Their pass then checks macOS, but their steps run with no container around them, so a `brew install` in one changes your machine. They have no terminal to ask for input at, so a step that does, such as `sudo` asking for a password, fails at once instead of waiting: GitHub's macOS runners have passwordless `sudo`, this Mac usually hasn't. The check is of the OS, not the version or architecture: on an Apple Silicon Mac a `macos-13` job, an Intel runner on GitHub, runs on Apple Silicon. Without the flag a macOS job runs as Linux, and `compare` counts its result as agreeing unverified.
+  - **`runner` values.** In container runtimes `${{ runner.os }}` is `Linux` and `runner.temp` and the other runner paths are Linux paths, even for a Windows image, so a job on a Windows container sees the wrong values. In emulation `runner.os` is the host OS.
 - `working-directory` outside the workspace — it must stay inside the workspace, so `${{ runner.temp }}/build` fails the step instead of running there.
 
 ## Installation
@@ -157,469 +180,15 @@ wrkflw list
 wrkflw doctor
 ```
 
-## Usage
-
-### Validation
-
-```bash
-# Validate all workflows in .gitea/workflows and .github/workflows
-wrkflw validate
-
-# Validate specific files or directories
-wrkflw validate path/to/workflow.yml
-wrkflw validate path/to/workflows/
-
-# Validate multiple paths
-wrkflw validate flow-1.yml flow-2.yml path/to/workflows/
-
-# GitLab pipelines
-wrkflw validate .gitlab-ci.yml --gitlab
-
-# Verbose output
-wrkflw validate --verbose path/to/workflow.yml
-```
-
-**Exit codes:** `0` = all valid, `1` = validation failures, `2` = usage error. Use `--no-exit-code` to disable.
-
-### Execution
-
-```bash
-# Run with auto-detection (default: tries Docker, then Podman, then emulation)
-wrkflw run .github/workflows/ci.yml
-
-# Run with Docker explicitly
-wrkflw run --runtime docker .github/workflows/ci.yml
-
-# Run with Podman
-wrkflw run --runtime podman .github/workflows/ci.yml
-
-# Run each step as a pod in a Kubernetes cluster
-wrkflw run --runtime kubernetes --k8s-namespace ci .github/workflows/ci.yml
-
-# Run in emulation mode (no containers)
-wrkflw run --runtime emulation .github/workflows/ci.yml
-
-# Run in sandboxed secure emulation
-wrkflw run --runtime secure-emulation .github/workflows/ci.yml
-
-# Run a specific job
-wrkflw run --job build .github/workflows/ci.yml
-
-# Set GitLab pipeline variables, which rules and scripts both see
-wrkflw run --variable CI_COMMIT_TAG=v1.0.0 .gitlab-ci.yml
-
-# List workflows and their jobs
-wrkflw list --jobs
-
-# Preserve failed containers for debugging
-wrkflw run --preserve-containers-on-failure .github/workflows/ci.yml
-```
-
-### Custom runner images
-
-By default `runs-on` maps to a small built-in image, so `ubuntu-latest` runs in `ubuntu:latest`, which has few of the tools a GitHub runner has. Use `-P`/`--platform` to pick the image for a label, for example the larger images made for [act](https://github.com/nektos/act):
-
-```bash
-wrkflw run -P ubuntu-latest=catthehacker/ubuntu:act-latest .github/workflows/ci.yml
-
-# Repeat the flag or separate entries with commas
-wrkflw run -P ubuntu-latest=my/image:1 -P ubuntu-22.04=my/image:2 .github/workflows/ci.yml
-
-# Set it once for every command, including the TUI and watch mode
-export WRKFLW_PLATFORM=ubuntu-latest=catthehacker/ubuntu:act-latest
-```
-
-- A job-level `container:` still wins over `--platform`, which wins over the built-in image.
-- The built-in image is the base image plus tools the hosted Ubuntu runner has and steps call without installing: `sudo`, `jq`, `gh`, `unzip`, `zip`, `wget`, `xz`, `zstd`, `file`, `ssh`, `rsync`, `git-lfs`, `python3` with `pip`, a C toolchain and Node.js. It is built once and shared by every job. `gh` comes from cli.github.com in a layer of its own: when that can't be reached the job runs without it, with a warning, and the next run tries again. When the tools can't be installed at all, a job with nothing else to set up runs on the bare base image.
-- Steps of a job in the built-in image run as `runner`, as on GitHub: a user with `/home/runner` for its home and `sudo` without a password, so a test that expects a permission error gets one. rustup and cargo are in its home, and it owns what `pip install` and `npm install -g` write to. On Linux the user has your uid, so what a step writes in the workspace stays yours; elsewhere it has GitHub's, 1001. Files an earlier run left in the workspace or the `--dep-cache` directories as root's are handed to that user before the first step. Steps run as root instead, with one warning per run, where that user can't write the job's files: under a rootless engine (not a rootless Podman whose containers keep your ids, with `userns = "keep-id"` or `PODMAN_USERNS=keep-id`), or when wrkflw itself runs as root on Linux. That is found before the first job, so their results are still kept and reused with `--reuse-results`, as root's. A job whose container shows another reason only once it is up, such as files an earlier run left that can't be handed over, runs as root with a warning of its own, and its result isn't kept. `WRKFLW_STEPS_AS_ROOT=1` runs them as root everywhere. A job `container:`, an image mapped with `--platform`, a step in a container of its own, and the Kubernetes and emulation runtimes are unchanged: they run as the image's user, or as you.
-- The built-in image's packages, tools, Node.js, GitHub CLI and `runner` user are published with each release as `ghcr.io/bahdotsh/wrkflw-runner`, so a first run pulls them instead of installing them, and builds only the job's setup runtimes on top. Its tag is a hash of `docker/runner.Dockerfile`, the text this wrkflw would build itself. On Linux the `runner` user is given your uid in one more layer. The latest release's image is rebuilt each week with current packages, under the same tag, for machines that pull it for the first time: a machine keeps the copy it pulled, as it keeps an image it built, until you remove the `ghcr.io/bahdotsh/wrkflw-runner` image and the `wrkflw-combined:base-*` image made from it, and the next run pulls the current one and builds the job images on it anew. Where it can't be pulled, wrkflw builds the whole image here as before: when the registry refused it (a wrkflw whose Dockerfile was never published) it doesn't try again for a day, and when it couldn't be reached (offline, or a firewall in front of ghcr.io) for an hour. A job that sets up Node.js, a job on another base, and Kubernetes still build the whole image. `WRKFLW_PREBUILT_IMAGES=0` always builds here, and `WRKFLW_RUNNER_IMAGE` names another base image to start from.
-- An image you map with `--platform` gets none of these tools, also when a setup action's runtime is installed on it. Map `ubuntu-latest=ubuntu:latest` to run on the bare Ubuntu image.
-- Labels match case-insensitively, and the last value given for a label wins. Every label in `runs-on: [self-hosted, linux]` is tried, and `runs-on: ${{ matrix.os }}` is resolved per matrix combination.
-- Runtimes from `actions/setup-*` are installed on top of your image, so the image must be Debian or Ubuntu based for those jobs.
-- `--platform` replaces `WRKFLW_PLATFORM` entirely when both are set. It has no effect in emulation mode.
-
-### Faster local reruns
-
-Two defaults make a rerun cheaper than a hosted runner's cold start. Both work the same for any language or toolchain.
-
-- **Each GitHub Actions job keeps its workspace.** GitLab pipelines still start each run in an empty workspace. Checkout syncs the source files into it, and leaves alone anything the repository ignores, such as build output, `node_modules` or a virtualenv. The second run of a build is therefore incremental. Unchanged files keep their timestamps, and files deleted from the repository are deleted from the workspace too. Workspaces live under your cache directory in `wrkflw/workspaces` (`~/Library/Caches` on macOS, `~/.cache` on Linux), one per repository, workflow file and job, and apart for a job run on this machine (emulation, or `--macos-on-host`) and the same job in a container: what a build leaves for one is wrong for the other. Upgrading to 0.9.0, a job run with `--runtime emulation` starts from an empty workspace once, and `wrkflw clean` removes its old one. Set `WRKFLW_WORKSPACES_DIR` to keep them somewhere else, such as a larger disk. `--fresh-workspace` or `WRKFLW_FRESH_WORKSPACE=1` gives every job an empty workspace, as a hosted runner does.
-- **Matrix legs that only pick a runner run once.** Locally, `runs-on: ${{ matrix.os }}` maps every OS to the same image. If a leg differs from another only in values that `runs-on` reads, or that nothing in the job reads, such as a `name` the job's display name uses, and at least one of them picks the runner, and the two would run in the same image, that leg reports the other's result instead of repeating it. Legs on the same runner always run, so `attempt: [1, 2, 3]` still repeats a job. Its history record and its `job_finished` event carry `repeated_from` with the leg it repeats. A leg whose workflow reads the value, or `strategy.job-index`, or which runs in a different image (see `--platform`), still runs, as do all legs of a `runs-on` that reads the matrix by index (`matrix['os']`). Only the workflow file is read: a script that reads `$MATRIX_OS` from a file of its own isn't seen, so pass `--every-matrix-leg` for such a job. `--every-matrix-leg` or `WRKFLW_EVERY_MATRIX_LEG=1` runs them all.
-
-What a kept workspace means in practice:
-
-- In a git repository, checkout brings every file git tracks, even one an ignore rule matches, as a clone would. Untracked files follow git's ignore rules: every `.gitignore` in the tree, `.git/info/exclude` and your global excludes file. Tracked dotfiles such as `.cargo/config.toml` are synced, and removed once the repository deletes them. Hidden files a tool leaves in the workspace, such as `.pytest_cache`, are kept. wrkflw records what git tracked at each checkout in a file beside the workspace, never by running git in the workspace, whose `.git` a step can change. Outside a git repository, or without `git` installed, only the ignore rules apply, and most hidden files are skipped.
-- Checkout copies the repository's symlinks as links, with the same target, as git checks them out, and never follows one. A link a step left where the repository has a file or directory is replaced, so a step can't make the next checkout write or delete outside the workspace.
-- `.git` is mirrored so `git describe` and `git diff` work. Its objects are hard-linked where the cache directory shares a filesystem with the repository, so they take no extra space. Git never rewrites an object in place, so the links are safe for git itself. A step that writes into `.git/objects` directly, or changes permissions or owners there, changes those files in your repository too, since a hard link is the same file. Hooks are left out, as in a fresh clone, and so are the `core.hooksPath`, `core.fsmonitor` and `core.worktree` settings and any `include` or `includeIf` section, which would run programs from your machine, point outside the workspace or read another config file.
-- A job that never runs `actions/checkout` finds whatever its last run left behind, not an empty directory. The run log says when a job reuses its workspace.
-- Files a step writes, including credentials such as `.npmrc` or a kubeconfig, stay in the workspace until the next run overwrites them or you clean it. Use `--fresh-workspace` for jobs where that matters.
-- If the cache directory is inside the directory you run from, as when you run from your home directory, checkout leaves the workspaces out.
-- `wrkflw clean` removes every kept workspace no run is using and says how much space it freed. It leaves each job's small lock file, so a run starting at the same moment still has the workspace to itself. Deleting the directory by hand is also safe; each job then starts cold once.
-- `cargo test` in this repository sets `WRKFLW_FRESH_WORKSPACE=1` through `.cargo/config.toml`, so tests never keep workspaces. The same applies to `cargo run`; set `WRKFLW_FRESH_WORKSPACE=0` to try kept workspaces from a source build.
-
-While a step runs, the TUI shows what it prints: the Run tab's Output pane shows the full output, and the Log story shows its last lines. Error, warning and notice annotations appear as `Error: …` lines, as on GitHub. Other workflow commands are hidden, and every line is masked before it is shown. An `::add-mask::` value is masked from the line after it; lines printed before it are already shown. A progress bar that redraws its line with carriage returns shows as one line, in its latest state once the line ends. The Output pane says how many earlier lines it isn't showing.
-
-wrkflw's own log, shown in the TUI and with `--verbose`, masks every secret, every `::add-mask::` value, and each `--variable` value whose name suggests a credential (a part ending in `TOKEN`, `SECRET`, `PASSWORD`, `KEY` and the like) or that is 16 characters or longer. Other `--variable` values, such as `BRANCH=main`, stay readable there. A value stays masked until the next run starts, so a session that runs many workflows, as the TUI does, doesn't mask one run's values in another's log. The log names the environment variables a container gets, never their values. Step output, both live in the TUI and as stored, is masked for every `--variable` value.
-
-### Trigger-aware execution
-
-Skip workflows whose `on:` block wouldn't fire for a given event/change set. Strict mode is on by default: `wrkflw run --event …` without `--diff` or `--changed-files` is rejected up front rather than silently skipping every `paths:`-gated workflow.
-
-```bash
-# Auto-detect changed files from git (vs origin/HEAD, main/master, or HEAD~1)
-wrkflw run --diff --event push .github/workflows/ci.yml
-
-# Pin the diff range
-wrkflw run --diff --diff-base main --diff-head HEAD --event push .github/workflows/ci.yml
-
-# Supply changed files explicitly (e.g. from a CI wrapper)
-wrkflw run --event push --changed-files src/main.rs,Cargo.toml .github/workflows/ci.yml
-
-# Simulate a pull_request — `--base-branch` is required under strict mode
-wrkflw run --event pull_request --base-branch main --diff .github/workflows/ci.yml
-
-# Opt out of strict rejection (legacy warn-and-proceed)
-wrkflw run --event push --no-strict-filter .github/workflows/ci.yml
-```
-
-See [BREAKING_CHANGES.md](BREAKING_CHANGES.md) for full migration notes.
-
-### Spending less on CI
-
-All of this is opt-in. Without these flags a run behaves as it always has.
-
-```bash
-# Check everything CI would run for this push, reusing what already passed.
-# On a feature branch, a workflow a push doesn't fire is checked as a pull
-# request into the default branch. The result says how much the pass proves:
-# verified, partial (some jobs ran as another OS, or passed a step whose
-# action wrkflw can't run) or nothing_checked.
-wrkflw gate
-
-# Run it on every push (an existing hook is left alone). The hook keeps the
-# --runtime and --remote-cache given here, and compares against what the
-# remote already has for the pushed branch. It refuses a core.hooksPath
-# outside the repository, which other repositories share. It checks the
-# working tree, so uncommitted changes count, and it warns when there are any.
-wrkflw gate --install-hook
-
-# The same pieces, one at a time
-wrkflw run .github/workflows/ci.yml --reuse-results
-wrkflw run .github/workflows/ci.yml --event push --affected
-wrkflw run .github/workflows/ci.yml --dep-cache
-```
-
-- **`--reuse-results`** skips a job when an identical job already passed on identical inputs. The fingerprint covers the job definition, workflow `env` and `defaults`, `needs` outputs, event, ref, runtime, operating system, CPU architecture, `--platform` overrides and file contents. Stored outputs still reach dependent jobs. Results expire after 7 days, or `WRKFLW_RESULT_TTL_SECS`, because images and floating action tags such as `@v4` aren't in the fingerprint.
-- **`--affected`** also skips a job when none of its declared paths changed, even with no stored result. It trusts the base you compare against to be green. The pre-push hook compares against the remote tip of the branch you push, which is green only if that push's CI passed. If it may not have, run `wrkflw gate --diff-base origin/main` by hand. It needs `--event`, and only applies to jobs listed in `.wrkflw/affected.yml`. Such a job counts as passed for its dependents and reports one `Not affected` step. A job still runs if it has `outputs` or a matrix, if a job it needs ran or didn't pass, or if a workflow file changed.
-- **One container per job** is how a job's `run:` steps run on Docker and Podman. What a step leaves outside the workspace, such as a tool from `go install`, `apt-get install` or `rustup toolchain add`, is there for the next step, as on GitHub. A step that times out may still be running in that container, so the next step gets a fresh one, and a job's services restart with it. `--step-containers`, or `WRKFLW_STEP_CONTAINERS=1`, gives each step a container of its own instead, as `--preserve-containers-on-failure` does. The variable also reaches runs started from the TUI and `wrkflw watch`. `--job-container` is still accepted and changes nothing, even beside `--step-containers`.
-- **`--docker-in-jobs`**, or `WRKFLW_DOCKER_IN_JOBS=1`, starts a Docker engine inside the container of each job whose `run:` steps run `docker`, as hosted runners have one. That container runs privileged, so it is off unless you ask: only use it for workflows you trust. The engine is the job's own, so `docker run -v $(pwd):/src` mounts the job's workspace, and its images and containers go with the job. Each such job says when its container starts privileged, so a variable left set in a shell doesn't grant it unseen. The variable also reaches runs started from the TUI and `wrkflw watch`. Without the flag such a step fails with `docker: command not found`, and the run says so before it starts. It works on Docker only: a rootless Podman container can't run an engine, and the run says so. An image you map with `-P` gets no engine added either, as it gets no runner tool: it must bring its own. A job counts as running `docker` when its `run:` script calls it as a shell would, including through `sudo`, `env`, `timeout` or `nice`, inside `$(...)`, in `bash -c '...'` and in a heredoc a shell reads; `command -v docker`, a quoted string, a `case` pattern and a heredoc that `cat` writes don't count. A `docker` run by `make`, by a script the step calls or through a variable isn't seen, and that job gets neither the engine nor the warning. The same reading decides which jobs get the runner's Rust, which an image you map with `-P`, or a `rust` image, doesn't get: those keep their own.
-- **`--dep-cache`** mounts host directories over the cargo, npm, pip and Go caches in root's home directory and, in the built-in image, in the `runner` user's too, so it helps steps that run as either. An image you map with `--platform` only gets root's: its own user's home is left alone. Steps that always run as root, as in a job `container:`, a mapped image, a step in a container of its own or a run with `WRKFLW_STEPS_AS_ROOT=1`, get a second set of directories, so they never leave root's files where a `runner` step must write. In the built-in image that set goes in the `runner` user's home too, as `CARGO_HOME` is there for root as well. The host directories live under `WRKFLW_DEP_CACHE_DIR` if set, or the user cache directory, with one set per repository. Steps can write to them, so a job you don't trust can leave packages there for later runs of the same repository, but not for other repositories. They are wrkflw's own directories, not your `~/.cargo` or `~/.npm`.
-
-Reuse is only as safe as its inputs. wrkflw always runs a job that reads secrets or a `github-token` input, has `write` permissions of its own or from the workflow's `permissions:`, exchanges artifacts, uses a known publishing action such as `actions/github-script`, `softprops/action-gh-release` or `docker/build-push-action`, or calls a reusable workflow, because those can have effects it can't see. It also always runs a job with `outputs` that uses `needs` when a job upstream reads secrets, so a passed-along secret doesn't get stored. A job with no `permissions:`, in a workflow with none, counts as read-only, though on GitHub it gets the repository's default token permissions, which are write-all for repositories created before February 2023. For anything else with outside effects, set `cache: false`. That includes a job that gets its credentials from the machine rather than from `secrets`, such as a deploy that uses `~/.aws`, `gh auth` or `~/.npmrc` in emulation: wrkflw can't see those, so it would reuse the result and the deploy would silently not happen.
-
-By default every file in the repository is an input, so any change reruns every job. `.wrkflw/affected.yml` narrows that. It lives outside the workflow file because GitHub rejects unknown keys there.
-
-```yaml
-jobs:
-  test:
-    paths: ['src/**', 'Cargo.lock']   # what this job reads
-  publish-preview:
-    cache: false                      # always run: never reuse or skip it
-  deploy:
-    gate: false                       # leave it to CI: `wrkflw gate` skips it
-```
-
-`wrkflw gate` runs every job a push would, with this machine's credentials, and it can't tell a deploy from a test. Mark deploys, releases and anything else that must only run in CI with `gate: false`. The gate reports them as skipped, and skips the jobs that need them too. It warns about a job that always runs because it reads secrets or publishes, unless that job has `gate: false` or `cache: false`.
-
-Paths you leave out go unnoticed, so list everything the job reads. `*` doesn't cross `/`, so `*.rs` only matches files at the root. Use `**/*.rs`, and wrkflw warns about a wildcard path with no `/`. `.github/actions/**`, `.gitea/actions/**`, this file and the directory of each local action the job uses, such as `uses: ./tools/release`, always count.
-
-#### Sharing results across machines
-
-```bash
-export WRKFLW_CACHE_SIGNING_KEY=...       # required
-export WRKFLW_REMOTE_CACHE_TOKEN=...      # optional bearer token
-
-# In trusted CI on your main branch: run every job and publish its result
-wrkflw run ci.yml --remote-cache https://cache.example.com/wrkflw --cache-push
-
-# Anywhere else: read
-wrkflw run ci.yml --reuse-results --remote-cache https://cache.example.com/wrkflw
-```
-
-The location is a directory, a `file://` path, or an `https://` base that serves `GET` and `PUT` on `<base>/<key>.json`. Entries are HMAC-signed, and one that doesn't verify is ignored. The key is symmetric, so anyone who can read results with it could also forge one given write access to the store. A forged result does more than mark a job as passed: its outputs reach `run:` scripts of dependent jobs, so the key plus write access means running commands on every machine that reads the store. Keep store write access to trusted CI, and don't expose the key to pull requests from forks.
-
-`--cache-push` publishes every passing job, with or without `--reuse-results`. Add `--reuse-results` to also skip jobs the store already has. If the remote fails to answer, or refuses the token, wrkflw warns, stops using it for the rest of that run and runs the jobs. Only a 404 counts as a miss.
-
-Local results older than the TTL are removed the first time a run stores one.
-
-Stored outputs aren't encrypted. A job that runs in emulation never pushes, because its result depends on the tools of that machine. wrkflw removes `WRKFLW_CACHE_SIGNING_KEY` and `WRKFLW_REMOTE_CACHE_TOKEN` from its own environment at startup, so steps it runs, in emulation or not, never see them.
-
-### Watch mode
-
-```bash
-# Watch .github/workflows for changes and rerun affected workflows
-wrkflw watch
-
-# Watch a specific path, simulate pull_request, and cap concurrency
-wrkflw watch --event pull_request --base-branch main \
-    --max-concurrency 2 --debounce 750 .github/workflows
-
-# Ignore extra directories on top of the built-in list
-wrkflw watch --ignore-dir .terraform --ignore-dir coverage
-```
-
-### TUI
-
-```bash
-# Open TUI with default directory
-wrkflw tui
-
-# Open with specific runtime
-wrkflw tui --runtime podman
-
-# Force a color theme
-wrkflw tui --theme light
-```
-
-The TUI follows your terminal's background and uses a light or dark palette to match. Set `--theme` or `WRKFLW_THEME` to `auto`, `dark` or `light` to override it. The theme is chosen at startup, so restart the TUI after switching your terminal's theme.
-
-**Tabs:** Workflows · Run (jobs, graph and log views of the current run) · History · Dispatch · Setup (runtime and secret providers). Help opens over any tab with `?`.
-
-**Controls:**
-
-| Key | Action |
-|-----|--------|
-| `Tab` / `Shift+Tab` | Switch tabs |
-| `1`–`5` | Jump to tab by number |
-| `w` | Jump to Workflows |
-| `x` / `g` / `l` | Run tab: jobs / graph / log view |
-| `↑`/`↓` or `k`/`j` | Navigate / scroll |
-| `Space` | Toggle workflow selection |
-| `Enter` | Run / view details |
-| `r` | Run selected workflows |
-| `a` / `n` | Select all / deselect all |
-| `Shift+R` | Reset workflow status |
-| `Shift+J` | View jobs in workflow |
-| `e` | Cycle runtime (Docker / Podman / Kubernetes / Secure Emulation / Emulation) |
-| `v` | Toggle Execution / Validation mode |
-| `d` / `D` | Toggle diff-aware filter / cycle simulated event |
-| `t` | Dispatch the workflow on GitHub / GitLab |
-| `,` | Open Tweaks overlay |
-| `?` / `h` | Toggle help overlay |
-| `q` / `Ctrl+C` | Quit |
-| `Esc` | Back (quits from the top level) |
-
-Run → jobs: `Enter` inspects a job's steps, `Tab` switches between Output and Matrix, `PgUp`/`PgDn` scroll a step's output and `End` returns to its tail. Run → graph adds `g` (graph↔list), `←`/`→` (scroll stages), `↑`/`↓` (previous/next workflow), `Enter` (back to jobs). Run → log adds `o` (story↔raw log), `s` (search), `f` (filter), `c` (clear), `n` (next match), `PgUp`/`PgDn` (page) and `Home`/`End` (first line / follow new lines). Dispatch tab adds `p` (github↔gitlab), `b` (edit branch), `i` (edit inputs), `+` (add input), `c` (copy curl preview); while a field is being edited, `Tab` moves between fields and `Enter` or `Esc` stops editing.
-
-The layout adapts to the terminal size: side panes drop out and tabs collapse to numbers on narrow terminals, and step output keeps the tool's own colours.
-
-Drag with the mouse to select text; it is copied to the clipboard when you release. A selection stays inside the pane it started in, a click or any key clears it, and the wheel scrolls. Hold your terminal's bypass modifier (usually Shift, or Option in iTerm2) to use its native selection instead. Over SSH, copying relies on your terminal supporting OSC 52.
-
-### Remote Triggering
-
-Trigger `workflow_dispatch` events on GitHub or GitLab.
-
-```bash
-# GitHub (requires GITHUB_TOKEN env var)
-wrkflw trigger workflow-name --branch main --input key=value
-
-# GitLab (requires GITLAB_TOKEN env var)
-wrkflw trigger-gitlab --branch main --variable key=value
-```
-
-### Using wrkflw from coding agents
-
-```bash
-# Machine-readable output: stdout is JSON only, logs go to stderr
-wrkflw --format json validate
-wrkflw --format json run .github/workflows/ci.yml --intent "check the new cache step"
-
-# See what would run, and why a trigger fires, without running anything
-wrkflw plan .github/workflows/ci.yml --event push --diff
-
-# Every run is recorded
-wrkflw runs list
-wrkflw runs failure latest
-wrkflw runs logs latest --step test --tail 50
-wrkflw runs replay latest
-
-# Resume a job at a step
-wrkflw run .github/workflows/ci.yml --job test --from-step "Run tests"
-
-# Run a workflow as a finished GitHub run did, and list where the results differ.
-# Check out the commit that run tested first; a detached HEAD is fine, the
-# run's branch is used.
-wrkflw compare https://github.com/OWNER/REPO/actions/runs/123456789
-
-# Check a push to another branch than the one checked out, or on a detached HEAD
-wrkflw run --event push --branch release/2.0 --diff .github/workflows/ci.yml
-
-# Check a tag push
-wrkflw run --event push --tag v1.2.0 .github/workflows/release.yml
-
-# Serve all of this over the Model Context Protocol
-wrkflw mcp serve
-```
-
-`compare` pairs the jobs of a called workflow, which GitHub shows as `caller / job`, with the caller's one local result, failed if any of them failed. A job that failed locally and not on GitHub says which step failed, with its exit code and the line of output that reads most like the error; one whose output shows `docker` finding no engine says that it needs `WRKFLW_DOCKER_IN_JOBS=1`. A job that agrees, but passed a step whose action didn't run locally or ran as Linux for a `macos-*` job, is counted under `unverified_agreements` and marked `unverified`: the agreement says less than it looks. A Windows job, which runs on a Linux stand-in, is not compared, and no longer keeps the two runs' overall results from being compared: they are, with the stand-ins' failures left out. A run's floating versions, such as `stable` Rust, are resolved now, not when GitHub ran it, so compare against a recent run.
-
-Every `run_finished`, and the gate result, carries a `verdict`. `verified` means every job ran as the OS it asked for and every `uses:` step ran its action. `partial` means some jobs ran as another OS (`gate` and `run` list them apart from skipped actions, and on a Mac say that `--macos-on-host` runs `macos-*` jobs on the Mac itself), or passed a step whose action didn't run, because wrkflw has no implementation of it, a JavaScript action found no `node` in the job's image, or, for a setup action, because a job `container:`, a composite action whose runtime the job didn't set up itself, or emulation kept its runtime out of the job; both are listed under `unverified`, told apart by `kind` (`runner` or `action_not_run`). An `actions-rs/cargo` step that runs its `command` on your machine in a container runtime counts as not run too. `nothing_checked` means no job ran, so the pass proves nothing. A failure digest names a likely `cause`: `out_of_memory` when the output says memory ran out, `killed` when a process got SIGKILL without a stated reason, or `setup_failed` when the job failed before any step ran because its image couldn't be built or pulled.
-
-On macOS and Windows, Docker Desktop and Podman machines see your files through a share that refuses file names that aren't UTF-8 and ignores case, so a test that relies on either fails there and passes on GitHub. So on macOS, steps see the job's workspace in a container volume inside the VM, a Linux filesystem; on Windows they do when `WRKFLW_WORKSPACE_MOUNT=volume` asks for it. wrkflw copies what changed on your machine into the volume before each step, and what the step changed back after it, also when the step ran out of time. The host copy is what checkout, caches, artifacts and `hashFiles` use, and what stays between runs. A file your filesystem can't hold, such as a name that isn't UTF-8 or one that differs only in case from one already there, stays in the volume only, also between runs of a kept workspace. A file your machine refuses for now, such as one in a directory a step made read-only, is tried again after the next step, with a warning until it is copied. The copies use `ubuntu:latest` for `find` and GNU `tar`; set `WRKFLW_WORKSPACE_HELPER_IMAGE` to another image that has both, with GNU tar 1.32 or later. A run interrupted with Ctrl-C removes its fresh workspaces and their volumes as it exits. Set `WRKFLW_WORKSPACE_MOUNT=bind` to mount the workspace directory as before, or `WRKFLW_WORKSPACE_MOUNT=volume` to use a volume on Linux or Windows too. `wrkflw clean` removes the volumes of workspaces that are gone.
-
-Docker Desktop and Podman machines often have half the 16 GB of a GitHub runner, and a Rust or C++ link can be killed there although it passes in CI. wrkflw warns when the VM has less than 14 GB. Each job's containers are sampled while they run, and the job's peak is kept in `job-memory.json` under your cache directory. On the next run, a job sets aside half again its highest peak of its last three runs, plus 256 MB and at least 512 MB, and jobs start while what they set aside fits in the VM. A job never measured sets aside what every job used to: the VM's memory divided by the number of whole 4 GB in it, so on an 8 GB VM it runs alone. So a matrix of light test jobs runs side by side after its first run. Jobs share the VM's memory less a tenth of it, at least 1 GiB, which the engine, image builds and the workspace copies use. Only a job that passed keeps its peak. A step killed by SIGKILL, as the out-of-memory killer does, forgets the measurements of every job running at the time, since the kernel picks its victim anywhere in the VM. The job's container and its services are sampled once a second, as a step's own container is. Podman jobs aren't measured, and forget what an earlier run measured. On Linux without a VM it only warns. Set `WRKFLW_JOB_MEMORY_FILE` to keep the measurements elsewhere, or to an empty value to keep none. Set `WRKFLW_MAX_PARALLEL_JOBS` to choose the limit.
-
-#### Conformance
-
-`scripts/conformance/compare_sweep.sh` reruns the finished GitHub runs listed in `compare_runs.txt` with `wrkflw compare` and prints, for each, how many jobs agreed, differed and weren't compared, how many job images it had to build, how long the local run and the GitHub run took, and how long the whole compare took. Some runs are known to differ, so it compares each with its line in `compare_expected.tsv` and fails only when a run got worse, with fewer jobs agreeing or more differing or agreeing unverified, or gave no report; `WRKFLW_SWEEP_RECORD=1` records the results as the new expectation. It runs those repositories' CI on your machine, and needs `gh`, `jq`, `git` and Docker or Podman. Pass `scripts/conformance/held_out_runs.txt` to sweep the held-out repositories instead; each list keeps its own expectations, in `<name>_expected.tsv` beside it.
-
-`scripts/conformance/plan_corpus.sh` plans the last finished run of every workflow in a list of public repositories, and compares the number of jobs with what GitHub ran. It needs `gh` and `jq`, and runs nothing.
-
-Register the MCP server with every coding agent installed on this machine, or name the ones you want. Running it again changes nothing, and an entry that launches a different command is left alone unless you pass `--force`.
-
-```bash
-wrkflw mcp install            # every agent found
-wrkflw mcp install codex      # just one
-wrkflw mcp install --dry-run  # show what would change
-```
-
-| Agent | Name | What `install` changes |
-|-------|------|------------------------|
-| Claude Code | `claude-code` | Runs `claude mcp add --scope user` |
-| Codex | `codex` | Runs `codex mcp add` |
-| Cursor | `cursor` | `~/.cursor/mcp.json` |
-| Windsurf | `windsurf` | `~/.codeium/windsurf/mcp_config.json` |
-| VS Code (Copilot) | `vscode` | `mcp.json` in the VS Code user directory |
-| Gemini CLI | `gemini` | `~/.gemini/settings.json` |
-| opencode | `opencode` | `~/.config/opencode/opencode.json` |
-| Claude Desktop | `claude-desktop` | `claude_desktop_config.json`, with the absolute path to `wrkflw`. Restart Claude Desktop afterwards |
-| GitHub Copilot CLI | `copilot` | `~/.copilot/mcp-config.json`, or under `$COPILOT_HOME` |
-| Grok Build | `grok` | Runs `grok mcp add` |
-| Kiro CLI | `kiro` | `~/.kiro/settings/mcp.json`, or under `$KIRO_HOME`, with the absolute path to `wrkflw` |
-| pi | `pi` | `~/.pi/agent/mcp.json`, or under `$PI_CODING_AGENT_DIR` |
-| Zed | `zed` | `context_servers` in Zed's `settings.json` |
-
-Without names, `install` sets up every agent whose CLI is on `PATH` or whose config directory exists. A named agent gets its config file even if it doesn't exist yet, so you can set up wrkflw before the agent's first run. Config files are edited in place, so comments, trailing commas and formatting are kept. For any other client, add a stdio server named `wrkflw` that runs `wrkflw mcp serve`.
-
-Runs record which agent started them and from which session. The agent comes from `--agent` or `WRKFLW_AGENT`, or is detected from `AI_AGENT` and what Claude Code, Codex, Gemini CLI, opencode, Cursor and Augment set. Other agents, such as Kiro, Grok Build, pi and Copilot CLI, set nothing wrkflw can rely on, so set `WRKFLW_AGENT` in their environment. The session comes from `--session` or `WRKFLW_SESSION`, or from `CLAUDE_CODE_SESSION_ID` or `CODEX_THREAD_ID`. Filter on either with `wrkflw runs list --agent claude-code --session <id>`.
-
-The TUI's History tab shows the same history, including which agent started each run and why. See [AGENTS.md](AGENTS.md) for the output contract, and `skills/wrkflw` for a Claude Code skill.
-
-## Runtime Modes
-
-| Mode | Description | Best for |
-|------|-------------|----------|
-| **Auto** (default) | Detects Docker, then Podman, then falls back to emulation | Most users |
-| **Docker** | Full container isolation, closest to GitHub runners | Production, CI/CD |
-| **Podman** | Rootless containers, no daemon required | Security-conscious environments |
-| **Kubernetes** | Each step runs as a pod in a cluster you point `kubectl` at | GPU/XPU jobs, shared build clusters, self-hosted forges |
-| **Emulation** | Runs directly on host, no containers needed | Quick local testing |
-| **Secure Emulation** | Sandboxed host processes with filesystem/network restrictions | Running untrusted workflows without a container runtime |
-
-Only **Auto** falls back. If you pass `--runtime docker` or `--runtime podman` and it doesn't answer, the run fails rather than running your steps on this machine.
-
-### Kubernetes runtime
-
-`--runtime kubernetes` dispatches every step to the cluster `kubectl` is configured for. It is never auto-detected, and it never falls back to running on your machine: if the cluster is unreachable, the run fails.
-
-```bash
-# Pick the cluster and namespace, then run as usual
-wrkflw run --runtime kubernetes --k8s-context gpu-cluster --k8s-namespace ci .github/workflows/train.yml
-
-# Land on GPU nodes and request an accelerator for every step
-wrkflw run --runtime kubernetes \
-  --k8s-node-selector accelerator=a100 \
-  --k8s-resource nvidia.com/gpu=1 --k8s-resource memory=16Gi \
-  .github/workflows/train.yml
-
-# Private registry, and a registry wrkflw can push locally built images to
-wrkflw run --runtime kubernetes --k8s-image-pull-secret regcred \
-  --k8s-registry registry.example.com/ci .github/workflows/ci.yml
-
-# Every flag has a WRKFLW_K8S_* environment variable, so set them once
-export WRKFLW_K8S_NAMESPACE=ci WRKFLW_K8S_RESOURCE=nvidia.com/gpu=1
-```
-
-| Flag | Environment variable | Purpose |
-|------|----------------------|---------|
-| `--k8s-context NAME` | `WRKFLW_K8S_CONTEXT` | kubeconfig context (default: current) |
-| `--k8s-namespace NAME` | `WRKFLW_K8S_NAMESPACE` | Namespace pods are created in (default: current) |
-| `--k8s-node-selector KEY=VALUE` | `WRKFLW_K8S_NODE_SELECTOR` | `nodeSelector` for every pod; repeatable |
-| `--k8s-resource NAME=QUANTITY` | `WRKFLW_K8S_RESOURCE` | Limits and requests for the step container, e.g. `nvidia.com/gpu=1`; repeatable |
-| `--k8s-image-pull-secret NAME` | `WRKFLW_K8S_IMAGE_PULL_SECRET` | `imagePullSecrets` for every pod; repeatable |
-| `--k8s-registry REGISTRY` | `WRKFLW_K8S_REGISTRY` | Where images built locally are pushed so the cluster can pull them |
-| `--k8s-helper-image IMAGE` | `WRKFLW_K8S_HELPER_IMAGE` | Image for the sync helpers (default `busybox:1.36`, pinned by digest; needs `sh` and `tar`) |
-| `--k8s-timeout SECONDS` | `WRKFLW_K8S_TIMEOUT` | Per-step limit, pod creation to sync-back (default 21600, the engine's job timeout) |
-| `--k8s-schedule-timeout SECONDS` | `WRKFLW_K8S_SCHEDULE_TIMEOUT` | How long a pod may stay unschedulable before the step fails (default 600) |
-
-How a step runs:
-
-1. A pod is created with one `emptyDir` per mount, an init container that waits for a ready marker, the step container, and a small sidecar. Pods are labelled `app.kubernetes.io/managed-by=wrkflw` and `wrkflw.dev/session=<id>`.
-2. The workspace, GitHub env files and action checkouts are streamed into the init container as tar archives, then the marker is set and the step starts.
-3. After the step exits, its logs are collected and every mount is streamed back out through the sidecar, so `GITHUB_OUTPUT`, artifacts and workspace changes reach the next step.
-4. The pod is deleted. With `--preserve-containers-on-failure` a failed pod is kept for `kubectl logs <pod> -c main` and `kubectl exec -it <pod> -c wrkflw-sync -- sh`.
-
-Every pod carries `activeDeadlineSeconds`, set to `--k8s-timeout` (at least 1) plus 30 seconds, so the cluster stops it even if wrkflw is killed. A preserved pod is stopped at that deadline too, and keeps its resources until then, GPUs included. Its logs stay readable until you delete it, but `kubectl exec` no longer works. `--preserve-containers-on-failure` also keeps a pod whose step timed out. After `--k8s-timeout` the deadline is only 30 seconds away, so read its logs instead. After a shorter `timeout-minutes`, `kubectl exec` works until the deadline. Ctrl+C always deletes pods.
-
-Things to know:
-
-- Only `kubectl` is needed on your machine. Jobs that build an image (`actions/setup-*` on a standard runner image, Dockerfile actions) also need Docker or Podman locally and `--k8s-registry`, because the cluster cannot see your local image store.
-- Each step syncs the workspace and `RUNNER_TEMP` in and out, so large workspaces and large temporary files cost time per step.
-- A failed image pull is retried for 60 seconds before the step fails, so a bad image name takes that long to report.
-- Mounts are copies. Job `container.volumes` directories are copied in and written back after each step, so parallel jobs sharing one do not see each other's changes and the last to finish wins. Write-back only adds and updates: a file a step deletes from such a directory stays on the host, and files other processes create there are left alone. Only the job's workspace and `GITHUB_*` files mirror the pod exactly. A single-path volume such as `/cache` lives only in the pod and is never written back. Single files and sockets cannot be mounted and are skipped with a warning, sockets inside a mounted directory are not synced, and named volumes start empty.
-- Logs are read from the kubelet when the step ends, so a step that outgrows the node's container log rotation (10 MiB by default) loses its earliest lines.
-- A failed status check is retried for 60 seconds, so a brief API server outage does not end a running step. A deleted pod fails the step at once.
-- A pod the scheduler cannot place fails the step after `--k8s-schedule-timeout`. Raise it if your autoscaler takes longer than 10 minutes to bring up a node.
-- Synced files are owned by root in the pod, so run steps in images that run as root, as GitHub requires for container actions. Other users can read the workspace but not write to it, and namespaces enforcing the `restricted` Pod Security Standard are not supported.
-- Stdout and stderr come back as one stream, as Kubernetes logs them.
-- Helper containers declare small fixed CPU and memory requests and limits, so namespaces with a `ResourceQuota` accept them.
-- Kubernetes validates environment variable names itself, and older clusters reject names Docker accepts. Such a step fails when its pod is created.
-- Secrets reach the step as plain pod environment variables, visible to anyone who can read pods in that namespace. Pods do not mount a service account token.
-- `--platform` and `runs-on` work as elsewhere: they pick the image. Node placement comes from `--k8s-node-selector`.
-
-## Reusable Workflows
-
-```yaml
-jobs:
-  call-local:
-    uses: ./.github/workflows/shared.yml
-
-  call-remote:
-    uses: my-org/my-repo/.github/workflows/shared.yml@v1
-    with:
-      foo: bar
-    secrets:
-      token: ${{ secrets.MY_TOKEN }}
-```
-
-- Local refs resolve relative to the working directory
-- Remote refs are shallow-cloned at the specified `@ref`
-- `with:` entries become `INPUT_<KEY>` env vars; `secrets:` become `SECRET_<KEY>`
-- Outputs from called jobs are merged back into `needs.<id>.outputs.*`
-
-**JavaScript actions:** an action whose `action.yml` says `runs.using: node20` (or `node12`, `node16`, `node24`), remote or local, runs as GitHub's runner runs it: `node <main>` from the action's directory, in the job's container as its user (under `--runtime emulation` or `secure-emulation`, on this machine as you, so a remote action is code from its repository that can reach whatever you can, your tokens and keys included. wrkflw leaves the variables of your environment named as credentials, such as `GH_TOKEN` or `AWS_SECRET_ACCESS_KEY`, out of a remote action's, as it does for a remote composite action's steps, and the job's own `GITHUB_TOKEN` still reaches it, but that is a precaution and not a boundary: the action can still run `gh auth token` or read your files. Use a container runtime for actions you don't trust), starting in the workspace whatever `defaults.run.working-directory` says, with each input as `INPUT_<NAME>` (from `with:`, its name matched without regard to case, else the input's `default`, `${{ }}` evaluated) and `GITHUB_ACTION_PATH`, `GITHUB_ACTION_REPOSITORY` and `GITHUB_ACTION_REF` set. Its `pre` runs when `pre-if` holds, right before `main` rather than at the start of the job as on GitHub. Its `post` runs at the end of the job when `post-if` holds (`always()` by default), also when `pre` or `main` failed or ran out of time, or a later step couldn't run at all, and a post that fails doesn't stop the others, last action first, within the job's `timeout-minutes` or five minutes past it, whichever is later, with the job's env as it is then, the step's own `env:` and inputs, and what `pre` and `main` saved through `$GITHUB_STATE` or `::save-state` as `STATE_<name>`. A local `./` action is read from the job's workspace, so one an earlier step built runs as built; a job with no checkout reads it from the repository wrkflw runs in. In a container, the whole of the action's repository is mounted, remote or local in the job's workspace, so a script may reach outside the action's own directory (`main: ../dist/index.js`); a local action read from the repository wrkflw runs in, for a job with no checkout, gets its own directory only. The action runs with the `node` in the job's image, Node 22 in the image wrkflw builds, whatever version it asks for, and the step warns when that Node is older than the action asks for (`node24` on Node 22); an image with no `node` (a `container:` job, an image mapped with `-P`) leaves the action unrun and the step `unverified`. A remote action is cloned once per run, and each job runs it from a copy of that clone without its `.git`, as GitHub's runner downloads an action once per job: the job's steps share that copy, and jobs and matrix legs that run at once never write into each other's. Actions that talk to GitHub's run services through `ACTIONS_RUNTIME_TOKEN` or its OIDC token, other than the built-in cache and artifact actions, fail, as there is no such service locally: `github/codeql-action`, `actions/deploy-pages` and `actions/attest-build-provenance` among them, which passed unrun before. List them in `WRKFLW_SKIP_ACTIONS`. The setup actions and the Rust toolchain actions still use wrkflw's own versions. `WRKFLW_JS_ACTIONS=0` leaves JavaScript actions unrun, as before. To leave only some actions unrun, such as one that deploys or needs GitHub's OIDC token, list them in `WRKFLW_SKIP_ACTIONS`, comma-separated: `owner/repo` for any of its actions at any ref, `owner/repo/path` for one action in it, either with `@ref` for that ref alone, or `./path` for a local one, a repository matched without regard to case and a local path exactly. Each listed step action, of any kind, passes without being fetched or run and is reported under `unverified`, so the run is `partial`. It covers `uses:` in steps; a job that calls a reusable workflow still runs it. Stored results are keyed on the list and on `WRKFLW_JS_ACTIONS`, so changing either reruns every job once under `--reuse-results`.
-
-**Private repositories:** a remote `uses:` (a called workflow, or a Docker, composite or JavaScript action) is cloned without credentials first. If GitHub refuses that, as it does for a private repository, it is cloned again with a GitHub token: the `GITHUB_TOKEN` a secret provider gives the job, else `GITHUB_TOKEN` or `GH_TOKEN` from the environment, else what `gh auth token` prints. The token goes to `git` on this machine only, as an HTTP header: not into the URL, the clone's `.git/config` or the job.
-
-**Limitations:** a called workflow that declares no `on.workflow_call.outputs` exposes all of its job outputs.
-
-## Secrets Management
-
-WRKFLW supports GitHub Actions-compatible `${{ secrets.* }}` syntax with multiple providers:
-
-```bash
-# Environment variables (simplest)
-export GITHUB_TOKEN="ghp_..."
-wrkflw run .github/workflows/ci.yml
-
-# File-based secrets (JSON, YAML, or .env format)
-# On Linux, put them in ~/.config/wrkflw/secrets/ (read by the `file` provider)
-```
-
-On GitHub every job has a `GITHUB_TOKEN`; here `secrets.GITHUB_TOKEN` and `github.token` are empty unless a provider has one, so a step that calls the GitHub API, such as `gh attestation verify`, fails with a 401. `WRKFLW_JOB_GITHUB_TOKEN=1` gives jobs this machine's token where no provider did: `GITHUB_TOKEN`, then `GH_TOKEN`, then what `gh auth token` prints. It is your own token, with your access, not a job's short-lived one scoped to the repository, so it is off by default: turn it on for workflows you trust.
-
-A secret no provider has expands to an empty string, as on GitHub. `wrkflw plan` lists these, and a step that reads one ends its output with a warning.
-
-Supported providers: environment variables, file-based, HashiCorp Vault, AWS Secrets Manager, Azure Key Vault, Google Cloud Secret Manager. See the [secrets demo](examples/secrets-demo/) for detailed examples.
+## Documentation
+
+- [Usage](docs/usage.md): validation, running workflows and jobs, runner images, trigger-aware runs, the push gate and shared results, watch mode, the TUI, remote triggering
+- [How a local run matches GitHub's](docs/matching-github.md): `compare`, verdicts, the workspace volume, memory, and the conformance sweeps
+- [Runtime modes](docs/runtimes.md): Docker, Podman, Kubernetes, emulation and secure emulation
+- [Coding agents](docs/agents.md): JSON output, run history, `plan`, and the MCP server
+- [Reusable workflows](docs/reusable-workflows.md)
+- [Secrets](docs/secrets.md)
+- [Breaking changes](BREAKING_CHANGES.md)
 
 ## Project Structure
 

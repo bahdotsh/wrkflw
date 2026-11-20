@@ -6,7 +6,7 @@ name: Refresh runner image
 # rebuilds the latest release's tag each week, so a machine pulling it for
 # the first time gets current packages and security fixes. A machine that
 # pulled it already keeps its copy, as it keeps an image it built, until the
-# image is removed (see the README). wrkflw's own job images build on it
+# image is removed (see docs/usage.md). wrkflw's own job images build on it
 # with the same tag, so nothing else changes.
 on:
   schedule:

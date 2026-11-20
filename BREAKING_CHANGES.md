@@ -1,14 +1,14 @@
 # Breaking Changes
 
-## JavaScript actions run (unreleased)
+## JavaScript actions run (0.9.0)
 
 A `uses:` step whose action runs on Node, such as `actions/github-script`, `codecov/codecov-action` or a local `./` action whose `action.yml` says `runs.using: node20`, used to pass without running and was reported as not run, which made the run `partial`. Such an action now runs with node in the job's container, with its `pre` and `post`; under `--runtime emulation` it runs on your machine as you, so a remote action is code from its repository (pinned only as firmly as its `@ref`) running with your access, your tokens and keys included: wrkflw leaves credential-named variables (`GH_TOKEN`, `AWS_SECRET_ACCESS_KEY`, `SSH_AUTH_SOCK` and the like) out of its environment, which is a precaution, not a boundary. The same goes for the steps of a remote composite action under emulation, which used to inherit them: one that runs `gh`, `aws` or `ssh` with your own credentials now needs them passed through the step's `env:`. A step can no longer set, for later steps through `$GITHUB_ENV`, a variable wrkflw sets for each step (GitHub's defaults such as `GITHUB_SHA` or `RUNNER_TEMP`, `GITHUB_ACTION_PATH`, `WRKFLW_RUNTIME_MODE`) or `NODE_OPTIONS`, as GitHub doesn't let it either; such a line is ignored with a warning. Names of your own, `GITHUB_SHA_SHORT` included, pass on as before. A local `./` action is read from the job's workspace rather than the repository wrkflw runs in, as on GitHub. Its `pre` runs right before it, not at the start of the job, and its `post` runs at the end of the job even when `pre`, `main` or a later step failed. The action can fail where it used to pass, and the run is `verified` when nothing else was left out. An action that needs GitHub's run services (`ACTIONS_RUNTIME_TOKEN` or the OIDC token) fails locally, so a workflow using `github/codeql-action`, `actions/deploy-pages` or `actions/attest-build-provenance` now fails under `wrkflw gate` where it was `partial`: add them to `WRKFLW_SKIP_ACTIONS`. A remote action is cloned from GitHub, with your GitHub token if the anonymous clone fails. `WRKFLW_JS_ACTIONS=0` brings back the old behaviour, and `WRKFLW_SKIP_ACTIONS=owner/repo,./path` leaves only the actions it lists unrun. Stored results are keyed on both, and the key's version goes to 6, so `--reuse-results` (which `wrkflw gate` always uses) reruns every job once instead of reusing a pass whose JavaScript actions didn't run. The setup actions and the Rust toolchain actions are unchanged.
 
-## Steps run as the `runner` user (unreleased)
+## Steps run as the `runner` user (0.9.0)
 
 In the image wrkflw builds for a job, its steps now run as `runner`, a user with a home directory and sudo without a password, as on GitHub's hosted runner, where they used to run as root. A step that wrote where only root may, or relied on being root, can now fail: run it with `sudo`, as on GitHub, or set `WRKFLW_STEPS_AS_ROOT=1` to keep root everywhere. On Linux the user takes the uid of whoever runs wrkflw, so a bind-mounted workspace stays theirs. Under a rootless engine, or where the user can't write the job's mounts, steps run as root with a warning. A job `container:`, an image mapped with `-P` and Kubernetes are unchanged. Stored results are keyed on it and the key's version goes to 5, so `--reuse-results` reruns every job once.
 
-## A job's steps share one container (unreleased)
+## A job's steps share one container (0.9.0)
 
 On Docker and Podman a job's `run:` steps now run in one container, started once and kept for the job, where each step used to get a container of its own. What a step leaves outside the workspace is there for the next one, as on GitHub: `go install`, `apt-get install`, `rustup toolchain add`, `pip install`, a file under `$HOME` or `/tmp`, a process left running. A workflow that only passed locally because a step started from a clean image now behaves as it does on GitHub. `--step-containers`, or `WRKFLW_STEP_CONTAINERS=1`, brings the old behaviour back, and `--preserve-containers-on-failure` still implies it. `--job-container` is accepted and does nothing, even beside `--step-containers`. Both variables also apply to runs started from the TUI and `wrkflw watch`. The jobs of a called workflow share a container too, and their services now start. A step that is cancelled or times out may still be running in the job's container, so the steps after it, `if: always()` ones included, get a fresh container without what earlier steps installed, and the job's services restart with it.
 
@@ -22,7 +22,7 @@ Stored results, local and remote, are keyed on whether a job's steps share a con
 
 For crates that use wrkflw as a library: `wrkflw_executor::Acceleration::job_container` is gone. `step_containers` is its opposite and defaults to `false`, so `Acceleration::default()` now runs one container per job, and `docker_in_jobs` is new. Struct literals that name `job_container` need changing.
 
-## A pass that skipped an action is `partial`, and library API changes (unreleased)
+## A pass that skipped an action is `partial`, and library API changes (0.9.0)
 
 A `uses:` step whose action wrkflw didn't run now makes a passing run's `verdict` `partial` instead of `verified`, with an entry `{kind: "action_not_run", job, step, uses, reason}` under `unverified`. Every `unverified` entry now has a `kind`, and the entries for a job run as another OS have `kind: "runner"`. That covers a JavaScript action wrkflw has no implementation of, such as `codecov/codecov-action`, `actions/github-script` or a local `./` action whose `action.yml` runs on Node, and a setup action whose runtime isn't in the job's image: one in a job with `container:`, one inside a composite action whose runtime the job's own steps didn't set up, one whose version wrkflw can't install, and every setup action under emulation. `node-version` and `.nvmrc` aliases such as `lts/*`, `lts/iron` and `node` are now installed rather than ignored, and an `lts/` codename wrkflw doesn't know is refused, as setup-node refuses it, instead of installing the newest LTS. A `go-version` or `go.mod` that names a line such as `1.22` installs that line's newest release. A `*-version-file` must be a path inside the repository. An action inside a composite action is reported on the step that calls the composite action. Workflows that use such actions and used to report `verified` now report `partial`, and `wrkflw gate` prints its partial warning for them. Its exit code is unchanged.
 
@@ -52,13 +52,13 @@ A job reused with `--reuse-results`, as `wrkflw gate` does, reports the actions 
 
 A setup step is judged on its own version. A `*-version-file` with no version in it, or one that doesn't exist, is refused and reported as not run, instead of installing a default version: the hosted action fails that step. When several setup steps of one language ask for different versions, the image holds the last one, and the others are reported as not run, whichever order a refused one comes in. Images for a version that names a channel or a range, such as `oldstable`, `stable`, `3.x`, `>=3.10`, `lts/*` or uv's `latest`, are rebuilt once a week, so they follow new releases. Commands `pip install` adds, such as `pytest` or `tox`, run by name: the interpreter's scripts directory is first on `PATH`. A failed download of an installer (uv, Node.js from nodesource, Composer) fails the image build instead of building an image without it. A matrix leg is folded less often: a matrix read on a later line of an `if: |` or `run: |` block, a `strategy.job-index` or `strategy.job-total`, or a `runs-on` that reads the matrix by index (`matrix['os']`) now keeps every leg, and a reused folded leg still carries `repeated_from`. `compare` adds `ref_unsure` when it couldn't ask `origin` whether the run's ref is a tag, and runs it as a branch, instead of taking an unanswered question for no tag. A failure digest keeps an error line that mentions a pass word, such as `Property 'Passed' does not exist`, and only folds matrix legs whose other failure lines agree too.
 
-## `wrkflw gate` checks pull request workflows, and fails when it checked nothing (unreleased)
+## `wrkflw gate` checks pull request workflows, and fails when it checked nothing (0.9.0)
 
 Without `--event`, the gate used to check every workflow as a push. On a feature branch, CI that only runs on pushes to `main` and on pull requests was skipped, and the gate passed with nothing run. Now a workflow that runs no job for a push, because it doesn't fire or every job is skipped by `if:`, is checked again as a pull request into the default branch, or into `--base-branch`. Pass `--event push` for the old behaviour.
 
 The gate's JSON gains `verdict`, and each workflow gains the `event` and `base_branch` it was checked as. `passed` is false when no job ran for any workflow, with `verdict: "nothing_checked"`. The exit code is still 0 then, so a push no CI runs for isn't blocked. A script that read `passed: true` as "safe to push" now sees `false` in that case. The gate's JSON hasn't been in a release, so `schema_version` stays 1: read `verdict` to tell why `passed` is false. A workflow checked as a pull request after the push ran no job carries `fell_back_from`, with the push's `event`, `run_id` and `skip_reason`.
 
-## `run_finished` says how much a pass proves (unreleased)
+## `run_finished` says how much a pass proves (0.9.0)
 
 `run_finished` gains `verdict`: `verified`, `partial`, `nothing_checked`, `failed`, `error`, `skipped` or `interrupted`. `status` is unchanged. In text mode, a pass with jobs that ran as another OS, or with no job run, no longer prints the plain success line.
 
@@ -66,27 +66,27 @@ A job that didn't run because an earlier result stands has `reused` on `job_fini
 
 The canned "Common causes for cargo command failures" text is gone from failed cargo steps. It blamed the code for failures that came from the machine.
 
-## Matrix `include` follows GitHub's rules (unreleased)
+## Matrix `include` follows GitHub's rules (0.9.0)
 
 An `include` entry is now added to every original combination whose matrix values it doesn't overwrite, and becomes a combination of its own only when it fits none. Entries are never merged into combinations an earlier `include` created. An entry with only new keys used to become a combination of its own, and now adds its keys to every combination. A workflow planned with fewer or different legs than GitHub runs now gets the same ones.
 
-## Matrix legs that only differ in runner and an unread label run once (unreleased)
+## Matrix legs that only differ in runner and an unread label run once (0.9.0)
 
 A leg that differs from another in a value `runs-on` reads and in values nothing in the job reads, such as a `name` used only by the job's display name, now reports that leg's result instead of running. Such legs used to run. `--every-matrix-leg` runs them all.
 
-## On macOS, steps see the workspace in a container volume (unreleased)
+## On macOS, steps see the workspace in a container volume (0.9.0)
 
 On macOS, Docker and Podman steps no longer bind-mount the job's workspace directory. They see a container volume that wrkflw copies changes into before each step and back out after it, so file names that aren't UTF-8 and names that differ only in case work as on GitHub. Each step starts and ends a little later, by the time the copies take. The copies need the image `ubuntu:latest`, or the one `WRKFLW_WORKSPACE_HELPER_IMAGE` names. If the volume can't be set up, the job mounts the directory as before and says so. Files in the volume belong to root, so a step image that runs as another user can't change them, as on GitHub when the user's ID differs from the runner's. Set `WRKFLW_WORKSPACE_MOUNT=bind` to keep the old behaviour. Windows keeps the bind mount unless `WRKFLW_WORKSPACE_MOUNT=volume` asks for the volume; its files have no permission bits, so they go into the volume executable, as the file share showed them. A custom helper image needs GNU tar 1.32 or later. A copy that moves nothing for 10 minutes, as one to an engine that stopped answering doesn't, is stopped and fails its step, and the job's later copies fail at once instead of waiting as long again. Entries the host refused for a reason that may pass, such as a read-only directory, are remembered between runs of a kept workspace, so its next run doesn't delete them from the volume.
 
-## Docker and Podman runs limit parallel jobs on a small VM (unreleased)
+## Docker and Podman runs limit parallel jobs on a small VM (0.9.0)
 
 When the Docker Desktop or Podman VM has less than 14 GB of memory, a run warns and sets aside the VM's memory divided by the number of whole 4 GB in it for each job, counting every job of the run together. A job measured on an earlier run sets aside half again its peak plus 256 MB instead, so light jobs run side by side from their second run. Measurements are kept in `job-memory.json` in the cache directory, and a job not run for 90 days is forgotten. Jobs share the VM's memory less a tenth of it, at least 1 GiB, kept for the engine and image builds. Only a job that passed records its peak, and a step killed for memory forgets the measurements of every job running beside it. A step the engine reports as killed for memory, or whose output shows a process killed with SIGKILL as cargo and gcc print it, forgets its job's measurements. Runs can take longer there. A Docker or Podman daemon on Linux without a VM is warned about but keeps its parallelism. Set `WRKFLW_MAX_PARALLEL_JOBS` to choose the limit on either.
 
-## Smaller schema changes (unreleased)
+## Smaller schema changes (0.9.0)
 
 A workflow without `name:` is named by its path, such as `.github/workflows/ci.yml`. It used to fail to parse. `strategy:` no longer needs a `matrix`. A top-level `cache-mode`, `deployment` on an `environment`, the `code-quality` permission, an empty env value and an expression in `timeout-minutes` are accepted. An expression timeout runs under the default timeout.
 
-## An explicit `--runtime docker` or `--runtime podman` no longer falls back to the host (unreleased)
+## An explicit `--runtime docker` or `--runtime podman` no longer falls back to the host (0.9.0)
 
 If Docker or Podman didn't answer within about a second, for example while Docker Desktop woke from Resource Saver, an explicit `--runtime docker` or `--runtime podman` ran every step on this machine and reported success. The TUI did the same after its runtime probe. Now the availability check waits longer, and a runtime you named that doesn't answer fails the run with a message saying what to start.
 
@@ -98,7 +98,7 @@ The same release also changes what container steps see:
 - Docker pulls each image once per run instead of before every step. A floating tag such as `ubuntu:latest` that moves during a run isn't picked up until the next run.
 - `hashFiles('dir/**')` hashes the files under the directory. It used to return an empty string, so cache keys built from it change.
 
-## `services:` start and can fail a job (unreleased)
+## `services:` start and can fail a job (0.9.0)
 
 On Docker and Podman, a job's `services:` now start, and its steps run in one container with them. A service that can't start or never turns healthy fails the job's container steps. These jobs used to log a warning and run without the service. Emulation, secure emulation, Kubernetes and called workflows still warn.
 
@@ -112,41 +112,41 @@ For such a job, this also changes how its steps run:
 - Two services whose `ports:` name the same container port fail the job, as services share one network.
 - A service's `volumes:` can't mount a host path, and its `options:` only take flags that shape the service container. `--privileged`, `-v`, `--mount`, `--network`, `--pid`, `--cap-add` and the like fail the job, as they would let workflow YAML reach this machine.
 
-## Job-level `concurrency:` is enforced within a run (unreleased)
+## Job-level `concurrency:` is enforced within a run (0.9.0)
 
 Jobs that share a `concurrency:` group now run one at a time, where they used to overlap. `cancel-in-progress` has no effect, and a run takes longer if it relied on the overlap.
 
-## New public fields on `ExecutionConfig`, `Job` and `WorkflowDefinition` (unreleased)
+## New public fields on `ExecutionConfig`, `Job` and `WorkflowDefinition` (0.9.0)
 
 `wrkflw_executor::ExecutionConfig` gains `acceleration`, `wrkflw_parser::workflow::Job` gains `concurrency`, and `wrkflw_parser::workflow::WorkflowDefinition` gains `permissions`. Code that builds any of them with a struct literal has to set the new field. `Default::default()` is what `acceleration` was before, and `None` is what `concurrency` and `permissions` were.
 
-## A missing secret no longer fails a `run:` step (unreleased)
+## A missing secret no longer fails a `run:` step (0.9.0)
 
 A `${{ secrets.X }}` that no provider has now expands to an empty string in `run:`, as it already did in `env:` and as it does on GitHub. The step used to fail with `Secret not found`. Anything relying on that failure should check for the value itself. A provider that fails for any other reason still fails the step.
 
-## `wrkflw validate` reports more problems (unreleased)
+## `wrkflw validate` reports more problems (0.9.0)
 
 Files that passed may now fail with `unknown-trigger-filter` and `unterminated-expression`, which GitHub rejects too.
 
 `undefined-step-reference`, `undefined-need-reference` and `undefined-matrix-key` are warnings: GitHub accepts these workflows, so they appear in `issues` with `severity: warning` and leave `valid` true. Every issue now has a `severity`, and code treating any entry in `issues` as a failure should read `valid` instead.
 
-## Failure digests fold matrix legs (unreleased)
+## Failure digests fold matrix legs (0.9.0)
 
 Legs of a matrix job whose same step failed with the same exit code and output share one entry in `failures`, with the others in `also_failed_in`. The entry's `command` is the first leg's script. Code counting failed legs should read `jobs` on `run_finished`.
 
-## `--event` needs a change set only for `paths:` filters (unreleased)
+## `--event` needs a change set only for `paths:` filters (0.9.0)
 
 `--event` without `--diff` or `--changed-files` used to fail for every workflow under `--strict-filter`. It now fails only if the workflow has a `paths:` or `paths-ignore:` filter on that event.
 
-## Unnamed `uses:` steps report the action (unreleased)
+## Unnamed `uses:` steps report the action (0.9.0)
 
 An unnamed step with `uses:` is reported as `actions/checkout@v4` rather than `Step 1`, including in run history. Log file names change with it. Unnamed `run:` steps keep `Step N`. `--from-step` accepts any name a run reports, and still accepts a 1-based position, which is how to reach a repeated action after the first.
 
-## Step output in events and history has relative paths (unreleased)
+## Step output in events and history has relative paths (0.9.0)
 
 The job workspace prefix is removed from `step_finished.output` and stored step logs, so `/tmp/.tmpAbC123/src/lib.rs` reads `src/lib.rs`.
 
-## Step output is masked, and `run` steps report their exit code (unreleased)
+## Step output is masked, and `run` steps report their exit code (0.9.0)
 
 `StepResult::output` and job logs now have secrets replaced with `***`, including values matching built-in token patterns. Previously nothing masked step output. Code that compared a secret's value against output will no longer match. Step outputs set with `::set-output::` keep their real values.
 
@@ -154,23 +154,23 @@ The job workspace prefix is removed from `step_finished.output` and stored step 
 
 GitLab `--variable` values are masked too, because they are often credentials. A value that is also ordinary text, such as `-V DEPLOY=true`, is replaced wherever that text appears in the output. Values under 3 characters are not masked.
 
-## Container steps are no longer capped at 6 minutes (unreleased)
+## Container steps are no longer capped at 6 minutes (0.9.0)
 
 The Docker and Podman runtimes used to stop every step after 300 to 360 seconds. Steps now run until their job's or step's `timeout-minutes`, which defaults to 360 minutes as on GitHub. A step that hangs now holds its job for that long, so set `timeout-minutes` on steps that can hang.
 
-## TUI: `7` opens the Runs tab, Help moved to `8` (unreleased)
+## TUI: `7` opens the Runs tab, Help moved to `8` (0.9.0)
 
 The `h` and `?` shortcuts for Help are unchanged.
 
-## `ValidationResult` gained `details` (unreleased)
+## `ValidationResult` gained `details` (0.9.0)
 
 Code that builds `ValidationResult` with a struct literal must use `ValidationResult::new()`. `issues` is unchanged.
 
-## Runs are recorded by default (unreleased)
+## Runs are recorded by default (0.9.0)
 
 `wrkflw run`, `watch` and TUI runs now write logs to the local data directory, keeping the newest 500. Pass `--no-record` or set `WRKFLW_NO_HISTORY=1` to opt out.
 
-## `actions/upload-artifact` follows GitHub's layout and rules (unreleased)
+## `actions/upload-artifact` follows GitHub's layout and rules (0.9.0)
 
 Artifact paths are now relative to where the `path:` search started, as on
 GitHub. After uploading `out/*` or `out/f.txt` and downloading into `got/`, the
@@ -196,14 +196,14 @@ A wildcard line that matches a directory now selects everything below it, as on
 GitHub. `packages/*/dist` uploads the contents of each `dist`, `!**/node_modules`
 excludes the contents, and `out/*` includes files in subdirectories of `out`.
 
-## `ExecutionConfig` gained a `platform_overrides` field (unreleased)
+## `ExecutionConfig` gained a `platform_overrides` field (0.9.0)
 
 Code that builds `wrkflw_executor::ExecutionConfig` as a struct literal must set
 the new field, or it no longer compiles. `ExecutionConfig` and `RuntimeType` now
 implement `Default`, so end a literal with `..Default::default()` to stay
 compatible with later additions. The default runtime is `RuntimeType::Auto`.
 
-## Jobs on act images now report real step results (unreleased)
+## Jobs on act images now report real step results (0.9.0)
 
 Under the Docker runtime, any image name containing both `catthehacker` and
 `act-` was treated as macOS emulation. Each step's command was discarded, so
@@ -220,7 +220,7 @@ derived from a `with.command` input, such as `npm run`, `cargo` and `pip`.
 Combined images for `actions/setup-*` jobs now put `/usr/local/bin` and
 `/usr/bin` first on `PATH`, so they are rebuilt once on the next run.
 
-## `~/.wrkflw` moved to the platform base directories (unreleased)
+## `~/.wrkflw` moved to the platform base directories (0.9.0)
 
 wrkflw no longer writes to a hardcoded `~/.wrkflw/`. The new locations follow
 the XDG Base Directory spec on Linux and the native conventions elsewhere:

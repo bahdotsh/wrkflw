@@ -1,0 +1,19 @@
+# What compare_sweep.sh expects of each held-out run: fewer agreeing, or
+# more differing or unverified jobs, than this is a regression. Recorded
+# from the first held-out sweep (2026-11-20, 0.9.0 code, Apple Silicon Mac,
+# 7.7 GB Docker VM). go-chi/chi and lib/pq gave no report then: wrkflw
+# refused their trigger filters (`branches: "**"` as a string, and the glob
+# `**.go`), so they have no line yet.
+# repo	run	agreed	differed	not_compared	unverified
+pallets/markupsafe	37080278497	9	0	1	1
+psf/requests	40366789388	12	6	7	6
+encode/httpx	43942265472	4	1	0	0
+sharkdp/hyperfine	38224324422	4	10	3	0
+sharkdp/fd	43561890385	5	10	5	0
+expressjs/express	41517558311	9	2	9	0
+sindresorhus/execa	44272044440	0	6	3	0
+urfave/cli	42738336663	3	1	2	2
+BurntSushi/memchr	31414505747	6	9	2	1
+go-sql-driver/mysql	44281558144	1	3	24	0
+jazzband/django-redis	42917669996	0	3	22	0
+dtolnay/anyhow	44655613210	9	2	1	0

@@ -398,6 +398,52 @@ mod tests {
         );
     }
 
+    /// A host step that asks for input at the terminal, as `sudo` does for
+    /// a password, fails at once instead of stopping the run: it has no
+    /// terminal to ask at.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_host_step_that_reads_the_terminal_fails_instead_of_hanging() {
+        let host = host();
+        let dir = tempfile::tempdir().unwrap();
+        let volumes = [(dir.path(), Path::new("/github/workspace"))];
+        let cmd = ["sh", "-c", "read answer </dev/tty"];
+        let step = host
+            .runtime
+            .run_container("", &cmd, &[], dir.path(), &volumes, None);
+        let output = tokio::time::timeout(std::time::Duration::from_secs(5), step)
+            .await
+            .expect("the step stopped, waiting for the terminal")
+            .unwrap();
+        assert_ne!(output.exit_code, 0, "{output:?}");
+    }
+
+    /// A step given up on before its process started never starts.
+    #[cfg(unix)]
+    #[test]
+    fn a_step_given_up_on_before_it_starts_never_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("ran");
+        let script = format!("touch {}", marker.display());
+        let cmd = ["bash", "-c", script.as_str()];
+        let volumes = [(dir.path(), Path::new("/github/workspace"))];
+        let runtime = wrkflw_runtime::emulation::EmulationRuntime::new();
+        let step = wrkflw_runtime::emulation::StepHandle::default();
+        step.kill();
+        let run = step.run(|| {
+            futures::executor::block_on(runtime.run_container(
+                "",
+                &cmd,
+                &[],
+                dir.path(),
+                &volumes,
+                None,
+            ))
+        });
+        assert!(run.is_err(), "{run:?}");
+        assert!(!marker.exists(), "the step ran after it was given up on");
+    }
+
     /// Two host steps don't run at once: they share this machine.
     #[cfg(unix)]
     #[tokio::test]

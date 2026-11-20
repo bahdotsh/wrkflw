@@ -193,7 +193,8 @@ async fn execute_github_workflow(
         wrkflw_logging::warning(
             "macos-* jobs run on this Mac itself (--macos-on-host), with no container \
              around their steps: they can change this machine, and they see this shell's \
-             environment, credentials included",
+             environment, credentials included. They have no terminal to ask for input \
+             at, so one that does, such as sudo asking for a password, fails",
         );
         Some(std::sync::Arc::new(crate::host_jobs::HostJobs::new(
             Box::new(emulation::EmulationRuntime::new()),
@@ -3644,7 +3645,12 @@ async fn execute_job_with_matrix(
         .await;
         let results = results?;
         let key = result_key.as_deref().filter(|_| !fell_back_to_root);
-        let on_host = runs_on_host(env_context) || crate::host_jobs::legs_may_run_on_host(job);
+        // Kept on this machine when any leg ran on it.
+        let on_host = runs_on_host(env_context)
+            || combinations.iter().any(|combination| {
+                crate::host_jobs::for_job(job, Some(&combination.values), platform_overrides)
+                    .is_some()
+            });
         store_passing_result(key, &results, on_host).await;
         Ok(results)
     } else {
@@ -3785,9 +3791,16 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
         .await;
     }
     // Only after the reusable workflow check: its jobs take places of their
-    // own, and a caller holding one would deadlock a limit of one.
-    let memory_id = job_memory_id(&ctx.workflow.name, ctx.job_name);
-    let _slot = crate::vm_memory::job_slot(memory_id.as_deref(), None).await;
+    // own, and a caller holding one would deadlock a limit of one. A job
+    // run on this machine uses none of the VM's memory: it is neither
+    // sized nor measured by it.
+    let on_host = runs_on_host(ctx.env_context);
+    let memory_id = job_memory_id(&ctx.workflow.name, ctx.job_name).filter(|_| !on_host);
+    let _slot = if on_host {
+        crate::vm_memory::host_job_slot().await
+    } else {
+        crate::vm_memory::job_slot(memory_id.as_deref(), None).await
+    };
     if let Some(id) = &memory_id {
         crate::job_memory::measure_as(id);
     }
@@ -4279,12 +4292,18 @@ async fn execute_matrix_job(
     let matrix_job_name = wrkflw_matrix::format_combination_name(job_name, combination);
 
     // One place in the run's pool for the leg, as for any job. A leg never
-    // measured is sized by the legs of its matrix that were.
-    let memory_id = job_memory_id(&workflow.name, &matrix_job_name);
-    let family = leg_family_memory_id(&workflow.name, job_name);
-    let _slot =
+    // measured is sized by the legs of its matrix that were. A leg run on
+    // this machine uses none of the VM's memory: it takes no room there,
+    // and what it measures, nothing, sizes no sibling.
+    let on_host = runs_on_host(base_env_context);
+    let _slot = if on_host {
+        crate::vm_memory::host_job_slot().await
+    } else {
+        let memory_id = job_memory_id(&workflow.name, &matrix_job_name);
+        let family = leg_family_memory_id(&workflow.name, job_name);
         crate::job_memory::leg_place(memory_id.as_deref(), family.as_deref(), &matrix_job_name)
-            .await;
+            .await
+    };
 
     wrkflw_logging::info(&format!("Executing matrix job: {}", matrix_job_name));
 

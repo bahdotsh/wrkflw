@@ -20,14 +20,27 @@ static EMULATION_PROCESSES: Lazy<Mutex<Vec<u32>>> = Lazy::new(|| Mutex::new(Vec:
 
 /// A step a caller may stop waiting for, and then end.
 ///
-/// A step run inside [`StepHandle::run`] starts as the leader of a process
-/// group of its own, and the group is tracked for [`cleanup_resources`]:
-/// in its own group a step no longer gets the terminal's Ctrl-C, so the
-/// cleanup that follows it ends the step instead. [`StepHandle::kill`] ends
-/// the group while the step runs, so what it started doesn't outlive a step
-/// given up on. Steps run without a handle start as before, in wrkflw's group.
+/// A step run inside [`StepHandle::run`] starts in a session of its own,
+/// as the leader of its process group, and the group is tracked for
+/// [`cleanup_resources`]. With no controlling terminal a step can't stop
+/// the run by asking for input there: `sudo`, `ssh` or a credential prompt
+/// fails at once, as on GitHub, where a background process group reading
+/// the terminal would be stopped and hang the run with nothing shown. Nor
+/// does the step get the terminal's Ctrl-C, so the cleanup that follows it
+/// ends the step instead. [`StepHandle::kill`] ends the group while the
+/// step runs, so what it started doesn't outlive a step given up on, and
+/// a step given up on before it started never starts. Steps run without a
+/// handle start as before, in wrkflw's session and group.
 #[derive(Clone, Default)]
-pub struct StepHandle(std::sync::Arc<Mutex<Option<u32>>>);
+pub struct StepHandle(std::sync::Arc<Mutex<StepState>>);
+
+#[derive(Default)]
+struct StepState {
+    /// The running step's process, which leads its group.
+    pid: Option<u32>,
+    /// The caller gave up on the step.
+    given_up: bool,
+}
 
 thread_local! {
     static STEP: std::cell::RefCell<Option<StepHandle>> = const { std::cell::RefCell::new(None) };
@@ -48,9 +61,14 @@ impl StepHandle {
         f()
     }
 
-    /// End the step's process group, if the step is still running.
+    /// Give up on the step: end its process group if it is running, and
+    /// keep it from starting if it hasn't yet.
     pub fn kill(&self) {
-        let pid = self.0.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let pid = {
+            let mut state = self.state();
+            state.given_up = true;
+            state.pid.take()
+        };
         if let Some(pid) = pid {
             wrkflw_logging::debug(&format!("Ending step process group {pid}"));
             end_process_group(pid, "KILL");
@@ -58,13 +76,29 @@ impl StepHandle {
         }
     }
 
+    fn state(&self) -> std::sync::MutexGuard<'_, StepState> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn given_up(&self) -> bool {
+        self.state().given_up
+    }
+
+    /// The step's process `pid` started. Given up on meanwhile, between
+    /// the check before it was started and now, it is ended at once.
     fn started(&self, pid: u32) {
-        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(pid);
+        let mut state = self.state();
+        if state.given_up {
+            drop(state);
+            end_process_group(pid, "KILL");
+            return;
+        }
+        state.pid = Some(pid);
         track_process(pid);
     }
 
     fn ended(&self) {
-        if let Some(pid) = self.0.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        if let Some(pid) = self.state().pid.take() {
             untrack_process(pid);
         }
     }
@@ -378,13 +412,29 @@ impl ContainerRuntime for EmulationRuntime {
             }
         }
 
-        // A step whose caller may give up on it leads a process group of
-        // its own, which the caller can end: see `StepHandle`.
+        // A step whose caller may give up on it runs in a session of its
+        // own, leading its process group, which the caller can end: see
+        // `StepHandle`.
         let handle = STEP.with(|step| step.borrow().clone());
+        if handle.as_ref().is_some_and(StepHandle::given_up) {
+            return Err(ContainerError::ContainerExecution(
+                "The step was given up on before it started".to_string(),
+            ));
+        }
         #[cfg(unix)]
         if handle.is_some() {
             use std::os::unix::process::CommandExt;
-            cmd.process_group(0);
+            // SAFETY: `setsid` is async-signal-safe, so it may be called
+            // between fork and exec. It fails only for a process that
+            // already leads a group, which a child just forked doesn't.
+            unsafe {
+                cmd.pre_exec(|| {
+                    if libc::setsid() == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
         }
 
         // Output is collected as `output()` would, and also passed on as it

@@ -163,6 +163,18 @@ pub(crate) async fn job_slot(
     }
 }
 
+/// A place in the run's pool for a job or leg whose steps run on this
+/// machine, not in the VM: one under a limit on jobs at once, which counts
+/// every job, and none under a memory limit, as the job uses none of the
+/// VM's memory.
+pub(crate) async fn host_job_slot() -> Option<OwnedSemaphorePermit> {
+    let pool = POOL.try_with(|pool| pool.get().cloned().flatten()).ok()??;
+    match pool.limit {
+        Limit::Jobs(_) => pool.place(None).await,
+        Limit::Memory { .. } => None,
+    }
+}
+
 /// The place of the leg `job` of the matrix `family`: by its own
 /// measurements, or, never measured, by its siblings'. With neither it waits
 /// as a job never measured, and looks again each time a sibling keeps its
@@ -535,6 +547,32 @@ mod tests {
             set_limit(Some(Limit::Jobs(3)));
             let again = tokio::time::timeout(Duration::from_millis(50), job_slot(None, None)).await;
             assert!(again.is_err(), "the run's pool was resized");
+        })
+        .await;
+    }
+
+    /// A job on this machine counts toward a limit on jobs at once, but
+    /// takes none of the VM's memory: a full pool doesn't hold it back.
+    #[tokio::test]
+    async fn a_host_job_takes_a_place_only_under_a_limit_on_jobs() {
+        with_run_pool(async {
+            set_limit(Some(Limit::Memory {
+                bytes: 8 * 1024 * MIB,
+                slots: 1,
+            }));
+            let _vm = job_slot(None, None).await.unwrap();
+            let host = tokio::time::timeout(Duration::from_millis(50), host_job_slot()).await;
+            assert!(
+                matches!(host, Ok(None)),
+                "a host job waited for the VM's memory"
+            );
+        })
+        .await;
+        with_run_pool(async {
+            set_limit(Some(Limit::Jobs(1)));
+            let _held = host_job_slot().await.unwrap();
+            let second = tokio::time::timeout(Duration::from_millis(50), host_job_slot()).await;
+            assert!(second.is_err(), "a limit of one let two jobs run");
         })
         .await;
     }

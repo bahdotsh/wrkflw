@@ -795,9 +795,13 @@ fn written_by(text: &str, pid: u32) -> Option<Value> {
 }
 
 /// Whether this is a Mac running jobs in containers, where a `macos-*` job
-/// runs as Linux but `--macos-on-host` would run it on the Mac itself.
+/// runs as Linux but `--macos-on-host` would run it on the Mac itself. Not
+/// when the flag is already on: advice to pass it would be no help.
 pub(crate) fn mac_with_containers(runtime_flag: &str) -> bool {
-    cfg!(target_os = "macos") && runtime_flag != "emulation" && runtime_flag != "secure-emulation"
+    cfg!(target_os = "macos")
+        && runtime_flag != "emulation"
+        && runtime_flag != "secure-emulation"
+        && !wrkflw_executor::run_options::macos_on_host()
 }
 
 /// What a partial gate didn't check, one line per cause: jobs run as

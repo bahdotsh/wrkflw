@@ -100,6 +100,39 @@ pub(crate) fn for_job(
     asks_for_macos(job, matrix, platform_overrides).then_some(host)
 }
 
+/// The runner substitution to report for `job`, or its leg with `matrix`,
+/// in a run whose env is `env`. A job or leg that runs on the host is
+/// judged by the env its steps get there, not the run's container env, so
+/// a leg reused or folded into a twin isn't reported as run as Linux.
+pub(crate) fn substitution(
+    job: &Job,
+    matrix: Option<&HashMap<String, Value>>,
+    env: &HashMap<String, String>,
+    platform_overrides: &HashMap<String, String>,
+) -> Option<crate::runner_fidelity::RunnerSubstitution> {
+    match for_job(job, matrix, platform_overrides) {
+        Some(host) => {
+            let (env, _) = host.env_for(env, &HashMap::new());
+            crate::runner_fidelity::substitution(job, matrix, &env, platform_overrides)
+        }
+        None => crate::runner_fidelity::substitution(job, matrix, env, platform_overrides),
+    }
+}
+
+/// How a leg folded into a twin says where both ran: the host, for a leg
+/// run there, else the image.
+pub(crate) fn place(
+    job: &Job,
+    matrix: Option<&HashMap<String, Value>>,
+    platform_overrides: &HashMap<String, String>,
+    image: String,
+) -> String {
+    match for_job(job, matrix, platform_overrides) {
+        Some(_) => "this Mac's own environment (--macos-on-host)".to_string(),
+        None => image,
+    }
+}
+
 fn asks_for_macos(
     job: &Job,
     matrix: Option<&HashMap<String, Value>>,
@@ -192,6 +225,23 @@ mod tests {
         scope(Some(Arc::new(host())), async {
             assert!(legs_may_run_on_host(&matrix));
             assert!(!legs_may_run_on_host(&plain), "judged by its own env");
+        })
+        .await;
+    }
+
+    /// A macOS leg reused or folded into a twin under the flag ran on the
+    /// Mac, so it isn't reported as run as Linux; without the flag it is.
+    #[tokio::test]
+    async fn a_host_leg_is_reported_by_the_os_it_ran_as() {
+        let job = job("runs-on: ${{ matrix.os }}\nsteps: []\n");
+        let leg = HashMap::from([("os".to_string(), Value::from("macos-15"))]);
+        let run_env = map(&[("RUNNER_OS", "Linux")]);
+        let none = HashMap::new();
+        assert!(substitution(&job, Some(&leg), &run_env, &none).is_some());
+        scope(Some(Arc::new(host())), async {
+            assert!(substitution(&job, Some(&leg), &run_env, &none).is_none());
+            let linux = HashMap::from([("os".to_string(), Value::from("windows-latest"))]);
+            assert!(substitution(&job, Some(&linux), &run_env, &none).is_some());
         })
         .await;
     }

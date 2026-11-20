@@ -3521,7 +3521,7 @@ async fn execute_job_with_matrix(
                             stored.name
                         ));
                     }
-                    let runner = crate::runner_fidelity::substitution(
+                    let runner = crate::host_jobs::substitution(
                         job,
                         matrix,
                         env_context,
@@ -4223,13 +4223,18 @@ async fn execute_matrix_combinations(
         ordered.push(match twins[i] {
             None => results[position[i]].clone(),
             Some(original) => {
-                let image = get_effective_runner_image(
+                let image = crate::host_jobs::place(
                     ctx.job_template,
-                    ctx.services.platform_overrides,
                     Some(&combination.values),
+                    ctx.services.platform_overrides,
+                    get_effective_runner_image(
+                        ctx.job_template,
+                        ctx.services.platform_overrides,
+                        Some(&combination.values),
+                    ),
                 );
                 let name = wrkflw_matrix::format_combination_name(ctx.job_name, combination);
-                let runner = crate::runner_fidelity::substitution(
+                let runner = crate::host_jobs::substitution(
                     ctx.job_template,
                     Some(&combination.values),
                     ctx.env_context,

@@ -1,5 +1,10 @@
 name: Release
 
+# A tag with a suffix, such as v0.9.0-rc.1, is a rehearsal: it builds the
+# archives, publishes the runner base image and makes a GitHub pre-release,
+# and leaves crates.io alone. Use one to try scripts/install.sh
+# (WRKFLW_VERSION=v0.9.0-rc.1) and to make a new runner image's package
+# public before the release that needs it.
 on:
   push:
     tags:
@@ -111,8 +116,10 @@ jobs:
             --push .
       # GHCR makes a new package private. wrkflw pulls the base without
       # credentials and builds the whole image itself when it can't, so a
-      # private package fails nothing; it only takes away the faster first
-      # run. Say so, rather than fail the release.
+      # private package breaks no run: it takes away the faster first run,
+      # silently, on every machine. So a release stops here, before anything
+      # is published, until the package is public (rerun this job then); a
+      # rehearsal only says so, as it is how the package first appears.
       - name: Check the image can be pulled anonymously
         env:
           IMAGE: ${{ steps.image.outputs.name }}
@@ -125,7 +132,11 @@ jobs:
               -H "Authorization: Bearer ${token}" \
               -H "Accept: application/vnd.oci.image.index.v1+json" \
               "https://ghcr.io/v2/${name}/manifests/${tag}"; then
-            echo "::warning::${IMAGE} can't be pulled anonymously: make the package public in its settings, or wrkflw builds the image on each machine"
+            message="${IMAGE} can't be pulled anonymously: make the package public in its settings, or wrkflw builds the image on each machine"
+            case "$RELEASE_TAG" in
+              *-*) echo "::warning::${message}" ;;
+              *) echo "::error::${message}"; exit 1 ;;
+            esac
           fi
 
   build:
@@ -198,8 +209,9 @@ jobs:
     # After the runner base image: a published wrkflw pulls it on first run.
     needs: [build, changelog, runner-image]
     # Only publish on tag push — manual dispatch uses a branch ref, intentionally excluded
-    # because publishing to crates.io is irreversible
-    if: startsWith(github.ref, 'refs/tags/v')
+    # because publishing to crates.io is irreversible. A rehearsal tag
+    # (v0.9.0-rc.1) publishes nothing there either.
+    if: startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-')
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -246,4 +258,7 @@ jobs:
             ## What's Changed
             ${{ needs.changelog.outputs.changelog }}
           files: artifacts/*
+          # A rehearsal tag is a pre-release, which "latest" skips: install.sh
+          # and the weekly runner image refresh keep using the last release.
+          prerelease: ${{ contains(env.RELEASE_TAG, '-') }}
           generate_release_notes: false

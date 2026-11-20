@@ -3,3 +3,6 @@
 .claude/todos/
 
 .idea/
+
+# Left by a test run that was killed before it could clean up.
+crates/wrkflw/.needs-reusable-*/

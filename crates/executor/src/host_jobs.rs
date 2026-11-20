@@ -19,9 +19,46 @@ use wrkflw_runtime::container::ContainerRuntime;
 /// What a job run on the host runs with instead of the run's runtime.
 pub(crate) struct HostJobs {
     pub runtime: Box<dyn ContainerRuntime + Send + Sync>,
-    /// The run's env as emulation seeds it: host paths, `RUNNER_OS` macOS.
-    pub env: HashMap<String, String>,
-    pub user_env: HashMap<String, String>,
+    /// The env values emulation seeds where they differ from the run's:
+    /// host paths, `RUNNER_OS` macOS, and workflow `env:` resolved with
+    /// them. Laid over the env a job is handed, so what its caller gave it,
+    /// such as a called workflow's inputs and secrets, stays.
+    overlay: Vec<(String, String)>,
+}
+
+impl HostJobs {
+    /// `run_env` is the run's env as its container runtime seeds it, and
+    /// `host_env` the same run's env as emulation seeds it.
+    pub fn new(
+        runtime: Box<dyn ContainerRuntime + Send + Sync>,
+        run_env: &HashMap<String, String>,
+        host_env: HashMap<String, String>,
+    ) -> Self {
+        let overlay = host_env
+            .into_iter()
+            .filter(|(key, value)| run_env.get(key) != Some(value))
+            .collect();
+        HostJobs { runtime, overlay }
+    }
+
+    /// The env and user env a job handed `env` and `user_env` runs with on
+    /// the host. A user env key is changed only where the job has it, so
+    /// a called workflow's empty user env stays empty.
+    pub fn env_for(
+        &self,
+        env: &HashMap<String, String>,
+        user_env: &HashMap<String, String>,
+    ) -> (HashMap<String, String>, HashMap<String, String>) {
+        let mut env = env.clone();
+        let mut user_env = user_env.clone();
+        for (key, value) in &self.overlay {
+            env.insert(key.clone(), value.clone());
+            if let Some(slot) = user_env.get_mut(key) {
+                slot.clone_from(value);
+            }
+        }
+        (env, user_env)
+    }
 }
 
 tokio::task_local! {
@@ -71,12 +108,54 @@ mod tests {
         serde_yaml::from_str(yaml).unwrap()
     }
 
+    fn map(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
     fn host() -> HostJobs {
-        HostJobs {
-            runtime: Box::new(wrkflw_runtime::emulation::EmulationRuntime::new()),
-            env: HashMap::from([("RUNNER_OS".to_string(), "macOS".to_string())]),
-            user_env: HashMap::new(),
-        }
+        HostJobs::new(
+            Box::new(wrkflw_runtime::emulation::EmulationRuntime::new()),
+            &map(&[("RUNNER_OS", "Linux")]),
+            map(&[("RUNNER_OS", "macOS")]),
+        )
+    }
+
+    /// A called workflow's job keeps its inputs and secrets on the host,
+    /// and its empty user env gets none of the caller's workflow env.
+    #[test]
+    fn a_host_job_keeps_the_env_it_was_handed_with_host_values_laid_over_it() {
+        let run = map(&[
+            ("RUNNER_OS", "Linux"),
+            ("GITHUB_WORKSPACE", "/github/workspace"),
+            ("OUT", "/github/workspace/out"),
+            ("GITHUB_REPOSITORY", "o/r"),
+        ]);
+        let host_env = map(&[
+            ("RUNNER_OS", "macOS"),
+            ("GITHUB_WORKSPACE", "/tmp/ws"),
+            ("OUT", "/tmp/ws/out"),
+            ("GITHUB_REPOSITORY", "o/r"),
+        ]);
+        let host = HostJobs::new(
+            Box::new(wrkflw_runtime::emulation::EmulationRuntime::new()),
+            &run,
+            host_env,
+        );
+        let mut called = run.clone();
+        called.insert("INPUT_TARGET".into(), "release".into());
+        called.insert("SECRET_TOKEN".into(), "s3cret".into());
+        let (env, user_env) = host.env_for(&called, &HashMap::new());
+        assert_eq!(env["INPUT_TARGET"], "release");
+        assert_eq!(env["SECRET_TOKEN"], "s3cret");
+        assert_eq!(env["RUNNER_OS"], "macOS");
+        assert_eq!(env["GITHUB_WORKSPACE"], "/tmp/ws");
+        assert!(user_env.is_empty(), "{user_env:?}");
+
+        let (_, user_env) = host.env_for(&run, &map(&[("OUT", "/github/workspace/out")]));
+        assert_eq!(user_env["OUT"], "/tmp/ws/out");
     }
 
     #[tokio::test]

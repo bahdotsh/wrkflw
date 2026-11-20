@@ -184,9 +184,9 @@ async fn execute_github_workflow(
         ExecutionError::Execution(format!("Failed to setup GitHub env files: {}", e))
     })?;
 
-    // `macos-*` jobs on this Mac, when asked: the env emulation would give.
+    // `macos-*` jobs on this Mac, when asked, with the env emulation gives.
     let host_jobs = if crate::host_jobs::wanted(&config.runtime_type) {
-        let (mut env, user_env) = github_run_env(
+        let (host_env, _) = github_run_env(
             &workflow,
             workspace_dir.path(),
             &RuntimeType::Emulation,
@@ -196,19 +196,24 @@ async fn execute_github_workflow(
                 base_branch: config.base_branch.as_deref(),
             },
         )?;
-        if let Some(hide) = env_context.get("WRKFLW_HIDE_ACTION_MESSAGES") {
-            env.insert("WRKFLW_HIDE_ACTION_MESSAGES".to_string(), hide.clone());
-        }
         wrkflw_logging::warning(
             "macos-* jobs run on this Mac itself (--macos-on-host), with no container \
              around their steps",
         );
-        Some(std::sync::Arc::new(crate::host_jobs::HostJobs {
-            runtime: Box::new(emulation::EmulationRuntime::new()),
-            env,
-            user_env,
-        }))
+        Some(std::sync::Arc::new(crate::host_jobs::HostJobs::new(
+            Box::new(emulation::EmulationRuntime::new()),
+            &env_context,
+            host_env,
+        )))
     } else {
+        if crate::run_options::macos_on_host() {
+            wrkflw_logging::warning(&format!(
+                "--macos-on-host has no effect here: it runs macos-* jobs on a Mac whose \
+                 other jobs run in containers, and this run is on {} with {}",
+                std::env::consts::OS,
+                config.runtime_type.mode_name()
+            ));
+        }
         None
     };
 
@@ -3376,13 +3381,14 @@ async fn execute_job_with_matrix(
         .is_none()
         .then(|| crate::host_jobs::for_job(job, None, platform_overrides))
         .flatten();
-    let (runtime, env_context, user_env) = match &host {
-        Some(host) => (
-            host.runtime.as_ref() as &dyn ContainerRuntime,
-            &host.env,
-            &host.user_env,
-        ),
-        None => (runtime, env_context, user_env),
+    let host_env = host
+        .as_ref()
+        .map(|host| host.env_for(env_context, user_env));
+    let (runtime, env_context, user_env) = match (&host, &host_env) {
+        (Some(host), Some((env, user))) => {
+            (host.runtime.as_ref() as &dyn ContainerRuntime, env, user)
+        }
+        _ => (runtime, env_context, user_env),
     };
 
     // Build filtered needs context for this job (only jobs declared in `needs:`)
@@ -3811,11 +3817,13 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
     })?;
 
     // The job's workspace, kept from its last run so builds are incremental.
-    let job_dir =
-        crate::workspace::JobWorkspace::acquire(&current_dir, &ctx.workflow.name, ctx.job_name)
-            .map_err(|e| {
-                ExecutionError::Execution(format!("Failed to create job directory: {}", e))
-            })?;
+    let job_dir = crate::workspace::JobWorkspace::acquire(
+        &current_dir,
+        &ctx.workflow.name,
+        ctx.job_name,
+        runs_on_host(&job_env),
+    )
+    .map_err(|e| ExecutionError::Execution(format!("Failed to create job directory: {}", e)))?;
 
     wrkflw_logging::info(&format!("Executing job: {}", ctx.job_name));
 
@@ -4114,13 +4122,14 @@ async fn execute_matrix_combinations(
                     ctx.services.platform_overrides,
                 );
                 async move {
-                    let (runtime, env_context, user_env) = match &host {
-                        Some(host) => (
-                            host.runtime.as_ref() as &dyn ContainerRuntime,
-                            &host.env,
-                            &host.user_env,
-                        ),
-                        None => (ctx.runtime, ctx.env_context, ctx.user_env),
+                    let host_env = host
+                        .as_ref()
+                        .map(|host| host.env_for(ctx.env_context, ctx.user_env));
+                    let (runtime, env_context, user_env) = match (&host, &host_env) {
+                        (Some(host), Some((env, user))) => {
+                            (host.runtime.as_ref() as &dyn ContainerRuntime, env, user)
+                        }
+                        _ => (ctx.runtime, ctx.env_context, ctx.user_env),
                     };
                     crate::job_memory::metered(
                         job_session::with_job_session(
@@ -4326,11 +4335,13 @@ async fn execute_matrix_job(
     })?;
 
     // The job's workspace, kept from its last run so builds are incremental.
-    let job_dir =
-        crate::workspace::JobWorkspace::acquire(&current_dir, &workflow.name, &matrix_job_name)
-            .map_err(|e| {
-                ExecutionError::Execution(format!("Failed to create job directory: {}", e))
-            })?;
+    let job_dir = crate::workspace::JobWorkspace::acquire(
+        &current_dir,
+        &workflow.name,
+        &matrix_job_name,
+        runs_on_host(&job_env),
+    )
+    .map_err(|e| ExecutionError::Execution(format!("Failed to create job directory: {}", e)))?;
 
     // Pre-resolve ${{ matrix.X }} in all step `with` values so that every downstream
     // consumer (detect_setup_runtimes, INPUT_* env vars, composite action inputs, etc.)

@@ -4,7 +4,9 @@ use crate::{is_gitlab_pipeline, prefilter, OutputFormat, RuntimeChoice};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use wrkflw_executor::runner_fidelity::{requested_os, runner_os_for, RequestedOs};
+use wrkflw_executor::runner_fidelity::{
+    macos_jobs_on_host, requested_os, runner_os_for, RequestedOs,
+};
 use wrkflw_parser::workflow::{Job, WorkflowDefinition};
 use wrkflw_runs::SCHEMA_VERSION;
 use wrkflw_secrets::{SecretError, SecretManager, SecretSubstitution};
@@ -161,9 +163,13 @@ fn requested(
 /// asks for, in the shape `run_finished` reports them.
 fn unverified(requests: &[(String, RequestedOs)], runtime: RuntimeChoice) -> Vec<Value> {
     let oses: Vec<&str> = requests.iter().map(|(_, request)| request.os).collect();
-    let ran_as = runner_os_for(runtime.into(), &oses);
+    let runtime: wrkflw_executor::RuntimeType = runtime.into();
+    let ran_as = runner_os_for(runtime.clone(), &oses);
+    // With `--macos-on-host` a macOS job runs as macOS, on this Mac.
+    let mac_on_host = macos_jobs_on_host(runtime);
     requests
         .iter()
+        .filter(|(_, request)| !(mac_on_host && request.os == "macOS"))
         .filter_map(|(name, request)| Some(request.ran_as(&ran_as)?.unverified_entry(name)))
         .collect()
 }

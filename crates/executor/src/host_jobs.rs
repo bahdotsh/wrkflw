@@ -12,9 +12,10 @@ use crate::engine::RuntimeType;
 use serde_yaml::Value;
 use std::collections::HashMap;
 use std::future::Future;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use wrkflw_parser::workflow::Job;
-use wrkflw_runtime::container::ContainerRuntime;
+use wrkflw_runtime::container::{ContainerError, ContainerOutput, ContainerRuntime};
 
 /// What a job run on the host runs with instead of the run's runtime.
 pub(crate) struct HostJobs {
@@ -38,7 +39,10 @@ impl HostJobs {
             .into_iter()
             .filter(|(key, value)| run_env.get(key) != Some(value))
             .collect();
-        HostJobs { runtime, overlay }
+        HostJobs {
+            runtime: Box::new(OffTask(Arc::from(runtime))),
+            overlay,
+        }
     }
 
     /// The env and user env a job handed `env` and `user_env` runs with on
@@ -61,6 +65,121 @@ impl HostJobs {
     }
 }
 
+/// A runtime whose steps run off the task that drives the run's jobs.
+///
+/// Emulation waits for a step's process in place, without yielding. A
+/// run's jobs, and the legs of a matrix chunk, are all polled from one
+/// task, so a host job's long `brew install` would stop the container jobs
+/// beside it until it ended. Here each step waits on a blocking thread.
+struct OffTask(Arc<dyn ContainerRuntime + Send + Sync>);
+
+#[async_trait::async_trait]
+impl ContainerRuntime for OffTask {
+    async fn run_container(
+        &self,
+        image: &str,
+        cmd: &[&str],
+        env_vars: &[(&str, &str)],
+        working_dir: &Path,
+        volumes: &[(&Path, &Path)],
+        entrypoint: Option<&str>,
+    ) -> Result<ContainerOutput, ContainerError> {
+        let runtime = Arc::clone(&self.0);
+        let image = image.to_string();
+        let cmd: Vec<String> = cmd.iter().map(|s| s.to_string()).collect();
+        let env: Vec<(String, String)> = env_vars
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let working_dir = working_dir.to_path_buf();
+        let volumes: Vec<(PathBuf, PathBuf)> = volumes
+            .iter()
+            .map(|(host, inside)| (host.to_path_buf(), inside.to_path_buf()))
+            .collect();
+        let entrypoint = entrypoint.map(str::to_string);
+        // The step's output goes to the tap of this task, which the thread
+        // below doesn't have: it is carried there.
+        let tap = wrkflw_runtime::live_output::current();
+        tokio::task::spawn_blocking(move || {
+            let cmd: Vec<&str> = cmd.iter().map(String::as_str).collect();
+            let env: Vec<(&str, &str)> =
+                env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+            let volumes: Vec<(&Path, &Path)> = volumes
+                .iter()
+                .map(|(host, inside)| (host.as_path(), inside.as_path()))
+                .collect();
+            let run = runtime.run_container(
+                &image,
+                &cmd,
+                &env,
+                &working_dir,
+                &volumes,
+                entrypoint.as_deref(),
+            );
+            match tap {
+                Some(tap) => futures::executor::block_on(
+                    wrkflw_runtime::live_output::with_output_tap(tap, run),
+                ),
+                None => futures::executor::block_on(run),
+            }
+        })
+        .await
+        .map_err(|e| ContainerError::ContainerExecution(format!("The step's thread failed: {e}")))?
+    }
+
+    async fn pull_image(&self, image: &str) -> Result<(), ContainerError> {
+        self.0.pull_image(image).await
+    }
+
+    async fn build_image(
+        &self,
+        dockerfile: &Path,
+        tag: &str,
+        context_dir: &Path,
+    ) -> Result<(), ContainerError> {
+        self.0.build_image(dockerfile, tag, context_dir).await
+    }
+
+    async fn prepare_language_environment(
+        &self,
+        language: &str,
+        version: Option<&str>,
+        additional_packages: Option<Vec<String>>,
+    ) -> Result<String, ContainerError> {
+        self.0
+            .prepare_language_environment(language, version, additional_packages)
+            .await
+    }
+
+    async fn image_exists(&self, tag: &str) -> Result<bool, ContainerError> {
+        self.0.image_exists(tag).await
+    }
+
+    async fn image_id(&self, image: &str) -> Option<String> {
+        self.0.image_id(image).await
+    }
+
+    fn identifies_images(&self) -> bool {
+        self.0.identifies_images()
+    }
+
+    fn mounts_are_copies(&self) -> bool {
+        self.0.mounts_are_copies()
+    }
+
+    fn session_cli(&self) -> Option<&'static str> {
+        self.0.session_cli()
+    }
+
+    fn reuses_build_layers(&self) -> bool {
+        self.0.reuses_build_layers()
+    }
+
+    fn flattens_commands(&self) -> bool {
+        self.0.flattens_commands()
+    }
+}
+
 tokio::task_local! {
     static HOST_JOBS: Arc<HostJobs>;
 }
@@ -71,6 +190,11 @@ pub(crate) fn wanted(runtime: &RuntimeType) -> bool {
 }
 
 /// Run `future`, a run's jobs, with `host` for its macOS jobs.
+///
+/// `host` is task-local: whatever decides how a job runs, its reuse key and
+/// where its result is kept must be polled inside this scope. Moving a job
+/// to another task with `tokio::spawn` would quietly run its macOS legs in
+/// containers again, and file a host pass under a container's key.
 pub(crate) async fn scope<F: Future>(host: Option<Arc<HostJobs>>, future: F) -> F::Output {
     match host {
         Some(host) => HOST_JOBS.scope(host, future).await,
@@ -198,6 +322,59 @@ mod tests {
 
         let (_, user_env) = host.env_for(&run, &map(&[("OUT", "/github/workspace/out")]));
         assert_eq!(user_env["OUT"], "/tmp/ws/out");
+    }
+
+    /// A host step waits on a thread of its own: a job polled beside it,
+    /// as every job of a batch is, goes on while it runs.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_long_host_step_does_not_hold_up_the_jobs_beside_it() {
+        let host = host();
+        let dir = tempfile::tempdir().unwrap();
+        let volumes = [(dir.path(), Path::new("/github/workspace"))];
+        let started = std::time::Instant::now();
+        let step = host
+            .runtime
+            .run_container("", &["sleep", "2"], &[], dir.path(), &volumes, None);
+        let beside = async {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            started.elapsed()
+        };
+        let (step, beside) = tokio::join!(step, beside);
+        assert_eq!(step.unwrap().exit_code, 0);
+        assert!(
+            beside < std::time::Duration::from_secs(1),
+            "the job beside waited {beside:?} for the host step"
+        );
+    }
+
+    /// The step's output still reaches the tap of the job that ran it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_host_step_streams_to_its_jobs_tap() {
+        let host = host();
+        let dir = tempfile::tempdir().unwrap();
+        let seen = Arc::new(std::sync::Mutex::new(String::new()));
+        let tap = wrkflw_runtime::live_output::OutputTap::new({
+            let seen = Arc::clone(&seen);
+            move |_, chunk| seen.lock().unwrap().push_str(chunk)
+        });
+        let output = wrkflw_runtime::live_output::with_output_tap(
+            tap,
+            host.runtime.run_container(
+                "",
+                &["echo", "hello"],
+                &[],
+                dir.path(),
+                &[(dir.path(), Path::new("/github/workspace"))],
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(output.stdout.contains("hello"), "{output:?}");
+        let seen = seen.lock().unwrap();
+        assert!(seen.contains("hello"), "{seen:?}");
     }
 
     #[tokio::test]

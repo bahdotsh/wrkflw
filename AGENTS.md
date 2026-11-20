@@ -95,4 +95,5 @@ The run also records your session, from `--session`, `WRKFLW_SESSION`, `CLAUDE_C
 - `--from-step` needs `--job`. Earlier steps are skipped apart from `actions/checkout`, so their outputs and files are missing. Use it to iterate on a step that doesn't depend on them.
 - `runs replay` reruns against the current working tree. Compare `git_sha` and `git_dirty` on the record if the result differs.
 - `--runtime emulation` runs steps directly on this machine. Use a container runtime or `secure-emulation` for code you don't trust.
+- `--macos-on-host` (`WRKFLW_MACOS_ON_HOST=1`) does the same for `macos-*` jobs: their steps run on this Mac with no container and see this shell's environment, credentials included. Don't pass it, even when `run` or `gate` suggests it, for a repository you don't trust.
 - `plan` reports a matrix computed by expressions as `dynamic`, because it is only known at run time.

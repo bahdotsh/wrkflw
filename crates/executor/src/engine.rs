@@ -192,7 +192,8 @@ async fn execute_github_workflow(
             github_run_env_from(github_context, &workflow, &RuntimeType::Emulation)?;
         wrkflw_logging::warning(
             "macos-* jobs run on this Mac itself (--macos-on-host), with no container \
-             around their steps",
+             around their steps: they can change this machine, and they see this shell's \
+             environment, credentials included",
         );
         Some(std::sync::Arc::new(crate::host_jobs::HostJobs::new(
             Box::new(emulation::EmulationRuntime::new()),
@@ -461,6 +462,13 @@ async fn execute_gitlab_pipeline(
     // Create a temporary workspace directory
     let workspace_dir = tempfile::tempdir()
         .map_err(|e| ExecutionError::Execution(format!("Failed to create workspace: {}", e)))?;
+
+    if crate::run_options::macos_on_host() {
+        wrkflw_logging::warning(
+            "--macos-on-host has no effect on a GitLab pipeline: it runs a GitHub workflow's \
+             macos-* jobs",
+        );
+    }
 
     // 5. Set up GitLab-like environment
     let mut env_context = create_gitlab_context(&pipeline, workspace_dir.path());
@@ -11784,6 +11792,141 @@ runs:
         async fn image_exists(&self, _tag: &str) -> Result<bool, ContainerError> {
             Ok(true)
         }
+    }
+
+    /// Records the `RUNNER_OS` of each step it is given to run.
+    #[derive(Default)]
+    struct RunnerOsRuntime {
+        seen: Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ContainerRuntime for RunnerOsRuntime {
+        async fn run_container(
+            &self,
+            _image: &str,
+            _cmd: &[&str],
+            env_vars: &[(&str, &str)],
+            _working_dir: &Path,
+            _volumes: &[(&Path, &Path)],
+            _entrypoint: Option<&str>,
+        ) -> Result<ContainerOutput, ContainerError> {
+            let os = env_vars
+                .iter()
+                .find(|(k, _)| *k == "RUNNER_OS")
+                .map(|(_, v)| v.to_string())
+                .unwrap_or_default();
+            self.seen.lock().unwrap().push(os);
+            Ok(ContainerOutput {
+                stdout: String::new(),
+                stderr: String::new(),
+                exit_code: 0,
+            })
+        }
+
+        async fn pull_image(&self, _image: &str) -> Result<(), ContainerError> {
+            Ok(())
+        }
+
+        async fn build_image(
+            &self,
+            _dockerfile: &Path,
+            _tag: &str,
+            _context_dir: &Path,
+        ) -> Result<(), ContainerError> {
+            Ok(())
+        }
+
+        async fn prepare_language_environment(
+            &self,
+            _language: &str,
+            _version: Option<&str>,
+            _additional_packages: Option<Vec<String>>,
+        ) -> Result<String, ContainerError> {
+            Ok("mock:latest".to_string())
+        }
+
+        async fn image_exists(&self, _tag: &str) -> Result<bool, ContainerError> {
+            Ok(true)
+        }
+    }
+
+    /// Under `--macos-on-host` a matrix's macOS leg runs on this machine as
+    /// macOS, its Linux leg in the run's container runtime as Linux, and the
+    /// two aren't folded into one though they share an image and steps.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_mixed_matrix_runs_its_macos_leg_on_the_host_and_the_rest_in_containers() {
+        let run_dir = tempfile::tempdir().unwrap();
+        let path = run_dir.path().join("ci.yml");
+        fs::write(
+            &path,
+            "name: CI\non: push\njobs:\n  build:\n    runs-on: ${{ matrix.os }}\n    \
+             strategy:\n      matrix:\n        os: [ubuntu-latest, macos-15]\n    \
+             steps:\n      - run: echo \"os=$RUNNER_OS\"\n",
+        )
+        .unwrap();
+        let workflow = parse_workflow(&path).unwrap();
+        environment::setup_github_environment_files(run_dir.path()).unwrap();
+        let context = environment::create_github_context(
+            &workflow,
+            run_dir.path(),
+            &environment::RunRef::default(),
+        );
+        let (env_context, user_env) =
+            github_run_env_from(context.clone(), &workflow, &RuntimeType::Docker).unwrap();
+        let (host_env, _) =
+            github_run_env_from(context, &workflow, &RuntimeType::Emulation).unwrap();
+        let host = crate::host_jobs::HostJobs::new(
+            Box::new(emulation::EmulationRuntime::new()),
+            &env_context,
+            host_env,
+        );
+
+        let runtime = RunnerOsRuntime::default();
+        let results = crate::host_jobs::scope(
+            Some(std::sync::Arc::new(host)),
+            execute_job_batch(
+                &["build".to_string()],
+                &workflow,
+                &runtime,
+                &env_context,
+                &user_env,
+                false,
+                None,
+                None,
+                &HashMap::new(),
+                &HashMap::new(),
+                &crate::artifacts::ArtifactStore::new(run_dir.path()).unwrap(),
+                &crate::cache::CacheStore::new().unwrap(),
+                &HashMap::new(),
+            ),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            *runtime.seen.lock().unwrap(),
+            ["Linux"],
+            "only the Linux leg"
+        );
+        let leg = |os: &str| {
+            results
+                .iter()
+                .find(|r| r.name.contains(os))
+                .unwrap_or_else(|| {
+                    let names: Vec<&str> = results.iter().map(|r| r.name.as_str()).collect();
+                    panic!("no {os} leg in {names:?}")
+                })
+        };
+        let mac = leg("macos-15");
+        assert_eq!(mac.status, JobStatus::Success, "{:?}", mac.steps);
+        assert!(
+            mac.steps.iter().any(|s| s.output.contains("os=macOS")),
+            "{:?}",
+            mac.steps
+        );
+        assert_eq!(leg("ubuntu-latest").status, JobStatus::Success);
     }
 
     /// Run `jobs` of `yaml` at once, each step held open until two overlap.

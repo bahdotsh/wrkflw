@@ -6,8 +6,10 @@
 # WRKFLW_VERSION   a release tag such as v0.9.0 (default: the latest release)
 # WRKFLW_INSTALL_DIR  where the binary goes (default: ~/.local/bin)
 #
-# The archive is checked against the release's SHA256SUMS; a release
-# published without one is refused unless WRKFLW_NO_VERIFY=1.
+# The archive is checked against the release's SHA256SUMS, which catches a
+# corrupt or cut-short download; it comes from the same release, so it
+# vouches for integrity, not for who published it. A release published
+# without one is refused unless WRKFLW_NO_VERIFY=1.
 # Linux on x86_64 gets the static musl build, which runs on any distribution.
 # On Windows, download wrkflw-x86_64-pc-windows-msvc.zip from the release page.
 
@@ -92,7 +94,14 @@ or pick a newer WRKFLW_VERSION"
   chmod 755 "$INSTALL_DIR/.wrkflw.new"
   mv -f "$INSTALL_DIR/.wrkflw.new" "$INSTALL_DIR/wrkflw"
 
-  say "installed $("$INSTALL_DIR/wrkflw" --version 2>/dev/null || echo wrkflw) to $INSTALL_DIR/wrkflw"
+  # A binary built for a newer system than this one fails here, for
+  # instance an arm64 Linux build on a distribution with an older glibc.
+  if version=$("$INSTALL_DIR/wrkflw" --version 2>&1); then
+    say "installed $version to $INSTALL_DIR/wrkflw"
+  else
+    say "installed $INSTALL_DIR/wrkflw, but it doesn't run here: $version"
+    die "install with \`cargo install wrkflw\` instead"
+  fi
   case ":$PATH:" in
     *":$INSTALL_DIR:"*) ;;
     *) say "add $INSTALL_DIR to your PATH to run it as \`wrkflw\`" ;;

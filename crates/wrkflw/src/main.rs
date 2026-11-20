@@ -178,8 +178,9 @@ struct Wrkflw {
 
     /// On a Mac, run `macos-*` jobs on the Mac itself, under emulation,
     /// while the other jobs keep their containers. Their pass then checks
-    /// macOS, but their steps run with no container around them, so a
-    /// `brew install` changes this machine
+    /// macOS, but their steps run with no container around them: a
+    /// `brew install` changes this machine, and they see this shell's
+    /// environment, credentials included
     #[arg(
         long,
         global = true,
@@ -2582,6 +2583,7 @@ mod tests {
             "WRKFLW_EVERY_MATRIX_LEG",
             "WRKFLW_STEP_CONTAINERS",
             "WRKFLW_DOCKER_IN_JOBS",
+            "WRKFLW_MACOS_ON_HOST",
         ]
         .into_iter()
         .map(|name| (name, std::env::var_os(name)))
@@ -2621,6 +2623,7 @@ mod tests {
             std::env::set_var("WRKFLW_EVERY_MATRIX_LEG", value);
             std::env::set_var("WRKFLW_STEP_CONTAINERS", value);
             std::env::set_var("WRKFLW_DOCKER_IN_JOBS", value);
+            std::env::set_var("WRKFLW_MACOS_ON_HOST", value);
             // The executor reads the same variables; it must agree.
             assert_eq!(
                 wrkflw_executor::run_options::switch_is_on(value),
@@ -2633,6 +2636,7 @@ mod tests {
                 cli.every_matrix_leg, on,
                 "WRKFLW_EVERY_MATRIX_LEG={value:?}"
             );
+            assert_eq!(cli.macos_on_host, on, "WRKFLW_MACOS_ON_HOST={value:?}");
             assert_eq!(
                 run_flags(),
                 (on, on),

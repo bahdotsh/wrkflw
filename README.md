@@ -5,9 +5,64 @@
 [![Build Status](https://img.shields.io/github/actions/workflow/status/bahdotsh/wrkflw/ci.yml?branch=main)](https://github.com/bahdotsh/wrkflw/actions/workflows/ci.yml)
 [![Downloads](https://img.shields.io/crates/d/wrkflw)](https://crates.io/crates/wrkflw)
 
-A command-line tool for validating and executing GitHub Actions workflows locally. Test your workflows on your machine before pushing to GitHub.
+**Run your GitHub Actions workflows on your own machine, and get the verdict GitHub would give.**
+
+`wrkflw gate` runs everything CI would run for a push, in Docker or Podman, before the push leaves your machine. Every run ends with a verdict that says how much its pass proves: `verified`, `partial` (and what wasn't checked), or `nothing_checked`. And `wrkflw compare <run URL>` checks wrkflw itself against a finished GitHub run, job by job.
 
 ![WRKFLW Demo](demo.gif)
+
+## How close to GitHub
+
+We rerun finished GitHub runs of open-source repositories with `wrkflw compare`. The last sweep (2026-11-19, on the 0.9.0 code): a job agrees when both sides passed or both failed; not compared are the Windows jobs, which run on a Linux stand-in. Jobs agreed include `macos-*` jobs run as Linux, which `compare` counts as agreeing unverified (`--macos-on-host` runs them on a Mac instead). Local times are warm, on a Mac with a 7.7 GB Docker VM.
+
+| Repository | Jobs agreed | Differed | Not compared | Local | GitHub |
+|---|---|---|---|---|---|
+| pallets/click | 10 | 0 | 1 | 38 s | 65 s |
+| chalk/chalk | 2 | 0 | 0 | 13 s | 39 s |
+| sindresorhus/ky | 4 | 0 | 0 | 130 s | 187 s |
+| rust-lang/log | 10 | 1 | 2 | 362 s | 527 s |
+| dtolnay/itoa | 8 | 3 | 0 | 101 s | 346 s |
+| tj/commander.js | 6 | 0 | 3 | 67 s | 99 s |
+| spf13/cobra | 18 | 0 | 1 | 134 s | 99 s |
+| fatih/color | 1 | 0 | 0 | 25 s | 57 s |
+| pallets/flask | 11 | 0 | 1 | 32 s | 44 s |
+
+rust-lang/log's one difference is its documentation job, which fails on Rust 1.100, released after its GitHub run, as `stable` floats. itoa's three verify an attestation with the job's GitHub token, which a local job doesn't get unless `WRKFLW_JOB_GITHUB_TOKEN=1` gives it yours.
+
+These nine repositories are the ones wrkflw has been fixed against. [`held_out_runs.txt`](scripts/conformance/held_out_runs.txt) lists fourteen more it has never been tuned for, with services, wide OS matrices and a known failure, to measure how it does on a repository it hasn't seen. See [Conformance](#conformance) to run either sweep yourself.
+
+## Quick Start
+
+```bash
+cargo binstall wrkflw          # or: brew install wrkflw, or see Installation
+
+wrkflw doctor                  # what runs here would use, and what would slow them down
+wrkflw gate                    # run what CI would run for this push
+wrkflw gate --install-hook     # ...and do it before every push
+wrkflw run .github/workflows/ci.yml
+wrkflw                         # the TUI
+```
+
+### Check every push before it leaves
+
+Add the gate to a repository once, and every `git push` first runs what CI would run for it:
+
+```bash
+wrkflw doctor                  # Docker answering, with enough memory?
+wrkflw gate --install-hook     # writes .git/hooks/pre-push; an existing hook is left alone
+```
+
+Then tell it what must only ever run in CI. The gate runs jobs with this machine's credentials and can't tell a deploy from a test, so mark deploys and releases in `.wrkflw/affected.yml`:
+
+```yaml
+jobs:
+  deploy:
+    gate: false     # the gate reports it skipped, with every job that needs it
+  release:
+    gate: false
+```
+
+A push the gate fails is stopped with the job, step and error lines that failed. `git push --no-verify` skips it once. A `partial` pass says on one line each what it didn't check, such as a `macos-*` job run as Linux or an action that didn't run. The hook keeps the `--runtime` and `--remote-cache` you install it with, so jobs that already passed in CI can be [reused](#sharing-results-across-machines) instead of rerun. See [Spending less on CI](#spending-less-on-ci) for everything it does.
 
 ## Features
 
@@ -43,10 +98,24 @@ A command-line tool for validating and executing GitHub Actions workflows locall
 - Service settings that reach the host — a service's `volumes:` can only name a volume, not a host path, and its `options:` only take flags that shape the service container itself, such as `--health-cmd`, `--user`, `--tmpfs` and `-e NAME=value`. Anything else, such as `--privileged` or `-v`, fails the job.
 - Services that listen on the same port — services share the job container's network, as they do on a GitHub runner, so two Postgres services can't both have 5432. wrkflw refuses two services whose `ports:` name the same container port, and warns about two services of one image.
 - A job with `services:` runs its steps in one container with them, which needs `sh` and `env` in the job's image. Files a step leaves outside the workspace are there for the next step, and `--preserve-containers-on-failure` doesn't keep that container.
-- Windows and macOS runners — `runs-on: windows-*` / `macos-*` runs as Linux, in the same Ubuntu image as `ubuntu-latest`, as a Linux Docker engine can't start a Windows image. Map the label to an image of your own with `-P`, such as a Windows image on a Windows engine. In container runtimes `${{ runner.os }}` is `Linux` and `runner.temp` and the other runner paths are Linux paths, even for a Windows image, so a job on a Windows container sees the wrong values. `wrkflw compare` leaves a Windows job's result out of its agreement, as its steps call Windows tools; a macOS job's result is compared. In emulation `runner.os` is the host OS. Every job whose `runs-on` names another OS than it ran as is listed under `unverified` in `run_finished` and in the `gate` result, logged as a warning, and marked on the job's line in the TUI, because its pass says nothing about OS-specific steps. `wrkflw plan` lists the same jobs before a run.
+- Windows and macOS runners — `runs-on: windows-*` / `macos-*` runs as Linux, in the same Ubuntu image as `ubuntu-latest`, as a Linux Docker engine can't start a Windows image. Map the label to an image of your own with `-P`, such as a Windows image on a Windows engine. On a Mac, `--macos-on-host` (or `WRKFLW_MACOS_ON_HOST=1`) runs `macos-*` jobs on the Mac itself, under emulation, while the other jobs keep their containers: their pass then checks macOS, but their steps run with no container around them, so a `brew install` in one changes your machine. They have no terminal to ask for input at, so a step that does, such as `sudo` asking for a password, fails at once instead of waiting: GitHub's macOS runners have passwordless `sudo`, this Mac usually hasn't. The check is of the OS, not the version or architecture: on an Apple Silicon Mac a `macos-13` job, an Intel runner on GitHub, runs on Apple Silicon. In container runtimes `${{ runner.os }}` is `Linux` and `runner.temp` and the other runner paths are Linux paths, even for a Windows image, so a job on a Windows container sees the wrong values. `wrkflw compare` leaves a Windows job's result out of its agreement, as its steps call Windows tools; a macOS job's result is compared. In emulation `runner.os` is the host OS. Every job whose `runs-on` names another OS than it ran as is listed under `unverified` in `run_finished` and in the `gate` result, logged as a warning, and marked on the job's line in the TUI, because its pass says nothing about OS-specific steps. `wrkflw plan` lists the same jobs before a run.
 - `working-directory` outside the workspace — it must stay inside the workspace, so `${{ runner.temp }}/build` fails the step instead of running there.
 
 ## Installation
+
+A prebuilt binary, with no Rust toolchain needed:
+
+```bash
+# With cargo-binstall
+cargo binstall wrkflw
+
+# Or with the install script (Linux and macOS), which checks the download
+# against the release's SHA256SUMS. WRKFLW_VERSION and WRKFLW_INSTALL_DIR
+# (default ~/.local/bin) choose the release and where it goes.
+curl -fsSL https://raw.githubusercontent.com/bahdotsh/wrkflw/main/scripts/install.sh | sh
+```
+
+Each [release](https://github.com/bahdotsh/wrkflw/releases) also has the archives to download by hand, Windows included. Or build it:
 
 ```bash
 cargo install wrkflw
@@ -66,7 +135,7 @@ cd wrkflw
 cargo build --release
 ```
 
-## Quick Start
+## More commands
 
 ```bash
 # Launch the TUI (auto-detects .gitea/workflows and .github/workflows)
@@ -83,6 +152,9 @@ wrkflw watch
 
 # List detected workflows and pipelines
 wrkflw list
+
+# Check the runtime, its memory, the runner base image, a GitHub token and git
+wrkflw doctor
 ```
 
 ## Usage
@@ -170,7 +242,7 @@ export WRKFLW_PLATFORM=ubuntu-latest=catthehacker/ubuntu:act-latest
 
 Two defaults make a rerun cheaper than a hosted runner's cold start. Both work the same for any language or toolchain.
 
-- **Each GitHub Actions job keeps its workspace.** GitLab pipelines still start each run in an empty workspace. Checkout syncs the source files into it, and leaves alone anything the repository ignores, such as build output, `node_modules` or a virtualenv. The second run of a build is therefore incremental. Unchanged files keep their timestamps, and files deleted from the repository are deleted from the workspace too. Workspaces live under your cache directory in `wrkflw/workspaces` (`~/Library/Caches` on macOS, `~/.cache` on Linux), one per repository, workflow file and job. Set `WRKFLW_WORKSPACES_DIR` to keep them somewhere else, such as a larger disk. `--fresh-workspace` or `WRKFLW_FRESH_WORKSPACE=1` gives every job an empty workspace, as a hosted runner does.
+- **Each GitHub Actions job keeps its workspace.** GitLab pipelines still start each run in an empty workspace. Checkout syncs the source files into it, and leaves alone anything the repository ignores, such as build output, `node_modules` or a virtualenv. The second run of a build is therefore incremental. Unchanged files keep their timestamps, and files deleted from the repository are deleted from the workspace too. Workspaces live under your cache directory in `wrkflw/workspaces` (`~/Library/Caches` on macOS, `~/.cache` on Linux), one per repository, workflow file and job, and apart for a job run on this machine (emulation, or `--macos-on-host`) and the same job in a container: what a build leaves for one is wrong for the other. Upgrading to 0.9.0, a job run with `--runtime emulation` starts from an empty workspace once, and `wrkflw clean` removes its old one. Set `WRKFLW_WORKSPACES_DIR` to keep them somewhere else, such as a larger disk. `--fresh-workspace` or `WRKFLW_FRESH_WORKSPACE=1` gives every job an empty workspace, as a hosted runner does.
 - **Matrix legs that only pick a runner run once.** Locally, `runs-on: ${{ matrix.os }}` maps every OS to the same image. If a leg differs from another only in values that `runs-on` reads, or that nothing in the job reads, such as a `name` the job's display name uses, and at least one of them picks the runner, and the two would run in the same image, that leg reports the other's result instead of repeating it. Legs on the same runner always run, so `attempt: [1, 2, 3]` still repeats a job. Its history record and its `job_finished` event carry `repeated_from` with the leg it repeats. A leg whose workflow reads the value, or `strategy.job-index`, or which runs in a different image (see `--platform`), still runs, as do all legs of a `runs-on` that reads the matrix by index (`matrix['os']`). Only the workflow file is read: a script that reads `$MATRIX_OS` from a file of its own isn't seen, so pass `--every-matrix-leg` for such a job. `--every-matrix-leg` or `WRKFLW_EVERY_MATRIX_LEG=1` runs them all.
 
 What a kept workspace means in practice:
@@ -390,32 +462,15 @@ wrkflw mcp serve
 
 `compare` pairs the jobs of a called workflow, which GitHub shows as `caller / job`, with the caller's one local result, failed if any of them failed. A job that failed locally and not on GitHub says which step failed, with its exit code and the line of output that reads most like the error; one whose output shows `docker` finding no engine says that it needs `WRKFLW_DOCKER_IN_JOBS=1`. A job that agrees, but passed a step whose action didn't run locally or ran as Linux for a `macos-*` job, is counted under `unverified_agreements` and marked `unverified`: the agreement says less than it looks. A Windows job, which runs on a Linux stand-in, is not compared, and no longer keeps the two runs' overall results from being compared: they are, with the stand-ins' failures left out. A run's floating versions, such as `stable` Rust, are resolved now, not when GitHub ran it, so compare against a recent run.
 
-Every `run_finished`, and the gate result, carries a `verdict`. `verified` means every job ran as the OS it asked for and every `uses:` step ran its action. `partial` means some jobs ran as another OS (`gate` and `run` list them apart from skipped actions, and on a Mac say that `--runtime emulation` runs a `macos-*` job on the Mac itself), or passed a step whose action didn't run, because wrkflw has no implementation of it, a JavaScript action found no `node` in the job's image, or, for a setup action, because a job `container:`, a composite action whose runtime the job didn't set up itself, or emulation kept its runtime out of the job; both are listed under `unverified`, told apart by `kind` (`runner` or `action_not_run`). An `actions-rs/cargo` step that runs its `command` on your machine in a container runtime counts as not run too. `nothing_checked` means no job ran, so the pass proves nothing. A failure digest names a likely `cause`: `out_of_memory` when the output says memory ran out, `killed` when a process got SIGKILL without a stated reason, or `setup_failed` when the job failed before any step ran because its image couldn't be built or pulled.
+Every `run_finished`, and the gate result, carries a `verdict`. `verified` means every job ran as the OS it asked for and every `uses:` step ran its action. `partial` means some jobs ran as another OS (`gate` and `run` list them apart from skipped actions, and on a Mac say that `--macos-on-host` runs `macos-*` jobs on the Mac itself), or passed a step whose action didn't run, because wrkflw has no implementation of it, a JavaScript action found no `node` in the job's image, or, for a setup action, because a job `container:`, a composite action whose runtime the job didn't set up itself, or emulation kept its runtime out of the job; both are listed under `unverified`, told apart by `kind` (`runner` or `action_not_run`). An `actions-rs/cargo` step that runs its `command` on your machine in a container runtime counts as not run too. `nothing_checked` means no job ran, so the pass proves nothing. A failure digest names a likely `cause`: `out_of_memory` when the output says memory ran out, `killed` when a process got SIGKILL without a stated reason, or `setup_failed` when the job failed before any step ran because its image couldn't be built or pulled.
 
 On macOS and Windows, Docker Desktop and Podman machines see your files through a share that refuses file names that aren't UTF-8 and ignores case, so a test that relies on either fails there and passes on GitHub. So on macOS, steps see the job's workspace in a container volume inside the VM, a Linux filesystem; on Windows they do when `WRKFLW_WORKSPACE_MOUNT=volume` asks for it. wrkflw copies what changed on your machine into the volume before each step, and what the step changed back after it, also when the step ran out of time. The host copy is what checkout, caches, artifacts and `hashFiles` use, and what stays between runs. A file your filesystem can't hold, such as a name that isn't UTF-8 or one that differs only in case from one already there, stays in the volume only, also between runs of a kept workspace. A file your machine refuses for now, such as one in a directory a step made read-only, is tried again after the next step, with a warning until it is copied. The copies use `ubuntu:latest` for `find` and GNU `tar`; set `WRKFLW_WORKSPACE_HELPER_IMAGE` to another image that has both, with GNU tar 1.32 or later. A run interrupted with Ctrl-C removes its fresh workspaces and their volumes as it exits. Set `WRKFLW_WORKSPACE_MOUNT=bind` to mount the workspace directory as before, or `WRKFLW_WORKSPACE_MOUNT=volume` to use a volume on Linux or Windows too. `wrkflw clean` removes the volumes of workspaces that are gone.
 
 Docker Desktop and Podman machines often have half the 16 GB of a GitHub runner, and a Rust or C++ link can be killed there although it passes in CI. wrkflw warns when the VM has less than 14 GB. Each job's containers are sampled while they run, and the job's peak is kept in `job-memory.json` under your cache directory. On the next run, a job sets aside half again its highest peak of its last three runs, plus 256 MB and at least 512 MB, and jobs start while what they set aside fits in the VM. A job never measured sets aside what every job used to: the VM's memory divided by the number of whole 4 GB in it, so on an 8 GB VM it runs alone. So a matrix of light test jobs runs side by side after its first run. Jobs share the VM's memory less a tenth of it, at least 1 GiB, which the engine, image builds and the workspace copies use. Only a job that passed keeps its peak. A step killed by SIGKILL, as the out-of-memory killer does, forgets the measurements of every job running at the time, since the kernel picks its victim anywhere in the VM. The job's container and its services are sampled once a second, as a step's own container is. Podman jobs aren't measured, and forget what an earlier run measured. On Linux without a VM it only warns. Set `WRKFLW_JOB_MEMORY_FILE` to keep the measurements elsewhere, or to an empty value to keep none. Set `WRKFLW_MAX_PARALLEL_JOBS` to choose the limit.
 
-`scripts/conformance/compare_sweep.sh` reruns the finished GitHub runs listed in `compare_runs.txt` with `wrkflw compare` and prints, for each, how many jobs agreed, differed and weren't compared, how many job images it had to build, how long the local run and the GitHub run took, and how long the whole compare took. Some runs are known to differ, so it compares each with its line in `compare_expected.tsv` and fails only when a run got worse, with fewer jobs agreeing or more differing or agreeing unverified, or gave no report; `WRKFLW_SWEEP_RECORD=1` records the results as the new expectation. It runs those repositories' CI on your machine, and needs `gh`, `jq`, `git` and Docker or Podman.
+#### Conformance
 
-#### How close to GitHub
-
-The last sweep (2026-11-19, on the 0.9.0 code), with `wrkflw compare` against each repository's finished GitHub run. A job agrees when both sides passed or both failed; not compared are the Windows jobs, which run on a Linux stand-in. Jobs agreed include `macos-*` jobs run as Linux, which `compare` counts as agreeing unverified (`compare_expected.tsv` records how many). Local times are warm (`built` 0), on a Mac with a 7.7 GB Docker VM.
-
-| Repository | Jobs agreed | Differed | Not compared | Local | GitHub |
-|---|---|---|---|---|---|
-| pallets/click | 10 | 0 | 1 | 38 s | 65 s |
-| chalk/chalk | 2 | 0 | 0 | 13 s | 39 s |
-| sindresorhus/ky | 4 | 0 | 0 | 130 s | 187 s |
-| rust-lang/log | 10 | 1 | 2 | 362 s | 527 s |
-| dtolnay/itoa | 8 | 3 | 0 | 101 s | 346 s |
-| tj/commander.js | 6 | 0 | 3 | 67 s | 99 s |
-| spf13/cobra | 18 | 0 | 1 | 134 s | 99 s |
-| fatih/color | 1 | 0 | 0 | 25 s | 57 s |
-| pallets/flask | 11 | 0 | 1 | 32 s | 44 s |
-
-rust-lang/log's one difference is its documentation job, which fails on Rust 1.100, released after its GitHub run, as `stable` floats. itoa's three verify an attestation with the job's GitHub token, which a local job doesn't get unless `WRKFLW_JOB_GITHUB_TOKEN=1` gives it yours.
-
+`scripts/conformance/compare_sweep.sh` reruns the finished GitHub runs listed in `compare_runs.txt` with `wrkflw compare` and prints, for each, how many jobs agreed, differed and weren't compared, how many job images it had to build, how long the local run and the GitHub run took, and how long the whole compare took. Some runs are known to differ, so it compares each with its line in `compare_expected.tsv` and fails only when a run got worse, with fewer jobs agreeing or more differing or agreeing unverified, or gave no report; `WRKFLW_SWEEP_RECORD=1` records the results as the new expectation. It runs those repositories' CI on your machine, and needs `gh`, `jq`, `git` and Docker or Podman. Pass `scripts/conformance/held_out_runs.txt` to sweep the held-out repositories instead; each list keeps its own expectations, in `<name>_expected.tsv` beside it.
 
 `scripts/conformance/plan_corpus.sh` plans the last finished run of every workflow in a list of public repositories, and compares the number of jobs with what GitHub ran. It needs `gh` and `jq`, and runs nothing.
 

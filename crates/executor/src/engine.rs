@@ -156,17 +156,19 @@ async fn execute_github_workflow(
     let workspace_dir = tempfile::tempdir()
         .map_err(|e| ExecutionError::Execution(format!("Failed to create workspace: {}", e)))?;
 
-    // 4. Set up GitHub-like environment
-    let (mut env_context, user_env) = github_run_env(
+    // 4. Set up GitHub-like environment. The context is made once: jobs run
+    // on the host below get the same run id and the like as the rest.
+    let github_context = environment::create_github_context(
         &workflow,
         workspace_dir.path(),
-        &config.runtime_type,
         &environment::RunRef {
             event_name: config.event_name.as_deref(),
             git_ref: config.git_ref.as_deref(),
             base_branch: config.base_branch.as_deref(),
         },
-    )?;
+    );
+    let (mut env_context, user_env) =
+        github_run_env_from(github_context.clone(), &workflow, &config.runtime_type)?;
 
     // show=true means hide=false (inverted for the env var)
     env_context.insert(
@@ -183,6 +185,33 @@ async fn execute_github_workflow(
     environment::setup_github_environment_files(workspace_dir.path()).map_err(|e| {
         ExecutionError::Execution(format!("Failed to setup GitHub env files: {}", e))
     })?;
+
+    // `macos-*` jobs on this Mac, when asked, with the env emulation gives.
+    let host_jobs = if crate::host_jobs::wanted(&config.runtime_type) {
+        let (host_env, _) =
+            github_run_env_from(github_context, &workflow, &RuntimeType::Emulation)?;
+        wrkflw_logging::warning(
+            "macos-* jobs run on this Mac itself (--macos-on-host), with no container \
+             around their steps: they can change this machine, and they see this shell's \
+             environment, credentials included. They have no terminal to ask for input \
+             at, so one that does, such as sudo asking for a password, fails",
+        );
+        Some(std::sync::Arc::new(crate::host_jobs::HostJobs::new(
+            Box::new(emulation::EmulationRuntime::new()),
+            &env_context,
+            host_env,
+        )))
+    } else {
+        if crate::run_options::macos_on_host() {
+            wrkflw_logging::warning(&format!(
+                "--macos-on-host has no effect here: it runs macos-* jobs on a Mac whose \
+                 other jobs run in containers, and this run is on {} with {}",
+                std::env::consts::OS,
+                config.runtime_type.mode_name()
+            ));
+        }
+        None
+    };
 
     // 5. Initialize secrets management
     let secret_manager = if let Some(secrets_config) = &config.secrets_config {
@@ -226,20 +255,23 @@ async fn execute_github_workflow(
         // Execute jobs in parallel if they don't depend on each other.
         // `needs:` failure propagation and `if:` evaluation happen per job inside
         // `execute_job_with_matrix`, so this loop and `run_called_workflow` share them.
-        let job_results = execute_job_batch(
-            &job_batch,
-            &workflow,
-            runtime.as_ref(),
-            &env_context,
-            &user_env,
-            config.verbose,
-            secret_manager.as_ref(),
-            Some(&secret_masker),
-            &all_job_outputs,
-            &all_job_results,
-            &artifact_store,
-            &cache_store,
-            &config.platform_overrides,
+        let job_results = crate::host_jobs::scope(
+            host_jobs.clone(),
+            execute_job_batch(
+                &job_batch,
+                &workflow,
+                runtime.as_ref(),
+                &env_context,
+                &user_env,
+                config.verbose,
+                secret_manager.as_ref(),
+                Some(&secret_masker),
+                &all_job_outputs,
+                &all_job_results,
+                &artifact_store,
+                &cache_store,
+                &config.platform_overrides,
+            ),
         )
         .await?;
 
@@ -431,6 +463,13 @@ async fn execute_gitlab_pipeline(
     // Create a temporary workspace directory
     let workspace_dir = tempfile::tempdir()
         .map_err(|e| ExecutionError::Execution(format!("Failed to create workspace: {}", e)))?;
+
+    if crate::run_options::macos_on_host() {
+        wrkflw_logging::warning(
+            "--macos-on-host has no effect on a GitLab pipeline: it runs a GitHub workflow's \
+             macos-* jobs",
+        );
+    }
 
     // 5. Set up GitLab-like environment
     let mut env_context = create_gitlab_context(&pipeline, workspace_dir.path());
@@ -889,14 +928,27 @@ pub fn detect_runtime(runtime_type: RuntimeType) -> RuntimeType {
 type EnvMap = HashMap<String, String>;
 
 /// Build the run-level env for a GitHub workflow. Returns the full lookup map
-/// and the user-declared slice of it.
+/// and the user-declared slice of it. A run makes its context itself and
+/// calls [`github_run_env_from`], as it may need the env for two runtimes.
+#[cfg(test)]
 fn github_run_env(
     workflow: &WorkflowDefinition,
     workspace_dir: &Path,
     runtime: &RuntimeType,
     run_ref: &environment::RunRef<'_>,
 ) -> Result<(EnvMap, EnvMap), ExecutionError> {
-    let mut env_context = environment::create_github_context(workflow, workspace_dir, run_ref);
+    let context = environment::create_github_context(workflow, workspace_dir, run_ref);
+    github_run_env_from(context, workflow, runtime)
+}
+
+/// [`github_run_env`] from a GitHub context already made. A run that needs
+/// its env for two runtimes makes the context once, so values taken when it
+/// is made, such as `GITHUB_RUN_ID`, are the same in both.
+fn github_run_env_from(
+    mut env_context: EnvMap,
+    workflow: &WorkflowDefinition,
+    runtime: &RuntimeType,
+) -> Result<(EnvMap, EnvMap), ExecutionError> {
     // Before the workflow env below, whose expressions must see what steps see.
     seed_runtime_context(&mut env_context, runtime, CiPlatform::GitHub);
 
@@ -3338,6 +3390,23 @@ async fn execute_job_with_matrix(
         ExecutionError::Execution(format!("Job '{}' not found in workflow", job_name))
     })?;
 
+    // A `macos-*` job runs on this Mac when the run asked for that. A matrix
+    // decides per leg, in `execute_matrix_combinations`.
+    let host = job
+        .matrix_config()
+        .is_none()
+        .then(|| crate::host_jobs::for_job(job, None, platform_overrides))
+        .flatten();
+    let host_env = host
+        .as_ref()
+        .map(|host| host.env_for(env_context, user_env));
+    let (runtime, env_context, user_env) = match (&host, &host_env) {
+        (Some(host), Some((env, user))) => {
+            (host.runtime.as_ref() as &dyn ContainerRuntime, env, user)
+        }
+        _ => (runtime, env_context, user_env),
+    };
+
     // Build filtered needs context for this job (only jobs declared in `needs:`)
     let (needs_ctx, needs_res) = build_needs_context(job, all_job_outputs, all_job_results);
 
@@ -3468,7 +3537,7 @@ async fn execute_job_with_matrix(
                             stored.name
                         ));
                     }
-                    let runner = crate::runner_fidelity::substitution(
+                    let runner = crate::host_jobs::substitution(
                         job,
                         matrix,
                         env_context,
@@ -3576,7 +3645,13 @@ async fn execute_job_with_matrix(
         .await;
         let results = results?;
         let key = result_key.as_deref().filter(|_| !fell_back_to_root);
-        store_passing_result(key, &results, env_context).await;
+        // Kept on this machine when any leg ran on it.
+        let on_host = runs_on_host(env_context)
+            || combinations.iter().any(|combination| {
+                crate::host_jobs::for_job(job, Some(&combination.values), platform_overrides)
+                    .is_some()
+            });
+        store_passing_result(key, &results, on_host).await;
         Ok(results)
     } else {
         // Regular job, no matrix
@@ -3620,7 +3695,7 @@ async fn execute_job_with_matrix(
         // A pass whose steps ran as root where they were to run as the
         // runner user isn't what its key says: see `noting_root_fallback`.
         let key = result_key.as_deref().filter(|_| !fell_back_to_root);
-        store_passing_result(key, &results, env_context).await;
+        store_passing_result(key, &results, runs_on_host(env_context)).await;
         Ok(results)
     }
 }
@@ -3662,16 +3737,12 @@ fn announce_reused(
 }
 
 /// File `results` under `key` if every job and matrix leg passed.
-async fn store_passing_result(
-    key: Option<&str>,
-    results: &[JobResult],
-    env_context: &HashMap<String, String>,
-) {
+async fn store_passing_result(key: Option<&str>, results: &[JobResult], on_host: bool) {
     let Some(key) = key else { return };
     if results.is_empty() || results.iter().any(|r| r.status != JobStatus::Success) {
         return;
     }
-    acceleration::store(key, stored_jobs(results), env_context).await;
+    acceleration::store(key, stored_jobs(results), on_host).await;
 }
 
 /// What a passing run keeps for reuse: names, outputs, and the steps that
@@ -3720,9 +3791,16 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
         .await;
     }
     // Only after the reusable workflow check: its jobs take places of their
-    // own, and a caller holding one would deadlock a limit of one.
-    let memory_id = job_memory_id(&ctx.workflow.name, ctx.job_name);
-    let _slot = crate::vm_memory::job_slot(memory_id.as_deref(), None).await;
+    // own, and a caller holding one would deadlock a limit of one. A job
+    // run on this machine uses none of the VM's memory: it is neither
+    // sized nor measured by it.
+    let on_host = runs_on_host(ctx.env_context);
+    let memory_id = job_memory_id(&ctx.workflow.name, ctx.job_name).filter(|_| !on_host);
+    let _slot = if on_host {
+        crate::vm_memory::host_job_slot().await
+    } else {
+        crate::vm_memory::job_slot(memory_id.as_deref(), None).await
+    };
     if let Some(id) = &memory_id {
         crate::job_memory::measure_as(id);
     }
@@ -3764,11 +3842,13 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
     })?;
 
     // The job's workspace, kept from its last run so builds are incremental.
-    let job_dir =
-        crate::workspace::JobWorkspace::acquire(&current_dir, &ctx.workflow.name, ctx.job_name)
-            .map_err(|e| {
-                ExecutionError::Execution(format!("Failed to create job directory: {}", e))
-            })?;
+    let job_dir = crate::workspace::JobWorkspace::acquire(
+        &current_dir,
+        &ctx.workflow.name,
+        ctx.job_name,
+        runs_on_host(&job_env),
+    )
+    .map_err(|e| ExecutionError::Execution(format!("Failed to create job directory: {}", e)))?;
 
     wrkflw_logging::info(&format!("Executing job: {}", ctx.job_name));
 
@@ -4012,6 +4092,16 @@ async fn execute_matrix_combinations(
     let images_ahead = async {
         use futures::StreamExt;
         futures::stream::iter(unique.iter().map(|combination| async move {
+            // A leg run on the host has no image to build.
+            if crate::host_jobs::for_job(
+                ctx.job_template,
+                Some(&combination.values),
+                ctx.services.platform_overrides,
+            )
+            .is_some()
+            {
+                return;
+            }
             let steps = crate::substitution::apply_matrix_to_steps(
                 &ctx.job_template.steps,
                 &combination.values,
@@ -4048,30 +4138,49 @@ async fn execute_matrix_combinations(
             }
 
             // Process this chunk of combinations in parallel
+            let ctx = &ctx;
             let chunk_futures = chunk.iter().map(|combination| {
-                crate::job_memory::metered(
-                    job_session::with_job_session(
-                        ctx.job_template,
-                        ctx.runtime,
-                        image_is_mapped(
+                // A `macos-*` leg runs on this Mac when the run asked for that.
+                let host = crate::host_jobs::for_job(
+                    ctx.job_template,
+                    Some(&combination.values),
+                    ctx.services.platform_overrides,
+                );
+                async move {
+                    let host_env = host
+                        .as_ref()
+                        .map(|host| host.env_for(ctx.env_context, ctx.user_env));
+                    let (runtime, env_context, user_env) = match (&host, &host_env) {
+                        (Some(host), Some((env, user))) => {
+                            (host.runtime.as_ref() as &dyn ContainerRuntime, env, user)
+                        }
+                        _ => (ctx.runtime, ctx.env_context, ctx.user_env),
+                    };
+                    crate::job_memory::metered(
+                        job_session::with_job_session(
                             ctx.job_template,
-                            ctx.services.platform_overrides,
-                            Some(&combination.values),
+                            runtime,
+                            image_is_mapped(
+                                ctx.job_template,
+                                ctx.services.platform_overrides,
+                                Some(&combination.values),
+                            ),
+                            execute_matrix_job(
+                                ctx.job_name,
+                                ctx.job_template,
+                                combination,
+                                ctx.workflow,
+                                runtime,
+                                env_context,
+                                user_env,
+                                ctx.verbose,
+                                &ctx.services,
+                            ),
                         ),
-                        execute_matrix_job(
-                            ctx.job_name,
-                            ctx.job_template,
-                            combination,
-                            ctx.workflow,
-                            ctx.runtime,
-                            ctx.env_context,
-                            ctx.user_env,
-                            ctx.verbose,
-                            &ctx.services,
-                        ),
-                    ),
-                    job_passed,
-                )
+                        job_passed,
+                    )
+                    .await
+                }
             });
 
             let chunk_results = future::join_all(chunk_futures).await;
@@ -4142,13 +4251,18 @@ async fn execute_matrix_combinations(
         ordered.push(match twins[i] {
             None => results[position[i]].clone(),
             Some(original) => {
-                let image = get_effective_runner_image(
+                let image = crate::host_jobs::place(
                     ctx.job_template,
-                    ctx.services.platform_overrides,
                     Some(&combination.values),
+                    ctx.services.platform_overrides,
+                    get_effective_runner_image(
+                        ctx.job_template,
+                        ctx.services.platform_overrides,
+                        Some(&combination.values),
+                    ),
                 );
                 let name = wrkflw_matrix::format_combination_name(ctx.job_name, combination);
-                let runner = crate::runner_fidelity::substitution(
+                let runner = crate::host_jobs::substitution(
                     ctx.job_template,
                     Some(&combination.values),
                     ctx.env_context,
@@ -4178,12 +4292,18 @@ async fn execute_matrix_job(
     let matrix_job_name = wrkflw_matrix::format_combination_name(job_name, combination);
 
     // One place in the run's pool for the leg, as for any job. A leg never
-    // measured is sized by the legs of its matrix that were.
-    let memory_id = job_memory_id(&workflow.name, &matrix_job_name);
-    let family = leg_family_memory_id(&workflow.name, job_name);
-    let _slot =
+    // measured is sized by the legs of its matrix that were. A leg run on
+    // this machine uses none of the VM's memory: it takes no room there,
+    // and what it measures, nothing, sizes no sibling.
+    let on_host = runs_on_host(base_env_context);
+    let _slot = if on_host {
+        crate::vm_memory::host_job_slot().await
+    } else {
+        let memory_id = job_memory_id(&workflow.name, &matrix_job_name);
+        let family = leg_family_memory_id(&workflow.name, job_name);
         crate::job_memory::leg_place(memory_id.as_deref(), family.as_deref(), &matrix_job_name)
-            .await;
+            .await
+    };
 
     wrkflw_logging::info(&format!("Executing matrix job: {}", matrix_job_name));
 
@@ -4251,11 +4371,13 @@ async fn execute_matrix_job(
     })?;
 
     // The job's workspace, kept from its last run so builds are incremental.
-    let job_dir =
-        crate::workspace::JobWorkspace::acquire(&current_dir, &workflow.name, &matrix_job_name)
-            .map_err(|e| {
-                ExecutionError::Execution(format!("Failed to create job directory: {}", e))
-            })?;
+    let job_dir = crate::workspace::JobWorkspace::acquire(
+        &current_dir,
+        &workflow.name,
+        &matrix_job_name,
+        runs_on_host(&job_env),
+    )
+    .map_err(|e| ExecutionError::Execution(format!("Failed to create job directory: {}", e)))?;
 
     // Pre-resolve ${{ matrix.X }} in all step `with` values so that every downstream
     // consumer (detect_setup_runtimes, INPUT_* env vars, composite action inputs, etc.)
@@ -11691,6 +11813,145 @@ runs:
         }
     }
 
+    /// Records the `RUNNER_OS` of each step it is given to run.
+    #[derive(Default)]
+    struct RunnerOsRuntime {
+        seen: Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ContainerRuntime for RunnerOsRuntime {
+        async fn run_container(
+            &self,
+            _image: &str,
+            _cmd: &[&str],
+            env_vars: &[(&str, &str)],
+            _working_dir: &Path,
+            _volumes: &[(&Path, &Path)],
+            _entrypoint: Option<&str>,
+        ) -> Result<ContainerOutput, ContainerError> {
+            let os = env_vars
+                .iter()
+                .find(|(k, _)| *k == "RUNNER_OS")
+                .map(|(_, v)| v.to_string())
+                .unwrap_or_default();
+            self.seen.lock().unwrap().push(os);
+            Ok(ContainerOutput {
+                stdout: String::new(),
+                stderr: String::new(),
+                exit_code: 0,
+            })
+        }
+
+        async fn pull_image(&self, _image: &str) -> Result<(), ContainerError> {
+            Ok(())
+        }
+
+        async fn build_image(
+            &self,
+            _dockerfile: &Path,
+            _tag: &str,
+            _context_dir: &Path,
+        ) -> Result<(), ContainerError> {
+            Ok(())
+        }
+
+        async fn prepare_language_environment(
+            &self,
+            _language: &str,
+            _version: Option<&str>,
+            _additional_packages: Option<Vec<String>>,
+        ) -> Result<String, ContainerError> {
+            Ok("mock:latest".to_string())
+        }
+
+        async fn image_exists(&self, _tag: &str) -> Result<bool, ContainerError> {
+            Ok(true)
+        }
+    }
+
+    /// Under `--macos-on-host` a matrix's macOS leg runs on this machine, as
+    /// the OS it is (macOS where the flag applies), its Linux leg in the
+    /// run's container runtime as Linux, and the two aren't folded into one
+    /// though they share an image and steps.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_mixed_matrix_runs_its_macos_leg_on_the_host_and_the_rest_in_containers() {
+        let run_dir = tempfile::tempdir().unwrap();
+        let path = run_dir.path().join("ci.yml");
+        fs::write(
+            &path,
+            "name: CI\non: push\njobs:\n  build:\n    runs-on: ${{ matrix.os }}\n    \
+             strategy:\n      matrix:\n        os: [ubuntu-latest, macos-15]\n    \
+             steps:\n      - run: echo \"os=$RUNNER_OS\"\n",
+        )
+        .unwrap();
+        let workflow = parse_workflow(&path).unwrap();
+        environment::setup_github_environment_files(run_dir.path()).unwrap();
+        let context = environment::create_github_context(
+            &workflow,
+            run_dir.path(),
+            &environment::RunRef::default(),
+        );
+        let (env_context, user_env) =
+            github_run_env_from(context.clone(), &workflow, &RuntimeType::Docker).unwrap();
+        let (host_env, _) =
+            github_run_env_from(context, &workflow, &RuntimeType::Emulation).unwrap();
+        let host = crate::host_jobs::HostJobs::new(
+            Box::new(emulation::EmulationRuntime::new()),
+            &env_context,
+            host_env,
+        );
+
+        let runtime = RunnerOsRuntime::default();
+        let results = crate::host_jobs::scope(
+            Some(std::sync::Arc::new(host)),
+            execute_job_batch(
+                &["build".to_string()],
+                &workflow,
+                &runtime,
+                &env_context,
+                &user_env,
+                false,
+                None,
+                None,
+                &HashMap::new(),
+                &HashMap::new(),
+                &crate::artifacts::ArtifactStore::new(run_dir.path()).unwrap(),
+                &crate::cache::CacheStore::new().unwrap(),
+                &HashMap::new(),
+            ),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            *runtime.seen.lock().unwrap(),
+            ["Linux"],
+            "only the Linux leg"
+        );
+        let leg = |os: &str| {
+            results
+                .iter()
+                .find(|r| r.name.contains(os))
+                .unwrap_or_else(|| {
+                    let names: Vec<&str> = results.iter().map(|r| r.name.as_str()).collect();
+                    panic!("no {os} leg in {names:?}")
+                })
+        };
+        let mac = leg("macos-15");
+        assert_eq!(mac.status, JobStatus::Success, "{:?}", mac.steps);
+        // The host's own OS: macOS where the flag applies, Linux on a Linux
+        // machine running this test.
+        let host_os = format!("os={}", environment::get_runner_os());
+        assert!(
+            mac.steps.iter().any(|s| s.output.contains(&host_os)),
+            "expected {host_os}: {:?}",
+            mac.steps
+        );
+        assert_eq!(leg("ubuntu-latest").status, JobStatus::Success);
+    }
+
     /// Run `jobs` of `yaml` at once, each step held open until two overlap.
     async fn run_overlapping(
         yaml: &str,
@@ -15477,6 +15738,40 @@ runs:
         let mut env = create_gitlab_context(&pipeline, host);
         seed_runtime_context(&mut env, &RuntimeType::Emulation, CiPlatform::GitLab);
         assert_eq!(env["CI_PROJECT_DIR"], "/host/workspace");
+    }
+
+    /// Jobs run on the host under `--macos-on-host` are laid over with what
+    /// differs between the run's env on its container runtime and under
+    /// emulation. Seeding one context for each runtime must differ only in
+    /// the runtime's own values, never a run-level one such as
+    /// `GITHUB_RUN_ID`, which every job shares. The run makes that one
+    /// context once, in `execute_github_workflow`.
+    #[test]
+    fn the_host_env_differs_from_the_container_env_only_by_the_runtime() {
+        let workflow = minimal_workflow();
+        let mut context = environment::create_github_context(
+            &workflow,
+            Path::new("/host/workspace"),
+            &environment::RunRef::default(),
+        );
+        context.insert("GITHUB_RUN_ID".to_string(), "100".to_string());
+        let (container, _) =
+            github_run_env_from(context.clone(), &workflow, &RuntimeType::Docker).unwrap();
+        let (host, _) = github_run_env_from(context, &workflow, &RuntimeType::Emulation).unwrap();
+        let differing: HashSet<&str> = host
+            .iter()
+            .filter(|(key, value)| container.get(*key) != Some(value))
+            .map(|(key, _)| key.as_str())
+            .collect();
+        let runtime_keys = HashSet::from([
+            "WRKFLW_RUNTIME_MODE",
+            "GITHUB_WORKSPACE",
+            "RUNNER_OS",
+            "RUNNER_TEMP",
+            "RUNNER_TOOL_CACHE",
+        ]);
+        assert!(differing.is_subset(&runtime_keys), "{differing:?}");
+        assert_eq!(host["GITHUB_RUN_ID"], container["GITHUB_RUN_ID"]);
     }
 
     #[test]

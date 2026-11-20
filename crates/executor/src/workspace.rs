@@ -69,6 +69,19 @@ pub(crate) fn job_identity(repo: &Path, workflow: &str, job: &str) -> String {
     )
 }
 
+/// The job part of a workspace key. A container job's is its name alone,
+/// as before, so saved workspaces stay valid. A job run on this machine,
+/// under `--macos-on-host` or a plain emulation run, gets a key of its own;
+/// an emulation run upgrading from a version without this starts from an
+/// empty workspace once.
+fn job_key(job: &str, on_host: bool) -> String {
+    if on_host {
+        format!("{job}\0host")
+    } else {
+        job.to_string()
+    }
+}
+
 /// The workflow part of a workspace key. Keys of jobs outside a reusable
 /// workflow are the workflow name alone, as before, so their saved
 /// workspaces stay valid.
@@ -124,8 +137,16 @@ impl JobWorkspace {
         }
     }
 
-    /// The workspace for `job` of `workflow`, run from `repo`.
-    pub(crate) fn acquire(repo: &Path, workflow: &str, job: &str) -> std::io::Result<Self> {
+    /// The workspace for `job` of `workflow`, run from `repo`. A job whose
+    /// steps run on this machine (`on_host`) keeps a workspace apart from
+    /// the one its container runs keep: what a build left there for Linux,
+    /// such as `node_modules` or `target`, is wrong for the host.
+    pub(crate) fn acquire(
+        repo: &Path,
+        workflow: &str,
+        job: &str,
+        on_host: bool,
+    ) -> std::io::Result<Self> {
         if crate::run_options::fresh_workspaces() {
             return Self::fresh();
         }
@@ -135,7 +156,7 @@ impl JobWorkspace {
         let file = workflow_file();
         let file = file.as_deref().unwrap_or(Path::new(""));
         let workflow = workflow_key(workflow, callers().as_deref());
-        match Self::keep(&root, repo, file, &workflow, job) {
+        match Self::keep(&root, repo, file, &workflow, &job_key(job, on_host)) {
             Ok(Some(workspace)) => Ok(workspace),
             Ok(None) => {
                 wrkflw_logging::info(&format!(
@@ -532,6 +553,32 @@ mod tests {
         .unwrap();
         assert_eq!(second.path(), path);
         assert!(second.path().join("out.o").exists());
+    }
+
+    #[test]
+    fn a_job_run_on_the_host_keeps_a_workspace_apart_from_its_container_runs() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let keep = |on_host| {
+            JobWorkspace::keep(
+                root.path(),
+                repo.path(),
+                Path::new(CI),
+                "CI",
+                &job_key("build (os: macos-15)", on_host),
+            )
+            .unwrap()
+            .unwrap()
+            .path()
+            .to_path_buf()
+        };
+        let container = keep(false);
+        assert_ne!(container, keep(true));
+        assert_eq!(
+            job_key("lint", false),
+            "lint",
+            "container keys are unchanged"
+        );
     }
 
     #[test]

@@ -6,6 +6,7 @@ use std::path::PathBuf;
 
 mod cli_secrets;
 mod compare_cmd;
+mod doctor_cmd;
 mod gate_cmd;
 mod git;
 mod json_output;
@@ -174,6 +175,20 @@ struct Wrkflw {
         value_parser = clap::builder::FalseyValueParser::new()
     )]
     every_matrix_leg: bool,
+
+    /// On a Mac, run `macos-*` jobs on the Mac itself, under emulation,
+    /// while the other jobs keep their containers. Their pass then checks
+    /// macOS, but their steps run with no container around them: a
+    /// `brew install` changes this machine, and they see this shell's
+    /// environment, credentials included
+    #[arg(
+        long,
+        global = true,
+        env = "WRKFLW_MACOS_ON_HOST",
+        action = clap::ArgAction::SetTrue,
+        value_parser = clap::builder::FalseyValueParser::new()
+    )]
+    macos_on_host: bool,
 
     #[command(flatten)]
     kubernetes: KubernetesArgs,
@@ -804,6 +819,11 @@ enum Commands {
     /// using. Each job starts from an empty workspace once afterwards
     Clean,
 
+    /// Check what runs on this machine would use (runtime, VM memory, the
+    /// runner base image, a GitHub token, git) and what would make them
+    /// slower or less like GitHub's. Starts and pulls nothing
+    Doctor,
+
     /// Inspect and replay recorded runs
     Runs {
         #[command(subcommand)]
@@ -870,6 +890,7 @@ fn global_child_args(cli: &Wrkflw, platform_overrides: &HashMap<String, String>)
         (cli.debug, "--debug"),
         (cli.fresh_workspace, "--fresh-workspace"),
         (cli.every_matrix_leg, "--every-matrix-leg"),
+        (cli.macos_on_host, "--macos-on-host"),
     ] {
         if given {
             args.push(flag.to_string());
@@ -900,6 +921,7 @@ fn hook_child_args(
             "every_matrix_leg",
             "--every-matrix-leg",
         ),
+        (cli.macos_on_host, "macos_on_host", "--macos-on-host"),
     ] {
         if on && given(id) {
             args.push(flag.to_string());
@@ -1332,6 +1354,7 @@ async fn run_cli() {
     let kubernetes = cli.kubernetes.to_config();
     wrkflw_executor::run_options::set_fresh_workspaces(cli.fresh_workspace);
     wrkflw_executor::run_options::set_every_matrix_leg(cli.every_matrix_leg);
+    wrkflw_executor::run_options::set_macos_on_host(cli.macos_on_host);
 
     match &cli.command {
         Some(Commands::Validate {
@@ -1617,6 +1640,11 @@ async fn run_cli() {
                 wrkflw_github::trigger_workflow(workflow, branch.as_deref(), inputs).await
             {
                 eprintln!("Error triggering GitHub workflow: {}", e);
+                std::process::exit(1);
+            }
+        }
+        Some(Commands::Doctor) => {
+            if !doctor_cmd::run(format.is_json()).await {
                 std::process::exit(1);
             }
         }
@@ -2555,6 +2583,7 @@ mod tests {
             "WRKFLW_EVERY_MATRIX_LEG",
             "WRKFLW_STEP_CONTAINERS",
             "WRKFLW_DOCKER_IN_JOBS",
+            "WRKFLW_MACOS_ON_HOST",
         ]
         .into_iter()
         .map(|name| (name, std::env::var_os(name)))
@@ -2594,6 +2623,7 @@ mod tests {
             std::env::set_var("WRKFLW_EVERY_MATRIX_LEG", value);
             std::env::set_var("WRKFLW_STEP_CONTAINERS", value);
             std::env::set_var("WRKFLW_DOCKER_IN_JOBS", value);
+            std::env::set_var("WRKFLW_MACOS_ON_HOST", value);
             // The executor reads the same variables; it must agree.
             assert_eq!(
                 wrkflw_executor::run_options::switch_is_on(value),
@@ -2606,6 +2636,7 @@ mod tests {
                 cli.every_matrix_leg, on,
                 "WRKFLW_EVERY_MATRIX_LEG={value:?}"
             );
+            assert_eq!(cli.macos_on_host, on, "WRKFLW_MACOS_ON_HOST={value:?}");
             assert_eq!(
                 run_flags(),
                 (on, on),

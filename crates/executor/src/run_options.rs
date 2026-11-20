@@ -10,11 +10,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 static FRESH_WORKSPACES: AtomicBool = AtomicBool::new(false);
 static EVERY_MATRIX_LEG: AtomicBool = AtomicBool::new(false);
+static MACOS_ON_HOST: AtomicBool = AtomicBool::new(false);
 
 /// Env var that gives every job a new, empty workspace, as a hosted runner does.
 pub const FRESH_WORKSPACE_ENV: &str = "WRKFLW_FRESH_WORKSPACE";
 /// Env var that runs matrix legs even when they would repeat another leg.
 pub const EVERY_MATRIX_LEG_ENV: &str = "WRKFLW_EVERY_MATRIX_LEG";
+/// Env var that runs a `macos-*` job on this Mac under emulation, while the
+/// run's other jobs keep their containers. See [`crate::host_jobs`].
+pub const MACOS_ON_HOST_ENV: &str = "WRKFLW_MACOS_ON_HOST";
 /// Env var that gives each `run:` step a container of its own instead of
 /// the job's one.
 pub const STEP_CONTAINERS_ENV: &str = "WRKFLW_STEP_CONTAINERS";
@@ -94,7 +98,7 @@ pub(crate) fn warn_of_own_token() {
 
 /// Whether the run asked for jobs to get a GitHub token, from a secret
 /// provider or, failing that, this machine: see [`job_github_token`].
-pub(crate) fn job_github_token_wanted() -> bool {
+pub fn job_github_token_wanted() -> bool {
     env_flag(JOB_GITHUB_TOKEN_ENV)
 }
 
@@ -121,6 +125,20 @@ async fn gh_auth_token() -> Option<String> {
         .status
         .success()
         .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Where a run would find this machine's GitHub token, for `wrkflw doctor`:
+/// `GITHUB_TOKEN`, `GH_TOKEN` or `gh auth token`. Never the token itself.
+pub async fn github_token_source() -> Option<&'static str> {
+    for name in ["GITHUB_TOKEN", "GH_TOKEN"] {
+        if std::env::var(name).is_ok_and(|t| !t.trim().is_empty()) {
+            return Some(name);
+        }
+    }
+    gh_auth_token()
+        .await
+        .filter(|t| !t.trim().is_empty())
+        .map(|_| "gh auth token")
 }
 
 /// [`job_github_token`] with `var` reading an environment variable and
@@ -156,6 +174,12 @@ pub fn set_every_matrix_leg(on: bool) {
 
 pub fn every_matrix_leg() -> bool {
     EVERY_MATRIX_LEG.load(Ordering::Relaxed) || env_flag(EVERY_MATRIX_LEG_ENV)
+}
+pub fn set_macos_on_host(on: bool) {
+    MACOS_ON_HOST.store(on, Ordering::Relaxed);
+}
+pub fn macos_on_host() -> bool {
+    MACOS_ON_HOST.load(Ordering::Relaxed) || env_flag(MACOS_ON_HOST_ENV)
 }
 
 /// Env var listing, comma-separated, actions that pass without running,

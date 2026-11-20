@@ -52,7 +52,14 @@ pub(crate) fn matrix_twins(
     };
     let images: Vec<String> = combinations
         .iter()
-        .map(|c| get_effective_runner_image(job, platform_overrides, Some(&c.values)))
+        .map(|c| {
+            let image = get_effective_runner_image(job, platform_overrides, Some(&c.values));
+            // A leg run on this Mac never repeats one run in a container.
+            match crate::host_jobs::for_job(job, Some(&c.values), platform_overrides) {
+                Some(_) => format!("host:{image}"),
+                None => image,
+            }
+        })
         .collect();
     let picks_runner = |key: &String| runner_keys.contains(key);
     for leg in 1..combinations.len() {

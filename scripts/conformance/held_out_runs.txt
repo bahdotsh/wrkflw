@@ -1,0 +1,27 @@
+# Held-out runs: repositories no wrkflw change was made against, so their
+# result says how wrkflw does on a repository it has never seen. Picked on
+# 2026-11-20 for variety: services (lib/pq, go-sql-driver/mysql,
+# jazzband/django-redis), wide OS matrices (sharkdp/fd, sharkdp/hyperfine,
+# psf/requests), a known failure (jazzband/django-redis), a schedule run
+# (dtolnay/anyhow), and Python, Node, Go and Rust projects.
+#
+# Run it with:
+#   scripts/conformance/compare_sweep.sh scripts/conformance/held_out_runs.txt
+# Its expectations are kept in held_out_expected.tsv, apart from the tuned
+# sweep's. Don't fix wrkflw against a run here and keep calling it held
+# out: move the repository to compare_runs.txt and pick a new one.
+#   owner/repo  run_id  [VAR=value ...]
+pallets/markupsafe       37080278497
+psf/requests             40366789388
+encode/httpx             43942265472
+sharkdp/hyperfine        38224324422
+sharkdp/fd               43561890385
+expressjs/express        41517558311
+sindresorhus/execa       44272044440
+urfave/cli               42738336663
+BurntSushi/memchr        31414505747
+go-chi/chi               42388391568
+lib/pq                   43793073655
+go-sql-driver/mysql      44281558144
+jazzband/django-redis    42917669996
+dtolnay/anyhow           44655613210

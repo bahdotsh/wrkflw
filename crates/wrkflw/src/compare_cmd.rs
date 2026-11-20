@@ -370,8 +370,8 @@ fn note_for(local: &Value, failures: &[Value], runs_docker: bool) -> Option<Stri
         && failures_of(failures, name).any(lacked_github_token)
     {
         notes.push(
-            "a step needed the GitHub token GitHub gives every job: a local job gets \
-             yours with WRKFLW_JOB_GITHUB_TOKEN=1"
+            "a step may have needed the GitHub token GitHub gives every job: a local \
+             job gets yours with WRKFLW_JOB_GITHUB_TOKEN=1"
                 .to_string(),
         );
     }
@@ -1522,8 +1522,8 @@ mod tests {
         assert_eq!(
             rows_[0].note.as_deref(),
             Some(
-                "a step needed the GitHub token GitHub gives every job: a local job gets \
-                 yours with WRKFLW_JOB_GITHUB_TOKEN=1; \
+                "a step may have needed the GitHub token GitHub gives every job: a local \
+                 job gets yours with WRKFLW_JOB_GITHUB_TOKEN=1; \
                  failed locally in step \"Install tool\" (exit 1): HTTP 401: Bad credentials"
             )
         );

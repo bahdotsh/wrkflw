@@ -76,10 +76,11 @@ main() {
     [ "$got" = "$want" ] || die "checksum mismatch for $archive: expected $want, got $got"
     say "checksum verified"
   elif [ "${WRKFLW_NO_VERIFY:-}" = 1 ]; then
-    say "this release publishes no SHA256SUMS; installing unverified (WRKFLW_NO_VERIFY=1)"
+    say "no SHA256SUMS to check against; installing unverified (WRKFLW_NO_VERIFY=1)"
   else
-    die "this release publishes no SHA256SUMS to check the download against; \
-set WRKFLW_NO_VERIFY=1 to install it anyway, or pick a newer WRKFLW_VERSION"
+    die "could not download SHA256SUMS to check the archive against: the release may \
+publish none, or the network failed. Set WRKFLW_NO_VERIFY=1 to install it anyway, \
+or pick a newer WRKFLW_VERSION"
   fi
 
   tar -xzf "$tmp/$archive" -C "$tmp"

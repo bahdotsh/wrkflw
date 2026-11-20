@@ -156,17 +156,19 @@ async fn execute_github_workflow(
     let workspace_dir = tempfile::tempdir()
         .map_err(|e| ExecutionError::Execution(format!("Failed to create workspace: {}", e)))?;
 
-    // 4. Set up GitHub-like environment
-    let (mut env_context, user_env) = github_run_env(
+    // 4. Set up GitHub-like environment. The context is made once: jobs run
+    // on the host below get the same run id and the like as the rest.
+    let github_context = environment::create_github_context(
         &workflow,
         workspace_dir.path(),
-        &config.runtime_type,
         &environment::RunRef {
             event_name: config.event_name.as_deref(),
             git_ref: config.git_ref.as_deref(),
             base_branch: config.base_branch.as_deref(),
         },
-    )?;
+    );
+    let (mut env_context, user_env) =
+        github_run_env_from(github_context.clone(), &workflow, &config.runtime_type)?;
 
     // show=true means hide=false (inverted for the env var)
     env_context.insert(
@@ -186,16 +188,8 @@ async fn execute_github_workflow(
 
     // `macos-*` jobs on this Mac, when asked, with the env emulation gives.
     let host_jobs = if crate::host_jobs::wanted(&config.runtime_type) {
-        let (host_env, _) = github_run_env(
-            &workflow,
-            workspace_dir.path(),
-            &RuntimeType::Emulation,
-            &environment::RunRef {
-                event_name: config.event_name.as_deref(),
-                git_ref: config.git_ref.as_deref(),
-                base_branch: config.base_branch.as_deref(),
-            },
-        )?;
+        let (host_env, _) =
+            github_run_env_from(github_context, &workflow, &RuntimeType::Emulation)?;
         wrkflw_logging::warning(
             "macos-* jobs run on this Mac itself (--macos-on-host), with no container \
              around their steps",
@@ -925,14 +919,27 @@ pub fn detect_runtime(runtime_type: RuntimeType) -> RuntimeType {
 type EnvMap = HashMap<String, String>;
 
 /// Build the run-level env for a GitHub workflow. Returns the full lookup map
-/// and the user-declared slice of it.
+/// and the user-declared slice of it. A run makes its context itself and
+/// calls [`github_run_env_from`], as it may need the env for two runtimes.
+#[cfg(test)]
 fn github_run_env(
     workflow: &WorkflowDefinition,
     workspace_dir: &Path,
     runtime: &RuntimeType,
     run_ref: &environment::RunRef<'_>,
 ) -> Result<(EnvMap, EnvMap), ExecutionError> {
-    let mut env_context = environment::create_github_context(workflow, workspace_dir, run_ref);
+    let context = environment::create_github_context(workflow, workspace_dir, run_ref);
+    github_run_env_from(context, workflow, runtime)
+}
+
+/// [`github_run_env`] from a GitHub context already made. A run that needs
+/// its env for two runtimes makes the context once, so values taken when it
+/// is made, such as `GITHUB_RUN_ID`, are the same in both.
+fn github_run_env_from(
+    mut env_context: EnvMap,
+    workflow: &WorkflowDefinition,
+    runtime: &RuntimeType,
+) -> Result<(EnvMap, EnvMap), ExecutionError> {
     // Before the workflow env below, whose expressions must see what steps see.
     seed_runtime_context(&mut env_context, runtime, CiPlatform::GitHub);
 
@@ -15565,6 +15572,39 @@ runs:
         let mut env = create_gitlab_context(&pipeline, host);
         seed_runtime_context(&mut env, &RuntimeType::Emulation, CiPlatform::GitLab);
         assert_eq!(env["CI_PROJECT_DIR"], "/host/workspace");
+    }
+
+    /// Jobs run on the host under `--macos-on-host` are laid over with what
+    /// differs between the run's env on its container runtime and under
+    /// emulation. That must be the runtime's own values only, never a
+    /// run-level one such as `GITHUB_RUN_ID`, which every job shares.
+    #[test]
+    fn the_host_env_differs_from_the_container_env_only_by_the_runtime() {
+        let workflow = minimal_workflow();
+        let mut context = environment::create_github_context(
+            &workflow,
+            Path::new("/host/workspace"),
+            &environment::RunRef::default(),
+        );
+        // As if the clock moved on between building the two envs.
+        context.insert("GITHUB_RUN_ID".to_string(), "100".to_string());
+        let (container, _) =
+            github_run_env_from(context.clone(), &workflow, &RuntimeType::Docker).unwrap();
+        let (host, _) = github_run_env_from(context, &workflow, &RuntimeType::Emulation).unwrap();
+        let differing: HashSet<&str> = host
+            .iter()
+            .filter(|(key, value)| container.get(*key) != Some(value))
+            .map(|(key, _)| key.as_str())
+            .collect();
+        let runtime_keys = HashSet::from([
+            "WRKFLW_RUNTIME_MODE",
+            "GITHUB_WORKSPACE",
+            "RUNNER_OS",
+            "RUNNER_TEMP",
+            "RUNNER_TOOL_CACHE",
+        ]);
+        assert!(differing.is_subset(&runtime_keys), "{differing:?}");
+        assert_eq!(host["GITHUB_RUN_ID"], container["GITHUB_RUN_ID"]);
     }
 
     #[test]

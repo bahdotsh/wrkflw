@@ -97,17 +97,17 @@ impl Engines {
 
 fn runtime_check(engines: Engines) -> Check {
     match (engines.docker, engines.podman) {
-        (true, _) => Check::ok("runtime", "Docker answers: runs use it"),
+        (true, _) => Check::ok("runtime", "Docker answers: runs with --runtime auto use it"),
         (false, true) => Check::warn(
             "runtime",
-            "Docker isn't answering, so runs use Podman",
+            "Docker isn't answering, so runs with --runtime auto use Podman",
             "Start Docker if you meant to use it; a Podman machine usually has less memory, \
              and timings measured on Docker won't compare",
         ),
         (false, false) => Check::warn(
             "runtime",
-            "Neither Docker nor Podman answers, so runs fall back to emulation, which runs \
-             steps on this machine with no container",
+            "Neither Docker nor Podman answers, so runs with --runtime auto fall back to \
+             emulation, which runs steps on this machine with no container",
             "Start Docker or Podman",
         ),
     }

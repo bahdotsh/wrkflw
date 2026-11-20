@@ -54,7 +54,11 @@ main() {
   archive="wrkflw-$target.tar.gz"
 
   tmp=$(mktemp -d)
-  trap 'rm -rf "$tmp"' EXIT INT TERM
+  # A trap on INT or TERM replaces the default exit, so exit from it;
+  # the EXIT trap then removes the download.
+  trap 'rm -rf "$tmp"' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
 
   say "downloading $archive ($VERSION)"
   fetch "$base/$archive" "$tmp/$archive" || die "cannot download $base/$archive"

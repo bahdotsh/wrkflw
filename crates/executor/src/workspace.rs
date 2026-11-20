@@ -69,11 +69,11 @@ pub(crate) fn job_identity(repo: &Path, workflow: &str, job: &str) -> String {
     )
 }
 
-/// The workflow part of a workspace key. Keys of jobs outside a reusable
-/// workflow are the workflow name alone, as before, so their saved
-/// workspaces stay valid.
 /// The job part of a workspace key. A container job's is its name alone,
-/// as before, so saved workspaces stay valid.
+/// as before, so saved workspaces stay valid. A job run on this machine,
+/// under `--macos-on-host` or a plain emulation run, gets a key of its own;
+/// an emulation run upgrading from a version without this starts from an
+/// empty workspace once.
 fn job_key(job: &str, on_host: bool) -> String {
     if on_host {
         format!("{job}\0host")
@@ -82,6 +82,9 @@ fn job_key(job: &str, on_host: bool) -> String {
     }
 }
 
+/// The workflow part of a workspace key. Keys of jobs outside a reusable
+/// workflow are the workflow name alone, as before, so their saved
+/// workspaces stay valid.
 fn workflow_key(workflow: &str, callers: Option<&str>) -> String {
     match callers {
         Some(callers) => format!("{workflow}\0called by\0{callers}"),

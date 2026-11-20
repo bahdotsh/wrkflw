@@ -255,6 +255,20 @@ const NO_DOCKER_ENGINE: &[&str] = &[
     "Cannot connect to the Docker daemon",
 ];
 
+/// Lines that show a step needed a GitHub token it wasn't given: what `gh`
+/// prints without one, in a workflow and outside, and the API's refusal.
+const NO_GITHUB_TOKEN: &[&str] = &[
+    "set the GH_TOKEN environment variable",
+    "gh auth login",
+    "Bad credentials",
+    "HTTP 401",
+];
+
+/// Whether a failed step's output shows it had no GitHub token.
+fn lacked_github_token(failure: &Value) -> bool {
+    failure_lines(failure).any(|line| NO_GITHUB_TOKEN.iter().any(|sign| line.contains(sign)))
+}
+
 /// The failed steps of the local job `name` in the run's failure digest,
 /// its own or those of a matrix leg it was folded into.
 fn failures_of<'a>(failures: &'a [Value], name: &'a str) -> impl Iterator<Item = &'a Value> {
@@ -348,6 +362,18 @@ fn note_for(local: &Value, failures: &[Value], runs_docker: bool) -> Option<Stri
         notes.push(
             "its steps run docker and found no engine: a job only has one with \
              WRKFLW_DOCKER_IN_JOBS=1 (run --docker-in-jobs), on Docker"
+                .to_string(),
+        );
+    }
+    // GitHub gives every job a token; a local job gets the user's only when
+    // asked, as it reaches further than the one a run is given.
+    if local["status"] == "failure"
+        && !wrkflw_executor::run_options::job_github_token_wanted()
+        && failures_of(failures, name).any(lacked_github_token)
+    {
+        notes.push(
+            "a step needed the GitHub token GitHub gives every job: a local job gets \
+             yours with WRKFLW_JOB_GITHUB_TOKEN=1"
                 .to_string(),
         );
     }
@@ -1424,6 +1450,7 @@ mod tests {
         }
         let own = failed_with("Dockerfile:3 DL3008 warning: Pin versions in apt get install");
         assert!(!own.contains("WRKFLW_DOCKER_IN_JOBS"), "{own}");
+        assert!(!own.contains("WRKFLW_JOB_GITHUB_TOKEN"), "{own}");
         assert_eq!(
             own,
             "failed locally in step \"Run docker run\" (exit 1): \
@@ -1493,9 +1520,14 @@ mod tests {
         // GitHub passed `doc` and failed `test` too.
         let github = vec![remote("doc", "success"), remote("test", "failure")];
         let rows_ = rows(&expected, &github, &local, &failures);
+        // A 401 from `gh` is the token GitHub would have given the job.
         assert_eq!(
             rows_[0].note.as_deref(),
-            Some("failed locally in step \"Install tool\" (exit 1): HTTP 401: Bad credentials")
+            Some(
+                "a step needed the GitHub token GitHub gives every job: a local job gets \
+                 yours with WRKFLW_JOB_GITHUB_TOKEN=1; \
+                 failed locally in step \"Install tool\" (exit 1): HTTP 401: Bad credentials"
+            )
         );
         // A failure both sides share needs no explaining.
         assert_eq!(rows_[1].agree, Some(true));
@@ -2107,5 +2139,33 @@ mod tests {
             "{args:?}"
         );
         assert!(!args.iter().any(|arg| arg == "--branch"), "{args:?}");
+    }
+
+    /// A job that failed for want of the token GitHub gives every job, as
+    /// `gh attestation verify` does, is told how to give it one.
+    #[test]
+    fn a_failure_for_want_of_a_github_token_says_how_to_give_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: CI\non: push\njobs:\n  doc:\n    runs-on: ubuntu-latest\n    steps:\n      - run: gh attestation verify x\n";
+        let expected = expected_jobs(&write(dir.path(), yaml)).unwrap();
+        let github = vec![remote("doc", "success")];
+        let local = vec![json!({"name": "doc", "status": "failure"})];
+        let note_after = |line: &str| {
+            let failures = [json!({"job": "doc", "step": "Run gh", "exit_code": 4,
+                "error_lines": [], "output_tail": [line]})];
+            rows(&expected, &github, &local, &failures)[0]
+                .note
+                .clone()
+                .unwrap()
+        };
+        for line in [
+            "gh: To use GitHub CLI in a GitHub Actions workflow, set the GH_TOKEN environment variable. Example:",
+            "HTTP 401: Bad credentials (https://api.github.com/repos/x/y/attestations)",
+        ] {
+            let note = note_after(line);
+            assert!(note.contains("WRKFLW_JOB_GITHUB_TOKEN=1"), "{note}");
+        }
+        let own = note_after("error: attestation does not match");
+        assert!(!own.contains("WRKFLW_JOB_GITHUB_TOKEN"), "{own}");
     }
 }

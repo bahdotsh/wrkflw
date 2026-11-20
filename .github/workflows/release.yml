@@ -232,6 +232,11 @@ jobs:
           path: artifacts
           merge-multiple: true
 
+      # scripts/install.sh checks the archive it downloads against these.
+      - name: Write checksums
+        working-directory: artifacts
+        run: sha256sum wrkflw-* > SHA256SUMS
+
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:

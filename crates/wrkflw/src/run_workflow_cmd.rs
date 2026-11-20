@@ -439,7 +439,8 @@ pub(crate) async fn run(ctx: RunCtx) {
                     println!(
                         "  {}",
                         cli_style::dim(
-                            "macOS jobs run on this Mac itself with `--runtime emulation`"
+                            "macOS jobs run on this Mac itself with `--macos-on-host`, \
+                             the other jobs staying in containers"
                         )
                     );
                 }

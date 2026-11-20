@@ -19,8 +19,10 @@
 # compare times of runs with the same `built`. Each run's full report and
 # log go to $WRKFLW_SWEEP_DIR/logs.
 #
-# `change` compares the run with its line in compare_expected.tsv, beside
-# the list of runs (or $WRKFLW_SWEEP_EXPECTED): `same`, `better`, `WORSE`
+# `change` compares the run with its line in the expectations beside the
+# list of runs: <name>_expected.tsv for a list named <name>_runs.txt, so
+# compare_runs.txt is checked against compare_expected.tsv and
+# held_out_runs.txt against held_out_expected.tsv (or $WRKFLW_SWEEP_EXPECTED): `same`, `better`, `WORSE`
 # when fewer jobs agree or more differ, or `new` for a run not listed
 # there; more `unverified` than recorded counts as WORSE too, where the
 # line records it. Some runs are known to differ, so the sweep exits 1 only when a
@@ -33,7 +35,13 @@
 set -uo pipefail
 
 RUNS="${1:-$(dirname "$0")/compare_runs.txt}"
-EXPECTED="${WRKFLW_SWEEP_EXPECTED:-$(dirname "$RUNS")/compare_expected.tsv}"
+# Each list of runs keeps its own expectations, so recording one sweep
+# never overwrites another's.
+case "$(basename "$RUNS")" in
+  *_runs.txt) default_expected="${RUNS%_runs.txt}_expected.tsv" ;;
+  *) default_expected="$(dirname "$RUNS")/compare_expected.tsv" ;;
+esac
+EXPECTED="${WRKFLW_SWEEP_EXPECTED:-$default_expected}"
 RECORD="${WRKFLW_SWEEP_RECORD:-}"
 WRKFLW="${2:-wrkflw}"
 if [[ "$WRKFLW" == */* ]]; then

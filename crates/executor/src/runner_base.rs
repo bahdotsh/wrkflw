@@ -55,6 +55,34 @@ pub(crate) fn image() -> Option<String> {
     (!recently_unavailable(&image, SystemTime::now())).then_some(image)
 }
 
+/// Where the runner base image stands, for `wrkflw doctor`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BaseImage {
+    /// [`PREBUILT_IMAGES_ENV`] turned it off: job images are built here.
+    Disabled,
+    /// A pull of it failed lately, so runs build here until the marker ages out.
+    RecentlyUnavailable(String),
+    /// Runs start job images from it.
+    Used(String),
+}
+
+/// The runner base image a run would start from, and why not when it won't.
+pub fn status() -> BaseImage {
+    if !enabled() {
+        return BaseImage::Disabled;
+    }
+    let image = std::env::var(RUNNER_IMAGE_ENV)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| published_image(&crate::engine::runner_base_dockerfile()));
+    if recently_unavailable(&image, SystemTime::now()) {
+        BaseImage::RecentlyUnavailable(image)
+    } else {
+        BaseImage::Used(image)
+    }
+}
+
 fn enabled() -> bool {
     crate::run_options::env_switch(PREBUILT_IMAGES_ENV, true)
 }

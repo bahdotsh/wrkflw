@@ -28,6 +28,10 @@ On Docker and Podman, a built-in job image on `ubuntu:latest` that doesn't set u
 
 Steps run as `runner` with passwordless `sudo`, share one container per job, so what a step installs is there for the next, and get the runner's tools (`gh`, `jq`, `zip`, `python3`, Rust when steps call cargo, Docker with `--docker-in-jobs`). Services start, and composite actions hand `$GITHUB_ENV` and `$GITHUB_PATH` on to the job.
 
+### macOS jobs on your Mac
+
+On a Mac, `--macos-on-host` runs `macos-*` jobs, and the macOS legs of a matrix, on the Mac itself while the other jobs keep their containers, so their pass checks macOS instead of standing in as Linux. It is off by default: those steps run with no container around them.
+
 ### Honest verdicts
 
 Every run ends with a `verdict`: `verified`, `partial` or `nothing_checked`. `partial` lists what wasn't checked: a Windows or macOS job run as Linux, or a step whose action didn't run. `wrkflw gate` checks a push as CI will see it, reuses jobs that already passed, and says each cause on its own line. `wrkflw compare <run>` checks wrkflw itself against a finished GitHub run.
@@ -46,11 +50,15 @@ Steps run as the `runner` user, JavaScript actions run, a job's steps share one 
 
 ## Install
 
+A prebuilt binary, no Rust needed:
+
 ```sh
-cargo install wrkflw
+cargo binstall wrkflw
+# or
+curl -fsSL https://raw.githubusercontent.com/bahdotsh/wrkflw/main/scripts/install.sh | sh
 ```
 
-or `brew install wrkflw`.
+or `brew install wrkflw`, or `cargo install wrkflw`. Then `wrkflw doctor` says what runs on your machine would use and what would slow them down, and `wrkflw gate --install-hook` checks every push before it leaves.
 
 ---
 

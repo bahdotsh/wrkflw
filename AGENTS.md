@@ -50,6 +50,8 @@ Add `--reuse-results` to `wrkflw run`, or `reuse_results` to the MCP `run_workfl
 
 `step_finished.output` holds the last 64 KiB of a step's output, delivered when the step ends. To follow a long step before it ends, add `--stream-output` to `run`: it adds `step_output` lines, `{job, step, index, lines}`, as the step prints, masked like the rest. Without it no `step_output` lines are printed.
 
+`doctor` prints `{"schema_version": 1, "type": "doctor", "ok": bool, "checks": [{"name": "...", "status": "ok" | "warn" | "fail", "detail": "...", "fix": "..." | null}]}`. The checks are `runtime` (which engine `auto` picks), `memory` (the engine's VM), `runner_image` (whether a first run pulls the prebuilt base or builds here), `macos_jobs` (on a Mac), `github_token` (where one was found, never the token), `git` and `workflows`. It starts and pulls nothing, and exits 1 only when a check fails; a `warn` is something that makes runs slower or less like GitHub's.
+
 `clean` prints `{"schema_version": 1, "type": "clean", "removed": n, "bytes": n, "in_use": n, "volumes": n, "failed": [{"path": "...", "error": "..."}]}`: workspaces removed, the bytes they held, workspaces left because a run holds them, container volumes removed because their workspace was gone, and workspaces that could not be removed. It exits 1 when `failed` is not empty, after cleaning the rest.
 
 A job that does not run, because of its `if:`, a failed `needs` job, fail-fast, a GitLab rule or `gate: false`, still gets `job_started` and `job_finished`, with `status` `skipped` and `duration_ms` 0.

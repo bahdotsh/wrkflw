@@ -1,0 +1,21 @@
+name: CI
+on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unit tests
+        run: ./test.sh
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Shell syntax
+        run: bash -n greet.sh test.sh
+  package:
+    needs: [test, lint]
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: tar czf greet.tar.gz greet.sh

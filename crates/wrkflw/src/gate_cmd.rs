@@ -795,7 +795,7 @@ fn written_by(text: &str, pid: u32) -> Option<Value> {
 }
 
 /// Whether this is a Mac running jobs in containers, where a `macos-*` job
-/// runs as Linux but `--runtime emulation` would run it on the Mac itself.
+/// runs as Linux but `--macos-on-host` would run it on the Mac itself.
 pub(crate) fn mac_with_containers(runtime_flag: &str) -> bool {
     cfg!(target_os = "macos") && runtime_flag != "emulation" && runtime_flag != "secure-emulation"
 }
@@ -828,7 +828,11 @@ fn partial_lines(unverified: &[Value], mac_hint: bool) -> Vec<String> {
                 .is_some_and(|os| os.to_ascii_lowercase().starts_with("mac"))
         });
         if mac_hint && asks_for_mac {
-            lines.push("macOS jobs run on this Mac itself with `--runtime emulation`".to_string());
+            lines.push(
+                "macOS jobs run on this Mac itself with `--macos-on-host`, \
+                 the other jobs staying in containers"
+                    .to_string(),
+            );
         }
     }
     let actions: Vec<&Value> = unverified
@@ -899,7 +903,7 @@ mod tests {
             lines[0].contains("build (os: windows-latest) (Windows)"),
             "{lines:?}"
         );
-        assert!(lines[1].contains("--runtime emulation"), "{lines:?}");
+        assert!(lines[1].contains("--macos-on-host"), "{lines:?}");
         assert!(lines[2].starts_with("1 step(s) passed without running their action"));
         assert!(lines[2].contains("org/act@v1 in lint"), "{lines:?}");
 

@@ -76,3 +76,13 @@ path = "src/main.rs"
 
 [dev-dependencies]
 tempfile.workspace = true
+
+# `cargo binstall wrkflw` installs the release's prebuilt binary instead of
+# building it: the archives the release workflow publishes for each target.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/wrkflw-{ target }{ archive-suffix }"
+bin-dir = "{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-fmt = "zip"

@@ -184,6 +184,34 @@ async fn execute_github_workflow(
         ExecutionError::Execution(format!("Failed to setup GitHub env files: {}", e))
     })?;
 
+    // `macos-*` jobs on this Mac, when asked: the env emulation would give.
+    let host_jobs = if crate::host_jobs::wanted(&config.runtime_type) {
+        let (mut env, user_env) = github_run_env(
+            &workflow,
+            workspace_dir.path(),
+            &RuntimeType::Emulation,
+            &environment::RunRef {
+                event_name: config.event_name.as_deref(),
+                git_ref: config.git_ref.as_deref(),
+                base_branch: config.base_branch.as_deref(),
+            },
+        )?;
+        if let Some(hide) = env_context.get("WRKFLW_HIDE_ACTION_MESSAGES") {
+            env.insert("WRKFLW_HIDE_ACTION_MESSAGES".to_string(), hide.clone());
+        }
+        wrkflw_logging::warning(
+            "macos-* jobs run on this Mac itself (--macos-on-host), with no container \
+             around their steps",
+        );
+        Some(std::sync::Arc::new(crate::host_jobs::HostJobs {
+            runtime: Box::new(emulation::EmulationRuntime::new()),
+            env,
+            user_env,
+        }))
+    } else {
+        None
+    };
+
     // 5. Initialize secrets management
     let secret_manager = if let Some(secrets_config) = &config.secrets_config {
         Some(
@@ -226,20 +254,23 @@ async fn execute_github_workflow(
         // Execute jobs in parallel if they don't depend on each other.
         // `needs:` failure propagation and `if:` evaluation happen per job inside
         // `execute_job_with_matrix`, so this loop and `run_called_workflow` share them.
-        let job_results = execute_job_batch(
-            &job_batch,
-            &workflow,
-            runtime.as_ref(),
-            &env_context,
-            &user_env,
-            config.verbose,
-            secret_manager.as_ref(),
-            Some(&secret_masker),
-            &all_job_outputs,
-            &all_job_results,
-            &artifact_store,
-            &cache_store,
-            &config.platform_overrides,
+        let job_results = crate::host_jobs::scope(
+            host_jobs.clone(),
+            execute_job_batch(
+                &job_batch,
+                &workflow,
+                runtime.as_ref(),
+                &env_context,
+                &user_env,
+                config.verbose,
+                secret_manager.as_ref(),
+                Some(&secret_masker),
+                &all_job_outputs,
+                &all_job_results,
+                &artifact_store,
+                &cache_store,
+                &config.platform_overrides,
+            ),
         )
         .await?;
 
@@ -3338,6 +3369,22 @@ async fn execute_job_with_matrix(
         ExecutionError::Execution(format!("Job '{}' not found in workflow", job_name))
     })?;
 
+    // A `macos-*` job runs on this Mac when the run asked for that. A matrix
+    // decides per leg, in `execute_matrix_combinations`.
+    let host = job
+        .matrix_config()
+        .is_none()
+        .then(|| crate::host_jobs::for_job(job, None, platform_overrides))
+        .flatten();
+    let (runtime, env_context, user_env) = match &host {
+        Some(host) => (
+            host.runtime.as_ref() as &dyn ContainerRuntime,
+            &host.env,
+            &host.user_env,
+        ),
+        None => (runtime, env_context, user_env),
+    };
+
     // Build filtered needs context for this job (only jobs declared in `needs:`)
     let (needs_ctx, needs_res) = build_needs_context(job, all_job_outputs, all_job_results);
 
@@ -4012,6 +4059,16 @@ async fn execute_matrix_combinations(
     let images_ahead = async {
         use futures::StreamExt;
         futures::stream::iter(unique.iter().map(|combination| async move {
+            // A leg run on the host has no image to build.
+            if crate::host_jobs::for_job(
+                ctx.job_template,
+                Some(&combination.values),
+                ctx.services.platform_overrides,
+            )
+            .is_some()
+            {
+                return;
+            }
             let steps = crate::substitution::apply_matrix_to_steps(
                 &ctx.job_template.steps,
                 &combination.values,
@@ -4048,30 +4105,48 @@ async fn execute_matrix_combinations(
             }
 
             // Process this chunk of combinations in parallel
+            let ctx = &ctx;
             let chunk_futures = chunk.iter().map(|combination| {
-                crate::job_memory::metered(
-                    job_session::with_job_session(
-                        ctx.job_template,
-                        ctx.runtime,
-                        image_is_mapped(
-                            ctx.job_template,
-                            ctx.services.platform_overrides,
-                            Some(&combination.values),
+                // A `macos-*` leg runs on this Mac when the run asked for that.
+                let host = crate::host_jobs::for_job(
+                    ctx.job_template,
+                    Some(&combination.values),
+                    ctx.services.platform_overrides,
+                );
+                async move {
+                    let (runtime, env_context, user_env) = match &host {
+                        Some(host) => (
+                            host.runtime.as_ref() as &dyn ContainerRuntime,
+                            &host.env,
+                            &host.user_env,
                         ),
-                        execute_matrix_job(
-                            ctx.job_name,
+                        None => (ctx.runtime, ctx.env_context, ctx.user_env),
+                    };
+                    crate::job_memory::metered(
+                        job_session::with_job_session(
                             ctx.job_template,
-                            combination,
-                            ctx.workflow,
-                            ctx.runtime,
-                            ctx.env_context,
-                            ctx.user_env,
-                            ctx.verbose,
-                            &ctx.services,
+                            runtime,
+                            image_is_mapped(
+                                ctx.job_template,
+                                ctx.services.platform_overrides,
+                                Some(&combination.values),
+                            ),
+                            execute_matrix_job(
+                                ctx.job_name,
+                                ctx.job_template,
+                                combination,
+                                ctx.workflow,
+                                runtime,
+                                env_context,
+                                user_env,
+                                ctx.verbose,
+                                &ctx.services,
+                            ),
                         ),
-                    ),
-                    job_passed,
-                )
+                        job_passed,
+                    )
+                    .await
+                }
             });
 
             let chunk_results = future::join_all(chunk_futures).await;

@@ -11851,9 +11851,10 @@ runs:
         }
     }
 
-    /// Under `--macos-on-host` a matrix's macOS leg runs on this machine as
-    /// macOS, its Linux leg in the run's container runtime as Linux, and the
-    /// two aren't folded into one though they share an image and steps.
+    /// Under `--macos-on-host` a matrix's macOS leg runs on this machine, as
+    /// the OS it is (macOS where the flag applies), its Linux leg in the
+    /// run's container runtime as Linux, and the two aren't folded into one
+    /// though they share an image and steps.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_mixed_matrix_runs_its_macos_leg_on_the_host_and_the_rest_in_containers() {
@@ -11921,9 +11922,12 @@ runs:
         };
         let mac = leg("macos-15");
         assert_eq!(mac.status, JobStatus::Success, "{:?}", mac.steps);
+        // The host's own OS: macOS where the flag applies, Linux on a Linux
+        // machine running this test.
+        let host_os = format!("os={}", environment::get_runner_os());
         assert!(
-            mac.steps.iter().any(|s| s.output.contains("os=macOS")),
-            "{:?}",
+            mac.steps.iter().any(|s| s.output.contains(&host_os)),
+            "expected {host_os}: {:?}",
             mac.steps
         );
         assert_eq!(leg("ubuntu-latest").status, JobStatus::Success);

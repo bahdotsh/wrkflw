@@ -242,8 +242,9 @@ impl Drop for Active {
 /// Run `future`, one job or matrix leg, with a meter of its own, and keep
 /// what it measured if the job named itself with [`measure_as`] and the run
 /// sizes jobs by memory: a run that doesn't would never read it back.
-/// `succeeded` says whether the output is a job that passed. A future that
-/// is dropped before it finishes keeps nothing.
+/// `succeeded` says whether the output is a job that ran to its end, so its
+/// peak covers its heaviest step. A future that is dropped before it
+/// finishes keeps nothing.
 pub(crate) async fn metered<F: std::future::Future>(
     future: F,
     succeeded: impl FnOnce(&F::Output) -> bool,
@@ -654,8 +655,9 @@ fn record(id: &str, family: Option<&str>, meter: &JobMeter, passed: bool) -> boo
     written.is_ok()
 }
 
-/// What to keep of a finished job's `outcome`. A failed job may have
-/// stopped before its heaviest step, so its peak says nothing.
+/// What to keep of a finished job's `outcome`. `passed` is false for a job
+/// that stopped part way, which may not have reached its heaviest step, so
+/// its peak says nothing.
 fn to_keep(outcome: Outcome, passed: bool) -> Option<Outcome> {
     match outcome {
         Outcome::Peak(_) if !passed => None,

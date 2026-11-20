@@ -956,18 +956,23 @@ pub(crate) fn get_install_script(language: &str, version: &str) -> String {
                 v = version
             )
         }
-        // The setup script is saved before it runs: piped into a shell, a
-        // failed download is an empty script that succeeds, and apt then
-        // installs the distribution's own, older Node.js without a word.
+        // A major, from nodejs.org's build of its newest release as the
+        // runner's Node is: nodesource has no package of an end-of-life
+        // major, such as 19, for a newer distribution, such as Ubuntu
+        // 26.04. nodesource's only when nodejs.org builds nothing for this
+        // machine.
         "node" => {
-            // Strip .x suffix for nodesource URL (e.g., "16.x" -> "16")
+            // Strip .x suffix (e.g., "16.x" -> "16")
             let major = version.split('.').next().unwrap_or(version);
-            format!(
-                "curl -fsSL https://deb.nodesource.com/setup_{}.x -o /tmp/node-setup.sh && \
-                 bash /tmp/node-setup.sh && rm -f /tmp/node-setup.sh && \
-                 apt-get install -y nodejs && node --version",
-                major
-            )
+            if !major.is_empty() && major.bytes().all(|b| b.is_ascii_digit()) {
+                format!(
+                    "({}) || ({})",
+                    node_tarball_install(major),
+                    nodesource_install(major)
+                )
+            } else {
+                nodesource_install(major)
+            }
         }
         // A runtime's install is a layer of its own, on top of the shared
         // packages' layer, which the builder may have cached weeks ago: an
@@ -1255,10 +1260,20 @@ pub(crate) const RUNNER_NODE_MAJOR: &str = "22";
 /// other installs trust where they fetch from, which run a script from
 /// astral.sh, sh.rustup.rs or deb.nodesource.com as root.
 pub(crate) fn runner_node_install() -> String {
-    let dist = format!("https://nodejs.org/dist/latest-v{}.x", RUNNER_NODE_MAJOR);
     format!(
-        "(command -v node >/dev/null 2>&1 || (\
-         dir=$(mktemp -d) && (\
+        "(command -v node >/dev/null 2>&1 || ({}) || ({}))",
+        node_tarball_install(RUNNER_NODE_MAJOR),
+        nodesource_install(RUNNER_NODE_MAJOR),
+    )
+}
+
+/// Installs the newest release of Node.js `major` from nodejs.org, as
+/// [`runner_node_install`] describes, failing on a machine nodejs.org builds
+/// nothing for.
+fn node_tarball_install(major: &str) -> String {
+    let dist = format!("https://nodejs.org/dist/latest-v{major}.x");
+    format!(
+        "dir=$(mktemp -d) && (\
          cd \"$dir\" && \
          arch=$(uname -m | sed 's/x86_64/x64/;s/aarch64/arm64/') && \
          curl -fsSLO {dist}/SHASUMS256.txt && \
@@ -1269,8 +1284,19 @@ pub(crate) fn runner_node_install() -> String {
          mkdir node && tar -xzf \"$file\" -C node --strip-components=1 --no-same-owner \
          --exclude='*/CHANGELOG.md' --exclude='*/LICENSE' --exclude='*/README.md' && \
          cp -a node/. /usr/local/); \
-         status=$?; [ -z \"$dir\" ] || rm -rf \"$dir\"; exit $status) || ({distribution}))",
-        distribution = get_install_script("node", RUNNER_NODE_MAJOR),
+         status=$?; [ -z \"$dir\" ] || rm -rf \"$dir\"; exit $status",
+    )
+}
+
+/// Installs Node.js `major` (or `lts`) from nodesource's apt repository.
+/// The setup script is saved before it runs: piped into a shell, a failed
+/// download is an empty script that succeeds, and apt then installs the
+/// distribution's own, older Node.js without a word.
+pub(crate) fn nodesource_install(major: &str) -> String {
+    format!(
+        "curl -fsSL https://deb.nodesource.com/setup_{major}.x -o /tmp/node-setup.sh && \
+         bash /tmp/node-setup.sh && rm -f /tmp/node-setup.sh && \
+         apt-get install -y nodejs && node --version"
     )
 }
 

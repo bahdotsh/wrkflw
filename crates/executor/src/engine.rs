@@ -2360,6 +2360,9 @@ const RUNNER_TOOLS: &[&str] = &[
     "python3",
     "python3-pip",
     "python3-venv",
+    // `python` as `python3`, which `shell: python` runs: the hosted runner
+    // has it, and go-sql-driver/mysql builds its matrix that way.
+    "python-is-python3",
 ];
 
 /// Installs the GitHub CLI from GitHub's own apt repository, the way the
@@ -2510,6 +2513,14 @@ fn combined_dockerfile_tail(runtimes: &[SetupRuntime], tools: RunnerTools) -> St
             format!("{}/.rustup", crate::runner_user::HOME),
         ));
     }
+    // A toolchain the image installed sits in a lower layer of the
+    // container's overlay filesystem, which refuses to rename its
+    // directories ("Invalid cross-device link"), so a step's rustup update
+    // of it fails, as BurntSushi/memchr's nightly job's did. This lets
+    // rustup copy instead, as GitHub's runner's plain disk never needs.
+    if has_rust {
+        env.push(("RUSTUP_PERMIT_COPY_RENAME".to_string(), "1".to_string()));
+    }
     if runtimes.iter().any(|rt| rt.language == "python") {
         env.push((
             "UV_PYTHON_INSTALL_DIR".to_string(),
@@ -2549,21 +2560,27 @@ fn combined_dockerfile_tail(runtimes: &[SetupRuntime], tools: RunnerTools) -> St
     // Base images can bundle tools ahead of the system directories. The act
     // images do this with Node, which would shadow the version a setup action
     // just installed. Every install script lands in one of these directories.
-    // setup-python puts its interpreter's scripts first, so what `pip
-    // install` adds runs by name.
+    // setup-python's interpreter's scripts come ahead of the system's, so
+    // what `pip install` adds runs by name. They come after
+    // /usr/local/bin, which has `python` as a link to the interpreter
+    // itself: the scripts directory holds a `python` too, but reached
+    // through the link [`PYTHON_SCRIPTS_DIR`] is, Python 3.10 and older
+    // look for their standard library beside that link, and fail to start
+    // ("Could not find platform independent libraries").
     // What `cargo install` installs goes on PATH, as `~/.cargo/bin` is on
     // the hosted runner's.
     let mut path: Vec<String> = Vec::new();
-    if runtimes.iter().any(|rt| rt.language == "python") {
-        path.push(PYTHON_SCRIPTS_DIR.to_string());
-    }
     if has_rust {
         path.push(match tools {
             RunnerTools::Install => format!("{}/bin", runner_cargo_home()),
             RunnerTools::Omit => ROOT_CARGO_BIN_DIR.to_string(),
         });
     }
-    path.extend(["/usr/local/bin", "/usr/bin", "$PATH"].map(str::to_string));
+    path.push("/usr/local/bin".to_string());
+    if runtimes.iter().any(|rt| rt.language == "python") {
+        path.push(PYTHON_SCRIPTS_DIR.to_string());
+    }
+    path.extend(["/usr/bin", "$PATH"].map(str::to_string));
     dockerfile.push_str(&format!("ENV PATH={}\n", path.join(":")));
 
     dockerfile
@@ -3687,7 +3704,7 @@ async fn execute_job_with_matrix(
                 image_ahead,
                 crate::job_memory::metered(
                     job_session::with_job_session(job, runtime, mapped, Box::pin(execute_job(ctx))),
-                    job_passed,
+                    measured_to_its_end,
                 ),
             ))
             .await;
@@ -4177,7 +4194,7 @@ async fn execute_matrix_combinations(
                                 &ctx.services,
                             ),
                         ),
-                        job_passed,
+                        measured_to_its_end,
                     )
                     .await
                 }
@@ -4657,10 +4674,34 @@ impl JobServices<'_> {
 /// hook that only runs after all steps complete and the job succeeds.
 /// Whether `result` is a job that ran and passed, so what it used stands
 /// for a whole run of it.
-fn job_passed(result: &Result<JobResult, ExecutionError>) -> bool {
-    result
-        .as_ref()
-        .is_ok_and(|job| job.status == JobStatus::Success && job.repeated_from.is_none())
+/// Whether a job's measured memory says what it needs: it passed, or it
+/// failed with every step after the first failure still run, as when only
+/// its last step, such as a coverage upload, failed. A job stopped part way
+/// may not have reached its heaviest step. Keeping only passes left
+/// sindresorhus/execa's legs, all failing at their last step, unmeasured on
+/// every run, so they ran one at a time.
+fn measured_to_its_end(result: &Result<JobResult, ExecutionError>) -> bool {
+    result.as_ref().is_ok_and(|job| {
+        job.repeated_from.is_none()
+            && match job.status {
+                JobStatus::Success => true,
+                JobStatus::Failure => ran_every_step(&job.steps),
+                JobStatus::Skipped => false,
+            }
+    })
+}
+
+/// Whether no step was skipped after the first that failed.
+fn ran_every_step(steps: &[StepResult]) -> bool {
+    match steps
+        .iter()
+        .position(|step| step.status == StepStatus::Failure)
+    {
+        Some(first) => steps[first..]
+            .iter()
+            .all(|step| step.status != StepStatus::Skipped),
+        None => false,
+    }
 }
 
 /// The id a job's memory measurements are kept under.
@@ -6589,8 +6630,20 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
             run.clone()
         };
 
-        // Resolve expression substitutions (hashFiles, step outputs, env, matrix vars)
-        let run_expr_ctx = ctx.expr_context();
+        // Resolve expression substitutions (hashFiles, step outputs, env, matrix vars).
+        // In a container, `${{ github.action_path }}` is the action's
+        // directory as the container sees it, as $GITHUB_ACTION_PATH is:
+        // lycheeverse/lychee-action runs `${{ github.action_path }}/entrypoint.sh`.
+        let container_env;
+        let run_expr_ctx = match container_action_path(ctx.job_env) {
+            Some(path) => {
+                let mut env = ctx.job_env.clone();
+                env.insert("GITHUB_ACTION_PATH".to_string(), path);
+                container_env = env;
+                ctx.expr_context_with_env(&container_env, ctx.job_user_env)
+            }
+            None => ctx.expr_context(),
+        };
         let resolved_run = match crate::substitution::preprocess_expressions(
             &resolved_run,
             ctx.working_dir,
@@ -7041,6 +7094,19 @@ type VolumePathPair = (PathBuf, PathBuf);
 /// True when steps execute inside a Docker/Podman/Kubernetes container
 /// rather than on the host. The mode is seeded from the runtime `initialize_runtime`
 /// returned, so `Auto` and any fallback to emulation are already resolved.
+/// Where a composite or JavaScript action's directory is inside the job's
+/// container, for an `env` that names one and runs in a container: what
+/// [`prepare_container_mounts`] sets $GITHUB_ACTION_PATH to.
+fn container_action_path(env: &HashMap<String, String>) -> Option<String> {
+    if !uses_container_runtime(env) {
+        return None;
+    }
+    let host = env.get("GITHUB_ACTION_PATH")?;
+    let root = crate::node_actions::action_root();
+    let (_, container) = action_mount(Path::new(host), root.as_ref());
+    Some(container.to_string_lossy().to_string())
+}
+
 fn uses_container_runtime(step_env: &HashMap<String, String>) -> bool {
     step_env
         .get("WRKFLW_RUNTIME_MODE")
@@ -8357,6 +8423,18 @@ async fn execute_node_action(
             .unwrap_or_default()
     }) {
         env.insert(name, value);
+    }
+    if js::needs_stand_in_token(&action_info.repository, &env) {
+        wrkflw_logging::info(&format!(
+            "{uses}: no GitHub token for its github-token input, as a local job has none \
+             unless {}=1; it gets a stand-in, so a script that never calls the API runs as \
+             on GitHub, and one that does fails with 401",
+            crate::run_options::JOB_GITHUB_TOKEN_ENV
+        ));
+        env.insert(
+            js::GITHUB_SCRIPT_TOKEN_INPUT.to_string(),
+            js::STAND_IN_TOKEN.to_string(),
+        );
     }
     env.insert(
         "GITHUB_ACTION_PATH".to_string(),
@@ -12566,6 +12644,10 @@ runs:
             built_in.contains("ENV RUSTUP_HOME=/home/runner/.rustup\n"),
             "{built_in}"
         );
+        assert!(
+            built_in.contains("ENV RUSTUP_PERMIT_COPY_RENAME=1\n"),
+            "{built_in}"
+        );
         // Before the install that reads them.
         assert!(
             built_in.find("ENV CARGO_HOME").unwrap() < built_in.find("RUN install-rust").unwrap(),
@@ -12580,7 +12662,7 @@ runs:
             "{built_in}"
         );
         assert!(
-            built_in.contains(":/home/runner/.cargo/bin:/usr/local/bin:"),
+            built_in.contains("PATH=/home/runner/.cargo/bin:/usr/local/bin:"),
             "{built_in}"
         );
 
@@ -12589,7 +12671,7 @@ runs:
         assert!(!mapped.contains("CARGO_HOME"), "{mapped}");
         assert!(mapped.contains("RUN install-rust\n"), "{mapped}");
         assert!(
-            mapped.contains(":/root/.cargo/bin:/usr/local/bin:"),
+            mapped.contains("PATH=/root/.cargo/bin:/usr/local/bin:"),
             "{mapped}"
         );
     }
@@ -12638,6 +12720,21 @@ runs:
         assert_eq!(shared_layers("FROM scratch\n"), "FROM scratch\n");
     }
 
+    /// setup-node's major comes from nodejs.org first: nodesource has no
+    /// package of an end-of-life major, such as 19, for Ubuntu 26.04.
+    #[test]
+    fn a_node_major_comes_from_nodejs_org_before_nodesource() {
+        let install = get_install_script("node", "19");
+        assert!(
+            install.starts_with("(dir=$(mktemp -d)")
+                && install.contains("https://nodejs.org/dist/latest-v19.x/SHASUMS256.txt")
+                && install.ends_with(&format!("|| ({})", nodesource_install("19"))),
+            "{install}"
+        );
+        // `lts` names no major nodejs.org has a directory for.
+        assert_eq!(get_install_script("node", "lts"), nodesource_install("lts"));
+    }
+
     #[test]
     fn the_runners_node_is_checked_against_its_published_checksum() {
         let install = runner_node_install();
@@ -12656,10 +12753,7 @@ runs:
             "{install}"
         );
         assert!(
-            install.ends_with(&format!(
-                "|| ({}))",
-                get_install_script("node", RUNNER_NODE_MAJOR)
-            )),
+            install.ends_with(&format!("|| ({}))", nodesource_install(RUNNER_NODE_MAJOR))),
             "{install}"
         );
         // One line: it is appended to the shared packages' `RUN`.
@@ -14818,8 +14912,13 @@ runs:
             None,
             RunnerTools::Install,
         );
+        // After /usr/local/bin, whose `python` links to the interpreter
+        // itself, and ahead of the system's commands.
         assert!(
-            df.contains(&format!("ENV PATH={}:", PYTHON_SCRIPTS_DIR)),
+            df.contains(&format!(
+                "ENV PATH=/usr/local/bin:{}:/usr/bin",
+                PYTHON_SCRIPTS_DIR
+            )),
             "{df}"
         );
         assert!(df.contains(&format!("\" {}", PYTHON_SCRIPTS_DIR)), "{df}");
@@ -18362,6 +18461,92 @@ runs:
             .volumes
             .iter()
             .any(|(host, guest)| host == &expected_host && guest == Path::new("/github/action")));
+    }
+
+    /// `${{ github.action_path }}` in a composite's `run:` names the
+    /// directory as the container sees it, not the host's, as
+    /// lycheeverse/lychee-action's `${{ github.action_path }}/entrypoint.sh`
+    /// needs.
+    #[tokio::test]
+    async fn composite_run_sees_github_action_path_inside_the_container() {
+        let action_dir = tempfile::tempdir().unwrap();
+        fs::write(
+            action_dir.path().join("action.yml"),
+            r#"
+name: test action
+runs:
+  using: composite
+  steps:
+    - run: ${{ github.action_path }}/entrypoint.sh
+      shell: bash
+"#,
+        )
+        .unwrap();
+
+        let runtime = MockContainerRuntime::default();
+        let mut job_env = HashMap::new();
+        job_env.insert("WRKFLW_RUNTIME_MODE".to_string(), "docker".to_string());
+        let working_dir = tempfile::tempdir().unwrap();
+        let step = make_run_step("noop");
+        let services = test_services();
+        let pending = std::sync::Mutex::new(Vec::<PendingCacheSave>::new());
+
+        execute_composite_action(
+            &step,
+            action_dir.path(),
+            &job_env,
+            &job_env,
+            working_dir.path(),
+            &runtime,
+            "ubuntu:latest",
+            &BuiltRuntimes::default(),
+            false,
+            &services,
+            &pending,
+        )
+        .await
+        .unwrap();
+
+        let calls = runtime.run_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        let command = format!(
+            "{} {}",
+            calls[0].cmd.join(" "),
+            calls[0].script.clone().unwrap_or_default()
+        );
+        assert!(
+            command.contains("/github/action/entrypoint.sh"),
+            "{command}"
+        );
+        let host = action_dir.path().canonicalize().unwrap();
+        assert!(!command.contains(&*host.to_string_lossy()), "{command}");
+    }
+
+    #[test]
+    fn a_job_that_failed_only_at_its_end_was_measured_whole() {
+        let step = |status| StepResult::new("s".to_string(), status, String::new());
+        use StepStatus::{Failure, Skipped, Success};
+        // execa: tests passed, the coverage upload at the end failed.
+        assert!(ran_every_step(&[
+            step(Success),
+            step(Success),
+            step(Failure)
+        ]));
+        // A step skipped by its own `if:` before the failure is no matter.
+        assert!(ran_every_step(&[
+            step(Skipped),
+            step(Failure),
+            step(Success)
+        ]));
+        // Stopped part way: the steps after the failure didn't run.
+        assert!(!ran_every_step(&[
+            step(Failure),
+            step(Skipped),
+            step(Skipped)
+        ]));
+        // Nothing failed, so nothing to say for a failed job.
+        assert!(!ran_every_step(&[step(Success)]));
+        assert!(!ran_every_step(&[]));
     }
 
     // --- Composite step if-condition tests ---

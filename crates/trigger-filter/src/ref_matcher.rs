@@ -18,12 +18,10 @@ pub fn matches_ref(
         return true;
     }
 
-    let opts = GlobPattern::match_options();
-
     // Check exclusions first
     if !exclude_patterns.is_empty() {
         for gp in exclude_patterns {
-            if gp.pattern.matches_with(ref_name, opts) {
+            if gp.matches(ref_name) {
                 return false;
             }
         }
@@ -35,7 +33,7 @@ pub fn matches_ref(
 
     // Check inclusions
     for gp in include_patterns {
-        if gp.pattern.matches_with(ref_name, opts) {
+        if gp.matches(ref_name) {
             return true;
         }
     }

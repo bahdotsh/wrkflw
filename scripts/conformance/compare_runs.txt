@@ -15,3 +15,20 @@ tj/commander.js      42330604270
 spf13/cobra          29133202016  WRKFLW_DOCKER_IN_JOBS=1
 fatih/color          29997796830
 pallets/flask        41077465744
+
+# Held out until 2026-11-20, when their first sweep found the causes fixed
+# then: wrkflw has been fixed against them since, so they are tuned now.
+pallets/markupsafe       37080278497
+psf/requests             40366789388
+encode/httpx             43942265472
+sharkdp/hyperfine        38224324422
+sharkdp/fd               43561890385
+expressjs/express        41517558311
+sindresorhus/execa       44272044440
+urfave/cli               42738336663
+BurntSushi/memchr        31414505747
+go-chi/chi               42388391568
+lib/pq                   43793073655
+go-sql-driver/mysql      44281558144
+jazzband/django-redis    42917669996
+dtolnay/anyhow           44655613210

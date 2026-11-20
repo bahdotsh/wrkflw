@@ -141,9 +141,11 @@ fn expected_jobs(path: &Path) -> Result<Vec<ExpectedJob>, String> {
         let job = &workflow.jobs[id];
         let called = job.uses.is_some();
         let runs_docker = wrkflw_executor::script_commands::steps_run(&job.steps, &["docker"]);
+        // GitHub trims a name: a folded `name: >` ends in a newline, and a
+        // leg missing a value the name reads leaves a trailing space.
         let template = raw["jobs"][id.as_str()]["name"]
             .as_str()
-            .map(str::to_string);
+            .map(|name| name.trim().to_string());
         let legs = job
             .matrix_config()
             .and_then(|config| wrkflw_matrix::expand_matrix(config).ok());
@@ -167,8 +169,9 @@ fn expected_jobs(path: &Path) -> Result<Vec<ExpectedJob>, String> {
             let named = template
                 .as_deref()
                 .and_then(|t| {
-                    wrkflw_executor::expression::evaluate_matrix_text(t, Some(&leg.values))
+                    wrkflw_executor::expression::evaluate_matrix_name(t, Some(&leg.values))
                 })
+                .map(|name| name.trim().to_string())
                 .unwrap_or_else(|| id.clone());
             let values: Option<Vec<String>> =
                 leg.values.values().map(value_text).collect::<Option<_>>();
@@ -260,7 +263,14 @@ const NO_DOCKER_ENGINE: &[&str] = &[
 /// 401 is left out, as a registry or upload service gives one for its own
 /// credentials, and so is a mention of `gh auth login`, which setup scripts
 /// and help text print too.
-const NO_GITHUB_TOKEN: &[&str] = &["set the GH_TOKEN environment variable", "Bad credentials"];
+const NO_GITHUB_TOKEN: &[&str] = &[
+    "set the GH_TOKEN environment variable",
+    "Bad credentials",
+    // An action's `github-token` or `token` input, which defaults to the
+    // job's token, refused as empty by `@actions/core`.
+    "Input required and not supplied: github-token",
+    "Input required and not supplied: token",
+];
 
 /// Whether a failed step's output shows it had no GitHub token.
 fn lacked_github_token(failure: &Value) -> bool {
@@ -289,6 +299,19 @@ fn failure_lines(failure: &Value) -> impl Iterator<Item = &str> {
 /// Whether a failed step's output shows that `docker` had no engine.
 fn lacked_docker(failure: &Value) -> bool {
     failure_lines(failure).any(|line| NO_DOCKER_ENGINE.iter().any(|sign| line.contains(sign)))
+}
+
+/// What a step prints when it runs an x86_64 program, as `cross` does, in
+/// an arm64 job container, such as one on an Apple Silicon Mac.
+const NEEDS_X86_64: &[&str] = &[
+    "rosetta error: failed to open elf at /lib64/ld-linux-x86-64.so.2",
+    "toolchain add stable-x86_64-unknown-linux-gnu",
+    "exec format error",
+];
+
+/// Whether a failed step's output shows it needed an x86_64 machine.
+fn needed_x86_64(failure: &Value) -> bool {
+    failure_lines(failure).any(|line| NEEDS_X86_64.iter().any(|sign| line.contains(sign)))
 }
 
 /// The most a note quotes of a line of a step's output.
@@ -372,6 +395,15 @@ fn note_for(local: &Value, failures: &[Value], runs_docker: bool) -> Option<Stri
         notes.push(
             "a step may have needed the GitHub token GitHub gives every job: a local \
              job gets yours with WRKFLW_JOB_GITHUB_TOKEN=1"
+                .to_string(),
+        );
+    }
+    // GitHub's `ubuntu-*` runners are x86_64; a job container on an arm64
+    // machine is arm64, and `cross` and its images are x86_64 only.
+    if local["status"] == "failure" && failures_of(failures, name).any(needed_x86_64) {
+        notes.push(
+            "a step ran an x86_64 program, as `cross` does, which this machine's arm64 \
+             job container can't run; GitHub's runner is x86_64"
                 .to_string(),
         );
     }
@@ -2159,6 +2191,8 @@ mod tests {
         for line in [
             "gh: To use GitHub CLI in a GitHub Actions workflow, set the GH_TOKEN environment variable. Example:",
             "HTTP 401: Bad credentials (https://api.github.com/repos/x/y/attestations)",
+            // actions/github-script's `github-token`, inside codecov-action.
+            "Error: Input required and not supplied: github-token",
         ] {
             let note = note_after(line);
             assert!(note.contains("WRKFLW_JOB_GITHUB_TOKEN=1"), "{note}");
@@ -2171,5 +2205,53 @@ mod tests {
             let note = note_after(own);
             assert!(!note.contains("WRKFLW_JOB_GITHUB_TOKEN"), "{note}");
         }
+    }
+
+    /// A job whose step ran an x86_64 program in an arm64 container, as
+    /// `cross` on an Apple Silicon Mac does, says so; a failure of its own
+    /// doesn't.
+    #[test]
+    fn a_failure_for_want_of_an_x86_64_machine_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: CI\non: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: cross build\n";
+        let expected = expected_jobs(&write(dir.path(), yaml)).unwrap();
+        let github = vec![remote("build", "success")];
+        let local = vec![json!({"name": "build", "status": "failure"})];
+        let note_after = |line: &str| {
+            let failures = [json!({"job": "build", "step": "Build", "exit_code": 1,
+                "error_lines": [], "output_tail": [line]})];
+            rows(&expected, &github, &local, &failures)[0]
+                .note
+                .clone()
+                .unwrap()
+        };
+        for line in [
+            "rosetta error: failed to open elf at /lib64/ld-linux-x86-64.so.2",
+            "1: `rustup toolchain add stable-x86_64-unknown-linux-gnu --profile minimal` failed with exit status: 1",
+        ] {
+            assert!(note_after(line).contains("x86_64"), "{line}");
+        }
+        assert!(!note_after("error[E0308]: mismatched types").contains("x86_64"));
+    }
+
+    /// GitHub trims a job's name: a folded `name: >` ends in a newline,
+    /// and a leg missing a value the name reads leaves a trailing space.
+    #[test]
+    fn a_folded_name_is_trimmed_as_github_trims_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: CI\non: push\njobs:\n  test:\n    name: >\n      Test Python ${{ matrix.python }},\n      Redis ${{ matrix.redis }}\n    runs-on: ubuntu-latest\n    strategy:\n      matrix:\n        python: ['3.13']\n        redis: ['latest']\n        include:\n          - python: '3.10'\n    steps:\n      - run: echo hi\n";
+        let expected = expected_jobs(&write(dir.path(), yaml)).unwrap();
+        assert!(
+            expected
+                .iter()
+                .any(|job| job.matches("Test Python 3.13, Redis latest")),
+            "{expected:?}"
+        );
+        assert!(
+            expected
+                .iter()
+                .any(|job| job.matches("Test Python 3.10, Redis")),
+            "{expected:?}"
+        );
     }
 }

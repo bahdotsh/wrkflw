@@ -168,17 +168,47 @@ mod tests {
 /// The source is retained so diagnostic messages can refer back to what the
 /// user wrote in the workflow YAML (e.g. `branch 'main' did not match
 /// ["release/*"]` instead of the compiled `Pattern`'s `Debug` output).
+///
+/// GitHub lets `**` sit inside a path component, as in `**.go` or
+/// `docs/**.md`, where it matches any characters, `/` included. The `glob`
+/// crate only takes `**` as a whole component, so such a pattern compiles
+/// to a few that together match the same: `pattern` and `alternatives`.
+/// Match with [`GlobPattern::matches`], which tries them all.
 #[derive(Debug, Clone)]
 pub struct GlobPattern {
     pub source: String,
     pub pattern: Pattern,
+    alternatives: Vec<Pattern>,
 }
+
+/// At most this many patterns stand for one source pattern: each component
+/// with `**` inside it doubles them.
+const MAX_GLOB_ALTERNATIVES: usize = 16;
 
 impl GlobPattern {
     pub fn new(source: impl Into<String>) -> Result<Self, PatternError> {
         let source = source.into();
-        let pattern = Pattern::new(&source)?;
-        Ok(Self { source, pattern })
+        let mut compiled = expand_inner_double_stars(&source)
+            .iter()
+            .map(|alternative| Pattern::new(alternative))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter();
+        // `expand_inner_double_stars` always returns at least the source.
+        let pattern = compiled.next().expect("at least one pattern");
+        Ok(Self {
+            source,
+            pattern,
+            alternatives: compiled.collect(),
+        })
+    }
+
+    /// Whether `text`, a ref name or a path, matches, with
+    /// [`GlobPattern::match_options`].
+    pub fn matches(&self, text: &str) -> bool {
+        let opts = Self::match_options();
+        std::iter::once(&self.pattern)
+            .chain(&self.alternatives)
+            .any(|pattern| pattern.matches_with(text, opts))
     }
 
     /// Match options used for both ref and path glob matching.
@@ -191,6 +221,44 @@ impl GlobPattern {
             require_literal_leading_dot: false,
         }
     }
+}
+
+/// The `glob` patterns that together match what GitHub matches with
+/// `source`. A component holding `**` next to other characters, `P**S`,
+/// matches `P`, anything, then `S`: within one component that is `P*S`, and
+/// across several `P*/**/*S`. Patterns with no such component come back
+/// unchanged, alone.
+fn expand_inner_double_stars(source: &str) -> Vec<String> {
+    let mut expanded = vec![String::new()];
+    for (index, component) in source.split('/').enumerate() {
+        let choices: Vec<String> = match component.find("**") {
+            Some(at) if component != "**" => {
+                let prefix = &component[..at];
+                // `***` and longer mean the same as `**`.
+                let suffix = component[at..].trim_start_matches('*');
+                vec![
+                    format!("{prefix}*{suffix}"),
+                    format!("{prefix}*/**/*{suffix}"),
+                ]
+            }
+            _ => vec![component.to_string()],
+        };
+        let fits = expanded.len() * choices.len() <= MAX_GLOB_ALTERNATIVES;
+        let choices = if fits { choices } else { choices[..1].to_vec() };
+        expanded = expanded
+            .iter()
+            .flat_map(|head| {
+                choices.iter().map(move |choice| {
+                    if index == 0 {
+                        choice.clone()
+                    } else {
+                        format!("{head}/{choice}")
+                    }
+                })
+            })
+            .collect();
+    }
+    expanded
 }
 
 /// Parsed trigger configuration for a single event type (e.g., push, pull_request).
@@ -306,4 +374,47 @@ pub struct TriggerMatchResult {
     pub matches: bool,
     pub matched_event: Option<String>,
     pub reason: String,
+}
+
+#[cfg(test)]
+mod glob_pattern_tests {
+    use super::GlobPattern;
+
+    #[test]
+    fn double_star_inside_a_component_matches_across_directories() {
+        // lib/pq's `paths: ['**.go']`: any Go file, at any depth.
+        let go = GlobPattern::new("**.go").unwrap();
+        assert!(go.matches("conn.go"));
+        assert!(go.matches("internal/proto/types.go"));
+        assert!(!go.matches("go.mod"));
+        assert!(!go.matches("README.md"));
+
+        let docs = GlobPattern::new("docs/**.md").unwrap();
+        assert!(docs.matches("docs/index.md"));
+        assert!(docs.matches("docs/guide/install.md"));
+        assert!(!docs.matches("src/index.md"));
+
+        let prefixed = GlobPattern::new("release-**").unwrap();
+        assert!(prefixed.matches("release-1.2"));
+        assert!(prefixed.matches("release-1.2/hotfix"));
+        assert!(!prefixed.matches("main"));
+    }
+
+    #[test]
+    fn whole_component_patterns_are_unchanged() {
+        let all = GlobPattern::new("**").unwrap();
+        assert!(all.matches("feature/x"));
+        let nested = GlobPattern::new("src/**/*.rs").unwrap();
+        assert!(nested.matches("src/a/b.rs"));
+        assert!(nested.matches("src/b.rs"));
+        let star = GlobPattern::new("*.md").unwrap();
+        assert!(star.matches("README.md"));
+        assert!(!star.matches("docs/README.md"));
+    }
+
+    #[test]
+    fn many_inner_double_stars_stay_bounded() {
+        let pattern = GlobPattern::new("a**/b**/c**/d**/e**/f**").unwrap();
+        assert!(pattern.matches("a/b/c/d/e/f"));
+    }
 }

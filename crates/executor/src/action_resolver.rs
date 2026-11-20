@@ -130,24 +130,92 @@ const ACTION_CACHE_DIR_ENV: &str = "WRKFLW_ACTION_CACHE_DIR";
 /// A missing, unreadable or corrupt cache file is ignored and the action is
 /// fetched again; the disk cache never fails a resolution.
 ///
+/// A private action is read with the token a clone of it would use:
+/// `provider_token`, the `GITHUB_TOKEN` a secret provider gave the job,
+/// else `GITHUB_TOKEN` or `GH_TOKEN` from the environment, else, only once
+/// the action wasn't found without one, what `gh auth token` prints.
+///
 /// Returns `Ok(ResolvedAction)` on success, or `Err` if the action metadata cannot be
 /// fetched or parsed. Callers should fall back to hardcoded image mappings on error.
 pub async fn resolve_remote_action(
     repo: &str,
     version: &str,
     sub_path: Option<&str>,
+    provider_token: Option<&str>,
 ) -> Result<ResolvedAction, String> {
-    let token = std::env::var("GITHUB_TOKEN").ok();
     let disk_cache_dir = action_cache_dir();
-    resolve_with(
+    resolve_with_token(
         GITHUB_RAW_BASE_URL,
         disk_cache_dir.as_deref(),
         repo,
         version,
         sub_path,
-        token.as_deref(),
+        first_token(provider_token, |name| std::env::var(name).ok()),
+        || crate::run_options::remote_clone_token(provider_token),
     )
     .await
+}
+
+/// The token an action's metadata is first fetched with: the secret
+/// provider's, else `GITHUB_TOKEN` or `GH_TOKEN` as `env` gives them.
+fn first_token(provider: Option<&str>, env: impl Fn(&str) -> Option<String>) -> Option<String> {
+    provider
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            ["GITHUB_TOKEN", "GH_TOKEN"]
+                .into_iter()
+                .find_map(|name| env(name).filter(|t| !t.trim().is_empty()))
+        })
+}
+
+/// [`resolve_with`] with `token`, else, when the action wasn't found
+/// without one, again with what `later_token` finds (`gh auth token`):
+/// a private action needs the same token a clone of it would, and asking
+/// `gh` for one only when it does keeps public actions from waiting on it.
+#[allow(clippy::too_many_arguments)]
+async fn resolve_with_token<F, Fut>(
+    base_url: &str,
+    disk_cache_dir: Option<&Path>,
+    repo: &str,
+    version: &str,
+    sub_path: Option<&str>,
+    token: Option<String>,
+    later_token: F,
+) -> Result<ResolvedAction, String>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Option<String>>,
+{
+    let first = resolve_with(
+        base_url,
+        disk_cache_dir,
+        repo,
+        version,
+        sub_path,
+        token.as_deref(),
+    )
+    .await;
+    match first {
+        // Both spellings of a missing file read "HTTP 404 ..." as
+        // `fetch_action_file` words them.
+        Err(e) if token.is_none() && e.contains("HTTP 404") => match later_token().await {
+            Some(token) => {
+                resolve_with(
+                    base_url,
+                    disk_cache_dir,
+                    repo,
+                    version,
+                    sub_path,
+                    Some(&token),
+                )
+                .await
+            }
+            None => Err(e),
+        },
+        other => other,
+    }
 }
 
 /// [`resolve_remote_action`] with its environment made explicit, so tests can
@@ -1350,6 +1418,116 @@ runs:
                 !has_auth,
                 "GITHUB_TOKEN leaked to redirect target! Authorization header found on redirect request."
             );
+        }
+
+        /// A token GitHub refuses, which it answers with a 404 even for a
+        /// public file, doesn't stop a public action resolving: the file is
+        /// fetched without the token first (`fetch_action_file`), which
+        /// matters now that a job's secret-provider token comes here.
+        #[tokio::test]
+        async fn a_bad_token_does_not_hide_a_public_action() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(header_exists("Authorization"))
+                .respond_with(ResponseTemplate::new(404))
+                .with_priority(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/bad-token/public/v1/action.yml"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(ACTION_YML_BODY))
+                .with_priority(5)
+                .mount(&server)
+                .await;
+            let resolved = resolve_with_token(
+                &server.uri(),
+                None,
+                "bad-token/public",
+                "v1",
+                None,
+                Some("stale_placeholder".to_string()),
+                || async { None },
+            )
+            .await;
+            assert!(resolved.is_ok(), "{resolved:?}");
+
+            // Not there at all: the error is still the first one's.
+            let missing = resolve_with_token(
+                &server.uri(),
+                None,
+                "bad-token/missing",
+                "v1",
+                None,
+                Some("stale_placeholder".to_string()),
+                || async { None },
+            )
+            .await;
+            assert!(missing.unwrap_err().contains("HTTP 404"));
+        }
+
+        /// A job's secret-provider token reads a private action, as it
+        /// would clone one; without it the environment's token does.
+        #[test]
+        fn the_providers_token_comes_first() {
+            let env = |name: &str| (name == "GH_TOKEN").then(|| "from_env".to_string());
+            assert_eq!(
+                first_token(Some("from_provider"), env).as_deref(),
+                Some("from_provider")
+            );
+            assert_eq!(first_token(Some("  "), env).as_deref(), Some("from_env"));
+            assert_eq!(first_token(None, env).as_deref(), Some("from_env"));
+            assert_eq!(first_token(None, |_| None), None);
+        }
+
+        #[tokio::test]
+        async fn a_private_action_is_resolved_with_a_token_found_later() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/later/private/v1/action.yml"))
+                .and(header_exists("Authorization"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(ACTION_YML_BODY))
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .respond_with(ResponseTemplate::new(404))
+                .with_priority(10)
+                .mount(&server)
+                .await;
+
+            let resolved = resolve_with_token(
+                &server.uri(),
+                None,
+                "later/private",
+                "v1",
+                None,
+                None,
+                || async { Some("gho_from_gh".to_string()) },
+            )
+            .await;
+            assert!(resolved.is_ok(), "{resolved:?}");
+
+            // A public action never asks for one.
+            Mock::given(method("GET"))
+                .and(path("/later/public/v1/action.yml"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(ACTION_YML_BODY))
+                .mount(&server)
+                .await;
+            let asked = std::sync::atomic::AtomicBool::new(false);
+            resolve_with_token(
+                &server.uri(),
+                None,
+                "later/public",
+                "v1",
+                None,
+                None,
+                || async {
+                    asked.store(true, std::sync::atomic::Ordering::SeqCst);
+                    None
+                },
+            )
+            .await
+            .unwrap();
+            assert!(!asked.load(std::sync::atomic::Ordering::SeqCst));
         }
 
         #[tokio::test]

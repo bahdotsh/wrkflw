@@ -56,6 +56,31 @@ pub(crate) async fn job_github_token() -> Option<String> {
     .await
 }
 
+/// The token a clone of a private repository is retried with: the
+/// `GITHUB_TOKEN` a secret provider gave the job (`provider`), else
+/// `GITHUB_TOKEN` or `GH_TOKEN` from the environment, else what
+/// `gh auth token` prints; found once per run.
+///
+/// Unlike [`job_github_token`] this needs no switch: the token goes to
+/// `git` on this machine only, to read what the user can already read,
+/// and never into a job.
+pub(crate) async fn remote_clone_token(provider: Option<&str>) -> Option<String> {
+    if let Some(token) = provider.map(str::trim).filter(|t| !t.is_empty()) {
+        return Some(token.to_string());
+    }
+    crate::acceleration::run_clone_token(|| async {
+        let token = job_github_token_from(|name| std::env::var(name).ok(), || None);
+        match token {
+            Some(token) => Some(token),
+            None => {
+                let from_gh = gh_auth_token().await;
+                job_github_token_from(|_| None, || from_gh)
+            }
+        }
+    })
+    .await
+}
+
 /// Say, once per run, that its jobs get the user's own GitHub token.
 pub(crate) fn warn_of_own_token() {
     if crate::acceleration::first_own_token_warning() {
@@ -77,11 +102,13 @@ pub(crate) fn job_github_token_wanted() -> bool {
 /// and one waiting on a locked keychain mustn't hold up the run.
 const GH_AUTH_TOKEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// What `gh auth token` prints, or `None` when it fails, isn't installed or
-/// takes longer than [`GH_AUTH_TOKEN_TIMEOUT`].
+/// What `gh auth token` prints for github.com, or `None` when it fails,
+/// isn't installed or takes longer than [`GH_AUTH_TOKEN_TIMEOUT`]. The host
+/// is named: with `GH_HOST` set to an Enterprise server, `gh` would hand
+/// back that server's token, which then goes to github.com.
 async fn gh_auth_token() -> Option<String> {
     let output = tokio::process::Command::new("gh")
-        .args(["auth", "token"])
+        .args(["auth", "token", "--hostname", "github.com"])
         .stdin(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .kill_on_drop(true)
@@ -131,10 +158,99 @@ pub fn every_matrix_leg() -> bool {
     EVERY_MATRIX_LEG.load(Ordering::Relaxed) || env_flag(EVERY_MATRIX_LEG_ENV)
 }
 
+/// Env var listing, comma-separated, actions that pass without running,
+/// such as one that deploys: `owner/repo` for each of its actions and
+/// refs, `owner/repo/path` for one action in it, either with `@ref` for
+/// that ref only, or `./path` for a local one. Step `uses:` only, not a
+/// job's reusable workflow. Each is reported as not run, so the run is
+/// `partial`.
+pub const SKIP_ACTIONS_ENV: &str = "WRKFLW_SKIP_ACTIONS";
+
+/// Why an action [`SKIP_ACTIONS_ENV`] lists didn't run.
+pub(crate) const SKIPPED_ACTION: &str = "the action is listed in WRKFLW_SKIP_ACTIONS";
+
+/// Whether [`SKIP_ACTIONS_ENV`] lists the action `uses` names.
+pub(crate) fn skipped_action(uses: &str) -> bool {
+    std::env::var(SKIP_ACTIONS_ENV).is_ok_and(|list| skip_list_has(&list, uses))
+}
+
+/// The actions [`SKIP_ACTIONS_ENV`] lists, as a stored result's key holds
+/// them: each entry once, its name in lower case (its ref as given), in
+/// order. `None` when it lists none.
+pub(crate) fn skipped_actions_key() -> Option<Vec<String>> {
+    std::env::var(SKIP_ACTIONS_ENV)
+        .ok()
+        .map(|list| skip_list_key(&list))
+        .filter(|entries| !entries.is_empty())
+}
+
+fn skip_list_key(list: &str) -> Vec<String> {
+    let mut entries: Vec<String> = list
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| match entry.split_once('@') {
+            Some((name, git_ref)) => {
+                format!("{}@{}", name.trim_end_matches('/').to_lowercase(), git_ref)
+            }
+            None if entry.starts_with('.') => entry.trim_end_matches('/').to_string(),
+            None => entry.trim_end_matches('/').to_lowercase(),
+        })
+        .collect();
+    entries.sort();
+    entries.dedup();
+    entries
+}
+
+/// Whether the [`SKIP_ACTIONS_ENV`] value `list` names the action `uses`:
+/// an entry is the action, or a repository whose action it is, ignoring
+/// case as GitHub does for repositories; with an `@ref` it names that ref
+/// alone.
+fn skip_list_has(list: &str, uses: &str) -> bool {
+    let (action, git_ref) = match uses.split_once('@') {
+        Some((action, git_ref)) => (action, Some(git_ref)),
+        None => (uses, None),
+    };
+    let action = action.trim_end_matches('/');
+    list.split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .any(|entry| {
+            let (name, wanted_ref) = match entry.split_once('@') {
+                Some((name, wanted)) => (name, Some(wanted)),
+                None => (entry, None),
+            };
+            let name = name.trim_end_matches('/');
+            // A local path names a directory, which a case-sensitive
+            // filesystem tells apart from one spelt otherwise.
+            let named = if name.starts_with('.') {
+                action == name
+            } else {
+                action.eq_ignore_ascii_case(name)
+            } || (!name.starts_with('.')
+                && action.len() > name.len()
+                && action.is_char_boundary(name.len())
+                && action[..name.len()].eq_ignore_ascii_case(name)
+                && action[name.len()..].starts_with('/'));
+            named
+                && match wanted_ref {
+                    Some(wanted) => git_ref == Some(wanted),
+                    None => true,
+                }
+        })
+}
+
 /// Whether the switch in environment variable `name` is on, read as the
 /// CLI reads it.
 pub(crate) fn env_flag(name: &str) -> bool {
     std::env::var(name).is_ok_and(|v| switch_is_on(&v))
+}
+
+/// Whether the switch in environment variable `name` is on, `default` when
+/// it isn't set: for a switch that is on until a user turns it off, read
+/// as [`switch_is_on`] reads it.
+pub(crate) fn env_switch(name: &str, default: bool) -> bool {
+    std::env::var(name).map_or(default, |v| switch_is_on(&v))
 }
 
 /// Whether an environment switch is on, read exactly as the CLI's flags read
@@ -200,5 +316,36 @@ mod tests {
             super::fresh_workspaces(),
             "set WRKFLW_FRESH_WORKSPACE=1 for tests (see .cargo/config.toml)"
         );
+    }
+
+    #[test]
+    fn the_skip_list_names_an_action_or_its_repository() {
+        use super::skip_list_has;
+        let list = " Org/Deploy , aws-actions/configure-aws-credentials/,./.github/actions/notify";
+        assert!(skip_list_has(list, "org/deploy@v1"));
+        assert!(skip_list_has(list, "org/deploy/sub@v1"));
+        assert!(skip_list_has(
+            list,
+            "aws-actions/configure-aws-credentials@v4"
+        ));
+        assert!(skip_list_has(list, "./.github/actions/notify"));
+        assert!(!skip_list_has(list, "org/deploy-preview@v1"));
+        assert!(!skip_list_has(list, "./.github/actions/notify/inner"));
+        assert!(!skip_list_has(list, "actions/github-script@v7"));
+        assert!(!skip_list_has("", "org/deploy@v1"));
+        assert!(skip_list_has("org/deploy@v2", "org/deploy@v2"));
+        assert!(!skip_list_has("org/deploy@v2", "org/deploy@v1"));
+        assert!(skip_list_has("org/deploy@v2", "org/deploy/sub@v2"));
+        assert!(!skip_list_has("./Notify", "./notify"));
+    }
+
+    #[test]
+    fn the_skip_list_keys_a_result_the_same_however_it_is_written() {
+        use super::skip_list_key;
+        assert_eq!(
+            skip_list_key(" Org/Deploy/ ,b/c@V1,org/deploy,"),
+            ["b/c@V1", "org/deploy"]
+        );
+        assert!(skip_list_key(" , ").is_empty());
     }
 }

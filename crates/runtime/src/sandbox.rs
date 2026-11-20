@@ -349,9 +349,14 @@ impl Sandbox {
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
 
+        // Host variables the step mustn't inherit go first, so a value the
+        // step sets itself still wins.
+        for name in crate::env_removals(env_vars) {
+            cmd.env_remove(name);
+        }
         // Set environment variables (filtered)
         for (key, value) in env_vars {
-            if self.is_env_var_safe(key) {
+            if *key != crate::ENV_REMOVE && self.is_env_var_safe(key) {
                 cmd.env(key, value);
             }
         }

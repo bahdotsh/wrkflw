@@ -43,6 +43,10 @@ fn ran_nothing(code: Option<i32>) -> bool {
 /// mode, where the verdict comes from `run_finished` instead.
 const PARTIAL_EXIT: i32 = 80;
 
+/// Env var naming the file a child run in text mode writes its
+/// `unverified` entries to, so the gate can say what wasn't checked.
+pub(crate) const UNVERIFIED_FILE_ENV: &str = "WRKFLW_GATE_UNVERIFIED_FILE";
+
 /// Whether a child's exit code says it passed, fully or not.
 fn passed(code: Option<i32>) -> bool {
     matches!(code, Some(0 | PARTIAL_EXIT))
@@ -567,7 +571,25 @@ impl Launcher<'_> {
                 "{}",
                 cli_style::dim(&format!("gate: {} ({})", file.display(), event.describe()))
             );
-            text_entry(file, child.status().ok().and_then(|status| status.code()))
+            let unverified_file = tempfile::NamedTempFile::new().ok();
+            if let Some(path) = &unverified_file {
+                child.env(UNVERIFIED_FILE_ENV, path.path());
+            }
+            let (pid, code) = match child.spawn() {
+                Ok(mut running) => (
+                    Some(running.id()),
+                    running.wait().ok().and_then(|status| status.code()),
+                ),
+                Err(_) => (None, None),
+            };
+            let mut entry = text_entry(file, code);
+            if let Some(unverified) = unverified_file
+                .and_then(|f| std::fs::read_to_string(f.path()).ok())
+                .and_then(|text| written_by(&text, pid?))
+            {
+                entry["unverified"] = unverified;
+            }
+            entry
         };
         entry["event"] = json!(event.name);
         if let Some(base) = &event.base_branch {
@@ -677,15 +699,31 @@ pub(crate) fn run(ctx: GateCtx) {
             .collect();
         eprintln!("gate failed: {}", paths.join(", "));
     } else if report["verdict"] == "partial" {
+        let unverified: &[Value] = report["unverified"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or_default();
         println!(
             "{}",
             cli_style::warning(&format!(
-                "gate passed, partially verified: {} workflow(s) ran, {} skipped. Some jobs \
-                 ran as another OS than runs-on asked for, or passed a step whose action \
-                 wrkflw can't run, so the pass doesn't stand for GitHub's",
+                "gate passed, partially verified: {} workflow(s) ran, {} skipped. The pass \
+                 doesn't stand for GitHub's:",
                 report["ran"], report["skipped"]
             ))
         );
+        let lines = partial_lines(unverified, mac_with_containers(ctx.runtime.as_flag()));
+        if lines.is_empty() {
+            println!(
+                "  {}",
+                cli_style::dim(
+                    "some jobs ran as another OS than runs-on asked for, or passed a step \
+                     whose action didn't run: see the runs above"
+                )
+            );
+        }
+        for line in lines {
+            println!("  {}", cli_style::dim(&line));
+        }
     } else if report["verdict"] != "nothing_checked" {
         println!(
             "gate passed: {} workflow(s) ran, {} skipped",
@@ -745,6 +783,78 @@ fn check_workflow(
     entry
 }
 
+/// What a child run wrote to [`UNVERIFIED_FILE_ENV`]'s file, when that
+/// child, process `pid`, wrote it: under emulation a step inherits the
+/// variable, and a `wrkflw run` inside a step (as in wrkflw's own tests)
+/// writes the same file with what *it* didn't check.
+fn written_by(text: &str, pid: u32) -> Option<Value> {
+    let written: Value = serde_json::from_str(text).ok()?;
+    (written["pid"] == pid)
+        .then(|| written["unverified"].clone())
+        .filter(Value::is_array)
+}
+
+/// Whether this is a Mac running jobs in containers, where a `macos-*` job
+/// runs as Linux but `--runtime emulation` would run it on the Mac itself.
+pub(crate) fn mac_with_containers(runtime_flag: &str) -> bool {
+    cfg!(target_os = "macos") && runtime_flag != "emulation" && runtime_flag != "secure-emulation"
+}
+
+/// What a partial gate didn't check, one line per cause: jobs run as
+/// another OS, and steps whose action didn't run. `mac_hint` adds how a
+/// `macos-*` job can run on this Mac.
+fn partial_lines(unverified: &[Value], mac_hint: bool) -> Vec<String> {
+    let text = |v: &Value| v.as_str().unwrap_or("?").to_string();
+    let mut lines = Vec::new();
+    let runners: Vec<&Value> = unverified
+        .iter()
+        .filter(|u| u["kind"] == "runner")
+        .collect();
+    if !runners.is_empty() {
+        let ran_as = text(&runners[0]["ran_as"]);
+        let jobs: Vec<String> = runners
+            .iter()
+            .map(|u| format!("{} ({})", text(&u["job"]), text(&u["requested"])))
+            .collect();
+        lines.push(format!(
+            "{} job(s) ran as {} for another OS, so steps that depend on the OS weren't checked: {}",
+            runners.len(),
+            ran_as,
+            jobs.join(", ")
+        ));
+        let asks_for_mac = runners.iter().any(|u| {
+            u["requested"]
+                .as_str()
+                .is_some_and(|os| os.to_ascii_lowercase().starts_with("mac"))
+        });
+        if mac_hint && asks_for_mac {
+            lines.push("macOS jobs run on this Mac itself with `--runtime emulation`".to_string());
+        }
+    }
+    let actions: Vec<&Value> = unverified
+        .iter()
+        .filter(|u| u["kind"] == "action_not_run")
+        .collect();
+    if !actions.is_empty() {
+        // Each action once per job, in the order they ran; the count is of
+        // steps, which may use one action more than once.
+        let mut steps: Vec<String> = Vec::new();
+        for u in &actions {
+            let step = format!("{} in {}", text(&u["uses"]), text(&u["job"]));
+            if !steps.contains(&step) {
+                steps.push(step);
+            }
+        }
+        lines.push(format!(
+            "{} step(s) passed without running their action, so what it installs or checks \
+             wasn't: {}",
+            actions.len(),
+            steps.join(", ")
+        ));
+    }
+    lines
+}
+
 /// The entry for a child run in text mode, from its exit code alone: its
 /// output went to the terminal, so the code is all there is to read.
 fn text_entry(file: &Path, code: Option<i32>) -> Value {
@@ -762,6 +872,59 @@ fn text_entry(file: &Path, code: Option<i32>) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_gates_own_child_is_read() {
+        let text = r#"{"pid":42,"unverified":[{"kind":"runner"}]}"#;
+        assert_eq!(written_by(text, 42), Some(json!([{"kind": "runner"}])));
+        assert_eq!(written_by(text, 43), None, "a nested run's file");
+        assert_eq!(written_by("[]", 42), None);
+        assert_eq!(written_by("garbage", 42), None);
+    }
+
+    #[test]
+    fn a_partial_gate_names_each_cause_apart() {
+        let unverified = vec![
+            json!({"kind": "runner", "job": "build (os: windows-latest)", "requested": "Windows", "ran_as": "Linux"}),
+            json!({"kind": "runner", "job": "mac", "requested": "macOS", "ran_as": "Linux"}),
+            json!({"kind": "action_not_run", "job": "lint", "step": "x", "uses": "org/act@v1"}),
+        ];
+        let lines = partial_lines(&unverified, true);
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert!(
+            lines[0].starts_with("2 job(s) ran as Linux for another OS"),
+            "{lines:?}"
+        );
+        assert!(
+            lines[0].contains("build (os: windows-latest) (Windows)"),
+            "{lines:?}"
+        );
+        assert!(lines[1].contains("--runtime emulation"), "{lines:?}");
+        assert!(lines[2].starts_with("1 step(s) passed without running their action"));
+        assert!(lines[2].contains("org/act@v1 in lint"), "{lines:?}");
+
+        let repeated = vec![
+            json!({"kind": "action_not_run", "job": "a", "uses": "o/x@v1"}),
+            json!({"kind": "action_not_run", "job": "b", "uses": "o/y@v1"}),
+            json!({"kind": "action_not_run", "job": "a", "uses": "o/x@v1"}),
+        ];
+        assert_eq!(
+            partial_lines(&repeated, false),
+            [
+                "3 step(s) passed without running their action, so what it installs or checks \
+              wasn't: o/x@v1 in a, o/y@v1 in b"
+            ],
+            "an action repeated apart is named once"
+        );
+
+        let no_hint = partial_lines(&unverified[..1], true);
+        assert_eq!(
+            no_hint.len(),
+            1,
+            "a Windows job gets no Mac hint: {no_hint:?}"
+        );
+        assert!(partial_lines(&[], true).is_empty());
+    }
 
     #[test]
     fn the_gate_object_fails_on_a_failed_or_broken_workflow() {

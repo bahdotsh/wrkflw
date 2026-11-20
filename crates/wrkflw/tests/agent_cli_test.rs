@@ -1440,11 +1440,578 @@ fn a_step_whose_action_did_not_run_makes_a_pass_partial() {
     );
 }
 
-/// A local JavaScript action can't run here, so its step passes but is
-/// listed under `unverified`, as a remote one is. A local composite action
-/// runs step by step and isn't.
+/// A local JavaScript action runs with node: its inputs, with defaults and
+/// hyphens kept, what it writes to `$GITHUB_OUTPUT` and `$GITHUB_ENV`, and
+/// a post that reads what it saved, at the end of the job.
 #[test]
-fn a_local_javascript_action_is_reported_as_not_run() {
+fn a_local_javascript_action_runs_with_its_inputs_state_and_post() {
+    if !has_node() {
+        return;
+    }
+    let sandbox = Sandbox::new();
+    let js = sandbox.repo.path().join(".github/actions/js");
+    fs::create_dir_all(&js).unwrap();
+    fs::write(
+        js.join("action.yml"),
+        "name: js\ninputs:\n  who-to:\n    default: world\n  greeting:\n    required: true\n\
+         runs:\n  using: node20\n  main: main.js\n  post: post.js\n",
+    )
+    .unwrap();
+    fs::write(
+        js.join("main.js"),
+        r#"const fs = require("fs");
+const greeting = process.env["INPUT_GREETING"] + " " + process.env["INPUT_WHO-TO"];
+console.log(greeting);
+fs.appendFileSync(process.env.GITHUB_OUTPUT, `said=${greeting}\n`);
+fs.appendFileSync(process.env.GITHUB_ENV, `FROM_JS=yes\n`);
+fs.appendFileSync(process.env.GITHUB_STATE, `saved=from-main\n`);
+"#,
+    )
+    .unwrap();
+    fs::write(
+        js.join("post.js"),
+        r#"console.log("post sees " + process.env.STATE_saved);"#,
+    )
+    .unwrap();
+    sandbox.write(
+        "local.yml",
+        "name: local\non: [push]\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      \
+         - name: JS\n        id: js\n        uses: ./.github/actions/js\n        with:\n          greeting: hello\n      \
+         - name: Check\n        run: |\n          test \"${{ steps.js.outputs.said }}\" = \"hello world\"\n          test \"$FROM_JS\" = yes\n",
+    );
+    let output = sandbox.run(&[
+        "--format",
+        "json",
+        "run",
+        "--runtime",
+        "emulation",
+        ".github/workflows/local.yml",
+    ]);
+    let lines = json_lines(&output);
+    let finished = lines
+        .iter()
+        .find(|line| line["type"] == "run_finished")
+        .unwrap_or_else(|| panic!("no run_finished: {}", stdout(&output)));
+    assert_eq!(finished["status"], "success", "{finished}");
+    let unverified_steps: Vec<&Value> = finished["unverified"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|entry| entry.get("step").is_some())
+        .collect();
+    assert!(unverified_steps.is_empty(), "{finished}");
+    let post = lines
+        .iter()
+        .find(|line| line["type"] == "step_finished" && line["step"] == "Post JS")
+        .unwrap_or_else(|| panic!("no post step: {}", stdout(&output)));
+    assert_eq!(post["status"], "success", "{post}");
+    assert!(
+        post["output"]
+            .as_str()
+            .unwrap()
+            .contains("post sees from-main"),
+        "{post}"
+    );
+}
+
+/// A JavaScript action inside a composite action queues its post for the
+/// end of the calling job, as on GitHub.
+#[test]
+fn a_javascript_action_in_a_composite_action_runs_its_post() {
+    if !has_node() {
+        return;
+    }
+    let sandbox = Sandbox::new();
+    js_action(
+        &sandbox,
+        "js",
+        "name: js\nruns:\n  using: node20\n  main: main.js\n  post: post.js\n",
+        &[
+            (
+                "main.js",
+                r#"require("fs").appendFileSync(process.env.GITHUB_STATE, "from=inner\n");"#,
+            ),
+            (
+                "post.js",
+                r#"console.log("inner post sees " + process.env.STATE_from);"#,
+            ),
+        ],
+    );
+    let wrapper = sandbox.repo.path().join(".github/actions/wrapper");
+    fs::create_dir_all(&wrapper).unwrap();
+    fs::write(
+        wrapper.join("action.yml"),
+        "name: wrapper\nruns:\n  using: composite\n  steps:\n    \
+         - name: Inner JS\n      uses: ./.github/actions/js\n",
+    )
+    .unwrap();
+    sandbox.write(
+        "wrapped.yml",
+        "name: wrapped\non: [push]\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      \
+         - name: Wrapper\n        uses: ./.github/actions/wrapper\n",
+    );
+    let output = sandbox.run(&[
+        "--format",
+        "json",
+        "run",
+        "--runtime",
+        "emulation",
+        ".github/workflows/wrapped.yml",
+    ]);
+    let lines = json_lines(&output);
+    let post = finished_step(&lines, "Post Inner JS", &output);
+    assert_eq!(post["status"], "success", "{post}");
+    assert!(
+        post["output"]
+            .as_str()
+            .unwrap()
+            .contains("inner post sees inner"),
+        "{post}"
+    );
+}
+
+/// Whether this machine has `node`, which the emulation tests of
+/// JavaScript actions run them with.
+fn has_node() -> bool {
+    let found = Command::new("node").arg("--version").output().is_ok();
+    if !found {
+        eprintln!("skipped: no node on this machine");
+    }
+    found
+}
+
+/// A local JavaScript action at `.github/actions/<name>` in `sandbox`,
+/// with `action.yml` and its scripts.
+fn js_action(sandbox: &Sandbox, name: &str, action_yml: &str, scripts: &[(&str, &str)]) {
+    let dir = sandbox.repo.path().join(".github/actions").join(name);
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("action.yml"), action_yml).unwrap();
+    for (file, text) in scripts {
+        fs::write(dir.join(file), text).unwrap();
+    }
+}
+
+/// The `step_finished` line of the step named `name`.
+fn finished_step<'a>(lines: &'a [Value], name: &str, output: &Output) -> &'a Value {
+    lines
+        .iter()
+        .find(|line| line["type"] == "step_finished" && line["step"] == name)
+        .unwrap_or_else(|| panic!("no step '{name}': {}", stdout(output)))
+}
+
+/// A JavaScript action starts in the workspace whatever
+/// `defaults.run.working-directory` says, runs as an earlier step built it
+/// in the workspace, runs its `pre` first, whose state `main` and `post`
+/// read, and its post sees the job's env as it is at the end of the job
+/// with the step's own `env:`.
+#[test]
+fn a_javascript_action_runs_as_built_in_the_workspace_with_the_end_of_job_env() {
+    if !has_node() {
+        return;
+    }
+    let sandbox = Sandbox::new();
+    fs::create_dir_all(sandbox.repo.path().join("sub")).unwrap();
+    fs::write(sandbox.repo.path().join("sub/.keep"), "").unwrap();
+    js_action(
+        &sandbox,
+        "js",
+        "name: js\nruns:\n  using: node20\n  pre: pre.js\n  main: main.js\n  post: post.js\n",
+        &[
+            (
+                "pre.js",
+                r#"require("fs").appendFileSync(process.env.GITHUB_STATE, "early=from-pre\n");
+console.log("pre ran");"#,
+            ),
+            (
+                "main.js",
+                r#"console.error("the checked-in main.js ran, not the one built"); process.exit(1);"#,
+            ),
+            (
+                "built.js",
+                r#"const fs = require("fs");
+// The workspace's root has sub/; `defaults.run` would have started it in sub.
+if (!fs.existsSync("sub/.keep")) { console.error(`started in ${process.cwd()}`); process.exit(1); }
+if (process.env.STATE_early !== "from-pre") { console.error(`STATE_early=${process.env.STATE_early}`); process.exit(1); }
+fs.appendFileSync(process.env.GITHUB_STATE, "saved=from-main\n");
+console.log("built main ran");
+"#,
+            ),
+            (
+                "post.js",
+                r#"const e = process.env;
+if (e.LATE !== "yes" || e.FROM_STEP !== "s" || e.STATE_saved !== "from-main" || e.STATE_early !== "from-pre") {
+  console.error(`post env: LATE=${e.LATE} FROM_STEP=${e.FROM_STEP} STATE_saved=${e.STATE_saved} STATE_early=${e.STATE_early}`);
+  process.exit(1);
+}
+console.log("post ok");
+"#,
+            ),
+        ],
+    );
+    sandbox.write(
+        "built.yml",
+        "name: built\non: [push]\ndefaults:\n  run:\n    working-directory: sub\njobs:\n  a:\n    \
+         runs-on: ubuntu-latest\n    steps:\n      \
+         - uses: actions/checkout@v4\n      \
+         - name: Build\n        run: cp ../.github/actions/js/built.js ../.github/actions/js/main.js\n      \
+         - name: JS\n        uses: ./.github/actions/js\n        env:\n          FROM_STEP: s\n      \
+         - name: Late\n        run: echo LATE=yes >> \"$GITHUB_ENV\"\n",
+    );
+    let output = sandbox.run(&[
+        "--format",
+        "json",
+        "run",
+        "--runtime",
+        "emulation",
+        ".github/workflows/built.yml",
+    ]);
+    let lines = json_lines(&output);
+    let js = finished_step(&lines, "JS", &output);
+    assert_eq!(js["status"], "success", "{js}");
+    let text = js["output"].as_str().unwrap();
+    assert!(text.contains("pre ran"), "{js}");
+    assert!(text.contains("built main ran"), "{js}");
+    let post = finished_step(&lines, "Post JS", &output);
+    assert_eq!(post["status"], "success", "{post}");
+    assert!(
+        post["output"].as_str().unwrap().contains("post ok"),
+        "{post}"
+    );
+}
+
+/// A post that fails fails the job, though its action's step passed.
+/// (A post past the job's time is covered by the executor's unit tests:
+/// emulation doesn't stop a step at the job's `timeout-minutes`.)
+#[test]
+fn a_failing_post_fails_the_job() {
+    if !has_node() {
+        return;
+    }
+    let sandbox = Sandbox::new();
+    js_action(
+        &sandbox,
+        "failing",
+        "name: f\nruns:\n  using: node20\n  main: main.js\n  post: post.js\n",
+        &[
+            ("main.js", r#"console.log("main ok");"#),
+            (
+                "post.js",
+                r#"console.error("post failed"); process.exit(3);"#,
+            ),
+        ],
+    );
+    sandbox.write(
+        "post.yml",
+        "name: p\non: [push]\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      \
+         - name: JS\n        uses: ./.github/actions/failing\n",
+    );
+    let output = sandbox.run(&[
+        "--format",
+        "json",
+        "run",
+        "--runtime",
+        "emulation",
+        ".github/workflows/post.yml",
+    ]);
+    let lines = json_lines(&output);
+    let finished = lines
+        .iter()
+        .find(|line| line["type"] == "run_finished")
+        .unwrap_or_else(|| panic!("no run_finished: {}", stdout(&output)));
+    assert_eq!(finished["status"], "failure", "{finished}");
+    assert_eq!(finished_step(&lines, "JS", &output)["status"], "success");
+    let post = finished_step(&lines, "Post JS", &output);
+    assert_eq!(post["status"], "failure", "{post}");
+}
+
+/// What `pre` writes to `$GITHUB_ENV` reaches `main`, as `pre` is a step
+/// of its own on GitHub, and the job's later steps.
+#[test]
+fn what_pre_exports_reaches_main_and_later_steps() {
+    if !has_node() {
+        return;
+    }
+    let sandbox = Sandbox::new();
+    js_action(
+        &sandbox,
+        "exports",
+        "name: e\nruns:\n  using: node20\n  pre: pre.js\n  main: main.js\n",
+        &[
+            (
+                "pre.js",
+                r#"require("fs").appendFileSync(process.env.GITHUB_ENV, "FROM_PRE=yes\n");"#,
+            ),
+            (
+                "main.js",
+                r#"if (process.env.FROM_PRE !== "yes") { console.error("main saw no FROM_PRE"); process.exit(1); }"#,
+            ),
+        ],
+    );
+    sandbox.write(
+        "pre_env.yml",
+        "name: p\non: [push]\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      \
+         - name: JS\n        uses: ./.github/actions/exports\n      \
+         - name: Later\n        run: test \"$FROM_PRE\" = yes\n",
+    );
+    let output = sandbox.run(&[
+        "--format",
+        "json",
+        "run",
+        "--runtime",
+        "emulation",
+        ".github/workflows/pre_env.yml",
+    ]);
+    let lines = json_lines(&output);
+    assert_eq!(finished_step(&lines, "JS", &output)["status"], "success");
+    assert_eq!(finished_step(&lines, "Later", &output)["status"], "success");
+}
+
+/// A post's `post-if` reads the job's status at the end of the job: a
+/// `success()` post is skipped once a later step failed, and an
+/// `always()` one still runs.
+#[test]
+fn a_success_only_post_is_skipped_after_a_failed_step() {
+    if !has_node() {
+        return;
+    }
+    let sandbox = Sandbox::new();
+    js_action(
+        &sandbox,
+        "on-success",
+        "name: s\nruns:\n  using: node20\n  main: main.js\n  post: post.js\n  post-if: success()\n",
+        &[
+            ("main.js", r#"console.log("main ok");"#),
+            ("post.js", r#"console.log("success post ran");"#),
+        ],
+    );
+    js_action(
+        &sandbox,
+        "always",
+        "name: a\nruns:\n  using: node20\n  main: main.js\n  post: post.js\n",
+        &[
+            ("main.js", r#"console.log("main ok");"#),
+            ("post.js", r#"console.log("always post ran");"#),
+        ],
+    );
+    sandbox.write(
+        "post_if.yml",
+        "name: p\non: [push]\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      \
+         - name: OnSuccess\n        uses: ./.github/actions/on-success\n      \
+         - name: Always\n        uses: ./.github/actions/always\n      \
+         - name: Break\n        run: exit 1\n",
+    );
+    let output = sandbox.run(&[
+        "--format",
+        "json",
+        "run",
+        "--runtime",
+        "emulation",
+        ".github/workflows/post_if.yml",
+    ]);
+    let lines = json_lines(&output);
+    assert_eq!(
+        finished_step(&lines, "Post OnSuccess", &output)["status"],
+        "skipped"
+    );
+    assert_eq!(
+        finished_step(&lines, "Post Always", &output)["status"],
+        "success"
+    );
+    assert!(!stdout(&output).contains("success post ran"));
+}
+
+/// Each leg of a matrix runs its JavaScript action's post: the matrix
+/// runs its steps through a loop of its own.
+#[test]
+fn each_matrix_leg_runs_its_actions_post() {
+    if !has_node() {
+        return;
+    }
+    let sandbox = Sandbox::new();
+    js_action(
+        &sandbox,
+        "cleanup",
+        "name: c\nruns:\n  using: node20\n  main: main.js\n  post: post.js\n",
+        &[
+            ("main.js", r#"console.log("main ok");"#),
+            ("post.js", r#"console.log("post ran");"#),
+        ],
+    );
+    sandbox.write(
+        "matrix_post.yml",
+        "name: m\non: [push]\njobs:\n  a:\n    runs-on: ubuntu-latest\n    strategy:\n      \
+         matrix:\n        leg: [one, two]\n    steps:\n      \
+         - name: JS\n        uses: ./.github/actions/cleanup\n",
+    );
+    let output = sandbox.run(&[
+        "--format",
+        "json",
+        "--every-matrix-leg",
+        "run",
+        "--runtime",
+        "emulation",
+        ".github/workflows/matrix_post.yml",
+    ]);
+    let lines = json_lines(&output);
+    let posts: Vec<&Value> = lines
+        .iter()
+        .filter(|line| line["type"] == "step_finished" && line["step"] == "Post JS")
+        .collect();
+    assert_eq!(posts.len(), 2, "{}", stdout(&output));
+    assert!(
+        posts.iter().all(|post| post["status"] == "success"),
+        "{posts:?}"
+    );
+}
+
+/// As on GitHub, where an action's `pre` registers its post, a `pre` that
+/// fails still has its post clean up at the end of the job, and `main`
+/// doesn't run.
+#[test]
+fn a_failing_pre_still_runs_its_post() {
+    if !has_node() {
+        return;
+    }
+    let sandbox = Sandbox::new();
+    js_action(
+        &sandbox,
+        "prefails",
+        "name: p\nruns:\n  using: node20\n  pre: pre.js\n  main: main.js\n  post: post.js\n",
+        &[
+            ("pre.js", r#"console.error("pre failed"); process.exit(2);"#),
+            ("main.js", r#"console.log("main ran");"#),
+            ("post.js", r#"console.log("post ran");"#),
+        ],
+    );
+    sandbox.write(
+        "pre.yml",
+        "name: p\non: [push]\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      \
+         - name: JS\n        uses: ./.github/actions/prefails\n",
+    );
+    let output = sandbox.run(&[
+        "--format",
+        "json",
+        "run",
+        "--runtime",
+        "emulation",
+        ".github/workflows/pre.yml",
+    ]);
+    let lines = json_lines(&output);
+    let js = finished_step(&lines, "JS", &output);
+    assert_eq!(js["status"], "failure", "{js}");
+    assert!(!stdout(&output).contains("main ran"), "{}", stdout(&output));
+    let post = finished_step(&lines, "Post JS", &output);
+    assert_eq!(post["status"], "success", "{post}");
+}
+
+/// A step that can't run at all, such as one naming a local action that
+/// isn't there, ends the job with an error; the posts of the actions that
+/// ran before it still clean up first.
+#[test]
+fn a_post_runs_when_a_later_step_cannot_run() {
+    if !has_node() {
+        return;
+    }
+    let sandbox = Sandbox::new();
+    js_action(
+        &sandbox,
+        "cleans",
+        "name: c\nruns:\n  using: node20\n  main: main.js\n  post: post.js\n",
+        &[
+            ("main.js", r#"console.log("main ok");"#),
+            (
+                "post.js",
+                r#"require("fs").writeFileSync(process.env.MARKER, "post ran");"#,
+            ),
+        ],
+    );
+    let marker = sandbox.repo.path().join("post-marker");
+    sandbox.write(
+        "post.yml",
+        &format!(
+            "name: p\non: [push]\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      \
+             - name: JS\n        uses: ./.github/actions/cleans\n        env:\n          \
+             MARKER: {}\n      - name: Missing\n        uses: ./.github/actions/missing\n",
+            marker.display()
+        ),
+    );
+    let output = sandbox.run(&[
+        "run",
+        "--runtime",
+        "emulation",
+        ".github/workflows/post.yml",
+    ]);
+    assert!(!output.status.success(), "{}", stdout(&output));
+    assert_eq!(
+        fs::read_to_string(&marker).ok().as_deref(),
+        Some("post ran"),
+        "{}\n{}",
+        stdout(&output),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// With `WRKFLW_SKIP_ACTIONS` naming an action, that action doesn't run and
+/// the run is partial, while the job's other actions still run.
+#[test]
+fn an_action_the_user_skips_is_reported_as_not_run() {
+    if !has_node() {
+        return;
+    }
+    let sandbox = Sandbox::new();
+    js_action(
+        &sandbox,
+        "deploy",
+        "name: d\nruns:\n  using: node20\n  main: main.js\n",
+        &[("main.js", r#"console.log("deployed"); process.exit(1);"#)],
+    );
+    js_action(
+        &sandbox,
+        "check",
+        "name: c\nruns:\n  using: node20\n  main: main.js\n",
+        &[("main.js", r#"console.log("checked");"#)],
+    );
+    sandbox.write(
+        "skip.yml",
+        "name: s\non: [push]\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      \
+         - name: Deploy\n        uses: ./.github/actions/deploy\n      \
+         - name: Check\n        uses: ./.github/actions/check\n",
+    );
+    let output = sandbox
+        .command(&[
+            "--format",
+            "json",
+            "run",
+            "--runtime",
+            "emulation",
+            ".github/workflows/skip.yml",
+        ])
+        .env("WRKFLW_SKIP_ACTIONS", "./.github/actions/deploy")
+        .output()
+        .unwrap();
+    let lines = json_lines(&output);
+    let finished = lines
+        .iter()
+        .find(|line| line["type"] == "run_finished")
+        .unwrap_or_else(|| panic!("no run_finished: {}", stdout(&output)));
+    assert_eq!(finished["status"], "success", "{finished}");
+    assert_eq!(finished["verdict"], "partial", "{finished}");
+    let not_run: Vec<&Value> = finished["unverified"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|entry| entry.get("step").is_some())
+        .collect();
+    assert_eq!(not_run.len(), 1, "{finished}");
+    assert_eq!(not_run[0]["step"], "Deploy");
+    assert_eq!(not_run[0]["uses"], "./.github/actions/deploy");
+    assert_eq!(finished_step(&lines, "Check", &output)["status"], "success");
+}
+
+/// With `WRKFLW_JS_ACTIONS=0` a JavaScript action doesn't run: the step
+/// passes and the run is partial. A composite action is still run.
+#[test]
+fn a_javascript_action_turned_off_is_reported_as_not_run() {
     let sandbox = Sandbox::new();
     let actions = sandbox.repo.path().join(".github/actions");
     fs::create_dir_all(actions.join("js")).unwrap();
@@ -1465,14 +2032,18 @@ fn a_local_javascript_action_is_reported_as_not_run() {
          - name: JS\n        uses: ./.github/actions/js\n      \
          - name: Composite\n        uses: ./.github/actions/composite\n",
     );
-    let output = sandbox.run(&[
-        "--format",
-        "json",
-        "run",
-        "--runtime",
-        "emulation",
-        ".github/workflows/local.yml",
-    ]);
+    let output = sandbox
+        .command(&[
+            "--format",
+            "json",
+            "run",
+            "--runtime",
+            "emulation",
+            ".github/workflows/local.yml",
+        ])
+        .env("WRKFLW_JS_ACTIONS", "0")
+        .output()
+        .unwrap();
     let finished = json_lines(&output)
         .into_iter()
         .find(|line| line["type"] == "run_finished")

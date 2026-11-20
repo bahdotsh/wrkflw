@@ -1456,12 +1456,19 @@ enum PreparedAction {
     Unresolved { image: String, fetch_error: String },
     /// A composite action that needs special step-based execution.
     Composite,
+    /// A JavaScript action, run with `node` as the runner runs it: see
+    /// [`execute_node_action`].
+    Node {
+        runs: crate::node_actions::NodeRuns,
+        definition: serde_yaml::Value,
+    },
 }
 
 // Add Action preparation functions
 async fn prepare_action(
     action: &ActionInfo,
     runtime: &dyn ContainerRuntime,
+    provider_token: Option<&str>,
 ) -> Result<PreparedAction, ExecutionError> {
     if action.is_docker {
         // Docker action: pull the image and run with its native entrypoint
@@ -1531,7 +1538,15 @@ async fn prepare_action(
                 }
             }
 
-            // Fall back to node for JS actions
+            // A JavaScript action, if `runs` says how to run it.
+            if let Some(def) = definition {
+                if let Some(runs) = crate::node_actions::NodeRuns::from_definition(&def) {
+                    return Ok(PreparedAction::Node {
+                        runs,
+                        definition: def,
+                    });
+                }
+            }
             return Ok(PreparedAction::Image("node:20-slim".to_string()));
         }
     }
@@ -1543,11 +1558,22 @@ async fn prepare_action(
             &action.repository,
             &action.version,
             action.sub_path.as_deref(),
+            provider_token,
         )
         .await
         {
             Ok(resolved) => match &resolved.action_type {
                 action_resolver::ActionType::Node { version } => {
+                    if let Some(runs) = resolved
+                        .definition
+                        .as_ref()
+                        .and_then(crate::node_actions::NodeRuns::from_definition)
+                    {
+                        return Ok(PreparedAction::Node {
+                            runs,
+                            definition: resolved.definition.clone().unwrap_or_default(),
+                        });
+                    }
                     let image = format!("node:{}-slim", version);
                     wrkflw_logging::info(&format!(
                         "Resolved action '{}' -> image '{}'",
@@ -1586,16 +1612,9 @@ async fn prepare_action(
                         action.repository
                     ));
 
-                    // Clone the repository.
-                    // `tempdir` is only needed through `build_image` — after the
-                    // image is built all files are baked into the Docker image
-                    // and the temp directory can be dropped safely.
-                    let tempdir = tempfile::tempdir().map_err(|e| {
-                        ExecutionError::Execution(format!("Failed to create temp dir: {}", e))
-                    })?;
-                    let repo_url = format!("https://github.com/{}.git", action.repository);
-                    let repo_dir = tempdir.path().join("action");
-                    shallow_clone(&repo_url, &action.version, &repo_dir).await?;
+                    // This run's clone of the repository, made once.
+                    let clone = cloned_action(action, provider_token).await?;
+                    let repo_dir = clone.path().join("action");
 
                     // Resolve the action directory (respecting sub_path)
                     let action_dir = match &action.sub_path {
@@ -1954,22 +1973,173 @@ fn extract_docker_runs_config(
 /// For branch/tag refs, uses `git clone --depth 1 --branch <ref>`.
 /// For SHA refs (40 hex chars), uses `git init` + `git fetch --depth 1` + `git checkout`.
 ///
+/// The clone is tried without credentials first. When that fails for a
+/// github.com URL and a token is at hand (`provider_token`, the
+/// `GITHUB_TOKEN` a secret provider gave the job, else the one
+/// [`crate::run_options::remote_clone_token`] finds on this machine), it is
+/// tried again with the token, so a private repository the user can read
+/// clones too. The token reaches git through its environment, as an extra
+/// HTTP header: never the URL, the command line or the clone's
+/// `.git/config`.
+///
 /// Uses `tokio::process::Command` to avoid blocking the async runtime.
 async fn shallow_clone(
     repo_url: &str,
     git_ref: &str,
     target_dir: &Path,
+    provider_token: Option<&str>,
+) -> Result<(), ExecutionError> {
+    let anonymous = match clone_attempt(repo_url, git_ref, target_dir, &[]).await {
+        Ok(()) => return Ok(()),
+        Err(e) => e,
+    };
+    if !repo_url.starts_with(GITHUB_CLONE_PREFIX) || !needs_credentials(&anonymous.to_string()) {
+        return Err(anonymous);
+    }
+    let Some(token) = crate::run_options::remote_clone_token(provider_token).await else {
+        return Err(anonymous);
+    };
+    crate::log_redaction::register_all(std::iter::once(&token));
+    // The failed attempt may have left a partial clone behind.
+    if target_dir.exists() {
+        let _ = std::fs::remove_dir_all(target_dir);
+    }
+    let auth = clone_auth_env(&token, std::env::var("GIT_CONFIG_COUNT").ok().as_deref());
+    clone_attempt(repo_url, git_ref, target_dir, &auth)
+        .await
+        .map(|()| {
+            // Said, as the repository is one only the user's token could
+            // read, and the run's steps can read what was cloned.
+            wrkflw_logging::info(&format!(
+                "Cloned {} at {} with your GitHub token: it isn't public",
+                repo_url
+                    .trim_start_matches(GITHUB_CLONE_PREFIX)
+                    .trim_end_matches(".git"),
+                git_ref
+            ));
+        })
+        .map_err(|with_token| {
+            ExecutionError::Execution(format!(
+                "{} (also failed with your GitHub token: {}; check that the repository and \
+                 ref exist, and that the token can read the repository)",
+                anonymous, with_token
+            ))
+        })
+}
+
+/// This run's clone of the remote action `action`'s repository, under
+/// `action` in the directory returned: made the first time a step of the
+/// run asks for that `repo@ref`, and kept until the run ends, so every
+/// step and matrix leg that uses it shares one.
+async fn cloned_action(
+    action: &ActionInfo,
+    provider_token: Option<&str>,
+) -> Result<Arc<tempfile::TempDir>, ExecutionError> {
+    let key = format!("{}@{}", action.repository, action.version);
+    let url = format!("{}{}.git", GITHUB_CLONE_PREFIX, action.repository);
+    let version = action.version.clone();
+    let token = provider_token.map(str::to_string);
+    acceleration::run_action_clone(&key, |dir| async move {
+        shallow_clone(&url, &version, &dir, token.as_deref())
+            .await
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(ExecutionError::Execution)
+}
+
+/// The job's copy of [`cloned_action`] for a step to run from: made the
+/// first time a step of the job uses the action, and shared by the job's
+/// later steps, as on GitHub; see [`crate::node_actions::JobActions`].
+async fn action_for_step(
+    action: &ActionInfo,
+    provider_token: Option<&str>,
+) -> Result<Arc<tempfile::TempDir>, ExecutionError> {
+    let key = format!("{}@{}", action.repository, action.version);
+    if let Some(copy) = crate::node_actions::job_copy(&key) {
+        return Ok(copy);
+    }
+    let clone = cloned_action(action, provider_token).await?;
+    let copy = tokio::task::spawn_blocking(move || crate::node_actions::private_copy(clone.path()))
+        .await
+        .map_err(|e| ExecutionError::Execution(format!("Copying the action failed: {}", e)))?
+        .map_err(ExecutionError::Execution)?;
+    Ok(crate::node_actions::keep_job_copy(&key, copy))
+}
+
+/// Whether a failed anonymous clone's error says GitHub wanted credentials,
+/// as it does for a private repository (which it reports as not found), and
+/// not that the ref or the network was at fault, which a token won't fix.
+fn needs_credentials(error: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        "could not read Username",
+        "terminal prompts disabled",
+        "Authentication failed",
+        "Repository not found",
+        "requested URL returned error: 401",
+        "requested URL returned error: 403",
+        "requested URL returned error: 404",
+    ];
+    MARKERS.iter().any(|marker| error.contains(marker))
+}
+
+/// Where every clone of a GitHub repository starts.
+const GITHUB_CLONE_PREFIX: &str = "https://github.com/";
+
+/// Environment that has git send `token` to github.com as basic auth, as
+/// `actions/checkout` does, without it showing in a command line. The
+/// header is added after the `count` entries the user's own environment
+/// may already give git (`GIT_CONFIG_COUNT`), so those still apply.
+fn clone_auth_env(token: &str, count: Option<&str>) -> Vec<(String, String)> {
+    use base64::Engine as _;
+    let credentials = base64::engine::general_purpose::STANDARD
+        .encode(format!("x-access-token:{}", token).as_bytes());
+    let index = count
+        .and_then(|count| count.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    vec![
+        ("GIT_CONFIG_COUNT".to_string(), (index + 1).to_string()),
+        (
+            format!("GIT_CONFIG_KEY_{}", index),
+            format!("http.{}.extraheader", GITHUB_CLONE_PREFIX),
+        ),
+        (
+            format!("GIT_CONFIG_VALUE_{}", index),
+            format!("AUTHORIZATION: basic {}", credentials),
+        ),
+    ]
+}
+
+/// A `git` command for a clone: hooks off, as cloned repositories are
+/// untrusted and could carry post-checkout hooks; never asking for a
+/// password, at the terminal or in Git Credential Manager's window, which
+/// would hang a run (a credential helper that answers on its own still
+/// does); in English, which [`needs_credentials`] reads; killed with the
+/// step that waits on it; and with `auth` in its environment.
+fn clone_git(auth: &[(String, String)]) -> tokio::process::Command {
+    let mut git = tokio::process::Command::new("git");
+    git.args(["-c", "core.hooksPath=/dev/null"])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GCM_INTERACTIVE", "never")
+        .env("LC_ALL", "C")
+        .envs(auth.iter().map(|(k, v)| (k, v)))
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true);
+    git
+}
+
+/// One try of [`shallow_clone`], with `auth` in git's environment.
+async fn clone_attempt(
+    repo_url: &str,
+    git_ref: &str,
+    target_dir: &Path,
+    auth: &[(String, String)],
 ) -> Result<(), ExecutionError> {
     let is_sha = is_git_sha(git_ref);
 
-    // Disable git hooks for all operations — cloned repos are untrusted and
-    // could contain malicious post-checkout / post-merge hooks.
-    let no_hooks = ["-c", "core.hooksPath=/dev/null"];
-
     if is_sha {
         // SHA refs can't use --branch; use init + fetch + checkout instead
-        let init = tokio::process::Command::new("git")
-            .args(no_hooks)
+        let init = clone_git(auth)
             .arg("init")
             .arg(target_dir)
             .stdout(std::process::Stdio::null())
@@ -1984,8 +2154,7 @@ async fn shallow_clone(
             )));
         }
 
-        let fetch = tokio::process::Command::new("git")
-            .args(no_hooks)
+        let fetch = clone_git(auth)
             .arg("-C")
             .arg(target_dir)
             .arg("fetch")
@@ -2011,8 +2180,7 @@ async fn shallow_clone(
             )));
         }
 
-        let checkout = tokio::process::Command::new("git")
-            .args(no_hooks)
+        let checkout = clone_git(auth)
             .arg("-C")
             .arg(target_dir)
             .arg("checkout")
@@ -2035,8 +2203,7 @@ async fn shallow_clone(
         }
     } else {
         // Branch/tag refs: standard shallow clone
-        let output = tokio::process::Command::new("git")
-            .args(no_hooks)
+        let output = clone_git(auth)
             .arg("clone")
             .arg("--depth")
             .arg("1")
@@ -2203,6 +2370,25 @@ fn generate_combined_dockerfile(
     week: Option<&str>,
     tools: RunnerTools,
 ) -> String {
+    combined_dockerfile_for_uid(
+        runtimes,
+        base_image,
+        base_id,
+        week,
+        tools,
+        crate::runner_user::uid(),
+    )
+}
+
+/// [`generate_combined_dockerfile`] with the runner user's uid given.
+fn combined_dockerfile_for_uid(
+    runtimes: &[SetupRuntime],
+    base_image: &str,
+    base_id: Option<&str>,
+    week: Option<&str>,
+    tools: RunnerTools,
+    uid: u32,
+) -> String {
     let mut dockerfile = format!("FROM {}\n", base_image);
     if let Some(id) = base_id {
         dockerfile.push_str(&format!("# base image id: {}\n", id));
@@ -2230,10 +2416,7 @@ fn generate_combined_dockerfile(
         dockerfile.push_str(&RUNNER_TOOLS.join(" "));
         // The user steps run as, once `sudo` is there for it.
         dockerfile.push_str(" && \\\n");
-        dockerfile.push_str(&format!(
-            "    {}",
-            crate::runner_user::create_script(crate::runner_user::uid())
-        ));
+        dockerfile.push_str(&format!("    {}", crate::runner_user::create_script(uid)));
     }
 
     // Hosted runners also have Node.js whatever the job sets up, and tools
@@ -2249,6 +2432,14 @@ fn generate_combined_dockerfile(
     dockerfile.push_str(REMOVE_PACKAGE_LISTS);
     dockerfile.push('\n');
 
+    dockerfile.push_str(&combined_dockerfile_tail(runtimes, tools));
+    dockerfile
+}
+
+/// What a combined image's Dockerfile has after its shared packages: the
+/// runtimes' environment, one `RUN` per runtime, and `PATH`.
+fn combined_dockerfile_tail(runtimes: &[SetupRuntime], tools: RunnerTools) -> String {
+    let mut dockerfile = String::new();
     // After the shared packages, so a variable that differs between the
     // legs of a matrix, such as `UV_PYTHON`, doesn't give each leg packages
     // of its own, and before the runtimes, whose installs read them.
@@ -2326,6 +2517,168 @@ fn generate_combined_dockerfile(
     dockerfile
 }
 
+/// The Dockerfile of the runner base image published with each release:
+/// what every built-in job image on `ubuntu:latest` starts with, the
+/// packages, the runner's tools, Node.js, the runner user with GitHub's
+/// uid and the GitHub CLI. See [`crate::runner_base`].
+pub fn runner_base_dockerfile() -> String {
+    let mut dockerfile = combined_dockerfile_for_uid(
+        &[],
+        "ubuntu:latest",
+        None,
+        None,
+        RunnerTools::Install,
+        crate::runner_user::HOSTED_UID,
+    );
+    dockerfile.push_str(&format!("RUN {}\n", GH_CLI_INSTALL));
+    dockerfile
+}
+
+/// A job image's Dockerfile on the runner base image `base` (whose runner
+/// user already has this machine's uid): the pulled base's `base_id`, so
+/// a refreshed base gets a new job image, a `RUN` naming `week` for
+/// floating versions, and then what [`combined_dockerfile_tail`] adds.
+fn dockerfile_on_runner_base(
+    runtimes: &[SetupRuntime],
+    base: &str,
+    base_id: Option<&str>,
+    week: Option<&str>,
+) -> String {
+    let mut dockerfile = format!("FROM {}\n", base);
+    if let Some(id) = base_id {
+        dockerfile.push_str(&format!("# base image id: {}\n", id));
+    }
+    if let Some(week) = week {
+        dockerfile.push_str(&format!("RUN : floating versions resolved in {}\n", week));
+    }
+    dockerfile.push_str(&combined_dockerfile_tail(runtimes, RunnerTools::Install));
+    dockerfile
+}
+
+/// The job image for `runtimes` built on the published runner base image,
+/// when it applies: a built-in image on `ubuntu:latest` with no Node.js of
+/// its own to install, on an engine that keeps what it builds. `None`
+/// when it doesn't apply, when the base image couldn't be pulled (a
+/// registry's refusal is remembered for a day), or when its runner user
+/// couldn't be given this machine's uid: the caller then builds the image
+/// here from the start. `Some(Err)` when the base was there but the
+/// runtimes failed to build on it, as they would here.
+async fn build_on_runner_base(
+    runtimes: &[SetupRuntime],
+    base_image: &str,
+    runtime: &dyn ContainerRuntime,
+    tools: RunnerTools,
+    what: &str,
+) -> Option<Result<String, ExecutionError>> {
+    if tools != RunnerTools::Install
+        || base_image != "ubuntu:latest"
+        || runtimes.iter().any(|rt| rt.language == "node")
+        || !runtime.reuses_build_layers()
+    {
+        return None;
+    }
+    let base = crate::runner_base::image()?;
+    let week = floating_versions_week(runtimes, chrono::Utc::now());
+    build_on_base(
+        runtimes,
+        &base,
+        runtime,
+        what,
+        crate::runner_user::uid(),
+        week.as_deref(),
+    )
+    .await
+}
+
+/// [`build_on_runner_base`] on the base image `base`, for the runner user's
+/// `uid` and the floating-versions `week`.
+async fn build_on_base(
+    runtimes: &[SetupRuntime],
+    base: &str,
+    runtime: &dyn ContainerRuntime,
+    what: &str,
+    uid: u32,
+    week: Option<&str>,
+) -> Option<Result<String, ExecutionError>> {
+    // A build of nothing but `FROM` pulls the base, with a build's time
+    // limit, which a large image needs, rather than a pull's.
+    let probe = format!(
+        "{}base-{:x}",
+        COMBINED_IMAGE_PREFIX,
+        fnv1a_hash(base.as_bytes())
+    );
+    if let Err(e) = build_image_once(
+        &format!("FROM {}\n", base),
+        &probe,
+        "the runner base image",
+        runtime,
+    )
+    .await
+    {
+        // A registry's refusal is remembered for a day. Anything else, a
+        // network that's down or a registry behind a firewall, for an
+        // hour: it says less about the image, but a machine offline all
+        // day shouldn't wait on the pull every run.
+        let when = if crate::runner_base::pull_refused(base, &e.to_string()) {
+            crate::runner_base::mark_unavailable(base, crate::runner_base::REFUSED_FOR);
+            "tried again tomorrow"
+        } else {
+            crate::runner_base::mark_unavailable(base, crate::runner_base::UNREACHABLE_FOR);
+            "tried again in an hour"
+        };
+        wrkflw_logging::info(&format!(
+            "The runner base image {} isn't available, so the job's image is built here \
+             ({}; {}=0 stops trying): {}",
+            base,
+            when,
+            crate::runner_base::PREBUILT_IMAGES_ENV,
+            e
+        ));
+        return None;
+    }
+    // The base as pulled. Its name stays the same when the weekly refresh
+    // replaces it, so the images built on it are named by its identity
+    // too, as `generate_combined_dockerfile` names a built image's base:
+    // otherwise they'd go on being reused, built on the old one.
+    let base_id = runtime.image_id(&probe).await;
+    // The runner user given this machine's uid in an image of its own: a
+    // failure there says nothing about the job, so its image is then built
+    // here, where the user gets the uid from the start.
+    let start = if uid == crate::runner_user::HOSTED_UID {
+        probe
+    } else {
+        let remapped = match &base_id {
+            Some(id) => format!("{}-uid{}-{:x}", probe, uid, fnv1a_hash(id.as_bytes())),
+            None => format!("{}-uid{}", probe, uid),
+        };
+        let remap = format!(
+            "FROM {}\n{}RUN {}\n",
+            probe,
+            base_id
+                .as_ref()
+                .map(|id| format!("# base image id: {}\n", id))
+                .unwrap_or_default(),
+            crate::runner_user::remap_script(uid)
+        );
+        if let Err(e) = build_image_once(&remap, &remapped, "the runner user", runtime).await {
+            wrkflw_logging::info(&format!(
+                "The runner user couldn't be given uid {} on the runner base image, so the \
+                 job's image is built here: {}",
+                uid, e
+            ));
+            return None;
+        }
+        remapped
+    };
+    let dockerfile = dockerfile_on_runner_base(runtimes, &start, base_id.as_deref(), week);
+    let tag = combined_image_tag(runtimes, &dockerfile);
+    Some(
+        build_image_once(&dockerfile, &tag, what, runtime)
+            .await
+            .map(|()| tag),
+    )
+}
+
 /// What hands the runner user the files `language`'s install just wrote,
 /// in an image that has that user.
 fn owned_by_runner(tools: RunnerTools, language: &str) -> Option<String> {
@@ -2350,7 +2703,7 @@ fn floating_versions_week(
 }
 
 /// FNV-1a hash — deterministic across Rust toolchain versions, unlike `DefaultHasher`.
-pub(crate) fn fnv1a_hash(data: &[u8]) -> u64 {
+pub fn fnv1a_hash(data: &[u8]) -> u64 {
     const FNV_OFFSET_BASIS: u64 = 14695981039346656037;
     const FNV_PRIME: u64 = 1099511628211;
     let mut hash = FNV_OFFSET_BASIS;
@@ -2417,6 +2770,19 @@ async fn build_combined_runtime_image(
     runtime: &dyn ContainerRuntime,
     tools: RunnerTools,
 ) -> Result<String, ExecutionError> {
+    let languages = runtimes
+        .iter()
+        .map(|r| r.language.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let what = if languages.is_empty() {
+        "the runner's tools".to_string()
+    } else {
+        languages
+    };
+    if let Some(built) = build_on_runner_base(runtimes, base_image, runtime, tools, &what).await {
+        return built;
+    }
     // The base image's identity, so a changed base gets a new combined image.
     // An image not yet present is pulled first: the build would pull it
     // anyway, and knowing its ID now saves a rebuild on the next run. A
@@ -2455,16 +2821,6 @@ async fn build_combined_runtime_image(
         return Ok(with_gh);
     }
 
-    let languages = runtimes
-        .iter()
-        .map(|r| r.language.as_str())
-        .collect::<Vec<_>>()
-        .join(", ");
-    let what = if languages.is_empty() {
-        "the runner's tools".to_string()
-    } else {
-        languages
-    };
     build_image_once(&dockerfile, &tag, &what, runtime).await?;
     match tools {
         RunnerTools::Install => Ok(with_github_cli(&tag, runtime).await),
@@ -3255,7 +3611,7 @@ async fn execute_job_with_matrix(
             job_session::noting_root_fallback(with_images_built_ahead(
                 image_ahead,
                 crate::job_memory::metered(
-                    job_session::with_job_session(job, runtime, mapped, execute_job(ctx)),
+                    job_session::with_job_session(job, runtime, mapped, Box::pin(execute_job(ctx))),
                     job_passed,
                 ),
             ))
@@ -3353,8 +3709,15 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
 
     // Handle reusable workflow jobs (job-level 'uses')
     if let Some(uses) = &job.uses {
-        return execute_reusable_workflow_job(&ctx, uses, job.with.as_ref(), job.secrets.as_ref())
-            .await;
+        // Boxed: a called workflow runs jobs of its own through this same
+        // function, so its future would otherwise nest in every caller's.
+        return Box::pin(execute_reusable_workflow_job(
+            &ctx,
+            uses,
+            job.with.as_ref(),
+            job.secrets.as_ref(),
+        ))
+        .await;
     }
     // Only after the reusable workflow check: its jobs take places of their
     // own, and a caller holding one would deadlock a limit of one.
@@ -3446,6 +3809,8 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
             .as_ref(),
     );
     let pending_cache_saves = std::sync::Mutex::new(Vec::<PendingCacheSave>::new());
+    let posts = crate::node_actions::JobScope::default();
+    let mut step_error: Option<ExecutionError> = None;
 
     let job_deadline = tokio::time::Instant::now() + job_timeout;
     let first_step = crate::events::first_step_for(ctx.job_name, &job.steps);
@@ -3462,54 +3827,55 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
             remaining,
             loop_state
                 .live_step(idx, step, ctx.services.secret_masker)
-                .run(Box::pin(run_step_with_guards(
-                    step,
-                    idx,
-                    &job_env,
-                    ctx.workflow,
-                    StepExecutionContext {
+                .run(Box::pin(crate::node_actions::within_job(
+                    &posts,
+                    Box::pin(run_step_with_guards(
                         step,
-                        step_idx: idx,
-                        job_env: &job_env,
-                        job_user_env: &job_user_env,
-                        working_dir: job_dir.path(),
-                        runtime: ctx.runtime,
-                        workflow: ctx.workflow,
-                        runner_image: &runner_image_value.image,
-                        installed_runtimes: &runner_image_value.built,
-                        verbose: ctx.verbose,
-                        matrix_combination: &None,
-                        container_config: job.container.as_ref(),
-                        workflow_defaults: ctx.workflow.defaults.as_ref(),
-                        job_defaults: job.defaults.as_ref(),
-                        step_outputs: &loop_state.step_outputs_map,
-                        step_statuses: &loop_state.step_status_map,
-                        job_status: &loop_state.job_status_str,
-                        services: JobServices {
-                            secret_manager: ctx.services.secret_manager,
-                            secret_masker: ctx.services.secret_masker,
-                            secrets_context: ctx.services.secrets_context,
-                            missing_secrets: ctx.services.missing_secrets,
-                            needs_context: ctx.services.needs_context,
-                            needs_results: ctx.services.needs_results,
-                            artifact_store: ctx.services.artifact_store,
-                            cache_store: ctx.services.cache_store,
-                            platform_overrides: ctx.services.platform_overrides,
+                        idx,
+                        &job_env,
+                        ctx.workflow,
+                        StepExecutionContext {
+                            step,
+                            step_idx: idx,
+                            job_env: &job_env,
+                            job_user_env: &job_user_env,
+                            working_dir: job_dir.path(),
+                            runtime: ctx.runtime,
+                            workflow: ctx.workflow,
+                            runner_image: &runner_image_value.image,
+                            installed_runtimes: &runner_image_value.built,
+                            verbose: ctx.verbose,
+                            matrix_combination: &None,
+                            container_config: job.container.as_ref(),
+                            workflow_defaults: ctx.workflow.defaults.as_ref(),
+                            job_defaults: job.defaults.as_ref(),
+                            step_outputs: &loop_state.step_outputs_map,
+                            step_statuses: &loop_state.step_status_map,
+                            job_status: &loop_state.job_status_str,
+                            services: ctx.services,
+                            pending_cache_saves: &pending_cache_saves,
                         },
-                        pending_cache_saves: &pending_cache_saves,
-                    },
+                    )),
                 ))),
         )
         .await
         {
-            Ok(result) => result?,
+            Ok(Ok(outcome)) => outcome,
+            // The job ends with this error, once its posts have run.
+            Ok(Err(e)) => {
+                // Recorded, so the posts below see a failed job.
+                loop_state.fail_step(step, idx, e.to_string());
+                step_error = Some(e);
+                job_success = false;
+                break;
+            }
             Err(_) => {
                 let msg = format!(
                     "Job '{}' exceeded timeout of {} minutes",
                     ctx.job_name, timeout_mins
                 );
                 copy_back_after_timeout(job_dir.path()).await;
-                loop_state.fail_step_on_timeout(step, idx, msg);
+                loop_state.fail_step(step, idx, msg);
                 job_success = false;
                 break;
             }
@@ -3526,6 +3892,37 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
             job_success = false;
             break;
         }
+    }
+
+    // JavaScript actions' posts, last first, whatever became of the job.
+    if Box::pin(run_job_posts(
+        crate::node_actions::take_posts(&posts),
+        posts_deadline(job_deadline, tokio::time::Instant::now()),
+        job.steps.len(),
+        &mut loop_state,
+        &mut job_env,
+        &mut job_user_env,
+        PostContext {
+            working_dir: job_dir.path(),
+            runtime: ctx.runtime,
+            workflow: ctx.workflow,
+            runner_image: &runner_image_value.image,
+            installed_runtimes: &runner_image_value.built,
+            verbose: ctx.verbose,
+            matrix_combination: &None,
+            container_config: job.container.as_ref(),
+            workflow_defaults: ctx.workflow.defaults.as_ref(),
+            job_defaults: job.defaults.as_ref(),
+            services: ctx.services,
+            pending_cache_saves: &pending_cache_saves,
+        },
+    ))
+    .await
+    {
+        job_success = false;
+    }
+    if let Some(e) = step_error {
+        return Err(e);
     }
 
     // Flush deferred cache saves only on success (matches GHA post-step semantics)
@@ -3920,6 +4317,8 @@ async fn execute_matrix_job(
         let job_deadline = tokio::time::Instant::now() + job_timeout;
 
         let first_step = crate::events::first_step_for(job_name, &materialized_steps);
+        let posts = crate::node_actions::JobScope::default();
+        let mut step_error: Option<ExecutionError> = None;
 
         for (idx, step) in materialized_steps.iter().enumerate() {
             if crate::events::skipped_by_from_step(idx, first_step, step) {
@@ -3933,54 +4332,55 @@ async fn execute_matrix_job(
                 remaining,
                 loop_state
                     .live_step(idx, step, services.secret_masker)
-                    .run(Box::pin(run_step_with_guards(
-                        step,
-                        idx,
-                        &job_env,
-                        workflow,
-                        StepExecutionContext {
+                    .run(Box::pin(crate::node_actions::within_job(
+                        &posts,
+                        Box::pin(run_step_with_guards(
                             step,
-                            step_idx: idx,
-                            job_env: &job_env,
-                            job_user_env: &job_user_env,
-                            working_dir: job_dir.path(),
-                            runtime,
+                            idx,
+                            &job_env,
                             workflow,
-                            runner_image: &runner_image_value.image,
-                            installed_runtimes: &runner_image_value.built,
-                            verbose,
-                            matrix_combination: &Some(combination.values.clone()),
-                            container_config: job_template.container.as_ref(),
-                            workflow_defaults: workflow.defaults.as_ref(),
-                            job_defaults: job_template.defaults.as_ref(),
-                            step_outputs: &loop_state.step_outputs_map,
-                            step_statuses: &loop_state.step_status_map,
-                            job_status: &loop_state.job_status_str,
-                            services: JobServices {
-                                secret_manager: services.secret_manager,
-                                secret_masker: services.secret_masker,
-                                secrets_context: services.secrets_context,
-                                missing_secrets: services.missing_secrets,
-                                needs_context: services.needs_context,
-                                needs_results: services.needs_results,
-                                artifact_store: services.artifact_store,
-                                cache_store: services.cache_store,
-                                platform_overrides: services.platform_overrides,
+                            StepExecutionContext {
+                                step,
+                                step_idx: idx,
+                                job_env: &job_env,
+                                job_user_env: &job_user_env,
+                                working_dir: job_dir.path(),
+                                runtime,
+                                workflow,
+                                runner_image: &runner_image_value.image,
+                                installed_runtimes: &runner_image_value.built,
+                                verbose,
+                                matrix_combination: &Some(combination.values.clone()),
+                                container_config: job_template.container.as_ref(),
+                                workflow_defaults: workflow.defaults.as_ref(),
+                                job_defaults: job_template.defaults.as_ref(),
+                                step_outputs: &loop_state.step_outputs_map,
+                                step_statuses: &loop_state.step_status_map,
+                                job_status: &loop_state.job_status_str,
+                                services: *services,
+                                pending_cache_saves: &pending_cache_saves,
                             },
-                            pending_cache_saves: &pending_cache_saves,
-                        },
+                        )),
                     ))),
             )
             .await
             {
-                Ok(result) => result?,
+                Ok(Ok(outcome)) => outcome,
+                // The job ends with this error, once its posts have run.
+                Ok(Err(e)) => {
+                    // Recorded, so the posts below see a failed job.
+                    loop_state.fail_step(step, idx, e.to_string());
+                    step_error = Some(e);
+                    all_steps_ok = false;
+                    break;
+                }
                 Err(_) => {
                     let msg = format!(
                         "Job '{}' exceeded timeout of {} minutes",
                         matrix_job_name, timeout_mins
                     );
                     copy_back_after_timeout(job_dir.path()).await;
-                    loop_state.fail_step_on_timeout(step, idx, msg);
+                    loop_state.fail_step(step, idx, msg);
                     all_steps_ok = false;
                     break;
                 }
@@ -3997,6 +4397,38 @@ async fn execute_matrix_job(
                 all_steps_ok = false;
                 break;
             }
+        }
+
+        // JavaScript actions' posts, last first, whatever became of the job.
+        let matrix_values = Some(combination.values.clone());
+        if Box::pin(run_job_posts(
+            crate::node_actions::take_posts(&posts),
+            posts_deadline(job_deadline, tokio::time::Instant::now()),
+            materialized_steps.len(),
+            &mut loop_state,
+            &mut job_env,
+            &mut job_user_env,
+            PostContext {
+                working_dir: job_dir.path(),
+                runtime,
+                workflow,
+                runner_image: &runner_image_value.image,
+                installed_runtimes: &runner_image_value.built,
+                verbose,
+                matrix_combination: &matrix_values,
+                container_config: job_template.container.as_ref(),
+                workflow_defaults: workflow.defaults.as_ref(),
+                job_defaults: job_template.defaults.as_ref(),
+                services: *services,
+                pending_cache_saves: &pending_cache_saves,
+            },
+        ))
+        .await
+        {
+            all_steps_ok = false;
+        }
+        if let Some(e) = step_error {
+            return Err(e);
         }
 
         all_steps_ok
@@ -4088,6 +4520,14 @@ pub(crate) struct JobServices<'a> {
     pub cache_store: &'a crate::cache::CacheStore,
     /// User-supplied `runs-on` label to image mappings for the run.
     pub platform_overrides: &'a HashMap<String, String>,
+}
+
+impl JobServices<'_> {
+    /// The `GITHUB_TOKEN` a secret provider gave the job, which a clone of
+    /// a private repository tries first.
+    fn clone_token(&self) -> Option<&str> {
+        self.secrets_context.get("GITHUB_TOKEN").map(String::as_str)
+    }
 }
 
 /// Flush pending cache saves. Called at end-of-job only when the job succeeded,
@@ -4270,9 +4710,10 @@ impl StepLoopState {
         });
     }
 
-    /// Fail the step in flight because the job ran out of time. The step's
-    /// future was dropped, so it has no outcome of its own to process.
-    fn fail_step_on_timeout(&mut self, step: &workflow::Step, index: usize, message: String) {
+    /// Fail the step in flight with `message`, when it has no outcome of
+    /// its own to process: it ran out of the job's time, and its future was
+    /// dropped, or it couldn't run at all.
+    fn fail_step(&mut self, step: &workflow::Step, index: usize, message: String) {
         wrkflw_logging::error(&message);
         self.job_logs.push_str(&format!("\n{}\n", message));
         let result = StepResult::new(step_display_name(step, index), StepStatus::Failure, message);
@@ -4835,6 +5276,20 @@ fn resolve_working_directory(
     Ok(workspace_relative_input(&resolved, ctx.job_env))
 }
 
+/// Where the local action `reference` (`./path`) is. As on GitHub, that is
+/// the job's workspace, where an earlier step may have built the action, as
+/// an action's own repository does with `npm run build` before `uses: ./`.
+/// A job that put no action there, such as one with no checkout, gets the
+/// repository wrkflw runs from.
+fn local_action_path(reference: &str, working_dir: &Path) -> String {
+    let in_workspace = working_dir.join(reference);
+    if in_workspace.join("action.yml").is_file() || in_workspace.join("action.yaml").is_file() {
+        in_workspace.to_string_lossy().into_owned()
+    } else {
+        reference.to_string()
+    }
+}
+
 /// Make a path input relative to the workspace, so it means the same place
 /// wherever it is used. Steps and the actions wrkflw handles itself both work
 /// in the job directory, while `github.workspace` is `/github/workspace` under
@@ -5278,7 +5733,22 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
     // Execute the step based on its type
     let step_result = if let Some(uses) = &ctx.step.uses {
         // Action step
-        let action_info = ctx.workflow.resolve_action(uses);
+        let mut action_info = ctx.workflow.resolve_action(uses);
+        if action_info.is_local {
+            action_info.repository = local_action_path(&action_info.repository, ctx.working_dir);
+        }
+
+        // An action the user asked to skip, such as one that deploys, is
+        // neither fetched nor run.
+        if crate::run_options::skipped_action(uses) {
+            let cause = crate::run_options::SKIPPED_ACTION;
+            return Ok(StepResult::new(
+                step_name,
+                StepStatus::Success,
+                format!("Action not run: {}", cause),
+            )
+            .without_running(report_action_not_run(uses, Some(cause))));
+        }
 
         // Check if this is the checkout action
         if uses.starts_with("actions/checkout") {
@@ -5330,7 +5800,8 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
             handle_cache_action(&step_name, &ctx).await?
         } else {
             // Get action info
-            let prepared = prepare_action(&action_info, ctx.runtime).await?;
+            let prepared =
+                prepare_action(&action_info, ctx.runtime, ctx.services.clone_token()).await?;
             // An action whose metadata couldn't be fetched runs like any
             // other image action; only the reason it ran nothing differs.
             let fetch_error = match &prepared {
@@ -5338,7 +5809,40 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                 _ => None,
             };
 
+            // A setup or Rust action is a JavaScript action wrkflw stands
+            // in for, below; with JavaScript actions off, none runs.
+            let prepared = match prepared {
+                PreparedAction::Node { runs, .. } if has_stand_in(&action_info.repository) => {
+                    PreparedAction::Image(format!("node:{}-slim", runs.node_major))
+                }
+                PreparedAction::Node { .. } if !crate::node_actions::enabled() => {
+                    let cause = crate::node_actions::JS_ACTIONS_OFF;
+                    return Ok(StepResult::new(
+                        step_name,
+                        StepStatus::Success,
+                        format!("Action not run: {}", cause),
+                    )
+                    .without_running(report_action_not_run(uses, Some(cause))));
+                }
+                other => other,
+            };
+
             match prepared {
+                PreparedAction::Node { runs, definition } => {
+                    // Boxed: inlined, its state would grow every step's
+                    // future, and called workflows nest those deeply.
+                    Box::pin(execute_node_action(
+                        &ctx,
+                        &step_env,
+                        &step_user_env,
+                        &action_info,
+                        step_name.as_str(),
+                        uses,
+                        runs,
+                        &definition,
+                    ))
+                    .await?
+                }
                 PreparedAction::Composite => {
                     let call_step = composite_call_step(&ctx, &step_env, &step_user_env);
                     if action_info.is_local {
@@ -5359,13 +5863,11 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                         )
                         .await?
                     } else {
-                        // Handle remote composite action: clone the repo and execute
-                        let tempdir = tempfile::tempdir().map_err(|e| {
-                            ExecutionError::Execution(format!("Failed to create temp dir: {}", e))
-                        })?;
-                        let repo_url = format!("https://github.com/{}.git", action_info.repository);
-                        let repo_dir = tempdir.path().join("action");
-                        shallow_clone(&repo_url, &action_info.version, &repo_dir).await?;
+                        // Handle remote composite action: this step's copy
+                        // of the run's one clone of its repository.
+                        let clone =
+                            action_for_step(&action_info, ctx.services.clone_token()).await?;
+                        let repo_dir = clone.path().join("action");
                         // If the action has a sub-path, the action.yml is inside that directory
                         let action_dir = match &action_info.sub_path {
                             Some(p) => {
@@ -5400,11 +5902,15 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                             }
                             None => repo_dir,
                         };
+                        // A third party's steps, as a remote JavaScript
+                        // action's scripts are: see `keep_host_credentials_from`.
+                        let mut composite_env = step_env.clone();
+                        keep_host_credentials_from(&mut composite_env);
                         // tempdir must stay alive until execute_composite_action completes
                         execute_composite_action(
                             &call_step,
                             &action_dir,
-                            &step_env,
+                            &composite_env,
                             &step_user_env,
                             ctx.working_dir,
                             ctx.runtime,
@@ -5439,8 +5945,7 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                     let mut owned_strings: Vec<String> = Vec::new(); // Keep strings alive until after we use cmd
 
                     // Special handling for Rust actions
-                    if uses.starts_with("actions-rs/") || uses.starts_with("dtolnay/rust-toolchain")
-                    {
+                    if is_rust_action(&action_info.repository) {
                         wrkflw_logging::info(
                             "🔄 Detected Rust action - using system Rust installation",
                         );
@@ -6451,8 +6956,9 @@ fn prepare_container_mounts(
                     "GITHUB_OUTPUT",
                     "GITHUB_PATH",
                     "GITHUB_STEP_SUMMARY",
+                    "GITHUB_STATE",
                 ] {
-                    if let Some(host_path) = job_env.get(*env_key) {
+                    if let Some(host_path) = step_env.get(*env_key).or(job_env.get(*env_key)) {
                         if let Some(filename) = Path::new(host_path).file_name() {
                             step_env.insert(
                                 env_key.to_string(),
@@ -6543,25 +7049,78 @@ fn prepare_container_mounts(
         }
     }
 
-    // Composite actions seed GITHUB_ACTION_PATH with the host action directory
-    // (see `execute_composite_action`). Under docker/podman that host path is
-    // invisible inside the container, so mount it and remap the env var to the
-    // container-side path, mirroring the GITHUB_ENV remap above.
+    // Composite and JavaScript actions seed GITHUB_ACTION_PATH with the host
+    // action directory (see `execute_composite_action`). Under docker/podman
+    // that host path is invisible inside the container, so mount it and remap
+    // the env var to the container-side path, mirroring the GITHUB_ENV remap
+    // above. A JavaScript action's script also has its repository's root,
+    // which it may reach out of its own directory into (`main:
+    // ../dist/x.js`): then the whole repository is mounted, and the action
+    // path points into it. A local action in the job's workspace is already
+    // in the container with it, so nothing is mounted. The root comes from
+    // wrkflw alone, never from the env (see `node_actions::with_action_root`).
     if is_container_runtime {
         if let Some(action_path) = job_env.get("GITHUB_ACTION_PATH") {
-            let container_action_dir = Path::new(crate::job_session::CONTAINER_ACTION_DIR);
+            let root = crate::node_actions::action_root();
+            let (host, container) = action_mount(Path::new(action_path), root.as_ref());
             step_env.insert(
                 "GITHUB_ACTION_PATH".to_string(),
-                container_action_dir.to_string_lossy().to_string(),
+                container.to_string_lossy().to_string(),
             );
-            owned_volume_paths.push((
-                PathBuf::from(action_path),
-                container_action_dir.to_path_buf(),
-            ));
+            if let Some(host) = host {
+                owned_volume_paths.push((
+                    host,
+                    Path::new(crate::job_session::CONTAINER_ACTION_DIR).to_path_buf(),
+                ));
+            }
         }
     }
 
     (owned_volume_paths, github_mount)
+}
+
+/// What to mount at [`crate::job_session::CONTAINER_ACTION_DIR`] for the
+/// action at `action_path`, if anything, and where the action is in the
+/// container: under the job's workspace for an action in it, with nothing
+/// mounted; inside its repository's root when the action is in that clone;
+/// else its own directory.
+fn action_mount(
+    action_path: &Path,
+    root: Option<&crate::node_actions::ActionRoot>,
+) -> (Option<PathBuf>, PathBuf) {
+    use crate::node_actions::ActionRoot;
+    // Joined with `/` whatever the host: the path is the container's, and
+    // on Windows `Path::join` would put a backslash in it.
+    let inside = |base: &str, inside: &Path| {
+        let mut container = base.to_string();
+        for part in inside.components() {
+            if let std::path::Component::Normal(part) = part {
+                container.push('/');
+                container.push_str(&part.to_string_lossy());
+            }
+        }
+        PathBuf::from(container)
+    };
+    match root {
+        Some(ActionRoot::Workspace(workspace)) => {
+            if let Ok(rel) = action_path.strip_prefix(workspace) {
+                return (None, inside(environment::CONTAINER_WORKSPACE, rel));
+            }
+        }
+        Some(ActionRoot::Repository(root)) => {
+            if let Ok(rel) = action_path.strip_prefix(root) {
+                return (
+                    Some(root.clone()),
+                    inside(crate::job_session::CONTAINER_ACTION_DIR, rel),
+                );
+            }
+        }
+        None => {}
+    }
+    (
+        Some(action_path.to_path_buf()),
+        PathBuf::from(crate::job_session::CONTAINER_ACTION_DIR),
+    )
 }
 
 /// Log warnings for container fields that are parsed but not yet supported.
@@ -6680,7 +7239,7 @@ async fn execute_reusable_workflow_job(
             // Clone into a subdirectory within tempdir to get clean structure
             let repo_dir = tempdir.path().join("cloned_repo");
 
-            shallow_clone(&repo_url, &r#ref, &repo_dir).await?;
+            shallow_clone(&repo_url, &r#ref, &repo_dir, ctx.services.clone_token()).await?;
             let joined = repo_dir.join(path);
 
             if !joined.exists() {
@@ -7174,17 +7733,7 @@ async fn execute_composite_action(
                     step_outputs: &composite_step_outputs,
                     step_statuses: &composite_step_statuses,
                     job_status: &composite_job_status,
-                    services: JobServices {
-                        secret_manager: services.secret_manager,
-                        secret_masker: services.secret_masker,
-                        secrets_context: services.secrets_context,
-                        missing_secrets: services.missing_secrets,
-                        needs_context: services.needs_context,
-                        needs_results: services.needs_results,
-                        artifact_store: services.artifact_store,
-                        cache_store: services.cache_store,
-                        platform_overrides: services.platform_overrides,
-                    },
+                    services: *services,
                     pending_cache_saves,
                 };
 
@@ -7352,6 +7901,496 @@ async fn execute_composite_action(
             "Action is not a composite action or has invalid format".to_string(),
         )),
     }
+}
+
+/// What a job's post steps run with, besides the step and its env.
+struct PostContext<'a> {
+    working_dir: &'a Path,
+    runtime: &'a dyn ContainerRuntime,
+    workflow: &'a WorkflowDefinition,
+    runner_image: &'a str,
+    installed_runtimes: &'a BuiltRuntimes,
+    verbose: bool,
+    matrix_combination: &'a Option<HashMap<String, Value>>,
+    container_config: Option<&'a JobContainer>,
+    workflow_defaults: Option<&'a workflow::Defaults>,
+    job_defaults: Option<&'a workflow::Defaults>,
+    services: JobServices<'a>,
+    pending_cache_saves: &'a std::sync::Mutex<Vec<PendingCacheSave>>,
+}
+
+/// How long a job's posts may still run once the job's own time is up:
+/// GitHub's runner runs a cancelled job's posts too, as they clean up
+/// after their actions, and only a post that hangs is cut off.
+const POST_GRACE: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// When a job's posts must be done by: the job's own deadline, or
+/// [`POST_GRACE`] from `now` when that leaves them less.
+fn posts_deadline(
+    job_deadline: tokio::time::Instant,
+    now: tokio::time::Instant,
+) -> tokio::time::Instant {
+    job_deadline.max(now + POST_GRACE)
+}
+
+/// Run the posts of a job's JavaScript actions, `first_index` on in the
+/// job's step numbering, each with the job's env as it is then and what
+/// its action's step had over it. They must be done by `deadline`, which
+/// [`posts_deadline`] gives: a post still running then fails, and the
+/// posts after it don't run. A post that fails, or can't run at all,
+/// doesn't stop the posts after it. True when one failed or ran out of
+/// time, which fails the job.
+#[allow(clippy::too_many_arguments)]
+async fn run_job_posts(
+    posts: Vec<crate::node_actions::PostStep>,
+    deadline: tokio::time::Instant,
+    first_index: usize,
+    loop_state: &mut StepLoopState,
+    job_env: &mut HashMap<String, String>,
+    job_user_env: &mut HashMap<String, String>,
+    pc: PostContext<'_>,
+) -> bool {
+    if posts.is_empty() {
+        return false;
+    }
+    let mut failed = false;
+    for (k, post) in posts.iter().enumerate() {
+        let post_step = crate::node_actions::post_as_step(post);
+        let idx = first_index + k;
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            wrkflw_logging::warning(&format!(
+                "{} post step(s) didn't run: the job ran out of time",
+                posts.len() - k
+            ));
+            failed = true;
+            break;
+        }
+        loop_state.begin_step(idx, &post_step);
+        // The job's env as it is now, with what the action's step had.
+        let mut post_env = job_env.clone();
+        post_env.extend(post.own_env.iter().map(|(k, v)| (k.clone(), v.clone())));
+        let post_user_env = job_user_env.clone();
+        let ran = tokio::time::timeout(
+            remaining,
+            loop_state
+                .live_step(idx, &post_step, pc.services.secret_masker)
+                .run(Box::pin(crate::node_actions::with_action_root(
+                    post.action_root.clone(),
+                    run_step_with_guards(
+                        &post_step,
+                        idx,
+                        &post_env,
+                        pc.workflow,
+                        StepExecutionContext {
+                            step: &post_step,
+                            step_idx: idx,
+                            job_env: &post_env,
+                            job_user_env: &post_user_env,
+                            working_dir: pc.working_dir,
+                            runtime: pc.runtime,
+                            workflow: pc.workflow,
+                            runner_image: pc.runner_image,
+                            installed_runtimes: pc.installed_runtimes,
+                            verbose: pc.verbose,
+                            matrix_combination: pc.matrix_combination,
+                            container_config: pc.container_config,
+                            workflow_defaults: pc.workflow_defaults,
+                            job_defaults: pc.job_defaults,
+                            step_outputs: &loop_state.step_outputs_map,
+                            step_statuses: &loop_state.step_status_map,
+                            job_status: &loop_state.job_status_str,
+                            services: pc.services,
+                            pending_cache_saves: pc.pending_cache_saves,
+                        },
+                    ),
+                ))),
+        )
+        .await;
+        let outcome = match ran {
+            Ok(Ok(outcome)) => outcome,
+            // A post that couldn't run fails as a step would, and the posts
+            // after it, which clean up after other actions, still run.
+            Ok(Err(e)) => {
+                loop_state.fail_step(&post_step, idx, format!("'{}' failed: {}", post.name, e));
+                failed = true;
+                continue;
+            }
+            Err(_) => {
+                copy_back_after_timeout(pc.working_dir).await;
+                loop_state.fail_step(
+                    &post_step,
+                    idx,
+                    format!("'{}' ran out of the job's time", post.name),
+                );
+                failed = true;
+                break;
+            }
+        };
+        if loop_state.process_outcome(
+            outcome,
+            &post_step,
+            pc.verbose,
+            job_env,
+            job_user_env,
+            pc.services.secret_masker,
+        ) {
+            failed = true;
+        }
+    }
+    failed
+}
+
+/// Whether `repository` is a Rust action wrkflw stands in for with the
+/// image's Rust: `dtolnay/rust-toolchain` and every `actions-rs/` action.
+fn is_rust_action(repository: &str) -> bool {
+    repository.starts_with("actions-rs/") || repository == "dtolnay/rust-toolchain"
+}
+
+/// Whether wrkflw runs something of its own for the JavaScript action from
+/// `repository`, so the action itself mustn't run: a setup action, whose
+/// runtime goes in the job's image, and the Rust actions.
+fn has_stand_in(repository: &str) -> bool {
+    SETUP_ACTIONS
+        .iter()
+        .any(|def| def.repos.contains(&repository))
+        || is_rust_action(repository)
+}
+
+impl<'a> StepExecutionContext<'a> {
+    /// This context running `step` with `job_env` instead.
+    fn with_step<'b>(
+        &'b self,
+        step: &'b workflow::Step,
+        job_env: &'b HashMap<String, String>,
+        job_user_env: &'b HashMap<String, String>,
+    ) -> StepExecutionContext<'b>
+    where
+        'a: 'b,
+    {
+        StepExecutionContext {
+            step,
+            step_idx: self.step_idx,
+            job_env,
+            job_user_env,
+            working_dir: self.working_dir,
+            runtime: self.runtime,
+            workflow: self.workflow,
+            runner_image: self.runner_image,
+            installed_runtimes: self.installed_runtimes,
+            verbose: self.verbose,
+            matrix_combination: self.matrix_combination,
+            container_config: self.container_config,
+            workflow_defaults: self.workflow_defaults,
+            job_defaults: self.job_defaults,
+            step_outputs: self.step_outputs,
+            step_statuses: self.step_statuses,
+            job_status: self.job_status,
+            services: self.services,
+            pending_cache_saves: self.pending_cache_saves,
+        }
+    }
+}
+
+/// Run one script of a JavaScript action, `node <script>`, as a `run:`
+/// step would run: in the job's container, as its user, with `env`.
+async fn run_node_script(
+    ctx: &StepExecutionContext<'_>,
+    env: &HashMap<String, String>,
+    user_env: &HashMap<String, String>,
+    name: String,
+    script: &str,
+    node_major: u32,
+    root: Option<&crate::node_actions::ActionRoot>,
+) -> Result<StepResult, ExecutionError> {
+    let step = crate::node_actions::script_step(
+        name,
+        crate::node_actions::node_command(script, node_major),
+    );
+    Box::pin(crate::node_actions::with_action_root(
+        root.cloned(),
+        execute_step(ctx.with_step(&step, env, user_env)),
+    ))
+    .await
+}
+
+/// The root of the repository the local action at `dir` is in: the job's
+/// workspace it was read from, which a container already has. `None` when
+/// it was read from the directory wrkflw runs in (see
+/// [`local_action_path`]), so a container mounts the action's own
+/// directory and not the user's repository, `.git` and all, read-write.
+fn local_action_root(dir: &Path, workspace: &Path) -> Option<crate::node_actions::ActionRoot> {
+    workspace
+        .canonicalize()
+        .ok()
+        .filter(|base| dir.starts_with(base))
+        .map(crate::node_actions::ActionRoot::Workspace)
+}
+
+/// Whether the step whose env is `env` runs on this machine: under
+/// emulation or secure emulation.
+fn runs_on_host(env: &HashMap<String, String>) -> bool {
+    matches!(
+        env.get("WRKFLW_RUNTIME_MODE").map(String::as_str),
+        Some(mode) if mode == RuntimeType::Emulation.mode_name()
+            || mode == RuntimeType::SecureEmulation.mode_name()
+    )
+}
+
+/// Leave this machine's credentials out of the environment of a third
+/// party's remote action, `env`, when it runs on this machine: a step there
+/// inherits the user's whole environment, where on GitHub it gets only what
+/// the job gives it. What the job sets itself, a token included, still
+/// reaches it. A precaution, not a boundary: code running as the user can
+/// reach the user's tokens in other ways (`gh auth token`, a keychain).
+fn keep_host_credentials_from(env: &mut HashMap<String, String>) {
+    if !runs_on_host(env) {
+        return;
+    }
+    let removed = host_credentials_kept_from(env, std::env::vars());
+    if !removed.is_empty() {
+        env.insert(wrkflw_runtime::ENV_REMOVE.to_string(), removed.join(","));
+    }
+}
+
+/// The variables of this machine's environment `host` a remote action run
+/// here is kept from: those named as credentials (`GH_TOKEN`,
+/// `AWS_SECRET_ACCESS_KEY`, `SSH_AUTH_SOCK`) that the step's `env` doesn't
+/// set itself. Sorted.
+fn host_credentials_kept_from(
+    env: &HashMap<String, String>,
+    host: impl IntoIterator<Item = (String, String)>,
+) -> Vec<String> {
+    let mut names: Vec<String> = host
+        .into_iter()
+        .map(|(name, _)| name)
+        .filter(|name| {
+            crate::log_redaction::names_credential(name)
+                && !matches!(name.as_str(), "PWD" | "OLDPWD")
+                && !env.contains_key(name)
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+/// Run a JavaScript action as GitHub's runner does: `pre` if it has one
+/// and `pre-if` holds, then `main`, each with `node` from the action's
+/// directory and its inputs as `INPUT_<NAME>`, and its `post` queued for
+/// the end of the job with what `main` saved as `STATE_<name>`.
+///
+/// Where there is no `node` to run it, the step passes and the action is
+/// reported as not run, as for an action wrkflw can't run at all.
+#[allow(clippy::too_many_arguments)]
+async fn execute_node_action(
+    ctx: &StepExecutionContext<'_>,
+    step_env: &HashMap<String, String>,
+    step_user_env: &HashMap<String, String>,
+    action_info: &ActionInfo,
+    step_name: &str,
+    uses: &str,
+    runs: crate::node_actions::NodeRuns,
+    definition: &serde_yaml::Value,
+) -> Result<StepResult, ExecutionError> {
+    use crate::node_actions as js;
+
+    // The action's directory and the root of the repository it is in,
+    // which is all there on GitHub, so a script may reach out of the
+    // action's own directory (`main: ../dist/x.js`).
+    let (action_dir, repo_root, clone) = if action_info.is_local {
+        let dir = Path::new(&action_info.repository);
+        let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+        let root = local_action_root(&dir, ctx.working_dir);
+        (dir, root, None)
+    } else {
+        let clone = action_for_step(action_info, ctx.services.clone_token()).await?;
+        let (dir, root) = js::action_dir_in(clone.path(), action_info.sub_path.as_deref())
+            .map_err(ExecutionError::Execution)?;
+        (
+            dir,
+            Some(crate::node_actions::ActionRoot::Repository(root)),
+            Some(clone),
+        )
+    };
+    if !action_info.is_local && runs_on_host(step_env) && acceleration::first_host_action_warning()
+    {
+        wrkflw_logging::warning(&format!(
+            "{} and the run's other remote JavaScript actions run on this machine as you, as \
+             their repository has them at their ref, and can reach whatever you can, your \
+             tokens and keys included. Leaving variables such as GH_TOKEN out of their \
+             environment is only a precaution, not a boundary: use a container runtime to \
+             keep them apart, or {}=0 or {} to skip them",
+            uses,
+            js::JS_ACTIONS_ENV,
+            crate::run_options::SKIP_ACTIONS_ENV
+        ));
+    }
+
+    // Inputs: `with` evaluated in the caller's scope, then each default.
+    let call = composite_call_step(ctx, step_env, step_user_env);
+    let expr_ctx = ctx.expr_context_with_env(step_env, step_user_env);
+    let mut env = step_env.clone();
+    for (name, value) in js::input_env(definition, call.with.as_ref(), |text| {
+        crate::substitution::preprocess_expressions(text, ctx.working_dir, &expr_ctx)
+            .unwrap_or_default()
+    }) {
+        env.insert(name, value);
+    }
+    env.insert(
+        "GITHUB_ACTION_PATH".to_string(),
+        action_dir.to_string_lossy().to_string(),
+    );
+    let (repository, git_ref) = if action_info.is_local {
+        (String::new(), String::new())
+    } else {
+        (action_info.repository.clone(), action_info.version.clone())
+    };
+    env.insert("GITHUB_ACTION_REPOSITORY".to_string(), repository);
+    env.insert("GITHUB_ACTION_REF".to_string(), git_ref);
+    if !action_info.is_local {
+        keep_host_credentials_from(&mut env);
+    }
+
+    // `$GITHUB_STATE` sits beside the job's other `GITHUB_*` files, so it
+    // is mounted where they are.
+    let state_file = step_env
+        .get("GITHUB_ENV")
+        .and_then(|p| Path::new(p).parent())
+        .map(|dir| dir.join("state"));
+    let clear_state = || {
+        if let Some(path) = &state_file {
+            let _ = fs::write(path, "");
+        }
+    };
+    if let Some(path) = &state_file {
+        env.insert(
+            "GITHUB_STATE".to_string(),
+            path.to_string_lossy().to_string(),
+        );
+    }
+
+    let not_run = |output: String, cause: &str| {
+        StepResult::new(step_name.to_string(), StepStatus::Success, output)
+            .without_running(report_action_not_run(uses, Some(cause)))
+    };
+    // What a script just saved, through `$GITHUB_STATE` or `::save-state`
+    // in its `output`, as the `STATE_<name>` the action's later scripts get.
+    let saved_by = |output: &str| -> Vec<(String, String)> {
+        let file = state_file
+            .as_ref()
+            .and_then(|path| fs::read_to_string(path).ok())
+            .unwrap_or_default();
+        js::saved_state(&file, output)
+            .into_iter()
+            .map(|(name, value)| (js::state_env_name(&name), value))
+            .collect()
+    };
+
+    // As on GitHub's runner, where the action's first script to run
+    // registers it, the post is queued before `pre` or `main` runs, so it
+    // runs at the end of the job also when either fails or runs out of
+    // time. It gets what the step has beyond the job's env: its own
+    // `env:`, the action's inputs and paths; what `pre` and `main` save is
+    // added as each is done. The post runs with these over the job's env
+    // as it is at the end of the job.
+    let post = runs.post.as_ref().and_then(|post| {
+        let own_env: HashMap<String, String> = env
+            .iter()
+            .filter(|(k, v)| ctx.job_env.get(*k) != Some(*v))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        js::queue_post(js::PostStep {
+            name: format!("Post {}", step_name),
+            command: js::node_command(post, runs.node_major),
+            condition: runs
+                .post_if
+                .clone()
+                .unwrap_or_else(|| "always()".to_string()),
+            own_env,
+            action_root: repo_root.clone(),
+            keep_action: clone.clone(),
+            withdrawn: false,
+        })
+    });
+
+    let mut output = String::new();
+    if let Some(pre) = &runs.pre {
+        let condition = runs.pre_if.as_deref().unwrap_or("always()");
+        if evaluate_step_condition(condition, ctx.working_dir, &expr_ctx) {
+            clear_state();
+            let result = run_node_script(
+                ctx,
+                &env,
+                step_user_env,
+                format!("Pre {}", step_name),
+                pre,
+                runs.node_major,
+                repo_root.as_ref(),
+            )
+            .await?;
+            if let Some(cause) = js::missing_program(result.exit_code, &result.output) {
+                js::update_post(post, |queued| queued.withdrawn = true);
+                return Ok(not_run(result.output, cause));
+            }
+            output.push_str(&result.output);
+            // On GitHub `pre` is a step of its own, so what it writes to
+            // `$GITHUB_ENV` and `$GITHUB_PATH` reaches `main`. Applied to
+            // `main`'s env here, then written back, so the job also gets it
+            // when the step ends. Its outputs and summary go, as a `pre`
+            // has no step id to give outputs under.
+            let applied = crate::github_env_files::apply_step_environment_updates(
+                &mut env,
+                &mut HashMap::new(),
+                &mut HashMap::new(),
+                None,
+            );
+            if let Err(e) = applied.write_to(&env) {
+                wrkflw_logging::warning(&format!(
+                    "What 'Pre {}' wrote to $GITHUB_ENV or $GITHUB_PATH may not reach later \
+                     steps: {}",
+                    step_name, e
+                ));
+            }
+            // As on GitHub, what `pre` saved is there for `main` and `post`.
+            let saved = saved_by(&result.output);
+            env.extend(saved.iter().cloned());
+            js::update_post(post, |queued| queued.own_env.extend(saved));
+            if result.status == StepStatus::Failure {
+                let failed = StepResult::new(step_name.to_string(), StepStatus::Failure, output);
+                return Ok(match result.exit_code {
+                    Some(code) => failed.with_exit_code(code),
+                    None => failed,
+                });
+            }
+        }
+    }
+
+    clear_state();
+    let main = run_node_script(
+        ctx,
+        &env,
+        step_user_env,
+        step_name.to_string(),
+        &runs.main,
+        runs.node_major,
+        repo_root.as_ref(),
+    )
+    .await?;
+    if let Some(cause) = js::missing_program(main.exit_code, &main.output) {
+        // An action that never ran has nothing to clean up.
+        js::update_post(post, |queued| queued.withdrawn = true);
+        return Ok(not_run(main.output, cause));
+    }
+    let saved = saved_by(&main.output);
+    js::update_post(post, |queued| queued.own_env.extend(saved));
+    clear_state();
+
+    output.push_str(&main.output);
+    let result = StepResult::new(step_name.to_string(), main.status, output);
+    Ok(match main.exit_code {
+        Some(code) => result.with_exit_code(code),
+        None => result,
+    })
 }
 
 /// Write what a composite action's steps put in `$GITHUB_ENV` and
@@ -8220,6 +9259,256 @@ mod tests {
             cache_store: &TEST_CACHE_STORE,
             platform_overrides: &EMPTY_PLATFORM_OVERRIDES,
         }
+    }
+
+    #[test]
+    fn a_job_image_on_the_runner_base_adds_only_its_runtimes() {
+        let python = vec![SetupRuntime {
+            language: "python".to_string(),
+            version: "3.13".to_string(),
+            install_script: "install-python".to_string(),
+            floating: false,
+            env: Vec::new(),
+        }];
+        let df = dockerfile_on_runner_base(&python, "base:x", None, None);
+        assert!(df.starts_with("FROM base:x\n"), "{df}");
+        assert!(df.contains("RUN install-python"), "{df}");
+        assert!(!df.contains("build-essential"), "{df}");
+        assert!(!df.contains("usermod"), "{df}");
+        assert!(!df.contains("floating versions"), "{df}");
+
+        // A refreshed base, under the same name, gets a new job image.
+        let old_base = dockerfile_on_runner_base(&python, "base:x", Some("sha256:aaa"), None);
+        let new_base = dockerfile_on_runner_base(&python, "base:x", Some("sha256:bbb"), None);
+        assert!(
+            old_base.contains("# base image id: sha256:aaa"),
+            "{old_base}"
+        );
+        assert_ne!(
+            combined_image_tag(&python, &old_base),
+            combined_image_tag(&python, &new_base)
+        );
+
+        let weekly = dockerfile_on_runner_base(&python, "base:x", None, Some("2026-W47"));
+        assert!(
+            weekly.contains("floating versions resolved in 2026-W47"),
+            "{weekly}"
+        );
+    }
+
+    /// A runner user that can't be given this machine's uid on the base
+    /// image says nothing about the job: its image is built here instead.
+    #[tokio::test]
+    async fn a_failed_uid_remap_builds_the_job_image_here() {
+        let failed = flaky(vec![None, Some("usermod: user runner is busy")], None);
+        assert!(
+            build_on_base(&[], "remap-fails:1", &failed, "x", 1000, None)
+                .await
+                .is_none()
+        );
+
+        let built = flaky(Vec::new(), None);
+        let tag = build_on_base(&[], "remap-works:1", &built, "x", 1000, None)
+            .await
+            .expect("the base was there")
+            .unwrap();
+        assert!(tag.starts_with(COMBINED_IMAGE_PREFIX), "{tag}");
+        assert_eq!(*built.builds.lock().unwrap(), 3, "probe, remap, job image");
+
+        // With GitHub's uid there is nothing to remap.
+        let hosted = flaky(Vec::new(), None);
+        build_on_base(
+            &[],
+            "hosted:1",
+            &hosted,
+            "x",
+            crate::runner_user::HOSTED_UID,
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(*hosted.builds.lock().unwrap(), 2, "probe, job image");
+    }
+
+    #[test]
+    fn the_runner_base_is_the_shared_layers_of_a_job_with_no_runtimes() {
+        let base = runner_base_dockerfile();
+        let local = combined_dockerfile_for_uid(
+            &[],
+            "ubuntu:latest",
+            None,
+            None,
+            RunnerTools::Install,
+            crate::runner_user::HOSTED_UID,
+        );
+        assert!(base.starts_with(&local), "{base}");
+        assert!(base.ends_with(&format!("RUN {}\n", GH_CLI_INSTALL)));
+    }
+
+    #[test]
+    fn a_local_action_is_read_from_the_workspace_when_it_is_there() {
+        let workspace = tempfile::tempdir().unwrap();
+        let in_workspace = workspace.path().join("./.github/actions/js");
+        assert_eq!(
+            local_action_path("./.github/actions/js", workspace.path()),
+            "./.github/actions/js",
+            "no action in the workspace: the repository's"
+        );
+        std::fs::create_dir_all(&in_workspace).unwrap();
+        std::fs::write(in_workspace.join("action.yaml"), "name: x\n").unwrap();
+        assert_eq!(
+            local_action_path("./.github/actions/js", workspace.path()),
+            in_workspace.to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn the_rust_actions_and_setup_actions_have_stand_ins() {
+        assert!(has_stand_in("actions/setup-node"));
+        assert!(has_stand_in("dtolnay/rust-toolchain"));
+        assert!(has_stand_in("actions-rs/cargo"));
+        assert!(!has_stand_in("dtolnay/rust-toolchain-fork"));
+        assert!(!has_stand_in("actions/github-script"));
+    }
+
+    #[test]
+    fn a_javascript_action_starts_in_the_workspace() {
+        let step = crate::node_actions::script_step("JS".into(), "node x".into());
+        assert_eq!(step.working_directory.as_deref(), Some("."));
+        assert_eq!(step.shell.as_deref(), Some("bash"));
+    }
+
+    #[test]
+    fn a_remote_action_on_this_machine_is_kept_from_its_credentials() {
+        let host = [
+            ("GH_TOKEN", "t"),
+            ("AWS_SECRET_ACCESS_KEY", "k"),
+            ("SSH_AUTH_SOCK", "/s"),
+            ("GITHUB_TOKEN", "job's"),
+            ("PATH", "/a-long-path-that-is-not-a-credential"),
+            ("PWD", "/x"),
+        ]
+        .map(|(k, v)| (k.to_string(), v.to_string()));
+        let env = HashMap::from([("GITHUB_TOKEN".to_string(), "job's".to_string())]);
+        assert_eq!(
+            host_credentials_kept_from(&env, host),
+            ["AWS_SECRET_ACCESS_KEY", "GH_TOKEN", "SSH_AUTH_SOCK"],
+            "the job's own GITHUB_TOKEN still reaches the action"
+        );
+    }
+
+    #[test]
+    fn a_local_actions_root_is_the_workspace_it_was_read_from() {
+        let workspace = tempfile::tempdir().unwrap();
+        let action = workspace.path().join(".github/actions/js");
+        std::fs::create_dir_all(&action).unwrap();
+        let action = action.canonicalize().unwrap();
+        assert_eq!(
+            local_action_root(&action, workspace.path()),
+            Some(crate::node_actions::ActionRoot::Workspace(
+                workspace.path().canonicalize().unwrap()
+            ))
+        );
+        let elsewhere = tempfile::tempdir().unwrap();
+        assert_eq!(
+            local_action_root(&elsewhere.path().canonicalize().unwrap(), workspace.path()),
+            None
+        );
+    }
+
+    #[test]
+    fn a_clone_token_goes_in_a_github_header_not_the_url() {
+        let env = clone_auth_env("ghp_secret", None);
+        let get = |k: &str| env.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+        assert_eq!(get("GIT_CONFIG_COUNT"), Some("1"));
+        assert_eq!(
+            get("GIT_CONFIG_KEY_0"),
+            Some("http.https://github.com/.extraheader")
+        );
+        let header = get("GIT_CONFIG_VALUE_0").unwrap();
+        assert_eq!(
+            header,
+            format!(
+                "AUTHORIZATION: basic {}",
+                "eC1hY2Nlc3MtdG9rZW46Z2hwX3NlY3JldA=="
+            )
+        );
+        assert!(!header.contains("ghp_secret"));
+
+        // Config the user passes git through its environment still applies.
+        let after = clone_auth_env("ghp_secret", Some("2"));
+        let get = |k: &str| after.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+        assert_eq!(get("GIT_CONFIG_COUNT"), Some("3"));
+        assert_eq!(
+            get("GIT_CONFIG_KEY_2"),
+            Some("http.https://github.com/.extraheader")
+        );
+        assert_eq!(get("GIT_CONFIG_KEY_0"), None);
+    }
+
+    #[test]
+    fn only_a_clone_github_refused_is_retried_with_a_token() {
+        assert!(needs_credentials(
+            "Failed to clone: fatal: could not read Username for 'https://github.com': terminal prompts disabled"
+        ));
+        assert!(needs_credentials(
+            "remote: Repository not found.\nfatal: repository 'https://github.com/o/r.git/' not found"
+        ));
+        assert!(!needs_credentials(
+            "warning: Could not find remote branch v9 to clone.\nfatal: Remote branch v9 not found in upstream origin"
+        ));
+        assert!(!needs_credentials(
+            "fatal: unable to access 'https://github.com/o/r.git/': Could not resolve host: github.com"
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_failed_clone_of_another_host_is_not_retried_with_a_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = shallow_clone(
+            "file:///nonexistent/wrkflw-no-such-repo",
+            "main",
+            &dir.path().join("repo"),
+            Some("ghp_never_used"),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(!err.contains("also failed with your GitHub token"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_local_repository_clones_without_a_token() {
+        let src = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "init.defaultBranch=main",
+                ])
+                .args(args)
+                .current_dir(src.path())
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(src.path().join("action.yml"), "name: x\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "init"]);
+        let dest = tempfile::tempdir().unwrap();
+        let url = format!("file://{}", src.path().display());
+        shallow_clone(&url, "main", &dest.path().join("repo"), None)
+            .await
+            .unwrap();
+        assert!(dest.path().join("repo/action.yml").exists());
     }
 
     #[test]
@@ -9220,6 +10509,94 @@ mod tests {
         assert_eq!(volumes[1].1, PathBuf::from("/dest"));
     }
 
+    /// A JavaScript action in a subdirectory of its repository has the
+    /// whole repository mounted, so a `main: ../dist/x.js` is there, and its
+    /// action path points into it. The root is wrkflw's own, never the env's.
+    #[test]
+    fn container_mounts_a_sub_path_actions_whole_repository() {
+        let job_env = HashMap::from([
+            ("WRKFLW_RUNTIME_MODE".to_string(), "docker".to_string()),
+            (
+                "GITHUB_ACTION_PATH".to_string(),
+                "/c/action/init".to_string(),
+            ),
+        ]);
+        let mounts = |root: Option<&str>, step_env: &mut HashMap<String, String>| {
+            tokio_test_root(root, || {
+                prepare_container_mounts(step_env, &job_env, None, false).0
+            })
+        };
+        let mut step_env = job_env.clone();
+        assert_eq!(
+            mounts(Some("/c/action"), &mut step_env),
+            vec![(PathBuf::from("/c/action"), PathBuf::from("/github/action"))]
+        );
+        assert_eq!(step_env["GITHUB_ACTION_PATH"], "/github/action/init");
+
+        // A root named in the env, as an action's `env:` or `$GITHUB_ENV`
+        // could name `/`, mounts nothing more than the action.
+        let mut forged = job_env.clone();
+        forged.insert("WRKFLW_ACTION_ROOT".to_string(), "/".to_string());
+        assert_eq!(
+            mounts(None, &mut forged),
+            vec![(
+                PathBuf::from("/c/action/init"),
+                PathBuf::from("/github/action")
+            )]
+        );
+
+        // Without a root, or on the host, as before.
+        assert_eq!(
+            action_mount(Path::new("/l/act"), None),
+            (
+                Some(PathBuf::from("/l/act")),
+                PathBuf::from("/github/action")
+            )
+        );
+        let elsewhere = crate::node_actions::ActionRoot::Repository("/elsewhere".into());
+        assert_eq!(
+            action_mount(Path::new("/l/act"), Some(&elsewhere)),
+            (
+                Some(PathBuf::from("/l/act")),
+                PathBuf::from("/github/action")
+            )
+        );
+        let mut host_env = HashMap::new();
+        assert!(mounts(Some("/c"), &mut host_env).is_empty());
+    }
+
+    /// Run `f` as a JavaScript action's script whose repository is `root`.
+    fn tokio_test_root<T>(root: Option<&str>, f: impl FnOnce() -> T) -> T {
+        crate::node_actions::sync_with_action_root(
+            root.map(|r| crate::node_actions::ActionRoot::Repository(PathBuf::from(r))),
+            f,
+        )
+    }
+
+    /// A local action in the job's workspace is addressed where the
+    /// container already has the workspace: nothing is mounted or copied,
+    /// so a step that rebuilt it is seen by the next use of it.
+    #[test]
+    fn a_workspace_action_is_found_in_the_containers_workspace() {
+        let job_env = HashMap::from([
+            ("WRKFLW_RUNTIME_MODE".to_string(), "docker".to_string()),
+            (
+                "GITHUB_ACTION_PATH".to_string(),
+                "/w/ws/.github/actions/js".to_string(),
+            ),
+        ]);
+        let mut step_env = job_env.clone();
+        let mounts = crate::node_actions::sync_with_action_root(
+            Some(crate::node_actions::ActionRoot::Workspace("/w/ws".into())),
+            || prepare_container_mounts(&mut step_env, &job_env, None, false).0,
+        );
+        assert!(mounts.is_empty(), "{mounts:?}");
+        assert_eq!(
+            step_env["GITHUB_ACTION_PATH"],
+            format!("{}/.github/actions/js", environment::CONTAINER_WORKSPACE)
+        );
+    }
+
     #[test]
     fn container_mounts_podman_runtime_remaps_env_paths() {
         let mut step_env = HashMap::new();
@@ -9339,6 +10716,29 @@ mod tests {
         assert_eq!(job_env.get("CONTAINER_ONLY").unwrap(), "container-value");
         // Job-only keys are preserved
         assert_eq!(job_env.get("JOB_ONLY").unwrap(), "job-value");
+    }
+
+    /// Every `GITHUB_*` and `RUNNER_*` variable of the job context wrkflw
+    /// builds is one a step can't overwrite through `$GITHUB_ENV`. The
+    /// per-step names (`GITHUB_ACTION_PATH`, `GITHUB_STATE` and the other
+    /// action ones) are set where an action runs, not here: keep them in
+    /// `RESERVED_ENV` by hand when adding one.
+    #[test]
+    fn every_variable_wrkflw_sets_is_reserved_from_github_env() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut env = environment::create_github_context(
+            &empty_workflow(),
+            dir.path(),
+            &environment::RunRef::default(),
+        );
+        environment::add_job_context(&mut env, "build");
+        environment::apply_github_container_context(&mut env);
+        let missing: Vec<_> = env
+            .keys()
+            .filter(|name| name.starts_with("GITHUB_") || name.starts_with("RUNNER_"))
+            .filter(|name| !crate::github_env_files::reserved(name))
+            .collect();
+        assert!(missing.is_empty(), "not reserved: {missing:?}");
     }
 
     // --- workflow-level env tests ---
@@ -10018,6 +11418,8 @@ runs:
         fail_builds: bool,
         /// The CLI a job session would use, as Docker's or Podman's.
         session_cli: Option<&'static str>,
+        /// How long each container takes to run, as a slow step's does.
+        delay: Option<std::time::Duration>,
     }
 
     #[derive(Debug, Clone)]
@@ -10072,6 +11474,9 @@ runs:
                 working_dir: working_dir.to_path_buf(),
                 script,
             });
+            if let Some(delay) = self.delay {
+                tokio::time::sleep(delay).await;
+            }
             Ok(ContainerOutput {
                 stdout: "mock ok".to_string(),
                 stderr: String::new(),
@@ -10436,6 +11841,9 @@ runs:
 
     // --- Actions that pass without running ---
 
+    /// A JavaScript action with no `main`: wrkflw has nothing to run.
+    const UNRUNNABLE_NODE_ACTION: &str = "name: x\nruns:\n  using: node20\n";
+
     /// Run one `uses:` step through `execute_step` the way a job would, on
     /// a container runtime unless `emulation`, with `installed` built into
     /// the job's image.
@@ -10450,13 +11858,9 @@ runs:
         emulation: bool,
     ) -> StepResult {
         // An unpinned `uses:` resolves at `main`; its metadata is seeded so
-        // nothing is fetched.
-        action_resolver::seed_cache_for_test(
-            uses,
-            "main",
-            "name: x\nruns:\n  using: node20\n  main: index.js\n",
-        )
-        .await;
+        // nothing is fetched. With no `main`, it is an action wrkflw can't
+        // run: one that names a script would be cloned and run with node.
+        action_resolver::seed_cache_for_test(uses, "main", UNRUNNABLE_NODE_ACTION).await;
         let runtime = MockContainerRuntime::default();
         let workflow = minimal_workflow();
         let mut job_env = HashMap::new();
@@ -10494,6 +11898,188 @@ runs:
             pending_cache_saves: &TEST_PENDING_CACHE_SAVES,
         };
         execute_step(ctx).await.unwrap()
+    }
+
+    /// Run `posts` through [`run_job_posts`] on `runtime` with `deadline`,
+    /// as the end of a job on a container runtime whose env is `job_env`.
+    async fn run_posts_on(
+        runtime: &MockContainerRuntime,
+        posts: Vec<crate::node_actions::PostStep>,
+        deadline: tokio::time::Instant,
+        job_env: &mut HashMap<String, String>,
+    ) -> (bool, StepLoopState) {
+        let workflow = minimal_workflow();
+        job_env.insert(
+            "WRKFLW_RUNTIME_MODE".to_string(),
+            RuntimeType::Docker.mode_name().to_string(),
+        );
+        let mut job_user_env = HashMap::new();
+        let working_dir = tempfile::tempdir().unwrap();
+        let mut loop_state = StepLoopState::new("job", "job");
+        let failed = run_job_posts(
+            posts,
+            deadline,
+            1,
+            &mut loop_state,
+            job_env,
+            &mut job_user_env,
+            PostContext {
+                working_dir: working_dir.path(),
+                runtime,
+                workflow: &workflow,
+                runner_image: "ubuntu:latest",
+                installed_runtimes: &BuiltRuntimes::default(),
+                verbose: false,
+                matrix_combination: &None,
+                container_config: None,
+                workflow_defaults: None,
+                job_defaults: None,
+                services: test_services(),
+                pending_cache_saves: &TEST_PENDING_CACHE_SAVES,
+            },
+        )
+        .await;
+        (failed, loop_state)
+    }
+
+    fn test_post(name: &str, own_env: &[(&str, &str)]) -> crate::node_actions::PostStep {
+        crate::node_actions::PostStep {
+            name: name.to_string(),
+            command: "node post.js".to_string(),
+            condition: "always()".to_string(),
+            own_env: own_env
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            action_root: None,
+            keep_action: None,
+            withdrawn: false,
+        }
+    }
+
+    /// A job out of time, or nearly, still gives its posts time to clean
+    /// up; a job with time left keeps its own deadline.
+    #[test]
+    fn posts_get_time_of_their_own_past_the_jobs_deadline() {
+        let now = tokio::time::Instant::now();
+        let past = now - std::time::Duration::from_secs(1);
+        assert_eq!(posts_deadline(past, now), now + POST_GRACE);
+        let later = now + POST_GRACE + std::time::Duration::from_secs(60);
+        assert_eq!(posts_deadline(later, now), later);
+    }
+
+    /// A post still running when the job's time is up fails the job, and
+    /// the run doesn't wait for it, nor run the posts after it.
+    #[tokio::test]
+    async fn a_post_past_the_jobs_deadline_fails_without_waiting_for_it() {
+        let runtime = MockContainerRuntime {
+            delay: Some(std::time::Duration::from_secs(30)),
+            ..MockContainerRuntime::default()
+        };
+        let started = std::time::Instant::now();
+        let (failed, loop_state) = run_posts_on(
+            &runtime,
+            vec![test_post("Post A", &[]), test_post("Post B", &[])],
+            tokio::time::Instant::now() + std::time::Duration::from_millis(300),
+            &mut HashMap::new(),
+        )
+        .await;
+        assert!(failed);
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        assert_eq!(loop_state.step_results.len(), 1, "Post B ran");
+        assert_eq!(loop_state.step_results[0].status, StepStatus::Failure);
+    }
+
+    /// A post is queued before its action's `main` runs, as GitHub's runner
+    /// queues it, so a `main` that runs out of time still has its post run
+    /// at the end of the job.
+    #[tokio::test]
+    async fn a_main_that_runs_out_of_time_keeps_its_post() {
+        let workspace = tempfile::tempdir().unwrap();
+        let action = workspace.path().join("act");
+        std::fs::create_dir_all(&action).unwrap();
+        std::fs::write(
+            action.join("action.yml"),
+            "name: x\nruns:\n  using: node20\n  main: main.js\n  post: post.js\n",
+        )
+        .unwrap();
+        let runtime = MockContainerRuntime {
+            delay: Some(std::time::Duration::from_secs(30)),
+            ..MockContainerRuntime::default()
+        };
+        let workflow = minimal_workflow();
+        let job_env = HashMap::from([(
+            "WRKFLW_RUNTIME_MODE".to_string(),
+            RuntimeType::Docker.mode_name().to_string(),
+        )]);
+        let step = make_step("Slow", "./act", None, HashMap::new());
+        let ctx = StepExecutionContext {
+            step: &step,
+            step_idx: 0,
+            job_env: &job_env,
+            job_user_env: &job_env,
+            working_dir: workspace.path(),
+            runtime: &runtime,
+            workflow: &workflow,
+            runner_image: "ubuntu:latest",
+            installed_runtimes: &BuiltRuntimes::default(),
+            verbose: false,
+            matrix_combination: &None,
+            container_config: None,
+            workflow_defaults: None,
+            job_defaults: None,
+            step_outputs: &HashMap::new(),
+            step_statuses: &HashMap::new(),
+            job_status: "success",
+            services: test_services(),
+            pending_cache_saves: &TEST_PENDING_CACHE_SAVES,
+        };
+        let posts = crate::node_actions::JobScope::default();
+        let timed_out = crate::node_actions::within_job(
+            &posts,
+            tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                Box::pin(execute_step(ctx)),
+            ),
+        )
+        .await;
+        assert!(timed_out.is_err(), "main finished in time");
+        let queued = crate::node_actions::take_posts(&posts);
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].name, "Post Slow");
+        assert!(
+            queued[0].command.ends_with("'post.js'"),
+            "{}",
+            queued[0].command
+        );
+    }
+
+    /// A post runs with the job's env as it is at the end of the job, with
+    /// what its action's step had over it.
+    #[tokio::test]
+    async fn a_post_sees_the_end_of_job_env_under_its_steps_own() {
+        let runtime = MockContainerRuntime::default();
+        let mut job_env = HashMap::from([
+            ("LATE".to_string(), "yes".to_string()),
+            ("SHARED".to_string(), "job".to_string()),
+        ]);
+        let (failed, _) = run_posts_on(
+            &runtime,
+            vec![test_post(
+                "Post A",
+                &[("SHARED", "step"), ("STATE_saved", "from-main")],
+            )],
+            tokio::time::Instant::now() + std::time::Duration::from_secs(60),
+            &mut job_env,
+        )
+        .await;
+        assert!(!failed);
+        let calls = runtime.run_calls.lock().unwrap();
+        let env = &calls.last().expect("the post didn't run").env_vars;
+        let get = |k: &str| env.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+        assert_eq!(get("LATE"), Some("yes"));
+        assert_eq!(get("SHARED"), Some("step"));
+        assert_eq!(get("STATE_saved"), Some("from-main"));
     }
 
     #[tokio::test]
@@ -14582,7 +16168,7 @@ runs:
         let mut state = StepLoopState::new("job", "job");
         state.begin_step(0, &step);
 
-        state.fail_step_on_timeout(&step, 0, "out of time".to_string());
+        state.fail_step(&step, 0, "out of time".to_string());
 
         assert_eq!(state.step_results.len(), 1);
         let result = &state.step_results[0];
@@ -14851,7 +16437,7 @@ runs:
     /// job built its runtime into the image.
     #[tokio::test]
     async fn a_composite_action_reports_the_actions_inside_it_that_did_not_run() {
-        let node_action = "name: x\nruns:\n  using: node20\n  main: index.js\n";
+        let node_action = UNRUNNABLE_NODE_ACTION;
         for uses in ["wrkflw-test/composite-inner", "actions/setup-node"] {
             action_resolver::seed_cache_for_test(uses, "main", node_action).await;
         }

@@ -441,13 +441,16 @@ fn rows(
         }
         let stand_in = local_job.is_some_and(stood_in_for_windows);
         let agree = agree(github_conclusion.as_deref(), local_status).filter(|_| !stand_in);
-        // A pass GitHub agrees with, of a job that skipped one of its actions.
+        // A pass GitHub agrees with, of a job that skipped one of its
+        // actions or ran as Linux for a macOS one: its OS-specific steps
+        // weren't checked.
         let unverified = agree == Some(true)
             && local_status == Some("success")
             && local_job.is_some_and(|l| {
                 l["actions_not_run"]
                     .as_array()
                     .is_some_and(|actions| !actions.is_empty())
+                    || l.get("runner").is_some_and(|runner| !runner.is_null())
             });
         // Where a local failure GitHub doesn't share came from.
         let why_failed = (agree == Some(false) && local_status == Some("failure"))
@@ -908,6 +911,7 @@ fn report(remote: &RemoteRun, local: &Value, rows: &[Row]) -> Value {
             "verdict": local["verdict"],
             "skip_reason": local["skip_reason"],
             "error": local["error"],
+            "duration_ms": local["duration_ms"],
         },
         "jobs": rows.iter().map(|r| json!({
             "github_name": r.github_name,
@@ -967,8 +971,8 @@ fn print_text(report: &Value) {
         println!(
             "{}",
             cli_style::warning(&format!(
-                "{unverified} job(s) agree on a pass that skipped an action GitHub ran, \
-                 so they agree on less than the rest"
+                "{unverified} job(s) agree on a pass that skipped an action GitHub ran, or \
+                 ran as Linux for a macOS job, so they agree on less than the rest"
             ))
         );
     }
@@ -1542,6 +1546,21 @@ mod tests {
         let failed = rows(&expected, &github, &local("failure"), &[]);
         assert_eq!(failed[0].agree, Some(false));
         assert!(!failed[0].unverified);
+    }
+
+    /// A macOS job run as Linux is compared, but its agreement is
+    /// unverified: its OS-specific steps weren't checked.
+    #[test]
+    fn an_agreeing_macos_stand_in_is_marked_unverified() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: CI\non: push\njobs:\n  test:\n    runs-on: macos-latest\n    steps:\n      - run: make test\n";
+        let expected = expected_jobs(&write(dir.path(), yaml)).unwrap();
+        let github = vec![remote("test", "success")];
+        let job = json!({"name": "test", "status": "success",
+                         "runner": {"requested": "macos-latest", "ran_as": "Linux"}});
+        let rows = rows(&expected, &github, std::slice::from_ref(&job), &[]);
+        assert_eq!(rows[0].agree, Some(true));
+        assert!(rows[0].unverified);
     }
 
     /// A run whose paired jobs all stood in for Windows ones compared

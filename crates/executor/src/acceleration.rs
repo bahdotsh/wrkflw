@@ -39,7 +39,9 @@ pub const SIDECAR_PATH: &str = ".wrkflw/affected.yml";
 /// Bump when the fingerprint's inputs change, so old entries stop matching.
 /// Version 5: steps of the built-in image run as the runner user, so a pass
 /// stored when they ran as root says nothing of a run as that user.
-const KEY_VERSION: u32 = 5;
+/// Version 6: JavaScript actions run, so a pass stored when they passed
+/// without running says nothing of a run of them.
+const KEY_VERSION: u32 = 6;
 
 /// Host directories mounted into containers under `--dep-cache`, and where
 /// in a user's home directory each tool keeps that cache.
@@ -508,6 +510,14 @@ fn job_key_with(
     if steps_as_root {
         document["steps_as_root"] = serde_json::json!(true);
     }
+    // A pass whose actions were left unrun, all JavaScript ones or those
+    // the user listed, can't stand in for a run of them.
+    if !crate::node_actions::enabled() {
+        document["js_actions"] = serde_json::json!(false);
+    }
+    if let Some(skipped) = crate::run_options::skipped_actions_key() {
+        document["skipped_actions"] = serde_json::json!(skipped);
+    }
     let text = serde_json::to_string(&canonical(document)).ok()?;
     Some(hex(&Sha256::digest(text.as_bytes())))
 }
@@ -549,8 +559,16 @@ struct ContainerScope {
     warned_of_missing_docker: AtomicBool,
     /// The GitHub token this run gives its jobs, once a job asked for it.
     job_token: tokio::sync::OnceCell<Option<String>>,
+    /// This machine's GitHub token for cloning private repositories, once
+    /// a clone needed it.
+    clone_token: tokio::sync::OnceCell<Option<String>>,
+    /// JavaScript actions cloned this run.
+    action_clones: crate::node_actions::ActionClones,
     /// Set once the run has said its jobs get the user's own token.
     warned_of_own_token: AtomicBool,
+    /// Set once the run has said a remote JavaScript action runs on this
+    /// machine as the user.
+    warned_of_host_actions: AtomicBool,
     /// Why this run's steps can't run as the runner user, once settled:
     /// `None` when they may.
     runner_user: tokio::sync::OnceCell<Option<crate::runner_user::Ruled>>,
@@ -697,7 +715,10 @@ pub(crate) async fn with_run_state<F: Future>(state: Arc<RunState>, future: F) -
         policy,
         warned_of_missing_docker: AtomicBool::new(false),
         job_token: tokio::sync::OnceCell::new(),
+        clone_token: tokio::sync::OnceCell::new(),
+        action_clones: crate::node_actions::ActionClones::default(),
         warned_of_own_token: AtomicBool::new(false),
+        warned_of_host_actions: AtomicBool::new(false),
         runner_user: tokio::sync::OnceCell::new(),
         warned_of_root_steps: AtomicBool::new(false),
     });
@@ -728,6 +749,14 @@ pub(crate) fn first_missing_docker_warning() -> bool {
 pub(crate) fn first_own_token_warning() -> bool {
     CONTAINERS
         .try_with(|scope| !scope.warned_of_own_token.swap(true, Ordering::Relaxed))
+        .unwrap_or(true)
+}
+
+/// True the first time a run asks, called workflows included, so it says
+/// only once that remote JavaScript actions run on this machine.
+pub(crate) fn first_host_action_warning() -> bool {
+    CONTAINERS
+        .try_with(|scope| !scope.warned_of_host_actions.swap(true, Ordering::Relaxed))
         .unwrap_or(true)
 }
 
@@ -771,6 +800,39 @@ where
     match CONTAINERS.try_with(Arc::clone) {
         Ok(scope) => scope.job_token.get_or_init(find).await.clone(),
         Err(_) => find().await,
+    }
+}
+
+/// What `find` gives for this run, the first time a clone of it needs a
+/// token: see [`crate::run_options::remote_clone_token`]. Outside a run,
+/// each call finds it anew.
+pub(crate) async fn run_clone_token<F>(find: impl FnOnce() -> F) -> Option<String>
+where
+    F: Future<Output = Option<String>>,
+{
+    match CONTAINERS.try_with(Arc::clone) {
+        Ok(scope) => scope.clone_token.get_or_init(find).await.clone(),
+        Err(_) => find().await,
+    }
+}
+
+/// This run's clone of the action `key` names, made with `clone` the first
+/// time a job asks for it. Outside a run each call clones anew.
+pub(crate) async fn run_action_clone<F, Fut>(
+    key: &str,
+    clone: F,
+) -> Result<Arc<tempfile::TempDir>, String>
+where
+    F: FnOnce(PathBuf) -> Fut,
+    Fut: Future<Output = Result<(), String>>,
+{
+    match CONTAINERS.try_with(Arc::clone) {
+        Ok(scope) => scope.action_clones.get_or_clone(key, clone).await,
+        Err(_) => {
+            crate::node_actions::ActionClones::default()
+                .get_or_clone(key, clone)
+                .await
+        }
     }
 }
 

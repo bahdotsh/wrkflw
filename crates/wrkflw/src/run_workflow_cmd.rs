@@ -286,6 +286,7 @@ pub(crate) async fn run(ctx: RunCtx) {
         format.fail(&e);
     }
 
+    let runtime_flag = ctx.runtime.as_flag();
     // Create execution configuration
     let config = wrkflw_executor::ExecutionConfig {
         acceleration,
@@ -338,6 +339,19 @@ pub(crate) async fn run(ctx: RunCtx) {
 
     // A pass that ran no job, or ran some as another OS, for a caller that
     // reads only the exit code and tells those from a full pass.
+    // A gate in text mode reads what wasn't checked from here, by this
+    // process's id, so a nested run's write isn't taken for this one's.
+    if let Ok(path) = std::env::var(crate::gate_cmd::UNVERIFIED_FILE_ENV) {
+        let _ = std::fs::write(
+            path,
+            serde_json::json!({
+                "pid": std::process::id(),
+                "unverified": unverified.clone(),
+            })
+            .to_string(),
+        );
+    }
+
     let verdict_exit = match verdict {
         "nothing_checked" => ctx.nothing_checked_exit_code,
         "partial" => ctx.partial_exit_code,
@@ -413,6 +427,20 @@ pub(crate) async fn run(ctx: RunCtx) {
                             entry["job"].as_str().unwrap_or_default(),
                             entry["reason"].as_str().unwrap_or_default()
                         ))
+                    );
+                }
+                let asks_for_mac = unverified.iter().any(|entry| {
+                    entry["kind"] == "runner"
+                        && entry["requested"]
+                            .as_str()
+                            .is_some_and(|os| os.to_ascii_lowercase().starts_with("mac"))
+                });
+                if asks_for_mac && crate::gate_cmd::mac_with_containers(runtime_flag) {
+                    println!(
+                        "  {}",
+                        cli_style::dim(
+                            "macOS jobs run on this Mac itself with `--runtime emulation`"
+                        )
                     );
                 }
             }

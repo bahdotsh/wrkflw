@@ -9,8 +9,28 @@ fn write_file(path: &std::path::Path, content: &str) {
     fs::write(path, content).expect("failed to write file");
 }
 
-#[tokio::test]
-async fn test_reusable_workflow_inputs_and_declared_outputs() {
+/// Below the 2 MiB a test thread gets, so a change that grows the futures a
+/// called workflow nests overflows here first, before it overflows a real
+/// run's worker thread.
+const STACK: usize = 3 * 512 * 1024;
+
+#[test]
+fn test_reusable_workflow_inputs_and_declared_outputs() {
+    std::thread::Builder::new()
+        .stack_size(STACK)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(reusable_workflow_inputs_and_declared_outputs())
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+async fn reusable_workflow_inputs_and_declared_outputs() {
     let dir = tempdir().unwrap();
     let called_path = dir.path().join("called.yml");
     let caller_path = dir.path().join("caller.yml");

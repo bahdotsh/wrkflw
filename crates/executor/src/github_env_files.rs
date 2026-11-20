@@ -137,6 +137,67 @@ pub fn read_step_environment_updates(job_env: &HashMap<String, String>) -> StepE
     updates
 }
 
+/// Variables a step can't set for later steps through `$GITHUB_ENV`.
+///
+/// GitHub's runner refuses only `NODE_OPTIONS` there; its own default
+/// variables keep their values because it sets them again for each step.
+/// wrkflw sets these for each step as well, and reads several back as
+/// host paths (`GITHUB_ENV`'s directory is what a container mounts at
+/// `/github`, `GITHUB_OUTPUT` is emptied before each step,
+/// `GITHUB_ACTION_PATH` names the directory a container mounts), so a step
+/// that set one could have any directory mounted or any file emptied.
+/// Any other name, `GITHUB_SHA_SHORT` included, passes on as on GitHub.
+const RESERVED_ENV: &[&str] = &[
+    "NODE_OPTIONS",
+    "WRKFLW_RUNTIME_MODE",
+    PATH_ADDITIONS_ENV,
+    wrkflw_runtime::ENV_REMOVE,
+    "GITHUB_ACTION",
+    "GITHUB_ACTION_PATH",
+    "GITHUB_ACTION_REF",
+    "GITHUB_ACTION_REPOSITORY",
+    "GITHUB_ACTIONS",
+    "GITHUB_ACTOR",
+    "GITHUB_API_URL",
+    "GITHUB_BASE_REF",
+    "GITHUB_ENV",
+    "GITHUB_EVENT_NAME",
+    "GITHUB_EVENT_PATH",
+    "GITHUB_GRAPHQL_URL",
+    "GITHUB_HEAD_REF",
+    "GITHUB_JOB",
+    "GITHUB_OUTPUT",
+    "GITHUB_PATH",
+    "GITHUB_REF",
+    "GITHUB_REF_NAME",
+    "GITHUB_REF_TYPE",
+    "GITHUB_REPOSITORY",
+    "GITHUB_REPOSITORY_OWNER",
+    "GITHUB_RETENTION_DAYS",
+    "GITHUB_RUN_ATTEMPT",
+    "GITHUB_RUN_ID",
+    "GITHUB_RUN_NUMBER",
+    "GITHUB_SERVER_URL",
+    "GITHUB_SHA",
+    "GITHUB_STATE",
+    "GITHUB_STEP_SUMMARY",
+    "GITHUB_TRIGGERING_ACTOR",
+    "GITHUB_WORKFLOW",
+    "GITHUB_WORKSPACE",
+    "RUNNER_ARCH",
+    "RUNNER_ENVIRONMENT",
+    "RUNNER_NAME",
+    "RUNNER_OS",
+    "RUNNER_TEMP",
+    "RUNNER_TOOL_CACHE",
+];
+
+/// Whether `$GITHUB_ENV` may not set `name`: see [`RESERVED_ENV`].
+/// GitHub matches `NODE_OPTIONS` without regard to case.
+pub(crate) fn reserved(name: &str) -> bool {
+    RESERVED_ENV.contains(&name) || name.eq_ignore_ascii_case("NODE_OPTIONS")
+}
+
 /// Apply environment updates from a completed step to the job state.
 ///
 /// - Stores step outputs keyed by step ID (for `${{ steps.<id>.outputs.<key> }}`)
@@ -152,7 +213,17 @@ pub fn apply_step_environment_updates(
     step_outputs_map: &mut HashMap<String, HashMap<String, String>>,
     step_id: Option<&str>,
 ) -> AppliedEnvironment {
-    let updates = read_step_environment_updates(job_env);
+    let mut updates = read_step_environment_updates(job_env);
+    updates.env_vars.retain(|name, _| {
+        let reserved = reserved(name);
+        if reserved {
+            wrkflw_logging::warning(&format!(
+                "A step wrote {} to $GITHUB_ENV, which wrkflw sets itself: ignored",
+                name
+            ));
+        }
+        !reserved
+    });
     let mut applied = AppliedEnvironment {
         env_vars: updates.env_vars.clone().into_iter().collect(),
         path_entries: updates.path_entries.clone(),
@@ -331,6 +402,53 @@ mod tests {
         fs::write(&env["GITHUB_ENV"], env_lines).unwrap();
         fs::write(&env["GITHUB_PATH"], path_lines).unwrap();
         apply_step_environment_updates(env, &mut HashMap::new(), &mut HashMap::new(), None)
+    }
+
+    /// A step can't set, for later steps, what wrkflw sets for each step:
+    /// a forged `GITHUB_ACTION_PATH` would choose the host directory a
+    /// container mounts.
+    #[test]
+    fn a_step_cannot_set_what_wrkflw_sets_for_each_step() {
+        let dir = tempdir().unwrap();
+        let mut job = job_env_in(dir.path());
+        let applied = step(
+            &mut job,
+            "GITHUB_ACTION_PATH=/\nWRKFLW_RUNTIME_MODE=docker\nWRKFLW_ENV_REMOVE=PATH\n\
+             GITHUB_OUTPUT=/etc/hosts\nRUNNER_TEMP=/\nNODE_OPTIONS=--require=/x\nKEPT=1\n\
+             GITHUB_SHA_SHORT=abc1234\nRUNNER_LABEL=mine\n",
+            "",
+        );
+        assert_eq!(job.get("KEPT").map(String::as_str), Some("1"));
+        for name in [
+            "GITHUB_ACTION_PATH",
+            "WRKFLW_RUNTIME_MODE",
+            "WRKFLW_ENV_REMOVE",
+            "RUNNER_TEMP",
+        ] {
+            assert!(!job.contains_key(name), "{name}");
+        }
+        assert_ne!(
+            job.get("GITHUB_OUTPUT").map(String::as_str),
+            Some("/etc/hosts")
+        );
+        assert!(!job.contains_key("NODE_OPTIONS"));
+        // A name of the user's own passes on, as on GitHub, whatever its
+        // prefix.
+        assert_eq!(
+            job.get("GITHUB_SHA_SHORT").map(String::as_str),
+            Some("abc1234")
+        );
+        assert_eq!(job.get("RUNNER_LABEL").map(String::as_str), Some("mine"));
+        let mut applied = applied.env_vars;
+        applied.sort();
+        assert_eq!(
+            applied,
+            vec![
+                ("GITHUB_SHA_SHORT".to_string(), "abc1234".to_string()),
+                ("KEPT".to_string(), "1".to_string()),
+                ("RUNNER_LABEL".to_string(), "mine".to_string()),
+            ]
+        );
     }
 
     /// What a composite action's steps write reaches the job as it would

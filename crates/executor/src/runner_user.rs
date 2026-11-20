@@ -294,6 +294,20 @@ pub(crate) fn create_script(uid: u32) -> String {
     )
 }
 
+/// Gives the runner user, made with [`HOSTED_UID`] in the published
+/// runner base image, the uid `uid` instead: the image's other user with
+/// that uid makes way, as in [`create_script`], and what the user owned is
+/// handed over again.
+pub(crate) fn remap_script(uid: u32) -> String {
+    format!(
+        "(other=\"$(getent passwd {uid} | cut -d: -f1)\"; \
+          [ -z \"$other\" ] || [ \"$other\" = {NAME} ] || userdel -r \"$other\" 2>/dev/null || true) && \
+         groupmod --non-unique --gid {uid} {NAME} && \
+         usermod --non-unique --uid {uid} --gid {uid} {NAME} && \
+         find / -xdev \\( -uid {HOSTED_UID} -o -gid {HOSTED_UID} \\) -exec chown -h {NAME}:{NAME} {{}} +"
+    )
+}
+
 /// Shell that gives the user what the runtime `language` just installed
 /// and a step later writes into, or nothing. It goes in the same `RUN` as
 /// the install: changing a file's owner in a later layer copies the file.

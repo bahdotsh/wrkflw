@@ -15719,8 +15719,10 @@ runs:
 
     /// Jobs run on the host under `--macos-on-host` are laid over with what
     /// differs between the run's env on its container runtime and under
-    /// emulation. That must be the runtime's own values only, never a
-    /// run-level one such as `GITHUB_RUN_ID`, which every job shares.
+    /// emulation. Seeding one context for each runtime must differ only in
+    /// the runtime's own values, never a run-level one such as
+    /// `GITHUB_RUN_ID`, which every job shares. The run makes that one
+    /// context once, in `execute_github_workflow`.
     #[test]
     fn the_host_env_differs_from_the_container_env_only_by_the_runtime() {
         let workflow = minimal_workflow();
@@ -15729,7 +15731,6 @@ runs:
             Path::new("/host/workspace"),
             &environment::RunRef::default(),
         );
-        // As if the clock moved on between building the two envs.
         context.insert("GITHUB_RUN_ID".to_string(), "100".to_string());
         let (container, _) =
             github_run_env_from(context.clone(), &workflow, &RuntimeType::Docker).unwrap();

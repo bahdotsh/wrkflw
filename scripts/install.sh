@@ -92,16 +92,16 @@ or pick a newer WRKFLW_VERSION"
   # overwritten as it reads itself.
   cp "$tmp/wrkflw" "$INSTALL_DIR/.wrkflw.new"
   chmod 755 "$INSTALL_DIR/.wrkflw.new"
-  mv -f "$INSTALL_DIR/.wrkflw.new" "$INSTALL_DIR/wrkflw"
-
-  # A binary built for a newer system than this one fails here, for
-  # instance an arm64 Linux build on a distribution with an older glibc.
-  if version=$("$INSTALL_DIR/wrkflw" --version 2>&1); then
-    say "installed $version to $INSTALL_DIR/wrkflw"
-  else
-    say "installed $INSTALL_DIR/wrkflw, but it doesn't run here: $version"
-    die "install with \`cargo install wrkflw\` instead"
+  # Tried before it replaces anything: a binary built for a newer system
+  # than this one fails here, for instance an arm64 Linux build on a
+  # distribution with an older glibc, and a wrkflw already installed stays.
+  if ! version=$("$INSTALL_DIR/.wrkflw.new" --version 2>&1); then
+    rm -f "$INSTALL_DIR/.wrkflw.new"
+    say "the downloaded wrkflw doesn't run here: $version"
+    die "nothing was changed; install with \`cargo install wrkflw\` instead"
   fi
+  mv -f "$INSTALL_DIR/.wrkflw.new" "$INSTALL_DIR/wrkflw"
+  say "installed $version to $INSTALL_DIR/wrkflw"
   case ":$PATH:" in
     *":$INSTALL_DIR:"*) ;;
     *) say "add $INSTALL_DIR to your PATH to run it as \`wrkflw\`" ;;

@@ -40,7 +40,10 @@ impl HostJobs {
             .filter(|(key, value)| run_env.get(key) != Some(value))
             .collect();
         HostJobs {
-            runtime: Box::new(OffTask(Arc::from(runtime))),
+            runtime: Box::new(OffTask {
+                runtime: Arc::from(runtime),
+                one_at_a_time: Arc::new(tokio::sync::Semaphore::new(1)),
+            }),
             overlay,
         }
     }
@@ -71,7 +74,26 @@ impl HostJobs {
 /// run's jobs, and the legs of a matrix chunk, are all polled from one
 /// task, so a host job's long `brew install` would stop the container jobs
 /// beside it until it ended. Here each step waits on a blocking thread.
-struct OffTask(Arc<dyn ContainerRuntime + Send + Sync>);
+///
+/// Host steps run one at a time. On GitHub each macOS job has a machine of
+/// its own; here they share this Mac, its Homebrew lock and its caches, so
+/// two at once can fail where neither would alone. They still run while
+/// container jobs do.
+struct OffTask {
+    runtime: Arc<dyn ContainerRuntime + Send + Sync>,
+    one_at_a_time: Arc<tokio::sync::Semaphore>,
+}
+
+/// Ends a step's processes when the step is given up on: a timeout or a
+/// cancelled job drops the future waiting for it, which leaves its thread
+/// running. A step that ended has nothing left to end.
+struct EndOnDrop(wrkflw_runtime::emulation::StepHandle);
+
+impl Drop for EndOnDrop {
+    fn drop(&mut self) {
+        self.0.kill();
+    }
+}
 
 #[async_trait::async_trait]
 impl ContainerRuntime for OffTask {
@@ -84,7 +106,7 @@ impl ContainerRuntime for OffTask {
         volumes: &[(&Path, &Path)],
         entrypoint: Option<&str>,
     ) -> Result<ContainerOutput, ContainerError> {
-        let runtime = Arc::clone(&self.0);
+        let runtime = Arc::clone(&self.runtime);
         let image = image.to_string();
         let cmd: Vec<String> = cmd.iter().map(|s| s.to_string()).collect();
         let env: Vec<(String, String)> = env_vars
@@ -100,6 +122,11 @@ impl ContainerRuntime for OffTask {
         // The step's output goes to the tap of this task, which the thread
         // below doesn't have: it is carried there.
         let tap = wrkflw_runtime::live_output::current();
+        let _turn = self.one_at_a_time.acquire().await.map_err(|e| {
+            ContainerError::ContainerExecution(format!("Host steps can't run: {e}"))
+        })?;
+        let step = wrkflw_runtime::emulation::StepHandle::default();
+        let _end = EndOnDrop(step.clone());
         tokio::task::spawn_blocking(move || {
             let cmd: Vec<&str> = cmd.iter().map(String::as_str).collect();
             let env: Vec<(&str, &str)> =
@@ -116,19 +143,19 @@ impl ContainerRuntime for OffTask {
                 &volumes,
                 entrypoint.as_deref(),
             );
-            match tap {
+            step.run(|| match tap {
                 Some(tap) => futures::executor::block_on(
                     wrkflw_runtime::live_output::with_output_tap(tap, run),
                 ),
                 None => futures::executor::block_on(run),
-            }
+            })
         })
         .await
         .map_err(|e| ContainerError::ContainerExecution(format!("The step's thread failed: {e}")))?
     }
 
     async fn pull_image(&self, image: &str) -> Result<(), ContainerError> {
-        self.0.pull_image(image).await
+        self.runtime.pull_image(image).await
     }
 
     async fn build_image(
@@ -137,7 +164,7 @@ impl ContainerRuntime for OffTask {
         tag: &str,
         context_dir: &Path,
     ) -> Result<(), ContainerError> {
-        self.0.build_image(dockerfile, tag, context_dir).await
+        self.runtime.build_image(dockerfile, tag, context_dir).await
     }
 
     async fn prepare_language_environment(
@@ -146,37 +173,37 @@ impl ContainerRuntime for OffTask {
         version: Option<&str>,
         additional_packages: Option<Vec<String>>,
     ) -> Result<String, ContainerError> {
-        self.0
+        self.runtime
             .prepare_language_environment(language, version, additional_packages)
             .await
     }
 
     async fn image_exists(&self, tag: &str) -> Result<bool, ContainerError> {
-        self.0.image_exists(tag).await
+        self.runtime.image_exists(tag).await
     }
 
     async fn image_id(&self, image: &str) -> Option<String> {
-        self.0.image_id(image).await
+        self.runtime.image_id(image).await
     }
 
     fn identifies_images(&self) -> bool {
-        self.0.identifies_images()
+        self.runtime.identifies_images()
     }
 
     fn mounts_are_copies(&self) -> bool {
-        self.0.mounts_are_copies()
+        self.runtime.mounts_are_copies()
     }
 
     fn session_cli(&self) -> Option<&'static str> {
-        self.0.session_cli()
+        self.runtime.session_cli()
     }
 
     fn reuses_build_layers(&self) -> bool {
-        self.0.reuses_build_layers()
+        self.runtime.reuses_build_layers()
     }
 
     fn flattens_commands(&self) -> bool {
-        self.0.flattens_commands()
+        self.runtime.flattens_commands()
     }
 }
 
@@ -345,6 +372,51 @@ mod tests {
         assert!(
             beside < std::time::Duration::from_secs(1),
             "the job beside waited {beside:?} for the host step"
+        );
+    }
+
+    /// A step given up on, as a timeout does, is ended with what it started,
+    /// rather than left running on this machine.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_host_step_given_up_on_is_ended_with_its_children() {
+        let host = host();
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("still-running");
+        let volumes = [(dir.path(), Path::new("/github/workspace"))];
+        let script = format!("sleep 1; touch {}", marker.display());
+        let cmd = ["bash", "-c", script.as_str()];
+        let step = host
+            .runtime
+            .run_container("", &cmd, &[], dir.path(), &volumes, None);
+        let gave_up = tokio::time::timeout(std::time::Duration::from_millis(200), step).await;
+        assert!(gave_up.is_err(), "the step should still have been running");
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        assert!(
+            !marker.exists(),
+            "the step went on after it was given up on"
+        );
+    }
+
+    /// Two host steps don't run at once: they share this machine.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn host_steps_take_turns() {
+        let host = host();
+        let dir = tempfile::tempdir().unwrap();
+        let volumes = [(dir.path(), Path::new("/github/workspace"))];
+        let started = std::time::Instant::now();
+        let step = || {
+            host.runtime
+                .run_container("", &["sleep", "0.5"], &[], dir.path(), &volumes, None)
+        };
+        let (a, b) = tokio::join!(step(), step());
+        assert_eq!(a.unwrap().exit_code, 0);
+        assert_eq!(b.unwrap().exit_code, 0);
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(1000),
+            "two host steps overlapped: {:?}",
+            started.elapsed()
         );
     }
 

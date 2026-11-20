@@ -18,6 +18,84 @@ use ignore::{gitignore::GitignoreBuilder, Match};
 static EMULATION_WORKSPACES: Lazy<Mutex<Vec<PathBuf>>> = Lazy::new(|| Mutex::new(Vec::new()));
 static EMULATION_PROCESSES: Lazy<Mutex<Vec<u32>>> = Lazy::new(|| Mutex::new(Vec::new()));
 
+/// A step a caller may stop waiting for, and then end.
+///
+/// A step run inside [`StepHandle::run`] starts as the leader of a process
+/// group of its own, and the group is tracked for [`cleanup_resources`]:
+/// in its own group a step no longer gets the terminal's Ctrl-C, so the
+/// cleanup that follows it ends the step instead. [`StepHandle::kill`] ends
+/// the group while the step runs, so what it started doesn't outlive a step
+/// given up on. Steps run without a handle start as before, in wrkflw's group.
+#[derive(Clone, Default)]
+pub struct StepHandle(std::sync::Arc<Mutex<Option<u32>>>);
+
+thread_local! {
+    static STEP: std::cell::RefCell<Option<StepHandle>> = const { std::cell::RefCell::new(None) };
+}
+
+impl StepHandle {
+    /// Run `f`, which runs a step with [`EmulationRuntime::run_container`]
+    /// on this thread, with this handle.
+    pub fn run<R>(&self, f: impl FnOnce() -> R) -> R {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                STEP.with(|step| step.borrow_mut().take());
+            }
+        }
+        STEP.with(|step| *step.borrow_mut() = Some(self.clone()));
+        let _reset = Reset;
+        f()
+    }
+
+    /// End the step's process group, if the step is still running.
+    pub fn kill(&self) {
+        let pid = self.0.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(pid) = pid {
+            wrkflw_logging::debug(&format!("Ending step process group {pid}"));
+            end_process_group(pid, "KILL");
+            untrack_process(pid);
+        }
+    }
+
+    fn started(&self, pid: u32) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(pid);
+        track_process(pid);
+    }
+
+    fn ended(&self) {
+        if let Some(pid) = self.0.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            untrack_process(pid);
+        }
+    }
+}
+
+/// Send `signal` to the process group `pid` leads, or to `pid` alone when
+/// it leads none. On Windows, end its process tree.
+fn end_process_group(pid: u32, signal: &str) {
+    #[cfg(unix)]
+    {
+        let group = Command::new("kill")
+            .arg(format!("-{signal}"))
+            .arg("--")
+            .arg(format!("-{pid}"))
+            .output();
+        if !group.is_ok_and(|out| out.status.success()) {
+            let _ = Command::new("kill")
+                .arg(format!("-{signal}"))
+                .arg(pid.to_string())
+                .output();
+        }
+    }
+    #[cfg(windows)]
+    {
+        let _ = signal;
+        let _ = Command::new("taskkill")
+            .args(["/F", "/T", "/PID", &pid.to_string()])
+            .output();
+    }
+}
+
 pub struct EmulationRuntime {
     #[allow(dead_code)]
     workspace: TempDir,
@@ -300,6 +378,15 @@ impl ContainerRuntime for EmulationRuntime {
             }
         }
 
+        // A step whose caller may give up on it leads a process group of
+        // its own, which the caller can end: see `StepHandle`.
+        let handle = STEP.with(|step| step.borrow().clone());
+        #[cfg(unix)]
+        if handle.is_some() {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
+
         // Output is collected as `output()` would, and also passed on as it
         // is printed so a long step shows progress.
         let run = cmd
@@ -308,10 +395,17 @@ impl ContainerRuntime for EmulationRuntime {
             .stderr(std::process::Stdio::piped())
             .spawn()
             .and_then(|child| {
-                crate::live_output::blocking_wait_with_live_output(
+                if let Some(handle) = &handle {
+                    handle.started(child.id());
+                }
+                let output = crate::live_output::blocking_wait_with_live_output(
                     child,
                     crate::live_output::current(),
-                )
+                );
+                if let Some(handle) = &handle {
+                    handle.ended();
+                }
+                output
             });
         match run {
             Ok(output_result) => {
@@ -677,25 +771,9 @@ async fn cleanup_processes() {
 
     for pid in processes_to_cleanup {
         wrkflw_logging::info(&format!("Cleaning up emulated process: {}", pid));
-
-        #[cfg(unix)]
-        {
-            // On Unix-like systems, use kill command
-            let _ = Command::new("kill")
-                .arg("-TERM")
-                .arg(pid.to_string())
-                .output();
-        }
-
-        #[cfg(windows)]
-        {
-            // On Windows, use taskkill
-            let _ = Command::new("taskkill")
-                .arg("/F")
-                .arg("/PID")
-                .arg(pid.to_string())
-                .output();
-        }
+        // A tracked step leads its own process group, out of reach of the
+        // terminal's Ctrl-C: end everything it started.
+        end_process_group(pid, "TERM");
 
         // Remove from tracking
         if let Ok(mut processes) = EMULATION_PROCESSES.lock() {

@@ -835,7 +835,8 @@ fn partial_lines(unverified: &[Value], mac_hint: bool) -> Vec<String> {
             lines.push(
                 "macOS jobs run on this Mac itself with `--macos-on-host`, \
                  the other jobs staying in containers (no container for theirs: \
-                 they can change this machine)"
+                 they can change this machine and see this shell's environment, \
+                 credentials included)"
                     .to_string(),
             );
         }

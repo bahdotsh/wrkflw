@@ -28,7 +28,7 @@ sindresorhus/execa       44272044440
 urfave/cli               42738336663
 BurntSushi/memchr        31414505747
 go-chi/chi               42388391568
-lib/pq                   43793073655
+lib/pq                   43793073655  WRKFLW_DOCKER_IN_JOBS=1
 go-sql-driver/mysql      44281558144
-jazzband/django-redis    42917669996
+jazzband/django-redis    42917669996  WRKFLW_DOCKER_IN_JOBS=1
 dtolnay/anyhow           44655613210

@@ -1,1 +1,1 @@
-ghcr.io/bahdotsh/wrkflw-runner:2d34653a00b1e1a0
+ghcr.io/bahdotsh/wrkflw-runner:aa92c48f29155b8a

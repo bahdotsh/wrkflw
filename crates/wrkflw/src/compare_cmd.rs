@@ -199,6 +199,71 @@ fn expected_jobs(path: &Path) -> Result<Vec<ExpectedJob>, String> {
     Ok(expected)
 }
 
+/// `expected` with each job whose matrix is only known once the run has
+/// it, such as `${{ fromJSON(needs.list.outputs.matrix) }}`, replaced by
+/// the legs the local run reported for it. GitHub names those legs by their
+/// values in the matrix's own key order, `test (ubuntu-latest, 1.27, 9.7)`,
+/// and wrkflw by `key: value` in key order, so a leg pairs by its values in
+/// any order (go-sql-driver/mysql).
+fn with_run_time_legs(expected: Vec<ExpectedJob>, local: &[Value]) -> Vec<ExpectedJob> {
+    let known: std::collections::HashSet<String> =
+        expected.iter().map(|job| job.local.clone()).collect();
+    let mut out = Vec::with_capacity(expected.len());
+    for job in expected {
+        let legs: Vec<(String, Vec<String>)> = if job.matrix_values.is_none()
+            && job.github.as_deref() == Some(job.github_base.as_str())
+        {
+            local
+                .iter()
+                .filter_map(|l| l["name"].as_str())
+                .filter(|name| !known.contains(*name))
+                .filter_map(|name| Some((name.to_string(), leg_values(&job.local, name)?)))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if legs.is_empty() {
+            out.push(job);
+            continue;
+        }
+        for (local, values) in legs {
+            out.push(ExpectedJob {
+                local,
+                github: None,
+                github_base: job.github_base.clone(),
+                matrix_values: Some(values),
+                called: job.called,
+                runs_docker: job.runs_docker,
+            });
+        }
+    }
+    out
+}
+
+/// The values of the leg wrkflw names `id (key: value, key: value)`. A
+/// value holding `, ` stays whole: a piece without `: ` continues the one
+/// before it.
+fn leg_values(id: &str, name: &str) -> Option<Vec<String>> {
+    let inner = name
+        .strip_prefix(id)?
+        .strip_prefix(" (")?
+        .strip_suffix(')')?;
+    let mut pairs: Vec<String> = Vec::new();
+    for piece in inner.split(", ") {
+        match pairs.last_mut() {
+            Some(last) if !piece.contains(": ") => {
+                last.push_str(", ");
+                last.push_str(piece);
+            }
+            _ => pairs.push(piece.to_string()),
+        }
+    }
+    pairs
+        .iter()
+        .map(|pair| pair.split_once(": ").map(|(_, value)| value.to_string()))
+        .collect()
+}
+
 /// One row of the comparison.
 #[derive(Debug, Clone, PartialEq)]
 struct Row {
@@ -301,6 +366,21 @@ fn lacked_docker(failure: &Value) -> bool {
     failure_lines(failure).any(|line| NO_DOCKER_ENGINE.iter().any(|sign| line.contains(sign)))
 }
 
+/// What a coverage service prints when it refuses an upload for want of
+/// what only a GitHub job has: Codecov without the repository's token on a
+/// protected branch (urfave/cli), Coveralls without the job's GitHub token
+/// and run (go-sql-driver/mysql).
+const NO_SERVICE_TOKEN: &[&str] = &[
+    "Token required because branch is protected",
+    "Couldn't find a repository matching this job",
+];
+
+/// Whether a failed step's output shows a service refused it for want of
+/// a token from the repository's secrets.
+fn lacked_service_token(failure: &Value) -> bool {
+    failure_lines(failure).any(|line| NO_SERVICE_TOKEN.iter().any(|sign| line.contains(sign)))
+}
+
 /// What a step prints when it runs an x86_64 program, as `cross` does, in
 /// an arm64 job container, such as one on an Apple Silicon Mac.
 const NEEDS_X86_64: &[&str] = &[
@@ -395,6 +475,13 @@ fn note_for(local: &Value, failures: &[Value], runs_docker: bool) -> Option<Stri
         notes.push(
             "a step may have needed the GitHub token GitHub gives every job: a local \
              job gets yours with WRKFLW_JOB_GITHUB_TOKEN=1"
+                .to_string(),
+        );
+    }
+    if local["status"] == "failure" && failures_of(failures, name).any(lacked_service_token) {
+        notes.push(
+            "a coverage service refused the upload: it takes it from a GitHub job, by the \
+             job's token or one the repository keeps in its secrets, such as CODECOV_TOKEN"
                 .to_string(),
         );
     }
@@ -1178,6 +1265,7 @@ pub(crate) async fn run(ctx: CompareCtx) -> ! {
         .as_array()
         .cloned()
         .unwrap_or_default();
+    let expected = with_run_time_legs(expected, &local_jobs);
     let rows = rows(&expected, &remote.jobs, &local_jobs, &failures);
     let mut report = report(&remote, &local, &rows);
     if let Some(note) = ref_unsure {
@@ -2210,6 +2298,64 @@ mod tests {
     /// A job whose step ran an x86_64 program in an arm64 container, as
     /// `cross` on an Apple Silicon Mac does, says so; a failure of its own
     /// doesn't.
+    #[test]
+    fn an_upload_refused_for_want_of_a_secret_token_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: CI\non: push\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: codecov/codecov-action@v5\n";
+        let expected = expected_jobs(&write(dir.path(), yaml)).unwrap();
+        let github = vec![remote("test", "success")];
+        let local = vec![json!({"name": "test", "status": "failure"})];
+        let failures = [
+            json!({"job": "test", "step": "Composite Action", "exit_code": 1,
+            "error_lines": [], "output_tail": [
+                "error - 2026-11-20 16:15:25,702 -- Upload failed: {\"message\":\"Token required because branch is protected\"}"
+            ]}),
+        ];
+        let note = rows(&expected, &github, &local, &failures)[0]
+            .note
+            .clone()
+            .unwrap();
+        assert!(note.contains("CODECOV_TOKEN"), "{note}");
+        let coveralls = [
+            json!({"job": "test", "step": "Send coverage", "exit_code": 1,
+            "error_lines": [], "output_tail": [
+                "{\"message\":\"Couldn't find a repository matching this job.\",\"error\":true}"
+            ]}),
+        ];
+        let note = rows(&expected, &github, &local, &coveralls)[0]
+            .note
+            .clone()
+            .unwrap();
+        assert!(note.contains("coverage service"), "{note}");
+    }
+
+    /// go-sql-driver/mysql's `test` matrix comes from its `list` job's
+    /// output, so its legs are only known from the local run.
+    #[test]
+    fn a_leg_of_a_matrix_made_at_run_time_pairs_by_its_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: CI\non: push\njobs:\n  list:\n    runs-on: ubuntu-latest\n    outputs:\n      matrix: ${{ steps.m.outputs.matrix }}\n    steps:\n      - id: m\n        run: echo hi\n  test:\n    needs: list\n    runs-on: ${{ matrix.os }}\n    strategy:\n      matrix: ${{ fromJSON(needs.list.outputs.matrix) }}\n    steps:\n      - run: echo hi\n";
+        let expected = expected_jobs(&write(dir.path(), yaml)).unwrap();
+        let local = vec![
+            json!({"name": "list", "status": "success"}),
+            json!({"name": "test (go: 1.27, mysql: 9.7, os: ubuntu-latest)", "status": "success"}),
+            json!({"name": "test (go: 1.27, mysql: mariadb-11.8, os: ubuntu-latest)", "status": "failure"}),
+        ];
+        let expected = with_run_time_legs(expected, &local);
+        let github = vec![
+            remote("list", "success"),
+            remote("test (ubuntu-latest, 1.27, mariadb-11.8)", "failure"),
+            remote("test (ubuntu-latest, 1.27, 9.7)", "success"),
+        ];
+        let rows = rows(&expected, &github, &local, &[]);
+        assert_eq!(rows.len(), 3, "{rows:?}");
+        assert!(rows.iter().all(|row| row.agree == Some(true)), "{rows:?}");
+        assert_eq!(
+            leg_values("t", "t (features: serde, std, os: linux)"),
+            Some(vec!["serde, std".to_string(), "linux".to_string()])
+        );
+    }
+
     #[test]
     fn a_failure_for_want_of_an_x86_64_machine_says_so() {
         let dir = tempfile::tempdir().unwrap();

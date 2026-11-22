@@ -2363,6 +2363,14 @@ const RUNNER_TOOLS: &[&str] = &[
     // `python` as `python3`, which `shell: python` runs: the hosted runner
     // has it, and go-sql-driver/mysql builds its matrix that way.
     "python-is-python3",
+    // The hosted runner has it, and prebuilt clients link it: the `mariadb`
+    // that shogo82148/actions-setup-mysql installs (go-sql-driver/mysql).
+    "libncurses6",
+    // The hosted runner has them, and a package built from source needs
+    // them where no wheel fits: `cryptography` for PyPy on arm64 finds no
+    // OpenSSL without them (psf/requests).
+    "libssl-dev",
+    "pkg-config",
 ];
 
 /// Installs the GitHub CLI from GitHub's own apt repository, the way the
@@ -5468,6 +5476,41 @@ fn workspace_relative_input(path: &str, job_env: &HashMap<String, String>) -> St
     }
 }
 
+/// Where `actions/checkout` puts the repository: the workspace, or the
+/// directory under it its `path:` input names. Its own repository only: a
+/// `repository:` naming another one keeps the workspace, as before. A path
+/// outside the workspace is refused, as actions/checkout refuses it.
+fn checkout_destination(ctx: &StepExecutionContext<'_>) -> Result<PathBuf, String> {
+    let with = ctx.step.with.as_ref();
+    let input = |key: &str| {
+        with.and_then(|w| w.get(key))
+            .map(|value| preprocess_with_value(value, ctx).trim().to_string())
+            .filter(|value| !value.is_empty())
+    };
+    let own_repository = match input("repository") {
+        None => true,
+        Some(repository) => ctx
+            .job_env
+            .get("GITHUB_REPOSITORY")
+            .is_some_and(|own| own.eq_ignore_ascii_case(&repository)),
+    };
+    let Some(path) = input("path").filter(|_| own_repository) else {
+        return Ok(ctx.working_dir.to_path_buf());
+    };
+    let relative = workspace_relative_input(&path, ctx.job_env);
+    let relative = Path::new(&relative);
+    if relative.is_absolute()
+        || relative
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(format!(
+            "actions/checkout: path '{path}' is not under the workspace"
+        ));
+    }
+    Ok(ctx.working_dir.join(relative))
+}
+
 /// Make a path under `workspace` relative, since steps see the workspace under
 /// `/github/workspace` and `github.workspace` is the host path in emulation. The
 /// comparison is by path component, so a sibling like `<workspace>-old` stays
@@ -5920,8 +5963,22 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                 ExecutionError::Execution(format!("Failed to get current dir: {}", e))
             })?;
 
-            // Copy the project files to the workspace
-            copy_directory_contents(&current_dir, ctx.working_dir)?;
+            // Copy the project files to the workspace, or to the directory
+            // under it that `path:` names, as go-chi/chi's GOPATH layout does.
+            let destination = match checkout_destination(&ctx) {
+                Ok(destination) => destination,
+                Err(message) => {
+                    return Ok(StepResult::new(step_name, StepStatus::Failure, message));
+                }
+            };
+            std::fs::create_dir_all(&destination).map_err(|e| {
+                ExecutionError::Execution(format!(
+                    "Failed to create checkout path {}: {}",
+                    destination.display(),
+                    e
+                ))
+            })?;
+            copy_directory_contents(&current_dir, &destination)?;
 
             // Add info for logs
             let output = if ctx.verbose {
@@ -5931,8 +5988,7 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                 // Add checkout action details
                 detailed_output.push_str("Checkout Details:\n");
                 detailed_output.push_str("  - Source: Local directory\n");
-                detailed_output
-                    .push_str(&format!("  - Destination: {}\n", ctx.working_dir.display()));
+                detailed_output.push_str(&format!("  - Destination: {}\n", destination.display()));
 
                 // Add a summary count instead of listing all files
                 if let Ok(entries) = std::fs::read_dir(&current_dir) {
@@ -15719,6 +15775,65 @@ runs:
         let result = execute_step(ctx).await.unwrap();
         assert_eq!(result.status, StepStatus::Failure);
         assert!(result.output.contains("Invalid working-directory"));
+    }
+
+    /// go-chi/chi checks itself out at `${{ env.GOPATH }}/src/github.com/
+    /// ${{ github.repository }}`, with GOPATH the workspace, and runs its
+    /// tests there: the checkout went to the workspace's root instead.
+    #[test]
+    fn checkout_goes_where_its_path_says_inside_the_workspace() {
+        let runtime = MockContainerRuntime::default();
+        let workflow = minimal_workflow();
+        let job_env = HashMap::from([
+            ("GITHUB_WORKSPACE".to_string(), "/host/repo".to_string()),
+            ("GITHUB_REPOSITORY".to_string(), "go-chi/chi".to_string()),
+        ]);
+        let working_dir = PathBuf::from("/host/repo");
+        let destination = |with: &[(&str, &str)]| {
+            let with = with
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect::<HashMap<_, _>>();
+            let step = make_step_uses("actions/checkout@v4", Some(with));
+            let ctx = StepExecutionContext {
+                step: &step,
+                step_idx: 0,
+                job_env: &job_env,
+                job_user_env: &job_env,
+                working_dir: &working_dir,
+                runtime: &runtime,
+                workflow: &workflow,
+                runner_image: "ubuntu:latest",
+                installed_runtimes: &BuiltRuntimes::default(),
+                verbose: false,
+                matrix_combination: &None,
+                container_config: None,
+                workflow_defaults: None,
+                job_defaults: None,
+                step_outputs: &HashMap::new(),
+                step_statuses: &HashMap::new(),
+                job_status: "success",
+                services: test_services(),
+                pending_cache_saves: &TEST_PENDING_CACHE_SAVES,
+            };
+            checkout_destination(&ctx)
+        };
+        assert_eq!(destination(&[]), Ok(working_dir.clone()));
+        assert_eq!(
+            destination(&[(
+                "path",
+                "${{ github.workspace }}/src/github.com/${{ github.repository }}"
+            )]),
+            Ok(working_dir.join("src/github.com/go-chi/chi"))
+        );
+        assert_eq!(destination(&[("path", "sub")]), Ok(working_dir.join("sub")));
+        // Another repository keeps the old behaviour.
+        assert_eq!(
+            destination(&[("repository", "other/repo"), ("path", "other")]),
+            Ok(working_dir.clone())
+        );
+        assert!(destination(&[("path", "../outside")]).is_err());
+        assert!(destination(&[("path", "/elsewhere")]).is_err());
     }
 
     #[tokio::test]

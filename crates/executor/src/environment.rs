@@ -89,10 +89,17 @@ pub fn apply_github_container_context(env: &mut HashMap<String, String>) {
         ("RUNNER_OS", "Linux"),
         ("RUNNER_TEMP", &container_runner_temp()),
         ("RUNNER_TOOL_CACHE", "/opt/hostedtoolcache"),
+        // What `ubuntu-latest` sets. Actions that download a build for the
+        // runner's OS release read it: shogo82148/actions-setup-mysql finds
+        // no MySQL without it (go-sql-driver/mysql).
+        ("ImageOS", IMAGE_OS),
     ] {
         env.insert(key.to_string(), value.to_string());
     }
 }
+
+/// `ImageOS` on GitHub's `ubuntu-latest` runner, Ubuntu 24.04.
+pub const IMAGE_OS: &str = "ubuntu24";
 
 /// Replace host paths with what a GitLab job sees inside a container. GitLab
 /// pipelines carry `GITHUB_WORKSPACE` too, since they share the step executor.
@@ -622,6 +629,7 @@ mod tests {
         assert_eq!(env["GITHUB_WORKSPACE"], "/github/workspace");
         assert_eq!(env["RUNNER_TEMP"], "/github/workflow/runner_temp");
         assert_eq!(env["RUNNER_TOOL_CACHE"], "/opt/hostedtoolcache");
+        assert_eq!(env["ImageOS"], "ubuntu24");
         assert_eq!(env["OTHER"], "kept");
         assert!(!env.contains_key("CI_PROJECT_DIR"));
     }

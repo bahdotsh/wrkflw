@@ -1,6 +1,6 @@
 # Codebase Index: wrkflw
 
-> Generated: 2026-11-20 11:05:49 UTC | Files: 282 | Lines: 127274
+> Generated: 2026-11-22 06:55:49 UTC | Files: 282 | Lines: 128551
 > Languages: JSON (4), Markdown (35), Rust (176), Shell (10), TOML (19), YAML (38)
 
 ## Directory Structure
@@ -479,6 +479,7 @@ wrkflw/
 - `pub const CONTAINER_WORKSPACE: &str = "/github/workspace"`
 - `pub const CONTAINER_GITHUB_DIR: &str = "/github/workflow"`
 - `pub fn apply_github_container_context(env: &mut HashMap<String, String>)`
+- `pub const IMAGE_OS: &str = "ubuntu24"`
 - `pub fn apply_gitlab_container_context(env: &mut HashMap<String, String>)`
 - `pub struct RunRef<'a>`
 - `pub fn create_github_context( workflow: &WorkflowDefinition, workspace_dir: &Path, run_ref: &RunRef<'_>, ) -> HashMap<String, String>`
@@ -504,6 +505,7 @@ wrkflw/
 - `pub fn contexts_read(expr: &str) -> Option<Vec<String>>`
 - `pub fn text_reads_context(text: &str, context: &str) -> bool`
 - `pub fn evaluate_matrix_text(text: &str, matrix: Option<&HashMap<String, Value>>) -> Option<String>`
+- `pub fn evaluate_matrix_name(text: &str, matrix: Option<&HashMap<String, Value>>) -> Option<String>`
 - `pub fn calls_status_function(expr: &str) -> bool`
 
 **crates/executor/src/github_env_files.rs**
@@ -1878,7 +1880,7 @@ wrkflw/
 
 ## BREAKING_CHANGES.md
 
-**Language:** Markdown | **Size:** 37.6 KB | **Lines:** 406
+**Language:** Markdown | **Size:** 38.7 KB | **Lines:** 412
 
 **Declarations:**
 
@@ -1902,7 +1904,7 @@ wrkflw/
 
 ## INDEX.md
 
-**Language:** Markdown | **Size:** 283.4 KB | **Lines:** 10460
+**Language:** Markdown | **Size:** 306.3 KB | **Lines:** 11219
 
 **Declarations:**
 
@@ -1910,7 +1912,7 @@ wrkflw/
 
 ## README.md
 
-**Language:** Markdown | **Size:** 13.8 KB | **Lines:** 200
+**Language:** Markdown | **Size:** 16.8 KB | **Lines:** 224
 
 **Declarations:**
 
@@ -2957,7 +2959,7 @@ wrkflw/
 
 ## crates/executor/src/environment.rs
 
-**Language:** Rust | **Size:** 20.5 KB | **Lines:** 640
+**Language:** Rust | **Size:** 20.9 KB | **Lines:** 648
 
 **Imports:**
 - `chrono::Utc`
@@ -3049,7 +3051,7 @@ wrkflw/
 
 ## crates/executor/src/expression.rs
 
-**Language:** Rust | **Size:** 132.2 KB | **Lines:** 3307
+**Language:** Rust | **Size:** 132.9 KB | **Lines:** 3325
 
 **Imports:**
 - `serde_yaml::Value`
@@ -3143,13 +3145,15 @@ wrkflw/
 
 `fn call_builtin( name: &str, args: &[ExprValue], ctx: &ExpressionContext, ) -> Result<ExprValue, String>`
 
+`fn matrix_text( text: &str, matrix: Option<&HashMap<String, Value>>, empty_is_nothing: bool, ) -> Option<String>`
+
 `mod tests`
 
 ---
 
 ## crates/executor/src/github_env_files.rs
 
-**Language:** Rust | **Size:** 29.1 KB | **Lines:** 820
+**Language:** Rust | **Size:** 30.8 KB | **Lines:** 865
 
 **Imports:**
 - `std::collections::HashMap`
@@ -3300,7 +3304,7 @@ wrkflw/
 
 ## crates/executor/src/job_memory.rs
 
-**Language:** Rust | **Size:** 38.5 KB | **Lines:** 1015
+**Language:** Rust | **Size:** 38.6 KB | **Lines:** 1017
 
 **Imports:**
 - `std::collections::HashMap`
@@ -4116,7 +4120,7 @@ wrkflw/
 
 ## crates/executor/src/node_actions.rs
 
-**Language:** Rust | **Size:** 33.8 KB | **Lines:** 886
+**Language:** Rust | **Size:** 35.5 KB | **Lines:** 923
 
 **Imports:**
 - `std::collections::HashMap`
@@ -4143,6 +4147,12 @@ wrkflw/
 `pub(crate) fn state_env_name(name: &str) -> String`
 
 `pub(crate) fn input_env( definition: &serde_yaml::Value, with: Option<&HashMap<String, String>>, evaluate: impl Fn(&str) -> String, ) -> Vec<(String, String)>`
+
+`pub(crate) const GITHUB_SCRIPT_TOKEN_INPUT: &str = "INPUT_GITHUB-TOKEN"`
+
+`pub(crate) const STAND_IN_TOKEN: &str = "wrkflw-no-github-token"`
+
+`pub(crate) fn needs_stand_in_token(repository: &str, env: &HashMap<String, String>) -> bool`
 
 `pub(crate) fn node_command(script: &str, major: u32) -> String`
 
@@ -4527,7 +4537,7 @@ wrkflw/
 
 ## crates/executor/src/setup_actions.rs
 
-**Language:** Rust | **Size:** 60.1 KB | **Lines:** 1482
+**Language:** Rust | **Size:** 61.0 KB | **Lines:** 1508
 
 **Imports:**
 - `std::collections::HashMap`
@@ -4631,6 +4641,10 @@ wrkflw/
 `pub(crate) const RUNNER_NODE_MAJOR: &str = "22"`
 
 `pub(crate) fn runner_node_install() -> String`
+
+`fn node_tarball_install(major: &str) -> String`
+
+`pub(crate) fn nodesource_install(major: &str) -> String`
 
 `const RUST_TOOLCHAIN_TOOL_BRANCHES: &[(&str, &str)] = &[("clippy", "clippy"), ("miri", "miri, rust-src")]`
 
@@ -5440,7 +5454,7 @@ wrkflw/
 
 ## crates/parser/src/github-workflow.json
 
-**Language:** JSON | **Size:** 91.0 KB | **Lines:** 1740
+**Language:** JSON | **Size:** 91.2 KB | **Lines:** 1749
 
 **Declarations:**
 
@@ -7014,7 +7028,7 @@ wrkflw/
 
 ## crates/trigger-filter/src/model.rs
 
-**Language:** Rust | **Size:** 11.9 KB | **Lines:** 309
+**Language:** Rust | **Size:** 16.1 KB | **Lines:** 420
 
 **Imports:**
 - `glob::{MatchOptions, Pattern, PatternError}`
@@ -7052,11 +7066,19 @@ wrkflw/
 
 `mod tests`
 
+`const MAX_GLOB_ALTERNATIVES: usize = 16`
+
 **`impl GlobPattern`**
   `pub fn new(source: impl Into<String>) -> Result<Self, PatternError>`
 
+  `pub fn matches(&self, text: &str) -> bool`
+
   `pub fn match_options() -> MatchOptions`
 
+
+`fn expand_inner_double_stars(source: &str) -> Vec<String>`
+
+`mod glob_pattern_tests`
 
 ---
 
@@ -7094,7 +7116,7 @@ wrkflw/
 
 ## crates/trigger-filter/src/path_matcher.rs
 
-**Language:** Rust | **Size:** 6.1 KB | **Lines:** 171
+**Language:** Rust | **Size:** 6.1 KB | **Lines:** 168
 
 **Imports:**
 - `crate::model::GlobPattern`
@@ -7109,7 +7131,7 @@ wrkflw/
 
 ## crates/trigger-filter/src/ref_matcher.rs
 
-**Language:** Rust | **Size:** 3.3 KB | **Lines:** 118
+**Language:** Rust | **Size:** 3.2 KB | **Lines:** 116
 
 **Imports:**
 - `crate::model::GlobPattern`
@@ -9153,7 +9175,7 @@ wrkflw/
 
 ## crates/wrkflw/src/compare_cmd.rs
 
-**Language:** Rust | **Size:** 86.6 KB | **Lines:** 2175
+**Language:** Rust | **Size:** 96.8 KB | **Lines:** 2403
 
 **Imports:**
 - `crate::git::line as git_line`
@@ -9187,6 +9209,10 @@ wrkflw/
 
 `fn expected_jobs(path: &Path) -> Result<Vec<ExpectedJob>, String>`
 
+`fn with_run_time_legs(expected: Vec<ExpectedJob>, local: &[Value]) -> Vec<ExpectedJob>`
+
+`fn leg_values(id: &str, name: &str) -> Option<Vec<String>>`
+
 `struct Row`
 > Fields: `github_name: Option<String>`, `local_name: Option<String>`, `github: Option<String>`, `local: Option<String>`, `agree: Option<bool>`, `note: Option<String>`, `stand_in: bool`, `unverified: bool`
 
@@ -9198,7 +9224,7 @@ wrkflw/
 
 `const NO_DOCKER_ENGINE: &[&str] = &[ "docker: command not found", "docker: not found", "docker: No such file or directory", "Cannot connect to the Docker daemon", ]`
 
-`const NO_GITHUB_TOKEN: &[&str] = &["set the GH_TOKEN environment variable", "Bad credentials"]`
+`const NO_GITHUB_TOKEN: &[&str] = &[ "set the GH_TOKEN environment variable", "Bad credentials", // An action's `github-token` or `token` input, which defaults to the // job's token, refused as empty by `@actions/core`. "Input required and not supplied: github-token", "Input required and not supplied: token", ]`
 
 `fn lacked_github_token(failure: &Value) -> bool`
 
@@ -9207,6 +9233,14 @@ wrkflw/
 `fn failure_lines(failure: &Value) -> impl Iterator<Item = &str>`
 
 `fn lacked_docker(failure: &Value) -> bool`
+
+`const NO_SERVICE_TOKEN: &[&str] = &[ "Token required because branch is protected", "Couldn't find a repository matching this job", ]`
+
+`fn lacked_service_token(failure: &Value) -> bool`
+
+`const NEEDS_X86_64: &[&str] = &[ "rosetta error: failed to open elf at /lib64/ld-linux-x86-64.so.2", "toolchain add stable-x86_64-unknown-linux-gnu", "exec format error", ]`
+
+`fn needed_x86_64(failure: &Value) -> bool`
 
 `const QUOTED_LINE_CHARS: usize = 200`
 
@@ -10818,7 +10852,7 @@ wrkflw/
 
 ## schemas/github-workflow.json
 
-**Language:** JSON | **Size:** 90.8 KB | **Lines:** 1732
+**Language:** JSON | **Size:** 91.0 KB | **Lines:** 1741
 
 **Declarations:**
 

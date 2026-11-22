@@ -29,26 +29,30 @@ We rerun finished GitHub runs of open-source repositories with `wrkflw compare`.
 
 rust-lang/log's one difference is its documentation job, which fails on Rust 1.100, released after its GitHub run, as `stable` floats. itoa's three verify an attestation with the job's GitHub token, which a local job doesn't get unless `WRKFLW_JOB_GITHUB_TOKEN=1` gives it yours. spf13/cobra is the one run slower here than on GitHub: its 19 jobs each get a machine of their own there, and share one 7.7 GB VM here.
 
-These nine repositories are the ones wrkflw has been fixed against. To see how it does on a repository it hasn't seen, [`held_out_runs.txt`](scripts/conformance/held_out_runs.txt) lists fourteen it has never been tuned for, with services, wide OS matrices and a known failure. Their first sweep (2026-11-20, same machine) agreed on 62 jobs and differed on 53:
+These nine repositories are the ones wrkflw has been fixed against. To see how it does on repositories it hadn't seen, fourteen more were held out, with services, wide OS matrices and a known failure. Their first sweep (2026-11-20, same machine) agreed on 62 jobs and differed on 53, and two refused to run. wrkflw was then fixed against what it found, and the same runs swept again (2026-11-22):
 
-| Repository | Jobs agreed | Differed | Not compared | Local | GitHub |
-|---|---|---|---|---|---|
-| pallets/markupsafe | 9 | 0 | 1 | 44 s | 38 s |
-| psf/requests | 12 | 6 | 7 | 211 s | 279 s |
-| encode/httpx | 4 | 1 | 0 | 116 s | 56 s |
-| sharkdp/hyperfine | 4 | 10 | 3 | 369 s | 183 s |
-| sharkdp/fd | 5 | 10 | 5 | 486 s | 384 s |
-| expressjs/express | 9 | 2 | 9 | 188 s | 125 s |
-| sindresorhus/execa | 0 | 6 | 3 | 3562 s | 1149 s |
-| urfave/cli | 3 | 1 | 2 | 249 s | 128 s |
-| BurntSushi/memchr | 6 | 9 | 2 | 790 s | 608 s |
-| go-sql-driver/mysql | 1 | 3 | 24 | 127 s | 671 s |
-| jazzband/django-redis | 0 | 3 | 22 | 64 s | 291 s |
-| dtolnay/anyhow | 9 | 2 | 1 | 620 s | 449 s |
-| go-chi/chi | – | – | – | refused | |
-| lib/pq | – | – | – | refused | |
+| Repository | First sweep: agreed / differed | After the fixes | Local | GitHub |
+|---|---|---|---|---|
+| pallets/markupsafe | 9 / 0 | 9 / 0 | 96 s | 38 s |
+| psf/requests | 12 / 6 | **18 / 0** | 239 s | 279 s |
+| encode/httpx | 4 / 1 | **5 / 0** | 62 s | 56 s |
+| go-chi/chi | refused | **4 / 0** | 113 s | 107 s |
+| lib/pq | refused | **13 / 2** | 446 s | 95 s |
+| jazzband/django-redis | 0 / 3 | **13 / 1** | 223 s | 291 s |
+| dtolnay/anyhow | 9 / 2 | 9 / 2 | 477 s | 449 s |
+| expressjs/express | 9 / 2 | 8 / 3 | 291 s | 125 s |
+| urfave/cli | 3 / 1 | 3 / 1 | 179 s | 128 s |
+| BurntSushi/memchr | 6 / 9 | 7 / 8 | 573 s | 608 s |
+| sharkdp/hyperfine | 4 / 10 | 4 / 10 | 355 s | 183 s |
+| sharkdp/fd | 5 / 10 | 5 / 10 | 370 s | 384 s |
+| sindresorhus/execa | 0 / 6 | 5 / 1 | 3725 s | 1149 s |
+| go-sql-driver/mysql | 1 / 3 | 2 / 18 | 1434 s | 671 s |
 
-The largest causes: cross-compiling with `cross` on an Apple Silicon Mac, which runs x86_64 tools that fail under Rosetta (hyperfine, fd, memchr); `codecov/codecov-action` stopping at its `github-token` input, which defaults to the token every GitHub job has and is empty in a local job unless `WRKFLW_JOB_GITHUB_TOKEN=1` (execa, urfave/cli); trigger filters wrkflw refuses although GitHub accepts them, `branches: "**"` given as a string and the glob `**.go` (chi, lib/pq, which therefore have no result); a matrix computed by a job that failed locally, which leaves GitHub's matrix legs with nothing to pair with (mysql); and job names written as a folded `>` string that `compare` can't pair (django-redis). Results are kept in [`held_out_expected.tsv`](scripts/conformance/held_out_expected.tsv). See [Conformance](docs/matching-github.md#conformance) to run either sweep yourself.
+What the first sweep found and is now fixed: trigger filters GitHub accepts, `branches: "**"` as a string and the glob `**.go` (chi, lib/pq); `actions/checkout` with a `path:` (chi); `actions/github-script` without a token, inside `codecov/codecov-action` (execa, urfave/cli); `${{ github.action_path }}` in a container step (execa); `::set-output` values lost to an empty `$GITHUB_OUTPUT` (django-redis); folded job names and legs of a matrix made at run time, which `compare` couldn't pair (django-redis, mysql); `ImageOS`, which actions that download a build for the runner's OS read (mysql); `python`, `libncurses6`, OpenSSL headers and the setup-python PATH order in the runner image (mysql, requests, httpx); Node 19 for Ubuntu 26.04 (express); and rustup on the overlay filesystem (memchr).
+
+What is left, and isn't wrkflw's to fix: coverage uploads to Codecov and Coveralls, which take them only from a GitHub job (mysql's 16 test legs pass their tests and differ only there, urfave/cli); steps that need the job's GitHub token, unless `WRKFLW_JOB_GITHUB_TOKEN=1` (anyhow, mysql); `cross` on an Apple Silicon Mac, which runs x86_64 tools the arm64 job container can't (hyperfine, fd, memchr), and which `compare` names on each job; timing tests that fail while many legs and databases share one machine (lib/pq, express); and one test that failed on GitHub and passed here (django-redis). execa's legs need more memory than a 7.7 GB Docker VM holds side by side, so they run one at a time, and one of them still runs out of JavaScript heap.
+
+Those fourteen are in the tuned sweep now. Fourteen new repositories, which no change has been made against, are held out in [`held_out_runs.txt`](scripts/conformance/held_out_runs.txt), with no results yet. See [Conformance](docs/matching-github.md#conformance) to run either sweep yourself.
 
 ## Quick Start
 

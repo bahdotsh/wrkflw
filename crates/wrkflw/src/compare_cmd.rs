@@ -389,6 +389,12 @@ const NEEDS_X86_64: &[&str] = &[
     "toolchain add stable-x86_64-unknown-linux-gnu",
 ];
 
+/// Whether this machine's job containers are arm64, where an x86_64
+/// program can't run: only there does [`needed_x86_64`] explain a failure.
+/// The same rustup line on an x86_64 machine, such as a download that
+/// failed, has a cause of its own.
+const HOST_IS_ARM64: bool = cfg!(target_arch = "aarch64");
+
 /// Whether a failed step's output shows it needed an x86_64 machine.
 fn needed_x86_64(failure: &Value) -> bool {
     failure_lines(failure).any(|line| NEEDS_X86_64.iter().any(|sign| line.contains(sign)))
@@ -487,7 +493,10 @@ fn note_for(local: &Value, failures: &[Value], runs_docker: bool) -> Option<Stri
     }
     // GitHub's `ubuntu-*` runners are x86_64; a job container on an arm64
     // machine is arm64, and `cross` and its images are x86_64 only.
-    if local["status"] == "failure" && failures_of(failures, name).any(needed_x86_64) {
+    if HOST_IS_ARM64
+        && local["status"] == "failure"
+        && failures_of(failures, name).any(needed_x86_64)
+    {
         notes.push(
             "a step ran an x86_64 program, as `cross` does, which this machine's arm64 \
              job container can't run; GitHub's runner is x86_64"
@@ -2402,13 +2411,17 @@ mod tests {
             rows(&expected, &github, &local, &failures)[0]
                 .note
                 .clone()
-                .unwrap()
+                .unwrap_or_default()
         };
         for line in [
             "rosetta error: failed to open elf at /lib64/ld-linux-x86-64.so.2",
             "1: `rustup toolchain add stable-x86_64-unknown-linux-gnu --profile minimal` failed with exit status: 1",
         ] {
-            assert!(note_after(line).contains("x86_64"), "{line}");
+            let failure = json!({"output_tail": [line]});
+            assert!(needed_x86_64(&failure), "{line}");
+            // Said only where the job container is arm64: on an x86_64
+            // machine the same line has another cause.
+            assert_eq!(note_after(line).contains("x86_64"), HOST_IS_ARM64, "{line}");
         }
         assert!(!note_after("error[E0308]: mismatched types").contains("x86_64"));
         // A bad shebang or a broken binary says this on any machine.

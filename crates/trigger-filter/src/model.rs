@@ -228,30 +228,38 @@ impl GlobPattern {
 /// The `glob` patterns that together match what GitHub matches with
 /// `source`. A component holding `**` next to other characters, `P**S`,
 /// matches `P`, anything, then `S`: within one component that is `P*S`, and
-/// across several `P*/**/*S`. Patterns with no such component come back
-/// unchanged, alone. More than [`MAX_GLOB_ALTERNATIVES`] is an error.
+/// across several `P*/**/*S`. Each `**` in a component, `a**b**c` having
+/// two, makes that choice of its own. Patterns with no such component come
+/// back unchanged, alone. More than [`MAX_GLOB_ALTERNATIVES`] is an error.
+///
+/// Errors in the rest of the pattern, such as an unclosed `[`, are found in
+/// the source itself, so their position is the one the user wrote.
 fn expand_inner_double_stars(source: &str) -> Result<Vec<String>, PatternError> {
+    Pattern::new(&same_length_check(source))?;
     let mut expanded = vec![String::new()];
     let mut offset = 0;
     for (index, component) in source.split('/').enumerate() {
         let start = offset;
         offset += component.len() + 1;
-        let choices: Vec<String> = match component.find("**") {
-            Some(at) if component != "**" => {
-                let prefix = &component[..at];
-                // `***` and longer mean the same as `**`.
-                let suffix = component[at..].trim_start_matches('*');
-                vec![
-                    format!("{prefix}*{suffix}"),
-                    format!("{prefix}*/**/*{suffix}"),
-                ]
+        let choices: Vec<String> = match inner_double_star_pieces(component) {
+            Some(pieces) => {
+                let mut choices = vec![pieces[0].to_string()];
+                for piece in &pieces[1..] {
+                    choices = choices
+                        .iter()
+                        .flat_map(|head| {
+                            [format!("{head}*{piece}"), format!("{head}*/**/*{piece}")]
+                        })
+                        .collect();
+                }
+                choices
             }
-            _ => vec![component.to_string()],
+            None => vec![component.to_string()],
         };
         if expanded.len() * choices.len() > MAX_GLOB_ALTERNATIVES {
             return Err(PatternError {
                 pos: start,
-                msg: "too many path components with `**` inside them (at most 4)",
+                msg: "too many `**` inside path components (at most 4)",
             });
         }
         expanded = expanded
@@ -268,6 +276,55 @@ fn expand_inner_double_stars(source: &str) -> Result<Vec<String>, PatternError> 
             .collect();
     }
     Ok(expanded)
+}
+
+/// `component` split at each run of two or more `*`, all of which GitHub
+/// takes as `**`, or `None` when it has none or is `**` alone, which `glob`
+/// takes itself.
+fn inner_double_star_pieces(component: &str) -> Option<Vec<&str>> {
+    if component == "**" || !component.contains("**") {
+        return None;
+    }
+    let mut pieces = Vec::new();
+    let mut rest = component;
+    while let Some(at) = rest.find("**") {
+        pieces.push(&rest[..at]);
+        rest = rest[at..].trim_start_matches('*');
+    }
+    pieces.push(rest);
+    Some(pieces)
+}
+
+/// `source` with each run of `*` inside a component written `*?..`, of the
+/// same length, which `glob` accepts: what is left to refuse is the rest of
+/// the pattern, at the position it has in `source`.
+fn same_length_check(source: &str) -> String {
+    source
+        .split('/')
+        .map(|component| {
+            if inner_double_star_pieces(component).is_none() {
+                return component.to_string();
+            }
+            let mut out = String::with_capacity(component.len());
+            let mut stars = 0;
+            for c in component.chars().chain(std::iter::once('\0')) {
+                if c == '*' {
+                    stars += 1;
+                    continue;
+                }
+                if stars > 0 {
+                    out.push('*');
+                    out.extend(std::iter::repeat_n('?', stars - 1));
+                    stars = 0;
+                }
+                if c != '\0' {
+                    out.push(c);
+                }
+            }
+            out
+        })
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 /// Parsed trigger configuration for a single event type (e.g., push, pull_request).
@@ -430,5 +487,30 @@ mod glob_pattern_tests {
         assert!(pattern.matches("a/b/c/x/d"));
         let refused = GlobPattern::new("a**/b**/c**/d**/e**").unwrap_err();
         assert_eq!(refused.pos, "a**/b**/c**/d**/".len());
+    }
+
+    #[test]
+    fn several_double_stars_in_one_component_each_cross_directories() {
+        let pattern = GlobPattern::new("a**b**c").unwrap();
+        assert!(pattern.matches("abc"));
+        assert!(pattern.matches("a1b2c"));
+        assert!(pattern.matches("a/x/b/y/c"));
+        assert!(pattern.matches("ax/b/yc"));
+        assert!(!pattern.matches("a/c"));
+        // `***` is `**`.
+        assert!(GlobPattern::new("src/***.rs")
+            .unwrap()
+            .matches("src/a/b.rs"));
+        // Two in one component count twice toward the limit.
+        assert!(GlobPattern::new("a**b**/c**d**").is_ok());
+        assert!(GlobPattern::new("a**b**c/d**e**f/g**").is_err());
+    }
+
+    #[test]
+    fn an_error_elsewhere_is_placed_in_the_pattern_as_written() {
+        let error = GlobPattern::new("docs/**.md/[ab").unwrap_err();
+        let plain = glob::Pattern::new("docs/x*.md/[ab").unwrap_err();
+        assert_eq!(error.pos, plain.pos);
+        assert_eq!(error.msg, plain.msg);
     }
 }

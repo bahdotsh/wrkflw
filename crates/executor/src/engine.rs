@@ -3835,6 +3835,7 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
     // mirrors only the user-declared slice for `toJSON(env)`.
     let mut job_env = ctx.env_context.clone();
     let mut job_user_env = ctx.user_env.clone();
+    environment::set_image_os(&mut job_env, &job_user_env, &job.runs_on);
 
     // Add container-level environment variables (lowest precedence).
     // Container env is user-declared (jobs.<id>.container.env in YAML) — mirror
@@ -4339,6 +4340,7 @@ async fn execute_matrix_job(
     let mut job_env = base_env_context.clone();
     let mut job_user_env = base_user_env.clone();
     environment::add_matrix_context(&mut job_env, combination);
+    environment::set_image_os(&mut job_env, &job_user_env, &job_template.runs_on);
 
     // Add container-level environment variables (lowest precedence). User-declared.
     if let Some(ref container) = job_template.container {

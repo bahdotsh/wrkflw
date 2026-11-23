@@ -5911,12 +5911,7 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
         .step
         .run
         .as_ref()
-        .and_then(|_| container_action_path(ctx.job_env))
-        .map(|path| {
-            let mut env = step_env.clone();
-            env.insert("GITHUB_ACTION_PATH".to_string(), path);
-            env
-        });
+        .and_then(|_| as_the_container_sees_it(&step_env));
 
     // Add step-level environment variables (with secret + expression substitution)
     for (key, value) in &ctx.step.env {
@@ -6707,14 +6702,9 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
         // In a container, `${{ github.action_path }}` is the action's
         // directory as the container sees it, as $GITHUB_ACTION_PATH is:
         // lycheeverse/lychee-action runs `${{ github.action_path }}/entrypoint.sh`.
-        let container_env;
-        let run_expr_ctx = match container_action_path(ctx.job_env) {
-            Some(path) => {
-                let mut env = ctx.job_env.clone();
-                env.insert("GITHUB_ACTION_PATH".to_string(), path);
-                container_env = env;
-                ctx.expr_context_with_env(&container_env, ctx.job_user_env)
-            }
+        let container_env = as_the_container_sees_it(ctx.job_env);
+        let run_expr_ctx = match &container_env {
+            Some(env) => ctx.expr_context_with_env(env, ctx.job_user_env),
             None => ctx.expr_context(),
         };
         let resolved_run = match crate::substitution::preprocess_expressions(
@@ -7164,17 +7154,24 @@ fn prepare_step_container_context(
 
 type VolumePathPair = (PathBuf, PathBuf);
 
-/// Where a composite or JavaScript action's directory is inside the job's
-/// container, for an `env` that names one and runs in a container: what
-/// [`prepare_container_mounts`] sets $GITHUB_ACTION_PATH to.
-fn container_action_path(env: &HashMap<String, String>) -> Option<String> {
+/// `env` as a step in the job's container sees it, for an `env` that names
+/// a composite or JavaScript action's directory and runs in a container:
+/// with $GITHUB_ACTION_PATH where [`prepare_container_mounts`] puts that
+/// directory, so `${{ github.action_path }}` names it too. `None` when
+/// nothing differs.
+fn as_the_container_sees_it(env: &HashMap<String, String>) -> Option<HashMap<String, String>> {
     if !uses_container_runtime(env) {
         return None;
     }
     let host = env.get("GITHUB_ACTION_PATH")?;
     let root = crate::node_actions::action_root();
     let (_, container) = action_mount(Path::new(host), root.as_ref());
-    Some(container.to_string_lossy().to_string())
+    let mut seen = env.clone();
+    seen.insert(
+        "GITHUB_ACTION_PATH".to_string(),
+        container.to_string_lossy().to_string(),
+    );
+    Some(seen)
 }
 
 /// True when steps execute inside a Docker/Podman/Kubernetes container

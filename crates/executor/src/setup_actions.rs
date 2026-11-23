@@ -999,14 +999,20 @@ pub(crate) fn get_install_script(language: &str, version: &str) -> String {
         // interpreters carry no such marker, so it goes. The directory pip
         // installs commands into, such as `pytest` or `tox`, is linked to
         // [`PYTHON_SCRIPTS_DIR`], which the image puts first on `PATH`, as
-        // setup-python does with its own.
+        // setup-python does with its own. Its interpreters, `python3.10`
+        // and the like, are linked one by one into [`PYTHON_LINKS_DIR`],
+        // ahead of it: reached through a linked directory, Python 3.10 and
+        // older look for their standard library beside the link, and fail
+        // to start ("Could not find platform independent libraries").
         "python" => {
             format!(
                 "{install_uv} && \
                  uv python install '{req}' && \
                  p=\"$(uv python find '{req}')\" && \
                  ln -sf \"$p\" /usr/local/bin/python && ln -sf \"$p\" /usr/local/bin/python3 && \
-                 ln -sfn \"$(\"$p\" -c '{scripts}')\" {scripts_dir} && \
+                 s=\"$(\"$p\" -c '{scripts}')\" && ln -sfn \"$s\" {scripts_dir} && \
+                 mkdir -p {links_dir} && \
+                 for f in \"$s\"/python* \"$s\"/pypy*; do [ ! -e \"$f\" ] || ln -sf \"$f\" {links_dir}/; done && \
                  \"$p\" -c '{drop_marker}' && \
                  (\"$p\" -m pip --version >/dev/null 2>&1 || \"$p\" -m ensurepip --upgrade) && \
                  printf '#!/bin/sh\\nexec /usr/local/bin/python -m pip \"$@\"\\n' > /usr/local/bin/pip && \
@@ -1016,6 +1022,7 @@ pub(crate) fn get_install_script(language: &str, version: &str) -> String {
                 drop_marker = DROP_EXTERNALLY_MANAGED,
                 scripts = PRINT_SCRIPTS_DIR,
                 scripts_dir = PYTHON_SCRIPTS_DIR,
+                links_dir = PYTHON_LINKS_DIR,
             )
         }
         "uv" => uv_install_command(version),
@@ -1172,6 +1179,11 @@ pub(crate) const UV_PYTHON_DIR: &str = "/opt/uv/python";
 /// `pip install` puts commands. Outside [`UV_PYTHON_DIR`], which uv reads
 /// as its own.
 pub(crate) const PYTHON_SCRIPTS_DIR: &str = "/opt/uv/python-bin";
+
+/// A directory of links to each setup-python interpreter itself, such as
+/// `python3.10`, put ahead of [`PYTHON_SCRIPTS_DIR`] on `PATH`, so an
+/// interpreter is always reached through a link to its file.
+pub(crate) const PYTHON_LINKS_DIR: &str = "/opt/uv/python-links";
 
 /// Python that prints the scripts directory of the interpreter running it.
 /// Single-quoted in the shell, so it holds none.

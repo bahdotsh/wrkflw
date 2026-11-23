@@ -29,8 +29,8 @@ use crate::matrix_fold::{matrix_twins, repeated_leg};
 use crate::podman;
 use crate::setup_actions::{
     detect_setup, runner_node_install, rust_toolchain_extras, static_input, unrun_action_cause,
-    BuiltRuntimes, SetupDetection, SetupRuntime, NO_IMPLEMENTATION, PYTHON_SCRIPTS_DIR,
-    SETUP_ACTIONS, UV_PYTHON_DIR,
+    BuiltRuntimes, SetupDetection, SetupRuntime, NO_IMPLEMENTATION, PYTHON_LINKS_DIR,
+    PYTHON_SCRIPTS_DIR, SETUP_ACTIONS, UV_PYTHON_DIR,
 };
 use wrkflw_logging;
 use wrkflw_matrix::MatrixCombination;
@@ -2568,27 +2568,23 @@ fn combined_dockerfile_tail(runtimes: &[SetupRuntime], tools: RunnerTools) -> St
     // Base images can bundle tools ahead of the system directories. The act
     // images do this with Node, which would shadow the version a setup action
     // just installed. Every install script lands in one of these directories.
-    // setup-python's interpreter's scripts come ahead of the system's, so
-    // what `pip install` adds runs by name. They come after
-    // /usr/local/bin, which has `python` as a link to the interpreter
-    // itself: the scripts directory holds a `python` too, but reached
-    // through the link [`PYTHON_SCRIPTS_DIR`] is, Python 3.10 and older
-    // look for their standard library beside that link, and fail to start
-    // ("Could not find platform independent libraries").
+    // setup-python puts its interpreter's scripts first, so what `pip
+    // install` adds runs by name, and its interpreters, by every name,
+    // ahead of them: [`PYTHON_LINKS_DIR`] says why.
     // What `cargo install` installs goes on PATH, as `~/.cargo/bin` is on
     // the hosted runner's.
     let mut path: Vec<String> = Vec::new();
+    if runtimes.iter().any(|rt| rt.language == "python") {
+        path.push(PYTHON_LINKS_DIR.to_string());
+        path.push(PYTHON_SCRIPTS_DIR.to_string());
+    }
     if has_rust {
         path.push(match tools {
             RunnerTools::Install => format!("{}/bin", runner_cargo_home()),
             RunnerTools::Omit => ROOT_CARGO_BIN_DIR.to_string(),
         });
     }
-    path.push("/usr/local/bin".to_string());
-    if runtimes.iter().any(|rt| rt.language == "python") {
-        path.push(PYTHON_SCRIPTS_DIR.to_string());
-    }
-    path.extend(["/usr/bin", "$PATH"].map(str::to_string));
+    path.extend(["/usr/local/bin", "/usr/bin", "$PATH"].map(str::to_string));
     dockerfile.push_str(&format!("ENV PATH={}\n", path.join(":")));
 
     dockerfile
@@ -12734,7 +12730,7 @@ runs:
             "{built_in}"
         );
         assert!(
-            built_in.contains("PATH=/home/runner/.cargo/bin:/usr/local/bin:"),
+            built_in.contains(":/home/runner/.cargo/bin:/usr/local/bin:"),
             "{built_in}"
         );
 
@@ -12743,7 +12739,7 @@ runs:
         assert!(!mapped.contains("CARGO_HOME"), "{mapped}");
         assert!(mapped.contains("RUN install-rust\n"), "{mapped}");
         assert!(
-            mapped.contains("PATH=/root/.cargo/bin:/usr/local/bin:"),
+            mapped.contains(":/root/.cargo/bin:/usr/local/bin:"),
             "{mapped}"
         );
     }
@@ -14999,13 +14995,16 @@ runs:
             None,
             RunnerTools::Install,
         );
-        // After /usr/local/bin, whose `python` links to the interpreter
-        // itself, and ahead of the system's commands.
+        // First, as setup-python's, behind links to the interpreters.
         assert!(
             df.contains(&format!(
-                "ENV PATH=/usr/local/bin:{}:/usr/bin",
-                PYTHON_SCRIPTS_DIR
+                "ENV PATH={}:{}:",
+                PYTHON_LINKS_DIR, PYTHON_SCRIPTS_DIR
             )),
+            "{df}"
+        );
+        assert!(
+            df.contains(&format!("ln -sf \"$f\" {}/", PYTHON_LINKS_DIR)),
             "{df}"
         );
         assert!(df.contains(&format!("\" {}", PYTHON_SCRIPTS_DIR)), "{df}");

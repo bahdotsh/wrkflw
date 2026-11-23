@@ -1,6 +1,6 @@
 # Codebase Index: wrkflw
 
-> Generated: 2026-11-23 11:16:56 UTC | Files: 282 | Lines: 128658
+> Generated: 2026-11-23 11:49:49 UTC | Files: 282 | Lines: 128858
 > Languages: JSON (4), Markdown (35), Rust (176), Shell (10), TOML (19), YAML (38)
 
 ## Directory Structure
@@ -480,6 +480,8 @@ wrkflw/
 - `pub const CONTAINER_GITHUB_DIR: &str = "/github/workflow"`
 - `pub fn apply_github_container_context(env: &mut HashMap<String, String>)`
 - `pub const IMAGE_OS: &str = "ubuntu24"`
+- `pub fn image_os(runs_on: &str) -> &'static str`
+- `pub fn set_image_os( env: &mut HashMap<String, String>, user_env: &HashMap<String, String>, runs_on: &Option<Vec<String>>, )`
 - `pub fn apply_gitlab_container_context(env: &mut HashMap<String, String>)`
 - `pub struct RunRef<'a>`
 - `pub fn create_github_context( workflow: &WorkflowDefinition, workspace_dir: &Path, run_ref: &RunRef<'_>, ) -> HashMap<String, String>`
@@ -1904,7 +1906,7 @@ wrkflw/
 
 ## INDEX.md
 
-**Language:** Markdown | **Size:** 307.8 KB | **Lines:** 11253
+**Language:** Markdown | **Size:** 308.0 KB | **Lines:** 11258
 
 **Declarations:**
 
@@ -2959,7 +2961,7 @@ wrkflw/
 
 ## crates/executor/src/environment.rs
 
-**Language:** Rust | **Size:** 20.9 KB | **Lines:** 648
+**Language:** Rust | **Size:** 23.4 KB | **Lines:** 710
 
 **Imports:**
 - `chrono::Utc`
@@ -4537,7 +4539,7 @@ wrkflw/
 
 ## crates/executor/src/setup_actions.rs
 
-**Language:** Rust | **Size:** 62.1 KB | **Lines:** 1531
+**Language:** Rust | **Size:** 62.9 KB | **Lines:** 1543
 
 **Imports:**
 - `std::collections::HashMap`
@@ -4627,6 +4629,8 @@ wrkflw/
 `pub(crate) const UV_PYTHON_DIR: &str = "/opt/uv/python"`
 
 `pub(crate) const PYTHON_SCRIPTS_DIR: &str = "/opt/uv/python-bin"`
+
+`pub(crate) const PYTHON_LINKS_DIR: &str = "/opt/uv/python-links"`
 
 `const PRINT_SCRIPTS_DIR: &str = "import sysconfig`
 
@@ -7033,7 +7037,7 @@ wrkflw/
 
 ## crates/trigger-filter/src/model.rs
 
-**Language:** Rust | **Size:** 16.8 KB | **Lines:** 434
+**Language:** Rust | **Size:** 19.8 KB | **Lines:** 516
 
 **Imports:**
 - `glob::{MatchOptions, Pattern, PatternError}`
@@ -7082,6 +7086,10 @@ wrkflw/
 
 
 `fn expand_inner_double_stars(source: &str) -> Result<Vec<String>, PatternError>`
+
+`fn inner_double_star_pieces(component: &str) -> Option<Vec<&str>>`
+
+`fn same_length_check(source: &str) -> String`
 
 `mod glob_pattern_tests`
 
@@ -9180,7 +9188,7 @@ wrkflw/
 
 ## crates/wrkflw/src/compare_cmd.rs
 
-**Language:** Rust | **Size:** 97.2 KB | **Lines:** 2407
+**Language:** Rust | **Size:** 98.8 KB | **Lines:** 2438
 
 **Imports:**
 - `crate::git::line as git_line`
@@ -10857,7 +10865,7 @@ wrkflw/
 
 ## schemas/github-workflow.json
 
-**Language:** JSON | **Size:** 91.0 KB | **Lines:** 1741
+**Language:** JSON | **Size:** 91.2 KB | **Lines:** 1749
 
 **Declarations:**
 

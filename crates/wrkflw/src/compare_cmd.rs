@@ -2355,6 +2355,37 @@ mod tests {
         );
     }
 
+    /// Two run-time legs whose values are the same set in another order
+    /// fit both GitHub names, as the matrix's key order isn't known here:
+    /// the rows say so rather than claim which is which.
+    #[test]
+    fn run_time_legs_that_differ_only_in_order_are_called_ambiguous() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "name: CI\non: push\njobs:\n  list:\n    runs-on: ubuntu-latest\n    outputs:\n      matrix: ${{ steps.m.outputs.matrix }}\n    steps:\n      - id: m\n        run: echo hi\n  test:\n    needs: list\n    runs-on: ubuntu-latest\n    strategy:\n      matrix: ${{ fromJSON(needs.list.outputs.matrix) }}\n    steps:\n      - run: echo hi\n";
+        let expected = expected_jobs(&write(dir.path(), yaml)).unwrap();
+        let local = vec![
+            json!({"name": "list", "status": "success"}),
+            json!({"name": "test (a: 1, b: 2)", "status": "success"}),
+            json!({"name": "test (a: 2, b: 1)", "status": "failure"}),
+        ];
+        let expected = with_run_time_legs(expected, &local);
+        let github = vec![
+            remote("list", "success"),
+            remote("test (1, 2)", "success"),
+            remote("test (2, 1)", "failure"),
+        ];
+        let rows = rows(&expected, &github, &local, &[]);
+        let legs: Vec<_> = rows
+            .iter()
+            .filter(|row| row.local_name.as_deref() != Some("list"))
+            .collect();
+        assert_eq!(legs.len(), 2, "{rows:?}");
+        for row in legs {
+            let note = row.note.clone().unwrap_or_default();
+            assert_eq!(note, ambiguous_note(row.github_name.as_deref().unwrap(), 2));
+        }
+    }
+
     /// A job whose step ran an x86_64 program in an arm64 container, as
     /// `cross` on an Apple Silicon Mac does, says so; a failure of its own
     /// doesn't.
